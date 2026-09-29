@@ -329,6 +329,9 @@ impl Network for CrashEnv {
     async fn recv_stream(&self, stream: u64) -> Envelope {
         self.inner.recv_stream(stream).await
     }
+    fn close_stream(&self, stream: u64) {
+        self.inner.close_stream(stream);
+    }
 }
 
 impl Spawner for CrashEnv {

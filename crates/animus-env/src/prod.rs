@@ -43,8 +43,8 @@ use crate::handshake;
 use crate::nid;
 use crate::tls::server_name_for;
 use crate::{
-    Clock, Disk, Env, Envelope, MaybeTlsStream, Metric, MetricsHandle, Nanos, Network, NodeId, Rng,
-    Spawner, TlsConfig, TlsMaterial, UnixMillis,
+    Clock, Disk, Env, Envelope, InboxCap, MaybeTlsStream, Metric, MetricsHandle, Nanos, Network,
+    NodeId, Rng, Spawner, TlsConfig, TlsMaterial, UnixMillis,
 };
 
 /// A production environment for a single node.
@@ -72,6 +72,110 @@ pub struct ProdEnv {
 struct Demux {
     queues: BTreeMap<u64, VecDeque<Envelope>>,
     wakers: BTreeMap<u64, Waker>,
+    /// Per-stream observability bookkeeping (issue: an unread stream's
+    /// queue in `queues` above grows forever — this is the measurement
+    /// this map exists to make possible, not a fix for it). Maintained
+    /// incrementally alongside `queues`/`wakers` on the exact same push
+    /// (`spawn_pump`) and pop (`RecvStream::poll`) sites — O(1) per
+    /// frame, no scan of `queues` itself required to answer "how many
+    /// bytes/frames are queued right now" (see [`ProdEnv::inbox_stats`]).
+    /// Never pruned when a stream's queue empties — a still-open stream's
+    /// bookkeeping outlives an empty queue by design (this is what makes
+    /// `ever_polled`/`last_pop` meaningful); an explicitly [`close_stream`]d
+    /// stream's entry IS pruned, see `closed` below.
+    ///
+    /// [`close_stream`]: ProdEnv::close_stream
+    stream_meta: BTreeMap<u64, StreamMeta>,
+    /// Streams explicitly retired via [`ProdEnv::close_stream`] and not yet
+    /// reopened by a subsequent `recv_stream` call (ADR 0026, 2026-09-28
+    /// amendment). Bounded by the number of tablets this node has ever
+    /// *hosted and torn down* — never by traffic volume — since a tombstone
+    /// is inserted only at an explicit close and removed the moment
+    /// `recv_stream` is next called for that stream (or the node itself
+    /// restarts, a fresh `ProdEnv` process starting with none). A stream
+    /// never closed is simply absent here, which is exactly "not yet
+    /// opened" staying indistinguishable from "ordinary, never-closed
+    /// stream" — the distinction this set exists to make is solely
+    /// "was `close_stream` ever called for this stream, since its last
+    /// reopen."
+    closed: BTreeSet<u64>,
+    /// The per-stream backpressure cap enforced at push time (ADR 0026,
+    /// 2026-09-28 inbox-cap amendment) — see [`crate::InboxCap`]'s own doc
+    /// for the derivation and [`spawn_pump`]'s drop-oldest enforcement for
+    /// the mechanism. Defaults to [`InboxCap::default`]; changeable at
+    /// runtime via [`ProdEnv::set_inbox_cap`] (a test shrinking it to
+    /// provoke overflow deterministically does not need to reconstruct the
+    /// env).
+    cap: InboxCap,
+}
+
+/// One stream's observability bookkeeping inside [`Demux`] — see that
+/// type's own doc. `bytes` is the sum of `payload.len()` for every
+/// envelope currently sitting in this stream's `Demux::queues` entry;
+/// frame count is read directly off that `VecDeque`'s own length rather
+/// than duplicated here, so the two can never drift apart.
+#[derive(Default, Clone, Copy)]
+struct StreamMeta {
+    /// Sum of `payload.len()` for every envelope currently queued.
+    bytes: usize,
+    /// Whether [`RecvStream::poll`] has ever been polled for this stream
+    /// at all (parked pending, or immediately ready) — distinguishes
+    /// "nobody has ever tried to consume this stream" from "a consumer
+    /// exists but is lagging."
+    ever_polled: bool,
+    /// Whether a receiver is *currently* parked on this stream (its most
+    /// recent poll returned `Pending` and no frame has arrived/been
+    /// popped since).
+    waker_parked: bool,
+    /// Wall-clock instant of the last successful pop from this stream's
+    /// queue, or `None` if it has never been popped — "never consumed"
+    /// vs. "lagging" is exactly this field being `None` vs. `Some` with
+    /// a large `elapsed()`.
+    last_pop: Option<Instant>,
+}
+
+/// A point-in-time snapshot of one stream's [`Demux`] bookkeeping
+/// ([`ProdEnv::inbox_stats`]) — pure observability, never used to make a
+/// routing/backpressure decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamInboxStats {
+    /// The stream id (ADR 0026) — `0` is `PRIMARY_STREAM` (the control
+    /// plane, or a non-split tablet's CP group on a combined node); a
+    /// nonzero id is a tablet id (`stream = tablet_id`, ADR 0040 Decision
+    /// A) — decoding it further (is this tablet still live, which table)
+    /// needs the replicated `Metadata` this crate doesn't have, so that
+    /// decoding is left to the caller (`animusd`'s admin debug route).
+    pub stream: u64,
+    /// Frames currently queued for this stream.
+    pub frames: usize,
+    /// Payload bytes currently queued for this stream (sum of every
+    /// queued envelope's `payload.len()`).
+    pub bytes: usize,
+    /// Whether a receiver is *currently* parked on this stream.
+    pub waker_parked: bool,
+    /// Whether this stream has ever been polled by a receiver at all.
+    pub ever_polled: bool,
+    /// Milliseconds since this stream's last successful pop, or `None`
+    /// if it has never been popped — "never consumed" vs. "lagging."
+    pub since_last_pop_ms: Option<u64>,
+}
+
+/// A point-in-time snapshot of a [`ProdEnv`]'s whole multiplexed inbox
+/// ([`ProdEnv::inbox_stats`]): aggregate totals across every stream (fed
+/// into `Metric::DemuxQueuedFrames`/`Metric::DemuxQueuedBytes` by
+/// [`Env::refresh_inbox_metrics`](crate::Env::refresh_inbox_metrics)) plus
+/// the largest streams by queued bytes, descending.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InboxStats {
+    /// Total frames queued across every stream this env has ever seen.
+    pub total_frames: usize,
+    /// Total payload bytes queued across every stream this env has ever
+    /// seen — the number that grows unboundedly for a stream nobody
+    /// reads.
+    pub total_bytes: usize,
+    /// The largest streams by `bytes` descending, capped at whatever
+    /// `top_n` [`ProdEnv::inbox_stats`] was called with.
+    pub top_streams: Vec<StreamInboxStats>,
 }
 
 struct Inner {
@@ -271,7 +375,7 @@ impl ProdEnv {
         let metrics = MetricsHandle::recording();
         let (raw_rx, accept_abort) = spawn_accept(listener, tls.clone(), metrics.clone());
         let demux = Arc::new(StdMutex::new(Demux::default()));
-        let pump_abort = spawn_pump(raw_rx, Arc::clone(&demux));
+        let pump_abort = spawn_pump(raw_rx, Arc::clone(&demux), metrics.clone());
 
         let raw = RawFsDisk {
             data_dir,
@@ -449,10 +553,115 @@ impl ProdEnv {
     /// one `name value` line per counter plus the leadership gauge, in stable
     /// order. This is what an integration-level `/metrics` endpoint serves; the
     /// `Env` seam itself does no HTTP. A pure read of the atomic sink.
+    ///
+    /// Refreshes the demux inbox gauges ([`Env::refresh_inbox_metrics`])
+    /// first, so this export always reflects the current queue state
+    /// rather than whatever the last refresh happened to leave behind.
     #[must_use]
     pub fn metrics_text(&self) -> String {
+        self.refresh_inbox_metrics_inner();
         self.inner.metrics.snapshot().to_text()
     }
+
+    /// Replace this env's per-stream inbox backpressure cap (ADR 0026,
+    /// 2026-09-28 inbox-cap amendment) — see [`crate::InboxCap`]'s own doc
+    /// for what it bounds and the default's derivation. Takes effect on the
+    /// very next frame pushed to any stream (`spawn_pump`'s own
+    /// `enforce_inbox_cap` reads it fresh under the same lock each time);
+    /// shrinking it can also evict an already-over-the-new-cap stream's
+    /// oldest frames on that next push, not only newly-arriving ones. Used
+    /// by a test that wants to provoke overflow deterministically without
+    /// sending megabytes of real payload.
+    pub fn set_inbox_cap(&self, cap: InboxCap) {
+        self.inner.demux.lock().expect("demux poisoned").cap = cap;
+    }
+
+    /// This env's current per-stream inbox backpressure cap ([`set_inbox_cap`](Self::set_inbox_cap)).
+    #[must_use]
+    pub fn inbox_cap(&self) -> InboxCap {
+        self.inner.demux.lock().expect("demux poisoned").cap
+    }
+
+    /// A point-in-time snapshot of this env's multiplexed inbox (ADR
+    /// 0026): total queued frames/bytes across every stream this env has
+    /// ever demultiplexed a frame for, plus the `top_n` largest streams by
+    /// queued bytes, descending. A pure read under the `Demux` lock — no
+    /// wall clock beyond a plain `Instant::now()` for the "time since last
+    /// pop" field (this module's own sanctioned real-time boundary, see
+    /// this file's module-level `disallowed_methods` allow), no I/O.
+    ///
+    /// `top_n = 0` skips building/sorting the per-stream list entirely —
+    /// the cheap path [`Env::refresh_inbox_metrics`] uses, since it only
+    /// wants the two totals.
+    #[must_use]
+    pub fn inbox_stats(&self, top_n: usize) -> InboxStats {
+        let d = self.inner.demux.lock().expect("demux poisoned");
+        let (total_frames, total_bytes) = inbox_totals_locked(&d);
+        let mut top_streams = Vec::new();
+        if top_n > 0 {
+            let now = Instant::now();
+            // Union of both maps' keys: a stream can have a `stream_meta`
+            // entry with no `queues` entry (polled but never pushed to —
+            // `RecvStream::poll`'s pending arm never creates a `queues`
+            // entry) or vice versa (pushed to but never yet polled).
+            let mut ids: BTreeSet<u64> = d.queues.keys().copied().collect();
+            ids.extend(d.stream_meta.keys().copied());
+            top_streams = ids
+                .into_iter()
+                .map(|stream| {
+                    let frames = d.queues.get(&stream).map_or(0, VecDeque::len);
+                    let meta = d.stream_meta.get(&stream).copied().unwrap_or_default();
+                    StreamInboxStats {
+                        stream,
+                        frames,
+                        bytes: meta.bytes,
+                        waker_parked: meta.waker_parked,
+                        ever_polled: meta.ever_polled,
+                        since_last_pop_ms: meta.last_pop.map(|t| {
+                            u64::try_from(now.duration_since(t).as_millis()).unwrap_or(u64::MAX)
+                        }),
+                    }
+                })
+                .collect();
+            top_streams.sort_by(|a, b| b.bytes.cmp(&a.bytes).then(a.stream.cmp(&b.stream)));
+            top_streams.truncate(top_n);
+        }
+        InboxStats {
+            total_frames,
+            total_bytes,
+            top_streams,
+        }
+    }
+
+    /// The actual body of [`Env::refresh_inbox_metrics`] — a free inherent
+    /// method (not the trait method itself) so [`metrics_text`](Self::
+    /// metrics_text) above can call it without going through the trait,
+    /// and so the trait impl below can delegate to it the same way
+    /// [`merge_peer`](Self::merge_peer)'s trait impl delegates to its own
+    /// inherent method.
+    fn refresh_inbox_metrics_inner(&self) {
+        let (total_frames, total_bytes) = {
+            let d = self.inner.demux.lock().expect("demux poisoned");
+            inbox_totals_locked(&d)
+        };
+        self.inner
+            .metrics
+            .set(Metric::DemuxQueuedFrames, total_frames as u64);
+        self.inner
+            .metrics
+            .set(Metric::DemuxQueuedBytes, total_bytes as u64);
+    }
+}
+
+/// Sum every stream's queued frame count / byte count under an already-
+/// locked [`Demux`] — `O(distinct streams ever seen)`, never
+/// `O(total frames queued)`, since `stream_meta`'s `bytes` field is
+/// maintained incrementally on push/pop (see that field's own doc)
+/// rather than by summing every envelope's payload length here.
+fn inbox_totals_locked(d: &Demux) -> (usize, usize) {
+    let total_frames = d.queues.values().map(VecDeque::len).sum();
+    let total_bytes = d.stream_meta.values().map(|m| m.bytes).sum();
+    (total_frames, total_bytes)
 }
 
 /// Ensure the parent directory of `path` exists, so opening a file whose name
@@ -549,17 +758,32 @@ async fn read_frames(
 /// `recv_stream` is done with the demux lock dropped first (never wake while
 /// holding a lock another poll might need). Runs until the accept loop's sender
 /// side is dropped (env shutdown).
+///
+/// A frame addressed to a [`Demux::closed`] stream (ADR 0026, 2026-09-28
+/// amendment) is dropped here rather than queued — counted via
+/// [`Metric::DemuxFramesDroppedClosed`] — since nothing will ever `recv` a
+/// closed stream's frames until it is reopened, and queuing them anyway
+/// would just reproduce the exact unbounded-growth defect closing the
+/// stream exists to fix.
 fn spawn_pump(
     mut raw_rx: mpsc::UnboundedReceiver<Envelope>,
     demux: Arc<StdMutex<Demux>>,
+    metrics: MetricsHandle,
 ) -> tokio::task::AbortHandle {
     let handle = tokio::spawn(async move {
         while let Some(env) = raw_rx.recv().await {
             let stream = env.stream;
             let waker = {
                 let mut d = demux.lock().expect("demux poisoned");
-                d.queues.entry(stream).or_default().push_back(env);
-                d.wakers.remove(&stream)
+                if d.closed.contains(&stream) {
+                    metrics.incr(Metric::DemuxFramesDroppedClosed);
+                    None
+                } else {
+                    d.stream_meta.entry(stream).or_default().bytes += env.payload.len();
+                    d.queues.entry(stream).or_default().push_back(env);
+                    enforce_inbox_cap(&mut d, stream, &metrics);
+                    d.wakers.remove(&stream)
+                }
             };
             if let Some(w) = waker {
                 w.wake();
@@ -567,6 +791,47 @@ fn spawn_pump(
         }
     });
     handle.abort_handle()
+}
+
+/// Enforce `d.cap` on `stream` after a push (ADR 0026, 2026-09-28 inbox-cap
+/// amendment): while the stream's queue is over either bound, drop its
+/// **oldest** frame (the front of the `VecDeque` — the newest, just-pushed
+/// frame at the back is never the one evicted) and count it via
+/// [`Metric::DemuxFramesDroppedOverflow`]. A no-op for the overwhelming
+/// majority of pushes (both bounds default far above ordinary traffic —
+/// see [`crate::InboxCap`]'s own doc) and a plain loop rather than a single
+/// `if`, since shrinking `cap` at runtime (`ProdEnv::set_inbox_cap`, what a
+/// test does to provoke overflow at a small scale) can leave a stream more
+/// than one frame over its new cap at once.
+fn enforce_inbox_cap(d: &mut Demux, stream: u64, metrics: &MetricsHandle) {
+    if crate::is_reserved_stream(stream) {
+        // Reserved, per-node streams (PRIMARY_STREAM, and the small block
+        // just below `u64::MAX` — see that function's own doc) never have
+        // this cap's "consumer might never start" liveness gap, and some
+        // legitimately carry a single frame far larger than an ordinary
+        // tablet's own Raft entry — capping them regressed a real
+        // production shape (a forward chase's retry budget exhausted
+        // against spuriously-evicted relay replies) before this exemption
+        // existed.
+        return;
+    }
+    let cap = d.cap;
+    while d
+        .queues
+        .get(&stream)
+        .is_some_and(|q| q.len() > cap.max_frames)
+        || d.stream_meta
+            .get(&stream)
+            .is_some_and(|m| m.bytes > cap.max_bytes)
+    {
+        let Some(dropped) = d.queues.get_mut(&stream).and_then(VecDeque::pop_front) else {
+            break;
+        };
+        if let Some(meta) = d.stream_meta.get_mut(&stream) {
+            meta.bytes = meta.bytes.saturating_sub(dropped.payload.len());
+        }
+        metrics.incr(Metric::DemuxFramesDroppedOverflow);
+    }
 }
 
 /// Future that yields the next message addressed to a node on a given stream
@@ -582,8 +847,16 @@ impl Future for RecvStream {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Envelope> {
         let mut d = self.demux.lock().expect("demux poisoned");
         if let Some(env) = d.queues.get_mut(&self.stream).and_then(VecDeque::pop_front) {
+            let meta = d.stream_meta.entry(self.stream).or_default();
+            meta.bytes = meta.bytes.saturating_sub(env.payload.len());
+            meta.ever_polled = true;
+            meta.waker_parked = false;
+            meta.last_pop = Some(Instant::now());
             Poll::Ready(env)
         } else {
+            let meta = d.stream_meta.entry(self.stream).or_default();
+            meta.ever_polled = true;
+            meta.waker_parked = true;
             d.wakers.insert(self.stream, cx.waker().clone());
             Poll::Pending
         }
@@ -771,11 +1044,41 @@ impl Network for ProdEnv {
     }
 
     async fn recv_stream(&self, stream: u64) -> Envelope {
+        // Reopen (ADR 0026, 2026-09-28 amendment): clear this stream's
+        // closed mark, if any, before ever awaiting — see this trait
+        // method's own doc for why a stream that was never closed is
+        // untouched by this (removing an absent key from a `BTreeSet` is a
+        // no-op) and why this must happen unconditionally on every call,
+        // not just the first, since a caller may `recv_stream` the same
+        // stream many times over its lifetime.
+        {
+            let mut d = self.inner.demux.lock().expect("demux poisoned");
+            d.closed.remove(&stream);
+        }
         RecvStream {
             demux: Arc::clone(&self.inner.demux),
             stream,
         }
         .await
+    }
+
+    fn close_stream(&self, stream: u64) {
+        debug_assert_ne!(
+            stream,
+            crate::PRIMARY_STREAM,
+            "closing PRIMARY_STREAM is never correct — it is the node's own \
+             control-plane/non-split-tablet stream, never a retired tablet's"
+        );
+        // Never wake a parked receiver here: the caller contract (see this
+        // method's own trait doc) is that nothing is still polling this
+        // stream by the time this is called, so any lingering waker belongs
+        // to a task that is already gone — dropping it (not waking it) is
+        // correct either way.
+        let mut d = self.inner.demux.lock().expect("demux poisoned");
+        d.queues.remove(&stream);
+        d.stream_meta.remove(&stream);
+        d.wakers.remove(&stream);
+        d.closed.insert(stream);
     }
 }
 
@@ -2154,6 +2457,12 @@ impl Env for ProdEnv {
     fn merge_peer(&self, id: NodeId, addr: String) {
         ProdEnv::merge_peer(self, id, addr);
     }
+
+    /// Delegates to the inherent `refresh_inbox_metrics_inner` — mirrors
+    /// `merge_peer`'s own delegation shape immediately above.
+    fn refresh_inbox_metrics(&self) {
+        self.refresh_inbox_metrics_inner();
+    }
 }
 
 #[cfg(test)]
@@ -2381,6 +2690,359 @@ mod tests {
             got_y, expected,
             "stream Y must receive exactly its own N frames — isolated from \
              stream X's concurrent traffic to the same (from, to) pair"
+        );
+
+        a.shutdown();
+        b.shutdown();
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    /// Demux inbox observability (ADR 0026 inbox-growth investigation): send
+    /// `N` frames to a stream nobody ever polls, and assert
+    /// [`ProdEnv::inbox_stats`] reports exactly `N` frames / the expected
+    /// total bytes for that stream (and that it has never been popped),
+    /// then pop them one by one and assert both counters decrement back to
+    /// zero and the last-pop time goes from `None` to `Some`. Real loopback
+    /// sockets, two `ProdEnv` instances, mirroring
+    /// `prod_env_multiplexed_streams_do_not_cross_talk`'s own bring-up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn inbox_stats_reports_an_unread_streams_frames_and_bytes_then_drains_on_pop() {
+        use crate::Network;
+
+        const STREAM: u64 = 77;
+        const N: usize = 25;
+        const VALUE_LEN: usize = 40;
+
+        let dir_a = unique_tmp_dir();
+        let dir_b = unique_tmp_dir();
+        let loop0 = || "127.0.0.1:0".parse::<SocketAddr>().unwrap();
+        let (a, a_addr) = ProdEnv::bind(nid(0), loop0(), &dir_a)
+            .await
+            .expect("bind a");
+        let (b, _) = ProdEnv::bind(nid(1), loop0(), &dir_b)
+            .await
+            .expect("bind b");
+        b.set_peers([(nid(0), a_addr.to_string())].into_iter().collect());
+
+        // Send N frames to `a` on `STREAM` without ever polling `recv_stream`
+        // for it — the exact "nobody reads this stream" shape the pump
+        // still queues forever.
+        for i in 0..N {
+            b.send_stream(nid(0), STREAM, vec![i as u8; VALUE_LEN])
+                .await;
+        }
+
+        // The pump is a background task; poll (bounded) until it has filed
+        // every frame rather than asserting on a fixed sleep.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let stats = loop {
+            let stats = a.inbox_stats(10);
+            if stats.total_frames >= N {
+                break stats;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pump never filed all {N} frames for stream {STREAM}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+
+        assert_eq!(stats.total_frames, N);
+        assert_eq!(stats.total_bytes, N * VALUE_LEN);
+        let s = stats
+            .top_streams
+            .iter()
+            .find(|s| s.stream == STREAM)
+            .expect("stream must appear in the top-N view");
+        assert_eq!(s.frames, N);
+        assert_eq!(s.bytes, N * VALUE_LEN);
+        assert!(
+            !s.ever_polled,
+            "never polled — nobody has called recv_stream yet"
+        );
+        assert!(!s.waker_parked);
+        assert_eq!(
+            s.since_last_pop_ms, None,
+            "never popped must report None, not a large elapsed value"
+        );
+
+        // Now pop every frame and confirm both counters drain back to zero.
+        for _ in 0..N {
+            let env = a.recv_stream(STREAM).await;
+            assert_eq!(env.payload.len(), VALUE_LEN);
+        }
+        let after = a.inbox_stats(10);
+        assert_eq!(after.total_frames, 0);
+        assert_eq!(after.total_bytes, 0);
+        let s_after = after
+            .top_streams
+            .iter()
+            .find(|s| s.stream == STREAM)
+            .expect("stream stays in the map even once drained (never pruned by this PR)");
+        assert_eq!(s_after.frames, 0);
+        assert_eq!(s_after.bytes, 0);
+        assert!(s_after.ever_polled);
+        assert!(
+            s_after.since_last_pop_ms.is_some(),
+            "popped at least once — must now report Some(elapsed), not None"
+        );
+
+        a.shutdown();
+        b.shutdown();
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    /// ADR 0026's 2026-09-28 amendment: `close_stream` drops a stream's
+    /// queued frames and marks it closed; a frame arriving afterward is
+    /// discarded and counted (`Metric::DemuxFramesDroppedClosed`), never
+    /// queued; a later `recv_stream` reopens it and delivery resumes. Real
+    /// loopback sockets, two `ProdEnv` instances, mirroring this file's own
+    /// `inbox_stats_reports_an_unread_streams_frames_and_bytes_then_drains_
+    /// on_pop` bring-up. Converged-or-timeout polling throughout — no fixed
+    /// sleeps for frame arrival (the pump is a background task).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn close_stream_drops_queued_frames_and_reopens_on_recv() {
+        use crate::{Env, Metric, Network};
+
+        const STREAM: u64 = 91;
+        const N: usize = 10;
+        const VALUE_LEN: usize = 16;
+
+        let dir_a = unique_tmp_dir();
+        let dir_b = unique_tmp_dir();
+        let loop0 = || "127.0.0.1:0".parse::<SocketAddr>().unwrap();
+        let (a, a_addr) = ProdEnv::bind(nid(0), loop0(), &dir_a)
+            .await
+            .expect("bind a");
+        let (b, _) = ProdEnv::bind(nid(1), loop0(), &dir_b)
+            .await
+            .expect("bind b");
+        b.set_peers([(nid(0), a_addr.to_string())].into_iter().collect());
+
+        // Send N frames to `a` on STREAM and wait (converged-or-timeout, no
+        // fixed sleep) until the pump has filed all of them, unread.
+        for i in 0..N {
+            b.send_stream(nid(0), STREAM, vec![i as u8; VALUE_LEN])
+                .await;
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if a.inbox_stats(0).total_frames >= N {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pump never filed all {N} frames for stream {STREAM}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Close the stream: its queue must drop to zero immediately (no
+        // consumer was ever polling it here, so the caller contract holds).
+        a.close_stream(STREAM);
+        let after_close = a.inbox_stats(0);
+        assert_eq!(
+            after_close.total_frames, 0,
+            "close_stream must drop every already-queued frame"
+        );
+        assert_eq!(after_close.total_bytes, 0);
+
+        // M more frames sent while closed must be dropped-and-counted, never
+        // queued.
+        const M: usize = 4;
+        let before_dropped = a.metrics().get(Metric::DemuxFramesDroppedClosed);
+        for i in 0..M {
+            b.send_stream(nid(0), STREAM, vec![i as u8; VALUE_LEN])
+                .await;
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let dropped = a.metrics().get(Metric::DemuxFramesDroppedClosed) - before_dropped;
+            if dropped >= M as u64 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pump never counted all {M} frames dropped against the closed stream"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            a.inbox_stats(0).total_frames,
+            0,
+            "a frame arriving for a closed stream must never be queued"
+        );
+
+        // recv_stream reopens: a subsequent send must now be delivered and
+        // received normally.
+        //
+        // The receiver is spawned and confirmed genuinely PARKED (via
+        // `inbox_stats`'s `waker_parked`, which only goes true once
+        // `RecvStream::poll`'s pending arm has actually run — after
+        // `recv_stream`'s own reopen already cleared the closed mark)
+        // before `b` ever sends, rather than sending first and calling
+        // `recv_stream` right after: under real OS scheduling (as opposed
+        // to this crate's own single-threaded `SimEnv`), the pump task
+        // filing the frame and this task reaching its own next line race
+        // each other, and a busy host can schedule the pump first — which
+        // would see the stream still marked closed (recv_stream's future
+        // not yet polled) and drop the very frame this test means to
+        // receive, hanging the final `.await` forever. Parking first makes
+        // the ordering deterministic regardless of scheduling.
+        let a2 = a.clone();
+        let recv_task = tokio::spawn(async move { a2.recv_stream(STREAM).await });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let parked = a
+                .inbox_stats(1)
+                .top_streams
+                .iter()
+                .any(|s| s.stream == STREAM && s.waker_parked);
+            if parked {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "recv_stream never parked on the reopened stream"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        b.send_stream(nid(0), STREAM, vec![0xAB; VALUE_LEN]).await;
+        let env = recv_task.await.expect("recv task panicked");
+        assert_eq!(env.payload, vec![0xAB; VALUE_LEN]);
+
+        a.shutdown();
+        b.shutdown();
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    /// ADR 0026's 2026-09-28 inbox-cap amendment: a per-stream byte/frame
+    /// cap, drop-oldest on overflow — the fix for the "consumer never
+    /// started polling at all" leak `close_stream` cannot reach (nothing
+    /// ever calls it for a stream this node never locally hosted). Real
+    /// loopback sockets, two `ProdEnv` instances, mirroring this file's own
+    /// `close_stream_drops_queued_frames_and_reopens_on_recv` bring-up —
+    /// converged-or-timeout polling throughout, no fixed sleeps.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn inbox_cap_drops_oldest_frames_past_the_cap_and_counts_them() {
+        use crate::{Env, InboxCap, Metric, Network};
+
+        const STREAM: u64 = 92;
+        const VALUE_LEN: usize = 100;
+        // A tiny cap so this test never has to send megabytes of real
+        // payload — `set_inbox_cap` is exactly the seam this exists for.
+        const CAP_FRAMES: usize = 5;
+        const N: usize = 20; // well past CAP_FRAMES
+
+        let dir_a = unique_tmp_dir();
+        let dir_b = unique_tmp_dir();
+        let loop0 = || "127.0.0.1:0".parse::<SocketAddr>().unwrap();
+        let (a, a_addr) = ProdEnv::bind(nid(0), loop0(), &dir_a)
+            .await
+            .expect("bind a");
+        let (b, _) = ProdEnv::bind(nid(1), loop0(), &dir_b)
+            .await
+            .expect("bind b");
+        b.set_peers([(nid(0), a_addr.to_string())].into_iter().collect());
+        a.set_inbox_cap(InboxCap {
+            max_bytes: usize::MAX,
+            max_frames: CAP_FRAMES,
+        });
+        assert_eq!(a.inbox_cap().max_frames, CAP_FRAMES);
+
+        // Send N frames to `a` on STREAM without ever polling `recv_stream`
+        // for it — the newest CAP_FRAMES must survive, the rest dropped.
+        //
+        // `send_stream` itself only *schedules* the real write onto its own
+        // spawned task (issue #661 — a slow/unreachable peer must never
+        // delay a different one queued behind it in the same caller loop),
+        // so nothing here guarantees these N sends are written to the wire
+        // in call order under a multi-threaded runtime. This test cares
+        // about **delivery** order (which frame the pump actually files
+        // first), so each iteration waits (converged-or-timeout) for this
+        // exact frame to be accounted for — queued or already evicted —
+        // before sending the next, making the whole sequence deterministic
+        // regardless of the runtime's own scheduling.
+        let before_overflow = a.metrics().get(Metric::DemuxFramesDroppedOverflow);
+        for i in 0..N {
+            b.send_stream(nid(0), STREAM, vec![i as u8; VALUE_LEN])
+                .await;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let accounted = a.inbox_stats(0).total_frames
+                    + (a.metrics().get(Metric::DemuxFramesDroppedOverflow) - before_overflow)
+                        as usize;
+                if accounted > i {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "pump never filed/accounted frame {i} for stream {STREAM}"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        // Queued bytes/frames stay at exactly the cap — never above it, and
+        // the drop-oldest counter matches exactly what overflowed (no
+        // over-counting from the loop above having overshot).
+        let stats = a.inbox_stats(10);
+        assert_eq!(stats.total_frames, CAP_FRAMES);
+        assert_eq!(stats.total_bytes, CAP_FRAMES * VALUE_LEN);
+        assert_eq!(
+            a.metrics().get(Metric::DemuxFramesDroppedOverflow) - before_overflow,
+            (N - CAP_FRAMES) as u64
+        );
+
+        // Newest frames retained (drop-oldest): popping every surviving
+        // frame must yield exactly the LAST CAP_FRAMES payloads sent, in
+        // order, never any of the first N - CAP_FRAMES.
+        for expected in (N - CAP_FRAMES)..N {
+            let env = a.recv_stream(STREAM).await;
+            assert_eq!(
+                env.payload,
+                vec![expected as u8; VALUE_LEN],
+                "drop-oldest must retain the newest frames, in send order"
+            );
+        }
+        assert_eq!(a.inbox_stats(0).total_frames, 0);
+
+        // After close_stream: zero queued, and no growth on further sends
+        // while it stays closed (the cap and the close/reopen mechanism
+        // compose without surprises — closing wins, exactly like
+        // `close_stream_drops_queued_frames_and_reopens_on_recv` proves for
+        // the un-capped case). A small, serialized batch (mirroring that
+        // test's own `M`, waiting for each frame's drop to be counted
+        // before sending the next) rather than another concurrent burst of
+        // `N` — under `cargo test --workspace`-level parallel socket load
+        // a large fire-and-forget burst can individually miss
+        // `SEND_TIMEOUT` and simply never arrive, which is a real
+        // scheduling artifact this test has no need to court twice.
+        a.close_stream(STREAM);
+        const M: usize = 4;
+        let before_closed = a.metrics().get(Metric::DemuxFramesDroppedClosed);
+        for i in 0..M {
+            b.send_stream(nid(0), STREAM, vec![i as u8; VALUE_LEN])
+                .await;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if a.metrics().get(Metric::DemuxFramesDroppedClosed) - before_closed > i as u64 {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "pump never counted frame {i} dropped against the closed stream"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        assert_eq!(
+            a.inbox_stats(0).total_frames,
+            0,
+            "no queued frames while closed, capped or not"
         );
 
         a.shutdown();

@@ -737,6 +737,160 @@ the production implementation; the deterministic implementation lives in
   metrics seam (`Env::metrics()`) uses — extend the trait so nothing existing
   has to change, not by widening every implementor's required surface.
 
+- **`Demux` inbox observability (ADR 0026 inbox-growth investigation,
+  measure-first PR, `animusd` issue: unbounded per-stream growth under
+  sustained splitting).** `Demux` gained a `stream_meta: BTreeMap<u64,
+  StreamMeta>` alongside its pre-existing `queues`/`wakers` — per-stream
+  queued-byte count, whether a receiver has ever polled/is currently
+  parked, and the `Instant` of the last successful pop — maintained
+  incrementally on the exact same push (`spawn_pump`) and pop
+  (`RecvStream::poll`) sites, O(1) per frame, never a scan of `queues`
+  itself. `ProdEnv::inbox_stats(top_n)` (`InboxStats`/`StreamInboxStats`,
+  both `#[cfg(feature = "prod")]`-exported) is the point-in-time snapshot:
+  total queued frames/bytes plus the `top_n` largest streams by bytes.
+  `Env::refresh_inbox_metrics()` (additive default, no-op — the identical
+  `metrics()`/`merge_peer()` shape) recomputes `Metric::
+  DemuxQueuedFrames`/`Metric::DemuxQueuedBytes` (two new **level** gauges,
+  ADR 0015) from that snapshot; `ProdEnv` overrides it, called from
+  `ClientCtx::metrics_text`/`metrics_json` (`animusd`) right before each
+  snapshot rather than on any hot path. `animusd`'s `GET /admin/debug/
+  inboxes` (`AdminHost::debug_inboxes_view`, default body `{"available":
+  false}` for a generic/`SimEnv` host) surfaces the top-N view, decoding a
+  stream id as far as `Metadata` allows (`0` = `PRIMARY_STREAM`; the two
+  other reserved ids, `animus_cp_data::heartbeat_batch::
+  HEARTBEAT_BATCH_STREAM`/`animus_cp_data::backup::BACKUP_SEGMENT_STREAM`;
+  else a `TabletId`, named/stated with its table+state if still in the
+  tablet map, flagged "not in this node's current tablet map" if not).
+  **This PR is measure-only — teardown and a cap are later PRs** (see
+  `docs/lessons/code-patterns/2026-09-28-an-unbounded-per-stream-queue-is-
+  invisible-until-it-has-its-own-observability.md` for what the live
+  measurement found: the growth is a mix of small per-split teardown-
+  timing residue and much larger bursts addressed to a peer whose own
+  consumer never started at all, not one single mechanism).
+
+- **Stream teardown — `Network::close_stream` (ADR 0026, 2026-09-28
+  amendment — the first of the two follow-up PRs the measure-only entry
+  above named).** A required `Network` method (`ProdEnv`/`SimEnv`/every
+  test-double `Network` implementor), fixing the "small per-split
+  teardown-timing residue" half of the live measurement above (the other
+  half — a stream whose consumer never starts polling at all — is a
+  separate cap, a later PR). `close_stream(stream)`: drops the stream's
+  queued frames, its parked receiver's waker, and its bookkeeping
+  (`ProdEnv`'s `StreamMeta` entry), and marks it **closed** in a new
+  `Demux::closed`/`SimState::closed_streams` set. While closed, an
+  arriving frame is discarded and counted
+  (`Metric::DemuxFramesDroppedClosed`, ProdEnv; `SimEnv` traces it as
+  `TraceEvent::Drop { reason: "stream-closed", .. }`) rather than queued —
+  this is the actual fix. `recv_stream(stream)` unconditionally clears the
+  closed mark before ever awaiting, on every call — **reopening** a closed
+  stream, required because a node can be dropped from a tablet's replica
+  set and later re-added, reusing the same stream id (`= tablet_id`). A
+  stream that was **never** closed is completely untouched by any of
+  this — it keeps the pre-existing buffer-before-first-`recv` behavior,
+  which is load-bearing (`animus-cp-data/CLAUDE.md`'s "Deterministic first
+  leader" split-fork mechanism depends on exactly this for a freshly-
+  materialized child's very first `PreVote`) — "not yet opened" and
+  "closed" are deliberately two distinct states, never conflated.
+  Tombstones are bounded by tablets-ever-hosted-and-torn-down, never by
+  traffic, and a restarted process starts with none (`Simulator::crash`/
+  `stop` clear `closed_streams` for the restarting node alongside
+  `inboxes`/`recv_wakers`, mirroring issue #841's existing node-prefix-scan
+  discipline — a fresh `ProdEnv` process needs no equivalent clear, since
+  `Demux` is that process's own in-memory state to begin with). Closing
+  `PRIMARY_STREAM` (or any other reserved stream constant) is
+  `debug_assert`ed against, never silently accepted. Caller contract: only
+  close a stream whose consumer is confirmed stopped — closing one a task
+  might still be `recv_stream`-ing would have that same call's own
+  unconditional reopen silently undo the close. `animus-cp-data`'s
+  `host::Reconciler::teardown` is the one production caller, gated on
+  `RaftKvNode::is_stopped()` — see that crate's own CLAUDE.md entry. See
+  ADR 0026's 2026-09-28 amendment for the full design record (including
+  why an explicit close was chosen over inferring "abandoned" from a
+  liveness heuristic) and
+  `docs/lessons/code-patterns/2026-09-28-an-unread-per-key-inbox-needs-a-
+  consumer-lifecycle-teardown-not-just-a-bound.md` for the generalized
+  lesson.
+
+- **Per-stream inbox cap — `InboxCap` (ADR 0026, 2026-09-28 amendment,
+  second follow-up PR).** `close_stream` above fixes the retired-tablet-
+  residue half of the live measurement that motivated both amendments; it
+  does nothing for the other, larger-magnitude half: a stream whose
+  consumer never started polling at all (a leader replicating to a node
+  before its own reconciler ever calls `start_hosted`, then a rebalance
+  reassigning the replica away before it does — nothing ever locally
+  recognizes this tablet as "this node's business", so `teardown` never
+  runs and `close_stream` is never called). `InboxCap { max_bytes,
+  max_frames }` (this crate's `lib.rs`, unconditional — no `prod` feature
+  needed, since `SimEnv` uses it too) bounds every stream independently:
+  once either bound is exceeded, the **oldest** still-queued frame is
+  dropped to make room for the newest one. Defaults —
+  `DEFAULT_INBOX_STREAM_BYTE_CAP` (8 MiB) / `DEFAULT_INBOX_STREAM_FRAME_CAP`
+  (4096) — are derived, not guessed: see those two constants' own doc
+  comments for the full math (`SNAPSHOT_CHUNK_BYTES`/
+  `MAX_APPEND_ENTRIES_BATCH`/`MAX_ITEM_SIZE_BYTES` bounding the largest
+  legitimate single frame, the live measurement bounding legitimate
+  backlog) and `docs/adr/0026-multiplexed-node-stream-addressing.md`'s
+  "Per-stream inbox cap" amendment for the consumer-classification table
+  proving every consumer here tolerates a dropped frame (Raft resends; a
+  request/response class times out and retries) and for why a **global**
+  (total-across-streams) cap was judged unnecessary on top of this one.
+  **`ProdEnv`**: `Demux` gained a `cap: InboxCap` field (default via
+  `InboxCap::default`), enforced by `spawn_pump`'s own `enforce_inbox_cap`
+  helper on every push, incrementing the new append-only
+  `Metric::DemuxFramesDroppedOverflow` counter per evicted frame;
+  `ProdEnv::set_inbox_cap`/`inbox_cap` are the runtime setter/getter (no
+  change to `bind`'s signature — mirrors `merge_peer`'s own "plain method,
+  not a constructor parameter" shape) so a test can shrink the cap to
+  provoke overflow deterministically at a small scale. **`SimEnv`**: a
+  parallel `inbox_bytes: BTreeMap<(NodeId, u64), usize>` (the `stream_meta.
+  bytes` twin) plus a single global `inbox_cap: InboxCap` field on
+  `SimState`, enforced by a new `SimState::enforce_inbox_cap` method called
+  right after `fire_event`'s `Deliver` arm pushes a frame; `Simulator::
+  set_inbox_cap`/`inbox_cap` are the equivalent setter/getter (one value
+  for the whole simulated world, mirroring `set_net_config`/
+  `set_disk_config`'s own global-default shape, not a per-node override).
+  An eviction is traced as `TraceEvent::Drop { reason: "inbox-overflow",
+  .. }` — the same shape a crashed-node/partitioned-link/closed-stream drop
+  already uses — and draws no RNG and schedules no timeline event, so the
+  byte-identical-trace guarantee is unaffected; `crash`/`stop` clear a
+  restarting node's `inbox_bytes` entries alongside `inboxes`/
+  `recv_wakers` (the same node-prefix-scan discipline, issue #841).
+  **`is_reserved_stream(stream)` (this crate's `lib.rs`) exempts
+  `PRIMARY_STREAM` and a small reserved block of ids just below `u64::MAX`
+  from enforcement entirely** — `enforce_inbox_cap` (both `ProdEnv` and
+  `SimEnv`) returns immediately for them, before touching any queue. This
+  was found necessary, not merely a nice-to-have: an earlier version of
+  this PR capped every stream uniformly, and `cargo test --workspace`
+  caught a real regression in `animusd`'s `sim_cluster_dynamo_page_size_
+  cap` suite — `forward_to_tablet_leader`'s multi-hop leader-chase
+  (`animusd::forwarding`) re-sends a whole forwarded `ClientRequest` (up
+  to DynamoDB's own largest single-call payload) on every hop over
+  `RELAY_STREAM`/the intra wire, and a still-relevant reply from an
+  earlier hop was being evicted by the cap before the chase's own retry
+  budget ran out, producing a real, client-visible `ServiceUnavailable`.
+  Every exempt stream's own consumer is bound to the *node's* lifetime
+  (starts at bind, runs forever), unlike a tablet's own stream, whose
+  consumer is conditional on a reconciler tick hosting that specific
+  tablet — the only class with the "never started" liveness gap this cap
+  exists to bound in the first place; only ordinary per-tablet streams are
+  actually capped. See `docs/adr/0026-multiplexed-node-stream-
+  addressing.md`'s "Per-stream inbox cap" amendment for the full
+  consumer-classification table and the regression's own account.
+  **No `animusd` flag** — both defaults are generous enough for every
+  production shape this codebase drives today (the whole point of deriving
+  them from real frame-size/backlog measurements rather than picking a
+  round number), and a config knob for a value nobody needs to tune yet is
+  a surface to maintain for no benefit; revisit if an operator ever
+  legitimately needs a different cap. Tests: `prod::tests::
+  inbox_cap_drops_oldest_frames_past_the_cap_and_counts_them` (this crate,
+  real loopback sockets) and `animus-sim`'s `tests/inbox_cap.rs` cover the
+  mechanism directly; `animus-cp-data`'s `tests/
+  inbox_overflow_tolerance.rs` is the seed-reproducible, fault-injecting
+  end-to-end proof that a live 3-node Raft group tolerates the loss the cap
+  introduces and still converges and serves a linearizable read afterward
+  (deliberately over an explicit non-reserved stream id via `start_hosted`,
+  not `PRIMARY_STREAM`, since the latter is now cap-exempt).
+
 - **TLS on the intra-node wire (ADR 0064, S-01 step 1) — `tls.rs`, config-gated,
   default off, byte-for-byte unchanged when unconfigured.** `TlsConfig
   {cert_path, key_path, ca_path: Option<PathBuf>}` names three PEM files —

@@ -46,8 +46,8 @@ use std::time::Duration;
 
 use animus_env::handshake::{self, Preamble, ProtocolSpec};
 use animus_env::{
-    BoxFuture, Clock, Disk, Env, Envelope, Nanos, Network, NodeId, PRIMARY_STREAM, Rng as RngTrait,
-    Spawner, UnixMillis,
+    BoxFuture, Clock, Disk, Env, Envelope, InboxCap, Nanos, Network, NodeId, PRIMARY_STREAM,
+    Rng as RngTrait, Spawner, UnixMillis,
 };
 use futures::task::ArcWake;
 use rand::{RngCore, SeedableRng};
@@ -588,6 +588,40 @@ struct SimState {
     // single-stream-per-node inbox.
     inboxes: BTreeMap<(NodeId, u64), VecDeque<Envelope>>,
     recv_wakers: BTreeMap<(NodeId, u64), Waker>,
+    /// Payload bytes currently queued per `(node, stream)`, maintained
+    /// incrementally alongside `inboxes` on the exact same push
+    /// (`fire_event`'s `Deliver` arm)/pop (`Recv::poll`) sites — the
+    /// `SimEnv` twin of `ProdEnv`'s `Demux::stream_meta`'s `bytes` field
+    /// (ADR 0026, 2026-09-28 inbox-cap amendment). Exists solely to enforce
+    /// `inbox_cap` in O(1) per frame rather than summing a `VecDeque` of
+    /// payload lengths on every push; never read for any decision other
+    /// than that cap. An entry with no bytes left is not proactively
+    /// pruned (mirrors `stream_meta` never pruning on empty) — only
+    /// [`SimEnv::close_stream`]/[`Simulator::crash`]/[`Simulator::stop`]
+    /// remove it, alongside `inboxes`/`recv_wakers`.
+    inbox_bytes: BTreeMap<(NodeId, u64), usize>,
+    /// The per-stream inbox backpressure cap enforced at push time (ADR
+    /// 0026, 2026-09-28 inbox-cap amendment) — see [`InboxCap`]'s own doc
+    /// for the derivation. One value for the whole simulated world (mirrors
+    /// `net`/`disk_cfg`'s own global-default shape, not a per-node
+    /// override — nothing in this codebase needs a *different* cap per
+    /// node, only a smaller one for the whole run under test). Defaults to
+    /// [`InboxCap::default`]; [`Simulator::set_inbox_cap`] replaces it.
+    inbox_cap: InboxCap,
+    /// Streams explicitly retired via [`SimEnv::close_stream`] and not yet
+    /// reopened by a subsequent `recv_stream` (ADR 0026, 2026-09-28
+    /// amendment) — the `SimEnv` twin of `ProdEnv`'s `Demux::closed`. A
+    /// frame delivered (`fire_event`'s `Deliver` arm) to a closed `(node,
+    /// stream)` is dropped exactly like a delivery to a crashed node or a
+    /// partitioned link, traced as `TraceEvent::Drop { reason:
+    /// "stream-closed", .. }`. Bounded the same way `Demux::closed` is
+    /// (see that field's own doc): one tombstone per tablet this node has
+    /// ever hosted and torn down, removed the instant `recv_stream` is next
+    /// called for that stream, or when the node crashes/stops (mirroring
+    /// `inboxes`/`recv_wakers`' own per-node-prefix clear — a restarted
+    /// node starts with no tombstones, exactly like a fresh `ProdEnv`
+    /// process).
+    closed_streams: BTreeSet<(NodeId, u64)>,
 
     disks: BTreeMap<(NodeId, String), FileState>,
 
@@ -625,6 +659,75 @@ impl SimState {
             .take_while(|((n, _), _)| n == node)
             .map(|(k, _)| k.clone())
             .collect()
+    }
+
+    /// [`node_prefix_keys`](Self::node_prefix_keys)'s `BTreeSet` twin — same
+    /// prefix-scan shape, for `closed_streams` (a set, not a map). Used by
+    /// [`Simulator::crash`]/[`Simulator::stop`] to clear a restarting node's
+    /// stream-closed tombstones alongside its inbox (issue #841's scan
+    /// pattern, ADR 0026's 2026-09-28 amendment).
+    fn node_prefix_set_keys<K>(set: &BTreeSet<(NodeId, K)>, node: &NodeId) -> Vec<(NodeId, K)>
+    where
+        K: Ord + Clone + Default,
+    {
+        set.range((node.clone(), K::default())..)
+            .take_while(|(n, _)| n == node)
+            .cloned()
+            .collect()
+    }
+
+    /// Enforce `self.inbox_cap` on `(node, stream)`'s queue after a push
+    /// (ADR 0026, 2026-09-28 inbox-cap amendment) — the `SimEnv` mirror of
+    /// `ProdEnv::prod::enforce_inbox_cap`, same drop-oldest semantics: while
+    /// the stream's queue is over either bound, pop its **oldest** frame
+    /// (the just-pushed newest frame is never the one evicted), trace it
+    /// (`TraceEvent::Drop { reason: "inbox-overflow", .. }`, the same shape
+    /// a crashed-node/partitioned-link/closed-stream drop already uses),
+    /// and decrement `inbox_bytes` to match. Draws no RNG and schedules no
+    /// timeline event — a synchronous, deterministic map operation, so this
+    /// does not perturb the byte-identical-trace guarantee any differently
+    /// than any other deterministic bookkeeping step already does. A plain
+    /// loop rather than a single `if` for the same reason `ProdEnv`'s
+    /// sibling is: shrinking `inbox_cap` at runtime
+    /// ([`Simulator::set_inbox_cap`]) can leave a queue more than one frame
+    /// over its new cap at once.
+    fn enforce_inbox_cap(&mut self, node: &NodeId, stream: u64, t: u64) {
+        if animus_env::is_reserved_stream(stream) {
+            // See `animus_env::is_reserved_stream`'s own doc: a reserved,
+            // per-node stream's consumer never has the "might never
+            // start" liveness gap this cap exists to bound, and some
+            // legitimately carry a single frame far larger than an
+            // ordinary tablet's own Raft entry.
+            return;
+        }
+        let cap = self.inbox_cap;
+        let key = (node.clone(), stream);
+        loop {
+            let over_frames = self
+                .inboxes
+                .get(&key)
+                .is_some_and(|q| q.len() > cap.max_frames);
+            let over_bytes = self
+                .inbox_bytes
+                .get(&key)
+                .is_some_and(|&b| b > cap.max_bytes);
+            if !over_frames && !over_bytes {
+                break;
+            }
+            let Some(dropped) = self.inboxes.get_mut(&key).and_then(VecDeque::pop_front) else {
+                break;
+            };
+            if let Some(bytes) = self.inbox_bytes.get_mut(&key) {
+                *bytes = bytes.saturating_sub(dropped.payload.len());
+            }
+            self.trace.push(TraceEvent::Drop {
+                t,
+                from: dropped.from,
+                to: node.clone(),
+                stream,
+                reason: "inbox-overflow",
+            });
+        }
     }
 
     /// The effective network fault/delay model for a message from `from` to
@@ -933,6 +1036,9 @@ impl Simulator {
             nodes: BTreeSet::new(),
             inboxes: BTreeMap::new(),
             recv_wakers: BTreeMap::new(),
+            inbox_bytes: BTreeMap::new(),
+            inbox_cap: InboxCap::default(),
+            closed_streams: BTreeSet::new(),
             disks: BTreeMap::new(),
             partitions: BTreeSet::new(),
             crashed: BTreeSet::new(),
@@ -1012,6 +1118,27 @@ impl Simulator {
     /// healthy).
     pub fn set_disk_config_for(&self, node: NodeId, cfg: DiskConfig) {
         self.shared.lock().node_disk_cfg.insert(node, cfg);
+    }
+
+    /// Replace the per-stream inbox backpressure cap (ADR 0026, 2026-09-28
+    /// inbox-cap amendment) — see [`InboxCap`]'s own doc for what it bounds
+    /// and the default's derivation. One value for the whole simulated
+    /// world (mirrors [`set_net_config`](Self::set_net_config)/
+    /// [`set_disk_config`](Self::set_disk_config)'s own global-default
+    /// shape, not a per-node override). Takes effect on the very next
+    /// frame delivered to any stream; a test shrinks this to provoke
+    /// overflow deterministically without needing to actually send
+    /// megabytes of payload. Deterministic by construction — a plain
+    /// setter, no RNG draw, no new timeline event.
+    pub fn set_inbox_cap(&self, cap: InboxCap) {
+        self.shared.lock().inbox_cap = cap;
+    }
+
+    /// The simulated world's current per-stream inbox backpressure cap
+    /// ([`set_inbox_cap`](Self::set_inbox_cap)).
+    #[must_use]
+    pub fn inbox_cap(&self) -> InboxCap {
+        self.shared.lock().inbox_cap
     }
 
     /// Set `node`'s network-protocol handshake preamble (ADR 0073 Phase 0,
@@ -1213,10 +1340,22 @@ impl Simulator {
             if let Some(inbox) = st.inboxes.get_mut(&k) {
                 inbox.clear();
             }
+            // ADR 0026, 2026-09-28 inbox-cap amendment: the byte-count
+            // bookkeeping the cap reads from is volatile too, exactly like
+            // the inbox it mirrors.
+            st.inbox_bytes.remove(&k);
         }
         let waker_keys = SimState::node_prefix_keys(&st.recv_wakers, &node);
         for k in waker_keys {
             st.recv_wakers.remove(&k);
+        }
+        // A restarted process starts with no stream-closed tombstones,
+        // exactly like a fresh `ProdEnv` (ADR 0026, 2026-09-28 amendment):
+        // `Demux::closed` lives only in that process's own memory, so a
+        // crash (which drops volatile state) must drop these too.
+        let closed_keys = SimState::node_prefix_set_keys(&st.closed_streams, &node);
+        for k in closed_keys {
+            st.closed_streams.remove(&k);
         }
         let (torn, corrupt) = {
             let cfg = st.disk_cfg_for(&node);
@@ -1343,10 +1482,20 @@ impl Simulator {
             if let Some(inbox) = st.inboxes.get_mut(&k) {
                 inbox.clear();
             }
+            // ADR 0026, 2026-09-28 inbox-cap amendment: the byte-count
+            // bookkeeping the cap reads from is volatile too, exactly like
+            // the inbox it mirrors.
+            st.inbox_bytes.remove(&k);
         }
         let waker_keys = SimState::node_prefix_keys(&st.recv_wakers, &node);
         for k in waker_keys {
             st.recv_wakers.remove(&k);
+        }
+        // Mirrors `crash`'s own clear (ADR 0026, 2026-09-28 amendment): a
+        // stopped-then-restarted process starts with no tombstones either.
+        let closed_keys = SimState::node_prefix_set_keys(&st.closed_streams, &node);
+        for k in closed_keys {
+            st.closed_streams.remove(&k);
         }
         let keys = SimState::node_prefix_keys(&st.disks, &node);
         for k in keys {
@@ -1525,6 +1674,31 @@ impl Simulator {
         Nanos(self.shared.lock().clock)
     }
 
+    /// Test/observability accessor: how many frames are currently queued in
+    /// `node`'s inbox for `stream` (ADR 0026, 2026-09-28 amendment) — `0`
+    /// for a stream with no entry at all, exactly like `ProdEnv::
+    /// inbox_stats`'s per-stream `frames` field. Used by fault-injection
+    /// corpora asserting a released tablet's stream ends genuinely empty,
+    /// not merely closed.
+    #[must_use]
+    pub fn inbox_len(&self, node: NodeId, stream: u64) -> usize {
+        self.shared
+            .lock()
+            .inboxes
+            .get(&(node, stream))
+            .map_or(0, VecDeque::len)
+    }
+
+    /// Test/observability accessor: whether `node`'s `stream` is currently
+    /// marked **closed** (ADR 0026, 2026-09-28 amendment) — `true` from the
+    /// moment [`Network::close_stream`] runs until the next
+    /// [`Network::recv_stream`] for the same `(node, stream)` reopens it,
+    /// or the node crashes/stops.
+    #[must_use]
+    pub fn stream_is_closed(&self, node: NodeId, stream: u64) -> bool {
+        self.shared.lock().closed_streams.contains(&(node, stream))
+    }
+
     /// A pure, additive, seed-reproducible measure of how much executor
     /// work this run has done so far — see [`SimStats`]'s own doc. Cheap
     /// (two `Relaxed` atomic loads, no lock); safe to call at any point,
@@ -1691,6 +1865,20 @@ impl Simulator {
                             reason: "crashed",
                         });
                         None
+                    } else if st.closed_streams.contains(&(to.clone(), stream)) {
+                        // ADR 0026, 2026-09-28 amendment: a frame addressed
+                        // to a stream this node has explicitly closed (and
+                        // not yet reopened via `recv_stream`) is discarded
+                        // rather than queued — the `SimEnv` mirror of
+                        // `ProdEnv`'s `Demux`-closed drop in `spawn_pump`.
+                        st.trace.push(TraceEvent::Drop {
+                            t,
+                            from,
+                            to,
+                            stream,
+                            reason: "stream-closed",
+                        });
+                        None
                     } else if st.partitions.contains(&(from.clone(), to.clone())) {
                         st.trace.push(TraceEvent::Drop {
                             t,
@@ -1738,10 +1926,10 @@ impl Simulator {
                             stream,
                             len,
                         });
-                        st.inboxes
-                            .entry((to.clone(), stream))
-                            .or_default()
-                            .push_back(env);
+                        let key = (to.clone(), stream);
+                        *st.inbox_bytes.entry(key.clone()).or_insert(0) += len;
+                        st.inboxes.entry(key).or_default().push_back(env);
+                        st.enforce_inbox_cap(&to, stream, t);
                         st.recv_wakers.remove(&(to, stream))
                     }
                 }
@@ -1941,12 +2129,40 @@ impl Network for SimEnv {
     }
 
     async fn recv_stream(&self, stream: u64) -> Envelope {
+        // Reopen (ADR 0026, 2026-09-28 amendment): mirrors `ProdEnv::
+        // recv_stream`'s own reopen exactly — clear this stream's closed
+        // mark, if any, before ever awaiting. A never-closed stream is
+        // untouched (removing an absent key is a no-op), preserving the
+        // load-bearing buffer-before-first-`recv` behavior.
+        {
+            let mut st = self.shared.lock();
+            st.closed_streams.remove(&(self.node_id.clone(), stream));
+        }
         Recv {
             shared: Arc::clone(&self.shared),
             node: self.node_id.clone(),
             stream,
         }
         .await
+    }
+
+    fn close_stream(&self, stream: u64) {
+        debug_assert_ne!(
+            stream,
+            crate::PRIMARY_STREAM,
+            "closing PRIMARY_STREAM is never correct — it is the node's own \
+             control-plane/non-split-tablet stream, never a retired tablet's"
+        );
+        let key = (self.node_id.clone(), stream);
+        let mut st = self.shared.lock();
+        // Never wake a parked receiver here — see `Network::close_stream`'s
+        // own doc: the caller contract is that nothing is still polling
+        // this stream, so any lingering waker belongs to a task that is
+        // already gone.
+        st.inboxes.remove(&key);
+        st.recv_wakers.remove(&key);
+        st.inbox_bytes.remove(&key);
+        st.closed_streams.insert(key);
     }
 }
 
@@ -2239,6 +2455,9 @@ impl Future for Recv {
         let mut st = self.shared.lock();
         let key = (self.node.clone(), self.stream);
         if let Some(env) = st.inboxes.get_mut(&key).and_then(VecDeque::pop_front) {
+            if let Some(bytes) = st.inbox_bytes.get_mut(&key) {
+                *bytes = bytes.saturating_sub(env.payload.len());
+            }
             Poll::Ready(env)
         } else {
             st.recv_wakers.insert(key, cx.waker().clone());

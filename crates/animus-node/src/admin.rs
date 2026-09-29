@@ -78,6 +78,7 @@ pub async fn dispatch<H: AdminHost + ?Sized>(
         ("GET", "/admin/ttl") => (200, host.ttl_view().await),
         ("GET", "/admin/gc") => (200, host.gc_view().await),
         ("GET", "/admin/segment-store") => (200, host.segment_store_view().await),
+        ("GET", "/admin/debug/inboxes") => (200, host.debug_inboxes_view().await),
         // A known admin path with the wrong verb vs. an unknown path.
         ("GET" | "POST", p) if p.starts_with("/admin/") => (
             404,
