@@ -3935,6 +3935,33 @@ mod stream_sealer_tests {
             assert_eq!(decoded.header.hlc_range, row.hlc_range);
             assert!(row.object_id.starts_with("backup/pitr/"));
 
+            // ADR 0073 Phase 0 E: a sealed PITR object is the segment codec's
+            // own output, so it carries that codec's format tag (magic, then
+            // the version byte) — never a version of its own. Compared
+            // against `segment::VERSION`, not a literal, so this holds
+            // across Workstream C's reset of that constant.
+            assert_eq!(
+                &bytes[..4],
+                b"SEGF",
+                "PITR object leads with the segment magic"
+            );
+            assert_eq!(
+                bytes[4],
+                animus_cp_data::segment::VERSION,
+                "PITR object carries the segment codec's current version byte"
+            );
+            // The restore replay path (`backup_restore`) reads it back through
+            // `decode_and_slice`; it must accept the writer's own bytes...
+            animus_cp_data::segment::decode_and_slice(&bytes, row.hlc_range)
+                .expect("restore read path decodes the writer's own object");
+            // ...and refuse (not silently accept) a future version byte.
+            let mut future = bytes.clone();
+            future[4] = animus_cp_data::segment::VERSION + 1;
+            assert!(
+                animus_cp_data::segment::decode_and_slice(&future, row.hlc_range).is_err(),
+                "a future-version PITR object must be a loud decode error"
+            );
+
             // The initial burst's own records now carry full images (this
             // table's PITR enablement puts it on `table_change_records_
             // carry_images`'s gate), which are large enough that the burst
@@ -5125,5 +5152,52 @@ mod stream_sealer_tests {
         })
         .await
         .expect("did not converge in time");
+    }
+
+    /// Workstream C's golden segment fixture (`segment/v1.bin`, ADR 0073) must
+    /// decode through the exact call PITR restore replay uses. The bytes are
+    /// embedded, never rewritten: this reads the fixture, it does not own it.
+    #[test]
+    fn c_segment_golden_fixture_decodes_through_pitr_restore_path() {
+        use animus_cp_data::segment;
+
+        const FIXTURE: &[u8] =
+            include_bytes!("../../animus-cp-data/tests/fixtures/formats/segment/v1.bin");
+
+        assert_eq!(
+            &FIXTURE[..4],
+            b"SEGF",
+            "fixture leads with the segment magic"
+        );
+        assert_eq!(FIXTURE[4], 1, "fixture is the v1 baseline");
+        assert_eq!(FIXTURE[4], segment::VERSION, "v1 is the current version");
+
+        let decoded = segment::decode(FIXTURE).expect("golden fixture decodes");
+        // Structural fields C's `format_fixtures.rs` asserts for v1.
+        assert_eq!(decoded.header.count as usize, decoded.records.len());
+        assert_eq!(
+            decoded.header.parent_shard_id.as_deref(),
+            Some("shardId-42-2")
+        );
+        assert_eq!(decoded.header.shard_id, segment::shard_id(42, 3));
+        assert_eq!(decoded.header.table, "orders-\u{00e9}");
+        assert_eq!((decoded.header.tablet, decoded.header.epoch), (42, 3));
+        assert_eq!(decoded.records.len(), 5, "fixture holds five records");
+        let keys: Vec<_> = decoded
+            .records
+            .iter()
+            .map(|r| (r.packed_hlc, r.ordinal))
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted, "records are in (packed_hlc, ordinal) order");
+        assert_eq!(decoded.records[1].change_record, Vec::<u8>::new());
+
+        // The restore replay path: slicing to the segment's own committed
+        // range keeps every record.
+        let (header, sliced) = segment::decode_and_slice(FIXTURE, decoded.header.hlc_range)
+            .expect("restore read path decodes the golden fixture");
+        assert_eq!(header, decoded.header);
+        assert_eq!(sliced, decoded.records);
     }
 }
