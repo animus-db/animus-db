@@ -2675,6 +2675,23 @@ disambiguation is needed.
   itself can partially fail) to clean up a case that is already safe to leave
   alone.
 
+## Versioned formats (ADR 0073 Phase 0)
+
+The shared convention (magic + `u8` version, loud named `FormatError`s,
+`tests/fixtures/formats/<format>/v<N>.bin` golden fixtures that are
+append-only per `scripts/check-format-fixtures.sh`, a directory-iterating
+decode test, a round-trip test, an `#[ignore]`d generator that refuses to
+overwrite) lives in `animus-control`'s `format.rs` — see its
+"Versioned formats (ADR 0073 Phase 0)" section. This crate's fixtures and
+tests are all in `tests/format_fixtures.rs`; new formats add a section there.
+
+- **`segment` v1** (`segment.rs`, magic `SEGF`, `VERSION = 1`): the
+  stream-shard segment object, also reused by backup/PITR/export objects.
+  `SegmentError` is `FormatError` (`PreBaselineFormat` for no/foreign magic,
+  `UnsupportedFormatVersion` for `0`/future, `Malformed` for framing damage).
+  Fixture: `tests/fixtures/formats/segment/v1.bin`. A layout change is a new
+  `VERSION` plus a new fixture file — never an edit to `v1.bin`.
+
 ## Tests
 
 `cargo test -p animus-cp-data`. All but two of the 29 test binaries drive

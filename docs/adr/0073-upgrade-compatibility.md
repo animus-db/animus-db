@@ -654,6 +654,27 @@ directly. Golden fixture: `tests/fixtures/formats/metadata/v1.json` (a
 `docs/lessons/code-patterns/`. See `crates/animus-control/CLAUDE.md`'s
 "Versioned formats" section for the full account.
 
+**Workstream C as-built (2026-09-29), layer 1 — segment codec.**
+`crates/animus-cp-data/src/segment.rs`'s `VERSION` is reset 2 → 1 (magic
+`SEGF` unchanged; the baseline layout is the one with the per-record
+`ordinal`, issue #852). The codec had no legacy decode branches — an
+unrecognised version was already a hard error — so the reset is the counter
+plus the error type: `SegmentError` (formerly a plain `String`) is now
+`animus_control::format::FormatError`, so a missing/foreign magic (or input
+too short to hold `magic + version`) is `PreBaselineFormat { format:
+"segment" }`, a version of `0` or above `VERSION` is
+`UnsupportedFormatVersion { format: "segment", found, max_supported }`, and
+any other framing damage (truncation, trailing bytes, `shard_id`
+mismatch, bad presence flag) is `Malformed { format, detail }`. Every
+existing caller only `Display`s the error, so none changed. Golden
+fixture `crates/animus-cp-data/tests/fixtures/formats/segment/v1.bin`
+(decode + structural asserts, decode-then-encode round-trip, an
+`#[ignore]`d refuse-to-overwrite generator) lives in
+`crates/animus-cp-data/tests/format_fixtures.rs`, the file the later
+workstream C layers (RaftKV codec, `SharedWal` envelope, key-layout marker)
+extend. Backup/PITR/export segment objects reuse this codec unchanged, so
+they inherit the reset; workstream E confirms rather than re-versions.
+
 ## Testing
 
 Every phase must stay provable under ADR 0003's determinism guarantee, the
