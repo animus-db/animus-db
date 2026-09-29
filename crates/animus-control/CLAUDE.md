@@ -1771,6 +1771,35 @@ freezes that type's absent-field semantics once merged.**
     `Metadata`, or a snapshot path silently sends nothing and a
     "no snapshot" assertion passes vacuously).
 
+- **A declined `InstallSnapshot` offer must resolve on the leader
+  (`handle_install_snapshot_resp`, found live 2026-09-29, pre-existing).**
+  A receiver that refuses an offer as redundant replies `last_index: 0,
+  next_offset: 0` on purpose (never the shape of a completed install, PR
+  #1048), and *nothing on the leader used to act on it*: `next_index` — reset
+  to 1 by a `needs_snapshot` echo whose `snapshot_served_through` lagged a
+  base that had since moved — stayed at 1, so the leader re-offered chunk 0
+  on every heartbeat forever, the reply handler's `snapshot_offset.entry(..)
+  .or_insert(0)` left a phantom in-flight entry (which the driver reads as
+  "defer compaction", then counts a `CpSnapshotTransferRestarts` every
+  `COMPACT_DEFER_IDLE_CEILING` at zero write rate), and the follower got no
+  entries. The fix keys on the unambiguous shape: `(0, 0)` answering a chunk
+  at **offset 0** (an accepting receiver always buffers it and reports
+  `next_offset > 0`; a receiver that lost its buffer only ever reports `0` to
+  a chunk at a *nonzero* offset) means the receiver holds state through the
+  offer's base (`snapshot_offer_base`, written at each send), so
+  `match_index`/`next_index`/`snapshot_served_through` advance to it and the
+  transfer is forgotten. Two gotchas: (1) the sender may resend the offset-0
+  chunk up to `SNAPSHOT_ACK_RESEND_CAP` times before its first ack, so a
+  *duplicate* refusal arrives after the first was handled — it must not
+  re-create the phantom entry (the second guard); (2) a bare-core test needs
+  its message delivery to take **a tick per hop**, not run to a fixpoint —
+  with `needs_snapshot` set, a leader's `AppendEntries` and the follower's
+  acks legitimately ping-pong at RTT rate while its engine digests, which a
+  recursive pump reads as a storm. Regression:
+  `tests/declined_snapshot_offer.rs` (red without the fix on every seed;
+  note the absent third voter is *legitimately* re-offered a snapshot
+  forever, so count only offers to the live peer).
+
 - **Leadership transfer (`RaftCore::transfer_leadership`, ADR 0029).**
   Originally a per-tablet CP-data primitive living here because the sync
   core is shared, described in an earlier revision of this note as
