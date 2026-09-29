@@ -139,9 +139,11 @@ fn leader_among(nodes: &[KvNode]) -> Option<usize> {
 /// production default (64).
 const TEST_EMERGENCY_CEILING: u64 = 200;
 
-/// The learner's own disk round-trip cost — one simulated fsync per
-/// RECEIVED message, however many entries that message carries (batching
-/// amortizes this the same way a real WAL does).
+/// The learner's own disk round-trip cost — the sim applies it to every
+/// `append` and every `sync`, and a persist round is ONE append + ONE sync
+/// however many entries the received message carries (issue #1092: it used
+/// to be one append per record, i.e. ~10 s for a 512-entry batch, which this
+/// file's own final-quarter window could not tell apart from a stall).
 const LEARNER_SYNC_DELAY: Duration = Duration::from_millis(20);
 
 /// Writes issued synchronously (no yield) per warm-up burst, and the
@@ -454,6 +456,21 @@ fn assert_late_join_converges_while_writing(seed: u64) {
 #[test]
 fn a_late_joining_learner_converges_despite_needing_a_multi_chunk_install_snapshot_issue_1064() {
     assert_late_join_converges_while_writing(BASE_LATE_JOIN_SEED);
+}
+
+/// Issue #1092: the corpus's second seed (`splitmix64(BASE ^ 1)`) used to
+/// fail the final-quarter progress assert at depth 2 — deterministically, not
+/// flakily. Root cause was not this file's protocol mechanism at all: the
+/// learner's WAL persist round for one 512-entry `AppendEntries` batch cost
+/// one disk latency PER RECORD (`persist_wal` appended record by record; a
+/// `SimEnv` `sync_delay` applies to every `append`), ~10 s of virtual time,
+/// longer than the run's final quarter (7.5 s) — the learner's ack (correctly
+/// held until durable) simply had not been released yet. `persist_wal` now
+/// coalesces a round into one append (`wal_round_single_append.rs` is the
+/// mechanism-level regression); this pins the exact failing seed.
+#[test]
+fn a_late_joining_learner_converges_at_the_issue_1092_seed() {
+    assert_late_join_converges_while_writing(0xfa2b_71bc_5313_f78c);
 }
 
 /// A small, fixed-quality mixing hash (splitmix64) — deliberately NOT the
