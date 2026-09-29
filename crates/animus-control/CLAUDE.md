@@ -1658,6 +1658,32 @@ refuses-to-overwrite discipline as `control-wal`'s.
     `log_ok`. `learner_promotion_leader_crash.rs`'s
     `promoted_candidate_wins_election_after_leader_dies_right_after_commit` is
     the standing guard against adding one back.
+  - **Two silence bounds, not one (2026-09-29 live check).** A departing
+    peer is dropped after `DEPARTING_NOTICE_GIVE_UP` (5 min) of silence from
+    its last reply — unless it is on the **short** bound,
+    `DEPARTING_QUIET_GIVE_UP` (30s): `departing_quiet` holds peers that
+    already **acked** their notice and peers **inherited** at
+    `become_leader`. Both are overwhelmingly peers that have *left* (their
+    host released the replica), and a released replica can never reply, so
+    the long bound just spent five minutes of frames per removal at a closed
+    stream (and every leadership change re-armed it for every removal still
+    in the retained log). Any reply resets the clock (`note_departing_reply`),
+    so a live peer is unaffected, and a peer cut off early is still told by
+    its own campaign (`stranger_notice`). Do not collapse the two into one
+    constant without re-reading why a leader's own just-made, unanswered
+    removal keeps the long one. `departing_quiet` is pruned wherever
+    `departing` shrinks (`drop_departing`, the config-change retain,
+    `become_leader`).
+  - **`RaftCore::removal_stats()` (`RemovalStats`)** are lifetime counters the
+    core keeps as plain facts (`notices_sent`/`notices_acked`/
+    `notices_ignored`/`departing_dropped`); the CP-data driver emits the
+    deltas as `Metric::CpRemovalNoticesSent`/`Acked`/`Ignored`/
+    `CpDepartingPeersDropped`. An ack from a peer **not** in `departing`
+    answers a `stranger_notice` and counts as acked (the first draft filed
+    those as ignored, which made `ignored == sent` on nodes that saw
+    not-yet-added joiners campaign); `ignored` is a peer-side notice that
+    failed a guard, or a leader-side ack covering nothing awaited
+    (`removal_index == 0`, or below the awaited entry).
   - `ships_before_durable` lists both new variants (no vote, no durable
     state). Tests: `tests/removal_notice.rs` (bare-core harness — note it
     must emulate the driver's snapshot-image build for the `DRIVER_APPLIED`

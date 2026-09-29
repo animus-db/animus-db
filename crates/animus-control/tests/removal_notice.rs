@@ -20,7 +20,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
 
 use animus_control::{
-    DEPARTING_NOTICE_GIVE_UP, MetaCommand, Metadata, ProposeResult, RaftCore, RaftMsg, Role,
+    DEPARTING_NOTICE_GIVE_UP, DEPARTING_QUIET_GIVE_UP, MetaCommand, Metadata, ProposeResult,
+    RaftCore, RaftMsg, Role,
 };
 use animus_env::{Nanos, NodeId, nid};
 
@@ -85,6 +86,10 @@ struct Net {
     /// send still gets through): isolates what the LEADER does on its own
     /// from the receiver-initiated reply to a returning campaigner.
     no_campaign: BTreeSet<NodeId>,
+    /// Nodes that never receive an `AppendEntries` (everything else gets
+    /// through): lets a peer be told of its removal by a notice alone while
+    /// the log could otherwise have served it.
+    no_append_to: BTreeSet<NodeId>,
     seed: u64,
     ctr: u64,
     log: Vec<Sent>,
@@ -99,6 +104,7 @@ impl Net {
             cut: BTreeSet::new(),
             down: BTreeSet::new(),
             no_campaign: BTreeSet::new(),
+            no_append_to: BTreeSet::new(),
             seed,
             ctr: 0,
             log: Vec::new(),
@@ -158,6 +164,7 @@ impl Net {
     fn heal_all(&mut self) {
         self.cut.clear();
         self.no_campaign.clear();
+        self.no_append_to.clear();
     }
 
     fn crash(&mut self, id: u64) {
@@ -196,6 +203,7 @@ impl Net {
             });
             if (self.no_campaign.contains(&f)
                 && matches!(m, RaftMsg::PreVote { .. } | RaftMsg::RequestVote { .. }))
+                || (self.no_append_to.contains(&to) && matches!(m, RaftMsg::AppendEntries { .. }))
                 || self.cut.contains(&(f.clone(), to.clone()))
                 || self.down.contains(&f)
                 || self.down.contains(&to)
@@ -943,4 +951,203 @@ fn a_reachable_departing_peer_learns_through_the_log_and_is_dropped() {
     );
     assert_eq!(net.count_after(mark, v, "Removed"), 0, "no notice needed");
     assert_eq!(net.count_after(mark, v, "InstallSnapshot"), 0);
+}
+
+// ---------------------------------------------------------------------------
+// (e) a departing peer that acked its notice and then LEFT stops being
+//     addressed after the short acked-silence bound (found live: the leader
+//     kept sending to the released replica's closed stream for the whole
+//     five-minute give-up, per removal, re-armed by every leadership change)
+// ---------------------------------------------------------------------------
+
+fn scenario_acked_then_released(seed: u64) {
+    let ids = [0u64, 1, 2];
+    let mut net = Net::new(seed, &ids);
+    let l = net.elect();
+    let v = a_follower(l, &ids);
+
+    // v misses its own removal, and the log (uncompacted) could still serve it.
+    net.write(l, 5);
+    net.isolate(v);
+    net.remove_voter(l, v);
+    net.step(Duration::from_millis(500));
+    for _ in 0..10 {
+        net.write(l, 5);
+        net.step(Duration::from_millis(50));
+    }
+    assert!(
+        net.core(l).departing_peers().contains(&nid(v)),
+        "seed={seed:#x}: precondition — the unreachable removed peer is departing"
+    );
+
+    // v comes back able to campaign and to be told, but never receives the
+    // removing entry itself: its election timer's pre-vote is answered with the
+    // notice (`stranger_notice`), which it acks — with the log still able to
+    // serve it, so the leader keeps it in `departing` (now marked acked).
+    net.heal_all();
+    net.no_append_to.insert(nid(v));
+    let mut acked = false;
+    for _ in 0..200 {
+        net.step(Duration::from_millis(50));
+        if net.core(l).removal_stats().notices_acked >= 1 {
+            acked = true;
+            break;
+        }
+    }
+    assert!(acked, "seed={seed:#x}: the peer must ack the notice");
+    assert!(
+        net.core(v).removed_by_leader(),
+        "seed={seed:#x}: the peer recorded its removal"
+    );
+    assert!(
+        net.core(l).departing_peers().contains(&nid(v)),
+        "seed={seed:#x}: the log can still serve the peer, so it stays owed the entry"
+    );
+    let acked_at = net
+        .log
+        .iter()
+        .filter(|s| s.kind == "RemovedAck" && s.from == nid(v))
+        .map(|s| s.at.0)
+        .max()
+        .expect("an ack was sent");
+
+    // The peer's host now releases the replica: it can never reply again.
+    net.isolate(v);
+    let bound = DEPARTING_QUIET_GIVE_UP.as_nanos() as u64;
+    let slack = Duration::from_secs(5).as_nanos() as u64;
+    net.step(DEPARTING_QUIET_GIVE_UP + Duration::from_secs(40));
+
+    assert!(
+        net.core(l).departing_peers().is_empty(),
+        "seed={seed:#x}: a peer that acked and went silent must be dropped after the acked bound, \
+         not held for the full {}s",
+        DEPARTING_NOTICE_GIVE_UP.as_secs()
+    );
+    let last_to_v = net
+        .log
+        .iter()
+        .filter(|s| s.to == nid(v) && s.at.0 > acked_at)
+        .map(|s| s.at.0)
+        .max();
+    if let Some(last) = last_to_v {
+        assert!(
+            last <= acked_at + bound + slack,
+            "seed={seed:#x}: the leader was still addressing the released peer {}ms after its \
+             ack (bound {}ms) — every such frame lands on a closed replica stream",
+            (last - acked_at) / 1_000_000,
+            bound / 1_000_000
+        );
+    }
+
+    // The counters tell the story.
+    let st = net.core(l).removal_stats();
+    assert!(st.notices_sent >= 1, "seed={seed:#x}: {st:?}");
+    assert_eq!(st.notices_acked, 1, "seed={seed:#x}: {st:?}");
+    assert_eq!(st.departing_dropped, 1, "seed={seed:#x}: {st:?}");
+
+    // Liveness of the group is untouched.
+    net.write(l, 3);
+    net.step(Duration::from_millis(500));
+    let c = net.core(l);
+    assert_eq!(c.commit_index(), c.last_log_index(), "seed={seed:#x}");
+}
+
+#[test]
+fn a_departing_peer_that_acked_and_left_stops_being_addressed() {
+    scenario_acked_then_released(seed_from_env(0x1061_5001));
+}
+
+#[test]
+fn a_departing_peer_that_acked_and_left_corpus() {
+    if std::env::var("ANIMUS_SEED").is_ok() {
+        return;
+    }
+    for i in 0..8u64 {
+        scenario_acked_then_released(0x1061_5100 + i);
+    }
+}
+
+/// The other half: a peer a NEW leader merely *inherits* as departing
+/// (`become_leader`'s re-derivation from its own log) is, in practice, one that
+/// left long ago — the previous leader finished (or gave up on) it, its replica
+/// is released — yet the re-derivation used to re-arm the full five-minute
+/// schedule of frames at a closed stream on every leadership change.
+fn scenario_inherited_departing_peer_that_never_answers(seed: u64) {
+    let ids = [0u64, 1, 2, 3];
+    let mut net = Net::new(seed, &ids);
+    let l = net.elect();
+    let v = a_follower(l, &ids);
+
+    net.write(l, 5);
+    net.isolate(v); // v never hears anything again: it has left
+    net.remove_voter(l, v);
+    net.step(Duration::from_millis(500));
+    for _ in 0..6 {
+        net.write(l, 5);
+        net.step(Duration::from_millis(50));
+    }
+
+    // The leader dies; a survivor takes over and re-derives v from the log.
+    net.crash(l);
+    let mut new_leader = None;
+    for _ in 0..200 {
+        net.step(Duration::from_millis(50));
+        if let Some(n) = net.leader() {
+            new_leader = Some(n);
+            break;
+        }
+    }
+    let nl = new_leader.unwrap_or_else(|| panic!("seed={seed:#x}: no new leader"));
+    net.step(Duration::from_millis(500));
+    assert!(
+        net.core(nl).departing_peers().contains(&nid(v)),
+        "seed={seed:#x}: precondition — the new leader must have re-derived the removed peer"
+    );
+    let took_over = net.now;
+
+    net.step(DEPARTING_QUIET_GIVE_UP + Duration::from_secs(40));
+    assert!(
+        net.core(nl).departing_peers().is_empty(),
+        "seed={seed:#x}: an inherited departing peer that never answers must be dropped on the \
+         short bound, not held for the full {}s",
+        DEPARTING_NOTICE_GIVE_UP.as_secs()
+    );
+    let bound = DEPARTING_QUIET_GIVE_UP.as_nanos() as u64;
+    let slack = Duration::from_secs(5).as_nanos() as u64;
+    if let Some(last) = net
+        .log
+        .iter()
+        .filter(|s| s.from == nid(nl) && s.to == nid(v))
+        .map(|s| s.at.0)
+        .max()
+    {
+        assert!(
+            last <= took_over + bound + slack,
+            "seed={seed:#x}: the new leader was still addressing the departed peer {}ms after \
+             taking over (bound {}ms)",
+            (last.saturating_sub(took_over)) / 1_000_000,
+            bound / 1_000_000
+        );
+    }
+    assert_eq!(
+        net.core(nl).removal_stats().departing_dropped,
+        1,
+        "seed={seed:#x}: {:?}",
+        net.core(nl).removal_stats()
+    );
+}
+
+#[test]
+fn an_inherited_departing_peer_that_never_answers_is_dropped_on_the_short_bound() {
+    scenario_inherited_departing_peer_that_never_answers(seed_from_env(0x1061_6001));
+}
+
+#[test]
+fn an_inherited_departing_peer_that_never_answers_corpus() {
+    if std::env::var("ANIMUS_SEED").is_ok() {
+        return;
+    }
+    for i in 0..8u64 {
+        scenario_inherited_departing_peer_that_never_answers(0x1061_6100 + i);
+    }
 }

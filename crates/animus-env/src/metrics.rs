@@ -907,12 +907,36 @@ pub enum Metric {
     /// never-hosted-consumer case this cap exists to bound rather than let
     /// grow without limit.
     DemuxFramesDroppedOverflow,
+
+    // --- Issue #1061 removal notice (ADR 0058's 2026-09-28/29 amendments) ---
+    // Appended after the handshake variants above (same slot-stability
+    // discipline). Folded in by the CP-data driver from `RaftCore::
+    // removal_stats()` deltas, so a live operator can see the notice
+    // schedule working — the first live check of the notice had no way to
+    // tell whether notices were being sent, acked, or discarded.
+    /// A leader emitted a removal notice (`RaftMsg::Removed`) — to a
+    /// departing peer whose log could not serve it, or in reply to a
+    /// returning stranger's pre-vote/vote.
+    CpRemovalNoticesSent,
+    /// A leader received a `RemovedAck` that counts: one covering the
+    /// removing entry it was waiting on, or one answering a notice it sent a
+    /// non-member in reply to that non-member's campaign.
+    CpRemovalNoticesAcked,
+    /// A removal notice or ack was discarded as stale: a peer-side notice
+    /// that failed a guard (older term, we lead/are a member, or not later
+    /// than our own latest self-membership), or a leader-side ack that did
+    /// not cover the entry awaited.
+    CpRemovalNoticesIgnored,
+    /// A leader stopped serving a departing peer (acked with an unservable
+    /// log, caught up past the removing entry, or silent past its give-up
+    /// bound) — the end of that peer's removal schedule.
+    CpDepartingPeersDropped,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 104] = [
+    pub const ALL: [Metric; 108] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -1017,6 +1041,10 @@ impl Metric {
         Metric::DemuxQueuedBytes,
         Metric::DemuxFramesDroppedClosed,
         Metric::DemuxFramesDroppedOverflow,
+        Metric::CpRemovalNoticesSent,
+        Metric::CpRemovalNoticesAcked,
+        Metric::CpRemovalNoticesIgnored,
+        Metric::CpDepartingPeersDropped,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -1128,6 +1156,10 @@ impl Metric {
             Metric::DemuxQueuedBytes => "demux_queued_bytes",
             Metric::DemuxFramesDroppedClosed => "demux_frames_dropped_closed",
             Metric::DemuxFramesDroppedOverflow => "demux_frames_dropped_overflow",
+            Metric::CpRemovalNoticesSent => "cp_removal_notices_sent",
+            Metric::CpRemovalNoticesAcked => "cp_removal_notices_acked",
+            Metric::CpRemovalNoticesIgnored => "cp_removal_notices_ignored",
+            Metric::CpDepartingPeersDropped => "cp_departing_peers_dropped",
         }
     }
 

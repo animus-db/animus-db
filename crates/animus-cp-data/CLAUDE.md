@@ -1632,6 +1632,22 @@ DynamoDB-wire and real-`LsmEngine` regressions this fix also carries.
   `tests/departing_removal_notice.rs` (a reconciler-hosted replica left behind
   the compacted log by a continuous writer: zero snapshot ships/restarts,
   told, not released while `Metadata` lists it, released once it does).
+- **Removal-notice observability (issue #1061 follow-up).** `drive`'s
+  per-iteration core read also takes `RaftCore::removal_stats()` and
+  `record_removal_stats` emits the growth as `Metric::CpRemovalNoticesSent`/
+  `CpRemovalNoticesAcked`/`CpRemovalNoticesIgnored`/`CpDepartingPeersDropped`
+  (`cp_removal_notices_sent`/`_acked`/`_ignored`, `cp_departing_peers_dropped`
+  in `/admin/metrics`) — a per-node sink, like every other `Cp*` counter.
+  `RaftKvNode::departing_peers()` and `snapshot_transfer_peers()` are the
+  pure accessors `/admin/raftkv` surfaces as `departing` /
+  `snapshot_transfer_peers` (leader-only, empty on an idle converged group; a
+  group that keeps a peer in the second at zero write rate is re-offering an
+  image the peer declines — `animus-control/CLAUDE.md`'s "declined offer"
+  entry). A `CpSnapshotTransferRestarts` increment is **not** proof that a
+  transfer restarted: `apply_and_compact` counts it whenever the idle
+  ceiling overrides an in-flight transfer, and the compaction that follows
+  can still no-op (clamped by a peer's `match_index` via `compaction_floor`),
+  which is exactly how the declined-offer livelock inflated it every 2s.
 - **`plan` never removes a tablet from `LocalState::hosted` on its own**
   when emitting a fallible teardown (`Reclaim`/`Release`) — real teardown
   is async and can time out. The caller calls

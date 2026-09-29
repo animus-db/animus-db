@@ -4847,6 +4847,17 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         self.lock().departing_peers()
     }
 
+    /// The peers this replica, while leading, currently has a chunked
+    /// `InstallSnapshot` transfer in flight to — see
+    /// [`RaftCore::snapshot_transfer_peers`]. Empty on a non-leader and on
+    /// an idle group. A pure accessor (never wakes a quiesced group): the
+    /// `/admin/raftkv` view surfaces it so a group that can never finish a
+    /// transfer (a re-offered image that is declined every couple of
+    /// seconds) is attributable to a peer without a debugger.
+    pub fn snapshot_transfer_peers(&self) -> BTreeSet<NodeId> {
+        self.lock().snapshot_transfer_peers()
+    }
+
     /// Whether learner `id` is caught up closely enough to the leader's own
     /// log to be a promotion candidate — see
     /// [`RaftCore::learner_caught_up`]. A pure predicate; it does not itself
@@ -7278,6 +7289,34 @@ fn record_reconfigure(metrics: &MetricsHandle, result: ProposeResult) -> Propose
         ProposeResult::NotLeader { .. } => metrics.incr(Metric::CpReconfigureRejected),
     }
     result
+}
+
+/// Emit the growth of a core's [`animus_control::RemovalStats`] since the
+/// previous reading as `Metric::CpRemoval*`/`CpDepartingPeersDropped` (issue
+/// #1061 observability). A reading that went *backwards* (the core was
+/// replaced) counts from zero.
+fn record_removal_stats(
+    metrics: &MetricsHandle,
+    prev: animus_control::RemovalStats,
+    now: animus_control::RemovalStats,
+) {
+    let delta = |prev: u64, now: u64| now.saturating_sub(if now < prev { 0 } else { prev });
+    metrics.incr_by(
+        Metric::CpRemovalNoticesSent,
+        delta(prev.notices_sent, now.notices_sent),
+    );
+    metrics.incr_by(
+        Metric::CpRemovalNoticesAcked,
+        delta(prev.notices_acked, now.notices_acked),
+    );
+    metrics.incr_by(
+        Metric::CpRemovalNoticesIgnored,
+        delta(prev.notices_ignored, now.notices_ignored),
+    );
+    metrics.incr_by(
+        Metric::CpDepartingPeersDropped,
+        delta(prev.departing_dropped, now.departing_dropped),
+    );
 }
 
 /// Record the snapshot-shipping + replication-traffic metrics implied by the
@@ -11489,6 +11528,9 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
     // doc for the two reverted attempts whose watermarks were sampled outside
     // the lock hold that produced the mutation.
     let mut persist_fut: Option<PersistFut<'_>> = None;
+    // Issue #1061 observability: the previous `RaftCore::removal_stats()` reading,
+    // so each loop pass emits only the growth as metrics.
+    let mut last_removal_stats = animus_control::RemovalStats::default();
     let mut gated = GatedOuts::default();
 
     // ADR 0058 Train 2 rung 4: the deterministic first-leader mechanism.
@@ -11947,12 +11989,24 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             persist_fut = None;
         }
 
-        let (after_commit, install_pending, is_quiesced_now) = {
+        let (after_commit, install_pending, is_quiesced_now, removal_stats) = {
             let c = core.lock().expect("raftkv core poisoned");
-            (c.commit_index(), c.has_pending_install(), c.is_quiesced())
+            (
+                c.commit_index(),
+                c.has_pending_install(),
+                c.is_quiesced(),
+                c.removal_stats(),
+            )
         };
         if after_commit > before_commit {
             metrics.incr_by(Metric::CpCommits, after_commit - before_commit);
+        }
+        // Issue #1061 observability: fold the core's lifetime removal-notice
+        // counters into the metrics sink as deltas (the core is sync and
+        // I/O-free, so it only keeps the facts).
+        if removal_stats != last_removal_stats {
+            record_removal_stats(&metrics, last_removal_stats, removal_stats);
+            last_removal_stats = removal_stats;
         }
         // ADR 0044 phase-1 PR7: count every genuine quiesced/ticking
         // transition this loop iteration observed — `was_quiesced` was
