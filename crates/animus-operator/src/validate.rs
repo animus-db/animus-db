@@ -25,7 +25,7 @@
 //! outage). Live checks stay exactly where they already were, in the
 //! reconciler, with their own condition-based fallback.
 
-use crate::crd::AnimusClusterSpec;
+use crate::crd::{AnimusClusterSpec, CONTENT_SCHEMA_VERSION, SPEC_FORMAT};
 
 /// One rule this spec failed, naming the field it's about (a JSON-pointer-
 /// ish dotted path, `spec.foo`/`spec.foo.bar` — not necessarily a single
@@ -42,6 +42,34 @@ pub struct Violation {
 impl std::fmt::Display for Violation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}: {}", self.field, self.message)
+    }
+}
+
+/// `spec.schemaVersion` must be in `1..=`[`CONTENT_SCHEMA_VERSION`] (ADR 0073
+/// Phase 0 E). `0` and a version newer than this operator understands are
+/// both refused, with a message naming the format and the way out.
+#[must_use]
+pub fn validate_schema_version(new: &AnimusClusterSpec) -> Option<Violation> {
+    let v = new.schema_version;
+    if v == 0 {
+        Some(Violation {
+            field: "spec.schemaVersion",
+            message: format!(
+                "{SPEC_FORMAT} schemaVersion 0 is invalid; set schemaVersion: \
+                 {CONTENT_SCHEMA_VERSION}"
+            ),
+        })
+    } else if v > CONTENT_SCHEMA_VERSION {
+        Some(Violation {
+            field: "spec.schemaVersion",
+            message: format!(
+                "{SPEC_FORMAT} schemaVersion {v} unsupported (this operator supports up to \
+                 {CONTENT_SCHEMA_VERSION}); upgrade the operator or set schemaVersion: \
+                 {CONTENT_SCHEMA_VERSION}"
+            ),
+        })
+    } else {
+        None
     }
 }
 
@@ -174,6 +202,8 @@ pub fn validate_ephemeral_voters(new: &AnimusClusterSpec) -> Option<Violation> {
 /// the grow-only rule, the previous spec) — the full rule list, run by both
 /// the reconciler and the webhook:
 ///
+/// - `spec.schemaVersion` is in `1..=CONTENT_SCHEMA_VERSION`
+///   ([`validate_schema_version`]).
 /// - `spec.nodes >= 1` ([`validate_nodes`]).
 /// - `spec.controlNodes` (resolved) is `>= 1` and `<= spec.nodes`
 ///   ([`validate_control_nodes_within_nodes`]).
@@ -203,6 +233,7 @@ pub fn validate_spec(
 ) -> Result<(), Vec<Violation>> {
     let mut violations = Vec::new();
 
+    violations.extend(validate_schema_version(new));
     violations.extend(validate_nodes(new));
     violations.extend(validate_control_nodes_within_nodes(new));
     if let Some(old) = old {
@@ -256,6 +287,35 @@ mod tests {
             control_nodes,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn schema_version_zero_and_future_are_violations_with_named_messages() {
+        let mut spec = base_spec(3, None);
+        spec.schema_version = 0;
+        let v = validate_schema_version(&spec).expect("0 is invalid");
+        assert_eq!(v.field, "spec.schemaVersion");
+        assert_eq!(
+            v.message,
+            "animuscluster-spec schemaVersion 0 is invalid; set schemaVersion: 1"
+        );
+        assert!(validate_spec(None, &spec).is_err());
+
+        spec.schema_version = 2;
+        let v = validate_schema_version(&spec).expect("2 is unsupported");
+        assert_eq!(
+            v.message,
+            "animuscluster-spec schemaVersion 2 unsupported (this operator supports up to 1); \
+             upgrade the operator or set schemaVersion: 1"
+        );
+        let all = validate_spec(None, &spec).unwrap_err();
+        assert!(
+            all.iter().any(|x| x.field == "spec.schemaVersion"),
+            "{all:?}"
+        );
+
+        spec.schema_version = 1;
+        assert_eq!(validate_schema_version(&spec), None);
     }
 
     #[test]

@@ -265,6 +265,22 @@ spec:
                 required:
                 - credentialsSecretName
                 type: object
+              schemaVersion:
+                description: |-
+                  The internal content-schema version of this spec (ADR 0073 Phase 0,
+                  Workstream E) — **distinct from the Kubernetes API version**
+                  (`v1alpha1`, which stays): that one names the CRD's served API shape,
+                  this one names the meaning of the spec's *content*, so a future
+                  operator can tell an old CR from a new one without guessing. Required,
+                  with **no serde default** — a CR that omits it is rejected by the API
+                  server's structural schema (it is listed under `required:`) and, for
+                  anything that bypasses that, by serde at decode. Must be in
+                  `1..=`[`CONTENT_SCHEMA_VERSION`] (`crate::validate::
+                  validate_schema_version`); `0` and a version this operator does not
+                  know are refused by both the webhook and the reconciler.
+                format: uint32
+                minimum: 1.0
+                type: integer
               segmentStore:
                 description: |-
                   The **non-S3** `--segment-store` value for every combined-role pod
@@ -393,6 +409,7 @@ spec:
                 type: object
             required:
             - nodes
+            - schemaVersion
             type: object
           status:
             description: '`AnimusCluster.status`.'

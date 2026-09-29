@@ -1520,6 +1520,7 @@ metadata:
   name: ${AC_NAME}
   namespace: ${NAMESPACE}
 spec:
+  schemaVersion: 1
   image: ${AC_IMAGE}
   nodes: 3
   controlNodes: 3

@@ -316,8 +316,17 @@ impl ClientServiceSpec {
     }
 }
 
+/// The `AnimusCluster.spec` content-schema version this operator writes and
+/// the highest one it reads (ADR 0073 Phase 0, Workstream E). Not the
+/// Kubernetes API version (`v1alpha1`).
+pub const CONTENT_SCHEMA_VERSION: u32 = 1;
+
+/// Format name used in `schemaVersion` rejection messages and the golden
+/// fixture directory (`tests/fixtures/formats/animuscluster-spec/`).
+pub const SPEC_FORMAT: &str = "animuscluster-spec";
+
 /// `AnimusCluster.spec` — the desired state of one AnimusDB cluster.
-#[derive(CustomResource, Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(CustomResource, Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[kube(
     group = "animusdb.io",
     version = "v1alpha1",
@@ -329,6 +338,19 @@ impl ClientServiceSpec {
 )]
 #[serde(rename_all = "camelCase")]
 pub struct AnimusClusterSpec {
+    /// The internal content-schema version of this spec (ADR 0073 Phase 0,
+    /// Workstream E) — **distinct from the Kubernetes API version**
+    /// (`v1alpha1`, which stays): that one names the CRD's served API shape,
+    /// this one names the meaning of the spec's *content*, so a future
+    /// operator can tell an old CR from a new one without guessing. Required,
+    /// with **no serde default** — a CR that omits it is rejected by the API
+    /// server's structural schema (it is listed under `required:`) and, for
+    /// anything that bypasses that, by serde at decode. Must be in
+    /// `1..=`[`CONTENT_SCHEMA_VERSION`] (`crate::validate::
+    /// validate_schema_version`); `0` and a version this operator does not
+    /// know are refused by both the webhook and the reconciler.
+    #[schemars(range(min = 1))]
+    pub schema_version: u32,
     /// The `animusd` container image. Defaults to
     /// [`DEFAULT_IMAGE`](Self::DEFAULT_IMAGE) when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -472,6 +494,32 @@ pub struct AnimusClusterSpec {
     /// nothing else about the pod template would otherwise change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption_key_secret_name: Option<String>,
+}
+
+impl Default for AnimusClusterSpec {
+    /// Every field at its zero/`None` value except `schema_version`, which
+    /// is the current [`CONTENT_SCHEMA_VERSION`] (a `0` default would be an
+    /// instantly-invalid spec).
+    fn default() -> Self {
+        Self {
+            schema_version: CONTENT_SCHEMA_VERSION,
+            image: None,
+            nodes: 0,
+            control_nodes: None,
+            storage: StorageSpec::default(),
+            resources: None,
+            base_port: None,
+            client_service: ClientServiceSpec::default(),
+            quiesce_after_secs: None,
+            auto_split_bytes: None,
+            dynamo_auth_secret_name: None,
+            tls: None,
+            s3: None,
+            backup_store: None,
+            segment_store: None,
+            encryption_key_secret_name: None,
+        }
+    }
 }
 
 impl AnimusClusterSpec {
@@ -789,6 +837,14 @@ pub const CONDITION_ENCRYPTION_KEY_SECRET_INVALID: &str = "EncryptionKeySecretIn
 /// the webhook installed should never actually observe this condition,
 /// since the webhook rejects the write before it is ever persisted.
 pub const CONDITION_NODES_SPEC_INVALID: &str = "NodesSpecInvalid";
+/// Condition type name used when `spec.schemaVersion` is `0` or newer than
+/// [`CONTENT_SCHEMA_VERSION`] (ADR 0073 Phase 0 E,
+/// `crate::validate::validate_schema_version`). Like
+/// [`CONDITION_EPHEMERAL_VOTER_STORAGE_REJECTED`] this is "refuse": the
+/// reconciler returns before applying any child resource (a spec whose
+/// content this operator cannot interpret must not be partially applied)
+/// and waits for a spec change rather than backing off.
+pub const CONDITION_SCHEMA_VERSION_INVALID: &str = "SchemaVersionInvalid";
 
 #[cfg(test)]
 mod tests {

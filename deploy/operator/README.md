@@ -30,6 +30,12 @@ kubectl get animuscluster example -o wide
 
 ## Example manifest
 
+Every `AnimusCluster` must set `spec.schemaVersion: 1` (ADR 0073) — the
+spec's internal content-schema version, distinct from the `v1alpha1` API
+version. The CRD requires it, and an unsupported value (`0`, or newer than
+the running operator supports) is rejected by the admission webhook, or
+surfaced as a `SchemaVersionInvalid` condition without it.
+
 See [`example.yaml`](example.yaml) — a 3-node combined-role cluster (every
 pod runs both the control and data role, `controlNodes` defaulting to
 `min(3, nodes)`), durable 10Gi storage, and the default `ClusterIP` client
