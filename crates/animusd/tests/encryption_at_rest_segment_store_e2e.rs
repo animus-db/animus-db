@@ -252,6 +252,7 @@ async fn bring_up_cluster(
             })
             .collect();
         let config = ClusterConfig {
+            version: animusd::config::CLUSTER_CONFIG_VERSION,
             nodes: nodes_cfg,
             dynamo_auth: None,
             cluster_settings: None,
@@ -399,6 +400,7 @@ async fn a_node_with_a_different_key_against_the_same_backup_store_is_refused_at
     // shared backup-store directory, under a DIFFERENT key.
     let addrs = support::free_addrs(6);
     let second_cfg = ClusterConfig {
+        version: animusd::config::CLUSTER_CONFIG_VERSION,
         nodes: vec![RoleAddrs {
             id: animusd::config::node_id(0),
             role: animusd::config::NodeRole::Both,
@@ -450,6 +452,7 @@ async fn a_key_against_an_existing_plaintext_backup_store_is_refused_at_startup(
     let key_path = write_key_file(tmp.path(), "late-key.hex", 0x64);
     let addrs = support::free_addrs(6);
     let keyed_cfg = ClusterConfig {
+        version: animusd::config::CLUSTER_CONFIG_VERSION,
         nodes: vec![RoleAddrs {
             id: animusd::config::node_id(0),
             role: animusd::config::NodeRole::Both,

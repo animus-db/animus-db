@@ -44,6 +44,7 @@ async fn bring_up(dir: &Path) -> (Node, ClusterConfig) {
     for attempt in 0..10 {
         let addrs = support::free_addrs(6);
         let config = ClusterConfig {
+            version: animusd::config::CLUSTER_CONFIG_VERSION,
             nodes: vec![RoleAddrs {
                 id: animusd::config::node_id(0),
                 role: NodeRole::Both,

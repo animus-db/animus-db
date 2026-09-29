@@ -180,6 +180,7 @@ async fn bring_up_split_durable(
             })
             .collect();
         let config = ClusterConfig {
+            version: animusd::config::CLUSTER_CONFIG_VERSION,
             nodes: nodes_cfg,
             dynamo_auth: None,
             cluster_settings: None,

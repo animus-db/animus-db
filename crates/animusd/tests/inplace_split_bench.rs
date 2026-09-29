@@ -61,6 +61,7 @@ async fn bring_up_inplace(n: usize, dir: &std::path::Path) -> (Vec<Node>, Cluste
             })
             .collect();
         let config = ClusterConfig {
+            version: animusd::config::CLUSTER_CONFIG_VERSION,
             nodes: nodes_cfg,
             dynamo_auth: None,
             cluster_settings: None,

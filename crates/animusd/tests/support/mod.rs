@@ -309,6 +309,7 @@ pub async fn start_single_node(dir: &Path, backend: StorageBackend) -> (Node, Cl
         .await
         .unwrap_or_else(|e| panic!("start_single_node: bind failed: {e}"));
     let config = ClusterConfig {
+        version: animusd::config::CLUSTER_CONFIG_VERSION,
         nodes: vec![bound_role_addrs(&bound)],
         dynamo_auth: None,
         cluster_settings: None,
@@ -394,6 +395,7 @@ pub async fn bring_up_deadline(
             bounds.push(bound);
         }
         let config = ClusterConfig {
+            version: animusd::config::CLUSTER_CONFIG_VERSION,
             nodes: bounds.iter().map(bound_role_addrs).collect(),
             dynamo_auth: None,
             cluster_settings: None,
@@ -510,6 +512,7 @@ pub async fn bring_up_deadline_tls(
             bounds.push(bound);
         }
         let config = ClusterConfig {
+            version: animusd::config::CLUSTER_CONFIG_VERSION,
             nodes: bounds
                 .iter()
                 .enumerate()
@@ -570,6 +573,7 @@ pub async fn grow_deadline(
             });
         }
         let expanded = ClusterConfig {
+            version: animusd::config::CLUSTER_CONFIG_VERSION,
             nodes: nodes_cfg,
             dynamo_auth: None,
             cluster_settings: None,
@@ -897,6 +901,7 @@ pub async fn bring_up_split(
             })
             .collect();
         let config = ClusterConfig {
+            version: animusd::config::CLUSTER_CONFIG_VERSION,
             nodes: nodes_cfg,
             dynamo_auth: None,
             cluster_settings: None,

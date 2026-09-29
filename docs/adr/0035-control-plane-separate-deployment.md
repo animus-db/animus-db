@@ -497,3 +497,16 @@ intra:4, console:5}`. The console-binding rule (combined and data-only
 bind it, control-only does not) is unaffected; only the numbering from
 `admin` onward shifts down by one slot. See ADR 0047's and ADR 0052's own
 matching amendment notes for the full before/after port table.
+
+## Amendment (2026-09-29, ADR 0073 Phase 0 Workstream E)
+
+`ClusterConfig` (the JSON config file this ADR's `role` split lives in) now
+carries a required top-level `"v": 1` (`animusd::config::
+CLUSTER_CONFIG_VERSION`), with no serde default. `ClusterConfig::from_json`
+checks it first: a missing `"v"` is `FormatError::PreBaselineFormat
+{ format: "cluster-config" }` and `"v": 0` or a future value is
+`FormatError::UnsupportedFormatVersion`, both surfaced by name at the CLI
+(`parsing cluster.json: cluster-config: ...`). `animusd gen-config` and the
+operator's generated `cluster.json` emit `"v": 1`; a hand-written config
+written before this change needs `"v": 1` added. The per-field
+`#[serde(default)]` additivity described above is unchanged.

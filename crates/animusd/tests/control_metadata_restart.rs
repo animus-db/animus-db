@@ -62,6 +62,7 @@ async fn await_leader_only(node: &Node) {
 /// restart can rebind the exact same addresses).
 async fn start_control(addrs: animusd::RoleAddrs, dir: &std::path::Path) -> Node {
     let config = animusd::ClusterConfig {
+        version: animusd::config::CLUSTER_CONFIG_VERSION,
         nodes: vec![addrs],
         dynamo_auth: None,
         cluster_settings: None,

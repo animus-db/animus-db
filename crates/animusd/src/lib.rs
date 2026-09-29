@@ -18173,6 +18173,7 @@ mod confirm_futility_tests {
     fn single_node_config() -> ClusterConfig {
         let addrs = free_addrs(6);
         ClusterConfig {
+            version: crate::config::CLUSTER_CONFIG_VERSION,
             nodes: vec![RoleAddrs {
                 id: crate::config::node_id(0),
                 role: NodeRole::Both,
@@ -18428,6 +18429,7 @@ mod forward_transport_failure_tests {
             })
             .collect();
         ClusterConfig {
+            version: crate::config::CLUSTER_CONFIG_VERSION,
             nodes,
             dynamo_auth: None,
             cluster_settings: None,
@@ -18810,6 +18812,7 @@ mod forward_hop_timeout_tests {
             })
             .collect();
         ClusterConfig {
+            version: crate::config::CLUSTER_CONFIG_VERSION,
             nodes,
             dynamo_auth: None,
             cluster_settings: None,
@@ -19638,6 +19641,7 @@ mod client_cancellation_tests {
             })
             .collect();
         ClusterConfig {
+            version: crate::config::CLUSTER_CONFIG_VERSION,
             nodes,
             dynamo_auth: None,
             cluster_settings: None,
@@ -19985,6 +19989,7 @@ mod halted_shutdown_tests {
     fn single_node_config() -> ClusterConfig {
         let addrs = free_addrs(6);
         ClusterConfig {
+            version: crate::config::CLUSTER_CONFIG_VERSION,
             nodes: vec![RoleAddrs {
                 id: crate::config::node_id(0),
                 role: NodeRole::Both,
@@ -22080,6 +22085,7 @@ mod issue_298_conflict_tests {
     fn single_node_config() -> ClusterConfig {
         let addrs = free_addrs(6);
         ClusterConfig {
+            version: crate::config::CLUSTER_CONFIG_VERSION,
             nodes: vec![RoleAddrs {
                 id: crate::config::node_id(0),
                 role: NodeRole::Both,

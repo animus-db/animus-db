@@ -173,6 +173,7 @@ async fn bring_up_with(
             encryption_key_path: encryption_key_path.clone(),
         };
         let config = animusd::ClusterConfig {
+            version: animusd::config::CLUSTER_CONFIG_VERSION,
             nodes: vec![node_cfg],
             dynamo_auth: None,
             cluster_settings: None,

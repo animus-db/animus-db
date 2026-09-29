@@ -27,6 +27,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::crd::AnimusClusterSpec;
 
+/// Mirrors `animusd::config::CLUSTER_CONFIG_VERSION` (this crate does not
+/// depend on `animusd`; a test in `animusd` cannot see this, so bump both).
+pub const CLUSTER_CONFIG_VERSION: u32 = 1;
+
 /// Port offsets from `base_port` (ADR 0047 stride, current post-ADR-0053
 /// shape — six ports, no `cql`): `internal:0, client:1, dynamo:2, admin:3,
 /// intra:4, console:5`.
@@ -169,6 +173,13 @@ impl ClusterSettings {
 /// field of the same name — see [`ClusterSettings`]'s own doc.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClusterConfig {
+    /// Mirrors `animusd::config::ClusterConfig::version` (`"v"`, ADR 0073
+    /// Phase 0 Workstream E) — required by `animusd`, so always emitted.
+    /// `#[serde(default)]` only so this crate can still *read back* a
+    /// pre-`"v"` ConfigMap it applied earlier (`controller::
+    /// previous_applied_control_nodes`); it never writes one.
+    #[serde(rename = "v", default)]
+    pub version: u32,
     pub nodes: Vec<RoleAddrs>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster_settings: Option<ClusterSettings>,
@@ -232,6 +243,7 @@ pub fn build_cluster_config(name: &str, ns: &str, spec: &AnimusClusterSpec) -> C
         .collect();
 
     ClusterConfig {
+        version: CLUSTER_CONFIG_VERSION,
         nodes,
         cluster_settings: cluster_settings_or_none(spec),
     }
@@ -535,6 +547,7 @@ mod tests {
         let cfg = build_cluster_config("c", "ns", &spec(3));
         let value: serde_json::Value = serde_json::from_str(&to_json(&cfg)).unwrap();
         let expected = serde_json::json!({
+            "v": 1,
             "nodes": [
                 {
                     "id": "c-0",

@@ -180,7 +180,10 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
   edit — nothing here will fail to compile if it drifts, only the generated
   `ConfigMap` will fail to parse (or silently mean something different) at
   container start. Grep `crates/animusd/CLAUDE.md`'s config.rs entry before
-  touching either side.
+  touching either side. **`"v"` (ADR 0073 Phase 0 E)**: `animusd` requires a
+  top-level `"v"`; the mirror's `version`/`CLUSTER_CONFIG_VERSION` must be
+  bumped with `animusd::config::CLUSTER_CONFIG_VERSION`. (The mirror's own
+  field is `#[serde(default)]` solely to read back a pre-`"v"` ConfigMap.)
 - **No per-pod port striding, unlike `animusd::config::ClusterConfig::
   generate`.** `animusd`'s own bare-metal/dev generator stripes ports
   across nodes (`base_port + 6*i + offset`) because several node processes

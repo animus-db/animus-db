@@ -83,6 +83,7 @@ async fn bring_up_named(
     loop {
         let addrs = support::free_addrs(n * 6);
         let config = ClusterConfig {
+            version: animusd::config::CLUSTER_CONFIG_VERSION,
             nodes: (0..n).map(|i| named_role_addrs(name, i, &addrs)).collect(),
             dynamo_auth: None,
             cluster_settings: None,
