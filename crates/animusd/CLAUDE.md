@@ -2979,7 +2979,7 @@ real-socket `ProdEnv` test, since `forwarding.rs` carries the same hard
 rebinds the deterministic first-guess replica's own former intra address
 and accepts every connection but never writes a reply, proving the fixed
 chase recovers via a live replica in a few seconds rather than dead-ending
-near the full `CLIENT_TIMEOUT`. **Its victim must be a non-leader (#1080):** a killed leader's re-election can outlast the 2s guess hop, adding the last-resort hinted retry of the stub, so one chase legitimately costs `FORWARD_HOP_TIMEOUT + HINTED_FORWARD_HOP_TIMEOUT` = 8s; the test transfers leadership away from `replicas[0]` first and derives its bounds from the constants. See `docs/engineering-lessons.md`'s
+near the full `CLIENT_TIMEOUT`. **Its victim must be a non-leader (#1080):** a killed leader's re-election can outlast the 2s guess hop, adding the last-resort hinted retry of the stub, so one chase legitimately costs `FORWARD_HOP_TIMEOUT + HINTED_FORWARD_HOP_TIMEOUT` = 8s, and starvation-driven election churn after the kill can cause it even with a follower victim; the test transfers leadership away from `replicas[0]` first (requiring a 1s-stable non-victim leader), asserts the outcome (`Ok(())`) plus a floor (`elapsed >= FORWARD_HOP_TIMEOUT`), and deliberately has no ceiling — a bound equal to the sum of caps is zero margin. See `docs/engineering-lessons.md`'s
 matching Testing entry for the general lesson (a hint-chasing forward's
 per-candidate timeout must be a bounded slice of the overall deadline,
 never the whole remaining budget). **This specific test still can't move

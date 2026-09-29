@@ -2581,9 +2581,12 @@ const FORWARD_HOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// (`resolve_forward_candidate`'s case 3), to re-dialling that same
 /// candidate as a *hinted* one — so one chase pass legitimately costs
 /// `FORWARD_HOP_TIMEOUT + HINTED_FORWARD_HOP_TIMEOUT` (2s + 6s = 8s), not
-/// just one cap. Any test bound over a forward chase must be derived from
-/// that sum, and its own outer `timeout` from the call's deadline
-/// ([`SCHEMA_COMMIT_TIMEOUT`]/[`CLIENT_TIMEOUT`]), never from a magic number.
+/// just one cap, and each `WaitElection` round can add further hops, all
+/// bounded only by the call's own deadline. A test must therefore assert the
+/// call's *outcome* (plus, if useful, a floor); a ceiling equal to the sum of
+/// caps is zero margin, and its own outer `timeout` must derive from the
+/// call's deadline ([`SCHEMA_COMMIT_TIMEOUT`]/[`CLIENT_TIMEOUT`]), never a
+/// magic number.
 const HINTED_FORWARD_HOP_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// **Issue #950.** How long [`ClientCtx::cp_route`] trusts its OWN, purely
@@ -18758,15 +18761,30 @@ mod forward_hop_timeout_tests {
         // and, if it is the victim, transfer leadership to `replicas[1]`.
         let follower_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         let mut transfer_armed = false;
+        // The leader must also be *stable*: the same single non-victim node
+        // observed continuously for `STABLE_FOR`, so a starved follower that
+        // is about to time out and win an election (CPU contention) is not
+        // mistaken for a settled group.
+        const STABLE_FOR: Duration = Duration::from_secs(1);
+        let mut stable_since: Option<(usize, tokio::time::Instant)> = None;
         loop {
             let leaders: Vec<usize> = replica_leaders(&nodes, &replicas, tablet);
             if leaders.len() == 1 && leaders[0] != victim {
-                break;
+                match stable_since {
+                    Some((l, since)) if l == leaders[0] => {
+                        if since.elapsed() >= STABLE_FOR {
+                            break;
+                        }
+                    }
+                    _ => stable_since = Some((leaders[0], tokio::time::Instant::now())),
+                }
+            } else {
+                stable_since = None;
             }
             assert!(
                 tokio::time::Instant::now() < follower_deadline,
-                "could not make the victim a non-leader (leaders now: {leaders:?}, victim \
-                 {victim})"
+                "could not make the victim a stable non-leader (leaders now: {leaders:?}, \
+                 victim {victim})"
             );
             if leaders == [victim] && !transfer_armed {
                 let target = replicas[1].clone();
@@ -18812,21 +18830,22 @@ mod forward_hop_timeout_tests {
             "forwarding must recover onto a live replica past the stalled stub, not dead-end \
              on it: {result:?}"
         );
-        // The #585 teeth. With a follower victim the chase is: one stalled
-        // guessed hop (`FORWARD_HOP_TIMEOUT`, 2s) then a live replica (the
-        // leader, or a follower whose hint names it) -- ~2s. The
-        // worst-case composition of a single chase pass is one stalled
-        // guess plus one last-resort *hinted* retry of that same stub:
-        // `FORWARD_HOP_TIMEOUT + HINTED_FORWARD_HOP_TIMEOUT` = 2s + 6s = 8s.
-        // Pre-#585 the stub alone consumed the whole 10s budget and the
-        // call failed, so both the `Ok(Ok(()))` above and this bound (8s <
-        // 10s) fail on the old behaviour.
-        let bound = crate::FORWARD_HOP_TIMEOUT + crate::HINTED_FORWARD_HOP_TIMEOUT;
-        assert!(
-            elapsed < bound,
-            "a fixed forward wastes at most one FORWARD_HOP_TIMEOUT on the stub (plus, worst \
-             case, one hinted retry of it): bound {bound:?}, took {elapsed:?}"
-        );
+        // The #585 teeth are the outcome, not a ceiling: the call returns
+        // `Ok(())` -- inside its own `SCHEMA_COMMIT_TIMEOUT` (10s) deadline --
+        // even though the first guess stalls. Pre-#585 the stalled stub's
+        // hop took the WHOLE remaining budget, so the chase never reached a
+        // live replica and the call failed (asserted above).
+        //
+        // No upper bound on `elapsed` is asserted on purpose. A follower
+        // victim normally costs ~2s (one `FORWARD_HOP_TIMEOUT` hop), but the
+        // design's worst case for one chase pass is a stalled guess plus a
+        // last-resort hinted retry of it (`FORWARD_HOP_TIMEOUT +
+        // HINTED_FORWARD_HOP_TIMEOUT` = 2s + 6s = 8s), and any
+        // `WaitElection` round adds more hops on top, all bounded only by
+        // the 10s call deadline. A ceiling equal to the sum of caps has zero
+        // margin (scheduling lag alone exceeds it), and a ceiling with real
+        // margin would sit at the deadline, which the outcome assert already
+        // enforces.
         // The stub really was dialled first (replicas[0] is the guess), so
         // the call cannot have finished before that hop's own cap elapsed.
         assert!(

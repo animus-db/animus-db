@@ -1,32 +1,41 @@
-# Derive a multi-stage retry/chase test bound from the sum of its stages' caps, and pin which branch the scenario exercises (issue #1080)
+# Assert a chase's outcome plus a floor; put a ceiling only where the design guarantees slack (issue #1080)
 
 **Context**: `forward_hop_timeout_tests::forward_to_tablet_leader_bounds_each_hop_so_a_slow_candidate_cannot_starve_the_chase`
-(issue #585's regression) failed rarely under CPU contention with its outer
-`timeout(8s)` firing. Instrumented run: hop 1 = the stalled stub (first
-guess, `FORWARD_HOP_TIMEOUT` 2s, timed out at 2.0015s); hops 2-3 = both live
-replicas refusing with no hint; hop 4 = last-resort retry of the stub as a
-*hinted* candidate (`HINTED_FORWARD_HOP_TIMEOUT` 6s). 2s + 6s = 8s, exactly
-the outer bound, which fired ~10ms before the hop's own cap. Every hop honoured
+(issue #585's regression) failed rarely under CPU contention. First diagnosis
+(instrumented run): the killed victim was the tablet's Raft *leader*, its
+re-election outlasted the 2s guessed hop, both live replicas refused with no
+hint, and the chase's last resort re-dialled the stub as a *hinted* candidate
+(`HINTED_FORWARD_HOP_TIMEOUT`, 6s). 2s + 6s = 8s equalled the test's outer
+`timeout(8s)`, which fired ~10ms before the hop's own cap. Every hop honoured
 its cap; there was no production bug.
 
-**What went wrong**:
-- The bound (8s outer, `elapsed < 6s`) was sized for the happy path (one stub
-  hop + a fast live hop), not for the sum of the caps of every stage the chase
-  can legitimately run.
-- The extra stage was conditional: it only ran when the victim happened to be
-  the tablet's Raft *leader* and its re-election outlasted the 2s guess hop.
-  That stayed invisible in quiet runs and appeared only when CPU contention
-  stretched the election past the hop.
+**What went wrong, twice**:
+- The first bounds (8s outer, `elapsed < 6s`) were sized for the happy path,
+  not the sum of the caps of every stage the chase can legitimately run.
+- The first *fix* replaced them with `elapsed < FORWARD_HOP_TIMEOUT +
+  HINTED_FORWARD_HOP_TIMEOUT` and made the victim a follower. That is still
+  zero margin: the design's worst case for one pass IS that sum, plus lag, and
+  starvation can still cause election churn after the kill (a live leader
+  loses leadership, or a follower starts an election), producing the same
+  stub-retry stage and every `WaitElection` round adds more hops. One failure
+  in ~360 loop runs was left unexplained; this is the most likely cause.
 
 **Rules**:
-1. A test bound over a retry/chase is derived from the sum of its stages' caps
-   (`FORWARD_HOP_TIMEOUT + HINTED_FORWARD_HOP_TIMEOUT`), written as an
-   expression of the named constants with the arithmetic in a comment.
-2. A test's outer `timeout` is only a "don't hang the suite" guard: call
-   deadline + margin, so it can never fire before the call's own deadline.
-3. Make the scenario deterministic about which branch it exercises (here:
-   transfer leadership away so the victim is a follower, and assert that at
-   kill time) rather than tolerating whichever branch timing picks.
-4. To debug a timing failure in a chase, instrument hop-start/hop-end tagged
-   with a per-chase id (the chase deadline works) so concurrently running
-   sibling tests' output can be told apart.
+1. Assert the call's *outcome* (here `Ok(())` within its own deadline: the
+   thing the regression exists to protect) plus a *floor* proving the intended
+   path ran (`elapsed >= FORWARD_HOP_TIMEOUT`: the stub was dialled first).
+2. Put a ceiling only where the design guarantees slack. A bound equal to the
+   sum of stage caps has none; a bound with real margin is the call's own
+   deadline, which the outcome assert already enforces.
+3. The outer `timeout` is only a "don't hang the suite" guard: call deadline
+   plus margin (`SCHEMA_COMMIT_TIMEOUT + 5s`), never a magic number.
+4. Conditionally-triggered stages (victim happened to be leader; election
+   outlasted the hop) stay invisible until CPU contention stretches the
+   trigger window. Make the scenario deterministic about which branch it
+   exercises (transfer leadership away, require the non-victim leader to be
+   stable for a window, re-check right before the kill, keep the setup assert
+   loud).
+5. Prove a timing test's teeth by temporarily reintroducing the original bug
+   and watching it fail, not by arguing the bound is tight.
+6. Per-chase-tagged hop-start/hop-end instrumentation (chase deadline as id)
+   disentangles concurrently running sibling tests.
