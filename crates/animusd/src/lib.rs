@@ -2574,6 +2574,16 @@ const FORWARD_HOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// binding constraint — a dead hinted peer already fails within this
 /// window via `RELAY_TRANSPORT_FAILURE`) and `SimEnv` (where it is the
 /// only thing that ever bounds a dead hinted peer's own hop at all).
+///
+/// **Composition (issue #1080).** A chase that times out on a *guessed*
+/// candidate ([`FORWARD_HOP_TIMEOUT`]) and finds every other replica
+/// refusing with no hint (mid-election) falls back, as a last resort
+/// (`resolve_forward_candidate`'s case 3), to re-dialling that same
+/// candidate as a *hinted* one — so one chase pass legitimately costs
+/// `FORWARD_HOP_TIMEOUT + HINTED_FORWARD_HOP_TIMEOUT` (2s + 6s = 8s), not
+/// just one cap. Any test bound over a forward chase must be derived from
+/// that sum, and its own outer `timeout` from the call's deadline
+/// ([`SCHEMA_COMMIT_TIMEOUT`]/[`CLIENT_TIMEOUT`]), never from a magic number.
 const HINTED_FORWARD_HOP_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// **Issue #950.** How long [`ClientCtx::cp_route`] trusts its OWN, purely
@@ -18618,6 +18628,29 @@ mod forward_hop_timeout_tests {
         .expect("seed put did not succeed in 40s");
     }
 
+    /// This node's hosted CP group for `tablet`, if any.
+    fn hosted_group(node: &Node, tablet: crate::TabletId) -> Option<crate::CpGroup> {
+        node.ctx_for_test()
+            .edge
+            .hosted_groups()
+            .into_iter()
+            .find(|(t, _)| *t == tablet)
+            .map(|(_, g)| g)
+    }
+
+    /// Indices of the replica nodes whose own group currently believes it
+    /// leads `tablet` (exactly one once the tablet has a stable leader).
+    fn replica_leaders(
+        nodes: &[Node],
+        replicas: &[crate::NodeId],
+        tablet: crate::TabletId,
+    ) -> Vec<usize> {
+        (0..nodes.len())
+            .filter(|i| replicas.contains(&crate::config::node_id(*i)))
+            .filter(|i| hosted_group(&nodes[*i], tablet).is_some_and(|g| g.is_leader()))
+            .collect()
+    }
+
     /// A raw TCP stub standing in for "reachable, but never answers" at
     /// `addr` — accepts every connection, drains whatever bytes the caller
     /// sends, and then holds the connection open forever with no reply.
@@ -18714,6 +18747,44 @@ mod forward_hop_timeout_tests {
             .expect("victim id is one of this cluster's nodes");
         assert_ne!(victim, caller, "the caller must not be its own victim");
 
+        // #1080: this test exercises "a slow, non-leader first guess" -- ONE
+        // stalled `FORWARD_HOP_TIMEOUT` hop, then a live replica. If the
+        // victim were the tablet's Raft LEADER, killing it would also start
+        // a re-election that can outlast that 2s hop; both live replicas
+        // then refuse with no hint, the chase's last resort re-dials the
+        // stub as a *hinted* candidate (`HINTED_FORWARD_HOP_TIMEOUT`, 6s),
+        // and the call legitimately takes 2s + 6s. So first make the
+        // victim a follower: wait for a stable leader among the replicas
+        // and, if it is the victim, transfer leadership to `replicas[1]`.
+        let follower_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let mut transfer_armed = false;
+        loop {
+            let leaders: Vec<usize> = replica_leaders(&nodes, &replicas, tablet);
+            if leaders.len() == 1 && leaders[0] != victim {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < follower_deadline,
+                "could not make the victim a non-leader (leaders now: {leaders:?}, victim \
+                 {victim})"
+            );
+            if leaders == [victim] && !transfer_armed {
+                let target = replicas[1].clone();
+                transfer_armed =
+                    match hosted_group(&nodes[victim], tablet).expect("victim hosts the tablet") {
+                        crate::CpGroup::Lsm(g) => g.transfer_leadership(target),
+                        crate::CpGroup::Mem(g) => g.transfer_leadership(target),
+                    };
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let leaders = replica_leaders(&nodes, &replicas, tablet);
+        assert!(
+            leaders.len() == 1 && leaders[0] != victim,
+            "setup regression: the victim must not be the tablet's leader at kill time, or the \
+             re-election can add a hinted-retry stage to the chase (#1080): {leaders:?}"
+        );
+
         // Capture the victim's own intra address BEFORE tearing it down --
         // forwarding dials the intra port (ADR 0047) -- then free the port
         // (`shutdown_and_wait`, not the fire-and-forget `shutdown`) so the
@@ -18724,13 +18795,13 @@ mod forward_hop_timeout_tests {
 
         let ctx = nodes[caller].ctx_for_test();
         let started = Instant::now();
-        // 8s outer bound: comfortably above what a FIXED forward needs (one
-        // ~`FORWARD_HOP_TIMEOUT` (2s) hop wasted on the stub, plus one or
-        // two fast real hops) but safely below `CLIENT_TIMEOUT` (10s), so
-        // this can never fire first and be mistaken for the thing under
-        // test -- the elapsed-time assertion below is the real teeth.
+        // The outer `timeout` is ONLY a "don't hang the suite" guard: the
+        // call carries its own `SCHEMA_COMMIT_TIMEOUT` (10s) deadline, so
+        // this bound is that plus a 5s margin and can never fire before the
+        // call's own deadline (and be mistaken for the thing under test).
+        let outer = crate::SCHEMA_COMMIT_TIMEOUT + Duration::from_secs(5);
         let result = timeout(
-            Duration::from_secs(8),
+            outer,
             ctx.clear_backfill_cursor_for_table("fwd585", "nonexistent-index"),
         )
         .await;
@@ -18741,14 +18812,27 @@ mod forward_hop_timeout_tests {
             "forwarding must recover onto a live replica past the stalled stub, not dead-end \
              on it: {result:?}"
         );
+        // The #585 teeth. With a follower victim the chase is: one stalled
+        // guessed hop (`FORWARD_HOP_TIMEOUT`, 2s) then a live replica (the
+        // leader, or a follower whose hint names it) -- ~2s. The
+        // worst-case composition of a single chase pass is one stalled
+        // guess plus one last-resort *hinted* retry of that same stub:
+        // `FORWARD_HOP_TIMEOUT + HINTED_FORWARD_HOP_TIMEOUT` = 2s + 6s = 8s.
+        // Pre-#585 the stub alone consumed the whole 10s budget and the
+        // call failed, so both the `Ok(Ok(()))` above and this bound (8s <
+        // 10s) fail on the old behaviour.
+        let bound = crate::FORWARD_HOP_TIMEOUT + crate::HINTED_FORWARD_HOP_TIMEOUT;
         assert!(
-            elapsed < Duration::from_secs(6),
-            "pre-fix: an unbounded hop eats the WHOLE remaining CLIENT_TIMEOUT budget on the \
-             stalled stub alone, so the chase never gets to try a live replica -- this either \
-             times out near the 8s outer bound or returns the transport error right around the \
-             10s CLIENT_TIMEOUT mark; a fixed forward wastes at most one FORWARD_HOP_TIMEOUT \
-             (2s) on the stub before succeeding on a live candidate, so 6s is a generous margin \
-             over that, just not over the old broken behavior: took {elapsed:?}"
+            elapsed < bound,
+            "a fixed forward wastes at most one FORWARD_HOP_TIMEOUT on the stub (plus, worst \
+             case, one hinted retry of it): bound {bound:?}, took {elapsed:?}"
+        );
+        // The stub really was dialled first (replicas[0] is the guess), so
+        // the call cannot have finished before that hop's own cap elapsed.
+        assert!(
+            elapsed >= crate::FORWARD_HOP_TIMEOUT,
+            "the stalled stub must have been tried first and timed out at \
+             FORWARD_HOP_TIMEOUT: took {elapsed:?}"
         );
 
         for (i, node) in nodes.iter().enumerate() {
