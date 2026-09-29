@@ -59,6 +59,75 @@
 //! replay is correct — replaying an already-flushed record just re-inserts an
 //! identical `(key, version)` slot (idempotent).
 //!
+//! ## File-level format header (ADR 0073 Phase 0, Workstream A)
+//!
+//! Every segment file's first bytes are a **file-level header**: magic
+//! `LWL1` + `u8` version, written exactly **once**, before any
+//! [`WalRecord`] frame — not a header on every individual record. The ADR's
+//! Phase 0 conventions table names this "LSM WAL record header", but a
+//! file-level header is the safer and cheaper shape for what is, in this
+//! codebase, a **rotating-segment-file** format rather than one growing
+//! file with an ambiguous start: it costs 5 bytes once per segment instead
+//! of once per record (segments already rotate on a byte threshold, ADR
+//! 0008, so the per-record cost would be paid forever on the hot write
+//! path for no ongoing benefit — every record in a given file is already
+//! known to share one version the instant the file's own header is read);
+//! and it needs no new per-record framing change at all — `encode_wal`/
+//! `decode_wal_record`'s frame (`len | crc32 | payload`) and every record's
+//! own tag byte are untouched, so nothing about record-level decoding
+//! (including the positional torn-tail-vs-corruption proof, see `lsm.rs`'s
+//! `decode_wal` module docs) needs to change to accommodate it.
+//!
+//! **Crash safety** follows the same durable-before-visible argument the
+//! rest of this file already relies on. The header is prepended to a
+//! segment's **first-ever** batch (whether that's the very first write to a
+//! brand-new engine's segment 0, or the first write to a segment a rotation
+//! just created) and appended in the same `Disk::append` call as that
+//! batch's records, so it becomes durable in exactly the `sync` that covers
+//! them — never separately, never in an earlier or later `sync`. A crash
+//! before that `sync` completes can therefore only ever leave the header
+//! **absent, torn (a strict prefix), or fully present** — the identical
+//! three-way outcome a plain record already has (see `decode_wal`'s "torn
+//! tail" argument in `lsm.rs`), so recovery reuses the same reasoning: a
+//! torn header proves nothing durable exists in this file at all (nothing
+//! could have synced past an incomplete header, since header and first
+//! record share one `sync`), so it is tolerated as if the file were empty,
+//! not reported as corruption.
+//!
+//! **When to (re-)write it**: [`Inner::active_seg_needs_header`] tracks,
+//! for the *currently* active segment only (older, sealed segments are
+//! never appended to again, so they need no ongoing tracking), whether its
+//! next batch must be header-prefixed. It starts `true` for a segment this
+//! `GroupCommit` has never durably touched — a brand-new engine's segment
+//! 0, or any segment reached via [`commit`](GroupCommit::commit)'s own
+//! rotation — and `false` for a segment recovered with existing bytes on
+//! disk (`GroupCommit::new`'s `active_seg_len` parameter; a non-zero
+//! recovered length can only exist if a prior header-carrying `append`
+//! already landed it — see `LsmEngine::open_with_metrics`, which derives
+//! this from the *post-repair* length so a torn-header segment that got
+//! truncated back to empty correctly reads as "needs a header again").
+//!
+//! It is flipped to `false` **the instant this coordinator's own `append`
+//! call (carrying the header) returns `Ok`** — deliberately neither earlier
+//! nor later:
+//! - **Not earlier** (e.g. alongside `active_seg_bytes`'s own speculative,
+//!   pre-outcome bump above): `SimEnv`'s fault model guarantees a *failed*
+//!   `append` changes nothing at all (no partial write), so flipping the
+//!   flag before knowing the call succeeded would leak a segment that
+//!   never received a header if that exact call happened to fail —
+//!   unlike the harmless `active_seg_bytes` heuristic, a missing header is
+//!   a real, later-fatal format error on reopen.
+//! - **Not later** (only after `sync` succeeds): a failed `sync` does
+//!   **not** roll back an already-`append`ed buffer (it stays buffered,
+//!   to be flushed by whatever unrelated `sync` eventually succeeds on
+//!   this file); waiting for `sync` before flipping the flag would make a
+//!   retried batch prepend a **second** header ahead of a buffer that
+//!   already starts with one the moment that first, sync-failed `append`
+//!   is ever followed by a later successful `sync` — corrupting the file
+//!   with no crash involved at all.
+//!
+//! See [`GroupCommit::flush_batch`] for where this is implemented.
+//!
 //! [`Disk`]: animus_env::Disk
 
 use std::collections::BTreeMap;
@@ -71,6 +140,24 @@ use std::task::{Context, Poll, Waker};
 use animus_env::Env;
 
 use crate::{Result, StorageError};
+
+/// WAL segment file-level format magic: "LWL1" (Lsm Write-ahead Log, format
+/// family 1 — ADR 0073 Phase 0, Workstream A). See the module docs above for
+/// why this is a once-per-file header rather than a per-record tag.
+pub(super) const WAL_MAGIC: [u8; 4] = *b"LWL1";
+/// Current WAL segment file-header version (within the `LWL1` magic family).
+pub(super) const WAL_VERSION: u8 = 1;
+/// Bytes in the WAL segment file-level header (`WAL_MAGIC` + one version byte).
+pub(super) const WAL_HEADER_LEN: usize = WAL_MAGIC.len() + 1;
+
+/// Encode the WAL segment file-level header: `WAL_MAGIC` followed by
+/// `WAL_VERSION`.
+pub(super) fn encode_wal_header() -> [u8; WAL_HEADER_LEN] {
+    let mut out = [0u8; WAL_HEADER_LEN];
+    out[..WAL_MAGIC.len()].copy_from_slice(&WAL_MAGIC);
+    out[WAL_MAGIC.len()] = WAL_VERSION;
+    out
+}
 
 /// Coordinates group-committed appends to a rotating set of WAL segment files
 /// named `<prefix>wal-NNNNNN`.
@@ -127,19 +214,40 @@ struct Inner {
     /// that segment contains. `BTreeMap` for deterministic iteration. The active
     /// segment is never in this map (its max seq is `durable_seq`).
     sealed: BTreeMap<u64, u64>,
+    /// Whether the active segment's **next** batch must be prefixed with the
+    /// WAL file-level header (ADR 0073 Phase 0) before its records. See the
+    /// module docs' "File-level format header" section for the full
+    /// crash-safety argument and exactly when this flips.
+    active_seg_needs_header: bool,
 }
 
 impl GroupCommit {
     /// A fresh coordinator writing segments under `prefix`, with `live_segments`
-    /// being the segments the recovered manifest names (in ascending order) and
-    /// `seg_threshold` the per-segment byte budget.
+    /// being the segments the recovered manifest names (in ascending order),
+    /// `seg_threshold` the per-segment byte budget, and `active_seg_len` the
+    /// **post-recovery-repair** byte length of the active (highest-numbered)
+    /// segment on disk — `0` for a brand-new engine with no segments at all.
     ///
     /// The sequence space resumes after recovery: recovered records already live
     /// in the memtable, so the next durable record is the first *new* write. The
     /// highest live segment is reopened as the active segment (further appends ride
     /// it until it crosses `seg_threshold`); the rest are sealed. `live_segments`
     /// empty means a fresh engine — the first write opens segment 0.
-    pub(super) fn new(prefix: String, live_segments: &[u64], seg_threshold: u64) -> Self {
+    ///
+    /// `active_seg_len == 0` means the active segment has no durable bytes at
+    /// all yet (a brand-new engine, or a recovered segment whose header was
+    /// itself torn and got repaired back to empty — see `LsmEngine::
+    /// open_with_metrics`), so its first batch here must carry a fresh
+    /// header; any nonzero length can only exist because a prior
+    /// header-carrying `append` already landed on this exact file (every
+    /// segment ever discovered by recovery got that way through this same
+    /// coordinator's own writes), so the header must not be written again.
+    pub(super) fn new(
+        prefix: String,
+        live_segments: &[u64],
+        seg_threshold: u64,
+        active_seg_len: u64,
+    ) -> Self {
         // All recovered records are folded into the memtable already, so the
         // resumed sequence space starts at 0; the active segment is the highest
         // live one (or 0 for a fresh engine). Older live segments are sealed with
@@ -169,6 +277,7 @@ impl GroupCommit {
                 active_seg,
                 active_seg_bytes: 0,
                 sealed,
+                active_seg_needs_header: active_seg_len == 0,
             }),
         }
     }
@@ -281,14 +390,32 @@ impl GroupCommit {
                         inner.sealed.insert(sealed_seg, sealed_max);
                         inner.active_seg += 1;
                         inner.active_seg_bytes = 0;
+                        // A freshly rotated-to segment is a brand-new file that
+                        // this coordinator has never written a byte to: its
+                        // first batch must carry the file header (see the
+                        // module docs' "File-level format header" section).
+                        inner.active_seg_needs_header = true;
                         // Observability (ADR 0015): a rotation actually happened.
                         self.rotations.fetch_add(1, Ordering::Relaxed);
                     }
                     let seg = inner.active_seg;
+                    let needs_header = inner.active_seg_needs_header;
                     // Account the bytes now so the *next* batch's rotation decision
-                    // sees this batch's contribution.
-                    inner.active_seg_bytes += batch.len() as u64;
-                    Action::Lead { batch, up_to, seg }
+                    // sees this batch's contribution — including the header's own
+                    // bytes when this batch will carry one, since those bytes are
+                    // genuinely appended to the segment file too.
+                    inner.active_seg_bytes += batch.len() as u64
+                        + if needs_header {
+                            WAL_HEADER_LEN as u64
+                        } else {
+                            0
+                        };
+                    Action::Lead {
+                        batch,
+                        up_to,
+                        seg,
+                        needs_header,
+                    }
                 }
             };
 
@@ -313,11 +440,16 @@ impl GroupCommit {
                     }
                     .await;
                 }
-                Action::Lead { batch, up_to, seg } => {
+                Action::Lead {
+                    batch,
+                    up_to,
+                    seg,
+                    needs_header,
+                } => {
                     // Perform the single batched append + sync, lock-free, to the
                     // chosen segment file.
                     let batch_len = batch.len();
-                    let res = self.flush_batch(env, seg, &batch).await;
+                    let res = self.flush_batch(env, seg, needs_header, &batch).await;
                     let woken = {
                         let mut inner = self.lock();
                         inner.flushing = false;
@@ -364,14 +496,35 @@ impl GroupCommit {
         }
     }
 
-    /// Append the whole batch to segment `seg`'s file then `sync` it once. The
-    /// lock is **not** held here.
-    async fn flush_batch<E: Env>(&self, env: &E, seg: u64, batch: &[u8]) -> Result<()> {
+    /// Append the whole batch — prefixed with the WAL file-level header when
+    /// `needs_header` (this segment's first-ever batch) — to segment `seg`'s
+    /// file, then `sync` it once. The lock is **not** held across the I/O;
+    /// it is retaken briefly, only to clear `active_seg_needs_header`, and
+    /// only once the `append` that carried the header has itself returned
+    /// `Ok` — see the module docs' "File-level format header" section for
+    /// exactly why that timing (neither earlier nor later) is load-bearing.
+    async fn flush_batch<E: Env>(
+        &self,
+        env: &E,
+        seg: u64,
+        needs_header: bool,
+        batch: &[u8],
+    ) -> Result<()> {
         let file = self.segment_file(seg);
-        if !batch.is_empty() {
-            env.append(&file, batch)
+        let framed: std::borrow::Cow<'_, [u8]> = if needs_header {
+            let mut framed = encode_wal_header().to_vec();
+            framed.extend_from_slice(batch);
+            std::borrow::Cow::Owned(framed)
+        } else {
+            std::borrow::Cow::Borrowed(batch)
+        };
+        if !framed.is_empty() {
+            env.append(&file, &framed)
                 .await
                 .map_err(|e| StorageError::Backend(e.to_string()))?;
+            if needs_header {
+                self.lock().active_seg_needs_header = false;
+            }
         }
         env.sync(&file)
             .await
@@ -405,11 +558,14 @@ enum Action {
     /// Our record's batch failed to sync; surface the error.
     Failed,
     /// Lead the flush of this claimed `batch` to segment `seg`, which makes records
-    /// `<= up_to` durable on success.
+    /// `<= up_to` durable on success. `needs_header` says whether this is
+    /// segment `seg`'s first-ever batch, so `flush_batch` must prepend the
+    /// WAL file-level header.
     Lead {
         batch: Vec<u8>,
         up_to: u64,
         seg: u64,
+        needs_header: bool,
     },
     /// Another writer is leading; park until our sequence is durable.
     Wait,

@@ -104,11 +104,18 @@ fn active_wal_file(e: &LsmEngine<SimEnv>) -> String {
     format!("{PREFIX}wal-{seg:06}")
 }
 
-/// The byte length of the first complete WAL frame in `bytes`. The on-disk
-/// framing is `len(u32 BE) | crc32(u32 BE) | payload` (see `lsm.rs`'s
-/// `encode_wal`); this reads just the length header to find the frame boundary.
-fn first_frame_len(bytes: &[u8]) -> usize {
-    let len = u32::from_be_bytes(bytes[0..4].try_into().expect("frame header present")) as usize;
+/// Bytes in the WAL segment file-level header (magic `LWL1` + `u8` version,
+/// ADR 0073 Phase 0) that precede every segment's first record. Mirrors
+/// `lsm::wal::WAL_HEADER_LEN`, duplicated here since it isn't part of the
+/// crate's public API.
+const WAL_FILE_HEADER_LEN: usize = 5;
+
+/// The byte length of the first complete WAL frame in `body` (bytes *past*
+/// the file-level header — see [`WAL_FILE_HEADER_LEN`]). The on-disk framing
+/// is `len(u32 BE) | crc32(u32 BE) | payload` (see `lsm.rs`'s `encode_wal`);
+/// this reads just the length header to find the frame boundary.
+fn first_frame_len(body: &[u8]) -> usize {
+    let len = u32::from_be_bytes(body[0..4].try_into().expect("frame header present")) as usize;
     8 + len
 }
 
@@ -117,14 +124,17 @@ fn first_frame_len(bytes: &[u8]) -> usize {
 /// holds when the power cuts between `append` and `sync` — then crash with a
 /// torn-tail model, so a seed-chosen strict prefix of that record survives.
 /// The buffered bytes are a copy of the segment's first (durable, complete)
-/// frame, so if the tear happens to retain the whole frame the replay is an
-/// idempotent duplicate — the interesting cases are the partial ones.
+/// frame **past the file header** (already durably present from the writes
+/// preceding this call), so if the tear happens to retain the whole frame
+/// the replay is an idempotent duplicate — the interesting cases are the
+/// partial ones.
 async fn buffer_unsynced_wal_record(sim: &Simulator, e: &LsmEngine<SimEnv>) {
     let env = sim.env(nid(0));
     let file = active_wal_file(e);
     let bytes = env.read(&file).await.expect("read wal segment");
-    let frame_len = first_frame_len(&bytes);
-    env.append(&file, &bytes[..frame_len])
+    let body = &bytes[WAL_FILE_HEADER_LEN..];
+    let frame_len = first_frame_len(body);
+    env.append(&file, &body[..frame_len])
         .await
         .expect("append un-synced record");
 }

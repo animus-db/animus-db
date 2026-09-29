@@ -167,6 +167,41 @@ pub enum StorageError {
         /// The rejected value.
         level_fanout: usize,
     },
+    /// A persisted format's bytes carried no recognized version tag at
+    /// all — no magic (a byte-oriented format) or, for a `serde_json`
+    /// format, no top-level `"v"` field — read by post-ADR-0073-Phase-0-
+    /// baseline code. **One variant shared across every format** (ADR
+    /// 0073's Phase 0 conventions), not one per format: a format-specific
+    /// error type per format would multiply without adding information,
+    /// since the handling (refuse loudly, name the format, never guess) is
+    /// identical everywhere. Phase 0 is the point at which pre-baseline
+    /// data is deliberately not owed compatibility — the point of this
+    /// variant is refusing it *by name*, loudly, rather than silently
+    /// misdecoding it as if it were the current format or silently
+    /// treating it as empty.
+    #[error("{format}: no recognized format tag (pre-baseline / untagged data)")]
+    PreBaselineFormat {
+        /// A short, stable slug naming the format, matching its fixture
+        /// directory under `tests/fixtures/formats/<format>/` (e.g.
+        /// `"lsm-wal"`).
+        format: &'static str,
+    },
+    /// A persisted format's version tag names a version this binary does
+    /// not know how to decode — either `0` (never assigned to a real
+    /// version) or newer than `max_supported`. **One variant shared across
+    /// every format**, exactly like [`PreBaselineFormat`](Self::PreBaselineFormat)
+    /// above and for the same reason. `found`/`max_supported` are `u32` so
+    /// this one shape covers both a `u8`-tagged binary format (e.g. the WAL
+    /// header) and a wider-tagged one, without truncation either way.
+    #[error("{format}: unsupported format version {found} (max supported {max_supported})")]
+    UnsupportedFormatVersion {
+        /// Same slug convention as [`PreBaselineFormat`](Self::PreBaselineFormat).
+        format: &'static str,
+        /// The version tag actually found in the bytes.
+        found: u32,
+        /// The newest version this binary knows how to decode for `format`.
+        max_supported: u32,
+    },
 }
 
 /// Result alias for storage operations.

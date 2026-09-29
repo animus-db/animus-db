@@ -22,18 +22,23 @@
 //!   offset/len, size), the engine's monotonic `max_version`, and the **live WAL
 //!   segment numbers**. Written **atomically** via [`Disk::replace`], so a crash
 //!   sees either the whole old or whole new manifest, never a mix.
-//! - `<prefix>wal-NNNNNN` — the write-ahead log, split into **numbered segments**
-//!   of [`WalRecord`]s, each one framed `len(u32) | crc32(u32) | payload` (a
-//!   compact hand-rolled binary encoding, not JSON — see the codec docs above
-//!   `encode_wal`), `append`ed then `sync`ed **before** a write is acknowledged
-//!   (an ack means durable). The group-commit coordinator appends to the active
-//!   segment and rolls to a fresh one once it passes a byte threshold; a flush
-//!   removes whole segments it has folded into an SSTable (see [`wal`]). Holds
-//!   the writes not yet folded into an SSTable. Recovery tolerates a torn
-//!   trailing frame (an un-synced write cut short by a crash) but treats any
-//!   other malformed/corrupt frame as a hard error (see `decode_wal`), and
-//!   truncates a recovered active segment's torn tail before further appends
-//!   ride it (see `LsmEngine::open_with_metrics`).
+//! - `<prefix>wal-NNNNNN` — the write-ahead log, split into **numbered segments**.
+//!   Each segment file starts with a **file-level header** — magic `LWL1` +
+//!   `u8` version (ADR 0073 Phase 0), written exactly once, before any record
+//!   — followed by a sequence of [`WalRecord`]s, each one framed
+//!   `len(u32) | crc32(u32) | payload` (a compact hand-rolled binary encoding,
+//!   not JSON — see the codec docs above `encode_wal`), `append`ed then
+//!   `sync`ed **before** a write is acknowledged (an ack means durable). See
+//!   [`wal`]'s module docs for why the header is file-level rather than
+//!   per-record, and how it stays crash-safe. The group-commit coordinator
+//!   appends to the active segment and rolls to a fresh one once it passes a
+//!   byte threshold; a flush removes whole segments it has folded into an
+//!   SSTable. Holds the writes not yet folded into an SSTable. Recovery
+//!   tolerates a torn trailing frame *or* a torn trailing header (an un-synced
+//!   write cut short by a crash) but treats any other malformed/corrupt frame,
+//!   or a complete-but-foreign/future-version header, as a hard error (see
+//!   `decode_wal`), and truncates a recovered active segment's torn tail
+//!   before further appends ride it (see `LsmEngine::open_with_metrics`).
 //! - `<prefix>sst-NNNNNN` — immutable, sorted SSTables (see [`sstable`]).
 //!
 //! ## Write path
@@ -180,7 +185,7 @@ mod wal;
 
 use bloom::BloomFilter;
 use sstable::{Record, SsTableMeta, SsTableReader, SsTableWriter};
-use wal::GroupCommit;
+use wal::{GroupCommit, WAL_HEADER_LEN, WAL_MAGIC, WAL_VERSION};
 
 /// Default memtable flush threshold: total bytes of buffered key+value data.
 const DEFAULT_FLUSH_BYTES: usize = 64 * 1024;
@@ -341,7 +346,7 @@ type History = BTreeMap<Version, Option<Value>>;
 /// apply *before* logging, so they are recorded as a plain `Put`/`Delete` at the
 /// chosen version; replay just re-inserts that `(key, version)` slot, which is
 /// idempotent and order-independent.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum WalRecord {
     Put {
         key: Key,
@@ -374,7 +379,7 @@ enum WalRecord {
 
 /// One decided merge as logged in a [`WalRecord::MergeBatch`]: `value` `Some` is a
 /// value slot, `None` a tombstone slot, at this op's own `version`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct MergeRec {
     key: Key,
     value: Option<Value>,
@@ -383,7 +388,7 @@ struct MergeRec {
 
 /// A batch op as logged: range deletes are pre-expanded to the affected keys so
 /// replay is a pure re-insert (it doesn't need to consult live state).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum BatchOp {
     Put { key: Key, value: Value },
     Delete { key: Key },
@@ -793,6 +798,17 @@ impl<E: Env> LsmEngine<E> {
         let mut memtable: BTreeMap<Key, History> = BTreeMap::new();
         let mut memtable_bytes = 0usize;
         let mut max_version = manifest.max_version;
+        // The active segment's own byte length after any torn-tail/torn-header
+        // repair below — `0` when there is no segment at all yet (a brand-new
+        // or legacy-migrating engine). This, not the manifest or the segment
+        // list alone, is what tells `GroupCommit::new` whether the active
+        // segment already carries a durable WAL file header: any nonzero
+        // length here can only exist because a prior header-carrying `append`
+        // already landed on this exact file (see `wal`'s module docs), while
+        // `0` — whether from never having existed, or from a torn header
+        // repaired back to empty just below — means the very next write must
+        // write a fresh one.
+        let mut active_seg_final_len: u64 = 0;
         if segments.is_empty() {
             // Legacy migration: a directory written by the single-file-WAL era has
             // no recorded segments. Replay the old `<prefix>wal` file (if any) so
@@ -838,6 +854,9 @@ impl<E: Env> LsmEngine<E> {
                         .await
                         .map_err(io)?;
                 }
+                if seg == active_seg {
+                    active_seg_final_len = consumed as u64;
+                }
             }
         }
 
@@ -866,6 +885,7 @@ impl<E: Env> LsmEngine<E> {
             prefix.to_string(),
             &segments,
             opts.wal_segment_bytes,
+            active_seg_final_len,
         ));
 
         Ok(Self {
@@ -3212,43 +3232,89 @@ fn wal_resync_point(bytes: &[u8], start: usize) -> Option<usize> {
     (start..bytes.len()).find(|&p| try_parse_wal_frame(bytes, p).is_some())
 }
 
-/// Decode a WAL segment's raw bytes into records plus how many leading bytes
-/// formed complete, valid frames (the recovery point the segment should be
-/// truncated to before further appends ride it — see
-/// `LsmEngine::open_with_metrics`).
+/// Decode a WAL segment's raw bytes: first the file-level header (magic +
+/// version, ADR 0073 Phase 0 — see `wal`'s module docs for why this is
+/// file-level rather than per-record), then its records. Returns the decoded
+/// records plus how many leading bytes formed a valid header and complete,
+/// valid record frames (the recovery point the segment should be truncated
+/// to before further appends ride it — see `LsmEngine::open_with_metrics`).
 ///
-/// Tolerates **only** a genuinely torn trailing frame: an un-synced write cut
-/// short by a crash, which was never acked and so is safe to drop silently. A
-/// parse failure that is *not* the tail — i.e. a valid frame still exists
-/// somewhere after it — can only be at-rest corruption of previously durable
-/// data (a crash cannot touch anything but the physical end of the file), and
-/// is surfaced loudly instead of silently truncating history.
+/// An empty `bytes` (no header, no records at all) decodes as empty with no
+/// error: this is the ordinary shape of a segment nothing has ever been
+/// durably appended to yet (this coordinator writes the header and a
+/// segment's first record together in one `append`, so "no header" and "no
+/// records" coincide for a genuinely untouched file — see `wal`'s module
+/// docs).
 ///
 /// # Errors
-/// Returns [`StorageError::Backend`] when a frame fails to parse and a valid
-/// frame is still found later in `bytes` (proof this was not a torn tail).
+/// - [`StorageError::PreBaselineFormat`] if at least [`WAL_MAGIC`]'s own
+///   length of bytes is present and the leading 4 bytes are not `WAL_MAGIC`,
+///   or if fewer bytes than that are present and even that short prefix
+///   doesn't match `WAL_MAGIC`'s own corresponding prefix (proof this is
+///   foreign/pre-baseline data, not a crash-torn write of *our* header — a
+///   real torn write can only ever be a true prefix of what was actually
+///   written, never a mismatched one).
+/// - [`StorageError::UnsupportedFormatVersion`] if the magic matches but the
+///   version byte is `0` or greater than [`WAL_VERSION`].
+/// - [`StorageError::Backend`] exactly as before, for a record frame that
+///   fails to parse and is provably not a trailing tear (a valid frame still
+///   parses later in the buffer).
+///
+/// A **torn header** — fewer than [`WAL_HEADER_LEN`] bytes present, matching
+/// `WAL_MAGIC`'s own prefix as far as it goes — is tolerated exactly like a
+/// torn trailing record: nothing in this file can have been durably synced
+/// (header and first record always share one `sync`), so it decodes as
+/// empty (`consumed == 0`), which lets the existing repair-on-open truncate
+/// the file to nothing and a fresh header get written on the next append.
 fn decode_wal(bytes: &[u8]) -> Result<(Vec<WalRecord>, usize)> {
+    if bytes.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+    if bytes.len() < WAL_HEADER_LEN {
+        // A real crash can only ever truncate a file's tail, so a legitimate
+        // torn write of our own header always leaves a true prefix of it.
+        // Anything else this short is foreign/pre-baseline data, not a tear.
+        if bytes == &WAL_MAGIC[..bytes.len()] {
+            return Ok((Vec::new(), 0));
+        }
+        return Err(StorageError::PreBaselineFormat { format: "lsm-wal" });
+    }
+    let magic: [u8; 4] = bytes[..4].try_into().expect("checked length above");
+    if magic != WAL_MAGIC {
+        return Err(StorageError::PreBaselineFormat { format: "lsm-wal" });
+    }
+    let version = bytes[4];
+    if version == 0 || version > WAL_VERSION {
+        return Err(StorageError::UnsupportedFormatVersion {
+            format: "lsm-wal",
+            found: u32::from(version),
+            max_supported: u32::from(WAL_VERSION),
+        });
+    }
+
+    let body = &bytes[WAL_HEADER_LEN..];
     let mut records = Vec::new();
     let mut pos = 0usize;
-    while pos < bytes.len() {
-        match try_parse_wal_frame(bytes, pos) {
+    while pos < body.len() {
+        match try_parse_wal_frame(body, pos) {
             Some((record, next)) => {
                 records.push(record);
                 pos = next;
             }
             None => {
-                if wal_resync_point(bytes, pos + 1).is_some() {
+                if wal_resync_point(body, pos + 1).is_some() {
                     return Err(StorageError::Backend(format!(
-                        "corrupt WAL record at byte offset {pos}: a valid record \
-                         still parses later in the file, so this is not a torn \
-                         tail — refusing to silently drop history"
+                        "corrupt WAL record at byte offset {pos} (past the file \
+                         header): a valid record still parses later in the file, \
+                         so this is not a torn tail — refusing to silently drop \
+                         history"
                     )));
                 }
                 break;
             }
         }
     }
-    Ok((records, pos))
+    Ok((records, WAL_HEADER_LEN + pos))
 }
 
 /// Encode a [`WalRecord`]'s payload (tag byte + fields; see the codec-level
@@ -3459,6 +3525,265 @@ fn decode_merge_rec(c: &mut Cursor<'_>) -> Result<MergeRec> {
         value,
         version,
     })
+}
+
+/// ADR 0073 Phase 0 (Workstream A) golden-fixture tests for the WAL
+/// **file-level header** (`wal::WAL_MAGIC` + `wal::WAL_VERSION`) — see
+/// `wal`'s module docs for the format itself and why it is file-level
+/// rather than per-record. Fixtures live at
+/// `tests/fixtures/formats/lsm-wal/v<N>.bin`, one whole segment-file image
+/// per version; once checked in, a fixture is never edited or deleted
+/// (`scripts/check-format-fixtures.sh` enforces this in CI) — a format
+/// change adds a new `v<N+1>.bin` instead.
+#[cfg(test)]
+mod wal_format_fixture_tests {
+    use super::*;
+
+    /// The fixture directory for this format, one file per version.
+    fn fixture_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/formats/lsm-wal")
+    }
+
+    /// A deterministic, representative sequence covering every `WalRecord`
+    /// kind — fixed keys/values/versions, no wall-clock time or unseeded
+    /// randomness (ADR 0073's fixture-determinism convention), so the
+    /// encoded bytes are stable across every future run and contributor.
+    fn representative_records() -> Vec<WalRecord> {
+        vec![
+            WalRecord::Put {
+                key: b"key-put".to_vec(),
+                value: b"value-put".to_vec(),
+                version: 1,
+            },
+            WalRecord::Delete {
+                key: b"key-delete".to_vec(),
+                version: 2,
+            },
+            WalRecord::DeleteRange {
+                start: b"range-start".to_vec(),
+                end: b"range-end".to_vec(),
+                keys: vec![b"range-key-a".to_vec(), b"range-key-b".to_vec()],
+                version: 3,
+            },
+            WalRecord::Batch {
+                version: 4,
+                ops: vec![
+                    BatchOp::Put {
+                        key: b"batch-put".to_vec(),
+                        value: b"batch-value".to_vec(),
+                    },
+                    BatchOp::Delete {
+                        key: b"batch-delete".to_vec(),
+                    },
+                    BatchOp::DeleteKeys {
+                        keys: vec![b"batch-key-a".to_vec(), b"batch-key-b".to_vec()],
+                    },
+                ],
+            },
+            WalRecord::MergeBatch {
+                ops: vec![
+                    MergeRec {
+                        key: b"merge-a".to_vec(),
+                        value: Some(b"merge-value-a".to_vec()),
+                        version: 5,
+                    },
+                    MergeRec {
+                        key: b"merge-b".to_vec(),
+                        value: None,
+                        version: 6,
+                    },
+                ],
+            },
+        ]
+    }
+
+    /// Encode a whole segment-file image: the file-level header followed by
+    /// every record in `records`, exactly as `LsmEngine`'s own write path
+    /// builds one (header once, then one `encode_wal` frame per record —
+    /// see `wal`'s module docs).
+    fn encode_fixture_file(records: &[WalRecord]) -> Vec<u8> {
+        let mut out = wal::encode_wal_header().to_vec();
+        for r in records {
+            out.extend_from_slice(&encode_wal(r));
+        }
+        out
+    }
+
+    /// Decode test (ADR 0073 Phase 0 convention): every fixture file under
+    /// `tests/fixtures/formats/lsm-wal/` decodes with the *current* code to
+    /// exactly the hand-written expected records, field by field — not
+    /// just "decodes without error" (a decoder that silently dropped a
+    /// field would otherwise pass). Written to iterate the directory
+    /// rather than name `v1` literally, so a future `v2` fixture needs no
+    /// test-code change.
+    #[test]
+    fn decodes_every_checked_in_fixture() {
+        let dir = fixture_dir();
+        let mut checked = 0usize;
+        for entry in std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("reading fixture dir {}: {e}", dir.display()))
+        {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("bin") {
+                continue;
+            }
+            let bytes = std::fs::read(&path)
+                .unwrap_or_else(|e| panic!("reading fixture {}: {e}", path.display()));
+            let (records, consumed) = decode_wal(&bytes)
+                .unwrap_or_else(|e| panic!("decoding fixture {}: {e}", path.display()));
+            assert_eq!(
+                consumed,
+                bytes.len(),
+                "fixture {} left {} trailing byte(s) unconsumed",
+                path.display(),
+                bytes.len() - consumed,
+            );
+            assert_eq!(
+                records,
+                representative_records(),
+                "fixture {} decoded to a value different from the expected one",
+                path.display(),
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "no fixture files found under {}",
+            dir.display()
+        );
+    }
+
+    /// Round-trip test: encode a representative value with the *current*
+    /// version, decode it back, and assert equality — catches an
+    /// encoder/decoder asymmetry a static (decode-only) fixture would miss.
+    #[test]
+    fn round_trips_the_current_version() {
+        let records = representative_records();
+        let bytes = encode_fixture_file(&records);
+        let (decoded, consumed) = decode_wal(&bytes).expect("decode");
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(decoded, records);
+    }
+
+    /// Fixture generator (ADR 0073 Phase 0 convention). Run explicitly:
+    /// `cargo test -p animus-storage --lib generate_fixture_lsm_wal -- --ignored`.
+    /// Writes `tests/fixtures/formats/lsm-wal/v<CURRENT>.bin` — but refuses
+    /// to overwrite a file that already exists, so a fixture is
+    /// regenerated only by deliberately bumping `wal::WAL_VERSION`, never
+    /// silently.
+    #[test]
+    #[ignore = "run explicitly to (re)generate the golden fixture"]
+    fn generate_fixture_lsm_wal() {
+        let dir = fixture_dir();
+        std::fs::create_dir_all(&dir).expect("create fixture dir");
+        let path = dir.join(format!("v{}.bin", wal::WAL_VERSION));
+        assert!(
+            std::fs::metadata(&path).is_err(),
+            "{} already exists — bump wal::WAL_VERSION and add a NEW fixture \
+             file instead of regenerating an existing one",
+            path.display(),
+        );
+        let bytes = encode_fixture_file(&representative_records());
+        std::fs::write(&path, &bytes).expect("write fixture");
+    }
+
+    /// A different, complete magic — foreign or corrupted data, not a
+    /// crash-torn write of our own header — is a loud, named refusal,
+    /// never a silent misdecode and never a panic.
+    #[test]
+    fn foreign_magic_is_a_loud_pre_baseline_error() {
+        let mut bytes = wal::encode_wal_header().to_vec();
+        bytes[0] = b'X'; // "XWL1" != "LWL1", and still a complete 4-byte magic.
+        bytes.extend_from_slice(&encode_wal(&WalRecord::Delete {
+            key: b"k".to_vec(),
+            version: 1,
+        }));
+        match decode_wal(&bytes) {
+            Err(StorageError::PreBaselineFormat { format }) => assert_eq!(format, "lsm-wal"),
+            other => panic!("expected PreBaselineFormat, got {other:?}"),
+        }
+    }
+
+    /// A magic-less file — plain record bytes with no header at all, as a
+    /// genuinely pre-baseline WAL segment would have been written — is the
+    /// same loud refusal.
+    #[test]
+    fn missing_magic_is_a_loud_pre_baseline_error() {
+        let bytes = encode_wal(&WalRecord::Delete {
+            key: b"k".to_vec(),
+            version: 1,
+        });
+        // The record frame's own length prefix is vanishingly unlikely to
+        // spell out `WAL_MAGIC` by coincidence; assert the precondition so
+        // this test can't pass for the wrong reason.
+        assert_ne!(&bytes[..4], &wal::WAL_MAGIC[..]);
+        match decode_wal(&bytes) {
+            Err(StorageError::PreBaselineFormat { format }) => assert_eq!(format, "lsm-wal"),
+            other => panic!("expected PreBaselineFormat, got {other:?}"),
+        }
+    }
+
+    /// Version `0` was never assigned to a real version; refuse loudly
+    /// rather than guess.
+    #[test]
+    fn version_zero_is_unsupported() {
+        let mut bytes = wal::encode_wal_header().to_vec();
+        bytes[4] = 0;
+        match decode_wal(&bytes) {
+            Err(StorageError::UnsupportedFormatVersion {
+                format,
+                found,
+                max_supported,
+            }) => {
+                assert_eq!(format, "lsm-wal");
+                assert_eq!(found, 0);
+                assert_eq!(max_supported, u32::from(wal::WAL_VERSION));
+            }
+            other => panic!("expected UnsupportedFormatVersion, got {other:?}"),
+        }
+    }
+
+    /// A version newer than this binary knows how to decode is the same
+    /// loud refusal, never a best-effort guess.
+    #[test]
+    fn future_version_is_unsupported() {
+        let mut bytes = wal::encode_wal_header().to_vec();
+        bytes[4] = wal::WAL_VERSION + 1;
+        match decode_wal(&bytes) {
+            Err(StorageError::UnsupportedFormatVersion {
+                format,
+                found,
+                max_supported,
+            }) => {
+                assert_eq!(format, "lsm-wal");
+                assert_eq!(found, u32::from(wal::WAL_VERSION + 1));
+                assert_eq!(max_supported, u32::from(wal::WAL_VERSION));
+            }
+            other => panic!("expected UnsupportedFormatVersion, got {other:?}"),
+        }
+    }
+
+    /// A torn header — a strict prefix of the real header, short of its
+    /// full length, exactly what a crash can leave — recovers as if the
+    /// file were empty: no records, nothing consumed, no error. Nothing
+    /// could have synced past an incomplete header (header and first
+    /// record always share one `sync` — see `wal`'s module docs), so this
+    /// is the crash-safety half of the format, not a corruption case.
+    #[test]
+    fn torn_header_recovers_as_empty() {
+        let full_header = wal::encode_wal_header();
+        for len in 0..wal::WAL_HEADER_LEN {
+            let torn = &full_header[..len];
+            let (records, consumed) = decode_wal(torn).unwrap_or_else(|e| {
+                panic!("a {len}-byte torn header must recover as empty, got Err: {e}")
+            });
+            assert!(
+                records.is_empty(),
+                "a {len}-byte torn header must decode with no records"
+            );
+            assert_eq!(consumed, 0, "a {len}-byte torn header must consume nothing");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
