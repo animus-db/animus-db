@@ -11057,8 +11057,8 @@ mod stream_write_path_tests {
 
     use crate::config::NodeRole;
     use crate::{
-        ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, read_frame, run_node,
-        write_frame,
+        ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, connect_client, read_frame,
+        run_node, write_frame,
     };
 
     fn free_addrs(count: usize) -> Vec<SocketAddr> {
@@ -11412,7 +11412,7 @@ mod stream_write_path_tests {
 
     /// Send one plain-client-protocol request and return the reply.
     async fn raw_request(addr: SocketAddr, request: &ClientRequest) -> ClientResponse {
-        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        let mut stream = connect_client(addr).await.expect("connect");
         write_frame(&mut stream, request).await.expect("send");
         read_frame(&mut stream)
             .await

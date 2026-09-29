@@ -38,7 +38,7 @@ use tokio::time::{sleep, timeout};
 mod support;
 
 async fn call(addr: SocketAddr, req: ClientRequest) -> Option<ClientResponse> {
-    let mut stream = TcpStream::connect(addr).await.ok()?;
+    let mut stream = animusd::connect_client(addr).await.ok()?;
     animusd::write_frame(&mut stream, &req).await.ok()?;
     read_frame(&mut stream).await.ok()?
 }
@@ -196,39 +196,64 @@ async fn bring_up_base(dir: &Path) -> (Vec<Node>, ClusterConfig) {
     support::bring_up_deadline(1, dir, support::JOIN_DEADLINE).await
 }
 
-/// A fresh combined-mode `RoleAddrs` (own ports, no config file) for join
-/// index `index`.
+/// A fresh, unbound (`:0`) combined-mode `RoleAddrs` for join index `index`
+/// — **bind-and-hold, not probe-and-release (issue #1042)**: every port is
+/// `:0`, resolved atomically by `Node::bind` inside `run_node_join`/
+/// `run_node_join_with_settings` itself (whose explicit-`--id` path now
+/// binds before it durably claims `--id`'s `NodeAddrs`), never a
+/// [`support::free_addrs`] probe that releases the port before the real
+/// bind. See `support::join_fresh_deadline`'s own doc for the full account.
 fn fresh_combined_addrs(index: usize, encryption_key_path: Option<String>) -> RoleAddrs {
-    let raw = support::free_addrs(6);
+    let ephemeral = SocketAddr::from(([127, 0, 0, 1], 0));
     RoleAddrs {
         id: animusd::config::node_id(index),
         role: animusd::config::NodeRole::Both,
-        internal: raw[0],
-        client: raw[1],
-        dynamo: raw[2],
-        admin: raw[3],
-        intra: raw[4],
-        console: raw[5],
+        internal: ephemeral,
+        client: ephemeral,
+        dynamo: ephemeral,
+        admin: ephemeral,
+        intra: ephemeral,
+        console: ephemeral,
         advertise_host: None,
         tls: None,
         encryption_key_path,
     }
 }
 
+/// The [`RoleAddrs`] a joined `node` actually bound — its own `:0` request
+/// resolved to real ports, recovered from the started [`Node`]'s own
+/// accessors (never the pre-bind request, which names no real port).
+/// `internal` stays the pre-bind `:0` request verbatim: nothing in this
+/// file dials it directly, and a later solo restart of the same directory
+/// (`solo_config`) doesn't need it to match — `Node` itself exposes no
+/// post-bind `internal_addr()` accessor to recover it from.
+fn bound_combined_addrs(requested: &RoleAddrs, node: &Node) -> RoleAddrs {
+    RoleAddrs {
+        client: node.client_addr(),
+        dynamo: node.dynamo_addr(),
+        admin: node.admin_addr(),
+        intra: node.intra_addr(),
+        console: node.console_addr(),
+        ..requested.clone()
+    }
+}
+
 /// Join a fresh combined-mode node via a BARE `animusd::run_node_join` call
 /// (its own unchanged, defaulted signature — no settings overrides), the
 /// exact shape a bare `animusd join` with no flags produces. Retries the
-/// allocate-ports-and-join step as a unit against a deadline, the same
-/// port-TOCTOU-resilient shape `support::join_fresh_deadline` uses.
+/// whole bind-and-join attempt (a fresh `:0` bind + claim, exactly like
+/// every other attempt) against a deadline — see `fresh_combined_addrs`'s
+/// own doc.
 async fn join_bare(seeds: &[SocketAddr], index: usize, dir: &Path) -> (Node, RoleAddrs, PathBuf) {
     let deadline = tokio::time::Instant::now() + support::JOIN_DEADLINE;
-    let addrs = fresh_combined_addrs(index, None);
+    let id = animusd::config::node_id(index);
     let mut attempt: u64 = 0;
     loop {
+        let addrs = fresh_combined_addrs(index, None);
         let node_dir = dir.join(format!("join-bare-{index}-{attempt}"));
         match animusd::run_node_join(
             seeds.iter().map(ToString::to_string).collect(),
-            Some(addrs.id.clone()),
+            Some(id.clone()),
             addrs.clone(),
             &node_dir,
             StorageBackend::Memory,
@@ -236,7 +261,10 @@ async fn join_bare(seeds: &[SocketAddr], index: usize, dir: &Path) -> (Node, Rol
         )
         .await
         {
-            Ok(node) => return (node, addrs, node_dir),
+            Ok(node) => {
+                let bound_addrs = bound_combined_addrs(&addrs, &node);
+                return (node, bound_addrs, node_dir);
+            }
             Err(e) => {
                 assert!(
                     tokio::time::Instant::now() < deadline,
@@ -265,13 +293,14 @@ async fn join_with_settings(
     encryption_key_path: Option<String>,
 ) -> (Node, RoleAddrs, PathBuf) {
     let deadline = tokio::time::Instant::now() + support::JOIN_DEADLINE;
-    let addrs = fresh_combined_addrs(index, encryption_key_path);
+    let id = animusd::config::node_id(index);
     let mut attempt: u64 = 0;
     loop {
+        let addrs = fresh_combined_addrs(index, encryption_key_path.clone());
         let node_dir = dir.join(format!("join-{index}-{attempt}"));
         match animusd::run_node_join_with_settings(
             seeds.iter().map(ToString::to_string).collect(),
-            Some(addrs.id.clone()),
+            Some(id.clone()),
             addrs.clone(),
             &node_dir,
             StorageBackend::Memory,
@@ -284,7 +313,10 @@ async fn join_with_settings(
         )
         .await
         {
-            Ok(node) => return (node, addrs, node_dir),
+            Ok(node) => {
+                let bound_addrs = bound_combined_addrs(&addrs, &node);
+                return (node, bound_addrs, node_dir);
+            }
             Err(e) => {
                 assert!(
                     tokio::time::Instant::now() < deadline,

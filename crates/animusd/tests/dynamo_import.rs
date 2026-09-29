@@ -216,7 +216,7 @@ fn tablets_for(meta: &animus_control::Metadata, table: &str) -> Vec<animus_table
 /// A plain-client-protocol `SplitTablet` call — mirrors `dynamo_export.rs`'s
 /// identical helper.
 async fn plain_split(client_addr: SocketAddr, tablet: animus_tablet::TabletId, split_key: Vec<u8>) {
-    let mut stream = TcpStream::connect(client_addr)
+    let mut stream = animusd::connect_client(client_addr)
         .await
         .expect("connect to client port");
     animusd::write_frame(

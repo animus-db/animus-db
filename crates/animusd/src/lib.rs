@@ -131,8 +131,9 @@ use animus_cp_data::{
     SHARED_WAL, StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome, TxnRecordView,
 };
 use animus_env::{
-    Clock, Disk, Env, FsSegmentStore, MaybeTlsStream, Metric, MetricsHandle, Nanos, NodeId,
-    ProdEnv, TlsMaterial,
+    CLIENT_PROTOCOL, Clock, Disk, Env, FsSegmentStore, MaybeTlsStream, Metric, MetricsHandle,
+    Nanos, NodeId, PreambleError, ProdEnv, TlsMaterial, exchange_preamble, read_preamble,
+    write_own_preamble,
 };
 use animus_storage::{
     Key, LsmEngine, MemoryEngine, SsTableView, StorageEngine, StorageError, VersionedValue,
@@ -2233,6 +2234,230 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 /// resumes accepting within a fraction of an election timeout rather than
 /// lingering backed off while a caller times out reaching this node.
 pub(crate) const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(10);
+
+/// Bounds the client/intra port's own per-connection handshake preamble
+/// exchange (ADR 0073 Phase 0, workstream D, layer 3) — this crate's
+/// counterpart to `animus_env::prod`'s internal-`Network` `HANDSHAKE_
+/// TIMEOUT`, same value, same reasoning: generous relative to a
+/// same-datacenter round trip (a one-time per-connection cost, not a
+/// per-frame one), and on the dial side mostly moot in practice since every
+/// dialer already wraps its own connect-plus-handshake-plus-frame in a
+/// tighter budget of its own (`CLIENT_TIMEOUT`/`JOIN_ATTEMPT_TIMEOUT`/
+/// `relay_request_with_timeout`'s own `timeout` argument) — the real job
+/// here is the **accept** side, which (like the internal wire) has no other
+/// timeout guarding a peer that connects and then sends nothing at all.
+const CLIENT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Classifies a [`PreambleError`] from the client/intra port's own
+/// handshake exchange into a logged, and — for a genuine refusal —
+/// counted `io::Error`. Factored out of [`perform_client_handshake`] so
+/// [`client_request_pipelined`]'s own read-and-check-the-peer's-preamble
+/// step shares the identical logging/counting discipline rather than a
+/// second hand-rolled copy of it: every caller on this wire logs and
+/// counts a handshake failure exactly the same way, whether it reached
+/// that failure through the fused write-then-read [`exchange_preamble`]
+/// or through the pipelined write-frame-then-read shape.
+///
+/// Mirrors `animus_env::prod::perform_handshake`'s own counting/logging
+/// rationale verbatim, just against [`Metric::ClientHandshakeRefused`] and
+/// [`CLIENT_PROTOCOL`] instead of that module's own
+/// `NetworkHandshakeRefused`/`NETWORK_PROTOCOL`: only a genuine protocol
+/// refusal (bad magic, unsupported version, an oversized declared
+/// extension) is counted — a plain I/O failure or a timeout is logged but
+/// not counted, since both are what a merely slow or already-dead peer
+/// looks like, not evidence of a wire mismatch.
+///
+/// `role` is `"accept"` or `"dial"`, only for the log line; `peer_desc` is
+/// the peer's address as this side knows it.
+fn classify_client_handshake_error(
+    err: PreambleError,
+    role: &'static str,
+    peer_desc: &str,
+    metrics: &MetricsHandle,
+) -> std::io::Error {
+    match err {
+        PreambleError::Io(err) => {
+            tracing::warn!(
+                ?err,
+                peer = %peer_desc,
+                role,
+                "client handshake failed (closing connection)"
+            );
+            err
+        }
+        PreambleError::Refused(err) => {
+            tracing::warn!(
+                ?err,
+                peer = %peer_desc,
+                role,
+                "client handshake refused (closing connection)"
+            );
+            metrics.incr(Metric::ClientHandshakeRefused);
+            std::io::Error::new(std::io::ErrorKind::InvalidData, err)
+        }
+        PreambleError::TimedOut => {
+            tracing::warn!(
+                peer = %peer_desc,
+                role,
+                timeout = ?CLIENT_HANDSHAKE_TIMEOUT,
+                "client handshake timed out (closing connection)"
+            );
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "client handshake timed out")
+        }
+    }
+}
+
+/// Performs this build's half of the client/intra port's per-connection
+/// handshake preamble (ADR 0073 Phase 0, workstream D, layer 3) on `conn` —
+/// this crate's own thin wrapper over the one shared implementation,
+/// `animus_env::exchange_preamble` (write ours, then read-and-check
+/// theirs, fused into one call). Used on the **accept** side
+/// ([`serve_requests`], where there is no request of our own to pipeline
+/// anything with) and by every **non-pooled, one-shot** dialer that isn't
+/// racing a per-hop budget against an unpooled relay connection
+/// ([`connect_client`], `animus-cli`'s own `maybe_tls_connect`/
+/// `connect_client`) — those pay one extra round trip per connection and
+/// it doesn't matter, since none of them opens a fresh connection *per
+/// forwarded request* the way [`relay_request_with_timeout`]/
+/// [`join_request`] do. See [`client_request_pipelined`] for the
+/// dial-side sibling those two use instead, and that function's own doc
+/// for why the forwarding path needs the extra round trip removed and how
+/// removing it is safe.
+///
+/// `role` is `"accept"` or `"dial"`, only for the log line; `peer_desc` is
+/// the peer's address as this side knows it. On any failure the connection
+/// is simply not usable any further — the caller closes it (by dropping
+/// it) without ever entering the frame loop.
+async fn perform_client_handshake<S: AsyncRead + AsyncWrite + Unpin>(
+    conn: &mut S,
+    role: &'static str,
+    peer_desc: &str,
+    metrics: &MetricsHandle,
+) -> std::io::Result<()> {
+    exchange_preamble(conn, &CLIENT_PROTOCOL, CLIENT_HANDSHAKE_TIMEOUT)
+        .await
+        .map_err(|err| classify_client_handshake_error(err, role, peer_desc, metrics))
+}
+
+/// The pipelined dial-side counterpart to [`perform_client_handshake`],
+/// built for the client/intra wire's **forwarding** path (ADR 0073 Phase
+/// 0, workstream D, layer 3's own pipelining amendment, closing the
+/// latency regression that layer's first cut introduced): writes this
+/// build's own [`CLIENT_PROTOCOL`] preamble, then `request`'s frame, back
+/// to back — **without** first waiting to read and check the peer's own
+/// preamble — then reads and checks the peer's preamble (bounded by
+/// [`CLIENT_HANDSHAKE_TIMEOUT`]), then reads the response frame.
+///
+/// **Why this is needed**: [`relay_request_with_timeout`] (every forward,
+/// `propose_schema`'s broadcast fallback, `AnimusdRelayClient::relay`) and
+/// [`join_request`] each open a **fresh** connection per call — relay
+/// connections are never pooled — so a per-connection handshake that
+/// waited for the peer's own preamble before ever sending the request
+/// frame added a full extra round trip to every single forwarded request,
+/// on top of the request's own round trip. Pipelining removes it: our
+/// preamble and our frame go out in the same burst, so the total cost
+/// stays one round trip (this write, the peer's eventual reply), not two.
+///
+/// **Why this is safe.** The accept side is asymmetric, not merely
+/// agreeable: [`serve_requests`]'s own accept-side handler runs
+/// [`perform_client_handshake`] (write ours, then read-and-check theirs,
+/// via the fused [`exchange_preamble`]) to completion **before** it ever
+/// calls `handle_connection` and reads a single frame. A mismatched
+/// server therefore never processes our frame at all — it refuses and
+/// closes the connection the instant it finds our preamble wrong, and the
+/// frame we already sent is simply dropped along with the rest of the
+/// stream, unread. There is no deadlock risk either: both sides write
+/// only a small, bounded amount before reading anything (a preamble, plus
+/// on our side one request frame), so neither side's write can ever block
+/// on the other side's own unread output for long enough to matter.
+async fn client_request_pipelined<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    peer_desc: &str,
+    request: &ClientRequest,
+) -> std::io::Result<ClientResponse> {
+    write_own_preamble(stream, &CLIENT_PROTOCOL)
+        .await
+        .map_err(|err| {
+            classify_client_handshake_error(err, "dial", peer_desc, &MetricsHandle::noop())
+        })?;
+    write_frame(stream, request).await?;
+    match tokio::time::timeout(
+        CLIENT_HANDSHAKE_TIMEOUT,
+        read_preamble(stream, &CLIENT_PROTOCOL),
+    )
+    .await
+    {
+        Ok(Ok(peer)) => {
+            if let Err(err) = animus_env::handshake::check_peer(&CLIENT_PROTOCOL, &peer) {
+                return Err(classify_client_handshake_error(
+                    PreambleError::Refused(err),
+                    "dial",
+                    peer_desc,
+                    &MetricsHandle::noop(),
+                ));
+            }
+        }
+        Ok(Err(err)) => {
+            return Err(classify_client_handshake_error(
+                err,
+                "dial",
+                peer_desc,
+                &MetricsHandle::noop(),
+            ));
+        }
+        Err(_elapsed) => {
+            return Err(classify_client_handshake_error(
+                PreambleError::TimedOut,
+                "dial",
+                peer_desc,
+                &MetricsHandle::noop(),
+            ));
+        }
+    }
+    read_frame::<ClientResponse, _>(stream)
+        .await?
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "connection closed before a reply",
+            )
+        })
+}
+
+/// **The one shared dial entry point for the client/intra JSON-RPC wire**
+/// (ADR 0073 Phase 0, workstream D, layer 3): connects a plain (non-TLS)
+/// `TcpStream` to `addr`, then performs this build's half of the
+/// [`CLIENT_PROTOCOL`] handshake before returning — every one-shot dialer
+/// of this wire (the `animus` CLI, `animusd`'s own integration tests,
+/// benches, and every plain-TCP internal caller that dials once and reuses
+/// the connection for more than a single relay hop) goes through this
+/// function instead of a bare `TcpStream::connect`, so the handshake is
+/// never hand-rolled at a call site. **Not pipelined** — this connection
+/// isn't reused across many forwarded requests, so the extra round trip
+/// the fused [`perform_client_handshake`] pays is harmless here; see
+/// [`client_request_pipelined`]'s own doc for the forwarding path that
+/// does need it removed. A TLS-wrapped dialer (`relay_request_with_
+/// timeout`, `animus-cli`'s own `maybe_tls_connect`) cannot use this
+/// helper directly since it needs to lay TLS *underneath* the handshake —
+/// those instead call [`perform_client_handshake`]/[`client_request_
+/// pipelined`] straight on the (already TLS-wrapped, if configured)
+/// stream they build themselves, reusing the exact same underlying
+/// exchange.
+///
+/// # Errors
+/// Propagates a connect failure, or a handshake failure/refusal/timeout —
+/// see [`perform_client_handshake`].
+pub async fn connect_client(addr: impl tokio::net::ToSocketAddrs) -> std::io::Result<TcpStream> {
+    let mut stream = TcpStream::connect(addr).await?;
+    perform_client_handshake(
+        &mut stream,
+        "dial",
+        "client/intra dial",
+        &MetricsHandle::noop(),
+    )
+    .await?;
+    Ok(stream)
+}
 
 /// ADR 0055: the refusal a node returns for a **forwarded** eventual read it
 /// cannot serve — it holds no serveable replica of the tablet, or the one it
@@ -13990,6 +14215,18 @@ async fn serve_requests(
                                     }
                                 },
                             };
+                            let mut stream = stream;
+                            if perform_client_handshake(
+                                &mut stream,
+                                "accept",
+                                &peer_addr.to_string(),
+                                &ctx.env.metrics(),
+                            )
+                            .await
+                            .is_err()
+                            {
+                                return; // already logged/counted by perform_client_handshake
+                            }
                             if let Err(err) = handle_connection(stream, ctx, listener).await {
                                 tracing::debug!(?err, "connection closed");
                             }
@@ -16577,13 +16814,18 @@ const JOIN_DISCOVERY_BUDGET: Duration = SCHEMA_COMMIT_TIMEOUT;
 /// One pass over `seeds`, trying each in order for `request`; returns the
 /// first non-[`Error`](ClientResponse::Error) reply. Standalone (not a
 /// [`ClientCtx`] method) because a joining node has no context yet — this is
-/// exactly what it's discovering.
+/// exactly what it's discovering. **Dials through [`client_request_
+/// pipelined`]**, not the fused [`perform_client_handshake`] — this opens a
+/// fresh connection per seed per pass, exactly the unpooled shape that
+/// helper's own doc names, so pipelining the handshake with the request
+/// frame here saves one round trip per attempt.
 async fn join_request(seeds: &[String], request: &ClientRequest) -> Option<ClientResponse> {
     for addr in seeds {
         let reply = tokio::time::timeout(JOIN_ATTEMPT_TIMEOUT, async {
             let mut stream = TcpStream::connect(addr.as_str()).await.ok()?;
-            write_frame(&mut stream, request).await.ok()?;
-            read_frame::<ClientResponse, _>(&mut stream).await.ok()?
+            client_request_pipelined(&mut stream, addr.as_str(), request)
+                .await
+                .ok()
         })
         .await;
         if let Ok(Some(resp)) = reply
@@ -16740,19 +16982,53 @@ pub async fn run_node_join_with_settings(
     let (original_control_ids, peers, client_route, intra_route, admin_addrs) =
         discover_join_info(&seeds).await?;
 
-    let mine = NodeAddrs {
-        internal: advertised_addr(addrs.advertise_host.as_deref(), addrs.internal),
-        client: advertised_addr(addrs.advertise_host.as_deref(), addrs.client),
-        admin: advertised_addr(addrs.advertise_host.as_deref(), addrs.admin),
-        intra: advertised_addr(addrs.advertise_host.as_deref(), addrs.intra),
-        role: "combined".to_string(),
+    // Bind-and-hold BEFORE claim for an explicit `--id` (issue #1042,
+    // mirroring issue #627's bind-and-hold fix for fresh-cluster bring-up).
+    // The old order — claim (durably register `--id`'s `NodeAddrs` via
+    // `MetaCommand::RegisterNode`), THEN `Node::bind` — meant a bind
+    // failure (the ordinary port-TOCTOU this retry loop exists to survive)
+    // left a durable claim on file for addresses this process never
+    // actually bound; a caller's retry then picked FRESH ports for the
+    // SAME `--id` (an explicit id doesn't change across retries, unlike a
+    // self-minted one), and re-registering proposed a different `NodeAddrs`
+    // for an id that had already durably claimed a different one moments
+    // earlier — a genuine CAS collision against itself
+    // (`RegisterOutcome::Collision`, surfacing as "node id already claimed
+    // by a different registration"), wedging the whole retry loop for its
+    // full deadline. Binding first means a bind failure can never have
+    // registered anything — nothing to collide with — so a retry (even
+    // with a fresh `:0` port) is always safe.
+    //
+    // A **self-minted** id (`id: None`) can't take this path — `NodeId::
+    // mint` is a genuinely pre-bind operation (ADR 0040 Decision B, no
+    // `Env`/listener needed) — but doesn't need to: a fresh id is minted on
+    // every attempt, so the same-id-different-addrs collision this
+    // reordering exists to prevent can never arise for it (a collision
+    // there is against a DIFFERENT node's earlier claim, never against this
+    // attempt's own). It keeps the original claim-then-bind order.
+    let (bound, my_id) = match id {
+        Some(explicit_id) => {
+            let bound = Node::bind(explicit_id.clone(), addrs, dir).await?;
+            let mine = bound_node_addrs(&bound, "combined");
+            let my_id = claim_join_identity(&seeds, Some(explicit_id), &mine, &labels).await?;
+            (bound, my_id)
+        }
+        None => {
+            let mine = NodeAddrs {
+                internal: advertised_addr(addrs.advertise_host.as_deref(), addrs.internal),
+                client: advertised_addr(addrs.advertise_host.as_deref(), addrs.client),
+                admin: advertised_addr(addrs.advertise_host.as_deref(), addrs.admin),
+                intra: advertised_addr(addrs.advertise_host.as_deref(), addrs.intra),
+                role: "combined".to_string(),
+            };
+            let my_id = claim_join_identity(&seeds, None, &mine, &labels).await?;
+            let bound = Node::bind(my_id.clone(), addrs, dir).await?;
+            (bound, my_id)
+        }
     };
-    let my_id = claim_join_identity(&seeds, id, &mine, &labels).await?;
-    let my_client_addr = addrs.client;
-    let my_admin_addr = addrs.admin;
-    let my_intra_addr = addrs.intra;
-
-    let bound = Node::bind(my_id.clone(), addrs, dir).await?;
+    let my_client_addr = bound.client_addr();
+    let my_admin_addr = bound.admin_addr();
+    let my_intra_addr = bound.intra_addr();
 
     finish_combined_join(
         bound,
@@ -16947,6 +17223,36 @@ async fn register_node_over_wire(
     }
 }
 
+/// The [`NodeAddrs`] a join should register for an already-[`Node::bind`]
+/// -bound `bound` — its own actually-resolved addresses (never the pre-bind
+/// request, which may have asked for `:0`), advertised through `bound`'s
+/// own `advertise_host` exactly like every other post-bind `NodeAddrs`
+/// construction in this file (`finish_combined_join`'s own merge,
+/// `BoundNode::start_with_growth`'s `mine`). Used only by
+/// [`run_node_join_with_settings`]'s explicit-`--id` bind-then-claim path
+/// (issue #1042) — see that call site's own doc.
+fn bound_node_addrs(bound: &BoundNode, role: &str) -> NodeAddrs {
+    NodeAddrs {
+        internal: advertised_addr(bound.advertise_host.as_deref(), bound.internal_addr()),
+        client: advertised_addr(bound.advertise_host.as_deref(), bound.client_addr()),
+        admin: advertised_addr(bound.advertise_host.as_deref(), bound.admin_addr()),
+        intra: advertised_addr(bound.advertise_host.as_deref(), bound.intra_addr()),
+        role: role.to_string(),
+    }
+}
+
+/// [`bound_node_addrs`]'s data-only dual, for [`run_node_data_join_with_settings`]'s
+/// identical bind-then-claim path.
+fn bound_data_node_addrs(bound: &BoundDataNode, role: &str) -> NodeAddrs {
+    NodeAddrs {
+        internal: advertised_addr(bound.advertise_host.as_deref(), bound.internal_addr),
+        client: advertised_addr(bound.advertise_host.as_deref(), bound.client_addr()),
+        admin: advertised_addr(bound.advertise_host.as_deref(), bound.admin_addr()),
+        intra: advertised_addr(bound.advertise_host.as_deref(), bound.intra_addr()),
+        role: role.to_string(),
+    }
+}
+
 /// Claim this join's identity, **pre-bind** (ADR 0040 Decision B/C):
 /// `explicit_id` is a `--id NAME` proposal (already validated —
 /// [`NodeId::propose`] ran at the CLI boundary), registered with one attempt
@@ -17081,19 +17387,32 @@ pub async fn run_node_data_join_with_settings(
     let (original_control_ids, peers, client_route, intra_route, admin_addrs) =
         discover_join_info(&seeds).await?;
 
-    let mine = NodeAddrs {
-        internal: advertised_addr(addrs.advertise_host.as_deref(), addrs.internal),
-        client: advertised_addr(addrs.advertise_host.as_deref(), addrs.client),
-        admin: advertised_addr(addrs.advertise_host.as_deref(), addrs.admin),
-        intra: advertised_addr(addrs.advertise_host.as_deref(), addrs.intra),
-        role: "data".to_string(),
+    // Bind-and-hold BEFORE claim for an explicit `--id` — the data-only
+    // dual of [`run_node_join_with_settings`]'s identical fix (issue
+    // #1042); see that call site's own doc for the full account.
+    let (bound, my_id) = match id {
+        Some(explicit_id) => {
+            let bound = Node::bind_data(explicit_id.clone(), addrs, dir).await?;
+            let mine = bound_data_node_addrs(&bound, "data");
+            let my_id = claim_join_identity(&seeds, Some(explicit_id), &mine, &labels).await?;
+            (bound, my_id)
+        }
+        None => {
+            let mine = NodeAddrs {
+                internal: advertised_addr(addrs.advertise_host.as_deref(), addrs.internal),
+                client: advertised_addr(addrs.advertise_host.as_deref(), addrs.client),
+                admin: advertised_addr(addrs.advertise_host.as_deref(), addrs.admin),
+                intra: advertised_addr(addrs.advertise_host.as_deref(), addrs.intra),
+                role: "data".to_string(),
+            };
+            let my_id = claim_join_identity(&seeds, None, &mine, &labels).await?;
+            let bound = Node::bind_data(my_id.clone(), addrs, dir).await?;
+            (bound, my_id)
+        }
     };
-    let my_id = claim_join_identity(&seeds, id, &mine, &labels).await?;
-    let my_client_addr = addrs.client;
-    let my_admin_addr = addrs.admin;
-    let my_intra_addr = addrs.intra;
-
-    let bound = Node::bind_data(my_id.clone(), addrs, dir).await?;
+    let my_client_addr = bound.client_addr();
+    let my_admin_addr = bound.admin_addr();
+    let my_intra_addr = bound.intra_addr();
 
     finish_data_join(
         bound,
@@ -17254,6 +17573,16 @@ pub use animus_node::MAX_FRAME_LEN;
 /// own documented requirement. A handshake failure surfaces as a plain
 /// connect failure, handled by the exact same fast-confirmed-dead path as
 /// any other dial failure below.
+///
+/// **Pipelined, not fused (ADR 0073 Phase 0, workstream D, layer 3's own
+/// pipelining amendment)**: this function opens a fresh, unpooled
+/// connection per call — the shape [`client_request_pipelined`]'s own doc
+/// names as needing the extra handshake round trip removed — so it dials
+/// through that helper instead of the fused [`perform_client_handshake`] +
+/// a separate `write_frame`/`read_frame` pair. No behavior change to the
+/// two sentinels below: a pipelined handshake failure is still resolved
+/// (or times out) inside the same outer `timeout(..)`, so it still comes
+/// out as `RELAY_TRANSPORT_FAILURE`/`RELAY_HOP_TIMEOUT` exactly as before.
 async fn relay_request_with_timeout(
     addr: String,
     request: &ClientRequest,
@@ -17270,8 +17599,9 @@ async fn relay_request_with_timeout(
                 MaybeTlsStream::Tls(Box::new(tls_stream.into()))
             }
         };
-        write_frame(&mut stream, request).await.ok()?;
-        read_frame::<ClientResponse, _>(&mut stream).await.ok()?
+        client_request_pipelined(&mut stream, &addr, request)
+            .await
+            .ok()
     })
     .await
     {
@@ -17329,6 +17659,227 @@ const RELAY_TRANSPORT_FAILURE: &str = "relay to peer node failed";
 /// See `forward_to_tablet_leader`'s own doc for the full mechanism this
 /// sentinel exists to support.
 const RELAY_HOP_TIMEOUT: &str = "relay hop timed out";
+
+/// Tests for [`client_request_pipelined`] and its two callers,
+/// [`relay_request_with_timeout`]/[`join_request`] (ADR 0073 Phase 0,
+/// workstream D, layer 3's own pipelining amendment) — in-crate because
+/// all three are private, plain (not `pub(crate)`) items at this crate's
+/// root, only reachable from a descendant module of `lib.rs` itself (see
+/// this crate's own `CLAUDE.md`, "Every in-crate bring-up retries the
+/// port-TOCTOU race" — the identical reason `forward_hop_timeout_tests`
+/// lives here rather than in `tests/`). Every stub below is a raw
+/// `TcpListener`, deterministic by construction (nothing time-based on the
+/// stub's own side) — the only clock that can ever fire is the real
+/// timeout under test, matching this file's own established stub idiom
+/// (`forward_hop_timeout_tests::spawn_never_answers_stub` and its
+/// siblings).
+#[cfg(test)]
+mod client_request_pipelining_tests {
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    use tokio::net::TcpListener;
+    use tokio::time::Instant;
+
+    use crate::{ClientRequest, ClientResponse};
+
+    /// A correct accept-side stub: writes its own genuine `CLIENT_PROTOCOL`
+    /// preamble eagerly (exactly like the real `serve_requests`/
+    /// `perform_client_handshake` accept path — it never waits on the
+    /// dialer first), then reads and checks the dialer's own preamble,
+    /// then reads the request frame and answers with `PutOk`. Models a
+    /// genuinely well-behaved peer, proving the pipelined dial still works
+    /// end to end against one.
+    async fn spawn_correct_server_stub(addr: SocketAddr) {
+        let listener = TcpListener::bind(addr).await.expect("bind stub");
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            if animus_env::write_own_preamble(&mut stream, &animus_env::CLIENT_PROTOCOL)
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let Ok(peer) =
+                animus_env::read_preamble(&mut stream, &animus_env::CLIENT_PROTOCOL).await
+            else {
+                return;
+            };
+            if animus_env::handshake::check_peer(&animus_env::CLIENT_PROTOCOL, &peer).is_err() {
+                return;
+            }
+            let _req: Option<ClientRequest> = crate::read_frame(&mut stream).await.ok().flatten();
+            let _ = crate::write_frame(&mut stream, &ClientResponse::PutOk).await;
+        });
+    }
+
+    /// A dial-side round trip against [`spawn_correct_server_stub`]
+    /// succeeds and comes back quickly — the focused positive proof the
+    /// task asks for, even though every real forwarding test already
+    /// exercises this path implicitly (a live peer's own `serve_requests`
+    /// accept handler is exactly this stub's own sequence).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pipelined_dial_succeeds_against_a_correct_server() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        spawn_correct_server_stub(addr).await;
+
+        let started = Instant::now();
+        let resp = crate::relay_request_with_timeout(
+            addr.to_string(),
+            &ClientRequest::Status,
+            Duration::from_secs(5),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(resp, ClientResponse::PutOk),
+            "a well-behaved peer must answer normally: {resp:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a correct peer should never make the pipelined dial wait: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A stub that replies with a right-magic, wrong-version preamble the
+    /// instant it accepts — never reading anything the dialer sent at all.
+    /// Proves a genuine protocol refusal surfaces through the relay path
+    /// as [`RELAY_TRANSPORT_FAILURE`] (a fast, confirmed failure resolved
+    /// well within the outer relay timeout), never a panic and never
+    /// `RELAY_HOP_TIMEOUT`.
+    async fn spawn_wrong_version_stub(addr: SocketAddr) {
+        let listener = TcpListener::bind(addr).await.expect("bind stub");
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let bad = animus_env::handshake::Preamble {
+                magic: animus_env::CLIENT_PROTOCOL.magic,
+                version: animus_env::CLIENT_PROTOCOL.version + 1,
+                extensions: Vec::new(),
+            };
+            let _ = tokio::io::AsyncWriteExt::write_all(
+                &mut stream,
+                &animus_env::handshake::encode(&bad),
+            )
+            .await;
+            let _ = tokio::io::AsyncWriteExt::flush(&mut stream).await;
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_wrong_version_peer_yields_a_relay_transport_failure_never_a_panic() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        spawn_wrong_version_stub(addr).await;
+
+        let resp = crate::relay_request_with_timeout(
+            addr.to_string(),
+            &ClientRequest::Status,
+            Duration::from_secs(5),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(&resp, ClientResponse::Error(msg) if msg == crate::RELAY_TRANSPORT_FAILURE),
+            "a genuine version mismatch must be a fast, confirmed transport failure, not a \
+             hop timeout or anything else: {resp:?}"
+        );
+    }
+
+    /// The pipelining regression test itself: a stub that reads the
+    /// dialer's own preamble **and** its request frame in full *before*
+    /// ever writing its own preamble back — the exact reversed order a
+    /// fused write-ours-then-wait-for-theirs dial can never satisfy (it
+    /// would block forever waiting to read a preamble the stub will not
+    /// send until it has first read a frame the fused dial never sent).
+    /// Against the pipelined dial this resolves immediately: the frame
+    /// already arrived right behind the preamble, with nothing in between
+    /// waiting on this stub's own reply.
+    async fn spawn_reversed_order_stub(addr: SocketAddr) {
+        let listener = TcpListener::bind(addr).await.expect("bind stub");
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            // Read the dialer's preamble first...
+            let Ok(peer) =
+                animus_env::read_preamble(&mut stream, &animus_env::CLIENT_PROTOCOL).await
+            else {
+                return;
+            };
+            if animus_env::handshake::check_peer(&animus_env::CLIENT_PROTOCOL, &peer).is_err() {
+                return;
+            }
+            // ...then the request frame — proving both arrived with no
+            // wait on this stub's own preamble in between.
+            let Ok(Some(_req)) = crate::read_frame::<ClientRequest, _>(&mut stream).await else {
+                return;
+            };
+            // Only now does the stub write its own preamble and answer.
+            if animus_env::write_own_preamble(&mut stream, &animus_env::CLIENT_PROTOCOL)
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let _ = crate::write_frame(&mut stream, &ClientResponse::PutOk).await;
+        });
+    }
+
+    /// Pre-fix (the fused `perform_client_handshake` dial), this stub
+    /// deadlocks: the dialer waits to read the stub's own preamble before
+    /// ever writing its request frame, and the stub waits to read that
+    /// same frame before ever writing its own preamble — resolved only by
+    /// the outer relay timeout, `RELAY_HOP_TIMEOUT`. Post-fix (the
+    /// pipelined dial), the dialer's preamble and frame both land before
+    /// the stub ever has to answer anything, so this returns quickly with
+    /// a real reply. The elapsed-time assertion is the actual teeth (the
+    /// generous outer timeout alone would still pass on the old,
+    /// deadlocking behavior, just slower); this was confirmed to fail
+    /// (time out at the outer bound, returning `RELAY_HOP_TIMEOUT`) against
+    /// the pre-fix code before the fix landed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pipelined_dial_sends_the_request_frame_right_behind_its_preamble_never_waiting_for_the_peers()
+     {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        spawn_reversed_order_stub(addr).await;
+
+        let started = Instant::now();
+        // Generous outer bound (comfortably below `CLIENT_HANDSHAKE_
+        // TIMEOUT`'s own 10s) so a pre-fix deadlock is still observed as a
+        // clean `RELAY_HOP_TIMEOUT` rather than racing some other timer;
+        // the real assertion is the elapsed-time bound below.
+        let resp = crate::relay_request_with_timeout(
+            addr.to_string(),
+            &ClientRequest::Status,
+            Duration::from_secs(8),
+            None,
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(resp, ClientResponse::PutOk),
+            "the pipelined dial must complete against this stub instead of deadlocking on the \
+             fused, wait-for-their-preamble-first shape: {resp:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "pre-fix this stub deadlocks until the outer relay timeout (8s), returning \
+             RELAY_HOP_TIMEOUT; the pipelined dial must instead complete almost immediately, \
+             with no round trip spent waiting on the peer's own preamble: took {elapsed:?}"
+        );
+    }
+}
 
 /// Write a length-prefixed (`u32` big-endian) JSON frame.
 ///
@@ -17448,7 +17999,7 @@ mod confirm_futility_tests {
     use crate::write_path::KindEvalApplied;
     use crate::{
         AnimusdRelayClient, ClientCtx, ClientRequest, ClientResponse, ClusterConfig, Node,
-        ProbeIdentity, RoleAddrs, read_frame, run_node, write_frame,
+        ProbeIdentity, RoleAddrs, connect_client, read_frame, run_node, write_frame,
     };
 
     fn free_addrs(count: usize) -> Vec<SocketAddr> {
@@ -17480,7 +18031,7 @@ mod confirm_futility_tests {
     }
 
     async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
-        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let mut stream = connect_client(addr).await.expect("connect");
         write_frame(&mut stream, &req).await.expect("send");
         read_frame(&mut stream)
             .await
@@ -17686,7 +18237,9 @@ mod forward_transport_failure_tests {
     use tokio::time::{sleep, timeout};
 
     use crate::config::NodeRole;
-    use crate::{ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, run_node};
+    use crate::{
+        ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, connect_client, run_node,
+    };
 
     fn free_addrs(count: usize) -> Vec<SocketAddr> {
         let ls: Vec<std::net::TcpListener> = (0..count)
@@ -17771,7 +18324,7 @@ mod forward_transport_failure_tests {
         // clusters are already warm by their own first write.
         timeout(Duration::from_secs(40), async {
             loop {
-                let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+                let mut stream = connect_client(addr).await.expect("connect");
                 crate::write_frame(
                     &mut stream,
                     &ClientRequest::Put {
@@ -17957,7 +18510,9 @@ mod forward_hop_timeout_tests {
     use tokio::time::{Instant, sleep, timeout};
 
     use crate::config::NodeRole;
-    use crate::{ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, run_node};
+    use crate::{
+        ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, connect_client, run_node,
+    };
 
     // Hand-rolled fixture helpers, duplicated from `forward_transport_
     // failure_tests` above rather than shared — every in-crate test module
@@ -18037,7 +18592,7 @@ mod forward_hop_timeout_tests {
     async fn put_until_ok(addr: SocketAddr, table: &str, key: &[u8], value: &[u8]) {
         timeout(Duration::from_secs(40), async {
             loop {
-                let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+                let mut stream = connect_client(addr).await.expect("connect");
                 crate::write_frame(
                     &mut stream,
                     &ClientRequest::Put {
@@ -18229,7 +18784,10 @@ mod forward_hop_timeout_tests {
                         // The stalled first hop: drain whatever the caller
                         // sends and hold the connection open with no reply
                         // — only the caller's own FORWARD_HOP_TIMEOUT ends
-                        // this side of things.
+                        // this side of things. Never completing the
+                        // handshake either is the identical "never
+                        // answers" shape [`spawn_never_answers_stub`]
+                        // already relies on.
                         let mut buf = [0u8; 4096];
                         loop {
                             match stream.read(&mut buf).await {
@@ -18238,8 +18796,23 @@ mod forward_hop_timeout_tests {
                             }
                         }
                     }
-                    // A later connection: answer immediately, as the real
-                    // leader would once its slow commit finally finishes.
+                    // A later connection: complete this build's half of
+                    // the client-protocol handshake (ADR 0073 Phase 0,
+                    // workstream D) before answering — the real dialer
+                    // waits for it before ever sending its own request
+                    // frame.
+                    if animus_env::exchange_preamble(
+                        &mut stream,
+                        &animus_env::CLIENT_PROTOCOL,
+                        Duration::from_secs(5),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
+                    // Answer immediately, as the real leader would once
+                    // its slow commit finally finishes.
                     let _ = crate::write_frame(&mut stream, &ClientResponse::PutOk).await;
                 });
             }
@@ -18266,6 +18839,16 @@ mod forward_hop_timeout_tests {
                 };
                 let hint_msg = hint_msg.clone();
                 tokio::spawn(async move {
+                    if animus_env::exchange_preamble(
+                        &mut stream,
+                        &animus_env::CLIENT_PROTOCOL,
+                        Duration::from_secs(5),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
                     let _req: Option<ClientRequest> =
                         crate::read_frame(&mut stream).await.ok().flatten();
                     sleep(delay).await;
@@ -18297,6 +18880,16 @@ mod forward_hop_timeout_tests {
                     return;
                 };
                 tokio::spawn(async move {
+                    if animus_env::exchange_preamble(
+                        &mut stream,
+                        &animus_env::CLIENT_PROTOCOL,
+                        Duration::from_secs(5),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
                     let _req: Option<ClientRequest> =
                         crate::read_frame(&mut stream).await.ok().flatten();
                     sleep(delay).await;
@@ -18656,7 +19249,9 @@ mod client_cancellation_tests {
     use tokio::time::{sleep, timeout};
 
     use crate::config::NodeRole;
-    use crate::{ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, run_node};
+    use crate::{
+        ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, connect_client, run_node,
+    };
 
     // Hand-rolled fixture helpers, duplicated from the sibling in-crate test
     // modules above rather than shared (see this crate's own `CLAUDE.md`,
@@ -18735,7 +19330,7 @@ mod client_cancellation_tests {
     async fn put_until_ok(addr: SocketAddr, table: &str, key: &[u8], value: &[u8]) {
         timeout(Duration::from_secs(40), async {
             loop {
-                let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+                let mut stream = connect_client(addr).await.expect("connect");
                 crate::write_frame(
                     &mut stream,
                     &ClientRequest::Put {
@@ -18881,7 +19476,7 @@ mod client_cancellation_tests {
         // connection ~100ms later -- long before the leader could ever
         // finish on its own (its only path to finishing without our help
         // is CLIENT_TIMEOUT, 10s away).
-        let mut stream = tokio::net::TcpStream::connect(leader_addr)
+        let mut stream = connect_client(leader_addr)
             .await
             .expect("connect to stranded leader");
         crate::write_frame(
@@ -18965,7 +19560,7 @@ mod client_cancellation_tests {
             .metrics()
             .get(Metric::ClientRequestsAbandoned);
 
-        let mut stream = tokio::net::TcpStream::connect(nodes[0].client_addr())
+        let mut stream = connect_client(nodes[0].client_addr())
             .await
             .expect("connect");
         // Both requests go out before either reply is read -- the exact
@@ -19074,14 +19669,12 @@ mod halted_shutdown_tests {
     /// Seed a put so the single-voter group provisions its first tablet and
     /// elects, then return that tablet's locally-hosted group handle.
     async fn provision_and_get_group(node: &Node) -> crate::CpGroup {
-        use crate::{ClientRequest, ClientResponse, read_frame, write_frame};
+        use crate::{ClientRequest, ClientResponse, connect_client, read_frame, write_frame};
 
         let client = node.client_addr();
         tokio::time::timeout(Duration::from_secs(20), async {
             loop {
-                let mut stream = tokio::net::TcpStream::connect(client)
-                    .await
-                    .expect("connect");
+                let mut stream = connect_client(client).await.expect("connect");
                 write_frame(
                     &mut stream,
                     &ClientRequest::Put {

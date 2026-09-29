@@ -23,7 +23,7 @@ use tokio::time::{sleep, timeout};
 mod support;
 
 async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
-    let mut stream = TcpStream::connect(addr)
+    let mut stream = animusd::connect_client(addr)
         .await
         .unwrap_or_else(|e| panic!("connect to {addr} failed: {e}"));
     animusd::write_frame(&mut stream, &req).await.expect("send");

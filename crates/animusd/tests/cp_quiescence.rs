@@ -42,7 +42,9 @@ mod support;
 const QUIESCE_AFTER: Duration = Duration::from_millis(300);
 
 async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
-    let mut stream = TcpStream::connect(addr).await.expect("connect to node");
+    let mut stream = animusd::connect_client(addr)
+        .await
+        .expect("connect to node");
     animusd::write_frame(&mut stream, &req)
         .await
         .expect("send request");

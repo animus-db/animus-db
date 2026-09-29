@@ -1817,7 +1817,7 @@ async fn client_protocol_status_survives_a_populated_stream_shard_catalog() {
     // The bug's wire-side symptom: this used to panic the connection
     // handler mid-encode, so the client would see the connection drop
     // instead of a reply.
-    let mut stream = TcpStream::connect(client_addr)
+    let mut stream = animusd::connect_client(client_addr)
         .await
         .expect("connect to client port");
     animusd::write_frame(&mut stream, &ClientRequest::Status)
@@ -2012,7 +2012,7 @@ async fn admin_data_dynamo_proxy_rejects_unknown_op_cleanly() {
 /// (murmur hash bytes are not, in general, valid UTF-8, so `POST
 /// /admin/tablet/split`'s JSON string field cannot carry one).
 async fn plain_split(client_addr: SocketAddr, tablet: TabletId, split_key: Vec<u8>, new_id: u64) {
-    let mut stream = TcpStream::connect(client_addr)
+    let mut stream = animusd::connect_client(client_addr)
         .await
         .expect("connect to client port");
     write_frame(

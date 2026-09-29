@@ -826,6 +826,33 @@ pub enum Metric {
     /// regardless (that isolation is the fix this metric observes).
     CpReconcilerStopTimeout,
 
+    // --- Wire protocol handshake (ADR 0073 Phase 0, workstream D) ---
+    // Appended after the reconciler-stop-timeout variant above; every
+    // earlier variant's slot and the text-export order stay stable, so the
+    // snapshot remains byte-reproducible. Not yet incremented anywhere in
+    // this layer — `handshake.rs`'s `check_peer` is a pure function with no
+    // metrics handle of its own; a later layer (wiring the handshake into
+    // `ProdEnv`'s accept/connect paths and `animusd`'s client/intra port)
+    // calls `MetricsHandle::incr` at the point it actually refuses a peer's
+    // preamble. Split into two variants, not one, because they are
+    // different failure surfaces: a bad `Network`-protocol preamble means a
+    // stray/pre-baseline peer on the internal wire (control/CP-data Raft),
+    // while a bad `ClientProtocol` preamble means one on the client/intra
+    // JSON-RPC port — conflating them would hide which listener is actually
+    // seeing incompatible peers.
+    /// This node's internal-wire (`Network`) accept or connect path read a
+    /// peer preamble that failed [`crate::handshake::check_peer`] against
+    /// [`crate::handshake::NETWORK_PROTOCOL`] — a bad magic (a pre-baseline
+    /// peer whose first bytes are a raw, unversioned frame) or an
+    /// unsupported version (a differently-built peer). The connection is
+    /// refused before any frame is trusted.
+    NetworkHandshakeRefused,
+    /// This node's client/intra port read a peer preamble that failed
+    /// [`crate::handshake::check_peer`] against
+    /// [`crate::handshake::CLIENT_PROTOCOL`] — same two causes as
+    /// [`Self::NetworkHandshakeRefused`], on the client-facing/relay wire
+    /// instead of the internal one.
+    ClientHandshakeRefused,
     /// The current length of `ProdEnv`'s own `Inner::tasks` — the number of
     /// `tokio::task::AbortHandle`s it is tracking for `shutdown`/
     /// `shutdown_and_wait`, after whatever pruning `Spawner::spawn` has
@@ -848,7 +875,7 @@ pub enum Metric {
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 99] = [
+    pub const ALL: [Metric; 101] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -947,6 +974,8 @@ impl Metric {
         Metric::CpRouteFanoutExhausted,
         Metric::CpHousekeepingProposalsAccepted,
         Metric::CpReconcilerStopTimeout,
+        Metric::NetworkHandshakeRefused,
+        Metric::ClientHandshakeRefused,
         Metric::SpawnedTaskHandlesTracked,
     ];
 
@@ -1053,6 +1082,8 @@ impl Metric {
             Metric::CpRouteFanoutExhausted => "cp_route_fanout_exhausted",
             Metric::CpHousekeepingProposalsAccepted => "cp_housekeeping_proposals_accepted",
             Metric::CpReconcilerStopTimeout => "cp_reconciler_stop_timeout",
+            Metric::NetworkHandshakeRefused => "net_handshake_refused",
+            Metric::ClientHandshakeRefused => "client_handshake_refused",
             Metric::SpawnedTaskHandlesTracked => "spawned_task_handles_tracked",
         }
     }

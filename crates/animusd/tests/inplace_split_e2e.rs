@@ -297,7 +297,7 @@ async fn paced_writer(
     stop: Arc<AtomicBool>,
     retried_count: Arc<AtomicU64>,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut stream = TcpStream::connect(addr).await.expect("connect writer");
+    let mut stream = animusd::connect_client(addr).await.expect("connect writer");
     let mut acked = Vec::new();
     let mut i: u32 = 0;
     while !stop.load(Ordering::Relaxed) {
@@ -327,7 +327,7 @@ async fn inplace_split_survives_a_paced_continuous_writer_across_fork_and_cutove
         let (nodes, _config) = bring_up_inplace(3, dir.path(), StreamSealKnobs::default()).await;
         support::await_bootstrap(&nodes).await;
 
-        let mut stream = TcpStream::connect(nodes[0].client_addr())
+        let mut stream = animusd::connect_client(nodes[0].client_addr())
             .await
             .expect("connect client port");
         // Pre-split population: 16 keys `[k,0]..[k,15]` (single byte after

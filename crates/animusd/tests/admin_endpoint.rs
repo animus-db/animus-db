@@ -330,7 +330,7 @@ async fn admin_interface_surfaces_state_and_actions() {
         support::await_bootstrap(&nodes).await;
 
         // Write a key through the client API (forwarded to the CP leader).
-        let mut stream = TcpStream::connect(nodes[0].client_addr())
+        let mut stream = animusd::connect_client(nodes[0].client_addr())
             .await
             .expect("connect");
         put(
@@ -1029,7 +1029,7 @@ async fn admin_system_table_split_lineage_after_a_real_split() {
         support::await_bootstrap(&nodes).await;
         let admin_addr = nodes[0].admin_addr();
 
-        let mut stream = TcpStream::connect(nodes[0].client_addr())
+        let mut stream = animusd::connect_client(nodes[0].client_addr())
             .await
             .expect("connect");
         for i in 0..10u32 {
@@ -1234,7 +1234,7 @@ async fn admin_storage_compact_action() {
         let (nodes, _config) = bring_up(3, dir.path()).await;
         support::await_bootstrap(&nodes).await;
 
-        let mut stream = TcpStream::connect(nodes[0].client_addr())
+        let mut stream = animusd::connect_client(nodes[0].client_addr())
             .await
             .expect("connect");
         put(

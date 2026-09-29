@@ -122,7 +122,7 @@ async fn await_true<F: Fn() -> bool>(secs: u64, what: &str, cond: F) {
 /// is individually bounded).
 async fn row_count(addr: SocketAddr, table: &str) -> Option<usize> {
     let once = async {
-        let mut s = TcpStream::connect(addr).await.ok()?;
+        let mut s = animusd::connect_client(addr).await.ok()?;
         let req = ClientRequest::Scan {
             start: Vec::new(),
             end: None,

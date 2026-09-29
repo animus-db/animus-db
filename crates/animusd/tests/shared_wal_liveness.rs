@@ -116,7 +116,9 @@ const LOAD_PHASE_BUDGET: Duration = Duration::from_secs(120);
 const GC_METRIC_BUDGET: Duration = Duration::from_secs(15);
 
 async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
-    let mut stream = TcpStream::connect(addr).await.expect("connect to node");
+    let mut stream = animusd::connect_client(addr)
+        .await
+        .expect("connect to node");
     animusd::write_frame(&mut stream, &req)
         .await
         .expect("send request");

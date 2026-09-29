@@ -124,7 +124,7 @@ async fn admin(addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -
 async fn client_put(addr: SocketAddr, table: &str, key: &[u8], value: &[u8]) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
-        let mut stream = TcpStream::connect(addr).await.expect("connect client");
+        let mut stream = animusd::connect_client(addr).await.expect("connect client");
         write_frame(
             &mut stream,
             &ClientRequest::Put {
@@ -151,7 +151,7 @@ async fn client_put(addr: SocketAddr, table: &str, key: &[u8], value: &[u8]) {
 
 /// Linearizable read of `key` from `table` through a node's client port.
 async fn client_get(addr: SocketAddr, table: &str, key: &[u8]) -> Option<Vec<u8>> {
-    let mut stream = TcpStream::connect(addr).await.expect("connect client");
+    let mut stream = animusd::connect_client(addr).await.expect("connect client");
     write_frame(
         &mut stream,
         &ClientRequest::Get {
