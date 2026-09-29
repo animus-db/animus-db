@@ -3935,6 +3935,33 @@ mod stream_sealer_tests {
             assert_eq!(decoded.header.hlc_range, row.hlc_range);
             assert!(row.object_id.starts_with("backup/pitr/"));
 
+            // ADR 0073 Phase 0 E: a sealed PITR object is the segment codec's
+            // own output, so it carries that codec's format tag (magic, then
+            // the version byte) — never a version of its own. Compared
+            // against `segment::VERSION`, not a literal, so this holds
+            // across Workstream C's reset of that constant.
+            assert_eq!(
+                &bytes[..4],
+                b"SEGF",
+                "PITR object leads with the segment magic"
+            );
+            assert_eq!(
+                bytes[4],
+                animus_cp_data::segment::VERSION,
+                "PITR object carries the segment codec's current version byte"
+            );
+            // The restore replay path (`backup_restore`) reads it back through
+            // `decode_and_slice`; it must accept the writer's own bytes...
+            animus_cp_data::segment::decode_and_slice(&bytes, row.hlc_range)
+                .expect("restore read path decodes the writer's own object");
+            // ...and refuse (not silently accept) a future version byte.
+            let mut future = bytes.clone();
+            future[4] = animus_cp_data::segment::VERSION + 1;
+            assert!(
+                animus_cp_data::segment::decode_and_slice(&future, row.hlc_range).is_err(),
+                "a future-version PITR object must be a loud decode error"
+            );
+
             // The initial burst's own records now carry full images (this
             // table's PITR enablement puts it on `table_change_records_
             // carry_images`'s gate), which are large enough that the burst
