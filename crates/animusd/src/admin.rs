@@ -3903,6 +3903,7 @@ mod system_table_tests {
     fn single_node_config() -> ClusterConfig {
         let addrs = free_addrs(6);
         ClusterConfig {
+            version: crate::config::CLUSTER_CONFIG_VERSION,
             nodes: vec![RoleAddrs {
                 id: crate::config::node_id(0),
                 role: NodeRole::Both,

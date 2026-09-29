@@ -7281,6 +7281,35 @@ attempted here.
 `=25` depths on the first complete run; the `ConsistentRead: false`
 prefix check and both direct probes never found a violation.
 
+## Versioned formats (ADR 0073 Phase 0, Workstream E)
+
+`ClusterConfig` is the config JSON file's top-level type and carries a
+**required** `"v": u32` (`config::CLUSTER_CONFIG_VERSION`, field
+`ClusterConfig::version`, `#[serde(rename = "v")]`, no serde default).
+
+- **Load path**: every `--config FILE` load goes through
+  `ClusterConfig::from_json`, which parses to a `serde_json::Value`, checks
+  `"v"` *first*, then deserializes. It returns `config::ConfigError`
+  (`Format(animus_control::format::FormatError)` | `Invalid(String)`).
+  Missing `"v"` -> `FormatError::PreBaselineFormat { format:
+  "cluster-config" }`; `"v": 0`/greater than the build's version ->
+  `UnsupportedFormatVersion`. The Display appends what to do (add
+  `"v": 1` or regenerate with `animusd gen-config`), and `main.rs` prefixes
+  `parsing <path>: `. Do not bypass `from_json` with a bare
+  `serde_json::from_str::<ClusterConfig>` (it would report a generic
+  "missing field `v`").
+- **Constructing** a `ClusterConfig` literal (tests, benches) needs
+  `version: animusd::config::CLUSTER_CONFIG_VERSION`; `generate`/
+  `generate_split` set it.
+- **Operator mirror**: `animus-operator`'s `desired::cluster_config::
+  ClusterConfig` has its own `version` (`"v"`) and constant; bump both
+  together. Its golden test pins `"v": 1`.
+- **Fixture**: `tests/fixtures/formats/cluster-config/v1.json`, exercised by
+  `tests/format_fixtures.rs` (structural decode of every file in the dir,
+  round-trip, missing/0/future `"v"` rejection). Regenerate only for a *new*
+  version, via the `#[ignore]`d `generate_fixture_cluster_config` (refuses to
+  overwrite). Never edit an existing fixture.
+
 ## Tests
 
 `cargo test -p animusd` — every test in `tests/` is a real-socket `ProdEnv`

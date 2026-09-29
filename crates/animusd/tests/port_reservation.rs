@@ -68,6 +68,7 @@ async fn control_only_node_ports_stay_claimed_across_a_restart_gap() {
     let node_dir = dir.path().join("node-0");
     let a = support::free_addrs(6);
     let config = ClusterConfig {
+        version: animusd::config::CLUSTER_CONFIG_VERSION,
         nodes: vec![RoleAddrs {
             id: nid(0),
             role: animusd::config::NodeRole::Control,

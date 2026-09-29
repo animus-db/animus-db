@@ -337,6 +337,7 @@ async fn join_with_settings(
 /// use for their own restart-with-flipped-flag proofs.
 fn solo_config(addrs: &RoleAddrs) -> ClusterConfig {
     ClusterConfig {
+        version: animusd::config::CLUSTER_CONFIG_VERSION,
         nodes: vec![addrs.clone()],
         dynamo_auth: None,
         cluster_settings: None,

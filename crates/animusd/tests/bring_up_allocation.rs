@@ -93,6 +93,7 @@ async fn a_late_start_failure_leaks_no_task_or_port() {
         encryption_key_path: None,
     };
     let config = animusd::ClusterConfig {
+        version: animusd::config::CLUSTER_CONFIG_VERSION,
         nodes: vec![resolved.clone()],
         dynamo_auth: None,
         cluster_settings: None,

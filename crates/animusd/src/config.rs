@@ -22,10 +22,10 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
+use animus_control::format::FormatError;
 use animus_env::NodeId;
 #[cfg(test)]
 use animus_env::nid;
-use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 
 use crate::RoleAddrs;
@@ -347,9 +347,49 @@ pub struct ClusterSettings {
     pub tablet_max_write_units: Option<u64>,
 }
 
+/// The `"v"` this build writes and the highest it reads (ADR 0073 Phase 0,
+/// Workstream E). The Phase 0 baseline is `1`.
+pub const CLUSTER_CONFIG_VERSION: u32 = 1;
+
+/// The format name used in [`FormatError`] messages and the fixture
+/// directory (`tests/fixtures/formats/cluster-config/`).
+pub const CLUSTER_CONFIG_FORMAT: &str = "cluster-config";
+
+/// Why [`ClusterConfig::from_json`] refused a config file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConfigError {
+    /// Missing or unsupported top-level `"v"` (ADR 0073).
+    Format(FormatError),
+    /// Not valid JSON / not a valid config / failed a load-time validation.
+    Invalid(String),
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigError::Format(e @ FormatError::PreBaselineFormat { .. }) => write!(
+                f,
+                "{e}: the config has no top-level \"v\" field; add \"v\": {CLUSTER_CONFIG_VERSION} \
+                 (or regenerate it with `animusd gen-config`)"
+            ),
+            ConfigError::Format(e) => write!(f, "{e}"),
+            ConfigError::Invalid(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
 /// A whole-cluster configuration shared (identically) by every node's process.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClusterConfig {
+    /// Format version (ADR 0073 Phase 0, Workstream E), serialized as `"v"`.
+    /// **Required**: no serde default, so a config without it never
+    /// deserializes through plain serde; [`ClusterConfig::from_json`] checks
+    /// it first and reports [`FormatError::PreBaselineFormat`] /
+    /// [`FormatError::UnsupportedFormatVersion`] by name.
+    #[serde(rename = "v")]
+    pub version: u32,
     /// Per-node listen addresses, indexed by node index.
     pub nodes: Vec<RoleAddrs>,
     /// The client DynamoDB port's SigV4 credential store (ADR 0057) —
@@ -397,6 +437,7 @@ impl ClusterConfig {
             })
             .collect();
         Self {
+            version: CLUSTER_CONFIG_VERSION,
             nodes,
             dynamo_auth: None,
             cluster_settings: None,
@@ -435,6 +476,7 @@ impl ClusterConfig {
             })
             .collect();
         Self {
+            version: CLUSTER_CONFIG_VERSION,
             nodes,
             dynamo_auth: None,
             cluster_settings: None,
@@ -531,29 +573,58 @@ impl ClusterConfig {
 
     /// Parse from JSON.
     ///
+    /// The top-level `"v"` field is checked **before** anything else: a
+    /// missing `"v"` is [`FormatError::PreBaselineFormat`], a `"v"` that is
+    /// `0` or greater than [`CLUSTER_CONFIG_VERSION`] is
+    /// [`FormatError::UnsupportedFormatVersion`] (ADR 0073 Phase 0
+    /// conventions) — never a silent best-effort parse.
+    ///
     /// # Errors
-    /// Returns a `serde_json` error if the text is not a valid config, if
+    /// Returns [`ConfigError::Format`] for a missing/unsupported `"v"`, and
+    /// [`ConfigError::Invalid`] if the text is not a valid config, if
     /// two entries claim the same [`RoleAddrs::id`] (ADR 0040 PR3: ids are
     /// now explicit and must be unique — a duplicate is a hard load-time
     /// error, not a silently-shadowed entry), if a present `dynamo_auth`
     /// section has an empty credentials map (ADR 0057 — see
     /// [`DynamoAuthConfig::validate`]), or if only some nodes carry a `tls`
     /// section (ADR 0064 — see [`Self::validate_tls`]).
-    pub fn from_json(text: &str) -> serde_json::Result<Self> {
-        let cfg: Self = serde_json::from_str(text)?;
+    pub fn from_json(text: &str) -> Result<Self, ConfigError> {
+        let value: serde_json::Value =
+            serde_json::from_str(text).map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        match value.get("v") {
+            None => {
+                return Err(ConfigError::Format(FormatError::PreBaselineFormat {
+                    format: CLUSTER_CONFIG_FORMAT,
+                }));
+            }
+            Some(v) => {
+                // A non-integer / out-of-range `"v"` is reported as
+                // version 0-or-huge: clamp to u8 range for the shared error.
+                let found = v.as_u64().unwrap_or(0);
+                if found == 0 || found > u64::from(CLUSTER_CONFIG_VERSION) {
+                    return Err(ConfigError::Format(FormatError::UnsupportedFormatVersion {
+                        format: CLUSTER_CONFIG_FORMAT,
+                        found: u8::try_from(found).unwrap_or(u8::MAX),
+                        max_supported: CLUSTER_CONFIG_VERSION as u8,
+                    }));
+                }
+            }
+        }
+        let cfg: Self =
+            serde_json::from_value(value).map_err(|e| ConfigError::Invalid(e.to_string()))?;
         let mut seen = std::collections::BTreeSet::new();
         for n in &cfg.nodes {
             if !seen.insert(n.id.clone()) {
-                return Err(serde_json::Error::custom(format!(
+                return Err(ConfigError::Invalid(format!(
                     "duplicate node id {:?} in config",
                     n.id
                 )));
             }
         }
         if let Some(auth) = &cfg.dynamo_auth {
-            auth.validate().map_err(serde_json::Error::custom)?;
+            auth.validate().map_err(ConfigError::Invalid)?;
         }
-        cfg.validate_tls().map_err(serde_json::Error::custom)?;
+        cfg.validate_tls().map_err(ConfigError::Invalid)?;
         Ok(cfg)
     }
 
@@ -739,7 +810,7 @@ mod tests {
         // An old-shaped config JSON with no `dynamo_auth` key at all must
         // still parse (the field is additive via `#[serde(default)]`, never
         // a breaking requirement on an existing config file).
-        let bare = serde_json::json!({ "nodes": cfg.nodes }).to_string();
+        let bare = serde_json::json!({ "v": 1, "nodes": cfg.nodes }).to_string();
         let parsed = ClusterConfig::from_json(&bare).unwrap();
         assert!(parsed.dynamo_auth.is_none());
     }
@@ -781,7 +852,7 @@ mod tests {
         // An old-shaped config JSON with no `cluster_settings` key at all
         // must still parse (`#[serde(default)]`, never a breaking
         // requirement on an existing config file).
-        let bare = serde_json::json!({ "nodes": cfg.nodes }).to_string();
+        let bare = serde_json::json!({ "v": 1, "nodes": cfg.nodes }).to_string();
         let parsed = ClusterConfig::from_json(&bare).unwrap();
         assert!(parsed.cluster_settings.is_none());
     }
@@ -815,6 +886,7 @@ mod tests {
         // every other field — each is independently `#[serde(default)]`.
         let cfg = ClusterConfig::generate(1, "127.0.0.1".parse().unwrap(), 7000);
         let text = serde_json::json!({
+            "v": 1,
             "nodes": cfg.nodes,
             "cluster_settings": { "auto_split_bytes": 2_000_000 }
         })
@@ -861,7 +933,7 @@ mod tests {
 
         // An old-shaped node JSON object with no `tls` key at all must
         // still parse (`#[serde(default)]`, never a breaking requirement).
-        let bare = serde_json::json!({ "nodes": cfg.nodes }).to_string();
+        let bare = serde_json::json!({ "v": 1, "nodes": cfg.nodes }).to_string();
         let parsed = ClusterConfig::from_json(&bare).unwrap();
         assert!(parsed.nodes.iter().all(|n| n.tls.is_none()));
     }
@@ -920,6 +992,7 @@ mod tests {
     #[test]
     fn validate_tls_is_a_no_op_on_an_empty_node_list() {
         let cfg = ClusterConfig {
+            version: CLUSTER_CONFIG_VERSION,
             nodes: vec![],
             dynamo_auth: None,
             cluster_settings: None,

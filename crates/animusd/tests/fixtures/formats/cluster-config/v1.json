@@ -1,0 +1,77 @@
+{
+  "v": 1,
+  "nodes": [
+    {
+      "id": "n0",
+      "role": "control",
+      "internal": "10.0.0.1:9000",
+      "client": "10.0.0.1:9001",
+      "intra": "10.0.0.1:9004",
+      "dynamo": "10.0.0.1:9002",
+      "admin": "10.0.0.1:9003",
+      "console": "10.0.0.1:9005",
+      "advertise_host": null,
+      "tls": {
+        "cert_path": "/etc/animus/tls/tls.crt",
+        "key_path": "/etc/animus/tls/tls.key",
+        "ca_path": "/etc/animus/tls/ca.crt"
+      },
+      "encryption_key_path": "/etc/animus/enc/key"
+    },
+    {
+      "id": "n1",
+      "role": "both",
+      "internal": "10.0.0.2:9006",
+      "client": "10.0.0.2:9007",
+      "intra": "10.0.0.2:9010",
+      "dynamo": "10.0.0.2:9008",
+      "admin": "10.0.0.2:9009",
+      "console": "10.0.0.2:9011",
+      "advertise_host": "n1.example.internal",
+      "tls": {
+        "cert_path": "/etc/animus/tls/tls.crt",
+        "key_path": "/etc/animus/tls/tls.key",
+        "ca_path": "/etc/animus/tls/ca.crt"
+      },
+      "encryption_key_path": null
+    },
+    {
+      "id": "n2",
+      "role": "data",
+      "internal": "10.0.0.3:9012",
+      "client": "10.0.0.3:9013",
+      "intra": "10.0.0.3:9016",
+      "dynamo": "10.0.0.3:9014",
+      "admin": "10.0.0.3:9015",
+      "console": "10.0.0.3:9017",
+      "advertise_host": null,
+      "tls": {
+        "cert_path": "/etc/animus/tls/tls.crt",
+        "key_path": "/etc/animus/tls/tls.key",
+        "ca_path": "/etc/animus/tls/ca.crt"
+      },
+      "encryption_key_path": null
+    }
+  ],
+  "dynamo_auth": {
+    "credentials": {
+      "AKIDEXAMPLE": "secret"
+    }
+  },
+  "cluster_settings": {
+    "auto_split_bytes": 1000000,
+    "auto_split_change_rate": null,
+    "auto_split_ops_rate": null,
+    "orphan_sweep_after_secs": null,
+    "quiesce_after_secs": 5,
+    "heartbeat_batch": null,
+    "shared_wal": null,
+    "stream_seal_bytes": null,
+    "stream_seal_age_secs": null,
+    "stream_retention_secs": null,
+    "throttle_read_units": null,
+    "throttle_write_units": null,
+    "tablet_max_read_units": null,
+    "tablet_max_write_units": null
+  }
+}

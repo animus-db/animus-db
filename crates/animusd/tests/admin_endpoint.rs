@@ -46,6 +46,7 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::Clust
             })
             .collect();
         let config = animusd::ClusterConfig {
+            version: animusd::config::CLUSTER_CONFIG_VERSION,
             nodes: nodes_cfg,
             dynamo_auth: None,
             cluster_settings: None,
@@ -119,6 +120,7 @@ async fn bring_up_with_streams(
             })
             .collect();
         let config = animusd::ClusterConfig {
+            version: animusd::config::CLUSTER_CONFIG_VERSION,
             nodes: nodes_cfg,
             dynamo_auth: None,
             cluster_settings: None,
@@ -189,6 +191,7 @@ async fn bring_up_with_fs_segment_store(
             })
             .collect();
         let config = animusd::ClusterConfig {
+            version: animusd::config::CLUSTER_CONFIG_VERSION,
             nodes: nodes_cfg,
             dynamo_auth: None,
             cluster_settings: None,
@@ -1109,6 +1112,7 @@ async fn bring_up_with_auth(
     for attempt in 0..16 {
         let addrs = support::free_addrs(6);
         let config = animusd::ClusterConfig {
+            version: animusd::config::CLUSTER_CONFIG_VERSION,
             nodes: vec![animusd::RoleAddrs {
                 id: animusd::config::node_id(0),
                 role: animusd::config::NodeRole::Both,
@@ -1531,6 +1535,7 @@ async fn bring_up_lone_voter_of(n: usize, dir: &std::path::Path) -> Node {
             })
             .collect();
         let config = animusd::ClusterConfig {
+            version: animusd::config::CLUSTER_CONFIG_VERSION,
             nodes: nodes_cfg,
             dynamo_auth: None,
             cluster_settings: None,

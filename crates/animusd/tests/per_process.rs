@@ -76,6 +76,7 @@ async fn per_process_nodes_form_a_cluster_from_shared_config() {
             })
             .collect();
         let config = ClusterConfig {
+            version: animusd::config::CLUSTER_CONFIG_VERSION,
             nodes: nodes_cfg,
             dynamo_auth: None,
             cluster_settings: None,

@@ -88,6 +88,7 @@ async fn await_leader(node: &Node) {
 /// mirror engine attached over the durable `LsmEngine` backend.
 async fn start(addrs: animusd::RoleAddrs, dir: &std::path::Path) -> Node {
     let config = animusd::ClusterConfig {
+        version: animusd::config::CLUSTER_CONFIG_VERSION,
         nodes: vec![addrs],
         dynamo_auth: None,
         cluster_settings: None,

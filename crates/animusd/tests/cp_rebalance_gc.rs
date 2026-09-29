@@ -67,6 +67,7 @@ async fn bring_up(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig, Vec<PathBu
     for attempt in 0..16 {
         let a = support::free_addrs(n * 6);
         let config = ClusterConfig {
+            version: animusd::config::CLUSTER_CONFIG_VERSION,
             nodes: (0..n)
                 .map(|i| RoleAddrs {
                     id: animusd::config::node_id(i),

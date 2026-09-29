@@ -83,5 +83,8 @@ mod tests {
         let json = &data[CONFIG_FILE_NAME];
         let value: serde_json::Value = serde_json::from_str(json).unwrap();
         assert_eq!(value["nodes"].as_array().unwrap().len(), 3);
+        // ADR 0073 Phase 0 Workstream E: `animusd` requires a top-level
+        // `"v"`, so the generated ConfigMap must carry it.
+        assert_eq!(value["v"], 1);
     }
 }

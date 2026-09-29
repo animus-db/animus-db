@@ -159,6 +159,7 @@ async fn a_second_node_reaches_an_advertised_node_purely_by_its_advertised_name(
     let dir = support::panic_safe_tempdir();
     let (nodes, config, _node_dirs) = bring_up_with_config(
         |addrs| ClusterConfig {
+            version: animusd::config::CLUSTER_CONFIG_VERSION,
             nodes: vec![
                 role_addrs_at(0, addrs, Some("localhost")),
                 role_addrs_at(1, addrs, None),
@@ -249,6 +250,7 @@ async fn same_identity_restart_on_a_different_bind_ip_keeps_the_same_advertised_
     let dir = support::panic_safe_tempdir();
     let (mut nodes, mut config, node_dirs) = bring_up_with_config(
         |addrs| ClusterConfig {
+            version: animusd::config::CLUSTER_CONFIG_VERSION,
             nodes: vec![
                 role_addrs_at(0, addrs, None),
                 role_addrs_at(1, addrs, Some(HOST)),
@@ -391,6 +393,7 @@ async fn the_static_config_derived_peer_book_dials_every_advertised_name() {
     let n = 3;
     let (nodes, _config, _node_dirs) = bring_up_with_config(
         |addrs| ClusterConfig {
+            version: animusd::config::CLUSTER_CONFIG_VERSION,
             nodes: (0..n)
                 .map(|i| role_addrs_at(i, addrs, Some("localhost")))
                 .collect(),

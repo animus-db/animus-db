@@ -318,6 +318,7 @@ async fn restarted_control_node_resets_its_ring_and_pre_restart_watchers_fall_ba
         }
     };
     let config = animusd::ClusterConfig {
+        version: animusd::config::CLUSTER_CONFIG_VERSION,
         nodes: vec![addrs],
         dynamo_auth: None,
         cluster_settings: None,

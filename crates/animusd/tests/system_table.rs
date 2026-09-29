@@ -73,6 +73,7 @@ async fn bring_up_one(dir: &std::path::Path) -> Node {
         encryption_key_path: None,
     };
     let config = animusd::ClusterConfig {
+        version: animusd::config::CLUSTER_CONFIG_VERSION,
         nodes: vec![node_cfg],
         dynamo_auth: None,
         cluster_settings: None,

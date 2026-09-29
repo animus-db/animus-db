@@ -126,6 +126,7 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, ClusterConfig)
             ls.iter().map(|l| l.local_addr().unwrap()).collect()
         };
         let cfg = ClusterConfig {
+            version: animusd::config::CLUSTER_CONFIG_VERSION,
             nodes: (0..n)
                 .map(|i| RoleAddrs {
                     id: animusd::config::node_id(i),
