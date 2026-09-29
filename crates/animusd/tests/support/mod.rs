@@ -212,9 +212,12 @@ pub fn assert_no_task_panics(nodes: &[&Node]) {
 pub const JOIN_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Reserve `count` free loopback ports (bind :0, read addr, release the
-/// listener). **This is itself a port-TOCTOU by construction**: the port is
-/// free the instant this returns, so another process/test's own bind can
-/// steal it before the real one happens — see issue #627's own investigation
+/// listener). **Since issue #1094 the ports are no longer released**: this
+/// is now [`reserve_addrs`] (a held, non-listening `SO_REUSEADDR` bind that
+/// the node can still bind atop and that outlives its shutdown). The
+/// paragraph below is the pre-#1094 history of why a released probe was a
+/// port-TOCTOU by construction: the port was free the instant it returned, so
+/// another process/test's own bind could steal it — see issue #627's own investigation
 /// (`docs/lessons/testing/2026-09-20-allocate-test-ports-by-binding-and-
 /// holding-never-probe-and-release.md`) for the two structural hazards this
 /// created in every bring-up that used to retry around it instead. **Every
@@ -243,33 +246,109 @@ pub const JOIN_DEADLINE: Duration = Duration::from_secs(30);
 /// `docs/lessons/testing/2026-09-28-freezing-a-port-set-across-retries-
 /// only-relocates-the-toctou-bind-and-hold-before-claim.md`.
 pub fn free_addrs(count: usize) -> Vec<SocketAddr> {
-    let listeners: Vec<std::net::TcpListener> = (0..count)
-        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect();
-    listeners.iter().map(|l| l.local_addr().unwrap()).collect()
-    // listeners dropped here, freeing the ports for the caller to bind.
+    reserve_addrs(count)
 }
 
-/// `127.0.0.1:0` — an address [`Node::bind`] resolves to a real,
-/// OS-assigned ephemeral port at bind time, atomically, with no separate
-/// probe-then-release step (contrast [`free_addrs`]'s own doc).
-fn ephemeral_loopback() -> SocketAddr {
-    SocketAddr::from(([127, 0, 0, 1], 0))
+/// Every port [`reserve_addrs`] has ever handed out, held open for the life
+/// of this test binary (see [`reserve_addrs`]).
+static RESERVATIONS: std::sync::Mutex<Vec<socket2::Socket>> = std::sync::Mutex::new(Vec::new());
+
+/// Allocate `count` distinct loopback addresses **and keep them reserved for
+/// the rest of the test process** (issue #1094) — the steal-proof
+/// replacement for the old bind-`:0`-read-drop probe.
+///
+/// Each address is a `SO_REUSEADDR` socket bound to `127.0.0.1:0` and **never
+/// `listen()`ed on**, parked in a process-global list. Two properties make
+/// that the right shape for a node that will bind the address itself (and
+/// re-bind it after a same-address restart, when a listener the test could
+/// hand over does not exist because `ProdEnv` binds its own internal socket):
+///
+/// - a node's own listener (tokio/mio also sets `SO_REUSEADDR`) **can bind and
+///   `listen()` atop the reservation** — Linux only refuses a reuse-bind when
+///   the other socket is in the `LISTEN` state — so no seam in the node is
+///   needed, and the reservation is still there, untouched, after the node
+///   shuts down and the address is otherwise free;
+/// - while nothing listens on it, the port is **still claimed in the
+///   kernel's bind table**, which is what `bind(:0)` (another test binary's
+///   `free_addrs`/`Node::bind` probe, a node's `:0` listener) and the
+///   ephemeral *source-port* selection of every outgoing `connect()` consult
+///   and skip — so none of them can be handed the port in the restart gap
+///   (verified with `ip_local_port_range` narrowed to 16 ports: a `:0`
+///   thief took the other 15 and never this one). The old probe-and-release
+///   left the port entirely unclaimed for the whole gap.
+///
+/// Deliberately **not** protected: a thief that *names this exact port* (no
+/// test or product code does). Non-Linux hosts fall back to the old release
+/// (BSD `SO_REUSEADDR` semantics do not permit the node's bind atop it). See
+/// `docs/lessons/testing/2026-09-29-hold-a-reservation-socket-across-a-same-
+/// address-restart-the-node-binds-its-own-listeners.md`.
+pub fn reserve_addrs(count: usize) -> Vec<SocketAddr> {
+    let mut held = RESERVATIONS.lock().unwrap_or_else(|p| p.into_inner());
+    (0..count)
+        .map(|_| {
+            let sock = socket2::Socket::new(
+                socket2::Domain::IPV4,
+                socket2::Type::STREAM,
+                Some(socket2::Protocol::TCP),
+            )
+            .expect("reservation socket");
+            sock.set_reuse_address(true).expect("SO_REUSEADDR");
+            sock.bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into())
+                .expect("bind reservation");
+            let addr = sock
+                .local_addr()
+                .expect("reservation local_addr")
+                .as_socket()
+                .expect("inet addr");
+            if cfg!(target_os = "linux") {
+                held.push(sock);
+            }
+            addr
+        })
+        .collect()
 }
 
-/// A fresh, unbound [`RoleAddrs`] for [`Node::bind`] — every port
-/// `127.0.0.1:0`, [`NodeRole::Both`], no advertise host/TLS/encryption key.
+/// Best-effort forensic snapshot for a rebind-failure panic message: every
+/// TCP socket `ss -tanp` shows on `addr`'s port (listeners *and* established/
+/// self-connected ones — a TCP self-connect can squat a port for as long as it
+/// lives, which `-l` alone would hide). Never masks the real failure.
+pub fn port_holders(addr: SocketAddr) -> String {
+    match std::process::Command::new("ss")
+        .args(["-tanp", "-H"])
+        .output()
+    {
+        Ok(out) => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let port = format!(":{}", addr.port());
+            let hits: Vec<&str> = text
+                .lines()
+                .filter(|l| l.split_whitespace().any(|f| f.ends_with(&port)))
+                .collect();
+            if hits.is_empty() {
+                format!("ss found no socket on {addr} (may lack permission to see it)")
+            } else {
+                format!("ss sockets on {addr}:\n{}", hits.join("\n"))
+            }
+        }
+        Err(e) => format!("ss unavailable ({e}); no diagnostic for {addr}"),
+    }
+}
+
+/// A fresh [`RoleAddrs`] for [`Node::bind`] — six [`reserve_addrs`]-reserved
+/// loopback ports (so a same-address restart of this node is steal-proof,
+/// issue #1094), [`NodeRole::Both`], no advertise host/TLS/encryption key.
 /// `id` is [`animusd::config::node_id(index)`].
 fn unbound_role_addrs(index: usize) -> RoleAddrs {
+    let a = reserve_addrs(6);
     RoleAddrs {
         id: animusd::config::node_id(index),
         role: NodeRole::Both,
-        internal: ephemeral_loopback(),
-        client: ephemeral_loopback(),
-        dynamo: ephemeral_loopback(),
-        admin: ephemeral_loopback(),
-        intra: ephemeral_loopback(),
-        console: ephemeral_loopback(),
+        internal: a[0],
+        client: a[1],
+        dynamo: a[2],
+        admin: a[3],
+        intra: a[4],
+        console: a[5],
         advertise_host: None,
         tls: None,
         encryption_key_path: None,
@@ -340,7 +419,8 @@ pub async fn restart_same_addrs(
             Err(e) => {
                 assert!(
                     tokio::time::Instant::now() < deadline,
-                    "restart on the same dir/addresses did not rebind: {e}"
+                    "restart on the same dir/addresses did not rebind: {e}\n{}",
+                    port_holders(config.nodes[index].internal)
                 );
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }

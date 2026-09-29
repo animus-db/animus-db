@@ -258,42 +258,12 @@ async fn restart_control(config: &ClusterConfig, index: usize, dir: &Path) -> No
                 if tokio::time::Instant::now() >= deadline {
                     panic!(
                         "control node {index} did not rebind on restart: {e}\n{}",
-                        listen_holders(Some(config.nodes[index].internal))
+                        support::port_holders(config.nodes[index].internal)
                     );
                 }
                 sleep(Duration::from_millis(50)).await;
             }
         }
-    }
-}
-
-/// Diagnostic-only: shell out to `ss` to show which process (if any) is
-/// listening on `addr` right now — attached to a rebind-timeout panic so a
-/// future flake carries forensic evidence (PID/process name) instead of just
-/// "address already in use", distinguishing "another process on this
-/// machine is genuinely squatting on this port" from a same-process
-/// socket-lifetime bug. Best-effort: `ss` may not exist or may need
-/// privileges to show every process, so a failure here never masks the real
-/// assertion.
-fn listen_holders(addr: Option<SocketAddr>) -> String {
-    let Some(addr) = addr else {
-        return "listen_holders: no address".into();
-    };
-    match std::process::Command::new("ss")
-        .args(["-ltnp", "-H"])
-        .output()
-    {
-        Ok(out) => {
-            let text = String::from_utf8_lossy(&out.stdout);
-            let port_suffix = format!(":{}", addr.port());
-            let hits: Vec<&str> = text.lines().filter(|l| l.contains(&port_suffix)).collect();
-            if hits.is_empty() {
-                format!("ss found no listener on {addr} (may lack permission to see it)")
-            } else {
-                format!("ss listeners on {addr}:\n{}", hits.join("\n"))
-            }
-        }
-        Err(e) => format!("ss unavailable ({e}); no diagnostic for {addr}"),
     }
 }
 
