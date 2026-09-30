@@ -94,6 +94,13 @@ pub use write_schema::{KindWrites, LsiDef, Projection, WriteSchema, derive_kind_
 /// `M` (a nested attribute map) and `L` (a heterogeneous list), and the
 /// homogeneous **set** types `SS` (string set), `NS` (number set), and `BS`
 /// (binary set).
+///
+/// **Frozen serde shape (ADR 0073).** This enum's (and [`Item`]'s) serde JSON
+/// form is embedded in the durable `stored-item` and `change-record` row
+/// formats, which outlive the cluster. Renaming a variant, changing a
+/// payload type, or reordering semantics is a format change (new tagged
+/// version + fixture), never a refactor; only additive changes, each with a
+/// golden fixture, are allowed. `legacy` decoders embedding it rely on this.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AttributeValue {
     /// String (`S`).

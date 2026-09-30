@@ -216,6 +216,8 @@ range a format needs:
 | PITR change-log segments | reuses the segment codec above (`segment.rs`, `SEGF` + `segment::VERSION`) as a fifth change-log consumer | versioned (inherits `segment.rs`) | durable, outlives the cluster (a PITR restore window can span a long retention period, default 35 days, but the *segments themselves* are read back by a restore that could run against a much later binary) | Inherits the same version discipline as streams (Workstream E confirmed the inheritance with a test that reads the sealed object's raw bytes); the open question is support *window* length, not mechanism. |
 | S3 export/import objects (ADR 0068) | `crates/animusd/src/import.rs`, export path (JSON-lines + manifest, gzip'd, DynamoDB's own format) | **externally defined by AWS's export/import format, not internally versioned by this repo**; `IMPORT_SEED_VERSION: u64 = 1` is an MVCC seed-version constant (a `merge` precondition), not a *format* version | durable, outlives the cluster | Because the on-wire *content* format is AWS's own documented export/import layout, cross-version compatibility here is largely inherited "for free," as long as this repo keeps emitting/consuming that fixed external shape rather than an internal one. |
 | Encryption envelope (ADR 0069) | `crates/animus-env/src/encrypted.rs` | `MAGIC = b"ADE1"`, `VERSION: u8 = 1` | durable, node-local (wraps every other on-disk format transparently at the `Disk` seam) | Versioned, magic-guarded, same discipline as the LSM manifest and the RaftKV/segment codecs — this is the second format in the table (after the LSM manifest) that already meets the Phase 0 bar. |
+| Stored-item codec (base-row value; ADR 0054 step 1) | `crates/animus-item/src/stored.rs` (`encode_stored_item`/`decode_stored_item`/`encode_tombstone`/`stored_item_version`) | **untagged JSON, frozen serde shape** (2026-09-30 decision, see "Row-value formats: freeze, don't tag"): `{"item": {..}}` / `{"tombstone":true}` over `AttributeValue`'s derived serde form (externally tagged, e.g. `{"S":"x"}`, `"Null"`, `{"B":[0,255]}`); fixture `crates/animus-item/tests/fixtures/formats/stored-item/v1.json`; v1 is identified by a first non-whitespace byte of `{` (live item) or `\"` (tombstone) | **durable, outlives the cluster** (every base row, and therefore every backup, PITR segment and export carrying one) | Opaque inside `raftkv-wal`/`segment`/`backup-data` payloads until the P1-A fixture. `AttributeValue`/`Item` are part of this format: changing their serde shape is a format change. |
+| Change record (`ChangeRecord`, change-log value; ADR 0041/0049) | `crates/animus-item/src/index.rs` (`ChangeRecord::encode`/`decode`/`version_of`) | **untagged JSON, frozen serde shape** (same decision): `{"base_sk":[..],"old_image":..,"new_image":..,"seeded":..,"marker":..,"staged":..,"ttl_expired":..}`; additions are `#[serde(default)]` only; fixture `crates/animus-item/tests/fixtures/formats/change-record/v1.json`; v1 identified by a leading `{` | **durable, outlives the cluster** (PITR segments and backups carry change records; Streams reads them) | A new `#[serde(default)]` must mean "what the old writer meant" (review-enforced; the fixture test also pins a pre-flag record). |
 
 **Summary — formats with *no* version tag at all today:** the LSM WAL, the
 control-plane Raft WAL and snapshot/`InstallSnapshot` payload, `Metadata`'s
@@ -1311,3 +1313,35 @@ in one change and updates this ADR's status header.
 **Phase status after this amendment:** Phase 0 done; **Phase 1 in progress**
 (design accepted, P1-A..P1-D not started); Phases 2 and 3 planned, blocked
 on Phase 1 as before.
+
+### Row-value formats: freeze, don't tag (2026-09-30 decision, P1-A)
+
+The audit above found two durable row values that were in no inventory and
+pinned by no fixture: the stored-item codec and `ChangeRecord`. Decision
+(adopting the Phase 1 proposal):
+
+- **Freeze the serde shape; do not add a tag now.** Both are untagged JSON
+  written by `serde_json`. Their shape, *including* `AttributeValue`/`Item`
+  (externally tagged enum: `{"S":".."}`, `{"Bool":true}`, `"Null"`,
+  `{"B":[..]}` as a number array, sets as arrays, `M` as an object), is a
+  frozen format. Changes are **additive-only** (a new `#[serde(default)]`
+  field or a new variant) and each ships with a new golden fixture; anything
+  else is a new *tagged* version via the normal checklist. A `legacy` module
+  that embeds `AttributeValue`/`Item` (decoder pattern, point 4) can rely on
+  this. The types carry a doc comment saying so.
+- **v1 is sniffable.** v1 is untagged JSON. A stored item is `{"item":{..}}`
+  (first non-whitespace byte `{`) or the tombstone, which is the bare JSON
+  *string* `"tombstone"` (serde serializes a unit variant as a string, not as
+  the `{"tombstone":true}` object the module doc used to claim; first byte
+  `"`). A `ChangeRecord` is always an object (`{`). The writers emit no
+  leading whitespace; it is skipped only to accept what the parser always
+  accepted. `animus_item::stored::stored_item_version` (`{` or `"`) and
+  `ChangeRecord::version_of` (`{`) return `Some(1)` for that form and `None`
+  otherwise, and the decoders dispatch through them. A later tagged v2 must
+  start with a byte that is neither `{` nor `"` nor whitespace, so the sniff
+  stays unambiguous with no migration of existing rows.
+- **Fixtures** (`crates/animus-item/tests/fixtures/formats/{stored-item,
+  change-record}/v1.json`) are produced by the current writer (no format
+  change), with `#[ignore]`d no-overwrite generators, a per-version expected
+  value that panics on a fixture with no expectation, and round-trip tests.
+  The tombstone (`"tombstone"`) is pinned by an inline byte assertion.
