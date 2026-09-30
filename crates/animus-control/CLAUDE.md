@@ -396,11 +396,18 @@ per-tablet CP data plane (`animus-cp-data`).
 
 ## Versioned formats (ADR 0073 Phase 0)
 
-**Phase 1 note (2026-09-30):** `unwrap`/`decode_lines` return the version, but the
-current callers (`persist.rs`, `node.rs`, `raft.rs`) discard it: a gate, not a
-dispatch. A new format version must `match` on it and keep the old decoder
-under `legacy` (ADR 0073 "Phase 1 design" checklist); do not change these
-helpers' signatures.
+**Phase 1 dispatch (P1-C layer 1, 2026-09-30):** `unwrap`/`decode_lines` return
+the version and every caller now uses it: `persist::dispatch` holds one
+`match version { 1 => .., found => format::unsupported_version(tag, found) }`
+body decoder per format (`wal_record` for `control-wal`, `shared_wal_line` for
+`shared-wal` — its only decode site is `PersistedState::decode_tagged`, here,
+not in `animus-cp-data` — and `snapshot_body` for `control-snapshot`, used by
+`raft.rs`'s InstallSnapshot install and `node.rs`'s `decode_syskv_image_bytes`).
+A bound-and-dropped `_version` is a review failure. v1 is still the current
+shape, so there is no `legacy` module yet: a v2 adds an arm and moves the v1
+arm's body to a frozen `persist::legacy::v1` with a `From` translation (ADR
+0073 "Phase 1 design" checklist). Do not change the `format.rs` helpers'
+signatures (`unsupported_version` is an addition).
 
 **`format.rs`** is the shared tagged-envelope convention Phase 0 workstream
 B introduced, and the one workstream C (`animus-cp-data`) reuses rather
