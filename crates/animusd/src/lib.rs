@@ -981,6 +981,16 @@ impl<E: Env> CpGroup<E> {
         }
     }
 
+    /// Whether this replica's boot-time cluster check permanently refused
+    /// it as a voter (see [`RaftKvNode::refused_as_voter`]). A pure flag
+    /// read; never wakes a quiesced group.
+    fn refused_as_voter(&self) -> bool {
+        match self {
+            CpGroup::Lsm(n) => n.refused_as_voter(),
+            CpGroup::Mem(n) => n.refused_as_voter(),
+        }
+    }
+
     /// Whether this group has applied its split-cutover freeze (ADR 0050
     /// rung 5) — a pure flag read, never a wake. Consulted by every local
     /// write/txn propose helper before proposing; see
@@ -1325,6 +1335,7 @@ impl<E: Env> CpGroup<E> {
                     key_count,
                     byte_size,
                     quiesced: $n.is_quiesced(),
+                    refused_as_voter: $n.refused_as_voter(),
                     voter_history: self
                         .voter_history()
                         .into_iter()
@@ -8751,6 +8762,16 @@ impl<E: Env> ClusterEdgeState<E> {
             .collect()
     }
 
+    /// How many of this node's hosted CP groups are permanently refused as a
+    /// voter by the boot-time cluster check — the value behind
+    /// `Metric::CpGroupsRefusedAsVoter`. A pure flag read per group.
+    pub(crate) fn refused_group_count(&self) -> u64 {
+        self.hosted_groups()
+            .iter()
+            .filter(|(_, g)| g.refused_as_voter())
+            .count() as u64
+    }
+
     /// The control handle that currently believes it is leader, if any.
     pub(crate) fn leader_handle(&self) -> Option<RaftNode<E>> {
         self.control
@@ -13793,6 +13814,13 @@ async fn metrics_sample_loop(ctx: ClientCtx) {
                 .filter(|(_, g)| g.is_quiesced())
                 .count() as u64;
             data.raftkv_metrics.set(Metric::CpGroupsQuiesced, quiesced);
+            // A level gauge: hosted tablet replicas the boot-time cluster
+            // check permanently refused as voters (a silent voter-short
+            // group). Expected 0.
+            data.raftkv_metrics.set(
+                Metric::CpGroupsRefusedAsVoter,
+                ctx.edge.refused_group_count(),
+            );
         }
         let (counters, is_leader) = ctx.metrics_json();
         let ts_ms = SystemTime::now()
@@ -22327,5 +22355,84 @@ mod issue_298_conflict_tests {
         );
 
         node.shutdown();
+    }
+}
+
+/// PR 1 of the release-vs-promote race work: a tablet replica the boot-time
+/// cluster check permanently refused as a voter must be *visible* — in
+/// `/admin/raftkv`'s per-group `refused_as_voter` field and in the
+/// `Metric::CpGroupsRefusedAsVoter` level gauge's source
+/// (`ClusterEdgeState::refused_group_count`). Drives the same wiped-voter
+/// shape as `animus-cp-data/tests/wiped_tablet_voter_boot_check.rs`, but over
+/// a *hosted* group (`stream = tablet id`, the shape that also labels the
+/// refusal's ERROR log with the tablet).
+#[cfg(test)]
+mod refused_voter_observability_tests {
+    use super::*;
+    use animus_cp_data::StorageScope;
+    use animus_env::nid;
+    use animus_sim::Simulator;
+    use animus_storage::MemoryEngine;
+    use std::time::Duration;
+
+    type Kv = RaftKvNode<animus_sim::SimEnv, MemoryEngine>;
+
+    #[test]
+    fn a_refused_tablet_replica_sets_the_admin_field_and_the_gauge_source() {
+        const TABLET: u64 = 7;
+        let seed = std::env::var("ANIMUS_SEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0xF00D_0001u64);
+        let ids = [0u64, 1, 2];
+        let start = |sim: &Simulator, i: u64| -> Kv {
+            RaftKvNode::start_hosted(
+                sim.env(nid(i)),
+                ids.iter().copied().map(nid).collect(),
+                MemoryEngine::new(),
+                StorageScope::new(KeyRange::whole()),
+                TABLET,
+            )
+        };
+        let mut sim = Simulator::new(seed);
+        let mut nodes: Vec<Kv> = ids.iter().map(|&i| start(&sim, i)).collect();
+        sim.run_for(Duration::from_secs(2));
+        let leader = (0..3).find(|&i| nodes[i].is_leader()).expect("a leader");
+        assert!(matches!(
+            nodes[leader].put(b"k".to_vec(), b"v".to_vec()),
+            animus_control::ProposeResult::Accepted { .. }
+        ));
+        sim.run_for(Duration::from_secs(1));
+        let victim = (0..3).find(|&i| i != leader).unwrap();
+        let healthy = (0..3).find(|&i| i != leader && i != victim).unwrap();
+
+        sim.stop(nid(victim as u64));
+        sim.wipe_disk(nid(victim as u64));
+        nodes[victim] = start(&sim, victim as u64);
+        sim.run_for(Duration::from_secs(3));
+
+        let edge = ClusterEdgeState::<animus_sim::SimEnv>::new();
+        edge.register_raftkv(TabletId(TABLET), CpGroup::Mem(nodes[victim].clone()));
+        assert!(
+            nodes[victim].refused_as_voter(),
+            "seed={seed}: precondition"
+        );
+        assert_eq!(edge.refused_group_count(), 1, "seed={seed}");
+        let view = futures::executor::block_on(
+            CpGroup::Mem(nodes[victim].clone()).raft_view(TabletId(TABLET), false),
+        );
+        assert!(view.refused_as_voter, "seed={seed}: admin view field");
+        assert!(
+            serde_json::to_value(&view).unwrap()["refused_as_voter"] == true,
+            "seed={seed}: serialized JSON carries the field"
+        );
+
+        let ok_edge = ClusterEdgeState::<animus_sim::SimEnv>::new();
+        ok_edge.register_raftkv(TabletId(TABLET), CpGroup::Mem(nodes[healthy].clone()));
+        assert_eq!(ok_edge.refused_group_count(), 0, "seed={seed}");
+        let view = futures::executor::block_on(
+            CpGroup::Mem(nodes[healthy].clone()).raft_view(TabletId(TABLET), false),
+        );
+        assert!(!view.refused_as_voter, "seed={seed}: healthy replica");
     }
 }

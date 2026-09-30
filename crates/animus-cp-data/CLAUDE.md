@@ -2634,6 +2634,16 @@ disambiguation is needed.
   seed re-pin for exactly this reason. See
   `docs/lessons/code-patterns/2026-09-15-a-generic-core-level-fix-does-
   not-wire-itself-into-every-driver.md` for the general lesson.
+- **A refusal is now observable (soak finding: 3 silent refusals in 4h).**
+  `start_inner` labels the core `"tablet <stream>"` (`RaftCore::
+  set_group_label`, by the `stream = tablet.0` convention) so the
+  `refusing to start as a voter` ERROR names its tablet
+  (`group = "tablet N"`; `"control"` for the control group);
+  `/admin/raftkv` carries a per-group `refused_as_voter` boolean; and the
+  `Metric::CpGroupsRefusedAsVoter` level gauge (set by animusd's metrics
+  sample loop from `ClusterEdgeState::refused_group_count`) counts this
+  node's refused hosted replicas. Expected 0; a sustained non-zero means a
+  group is silently a voter short.
 - **Issue #945 (the corpus-deep regression this shipped as): `campaign_immediately`
   and `skip_cluster_check` are two different flags, not one.** The
   original issue #900 fix gated the cluster-check skip on

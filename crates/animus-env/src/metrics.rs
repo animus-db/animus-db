@@ -948,12 +948,23 @@ pub enum Metric {
     /// log, caught up past the removing entry, or silent past its give-up
     /// bound) — the end of that peer's removal schedule.
     CpDepartingPeersDropped,
+
+    // --- Refused-voter observability (appended; same slot-stability discipline) ---
+    /// A **level**: how many of this node's currently-hosted CP-data tablet
+    /// replicas have been permanently refused as a voter by the boot-time
+    /// cluster check (`RaftCore::refused_as_voter`) — a replica that
+    /// replicates but never votes or campaigns, so its group silently runs
+    /// a voter short. Overwritten via `MetricsHandle::set` on every metrics
+    /// sample (not incremented), like `CpGroupsQuiesced`. Expected `0`; any
+    /// sustained non-zero value needs an operator (`/admin/raftkv`'s
+    /// per-group `refused_as_voter` names which tablet).
+    CpGroupsRefusedAsVoter,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 109] = [
+    pub const ALL: [Metric; 110] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -1063,6 +1074,7 @@ impl Metric {
         Metric::CpRemovalNoticesAcked,
         Metric::CpRemovalNoticesIgnored,
         Metric::CpDepartingPeersDropped,
+        Metric::CpGroupsRefusedAsVoter,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -1179,6 +1191,7 @@ impl Metric {
             Metric::CpRemovalNoticesAcked => "cp_removal_notices_acked",
             Metric::CpRemovalNoticesIgnored => "cp_removal_notices_ignored",
             Metric::CpDepartingPeersDropped => "cp_departing_peers_dropped",
+            Metric::CpGroupsRefusedAsVoter => "cp_groups_refused_as_voter",
         }
     }
 
