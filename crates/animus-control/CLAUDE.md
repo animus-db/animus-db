@@ -648,9 +648,11 @@ stop compiling, `ALL_KINDS` and the scenario need the new kind, and
 `every_entity_kind_has_a_fixture_for_the_current_version` fails until its
 fixture directory exists (generate with the `#[ignore]`d
 `generate_fixture_mirror_entities`). The decoders (`apply_put`) take no
-version today: the mirror version is a whole-keyspace gate in
-`rebuild_metadata_from_engine`, so a v2 layout adds a version-dispatching
-decode next to it and keeps the v1 one.
+version themselves, but the mirror version is a real dispatch in
+`rebuild_metadata_from_engine` (P1-C): `match found_version { 1 =>
+rebuild_metadata_v1(..), v => unsupported-version error }`, so a v2 layout
+adds an arm there, moves the v1 body and its `apply_put` shapes to a frozen
+`legacy`, and keeps the v1 fixtures decoding.
 
 **Golden fixture**: `tests/fixtures/formats/metadata/v1.json` — a small,
 deterministic `Metadata` built by *applying real `MetaCommand`s* through
