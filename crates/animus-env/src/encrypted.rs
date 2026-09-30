@@ -276,9 +276,25 @@ fn scan(key: &EncryptionKey, raw: &[u8]) -> Scan {
     if raw.len() < HEADER_LEN || raw[0..4] != MAGIC {
         return Scan::NotEncrypted;
     }
-    if raw[4] == 0 || raw[4] > VERSION {
-        return Scan::UnsupportedVersion(raw[4]);
+    // Version dispatch (ADR 0073 Phase 1): exact `match`, never a range check.
+    // When `VERSION` becomes 2, `2 => scan_v2(..)` joins here and the v1 arm
+    // moves to `legacy::v1` (see `legacy`).
+    match raw[4] {
+        1 => scan_v1(key, raw),
+        v => Scan::UnsupportedVersion(v),
     }
+}
+
+/// Legacy (pre-current-version) ADE1 envelope scanners (ADR 0073 Phase 1,
+/// "upgrade-on-read"). Empty while the envelope is still v1. Once version N+1
+/// exists, `scan_vN` moves to `legacy::vN` unchanged in behavior and — the
+/// upgrade-on-read contract — yields the *current* in-memory `Scan`/
+/// `FileIndex`; `scan`'s `match` routes to it. Never deleted (support
+/// window: forever).
+mod legacy {}
+
+/// The v1 envelope scan: `raw` is known to start with a full, v1 header.
+fn scan_v1(key: &EncryptionKey, raw: &[u8]) -> Scan {
     let mut salt = [0u8; SALT_LEN];
     salt.copy_from_slice(&raw[5..HEADER_LEN]);
 
