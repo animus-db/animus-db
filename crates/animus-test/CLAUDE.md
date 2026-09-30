@@ -41,6 +41,28 @@ properties; it also hosts cross-crate fault sweeps.
   for printing a human report plus a copy-pasteable machine handle. See
   "Failure minimization" below.
 
+- `src/upgrade/transcode.rs` (ADR 0073 Phase 1, P1-D) — the upgrade-restart
+  harness's **per-format transcode table** (`TABLE`: one `FormatEntry` per
+  durable whole-file format — `lsm-wal`, `lsm-manifest`, `lsm-sstable`,
+  `control-wal`, `shared-wal`, `encryption-envelope` — with `current_version`,
+  a `VersionSpec` list carrying a placeholder `CapabilityMask`, and a
+  `transcode` fn) and the disk-level entry point `transcode_disk(&SimEnv,
+  target_back, &TranscodeOpts)` (sorted, classified by name/magic, rewritten
+  with `Disk::replace`; per-file keep/skip from splitmix64 of `(seed, file)`,
+  never the simulator RNG; `stop_after_files` models a crash mid-window).
+  Every format is v1, so only `target_back == 0` (identity) is supported and
+  anything else is an `UnsupportedTarget` error, never a silent identity.
+  **Checklist step 7 is editing one `FormatEntry`** (bump `current_version`,
+  add a `VersionSpec`, point `transcode` at the `legacy::vK::encode` calls);
+  `tests/upgrade_restart_tier0.rs` fails if the table drifts from the newest
+  checked-in fixture. Tier 0 (`tests/upgrade_restart_tier0.rs`) seeds a
+  `SimEnv` disk with each whole-file fixture, runs it through the table,
+  crashes, and opens the real reader (`LsmEngine::open_with`,
+  `PersistedState::decode`/`replay`, `SharedWal::open`); its negative
+  controls pin the exact outcome for each corruption. Needs `animus-env`,
+  `animus-sim` and `futures` as **normal** deps of this crate (it is only ever a
+  dev-dependency elsewhere, so no production build sees them).
+
 Env knobs at a glance (details in the sections below):
 
 | Knob | Default | Effect |
