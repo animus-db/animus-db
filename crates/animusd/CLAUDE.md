@@ -2545,7 +2545,7 @@ deliberate round-robin several pagination suites do to exercise the forwarded
 path — is only stable if every node it touches agrees: consecutive pages now
 sample different, independently-lagging replicas. Fix by asking for the strong
 read, or (a GSI rejects it) converging on *every* address first
-(`dynamo_query_pagination.rs::await_gsi_query_everywhere`) **and then**
+(`sim_cluster_dynamo_query_pagination.rs::await_gsi_query_everywhere`) **and then**
 `support::await_replicas_caught_up` — polling addresses proves only that
 *some* replica per address had the rows: the freshness gate is local
 (`engine_applied >= the replica's own commit_index`), and a follower learns

@@ -23,5 +23,7 @@ poll samples whoever answered that instant, not every replica.
 - An empty/short page with no LEK is not a pagination bug: LEK is emitted only when the `Limit+1`
   probe row exists on the serving replica.
 - Do not widen the poll, retry the walk or relax the assertion: the walk is meaningful only over
-  converged replicas. The same shape lurks in other `*_everywhere` helpers (e.g. `dynamo_streams`,
-  `dynamo_query_pagination`).
+  converged replicas. Only an *eventual data read* has this hazard: `*_everywhere` helpers that poll
+  replicated control-plane `Metadata` (e.g. `dynamo_streams`'s stream-label poll) do not. The
+  SimCluster suite `src/sim_cluster_dynamo_query_pagination.rs` has the same per-node-poll-then-
+  rotating-walk shape and no per-replica equivalent yet.
