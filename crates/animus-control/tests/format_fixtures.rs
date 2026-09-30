@@ -381,47 +381,83 @@ fn metadata_fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/formats/metadata")
 }
 
-/// Iterates every file under `tests/fixtures/formats/metadata/` (never
-/// naming `v1` literally, per the ADR 0073 Phase 0 conventions — a future
-/// version's own fixture needs no test-code change) and asserts each
-/// decodes, structurally, to the exact expected value for its version.
+/// Iterates every file under `tests/fixtures/formats/metadata/` and asserts
+/// each decodes, via the version-dispatching [`Metadata::from_json`], to its
+/// own per-version expected value (ADR 0073 Phase 1). The version comes from
+/// the `vN.json` file name and must agree with the document's own `"v"`; an
+/// unrecognised version panics, so a new fixture forces a new expectation.
 #[test]
-fn decodes_every_checked_in_metadata_fixture_structurally() {
+fn decodes_every_checked_in_metadata_fixture_to_its_per_version_value() {
     let dir = metadata_fixtures_dir();
-    let mut checked = 0usize;
+    let mut seen = Vec::new();
     let entries = std::fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("reading fixtures dir {}: {e}", dir.display()));
     for entry in entries {
-        let entry = entry.expect("readable dir entry");
-        let path = entry.path();
+        let path = entry.expect("readable dir entry").path();
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or_default()
             .to_string();
+        let version: u32 = name
+            .strip_prefix('v')
+            .and_then(|r| r.strip_suffix(".json"))
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("{name}: fixture name is not vN.json"));
         let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("reading {name}: {e}"));
-        match name.as_str() {
-            "v1.json" => {
-                let decoded = Metadata::from_json(&bytes)
-                    .unwrap_or_else(|e| panic!("{name} failed to decode: {e}"));
-                assert_eq!(
-                    decoded,
-                    v1_metadata(),
-                    "{name} decoded to an unexpected value"
-                );
-                checked += 1;
-            }
+        let decoded =
+            Metadata::from_json(&bytes).unwrap_or_else(|e| panic!("{name} failed to decode: {e}"));
+        assert_eq!(decoded.version, version, "{name}: file name vs decoded v");
+        let expected = match version {
+            1 => v1_metadata(),
             other => panic!(
-                "unrecognized metadata fixture {other:?} — add a matching expected-value \
-                 arm to this test before adding the fixture file"
+                "{name}: no expected value for metadata v{other}; add a match arm (and a \
+                 frozen legacy decoder) before adding the fixture file"
             ),
-        }
+        };
+        assert_eq!(decoded, expected, "{name} decoded to an unexpected value");
+        seen.push(version);
     }
     assert!(
-        checked > 0,
-        "no metadata fixtures found under {}",
+        !seen.is_empty(),
+        "no metadata fixtures under {}",
         dir.display()
     );
+    assert!(
+        seen.contains(&animus_control::meta::METADATA_VERSION),
+        "no fixture for the current METADATA_VERSION: {seen:?}"
+    );
+}
+
+/// `from_json` dispatches on the peeked version: `0` and future versions are
+/// refused by name, a missing `"v"` is pre-baseline; plain serde (the
+/// nested-in-an-envelope path) still reads a `"v"`-less document as v1, which
+/// the frozen `control-wal`/`shared-wal` fixtures depend on.
+#[test]
+fn metadata_from_json_refuses_unknown_versions_and_serde_defaults_missing_v() {
+    use animus_control::format::FormatError;
+    let mut value = serde_json::to_value(v1_metadata()).unwrap();
+    for bad in [0u8, 2, 99] {
+        value["v"] = bad.into();
+        let err = Metadata::from_json(value.to_string().as_bytes()).unwrap_err();
+        assert_eq!(
+            err,
+            FormatError::UnsupportedFormatVersion {
+                format: "metadata",
+                found: bad,
+                max_supported: 1
+            },
+            "v={bad}"
+        );
+    }
+    value.as_object_mut().unwrap().remove("v");
+    let bytes = value.to_string().into_bytes();
+    assert!(matches!(
+        Metadata::from_json(&bytes),
+        Err(FormatError::PreBaselineFormat { .. })
+    ));
+    let nested: Metadata = serde_json::from_slice(&bytes).expect("serde defaults v to 1");
+    assert_eq!(nested, v1_metadata());
 }
 
 /// Encoding the same representative value with the *current* code and

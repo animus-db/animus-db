@@ -105,32 +105,45 @@ fn assert_v1_structure(c: &ClusterConfig, name: &str) {
     assert_eq!(s.orphan_sweep_after_secs, None, "{name}");
 }
 
-/// Iterates every file under the fixture dir (a future version's fixture
-/// needs a new arm here before it can be added).
+/// Per-version expected value (ADR 0073 Phase 1): the version comes from the
+/// `vN.json` file name and must agree with the decoded `"v"`; an unrecognised
+/// version panics, so a new fixture forces a new expectation (and a frozen
+/// legacy decoder in `ClusterConfig::from_json`'s dispatch).
 #[test]
-fn decodes_every_checked_in_cluster_config_fixture_structurally() {
+fn decodes_every_checked_in_cluster_config_fixture_to_its_per_version_value() {
     let dir = fixtures_dir();
-    let mut checked = 0usize;
+    let mut seen = Vec::new();
     for entry in std::fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("reading fixtures dir {}: {e}", dir.display()))
     {
         let path = entry.expect("dir entry").path();
         let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let version: u32 = name
+            .strip_prefix('v')
+            .and_then(|r| r.strip_suffix(".json"))
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("{name}: fixture name is not vN.json"));
         let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {name}: {e}"));
-        match name.as_str() {
-            "v1.json" => {
-                let c = ClusterConfig::from_json(&text)
-                    .unwrap_or_else(|e| panic!("{name} failed to decode: {e}"));
+        let c = ClusterConfig::from_json(&text)
+            .unwrap_or_else(|e| panic!("{name} failed to decode: {e}"));
+        assert_eq!(c.version, version, "{name}: file name vs decoded v");
+        match version {
+            1 => {
                 assert_v1_structure(&c, &name);
-                checked += 1;
+                assert_eq!(c.to_json(), v1_config().to_json(), "{name}");
             }
             other => panic!(
-                "unrecognized cluster-config fixture {other:?} — add a matching arm before \
-                 adding the fixture file"
+                "{name}: no expected value for cluster-config v{other}; add a match arm \
+                 before adding the fixture file"
             ),
         }
+        seen.push(version);
     }
-    assert!(checked > 0, "no fixtures under {}", dir.display());
+    assert!(!seen.is_empty(), "no fixtures under {}", dir.display());
+    assert!(
+        seen.contains(&CLUSTER_CONFIG_VERSION),
+        "no fixture for the current CLUSTER_CONFIG_VERSION: {seen:?}"
+    );
 }
 
 #[test]

@@ -161,7 +161,7 @@ a literal `:0`.
   in `lib.rs` instead.
 - **`main.rs`** — thin CLI wrapper; dispatches the invocation modes (below) and
   wires `otel::init_tracing` + the Ctrl-C graceful-shutdown path.
-- **`config.rs`** — `ClusterConfig`/`RoleAddrs` (per-process deployment
+- **`config.rs`** — (ADR 0073 P1-C: `ClusterConfig::from_json` `match`es on the peeked `"v"`, which stays required with no serde default; `tests/format_fixtures.rs` is per-version.) `ClusterConfig`/`RoleAddrs` (per-process deployment
   config; every entry names its own **`id: NodeId`** rather than deriving
   it from position — `from_json` hard-errors on a duplicate) and the
   **six-port stride** (ADR 0047 + ADR 0052 + ADR 0053: `base_port + 6*i +
