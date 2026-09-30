@@ -409,6 +409,8 @@ arm's body to a frozen `persist::legacy::v1` with a `From` translation (ADR
 0073 "Phase 1 design" checklist). Do not change the `format.rs` helpers'
 signatures (`unsupported_version` is an addition).
 
+**P1-C (metadata):** `Metadata::from_json` dispatches with `match` on the peeked `"v"`; `Metadata`'s serde default on `"v"` deliberately stays (frozen `control-wal`/`shared-wal`/`control-snapshot` fixtures embed a `"v"`-less `Metadata`; see the field's doc). The fixture test is per-version (name-derived version, per-version expected value, panics on an unrecognised one).
+
 **`format.rs`** is the shared tagged-envelope convention Phase 0 workstream
 B introduced, and the one workstream C (`animus-cp-data`) reuses rather
 than inventing a second "envelope wraps an inner payload" scheme for the
