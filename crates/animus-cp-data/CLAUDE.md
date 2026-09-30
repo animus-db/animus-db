@@ -1639,6 +1639,21 @@ DynamoDB-wire and real-`LsmEngine` regressions this fix also carries.
   `tests/departing_removal_notice.rs` (a reconciler-hosted replica left behind
   the compacted log by a continuous writer: zero snapshot ships/restarts,
   told, not released while `Metadata` lists it, released once it does).
+- **Release predicate and destructive-step recheck (release-vs-promote race,
+  ADR 0031's 2026-09-30 addendum).** "Excluded" is `host::replica_excluded`
+  (removal notice received, OR in neither `config()` nor `learners()`) — a
+  **learner is a member**; `config()` is voters only, so testing it alone
+  released mid-catch-up learners. `Reconciler::teardown(tablet, release)`
+  re-checks before stopping the driver, and `finish_teardown` re-checks live
+  state again right before `erase_tablet_files` for a `Release` (also on the
+  parked `sweep_stopping` path via `StoppingNode::release`); a replica that
+  is a member again keeps its files and its claim is cleared so the next
+  `Host` re-adopts the intact disk. `Reclaim` never rechecks. `tick()` always
+  gathers fresh facts, so a stale plan is only expressible by driving
+  `finish_teardown` directly (`host.rs` unit tests). Corpus:
+  `tests/release_race_corpus.rs` (`ANIMUS_RELEASE_RACE_SEEDS`). Known
+  leader-side residual: a wiped learner re-added while the leader's progress
+  for it is stale can be judged caught up.
 - **Removal-notice observability (issue #1061 follow-up).** `drive`'s
   per-iteration core read also takes `RaftCore::removal_stats()` and
   `record_removal_stats` emits the growth as `Metric::CpRemovalNoticesSent`/
