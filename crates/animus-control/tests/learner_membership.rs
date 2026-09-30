@@ -11,7 +11,7 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use animus_control::raft::{MemberRole, ProposeResult, RaftCore};
+use animus_control::raft::{MemberRole, ProposeResult, RaftCore, RaftMsg};
 use animus_control::{MetaCommand, Metadata, NodeStatus};
 use animus_env::{Nanos, NodeId, nid};
 use animus_sim::{SimEnv, Simulator};
@@ -365,4 +365,91 @@ fn a_learner_never_campaigns_even_when_it_never_hears_from_a_leader() {
         learner.metadata().members.contains_key(&nid(200)),
         "seed={seed}: a healed learner still catches up normally"
     );
+}
+
+// ---- stale-progress-on-re-add (stale-learner-promotion fix) ----
+
+fn success_ack(term: u64, match_index: u64) -> RaftMsg<MetaCommand> {
+    RaftMsg::AppendEntriesResp {
+        term,
+        success: true,
+        match_index,
+        needs_snapshot: false,
+    }
+}
+
+/// A peer removed and later re-added as a learner must start with FRESH
+/// replication progress: `match_index == 0`, and `learner_caught_up` false
+/// until it acks something since the re-add. Otherwise the leader judges a
+/// wiped replica caught up and promotes it before it has received anything.
+fn stale_progress_scenario(remove_via_learner: bool) {
+    let mut c = core(0, &[0]);
+    elect_solo_leader(&mut c);
+    for i in 0..3 {
+        assert!(matches!(
+            c.propose(upsert(10 + i)),
+            ProposeResult::Accepted { .. }
+        ));
+    }
+    let _ = c.tick(Nanos(11_000_000_000), 0);
+    assert!(matches!(
+        c.add_learner(nid(1)),
+        ProposeResult::Accepted { .. }
+    ));
+    let term = c.term();
+    let now = Nanos(12_000_000_000);
+    let _ = c.handle(nid(1), success_ack(term, c.last_log_index()), now, 0);
+    let _ = c.tick(Nanos(13_000_000_000), 0);
+    assert!(c.commit_index() > 0);
+    assert_eq!(c.peer_match(&nid(1)), c.last_log_index());
+    assert!(
+        c.learner_caught_up(&nid(1), 0),
+        "acked learner is caught up"
+    );
+
+    if remove_via_learner {
+        assert!(matches!(
+            c.remove_learner(nid(1)),
+            ProposeResult::Accepted { .. }
+        ));
+    } else {
+        // Promote, then drop as a voter: the peer becomes `departing` and
+        // keeps its state until it acks the removal.
+        assert!(matches!(
+            c.promote_learner(nid(1)),
+            ProposeResult::Accepted { .. }
+        ));
+        let _ = c.handle(nid(1), success_ack(term, c.last_log_index()), now, 0);
+        let _ = c.tick(Nanos(14_000_000_000), 0);
+        assert!(matches!(
+            c.change_membership(set(&[0])),
+            ProposeResult::Accepted { .. }
+        ));
+    }
+    assert!(matches!(
+        c.add_learner(nid(1)),
+        ProposeResult::Accepted { .. }
+    ));
+    assert_eq!(c.learners(), set(&[1]));
+    assert_eq!(
+        c.peer_match(&nid(1)),
+        0,
+        "a re-added learner must start with fresh progress"
+    );
+    assert!(
+        !c.learner_caught_up(&nid(1), 0),
+        "a re-added learner is not caught up until it acks since the re-add"
+    );
+    let _ = c.handle(nid(1), success_ack(term, c.last_log_index()), now, 0);
+    assert_eq!(c.peer_match(&nid(1)), c.last_log_index());
+}
+
+#[test]
+fn a_removed_then_readded_learner_starts_with_fresh_progress() {
+    stale_progress_scenario(true);
+}
+
+#[test]
+fn a_departing_voter_readded_as_learner_starts_with_fresh_progress() {
+    stale_progress_scenario(false);
 }

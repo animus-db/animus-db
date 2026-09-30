@@ -2849,3 +2849,19 @@ wired into CI's nightly `corpus-deep.yml`, default `40`). A structural
 matrix honest, mirroring `raftkv_corpus_covers_the_fault_matrix` — it
 deliberately does not (and must not) require the `#[ignore]`d
 corrupt-on-crash cell to be part of the asserted set.
+
+## Fresh replication progress on (re)introduction (stale-learner-promotion fix)
+
+`RaftCore::log_append` (leader, config-bearing entry) calls
+`reset_peer_progress_on_membership_change`: a node the entry newly introduces
+as voter or learner (in neither old set) gets `match_index = 0`,
+`next_index = entry.index`, and its snapshot-transfer bookkeeping forgotten; a
+node that leaves membership without becoming `departing` (a removed learner)
+has all per-peer progress dropped; a `departing` peer keeps its state (still
+owed the removal notice). Before this, a peer removed and re-added as a
+learner (its files erased meanwhile) inherited its old `match_index`, so
+`learner_caught_up` judged it caught up and `reconfigure_step` promoted it
+empty; the wiped-voter guard then refused it permanently. `learner_caught_up`
+must therefore only ever be true from an ack received since the (re)add.
+Tests: `tests/learner_membership.rs` `*_starts_with_fresh_progress`,
+`animus-cp-data/tests/release_race_corpus.rs` stale-progress cells.
