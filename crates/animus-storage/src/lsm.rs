@@ -3288,16 +3288,31 @@ fn decode_wal(bytes: &[u8]) -> Result<(Vec<WalRecord>, usize)> {
     if magic != WAL_MAGIC {
         return Err(StorageError::PreBaselineFormat { format: "lsm-wal" });
     }
-    let version = bytes[4];
-    if version == 0 || version > WAL_VERSION {
-        return Err(StorageError::UnsupportedFormatVersion {
+    // Version dispatch (ADR 0073 Phase 1): an exact `match`, never a range
+    // check. When `WAL_VERSION` becomes 2, `2 => decode_wal_v2(..)` joins here
+    // and `1 => wal_legacy::v1::decode(..)` moves the v1 arm to `legacy`.
+    match bytes[4] {
+        1 => decode_wal_v1(&bytes[WAL_HEADER_LEN..]),
+        v => Err(StorageError::UnsupportedFormatVersion {
             format: "lsm-wal",
-            found: u32::from(version),
+            found: u32::from(v),
             max_supported: u32::from(WAL_VERSION),
-        });
+        }),
     }
+}
 
-    let body = &bytes[WAL_HEADER_LEN..];
+/// Legacy (pre-current-version) on-disk decoders for the LSM WAL and manifest
+/// (ADR 0073 Phase 1, "upgrade-on-read"). Empty while every format is still
+/// v1. Once version N+1 of a format exists, its `vN` decoder moves to
+/// `legacy::vN` **unchanged in behavior**, and — the upgrade-on-read contract —
+/// returns the *current* in-memory type (`Vec<WalRecord>` / `Manifest`), never
+/// a legacy shape; the version `match` in `decode_wal` / `decode_manifest`
+/// routes to it. A legacy decoder is never deleted (support window: forever).
+mod legacy {}
+
+/// The v1 WAL body decoder: `body` is everything after the 5-byte header.
+/// Returns the records and the total consumed length *including* the header.
+fn decode_wal_v1(body: &[u8]) -> Result<(Vec<WalRecord>, usize)> {
     let mut records = Vec::new();
     let mut pos = 0usize;
     while pos < body.len() {
@@ -3977,13 +3992,19 @@ fn decode_manifest(bytes: &[u8]) -> Result<Manifest> {
     let mut c = Cursor::new(bytes);
     let _magic = c.take(4)?;
     let version = c.u8()?;
-    if version == 0 || version > MANIFEST_VERSION {
-        return Err(StorageError::UnsupportedFormatVersion {
+    // Version dispatch (ADR 0073 Phase 1): exact `match`; see `legacy`.
+    match version {
+        1 => decode_manifest_v1(c),
+        v => Err(StorageError::UnsupportedFormatVersion {
             format: "lsm-manifest",
-            found: u32::from(version),
+            found: u32::from(v),
             max_supported: u32::from(MANIFEST_VERSION),
-        });
+        }),
     }
+}
+
+/// The v1 manifest body decoder; `c` is positioned just past the version byte.
+fn decode_manifest_v1(mut c: Cursor<'_>) -> Result<Manifest> {
     let next_seq = c.u64()?;
     let max_version = c.u64()?;
     let table_count = c.u32()? as usize;

@@ -65,7 +65,9 @@ the production implementation; the deterministic implementation lives in
   this in CI). `scan()` rejects a version byte outside
   `1..=VERSION` (once the full 21-byte header is present) with a distinct
   `InvalidData` error naming `ADE1`, the version found and the supported
-  range (`Scan::UnsupportedVersion`); a strict header prefix still
+  range (`Scan::UnsupportedVersion`, produced by the exact version `match` in `scan` —
+  `1 => scan_v1`; an empty `mod legacy {}` awaits future `vN` scanners, ADR 0073 P1-B
+  step 2); a strict header prefix still
   classifies as before. `open_whole` (marker/segment-store objects) does
   not inspect the version byte.
 - **`encrypted_segment_store.rs`** (ADR 0069, S-03 PR 2) — the

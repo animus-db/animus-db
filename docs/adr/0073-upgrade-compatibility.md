@@ -1277,6 +1277,18 @@ also asserts a fixture exists for the *current* version constant.
 rather than `spec.version`. The dispatch seam in the decoders is step 2 (a
 stacked PR).
 
+**P1-B step 2 as-built (dispatch seam, every format still v1; P1-B done).**
+`decode_wal`, `decode_manifest`, `SsTableReader::read_block` (on
+`meta.format`) and the envelope `scan` (`EncryptedDisk`) now read the version
+tag and `match` it exactly: `1 => <v1 decode fn>` (`decode_wal_v1`,
+`decode_manifest_v1`, `decode_block_v1`, `scan_v1` — the former bodies, moved
+verbatim), `v => <the same unsupported-version error as before>`; no range
+check remains. Each of the three files carries an empty `mod legacy {}` whose
+doc states the upgrade-on-read contract (a `legacy::vN` decoder returns the
+*current* in-memory type; never deleted). Behavior is byte-for-byte unchanged:
+the existing fixture tests and the existing version-0 / newer-version tests
+per decoder pass untouched, and no fixture was edited.
+
 **Waves.** Wave 1: P1-A, P1-B, P1-C, fully concurrent (disjoint crates; the
 only shared surface is `animus_control::format`, which nobody changes).
 Wave 2: P1-D tier 0/1 (starts once one of A/B/C has landed its

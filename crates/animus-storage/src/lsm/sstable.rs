@@ -81,11 +81,42 @@ fn check_format(format: u32) -> Result<()> {
     if (1..=FORMAT_CURRENT).contains(&format) {
         Ok(())
     } else {
-        Err(StorageError::UnsupportedFormatVersion {
-            format: "lsm-sstable",
-            found: format,
-            max_supported: FORMAT_CURRENT,
-        })
+        Err(unsupported_format(format))
+    }
+}
+
+fn unsupported_format(found: u32) -> StorageError {
+    StorageError::UnsupportedFormatVersion {
+        format: "lsm-sstable",
+        found,
+        max_supported: FORMAT_CURRENT,
+    }
+}
+
+/// Legacy (pre-current-format) SSTable block decoders (ADR 0073 Phase 1,
+/// "upgrade-on-read"). Empty while the only format is 1. Once format N+1
+/// exists, the `vN` block decoder moves to `legacy::vN` unchanged in behavior
+/// and — the upgrade-on-read contract — returns the *current* in-memory
+/// records (`Vec<Record>`); `read_block`'s `match` on `meta.format` routes to
+/// it. Never deleted (support window: forever).
+mod legacy {}
+
+/// Decode one CRC-verified format-1 block: first byte is the block tag; the
+/// rest is the (maybe-compressed) record payload.
+fn decode_block_v1(framed: &[u8]) -> Result<Vec<Record>> {
+    let (&tag, payload) = framed
+        .split_first()
+        .ok_or_else(|| StorageError::Backend("empty sstable block".into()))?;
+    match tag {
+        BLOCK_STORED => decode_block(payload),
+        BLOCK_LZ4 => {
+            let rec_bytes = lz4_flex::decompress_size_prepended(payload)
+                .map_err(|e| StorageError::Backend(format!("sstable block decompress: {e}")))?;
+            decode_block(&rec_bytes)
+        }
+        other => Err(StorageError::Backend(format!(
+            "bad sstable block tag {other}"
+        ))),
     }
 }
 /// Fixed footer size: `index_offset(8) + index_len(8) + magic(8)`.
@@ -634,24 +665,13 @@ impl SsTableReader {
         if crc32fast::hash(framed) != want {
             return Err(StorageError::Backend("sstable block crc mismatch".into()));
         }
-        // Format dispatch (ADR 0073): `open` already refused an unknown format,
-        // but `meta` is a public field, so re-check rather than assume.
-        check_format(self.meta.format)?;
-        // Format 1: first byte is the block tag; the rest is the
-        // (maybe-compressed) record payload.
-        let (&tag, payload) = framed
-            .split_first()
-            .ok_or_else(|| StorageError::Backend("empty sstable block".into()))?;
-        match tag {
-            BLOCK_STORED => decode_block(payload),
-            BLOCK_LZ4 => {
-                let rec_bytes = lz4_flex::decompress_size_prepended(payload)
-                    .map_err(|e| StorageError::Backend(format!("sstable block decompress: {e}")))?;
-                decode_block(&rec_bytes)
-            }
-            other => Err(StorageError::Backend(format!(
-                "bad sstable block tag {other}"
-            ))),
+        // Format dispatch (ADR 0073 Phase 1): exact `match` on the
+        // manifest-recorded format. `open` already refused an unknown format,
+        // but `meta` is a public field, so the fallback arm re-checks rather
+        // than assuming.
+        match self.meta.format {
+            1 => decode_block_v1(framed),
+            other => Err(unsupported_format(other)),
         }
     }
 

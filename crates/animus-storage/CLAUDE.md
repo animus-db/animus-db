@@ -175,7 +175,10 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   0073 Phase 0) and **the reader now dispatches on it**: `check_format` at
   `SsTableReader::open` and again in `read_block` turn any other value into
   `UnsupportedFormatVersion { "lsm-sstable" }`, so a second format is a new
-  decoder arm + fixture. The footer `MAGIC` and `SSIX` index tag are unchanged. (Restart-point in-block
+  decoder arm + fixture. `decode_wal`/`decode_manifest`/`read_block` are exact
+  `match`es on the version (`1 => decode_*_v1`, else `UnsupportedFormatVersion`),
+  with an empty `mod legacy {}` per file for future `legacy::vN` decoders that
+  return the current in-memory type (ADR 0073 P1-B step 2). The footer `MAGIC` and `SSIX` index tag are unchanged. (Restart-point in-block
   binary-search seek — the other half of LevelDB's block format — is a deliberate
   follow-up: the reader decodes whole blocks, gated by the block index + Bloom, so
   restart points would be unused machinery today.)
