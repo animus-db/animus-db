@@ -124,6 +124,19 @@ impl fmt::Display for FormatError {
 
 impl std::error::Error for FormatError {}
 
+/// The named error for a version byte a dispatching decoder has no arm for
+/// (ADR 0073 Phase 1 "upgrade on read"): the `found => Err(..)` arm of a
+/// `match version { 1 => .., found => format::unsupported_version(tag, found) }`.
+/// Never a panic. `max_supported` is `tag.version`.
+#[must_use]
+pub fn unsupported_version(tag: &FormatTag, found: u8) -> FormatError {
+    FormatError::UnsupportedFormatVersion {
+        format: tag.name,
+        found,
+        max_supported: tag.version,
+    }
+}
+
 /// Encode `payload` as a binary envelope: `magic(4) || version(u8) ||
 /// payload`. Pairs with [`unwrap`].
 #[must_use]

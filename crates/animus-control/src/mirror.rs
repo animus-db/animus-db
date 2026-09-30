@@ -64,7 +64,7 @@ use animus_env::NodeId;
 #[cfg(test)]
 use animus_env::nid;
 use animus_placement::PlacementPolicy;
-use animus_storage::{StorageEngine, StorageError};
+use animus_storage::{StorageEngine, StorageError, VersionedValue};
 use animus_tablet::{Tablet, TabletId};
 use serde::{Deserialize, Serialize};
 
@@ -660,43 +660,46 @@ fn decode_node_id(bytes: Vec<u8>) -> NodeId {
 pub async fn rebuild_metadata_from_engine<S: StorageEngine>(
     engine: &S,
 ) -> Result<Metadata, RebuildError> {
-    let mut meta = Metadata::default();
     let entries = engine.entries().await.map_err(RebuildError::Storage)?;
-    let is_empty = entries.is_empty();
     let format_version_key = syskv_format_version_key();
-    let mut found_version: Option<u64> = None;
+    let found_version = entries
+        .iter()
+        .find(|(key, _)| *key == format_version_key)
+        .map(|(_, versioned)| decode_u64(&versioned.value));
+    // ADR 0073 Phase 1 (P1-C): a real dispatch on the version row, not a
+    // range gate. A fresh, empty engine has nothing to version yet and
+    // rebuilds to the default `Metadata`. An engine that already holds
+    // *some* reserved-namespace state but no `SYSKV_FORMAT_VERSION_COUNTER`
+    // row is pre-baseline (this counter is written unconditionally on every
+    // durable apply pass, see `node.rs`'s `meta_apply_and_compact`). A
+    // future v2 adds an arm and moves the v1 body to a frozen `legacy`
+    // module with a translation.
+    if entries.is_empty() {
+        return Ok(Metadata::default());
+    }
+    match found_version {
+        None => Err(RebuildError::Format(FormatError::PreBaselineFormat {
+            format: "syskv-mirror",
+        })),
+        Some(1) => Ok(rebuild_metadata_v1(entries)),
+        Some(v) => Err(RebuildError::Format(
+            FormatError::UnsupportedFormatVersion {
+                format: "syskv-mirror",
+                found: u8::try_from(v).unwrap_or(u8::MAX),
+                max_supported: u8::try_from(SYSKV_MIRROR_VERSION).unwrap_or(u8::MAX),
+            },
+        )),
+    }
+}
+
+/// The v1 (current) syskv-mirror rebuild body: fold every engine entry onto
+/// a default [`Metadata`] through [`apply_key_write`].
+fn rebuild_metadata_v1(entries: Vec<(Vec<u8>, VersionedValue)>) -> Metadata {
+    let mut meta = Metadata::default();
     for (key, versioned) in entries {
-        if key == format_version_key {
-            found_version = Some(decode_u64(&versioned.value));
-        }
         apply_key_write(&mut meta, &KeyWrite::Put(key, versioned.value));
     }
-    // ADR 0073 Phase 0 workstream B: an engine that already holds *some*
-    // reserved-namespace state but no `SYSKV_FORMAT_VERSION_COUNTER` row is
-    // pre-baseline (this counter is written unconditionally on every durable
-    // apply pass — see `node.rs`'s `meta_apply_and_compact`); a fresh, empty
-    // engine has nothing to version yet, so it's fine. A recognized
-    // version is any of `1..=SYSKV_MIRROR_VERSION`.
-    if !is_empty {
-        match found_version {
-            None => {
-                return Err(RebuildError::Format(FormatError::PreBaselineFormat {
-                    format: "syskv-mirror",
-                }));
-            }
-            Some(v) if v == 0 || v > u64::from(SYSKV_MIRROR_VERSION) => {
-                return Err(RebuildError::Format(
-                    FormatError::UnsupportedFormatVersion {
-                        format: "syskv-mirror",
-                        found: u8::try_from(v).unwrap_or(u8::MAX),
-                        max_supported: u8::try_from(SYSKV_MIRROR_VERSION).unwrap_or(u8::MAX),
-                    },
-                ));
-            }
-            Some(_) => {}
-        }
-    }
-    Ok(meta)
+    meta
 }
 
 /// [`rebuild_metadata_from_engine`]'s failure modes: a real
@@ -2738,6 +2741,51 @@ mod tests {
             ),
             "expected UnsupportedFormatVersion, got: {err:?}"
         );
+    }
+
+    /// P1-C: the mirror version row is a dispatch, not a range gate. `1` is
+    /// accepted; `0`, `2` and `u64::MAX` are each refused by name (saturated
+    /// to `u8::MAX` for the found value, exactly the pre-dispatch shape).
+    #[tokio::test]
+    async fn rebuild_from_engine_dispatches_on_the_version_row() {
+        use animus_storage::MergeOp;
+
+        for (raw, found) in [(0u64, 0u8), (2, 2), (u64::MAX, u8::MAX)] {
+            let engine = MemoryEngine::new();
+            engine
+                .merge_batch(vec![MergeOp::put(
+                    syskv_format_version_key(),
+                    raw.to_be_bytes().to_vec(),
+                    1,
+                )])
+                .await
+                .expect("merge batch");
+            let err = rebuild_metadata_from_engine(&engine)
+                .await
+                .expect_err("an unsupported version row must be refused");
+            assert!(
+                matches!(
+                    err,
+                    RebuildError::Format(FormatError::UnsupportedFormatVersion {
+                        format: "syskv-mirror",
+                        found: f,
+                        max_supported: 1,
+                    }) if f == found
+                ),
+                "version {raw}: expected UnsupportedFormatVersion, got: {err:?}"
+            );
+        }
+
+        let engine = MemoryEngine::new();
+        engine
+            .merge_batch(vec![MergeOp::put(
+                syskv_format_version_key(),
+                1u64.to_be_bytes().to_vec(),
+                1,
+            )])
+            .await
+            .expect("merge batch");
+        assert!(rebuild_metadata_from_engine(&engine).await.is_ok());
     }
 
     /// The incremental-delta consumer path (ADR 0038 PR5, `apply_key_write`):

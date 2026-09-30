@@ -396,11 +396,20 @@ per-tablet CP data plane (`animus-cp-data`).
 
 ## Versioned formats (ADR 0073 Phase 0)
 
-**Phase 1 note (2026-09-30):** `unwrap`/`decode_lines` return the version, but the
-current callers (`persist.rs`, `node.rs`, `raft.rs`) discard it: a gate, not a
-dispatch. A new format version must `match` on it and keep the old decoder
-under `legacy` (ADR 0073 "Phase 1 design" checklist); do not change these
-helpers' signatures.
+**Phase 1 dispatch (P1-C layer 1, 2026-09-30):** `unwrap`/`decode_lines` return
+the version and every caller now uses it: `persist::dispatch` holds one
+`match version { 1 => .., found => format::unsupported_version(tag, found) }`
+body decoder per format (`wal_record` for `control-wal`, `shared_wal_line` for
+`shared-wal` — its only decode site is `PersistedState::decode_tagged`, here,
+not in `animus-cp-data` — and `snapshot_body` for `control-snapshot`, used by
+`raft.rs`'s InstallSnapshot install and `node.rs`'s `decode_syskv_image_bytes`).
+A bound-and-dropped `_version` is a review failure. v1 is still the current
+shape, so there is no `legacy` module yet: a v2 adds an arm and moves the v1
+arm's body to a frozen `persist::legacy::v1` with a `From` translation (ADR
+0073 "Phase 1 design" checklist). Do not change the `format.rs` helpers'
+signatures (`unsupported_version` is an addition).
+
+**P1-C (metadata):** `Metadata::from_json` dispatches with `match` on the peeked `"v"`; `Metadata`'s serde default on `"v"` deliberately stays (frozen `control-wal`/`shared-wal`/`control-snapshot` fixtures embed a `"v"`-less `Metadata`; see the field's doc). The fixture test is per-version (name-derived version, per-version expected value, panics on an unrecognised one).
 
 **`format.rs`** is the shared tagged-envelope convention Phase 0 workstream
 B introduced, and the one workstream C (`animus-cp-data`) reuses rather
@@ -619,15 +628,31 @@ return without advancing anything) — the identical discipline
 `install_syskv_image`'s own decode-failure branch already established two
 PRs up this same stack; a `RebuildError::Storage` at either site keeps the
 pre-existing hard panic (a real backend fault this early means the engine
-itself is unusable, not a format problem). **No separate `syskv-mirror`
-golden fixture exists** — this row is mirror-internal bookkeeping that never
-rides a `Metadata` value at all, and it already has direct unit-test
-coverage in `mirror.rs`'s own test module (`rebuild_from_engine_is_ok_on_a_
-genuinely_empty_engine`/`rebuild_from_engine_rejects_a_populated_keyspace_
-missing_the_version_row`/`rebuild_from_engine_rejects_an_unsupported_
-future_version_row`); the pre-existing `control-snapshot` fixture already
-covers a real system-keyspace image's on-the-wire bytes structurally, which
-is as close as this mirror-internal row gets to a fixture of its own.
+itself is unusable, not a format problem). **Golden fixtures (ADR 0073 Phase 1, P1-C layer 3)**: the row's value bytes are
+`tests/fixtures/formats/mirror-version/v1.bin` (8-byte big-endian `1`), and
+every `EntityKind` has its own value fixture under
+`tests/fixtures/formats/mirror-entities/<EntityKind::as_str()>/v1.<ext>`
+(`.json` for the JSON-valued kinds; `.bin` for `counter`, an 8-byte
+big-endian `u64`, and for `index_backfill`/`pitr_base_backup`, whose value
+is an always-empty presence marker, so those two fixtures are **zero-byte
+files by design**). The fixture is the value bytes only; the key is re-derived
+from the real `syskv` key helpers. `tests/format_fixtures.rs` generates them
+from a fixed `MetaCommand` script run through `apply_and_derive_mirror` (so
+the bytes are what the real encoder wrote, one representative non-trivial row
+per kind, including a directed-Placing `split_placing` row), decodes each
+through `apply_key_write`/`rebuild_metadata_from_engine` with a `match` on the
+file-name version (an unrecognised version panics), and requires a fixture for
+`SYSKV_MIRROR_VERSION` in every kind directory. **Adding an `EntityKind`
+variant**: the exhaustive matches in that file (`kind_witness`, `v1_entity`)
+stop compiling, `ALL_KINDS` and the scenario need the new kind, and
+`every_entity_kind_has_a_fixture_for_the_current_version` fails until its
+fixture directory exists (generate with the `#[ignore]`d
+`generate_fixture_mirror_entities`). The decoders (`apply_put`) take no
+version themselves, but the mirror version is a real dispatch in
+`rebuild_metadata_from_engine` (P1-C): `match found_version { 1 =>
+rebuild_metadata_v1(..), v => unsupported-version error }`, so a v2 layout
+adds an arm there, moves the v1 body and its `apply_put` shapes to a frozen
+`legacy`, and keeps the v1 fixtures decoding.
 
 **Golden fixture**: `tests/fixtures/formats/metadata/v1.json` — a small,
 deterministic `Metadata` built by *applying real `MetaCommand`s* through
@@ -2865,3 +2890,18 @@ empty; the wiped-voter guard then refused it permanently. `learner_caught_up`
 must therefore only ever be true from an ack received since the (re)add.
 Tests: `tests/learner_membership.rs` `*_starts_with_fresh_progress`,
 `animus-cp-data/tests/release_race_corpus.rs` stale-progress cells.
+
+## `wal_lock` is a FIFO-fair `FairMutex` (apply-task starvation fix)
+
+`node.rs`'s `wal_lock` (serializes the consensus loop's `persist_wal` append/fsync
+against the apply task's compaction rewrite of the same WAL file) is
+`fair_lock::FairMutex`, not `futures::lock::Mutex`. The unfair mutex let `drive`'s
+back-to-back persist rounds barge ahead of the apply task's compaction wait
+indefinitely under continuous proposals on a slow disk, freezing
+`engine_applied_index` while core `last_applied == commit` hid it (ADR 0038
+amendment 2026-09-30). Do not swap it back; any new `wal_lock` user must also be
+cancel-safe-fair (it is). Liveness tests for the apply path assert on
+`engine_applied_index()`, never core `last_applied` (`tests/apply_not_starved_by_wal_lock.rs`).
+Known follow-up, deliberately not fixed here: the failure detector re-proposes
+`status: Down` for members a stale cache still shows Active, feeding more WAL
+rounds while the apply task is behind.

@@ -1,0 +1,1 @@
+{"table":"orders","table_arn":"arn:aws:dynamodb:animus:0:table/orders","s3_bucket":"bucket","s3_prefix":"exports/","format":"DynamoDbJson","export_type":"Full","export_time_ms":null,"client_token":"tok-e1","status":"InProgress","created_wall_ms":1700000000400,"completed_wall_ms":null,"item_count":0,"billed_size_bytes":0,"export_manifest":null}

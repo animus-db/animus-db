@@ -10,13 +10,13 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
+use crate::fair_lock::FairMutex;
 #[cfg(test)]
 use animus_env::nid;
 use animus_env::{Env, EnvExt, Metric, MetricsHandle, Nanos, NodeId};
 use animus_storage::{MergeOp, StorageEngine};
 use animus_tablet::TabletId;
 use futures::future::{Either, select};
-use futures::lock::Mutex as AsyncMutex;
 
 use crate::delta_ring::DeltaRing;
 use crate::detector::FailureDetector;
@@ -595,7 +595,7 @@ pub struct RaftNode<E: Env> {
     /// task's WAL-compaction rewrite of the same file (ADR 0038 PR3) — both
     /// tasks write `raft.wal`. Also held by [`flush`](Self::flush) for the
     /// same reason.
-    wal_lock: Arc<AsyncMutex<()>>,
+    wal_lock: Arc<FairMutex>,
     /// Issue #279: persist-round accounting shared by this node's three WAL
     /// drainers — the consensus loop, the apply task's compaction rewrite, and
     /// the public [`RaftNode::flush`].
@@ -723,7 +723,7 @@ impl<E: Env> RaftNode<E> {
         let cache = Arc::new(Mutex::new(Metadata::default()));
         let engine_applied = Arc::new(AtomicU64::new(0));
         let delta_ring = Arc::new(Mutex::new(delta_ring));
-        let wal_lock = Arc::new(AsyncMutex::new(()));
+        let wal_lock = Arc::new(FairMutex::new());
         let persist = Arc::new(PersistProgress::default());
         let halted = Arc::new(AtomicBool::new(false));
         let node = Self {
@@ -1256,7 +1256,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
     cache: Arc<Mutex<Metadata>>,
     engine_applied: Arc<AtomicU64>,
     delta_ring: Arc<Mutex<DeltaRing>>,
-    wal_lock: Arc<AsyncMutex<()>>,
+    wal_lock: Arc<FairMutex>,
     persist: Arc<PersistProgress>,
     // Issue #667: the SAME entropy value `start_with_orphan_sweep_after`
     // already drew for this `RaftCore`'s own construction (never a fresh
@@ -1720,7 +1720,7 @@ async fn meta_apply_loop<E: Env, S: StorageEngine>(
     engine_applied: Arc<AtomicU64>,
     delta_ring: Arc<Mutex<DeltaRing>>,
     watch: MetadataWatch,
-    wal_lock: Arc<AsyncMutex<()>>,
+    wal_lock: Arc<FairMutex>,
     persist: Arc<PersistProgress>,
     halted: Arc<AtomicBool>,
     mut shadow: Metadata,
@@ -1786,7 +1786,7 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
     engine_applied: &Arc<AtomicU64>,
     delta_ring: &Arc<Mutex<DeltaRing>>,
     watch: &MetadataWatch,
-    wal_lock: &AsyncMutex<()>,
+    wal_lock: &FairMutex,
     persist: &PersistProgress,
     halted: &AtomicBool,
     shadow: &mut Metadata,
@@ -2025,6 +2025,18 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
         let image_installed = image.is_some();
         // Serialize the WAL rewrite against the consensus loop's appends —
         // both tasks write the same file.
+        //
+        // This wait is the only place the apply task can park behind the
+        // consensus loop, and it happens *after* this pass's `merge_batch`
+        // has landed and `engine_applied`/`cache` have been published, so
+        // committed entries are never held back by compaction on this pass.
+        // `wal_lock` is a FIFO-fair `FairMutex` (see `fair_lock`'s module
+        // doc): `drive` re-locks for its next persist round the instant the
+        // previous one lands, and with an unfair mutex that barging starved
+        // this wait indefinitely (frozen `engine_applied_index`, stale
+        // `metadata()`, unbounded `pending_apply`). Fair hand-off bounds the
+        // wait to the rounds already ahead of us in the queue, so
+        // compaction still always happens.
         let _wal = wal_lock.lock().await;
         let (bytes, lli) = {
             let mut c = core.lock().expect("raft core poisoned");
@@ -2114,11 +2126,8 @@ pub fn encode_syskv_image_bytes(entries: &[SyskvImageEntry]) -> Vec<u8> {
 /// [`encode_syskv_image_bytes`]'s own doc for why this is exposed.
 #[doc(hidden)]
 pub fn decode_syskv_image_bytes(bytes: &[u8]) -> Result<Vec<SyskvImageEntry>, FormatError> {
-    let (_version, payload) = format::unwrap(&CONTROL_SNAPSHOT, bytes)?;
-    serde_json::from_slice(payload).map_err(|e| FormatError::Malformed {
-        format: CONTROL_SNAPSHOT.name,
-        detail: e.to_string(),
-    })
+    let (version, payload) = format::unwrap(&CONTROL_SNAPSHOT, bytes)?;
+    crate::persist::dispatch::snapshot_body(version, payload)
 }
 
 /// Build the system-keyspace image shipped to a lagging follower via
@@ -2988,7 +2997,7 @@ async fn orphan_sweep_loop<E: Env>(
 async fn persist_wal<E: Env>(
     env: &E,
     core: &Arc<Mutex<RaftCore>>,
-    wal_lock: &AsyncMutex<()>,
+    wal_lock: &FairMutex,
     progress: &PersistProgress,
     halted: &AtomicBool,
 ) -> usize {
@@ -3429,7 +3438,7 @@ mod tests {
         let engine_applied = Arc::new(AtomicU64::new(0));
         let delta_ring = Arc::new(Mutex::new(DeltaRing::default()));
         let watch = MetadataWatch::default();
-        let wal_lock = Arc::new(AsyncMutex::new(()));
+        let wal_lock = Arc::new(FairMutex::new());
         let mut shadow = Metadata::default();
         // Pretend a restart's rebuild already caught the watermark up to
         // cover every one of these commands.
@@ -3506,7 +3515,7 @@ mod tests {
         let engine_applied = Arc::new(AtomicU64::new(0));
         let delta_ring = Arc::new(Mutex::new(DeltaRing::default()));
         let watch = MetadataWatch::default();
-        let wal_lock = Arc::new(AsyncMutex::new(()));
+        let wal_lock = Arc::new(FairMutex::new());
 
         // Simulate "the engine already durably reflects the no-op and the
         // first two upserts" (members 0 and 1) — exactly what a genuine
@@ -3646,7 +3655,7 @@ mod tests {
         let engine_applied = Arc::new(AtomicU64::new(200));
         let delta_ring = Arc::new(Mutex::new(DeltaRing::default()));
         let watch = MetadataWatch::default();
-        let wal_lock = Arc::new(AsyncMutex::new(()));
+        let wal_lock = Arc::new(FairMutex::new());
         let mut shadow = Metadata::default();
         let mut watermark = 200;
         let mut compact_defer_since: Option<Nanos> = None;

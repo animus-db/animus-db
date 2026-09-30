@@ -34,6 +34,7 @@
 
 pub mod delta_ring;
 pub mod detector;
+pub mod fair_lock;
 pub mod format;
 pub mod meta;
 pub mod mirror;
