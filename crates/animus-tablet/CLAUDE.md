@@ -115,3 +115,13 @@ now the independent anchor that claim can be checked against. `proptest`
 (dev-dep) adds `partition_token` properties — determinism and fixed width
 over arbitrary byte inputs, and a randomized-batch generalization of the
 fixed octant-spread check — at a modest case count for the per-push gate.
+
+## Format fixtures (ADR 0073, P1-A)
+
+`tests/fixtures/formats/partition-token/v1.json` and `escape/v1.json`
+(`tests/format_fixtures.rs`) pin `partition_token` (murmur3 x64-128 seed 0, top
+64 bits big-endian) and `escape` as input -> output hex vectors, covered by the
+append-only guard (`scripts/check-format-fixtures.sh`). They are pinned vectors,
+not tagged formats; changing an output is a key-space break (ADR 0073's open
+question on the hash-ring layer). Add cases via a new `vN.json` with the
+`#[ignore]`d no-overwrite `generate_fixture_*`; never edit an existing file.

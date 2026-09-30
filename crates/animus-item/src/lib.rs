@@ -232,6 +232,9 @@ pub fn storage_key(pk: &AttributeValue, sk: Option<&AttributeValue>) -> Vec<u8> 
 }
 
 #[cfg(test)]
+mod key_bytes_vectors;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
