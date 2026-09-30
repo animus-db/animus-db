@@ -5098,6 +5098,7 @@ ADR itself for the full design/rationale.
 
 ## Gotchas
 
+- **`provision_tablet` returning does not mean this node hosts the group (issue #298 fixture flake)** — it returns once the tablet is in control-plane `Metadata`; hosting is an async `tablet_host_reconciler_loop` tick. A `ProdEnv` fixture's `node.edge.local_cp(tablet).expect(..)` right after it must be a bounded poll (`local_cp` until `Some`, then `is_leader`, in one `timeout`), as `provision_and_await_leader` does. See `docs/lessons/testing/2026-09-30-provision-tablet-returning-is-not-this-node-hosts-the-group.md`.
 - **Every listener accept loop must survive a single transient `accept()`
   error (issue #592, fixed 2026-09-16)** — `serve_requests` (`lib.rs`, the
   client/intra ports), `dynamo::serve`, `admin::serve`, and
