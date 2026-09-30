@@ -22130,9 +22130,13 @@ mod issue_298_conflict_tests {
         );
     }
 
-    /// Provisions `table`'s first tablet and waits for its single-voter
-    /// group to actually elect locally — `provision_tablet` alone does not
-    /// wait for that (`confirm_futility_tests`'s identical polling doc).
+    /// Provisions `table`'s first tablet and waits for this node to actually
+    /// host its single-voter group and elect locally — `provision_tablet`
+    /// alone waits for neither. It returns once the tablet is in control-plane
+    /// `Metadata`, but hosting is a separate async step: this node's
+    /// `tablet_host_reconciler_loop` must tick and register the group, so
+    /// `local_cp` can still be `None` right after provisioning. Both waits
+    /// are polled inside one bounded budget.
     async fn provision_and_await_leader(node: &Node, ctx: &ClientCtx, table: &str) {
         ctx.provision_tablet(table)
             .await
@@ -22143,11 +22147,13 @@ mod issue_298_conflict_tests {
             .next()
             .expect("provisioning created a tablet")
             .0;
-        let group = node
-            .edge
-            .local_cp(tablet)
-            .expect("this single node hosts the tablet");
         timeout(Duration::from_secs(10), async {
+            let group = loop {
+                if let Some(group) = node.edge.local_cp(tablet) {
+                    break group;
+                }
+                sleep(Duration::from_millis(10)).await;
+            };
             while !group.is_leader() {
                 sleep(Duration::from_millis(10)).await;
             }
