@@ -83,10 +83,10 @@ interpretation.
      enforces the "never deleted" half mechanically; the "decoder still
      accepts it" half is reviewed by hand until Phase 1's N-1 requirement
      is actually implemented per format — see Phase status). **Support
-     window:** proposed default is *every post-baseline version stays
-     readable until the project's first tagged release defines an explicit
-     window* — left as an open question below since pre-alpha has no
-     tagged releases yet to hang a window off of.
+     window: every post-baseline version stays readable forever**
+     (maintainer decision, 2026-09-30 — see the "Phase 1 design"
+     amendment at the end of this ADR; this replaces the earlier
+     "until the first tagged release" default).
    - **Once Phase 2 lands (a replicated cluster version / feature gate in
      `Metadata`) — wire formats join the same rule.** Internal `Network`
      message enums (control-plane Raft, CP-data Raft, the client/intra
@@ -112,8 +112,10 @@ interpretation.
      reset:** **done** (2026-09-30). Tracked as five
      independent workstreams (A–E) — see the table below. All five PR
      series merged; the baseline commit above is `9a9f972f`.
-   - **Phase 1 — on-disk N-1 stability:** planned; unblocked now that
-     Phase 0's baseline is set.
+   - **Phase 1 — on-disk N-1 stability:** **in progress** (design
+     accepted 2026-09-30, see the "Phase 1 design" amendment: window =
+     every post-baseline version forever; per-crate implementation
+     workstreams P1-A..P1-D).
    - **Phase 2 — replicated cluster version / wire feature-gate:** planned,
      blocked on Phase 1.
    - **Phase 3 — rolling-upgrade orchestration:** planned, blocked on
@@ -900,23 +902,26 @@ same way every other distributed behavior in this codebase is:
 
 ## Open questions
 
-- **Support window length, post-baseline.** Still open. Proposed default
-  (see Maintainer decision, point 3): *every post-baseline version stays
-  readable until the project's first tagged release defines an explicit
-  window*, since pre-alpha has no releases yet to size a window against.
-  Revisit at the first tagged release — N-1 only, N-2, or a time-boxed
-  "supported upgrade path" (Kubernetes' skip-version policy) are the
-  candidates, and longer windows cost more ongoing translation-path
-  maintenance.
-- **Which formats go first inside Phase 1?** Still open, but narrowed:
+- **Support window length, post-baseline.** **Resolved 2026-09-30:**
+  every post-baseline format version stays readable forever; old decoders
+  and fixtures are never deleted (see the "Phase 1 design" amendment).
+  The N-1 / N-2 / skip-version-policy candidates listed here earlier are
+  moot; the only remaining lever is an explicit ADR amendment naming a
+  break and its migration path (the escape hatch in Maintainer decision
+  point 3).
+- **Which formats go first inside Phase 1?** **Resolved 2026-09-30** by the
+  "Phase 1 design" amendment (workstreams P1-A..P1-D, backups/PITR/export
+  first). Original text, kept for record — narrowed:
   Phase 0's own workstream split (A–E above) already sequences the *reset*
   by crate; Phase 1's own sequencing (which reset format gets its N-1
   decode path first) still prioritizes backups/PITR/export (already
   outlive the cluster) and the RaftKV codec + LSM formats (highest change
   frequency, sit under everything else), but the actual order is a sizing
   decision for whoever picks Phase 1 up, not fixed here.
-- **Freeze the Raft codec, or keep translating it?** Still open, and now
-  sharper: Phase 0 resets `codec.rs::VERSION` to 1, so this question is
+- **Freeze the Raft codec, or keep translating it?** Still open, sharper
+  still under the 2026-09-30 forever-readable window (every bump now costs a
+  permanent `legacy` decoder + encoder, so bump cadence is a real budget).
+  Earlier text: sharper: Phase 0 resets `codec.rs::VERSION` to 1, so this question is
   really "how many more times will Phase 1 let it bump before freezing the
   wire/log shape and pushing further evolution into a schema-versioned
   inner envelope the codec itself doesn't need to understand." Not decided
@@ -973,3 +978,336 @@ notes above are unchanged.
   Phase 1 implements a real N-1 decode path per format.
 - **Inventory table.** The *Location* and *Version tag today* cells were
   refreshed to the as-built constants (see the note above the table).
+
+## Amendment 2026-09-30 — Phase 1 design
+
+Maintainer decisions, 2026-09-30:
+
+1. **Support window: every post-baseline format version stays readable
+   forever.** A newer binary must decode every version written by any
+   post-baseline binary. Old decoders and old fixtures are never deleted.
+   This resolves the "Support window length" open question (struck above)
+   and replaces the earlier "until the first tagged release" default.
+2. **Phase 1 starts with a design PR** (this amendment), then per-crate
+   implementation sessions fan out (workstreams P1-A..P1-D below).
+
+This amendment changes no format, no code and no fixture. It records the
+audit that sizes Phase 1, the decoder pattern, the format-change checklist,
+the upgrade-restart harness design, the workstreams, and the definition of
+"Phase 1 done".
+
+### Audit: is "forever readable" already mechanically enforced?
+
+All formats are at v1, so nothing has yet had to keep a second decoder. The
+hypothesis was that the fixture layer already enforces most of the rule:
+every format's fixture test iterates its `tests/fixtures/formats/<format>/`
+directory, and `scripts/check-format-fixtures.sh` forbids editing or
+deleting a checked-in fixture, so dropping the v1 decoder fails CI.
+Verified format by format against the code at `cbd23d05`:
+
+| Format (fixture dir) | Crate | Fixture test | Per-version expected values? | Version-dispatch shape | Gap |
+|---|---|---|---|---|---|
+| `lsm-wal` | `animus-storage` | `src/lsm.rs`, `wal_format_fixture_tests::decodes_every_checked_in_fixture`; round trip present | **No** — every file is asserted equal to the one `representative_records()` | File-header gate `version == 0 \|\| > WAL_VERSION` → named error; body is one decode path, version not passed on | Same expected value for all files (a v2 with new information cannot be expressed); no dispatch seam |
+| `lsm-manifest` | `animus-storage` | `src/lsm.rs`, `decodes_every_checked_in_fixture`; round trip `binary_manifest_round_trips` | **No** — same `representative_manifest()` for every file | Gate on `1..=MANIFEST_VERSION`, then a single inline field-by-field decode | Same as above |
+| `lsm-sstable` | `animus-storage` | `src/lsm/sstable.rs`, `decodes_every_checked_in_fixture`; round trip `writer_output_round_trips_the_fixture_records` | **No** — same `fixture_records()`; every file is opened with `FORMAT_CURRENT`, not the version its file name says (the format lives in the manifest, not the file) | Best shaped: `check_format(meta.format)` at open and again in `read_block`, decode arm commented "Format 1" | A v2 fixture needs its format supplied from the file name; `read_block` has no `match` yet |
+| `encryption-envelope` | `animus-env` | `src/encrypted.rs`, `decode_every_fixture_matches_current_code`; round trip present | **Only v1** gets the known-value asserts; any other file silently gets the weaker checks (magic, version range, decrypts) and **does not panic** | `scan` returns `UnsupportedVersion` for `0`/`> VERSION`; one frame decoder | A v2 fixture would pass with almost no content check |
+| `network-handshake`, `client-handshake` (wire, Phase 2) | `animus-env` | `tests/format_fixtures.rs`; round trips present | Asserts *every* fixture has `version == spec.version` (the **current** version) and an empty `ext` | `decode` reads any version; `check_peer` is exact equality (by design until Phase 2) | The test itself would fail on the retained v1 file the moment `spec.version` becomes 2, i.e. it forces the fixture to be deleted or the test rewritten |
+| `control-wal`, `control-snapshot`, `shared-wal`, `metadata` | `animus-control` | `tests/format_fixtures.rs`; round trips present | **Yes** — `match` on the file name, hand-written expectation, `panic!` on an unrecognised fixture | `format::decode_lines`/`unwrap` gate on `1..=tag.version` and **return the version**, but every caller (`persist.rs` x2, `node.rs`, `raft.rs`) discards it (`_version`) and parses one serde shape. `Metadata`'s `"v"` has a serde default (deliberate, see Workstream B PR 4) and one struct | Gate, not dispatch: bumping the tag and changing the payload shape in place would be accepted for v1 bytes and misread unless a serde default happens to cover it |
+| `raftkv-wire`, `raftkv-image`, `raftkv-wal`, `cp-engine-layout` | `animus-cp-data` | `src/format_fixture_tests.rs`; round trips present | **Yes** (`match version`, `panic!` otherwise; `raftkv-wal` asserts all 16 `KvCommand` variants) | `check_header` (`codec.rs`) and `decode_layout_value` gate `1..=CURRENT`; single body decoder. `raftkv-wal` shares `control-wal`'s line gate | Gate, not dispatch (as above) |
+| `segment` (also PITR objects) | `animus-cp-data` | `tests/format_fixtures.rs`; round trip present; `animusd/src/index_drain.rs` also reads `segment/v1.bin` through the PITR restore path | **Yes** | `decode` gates `1..=VERSION`, then a single `decode_body` | Gate, not dispatch. Test hardcodes `assert_eq!(segment::VERSION, 1, "Phase 0 baseline")` (fails on bump: acceptable forcing function, but it should assert "fixture for `VERSION` exists" instead) |
+| `backup-manifest`, `backup-data` | `animus-cp-data` | `tests/backup_format_fixtures.rs`; round trips present | **Yes** (`match`, `panic!` otherwise) | Via `format::unwrap`; `_version` discarded at the call | Gate, not dispatch. Outlives the cluster, so highest priority |
+| `cluster-config` | `animusd` | `tests/format_fixtures.rs`; round trip present | **Yes** (`match` on the file name; comment says a new arm is required before a new fixture) | `from_json` checks `"v"` before serde, then plain serde into `ClusterConfig` | Gate, not dispatch |
+| `animuscluster-spec` | `animus-operator` | `tests/format_fixtures.rs`; lossless round trip present | **No** — `assert_v1_structure` is applied to every `.json`, including asserting `schema_version == 1` | `validate_spec` rejects `0`/future `schemaVersion`; one serde type | A v2 fixture would fail the v1 asserts; no dispatch seam |
+
+Outside the fixture directories, three more durable groups matter:
+
+- **Hash-ring token / key encoding** (`animus-tablet` murmur3, `animus-item`
+  `numkey` and `key_bytes`): no tag by design (a key-space convention, see
+  the inventory). It *is* pinned, but by in-source reference-vector and
+  differential tests, not by `tests/fixtures/formats/`, so
+  `check-format-fixtures.sh` does not cover it.
+- **Row values that were never in the inventory**: the stored-item codec
+  (`animus-item/src/stored.rs`, `{"item": ..}` / `{"tombstone": true}`
+  JSON in every base-row value), `ChangeRecord` (`animus-item/src/index.rs`,
+  serde JSON with `#[serde(default)]` additions), and the per-entity JSON
+  values of the `Metadata` system-keyspace mirror (`syskv.rs` /
+  `mirror.rs`). They are untagged, and no fixture pins their exact shape
+  (they appear only opaquely inside `raftkv-wal`, `segment`, `backup-data`
+  and the `control-snapshot` fixture, whose values are placeholder JSON).
+  Two of them are read back out of backups and PITR segments, so they are
+  the real contents of the objects that outlive a cluster. This is the most
+  consequential audit finding.
+- **S3 export/import**: AWS's own format, no in-repo version, no fixture.
+  Nothing to add beyond keeping the item JSON stable (previous bullet).
+
+**Verdict.** The hypothesis holds for the *deletion* half and is weaker for
+the *misread* half:
+
+- *A v1 decoder cannot be dropped silently.* All 19 fixture directories
+  decode their v1 file in CI, and the guard forbids deleting or editing it.
+  Even the weak tests (same expected value for every file) still force v1 to
+  keep decoding.
+- *A v1 file can still be silently misread after a v2 change.* Every
+  decoder is a range gate (`1..=CURRENT`, named error outside it, correct
+  and loud) followed by **one** body decoder; the version that was just
+  checked is dropped. Adding v2 therefore means editing that one body in
+  place, and v1 survives only if the single hand-written v1 fixture happens
+  to exercise whatever changed. The seven formats marked "No"/"Only v1"/
+  "would fail" in the table also cannot express a per-version expectation
+  yet. The fixture layer is a safety net, not a structure that makes v2
+  natural; Phase 1 has to add the structure.
+- Twelve of nineteen fixture tests already fail loudly on a fixture with no
+  expectation (`panic!` on an unrecognised version), which is the desired
+  forcing function for checklist step 4 below. The other seven do not.
+
+This is a small amount of implementation work (test hardening plus a
+dispatch seam per format, no format changes), plus the row-value gap and
+the restart harness, which is the bulk of Phase 1.
+
+### The decoder pattern: upgrade on read
+
+1. **Decoders dispatch on the version and translate every older version
+   into the current in-memory type.** Concretely, after the existing gate
+   (which stays: `0` and `> CURRENT` are named errors), the caller matches
+   on the version it was just handed (`format::unwrap`/`decode_lines`
+   already return it; the header checks in `codec.rs`, `segment.rs`,
+   `lsm.rs` and `layout.rs` need to start returning it):
+
+   ```rust
+   match version {
+       1 => legacy::v1::decode(body).map(Into::into),   // frozen
+       2 => decode_v2(body),                            // current
+       found => Err(UnsupportedFormatVersion { found, max_supported: CURRENT, .. }),
+   }
+   ```
+
+   An `_version` that is bound and dropped is a review failure from now on.
+   Callers never see an older shape: there is exactly one in-memory type per
+   format, and `From<legacy::vN::T>` is the whole translation.
+2. **Writers always write the current version.** There is no "write in
+   version N-1 for compatibility" mode. Old-version files persist until the
+   normal lifecycle rewrites them (LSM compaction, WAL rotation, snapshot);
+   an engine therefore legitimately holds several versions at once (SSTables
+   of different `format` in one manifest, WAL segments of different versions
+   in one directory), and every reader must handle the mix. Backups, PITR
+   segments and exports are immutable, so they stay in their writer's
+   version for their whole life and are read by every later binary.
+3. **A newer-than-supported version stays a named error**
+   (`UnsupportedFormatVersion { found, max_supported }`), never a silent
+   misread and never a panic. **There is no downgrade**: after a node has
+   restarted on the new binary and written new-version data, an older
+   binary refuses it by name. The rollback path is restore from a backup
+   taken before the upgrade (readable by the new binary, and by the old one
+   only if nothing newer was written to it).
+4. **Where legacy code lives:** a `legacy` module beside each format's
+   current codec, one submodule per retired version
+   (`codec/legacy/v1.rs`, or an inline `mod legacy { pub mod v1 { .. } }`
+   for a small format). It holds the frozen decoder, the frozen shape type
+   the decoder produces (`V1Foo`), and the `From<V1Foo> for Foo`
+   translation. Kept forever; edited only by mechanical compile fixes, never
+   to change behaviour. **A legacy module must not reuse a type whose
+   serialization can change without a version bump**; if it embeds
+   `AttributeValue`/`Item`, that type's serde shape is itself a frozen
+   format (see P1-A's row-value fixtures), so a change to it is a format
+   change with its own tag and checklist run, not a refactor.
+5. **Legacy encoders are test-only** (see the harness section): a
+   `legacy::vN::encode`, compiled under `#[cfg(any(test, feature =
+   "legacy-encoders"))]` (feature off by default, enabled only by test
+   crates), that is anchored to the checked-in fixture by a byte-equality
+   test.
+
+### The format-change checklist
+
+Adding version N+1 of any durable format (every item is part of the same
+PR series; a PR missing one is not mergeable):
+
+1. Bump the version constant.
+2. Keep the vN decode path: move it to `legacy::vN` (decoder, frozen shape,
+   `From` translation), and route the version `match` to it.
+3. Add a `vN+1` fixture with the format's `#[ignore]`d no-overwrite
+   generator (`generate_fixture_<format>`). Never regenerate vN.
+4. Add a per-version expected value to the decode test (the `match` arm for
+   `vN+1`; an unrecognised fixture panics, so the test fails until this is
+   done).
+5. Add a round-trip test at the new version (encode with the current
+   writer, decode, compare).
+6. Add a test that vN input (the retained fixture, and the legacy encoder's
+   output) decodes to the correct *current* value, i.e. that the
+   translation fills new fields with what an old writer implicitly meant.
+7. Add `legacy::vN::encode` (test-only) with the byte-equality test against
+   `vN`'s fixture, and register the new pair in the upgrade-restart
+   harness's per-format transcode table.
+8. Update this ADR's inventory row (version tag today, fixture, legacy
+   module) and, if the change is not purely additive to a wire enum, say so.
+
+Steps 1-7 are mechanical once the seam exists; step 8 is review.
+
+**What is enforced mechanically once Phase 1 lands, and what stays
+review.** Mechanical: fixtures are never edited or deleted (CI script);
+every fixture must decode and match a hand-written per-version value, and an
+unrecognised fixture panics (all formats after P1-A..P1-C); the legacy
+encoder reproduces the fixture byte-for-byte; the harness restarts on
+version N-k state built by the legacy encoders and verifies every
+acknowledged write (P1-D). **Still review:** that a legacy module was not
+altered in behaviour; that a type embedded by a legacy shape did not change
+serialization; that a new `#[serde(default)]` on a JSON format really means
+"what the old writer meant" (the audit's most fragile area: `Metadata`,
+`ClusterConfig`, `ChangeRecord`, the mirror entities); that step 8 was done.
+Until P1-A..P1-C land, the "decoder still accepts every older version" half
+is enforced only by the v1 fixtures still decoding (see the verdict above)
+and by review.
+
+### The upgrade-restart harness
+
+**Property.** A node or cluster writes durable state in the format versions
+of an older post-baseline build, stops or crashes, and restarts on the
+current code. Every acknowledged write survives and reads back identically;
+no named format error is produced for a supported version; the restarted
+cluster keeps accepting writes and rewrites data in the current version.
+
+**What exists today, and why it is not enough.** `SimCluster`'s restart
+keeps a node's engine as an in-memory `MemoryEngine` (`sim_cluster.rs`
+module doc), so a "restart" never re-reads any encoded file: the formats
+Phase 0 tagged are exactly what it does not exercise. The `raftkv` corpus's
+`ANIMUS_RAFTKV_LSM=1` and `ANIMUS_RAFTKV_WAL_FAULTS=1` tiers, and the LSM
+crash corpora, do restart over `LsmEngine<SimEnv>` and real WAL bytes, so
+disk-backed restarts on `SimEnv` are an established pattern; they only ever
+read what the current binary wrote.
+
+**Old encoders: decision.** Two options:
+
+- *Restore from checked-in fixtures.* Free (they exist), and a fixture is
+  frozen forever by construction. But a fixture is one small representative
+  value per format, not a seed-driven workload; it cannot hold thousands of
+  acknowledged writes, interleavings, torn tails or several tablets, so it
+  can only prove "this file decodes", which the fixture tests already prove.
+- *Test-only legacy encoders beside the forever-kept legacy decoders.*
+
+**Recommendation: test-only legacy encoders (`legacy::vN::encode`), anchored
+to the fixtures, used by the harness through a transcode-at-rest step, with
+fixtures kept as the cheap tier-0.** Justification:
+(a) the property to prove is about *workload-shaped* state (acked writes
+across restarts), which only an encoder can produce at scale; (b) the
+fixture byte-equality test (checklist step 7) is what makes the encoder
+trustworthy: an encoder that drifts from the frozen bytes fails CI, so we
+never test against a fictional "old format"; (c) the cost is one encoder per
+retired version per format, added at exactly the moment the format changes
+and its author knows the old layout best, which is far cheaper than
+resurrecting an old binary later; (d) it needs no second binary or
+old-release build in CI. Harness mechanics: run the workload at the
+*current* version on `SimEnv` disks, stop or crash the node, **transcode**
+each durable file to version N-k with the legacy encoders (decode current →
+re-encode as N-k, record by record, per format), restart on the current
+code, and verify. Because an older version can only carry what it could
+express, the workload is drawn from the feature set the target version
+supports (a per-version "capability mask" recorded next to the legacy
+encoder; a version that lacks a field simply omits it from the workload).
+Fixture-seeded restarts stay as tier-0: seed a `SimEnv` disk with the
+checked-in whole-file fixtures (`lsm-wal`, `lsm-manifest`,
+`lsm-sstable`, `control-wal`, `shared-wal`) and open a real engine on it,
+a fast per-format smoke that needs no encoder and exists from day one.
+
+**Design.**
+
+- Two tiers, both deterministic `SimEnv`, seed-reproducible via
+  `ANIMUS_SEED`, fault-injecting per the repo convention (crash at random
+  points including mid-transcode-window, torn-tail and corrupt-on-crash as
+  in `ANIMUS_RAFTKV_WAL_FAULTS`, partitions during the post-upgrade
+  catch-up), and mixed-version *files* (a fraction of files left in the
+  current version, so a single engine holds several versions).
+  - **Tier 1, `animus-test`: `upgrade_restart_corpus`.** Single tablet
+    group and control group over `LsmEngine<SimEnv>` with the real
+    WAL/manifest/SSTable/`CWL1`/`SWL1` paths: cells = {leader restart,
+    follower restart, whole-group stop} x {clean stop, crash, torn tail} x
+    target version k back. Oracle: the raftkv corpus's linearizability
+    checker over pre- and post-restart histories, plus an "every acked
+    write present" check.
+  - **Tier 2, `animusd`: `sim_cluster_upgrade_corpus`.** Whole-cluster stop
+    → transcode → restart through `SimCluster` with an `LsmEngine`-backed
+    engine factory (a new option; `SimCluster` is `MemoryEngine`-only today)
+    and the DynamoDB wire on top, so control `Metadata`, the mirror, tablet
+    hosting, streams cursors and a backup taken *before* the upgrade
+    (restored after it) are all in the loop. Second wave: it depends on the
+    factory option and on tier 1 being stable.
+- **Knob: `ANIMUS_UPGRADE_RESTART_SEEDS=K`** (default 1), added to root
+  `CLAUDE.md`'s table when tier 1 lands; the corpus is also added to
+  `corpus-deep.yml`. `ANIMUS_UPGRADE_SEEDS` (proposed in the Testing section
+  above for Phase 2's mixed-version *running* cluster) stays reserved for
+  that later corpus, so the two are never conflated.
+- **Degenerate today, by design.** With only v1 in existence the transcode
+  step is the identity, so the first landing proves the machinery (restart
+  over real bytes, the oracle, seed replay) and every later format bump
+  activates it by adding one table entry (checklist step 7). It must have
+  teeth without a real v2: a **negative control** (as in
+  `animus-test/tests/negative_control.rs`) transcodes through a
+  deliberately broken translation (a legacy decoder that drops a field, a
+  legacy encoder that emits a torn record) and the corpus must fail.
+- **Lives in:** the corpus in `animus-test` (tier 1) and `animusd`
+  (`src/sim_cluster_upgrade_corpus.rs`, tier 2); the legacy encoders in each
+  format's own crate behind the `legacy-encoders` feature; the per-format
+  transcode table in a small `animus-test` module that depends on those
+  features (dev-dependencies only, never in a production build).
+
+### Phase 1 workstreams
+
+Four sessions, one PR series each (root `CLAUDE.md`, "independent work runs
+in a separate session"). The audit shows little decode-plumbing work, so the
+crate workstreams are deliberately small and only P1-D is large. Every
+workstream produces **no format change**: v1 stays v1, no fixture is added,
+no fixture is touched. Each implementation session gets this ADR in full,
+its own row, the crate guides, the lessons index, and the do-not-touch
+lists below.
+
+| Workstream | Crate(s) | Scope | Depends on | Do not touch |
+|---|---|---|---|---|
+| **P1-A** (backups/PITR/export first; outlives the cluster) | `animus-cp-data`, `animus-item` | Dispatch seam (`match version`, `legacy` module scaffolding) for `backup-manifest`, `backup-data`, `segment` (PITR), then `raftkv-wire`/`raftkv-image`/`raftkv-wal`/`cp-engine-layout`; `segment.rs` fixture test asserts "fixture for `VERSION` exists" instead of `== 1`. **Row values**: add golden fixtures (new files under `animus-item/tests/fixtures/formats/`) for `stored-item` and `change-record`, decide tag-vs-freeze for them (proposal: freeze the serde shape, additive-only with fixtures; an untagged JSON `{` document is v1, so a later tagged v2 is unambiguous to sniff) and add the inventory rows; pin key-encoding vectors (`numkey`, `key_bytes`, murmur3) as fixtures in `animus-tablet`/`animus-item` (the guard then covers them) | none | `animus-control/**` (incl. `format.rs` — consume, do not change signatures), `animus-storage/**`, `animusd/**`, `animus-env/**` |
+| **P1-B** | `animus-storage`, `animus-env` | Per-version expected values for `lsm-wal`, `lsm-manifest`, `lsm-sstable` (format derived from the file name; unrecognised fixture panics), `encryption-envelope` (panic instead of silently weaker checks), `network-handshake`/`client-handshake` (assert `version == <file version>`, not the current one); dispatch seam in `decode_wal`, `decode_manifest`, `read_block`, `EncryptedDisk::scan`; `legacy` scaffolding | none | `animus-cp-data/**`, `animus-control/**` |
+| **P1-C** | `animus-control`, `animusd`, `animus-operator` | `control-wal`/`control-snapshot`/`shared-wal`: callers use the returned version and dispatch (kills the `_version` discards in `persist.rs`, `node.rs`, `raft.rs`); `Metadata`/`ClusterConfig`: per-version decode entry points; system-keyspace mirror entity-value fixtures (`mirror-entities`, one per `EntityKind`) and a mirror-version fixture; `animuscluster-spec` per-version test | none | `animus-cp-data/**`, `animus-storage/**`; do not edit `format.rs` helper signatures (P1-A consumes them as they are) |
+| **P1-D** | `animus-test`, `animusd`, plus `legacy-encoders` feature plumbing in the crates above | The upgrade-restart harness: tier 0 fixture-seeded restarts, tier 1 `upgrade_restart_corpus`, negative control, `ANIMUS_UPGRADE_RESTART_SEEDS`, `corpus-deep.yml`; then tier 2 (`sim_cluster_upgrade_corpus`, `SimCluster` `LsmEngine` factory). Adds the per-format transcode table skeleton (identity today) | A, B, C for the per-format plug-ins and the `legacy-encoders` feature convention; tier 0/1 skeleton may start earlier against the convention in this ADR | The format crates' non-test source apart from the feature gate; `sim_cluster.rs` beyond the factory option |
+
+**Waves.** Wave 1: P1-A, P1-B, P1-C, fully concurrent (disjoint crates; the
+only shared surface is `animus_control::format`, which nobody changes).
+Wave 2: P1-D tier 0/1 (starts once one of A/B/C has landed its
+`legacy-encoders` convention, or earlier against this ADR's text). Wave 3:
+P1-D tier 2. Phase 1 is done when all four have merged.
+
+### What Phase 1 "done" means, and what users can rely on
+
+Done, when every one of these holds on `main`:
+
+- Every durable format in the inventory (plus the row-value formats added by
+  P1-A and P1-C) has: a version-dispatching decoder with a `legacy` seam, a
+  per-version-asserting fixture test that panics on a fixture with no
+  expectation, a round-trip test, and a fixture directory covered by the CI
+  guard.
+- The format-change checklist above is in root `CLAUDE.md` (pointer) and
+  followed by review.
+- The upgrade-restart corpus (tiers 0-2) is in the per-push gate at its
+  default depth and in `corpus-deep.yml`, and its negative control fails as
+  it should.
+
+**What users can then rely on:** a **full-cluster stop → upgrade → restart
+across any post-baseline versions is supported and tested**: no data loss,
+no manual conversion, backups/PITR/export objects written by any
+post-baseline version stay readable by every later one, and a downgrade is
+refused by name (rollback is restore from backup). What they still cannot
+rely on until later phases: **mixed-version running** (wire compatibility,
+Phase 2), **rolling upgrades** and operator `spec.image` changes (Phase 3),
+and a stable hash-ring/key encoding beyond "frozen by the vectors" (open
+question below, unchanged).
+
+**Documents that claim otherwise today, and change only when Phase 1
+lands, not in this PR:** `website/architecture.html` (lines ~277 and ~292:
+"on-disk formats change between revisions ... upgrading means recreating
+the cluster"), `website/docs.html` (~536 and ~635), `website/how-it-works.html`
+(~222), and `website/index.html`'s "On-disk format stability, then rolling
+upgrades" Planned entry; also `docs/roadmap.md` C-16's status line and ADR
+0060's "Upgrades: None, by design". The website copy stays true as a
+statement of what is *tested and supported* (an upgrade is still cluster
+recreation until the restart corpus exists) even though the durable-format
+rule already binds the code; the Phase 1 close-out PR rewrites all of them
+in one change and updates this ADR's status header.
+
+**Phase status after this amendment:** Phase 0 done; **Phase 1 in progress**
+(design accepted, P1-A..P1-D not started); Phases 2 and 3 planned, blocked
+on Phase 1 as before.

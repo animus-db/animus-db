@@ -105,9 +105,16 @@ or deleted (`scripts/check-format-fixtures.sh` enforces this in CI), and a
 format change is a new version tag plus a new fixture, never a rewrite of an
 old one. **Wire formats** join the same rule once Phase 2 (a replicated
 cluster version / feature gate) lands; **rolling upgrades** once Phase 3
-lands; Phase 1 (real N-1 decode paths, backups/PITR first) is next, and until
-it lands the "decoder still accepts older versions" half is enforced by
-review. Wire changes stay free until Phase 2. See ADR 0073 for the phase
+lands; **Support window: every post-baseline version stays readable forever**
+(2026-09-30) — old decoders and fixtures are never deleted. Phase 1 (upgrade-
+on-read decoders, per-version fixture tests, an upgrade-restart sim corpus;
+backups/PITR first) is in progress; until it lands the "decoder still
+accepts older versions" half is enforced by the v1 fixtures still decoding
+in CI plus review. **A format change follows ADR 0073's "Phase 1 design"
+checklist** ([`docs/adr/0073-upgrade-compatibility.md`](docs/adr/0073-upgrade-compatibility.md):
+bump, keep the vN decoder under `legacy`, new no-overwrite fixture,
+per-version expected value, round-trip and old-input tests, test-only legacy
+encoder, inventory row). Wire changes stay free until Phase 2. See ADR 0073 for the phase
 plan, the conventions (tag shape, fixture layout), and the open questions
 (support window length, the hash-ring/key-encoding layer). A break that
 can't be made compatible needs an explicit ADR amendment naming it and its
