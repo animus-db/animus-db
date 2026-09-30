@@ -53,7 +53,15 @@ fn assert_all_fixtures_decode_to(format: &str, spec: &ProtocolSpec) {
             path.display()
         );
         assert_eq!(preamble.magic, spec.magic, "fixture {}", path.display());
-        assert_eq!(preamble.version, spec.version, "fixture {}", path.display());
+        // The version under test is the fixture's own (from its file name),
+        // not `spec.version`, so a retained v1 file keeps passing once v2
+        // exists (ADR 0073 Phase 1, P1-B).
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let file_version: u8 = stem
+            .strip_prefix('v')
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("fixture {} is not named v<N>.bin", path.display()));
+        assert_eq!(preamble.version, file_version, "fixture {}", path.display());
         assert_eq!(
             preamble.extensions,
             Vec::<u8>::new(),
@@ -61,6 +69,11 @@ fn assert_all_fixtures_decode_to(format: &str, spec: &ProtocolSpec) {
             path.display()
         );
     }
+    assert!(
+        dir.join(format!("v{}.bin", spec.version)).exists(),
+        "no fixture for the current {format} version ({})",
+        spec.version
+    );
 }
 
 #[test]

@@ -1362,13 +1362,24 @@ mod tests {
                 continue;
             }
             let bytes = std::fs::read(&path).expect("read fixture");
+            // The version under test is the fixture's own (file name), not
+            // `FORMAT_CURRENT`; each version needs its own expectation, and
+            // an unknown one panics rather than being skipped.
+            let version = crate::fixture_file_version(&path);
+            let want = match version {
+                1 => fixture_records(),
+                v => panic!(
+                    "fixture {} is version {v} but this test has no expectation for it — \
+                     add a per-version arm (ADR 0073 Phase 1 checklist)",
+                    path.display()
+                ),
+            };
             block_on(async {
-                let reader = open_image(&env, &bytes, FORMAT_CURRENT)
+                let reader = open_image(&env, &bytes, version)
                     .await
                     .unwrap_or_else(|e| panic!("opening fixture {}: {e}", path.display()));
                 assert!(reader.index.len() > 1, "fixture has a multi-block index");
                 let got = reader.full_scan(&env).await.expect("scan fixture");
-                let want = fixture_records();
                 assert_eq!(got.len(), want.len(), "record count");
                 for (r, (k, v, val)) in want.iter().zip(&got) {
                     assert_eq!(&r.key, k);
@@ -1388,6 +1399,10 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 0, "no fixture files under {}", dir.display());
+        assert!(
+            dir.join(format!("v{FORMAT_CURRENT}.bin")).exists(),
+            "no fixture for the current FORMAT_CURRENT ({FORMAT_CURRENT})"
+        );
     }
 
     /// Round trip: the current writer's output reads back identically.

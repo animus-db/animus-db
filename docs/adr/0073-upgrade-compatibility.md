@@ -1265,6 +1265,18 @@ lists below.
 | **P1-C** | `animus-control`, `animusd`, `animus-operator` | `control-wal`/`control-snapshot`/`shared-wal`: callers use the returned version and dispatch (kills the `_version` discards in `persist.rs`, `node.rs`, `raft.rs`); `Metadata`/`ClusterConfig`: per-version decode entry points; system-keyspace mirror entity-value fixtures (`mirror-entities`, one per `EntityKind`) and a mirror-version fixture; `animuscluster-spec` per-version test | none | `animus-cp-data/**`, `animus-storage/**`; do not edit `format.rs` helper signatures (P1-A consumes them as they are) |
 | **P1-D** | `animus-test`, `animusd`, plus `legacy-encoders` feature plumbing in the crates above | The upgrade-restart harness: tier 0 fixture-seeded restarts, tier 1 `upgrade_restart_corpus`, negative control, `ANIMUS_UPGRADE_RESTART_SEEDS`, `corpus-deep.yml`; then tier 2 (`sim_cluster_upgrade_corpus`, `SimCluster` `LsmEngine` factory). Adds the per-format transcode table skeleton (identity today) | A, B, C for the per-format plug-ins and the `legacy-encoders` feature convention; tier 0/1 skeleton may start earlier against the convention in this ADR | The format crates' non-test source apart from the feature gate; `sim_cluster.rs` beyond the factory option |
 
+**P1-B step 1 as-built (tests only, every format still v1).** The fixture
+decode tests for `lsm-wal`, `lsm-manifest`, `lsm-sstable` and
+`encryption-envelope` now take the version under test from the fixture's
+**file name** (`animus-storage`'s `#[cfg(test)] fixture_file_version`; the
+envelope test matches the header byte and asserts it agrees with the name)
+and `match` it to a per-version expected value; a fixture whose version has
+no arm **panics** instead of being skipped or weakly checked, and each test
+also asserts a fixture exists for the *current* version constant.
+`network-handshake`/`client-handshake` assert `version == <file-name version>`
+rather than `spec.version`. The dispatch seam in the decoders is step 2 (a
+stacked PR).
+
 **Waves.** Wave 1: P1-A, P1-B, P1-C, fully concurrent (disjoint crates; the
 only shared surface is `animus_control::format`, which nobody changes).
 Wave 2: P1-D tier 0/1 (starts once one of A/B/C has landed its

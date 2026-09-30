@@ -1195,35 +1195,49 @@ mod format_fixture_tests {
             let plaintext = block_on(wrapped.read(FIXTURE_FILE_NAME))
                 .unwrap_or_else(|e| panic!("{path:?}: decrypt via EncryptedDisk::read: {e}"));
 
-            // The one fixture in the inventory today (`v1.bin`) gets the
-            // full known-value assertion; a future `v2.bin` etc. still gets
-            // every check above, plus this one once its own expected
-            // salt/plaintext are known.
-            if path.file_name().and_then(|n| n.to_str()) == Some("v1.bin") {
-                assert_eq!(version, 1, "{path:?}: expected version 1");
-                assert_eq!(
-                    index.salt, FIXED_SALT,
-                    "{path:?}: salt header field mismatch"
-                );
-                assert_eq!(index.frames.len(), 2, "{path:?}: expected exactly 2 frames");
-                assert_eq!(
-                    index.frames[0].plain_len as usize,
-                    PLAINTEXT_FRAME_1.len(),
-                    "{path:?}: frame 0 plaintext length mismatch"
-                );
-                assert_eq!(
-                    index.frames[1].plain_len as usize,
-                    PLAINTEXT_FRAME_2.len(),
-                    "{path:?}: frame 1 plaintext length mismatch"
-                );
-                assert_eq!(
-                    plaintext,
-                    expected_plaintext(),
-                    "{path:?}: decrypted plaintext mismatch"
-                );
+            // Expected value per fixture *version*: an unknown version has
+            // no known salt/plaintext, so it panics rather than getting only
+            // the weaker structural checks above (ADR 0073 Phase 1, P1-B).
+            match version {
+                1 => {
+                    assert_eq!(
+                        index.salt, FIXED_SALT,
+                        "{path:?}: salt header field mismatch"
+                    );
+                    assert_eq!(index.frames.len(), 2, "{path:?}: expected exactly 2 frames");
+                    assert_eq!(
+                        index.frames[0].plain_len as usize,
+                        PLAINTEXT_FRAME_1.len(),
+                        "{path:?}: frame 0 plaintext length mismatch"
+                    );
+                    assert_eq!(
+                        index.frames[1].plain_len as usize,
+                        PLAINTEXT_FRAME_2.len(),
+                        "{path:?}: frame 1 plaintext length mismatch"
+                    );
+                    assert_eq!(
+                        plaintext,
+                        expected_plaintext(),
+                        "{path:?}: decrypted plaintext mismatch"
+                    );
+                }
+                v => panic!(
+                    "{path:?}: fixture is version {v} but this test has no expectation for it — \
+                     add a per-version arm (ADR 0073 Phase 1 checklist)"
+                ),
             }
+            // The header byte must agree with the file name's version.
+            assert_eq!(
+                path.file_name().and_then(|n| n.to_str()),
+                Some(format!("v{version}.bin").as_str()),
+                "{path:?}: file name disagrees with the header version"
+            );
         }
         assert!(checked > 0, "no fixture files found under {dir:?}");
+        assert!(
+            dir.join(format!("v{VERSION}.bin")).exists(),
+            "no fixture for the current VERSION ({VERSION})"
+        );
     }
 
     /// Round-trip test (ADR 0073 Phase 0 convention): encode a

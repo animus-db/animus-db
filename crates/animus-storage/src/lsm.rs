@@ -3643,9 +3643,20 @@ mod wal_format_fixture_tests {
                 path.display(),
                 bytes.len() - consumed,
             );
+            // Expected value per fixture *version* (from the file name, not
+            // `WAL_VERSION`): a new `vN.bin` with no arm here fails loudly
+            // instead of being skipped or checked against the wrong value.
+            let expected = match crate::fixture_file_version(&path) {
+                1 => representative_records(),
+                v => panic!(
+                    "fixture {} is version {v} but this test has no expectation for it — \
+                     add a per-version arm (ADR 0073 Phase 1 checklist)",
+                    path.display()
+                ),
+            };
             assert_eq!(
                 records,
-                representative_records(),
+                expected,
                 "fixture {} decoded to a value different from the expected one",
                 path.display(),
             );
@@ -3655,6 +3666,11 @@ mod wal_format_fixture_tests {
             checked > 0,
             "no fixture files found under {}",
             dir.display()
+        );
+        assert!(
+            dir.join(format!("v{}.bin", wal::WAL_VERSION)).exists(),
+            "no fixture for the current WAL_VERSION ({})",
+            wal::WAL_VERSION
         );
     }
 
@@ -4169,10 +4185,24 @@ mod manifest_tests {
                 .unwrap_or_else(|e| panic!("reading fixture {}: {e}", path.display()));
             let m = decode_manifest(&bytes)
                 .unwrap_or_else(|e| panic!("decoding fixture {}: {e}", path.display()));
-            assert_manifest_eq(&m, &representative_manifest(), &path.display().to_string());
+            // Expected value per fixture version (from the file name, not
+            // `MANIFEST_VERSION`); an unknown version panics, never skips.
+            let expected = match crate::fixture_file_version(&path) {
+                1 => representative_manifest(),
+                v => panic!(
+                    "fixture {} is version {v} but this test has no expectation for it — \
+                     add a per-version arm (ADR 0073 Phase 1 checklist)",
+                    path.display()
+                ),
+            };
+            assert_manifest_eq(&m, &expected, &path.display().to_string());
             checked += 1;
         }
         assert!(checked > 0, "no fixture files under {}", dir.display());
+        assert!(
+            dir.join(format!("v{MANIFEST_VERSION}.bin")).exists(),
+            "no fixture for the current MANIFEST_VERSION ({MANIFEST_VERSION})"
+        );
     }
 
     /// Fixture generator. Run explicitly:
