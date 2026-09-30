@@ -46,6 +46,62 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use animus_env::NodeId;
+/// Version dispatch for the three control-plane formats (ADR 0073 Phase 1,
+/// workstream P1-C): `format::unwrap`/`decode_lines` hand back the version
+/// byte and each body decoder here `match`es on it, so a future v2 adds an
+/// arm (and moves the v1 arm's body into a frozen `legacy::v1`, with a
+/// `From` translation into the current type) instead of editing one shared
+/// decoder in place. Every format is still v1, whose shape *is* the current
+/// in-memory type, so the v1 arm decodes directly and there is no `legacy`
+/// module yet. An unknown version is [`format::unsupported_version`], never
+/// a panic.
+pub(crate) mod dispatch {
+    use super::{CONTROL_SNAPSHOT, CONTROL_WAL, SHARED_WAL_TAG};
+    use crate::format::{self, FormatError};
+    use serde::de::DeserializeOwned;
+
+    fn malformed(name: &'static str, e: &serde_json::Error) -> FormatError {
+        FormatError::Malformed {
+            format: name,
+            detail: e.to_string(),
+        }
+    }
+
+    /// Body of one [`CONTROL_WAL`] line (a `WalRecord<C, S>`).
+    pub(crate) fn wal_record<T: DeserializeOwned>(
+        version: u8,
+        payload: &[u8],
+    ) -> Result<T, FormatError> {
+        match version {
+            1 => serde_json::from_slice(payload).map_err(|e| malformed(CONTROL_WAL.name, &e)),
+            found => Err(format::unsupported_version(&CONTROL_WAL, found)),
+        }
+    }
+
+    /// Body of one [`SHARED_WAL_TAG`] line (`{tablet, record}`).
+    pub(crate) fn shared_wal_line<T: DeserializeOwned>(
+        version: u8,
+        payload: &[u8],
+    ) -> Result<T, FormatError> {
+        match version {
+            1 => serde_json::from_slice(payload).map_err(|e| malformed(SHARED_WAL_TAG.name, &e)),
+            found => Err(format::unsupported_version(&SHARED_WAL_TAG, found)),
+        }
+    }
+
+    /// Body of a [`CONTROL_SNAPSHOT`] envelope (the control state `S`, or the
+    /// system-keyspace image entries).
+    pub(crate) fn snapshot_body<T: DeserializeOwned>(
+        version: u8,
+        payload: &[u8],
+    ) -> Result<T, FormatError> {
+        match version {
+            1 => serde_json::from_slice(payload).map_err(|e| malformed(CONTROL_SNAPSHOT.name, &e)),
+            found => Err(format::unsupported_version(&CONTROL_SNAPSHOT, found)),
+        }
+    }
+}
+
 #[cfg(test)]
 use animus_env::nid;
 use animus_tablet::TabletId;
@@ -258,12 +314,8 @@ where
     pub fn decode(bytes: &[u8]) -> Result<Vec<WalRecord<C, S>>, FormatError> {
         let lines = format::decode_lines(&CONTROL_WAL, bytes)?;
         let mut records = Vec::with_capacity(lines.len());
-        for (_version, payload) in lines {
-            let record = serde_json::from_slice(payload).map_err(|e| FormatError::Malformed {
-                format: CONTROL_WAL.name,
-                detail: e.to_string(),
-            })?;
-            records.push(record);
+        for (version, payload) in lines {
+            records.push(dispatch::wal_record(version, payload)?);
         }
         Ok(records)
     }
@@ -325,12 +377,8 @@ where
         }
         let raw = format::decode_lines(&SHARED_WAL_TAG, bytes)?;
         let mut lines = Vec::with_capacity(raw.len());
-        for (_version, payload) in raw {
-            let line: Line<C, S> =
-                serde_json::from_slice(payload).map_err(|e| FormatError::Malformed {
-                    format: SHARED_WAL_TAG.name,
-                    detail: e.to_string(),
-                })?;
+        for (version, payload) in raw {
+            let line: Line<C, S> = dispatch::shared_wal_line(version, payload)?;
             lines.push((line.tablet, line.record));
         }
         Ok(lines)
@@ -831,5 +879,45 @@ mod tests {
                 .unwrap_or_else(|e| panic!("cut {cut}: torn tail must not be an Err: {e}"));
             assert_eq!(decoded.len(), 1, "cut {cut}");
         }
+    }
+
+    #[test]
+    fn dispatchers_reject_an_unknown_version_by_name() {
+        for v in [0u8, 2, 255] {
+            assert_eq!(
+                dispatch::wal_record::<serde_json::Value>(v, b"{}").unwrap_err(),
+                FormatError::UnsupportedFormatVersion {
+                    format: CONTROL_WAL.name,
+                    found: v,
+                    max_supported: CONTROL_WAL.version
+                }
+            );
+            assert_eq!(
+                dispatch::shared_wal_line::<serde_json::Value>(v, b"{}").unwrap_err(),
+                FormatError::UnsupportedFormatVersion {
+                    format: SHARED_WAL_TAG.name,
+                    found: v,
+                    max_supported: SHARED_WAL_TAG.version
+                }
+            );
+            assert_eq!(
+                dispatch::snapshot_body::<serde_json::Value>(v, b"{}").unwrap_err(),
+                FormatError::UnsupportedFormatVersion {
+                    format: CONTROL_SNAPSHOT.name,
+                    found: v,
+                    max_supported: CONTROL_SNAPSHOT.version
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn dispatchers_decode_v1_and_report_malformed_bodies() {
+        let ok: serde_json::Value = dispatch::wal_record(1, br#"{"a":1}"#).unwrap();
+        assert_eq!(ok["a"], 1);
+        assert!(matches!(
+            dispatch::snapshot_body::<serde_json::Value>(1, b"nope"),
+            Err(FormatError::Malformed { format, .. }) if format == CONTROL_SNAPSHOT.name
+        ));
     }
 }
