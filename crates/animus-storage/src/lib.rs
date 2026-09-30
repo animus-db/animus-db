@@ -27,6 +27,20 @@
 mod lsm;
 mod memory;
 
+/// Test-only helper shared by the golden-fixture tests (ADR 0073 Phase 1,
+/// P1-B): the version a fixture file claims, parsed from its `v<N>.bin`
+/// name — never from the current format constant, so a retained old
+/// fixture keeps being checked against *its own* expectation once a newer
+/// version exists.
+#[cfg(test)]
+pub(crate) fn fixture_file_version(path: &std::path::Path) -> u32 {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.strip_prefix('v'))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("fixture {} is not named v<N>.bin", path.display()))
+}
+
 pub use lsm::{LsmEngine, LsmOptions, LsmSnapshot, SsTableView, WalRecordView};
 pub use memory::{MemoryEngine, MemorySnapshot};
 

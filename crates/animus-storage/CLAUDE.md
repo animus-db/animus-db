@@ -373,7 +373,8 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   alongside it is the only legitimate way forward once a version has
   fixtures. Each format's fixture directory gets a decode test (iterates
   every file in the directory, not just `v1`, so a later version needs no
-  test-code change), a round-trip test, and an `#[ignore]`d generator
+  test-code change; the expected value is picked per version from the file
+  name via `fixture_file_version` and a version with no arm panics), a round-trip test, and an `#[ignore]`d generator
   (`generate_fixture_lsm_wal` in `lsm.rs`'s `wal_format_fixture_tests`
   module is the WAL's) that refuses to overwrite a fixture that already
   exists — run it explicitly with `cargo test -p animus-storage --lib
