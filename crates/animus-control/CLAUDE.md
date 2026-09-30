@@ -396,6 +396,12 @@ per-tablet CP data plane (`animus-cp-data`).
 
 ## Versioned formats (ADR 0073 Phase 0)
 
+**Phase 1 note (2026-09-30):** `unwrap`/`decode_lines` return the version, but the
+current callers (`persist.rs`, `node.rs`, `raft.rs`) discard it: a gate, not a
+dispatch. A new format version must `match` on it and keep the old decoder
+under `legacy` (ADR 0073 "Phase 1 design" checklist); do not change these
+helpers' signatures.
+
 **`format.rs`** is the shared tagged-envelope convention Phase 0 workstream
 B introduced, and the one workstream C (`animus-cp-data`) reuses rather
 than inventing a second "envelope wraps an inner payload" scheme for the

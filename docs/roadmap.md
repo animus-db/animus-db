@@ -1519,7 +1519,7 @@ rows this section used to carry were fixed by the stale-prose sweep.
   amendment's own "what remains unowned" accounting and `crates/animusd/
   CLAUDE.md`'s consolidated closed-C-15 appendix.
 
-### C-16 Upgrade compatibility (ADR 0073) — Phase 0 done; Phase 1 next
+### C-16 Upgrade compatibility (ADR 0073) — Phase 0 done; Phase 1 in progress
 
 - **Gap (closed):** `website/index.html` listed "On-disk format stability,
   then rolling upgrades" as Planned with no ADR, roadmap entry, or issue
@@ -1560,8 +1560,22 @@ rows this section used to carry were fixed by the stale-prose sweep.
   Phase 1 (on-disk N-1 stability, backups/PITR first), Phase 2 (replicated
   cluster-version/feature-gate for wire compatibility), and Phase 3
   (rolling-upgrade orchestration including operator `spec.image` support)
-  remain planned; **Phase 1 is the next step** (on-disk N-1 readability,
-  backups/PITR first), now unblocked by the recorded baseline. Phase 4 (lifting/rewriting root `CLAUDE.md`'s
+  remain planned. **Phase 1 is in progress** (design accepted 2026-09-30:
+  the support window is **every post-baseline format version, forever**;
+  see ADR 0073's "Phase 1 design" amendment for the audit, the
+  upgrade-on-read decoder pattern, the format-change checklist and the
+  harness design). Its workstreams, one session/PR series each, no format
+  changes: **P1-A** `animus-cp-data` + `animus-item` (backups/PITR/segment
+  first; dispatch seam; golden fixtures for the row values the inventory
+  missed: stored item, `ChangeRecord`, key-encoding vectors); **P1-B**
+  `animus-storage` + `animus-env` (per-version expected values for the LSM
+  formats, encryption envelope, handshakes); **P1-C** `animus-control` +
+  `animusd` + `animus-operator` (use the returned version in the Raft
+  WAL/snapshot callers, `Metadata`/`ClusterConfig`/CRD per-version tests,
+  mirror entity fixtures); **P1-D** `animus-test` + `animusd` (the
+  upgrade-restart corpus: test-only legacy encoders + transcode-at-rest,
+  tiers 0-2, knob `ANIMUS_UPGRADE_RESTART_SEEDS`). Waves: A/B/C concurrent,
+  then D. Phase 4 (lifting/rewriting root `CLAUDE.md`'s
   no-back-compat rule) is **already done** by this same maintainer
   decision — root `CLAUDE.md` now states the staged ratchet directly.
 - **Reuse:** the magic (4-byte ASCII) + `u8` version + loud named error
@@ -1580,7 +1594,8 @@ rows this section used to carry were fixed by the stale-prose sweep.
   knob `ANIMUS_UPGRADE_SEEDS`, Phase 2/3 work); a `kind` e2e for the
   operator's rolling-restart path, once Phase 3 exists.
 - **ADR:** [0073](adr/0073-upgrade-compatibility.md) (Accepted, 2026-09-27
-  — Phase 0 done, baseline `9a9f972f`; Phases 1-3 planned).
+  — Phase 0 done, baseline `9a9f972f`; Phase 1 in progress; Phases 2-3
+  planned).
 - **Size:** XL overall across all four phases; Phase 0 alone is roughly M
   (mechanical, one format at a time, no design risk), now split five ways
   across independent sessions.
@@ -1590,7 +1605,8 @@ rows this section used to carry were fixed by the stale-prose sweep.
   its orchestration primitives, and on ADR 0060 for the operator's own
   `spec.image` handling.
 - **Status:** Phase 0 done (workstreams A-E merged, baseline `9a9f972f`);
-  Phase 1 next; Phases 2-3 not started, no owner or target wave yet.
+  Phase 1 in progress (design PR 2026-09-30; P1-A..P1-D not started);
+  Phases 2-3 not started, no owner or target wave yet.
 
 ## 4. Operator surfaces: admin API, dashboard, console, CLI
 
