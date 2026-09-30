@@ -628,15 +628,31 @@ return without advancing anything) — the identical discipline
 `install_syskv_image`'s own decode-failure branch already established two
 PRs up this same stack; a `RebuildError::Storage` at either site keeps the
 pre-existing hard panic (a real backend fault this early means the engine
-itself is unusable, not a format problem). **No separate `syskv-mirror`
-golden fixture exists** — this row is mirror-internal bookkeeping that never
-rides a `Metadata` value at all, and it already has direct unit-test
-coverage in `mirror.rs`'s own test module (`rebuild_from_engine_is_ok_on_a_
-genuinely_empty_engine`/`rebuild_from_engine_rejects_a_populated_keyspace_
-missing_the_version_row`/`rebuild_from_engine_rejects_an_unsupported_
-future_version_row`); the pre-existing `control-snapshot` fixture already
-covers a real system-keyspace image's on-the-wire bytes structurally, which
-is as close as this mirror-internal row gets to a fixture of its own.
+itself is unusable, not a format problem). **Golden fixtures (ADR 0073 Phase 1, P1-C layer 3)**: the row's value bytes are
+`tests/fixtures/formats/mirror-version/v1.bin` (8-byte big-endian `1`), and
+every `EntityKind` has its own value fixture under
+`tests/fixtures/formats/mirror-entities/<EntityKind::as_str()>/v1.<ext>`
+(`.json` for the JSON-valued kinds; `.bin` for `counter`, an 8-byte
+big-endian `u64`, and for `index_backfill`/`pitr_base_backup`, whose value
+is an always-empty presence marker, so those two fixtures are **zero-byte
+files by design**). The fixture is the value bytes only; the key is re-derived
+from the real `syskv` key helpers. `tests/format_fixtures.rs` generates them
+from a fixed `MetaCommand` script run through `apply_and_derive_mirror` (so
+the bytes are what the real encoder wrote, one representative non-trivial row
+per kind, including a directed-Placing `split_placing` row), decodes each
+through `apply_key_write`/`rebuild_metadata_from_engine` with a `match` on the
+file-name version (an unrecognised version panics), and requires a fixture for
+`SYSKV_MIRROR_VERSION` in every kind directory. **Adding an `EntityKind`
+variant**: the exhaustive matches in that file (`kind_witness`, `v1_entity`)
+stop compiling, `ALL_KINDS` and the scenario need the new kind, and
+`every_entity_kind_has_a_fixture_for_the_current_version` fails until its
+fixture directory exists (generate with the `#[ignore]`d
+`generate_fixture_mirror_entities`). The decoders (`apply_put`) take no
+version themselves, but the mirror version is a real dispatch in
+`rebuild_metadata_from_engine` (P1-C): `match found_version { 1 =>
+rebuild_metadata_v1(..), v => unsupported-version error }`, so a v2 layout
+adds an arm there, moves the v1 body and its `apply_put` shapes to a frozen
+`legacy`, and keeps the v1 fixtures decoding.
 
 **Golden fixture**: `tests/fixtures/formats/metadata/v1.json` — a small,
 deterministic `Metadata` built by *applying real `MetaCommand`s* through
