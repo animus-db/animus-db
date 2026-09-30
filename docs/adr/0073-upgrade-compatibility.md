@@ -655,7 +655,9 @@ real call sites (`node.rs`'s `meta_apply_seed` and
 `RebuildError::Format` the established halt-not-panic treatment, while
 `RebuildError::Storage` keeps the pre-existing hard panic. No separate
 `syskv-mirror` golden fixture — that row is mirror-internal and unit-tested
-directly. Golden fixture: `tests/fixtures/formats/metadata/v1.json` (a
+directly. *(Superseded by P1-C, 2026-09-30: the mirror entity values and the
+version row now have golden fixtures, `mirror-entities` and `mirror-version`;
+see "P1-C as-built" under Phase 1 workstreams.)* Golden fixture: `tests/fixtures/formats/metadata/v1.json` (a
 `Metadata` built by applying real `MetaCommand`s). Lessons recorded under
 `docs/lessons/code-patterns/`. See `crates/animus-control/CLAUDE.md`'s
 "Versioned formats" section for the full account.
@@ -1039,6 +1041,10 @@ Outside the fixture directories, three more durable groups matter:
   Two of them are read back out of backups and PITR segments, so they are
   the real contents of the objects that outlive a cluster. This is the most
   consequential audit finding.
+  *(Partly superseded by P1-C, 2026-09-30: the `Metadata` mirror entity
+  values are now pinned by the 18 `mirror-entities` fixtures and the version
+  row by `mirror-version`; see "P1-C as-built" under Phase 1 workstreams.
+  The stored-item codec and `ChangeRecord` remain P1-A's.)*
 - **S3 export/import**: AWS's own format, no in-repo version, no fixture.
   Nothing to add beyond keeping the item JSON stable (previous bullet).
 
@@ -1290,6 +1296,35 @@ doc states the upgrade-on-read contract (a `legacy::vN` decoder returns the
 *current* in-memory type; never deleted). Behavior is byte-for-byte unchanged:
 the existing fixture tests and the existing version-0 / newer-version tests
 per decoder pass untouched, and no fixture was edited.
+
+**P1-C as-built (2026-09-30).** Landed as a four-PR stack on the baseline
+`9a9f972f`; every change is additive, no existing fixture is edited, no
+format changes (v1 stays v1).
+
+- **Layer 1, control dispatch.** `persist::dispatch` holds one body decoder per
+  format, `wal_record` (`control-wal`), `shared_wal_line` (`shared-wal`) and
+  `snapshot_body` (`control-snapshot`), each `match version { 1 => .., found =>
+  format::unsupported_version(tag, found) }`. The `_version` discards in
+  `persist.rs`, `node.rs` and `raft.rs` are gone. `format::unsupported_version`
+  is a new helper (an addition; the `wrap`/`unwrap`/`decode_lines` signatures are
+  unchanged).
+- **Layer 2, `Metadata` and `ClusterConfig`.** Each has a per-version entry
+  point (`Metadata::from_json`, `ClusterConfig::from_json` match on the peeked
+  `"v"`) and a per-version fixture test. **Decision: `Metadata`'s `"v"` serde
+  default is kept**, because the frozen `control-wal`, `shared-wal` and
+  `control-snapshot` v1 fixtures embed a `Metadata` with no `"v"` and may never
+  be edited; standalone `Metadata::from_json` stays strict (missing is
+  pre-baseline, non-1 unsupported). `ClusterConfig`'s `"v"` stays required.
+  Lesson: `docs/lessons/code-patterns/2026-09-30-a-serde-default-on-the-version-field-is-decided-by-frozen-fixtures.md`.
+- **Layer 3, mirror.** 18 `mirror-entities` fixtures (one per `EntityKind`) plus
+  one `mirror-version` fixture, each with a per-version expected value.
+  `rebuild_metadata_from_engine` is now a real dispatch on the version row
+  (`1 => rebuild_metadata_v1`, else a named `UnsupportedFormatVersion`; empty
+  engine and a missing row behave as before), refusing `0`, `2` and `u64::MAX`
+  by name. It had been a range gate that read the version and ignored it.
+- **Layer 4, operator.** A per-version `animuscluster-spec` fixture test
+  (version from the file name, panics on an unrecognised one) and
+  `crd::decode_cluster`, which dispatches on `spec.schemaVersion`.
 
 **Waves.** Wave 1: P1-A, P1-B, P1-C, fully concurrent (disjoint crates; the
 only shared surface is `animus_control::format`, which nobody changes).
