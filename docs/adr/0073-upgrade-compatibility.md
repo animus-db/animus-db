@@ -54,8 +54,11 @@ interpretation.
 2. **The baseline.** The baseline is **the merge commit on `main` where the
    last Phase 0 workstream (A–E below) lands**. This ADR records the actual
    commit SHA and date here once that happens:
-   - **Baseline commit:** *(not yet reached — filled in when Phase 0's last
-     workstream merges)*.
+   - **Baseline commit:** `9a9f972fb38a766be4a4b044379540ded533eefc`
+     (`9a9f972f`), "Merge pull request #1104" (Workstream E's last PR),
+     merged 2026-09-29 22:50 UTC. Set 2026-09-30; see the "Phase 0
+     complete" amendment at the end of this ADR for the PR list and
+     verification.
    Before the baseline, every format may still change incompatibly *as
    part of Phase 0 work only* — Phase 0 is not itself covered by the rule
    it exists to establish. From the baseline onward, the "as if production"
@@ -106,12 +109,11 @@ interpretation.
 4. **Phase status** (updated as phases land; this is the live status this
    ADR's own header should be read against):
    - **Phase 0 — version-tag everything + golden fixtures + the final
-     reset:** **in progress**, this PR starts it. Tracked as five
-     independent workstreams (A–E) — see the table below. Not done until
-     every workstream's PR series has merged and the baseline commit above
-     is filled in.
-   - **Phase 1 — on-disk N-1 stability:** planned, blocked on Phase 0's
-     baseline.
+     reset:** **done** (2026-09-30). Tracked as five
+     independent workstreams (A–E) — see the table below. All five PR
+     series merged; the baseline commit above is `9a9f972f`.
+   - **Phase 1 — on-disk N-1 stability:** planned; unblocked now that
+     Phase 0's baseline is set.
    - **Phase 2 — replicated cluster version / wire feature-gate:** planned,
      blocked on Phase 1.
    - **Phase 3 — rolling-upgrade orchestration:** planned, blocked on
@@ -188,24 +190,26 @@ range a format needs:
   entirely (backups above all; also PITR change-log segments and S3
   exports). These need the widest support window of anything in this table.
 
+**As-built refresh (2026-09-30, Phase 0 complete):** the *Location* and *Version tag today* cells below are corrected to match `main` at the baseline. The *Notes* cells, the Summary paragraph that follows, and the workstream rows keep their original pre-Phase-0 wording as a historical record of the starting inventory; where they say a format has "no version tag", read the corrected cell and the as-built notes instead.
+
 | Format | Location | Version tag today | Lifetime | Notes |
 |---|---|---|---|---|
-| LSM WAL records | `crates/animus-storage/src/lsm/wal.rs` | **none found** — no magic/version constant in the module | durable, node-local | Record framing has no explicit version byte; crash-safety relies on length-prefixed/checksummed records and torn-tail detection, not on version negotiation. Any format change today is a silent break on reopen with an older build, or a loud one only if the length/checksum fields happen to mismatch. |
-| LSM SSTable data blocks + footer | `crates/animus-storage/src/lsm/sstable.rs` | `MAGIC: u64 = 0x4355_5354_4F53_5333` in the footer (file identification only — the reader takes the actual format from the manifest, not by re-reading the footer) plus a real per-table version tag, `SsTableMeta::format: u32` (`FORMAT_CURRENT = 3`), recorded in the manifest for each table | durable, node-local | Better covered than it first looks: the format version lives one level up, in the manifest's per-table metadata, not in the footer bytes themselves. The block index has its own separate magic+version too: `INDEX_MAGIC = b"SSIX"`, `INDEX_VERSION: u8 = 1`. All three (footer magic, manifest-recorded table format, index magic+version) currently describe a single supported format — there is no decoder path for `format != FORMAT_CURRENT` yet, so the tag would need a real N-1 branch added before Phase 1 could rely on it. |
-| LSM manifest | `crates/animus-storage/src/lsm.rs` (`encode_manifest`/`decode_manifest`) | `MANIFEST_MAGIC = b"CMF1"`, `MANIFEST_VERSION: u8 = 2` | durable, node-local | The best-covered format in `animus-storage`: magic + version + a documented legacy fallback (`decode_manifest` still reads a pre-binary-codec JSON manifest when the magic is absent). This is the pattern the rest of the inventory should converge on. |
-| Control-plane Raft WAL (`RaftCore` log entries + membership records) | `crates/animus-control/src/persist.rs` | **none** — `serde_json`-per-line (`Line<C, S>`, comment at persist.rs:31 notes this replaced an even older plain-newline-JSON format with no version marker either) | durable, node-local | Two generations of this format have already existed with no version discriminator between them; a reader distinguishes them structurally (parse success), not by a tag. Works only because both are JSON and one is a strict superset shape. |
-| Control-plane snapshot / `InstallSnapshot` payload | `crates/animus-control/src/raft.rs` (`RaftCore::snapshot`, the `S` state-machine type) | **none** — the snapshot image is just `S`'s own `serde_json`/`serde` encoding, chunked by `SNAPSHOT_CHUNK_BYTES`; no envelope version | durable, node-local (persisted) **and** transient wire (`InstallSnapshot` RPC) | Same gap as the WAL: whatever `Metadata`'s own serde shape is *is* the wire format, with no independent version byte wrapping it. |
-| `Metadata` + its system-keyspace mirror (ADR 0038) | `crates/animus-control/src/meta.rs`, `syskv.rs` | **none dedicated** — individual fields get `#[serde(default)]` on addition (ADR 0035's pattern, e.g. `RoleAddrs.role`, `ClusterSettings`), but there is no single schema-version field on `Metadata` itself | durable, node-local (mirror) **and** replicated over the control Raft log | The field-by-field-default discipline is real and documented (ADR 0035 §"Rolling upgrade") but it is a convention, not a checked invariant — nothing fails loudly if a new field is added without the default, or if a field's *meaning* changes without renaming it. |
-| CP-data Raft command codec (`KvCommand` etc.) | `crates/animus-cp-data/src/codec.rs` | `const VERSION: u8 = 31` | durable, node-local (in the WAL/SharedWal) and transient wire (Raft replication) | The single best-versioned format in the whole system — a version byte is written by every encode and checked by every decode, loud `Err` on mismatch (no cross-version decoding attempted). The `VERSION` bump cadence (31 already) shows how often this layer has changed; each bump is currently an unconditional breaking change, by design. |
-| Segment codec (streams, ADR 0042/0043) | `crates/animus-cp-data/src/segment.rs` | `pub const VERSION: u8 = 2` | durable, node-local (per-tablet change-log segments) and consumed by backup/PITR/export as a data source | Same magic+version+loud-error discipline as the RaftKV codec, explicitly modeled on it (module doc: "mirroring `codec.rs`'s own ... discipline"). |
-| `SharedWal` record framing (ADR 0028, C-05) | `crates/animus-control/src/shared_wal.rs` (record shape via `persist::encode_tagged_record`) | **none of its own** — the *outer* `Line{tablet, record}` envelope is unversioned `serde_json`, same as `persist.rs`'s single-tablet WAL; the inner `record` bytes are the already-versioned `codec.rs` payload | durable, node-local | Two-layer format: inner payload versioned, outer multi-tenant tagging envelope not. |
-| Per-tablet engine key layout (ADR 0050: `kind \|\| logical`) | `crates/animus-cp-data/src/host.rs` and callers | **none** — this is a *key-space convention*, not a length-prefixed codec, so there is no version byte to check; a layout change is a data migration, not a decode-time rejection | durable, node-local (defines what every stored key means) | Explicitly called out in the task framing: changing this is equivalent to a full re-encode of every stored row, categorically different from bumping `codec.rs::VERSION`. |
+| LSM WAL records | `crates/animus-storage/src/lsm/wal.rs` | `WAL_MAGIC = b"LWL1"`, `WAL_VERSION: u8 = 1` | durable, node-local | Record framing has no explicit version byte; crash-safety relies on length-prefixed/checksummed records and torn-tail detection, not on version negotiation. Any format change today is a silent break on reopen with an older build, or a loud one only if the length/checksum fields happen to mismatch. |
+| LSM SSTable data blocks + footer | `crates/animus-storage/src/lsm/sstable.rs` | `MAGIC: u64 = 0x4355_5354_4F53_5333` in the footer (file identification only — the reader takes the actual format from the manifest, not by re-reading the footer) plus a real per-table version tag, `SsTableMeta::format: u32` (`FORMAT_CURRENT = 1`), recorded in the manifest for each table | durable, node-local | Better covered than it first looks: the format version lives one level up, in the manifest's per-table metadata, not in the footer bytes themselves. The block index has its own separate magic+version too: `INDEX_MAGIC = b"SSIX"`, `INDEX_VERSION: u8 = 1`. All three (footer magic, manifest-recorded table format, index magic+version) currently describe a single supported format — there is no decoder path for `format != FORMAT_CURRENT` yet, so the tag would need a real N-1 branch added before Phase 1 could rely on it. |
+| LSM manifest | `crates/animus-storage/src/lsm.rs` (`encode_manifest`/`decode_manifest`) | `MANIFEST_MAGIC = b"CMF1"`, `MANIFEST_VERSION: u8 = 1` | durable, node-local | The best-covered format in `animus-storage`: magic + version + a documented legacy fallback (`decode_manifest` still reads a pre-binary-codec JSON manifest when the magic is absent). This is the pattern the rest of the inventory should converge on. |
+| Control-plane Raft WAL (`RaftCore` log entries + membership records) | `crates/animus-control/src/persist.rs` | `CONTROL_WAL`: `CWL1` + version 1 (`format::encode_line`) | durable, node-local | Two generations of this format have already existed with no version discriminator between them; a reader distinguishes them structurally (parse success), not by a tag. Works only because both are JSON and one is a strict superset shape. |
+| Control-plane snapshot / `InstallSnapshot` payload | `crates/animus-control/src/raft.rs` (`RaftCore::snapshot`, the `S` state-machine type) | `CONTROL_SNAPSHOT`: `CSN1` + version 1 (`persist.rs`), wrapping `S`'s own serde shape | durable, node-local (persisted) **and** transient wire (`InstallSnapshot` RPC) | Same gap as the WAL: whatever `Metadata`'s own serde shape is *is* the wire format, with no independent version byte wrapping it. |
+| `Metadata` + its system-keyspace mirror (ADR 0038) | `crates/animus-control/src/meta.rs`, `syskv.rs` | `METADATA_VERSION: u32 = 1` (`meta.rs`, serialized as `"v"`); the system-keyspace mirror carries `SYSKV_MIRROR_VERSION: u32 = 1` (`mirror.rs`). Individual fields still use ADR 0035's `#[serde(default)]` pattern | durable, node-local (mirror) **and** replicated over the control Raft log | The field-by-field-default discipline is real and documented (ADR 0035 §"Rolling upgrade") but it is a convention, not a checked invariant — nothing fails loudly if a new field is added without the default, or if a field's *meaning* changes without renaming it. |
+| CP-data Raft command codec (`KvCommand` etc.) | `crates/animus-cp-data/src/codec.rs` | `MAGIC = 0xCB`, `const VERSION: u8 = 1` | durable, node-local (in the WAL/SharedWal) and transient wire (Raft replication) | The single best-versioned format in the whole system — a version byte is written by every encode and checked by every decode, loud `Err` on mismatch (no cross-version decoding attempted). The `VERSION` bump cadence (31 already) shows how often this layer has changed; each bump is currently an unconditional breaking change, by design. |
+| Segment codec (streams, ADR 0042/0043) | `crates/animus-cp-data/src/segment.rs` | `MAGIC = b"SEGF"`, `pub const VERSION: u8 = 1` | durable, node-local (per-tablet change-log segments) and consumed by backup/PITR/export as a data source | Same magic+version+loud-error discipline as the RaftKV codec, explicitly modeled on it (module doc: "mirroring `codec.rs`'s own ... discipline"). |
+| `SharedWal` record framing (ADR 0028, C-05) | `crates/animus-control/src/persist.rs` (`SHARED_WAL_TAG`, `encode_tagged_record`) | `SHARED_WAL_TAG`: `SWL1` + version 1 on the outer `Line{tablet, record}` envelope; the inner `record` bytes are the already-versioned `codec.rs` payload | durable, node-local | Two-layer format: inner payload versioned, outer multi-tenant tagging envelope not. |
+| Per-tablet engine key layout (ADR 0050: `kind \|\| logical`) | `crates/animus-cp-data/src/layout.rs` (and `host.rs` callers) | a reserved-namespace marker key per engine: `LAYOUT_MAGIC = b"KLY1"`, `LAYOUT_EPOCH: u8 = 1` (the layout is still a key-space convention; the marker stamps its epoch) | durable, node-local (defines what every stored key means) | Explicitly called out in the task framing: changing this is equivalent to a full re-encode of every stored row, categorically different from bumping `codec.rs::VERSION`. |
 | Hash-ring token / key encoding (ADR 0022/0023, ADR 0063's `N`-key layout) | `crates/animus-tablet/src/lib.rs` (`murmur3_x64_128`, `key_bytes()` in `animus-item`) | **none** — no version byte; correctness here means *every* node, every table, every historical row agrees on one encoding | durable, outlives the cluster (any row's placement and every index/backup/export/stream record derived from its key depend on it) | The highest-blast-radius unversioned format in the system: ADR 0063's own note is explicit that changing this is "no migration owed per root `CLAUDE.md`" today — i.e. it is currently *understood* to be a breaking, no-compat-path change, same category as the key layout above, but with the widest reach (base keys, GSI/LSI keys, stream `base_sk`, backup/export objects all inherit it). |
-| Internal `Network` message enums (control Raft `RaftMsg`, CP-data Raft messages, `ClientRequest`/`ClientResponse` in `animus-node::wire`) | `crates/animus-control/src/raft.rs` (`RaftMsg<C>`), `crates/animus-node/src/wire.rs` (`ClientRequest`/`ClientResponse`) | **none** — `serde_json` enums with no schema version; `wire.rs`'s own doc comment says outright: *"this repo's pre-alpha stance ... both sides of a cluster are the same build ... so no version negotiation is needed"* | transient wire (internal/intra ports) | The one format in this table whose *design comment* already states the exact assumption this ADR would need to break: same-build-on-both-ends. Any mixed-version rolling upgrade needs this to become additive-only (ADR 0035's config/wire pattern), immediately, before anything else here matters — a rolling restart is, definitionally, a period where two builds talk to each other over this wire. |
+| Internal `Network` message enums (control Raft `RaftMsg`, CP-data Raft messages, `ClientRequest`/`ClientResponse` in `animus-node::wire`) | `crates/animus-control/src/raft.rs` (`RaftMsg<C>`), `crates/animus-node/src/wire.rs` (`ClientRequest`/`ClientResponse`) | the connection handshake carries `NETWORK_PROTOCOL` (`NHS1`) / `CLIENT_PROTOCOL` (`CHS1`), each version 1 (`animus-env/src/handshake.rs`); the message enums themselves are still unversioned `serde_json`, and `wire.rs`'s (pre-Phase-0) doc comment said outright: *"this repo's pre-alpha stance ... both sides of a cluster are the same build ... so no version negotiation is needed"* | transient wire (internal/intra ports) | The one format in this table whose *design comment* already states the exact assumption this ADR would need to break: same-build-on-both-ends. Any mixed-version rolling upgrade needs this to become additive-only (ADR 0035's config/wire pattern), immediately, before anything else here matters — a rolling restart is, definitionally, a period where two builds talk to each other over this wire. |
 | Client-port `ClientRequest`/`ClientResponse` (DynamoDB wire is separate — see next row) | same file, `Surface::Client`/`Surface::Intra` variants | same as above | transient wire | No DynamoDB-specific versioning issue here; this is the internal admin/relay protocol, not the public API. |
 | DynamoDB JSON/HTTP wire (`animus-dynamo`) | `crates/animus-dynamo/src/wire.rs` | **externally versioned by AWS's own API, not by this codebase** — this repo tracks a fixed slice of DynamoDB's API surface; there is no AnimusDB-specific wire version | transient wire, public | Out of scope for internal version-gating — compatibility here means "faithful to AWS's wire," already the project's stated goal (root `CLAUDE.md`'s wire-adapter section). |
-| Cluster config JSON (`animusd::config::ClusterConfig`) | `crates/animusd/src/config.rs` | **none** — no schema-version field on `ClusterConfig` itself; individual additions use `#[serde(default)]` (`dynamo_auth`, `cluster_settings`), exactly ADR 0035's pattern | durable, node-local (read at process start) | Same convention-not-invariant gap as `Metadata` above — works today because every addition so far has, by discipline, remembered the default. |
-| Kubernetes operator CRD (`AnimusCluster`) | `crates/animus-operator/src/crd.rs` | `version = "v1alpha1"` (a real Kubernetes API version, with no `v1alpha1`→next conversion webhook — ADR 0060's deferred list: *"the CRD ships with no webhook of any kind; `v1alpha1` has no prior version to convert from"*) | durable, outlives a single reconcile but is itself the operator's config, not cluster data | Kubernetes' own CRD versioning mechanism exists and is unused beyond the label; a `v1alpha1`→`v1beta1` bump today would be a hard break for existing `AnimusCluster` objects. |
+| Cluster config JSON (`animusd::config::ClusterConfig`) | `crates/animusd/src/config.rs` | `CLUSTER_CONFIG_VERSION: u32 = 1` (`config.rs`, serialized as `"v"`); individual additions still use `#[serde(default)]`, ADR 0035's pattern | durable, node-local (read at process start) | Same convention-not-invariant gap as `Metadata` above — works today because every addition so far has, by discipline, remembered the default. |
+| Kubernetes operator CRD (`AnimusCluster`) | `crates/animus-operator/src/crd.rs` | `version = "v1alpha1"` plus a content-schema `CONTENT_SCHEMA_VERSION: u32 = 1` (`spec.schemaVersion`, distinct from the Kubernetes API version) (a real Kubernetes API version, with no `v1alpha1`→next conversion webhook — ADR 0060's deferred list: *"the CRD ships with no webhook of any kind; `v1alpha1` has no prior version to convert from"*) | durable, outlives a single reconcile but is itself the operator's config, not cluster data | Kubernetes' own CRD versioning mechanism exists and is unused beyond the label; a `v1alpha1`→`v1beta1` bump today would be a hard break for existing `AnimusCluster` objects. |
 | Backup manifest (JSON) + chunked data objects (ADR 0059) | `crates/animus-cp-data/src/backup.rs` | Manifest: `BKMF` + `u8` version (`MANIFEST_VERSION = 1`) envelope around a JSON body — the envelope is the version tag, so the body needs no `"v"` field; data chunks: `pub const DATA_VERSION: u8 = 1`, checked with a loud, named error on mismatch | **durable, outlives the cluster** — a backup id survives its source table's deletion, by design (ADR 0059) | The module's own doc is unusually explicit that this discipline is deliberate *despite* the no-back-compat rule: "pre-alpha 'no back-compat' notwithstanding, a version bump here should [get the magic+version treatment]" — i.e. backups already understand they need a longer memory than everything else in this table. This is the natural Phase 1 starting point. |
 | PITR change-log segments | reuses the segment codec above (`segment.rs`, `SEGF` + `segment::VERSION`) as a fifth change-log consumer | versioned (inherits `segment.rs`) | durable, outlives the cluster (a PITR restore window can span a long retention period, default 35 days, but the *segments themselves* are read back by a restore that could run against a much later binary) | Inherits the same version discipline as streams (Workstream E confirmed the inheritance with a test that reads the sealed object's raw bytes); the open question is support *window* length, not mechanism. |
 | S3 export/import objects (ADR 0068) | `crates/animusd/src/import.rs`, export path (JSON-lines + manifest, gzip'd, DynamoDB's own format) | **externally defined by AWS's export/import format, not internally versioned by this repo**; `IMPORT_SEED_VERSION: u64 = 1` is an MVCC seed-version constant (a `merge` precondition), not a *format* version | durable, outlives the cluster | Because the on-wire *content* format is AWS's own documented export/import layout, cross-version compatibility here is largely inherited "for free," as long as this repo keeps emitting/consuming that fixed external shape rather than an internal one. |
@@ -810,9 +814,9 @@ Recorded here as one addition, not a rewrite of the row above.
    merges:** add a fixture-decode test against C's
    `segment/v1.bin` (it does not exist on `main` yet).
 
-This is the last PR of Workstream E. **Baseline: _to be filled in by the
-maintainer with the merge commit of the last Phase 0 PR_** — Phase 0's
-baseline is set only when all of A/B/C/D/E have merged.
+This is the last PR of Workstream E. **Baseline: `9a9f972f`** (full SHA in
+Maintainer decision point 2 and the "Phase 0 complete" amendment below) —
+set once all of A/B/C/D/E had merged.
 
 ## Testing
 
@@ -933,3 +937,39 @@ same way every other distributed behavior in this codebase is:
   since it is a key-space convention, not a framed record — see the
   inventory table's own note), but whether it ever gets a Phase 1
   compatibility mechanism at all remains undecided.
+
+## Amendment 2026-09-30 — Phase 0 complete; baseline set
+
+Phase 0 is **done**. The baseline is `9a9f972fb38a766be4a4b044379540ded533eefc`
+(`9a9f972f`), "Merge pull request #1104", merged 2026-09-29 22:50 UTC — the
+merge commit where the last workstream landed. The workstream rows' as-built
+notes above are unchanged.
+
+- **Workstream PRs.** D (wire handshake): #1056, #1059, #1066, #1069. B
+  (`animus-control`): #1058, #1063, #1087, #1088. A (`animus-storage`): #1079,
+  #1082, #1086 (plus the related fix #1081). C (`animus-cp-data`): #1089,
+  #1090, #1091, #1097. E (`animusd`/operator/backup): #1099, #1100, #1101,
+  #1104.
+- **Verification.** The baseline commit's own `main` CI run was cancelled by
+  the workflow's concurrency setting (a newer push superseded it), so it has
+  no green run of its own. The covering verification is `main` CI at
+  `516759d4` (= `9a9f972f` plus #1108, a test-only flake fix): every gate and
+  every prod-liveness job green. The `kind` e2e smoke passed on `main` at
+  `0fa0cf47` (the #1100 operator merge).
+- **What applies from the baseline on.**
+  - Durable formats must stay readable by newer builds (a full-cluster stop,
+    upgrade, restart with no data loss and no manual conversion).
+  - Golden fixtures are append-only: a format change is a new version tag, a
+    decoder that accepts the older versions, and a new fixture; an existing
+    fixture is never edited or deleted (`scripts/check-format-fixtures.sh`
+    enforces this in CI).
+  - Wire compatibility applies once Phase 2 lands; before that, wire changes
+    stay free but additive-by-design where cheap.
+  - Rolling upgrades are supported once Phase 3 lands. Until then an upgrade
+    is still a full-cluster stop and restart.
+- **Phase status.** Phase 0 done. Phases 1 (on-disk N-1 readability, backups
+  and PITR first), 2 and 3 remain planned; the "decoder still accepts every
+  older version" half of the durable-format rule is reviewed by hand until
+  Phase 1 implements a real N-1 decode path per format.
+- **Inventory table.** The *Location* and *Version tag today* cells were
+  refreshed to the as-built constants (see the note above the table).

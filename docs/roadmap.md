@@ -1519,7 +1519,7 @@ rows this section used to carry were fixed by the stale-prose sweep.
   amendment's own "what remains unowned" accounting and `crates/animusd/
   CLAUDE.md`'s consolidated closed-C-15 appendix.
 
-### C-16 Upgrade compatibility (ADR 0073) — Phase 0 in progress
+### C-16 Upgrade compatibility (ADR 0073) — Phase 0 done; Phase 1 next
 
 - **Gap (closed):** `website/index.html` listed "On-disk format stability,
   then rolling upgrades" as Planned with no ADR, roadmap entry, or issue
@@ -1537,7 +1537,8 @@ rows this section used to carry were fixed by the stale-prose sweep.
 - **Plan:** Phase 0 — version-tag everything, add golden fixtures, and take
   the **one last permitted incompatible reset** (every version counter
   restarts at 1; pre-baseline legacy-compat fields like ADR 0032/0040's
-  `cp_member_addrs` are dropped) — is **in progress**, split into five
+  `cp_member_addrs` are dropped) — is **done**: the baseline is
+  `9a9f972f` (merge of #1104, 2026-09-29; full SHA in ADR 0073). It was split into five
   independent Phase 0 workstreams, each its own session/PR series (see
   ADR 0073's "Phase 0 workstreams" table for the full dependency graph and
   do-not-touch lists):
@@ -1559,8 +1560,8 @@ rows this section used to carry were fixed by the stale-prose sweep.
   Phase 1 (on-disk N-1 stability, backups/PITR first), Phase 2 (replicated
   cluster-version/feature-gate for wire compatibility), and Phase 3
   (rolling-upgrade orchestration including operator `spec.image` support)
-  remain planned, gated on Phase 0's baseline landing (recorded in ADR
-  0073 once it happens). Phase 4 (lifting/rewriting root `CLAUDE.md`'s
+  remain planned; **Phase 1 is the next step** (on-disk N-1 readability,
+  backups/PITR first), now unblocked by the recorded baseline. Phase 4 (lifting/rewriting root `CLAUDE.md`'s
   no-back-compat rule) is **already done** by this same maintainer
   decision — root `CLAUDE.md` now states the staged ratchet directly.
 - **Reuse:** the magic (4-byte ASCII) + `u8` version + loud named error
@@ -1579,17 +1580,17 @@ rows this section used to carry were fixed by the stale-prose sweep.
   knob `ANIMUS_UPGRADE_SEEDS`, Phase 2/3 work); a `kind` e2e for the
   operator's rolling-restart path, once Phase 3 exists.
 - **ADR:** [0073](adr/0073-upgrade-compatibility.md) (Accepted, 2026-09-27
-  — Phase 0 in progress; Phases 1-3 planned, gated on Phase 0's baseline).
+  — Phase 0 done, baseline `9a9f972f`; Phases 1-3 planned).
 - **Size:** XL overall across all four phases; Phase 0 alone is roughly M
   (mechanical, one format at a time, no design risk), now split five ways
   across independent sessions.
-- **Depends:** none to *start* Phase 0 (in progress now). Phase 2 depends
+- **Depends:** none to *start* Phase 0 (done). Phase 2 depends
   on `Metadata` already being the natural home for a cluster version (ADR
   0038). Phase 3 depends on ADR 0032 (drain) and ADR 0037 (admin API) for
   its orchestration primitives, and on ADR 0060 for the operator's own
   `spec.image` handling.
-- **Status:** Phase 0 in progress (workstreams A-E, see above); Phases 1-3
-  not started, no owner or target wave yet.
+- **Status:** Phase 0 done (workstreams A-E merged, baseline `9a9f972f`);
+  Phase 1 next; Phases 2-3 not started, no owner or target wave yet.
 
 ## 4. Operator surfaces: admin API, dashboard, console, CLI
 
