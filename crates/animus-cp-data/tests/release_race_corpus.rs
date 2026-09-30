@@ -77,14 +77,18 @@ struct Outcome {
     /// voter or learner.
     torn_while_member: u32,
     refused: bool,
+    /// The leader judged the re-added learner caught up while its own
+    /// replica had received (almost) nothing.
+    premature_caught_up: bool,
     final_voter: bool,
     final_caught_up: bool,
     #[allow(dead_code, reason = "read through Debug in assertion messages")]
     info: String,
 }
 
-fn run(seed: u64, led: bool) -> Outcome {
+fn run(seed: u64, led: bool, stale: bool) -> Outcome {
     let mut sim = Simulator::new(seed);
+    let sim2 = sim.clone();
     let mut net = NetConfig::default();
     net.set_duplicate_prob(0.2);
     net.set_drop_prob(0.01);
@@ -100,6 +104,7 @@ fn run(seed: u64, led: bool) -> Outcome {
     ea.spawn_task(async move {
         let leader_cell: Arc<Mutex<Option<KvNode>>> = Arc::new(Mutex::new(None));
         let torn = Arc::new(Mutex::new(0u32));
+        let premature = Arc::new(Mutex::new(false));
         let (lc, tc) = (leader_cell.clone(), torn.clone());
         let mut rec: Reconciler<SimEnv, MemoryEngine> = Reconciler::new(
             tenv.clone(),
@@ -179,6 +184,17 @@ fn run(seed: u64, led: bool) -> Outcome {
             tenv.sleep(Duration::from_millis(100)).await;
         }
         assert!(b.is_leader(), "seed={seed}: B must lead");
+        // Stale-progress cell: A's replies never reach the leader, so the
+        // leader keeps its progress for A (a `departing` peer is only
+        // forgotten on A's `RemovedAck`) while A itself still receives.
+        if stale {
+            for _ in 0..40u64 {
+                let _ = b.put(b"warm".to_vec(), vec![2; 64]);
+            }
+            tenv.sleep(Duration::from_secs(1)).await;
+            sim2.partition(nid(A), nid(B));
+            sim2.partition(nid(A), nid(C));
+        }
         for _ in 0..80 {
             if !matches!(
                 b.change_membership([nid(B), nid(C)].into_iter().collect()),
@@ -206,6 +222,26 @@ fn run(seed: u64, led: bool) -> Outcome {
         );
         *torn.lock().unwrap() = 0;
         *leader_cell.lock().unwrap() = Some(b.clone());
+        if stale {
+            // Re-add A as a learner while the leader still holds A's old
+            // progress, then let A talk again.
+            for _ in 0..200 {
+                if matches!(b.add_learner(nid(A)), ProposeResult::Accepted { .. }) {
+                    break;
+                }
+                tenv.sleep(Duration::from_millis(20)).await;
+            }
+            // A's replica is erased and not re-hosted yet: it has received
+            // nothing, so a leader judging it caught up is judging stale
+            // progress -- and the production reconciler promotes on exactly
+            // that judgement.
+            if rec.hosted_node(T).is_none() && b.learner_caught_up(&nid(A), 4) {
+                *premature.lock().unwrap() = true;
+                let _ = b.promote_learner(nid(A));
+            }
+            sim2.heal(nid(A), nid(B));
+            sim2.heal(nid(A), nid(C));
+        }
 
         // Placement re-adds A: re-host empty, leader adds it as a learner.
         rec.tick(&tab(&[A, B, C], 4)).await;
@@ -213,6 +249,8 @@ fn run(seed: u64, led: bool) -> Outcome {
             .await;
         let _ = b.add_learner(nid(A));
         let an = rec.hosted_node(T).expect("A re-hosted").clone();
+        let premature2 = premature.clone();
+        let an_probe = an.clone();
         // Wait until A itself knows it is a learner (the leader's entry landed).
         for _ in 0..100 {
             if an.learners().contains(&nid(A)) {
@@ -228,6 +266,10 @@ fn run(seed: u64, led: bool) -> Outcome {
         tenv.spawn_task(async move {
             for _ in 0..4000 {
                 if lead2.learners().contains(&nid(A)) && lead2.learner_caught_up(&nid(A), 4) {
+                    // Judged caught up: A's own replica must really be.
+                    if an_probe.commit_index() + 8 < lead2.commit_index() {
+                        *premature2.lock().unwrap() = true;
+                    }
                     break;
                 }
                 denv.sleep(Duration::from_millis(1)).await;
@@ -279,6 +321,7 @@ fn run(seed: u64, led: bool) -> Outcome {
         *out2.lock().unwrap() = Some(Outcome {
             torn_while_member: *torn.lock().unwrap(),
             refused,
+            premature_caught_up: *premature.lock().unwrap(),
             final_voter,
             final_caught_up,
             info,
@@ -294,16 +337,21 @@ fn run(seed: u64, led: bool) -> Outcome {
     r.unwrap_or_else(|| panic!("seed={seed}: scenario did not finish"))
 }
 
-fn check(name: &str, led: bool) {
+fn check(name: &str, led: bool, stale: bool) {
     corpus::for_each_seed(
         name,
         corpus::seeds_from_env("ANIMUS_RELEASE_RACE_SEEDS"),
         |seed| {
-            let o = run(seed, led);
+            let o = run(seed, led, stale);
             assert!(
                 !o.refused,
                 "{name} seed={seed}: the re-hosted replica was refused as a voter -- the \
              release-vs-promote race: {o:?}"
+            );
+            assert!(
+                !o.premature_caught_up,
+                "{name} seed={seed}: the leader judged a wiped, re-added learner caught up from \
+             stale progress: {o:?}"
             );
             assert_eq!(
                 o.torn_while_member, 0,
@@ -320,10 +368,23 @@ fn check(name: &str, led: bool) {
 
 #[test]
 fn a_promoted_learner_is_never_released_and_erased() {
-    check("release_race_plain", false);
+    check("release_race_plain", false, false);
 }
 
 #[test]
 fn a_promoted_learner_that_previously_led_is_never_released_and_erased() {
-    check("release_race_previously_led", true);
+    check("release_race_previously_led", true, false);
+}
+
+/// The leader still holds the removed voter's replication progress when it
+/// re-adds the (erased) node as a learner: fresh progress must apply, or the
+/// wiped learner is judged caught up, promoted empty, and refused.
+#[test]
+fn a_readded_learner_never_inherits_stale_replication_progress() {
+    check("release_race_stale_progress", false, true);
+}
+
+#[test]
+fn a_readded_previously_led_learner_never_inherits_stale_replication_progress() {
+    check("release_race_stale_progress_led", true, true);
 }

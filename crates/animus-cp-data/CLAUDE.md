@@ -1651,9 +1651,11 @@ DynamoDB-wire and real-`LsmEngine` regressions this fix also carries.
   `Host` re-adopts the intact disk. `Reclaim` never rechecks. `tick()` always
   gathers fresh facts, so a stale plan is only expressible by driving
   `finish_teardown` directly (`host.rs` unit tests). Corpus:
-  `tests/release_race_corpus.rs` (`ANIMUS_RELEASE_RACE_SEEDS`). Known
-  leader-side residual: a wiped learner re-added while the leader's progress
-  for it is stale can be judged caught up.
+  `tests/release_race_corpus.rs` (`ANIMUS_RELEASE_RACE_SEEDS`). The
+  leader-side follow-on (a wiped learner re-added while the leader's progress
+  for it is stale being judged caught up) is fixed in `RaftCore` — see
+  `animus-control/CLAUDE.md` and ADR 0058's 2026-09-30 amendment; corpus
+  cells `a_readded_*_never_inherits_stale_replication_progress`.
 - **Removal-notice observability (issue #1061 follow-up).** `drive`'s
   per-iteration core read also takes `RaftCore::removal_stats()` and
   `record_removal_stats` emits the growth as `Metric::CpRemovalNoticesSent`/

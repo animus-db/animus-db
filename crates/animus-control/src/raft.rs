@@ -2795,6 +2795,11 @@ where
     fn log_append(&mut self, entry: LogEntry<C>) {
         if let Some(voters) = &entry.config {
             let old_peers = self.peers.clone();
+            let old_members: BTreeSet<NodeId> = old_peers
+                .iter()
+                .chain(self.learners.iter())
+                .cloned()
+                .collect();
             // Every membership-change entry carries both sets together (see
             // `LogEntry::learners`'s doc); fall back to the current learners
             // only as defensive robustness against a decoded entry that
@@ -2827,6 +2832,9 @@ where
             }
             self.departing
                 .retain(|n, _| !self.peers.contains(n) && !self.learners.contains(n));
+            if self.role == Role::Leader {
+                self.reset_peer_progress_on_membership_change(&old_members, entry.index);
+            }
             self.departing_since
                 .retain(|n, _| self.departing.contains_key(n));
             self.departing_quiet
@@ -5365,6 +5373,49 @@ where
         if self.departing.contains_key(peer) {
             self.departing_since.insert(peer.clone(), now);
             self.removal_sched.remove(peer);
+        }
+    }
+
+    /// Leader-side: keep per-peer replication progress honest across a
+    /// membership change (the stale-learner-promotion fix). A peer that this
+    /// entry (re)introduces as a voter or learner — i.e. was in neither
+    /// `old_members` set — starts FRESH: `match_index = 0`,
+    /// `next_index = entry_index` (the entry itself), and any snapshot-transfer
+    /// bookkeeping from an earlier incarnation is forgotten. Without this a
+    /// node that was removed (its files erased) and re-added as a learner
+    /// inherited its previous membership's `match_index`, so
+    /// [`learner_caught_up`](Self::learner_caught_up) judged the wiped learner
+    /// caught up and it was promoted before receiving anything. A peer that
+    /// left membership without becoming `departing` (a removed learner is never
+    /// departing) has all its progress dropped, so nothing lingers to be
+    /// inherited by a later re-add. A `departing` peer keeps its state: it is
+    /// still owed the removal notice.
+    fn reset_peer_progress_on_membership_change(
+        &mut self,
+        old_members: &BTreeSet<NodeId>,
+        entry_index: u64,
+    ) {
+        let now_members: BTreeSet<NodeId> = self
+            .peers
+            .iter()
+            .chain(self.learners.iter())
+            .cloned()
+            .collect();
+        for n in now_members.difference(old_members) {
+            self.next_index.insert(n.clone(), entry_index);
+            self.match_index.insert(n.clone(), 0);
+            self.snapshot_served_through.remove(n);
+            self.forget_snapshot_transfer(n);
+        }
+        for n in old_members.difference(&now_members) {
+            if self.departing.contains_key(n) {
+                continue;
+            }
+            self.next_index.remove(n);
+            self.match_index.remove(n);
+            self.last_contact.remove(n);
+            self.snapshot_served_through.remove(n);
+            self.forget_snapshot_transfer(n);
         }
     }
 

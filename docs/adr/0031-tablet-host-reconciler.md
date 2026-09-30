@@ -375,11 +375,11 @@ leader's promotion of the same node.
    keeps its files and its claim is cleared, so the next tick's `Host`
    re-adopts the intact disk (a non-empty WAL replay, so no boot check).
    `Reclaim` (a dropped table) erases unconditionally.
-4. Residual, out of scope here: a leader adding this node after the erase
-   completes is an ordinary fresh learner join. If the leader's per-peer
-   progress for the node is stale at that moment it can judge the wiped
-   learner caught up (`learner_caught_up` trusts `match_index`); that is a
-   leader-side defect tracked separately.
+4. A leader adding this node after the erase completes is an ordinary fresh
+   learner join. The leader-side staleness this used to leave (the leader's
+   per-peer progress for the node surviving from its earlier membership, so
+   `learner_caught_up` judged the wiped learner caught up) is closed by
+   ADR 0058's 2026-09-30 amendment (fresh progress on every (re)introduction).
 
 Regression: `tests/release_race_corpus.rs` (`ANIMUS_RELEASE_RACE_SEEDS`) and
 the `host.rs` unit tests around `replica_excluded`/`finish_teardown`.
