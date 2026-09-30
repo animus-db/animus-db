@@ -1505,6 +1505,13 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // replication; it must be re-admitted through the learner/rejoin path
     // (ADR 0032/0058) as a genuinely new membership event.
     cluster_check_refused: bool,
+    /// Optional human-readable label for the group this core serves (e.g.
+    /// `"tablet 7"`), set by a multi-group driver (the CP-data tablet
+    /// driver) so log lines that would otherwise be indistinguishable
+    /// across groups — the `cluster_check_refused` ERROR most of all — name
+    /// their group. Purely diagnostic: never read by any protocol decision.
+    /// `None` for the control group itself.
+    group_label: Option<String>,
 }
 
 impl<C, S> RaftCore<C, S>
@@ -1591,6 +1598,7 @@ where
             cluster_check_resend_deadline: None,
             cluster_check_saw_established_with_me: false,
             cluster_check_refused: false,
+            group_label: None,
         };
         core.reset_election_timer(now, entropy);
         core
@@ -3571,6 +3579,7 @@ where
                 self.cluster_check_refused = true;
                 tracing::error!(
                     node = %self.id,
+                    group = self.group_label.as_deref().unwrap_or("control"),
                     "refusing to start as a voter: this node's persisted Raft state is empty \
                      (ephemeral storage wiped?), every configured peer already has real \
                      history, and at least one both recognizes this node id as an established \
@@ -3616,6 +3625,12 @@ where
     #[must_use]
     pub fn refused_as_voter(&self) -> bool {
         self.cluster_check_refused
+    }
+
+    /// Label this core's group for diagnostics (see the `group_label`
+    /// field). Log-only; never affects protocol behavior.
+    pub fn set_group_label(&mut self, label: impl Into<String>) {
+        self.group_label = Some(label.into());
     }
 
     /// Propose a command. If leader, append it (replicated on the next

@@ -160,6 +160,12 @@ pub(crate) struct CpRaftView {
     /// specifically to surface that the feature is working, the operator's
     /// own diagnostic.
     pub(crate) quiesced: bool,
+    /// Whether this replica's boot-time cluster check permanently refused it
+    /// as a voter (`RaftCore::refused_as_voter`): it replicates but never
+    /// votes or campaigns, so the group runs a voter short. Sticky until the
+    /// replica is re-admitted through the learner path. A pure observer;
+    /// `Metric::CpGroupsRefusedAsVoter` counts these per node.
+    pub(crate) refused_as_voter: bool,
     /// Every distinct voter configuration this replica has adopted, in
     /// adoption order (issue #596) — each entry the sorted `String` node ids
     /// of one voter set, oldest first, dropping the timestamp `RaftKvNode::

@@ -2972,12 +2972,13 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // also the ADR 0034 fix: auto-split stops measuring change-log churn.
         let kind_scopes = kind_scopes(&scope);
         let scope = kind_scopes[KIND_BASE as usize].clone();
-        let core = Arc::new(Mutex::new(RaftCore::new(
-            env.node_id(),
-            &all_nodes,
-            env.now(),
-            env.next_u64(),
-        )));
+        let mut raw_core = RaftCore::new(env.node_id(), &all_nodes, env.now(), env.next_u64());
+        // By the `stream = tablet.0` convention a hosted group's stream is its
+        // tablet id: label the core so a boot-check refusal names the tablet.
+        if stream != PRIMARY_STREAM {
+            raw_core.set_group_label(format!("tablet {stream}"));
+        }
+        let core = Arc::new(Mutex::new(raw_core));
         let reads = Arc::new(Mutex::new(ReadState::default()));
         let cas = Arc::new(Mutex::new(CasResults::default()));
         let stage = Arc::new(Mutex::new(StageOutcomes::default()));
