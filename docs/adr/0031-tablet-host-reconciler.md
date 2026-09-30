@@ -345,3 +345,43 @@ the group ever started — that clone has no committed group state of its own
 to lose, so destroying the corrupt clone and falling through to an ordinary
 fresh re-clone from the parent's own CURRENT state is always correct,
 mirroring the G4 contract's own "crash before step 1" case this re-enters.
+
+### Addendum (2026-09-30): the release predicate and the destructive-step recheck
+
+A 4-hour soak logged three permanent `refusing to start as a voter` refusals
+(ADR 0009's issue #667/#900 boot check) on tablet replicas nobody had wiped.
+Root cause: a race between this reconciler's `Release` and the tablet
+leader's promotion of the same node.
+
+1. `plan` released a hosted tablet when this node's `Metadata` view excluded
+   it for `RELEASE_CONFIRM_TICKS` at an unchanged epoch **and**
+   `config_excludes_me`. That fact was derived from `RaftCore::config()`,
+   which is **voters only**, so a mid-catch-up **learner** (ADR 0058) always
+   counted as excluded. `Reconciler::teardown` then stopped the driver and
+   erased the files without re-checking anything (a TOCTOU on facts gathered
+   at tick start), while the leader, whose own view still listed the node,
+   promoted it. The next tick re-hosted the now-empty replica; peers named it
+   an established voter they had heard from, so the boot check refused it
+   for good and the group silently ran a voter short.
+2. **Decision.** "Excluded" is now the single predicate
+   `host::replica_excluded`: the leader's removal notice was received, **or**
+   this node is in neither the group's voter set nor its learner set. A
+   learner is a member. `gather_facts` and the teardown recheck both use it.
+3. **Decision.** A planned `Release` re-checks live membership at the two
+   points where it can still be undone: before stopping the driver, and (the
+   destructive step) after the driver has stopped and immediately before
+   `erase_tablet_files` (`Reconciler::finish_teardown`, also used by the
+   parked-teardown `sweep_stopping` path). A node that is a member again
+   keeps its files and its claim is cleared, so the next tick's `Host`
+   re-adopts the intact disk (a non-empty WAL replay, so no boot check).
+   `Reclaim` (a dropped table) erases unconditionally.
+4. Residual, out of scope here: a leader adding this node after the erase
+   completes is an ordinary fresh learner join. If the leader's per-peer
+   progress for the node is stale at that moment it can judge the wiped
+   learner caught up (`learner_caught_up` trusts `match_index`); that is a
+   leader-side defect tracked separately.
+
+Regression: `tests/release_race_corpus.rs` (`ANIMUS_RELEASE_RACE_SEEDS`) and
+the `host.rs` unit tests around `replica_excluded`/`finish_teardown`.
+Observability of a refusal (tablet-named ERROR, `/admin/raftkv`
+`refused_as_voter`, `Metric::CpGroupsRefusedAsVoter`) landed separately.

@@ -259,6 +259,30 @@ impl EngineFactory<MemoryEngine> for MemoryTabletEngines {
 /// cancels a release part-way confirmed.
 pub const RELEASE_CONFIRM_TICKS: u8 = 3;
 
+/// Whether a hosted replica's own Raft state says this node is **out of the
+/// group** and its files may be released — the one predicate behind both
+/// [`TabletFacts::config_excludes_me`] (the `plan`-time fact) and
+/// [`Reconciler`]'s destructive-step recheck immediately before it erases
+/// a released tablet's files.
+///
+/// `true` iff the leader's explicit removal notice arrived
+/// (`removed_by_leader`, issue #1061 — cleared by any later config entry that
+/// re-adds this node), **or** this node is in neither the group's voter set
+/// nor its learner set. A **learner is a member**, not an excluded node:
+/// `RaftCore::config()` is voters only, so testing it alone made every
+/// mid-catch-up learner (or a node the leader is about to promote) look
+/// removed, released it, and erased the very replica the leader was about to
+/// promote (the release-vs-promote race; see ADR 0031's amendment).
+#[must_use]
+pub fn replica_excluded(
+    me: &NodeId,
+    voters: &BTreeSet<NodeId>,
+    learners: &BTreeSet<NodeId>,
+    removed_by_leader: bool,
+) -> bool {
+    removed_by_leader || (!voters.contains(me) && !learners.contains(me))
+}
+
 /// An owned, minimal projection of replicated `Metadata` — *not* the whole
 /// `animus_control::Metadata` (this crate stays decoupled from the control
 /// plane's full state shape; only what a host-reconcile decision needs).
@@ -1139,6 +1163,11 @@ struct StoppingNode<E: Env, S: StorageEngine> {
     /// [`RECLAIM_STOP_TIMEOUT`] to decide whether this has been stopping
     /// for long enough to warn about.
     halted_at: Nanos,
+    /// Whether the parked teardown is a [`HostAction::Release`] (`true`) or a
+    /// [`HostAction::Reclaim`]: a release re-checks live membership before
+    /// erasing (see [`Reconciler::finish_teardown`]); a reclaim (dropped
+    /// table) erases unconditionally.
+    release: bool,
     /// Whether [`Reconciler::sweep_stopping`] has already logged the "did
     /// not stop in time" warning and bumped [`Metric::
     /// CpReconcilerStopTimeout`] for this stopping episode — bumped **at
@@ -1509,10 +1538,10 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                     }
                 }
                 HostAction::Release { tablet } => {
-                    self.teardown(tablet).await;
+                    self.teardown(tablet, true).await;
                 }
                 HostAction::Reclaim { tablet } => {
-                    self.teardown(tablet).await;
+                    self.teardown(tablet, false).await;
                 }
                 HostAction::ProposeSplitFork {
                     tablet,
@@ -1569,8 +1598,7 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
             // leadership change partitioned, can ever get. `plan` still
             // requires replicated `Metadata` to exclude this node too, and
             // still debounces over `RELEASE_CONFIRM_TICKS`.
-            let config_excludes_me =
-                !node.config().contains(&self.base_id) || node.removed_by_leader();
+            let config_excludes_me = Self::node_excludes_me(node, &self.base_id);
             // Issue #987 follow-up: consulted for EVERY hosted tablet,
             // never gated on whether THIS tick's `view` still shows an
             // `inplace_split` intent. The old gate (only call
@@ -2120,7 +2148,7 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
     /// establish a handle) and the claim is confirmed torn down
     /// immediately, so `plan` stops re-emitting a teardown action that could
     /// otherwise never make progress.
-    async fn teardown(&mut self, tablet: TabletId) {
+    async fn teardown(&mut self, tablet: TabletId, release: bool) {
         // Already parked from an earlier tick's timed-out wait: `plan` will
         // keep re-emitting the identical `Reclaim`/`Release` for this
         // tablet every tick until `sweep_stopping` confirms it torn down
@@ -2131,6 +2159,25 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         // double-call `on_teardown`/`shutdown` on state already moved into
         // `self.stopping`.
         if self.stopping.contains_key(&tablet) {
+            return;
+        }
+        // A planned `Release` was decided from facts gathered at the start of
+        // this tick. Re-check the live replica before touching anything: if
+        // it is a member again (re-added as voter or learner since), the
+        // release is stale — keep it hosted and forget the confirmation
+        // count (destructive-step recheck; see `finish_teardown`).
+        if release
+            && self
+                .hosted
+                .get(&tablet)
+                .is_some_and(|node| !Self::node_excludes_me(node, &self.base_id))
+        {
+            tracing::info!(
+                tablet = tablet.0,
+                "reconciler: skipping a planned release — this node is a member of the \
+                 group again (voter or learner)"
+            );
+            self.state.pending_release.remove(&tablet);
             return;
         }
         let Some(node) = self.hosted.remove(&tablet) else {
@@ -2169,6 +2216,7 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                     StoppingNode {
                         node,
                         halted_at: self.env.now(),
+                        release,
                         warned: false,
                     },
                 );
@@ -2187,7 +2235,45 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         // `recv_stream`'s own unconditional reopen (see `Network::
         // close_stream`'s doc) and silently undo the close.
         self.env.close_stream(tablet.0);
+        self.finish_teardown(tablet, node, release).await;
+    }
 
+    /// Whether `node`'s own live Raft state says this node is out of the
+    /// group — [`replica_excluded`] over its accessors.
+    fn node_excludes_me(node: &RaftKvNode<E, S>, me: &NodeId) -> bool {
+        replica_excluded(
+            me,
+            &node.config(),
+            &node.learners(),
+            node.removed_by_leader(),
+        )
+    }
+
+    /// The erase tail shared by [`teardown`](Self::teardown) and
+    /// [`sweep_stopping`](Self::sweep_stopping), run once the driver has
+    /// stopped. **For a `Release`, the destructive step re-checks live
+    /// state first**: the planned release was decided from facts gathered
+    /// at tick start, and the tablet leader — whose own view can still list
+    /// this node — may have added or promoted it since (the release-vs-
+    /// promote race: erasing a replica the leader has just made a voter
+    /// re-hosts it empty, and the issue #900 boot check then refuses it
+    /// forever, leaving the group a voter short). A replica that is a
+    /// member (voter or learner) again keeps its files: the claim is
+    /// cleared with no erase, so the next tick's `Host` re-adopts the
+    /// intact disk (its WAL replays non-empty, so no boot-time cluster
+    /// check runs). A `Reclaim` (dropped table) erases unconditionally.
+    async fn finish_teardown(&mut self, tablet: TabletId, node: RaftKvNode<E, S>, release: bool) {
+        if release && !Self::node_excludes_me(&node, &self.base_id) {
+            tracing::warn!(
+                tablet = tablet.0,
+                "reconciler: a planned release found this node a member of the group again \
+                 after its driver stopped — keeping the files and re-adopting the replica"
+            );
+            drop(node);
+            self.engines.remove(&tablet);
+            self.state.confirm_torn_down(tablet);
+            return;
+        }
         // ADR 0050 rung 1: a tablet's engine is private, so teardown reduces
         // to deleting its files whole — instant, real space reclaim, no
         // `merge_tombstone` sweep (the shared-engine sibling-sparing bound
@@ -2226,9 +2312,8 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                 // confirmed true, so nothing can still be polling
                 // `recv_stream(tablet.0)`).
                 self.env.close_stream(tablet.0);
-                drop(stopping.node);
-                self.erase_tablet_files(tablet).await;
-                self.state.confirm_torn_down(tablet);
+                self.finish_teardown(tablet, stopping.node, stopping.release)
+                    .await;
                 continue;
             }
             let now = self.env.now();
@@ -3128,6 +3213,84 @@ mod tests {
         assert!(!state.pending_release.contains_key(&TabletId(1)));
     }
 
+    // === replica_excluded (the release predicate) ===========================
+
+    fn ids(v: &[u64]) -> BTreeSet<NodeId> {
+        v.iter().copied().map(animus_env::nid).collect()
+    }
+
+    /// A voter is never excluded, and neither is a **learner** (`config()` is
+    /// voters only, so testing it alone used to release every mid-catch-up
+    /// learner — the release-vs-promote race).
+    #[test]
+    fn a_learner_or_a_voter_is_not_planned_for_release() {
+        let me = animus_env::nid(7);
+        assert!(
+            !replica_excluded(&me, &ids(&[7, 8]), &ids(&[]), false),
+            "voter"
+        );
+        assert!(
+            !replica_excluded(&me, &ids(&[8, 9]), &ids(&[7]), false),
+            "learner: not in config(), but a member"
+        );
+        // And through `plan`: a hosted learner's fact is `config_excludes_me:
+        // false`, so even at an unchanged epoch for many ticks it is never
+        // released.
+        let facts: BTreeMap<TabletId, TabletFacts> = [(
+            TabletId(1),
+            TabletFacts {
+                hosted: true,
+                config_excludes_me: replica_excluded(&me, &ids(&[8, 9]), &ids(&[7]), false),
+                ..Default::default()
+            },
+        )]
+        .into_iter()
+        .collect();
+        let mut state = LocalState::default();
+        state.hosted.insert(TabletId(1));
+        let mut tablet = Tablet::new_for_table(
+            TabletId(1),
+            "t",
+            KeyRange::whole(),
+            vec![animus_env::nid(8), animus_env::nid(9)],
+        );
+        tablet.epoch = Epoch(5);
+        let v = MetadataView {
+            tablets: [(TabletId(1), tablet)].into_iter().collect(),
+            ..Default::default()
+        };
+        for tick in 0..(RELEASE_CONFIRM_TICKS as usize * 3) {
+            let (actions, next) = plan(&v, &facts, &BTreeSet::new(), &state, me.clone());
+            assert!(
+                !actions
+                    .iter()
+                    .any(|a| matches!(a, HostAction::Release { .. })),
+                "tick {tick}: a learner must never be released"
+            );
+            state = next;
+        }
+    }
+
+    /// A voter re-added after the plan (the live recheck's input) flips the
+    /// predicate back to "member"; only an actually-removed node — or an
+    /// explicit removal notice — is excluded.
+    #[test]
+    fn replica_excluded_only_when_out_of_the_group_or_notified() {
+        let me = animus_env::nid(7);
+        assert!(
+            replica_excluded(&me, &ids(&[8, 9]), &ids(&[]), false),
+            "removed"
+        );
+        assert!(
+            !replica_excluded(&me, &ids(&[7, 8, 9]), &ids(&[]), false),
+            "re-added as a voter after the plan"
+        );
+        assert!(
+            replica_excluded(&me, &ids(&[7, 8]), &ids(&[]), true),
+            "the leader's removal notice wins"
+        );
+    }
+
     // === LocalState::release_unconfirmed_host ===============================
 
     #[test]
@@ -3195,7 +3358,7 @@ mod tests {
             .pending_release
             .insert(TabletId(1), (Epoch::INITIAL, 2));
 
-        futures::executor::block_on(reconciler.teardown(TabletId(1)));
+        futures::executor::block_on(reconciler.teardown(TabletId(1), false));
 
         assert!(
             !reconciler.local_state().hosted.contains(&TabletId(1)),
@@ -3216,6 +3379,88 @@ mod tests {
             sim.stream_is_closed(base(), TabletId(1).0),
             "teardown's zombie-claim path must close the tablet's stream"
         );
+    }
+
+    // === Reconciler::finish_teardown: the destructive-step recheck ===========
+    //
+    // A `Release` planned from tick-start facts must re-check live
+    // membership before erasing (the release-vs-promote race). `tick()`
+    // gathers fresh facts, so a stale plan cannot be expressed through the
+    // public API; drive `finish_teardown` directly on a hosted replica.
+
+    /// Host tablet 1 on `base()` with `replicas` at `epoch` (a single-voter
+    /// formation when `replicas == [base()]` at `Epoch::INITIAL`), then hand
+    /// back the reconciler, its engine registry, and the live node taken out
+    /// of the hosted map as `teardown` would have.
+    fn hosted_for_teardown(
+        replicas: Vec<NodeId>,
+        epoch: Epoch,
+    ) -> (
+        animus_sim::Simulator,
+        Reconciler<animus_sim::SimEnv, MemoryEngine>,
+        MemoryTabletEngines,
+        crate::RaftKvNode<animus_sim::SimEnv, MemoryEngine>,
+    ) {
+        let sim = animus_sim::Simulator::new(0x2E1E_A5E5_u64);
+        let engines = MemoryTabletEngines::new();
+        let mut rec: Reconciler<animus_sim::SimEnv, MemoryEngine> = Reconciler::new(
+            sim.env(base()),
+            engines.clone(),
+            base(),
+            |_t, _n| {},
+            |_t| {},
+        );
+        let mut t = tablet(1, b"", None, replicas);
+        t.epoch = epoch;
+        futures::executor::block_on(rec.tick(&view([(1, t)])));
+        let node = rec
+            .hosted
+            .remove(&TabletId(1))
+            .expect("tablet 1 hosted by the tick");
+        (sim, rec, engines, node)
+    }
+
+    /// The bug: a planned `Release` whose replica is a member again by the
+    /// time the driver has stopped must keep its files and clear the claim
+    /// (so the next tick's `Host` re-adopts the intact disk), not erase.
+    #[test]
+    fn a_planned_release_of_a_replica_that_is_a_member_again_keeps_its_files() {
+        // A single-voter formation: this node is in its own `config()`.
+        let (_sim, mut rec, engines, node) = hosted_for_teardown(vec![base()], Epoch::INITIAL);
+        assert!(!Reconciler::<animus_sim::SimEnv, MemoryEngine>::node_excludes_me(&node, &base()));
+        futures::executor::block_on(rec.finish_teardown(TabletId(1), node, true));
+        assert!(
+            futures::executor::block_on(engines.probe(TabletId(1))),
+            "a member replica's files must survive a stale release"
+        );
+        assert!(
+            !rec.local_state().hosted.contains(&TabletId(1)),
+            "the claim is cleared so the next `Host` recovers from the intact disk"
+        );
+    }
+
+    /// The same live member is erased by a `Reclaim` (dropped table): the
+    /// recheck is release-only.
+    #[test]
+    fn a_reclaim_erases_regardless_of_membership() {
+        let (_sim, mut rec, engines, node) = hosted_for_teardown(vec![base()], Epoch::INITIAL);
+        futures::executor::block_on(rec.finish_teardown(TabletId(1), node, false));
+        assert!(!futures::executor::block_on(engines.probe(TabletId(1))));
+    }
+
+    /// A genuinely removed replica (not a voter, not a learner) is still
+    /// erased by a release — the legitimate path must not regress.
+    #[test]
+    fn a_planned_release_of_a_removed_replica_still_erases() {
+        // Hosted as a joiner (this node in the replica set at a bumped epoch:
+        // a quiet non-voter whose own Raft config lacks it, no learner entry).
+        let (_sim, mut rec, engines, node) = hosted_for_teardown(vec![base(), nid(301)], Epoch(3));
+        assert!(
+            Reconciler::<animus_sim::SimEnv, MemoryEngine>::node_excludes_me(&node, &base()),
+            "a quiet joiner is neither voter nor learner yet"
+        );
+        futures::executor::block_on(rec.finish_teardown(TabletId(1), node, true));
+        assert!(!futures::executor::block_on(engines.probe(TabletId(1))));
     }
 
     #[test]
