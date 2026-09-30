@@ -96,22 +96,22 @@ this file does not keep a feature changelog. For what is *not* implemented yet, 
 
 **Upgrade compatibility (ADR 0073, Accepted 2026-09-27): a staged ratchet, not
 a blanket "no back-compat" any more.** Phase 0 — the last permitted
-incompatible reset, currently in progress — gives every persisted/wire format
-a version tag and a golden fixture; version counters restart at 1 and
-pre-baseline legacy-compat fields are dropped. From the baseline (the merge
-commit where Phase 0's last workstream lands, recorded in ADR 0073) on:
+incompatible reset (every persisted/wire format gained a version tag and a
+golden fixture; version counters restarted at 1) — is **done, and the
+baseline is set: `9a9f972f` (2026-09-29, see ADR 0073)**. From it on:
 **durable formats must be compatible** — a newer binary reads everything an
 older post-baseline binary wrote, an existing golden fixture is never edited
 or deleted (`scripts/check-format-fixtures.sh` enforces this in CI), and a
 format change is a new version tag plus a new fixture, never a rewrite of an
 old one. **Wire formats** join the same rule once Phase 2 (a replicated
 cluster version / feature gate) lands; **rolling upgrades** once Phase 3
-lands. Before the baseline, and for anything Phase 0 hasn't reached yet,
-formats may still change freely. See ADR 0073 for the full phase plan, the
-Phase 0 conventions (tag shape, fixture layout, workstreams), and the open
-questions (support window length, the hash-ring/key-encoding layer). A break
-that can't be made compatible once its phase applies still needs an explicit
-ADR amendment naming it and its migration path.
+lands; Phase 1 (real N-1 decode paths, backups/PITR first) is next, and until
+it lands the "decoder still accepts older versions" half is enforced by
+review. Wire changes stay free until Phase 2. See ADR 0073 for the phase
+plan, the conventions (tag shape, fixture layout), and the open questions
+(support window length, the hash-ring/key-encoding layer). A break that
+can't be made compatible needs an explicit ADR amendment naming it and its
+migration path.
 
 ## Per-crate guides
 
