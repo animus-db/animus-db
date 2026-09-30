@@ -1,0 +1,1 @@
+{"backup_id":"b1","source_table":"orders","target_table":"restored","tablet":10,"gsi_defs":[],"pitr":null,"status":"Seeding"}
