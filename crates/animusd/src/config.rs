@@ -385,7 +385,10 @@ impl std::error::Error for ConfigError {}
 pub struct ClusterConfig {
     /// Format version (ADR 0073 Phase 0, Workstream E), serialized as `"v"`.
     /// **Required**: no serde default, so a config without it never
-    /// deserializes through plain serde; [`ClusterConfig::from_json`] checks
+    /// deserializes through plain serde (P1-C decision: unlike `Metadata`,
+    /// this stays required — the config is only ever a standalone document,
+    /// never nested in a versioned envelope, and the checked-in fixture
+    /// carries `"v"`, so nothing needs an untagged read); [`ClusterConfig::from_json`] checks
     /// it first and reports [`FormatError::PreBaselineFormat`] /
     /// [`FormatError::UnsupportedFormatVersion`] by name.
     #[serde(rename = "v")]
@@ -591,27 +594,28 @@ impl ClusterConfig {
     pub fn from_json(text: &str) -> Result<Self, ConfigError> {
         let value: serde_json::Value =
             serde_json::from_str(text).map_err(|e| ConfigError::Invalid(e.to_string()))?;
-        match value.get("v") {
+        let cfg: Self = match value.get("v") {
             None => {
                 return Err(ConfigError::Format(FormatError::PreBaselineFormat {
                     format: CLUSTER_CONFIG_FORMAT,
                 }));
             }
-            Some(v) => {
-                // A non-integer / out-of-range `"v"` is reported as
-                // version 0-or-huge: clamp to u8 range for the shared error.
-                let found = v.as_u64().unwrap_or(0);
-                if found == 0 || found > u64::from(CLUSTER_CONFIG_VERSION) {
+            // Per-version dispatch (ADR 0073 Phase 1 design): a `match` on
+            // the peeked `"v"`, not a range gate. A v2 moves the
+            // current-type arm to `2` and puts a frozen `legacy::v1`
+            // decoder (+ `From`) on `1`. A non-integer `"v"` reads as 0.
+            Some(v) => match v.as_u64().unwrap_or(0) {
+                1 => serde_json::from_value(value)
+                    .map_err(|e| ConfigError::Invalid(e.to_string()))?,
+                found => {
                     return Err(ConfigError::Format(FormatError::UnsupportedFormatVersion {
                         format: CLUSTER_CONFIG_FORMAT,
                         found: u8::try_from(found).unwrap_or(u8::MAX),
                         max_supported: CLUSTER_CONFIG_VERSION as u8,
                     }));
                 }
-            }
-        }
-        let cfg: Self =
-            serde_json::from_value(value).map_err(|e| ConfigError::Invalid(e.to_string()))?;
+            },
+        };
         let mut seen = std::collections::BTreeSet::new();
         for n in &cfg.nodes {
             if !seen.insert(n.id.clone()) {

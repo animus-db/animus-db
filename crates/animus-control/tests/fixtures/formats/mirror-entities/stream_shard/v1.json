@@ -1,0 +1,1 @@
+{"table":"orders","label":"L1","view_type":"NewAndOldImages","hlc_range":[0,100],"count":7,"seal_wall_ms":1700000000000,"replicas":["n1","n2"],"object_id":"orders/L1/1/0/obj","expired":false}

@@ -2114,11 +2114,8 @@ pub fn encode_syskv_image_bytes(entries: &[SyskvImageEntry]) -> Vec<u8> {
 /// [`encode_syskv_image_bytes`]'s own doc for why this is exposed.
 #[doc(hidden)]
 pub fn decode_syskv_image_bytes(bytes: &[u8]) -> Result<Vec<SyskvImageEntry>, FormatError> {
-    let (_version, payload) = format::unwrap(&CONTROL_SNAPSHOT, bytes)?;
-    serde_json::from_slice(payload).map_err(|e| FormatError::Malformed {
-        format: CONTROL_SNAPSHOT.name,
-        detail: e.to_string(),
-    })
+    let (version, payload) = format::unwrap(&CONTROL_SNAPSHOT, bytes)?;
+    crate::persist::dispatch::snapshot_body(version, payload)
 }
 
 /// Build the system-keyspace image shipped to a lagging follower via

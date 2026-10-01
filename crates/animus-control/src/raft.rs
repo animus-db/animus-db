@@ -4470,12 +4470,10 @@ where
             // snapshot (or a pre-baseline/unsupported-version tag — loud, named,
             // logged below rather than silently misread) would be a leader bug;
             // drop + re-request rather than install garbage.
-            let decoded = format::unwrap(&CONTROL_SNAPSHOT, &inc.buf).and_then(|(_, payload)| {
-                serde_json::from_slice::<S>(payload).map_err(|e| format::FormatError::Malformed {
-                    format: CONTROL_SNAPSHOT.name,
-                    detail: e.to_string(),
-                })
-            });
+            let decoded =
+                format::unwrap(&CONTROL_SNAPSHOT, &inc.buf).and_then(|(version, payload)| {
+                    crate::persist::dispatch::snapshot_body::<S>(version, payload)
+                });
             match decoded {
                 Ok(state) => {
                     self.metadata = state;

@@ -1,0 +1,1 @@
+{"table":"orders","generation":1,"hlc_range":[0,100],"count":7,"seal_wall_ms":1700000000200,"replicas":["n1","n2"],"object_id":"backup/pitr/orders/1/0/obj","expired":false}

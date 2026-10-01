@@ -35,15 +35,9 @@
 //! covers, added by workstream B PR 3** — a `serde_json` "top-level `\"v\"`
 //! field" format per the ADR's Phase 0 conventions, not a binary/line
 //! envelope, so it has no `format::wrap`/`encode_line` tag to check; its own
-//! decode path is [`Metadata::from_json`]. **No separate `syskv-mirror`
-//! fixture exists** — the system-keyspace mirror's own format-version row
-//! (`mirror::SYSKV_FORMAT_VERSION_COUNTER`) is mirror-internal bookkeeping
-//! that never rides a `Metadata` value at all (`Metadata` is `DRIVER_APPLIED`
-//! — see `crates/animus-control/CLAUDE.md`'s "Versioned formats" section),
-//! and it already has direct unit-test coverage in `mirror.rs`'s own test
-//! module; the `control-snapshot` fixture above already covers a real
-//! system-keyspace image's on-the-wire bytes structurally, which is as close
-//! as that mirror-internal row gets to a "fixture" of its own.
+//! decode path is [`Metadata::from_json`]. The system-keyspace mirror's own
+//! value fixtures (`mirror-entities`, `mirror-version`, ADR 0073 Phase 1
+//! P1-C) live at the bottom of this file.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -381,47 +375,83 @@ fn metadata_fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/formats/metadata")
 }
 
-/// Iterates every file under `tests/fixtures/formats/metadata/` (never
-/// naming `v1` literally, per the ADR 0073 Phase 0 conventions — a future
-/// version's own fixture needs no test-code change) and asserts each
-/// decodes, structurally, to the exact expected value for its version.
+/// Iterates every file under `tests/fixtures/formats/metadata/` and asserts
+/// each decodes, via the version-dispatching [`Metadata::from_json`], to its
+/// own per-version expected value (ADR 0073 Phase 1). The version comes from
+/// the `vN.json` file name and must agree with the document's own `"v"`; an
+/// unrecognised version panics, so a new fixture forces a new expectation.
 #[test]
-fn decodes_every_checked_in_metadata_fixture_structurally() {
+fn decodes_every_checked_in_metadata_fixture_to_its_per_version_value() {
     let dir = metadata_fixtures_dir();
-    let mut checked = 0usize;
+    let mut seen = Vec::new();
     let entries = std::fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("reading fixtures dir {}: {e}", dir.display()));
     for entry in entries {
-        let entry = entry.expect("readable dir entry");
-        let path = entry.path();
+        let path = entry.expect("readable dir entry").path();
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or_default()
             .to_string();
+        let version: u32 = name
+            .strip_prefix('v')
+            .and_then(|r| r.strip_suffix(".json"))
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("{name}: fixture name is not vN.json"));
         let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("reading {name}: {e}"));
-        match name.as_str() {
-            "v1.json" => {
-                let decoded = Metadata::from_json(&bytes)
-                    .unwrap_or_else(|e| panic!("{name} failed to decode: {e}"));
-                assert_eq!(
-                    decoded,
-                    v1_metadata(),
-                    "{name} decoded to an unexpected value"
-                );
-                checked += 1;
-            }
+        let decoded =
+            Metadata::from_json(&bytes).unwrap_or_else(|e| panic!("{name} failed to decode: {e}"));
+        assert_eq!(decoded.version, version, "{name}: file name vs decoded v");
+        let expected = match version {
+            1 => v1_metadata(),
             other => panic!(
-                "unrecognized metadata fixture {other:?} — add a matching expected-value \
-                 arm to this test before adding the fixture file"
+                "{name}: no expected value for metadata v{other}; add a match arm (and a \
+                 frozen legacy decoder) before adding the fixture file"
             ),
-        }
+        };
+        assert_eq!(decoded, expected, "{name} decoded to an unexpected value");
+        seen.push(version);
     }
     assert!(
-        checked > 0,
-        "no metadata fixtures found under {}",
+        !seen.is_empty(),
+        "no metadata fixtures under {}",
         dir.display()
     );
+    assert!(
+        seen.contains(&animus_control::meta::METADATA_VERSION),
+        "no fixture for the current METADATA_VERSION: {seen:?}"
+    );
+}
+
+/// `from_json` dispatches on the peeked version: `0` and future versions are
+/// refused by name, a missing `"v"` is pre-baseline; plain serde (the
+/// nested-in-an-envelope path) still reads a `"v"`-less document as v1, which
+/// the frozen `control-wal`/`shared-wal` fixtures depend on.
+#[test]
+fn metadata_from_json_refuses_unknown_versions_and_serde_defaults_missing_v() {
+    use animus_control::format::FormatError;
+    let mut value = serde_json::to_value(v1_metadata()).unwrap();
+    for bad in [0u8, 2, 99] {
+        value["v"] = bad.into();
+        let err = Metadata::from_json(value.to_string().as_bytes()).unwrap_err();
+        assert_eq!(
+            err,
+            FormatError::UnsupportedFormatVersion {
+                format: "metadata",
+                found: bad,
+                max_supported: 1
+            },
+            "v={bad}"
+        );
+    }
+    value.as_object_mut().unwrap().remove("v");
+    let bytes = value.to_string().into_bytes();
+    assert!(matches!(
+        Metadata::from_json(&bytes),
+        Err(FormatError::PreBaselineFormat { .. })
+    ));
+    let nested: Metadata = serde_json::from_slice(&bytes).expect("serde defaults v to 1");
+    assert_eq!(nested, v1_metadata());
 }
 
 /// Encoding the same representative value with the *current* code and
@@ -626,4 +656,740 @@ fn generate_fixture_shared_wal() {
     }
     let bytes = encode_shared_wal(&v1_shared_wal_lines());
     std::fs::write(&path, &bytes).unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
+}
+
+// ---------------------------------------------------------------------------
+// `mirror-entities` / `mirror-version` — the system-keyspace mirror's VALUE
+// encodings (ADR 0073 Phase 1 workstream P1-C, layer 3).
+//
+// The mirror is `DRIVER_APPLIED` (ADR 0038): its per-entity values and its
+// format-version row are the control plane's real durable state, and none of
+// it is covered by the `metadata` fixture above (which versions
+// `Metadata`'s own JSON, a shape that never reaches disk on the real path).
+//
+// Layout: `formats/mirror-entities/<EntityKind::as_str()>/v<N>.<ext>` holds
+// exactly the value bytes the mirror encoder wrote for one representative
+// entity of that kind (the key is re-derived from the real `syskv` key
+// helpers, so the fixture stays honest about the key shape without
+// duplicating it); `formats/mirror-version/v<N>.bin` holds the value bytes
+// of the `SYSKV_FORMAT_VERSION_COUNTER` row. Every fixture decodes through
+// the real mirror read path (`apply_key_write` / `rebuild_metadata_from_
+// engine`) to a hand-derived expected value, selected by the `vN` in its
+// file name; an unrecognised version panics so a new fixture forces a new
+// arm.
+
+use animus_control::mirror::{
+    self, KeyWrite, NEXT_TABLET_ID_COUNTER, SYSKV_MIRROR_VERSION, apply_and_derive_mirror,
+    apply_key_write, rebuild_metadata_from_engine,
+};
+use animus_control::syskv::{self, DecodedKey, EntityKind};
+use animus_control::{
+    ExportFormat, ExportType, InputCompressionType, InputFormat, NodeAddrs, OpClass, Policy,
+    SecretKey, TableMatch,
+};
+use animus_storage::{MemoryEngine, MergeOp, StorageEngine};
+
+/// Every [`EntityKind`]. The exhaustive `match` in [`kind_witness`] makes a
+/// new variant a compile error there, and the scenario/fixture-directory
+/// tests below fail until this list, [`v1_entity`], and a checked-in fixture
+/// directory all cover it.
+const ALL_KINDS: [EntityKind; 18] = [
+    EntityKind::Tablet,
+    EntityKind::Member,
+    EntityKind::Schema,
+    EntityKind::Policy,
+    EntityKind::NodeAddrs,
+    EntityKind::Counter,
+    EntityKind::StreamShard,
+    EntityKind::IndexBackfill,
+    EntityKind::SplitLineage,
+    EntityKind::SplitPlacing,
+    EntityKind::Backup,
+    EntityKind::BackupProgress,
+    EntityKind::Restore,
+    EntityKind::PitrSegment,
+    EntityKind::PitrBaseBackup,
+    EntityKind::Credential,
+    EntityKind::Export,
+    EntityKind::Import,
+];
+
+/// Exhaustive over [`EntityKind`] (no wildcard).
+fn kind_witness(kind: EntityKind) -> usize {
+    match kind {
+        EntityKind::Tablet => 0,
+        EntityKind::Member => 1,
+        EntityKind::Schema => 2,
+        EntityKind::Policy => 3,
+        EntityKind::NodeAddrs => 4,
+        EntityKind::Counter => 5,
+        EntityKind::StreamShard => 6,
+        EntityKind::IndexBackfill => 7,
+        EntityKind::SplitLineage => 8,
+        EntityKind::SplitPlacing => 9,
+        EntityKind::Backup => 10,
+        EntityKind::BackupProgress => 11,
+        EntityKind::Restore => 12,
+        EntityKind::PitrSegment => 13,
+        EntityKind::PitrBaseBackup => 14,
+        EntityKind::Credential => 15,
+        EntityKind::Export => 16,
+        EntityKind::Import => 17,
+    }
+}
+
+fn mirror_entities_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/formats/mirror-entities")
+}
+
+fn mirror_version_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/formats/mirror-version")
+}
+
+type Live = BTreeMap<Vec<u8>, Vec<u8>>;
+
+fn run_mirror(meta: &mut Metadata, live: &mut Live, command: MetaCommand) {
+    let (outcome, writes) = apply_and_derive_mirror(meta, &command);
+    assert_eq!(
+        outcome,
+        ApplyOutcome::Applied,
+        "fixture premise: {command:?} applies cleanly"
+    );
+    for w in writes {
+        match w {
+            KeyWrite::Put(k, v) => {
+                live.insert(k, v);
+            }
+            KeyWrite::Delete(k) => {
+                live.remove(&k);
+            }
+        }
+    }
+}
+
+/// The `Metadata` a fixed, fully-deterministic command script produces, plus
+/// the final (last-write-wins) system-keyspace value bytes the real mirror
+/// encoder derived along the way. Every `EntityKind` ends up with at least
+/// one live row (asserted by the callers).
+fn v1_mirror_scenario() -> (Metadata, Live) {
+    let mut meta = Metadata::default();
+    let mut live = Live::new();
+    let (m, l) = (&mut meta, &mut live);
+    let labels = BTreeMap::from([("region".to_string(), "eu-west".to_string())]);
+    for n in [1, 2] {
+        run_mirror(
+            m,
+            l,
+            MetaCommand::UpsertMember {
+                node: nid(n),
+                labels: labels.clone(),
+                status: NodeStatus::Active,
+            },
+        );
+    }
+    run_mirror(
+        m,
+        l,
+        MetaCommand::RegisterNodeAddrs {
+            node: nid(1),
+            addrs: NodeAddrs {
+                internal: "10.0.0.1:7001".to_string(),
+                client: "10.0.0.1:8001".to_string(),
+                admin: "10.0.0.1:9001".to_string(),
+                intra: "10.0.0.1:7501".to_string(),
+                role: "combined".to_string(),
+            },
+        },
+    );
+    run_mirror(
+        m,
+        l,
+        MetaCommand::CreateTableSchema {
+            table: "orders".to_string(),
+            schema: TableSchema::simple("id", ColumnType::String),
+        },
+    );
+    run_mirror(
+        m,
+        l,
+        MetaCommand::CreateTableIndex {
+            table: "orders".to_string(),
+            index: animus_control::IndexDef {
+                name: "by_email".to_string(),
+                kind: animus_control::IndexKind::Global,
+                hash_attribute: "email".to_string(),
+                sort_attribute: None,
+                projection: animus_control::IndexProjection::All,
+                status: animus_control::IndexStatus::Creating,
+                hash_attribute_type: None,
+                sort_attribute_type: None,
+            },
+        },
+    );
+    run_mirror(
+        m,
+        l,
+        MetaCommand::CreateTablet {
+            tablet: TabletId(1),
+            table: Some("orders".to_string()),
+            range: KeyRange::whole(),
+            replicas: vec![nid(1), nid(2)],
+        },
+    );
+    run_mirror(
+        m,
+        l,
+        MetaCommand::SetTabletPolicy {
+            tablet: TabletId(1),
+            policy: Some(PlacementPolicy::simple("p", 2)),
+        },
+    );
+    run_mirror(
+        m,
+        l,
+        MetaCommand::MarkIndexBackfilled {
+            table: "orders".to_string(),
+            index: "by_email".to_string(),
+            tablet: TabletId(1),
+        },
+    );
+    run_mirror(
+        m,
+        l,
+        MetaCommand::SetTableStream {
+            table: "orders".to_string(),
+            spec: Some(animus_control::StreamSpec {
+                view_type: animus_control::StreamViewType::NewAndOldImages,
+                label: "L1".to_string(),
+            }),
+        },
+    );
+    run_mirror(
+        m,
+        l,
+        MetaCommand::SealStreamShard {
+            table: "orders".to_string(),
+            label: "L1".to_string(),
+            tablet: TabletId(1),
+            epoch: 0,
+            view_type: animus_control::StreamViewType::NewAndOldImages,
+            hlc_range: (0, 100),
+            count: 7,
+            seal_wall_ms: 1_700_000_000_000,
+            replicas: vec![nid(1), nid(2)],
+            object_id: "orders/L1/1/0/obj".to_string(),
+        },
+    );
+    run_mirror(
+        m,
+        l,
+        MetaCommand::UpdateContinuousBackups {
+            table: "orders".to_string(),
+            enabled: true,
+            wall_ms: 1_700_000_000_100,
+        },
+    );
+    run_mirror(
+        m,
+        l,
+        MetaCommand::SealPitrSegment {
+            table: "orders".to_string(),
+            generation: 1,
+            tablet: TabletId(1),
+            epoch: 0,
+            hlc_range: (0, 100),
+            count: 7,
+            seal_wall_ms: 1_700_000_000_200,
+            replicas: vec![nid(1), nid(2)],
+            object_id: "backup/pitr/orders/1/0/obj".to_string(),
+        },
+    );
+    run_mirror(
+        m,
+        l,
+        MetaCommand::BeginBackup {
+            backup_id: "b1".to_string(),
+            table: "orders".to_string(),
+            created_wall_ms: 1_700_000_000_300,
+            backup_name: "nightly".to_string(),
+            pitr_base: true,
+        },
+    );
+    run_mirror(
+        m,
+        l,
+        MetaCommand::RecordBackupTabletComplete {
+            backup_id: "b1".to_string(),
+            tablet: TabletId(1),
+            cut_version: 42,
+            bytes: 4096,
+            chunk_count: 2,
+        },
+    );
+    run_mirror(
+        m,
+        l,
+        MetaCommand::PutCredential {
+            id: "AKID1".to_string(),
+            secret: SecretKey::new("s3cr3t"),
+            policy: Policy {
+                tables: TableMatch::Names(BTreeSet::from(["orders".to_string()])),
+                ops: BTreeSet::from([OpClass::Read]),
+            },
+            enabled: true,
+            now: 1_000,
+        },
+    );
+    run_mirror(
+        m,
+        l,
+        MetaCommand::BeginExport {
+            export_id: "e1".to_string(),
+            table: "orders".to_string(),
+            table_arn: "arn:aws:dynamodb:animus:0:table/orders".to_string(),
+            s3_bucket: "bucket".to_string(),
+            s3_prefix: Some("exports/".to_string()),
+            format: ExportFormat::DynamoDbJson,
+            export_type: ExportType::Full,
+            export_time_ms: None,
+            client_token: Some("tok-e1".to_string()),
+            created_wall_ms: 1_700_000_000_400,
+        },
+    );
+    run_mirror(
+        m,
+        l,
+        MetaCommand::CreateTableSchema {
+            table: "restored".to_string(),
+            schema: TableSchema::simple("id", ColumnType::String),
+        },
+    );
+    run_mirror(
+        m,
+        l,
+        MetaCommand::BeginRestore {
+            restore_id: "r1".to_string(),
+            backup_id: "b1".to_string(),
+            source_table: "orders".to_string(),
+            target_table: "restored".to_string(),
+            tablet: TabletId(10),
+            replicas: vec![nid(1)],
+            gsi_defs: Vec::new(),
+            pitr: None,
+        },
+    );
+    run_mirror(
+        m,
+        l,
+        MetaCommand::CreateTableSchema {
+            table: "imported".to_string(),
+            schema: TableSchema::simple("id", ColumnType::String),
+        },
+    );
+    run_mirror(
+        m,
+        l,
+        MetaCommand::BeginImport {
+            import_id: "i1".to_string(),
+            target_table: "imported".to_string(),
+            target_table_arn: "arn:aws:dynamodb:animus:0:table/imported".to_string(),
+            table_id: "table-id-1".to_string(),
+            s3_bucket: "bucket".to_string(),
+            s3_prefix: None,
+            input_format: InputFormat::DynamoDbJson,
+            input_compression: InputCompressionType::Gzip,
+            base_schema: Box::new(TableSchema::simple("id", ColumnType::String)),
+            key_types: vec![("id".to_string(), "S".to_string())],
+            gsi_defs: Vec::new(),
+            throughput: None,
+            tablet: TabletId(11),
+            replicas: vec![nid(1)],
+            client_token: None,
+            created_wall_ms: 1_700_000_000_500,
+        },
+    );
+    // In-place split of tablet 1 into children 12 and 13. The children's
+    // replica sets deliberately do not satisfy the RF-2 policy, so cutover
+    // also writes a directed-Placing row.
+    let epoch = m.tablets[&TabletId(1)].epoch;
+    run_mirror(
+        m,
+        l,
+        MetaCommand::BeginSplitInPlace {
+            parent: TabletId(1),
+            expected_epoch: epoch,
+            split_key: vec![0x80, 0, 0, 0, 0, 0, 0, 0],
+            children: [(TabletId(12), vec![nid(1)]), (TabletId(13), vec![nid(1)])],
+        },
+    );
+    let epoch = m.tablets[&TabletId(1)].epoch;
+    run_mirror(
+        m,
+        l,
+        MetaCommand::CutoverSplit {
+            parent: TabletId(1),
+            expected_epoch: epoch,
+            cutover_wall_ms: 1_700_000_000_600,
+        },
+    );
+    (meta, live)
+}
+
+/// For one [`EntityKind`]: the representative entity's system-keyspace key,
+/// and the `Metadata` that decoding exactly that one row onto an empty
+/// `Metadata` must produce (the expected value, derived from the scenario's
+/// authoritative state — not from the fixture bytes under test). Exhaustive
+/// over [`EntityKind`].
+fn v1_entity(kind: EntityKind, full: &Metadata) -> (Vec<u8>, Metadata) {
+    let mut m = Metadata::default();
+    let key = match kind {
+        EntityKind::Tablet => {
+            let id = TabletId(12);
+            m.tablets.insert(id, full.tablets[&id].clone());
+            syskv::tablet_key(id)
+        }
+        EntityKind::Member => {
+            m.members.insert(nid(1), full.members[&nid(1)].clone());
+            syskv::member_key(&nid(1))
+        }
+        EntityKind::Schema => {
+            // `SchemaCatalog::insert` is crate-private; the public path in is
+            // the replicated command.
+            assert_eq!(
+                m.apply(&MetaCommand::CreateTableSchema {
+                    table: "orders".to_string(),
+                    schema: full.schemas.get("orders").unwrap().clone(),
+                }),
+                ApplyOutcome::Applied
+            );
+            syskv::schema_key("orders")
+        }
+        EntityKind::Policy => {
+            let id = TabletId(12);
+            m.policies.insert(id, full.policies[&id].clone());
+            syskv::policy_key(id)
+        }
+        EntityKind::NodeAddrs => {
+            m.node_addrs
+                .insert(nid(1), full.node_addrs[&nid(1)].clone());
+            syskv::node_addrs_key(&nid(1))
+        }
+        EntityKind::Counter => {
+            m.next_tablet_id = full.next_tablet_id;
+            syskv::counter_key(NEXT_TABLET_ID_COUNTER)
+        }
+        EntityKind::StreamShard => {
+            let id = (TabletId(1), 0);
+            m.stream_shards.insert(id, full.stream_shards[&id].clone());
+            syskv::stream_shard_key(id.0, id.1)
+        }
+        EntityKind::IndexBackfill => {
+            m.index_backfill
+                .insert((TabletId(1), "by_email".to_string()), ());
+            syskv::index_backfill_key(TabletId(1), "by_email")
+        }
+        EntityKind::SplitLineage => {
+            let id = TabletId(12);
+            m.split_lineage.insert(id, full.split_lineage[&id]);
+            syskv::split_lineage_key(id)
+        }
+        EntityKind::SplitPlacing => {
+            let id = *full
+                .split_placing
+                .keys()
+                .next()
+                .expect("scenario premise: cutover wrote a directed-Placing row");
+            m.split_placing.insert(id, full.split_placing[&id].clone());
+            syskv::split_placing_key(id)
+        }
+        EntityKind::Backup => {
+            m.backups
+                .insert("b1".to_string(), full.backups["b1"].clone());
+            syskv::backup_key("b1")
+        }
+        EntityKind::BackupProgress => {
+            let id = ("b1".to_string(), TabletId(1));
+            m.backup_tablet_progress
+                .insert(id.clone(), full.backup_tablet_progress[&id]);
+            syskv::backup_progress_key("b1", TabletId(1))
+        }
+        EntityKind::Restore => {
+            m.restores
+                .insert("r1".to_string(), full.restores["r1"].clone());
+            syskv::restore_key("r1")
+        }
+        EntityKind::PitrSegment => {
+            let id = (TabletId(1), 0);
+            m.pitr_segments.insert(id, full.pitr_segments[&id].clone());
+            syskv::pitr_segment_key(id.0, id.1)
+        }
+        EntityKind::PitrBaseBackup => {
+            m.pitr_base_backups.insert("b1".to_string());
+            syskv::pitr_base_backup_key("b1")
+        }
+        EntityKind::Credential => {
+            m.credentials
+                .insert("AKID1".to_string(), full.credentials["AKID1"].clone());
+            syskv::credential_key("AKID1")
+        }
+        EntityKind::Export => {
+            m.exports
+                .insert("e1".to_string(), full.exports["e1"].clone());
+            syskv::export_key("e1")
+        }
+        EntityKind::Import => {
+            m.imports
+                .insert("i1".to_string(), full.imports["i1"].clone());
+            syskv::import_key("i1")
+        }
+    };
+    (key, m)
+}
+
+/// Fixture extension per kind: JSON-valued kinds are `.json`; the kinds
+/// whose value is not JSON (an 8-byte big-endian counter, an always-empty
+/// presence marker) are `.bin`.
+fn entity_ext(kind: EntityKind) -> &'static str {
+    match kind {
+        EntityKind::Counter | EntityKind::PitrBaseBackup | EntityKind::IndexBackfill => "bin",
+        _ => "json",
+    }
+}
+
+/// Parse `v<N>` out of a fixture file name (`v1.json` -> `1`).
+fn fixture_version(path: &Path) -> u32 {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_else(|| panic!("fixture {} has no file stem", path.display()));
+    stem.strip_prefix('v')
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("fixture {} is not named v<N>.<ext>", path.display()))
+}
+
+fn fixture_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("reading fixtures dir {}: {e}", dir.display()))
+        .map(|e| e.expect("readable dir entry").path())
+        .collect();
+    files.sort();
+    files
+}
+
+/// The scenario itself must exercise every kind — otherwise a kind could be
+/// "covered" by a fixture the real encoder never actually produces.
+#[test]
+fn mirror_scenario_produces_a_live_row_of_every_entity_kind() {
+    let (full, live) = v1_mirror_scenario();
+    let mut seen: BTreeSet<usize> = BTreeSet::new();
+    for kind in ALL_KINDS {
+        assert!(seen.insert(kind_witness(kind)), "{kind:?} listed twice");
+        let (key, _) = v1_entity(kind, &full);
+        assert!(
+            live.contains_key(&key),
+            "scenario produced no live mirror row for {kind:?}"
+        );
+        match syskv::decode_key(&key) {
+            Some(DecodedKey::Entity { kind: k, .. }) => assert_eq!(k, kind),
+            other => panic!("{kind:?} key decodes to {other:?}"),
+        }
+    }
+    assert_eq!(seen.len(), 18, "ALL_KINDS must list every EntityKind");
+    // Any kind the scenario writes but ALL_KINDS forgot is caught here too.
+    for key in live.keys() {
+        if let Some(DecodedKey::Entity { kind, .. }) = syskv::decode_key(key) {
+            assert!(ALL_KINDS.contains(&kind), "{kind:?} missing from ALL_KINDS");
+        }
+    }
+}
+
+/// Every `EntityKind` has a fixture directory, and that directory holds a
+/// fixture for the current mirror version.
+#[test]
+fn every_entity_kind_has_a_fixture_for_the_current_version() {
+    for kind in ALL_KINDS {
+        let dir = mirror_entities_root().join(kind.as_str());
+        assert!(
+            dir.is_dir(),
+            "EntityKind::{kind:?} has no fixture directory {} — add one (ADR 0073)",
+            dir.display()
+        );
+        let versions: Vec<u32> = fixture_files(&dir)
+            .iter()
+            .map(|p| fixture_version(p))
+            .collect();
+        assert!(
+            versions.contains(&SYSKV_MIRROR_VERSION),
+            "{kind:?} has no fixture for the current mirror version v{SYSKV_MIRROR_VERSION}"
+        );
+    }
+    // And no stray directory for a kind that does not exist.
+    for entry in fixture_files(&mirror_entities_root()) {
+        let name = entry.file_name().unwrap().to_str().unwrap().to_string();
+        assert!(
+            ALL_KINDS.iter().any(|k| k.as_str() == name),
+            "unrecognized mirror-entities directory {name:?}"
+        );
+    }
+}
+
+/// Every checked-in entity fixture decodes, through the real mirror read
+/// path, to the expected value for its version.
+#[test]
+fn decodes_every_checked_in_mirror_entity_fixture_structurally() {
+    let (full, _) = v1_mirror_scenario();
+    let mut checked = 0usize;
+    for kind in ALL_KINDS {
+        let dir = mirror_entities_root().join(kind.as_str());
+        for path in fixture_files(&dir) {
+            let version = fixture_version(&path);
+            let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            match version {
+                1 => {
+                    let (key, expected) = v1_entity(kind, &full);
+                    let mut decoded = Metadata::default();
+                    apply_key_write(&mut decoded, &KeyWrite::Put(key, bytes));
+                    assert_eq!(
+                        decoded,
+                        expected,
+                        "{} decoded to an unexpected value",
+                        path.display()
+                    );
+                    checked += 1;
+                }
+                other => panic!(
+                    "unrecognized mirror-entities fixture version v{other} ({}) — add a \
+                     matching expected-value arm",
+                    path.display()
+                ),
+            }
+        }
+    }
+    assert!(
+        checked >= ALL_KINDS.len(),
+        "too few fixtures checked: {checked}"
+    );
+}
+
+/// The current encoder's bytes decode (through the same path) to the same
+/// value the checked-in v1 fixture does — an encoder/decoder asymmetry check.
+#[test]
+fn mirror_entities_round_trip_through_encode_and_decode() {
+    let (full, live) = v1_mirror_scenario();
+    for kind in ALL_KINDS {
+        let (key, expected) = v1_entity(kind, &full);
+        let mut decoded = Metadata::default();
+        apply_key_write(
+            &mut decoded,
+            &KeyWrite::Put(key.clone(), live[&key].clone()),
+        );
+        assert_eq!(decoded, expected, "{kind:?} round trip");
+    }
+}
+
+/// Regenerates the `mirror-entities/<kind>/v<SYSKV_MIRROR_VERSION>.<ext>`
+/// fixtures from the real mirror encoder. Run explicitly:
+/// `cargo test -p animus-control --test format_fixtures generate_fixture_mirror_entities -- --ignored`.
+/// Refuses to overwrite an existing fixture.
+#[test]
+#[ignore]
+fn generate_fixture_mirror_entities() {
+    let (full, live) = v1_mirror_scenario();
+    for kind in ALL_KINDS {
+        let (key, _) = v1_entity(kind, &full);
+        let dir = mirror_entities_root().join(kind.as_str());
+        std::fs::create_dir_all(&dir).expect("create fixtures dir");
+        let path = dir.join(format!("v{SYSKV_MIRROR_VERSION}.{}", entity_ext(kind)));
+        if std::fs::metadata(&path).is_ok() {
+            panic!(
+                "{} already exists — a checked-in fixture is never regenerated in place; \
+                 bump SYSKV_MIRROR_VERSION and add a new fixture file instead",
+                path.display()
+            );
+        }
+        std::fs::write(&path, &live[&key])
+            .unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
+    }
+}
+
+/// Every checked-in `mirror-version` fixture (the bytes of the
+/// `SYSKV_FORMAT_VERSION_COUNTER` row's value) is the version named by its
+/// own file name, and an engine holding that row plus a real entity row
+/// rebuilds cleanly through `rebuild_metadata_from_engine`.
+#[tokio::test]
+async fn decodes_every_checked_in_mirror_version_fixture_structurally() {
+    let (full, live) = v1_mirror_scenario();
+    let (member_key, member_expected) = v1_entity(EntityKind::Member, &full);
+    let mut versions = Vec::new();
+    for path in fixture_files(&mirror_version_dir()) {
+        let version = fixture_version(&path);
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        match version {
+            1 => {
+                assert_eq!(
+                    bytes,
+                    1u64.to_be_bytes().to_vec(),
+                    "{} is not the 8-byte big-endian encoding of 1",
+                    path.display()
+                );
+                let engine = MemoryEngine::new();
+                engine
+                    .merge_batch(vec![
+                        MergeOp::put(mirror::syskv_format_version_key(), bytes.clone(), 1),
+                        MergeOp::put(member_key.clone(), live[&member_key].clone(), 1),
+                    ])
+                    .await
+                    .expect("merge");
+                let rebuilt = rebuild_metadata_from_engine(&engine)
+                    .await
+                    .unwrap_or_else(|e| panic!("{} did not rebuild: {e}", path.display()));
+                assert_eq!(rebuilt.members, member_expected.members);
+            }
+            other => panic!(
+                "unrecognized mirror-version fixture version v{other} ({}) — add a matching \
+                 expected-value arm",
+                path.display()
+            ),
+        }
+        versions.push(version);
+    }
+    assert!(
+        versions.contains(&SYSKV_MIRROR_VERSION),
+        "no mirror-version fixture for the current version v{SYSKV_MIRROR_VERSION}"
+    );
+}
+
+/// The current encoder writes exactly the current version's fixture bytes.
+#[test]
+fn mirror_version_row_matches_the_current_encoder() {
+    match mirror::put_syskv_format_version() {
+        KeyWrite::Put(key, value) => {
+            assert_eq!(key, mirror::syskv_format_version_key());
+            let path = mirror_version_dir().join(format!("v{SYSKV_MIRROR_VERSION}.bin"));
+            let fixture =
+                std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            assert_eq!(value, fixture);
+        }
+        KeyWrite::Delete(_) => panic!("format-version row is a Put"),
+    }
+}
+
+/// Regenerates `mirror-version/v<SYSKV_MIRROR_VERSION>.bin`. Run explicitly:
+/// `cargo test -p animus-control --test format_fixtures generate_fixture_mirror_version -- --ignored`.
+#[test]
+#[ignore]
+fn generate_fixture_mirror_version() {
+    let dir = mirror_version_dir();
+    std::fs::create_dir_all(&dir).expect("create fixtures dir");
+    let path = dir.join(format!("v{SYSKV_MIRROR_VERSION}.bin"));
+    if std::fs::metadata(&path).is_ok() {
+        panic!(
+            "{} already exists — bump SYSKV_MIRROR_VERSION and add a new fixture instead",
+            path.display()
+        );
+    }
+    let KeyWrite::Put(_, value) = mirror::put_syskv_format_version() else {
+        panic!("format-version row is a Put");
+    };
+    std::fs::write(&path, value).unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
 }

@@ -231,6 +231,18 @@ pub struct Metadata {
     /// decoded at. Always [`METADATA_VERSION`] for a freshly-constructed
     /// value; [`Metadata::from_json`] is the intended decode path for
     /// untrusted bytes (see the struct's own doc).
+    ///
+    /// **Why the serde default stays (ADR 0073 Phase 1, P1-C decision).**
+    /// Every post-baseline write emits `"v"` (the field is always
+    /// serialized), but the frozen, never-editable fixtures
+    /// `control-wal/v1.bin` and `shared-wal/v1.bin` embed a `Metadata`
+    /// serialized before the field existed, and `control-snapshot/v1.bin`
+    /// likewise carries none; they must decode forever, and the outer
+    /// `CWL1`/`CSN1` envelope versions the record, not this nested value.
+    /// Removing the default would break those fixtures. The default is the
+    /// literal v1 ([`metadata_v1`]), so it stays correct after a bump: an
+    /// untagged nested `Metadata` always means v1. Standalone documents
+    /// go through the strict, dispatching [`Metadata::from_json`] instead.
     #[serde(
         rename = "v",
         default = "metadata_v1",
@@ -616,19 +628,24 @@ impl Metadata {
             Ok(peek) => peek,
             Err(_) => return Err(FormatError::PreBaselineFormat { format: FORMAT }),
         };
-        if peek.v == 0 || peek.v > METADATA_VERSION {
-            let found = u8::try_from(peek.v).unwrap_or(u8::MAX);
-            let max_supported = u8::try_from(METADATA_VERSION).unwrap_or(u8::MAX);
-            return Err(FormatError::UnsupportedFormatVersion {
+        // Per-version dispatch (ADR 0073 Phase 1 design): a `match` on the
+        // peeked version, not a range gate. A v2 moves the current-type arm
+        // to `2` and puts a frozen `legacy::v1` decoder (+ `From`) on `1`.
+        match peek.v {
+            1 => serde_json::from_slice(bytes).map_err(|e| FormatError::Malformed {
                 format: FORMAT,
-                found,
-                max_supported,
-            });
+                detail: e.to_string(),
+            }),
+            found => {
+                let found = u8::try_from(found).unwrap_or(u8::MAX);
+                let max_supported = u8::try_from(METADATA_VERSION).unwrap_or(u8::MAX);
+                Err(FormatError::UnsupportedFormatVersion {
+                    format: FORMAT,
+                    found,
+                    max_supported,
+                })
+            }
         }
-        serde_json::from_slice(bytes).map_err(|e| FormatError::Malformed {
-            format: FORMAT,
-            detail: e.to_string(),
-        })
     }
 }
 
