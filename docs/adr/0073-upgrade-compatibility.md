@@ -1265,7 +1265,7 @@ lists below.
 | **P1-A** (backups/PITR/export first; outlives the cluster) | `animus-cp-data`, `animus-item` | Dispatch seam (`match version`, `legacy` module scaffolding) for `backup-manifest`, `backup-data`, `segment` (PITR), then `raftkv-wire`/`raftkv-image`/`raftkv-wal`/`cp-engine-layout`; `segment.rs` fixture test asserts "fixture for `VERSION` exists" instead of `== 1`. **Row values**: add golden fixtures (new files under `animus-item/tests/fixtures/formats/`) for `stored-item` and `change-record`, decide tag-vs-freeze for them (proposal: freeze the serde shape, additive-only with fixtures; an untagged JSON `{` document is v1, so a later tagged v2 is unambiguous to sniff) and add the inventory rows; pin key-encoding vectors (`numkey`, `key_bytes`, murmur3) as fixtures in `animus-tablet`/`animus-item` (the guard then covers them) | none | `animus-control/**` (incl. `format.rs` — consume, do not change signatures), `animus-storage/**`, `animusd/**`, `animus-env/**` |
 | **P1-B** | `animus-storage`, `animus-env` | Per-version expected values for `lsm-wal`, `lsm-manifest`, `lsm-sstable` (format derived from the file name; unrecognised fixture panics), `encryption-envelope` (panic instead of silently weaker checks), `network-handshake`/`client-handshake` (assert `version == <file version>`, not the current one); dispatch seam in `decode_wal`, `decode_manifest`, `read_block`, `EncryptedDisk::scan`; `legacy` scaffolding | none | `animus-cp-data/**`, `animus-control/**` |
 | **P1-C** | `animus-control`, `animusd`, `animus-operator` | `control-wal`/`control-snapshot`/`shared-wal`: callers use the returned version and dispatch (kills the `_version` discards in `persist.rs`, `node.rs`, `raft.rs`); `Metadata`/`ClusterConfig`: per-version decode entry points; system-keyspace mirror entity-value fixtures (`mirror-entities`, one per `EntityKind`) and a mirror-version fixture; `animuscluster-spec` per-version test | none | `animus-cp-data/**`, `animus-storage/**`; do not edit `format.rs` helper signatures (P1-A consumes them as they are) |
-| **P1-D** | `animus-test`, `animusd`, plus `legacy-encoders` feature plumbing in the crates above | The upgrade-restart harness: tier 0 fixture-seeded restarts, tier 1 `upgrade_restart_corpus`, negative control, `ANIMUS_UPGRADE_RESTART_SEEDS`, `corpus-deep.yml`; then tier 2 (`sim_cluster_upgrade_corpus`, `SimCluster` `LsmEngine` factory). Adds the per-format transcode table skeleton (identity today) | A, B, C for the per-format plug-ins and the `legacy-encoders` feature convention; tier 0/1 skeleton may start earlier against the convention in this ADR | The format crates' non-test source apart from the feature gate; `sim_cluster.rs` beyond the factory option |
+| **P1-D** | `animus-test`, `animusd`, plus `legacy-encoders` feature plumbing in the crates above | The upgrade-restart harness: tier 0 fixture-seeded restarts, tier 1 `upgrade_restart_corpus`, negative control, `ANIMUS_UPGRADE_RESTART_SEEDS`, `corpus-deep.yml`; then tier 2 (`sim_cluster_upgrade_corpus`, `SimCluster` `LsmEngine` factory; landed 2026-10-01, per-format plug-ins still to come as P1-A/P1-C land). Adds the per-format transcode table skeleton (identity today) | A, B, C for the per-format plug-ins and the `legacy-encoders` feature convention; tier 0/1 skeleton may start earlier against the convention in this ADR | The format crates' non-test source apart from the feature gate; `sim_cluster.rs` beyond the factory option |
 
 **P1-B step 1 as-built (tests only, every format still v1).** The fixture
 decode tests for `lsm-wal`, `lsm-manifest`, `lsm-sstable` and
@@ -1314,8 +1314,42 @@ open. **Three real bugs the harness found:** (1) CWL1/SWL1 treated a CRC
 failure anywhere as a torn tail (handed off to its own session); (2) the
 control `wal_lock` starved the ADR 0038 apply task (#1133); (3) an `LsmEngine`
 WAL torn-header open failure (three TornTail seeds at K=50; fix in progress,
-PR to come). Tier 2 (`sim_cluster_upgrade_corpus`) is pending. See
-`animus-test/CLAUDE.md`.
+PR to come). Tier 2 (`sim_cluster_upgrade_corpus`) landed afterwards, see
+the next note. See `animus-test/CLAUDE.md`.
+
+**P1-D as-built, tier 2 (2026-10-01; every format still v1).**
+`animusd/src/sim_cluster_upgrade_corpus.rs` restarts a whole `SimCluster`
+(roles `[Both, Both, Both, Data]`, RF 3) over a new `LsmEngine<SimEnv>` backend
+option (`SimEngineBackend::Lsm`, `SimCluster::new_with_lsm_engines`; the default
+stays `MemoryEngine`, every existing constructor unchanged): every node is
+stopped (after a `Simulator::crash`, optionally with torn tail and
+corrupt-on-crash armed together, on the crash cells), `transcode_disk` runs on
+every node's disk (identity today; seeded mid-transcode stop and
+mixed-version fraction), and every node restarts through `SimCluster::restart`
+with **strict** engine opens (the sim tablet factory panics rather than return
+`Err`, because the reconciler answers an `Err` open with destroy-and-reopen).
+In the loop: control `Metadata` and its system-keyspace LSM mirror, the
+data-only node's mirror, tablet hosting and rebalancing, DynamoDB streams
+(enabled, written, optionally sealed, then read back through
+`GetRecords` over sealed and open shards), a backup catalog row, and the
+DynamoDB wire clients. **Not drivable under `SimCluster`, so not faked:** a
+backup *captured* before the upgrade and *restored* after it
+(`backup_capture_loop`/`backup_restore_loop` take the concrete
+`ClientCtx<ProdEnv, ..>` and `SimCluster` spawns only the janitor) and stream
+cursor advancement (no `change_consumer_loop` runs under `SimCluster`); the
+backup row is a catalog row only, and the sealed segments live in a shared
+`SimSegmentStore` outside any node's disk. Oracle: `check_cycles`, a wire probe
+that every acknowledged append reads back in order before any phase-2 write
+(equality with a pre-stop snapshot on clean cells), the control apply frontier,
+metadata/backup/hosting agreement across all four nodes, the stream check,
+`check_durability`/`check_convergence`, non-vacuity. Knob
+`ANIMUS_UPGRADE_RESTART_SEEDS` (shared with tier 1); `corpus-deep.yml` runs it
+at K=50 (K=20 measured at about 150s wall in debug). **Negative controls:**
+logs halved with engines wiped, and every disk wiped, are each caught as lost
+acknowledged appends; a truncated LSM file fails the strict open. **Remaining
+for P1-D:** per-format plug-ins arrive as P1-A and P1-C land (one
+`transcode::TABLE` entry each; the cells grow with `supported_back()`); nothing
+in tier 2 names a format version.
 
 ### What Phase 1 "done" means, and what users can rely on
 

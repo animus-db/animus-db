@@ -21308,12 +21308,20 @@ mod sim_cluster_cp_route_fanout;
 /// own `pub(crate)` surface, no further visibility widened).
 #[cfg(test)]
 mod sim_cluster_dynamo_throttle;
+#[cfg(test)]
+mod sim_cluster_lsm;
 /// ADR 0065's own `SimEnv`-driven, virtual-time-only throttle-enforcement
 /// coverage, over the real `SimCluster` fixture — a sibling of
 /// `sim_cluster_corpus`, for the identical reason (needs `SimCluster`'s own
 /// `pub(crate)` surface, no further visibility widened).
 #[cfg(test)]
 mod sim_cluster_throttle;
+/// ADR 0073 Phase 1, P1-D tier 2: the whole-cluster upgrade-restart corpus over
+/// `SimCluster`'s `LsmEngine` backend and the DynamoDB wire. Run via `cargo
+/// test -p animusd --lib sim_cluster_upgrade_corpus`; depth knob
+/// `ANIMUS_UPGRADE_RESTART_SEEDS` (shared with tier 1). See that module's doc.
+#[cfg(test)]
+mod sim_cluster_upgrade_corpus;
 
 /// A first deterministic smoke over `SimClusterHandle::dynamo`/`SimCluster::
 /// dynamo` (ADR 0061 rung D2 PR 1) — the DynamoDB wire edge, decoded by

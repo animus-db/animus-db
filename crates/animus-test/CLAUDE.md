@@ -243,6 +243,10 @@ workload continues. One `Recorder` spans both phases.
   animus-test --test upgrade_restart_corpus -- --nocapture`. Depth: `ANIMUS_UPGRADE_RESTART_SEEDS=K`
   (K=50 is ~55s in debug; nightly runs 100 via `corpus-deep.yml`).
 
+**Tier 2** (whole-cluster restart over `SimCluster`'s `LsmEngine` backend and the DynamoDB wire) lives in
+`animusd` (`src/sim_cluster_upgrade_corpus.rs`, shares `ANIMUS_UPGRADE_RESTART_SEEDS`), reusing this crate's
+`upgrade::transcode`; see `crates/animusd/CLAUDE.md`.
+
 ## Tests
 
 `cargo test -p animus-test` — `cycle_checker.rs` (hand-built histories) + the

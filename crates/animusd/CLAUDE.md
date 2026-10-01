@@ -11765,3 +11765,88 @@ ground truth (including the D4-PR-2 count-drift account) and
 `docs/roadmap.md`'s C-15 entry.
 
 - **Same-address restart tests reserve their ports (issue #1094).** `tests/support`'s `free_addrs`/`reserve_addrs` (and the `start_single_node`/`bring_up_deadline` helpers) hold a non-listening `SO_REUSEADDR` socket per port for the whole test process, so a node can still bind atop it but nobody else's `:0`/ephemeral allocation can take the port in the shutdown-to-rebind gap. Never hand-roll a bind-`:0`-drop probe in a restart test; use `support::reserve_addrs` and attach `support::port_holders` to rebind panics. `tests/port_reservation.rs` is the regression. See `docs/lessons/testing/2026-09-29-hold-a-reservation-socket-across-a-same-address-restart-the-node-binds-its-own-listeners.md`.
+
+## Appendix — `sim_cluster_upgrade_corpus`: whole-cluster upgrade restart over `SimCluster`'s `LsmEngine` backend (ADR 0073 P1-D tier 2, 2026-10-01)
+
+Tier 1 (`animus-test/tests/upgrade_restart_corpus.rs`) restarts one Raft group
+over `LsmEngine`. This is tier 2: a **whole cluster** — control `Metadata`
+(CWL1 + the system-keyspace LSM mirror, ADR 0038), the data-only node's
+mirror, every per-tablet `LsmEngine`, the tablet-host reconciler, streams and
+the DynamoDB wire — stopped, every node's disk run through
+`animus_test::upgrade::transcode::transcode_disk` (identity while every format
+is v1), restarted with **strict** engine opens, and checked. Run via
+`cargo test -p animusd --lib sim_cluster_upgrade_corpus`; knob
+`ANIMUS_UPGRADE_RESTART_SEEDS=K` (shared with tier 1; `ANIMUS_UPGRADE_SEEDS`
+stays reserved for Phase 2), `ANIMUS_SEED=<seed>` replays,
+`ANIMUS_UPGRADE_RESTART_CELL=<substring>` filters. K=20 is ~150s wall (3 cells
+per seed, ~2.5s each); nightly `corpus-deep.yml` runs K=50.
+
+**The factory option (`sim_cluster_lsm.rs`, `SimEngineBackend`).**
+`SimCluster::new_with_lsm_engines(seed, roles, replication, quiesce)` builds
+every engine as `LsmEngine<SimEnv>` over the node's retained `SimEnv` disk:
+the control `RaftNode`'s system-keyspace engine (`SYSKV_LSM_PREFIX`,
+`start_control`) and one engine per tablet (`SimLsmTabletFactory`, the
+`LsmTabletFactory` shape over `SimEnv`, files `db-t{tablet}-…`), behind a
+`SimReconciler::{Mem, Lsm}` facade. Every pre-existing constructor still
+funnels into the same workhorse with `SimEngineBackend::Memory`, whose arms are
+the exact calls they replaced. **Opens are strict**: the factory *panics* on a
+failed open rather than returning `Err`, because `Reconciler::ensure_engine`
+answers an `Err` open with destroy-and-reopen (issue #554), which would turn a
+bad transcode into a silent clean wipe; see
+`docs/lessons/testing/2026-10-01-a-sim-cluster-engine-factory-must-panic-on-a-failed-open-…`.
+`SimCluster::simulator()` hands the corpus the `Simulator` it needs for
+`Simulator::stop` without the immediate rebuild `SimCluster::restart` does
+(`SimCluster::crash` only mutes, so it cannot give a transcoder quiet disks)
+and for `set_disk_config_for`.
+
+**Cluster shape.** Roles `[Both, Both, Both, Data]`, RF 3: node 3 reaches the
+control plane through its `ControlHandle::Remote` mirror, so the mirror
+restarts too; the placement reconciler rebalances a replica onto it.
+
+**In the loop.** Control `Metadata`; the mirror; tablet hosting and
+rebalancing; streams (stream enabled at `CreateTable`, an optional seeded
+`drive_stream_seal` into the shared `SimSegmentStore`, then
+`ListStreams`/`DescribeStream`/`GetShardIterator`/`GetRecords` over sealed and
+open shards after the restart, every acknowledged append must still be in some
+`NewImage`); a backup *catalog* row (`BeginBackup` /
+`RecordBackupTabletComplete` / `CompleteBackup` on the control leader, read
+back `Available` on every node after the restart); aux items on a second table.
+
+**Not drivable under `SimCluster` today, and not faked.** A backup whose data
+is captured before the upgrade and *restored* after it:
+`backup_capture::backup_capture_loop` and `backup_restore::backup_restore_loop`
+take the concrete `ClientCtx<ProdEnv, AnimusdRelayClient>` and `SimCluster`
+spawns only the backup *janitor*. Stream cursors: the `KIND_CURSOR` rows live in
+the tablet engines and are transcoded with them, but no
+`index_drain::change_consumer_loop` runs under `SimCluster`, so nothing
+advances a cursor here. The sealed stream segments and the backup store live in
+shared `SimSegmentStore`s outside any node's disk, so they are never
+transcoded.
+
+**Oracle.** `check_cycles` over phase 1 + probe reads + phase 2; a wire probe
+that every acknowledged append reads back in order *before* any phase-2 write
+(a clean cell also requires equality with a pre-stop snapshot); the control
+apply frontier (`engine_applied_index` reaching `commit_index`); every node
+(mirror included) agreeing on the table/tablet map and the backup row; every
+tablet re-hosted on 3 replicas; the stream check above; `check_durability` and
+`check_convergence` per live replica after a converged-or-timeout poll;
+non-vacuity (acks in both phases).
+
+**Faults.** Clean stop vs crash vs torn-tail crash (`torn_tail_on_crash` +
+`corrupt_on_crash` armed together after bring-up and reset to default before the
+restart); a seeded mid-transcode stop (`stop_after_files`) and mixed-version
+fraction (`keep_current_fraction_permille`); a seeded partition of one restarted
+node from one peer during catch-up. All timing comes from
+`splitmix64(cell seed, tag)`, never the simulator RNG. Each cell runs on its own
+OS thread under a 300s wall-clock `CELL_WATCHDOG` (diagnostic only).
+
+**Negative controls** (clean cell, fixed seed; the identity run passes first):
+logs halved and engines wiped on every node, and every disk wiped, must each
+report `lost acknowledged append` (plus the table map, backup row and re-hosting
+violations); a truncated LSM file on every node must fail the strict open
+(`strict open of the tablet N LSM engine failed`).
+
+**Per-format plug-ins** (P1-A / P1-C row-value formats, and any later format
+bump) need no change here: they land as one `transcode::TABLE` entry and the
+cells grow with `transcode::supported_back()`.
+
