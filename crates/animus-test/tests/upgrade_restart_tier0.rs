@@ -547,7 +547,8 @@ fn lsm_sstable_negative_controls_are_caught() {
 /// `animus-control/tests/format_fixtures.rs` pin (one of each `WalRecord`).
 fn control_wal_expected(version: u32) -> Vec<WalRecord<MetaCommand, Metadata>> {
     match version {
-        1 => vec![
+        // v2 adds only sync-marker lines, which decoding consumes.
+        1 | 2 => vec![
             WalRecord::Hard {
                 term: 3,
                 voted_for: Some(nid(1)),
@@ -641,10 +642,11 @@ fn control_wal_negative_controls_are_caught() {
     each_seed("tier0_control_wal_neg", |seed| {
         let mut flipped = v1.clone();
         flipped[20] ^= 0xff; // inside the first record's payload
-        // Today a CRC failure on a line is treated as a torn tail *wherever* it
-        // sits: decode succeeds and drops the line and everything after it (the
-        // LSM WAL, by contrast, refuses mid-file corruption). Pin the observable
-        // outcome: the open is fine, the content is not.
+        // v1-ONLY behaviour: a v1 file has no sync markers, so a CRC failure on a
+        // line is treated as a torn tail *wherever* it sits (decode succeeds and
+        // drops the line and everything after it). A v2 file refuses the same
+        // damage; see the v2 counterpart below. Pin the v1 outcome: the open is
+        // fine, the content is not.
         let (records, _) = control_wal_run(seed, &flipped).unwrap_or_else(|e| {
             panic!("seed={seed}: a CRC-failed line reads as a torn tail, got {e}")
         });
@@ -653,6 +655,15 @@ fn control_wal_negative_controls_are_caught() {
             control_wal_expected(1),
             "seed={seed}: corruption unnoticed"
         );
+
+        // v2 counterpart (issue #1132): the same first-line damage, with a
+        // durable sync marker after it, is the named mid-file corruption error.
+        let v2 = fixtures("control-wal")[&2].clone();
+        let mut flipped2 = v2.clone();
+        flipped2[20] ^= 0xff;
+        let err = control_wal_run(seed, &flipped2)
+            .expect_err("a corrupted first v2 line before a marker must be refused");
+        assert!(err.contains("corrupt"), "seed={seed}: {err}");
 
         let future = encode_line(
             &FormatTag {

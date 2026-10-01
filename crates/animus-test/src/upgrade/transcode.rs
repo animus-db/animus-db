@@ -180,6 +180,21 @@ const V1_ONLY: &[VersionSpec] = &[VersionSpec {
     capabilities: CapabilityMask::ALL,
 }];
 
+/// `CWL1`/`SWL1` v1 (no sync markers) and v2 (sync markers, issue #1132). Both
+/// are *readable* by the current code (a v2 reader reads v1 lines), but a v2 to
+/// v1 *write* is not offered: a v1 reader rejects version-2 lines, so
+/// `identity_current_only` refuses the v1 target with `UnsupportedTarget`.
+const V1_V2: &[VersionSpec] = &[
+    VersionSpec {
+        version: 1,
+        capabilities: CapabilityMask::ALL,
+    },
+    VersionSpec {
+        version: 2,
+        capabilities: CapabilityMask::ALL,
+    },
+];
+
 /// The table: one entry per durable whole-file format ADR 0073 inventories
 /// that lives on a node's disk. Names equal the fixture directory names.
 pub static TABLE: &[FormatEntry] = &[
@@ -203,8 +218,8 @@ pub static TABLE: &[FormatEntry] = &[
     },
     FormatEntry {
         name: "control-wal",
-        current_version: 1,
-        versions: V1_ONLY,
+        current_version: 2,
+        versions: V1_V2,
         transcode: identity_current_only,
     },
     FormatEntry {
