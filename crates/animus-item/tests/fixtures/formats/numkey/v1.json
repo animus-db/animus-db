@@ -1,0 +1,242 @@
+[
+  {
+    "checked": "03",
+    "decoded": "0",
+    "encoded": "03",
+    "input": "0"
+  },
+  {
+    "checked": "03",
+    "decoded": "0",
+    "encoded": "03",
+    "input": "-0"
+  },
+  {
+    "checked": "03",
+    "decoded": "0",
+    "encoded": "03",
+    "input": "0.000"
+  },
+  {
+    "checked": "03",
+    "decoded": "0",
+    "encoded": "03",
+    "input": "0e5"
+  },
+  {
+    "checked": "03",
+    "decoded": "0",
+    "encoded": "03",
+    "input": "-0.0E-3"
+  },
+  {
+    "checked": "03",
+    "decoded": "0",
+    "encoded": "03",
+    "input": "+0"
+  },
+  {
+    "checked": "0404010200",
+    "decoded": "1",
+    "encoded": "0404010200",
+    "input": "1"
+  },
+  {
+    "checked": "02fbfefdff",
+    "decoded": "-1",
+    "encoded": "02fbfefdff",
+    "input": "-1"
+  },
+  {
+    "checked": "0404000600",
+    "decoded": "0.5",
+    "encoded": "0404000600",
+    "input": "0.5"
+  },
+  {
+    "checked": "02fbfff9ff",
+    "decoded": "-0.5",
+    "encoded": "02fbfff9ff",
+    "input": "-0.5"
+  },
+  {
+    "checked": "0403ff0600",
+    "decoded": "0.05",
+    "encoded": "0403ff0600",
+    "input": "0.05"
+  },
+  {
+    "checked": "04040302030400",
+    "decoded": "123",
+    "encoded": "04040302030400",
+    "input": "123"
+  },
+  {
+    "checked": "04040402030400",
+    "decoded": "1230",
+    "encoded": "04040402030400",
+    "input": "1230"
+  },
+  {
+    "checked": "040402020300",
+    "decoded": "12",
+    "encoded": "040402020300",
+    "input": "12"
+  },
+  {
+    "checked": "02fbfcfdfcfbff",
+    "decoded": "-123",
+    "encoded": "02fbfcfdfcfbff",
+    "input": "-123"
+  },
+  {
+    "checked": "02fbfdfdfcff",
+    "decoded": "-12",
+    "encoded": "02fbfdfdfcff",
+    "input": "-12"
+  },
+  {
+    "checked": "0404010a00",
+    "decoded": "9",
+    "encoded": "0404010a00",
+    "input": "9"
+  },
+  {
+    "checked": "040402020600",
+    "decoded": "15",
+    "encoded": "040402020600",
+    "input": "15"
+  },
+  {
+    "checked": "02fbfef9ff",
+    "decoded": "-5",
+    "encoded": "02fbfef9ff",
+    "input": "-5"
+  },
+  {
+    "checked": "02fbfdfdff",
+    "decoded": "-10",
+    "encoded": "02fbfdfdff",
+    "input": "-10"
+  },
+  {
+    "checked": "0404010600",
+    "decoded": "5",
+    "encoded": "0404010600",
+    "input": "5"
+  },
+  {
+    "checked": "04040b0200",
+    "decoded": "10000000000",
+    "encoded": "04040b0200",
+    "input": "1E10"
+  },
+  {
+    "checked": "04040c0200",
+    "decoded": "100000000000",
+    "encoded": "04040c0200",
+    "input": "1E11"
+  },
+  {
+    "checked": "04042902030400",
+    "decoded": "12300000000000000000000000000000000000000",
+    "encoded": "04042902030400",
+    "input": "1.23E40"
+  },
+  {
+    "checked": "02fb81f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5ff",
+    "decoded": "-999999999999999999999999999999999999990000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "encoded": "02fb81f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5ff",
+    "input": "-9.9999999999999999999999999999999999999E+125"
+  },
+  {
+    "checked": "04047e0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a00",
+    "decoded": "999999999999999999999999999999999999990000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "encoded": "04047e0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a00",
+    "input": "9.9999999999999999999999999999999999999E+125"
+  },
+  {
+    "checked": "0403800200",
+    "decoded": "0.000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001",
+    "encoded": "0403800200",
+    "input": "1E-129"
+  },
+  {
+    "checked": "040402050300",
+    "decoded": "42",
+    "encoded": "040402050300",
+    "input": " 42 "
+  },
+  {
+    "checked": "040402050300",
+    "decoded": "42",
+    "encoded": "040402050300",
+    "input": "+42"
+  },
+  {
+    "checked": "040402050300",
+    "decoded": "42",
+    "encoded": "040402050300",
+    "input": "42."
+  },
+  {
+    "checked": "040402050300",
+    "decoded": "42",
+    "encoded": "040402050300",
+    "input": "42"
+  },
+  {
+    "checked": null,
+    "decoded": "1.23456789012345678901234567890123456789",
+    "encoded": "04040102030405060708090a0102030405060708090a0102030405060708090a0102030405060708090a00",
+    "input": "1.23456789012345678901234567890123456789"
+  },
+  {
+    "checked": null,
+    "decoded": null,
+    "encoded": null,
+    "input": ""
+  },
+  {
+    "checked": null,
+    "decoded": null,
+    "encoded": null,
+    "input": " "
+  },
+  {
+    "checked": null,
+    "decoded": null,
+    "encoded": null,
+    "input": "abc"
+  },
+  {
+    "checked": null,
+    "decoded": null,
+    "encoded": null,
+    "input": "1e"
+  },
+  {
+    "checked": null,
+    "decoded": null,
+    "encoded": null,
+    "input": "--1"
+  },
+  {
+    "checked": null,
+    "decoded": null,
+    "encoded": null,
+    "input": "1.2.3"
+  },
+  {
+    "checked": null,
+    "decoded": null,
+    "encoded": null,
+    "input": "NaN"
+  },
+  {
+    "checked": null,
+    "decoded": null,
+    "encoded": null,
+    "input": "."
+  }
+]

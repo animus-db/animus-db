@@ -157,7 +157,9 @@ fn segment_decodes_every_checked_in_fixture_structurally() {
                 let (_, sliced) = segment::decode_and_slice(&bytes, h.hlc_range).expect("slice");
                 assert_eq!(sliced, decoded.records);
             }
-            other => panic!("segment v{other} fixture has no structural expectation yet"),
+            other => panic!(
+                "fixture v{other} has no expected value — add one (ADR 0073 checklist step 4)"
+            ),
         }
     }
 }
@@ -183,20 +185,33 @@ fn segment_round_trips_through_encode_and_decode() {
 
 #[test]
 fn segment_fixture_is_current_version_and_refuses_pre_baseline_shapes() {
-    assert_eq!(segment::VERSION, 1, "Phase 0 baseline");
+    // A fixture for the current `VERSION` must exist (ADR 0073 checklist
+    // step 3); this deliberately does not pin `VERSION == 1`, so a bump
+    // only fails here until its new fixture is added.
     let (_, bytes) = fixture_files(&formats_dir("segment"))
         .into_iter()
-        .find(|(v, _)| *v == 1)
-        .expect("v1 fixture");
-    // A pre-baseline `2`-tagged object (the old VERSION) is refused by name.
+        .find(|(v, _)| *v == segment::VERSION)
+        .unwrap_or_else(|| panic!("no fixture for segment::VERSION {}", segment::VERSION));
+    // A version above the current one is refused by name.
     let mut old = bytes.clone();
-    old[4] = 2;
+    old[4] = segment::VERSION + 1;
     assert_eq!(
         segment::decode(&old).expect_err("v2 refused"),
         FormatError::UnsupportedFormatVersion {
             format: "segment",
-            found: 2,
-            max_supported: 1
+            found: segment::VERSION + 1,
+            max_supported: segment::VERSION
+        }
+    );
+    // Version 0 is never valid.
+    let mut zero = bytes.clone();
+    zero[4] = 0;
+    assert_eq!(
+        segment::decode(&zero).expect_err("v0 refused"),
+        FormatError::UnsupportedFormatVersion {
+            format: "segment",
+            found: 0,
+            max_supported: segment::VERSION
         }
     );
     // Untagged input (the body without magic+version) is pre-baseline.

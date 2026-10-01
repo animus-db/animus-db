@@ -1288,7 +1288,11 @@ before any child is applied — not `Err`, which would back off and requeue).
 must name the field. Golden fixture:
 `tests/fixtures/formats/animuscluster-spec/v1.json` (never edited; a change
 is `CONTENT_SCHEMA_VERSION` + a new `v2.json`), tests in
-`tests/format_fixtures.rs`. Every `AnimusCluster` manifest
+`tests/format_fixtures.rs`. **Phase 1 (P1-C):** `crd::decode_cluster` is the
+version-dispatching decode entry point (peeks `spec.schemaVersion`, `match`es;
+a v2 moves the current-type arm to `2` and puts a frozen `legacy::v1` decoder
+on `1`), and the fixture test is per-version — version from the `vN.json` file
+name, per-version expected value, `panic!` on an unrecognised version. Every `AnimusCluster` manifest
 (`deploy/operator/example.yaml`, `scripts/e2e-kind.sh`'s heredoc) carries
 `schemaVersion: 1`; regenerate `deploy/operator/crd.yaml` after touching the
 spec type.
