@@ -273,7 +273,15 @@ per-tablet CP data plane (`animus-cp-data`).
   latest round has no durable marker until the next sync; a disk that lied
   about `fsync` can now fail loudly. Corruption of a CRC-valid line's
   *payload* was always loud (`Malformed`). No back-compat for a pre-checksum
-  WAL file (pre-baseline).
+  WAL file (pre-baseline). **`SWL1` (the `SharedWal` file) is v2 too**:
+  `SharedWal::flush` appends the marker after each successful `Append`-batch
+  sync (typed/tagged API only; the raw untyped `append` the fsync bench uses is
+  untouched), `SharedWal::open` repairs a torn tail via
+  `decode_tagged_with_extent` + `repair_tail` and maps `MidFileCorruption` to
+  `InvalidData` naming the offset. A `Compact` (`Disk::replace`) writes no
+  marker (its file is rebuilt from records; markers never survive a rewrite,
+  which is what keeps every marker's offset exact). Tests:
+  `tests/shared_wal_midfile_corruption.rs`.
 
 - **`detector.rs`** — `FailureDetector` (ADR 0012): a pure, unit-tested
   interval+timeout liveness detector. No clock, no RNG.
@@ -497,14 +505,15 @@ non-`SharedWal` per-group WAL too** — its fallback persist path
 here, just instantiated `C = KvCommand`/`S = KvState`; there is no second
 WAL-line codec for that crate to keep in sync. **`encode_tagged_record`/
 `decode_tagged` (the `SharedWal` outer `Line{tablet, record}` envelope)
-are `persist::SHARED_WAL_TAG`** (magic `SWL1`, version 1, ADR 0073 workstream
+are `persist::SHARED_WAL_TAG`** (magic `SWL1`, version 2 since #1132, ADR 0073 workstream
 C) — the same `format::encode_line`/`decode_lines` shape as `CWL1`, payload
 `{"tablet":..,"record":..}` `serde_json` whose inner `record` is the same
 `WalRecord<C, S>` shape (not a `codec.rs` payload). `decode_tagged` returns
 `Result<_, FormatError>`: a torn tail/CRC-failed line stays a silent stop
 (`Ok(prefix)`); pre-baseline/unknown-version/CRC-valid-but-bad-JSON
 (`Malformed`) are loud, and `SharedWal::open` maps them to `InvalidData`.
-The old private `encode_checksummed_line`/`verify_checksummed_line` are
+(`SWL1` is **version 2** since #1132: sync markers, `legacy_shared::v1`, fixtures
+`shared-wal/v1.bin` + `v2.bin`.) The old private `encode_checksummed_line`/`verify_checksummed_line` are
 deleted. **`shared_wal.rs` lives in this crate (`animus-control`), not
 `animus-cp-data`, despite the ADR's workstream table listing the
 `SharedWal` envelope under workstream C** — grep before assuming a format

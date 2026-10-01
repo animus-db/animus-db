@@ -609,6 +609,22 @@ fn encode_shared_wal(lines: &[(TabletId, WalRecord<MetaCommand, Metadata>)]) -> 
     bytes
 }
 
+/// The exact bytes a current (v2) `SharedWal` produces for
+/// [`v1_shared_wal_lines`] as two flushes (a sync marker after each).
+fn v2_shared_wal_bytes() -> Vec<u8> {
+    let lines = v1_shared_wal_lines();
+    let mid = lines.len() / 2;
+    let mut bytes = Vec::new();
+    for round in [&lines[..mid], &lines[mid..]] {
+        bytes.extend(encode_shared_wal(round));
+        bytes.extend(animus_control::format::encode_sync_marker(
+            &SHARED_WAL_TAG,
+            bytes.len() as u64,
+        ));
+    }
+    bytes
+}
+
 /// Iterates every file under `tests/fixtures/formats/shared-wal/` (never
 /// naming `v1` literally) and asserts each decodes structurally.
 #[test]
@@ -637,6 +653,21 @@ fn decodes_every_checked_in_shared_wal_fixture_structurally() {
                 );
                 checked += 1;
             }
+            "v2.bin" => {
+                let decoded = PersistedState::<MetaCommand, Metadata>::decode_tagged(&bytes)
+                    .unwrap_or_else(|e| panic!("{name} failed to decode: {e}"));
+                assert_eq!(
+                    decoded,
+                    v1_shared_wal_lines(),
+                    "{name} decoded to an unexpected value (markers consumed)"
+                );
+                assert_eq!(
+                    bytes,
+                    v2_shared_wal_bytes(),
+                    "{name}: current writer emits the fixture"
+                );
+                checked += 1;
+            }
             other => panic!(
                 "unrecognized shared-wal fixture {other:?} — add a matching expected-value \
                  arm to this test before adding the fixture file"
@@ -662,8 +693,9 @@ fn shared_wal_round_trips_through_encode_and_decode() {
 /// right after the 8-hex-digit checksum and its colon.
 #[test]
 fn shared_wal_fixture_starts_with_the_shared_wal_tag() {
-    let bytes = std::fs::read(shared_wal_fixtures_dir().join("v1.bin"))
-        .expect("v1.bin fixture is checked in");
+    let bytes =
+        std::fs::read(shared_wal_fixtures_dir().join(format!("v{}.bin", SHARED_WAL_TAG.version)))
+            .expect("the current version's fixture is checked in");
     assert_eq!(&bytes[9..13], &SHARED_WAL_TAG.magic);
     assert_eq!(
         &bytes[13..15],
@@ -687,7 +719,7 @@ fn generate_fixture_shared_wal() {
             path.display()
         );
     }
-    let bytes = encode_shared_wal(&v1_shared_wal_lines());
+    let bytes = v2_shared_wal_bytes();
     std::fs::write(&path, &bytes).unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
 }
 

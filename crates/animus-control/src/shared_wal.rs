@@ -76,7 +76,10 @@
 //!   mid-rewrite yields, for every tablet, exactly its own last **durably
 //!   written** tail — `PersistedState::decode_tagged`'s per-record `SWL1` CRC32 +
 //!   torn-tail tolerance (issue #495) already guarantees a torn trailing
-//!   write is dropped rather than corrupting recovery, and a rewrite
+//!   write is dropped rather than corrupting recovery (and, since #1132, the
+//!   v2 sync marker `flush` appends after each successful sync is what lets
+//!   the decoder tell that tail from corruption of durable history; `open`
+//!   also cuts a torn tail back before any append), and a rewrite
 //!   (`Disk::replace`) is atomic at the `Env` seam (either the old file or
 //!   the fully-written new one is what a fresh `open` sees — see
 //!   `animus-sim`'s `torn_tail_on_crash`/`corrupt_on_crash` knobs for how
@@ -422,8 +425,23 @@ impl<C: Clone, S: Clone> SharedWal<C, S> {
                     }
                 }
             }
+            let landed_append = result.is_ok()
+                && matches!(batch[0].op, WalOp::Append(_))
+                && batch.iter().any(|p| p.undo.is_some());
             for pending in batch {
                 let _ = pending.done.send(result.clone());
+            }
+            if landed_append {
+                // Issue #1132: the round is synced and its callers are
+                // released; record that everything before this point is
+                // durable (`SWL1` v2 sync marker). Still inside this leader's
+                // exclusive drive loop, so nothing appends between the sync
+                // and the marker and the marker's offset is exact. A
+                // `Compact` needs none: its file is rebuilt from records. Only
+                // the tagged (typed) API writes markers: the raw `append`
+                // moves opaque bytes (the fsync bench's), which nothing decodes.
+                crate::persist::append_sync_marker(env, &crate::persist::SHARED_WAL_TAG, file)
+                    .await;
             }
         }
     }
@@ -519,8 +537,11 @@ where
     pub async fn open<E: Env>(env: &E, file: &str) -> io::Result<Arc<Self>> {
         let bytes = env.read(file).await.unwrap_or_default();
         let mut group_tails: BTreeMap<TabletId, Vec<WalRecord<C, S>>> = BTreeMap::new();
-        let records = PersistedState::<C, S>::decode_tagged(&bytes)
+        let (records, valid_len) = PersistedState::<C, S>::decode_tagged_with_extent(&bytes)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{file}: {e}")))?;
+        // Issue #1132: cut a torn tail back on disk before any append rides
+        // it (see `PersistedState::recover`).
+        crate::persist::repair_tail(env, file, &bytes, valid_len).await?;
         for (tablet, record) in records {
             group_tails.entry(tablet).or_default().push(record);
         }

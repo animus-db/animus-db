@@ -120,13 +120,59 @@ pub(crate) mod dispatch {
         }
     }
 
+    /// Frozen `SWL1` version-1 decoder (the `SharedWal` sibling of `legacy`): same
+    /// `{tablet, record}` payload shape as v2; a v1 file has no sync markers.
+    pub(crate) mod legacy_shared {
+        pub(crate) mod v1 {
+            use crate::format::FormatError;
+            use crate::persist::SHARED_WAL_TAG;
+            use serde::de::DeserializeOwned;
+
+            pub(crate) fn shared_wal_line<T: DeserializeOwned>(
+                payload: &[u8],
+            ) -> Result<T, FormatError> {
+                serde_json::from_slice(payload)
+                    .map_err(|e| super::super::malformed(SHARED_WAL_TAG.name, &e))
+            }
+
+            /// Test-only legacy encoder (ADR 0073 checklist step 7), anchored
+            /// to `tests/fixtures/formats/shared-wal/v1.bin` in `persist::tests`.
+            #[cfg(test)]
+            pub(crate) fn encode_tagged_record<C, S>(
+                tablet: animus_tablet::TabletId,
+                record: &crate::persist::WalRecord<C, S>,
+            ) -> Vec<u8>
+            where
+                C: serde::Serialize,
+                S: serde::Serialize,
+            {
+                use crate::format::{self, FormatTag};
+                #[derive(serde::Serialize)]
+                struct Line<'a, C, S> {
+                    tablet: animus_tablet::TabletId,
+                    record: &'a crate::persist::WalRecord<C, S>,
+                }
+                const V1: FormatTag = FormatTag {
+                    magic: *b"SWL1",
+                    version: 1,
+                    name: "shared-wal",
+                };
+                format::encode_line(
+                    &V1,
+                    &serde_json::to_vec(&Line { tablet, record }).expect("serializes"),
+                )
+            }
+        }
+    }
+
     /// Body of one [`SHARED_WAL_TAG`] line (`{tablet, record}`).
     pub(crate) fn shared_wal_line<T: DeserializeOwned>(
         version: u8,
         payload: &[u8],
     ) -> Result<T, FormatError> {
         match version {
-            1 => serde_json::from_slice(payload).map_err(|e| malformed(SHARED_WAL_TAG.name, &e)),
+            1 => legacy_shared::v1::shared_wal_line(payload),
+            2 => serde_json::from_slice(payload).map_err(|e| malformed(SHARED_WAL_TAG.name, &e)),
             found => Err(format::unsupported_version(&SHARED_WAL_TAG, found)),
         }
     }
@@ -205,7 +251,7 @@ pub type TaggedRecords<C, S> = Vec<(TabletId, WalRecord<C, S>)>;
 /// `serde_json`. See this module's own doc.
 pub const SHARED_WAL_TAG: FormatTag = FormatTag {
     magic: *b"SWL1",
-    version: 1,
+    version: 2,
     name: "shared-wal",
 };
 
@@ -467,9 +513,13 @@ where
     }
 
     /// Decode a shared WAL's bytes into `(tablet, record)` pairs, in file
-    /// order, stopping silently at the first line whose framing fails — a
-    /// trailing partial line **or** a checksum mismatch (issue #495), per
-    /// [`decode`](Self::decode)'s doc (`Ok` with the valid prefix).
+    /// order, stopping at the first line whose framing fails — a trailing
+    /// partial line **or** a checksum mismatch (issue #495), per
+    /// [`decode`](Self::decode)'s doc (`Ok` with the valid prefix) — **unless
+    /// a later `SWL1` v2 sync marker proves that line was already durable**,
+    /// in which case it is [`FormatError::MidFileCorruption`] (issue #1132;
+    /// `SharedWal` appends a marker after each successful `fsync`, see
+    /// `SharedWal::flush`).
     ///
     /// Loud errors, exactly as [`decode`](Self::decode): a CRC-valid line
     /// with no [`SHARED_WAL_TAG`] magic (a pre-baseline untagged
@@ -1247,5 +1297,46 @@ mod tests {
             PersistedState::<MetaCommand, Metadata>::decode(&rotted),
             Err(FormatError::MidFileCorruption { offset: 0, .. })
         ));
+    }
+
+    /// `SWL1` mirror of the CWL1 checks: the legacy v1 encoder reproduces every
+    /// non-snapshot line of the v1 fixture byte for byte (the `Snapshot` line
+    /// embeds a `Metadata` serialized before its `"v"` field existed, so it
+    /// is checked by round trip instead), a marker-less v1 file keeps the
+    /// lenient rule, and a forged future-version line keeps its error.
+    #[test]
+    fn shared_wal_v1_fixture_legacy_encoder_leniency_and_forged_version() {
+        let v1 = include_bytes!("../tests/fixtures/formats/shared-wal/v1.bin");
+        let lines = PersistedState::<MetaCommand, Metadata>::decode_tagged(v1).unwrap();
+        let fixture_lines: Vec<&[u8]> = v1.split_inclusive(|&b| b == b'\n').collect();
+        assert_eq!(fixture_lines.len(), lines.len());
+        for (i, ((tablet, record), fixture)) in lines.iter().zip(&fixture_lines).enumerate() {
+            let re = dispatch::legacy_shared::v1::encode_tagged_record(*tablet, record);
+            if matches!(record, WalRecord::Snapshot { .. }) {
+                let again = PersistedState::<MetaCommand, Metadata>::decode_tagged(&re).unwrap();
+                assert_eq!(again, vec![(*tablet, record.clone())], "line {i}");
+            } else {
+                assert_eq!(&re[..], *fixture, "line {i}");
+            }
+        }
+        let mut bad = v1.to_vec();
+        bad[12] ^= 0xFF;
+        assert!(
+            PersistedState::<MetaCommand, Metadata>::decode_tagged(&bad)
+                .unwrap()
+                .is_empty()
+        );
+        let body = b"SWL103{}";
+        let mut forged = format!("{:08x}:", crc32fast::hash(body)).into_bytes();
+        forged.extend_from_slice(body);
+        forged.push(b'\n');
+        assert_eq!(
+            PersistedState::<MetaCommand, Metadata>::decode_tagged(&forged).unwrap_err(),
+            FormatError::UnsupportedFormatVersion {
+                format: "shared-wal",
+                found: 3,
+                max_supported: 2,
+            }
+        );
     }
 }
