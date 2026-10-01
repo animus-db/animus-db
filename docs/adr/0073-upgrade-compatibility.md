@@ -1337,3 +1337,22 @@ in one change and updates this ADR's status header.
 **Phase status after this amendment:** Phase 0 done; **Phase 1 in progress**
 (design accepted, P1-A..P1-D not started); Phases 2 and 3 planned, blocked
 on Phase 1 as before.
+
+### Amendment 2026-10-01: LSM WAL segment header is synced before any record (P1-B / P1-D follow-up)
+
+The P1-D tier-1 upgrade-restart corpus (strict `LsmEngine` open straight
+after `Simulator::crash` with `torn_tail_on_crash` + `corrupt_on_crash`)
+found that a crash during WAL segment creation could leave a node that
+cannot restart: the 5-byte header (`LWL1` + version) shared one `sync` with
+the segment's first records, so a torn-and-bit-flipped un-synced header
+decoded as `UnsupportedFormatVersion { found: 254 }` or `PreBaselineFormat`.
+**No encoding or fixture changes, no version bump.** Two coupled changes:
+(1) the write side appends and `sync`s the header on its own before any
+record is appended (one extra `fsync` per segment creation);
+(2) `decode_wal` now treats any file shorter than the header, whatever its
+bytes, as an empty torn tail (previously only a true prefix of `WAL_MAGIC`).
+Soundness: after (1) every file longer than the header has a durable header,
+so a bad header there is real corruption and stays loud (the version-dispatch
+seam is untouched for >= 5 bytes); a shorter file never had a synced header
+and holds no acked data. Regression: `animus-storage/tests/lsm_crash.rs`
+`crash_during_segment_header_creation`.

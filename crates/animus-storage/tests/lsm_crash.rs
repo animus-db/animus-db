@@ -377,6 +377,71 @@ fn scenario_flush_then_compaction_happen_and_keep_data(seed: u64) {
 // mirrors `raftkv_linearizable.rs`/`reconciler_corpus.rs`'s own shape exactly).
 // ---------------------------------------------------------------------------
 
+/// 7. **A crash while a fresh WAL segment's header is still un-synced** (the
+///    `claude/lsm-wal-torn-header` bug): `crash` with `torn_tail_on_crash` +
+///    `corrupt_on_crash` keeps a strict prefix of each file's un-synced
+///    buffer and flips one byte in it. Before the fix, a segment's 5-byte
+///    header (`LWL1` + version) was appended in the *same* `sync` as its
+///    first records, so the flip could land in the header of a segment that
+///    held no acked data, turning it into `UnsupportedFormatVersion` /
+///    `PreBaselineFormat` — a node that can never restart after a crash
+///    during segment creation. The header is now synced before any record is
+///    appended, and a file shorter than the header (provably never synced)
+///    decodes as empty, so a strict reopen succeeds and every acked write
+///    survives. Sweeps how many writes are acked first (so the failing
+///    write lands on every phase of the rotation cycle, including the
+///    very first segment) and, per phase, several tear/corrupt draws.
+fn scenario_crash_during_segment_header_creation(seed: u64) {
+    for acked in 0..14u64 {
+        for draw in 0..6u64 {
+            let sim = Simulator::new(seed.wrapping_add(acked * 1_000 + draw));
+            {
+                let e = open(&sim);
+                block_on(async {
+                    for i in 0..acked {
+                        e.put(format!("k{i:03}").as_bytes(), b"v", i + 1)
+                            .await
+                            .unwrap();
+                    }
+                });
+                // From here every fsync fails: the next write's append
+                // (possibly carrying a brand-new segment's header) stays
+                // buffered, un-synced, and the write is never acked.
+                let mut cfg = DiskConfig::default();
+                cfg.torn_tail_on_crash = true;
+                cfg.corrupt_on_crash = true;
+                cfg.set_sync_error_prob(1.0);
+                sim.set_disk_config(cfg);
+                let r = block_on(e.put(b"unacked", b"v", acked + 1));
+                assert!(r.is_err(), "seed={seed} acked={acked}: sync must fail");
+            }
+            sim.crash(nid(0));
+            // Strict reopen: no destroy-and-reopen fallback.
+            let mut cfg = DiskConfig::default();
+            cfg.torn_tail_on_crash = true;
+            cfg.corrupt_on_crash = true;
+            sim.set_disk_config(cfg);
+            let e = block_on(LsmEngine::open_with(sim.env(nid(0)), PREFIX, opts())).unwrap_or_else(
+                |err| panic!("seed={seed} acked={acked} draw={draw}: strict reopen failed: {err}"),
+            );
+            block_on(async {
+                for i in 0..acked {
+                    let got = e
+                        .get(format!("k{i:03}").as_bytes())
+                        .await
+                        .unwrap()
+                        .unwrap_or_else(|| {
+                            panic!("seed={seed} acked={acked} draw={draw}: acked k{i:03} lost")
+                        });
+                    assert_eq!(got.value, b"v");
+                }
+                // And the engine is writable + durable again afterwards.
+                e.put(b"after", b"v", acked + 2).await.unwrap();
+            });
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Scenario {
     name: String,
@@ -438,6 +503,10 @@ fn scenario_cells() -> Vec<Scenario> {
         scenario!(
             "flush_then_compaction_happen_and_keep_data",
             scenario_flush_then_compaction_happen_and_keep_data
+        ),
+        scenario!(
+            "crash_during_segment_header_creation",
+            scenario_crash_during_segment_header_creation
         ),
     ]
 }
