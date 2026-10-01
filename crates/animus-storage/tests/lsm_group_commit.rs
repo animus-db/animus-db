@@ -170,9 +170,10 @@ fn merge_batch_coalesces_one_fsync_and_is_durable() {
 fn crash_drops_unfsynced_batch_tail() {
     let seed = 0xBA7C4;
     let sim = Simulator::new(seed);
-    // Interrupt the *second* group fsync: the first batch is durable (acked); the
-    // second batch's append lands in the buffer but its fsync never persists.
-    let env = CrashEnv::new(sim.env(nid(0)), 2);
+    // Interrupt the *third* `sync` call: #1 is the brand-new segment's own header
+    // (synced on its own, before any record), #2 the first batch (durable, acked);
+    // the second batch's append lands in the buffer but its fsync never persists.
+    let env = CrashEnv::new(sim.env(nid(0)), 3);
 
     {
         let engine = block_on(LsmEngine::open_with(env.clone(), PREFIX, opts())).expect("open");

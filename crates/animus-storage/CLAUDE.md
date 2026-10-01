@@ -356,6 +356,18 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   `first_frame_len` helpers know to skip past this header when locating a
   segment's first record frame — a hand-rolled offset duplicated from
   `wal::WAL_HEADER_LEN` since it isn't part of the crate's public API.
+- **The WAL segment header is `sync`ed on its own before any record is
+  appended** (`GroupCommit::flush_batch`: one extra fsync per segment
+  creation; `lsm_crash.rs::crash_during_segment_header_creation`). This
+  supersedes the "header shares the first batch's `sync`" wording above:
+  with a shared sync, `Simulator::crash` (`torn_tail_on_crash` +
+  `corrupt_on_crash`) could flip a byte of an un-synced header and the
+  strict reopen failed (`UnsupportedFormatVersion { found: 254 }` /
+  `PreBaselineFormat`). Now a file >= `WAL_HEADER_LEN` bytes has a durable
+  header (bad one = loud corruption) and `decode_wal` accepts any file
+  *shorter* than the header, whatever its bytes, as an empty torn tail.
+  No encoding/fixture change. Tests that interrupt the Nth `sync` by ordinal
+  must count the header sync (`lsm_group_commit.rs`).
 - **Format versioning is now a standing rule for every format in this
   crate, not just the WAL** (ADR 0073 Phase 0). `StorageError::
   PreBaselineFormat { format }` / `StorageError::UnsupportedFormatVersion {
