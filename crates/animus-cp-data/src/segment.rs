@@ -401,7 +401,30 @@ pub fn decode(bytes: &[u8]) -> Result<Segment, SegmentError> {
             max_supported: VERSION,
         });
     }
-    decode_body(&bytes[5..]).map_err(|detail| FormatError::Malformed {
+    let body = &bytes[5..];
+    match version {
+        1 => decode_v1(body),
+        found => Err(FormatError::UnsupportedFormatVersion {
+            format: FORMAT_NAME,
+            found,
+            max_supported: VERSION,
+        }),
+    }
+}
+
+/// Retired format versions (ADR 0073 "The decoder pattern", point 4). Each
+/// retired version `N` gets a submodule `legacy::vN` holding its frozen
+/// decoder, the frozen shape type that decoder produces (`VNFoo`), and the
+/// `From<VNFoo>` translation into the current in-memory type; the version
+/// `match` in the public decoder routes to it. Kept forever, edited only by
+/// mechanical compile fixes. Empty today: every version of this codec is
+/// still v1, i.e. current.
+mod legacy {}
+
+/// The version-1 (current) body decoder: everything after the magic +
+/// version byte. When v2 lands this moves, frozen, into [`legacy`].
+fn decode_v1(body: &[u8]) -> Result<Segment, SegmentError> {
+    decode_body(body).map_err(|detail| FormatError::Malformed {
         format: FORMAT_NAME,
         detail,
     })

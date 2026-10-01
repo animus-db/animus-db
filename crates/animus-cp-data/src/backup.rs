@@ -329,7 +329,21 @@ pub fn encode_data_chunk(rows: &[SeedRow]) -> Vec<u8> {
 /// A typed [`FormatError`]: `PreBaselineFormat` (no magic), `UnsupportedFormatVersion`
 /// (`0`/future), `Malformed` (truncated or trailing bytes).
 pub fn decode_data_chunk(bytes: &[u8]) -> Result<Vec<SeedRow>, BackupCodecError> {
-    let (_version, body) = format::unwrap(&DATA_TAG, bytes)?;
+    let (version, body) = format::unwrap(&DATA_TAG, bytes)?;
+    match version {
+        1 => decode_data_v1(body),
+        found => Err(FormatError::UnsupportedFormatVersion {
+            format: DATA_TAG.name,
+            found,
+            max_supported: DATA_TAG.version,
+        }),
+    }
+}
+
+/// The version-1 (current) `backup-data` body decoder: everything after the
+/// `BKDT` magic + version byte. When v2 lands this moves, frozen, into
+/// [`legacy`] (ADR 0073 "The decoder pattern", point 4).
+fn decode_data_v1(body: &[u8]) -> Result<Vec<SeedRow>, BackupCodecError> {
     let malformed = |detail: String| FormatError::Malformed {
         format: DATA_TAG.name,
         detail,
@@ -441,12 +455,35 @@ pub fn encode_manifest_object(obj: &BackupManifestObject) -> Vec<u8> {
 /// `0` or a future one, [`FormatError::Malformed`] for a bad/trailing-garbage
 /// JSON body.
 pub fn decode_manifest_object(bytes: &[u8]) -> Result<BackupManifestObject, BackupCodecError> {
-    let (_version, body) = format::unwrap(&MANIFEST_TAG, bytes)?;
+    let (version, body) = format::unwrap(&MANIFEST_TAG, bytes)?;
+    match version {
+        1 => decode_manifest_v1(body),
+        found => Err(FormatError::UnsupportedFormatVersion {
+            format: MANIFEST_TAG.name,
+            found,
+            max_supported: MANIFEST_TAG.version,
+        }),
+    }
+}
+
+/// The version-1 (current) `backup-manifest` body decoder (JSON). When v2
+/// lands this moves, frozen, into [`legacy`] (ADR 0073 "The decoder
+/// pattern", point 4).
+fn decode_manifest_v1(body: &[u8]) -> Result<BackupManifestObject, BackupCodecError> {
     serde_json::from_slice(body).map_err(|e| FormatError::Malformed {
         format: MANIFEST_TAG.name,
         detail: e.to_string(),
     })
 }
+
+/// Retired format versions (ADR 0073 "The decoder pattern", point 4). Each
+/// retired version `N` gets a submodule `legacy::vN` holding its frozen
+/// decoder, the frozen shape type that decoder produces (`VNFoo`), and the
+/// `From<VNFoo>` translation into the current in-memory type; the version
+/// `match` in the public decoder routes to it. Kept forever, edited only by
+/// mechanical compile fixes. Empty today: every version of this codec is
+/// still v1, i.e. current.
+mod legacy {}
 
 #[cfg(test)]
 mod tests {

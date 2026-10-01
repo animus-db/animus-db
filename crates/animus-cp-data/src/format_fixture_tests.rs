@@ -139,7 +139,9 @@ fn raftkv_wire_decodes_every_checked_in_fixture_structurally() {
                 }
                 assert_eq!(variants.len(), 16, "all KvCommand variants: {variants:?}");
             }
-            other => panic!("raftkv-wire v{other} fixture has no structural expectation yet"),
+            other => panic!(
+                "raftkv-wire fixture v{other} has no expected value — add one (ADR 0073 checklist step 4)"
+            ),
         }
     }
 }
@@ -231,7 +233,9 @@ fn raftkv_image_decodes_every_checked_in_fixture_structurally() {
                 assert_eq!(got, v1_image(), "v1 structural");
                 assert!(got.0.is_some(), "nonzero max_ts header");
             }
-            other => panic!("raftkv-image v{other} fixture has no structural expectation yet"),
+            other => panic!(
+                "raftkv-image fixture v{other} has no expected value — add one (ADR 0073 checklist step 4)"
+            ),
         }
     }
 }
@@ -343,7 +347,9 @@ fn raftkv_wal_decodes_every_checked_in_fixture_structurally() {
                 assert_eq!(appended, sample_entries().len());
             }
             2 => assert_eq!(got, v1_wal_records(), "v2 structural (markers consumed)"),
-            other => panic!("raftkv-wal v{other} fixture has no structural expectation yet"),
+            other => panic!(
+                "raftkv-wal fixture v{other} has no expected value — add one (ADR 0073 checklist step 4)"
+            ),
         }
     }
 }
@@ -445,7 +451,9 @@ fn cp_engine_layout_decodes_every_checked_in_fixture_structurally() {
                 assert_eq!(value, &[b'K', b'L', b'Y', b'1', 1], "v1 value bytes");
                 assert_eq!(crate::layout::decode_layout_value(value), Ok(1));
             }
-            other => panic!("cp-engine-layout v{other} fixture has no structural expectation yet"),
+            other => panic!(
+                "cp-engine-layout fixture v{other} has no expected value — add one (ADR 0073 checklist step 4)"
+            ),
         }
     }
 }
