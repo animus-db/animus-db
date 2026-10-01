@@ -123,7 +123,9 @@ fn backup_manifest_fixtures_decode_structurally() {
                 assert_eq!(obj.total_bytes(), 1_000 + u64::MAX / 2);
                 assert_eq!(obj, want);
             }
-            other => panic!("fixture v{other} has no structural assertions yet"),
+            other => panic!(
+                "fixture v{other} has no expected value — add one (ADR 0073 checklist step 4)"
+            ),
         }
     }
 }
@@ -246,7 +248,9 @@ fn backup_data_fixtures_decode_structurally() {
                 assert_eq!(rows[3].3, u64::MAX);
                 assert_eq!(rows, v1_rows());
             }
-            other => panic!("fixture v{other} has no structural assertions yet"),
+            other => panic!(
+                "fixture v{other} has no expected value — add one (ADR 0073 checklist step 4)"
+            ),
         }
     }
 }

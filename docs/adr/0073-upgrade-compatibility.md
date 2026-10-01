@@ -216,6 +216,11 @@ range a format needs:
 | PITR change-log segments | reuses the segment codec above (`segment.rs`, `SEGF` + `segment::VERSION`) as a fifth change-log consumer | versioned (inherits `segment.rs`) | durable, outlives the cluster (a PITR restore window can span a long retention period, default 35 days, but the *segments themselves* are read back by a restore that could run against a much later binary) | Inherits the same version discipline as streams (Workstream E confirmed the inheritance with a test that reads the sealed object's raw bytes); the open question is support *window* length, not mechanism. |
 | S3 export/import objects (ADR 0068) | `crates/animusd/src/import.rs`, export path (JSON-lines + manifest, gzip'd, DynamoDB's own format) | **externally defined by AWS's export/import format, not internally versioned by this repo**; `IMPORT_SEED_VERSION: u64 = 1` is an MVCC seed-version constant (a `merge` precondition), not a *format* version | durable, outlives the cluster | Because the on-wire *content* format is AWS's own documented export/import layout, cross-version compatibility here is largely inherited "for free," as long as this repo keeps emitting/consuming that fixed external shape rather than an internal one. |
 | Encryption envelope (ADR 0069) | `crates/animus-env/src/encrypted.rs` | `MAGIC = b"ADE1"`, `VERSION: u8 = 1` | durable, node-local (wraps every other on-disk format transparently at the `Disk` seam) | Versioned, magic-guarded, same discipline as the LSM manifest and the RaftKV/segment codecs — this is the second format in the table (after the LSM manifest) that already meets the Phase 0 bar. |
+| Stored-item codec (base-row value; ADR 0054 step 1) | `crates/animus-item/src/stored.rs` (`encode_stored_item`/`decode_stored_item`/`encode_tombstone`/`stored_item_version`) | **untagged JSON, frozen serde shape** (2026-09-30 decision, see "Row-value formats: freeze, don't tag"): `{"item": {..}}` / the bare JSON string `"tombstone"` over `AttributeValue`'s derived serde form (externally tagged, e.g. `{"S":"x"}`, `"Null"`, `{"B":[0,255]}`); fixture `crates/animus-item/tests/fixtures/formats/stored-item/v1.json`; v1 is identified by a first non-whitespace byte of `{` (live item) or `\"` (tombstone) | **durable, outlives the cluster** (every base row, and therefore every backup, PITR segment and export carrying one) | Opaque inside `raftkv-wal`/`segment`/`backup-data` payloads until the P1-A fixture. `AttributeValue`/`Item` are part of this format: changing their serde shape is a format change. |
+| Change record (`ChangeRecord`, change-log value; ADR 0041/0049) | `crates/animus-item/src/index.rs` (`ChangeRecord::encode`/`decode`/`version_of`) | **untagged JSON, frozen serde shape** (same decision): `{"base_sk":[..],"old_image":..,"new_image":..,"seeded":..,"marker":..,"staged":..,"ttl_expired":..}`; additions are `#[serde(default)]` only; fixture `crates/animus-item/tests/fixtures/formats/change-record/v1.json`; v1 identified by a leading `{` | **durable, outlives the cluster** (PITR segments and backups carry change records; Streams reads them) | A new `#[serde(default)]` must mean "what the old writer meant" (review-enforced; the fixture test also pins a pre-flag record). |
+| `numkey` (DynamoDB `N` key encoding, ADR 0063) — **pinned vectors, not a tagged format** | `crates/animus-item/src/numkey.rs` | **none by design**; pinned by fixture `crates/animus-item/tests/fixtures/formats/numkey/v1.json` (input → `encode`/`encode_checked`/`decode`, edge cases from the unit tests: zero forms, ordering regressions, range extremes, 38-digit cap, malformed text), checked by `tests/numkey_vectors.rs` | durable, outlives the cluster (inside every stored `N` key) | The fixture is the compatibility pin; a vector change is a breaking key-space change needing an ADR amendment. See the open question on the hash-ring/key-encoding layer. |
+| `AttributeValue::key_bytes` — **pinned vectors, not a tagged format** | `crates/animus-item/src/lib.rs` (`pub(crate)`; test in `src/key_bytes_vectors.rs`) | **none by design**; fixture `crates/animus-item/tests/fixtures/formats/key-bytes/v1.json` (every `AttributeValue` variant → key bytes, incl. the malformed-`N` raw-text fallback and the empty encoding of non-key types) | durable, outlives the cluster | As above; the fixture's `value` side also pins `AttributeValue`'s serde shape. |
+| Hash-ring token + key `escape` — **pinned vectors, not a tagged format** | `crates/animus-tablet/src/lib.rs` (`partition_token`/`murmur3_x64_128`, `escape`) | **none by design**; fixtures `crates/animus-tablet/tests/fixtures/formats/partition-token/v1.json` and `.../escape/v1.json` (every murmur3 tail length and block boundary, embedded `0x00`s), checked by `tests/format_fixtures.rs`; the canonical-reference unit test stays | durable, outlives the cluster | Refines the "Hash-ring token / key encoding" row above: the pin now lives in checked-in fixtures covered by the append-only guard, not only in in-source vectors. Whether the layer ever gets a version tag remains the open question below. |
 
 **Summary — formats with *no* version tag at all today:** the LSM WAL, the
 control-plane Raft WAL and snapshot/`InstallSnapshot` payload, `Metadata`'s
@@ -1031,8 +1036,9 @@ Outside the fixture directories, three more durable groups matter:
   differential tests, not by `tests/fixtures/formats/`, so
   `check-format-fixtures.sh` does not cover it.
 - **Row values that were never in the inventory**: the stored-item codec
-  (`animus-item/src/stored.rs`, `{"item": ..}` / `{"tombstone": true}`
-  JSON in every base-row value), `ChangeRecord` (`animus-item/src/index.rs`,
+  (`animus-item/src/stored.rs`, `{"item": ..}` / `"tombstone"` JSON in
+  every base-row value; this audit originally repeated the module doc's
+  wrong `{"tombstone": true}`, corrected by P1-A's fixture), `ChangeRecord` (`animus-item/src/index.rs`,
   serde JSON with `#[serde(default)]` additions), and the per-entity JSON
   values of the `Metadata` system-keyspace mirror (`syskv.rs` /
   `mirror.rs`). They are untagged, and no fixture pins their exact shape
@@ -1370,5 +1376,75 @@ rule already binds the code; the Phase 1 close-out PR rewrites all of them
 in one change and updates this ADR's status header.
 
 **Phase status after this amendment:** Phase 0 done; **Phase 1 in progress**
-(design accepted, P1-A..P1-D not started); Phases 2 and 3 planned, blocked
+(design accepted; P1-A implemented, see "P1-A as built" below; P1-B..P1-D
+in flight); Phases 2 and 3 planned, blocked
 on Phase 1 as before.
+
+### Row-value formats: freeze, don't tag (2026-09-30 decision, P1-A)
+
+The audit above found two durable row values that were in no inventory and
+pinned by no fixture: the stored-item codec and `ChangeRecord`. Decision
+(adopting the Phase 1 proposal):
+
+- **Freeze the serde shape; do not add a tag now.** Both are untagged JSON
+  written by `serde_json`. Their shape, *including* `AttributeValue`/`Item`
+  (externally tagged enum: `{"S":".."}`, `{"Bool":true}`, `"Null"`,
+  `{"B":[..]}` as a number array, sets as arrays, `M` as an object), is a
+  frozen format. Changes are **additive-only** (a new `#[serde(default)]`
+  field or a new variant) and each ships with a new golden fixture; anything
+  else is a new *tagged* version via the normal checklist. A `legacy` module
+  that embeds `AttributeValue`/`Item` (decoder pattern, point 4) can rely on
+  this. The types carry a doc comment saying so.
+- **v1 is sniffable.** v1 is untagged JSON. A stored item is `{"item":{..}}`
+  (first non-whitespace byte `{`) or the tombstone, which is the bare JSON
+  *string* `"tombstone"` (serde serializes a unit variant as a string, not as
+  the `{"tombstone":true}` object the module doc used to claim; first byte
+  `"`). A `ChangeRecord` is always an object (`{`). The writers emit no
+  leading whitespace; it is skipped only to accept what the parser always
+  accepted. `animus_item::stored::stored_item_version` (`{` or `"`) and
+  `ChangeRecord::version_of` (`{`) return `Some(1)` for that form and `None`
+  otherwise, and the decoders dispatch through them. A later tagged v2 must
+  start with a byte that is neither `{` nor `"` nor whitespace, so the sniff
+  stays unambiguous with no migration of existing rows.
+- **Fixtures** (`crates/animus-item/tests/fixtures/formats/{stored-item,
+  change-record}/v1.json`) are produced by the current writer (no format
+  change), with `#[ignore]`d no-overwrite generators, a per-version expected
+  value that panics on a fixture with no expectation, and round-trip tests.
+  The tombstone (`"tombstone"`) is pinned by an inline byte assertion.
+
+### P1-A as built (2026-09-30)
+
+One four-PR stack, no format change (every tag is still v1, no existing
+fixture edited):
+
+1. **Backup/PITR dispatch seam** (`animus-cp-data`): `backup-data`
+   (`backup::decode_data_chunk`), `backup-manifest`
+   (`backup::decode_manifest_object`) and `segment` (`segment::decode`) keep
+   the header gate's named errors for `0` and `> CURRENT`, then
+   `match version { 1 => decode_<fmt>_v1(body), found =>
+   Err(UnsupportedFormatVersion { .. }) }`. The segment fixture test asserts
+   a fixture exists for `segment::VERSION` instead of `VERSION == 1`.
+2. **raftkv/layout dispatch seam** (`animus-cp-data`): the same for
+   `raftkv-wire` (`codec::decode_wire`), `raftkv-image`
+   (`codec::decode_image`; `codec::check_header` now returns the version it
+   checked) and `cp-engine-layout` (`layout::decode_layout_value`, whose
+   version *is* the epoch). `raftkv-wal` has no cp-data decoder to dispatch:
+   it is read by `animus-control`'s `PersistedState::decode` through
+   `format::decode_lines` (P1-C's); only its fixture test lives here, and it
+   was hardened.
+3. **Row values** (`animus-item`): `stored-item` and `change-record`
+   fixtures, the freeze decision above, and the v1 sniffs.
+4. **Key vectors** (`animus-item`, `animus-tablet`): `numkey`, `key-bytes`,
+   `partition-token` (murmur3) and `escape` pinned as fixtures.
+
+**The `legacy` convention (what P1-B/C/D copy).** Each format file has a
+private `mod legacy {}` directly after its public decoder, documented as the
+home of `legacy::vN` (frozen decoder, frozen `VNFoo` shape, `From<VNFoo>`
+translation), empty while the format is at v1. The current body decoder is
+a private `decode_<fmt>_v1(body)`; bumping to v2 moves it into
+`legacy::v1` and adds a `2 =>` arm. Every fixture test's per-version
+expectation is a `match` whose fallback arm panics with "fixture v{N} has
+no expected value — add one (ADR 0073 checklist step 4)". The
+`legacy-encoders` feature is not added here: nothing is retired yet, so
+there is no encoder to gate; P1-D introduces the feature with its first
+consumer.

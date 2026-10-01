@@ -199,3 +199,20 @@ attribute that does not delete-then-reput the same row, and a delete) — the
 apply-path integration coverage (`KvCommand::KindEval` end to end) lives in
 `animus-cp-data`'s own `tests/kind_eval.rs` instead, since this crate has no
 Raft/apply machinery to integration-test against.
+
+## Format fixtures (ADR 0073, P1-A)
+
+`tests/fixtures/formats/` pins the durable row values and key encodings;
+`scripts/check-format-fixtures.sh` makes them append-only.
+- `stored-item/v1.json`, `change-record/v1.json` (`tests/format_fixtures.rs`):
+  untagged JSON, **frozen serde shape** (`AttributeValue`/`Item` included —
+  additive-only with a new fixture, else a new tagged version). v1 is sniffed
+  by `stored::stored_item_version` (first non-whitespace byte `{` or `"` — a
+  tombstone is the bare string `"tombstone"`, not an object) and
+  `ChangeRecord::version_of` (`{`). Note the serde variant names (`Bool`,
+  `Null`) differ from the DynamoDB wire names (`BOOL`, `NULL`).
+- `numkey/v1.json` (`tests/numkey_vectors.rs`) and `key-bytes/v1.json`
+  (`src/key_bytes_vectors.rs`, in-crate because `key_bytes` is `pub(crate)`):
+  pinned input -> bytes vectors, not tagged formats. Editing an expected
+  vector is a key-space break; add cases by a new `vN.json`, never by editing.
+- Each fixture has an `#[ignore]`d no-overwrite `generate_fixture_*`.
