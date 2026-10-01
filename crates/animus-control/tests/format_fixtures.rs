@@ -100,6 +100,21 @@ fn encode_all(records: &[WalRecord<MetaCommand, Metadata>]) -> Vec<u8> {
     bytes
 }
 
+/// The exact bytes a current (v2) writer produces for [`v1_records`] as two
+/// persist rounds: records 0..2 and a sync marker, then records 2.. and a
+/// second marker — each marker appended after the round it covers, at the
+/// file length it claims.
+fn v2_wal_bytes() -> Vec<u8> {
+    let records = v1_records();
+    let mut bytes = Vec::new();
+    for round in [&records[..2], &records[2..]] {
+        bytes.extend(encode_all(round));
+        let marker = animus_control::format::encode_sync_marker(&CONTROL_WAL, bytes.len() as u64);
+        bytes.extend(marker);
+    }
+    bytes
+}
+
 /// Iterates every file under `tests/fixtures/formats/control-wal/` (never
 /// naming `v1` literally, per the ADR 0073 Phase 0 conventions — a future
 /// version's own fixture needs no test-code change) and asserts each
@@ -127,6 +142,23 @@ fn decodes_every_checked_in_fixture_structurally() {
                     decoded,
                     v1_records(),
                     "{name} decoded to an unexpected value"
+                );
+                checked += 1;
+            }
+            "v2.bin" => {
+                // Same records as v1 (the payload shape did not change); the
+                // sync markers are consumed by the decoder.
+                let decoded = PersistedState::<MetaCommand, Metadata>::decode(&bytes)
+                    .unwrap_or_else(|e| panic!("{name} failed to decode: {e}"));
+                assert_eq!(
+                    decoded,
+                    v1_records(),
+                    "{name} decoded to an unexpected value"
+                );
+                assert_eq!(
+                    bytes,
+                    v2_wal_bytes(),
+                    "{name}: current writer emits the fixture"
                 );
                 checked += 1;
             }
@@ -160,7 +192,8 @@ fn round_trips_through_encode_and_decode() {
 /// tag sits right after the 8-hex-digit checksum and its colon.
 #[test]
 fn fixture_starts_with_the_control_wal_tag() {
-    let bytes = std::fs::read(fixtures_dir().join("v1.bin")).expect("v1.bin fixture is checked in");
+    let bytes = std::fs::read(fixtures_dir().join(format!("v{}.bin", CONTROL_WAL.version)))
+        .expect("the current version's fixture is checked in");
     assert_eq!(&bytes[9..13], &CONTROL_WAL.magic);
     assert_eq!(
         &bytes[13..15],
@@ -188,7 +221,7 @@ fn generate_fixture_control_wal() {
             path.display()
         );
     }
-    let bytes = encode_all(&v1_records());
+    let bytes = v2_wal_bytes();
     std::fs::write(&path, &bytes).unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
 }
 

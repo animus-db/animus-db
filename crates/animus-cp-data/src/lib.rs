@@ -7462,6 +7462,17 @@ async fn persist_wal<E: Env>(
         progress.complete_drain(round);
     }
     apply_signal.notify();
+    // Issue #1132: the per-group WAL's sync marker (after the sync, after the
+    // acks, under `wal_lock`). The shared-WAL branch writes its own markers
+    // inside `SharedWal::flush`, so only the private-file branch needs one.
+    if shared.is_none() {
+        animus_control::persist::append_sync_marker(
+            env,
+            &animus_control::persist::CONTROL_WAL,
+            wal,
+        )
+        .await;
+    }
 }
 
 /// Whether `key` falls inside any range this group has already sealed
@@ -11274,14 +11285,15 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
     let state = if let Some(shared) = &shared_wal {
         shared.recovered_state(tablet).await
     } else {
-        let bytes = env.read(&wal).await.unwrap_or_default();
+        // Issue #1132: `recover` also cuts a torn tail back on disk (see
+        // `PersistedState::recover`), so later appends never sit after garbage.
         // ADR 0073 Phase 0 workstream B: `PersistedState::decode` is now
         // fallible (pre-baseline / unknown-version / malformed WAL). `drive`
         // is spawned fire-and-forget with no `Result` to propagate into, so
         // mirror `animus_control::node::drive`: log the named error loudly
         // and halt this group before recovery — never panic, never recover
         // as an empty log.
-        match PersistedState::decode(&bytes) {
+        match PersistedState::recover(&env, &wal).await {
             Ok(records) => PersistedState::replay(records),
             Err(e) => {
                 tracing::error!(

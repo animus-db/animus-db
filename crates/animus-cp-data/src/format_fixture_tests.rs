@@ -296,11 +296,39 @@ fn v1_wal_records() -> Vec<Rec> {
     recs
 }
 
+/// One `CWL1` **version 1** line, exactly as a v1 writer framed it (the
+/// current `encode_record` now writes v2): the legacy encoder for this
+/// fixture (ADR 0073 checklist step 7), anchored by the byte-equality test
+/// below.
+fn v1_wal_line(r: &Rec) -> Vec<u8> {
+    const V1: animus_control::format::FormatTag = animus_control::format::FormatTag {
+        magic: *b"CWL1",
+        version: 1,
+        name: "control-wal",
+    };
+    animus_control::format::encode_line(&V1, &serde_json::to_vec(r).expect("serializes"))
+}
+
 fn v1_wal_bytes() -> Vec<u8> {
-    v1_wal_records()
-        .iter()
-        .flat_map(PersistedState::<KvCommand, KvState>::encode_record)
-        .collect()
+    v1_wal_records().iter().flat_map(v1_wal_line).collect()
+}
+
+/// The v2 layout (#1132): the same records as two persist rounds, each
+/// followed by its sync marker at the file length it claims.
+fn v2_wal_bytes() -> Vec<u8> {
+    let recs = v1_wal_records();
+    let mid = recs.len() / 2;
+    let mut bytes = Vec::new();
+    for round in [&recs[..mid], &recs[mid..]] {
+        for r in round {
+            bytes.extend(PersistedState::<KvCommand, KvState>::encode_record(r));
+        }
+        bytes.extend(animus_control::format::encode_sync_marker(
+            &animus_control::persist::CONTROL_WAL,
+            bytes.len() as u64,
+        ));
+    }
+    bytes
 }
 
 #[test]
@@ -314,6 +342,7 @@ fn raftkv_wal_decodes_every_checked_in_fixture_structurally() {
                 let appended = got.iter().filter(|r| matches!(r, Rec::Append(_))).count();
                 assert_eq!(appended, sample_entries().len());
             }
+            2 => assert_eq!(got, v1_wal_records(), "v2 structural (markers consumed)"),
             other => panic!("raftkv-wal v{other} fixture has no structural expectation yet"),
         }
     }
@@ -322,20 +351,27 @@ fn raftkv_wal_decodes_every_checked_in_fixture_structurally() {
 #[test]
 fn raftkv_wal_round_trips_and_matches_the_fixture_bytes() {
     for (version, bytes) in fixture_files(&formats_dir("raftkv-wal")) {
-        if version != 1 {
-            continue;
+        match version {
+            1 => {
+                let recs = PersistedState::<KvCommand, KvState>::decode(&bytes).expect("decode");
+                let re: Vec<u8> = recs.iter().flat_map(v1_wal_line).collect();
+                assert_eq!(
+                    re, bytes,
+                    "v1: decode -> legacy encode reproduces the fixture"
+                );
+                assert_eq!(
+                    v1_wal_bytes(),
+                    bytes,
+                    "v1: legacy encoder emits the fixture"
+                );
+            }
+            2 => assert_eq!(
+                v2_wal_bytes(),
+                bytes,
+                "v2: current encoder + markers emit the fixture"
+            ),
+            other => panic!("raftkv-wal v{other} fixture has no byte expectation yet"),
         }
-        let recs = PersistedState::<KvCommand, KvState>::decode(&bytes).expect("decode");
-        let re: Vec<u8> = recs
-            .iter()
-            .flat_map(PersistedState::<KvCommand, KvState>::encode_record)
-            .collect();
-        assert_eq!(re, bytes, "v1: decode -> encode reproduces the fixture");
-        assert_eq!(
-            v1_wal_bytes(),
-            bytes,
-            "v1: current encoder emits the fixture"
-        );
     }
 }
 
@@ -373,7 +409,11 @@ fn raftkv_wal_txn_write_fields_are_required() {
 #[test]
 #[ignore]
 fn generate_fixture_raftkv_wal() {
-    write_new_fixture(&formats_dir("raftkv-wal"), 1, &v1_wal_bytes());
+    write_new_fixture(
+        &formats_dir("raftkv-wal"),
+        animus_control::persist::CONTROL_WAL.version,
+        &v2_wal_bytes(),
+    );
 }
 
 // ---------------------------------------------------------------------------

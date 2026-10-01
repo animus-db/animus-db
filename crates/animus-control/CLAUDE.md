@@ -240,26 +240,40 @@ per-tablet CP data plane (`animus-cp-data`).
 
   **Every WAL line carries a per-record CRC32 checksum (issue #495)**:
   `<crc32 as 8 lowercase hex chars>:<tag+payload>\n`, checked in
-  `format::decode_lines` before the JSON is ever parsed. Before this, the
+  `format::decode_lines_extent` before the JSON is ever parsed. Before this, the
   newline-terminated-`serde_json` framing had no way to distinguish a
   bit-flip that happened to keep a record's JSON syntactically valid (e.g.
   a digit inside a packed numeric field) from a legitimate value — it
   decoded successfully into a silently wrong record instead of a decode
   error, confirmed to reach a hard panic once such a record applied past
   `animus_cp_data::assert_ts_monotonic` (`docs/engineering-lessons.md` has
-  the full account). **A checksum failure is treated exactly like a torn
-  trailing line**: `decode`/`decode_tagged` stop at the first bad record
-  and drop it plus everything physically after it in the buffer — never
-  applied, never a panic. This is a deliberately simpler rule than
-  `animus-storage`'s own CRC-checked WAL framing, which additionally
-  distinguishes real mid-file corruption (hard error) from a torn tail
-  (tolerated) by checking whether a valid record follows; this WAL has no
-  invariant that needs that finer distinction, since a dropped tail-of-log
-  is always safe to recover from here. No back-compat/migration for a
-  pre-existing unchecksummed WAL file — an upgraded node needs a fresh WAL,
-  as with any format change made before ADR 0073's baseline (root
-  `CLAUDE.md`'s upgrade-compatibility section); this WAL envelope is itself
-  in scope for ADR 0073 Phase 0 workstream B's reset.
+  the full account). **A checksum failure is a torn tail only if no durable
+  sync marker proves otherwise (issue #1132, `CWL1`/`SWL1` v2).** Until v2,
+  `decode`/`decode_tagged` stopped at the first bad record anywhere and
+  silently dropped it plus everything after, so rot in an early line lost
+  acked history. v2 writers append a `!sync:<N>` marker line after every
+  successful `fsync` (`persist::append_sync_marker`; `N` = file length = the
+  marker's own offset), and `format::decode_lines_extent` returns
+  `FormatError::MidFileCorruption {offset, durable_to}` for a bad line that
+  starts before the greatest valid marker (it keeps scanning past the first
+  bad line for markers, so a rotted first line cannot hide the proof). A bad
+  line at or after the last marker is still a tolerated tail; a marker-less
+  (v1) file keeps the old lenient rule. **Do not "simplify" this to the LSM
+  WAL's "a valid line follows" resync proof**: a persist round appends N lines
+  and syncs once, and `corrupt_on_crash` flips a byte anywhere in the kept part
+  of that un-synced region, so a correct writer plus a crash yields "bad line,
+  valid line" (72/300 seeds); see
+  `docs/lessons/testing/2026-10-01-a-positional-torn-tail-proof-needs-a-durable-sync-boundary.md`.
+  **Writers repair on open**: `PersistedState::recover` (control + per-group
+  WAL) and `SharedWal::open` cut a torn tail back with `Disk::replace` before
+  any append; without it the next appends sit after garbage and the next
+  recovery refuses the file. The marker is written after the sync, after acks
+  are released, under the same lock as the appends (so its offset is exact),
+  and is best-effort. Tests: `tests/wal_midfile_corruption.rs`. Residual: the
+  latest round has no durable marker until the next sync; a disk that lied
+  about `fsync` can now fail loudly. Corruption of a CRC-valid line's
+  *payload* was always loud (`Malformed`). No back-compat for a pre-checksum
+  WAL file (pre-baseline).
 
 - **`detector.rs`** — `FailureDetector` (ADR 0012): a pure, unit-tested
   interval+timeout liveness detector. No clock, no RNG.
@@ -403,10 +417,11 @@ body decoder per format (`wal_record` for `control-wal`, `shared_wal_line` for
 `shared-wal` — its only decode site is `PersistedState::decode_tagged`, here,
 not in `animus-cp-data` — and `snapshot_body` for `control-snapshot`, used by
 `raft.rs`'s InstallSnapshot install and `node.rs`'s `decode_syskv_image_bytes`).
-A bound-and-dropped `_version` is a review failure. v1 is still the current
-shape, so there is no `legacy` module yet: a v2 adds an arm and moves the v1
-arm's body to a frozen `persist::legacy::v1` with a `From` translation (ADR
-0073 "Phase 1 design" checklist). Do not change the `format.rs` helpers'
+A bound-and-dropped `_version` is a review failure. `control-wal` is now v2
+(#1132): `dispatch::wal_record` has `1 => legacy::v1::wal_record`, `2 =>` current
+(the record payload shape is unchanged; v2 adds marker lines the line decoder
+consumes), with a `cfg(test)` v1 legacy encoder anchoring the v1 fixture
+(ADR 0073 "Phase 1 design" checklist). Do not change the `format.rs` helpers'
 signatures (`unsupported_version` is an addition).
 
 **P1-C (metadata):** `Metadata::from_json` dispatches with `match` on the peeked `"v"`; `Metadata`'s serde default on `"v"` deliberately stays (frozen `control-wal`/`shared-wal`/`control-snapshot` fixtures embed a `"v"`-less `Metadata`; see the field's doc). The fixture test is per-version (name-derived version, per-version expected value, panics on an unrecognised one).
@@ -453,7 +468,9 @@ tag plus two independent framing shapes:
   write cut short by a crash — no `:` separator, a non-8-hex-digit prefix,
   a CRC mismatch, or a body too short to hold `magic + version` once the
   CRC does check out) **stops decoding silently**, returning whatever was
-  collected before it — never an `Err`, since a torn/un-fsynced write was
+  collected before it, **unless a v2 sync marker proves the bad line was
+  already durable** (`MidFileCorruption`; `BadSyncMarker` for a marker not at
+  its own offset — see the persist.rs entry above) — never an `Err` otherwise, since a torn/un-fsynced write was
   never acknowledged either way (durable-before-visible, ADR 0009), so
   recovering it or not is equally safe. A **CRC-valid line with the wrong
   magic** is `Err(PreBaselineFormat)` — exactly what a pre-baseline,
@@ -461,7 +478,9 @@ tag plus two independent framing shapes:
   correctly-tagged line with an unsupported version** is
   `Err(UnsupportedFormatVersion)`.
 
-**`persist::CONTROL_WAL`** (magic `CWL1`, version 1) is what
+**`persist::CONTROL_WAL`** (magic `CWL1`, **version 2** since #1132; v1 is
+`dispatch::legacy::v1`, fixture `control-wal/v1.bin`, v2 fixture
+`control-wal/v2.bin` with markers) is what
 `PersistedState::encode_record`/`PersistedState::decode` use via
 `format::encode_line`/`format::decode_lines` — replacing the two-generation
 "a reader distinguishes them structurally, not by a tag" scheme ADR 0073's

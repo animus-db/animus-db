@@ -23,7 +23,7 @@ use crate::detector::FailureDetector;
 use crate::format::{self, FormatError};
 use crate::meta::{Member, MetaCommand, Metadata, NodeStatus, PlacementView};
 use crate::mirror::{self, KeyWrite, RebuildError};
-use crate::persist::{CONTROL_SNAPSHOT, PersistedState};
+use crate::persist::{CONTROL_SNAPSHOT, CONTROL_WAL, PersistedState, append_sync_marker};
 use crate::persist_round::{self, GatedOuts, PersistArm, PersistFut, PersistProgress, PersistWake};
 use crate::raft::{Out, ProposeResult, RaftCore, RaftMsg, Role};
 use crate::syskv;
@@ -1270,8 +1270,10 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
     halted: Arc<AtomicBool>,
 ) {
     // Recover from the WAL before serving anything.
-    let bytes = env.read(WAL).await.unwrap_or_default();
-    let records = match PersistedState::decode(&bytes) {
+    // Issue #1132: `recover` also cuts a torn tail back on disk, so this
+    // node's later appends never sit after garbage (which the v2 mid-file
+    // rule would otherwise refuse on the next recovery).
+    let records = match PersistedState::recover(&env, WAL).await {
         Ok(records) => records,
         Err(e) => {
             // ADR 0073 Phase 0 workstream B: a WAL that fails to decode —
@@ -3030,6 +3032,10 @@ async fn persist_wal<E: Env>(
         core.mark_durable_through(through);
         progress.complete_drain(round);
     }
+    // Issue #1132: record that everything before this point is fsynced, AFTER
+    // the sync and after acks are released (so it adds no ack latency), still
+    // under `wal_lock` so nothing appends between the sync and the marker.
+    append_sync_marker(env, &CONTROL_WAL, WAL).await;
     records.len()
 }
 

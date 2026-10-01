@@ -45,7 +45,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use animus_env::NodeId;
+use animus_env::{Env, NodeId};
 /// Version dispatch for the three control-plane formats (ADR 0073 Phase 1,
 /// workstream P1-C): `format::unwrap`/`decode_lines` hand back the version
 /// byte and each body decoder here `match`es on it, so a future v2 adds an
@@ -67,13 +67,55 @@ pub(crate) mod dispatch {
         }
     }
 
+    /// Frozen decoders for retired versions (ADR 0073 Phase 1). Never edited
+    /// to change behaviour.
+    pub(crate) mod legacy {
+        /// `CWL1` version 1: the record payload shape is the same
+        /// `serde_json` `WalRecord` as v2 (v2 only added sync-marker lines,
+        /// which the line decoder consumes before dispatch), and a v1 file
+        /// has no markers, so the line decoder keeps its lenient
+        /// torn-tail-anywhere behaviour for it.
+        pub(crate) mod v1 {
+            use crate::format::FormatError;
+            use crate::persist::CONTROL_WAL;
+            use serde::de::DeserializeOwned;
+
+            pub(crate) fn wal_record<T: DeserializeOwned>(
+                payload: &[u8],
+            ) -> Result<T, FormatError> {
+                serde_json::from_slice(payload)
+                    .map_err(|e| super::super::malformed(CONTROL_WAL.name, &e))
+            }
+
+            /// Test-only legacy encoder (ADR 0073 checklist step 7): the
+            /// exact bytes a v1 writer produced for one record, anchored to
+            /// `tests/fixtures/formats/control-wal/v1.bin` by a byte-equality
+            /// test in `persist::tests`.
+            #[cfg(test)]
+            pub(crate) fn encode_record<C, S>(record: &crate::persist::WalRecord<C, S>) -> Vec<u8>
+            where
+                C: serde::Serialize,
+                S: serde::Serialize,
+            {
+                use crate::format::{self, FormatTag};
+                const V1: FormatTag = FormatTag {
+                    magic: *b"CWL1",
+                    version: 1,
+                    name: "control-wal",
+                };
+                format::encode_line(&V1, &serde_json::to_vec(record).expect("serializes"))
+            }
+        }
+    }
+
     /// Body of one [`CONTROL_WAL`] line (a `WalRecord<C, S>`).
     pub(crate) fn wal_record<T: DeserializeOwned>(
         version: u8,
         payload: &[u8],
     ) -> Result<T, FormatError> {
         match version {
-            1 => serde_json::from_slice(payload).map_err(|e| malformed(CONTROL_WAL.name, &e)),
+            1 => legacy::v1::wal_record(payload),
+            2 => serde_json::from_slice(payload).map_err(|e| malformed(CONTROL_WAL.name, &e)),
             found => Err(format::unsupported_version(&CONTROL_WAL, found)),
         }
     }
@@ -118,7 +160,7 @@ use crate::raft::LogEntry;
 /// `crate::format`'s doc for the line shape/error semantics.
 pub const CONTROL_WAL: FormatTag = FormatTag {
     magic: *b"CWL1",
-    version: 1,
+    version: 2,
     name: "control-wal",
 };
 
@@ -166,6 +208,58 @@ pub const SHARED_WAL_TAG: FormatTag = FormatTag {
     version: 1,
     name: "shared-wal",
 };
+
+/// Why [`PersistedState::recover`] refused a WAL file.
+#[derive(Debug)]
+pub enum WalRecoverError {
+    /// The file failed to decode (named, typed: see [`FormatError`]).
+    Format(FormatError),
+    /// The file decoded, but cutting its torn tail back could not be made
+    /// durable.
+    Repair(std::io::Error),
+}
+
+impl std::fmt::Display for WalRecoverError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WalRecoverError::Format(e) => write!(f, "{e}"),
+            WalRecoverError::Repair(e) => write!(f, "tail repair failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for WalRecoverError {}
+
+/// Cut a torn/corrupt tail off `file` (see [`format::repaired_image`]) so the
+/// next append starts on a clean line. A no-op for an already-clean file.
+pub async fn repair_tail<E: Env>(
+    env: &E,
+    file: &str,
+    bytes: &[u8],
+    valid_len: usize,
+) -> std::io::Result<()> {
+    match format::repaired_image(bytes, valid_len) {
+        Some(clean) => env.replace(file, &clean).await,
+        None => Ok(()),
+    }
+}
+
+/// Append a sync marker to `file` for `tag` (version >= 2 only): call it
+/// **after** an `env.sync(file)` that returned `Ok` and covered the whole
+/// file, from the same critical section as the appends (nothing else may
+/// append between that sync and this marker, or the claimed offset would not
+/// be the marker's own start). Best-effort by design: a marker only ever
+/// *adds* a durability proof, so failing to write one (size or append error)
+/// merely leaves the earlier proof in force and never affects correctness.
+/// The marker is itself un-synced until the next sync and may be torn.
+pub async fn append_sync_marker<E: Env>(env: &E, tag: &FormatTag, file: &str) {
+    let Ok(len) = env.size(file).await else {
+        return;
+    };
+    let _ = env
+        .append(file, &format::encode_sync_marker(tag, len))
+        .await;
+}
 
 /// One durable change, appended to the write-ahead log. Generic over the command
 /// type `C` and snapshot-image type `S` (defaults: the control plane's
@@ -292,14 +386,21 @@ where
 
     /// Decode the WAL bytes back into records.
     ///
-    /// - A **trailing partial line** (a write torn by a crash — its effect
-    ///   was never acted on) or a **checksum mismatch** (issue #495:
-    ///   at-rest corruption of an already-fsynced record) stops decoding at
-    ///   the first such line and returns everything collected before it as
-    ///   `Ok` — never applied, never a panic, never an `Err`: a dropped
-    ///   tail-of-log is always safe here (see [`PersistedState::replay`]'s
-    ///   doc), so silently returning the valid prefix is the correct
-    ///   behavior, not merely tolerated.
+    /// - A **bad line** (a trailing partial line, a write torn by a crash,
+    ///   or a **checksum mismatch**, issue #495) stops decoding at the
+    ///   first such line and returns everything before it as `Ok` — never
+    ///   applied, never a panic — **provided no later valid sync marker
+    ///   proves the bad line was already durable**. A version-2 writer
+    ///   appends a `!sync:<offset>` marker after every successful `fsync`
+    ///   ([`append_sync_marker`]); a bad line that starts before the
+    ///   greatest valid marker is [`FormatError::MidFileCorruption`], never
+    ///   a silent truncation (issue #1132: the old "stop at the first bad
+    ///   line, anywhere" rule silently dropped acked term/vote/log history
+    ///   when an early line rotted). The exact algorithm and why a plain
+    ///   "valid line after a bad one" scan is unsound here (the un-synced
+    ///   tail holds several lines, so `corrupt_on_crash` legitimately
+    ///   produces that shape) is [`crate::format::decode_lines_extent`]'s
+    ///   doc. A version-1 file has no markers and keeps the lenient rule.
     /// - A CRC-valid line with no recognized [`CONTROL_WAL`] tag (a
     ///   pre-baseline WAL file, written before the ADR 0073 Phase 0 reset)
     ///   is `Err(FormatError::PreBaselineFormat)`.
@@ -312,11 +413,38 @@ where
     ///
     /// Nothing here ever panics on corrupt input.
     pub fn decode(bytes: &[u8]) -> Result<Vec<WalRecord<C, S>>, FormatError> {
-        let lines = format::decode_lines(&CONTROL_WAL, bytes)?;
-        let mut records = Vec::with_capacity(lines.len());
-        for (version, payload) in lines {
+        Self::decode_with_extent(bytes).map(|(records, _)| records)
+    }
+
+    /// [`decode`](Self::decode) plus the length of the file's clean prefix
+    /// (see [`crate::format::DecodedLines::valid_len`]) — what a writer
+    /// reopening the file needs to repair a torn tail before appending.
+    pub fn decode_with_extent(bytes: &[u8]) -> Result<(Vec<WalRecord<C, S>>, usize), FormatError> {
+        let decoded = format::decode_lines_extent(&CONTROL_WAL, bytes)?;
+        let mut records = Vec::with_capacity(decoded.lines.len());
+        for (version, payload) in decoded.lines {
             records.push(dispatch::wal_record(version, payload)?);
         }
+        Ok((records, decoded.valid_len))
+    }
+
+    /// Recover a line-framed WAL file for a node about to append to it:
+    /// read `file` (missing reads as empty), decode it, and **repair the
+    /// tail on disk** (`Disk::replace`, atomic) so later appends never sit
+    /// after torn bytes — otherwise the second recovery would see a bad line
+    /// before durable markers and refuse the file. A decode failure or a
+    /// failed repair is an `Err` the caller must treat as "halt, never
+    /// recover as empty".
+    pub async fn recover<E: Env>(
+        env: &E,
+        file: &str,
+    ) -> Result<Vec<WalRecord<C, S>>, WalRecoverError> {
+        let bytes = env.read(file).await.unwrap_or_default();
+        let (records, valid_len) =
+            Self::decode_with_extent(&bytes).map_err(WalRecoverError::Format)?;
+        repair_tail(env, file, &bytes, valid_len)
+            .await
+            .map_err(WalRecoverError::Repair)?;
         Ok(records)
     }
 
@@ -370,18 +498,26 @@ where
     /// own module doc ("Crash safety") and `docs/adr/0028-*.md`'s C-05 PR 2
     /// amendment for the full argument.
     pub fn decode_tagged(bytes: &[u8]) -> Result<TaggedRecords<C, S>, FormatError> {
+        Self::decode_tagged_with_extent(bytes).map(|(lines, _)| lines)
+    }
+
+    /// [`decode_tagged`](Self::decode_tagged) plus the clean-prefix length,
+    /// for `SharedWal::open`'s tail repair.
+    pub fn decode_tagged_with_extent(
+        bytes: &[u8],
+    ) -> Result<(TaggedRecords<C, S>, usize), FormatError> {
         #[derive(Deserialize)]
         struct Line<C, S> {
             tablet: TabletId,
             record: WalRecord<C, S>,
         }
-        let raw = format::decode_lines(&SHARED_WAL_TAG, bytes)?;
-        let mut lines = Vec::with_capacity(raw.len());
-        for (version, payload) in raw {
+        let raw = format::decode_lines_extent(&SHARED_WAL_TAG, bytes)?;
+        let mut lines = Vec::with_capacity(raw.lines.len());
+        for (version, payload) in raw.lines {
             let line: Line<C, S> = dispatch::shared_wal_line(version, payload)?;
             lines.push((line.tablet, line.record));
         }
-        Ok(lines)
+        Ok((lines, raw.valid_len))
     }
 
     /// Demultiplex a shared WAL's bytes into one [`PersistedState`] per tablet —
@@ -883,7 +1019,7 @@ mod tests {
 
     #[test]
     fn dispatchers_reject_an_unknown_version_by_name() {
-        for v in [0u8, 2, 255] {
+        for v in [0u8, 3, 255] {
             assert_eq!(
                 dispatch::wal_record::<serde_json::Value>(v, b"{}").unwrap_err(),
                 FormatError::UnsupportedFormatVersion {
@@ -918,6 +1054,198 @@ mod tests {
         assert!(matches!(
             dispatch::snapshot_body::<serde_json::Value>(1, b"nope"),
             Err(FormatError::Malformed { format, .. }) if format == CONTROL_SNAPSHOT.name
+        ));
+    }
+
+    // --- issue #1132: mid-file corruption vs torn tail (CWL1 v2) -----------
+
+    fn hard(term: u64) -> WalRecord<MetaCommand, Metadata> {
+        WalRecord::Hard {
+            term,
+            voted_for: None,
+        }
+    }
+
+    fn lines_of(records: &[WalRecord<MetaCommand, Metadata>]) -> Vec<Vec<u8>> {
+        records
+            .iter()
+            .map(PersistedState::<MetaCommand, Metadata>::encode_record)
+            .collect()
+    }
+
+    /// Two synced rounds (`[1,2]` then `[3]`), each followed by its marker,
+    /// as the real writer lays them out. Returns the bytes and the start
+    /// offset of each record line / marker line, in file order.
+    fn two_round_file() -> (Vec<u8>, Vec<usize>) {
+        let mut bytes = Vec::new();
+        let mut starts = Vec::new();
+        for round in [vec![hard(1), hard(2)], vec![hard(3)]] {
+            for line in lines_of(&round) {
+                starts.push(bytes.len());
+                bytes.extend(line);
+            }
+            starts.push(bytes.len());
+            bytes.extend(format::encode_sync_marker(&CONTROL_WAL, bytes.len() as u64));
+        }
+        (bytes, starts)
+    }
+
+    #[test]
+    fn a_flipped_byte_before_a_durable_marker_is_a_named_error_even_on_the_first_line() {
+        let (clean, starts) = two_round_file();
+        // starts = [r1, r2, marker1, r3, marker2]; flip inside r1, r2, r3.
+        for (victim, durable_to) in [(0usize, starts[4]), (1, starts[4]), (3, starts[4])] {
+            let mut bytes = clean.clone();
+            bytes[starts[victim] + 12] ^= 0xFF;
+            assert_eq!(
+                PersistedState::<MetaCommand, Metadata>::decode(&bytes).unwrap_err(),
+                FormatError::MidFileCorruption {
+                    format: "control-wal",
+                    offset: starts[victim] as u64,
+                    durable_to: durable_to as u64,
+                },
+                "victim line {victim}"
+            );
+        }
+    }
+
+    #[test]
+    fn damage_after_the_last_marker_is_a_tolerated_torn_tail() {
+        let (mut bytes, _) = two_round_file();
+        let unsynced = lines_of(&[hard(4), hard(5), hard(6)]);
+        let tail_start = bytes.len();
+        for l in &unsynced {
+            bytes.extend(l);
+        }
+        // Flip a byte in the FIRST un-synced line while later un-synced lines
+        // stay valid: exactly what `corrupt_on_crash` makes, and not an error.
+        let mut flipped = bytes.clone();
+        flipped[tail_start + 12] ^= 0xFF;
+        let (records, valid_len) =
+            PersistedState::<MetaCommand, Metadata>::decode_with_extent(&flipped).unwrap();
+        assert_eq!(records, vec![hard(1), hard(2), hard(3)]);
+        assert_eq!(valid_len, tail_start);
+        // And a torn (cut) final marker: its proof is lost, nothing invented.
+        let mut cut = two_round_file().0;
+        cut.truncate(cut.len() - 5);
+        let records = PersistedState::<MetaCommand, Metadata>::decode(&cut).unwrap();
+        assert_eq!(records, vec![hard(1), hard(2), hard(3)]);
+    }
+
+    #[test]
+    fn partial_final_line_and_blank_final_line_decode_as_before() {
+        let (mut bytes, _) = two_round_file();
+        bytes.extend_from_slice(b"\n\n");
+        assert_eq!(
+            PersistedState::<MetaCommand, Metadata>::decode(&bytes)
+                .unwrap()
+                .len(),
+            3
+        );
+        bytes.extend_from_slice(b"deadbeef:CWL1");
+        let (records, valid_len) =
+            PersistedState::<MetaCommand, Metadata>::decode_with_extent(&bytes).unwrap();
+        assert_eq!(records.len(), 3);
+        assert_eq!(valid_len, bytes.len() - b"deadbeef:CWL1".len());
+    }
+
+    #[test]
+    fn a_marker_that_is_not_where_it_claims_is_a_named_error() {
+        let (mut bytes, _) = two_round_file();
+        let at = bytes.len() as u64;
+        bytes.extend(format::encode_sync_marker(&CONTROL_WAL, 7));
+        assert_eq!(
+            PersistedState::<MetaCommand, Metadata>::decode(&bytes).unwrap_err(),
+            FormatError::BadSyncMarker {
+                format: "control-wal",
+                offset: at,
+                claimed: 7,
+            }
+        );
+    }
+
+    #[test]
+    fn a_forged_future_version_line_keeps_its_existing_error() {
+        // CRC-valid CWL1 line, version 03, first in the file.
+        let body = b"CWL103{}";
+        let mut line = format!("{:08x}:", crc32fast::hash(body)).into_bytes();
+        line.extend_from_slice(body);
+        line.push(b'\n');
+        let expect = FormatError::UnsupportedFormatVersion {
+            format: "control-wal",
+            found: 3,
+            max_supported: 2,
+        };
+        assert_eq!(
+            PersistedState::<MetaCommand, Metadata>::decode(&line).unwrap_err(),
+            expect
+        );
+        // Still the same error with durable-looking history behind it.
+        let (mut bytes, _) = two_round_file();
+        bytes.extend(&line);
+        assert_eq!(
+            PersistedState::<MetaCommand, Metadata>::decode(&bytes).unwrap_err(),
+            expect
+        );
+    }
+
+    #[test]
+    fn v1_files_keep_the_lenient_torn_tail_anywhere_rule() {
+        let v1 = include_bytes!("../tests/fixtures/formats/control-wal/v1.bin");
+        let clean = PersistedState::<MetaCommand, Metadata>::decode(v1).unwrap();
+        assert_eq!(clean.len(), 4);
+        // Corrupting line 0 of a marker-less v1 file is still a (silent) tail.
+        let mut bad = v1.to_vec();
+        bad[12] ^= 0xFF;
+        assert!(
+            PersistedState::<MetaCommand, Metadata>::decode(&bad)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Checklist step 7. The fixture's `Snapshot` line embeds a `Metadata`
+    /// serialized before `Metadata` grew its `"v"` field (P1-C kept that field
+    /// optional on read precisely so this frozen fixture still decodes), so
+    /// that one line cannot be byte-equal to what *today's* `Metadata` serde
+    /// emits; every other line is byte-for-byte, and the snapshot line must
+    /// round-trip to the identical record.
+    #[test]
+    fn legacy_v1_encoder_reproduces_the_v1_fixture_byte_for_byte() {
+        let v1 = include_bytes!("../tests/fixtures/formats/control-wal/v1.bin");
+        let records = PersistedState::<MetaCommand, Metadata>::decode(v1).unwrap();
+        let fixture_lines: Vec<&[u8]> = v1.split_inclusive(|&b| b == b'\n').collect();
+        assert_eq!(fixture_lines.len(), records.len());
+        for (i, (record, fixture)) in records.iter().zip(&fixture_lines).enumerate() {
+            let re = dispatch::legacy::v1::encode_record(record);
+            if matches!(record, WalRecord::Snapshot { .. }) {
+                let again = PersistedState::<MetaCommand, Metadata>::decode(&re).unwrap();
+                assert_eq!(again, vec![record.clone()], "line {i}");
+            } else {
+                assert_eq!(&re[..], *fixture, "line {i}");
+            }
+        }
+    }
+
+    /// A v1 file reopened by this build: new appends are v2 lines + markers
+    /// (version is per line), the mix decodes, and a marker's proof covers
+    /// the v1 lines before it.
+    #[test]
+    fn a_v1_file_extended_with_v2_rounds_decodes_and_protects_its_v1_prefix() {
+        let v1 = include_bytes!("../tests/fixtures/formats/control-wal/v1.bin");
+        let mut bytes = v1.to_vec();
+        for line in lines_of(&[hard(9)]) {
+            bytes.extend(line);
+        }
+        bytes.extend(format::encode_sync_marker(&CONTROL_WAL, bytes.len() as u64));
+        let records = PersistedState::<MetaCommand, Metadata>::decode(&bytes).unwrap();
+        assert_eq!(records.len(), 5);
+        assert_eq!(records[4], hard(9));
+        let mut rotted = bytes.clone();
+        rotted[12] ^= 0xFF;
+        assert!(matches!(
+            PersistedState::<MetaCommand, Metadata>::decode(&rotted),
+            Err(FormatError::MidFileCorruption { offset: 0, .. })
         ));
     }
 }

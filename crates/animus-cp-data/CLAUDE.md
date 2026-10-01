@@ -108,9 +108,13 @@ amendment — the shape predates and outlives it.)
   precisely because this is fixed) and `docs/engineering-lessons.md`'s
   matching entry for the full account. **Fixed** by a per-record CRC32
   checksum on every WAL line (`animus-control::persist`): a checksum
-  mismatch is now dropped exactly like a torn trailing line — along with
+  mismatch is dropped like a torn trailing line — along with
   everything physically after it in the file — never decoded into a value,
-  never a panic. This was the WAL-side sibling of this same crate's own
+  never a panic, **unless a later v2 sync marker proves the line was already
+  durable, in which case it is the loud `FormatError::MidFileCorruption`**
+  (issue #1132, `CWL1` v2: the per-group WAL's own writer appends the marker
+  after each sync, `PersistedState::recover` repairs a torn tail on open —
+  see `animus-control/CLAUDE.md`'s persist.rs entry). This was the WAL-side sibling of this same crate's own
   `codec.rs` wire decoder's separately-known untrusted-length-prefix
   allocator-abort gap (`Vec::with_capacity(n as usize)` on an unvalidated
   `u32` — see the sibling `raftkv`/`txn` corpora's own `Nemesis::Chaos` doc
