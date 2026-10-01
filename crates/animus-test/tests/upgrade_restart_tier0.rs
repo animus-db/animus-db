@@ -689,7 +689,8 @@ fn control_wal_negative_controls_are_caught() {
 
 fn shared_wal_expected(version: u32) -> Vec<(TabletId, WalRecord<MetaCommand, Metadata>)> {
     match version {
-        1 => {
+        // v2 adds only sync-marker lines, which decoding consumes.
+        1 | 2 => {
             let entry = |i, t, n| WalRecord::Append(upsert_entry(i, t, n));
             vec![
                 (
@@ -798,6 +799,8 @@ fn shared_wal_negative_controls_are_caught() {
     each_seed("tier0_shared_wal_neg", |seed| {
         let mut flipped = v1.clone();
         flipped[20] ^= 0xff;
+        // v1-ONLY behaviour: no sync markers, so a CRC failure anywhere reads
+        // as a torn tail. The v2 counterpart follows.
         let got = shared_wal_run(seed, &flipped).unwrap_or_else(|e| {
             panic!("seed={seed}: a CRC-failed line reads as a torn tail, got {e}")
         });
@@ -806,6 +809,19 @@ fn shared_wal_negative_controls_are_caught() {
             shared_wal_expected_state(1),
             "seed={seed}: corruption unnoticed"
         );
+
+        // v2 counterpart (issue #1132): the same first-line damage before a
+        // durable marker fails the open with InvalidData.
+        let mut flipped2 = fixtures("shared-wal")[&2].clone();
+        flipped2[20] ^= 0xff;
+        let err = shared_wal_run(seed, &flipped2)
+            .expect_err("a corrupted first v2 line before a marker must fail the open");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "seed={seed}: {err}"
+        );
+        assert!(err.to_string().contains("corrupt"), "seed={seed}: {err}");
 
         let future = encode_line(
             &FormatTag {

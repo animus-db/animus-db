@@ -224,8 +224,8 @@ pub static TABLE: &[FormatEntry] = &[
     },
     FormatEntry {
         name: "shared-wal",
-        current_version: 1,
-        versions: V1_ONLY,
+        current_version: 2,
+        versions: V1_V2,
         transcode: identity_current_only,
     },
     // The `ADE1` encryption envelope wraps whole files of an `EncryptedEnv`
