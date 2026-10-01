@@ -2837,6 +2837,20 @@ wire/image codec is `pub(crate)`; new formats add a section in whichever fits.
     build must not touch (pre-baseline or newer-version data). Keep the
     refusal a plain `return None` before that `match` arm.
 
+- **Decoder dispatch + `legacy` seam (ADR 0073 Phase 1, P1-A).** Every
+  format here (`backup-manifest`, `backup-data`, `segment`, `raftkv-wire`,
+  `raftkv-image`, `cp-engine-layout`) keeps its `0`/`> CURRENT` named error
+  in the header check, then dispatches with `match version { 1 =>
+  decode_v1(body), found => Err(UnsupportedFormatVersion { found,
+  max_supported, .. }) }` — the version is never bound-and-dropped
+  (`codec::check_header` returns it). Each file has an empty `mod legacy {}`
+  whose doc says where retired versions' frozen decoders, `VNFoo` shape types
+  and `From<VNFoo>` translations go; adding v2 = move the v1 body decoder
+  into `legacy::v1`, add the `2 =>` arm (checklist in the ADR). `raftkv-wal`
+  is decoded by `animus-control`'s `PersistedState::decode` (P1-C owns that
+  dispatch); here only its fixture test lives, and it panics on a fixture
+  version with no expected value, like every other fixture test.
+
 ## Tests
 
 `cargo test -p animus-cp-data`. All but two of the 29 test binaries drive
