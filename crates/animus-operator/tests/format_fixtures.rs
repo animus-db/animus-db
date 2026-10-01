@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use animus_operator::AnimusCluster;
-use animus_operator::crd::{CONTENT_SCHEMA_VERSION, SPEC_FORMAT};
+use animus_operator::crd::{CONTENT_SCHEMA_VERSION, SPEC_FORMAT, decode_cluster};
 use animus_operator::validate::{validate_schema_version, validate_spec};
 use kube::CustomResourceExt;
 
@@ -19,7 +19,6 @@ fn fixtures_dir() -> PathBuf {
 
 fn assert_v1_structure(c: &AnimusCluster, name: &str) {
     let s = &c.spec;
-    assert_eq!(s.schema_version, 1, "{name}");
     assert_eq!(c.metadata.name.as_deref(), Some("golden"), "{name}");
     assert_eq!(c.metadata.namespace.as_deref(), Some("animus"), "{name}");
     assert_eq!(
@@ -66,23 +65,60 @@ fn assert_v1_structure(c: &AnimusCluster, name: &str) {
     );
 }
 
+/// Per-version expected value (ADR 0073 Phase 1): the version comes from the
+/// file name (`vN.json`), the file's own `spec.schemaVersion` must agree, and
+/// an unrecognised version panics so adding a fixture forces adding its arm.
 #[test]
-fn every_checked_in_fixture_decodes_and_validates() {
-    let mut seen = 0;
+fn every_checked_in_fixture_decodes_to_its_per_version_expected_value() {
+    let mut seen = Vec::new();
     for entry in std::fs::read_dir(fixtures_dir()).expect("fixtures dir") {
         let path = entry.unwrap().path();
         if path.extension().is_none_or(|e| e != "json") {
             continue;
         }
         let name = path.file_name().unwrap().to_string_lossy().to_string();
-        let text = std::fs::read_to_string(&path).unwrap();
-        let cluster: AnimusCluster =
-            serde_json::from_str(&text).unwrap_or_else(|e| panic!("{name}: {e}"));
-        assert_v1_structure(&cluster, &name);
-        validate_spec(None, &cluster.spec).unwrap_or_else(|v| panic!("{name}: {v:?}"));
-        seen += 1;
+        let version: u32 = name
+            .strip_prefix('v')
+            .and_then(|r| r.strip_suffix(".json"))
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("{name}: fixture name is not vN.json"));
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let cluster = decode_cluster(value.clone()).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(cluster.spec.schema_version, version, "{name}");
+        match version {
+            1 => {
+                assert_v1_structure(&cluster, &name);
+                validate_spec(None, &cluster.spec).unwrap_or_else(|v| panic!("{name}: {v:?}"));
+                let direct: AnimusCluster = serde_json::from_value(value).unwrap();
+                assert_eq!(cluster.spec, direct.spec, "{name}");
+            }
+            other => panic!("{name}: no expected value for v{other}; add a match arm"),
+        }
+        seen.push(version);
     }
-    assert!(seen >= 1, "no fixtures found");
+    assert!(!seen.is_empty(), "no fixtures found");
+    assert!(
+        seen.contains(&CONTENT_SCHEMA_VERSION),
+        "no fixture for the current CONTENT_SCHEMA_VERSION {CONTENT_SCHEMA_VERSION}: {seen:?}"
+    );
+}
+
+#[test]
+fn decode_cluster_refuses_unknown_and_missing_versions_by_name() {
+    for bad in [0u64, 2, 99] {
+        let mut v = v1_value();
+        v["spec"]["schemaVersion"] = bad.into();
+        let err = decode_cluster(v).unwrap_err();
+        assert!(
+            err.contains(SPEC_FORMAT) && err.contains("unsupported"),
+            "{err}"
+        );
+    }
+    let mut v = v1_value();
+    v["spec"].as_object_mut().unwrap().remove("schemaVersion");
+    let err = decode_cluster(v).unwrap_err();
+    assert!(err.contains("schemaVersion"), "{err}");
 }
 
 #[test]

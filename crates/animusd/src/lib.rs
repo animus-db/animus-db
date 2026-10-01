@@ -1325,6 +1325,7 @@ impl<E: Env> CpGroup<E> {
                     term: $n.term(),
                     commit_index: $n.commit_index(),
                     last_applied: $n.last_applied(),
+                    engine_applied_index: $n.engine_applied_index(),
                     durable_index: $n.durable_index(),
                     snapshot_index: $n.snapshot_index(),
                     log_len: $n.log_len(),

@@ -260,6 +260,7 @@ dependencies = [
  "animus-env",
  "proptest",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -467,6 +467,14 @@ impl IndexFootprint {
 /// `old_image`/`new_image`. DynamoDB Streams will read the same records
 /// **literally and in order**, which is why the log is append-only and carries
 /// both images even though the drain alone would not need either.
+///
+/// **Frozen format (ADR 0073).** This struct's serde shape (and that of the
+/// [`Item`]/`AttributeValue` it embeds) is the durable v1 change-log value
+/// format, carried inside PITR segments and backups that outlive the
+/// cluster. It is untagged JSON (see [`ChangeRecord::version_of`]); changes
+/// are additive-only (`#[serde(default)]` field, plus a new golden fixture
+/// under `tests/fixtures/formats/change-record/`), and anything else is a new
+/// tagged version. A `legacy` module embedding this type relies on that.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangeRecord {
     /// The mutated item's base sort key bytes (empty for a simple table). The
@@ -580,10 +588,26 @@ impl ChangeRecord {
         serde_json::to_vec(self).expect("change record serializes")
     }
 
+    /// The version of the change-record encoding `bytes` is written in, or
+    /// `None` if unrecognised. **v1 is untagged**: a JSON object, so its
+    /// first non-whitespace byte is `{` (the writer emits no leading
+    /// whitespace). A later tagged version must start with a different
+    /// byte, so this sniff stays unambiguous (ADR 0073 Phase 1 design).
+    #[must_use]
+    pub fn version_of(bytes: &[u8]) -> Option<u32> {
+        match bytes.iter().find(|b| !b.is_ascii_whitespace()) {
+            Some(b'{') => Some(1),
+            _ => None,
+        }
+    }
+
     /// Decode a stored change record, or `None` if the bytes are corrupt.
     #[must_use]
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        serde_json::from_slice(bytes).ok()
+        match Self::version_of(bytes)? {
+            1 => serde_json::from_slice(bytes).ok(),
+            _ => None,
+        }
     }
 }
 

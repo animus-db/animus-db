@@ -278,8 +278,12 @@ async fn setup() -> (support::PanicSafeTempDir, Vec<Node>, SocketAddr) {
 /// scan (the drain is asynchronous), then a `Limit`-paginated walk over the
 /// now-stable data collecting every distinct item exactly once.
 ///
-/// The convergence poll runs against **every** node, not just the one the
-/// walk itself talks to (`await_gsi_scan_everywhere`, ADR 0055): pagination
+/// Convergence is proven per **replica**, not per node address: the address
+/// poll (`await_gsi_scan_everywhere`) only shows the index rows are committed,
+/// then `support::await_replicas_caught_up` waits for every replica's own
+/// engine to reach its tablet's commit index — the address poll alone left a
+/// ~0.5% flake (a follower that has not yet heard the last commit passes the
+/// eventual-read gate one entry behind and serves a short page). Pagination
 /// correctness is what this test proves, and a `ConsistentRead: false` walk
 /// (a GSI `Scan` accepts no other consistency, `gsi_scan_rejects_consistent_
 /// read` below) can be answered by whichever replica of the tablet the
@@ -301,6 +305,12 @@ async fn gsi_scan_paginates_and_drains_all_rows() {
         |b| b.contains("\"Count\":5"),
     )
     .await;
+
+    // Every index row is now committed (some replica served all 5), but that
+    // proves nothing about the *other* replicas' engines — see
+    // `await_replicas_caught_up`. Only once each replica has applied the
+    // leader's commit index can no page of the walk land on a lagging one.
+    support::await_replicas_caught_up(&nodes, "GSI drain").await;
 
     let combined = drain_scan_pages(addr, r#"{"TableName":"events","IndexName":"by-cat""#, 2).await;
     for sk in ["a0", "a1", "a2", "b0", "b1"] {
