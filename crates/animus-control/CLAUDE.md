@@ -2905,3 +2905,5 @@ cancel-safe-fair (it is). Liveness tests for the apply path assert on
 Known follow-up, deliberately not fixed here: the failure detector re-proposes
 `status: Down` for members a stale cache still shows Active, feeding more WAL
 rounds while the apply task is behind.
+
+**Upgrade-harness class (ADR 0073 P1-D):** `control-wal`/`shared-wal` are whole-file `TABLE` entries in `animus-test`'s transcode table (a bump edits that entry; legacy encoders must be `pub` + `legacy-encoders`-gated); `control-snapshot`, `metadata`, `mirror-version` and `mirror-entities` are `EMBEDDED` (a bump edits their carrier's transcode).
