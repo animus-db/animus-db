@@ -108,10 +108,6 @@ on:
         description: "Seeds per cell (ANIMUS_SHAREDWAL_SEEDS, ADR 0028 C-05 PR 2 SharedWal cross-tablet ordering/crash-safety/GC fault corpus)"
         required: false
         default: "40"
-      upgrade_restart_seeds:
-        description: "Seeds per cell (ANIMUS_UPGRADE_RESTART_SEEDS, ADR 0073 P1-D tier-1 upgrade-restart corpus; K=50 is ~55s wall in debug)"
-        required: false
-        default: "100"
       learner_snapshot_livelock_seeds:
         description: "Seeds (ANIMUS_LEARNER_SNAPSHOT_LIVELOCK_SEEDS, issue #1064/#1092 late-joining-learner-under-a-continuous-writer corpus; ~10s per seed)"
         required: false
@@ -534,7 +530,9 @@ jobs:
         continue-on-error: true
         timeout-minutes: 15
         env:
-          ANIMUS_UPGRADE_RESTART_SEEDS: ${{ github.event.inputs.upgrade_restart_seeds || '100' }}
+          # Fixed depth, deliberately not a workflow_dispatch input: GitHub caps
+          # workflow_dispatch at 25 inputs and this file is already at the cap.
+          ANIMUS_UPGRADE_RESTART_SEEDS: '100'
         run: cargo test -p animus-test --test upgrade_restart_corpus -- --nocapture
 
       # Issue #1064/#1092: a late-joining learner needing a real multi-chunk
