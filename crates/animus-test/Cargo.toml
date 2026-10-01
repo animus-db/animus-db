@@ -12,17 +12,25 @@ description = "AnimusDB Elle-style history recorder + checker."
 workspace = true
 
 [dependencies]
+# The upgrade-restart transcode table (`upgrade::transcode`) drives a stopped
+# node's `SimEnv` disk. animus-test is only ever a dev-dependency of other
+# crates (never in a production build), and `animus-env` here has its default
+# features only (no `prod`).
+animus-env.workspace = true
+animus-sim.workspace = true
+futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
-animus-env.workspace = true
-animus-sim.workspace = true
-animus-control.workspace = true
-animus-cp-data.workspace = true
+# `legacy-encoders` (ADR 0073 "Legacy encoders are test-only"): the test-only
+# `legacy::vN::encode` functions the transcode table calls. Enabled here, on
+# dev-dependency entries only, so no production build ever compiles them.
+animus-env = { workspace = true, features = ["legacy-encoders"] }
+animus-control = { workspace = true, features = ["legacy-encoders"] }
+animus-cp-data = { workspace = true, features = ["legacy-encoders"] }
 animus-dynamo.workspace = true
 animus-item.workspace = true
-animus-storage.workspace = true
+animus-storage = { workspace = true, features = ["legacy-encoders"] }
 animus-tablet.workspace = true
 flate2.workspace = true
-futures.workspace = true
