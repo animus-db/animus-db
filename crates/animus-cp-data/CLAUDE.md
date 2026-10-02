@@ -3014,6 +3014,8 @@ different host/session/media (the bench prints the resolved `/proc/mounts`
 filesystem type + device for whatever directory it writes into, so a
 reader never has to take the media on faith).
 
+**Upgrade-harness class (ADR 0073 P1-D):** none of this crate's formats is a whole-file `TABLE` entry; `raftkv-wal` and `cp-engine-layout` are `EMBEDDED` in a whole-file carrier (`control-wal`/`lsm-sstable`), and `raftkv-wire`, `raftkv-image`, `segment`, `backup-manifest`, `backup-data` are `EMBEDDED` off-disk (`animus-test`'s `upgrade::transcode::EMBEDDED`).
+
 ## `wal_lock` is a FIFO-fair `FairMutex` (apply-task starvation fix)
 
 The per-tablet `wal_lock` (serializes `persist_wal`'s append/fsync against

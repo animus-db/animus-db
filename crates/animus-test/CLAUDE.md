@@ -54,8 +54,13 @@ properties; it also hosts cross-crate fault sweeps.
   anything else is an `UnsupportedTarget` error, never a silent identity.
   **Checklist step 7 is editing one `FormatEntry`** (bump `current_version`,
   add a `VersionSpec`, point `transcode` at the `legacy::vK::encode` calls);
-  `tests/upgrade_restart_tier0.rs` fails if the table drifts from the newest
-  checked-in fixture. Tier 0 (`tests/upgrade_restart_tier0.rs`) seeds a
+  a format that is *not* a whole node-disk file is listed in
+  `EMBEDDED` (name, `Carrier::Table(<entry>)` or `Carrier::OffDisk`, owner,
+  version) and its bump edits its **carrier's** transcode. Legacy encoders the
+  harness calls must be `pub` under `cfg(any(test, feature = "legacy-encoders"))`,
+  never `cfg(test)`-private. `tests/upgrade_restart_tier0.rs` fails if the
+  table drifts from the newest checked-in fixture or if any crate's
+  `tests/fixtures/formats/<dir>` is in neither `TABLE` nor `EMBEDDED`. Tier 0 (`tests/upgrade_restart_tier0.rs`) seeds a
   `SimEnv` disk with each whole-file fixture, runs it through the table,
   crashes, and opens the real reader (`LsmEngine::open_with`,
   `PersistedState::decode`/`replay`, `SharedWal::open`); its negative
