@@ -14,14 +14,38 @@
 //!
 //! # Adding a format version (checklist step 7)
 //!
-//! When a format bumps to version N+1 its [`FormatEntry`] changes in place:
-//! bump `current_version`, append a [`VersionSpec`] (with the capability mask
-//! of what that version can express), and point `transcode` at a function that
-//! decodes current bytes and re-encodes them with `legacy::vK::encode` for each
-//! supported `K`. That is the whole registration; nothing else in the harness
-//! names a version. `tests/upgrade_restart_tier0.rs` fails if the table's
-//! `current_version` drifts from the newest checked-in fixture, so forgetting
-//! this step is a red test, not a silent gap.
+//! Formats come in two harness classes, and the registration differs.
+//!
+//! * **Whole-file formats** (a file on a node's disk that one format owns:
+//!   `lsm-wal`, `lsm-manifest`, `lsm-sstable`, `control-wal`, `shared-wal`,
+//!   `encryption-envelope`) have a [`TABLE`] entry. A bump edits that entry in
+//!   place: bump `current_version`, append a [`VersionSpec`] (with the
+//!   capability mask of what that version can express), and point `transcode`
+//!   at a function that decodes current bytes and re-encodes them with
+//!   `legacy::vK` for each supported `K`.
+//! * **Embedded formats** (records that live *inside* another format's file,
+//!   or off a node's disk entirely) are listed in [`EMBEDDED`] with the
+//!   [`Carrier`] that holds them. They get no `TABLE` entry of their own. A
+//!   bump edits **the carrier's** transcode, so the carrier re-encodes every
+//!   embedded record through the embedded format's legacy encoder (an
+//!   embedded `Metadata` v2 -> v1 is part of `control-wal`'s transcode). Update
+//!   the `EMBEDDED` row's `current_version` too. A [`Carrier::OffDisk`] format
+//!   (segment, backup, config, CR, wire) is never transcoded by the disk pass;
+//!   its upgrade coverage is its own per-version fixture test.
+//!
+//! **Legacy encoders the harness calls must be `pub`**, gated
+//! `#[cfg(any(test, feature = "legacy-encoders"))]` (this crate enables the
+//! feature on every format crate). A `cfg(test)`-only or crate-private encoder
+//! is invisible to `animus-test`, so the transcode could not call it. Prefer a
+//! type-erased byte-level function (old framing in, new framing out) over one
+//! generic over the crate's record types.
+//!
+//! `tests/upgrade_restart_tier0.rs` is the backstop: the table's
+//! `current_version` must equal the newest checked-in fixture, every fixture
+//! version needs a `VersionSpec`, and every
+//! `tests/fixtures/formats/<dir>` in the workspace must be named by `TABLE` or
+//! `EMBEDDED` (with every carrier naming a real `TABLE` entry). Forgetting step
+//! 7 is a red test, not a silent gap.
 
 use std::fmt;
 use std::io;
@@ -237,6 +261,111 @@ pub static TABLE: &[FormatEntry] = &[
         versions: V1_ONLY,
         transcode: identity_current_only,
     },
+];
+
+/// Where an embedded format's bytes live.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Carrier {
+    /// Inside the whole-file format named by this [`TABLE`] entry; a bump of
+    /// the embedded format is implemented by that entry's transcode.
+    Table(&'static str),
+    /// Not on a node's disk (segment/backup objects, config, CR, wire). The
+    /// disk pass never touches it.
+    OffDisk,
+}
+
+/// A versioned format ADR 0073 puts behind dispatch that is **not** a whole
+/// node-disk file, so it has no [`TABLE`] entry (see the module header).
+#[derive(Clone, Copy, Debug)]
+pub struct Embedded {
+    /// Stable slug, equal to its fixture directory name under the owning
+    /// crate's `tests/fixtures/formats/`.
+    pub name: &'static str,
+    /// What holds it.
+    pub carrier: Carrier,
+    /// The crate that owns the format and its fixtures.
+    pub owner: &'static str,
+    /// The version the current code writes (`1` for the untagged, frozen
+    /// formats and pinned vectors, which are v1 by definition).
+    pub current_version: u32,
+}
+
+const fn emb(name: &'static str, carrier: Carrier, owner: &'static str) -> Embedded {
+    Embedded {
+        name,
+        carrier,
+        owner,
+        current_version: 1,
+    }
+}
+
+/// Every versioned format that is not a whole node-disk file. Together with
+/// [`TABLE`] this must name every `tests/fixtures/formats/<dir>` in the
+/// workspace (enforced by `tests/upgrade_restart_tier0.rs`). Every format is
+/// v1 today.
+///
+/// Engine-resident row values and key encodings use `lsm-sstable` as their
+/// carrier (they also pass through `lsm-wal` and the `raftkv`/`shared-wal`
+/// payloads on the way in); the first transcode that needs them re-encodes
+/// them wherever the engine holds them.
+pub static EMBEDDED: &[Embedded] = &[
+    // animus-control: records inside the control WAL (and `raftkv.wal*`,
+    // which share the `CWL1` tag) and the node's system-keyspace engine.
+    emb(
+        "control-snapshot",
+        Carrier::Table("control-wal"),
+        "animus-control",
+    ),
+    emb("metadata", Carrier::Table("control-wal"), "animus-control"),
+    emb(
+        "mirror-version",
+        Carrier::Table("lsm-sstable"),
+        "animus-control",
+    ),
+    emb(
+        "mirror-entities",
+        Carrier::Table("lsm-sstable"),
+        "animus-control",
+    ),
+    // animus-cp-data: the codec payload inside `raftkv.wal.<tablet>` /
+    // `SharedWal` lines, the per-tablet engine layout, off-disk objects.
+    emb(
+        "raftkv-wal",
+        Carrier::Table("control-wal"),
+        "animus-cp-data",
+    ),
+    emb("raftkv-wire", Carrier::OffDisk, "animus-cp-data"),
+    emb("raftkv-image", Carrier::OffDisk, "animus-cp-data"),
+    emb(
+        "cp-engine-layout",
+        Carrier::Table("lsm-sstable"),
+        "animus-cp-data",
+    ),
+    emb("segment", Carrier::OffDisk, "animus-cp-data"),
+    emb("backup-manifest", Carrier::OffDisk, "animus-cp-data"),
+    emb("backup-data", Carrier::OffDisk, "animus-cp-data"),
+    // animus-item: untagged frozen row values and pinned key vectors.
+    emb("stored-item", Carrier::Table("lsm-sstable"), "animus-item"),
+    emb(
+        "change-record",
+        Carrier::Table("lsm-sstable"),
+        "animus-item",
+    ),
+    emb("key-bytes", Carrier::Table("lsm-sstable"), "animus-item"),
+    emb("numkey", Carrier::Table("lsm-sstable"), "animus-item"),
+    // animus-tablet: pinned key-space vectors.
+    emb("escape", Carrier::Table("lsm-sstable"), "animus-tablet"),
+    emb(
+        "partition-token",
+        Carrier::Table("lsm-sstable"),
+        "animus-tablet",
+    ),
+    // animus-env: transient wire handshakes.
+    emb("network-handshake", Carrier::OffDisk, "animus-env"),
+    emb("client-handshake", Carrier::OffDisk, "animus-env"),
+    // animusd / animus-operator: process config and the CR.
+    emb("cluster-config", Carrier::OffDisk, "animusd"),
+    emb("animuscluster-spec", Carrier::OffDisk, "animus-operator"),
 ];
 
 /// The table entry named `name`.

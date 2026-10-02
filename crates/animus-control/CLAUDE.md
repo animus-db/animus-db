@@ -2944,3 +2944,5 @@ rounds while the apply task is behind.
   unconditional per-round marker is a second `append` under `wal_lock`, which
   the sim charges `sync_delay` and which starves slow-disk learner catch-up
   (`snapshot_transfer_survives_compaction`).
+
+**Upgrade-harness class (ADR 0073 P1-D):** `control-wal`/`shared-wal` are whole-file `TABLE` entries in `animus-test`'s transcode table (a bump edits that entry; legacy encoders must be `pub` + `legacy-encoders`-gated); `control-snapshot`, `metadata`, `mirror-version` and `mirror-entities` are `EMBEDDED` (a bump edits their carrier's transcode).
