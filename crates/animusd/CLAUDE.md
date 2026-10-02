@@ -11774,7 +11774,7 @@ ground truth (including the D4-PR-2 count-drift account) and
 
 ## Appendix — `sim_cluster_upgrade_corpus`: whole-cluster upgrade restart over `SimCluster`'s `LsmEngine` backend (ADR 0073 P1-D tier 2, 2026-10-01)
 
-Tier 1 (`animus-test/tests/upgrade_restart_corpus.rs`) restarts one Raft group
+Tier 1 (`animus-test/tests/it/upgrade_restart_corpus.rs`) restarts one Raft group
 over `LsmEngine`. This is tier 2: a **whole cluster** — control `Metadata`
 (CWL1 + the system-keyspace LSM mirror, ADR 0038), the data-only node's
 mirror, every per-tablet `LsmEngine`, the tablet-host reconciler, streams and

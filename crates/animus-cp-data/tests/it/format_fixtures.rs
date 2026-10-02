@@ -222,7 +222,7 @@ fn segment_fixture_is_current_version_and_refuses_pre_baseline_shapes() {
 }
 
 /// Regenerates `segment/v<VERSION>.bin` with the *current* encoder:
-/// `cargo test -p animus-cp-data --test format_fixtures generate_fixture_segment -- --ignored`.
+/// `cargo test -p animus-cp-data --test it format_fixtures::generate_fixture_segment -- --ignored`.
 /// Refuses to overwrite an existing fixture (ADR 0073 Phase 0).
 #[test]
 #[ignore]

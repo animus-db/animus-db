@@ -2426,7 +2426,7 @@ fn control_register_cas_baseline_holds_integrity() {
 /// test drives a `Group` directly instead of going through
 /// `run_scenario`/`assert_scenario_ok`.
 ///
-/// Run explicitly: `cargo test -p animus-control --test control_corpus
+/// Run explicitly: `cargo test -p animus-control --test it control_corpus::
 /// control_corrupt_on_crash_may_hard_panic_issue_495 -- --ignored`.
 #[test]
 #[ignore = "standing regression probe for the WAL-corruption composition tracked by issue #495 (fixed by a per-record checksum) — see this test's own doc"]

@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working in this crate.
 
+> **Test layout (2026-10-02).** The SimEnv integration tests are modules of one binary, `tests/it/main.rs` (`cargo test -p animus-storage --test it <file>::`); the real-thread/`ProdEnv` tests (`lsm_concurrent`, `idle_engine_cost`, `lsm_clone_concurrent`, `lsm_clone_filtered_concurrent`, `lsm_clone_prodenv`) stay separate `tests/*.rs` targets. Older sections below that cite `tests/<name>.rs` mean `tests/it/<name>.rs`.
+
 ## Purpose
 
 The `StorageEngine` trait and its backing implementations. The trait is driven

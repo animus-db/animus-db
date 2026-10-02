@@ -15,7 +15,7 @@ Probe each corruption first (print the outcome), then pin it: a named
 error where the decoder promises one, and "opens fine, content differs"
 where recovery tolerates it. A control asserting only `is_err()` would have
 failed on the tolerated shapes and hidden the asymmetry between formats.
-(`crates/animus-test/tests/upgrade_restart_tier0.rs`.) The lesson inside the
+(`crates/animus-test/tests/it/upgrade_restart_tier0.rs`.) The lesson inside the
 lesson: when a format bump changes a tolerance, the old control silently
 becomes version-specific. Say which version it pins and add the new version's
 counterpart.

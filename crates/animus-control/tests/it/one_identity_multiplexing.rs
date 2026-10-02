@@ -16,7 +16,7 @@
 //! a combined node's two internal `ProdEnv`s into one.
 //!
 //! Byte-reproducible from the printed seed (`ANIMUS_SEED=<seed> cargo test
-//! -p animus-control --test one_identity_multiplexing`).
+//! -p animus-control --test it one_identity_multiplexing::`).
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
