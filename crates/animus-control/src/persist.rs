@@ -244,21 +244,64 @@ pub async fn repair_tail<E: Env>(
     }
 }
 
-/// Append a sync marker to `file` for `tag` (version >= 2 only): call it
-/// **after** an `env.sync(file)` that returned `Ok` and covered the whole
-/// file, from the same critical section as the appends (nothing else may
-/// append between that sync and this marker, or the claimed offset would not
-/// be the marker's own start). Best-effort by design: a marker only ever
-/// *adds* a durability proof, so failing to write one (size or append error)
-/// merely leaves the earlier proof in force and never affects correctness.
-/// The marker is itself un-synced until the next sync and may be torn.
-pub async fn append_sync_marker<E: Env>(env: &E, tag: &FormatTag, file: &str) {
-    let Ok(len) = env.size(file).await else {
-        return;
-    };
-    let _ = env
-        .append(file, &format::encode_sync_marker(tag, len))
-        .await;
+/// Piggybacked sync-marker state for one WAL file (issue #1132, CWL1/SWL1 v2).
+///
+/// A sync marker `!sync:<N>` claims "every byte before offset `N` is fsynced"
+/// (see [`crate::format::decode_lines_extent`]). It is **never** appended on its
+/// own: a standalone marker after every fsync is a second `append` under the
+/// WAL lock, which a slow disk charges a full extra latency per round (it
+/// starved a slow learner's catch-up — see the lesson under
+/// `docs/lessons/testing/`). Instead the writer remembers that its previous
+/// round's `fsync` succeeded and **prepends the marker to the next round's own
+/// single `append`**: the claim is still true when written (that fsync
+/// completed before this append starts), and the marker's own durability is
+/// the same as a standalone one's (it only becomes durable at the next sync).
+/// The residual is unchanged and documented: the latest round has no durable
+/// marker until the next round syncs.
+///
+/// Protocol, all under the file's writer lock (the state lives beside it so
+/// the two cannot be separated):
+/// 1. [`take_marker`](Self::take_marker) — returns the marker bytes to prepend
+///    (empty unless the previous sync is known good) and **clears** the flag;
+///    the offset `N` is the file's live length, i.e. exactly where the
+///    prepended marker will start.
+/// 2. `append(marker ++ records)`, then `sync`.
+/// 3. [`mark_synced`](Self::mark_synced) only if both returned `Ok`.
+///
+/// Anything that rewrites the file (compaction's `replace`) calls
+/// [`invalidate`](Self::invalidate); a failure anywhere leaves the flag clear
+/// (step 1 cleared it), so a marker is never claimed over bytes whose sync is
+/// unknown. Opening a file starts clear (also after a tail repair).
+#[derive(Debug, Default)]
+pub struct SyncMarkerState {
+    synced: std::sync::atomic::AtomicBool,
+}
+
+impl SyncMarkerState {
+    /// The marker line to prepend to this round's append, or empty. Clears
+    /// the flag (see the type doc).
+    pub async fn take_marker<E: Env>(&self, env: &E, tag: &FormatTag, file: &str) -> Vec<u8> {
+        if !self.synced.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Vec::new();
+        }
+        match env.size(file).await {
+            Ok(len) => format::encode_sync_marker(tag, len),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Record that the append + `fsync` after a [`take_marker`](Self::take_marker)
+    /// both succeeded: everything now in the file is durable.
+    pub fn mark_synced(&self) {
+        self.synced.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Forget any pending marker (the file was rewritten or its sync state is
+    /// unknown).
+    pub fn invalidate(&self) {
+        self.synced
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// One durable change, appended to the write-ahead log. Generic over the command
@@ -569,6 +612,7 @@ where
 mod tests {
     use super::*;
     use crate::meta::{MetaCommand, NodeStatus};
+    use animus_env::Disk;
 
     // --- tagged / multiplexed WAL (PR1 of the single-command-split redesign) ---
 
@@ -1247,5 +1291,91 @@ mod tests {
             PersistedState::<MetaCommand, Metadata>::decode(&rotted),
             Err(FormatError::MidFileCorruption { offset: 0, .. })
         ));
+    }
+
+    // --- issue #1132: piggybacked sync markers (`SyncMarkerState`) ---------
+
+    /// Drive the writer protocol against a `SimEnv` disk exactly as
+    /// `persist_wal` does: take_marker, one append, sync, mark_synced.
+    async fn round<E: Env>(
+        env: &E,
+        st: &SyncMarkerState,
+        records: &[WalRecord<MetaCommand, Metadata>],
+    ) {
+        let mut buf = st.take_marker(env, &CONTROL_WAL, "w").await;
+        for r in records {
+            buf.extend(PersistedState::<MetaCommand, Metadata>::encode_record(r));
+        }
+        env.append("w", &buf).await.unwrap();
+        env.sync("w").await.unwrap();
+        st.mark_synced();
+    }
+
+    fn sim_env() -> animus_sim::SimEnv {
+        animus_sim::Simulator::new(7).env(animus_env::nid(0))
+    }
+
+    #[test]
+    fn a_marker_rides_at_the_start_of_the_next_rounds_append_with_its_own_offset() {
+        futures::executor::block_on(async {
+            let env = sim_env();
+            let st = SyncMarkerState::default();
+            round(&env, &st, &[hard(1), hard(2)]).await;
+            let after_first = env.size("w").await.unwrap();
+            // Round 1 wrote no marker (nothing was proven yet).
+            let bytes = env.read("w").await.unwrap();
+            assert_eq!(bytes.len() as u64, after_first);
+            assert!(!bytes.windows(6).any(|w| w == b"!sync:"));
+            round(&env, &st, &[hard(3)]).await;
+            let bytes = env.read("w").await.unwrap();
+            let expect = format::encode_sync_marker(&CONTROL_WAL, after_first);
+            assert_eq!(
+                &bytes[after_first as usize..after_first as usize + expect.len()],
+                &expect[..],
+                "the marker sits at offset N == its own start, before round 2's records"
+            );
+            // And the file decodes cleanly to all three records.
+            let (records, valid) =
+                PersistedState::<MetaCommand, Metadata>::decode_with_extent(&bytes).unwrap();
+            assert_eq!(records, vec![hard(1), hard(2), hard(3)]);
+            assert_eq!(valid, bytes.len());
+        });
+    }
+
+    #[test]
+    fn a_flip_before_a_piggybacked_marker_is_mid_file_corruption() {
+        futures::executor::block_on(async {
+            let env = sim_env();
+            let st = SyncMarkerState::default();
+            round(&env, &st, &[hard(1), hard(2)]).await;
+            let n = env.size("w").await.unwrap();
+            round(&env, &st, &[hard(3)]).await;
+            let mut bytes = env.read("w").await.unwrap();
+            bytes[12] ^= 0xFF; // inside record 1, before the marker at `n`
+            assert_eq!(
+                PersistedState::<MetaCommand, Metadata>::decode(&bytes).unwrap_err(),
+                FormatError::MidFileCorruption {
+                    format: "control-wal",
+                    offset: 0,
+                    durable_to: n,
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn invalidate_and_a_failed_round_clear_the_pending_marker() {
+        futures::executor::block_on(async {
+            let env = sim_env();
+            let st = SyncMarkerState::default();
+            round(&env, &st, &[hard(1)]).await;
+            st.invalidate(); // e.g. a compaction rewrite
+            assert!(st.take_marker(&env, &CONTROL_WAL, "w").await.is_empty());
+            // take_marker itself clears: a round that then fails (never calls
+            // mark_synced) leaves nothing pending.
+            round(&env, &st, &[hard(2)]).await;
+            let _ = st.take_marker(&env, &CONTROL_WAL, "w").await;
+            assert!(st.take_marker(&env, &CONTROL_WAL, "w").await.is_empty());
+        });
     }
 }

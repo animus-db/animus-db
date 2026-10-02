@@ -1501,15 +1501,21 @@ of that un-synced region, so a correct writer plus a crash produces "bad line,
 then valid line" (72 of 300 seeds measured). The reader needs a durable sync
 boundary.
 
-- **Format v2** (checklist step 1): after every `fsync` that returns `Ok` (the
-  line-framed per-group/control WALs skip it while another persist round is
-  already queued, since markers are cumulative and the next round's marker
-  covers this one; the marker is only ever missing for a WAL that is not yet
-  quiescent), the writer appends a marker line `!sync:<N>` (an ordinary CRC-checked line
-  carrying the tag's version) where `N` is the file length at that moment,
-  which is the marker's own start offset. Written *after* the sync, never
-  before (a pre-sync marker could survive a kept-prefix tear next to a flipped
-  byte in the same un-synced round). Record payloads are unchanged.
+- **Format v2** (checklist step 1): after every `fsync` that returns `Ok`, the
+  writer records that the file is durable and **piggybacks** the marker on its
+  *next* persist round: it is prepended to that round's single `append` (never
+  a separate append under the WAL lock, which a slow disk charges a full extra
+  latency per round), with `N` read from the file's live length at that moment.
+  The claim is true when written (the earlier fsync completed first); a
+  compaction rewrite or any failed round clears the pending state. Residual:
+  the latest round has no durable marker until the next round syncs. The
+  marker is a line `!sync:<N>` (an ordinary CRC-checked line carrying the
+  tag's version) where `N` is the file length at that moment, which is the
+  marker's own start offset. Never written before the sync it vouches for (a
+  pre-sync marker could survive a kept-prefix tear next to a flipped byte in
+  the same un-synced round). Record payloads are unchanged. Harness: the
+  `control-wal` transcode reframes v2 to v1 through `format::reframe_to_v1`
+  (`legacy-encoders`-gated), and the `raftkv-wal` EMBEDDED row is at v2.
 - **Decoder** (`format::decode_lines_extent`, documented there): a bad line
   that starts before the greatest valid marker is
   `FormatError::MidFileCorruption { offset, durable_to }`; at or after it, a

@@ -750,6 +750,36 @@ fn control_wal_fixture_restarts_with_current_code() {
     }
 }
 
+/// The v2 -> v1 transcode (ADR 0073 coordination note): the legacy reframer
+/// drops the sync-marker lines and re-frames every record under the v1 tag, so
+/// the result is a marker-less v1 file that decodes to the same records.
+#[test]
+fn control_wal_v2_transcodes_to_a_v1_file_with_the_same_records() {
+    let entry = transcode::TABLE
+        .iter()
+        .find(|e| e.name == "control-wal")
+        .expect("control-wal entry");
+    let v2 = fixtures("control-wal")[&2].clone();
+    let v1 = entry.transcode_to(&v2, 1).expect("v2 -> v1");
+    assert!(
+        !v1.windows(6).any(|w| w == b"!sync:"),
+        "v1 has no marker lines"
+    );
+    assert!(
+        v1.split(|&b| b == b'\n')
+            .filter(|l| !l.is_empty())
+            .all(|l| &l[9..13] == b"CWL1" && &l[13..15] == b"01"),
+        "every line re-framed under the v1 tag"
+    );
+    assert_eq!(
+        PersistedState::<MetaCommand, Metadata>::decode(&v1).expect("v1 decodes"),
+        control_wal_expected(1)
+    );
+    // (Not byte-equal to the v1 fixture: its `Snapshot` line embeds a
+    // `Metadata` serialized before `Metadata` grew its `"v"` field; the
+    // records are what must match.)
+}
+
 /// `CWL1` lines are CRC-framed, so zeroing the version *in place* breaks the
 /// CRC and reads as a torn line (tolerated: content check fails). A forged
 /// line with a valid CRC but a future version is the named-error shape.

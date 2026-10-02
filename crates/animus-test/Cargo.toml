@@ -18,6 +18,9 @@ workspace = true
 # features only (no `prod`).
 animus-env.workspace = true
 animus-sim.workspace = true
+# `src/upgrade/transcode.rs` (library code of this test-only crate, never a
+# production dependency) calls the `legacy-encoders`-gated `reframe_to_v1`.
+animus-control = { workspace = true, features = ["legacy-encoders"] }
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true

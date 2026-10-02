@@ -2939,10 +2939,16 @@ Known follow-up, deliberately not fixed here: the failure detector re-proposes
 `status: Down` for members a stale cache still shows Active, feeding more WAL
 rounds while the apply task is behind.
 
-- Sync markers (`append_sync_marker`) are written only when the core has no
-  `has_unflushed_wal()` left after a persist round (markers are cumulative). An
-  unconditional per-round marker is a second `append` under `wal_lock`, which
-  the sim charges `sync_delay` and which starves slow-disk learner catch-up
-  (`snapshot_transfer_survives_compaction`).
+- Sync markers (CWL1/SWL1 v2, issue #1132) are **piggybacked**, never a separate
+  append: `FairMutex::markers()` (`persist::SyncMarkerState`) remembers that the
+  previous round's fsync succeeded, and the next round prepends `!sync:<N>` to
+  its own single `append` (`N` = live file length = the marker's own start). A
+  compaction `replace` calls `invalidate()`; `take_marker` clears the flag so a
+  failed round leaves nothing pending. Do **not** add a standalone marker append
+  under `wal_lock` (the sim charges `sync_delay` per append and it starves
+  slow-disk learner catch-up, `snapshot_transfer_survives_compaction`), and do
+  **not** gate markers on `has_unflushed_wal()` (it can stay true for whole
+  bursts, leaving them unprotected). The newest round has no durable marker
+  until the next round syncs.
 
 **Upgrade-harness class (ADR 0073 P1-D):** `control-wal`/`shared-wal` are whole-file `TABLE` entries in `animus-test`'s transcode table (a bump edits that entry; legacy encoders must be `pub` + `legacy-encoders`-gated); `control-snapshot`, `metadata`, `mirror-version` and `mirror-entities` are `EMBEDDED` (a bump edits their carrier's transcode).

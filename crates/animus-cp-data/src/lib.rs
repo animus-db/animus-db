@@ -7438,7 +7438,14 @@ async fn persist_wal<E: Env>(
         // a joining learner's persist round for one MAX_APPEND_ENTRIES_BATCH
         // batch outlast the whole run on a slow-disk `SimEnv` node (and, on
         // `ProdEnv`, cost one `open` + `write` + `flush` per record).
-        let mut buf = Vec::new();
+        //
+        // Issue #1132: the previous round's sync marker (if its fsync
+        // succeeded) rides at the front of this same `append` — never its own
+        // append under `wal_lock` (see `animus_control::persist::SyncMarkerState`).
+        let mut buf = wal_lock
+            .markers()
+            .take_marker(env, &animus_control::persist::CONTROL_WAL, wal)
+            .await;
         for record in &records {
             buf.extend(PersistedState::encode_record(record));
         }
@@ -7456,6 +7463,7 @@ async fn persist_wal<E: Env>(
             );
             return;
         }
+        wal_lock.markers().mark_synced();
     }
     // Durable now: advance the log watermark and the round watermark under one
     // acquisition, then release whatever the consensus loop buffered on this
@@ -7466,29 +7474,6 @@ async fn persist_wal<E: Env>(
         progress.complete_drain(round);
     }
     apply_signal.notify();
-    // Issue #1132: the per-group WAL's sync marker (after the sync, after the
-    // acks, under `wal_lock`). The shared-WAL branch writes its own markers
-    // inside `SharedWal::flush`, so only the private-file branch needs one.
-    //
-    // Skipped while more records are already waiting for their own round: a
-    // marker is cumulative (it claims everything before its offset is fsynced),
-    // so the very next round's marker covers this one too, and the extra
-    // append would otherwise sit under `wal_lock` on every back-to-back round
-    // (on a slow disk that doubles each round's lock hold and starves a
-    // lagging learner's catch-up). The marker is written when a round leaves
-    // the WAL fully flushed, i.e. before the group goes idle.
-    let more_pending = core
-        .lock()
-        .expect("raftkv core poisoned")
-        .has_unflushed_wal();
-    if shared.is_none() && !more_pending {
-        animus_control::persist::append_sync_marker(
-            env,
-            &animus_control::persist::CONTROL_WAL,
-            wal,
-        )
-        .await;
-    }
 }
 
 /// Whether `key` falls inside any range this group has already sealed
@@ -10759,6 +10744,9 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 for record in &records {
                     buf.extend(PersistedState::encode_record(record));
                 }
+                // Issue #1132: rebuilt from records — any pending piggybacked
+                // marker no longer describes this file.
+                wal_lock.markers().invalidate();
                 env.replace(wal, &buf).await
             };
             match write_result {
