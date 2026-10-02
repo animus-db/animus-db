@@ -3246,43 +3246,46 @@ fn wal_resync_point(bytes: &[u8], start: usize) -> Option<usize> {
 ///
 /// An empty `bytes` (no header, no records at all) decodes as empty with no
 /// error: this is the ordinary shape of a segment nothing has ever been
-/// durably appended to yet (this coordinator writes the header and a
-/// segment's first record together in one `append`, so "no header" and "no
-/// records" coincide for a genuinely untouched file — see `wal`'s module
-/// docs).
+/// durably appended to yet (this coordinator syncs the header before any
+/// record is appended, so "no header" implies "no records" for a genuinely
+/// untouched file — see `wal`'s module docs).
 ///
 /// # Errors
-/// - [`StorageError::PreBaselineFormat`] if at least [`WAL_MAGIC`]'s own
-///   length of bytes is present and the leading 4 bytes are not `WAL_MAGIC`,
-///   or if fewer bytes than that are present and even that short prefix
-///   doesn't match `WAL_MAGIC`'s own corresponding prefix (proof this is
-///   foreign/pre-baseline data, not a crash-torn write of *our* header — a
-///   real torn write can only ever be a true prefix of what was actually
-///   written, never a mismatched one).
+/// - [`StorageError::PreBaselineFormat`] if at least [`WAL_HEADER_LEN`]
+///   bytes are present and the leading 4 bytes are not `WAL_MAGIC`.
 /// - [`StorageError::UnsupportedFormatVersion`] if the magic matches but the
 ///   version byte is `0` or greater than [`WAL_VERSION`].
 /// - [`StorageError::Backend`] exactly as before, for a record frame that
 ///   fails to parse and is provably not a trailing tear (a valid frame still
 ///   parses later in the buffer).
 ///
-/// A **torn header** — fewer than [`WAL_HEADER_LEN`] bytes present, matching
-/// `WAL_MAGIC`'s own prefix as far as it goes — is tolerated exactly like a
-/// torn trailing record: nothing in this file can have been durably synced
-/// (header and first record always share one `sync`), so it decodes as
-/// empty (`consumed == 0`), which lets the existing repair-on-open truncate
-/// the file to nothing and a fresh header get written on the next append.
+/// A **torn header** — fewer than [`WAL_HEADER_LEN`] bytes present, *whatever
+/// their content* — is tolerated exactly like a torn trailing record and
+/// decodes as empty (`consumed == 0`), which lets the existing repair-on-open
+/// truncate the file to nothing and a fresh header get written on the next
+/// append. This is sound because the write side syncs the header **on its
+/// own, before any record is appended** (`wal`'s `flush_batch`): a file with
+/// a durable header is at least `WAL_HEADER_LEN` long, so a shorter one never
+/// had its header synced and cannot hold acked data. Content is deliberately
+/// not checked: a crash that tears an un-synced write may leave a prefix
+/// with a flipped or zeroed byte (`SimEnv`'s `corrupt_on_crash`; torn sectors
+/// on a real disk). A file of `WAL_HEADER_LEN` or more bytes with a bad header
+/// stays a loud error — its header was synced, so that is real corruption.
 fn decode_wal(bytes: &[u8]) -> Result<(Vec<WalRecord>, usize)> {
     if bytes.is_empty() {
         return Ok((Vec::new(), 0));
     }
     if bytes.len() < WAL_HEADER_LEN {
-        // A real crash can only ever truncate a file's tail, so a legitimate
-        // torn write of our own header always leaves a true prefix of it.
-        // Anything else this short is foreign/pre-baseline data, not a tear.
-        if bytes == &WAL_MAGIC[..bytes.len()] {
-            return Ok((Vec::new(), 0));
-        }
-        return Err(StorageError::PreBaselineFormat { format: "lsm-wal" });
+        // Shorter than the header: the header was never synced (the write
+        // side syncs the 5-byte header on its own, before any record is
+        // appended, so a durably-headed file is always at least
+        // `WAL_HEADER_LEN` long and a file this short provably holds no
+        // acked data). Crash-torn bytes of an un-synced write can be a
+        // prefix *or* carry a flipped/zeroed byte, so the content is not
+        // checked. Nothing this short can be a real record either (the
+        // smallest frame is longer than the header), so foreign
+        // pre-baseline data this short is as harmless as a tear.
+        return Ok((Vec::new(), 0));
     }
     let magic: [u8; 4] = bytes[..4].try_into().expect("checked length above");
     if magic != WAL_MAGIC {
@@ -3801,10 +3804,10 @@ mod wal_format_fixture_tests {
 
     /// A torn header — a strict prefix of the real header, short of its
     /// full length, exactly what a crash can leave — recovers as if the
-    /// file were empty: no records, nothing consumed, no error. Nothing
-    /// could have synced past an incomplete header (header and first
-    /// record always share one `sync` — see `wal`'s module docs), so this
-    /// is the crash-safety half of the format, not a corruption case.
+    /// file were empty: no records, nothing consumed, no error. The header
+    /// is synced before any record is appended (see `wal`'s module docs),
+    /// so a file shorter than the header holds nothing durable: this is the
+    /// crash-safety half of the format, not a corruption case.
     #[test]
     fn torn_header_recovers_as_empty() {
         let full_header = wal::encode_wal_header();
@@ -3818,6 +3821,31 @@ mod wal_format_fixture_tests {
                 "a {len}-byte torn header must decode with no records"
             );
             assert_eq!(consumed, 0, "a {len}-byte torn header must consume nothing");
+        }
+    }
+
+    /// A crash-torn header with a flipped byte (`corrupt_on_crash`) is still
+    /// shorter than the header, so it never had a synced header: empty, not
+    /// an error. But the same flip in a full-length header stays loud.
+    #[test]
+    fn short_corrupted_header_is_empty_but_full_length_one_stays_loud() {
+        let full = wal::encode_wal_header();
+        for len in 1..wal::WAL_HEADER_LEN {
+            for at in 0..len {
+                let mut torn = full[..len].to_vec();
+                torn[at] ^= 0xFF;
+                let (records, consumed) = decode_wal(&torn).expect("short torn header");
+                assert!(records.is_empty());
+                assert_eq!(consumed, 0);
+            }
+        }
+        for at in 0..wal::WAL_HEADER_LEN {
+            let mut bad = full.to_vec();
+            bad[at] ^= 0xFF;
+            assert!(
+                decode_wal(&bad).is_err(),
+                "a flipped byte {at} in a full-length header must stay a loud error"
+            );
         }
     }
 }

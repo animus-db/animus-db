@@ -63,6 +63,7 @@ fn ack_all(core: &mut RaftCore, from: NodeId) {
             success: true,
             match_index: core.last_log_index(),
             needs_snapshot: false,
+            check_pending: false,
         },
         NOW,
         7,

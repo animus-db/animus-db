@@ -532,6 +532,20 @@ version-storage-that-never-serializes-the-type.md`. See
 full mechanical account (including the deliberately-left-red
 `control-wal` fixture gap this same PR reports rather than papers over).
 
+## Amendment (2026-09-30 — `wal_lock` is FIFO-fair; the apply task can no longer be starved of it)
+
+`wal_lock` (the consensus loop's `persist_wal` vs. the apply task's compaction
+rewrite) was a `futures::lock::Mutex`, which is unfair. `drive` starts the next
+persist round the moment the previous lands, and under continuous proposals on a
+slow disk it re-locked ahead of the apply task's compaction wait indefinitely: no
+further `merge_batch`, `engine_applied_index` frozen, `metadata()` stale,
+`pending_apply` unbounded, while core `last_applied` still equalled commit. It is now
+`fair_lock::FairMutex` (ticketed FIFO hand-off, cancel-safe, no timer). The apply
+task's `merge_batch` for a pass always lands before it queues for compaction, and the
+queue wait is bounded by the rounds ahead of it. Regression:
+`tests/apply_not_starved_by_wal_lock.rs`. Follow-up not addressed: the failure
+detector re-proposing `Down` for members a stale cache shows Active.
+
 ## See also
 
 - `crates/animus-control/CLAUDE.md` — `node.rs`/`raft.rs`/`mirror.rs`/`syskv.rs`/

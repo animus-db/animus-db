@@ -1020,3 +1020,35 @@ control plane's own wire is `serde_json` (additive by construction);
 `animus-cp-data`'s hand-rolled codec bumps to version `32`. Full design and
 safety argument: ADR 0058's issue #1061 amendment.
 
+
+## Amendment (2026-09-30): never promote a learner whose boot-time cluster check is pending (issue #1131)
+
+The issue #667 boot-time check makes a node with an unresolved
+`cluster_check_pending` refuse every vote and never campaign. A freshly hosted
+learner runs that check too, seeded from its (stale) bootstrap peers. If the
+leader promoted it before the check resolved, the first probe reply that then
+arrived already named the learner as a voter with `ever_heard_from_prober ==
+false`, which takes the ambiguous wait-for-**every**-pending-peer path; with
+one seeded peer dead that path never completes. The promoted voter then sits
+in the quorum denominator unable to vote, so with one original voter also
+dead the group needs votes it can never get and stays leaderless for good
+(`animusd::cluster_growth::dashboard_health_recovers_after_grown_cluster_loses_an_original_node`,
+~3/46 under heavy CPU load, term climbing ~140x in 30s).
+
+Fix: `RaftMsg::AppendEntriesResp` gains `check_pending` (true while the responder
+cannot vote yet: its `cluster_check_pending`, **or** its check resolved to
+refused — a wiped voter never votes or campaigns either; `#[serde(default)]`; in `animus-cp-data`'s binary
+codec it is bit 1 of the existing `needs_snapshot` byte, so every v1 frame and
+the `raftkv-wire/v1.bin` fixture decode and re-encode unchanged). The leader
+records the latest report per peer (`peer_check_pending`, volatile, reset with
+`match_index`) and `RaftCore::learner_caught_up` — the single predicate every
+production promotion consults (`reconfigure_step` step 2, which also serves
+directed Placing and split placing; the control plane has no automatic
+promoter) — is `false` until the learner has reported `check_pending == false`
+since the leader's stint / the learner's (re)introduction. While it is still a
+learner no voter's config lists it, so its probes resolve on the existing
+`!config.contains(self)` branch at once; the gate only ever delays promotion,
+and a refused promotion is retried by the next reconcile pass. It cannot weaken
+the #667 safety property, which constrains what a node does once it is a voter,
+and the gate makes the node resolve its check before it becomes one. Regression:
+`tests/learner_promotion_pending_check.rs`.

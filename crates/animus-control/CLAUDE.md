@@ -761,6 +761,20 @@ freezes that type's absent-field semantics once merged.**
   signal-is-not-safe-when-the.md` and the new
   `tests/wiped_voter_follower_peer_evidence.rs`.
 
+- **Never promote a learner whose boot-time cluster check is pending (issue
+  #1131, ADR 0009's 2026-09-30 amendment).** A pending check refuses every vote
+  and never campaigns, so a promoted-but-pending voter can leave a group
+  leaderless forever (its wait-for-all probe set may contain a dead peer).
+  `AppendEntriesResp::check_pending` (`RaftCore::cannot_vote_yet`: check pending
+  OR resolved-to-refused) carries the learner's own state to the
+  leader (`peer_check_pending`); `RaftCore::learner_caught_up` is `false` until
+  it reports `false`, and is the one gate every production promoter consults
+  (cp-data `reconfigure_step`; the control plane has no automatic promoter).
+  Any new promotion path must go through it. In cp-data's binary codec the flag
+  is bit 1 of the `needs_snapshot` byte (v1 frames unchanged). Regression:
+  `tests/learner_promotion_pending_check.rs`
+  (`ANIMUS_LEARNER_PENDING_CHECK_SEEDS`).
+
 - **Config-in-log + current-term-commit gate (ADR 0017 C).** `LogEntry` may
   carry a `config: Option<voters>`; `RaftCore` keeps `peers`/`cluster_size` in
   sync with the latest log config (config rides snapshots + `InstallSnapshot`).
@@ -2909,3 +2923,18 @@ empty; the wiped-voter guard then refused it permanently. `learner_caught_up`
 must therefore only ever be true from an ack received since the (re)add.
 Tests: `tests/learner_membership.rs` `*_starts_with_fresh_progress`,
 `animus-cp-data/tests/release_race_corpus.rs` stale-progress cells.
+
+## `wal_lock` is a FIFO-fair `FairMutex` (apply-task starvation fix)
+
+`node.rs`'s `wal_lock` (serializes the consensus loop's `persist_wal` append/fsync
+against the apply task's compaction rewrite of the same WAL file) is
+`fair_lock::FairMutex`, not `futures::lock::Mutex`. The unfair mutex let `drive`'s
+back-to-back persist rounds barge ahead of the apply task's compaction wait
+indefinitely under continuous proposals on a slow disk, freezing
+`engine_applied_index` while core `last_applied == commit` hid it (ADR 0038
+amendment 2026-09-30). Do not swap it back; any new `wal_lock` user must also be
+cancel-safe-fair (it is). Liveness tests for the apply path assert on
+`engine_applied_index()`, never core `last_applied` (`tests/apply_not_starved_by_wal_lock.rs`).
+Known follow-up, deliberately not fixed here: the failure detector re-proposes
+`status: Down` for members a stale cache still shows Active, feeding more WAL
+rounds while the apply task is behind.
