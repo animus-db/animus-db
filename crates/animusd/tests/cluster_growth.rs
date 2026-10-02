@@ -490,9 +490,13 @@ async fn raftkv_group_details(admin_addr: SocketAddr) -> Vec<String> {
                         .as_array()
                         .map(|v| v.iter().filter_map(|x| x.as_str()).collect())
                         .unwrap_or_default();
+                    // Issue #1131: a node whose boot-time cluster check is
+                    // still pending refuses every vote and never campaigns.
+                    let check_pending = g["cluster_check_pending"].as_bool().unwrap_or(false);
                     format!(
                         "tablet={tablet} node={node} role={role} leader={leader} \
-                         term={term} commit={commit} voters={voters:?} learners={learners:?}"
+                         term={term} commit={commit} voters={voters:?} learners={learners:?} \
+                         cluster_check_pending={check_pending}"
                     )
                 })
                 .collect()

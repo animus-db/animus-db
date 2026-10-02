@@ -1778,3 +1778,11 @@ generalizes from a range-scoped seal to a whole-group fork), and ADR 0017
 §4 (the original in-place design this proposal is not a resurrection of,
 but a structurally corrected descendant of — see "Relationship to the
 original ADR 0017 §4 design").
+
+## Amendment (2026-09-30): the promotion criterion includes the learner's boot-time check (issue #1131)
+
+"Caught up" (`RaftCore::learner_caught_up`) now also requires that the learner
+has reported its issue #667 cluster check resolved (`AppendEntriesResp::
+check_pending == false`): a node with a pending check refuses every vote, so
+promoting it adds a voter that cannot vote. See ADR 0009's 2026-09-30
+amendment for the mechanism and safety argument.

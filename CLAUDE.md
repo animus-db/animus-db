@@ -187,6 +187,7 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 | `ANIMUS_BACKFILL_SEEDS=K` | 1 | secondary-index backfill fault-injection corpus depth (`animus-test`, ADR 0045) |
 | `ANIMUS_QUIESCE_SEEDS=K` | 1 | idle-tablet-group quiescence corpus depth (`animus-cp-data`, ADR 0044 phase 1) |
 | `ANIMUS_SPLIT_SEEDS=K` | 1 | `KvCommand::SeedBatch` corpus depth (`animus-cp-data`) — the version-carrying row-merge command originally built for the now-deleted copy-based split driver (ADR 0050 Train B), its sole surviving consumer is the restore driver (ADR 0059 §7) |
+| `ANIMUS_LEARNER_PENDING_CHECK_SEEDS=K` | 8 (floor) | grown-group-elects-after-leader-loss corpus depth with a learner whose boot-time cluster check is pending (`animus-control`, `tests/learner_promotion_pending_check.rs`, issue #1131) |
 | `ANIMUS_LEARNER_SEEDS=K` | 1 | learner (non-voting) membership-class fault-injection corpus depth (`animus-control`, ADR 0058 Train 1) |
 | `ANIMUS_RECONFIGURE_DROP_SEEDS=K` | 1 | healthy-voter-drop reconfigure corpus depth (`animus-cp-data`, issue #781) — a live follower, and separately the leader, dropped via a direct `CasTabletReplicas` through the real `spawn_reconfigure_loop`/`reconfigure_step` |
 | `ANIMUS_CONTROL_SEEDS=K` | 1 | control-plane machinery (apply task, schema-catalog exclusivity) fault-injection corpus depth (`animus-control`) |

@@ -189,6 +189,7 @@ fn caught_up_node_reships_non_empty_snapshot() {
                     success: true,
                     match_index: index,
                     needs_snapshot: false,
+                    check_pending: false,
                 },
                 now,
                 7,
