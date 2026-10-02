@@ -44,26 +44,32 @@ use futures::executor::block_on;
 // ---------------------------------------------------------------------------
 // Fixtures and seeding
 
-/// The five tier-0 formats and the crate whose `tests/fixtures/formats/`
-/// directory holds each one's fixtures (`shared-wal` lives in `animus-control`).
-const FORMATS: &[(&str, &str)] = &[
-    ("lsm-wal", "animus-storage"),
-    ("lsm-manifest", "animus-storage"),
-    ("lsm-sstable", "animus-storage"),
-    ("control-wal", "animus-control"),
-    ("shared-wal", "animus-control"),
-];
+/// Every crate's `tests/fixtures/formats` directory.
+fn format_roots() -> Vec<PathBuf> {
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut roots: Vec<PathBuf> = std::fs::read_dir(&crates)
+        .expect("read crates/")
+        .map(|e| e.expect("dir entry").path().join("tests/fixtures/formats"))
+        .filter(|p| p.is_dir())
+        .collect();
+    roots.sort();
+    roots
+}
 
+/// The fixture directory of `format`, found by scanning every crate (so a
+/// table entry needs no crate bookkeeping).
 fn fixture_dir(format: &str) -> PathBuf {
-    let (_, krate) = FORMATS
-        .iter()
-        .find(|(f, _)| *f == format)
-        .unwrap_or_else(|| panic!("no fixture crate recorded for {format}"));
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join(krate)
-        .join("tests/fixtures/formats")
-        .join(format)
+    let hits: Vec<PathBuf> = format_roots()
+        .into_iter()
+        .map(|r| r.join(format))
+        .filter(|p| p.is_dir())
+        .collect();
+    assert_eq!(
+        hits.len(),
+        1,
+        "{format}: expected one fixture dir, got {hits:?}"
+    );
+    hits.into_iter().next().unwrap()
 }
 
 /// Every checked-in fixture of `format`, keyed by the version in its file name.
@@ -179,11 +185,12 @@ fn each_seed(name: &str, mut body: impl FnMut(u64)) {
 
 /// Checklist step 7 made mechanical: every fixture version has a table entry
 /// version, and the table's current version is the newest fixture's. A format
-/// that bumped without registering its pair fails here.
+/// that bumped without registering its pair fails here. Iterates the whole
+/// `TABLE` (a whole-file format with no fixture is itself a failure).
 #[test]
 fn transcode_table_matches_the_checked_in_fixtures() {
-    for (format, _) in FORMATS {
-        let entry = transcode::entry(format).unwrap_or_else(|| panic!("{format}: not in TABLE"));
+    for entry in transcode::TABLE {
+        let format = entry.name;
         let versions: Vec<u32> = fixtures(format).keys().copied().collect();
         assert_eq!(
             entry.current_version,
@@ -198,6 +205,116 @@ fn transcode_table_matches_the_checked_in_fixtures() {
             );
         }
     }
+    for e in transcode::EMBEDDED {
+        let newest = newest_fixture_version(&fixture_dir(e.name));
+        assert_eq!(
+            e.current_version, newest,
+            "{}: EMBEDDED current_version differs from the newest fixture \
+             (a bump edits the carrier's transcode and this row)",
+            e.name
+        );
+    }
+}
+
+/// The newest `v<N>.<ext>` fixture version under `dir`, recursing into
+/// subdirectories (`mirror-entities` has one directory per entity kind; the
+/// newest version must be common to every kind's newest, so take the minimum
+/// of per-directory maxima).
+fn newest_fixture_version(dir: &Path) -> u32 {
+    let mut here: Option<u32> = None;
+    let mut sub: Option<u32> = None;
+    for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())) {
+        let path = entry.expect("dir entry").path();
+        if path.is_dir() {
+            let v = newest_fixture_version(&path);
+            sub = Some(sub.map_or(v, |s| s.min(v)));
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        let v: u32 = name
+            .strip_prefix('v')
+            .and_then(|s| s.split('.').next())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| {
+                panic!("unexpected fixture file name {name:?} in {}", dir.display())
+            });
+        here = Some(here.map_or(v, |h| h.max(v)));
+    }
+    here.or(sub)
+        .unwrap_or_else(|| panic!("no fixtures under {}", dir.display()))
+}
+
+/// The names in `dirs` that neither `TABLE` nor `EMBEDDED` registers. Pure, so
+/// the negative control can feed it a synthetic directory.
+fn unregistered(dirs: &[String]) -> Vec<String> {
+    dirs.iter()
+        .filter(|d| {
+            transcode::entry(d).is_none() && !transcode::EMBEDDED.iter().any(|e| e.name == **d)
+        })
+        .cloned()
+        .collect()
+}
+
+fn all_fixture_dir_names() -> Vec<String> {
+    let mut names = Vec::new();
+    for root in format_roots() {
+        for e in std::fs::read_dir(&root).expect("read formats dir") {
+            let p = e.expect("dir entry").path();
+            if p.is_dir() {
+                names.push(p.file_name().unwrap().to_string_lossy().into_owned());
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
+/// Every format fixture directory is accounted for by the harness, every
+/// registration names a real directory, and every embedded carrier is a real
+/// `TABLE` entry.
+#[test]
+fn every_fixture_dir_is_registered_with_the_harness() {
+    let dirs = all_fixture_dir_names();
+    assert_eq!(
+        unregistered(&dirs),
+        Vec::<String>::new(),
+        "fixture dir(s) in no TABLE/EMBEDDED entry (ADR 0073 step 7): register \
+         whole-file formats in transcode::TABLE, others in transcode::EMBEDDED"
+    );
+    let mut registered: Vec<&str> = transcode::TABLE.iter().map(|e| e.name).collect();
+    registered.extend(transcode::EMBEDDED.iter().map(|e| e.name));
+    let n = registered.len();
+    registered.sort_unstable();
+    registered.dedup();
+    assert_eq!(n, registered.len(), "a format is registered twice");
+    for name in registered {
+        assert!(
+            dirs.iter().any(|d| d == name),
+            "{name}: registered but no tests/fixtures/formats/{name} directory"
+        );
+    }
+    for e in transcode::EMBEDDED {
+        if let transcode::Carrier::Table(t) = e.carrier {
+            assert!(
+                transcode::entry(t).is_some(),
+                "{}: carrier {t:?} is not a TABLE entry",
+                e.name
+            );
+        }
+    }
+}
+
+/// Negative control: the completeness check has teeth. A synthetic unregistered
+/// directory is reported, and registered ones are not.
+#[test]
+fn completeness_check_flags_an_unregistered_fixture_dir() {
+    let mut dirs = all_fixture_dir_names();
+    assert!(unregistered(&dirs).is_empty());
+    dirs.push("brand-new-format".to_string());
+    assert_eq!(unregistered(&dirs), vec!["brand-new-format".to_string()]);
 }
 
 // ---------------------------------------------------------------------------
@@ -631,6 +748,36 @@ fn control_wal_fixture_restarts_with_current_code() {
             assert_eq!(state.log, vec![upsert_entry(1, 3, 2)], "seed={seed}");
         });
     }
+}
+
+/// The v2 -> v1 transcode (ADR 0073 coordination note): the legacy reframer
+/// drops the sync-marker lines and re-frames every record under the v1 tag, so
+/// the result is a marker-less v1 file that decodes to the same records.
+#[test]
+fn control_wal_v2_transcodes_to_a_v1_file_with_the_same_records() {
+    let entry = transcode::TABLE
+        .iter()
+        .find(|e| e.name == "control-wal")
+        .expect("control-wal entry");
+    let v2 = fixtures("control-wal")[&2].clone();
+    let v1 = entry.transcode_to(&v2, 1).expect("v2 -> v1");
+    assert!(
+        !v1.windows(6).any(|w| w == b"!sync:"),
+        "v1 has no marker lines"
+    );
+    assert!(
+        v1.split(|&b| b == b'\n')
+            .filter(|l| !l.is_empty())
+            .all(|l| &l[9..13] == b"CWL1" && &l[13..15] == b"01"),
+        "every line re-framed under the v1 tag"
+    );
+    assert_eq!(
+        PersistedState::<MetaCommand, Metadata>::decode(&v1).expect("v1 decodes"),
+        control_wal_expected(1)
+    );
+    // (Not byte-equal to the v1 fixture: its `Snapshot` line embeds a
+    // `Metadata` serialized before `Metadata` grew its `"v"` field; the
+    // records are what must match.)
 }
 
 /// `CWL1` lines are CRC-framed, so zeroing the version *in place* breaks the

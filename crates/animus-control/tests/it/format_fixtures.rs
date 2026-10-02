@@ -203,7 +203,7 @@ fn fixture_starts_with_the_control_wal_tag() {
 
 /// Regenerates `v<CONTROL_WAL.version>.bin` from [`v1_records`] with the
 /// *current* encoder. Run explicitly, never part of the default test run:
-/// `cargo test -p animus-control --test format_fixtures generate_fixture_control_wal -- --ignored`.
+/// `cargo test -p animus-control --test it format_fixtures::generate_fixture_control_wal -- --ignored`.
 ///
 /// Refuses to overwrite a fixture that already exists (ADR 0073 Phase 0
 /// conventions) — bump [`CONTROL_WAL`]'s version and add a new file instead
@@ -331,7 +331,7 @@ fn control_snapshot_fixture_starts_with_the_control_snapshot_tag() {
 
 /// Regenerates `v<CONTROL_SNAPSHOT.version>.bin` from [`v1_syskv_entries`]
 /// with the *current* encoder. Run explicitly, never part of the default
-/// test run: `cargo test -p animus-control --test format_fixtures
+/// test run: `cargo test -p animus-control --test it format_fixtures::
 /// generate_fixture_control_snapshot -- --ignored`.
 ///
 /// Refuses to overwrite a fixture that already exists (ADR 0073 Phase 0
@@ -516,7 +516,7 @@ fn metadata_fixture_carries_the_v_field() {
 
 /// Regenerates `v<METADATA_VERSION>.json` from [`v1_metadata`] with the
 /// *current* encoder. Run explicitly, never part of the default test run:
-/// `cargo test -p animus-control --test format_fixtures generate_fixture_metadata -- --ignored`.
+/// `cargo test -p animus-control --test it format_fixtures::generate_fixture_metadata -- --ignored`.
 ///
 /// Refuses to overwrite a fixture that already exists (ADR 0073 Phase 0
 /// conventions) — bump [`Metadata::version`]'s `METADATA_VERSION` and add a
@@ -704,7 +704,7 @@ fn shared_wal_fixture_starts_with_the_shared_wal_tag() {
 }
 
 /// Regenerates `v<SHARED_WAL_TAG.version>.bin`. Run explicitly:
-/// `cargo test -p animus-control --test format_fixtures generate_fixture_shared_wal -- --ignored`.
+/// `cargo test -p animus-control --test it format_fixtures::generate_fixture_shared_wal -- --ignored`.
 /// Refuses to overwrite an existing fixture (ADR 0073 Phase 0 conventions).
 #[test]
 #[ignore]
@@ -1354,7 +1354,7 @@ fn mirror_entities_round_trip_through_encode_and_decode() {
 
 /// Regenerates the `mirror-entities/<kind>/v<SYSKV_MIRROR_VERSION>.<ext>`
 /// fixtures from the real mirror encoder. Run explicitly:
-/// `cargo test -p animus-control --test format_fixtures generate_fixture_mirror_entities -- --ignored`.
+/// `cargo test -p animus-control --test it format_fixtures::generate_fixture_mirror_entities -- --ignored`.
 /// Refuses to overwrite an existing fixture.
 #[test]
 #[ignore]
@@ -1440,7 +1440,7 @@ fn mirror_version_row_matches_the_current_encoder() {
 }
 
 /// Regenerates `mirror-version/v<SYSKV_MIRROR_VERSION>.bin`. Run explicitly:
-/// `cargo test -p animus-control --test format_fixtures generate_fixture_mirror_version -- --ignored`.
+/// `cargo test -p animus-control --test it format_fixtures::generate_fixture_mirror_version -- --ignored`.
 #[test]
 #[ignore]
 fn generate_fixture_mirror_version() {

@@ -289,6 +289,28 @@ pub struct DecodedLines<'a> {
 /// torn garbage in place and appending after it would put a bad line *before*
 /// later valid sync markers, and the next recovery would (correctly!) refuse
 /// the file as mid-file corruption.
+/// Legacy-encoder for the upgrade-restart harness (ADR 0073 "Legacy encoders
+/// are test-only"): re-frame a line-framed file at `tag`'s current (v2)
+/// version back to **v1**. Type-erased on purpose (framing in, framing out; the
+/// record payloads are identical between v1 and v2, v2 only added sync-marker
+/// lines). Sync-marker lines are dropped (v1 has none and a v1 reader rejects a
+/// version-2 line), every record line is re-framed under the v1 tag, and a torn
+/// tail is cut (the same clean prefix a recovering writer keeps). A file that
+/// is mid-file corrupt is the same named error the decoder reports.
+///
+/// # Errors
+/// Whatever [`decode_lines_extent`] reports for `bytes`.
+#[cfg(any(test, feature = "legacy-encoders"))]
+pub fn reframe_to_v1(tag: &FormatTag, bytes: &[u8]) -> Result<Vec<u8>, FormatError> {
+    let v1 = FormatTag { version: 1, ..*tag };
+    let decoded = decode_lines_extent(tag, bytes)?;
+    let mut out = Vec::with_capacity(bytes.len());
+    for (_version, payload) in decoded.lines {
+        out.extend(encode_line(&v1, payload));
+    }
+    Ok(out)
+}
+
 #[must_use]
 pub fn repaired_image(bytes: &[u8], valid_len: usize) -> Option<Vec<u8>> {
     let mut clean = bytes[..valid_len].to_vec();

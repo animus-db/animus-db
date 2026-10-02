@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working in this crate.
 
+> **Test layout (2026-10-02).** Every corpus is a module of one binary, `tests/it/main.rs` (`cargo test -p animus-test --test it <corpus>::`, e.g. `raftkv_linearizable::`). Older sections below that cite `tests/<name>.rs` mean `tests/it/<name>.rs`.
+
 ## Purpose
 
 Elle/Jepsen-style history recording and consistency checking. A library other
@@ -54,8 +56,13 @@ properties; it also hosts cross-crate fault sweeps.
   anything else is an `UnsupportedTarget` error, never a silent identity.
   **Checklist step 7 is editing one `FormatEntry`** (bump `current_version`,
   add a `VersionSpec`, point `transcode` at the `legacy::vK::encode` calls);
-  `tests/upgrade_restart_tier0.rs` fails if the table drifts from the newest
-  checked-in fixture. Tier 0 (`tests/upgrade_restart_tier0.rs`) seeds a
+  a format that is *not* a whole node-disk file is listed in
+  `EMBEDDED` (name, `Carrier::Table(<entry>)` or `Carrier::OffDisk`, owner,
+  version) and its bump edits its **carrier's** transcode. Legacy encoders the
+  harness calls must be `pub` under `cfg(any(test, feature = "legacy-encoders"))`,
+  never `cfg(test)`-private. `tests/it/upgrade_restart_tier0.rs` fails if the
+  table drifts from the newest checked-in fixture or if any crate's
+  `tests/fixtures/formats/<dir>` is in neither `TABLE` nor `EMBEDDED`. Tier 0 (`tests/it/upgrade_restart_tier0.rs`) seeds a
   `SimEnv` disk with each whole-file fixture, runs it through the table,
   crashes, and opens the real reader (`LsmEngine::open_with`,
   `PersistedState::decode`/`replay`, `SharedWal::open`); its negative
@@ -192,7 +199,7 @@ Env knobs at a glance (details in the sections below):
 
 ## Upgrade-restart corpus (ADR 0073 P1-D, tier 1)
 
-`tests/upgrade_restart_corpus.rs` (tier 0 is `upgrade_restart_tier0.rs`, fixture-seeded
+`tests/it/upgrade_restart_corpus.rs` (tier 0 is `it/upgrade_restart_tier0.rs`, fixture-seeded
 restarts). A live workload runs at the current format versions on `SimEnv` disks, the
 node(s) stop, each stopped disk goes through `animus_test::upgrade::transcode` (the
 **identity** while every format is v1), fresh nodes restart on current code, and the
@@ -240,7 +247,7 @@ workload continues. One `Recorder` spans both phases.
   every kind.
 - **Replay.** Failures print `cell=<name> seed=<seed>`. Replay with
   `ANIMUS_SEED=<seed> ANIMUS_UPGRADE_RESTART_CELL=<cell name substring> cargo test -p
-  animus-test --test upgrade_restart_corpus -- --nocapture`. Depth: `ANIMUS_UPGRADE_RESTART_SEEDS=K`
+  animus-test --test it upgrade_restart_corpus:: -- --nocapture`. Depth: `ANIMUS_UPGRADE_RESTART_SEEDS=K`
   (K=50 is ~55s in debug; nightly runs 100 via `corpus-deep.yml`).
 
 **Tier 2** (whole-cluster restart over `SimCluster`'s `LsmEngine` backend and the DynamoDB wire) lives in
@@ -414,7 +421,7 @@ retrievable from git history.)
   snapshot.rs`'s own `drive_bounded` (a reintroduced #811 livelock has no
   `.await` yield point `SimEnv`'s own step/timeline budget could otherwise
   bound — only a real OS-thread wall-clock bound catches it). Runs at
-  `cargo test -p animus-test --test raftkv_linearizable` with no env var
+  `cargo test -p animus-test --test it raftkv_linearizable::` with no env var
   (`raftkv_snapshot_caught_up_follower_restart_is_linearizable`, so
   automatically in the nightly `corpus-deep.yml` tier), deepens with
   `ANIMUS_RAFTKV_SEEDS=K` via the same `corpus::seed_expand`/`SeedVariant`

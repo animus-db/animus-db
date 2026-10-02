@@ -2303,7 +2303,7 @@ fn raftkv_run_is_deterministic() {
 // for a cell those tests were never meant to describe.
 // ---------------------------------------------------------------------------
 
-/// Runs at `cargo test -p animus-test --test raftkv_linearizable` with no
+/// Runs at `cargo test -p animus-test --test it raftkv_linearizable::` with no
 /// env var (so it is automatically part of the nightly deep-corpus tier,
 /// `.github/workflows/corpus-deep.yml`, which runs this whole binary at
 /// `ANIMUS_RAFTKV_SEEDS=40`) and deepens with `ANIMUS_RAFTKV_SEEDS=K` via

@@ -3,6 +3,8 @@
 This file provides guidance to Claude Code (claude.ai/code) when working in this
 crate.
 
+> **Test layout (2026-10-02).** All SimEnv/pure integration tests are modules of one binary, `tests/it/main.rs` (`cargo test -p animus-cp-data --test it <file>::`); only the real-thread `prod_*` tests (`prod-heavy`) and three tests that read `SimEnv` counters stay separate `tests/*.rs` targets (`departing_removal_notice`, `reconciler`, `reconciler_stop_timing`: `SimEnv::metrics()` is the **process-wide shared no-op sink**, so a before/after counter delta races with any other test in the same process incrementing that metric — it failed `departing_removal_notice` when merged; give a test its own `MetricsHandle::recording()` via `start_with_metrics` instead of reading `env.metrics()`). Older sections below that cite `tests/<name>.rs` mean `tests/it/<name>.rs`.
+
 ## Purpose
 
 The **leaderful, strongly-consistent (CP) data plane** (ADR 0016, ADR 0017):
@@ -2985,7 +2987,7 @@ reconciler-adoption rung's own fault-injection coverage — see this file's
   first time (a hang means a same-instant unbounded-work loop, not slowness —
   see the root `CLAUDE.md`).
 - **Run at depth**: `ANIMUS_RECONCILER_SEEDS=K cargo test -p animus-cp-data
-  --test reconciler_corpus reconciler_corpus_runs_every_scenario` (default
+  --test it reconciler_corpus::reconciler_corpus_runs_every_scenario` (default
   `K=1`; held green through `K=300` in ~52s).
 
 ## Benchmark
@@ -3017,6 +3019,8 @@ noise floor; run it locally, and never compare its numbers against a
 different host/session/media (the bench prints the resolved `/proc/mounts`
 filesystem type + device for whatever directory it writes into, so a
 reader never has to take the media on faith).
+
+**Upgrade-harness class (ADR 0073 P1-D):** none of this crate's formats is a whole-file `TABLE` entry; `raftkv-wal` and `cp-engine-layout` are `EMBEDDED` in a whole-file carrier (`control-wal`/`lsm-sstable`), and `raftkv-wire`, `raftkv-image`, `segment`, `backup-manifest`, `backup-data` are `EMBEDDED` off-disk (`animus-test`'s `upgrade::transcode::EMBEDDED`).
 
 ## `wal_lock` is a FIFO-fair `FairMutex` (apply-task starvation fix)
 

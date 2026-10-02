@@ -1340,7 +1340,7 @@ P1-D tier 2. Phase 1 is done when all four have merged.
 
 **P1-D as-built, tiers 0 and 1 (2026-09-30; tier 2 pending; every format still
 v1).** Tier 0 (#1130) seeds disks from the checked-in fixtures and restarts
-the real readers; tier 1 is `animus-test/tests/upgrade_restart_corpus.rs`
+the real readers; tier 1 is `animus-test/tests/it/upgrade_restart_corpus.rs`
 (21 cells: Data / Control / SharedWal x leader / follower / whole-group x
 clean / crash / torn-tail, strict engine opens, list-append oracle with a
 post-restart probe, a 300s wall-clock watchdog, and for Control a check on the
@@ -1391,6 +1391,41 @@ acknowledged appends; a truncated LSM file fails the strict open. **Remaining
 for P1-D:** per-format plug-ins arrive as P1-A and P1-C land (one
 `transcode::TABLE` entry each; the cells grow with `supported_back()`); nothing
 in tier 2 names a format version.
+
+**P1-D as-built, step 4: per-format plug-ins and coverage (2026-10-01; every
+format still v1).** Formats fall into two harness classes. **Whole-file**
+(a file on a node's disk one format owns): `lsm-wal`, `lsm-manifest`,
+`lsm-sstable`, `control-wal` (also `raftkv.wal*`), `shared-wal`,
+`encryption-envelope`; each is a `transcode::TABLE` entry and a bump edits that
+entry. **Embedded** (everything else with a fixture directory): listed in the new
+`transcode::EMBEDDED` registry with a carrier, and a bump edits the *carrier's*
+transcode so it re-encodes the embedded records through the legacy encoder.
+Carriers: `control-wal` for `control-snapshot`, `metadata` and the `raftkv-wal`
+payload; `lsm-sstable` for the engine-resident `mirror-version`,
+`mirror-entities`, `cp-engine-layout`, `stored-item`, `change-record`,
+`key-bytes`, `numkey`, `escape`, `partition-token`; **off-disk** (never touched
+by the disk pass; covered by their own per-version fixture tests) for `segment`,
+`backup-manifest`, `backup-data`, `raftkv-wire`, `raftkv-image`,
+`network-handshake`, `client-handshake`, `cluster-config`, `animuscluster-spec`.
+Legacy encoders the harness calls must be `pub`, gated
+`#[cfg(any(test, feature = "legacy-encoders"))]`, not `cfg(test)`-private (the
+latter is invisible to `animus-test`). Tier 0 now iterates `TABLE` for the
+newest-fixture check (which includes `encryption-envelope`, previously skipped),
+checks `EMBEDDED` versions against their newest fixture, and has a completeness
+test: every crate's `tests/fixtures/formats/<dir>` must be named in `TABLE` or
+`EMBEDDED`, every registration must have a directory, and every carrier must be
+a `TABLE` entry; a negative control feeds the pure check a synthetic
+unregistered name and asserts it is flagged.
+
+**Coordination with #1140/#1141.** Those PRs bump `control-wal` (CWL) and
+`shared-wal` (SWL) to v2. Whichever of them lands second against this stack
+must register v2 in `TABLE`: `current_version` 2, `versions` `[v1, v2]` both
+`CapabilityMask::ALL`, and a `transcode` that goes through a `pub`,
+`legacy-encoders`-gated, type-erased v2 -> v1 line reframer in `animus-control`
+(it drops the sync-marker lines and re-frames each payload under the v1 tag).
+Until that is done the tier-0 `transcode_table_matches_the_checked_in_fixtures`
+test is red, by design: it sees a v2 fixture with no `VersionSpec`. This stack
+deliberately does **not** pre-register v2, which would be red against `main`.
 
 ### What Phase 1 "done" means, and what users can rely on
 
@@ -1466,15 +1501,21 @@ of that un-synced region, so a correct writer plus a crash produces "bad line,
 then valid line" (72 of 300 seeds measured). The reader needs a durable sync
 boundary.
 
-- **Format v2** (checklist step 1): after every `fsync` that returns `Ok` (the
-  line-framed per-group/control WALs skip it while another persist round is
-  already queued, since markers are cumulative and the next round's marker
-  covers this one; the marker is only ever missing for a WAL that is not yet
-  quiescent), the writer appends a marker line `!sync:<N>` (an ordinary CRC-checked line
-  carrying the tag's version) where `N` is the file length at that moment,
-  which is the marker's own start offset. Written *after* the sync, never
-  before (a pre-sync marker could survive a kept-prefix tear next to a flipped
-  byte in the same un-synced round). Record payloads are unchanged.
+- **Format v2** (checklist step 1): after every `fsync` that returns `Ok`, the
+  writer records that the file is durable and **piggybacks** the marker on its
+  *next* persist round: it is prepended to that round's single `append` (never
+  a separate append under the WAL lock, which a slow disk charges a full extra
+  latency per round), with `N` read from the file's live length at that moment.
+  The claim is true when written (the earlier fsync completed first); a
+  compaction rewrite or any failed round clears the pending state. Residual:
+  the latest round has no durable marker until the next round syncs. The
+  marker is a line `!sync:<N>` (an ordinary CRC-checked line carrying the
+  tag's version) where `N` is the file length at that moment, which is the
+  marker's own start offset. Never written before the sync it vouches for (a
+  pre-sync marker could survive a kept-prefix tear next to a flipped byte in
+  the same un-synced round). Record payloads are unchanged. Harness: the
+  `control-wal` transcode reframes v2 to v1 through `format::reframe_to_v1`
+  (`legacy-encoders`-gated), and the `raftkv-wal` EMBEDDED row is at v2.
 - **Decoder** (`format::decode_lines_extent`, documented there): a bad line
   that starts before the greatest valid marker is
   `FormatError::MidFileCorruption { offset, durable_to }`; at or after it, a

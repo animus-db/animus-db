@@ -23,7 +23,7 @@ use crate::detector::FailureDetector;
 use crate::format::{self, FormatError};
 use crate::meta::{Member, MetaCommand, Metadata, NodeStatus, PlacementView};
 use crate::mirror::{self, KeyWrite, RebuildError};
-use crate::persist::{CONTROL_SNAPSHOT, CONTROL_WAL, PersistedState, append_sync_marker};
+use crate::persist::{CONTROL_SNAPSHOT, CONTROL_WAL, PersistedState};
 use crate::persist_round::{self, GatedOuts, PersistArm, PersistFut, PersistProgress, PersistWake};
 use crate::raft::{Out, ProposeResult, RaftCore, RaftMsg, Role};
 use crate::syskv;
@@ -2079,6 +2079,9 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
             // is unaffected. A failure while *not* halted is a real
             // durability fault → surface (mirrors `animus-cp-data`'s own
             // compaction-rewrite handling exactly).
+            // Issue #1132: the file is rebuilt from records, so any pending
+            // piggybacked marker no longer describes it.
+            wal_lock.markers().invalidate();
             match env.replace(WAL, &bytes).await {
                 Ok(()) => {
                     let mut c = core.lock().expect("raft core poisoned");
@@ -3016,17 +3019,20 @@ async fn persist_wal<E: Env>(
         debug_assert!(records.is_empty());
         return 0;
     };
+    // Issue #1132: ONE `append` per round, with the previous round's sync
+    // marker (if its fsync succeeded) prepended — never a separate marker
+    // append under `wal_lock` (see `SyncMarkerState`). The WAL is line-framed,
+    // so the concatenation is byte-identical to per-record appends.
+    let mut buf = wal_lock.markers().take_marker(env, &CONTROL_WAL, WAL).await;
     for record in &records {
-        if let Err(e) = env
-            .append(WAL, &PersistedState::encode_record(record))
-            .await
-        {
-            assert!(
-                halted.load(Ordering::SeqCst),
-                "wal append failed while running: {e}"
-            );
-            return 0;
-        }
+        buf.extend(PersistedState::encode_record(record));
+    }
+    if let Err(e) = env.append(WAL, &buf).await {
+        assert!(
+            halted.load(Ordering::SeqCst),
+            "wal append failed while running: {e}"
+        );
+        return 0;
     }
     if let Err(e) = env.sync(WAL).await {
         assert!(
@@ -3035,6 +3041,7 @@ async fn persist_wal<E: Env>(
         );
         return 0;
     }
+    wal_lock.markers().mark_synced();
     // The records are now durable: advance both watermarks under one acquisition
     // — the log index (which applies any now-durable committed entries) and the
     // persist round (which releases whatever `drive` buffered against it). Only
@@ -3043,17 +3050,6 @@ async fn persist_wal<E: Env>(
         let mut core = core.lock().expect("raft core poisoned");
         core.mark_durable_through(through);
         progress.complete_drain(round);
-    }
-    // Issue #1132: record that everything before this point is fsynced, AFTER
-    // the sync and after acks are released (so it adds no ack latency), still
-    // under `wal_lock` so nothing appends between the sync and the marker.
-    // Skipped while more records already wait for their own round: markers are
-    // cumulative, so the next round's marker covers this one (see the same
-    // note in `animus-cp-data`'s `persist_wal`), and the extra append would
-    // otherwise sit under `wal_lock` on every back-to-back round.
-    let more_pending = core.lock().expect("raft core poisoned").has_unflushed_wal();
-    if !more_pending {
-        append_sync_marker(env, &CONTROL_WAL, WAL).await;
     }
     records.len()
 }

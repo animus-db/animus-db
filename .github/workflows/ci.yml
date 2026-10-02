@@ -40,9 +40,41 @@ jobs:
   # need dedicated cores that this 2-vCPU shared runner can't give a job also
   # building/testing the rest of the workspace, and were starving here one
   # distinct victim per run (issues #280/#286).
+  #
+  # `gates` is a thin aggregate over four parallel jobs (`lint`,
+  # `test-archive` -> `test-shard`, `test-doc`), the same shape as
+  # `prod-liveness` below, for the same reason: branch protection names one
+  # required check, "gates", and that name has to keep resolving to a single
+  # job. Before this split `gates` was one serial job (fmt, clippy, build,
+  # `cargo test`, `--lib`, deny); its test phase now runs sharded under
+  # cargo-nextest and every compile job shares an sccache compile cache.
   gates:
     name: gates
+    needs: [lint, test-shard, test-doc]
+    if: always()
     runs-on: ubuntu-latest
+    steps:
+      - name: Check gate results
+        run: |
+          lint="${{ needs.lint.result }}"
+          shards="${{ needs.test-shard.result }}"
+          doc="${{ needs.test-doc.result }}"
+          echo "lint (fmt, fixtures, clippy, build, deny): ${lint}"
+          echo "test-shard (all shards): ${shards}"
+          echo "test-doc: ${doc}"
+          if [ "${lint}" != "success" ] || [ "${shards}" != "success" ] || [ "${doc}" != "success" ]; then
+            echo "::error::one or more gates jobs failed"
+            exit 1
+          fi
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    env:
+      # sccache (see the step below) wraps every rustc invocation; it needs
+      # CARGO_INCREMENTAL=0, which the workflow-level env already sets.
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
     steps:
       # Full history (not the default shallow depth-1 clone): the format-
       # fixtures guard step below needs `git merge-base HEAD origin/main` to
@@ -74,18 +106,30 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # Compile cache for every compile-heavy job in this file. Registry/git
+      # deps stay with Swatinem/rust-cache below; the compiled artifacts go
+      # through sccache's GitHub Actions cache backend instead of caching
+      # `target/` (see the comment on the rust-cache step for why `target/`
+      # itself stays uncached: a multi-GB dir whose upload/restore can cost
+      # more than the compile it saves, and which eats the shared 10 GB
+      # cache budget). sccache caches per-crate rustc outputs, so only the
+      # crates a diff actually touches (plus their dependents) recompile, and
+      # sibling jobs (`lint`, `test-archive`, `test-doc`, each
+      # `prod-liveness-*` shard) reuse each other's dependency builds. Its
+      # footprint is measured via the `sccache --show-stats` step at the end
+      # of each job — read those before widening what it caches.
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
       # `--all-targets` builds every test/bench binary in every crate, so this
       # job's target/ dir is much larger than corpus-deep's (which builds only
-      # 4 test binaries). Cache just the registry + git deps, not target/, so
-      # cache restore doesn't itself eat the disk headroom freed above.
+      # a few test binaries). Cache just the registry + git deps, not target/,
+      # so cache restore doesn't itself eat the disk headroom freed above.
       #
-      # Left at `cache-targets: "false"` even now that CARGO_PROFILE_DEV_DEBUG=0
-      # shrinks the target dir: no CI measurement yet shows it now fits the
-      # cache usefully (upload/restore of a still-multi-GB dir can cost more
-      # than the compile time it would save, and it eats into this repo's
-      # shared 10 GB cache budget). Flip it only once a CI run's actual
-      # target/ size after this change justifies it — not as a side effect of
-      # this diff.
+      # Left at `cache-targets: "false"` deliberately, now that sccache is the
+      # compile cache: caching `target/` too would store the same objects
+      # twice. Flip it only if a CI measurement shows sccache alone
+      # under-delivers.
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
         with:
@@ -93,6 +137,7 @@ jobs:
 
       # The five required gates (see CLAUDE.md "Commands"), each a separate,
       # clearly-named step so a failure points straight at the offending gate.
+      # (`test` is the `test-shard`/`test-doc` jobs below.)
       - name: rustfmt (cargo fmt --all --check)
         run: cargo fmt --all --check
 
@@ -104,86 +149,208 @@ jobs:
       - name: format fixtures are append-only (ADR 0073)
         run: scripts/check-format-fixtures.sh
 
-      # `--all-features` here (unlike the plain `cargo test` below) turns on
-      # every crate's opt-in `prod-heavy` feature too, so the real-thread test
-      # binaries gated behind it (see `prod-liveness`) still get type-checked
-      # on every push even though this job never runs them.
+      # `--all-features` here (unlike the plain `cargo test` the test jobs run)
+      # turns on every crate's opt-in `prod-heavy` feature too, so the
+      # real-thread test binaries gated behind it (see `prod-liveness`) still
+      # get type-checked on every push even though this job never runs them.
       - name: clippy (-D warnings)
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: build (--workspace --all-targets)
         run: cargo build --workspace --all-targets --locked
 
-      # Hosted runners give this job 2 cores, but the default test-threads
-      # (= logical CPUs) lets cargo test run many heavyweight multi-node
-      # ProdEnv cluster tests concurrently, oversubscribing those 2 cores and
-      # blowing the suite's timing/convergence budgets under contention
-      # (issue #278 items 2/9 and the budget-class flakes it catalogs).
-      # Bound in-binary test parallelism to match the cores while keeping
-      # some overlap; if wall-time grows too much the alternative is a
-      # larger (more-core) self-hosted runner rather than raising this back.
-      #
-      # `--exclude animusd` drops that crate's 100 real-thread `tests/`
-      # integration binaries (120 pre-D3; ADR 0061 rung D3, closed
-      # 2026-09-07, converted 20 of them to deterministic `SimCluster`
-      # coverage — `prod-liveness-animusd` below covers the 100 that
-      # remain). It no longer drops animusd's `--lib` target: since D3,
-      # `--lib` is dominated by deterministic `SimCluster` sim tests
-      # (`sim_cluster*.rs`: 5 → 29 modules, 35 → 140 tests) rather than
-      # real-thread ones, so it runs as this job's own separate step below
-      # instead of riding along in a real-thread shard. The other 5
-      # scattered real-thread binaries (`animus-control`/`animus-cp-data`/
-      # `animus-storage`) are excluded structurally, not by name here: each
-      # is declared as an explicit `[[test]] required-features =
-      # ["prod-heavy"]` target in its crate's Cargo.toml, and this plain
-      # `cargo test` (no `--features`) never turns that feature on, so Cargo
-      # skips building/running them. That makes the split compile-visible
-      # instead of a hand-maintained exclude list that silently drifts as
-      # tests are added (see docs/engineering-lessons.md).
-      - name: test (--workspace --exclude animusd)
-        run: cargo test --workspace --exclude animusd --locked -- --test-threads=2
-
-      # `animusd`'s `--lib` target, added as its own `gates` step by ADR
-      # 0061 rung D3's closing PR (2026-09-07). D3 converted five PRs'
-      # worth of `tests/*.rs` ProdEnv binaries into deterministic
-      # `SimCluster`-driven `#[cfg(test)] mod`s inside `src/`
-      # (`sim_cluster*.rs`, 5 → 29 modules, 35 → 140 tests) — the bulk of
-      # `--lib`'s own growth (240 → 306 tests, 307 after D4 PR 1). Running
-      # it here instead of inside the sharded real-thread tier below means
-      # a sim regression shows up in `gates` — this job's hard,
-      # single-attempt gate — rather than riding along inside a shard whose
-      # own real-thread tests are the ones this repo already knows are
-      # contention-sensitive on a shared runner.
-      #
-      # `--lib` is not perfectly pure, though: `cargo test --lib` builds
-      # and runs one target, with no way to split it further, and a
-      # handful of `#[cfg(test)] mod`s inside it predate D3 and are genuine
-      # single-node `ProdEnv` bring-ups, not deterministic —
-      # `confirm_futility_tests`/`forward_transport_failure_tests`/
-      # `halted_shutdown_tests`/`issue_412_tests`/`issue_298_conflict_tests`
-      # in `lib.rs`, `stream_write_path_tests` in `dynamo.rs`,
-      # `gsi_drain_cursor_tests`/`stream_sealer_tests` in `index_drain.rs`,
-      # `orphan_reap_tests` in `segment_janitor.rs`, `system_table_tests` in
-      # `admin.rs`. They ride along here too. Judged an acceptable
-      # trade-off, not an oversight: each is a small, single-node bring-up
-      # (a `TcpListener`, a one-node `run_node`, no multi-node election
-      # timing), a different shape than the heavier multi-node cluster
-      # tests `tests/*.rs` holds and that this crate was excluded from
-      # `gates` for in the first place (see the step above) — and
-      # `--test-threads=2` matches that step's own choice, for the same
-      # 2-vCPU-runner reason. If this step becomes a source of flakes,
-      # narrowing `--lib`'s own real-thread residue further (a nextest `-E`
-      # filter splitting it back out) is the fix, not a retry.
-      - name: test animusd sim tier (--lib)
-        run: cargo test -p animusd --lib --locked -- --test-threads=2
-
       # cargo-deny can't run in the local dev sandbox (not installed); CI is
       # where this gate actually executes. The pinned action installs cargo-deny
       # and runs `cargo deny check` (advisories + bans + licenses + sources).
+      #
+      # `RUSTC_WRAPPER` is blanked for this step only: the action runs cargo
+      # inside its own Docker container, which inherits the job-level
+      # `RUSTC_WRAPPER: sccache` but has no `sccache` binary, so `cargo
+      # metadata` died with "could not execute process `sccache .../rustc -vV`
+      # (never executed)". deny only resolves metadata; it compiles nothing.
       - name: cargo-deny check
         uses: EmbarkStudios/cargo-deny-action@v2
+        env:
+          RUSTC_WRAPPER: ""
         with:
           command: check
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
+
+  # Builds the gates' test binaries once, as a cargo-nextest archive, so the
+  # `test-shard` jobs below only *run* tests (no repeated compile/link).
+  #
+  # Two archives, because one `cargo nextest archive` invocation cannot say
+  # "every crate's tests, but only `animusd`'s `--lib`":
+  #   * `gates-workspace.tar.zst` — `--workspace --exclude animusd`: every
+  #     other crate's lib unit tests and integration tests. Cargo's plain
+  #     `cargo test` (no `--features`) never turns on the opt-in `prod-heavy`
+  #     feature, so the explicit `[[test]] required-features = ["prod-heavy"]`
+  #     real-thread binaries are skipped structurally here exactly as they were
+  #     under `cargo test` (they run in `prod-liveness-scattered`). The
+  #     remaining real-thread-ish binaries (`lsm_clone_*`, one-per-file) stay
+  #     separate targets for the same reason, not merged into the `it` binary.
+  #   * `gates-animusd-lib.tar.zst` — `animusd`'s `--lib` sim tier (ADR 0061
+  #     rung D3: dominated by deterministic `SimCluster` tests; a handful of
+  #     single-node `ProdEnv` bring-ups ride along, as before). Its 100
+  #     real-thread `tests/*.rs` binaries are `prod-liveness-animusd`'s.
+  test-archive:
+    name: test-archive
+    runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          df -h /
+
+      - name: Install Rust toolchain (1.96)
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      # Pinned exact version, same as `prod-liveness-animusd`.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.143
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "false"
+
+      - name: archive workspace tests (--exclude animusd)
+        run: |
+          cargo nextest archive --workspace --exclude animusd --locked \
+            --archive-file gates-workspace.tar.zst
+          cargo nextest archive -p animusd --lib --locked \
+            --archive-file gates-animusd-lib.tar.zst
+          ls -lh *.tar.zst
+
+      # Already zstd-compressed, so no second compression pass.
+      - name: Upload test archives
+        uses: actions/upload-artifact@v4
+        with:
+          name: gates-test-archives
+          path: |
+            gates-workspace.tar.zst
+            gates-animusd-lib.tar.zst
+          compression-level: 0
+          retention-days: 1
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
+
+  # The gates' test execution, sharded 4 ways by test count
+  # (`--partition count:N/4`) over the archives `test-archive` built. Replaces
+  # the old single `cargo test --workspace --exclude animusd --
+  # --test-threads=2` + `cargo test -p animusd --lib -- --test-threads=2`
+  # steps. Same scope: every test those two commands ran still runs per push
+  # (doc tests, which nextest does not run, are `test-doc` below).
+  #
+  # `--profile gates` (.config/nextest.toml) pins test-threads=2 — the same
+  # in-runner parallelism the old steps used, matching these runners' 2 vCPUs
+  # so heavyweight multi-node cluster tests don't oversubscribe them (issue
+  # #278 items 2/9) — and fail-fast=false, retries=0. A flaky test is a bug in
+  # this repo, never a retry (CLAUDE.md, Session operating mode item 4): there
+  # is no retry here and no terminating timeout. nextest runs each test in its
+  # own process, strictly more isolation than `cargo test`'s shared-process
+  # default.
+  test-shard:
+    name: test-shard (${{ matrix.partition }}/4)
+    needs: test-archive
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3, 4]
+    runs-on: ubuntu-latest
+    steps:
+      # The tests read checked-in fixtures relative to `CARGO_MANIFEST_DIR`,
+      # so the archive is run against a real checkout at the same path it
+      # was built from.
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (1.96)
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.143
+
+      - name: Download test archives
+        uses: actions/download-artifact@v4
+        with:
+          name: gates-test-archives
+
+      - name: test workspace shard ${{ matrix.partition }}/4 (--exclude animusd)
+        run: |
+          cargo nextest run --archive-file gates-workspace.tar.zst \
+            --workspace-remap . \
+            --partition count:${{ matrix.partition }}/4 \
+            --profile gates
+
+      - name: test animusd sim tier shard ${{ matrix.partition }}/4 (--lib)
+        run: |
+          cargo nextest run --archive-file gates-animusd-lib.tar.zst \
+            --workspace-remap . \
+            --partition count:${{ matrix.partition }}/4 \
+            --profile gates
+
+  # nextest does not run doc tests, so they keep their own `cargo test --doc`
+  # job with the same scope the old `cargo test --workspace --exclude
+  # animusd` had (animusd's lib has no doctests that the old `--lib` step ran).
+  test-doc:
+    name: test-doc
+    runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          df -h /
+
+      - name: Install Rust toolchain (1.96)
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "false"
+
+      - name: doc tests (--workspace --exclude animusd)
+        run: cargo test --workspace --exclude animusd --doc --locked -- --test-threads=2
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
 
   # The real-thread ProdEnv tier (issues #280/#286), sharded.
   #
@@ -261,6 +428,9 @@ jobs:
       matrix:
         partition: [1, 2, 3, 4]
     runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -276,6 +446,10 @@ jobs:
 
       - name: Install Rust toolchain (1.96)
         uses: dtolnay/rust-toolchain@1.96.0
+
+      # Compile cache — see the `lint` job's `Set up sccache` step.
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       # Pinned exact version, per this repo's own convention for every other
       # third-party tool in these workflows (the Rust toolchain, cargo-deny).
@@ -314,6 +488,10 @@ jobs:
             --partition count:${{ matrix.partition }}/4 \
             --profile ci
 
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
+
   # `dynamo_index_writes.rs`'s two cross-node "hammer" tests
   # (`cross_node_racing_unconditional_puts_never_orphan_an_lsi_row` and
   # `cross_node_racing_transactional_and_plain_puts_never_orphan_an_lsi_row`)
@@ -340,6 +518,9 @@ jobs:
   prod-liveness-hammer-pair:
     name: prod-liveness-hammer-pair
     runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -356,6 +537,10 @@ jobs:
       - name: Install Rust toolchain (1.96)
         uses: dtolnay/rust-toolchain@1.96.0
 
+      # Compile cache — see the `lint` job's `Set up sccache` step.
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
         with:
@@ -365,6 +550,10 @@ jobs:
         run: |
           cargo test -p animusd --test dynamo_index_writes --locked \
             -- --test-threads=1 orphan_an_lsi_row
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
 
   # The 5 scattered real-thread binaries outside animusd, each gated behind
   # its crate's opt-in `prod-heavy` feature (see `gates`'s test step
@@ -381,6 +570,9 @@ jobs:
   prod-liveness-scattered:
     name: prod-liveness-scattered
     runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -396,6 +588,10 @@ jobs:
 
       - name: Install Rust toolchain (1.96)
         uses: dtolnay/rust-toolchain@1.96.0
+
+      # Compile cache — see the `lint` job's `Set up sccache` step.
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
@@ -414,6 +610,10 @@ jobs:
           cargo test -p animus-storage --features prod-heavy --locked \
             --test lsm_concurrent --test idle_engine_cost \
             -- --test-threads=1
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
 
   # The required-check aggregate: branch protection names "prod-liveness" as
   # a single required status, so this job exists purely to keep that name

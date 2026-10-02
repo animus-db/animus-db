@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working in this crate.
 
+> **Test layout (2026-10-02).** The SimEnv integration tests are modules of one binary, `tests/it/main.rs` (`cargo test -p animus-storage --test it <file>::`); the real-thread/`ProdEnv` tests (`lsm_concurrent`, `idle_engine_cost`, `lsm_clone_concurrent`, `lsm_clone_filtered_concurrent`, `lsm_clone_prodenv`) stay separate `tests/*.rs` targets. Older sections below that cite `tests/<name>.rs` mean `tests/it/<name>.rs`.
+
 ## Purpose
 
 The `StorageEngine` trait and its backing implementations. The trait is driven
@@ -775,3 +777,5 @@ the CP-data Raft apply pattern). Also reports `clone_to`'s own cost
 (ADR 0058 rung 2) on the already-populated `LsmEngine` from the put/get/scan
 section — expected to scale with table count, not data volume, since it
 hard-links rather than copies.
+
+**Upgrade-harness class (ADR 0073 P1-D):** `lsm-wal`, `lsm-manifest` and `lsm-sstable` are whole-file `TABLE` entries in `animus-test`'s transcode table (a bump edits that entry; legacy encoders must be `pub` + `legacy-encoders`-gated); `lsm-sstable` is also the carrier of every engine-resident `EMBEDDED` format.

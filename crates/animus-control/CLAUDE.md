@@ -3,6 +3,8 @@
 This file provides guidance to Claude Code (claude.ai/code) when working in this
 crate.
 
+> **Test layout (2026-10-02).** All SimEnv/pure integration tests are modules of one binary, `tests/it/main.rs` (`cargo test -p animus-control --test it <file>::`); only the real-thread `prod_liveness` and `control_membership_prod` (`prod-heavy`) stay separate `tests/*.rs` targets. Older sections below that cite `tests/<name>.rs` mean `tests/it/<name>.rs`.
+
 ## Purpose
 
 The strongly-consistent control plane: an in-house Raft (ADR 0009, *not*
@@ -269,7 +271,7 @@ per-tablet CP data plane (`animus-cp-data`).
   any append; without it the next appends sit after garbage and the next
   recovery refuses the file. The marker is written after the sync, after acks
   are released, under the same lock as the appends (so its offset is exact),
-  and is best-effort. Tests: `tests/wal_midfile_corruption.rs`. Residual: the
+  and is best-effort. Tests: `tests/it/wal_midfile_corruption.rs`. Residual: the
   latest round has no durable marker until the next sync; a disk that lied
   about `fsync` can now fail loudly. Corruption of a CRC-valid line's
   *payload* was always loud (`Malformed`). No back-compat for a pre-checksum
@@ -527,9 +529,9 @@ own module doc for why the embedded `Metadata` is deliberately minimal: a
 later PR in this same stack adds a `"v"` field to `Metadata`'s JSON shape
 that serde-defaults to 1 when absent, so this frozen fixture still decodes —
 a checked-in fixture may never be edited once merged).
-`tests/format_fixtures.rs` has the decode/round-trip tests plus the
+`tests/it/format_fixtures.rs` has the decode/round-trip tests plus the
 `#[ignore]`d `generate_fixture_control_wal` generator (`cargo test -p
-animus-control --test format_fixtures generate_fixture_control_wal --
+animus-control --test it format_fixtures::generate_fixture_control_wal --
 --ignored`) — refuses to overwrite an existing fixture file; bump
 `CONTROL_WAL::version` and add a new one instead.
 
@@ -2948,8 +2950,16 @@ Known follow-up, deliberately not fixed here: the failure detector re-proposes
 `status: Down` for members a stale cache still shows Active, feeding more WAL
 rounds while the apply task is behind.
 
-- Sync markers (`append_sync_marker`) are written only when the core has no
-  `has_unflushed_wal()` left after a persist round (markers are cumulative). An
-  unconditional per-round marker is a second `append` under `wal_lock`, which
-  the sim charges `sync_delay` and which starves slow-disk learner catch-up
-  (`snapshot_transfer_survives_compaction`).
+- Sync markers (CWL1/SWL1 v2, issue #1132) are **piggybacked**, never a separate
+  append: `FairMutex::markers()` (`persist::SyncMarkerState`) remembers that the
+  previous round's fsync succeeded, and the next round prepends `!sync:<N>` to
+  its own single `append` (`N` = live file length = the marker's own start). A
+  compaction `replace` calls `invalidate()`; `take_marker` clears the flag so a
+  failed round leaves nothing pending. Do **not** add a standalone marker append
+  under `wal_lock` (the sim charges `sync_delay` per append and it starves
+  slow-disk learner catch-up, `snapshot_transfer_survives_compaction`), and do
+  **not** gate markers on `has_unflushed_wal()` (it can stay true for whole
+  bursts, leaving them unprotected). The newest round has no durable marker
+  until the next round syncs.
+
+**Upgrade-harness class (ADR 0073 P1-D):** `control-wal`/`shared-wal` are whole-file `TABLE` entries in `animus-test`'s transcode table (a bump edits that entry; legacy encoders must be `pub` + `legacy-encoders`-gated); `control-snapshot`, `metadata`, `mirror-version` and `mirror-entities` are `EMBEDDED` (a bump edits their carrier's transcode).

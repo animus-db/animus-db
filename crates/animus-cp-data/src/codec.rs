@@ -1092,7 +1092,7 @@ fn read_raft(c: &mut Cursor<'_>) -> Result<RaftMsg<KvCommand>, DecodeError> {
             // `read_kind_writes`'s comment for why. This is the exact site
             // a corrupted `AppendEntries` entry-count field once reached to
             // trigger `SIGABRT` via `handle_alloc_error` (reproduced via
-            // `cargo test -p animus-test --test raftkv_linearizable`).
+            // `cargo test -p animus-test --test it raftkv_linearizable::`).
             let mut entries = Vec::with_capacity(n.min(1 << 20) as usize);
             for _ in 0..n {
                 entries.push(read_entry(c)?);
@@ -1989,7 +1989,7 @@ pub(crate) mod tests {
     /// hundreds of GB — which Rust's global allocator handles by aborting
     /// the whole process (`handle_alloc_error`, not a catchable panic).
     /// This exact shape (`read_raft`'s entry-count field) was reproduced
-    /// live via `cargo test -p animus-test --test raftkv_linearizable`
+    /// live via `cargo test -p animus-test --test it raftkv_linearizable::`
     /// before the fix; now it must return a graceful `Err`.
     #[test]
     fn corrupted_append_entries_count_returns_a_graceful_error_not_an_alloc_abort() {

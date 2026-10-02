@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working in this crate.
 
+> **Test layout (2026-10-02).** Integration tests are modules of one binary, `tests/it/main.rs` (`cargo test -p animus-sim --test it <file>::`). Older sections below that cite `tests/<name>.rs` mean `tests/it/<name>.rs`.
+
 ## Purpose
 
 The deterministic simulator: a seeded `SimEnv` implementing the `animus-env`

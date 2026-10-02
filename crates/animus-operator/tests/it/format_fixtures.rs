@@ -170,7 +170,7 @@ fn crd_schema_lists_schema_version_as_required_with_a_minimum() {
 }
 
 /// Regenerates `v1.json`:
-/// `cargo test -p animus-operator --test format_fixtures generate_fixture_animuscluster_spec -- --ignored`.
+/// `cargo test -p animus-operator --test it format_fixtures::generate_fixture_animuscluster_spec -- --ignored`.
 /// Refuses to overwrite an existing fixture (ADR 0073).
 #[test]
 #[ignore]
