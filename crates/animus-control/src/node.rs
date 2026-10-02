@@ -3047,7 +3047,14 @@ async fn persist_wal<E: Env>(
     // Issue #1132: record that everything before this point is fsynced, AFTER
     // the sync and after acks are released (so it adds no ack latency), still
     // under `wal_lock` so nothing appends between the sync and the marker.
-    append_sync_marker(env, &CONTROL_WAL, WAL).await;
+    // Skipped while more records already wait for their own round: markers are
+    // cumulative, so the next round's marker covers this one (see the same
+    // note in `animus-cp-data`'s `persist_wal`), and the extra append would
+    // otherwise sit under `wal_lock` on every back-to-back round.
+    let more_pending = core.lock().expect("raft core poisoned").has_unflushed_wal();
+    if !more_pending {
+        append_sync_marker(env, &CONTROL_WAL, WAL).await;
+    }
     records.len()
 }
 

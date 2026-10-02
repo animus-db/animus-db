@@ -2938,3 +2938,9 @@ cancel-safe-fair (it is). Liveness tests for the apply path assert on
 Known follow-up, deliberately not fixed here: the failure detector re-proposes
 `status: Down` for members a stale cache still shows Active, feeding more WAL
 rounds while the apply task is behind.
+
+- Sync markers (`append_sync_marker`) are written only when the core has no
+  `has_unflushed_wal()` left after a persist round (markers are cumulative). An
+  unconditional per-round marker is a second `append` under `wal_lock`, which
+  the sim charges `sync_delay` and which starves slow-disk learner catch-up
+  (`snapshot_transfer_survives_compaction`).

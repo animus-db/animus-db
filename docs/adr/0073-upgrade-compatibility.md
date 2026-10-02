@@ -1466,8 +1466,11 @@ of that un-synced region, so a correct writer plus a crash produces "bad line,
 then valid line" (72 of 300 seeds measured). The reader needs a durable sync
 boundary.
 
-- **Format v2** (checklist step 1): after every `fsync` that returns `Ok`, the
-  writer appends a marker line `!sync:<N>` (an ordinary CRC-checked line
+- **Format v2** (checklist step 1): after every `fsync` that returns `Ok` (the
+  line-framed per-group/control WALs skip it while another persist round is
+  already queued, since markers are cumulative and the next round's marker
+  covers this one; the marker is only ever missing for a WAL that is not yet
+  quiescent), the writer appends a marker line `!sync:<N>` (an ordinary CRC-checked line
   carrying the tag's version) where `N` is the file length at that moment,
   which is the marker's own start offset. Written *after* the sync, never
   before (a pre-sync marker could survive a kept-prefix tear next to a flipped

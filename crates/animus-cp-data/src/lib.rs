@@ -7469,7 +7469,19 @@ async fn persist_wal<E: Env>(
     // Issue #1132: the per-group WAL's sync marker (after the sync, after the
     // acks, under `wal_lock`). The shared-WAL branch writes its own markers
     // inside `SharedWal::flush`, so only the private-file branch needs one.
-    if shared.is_none() {
+    //
+    // Skipped while more records are already waiting for their own round: a
+    // marker is cumulative (it claims everything before its offset is fsynced),
+    // so the very next round's marker covers this one too, and the extra
+    // append would otherwise sit under `wal_lock` on every back-to-back round
+    // (on a slow disk that doubles each round's lock hold and starves a
+    // lagging learner's catch-up). The marker is written when a round leaves
+    // the WAL fully flushed, i.e. before the group goes idle.
+    let more_pending = core
+        .lock()
+        .expect("raftkv core poisoned")
+        .has_unflushed_wal();
+    if shared.is_none() && !more_pending {
         animus_control::persist::append_sync_marker(
             env,
             &animus_control::persist::CONTROL_WAL,
