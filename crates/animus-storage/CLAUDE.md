@@ -777,3 +777,5 @@ the CP-data Raft apply pattern). Also reports `clone_to`'s own cost
 (ADR 0058 rung 2) on the already-populated `LsmEngine` from the put/get/scan
 section — expected to scale with table count, not data volume, since it
 hard-links rather than copies.
+
+**Upgrade-harness class (ADR 0073 P1-D):** `lsm-wal`, `lsm-manifest` and `lsm-sstable` are whole-file `TABLE` entries in `animus-test`'s transcode table (a bump edits that entry; legacy encoders must be `pub` + `legacy-encoders`-gated); `lsm-sstable` is also the carrier of every engine-resident `EMBEDDED` format.

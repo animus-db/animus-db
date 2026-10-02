@@ -164,6 +164,7 @@ use super::*;
 // ADR 0061 rung L, C-12 PR 2: per-node roles under `SimCluster`. Already
 // production-shipped (`crates/animusd/CLAUDE.md`'s own "control/data role
 // split" entry) — this fixture only consumes it, no widening needed.
+use super::sim_cluster_lsm::{SimEngineBackend, SimLsmTabletFactory, SimReconciler, start_control};
 use crate::config::NodeRole;
 
 /// How long a single client op ([`SimCluster::put`]/`get`/`delete`/`scan`)
@@ -315,13 +316,28 @@ const SIM_TTL_SWEEP_INTERVAL: Duration = SIM_FALLBACK_TICK;
 fn build_reconciler(
     env: SimEnv,
     engines: MemoryTabletEngines,
+    backend: SimEngineBackend,
     node_id: NodeId,
     edge: ClusterEdgeState<SimEnv>,
-) -> Reconciler<SimEnv, MemoryEngine> {
+) -> SimReconciler {
     let host_edge = edge.clone();
     let teardown_edge = edge;
     let base_id = node_id.clone();
-    Reconciler::new(
+    if backend == SimEngineBackend::Lsm {
+        let factory = SimLsmTabletFactory::new(env.clone());
+        return SimReconciler::Lsm(Reconciler::new(
+            env,
+            factory,
+            node_id,
+            move |tablet, node: &RaftKvNode<SimEnv, LsmEngine<SimEnv>>| {
+                host_edge.register_raftkv(tablet, CpGroup::Lsm(node.clone()));
+            },
+            move |tablet| {
+                teardown_edge.unregister_raftkv(tablet, base_id.clone());
+            },
+        ));
+    }
+    SimReconciler::Mem(Reconciler::new(
         env,
         engines,
         node_id,
@@ -331,7 +347,7 @@ fn build_reconciler(
         move |tablet| {
             teardown_edge.unregister_raftkv(tablet, base_id.clone());
         },
-    )
+    ))
 }
 
 /// Drive `reconciler`'s per-tick lifecycle on `ctx`'s own node — this
@@ -359,7 +375,7 @@ fn build_reconciler(
 /// `effective_metadata()` never reads as the pre-recovery empty default a
 /// genuinely cold node's `ctx.control.last_applied() == 0` window guards
 /// against in production.
-fn spawn_reconciler_loop(ctx: SimNodeCtx, mut reconciler: Reconciler<SimEnv, MemoryEngine>) {
+fn spawn_reconciler_loop(ctx: SimNodeCtx, mut reconciler: SimReconciler) {
     ctx.env.clone().spawn_task(async move {
         let watch = ctx.control.metadata_watch();
         let mut last_seen = watch.latest();
@@ -1693,6 +1709,10 @@ pub(crate) struct SimCluster {
     /// `new_with_cp_quiescence`) means every CP-data group in this cluster
     /// stays permanently unquiesced — today's behavior, unchanged.
     cp_quiesce_after: Option<Duration>,
+    /// Which engine every node's control plane and tablet reconciler is
+    /// built over (ADR 0073 P1-D tier 2) — [`SimEngineBackend::Memory`]
+    /// (the default; every historic constructor) or `Lsm`.
+    backend: SimEngineBackend,
     /// Node id -> index into `self.controls` (ADR 0061 rung N, C-14 PR 2)
     /// — decouples "which node id is a control voter" from "position in
     /// the `self.controls` vec", so a control voter minted AFTER
@@ -1938,6 +1958,46 @@ impl SimCluster {
         segment_janitor_retention: Duration,
         cp_quiesce_after: Option<Duration>,
     ) -> Self {
+        Self::new_with_engine_backend(
+            seed,
+            roles,
+            replication,
+            segment_janitor_retention,
+            cp_quiesce_after,
+            SimEngineBackend::Memory,
+        )
+    }
+
+    /// A cluster whose engines are real `LsmEngine<SimEnv>`s over each
+    /// node's retained disk (ADR 0073 P1-D tier 2) — see
+    /// [`SimEngineBackend::Lsm`]. Otherwise identical to
+    /// [`SimCluster::new_with_cp_quiescence`].
+    pub(crate) fn new_with_lsm_engines(
+        seed: u64,
+        roles: &[NodeRole],
+        replication: usize,
+        cp_quiesce_after: Option<Duration>,
+    ) -> Self {
+        Self::new_with_engine_backend(
+            seed,
+            roles,
+            replication,
+            DEFAULT_SIM_SEGMENT_JANITOR_RETENTION,
+            cp_quiesce_after,
+            SimEngineBackend::Lsm,
+        )
+    }
+
+    /// The workhorse every constructor above funnels into: the same body
+    /// that was `..._and_cp_quiescence`, plus the engine `backend`.
+    fn new_with_engine_backend(
+        seed: u64,
+        roles: &[NodeRole],
+        replication: usize,
+        segment_janitor_retention: Duration,
+        cp_quiesce_after: Option<Duration>,
+        backend: SimEngineBackend,
+    ) -> Self {
         let nodes = roles.len();
         assert!(nodes >= 1, "a cluster needs at least one node");
         assert!(
@@ -2049,11 +2109,11 @@ impl SimCluster {
             .iter()
             .zip(node_metrics[..control_count].iter())
             .map(|(id, metrics)| {
-                RaftNode::start_with_metrics(
+                start_control(
+                    backend,
                     sim.env(id.clone()),
                     control_ids.clone(),
-                    metrics.clone(),
-                    MemoryEngine::new(),
+                    Some(metrics.clone()),
                 )
             })
             .collect();
@@ -2351,6 +2411,7 @@ impl SimCluster {
             let mut reconciler = build_reconciler(
                 ctxs[i].env.clone(),
                 engines[i].clone(),
+                backend,
                 id.clone(),
                 ctxs[i].edge.clone(),
             );
@@ -2506,6 +2567,7 @@ impl SimCluster {
             segment_janitor_retention,
             roles: roles.to_vec(),
             cp_quiesce_after,
+            backend,
             control_index,
             control_node_ids,
         };
@@ -4951,10 +5013,11 @@ impl SimCluster {
 
         if let Some(idx) = self.control_index_of(node) {
             // ---- control-bearing node (NodeRole::Both / NodeRole::Control) ----
-            let fresh_control: RaftNode<SimEnv> = RaftNode::start(
+            let fresh_control: RaftNode<SimEnv> = start_control(
+                self.backend,
                 self.sim.env(id.clone()),
                 control_ids.clone(),
-                MemoryEngine::new(),
+                None,
             );
             let fresh_relay: SimRelayClient<SimEnv> = SimRelayClient::new(self.sim.env(id.clone()));
 
@@ -5062,6 +5125,7 @@ impl SimCluster {
                 let mut reconciler = build_reconciler(
                     ctx.env.clone(),
                     self.engines[node as usize].clone(),
+                    self.backend,
                     id.clone(),
                     ctx.edge.clone(),
                 );
@@ -5174,6 +5238,7 @@ impl SimCluster {
             let mut reconciler = build_reconciler(
                 ctx.env.clone(),
                 self.engines[node as usize].clone(),
+                self.backend,
                 id.clone(),
                 ctx.edge.clone(),
             );
@@ -5236,6 +5301,15 @@ impl SimCluster {
         if let Some(thresholds) = self.auto_split {
             self.spawn_auto_split(node, thresholds);
         }
+    }
+
+    /// A handle onto this cluster's own `Simulator` (a cheap clone) — for
+    /// the whole-cluster stop / disk-fault / transcode sequence of the
+    /// upgrade corpus (`sim_cluster_upgrade_corpus`), which needs
+    /// `Simulator::stop` WITHOUT [`SimCluster::restart`]'s immediate
+    /// rebuild, and `set_disk_config_for`.
+    pub(crate) fn simulator(&self) -> Simulator {
+        self.sim.clone()
     }
 
     /// Symmetrically partition `a` and `b` (`Simulator::partition_pair`).
@@ -5574,6 +5648,7 @@ impl SimCluster {
         let mut reconciler = build_reconciler(
             env.clone(),
             self.engines[new_n as usize].clone(),
+            self.backend,
             id.clone(),
             edge,
         );
@@ -5766,11 +5841,11 @@ impl SimCluster {
         // The fresh, lone standalone control-plane core — its own
         // membership excludes itself, exactly like `join_control_nonvoter`'s
         // real `bind_control`/`start_control_with` core.
-        let fresh_control: RaftNode<SimEnv> = RaftNode::start_with_metrics(
+        let fresh_control: RaftNode<SimEnv> = start_control(
+            self.backend,
             env.clone(),
             control_ids.clone(),
-            MetricsHandle::recording(),
-            MemoryEngine::new(),
+            Some(MetricsHandle::recording()),
         );
         let control = GenericControlHandle::Local(fresh_control.clone());
         let edge = ClusterEdgeState::<SimEnv>::new();
@@ -6066,11 +6141,11 @@ impl SimCluster {
 
         // The fresh, lone standalone control-plane core — identical
         // construction to `grow_control`'s own.
-        let fresh_control: RaftNode<SimEnv> = RaftNode::start_with_metrics(
+        let fresh_control: RaftNode<SimEnv> = start_control(
+            self.backend,
             env.clone(),
             control_ids.clone(),
-            MetricsHandle::recording(),
-            MemoryEngine::new(),
+            Some(MetricsHandle::recording()),
         );
         let control = GenericControlHandle::Local(fresh_control.clone());
         let edge = ClusterEdgeState::<SimEnv>::new();
@@ -6234,6 +6309,7 @@ impl SimCluster {
         let mut reconciler = build_reconciler(
             env.clone(),
             self.engines[new_n as usize].clone(),
+            self.backend,
             id.clone(),
             edge,
         );
@@ -6918,6 +6994,7 @@ impl SimCluster {
         let mut reconciler = build_reconciler(
             env.clone(),
             self.engines[new_n as usize].clone(),
+            self.backend,
             id.clone(),
             edge,
         );
