@@ -144,5 +144,14 @@ unsafe_code = "forbid"
 disallowed_types = "warn"
 disallowed_methods = "warn"
 
+# Dev/test builds carry line tables only (file:line in panics and backtraces)
+# instead of full DWARF — the bulk of a clean build's time and `target/` size.
+# `profile.test` inherits from `dev`, so this covers `cargo test` too. CI
+# overrides this with `CARGO_PROFILE_DEV_DEBUG=0` (an env var beats the
+# manifest); use `debug = true` locally via the same env var when you need a
+# real debugger session (`CARGO_PROFILE_DEV_DEBUG=2`).
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
 debug = 1
