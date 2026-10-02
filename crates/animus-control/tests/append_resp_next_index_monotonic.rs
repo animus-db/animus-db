@@ -76,6 +76,7 @@ fn success_ack(term: u64, match_index: u64) -> RaftMsg {
         success: true,
         match_index,
         needs_snapshot: false,
+        check_pending: false,
     }
 }
 
@@ -163,6 +164,7 @@ fn a_reject_ack_still_backs_off_next_index_normally() {
         success: false,
         match_index: 0,
         needs_snapshot: false,
+        check_pending: false,
     };
     let out = leader.handle(nid(1), reject.clone(), now, 7);
     assert!(

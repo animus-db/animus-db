@@ -1277,7 +1277,7 @@ lists below.
 | **P1-A** (backups/PITR/export first; outlives the cluster) | `animus-cp-data`, `animus-item` | Dispatch seam (`match version`, `legacy` module scaffolding) for `backup-manifest`, `backup-data`, `segment` (PITR), then `raftkv-wire`/`raftkv-image`/`raftkv-wal`/`cp-engine-layout`; `segment.rs` fixture test asserts "fixture for `VERSION` exists" instead of `== 1`. **Row values**: add golden fixtures (new files under `animus-item/tests/fixtures/formats/`) for `stored-item` and `change-record`, decide tag-vs-freeze for them (proposal: freeze the serde shape, additive-only with fixtures; an untagged JSON `{` document is v1, so a later tagged v2 is unambiguous to sniff) and add the inventory rows; pin key-encoding vectors (`numkey`, `key_bytes`, murmur3) as fixtures in `animus-tablet`/`animus-item` (the guard then covers them) | none | `animus-control/**` (incl. `format.rs` — consume, do not change signatures), `animus-storage/**`, `animusd/**`, `animus-env/**` |
 | **P1-B** | `animus-storage`, `animus-env` | Per-version expected values for `lsm-wal`, `lsm-manifest`, `lsm-sstable` (format derived from the file name; unrecognised fixture panics), `encryption-envelope` (panic instead of silently weaker checks), `network-handshake`/`client-handshake` (assert `version == <file version>`, not the current one); dispatch seam in `decode_wal`, `decode_manifest`, `read_block`, `EncryptedDisk::scan`; `legacy` scaffolding | none | `animus-cp-data/**`, `animus-control/**` |
 | **P1-C** | `animus-control`, `animusd`, `animus-operator` | `control-wal`/`control-snapshot`/`shared-wal`: callers use the returned version and dispatch (kills the `_version` discards in `persist.rs`, `node.rs`, `raft.rs`); `Metadata`/`ClusterConfig`: per-version decode entry points; system-keyspace mirror entity-value fixtures (`mirror-entities`, one per `EntityKind`) and a mirror-version fixture; `animuscluster-spec` per-version test | none | `animus-cp-data/**`, `animus-storage/**`; do not edit `format.rs` helper signatures (P1-A consumes them as they are) |
-| **P1-D** | `animus-test`, `animusd`, plus `legacy-encoders` feature plumbing in the crates above | The upgrade-restart harness: tier 0 fixture-seeded restarts, tier 1 `upgrade_restart_corpus`, negative control, `ANIMUS_UPGRADE_RESTART_SEEDS`, `corpus-deep.yml`; then tier 2 (`sim_cluster_upgrade_corpus`, `SimCluster` `LsmEngine` factory). Adds the per-format transcode table skeleton (identity today) | A, B, C for the per-format plug-ins and the `legacy-encoders` feature convention; tier 0/1 skeleton may start earlier against the convention in this ADR | The format crates' non-test source apart from the feature gate; `sim_cluster.rs` beyond the factory option |
+| **P1-D** | `animus-test`, `animusd`, plus `legacy-encoders` feature plumbing in the crates above | The upgrade-restart harness: tier 0 fixture-seeded restarts, tier 1 `upgrade_restart_corpus`, negative control, `ANIMUS_UPGRADE_RESTART_SEEDS`, `corpus-deep.yml`; then tier 2 (`sim_cluster_upgrade_corpus`, `SimCluster` `LsmEngine` factory; landed 2026-10-01, per-format plug-ins still to come as P1-A/P1-C land). Adds the per-format transcode table skeleton (identity today) | A, B, C for the per-format plug-ins and the `legacy-encoders` feature convention; tier 0/1 skeleton may start earlier against the convention in this ADR | The format crates' non-test source apart from the feature gate; `sim_cluster.rs` beyond the factory option |
 
 **P1-B step 1 as-built (tests only, every format still v1).** The fixture
 decode tests for `lsm-wal`, `lsm-manifest`, `lsm-sstable` and
@@ -1338,6 +1338,60 @@ Wave 2: P1-D tier 0/1 (starts once one of A/B/C has landed its
 `legacy-encoders` convention, or earlier against this ADR's text). Wave 3:
 P1-D tier 2. Phase 1 is done when all four have merged.
 
+**P1-D as-built, tiers 0 and 1 (2026-09-30; tier 2 pending; every format still
+v1).** Tier 0 (#1130) seeds disks from the checked-in fixtures and restarts
+the real readers; tier 1 is `animus-test/tests/upgrade_restart_corpus.rs`
+(21 cells: Data / Control / SharedWal x leader / follower / whole-group x
+clean / crash / torn-tail, strict engine opens, list-append oracle with a
+post-restart probe, a 300s wall-clock watchdog, and for Control a check on the
+driver-applied `engine_applied_index`; knobs `ANIMUS_UPGRADE_RESTART_SEEDS`,
+`ANIMUS_UPGRADE_RESTART_CELL`; wired into `corpus-deep.yml` at K=100). The
+transcode step is the **identity** today. **Negative controls** prove it has
+teeth: dropping the final WAL record is caught for `Data` (and benign for
+`Control`/`SharedWal`, which hold redundant copies); halving the log and
+wiping the engine, wiping the `SharedWal` engines, and wiping everything are
+each caught as lost acknowledged appends; a truncated SSTable fails the strict
+open. **Three real bugs the harness found:** (1) CWL1/SWL1 treated a CRC
+failure anywhere as a torn tail (handed off to its own session); (2) the
+control `wal_lock` starved the ADR 0038 apply task (#1133); (3) an `LsmEngine`
+WAL torn-header open failure (three TornTail seeds at K=50; fix in progress,
+PR to come). Tier 2 (`sim_cluster_upgrade_corpus`) landed afterwards, see
+the next note. See `animus-test/CLAUDE.md`.
+
+**P1-D as-built, tier 2 (2026-10-01; every format still v1).**
+`animusd/src/sim_cluster_upgrade_corpus.rs` restarts a whole `SimCluster`
+(roles `[Both, Both, Both, Data]`, RF 3) over a new `LsmEngine<SimEnv>` backend
+option (`SimEngineBackend::Lsm`, `SimCluster::new_with_lsm_engines`; the default
+stays `MemoryEngine`, every existing constructor unchanged): every node is
+stopped (after a `Simulator::crash`, optionally with torn tail and
+corrupt-on-crash armed together, on the crash cells), `transcode_disk` runs on
+every node's disk (identity today; seeded mid-transcode stop and
+mixed-version fraction), and every node restarts through `SimCluster::restart`
+with **strict** engine opens (the sim tablet factory panics rather than return
+`Err`, because the reconciler answers an `Err` open with destroy-and-reopen).
+In the loop: control `Metadata` and its system-keyspace LSM mirror, the
+data-only node's mirror, tablet hosting and rebalancing, DynamoDB streams
+(enabled, written, optionally sealed, then read back through
+`GetRecords` over sealed and open shards), a backup catalog row, and the
+DynamoDB wire clients. **Not drivable under `SimCluster`, so not faked:** a
+backup *captured* before the upgrade and *restored* after it
+(`backup_capture_loop`/`backup_restore_loop` take the concrete
+`ClientCtx<ProdEnv, ..>` and `SimCluster` spawns only the janitor) and stream
+cursor advancement (no `change_consumer_loop` runs under `SimCluster`); the
+backup row is a catalog row only, and the sealed segments live in a shared
+`SimSegmentStore` outside any node's disk. Oracle: `check_cycles`, a wire probe
+that every acknowledged append reads back in order before any phase-2 write
+(equality with a pre-stop snapshot on clean cells), the control apply frontier,
+metadata/backup/hosting agreement across all four nodes, the stream check,
+`check_durability`/`check_convergence`, non-vacuity. Knob
+`ANIMUS_UPGRADE_RESTART_SEEDS` (shared with tier 1); `corpus-deep.yml` runs it
+at K=50 (K=20 measured at about 150s wall in debug). **Negative controls:**
+logs halved with engines wiped, and every disk wiped, are each caught as lost
+acknowledged appends; a truncated LSM file fails the strict open. **Remaining
+for P1-D:** per-format plug-ins arrive as P1-A and P1-C land (one
+`transcode::TABLE` entry each; the cells grow with `supported_back()`); nothing
+in tier 2 names a format version.
+
 ### What Phase 1 "done" means, and what users can rely on
 
 Done, when every one of these holds on `main`:
@@ -1380,6 +1434,25 @@ in one change and updates this ADR's status header.
 in flight); Phases 2 and 3 planned, blocked
 on Phase 1 as before.
 
+### Amendment 2026-10-01: LSM WAL segment header is synced before any record (P1-B / P1-D follow-up)
+
+The P1-D tier-1 upgrade-restart corpus (strict `LsmEngine` open straight
+after `Simulator::crash` with `torn_tail_on_crash` + `corrupt_on_crash`)
+found that a crash during WAL segment creation could leave a node that
+cannot restart: the 5-byte header (`LWL1` + version) shared one `sync` with
+the segment's first records, so a torn-and-bit-flipped un-synced header
+decoded as `UnsupportedFormatVersion { found: 254 }` or `PreBaselineFormat`.
+**No encoding or fixture changes, no version bump.** Two coupled changes:
+(1) the write side appends and `sync`s the header on its own before any
+record is appended (one extra `fsync` per segment creation);
+(2) `decode_wal` now treats any file shorter than the header, whatever its
+bytes, as an empty torn tail (previously only a true prefix of `WAL_MAGIC`).
+Soundness: after (1) every file longer than the header has a durable header,
+so a bad header there is real corruption and stays loud (the version-dispatch
+seam is untouched for >= 5 bytes); a shorter file never had a synced header
+and holds no acked data. Regression: `animus-storage/tests/lsm_crash.rs`
+`crash_during_segment_header_creation`.
+
 ## Amendment 2026-10-01 — `CWL1`/`SWL1` v2: sync markers (issue #1132)
 
 A decoder-behaviour change that needed a format bump. Both line-framed WALs
@@ -1393,8 +1466,11 @@ of that un-synced region, so a correct writer plus a crash produces "bad line,
 then valid line" (72 of 300 seeds measured). The reader needs a durable sync
 boundary.
 
-- **Format v2** (checklist step 1): after every `fsync` that returns `Ok`, the
-  writer appends a marker line `!sync:<N>` (an ordinary CRC-checked line
+- **Format v2** (checklist step 1): after every `fsync` that returns `Ok` (the
+  line-framed per-group/control WALs skip it while another persist round is
+  already queued, since markers are cumulative and the next round's marker
+  covers this one; the marker is only ever missing for a WAL that is not yet
+  quiescent), the writer appends a marker line `!sync:<N>` (an ordinary CRC-checked line
   carrying the tag's version) where `N` is the file length at that moment,
   which is the marker's own start offset. Written *after* the sync, never
   before (a pre-sync marker could survive a kept-prefix tear next to a flipped

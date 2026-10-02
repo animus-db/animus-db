@@ -3017,3 +3017,19 @@ noise floor; run it locally, and never compare its numbers against a
 different host/session/media (the bench prints the resolved `/proc/mounts`
 filesystem type + device for whatever directory it writes into, so a
 reader never has to take the media on faith).
+
+## `wal_lock` is a FIFO-fair `FairMutex` (apply-task starvation fix)
+
+The per-tablet `wal_lock` (serializes `persist_wal`'s append/fsync against
+`apply_and_compact`'s compaction rewrite) is `animus_control::fair_lock::
+FairMutex`, not `futures::lock::Mutex`. The consensus loop starts back-to-back
+persist rounds while `has_unflushed_wal()`, so under continuous proposals on a
+slow disk the unfair mutex let it re-lock ahead of the apply task's compaction
+wait indefinitely: `engine_applied_index` froze while core `last_applied ==
+commit` hid it. **`persist_wal` takes `wal_lock` before branching on `shared`,
+so the `SharedWal` path had the identical bug.** Do not swap it back; `SharedWal`'s
+own internal mutex (in `animus-control`) is only taken inside `append_tagged`/
+`compact_group`, under `wal_lock`, and needs no change. Regression:
+`tests/apply_not_starved_by_wal_lock.rs` (both paths, asserts on
+`engine_applied_index`, never core `last_applied`). ADR 0017's and ADR 0038's
+2026-09-30 amendments.

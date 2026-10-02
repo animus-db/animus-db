@@ -1277,3 +1277,15 @@ Regression: `crates/animus-cp-data/tests/learner_snapshot_livelock_under_continu
 It sets a small ceiling through the test-only `CompactTuning` seam and asserts
 while the writer is still running. Pre-fix it shows 75 restarts, 0 installs and
 the learner's applied index stuck at 0.
+
+## Amendment (2026-09-30) — `wal_lock` is FIFO-fair; the apply task can no longer be starved of it
+
+The per-tablet `wal_lock` (`persist_wal` vs. `apply_and_compact`'s compaction
+rewrite) was a `futures::lock::Mutex`, which is unfair. The consensus loop starts
+the next persist round the moment the last lands (`has_unflushed_wal()`), so under
+continuous proposals on a slow disk it re-locked ahead of the apply task's
+compaction wait indefinitely: no further engine apply, `engine_applied_index`
+frozen, while core `last_applied` still equalled commit. `persist_wal` takes the
+lock before branching on `SharedWal`, so both WAL paths were affected. It is now
+`animus_control::fair_lock::FairMutex`; see ADR 0038's 2026-09-30 amendment for
+the mechanism. Regression: `crates/animus-cp-data/tests/apply_not_starved_by_wal_lock.rs`.

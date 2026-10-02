@@ -45,6 +45,7 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use animus_control::SharedWal;
+use animus_control::fair_lock::FairMutex;
 use animus_control::persist_round::{
     self, GatedOuts, PersistArm, PersistFut, PersistProgress, PersistWake,
 };
@@ -57,7 +58,6 @@ use animus_item::{AttributeValue, ConditionExpression, Item, UpdateAction, Write
 use animus_storage::{MergeOp, StorageEngine, Version};
 use animus_tablet::{KeyRange, SplitChild, TabletId};
 use futures::future::{Either, select};
-use futures::lock::Mutex as AsyncMutex;
 use futures::task::AtomicWaker;
 use serde::{Deserialize, Serialize};
 
@@ -2991,7 +2991,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let apply_stopped = Arc::new(AtomicBool::new(false));
         let engine_applied = Arc::new(AtomicU64::new(0));
         let applied_watch = AppliedWatch::default();
-        let wal_lock = Arc::new(AsyncMutex::new(()));
+        let wal_lock = Arc::new(FairMutex::new());
         let propose_signal = Arc::new(ProposeSignal::default());
         let apply_signal = Arc::new(ApplySignal::default());
         let wake_signal = Arc::new(WakeSignal::default());
@@ -7355,6 +7355,10 @@ fn record_kv_outbound(metrics: &MetricsHandle, outs: &[(NodeId, KvWire)]) {
 /// so this loop stays responsive to Raft messages / heartbeats within the election
 /// timeout (ADR 0017 — the driver-liveness fix). Holds `wal_lock` so the append
 /// cannot interleave with the apply task's compaction rewrite of the same file.
+/// `wal_lock` is a FIFO-fair [`FairMutex`]: this loop starts the next round as
+/// soon as the last lands, so an unfair lock lets it re-lock ahead of the apply
+/// task's compaction wait forever and freeze the engine-applied frontier (ADR
+/// 0038's 2026-09-30 amendment).
 /// Durability precedes visibility: `mark_durable_through` follows the `fsync`.
 ///
 /// **Raises `apply_signal`** (ADR 0044 phase-1 PR1) whenever it reaches
@@ -7391,7 +7395,7 @@ async fn persist_wal<E: Env>(
     env: &E,
     wal: &str,
     core: &Arc<Mutex<KvCore>>,
-    wal_lock: &AsyncMutex<()>,
+    wal_lock: &FairMutex,
     apply_signal: &ApplySignal,
     halted: &AtomicBool,
     progress: &PersistProgress,
@@ -7465,7 +7469,19 @@ async fn persist_wal<E: Env>(
     // Issue #1132: the per-group WAL's sync marker (after the sync, after the
     // acks, under `wal_lock`). The shared-WAL branch writes its own markers
     // inside `SharedWal::flush`, so only the private-file branch needs one.
-    if shared.is_none() {
+    //
+    // Skipped while more records are already waiting for their own round: a
+    // marker is cumulative (it claims everything before its offset is fsynced),
+    // so the very next round's marker covers this one too, and the extra
+    // append would otherwise sit under `wal_lock` on every back-to-back round
+    // (on a slow disk that doubles each round's lock hold and starves a
+    // lagging learner's catch-up). The marker is written when a round leaves
+    // the WAL fully flushed, i.e. before the group goes idle.
+    let more_pending = core
+        .lock()
+        .expect("raftkv core poisoned")
+        .has_unflushed_wal();
+    if shared.is_none() && !more_pending {
         animus_control::persist::append_sync_marker(
             env,
             &animus_control::persist::CONTROL_WAL,
@@ -8035,7 +8051,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     kind_eval_batch_results: &Arc<Mutex<KindEvalBatchResults>>,
     engine_applied: &AtomicU64,
     applied_watch: &AppliedWatch,
-    wal_lock: &AsyncMutex<()>,
+    wal_lock: &FairMutex,
     halted: &AtomicBool,
     metrics: &MetricsHandle,
     scope: &StorageScope,
@@ -10568,7 +10584,8 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         // spin), and/or a real WAL-rewriting compaction completed
         // (`bytes.is_some()`, checked below).
         let image_installed = image.is_some();
-        // Serialize the WAL rewrite against the consensus loop's appends.
+        // Serialize the WAL rewrite against the consensus loop's appends. The
+        // lock is FIFO-fair so back-to-back persist rounds cannot starve this.
         let _wal = wal_lock.lock().await;
         let (bytes, lli) = {
             let mut c = core.lock().expect("raftkv core poisoned");
@@ -11053,7 +11070,7 @@ struct DriveState<E: Env, S: StorageEngine> {
     kind_eval_batch_results: Arc<Mutex<KindEvalBatchResults>>,
     engine_applied: Arc<AtomicU64>,
     applied_watch: AppliedWatch,
-    wal_lock: Arc<AsyncMutex<()>>,
+    wal_lock: Arc<FairMutex>,
     halted: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
     apply_stopped: Arc<AtomicBool>,
@@ -12128,7 +12145,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     kind_eval_batch_results: Arc<Mutex<KindEvalBatchResults>>,
     engine_applied: Arc<AtomicU64>,
     applied_watch: AppliedWatch,
-    wal_lock: Arc<AsyncMutex<()>>,
+    wal_lock: Arc<FairMutex>,
     halted: Arc<AtomicBool>,
     apply_stopped: Arc<AtomicBool>,
     metrics: MetricsHandle,
