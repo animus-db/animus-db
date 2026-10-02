@@ -946,12 +946,20 @@ fn put_raft(out: &mut Vec<u8>, m: &RaftMsg<KvCommand>) {
             success,
             match_index,
             needs_snapshot,
+            check_pending,
         } => {
             put_u8(out, 5);
             put_u64(out, *term);
             put_bool(out, *success);
             put_u64(out, *match_index);
-            put_bool(out, *needs_snapshot);
+            // Issue #1131: the trailing byte is a flag set — bit 0
+            // `needs_snapshot` (the original `bool`, so a v1 frame's `0`/`1`
+            // decodes unchanged and a frame with `check_pending == false`
+            // encodes byte-identically to v1), bit 1 `check_pending`.
+            put_u8(
+                out,
+                u8::from(*needs_snapshot) | (u8::from(*check_pending) << 1),
+            );
         }
         RaftMsg::InstallSnapshot {
             term,
@@ -1098,12 +1106,22 @@ fn read_raft(c: &mut Cursor<'_>) -> Result<RaftMsg<KvCommand>, DecodeError> {
                 leader_commit: c.u64()?,
             }
         }
-        5 => RaftMsg::AppendEntriesResp {
-            term: c.u64()?,
-            success: c.bool()?,
-            match_index: c.u64()?,
-            needs_snapshot: c.bool()?,
-        },
+        5 => {
+            let term = c.u64()?;
+            let success = c.bool()?;
+            let match_index = c.u64()?;
+            let flags = c.u8()?;
+            if flags > 0b11 {
+                return Err(format!("invalid AppendEntriesResp flags byte {flags}"));
+            }
+            RaftMsg::AppendEntriesResp {
+                term,
+                success,
+                match_index,
+                needs_snapshot: flags & 1 != 0,
+                check_pending: flags & 2 != 0,
+            }
+        }
         6 => RaftMsg::InstallSnapshot {
             term: c.u64()?,
             leader: c.node_id()?,
@@ -1724,6 +1742,7 @@ pub(crate) mod tests {
                 success: true,
                 match_index: 23,
                 needs_snapshot: true,
+                check_pending: false,
             },
             RaftMsg::InstallSnapshot {
                 term: 7,

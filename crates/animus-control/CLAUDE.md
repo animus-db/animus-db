@@ -742,6 +742,20 @@ freezes that type's absent-field semantics once merged.**
   signal-is-not-safe-when-the.md` and the new
   `tests/wiped_voter_follower_peer_evidence.rs`.
 
+- **Never promote a learner whose boot-time cluster check is pending (issue
+  #1131, ADR 0009's 2026-09-30 amendment).** A pending check refuses every vote
+  and never campaigns, so a promoted-but-pending voter can leave a group
+  leaderless forever (its wait-for-all probe set may contain a dead peer).
+  `AppendEntriesResp::check_pending` (`RaftCore::cannot_vote_yet`: check pending
+  OR resolved-to-refused) carries the learner's own state to the
+  leader (`peer_check_pending`); `RaftCore::learner_caught_up` is `false` until
+  it reports `false`, and is the one gate every production promoter consults
+  (cp-data `reconfigure_step`; the control plane has no automatic promoter).
+  Any new promotion path must go through it. In cp-data's binary codec the flag
+  is bit 1 of the `needs_snapshot` byte (v1 frames unchanged). Regression:
+  `tests/learner_promotion_pending_check.rs`
+  (`ANIMUS_LEARNER_PENDING_CHECK_SEEDS`).
+
 - **Config-in-log + current-term-commit gate (ADR 0017 C).** `LogEntry` may
   carry a `config: Option<voters>`; `RaftCore` keeps `peers`/`cluster_size` in
   sync with the latest log config (config rides snapshots + `InstallSnapshot`).
