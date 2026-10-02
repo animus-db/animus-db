@@ -54,6 +54,7 @@ mod stale_snapshot_no_rewind;
 mod tablet_split;
 mod transfer_third_voter_wins;
 mod wal_compaction;
+mod wal_midfile_corruption;
 mod watch_deltas;
 mod wiped_voter_double_vote_safety;
 mod wiped_voter_follower_peer_evidence;

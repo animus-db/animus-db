@@ -271,7 +271,7 @@ per-tablet CP data plane (`animus-cp-data`).
   any append; without it the next appends sit after garbage and the next
   recovery refuses the file. The marker is written after the sync, after acks
   are released, under the same lock as the appends (so its offset is exact),
-  and is best-effort. Tests: `tests/wal_midfile_corruption.rs`. Residual: the
+  and is best-effort. Tests: `tests/it/wal_midfile_corruption.rs`. Residual: the
   latest round has no durable marker until the next sync; a disk that lied
   about `fsync` can now fail loudly. Corruption of a CRC-valid line's
   *payload* was always loud (`Malformed`). No back-compat for a pre-checksum
