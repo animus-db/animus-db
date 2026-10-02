@@ -82,17 +82,20 @@
 //! rest of this file already relies on. The header is prepended to a
 //! segment's **first-ever** batch (whether that's the very first write to a
 //! brand-new engine's segment 0, or the first write to a segment a rotation
-//! just created) and appended in the same `Disk::append` call as that
-//! batch's records, so it becomes durable in exactly the `sync` that covers
-//! them — never separately, never in an earlier or later `sync`. A crash
-//! before that `sync` completes can therefore only ever leave the header
-//! **absent, torn (a strict prefix), or fully present** — the identical
-//! three-way outcome a plain record already has (see `decode_wal`'s "torn
-//! tail" argument in `lsm.rs`), so recovery reuses the same reasoning: a
-//! torn header proves nothing durable exists in this file at all (nothing
-//! could have synced past an incomplete header, since header and first
-//! record share one `sync`), so it is tolerated as if the file were empty,
-//! not reported as corruption.
+//! just created) but is appended and **`sync`ed on its own, before any
+//! record is appended** ([`GroupCommit::flush_batch`]: one extra `fsync` per
+//! segment creation). An earlier shape shared one `sync` between the header
+//! and the first records; a crash that tore that un-synced write (and, with
+//! corruption, flipped a byte in the kept prefix) could then damage the
+//! *header* of a segment that held no acked data, leaving a node that could
+//! never restart (`UnsupportedFormatVersion { found: 254 }` /
+//! `PreBaselineFormat`; `lsm_crash.rs`'s
+//! `crash_during_segment_header_creation`). With the header synced first,
+//! every file longer than [`WAL_HEADER_LEN`] has a durable header, so a bad
+//! header on such a file is real corruption and stays a loud error; a file
+//! *shorter* than the header never had it synced, provably holds no acked
+//! data, and `decode_wal` recovers it as empty whatever its bytes. The
+//! on-disk encoding is unchanged (no version bump, no fixture change).
 //!
 //! **When to (re-)write it**: [`Inner::active_seg_needs_header`] tracks,
 //! for the *currently* active segment only (older, sealed segments are
@@ -523,20 +526,24 @@ impl GroupCommit {
         batch: &[u8],
     ) -> Result<()> {
         let file = self.segment_file(seg);
-        let framed: std::borrow::Cow<'_, [u8]> = if needs_header {
-            let mut framed = encode_wal_header().to_vec();
-            framed.extend_from_slice(batch);
-            std::borrow::Cow::Owned(framed)
-        } else {
-            std::borrow::Cow::Borrowed(batch)
-        };
-        if !framed.is_empty() {
-            env.append(&file, &framed)
+        if needs_header {
+            // Header first, and **synced on its own** before any record is
+            // appended (see the module docs' "File-level format header"
+            // section): a file longer than the header therefore always has a
+            // durable header, so a bad header on such a file is real
+            // corruption, never a crash-torn write.
+            env.append(&file, &encode_wal_header())
                 .await
                 .map_err(|e| StorageError::Backend(e.to_string()))?;
-            if needs_header {
-                self.lock().active_seg_needs_header = false;
-            }
+            self.lock().active_seg_needs_header = false;
+            env.sync(&file)
+                .await
+                .map_err(|e| StorageError::Backend(e.to_string()))?;
+        }
+        if !batch.is_empty() {
+            env.append(&file, batch)
+                .await
+                .map_err(|e| StorageError::Backend(e.to_string()))?;
         }
         env.sync(&file)
             .await
