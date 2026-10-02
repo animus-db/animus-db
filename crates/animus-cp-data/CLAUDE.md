@@ -3015,3 +3015,19 @@ filesystem type + device for whatever directory it writes into, so a
 reader never has to take the media on faith).
 
 **Upgrade-harness class (ADR 0073 P1-D):** none of this crate's formats is a whole-file `TABLE` entry; `raftkv-wal` and `cp-engine-layout` are `EMBEDDED` in a whole-file carrier (`control-wal`/`lsm-sstable`), and `raftkv-wire`, `raftkv-image`, `segment`, `backup-manifest`, `backup-data` are `EMBEDDED` off-disk (`animus-test`'s `upgrade::transcode::EMBEDDED`).
+
+## `wal_lock` is a FIFO-fair `FairMutex` (apply-task starvation fix)
+
+The per-tablet `wal_lock` (serializes `persist_wal`'s append/fsync against
+`apply_and_compact`'s compaction rewrite) is `animus_control::fair_lock::
+FairMutex`, not `futures::lock::Mutex`. The consensus loop starts back-to-back
+persist rounds while `has_unflushed_wal()`, so under continuous proposals on a
+slow disk the unfair mutex let it re-lock ahead of the apply task's compaction
+wait indefinitely: `engine_applied_index` froze while core `last_applied ==
+commit` hid it. **`persist_wal` takes `wal_lock` before branching on `shared`,
+so the `SharedWal` path had the identical bug.** Do not swap it back; `SharedWal`'s
+own internal mutex (in `animus-control`) is only taken inside `append_tagged`/
+`compact_group`, under `wal_lock`, and needs no change. Regression:
+`tests/apply_not_starved_by_wal_lock.rs` (both paths, asserts on
+`engine_applied_index`, never core `last_applied`). ADR 0017's and ADR 0038's
+2026-09-30 amendments.
