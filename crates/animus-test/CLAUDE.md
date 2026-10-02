@@ -60,9 +60,9 @@ properties; it also hosts cross-crate fault sweeps.
   `EMBEDDED` (name, `Carrier::Table(<entry>)` or `Carrier::OffDisk`, owner,
   version) and its bump edits its **carrier's** transcode. Legacy encoders the
   harness calls must be `pub` under `cfg(any(test, feature = "legacy-encoders"))`,
-  never `cfg(test)`-private. `tests/upgrade_restart_tier0.rs` fails if the
+  never `cfg(test)`-private. `tests/it/upgrade_restart_tier0.rs` fails if the
   table drifts from the newest checked-in fixture or if any crate's
-  `tests/fixtures/formats/<dir>` is in neither `TABLE` nor `EMBEDDED`. Tier 0 (`tests/upgrade_restart_tier0.rs`) seeds a
+  `tests/fixtures/formats/<dir>` is in neither `TABLE` nor `EMBEDDED`. Tier 0 (`tests/it/upgrade_restart_tier0.rs`) seeds a
   `SimEnv` disk with each whole-file fixture, runs it through the table,
   crashes, and opens the real reader (`LsmEngine::open_with`,
   `PersistedState::decode`/`replay`, `SharedWal::open`); its negative
@@ -199,7 +199,7 @@ Env knobs at a glance (details in the sections below):
 
 ## Upgrade-restart corpus (ADR 0073 P1-D, tier 1)
 
-`tests/upgrade_restart_corpus.rs` (tier 0 is `upgrade_restart_tier0.rs`, fixture-seeded
+`tests/it/upgrade_restart_corpus.rs` (tier 0 is `it/upgrade_restart_tier0.rs`, fixture-seeded
 restarts). A live workload runs at the current format versions on `SimEnv` disks, the
 node(s) stop, each stopped disk goes through `animus_test::upgrade::transcode` (the
 **identity** while every format is v1), fresh nodes restart on current code, and the

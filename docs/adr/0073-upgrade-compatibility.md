@@ -1340,7 +1340,7 @@ P1-D tier 2. Phase 1 is done when all four have merged.
 
 **P1-D as-built, tiers 0 and 1 (2026-09-30; tier 2 pending; every format still
 v1).** Tier 0 (#1130) seeds disks from the checked-in fixtures and restarts
-the real readers; tier 1 is `animus-test/tests/upgrade_restart_corpus.rs`
+the real readers; tier 1 is `animus-test/tests/it/upgrade_restart_corpus.rs`
 (21 cells: Data / Control / SharedWal x leader / follower / whole-group x
 clean / crash / torn-tail, strict engine opens, list-append oracle with a
 post-restart probe, a 300s wall-clock watchdog, and for Control a check on the
