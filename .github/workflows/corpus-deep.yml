@@ -194,7 +194,8 @@ jobs:
         timeout-minutes: 20
         env:
           ANIMUS_RAFTKV_SEEDS: ${{ github.event.inputs.raftkv_seeds || '40' }}
-        run: cargo test -p animus-test --test raftkv_linearizable -- --nocapture
+        run: |
+          cargo test -p animus-test --test it raftkv_linearizable:: -- --nocapture
 
       # The identical corpus over LsmEngine<SimEnv> instead of MemoryEngine —
       # the durable path (real WAL/SSTable recovery through the deterministic
@@ -211,7 +212,8 @@ jobs:
         env:
           ANIMUS_RAFTKV_LSM: "1"
           ANIMUS_RAFTKV_SEEDS: ${{ github.event.inputs.raftkv_lsm_seeds || '40' }}
-        run: cargo test -p animus-test --test raftkv_linearizable -- --nocapture
+        run: |
+          cargo test -p animus-test --test it raftkv_linearizable:: -- --nocapture
 
       # ADR 0017's raftkv corpus, WAL-faults tier: a second full pass of the
       # corpus's single-crash cells (LeaderKill/FollowerKill) over
@@ -228,7 +230,8 @@ jobs:
         env:
           ANIMUS_RAFTKV_WAL_FAULTS: "1"
           ANIMUS_RAFTKV_SEEDS: ${{ github.event.inputs.raftkv_wal_faults_seeds || '40' }}
-        run: cargo test -p animus-test --test raftkv_linearizable raftkv_wal_faults_corpus_is_linearizable -- --nocapture
+        run: |
+          cargo test -p animus-test --test it raftkv_linearizable::raftkv_wal_faults_corpus_is_linearizable -- --nocapture
 
       # ADR 0018's multi-tablet cross-transaction corpus: the 2PC protocol
       # (stage/commit/resolve + the recovery push) under fault injection,
@@ -240,7 +243,8 @@ jobs:
         timeout-minutes: 15
         env:
           ANIMUS_TXN_SEEDS: ${{ github.event.inputs.txn_seeds || '40' }}
-        run: cargo test -p animus-test --test txn_serializable -- --nocapture
+        run: |
+          cargo test -p animus-test --test it txn_serializable:: -- --nocapture
 
       # ADR 0042/0043's DynamoDB Streams lineage-walk corpus: exactly-once +
       # per-item order + chain continuity under seals/splits/leader-kills/
@@ -252,7 +256,8 @@ jobs:
         timeout-minutes: 10
         env:
           ANIMUS_STREAM_SEEDS: ${{ github.event.inputs.stream_seeds || '40' }}
-        run: cargo test -p animus-test --test stream_lineage_corpus -- --nocapture
+        run: |
+          cargo test -p animus-test --test it stream_lineage_corpus:: -- --nocapture
 
       # ADR 0045's secondary-index backfill seeder + completion aggregator:
       # coverage/convergence under concurrent splits, leader kills, live
@@ -265,7 +270,8 @@ jobs:
         timeout-minutes: 10
         env:
           ANIMUS_BACKFILL_SEEDS: ${{ github.event.inputs.backfill_seeds || '40' }}
-        run: cargo test -p animus-test --test backfill_fault_corpus -- --nocapture
+        run: |
+          cargo test -p animus-test --test it backfill_fault_corpus:: -- --nocapture
 
       # KvCommand::SeedBatch corpus: idempotence + child-replica
       # crash/partition/duplicate-delivery during a row merge, scaled to
@@ -279,7 +285,8 @@ jobs:
         timeout-minutes: 10
         env:
           ANIMUS_SPLIT_SEEDS: ${{ github.event.inputs.split_seeds || '40' }}
-        run: cargo test -p animus-cp-data --test seed_batch -- --nocapture
+        run: |
+          cargo test -p animus-cp-data --test it seed_batch:: -- --nocapture
 
       # ADR 0031's reconciler lifecycle corpus (post-ADR 0050 lifecycle
       # scenarios: Building host, cutover, reclaim, crash/restart over
@@ -290,7 +297,8 @@ jobs:
         timeout-minutes: 10
         env:
           ANIMUS_RECONCILER_SEEDS: ${{ github.event.inputs.reconciler_seeds || '40' }}
-        run: cargo test -p animus-cp-data --test reconciler_corpus -- --nocapture
+        run: |
+          cargo test -p animus-cp-data --test it reconciler_corpus:: -- --nocapture
 
       # ADR 0048's quiescence property corpus, scaled to depth.
       - name: deep quiescence corpus (ADR 0048)
@@ -299,7 +307,8 @@ jobs:
         timeout-minutes: 10
         env:
           ANIMUS_QUIESCE_SEEDS: ${{ github.event.inputs.quiesce_seeds || '40' }}
-        run: cargo test -p animus-cp-data --test quiescence -- --nocapture
+        run: |
+          cargo test -p animus-cp-data --test it quiescence:: -- --nocapture
 
       # ADR 0058 Train 1's learner (non-voting) membership-class corpus:
       # catch-up under partition, leader change mid-catch-up, and the
@@ -311,7 +320,8 @@ jobs:
         timeout-minutes: 10
         env:
           ANIMUS_LEARNER_SEEDS: ${{ github.event.inputs.learner_seeds || '40' }}
-        run: cargo test -p animus-control --test learner_corpus -- --nocapture
+        run: |
+          cargo test -p animus-control --test it learner_corpus:: -- --nocapture
 
       # Issue #781's healthy-voter-drop corpus: a live follower, and
       # separately the leader itself, dropped via a direct
@@ -325,7 +335,8 @@ jobs:
         timeout-minutes: 10
         env:
           ANIMUS_RECONFIGURE_DROP_SEEDS: ${{ github.event.inputs.reconfigure_drop_seeds || '40' }}
-        run: cargo test -p animus-cp-data --test reconfigure_healthy_drop -- --nocapture
+        run: |
+          cargo test -p animus-cp-data --test it reconfigure_healthy_drop:: -- --nocapture
 
       # ADR 0058 Train 2 rung 3's in-place split group-mint-at-apply corpus:
       # the full happy path, a leader crash mid-catch-up, the G4 crash
@@ -339,7 +350,8 @@ jobs:
         timeout-minutes: 10
         env:
           ANIMUS_INPLACE_SPLIT_SEEDS: ${{ github.event.inputs.inplace_split_seeds || '40' }}
-        run: cargo test -p animus-cp-data --test inplace_split_reconciler -- --nocapture
+        run: |
+          cargo test -p animus-cp-data --test it inplace_split_reconciler:: -- --nocapture
 
       # ADR 0059 Train 1's on-demand backup capture driver + completion
       # aggregator: concurrent writes, leader kills, a capture-driver
@@ -353,7 +365,8 @@ jobs:
         timeout-minutes: 10
         env:
           ANIMUS_BACKUP_SEEDS: ${{ github.event.inputs.backup_seeds || '40' }}
-        run: cargo test -p animus-test --test backup_fault_corpus -- --nocapture
+        run: |
+          cargo test -p animus-test --test it backup_fault_corpus:: -- --nocapture
 
       # ADR 0059 Train 3's PITR sealing consumer arm: leader kills mid-seal,
       # disable/re-enable generation resets, split interplay, and the
@@ -365,7 +378,8 @@ jobs:
         timeout-minutes: 10
         env:
           ANIMUS_PITR_SEEDS: ${{ github.event.inputs.pitr_seeds || '40' }}
-        run: cargo test -p animus-test --test pitr_fault_corpus -- --nocapture
+        run: |
+          cargo test -p animus-test --test it pitr_fault_corpus:: -- --nocapture
 
       # LsmEngine crash-safety corpus: synced writes / a flushed SSTable /
       # crash mid-flush / crash mid-compaction / flush+compaction all surviving
@@ -378,7 +392,8 @@ jobs:
         timeout-minutes: 10
         env:
           ANIMUS_LSM_CRASH_SEEDS: ${{ github.event.inputs.lsm_crash_seeds || '40' }}
-        run: cargo test -p animus-storage --test lsm_crash -- --nocapture
+        run: |
+          cargo test -p animus-storage --test it lsm_crash:: -- --nocapture
 
       # LsmEngine DiskConfig fault-injection corpus: injected I/O errors, torn
       # WAL tails on crash, and at-rest byte corruption (WAL records, SSTable
@@ -391,7 +406,8 @@ jobs:
         timeout-minutes: 10
         env:
           ANIMUS_LSM_DISK_FAULT_SEEDS: ${{ github.event.inputs.lsm_disk_fault_seeds || '40' }}
-        run: cargo test -p animus-storage --test lsm_disk_faults -- --nocapture
+        run: |
+          cargo test -p animus-storage --test it lsm_disk_faults:: -- --nocapture
 
       # LsmEngine<EncryptedEnv<SimEnv>> crash/fault corpus (ADR 0069, S-03
       # PR 1): the encrypted sibling of the two corpora above — a torn or
@@ -405,7 +421,8 @@ jobs:
         timeout-minutes: 10
         env:
           ANIMUS_LSM_ENCRYPTED_SEEDS: ${{ github.event.inputs.lsm_encrypted_seeds || '40' }}
-        run: cargo test -p animus-storage --test lsm_crash_encrypted -- --nocapture
+        run: |
+          cargo test -p animus-storage --test it lsm_crash_encrypted:: -- --nocapture
 
       # EncryptedSegmentStore fault-injection corpus (ADR 0069, S-03 PR 2):
       # every SegmentFaultConfig/unavailability fault the backup/PITR/
@@ -420,7 +437,8 @@ jobs:
         timeout-minutes: 10
         env:
           ANIMUS_SEGMENT_STORE_ENCRYPTED_SEEDS: ${{ github.event.inputs.segment_store_encrypted_seeds || '40' }}
-        run: cargo test -p animus-test --test segment_store_encrypted_fault_corpus -- --nocapture
+        run: |
+          cargo test -p animus-test --test it segment_store_encrypted_fault_corpus:: -- --nocapture
 
       # The control-plane machinery corpus: the ADR 0038 async apply task
       # (including its real `StopRestart` crash-recovery path), the
@@ -435,7 +453,8 @@ jobs:
         timeout-minutes: 15
         env:
           ANIMUS_CONTROL_SEEDS: ${{ github.event.inputs.control_seeds || '40' }}
-        run: cargo test -p animus-control --test control_corpus -- --nocapture
+        run: |
+          cargo test -p animus-control --test it control_corpus:: -- --nocapture
 
       # ADR 0061 rung D1's SimCluster cycles/durability corpus: a real
       # multi-node, multi-tablet `animusd::ClientCtx` cluster (control-plane
@@ -483,7 +502,8 @@ jobs:
         timeout-minutes: 10
         env:
           ANIMUS_EXPORT_IMPORT_SEEDS: ${{ github.event.inputs.export_import_seeds || '40' }}
-        run: cargo test -p animus-test --test export_import_fault_corpus -- --nocapture
+        run: |
+          cargo test -p animus-test --test it export_import_fault_corpus:: -- --nocapture
 
       # ADR 0044 phase 2's per-node heartbeat batcher (C-02 PR 2):
       # frame-vs-logical scaling, every per-group invariant under batching,
@@ -500,7 +520,8 @@ jobs:
         timeout-minutes: 10
         env:
           ANIMUS_HEARTBEAT_SEEDS: ${{ github.event.inputs.heartbeat_seeds || '40' }}
-        run: cargo test -p animus-cp-data --test heartbeat_batch_corpus -- --nocapture
+        run: |
+          cargo test -p animus-cp-data --test it heartbeat_batch_corpus:: -- --nocapture
 
       # ADR 0028's C-05 PR 2 SharedWal persist-path wiring: cross-tablet
       # coalescing under a burst of concurrent hosted-group writes, a crash
@@ -516,7 +537,8 @@ jobs:
         timeout-minutes: 10
         env:
           ANIMUS_SHAREDWAL_SEEDS: ${{ github.event.inputs.sharedwal_seeds || '40' }}
-        run: cargo test -p animus-cp-data --test sharedwal_fault_corpus -- --nocapture
+        run: |
+          cargo test -p animus-cp-data --test it sharedwal_fault_corpus:: -- --nocapture
 
       # ADR 0073 P1-D tier 1: a live workload on LsmEngine/SharedWal disks,
       # stopped cleanly / by a crash / by a torn-tail crash, run through the
@@ -533,7 +555,8 @@ jobs:
           # Fixed depth, deliberately not a workflow_dispatch input: GitHub caps
           # workflow_dispatch at 25 inputs and this file is already at the cap.
           ANIMUS_UPGRADE_RESTART_SEEDS: '100'
-        run: cargo test -p animus-test --test upgrade_restart_corpus -- --nocapture
+        run: |
+          cargo test -p animus-test --test it upgrade_restart_corpus:: -- --nocapture
 
       # Issue #1064/#1092: a late-joining learner needing a real multi-chunk
       # InstallSnapshot under a writer that never stops, one corpus seed per
@@ -546,7 +569,8 @@ jobs:
         timeout-minutes: 15
         env:
           ANIMUS_LEARNER_SNAPSHOT_LIVELOCK_SEEDS: ${{ github.event.inputs.learner_snapshot_livelock_seeds || '16' }}
-        run: cargo test -p animus-cp-data --test learner_snapshot_livelock_under_continuous_writer -- --nocapture
+        run: |
+          cargo test -p animus-cp-data --test it learner_snapshot_livelock_under_continuous_writer:: -- --nocapture
 
       # Turns each corpus step's individually-recorded outcome back into one
       # overall job failure. `if: always()` makes this step run even though

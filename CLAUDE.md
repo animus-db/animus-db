@@ -149,8 +149,11 @@ the relevant one before working in a crate:
 cargo build --workspace --all-targets
 cargo test --workspace
 cargo test -p animus-control                       # one crate
-cargo test -p animus-control --test control_raft   # one test binary
+cargo test -p animus-control --test it             # the crate's merged SimEnv/pure binary (tests/it/main.rs)
+cargo test -p animus-control --test it control_raft::   # one former test file (now a module of `it`)
 cargo test -p animus-control survives_leader_kill  # one test by name substring
+cargo nextest run --workspace --exclude animusd    # what CI's sharded `gates` tier runs (+ `cargo test --workspace --exclude animusd --doc`)
+cargo nextest run -p animusd --lib --profile gates # animusd's SimCluster `--lib` tier
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all --check
 cargo deny check                                   # licenses + advisories (cargo install cargo-deny)
@@ -159,6 +162,20 @@ cargo bench -p animus-storage                      # ProdEnv smoke of the write/
 cargo bench -p animusd                             # cluster wire benchmark: latency percentiles + degraded phase
 cargo bench -p animus-cp-data --bench wal_fsync_bench  # ProdEnv WAL fsync bench gating SharedWal wiring (ADR 0028, C-05)
 ```
+
+**Integration-test layout (consolidated 2026-10-02).** Each crate's
+SimEnv/pure integration tests are modules of ONE binary, `tests/it/main.rs`
+(`mod foo;` per former `tests/foo.rs`, which now lives at `tests/it/foo.rs`),
+so each crate links once instead of once per file. Select a former file with
+`cargo test -p <crate> --test it foo::` (a name filter on the module path —
+check it with `-- --list` when adding a CI step: a filter that matches nothing
+passes green). A new SimEnv/pure test goes in `tests/it/` plus a `mod` line;
+a test that needs real threads / `ProdEnv` / real sockets / process-global
+state (env vars, cwd, `/etc/hosts`, signal handlers) stays its own
+`tests/<name>.rs` target (`animusd`'s 100 `tests/*.rs` all are, and
+`prod-heavy` ones keep their `[[test]] required-features`) — merging those
+raises in-binary concurrency and brings back the documented spurious
+`ProdEnv` timeouts. Rationale: `docs/lessons/testing/2026-10-02-integration-test-binary-consolidation.md`.
 
 All five gates (fmt, clippy `-D warnings`, build, test, deny) must be green; CI
 runs them. Green is a standing invariant, not a per-PR aspiration — see
@@ -200,11 +217,11 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 | `ANIMUS_SEGMENT_STORE_ENCRYPTED_SEEDS=K` | 1 | `EncryptedSegmentStore` fault-injection corpus depth (`animus-test`, `tests/segment_store_encrypted_fault_corpus.rs`, ADR 0069 S-03 PR 2) |
 | `ANIMUS_SIMCLUSTER_SEEDS=K` | 1 | multi-node/multi-tablet `SimCluster` cycles/durability corpus depth (`animusd`, ADR 0061 rung D1) — run via `cargo test -p animusd --lib sim_cluster_corpus` |
 | `ANIMUS_DYNAMO_WIRE_SEEDS=K` | 1 | end-to-end DynamoDB-wire cycles/durability corpus depth over `SimCluster` (`animusd`, ADR 0061 rung D2 PR 2) — run via `cargo test -p animusd --lib sim_cluster_dynamo_corpus` |
-| `ANIMUS_SHAREDWAL_SEEDS=K` | 1 | `SharedWal` cross-tablet ordering/crash-safety/GC fault-injection corpus depth (`animus-cp-data`, ADR 0028, C-05 — on by default since PR 3's cutover) — `cargo test -p animus-cp-data --test sharedwal_fault_corpus` |
+| `ANIMUS_SHAREDWAL_SEEDS=K` | 1 | `SharedWal` cross-tablet ordering/crash-safety/GC fault-injection corpus depth (`animus-cp-data`, ADR 0028, C-05 — on by default since PR 3's cutover) — `cargo test -p animus-cp-data --test it sharedwal_fault_corpus::` |
 | `ANIMUS_EXPORT_IMPORT_SEEDS=K` | 1 | S3 export/import fault-injection corpus depth (`animus-test`, ADR 0068, S-05 PR 3) |
-| `ANIMUS_HEARTBEAT_SEEDS=K` | 1 | per-node heartbeat-batcher fault-injection corpus depth (`animus-cp-data`, ADR 0044 phase 2, C-02 PR 2) — run via `cargo test -p animus-cp-data --test heartbeat_batch_corpus` |
-| `ANIMUS_DIRECTED_PLACING_LOAD_SEEDS=K` | 1 | directed-Placing (2-of-3 replica diff) learner-promotion-under-a-continuous-writer corpus depth (`animus-cp-data`, issue #1064) — `cargo test -p animus-cp-data --test directed_placing_under_sustained_load` |
-| `ANIMUS_LEARNER_SNAPSHOT_LIVELOCK_SEEDS=K` | 1 | late-joining-learner-needing-a-real-InstallSnapshot-under-a-continuous-writer corpus depth (`animus-cp-data`, issue #1064 part 2) — `cargo test -p animus-cp-data --test learner_snapshot_livelock_under_continuous_writer` |
+| `ANIMUS_HEARTBEAT_SEEDS=K` | 1 | per-node heartbeat-batcher fault-injection corpus depth (`animus-cp-data`, ADR 0044 phase 2, C-02 PR 2) — run via `cargo test -p animus-cp-data --test it heartbeat_batch_corpus::` |
+| `ANIMUS_DIRECTED_PLACING_LOAD_SEEDS=K` | 1 | directed-Placing (2-of-3 replica diff) learner-promotion-under-a-continuous-writer corpus depth (`animus-cp-data`, issue #1064) — `cargo test -p animus-cp-data --test it directed_placing_under_sustained_load::` |
+| `ANIMUS_LEARNER_SNAPSHOT_LIVELOCK_SEEDS=K` | 1 | late-joining-learner-needing-a-real-InstallSnapshot-under-a-continuous-writer corpus depth (`animus-cp-data`, issue #1064 part 2) — `cargo test -p animus-cp-data --test it learner_snapshot_livelock_under_continuous_writer::` |
 | `ANIMUS_RELEASE_RACE_SEEDS=K` | 1 | release-vs-promote race corpus depth (`animus-cp-data`, `tests/release_race_corpus.rs`, ADR 0031's 2026-09-30 amendment) — a mid-catch-up learner must never be released/erased by the host reconciler nor refused as a voter on re-host |
 | `ANIMUS_SHRINK=1` | off | when a corpus scenario fails, delta-debug it to a minimal reproducing case and print a replayable handle (`animus-test::shrink`, ADR 0061 rung B4) |
 | `ANIMUS_SHRINK_MAX_CHECKS=N` | 500 | iteration budget for `ANIMUS_SHRINK`'s search (a plain check count, not wall-clock time — see `animus-test/CLAUDE.md`) |

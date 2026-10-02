@@ -153,7 +153,7 @@ fn write_new_fixture(path: &Path, bytes: &[u8]) {
 }
 
 #[test]
-#[ignore = "run explicitly to (re)generate a fixture: cargo test -p animus-item --test numkey_vectors generate_fixture_numkey -- --ignored"]
+#[ignore = "run explicitly to (re)generate a fixture: cargo test -p animus-item --test it numkey_vectors::generate_fixture_numkey -- --ignored"]
 fn generate_fixture_numkey() {
     let doc: Vec<Value> = inputs().iter().map(|i| compute(i)).collect();
     let mut text = serde_json::to_string_pretty(&doc).expect("serialize");

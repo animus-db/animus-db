@@ -216,7 +216,7 @@ fn unrecognised_encodings_are_not_v1() {
 }
 
 #[test]
-#[ignore = "run explicitly to (re)generate a fixture: cargo test -p animus-item --test format_fixtures generate_fixture_stored_item -- --ignored"]
+#[ignore = "run explicitly to (re)generate a fixture: cargo test -p animus-item --test it format_fixtures::generate_fixture_stored_item -- --ignored"]
 fn generate_fixture_stored_item() {
     write_new_fixture(
         &fixtures_dir("stored-item").join("v1.json"),
@@ -225,7 +225,7 @@ fn generate_fixture_stored_item() {
 }
 
 #[test]
-#[ignore = "run explicitly to (re)generate a fixture: cargo test -p animus-item --test format_fixtures generate_fixture_change_record -- --ignored"]
+#[ignore = "run explicitly to (re)generate a fixture: cargo test -p animus-item --test it format_fixtures::generate_fixture_change_record -- --ignored"]
 fn generate_fixture_change_record() {
     write_new_fixture(
         &fixtures_dir("change-record").join("v1.json"),

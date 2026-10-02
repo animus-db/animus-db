@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working in this crate.
 
+> **Test layout (2026-10-02).** Every corpus is a module of one binary, `tests/it/main.rs` (`cargo test -p animus-test --test it <corpus>::`, e.g. `raftkv_linearizable::`). Older sections below that cite `tests/<name>.rs` mean `tests/it/<name>.rs`.
+
 ## Purpose
 
 Elle/Jepsen-style history recording and consistency checking. A library other
@@ -240,7 +242,7 @@ workload continues. One `Recorder` spans both phases.
   every kind.
 - **Replay.** Failures print `cell=<name> seed=<seed>`. Replay with
   `ANIMUS_SEED=<seed> ANIMUS_UPGRADE_RESTART_CELL=<cell name substring> cargo test -p
-  animus-test --test upgrade_restart_corpus -- --nocapture`. Depth: `ANIMUS_UPGRADE_RESTART_SEEDS=K`
+  animus-test --test it upgrade_restart_corpus:: -- --nocapture`. Depth: `ANIMUS_UPGRADE_RESTART_SEEDS=K`
   (K=50 is ~55s in debug; nightly runs 100 via `corpus-deep.yml`).
 
 ## Tests
@@ -410,7 +412,7 @@ retrievable from git history.)
   snapshot.rs`'s own `drive_bounded` (a reintroduced #811 livelock has no
   `.await` yield point `SimEnv`'s own step/timeline budget could otherwise
   bound — only a real OS-thread wall-clock bound catches it). Runs at
-  `cargo test -p animus-test --test raftkv_linearizable` with no env var
+  `cargo test -p animus-test --test it raftkv_linearizable::` with no env var
   (`raftkv_snapshot_caught_up_follower_restart_is_linearizable`, so
   automatically in the nightly `corpus-deep.yml` tier), deepens with
   `ANIMUS_RAFTKV_SEEDS=K` via the same `corpus::seed_expand`/`SeedVariant`

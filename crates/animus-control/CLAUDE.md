@@ -3,6 +3,8 @@
 This file provides guidance to Claude Code (claude.ai/code) when working in this
 crate.
 
+> **Test layout (2026-10-02).** All SimEnv/pure integration tests are modules of one binary, `tests/it/main.rs` (`cargo test -p animus-control --test it <file>::`); only the real-thread `prod_liveness` and `control_membership_prod` (`prod-heavy`) stay separate `tests/*.rs` targets. Older sections below that cite `tests/<name>.rs` mean `tests/it/<name>.rs`.
+
 ## Purpose
 
 The strongly-consistent control plane: an in-house Raft (ADR 0009, *not*
@@ -499,9 +501,9 @@ own module doc for why the embedded `Metadata` is deliberately minimal: a
 later PR in this same stack adds a `"v"` field to `Metadata`'s JSON shape
 that serde-defaults to 1 when absent, so this frozen fixture still decodes —
 a checked-in fixture may never be edited once merged).
-`tests/format_fixtures.rs` has the decode/round-trip tests plus the
+`tests/it/format_fixtures.rs` has the decode/round-trip tests plus the
 `#[ignore]`d `generate_fixture_control_wal` generator (`cargo test -p
-animus-control --test format_fixtures generate_fixture_control_wal --
+animus-control --test it format_fixtures::generate_fixture_control_wal --
 --ignored`) — refuses to overwrite an existing fixture file; bump
 `CONTROL_WAL::version` and add a new one instead.
 
