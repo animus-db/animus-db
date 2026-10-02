@@ -1193,6 +1193,95 @@ async fn engine_applied_index(addr: SocketAddr) -> Option<u64> {
     value["engine_applied_index"].as_u64()
 }
 
+/// One best-effort `GET <path>` against an admin `addr`, parsed as JSON
+/// (`None` on any connect/parse/non-200 failure — the caller polls).
+async fn admin_get_json(addr: SocketAddr, path: &str) -> Option<serde_json::Value> {
+    let mut stream = TcpStream::connect(addr).await.ok()?;
+    let request = format!("GET {path} HTTP/1.0\r\nHost: animus\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.ok()?;
+    stream.flush().await.ok()?;
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.ok()?;
+    let text = String::from_utf8(raw).ok()?;
+    let (head, payload) = text.split_once("\r\n\r\n")?;
+    let status: u16 = head
+        .lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    if status != 200 {
+        return None;
+    }
+    serde_json::from_str(payload).ok()
+}
+
+/// Whether **every replica of every tablet** hosted across `nodes` has its own
+/// engine caught up to the highest commit index any replica of that tablet
+/// reports (one `GET /admin/raftkv` per node), with every voter of every
+/// group actually reporting. `false` also when a node cannot be reached, a
+/// group reports no voters, or a tablet has fewer reporting replicas than
+/// voters (a replica not hosted yet). See [`await_replicas_caught_up`].
+async fn replicas_caught_up(nodes: &[Node]) -> bool {
+    // tablet -> (highest commit_index seen, per-replica engine_applied_index,
+    // voter count).
+    let mut tablets: BTreeMap<u64, (u64, Vec<u64>, usize)> = BTreeMap::new();
+    for node in nodes {
+        let Some(view) = admin_get_json(node.admin_addr(), "/admin/raftkv").await else {
+            return false;
+        };
+        for g in view["groups"].as_array().cloned().unwrap_or_default() {
+            let (Some(tablet), Some(commit), Some(applied)) = (
+                g["tablet"].as_u64(),
+                g["commit_index"].as_u64(),
+                g["engine_applied_index"].as_u64(),
+            ) else {
+                return false;
+            };
+            let voters = g["voters"].as_array().map_or(0, Vec::len);
+            let entry = tablets.entry(tablet).or_insert((0, Vec::new(), 0));
+            entry.0 = entry.0.max(commit);
+            entry.1.push(applied);
+            entry.2 = entry.2.max(voters);
+        }
+    }
+    !tablets.is_empty()
+        && tablets.values().all(|(commit, applied, voters)| {
+            *voters > 0 && applied.len() >= *voters && applied.iter().all(|a| a >= commit)
+        })
+}
+
+/// Converged-or-stalled poll until [`replicas_caught_up`]: **every replica's
+/// own engine** has applied everything any replica of its tablet has
+/// committed.
+///
+/// This is what "an eventually-consistent read can no longer miss a row" needs
+/// (ADR 0055), and polling each node's *address* does not prove it: an
+/// eventual read is answered by whichever replica the serving node's routing
+/// picks that instant (its own if it passes `stale_read_ready`, else a
+/// forwarded sibling — a choice that can flip request to request), and that
+/// gate is **purely local**: `engine_applied >= the replica's own
+/// commit_index`, where a follower learns the commit index only from the
+/// leader's next AppendEntries/heartbeat. A follower that has not yet heard
+/// about the last commit therefore passes the gate while a full entry
+/// behind — indistinguishable, from any one read, from a caught-up replica.
+/// Only the replicas' own applied watermarks, compared to the leader's commit
+/// index, prove no such replica is left (the `gsi_scan_paginates_and_drains_
+/// all_rows` flake).
+pub async fn await_replicas_caught_up(nodes: &[Node], what: &str) {
+    let Some(first) = nodes.first() else {
+        return;
+    };
+    poll_until_or_stalled(
+        first.admin_addr(),
+        &format!("{what}: every replica's engine caught up to its tablet's commit index"),
+        Duration::from_millis(50),
+        || replicas_caught_up(nodes),
+    )
+    .await;
+}
+
 /// Poll `condition` to convergence for an eventual property that is read
 /// through a node's ADR 0038 async apply-task cache (`/admin/status`, a
 /// tablet map, member statuses, `/admin/peers`, ...) — which has **no

@@ -114,6 +114,14 @@ pub(crate) struct CpRaftView {
     pub(crate) term: u64,
     pub(crate) commit_index: u64,
     pub(crate) last_applied: u64,
+    /// How far this replica's own **engine** has applied — the watermark the
+    /// ADR 0055 eventual-read freshness gate (`stale_read_ready`) compares
+    /// against this replica's own `commit_index`, and so the state an
+    /// eventually-consistent read actually observes (`last_applied` above is
+    /// the Raft core's, which leads the engine by the apply task's lag). A
+    /// pure observer; lets a test prove *every replica* of a group holds
+    /// the leader's committed state, which polling a node address cannot.
+    pub(crate) engine_applied_index: u64,
     pub(crate) durable_index: u64,
     pub(crate) snapshot_index: u64,
     pub(crate) log_len: usize,

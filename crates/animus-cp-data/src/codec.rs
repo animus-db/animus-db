@@ -84,10 +84,14 @@ type DecodeError = String;
 const WIRE_NAME: &str = "raftkv-wire";
 const IMAGE_NAME: &str = "raftkv-image";
 
-/// Validate the `magic || version` header, returning the cursor positioned
-/// after it. Empty/foreign input is pre-baseline; version `0` or one newer
-/// than this build is unsupported.
-fn check_header<'a>(bytes: &'a [u8], format: &'static str) -> Result<Cursor<'a>, FormatError> {
+/// Validate the `magic || version` header, returning the version found and
+/// the cursor positioned after it; the caller dispatches on the version.
+/// Empty/foreign input is pre-baseline; version `0` or one newer than this
+/// build is unsupported.
+fn check_header<'a>(
+    bytes: &'a [u8],
+    format: &'static str,
+) -> Result<(u8, Cursor<'a>), FormatError> {
     if bytes.first() != Some(&MAGIC) {
         return Err(FormatError::PreBaselineFormat { format });
     }
@@ -106,7 +110,25 @@ fn check_header<'a>(bytes: &'a [u8], format: &'static str) -> Result<Cursor<'a>,
     }
     let mut c = Cursor::new(bytes);
     c.pos = 2;
-    Ok(c)
+    Ok((version, c))
+}
+
+/// Retired format versions (ADR 0073 "The decoder pattern", point 4). Each
+/// retired version `N` gets a submodule `legacy::vN` holding its frozen
+/// decoder, the frozen shape type that decoder produces (`VNFoo`), and the
+/// `From<VNFoo>` translation into the current in-memory type; the version
+/// `match` in the public decoder routes to it. Kept forever, edited only by
+/// mechanical compile fixes. Empty today: every version of this codec is
+/// still v1, i.e. current.
+mod legacy {}
+
+/// The error for a version the dispatch `match` has no arm for.
+fn unsupported(format: &'static str, found: u8) -> FormatError {
+    FormatError::UnsupportedFormatVersion {
+        format,
+        found,
+        max_supported: VERSION,
+    }
 }
 
 // ---- primitive writers -----------------------------------------------------
@@ -924,12 +946,20 @@ fn put_raft(out: &mut Vec<u8>, m: &RaftMsg<KvCommand>) {
             success,
             match_index,
             needs_snapshot,
+            check_pending,
         } => {
             put_u8(out, 5);
             put_u64(out, *term);
             put_bool(out, *success);
             put_u64(out, *match_index);
-            put_bool(out, *needs_snapshot);
+            // Issue #1131: the trailing byte is a flag set — bit 0
+            // `needs_snapshot` (the original `bool`, so a v1 frame's `0`/`1`
+            // decodes unchanged and a frame with `check_pending == false`
+            // encodes byte-identically to v1), bit 1 `check_pending`.
+            put_u8(
+                out,
+                u8::from(*needs_snapshot) | (u8::from(*check_pending) << 1),
+            );
         }
         RaftMsg::InstallSnapshot {
             term,
@@ -1076,12 +1106,22 @@ fn read_raft(c: &mut Cursor<'_>) -> Result<RaftMsg<KvCommand>, DecodeError> {
                 leader_commit: c.u64()?,
             }
         }
-        5 => RaftMsg::AppendEntriesResp {
-            term: c.u64()?,
-            success: c.bool()?,
-            match_index: c.u64()?,
-            needs_snapshot: c.bool()?,
-        },
+        5 => {
+            let term = c.u64()?;
+            let success = c.bool()?;
+            let match_index = c.u64()?;
+            let flags = c.u8()?;
+            if flags > 0b11 {
+                return Err(format!("invalid AppendEntriesResp flags byte {flags}"));
+            }
+            RaftMsg::AppendEntriesResp {
+                term,
+                success,
+                match_index,
+                needs_snapshot: flags & 1 != 0,
+                check_pending: flags & 2 != 0,
+            }
+        }
         6 => RaftMsg::InstallSnapshot {
             term: c.u64()?,
             leader: c.node_id()?,
@@ -1165,7 +1205,16 @@ pub(crate) fn encode_wire(w: &KvWire) -> Vec<u8> {
 /// Decode a binary frame into a [`KvWire`] message. Errors are descriptive and
 /// the caller logs them loudly before dropping the message.
 pub(crate) fn decode_wire(bytes: &[u8]) -> Result<KvWire, FormatError> {
-    let c = check_header(bytes, WIRE_NAME)?;
+    let (version, c) = check_header(bytes, WIRE_NAME)?;
+    match version {
+        1 => decode_wire_v1(c),
+        found => Err(unsupported(WIRE_NAME, found)),
+    }
+}
+
+/// The version-1 (current) `raftkv-wire` body decoder. When v2 lands this
+/// moves, frozen, into [`legacy`].
+fn decode_wire_v1(c: Cursor<'_>) -> Result<KvWire, FormatError> {
     decode_wire_body(c).map_err(|detail| FormatError::Malformed {
         format: WIRE_NAME,
         detail,
@@ -1234,7 +1283,16 @@ pub(crate) fn encode_image(entries: &[ImageEntry], max_ts: Option<HlcTimestamp>)
 pub(crate) fn decode_image(
     bytes: &[u8],
 ) -> Result<(Option<HlcTimestamp>, Vec<ImageEntry>), FormatError> {
-    let c = check_header(bytes, IMAGE_NAME)?;
+    let (version, c) = check_header(bytes, IMAGE_NAME)?;
+    match version {
+        1 => decode_image_v1(c),
+        found => Err(unsupported(IMAGE_NAME, found)),
+    }
+}
+
+/// The version-1 (current) `raftkv-image` body decoder. When v2 lands this
+/// moves, frozen, into [`legacy`].
+fn decode_image_v1(c: Cursor<'_>) -> Result<(Option<HlcTimestamp>, Vec<ImageEntry>), FormatError> {
     decode_image_body(c).map_err(|detail| FormatError::Malformed {
         format: IMAGE_NAME,
         detail,
@@ -1684,6 +1742,7 @@ pub(crate) mod tests {
                 success: true,
                 match_index: 23,
                 needs_snapshot: true,
+                check_pending: false,
             },
             RaftMsg::InstallSnapshot {
                 term: 7,

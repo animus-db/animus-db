@@ -125,8 +125,27 @@ pub fn decode_layout_value(bytes: &[u8]) -> Result<u8, FormatError> {
             max_supported: LAYOUT_EPOCH,
         });
     }
-    Ok(epoch)
+    // The marker has no body beyond the epoch, so dispatch is just "is this
+    // epoch one we know"; a future epoch with a body routes to its decoder
+    // here, older epochs into [`legacy`].
+    match epoch {
+        1 => Ok(epoch),
+        found => Err(FormatError::UnsupportedFormatVersion {
+            format: LAYOUT_FORMAT,
+            found,
+            max_supported: LAYOUT_EPOCH,
+        }),
+    }
 }
+
+/// Retired format versions (ADR 0073 "The decoder pattern", point 4). Each
+/// retired version `N` gets a submodule `legacy::vN` holding its frozen
+/// decoder, the frozen shape type that decoder produces (`VNFoo`), and the
+/// `From<VNFoo>` translation into the current in-memory type; the version
+/// `match` in the public decoder routes to it. Kept forever, edited only by
+/// mechanical compile fixes. Empty today: every version of this codec is
+/// still v1, i.e. current.
+mod legacy {}
 
 /// Why [`check_or_stamp`] / [`verify`] did not return `Ok`.
 #[derive(Debug)]
@@ -153,7 +172,9 @@ impl std::fmt::Display for LayoutError {
 async fn read_marker<S: StorageEngine>(engine: &S, tablet: u64) -> Result<bool, LayoutError> {
     match engine.get(&layout_marker_key(tablet)).await {
         Ok(Some(v)) => decode_layout_value(&v.value)
-            .map(|_| true)
+            // Every supported epoch means "marker present and usable"; an
+            // epoch-specific check would dispatch on the returned epoch here.
+            .map(|_supported_epoch| true)
             .map_err(LayoutError::Refused),
         Ok(None) => Ok(false),
         Err(e) => Err(LayoutError::Storage(e.to_string())),

@@ -325,6 +325,33 @@ pub const CONTENT_SCHEMA_VERSION: u32 = 1;
 /// fixture directory (`tests/fixtures/formats/animuscluster-spec/`).
 pub const SPEC_FORMAT: &str = "animuscluster-spec";
 
+/// Version-dispatching decode of a full `AnimusCluster` CR document (ADR 0073
+/// Phase 1 design). Reads `spec.schemaVersion` first and dispatches on it, so
+/// a future v2 edits only the current arm and a frozen `legacy::v1` decoder
+/// (plus `From<legacy::v1::AnimusClusterSpec>`) takes the `1` arm; an unknown
+/// or absent version is a named error, never a silent misread. Today only v1
+/// exists, so the `1` arm decodes the current type.
+///
+/// # Errors
+/// A malformed document, a missing/non-integer `spec.schemaVersion`, or a
+/// version this operator does not know.
+pub fn decode_cluster(value: serde_json::Value) -> Result<AnimusCluster, String> {
+    let version = value
+        .get("spec")
+        .and_then(|s| s.get("schemaVersion"))
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("{SPEC_FORMAT}: spec.schemaVersion missing or not an integer"))?;
+    match version {
+        // When v2 lands: `1 => legacy::v1::decode(value).map(Into::into)`, and
+        // the current-type arm becomes `2`.
+        1 => serde_json::from_value(value).map_err(|e| format!("{SPEC_FORMAT} v1: {e}")),
+        found => Err(format!(
+            "{SPEC_FORMAT} schemaVersion {found} unsupported (this operator supports up to \
+             {CONTENT_SCHEMA_VERSION})"
+        )),
+    }
+}
+
 /// `AnimusCluster.spec` — the desired state of one AnimusDB cluster.
 #[derive(CustomResource, Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[kube(

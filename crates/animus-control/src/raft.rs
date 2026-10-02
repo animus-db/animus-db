@@ -495,6 +495,18 @@ pub enum RaftMsg<C = MetaCommand> {
         /// sets `state_machine_behind` at all.
         #[serde(default)]
         needs_snapshot: bool,
+        /// **Issue #1131.** `true` while the responder cannot vote yet because
+        /// of its issue #667 boot-time cluster check: still unresolved
+        /// ([`RaftCore::cluster_check_pending`]) or resolved to refused
+        /// ([`RaftCore::refused_as_voter`]). Either way it refuses every vote
+        /// and never campaigns (it cannot act as a voter). The
+        /// leader records it per peer and refuses to promote a learner
+        /// reporting `true` ([`RaftCore::learner_caught_up`]): promoting a
+        /// voter that cannot vote can leave the group without a quorum of
+        /// voters able to vote. `#[serde(default)]` so a peer that omits it
+        /// decodes to `false` (no pending check, the pre-existing behavior).
+        #[serde(default)]
+        check_pending: bool,
     },
     /// One **offset-addressed chunk** of the leader's state-machine snapshot,
     /// shipped to a follower whose log has fallen behind the leader's compacted
@@ -989,6 +1001,13 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // harmlessly stale-but-safe if a peer id is reused (worst case: one
     // needless resend cycle, not a correctness issue).
     snapshot_served_through: BTreeMap<NodeId, u64>,
+    // Leader-only, volatile (issue #1131): each peer's own latest-reported
+    // `cluster_check_pending` (echoed on its `AppendEntriesResp`). ABSENT
+    // means "has not reported to this leader yet" and is treated as pending
+    // by `learner_caught_up` — conservative, since it only delays a
+    // promotion. Cleared on `become_leader` and on any membership change that
+    // (re)introduces or drops the peer, exactly like `match_index`.
+    peer_check_pending: BTreeMap<NodeId, bool>,
     // Leader-only, volatile liveness bookkeeping (ADR 0037 hardening PR2): the
     // `now` at which this leader last heard an `AppendEntriesResp` (success OR
     // reject — either proves the peer is up and reachable) from each peer.
@@ -1552,6 +1571,7 @@ where
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
             snapshot_served_through: BTreeMap::new(),
+            peer_check_pending: BTreeMap::new(),
             last_contact: BTreeMap::new(),
             leader_since: None,
             heard_from: BTreeSet::new(),
@@ -2376,10 +2396,35 @@ where
     /// anyway — a peer "caught up to `last_log_index`" could still be
     /// stale by the time its own promotion entry is itself appended.
     /// Regression: `tests/directed_placing_under_sustained_load.rs`.
+    ///
+    /// **Issue #1131 — also `false` while the learner's own issue #667
+    /// boot-time cluster check is unresolved** (or it has not yet reported
+    /// one to this leader; see [`RaftMsg::AppendEntriesResp`]'s
+    /// `check_pending`). A node with a pending check refuses every vote and
+    /// never campaigns, so promoting it adds a voter to the quorum
+    /// denominator that cannot vote; with one other voter dead the group
+    /// can then never elect (a permanent leaderless livelock). Gating the
+    /// promotion only ever *delays* it — the learner resolves its check via
+    /// any live peer that does not list it as a voter (it is still a
+    /// learner, so no voter does), after which the next reconcile pass
+    /// promotes it — so it cannot weaken the #667 wiped-voter safety
+    /// property, which concerns what a node may do once it IS a voter.
+    /// This predicate is the single gate for every production promotion
+    /// path (`reconfigure_step` step 2; the control plane has no automatic
+    /// promoter).
     #[must_use]
     pub fn learner_caught_up(&self, id: &NodeId, threshold: u64) -> bool {
         self.learners.contains(id)
+            && self.peer_check_pending.get(id) == Some(&false)
             && self.commit_index().saturating_sub(self.peer_match(id)) <= threshold
+    }
+
+    /// Leader-side: the last `cluster_check_pending` `id` reported on an
+    /// `AppendEntriesResp` (issue #1131), `None` if it has not reported
+    /// since this leader's stint (or membership entry for it) began.
+    #[must_use]
+    pub fn peer_check_pending(&self, id: &NodeId) -> Option<bool> {
+        self.peer_check_pending.get(id).copied()
     }
 
     /// Adopt `voters`/`learners` as the active config and keep
@@ -3187,7 +3232,16 @@ where
                 success,
                 match_index,
                 needs_snapshot,
-            } => self.handle_append_resp(from, term, success, match_index, needs_snapshot, now),
+                check_pending,
+            } => self.handle_append_resp(
+                from,
+                term,
+                success,
+                match_index,
+                needs_snapshot,
+                check_pending,
+                now,
+            ),
             RaftMsg::InstallSnapshot {
                 term,
                 leader,
@@ -3635,6 +3689,16 @@ where
         self.cluster_check_refused
     }
 
+    /// Issue #1131: `true` while this node would refuse every vote and never
+    /// campaign because of the #667 boot-time check — the check is still
+    /// pending, or it resolved to REFUSED (a wiped voter). This is what a
+    /// node reports to its leader as `AppendEntriesResp::check_pending`, so a
+    /// leader never promotes a learner that could not vote once promoted.
+    #[must_use]
+    fn cannot_vote_yet(&self) -> bool {
+        self.cluster_check_pending.is_some() || self.cluster_check_refused
+    }
+
     /// Label this core's group for diagnostics (see the `group_label`
     /// field). Log-only; never affects protocol behavior.
     pub fn set_group_label(&mut self, label: impl Into<String>) {
@@ -3997,6 +4061,7 @@ where
                     success: false,
                     match_index: 0,
                     needs_snapshot: self.state_machine_behind,
+                    check_pending: self.cannot_vote_yet(),
                 },
             )];
         }
@@ -4024,6 +4089,7 @@ where
                     success: true,
                     match_index: self.snapshot_index,
                     needs_snapshot: self.state_machine_behind,
+                    check_pending: self.cannot_vote_yet(),
                 },
             )];
         }
@@ -4040,6 +4106,7 @@ where
                     success: false,
                     match_index: 0,
                     needs_snapshot: self.state_machine_behind,
+                    check_pending: self.cannot_vote_yet(),
                 },
             )];
         }
@@ -4073,10 +4140,12 @@ where
                 success: true,
                 match_index,
                 needs_snapshot: self.state_machine_behind,
+                check_pending: self.cannot_vote_yet(),
             },
         )]
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_append_resp(
         &mut self,
         from: NodeId,
@@ -4084,11 +4153,16 @@ where
         success: bool,
         match_index: u64,
         needs_snapshot: bool,
+        check_pending: bool,
         now: Nanos,
     ) -> Vec<Out<C>> {
         if self.role != Role::Leader || term != self.current_term {
             return Vec::new();
         }
+        // Issue #1131: latest report wins (a reordered older ack can only
+        // make a resolved check look pending again, which only delays a
+        // promotion).
+        self.peer_check_pending.insert(from.clone(), check_pending);
         // Either outcome — success or reject — proves `from` is up and
         // reachable right now, which is exactly the liveness signal
         // `peer_last_contact`/`control_peer_believed_alive` need. Stamped once
@@ -5041,6 +5115,7 @@ where
         self.quiesced = false;
         self.last_activity = now;
         let last = self.last_log_index();
+        self.peer_check_pending.clear();
         // ADR 0058 Train 1: seed a learner's `next_index`/`match_index`/
         // `last_contact` the identical way a voter's is seeded — a learner is
         // replicated to and tracked exactly like a follower, just never
@@ -5403,6 +5478,7 @@ where
             self.next_index.insert(n.clone(), entry_index);
             self.match_index.insert(n.clone(), 0);
             self.snapshot_served_through.remove(n);
+            self.peer_check_pending.remove(n);
             self.forget_snapshot_transfer(n);
         }
         for n in old_members.difference(&now_members) {
@@ -5413,6 +5489,7 @@ where
             self.match_index.remove(n);
             self.last_contact.remove(n);
             self.snapshot_served_through.remove(n);
+            self.peer_check_pending.remove(n);
             self.forget_snapshot_transfer(n);
         }
     }
@@ -5435,6 +5512,7 @@ where
         self.match_index.remove(peer);
         self.last_contact.remove(peer);
         self.snapshot_served_through.remove(peer);
+        self.peer_check_pending.remove(peer);
         self.forget_snapshot_transfer(peer);
     }
 
