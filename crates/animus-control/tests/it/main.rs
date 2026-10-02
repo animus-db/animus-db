@@ -46,6 +46,7 @@ mod restart;
 mod restart_seed_before_election;
 mod schema_catalog;
 mod schema_indexes;
+mod shared_wal_midfile_corruption;
 mod slow_disk_no_livelock;
 mod snapshot_compaction_race;
 mod snapshot_heartbeat_no_disruption_during_backoff;

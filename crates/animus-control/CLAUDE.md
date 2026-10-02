@@ -253,9 +253,10 @@ per-tablet CP data plane (`animus-cp-data`).
   sync marker proves otherwise (issue #1132, `CWL1`/`SWL1` v2).** Until v2,
   `decode`/`decode_tagged` stopped at the first bad record anywhere and
   silently dropped it plus everything after, so rot in an early line lost
-  acked history. v2 writers append a `!sync:<N>` marker line after every
-  successful `fsync` (`persist::append_sync_marker`; `N` = file length = the
-  marker's own offset), and `format::decode_lines_extent` returns
+  acked history. v2 writers **piggyback** a `!sync:<N>` marker line
+  on the round after every successful `fsync` (`persist::SyncMarkerState`; `N` =
+  live file length = the marker's own offset; see the piggyback note at the
+  end of this file), and `format::decode_lines_extent` returns
   `FormatError::MidFileCorruption {offset, durable_to}` for a bad line that
   starts before the greatest valid marker (it keeps scanning past the first
   bad line for markers, so a rotted first line cannot hide the proof). A bad
@@ -269,21 +270,21 @@ per-tablet CP data plane (`animus-cp-data`).
   **Writers repair on open**: `PersistedState::recover` (control + per-group
   WAL) and `SharedWal::open` cut a torn tail back with `Disk::replace` before
   any append; without it the next appends sit after garbage and the next
-  recovery refuses the file. The marker is written after the sync, after acks
-  are released, under the same lock as the appends (so its offset is exact),
-  and is best-effort. Tests: `tests/it/wal_midfile_corruption.rs`. Residual: the
+  recovery refuses the file. The marker is prepended to the NEXT round's single
+  append under the same lock (so its offset is exact), never its own append. Tests: `tests/it/wal_midfile_corruption.rs`. Residual: the
   latest round has no durable marker until the next sync; a disk that lied
   about `fsync` can now fail loudly. Corruption of a CRC-valid line's
   *payload* was always loud (`Malformed`). No back-compat for a pre-checksum
   WAL file (pre-baseline). **`SWL1` (the `SharedWal` file) is v2 too**:
-  `SharedWal::flush` appends the marker after each successful `Append`-batch
-  sync (typed/tagged API only; the raw untyped `append` the fsync bench uses is
-  untouched), `SharedWal::open` repairs a torn tail via
+  `SharedWal::flush` prepends the pending marker to the next tagged
+  `Append`-batch's single append and sets the pending flag after that batch's
+  sync (typed/tagged API only; the raw untyped `append` the fsync bench uses
+  neither takes nor sets one; a failed append/sync and a `Compact` clear it), `SharedWal::open` repairs a torn tail via
   `decode_tagged_with_extent` + `repair_tail` and maps `MidFileCorruption` to
   `InvalidData` naming the offset. A `Compact` (`Disk::replace`) writes no
   marker (its file is rebuilt from records; markers never survive a rewrite,
   which is what keeps every marker's offset exact). Tests:
-  `tests/shared_wal_midfile_corruption.rs`.
+  `tests/it/shared_wal_midfile_corruption.rs`.
 
 - **`detector.rs`** — `FailureDetector` (ADR 0012): a pure, unit-tested
   interval+timeout liveness detector. No clock, no RNG.

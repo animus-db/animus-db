@@ -480,8 +480,8 @@ where
     ///   first such line and returns everything before it as `Ok` — never
     ///   applied, never a panic — **provided no later valid sync marker
     ///   proves the bad line was already durable**. A version-2 writer
-    ///   appends a `!sync:<offset>` marker after every successful `fsync`
-    ///   ([`append_sync_marker`]); a bad line that starts before the
+    ///   records every successful `fsync` and prepends a `!sync:<offset>` marker
+    ///   (piggybacked on the next round's append, see [`SyncMarkerState`]); a bad line that starts before the
     ///   greatest valid marker is [`FormatError::MidFileCorruption`], never
     ///   a silent truncation (issue #1132: the old "stop at the first bad
     ///   line, anywhere" rule silently dropped acked term/vote/log history

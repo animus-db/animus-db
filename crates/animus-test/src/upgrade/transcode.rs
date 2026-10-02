@@ -228,6 +228,19 @@ fn control_wal_transcode(
     line_wal_transcode(&animus_control::persist::CONTROL_WAL, entry, bytes, target)
 }
 
+fn shared_wal_transcode(
+    entry: &FormatEntry,
+    bytes: &[u8],
+    target: u32,
+) -> Result<Vec<u8>, TranscodeError> {
+    line_wal_transcode(
+        &animus_control::persist::SHARED_WAL_TAG,
+        entry,
+        bytes,
+        target,
+    )
+}
+
 const V1_ONLY: &[VersionSpec] = &[VersionSpec {
     version: 1,
     capabilities: CapabilityMask::ALL,
@@ -278,7 +291,7 @@ pub static TABLE: &[FormatEntry] = &[
         name: "shared-wal",
         current_version: 2,
         versions: V1_V2,
-        transcode: identity_current_only,
+        transcode: shared_wal_transcode,
     },
     // The `ADE1` encryption envelope wraps whole files of an `EncryptedEnv`
     // disk; transcoding the files *inside* it needs the key, so a real

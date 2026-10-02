@@ -780,6 +780,31 @@ fn control_wal_v2_transcodes_to_a_v1_file_with_the_same_records() {
     // records are what must match.)
 }
 
+/// `SWL1` mirror of the CWL1 v2 -> v1 transcode check.
+#[test]
+fn shared_wal_v2_transcodes_to_a_v1_file_with_the_same_records() {
+    let entry = transcode::TABLE
+        .iter()
+        .find(|e| e.name == "shared-wal")
+        .expect("shared-wal entry");
+    let v2 = fixtures("shared-wal")[&2].clone();
+    let v1 = entry.transcode_to(&v2, 1).expect("v2 -> v1");
+    assert!(
+        !v1.windows(6).any(|w| w == b"!sync:"),
+        "v1 has no marker lines"
+    );
+    assert!(
+        v1.split(|&b| b == b'\n')
+            .filter(|l| !l.is_empty())
+            .all(|l| &l[9..13] == b"SWL1" && &l[13..15] == b"01"),
+        "every line re-framed under the v1 tag"
+    );
+    assert_eq!(
+        PersistedState::<MetaCommand, Metadata>::decode_tagged(&v1).expect("v1 decodes"),
+        PersistedState::<MetaCommand, Metadata>::decode_tagged(&v2).expect("v2 decodes"),
+    );
+}
+
 /// `CWL1` lines are CRC-framed, so zeroing the version *in place* breaks the
 /// CRC and reads as a torn line (tolerated: content check fails). A forged
 /// line with a valid CRC but a future version is the named-error shape.

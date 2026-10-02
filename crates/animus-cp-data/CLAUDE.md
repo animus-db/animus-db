@@ -114,8 +114,8 @@ amendment — the shape predates and outlives it.)
   everything physically after it in the file — never decoded into a value,
   never a panic, **unless a later v2 sync marker proves the line was already
   durable, in which case it is the loud `FormatError::MidFileCorruption`**
-  (issue #1132, `CWL1` v2: the per-group WAL's own writer appends the marker
-  after each sync, `PersistedState::recover` repairs a torn tail on open —
+  (issue #1132, `CWL1` v2: the per-group WAL's own writer piggybacks the marker
+  on the next round's append, `PersistedState::recover` repairs a torn tail on open —
   see `animus-control/CLAUDE.md`'s persist.rs entry). This was the WAL-side sibling of this same crate's own
   `codec.rs` wire decoder's separately-known untrusted-length-prefix
   allocator-abort gap (`Vec::with_capacity(n as usize)` on an unvalidated

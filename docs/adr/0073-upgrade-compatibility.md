@@ -1515,7 +1515,7 @@ boundary.
   pre-sync marker could survive a kept-prefix tear next to a flipped byte in
   the same un-synced round). Record payloads are unchanged. Harness: the
   `control-wal` transcode reframes v2 to v1 through `format::reframe_to_v1`
-  (`legacy-encoders`-gated), and the `raftkv-wal` EMBEDDED row is at v2.
+  (`legacy-encoders`-gated), and the `shared-wal` transcode does the same for `SWL1`, and the `raftkv-wal` EMBEDDED row is at v2.
 - **Decoder** (`format::decode_lines_extent`, documented there): a bad line
   that starts before the greatest valid marker is
   `FormatError::MidFileCorruption { offset, durable_to }`; at or after it, a
