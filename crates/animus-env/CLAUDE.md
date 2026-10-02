@@ -577,13 +577,15 @@ the production implementation; the deterministic implementation lives in
   the end-to-end proof.
 - **Metrics are additive and determinism-safe (ADR 0015).** `Env::metrics()` has
   a **default** returning a shared no-op `MetricsHandle`, so the supertrait is
-  unchanged and every `E: Env` impl (`SimEnv` included) compiles untouched.
+  unchanged and every `E: Env` impl compiles untouched.
   Recording is a relaxed atomic add — no wall clock (a timestamped metric takes
   `Clock::now`), no I/O, no `HashMap` (a snapshot uses `BTreeMap`). `ProdEnv`
-  overrides `metrics()` with a recording sink; a sim test that wants to *read*
-  counters threads a recording handle into the component (e.g.
-  `RaftNode::start_with_metrics`) rather than relying on the no-op default — so
-  no change to `animus-sim` is needed to observe metrics. The storage engine
+  overrides `metrics()` with a recording sink, and (2026-10-02) so does
+  `SimEnv`: one recording sink per (Simulator, node), created lazily, so a sim
+  test can read `env.metrics()` deltas in isolation. Never assert on the
+  process-wide no-op default (concurrent tests in one binary share it). A
+  component can still be handed an explicit handle (e.g.
+  `RaftNode::start_with_metrics`). The storage engine
   follows the same pattern: `LsmEngine::open`/`open_with` forward
   `env.metrics()`, and the additive `LsmEngine::open_with_metrics` threads a
   recording handle in for a sim test. (The deleted AP data plane's

@@ -2397,7 +2397,7 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// Observability sink (ADR 0015). The public propose API records the real
     /// accept/reject outcome into it, and the consensus loop + apply task each hold
     /// a clone for the commit/apply/read-barrier/snapshot recording sites. Cheap to
-    /// clone; defaults to `env.metrics()` (a no-op under `SimEnv`, a real sink under
+    /// clone; defaults to `env.metrics()` (a per-node recording sink under `SimEnv`, a real sink under
     /// `ProdEnv`) — see [`start_with_metrics`](Self::start_with_metrics) to observe
     /// it under simulation.
     metrics: MetricsHandle,

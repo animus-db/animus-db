@@ -254,7 +254,7 @@ impl<E: Env> HeartbeatBatcher<E> {
     /// [`EnvExt::spawn_task`] — never once per hosted group. `metrics` is
     /// the sink [`Metric::CpHeartbeatFramesSent`]/[`Metric::
     /// CpHeartbeatDemuxDropped`] record into; production callers pass
-    /// `env.metrics()` (a no-op under `SimEnv`, a real sink under
+    /// `env.metrics()` (a per-node recording sink under `SimEnv`, a real sink under
     /// `ProdEnv`), mirroring [`RaftKvNode::start`](crate::RaftKvNode::start)'s
     /// own default — a sim test that wants to observe these counters
     /// passes a recording handle instead, the same

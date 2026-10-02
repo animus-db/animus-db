@@ -877,12 +877,14 @@ pub trait Env: Clock + Rng + Network + Disk + Spawner + Clone + Send + Sync + 's
 
     /// The metrics sink for this env (ADR 0015). Additive with a default: an env
     /// that does not record metrics returns the shared no-op handle
-    /// ([`MetricsHandle::noop`]), so every existing `E: Env` implementation —
-    /// `SimEnv` included — keeps compiling and behaving identically without
-    /// change. `ProdEnv` overrides this to return its own recording handle; a
-    /// component that wants to record into a test-readable sink under simulation
-    /// is handed a recording [`MetricsHandle`] directly rather than relying on
-    /// this default. Returning a handle (not `Option`) means recording sites need
+    /// ([`MetricsHandle::noop`]), so every existing `E: Env` implementation
+    /// keeps compiling and behaving identically without change. `ProdEnv`
+    /// overrides this to return its own recording handle, and `SimEnv`
+    /// overrides it with a recording sink scoped to its (simulator, node) —
+    /// so a sim test can read `env.metrics()` deltas in isolation. Any other
+    /// env that keeps the default shares one process-wide sink, which is
+    /// write-only by contract: never assert on it, since concurrent tests in
+    /// one binary all record into it. Returning a handle (not `Option`) means recording sites need
     /// no `if let Some(..)` guard.
     fn metrics(&self) -> MetricsHandle {
         MetricsHandle::noop()

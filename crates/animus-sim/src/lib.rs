@@ -46,8 +46,8 @@ use std::time::Duration;
 
 use animus_env::handshake::{self, Preamble, ProtocolSpec};
 use animus_env::{
-    BoxFuture, Clock, Disk, Env, Envelope, InboxCap, Nanos, Network, NodeId, PRIMARY_STREAM,
-    Rng as RngTrait, Spawner, UnixMillis,
+    BoxFuture, Clock, Disk, Env, Envelope, InboxCap, MetricsHandle, Nanos, Network, NodeId,
+    PRIMARY_STREAM, Rng as RngTrait, Spawner, UnixMillis,
 };
 use futures::task::ArcWake;
 use rand::{RngCore, SeedableRng};
@@ -545,6 +545,11 @@ struct SimState {
     // before that instant either (see `send_stream`'s deliver_at clamp). See
     // `Simulator::pause`.
     paused_until: BTreeMap<NodeId, u64>,
+    // Per-node recording metrics sink handed out by `SimEnv::metrics()`,
+    // created lazily on first access. Scoped to THIS simulator's state, so
+    // two simulators (or two nodes) never share a sink — mirrors `ProdEnv`'s
+    // one-sink-per-node-process. Never read by any sim decision.
+    metrics: BTreeMap<NodeId, MetricsHandle>,
     // Which node owns each pending sleep timer, so a firing `Event::Timer`
     // can check whether its owner is currently paused. Populated the first
     // time a `Sleep` future is polled (mirrors `task_owner`'s "record at
@@ -1024,6 +1029,7 @@ impl Simulator {
             clock_skew: BTreeMap::new(),
             clock_drift: BTreeMap::new(),
             paused_until: BTreeMap::new(),
+            metrics: BTreeMap::new(),
             timer_owner: BTreeMap::new(),
             timer_key: BTreeMap::new(),
             next_task_id: 0,
@@ -1176,11 +1182,9 @@ impl Simulator {
     /// Each refused message stands in for one refused connection in
     /// `ProdEnv` (`SimEnv` has no real connections — ADR 0003), so this is
     /// the message-granular analogue of `ProdEnv`'s
-    /// `Metric::NetworkHandshakeRefused` counter; `SimEnv` does not itself
-    /// carry a `MetricsHandle` (`Env::metrics()` defaults to a no-op for it,
-    /// and nothing in this crate threads a recording one in), so this
-    /// accessor — not a metrics snapshot — is how a sim test observes the
-    /// refusal count.
+    /// `Metric::NetworkHandshakeRefused` counter; nothing in this crate
+    /// records that metric into `SimEnv::metrics()`, so this accessor is how
+    /// a sim test observes the refusal count.
     #[must_use]
     pub fn protocol_refusals(&self, node: &NodeId) -> u64 {
         self.shared
@@ -2363,6 +2367,19 @@ impl Spawner for SimEnv {
 impl Env for SimEnv {
     fn node_id(&self) -> NodeId {
         self.node_id.clone()
+    }
+
+    /// A recording sink scoped to this `(Simulator, node)` — every handle of
+    /// this node in this simulator returns clones of the same sink; other
+    /// nodes and other simulators get independent ones. (The trait default is
+    /// a process-wide no-op sink that would couple concurrent tests.)
+    fn metrics(&self) -> MetricsHandle {
+        self.shared
+            .lock()
+            .metrics
+            .entry(self.node_id.clone())
+            .or_insert_with(MetricsHandle::recording)
+            .clone()
     }
 }
 
