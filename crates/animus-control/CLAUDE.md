@@ -2890,3 +2890,18 @@ empty; the wiped-voter guard then refused it permanently. `learner_caught_up`
 must therefore only ever be true from an ack received since the (re)add.
 Tests: `tests/learner_membership.rs` `*_starts_with_fresh_progress`,
 `animus-cp-data/tests/release_race_corpus.rs` stale-progress cells.
+
+## `wal_lock` is a FIFO-fair `FairMutex` (apply-task starvation fix)
+
+`node.rs`'s `wal_lock` (serializes the consensus loop's `persist_wal` append/fsync
+against the apply task's compaction rewrite of the same WAL file) is
+`fair_lock::FairMutex`, not `futures::lock::Mutex`. The unfair mutex let `drive`'s
+back-to-back persist rounds barge ahead of the apply task's compaction wait
+indefinitely under continuous proposals on a slow disk, freezing
+`engine_applied_index` while core `last_applied == commit` hid it (ADR 0038
+amendment 2026-09-30). Do not swap it back; any new `wal_lock` user must also be
+cancel-safe-fair (it is). Liveness tests for the apply path assert on
+`engine_applied_index()`, never core `last_applied` (`tests/apply_not_starved_by_wal_lock.rs`).
+Known follow-up, deliberately not fixed here: the failure detector re-proposes
+`status: Down` for members a stale cache still shows Active, feeding more WAL
+rounds while the apply task is behind.
