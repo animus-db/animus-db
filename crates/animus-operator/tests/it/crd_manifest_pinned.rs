@@ -14,7 +14,7 @@
 
 use kube::CustomResourceExt;
 
-const COMMITTED: &str = include_str!("../../../deploy/operator/crd.yaml");
+const COMMITTED: &str = include_str!("../../../../deploy/operator/crd.yaml");
 
 #[test]
 fn committed_crd_manifest_matches_the_generated_one() {
