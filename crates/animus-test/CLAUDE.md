@@ -190,6 +190,59 @@ Env knobs at a glance (details in the sections below):
   author decides what's safe to reduce without changing which failure is
   being modeled).
 
+## Upgrade-restart corpus (ADR 0073 P1-D, tier 1)
+
+`tests/upgrade_restart_corpus.rs` (tier 0 is `upgrade_restart_tier0.rs`, fixture-seeded
+restarts). A live workload runs at the current format versions on `SimEnv` disks, the
+node(s) stop, each stopped disk goes through `animus_test::upgrade::transcode` (the
+**identity** while every format is v1), fresh nodes restart on current code, and the
+workload continues. One `Recorder` spans both phases.
+
+- **Cell matrix (21 cells, 11 tests).** kind {`Data`: 3-replica `RaftKvNode` over
+  `LsmEngine`; `Control`: 3-node `animus_control::RaftNode` over `LsmEngine` (CWL1 +
+  LSM); `SharedWal`: one node, four tablets on one SWL1, whole-node only} x scope
+  {`Leader`, `Follower`, `WholeGroup`} x stop {`Clean`, `Crash`, `TornTail`} x `back` in
+  `transcode::supported_back()` (only `0` today, so the matrix grows with the table).
+  `TornTail` arms `torn_tail_on_crash` + `corrupt_on_crash` together (issue #495's
+  combination); do not narrow it, a failure there is a real finding. Fault timing
+  (transcode-window crash, mixed-version fraction, crash jitter, partition window) is
+  drawn from `splitmix64(cell seed, tag)`, never the simulator RNG.
+- **Oracle.** `check_cycles` over the combined history; a post-restart probe that every
+  phase-1 ack survived *before* any phase-2 write can mask a loss by rewriting a list;
+  `check_durability` per replica; `check_convergence` after a converged-or-timeout poll;
+  non-vacuity (acks in both phases).
+- **Strict open.** Engines are opened with `.expect`, deliberately NOT the raftkv corpus's
+  destroy-and-reopen fallback, which would mask a bad transcode or a recovery bug as a
+  clean wipe (see the lesson on strict-open harnesses).
+- **Watchdog.** Each cell runs on its own OS thread under a 300s wall-clock
+  `CELL_WATCHDOG` and a hang panics naming the cell and seed. The in-sim budgets are
+  *virtual* time; a livelock that never advances virtual time (the `wal_lock` starvation
+  of the ADR 0038 apply task this harness found, #1133) can never hit them, so only an OS
+  bound turns it into a failure. It is diagnostic only, never a verdict-deciding timeout;
+  a healthy cell takes seconds.
+- **Control apply-frontier.** For `Control`, liveness after restart is judged on
+  `engine_applied_index()` reaching `commit_index()` (and non-zero), NOT core
+  `last_applied`, which only means "handed to the apply task" (ADR 0038). See the
+  matching lesson.
+- **Negative controls** (fixed seed, `WholeGroup`, `Clean`; the identity run of the same
+  cells must pass):
+  (a) drop the final record of every WAL: `Data` must report `post-restart probe: lost
+  acknowledged append` and open cleanly; `Control` and `SharedWal` are asserted *benign*,
+  by design: the control plane mirrors every applied entry into its LSM engine (ADR 0038)
+  and keeps the whole uncompacted `raft.wal` (two independent copies), and `SharedWal`'s
+  per-tablet engines hold what the SWL1 tail lost once flushed.
+  (b) halve the consensus log and wipe the engine: every kind must report a lost
+  acknowledged append (this is the corruption that gives `Control` teeth).
+  (c) `SharedWal` engines wiped: lost acknowledged append (SWL1 is GC'd past flushed
+  tablets, so the engines are the only holder of older history).
+  (d) wipe everything: lost acknowledged append, every kind.
+  (e) truncate the largest SSTable: must fail at the strict open (`strict open of the`),
+  every kind.
+- **Replay.** Failures print `cell=<name> seed=<seed>`. Replay with
+  `ANIMUS_SEED=<seed> ANIMUS_UPGRADE_RESTART_CELL=<cell name substring> cargo test -p
+  animus-test --test upgrade_restart_corpus -- --nocapture`. Depth: `ANIMUS_UPGRADE_RESTART_SEEDS=K`
+  (K=50 is ~55s in debug; nightly runs 100 via `corpus-deep.yml`).
+
 ## Tests
 
 `cargo test -p animus-test` — `cycle_checker.rs` (hand-built histories) + the

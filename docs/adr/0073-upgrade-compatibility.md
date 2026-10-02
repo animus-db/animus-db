@@ -1338,6 +1338,26 @@ Wave 2: P1-D tier 0/1 (starts once one of A/B/C has landed its
 `legacy-encoders` convention, or earlier against this ADR's text). Wave 3:
 P1-D tier 2. Phase 1 is done when all four have merged.
 
+**P1-D as-built, tiers 0 and 1 (2026-09-30; tier 2 pending; every format still
+v1).** Tier 0 (#1130) seeds disks from the checked-in fixtures and restarts
+the real readers; tier 1 is `animus-test/tests/upgrade_restart_corpus.rs`
+(21 cells: Data / Control / SharedWal x leader / follower / whole-group x
+clean / crash / torn-tail, strict engine opens, list-append oracle with a
+post-restart probe, a 300s wall-clock watchdog, and for Control a check on the
+driver-applied `engine_applied_index`; knobs `ANIMUS_UPGRADE_RESTART_SEEDS`,
+`ANIMUS_UPGRADE_RESTART_CELL`; wired into `corpus-deep.yml` at K=100). The
+transcode step is the **identity** today. **Negative controls** prove it has
+teeth: dropping the final WAL record is caught for `Data` (and benign for
+`Control`/`SharedWal`, which hold redundant copies); halving the log and
+wiping the engine, wiping the `SharedWal` engines, and wiping everything are
+each caught as lost acknowledged appends; a truncated SSTable fails the strict
+open. **Three real bugs the harness found:** (1) CWL1/SWL1 treated a CRC
+failure anywhere as a torn tail (handed off to its own session); (2) the
+control `wal_lock` starved the ADR 0038 apply task (#1133); (3) an `LsmEngine`
+WAL torn-header open failure (three TornTail seeds at K=50; fix in progress,
+PR to come). Tier 2 (`sim_cluster_upgrade_corpus`) is pending. See
+`animus-test/CLAUDE.md`.
+
 ### What Phase 1 "done" means, and what users can rely on
 
 Done, when every one of these holds on `main`:

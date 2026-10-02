@@ -180,6 +180,7 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 | `ANIMUS_RAFTKV_SEEDS=K` | 1 | raftkv-corpus depth (`animus-test`) |
 | `ANIMUS_RAFTKV_LSM=1` | off | run the whole raftkv corpus over `LsmEngine<SimEnv>` |
 | `ANIMUS_RAFTKV_WAL_FAULTS=1` | off | run a second pass of the raftkv corpus's crash-based cells (`LeaderKill`/`FollowerKill`) with `torn_tail_on_crash`+`corrupt_on_crash` armed for the whole run |
+| `ANIMUS_UPGRADE_RESTART_SEEDS=K` | 1 | upgrade-restart tier-1 corpus depth (`animus-test`, `tests/upgrade_restart_corpus.rs`, ADR 0073 P1-D) — K seeds per cell (21 cells); `ANIMUS_UPGRADE_RESTART_CELL=<substring>` narrows to matching cells (combine with `ANIMUS_SEED=<seed>` to replay one) |
 | `ANIMUS_RECONCILER_SEEDS=K` | 1 | reconciler-corpus depth (`animus-cp-data`) |
 | `ANIMUS_TXN_SEEDS=K` | 1 | multi-tablet cross-transaction corpus depth (`animus-test`, ADR 0018) |
 | `ANIMUS_STREAM_SEEDS=K` | 1 | DynamoDB Streams lineage-walk corpus depth (`animus-test`, ADR 0042/0043) |
