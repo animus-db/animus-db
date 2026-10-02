@@ -162,8 +162,16 @@ jobs:
       # cargo-deny can't run in the local dev sandbox (not installed); CI is
       # where this gate actually executes. The pinned action installs cargo-deny
       # and runs `cargo deny check` (advisories + bans + licenses + sources).
+      #
+      # `RUSTC_WRAPPER` is blanked for this step only: the action runs cargo
+      # inside its own Docker container, which inherits the job-level
+      # `RUSTC_WRAPPER: sccache` but has no `sccache` binary, so `cargo
+      # metadata` died with "could not execute process `sccache .../rustc -vV`
+      # (never executed)". deny only resolves metadata; it compiles nothing.
       - name: cargo-deny check
         uses: EmbarkStudios/cargo-deny-action@v2
+        env:
+          RUSTC_WRAPPER: ""
         with:
           command: check
 
