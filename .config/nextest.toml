@@ -1,4 +1,37 @@
-# cargo-nextest config for the sharded `prod-liveness` CI tier
+# cargo-nextest configuration. Three profiles:
+#
+#   default  local `cargo nextest run` (the developer workflow, see CLAUDE.md
+#            "Commands")
+#   gates    the per-push `test-shard` jobs in .github/workflows/ci.yml
+#   ci       the sharded `prod-liveness` real-thread tier (same workflow)
+#
+# Repo-wide rule for every profile: `retries = 0`. A test that fails once and
+# passes on retry has found a real defect (CLAUDE.md, Session operating mode
+# item 4) — nextest's retry feature would hide exactly that, so it is never
+# enabled, and no profile has a *terminating* slow-timeout either: each
+# test's own in-test deadline is the guard, a second outer one would only add
+# a second, differently-tuned flake source.
+
+[profile.default]
+# See every failure in one run instead of stopping at the first.
+fail-fast = false
+retries = 0
+
+# The deterministic per-push gates tier (SimEnv suites + `animusd --lib`).
+# Test threads match the 2-vCPU hosted runner, the same in-runner parallelism
+# the plain `cargo test -- --test-threads=2` steps this replaced used —
+# oversubscribing the cores with heavyweight multi-node cluster tests blows
+# their timing/convergence budgets (issue #278 items 2/9).
+[profile.gates]
+fail-fast = false
+retries = 0
+test-threads = 2
+# A warning marker only (no `terminate-after`): surfaces a test that is
+# running suspiciously long in the log without killing it.
+slow-timeout = { period = "120s" }
+failure-output = "immediate-final"
+
+# `ci` profile: the sharded `prod-liveness` CI tier
 # (.github/workflows/ci.yml). See that workflow for why this tier exists
 # (real-thread ProdEnv liveness tests, contention-sensitive on shared
 # 2-vCPU runners) and why it runs under nextest instead of `cargo test`.
