@@ -1,0 +1,67 @@
+{
+  "v": 1,
+  "members": {
+    "n1": {
+      "labels": {},
+      "status": "Active",
+      "has_activated": true
+    },
+    "n2": {
+      "labels": {},
+      "status": "Active",
+      "has_activated": true
+    }
+  },
+  "tablets": {},
+  "policies": {},
+  "schemas": {
+    "tables": {}
+  },
+  "next_tablet_id": 0,
+  "node_addrs": {
+    "n3": {
+      "internal": "127.0.0.1:9303",
+      "client": "127.0.0.1:9003",
+      "intra": "127.0.0.1:9603",
+      "admin": "127.0.0.1:9503",
+      "role": "control"
+    }
+  },
+  "split_lineage": {},
+  "split_placing": {},
+  "stream_shards": [],
+  "index_backfill": [],
+  "backups": {},
+  "backup_tablet_progress": [],
+  "restores": {},
+  "pitr_segments": [],
+  "pitr_generation": {},
+  "pitr_base_backups": [],
+  "credentials": {},
+  "exports": {},
+  "imports": {},
+  "node_versions": {
+    "n1": {
+      "range": {
+        "min": 1,
+        "max": 2
+      },
+      "build": "2.0.0"
+    },
+    "n2": {
+      "range": {
+        "min": 1,
+        "max": 2
+      },
+      "build": "2.0.0"
+    },
+    "n3": {
+      "range": {
+        "min": 1,
+        "max": 2
+      },
+      "build": "2.0.1"
+    }
+  },
+  "cluster_version": 2
+}

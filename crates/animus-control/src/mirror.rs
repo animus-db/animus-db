@@ -79,6 +79,12 @@ use crate::syskv::{self, DecodedKey, EntityKind};
 /// along with the allocator itself.
 pub const NEXT_TABLET_ID_COUNTER: &str = "next_tablet_id";
 
+/// The counter name for `Metadata::cluster_version` under
+/// [`EntityKind::Counter`] (ADR 0073 Phase 2, P2-A). **Era-only**: written
+/// only by an applied `FinalizeClusterVersion`; a Phase 1 reader ignores an
+/// unknown counter id.
+pub const CLUSTER_VERSION_COUNTER: &str = "cluster_version";
+
 /// The counter name for the system-keyspace mirror's own on-disk format
 /// version (ADR 0073 Phase 0 workstream B), under [`EntityKind::Counter`]
 /// (`syskv::counter_key`) exactly like [`NEXT_TABLET_ID_COUNTER`] — this is
@@ -234,6 +240,17 @@ pub fn apply_and_derive_mirror(
         command,
         MetaCommand::DeleteBackup { backup_id } if meta.pitr_base_backups.contains(backup_id)
     );
+
+    // `RemoveMember` prunes the node's `node_versions` row as a side effect;
+    // only an era-active cluster has one, so era-0 emits no extra tombstone.
+    let had_node_version = matches!(
+        command,
+        MetaCommand::RemoveMember { node } if meta.node_versions.contains_key(node)
+    );
+
+    // The first `ReportNodeVersion` starts the era by setting the stored
+    // `cluster_version` to 1, which the mirror must carry too.
+    let era_was_active = meta.versioning_active();
 
     let outcome = meta.apply(command);
     if outcome != ApplyOutcome::Applied {
@@ -395,6 +412,27 @@ pub fn apply_and_derive_mirror(
         MetaCommand::RemoveMember { node } => {
             writes.push(KeyWrite::Delete(syskv::member_key(node)));
             writes.push(KeyWrite::Delete(syskv::node_addrs_key(node)));
+            if had_node_version {
+                writes.push(KeyWrite::Delete(syskv::node_version_key(node)));
+            }
+        }
+        MetaCommand::ReportNodeVersion { node, .. } => {
+            writes.push(put_json(
+                syskv::node_version_key(node),
+                &meta.node_versions[node],
+            ));
+            if !era_was_active {
+                writes.push(put_counter(
+                    CLUSTER_VERSION_COUNTER,
+                    u64::from(meta.cluster_version),
+                ));
+            }
+        }
+        MetaCommand::FinalizeClusterVersion { .. } => {
+            writes.push(put_counter(
+                CLUSTER_VERSION_COUNTER,
+                u64::from(meta.cluster_version),
+            ));
         }
         MetaCommand::RegisterNode { node, .. } => {
             // `apply_and_derive_mirror` only reaches here when `outcome ==
@@ -783,6 +821,8 @@ fn apply_put(meta: &mut Metadata, key: &[u8], value: &[u8]) {
             let value = decode_u64(value);
             if id == NEXT_TABLET_ID_COUNTER.as_bytes() {
                 meta.next_tablet_id = value;
+            } else if id == CLUSTER_VERSION_COUNTER.as_bytes() {
+                meta.cluster_version = u32::try_from(value).unwrap_or(u32::MAX);
             } else if let Some(table) = syskv::pitr_generation_table(&id) {
                 meta.pitr_generation.insert(table.to_owned(), value);
             }
@@ -858,6 +898,11 @@ fn apply_put(meta: &mut Metadata, key: &[u8], value: &[u8]) {
             let row: crate::meta::ExportRow =
                 serde_json::from_slice(value).expect("mirrored export value decodes");
             meta.exports.insert(export_id, row);
+        }
+        EntityKind::NodeVersion => {
+            let row: crate::version::NodeVersion =
+                serde_json::from_slice(value).expect("mirrored node-version value decodes");
+            meta.node_versions.insert(decode_node_id(id), row);
         }
         EntityKind::Import => {
             let import_id = String::from_utf8(id).expect("import id is UTF-8");
@@ -969,6 +1014,10 @@ fn apply_delete(meta: &mut Metadata, key: &[u8]) {
             // doc) — listed for match exhaustiveness.
             let export_id = String::from_utf8(id).expect("export id is UTF-8");
             meta.exports.remove(&export_id);
+        }
+        EntityKind::NodeVersion => {
+            // Reachable in practice — `RemoveMember` prunes the node's row.
+            meta.node_versions.remove(&decode_node_id(id));
         }
         EntityKind::Import => {
             // Never deleted in practice (no `DeleteImport` command exists,
@@ -2844,6 +2893,92 @@ mod tests {
             mirror_side, direct,
             "a delta-consumer's incremental apply matches direct apply"
         );
+    }
+
+    /// ADR 0073 Phase 2 (P2-A): `node_versions` and `cluster_version` survive
+    /// the mirror — engine rebuild and incremental delta — losslessly,
+    /// including a `RemoveMember` pruning a version row, and an era-0
+    /// `RemoveMember` emits no extra tombstone.
+    #[tokio::test]
+    async fn era_fields_round_trip_through_the_mirror() {
+        use animus_storage::MergeOp;
+
+        use crate::version::VersionRange;
+
+        let engine = MemoryEngine::new();
+        engine
+            .merge_batch(vec![match put_syskv_format_version() {
+                KeyWrite::Put(k, v) => MergeOp::put(k, v, 1),
+                KeyWrite::Delete(_) => unreachable!("always a Put"),
+            }])
+            .await
+            .expect("version row");
+        let reg = |n: u64, role: &str| MetaCommand::RegisterNode {
+            node: nid(n),
+            addrs: NodeAddrs {
+                internal: format!("i{n}"),
+                client: format!("c{n}"),
+                admin: format!("a{n}"),
+                intra: format!("x{n}"),
+                role: role.to_string(),
+            },
+            labels: BTreeMap::new(),
+        };
+        let report = |n: u64, max: u32| MetaCommand::ReportNodeVersion {
+            node: nid(n),
+            range: VersionRange::new(1, max),
+            build: format!("b{n}"),
+        };
+        let commands = [
+            reg(1, "combined"),
+            reg(2, "control"),
+            reg(3, "control"),
+            // Era 0 removal of a never-reported node: no version tombstone.
+            MetaCommand::RemoveMember { node: nid(3) },
+            report(1, 2),
+            report(2, 2),
+            MetaCommand::FinalizeClusterVersion {
+                expected: 1,
+                target: 2,
+            },
+            reg(4, "control"),
+            report(4, 3),
+            MetaCommand::RemoveMember { node: nid(4) },
+            MetaCommand::RemoveMember { node: nid(2) },
+        ];
+        let mut shadow = Metadata::default();
+        let mut delta_view = Metadata::default();
+        for (index, command) in commands.iter().enumerate() {
+            let (outcome, writes) = apply_and_derive_mirror(&mut shadow, command);
+            assert_eq!(outcome, ApplyOutcome::Applied, "{command:?}");
+            if index == 3 {
+                assert_eq!(
+                    writes,
+                    vec![
+                        KeyWrite::Delete(syskv::member_key(&nid(3))),
+                        KeyWrite::Delete(syskv::node_addrs_key(&nid(3))),
+                    ],
+                    "era-0 removal emits no node_version tombstone"
+                );
+            }
+            let mut ops = Vec::new();
+            for w in &writes {
+                apply_key_write(&mut delta_view, w);
+                ops.push(match w {
+                    KeyWrite::Put(k, v) => MergeOp::put(k.clone(), v.clone(), index as u64 + 2),
+                    KeyWrite::Delete(k) => MergeOp::tombstone(k.clone(), index as u64 + 2),
+                });
+            }
+            engine.merge_batch(ops).await.expect("merge batch");
+        }
+        assert_eq!(shadow.cluster_version(), 2);
+        assert_eq!(shadow.node_versions.len(), 1);
+        assert!(shadow.versioning_active());
+        let rebuilt = rebuild_metadata_from_engine(&engine)
+            .await
+            .expect("rebuild");
+        assert_eq!(rebuilt, shadow, "engine rebuild is lossless");
+        assert_eq!(delta_view, shadow, "incremental delta is lossless");
     }
 
     /// `apply_key_write` ignores a key it doesn't recognize (an undecodable

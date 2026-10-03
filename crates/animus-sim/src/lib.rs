@@ -526,6 +526,10 @@ struct SimState {
     // what would have been one refused *connection* in `ProdEnv` — see
     // `Simulator::protocol_refusals`.
     protocol_refusals: BTreeMap<NodeId, u64>,
+    // Nodes that currently refuse peers advertising no handshake `ext`
+    // (ADR 0073 Phase 2) — set through the `Network::set_require_peer_ext`
+    // hook on that node's own `SimEnv`. Absent = off (every existing test).
+    require_peer_ext: BTreeSet<NodeId>,
     // Per-node clock skew (signed nanoseconds), applied only to that node's
     // own `Clock::now()` reads (ADR 0018 §2 sim support). Absent = zero skew;
     // default-empty so every existing test stays byte-identical (see
@@ -795,10 +799,25 @@ impl SimState {
     /// its default (true of every test that never calls
     /// [`Simulator::set_network_protocol_for`], i.e. every test that existed
     /// before this check did), both `check_peer` calls trivially succeed and
-    /// this returns `false` every time — byte-identical to a build that
+    /// this returns `None` every time — byte-identical to a build that
     /// never had this check at all. That is what keeps every existing
     /// seed's recorded [`TraceEvent`]s and executions unperturbed.
-    fn network_protocol_refused(&self, from: &NodeId, to: &NodeId) -> bool {
+    ///
+    /// Returns the refusal's trace reason (`None` = deliver). ADR 0073 Phase 2
+    /// adds the `ext` checks:
+    /// disjoint version ranges / malformed `ext` in either direction
+    /// (`"protocol-refused"`, via [`handshake::check_peer_ext`]), and the
+    /// era-on require flag (`"phase1-peer-refused"`): a receiver with the flag
+    /// on refuses an envelope whose send-time `peer_ext` is empty, and a
+    /// sender with the flag on refuses a destination whose current `ext` is
+    /// empty (the dial side of `ProdEnv`'s handshake). Still a pure
+    /// comparison — no RNG draw, no timeline event.
+    fn network_protocol_refused(
+        &self,
+        from: &NodeId,
+        to: &NodeId,
+        sent_ext: Option<&[u8]>,
+    ) -> Option<&'static str> {
         let from_preamble = self.network_preamble_for(from);
         let to_preamble = self.network_preamble_for(to);
         let from_spec = ProtocolSpec {
@@ -811,8 +830,22 @@ impl SimState {
             magic: to_preamble.magic,
             version: to_preamble.version,
         };
-        handshake::check_peer(&to_spec, &from_preamble).is_err()
-            || handshake::check_peer(&from_spec, &to_preamble).is_err()
+        if handshake::check_peer_ext(&to_spec, &to_preamble.extensions, &from_preamble, false)
+            .is_err()
+            || handshake::check_peer_ext(&from_spec, &from_preamble.extensions, &to_preamble, false)
+                .is_err()
+        {
+            return Some("protocol-refused");
+        }
+        if !self.require_peer_ext.is_empty() {
+            let from_ext = sent_ext.unwrap_or(&from_preamble.extensions);
+            if (self.require_peer_ext.contains(to) && from_ext.is_empty())
+                || (self.require_peer_ext.contains(from) && to_preamble.extensions.is_empty())
+            {
+                return Some("phase1-peer-refused");
+            }
+        }
+        None
     }
 
     /// Sample error injection for one disk op on `node`. Draws RNG **only**
@@ -1026,6 +1059,7 @@ impl Simulator {
             node_disk_cfg: BTreeMap::new(),
             node_protocol: BTreeMap::new(),
             protocol_refusals: BTreeMap::new(),
+            require_peer_ext: BTreeSet::new(),
             clock_skew: BTreeMap::new(),
             clock_drift: BTreeMap::new(),
             paused_until: BTreeMap::new(),
@@ -1168,10 +1202,31 @@ impl Simulator {
     /// for why that keeps every pre-existing seed's execution and trace
     /// byte-identical.
     pub fn set_network_protocol_for(&self, node: NodeId, spec: ProtocolSpec) {
-        self.shared
-            .lock()
+        let mut st = self.shared.lock();
+        // Keep any `ext` already configured for the node.
+        let extensions = st
             .node_protocol
-            .insert(node, Preamble::for_protocol(&spec));
+            .get(&node)
+            .map(|p| p.extensions.clone())
+            .unwrap_or_default();
+        let mut preamble = Preamble::for_protocol(&spec);
+        preamble.extensions = extensions;
+        st.node_protocol.insert(node, preamble);
+    }
+
+    /// Set `node`'s handshake `ext` bytes (ADR 0073 Phase 2; build them with
+    /// [`handshake::encode_ext`]), the model of a peer advertising a
+    /// supported version range. Takes effect for messages sent after the
+    /// call (each envelope's `peer_ext` is stamped with the sender's `ext` at
+    /// send time) and for refusal checks at delivery. Calling it again
+    /// models a restart that changed the node's `ext`. Default (never
+    /// called) is empty — a Phase 1 binary.
+    pub fn set_network_ext_for(&self, node: NodeId, ext: Vec<u8>) {
+        let mut st = self.shared.lock();
+        st.node_protocol
+            .entry(node)
+            .or_insert_with(|| Preamble::for_protocol(&handshake::NETWORK_PROTOCOL))
+            .extensions = ext;
     }
 
     /// How many messages addressed to `node` have been refused so far by the
@@ -1892,7 +1947,9 @@ impl Simulator {
                             reason: "partition",
                         });
                         None
-                    } else if st.network_protocol_refused(&from, &to) {
+                    } else if let Some(reason) =
+                        st.network_protocol_refused(&from, &to, Some(&env.peer_ext))
+                    {
                         // Handshake-modelled refusal (ADR 0073 Phase 0,
                         // workstream D) — see `network_protocol_refused`'s
                         // doc for why this is a pure comparison (no RNG, no
@@ -1909,7 +1966,7 @@ impl Simulator {
                             from,
                             to,
                             stream,
-                            reason: "protocol-refused",
+                            reason,
                         });
                         None
                     } else if let Some(until) =
@@ -2087,6 +2144,12 @@ impl Network for SimEnv {
             net_cfg.duplicate_threshold > 0 && st.rng.next_u64() < net_cfg.duplicate_threshold;
         let dup_payload = duplicate.then(|| payload.clone());
 
+        // The sender's handshake `ext` as of this send (ADR 0073 Phase 2).
+        let sender_ext: Arc<[u8]> = match st.node_protocol.get(&from) {
+            Some(p) if !p.extensions.is_empty() => Arc::from(p.extensions.as_slice()),
+            _ => Arc::from(Vec::new()),
+        };
+
         let seq = st.next_seq;
         st.next_seq += 1;
         st.timeline.insert(
@@ -2097,6 +2160,7 @@ impl Network for SimEnv {
                     from: from.clone(),
                     stream,
                     payload,
+                    peer_ext: Arc::clone(&sender_ext),
                 },
             },
         );
@@ -2126,6 +2190,7 @@ impl Network for SimEnv {
                         from,
                         stream,
                         payload: dup_payload,
+                        peer_ext: sender_ext,
                     },
                 },
             );
@@ -2148,6 +2213,15 @@ impl Network for SimEnv {
             stream,
         }
         .await
+    }
+
+    fn set_require_peer_ext(&self, on: bool) {
+        let mut st = self.shared.lock();
+        if on {
+            st.require_peer_ext.insert(self.node_id.clone());
+        } else {
+            st.require_peer_ext.remove(&self.node_id);
+        }
     }
 
     fn close_stream(&self, stream: u64) {

@@ -404,6 +404,93 @@ fn v1_metadata() -> Metadata {
     m
 }
 
+/// The era shape (ADR 0073 Phase 2, P2-A): two data members, one
+/// control-only node (a `node_addrs` claim with no `Member` row), every node
+/// reported `[1, 2]`, finalized to cluster version 2. Built through real
+/// commands, like [`v1_metadata`].
+fn v1_era_metadata() -> Metadata {
+    use animus_control::meta::NodeAddrs;
+    use animus_control::version::VersionRange;
+    let mut m = Metadata::default();
+    let mut commands = vec![
+        MetaCommand::UpsertMember {
+            node: nid(1),
+            labels: BTreeMap::new(),
+            status: NodeStatus::Active,
+        },
+        MetaCommand::UpsertMember {
+            node: nid(2),
+            labels: BTreeMap::new(),
+            status: NodeStatus::Active,
+        },
+        MetaCommand::RegisterNode {
+            node: nid(3),
+            addrs: NodeAddrs {
+                internal: "127.0.0.1:9303".to_string(),
+                client: "127.0.0.1:9003".to_string(),
+                intra: "127.0.0.1:9603".to_string(),
+                admin: "127.0.0.1:9503".to_string(),
+                role: "control".to_string(),
+            },
+            labels: BTreeMap::new(),
+        },
+    ];
+    for (n, build) in [(1, "2.0.0"), (2, "2.0.0"), (3, "2.0.1")] {
+        commands.push(MetaCommand::ReportNodeVersion {
+            node: nid(n),
+            range: VersionRange::new(1, 2),
+            build: build.to_string(),
+        });
+    }
+    commands.push(MetaCommand::FinalizeClusterVersion {
+        expected: 1,
+        target: 2,
+    });
+    for command in &commands {
+        assert_eq!(
+            m.apply(command),
+            ApplyOutcome::Applied,
+            "fixture premise: every command applies cleanly"
+        );
+    }
+    assert!(m.versioning_active() && m.cluster_version() == 2);
+    m
+}
+
+/// ADR 0073 Phase 2 (P2-A): era-0 serialization is byte-identical to Phase 1's.
+/// `v1_metadata` carries no version record, so its current encoding must equal
+/// the frozen `v1.json` (pretty-printed, as the generator wrote it) exactly,
+/// and must not mention either new field.
+#[test]
+fn era_0_metadata_encoding_is_byte_identical_to_the_v1_fixture() {
+    let fixture = std::fs::read(metadata_fixtures_dir().join("v1.json")).expect("v1.json");
+    let encoded = serde_json::to_vec_pretty(&v1_metadata()).expect("serializes");
+    assert_eq!(
+        String::from_utf8(encoded).unwrap().trim_end(),
+        String::from_utf8(fixture).unwrap().trim_end()
+    );
+    let compact = serde_json::to_string(&v1_metadata()).unwrap();
+    assert!(!compact.contains("node_versions") && !compact.contains("cluster_version"));
+    let era = serde_json::to_string(&v1_era_metadata()).unwrap();
+    assert!(era.contains("node_versions") && era.contains("\"cluster_version\":2"));
+}
+
+/// A Phase 1 reader's view: the era fixture decodes fine with the new fields
+/// absent from the document ignored by an old shape — modelled here by
+/// stripping them and checking the rest still decodes to the era-0 reading.
+#[test]
+fn era_fixture_round_trips_and_an_absent_version_reads_as_one() {
+    let era = v1_era_metadata();
+    let bytes = serde_json::to_vec(&era).unwrap();
+    assert_eq!(Metadata::from_json(&bytes).unwrap(), era);
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    value.as_object_mut().unwrap().remove("node_versions");
+    value.as_object_mut().unwrap().remove("cluster_version");
+    let stripped: Metadata = serde_json::from_value(value).unwrap();
+    assert!(!stripped.versioning_active());
+    assert_eq!(stripped.cluster_version(), 1);
+}
+
 fn metadata_fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/formats/metadata")
 }
@@ -426,24 +513,33 @@ fn decodes_every_checked_in_metadata_fixture_to_its_per_version_value() {
             .and_then(|n| n.to_str())
             .unwrap_or_default()
             .to_string();
-        let version: u32 = name
+        // `vN.json` (the era-0 shape) or `vN-<shape>.json` (ADR 0073 Phase 2:
+        // a gated additive field inside the same `"v": N`).
+        let stem = name
             .strip_prefix('v')
             .and_then(|r| r.strip_suffix(".json"))
-            .and_then(|n| n.parse().ok())
-            .unwrap_or_else(|| panic!("{name}: fixture name is not vN.json"));
+            .unwrap_or_else(|| panic!("{name}: fixture name is not vN[-shape].json"));
+        let (num, shape) = match stem.split_once('-') {
+            Some((n, shape)) => (n, Some(shape)),
+            None => (stem, None),
+        };
+        let version: u32 = num
+            .parse()
+            .unwrap_or_else(|_| panic!("{name}: fixture name is not vN[-shape].json"));
         let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("reading {name}: {e}"));
         let decoded =
             Metadata::from_json(&bytes).unwrap_or_else(|e| panic!("{name} failed to decode: {e}"));
         assert_eq!(decoded.version, version, "{name}: file name vs decoded v");
-        let expected = match version {
-            1 => v1_metadata(),
-            other => panic!(
-                "{name}: no expected value for metadata v{other}; add a match arm (and a \
+        let expected = match (version, shape) {
+            (1, None) => v1_metadata(),
+            (1, Some("era")) => v1_era_metadata(),
+            (other, _) => panic!(
+                "{name}: no expected value for metadata v{other} shape {shape:?}; add a match arm (and a \
                  frozen legacy decoder) before adding the fixture file"
             ),
         };
         assert_eq!(decoded, expected, "{name} decoded to an unexpected value");
-        seen.push(version);
+        seen.push((version, shape.map(str::to_owned)));
     }
     assert!(
         !seen.is_empty(),
@@ -451,7 +547,7 @@ fn decodes_every_checked_in_metadata_fixture_to_its_per_version_value() {
         dir.display()
     );
     assert!(
-        seen.contains(&animus_control::meta::METADATA_VERSION),
+        seen.contains(&(animus_control::meta::METADATA_VERSION, None)),
         "no fixture for the current METADATA_VERSION: {seen:?}"
     );
 }
@@ -535,6 +631,22 @@ fn generate_fixture_metadata() {
         );
     }
     let bytes = serde_json::to_vec_pretty(&v1_metadata()).expect("metadata serializes");
+    std::fs::write(&path, &bytes).unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
+}
+
+/// Writes `v1-era.json` from [`v1_era_metadata`]; refuses to overwrite.
+/// `cargo test -p animus-control --test it format_fixtures::generate_fixture_metadata_era -- --ignored`.
+#[test]
+#[ignore]
+fn generate_fixture_metadata_era() {
+    let path = metadata_fixtures_dir().join("v1-era.json");
+    if std::fs::metadata(&path).is_ok() {
+        panic!(
+            "{} already exists — never regenerated in place",
+            path.display()
+        );
+    }
+    let bytes = serde_json::to_vec_pretty(&v1_era_metadata()).expect("metadata serializes");
     std::fs::write(&path, &bytes).unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
 }
 
@@ -758,7 +870,7 @@ use animus_storage::{MemoryEngine, MergeOp, StorageEngine};
 /// new variant a compile error there, and the scenario/fixture-directory
 /// tests below fail until this list, [`v1_entity`], and a checked-in fixture
 /// directory all cover it.
-const ALL_KINDS: [EntityKind; 18] = [
+const ALL_KINDS: [EntityKind; 19] = [
     EntityKind::Tablet,
     EntityKind::Member,
     EntityKind::Schema,
@@ -777,6 +889,7 @@ const ALL_KINDS: [EntityKind; 18] = [
     EntityKind::Credential,
     EntityKind::Export,
     EntityKind::Import,
+    EntityKind::NodeVersion,
 ];
 
 /// Exhaustive over [`EntityKind`] (no wildcard).
@@ -800,6 +913,7 @@ fn kind_witness(kind: EntityKind) -> usize {
         EntityKind::Credential => 15,
         EntityKind::Export => 16,
         EntityKind::Import => 17,
+        EntityKind::NodeVersion => 18,
     }
 }
 
@@ -1097,6 +1211,16 @@ fn v1_mirror_scenario() -> (Metadata, Live) {
             cutover_wall_ms: 1_700_000_000_600,
         },
     );
+    // ADR 0073 Phase 2 (P2-A): the era-only `NodeVersion` kind.
+    run_mirror(
+        m,
+        l,
+        MetaCommand::ReportNodeVersion {
+            node: nid(1),
+            range: animus_control::version::VersionRange::new(1, 2),
+            build: "2.0.0".to_string(),
+        },
+    );
     (meta, live)
 }
 
@@ -1207,6 +1331,11 @@ fn v1_entity(kind: EntityKind, full: &Metadata) -> (Vec<u8>, Metadata) {
                 .insert("i1".to_string(), full.imports["i1"].clone());
             syskv::import_key("i1")
         }
+        EntityKind::NodeVersion => {
+            m.node_versions
+                .insert(nid(1), full.node_versions[&nid(1)].clone());
+            syskv::node_version_key(&nid(1))
+        }
     };
     (key, m)
 }
@@ -1259,7 +1388,7 @@ fn mirror_scenario_produces_a_live_row_of_every_entity_kind() {
             other => panic!("{kind:?} key decodes to {other:?}"),
         }
     }
-    assert_eq!(seen.len(), 18, "ALL_KINDS must list every EntityKind");
+    assert_eq!(seen.len(), 19, "ALL_KINDS must list every EntityKind");
     // Any kind the scenario writes but ALL_KINDS forgot is caught here too.
     for key in live.keys() {
         if let Some(DecodedKey::Entity { kind, .. }) = syskv::decode_key(key) {

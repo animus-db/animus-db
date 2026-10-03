@@ -54,6 +54,7 @@ mod staggered_genesis_boot;
 mod stale_snapshot_no_rewind;
 mod tablet_split;
 mod transfer_third_voter_wins;
+mod version_apply_corpus;
 mod wal_compaction;
 mod wal_midfile_corruption;
 mod watch_deltas;

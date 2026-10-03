@@ -45,7 +45,10 @@ pub use prod::{FsSegmentStore, InboxStats, ProdEnv, StreamInboxStats};
 /// paths, so that wire's handshake reuses this exact exchange rather than
 /// reimplementing it.
 #[cfg(feature = "prod")]
-pub use prod::{PreambleError, exchange_preamble, read_preamble, write_own_preamble};
+pub use prod::{
+    PreambleError, exchange_preamble, exchange_preamble_with, read_preamble, write_own_preamble,
+    write_own_preamble_with,
+};
 
 /// TLS material for the intra-node wire (ADR 0064, S-01 step 1) — gated
 /// alongside `prod.rs` since it exists only to serve `ProdEnv`'s real
@@ -473,6 +476,25 @@ pub struct Envelope {
     /// The opaque payload. Higher layers define and (de)serialize their own
     /// message types; the network moves bytes.
     pub payload: Vec<u8>,
+    /// The handshake `ext` bytes (ADR 0073 Phase 2, [`handshake`]) of the
+    /// sending node as of the connection / send that carried this message.
+    /// Empty for a Phase 1 peer, or when nothing configured an `ext`. One
+    /// shared buffer per connection under `ProdEnv` (no per-frame
+    /// allocation); [`Envelope::new`] defaults it to empty.
+    pub peer_ext: Arc<[u8]>,
+}
+
+impl Envelope {
+    /// An envelope with an empty `peer_ext`.
+    #[must_use]
+    pub fn new(from: NodeId, stream: u64, payload: Vec<u8>) -> Self {
+        Envelope {
+            from,
+            stream,
+            payload,
+            peer_ext: Arc::from(Vec::new()),
+        }
+    }
 }
 
 /// A **wall-clock** instant: milliseconds since the Unix epoch (1970-01-01
@@ -649,6 +671,11 @@ pub trait Network: Send + Sync {
     /// primary stream — so implementations `debug_assert` against it rather
     /// than silently accepting it.
     fn close_stream(&self, stream: u64);
+
+    /// Whether this node must refuse peers that advertise no handshake `ext`
+    /// (ADR 0073 Phase 2: the era-on refusal of Phase 1 binaries). Default
+    /// no-op; `ProdEnv`/`SimEnv` implement it and wrappers forward it.
+    fn set_require_peer_ext(&self, _on: bool) {}
 
     /// Send on [`PRIMARY_STREAM`] — the whole pre-multiplexing API surface.
     async fn send(&self, to: NodeId, payload: Vec<u8>) {

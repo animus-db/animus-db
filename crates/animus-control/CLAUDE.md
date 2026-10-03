@@ -16,6 +16,26 @@ per-tablet CP data plane (`animus-cp-data`).
 
 ## Entry points
 
+- **`version.rs`** (ADR 0073 Phase 2, P2-A) — `ClusterVersion` (`u32` alias),
+  `VersionRange`, `MIN_SUPPORTED`/`MAX_SUPPORTED`/`own_range()`, the `Gate`
+  registry (`Gate::version()` is an exhaustive table; `Gate::Era` is
+  era-gated) and the per-node cheap-clone `ClusterFeatures` handle (floor
+  semantics until first `update(&Metadata)`; no globals). **Gates are read by
+  emitters/proposers only — `Metadata::apply` never reads one.** The record
+  lives in `Metadata::node_versions` + `cluster_version` (additive,
+  skipped-at-default fields; era-0 bytes equal the frozen `metadata/v1.json`,
+  pinned by `era_0_metadata_encoding_is_byte_identical_to_the_v1_fixture`).
+  `versioning_active()` is the **sticky** stored `cluster_version != 0` (the
+  first applied `ReportNodeVersion` sets it to 1; nothing resets it, so
+  removing the last reporter keeps the era on; the apply corpus
+  `tests/it/version_apply_corpus.rs` asserts it).
+  The required set (`required_version_set`) is `members` ∪ `node_addrs` keys,
+  because control-only voters have no `Member` row. The mirror carries the
+  record as `EntityKind::NodeVersion` and the version as counter
+  `CLUSTER_VERSION_COUNTER`; both are era-only (a Phase 1 reader ignores
+  unknown kinds/counters). `ReportNodeVersion`/`FinalizeClusterVersion` are
+  deliberately not relayable in `animus-node` until P2-B/P2-C decide.
+
 - **`lib.rs`** — the public surface: re-exports the core types (`SharedWal`,
   `RaftCore`, `RaftNode`, `Metadata`/`MetaCommand`, the schema types,
   `FailureDetector`) plus `animus_placement::PlacementPolicy` (so a downstream

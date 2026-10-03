@@ -29,7 +29,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -178,8 +178,32 @@ pub struct InboxStats {
     pub top_streams: Vec<StreamInboxStats>,
 }
 
+/// This env's handshake `ext` policy (ADR 0073 Phase 2), shared by the
+/// accept loop and every dial: its own `ext` bytes (default empty — the
+/// pre-Phase-2 preamble, byte for byte) and whether a peer advertising no
+/// `ext` (a Phase 1 binary) is refused. Both are read at handshake time, so
+/// a change applies to **new** connections; additionally an already-open
+/// accepted connection whose peer sent an empty `ext` is closed on its next
+/// frame once `require_peer_ext` is on (see `read_frames`).
+#[derive(Default)]
+struct HandshakeCfg {
+    own_ext: StdMutex<Arc<[u8]>>,
+    require_peer_ext: AtomicBool,
+}
+
+impl HandshakeCfg {
+    fn own_ext(&self) -> Arc<[u8]> {
+        Arc::clone(&self.own_ext.lock().expect("handshake cfg poisoned"))
+    }
+    fn require(&self) -> bool {
+        self.require_peer_ext.load(Ordering::Acquire)
+    }
+}
+
 struct Inner {
     node_id: NodeId,
+    /// Handshake `ext` policy; see [`HandshakeCfg`].
+    hs: Arc<HandshakeCfg>,
     start: Instant,
     /// The peer address book: node id -> `host:port` (a hostname or a numeric
     /// address — `TcpStream::connect` resolves either). Kept as a string end
@@ -390,7 +414,9 @@ impl ProdEnv {
         // the same sink this env's `metrics_text()`/`Env::metrics()` expose —
         // one recording handle for the whole env, not a second one.
         let metrics = MetricsHandle::recording();
-        let (raw_rx, accept_abort) = spawn_accept(listener, tls.clone(), metrics.clone());
+        let hs = Arc::new(HandshakeCfg::default());
+        let (raw_rx, accept_abort) =
+            spawn_accept(listener, tls.clone(), metrics.clone(), Arc::clone(&hs));
         let demux = Arc::new(StdMutex::new(Demux::default()));
         let pump_abort = spawn_pump(raw_rx, Arc::clone(&demux), metrics.clone());
 
@@ -412,6 +438,7 @@ impl ProdEnv {
         let env = Self {
             inner: Arc::new(Inner {
                 node_id,
+                hs,
                 start: Instant::now(),
                 peers: Arc::new(StdMutex::new(BTreeMap::new())),
                 local_addr,
@@ -427,6 +454,26 @@ impl ProdEnv {
             }),
         };
         Ok((env, local_addr))
+    }
+
+    /// Set the handshake `ext` bytes (ADR 0073 Phase 2; see
+    /// [`handshake::encode_ext`]) this env advertises in its preamble on
+    /// both dial and accept. Default empty, which writes today's preamble
+    /// bytes exactly. Applies to connections handshaken after the call;
+    /// existing pooled connections keep what they advertised.
+    pub fn set_own_ext(&self, ext: Vec<u8>) {
+        *self
+            .inner
+            .hs
+            .own_ext
+            .lock()
+            .expect("handshake cfg poisoned") = Arc::from(ext);
+    }
+
+    /// This env's own current handshake `ext` bytes.
+    #[must_use]
+    pub fn own_ext(&self) -> Vec<u8> {
+        self.inner.hs.own_ext().to_vec()
     }
 
     /// This env's own listener address.
@@ -737,6 +784,9 @@ async fn open_append(path: &std::path::Path) -> std::io::Result<tokio::fs::File>
 async fn read_frames(
     mut stream: MaybeTlsStream,
     tx: mpsc::UnboundedSender<Envelope>,
+    peer_ext: Arc<[u8]>,
+    hs: Arc<HandshakeCfg>,
+    metrics: MetricsHandle,
 ) -> std::io::Result<()> {
     loop {
         let from_len = match stream.read_u32().await {
@@ -757,11 +807,22 @@ async fn read_frames(
         let len = stream.read_u32().await? as usize;
         let mut payload = vec![0u8; len];
         stream.read_exact(&mut payload).await?;
+        // The era-on refusal reaches connections opened before the flag
+        // flipped: a Phase 1 (empty-ext) peer's open connection is closed on
+        // its next frame; it re-dials and is refused at the handshake.
+        if peer_ext.is_empty() && hs.require() {
+            metrics.incr(Metric::NetworkHandshakeRefused);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                handshake::HandshakeError::Phase1Peer,
+            ));
+        }
         if tx
             .send(Envelope {
                 from,
                 stream: msg_stream,
                 payload,
+                peer_ext: Arc::clone(&peer_ext),
             })
             .is_err()
         {
@@ -997,6 +1058,7 @@ impl Network for ProdEnv {
         };
         let tls = self.inner.tls.clone();
         let metrics = self.inner.metrics.clone();
+        let hs = Arc::clone(&self.inner.hs);
         // Issue #661: run the actual connect+write on its own task, bounded by
         // `SEND_TIMEOUT`, instead of inline on this `.await` — see
         // `SEND_TIMEOUT`'s own doc for why a caller (most importantly a Raft
@@ -1016,8 +1078,11 @@ impl Network for ProdEnv {
                     &from,
                     stream,
                     &payload,
-                    tls.as_ref(),
-                    &metrics,
+                    DialCtx {
+                        tls: tls.as_ref(),
+                        metrics: &metrics,
+                        hs: &hs,
+                    },
                 ),
             )
             .await
@@ -1077,6 +1142,10 @@ impl Network for ProdEnv {
             stream,
         }
         .await
+    }
+
+    fn set_require_peer_ext(&self, on: bool) {
+        self.inner.hs.require_peer_ext.store(on, Ordering::Release);
     }
 
     fn close_stream(&self, stream: u64) {
@@ -1419,7 +1488,19 @@ pub async fn write_own_preamble<S: AsyncWrite + Unpin>(
     conn: &mut S,
     spec: &handshake::ProtocolSpec,
 ) -> Result<(), PreambleError> {
-    let ours = handshake::encode(&handshake::Preamble::for_protocol(spec));
+    write_own_preamble_with(conn, spec, &[]).await
+}
+
+/// [`write_own_preamble`] advertising `ext` (ADR 0073 Phase 2) in the
+/// preamble's extension area. `ext` must fit [`handshake::MAX_EXTENSION_LEN`].
+pub async fn write_own_preamble_with<S: AsyncWrite + Unpin>(
+    conn: &mut S,
+    spec: &handshake::ProtocolSpec,
+    ext: &[u8],
+) -> Result<(), PreambleError> {
+    let mut preamble = handshake::Preamble::for_protocol(spec);
+    preamble.extensions = ext.to_vec();
+    let ours = handshake::encode(&preamble);
     conn.write_all(&ours).await.map_err(PreambleError::Io)?;
     conn.flush().await.map_err(PreambleError::Io)
 }
@@ -1448,10 +1529,28 @@ pub async fn exchange_preamble<S: AsyncRead + AsyncWrite + Unpin>(
     spec: &handshake::ProtocolSpec,
     timeout: Duration,
 ) -> Result<(), PreambleError> {
+    exchange_preamble_with(conn, spec, timeout, &[], false)
+        .await
+        .map(|_| ())
+}
+
+/// [`exchange_preamble`] with the Phase 2 `ext` area (ADR 0073): advertises
+/// `own_ext`, checks the peer with [`handshake::check_peer_ext`]
+/// (`require_peer_ext` refuses an empty peer `ext`), and returns the peer's
+/// preamble so the caller can keep its `ext`.
+pub async fn exchange_preamble_with<S: AsyncRead + AsyncWrite + Unpin>(
+    conn: &mut S,
+    spec: &handshake::ProtocolSpec,
+    timeout: Duration,
+    own_ext: &[u8],
+    require_peer_ext: bool,
+) -> Result<handshake::Preamble, PreambleError> {
     match tokio::time::timeout(timeout, async {
-        write_own_preamble(conn, spec).await?;
+        write_own_preamble_with(conn, spec, own_ext).await?;
         let peer = read_preamble(conn, spec).await?;
-        handshake::check_peer(spec, &peer).map_err(PreambleError::Refused)
+        handshake::check_peer_ext(spec, own_ext, &peer, require_peer_ext)
+            .map_err(PreambleError::Refused)?;
+        Ok(peer)
     })
     .await
     {
@@ -1513,9 +1612,19 @@ async fn perform_handshake(
     role: &'static str,
     peer_desc: &str,
     metrics: &MetricsHandle,
-) -> std::io::Result<MaybeTlsStream> {
-    match exchange_preamble(&mut conn, &handshake::NETWORK_PROTOCOL, HANDSHAKE_TIMEOUT).await {
-        Ok(()) => Ok(conn),
+    hs: &HandshakeCfg,
+) -> std::io::Result<(MaybeTlsStream, Arc<[u8]>)> {
+    let own_ext = hs.own_ext();
+    match exchange_preamble_with(
+        &mut conn,
+        &handshake::NETWORK_PROTOCOL,
+        HANDSHAKE_TIMEOUT,
+        &own_ext,
+        hs.require(),
+    )
+    .await
+    {
+        Ok(peer) => Ok((conn, Arc::from(peer.extensions))),
         Err(PreambleError::Io(err)) => {
             tracing::warn!(
                 ?err,
@@ -1609,6 +1718,7 @@ fn spawn_accept(
     listener: TcpListener,
     tls: Option<TlsMaterial>,
     metrics: MetricsHandle,
+    hs: Arc<HandshakeCfg>,
 ) -> (mpsc::UnboundedReceiver<Envelope>, tokio::task::AbortHandle) {
     let (tx, rx) = mpsc::unbounded_channel();
     let accept = tokio::spawn(async move {
@@ -1619,6 +1729,7 @@ fn spawn_accept(
                     let tx = tx.clone();
                     let tls = tls.clone();
                     let metrics = metrics.clone();
+                    let hs = Arc::clone(&hs);
                     tokio::spawn(async move {
                         let stream = match tls {
                             None => MaybeTlsStream::Plain(stream),
@@ -1634,18 +1745,19 @@ fn spawn_accept(
                                 }
                             },
                         };
-                        let stream = match perform_handshake(
+                        let (stream, peer_ext) = match perform_handshake(
                             stream,
                             "accept",
                             &peer_addr.to_string(),
                             &metrics,
+                            &hs,
                         )
                         .await
                         {
-                            Ok(stream) => stream,
+                            Ok(ok) => ok,
                             Err(_err) => return, // already logged/counted by perform_handshake
                         };
-                        if let Err(err) = read_frames(stream, tx).await {
+                        if let Err(err) = read_frames(stream, tx, peer_ext, hs, metrics).await {
                             tracing::debug!(?err, "peer connection closed");
                         }
                     });
@@ -1658,6 +1770,15 @@ fn spawn_accept(
         }
     });
     (rx, accept.abort_handle())
+}
+
+/// What a dial needs beyond the address: TLS material, the metrics sink and
+/// the handshake `ext` policy.
+#[derive(Clone, Copy)]
+struct DialCtx<'a> {
+    tls: Option<&'a TlsMaterial>,
+    metrics: &'a MetricsHandle,
+    hs: &'a HandshakeCfg,
 }
 
 /// Send one frame over the cached connection for `addr`, connecting (with
@@ -1715,18 +1836,18 @@ async fn send_frame_pooled(
     from: &NodeId,
     msg_stream: u64,
     payload: &[u8],
-    tls: Option<&TlsMaterial>,
-    metrics: &MetricsHandle,
+    dial: DialCtx<'_>,
 ) -> std::io::Result<()> {
+    let DialCtx { tls, metrics, hs } = dial;
     let mut guard = slot.lock().await;
     if guard.is_none() {
-        *guard = Some(connect_maybe_tls(addr, tls, metrics).await?);
+        *guard = Some(connect_maybe_tls(addr, tls, metrics, hs).await?);
     }
     let conn = guard.as_mut().expect("connection just ensured");
     if let Err(err) = write_frame(conn, from, msg_stream, payload).await {
         tracing::debug!(?err, %addr, "cached connection failed; reconnecting once");
         *guard = None; // drop the stale stream before dialing afresh
-        let mut fresh = connect_maybe_tls(addr, tls, metrics).await?;
+        let mut fresh = connect_maybe_tls(addr, tls, metrics, hs).await?;
         write_frame(&mut fresh, from, msg_stream, payload).await?;
         *guard = Some(fresh); // cache only a stream that just carried a frame
     }
@@ -1766,6 +1887,7 @@ async fn connect_maybe_tls(
     addr: &str,
     tls: Option<&TlsMaterial>,
     metrics: &MetricsHandle,
+    hs: &HandshakeCfg,
 ) -> std::io::Result<MaybeTlsStream> {
     let stream = connect_nodelay(addr).await?;
     let stream = match tls {
@@ -1776,7 +1898,12 @@ async fn connect_maybe_tls(
             MaybeTlsStream::Tls(Box::new(tls_stream.into()))
         }
     };
-    perform_handshake(stream, "dial", addr, metrics).await
+    // A dialed connection only ever carries this node's outbound frames (the
+    // acceptor never writes frames back on it), so the acceptor's `ext` has
+    // no frames to be stamped onto; it was still checked above.
+    perform_handshake(stream, "dial", addr, metrics, hs)
+        .await
+        .map(|(stream, _peer_ext)| stream)
 }
 
 /// Write one length-prefixed `[from_len: u32][from: utf8 bytes][stream:

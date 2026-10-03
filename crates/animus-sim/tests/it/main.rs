@@ -6,6 +6,7 @@ mod determinism;
 mod disk_faults;
 mod encrypted_disk;
 mod executor_leak;
+mod handshake_ext;
 mod inbox_cap;
 mod net_faults;
 mod pause;

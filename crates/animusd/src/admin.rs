@@ -1560,7 +1560,10 @@ fn system_table_value_display(kind: syskv::EntityKind, value: &[u8]) -> Value {
         // convention.
         | syskv::EntityKind::SplitLineage
         // A `SplitPlacing` (ADR 0062 §2) — same JSON passthrough convention.
-        | syskv::EntityKind::SplitPlacing => {
+        | syskv::EntityKind::SplitPlacing
+        // A `NodeVersion` (ADR 0073 Phase 2, P2-A) — same JSON passthrough
+        // convention.
+        | syskv::EntityKind::NodeVersion => {
             serde_json::from_slice::<Value>(value).unwrap_or(Value::Null)
         }
         syskv::EntityKind::Counter => match <[u8; 8]>::try_from(value) {

@@ -68,6 +68,18 @@ function of one seed. This is the substrate every distributed test runs on.
   Read it once before a scenario and once after, then subtract, to get a
   per-scenario delta — the counters themselves are monotonic for the
   lifetime of one `Simulator` (shared across every `Clone`, never reset).
+- **Handshake `ext` model** (ADR 0073 Phase 2, P2-A): `set_network_ext_for(
+  node, ext)` stores the node's `ext` bytes in its preamble (build with
+  `animus_env::handshake::encode_ext`; calling it again models a restart that
+  changed the ext; `set_network_protocol_for` preserves it). Every `Envelope`
+  is stamped with the **sender's ext at send time** (`peer_ext`). At delivery
+  the refusal check also runs `check_peer_ext` both ways (disjoint ranges ->
+  `Drop` reason `"protocol-refused"`), and the per-node era-on flag, set via
+  `Network::set_require_peer_ext` on that node's own `SimEnv`, drops an
+  envelope whose send-time ext is empty (or a destination whose current ext
+  is empty, for a requiring sender) with reason `"phase1-peer-refused"`;
+  both count in `protocol_refusals(to)`. Pure comparison: no RNG, no timeline
+  event. Test: `tests/it/handshake_ext.rs`.
 - **Network-protocol handshake model** (ADR 0073 Phase 0, workstream D):
   `set_network_protocol_for(node, spec: animus_env::handshake::
   ProtocolSpec)` overrides `node`'s network-protocol preamble, defaulting
