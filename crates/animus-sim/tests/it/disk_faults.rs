@@ -759,3 +759,54 @@ fn fsync_lie_acks_but_a_crash_still_loses_the_bytes() {
         "seed={seed}: with the fault off, a genuinely synced write must survive a crash"
     );
 }
+
+/// Issue #1116: the split replace (`stage_replace`/`stage_extend`/
+/// `commit_staged`) leaves the target untouched until the swap lands, a crash
+/// before the swap keeps the whole old file, and the slow data phase
+/// (`replace_data_delay`) elapses before anything is visible.
+#[test]
+fn staged_replace_is_invisible_until_commit_and_crash_keeps_the_old_file() {
+    let mut sim = Simulator::new(1116);
+    let mut cfg = DiskConfig::default();
+    cfg.set_replace_data_delay(Duration::from_secs(2));
+    sim.set_disk_config_for(nid(0), cfg);
+    let out = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+    let env = sim.env(nid(0));
+    let o = Arc::clone(&out);
+    env.clone().spawn_task(async move {
+        env.append("wal", b"old").await.unwrap();
+        env.sync("wal").await.unwrap();
+        env.stage_replace("wal", b"image").await.unwrap();
+        env.stage_extend("wal", b"+tail").await.unwrap();
+        let v = env.read("wal").await.unwrap();
+        o.lock().unwrap().push(v);
+        env.commit_staged("wal").await.unwrap();
+        let v = env.read("wal").await.unwrap();
+        o.lock().unwrap().push(v);
+    });
+    sim.run_for(Duration::from_secs(1));
+    assert!(
+        out.lock().unwrap().is_empty(),
+        "stage_replace still in its delay"
+    );
+    sim.run_for(Duration::from_secs(3));
+    let got = out.lock().unwrap().clone();
+    assert_eq!(got, vec![b"old".to_vec(), b"image+tail".to_vec()]);
+
+    // A crash after staging but before the swap keeps the old contents.
+    let env = sim.env(nid(0));
+    env.clone().spawn_task(async move {
+        env.stage_replace("wal", b"never-swapped").await.unwrap();
+    });
+    sim.run_for(Duration::from_secs(3));
+    sim.crash(nid(0));
+    sim.restart(nid(0));
+    let env = sim.env(nid(0));
+    let after = Arc::new(Mutex::new(Vec::new()));
+    let a = Arc::clone(&after);
+    env.clone().spawn_task(async move {
+        *a.lock().unwrap() = env.read("wal").await.unwrap();
+    });
+    sim.run_for(Duration::from_secs(1));
+    assert_eq!(*after.lock().unwrap(), b"image+tail".to_vec());
+}
