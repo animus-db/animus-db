@@ -96,9 +96,9 @@
 //!
 //! **Reserved stream.** [`HEARTBEAT_BATCH_STREAM`] is the fourth reserved,
 //! well-known stream constant in this crate — see its own doc for why
-//! `u64::MAX - 2`, distinct from [`crate::cluster_segment_store::
-//! SEGMENT_STREAM`] (`u64::MAX`) and [`crate::backup::
-//! BACKUP_SEGMENT_STREAM`] (`u64::MAX - 1`).
+//! `u64::MAX - 2`; the authoritative allocation table of all reserved
+//! streams (with a compile-time distinctness assertion) is
+//! `animus_node::reserved_streams`.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;

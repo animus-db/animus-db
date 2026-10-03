@@ -32,6 +32,7 @@ pub mod host;
 pub mod http;
 pub mod index_backfill;
 pub mod pitr_janitor;
+pub mod reserved_streams;
 pub mod sigv4_gate;
 pub mod sim_relay;
 pub mod topology;

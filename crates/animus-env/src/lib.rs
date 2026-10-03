@@ -429,9 +429,8 @@ const RESERVED_STREAM_BLOCK: u64 = 16;
 /// `animus_cp_data::cluster_segment_store::SEGMENT_STREAM` (`u64::MAX`),
 /// `animus_cp_data::backup::BACKUP_SEGMENT_STREAM` (`u64::MAX - 1`), and
 /// `animus_cp_data::heartbeat_batch::HEARTBEAT_BATCH_STREAM`/
-/// `animus_node::sim_relay::RELAY_STREAM` (both `u64::MAX - 2`, by
-/// deliberate design — see those constants' own docs for why they never
-/// coexist on one env). This crate cannot name those constants directly
+/// `animus_node::sim_relay::RELAY_STREAM` (`u64::MAX - 2` and
+/// `u64::MAX - 3`; the table is `animus_node::reserved_streams`). This crate cannot name those constants directly
 /// (they live in crates layered above it), so it recognizes the
 /// *convention* they already all follow instead — "deliberately outside
 /// any `TabletId`'s realistic range" (a tablet id is minted from a small
