@@ -7,6 +7,9 @@
   actually in force. Root `CLAUDE.md`'s no-back-compat paragraph has been
   rewritten to match (see that file); it no longer states an unconditional
   "no compat, ever" rule — it now points here.
+  **Update 2026-10-03: Phase 0 and Phase 1 are done** (see "Phase 1 as
+  built (2026-10-03)" below); Phase 2 (wire/feature gate) is next, and
+  Phase 3 (rolling upgrades) after it.
 - **Date:** 2026-09-27 (Proposed); accepted 2026-09-27 (see Maintainer
   decision)
 - **Amends:** none. **Depends on:** [ADR 0003](0003-deterministic-simulation.md)
@@ -112,12 +115,12 @@ interpretation.
      reset:** **done** (2026-09-30). Tracked as five
      independent workstreams (A–E) — see the table below. All five PR
      series merged; the baseline commit above is `9a9f972f`.
-   - **Phase 1 — on-disk N-1 stability:** **in progress** (design
-     accepted 2026-09-30, see the "Phase 1 design" amendment: window =
-     every post-baseline version forever; per-crate implementation
-     workstreams P1-A..P1-D).
-   - **Phase 2 — replicated cluster version / wire feature-gate:** planned,
-     blocked on Phase 1.
+   - **Phase 1 — on-disk N-1 stability:** **done** (2026-10-03). Design
+     accepted 2026-09-30 (window = every post-baseline version forever);
+     workstreams P1-A..P1-D all merged. See "Phase 1 as built
+     (2026-10-03)" below for what is enforced and what is not.
+   - **Phase 2 — replicated cluster version / wire feature-gate:** planned;
+     unblocked by Phase 1 (next).
    - **Phase 3 — rolling-upgrade orchestration:** planned, blocked on
      Phase 2.
    - **Phase 4 — lift/rewrite the root `CLAUDE.md` no-back-compat rule:**
@@ -1452,22 +1455,86 @@ Phase 2), **rolling upgrades** and operator `spec.image` changes (Phase 3),
 and a stable hash-ring/key encoding beyond "frozen by the vectors" (open
 question below, unchanged).
 
-**Documents that claim otherwise today, and change only when Phase 1
-lands, not in this PR:** `website/architecture.html` (lines ~277 and ~292:
-"on-disk formats change between revisions ... upgrading means recreating
-the cluster"), `website/docs.html` (~536 and ~635), `website/how-it-works.html`
-(~222), and `website/index.html`'s "On-disk format stability, then rolling
-upgrades" Planned entry; also `docs/roadmap.md` C-16's status line and ADR
-0060's "Upgrades: None, by design". The website copy stays true as a
-statement of what is *tested and supported* (an upgrade is still cluster
-recreation until the restart corpus exists) even though the durable-format
-rule already binds the code; the Phase 1 close-out PR rewrites all of them
-in one change and updates this ADR's status header.
+**Documents that claimed otherwise** (`website/architecture.html`,
+`website/docs.html`, `website/how-it-works.html`, `website/install.html`,
+`website/index.html`, `docs/roadmap.md` C-16, ADR 0060's "Upgrades") were
+rewritten by the Phase 1 close-out PR (2026-10-03) to the contract above.
 
-**Phase status after this amendment:** Phase 0 done; **Phase 1 in progress**
-(design accepted; P1-A implemented, see "P1-A as built" below; P1-B..P1-D
-in flight); Phases 2 and 3 planned, blocked
-on Phase 1 as before.
+**Phase status after this amendment (historical, as of 2026-09-30):** Phase 0
+done; Phase 1 in progress; Phases 2 and 3 planned. Superseded by the next
+section.
+
+### Phase 1 as built (2026-10-03)
+
+Phase 1 is **done**: P1-A (#1124-#1127), P1-B (#1117, #1118), P1-C
+(#1119-#1122) and P1-D (#1130, #1137, #1139, #1143) have all merged, and
+#1144 moved the `animus-test` integration tests under `tests/it/`. The
+per-workstream as-built notes are above ("P1-A as built", "P1-B step 1/2
+as-built", "P1-C as-built", "P1-D as-built" tiers 0/1/2 and step 4); this
+section only states the resulting contract.
+
+**Enforced now:**
+
+- **Per-version fixture tests and `legacy` seams** for every durable format
+  in the inventory plus the row-value formats P1-A/P1-C added: the decoder
+  matches the version exactly, a fixture with no per-version expected value
+  panics, and an unsupported version is a named error (a downgrade is
+  refused by name, not misread).
+- **The 8-step format-change checklist** ("Phase 1 design" above) is the
+  review gate for any format change; it is pointed to from root
+  `CLAUDE.md`.
+- **`scripts/check-format-fixtures.sh`** (per-push CI): an existing fixture
+  is never edited or deleted.
+- **The upgrade-restart harness**, which restarts on state transcoded to an
+  older version with the test-only legacy encoders and verifies every
+  acknowledged write:
+  - *Tier 0* (`animus-test` `tests/it/upgrade_restart_tier0.rs`): seeds
+    disks from the checked-in fixtures and opens the real readers. Runs in
+    `cargo test --workspace`, i.e. per-push. Includes #1143's
+    registration/completeness check: every crate's
+    `tests/fixtures/formats/<dir>` must be named in `transcode::TABLE` or
+    `transcode::EMBEDDED`, every registration must have a directory, every
+    carrier must be a `TABLE` entry, and `current_version` must equal the
+    newest checked-in fixture. A new format therefore cannot land without
+    being registered with the harness.
+  - *Tier 1* (`animus-test` `tests/it/upgrade_restart_corpus.rs`, 21
+    cells): per-push at the default `ANIMUS_UPGRADE_RESTART_SEEDS=1`,
+    nightly at K=100 (`corpus-deep.yml`, step `upgrade_restart`).
+  - *Tier 2* (`animusd` `sim_cluster_upgrade_corpus`, whole `SimCluster`
+    over `LsmEngine<SimEnv>` plus the DynamoDB wire, 3 cells): per-push at
+    K=1 (it is a `--lib` test of `animusd`), nightly at K=50
+    (`corpus-deep.yml`, step `upgrade_restart_cluster`).
+  - Negative controls (a deliberately lossy transcode must fail the
+    corpus) are part of both tiers; see the P1-D as-built notes.
+
+**What Phase 1 does not give:**
+
+- **No wire compatibility.** Internal `Network` messages, forwarded client
+  requests and handshakes are only version-tagged (Phase 0 workstream D),
+  not negotiated; two builds with different wire formats cannot run in one
+  cluster. That is Phase 2.
+- **No rolling upgrades and no mixed-version running cluster.** The only
+  supported upgrade is a **whole-cluster stop, upgrade, restart**. Phase 3
+  (including operator `spec.image` orchestration) comes after Phase 2.
+- No stability guarantee for the hash-ring/key encoding beyond "pinned by
+  the key-vector fixtures" (open question below, unchanged).
+
+**State of the formats on main (2026-10-03):** there is **no checked-in
+`v2` fixture anywhere**, every `transcode::TABLE` entry has
+`current_version: 1`, so the harness's transcode is the **identity** for all
+formats today. The machinery is proven (restart over real bytes, oracle,
+seed replay, negative controls, registration completeness) but the
+older-version path has not yet been exercised by a real format bump. The
+first real bumps are in flight, **not landed**: #1140 (`control-wal` CWL
+v2) and #1141 (`shared-wal` SWL v2, sync markers). Whichever lands second
+must register v2 in `TABLE` (see "Coordination with #1140/#1141" above), and
+this section's "every `TABLE` entry is v1" sentence must then be updated.
+
+**Open questions resolved by Phase 1:** the support window (every
+post-baseline version, forever; decided 2026-09-30) and the Phase 1
+ordering (backups/PITR/export first) are resolved above. Still open: the
+Raft-codec freeze-or-keep-translating question and the hash-ring/key-
+encoding question.
 
 ### Amendment 2026-10-01: LSM WAL segment header is synced before any record (P1-B / P1-D follow-up)
 

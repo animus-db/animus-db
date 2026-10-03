@@ -106,11 +106,16 @@ format change is a new version tag plus a new fixture, never a rewrite of an
 old one. **Wire formats** join the same rule once Phase 2 (a replicated
 cluster version / feature gate) lands; **rolling upgrades** once Phase 3
 lands; **Support window: every post-baseline version stays readable forever**
-(2026-09-30) — old decoders and fixtures are never deleted. Phase 1 (upgrade-
-on-read decoders, per-version fixture tests, an upgrade-restart sim corpus;
-backups/PITR first) is in progress; until it lands the "decoder still
-accepts older versions" half is enforced by the v1 fixtures still decoding
-in CI plus review. **A format change follows ADR 0073's "Phase 1 design"
+(2026-09-30) — old decoders and fixtures are never deleted. **Phase 1 is done (2026-10-03):** every durable format has a
+version-dispatching decoder with a `legacy` seam and a per-version fixture
+test, and the upgrade-restart harness (`animus-test` tiers 0/1,
+`animusd` `sim_cluster_upgrade_corpus` tier 2; per-push at K=1, nightly in
+`corpus-deep.yml`) restarts on state transcoded to older versions. So a
+**whole-cluster stop → upgrade → restart is supported and tested**;
+**mixed-version wire and rolling upgrades are not** (Phases 2 and 3 —
+Phase 2, a replicated cluster version / feature gate, is next). Every
+format is still v1 on `main`, so the transcode is the identity until the
+first real bump. **A format change follows ADR 0073's "Phase 1 design"
 checklist** ([`docs/adr/0073-upgrade-compatibility.md`](docs/adr/0073-upgrade-compatibility.md):
 bump, keep the vN decoder under `legacy`, new no-overwrite fixture,
 per-version expected value, round-trip and old-input tests, test-only legacy

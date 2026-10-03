@@ -532,9 +532,10 @@
         tears down everything it owns through ordinary Kubernetes garbage collection. A
         CI-gated smoke test exercises a real <code>kind</code> cluster end-to-end — create,
         bootstrap, scale, delete — on every change to this surface. Kubernetes' own rolling
-        update replaces pods one at a time on an image change, but AnimusDB gives no
-        format-compatibility guarantee between revisions, so an upgrade still means recreating
-        the cluster in practice.
+        update would replace pods one at a time on an image change, but AnimusDB does not yet
+        support running two versions in one cluster (no wire compatibility, no rolling
+        upgrades), so the operator does not orchestrate upgrades: the supported path is a
+        whole-cluster stop, upgrade and restart.
       </p>
     </section>
 
@@ -632,8 +633,10 @@
           config-gated per cluster. A cluster with no TLS configured is unauthenticated plain TCP,
           exactly as before; caller identity on the DynamoDB port is opt-in SigV4 either way, not
           affected by TLS.</li>
-        <li><strong>No format compatibility between revisions.</strong> Upgrading means recreating
-          the cluster.</li>
+        <li><strong>No rolling upgrades or mixed-version clusters.</strong> A full-cluster stop,
+          upgrade and restart across versions is supported and tested (on-disk formats stay
+          readable across versions), but nodes on different versions cannot talk to each
+          other yet, so upgrade every node at once.</li>
         <li><strong>Restore always creates a brand-new table, never in-place</strong> — matching
           real DynamoDB, for both on-demand backups (<code>RestoreTableFromBackup</code>) and
           continuous backups (<code>RestoreTableToPointInTime</code>); a source table's backup

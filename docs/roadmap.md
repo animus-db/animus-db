@@ -1519,7 +1519,7 @@ rows this section used to carry were fixed by the stale-prose sweep.
   amendment's own "what remains unowned" accounting and `crates/animusd/
   CLAUDE.md`'s consolidated closed-C-15 appendix.
 
-### C-16 Upgrade compatibility (ADR 0073) — Phase 0 done; Phase 1 in progress
+### C-16 Upgrade compatibility (ADR 0073) — Phases 0 and 1 done; Phase 2 next
 
 - **Gap (closed):** `website/index.html` listed "On-disk format stability,
   then rolling upgrades" as Planned with no ADR, roadmap entry, or issue
@@ -1560,7 +1560,7 @@ rows this section used to carry were fixed by the stale-prose sweep.
   Phase 1 (on-disk N-1 stability, backups/PITR first), Phase 2 (replicated
   cluster-version/feature-gate for wire compatibility), and Phase 3
   (rolling-upgrade orchestration including operator `spec.image` support)
-  remain planned. **Phase 1 is in progress** (design accepted 2026-09-30:
+  remain planned. **Phase 1 is done (2026-10-03)** (design accepted 2026-09-30:
   the support window is **every post-baseline format version, forever**;
   see ADR 0073's "Phase 1 design" amendment for the audit, the
   upgrade-on-read decoder pattern, the format-change checklist and the
@@ -1575,7 +1575,16 @@ rows this section used to carry were fixed by the stale-prose sweep.
   mirror entity fixtures); **P1-D** `animus-test` + `animusd` (the
   upgrade-restart corpus: test-only legacy encoders + transcode-at-rest,
   tiers 0-2, knob `ANIMUS_UPGRADE_RESTART_SEEDS`). Waves: A/B/C concurrent,
-  then D. Phase 4 (lifting/rewriting root `CLAUDE.md`'s
+  then D. All four workstreams have merged; ADR 0073's "Phase 1 as built
+  (2026-10-03)" states the resulting contract: a **whole-cluster stop →
+  upgrade → restart across post-baseline versions is supported and
+  tested** (per-version fixture tests, `legacy` decoders, the format-change
+  checklist, the upgrade-restart harness tiers 0-2 per-push at K=1 and
+  nightly at K=100/K=50). **Not supported yet:** mixed-version wire and
+  rolling upgrades. Every format is still at v1 on `main` (the harness's
+  transcode is the identity); the first real bumps, CWL/SWL v2, are in
+  flight (#1140/#1141). **Next: Phase 2** (replicated cluster version /
+  feature gate), then Phase 3. Phase 4 (lifting/rewriting root `CLAUDE.md`'s
   no-back-compat rule) is **already done** by this same maintainer
   decision — root `CLAUDE.md` now states the staged ratchet directly.
 - **Reuse:** the magic (4-byte ASCII) + `u8` version + loud named error
@@ -1594,7 +1603,7 @@ rows this section used to carry were fixed by the stale-prose sweep.
   knob `ANIMUS_UPGRADE_SEEDS`, Phase 2/3 work); a `kind` e2e for the
   operator's rolling-restart path, once Phase 3 exists.
 - **ADR:** [0073](adr/0073-upgrade-compatibility.md) (Accepted, 2026-09-27
-  — Phase 0 done, baseline `9a9f972f`; Phase 1 in progress; Phases 2-3
+  — Phases 0 and 1 done, baseline `9a9f972f`; Phase 2 next; Phase 3
   planned).
 - **Size:** XL overall across all four phases; Phase 0 alone is roughly M
   (mechanical, one format at a time, no design risk), now split five ways
