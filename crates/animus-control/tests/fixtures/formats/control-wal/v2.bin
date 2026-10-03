@@ -1,0 +1,6 @@
+3133edf2:CWL102{"Hard":{"term":3,"voted_for":"n1"}}
+a15afa3a:CWL102{"Append":{"term":3,"index":1,"command":{"UpsertMember":{"node":"n2","labels":{},"status":"Active"}},"config":null,"learners":null}}
+c16be124:CWL102!sync:200
+b608ee54:CWL102{"Truncate":{"keep":1}}
+65671af8:CWL102{"Snapshot":{"metadata":{"v":1,"members":{},"tablets":{},"policies":{},"schemas":{"tables":{}},"next_tablet_id":0,"node_addrs":{},"split_lineage":{},"split_placing":{},"stream_shards":[],"index_backfill":[],"backups":{},"backup_tablet_progress":[],"restores":{},"pitr_segments":[],"pitr_generation":{},"pitr_base_backups":[],"credentials":{},"exports":{},"imports":{}},"last_index":5,"last_term":3,"config":["n1","n2"],"learners":["n3"]}}
+d0609abc:CWL102!sync:718

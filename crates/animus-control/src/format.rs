@@ -98,6 +98,39 @@ pub enum FormatError {
         /// underlying `serde_json` error's own `Display`).
         detail: String,
     },
+    /// A line-framed WAL's line failed its checksum (or was otherwise
+    /// unframed) at byte `offset`, **but a valid sync marker proves every
+    /// byte before `durable_to` had been fsynced** (see [`decode_lines`]'s
+    /// "Mid-file corruption" section) and `offset < durable_to`. A crash
+    /// can only ever damage the un-synced tail, so this is damage to
+    /// already-durable, possibly acknowledged history (at-rest corruption,
+    /// or a disk that acked an `fsync` it then lost) — never a torn tail.
+    /// Silently truncating here would drop acked Raft term/vote/log
+    /// history, so it is always loud.
+    MidFileCorruption {
+        /// The format's [`FormatTag::name`].
+        format: &'static str,
+        /// Byte offset of the first bad line.
+        offset: u64,
+        /// Offset claimed by the greatest valid sync marker (the marker's
+        /// own start): every byte before it was durable when it was written.
+        durable_to: u64,
+    },
+    /// A CRC-valid sync marker whose claimed offset is not the byte offset
+    /// the marker line actually starts at. A correct writer cannot produce
+    /// this (it appends the marker at exactly the length it records, and
+    /// every file rewrite regenerates the file from records, dropping
+    /// markers), so it means the file was spliced, truncated from the
+    /// front, or had a marker copied across offsets: the marker's durability
+    /// claim can no longer be trusted, so decoding refuses by name.
+    BadSyncMarker {
+        /// The format's [`FormatTag::name`].
+        format: &'static str,
+        /// Byte offset the marker line actually starts at.
+        offset: u64,
+        /// The offset the marker claims.
+        claimed: u64,
+    },
 }
 
 impl fmt::Display for FormatError {
@@ -118,6 +151,25 @@ impl fmt::Display for FormatError {
             FormatError::Malformed { format, detail } => {
                 write!(f, "{format}: malformed record: {detail}")
             }
+            FormatError::MidFileCorruption {
+                format,
+                offset,
+                durable_to,
+            } => write!(
+                f,
+                "{format}: corrupt record at byte offset {offset}, before the \
+                 durable boundary {durable_to} proven by a later valid sync \
+                 marker: not a torn tail - refusing to silently drop durable history"
+            ),
+            FormatError::BadSyncMarker {
+                format,
+                offset,
+                claimed,
+            } => write!(
+                f,
+                "{format}: sync marker at byte offset {offset} claims offset \
+                 {claimed}: marker does not sit where it says (spliced or damaged file)"
+            ),
         }
     }
 }
@@ -190,84 +242,294 @@ pub fn encode_line(tag: &FormatTag, payload: &[u8]) -> Vec<u8> {
     line
 }
 
+/// The first version whose writers emit sync markers
+/// ([`encode_sync_marker`]); lines of an older version never carry one.
+pub const SYNC_MARKER_MIN_VERSION: u8 = 2;
+
+/// Payload prefix of a sync-marker line. Every real record payload is
+/// `serde_json` of an object/enum (`{` / `"`), so `!` can never begin one.
+const SYNC_MARKER_PREFIX: &[u8] = b"!sync:";
+
+/// Frame a **sync marker**: an ordinary [`encode_line`] line (so it is
+/// CRC-checked like any other, and carries `tag.version`) whose payload is
+/// `!sync:<durable_to>`. `durable_to` must be the file's length at the
+/// moment the marker is appended — i.e. the marker's own start offset — and
+/// the marker must be appended only **after** an `fsync` that returned `Ok`
+/// and covered every byte before it. See [`decode_lines`].
+///
+/// # Panics
+/// Never; a `tag.version` below [`SYNC_MARKER_MIN_VERSION`] simply produces a
+/// marker no decoder will recognise (callers only use v2+ tags).
+#[must_use]
+pub fn encode_sync_marker(tag: &FormatTag, durable_to: u64) -> Vec<u8> {
+    encode_line(tag, format!("!sync:{durable_to}").as_bytes())
+}
+
+/// A [`decode_lines`] result plus how much of the buffer is clean.
+#[derive(Debug)]
+pub struct DecodedLines<'a> {
+    /// Every record line, in file order, as `(version, payload)`. Sync
+    /// markers are consumed by the decoder and never appear here.
+    pub lines: Vec<(u8, &'a [u8])>,
+    /// Length of the clean prefix: the offset of the first bad line (a
+    /// tolerated torn tail), or `bytes.len()` when every line was good. A
+    /// writer reopening the file must cut it back to this length (see
+    /// [`repaired_image`]) before appending, or its next write would sit
+    /// after garbage.
+    pub valid_len: usize,
+}
+
+/// The bytes a writer must `replace` the file with before appending to it
+/// again, or `None` when the file is already clean. A torn/corrupt tail is
+/// cut off at [`DecodedLines::valid_len`]; a final valid line that merely
+/// lacks its `\n` (a crash between a line's body and its terminator) gets one,
+/// so the next append starts on a fresh line instead of fusing with it.
+///
+/// This is load-bearing for the mid-file rule, not just tidiness: leaving
+/// torn garbage in place and appending after it would put a bad line *before*
+/// later valid sync markers, and the next recovery would (correctly!) refuse
+/// the file as mid-file corruption.
+/// Legacy-encoder for the upgrade-restart harness (ADR 0073 "Legacy encoders
+/// are test-only"): re-frame a line-framed file at `tag`'s current (v2)
+/// version back to **v1**. Type-erased on purpose (framing in, framing out; the
+/// record payloads are identical between v1 and v2, v2 only added sync-marker
+/// lines). Sync-marker lines are dropped (v1 has none and a v1 reader rejects a
+/// version-2 line), every record line is re-framed under the v1 tag, and a torn
+/// tail is cut (the same clean prefix a recovering writer keeps). A file that
+/// is mid-file corrupt is the same named error the decoder reports.
+///
+/// # Errors
+/// Whatever [`decode_lines_extent`] reports for `bytes`.
+#[cfg(any(test, feature = "legacy-encoders"))]
+pub fn reframe_to_v1(tag: &FormatTag, bytes: &[u8]) -> Result<Vec<u8>, FormatError> {
+    let v1 = FormatTag { version: 1, ..*tag };
+    let decoded = decode_lines_extent(tag, bytes)?;
+    let mut out = Vec::with_capacity(bytes.len());
+    for (_version, payload) in decoded.lines {
+        out.extend(encode_line(&v1, payload));
+    }
+    Ok(out)
+}
+
+#[must_use]
+pub fn repaired_image(bytes: &[u8], valid_len: usize) -> Option<Vec<u8>> {
+    let mut clean = bytes[..valid_len].to_vec();
+    if clean.last().is_some_and(|&b| b != b'\n') {
+        clean.push(b'\n');
+    }
+    (clean != bytes).then_some(clean)
+}
+
+/// CRC-check one line (no trailing `\n`): `Some(body)` (magic + version +
+/// payload, at least 6 bytes) when it is framed correctly, else `None`.
+fn frame_body(line: &[u8]) -> Option<&[u8]> {
+    let colon = line.iter().position(|&b| b == b':')?;
+    let (hex, rest) = line.split_at(colon);
+    if hex.len() != 8 {
+        return None;
+    }
+    let expected_crc = u32::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?;
+    let body = &rest[1..];
+    if crc32fast::hash(body) != expected_crc {
+        return None;
+    }
+    // CRC-valid, but too short to hold magic + version: can only arise by
+    // the same physical torn-write process, so it counts as unframed.
+    (body.len() >= 6).then_some(body)
+}
+
+/// The version of a CRC-valid body, or the same named errors
+/// [`decode_lines`] has always returned for it.
+fn body_version(tag: &FormatTag, body: &[u8]) -> Result<u8, FormatError> {
+    if body[..4] != tag.magic[..] {
+        return Err(FormatError::PreBaselineFormat { format: tag.name });
+    }
+    let Some(version) = std::str::from_utf8(&body[4..6])
+        .ok()
+        .and_then(|s| u8::from_str_radix(s, 16).ok())
+    else {
+        return Err(FormatError::Malformed {
+            format: tag.name,
+            detail: format!("version field {:?} is not valid hex", &body[4..6]),
+        });
+    };
+    if version == 0 || version > tag.version {
+        return Err(FormatError::UnsupportedFormatVersion {
+            format: tag.name,
+            found: version,
+            max_supported: tag.version,
+        });
+    }
+    Ok(version)
+}
+
+/// If `payload` is a sync marker, its claimed offset. `Err` for a marker
+/// whose number does not parse (CRC-valid, so real damage or an encoder bug).
+fn parse_marker(tag: &FormatTag, payload: &[u8]) -> Result<Option<u64>, FormatError> {
+    let Some(num) = payload.strip_prefix(SYNC_MARKER_PREFIX) else {
+        return Ok(None);
+    };
+    std::str::from_utf8(num)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Some)
+        .ok_or_else(|| FormatError::Malformed {
+            format: tag.name,
+            detail: format!("sync marker offset {num:?} is not a decimal u64"),
+        })
+}
+
 /// Decode a buffer of [`encode_line`]-framed lines back into `(version,
-/// payload)` pairs, in file order.
+/// payload)` pairs, in file order. Thin wrapper over
+/// [`decode_lines_extent`] for callers that do not repair the file.
+pub fn decode_lines<'a>(
+    tag: &FormatTag,
+    bytes: &'a [u8],
+) -> Result<Vec<(u8, &'a [u8])>, FormatError> {
+    decode_lines_extent(tag, bytes).map(|d| d.lines)
+}
+
+/// Decode a buffer of [`encode_line`]-framed lines.
 ///
 /// - Empty lines are skipped.
 /// - A line whose CRC **framing** itself fails to check out — no `:`
 ///   separator, a non-8-hex-digit prefix, a CRC mismatch, or (once the CRC
 ///   *does* match) too few bytes to even hold a full `magic + version`
-///   header — **stops decoding silently**, returning every line collected
-///   so far, never an `Err`. This is the torn-tail/at-rest-corruption
-///   tolerance issue #495 established for `persist.rs`'s own WAL,
-///   generalized here: a write torn by a crash can only ever be the
-///   buffer's physical tail, so everything decoded before it is unaffected
-///   and safe to trust.
+///   header — is a **bad line**. Records are returned only up to the first
+///   bad line; whether that is tolerated is decided below.
 /// - A CRC-valid line whose magic doesn't match `tag.magic` is
 ///   `Err(FormatError::PreBaselineFormat)` — exactly what a pre-baseline,
 ///   untagged line (a bare `<crc32>:<json>` record, the format this line
 ///   shape replaces) looks like to a post-baseline decoder.
 /// - A CRC-valid, correctly-tagged line whose version is `0` or greater
 ///   than `tag.version` is `Err(FormatError::UnsupportedFormatVersion)`.
+///   (Only for lines reached *before* the first bad line, unchanged.)
+///
+/// # Mid-file corruption (version 2+; the sync-marker rule)
+///
+/// A crash tears only the file's un-synced tail, but that tail can hold
+/// **several complete lines** (a persist round appends N records and syncs
+/// once), and `animus-sim`'s `corrupt_on_crash` flips a byte anywhere in the
+/// kept part of it. So "bad line followed by a valid line" is *not* proof of
+/// mid-file corruption here — measured at 72 of 300 crash seeds with a
+/// correct writer. (`animus-storage`'s LSM WAL resync proof is sound only
+/// when at most one frame can be un-synced.) The decoder therefore needs a
+/// positional proof it cannot forge: the **sync marker**. After every `fsync`
+/// that returns `Ok`, the writer appends a marker line `!sync:<N>` where `N`
+/// is the file length at that moment == the marker's own start offset. A
+/// valid marker at offset `M` proves every byte `< M` was durable, hence
+/// untouchable by any later crash. (The marker is written *after* the sync;
+/// written before, a kept-prefix tear could preserve it next to a flipped
+/// byte in the same un-synced round and fake a proof. The marker itself is
+/// un-synced until the next sync and may be torn — which only loses a proof,
+/// never invents one.)
+///
+/// Exact algorithm, one pass over the lines with their byte offsets:
+/// 1. Walk lines in order. Before any bad line, a valid line is processed as
+///    above; a marker line (version `>= 2`, payload `!sync:<N>`) is not
+///    emitted, and if `N` != its own start offset the decode is
+///    `Err(BadSyncMarker)`; otherwise it raises `M` (the greatest marker
+///    start seen).
+/// 2. At the first bad line, remember its offset `B` and **keep scanning to
+///    the end of the buffer for markers only** (this is what stops a bad
+///    *first* line from hiding every later proof). Valid non-marker lines
+///    after `B` are ignored; a valid marker after `B` is checked for
+///    `N == own offset` (else `Err(BadSyncMarker)`) and raises `M`. Bad
+///    lines after `B` are ignored.
+/// 3. At the end: if `B` exists and `B < M`, `Err(MidFileCorruption {
+///    offset: B, durable_to: M })`. Otherwise (`B >= M`, or no marker at
+///    all, or no bad line) the bad line is a torn tail: return the records
+///    before `B`, exactly as before.
+///
+/// Files with no markers (every version-1 file, or a v2 file crashed before
+/// its first marker) keep the lenient behaviour: a bad line anywhere is a
+/// tail. A mixed file (v1 lines, then v2 lines and markers) is valid; a
+/// marker's proof covers v1 lines before it too.
+///
+/// Residual exposure, inherent: the *latest* round has no durable marker
+/// until the next sync, so corruption of that one round alone is still
+/// indistinguishable from a torn tail.
 ///
 /// Never panics on any input.
-pub fn decode_lines<'a>(
+pub fn decode_lines_extent<'a>(
     tag: &FormatTag,
     bytes: &'a [u8],
-) -> Result<Vec<(u8, &'a [u8])>, FormatError> {
-    let mut out = Vec::new();
-    for line in bytes.split(|&b| b == b'\n') {
+) -> Result<DecodedLines<'a>, FormatError> {
+    let mut lines = Vec::new();
+    let mut first_bad: Option<usize> = None;
+    let mut durable_to: Option<usize> = None;
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let start = pos;
+        let (end, next) = match bytes[pos..].iter().position(|&b| b == b'\n') {
+            Some(r) => (pos + r, pos + r + 1),
+            None => (bytes.len(), bytes.len()),
+        };
+        pos = next;
+        let line = &bytes[start..end];
         if line.is_empty() {
             continue;
         }
-        let Some(colon) = line.iter().position(|&b| b == b':') else {
-            break;
+        let body = frame_body(line);
+        let Some(body) = body else {
+            first_bad.get_or_insert(start);
+            continue;
         };
-        let (hex, rest) = line.split_at(colon);
-        if hex.len() != 8 {
-            break;
+        if first_bad.is_some() {
+            // Past the first bad line: only a valid marker matters, and only
+            // one this decoder understands (right magic, v2..=current).
+            if body[..4] != tag.magic[..] {
+                continue;
+            }
+            let Some(version) = std::str::from_utf8(&body[4..6])
+                .ok()
+                .and_then(|s| u8::from_str_radix(s, 16).ok())
+            else {
+                continue;
+            };
+            if !(SYNC_MARKER_MIN_VERSION..=tag.version).contains(&version) {
+                continue;
+            }
+            if let Some(claimed) = parse_marker(tag, &body[6..])? {
+                durable_to = Some(check_marker(tag, start, claimed)?);
+            }
+            continue;
         }
-        let Ok(hex_str) = std::str::from_utf8(hex) else {
-            break;
-        };
-        let Ok(expected_crc) = u32::from_str_radix(hex_str, 16) else {
-            break;
-        };
-        let body = &rest[1..];
-        if crc32fast::hash(body) != expected_crc {
-            break;
+        let version = body_version(tag, body)?;
+        if version >= SYNC_MARKER_MIN_VERSION
+            && let Some(claimed) = parse_marker(tag, &body[6..])?
+        {
+            durable_to = Some(check_marker(tag, start, claimed)?);
+            continue;
         }
-        // CRC-valid from here on: every remaining decision is about real
-        // content (an unrecognized tag, an unsupported version), never a
-        // torn tail — except a body too short to even hold a magic+version
-        // header, which (an adversarial CRC collision aside) can't
-        // legitimately arise except by the same physical torn-write
-        // process, so it's treated identically: a silent stop.
-        if body.len() < 6 {
-            break;
-        }
-        if body[..4] != tag.magic[..] {
-            return Err(FormatError::PreBaselineFormat { format: tag.name });
-        }
-        let Some(version) = std::str::from_utf8(&body[4..6])
-            .ok()
-            .and_then(|s| u8::from_str_radix(s, 16).ok())
-        else {
-            return Err(FormatError::Malformed {
-                format: tag.name,
-                detail: format!("version field {:?} is not valid hex", &body[4..6]),
-            });
-        };
-        if version == 0 || version > tag.version {
-            return Err(FormatError::UnsupportedFormatVersion {
-                format: tag.name,
-                found: version,
-                max_supported: tag.version,
-            });
-        }
-        out.push((version, &body[6..]));
+        lines.push((version, &body[6..]));
     }
-    Ok(out)
+    if let (Some(bad), Some(durable)) = (first_bad, durable_to)
+        && bad < durable
+    {
+        return Err(FormatError::MidFileCorruption {
+            format: tag.name,
+            offset: bad as u64,
+            durable_to: durable as u64,
+        });
+    }
+    Ok(DecodedLines {
+        lines,
+        valid_len: first_bad.unwrap_or(bytes.len()),
+    })
+}
+
+/// A marker is only a proof if it sits where it says it does.
+fn check_marker(tag: &FormatTag, start: usize, claimed: u64) -> Result<usize, FormatError> {
+    if claimed == start as u64 {
+        Ok(start)
+    } else {
+        Err(FormatError::BadSyncMarker {
+            format: tag.name,
+            offset: start as u64,
+            claimed,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -464,5 +726,65 @@ mod tests {
                 max_supported: 1,
             }
         );
+    }
+
+    const TAG2: FormatTag = FormatTag {
+        magic: *b"TST1",
+        version: 2,
+        name: "test-format",
+    };
+
+    /// A bad *first* line followed by a valid marker must not hide the proof:
+    /// the scan continues past the first bad line.
+    #[test]
+    fn a_bad_first_line_before_a_marker_is_mid_file_corruption() {
+        let mut bytes = encode_line(&TAG2, b"{\"a\":1}");
+        let second = bytes.len();
+        bytes.extend(encode_line(&TAG2, b"{\"b\":2}"));
+        let marker_at = bytes.len();
+        bytes.extend(encode_sync_marker(&TAG2, marker_at as u64));
+        bytes[12] ^= 0xFF;
+        assert_eq!(
+            decode_lines(&TAG2, &bytes).unwrap_err(),
+            FormatError::MidFileCorruption {
+                format: "test-format",
+                offset: 0,
+                durable_to: marker_at as u64,
+            }
+        );
+        assert!(second > 0);
+        // No marker at all: lenient, even with a valid line after the bad one.
+        let lenient = &bytes[..marker_at];
+        assert_eq!(decode_lines(&TAG2, lenient).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn a_malformed_marker_payload_is_malformed() {
+        let line = encode_line(&TAG2, b"!sync:notanumber");
+        assert!(matches!(
+            decode_lines(&TAG2, &line),
+            Err(FormatError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn repaired_image_cuts_the_tail_and_terminates_the_last_line() {
+        let mut bytes = encode_line(&TAG2, b"x");
+        let good = bytes.len();
+        bytes.extend_from_slice(b"deadbeef:TST102garb");
+        let d = decode_lines_extent(&TAG2, &bytes).unwrap();
+        assert_eq!(d.valid_len, good);
+        assert_eq!(
+            repaired_image(&bytes, d.valid_len).unwrap(),
+            bytes[..good].to_vec()
+        );
+        // Clean file: nothing to do.
+        let clean = encode_line(&TAG2, b"x");
+        assert!(repaired_image(&clean, clean.len()).is_none());
+        // Valid last line with its `\n` lost gains one.
+        let unterminated = &clean[..clean.len() - 1];
+        let d = decode_lines_extent(&TAG2, unterminated).unwrap();
+        assert_eq!(d.lines.len(), 1);
+        assert_eq!(repaired_image(unterminated, d.valid_len).unwrap(), clean);
     }
 }

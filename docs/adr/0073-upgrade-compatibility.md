@@ -199,12 +199,12 @@ range a format needs:
 | LSM WAL records | `crates/animus-storage/src/lsm/wal.rs` | `WAL_MAGIC = b"LWL1"`, `WAL_VERSION: u8 = 1` | durable, node-local | Record framing has no explicit version byte; crash-safety relies on length-prefixed/checksummed records and torn-tail detection, not on version negotiation. Any format change today is a silent break on reopen with an older build, or a loud one only if the length/checksum fields happen to mismatch. |
 | LSM SSTable data blocks + footer | `crates/animus-storage/src/lsm/sstable.rs` | `MAGIC: u64 = 0x4355_5354_4F53_5333` in the footer (file identification only — the reader takes the actual format from the manifest, not by re-reading the footer) plus a real per-table version tag, `SsTableMeta::format: u32` (`FORMAT_CURRENT = 1`), recorded in the manifest for each table | durable, node-local | Better covered than it first looks: the format version lives one level up, in the manifest's per-table metadata, not in the footer bytes themselves. The block index has its own separate magic+version too: `INDEX_MAGIC = b"SSIX"`, `INDEX_VERSION: u8 = 1`. All three (footer magic, manifest-recorded table format, index magic+version) currently describe a single supported format — there is no decoder path for `format != FORMAT_CURRENT` yet, so the tag would need a real N-1 branch added before Phase 1 could rely on it. |
 | LSM manifest | `crates/animus-storage/src/lsm.rs` (`encode_manifest`/`decode_manifest`) | `MANIFEST_MAGIC = b"CMF1"`, `MANIFEST_VERSION: u8 = 1` | durable, node-local | The best-covered format in `animus-storage`: magic + version + a documented legacy fallback (`decode_manifest` still reads a pre-binary-codec JSON manifest when the magic is absent). This is the pattern the rest of the inventory should converge on. |
-| Control-plane Raft WAL (`RaftCore` log entries + membership records) | `crates/animus-control/src/persist.rs` | `CONTROL_WAL`: `CWL1` + version 1 (`format::encode_line`) | durable, node-local | Two generations of this format have already existed with no version discriminator between them; a reader distinguishes them structurally (parse success), not by a tag. Works only because both are JSON and one is a strict superset shape. |
+| Control-plane Raft WAL (`RaftCore` log entries + membership records) | `crates/animus-control/src/persist.rs` | `CONTROL_WAL`: `CWL1` + version **2** (`format::encode_line`); v1 retained as `persist::dispatch::legacy::v1` (fixture `control-wal/v1.bin`; v2 adds sync-marker lines, fixture `control-wal/v2.bin`, issue #1132) | durable, node-local | Two generations of this format have already existed with no version discriminator between them; a reader distinguishes them structurally (parse success), not by a tag. Works only because both are JSON and one is a strict superset shape. |
 | Control-plane snapshot / `InstallSnapshot` payload | `crates/animus-control/src/raft.rs` (`RaftCore::snapshot`, the `S` state-machine type) | `CONTROL_SNAPSHOT`: `CSN1` + version 1 (`persist.rs`), wrapping `S`'s own serde shape | durable, node-local (persisted) **and** transient wire (`InstallSnapshot` RPC) | Same gap as the WAL: whatever `Metadata`'s own serde shape is *is* the wire format, with no independent version byte wrapping it. |
 | `Metadata` + its system-keyspace mirror (ADR 0038) | `crates/animus-control/src/meta.rs`, `syskv.rs` | `METADATA_VERSION: u32 = 1` (`meta.rs`, serialized as `"v"`); the system-keyspace mirror carries `SYSKV_MIRROR_VERSION: u32 = 1` (`mirror.rs`). Individual fields still use ADR 0035's `#[serde(default)]` pattern | durable, node-local (mirror) **and** replicated over the control Raft log | The field-by-field-default discipline is real and documented (ADR 0035 §"Rolling upgrade") but it is a convention, not a checked invariant — nothing fails loudly if a new field is added without the default, or if a field's *meaning* changes without renaming it. |
 | CP-data Raft command codec (`KvCommand` etc.) | `crates/animus-cp-data/src/codec.rs` | `MAGIC = 0xCB`, `const VERSION: u8 = 1` | durable, node-local (in the WAL/SharedWal) and transient wire (Raft replication) | The single best-versioned format in the whole system — a version byte is written by every encode and checked by every decode, loud `Err` on mismatch (no cross-version decoding attempted). The `VERSION` bump cadence (31 already) shows how often this layer has changed; each bump is currently an unconditional breaking change, by design. |
 | Segment codec (streams, ADR 0042/0043) | `crates/animus-cp-data/src/segment.rs` | `MAGIC = b"SEGF"`, `pub const VERSION: u8 = 1` | durable, node-local (per-tablet change-log segments) and consumed by backup/PITR/export as a data source | Same magic+version+loud-error discipline as the RaftKV codec, explicitly modeled on it (module doc: "mirroring `codec.rs`'s own ... discipline"). |
-| `SharedWal` record framing (ADR 0028, C-05) | `crates/animus-control/src/persist.rs` (`SHARED_WAL_TAG`, `encode_tagged_record`) | `SHARED_WAL_TAG`: `SWL1` + version 1 on the outer `Line{tablet, record}` envelope; the inner `record` bytes are the already-versioned `codec.rs` payload | durable, node-local | Two-layer format: inner payload versioned, outer multi-tenant tagging envelope not. |
+| `SharedWal` record framing (ADR 0028, C-05) | `crates/animus-control/src/persist.rs` (`SHARED_WAL_TAG`, `encode_tagged_record`) | `SHARED_WAL_TAG`: `SWL1` + version **2** (sync markers, #1132; v1 kept as `dispatch::legacy_shared::v1`, fixtures `shared-wal/v1.bin`+`v2.bin`) on the outer `Line{tablet, record}` envelope; the inner `record` bytes are the already-versioned `codec.rs` payload | durable, node-local | Two-layer format: inner payload versioned, outer multi-tenant tagging envelope not. |
 | Per-tablet engine key layout (ADR 0050: `kind \|\| logical`) | `crates/animus-cp-data/src/layout.rs` (and `host.rs` callers) | a reserved-namespace marker key per engine: `LAYOUT_MAGIC = b"KLY1"`, `LAYOUT_EPOCH: u8 = 1` (the layout is still a key-space convention; the marker stamps its epoch) | durable, node-local (defines what every stored key means) | Explicitly called out in the task framing: changing this is equivalent to a full re-encode of every stored row, categorically different from bumping `codec.rs::VERSION`. |
 | Hash-ring token / key encoding (ADR 0022/0023, ADR 0063's `N`-key layout) | `crates/animus-tablet/src/lib.rs` (`murmur3_x64_128`, `key_bytes()` in `animus-item`) | **none** — no version byte; correctness here means *every* node, every table, every historical row agrees on one encoding | durable, outlives the cluster (any row's placement and every index/backup/export/stream record derived from its key depend on it) | The highest-blast-radius unversioned format in the system: ADR 0063's own note is explicit that changing this is "no migration owed per root `CLAUDE.md`" today — i.e. it is currently *understood* to be a breaking, no-compat-path change, same category as the key layout above, but with the widest reach (base keys, GSI/LSI keys, stream `base_sk`, backup/export objects all inherit it). |
 | Internal `Network` message enums (control Raft `RaftMsg`, CP-data Raft messages, `ClientRequest`/`ClientResponse` in `animus-node::wire`) | `crates/animus-control/src/raft.rs` (`RaftMsg<C>`), `crates/animus-node/src/wire.rs` (`ClientRequest`/`ClientResponse`) | the connection handshake carries `NETWORK_PROTOCOL` (`NHS1`) / `CLIENT_PROTOCOL` (`CHS1`), each version 1 (`animus-env/src/handshake.rs`); the message enums themselves are still unversioned `serde_json`, and `wire.rs`'s (pre-Phase-0) doc comment said outright: *"this repo's pre-alpha stance ... both sides of a cluster are the same build ... so no version negotiation is needed"* | transient wire (internal/intra ports) | The one format in this table whose *design comment* already states the exact assumption this ADR would need to break: same-build-on-both-ends. Any mixed-version rolling upgrade needs this to become additive-only (ADR 0035's config/wire pattern), immediately, before anything else here matters — a rolling restart is, definitionally, a period where two builds talk to each other over this wire. |
@@ -1487,6 +1487,63 @@ so a bad header there is real corruption and stays loud (the version-dispatch
 seam is untouched for >= 5 bytes); a shorter file never had a synced header
 and holds no acked data. Regression: `animus-storage/tests/lsm_crash.rs`
 `crash_during_segment_header_creation`.
+
+## Amendment 2026-10-01 — `CWL1`/`SWL1` v2: sync markers (issue #1132)
+
+A decoder-behaviour change that needed a format bump. Both line-framed WALs
+(`CWL1`, the control-plane Raft WAL, and `SWL1`, the `SharedWal`; the
+per-group `raftkv.wal` shares `CWL1`) treated a CRC failure on *any* line as a
+crash-torn tail, so rot in an early line silently dropped acked term/vote/log
+history. The LSM WAL's resync proof ("a valid frame follows, so it is not a
+torn tail") cannot be copied: a persist round appends N lines then syncs once,
+and `animus-sim`'s `corrupt_on_crash` flips a byte anywhere in the kept part
+of that un-synced region, so a correct writer plus a crash produces "bad line,
+then valid line" (72 of 300 seeds measured). The reader needs a durable sync
+boundary.
+
+- **Format v2** (checklist step 1): after every `fsync` that returns `Ok`, the
+  writer records that the file is durable and **piggybacks** the marker on its
+  *next* persist round: it is prepended to that round's single `append` (never
+  a separate append under the WAL lock, which a slow disk charges a full extra
+  latency per round), with `N` read from the file's live length at that moment.
+  The claim is true when written (the earlier fsync completed first); a
+  compaction rewrite or any failed round clears the pending state. Residual:
+  the latest round has no durable marker until the next round syncs. The
+  marker is a line `!sync:<N>` (an ordinary CRC-checked line carrying the
+  tag's version) where `N` is the file length at that moment, which is the
+  marker's own start offset. Never written before the sync it vouches for (a
+  pre-sync marker could survive a kept-prefix tear next to a flipped byte in
+  the same un-synced round). Record payloads are unchanged. Harness: the
+  `control-wal` transcode reframes v2 to v1 through `format::reframe_to_v1`
+  (`legacy-encoders`-gated), and the `shared-wal` transcode does the same for `SWL1`, and the `raftkv-wal` EMBEDDED row is at v2.
+- **Decoder** (`format::decode_lines_extent`, documented there): a bad line
+  that starts before the greatest valid marker is
+  `FormatError::MidFileCorruption { offset, durable_to }`; at or after it, a
+  torn tail as before. The decoder keeps scanning past the first bad line for
+  markers. A valid marker whose claimed offset is not its own start is
+  `FormatError::BadSyncMarker`. A marker-less file (every v1 file) keeps the
+  lenient rule. The forged-future-version error is unchanged.
+- **Legacy** (step 2): the v1 arm of `persist::dispatch` is
+  `legacy::v1::wal_record`, frozen; a test-only v1 encoder anchors the v1
+  fixture (step 7; `cfg(test)`, no `legacy-encoders` feature exists on this
+  base). **Not done here:** registering the v2 pair in the upgrade-restart
+  harness's transcode table (`animus-test/src/upgrade/`, owned by another
+  workstream).
+- **Fixtures** (steps 3-4): `control-wal/v2.bin`, `raftkv-wal/v2.bin` (and
+  `shared-wal/v2.bin` on the SWL branch), each with a per-version expected
+  value; v1 files untouched.
+- **v1 reopen**: version is per line, so a v1 file reopened by a v2 build is
+  appended to with v2 lines and markers (no rewrite, no mixed-file hazard: the
+  marker offset is absolute). A marker then also protects the v1 prefix.
+- **Writers also repair on open**: a torn tail is cut back (`Disk::replace`)
+  at recovery, otherwise the next appends would sit after garbage and the
+  next recovery would correctly refuse the file. This also closes a latent
+  v1-era bug (acked records appended after a torn tail were lost at the next
+  recovery).
+- **Residual**: the latest round has no durable marker until the next sync, so
+  corruption of that one round alone is indistinguishable from a torn tail.
+  A disk that lied about `fsync` and lost acked bytes before a surviving
+  marker now fails loudly.
 
 ### Row-value formats: freeze, don't tag (2026-09-30 decision, P1-A)
 

@@ -199,10 +199,66 @@ fn identity_current_only(
     Ok(bytes.to_vec())
 }
 
+/// `CWL1`/`SWL1` transcode: current (v2) is the identity; v1 goes through
+/// `animus-control`'s `legacy-encoders`-gated `reframe_to_v1`, which drops the
+/// sync-marker lines and re-frames each record under the v1 tag.
+fn line_wal_transcode(
+    tag: &animus_control::format::FormatTag,
+    entry: &FormatEntry,
+    bytes: &[u8],
+    target: u32,
+) -> Result<Vec<u8>, TranscodeError> {
+    match target {
+        t if t == entry.current_version => Ok(bytes.to_vec()),
+        1 => animus_control::format::reframe_to_v1(tag, bytes).map_err(|e| {
+            TranscodeError::Malformed {
+                format: entry.name,
+                detail: e.to_string(),
+            }
+        }),
+        t => Err(entry.unsupported(t)),
+    }
+}
+
+fn control_wal_transcode(
+    entry: &FormatEntry,
+    bytes: &[u8],
+    target: u32,
+) -> Result<Vec<u8>, TranscodeError> {
+    line_wal_transcode(&animus_control::persist::CONTROL_WAL, entry, bytes, target)
+}
+
+fn shared_wal_transcode(
+    entry: &FormatEntry,
+    bytes: &[u8],
+    target: u32,
+) -> Result<Vec<u8>, TranscodeError> {
+    line_wal_transcode(
+        &animus_control::persist::SHARED_WAL_TAG,
+        entry,
+        bytes,
+        target,
+    )
+}
+
 const V1_ONLY: &[VersionSpec] = &[VersionSpec {
     version: 1,
     capabilities: CapabilityMask::ALL,
 }];
+
+/// `CWL1`/`SWL1` v1 (no sync markers) and v2 (sync markers, issue #1132). A
+/// v2 file transcodes to v1 by dropping the marker lines and re-framing each
+/// record under the v1 tag (`animus_control::format::reframe_to_v1`).
+const V1_V2: &[VersionSpec] = &[
+    VersionSpec {
+        version: 1,
+        capabilities: CapabilityMask::ALL,
+    },
+    VersionSpec {
+        version: 2,
+        capabilities: CapabilityMask::ALL,
+    },
+];
 
 /// The table: one entry per durable whole-file format ADR 0073 inventories
 /// that lives on a node's disk. Names equal the fixture directory names.
@@ -227,15 +283,15 @@ pub static TABLE: &[FormatEntry] = &[
     },
     FormatEntry {
         name: "control-wal",
-        current_version: 1,
-        versions: V1_ONLY,
-        transcode: identity_current_only,
+        current_version: 2,
+        versions: V1_V2,
+        transcode: control_wal_transcode,
     },
     FormatEntry {
         name: "shared-wal",
-        current_version: 1,
-        versions: V1_ONLY,
-        transcode: identity_current_only,
+        current_version: 2,
+        versions: V1_V2,
+        transcode: shared_wal_transcode,
     },
     // The `ADE1` encryption envelope wraps whole files of an `EncryptedEnv`
     // disk; transcoding the files *inside* it needs the key, so a real
@@ -276,11 +332,21 @@ pub struct Embedded {
 }
 
 const fn emb(name: &'static str, carrier: Carrier, owner: &'static str) -> Embedded {
+    emb_v(name, carrier, owner, 1)
+}
+
+/// [`emb`] for an embedded format already past v1.
+const fn emb_v(
+    name: &'static str,
+    carrier: Carrier,
+    owner: &'static str,
+    current_version: u32,
+) -> Embedded {
     Embedded {
         name,
         carrier,
         owner,
-        current_version: 1,
+        current_version,
     }
 }
 
@@ -314,10 +380,13 @@ pub static EMBEDDED: &[Embedded] = &[
     ),
     // animus-cp-data: the codec payload inside `raftkv.wal.<tablet>` /
     // `SharedWal` lines, the per-tablet engine layout, off-disk objects.
-    emb(
+    // v2: the `CWL1` v2 framing its lines carry (sync markers, issue #1132);
+    // its payload is unchanged, so `control-wal`'s transcode covers it.
+    emb_v(
         "raftkv-wal",
         Carrier::Table("control-wal"),
         "animus-cp-data",
+        2,
     ),
     emb("raftkv-wire", Carrier::OffDisk, "animus-cp-data"),
     emb("raftkv-image", Carrier::OffDisk, "animus-cp-data"),

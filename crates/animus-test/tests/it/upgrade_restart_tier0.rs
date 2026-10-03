@@ -664,7 +664,8 @@ fn lsm_sstable_negative_controls_are_caught() {
 /// `animus-control/tests/format_fixtures.rs` pin (one of each `WalRecord`).
 fn control_wal_expected(version: u32) -> Vec<WalRecord<MetaCommand, Metadata>> {
     match version {
-        1 => vec![
+        // v2 adds only sync-marker lines, which decoding consumes.
+        1 | 2 => vec![
             WalRecord::Hard {
                 term: 3,
                 voted_for: Some(nid(1)),
@@ -749,6 +750,61 @@ fn control_wal_fixture_restarts_with_current_code() {
     }
 }
 
+/// The v2 -> v1 transcode (ADR 0073 coordination note): the legacy reframer
+/// drops the sync-marker lines and re-frames every record under the v1 tag, so
+/// the result is a marker-less v1 file that decodes to the same records.
+#[test]
+fn control_wal_v2_transcodes_to_a_v1_file_with_the_same_records() {
+    let entry = transcode::TABLE
+        .iter()
+        .find(|e| e.name == "control-wal")
+        .expect("control-wal entry");
+    let v2 = fixtures("control-wal")[&2].clone();
+    let v1 = entry.transcode_to(&v2, 1).expect("v2 -> v1");
+    assert!(
+        !v1.windows(6).any(|w| w == b"!sync:"),
+        "v1 has no marker lines"
+    );
+    assert!(
+        v1.split(|&b| b == b'\n')
+            .filter(|l| !l.is_empty())
+            .all(|l| &l[9..13] == b"CWL1" && &l[13..15] == b"01"),
+        "every line re-framed under the v1 tag"
+    );
+    assert_eq!(
+        PersistedState::<MetaCommand, Metadata>::decode(&v1).expect("v1 decodes"),
+        control_wal_expected(1)
+    );
+    // (Not byte-equal to the v1 fixture: its `Snapshot` line embeds a
+    // `Metadata` serialized before `Metadata` grew its `"v"` field; the
+    // records are what must match.)
+}
+
+/// `SWL1` mirror of the CWL1 v2 -> v1 transcode check.
+#[test]
+fn shared_wal_v2_transcodes_to_a_v1_file_with_the_same_records() {
+    let entry = transcode::TABLE
+        .iter()
+        .find(|e| e.name == "shared-wal")
+        .expect("shared-wal entry");
+    let v2 = fixtures("shared-wal")[&2].clone();
+    let v1 = entry.transcode_to(&v2, 1).expect("v2 -> v1");
+    assert!(
+        !v1.windows(6).any(|w| w == b"!sync:"),
+        "v1 has no marker lines"
+    );
+    assert!(
+        v1.split(|&b| b == b'\n')
+            .filter(|l| !l.is_empty())
+            .all(|l| &l[9..13] == b"SWL1" && &l[13..15] == b"01"),
+        "every line re-framed under the v1 tag"
+    );
+    assert_eq!(
+        PersistedState::<MetaCommand, Metadata>::decode_tagged(&v1).expect("v1 decodes"),
+        PersistedState::<MetaCommand, Metadata>::decode_tagged(&v2).expect("v2 decodes"),
+    );
+}
+
 /// `CWL1` lines are CRC-framed, so zeroing the version *in place* breaks the
 /// CRC and reads as a torn line (tolerated: content check fails). A forged
 /// line with a valid CRC but a future version is the named-error shape.
@@ -758,10 +814,11 @@ fn control_wal_negative_controls_are_caught() {
     each_seed("tier0_control_wal_neg", |seed| {
         let mut flipped = v1.clone();
         flipped[20] ^= 0xff; // inside the first record's payload
-        // Today a CRC failure on a line is treated as a torn tail *wherever* it
-        // sits: decode succeeds and drops the line and everything after it (the
-        // LSM WAL, by contrast, refuses mid-file corruption). Pin the observable
-        // outcome: the open is fine, the content is not.
+        // v1-ONLY behaviour: a v1 file has no sync markers, so a CRC failure on a
+        // line is treated as a torn tail *wherever* it sits (decode succeeds and
+        // drops the line and everything after it). A v2 file refuses the same
+        // damage; see the v2 counterpart below. Pin the v1 outcome: the open is
+        // fine, the content is not.
         let (records, _) = control_wal_run(seed, &flipped).unwrap_or_else(|e| {
             panic!("seed={seed}: a CRC-failed line reads as a torn tail, got {e}")
         });
@@ -770,6 +827,15 @@ fn control_wal_negative_controls_are_caught() {
             control_wal_expected(1),
             "seed={seed}: corruption unnoticed"
         );
+
+        // v2 counterpart (issue #1132): the same first-line damage, with a
+        // durable sync marker after it, is the named mid-file corruption error.
+        let v2 = fixtures("control-wal")[&2].clone();
+        let mut flipped2 = v2.clone();
+        flipped2[20] ^= 0xff;
+        let err = control_wal_run(seed, &flipped2)
+            .expect_err("a corrupted first v2 line before a marker must be refused");
+        assert!(err.contains("corrupt"), "seed={seed}: {err}");
 
         let future = encode_line(
             &FormatTag {
@@ -795,7 +861,8 @@ fn control_wal_negative_controls_are_caught() {
 
 fn shared_wal_expected(version: u32) -> Vec<(TabletId, WalRecord<MetaCommand, Metadata>)> {
     match version {
-        1 => {
+        // v2 adds only sync-marker lines, which decoding consumes.
+        1 | 2 => {
             let entry = |i, t, n| WalRecord::Append(upsert_entry(i, t, n));
             vec![
                 (
@@ -904,6 +971,8 @@ fn shared_wal_negative_controls_are_caught() {
     each_seed("tier0_shared_wal_neg", |seed| {
         let mut flipped = v1.clone();
         flipped[20] ^= 0xff;
+        // v1-ONLY behaviour: no sync markers, so a CRC failure anywhere reads
+        // as a torn tail. The v2 counterpart follows.
         let got = shared_wal_run(seed, &flipped).unwrap_or_else(|e| {
             panic!("seed={seed}: a CRC-failed line reads as a torn tail, got {e}")
         });
@@ -912,6 +981,19 @@ fn shared_wal_negative_controls_are_caught() {
             shared_wal_expected_state(1),
             "seed={seed}: corruption unnoticed"
         );
+
+        // v2 counterpart (issue #1132): the same first-line damage before a
+        // durable marker fails the open with InvalidData.
+        let mut flipped2 = fixtures("shared-wal")[&2].clone();
+        flipped2[20] ^= 0xff;
+        let err = shared_wal_run(seed, &flipped2)
+            .expect_err("a corrupted first v2 line before a marker must fail the open");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "seed={seed}: {err}"
+        );
+        assert!(err.to_string().contains("corrupt"), "seed={seed}: {err}");
 
         let future = encode_line(
             &FormatTag {

@@ -7438,7 +7438,14 @@ async fn persist_wal<E: Env>(
         // a joining learner's persist round for one MAX_APPEND_ENTRIES_BATCH
         // batch outlast the whole run on a slow-disk `SimEnv` node (and, on
         // `ProdEnv`, cost one `open` + `write` + `flush` per record).
-        let mut buf = Vec::new();
+        //
+        // Issue #1132: the previous round's sync marker (if its fsync
+        // succeeded) rides at the front of this same `append` — never its own
+        // append under `wal_lock` (see `animus_control::persist::SyncMarkerState`).
+        let mut buf = wal_lock
+            .markers()
+            .take_marker(env, &animus_control::persist::CONTROL_WAL, wal)
+            .await;
         for record in &records {
             buf.extend(PersistedState::encode_record(record));
         }
@@ -7456,6 +7463,7 @@ async fn persist_wal<E: Env>(
             );
             return;
         }
+        wal_lock.markers().mark_synced();
     }
     // Durable now: advance the log watermark and the round watermark under one
     // acquisition, then release whatever the consensus loop buffered on this
@@ -10736,6 +10744,9 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 for record in &records {
                     buf.extend(PersistedState::encode_record(record));
                 }
+                // Issue #1132: rebuilt from records — any pending piggybacked
+                // marker no longer describes this file.
+                wal_lock.markers().invalidate();
                 env.replace(wal, &buf).await
             };
             match write_result {
@@ -11279,14 +11290,15 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
     let state = if let Some(shared) = &shared_wal {
         shared.recovered_state(tablet).await
     } else {
-        let bytes = env.read(&wal).await.unwrap_or_default();
+        // Issue #1132: `recover` also cuts a torn tail back on disk (see
+        // `PersistedState::recover`), so later appends never sit after garbage.
         // ADR 0073 Phase 0 workstream B: `PersistedState::decode` is now
         // fallible (pre-baseline / unknown-version / malformed WAL). `drive`
         // is spawned fire-and-forget with no `Result` to propagate into, so
         // mirror `animus_control::node::drive`: log the named error loudly
         // and halt this group before recovery — never panic, never recover
         // as an empty log.
-        match PersistedState::decode(&bytes) {
+        match PersistedState::recover(&env, &wal).await {
             Ok(records) => PersistedState::replay(records),
             Err(e) => {
                 tracing::error!(

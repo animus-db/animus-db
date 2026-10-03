@@ -242,26 +242,49 @@ per-tablet CP data plane (`animus-cp-data`).
 
   **Every WAL line carries a per-record CRC32 checksum (issue #495)**:
   `<crc32 as 8 lowercase hex chars>:<tag+payload>\n`, checked in
-  `format::decode_lines` before the JSON is ever parsed. Before this, the
+  `format::decode_lines_extent` before the JSON is ever parsed. Before this, the
   newline-terminated-`serde_json` framing had no way to distinguish a
   bit-flip that happened to keep a record's JSON syntactically valid (e.g.
   a digit inside a packed numeric field) from a legitimate value — it
   decoded successfully into a silently wrong record instead of a decode
   error, confirmed to reach a hard panic once such a record applied past
   `animus_cp_data::assert_ts_monotonic` (`docs/engineering-lessons.md` has
-  the full account). **A checksum failure is treated exactly like a torn
-  trailing line**: `decode`/`decode_tagged` stop at the first bad record
-  and drop it plus everything physically after it in the buffer — never
-  applied, never a panic. This is a deliberately simpler rule than
-  `animus-storage`'s own CRC-checked WAL framing, which additionally
-  distinguishes real mid-file corruption (hard error) from a torn tail
-  (tolerated) by checking whether a valid record follows; this WAL has no
-  invariant that needs that finer distinction, since a dropped tail-of-log
-  is always safe to recover from here. No back-compat/migration for a
-  pre-existing unchecksummed WAL file — an upgraded node needs a fresh WAL,
-  as with any format change made before ADR 0073's baseline (root
-  `CLAUDE.md`'s upgrade-compatibility section); this WAL envelope is itself
-  in scope for ADR 0073 Phase 0 workstream B's reset.
+  the full account). **A checksum failure is a torn tail only if no durable
+  sync marker proves otherwise (issue #1132, `CWL1`/`SWL1` v2).** Until v2,
+  `decode`/`decode_tagged` stopped at the first bad record anywhere and
+  silently dropped it plus everything after, so rot in an early line lost
+  acked history. v2 writers **piggyback** a `!sync:<N>` marker line
+  on the round after every successful `fsync` (`persist::SyncMarkerState`; `N` =
+  live file length = the marker's own offset; see the piggyback note at the
+  end of this file), and `format::decode_lines_extent` returns
+  `FormatError::MidFileCorruption {offset, durable_to}` for a bad line that
+  starts before the greatest valid marker (it keeps scanning past the first
+  bad line for markers, so a rotted first line cannot hide the proof). A bad
+  line at or after the last marker is still a tolerated tail; a marker-less
+  (v1) file keeps the old lenient rule. **Do not "simplify" this to the LSM
+  WAL's "a valid line follows" resync proof**: a persist round appends N lines
+  and syncs once, and `corrupt_on_crash` flips a byte anywhere in the kept part
+  of that un-synced region, so a correct writer plus a crash yields "bad line,
+  valid line" (72/300 seeds); see
+  `docs/lessons/testing/2026-10-01-a-positional-torn-tail-proof-needs-a-durable-sync-boundary.md`.
+  **Writers repair on open**: `PersistedState::recover` (control + per-group
+  WAL) and `SharedWal::open` cut a torn tail back with `Disk::replace` before
+  any append; without it the next appends sit after garbage and the next
+  recovery refuses the file. The marker is prepended to the NEXT round's single
+  append under the same lock (so its offset is exact), never its own append. Tests: `tests/it/wal_midfile_corruption.rs`. Residual: the
+  latest round has no durable marker until the next sync; a disk that lied
+  about `fsync` can now fail loudly. Corruption of a CRC-valid line's
+  *payload* was always loud (`Malformed`). No back-compat for a pre-checksum
+  WAL file (pre-baseline). **`SWL1` (the `SharedWal` file) is v2 too**:
+  `SharedWal::flush` prepends the pending marker to the next tagged
+  `Append`-batch's single append and sets the pending flag after that batch's
+  sync (typed/tagged API only; the raw untyped `append` the fsync bench uses
+  neither takes nor sets one; a failed append/sync and a `Compact` clear it), `SharedWal::open` repairs a torn tail via
+  `decode_tagged_with_extent` + `repair_tail` and maps `MidFileCorruption` to
+  `InvalidData` naming the offset. A `Compact` (`Disk::replace`) writes no
+  marker (its file is rebuilt from records; markers never survive a rewrite,
+  which is what keeps every marker's offset exact). Tests:
+  `tests/it/shared_wal_midfile_corruption.rs`.
 
 - **`detector.rs`** — `FailureDetector` (ADR 0012): a pure, unit-tested
   interval+timeout liveness detector. No clock, no RNG.
@@ -405,10 +428,11 @@ body decoder per format (`wal_record` for `control-wal`, `shared_wal_line` for
 `shared-wal` — its only decode site is `PersistedState::decode_tagged`, here,
 not in `animus-cp-data` — and `snapshot_body` for `control-snapshot`, used by
 `raft.rs`'s InstallSnapshot install and `node.rs`'s `decode_syskv_image_bytes`).
-A bound-and-dropped `_version` is a review failure. v1 is still the current
-shape, so there is no `legacy` module yet: a v2 adds an arm and moves the v1
-arm's body to a frozen `persist::legacy::v1` with a `From` translation (ADR
-0073 "Phase 1 design" checklist). Do not change the `format.rs` helpers'
+A bound-and-dropped `_version` is a review failure. `control-wal` is now v2
+(#1132): `dispatch::wal_record` has `1 => legacy::v1::wal_record`, `2 =>` current
+(the record payload shape is unchanged; v2 adds marker lines the line decoder
+consumes), with a `cfg(test)` v1 legacy encoder anchoring the v1 fixture
+(ADR 0073 "Phase 1 design" checklist). Do not change the `format.rs` helpers'
 signatures (`unsupported_version` is an addition).
 
 **P1-C (metadata):** `Metadata::from_json` dispatches with `match` on the peeked `"v"`; `Metadata`'s serde default on `"v"` deliberately stays (frozen `control-wal`/`shared-wal`/`control-snapshot` fixtures embed a `"v"`-less `Metadata`; see the field's doc). The fixture test is per-version (name-derived version, per-version expected value, panics on an unrecognised one).
@@ -455,7 +479,9 @@ tag plus two independent framing shapes:
   write cut short by a crash — no `:` separator, a non-8-hex-digit prefix,
   a CRC mismatch, or a body too short to hold `magic + version` once the
   CRC does check out) **stops decoding silently**, returning whatever was
-  collected before it — never an `Err`, since a torn/un-fsynced write was
+  collected before it, **unless a v2 sync marker proves the bad line was
+  already durable** (`MidFileCorruption`; `BadSyncMarker` for a marker not at
+  its own offset — see the persist.rs entry above) — never an `Err` otherwise, since a torn/un-fsynced write was
   never acknowledged either way (durable-before-visible, ADR 0009), so
   recovering it or not is equally safe. A **CRC-valid line with the wrong
   magic** is `Err(PreBaselineFormat)` — exactly what a pre-baseline,
@@ -463,7 +489,9 @@ tag plus two independent framing shapes:
   correctly-tagged line with an unsupported version** is
   `Err(UnsupportedFormatVersion)`.
 
-**`persist::CONTROL_WAL`** (magic `CWL1`, version 1) is what
+**`persist::CONTROL_WAL`** (magic `CWL1`, **version 2** since #1132; v1 is
+`dispatch::legacy::v1`, fixture `control-wal/v1.bin`, v2 fixture
+`control-wal/v2.bin` with markers) is what
 `PersistedState::encode_record`/`PersistedState::decode` use via
 `format::encode_line`/`format::decode_lines` — replacing the two-generation
 "a reader distinguishes them structurally, not by a tag" scheme ADR 0073's
@@ -480,14 +508,15 @@ non-`SharedWal` per-group WAL too** — its fallback persist path
 here, just instantiated `C = KvCommand`/`S = KvState`; there is no second
 WAL-line codec for that crate to keep in sync. **`encode_tagged_record`/
 `decode_tagged` (the `SharedWal` outer `Line{tablet, record}` envelope)
-are `persist::SHARED_WAL_TAG`** (magic `SWL1`, version 1, ADR 0073 workstream
+are `persist::SHARED_WAL_TAG`** (magic `SWL1`, version 2 since #1132, ADR 0073 workstream
 C) — the same `format::encode_line`/`decode_lines` shape as `CWL1`, payload
 `{"tablet":..,"record":..}` `serde_json` whose inner `record` is the same
 `WalRecord<C, S>` shape (not a `codec.rs` payload). `decode_tagged` returns
 `Result<_, FormatError>`: a torn tail/CRC-failed line stays a silent stop
 (`Ok(prefix)`); pre-baseline/unknown-version/CRC-valid-but-bad-JSON
 (`Malformed`) are loud, and `SharedWal::open` maps them to `InvalidData`.
-The old private `encode_checksummed_line`/`verify_checksummed_line` are
+(`SWL1` is **version 2** since #1132: sync markers, `legacy_shared::v1`, fixtures
+`shared-wal/v1.bin` + `v2.bin`.) The old private `encode_checksummed_line`/`verify_checksummed_line` are
 deleted. **`shared_wal.rs` lives in this crate (`animus-control`), not
 `animus-cp-data`, despite the ADR's workstream table listing the
 `SharedWal` envelope under workstream C** — grep before assuming a format
@@ -2921,5 +2950,17 @@ cancel-safe-fair (it is). Liveness tests for the apply path assert on
 Known follow-up, deliberately not fixed here: the failure detector re-proposes
 `status: Down` for members a stale cache still shows Active, feeding more WAL
 rounds while the apply task is behind.
+
+- Sync markers (CWL1/SWL1 v2, issue #1132) are **piggybacked**, never a separate
+  append: `FairMutex::markers()` (`persist::SyncMarkerState`) remembers that the
+  previous round's fsync succeeded, and the next round prepends `!sync:<N>` to
+  its own single `append` (`N` = live file length = the marker's own start). A
+  compaction `replace` calls `invalidate()`; `take_marker` clears the flag so a
+  failed round leaves nothing pending. Do **not** add a standalone marker append
+  under `wal_lock` (the sim charges `sync_delay` per append and it starves
+  slow-disk learner catch-up, `snapshot_transfer_survives_compaction`), and do
+  **not** gate markers on `has_unflushed_wal()` (it can stay true for whole
+  bursts, leaving them unprotected). The newest round has no durable marker
+  until the next round syncs.
 
 **Upgrade-harness class (ADR 0073 P1-D):** `control-wal`/`shared-wal` are whole-file `TABLE` entries in `animus-test`'s transcode table (a bump edits that entry; legacy encoders must be `pub` + `legacy-encoders`-gated); `control-snapshot`, `metadata`, `mirror-version` and `mirror-entities` are `EMBEDDED` (a bump edits their carrier's transcode).

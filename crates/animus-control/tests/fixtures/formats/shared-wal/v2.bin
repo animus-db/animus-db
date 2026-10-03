@@ -1,0 +1,11 @@
+3fdd0bed:SWL102{"tablet":1,"record":{"Hard":{"term":2,"voted_for":"n1"}}}
+dec0f26e:SWL102{"tablet":2,"record":{"Hard":{"term":4,"voted_for":null}}}
+a45ada47:SWL102{"tablet":1,"record":{"Append":{"term":2,"index":1,"command":{"UpsertMember":{"node":"n2","labels":{},"status":"Active"}},"config":null,"learners":null}}}
+afa87556:SWL102{"tablet":7,"record":{"Append":{"term":4,"index":1,"command":{"UpsertMember":{"node":"n3","labels":{},"status":"Active"}},"config":null,"learners":null}}}
+478600e3:SWL102!sync:488
+07e4f895:SWL102{"tablet":2,"record":{"Append":{"term":4,"index":1,"command":{"UpsertMember":{"node":"n4","labels":{},"status":"Active"}},"config":null,"learners":null}}}
+08d50d03:SWL102{"tablet":1,"record":{"Append":{"term":2,"index":2,"command":{"UpsertMember":{"node":"n5","labels":{},"status":"Active"}},"config":null,"learners":null}}}
+778ee78e:SWL102{"tablet":1,"record":{"Truncate":{"keep":1}}}
+62ed69ab:SWL102{"tablet":7,"record":{"Snapshot":{"metadata":{"v":1,"members":{},"tablets":{},"policies":{},"schemas":{"tables":{}},"next_tablet_id":0,"node_addrs":{},"split_lineage":{},"split_placing":{},"stream_shards":[],"index_backfill":[],"backups":{},"backup_tablet_progress":[],"restores":{},"pitr_segments":[],"pitr_generation":{},"pitr_base_backups":[],"credentials":{},"exports":{},"imports":{}},"last_index":5,"last_term":4,"config":["n1","n2"],"learners":["n3"]}}}
+7ebe502a:SWL102{"tablet":2,"record":{"Append":{"term":4,"index":2,"command":{"UpsertMember":{"node":"n6","labels":{},"status":"Active"}},"config":null,"learners":null}}}
+6c1aa40c:SWL102!sync:1560

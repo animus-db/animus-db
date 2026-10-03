@@ -37,6 +37,10 @@ struct Inner {
 /// FIFO-fair async mutex over `()` (it guards a file, not data).
 pub struct FairMutex {
     inner: Mutex<Inner>,
+    /// The guarded WAL file's piggybacked sync-marker state (issue #1132). It
+    /// rides with the lock that serializes the file's writers so the two cannot
+    /// be separated; only touch it while holding the lock.
+    markers: crate::persist::SyncMarkerState,
 }
 
 impl Default for FairMutex {
@@ -55,7 +59,14 @@ impl FairMutex {
                 next_ticket: 0,
                 queue: VecDeque::new(),
             }),
+            markers: crate::persist::SyncMarkerState::default(),
         }
+    }
+
+    /// The guarded file's piggybacked sync-marker state (see
+    /// [`crate::persist::SyncMarkerState`]). Use only while holding the lock.
+    pub fn markers(&self) -> &crate::persist::SyncMarkerState {
+        &self.markers
     }
 
     /// Acquire the lock, queueing behind every earlier caller.

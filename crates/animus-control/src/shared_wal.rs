@@ -76,7 +76,10 @@
 //!   mid-rewrite yields, for every tablet, exactly its own last **durably
 //!   written** tail — `PersistedState::decode_tagged`'s per-record `SWL1` CRC32 +
 //!   torn-tail tolerance (issue #495) already guarantees a torn trailing
-//!   write is dropped rather than corrupting recovery, and a rewrite
+//!   write is dropped rather than corrupting recovery (and, since #1132, the
+//!   v2 sync marker `flush` appends after each successful sync is what lets
+//!   the decoder tell that tail from corruption of durable history; `open`
+//!   also cuts a torn tail back before any append), and a rewrite
 //!   (`Disk::replace`) is atomic at the `Env` seam (either the old file or
 //!   the fully-written new one is what a fresh `open` sees — see
 //!   `animus-sim`'s `torn_tail_on_crash`/`corrupt_on_crash` knobs for how
@@ -230,6 +233,10 @@ pub struct SharedWal<C = MetaCommand, S = Metadata> {
     /// `CpSharedWalGcRewrites` from there; this counter is the lower-level,
     /// caller-independent primitive those metrics are derived from).
     physical_writes: std::sync::atomic::AtomicU64,
+    /// Issue #1132: piggybacked `SWL1` v2 sync-marker state (see
+    /// [`crate::persist::SyncMarkerState`]). Only touched from the exclusive
+    /// `drive` loop's `flush`.
+    markers: crate::persist::SyncMarkerState,
 }
 
 // `C: Clone, S: Clone` here (not previously required) is issue #838's
@@ -244,6 +251,7 @@ impl<C: Clone, S: Clone> SharedWal<C, S> {
         Self {
             inner: AsyncMutex::new(SharedWalState::default()),
             physical_writes: std::sync::atomic::AtomicU64::new(0),
+            markers: crate::persist::SyncMarkerState::default(),
         }
     }
 
@@ -401,7 +409,7 @@ impl<C: Clone, S: Clone> SharedWal<C, S> {
                 }
             };
 
-            let result = Self::flush(env, file, &batch).await;
+            let result = Self::flush(&self.markers, env, file, &batch).await;
             if result.is_ok() {
                 self.physical_writes
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -429,6 +437,7 @@ impl<C: Clone, S: Clone> SharedWal<C, S> {
     }
 
     async fn flush<E: Env>(
+        markers: &crate::persist::SyncMarkerState,
         env: &E,
         file: &str,
         batch: &[Pending<C, S>],
@@ -440,19 +449,37 @@ impl<C: Clone, S: Clone> SharedWal<C, S> {
                     1,
                     "a Compact is never batched with anything else"
                 );
+                // Issue #1132: rebuilt from records — any pending piggybacked
+                // marker no longer describes this file.
+                markers.invalidate();
                 env.replace(file, image).await.map_err(SharedWalError::from)
             }
             WalOp::Append(_) => {
-                let mut merged = Vec::new();
+                // Issue #1132: the previous round's `SWL1` v2 sync marker (if
+                // its fsync succeeded) is prepended to THIS round's single
+                // append — never its own append (see `SyncMarkerState`). Only
+                // the tagged (typed) API carries markers: the raw `append`
+                // moves opaque bytes (the fsync bench's) nothing decodes, so a
+                // raw-only batch takes none and leaves the flag as it was.
+                let tagged = batch.iter().any(|p| p.undo.is_some());
+                let mut merged = if tagged {
+                    markers
+                        .take_marker(env, &crate::persist::SHARED_WAL_TAG, file)
+                        .await
+                } else {
+                    Vec::new()
+                };
                 for pending in batch {
                     if let WalOp::Append(bytes) = &pending.op {
                         merged.extend_from_slice(bytes);
                     }
                 }
-                env.append(file, &merged)
-                    .await
-                    .map_err(SharedWalError::from)?;
+                if let Err(e) = env.append(file, &merged).await {
+                    markers.invalidate();
+                    return Err(SharedWalError::from(e));
+                }
                 if let Err(e) = env.sync(file).await {
+                    markers.invalidate();
                     // Issue #883: `env.append` above already landed `merged`
                     // in the file's un-synced buffered region before this
                     // round's own `sync` failed — `Disk::append`/`Disk::sync`
@@ -492,6 +519,9 @@ impl<C: Clone, S: Clone> SharedWal<C, S> {
                     }
                     return Err(SharedWalError::from(e));
                 }
+                if tagged {
+                    markers.mark_synced();
+                }
                 Ok(())
             }
         }
@@ -519,8 +549,11 @@ where
     pub async fn open<E: Env>(env: &E, file: &str) -> io::Result<Arc<Self>> {
         let bytes = env.read(file).await.unwrap_or_default();
         let mut group_tails: BTreeMap<TabletId, Vec<WalRecord<C, S>>> = BTreeMap::new();
-        let records = PersistedState::<C, S>::decode_tagged(&bytes)
+        let (records, valid_len) = PersistedState::<C, S>::decode_tagged_with_extent(&bytes)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{file}: {e}")))?;
+        // Issue #1132: cut a torn tail back on disk before any append rides
+        // it (see `PersistedState::recover`).
+        crate::persist::repair_tail(env, file, &bytes, valid_len).await?;
         for (tablet, record) in records {
             group_tails.entry(tablet).or_default().push(record);
         }
@@ -531,6 +564,7 @@ where
                 group_tails,
             }),
             physical_writes: std::sync::atomic::AtomicU64::new(0),
+            markers: crate::persist::SyncMarkerState::default(),
         }))
     }
 
@@ -714,6 +748,66 @@ mod tests {
             let state = &demuxed[&TabletId(t)];
             assert_eq!(state.log.len(), 1, "tablet {t}'s append must have landed");
         }
+    }
+
+    /// Issue #1132: the `SWL1` v2 marker is piggybacked — round 2's single
+    /// append starts with `!sync:<N>`, `N` being round 1's end (the marker's
+    /// own start offset), and a compaction clears the pending marker.
+    #[test]
+    fn the_marker_rides_the_next_tagged_round_and_compaction_clears_it() {
+        let mut sim = Simulator::new(3);
+        let env: SimEnv = sim.env(nid(0));
+        let wal = Arc::new(SharedWal::<MetaCommand, Metadata>::new());
+        let rec = |i| WalRecord::Append(entry(i, 1, nid(300)));
+        let round = |wal: &Arc<SharedWal<MetaCommand, Metadata>>, i| {
+            let (wal, env) = (wal.clone(), env.clone());
+            env.clone().spawn_task(async move {
+                wal.append_tagged(&env, WAL, TabletId(1), &[rec(i)])
+                    .await
+                    .expect("append");
+            });
+        };
+        let size = || futures::executor::block_on(env.size(WAL)).unwrap();
+
+        round(&wal, 1);
+        sim.run_until_quiescent(MAX_STEPS);
+        let end_of_round_1 = size();
+        let bytes = futures::executor::block_on(env.read(WAL)).unwrap();
+        assert!(!bytes.windows(6).any(|w| w == b"!sync:"), "none yet");
+
+        round(&wal, 2);
+        sim.run_until_quiescent(MAX_STEPS);
+        let bytes = futures::executor::block_on(env.read(WAL)).unwrap();
+        let marker =
+            crate::format::encode_sync_marker(&crate::persist::SHARED_WAL_TAG, end_of_round_1);
+        assert_eq!(
+            &bytes[end_of_round_1 as usize..end_of_round_1 as usize + marker.len()],
+            &marker[..]
+        );
+        let demuxed = PersistedState::<MetaCommand, Metadata>::replay_multiplexed(&bytes).unwrap();
+        assert_eq!(demuxed[&TabletId(1)].log.len(), 2);
+
+        // A rewrite clears the pending marker: the next round carries none.
+        let w = wal.clone();
+        let e = env.clone();
+        env.clone().spawn_task(async move {
+            w.compact_group(
+                &e,
+                WAL,
+                TabletId(1),
+                vec![WalRecord::Append(entry(1, 1, nid(300)))],
+            )
+            .await
+            .expect("compact");
+        });
+        sim.run_until_quiescent(MAX_STEPS);
+        round(&wal, 3);
+        sim.run_until_quiescent(MAX_STEPS);
+        let bytes = futures::executor::block_on(env.read(WAL)).unwrap();
+        assert!(
+            !bytes.windows(6).any(|w| w == b"!sync:"),
+            "cleared by compaction"
+        );
     }
 
     /// A `compact` racing concurrent `append`s must never interleave with
