@@ -33,24 +33,10 @@
 //!
 //! # Stream allocation (ADR 0026)
 //!
-//! `(node, stream)` is single-consumer, so every distinct protocol
-//! instance sharing a node needs its own reserved `stream` id. The full
-//! allocation, gathered by grepping every existing reserved-stream constant
-//! in the workspace (each one documents this same table, or a pointer to
-//! it, beside its own definition):
-//!
-//! | Stream | Owner | Value |
-//! |---|---|---|
-//! | [`animus_env::PRIMARY_STREAM`] | every pre-multiplexing protocol (the control-plane Raft group; a non-split CP tablet's Raft group) | `0` |
-//! | a CP data-plane tablet's own Raft group (post-split, or any tablet once it needs a distinct stream) | `animus-cp-data`'s host reconciler, `animusd`'s `RaftKvNode` wiring | `tablet.0` (the [`TabletId`](animus_tablet::TabletId)'s own `u64`, "stream = tablet.0" — see `animus_cp_data::lib`'s host-reconciler doc) |
-//! | [`RELAY_STREAM`] (this module) | [`SimRelayClient`]'s own request/reply traffic | `u64::MAX - 2` |
-//! | `animus_cp_data::cluster_segment_store::BACKUP_SEGMENT_STREAM`'s sibling, `animus_cp_data::backup::BACKUP_SEGMENT_STREAM` | the on-demand backup store's `ClusterSegmentStore` | `u64::MAX - 1` |
-//! | `animus_cp_data::cluster_segment_store::SEGMENT_STREAM` | the DynamoDB Streams segment store's `ClusterSegmentStore` | `u64::MAX` |
-//!
-//! `RELAY_STREAM` sits at `u64::MAX - 2`: disjoint from `PRIMARY_STREAM`
-//! (0), from every plausible `tablet.0` (small, sequential, minted by the
-//! control plane — nowhere near `u64::MAX`), and from the two pre-existing
-//! `u64::MAX`/`u64::MAX - 1` reservations one below the ceiling.
+//! `RELAY_STREAM` is `u64::MAX - 3`. The authoritative table of every
+//! reserved stream id, with a compile-time pairwise-distinctness assertion,
+//! lives in [`crate::reserved_streams`]; it was moved off `u64::MAX - 2`
+//! because that is `HEARTBEAT_BATCH_STREAM` (issue #1055).
 //!
 //! # Address convention
 //!
@@ -135,9 +121,8 @@ use crate::host::RelayClient;
 use crate::wire::{ClientRequest, ClientResponse};
 
 /// This module's reserved [`Network`](animus_env::Network) stream — see the
-/// module doc's "Stream allocation" table for the full allocation and why
-/// this particular value was picked.
-pub const RELAY_STREAM: u64 = u64::MAX - 2;
+/// [`crate::reserved_streams`] table for the full allocation.
+pub const RELAY_STREAM: u64 = u64::MAX - 3;
 
 /// The stable prefix of the plain-text error [`SimRelayClient::relay`]
 /// returns when its own `timeout` elapses with no reply — issue #900's own

@@ -733,11 +733,12 @@ actually load-bearing end to end rather than reachable only by
 `AnimusdRelayClient`.
 
 **Stream allocation.** `SimRelayClient` reserves `RELAY_STREAM = u64::MAX -
-2` (`animus_node::sim_relay`, whose module doc carries the full table
-gathered by grepping every existing reserved-stream constant in the
-workspace: `PRIMARY_STREAM` = 0, a CP data-plane tablet's own group =
-`tablet.0`, `BACKUP_SEGMENT_STREAM` = `u64::MAX - 1`, `SEGMENT_STREAM` =
-`u64::MAX`) — disjoint from all three, and from every plausible `tablet.0`
+3` (moved from `- 2` by issue #1055, which collided with
+`HEARTBEAT_BATCH_STREAM`; `animus_node::reserved_streams` is the one
+authoritative table, with a `const` distinctness assertion: `PRIMARY_STREAM`
+= 0, a CP data-plane tablet's own group = `tablet.0`,
+`BACKUP_SEGMENT_STREAM` = `u64::MAX - 1`, `SEGMENT_STREAM` = `u64::MAX`,
+`HEARTBEAT_BATCH_STREAM` = `u64::MAX - 2`) — disjoint from all of them, and from every plausible `tablet.0`
 (small, sequential, nowhere near `u64::MAX`).
 
 **Address convention.** A `SimEnv` node has no host:port, so
