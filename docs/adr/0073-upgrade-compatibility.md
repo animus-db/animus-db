@@ -11,8 +11,8 @@
   built (2026-10-03)" below); Phase 2 (wire/feature gate) is next, and
   Phase 3 (rolling upgrades) after it. **Phase 2 design in review
   (2026-10-03):** see "Amendment 2026-10-03 — Phase 2 design: cluster version
-  and feature gates" at the end (rollback policy decided: no rollback once a
-  node has run the new binary).
+  and feature gates" at the end (decided: no rollback once a node has run the new binary; Phase 2 itself
+  is rolling-installable over live Phase 1 binaries, no restart ever needed).
 - **Date:** 2026-09-27 (Proposed); accepted 2026-09-27 (see Maintainer
   decision)
 - **Amends:** none. **Depends on:** [ADR 0003](0003-deterministic-simulation.md)
@@ -1688,373 +1688,391 @@ consumer.
 ## Amendment 2026-10-03 — Phase 2 design: cluster version and feature gates
 
 Design only; no code. Status: **in review**. Phase 2 makes a mixed-version
-cluster *safe on the wire and in replicated state*; it is what turns "restart
-every node by hand, one at a time" from unsupported into supported. Phase 3
-(orchestration) stays later. Every claim below was checked against `main` at
-`ac57d56a`.
+cluster *safe on the wire and in replicated state*, which is what turns
+"restart every node by hand, one at a time" from unsupported into supported.
+Phase 3 (orchestration) stays later. Claims below were checked against `main`
+at `ac57d56a`.
 
-### What the code does today (the facts the design rests on)
+**Maintainer rule (2026-10-03): an upgrade never needs a restart of the whole
+cluster. That includes the very first one, from today's Phase 1 binaries
+to the Phase 2 release ("B2"), and every future release.** Section 2 is the
+design that satisfies it; the rest is built on it.
+
+### What the code does today
 
 | Fact | Evidence |
 |---|---|
-| Control Raft messages are `serde_json` of `RaftMsg<C>`; an undecodable message is **logged and dropped** (`undecodable raft message dropped`) | `animus-control/src/node.rs` (`serde_json::from_slice::<RaftMsg>`) |
-| CP-data Raft messages are the binary `codec.rs` (`0xCB` + `VERSION`), one `VERSION` for wire, image and WAL payloads; a bad version/unknown tag/trailing byte is `FormatError`, and the receiver **drops the message** (`undecodable raftkv message dropped`) | `animus-cp-data/src/codec.rs`, `lib.rs` (`decode_wire` arm) |
-| `ClientRequest`/`ClientResponse` are length-prefixed `serde_json`; an undecodable frame is an `InvalidData` I/O error that **tears down the connection** | `animus-node/src/codec.rs`, `animusd/src/lib.rs` `read_frame` |
-| **No `deny_unknown_fields` anywhere in the workspace** (grep). So: an unknown *field* is silently ignored by an older reader; an unknown enum *variant* fails the whole enclosing value. One new `MetaCommand` variant inside an `AppendEntries` fails the **entire** message, so a follower never receives *any* entry in that batch: replication wedges, silently | grep; serde defaults |
-| Handshakes: `NHS1`/`CHS1`, version 1, `ext` carried but never interpreted; `check_peer` is exact version equality; `SimEnv` models it per message with a per-node `set_network_protocol_for` | `animus-env/src/handshake.rs`, `prod.rs`, `animus-sim/src/lib.rs` |
-| `Metadata` is `"v": 1` JSON; `Metadata::from_json` dispatches on `v`; `Member` has `labels`/`status`/`has_activated`; `RegisterNode`/`UpsertMember` are the registration commands | `animus-control/src/meta.rs` |
-| The system-keyspace mirror **`expect`s** every entity decode (`mirrored ... value decodes`), so a new mirror entity shape is a node-local panic on an older reader | `animus-control/src/mirror.rs` |
-| Data-only nodes get `Metadata` from a mirror (`ControlHandle::Remote`, `MetadataDelta` long-poll); a data node's view lags the control leader | ADR 0035, `animus-node/src/wire.rs` |
-| A `KvCommand` is applied by tablet replicas that **cannot read `Metadata`** (a tablet's state machine holds no cluster state) | `animus-cp-data` |
-| CWL/SWL v2 and `raftkv-wal` v2 are written unconditionally; a v1 file reopened by a v2 build is appended to with v2 lines | #1140/#1141, CWL/SWL v2 amendment above |
+| Control Raft messages are `serde_json` of `RaftMsg<C>`; an undecodable message is **logged and dropped** | `animus-control/src/node.rs` (`serde_json::from_slice::<RaftMsg>`, `undecodable raft message dropped`) |
+| CP-data Raft messages are the binary `codec.rs` (`0xCB` + `VERSION`, one version for wire, image and WAL payloads); a bad version/tag/trailing byte is a `FormatError` and the receiver **drops the message** | `animus-cp-data/src/codec.rs`; `lib.rs` (`undecodable raftkv message dropped`) |
+| `ClientRequest`/`ClientResponse` are length-prefixed `serde_json`; an undecodable frame is an `InvalidData` error that **tears down the connection** | `animus-node/src/codec.rs`; `animusd/src/lib.rs` `read_frame` |
+| **No `deny_unknown_fields` anywhere in the workspace.** An unknown *field* is ignored by an older reader; an unknown enum *variant* fails the whole enclosing value. One new `MetaCommand` inside an `AppendEntries` fails the whole message, so the follower never gets that batch: replication wedges silently | grep; serde defaults |
+| **A non-empty handshake `ext` is accepted and ignored today (verified).** `handshake::decode` (`animus-env/src/handshake.rs:235`) copies `ext` (<= `MAX_EXTENSION_LEN` = 1024) into `Preamble.extensions` and never inspects it; `handshake::check_peer` (`:272`) compares **only magic and version**; `prod::read_preamble` (`animus-env/src/prod.rs:1360`) reads `ext_len` extra bytes before returning; pinned by the unit test `round_trip_nonempty_extensions_is_carried_through_unrejected` (`handshake.rs:332`). `animusd`'s client/intra port uses the same functions | code |
+| `Metadata` is `"v": 1` JSON; `Metadata::from_json` and the embedded `v` deserializer refuse any `v != 1` by name; `Member` has `labels`/`status`/`has_activated` | `animus-control/src/meta.rs` |
+| The system-keyspace mirror **`expect`s** every entity decode, so a new entity kind or shape is a node-local panic on a reader that does not know it | `animus-control/src/mirror.rs` |
+| Data-only nodes read `Metadata` through a mirror (`ControlHandle::Remote`, `WatchMetadata` -> `MetadataDelta { writes: Vec<KeyWrite> }`); their view lags the leader | ADR 0035; `animus-node/src/wire.rs` |
+| Every member heartbeats to the control nodes (`heartbeat_loop_live`, spawned in both node assemblies, `animusd/src/lib.rs:6350`, `:8328`) | code |
+| A tablet replica's state machine cannot read `Metadata` | `animus-cp-data` |
+| CWL/SWL v2 and `raftkv-wal` v2 are written unconditionally (node-local) | #1140/#1141 |
 
 ### Decisions
 
-Summary (details in the sections that follow):
-
-1. **Version model.** A binary has `[min_supported, max_supported]` over a
-   single integer *cluster version*. `Metadata.cluster_version` is the
-   active one.
-2. **Gates** cover **cross-node surface only** (wire, replicated command
-   shapes, snapshot content, replicated `Metadata` content, client-visible
-   features). A gate opens only at `cluster_version >= gate`; decoders always
-   accept every version.
-3. **Finalize** is an explicit, manual control-plane command, one version at a
-   time, refused unless every member row reports `max_supported >= target`.
-4. **Rollback policy: Option B (DECIDED by the maintainer, 2026-10-03):** no
-   rollback once a node has run the new binary; node-local formats switch at
-   first start of the new binary. Option A is recorded as a possible future
-   direction with its switching cost.
-5. **Skew:** N-1 and N only.
+| # | Decision | Status |
+|---|---|---|
+| 1 | Version model: a binary has `[min_supported, max_supported]` over one integer cluster version; `Metadata.cluster_version` is the active one (absent = 1) | design |
+| 2 | **B2 is rolling-installable over live Phase 1 binaries**: no handshake version bump, nothing new on any replicated/shipped surface until a leader-local precondition proves every member is B2 | design (maintainer rule) |
+| 3 | The handshake version is **never bumped incompatibly again**; handshake changes go in `ext` TLVs, unknown TLVs ignored | rule |
+| 4 | Gates cover cross-node surface only; decoders accept every version; apply never branches on a gate | design |
+| 5 | Finalize is **manual** (admin API/CLI), one version at a time; auto-finalize may come as a Phase 3 option | **DECIDED** |
+| 6 | Down / removed-pending members **block** Finalize; remedy: bring the node back on the new binary or remove it (ADR 0032); no override | **DECIDED** |
+| 7 | Floor policy: `min_supported = max_supported - 1`, raised only by an ADR amendment naming the stepping-stone release; durable readability stays forever | **DECIDED** |
+| 8 | Rollback: **Option B**, no rollback once a node has run the new binary | **DECIDED** |
+| 9 | Skew: N-1 and N only | design |
 
 ### 1. Version model
 
-- **`ClusterVersion`** is a `u32`. **Version 1 is the Phase 2 baseline B2**:
-  everything that exists in the commit that lands Phase 2 (the handshake
-  version bump, `Metadata` v2, `ReportNodeVersion`, `FinalizeClusterVersion`,
-  CWL/SWL v2, every current message and command). Gates start at 2.
-- **A binary's range.** `max_supported` = the highest cluster version it
-  knows how to run at (its release number). `min_supported` = the lowest
-  version it can still *emit for* (policy: `max_supported - 1`; see "Skew").
-  Both are `const`s in one module, `animus_control::version`
-  (`ClusterVersion`, `VersionRange`, `Gate`, the registry): `animus-control`
-  sits below `animus-cp-data`, `animus-node` and `animusd`, and owns
-  `Metadata`. `animus-env` must not depend on it, so the handshake codec
-  only carries opaque `ext` bytes (below).
-- **How a node advertises its range (two channels, two purposes).**
-
-| Channel | Carries | Purpose |
-|---|---|---|
-| Handshake `ext` (NHS1 and CHS1), TLV: tag 1 = `min:u32, max:u32`, tag 2 = build string (display only) | the binary's range | Fast per-connection refusal when ranges are **disjoint**: `check_peer` relaxes from "version equal" to "ranges intersect" (a peer with an unknown ext tag is fine; the codec already never rejects ext). Needs no `Metadata`, so it works before a node is a member and for clients on the intra port |
-| New replicated command `MetaCommand::ReportNodeVersion { node, range, build }`, stored as `Member.version_range: Option<VersionRange>` + `Member.build` (`#[serde(default)]`, `None` = never reported) | the binary's range, **durably, including for nodes that are down** | Finalize needs a verdict on nodes the leader is not connected to. Proposed by the node itself on every boot, after it has read `cluster_version` (idempotent upsert; relayed like other node-originated commands, so `is_relayable_command` must allow it; data-only nodes use the existing relay) |
-
-- **Handshake versions bump to 2 at B2** (both `NHS1` and `CHS1`). This is the
-  deliberate loud break with Phase 1 binaries: a Phase 1 build has no idea what
-  `ReportNodeVersion` is and would drop the control `AppendEntries` that carries
-  it (see the facts table). Exact-equality in a Phase 1 `check_peer` turns that
-  into a named `UnsupportedVersion` refusal instead. From B2 on, the handshake
-  version changes only if the preamble layout itself changes; compatibility is
-  carried by the range in `ext`.
-- **`Metadata` v2** (checklist: bump, `legacy::v1` decoder with
-  `cluster_version = 1`, new fixture `metadata/v2.json`, per-version expected
-  value, round-trip, old-input test, test-only legacy encoder, inventory row):
-  adds `cluster_version: u32` and the `Member` fields above. A Phase 1 build
-  refuses `"v": 2` by name. Also a new mirror entity (`cluster`) under
-  `SYSKV_MIRROR_VERSION`; **it is part of B2**, so it is not a gated change.
-  **The move from Phase 1 binaries to B2 is a whole-cluster stop/upgrade/
-  restart** (supported since Phase 1); no mixed Phase-1/B2 cluster exists.
+- **`ClusterVersion`** is a `u32`. **Version 1 is "everything in Phase 1 and B2"**:
+  the surfaces that exist today, plus B2's handshake `ext` and the era
+  machinery of section 2. Real gates start at 2.
+- **A binary's range.** `max_supported` = the highest cluster version it can run
+  at; `min_supported` = the lowest it can still *emit for* (`max - 1`). Both are
+  `const`s in one module, `animus_control::version` (`ClusterVersion`,
+  `VersionRange`, `Gate`, the registry). `animus-env` must not depend on it, so
+  the handshake codec carries opaque `ext` bytes.
+- **Handshake `ext` (NHS1 and CHS1), version stays 1.** A TLV list: tag 1 =
+  `min:u32, max:u32` LE, tag 2 = build string (display only); unknown tags are
+  ignored (rule 3). **Empty `ext` means a Phase 1 binary, range [1,1].** A B2
+  binary always sends tag 1, even at [1,1]: *presence* is what distinguishes
+  B2 from Phase 1. `check_peer` keeps magic+version equality and additionally
+  refuses **disjoint** ranges, by name.
+- **Observation.** The `Network` seam hands the control layer the `ext` of the
+  connection each envelope arrived on (`Envelope` gains `peer_ext`, default
+  empty; `ProdEnv` stamps it from the connection's preamble, `SimEnv` from the
+  per-node override). A control node's receive loop records `from -> (range,
+  observed_at)` leader-locally. Every member heartbeats to the control nodes, so
+  the leader sees every live member without any new message. (P2-A confirms
+  each role does, with a test.)
+- **Replicated record.** Once the era has started (section 2): `Member.version_range:
+  Option<VersionRange>` and `Member.build`, `Metadata.cluster_version: u32`.
+  All are `#[serde(default, skip_serializing_if = ...)]` **additions inside
+  `Metadata` `"v": 1`**: with default values they are not serialized, so era-0
+  bytes are identical to Phase 1's. Why no `"v": 2`: a v2 tag would make every
+  Phase 1 reader refuse the snapshot, and an additive field is exactly what the
+  gate (not the tag) protects. New fixture `metadata/v1-era.json`, existing
+  fixtures untouched (checklist steps 3-4); the checklist's "new version tag"
+  step is replaced by "gated additive field" for this one change, and the
+  per-version expected value records both shapes.
 - **Safe target** = `min` over every member row of `version_range.max`, capped
-  at the leader's own `max_supported`; no row may have `version_range == None`.
-  The leader publishes `{active, safe_target, blockers: [(node, reason)]}` on
-  the admin API; it does not act on it.
-- **Startup rule (loud).** After reading `Metadata` (control: recovered
-  snapshot+log; data-only: first mirror fetch), a node whose range does not
-  contain `cluster_version` exits with a named error: `cluster version A is
-  above this binary's max M (downgrade is not supported)` or `... below this
-  binary's min m (upgrade through release R first)`. A joiner checks `JoinInfo`
-  (which gains `cluster_version`, `#[serde(default)]` = 1) before registering.
-  Voter/learner additions (ADR 0037 `change_membership`) are refused at the
-  admin API when the target member's recorded range does not contain the
-  active version. Until a node has read `cluster_version` it uses the **floor**
-  (`min_supported`) for every gate decision.
+  at the leader's `max_supported`; a row with `None` blocks. Published on the
+  admin API `{active, safe_target, blockers}`; the leader does not act on it.
+- **Startup rule (loud).** After reading `Metadata`, a node whose range does not
+  contain `cluster_version` exits with a named error (`cluster version A is above
+  this binary's max M (downgrade is not supported)` / `below this binary's min m
+  (upgrade through release R first)`). Until a node has read `cluster_version`
+  it uses the **floor** (`min_supported`) for every gate decision.
 
-### 2. Gates
+### 2. B2 is rolling-installable over a live Phase 1 cluster
 
-- **Registry.** `animus_control::version::Gate` is an enum, one variant per
-  behavior change, with an exhaustive `const fn version(self) -> ClusterVersion`
-  table (the "gate -> cluster version" table; one row per gate, each with the
-  PR/ADR that introduced it). A handle `ClusterFeatures` (cheap clone, updated
-  by the `Metadata` apply task / mirror, `is_open(Gate)`) is injected into every
-  component that emits. Never a global static: `SimEnv` runs many nodes in one
-  process, and a per-node handle is what lets two nodes be "different binaries".
-- **Rule (emit).** Anything **another node or another binary reads** is emitted
-  in its new form only when `is_open(gate)`; otherwise the previous form is
-  emitted. Scope:
-  1. a new wire message, variant or field (`RaftMsg`, `KvWire`, `KvCommand`
-     wire payloads, `ClientRequest`/`ClientResponse`, `MetaCommand`);
-  2. a new replicated command *shape*, whether it travels in Raft entries or in a
-     `MetaCommand`;
-  3. any change to snapshot / `InstallSnapshot` content (`raftkv-image`,
-     `CSN1` body, the `MetadataDelta` writes);
-  4. any change to replicated `Metadata` content or mirror entity shapes;
-  5. a **client-visible feature** that only some nodes could serve (a new
-     DynamoDB behavior or operation): until the gate opens, it is refused with a
-     named error on every node, so a client does not get a feature from one node
-     and "unsupported" from the next.
-- **Rule (decode).** Every decoder accepts every version it has ever known,
-  gate state notwithstanding (this is Phase 1's `legacy` dispatch, unchanged).
-- **Rule (apply): never branch on a gate while applying.** A tablet replica
-  cannot read `Metadata`, and a data node's view lags; if replicas branch on
-  their own view they diverge. Apply behavior must be a pure function of the
-  entry bytes and the state machine. A semantic change therefore ships as a
-  *new variant or flag field*, gated at the **proposer**; it is never a changed
-  interpretation of existing bytes. (The control plane could branch on
-  `Metadata.cluster_version` at apply, being in the same state machine;
-  the rule is still "new variant" for uniformity, with that as a stated
-  exception only when a variant is impossible.) The proposer's view may only be
-  *behind* the truth, which is the safe direction: it emits the older form,
-  which every decoder accepts.
-- **JSON enums (control `RaftMsg`, `ClientRequest`/`Response`, `MetaCommand`).**
-  *Fields:* new fields stay `#[serde(default)]` (ADR 0035 pattern) and an old
-  reader ignores them silently, so a field is only safe when absence means the
-  old behavior; the gate keeps it at its default until open. *Variants:* "additive"
-  is **not** safe for variants (whole-message failure above); only gating is.
-  Enforcement: each of these enums gets `fn required_gate(&self) -> Gate`, an
-  **exhaustive `match` with no `_` arm**, so a new variant does not compile
-  until it names its gate (baseline variants map to `Gate::B2`). The send choke
-  points (`serde_json::to_vec` sites in `node.rs`, `encode_client_frame`,
-  `codec::encode_wire`, the propose path) `debug_assert!(required_gate <=
-  active)` and bump a metric in release builds (never panic in production).
-- **Binary codecs (`codec.rs`).** The frame version byte stays the dispatch.
-  The encoder picks the frame version from the gate (`encode_wire` takes the
-  node's `ClusterFeatures`), the decoder accepts all. Because `VERSION` is shared
-  by wire/image/WAL payloads, a version bump is split by surface: the *wire* and
-  *image* frames follow the gate; the WAL payload follows "local" (below).
-- **Gate-off equals the previous release, byte for byte.** For each gate, a test
-  encodes a representative value with the gate closed and asserts equality with
-  the previous release's golden fixture (the Phase 1 fixture directories are the
-  oracle; no new fixtures are needed for the closed side). The open side gets its
-  own new fixture per the checklist.
+**Principle.** While any Phase 1 binary can be in the cluster, B2 emits nothing a
+Phase 1 binary cannot decode, and replicates nothing new. Only the era-start
+step (below) changes that, and only after the leader has *proven* every member
+is B2.
 
-### 3. Finalize
+**What B2 holds back until the era starts (every Phase 1 surface, checked one by one).**
 
-- **Command:** `MetaCommand::FinalizeClusterVersion { expected: u32, target: u32 }`.
-  Apply rejects (deterministically, from state) unless `expected ==
-  cluster_version`, `target == cluster_version + 1`, **every** `Member` row has
-  `version_range == Some(r)` with `r.max >= target` and `r.min <= target`.
-  One version per command: a skipped version could never have been run by anyone.
-- **Down-but-not-removed members block Finalize (DECIDED here, for confirmation).**
-  Rule: every row in `Metadata.members` counts, whatever its status, including
-  `Down`, `Leaving` and a never-activated `Joining` row. Why: such a node still
-  holds replicas and possibly a vote; if it returns on an old binary after
-  Finalize it is refused at startup, i.e. permanent capacity loss disguised as
-  an upgrade; and its last recorded range is the only evidence we have. The
-  cost is that one dead node holds the cluster at the old version (which is
-  harmless: the old version always works). The remedy uses existing primitives:
-  bring it back on the new binary, or remove it (ADR 0032 drain/remove).
-  *Alternative:* a `--exclude-down` override; rejected for v1 because it turns a
-  safe default into a footgun with no use before Phase 3.
-- **Manual in v1 (recommended, for confirmation).** `animus-cli cluster
-  version` (reads `/admin/cluster-version`: active, per-node range+build, safe
-  target, blockers) and `animus-cli cluster finalize [--to N]` (admin API ->
-  control leader -> `FinalizeClusterVersion`; follows ADR 0037's admin shape,
-  role-gated like membership actions). Why not automatic: Finalize is the one
-  step that cannot be undone and that disables a node's right to rejoin on an
-  old binary; auto-finalizing on "all nodes report N" would act during a
-  half-finished roll (a node restarted early, the rest not yet verified).
-  Auto-finalize is a Phase 3 option behind a flag once the orchestrator knows
-  the roll is complete.
-- **Race:** the apply check reads the *last reported* ranges. A node that has run
-  the new binary cannot go back (Option B), so there is no "reported new, ran
-  old" window by policy; the CLI refuses while any blocker exists.
+| Phase 1 surface a Phase 1 node reads | B2 behavior before the era |
+|---|---|
+| NHS1/CHS1 preamble | version 1; `ext` now non-empty, which Phase 1 `decode`/`check_peer`/`read_preamble` accept and ignore (verified above) |
+| Control `RaftMsg` JSON (incl. `Heartbeat`, `AppendEntries` entries, `InstallSnapshot` chunks) | no new variant, no new field |
+| `MetaCommand` in control log entries and in `ProposeSchema` | only existing variants; `ReportNodeVersion`/`FinalizeClusterVersion` are new variants and are era-only |
+| `Metadata` JSON in `CSN1` snapshots, `InstallSnapshot`, `Status`/`JoinInfo` carriers | byte-identical to Phase 1 (`"v": 1`; new fields skipped at default) |
+| `MetadataDelta`/`KeyWrite` mirror stream read by Phase 1 data-only nodes; mirror entity kinds | no new entity kind (the `cluster` entity is era-only); `Member` entity value unchanged |
+| `ClientRequest`/`ClientResponse` | no new variant; the admin Finalize rides the existing `ProposeSchema` relay and exists only post-era; `JoinInfo` may carry an additive `#[serde(default)]` field, which Phase 1 ignores |
+| `KvWire`, `KvCommand`, `raftkv-image`, `codec.rs` `VERSION` | unchanged; B2 adds nothing here |
+| `control-wal`/`shared-wal`/`raftkv-wal`/LSM files | unchanged (v2 already shipped on `main`; node-local anyway) |
+| Admin/dashboard HTTP, DynamoDB wire | admin gets new routes (additive); Dynamo unchanged |
 
-### 4. Rollback policy: Option B (DECIDED, maintainer, 2026-10-03)
+A B2 build with no Phase 1 peer ever observed still behaves this way until the
+era starts. A test pins it: B2 pre-era encodings equal the existing Phase 1
+golden fixtures byte for byte.
 
-**No rollback once a node has run the new binary.** Gating covers only what
-another node or another binary reads. Everything a node writes **only for
-itself** switches to the new version the first time the node starts the new
-binary, with no old-format writer kept in production code.
+**Chicken and egg.** `ReportNodeVersion` is a new `MetaCommand` a Phase 1 voter
+cannot decode, so it cannot be how B2 learns versions before every voter is B2.
+Bootstrap instead:
 
-- Node-local, not gated (the node's own format changes take effect at first
-  start): `control-wal` / `shared-wal` / `raftkv-wal` payload framing, LSM WAL,
-  SSTable, manifest, the tablet engine key layout marker, the encryption envelope,
-  the system-keyspace mirror *file* contents when only that node reads them,
-  `ClusterConfig` as parsed by that node.
-- **The already-landed CWL/SWL v2 and `raftkv-wal` v2 need no retrofit.** They
-  predate B2 and are part of the baseline; Option B would not retrofit them
-  anyway.
-- **Consequence, stated plainly:** a bad release mid-roll is **fix-forward only**:
-  ship a fixed binary, or wipe the node and rebuild it from its peers, or
-  restore from backup. Each node passes its own point of no return the first
-  time it starts the new binary. Docs (and Phase 3's runbook) must say so before
-  the first node is touched.
-- **Classification rule, and its hazard.** A format is *local* only if **no
-  other node and no other binary ever reads its bytes**. The traps:
-  - snapshots built from local engine state are **shipped to peers**
-    (`raftkv-image`/`InstallSnapshot` content comes out of the leader's engine;
-    `CSN1` is persisted *and* sent): gated, not local;
-  - `Metadata` and the mirror's *entity shapes* are replicated content: gated;
-  - backup manifests/data, PITR change-log segments, S3 export objects outlive
-    the cluster and are read by future binaries: they keep Phase 1's
-    forever-readable rule and each format change is a new version + fixture
-    (checklist), **independent of this policy**; they are never rewritten in an old
-    form, and are not gated on the cluster version either (nothing reads
-    them concurrently);
-  - **anything in the inventory not obviously local defaults to gated.** A wrong
-    "local" is silent data loss on the peer; a wrong "gated" costs one release of
-    delay. The inventory table below carries the classification per row so
-    reviewers can challenge it.
-- **Option A (maybe later): rollback allowed until Finalize.** New binaries keep
-  writing old formats, wire **and** durable, until Finalize (CockroachDB's model);
-  a node can go back to the previous binary until the cluster is finalized.
-  **This may be preferred in the future**, so the design does not preclude it:
-  the `Gate` registry is defined to be able to name *durable* formats too, and
-  `required_gate` style tables are per-format, not per-wire. Switching to A
-  later costs: (1) gating every durable write site (WAL framing, LSM files,
-  manifest, key layout) behind `is_open`, with the node-start-time floor rule
-  already specified above; (2) shipping and testing an N-1 *writer* for each
-  (the `legacy-encoders` test-only encoders become production code); (3) deciding
-  what happens to formats that already switched under B (grandfather them,
-  as with CWL/SWL v2 today, or declare the first A release a new baseline); (4)
-  the upgrade-restart harness gaining a "write old, restart new, then write new"
-  axis. None of this changes the wire/gate design here.
+- `cluster_version` is implicitly 1 when absent, and the era is *off*;
+- the control leader learns live ranges from handshake `ext` (passive, above);
+- **Precondition P (leader-local):** every control voter and learner **and every
+  row in `Metadata.members`** has been observed by *this* leader with a B2 range
+  (tag 1 present) within the last `T` (default 3 heartbeat intervals), and the
+  leader itself is B2. **It must be every member, not only the control voters:**
+  data-only Phase 1 nodes read `Metadata` through `MetadataDelta`, whose entity
+  kinds the era changes, so a Phase 1 data-only node would panic in the mirror
+  `expect`. A member never observed (down, partitioned) counts as [1,1] and
+  blocks P, consistent with decision 6;
+- **Era start:** when P holds, the leader proposes `ReportNodeVersion` for each
+  member (its first and only new-variant emission). The era is *on* once any
+  member row has `version_range: Some` (`Metadata::versioning_active()`, read
+  from replicated state, so followers and data nodes agree);
+- **Era on:** B2 nodes (a) self-report `ReportNodeVersion` at every boot,
+  (b) **refuse any peer whose handshake `ext` is empty** (a Phase 1 binary) at
+  the handshake, with a `warn` naming `peer is a Phase 1 binary; cluster has
+  versioning enabled`, a refusal metric, and connection close, (c) refuse
+  `RegisterNode`/`UpsertMember`/`change_membership` for a peer with no observed
+  range, (d) allow `FinalizeClusterVersion`. `Gate::Era` is the registry's one
+  gate whose open condition is `versioning_active()` rather than `cluster_version`.
+- **A Phase 1 binary joining or rejoining after the era** cannot read `ext`
+  ranges and is not asked to: the **B2 side refuses it** (b)/(c). The Phase 1
+  node sees only a closed connection; the loud error is on the B2 side. A late
+  Phase 1 joiner racing P (registered between P and the first report) gets a row
+  with `version_range: None`, is refused at every connection, never becomes
+  `Active`, and blocks Finalize until removed.
 
-### 5. Supported skew
+**Ordered sequence, Phase 1 -> R (R's `max_supported` = 2), then Finalize.**
+
+1. Cluster is all Phase 1, `cluster_version` implicit 1, era off.
+2. Operator restarts **one node** on R (any role, any order; keep a control
+   quorum). R speaks NHS1/CHS1 v1 with `ext` and emits only Phase 1 bytes, so the
+   Phase 1 peers carry on. Repeat per node, waiting for `Active` and no
+   under-replicated tablet each time.
+3. After the **last** member is on R (a down member never observed holds this
+   at step 3, indefinitely and harmlessly: era-0 is a fully working cluster;
+   remove it per ADR 0032 or bring it back on R), P holds on the leader.
+4. Leader proposes the initial `ReportNodeVersion`s; the era starts; Phase 1 peers
+   are refused from now on (there are none).
+5. Every node self-reports at each later boot; `cluster version` shows `active 1,
+   safe_target 2, blockers []`.
+6. Operator runs `cluster finalize`; `FinalizeClusterVersion { expected: 1,
+   target: 2 }` applies; `Gate(2)` opens everywhere as each node applies it.
+
+No step requires a stop: each is one node's ordinary restart, and at no moment
+does any node receive bytes it cannot decode (before step 4 nothing new exists;
+after step 4 every reader is R). If R's `max_supported` is 1 (no gate yet), the
+roll ends at step 5.
+
+**A B2 leader steps down to a Phase 1 leader mid-roll.** Safe: before P holds B2
+has proposed and replicated nothing a Phase 1 node cannot decode, so the Phase 1
+leader and replicas read every entry, snapshot and delta. After P holds there is
+no Phase 1 voter to become leader. A Phase 1 binary reinstalled on a node after the
+era (violating Option B) is refused at the handshake by every B2 peer, so it
+looks partitioned instead of wedging on a variant it cannot decode.
+
+**No future stop-the-world step (rules).**
+1. The handshake version is never bumped incompatibly; handshake evolution is
+   `ext` TLVs, unknown ones ignored.
+2. A release's only way to change a cross-node surface is a gate. A change that
+   cannot be a gate is split into two releases (expand, then contract); it never
+   ships as "restart everything".
+3. Every release runs the mixed-version corpus against the **previous release
+   profile** (section 7); a release that fails it does not merge.
+
+### 3. Gates
+
+- **Registry.** `Gate` is an enum, one variant per behavior change, with an
+  exhaustive `const fn version(self)` table (gate -> cluster version; `Gate::Era`
+  excepted, above) naming the PR/ADR that introduced each. `ClusterFeatures` (a
+  cheap clone, updated by the `Metadata` apply task / mirror, `is_open(Gate)`) is
+  injected into every emitter. Never a global: `SimEnv` runs many nodes in one
+  process and a per-node handle is what lets two nodes be different binaries.
+- **Emit.** Anything **another node or binary reads** is emitted in its new form
+  only when `is_open(gate)`, otherwise in the previous form. Scope: a new wire
+  message/variant/field (`RaftMsg`, `KvWire`, `KvCommand`, `ClientRequest`/
+  `ClientResponse`, `MetaCommand`); a new replicated command shape; any change to
+  snapshot/`InstallSnapshot` content (`raftkv-image`, `CSN1`, `MetadataDelta`);
+  any change to replicated `Metadata`/mirror content; a client-visible feature
+  that only some nodes could serve (refused by name on every node until open).
+- **Decode.** Every decoder accepts every version it has ever known.
+- **Apply never branches on a gate.** A tablet replica cannot read `Metadata` and a
+  data node's view lags; replicas branching on their own view would diverge.
+  Apply is a pure function of the entry bytes and the state machine. A semantic
+  change ships as a new variant or flag, gated at the **proposer**; the proposer's
+  view can only be behind the truth, which is the safe direction.
+- **JSON enums.** Fields stay `#[serde(default)]` and are safe only when absence
+  means the old behavior; the gate keeps them at default until open. **Variants
+  are not safe by being additive** (whole-message failure above). Enforcement: each
+  of `RaftMsg`, `KvWire`, `KvCommand`, `MetaCommand`, `ClientRequest`,
+  `ClientResponse` gets `fn required_gate(&self) -> Gate`, an **exhaustive match
+  with no `_` arm**, so a new variant does not compile until it names its gate.
+  The send choke points (`to_vec` sites in `node.rs`, `encode_client_frame`,
+  `codec::encode_wire`, the propose path) `debug_assert!(required_gate <= open)`
+  and bump a metric in release builds; never a production panic.
+- **Binary codecs.** The frame version byte is the dispatch; the encoder picks it
+  from the gate for wire and image frames, the decoder accepts all. The WAL
+  payload of the same codec follows "local" (section 5).
+- **Gate-off equals the previous release, byte for byte,** asserted against the
+  previous release's golden fixture; the open side gets a new fixture.
+
+### 4. Finalize
+
+- `MetaCommand::FinalizeClusterVersion { expected: u32, target: u32 }` (era-only).
+  Apply rejects unless `expected == cluster_version`, `target == cluster_version + 1`,
+  and **every** `Member` row has `version_range == Some(r)` with `r.min <= target <= r.max`.
+- **Down / removed-pending members block (DECIDED).** Every row in
+  `Metadata.members` counts: `Down`, `Leaving`, a never-activated `Joining`. Such a
+  node still holds replicas and maybe a vote; returning on an old binary after
+  Finalize it would be refused, a permanent capacity loss. Remedy: bring it back
+  on the new binary or remove it (ADR 0032). No override.
+- **Manual (DECIDED).** `animus-cli cluster version` (reads `/admin/cluster-version`:
+  active, per-node range+build, safe target, blockers) and `animus-cli cluster
+  finalize [--to N]` (admin API -> control leader; role-gated like ADR 0037's
+  membership actions). Finalize is the step that cannot be undone. Auto-finalize
+  may come as a Phase 3 option once an orchestrator knows the roll is complete.
+
+### 5. Rollback policy: Option B (DECIDED, maintainer, 2026-10-03)
+
+**No rollback once a node has run the new binary.** Gating covers only what another
+node or binary reads. What a node writes **only for itself** switches to the new
+version the first time the node starts the new binary; no old-format writer is kept
+in production code. The already-landed CWL/SWL v2 and `raftkv-wal` v2 need no
+retrofit. **Consequence:** a bad release mid-roll is **fix-forward only** (ship a
+fixed binary, wipe and rebuild the node from peers, or restore from backup); each
+node passes its own point of no return at its first start of the new binary. Docs
+and the Phase 3 runbook must say so before the first node is touched.
+
+- **Classification rule and its hazard.** A format is *local* only if **no other
+  node and no other binary ever reads its bytes**. Traps: snapshots built from
+  local engine state are **shipped to peers** (`raftkv-image`, `CSN1`): gated;
+  `Metadata` and mirror entity shapes are replicated content: gated; backup
+  manifests/data, PITR segments and S3 export objects outlive the cluster and are
+  read by future binaries: they keep Phase 1's forever-readable rule regardless
+  (each change is a new version + fixture), never gated on cluster version;
+  **anything not obviously local defaults to gated** (a wrong "local" is silent
+  data loss on a peer; a wrong "gated" costs a release of delay).
+- **Option A (rollback allowed until Finalize; new binaries keep writing old
+  formats, wire and durable, until Finalize; CockroachDB's model) may be preferred
+  in the future.** The design does not preclude it: the `Gate` registry can name
+  durable formats, and the floor rule already covers boot-time writes. Switching
+  later costs: gating every durable write site (WAL framing, LSM files, manifest,
+  key layout); shipping and testing an N-1 *writer* for each (today's test-only
+  `legacy-encoders` become production code); deciding what to do with formats that
+  already switched under B (grandfather, as CWL/SWL v2 is, or declare the first A
+  release a baseline); and a "write old, restart new, write new" axis in the
+  upgrade-restart harness. The wire/gate design is unchanged.
+
+### 6. Supported skew and floor policy (DECIDED)
 
 **N-1 <-> N only**, one cluster version at a time. A release at `max_supported = R`
-runs at cluster versions R-1 and R (`min_supported = R-1`), so binaries R-1 and R
-can share a cluster and R-1 and R+1 cannot (R+1 refuses a cluster at R-1 by
-name; the handshake ranges are disjoint). Why: the emit-old-form code for a gate
-must be kept and tested for as long as it can be selected; a window of one
-release bounds that cost and the mixed-version test matrix to one pair. Why not
-wider: every extra supported version multiplies gate-off paths and corpus cells.
-**Open (flagged): floor policy.** Raising `min_supported` forces stepping through
-the intermediate release even for a whole-cluster restart, which narrows Phase 1's
-"any post-baseline version" *upgrade path* (durable *readability* stays forever).
-Recommendation: `min_supported` rises only by an ADR amendment naming the
-required stepping-stone release; until the first gate ships it is 1 for everyone.
+runs at cluster versions R-1 and R (`min_supported = R-1`); R+1 refuses a cluster at
+R-1 by name. Why: the emit-old-form code for each gate must be kept and tested for
+as long as it can be selected; one release of window bounds that cost and the
+mixed-version matrix to one pair. `min_supported` rises only by an ADR amendment
+naming the required stepping-stone release; until the first gate ships it is 1.
+Durable *readability* stays forever (Phase 1); only the *upgrade path* across a
+raised floor needs the intermediate release, and it is still a rolling upgrade.
 
-### 6. Testing
+### 7. Testing
 
-The mixed-version corpus rides `SimCluster` + `SimEnv` and reuses the existing
-oracles (`check_cycles`, `check_durability`, `check_convergence`; the
-`raftkv_linearizable` linearizability checker for single-key histories; the
-DynamoDB-wire workload of `sim_cluster_dynamo_corpus`).
+Mixed-version corpus on `SimCluster`/`SimEnv`, reusing `check_cycles`,
+`check_durability`, `check_convergence`, the `raftkv_linearizable` checker and the
+`sim_cluster_dynamo_corpus` workload.
 
-- **Two binaries in one run.** Real historical binaries are not available in a
-  sim, so a node's "binary" is a per-node `BinaryProfile { min, max }` passed
-  to `ClusterFeatures`. A node built with `max = N-1` (a) emits only forms with
-  `gate <= N-1` and (b) **rejects on decode** whatever an old binary would
-  reject: under `cfg(any(test, feature = "sim-versions"))` the decoders call
-  `required_gate(msg) <= profile.max` and otherwise return the same error the
-  real old decoder gives (unknown variant / `UnsupportedFormatVersion`). The
-  profile is also what the handshake `ext` advertises, so `SimEnv`'s per-message
-  `check_peer` models range intersection.
-- **Synthetic gate ladder.** Phase 2 ships with no real gate, and a corpus with
-  nothing to gate is vacuous. Test-only gates `Gate::TestV2..` (behind the same
-  cfg) add: one variant per layer (`RaftMsg`, `KvCommand`, `ClientRequest`,
-  `MetaCommand`), one `#[serde(default)]` field, one binary-codec frame version,
-  and one snapshot-content change. Each real gate added later joins the cells
-  automatically through `Gate::ALL`.
-- **Knob: `ANIMUS_UPGRADE_SEEDS=K`** (default 1; per-push at K=1, nightly in
-  `corpus-deep.yml`); `ANIMUS_UPGRADE_CELL=<substring>` narrows, with
-  `ANIMUS_SEED=<seed>` replay. Distinct from `ANIMUS_UPGRADE_RESTART_SEEDS`
-  (Phase 1, same-version restarts). Home: `animusd` `sim_cluster_mixed_version_corpus`
-  (a `--lib` test, like tier 2) plus an `animus-control`/`animus-cp-data` pure
-  tier for the per-layer gate cells.
-- **Cells** (each a seeded rolling run, fault-injected: crash, torn-tail crash,
-  partition of the restarting node from one peer, leader kill during the roll):
+- **Binary profiles.** A node's "binary" is a per-node `BinaryProfile` handed to
+  `ClusterFeatures`, with: `Phase1` (empty `ext`, today's encodings,
+  **decode-only of today's variants**), `B2` (range [1,1]), and later `Release(N)`.
+  A node capped below a gate (a) emits only forms with `gate <= cap` and (b) under
+  `cfg(any(test, feature = "sim-versions"))` **rejects on decode** exactly what the
+  real older binary would (`required_gate(msg) > cap` -> the same unknown-variant /
+  `UnsupportedFormatVersion` error, then the receiver's "dropped"/teardown
+  behavior). `SimEnv` gains a per-node `ext` override beside
+  `set_network_protocol_for`, so `check_peer` and the leader's observation see the
+  profile. Phase 1 behavior is real code, not a mock: B2 pre-era emits Phase 1 bytes.
+- **Synthetic ladder.** Test-only gates (one variant per layer, one default field,
+  one codec frame version, one snapshot-content change) model B2 -> B3, since Phase 2
+  ships no real gate. Real gates join via `Gate::ALL`.
+- **Knob `ANIMUS_UPGRADE_SEEDS=K`** (default 1; nightly deep in `corpus-deep.yml`);
+  `ANIMUS_UPGRADE_CELL=<substring>`, `ANIMUS_SEED=<seed>` replay. Distinct from
+  `ANIMUS_UPGRADE_RESTART_SEEDS`. Home: `animusd` `sim_cluster_mixed_version_corpus`
+  (`--lib`, like tier 2) plus a pure per-layer tier in `animus-control`/`animus-cp-data`.
 
 | Cell | Asserts |
 |---|---|
-| roll all nodes N-1 -> N under a linearizable workload, then Finalize | no client-visible error beyond retries; `check_cycles` + linearizability; every ack readable; Finalize applies only after the last report |
-| roll in several orders (control first, data first, leader first) | same; the control quorum never loses its majority |
-| Finalize attempted early (one node not yet reported / one down) | rejected, by name; cluster unaffected; Finalize succeeds once resolved |
-| out-of-range node (N+1 binary against a cluster at N-1; N-1 binary against a cluster at N) | refuses at startup with the named error; handshake refusal counted; never joins |
-| gate opened by Finalize, workload continues, restart everything | new forms flow; per-node mirror agrees on `cluster_version` |
-| Option B point of no return | a node that ran N is *not* handed N-1 state in any cell (the harness does not simulate rollback; a test asserts the docs'/startup refusal path only) |
-| **negative controls** | an ungated new variant, an ungated field, and a gate opened on a stale view must each fail the corpus |
+| **Phase 1 -> B2 under load**: all nodes `Phase1`, rolled one at a time to `B2` with a linearizable workload, **leader changes mid-roll** (kill leader at random points, incl. while P is about to hold), crashes, torn-tail, partitions | no client-visible error beyond retries; `check_cycles` + linearizability; no Phase 1 profile node ever receives a byte with `required_gate > Phase 1` (a delivery assertion); the era starts only after the last member is `B2`; a Phase 1 leader and a B2 leader both appear in some seeds |
+| era start, then Finalize to 2 with the synthetic ladder | gate 2 opens only after every row reports; `check_cycles`; per-node mirrors agree on `cluster_version` |
+| a member down (never observed) at P | era does not start; cluster serves normally; era starts once it is back on `B2` or removed |
+| Phase 1 binary (re)joins after the era; Phase 1 binary against a cluster at 2 | refused by the B2 side at the handshake; counted; never a member; Finalize blocked until removed |
+| out-of-range binary (R+1 vs cluster at R-1; R-1 vs cluster at R) | refused at startup or handshake by name |
+| Finalize early (blocker present) | rejected by name; cluster unaffected |
+| N-1 -> N for every later release (previous-release profile) | same assertions; this cell is mandatory for every release (rule 3) |
+| **negative controls** | (1) a premature new `MetaCommand` variant emitted while a `Phase1` voter exists **wedges that replica** (its `AppendEntries` is dropped; commit never reaches it) and the corpus must fail; (2) an ungated variant, (3) an ungated field, (4) a gate opened on a stale view, each fail the corpus |
 
-- **Per-gate unit tests (both sides):** gate closed -> emitted bytes equal the
-  previous golden fixture and an N-1-profile decoder accepts them; gate open ->
-  new fixture round-trips and an N-1-profile decoder refuses by name; plus an
-  exhaustiveness test that every `Gate` row has a version and a test row.
-- **Later (Phase 3, not here):** a CI job that builds the previous release tag's
-  `animusd` and rolls a real `ProdEnv` cluster across it, since the sim profile
-  models gate discipline of the *current* tree, not the actual old bytes.
+- **Per-gate unit tests (both sides):** closed -> bytes equal the previous golden
+  fixture and an older-profile decoder accepts them; open -> new fixture round-trips and
+  an older-profile decoder refuses by name; an exhaustiveness test that every `Gate`
+  has a version and a test row.
+- **Later (Phase 3):** a CI job that builds the previous release tag's real `animusd`
+  and rolls a `ProdEnv`/`kind` cluster across it, since the profile models the gate
+  discipline of the *current* tree, not the old bytes.
 
-### 7. Inventory: surfaces Phase 2 puts under the gate discipline
+### 8. Inventory: surfaces under the gate discipline
 
-"Class": **G** = gated on `cluster_version`; **L** = node-local, switches at first start of the new binary (Option B); **F** = outlives the cluster, Phase 1 rules only.
+Class: **G** gated on `cluster_version` (or `Gate::Era`); **L** node-local, switches at
+first start of the new binary (Option B); **F** outlives the cluster, Phase 1 rules only.
 
-| Surface | Code | Class | Mechanism under Phase 2 |
+| Surface | Code | Class | Mechanism |
 |---|---|---|---|
-| Control `RaftMsg` (JSON) incl. `Heartbeat` | `animus-control/src/raft.rs` `RaftMsg`, sent/decoded in `node.rs` | G | `required_gate`; variants gated, fields `#[serde(default)]` |
-| `MetaCommand` (inside `LogEntry`/`AppendEntries`, and via `ProposeSchema`) | `animus-control/src/meta.rs`, `animus-node/src/wire.rs` `is_relayable_command` | G | `required_gate`; relay allowlist updated with every new variant (root CLAUDE.md rule) |
-| `Metadata` content, `Member` fields | `meta.rs` | G | new fields default; new content only after the gate |
-| Control snapshot / `InstallSnapshot` body (`CSN1`) | `raft.rs` snapshot, `persist.rs` `CONTROL_SNAPSHOT` | G | the same bytes are persisted *and* shipped; follows the gate |
-| `MetadataDelta` / `WatchMetadata` and mirror entity values (`KeyWrite`) | `animus-node/src/wire.rs`, `animus-control/src/mirror.rs`, `delta_ring.rs` | G | entity shapes gated (the mirror `expect`s on decode) |
-| CP-data Raft wire (`KvWire`: `Raft`, `ReadProbe`, `HeartbeatBatch`) | `animus-cp-data/src/lib.rs` `KvWire`, `codec::encode_wire` | G | frame version chosen from the gate |
-| `KvCommand` shapes (replicated in the tablet log) | `animus-cp-data/src/lib.rs` `KvCommand`, `codec.rs` | G | new shape = new variant/flag, gated at the proposer; never branch at apply |
-| Tablet `InstallSnapshot` image (`ImageEntry`, `raftkv-image`) | `animus-cp-data/src/lib.rs` (image build), `codec.rs` | G | built from the leader's engine but read by peers |
-| `ClientRequest`/`ClientResponse` (forwarding, relay, intra) | `animus-node/src/wire.rs`, `codec.rs`, `animusd` `read_frame`/`write_frame` | G | `required_gate`; unknown variant tears down the connection, so never emitted early |
-| Client-visible DynamoDB behavior | `animusd/src/dynamo.rs`, `animus-dynamo` | G | new feature refused by name on every node until the gate opens |
-| Admin/dashboard/console HTTP JSON | `animusd/src/admin.rs`, `dashboard*`, `animus-node/src/console.rs` | G (additive) | readers tolerate unknown fields; new fields only; new action routes gated |
-| Handshakes `NHS1`/`CHS1` | `animus-env/src/handshake.rs`, `prod.rs`, `animusd/src/lib.rs` | B2 baseline | version 2; `ext` = range TLV; `check_peer` = range intersection |
-| `ReportNodeVersion`, `FinalizeClusterVersion`, `JoinInfo.cluster_version` | new | B2 baseline | not gated; they are the mechanism |
-| `control-wal`/`shared-wal`/`raftkv-wal` framing, LSM WAL/SSTable/manifest, key-layout marker, `ADE1` | `animus-control/src/persist.rs`, `animus-storage`, `animus-cp-data/src/layout.rs`, `animus-env/src/encrypted.rs` | L | next bump takes effect at first start; checklist applies |
-| System-keyspace mirror file, `ClusterConfig` | `mirror.rs`, `animusd/src/config.rs` | L | only that node reads it (config also checked by `check-format-fixtures`) |
+| Control `RaftMsg` (JSON) incl. `Heartbeat` | `animus-control/src/raft.rs`, `node.rs` | G | `required_gate`; variants gated, fields `#[serde(default)]` |
+| `MetaCommand` (log entries, `ProposeSchema`) | `animus-control/src/meta.rs`; `animus-node/src/wire.rs` `is_relayable_command` | G | `required_gate`; relay allowlist updated with every new variant (root CLAUDE.md rule) |
+| `Metadata` content, `Member` fields | `meta.rs` | G | additive skipped-at-default fields; populated only after the gate |
+| Control snapshot / `InstallSnapshot` (`CSN1`) | `raft.rs`, `persist.rs` | G | persisted *and* shipped |
+| `MetadataDelta`/`WatchMetadata`, mirror entity values | `animus-node/src/wire.rs`, `mirror.rs`, `delta_ring.rs` | G | entity shapes gated (mirror `expect`s) |
+| `KvWire` (`Raft`, `ReadProbe`, `HeartbeatBatch`) | `animus-cp-data/src/lib.rs`, `codec::encode_wire` | G | frame version from the gate |
+| `KvCommand` shapes | `animus-cp-data/src/lib.rs`, `codec.rs` | G | new variant/flag gated at the proposer |
+| Tablet `InstallSnapshot` image (`ImageEntry`) | `animus-cp-data/src/lib.rs`, `codec.rs` | G | built from the leader's engine, read by peers |
+| `ClientRequest`/`ClientResponse` | `animus-node/src/wire.rs`, `codec.rs`, `animusd` `read_frame` | G | `required_gate`; an unknown variant tears down the connection |
+| Client-visible DynamoDB behavior | `animusd/src/dynamo.rs`, `animus-dynamo` | G | refused by name on every node until open |
+| Admin/dashboard/console HTTP JSON | `animusd/src/admin.rs`, `dashboard*`, `console.rs` | G (additive) | new fields only; new action routes gated |
+| Handshakes `NHS1`/`CHS1` | `animus-env/src/handshake.rs`, `prod.rs`, `animusd/src/lib.rs` | version fixed at 1 forever | `ext` TLVs; `check_peer` + disjoint-range refusal; `Envelope.peer_ext` |
+| `ReportNodeVersion`, `FinalizeClusterVersion` | new | `Gate::Era` | era-only variants |
+| `control-wal`/`shared-wal`/`raftkv-wal`, LSM WAL/SSTable/manifest, key-layout marker, `ADE1` | `animus-control/src/persist.rs`, `animus-storage`, `animus-cp-data/src/layout.rs`, `animus-env/src/encrypted.rs` | L | next bump at first start; checklist applies |
+| Mirror files, `ClusterConfig` | `mirror.rs`, `animusd/src/config.rs` | L | only that node reads them |
 | Backup manifest/data, PITR/stream segments, S3 export | `animus-cp-data/src/backup.rs`, `segment.rs`, `animusd/src/import.rs` | F | forever-readable; no gate |
-| Hash-ring token, `numkey`, key bytes, stored item, `ChangeRecord` | `animus-tablet`, `animus-item` | frozen (not gated) | pinned by vectors; a change is an ADR amendment, not a gate |
+| Hash-ring token, `numkey`, key bytes, stored item, `ChangeRecord` | `animus-tablet`, `animus-item` | frozen | pinned by vectors; a change is an ADR amendment |
 | Operator CRD | `animus-operator/src/crd.rs` | out of scope | Phase 3 |
 
-### 8. Workstreams (one session/PR series each; do-not-touch lists)
+### 9. Workstreams (one session/PR series each)
 
 | WS | Crates | Scope | Depends on | Do not touch |
 |---|---|---|---|---|
-| **P2-A** version core | `animus-control`, `animus-env` | `version` module (`ClusterVersion`, `VersionRange`, `Gate` + registry, `ClusterFeatures`); `Metadata` v2 (`cluster_version`, `Member` fields) with the full checklist; `ReportNodeVersion` and `FinalizeClusterVersion` commands + apply checks; mirror `cluster` entity; handshake `ext` range TLV, `check_peer` -> range intersection, version 2 for both protocols, `SimEnv` per-node range; startup range check | none | `animus-cp-data`, `animus-node`, `animusd`, operator, `website/` |
-| **P2-B** gate enforcement | `animus-control`, `animus-cp-data`, `animus-node` | `required_gate` exhaustive tables for `RaftMsg`/`MetaCommand`/`KvWire`/`KvCommand`/`ClientRequest`/`ClientResponse`; emit-side `debug_assert` + metric at the choke points; gate-selected frame version in `codec.rs`; `is_relayable_command` allow for the new commands; classification column (G/L/F) in the inventory, reviewed | P2-A (types) | `animusd` wiring, `animus-test`, docs outside this ADR |
-| **P2-C** node wiring + admin | `animusd`, `animus-cli` | `ClusterFeatures` fed from the apply task / mirror and injected into every emitter; boot-time `ReportNodeVersion`; `/admin/cluster-version`, `cluster version` and `cluster finalize` CLI; joiner and `change_membership` range checks; `JoinInfo.cluster_version` | P2-A (P2-B for the full emit gating) | `animus-env`, `animus-control` internals, operator |
-| **P2-D** mixed-version corpus | `animus-test`, `animusd`, test-only cfg in the crates above | `BinaryProfile` + capped decode, synthetic gate ladder, `sim_cluster_mixed_version_corpus`, pure per-layer tier, per-gate both-sides tests, negative controls, `ANIMUS_UPGRADE_SEEDS`, `corpus-deep.yml` step | P2-A and P2-B; P2-C for the cluster tier | production emit/apply logic (report bugs, do not fix inline) |
+| **P2-A** version core + bootstrap | `animus-control`, `animus-env`, `animus-sim` | `version` module (`ClusterVersion`, `VersionRange`, `Gate` incl. `Gate::Era`, `ClusterFeatures`); `Metadata` additive fields + `versioning_active()` + fixture; `ReportNodeVersion`/`FinalizeClusterVersion` + apply checks (era-only); handshake `ext` TLV codec, disjoint-range refusal, `Envelope.peer_ext` in `ProdEnv`/`SimEnv`, per-node `SimEnv` ext override; the leader's observation table and **precondition P / era start**; era-on handshake refusal of empty-`ext` peers; startup range check | none | `animus-cp-data`, `animus-node`, `animusd`, operator, `website/` |
+| **P2-B** gate enforcement | `animus-control`, `animus-cp-data`, `animus-node` | `required_gate` exhaustive tables for the six enums; send-site asserts and metric; gate-selected codec frame version; `is_relayable_command` for the new commands; G/L/F review of the inventory; **byte-identity test: B2 pre-era encodings equal the Phase 1 fixtures** | P2-A (types) | `animusd` wiring, `animus-test`, `animus-env` |
+| **P2-C** node wiring + admin | `animusd`, `animus-cli` | `ClusterFeatures` fed from the apply task/mirror and injected into every emitter; boot-time self-report (era on); `/admin/cluster-version`, `cluster version`/`cluster finalize`; joiner and `change_membership` range checks; additive `JoinInfo` field | P2-A (P2-B for full gating) | `animus-env`, `animus-control` internals, operator |
+| **P2-D** corpus | `animus-test`, `animusd`, test-only cfg elsewhere | `BinaryProfile` incl. `Phase1`, capped decode, delivery assertion, synthetic ladder, `sim_cluster_mixed_version_corpus`, pure tier, per-gate tests, negative controls, `ANIMUS_UPGRADE_SEEDS`, `corpus-deep.yml` step | P2-A, P2-B; P2-C for the cluster tier | production emit/apply logic (report bugs, do not fix inline) |
 
-Waves: P2-A first (small); P2-B and P2-C concurrent; P2-D starts its pure tier
-with P2-B and its cluster tier with P2-C. Concurrent sessions respect the
-two-heavy-agent budget per container (root `CLAUDE.md`).
+Waves: P2-A first (largest now: it owns the bootstrap); P2-B and P2-C concurrent; P2-D
+starts its pure tier with P2-B and its cluster tier with P2-C. **P2-A must not merge
+alone into a release**: until P2-B's enforcement and P2-D's Phase 1 cell land, nothing
+proves B2 is Phase 1-safe, so the three merge as one release train.
 
-### 9. What Phase 2 "done" means, and what is supported
+### 10. What Phase 2 "done" means, and what is supported
 
-Done when: B2 baseline merged; every inventory row marked G has `required_gate`
-or a per-gate test; the mixed-version corpus (both tiers, negative controls) is in
-the per-push gate at K=1 and nightly deep; the format-change checklist in root
-`CLAUDE.md` gains the "which class (G/L/F), which gate" step; the website and ADR
-0060 "Upgrades" are updated *in that final PR* (not before: nothing user-visible
-changes until it is built).
+Done when: B2 merged; every G row has `required_gate` or a per-gate test; the corpus
+(both tiers, negative controls, the Phase 1 -> B2 cell) is in the per-push gate at K=1
+and nightly deep; root `CLAUDE.md`'s format-change checklist gains the "class G/L/F,
+which gate" step; the website and ADR 0060 "Upgrades" are updated in that final PR.
 
-**Supported after Phase 2 (and only this):** a **manual node-by-node restart**
-from release R-1 to R, with the cluster serving clients throughout: restart one
-node at a time, wait until it is `Active` and no tablet is under-replicated,
-repeat, then run `cluster finalize` once every member (down ones too) reports R.
-Control voters one at a time so the quorum holds. **Not supported:** skipping a
-release; running N-1 and N+1 together; rolling a node back after it has run the
-new binary (fix forward, rebuild the node from peers, or restore from backup);
-operator-driven `spec.image` changes (the operator is untouched: ADR 0060
-"Upgrades" stands until Phase 3); a Phase 1 binary joining a B2 cluster (refused
-by name).
+**Supported after Phase 2:** a **manual node-by-node rolling upgrade with no stop**,
+**from today's Phase 1 binaries to B2** and from release R-1 to R afterwards: restart
+one node at a time, wait until it is `Active` and no tablet is under-replicated
+(control quorum kept), then run `cluster finalize` once every member, down ones too,
+reports the new range. **Not supported:** skipping a release; running N-1 with N+1;
+rolling a node back after it ran the new binary (fix forward, rebuild from peers,
+restore from backup); a Phase 1 binary joining or rejoining once the era has started
+(refused by name on the B2 side); operator-driven `spec.image` changes (the operator
+is untouched; ADR 0060 "Upgrades" stands until Phase 3).
 
-**Phase 3 sketch (not a design):** a per-node roll runbook/CLI (drain via ADR
-0032 where useful, restart, wait-healthy), a status view of the roll, optional
-auto-finalize once every member is verified, operator `spec.image`
-orchestration (OnDelete, one pod at a time, gated on the same health signal),
-the previous-release `ProdEnv`/`kind` cross-version CI job, and the `min_supported`
-floor policy.
+**Phase 3 sketch (not a design):** a per-node roll runbook/CLI (drain via ADR 0032
+where useful, restart, wait-healthy), a roll status view, optional auto-finalize, operator
+`spec.image` orchestration (OnDelete, one pod at a time, gated on the same health
+signal), and the previous-release `ProdEnv`/`kind` cross-version CI job.
 
-### Open questions for maintainer confirmation
+**Residual risks (not closed by design):**
+1. *Observation is leader-local and time-bounded.* A Phase 1 node installed after P
+   but before the first report is applied is handled by the refusal rules, but P
+   itself trusts heartbeats' `ext`; P2-A must test that every role's heartbeats carry
+   it.
+2. *An operator violating Option B* (reinstalling a Phase 1 binary after the era) is
+   made safe by the B2 handshake refusal, but the Phase 1 node's own logs only show a
+   closed connection.
+3. *The profile models gate discipline, not old bytes*; the previous-release `ProdEnv`
+   job (Phase 3) is the real proof.
 
-1. **Finalize mode:** manual via admin API/CLI (recommended) vs auto.
-2. **Down/removed-pending members:** block Finalize (recommended) vs an override.
-3. **Floor policy:** `min_supported = max_supported - 1`, raised only by an ADR
-   amendment naming the stepping-stone release; accept that a whole-cluster jump
-   across a raised floor then needs the intermediate release.
-
-(Decided, not open: Option B rollback policy and the CWL/SWL v2 no-retrofit,
-2026-10-03; Option A is recorded in section 4 as a possible future direction.)
+(All maintainer questions on this amendment are decided; none remain open.)

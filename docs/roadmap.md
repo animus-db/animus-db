@@ -1586,7 +1586,8 @@ rows this section used to carry were fixed by the stale-prose sweep.
   harness transcodes them to v1 for real; every other format is still v1. **Next: Phase 2** (replicated cluster version /
   feature gate; **design in review 2026-10-03**, ADR 0073's "Phase 2 design"
   amendment: workstreams P2-A..P2-D, knob `ANIMUS_UPGRADE_SEEDS`, no rollback
-  once a node has run the new binary), then Phase 3. Phase 4 (lifting/rewriting root `CLAUDE.md`'s
+  once a node has run the new binary; rolling-installable from today's
+  Phase 1 binaries, never a stop-the-world step), then Phase 3. Phase 4 (lifting/rewriting root `CLAUDE.md`'s
   no-back-compat rule) is **already done** by this same maintainer
   decision — root `CLAUDE.md` now states the staged ratchet directly.
 - **Reuse:** the magic (4-byte ASCII) + `u8` version + loud named error
