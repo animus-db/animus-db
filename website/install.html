@@ -436,11 +436,12 @@ table.put_item(Item={<span class="s">"id"</span>: <span class="s">"a-2"</span>, 
         give each process its own, on storage you would be happy to lose a machine's worth of.
       </p>
       <div class="callout warn">
-        <span class="label">No migrations yet</span>
+        <span class="label">No rolling upgrades yet</span>
         <p>
-          On-disk and wire formats change between revisions without compatibility shims. When you
-          update AnimusDB, recreate the cluster: stop the nodes, delete the data directories, and
-          start fresh.
+          To update AnimusDB, stop every node, install the new version, and start them all again;
+          on-disk formats are readable across versions and this path is tested. Do not run two
+          versions in one cluster (even briefly): the node-to-node wire has no cross-version
+          compatibility yet, so a rolling, node-by-node upgrade is not supported.
         </p>
       </div>
     </section>
