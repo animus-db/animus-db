@@ -4,7 +4,7 @@
 //! per-table Bloom hits/misses, and WAL segment rotations — all through the
 //! `Env` metrics seam, all observe-only (they change no engine behavior).
 //!
-//! Under `SimEnv` `env.metrics()` is the no-op handle, so a test that wants to
+//! (Historical: `env.metrics()` was once the shared no-op under `SimEnv`; it is now per-node.) A test that wants to
 //! *read* the counters threads a recording [`MetricsHandle`] in via
 //! [`LsmEngine::open_with_metrics`] (the additive `*_with_metrics` pattern). Every
 //! assertion is reproducible from a seed, and the recorded snapshot is asserted

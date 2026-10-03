@@ -1303,7 +1303,9 @@ impl MetricsHandle {
     /// The process-wide no-op handle: a single shared sink that is recorded into
     /// but never read. This is what [`Env::metrics`](crate::Env::metrics)'s
     /// default returns, so an env that does not care about metrics costs nothing
-    /// and changes no behavior. (It is a real sink, not a branch on every
+    /// and changes no behavior. Because it is process-wide, a test must never
+    /// read counters from it (concurrent tests in one binary all record into
+    /// it); `ProdEnv` and `SimEnv` override `metrics()` with their own sinks. (It is a real sink, not a branch on every
     /// record, so the hot path has no `if metrics.is_some()` check.)
     #[must_use]
     pub fn noop() -> Self {

@@ -575,6 +575,14 @@ function of one seed. This is the substrate every distributed test runs on.
   already explicit, un-randomized `Scenario` data, not something this crate
   draws from RNG).
 
+- **`SimEnv::metrics()` is a recording sink per (Simulator, node)** (2026-10-02,
+  ADR 0015 amendment): created lazily in the simulator's shared state
+  (`BTreeMap<NodeId, MetricsHandle>`), shared by every handle/clone of that
+  node, independent across nodes and across Simulators. So a sim test can read
+  `env.metrics()` before/after deltas in isolation under plain `cargo test`;
+  before this, the env default was a process-wide no-op sink shared by every
+  sim in the binary. Proven by `tests/metrics_isolation.rs`.
+
 ## Tests
 
 `cargo test -p animus-sim` — `tests/stop_semantics.rs` proves `stop`'s

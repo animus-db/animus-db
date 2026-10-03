@@ -202,3 +202,17 @@ integration; the seam itself does **no** HTTP.
   are recorded only into the env/handle the engine was opened with; wiring them into
   `animusd`'s aggregated `/metrics` endpoint (alongside the control/data role sinks)
   is a thin follow-up at the assembly point and is not part of this change.
+
+## Amendment (2026-10-02) — `SimEnv` records into a per-(simulator, node) sink
+
+The "`SimEnv` included (it does not override it)" statements above no longer
+hold. The process-wide no-op default is a single shared sink, so under plain
+`cargo test` (many tests in one binary) every `SimEnv` in every `Simulator`
+recorded into the same counters, and any test asserting an `env.metrics()`
+before/after delta saw other tests' increments (masked under nextest's
+process-per-test). `SimEnv` now overrides `metrics()` with a recording handle
+scoped to its `(Simulator, node)`, created lazily and shared by every handle of
+that node — mirroring `ProdEnv`'s one sink per node process. `Env::metrics()`'s
+default and `MetricsHandle::noop()` are unchanged: other non-Prod envs still get
+the additive no-op, which tests must never read. Recording remains a relaxed
+atomic add, so determinism is unaffected.
