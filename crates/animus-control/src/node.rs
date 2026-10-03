@@ -634,6 +634,10 @@ pub struct RaftNode<E: Env> {
     /// This node's own advertised version profile (see
     /// [`set_own_version_range`](Self::set_own_version_range)).
     own_version: Arc<Mutex<OwnVersion>>,
+    /// Why this node latched `halted` for a version reason (ADR 0073 Phase 2
+    /// startup/install range check); `None` otherwise. See
+    /// [`halt_reason`](Self::halt_reason).
+    halt_reason: Arc<Mutex<Option<String>>>,
 }
 
 impl<E: Env> RaftNode<E> {
@@ -744,6 +748,7 @@ impl<E: Env> RaftNode<E> {
         let halted = Arc::new(AtomicBool::new(false));
         let observations = Arc::new(Mutex::new(VersionObservations::default()));
         let own_version = Arc::new(Mutex::new(OwnVersion::default()));
+        let halt_reason = Arc::new(Mutex::new(None));
         let node = Self {
             env: env.clone(),
             core: Arc::clone(&core),
@@ -758,6 +763,7 @@ impl<E: Env> RaftNode<E> {
             halted: Arc::clone(&halted),
             observations: Arc::clone(&observations),
             own_version: Arc::clone(&own_version),
+            halt_reason: Arc::clone(&halt_reason),
         };
         env.spawn_task(drive(
             env.clone(),
@@ -775,6 +781,8 @@ impl<E: Env> RaftNode<E> {
             boot_entropy,
             Arc::clone(&halted),
             Arc::clone(&observations),
+            Arc::clone(&own_version),
+            Arc::clone(&halt_reason),
         ));
         // The placement reconciler runs alongside the driver; it only ever
         // *proposes* on the core (no I/O of its own), and proposals are honored
@@ -847,6 +855,23 @@ impl<E: Env> RaftNode<E> {
     #[must_use]
     pub fn is_halted(&self) -> bool {
         self.halted.load(Ordering::SeqCst)
+    }
+
+    /// Why this node halted for a version reason (ADR 0073 Phase 2 range
+    /// check), if it did: `cluster version A is above this binary's max M
+    /// (downgrade is not supported)` or `cluster version A is below this
+    /// binary's min m (upgrade through a release whose range contains A
+    /// first)`. Checked at the boot seed, after every `InstallSnapshot`
+    /// install and on a committed `FinalizeClusterVersion`. Like
+    /// [`halt`](Self::halt) this latches `is_halted()` but does not stop the
+    /// driver loops; turning it into the named process exit is `animusd`'s
+    /// wiring (P2-C).
+    #[must_use]
+    pub fn halt_reason(&self) -> Option<String> {
+        self.halt_reason
+            .lock()
+            .expect("halt reason poisoned")
+            .clone()
     }
 
     /// A snapshot of the leader-local version observation table (ADR 0073
@@ -1343,6 +1368,8 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
     boot_entropy: u64,
     halted: Arc<AtomicBool>,
     observations: Arc<Mutex<VersionObservations>>,
+    own_version: Arc<Mutex<OwnVersion>>,
+    halt_reason: Arc<Mutex<Option<String>>>,
 ) {
     // Recover from the WAL before serving anything.
     // Issue #1132: `recover` also cuts a torn tail back on disk, so this
@@ -1482,6 +1509,11 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
             }
         };
 
+    // ADR 0073 Phase 2 (P2-A): era-on handshake refusal + startup range check
+    // against the freshly read `Metadata`, before the first tick.
+    let mut era_watch = EraWatch::default();
+    era_watch.sync(&env, &shadow, &own_version, &halted, &halt_reason);
+
     // Now spawn the steady-state apply loop, handing it the seed's already-
     // published state — this loop does no more engine I/O than the ongoing
     // apply/compact work `meta_apply_and_compact` was always doing (ADR 0038
@@ -1500,6 +1532,9 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
         Arc::clone(&halted),
         shadow,
         watermark,
+        era_watch,
+        own_version,
+        halt_reason,
     ));
 
     // Issue #279: the loop's own in-flight persist round, and the outbound
@@ -1693,6 +1728,55 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
     }
 }
 
+/// What the apply task last acted on for ADR 0073 Phase 2 (P2-A): drives the
+/// era-on handshake refusal (`Network::set_require_peer_ext`, flipped once the
+/// replicated era marker is seen, sticky so effectively once) and the
+/// startup/install **range check** (a node whose own range excludes the
+/// cluster version halts with a named [`RaftNode::halt_reason`]). Re-evaluated
+/// whenever the era, the cluster version or the own range changes, so it
+/// covers the boot seed, every snapshot install, a committed
+/// `FinalizeClusterVersion`, and a late `set_own_version_range`.
+#[derive(Default)]
+struct EraWatch {
+    seen: Option<(bool, u32, Option<VersionRange>)>,
+    require_set: bool,
+}
+
+impl EraWatch {
+    fn sync<E: Env>(
+        &mut self,
+        env: &E,
+        meta: &Metadata,
+        own: &Mutex<OwnVersion>,
+        halted: &AtomicBool,
+        halt_reason: &Mutex<Option<String>>,
+    ) {
+        let era = meta.versioning_active();
+        let cv = meta.cluster_version();
+        let own_range = own.lock().expect("own version poisoned").range;
+        let key = (era, cv, own_range);
+        if self.seen == Some(key) {
+            return;
+        }
+        self.seen = Some(key);
+        if era && !self.require_set {
+            self.require_set = true;
+            env.set_require_peer_ext(true);
+        }
+        if era
+            && let Some(r) = own_range
+            && let Some(msg) = r.exclusion_message(cv)
+        {
+            tracing::error!(%msg, "cluster version outside this binary's range; halting this node");
+            let mut reason = halt_reason.lock().expect("halt reason poisoned");
+            if reason.is_none() {
+                *reason = Some(msg);
+            }
+            halted.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
 /// The apply task's freshly-rebuilt state at boot: the shadow `Metadata`
 /// [`meta_apply_seed`] rebuilt from the engine, and the durable watermark it
 /// read alongside it. Returned to `drive` so it can hand both straight to
@@ -1811,6 +1895,9 @@ async fn meta_apply_loop<E: Env, S: StorageEngine>(
     halted: Arc<AtomicBool>,
     mut shadow: Metadata,
     mut watermark: u64,
+    mut era_watch: EraWatch,
+    own_version: Arc<Mutex<OwnVersion>>,
+    halt_reason: Arc<Mutex<Option<String>>>,
 ) {
     // Issue #898 follow-up: owned by this loop, across iterations — see
     // `SNAPSHOT_COMPACT_DEFER_IDLE_CEILING`'s own doc for why this lives
@@ -1841,6 +1928,10 @@ async fn meta_apply_loop<E: Env, S: StorageEngine>(
             &mut compact_defer_progress,
         )
         .await;
+        // After every pass (tail apply, snapshot install, or neither): a
+        // changed era/cluster version/own range re-runs the era-on refusal
+        // flip and the range check. Cheap: three scalars compared.
+        era_watch.sync(&env, &shadow, &own_version, &halted, &halt_reason);
         if !did_work {
             env.sleep(APPLY_IDLE_POLL).await;
         }

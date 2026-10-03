@@ -67,6 +67,26 @@ per-tablet CP data plane (`animus-cp-data`).
   if P stops requiring `Some(range)`), and `animusd`'s
   `sim_cluster_version_observation` for every node role.
 
+- **Era-on refusal and the range check** (ADR 0073 Phase 2, P2-A; `node.rs`
+  `EraWatch`). The control apply task (the boot seed in `drive`, and after
+  every `meta_apply_loop` pass, so tail applies, `InstallSnapshot` installs and
+  committed `FinalizeClusterVersion`s all go through one place) compares
+  `(versioning_active, cluster_version, own range)` with what it last acted on.
+  When the era is first seen it calls `env.set_require_peer_ext(true)` (sticky,
+  never reset): every era-on peer then refuses a handshake with an empty `ext`
+  (a Phase 1 binary), which the sim shows as `protocol_refusals` /
+  `"phase1-peer-refused"`. When the era is on and the own range is `Some` and
+  excludes the cluster version, the `RaftNode` latches `halted` and
+  `halt_reason()` returns the ADR's message (`cluster version A is above this
+  binary's max M (downgrade is not supported)` / `... below this binary's min m
+  (upgrade through a release whose range contains A first)`, built by
+  `VersionRange::exclusion_message`). `halt()` does not stop the driver loops
+  (pre-existing semantics); the named process exit is `animusd` wiring (P2-C), as
+  is flipping the flag on data-only (`ControlHandle::Remote`) nodes. A late
+  `set_own_version_range` is re-checked on the next apply pass.
+  Tests: `tests/it/version_era_on.rs` (mutation-checked: removing the flag flip
+  or the halt fails them).
+
 - **`lib.rs`** — the public surface: re-exports the core types (`SharedWal`,
   `RaftCore`, `RaftNode`, `Metadata`/`MetaCommand`, the schema types,
   `FailureDetector`) plus `animus_placement::PlacementPolicy` (so a downstream

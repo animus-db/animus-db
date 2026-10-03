@@ -102,6 +102,9 @@ pub struct World {
     engines: BTreeMap<u64, MemoryEngine>,
     /// Nodes currently upgraded to B2.
     pub flipped: BTreeSet<u64>,
+    /// Per-node B2 range override (default [`own_range`]); set by
+    /// [`World::flip_range`].
+    pub ranges: BTreeMap<u64, (u32, u32)>,
     /// Control nodes restarted since start (their `Metadata` view resets).
     pub restarted: BTreeSet<u64>,
     pub rng: Rng,
@@ -120,6 +123,7 @@ impl World {
             nodes: BTreeMap::new(),
             engines: BTreeMap::new(),
             flipped: BTreeSet::new(),
+            ranges: BTreeMap::new(),
             restarted: BTreeSet::new(),
             rng: Rng(seed ^ 0xA5A5_5A5A_1234_4321),
         };
@@ -149,7 +153,11 @@ impl World {
 
     fn apply_profile(&self, id: u64, node: &RaftNode<SimEnv>) {
         if self.flipped.contains(&id) {
-            node.set_own_version_range(Some(own_range()));
+            let r = self
+                .ranges
+                .get(&id)
+                .map_or_else(own_range, |&(a, b)| VersionRange::new(a, b));
+            node.set_own_version_range(Some(r));
             node.set_own_build("b2");
         } else {
             node.set_own_version_range(None);
@@ -268,6 +276,26 @@ impl World {
         } else if let Some(n) = self.nodes.get(&id) {
             self.apply_profile(id, n);
         }
+    }
+
+    /// [`flip`](Self::flip) to a B2 profile with an explicit range `(min,
+    /// max)` (advertised in the `ext` and used as the control node's own
+    /// range).
+    pub fn flip_range(&mut self, id: u64, range: (u32, u32), restart: bool) {
+        self.ranges.insert(id, range);
+        self.flip(id, restart);
+        self.sim
+            .set_network_ext_for(nid(id), encode_ext(Some(range), Some("b2")));
+    }
+
+    /// Stop and freshly start control node `id` over its retained durable
+    /// state, then override its own range (`Some`/`None`) before any sim time
+    /// passes (so the boot-time range check sees it).
+    pub fn restart_with_own(&mut self, id: u64, own: Option<VersionRange>) {
+        self.sim.stop(nid(id));
+        self.restarted.insert(id);
+        self.start_control(id);
+        self.nodes[&id].set_own_version_range(own);
     }
 
     /// Advertise B2 on the wire for `id` without touching its own-range
