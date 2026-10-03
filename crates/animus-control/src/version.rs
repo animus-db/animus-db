@@ -106,6 +106,28 @@ impl VersionRange {
         range.is_valid().then_some(range)
     }
 
+    /// The startup/install range check (ADR 0073 section 1): `None` when
+    /// `cluster_version` lies inside this range, else the named refusal
+    /// message a halted node reports.
+    #[must_use]
+    pub fn exclusion_message(&self, cluster_version: ClusterVersion) -> Option<String> {
+        if cluster_version > self.max {
+            Some(format!(
+                "cluster version {cluster_version} is above this binary's max {} \
+                 (downgrade is not supported)",
+                self.max
+            ))
+        } else if cluster_version < self.min {
+            Some(format!(
+                "cluster version {cluster_version} is below this binary's min {} \
+                 (upgrade through a release whose range contains {cluster_version} first)",
+                self.min
+            ))
+        } else {
+            None
+        }
+    }
+
     /// The range an empty handshake `ext` denotes: a Phase 1 binary, `[1, 1]`.
     #[must_use]
     pub const fn phase1() -> Self {
@@ -225,6 +247,24 @@ impl ClusterFeatures {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn exclusion_message_names_above_max_and_below_min() {
+        let r = VersionRange::new(2, 3);
+        assert_eq!(r.exclusion_message(2), None);
+        assert_eq!(r.exclusion_message(3), None);
+        assert_eq!(
+            r.exclusion_message(4).as_deref(),
+            Some("cluster version 4 is above this binary's max 3 (downgrade is not supported)")
+        );
+        assert_eq!(
+            r.exclusion_message(1).as_deref(),
+            Some(
+                "cluster version 1 is below this binary's min 2 \
+                     (upgrade through a release whose range contains 1 first)"
+            )
+        );
+    }
+
     use animus_env::nid;
 
     use super::*;

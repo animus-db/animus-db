@@ -2156,3 +2156,31 @@ release train.
    seed and on snapshot install) halts its `RaftNode` with a named
    `halt_reason`. Turning that into the named process exit is `animusd`
    wiring (P2-C).
+
+### Amendment 2026-10-03 — P2-A notes from PRs 4 and 5
+
+1. **A `RaftNode` defaults to the Phase 1 profile** (`own range = None`).
+   The assembler opts in with `set_own_version_range(Some(own_range()))`
+   in the same step that gives the `Env` its `ext` (`set_own_ext`). That
+   step is P2-C wiring. With a B2 default, a lone voter (required set =
+   itself) satisfies P at once and starts the era. The era-on refusal then
+   refuses every peer whose `ext` is still empty, which broke 13 existing
+   single-node tests and would break a one-node production cluster before
+   P2-C. So until P2-C lands, P2-A never starts an era in production.
+2. **A leader whose required set is only itself satisfies P immediately.**
+   This is intended. Because the era then refuses empty-`ext` peers, the
+   `Env` must carry its `ext` before the node can lead.
+3. **Cache lag.** P is evaluated against the leader's applied cache. The
+   loop waits for `engine_applied >= commit_index` and for one observation
+   window of leadership. That narrows the late-joiner race but does not
+   close it: a Phase 1 node may register between the last P evaluation and
+   the first applied report. The **era-on refusal** closes that race, not P.
+4. **The era-on upkeep records late registrants.** After the era starts,
+   the leader's upkeep (`era_on_proposals`) also reports any required node
+   that has no record yet, or whose observed range or build changed (rate
+   limited). Boot-time self-report (P2-C) remains, and this leader path is
+   an additional safety net.
+5. **`halt()` does not stop the driver loops** (existing semantics). The
+   out-of-range halt is observable through `RaftNode::halt_reason()`, and
+   the named process exit is P2-C. The era-on flag flip on data-only nodes
+   (`ControlHandle::Remote`) is P2-C too.
