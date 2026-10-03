@@ -467,6 +467,11 @@ fn gsi_query_paginates_with_the_scan_cursor_shape() {
             "ExpressionAttributeValues":{":c":{"S":"X"}}}"#,
         |b| b.contains("\"Count\":6"),
     );
+    // The per-node poll above proves only that whichever replica answered
+    // was complete at that instant; the ADR 0055 freshness gate is
+    // replica-local, so a follower can serve one entry behind. Prove every
+    // replica of every tablet has applied everything committed (#1129).
+    cluster.await_replicas_caught_up("gsi pagination");
 
     // Drive pagination by hand so every page's raw `LastEvaluatedKey` JSON
     // can be checked for its exact attribute set (the index's own hash

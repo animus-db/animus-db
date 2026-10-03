@@ -1030,6 +1030,17 @@ impl<E: Env> CpGroup<E> {
         }
     }
 
+    /// Highest committed log index this replica knows of (a follower learns it
+    /// only from the leader's next AppendEntries/heartbeat). Test-only: the
+    /// `SimCluster` replica catch-up poll's input.
+    #[cfg(test)]
+    pub(crate) fn commit_index(&self) -> u64 {
+        match self {
+            CpGroup::Lsm(n) => n.commit_index(),
+            CpGroup::Mem(n) => n.commit_index(),
+        }
+    }
+
     /// This replica's `engine_applied_index()` — the confirm-by-index
     /// primitive linearizable reads themselves gate on. See
     /// [`RaftKvNode::engine_applied_index`]. Used by the backfill seeder
