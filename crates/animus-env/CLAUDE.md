@@ -159,6 +159,26 @@ the production implementation; the deterministic implementation lives in
   `#[doc(hidden)]`, always-compiled (not `#[cfg(test)]`) cross-crate test
   helper, since `#[cfg(test)]` only gates this crate's own test binaries and
   `animus-sim`'s `SimSegmentStore` tests need the same assertions.
+- **Handshake `ext` (ADR 0073 Phase 2, P2-A).** `handshake.rs` gained an
+  `ext` TLV codec (`tag:u16 LE | len:u16 LE | value`; tag 1 = range
+  `min:u32,max:u32`, tag 2 = display-only build string; unknown tags
+  skipped): `encode_ext`, `parse_ext_range` (empty = `None` = Phase 1 =
+  `[1,1]`), `check_peer_ext(spec, own_ext, peer, require_peer_ext)`
+  (`check_peer` + malformed/disjoint/`Phase1Peer` refusals, all new
+  `HandshakeError` variants; `check_peer` itself is unchanged). `Envelope`
+  gained `peer_ext: Arc<[u8]>` (use `Envelope::new` for an empty one).
+  `ProdEnv::set_own_ext(Vec<u8>)` (default empty = today's preamble bytes)
+  applies to handshakes after the call; `write_own_preamble_with` /
+  `exchange_preamble_with` take the ext (the old fns delegate with empty).
+  The accept path keeps the peer's `ext` and stamps one shared `Arc` into
+  every `Envelope` of that connection; dialed connections carry no inbound
+  frames, so they only *check* the acceptor's ext. `Network::
+  set_require_peer_ext(bool)` (default no-op; `ProdEnv` stores an
+  `AtomicBool`, `EncryptedEnv` forwards) refuses empty-ext peers at new
+  handshakes **and** closes an already-open accepted connection whose peer
+  sent an empty ext on its next frame (that frame is dropped, the re-dial is
+  refused). Nothing in `animusd` sets an ext yet (P2-C), so no wire byte
+  changes. Real-socket test: `tests/handshake_ext_prod.rs`.
 - **`handshake.rs`** (ADR 0073 Phase 0, workstream D) — a per-connection
   handshake preamble: `Preamble { magic: [u8;4], version: u8, extensions:
   Vec<u8> }`, byte layout `magic[4] | version:u8 | ext_len:u16 LE |

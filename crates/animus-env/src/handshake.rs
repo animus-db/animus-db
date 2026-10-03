@@ -44,9 +44,13 @@
 //! magic[4] | version:u8 | ext_len:u16 (LE) | ext[ext_len]
 //! ```
 //!
-//! `ext` is **reserved for Phase 2** (feature bits, a min/max supported
-//! version range for real negotiation). A v1 [`encode`] always writes it
-//! empty; a v1 [`decode`] reads whatever bytes are there and carries them
+//! `ext` is the **Phase 2 extension area** (ADR 0073 Phase 2): a sequence of
+//! TLVs, each `tag:u16 LE | len:u16 LE | value[len]` — tag 1 a supported
+//! version range (`min:u32 LE | max:u32 LE`, opaque numbers to this crate),
+//! tag 2 a display-only UTF-8 build string; unknown tags are skipped. See
+//! [`encode_ext`], [`parse_ext_range`] and [`check_peer_ext`]; an empty `ext`
+//! is a Phase 1 binary, read as the range `[1,1]`. A v1 [`encode`] always
+//! wrote it empty; a v1 [`decode`] reads whatever bytes are there and carries them
 //! through on the returned [`Preamble`] **without ever rejecting a non-empty
 //! ext** — that is what makes this preamble forward-extensible without
 //! another format reset once Phase 2 needs the field for real. `ext_len` is
@@ -198,6 +202,30 @@ pub enum HandshakeError {
     /// and decodes again.
     #[error("handshake: truncated input, need more bytes")]
     Incomplete,
+    /// (Phase 2) The `ext` bytes are not a well-formed TLV sequence
+    /// (truncated header or value, a range value that is not 8 bytes, or
+    /// `min > max`).
+    #[error("handshake: malformed extension area ({0})")]
+    Malformed(&'static str),
+    /// (Phase 2) The two ends' supported version ranges do not intersect.
+    #[error(
+        "handshake: version ranges are disjoint (peer supports {peer_min}..={peer_max}, \
+         this node supports {own_min}..={own_max})"
+    )]
+    DisjointRanges {
+        /// Peer's range minimum.
+        peer_min: u32,
+        /// Peer's range maximum.
+        peer_max: u32,
+        /// Own range minimum.
+        own_min: u32,
+        /// Own range maximum.
+        own_max: u32,
+    },
+    /// (Phase 2) The peer sent no `ext` (a Phase 1 binary) while the
+    /// cluster has versioning enabled.
+    #[error("handshake: peer is a Phase 1 binary; cluster has versioning enabled")]
+    Phase1Peer,
 }
 
 /// Encodes `preamble` to its wire bytes: `magic | version | ext_len (LE) |
@@ -281,6 +309,144 @@ pub fn check_peer(expected: &ProtocolSpec, peer: &Preamble) -> Result<(), Handsh
             protocol: expected.name,
             found: peer.version,
             supported: expected.version,
+        });
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Phase 2 (ADR 0073): the `ext` TLV area — a supported-version range and a
+// display-only build string — plus the era-aware peer check.
+// ---------------------------------------------------------------------
+
+/// `ext` TLV tag: a supported version range, `min:u32 LE, max:u32 LE`
+/// (8-byte value). The numbers are opaque to this crate (it does not depend
+/// on `animus-control`); callers interpret them as a cluster-version range.
+pub const EXT_TAG_RANGE: u16 = 1;
+/// `ext` TLV tag: a build string, UTF-8, display only (never compared).
+pub const EXT_TAG_BUILD: u16 = 2;
+
+/// The range an empty `ext` stands for: a Phase 1 binary, which supports
+/// exactly cluster version 1.
+pub const PHASE1_RANGE: (u32, u32) = (1, 1);
+
+/// The refusal text for a Phase 1 (empty-`ext`) peer once the cluster has
+/// versioning enabled.
+pub const PHASE1_PEER_REFUSAL: &str = "peer is a Phase 1 binary; cluster has versioning enabled";
+
+/// Encodes an `ext` area. Layout: a sequence of TLVs, each
+/// `tag:u16 LE | len:u16 LE | value[len]`. Tag [`EXT_TAG_RANGE`] carries
+/// `min:u32 LE | max:u32 LE`; tag [`EXT_TAG_BUILD`] carries UTF-8 text. Both
+/// `None` yields an empty vec (today's bytes exactly). A build string is
+/// truncated (at a char boundary) so the whole area fits
+/// [`MAX_EXTENSION_LEN`].
+#[must_use]
+pub fn encode_ext(range: Option<(u32, u32)>, build: Option<&str>) -> Vec<u8> {
+    let mut out = Vec::new();
+    if let Some((min, max)) = range {
+        out.extend_from_slice(&EXT_TAG_RANGE.to_le_bytes());
+        out.extend_from_slice(&8u16.to_le_bytes());
+        out.extend_from_slice(&min.to_le_bytes());
+        out.extend_from_slice(&max.to_le_bytes());
+    }
+    if let Some(build) = build {
+        let room = (MAX_EXTENSION_LEN as usize).saturating_sub(out.len() + 4);
+        let mut end = build.len().min(room);
+        while !build.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.extend_from_slice(&EXT_TAG_BUILD.to_le_bytes());
+        out.extend_from_slice(&(end as u16).to_le_bytes());
+        out.extend_from_slice(&build.as_bytes()[..end]);
+    }
+    out
+}
+
+/// Walks the TLVs of `ext`, calling `f(tag, value)` for each.
+fn for_each_tlv(
+    ext: &[u8],
+    mut f: impl FnMut(u16, &[u8]) -> Result<(), HandshakeError>,
+) -> Result<(), HandshakeError> {
+    let mut rest = ext;
+    while !rest.is_empty() {
+        if rest.len() < 4 {
+            return Err(HandshakeError::Malformed("truncated TLV header"));
+        }
+        let tag = u16::from_le_bytes([rest[0], rest[1]]);
+        let len = u16::from_le_bytes([rest[2], rest[3]]) as usize;
+        let body = &rest[4..];
+        if body.len() < len {
+            return Err(HandshakeError::Malformed("truncated TLV value"));
+        }
+        f(tag, &body[..len])?;
+        rest = &body[len..];
+    }
+    Ok(())
+}
+
+/// Parses the supported range out of an `ext` area. An empty `ext` is
+/// `Ok(None)` (a Phase 1 binary; callers read it as [`PHASE1_RANGE`]).
+/// Unknown tags are ignored; a well-formed `ext` without a range tag is also
+/// `Ok(None)`. A malformed `ext` is an `Err`, never a panic.
+pub fn parse_ext_range(ext: &[u8]) -> Result<Option<(u32, u32)>, HandshakeError> {
+    let mut range = None;
+    for_each_tlv(ext, |tag, v| {
+        if tag == EXT_TAG_RANGE {
+            let v: [u8; 8] = v
+                .try_into()
+                .map_err(|_| HandshakeError::Malformed("range value is not 8 bytes"))?;
+            let min = u32::from_le_bytes([v[0], v[1], v[2], v[3]]);
+            let max = u32::from_le_bytes([v[4], v[5], v[6], v[7]]);
+            if min > max {
+                return Err(HandshakeError::Malformed("range min exceeds max"));
+            }
+            range = Some((min, max));
+        }
+        Ok(())
+    })?;
+    Ok(range)
+}
+
+/// Parses the display-only build string out of an `ext` area, if present and
+/// valid UTF-8. Malformed input yields `None`.
+#[must_use]
+pub fn parse_ext_build(ext: &[u8]) -> Option<String> {
+    let mut build = None;
+    let _ = for_each_tlv(ext, |tag, v| {
+        if tag == EXT_TAG_BUILD {
+            build = std::str::from_utf8(v).ok().map(str::to_owned);
+        }
+        Ok(())
+    });
+    build
+}
+
+/// [`check_peer`] plus the Phase 2 `ext` checks. After the magic/version
+/// check: a malformed peer or own `ext` is refused; an empty peer `ext` is
+/// refused with [`PHASE1_PEER_REFUSAL`] when `require_peer_ext` is set;
+/// otherwise the two ranges (empty `ext` = [`PHASE1_RANGE`]) must intersect,
+/// else [`HandshakeError::DisjointRanges`]. With both `ext` areas empty and
+/// `require_peer_ext` off this is exactly [`check_peer`].
+pub fn check_peer_ext(
+    expected: &ProtocolSpec,
+    own_ext: &[u8],
+    peer: &Preamble,
+    require_peer_ext: bool,
+) -> Result<(), HandshakeError> {
+    check_peer(expected, peer)?;
+    let peer_range = parse_ext_range(&peer.extensions)?;
+    if require_peer_ext && peer.extensions.is_empty() {
+        return Err(HandshakeError::Phase1Peer);
+    }
+    let own_range = parse_ext_range(own_ext)?;
+    let (peer_min, peer_max) = peer_range.unwrap_or(PHASE1_RANGE);
+    let (own_min, own_max) = own_range.unwrap_or(PHASE1_RANGE);
+    if peer_min > own_max || own_min > peer_max {
+        return Err(HandshakeError::DisjointRanges {
+            peer_min,
+            peer_max,
+            own_min,
+            own_max,
         });
     }
     Ok(())
@@ -483,5 +649,167 @@ mod tests {
                 ),
             }
         }
+    }
+
+    #[test]
+    fn ext_tlv_round_trip() {
+        let e = encode_ext(Some((2, 5)), Some("build-x"));
+        assert_eq!(parse_ext_range(&e), Ok(Some((2, 5))));
+        assert_eq!(parse_ext_build(&e).as_deref(), Some("build-x"));
+        assert_eq!(encode_ext(None, None), Vec::<u8>::new());
+        assert_eq!(parse_ext_range(&encode_ext(None, Some("b"))), Ok(None));
+    }
+
+    #[test]
+    fn ext_unknown_tag_ignored() {
+        let mut e = Vec::new();
+        e.extend_from_slice(&99u16.to_le_bytes());
+        e.extend_from_slice(&3u16.to_le_bytes());
+        e.extend_from_slice(b"abc");
+        e.extend_from_slice(&encode_ext(Some((1, 3)), None));
+        assert_eq!(parse_ext_range(&e), Ok(Some((1, 3))));
+    }
+
+    #[test]
+    fn ext_malformed_refused_not_panicking() {
+        let good = encode_ext(Some((1, 3)), Some("hello"));
+        for cut in 1..good.len() {
+            // every strict prefix either parses (cut on a TLV boundary) or errs
+            let _ = parse_ext_range(&good[..cut]);
+        }
+        assert!(matches!(
+            parse_ext_range(&[1]),
+            Err(HandshakeError::Malformed(_))
+        ));
+        assert!(matches!(
+            parse_ext_range(&good[..good.len() - 1]),
+            Err(HandshakeError::Malformed(_))
+        ));
+        // range value of the wrong size
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&EXT_TAG_RANGE.to_le_bytes());
+        bad.extend_from_slice(&4u16.to_le_bytes());
+        bad.extend_from_slice(&[0; 4]);
+        assert!(matches!(
+            parse_ext_range(&bad),
+            Err(HandshakeError::Malformed(_))
+        ));
+        // min > max
+        let inv = encode_ext(Some((5, 2)), None);
+        assert!(matches!(
+            parse_ext_range(&inv),
+            Err(HandshakeError::Malformed(_))
+        ));
+        let peer = Preamble {
+            extensions: bad,
+            ..Preamble::for_protocol(&NETWORK_PROTOCOL)
+        };
+        assert!(matches!(
+            check_peer_ext(&NETWORK_PROTOCOL, &[], &peer, false),
+            Err(HandshakeError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn empty_ext_is_range_one_one() {
+        let phase1 = Preamble::for_protocol(&NETWORK_PROTOCOL);
+        let with = |r| Preamble {
+            extensions: encode_ext(Some(r), None),
+            ..Preamble::for_protocol(&NETWORK_PROTOCOL)
+        };
+        // both empty
+        check_peer_ext(&NETWORK_PROTOCOL, &[], &phase1, false).unwrap();
+        // own [1,3] vs empty peer: overlap at 1
+        check_peer_ext(
+            &NETWORK_PROTOCOL,
+            &encode_ext(Some((1, 3)), None),
+            &phase1,
+            false,
+        )
+        .unwrap();
+        // own [2,3] vs empty peer: disjoint
+        let err = check_peer_ext(
+            &NETWORK_PROTOCOL,
+            &encode_ext(Some((2, 3)), None),
+            &phase1,
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            HandshakeError::DisjointRanges {
+                peer_min: 1,
+                peer_max: 1,
+                own_min: 2,
+                own_max: 3
+            }
+        ));
+        // empty own vs peer [2,3]: disjoint
+        assert!(matches!(
+            check_peer_ext(&NETWORK_PROTOCOL, &[], &with((2, 3)), false),
+            Err(HandshakeError::DisjointRanges { .. })
+        ));
+    }
+
+    #[test]
+    fn disjoint_refused_by_name_overlap_accepted() {
+        let own = encode_ext(Some((1, 3)), None);
+        let peer = |r| Preamble {
+            extensions: encode_ext(Some(r), None),
+            ..Preamble::for_protocol(&NETWORK_PROTOCOL)
+        };
+        let err = check_peer_ext(&NETWORK_PROTOCOL, &own, &peer((4, 6)), false).unwrap_err();
+        assert!(err.to_string().contains("disjoint"), "{err}");
+        check_peer_ext(&NETWORK_PROTOCOL, &own, &peer((3, 6)), false).unwrap();
+        check_peer_ext(&NETWORK_PROTOCOL, &own, &peer((2, 2)), false).unwrap();
+    }
+
+    #[test]
+    fn require_flag_refuses_empty_peer_ext() {
+        let phase1 = Preamble::for_protocol(&NETWORK_PROTOCOL);
+        let err = check_peer_ext(
+            &NETWORK_PROTOCOL,
+            &encode_ext(Some((1, 2)), None),
+            &phase1,
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(err, HandshakeError::Phase1Peer);
+        assert!(err.to_string().contains(PHASE1_PEER_REFUSAL));
+        // a peer with a non-empty ext passes the flag
+        let ok = Preamble {
+            extensions: encode_ext(Some((1, 2)), None),
+            ..phase1
+        };
+        check_peer_ext(&NETWORK_PROTOCOL, &[], &ok, true).unwrap();
+    }
+
+    #[test]
+    fn check_peer_ext_still_checks_magic_and_version() {
+        let mut p = Preamble::for_protocol(&NETWORK_PROTOCOL);
+        p.version = 9;
+        assert!(matches!(
+            check_peer_ext(&NETWORK_PROTOCOL, &[], &p, false),
+            Err(HandshakeError::UnsupportedVersion { .. })
+        ));
+    }
+
+    #[test]
+    fn default_preamble_bytes_unchanged() {
+        let bytes = encode(&Preamble::for_protocol(&NETWORK_PROTOCOL));
+        assert_eq!(bytes, [b'N', b'H', b'S', b'1', 1, 0, 0]);
+        let bytes = encode(&Preamble {
+            extensions: encode_ext(None, None),
+            ..Preamble::for_protocol(&NETWORK_PROTOCOL)
+        });
+        assert_eq!(bytes, [b'N', b'H', b'S', b'1', 1, 0, 0]);
+    }
+
+    #[test]
+    fn build_string_fits_max_extension() {
+        let long = "é".repeat(2000);
+        let e = encode_ext(Some((1, 1)), Some(&long));
+        assert!(e.len() <= MAX_EXTENSION_LEN as usize);
+        assert!(parse_ext_build(&e).is_some());
     }
 }

@@ -853,6 +853,10 @@ impl<E: Env> Network for EncryptedEnv<E> {
     fn close_stream(&self, stream: u64) {
         self.env.close_stream(stream);
     }
+
+    fn set_require_peer_ext(&self, on: bool) {
+        self.env.set_require_peer_ext(on);
+    }
 }
 
 #[async_trait::async_trait]
