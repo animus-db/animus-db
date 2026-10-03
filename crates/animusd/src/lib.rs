@@ -22015,6 +22015,14 @@ mod sim_cluster_control_membership_admin;
 #[cfg(test)]
 mod sim_cluster_seed_join;
 
+/// ADR 0073 Phase 2 (P2-A) residual risk #1 at the node-assembly level: every
+/// node role `SimCluster` can build (control-only, combined, data-only, a
+/// runtime-grown control voter, `join_via_seed` joiners of both kinds) is in
+/// the control leader's passive version-observation table with its advertised
+/// range. See `sim_cluster_version_observation.rs`'s own module doc.
+#[cfg(test)]
+mod sim_cluster_version_observation;
+
 /// C-13 / ADR 0061 rung M PR 6 — `tests/control_membership_split.rs`'s own
 /// two real-socket tests, a mixed disposition: (1)
 /// `admin_add_control_member_races_a_control_only_self_registration_and_

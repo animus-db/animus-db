@@ -49,6 +49,7 @@ pub mod schema;
 pub mod shared_wal;
 pub mod syskv;
 pub mod version;
+pub mod version_observe;
 
 pub use delta_ring::DeltaRing;
 pub use detector::{FailureDetector, Liveness};

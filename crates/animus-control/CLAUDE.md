@@ -36,6 +36,37 @@ per-tablet CP data plane (`animus-cp-data`).
   unknown kinds/counters). `ReportNodeVersion`/`FinalizeClusterVersion` are
   deliberately not relayable in `animus-node` until P2-B/P2-C decide.
 
+- **`version_observe.rs` + `RaftNode`'s `version_loop`** (ADR 0073 Phase 2,
+  P2-A section 2). Leader-local, passive, **no wire change**: the driver loop
+  records `Envelope.from -> (Option<VersionRange>, build, observed_at)` for
+  EVERY inbound control envelope (control-only voters never heartbeat; they are
+  seen through Raft traffic) into a `VersionObservations` table created inside
+  `RaftNode` like the `FailureDetector` (so no `RaftNode::start*` call site
+  changed). Empty or malformed `ext` is `range: None` (a Phase 1 peer).
+  Read it with `RaftNode::version_observations()`. Own profile:
+  `set_own_version_range(Option<VersionRange>)` (default `None` = Phase 1 profile, never proposes;
+  an assembler opts in with `Some(own_range())` alongside the `Env`'s `ext` — a
+  `Some` default made a lone voter start the era and refuse every empty-ext
+  peer, breaking 13 `animusd` lib tests) and `set_own_build`.
+  The pure `era_start_proposals` (precondition P: era off, own range `Some`,
+  every `required_version_set()` ∪ control voter ∪ learner observed within
+  `OBSERVATION_WINDOW` = 3 x `HEARTBEAT_INTERVAL` with a `Some` range
+  containing `cluster_version()`; then one `ReportNodeVersion` per required
+  node) and `era_on_proposals` (re-report a required node whose fresh
+  observation differs from, or has no, record) feed `version_loop`
+  (`detect_loop`-shaped: leader-gated, waits one window after a term change,
+  waits until the apply cache has caught up to `commit_index`, one proposal
+  per node per window; proposals are fire-and-forget and re-derived from the
+  applied cache every tick, identical re-reports are `NoOp`). A control voter
+  or learner outside `node_addrs` still blocks P (it is in the voter/learner
+  set) but cannot get a record until it registers; once it does, the era-on
+  upkeep records it. The loop is spawned LAST in `start_with_orphan_sweep_after`
+  so it never shifts earlier tasks' ids. Tests: `tests/it/version_observe_corpus.rs`
+  (cells a-f over the shared `tests/it/version_world.rs` harness; its safety
+  check "era active => every required node is currently B2" has teeth: it fails
+  if P stops requiring `Some(range)`), and `animusd`'s
+  `sim_cluster_version_observation` for every node role.
+
 - **`lib.rs`** — the public surface: re-exports the core types (`SharedWal`,
   `RaftCore`, `RaftNode`, `Metadata`/`MetaCommand`, the schema types,
   `FailureDetector`) plus `animus_placement::PlacementPolicy` (so a downstream

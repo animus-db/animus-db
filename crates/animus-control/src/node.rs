@@ -27,6 +27,11 @@ use crate::persist::{CONTROL_SNAPSHOT, CONTROL_WAL, PersistedState};
 use crate::persist_round::{self, GatedOuts, PersistArm, PersistFut, PersistProgress, PersistWake};
 use crate::raft::{Out, ProposeResult, RaftCore, RaftMsg, Role};
 use crate::syskv;
+use crate::version::VersionRange;
+use crate::version_observe::{
+    OBSERVATION_WINDOW, OwnVersion, VersionObservation, VersionObservations, VersionView,
+    command_node, era_on_proposals, era_start_proposals,
+};
 
 /// File name of the per-node Raft write-ahead log on the `Env` disk.
 const WAL: &str = "raft.wal";
@@ -619,6 +624,16 @@ pub struct RaftNode<E: Env> {
     /// failure the *rest of teardown* (task abort, env teardown) can still
     /// cause means, never when the loops themselves stop.
     halted: Arc<AtomicBool>,
+    /// Leader-local passive version observation table (ADR 0073 Phase 2,
+    /// P2-A): `Envelope.from -> (range, build, observed_at)` for EVERY inbound
+    /// control envelope (control-only voters are seen through Raft traffic,
+    /// not heartbeats). Written by the driver loop, read by the
+    /// [`version_loop`] and [`version_observations`](Self::version_observations).
+    /// Volatile and per-process, like the failure detector.
+    observations: Arc<Mutex<VersionObservations>>,
+    /// This node's own advertised version profile (see
+    /// [`set_own_version_range`](Self::set_own_version_range)).
+    own_version: Arc<Mutex<OwnVersion>>,
 }
 
 impl<E: Env> RaftNode<E> {
@@ -722,10 +737,13 @@ impl<E: Env> RaftNode<E> {
         let watch = MetadataWatch::default();
         let cache = Arc::new(Mutex::new(Metadata::default()));
         let engine_applied = Arc::new(AtomicU64::new(0));
+        let engine_applied_for_version = Arc::clone(&engine_applied);
         let delta_ring = Arc::new(Mutex::new(delta_ring));
         let wal_lock = Arc::new(FairMutex::new());
         let persist = Arc::new(PersistProgress::default());
         let halted = Arc::new(AtomicBool::new(false));
+        let observations = Arc::new(Mutex::new(VersionObservations::default()));
+        let own_version = Arc::new(Mutex::new(OwnVersion::default()));
         let node = Self {
             env: env.clone(),
             core: Arc::clone(&core),
@@ -738,6 +756,8 @@ impl<E: Env> RaftNode<E> {
             persist: Arc::clone(&persist),
             metrics: metrics.clone(),
             halted: Arc::clone(&halted),
+            observations: Arc::clone(&observations),
+            own_version: Arc::clone(&own_version),
         };
         env.spawn_task(drive(
             env.clone(),
@@ -753,7 +773,8 @@ impl<E: Env> RaftNode<E> {
             wal_lock,
             persist,
             boot_entropy,
-            halted,
+            Arc::clone(&halted),
+            Arc::clone(&observations),
         ));
         // The placement reconciler runs alongside the driver; it only ever
         // *proposes* on the core (no I/O of its own), and proposals are honored
@@ -781,12 +802,25 @@ impl<E: Env> RaftNode<E> {
         if !orphan_sweep_after.is_zero() {
             env.spawn_task(orphan_sweep_loop(
                 env.clone(),
-                core,
-                cache,
+                Arc::clone(&core),
+                Arc::clone(&cache),
                 orphan_sweep_after,
                 metrics,
             ));
         }
+        // Leader-local version observation consumer (ADR 0073 Phase 2, P2-A):
+        // same "only proposes, safe on every node, only acts when leader"
+        // shape. Spawned last so it never shifts the task ids of the loops
+        // above.
+        env.spawn_task(version_loop(
+            env.clone(),
+            core,
+            cache,
+            engine_applied_for_version,
+            observations,
+            own_version,
+            halted,
+        ));
         node
     }
 
@@ -813,6 +847,46 @@ impl<E: Env> RaftNode<E> {
     #[must_use]
     pub fn is_halted(&self) -> bool {
         self.halted.load(Ordering::SeqCst)
+    }
+
+    /// A snapshot of the leader-local version observation table (ADR 0073
+    /// Phase 2, P2-A): for every peer this node has received a control
+    /// envelope from, its advertised range/build and when it was last seen.
+    /// Meaningful on the leader; every node keeps one. For tests and admin.
+    #[must_use]
+    pub fn version_observations(&self) -> BTreeMap<NodeId, VersionObservation> {
+        self.observations
+            .lock()
+            .expect("observations poisoned")
+            .snapshot()
+    }
+
+    /// Set this node's own advertised version range (ADR 0073 Phase 2,
+    /// P2-A). The default is `None`: a **Phase 1 profile** that never
+    /// evaluates precondition P, never starts the era and never proposes a
+    /// version command. An assembler opts in with `Some(own_range())` at the
+    /// same time it gives its `Env` the matching handshake `ext` (P2-C; P2-D's
+    /// binary profiles drive this). Defaulting to `Some` would let a lone voter
+    /// start the era and then refuse every empty-`ext` peer. It does not change
+    /// the handshake `ext` the node advertises (that is the `Env`'s: see
+    /// `ProdEnv::set_own_ext` / `Simulator::set_network_ext_for`).
+    pub fn set_own_version_range(&self, range: Option<VersionRange>) {
+        self.own_version.lock().expect("own version poisoned").range = range;
+    }
+
+    /// Set the build string this node's own version record carries (display
+    /// only). Defaults to this crate's package version.
+    pub fn set_own_build(&self, build: impl Into<String>) {
+        self.own_version.lock().expect("own version poisoned").build = build.into();
+    }
+
+    /// This node's own advertised version profile.
+    #[must_use]
+    pub fn own_version(&self) -> OwnVersion {
+        self.own_version
+            .lock()
+            .expect("own version poisoned")
+            .clone()
     }
 
     /// This node's metrics handle (ADR 0015). A snapshot of it
@@ -1268,6 +1342,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
     // no logic bug anywhere (`chunked_snapshot_receiver_stop_restart_3`).
     boot_entropy: u64,
     halted: Arc<AtomicBool>,
+    observations: Arc<Mutex<VersionObservations>>,
 ) {
     // Recover from the WAL before serving anything.
     // Issue #1132: `recover` also cuts a torn tail back on disk, so this
@@ -1487,6 +1562,15 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
                     (Vec::new(), None)
                 }
                 Either::Right((Either::Left((envelope, _)), _)) => {
+                    // ADR 0073 Phase 2 (P2-A): record the sender's advertised
+                    // version for EVERY inbound control envelope — control-only
+                    // nodes never heartbeat and are seen only through Raft
+                    // traffic. No RNG, no I/O.
+                    observations.lock().expect("observations poisoned").observe(
+                        &envelope.from,
+                        &envelope.peer_ext,
+                        env.now(),
+                    );
                     let entropy = env.next_u64();
                     match serde_json::from_slice::<RaftMsg>(&envelope.payload) {
                         // A heartbeat is not consensus traffic (ADR 0012): record it
@@ -2789,6 +2873,104 @@ async fn detect_loop<E: Env>(
                     NodeStatus::Active => metrics.incr(Metric::FailureDetectorUp),
                     _ => {}
                 }
+            }
+            core.lock().expect("raft core poisoned").propose(command);
+        }
+    }
+}
+
+/// The leader-local version loop (ADR 0073 Phase 2, P2-A section 2; see
+/// [`crate::version_observe`] for the rules). Modeled on [`detect_loop`]:
+/// leader-gated, with a per-term grace (`leader_since`) of one
+/// [`OBSERVATION_WINDOW`] so a fresh leader has a chance to observe every peer
+/// before it evaluates precondition P, reading the apply task's published
+/// cache and proposing through the core.
+///
+/// Proposals are **fire-and-forget**: `ProposeResult::Accepted` only means
+/// "appended locally". The loop re-derives what is still missing from the
+/// applied cache on every tick, so a lost proposal is retried; to avoid a
+/// duplicate storm while a proposal is in flight, at most one proposal per
+/// node per [`OBSERVATION_WINDOW`] is made (`last_proposed`, cleared whenever
+/// leadership or the term changes). An identical re-report applies as `NoOp`.
+///
+/// It additionally waits until the cache has applied everything the core has
+/// committed (`engine_applied >= commit_index`), so a leader that has just won
+/// does not judge a required set that predates entries it has already
+/// committed.
+async fn version_loop<E: Env>(
+    env: E,
+    core: Arc<Mutex<RaftCore>>,
+    cache: Arc<Mutex<Metadata>>,
+    engine_applied: Arc<AtomicU64>,
+    observations: Arc<Mutex<VersionObservations>>,
+    own_version: Arc<Mutex<OwnVersion>>,
+    halted: Arc<AtomicBool>,
+) {
+    let self_id = env.node_id();
+    let mut leader_since: Option<(u64, Nanos)> = None;
+    let mut last_proposed: BTreeMap<NodeId, Nanos> = BTreeMap::new();
+    loop {
+        env.sleep(DETECT_INTERVAL).await;
+        if halted.load(Ordering::SeqCst) {
+            continue;
+        }
+        let now = env.now();
+        let (term_now, control_nodes, commit) = {
+            let c = core.lock().expect("raft core poisoned");
+            if !c.is_leader() {
+                leader_since = None;
+                last_proposed.clear();
+                continue;
+            }
+            let mut nodes = c.config();
+            nodes.extend(c.learners());
+            (c.term(), nodes, c.commit_index())
+        };
+        let since = match leader_since {
+            Some((t, since)) if t == term_now => since,
+            _ => {
+                leader_since = Some((term_now, now));
+                last_proposed.clear();
+                now
+            }
+        };
+        if now.duration_since(since) < OBSERVATION_WINDOW {
+            continue;
+        }
+        if engine_applied.load(Ordering::Acquire) < commit {
+            continue;
+        }
+        let own = own_version.lock().expect("own version poisoned").clone();
+        if own.range.is_none() {
+            continue;
+        }
+        let view = VersionView::from_metadata(&cache.lock().expect("cache poisoned"));
+        let obs = observations
+            .lock()
+            .expect("observations poisoned")
+            .snapshot();
+        let proposals = if view.era_active {
+            era_on_proposals(&view, &obs, &self_id, &own, now, OBSERVATION_WINDOW)
+        } else {
+            era_start_proposals(
+                &view,
+                &control_nodes,
+                &obs,
+                &self_id,
+                &own,
+                now,
+                OBSERVATION_WINDOW,
+            )
+        };
+        for command in proposals {
+            if let Some(node) = command_node(&command) {
+                if last_proposed
+                    .get(node)
+                    .is_some_and(|t| now.duration_since(*t) < OBSERVATION_WINDOW)
+                {
+                    continue;
+                }
+                last_proposed.insert(node.clone(), now);
             }
             core.lock().expect("raft core poisoned").propose(command);
         }
