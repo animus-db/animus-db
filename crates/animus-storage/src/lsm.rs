@@ -3295,7 +3295,7 @@ fn decode_wal(bytes: &[u8]) -> Result<(Vec<WalRecord>, usize)> {
     // check. When `WAL_VERSION` becomes 2, `2 => decode_wal_v2(..)` joins here
     // and `1 => wal_legacy::v1::decode(..)` moves the v1 arm to `legacy`.
     match bytes[4] {
-        1 => decode_wal_v1(&bytes[WAL_HEADER_LEN..]),
+        1 => legacy::v1::decode(&bytes[WAL_HEADER_LEN..]),
         v => Err(StorageError::UnsupportedFormatVersion {
             format: "lsm-wal",
             found: u32::from(v),
@@ -3305,39 +3305,51 @@ fn decode_wal(bytes: &[u8]) -> Result<(Vec<WalRecord>, usize)> {
 }
 
 /// Legacy (pre-current-version) on-disk decoders for the LSM WAL and manifest
-/// (ADR 0073 Phase 1, "upgrade-on-read"). Empty while every format is still
-/// v1. Once version N+1 of a format exists, its `vN` decoder moves to
-/// `legacy::vN` **unchanged in behavior**, and — the upgrade-on-read contract —
-/// returns the *current* in-memory type (`Vec<WalRecord>` / `Manifest`), never
-/// a legacy shape; the version `match` in `decode_wal` / `decode_manifest`
-/// routes to it. A legacy decoder is never deleted (support window: forever).
-mod legacy {}
+/// (ADR 0073 Phase 1, "upgrade-on-read"). Once version N+1 of a format exists,
+/// its `vN` decoder lives in `legacy::vN` **unchanged in behavior**, and — the
+/// upgrade-on-read contract — returns the *current* in-memory type
+/// (`Vec<WalRecord>` / `Manifest`), never a legacy shape; the version `match`
+/// in `decode_wal` / `decode_manifest` routes to it. A legacy decoder is never
+/// deleted (support window: forever).
+mod legacy {
+    /// The v1 WAL body format: `len | crc32 | payload` frames with **no sync
+    /// markers**, so the only torn-tail-vs-corruption signal is the lenient
+    /// positional rule (a bad frame followed by a valid one is "not a tail").
+    /// That rule is unsound for a coalesced un-synced batch (issue #1142) but
+    /// is kept byte-for-byte for files an older binary wrote.
+    pub(super) mod v1 {
+        use super::super::{
+            Result, StorageError, WAL_HEADER_LEN, WalRecord, try_parse_wal_frame, wal_resync_point,
+        };
 
-/// The v1 WAL body decoder: `body` is everything after the 5-byte header.
-/// Returns the records and the total consumed length *including* the header.
-fn decode_wal_v1(body: &[u8]) -> Result<(Vec<WalRecord>, usize)> {
-    let mut records = Vec::new();
-    let mut pos = 0usize;
-    while pos < body.len() {
-        match try_parse_wal_frame(body, pos) {
-            Some((record, next)) => {
-                records.push(record);
-                pos = next;
-            }
-            None => {
-                if wal_resync_point(body, pos + 1).is_some() {
-                    return Err(StorageError::Backend(format!(
-                        "corrupt WAL record at byte offset {pos} (past the file \
-                         header): a valid record still parses later in the file, \
-                         so this is not a torn tail — refusing to silently drop \
-                         history"
-                    )));
+        /// The v1 WAL body decoder: `body` is everything after the 5-byte
+        /// header. Returns the records and the total consumed length
+        /// *including* the header.
+        pub(in super::super) fn decode(body: &[u8]) -> Result<(Vec<WalRecord>, usize)> {
+            let mut records = Vec::new();
+            let mut pos = 0usize;
+            while pos < body.len() {
+                match try_parse_wal_frame(body, pos) {
+                    Some((record, next)) => {
+                        records.push(record);
+                        pos = next;
+                    }
+                    None => {
+                        if wal_resync_point(body, pos + 1).is_some() {
+                            return Err(StorageError::Backend(format!(
+                                "corrupt WAL record at byte offset {pos} (past the file \
+                                 header): a valid record still parses later in the file, \
+                                 so this is not a torn tail — refusing to silently drop \
+                                 history"
+                            )));
+                        }
+                        break;
+                    }
                 }
-                break;
             }
+            Ok((records, WAL_HEADER_LEN + pos))
         }
     }
-    Ok((records, WAL_HEADER_LEN + pos))
 }
 
 /// Encode a [`WalRecord`]'s payload (tag byte + fields; see the codec-level
