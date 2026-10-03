@@ -2269,12 +2269,43 @@ disambiguation is needed.
   - The WAL is written by both tasks (append vs. compaction rewrite),
     serialized by the async `wal_lock`; compaction snapshots only up to
     `engine_applied` via `snapshot_upto` (not `last_applied`, which the engine
-    hasn't merged) and **discards the consensus loop's pending records** in the
-    same locked block (`replay` is push-based → re-appending would duplicate).
-    That discard is also a **persist round** now (issue #279): it goes through
-    `persist_round::drain_for_round` like the loop's own drain and completes the
-    round once its `env.replace` lands, or the acks the loop buffered against
-    those records would wait on a round with no drainer.
+    hasn't merged). **Issue #1116: on the per-group-file path the rewrite's
+    slow half no longer runs under `wal_lock`, nor on the apply task.** Under
+    the lock the apply task captures the image (`wal_image`), drains the
+    pending records and makes them durable in the LIVE WAL like an ordinary
+    persist round (so a later round can never ack over a gap), arms
+    `wal_lock.tail()` and releases the lock. A spawned task
+    (`rewrite_wal_staged`) then `Disk::stage_replace`s the image (write +
+    fsync of `{wal}.tmp`) unlocked, drains the tail of rounds persisted
+    meanwhile into the staged file (`stage_extend`; `persist_wal` pushes each
+    durable round's record bytes onto `RewriteTail`), and takes the lock only
+    for the last tail drain, `markers().invalidate()` and
+    `Disk::commit_staged` (rename + directory fsync). The swapped-in file is
+    `image ++ every round since`, the bytes a rewrite under the lock would
+    have produced; a crash before the swap leaves the live WAL (holds every
+    acked record), after it the new file (tail synced before the rename).
+    Residual under the lock: the rename + directory fsync, plus one small
+    fsync only if a round landed since the last unlocked catch-up. At most one
+    rewrite is in flight (`WalRewriteSlot`); a threshold-only trigger waits
+    for it, the take-once `image_needed`/just-installed-snapshot triggers
+    wait it out, and `apply_loop` will not report `apply_stopped` while one
+    runs (the GC deletes the files once `is_stopped()`). Why the apply task
+    too: reads confirm off `engine_applied`, which only that task advances, so
+    a rewrite run inline there stalls every confirm for its whole fsync even
+    with the lock free (the first cut of this fix kept the rewrite inline and
+    its sim test still saw 3s). The **shared-WAL path is unchanged** (one
+    physical file for all groups: `compact_group` still rewrites it under
+    `wal_lock`, and its queue is FIFO behind the rewrite regardless).
+    `ProdEnv` over an encrypted disk uses `Disk`'s default staged methods
+    (correct, but the swap re-reads and `replace`s under the lock). Tests:
+    `tests/it/wal_rewrite_no_stall.rs` (slow-rewrite `SimEnv`,
+    `DiskConfig::set_replace_data_delay`; failed at 3.06s on main) and
+    `tests/it/wal_rewrite_crash.rs` (whole-cluster crash at 12 offsets into a
+    stalled rewrite, plain and torn/corrupt tails;
+    `ANIMUS_WAL_REWRITE_CRASH_SEEDS`).
+    The drain is still a **persist round** (issue #279): it goes through
+    `persist_round::drain_for_round`, and the round completes as soon as the
+    drained records are durable in the live WAL.
     Compaction is skipped while `halted`. `is_stopped()` requires *both* tasks
     stopped (`stopped && apply_stopped`) before the GC deletes artifacts.
 
