@@ -52,8 +52,9 @@ properties; it also hosts cross-crate fault sweeps.
   target_back, &TranscodeOpts)` (sorted, classified by name/magic, rewritten
   with `Disk::replace`; per-file keep/skip from splitmix64 of `(seed, file)`,
   never the simulator RNG; `stop_after_files` models a crash mid-window).
-  Every format is v1, so only `target_back == 0` (identity) is supported and
-  anything else is an `UnsupportedTarget` error, never a silent identity.
+  `control-wal`, `shared-wal` and `lsm-wal` are v2 (transcoded to v1 for real);
+  every other format is v1 (identity only), and an unlisted target is an
+  `UnsupportedTarget` error, never a silent identity.
   **Checklist step 7 is editing one `FormatEntry`** (bump `current_version`,
   add a `VersionSpec`, point `transcode` at the `legacy::vK::encode` calls);
   a format that is *not* a whole node-disk file is listed in

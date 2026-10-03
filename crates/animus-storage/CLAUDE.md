@@ -324,7 +324,7 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   the engine's lifetime; a listing is one call regardless of history.
 - **Every WAL segment file starts with a file-level format header** (ADR
   0073 Phase 0, Workstream A): magic `LWL1` (`wal::WAL_MAGIC`) + `u8`
-  version (`wal::WAL_VERSION`, currently `1`) — a **file-level** header,
+  version (`wal::WAL_VERSION`, currently `2` since #1142; v1 files still decode) — a **file-level** header,
   not a per-record one, written **exactly once**, before any record.
   Chosen over a per-record tag (the ADR's Phase 0 conventions table names
   this format "LSM WAL record header") because the WAL is already a
@@ -370,6 +370,23 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   *shorter* than the header, whatever its bytes, as an empty torn tail.
   No encoding/fixture change. Tests that interrupt the Nth `sync` by ordinal
   must count the header sync (`lsm_group_commit.rs`).
+- **The WAL is v2: sync-marker frames bound the provably-synced prefix (issue
+  #1142).** The old rule "a bad frame with a valid frame after it is not a torn
+  tail" is unsound for a coalesced `GroupCommit` batch (several frames, one
+  fsync; `corrupt_on_crash` flips a byte anywhere in the kept un-synced
+  region). A marker frame (`len=9 | crc | tag 5 | offset u64`, `offset` = its
+  own file offset) is **prepended to the next batch's append** only when the
+  previous batch's append+sync on the segment returned `Ok`
+  (`Inner::marker_ready`; cleared when a batch is claimed, at rotation and at
+  open). `decode_wal_v2`: a bad frame starting before a valid, correctly placed
+  marker is a hard error; otherwise a torn tail even if valid frames follow.
+  A recovered **v1** active segment is appended without markers until it
+  rotates (`GroupCommit::new`'s `active_seg_is_v2`). Tests:
+  `tests/it/lsm_wal_sync_markers.rs` (coalesced tear reopens at 300 seeds,
+  synced-frame flip still refused), the `lsm_crash`/`lsm_disk_faults` cells,
+  `wal_format_fixture_tests`. A fault corpus must buffer MORE THAN ONE
+  un-synced frame to test a torn-tail proof (lesson
+  `2026-10-03-a-fault-harness-must-buffer-more-than-one-unsynced-frame.md`).
 - **Format versioning is now a standing rule for every format in this
   crate, not just the WAL** (ADR 0073 Phase 0). `StorageError::
   PreBaselineFormat { format }` / `StorageError::UnsupportedFormatVersion {

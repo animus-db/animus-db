@@ -21,8 +21,9 @@ kept-prefix tear next to a flipped byte in the same round); scan past the first
 bad line for markers (or a rotted first line hides every proof); cut the torn
 tail back on open (or later appends sit after garbage and the next recovery
 refuses the file); a disk that lied about `fsync` and lost acked bytes now fails
-loudly, which is correct. Check whether the LSM WAL's resync has the same
-exposure whenever a multi-frame batch can be un-synced (it uses the same
-rule today, untested against this fault shape; unconfirmed). How to verify a proof is sound: write
+loudly, which is correct. The LSM WAL's resync had the same
+exposure and it was **confirmed** (76/300 seeds, issue #1142; fixed with the
+same marker design, see
+`2026-10-03-a-fault-harness-must-buffer-more-than-one-unsynced-frame.md`). How to verify a proof is sound: write
 the probe first (N appends, crash with the faults armed, count seeds where the
 "proof" fires on a correct writer) before designing the rule.
