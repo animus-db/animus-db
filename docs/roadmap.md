@@ -1581,9 +1581,9 @@ rows this section used to carry were fixed by the stale-prose sweep.
   tested** (per-version fixture tests, `legacy` decoders, the format-change
   checklist, the upgrade-restart harness tiers 0-2 per-push at K=1 and
   nightly at K=100/K=50). **Not supported yet:** mixed-version wire and
-  rolling upgrades. Every format is still at v1 on `main` (the harness's
-  transcode is the identity); the first real bumps, CWL/SWL v2, are in
-  flight (#1140/#1141). **Next: Phase 2** (replicated cluster version /
+  rolling upgrades. The first real format bumps have landed
+  (CWL/SWL v2 WAL sync markers, #1140/#1141, plus `raftkv-wal` v2), and the
+  harness transcodes them to v1 for real; every other format is still v1. **Next: Phase 2** (replicated cluster version /
   feature gate), then Phase 3. Phase 4 (lifting/rewriting root `CLAUDE.md`'s
   no-back-compat rule) is **already done** by this same maintainer
   decision — root `CLAUDE.md` now states the staged ratchet directly.

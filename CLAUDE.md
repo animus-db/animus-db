@@ -113,9 +113,11 @@ test, and the upgrade-restart harness (`animus-test` tiers 0/1,
 `corpus-deep.yml`) restarts on state transcoded to older versions. So a
 **whole-cluster stop → upgrade → restart is supported and tested**;
 **mixed-version wire and rolling upgrades are not** (Phases 2 and 3 —
-Phase 2, a replicated cluster version / feature gate, is next). Every
-format is still v1 on `main`, so the transcode is the identity until the
-first real bump. **A format change follows ADR 0073's "Phase 1 design"
+Phase 2, a replicated cluster version / feature gate, is next). The
+first real bumps have landed (2026-10-03, #1140/#1141): `control-wal` and
+`shared-wal` are v2 (WAL sync markers) and the harness transcodes them to
+v1 for real; `raftkv-wal` is v2 too (embedded in the control-wal carrier);
+every other format is still v1, transcoded as the identity. **A format change follows ADR 0073's "Phase 1 design"
 checklist** ([`docs/adr/0073-upgrade-compatibility.md`](docs/adr/0073-upgrade-compatibility.md):
 bump, keep the vN decoder under `legacy`, new no-overwrite fixture,
 per-version expected value, round-trip and old-input tests, test-only legacy
