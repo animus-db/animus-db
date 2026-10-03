@@ -59,6 +59,35 @@
 //! replay is correct — replaying an already-flushed record just re-inserts an
 //! identical `(key, version)` slot (idempotent).
 //!
+//! ## Sync markers (WAL v2, issue #1142)
+//!
+//! A group-commit batch is *many* writers' frames in one `append` + one `sync`,
+//! so a crash can leave several un-synced frames, and `corrupt_on_crash` can
+//! flip a byte in any of them while a later one survives intact. "A valid
+//! frame follows the bad one, so it is not a torn tail" (the v1 rule) then
+//! refuses a correct writer's file (76 of 300 seeds in the `lsm_wal_coalesced_
+//! tear_probe` regression). v2 gives the reader a durable boundary: a
+//! CRC-checked marker frame `[len=9][crc][tag 5][offset u64]` whose `offset` is
+//! **its own file offset** and which claims "every byte before me is fsynced".
+//! The decoder (`decode_wal_v2`) treats a bad frame that starts *before* a
+//! valid, correctly-placed marker as corruption (hard error) and anything
+//! after the last marker as a tolerated torn tail.
+//!
+//! Mirrors the control-WAL's CWL1 v2 (#1140): the marker is **piggybacked on
+//! the next batch's own `append`** rather than written/synced on its own (a
+//! second append+fsync per round would double the commit cost). It is only
+//! prepended when the *previous* batch's `sync` on this segment returned `Ok`
+//! (`Inner::marker_ready`, cleared when the batch is claimed and set again only
+//! on success), and its offset is read from `env.size` at flush time (the
+//! leader is the only appender, so it is exactly where the marker lands). So a
+//! marker is never written over bytes whose sync is unknown, and it is itself
+//! durable only with the next sync — the newest batch has no durable marker
+//! until the next one, which merely shrinks the provable region. A disk that
+//! lies about `fsync` and then loses acked bytes can leave a marker claiming
+//! them; the decoder then fails loudly, which is correct. A segment with no
+//! marker is lenient exactly like v1 (a recovered v1 segment, or one with no
+//! marker yet).
+//!
 //! ## File-level format header (ADR 0073 Phase 0, Workstream A)
 //!
 //! Every segment file's first bytes are a **file-level header**: magic
@@ -149,16 +178,32 @@ use crate::{Result, StorageError};
 /// why this is a once-per-file header rather than a per-record tag.
 pub(super) const WAL_MAGIC: [u8; 4] = *b"LWL1";
 /// Current WAL segment file-header version (within the `LWL1` magic family).
-pub(super) const WAL_VERSION: u8 = 1;
+///
+/// **v2** (issue #1142) adds *sync-boundary marker* frames — see the module
+/// docs' "Sync markers" section. v1 files stay readable (`lsm.rs`'s
+/// `legacy::v1`); a recovered v1 *active* segment keeps being appended to
+/// without markers until it rotates.
+pub(super) const WAL_VERSION: u8 = 2;
+/// The first WAL version (no sync markers).
+pub(super) const WAL_VERSION_V1: u8 = 1;
+/// Payload tag byte of a sync-marker frame (record tags are `0..=4`).
+pub(super) const WAL_MARKER_TAG: u8 = 5;
+/// Bytes of one encoded sync-marker frame (`len | crc` header + tag + `u64`).
+pub(super) const WAL_MARKER_FRAME_LEN: usize = 8 + 1 + 8;
 /// Bytes in the WAL segment file-level header (`WAL_MAGIC` + one version byte).
 pub(super) const WAL_HEADER_LEN: usize = WAL_MAGIC.len() + 1;
 
 /// Encode the WAL segment file-level header: `WAL_MAGIC` followed by
 /// `WAL_VERSION`.
 pub(super) fn encode_wal_header() -> [u8; WAL_HEADER_LEN] {
+    encode_wal_header_version(WAL_VERSION)
+}
+
+/// The header for an explicit `version` (test-only legacy encoders write v1).
+pub(super) fn encode_wal_header_version(version: u8) -> [u8; WAL_HEADER_LEN] {
     let mut out = [0u8; WAL_HEADER_LEN];
     out[..WAL_MAGIC.len()].copy_from_slice(&WAL_MAGIC);
-    out[WAL_MAGIC.len()] = WAL_VERSION;
+    out[WAL_MAGIC.len()] = version;
     out
 }
 
@@ -223,6 +268,28 @@ struct Inner {
     /// module docs' "File-level format header" section for the full
     /// crash-safety argument and exactly when this flips.
     active_seg_needs_header: bool,
+    /// Whether the active segment is a v2 file (markers allowed). `false` only
+    /// for a recovered v1 segment, until it rotates.
+    markers_enabled: bool,
+    /// The previous batch's append+`sync` on the active segment both returned
+    /// `Ok` and nothing has been appended since, so every byte now in the file
+    /// is durable and the next batch may open with a marker claiming that.
+    /// Cleared the moment a leader claims a batch; re-set only on success.
+    marker_ready: bool,
+}
+
+/// Encode a sync-marker frame claiming "every byte before file offset `offset`
+/// is fsynced", where `offset` is this frame's own start.
+pub(super) fn encode_wal_marker(offset: u64) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(9);
+    payload.push(WAL_MARKER_TAG);
+    payload.extend_from_slice(&offset.to_be_bytes());
+    let crc = crc32fast::hash(&payload);
+    let mut out = Vec::with_capacity(WAL_MARKER_FRAME_LEN);
+    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    out.extend_from_slice(&crc.to_be_bytes());
+    out.extend_from_slice(&payload);
+    out
 }
 
 impl GroupCommit {
@@ -253,11 +320,16 @@ impl GroupCommit {
     ///   header-carrying `append` already landed on this exact file (every
     ///   segment ever discovered by recovery got that way through this same
     ///   coordinator's own writes), so the header must not be written again.
+    ///
+    /// `active_seg_is_v2` says whether the recovered (non-empty) active segment
+    /// carries a v2 header; a v1 one keeps being appended to without sync
+    /// markers. Ignored when `active_seg_len == 0` (a fresh header is v2).
     pub(super) fn new(
         prefix: String,
         live_segments: &[u64],
         seg_threshold: u64,
         active_seg_len: u64,
+        active_seg_is_v2: bool,
     ) -> Self {
         // All recovered records are folded into the memtable already, so the
         // resumed sequence space starts at 0; the active segment is the highest
@@ -293,6 +365,9 @@ impl GroupCommit {
                 },
                 sealed,
                 active_seg_needs_header: active_seg_len == 0,
+                markers_enabled: active_seg_len == 0 || active_seg_is_v2,
+                // Nothing is known synced at open (also after a tail repair).
+                marker_ready: false,
             }),
         }
     }
@@ -410,11 +485,17 @@ impl GroupCommit {
                         // first batch must carry the file header (see the
                         // module docs' "File-level format header" section).
                         inner.active_seg_needs_header = true;
+                        inner.markers_enabled = true;
+                        inner.marker_ready = false;
                         // Observability (ADR 0015): a rotation actually happened.
                         self.rotations.fetch_add(1, Ordering::Relaxed);
                     }
                     let seg = inner.active_seg;
                     let needs_header = inner.active_seg_needs_header;
+                    // Claim the marker flag: cleared now, re-set only if this
+                    // batch's append + sync both succeed (see module docs).
+                    let with_marker = inner.marker_ready && inner.markers_enabled && !needs_header;
+                    inner.marker_ready = false;
                     // Account the bytes now so the *next* batch's rotation decision
                     // sees this batch's contribution — including the header's own
                     // bytes when this batch will carry one, since those bytes are
@@ -424,12 +505,18 @@ impl GroupCommit {
                             WAL_HEADER_LEN as u64
                         } else {
                             0
+                        }
+                        + if with_marker {
+                            WAL_MARKER_FRAME_LEN as u64
+                        } else {
+                            0
                         };
                     Action::Lead {
                         batch,
                         up_to,
                         seg,
                         needs_header,
+                        with_marker,
                     }
                 }
             };
@@ -460,16 +547,24 @@ impl GroupCommit {
                     up_to,
                     seg,
                     needs_header,
+                    with_marker,
                 } => {
                     // Perform the single batched append + sync, lock-free, to the
                     // chosen segment file.
                     let batch_len = batch.len();
-                    let res = self.flush_batch(env, seg, needs_header, &batch).await;
+                    let res = self
+                        .flush_batch(env, seg, needs_header, with_marker, &batch)
+                        .await;
                     let woken = {
                         let mut inner = self.lock();
                         inner.flushing = false;
                         match &res {
-                            Ok(()) => inner.durable_seq = inner.durable_seq.max(up_to),
+                            Ok(()) => {
+                                inner.durable_seq = inner.durable_seq.max(up_to);
+                                // Everything now in the segment is synced: the
+                                // next batch may open with a marker.
+                                inner.marker_ready = inner.markers_enabled;
+                            }
                             // The append/sync failed: nothing past the prior durable
                             // point is durable, and the claimed records are gone from
                             // `pending`. Mark the whole lost batch failed so every
@@ -523,6 +618,7 @@ impl GroupCommit {
         env: &E,
         seg: u64,
         needs_header: bool,
+        with_marker: bool,
         batch: &[u8],
     ) -> Result<()> {
         let file = self.segment_file(seg);
@@ -540,7 +636,28 @@ impl GroupCommit {
                 .await
                 .map_err(|e| StorageError::Backend(e.to_string()))?;
         }
-        if !batch.is_empty() {
+        if with_marker {
+            // The marker's offset is where it lands: the file's live length
+            // (buffered bytes included; the leader is the only appender). If
+            // the size is unreadable, skip the marker — it only shrinks the
+            // provable region.
+            match env.size(&file).await {
+                Ok(len) => {
+                    let mut buf = encode_wal_marker(len);
+                    buf.extend_from_slice(batch);
+                    env.append(&file, &buf)
+                        .await
+                        .map_err(|e| StorageError::Backend(e.to_string()))?;
+                }
+                Err(_) => {
+                    if !batch.is_empty() {
+                        env.append(&file, batch)
+                            .await
+                            .map_err(|e| StorageError::Backend(e.to_string()))?;
+                    }
+                }
+            }
+        } else if !batch.is_empty() {
             env.append(&file, batch)
                 .await
                 .map_err(|e| StorageError::Backend(e.to_string()))?;
@@ -585,6 +702,8 @@ enum Action {
         up_to: u64,
         seg: u64,
         needs_header: bool,
+        /// Prepend a sync marker to the batch's append (see module docs).
+        with_marker: bool,
     },
     /// Another writer is leading; park until our sequence is durable.
     Wait,
