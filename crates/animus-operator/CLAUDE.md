@@ -1297,6 +1297,25 @@ name, per-version expected value, `panic!` on an unrecognised version. Every `An
 `schemaVersion: 1`; regenerate `deploy/operator/crd.yaml` after touching the
 spec type.
 
+## `spec.image` is immutable on a running cluster (ADR 0060 "Upgrades", 2026-10-03)
+
+ADR 0073 Phase 1 supports only a whole-cluster stop → upgrade → restart;
+a `StatefulSet` `RollingUpdate` on an image edit is the unsupported
+mixed-version window. So `validate::image_change_rejection(prior, target)`
+(compares *effective* images: `None` ≡ `DEFAULT_IMAGE`) is run by
+`validate_spec` on UPDATE only (webhook; CREATE unaffected) **and** by
+`controller::reconcile`'s fallback, which reads the running image off the
+live `StatefulSet`'s `animusd` container (`applied_image`, the analogue of
+`previous_applied_control_nodes`), sets `ImageChangeRejected`, and pins
+`spec.image` to the running one while reconciling everything else ("pin and
+continue", unlike the ephemeral "refuse"). The manual procedure is
+delete-and-recreate the CR keeping the PVCs (K8s default `Retain`; the
+operator sets no retention policy) — see the ADR section for the caveats
+(code-verified, not e2e-tested). The follow-up PR moves to `OnDelete` +
+an operator-orchestrated whole-cluster restart and relaxes this rule. Don't
+test "other edits are allowed" by editing the image any more (the ephemeral
+validator test uses `base_port`).
+
 ## Tests
 
 `cargo test -p animus-operator` — every `desired::*` builder module has its

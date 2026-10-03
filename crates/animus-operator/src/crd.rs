@@ -805,6 +805,16 @@ pub const CONDITION_EPHEMERAL_VOTER_STORAGE_HAZARD: &str = "EphemeralVoterStorag
 /// nobody asked for — a visible refusal is safer than either. Cleared once
 /// the spec no longer matches the rejected combination.
 pub const CONDITION_EPHEMERAL_VOTER_STORAGE_REJECTED: &str = "EphemeralVoterStorageRejected";
+/// Condition type name set when `spec.image` differs from the image the
+/// live `StatefulSet` is running (ADR 0060 "Upgrades", 2026-10-03
+/// amendment). The admission webhook denies such an edit at write time
+/// (`crate::validate::image_change_rejection`); this is the reconciler's
+/// fallback for a cluster installed without the webhook. Unlike
+/// `EphemeralVoterStorageRejected` it is "pin and continue": the reconciler
+/// keeps applying every other field with the *running* image so a rejected
+/// image edit never rolls a single pod, and clears the condition once
+/// `spec.image` matches the running image again.
+pub const CONDITION_IMAGE_CHANGE_REJECTED: &str = "ImageChangeRejected";
 /// Condition type name used when a scale-down below `controlNodes` is
 /// refused.
 pub const CONDITION_SCALE_BELOW_CONTROL_NODES_REFUSED: &str = "ScaleBelowControlNodesRefused";

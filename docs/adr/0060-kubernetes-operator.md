@@ -421,21 +421,62 @@ just because it sits outside the `Env` seam.
 ### Upgrades
 
 **No operator-driven upgrade yet; rolling upgrades wait on ADR 0073
-Phase 3.** The repository's compatibility rule is now staged (root
-`CLAUDE.md`, [ADR 0073](0073-upgrade-compatibility.md)): as of Phase 1
+Phase 3. A `spec.image` change on an existing cluster is rejected
+(2026-10-03 amendment).** The repository's compatibility rule is staged
+(root `CLAUDE.md`, [ADR 0073](0073-upgrade-compatibility.md)): as of Phase 1
 (done 2026-10-03) a **whole-cluster stop → upgrade → restart** across
 post-baseline versions is supported and tested by the upgrade-restart
 harness, but there is **no wire compatibility and no rolling-upgrade
 story** until Phases 2 and 3. For this operator that means the supported
 way to move to a new `animusd` build is a whole-cluster restart, never a
-pod-by-pod mix of versions. The operator does not enforce this: it does
-not reject a `spec.image` edit (a `validate_spec` test allows one), and
-the `StatefulSet` controller rolls it like any pod-template change, which
-is precisely the mixed-version window that is unsupported before Phase 3.
-Treat `spec.image` changes as unsupported until the operator orchestrates
-upgrades (Phase 3), or recreate the `AnimusCluster`. (Earlier text claimed
-an image change was "either rejected by the operator's own validation or
-requires recreating the cluster"; the validation half was never true.)
+pod-by-pod mix of versions.
+
+*Amendment, 2026-10-03.* This section used to record that the operator did
+**not** enforce that: a `spec.image` edit was accepted, and the
+`StatefulSet`'s default `RollingUpdate` rolled it one pod at a time — exactly
+the unsupported mixed-version window. It now does:
+
+- **Rule.** On an UPDATE, the *effective* image (`spec.image`, or
+  `AnimusClusterSpec::DEFAULT_IMAGE` when unset — the same resolution
+  `desired::statefulset::build` renders with) must equal the previous one,
+  so `None` ↔ the explicit default is a no-op, not a change. CREATE is
+  unaffected. The rule is `validate::image_change_rejection`, run by
+  `validate_spec` (the admission webhook, ADR 0070, and nothing else) and
+  by the reconciler's fallback for clusters installed without the webhook:
+  the reconciler compares `spec.image` to the image the live `StatefulSet`'s
+  `animusd` container actually runs, sets the `ImageChangeRejected`
+  condition, and reconciles everything else with the *running* image pinned
+  (so a rejected edit never rolls a pod); the condition clears when the spec
+  matches again. The error names the old and new image and points here.
+- **The manual procedure (whole-cluster stop → upgrade → restart).** Delete
+  the `AnimusCluster` and re-create it, identical but for `spec.image`
+  (same `name`, `nodes`, `controlNodes`, storage, TLS/S3/encryption
+  settings). Deleting the CR garbage-collects the `StatefulSet` and every
+  other child (all pods stop together); the per-pod `PersistentVolumeClaim`s
+  (`data-<name>-<ordinal>`) are **not** owned by the CR and the operator sets
+  no `persistentVolumeClaimRetentionPolicy`, so Kubernetes' default
+  (`whenDeleted: Retain`, `whenScaled: Retain`) leaves them in place, and the
+  re-created `StatefulSet` re-attaches them by name, with every pod then
+  starting on the new image against its existing on-disk state — the
+  supported, upgrade-tested restart-on-existing-data path (ADR 0073). **Do
+  not delete the PVCs, and do not use `storage.ephemeral: true` clusters
+  (an `emptyDir` is wiped: nothing survives).** Caveats: this was verified by
+  reading the code (PVC ownership, retention policy, the `volumeClaimTemplates`
+  naming, `cluster.json` being regenerated from the spec on re-create), **not**
+  by an automated test — `scripts/e2e-kind.sh` only proves that CR deletion
+  garbage-collects the `StatefulSet`, never a delete/re-create on retained
+  PVCs; the cluster is fully unavailable for the duration; and the re-created
+  spec must keep the original `controlNodes` (the role split is positional:
+  the first `controlNodes` ordinals are control voters). There is no safe
+  in-place alternative without operator support.
+- **Next step in the stack:** the follow-up PR switches the `StatefulSet`
+  to `updateStrategy: OnDelete` and has the operator orchestrate the
+  whole-cluster restart itself (stop every pod, then start them all on the
+  new image), at which point this rejection is relaxed to "an image change
+  triggers the orchestrated restart" and the manual delete/re-create above
+  becomes unnecessary.
+
+True rolling upgrades remain gated on ADR 0073 Phases 2 and 3.
 
 ### End-to-end testing
 

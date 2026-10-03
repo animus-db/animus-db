@@ -534,8 +534,10 @@
         bootstrap, scale, delete — on every change to this surface. Kubernetes' own rolling
         update would replace pods one at a time on an image change, but AnimusDB does not yet
         support running two versions in one cluster (no wire compatibility, no rolling
-        upgrades), so the operator does not orchestrate upgrades: the supported path is a
-        whole-cluster stop, upgrade and restart.
+        upgrades), so the operator rejects a change to <code>spec.image</code> on an existing
+        cluster and does not orchestrate upgrades yet: the supported path is a whole-cluster
+        stop, upgrade and restart (delete the <code>AnimusCluster</code>, keeping its
+        <code>PersistentVolumeClaim</code>s, and re-create it with the new image).
       </p>
     </section>
 

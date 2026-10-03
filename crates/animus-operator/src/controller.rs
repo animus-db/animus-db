@@ -34,10 +34,11 @@ use crate::crd::{
     AnimusCluster, AnimusClusterStatus, CONDITION_CONTROL_NODES_GROWING,
     CONDITION_CONTROL_NODES_SHRINK_REJECTED, CONDITION_DRAIN_FAILED,
     CONDITION_ENCRYPTION_KEY_SECRET_INVALID, CONDITION_EPHEMERAL_VOTER_STORAGE_HAZARD,
-    CONDITION_EPHEMERAL_VOTER_STORAGE_REJECTED, CONDITION_NODES_SPEC_INVALID,
-    CONDITION_S3_SPEC_INVALID, CONDITION_SCALE_BELOW_CONTROL_NODES_REFUSED,
-    CONDITION_SCHEMA_VERSION_INVALID, CONDITION_STORE_SPEC_INVALID, CONDITION_TLS_SPEC_INVALID,
-    ClusterCondition, ClusterPhase, ConditionStatus,
+    CONDITION_EPHEMERAL_VOTER_STORAGE_REJECTED, CONDITION_IMAGE_CHANGE_REJECTED,
+    CONDITION_NODES_SPEC_INVALID, CONDITION_S3_SPEC_INVALID,
+    CONDITION_SCALE_BELOW_CONTROL_NODES_REFUSED, CONDITION_SCHEMA_VERSION_INVALID,
+    CONDITION_STORE_SPEC_INVALID, CONDITION_TLS_SPEC_INVALID, ClusterCondition, ClusterPhase,
+    ConditionStatus,
 };
 use crate::desired;
 use crate::validate;
@@ -147,6 +148,25 @@ async fn apply_children<C: ClusterApi>(
     let applied = cluster_api.apply_statefulset(ns, &sts).await?;
 
     Ok(applied)
+}
+
+/// The image the live `StatefulSet`'s `animusd` container is configured with,
+/// or `None` on a fresh cluster (no `StatefulSet` yet) or one whose
+/// `StatefulSet` has no such container. Source of truth for the reconciler's
+/// `spec.image` change rejection (see its call site).
+async fn applied_image<C: ClusterApi>(
+    cluster_api: &C,
+    ns: &str,
+    name: &str,
+) -> Result<Option<String>, ReconcileError> {
+    let Some(sts) = cluster_api.get_statefulset(ns, name).await? else {
+        return Ok(None);
+    };
+    Ok(sts
+        .spec
+        .and_then(|s| s.template.spec)
+        .and_then(|p| p.containers.into_iter().find(|c| c.name == "animusd"))
+        .and_then(|c| c.image))
 }
 
 /// The `spec.controlNodes` value the *previous* reconcile actually applied
@@ -1024,6 +1044,47 @@ async fn reconcile<C: ClusterApi, A: AdminOps>(
     status
         .conditions
         .retain(|c| c.type_ != CONDITION_EPHEMERAL_VOTER_STORAGE_REJECTED);
+
+    // `spec.image` may not change on a running cluster (ADR 0060 "Upgrades",
+    // 2026-10-03 amendment; ADR 0073 — no mixed-version window, so no
+    // StatefulSet rolling update across versions). **The webhook rejects
+    // this at write time when installed** (`validate::validate_spec`, via
+    // the same `validate::image_change_rejection`); this is the fallback for
+    // a cluster installed without it. The source of truth is the image the
+    // live `StatefulSet`'s `animusd` container actually runs (the analogue of
+    // `previous_applied_control_nodes`'s ConfigMap read), not the previous CR
+    // spec. "Pin and continue": reconcile everything else with the running
+    // image, so the rejected edit never rolls a pod.
+    let cluster = match applied_image(&ctx.cluster_api, &ns, &name).await? {
+        Some(running)
+            if validate::image_change_rejection(&running, cluster.spec.image_or_default())
+                .is_some() =>
+        {
+            let violation =
+                validate::image_change_rejection(&running, cluster.spec.image_or_default())
+                    .expect("guard above just proved this is Some");
+            warn!(
+                cluster = %name,
+                running_image = %running,
+                requested_image = %cluster.spec.image_or_default(),
+                "refusing spec.image change on a running cluster"
+            );
+            set_condition(
+                &mut status,
+                CONDITION_IMAGE_CHANGE_REJECTED,
+                violation.message,
+            );
+            let mut pinned = (*cluster).clone();
+            pinned.spec.image = Some(running);
+            Arc::new(pinned)
+        }
+        _ => {
+            status
+                .conditions
+                .retain(|c| c.type_ != CONDITION_IMAGE_CHANGE_REJECTED);
+            cluster
+        }
+    };
 
     // Validate `spec.tls` (ADR 0064 commit 3). **The validating webhook
     // (`crate::webhook`, S-07e/ADR 0070) rejects this at write time when
@@ -3057,6 +3118,107 @@ mod tests {
                 .iter()
                 .any(|c| c.type_ == CONDITION_EPHEMERAL_VOTER_STORAGE_REJECTED),
             "the rejected condition must clear once the spec is fixed: {:?}",
+            status.conditions
+        );
+    }
+
+    /// ADR 0060 "Upgrades" (2026-10-03): a `spec.image` edit on a running
+    /// cluster is refused by the reconciler fallback — the StatefulSet keeps
+    /// the running image (no rolling update), every other field still
+    /// reconciles, and the condition clears when the edit is reverted. A
+    /// `None` -> explicit-default normalisation is not a change.
+    #[tokio::test]
+    async fn reconcile_rejects_image_change_pins_running_image_then_clears() {
+        let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
+        let image_of = |sts: &StatefulSet| {
+            sts.spec
+                .as_ref()
+                .unwrap()
+                .template
+                .spec
+                .as_ref()
+                .unwrap()
+                .containers[0]
+                .image
+                .clone()
+        };
+        let mut cluster = test_cluster("demo", "ns1", 3, Some(3));
+        cluster.spec.image = Some("example/animusd:v1".to_string());
+        reconcile(Arc::new(cluster.clone()), Arc::clone(&ctx))
+            .await
+            .unwrap();
+        let mut status = ctx.cluster_api.last_status().unwrap();
+        assert!(
+            !status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_IMAGE_CHANGE_REJECTED)
+        );
+
+        // Image bump plus an unrelated edit (nodes 3 -> 4).
+        let mut bumped = cluster.clone();
+        bumped.status = Some(status.clone());
+        bumped.spec.image = Some("example/animusd:v2".to_string());
+        bumped.spec.nodes = 4;
+        reconcile(Arc::new(bumped), Arc::clone(&ctx)).await.unwrap();
+        status = ctx.cluster_api.last_status().unwrap();
+        let cond = status
+            .conditions
+            .iter()
+            .find(|c| c.type_ == CONDITION_IMAGE_CHANGE_REJECTED)
+            .unwrap_or_else(|| panic!("{:?}", status.conditions));
+        let msg = cond.message.as_deref().unwrap_or_default();
+        assert!(msg.contains("ADR 0060"), "{msg}");
+        let sts = ctx
+            .cluster_api
+            .get_statefulset("ns1", "demo")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(image_of(&sts).as_deref(), Some("example/animusd:v1"));
+        assert_eq!(
+            sts.spec.as_ref().unwrap().replicas,
+            Some(4),
+            "other fields still converge"
+        );
+
+        // Revert: condition clears.
+        let mut reverted = cluster.clone();
+        reverted.status = Some(status);
+        reverted.spec.nodes = 4;
+        reconcile(Arc::new(reverted), Arc::clone(&ctx))
+            .await
+            .unwrap();
+        let status = ctx.cluster_api.last_status().unwrap();
+        assert!(
+            !status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_IMAGE_CHANGE_REJECTED),
+            "{:?}",
+            status.conditions
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_treats_none_to_explicit_default_image_as_no_change() {
+        let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
+        let cluster = test_cluster("demo", "ns1", 3, Some(3));
+        reconcile(Arc::new(cluster.clone()), Arc::clone(&ctx))
+            .await
+            .unwrap();
+        let mut explicit = cluster;
+        explicit.spec.image = Some(AnimusClusterSpec::DEFAULT_IMAGE.to_string());
+        reconcile(Arc::new(explicit), Arc::clone(&ctx))
+            .await
+            .unwrap();
+        let status = ctx.cluster_api.last_status().unwrap();
+        assert!(
+            !status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_IMAGE_CHANGE_REJECTED),
+            "{:?}",
             status.conditions
         );
     }

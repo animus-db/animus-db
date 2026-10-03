@@ -429,6 +429,34 @@ mod tests {
         assert!(resp.allowed, "{:?}", resp.result);
     }
 
+    #[test]
+    fn an_update_changing_the_image_is_denied_but_create_with_an_image_is_allowed() {
+        let old = cluster(spec(3, None));
+        let mut new_spec = spec(3, None);
+        new_spec.image = Some("example/animusd:v2".to_string());
+        let out = handle_review(review(
+            Operation::Update,
+            Some(cluster(new_spec.clone())),
+            Some(old),
+            animuscluster_gvk(),
+        ));
+        let resp = out.response.expect("response set");
+        assert!(!resp.allowed);
+        assert!(
+            resp.result.message.contains("spec.image"),
+            "{}",
+            resp.result.message
+        );
+
+        let out = handle_review(review(
+            Operation::Create,
+            Some(cluster(new_spec)),
+            None,
+            animuscluster_gvk(),
+        ));
+        assert!(out.response.expect("response set").allowed);
+    }
+
     fn ephemeral_spec(nodes: i32, control_nodes: Option<i32>) -> AnimusClusterSpec {
         let mut s = spec(nodes, control_nodes);
         s.storage.ephemeral = Some(true);

@@ -148,6 +148,42 @@ pub fn control_nodes_regression(prior: i32, target: i32) -> Option<Violation> {
     }
 }
 
+/// `spec.image` (resolved against [`AnimusClusterSpec::DEFAULT_IMAGE`], the
+/// same resolution `desired::statefulset::build` renders with) may not
+/// change on an existing cluster (ADR 0060 "Upgrades", 2026-10-03
+/// amendment). `prior` is the previously-accepted *effective* image,
+/// `target` the newly-requested one. Comparing effective values means
+/// `None` -> `Some(<the default>)` (and back) is a no-op normalisation, not
+/// a change.
+///
+/// Why: ADR 0073 Phase 1 supports only a whole-cluster stop -> upgrade ->
+/// restart; mixed-version wire and rolling upgrades are not supported
+/// (Phases 2/3), and a `StatefulSet`'s default `RollingUpdate` would roll a
+/// new image one pod at a time, which is exactly that unsupported mixed
+/// window. Shared by [`validate_spec`] (fed the old spec's effective image
+/// on an UPDATE review) and `crate::controller::reconcile`'s fallback (fed
+/// the image the live `StatefulSet` actually runs, for a cluster installed
+/// without the webhook). Lifted by the follow-up that makes the operator
+/// orchestrate a whole-cluster restart.
+#[must_use]
+pub fn image_change_rejection(prior: &str, target: &str) -> Option<Violation> {
+    if prior == target {
+        None
+    } else {
+        Some(Violation {
+            field: "spec.image",
+            message: format!(
+                "spec.image changed from {prior} to {target} — changing the image of a running \
+                 cluster is rejected: AnimusDB does not support mixed-version clusters or \
+                 rolling upgrades yet (ADR 0073), and a StatefulSet rolling update would run \
+                 two versions at once. Upgrade with a whole-cluster stop, upgrade and restart \
+                 instead (ADR 0060, \"Upgrades\": delete the AnimusCluster, keeping its \
+                 PersistentVolumeClaims, and re-create it with the new image)"
+            ),
+        })
+    }
+}
+
 /// `spec.storage.ephemeral: true` together with a resolved `spec.
 /// controlNodes` above `1` is rejected outright (issue #989, ADR 0060's
 /// 2026-09-19 amendment to its own
@@ -211,6 +247,8 @@ pub fn validate_ephemeral_voters(new: &AnimusClusterSpec) -> Option<Violation> {
 ///   resolved value, when `old` is given ([`control_nodes_regression`]) —
 ///   `None` on a CREATE review, or when the reconciler has no previously-
 ///   applied `ConfigMap` yet.
+/// - `spec.image` (resolved against its default) never changes from `old`'s
+///   own resolved value, when `old` is given ([`image_change_rejection`]).
 /// - `spec.storage.ephemeral: true` requires `spec.controlNodes` (resolved)
 ///   `<= 1` ([`validate_ephemeral_voters`]) — checked on every CREATE and
 ///   UPDATE, so flipping an existing multi-voter cluster to ephemeral, or
@@ -240,6 +278,10 @@ pub fn validate_spec(
         violations.extend(control_nodes_regression(
             old.control_nodes_or_default(),
             new.control_nodes_or_default(),
+        ));
+        violations.extend(image_change_rejection(
+            old.image_or_default(),
+            new.image_or_default(),
         ));
     }
     violations.extend(validate_ephemeral_voters(new));
@@ -525,8 +567,60 @@ mod tests {
     fn update_keeping_a_single_ephemeral_voter_with_other_edits_is_allowed() {
         let old = ephemeral_spec(3, Some(1));
         let mut new = ephemeral_spec(5, Some(1));
-        new.image = Some("ghcr.io/animus-db/animusd:v2".to_string());
+        new.base_port = Some(9100);
         assert_eq!(validate_spec(Some(&old), &new), Ok(()));
+    }
+
+    #[test]
+    fn update_changing_the_image_is_rejected_with_a_pointer_to_the_procedure() {
+        let old = base_spec(3, None);
+        let mut new = base_spec(3, None);
+        new.image = Some("ghcr.io/animus-db/animusd:v2".to_string());
+        let violations = validate_spec(Some(&old), &new).unwrap_err();
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert_eq!(violations[0].field, "spec.image");
+        let msg = &violations[0].message;
+        assert!(msg.contains(AnimusClusterSpec::DEFAULT_IMAGE), "{msg}");
+        assert!(msg.contains("ghcr.io/animus-db/animusd:v2"), "{msg}");
+        assert!(msg.contains("whole-cluster stop"), "{msg}");
+        assert!(msg.contains("ADR 0060"), "{msg}");
+        assert!(msg.contains("Upgrades"), "{msg}");
+    }
+
+    #[test]
+    fn update_between_two_explicit_images_is_rejected() {
+        let mut old = base_spec(3, None);
+        old.image = Some("example/animusd:v1".to_string());
+        let mut new = base_spec(3, None);
+        new.image = Some("example/animusd:v2".to_string());
+        assert!(validate_spec(Some(&old), &new).is_err());
+    }
+
+    #[test]
+    fn update_leaving_the_image_unchanged_is_allowed() {
+        let mut old = base_spec(3, None);
+        old.image = Some("example/animusd:v1".to_string());
+        let mut new = base_spec(5, None);
+        new.image = Some("example/animusd:v1".to_string());
+        assert_eq!(validate_spec(Some(&old), &new), Ok(()));
+    }
+
+    #[test]
+    fn update_normalising_none_to_the_explicit_default_image_is_allowed() {
+        let old = base_spec(3, None);
+        assert!(old.image.is_none());
+        let mut new = base_spec(3, None);
+        new.image = Some(AnimusClusterSpec::DEFAULT_IMAGE.to_string());
+        assert_eq!(validate_spec(Some(&old), &new), Ok(()));
+        // ... and back again.
+        assert_eq!(validate_spec(Some(&new), &old), Ok(()));
+    }
+
+    #[test]
+    fn create_with_any_image_is_unaffected_by_the_image_rule() {
+        let mut spec = base_spec(3, None);
+        spec.image = Some("example/animusd:v7".to_string());
+        assert_eq!(validate_spec(None, &spec), Ok(()));
     }
 
     #[test]
