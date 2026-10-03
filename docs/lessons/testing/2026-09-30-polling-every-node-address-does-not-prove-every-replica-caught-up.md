@@ -25,5 +25,5 @@ poll samples whoever answered that instant, not every replica.
 - Do not widen the poll, retry the walk or relax the assertion: the walk is meaningful only over
   converged replicas. Only an *eventual data read* has this hazard: `*_everywhere` helpers that poll
   replicated control-plane `Metadata` (e.g. `dynamo_streams`'s stream-label poll) do not. The
-  SimCluster suite `src/sim_cluster_dynamo_query_pagination.rs` has the same per-node-poll-then-
-  rotating-walk shape and no per-replica equivalent yet.
+  SimCluster twin is `SimCluster::await_replicas_caught_up` (#1129), called by
+  `src/sim_cluster_dynamo_query_pagination.rs` between the per-node poll and the walk.

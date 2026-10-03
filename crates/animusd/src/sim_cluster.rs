@@ -1191,6 +1191,25 @@ impl SimClusterHandle {
             .collect()
     }
 
+    /// Per-replica progress of every CP group `node` hosts, read straight off
+    /// its `RaftKvNode`s: `(tablet, commit_index, engine_applied_index,
+    /// voter count)`. Input to [`SimCluster::await_replicas_caught_up`].
+    pub(crate) fn replica_progress(&self, node: u64) -> Vec<(TabletId, u64, u64, usize)> {
+        self.ctx(node)
+            .edge
+            .hosted_groups()
+            .into_iter()
+            .map(|(t, g)| {
+                (
+                    t,
+                    g.commit_index(),
+                    g.engine_applied_index(),
+                    g.config().len(),
+                )
+            })
+            .collect()
+    }
+
     /// Resolve a CP route for `(table, key)` from `node`'s own `ClientCtx`
     /// (`ClientCtx::cp_route`) directly — issue #950's regression drives
     /// this instead of a full [`put`](Self::put) so it can measure the
@@ -3180,6 +3199,75 @@ impl SimCluster {
     /// assert on tablet placement / schema visibility per node.
     pub(crate) fn metadata(&self, node: u64) -> Metadata {
         self.shared.metadata(node)
+    }
+
+    /// Whether **every replica of every tablet** hosted across the cluster's
+    /// nodes has its own engine caught up to the highest commit index any
+    /// replica of that tablet reports, with every voter actually reporting
+    /// (a tablet with fewer reporting replicas than voters is a replica not
+    /// hosted yet). `Err` carries a per-replica dump for the timeout message.
+    /// Covers GSI/LSI rows too: index rows live in their base tablet's own
+    /// engine, so they are not separate Raft groups.
+    fn replicas_caught_up(&self) -> Result<(), String> {
+        /// `(max commit, per-node (node, applied), max voter count)`.
+        type TabletProgress = (u64, Vec<(u64, u64)>, usize);
+        // tablet -> (max commit, per-node applied, max voter count)
+        let mut tablets: BTreeMap<TabletId, TabletProgress> = BTreeMap::new();
+        for node in 0..self.node_count() as u64 {
+            for (t, commit, applied, voters) in self.shared.replica_progress(node) {
+                let e = tablets.entry(t).or_insert((0, Vec::new(), 0));
+                e.0 = e.0.max(commit);
+                e.1.push((node, applied));
+                e.2 = e.2.max(voters);
+            }
+        }
+        let behind: Vec<String> = tablets
+            .iter()
+            .filter(|(_, (commit, applied, voters))| {
+                *voters == 0 || applied.len() < *voters || applied.iter().any(|(_, a)| a < commit)
+            })
+            .map(|(t, (commit, applied, voters))| {
+                format!("{t:?}: max_commit={commit} voters={voters} applied(node,idx)={applied:?}")
+            })
+            .collect();
+        if tablets.is_empty() {
+            Err("no tablet hosted anywhere".to_owned())
+        } else if behind.is_empty() {
+            Ok(())
+        } else {
+            Err(behind.join("; "))
+        }
+    }
+
+    /// Converged-or-timeout poll (virtual time, 50ms steps, 20s budget)
+    /// until [`replicas_caught_up`](Self::replicas_caught_up): every
+    /// replica's own `engine_applied_index` >= its tablet's highest
+    /// `commit_index`. The `SimCluster` twin of the real-socket
+    /// `tests/support::await_replicas_caught_up` (#1128).
+    ///
+    /// Needed before any multi-node / rotating-replica **eventual**
+    /// (`ConsistentRead: false`) read walk: polling each node's *address*
+    /// proves only that whichever replica answered was complete then. The
+    /// ADR 0055 gate (`stale_read_ready`) is replica-local
+    /// (`engine_applied >= own commit_index`), and a follower learns the
+    /// commit index only from the leader's next AppendEntries, so it can
+    /// pass the gate one entry behind and serve a short page. See
+    /// `docs/lessons/testing/2026-09-30-polling-every-node-address-does-
+    /// not-prove-every-replica-caught-up.md`. Reads node state directly, not
+    /// via `/admin/raftkv`, so it burns no `OP_BUDGET`.
+    pub(crate) fn await_replicas_caught_up(&mut self, what: &str) {
+        let mut last = String::new();
+        for _ in 0..400 {
+            match self.replicas_caught_up() {
+                Ok(()) => return,
+                Err(dump) => last = dump,
+            }
+            self.run_for(Duration::from_millis(50));
+        }
+        panic!(
+            "{what}: replicas never caught up to their tablet's commit index (seed={}): {last}",
+            self.seed()
+        );
     }
 
     /// [`SimClusterHandle::hosted_tablets`]'s own driver-callable twin.
