@@ -58,22 +58,18 @@ hook re-injects a summary at boot; treat a violation like a failed gate.
    or the maintainer has overridden the objection explicitly and
    deliberately, in so many words. A silent bypass is a gate violation.
 
-5. **Independent work runs in a separate session, one session per
-   workstream.** A session is one container: one 4-core CPU budget and one
-   `CARGO_TARGET_DIR`, and more than two concurrent test gates on it produce
-   spurious `ProdEnv` timeouts that read like real failures (and a stale
-   binary served from the shared target dir can even run another worktree's
-   test). So a session keeps only work that is *entangled* — a stacked
-   series and the defects that gate it — and runs at most two heavy agents
-   at a time. Anything independent (the next unrelated issues on a backlog,
+5. **No sub-sessions.** Never create a new session (`create_session`) or
+   otherwise spawn sibling sessions to farm out work — maintainer
+   instruction, 2026-10-03, superseding the earlier "one session per
+   workstream" split. A session is still one container: one 4-core CPU
+   budget and one `CARGO_TARGET_DIR`, and more than two concurrent test
+   gates on it produce spurious `ProdEnv` timeouts that read like real
+   failures — so run at most two heavy agents at a time. Work that is
+   independent of the current task (the next unrelated issues on a backlog,
    or a pre-existing defect discovered mid-task that does not gate the
-   current PR) is launched in a **new session in the same environment**
-   (`create_session`), briefed with its scope, an explicit do-not-touch list
-   of what the parent owns, the mechanics that session needs (PR creation,
-   gates, worktrees, the no-AI-attribution rule for commits and PRs), and the
-   instruction to report to the maintainer in its own chat. The parent
-   session never launches backlog work after the split, and the split is a
-   normal step, not an exception to announce.
+   current PR) is **filed as a GitHub issue** (scope, failing test,
+   seed/log, what is known) and reported to the maintainer, not launched
+   in a separate session.
 
 
 
