@@ -3123,6 +3123,21 @@ impl SimCluster {
         self.shared.ctx(node).control.config()
     }
 
+    /// **ADR 0073 Phase 2 (P2-A), residual risk #1**: a snapshot of `node`'s
+    /// own control `RaftNode`'s leader-local version observation table
+    /// (`RaftNode::version_observations`) — what that node has heard of every
+    /// peer's advertised range/build off its inbound control envelopes.
+    /// Meaningful on the control leader. `node` must be control-bearing.
+    pub(crate) fn control_version_observations(
+        &self,
+        node: u64,
+    ) -> BTreeMap<NodeId, animus_control::version_observe::VersionObservation> {
+        let idx = self
+            .control_index_of(node)
+            .unwrap_or_else(|| panic!("node {node} is not control-bearing"));
+        self.controls[idx].version_observations()
+    }
+
     /// **C-13 / ADR 0061 rung M PR 6**: `(commit_index, engine_applied_index)`
     /// read directly off `node`'s own local control `RaftNode<SimEnv>` —
     /// bypasses the `/admin/raft` HTTP-JSON round trip entirely (unlike
