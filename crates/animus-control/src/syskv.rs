@@ -214,6 +214,14 @@ pub enum EntityKind {
     /// identical identity discipline [`Export`](Self::Export) uses. The
     /// value is the JSON-encoded `ImportRow`.
     Import,
+    /// A node's replicated version record (`Metadata::node_versions`, ADR
+    /// 0073 Phase 2, P2-A), keyed by its [`NodeId`] ([`node_version_key`]).
+    /// The value is the JSON-encoded `NodeVersion`. **Era-only**: never
+    /// written before the first `ReportNodeVersion`, and a Phase 1 reader
+    /// ignores an unknown kind (`decode_key` returns `None`), so adding it
+    /// leaves every era-0 mirror byte-identical. The cluster version itself
+    /// rides [`Counter`](Self::Counter) as `mirror::CLUSTER_VERSION_COUNTER`.
+    NodeVersion,
 }
 
 impl EntityKind {
@@ -243,6 +251,7 @@ impl EntityKind {
             EntityKind::Credential => "credential",
             EntityKind::Export => "export",
             EntityKind::Import => "import",
+            EntityKind::NodeVersion => "node_version",
         }
     }
 
@@ -273,6 +282,7 @@ impl EntityKind {
             b"credential" => EntityKind::Credential,
             b"export" => EntityKind::Export,
             b"import" => EntityKind::Import,
+            b"node_version" => EntityKind::NodeVersion,
             _ => return None,
         })
     }
@@ -363,6 +373,12 @@ pub fn tablet_key(id: TabletId) -> Vec<u8> {
 #[must_use]
 pub fn member_key(id: &NodeId) -> Vec<u8> {
     entity_key(EntityKind::Member, id.as_str().as_bytes())
+}
+
+/// A [`NodeId`]'s key under [`EntityKind::NodeVersion`] (ADR 0073 Phase 2).
+#[must_use]
+pub fn node_version_key(id: &NodeId) -> Vec<u8> {
+    entity_key(EntityKind::NodeVersion, id.as_str().as_bytes())
 }
 
 /// A table name's key under [`EntityKind::Schema`].
@@ -664,7 +680,7 @@ mod tests {
     // `Restore` — pre-existing drift from `EntityKind`'s real variant count,
     // out of this change's scope to backfill (see `docs/engineering-
     // lessons.md`). The two kinds this PR adds ARE included below.
-    const ALL_KINDS: [EntityKind; 10] = [
+    const ALL_KINDS: [EntityKind; 11] = [
         EntityKind::Tablet,
         EntityKind::Member,
         EntityKind::Schema,
@@ -675,6 +691,7 @@ mod tests {
         EntityKind::IndexBackfill,
         EntityKind::PitrSegment,
         EntityKind::PitrBaseBackup,
+        EntityKind::NodeVersion,
     ];
 
     // --- reserved-name guard -------------------------------------------------

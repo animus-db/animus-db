@@ -236,7 +236,9 @@ fn newest_fixture_version(dir: &Path) -> u32 {
             .unwrap_or_default();
         let v: u32 = name
             .strip_prefix('v')
-            .and_then(|s| s.split('.').next())
+            // `vN.ext`, or `vN-<shape>.ext` (ADR 0073 Phase 2's gated
+            // additive field, e.g. `metadata/v1-era.json`).
+            .and_then(|s| s.split(['.', '-']).next())
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(|| {
                 panic!("unexpected fixture file name {name:?} in {}", dir.display())

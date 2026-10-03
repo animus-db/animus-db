@@ -25,6 +25,7 @@ use crate::schema::{
     IndexDef, IndexStatus, PitrSpec, ProvisionedThroughput, SchemaCatalog, StreamSpec,
     StreamViewType, TableName, TableSchema, TtlSpec,
 };
+use crate::version::{ClusterVersion, NodeVersion, VersionRange};
 
 /// The default a [`StreamShardRow`]/[`MetaCommand::SealStreamShard`]'s
 /// `view_type` field decodes to when loading a snapshot encoded before this
@@ -545,6 +546,32 @@ pub struct Metadata {
     /// keeps pre-import snapshots loading (empty map).
     #[serde(default)]
     pub imports: BTreeMap<ImportId, ImportRow>,
+    /// **Per-node version record** (ADR 0073 Phase 2, P2-A), keyed by every
+    /// registered node (any role) that has reported via
+    /// [`MetaCommand::ReportNodeVersion`]. A separate map rather than
+    /// `Member` fields: `UpsertMember`'s apply replaces the whole `Member`
+    /// (a failure-detector flip would erase it), and control-only voters have
+    /// no `Member` row at all. The first report starts the era (by setting
+    /// [`cluster_version`](Self::cluster_version) to an explicit `1`; the era
+    /// marker is that field, not this map's emptiness).
+    /// `#[serde(default, skip_serializing_if)]` keeps
+    /// era-0 bytes identical to Phase 1's `"v": 1`. Pruned by
+    /// [`MetaCommand::RemoveMember`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub node_versions: BTreeMap<NodeId, NodeVersion>,
+    /// The raw replicated cluster version (ADR 0073 Phase 2): `0`/absent
+    /// means the era is off and reads as `1` — use
+    /// [`cluster_version`](Self::cluster_version). Also the sticky **era
+    /// marker** ([`versioning_active`](Self::versioning_active)): set to `1`
+    /// by the first applied `ReportNodeVersion`, raised only by
+    /// [`MetaCommand::FinalizeClusterVersion`], never reset. Skipped at
+    /// the default so era-0 bytes match Phase 1's.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub cluster_version: u32,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 impl Default for Metadata {
@@ -577,6 +604,8 @@ impl Default for Metadata {
             credentials: Default::default(),
             exports: Default::default(),
             imports: Default::default(),
+            node_versions: Default::default(),
+            cluster_version: 0,
         }
     }
 }
@@ -590,6 +619,36 @@ struct MetadataVersionPeek {
 }
 
 impl Metadata {
+    /// The active cluster version (ADR 0073 Phase 2): the raw field with
+    /// `0`/absent reading as `1`.
+    #[must_use]
+    pub fn cluster_version(&self) -> ClusterVersion {
+        self.cluster_version.max(1)
+    }
+
+    /// Whether the version era has started: the stored `cluster_version` is
+    /// non-zero. The era is **sticky**: the first applied
+    /// `ReportNodeVersion` sets the stored field to `1`, and nothing ever
+    /// resets it, so removing the last reporter cannot switch it off (a
+    /// Phase 1 binary could otherwise rejoin and wedge on era-only
+    /// entities/variants).
+    #[must_use]
+    pub fn versioning_active(&self) -> bool {
+        self.cluster_version != 0
+    }
+
+    /// Every node whose version must be known before the cluster version can
+    /// advance: `members` keys union `node_addrs` keys (control-only voters
+    /// have no `Member` row, only a `node_addrs` claim).
+    #[must_use]
+    pub fn required_version_set(&self) -> BTreeSet<NodeId> {
+        self.members
+            .keys()
+            .chain(self.node_addrs.keys())
+            .cloned()
+            .collect()
+    }
+
     /// Decode untrusted `serde_json` bytes as a [`Metadata`] (ADR 0073 Phase
     /// 0 workstream B): peeks the top-level `"v"` field first, distinguishing
     /// three cases before ever attempting the full decode:
@@ -2460,6 +2519,30 @@ pub enum MetaCommand {
         node: NodeId,
         addrs: NodeAddrs,
         labels: BTreeMap<String, String>,
+    },
+    /// **Era-only (ADR 0073 Phase 2, P2-A)**: record `node`'s supported
+    /// cluster-version range and build. Rejected if `node` is not in
+    /// [`Metadata::required_version_set`], if `range` is invalid
+    /// (empty/inverted/zero), or if `range` excludes the current cluster
+    /// version (a binary the cluster cannot run with must not be recorded as
+    /// fine; deliberately not conditional on the era, see the apply arm). Re-reporting an
+    /// identical record is a `NoOp`. **The first report starts the era.**
+    /// A new variant: a Phase 1 voter cannot decode it, so a proposer may
+    /// emit it only once the leader-local precondition has proven every
+    /// member is Phase 2.
+    ReportNodeVersion {
+        node: NodeId,
+        range: VersionRange,
+        build: String,
+    },
+    /// **Era-only (ADR 0073 Phase 2, P2-A)**: raise the cluster version one
+    /// step. Rejected unless the era is active, `expected` is the current
+    /// [`Metadata::cluster_version`] (a CAS), `target == expected + 1`, and
+    /// every node in the required set has a `node_versions` entry whose
+    /// range contains `target`. Apply never reads a feature gate.
+    FinalizeClusterVersion {
+        expected: ClusterVersion,
+        target: ClusterVersion,
     },
     /// Begin an on-demand backup (ADR 0059 §3/§4): mints a
     /// [`BackupStatus::Creating`] catalog row at `backup_id`. The manifest
@@ -5022,7 +5105,11 @@ impl Metadata {
                     // `Metadata` at all, so the caller (the orphan-sweep
                     // driver, or an admin action) must check it *before*
                     // ever proposing this command.
-                    if self.node_addrs.remove(node).is_some() {
+                    // A stray version record is dropped too, so a removed
+                    // node never blocks `FinalizeClusterVersion`.
+                    let had_addrs = self.node_addrs.remove(node).is_some();
+                    let had_version = self.node_versions.remove(node).is_some();
+                    if had_addrs || had_version {
                         return ApplyOutcome::Applied;
                     }
                     return ApplyOutcome::NoOp;
@@ -5035,6 +5122,67 @@ impl Metadata {
                 }
                 self.members.remove(node);
                 self.node_addrs.remove(node);
+                self.node_versions.remove(node);
+                ApplyOutcome::Applied
+            }
+            MetaCommand::ReportNodeVersion { node, range, build } => {
+                if !self.members.contains_key(node) && !self.node_addrs.contains_key(node) {
+                    return ApplyOutcome::Rejected("version report from an unregistered node");
+                }
+                if !range.is_valid() {
+                    return ApplyOutcome::Rejected("invalid version range (empty or inverted)");
+                }
+                // Unconditional (not only once the era is active): a binary
+                // whose range excludes the current cluster version halts at
+                // startup (ADR 0073 section 1), so it must never be
+                // recorded, era or not.
+                if !range.contains(self.cluster_version()) {
+                    return ApplyOutcome::Rejected(
+                        "version range excludes the current cluster version",
+                    );
+                }
+                let record = NodeVersion {
+                    range: *range,
+                    build: build.clone(),
+                };
+                if self.node_versions.get(node) == Some(&record) {
+                    return ApplyOutcome::NoOp;
+                }
+                self.node_versions.insert(node.clone(), record);
+                // The first applied report starts the (sticky) era.
+                if self.cluster_version == 0 {
+                    self.cluster_version = 1;
+                }
+                ApplyOutcome::Applied
+            }
+            MetaCommand::FinalizeClusterVersion { expected, target } => {
+                if !self.versioning_active() {
+                    return ApplyOutcome::Rejected("version era not active");
+                }
+                if *expected != self.cluster_version() {
+                    return ApplyOutcome::Rejected(
+                        "expected version is not the current cluster version",
+                    );
+                }
+                if expected.checked_add(1) != Some(*target) {
+                    return ApplyOutcome::Rejected("target must be exactly expected + 1");
+                }
+                for node in self.required_version_set() {
+                    match self.node_versions.get(&node) {
+                        None => {
+                            return ApplyOutcome::Rejected(
+                                "blocked: a registered node has not reported its version",
+                            );
+                        }
+                        Some(v) if !v.range.contains(*target) => {
+                            return ApplyOutcome::Rejected(
+                                "blocked: a registered node's range excludes the target version",
+                            );
+                        }
+                        Some(_) => {}
+                    }
+                }
+                self.cluster_version = *target;
                 ApplyOutcome::Applied
             }
             MetaCommand::RegisterNode {

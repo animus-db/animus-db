@@ -1158,6 +1158,12 @@ pub fn is_relayable_command(command: &MetaCommand) -> bool {
         MetaCommand::ExpireStreamShards { .. } => false,
         MetaCommand::ExpirePitrSegments { .. } => false,
         MetaCommand::RemoveMember { .. } => false,
+        // ADR 0073 Phase 2 (P2-A): version commands are era-only and not
+        // relayable for now; whether and how they relay (boot-time
+        // self-report from data-only nodes, admin Finalize) is decided by
+        // P2-B/P2-C per ADR 0073's P2-A implementation note 5.
+        MetaCommand::ReportNodeVersion { .. } => false,
+        MetaCommand::FinalizeClusterVersion { .. } => false,
         MetaCommand::CompleteBackup { .. } => false,
         MetaCommand::FailBackup { .. } => false,
         MetaCommand::DeleteBackup { .. } => false,
@@ -1716,6 +1722,15 @@ mod tests {
                 remove: false,
             },
             MetaCommand::RemoveMember { node: nid(1) },
+            MetaCommand::ReportNodeVersion {
+                node: nid(1),
+                range: animus_control::version::VersionRange::new(1, 1),
+                build: "t".to_string(),
+            },
+            MetaCommand::FinalizeClusterVersion {
+                expected: 1,
+                target: 2,
+            },
             MetaCommand::CompleteBackup {
                 backup_id: "b1".to_string(),
             },

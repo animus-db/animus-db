@@ -25,6 +25,8 @@
 //! - [`delta_ring`] — the apply task's bounded, per-node in-memory ring of
 //!   [`mirror::KeyWrite`] deltas (ADR 0038 PR5), the incremental half of
 //!   `WatchMetadata`'s reply (`RaftNode::watch_delta_since`).
+//! - [`version`] — cluster version, per-binary [`VersionRange`], feature
+//!   [`Gate`]s and the per-node [`ClusterFeatures`] handle (ADR 0073 Phase 2).
 //! - [`format`] — the shared tagged-envelope convention (ADR 0073 Phase 0
 //!   workstream B): [`format::FormatTag`]/[`format::FormatError`], the
 //!   binary [`format::wrap`]/[`format::unwrap`] envelope, and the
@@ -46,6 +48,7 @@ pub mod raft;
 pub mod schema;
 pub mod shared_wal;
 pub mod syskv;
+pub mod version;
 
 pub use delta_ring::DeltaRing;
 pub use detector::{FailureDetector, Liveness};
@@ -79,3 +82,4 @@ pub use raft::{
     RaftCore, RaftMsg, RemovalStats, Role, StateMachine,
 };
 pub use shared_wal::SharedWal;
+pub use version::{ClusterFeatures, ClusterVersion, Gate, NodeVersion, VersionRange};
