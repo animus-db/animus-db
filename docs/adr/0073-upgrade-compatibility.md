@@ -2076,3 +2076,76 @@ signal), and the previous-release `ProdEnv`/`kind` cross-version CI job.
    job (Phase 3) is the real proof.
 
 (All maintainer questions on this amendment are decided; none remain open.)
+
+### Amendment 2026-10-03 — P2-A implementation notes (corrections found in the code)
+
+These notes record where the Phase 2 design above was wrong or incomplete
+against `main` at `2e28aeb`, and how P2-A does it instead. They belong to the
+P2-A stack. Like the rest of P2-A, they ship in the P2-A + P2-B + P2-D
+release train.
+
+1. **The version record is a separate map, not `Member` fields.**
+   `Metadata.node_versions: BTreeMap<NodeId, NodeVersion { range:
+   VersionRange, build: String }>` (`#[serde(default, skip_serializing_if =
+   "BTreeMap::is_empty")]`) and `Metadata.cluster_version: u32`
+   (`#[serde(default, skip_serializing_if = ...)]`, where `0` or absent reads
+   as `1`). These replace `Member.version_range`/`Member.build`. There are
+   three reasons:
+   - `UpsertMember`'s apply replaces the whole `Member`, so every
+     failure-detector flip would erase a version field stored there.
+   - **Control-only voters have no `Member` row at all.** `RegisterNode`
+     with `role == "control"` creates only a `node_addrs` entry, so "every
+     row in `members`" missed them. A Phase 1 control-only voter would then
+     not block Finalize, yet it would wedge on the first gated variant.
+   - A new `Member` field touches ~120 struct literals across crates
+     outside P2-A.
+
+   **The required set** for precondition P, the era-start reports and
+   Finalize's apply check is therefore `members` ∪ `node_addrs` keys (every
+   registered node of any role). `RemoveMember` already prunes `node_addrs`,
+   and now prunes `node_versions` too.
+
+   `versioning_active()` is `!node_versions.is_empty()`. Era-0 bytes stay
+   identical to Phase 1's `"v": 1` (fixture `metadata/v1-era.json` is new,
+   and `v1.json` is untouched). The fixture test learns the `vN-<shape>.json`
+   naming, with one expected value per shape.
+2. **Observation covers every inbound control envelope, not only
+   `Heartbeat`.** Control-only nodes do not run `heartbeat_loop_live`.
+   - Each role does reach the leader on a connection it dialed itself, over
+     NHS1, never relayed:
+     - combined (incl. `--cluster N`, which uses real sockets between
+       in-process nodes) and data-only (incl. `--seed`/`join`): via
+       heartbeats;
+     - control voters and learners: via their Raft traffic.
+   - The leader keys its table by `Envelope.from`. A SimEnv test per role
+     pins this (residual risk #1).
+3. **The mirror does not panic on an unknown entity kind.**
+   `syskv::decode_key` returns `None` for an unknown kind and `apply_put`
+   skips it, and an unknown counter id is ignored as well. Only a changed
+   *shape* of an existing kind hits the `expect`s. P still covers every
+   registered node, because data-only nodes also decode control-plane
+   relays.
+4. **Plumbing the design did not name** (all in `animus-env`/`animus-sim`):
+   - `ProdEnv` gets a setter for its own `ext` (today
+     `Preamble::for_protocol` hardcodes it empty).
+   - The accept path keeps the peer preamble and stamps
+     `Envelope.peer_ext` (one shared buffer per connection).
+   - A `check_peer_ext(own, peer)` beside `check_peer` adds the
+     disjoint-range refusal. It uses a TLV parser local to `animus-env`, so
+     `animus-env` still does not depend on `animus-control`.
+   - A `Network::set_require_peer_ext(bool)` hook (default no-op;
+     `ProdEnv`, `SimEnv` and `EncryptedEnv` implement or forward it) is
+     what the control apply task flips when `versioning_active()` becomes
+     true. That is the era-on refusal of empty-`ext` peers.
+   - `SimEnv` gains `set_network_ext_for(node, ext)`.
+   - **Wiring `animusd` to give each `ProdEnv` its `ext`, and its CHS1
+     sites, is P2-C**, so P2-A on its own changes no byte on any wire.
+5. **`animus-node` gets one minimal edit.** `is_relayable_command` is an
+   exhaustive match, so the two new `MetaCommand` variants need an arm for
+   the workspace to compile. P2-A adds them as **not relayable**. P2-B/P2-C
+   decide relay (boot-time self-report from data-only nodes; admin Finalize).
+6. **The startup range check halts the node, not the process.** In
+   `animus-control`, a node whose range excludes `cluster_version` (at the
+   seed and on snapshot install) halts its `RaftNode` with a named
+   `halt_reason`. Turning that into the named process exit is `animusd`
+   wiring (P2-C).
