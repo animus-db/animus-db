@@ -1519,7 +1519,7 @@ rows this section used to carry were fixed by the stale-prose sweep.
   amendment's own "what remains unowned" accounting and `crates/animusd/
   CLAUDE.md`'s consolidated closed-C-15 appendix.
 
-### C-16 Upgrade compatibility (ADR 0073) — Phases 0 and 1 done; Phase 2 next
+### C-16 Upgrade compatibility (ADR 0073) — Phases 0 and 1 done; Phase 2 design in review
 
 - **Gap (closed):** `website/index.html` listed "On-disk format stability,
   then rolling upgrades" as Planned with no ADR, roadmap entry, or issue
@@ -1584,7 +1584,10 @@ rows this section used to carry were fixed by the stale-prose sweep.
   rolling upgrades. The first real format bumps have landed
   (CWL/SWL v2 WAL sync markers, #1140/#1141, plus `raftkv-wal` v2), and the
   harness transcodes them to v1 for real; every other format is still v1. **Next: Phase 2** (replicated cluster version /
-  feature gate), then Phase 3. Phase 4 (lifting/rewriting root `CLAUDE.md`'s
+  feature gate; **design in review 2026-10-03**, ADR 0073's "Phase 2 design"
+  amendment: workstreams P2-A..P2-D, knob `ANIMUS_UPGRADE_SEEDS`, no rollback
+  once a node has run the new binary; rolling-installable from today's
+  Phase 1 binaries, never a stop-the-world step), then Phase 3. Phase 4 (lifting/rewriting root `CLAUDE.md`'s
   no-back-compat rule) is **already done** by this same maintainer
   decision — root `CLAUDE.md` now states the staged ratchet directly.
 - **Reuse:** the magic (4-byte ASCII) + `u8` version + loud named error
@@ -1614,8 +1617,8 @@ rows this section used to carry were fixed by the stale-prose sweep.
   its orchestration primitives, and on ADR 0060 for the operator's own
   `spec.image` handling.
 - **Status:** Phase 0 done (workstreams A-E merged, baseline `9a9f972f`);
-  Phase 1 in progress (design PR 2026-09-30; P1-A..P1-D not started);
-  Phases 2-3 not started, no owner or target wave yet.
+  Phase 1 done (2026-10-03); Phase 2 design in review (2026-10-03),
+  not started; Phase 3 not started, no owner or target wave yet.
 
 ## 4. Operator surfaces: admin API, dashboard, console, CLI
 
