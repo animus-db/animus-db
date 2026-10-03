@@ -6,9 +6,10 @@
 //! format back to an older version (`target_back` versions behind current),
 //! restarts on the current code, and verifies every acknowledged write.
 //!
-//! Every format is v1 today, so the only supported target is the current
-//! version and every transcode is the identity. A request for any other
-//! target is an **error** ([`TranscodeError::UnsupportedTarget`]), never a
+//! `lsm-wal`, `control-wal` and `shared-wal` are v2 and transcode to v1 for
+//! real; every other format is still v1 only, so its only supported target
+//! is the current version and its transcode is the identity. A request for
+//! any unlisted target is an **error** ([`TranscodeError::UnsupportedTarget`]), never a
 //! silent identity: a harness that asked for "one version back" and got the
 //! bytes unchanged would be green while proving nothing.
 //!
@@ -241,12 +242,29 @@ fn shared_wal_transcode(
     )
 }
 
+/// `LWL1` (LSM WAL segment) v2 -> v1: decode and re-encode the records under
+/// the v1 header with no sync markers (`animus_storage::reframe_wal_to_v1`).
+fn lsm_wal_transcode(
+    entry: &FormatEntry,
+    bytes: &[u8],
+    target: u32,
+) -> Result<Vec<u8>, TranscodeError> {
+    match target {
+        t if t == entry.current_version => Ok(bytes.to_vec()),
+        1 => animus_storage::reframe_wal_to_v1(bytes).map_err(|e| TranscodeError::Malformed {
+            format: entry.name,
+            detail: e.to_string(),
+        }),
+        t => Err(entry.unsupported(t)),
+    }
+}
+
 const V1_ONLY: &[VersionSpec] = &[VersionSpec {
     version: 1,
     capabilities: CapabilityMask::ALL,
 }];
 
-/// `CWL1`/`SWL1` v1 (no sync markers) and v2 (sync markers, issue #1132). A
+/// `CWL1`/`SWL1`/`LWL1` v1 (no sync markers) and v2 (sync markers, issue #1132). A
 /// v2 file transcodes to v1 by dropping the marker lines and re-framing each
 /// record under the v1 tag (`animus_control::format::reframe_to_v1`).
 const V1_V2: &[VersionSpec] = &[
@@ -265,9 +283,9 @@ const V1_V2: &[VersionSpec] = &[
 pub static TABLE: &[FormatEntry] = &[
     FormatEntry {
         name: "lsm-wal",
-        current_version: 1,
-        versions: V1_ONLY,
-        transcode: identity_current_only,
+        current_version: 2,
+        versions: V1_V2,
+        transcode: lsm_wal_transcode,
     },
     FormatEntry {
         name: "lsm-manifest",
@@ -352,8 +370,9 @@ const fn emb_v(
 
 /// Every versioned format that is not a whole node-disk file. Together with
 /// [`TABLE`] this must name every `tests/fixtures/formats/<dir>` in the
-/// workspace (enforced by `tests/upgrade_restart_tier0.rs`). Every format is
-/// v1 today.
+/// workspace (enforced by `tests/upgrade_restart_tier0.rs`). An embedded
+/// format's version moves with its carrier (e.g. `raftkv-wal` v2 inside the
+/// v2 `control-wal`); none needs a transcode of its own yet.
 ///
 /// Engine-resident row values and key encodings use `lsm-sstable` as their
 /// carrier (they also pass through `lsm-wal` and the `raftkv`/`shared-wal`

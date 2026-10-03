@@ -202,7 +202,7 @@ range a format needs:
 
 | Format | Location | Version tag today | Lifetime | Notes |
 |---|---|---|---|---|
-| LSM WAL records | `crates/animus-storage/src/lsm/wal.rs` | `WAL_MAGIC = b"LWL1"`, `WAL_VERSION: u8 = 1` | durable, node-local | Record framing has no explicit version byte; crash-safety relies on length-prefixed/checksummed records and torn-tail detection, not on version negotiation. Any format change today is a silent break on reopen with an older build, or a loud one only if the length/checksum fields happen to mismatch. |
+| LSM WAL records | `crates/animus-storage/src/lsm/wal.rs` | `WAL_MAGIC = b"LWL1"`, `WAL_VERSION: u8 = 2` (file-level header; **v2** adds sync-marker frames, #1142; v1 kept as `lsm.rs` `legacy::v1`, fixture `lsm-wal/v1.bin`) | durable, node-local | Record framing has no per-record version byte; the file header carries it and `decode_wal` dispatches on it. Crash-safety relies on length-prefixed/checksummed records plus, from v2, durable sync markers that bound the provably-synced prefix; a v1 file keeps the lenient "no valid frame follows" torn-tail rule. |
 | LSM SSTable data blocks + footer | `crates/animus-storage/src/lsm/sstable.rs` | `MAGIC: u64 = 0x4355_5354_4F53_5333` in the footer (file identification only — the reader takes the actual format from the manifest, not by re-reading the footer) plus a real per-table version tag, `SsTableMeta::format: u32` (`FORMAT_CURRENT = 1`), recorded in the manifest for each table | durable, node-local | Better covered than it first looks: the format version lives one level up, in the manifest's per-table metadata, not in the footer bytes themselves. The block index has its own separate magic+version too: `INDEX_MAGIC = b"SSIX"`, `INDEX_VERSION: u8 = 1`. All three (footer magic, manifest-recorded table format, index magic+version) currently describe a single supported format — there is no decoder path for `format != FORMAT_CURRENT` yet, so the tag would need a real N-1 branch added before Phase 1 could rely on it. |
 | LSM manifest | `crates/animus-storage/src/lsm.rs` (`encode_manifest`/`decode_manifest`) | `MANIFEST_MAGIC = b"CMF1"`, `MANIFEST_VERSION: u8 = 1` | durable, node-local | The best-covered format in `animus-storage`: magic + version + a documented legacy fallback (`decode_manifest` still reads a pre-binary-codec JSON manifest when the magic is absent). This is the pattern the rest of the inventory should converge on. |
 | Control-plane Raft WAL (`RaftCore` log entries + membership records) | `crates/animus-control/src/persist.rs` | `CONTROL_WAL`: `CWL1` + version **2** (`format::encode_line`); v1 retained as `persist::dispatch::legacy::v1` (fixture `control-wal/v1.bin`; v2 adds sync-marker lines, fixture `control-wal/v2.bin`, issue #1132) | durable, node-local | Two generations of this format have already existed with no version discriminator between them; a reader distinguishes them structurally (parse success), not by a tag. Works only because both are JSON and one is a strict superset shape. |
@@ -1020,7 +1020,7 @@ Verified format by format against the code at `cbd23d05`:
 
 | Format (fixture dir) | Crate | Fixture test | Per-version expected values? | Version-dispatch shape | Gap |
 |---|---|---|---|---|---|
-| `lsm-wal` | `animus-storage` | `src/lsm.rs`, `wal_format_fixture_tests::decodes_every_checked_in_fixture`; round trip present | **No** — every file is asserted equal to the one `representative_records()` | File-header gate `version == 0 \|\| > WAL_VERSION` → named error; body is one decode path, version not passed on | Same expected value for all files (a v2 with new information cannot be expressed); no dispatch seam |
+| `lsm-wal` | `animus-storage` | `src/lsm.rs`, `wal_format_fixture_tests::decodes_every_checked_in_fixture`; round trip present; v1-reframe test | **Yes (#1142)** — per-version arm (`1 \| 2`, same records) | `decode_wal` exact `match` on the header version: `1 => legacy::v1::decode`, `2 => decode_wal_v2` | v1 and v2 share one expected value (markers carry no record data) |
 | `lsm-manifest` | `animus-storage` | `src/lsm.rs`, `decodes_every_checked_in_fixture`; round trip `binary_manifest_round_trips` | **No** — same `representative_manifest()` for every file | Gate on `1..=MANIFEST_VERSION`, then a single inline field-by-field decode | Same as above |
 | `lsm-sstable` | `animus-storage` | `src/lsm/sstable.rs`, `decodes_every_checked_in_fixture`; round trip `writer_output_round_trips_the_fixture_records` | **No** — same `fixture_records()`; every file is opened with `FORMAT_CURRENT`, not the version its file name says (the format lives in the manifest, not the file) | Best shaped: `check_format(meta.format)` at open and again in `read_block`, decode arm commented "Format 1" | A v2 fixture needs its format supplied from the file name; `read_block` has no `match` yet |
 | `encryption-envelope` | `animus-env` | `src/encrypted.rs`, `decode_every_fixture_matches_current_code`; round trip present | **Only v1** gets the known-value asserts; any other file silently gets the weaker checks (magic, version range, decrypts) and **does not panic** | `scan` returns `UnsupportedVersion` for `0`/`> VERSION`; one frame decoder | A v2 fixture would pass with almost no content check |
@@ -1522,7 +1522,8 @@ section only states the resulting contract.
 - No stability guarantee for the hash-ring/key encoding beyond "pinned by
   the key-vector fixtures" (open question below, unchanged).
 
-**State of the formats on main (2026-10-03, after #1140/#1141 merged):**
+**State of the formats on main (2026-10-03, after #1140/#1141 merged; `lsm-wal`
+bumped to v2 by #1142, see the 2026-10-03 amendment):**
 the first real format bumps have landed — `control-wal` (CWL v2) and
 `shared-wal` (SWL v2), both adding WAL sync markers, with new
 `control-wal/v2.bin`/`shared-wal/v2.bin` fixtures, and `raftkv-wal` v2
@@ -1558,6 +1559,53 @@ so a bad header there is real corruption and stays loud (the version-dispatch
 seam is untouched for >= 5 bytes); a shorter file never had a synced header
 and holds no acked data. Regression: `animus-storage/tests/lsm_crash.rs`
 `crash_during_segment_header_creation`.
+
+## Amendment 2026-10-03 — `LWL1` v2: sync markers in the LSM WAL (issue #1142)
+
+The LSM WAL decoder used the rule the #1132 amendment below declined to copy:
+a frame that fails to parse is a torn tail only if no valid frame follows it.
+That is sound only if at most one frame can be un-synced, but `GroupCommit`
+coalesces several writers' frames into one append + one fsync, and
+`corrupt_on_crash` flips a byte anywhere in the kept prefix of that un-synced
+region (never in already-synced bytes). A correct writer plus a crash therefore
+left "bad frame, then valid frame" and recovery was wrongly refused: 76 of 300
+seeds of the `lsm_wal_sync_markers` probe (1..=7 coalesced writers). The
+existing `lsm_crash`/`lsm_disk_faults` corpora never exposed it because they
+buffer exactly one un-synced frame.
+
+- **Format v2** (checklist step 1): `WAL_VERSION = 2` (file-level header, as
+  before). A *sync marker* frame is `len=9 | crc32 | tag 5 | offset u64` and
+  claims "every byte before `offset` is fsynced", where `offset` is the marker's
+  own start (the file offset, header included). Markers are **piggybacked on
+  the next batch's own `append`**, mirroring #1132: prepended only when the
+  previous batch's append+sync on that segment both returned `Ok` (flag cleared
+  when a leader claims a batch, set again only on success; also cleared on
+  rotation and at open), with `offset` read from `env.size` at flush time. No
+  separate append or fsync (one extra fsync per round would double commit
+  latency); the marker is itself durable only with the next sync, so the newest
+  batch has no durable marker until the next one — that only shrinks the
+  provable region. `fsync_lie`: a lied-to sync leaves its bytes buffered; a
+  later marker may then vouch for bytes a crash tore, and recovery fails loudly
+  — the same, correct outcome as #1132 (acked bytes were lost by the disk).
+- **Decoder** (`decode_wal_v2`): a frame that fails to parse and starts before
+  a valid marker located *at the offset it claims* is a hard error (durable
+  data corrupted); with no such marker after it, it is a torn tail even if
+  valid frames follow. A marker met in sequence at the wrong offset is a hard
+  error; one merely found by the resync scan at the wrong offset is not a
+  boundary. (A forged marker inside a record value can only cause a spurious
+  refusal, never an accepted corruption.)
+- **Legacy** (step 2): the v1 decoder moved unchanged to `legacy::v1::decode`
+  (commit 1); a test-only `legacy::v1::encode_file` and the
+  `legacy-encoders`-gated `reframe_wal_to_v1` build v1 images. A recovered v1
+  *active* segment is appended to **without** markers (its header still says
+  v1, so a v1 reader keeps parsing it) until it rotates; new segments are v2.
+- **Fixtures** (steps 3-4): `lsm-wal/v2.bin` (records interleaved with
+  markers, expected value shared with v1: the same `representative_records()`),
+  `v1.bin` untouched; a reframe of the v2 image is byte-identical to `v1.bin`.
+- **Harness** (step 7): `lsm-wal` `TABLE` entry `current_version: 2`,
+  `[v1, v2]`, transcode through `animus_storage::reframe_wal_to_v1`.
+- **Residual**: as #1132 — corruption confined to the one newest, not yet
+  marker-vouched round is indistinguishable from a torn tail.
 
 ## Amendment 2026-10-01 — `CWL1`/`SWL1` v2: sync markers (issue #1132)
 

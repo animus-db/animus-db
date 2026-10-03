@@ -185,7 +185,7 @@ mod wal;
 
 use bloom::BloomFilter;
 use sstable::{Record, SsTableMeta, SsTableReader, SsTableWriter};
-use wal::{GroupCommit, WAL_HEADER_LEN, WAL_MAGIC, WAL_VERSION};
+use wal::{GroupCommit, WAL_HEADER_LEN, WAL_MAGIC, WAL_MARKER_TAG, WAL_VERSION, WAL_VERSION_V1};
 
 /// Default memtable flush threshold: total bytes of buffered key+value data.
 const DEFAULT_FLUSH_BYTES: usize = 64 * 1024;
@@ -823,6 +823,9 @@ impl<E: Env> LsmEngine<E> {
         // repaired back to empty just below — means the very next write must
         // write a fresh one.
         let mut active_seg_final_len: u64 = 0;
+        // Whether that active segment's header says v2 (sync markers allowed);
+        // a recovered v1 segment keeps being appended without markers.
+        let mut active_seg_is_v2 = false;
         // An empty segment list is a fresh engine: nothing to replay, and the
         // first write opens segment 0.
         if !segments.is_empty() {
@@ -861,6 +864,8 @@ impl<E: Env> LsmEngine<E> {
                     // the group commit's rotation counter (see
                     // `GroupCommit::new`).
                     active_seg_final_len = consumed as u64;
+                    active_seg_is_v2 = consumed >= WAL_HEADER_LEN
+                        && wal_bytes.get(4).copied() != Some(WAL_VERSION_V1);
                 }
             }
         }
@@ -891,6 +896,7 @@ impl<E: Env> LsmEngine<E> {
             &segments,
             opts.wal_segment_bytes,
             active_seg_final_len,
+            active_seg_is_v2,
         ));
 
         Ok(Self {
@@ -3296,6 +3302,7 @@ fn decode_wal(bytes: &[u8]) -> Result<(Vec<WalRecord>, usize)> {
     // and `1 => wal_legacy::v1::decode(..)` moves the v1 arm to `legacy`.
     match bytes[4] {
         1 => legacy::v1::decode(&bytes[WAL_HEADER_LEN..]),
+        2 => decode_wal_v2(&bytes[WAL_HEADER_LEN..]),
         v => Err(StorageError::UnsupportedFormatVersion {
             format: "lsm-wal",
             found: u32::from(v),
@@ -3349,7 +3356,111 @@ mod legacy {
             }
             Ok((records, WAL_HEADER_LEN + pos))
         }
+
+        /// Test-only legacy encoder (ADR 0073 "Legacy encoders are test-only"):
+        /// a whole v1 segment-file image — v1 header, then one frame per
+        /// record, no markers.
+        #[cfg(any(test, feature = "legacy-encoders"))]
+        pub(in super::super) fn encode_file(records: &[WalRecord]) -> Vec<u8> {
+            let mut out =
+                super::super::wal::encode_wal_header_version(super::super::wal::WAL_VERSION_V1)
+                    .to_vec();
+            for r in records {
+                out.extend_from_slice(&super::super::encode_wal(r));
+            }
+            out
+        }
     }
+}
+
+/// Re-frame a current-version (v2) WAL segment image as a v1 image: decode it
+/// and re-encode the records under the v1 header with no sync markers. The
+/// upgrade-restart harness's transcode for `lsm-wal` (ADR 0073 P1-D); a
+/// type-erased byte-level function so `animus-test` need not name `WalRecord`.
+///
+/// # Errors
+/// Whatever [`decode_wal`] reports for `bytes`.
+#[cfg(any(test, feature = "legacy-encoders"))]
+pub fn reframe_wal_to_v1(bytes: &[u8]) -> Result<Vec<u8>> {
+    if bytes.len() < WAL_HEADER_LEN {
+        return Ok(bytes.to_vec());
+    }
+    let (records, _) = decode_wal(bytes)?;
+    Ok(legacy::v1::encode_file(&records))
+}
+
+/// Parse a sync-marker frame at `bytes[pos..]`: `Some((claimed_offset, next))`
+/// for a complete, checksum-valid frame whose payload is exactly the marker tag
+/// plus a `u64`. (A marker is not a [`WalRecord`], so [`try_parse_wal_frame`]
+/// rejects it.)
+fn try_parse_wal_marker(bytes: &[u8], pos: usize) -> Option<(u64, usize)> {
+    if pos + WAL_FRAME_HEADER_BYTES > bytes.len() {
+        return None;
+    }
+    let len = u32::from_be_bytes(bytes[pos..pos + 4].try_into().ok()?) as usize;
+    if len != 9 {
+        return None;
+    }
+    let crc = u32::from_be_bytes(bytes[pos + 4..pos + 8].try_into().ok()?);
+    let payload_start = pos + WAL_FRAME_HEADER_BYTES;
+    let payload = bytes.get(payload_start..payload_start + 9)?;
+    if payload[0] != WAL_MARKER_TAG || crc32fast::hash(payload) != crc {
+        return None;
+    }
+    let claimed = u64::from_be_bytes(payload[1..9].try_into().ok()?);
+    Some((claimed, payload_start + 9))
+}
+
+/// The first position `>= start` holding a valid marker that sits exactly at
+/// the file offset it claims (`WAL_HEADER_LEN + pos`). A valid-CRC marker at the
+/// wrong offset is not a boundary (it could be bytes copied into a value).
+fn wal_marker_after(body: &[u8], start: usize) -> Option<usize> {
+    (start..body.len()).find(|&p| {
+        try_parse_wal_marker(body, p)
+            .is_some_and(|(claimed, _)| claimed == (WAL_HEADER_LEN + p) as u64)
+    })
+}
+
+/// The v2 WAL body decoder (issue #1142): v1 framing plus sync-marker frames.
+/// A marker claims every byte before itself was fsynced, so a frame that fails
+/// to parse **before** a valid, correctly-placed marker is corruption of
+/// durable data (a hard error), while a bad frame with no marker after it is a
+/// crash-torn tail (even if valid frames follow — a coalesced batch can leave
+/// several un-synced frames). Returns the records and the consumed length
+/// including the header (the recovery truncation point).
+fn decode_wal_v2(body: &[u8]) -> Result<(Vec<WalRecord>, usize)> {
+    let mut records = Vec::new();
+    let mut pos = 0usize;
+    while pos < body.len() {
+        if let Some((record, next)) = try_parse_wal_frame(body, pos) {
+            records.push(record);
+            pos = next;
+            continue;
+        }
+        if let Some((claimed, next)) = try_parse_wal_marker(body, pos) {
+            if claimed != (WAL_HEADER_LEN + pos) as u64 {
+                return Err(StorageError::Backend(format!(
+                    "WAL sync marker at byte offset {} claims offset {claimed}: \
+                     not where it says it is, so the file is corrupt",
+                    WAL_HEADER_LEN + pos
+                )));
+            }
+            pos = next;
+            continue;
+        }
+        if let Some(m) = wal_marker_after(body, pos + 1) {
+            return Err(StorageError::Backend(format!(
+                "corrupt WAL record at byte offset {} (past the file header): a \
+                 durable sync marker at offset {} proves every byte before it was \
+                 fsynced, so this is not a torn tail — refusing to silently drop \
+                 history",
+                WAL_HEADER_LEN + pos,
+                WAL_HEADER_LEN + m
+            )));
+        }
+        break;
+    }
+    Ok((records, WAL_HEADER_LEN + pos))
 }
 
 /// Encode a [`WalRecord`]'s payload (tag byte + fields; see the codec-level
@@ -3632,16 +3743,43 @@ mod wal_format_fixture_tests {
         ]
     }
 
-    /// Encode a whole segment-file image: the file-level header followed by
-    /// every record in `records`, exactly as `LsmEngine`'s own write path
-    /// builds one (header once, then one `encode_wal` frame per record —
-    /// see `wal`'s module docs).
+    /// Encode a whole **v2** segment-file image the way `LsmEngine`'s write
+    /// path shapes one: the file-level header, then record frames with a sync
+    /// marker (claiming its own offset) after every second record — so the
+    /// fixture exercises records interleaved with markers.
     fn encode_fixture_file(records: &[WalRecord]) -> Vec<u8> {
         let mut out = wal::encode_wal_header().to_vec();
-        for r in records {
+        for (i, r) in records.iter().enumerate() {
+            if i > 0 && i % 2 == 0 {
+                out.extend_from_slice(&wal::encode_wal_marker(out.len() as u64));
+            }
             out.extend_from_slice(&encode_wal(r));
         }
         out
+    }
+
+    fn put(i: u64) -> WalRecord {
+        WalRecord::Put {
+            key: format!("k{i}").into_bytes(),
+            value: vec![b'v'; 12],
+            version: i + 1,
+        }
+    }
+
+    /// A v2 image: `[rec0 rec1] marker [rec2 rec3] marker [rec4]`, returning
+    /// the bytes and the file offset of each record frame and marker.
+    fn v2_image() -> (Vec<u8>, Vec<usize>, Vec<usize>) {
+        let mut out = wal::encode_wal_header().to_vec();
+        let (mut recs, mut marks) = (Vec::new(), Vec::new());
+        for i in 0..5u64 {
+            if i == 2 || i == 4 {
+                marks.push(out.len());
+                out.extend_from_slice(&wal::encode_wal_marker(out.len() as u64));
+            }
+            recs.push(out.len());
+            out.extend_from_slice(&encode_wal(&put(i)));
+        }
+        (out, recs, marks)
     }
 
     /// Decode test (ADR 0073 Phase 0 convention): every fixture file under
@@ -3677,7 +3815,7 @@ mod wal_format_fixture_tests {
             // `WAL_VERSION`): a new `vN.bin` with no arm here fails loudly
             // instead of being skipped or checked against the wrong value.
             let expected = match crate::fixture_file_version(&path) {
-                1 => representative_records(),
+                1 | 2 => representative_records(),
                 v => panic!(
                     "fixture {} is version {v} but this test has no expectation for it — \
                      add a per-version arm (ADR 0073 Phase 1 checklist)",
@@ -3714,6 +3852,114 @@ mod wal_format_fixture_tests {
         let (decoded, consumed) = decode_wal(&bytes).expect("decode");
         assert_eq!(consumed, bytes.len());
         assert_eq!(decoded, records);
+    }
+
+    /// Old-input test (ADR 0073 checklist): the checked-in v1 fixture, and a
+    /// fresh test-only v1 encoding of the same records, still decode with
+    /// today's code, and a v2 image reframed to v1 is byte-identical to the v1
+    /// fixture (this is also the harness transcode's contract).
+    #[test]
+    fn v1_files_still_decode_and_v2_reframes_to_the_v1_fixture() {
+        let records = representative_records();
+        let v1 = legacy::v1::encode_file(&records);
+        assert_eq!(v1[4], 1);
+        let (decoded, consumed) = decode_wal(&v1).expect("decode v1");
+        assert_eq!((decoded, consumed), (records.clone(), v1.len()));
+        let on_disk = std::fs::read(fixture_dir().join("v1.bin")).expect("v1 fixture");
+        assert_eq!(on_disk, v1, "the v1 fixture is the legacy encoder's output");
+        let v2 = encode_fixture_file(&records);
+        assert_eq!(v2[4], 2);
+        assert_eq!(reframe_wal_to_v1(&v2).expect("reframe"), v1);
+    }
+
+    /// The v1 rule is kept byte-for-byte for v1 files: a bad frame followed
+    /// by a valid one is still refused there (and a v2 file with no marker
+    /// after the bad frame tolerates exactly that shape).
+    #[test]
+    fn v1_keeps_the_lenient_rule_v2_needs_a_marker() {
+        let mut v1 = legacy::v1::encode_file(&[put(0), put(1), put(2)]);
+        let f0 = WAL_HEADER_LEN;
+        v1[f0 + WAL_FRAME_HEADER_BYTES + 2] ^= 0xFF;
+        assert!(decode_wal(&v1).is_err(), "v1: bad frame, valid frame after");
+        let mut v2 = wal::encode_wal_header().to_vec();
+        for i in 0..3 {
+            v2.extend_from_slice(&encode_wal(&put(i)));
+        }
+        v2[f0 + WAL_FRAME_HEADER_BYTES + 2] ^= 0xFF;
+        let (recs, consumed) = decode_wal(&v2).expect("v2 without a marker: torn tail");
+        assert!(recs.is_empty());
+        assert_eq!(consumed, f0);
+    }
+
+    /// A flipped byte in any frame before a later valid marker is a loud
+    /// error, including the first frame; damage after the last marker is a
+    /// tolerated tail cut back to the last good frame.
+    #[test]
+    fn damage_before_a_marker_is_refused_after_it_is_a_tail() {
+        let (img, recs, marks) = v2_image();
+        // Frames 0..=3 start before the last marker; frame 4 is after it.
+        for (i, &at) in recs.iter().enumerate().take(4) {
+            for off in [0usize, 5, WAL_FRAME_HEADER_BYTES + 1] {
+                let mut bad = img.clone();
+                bad[at + off] ^= 0xFF;
+                assert!(
+                    decode_wal(&bad).is_err(),
+                    "frame {i} byte +{off} flipped before a marker must be refused"
+                );
+            }
+        }
+        // A flipped marker byte makes the marker a bad frame; the next marker
+        // (the second) still proves it.
+        let mut bad = img.clone();
+        bad[marks[0] + WAL_FRAME_HEADER_BYTES + 3] ^= 0xFF;
+        assert!(decode_wal(&bad).is_err());
+        // Flip in the last record (after the last marker): tail.
+        let mut bad = img.clone();
+        bad[recs[4] + 9] ^= 0xFF;
+        let (r, consumed) = decode_wal(&bad).expect("tail after last marker");
+        assert_eq!((r.len(), consumed), (4, recs[4]));
+        // Flip in the last marker itself: nothing after it proves anything, but
+        // the first marker still covers frames 0 and 1 only; frames 2.. tail.
+        let mut bad = img.clone();
+        bad[marks[1] + WAL_FRAME_HEADER_BYTES + 3] ^= 0xFF;
+        let (r, consumed) = decode_wal(&bad).expect("torn last marker");
+        assert_eq!((r.len(), consumed), (4, marks[1]));
+    }
+
+    /// The coalesced-batch shape: several frames after the last marker, one
+    /// of them damaged with valid frames after it — a torn tail, not an error.
+    #[test]
+    fn a_bad_frame_followed_by_valid_frames_after_the_last_marker_is_a_tail() {
+        let mut img = wal::encode_wal_header().to_vec();
+        img.extend_from_slice(&encode_wal(&put(0)));
+        let m = img.len();
+        img.extend_from_slice(&wal::encode_wal_marker(m as u64));
+        let first_unsynced = img.len();
+        for i in 1..6 {
+            img.extend_from_slice(&encode_wal(&put(i)));
+        }
+        img[first_unsynced + 10] ^= 0xFF;
+        let (r, consumed) = decode_wal(&img).expect("tail");
+        assert_eq!((r.len(), consumed), (1, first_unsynced));
+    }
+
+    /// A valid marker that is not at the offset it claims is a named error
+    /// when met in sequence, and is not a boundary when merely found by the
+    /// resync scan.
+    #[test]
+    fn a_misplaced_marker_is_an_error_in_sequence_and_ignored_in_resync() {
+        let mut img = wal::encode_wal_header().to_vec();
+        img.extend_from_slice(&encode_wal(&put(0)));
+        img.extend_from_slice(&wal::encode_wal_marker(7));
+        assert!(decode_wal(&img).is_err());
+        // Same misplaced marker *after* a bad frame: not a proof, so a tail.
+        let mut img = wal::encode_wal_header().to_vec();
+        let at = img.len();
+        img.extend_from_slice(&encode_wal(&put(0)));
+        img[at + 9] ^= 0xFF;
+        img.extend_from_slice(&wal::encode_wal_marker(7));
+        let (r, consumed) = decode_wal(&img).expect("tail");
+        assert_eq!((r.len(), consumed), (0, at));
     }
 
     /// Fixture generator (ADR 0073 Phase 0 convention). Run explicitly:
@@ -5005,6 +5251,48 @@ mod legacy_wal_guard_tests {
                 .unwrap();
             let got = e.get(b"k").await.unwrap().expect("acked write survives");
             assert_eq!(got.value, b"v");
+        });
+    }
+
+    /// A recovered **v1** active segment (written by an older binary) keeps
+    /// being appended to by this build *without* sync markers — its header
+    /// still says v1, so a v1 reader (and `legacy::v1::decode`) must keep
+    /// parsing it — and everything survives a further crash and reopen.
+    #[test]
+    fn recovered_v1_active_segment_is_appended_without_markers() {
+        let sim = Simulator::new(0x1142);
+        let env = sim.env(nid(0));
+        let rec = |i: u64| WalRecord::Put {
+            key: format!("k{i}").into_bytes(),
+            value: b"v".to_vec(),
+            version: i + 1,
+        };
+        block_on(async {
+            let file = format!("{PREFIX}wal-000000");
+            env.replace(&file, &legacy::v1::encode_file(&[rec(0), rec(1)]))
+                .await
+                .unwrap();
+            let e = LsmEngine::open_with(env.clone(), PREFIX, LsmOptions::default())
+                .await
+                .expect("open v1 segment");
+            for i in 2..6u64 {
+                e.put(format!("k{i}").as_bytes(), b"v", i + 1)
+                    .await
+                    .unwrap();
+            }
+            drop(e);
+            let bytes = env.read(&file).await.unwrap();
+            assert_eq!(bytes[4], 1, "the segment keeps its v1 header");
+            let (records, _) = legacy::v1::decode(&bytes[WAL_HEADER_LEN..])
+                .expect("a v1 reader still parses it: no markers were appended");
+            assert_eq!(records.len(), 6);
+            sim.crash(nid(0));
+            let e = LsmEngine::open_with(sim.env(nid(0)), PREFIX, LsmOptions::default())
+                .await
+                .unwrap();
+            for i in 0..6u64 {
+                assert!(e.get(format!("k{i}").as_bytes()).await.unwrap().is_some());
+            }
         });
     }
 }

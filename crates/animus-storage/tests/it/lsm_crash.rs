@@ -442,6 +442,32 @@ fn scenario_crash_during_segment_header_creation(seed: u64) {
     }
 }
 
+/// 8. **A crash with a multi-frame un-synced group-commit batch** (issue
+///    #1142): several concurrent writers' frames coalesce into one append whose
+///    fsync fails, and `crash` (tear + corrupt) damages some frame in that
+///    region while later frames survive. The v1 "valid frame follows, so not a
+///    tail" rule refused the reopen; v2 sync markers make it a tolerated tail.
+///    Sweeps 1..=7 writers, 0..=3 prior synced rounds (so markers exist) and a
+///    healed-disk follow-up round, with the marker's own sync failing in the
+///    mix. The seed-diversity lives in the sim seed itself.
+fn scenario_coalesced_unsynced_batch_tear_reopens(seed: u64) {
+    for i in 0..21u64 {
+        let r = crate::lsm_wal_sync_markers::run_coalesced_tear(
+            seed.wrapping_add(i),
+            i % 4,
+            1 + i % 7,
+            (i / 7) % 3,
+        );
+        match r {
+            Err(e) => panic!("seed={seed} case={i}: strict reopen refused: {e}"),
+            Ok(lost) => assert!(
+                lost.is_empty(),
+                "seed={seed} case={i}: acked lost: {lost:?}"
+            ),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Scenario {
     name: String,
@@ -507,6 +533,10 @@ fn scenario_cells() -> Vec<Scenario> {
         scenario!(
             "crash_during_segment_header_creation",
             scenario_crash_during_segment_header_creation
+        ),
+        scenario!(
+            "coalesced_unsynced_batch_tear_reopens",
+            scenario_coalesced_unsynced_batch_tear_reopens
         ),
     ]
 }
