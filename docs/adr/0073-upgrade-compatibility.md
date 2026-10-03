@@ -1519,16 +1519,17 @@ section only states the resulting contract.
 - No stability guarantee for the hash-ring/key encoding beyond "pinned by
   the key-vector fixtures" (open question below, unchanged).
 
-**State of the formats on main (2026-10-03):** there is **no checked-in
-`v2` fixture anywhere**, every `transcode::TABLE` entry has
-`current_version: 1`, so the harness's transcode is the **identity** for all
-formats today. The machinery is proven (restart over real bytes, oracle,
-seed replay, negative controls, registration completeness) but the
-older-version path has not yet been exercised by a real format bump. The
-first real bumps are in flight, **not landed**: #1140 (`control-wal` CWL
-v2) and #1141 (`shared-wal` SWL v2, sync markers). Whichever lands second
-must register v2 in `TABLE` (see "Coordination with #1140/#1141" above), and
-this section's "every `TABLE` entry is v1" sentence must then be updated.
+**State of the formats on main (2026-10-03, after #1140/#1141 merged):**
+the first real format bumps have landed — `control-wal` (CWL v2) and
+`shared-wal` (SWL v2), both adding WAL sync markers, with new
+`control-wal/v2.bin`/`shared-wal/v2.bin` fixtures, and `raftkv-wal` v2
+(`raftkv-wal/v2.bin`, an `EMBEDDED` format in the control-wal carrier).
+Their `transcode::TABLE` entries have `current_version: 2` and transcode to
+v1 for real (`animus_control::format::reframe_to_v1`, `legacy-encoders`-
+gated: drop marker lines, re-frame each record under the v1 tag), so the
+older-version path is now exercised by a real bump, not only the identity.
+Every other format is still v1 and transcodes as the identity. (Before
+#1140/#1141 merged, this section correctly stated that no v2 existed.)
 
 **Open questions resolved by Phase 1:** the support window (every
 post-baseline version, forever; decided 2026-09-30) and the Phase 1
