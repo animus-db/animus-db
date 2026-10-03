@@ -2130,13 +2130,20 @@ release train.
      `Preamble::for_protocol` hardcodes it empty).
    - The accept path keeps the peer preamble and stamps
      `Envelope.peer_ext` (one shared buffer per connection).
-   - A `check_peer_ext(own, peer)` beside `check_peer` adds the
-     disjoint-range refusal. It uses a TLV parser local to `animus-env`, so
-     `animus-env` still does not depend on `animus-control`.
+   - A `check_peer_ext(spec, own_ext, peer, require_peer_ext)` beside
+     `check_peer` adds the disjoint-range refusal and the era-on refusal of
+     an empty `ext`, both as named `HandshakeError` variants. It uses a TLV
+     parser local to `animus-env`, so `animus-env` still does not depend on
+     `animus-control`.
    - A `Network::set_require_peer_ext(bool)` hook (default no-op;
      `ProdEnv`, `SimEnv` and `EncryptedEnv` implement or forward it) is
      what the control apply task flips when `versioning_active()` becomes
-     true. That is the era-on refusal of empty-`ext` peers.
+     true. That is the era-on refusal of empty-`ext` peers. In `ProdEnv` it
+     refuses new handshakes and closes an already-accepted empty-`ext`
+     connection on its next frame.
+   - `ProdEnv::set_own_ext` applies to connections handshaken after the call
+     (pooled dialed connections keep what they advertised), so `animusd`
+     sets it at bind, before any traffic.
    - `SimEnv` gains `set_network_ext_for(node, ext)`.
    - **Wiring `animusd` to give each `ProdEnv` its `ext`, and its CHS1
      sites, is P2-C**, so P2-A on its own changes no byte on any wire.
