@@ -34,6 +34,13 @@ function of one seed. This is the substrate every distributed test runs on.
   a real hard link for the trait's sanctioned use: sharing an already-fully-
   synced, never-mutated-in-place file), torn un-synced tails on crash, byte
   corruption of the torn region,
+  `DiskConfig::set_replace_data_delay` (issue #1116) — latency of only the
+  temp-file write + fsync half of `Disk::replace`/`stage_replace` (default
+  off); the swap (`commit_staged`) and `stage_extend` cost `sync_delay`.
+  Lets a test prove a slow WAL-rewrite fsync does not stall the persist path.
+  `Disk::stage_replace`/`stage_extend`/`commit_staged`/`discard_staged` are
+  overridden natively (`{file}.tmp` is an ordinary disk entry, so a crash
+  keeps its synced bytes and never touches the target).
   `DiskConfig::set_sync_delay` — a fixed extra virtual-time latency on every
   `append`/`sync`, issue #279's slow-disk livelock repro; unlike the other
   knobs it draws no RNG, so it's a plain fixed cost, not a seed-sampled

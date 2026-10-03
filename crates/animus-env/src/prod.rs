@@ -2151,6 +2151,43 @@ impl Disk for RawFsDisk {
         Ok(())
     }
 
+    // Issue #1116: `replace` split in two so the slow half (write + fsync of
+    // the temp file) can run outside the caller's WAL lock. Same `{file}.tmp`
+    // name and the same fsync discipline as `replace` above.
+    async fn stage_replace(&self, file: &str, bytes: &[u8]) -> std::io::Result<()> {
+        let target = self.path(file);
+        let tmp = self.path(&format!("{file}.tmp"));
+        ensure_parent(&target).await?;
+        let mut f = tokio::fs::File::create(&tmp).await?;
+        f.write_all(bytes).await?;
+        f.flush().await?;
+        f.sync_all().await
+    }
+
+    async fn stage_extend(&self, file: &str, bytes: &[u8]) -> std::io::Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let mut f = open_append(&self.path(&format!("{file}.tmp"))).await?;
+        f.write_all(bytes).await?;
+        f.flush().await?;
+        f.sync_all().await
+    }
+
+    async fn commit_staged(&self, file: &str) -> std::io::Result<()> {
+        let target = self.path(file);
+        let tmp = self.path(&format!("{file}.tmp"));
+        tokio::fs::rename(&tmp, &target).await?;
+        // As in `replace`: the rename is not durable until the directory
+        // chain is fsynced.
+        self.sync_parents(file).await?;
+        self.dir_synced
+            .lock()
+            .expect("dir_synced poisoned")
+            .insert(file.to_string());
+        Ok(())
+    }
+
     async fn link(&self, src: &str, dst: &str) -> std::io::Result<()> {
         let src_path = self.path(src);
         let dst_path = self.path(dst);
@@ -2236,6 +2273,22 @@ impl Disk for ProdEnv {
 
     async fn replace(&self, file: &str, bytes: &[u8]) -> std::io::Result<()> {
         dispatch_disk!(self, replace(file, bytes))
+    }
+
+    async fn stage_replace(&self, file: &str, bytes: &[u8]) -> std::io::Result<()> {
+        dispatch_disk!(self, stage_replace(file, bytes))
+    }
+
+    async fn stage_extend(&self, file: &str, bytes: &[u8]) -> std::io::Result<()> {
+        dispatch_disk!(self, stage_extend(file, bytes))
+    }
+
+    async fn commit_staged(&self, file: &str) -> std::io::Result<()> {
+        dispatch_disk!(self, commit_staged(file))
+    }
+
+    async fn discard_staged(&self, file: &str) -> std::io::Result<()> {
+        dispatch_disk!(self, discard_staged(file))
     }
 
     async fn list(&self) -> std::io::Result<Vec<String>> {
@@ -3939,6 +3992,47 @@ mod tests {
             b"m1"
         );
 
+        env.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #1116: the split replace (`stage_replace` + `stage_extend` +
+    /// `commit_staged`) leaves the target untouched until the swap, then
+    /// yields `staged ++ extended` and consumes the staging file — over the
+    /// plain disk, a nested path, and the encrypted-disk default impls.
+    #[tokio::test]
+    async fn staged_replace_swaps_atomically_and_leaves_the_target_until_commit() {
+        let dir = unique_tmp_dir();
+        let (env, _addr) = ProdEnv::bind(nid(0), "127.0.0.1:0".parse().unwrap(), &dir)
+            .await
+            .expect("bind");
+        for file in ["wal", "nested/dir/wal"] {
+            env.append(file, b"old").await.expect("append");
+            env.sync(file).await.expect("sync");
+
+            env.stage_replace(file, b"image").await.expect("stage");
+            env.stage_extend(file, b"+tail1").await.expect("extend");
+            env.stage_extend(file, b"").await.expect("empty extend");
+            env.stage_extend(file, b"+tail2").await.expect("extend");
+            assert_eq!(env.read(file).await.unwrap(), b"old", "target untouched");
+
+            env.commit_staged(file).await.expect("commit");
+            assert_eq!(env.read(file).await.unwrap(), b"image+tail1+tail2");
+            assert!(
+                env.read(&format!("{file}.tmp")).await.unwrap().is_empty(),
+                "staging file consumed"
+            );
+            // Appends after the swap land on the new file.
+            env.append(file, b"!").await.expect("append after");
+            env.sync(file).await.expect("sync after");
+            assert_eq!(env.read(file).await.unwrap(), b"image+tail1+tail2!");
+
+            // A re-stage overwrites a leftover staged file; discard drops it.
+            env.stage_replace(file, b"x").await.expect("restage");
+            env.stage_replace(file, b"y").await.expect("restage over");
+            env.discard_staged(file).await.expect("discard");
+            assert!(env.read(&format!("{file}.tmp")).await.unwrap().is_empty());
+        }
         env.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }
