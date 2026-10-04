@@ -35,6 +35,14 @@ spec:
   #   backupStore: "s3://my-backups-bucket?endpoint=https://s3.us-east-1.amazonaws.com&region=us-east-1"
   #   # segmentStore: "s3://my-streams-bucket?endpoint=https://s3.us-east-1.amazonaws.com&region=us-east-1"
   #   credentialsSecretName: example-s3-credentials
+  #   # ...or, instead of a long-lived Secret (set exactly ONE of the two),
+  #   # EKS IRSA-style temporary credentials: the pod's projected
+  #   # service-account token is exchanged with STS AssumeRoleWithWebIdentity.
+  #   # webIdentity:
+  #   #   roleArn: arn:aws:iam::123456789012:role/animus-s3
+  #   #   serviceAccountName: animus        # optional; default ServiceAccount otherwise
+  #   #   audience: sts.amazonaws.com       # optional (default shown)
+  #   # Add &path_style=false to a store URI for virtual-hosted addressing.
   #   allowInsecureHttp: false
   #   egressCidrs: ["0.0.0.0/0"]
   # Non-S3 backup/segment stores (S-07b) — mutually exclusive with the
