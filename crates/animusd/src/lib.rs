@@ -3208,7 +3208,9 @@ fn s3_store_location(s3: &S3StoreConfig) -> String {
 
 #[cfg(test)]
 mod s3_store_view_tests {
-    use super::{BackupStoreConfig, S3StoreConfig, SegmentStoreConfig, StoreView};
+    use super::{
+        BackupStoreConfig, S3CredentialSource, S3StoreConfig, SegmentStoreConfig, StoreView,
+    };
 
     fn test_s3_config() -> S3StoreConfig {
         S3StoreConfig {
@@ -3217,8 +3219,40 @@ mod s3_store_view_tests {
             endpoint: "https://s3.example.com:9000".to_string(),
             region: "us-west-2".to_string(),
             insecure_http: false,
-            credentials: animus_s3::sigv4::Credentials::new("AKIDTEST", "supersecret"),
+            credential_source: S3CredentialSource::Static(animus_s3::sigv4::Credentials::new(
+                "AKIDTEST",
+                "supersecret",
+            )),
+            virtual_hosted: false,
         }
+    }
+
+    #[test]
+    fn s3_view_never_exposes_a_non_static_credential_source() {
+        let mut cfg = test_s3_config();
+        cfg.credential_source = S3CredentialSource::WebIdentity {
+            role_arn: "arn:aws:iam::123456789012:role/secret-role-name".to_string(),
+            token_file: "/var/run/secrets/eks/token".to_string(),
+            session_name: "animusd".to_string(),
+            sts_endpoint: None,
+        };
+        cfg.virtual_hosted = true;
+        let view = StoreView::from(&SegmentStoreConfig::S3(cfg));
+        let location = view.path.expect("location");
+        assert!(!location.contains("role"), "{location}");
+        assert!(!location.contains("token"), "{location}");
+    }
+
+    #[test]
+    fn s3_config_debug_redacts_static_and_session_secrets() {
+        let mut cfg = test_s3_config();
+        cfg.credential_source = S3CredentialSource::Static(
+            animus_s3::sigv4::Credentials::new("AKIDTEST", "supersecret")
+                .with_session_token("supertoken", None),
+        );
+        let rendered = format!("{cfg:?}");
+        assert!(!rendered.contains("supersecret"), "{rendered}");
+        assert!(!rendered.contains("supertoken"), "{rendered}");
     }
 
     /// The load-bearing admin-surface assertion (roadmap S-04 PR 2): an
@@ -9294,7 +9328,39 @@ pub struct S3StoreConfig {
     /// enforced; this field just remembers the decision for
     /// `build_segment_store`/`build_backup_store` to act on.
     pub insecure_http: bool,
-    pub credentials: animus_s3::sigv4::Credentials,
+    /// Where this store's signing credentials come from (S-08 M1) — static
+    /// keys (the S-04 default) or a temporary-credential source. Its `Debug`
+    /// redacts every secret/token.
+    pub credential_source: S3CredentialSource,
+    /// `true` for virtual-hosted addressing (`bucket.host/key`, URI
+    /// `path_style=false`); `false` (the default) is path-style.
+    pub virtual_hosted: bool,
+}
+
+/// Where an S3 store's credentials come from (S-08 M1; `--s3-credentials`
+/// file `source`). Only `Static` carries a secret, and
+/// [`animus_s3::sigv4::Credentials`]'s `Debug` already redacts it; the other
+/// variants name *where to fetch*, never a token value (a web-identity token
+/// is re-read from `token_file` on every STS call, since it rotates).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum S3CredentialSource {
+    /// Long-lived keys (optionally with a literal session token).
+    Static(animus_s3::sigv4::Credentials),
+    /// `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN`.
+    Env,
+    /// STS `AssumeRoleWithWebIdentity` with a rotating projected token
+    /// (EKS IRSA).
+    WebIdentity {
+        role_arn: String,
+        token_file: String,
+        session_name: String,
+        /// `None` = `https://sts.<store region>.amazonaws.com`.
+        sts_endpoint: Option<String>,
+    },
+    /// ECS task role / EKS Pod Identity (`AWS_CONTAINER_CREDENTIALS_*`).
+    Container,
+    /// EC2 instance profile via IMDSv2.
+    Imds,
 }
 
 /// `--segment-store` CLI opt-in (ADR 0043 §A7b): the default,
@@ -9323,17 +9389,90 @@ pub enum SegmentStoreConfig {
     S3(S3StoreConfig),
 }
 
-/// Build the `T: Transport` + [`animus_s3::client::S3Config`] pair
-/// [`build_segment_store`]/[`build_backup_store`]'s `S3` arm both need from
-/// an [`S3StoreConfig`] — factored out since the two call sites are
-/// otherwise identical (same transport-construction/credential-forwarding
-/// logic, differing only in which handle enum wraps the result).
+/// A transport for a credential endpoint: TLS for `https://`, plain HTTP for
+/// `http://` (IMDS and ECS/Pod Identity are link-local plain HTTP by
+/// design; an `http://` STS endpoint is a local-test knob).
+fn credential_endpoint_transport(
+    url: &str,
+) -> std::io::Result<animus_s3::prod::HyperRustlsTransport> {
+    if url.starts_with("http://") {
+        animus_s3::prod::HyperRustlsTransport::new_allow_insecure_http()
+    } else {
+        animus_s3::prod::HyperRustlsTransport::new()
+    }
+    .map_err(|e| std::io::Error::other(format!("building credential transport: {e}")))
+}
+
+/// Build the [`animus_s3::creds::CredentialProvider`] for `source` (fetching
+/// providers are wrapped in a refreshing, single-flight
+/// [`animus_s3::creds::CachingProvider`]). `region` is the store's region,
+/// used only for the default STS endpoint.
+///
+/// # Errors
+/// A transport can't be built, or `Container` is selected without the
+/// `AWS_CONTAINER_CREDENTIALS_*` environment.
+fn s3_credential_provider(
+    source: &S3CredentialSource,
+    region: &str,
+) -> std::io::Result<Arc<dyn animus_s3::creds::CredentialProvider>> {
+    use animus_s3::creds::{
+        CachingProvider, ContainerProvider, ImdsV2Provider, StaticProvider, StsWebIdentityProvider,
+    };
+    Ok(match source {
+        S3CredentialSource::Static(c) => Arc::new(StaticProvider::new(c.clone())),
+        S3CredentialSource::Env => {
+            Arc::new(CachingProvider::new(animus_s3::creds_prod::EnvProvider))
+        }
+        S3CredentialSource::WebIdentity {
+            role_arn,
+            token_file,
+            session_name,
+            sts_endpoint,
+        } => {
+            let endpoint = sts_endpoint
+                .clone()
+                .unwrap_or_else(|| format!("https://sts.{region}.amazonaws.com"));
+            let transport = credential_endpoint_transport(&endpoint)?;
+            Arc::new(CachingProvider::new(StsWebIdentityProvider::new(
+                transport,
+                endpoint,
+                role_arn.clone(),
+                session_name.clone(),
+                animus_s3::creds_prod::file_token_source(token_file),
+            )))
+        }
+        S3CredentialSource::Container => {
+            let (uri, auth) = animus_s3::creds_prod::container_endpoint_from_env()
+                .map_err(std::io::Error::other)?;
+            let transport = credential_endpoint_transport(&uri)?;
+            Arc::new(CachingProvider::new(ContainerProvider::new(
+                transport, uri, auth,
+            )))
+        }
+        S3CredentialSource::Imds => {
+            let endpoint =
+                ImdsV2Provider::<animus_s3::prod::HyperRustlsTransport>::DEFAULT_ENDPOINT;
+            let transport = credential_endpoint_transport(endpoint)?;
+            Arc::new(CachingProvider::new(ImdsV2Provider::new(
+                transport, endpoint,
+            )))
+        }
+    })
+}
+
+/// Build the `T: Transport` + [`animus_s3::client::S3Client`] an
+/// [`S3StoreConfig`] describes, wrapped in a segment store —
+/// [`build_segment_store`]/[`build_backup_store`]'s `S3` arm both need it
+/// (same transport/credential/addressing logic, differing only in which
+/// handle enum wraps the result).
 ///
 /// # Errors
 /// If installing the `ring` crypto provider fails (only possible if a
 /// *different* provider is already installed process-wide — see
 /// [`animus_s3::prod::HyperRustlsTransport::new`]'s own doc; tolerable
-/// "already installed by this same call" is not an error).
+/// "already installed by this same call" is not an error), the credential
+/// provider can't be built, or virtual-hosted addressing is asked for
+/// against an IP endpoint / non-DNS bucket name.
 fn s3_segment_store(
     s3: &S3StoreConfig,
 ) -> std::io::Result<animus_env::S3SegmentStore<animus_s3::prod::HyperRustlsTransport>> {
@@ -9343,15 +9482,20 @@ fn s3_segment_store(
         animus_s3::prod::HyperRustlsTransport::new()
     }
     .map_err(|e| std::io::Error::other(format!("building S3 transport: {e}")))?;
-    let config = animus_s3::client::S3Config {
+    let provider = s3_credential_provider(&s3.credential_source, &s3.region)?;
+    let target = animus_s3::client::S3Target {
         endpoint: s3.endpoint.clone(),
         bucket: s3.bucket.clone(),
         region: s3.region.clone(),
-        credentials: s3.credentials.clone(),
     };
-    Ok(animus_env::S3SegmentStore::new(
-        transport,
-        config,
+    let mut client = animus_s3::client::S3Client::with_provider(transport, target, provider);
+    if s3.virtual_hosted {
+        client = client
+            .with_addressing(animus_s3::client::Addressing::VirtualHosted)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+    }
+    Ok(animus_env::S3SegmentStore::from_client(
+        client,
         s3.prefix.clone(),
     ))
 }
@@ -9382,7 +9526,10 @@ pub struct ExportS3Config {
     /// `main.rs`'s own loopback-or-`--allow-insecure-s3` check already
     /// passed.
     pub insecure_http: bool,
-    pub credentials: animus_s3::sigv4::Credentials,
+    pub credential_source: S3CredentialSource,
+    /// Virtual-hosted addressing for the customer bucket (validated per
+    /// request against that request's bucket name).
+    pub virtual_hosted: bool,
 }
 
 /// A customer-bucket object-store factory for S3 export (ADR 0068 §2):
@@ -9420,11 +9567,63 @@ fn default_export_store_factory(export_s3: Option<ExportS3Config>) -> ExportStor
             endpoint: cfg.endpoint.clone(),
             region: cfg.region.clone(),
             insecure_http: cfg.insecure_http,
-            credentials: cfg.credentials.clone(),
+            credential_source: cfg.credential_source.clone(),
+            virtual_hosted: cfg.virtual_hosted,
         };
         let store: Arc<dyn animus_env::SegmentStore> = Arc::new(s3_segment_store(&s3)?);
         Ok(store)
     })
+}
+
+#[cfg(test)]
+mod s3_credential_wiring_tests {
+    use super::{S3CredentialSource, S3StoreConfig, s3_credential_provider, s3_segment_store};
+
+    fn cfg(endpoint: &str, bucket: &str, virtual_hosted: bool) -> S3StoreConfig {
+        S3StoreConfig {
+            bucket: bucket.to_string(),
+            prefix: None,
+            endpoint: endpoint.to_string(),
+            region: "us-east-1".to_string(),
+            insecure_http: endpoint.starts_with("http://"),
+            credential_source: S3CredentialSource::Static(animus_s3::sigv4::Credentials::new(
+                "AKIDTEST", "secret",
+            )),
+            virtual_hosted,
+        }
+    }
+
+    #[test]
+    fn virtual_hosted_against_an_ip_endpoint_is_refused_at_build() {
+        let err = s3_segment_store(&cfg("http://127.0.0.1:9000", "good-bucket", true))
+            .err()
+            .expect("IP endpoint refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("IP"), "{err}");
+        let err = s3_segment_store(&cfg("https://s3.example.com", "Bad_Bucket", true))
+            .err()
+            .expect("non-DNS bucket refused");
+        assert!(err.to_string().contains("DNS-compatible"), "{err}");
+        // Path-style and valid virtual-hosted both build.
+        assert!(s3_segment_store(&cfg("http://127.0.0.1:9000", "Any_Name", false)).is_ok());
+        assert!(s3_segment_store(&cfg("https://s3.example.com", "good-bucket", true)).is_ok());
+    }
+
+    #[test]
+    fn every_source_builds_a_provider_without_touching_the_network() {
+        for src in [
+            S3CredentialSource::Env,
+            S3CredentialSource::Imds,
+            S3CredentialSource::WebIdentity {
+                role_arn: "arn:aws:iam::1:role/r".to_string(),
+                token_file: "/nonexistent/token".to_string(),
+                session_name: "animusd".to_string(),
+                sts_endpoint: None,
+            },
+        ] {
+            assert!(s3_credential_provider(&src, "eu-west-1").is_ok(), "{src:?}");
+        }
+    }
 }
 
 /// S-04 PR 2's own end-to-end proof that `SegmentStoreHandle::S3`/

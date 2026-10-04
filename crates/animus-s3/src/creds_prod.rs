@@ -70,6 +70,41 @@ pub fn env_token_source(var: impl Into<String>) -> TokenSource {
     })
 }
 
+/// Resolve the container-credentials endpoint from the standard AWS
+/// environment: `AWS_CONTAINER_CREDENTIALS_FULL_URI` (EKS Pod Identity, ECS
+/// with a full URI) or `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` (ECS, joined
+/// onto the link-local `http://169.254.170.2`), plus the optional
+/// authorization token from `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`
+/// (preferred, rotates) or `AWS_CONTAINER_AUTHORIZATION_TOKEN`.
+///
+/// # Errors
+/// Neither URI variable is set.
+pub fn container_endpoint_from_env() -> Result<(String, Option<TokenSource>), String> {
+    let get = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
+    let uri = match (
+        get("AWS_CONTAINER_CREDENTIALS_FULL_URI"),
+        get("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"),
+    ) {
+        (Some(full), _) => full,
+        (None, Some(rel)) => format!("http://169.254.170.2{rel}"),
+        (None, None) => {
+            return Err(
+                "source=container needs AWS_CONTAINER_CREDENTIALS_FULL_URI or \
+                 AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"
+                    .to_string(),
+            );
+        }
+    };
+    let auth = if let Some(file) = get("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE") {
+        Some(file_token_source(file))
+    } else if get("AWS_CONTAINER_AUTHORIZATION_TOKEN").is_some() {
+        Some(env_token_source("AWS_CONTAINER_AUTHORIZATION_TOKEN"))
+    } else {
+        None
+    };
+    Ok((uri, auth))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
