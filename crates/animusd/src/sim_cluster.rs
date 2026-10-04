@@ -2367,6 +2367,7 @@ impl SimCluster {
                 throttle: ThrottleTracker::new(),
                 throttle_defaults: Arc::new(ThrottleDefaults::default()),
                 any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                overload: Default::default(),
             };
             ctxs.push(ctx);
         }
@@ -5678,6 +5679,7 @@ impl SimCluster {
             throttle: ThrottleTracker::new(),
             throttle_defaults: Arc::new(ThrottleDefaults::default()),
             any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            overload: Default::default(),
         };
 
         // Install the relay server, exactly like `SimCluster::new`/
@@ -6013,6 +6015,7 @@ impl SimCluster {
             throttle: ThrottleTracker::new(),
             throttle_defaults: Arc::new(ThrottleDefaults::default()),
             any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            overload: Default::default(),
         };
 
         let ctx_for_server = ctx.clone();
@@ -6316,6 +6319,7 @@ impl SimCluster {
             throttle: ThrottleTracker::new(),
             throttle_defaults: Arc::new(ThrottleDefaults::default()),
             any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            overload: Default::default(),
         };
 
         let ctx_for_server = ctx.clone();
@@ -7069,6 +7073,7 @@ impl SimCluster {
             throttle: ThrottleTracker::new(),
             throttle_defaults: Arc::new(ThrottleDefaults::default()),
             any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            overload: Default::default(),
         };
 
         let ctx_for_server = ctx.clone();
