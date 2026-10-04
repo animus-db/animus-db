@@ -20,6 +20,7 @@ use crate::workload::WorkloadKind;
 /// Usage text.
 pub const USAGE: &str = "\
 animus-bench [run] [options]      open-loop YCSB A-F load generator over the DynamoDB wire
+animus-bench compare ...          A/B-compare results files (see `animus-bench compare --help`)
 
 cluster (pick one):
   --nodes D@A[,D@A...]        attach to a running cluster: DynamoDB addr @ admin addr per node

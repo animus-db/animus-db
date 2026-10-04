@@ -106,6 +106,20 @@ to this crate's.**
   directly), wrap the phases in a `RunResult`, add it to a `Report`. No CLI
   change needed; wire a flag in `cli.rs` only if you want a command.
 
+## A/B comparison and the `bench` workflow
+
+`animus-bench compare [--threshold-pct P] [--out FILE] --base A1.json A2.json
+--head B1.json B2.json` (`compare.rs`, pure) prints a markdown table of
+median / spread / delta per `(run, phase, metric)` (corrected p50/p99/p99.9
+and achieved rate; sweep points too). A row is flagged only when `|delta| >
+P` **and** the base/head [min,max] ranges are disjoint; otherwise a big
+delta is `noisy`. Reporting only: exit 0 for any well-formed input (2 usage,
+1 unreadable file). `.github/workflows/bench.yml` is `workflow_dispatch`
+only: builds the generator once (head's) plus `animusd` for `base_ref` and
+head, runs them interleaved base/head/base/head on one runner, uploads the
+JSON + summaries, and appends the table to the step summary. Hosted-runner
+numbers are colocated, non-publishable, and not a baseline.
+
 ## Lint posture
 
 A real process boundary, modelled on `animus-cli`: **no package-level
@@ -130,15 +144,32 @@ used only at the edges (`cluster.rs` port probing/config files, `envinfo.rs`).
 - `tests/smoke.rs`: a real 3-node in-process cluster **with SigV4 on**; A-F x
   both read modes at ~300 ops each plus a follower-kill run. Asserts **wire
   shapes and correctness only** (zero unexpected errors, every arrival
-  completes, JSON round-trips) — **never a latency or rate**. It is an
-  ordinary (non-`prod-heavy`) target so it runs in `cargo test -p animus-bench`
-  and CI's `gates` tier (`--workspace --exclude animusd`); ~45 s.
+  completes, JSON round-trips) — **never a latency or rate**. It is a
+  `prod-heavy` target (`[[test]] required-features`, like animus-control /
+  animus-cp-data / animus-storage's real-thread tests): a whole ProdEnv
+  cluster must not run beside other tests, so it is **not** in the per-push
+  `gates` tier (`--workspace --exclude animusd` skips it structurally) and
+  runs exactly once, in CI's `prod-liveness-scattered` job
+  (`cargo test -p animus-bench --features prod-heavy --test smoke --
+  --test-threads=1`); ~45 s. Locally: `cargo test -p animus-bench --features
+  prod-heavy`; a plain `cargo test -p animus-bench` runs only the unit tests.
+- `compare.rs` tests: verdict logic of `animus-bench compare` (threshold
+  respected and disclosed, a delta inside the run-to-run range is `noisy`
+  not a regression, single-run groups never call a regression, throughput
+  direction inverted, one-sided series reported, arg parsing).
 - Nothing here validates absolute performance. Numbers from a colocated run
   are labelled non-publishable; the first publishable numbers need a
   dedicated client host and an external cluster (an operations task).
 
 ## Gotchas
 
+- **A fat colocated tail is server-side, not the generator** (investigated
+  2026-10-04; see `docs/lessons/testing/2026-10-04-a-suspicious-benchmark-
+  tail-is-diagnosed-by-periodicity-and-an-independent-client.md`): ~200-300
+  ms all-connection stalls every few seconds under a *write* workload, and a
+  ~22 ms floor on `ConsistentRead: true` gets, reproduce with a plain Python
+  client. Don't "fix" them here. Consider `--workloads C` or
+  `--consistent-read false` when you need a clean read baseline.
 - `serde_json` float parsing is not bit-exact: don't `assert_eq!` a `Report`
   against its re-parsed file (compare ints/strings).
 - Sleep granularity is ~1 ms (tokio timer): at high rates arrivals are sent in

@@ -12,11 +12,13 @@
 //! - [`engine`] — `run_phase`, the thin open-loop I/O shell;
 //!   [`scenario`] — warm-up/steady/sweep and baseline/degraded/recovery
 //!   plans plus the YCSB glue;  [`cluster`] — the system under test and its
-//!   fault hooks;  [`envinfo`] — host + `/admin` topology capture.
+//!   fault hooks;  [`envinfo`] — host + `/admin` topology capture;
+//!   [`compare`] — pure A/B comparison of results files (`animus-bench compare`).
 
 pub mod cli;
 pub mod client;
 pub mod cluster;
+pub mod compare;
 pub mod dist;
 pub mod engine;
 pub mod envinfo;
