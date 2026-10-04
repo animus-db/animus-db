@@ -17,7 +17,8 @@
 //!
 //! Knobs: `ANIMUS_DENSITY_GROUPS` (default `100,1000`), `ANIMUS_DENSITY_RF`
 //! (default `1,3`), `ANIMUS_DENSITY_WINDOW_SECS` (steady-CPU window, default
-//! 10). RF=3 hosts three replicas per group over three `ProdEnv`s in this one
+//! 10), `ANIMUS_DENSITY_BATCH` (host N groups at a time, waiting for
+//! leaders between batches; default 0 = all at once). RF=3 hosts three replicas per group over three `ProdEnv`s in this one
 //! process (real loopback sockets), so heartbeats, the per-node heartbeat
 //! batcher and the quorum path count; per-group figures divide by `RF * G`
 //! replicas. Output lines are `C17T2 ...` (machine-readable).
@@ -191,6 +192,10 @@ async fn one_density_run(g: usize, rf: usize, window: Duration, page: u64, hz: u
     // groups[g][replica]; replica 0 campaigns immediately (deterministic leader).
     let t0 = Instant::now();
     let mut groups: Vec<Vec<KvNode>> = Vec::with_capacity(g);
+    let batch: usize = std::env::var("ANIMUS_DENSITY_BATCH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     for s in 0..g as u64 {
         let mut reps = Vec::with_capacity(rf);
         // Followers first, the campaigning replica 0 last, so its first vote
@@ -219,10 +224,66 @@ async fn one_density_run(g: usize, rf: usize, window: Duration, page: u64, hz: u
         }
         reps.reverse();
         groups.push(reps);
+        // Optional staggered bring-up (`ANIMUS_DENSITY_BATCH=N`): wait until
+        // every group hosted so far is led before hosting the next N. Separates
+        // a bootstrap thundering herd from steady-state cost.
+        if batch > 0 && (s as usize + 1) % batch == 0 {
+            let dl = Instant::now() + Duration::from_secs(300);
+            let (mut lg, mut lt) = (Instant::now(), cpu_ticks());
+            loop {
+                let led = groups
+                    .iter()
+                    .filter(|r| r.iter().any(KvNode::is_leader))
+                    .count();
+                if led == groups.len() {
+                    break;
+                }
+                if lg.elapsed() >= Duration::from_secs(5) {
+                    let ticks = cpu_ticks();
+                    println!(
+                        "C17T2 groups={g} rf={rf} phase=batch-wait hosted={} led={led} max_term={:?} cpu_cores={:.2}",
+                        groups.len(),
+                        groups.iter().flat_map(|r| r.iter()).map(KvNode::term).max(),
+                        (ticks - lt) as f64 / hz as f64 / lg.elapsed().as_secs_f64()
+                    );
+                    lg = Instant::now();
+                    lt = ticks;
+                }
+                assert!(Instant::now() < dl, "staggered batch never elected");
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
     }
     // Every group hosted AND led.
+    println!(
+        "C17T2 groups={g} rf={rf} phase=spawned spawn_ms={} cpu_ticks={}",
+        t0.elapsed().as_millis(),
+        cpu_ticks()
+    );
     let deadline = Instant::now() + Duration::from_secs(300);
+    let (mut last_log, mut last_ticks) = (Instant::now(), cpu_ticks());
     loop {
+        if last_log.elapsed() >= Duration::from_secs(5) {
+            let ticks = cpu_ticks();
+            let secs = last_log.elapsed().as_secs_f64();
+            let led = groups
+                .iter()
+                .filter(|r| r.iter().any(KvNode::is_leader))
+                .count();
+            let max_term = groups.iter().flat_map(|r| r.iter()).map(KvNode::term).max();
+            let multi = groups
+                .iter()
+                .filter(|r| r.iter().map(KvNode::term).max().unwrap_or(0) > 1)
+                .count();
+            println!(
+                "C17T2 groups={g} rf={rf} phase=electing t_s={} led={led} groups_term_gt1={multi} max_term={max_term:?} cpu_cores={:.2} rss={}",
+                t0.elapsed().as_secs(),
+                (ticks - last_ticks) as f64 / hz as f64 / secs,
+                rss_bytes(page)
+            );
+            last_log = Instant::now();
+            last_ticks = ticks;
+        }
         let led = groups
             .iter()
             .filter(|r| r.iter().any(KvNode::is_leader))
@@ -284,13 +345,23 @@ async fn one_density_run(g: usize, rf: usize, window: Duration, page: u64, hz: u
             ProposeResult::Accepted { index, .. } => index,
             other => panic!("woken leader refused write: {other:?}"),
         };
+        // Time until the entry is committed, durable (WAL fsynced), applied to
+        // the engine, AND readable back through a linearizable read.
         timeout(Duration::from_secs(30), async {
-            while leader.commit_index() < idx {
-                sleep(Duration::from_micros(100)).await;
+            while leader.commit_index() < idx
+                || leader.durable_index() < idx
+                || leader.engine_applied_index() < idx
+            {
+                sleep(Duration::from_micros(50)).await;
             }
+            assert_eq!(
+                leader.linearizable_get(b"wake").await,
+                Some(b"1".to_vec()),
+                "woken write not readable back"
+            );
         })
         .await
-        .expect("woken group never committed the write");
+        .expect("woken group never committed+applied the write");
         samples.push(t.elapsed().as_micros() as u64);
     }
     samples.sort_unstable();

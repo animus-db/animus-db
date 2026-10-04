@@ -3078,7 +3078,9 @@ own internal mutex (in `animus-control`) is only taken inside `append_tagged`/
   awake-idle then quiesced. Run: `ANIMUS_DENSITY_GROUPS=100,500,1000,5000,10000
   ANIMUS_DENSITY_RF=1,3 cargo test --release -p animus-cp-data --test
   group_density_cost --features prod-heavy -- --ignored --nocapture`
-  (`ANIMUS_DENSITY_WINDOW_SECS`, default 10, is the CPU window). Each (rf, G)
+  (`ANIMUS_DENSITY_WINDOW_SECS`, default 10, is the CPU window;
+  `ANIMUS_DENSITY_BATCH=N` hosts N groups at a time waiting for leaders, avoiding
+  the all-at-once election herd). Each (rf, G)
   cell runs in a child process so allocator retention cannot leak between cells.
   Assertions are liveness only; the numbers are the product. Known finding: a
   quiesced group still wakes every `APPLY_SAFETY_POLL` (250 ms) via its apply
