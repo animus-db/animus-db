@@ -3394,7 +3394,8 @@ mod tests {
                 "s3://my-bucket/backups?endpoint=https://s3.example.com".to_string(),
             ),
             segment_store: None,
-            credentials_secret_name: "my-s3-creds".to_string(),
+            credentials_secret_name: Some("my-s3-creds".to_string()),
+            web_identity: None,
             allow_insecure_http: false,
             egress_cidrs: S3StoreSpec::default_egress_cidrs(),
         }
@@ -3529,7 +3530,7 @@ mod tests {
     async fn reconcile_rejects_s3_spec_with_empty_credentials_secret_name() {
         let mut cluster = test_cluster("demo", "ns1", 3, None);
         cluster.spec.s3 = Some(S3StoreSpec {
-            credentials_secret_name: String::new(),
+            credentials_secret_name: Some(String::new()),
             ..valid_s3()
         });
         let ctx = make_ctx(FakeClusterApi::new(), FakeAdminClient::new());
