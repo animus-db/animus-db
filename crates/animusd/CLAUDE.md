@@ -11785,7 +11785,7 @@ the DynamoDB wire — stopped, every node's disk run through
 is v1), restarted with **strict** engine opens, and checked. Run via
 `cargo test -p animusd --lib sim_cluster_upgrade_corpus`; knob
 `ANIMUS_UPGRADE_RESTART_SEEDS=K` (shared with tier 1; `ANIMUS_UPGRADE_SEEDS`
-stays reserved for Phase 2), `ANIMUS_SEED=<seed>` replays,
+is the Phase 2 mixed-version knob, see the next appendix), `ANIMUS_SEED=<seed>` replays,
 `ANIMUS_UPGRADE_RESTART_CELL=<substring>` filters. K=20 is ~150s wall (3 cells
 per seed, ~2.5s each); nightly `corpus-deep.yml` runs K=50.
 
@@ -11858,6 +11858,48 @@ violations); a truncated LSM file on every node must fail the strict open
 bump) need no change here: they land as one `transcode::TABLE` entry and the
 cells grow with `transcode::supported_back()`.
 
+## Appendix — `sim_cluster_mixed_version_corpus`: rolling Phase 1 -> B2 over `SimCluster` (ADR 0073 Phase 2, P2-D, 2026-10-04)
+
+The cluster tier of the mixed-version corpus (the pure tier is
+`animus-control/tests/it/version_mixed_corpus.rs`). Roles `[Both, Both, Both,
+Data]`, RF 3, Memory backend, CP quiescence on. Run `cargo test -p animusd --lib
+sim_cluster_mixed_version`; knobs `ANIMUS_UPGRADE_SEEDS=K` (default 1),
+`ANIMUS_UPGRADE_CELL=<substring>`, `ANIMUS_SEED` replay; one `#[test]` per cell
+family (`roll_`, `kill_`, `member_down`, `negative_control`) so nextest spreads
+them. K=20 is ~2 minutes wall.
+
+**Node profiles.** `SimCluster::set_binary_profile(node, BinaryProfile)` stores a
+profile and applies it through the single `apply_profile` helper (handshake `ext`
+for every role; `RaftNode::set_binary_profile` for control-bearing nodes), which
+`restart` also calls, so a restarted node never reverts to Phase 1 (the
+per-node-config-resets-on-restart hazard). Default is `Phase1`. **Grow/join
+paths stay Phase 1** and a `Data` node gets only the `ext` (no `RaftNode`, so no
+capped decode and no era-on handshake flag: that is P2-C).
+
+**Oracle**: `check_cycles` over `ConsistentRead: true` reads, per-replica
+`check_durability`/`check_convergence`, the delivery assertion (`cap_rejections()`
+empty in a positive cell), era safety every 50 ms, a Phase 1 control node's
+`Metadata` never showing versioning fields, the era actually starting after the
+last node is B2, control replicas applying what the leader committed, and
+non-vacuity (acks before the roll, during it, after the era; both a Phase 1 and a
+B2 leader seen in the leader-kill cells).
+
+**N1** acts as the buggy proposer from the test (`propose_meta(ReportNodeVersion)`
+through the control leader while a Phase 1 voter exists): its verdict is a list of
+*shortfalls*, so an empty list means the oracle caught the wedge as expected. The
+capped-decode "never entered its log" proof lives in the pure tier (`SimCluster`
+exposes no last-log-index accessor); here the wedge is read off
+`control_raft_indices`.
+
+**Not covered here (pending, not registered)**: Phase 1 *joiners* after the era and
+the data-only era flag (P2-C: `ControlHandle::Remote` flips `require_peer_ext`,
+`RegisterNode` joiner range checks); "gate 2 opens only after every row reports"
+and the synthetic ladder (P2-B `required_gate` tables + P2-C `ClusterFeatures`
+fed into emitters); `Release(N-1) -> Release(N)` cells over real gates.
+
+**Gotcha**: the member-down cell crashes a node the shared client loop keeps
+routing 1/4 of its ops to (each stalls for the wire timeout), so acks *during* its
+roll are legitimately sparse; non-vacuity there is asserted after the era.
 
 ## Appendix — `sim_cluster_scale`: C-17 Tier 1 scale and density measurement (2026-10-04)
 

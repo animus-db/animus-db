@@ -1691,6 +1691,15 @@ pub(crate) struct SimCluster {
     /// own [`SimCluster::restart`] method despite the shared name — see
     /// that method's own doc).
     crashed: BTreeSet<u64>,
+    /// ADR 0073 Phase 2 (P2-D): the `BinaryProfile` each node plays (absent =
+    /// `Phase1`, today's behavior for every pre-existing scenario). Applied
+    /// only through [`SimCluster::apply_profile`], which construction-time
+    /// callers (`set_binary_profile`) and [`SimCluster::restart`] both use, so
+    /// a restart never silently resets a node to the old profile.
+    profiles: BTreeMap<u64, animus_control::sim_versions::BinaryProfile>,
+    /// Every capped-decode rejection log ever installed, `(node, log)` (a
+    /// restart installs a fresh one on the new `RaftNode`).
+    cap_logs: Vec<(u64, animus_control::sim_versions::CapLog)>,
     /// ADR 0061 rung D4 PR 2: the auto-split trigger thresholds this
     /// cluster is opted into, if any — `None` (the default every existing
     /// scenario gets) means `auto_split_loop` is never spawned at all.
@@ -2604,6 +2613,8 @@ impl SimCluster {
             shared: SimClusterHandle::new(ctxs),
             engines,
             crashed: BTreeSet::new(),
+            profiles: BTreeMap::new(),
+            cap_logs: Vec::new(),
             auto_split: None,
             backup_store,
             segment_store,
@@ -3209,6 +3220,16 @@ impl SimCluster {
             .unwrap_or_else(|| panic!("control_raft_indices: node {node} is not control-bearing"));
         let raft = &self.controls[idx];
         (raft.commit_index(), raft.engine_applied_index())
+    }
+
+    /// Test-only (ADR 0073 P2-D): `node`'s control `RaftNode` last log index,
+    /// so a corpus can prove a capped (Phase 1) replica never appended a batch
+    /// it was meant to drop.
+    pub(crate) fn control_last_log_index(&self, node: u64) -> u64 {
+        let idx = self.control_index_of(node).unwrap_or_else(|| {
+            panic!("control_last_log_index: node {node} is not control-bearing")
+        });
+        self.controls[idx].last_log_index()
     }
 
     /// **C-13 / ADR 0061 rung M PR 4**: `node`'s own current `client_route`
@@ -5049,6 +5070,57 @@ impl SimCluster {
         }
     }
 
+    /// ADR 0073 Phase 2 (P2-D): make `node` play `profile` from now on — its
+    /// handshake `ext`, and (control-bearing) its `RaftNode`'s own range,
+    /// build and capped decode — through the single [`SimCluster::
+    /// apply_profile`] helper that [`SimCluster::restart`] also uses. A node
+    /// never given a profile is `Phase1`. `SimCluster` grow/join paths do not
+    /// consult profiles (a grown node is Phase 1).
+    pub(crate) fn set_binary_profile(
+        &mut self,
+        node: u64,
+        profile: animus_control::sim_versions::BinaryProfile,
+    ) {
+        self.profiles.insert(node, profile);
+        let live = self
+            .control_index_of(node)
+            .map(|idx| self.controls[idx].clone());
+        self.apply_profile(node, live.as_ref());
+    }
+
+    /// The one place a node's profile is applied: wire `ext` for every role,
+    /// plus the `RaftNode` side when `control` is given.
+    fn apply_profile(&mut self, node: u64, control: Option<&RaftNode<SimEnv>>) {
+        use animus_control::sim_versions::BinaryProfile;
+        let p = self
+            .profiles
+            .get(&node)
+            .copied()
+            .unwrap_or(BinaryProfile::Phase1);
+        self.sim.set_network_ext_for(nid(node), p.ext());
+        if let Some(c) = control {
+            let log = c.set_binary_profile(p);
+            self.cap_logs.push((node, log));
+        }
+    }
+
+    /// The profile `node` plays.
+    pub(crate) fn profile_of(&self, node: u64) -> animus_control::sim_versions::BinaryProfile {
+        self.profiles
+            .get(&node)
+            .copied()
+            .unwrap_or(animus_control::sim_versions::BinaryProfile::Phase1)
+    }
+
+    /// Every capped-decode rejection on any node, ever — the delivery
+    /// assertion's observable (empty in a faithful roll).
+    pub(crate) fn cap_rejections(&self) -> Vec<(u64, animus_control::sim_versions::CapRejection)> {
+        self.cap_logs
+            .iter()
+            .flat_map(|(n, l)| l.rejections().into_iter().map(move |r| (*n, r)))
+            .collect()
+    }
+
     /// Crash `node`: its tasks stay alive but muted (no sends land, its
     /// inbox is cleared) — `Simulator::crash`'s own contract. Use
     /// [`SimCluster::restart`] instead for a true process restart (a
@@ -5154,6 +5226,10 @@ impl SimCluster {
                 self.control_syskv[idx].clone(),
             );
             let fresh_relay: SimRelayClient<SimEnv> = SimRelayClient::new(self.sim.env(id.clone()));
+            // ADR 0073 Phase 2 (P2-D): a restart rebuilds the `RaftNode` with
+            // the Phase 1 defaults; re-apply the node's profile before any
+            // simulated time passes (one helper, never half-applied).
+            self.apply_profile(node, Some(&fresh_control));
 
             // A restarted node's own `Simulator::stop` dropped its previous
             // `heartbeat_loop` task along with everything else it owned —
