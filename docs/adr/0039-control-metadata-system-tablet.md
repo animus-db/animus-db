@@ -357,3 +357,45 @@ this, since the throughput relief requires the meta tablet to actually split.
   machinery this design reuses in full.
 - `crates/animus-control/CLAUDE.md` — `meta.rs`/`syskv.rs`/`mirror.rs`, the
   pieces that carry over largely unchanged.
+
+## Amendment (2026-10-04): C-17 measurable thresholds for section 5, ratified before measurement
+
+Roadmap item C-17 turns section 5's qualitative criteria into numbers. They
+are fixed here **before** any C-17 run so that results cannot move them.
+This ADR reopens (and ADR 0018's stability still gates it, per the headline
+finding) only if a C-17 run shows either of the following:
+
+1. A lagging control voter's `InstallSnapshot` catch-up takes **more than
+   10 s** at the largest entity count a plausible deployment reaches, taken
+   as **50,000 tablets** (plus their members and schemas).
+2. The control leader's proposal queue grows **without bound** under the
+   steady `reconcile_loop`/`detect_loop`/heartbeat cadence at that same
+   count.
+
+Otherwise this ADR stays at section 6 ("not planned") and gains C-17's
+measured curves as its evidence.
+
+**Corrections to the text above, as verified against the code on
+2026-10-04:**
+
+- **The snapshot is not a whole-`Metadata` `serde_json` image.** Since ADR
+  0038, `Metadata` has been `DRIVER_APPLIED`. The control `InstallSnapshot`
+  payload is the CSN1-tagged system-keyspace image: a list of `(key,
+  value, version)` entries from the per-node syskv engine
+  (`animus_control::node::encode_syskv_image_bytes`). It ships in 64 KiB
+  chunks (`SNAPSHOT_CHUNK_BYTES`). C-17 measures that real encoder's
+  output, not the earlier estimate.
+- **The metric names are different.** What section 5 calls
+  `snapshot_installs` and `append_entries_sent` are `Metric::SnapshotInstalls`
+  (exported as `control_snapshot_installs`) and `Metric::AppendEntriesSent`
+  (`control_append_entries_sent`), in `crates/animus-env/src/metrics.rs`.
+- **Data-node mirrors usually catch up by delta.** A data node's mirror
+  follows by per-key delta (`RaftNode::watch_delta_since`, bounded by the
+  1024-entry / 4 MiB `DeltaRing`). It falls back to a full-`Metadata`
+  `Status` payload only outside that ring.
+
+**Where the measurements live.** Counts and bytes come from C-17's Tier 1
+(`crates/animusd/src/sim_cluster_scale.rs`). Criterion 1's wall-clock 10 s
+needs a `ProdEnv` run, because `SimEnv` virtual time is not wall-clock time.
+Until such a run exists, C-17 reports snapshot bytes and chunk counts at
+50k tablets as a proxy.

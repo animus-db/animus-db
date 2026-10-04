@@ -658,3 +658,37 @@ batching" section.
 See ADR 0048's own 2026-09-07 amendment for `--quiesce-after`'s identical
 closure and `crates/animusd/CLAUDE.md`'s "Heartbeat batching"/"Quiescence"
 sections for the current, complete per-entry-point enumeration.
+
+## Amendment (2026-10-04): C-17 reopening thresholds for phase 3 (C-03), ratified before measurement
+
+Roadmap item C-17 (scale and density testing) owns the measurement the
+2026-09-07 amendment above left open: the per-group `RaftCore`/`RaftKvNode`
+in-memory bookkeeping and its `drive` task, at a realistic per-node density.
+So that a measurement cannot move the goalposts, the thresholds are fixed
+here **before** any C-17 run, as C-17 proposed them:
+
+- **Phase 3 (C-03) reopens** if, at **1,000 hosted groups on one node**,
+  either:
+  - *quiesced* per-group overhead exceeds **64 KB RSS**, or shows **any
+    nonzero steady CPU** attributable to the quiesced groups (measured as
+    process CPU over a fixed idle window after every group reports
+    quiesced, against the zero-group baseline); or
+  - *active* per-group overhead, excluding engine memtables, exceeds
+    **1 MB RSS**, or a hot tablet's p99 client latency degrades by more
+    than **2x** against the 1-group baseline.
+- Otherwise phase 3 stays deferred, and this ADR records the measured
+  numbers as its evidence. That is an equally valid outcome.
+- C-03's condition (b), RF > 3 for failure-domain spread, is independent of
+  density and is not tested by C-17.
+
+**How each half is measured.** The quiesced half needs no load generator. It
+is a `ProdEnv` real-thread measurement of G hosted groups in one process:
+RSS delta, CPU over an idle window, open fds, and live tokio tasks. Its
+harness is `crates/animus-cp-data/tests/group_density_cost.rs`, in the
+style of `idle_engine_cost`. The active half (a fixed per-group write rate,
+and a hot tablet's p99) needs B-01's open-loop load generator. It is
+measured on that harness once B-01 lands, never on a parallel generator.
+Counts that `SimEnv` can prove are reported by C-17's Tier 1 corpus
+(`crates/animusd/src/sim_cluster_scale.rs`). Those are timer fires, task
+polls, messages and bytes per virtual second from quiesced vs awake
+groups. `SimEnv` virtual time is never read as wall-clock CPU.
