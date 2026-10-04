@@ -249,6 +249,7 @@ async fn bring_up_cluster(
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: encryption_key_path.clone(),
+                labels: Default::default(),
             })
             .collect();
         let config = ClusterConfig {
@@ -413,6 +414,7 @@ async fn a_node_with_a_different_key_against_the_same_backup_store_is_refused_at
             advertise_host: None,
             tls: None,
             encryption_key_path: Some(key_b),
+            labels: Default::default(),
         }],
         dynamo_auth: None,
         cluster_settings: None,
@@ -465,6 +467,7 @@ async fn a_key_against_an_existing_plaintext_backup_store_is_refused_at_startup(
             advertise_host: None,
             tls: None,
             encryption_key_path: Some(key_path),
+            labels: Default::default(),
         }],
         dynamo_auth: None,
         cluster_settings: None,

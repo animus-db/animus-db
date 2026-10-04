@@ -436,6 +436,7 @@ impl ClusterConfig {
                     advertise_host: None,
                     tls: None,
                     encryption_key_path: None,
+                    labels: Default::default(),
                 }
             })
             .collect();
@@ -475,6 +476,7 @@ impl ClusterConfig {
                     advertise_host: None,
                     tls: None,
                     encryption_key_path: None,
+                    labels: Default::default(),
                 }
             })
             .collect();
@@ -1003,5 +1005,25 @@ mod tests {
         };
         cfg.validate_tls()
             .expect("no nodes means nothing to disagree");
+    }
+
+    /// G-01 stage G-a: a node entry's `labels` is additive — absent parses as
+    /// empty, empty is skipped on serialize (existing config bytes, and the
+    /// golden fixture, are unchanged), a populated map round-trips.
+    #[test]
+    fn node_labels_are_additive_and_round_trip() {
+        let mut cfg = ClusterConfig::generate(2, "127.0.0.1".parse().unwrap(), 7000);
+        assert!(
+            !cfg.to_json().contains("\"labels\""),
+            "empty labels skipped"
+        );
+        let bare = ClusterConfig::from_json(&cfg.to_json()).unwrap();
+        assert!(bare.nodes.iter().all(|n| n.labels.is_empty()));
+        cfg.nodes[1]
+            .labels
+            .insert("topology.kubernetes.io/zone".to_owned(), "z1".to_owned());
+        let parsed = ClusterConfig::from_json(&cfg.to_json()).unwrap();
+        assert!(parsed.nodes[0].labels.is_empty());
+        assert_eq!(parsed.nodes[1].labels["topology.kubernetes.io/zone"], "z1");
     }
 }

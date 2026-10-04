@@ -58,6 +58,7 @@ async fn bring_up(n: usize, dir: &Path) -> (Vec<Node>, animusd::ClusterConfig) {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                labels: Default::default(),
             })
             .collect();
         let config = animusd::ClusterConfig {

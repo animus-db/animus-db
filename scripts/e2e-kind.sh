@@ -1058,6 +1058,21 @@ KIND_CLUSTER_UP="true"
 export KUBECONFIG="$KIND_KUBECONFIG"
 kubectl cluster-info >/dev/null
 
+phase "label the kind node(s) with a region/zone (G-01 stage G-a)"
+# The operator resolves each scheduled pod's node topology labels onto the
+# pod as `animus.io/topology-*` annotations (animusd reads them back through
+# a downward-API volume, `--labels-file`) — so the node must carry some. A
+# single-node kind cluster has one zone by construction; this proves the
+# label-resolution + registration plumbing end to end, NOT cross-zone
+# placement (that is the `sim_cluster_zone_placement` corpus). The operator
+# runs out-of-cluster here with the kind admin kubeconfig, so the
+# `nodes`/`pods patch` RBAC of deploy/operator/rbac.yaml is not exercised.
+E2E_TOPOLOGY_REGION="e2e-region"
+E2E_TOPOLOGY_ZONE="e2e-zone-a"
+kubectl label node --all --overwrite \
+    "topology.kubernetes.io/region=${E2E_TOPOLOGY_REGION}" \
+    "topology.kubernetes.io/zone=${E2E_TOPOLOGY_ZONE}"
+
 phase "load image"
 kind load docker-image "$ANIMUSD_IMAGE" --name "$CLUSTER_NAME"
 
@@ -1652,6 +1667,28 @@ phase "wait for that pod's own readiness (GET /admin/health == 200)"
 # is a second, independent line of defense on top of that root-cause fix,
 # not a replacement for it.
 wait_for "pod ${DYNAMO_POD}'s /admin/health is 200" 60 2 -- admin_health_ready
+
+phase "check the operator annotated every pod with its node's topology and animusd registered it (G-01 stage G-a)"
+# The operator patches `animus.io/topology-{region,zone,resolved}` onto each
+# scheduled pod; animusd's `--labels-wait-secs` gated its own registration on
+# `resolved`, so by the time a pod is Ready its member row must already carry
+# the labels. (`RegisterNode` also fills labels into an already-present but
+# unlabelled row, so bootstrap's own `UpsertMember` winning the race does not
+# lose them.)
+for pod in $(kubectl get pods -n "$NAMESPACE" \
+    -l "app.kubernetes.io/instance=${AC_NAME}" -o jsonpath='{.items[*].metadata.name}'); do
+    POD_ZONE="$(kubectl get pod "$pod" -n "$NAMESPACE" \
+        -o jsonpath='{.metadata.annotations.animus\.io/topology-zone}')"
+    [ "$POD_ZONE" = "$E2E_TOPOLOGY_ZONE" ] || fail "pod ${pod} annotation animus.io/topology-zone is \
+'${POD_ZONE:-<empty>}', expected ${E2E_TOPOLOGY_ZONE} (operator node-label resolution did not run — RBAC for nodes/pods patch?)"
+done
+log "every pod carries animus.io/topology-zone=${E2E_TOPOLOGY_ZONE}"
+STATUS_BODY="$(curl -sS -m 5 "${CURL_TLS_ARGS[@]}" \
+    "${ADMIN_SCHEME}://${ADMIN_HOST}:${ADMIN_LOCAL_PORT}/admin/status")"
+LABELLED_MEMBERS="$(jq '[.. | objects | select(has("labels")) | .labels["topology.kubernetes.io/zone"]? | select(. == "'"$E2E_TOPOLOGY_ZONE"'")] | length' <<<"$STATUS_BODY")"
+[ "${LABELLED_MEMBERS:-0}" -ge 3 ] || fail "expected >=3 members registered with \
+topology.kubernetes.io/zone=${E2E_TOPOLOGY_ZONE} in /admin/status, found ${LABELLED_MEMBERS:-0}: ${STATUS_BODY}"
+log "/admin/status reports ${LABELLED_MEMBERS} members labelled topology.kubernetes.io/zone=${E2E_TOPOLOGY_ZONE}"
 
 phase "check GET /admin/segment-store reports the S-07b dir: store (kind: fs)"
 RESULT="$(curl -sS -m 5 "${CURL_TLS_ARGS[@]}" \

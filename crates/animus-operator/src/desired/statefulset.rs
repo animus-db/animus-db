@@ -47,9 +47,11 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::api::apps::v1::{StatefulSet, StatefulSetSpec};
 use k8s_openapi::api::core::v1::{
-    ConfigMapVolumeSource, Container, EmptyDirVolumeSource, EnvVar, HTTPGetAction,
-    PersistentVolumeClaim, PersistentVolumeClaimSpec, PodSpec, PodTemplateSpec, Probe,
-    ResourceRequirements, SecretVolumeSource, Volume, VolumeMount,
+    Affinity, ConfigMapVolumeSource, Container, DownwardAPIVolumeFile, DownwardAPIVolumeSource,
+    EmptyDirVolumeSource, EnvVar, HTTPGetAction, ObjectFieldSelector, PersistentVolumeClaim,
+    PersistentVolumeClaimSpec, PodAffinityTerm, PodAntiAffinity, PodSpec, PodTemplateSpec, Probe,
+    ResourceRequirements, SecretVolumeSource, TopologySpreadConstraint, Volume, VolumeMount,
+    WeightedPodAffinityTerm,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
@@ -248,6 +250,7 @@ const DYNAMO_AUTH_VOLUME: &str = "dynamo-auth";
 const TLS_VOLUME: &str = "tls";
 const S3_VOLUME: &str = "s3";
 const ENCRYPTION_KEY_VOLUME: &str = "encryption-key";
+const TOPOLOGY_VOLUME: &str = "topology";
 /// `defaultMode` for the encryption-key `Secret` volume (ADR 0069, S-03 PR
 /// 3): world-readable, no write bit for anyone — tighter than the
 /// Kubernetes default (`0644`, which grants the file owner write access
@@ -463,6 +466,71 @@ pub fn build(cluster: &AnimusCluster, spec: &AnimusClusterSpec) -> StatefulSet {
         });
     }
 
+    // G-01 stage G-a: the pod's own annotations, projected to a file. The
+    // operator patches the scheduled node's region/zone onto the pod as
+    // annotations (`desired::topology`); `animusd --labels-file` reads them
+    // back as this node's member labels. Always present (the label
+    // resolution is independent of `spec.topology.spread`).
+    volumes.push(Volume {
+        name: TOPOLOGY_VOLUME.to_string(),
+        downward_api: Some(DownwardAPIVolumeSource {
+            items: Some(vec![DownwardAPIVolumeFile {
+                path: super::topology::TOPOLOGY_FILE_NAME.to_string(),
+                field_ref: Some(ObjectFieldSelector {
+                    field_path: "metadata.annotations".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    volume_mounts.push(VolumeMount {
+        name: TOPOLOGY_VOLUME.to_string(),
+        mount_path: super::topology::TOPOLOGY_MOUNT_DIR.to_string(),
+        read_only: Some(true),
+        ..Default::default()
+    });
+
+    let (topology_spread_constraints, affinity) = if spec.topology_spread_enabled() {
+        (
+            Some(vec![TopologySpreadConstraint {
+                max_skew: 1,
+                topology_key: super::topology::NODE_ZONE_LABEL.to_string(),
+                // `ScheduleAnyway`: a single-zone (kind/minikube) cluster must
+                // still schedule every pod.
+                when_unsatisfiable: "ScheduleAnyway".to_string(),
+                label_selector: Some(LabelSelector {
+                    match_labels: Some(selector.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            Some(Affinity {
+                pod_anti_affinity: Some(PodAntiAffinity {
+                    preferred_during_scheduling_ignored_during_execution: Some(vec![
+                        WeightedPodAffinityTerm {
+                            weight: 100,
+                            pod_affinity_term: PodAffinityTerm {
+                                topology_key: super::topology::HOSTNAME_LABEL.to_string(),
+                                label_selector: Some(LabelSelector {
+                                    match_labels: Some(selector.clone()),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            },
+                        },
+                    ]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        )
+    } else {
+        (None, None)
+    };
+
     let container = Container {
         name: "animusd".to_string(),
         image: Some(spec.image_or_default().to_string()),
@@ -523,6 +591,8 @@ pub fn build(cluster: &AnimusCluster, spec: &AnimusClusterSpec) -> StatefulSet {
                 spec: Some(PodSpec {
                     containers: vec![container],
                     volumes: Some(volumes),
+                    topology_spread_constraints,
+                    affinity,
                     termination_grace_period_seconds: Some(TERMINATION_GRACE_PERIOD_SECS),
                     ..Default::default()
                 }),
@@ -567,6 +637,76 @@ mod tests {
             .annotations
             .unwrap()[CONFIG_HASH_ANNOTATION]
             .clone()
+    }
+
+    fn pod_spec(sts: &StatefulSet) -> PodSpec {
+        sts.spec.as_ref().unwrap().template.spec.clone().unwrap()
+    }
+
+    #[test]
+    fn topology_spread_and_anti_affinity_default_on() {
+        let cluster = test_cluster("c", "ns", 3, None);
+        let ps = pod_spec(&build(&cluster, &cluster.spec));
+        let tsc = ps.topology_spread_constraints.expect("spread constraints");
+        assert_eq!(tsc.len(), 1);
+        assert_eq!(tsc[0].topology_key, "topology.kubernetes.io/zone");
+        assert_eq!(tsc[0].max_skew, 1);
+        assert_eq!(tsc[0].when_unsatisfiable, "ScheduleAnyway");
+        assert_eq!(
+            tsc[0].label_selector.as_ref().unwrap().match_labels,
+            Some(selector_labels("c"))
+        );
+        let terms = ps
+            .affinity
+            .unwrap()
+            .pod_anti_affinity
+            .unwrap()
+            .preferred_during_scheduling_ignored_during_execution
+            .unwrap();
+        assert_eq!(terms.len(), 1);
+        assert_eq!(
+            terms[0].pod_affinity_term.topology_key,
+            "kubernetes.io/hostname"
+        );
+    }
+
+    #[test]
+    fn topology_spread_can_be_disabled_but_label_projection_stays() {
+        let mut cluster = test_cluster("c", "ns", 3, None);
+        cluster.spec.topology = Some(crate::crd::TopologySpec {
+            spread: Some(false),
+        });
+        let ps = pod_spec(&build(&cluster, &cluster.spec));
+        assert!(ps.topology_spread_constraints.is_none());
+        assert!(ps.affinity.is_none());
+        assert!(ps.volumes.unwrap().iter().any(|v| v.name == "topology"));
+    }
+
+    #[test]
+    fn topology_downward_api_volume_projects_annotations() {
+        let cluster = test_cluster("c", "ns", 3, None);
+        let sts = build(&cluster, &cluster.spec);
+        let ps = pod_spec(&sts);
+        let vol = ps
+            .volumes
+            .unwrap()
+            .into_iter()
+            .find(|v| v.name == "topology")
+            .unwrap();
+        let item = &vol.downward_api.unwrap().items.unwrap()[0];
+        assert_eq!(item.path, "annotations");
+        assert_eq!(
+            item.field_ref.as_ref().unwrap().field_path,
+            "metadata.annotations"
+        );
+        let mount = container(&sts)
+            .volume_mounts
+            .unwrap()
+            .into_iter()
+            .find(|m| m.name == "topology")
+            .unwrap();
+        assert_eq!(mount.mount_path, "/etc/animus/topology");
+        assert_eq!(mount.read_only, Some(true));
     }
 
     #[test]
@@ -1249,8 +1389,14 @@ mod tests {
         // byte-identically to before the field existed, so no already-
         // deployed cluster restarts on upgrade purely because this PR
         // shipped.
+        //
+        // **Deliberately changed by G-01 stage G-a** (2026-10-04): the
+        // entrypoint now passes `--labels-file ... --labels-wait-secs`, and
+        // the pod template gains the topology downward-API volume and spread
+        // hints, so every existing cluster rolls once on the operator
+        // upgrade that ships this — unavoidable, the template itself changed.
         let cluster = test_cluster("c", "ns", 3, None);
-        assert_eq!(config_hash(&cluster), "f5c65fc10dcc4e1c");
+        assert_eq!(config_hash(&cluster), "7ae469656d485b98");
     }
 
     #[test]

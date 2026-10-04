@@ -1754,3 +1754,20 @@ reasons. If `scripts/e2e-kind.sh` fails at the `kind create cluster` phase
 with this exact `runc`/`EOF` signature in the diagnostics dump, this is
 almost certainly it — check `docker run --cap-add SYS_RESOURCE ... echo ok`
 first before debugging anything else.
+
+## G-01 stage G-a: topology (2026-10-04)
+
+- `desired::topology`: constants + the pure `pod_annotation_patch`. The
+  controller's `resolve_pod_topology` (end of `finish_reconcile`, best effort)
+  lists the cluster's pods, reads each scheduled pod's Node labels and patches
+  `animus.io/topology-{region,zone,resolved}` onto the pod; new `ClusterApi`
+  methods `list_pods`/`get_node_labels`/`patch_pod_annotations` (+ fakes).
+  RBAC: `nodes` get/list/watch, `pods` patch (`deploy/operator/rbac.yaml`).
+- StatefulSet: zone `topologySpreadConstraints` (ScheduleAnyway) + preferred
+  hostname anti-affinity (`spec.topology.spread`, default true), and a
+  downward-API volume of `metadata.annotations` at `/etc/animus/topology`;
+  the entrypoint passes `--labels-file ... --labels-file-annotations
+  --labels-wait-secs 180`. The config-hash literal changed on purpose.
+- Operator and `animusd` image ship together (an old image rejects the flags).
+  kind e2e labels the node and asserts annotations + registered member labels
+  (could not be run in the authoring sandbox).

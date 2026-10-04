@@ -2030,7 +2030,11 @@ outstanding on the wire surface at present.
      model is part of the work.
 - **Plan (staged, each stage independently valuable and mergeable):**
   - **G-a Topology-aware single-cluster operator (S-M, independent, do
-    now).** Add a labels input to `ClusterConfig`/`animusd` flags
+    now). LANDED 2026-10-04 (branch `g01-a-topology-placement`; see the ADR 0005/0060
+    2026-10-04 amendments): labels input (`--label`/`--labels-file`/config
+    `labels`), operator node-topology annotations + spread hints, zone-spread
+    default policy, `sim_cluster_zone_placement` corpus. Known limits: policy
+    fixed at table creation; labels fixed at first registration.** Add a labels input to `ClusterConfig`/`animusd` flags
     (additive `#[serde(default)]`, ADR 0035 discipline, ADR 0073 format
     rules) so a node self-registers with labels; have the operator inject
     the pod's node `topology.kubernetes.io/region` and `/zone` labels

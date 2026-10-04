@@ -442,6 +442,18 @@ pub fn entrypoint_script(spec: &AnimusClusterSpec) -> String {
     let mut data_flags = String::new();
     let mut both_preamble = String::new();
 
+    // G-01 stage G-a: this node's topology labels, resolved by the operator
+    // onto the pod's annotations and projected to a file (see
+    // `super::topology`). Both branches accept the flags.
+    let labels_flags = format!(
+        " --labels-file {}/{} --labels-file-annotations --labels-wait-secs {}",
+        super::topology::TOPOLOGY_MOUNT_DIR,
+        super::topology::TOPOLOGY_FILE_NAME,
+        super::topology::LABELS_WAIT_SECS,
+    );
+    both_flags.push_str(&labels_flags);
+    data_flags.push_str(&labels_flags);
+
     if ephemeral {
         both_flags.push_str(" --ephemeral");
         data_flags.push_str(" --ephemeral");
@@ -902,6 +914,9 @@ mod tests {
         "--quiesce-after",
         "--dynamo-auth",
         "--advertise-host",
+        "--labels-file",
+        "--labels-file-annotations",
+        "--labels-wait-secs",
         "--seed",
         "--id",
         "--base-port",
@@ -947,6 +962,18 @@ mod tests {
             "entrypoint script emitted flag(s) `animusd` does not accept: {unknown:?}\n\
              script:\n{script}"
         );
+    }
+
+    #[test]
+    fn entrypoint_passes_the_topology_labels_flags_on_both_branches() {
+        let script = entrypoint_script(&spec(3));
+        let (both_branch, data_branch) = script.split_once("else").unwrap();
+        for branch in [both_branch, data_branch] {
+            assert!(branch.contains(
+                "--labels-file /etc/animus/topology/annotations --labels-file-annotations \
+                 --labels-wait-secs 180"
+            ));
+        }
     }
 
     #[test]

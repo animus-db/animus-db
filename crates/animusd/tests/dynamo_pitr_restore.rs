@@ -58,6 +58,7 @@ async fn start_single_node_fast_pitr(dir: &Path) -> (Node, ClusterConfig) {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                labels: Default::default(),
             }],
             dynamo_auth: None,
             cluster_settings: None,

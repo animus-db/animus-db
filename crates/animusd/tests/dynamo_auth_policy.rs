@@ -57,6 +57,7 @@ async fn bring_up(dir: &Path) -> (Node, ClusterConfig) {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                labels: Default::default(),
             }],
             dynamo_auth: Some(DynamoAuthConfig {
                 credentials: credentials.clone(),

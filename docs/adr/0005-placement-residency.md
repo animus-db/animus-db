@@ -213,3 +213,59 @@ untouched by rebalance. See `node::REPAIR_DWELL`'s own doc for the dwell
 value and trade-off, `crates/animus-control/CLAUDE.md`'s matching entry, and
 `docs/lessons/code-patterns/` for the general "protect an existing replica
 without offering it for fresh placement" pattern this established.
+
+## Amendment 2026-10-04: labels are populated in production; zone-spread default (G-01 stage G-a)
+
+Until now `Member.labels` and `PlacementPolicy`/`SpreadPolicy` existed but
+nothing in production set either: self-registration passed an empty label
+map and table creation always installed `PlacementPolicy::simple("cp-rf",
+..)`. Stage G-a of roadmap G-01 wires both (the multi-region work proper is
+ADR 0075).
+
+- **Labels in.** A node's labels come from `RoleAddrs::labels` (an additive,
+  skip-if-empty `#[serde(default)]` field of the `ClusterConfig` node
+  entry), the repeatable `--label key=value` flag and `--labels-file PATH`
+  (one `key=value` per line, `#` comments and blanks ignored, values quoted
+  or not; `--labels-file-annotations` selects the pod-annotations projection
+  the Kubernetes operator uses, ADR 0060's 2026-10-04 amendment). Flags win
+  over the file, the file over the config. Every self-registering role passes
+  them to `register_node` / `admin_add_member`. No durable or wire format
+  changed (`Member.labels` already existed).
+- **Labels are fixed at first registration, with one narrow exception.**
+  `RegisterNode`'s apply still never overwrites a non-empty label set. It now
+  *fills in* the labels of an already-present member row whose labels are
+  empty (status and `has_activated` untouched). That exists because
+  `bootstrap`'s `UpsertMember { labels: {} }` can insert a founding member's
+  row before the node's own registration lands, and no relayable command can
+  repair the row afterwards (`UpsertMember` relays only as `Down`); it also
+  lets a restart label a previously unlabelled node. **Changing a non-empty
+  label set is unsupported** (it would need a new, non-relayable command).
+  This is an apply-semantics extension of an existing command; it is
+  replay-compatible in practice because no production writer ever sent
+  non-empty labels in `RegisterNode` before this change.
+- **Policy.** `animus_placement::zone_spread_policy` returns the plain
+  `cp-rf` policy unless **every** non-`Leaving` member carries a non-empty
+  `topology.kubernetes.io/zone` value and there are at least RF distinct
+  values, in which case it adds a **best-effort** (`strict: false`) spread
+  over that key. All-members-labelled is required because a spread policy
+  excludes a candidate lacking the domain label (`eligible_domains`), so
+  installing it on a partially labelled cluster would silently shrink the
+  candidate pool. Best-effort rather than strict so that after a whole zone is
+  lost the repair pass (`replan_repair`) doubles up in a surviving zone
+  instead of refusing to heal; `rebalance_step` already never worsens the
+  worst domain for a best-effort spread, and its termination argument (sum of
+  squares of per-node counts) is independent of spread, so the documented
+  non-convergence caveat (max-min <= 1 not guaranteed under a spread
+  constraint) applies unchanged.
+- **Initial replica pick.** The first tablet's initial replicas are chosen
+  with `select_replicas_balanced` over the `Active` members when the policy
+  spreads (fallback: the historical first-RF-by-id), because the reconciler
+  does not repair a best-effort spread that merely *started* skewed (it is not
+  a hard violation). Split children inherit the parent's replicas and are
+  placed by the existing directed-Placing machinery under the parent's policy.
+- **Known limitations.** The policy is computed at table-creation time only:
+  a cluster that gains zones later does not retro-upgrade existing tables, and
+  a cluster that is partially labelled at creation gets the plain policy
+  forever for that table. A node added later without the zone label is not
+  eligible for spread-policy tables. Verified by the seed-reproducible
+  `sim_cluster_zone_placement` corpus (`ANIMUS_ZONE_PLACEMENT_SEEDS`).

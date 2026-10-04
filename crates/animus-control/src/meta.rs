@@ -570,6 +570,35 @@ pub struct Metadata {
     pub cluster_version: u32,
 }
 
+/// G-01 stage G-a: `RegisterNode`'s one narrow label write onto an
+/// **already-present** member row — fill the labels in iff the row's own are
+/// empty and the registration carries some. Returns whether it changed
+/// anything. Never overwrites a non-empty label set and never touches
+/// `status`/`has_activated`.
+///
+/// Why it exists: a founding member's row can be inserted by `bootstrap`'s
+/// `UpsertMember { labels: {} }` (or an operator's bare `admin_add_member`)
+/// *before* the node's own self-registration — carrying the topology labels
+/// resolved from its pod's node — reaches the log, and no relayable command
+/// can fix the row afterwards (`UpsertMember` is relayable only as `Down`).
+/// Without this the placement spread policy would silently see an unlabelled
+/// node depending on a startup race. Also lets a restart of a previously
+/// unlabelled node (same addresses, the idempotent arm) label it. Changing a
+/// non-empty label set is deliberately still unsupported.
+fn fill_empty_labels(
+    members: &mut BTreeMap<NodeId, Member>,
+    node: &NodeId,
+    labels: &BTreeMap<String, String>,
+) -> bool {
+    match members.get_mut(node) {
+        Some(m) if m.labels.is_empty() && !labels.is_empty() => {
+            m.labels = labels.clone();
+            true
+        }
+        _ => false,
+    }
+}
+
 fn is_zero_u32(v: &u32) -> bool {
     *v == 0
 }
@@ -5246,6 +5275,9 @@ impl Metadata {
                             );
                             return ApplyOutcome::Applied;
                         }
+                        if claims_membership && fill_empty_labels(&mut self.members, node, labels) {
+                            return ApplyOutcome::Applied;
+                        }
                         ApplyOutcome::NoOp
                     }
                     Some(_) => {
@@ -5270,6 +5302,8 @@ impl Metadata {
                                     has_activated: false,
                                 },
                             );
+                        } else if claims_membership {
+                            fill_empty_labels(&mut self.members, node, labels);
                         }
                         ApplyOutcome::Applied
                     }
@@ -11266,7 +11300,9 @@ mod tests {
             m.apply(&MetaCommand::RegisterNode {
                 node: nid(901),
                 addrs: cas_addrs(1),
-                labels: BTreeMap::new(),
+                // Non-empty: G-a's fill-in only ever labels an *unlabelled*
+                // row, so a differing later label set must stay a NoOp.
+                labels: [("region".to_owned(), "us-east".to_owned())].into(),
             }),
             ApplyOutcome::Applied
         );
@@ -11415,6 +11451,66 @@ mod tests {
             "RegisterNode must never overwrite labels a different command already set"
         );
         assert_eq!(member.status, NodeStatus::Down);
+    }
+
+    /// G-01 stage G-a: a member row inserted *unlabelled* (bootstrap's
+    /// `UpsertMember { labels: {} }` winning the race against the node's own
+    /// self-registration) gets its labels filled in by the later
+    /// `RegisterNode` — status and `has_activated` untouched — on both the
+    /// unclaimed-address arm and the idempotent same-addresses re-registration
+    /// arm (a restart of a previously unlabelled node); a non-empty label set
+    /// is never overwritten.
+    #[test]
+    fn register_node_fills_in_labels_on_an_unlabelled_member_but_never_overwrites() {
+        let zone = |z: &str| -> BTreeMap<String, String> {
+            [("topology.kubernetes.io/zone".to_owned(), z.to_owned())].into()
+        };
+        let mut m = Metadata::default();
+        m.apply(&MetaCommand::UpsertMember {
+            node: nid(906),
+            labels: BTreeMap::new(),
+            status: NodeStatus::Active,
+        });
+        assert_eq!(
+            m.apply(&MetaCommand::RegisterNode {
+                node: nid(906),
+                addrs: cas_addrs(6),
+                labels: zone("a"),
+            }),
+            ApplyOutcome::Applied
+        );
+        let member = &m.members[&nid(906)];
+        assert_eq!(member.labels, zone("a"));
+        assert_eq!(member.status, NodeStatus::Active);
+        assert!(member.has_activated);
+        // A different label set never overwrites a non-empty one.
+        assert_eq!(
+            m.apply(&MetaCommand::RegisterNode {
+                node: nid(906),
+                addrs: cas_addrs(6),
+                labels: zone("b"),
+            }),
+            ApplyOutcome::NoOp
+        );
+        assert_eq!(m.members[&nid(906)].labels, zone("a"));
+
+        // Idempotent arm: addresses already on file, member row unlabelled.
+        let mut m = Metadata::default();
+        m.apply(&MetaCommand::RegisterNode {
+            node: nid(907),
+            addrs: cas_addrs(7),
+            labels: BTreeMap::new(),
+        });
+        assert_eq!(
+            m.apply(&MetaCommand::RegisterNode {
+                node: nid(907),
+                addrs: cas_addrs(7),
+                labels: zone("c"),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(m.members[&nid(907)].labels, zone("c"));
+        assert_eq!(m.members[&nid(907)].status, NodeStatus::Down);
     }
 
     /// **The bug an integration test caught** (`animusd`'s `control_only_

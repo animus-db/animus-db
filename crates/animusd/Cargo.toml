@@ -70,6 +70,7 @@ animus-s3 = { workspace = true, features = ["prod"] }
 # re-exports its wire types/`topology`/`decide` from at the crate root.
 animus-node.workspace = true
 animus-control.workspace = true
+animus-placement.workspace = true
 animus-cp-data.workspace = true
 animus-storage.workspace = true
 animus-tablet.workspace = true

@@ -188,7 +188,12 @@
         Which nodes hold which replicas is a <strong>placement</strong> decision made by the
         control plane. The placement engine honours the replication factor, spreads replicas
         across failure domains, and respects residency labels — so you can require that a
-        group's data never leaves a given region or jurisdiction.
+        group's data never leaves a given region or jurisdiction. A node's labels are set at
+        its first registration with <code>--label key=value</code>, <code>--labels-file</code>,
+        or a node entry's <code>labels</code> in the cluster config; on Kubernetes the operator
+        supplies the node's <code>topology.kubernetes.io/region</code> and <code>/zone</code>
+        automatically, and a table created while the members span at least as many zones as
+        its replication factor spreads its replicas across zones (best effort).
       </p>
       <p>
         When a node fails, the control plane notices through heartbeats, re-plans the affected

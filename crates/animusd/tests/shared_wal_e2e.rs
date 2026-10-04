@@ -184,6 +184,7 @@ async fn bring_up_with(
             advertise_host: None,
             tls: None,
             encryption_key_path: None,
+            labels: Default::default(),
         };
         let config = animusd::ClusterConfig {
             version: animusd::config::CLUSTER_CONFIG_VERSION,

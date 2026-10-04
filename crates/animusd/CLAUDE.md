@@ -11858,3 +11858,20 @@ violations); a truncated LSM file on every node must fail the strict open
 bump) need no change here: they land as one `transcode::TABLE` entry and the
 cells grow with `transcode::supported_back()`.
 
+
+## G-01 stage G-a: node labels and the zone-spread default (2026-10-04)
+
+- `RoleAddrs::labels` (additive, skip-if-empty) is each node's topology labels;
+  `Bound{,Control,Data}Node` keep them and pass them to `register_node` /
+  `admin_add_member`. Inputs and merge order: `node_labels::LabelFlags`
+  (`--label`, `--labels-file`, `--labels-file-annotations`,
+  `--labels-wait-secs`; flag > file > config). `--cluster N` rejects them.
+  `node_labels.rs` is process-boundary startup code (real `std::fs` and a real
+  bounded wait) and deliberately not a `#[deny(disallowed_methods)]` module.
+- `schema.rs::default_table_policy` / `zone_aware_initial_replicas`: the
+  zone-spread policy decision at table creation (see
+  `animus_placement::zone_spread_policy`). Computed once at creation.
+- `sim_cluster_zone_placement.rs` (`ANIMUS_ZONE_PLACEMENT_SEEDS`,
+  `SimCluster::new_with_node_labels`): 6 nodes / 3 zones, RF 3, wire
+  `CreateTable`, zone kill. Negative-controlled: disabling the zone-aware
+  initial pick fails it at placement.

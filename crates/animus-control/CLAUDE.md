@@ -3035,3 +3035,14 @@ rounds while the apply task is behind.
   until the next round syncs.
 
 **Upgrade-harness class (ADR 0073 P1-D):** `control-wal`/`shared-wal` are whole-file `TABLE` entries in `animus-test`'s transcode table (a bump edits that entry; legacy encoders must be `pub` + `legacy-encoders`-gated); `control-snapshot`, `metadata`, `mirror-version` and `mirror-entities` are `EMBEDDED` (a bump edits their carrier's transcode).
+
+## G-01 stage G-a: `RegisterNode` label fill-in (2026-10-04)
+
+`RegisterNode`'s apply still never overwrites a *non-empty* member label set,
+but now fills in an already-present member row whose labels are *empty*
+(`fill_empty_labels`; status/`has_activated` untouched), on both the
+unclaimed-address and the idempotent same-addresses arms. Reason: bootstrap's
+`UpsertMember { labels: {} }` can beat the node's own registration, and no
+relayable command can repair the row afterwards. Changing non-empty labels is
+unsupported (would need a new non-relayable command). See ADR 0005's
+2026-10-04 amendment.

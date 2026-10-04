@@ -1880,3 +1880,56 @@ installed without the webhook the reconciler sets the
 before applying any child resource. Every shipped `AnimusCluster` manifest
 carries `schemaVersion: 1`, and a golden fixture
 (`tests/fixtures/formats/animuscluster-spec/v1.json`) pins the format.
+
+## Amendment 2026-10-04: node topology resolution and spread hints (G-01 stage G-a)
+
+**Spread hints.** The `StatefulSet` pod template carries a
+`topologySpreadConstraints` entry over `topology.kubernetes.io/zone`
+(`maxSkew: 1`, `whenUnsatisfiable: ScheduleAnyway`, so a single-zone kind or
+dev cluster still schedules) and a *preferred* pod anti-affinity over
+`kubernetes.io/hostname`, both selecting the cluster's own pods. On by
+default; `spec.topology.spread: false` (additive optional CRD field) turns
+both off.
+
+**Resolving a node's region/zone.** The downward API cannot expose a *node's*
+labels, so `animusd` cannot read them itself. Decision: the **operator**
+resolves them. After applying children, every reconcile lists the cluster's
+pods; for each scheduled pod it reads the `Node` named by `spec.nodeName`
+and merge-patches `animus.io/topology-region`, `animus.io/topology-zone` (only
+those the node has) and `animus.io/topology-resolved: "true"` onto the pod
+(`desired::topology::pod_annotation_patch`, a pure function; a node with no
+topology labels still gets the marker, an unreadable node patches nothing and
+is retried). The reconcile requeues after 3 s while any pod is unscheduled.
+The pod template mounts a downward-API volume projecting
+`metadata.annotations` to `/etc/animus/topology/annotations`, and the
+entrypoint passes `--labels-file ... --labels-file-annotations
+--labels-wait-secs 180` on both role branches. `animusd` keeps only the
+`animus.io/topology-*` keys, translates them back to the canonical
+`topology.kubernetes.io/{region,zone}` label keys
+(`animusd::node_labels`), and waits (bounded, polling the file) for the
+`resolved` marker before registering; on timeout it logs a warning and
+registers with whatever is there (labels are then fixed until a restart that
+finds them, ADR 0005's 2026-10-04 amendment). RBAC added in
+`deploy/operator/rbac.yaml`: `nodes` get/list/watch (cluster-scoped) and
+`pods` patch.
+
+**Why not an init container.** An init container would have to read the Node
+itself, i.e. every cluster pod's ServiceAccount would need cluster-wide `nodes`
+read access, a far wider grant than the one operator doing it once; it also
+needs a new image or a `kubectl`-capable one and still has to hand the result
+to `animusd` through a shared volume. The operator already watches the pods
+and has the permissions' natural home. The cost: the kubelet refreshes a
+downward-API volume on its own sync period (up to about a minute after the
+annotation lands), hence the generous default wait; and the startup path
+depends on the operator being up (bounded by the wait, never a hard failure).
+
+**Compatibility and rollout.** The operator and the `animusd` image ship
+together: an old image rejects the new flags. The pod template (volume, spread
+hints, entrypoint) changes, so every existing cluster rolls once on the
+operator upgrade that ships this. The `rbac.yaml` update is needed for
+resolution; without it pods still start (after the wait) unlabelled and the
+operator logs a warning per reconcile. `scripts/e2e-kind.sh` labels the kind
+node with a region/zone and asserts the annotations and the registered member
+labels (it runs the operator out-of-cluster, so the RBAC itself is not
+exercised there). Cross-zone placement is proven by the `SimCluster` corpus,
+not by kind. The multi-region ADR is 0075.
