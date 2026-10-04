@@ -46,6 +46,12 @@ Each node assembles three internal roles over `ProdEnv` (the only place real
 time/IO/RNG live): a control-plane Raft node, a data-plane replica, and a
 client-facing coordinator that serves the DynamoDB-JSON wire adapter.
 
+## Operating a cluster
+
+Procedures for day-two operations (node replacement and decommission, quorum
+loss, backup and restore, certificate rotation, upgrades, disk, overload) are in
+the [operations runbook](runbook/README.md).
+
 ## Where metrics surface
 
 Observability is a **deterministic-safe seam** in `animus-env` (ADR 0015):
@@ -124,11 +130,10 @@ curl -s <dynamo addr>/metrics
 # control_is_leader 1
 ```
 
-The body is **aggregated across the node's three role sinks** (control, data,
-coord), read at request time so it reflects live activity. A node runs three
-internal `ProdEnv` roles on distinct ids, each recording into its own sink:
-`RaftNode::start` records into the control env's sink, the data replica and the
-coordinator into theirs. The handler sums the three snapshots counter-by-counter
+The body is **aggregated across the node's two metric sinks** (control and
+data), read at request time so it reflects live activity (`ClientCtx::metrics_text`).
+The control plane records into the control env's sink and the data replica into
+its own; the handler sums the snapshots counter-by-counter
 (and takes the max of the leadership gauge, which only the control plane sets),
 so both control- and data-plane counters surface from one endpoint. Both move
 today: the control-plane counters as soon as the control Raft group is active,
