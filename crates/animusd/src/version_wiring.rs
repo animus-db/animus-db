@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use animus_control::meta::{MetaCommand, Metadata, NodeStatus};
+use animus_control::meta::{MetaCommand, Metadata};
 use animus_control::version::{ClusterFeatures, NodeVersion, VersionRange, own_range};
 use animus_control::version_observe::{OBSERVATION_WINDOW, VersionObservation};
 use animus_env::{Env, EnvExt, NodeId, handshake};
@@ -214,23 +214,19 @@ pub(crate) struct Blocker {
 
 /// Every node that blocks `FinalizeClusterVersion { target }` right now.
 ///
-/// Superset of what `Metadata::apply` enforces (no record; range excludes
-/// `target`): ADR 0073 decision 6 also makes `Down`, `Leaving` and
-/// never-activated `Joining` members block regardless of any recorded range.
-/// Apply does NOT enforce the status half; this pre-check does, on the
-/// leader's own view (racy, operator-level). Apply-level enforcement is a
-/// known gap tracked in issue #1168.
+/// Mirrors what `Metadata::apply` enforces (no record; range excludes
+/// `target`; and, since issue #1168, a `Down`, `Leaving` or never-activated
+/// `Joining` member via `Member::finalize_block_reason`) but names every
+/// blocker. It reads the leader's applied cache, so it is operator-level
+/// only: apply is the authoritative check.
 pub(crate) fn finalize_blockers(meta: &Metadata, target: u32) -> Vec<Blocker> {
     let mut out = Vec::new();
     for node in meta.required_version_set() {
-        let status_reason = meta.members.get(&node).and_then(|m| match m.status {
-            NodeStatus::Down => Some("member is Down".to_string()),
-            NodeStatus::Leaving => Some("member is Leaving".to_string()),
-            NodeStatus::Joining if !m.has_activated => {
-                Some("member is Joining (never activated)".to_string())
-            }
-            _ => None,
-        });
+        let status_reason = meta
+            .members
+            .get(&node)
+            .and_then(|m| m.finalize_block_reason())
+            .map(str::to_string);
         let reason = status_reason.or_else(|| match meta.node_versions.get(&node) {
             None => Some("not reported".to_string()),
             Some(v) if !v.range.contains(target) => Some(format!(
@@ -435,7 +431,7 @@ pub(crate) async fn version_wiring_loop<E: Env, R: RelayClient>(ctx: ClientCtx<E
 #[cfg(test)]
 mod tests {
     use super::*;
-    use animus_control::meta::{Member, NodeAddrs};
+    use animus_control::meta::{Member, NodeAddrs, NodeStatus};
 
     fn nid(s: &str) -> NodeId {
         NodeId::propose(s).unwrap()

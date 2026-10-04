@@ -583,10 +583,11 @@ fn run_phase1_after_era(seed: u64, variant: u64) {
             expected: 1,
             target: 2,
         });
-        // Every recorded node is [1,1] (excludes the target) and 12 never
-        // reported: either named blocker is correct; an Applied is the bug.
+        // Every recorded node is [1,1] (excludes the target), 12 never
+        // reported and (registered, never heard from) is a `Down` member: any
+        // named blocker is correct; an Applied is the bug.
         assert!(
-            format!("{out:?}").starts_with("Rejected(\"blocked: a registered node"),
+            format!("{out:?}").starts_with("Rejected(\"blocked: a "),
             "seed={seed}: {out:?}"
         );
     }
