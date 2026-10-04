@@ -167,6 +167,7 @@ cargo deny check                                   # licenses + advisories (carg
 scripts/check-format-fixtures.sh                   # ADR 0073 Phase 0: fails if a checked-in format fixture was edited/deleted
 cargo bench -p animus-storage                      # ProdEnv smoke of the write/IO path
 cargo bench -p animusd                             # cluster wire benchmark: latency percentiles + degraded phase
+cargo run --release -p animus-bench -- --help      # open-loop YCSB A-F load generator over the DynamoDB wire (docs/benchmarks.md, ADR 0074)
 cargo bench -p animus-cp-data --bench wal_fsync_bench  # ProdEnv WAL fsync bench gating SharedWal wiring (ADR 0028, C-05)
 ```
 
