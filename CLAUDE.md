@@ -147,6 +147,7 @@ the relevant one before working in a crate:
 | `animus-node` | [crates/animus-node/CLAUDE.md](crates/animus-node/CLAUDE.md) |
 | `animusd` | [crates/animusd/CLAUDE.md](crates/animusd/CLAUDE.md) |
 | `animus-cli` | [crates/animus-cli/CLAUDE.md](crates/animus-cli/CLAUDE.md) |
+| `animus-bench` | [crates/animus-bench/CLAUDE.md](crates/animus-bench/CLAUDE.md) |
 | `animus-operator` | [crates/animus-operator/CLAUDE.md](crates/animus-operator/CLAUDE.md) |
 
 ## Commands
