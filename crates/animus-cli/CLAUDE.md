@@ -412,6 +412,7 @@ control-grow <leader-admin-addr> <node-id> <admin-addr> [<node-id> <admin-addr>.
 deadline polled — the regression net for the admin dial/preamble bug
 (`docs/lessons/testing/2026-10-04-cli-admin-path-never-ran-against-real-admin-listener.md`).
 Any change to `dial`/`maybe_tls_connect`/`http_call` must keep it green.
+It resolves the binary through `animus_bin()` (runtime `NEXTEST_BIN_EXE_animus`, falling back to compile-time `CARGO_BIN_EXE_animus`): CI runs nextest archives on another runner, where the compile-time path does not exist (`docs/lessons/testing/2026-10-04-cargo-bin-exe-is-compile-time-archived-nextest.md`). Any new test spawning a workspace binary must do the same.
 (This crate may host such tests because it depends on `animusd`; the reverse
 is not possible.) The older note that follows predates it: the client path
 (`status`/`put`/`get`) and the rest of the admin surface's HTTP

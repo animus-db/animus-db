@@ -17,7 +17,7 @@
 )]
 
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -111,6 +111,17 @@ fn test_pki(dir: &Path) -> (TlsSection, std::path::PathBuf) {
     )
 }
 
+/// Path to the `animus` binary under test. CI runs this target from a
+/// cargo-nextest archive extracted on another runner (`--workspace-remap`),
+/// where the compile-time `CARGO_BIN_EXE_animus` path does not exist; nextest
+/// sets `NEXTEST_BIN_EXE_animus` to the remapped path at runtime, so prefer it
+/// and fall back to the compile-time path for plain `cargo test`.
+fn animus_bin() -> PathBuf {
+    std::env::var_os("NEXTEST_BIN_EXE_animus")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_animus")))
+}
+
 /// Run `animus [--tls-ca CA] admin <sub> <addr>` until it succeeds with a
 /// stdout satisfying `ok`, or `OVERALL` elapses (then panic with the last
 /// stdout/stderr).
@@ -120,7 +131,7 @@ async fn run_admin_until(sub: &str, addr: SocketAddr, ca: Option<&Path>, ok: fn(
     let out = tokio::task::spawn_blocking(move || {
         let deadline = Instant::now() + OVERALL;
         loop {
-            let mut cmd = Command::new(env!("CARGO_BIN_EXE_animus"));
+            let mut cmd = Command::new(animus_bin());
             if let Some(ca) = &ca {
                 cmd.arg("--tls-ca").arg(ca);
             }
