@@ -11858,3 +11858,17 @@ violations); a truncated LSM file on every node must fail the strict open
 bump) need no change here: they land as one `transcode::TABLE` entry and the
 cells grow with `transcode::supported_back()`.
 
+
+## Observability kit and the metrics-exist check (R-01 (f))
+
+`deploy/observability/` (alert + recording rules, Grafana dashboard, SLO
+README) references real exposition names only. Prometheus scrapes
+`GET /metrics` on the DynamoDB port (`dynamo.rs::handle_conn`), not
+`/admin/metrics` (JSON). `sim_cluster_admin::metric_references_exist_in_exposition`
+(runs in the `--lib` nextest tier) renders `SimCluster::metrics_text(node)`
+(the real `ClientCtx::metrics_text`), cross-checks it against `/admin/metrics`
+and `Metric::ALL`, then greps `docs/`, `website/` and `deploy/observability/`.
+A false positive (a backticked identifier that only looks like a metric)
+goes in its `NOT_A_METRIC` allowlist with a reason. `dynamo_requests_total` /
+`dynamo_responses_5xx` are bumped per dispatched request in `handle_conn`
+(test: `dynamo::..::request_outcome_counters_count_requests_and_only_5xx_faults`).

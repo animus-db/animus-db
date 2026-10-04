@@ -574,7 +574,9 @@
       <ul>
         <li><strong>Metrics</strong> — a line-oriented <code>name value</code> text export at
           <code>GET /metrics</code> on the DynamoDB port. Counters and a leadership gauge, in
-          stable order.</li>
+          stable order. Reference Prometheus alert rules, availability SLO
+          recording rules and a Grafana dashboard ship in
+          <code>deploy/observability/</code>.</li>
         <li><strong>Tracing</strong> — optional OpenTelemetry export with W3C trace context
           propagated across forwarded hops, so a request that lands on the wrong node still shows
           as one trace.</li>

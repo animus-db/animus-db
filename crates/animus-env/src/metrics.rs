@@ -959,12 +959,25 @@ pub enum Metric {
     /// sustained non-zero value needs an operator (`/admin/raftkv`'s
     /// per-group `refused_as_voter` names which tablet).
     CpGroupsRefusedAsVoter,
+
+    // --- DynamoDB wire request outcomes (R-01 (f), appended; same slot-stability discipline) ---
+    // Recorded by `animusd::dynamo`'s per-connection loop, once per request that
+    // reached `dispatch` (i.e. past the `/metrics` route and the SigV4 gate).
+    // They exist so a Prometheus alert can express a server-fault ratio
+    // (`dynamo_responses_5xx / dynamo_requests_total`); a throttled or invalid
+    // request is a 4xx and is deliberately not counted as a fault.
+    /// A DynamoDB-wire request was dispatched (every response status).
+    DynamoRequestsTotal,
+    /// A dispatched DynamoDB-wire request answered with an HTTP 5xx status
+    /// (`InternalServerError`/`ServiceUnavailable`: the server, not the client
+    /// or a throttle, failed it).
+    DynamoResponses5xx,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 110] = [
+    pub const ALL: [Metric; 112] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -1075,6 +1088,8 @@ impl Metric {
         Metric::CpRemovalNoticesIgnored,
         Metric::CpDepartingPeersDropped,
         Metric::CpGroupsRefusedAsVoter,
+        Metric::DynamoRequestsTotal,
+        Metric::DynamoResponses5xx,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -1192,6 +1207,8 @@ impl Metric {
             Metric::CpRemovalNoticesIgnored => "cp_removal_notices_ignored",
             Metric::CpDepartingPeersDropped => "cp_departing_peers_dropped",
             Metric::CpGroupsRefusedAsVoter => "cp_groups_refused_as_voter",
+            Metric::DynamoRequestsTotal => "dynamo_requests_total",
+            Metric::DynamoResponses5xx => "dynamo_responses_5xx",
         }
     }
 

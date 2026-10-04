@@ -1187,3 +1187,9 @@ hold the lock only for the swap. Trait defaults are correct for any `Disk`
 and `SimEnv` override them natively. `EncryptedDisk` deliberately uses the
 defaults (its per-file frame index makes a native rename-based swap
 non-trivial), so under `--encryption-key` the swap re-reads and `replace`s.
+
+**Adding a `Metric` (R-01 (f)):** append the variant, its `ALL` row and its
+`name()` arm, then update every doc/alert that should reference it; the
+`animusd` test `sim_cluster_admin::metric_references_exist_in_exposition`
+fails if any name in `docs/`, `website/` or `deploy/observability/` is not in
+the live exposition. Exported names are unprefixed (no `animus_`).
