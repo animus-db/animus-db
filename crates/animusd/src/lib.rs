@@ -12299,7 +12299,11 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     pub(crate) fn admin_cluster_version_view(&self) -> serde_json::Value {
         let meta = self.effective_metadata();
         let observed = self.edge.leader_handle().map(|l| l.version_observations());
-        version_wiring::cluster_version_view(&meta, &self.edge.version().profile(), observed.as_ref())
+        version_wiring::cluster_version_view(
+            &meta,
+            &self.edge.version().profile(),
+            observed.as_ref(),
+        )
     }
 
     /// `POST /admin/cluster-version/finalize` (ADR 0073 Phase 2, P2-C):
@@ -12350,7 +12354,12 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 )}),
             );
         }
-        let own = self.edge.version().profile().range.unwrap_or_else(animus_control::version::own_range);
+        let own = self
+            .edge
+            .version()
+            .profile()
+            .range
+            .unwrap_or_else(animus_control::version::own_range);
         if target > own.max {
             return (
                 409,
@@ -17580,8 +17589,11 @@ async fn discover_join_info(
             // anything (covers the pre-era "binary R+1 vs cluster at R-1"
             // case, which `EraWatch` cannot: it is era-only). A Phase 1 seed
             // omits the field (reads 0 = version 1).
-            version_wiring::check_join_range(cluster_version, &animus_control::version::own_range())
-                .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidData, msg))?;
+            version_wiring::check_join_range(
+                cluster_version,
+                &animus_control::version::own_range(),
+            )
+            .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidData, msg))?;
             Ok((control_ids, peers, client_route, intra_route, admin_addrs))
         }
         other => Err(std::io::Error::other(format!(
@@ -22239,6 +22251,8 @@ mod sim_cluster_control_membership_admin;
 #[cfg(test)]
 mod sim_cluster_seed_join;
 
+#[cfg(test)]
+mod sim_cluster_cluster_version;
 /// ADR 0073 Phase 2 (P2-A) residual risk #1 at the node-assembly level: every
 /// node role `SimCluster` can build (control-only, combined, data-only, a
 /// runtime-grown control voter, `join_via_seed` joiners of both kinds) is in
@@ -22246,8 +22260,6 @@ mod sim_cluster_seed_join;
 /// range. See `sim_cluster_version_observation.rs`'s own module doc.
 #[cfg(test)]
 mod sim_cluster_version_observation;
-#[cfg(test)]
-mod sim_cluster_cluster_version;
 
 /// C-13 / ADR 0061 rung M PR 6 — `tests/control_membership_split.rs`'s own
 /// two real-socket tests, a mixed disposition: (1)

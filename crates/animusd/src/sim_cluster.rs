@@ -3181,21 +3181,25 @@ impl SimCluster {
     /// control-bearing; a data-only node has no `RaftNode`), and the
     /// simulated network `ext` its peers observe (`Simulator::
     /// set_network_ext_for`). Takes effect immediately, no restart needed.
-    pub(crate) fn set_node_version(&mut self, node: u64, range: Option<animus_control::version::VersionRange>) {
+    pub(crate) fn set_node_version(
+        &mut self,
+        node: u64,
+        range: Option<animus_control::version::VersionRange>,
+    ) {
         let ctx = self.shared.ctx(node);
         let build = version_wiring::BUILD.to_string();
-        ctx.edge.version().set_profile(version_wiring::VersionProfile {
-            range,
-            build: build.clone(),
-        });
+        ctx.edge
+            .version()
+            .set_profile(version_wiring::VersionProfile {
+                range,
+                build: build.clone(),
+            });
         if let Some(idx) = self.control_index_of(node) {
             self.controls[idx].set_own_build(build.clone());
             self.controls[idx].set_own_version_range(range);
         }
-        self.sim.set_network_ext_for(
-            ctx.env.node_id(),
-            version_wiring::ext_for(range, &build),
-        );
+        self.sim
+            .set_network_ext_for(ctx.env.node_id(), version_wiring::ext_for(range, &build));
     }
 
     /// Set ONLY a control-bearing node's `RaftNode` own range, leaving its
@@ -3215,7 +3219,10 @@ impl SimCluster {
     }
 
     /// [`set_node_version`](Self::set_node_version) for every node.
-    pub(crate) fn set_all_node_versions(&mut self, range: Option<animus_control::version::VersionRange>) {
+    pub(crate) fn set_all_node_versions(
+        &mut self,
+        range: Option<animus_control::version::VersionRange>,
+    ) {
         for node in 0..self.nodes as u64 {
             self.set_node_version(node, range);
         }

@@ -1183,7 +1183,10 @@ pub fn is_relayable_command(command: &MetaCommand) -> bool {
 
 /// `skip_serializing_if` predicate for additive `u32` wire fields whose
 /// default must not appear on the wire (ADR 0073 Phase 2).
-#[allow(clippy::trivially_copy_pass_by_ref, reason = "serde skip predicate signature")]
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip predicate signature"
+)]
 fn is_zero_u32(v: &u32) -> bool {
     *v == 0
 }

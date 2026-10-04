@@ -142,7 +142,10 @@ impl Default for VersionState {
 
 impl VersionState {
     pub(crate) fn profile(&self) -> VersionProfile {
-        self.profile.lock().expect("version profile poisoned").clone()
+        self.profile
+            .lock()
+            .expect("version profile poisoned")
+            .clone()
     }
 
     pub(crate) fn set_profile(&self, p: VersionProfile) {
@@ -357,9 +360,8 @@ pub(crate) async fn version_wiring_loop<E: Env, R: RelayClient>(ctx: ClientCtx<E
                                 let me = me2.clone();
                                 let want = want2.clone();
                                 async move {
-                                    (c.effective_metadata().node_versions.get(&me)
-                                        == Some(&want))
-                                    .then_some(())
+                                    (c.effective_metadata().node_versions.get(&me) == Some(&want))
+                                        .then_some(())
                                 }
                             })
                             .await;
@@ -454,7 +456,8 @@ mod tests {
         assert_eq!(safe_target(&meta, &VersionRange::new(1, 2)), None);
 
         let mut ok = Metadata::default();
-        ok.members.insert(nid("a"), member(NodeStatus::Active, true));
+        ok.members
+            .insert(nid("a"), member(NodeStatus::Active, true));
         ok.node_addrs.insert(
             nid("v"),
             NodeAddrs {

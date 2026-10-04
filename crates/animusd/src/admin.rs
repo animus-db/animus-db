@@ -2822,7 +2822,8 @@ async fn action_finalize_cluster_version<E: Env, R: RelayClient>(
             Err(e) => return e,
         }
     };
-    ctx.admin_finalize_cluster_version(req.to, req.expected).await
+    ctx.admin_finalize_cluster_version(req.to, req.expected)
+        .await
 }
 
 // ---- data write proxies (ADR 0021 dashboard) ----------------------------

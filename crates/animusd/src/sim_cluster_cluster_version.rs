@@ -69,7 +69,12 @@ fn poll_until(
     }
 }
 
-const ROLES: [NodeRole; 4] = [NodeRole::Both, NodeRole::Both, NodeRole::Both, NodeRole::Data];
+const ROLES: [NodeRole; 4] = [
+    NodeRole::Both,
+    NodeRole::Both,
+    NodeRole::Both,
+    NodeRole::Data,
+];
 const DATA_NODE: u64 = 3;
 
 fn new_cluster(seed: u64) -> SimCluster {
@@ -90,7 +95,10 @@ fn a_follower(cluster: &mut SimCluster) -> u64 {
 
 fn get_view(cluster: &mut SimCluster, node: u64) -> Value {
     let (status, body) = cluster.admin(node, "GET", "/admin/cluster-version", "", b"");
-    assert_eq!(status, 200, "GET /admin/cluster-version on node {node}: {body}");
+    assert_eq!(
+        status, 200,
+        "GET /admin/cluster-version on node {node}: {body}"
+    );
     serde_json::from_str(&body).expect("view json")
 }
 
@@ -118,8 +126,7 @@ fn start_era(cluster: &mut SimCluster, seed: u64, hi: u32) {
         "the era to start and every node to hold a record",
         |c| {
             (0..ROLES.len() as u64).all(|n| c.features(n).era_active())
-                && (0..ROLES.len() as u64)
-                    .all(|n| c.metadata(n).node_versions.len() == ROLES.len())
+                && (0..ROLES.len() as u64).all(|n| c.metadata(n).node_versions.len() == ROLES.len())
         },
     );
 }
@@ -134,7 +141,10 @@ fn run_no_report_before_the_era(seed: u64) {
     cluster.run_for(Duration::from_secs(20));
     for node in 0..ROLES.len() as u64 {
         let meta = cluster.metadata(node);
-        assert_eq!(meta.cluster_version, 0, "seed={seed}: node {node} era started");
+        assert_eq!(
+            meta.cluster_version, 0,
+            "seed={seed}: node {node} era started"
+        );
         assert!(
             meta.node_versions.is_empty(),
             "seed={seed}: node {node} holds a version record before the era"
@@ -160,7 +170,10 @@ fn run_era_starts_and_every_role_is_fed(seed: u64) {
         let f = cluster.features(node);
         assert!(f.era_active(), "seed={seed}: node {node}");
         assert_eq!(f.cluster_version(), 1, "seed={seed}: node {node}");
-        assert!(cluster.version_halt(node).is_none(), "seed={seed}: node {node}");
+        assert!(
+            cluster.version_halt(node).is_none(),
+            "seed={seed}: node {node}"
+        );
     }
 }
 
@@ -278,7 +291,10 @@ fn run_finalize_success_and_refusals(seed: u64) {
         let (status, v) = post_finalize(&mut cluster, node, "{}");
         assert_eq!(status, 409, "seed={seed} node {node}: {v}");
         assert!(
-            v["error"].as_str().unwrap().contains("not the control-plane leader"),
+            v["error"]
+                .as_str()
+                .unwrap()
+                .contains("not the control-plane leader"),
             "seed={seed} node {node}: {v}"
         );
     }
@@ -329,9 +345,10 @@ fn run_finalize_blocked_by_a_down_member(seed: u64) {
         seed,
         "the failure detector to mark the crashed member Down",
         |c| {
-            c.metadata(leader).members.get(&victim_id).is_some_and(|m| {
-                m.status == animus_control::meta::NodeStatus::Down
-            })
+            c.metadata(leader)
+                .members
+                .get(&victim_id)
+                .is_some_and(|m| m.status == animus_control::meta::NodeStatus::Down)
         },
     );
     let v = get_view(&mut cluster, leader);
@@ -343,7 +360,12 @@ fn run_finalize_blocked_by_a_down_member(seed: u64) {
         "seed={seed}: {v}"
     );
     // Strict: no recorded range overrides it.
-    assert!(cluster.metadata(leader).node_versions.contains_key(&victim_id));
+    assert!(
+        cluster
+            .metadata(leader)
+            .node_versions
+            .contains_key(&victim_id)
+    );
     let (status, v) = post_finalize(&mut cluster, leader, "{}");
     assert_eq!(status, 409, "seed={seed}: {v}");
     let msg = v["error"].as_str().unwrap();
@@ -458,7 +480,10 @@ fn join_info_carries_the_cluster_version_only_when_the_era_is_on() {
         }
     ));
     let mut on = base();
-    if let ClientResponse::JoinInfo { cluster_version, .. } = &mut on {
+    if let ClientResponse::JoinInfo {
+        cluster_version, ..
+    } = &mut on
+    {
         *cluster_version = 2;
     }
     let era = serde_json::to_string(&on).unwrap();
