@@ -21,6 +21,9 @@ workspace = true
 # ADR 0073 (Phase 1, "Legacy encoders are test-only"): gates `legacy::vN::encode`.
 # Off by default; enabled only by test crates (animus-test's dev-dependencies).
 legacy-encoders = []
+# ADR 0073 Phase 2 (P2-D): test-only per-node binary profiles + capped decode
+# (`sim_versions`). Inert unless a profile is installed. Enabled by animus-test.
+sim-versions = []
 prod-heavy = []
 
 [dependencies]
