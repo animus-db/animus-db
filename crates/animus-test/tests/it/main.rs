@@ -14,3 +14,4 @@ mod stream_lineage_corpus;
 mod txn_serializable;
 mod upgrade_restart_corpus;
 mod upgrade_restart_tier0;
+mod upgrade_restart_txn_envelope;

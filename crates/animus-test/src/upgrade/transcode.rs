@@ -13,6 +13,17 @@
 //! silent identity: a harness that asked for "one version back" and got the
 //! bytes unchanged would be green while proving nothing.
 //!
+//! # Formats inside engine row values ([`ROW_TABLE`])
+//!
+//! A value stored under an engine row (`txn-envelope`'s intents) is opaque to
+//! every whole-file format that carries it, so no [`TABLE`] entry can re-encode
+//! it. [`ROW_TABLE`] lists those formats with a real transcode, and
+//! [`transcode_rows`] applies it to a stopped node's engine files
+//! (`animus_storage::rewrite_row_values`: every WAL segment at its existing
+//! version, every manifest-listed SSTable rewritten whole). `row_back` is
+//! independent of `target_back`; [`transcode_disk`] runs the row pass after the
+//! file pass when `TranscodeOpts::row_back > 0`.
+//!
 //! # Adding a format version (checklist step 7)
 //!
 //! Formats come in two harness classes, and the registration differs.
@@ -52,8 +63,9 @@ use std::fmt;
 use std::io;
 use std::sync::OnceLock;
 
-use animus_env::Disk;
+use animus_env::{Disk, Env};
 use animus_sim::SimEnv;
+use animus_storage::RowRewriteReport;
 use futures::executor::block_on;
 
 use crate::corpus::name_seed;
@@ -322,6 +334,153 @@ pub static TABLE: &[FormatEntry] = &[
     },
 ];
 
+/// A row-value transcode function: `(key, value, target version)` -> the value
+/// at `target`, or `None` to leave the row alone.
+pub type RowTranscodeFn = fn(&[u8], &[u8], u32) -> Option<Vec<u8>>;
+
+/// A transcode for a format that lives **inside engine row values**: a value
+/// written under a row key by a crate's apply path, opaque to every
+/// whole-file format (`lsm-wal`, `lsm-sstable`, ...) that carries it, so no
+/// [`TABLE`] entry can re-encode it. [`transcode_rows`] walks a stopped node's
+/// engine files (`animus_storage::rewrite_row_values`) and offers every
+/// `(key, value)` to each entry's function.
+pub struct RowFormat {
+    /// Stable slug: the [`EMBEDDED`] row (and fixture directory) this
+    /// transcodes.
+    pub name: &'static str,
+    /// The version the current code writes.
+    pub current_version: u32,
+    /// Every version a transcode may target, ascending, ending with
+    /// `current_version`.
+    pub versions: &'static [VersionSpec],
+    /// `(key, value)` at the current version -> `Some(value at target)`, or
+    /// `None` to leave the row alone (not this format, or already older).
+    /// Called only with a `target` this entry lists and that is older than
+    /// current; the function must be strict about recognising its own shape,
+    /// since an engine holds many unrelated value kinds under unrelated keys.
+    pub transcode: RowTranscodeFn,
+}
+
+/// `txn-envelope` v2 -> v1 (ADR 0018 §2's 2026-10-04 amendment): a v2 intent
+/// loses its `prior`. Anything that is not exactly one v2 intent is left
+/// alone (`animus_cp_data::downgrade_txn_envelope_to_v1`).
+fn txn_envelope_transcode(_key: &[u8], value: &[u8], target: u32) -> Option<Vec<u8>> {
+    match target {
+        1 => animus_cp_data::downgrade_txn_envelope_to_v1(value),
+        t => unreachable!("txn-envelope: no transcode to v{t} (guarded by RowFormat::versions)"),
+    }
+}
+
+/// The row-value formats with a real transcode. Every entry names an
+/// [`EMBEDDED`] row of the same name and version (checked by
+/// `tests/it/upgrade_restart_tier0.rs`), so a bump of the format edits both.
+pub static ROW_TABLE: &[RowFormat] = &[RowFormat {
+    name: "txn-envelope",
+    current_version: 2,
+    versions: V1_V2,
+    transcode: txn_envelope_transcode,
+}];
+
+/// The row format named `name`.
+#[must_use]
+pub fn row_entry(name: &str) -> Option<&'static RowFormat> {
+    ROW_TABLE.iter().find(|e| e.name == name)
+}
+
+/// The `row_back` values (versions behind current, `0` = current) every
+/// [`ROW_TABLE`] format supports. Independent of [`supported_back`]: the row
+/// formats are versioned separately from the whole-file ones, so a cell can
+/// restart on "older" row values over current files.
+#[must_use]
+pub fn supported_row_back() -> Vec<u32> {
+    let deepest = ROW_TABLE
+        .iter()
+        .map(|e| e.current_version)
+        .max()
+        .unwrap_or(0);
+    (0..deepest)
+        .filter(|&k| {
+            ROW_TABLE
+                .iter()
+                .all(|e| k < e.current_version && e.capabilities_of(e.current_version - k))
+        })
+        .collect()
+}
+
+impl RowFormat {
+    fn capabilities_of(&self, version: u32) -> bool {
+        self.versions.iter().any(|v| v.version == version)
+    }
+
+    fn unsupported(&self, target: u32) -> TranscodeError {
+        TranscodeError::UnsupportedTarget {
+            format: self.name,
+            target,
+            supported: self.versions.iter().map(|v| v.version).collect(),
+        }
+    }
+}
+
+/// Transcode the engine row values on `env`'s (stopped) disk `row_back`
+/// versions back (`0` = current = nothing to do). Per-file participation
+/// follows [`TranscodeOpts::keep_current_fraction_permille`], so one engine
+/// can end up with some files at the older row version and some at the
+/// current one.
+///
+/// Every row format is applied at `current - row_back`; a `row_back` that
+/// some format cannot reach fails the whole pass up front, before any file is
+/// touched.
+///
+/// # Errors
+/// An unsupported target, a malformed engine file, or a disk error.
+pub async fn transcode_rows_async<E: Env>(
+    env: &E,
+    row_back: u32,
+    opts: &TranscodeOpts,
+) -> Result<RowRewriteReport, TranscodeError> {
+    if row_back == 0 {
+        return Ok(RowRewriteReport::default());
+    }
+    for e in ROW_TABLE {
+        let target = e.current_version.saturating_sub(row_back);
+        if row_back >= e.current_version || !e.capabilities_of(target) {
+            return Err(e.unsupported(target));
+        }
+    }
+    let map = |key: &[u8], value: &[u8]| -> Option<Vec<u8>> {
+        // Each format is offered the value as the previous one left it, so
+        // one row can only be converted by the format that recognises it.
+        let mut cur: Option<Vec<u8>> = None;
+        for e in ROW_TABLE {
+            let target = e.current_version - row_back;
+            let input = cur.as_deref().unwrap_or(value);
+            if let Some(out) = (e.transcode)(key, input, target) {
+                cur = Some(out);
+            }
+        }
+        cur
+    };
+    let take_part = |file: &str| !keeps_current(opts, file);
+    animus_storage::rewrite_row_values(env, &map, &take_part)
+        .await
+        .map_err(|e| TranscodeError::Io(e.to_string()))
+}
+
+/// Synchronous [`transcode_rows_async`] over a **stopped** node's `SimEnv`.
+///
+/// # Errors
+/// As [`transcode_rows_async`], as an `InvalidInput`/I-O `io::Error`.
+pub fn transcode_rows(
+    env: &SimEnv,
+    row_back: u32,
+    opts: &TranscodeOpts,
+) -> io::Result<RowRewriteReport> {
+    block_on(transcode_rows_async(env, row_back, opts)).map_err(|e| match e {
+        TranscodeError::Io(m) => io::Error::other(m),
+        other => other.into(),
+    })
+}
+
 /// Where an embedded format's bytes live.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Carrier {
@@ -417,6 +576,17 @@ pub static EMBEDDED: &[Embedded] = &[
         "cp-engine-layout",
         Carrier::Table("lsm-sstable"),
         "animus-cp-data",
+    ),
+    // v2 (ADR 0018 §2's 2026-10-04 amendment): an intent carries the
+    // committed value it shadows. An engine-resident row value, so no
+    // whole-file transcode can reach it: its real v2 -> v1 transcode is the
+    // [`ROW_TABLE`] entry of the same name, applied by [`transcode_rows`]
+    // (and by [`transcode_disk`] when `TranscodeOpts::row_back > 0`).
+    emb_v(
+        "txn-envelope",
+        Carrier::Table("lsm-sstable"),
+        "animus-cp-data",
+        2,
     ),
     emb("segment", Carrier::OffDisk, "animus-cp-data"),
     emb("backup-manifest", Carrier::OffDisk, "animus-cp-data"),
@@ -534,6 +704,12 @@ pub struct TranscodeOpts {
     /// name through splitmix64; the simulator's RNG is never drawn, so calling
     /// this never perturbs a run's other random choices.
     pub seed: u64,
+    /// Versions behind current for the [`ROW_TABLE`] formats (engine row
+    /// values such as `txn-envelope`), applied by [`transcode_disk`] after the
+    /// whole-file pass (independent of its `target_back`). `0` leaves row
+    /// values as written. Per-file participation follows
+    /// `keep_current_fraction_permille`.
+    pub row_back: u32,
 }
 
 /// What a [`transcode_disk`] pass did, every list in file-name order.
@@ -549,6 +725,9 @@ pub struct TranscodeReport {
     pub unrecognised: Vec<String>,
     /// Recognised files not reached because `stop_after_files` ended the pass.
     pub not_reached: Vec<(String, &'static str)>,
+    /// What the engine-row pass ([`transcode_rows`]) did; empty when
+    /// `row_back` is `0`.
+    pub rows: RowRewriteReport,
 }
 
 fn splitmix64(x: u64) -> u64 {
@@ -635,10 +814,13 @@ pub fn transcode_disk(
     target_back: u32,
     opts: &TranscodeOpts,
 ) -> io::Result<TranscodeReport> {
-    block_on(transcode_disk_async(env, target_back, opts)).map_err(|e| match e {
-        TranscodeError::Io(m) => io::Error::other(m),
-        other => other.into(),
-    })
+    let mut report =
+        block_on(transcode_disk_async(env, target_back, opts)).map_err(|e| match e {
+            TranscodeError::Io(m) => io::Error::other(m),
+            other => other.into(),
+        })?;
+    report.rows = transcode_rows(env, opts.row_back, opts)?;
+    Ok(report)
 }
 
 #[cfg(test)]
