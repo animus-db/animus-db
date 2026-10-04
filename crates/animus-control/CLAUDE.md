@@ -3046,3 +3046,5 @@ unclaimed-address and the idempotent same-addresses arms. Reason: bootstrap's
 relayable command can repair the row afterwards. Changing non-empty labels is
 unsupported (would need a new non-relayable command). See ADR 0005's
 2026-10-04 amendment.
+
+- `Metadata::apply(UpsertMember)` keeps an existing non-empty label set when the incoming one is empty (status-only proposers like the detector build from stale reads that can predate a `RegisterNode` label fill-in); see `docs/lessons/testing/2026-10-04-status-only-upsert-built-from-a-stale-read-wipes-fields.md`.
