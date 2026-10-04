@@ -18,9 +18,11 @@
 //! calendar meaning) and passes the result straight through.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::creds::{CredentialProvider, StaticProvider};
 use crate::sigv4::{
     Credentials, PayloadHash, RequestToSign, SigningScope, canonical_query_string,
     canonical_uri_s3, format_amz_date, sign_request,
@@ -71,6 +73,13 @@ pub trait Transport: Send + Sync {
     async fn send(&self, request: HttpRequest) -> Result<HttpResponse, TransportError>;
 }
 
+#[async_trait]
+impl<T: Transport + ?Sized> Transport for Arc<T> {
+    async fn send(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
+        (**self).send(request).await
+    }
+}
+
 /// An S3 operation's outcome, distinguishing the shapes a caller actually
 /// needs to branch on.
 #[derive(Debug, thiserror::Error)]
@@ -85,6 +94,20 @@ pub enum S3Error {
     /// The transport itself failed — no HTTP response at all.
     #[error("transport error: {0}")]
     Transport(#[from] TransportError),
+    /// S3 rejected the credentials as expired/invalid (`ExpiredToken`,
+    /// `InvalidToken`, `TokenRefreshRequired`) **even after** one forced
+    /// credential refresh and retry.
+    #[error("credentials expired or invalid (still rejected after a refresh)")]
+    CredentialsExpired,
+    /// A credential provider failed in a way that is not an HTTP error
+    /// response (unreadable token file, malformed credentials document).
+    /// Never carries a secret or token.
+    #[error("credential provider error: {0}")]
+    Credentials(String),
+    /// The client configuration is invalid (e.g. virtual-hosted addressing
+    /// against an IP endpoint).
+    #[error("invalid S3 configuration: {0}")]
+    InvalidConfig(String),
     /// Any other S3 error response.
     #[error("S3 error {status} {code}: {message}")]
     Service {
@@ -116,16 +139,63 @@ pub struct ListObjectsPage {
     pub next_continuation_token: Option<String>,
 }
 
+/// How a bucket is addressed in the request URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Addressing {
+    /// `https://endpoint/bucket/key` — the default; what MinIO/RustFS/
+    /// localstack and an explicit `--endpoint` want.
+    #[default]
+    Path,
+    /// `https://bucket.endpoint/key` — AWS's preferred style. Needs a DNS
+    /// endpoint (not an IP) and a DNS-compatible bucket name; see
+    /// [`validate_virtual_hosted`].
+    VirtualHosted,
+}
+
+/// Whether `bucket` can be a virtual-hosted label: 3-63 chars of
+/// `[a-z0-9-]`, starting and ending alphanumeric. Dots are rejected too — a
+/// dotted bucket under HTTPS breaks the `*.endpoint` wildcard certificate.
+///
+/// # Errors
+/// A human-readable reason.
+pub fn validate_virtual_hosted(endpoint: &str, bucket: &str) -> Result<(), String> {
+    let host = crate::endpoint_host(endpoint);
+    let host_only = if let Some(rest) = host.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        host.rsplit_once(':').map_or(host.as_str(), |(h, _)| h)
+    };
+    if host_only.is_empty() {
+        return Err(format!("endpoint {endpoint:?} has no host"));
+    }
+    if host.starts_with('[') || host_only.parse::<std::net::IpAddr>().is_ok() {
+        return Err(format!(
+            "virtual-hosted addressing needs a DNS endpoint, but {endpoint:?} is an IP address              (use path-style addressing for it)"
+        ));
+    }
+    let ok_chars = bucket
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    let ends_ok = bucket
+        .bytes()
+        .next()
+        .zip(bucket.bytes().last())
+        .is_some_and(|(f, l)| f.is_ascii_alphanumeric() && l.is_ascii_alphanumeric());
+    if !(3..=63).contains(&bucket.len()) || !ok_chars || !ends_ok {
+        return Err(format!(
+            "bucket name {bucket:?} is not DNS-compatible for virtual-hosted addressing              (3-63 chars of lowercase letters, digits and hyphens, starting and ending              alphanumeric)"
+        ));
+    }
+    Ok(())
+}
+
 /// Bucket/endpoint/credential configuration for one [`S3Client`].
 ///
-/// **Path-style addressing only** in this PR (`https://endpoint/bucket/key`)
-/// — the ADR 0059 amendment's own design section covers why (MinIO/
-/// localstack compatibility with an explicit endpoint); virtual-hosted-style
-/// (`https://bucket.endpoint/key`) is a documented, unimplemented option for
-/// a later PR, not a correctness gap for real AWS S3 (which accepts
-/// path-style too, if with a deprecation notice for `us-east-1`-only
-/// virtual buckets that doesn't apply to a bucket created with an explicit
-/// region).
+/// Addressing is path-style unless the client is built
+/// [`S3Client::with_addressing`]`(`[`Addressing::VirtualHosted`]`)` — kept
+/// off this struct on purpose so existing struct-literal callers keep
+/// compiling. `credentials` are static; for temporary credentials use
+/// [`S3Client::with_provider`].
 #[derive(Debug, Clone)]
 pub struct S3Config {
     /// `scheme://host[:port]`, no trailing slash — e.g.
@@ -136,16 +206,95 @@ pub struct S3Config {
     pub credentials: Credentials,
 }
 
+/// The credential-free part of an [`S3Config`] — what
+/// [`S3Client::with_provider`] takes alongside a [`CredentialProvider`].
+#[derive(Debug, Clone)]
+pub struct S3Target {
+    pub endpoint: String,
+    pub bucket: String,
+    pub region: String,
+}
+
 /// A minimal S3 client over an explicit [`Transport`] — see the module doc.
 pub struct S3Client<T: Transport> {
     transport: T,
-    config: S3Config,
+    target: S3Target,
+    addressing: Addressing,
+    provider: Arc<dyn CredentialProvider>,
+}
+
+/// S3 error codes meaning "the credentials are stale": force a refresh and
+/// retry once.
+fn is_expired_token_code(code: &str) -> bool {
+    matches!(
+        code,
+        "ExpiredToken" | "ExpiredTokenException" | "InvalidToken" | "TokenRefreshRequired"
+    )
 }
 
 impl<T: Transport> S3Client<T> {
+    /// A client with static credentials (`config.credentials`), path-style.
     #[must_use]
     pub fn new(transport: T, config: S3Config) -> Self {
-        S3Client { transport, config }
+        let provider = Arc::new(StaticProvider::new(config.credentials));
+        S3Client {
+            transport,
+            target: S3Target {
+                endpoint: config.endpoint,
+                bucket: config.bucket,
+                region: config.region,
+            },
+            addressing: Addressing::Path,
+            provider,
+        }
+    }
+
+    /// A client whose credentials come from `provider` (path-style; chain
+    /// [`Self::with_addressing`] for virtual-hosted).
+    #[must_use]
+    pub fn with_provider(
+        transport: T,
+        target: S3Target,
+        provider: Arc<dyn CredentialProvider>,
+    ) -> Self {
+        S3Client {
+            transport,
+            target,
+            addressing: Addressing::Path,
+            provider,
+        }
+    }
+
+    /// Select the addressing style.
+    ///
+    /// # Errors
+    /// [`S3Error::InvalidConfig`] when `VirtualHosted` is asked for against
+    /// an IP endpoint or a non-DNS-compatible bucket name.
+    pub fn with_addressing(mut self, addressing: Addressing) -> Result<Self, S3Error> {
+        if addressing == Addressing::VirtualHosted {
+            validate_virtual_hosted(&self.target.endpoint, &self.target.bucket)
+                .map_err(S3Error::InvalidConfig)?;
+        }
+        self.addressing = addressing;
+        Ok(self)
+    }
+
+    /// The `Host` header (and TLS server name): `bucket.host` when
+    /// virtual-hosted, else the endpoint's `host[:port]`.
+    fn host(&self) -> String {
+        let h = crate::endpoint_host(&self.target.endpoint);
+        match self.addressing {
+            Addressing::Path => h,
+            Addressing::VirtualHosted => format!("{}.{h}", self.target.bucket),
+        }
+    }
+
+    /// Raw (unescaped) path of the bucket root.
+    fn bucket_path(&self) -> String {
+        match self.addressing {
+            Addressing::Path => format!("/{}", self.target.bucket),
+            Addressing::VirtualHosted => "/".to_string(),
+        }
     }
 
     /// `PUT /{bucket}/{key}` with `body` — write-once at the `Transport`
@@ -231,7 +380,7 @@ impl<T: Transport> S3Client<T> {
         if let Some(token) = continuation {
             query_pairs.push(("continuation-token", token));
         }
-        let path = format!("/{}", self.config.bucket);
+        let path = self.bucket_path();
         let resp = self
             .execute(
                 "GET",
@@ -272,6 +421,7 @@ impl<T: Transport> S3Client<T> {
             return match err.code.as_str() {
                 "NoSuchKey" | "NoSuchBucket" => S3Error::NotFound,
                 "AccessDenied" => S3Error::AccessDenied,
+                c if is_expired_token_code(c) => S3Error::CredentialsExpired,
                 _ => S3Error::Service {
                     code: err.code,
                     message: err.message,
@@ -306,7 +456,10 @@ impl<T: Transport> S3Client<T> {
         // `%2520` on the wire) — see `sigv4`'s module doc for the general
         // "encode exactly once, from the same raw input, for each purpose"
         // rule this crate follows throughout.
-        let raw_path = format!("/{}/{}", self.config.bucket, key);
+        let raw_path = match self.addressing {
+            Addressing::Path => format!("/{}/{}", self.target.bucket, key),
+            Addressing::VirtualHosted => format!("/{key}"),
+        };
         self.execute(
             method,
             &raw_path,
@@ -342,7 +495,48 @@ impl<T: Transport> S3Client<T> {
         extra_headers: BTreeMap<String, String>,
         now_epoch_ms: u64,
     ) -> Result<HttpResponse, S3Error> {
-        let host = crate::endpoint_host(&self.config.endpoint);
+        let mut creds = self.provider.credentials(now_epoch_ms).await?;
+        let mut refreshed = false;
+        loop {
+            let resp = self
+                .send_signed(
+                    &creds,
+                    method,
+                    path,
+                    query_pairs,
+                    body.clone(),
+                    extra_headers.clone(),
+                    now_epoch_ms,
+                )
+                .await?;
+            let stale = resp.status >= 400
+                && xml::parse_error(&String::from_utf8_lossy(&resp.body))
+                    .is_some_and(|e| is_expired_token_code(&e.code));
+            if !stale {
+                return Ok(resp);
+            }
+            if refreshed {
+                return Err(S3Error::CredentialsExpired);
+            }
+            // S3 says the credentials are stale: one forced refresh, then
+            // retry the identical request once.
+            creds = self.provider.refresh(&creds, now_epoch_ms).await?;
+            refreshed = true;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_signed(
+        &self,
+        creds: &Credentials,
+        method: &'static str,
+        path: &str,
+        query_pairs: &[(&str, &str)],
+        body: Vec<u8>,
+        extra_headers: BTreeMap<String, String>,
+        now_epoch_ms: u64,
+    ) -> Result<HttpResponse, S3Error> {
+        let host = self.host();
         // Both derived from the SAME raw pairs, independently, exactly once
         // each — never chained (never fed each other's output back in), and
         // never routed through an intermediate joined-then-split string.
@@ -362,10 +556,10 @@ impl<T: Transport> S3Client<T> {
             timestamp: &amz_date,
         };
         let scope = SigningScope {
-            region: self.config.region.clone(),
+            region: self.target.region.clone(),
             service: "s3".to_string(),
         };
-        let signed = sign_request(&self.config.credentials, &scope, &req_to_sign);
+        let signed = sign_request(creds, &scope, &req_to_sign);
 
         let mut headers = extra_headers;
         headers.insert("host".to_string(), host);
@@ -374,6 +568,9 @@ impl<T: Transport> S3Client<T> {
             "x-amz-content-sha256".to_string(),
             signed.x_amz_content_sha256,
         );
+        if let Some(token) = signed.x_amz_security_token {
+            headers.insert("x-amz-security-token".to_string(), token);
+        }
         headers.insert("authorization".to_string(), signed.authorization);
         if !body.is_empty() {
             headers.insert("content-length".to_string(), body.len().to_string());
@@ -390,7 +587,6 @@ impl<T: Transport> S3Client<T> {
             headers,
             body,
         };
-        let resp = self.transport.send(request).await?;
-        Ok(resp)
+        Ok(self.transport.send(request).await?)
     }
 }

@@ -128,7 +128,11 @@ fn is_retryable(err: &S3Error) -> bool {
     match err {
         S3Error::Transport(_) => true,
         S3Error::Service { status, .. } => *status >= 500,
-        S3Error::NotFound | S3Error::AccessDenied => false,
+        S3Error::NotFound
+        | S3Error::AccessDenied
+        | S3Error::CredentialsExpired
+        | S3Error::Credentials(_)
+        | S3Error::InvalidConfig(_) => false,
     }
 }
 
@@ -141,7 +145,7 @@ fn is_retryable(err: &S3Error) -> bool {
 fn map_io_error(err: S3Error) -> std::io::Error {
     match err {
         S3Error::NotFound => std::io::Error::new(std::io::ErrorKind::NotFound, err.to_string()),
-        S3Error::AccessDenied => {
+        S3Error::AccessDenied | S3Error::CredentialsExpired => {
             std::io::Error::new(std::io::ErrorKind::PermissionDenied, err.to_string())
         }
         other => std::io::Error::other(other.to_string()),
@@ -169,6 +173,19 @@ impl<T: Transport> S3SegmentStore<T> {
     pub fn new(transport: T, config: S3Config, prefix: Option<String>) -> Self {
         S3SegmentStore {
             client: Arc::new(S3Client::new(transport, config)),
+            prefix: prefix.filter(|p| !p.is_empty()),
+            clock: Arc::new(real_now_epoch_ms),
+        }
+    }
+
+    /// Build a store over an already-constructed [`S3Client`] — the entry
+    /// point for a client with a non-static credential provider or
+    /// virtual-hosted addressing (S-08 M1; see `S3Client::with_provider`/
+    /// `with_addressing`).
+    #[must_use]
+    pub fn from_client(client: S3Client<T>, prefix: Option<String>) -> Self {
+        S3SegmentStore {
+            client: Arc::new(client),
             prefix: prefix.filter(|p| !p.is_empty()),
             clock: Arc::new(real_now_epoch_ms),
         }

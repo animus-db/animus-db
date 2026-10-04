@@ -216,6 +216,8 @@ dependencies = [
  "rustls",
  "rustls-native-certs",
  "rustls-pki-types",
+ "serde",
+ "serde_json",
  "sha2",
  "thiserror",
  "tokio",
