@@ -1,10 +1,11 @@
 //! An opt-in **real** round trip against a real S3-compatible endpoint
-//! (MinIO/localstack/real AWS S3) — `#[cfg(feature = "prod")]`, so it only
+//! (MinIO, RustFS, localstack, real AWS S3 ...; CI runs RustFS) — `#[cfg(feature = "prod")]`, so it only
 //! builds under `cargo test -p animus-s3 --features prod` (or
 //! `--all-features`). Deliberately **not** `#[ignore]`d: the test always
 //! runs, but does nothing and prints a skip line when
 //! `ANIMUS_S3_TEST_ENDPOINT` is unset, so the workspace gates stay green
-//! with no infrastructure. See `CLAUDE.md`'s Testing section for exactly
+//! with no infrastructure. Setting `ANIMUS_S3_REQUIRE_ENDPOINT=1` (as CI's
+//! `s3-real-endpoint` job does) turns that skip into a panic. See `CLAUDE.md`'s Testing section for exactly
 //! how to run this against a local MinIO.
 #![cfg(feature = "prod")]
 
@@ -22,6 +23,11 @@ use animus_s3::sigv4::Credentials;
 )]
 async fn real_endpoint_put_get_list_delete_round_trip() {
     let Ok(endpoint) = std::env::var("ANIMUS_S3_TEST_ENDPOINT") else {
+        assert!(
+            std::env::var("ANIMUS_S3_REQUIRE_ENDPOINT").as_deref() != Ok("1"),
+            "ANIMUS_S3_REQUIRE_ENDPOINT=1 but ANIMUS_S3_TEST_ENDPOINT is not set: \
+             refusing to skip the real-endpoint test vacuously"
+        );
         eprintln!(
             "skipping real_endpoint_put_get_list_delete_round_trip: \
              ANIMUS_S3_TEST_ENDPOINT is not set (see crates/animus-s3/CLAUDE.md)"

@@ -3,10 +3,11 @@
 //! but drives the higher `SegmentStore` layer's
 //! `assert_segment_store_contract` instead of raw client calls, so it proves
 //! the store's own write-once/list-pagination logic against a real S3-
-//! compatible endpoint, not just the underlying signer/client.
+//! compatible endpoint (MinIO, RustFS, ...; CI runs RustFS), not just the underlying signer/client.
 //!
 //! **Unset `ANIMUS_S3_TEST_ENDPOINT` ⇒ this test prints a skip line and
-//! returns immediately** (never `#[ignore]`d — `cargo test -p animus-env
+//! returns immediately** unless `ANIMUS_S3_REQUIRE_ENDPOINT=1`, which
+//! makes it panic instead (CI's `s3-real-endpoint` job) (never `#[ignore]`d — `cargo test -p animus-env
 //! --all-features` always runs it, it just does nothing without this
 //! variable), so the workspace gates stay green with no MinIO/localstack
 //! infrastructure.
@@ -30,6 +31,11 @@ use animus_s3::sigv4::Credentials;
 #[tokio::test]
 async fn s3_segment_store_contract_against_a_real_endpoint() {
     let Ok(endpoint) = std::env::var("ANIMUS_S3_TEST_ENDPOINT") else {
+        assert!(
+            std::env::var("ANIMUS_S3_REQUIRE_ENDPOINT").as_deref() != Ok("1"),
+            "ANIMUS_S3_REQUIRE_ENDPOINT=1 but ANIMUS_S3_TEST_ENDPOINT is not set: \
+             refusing to skip the real-endpoint test vacuously"
+        );
         println!(
             "ANIMUS_S3_TEST_ENDPOINT not set — skipping S3SegmentStore real-endpoint round trip"
         );
