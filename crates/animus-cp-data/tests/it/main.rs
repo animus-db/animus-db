@@ -39,6 +39,7 @@ mod learner_reconfigure;
 mod learner_snapshot_livelock_under_continuous_writer;
 mod membership;
 mod metrics;
+mod quiesced_apply_no_poll;
 mod quiesced_eventual_read;
 mod quiescence;
 mod read_index;
