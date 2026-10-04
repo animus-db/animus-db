@@ -717,7 +717,10 @@ aborted → the value the key held **immediately before** the intent,
 restored forward at `ts` by rewinding to the version just below the
 intent's own applied version (`get_at(key, intent_version - 1)`) — never
 a tombstone, which would incorrectly shadow that older, still-live
-committed value. A key whose stored value is no longer that exact intent
+committed value. *(Superseded 2026-10-04: that lookback depended on MVCC
+history that LSM compaction GC and latest-only snapshot images discard, and
+aborted transactions lost acked writes; a v2 intent now carries the prior
+value itself — see the 2026-10-04 amendment at the end.)* A key whose stored value is no longer that exact intent
 (already resolved, or overwritten by something newer) is left untouched.
 
 `RaftKvNode::txn_stage`/`txn_decide`/`txn_write` are the leader-side API:
@@ -4052,3 +4055,86 @@ observe stale state a direct-write world could never produce. Grep every
 loop for a preceding `flush_pending` before converting any further
 direct-write site — see `docs/lessons/code-patterns/` for the recorded
 general form of this check.
+
+## Amendment (2026-10-04): an intent carries the committed value it shadows (aborted transactions lost acked writes)
+
+**Finding.** The real-process chaos harness (`crates/animusd/tests/chaos*.rs`,
+`docs/chaos.md`) lost acknowledged list-append writes on keys touched by an
+**aborted** cross-tablet transaction (about 2 smoke runs in 25). Root cause:
+the abort branch of `TxnResolve` (and the read path's
+`prior_committed`, used by a reader whose snapshot predates the commit and by
+every ADR 0055 eventual read under an unresolved intent) recovered the key's
+pre-intent value by reading MVCC history one version below the intent,
+`get_at(key, intent_version - 1)`, and wrote a **tombstone** when that read
+was empty. No engine promises to keep that history:
+
+1. **`LsmEngine` compaction GC.** Versions below the GC floor
+   (`max_version - tombstone_grace_versions`) collapse to the newest one at or
+   below the floor. The default grace is `1 << 20` versions and data-plane
+   versions are packed HLC timestamps (`wall_ms << 20`, §2), so the floor
+   trails the newest write by about **one millisecond**. An intent older than
+   that becomes the floor anchor at the next compaction, and the committed
+   value under it is dropped.
+2. **`InstallSnapshot`.** `engine_image` ships each key's latest record only.
+   A follower caught up by snapshot while an intent is live holds the intent
+   and nothing under it — on `MemoryEngine` too. Its later abort tombstoned the
+   key while the leader restored it: replica divergence, and an acked write
+   lost if that follower became leader.
+
+Every simulation corpus ran on `MemoryEngine` (which keeps every version
+forever), and the one snapshot-with-intent test staged over a key with no
+prior value and then *committed*, so neither mechanism was ever exercised.
+
+**Decision.** The intent itself carries the prior committed value. A new
+intent envelope version (`txn-envelope` v2, tag `2`) is the v1 body plus a
+trailing `prior: Option<bytes>`; `TxnStage`'s apply fills it from the key's
+**latest** record immediately before writing the intent (after flushing the
+pending run, so it sees every earlier entry of the pass). Every replica applies
+the same log prefix to the same latest-record state, and neither compaction GC
+nor snapshot install ever changes a key's latest record, so every replica
+captures the same prior. Abort-restore and `prior_committed` use it and never
+read history. Details:
+
+- A same-transaction re-stage (WAL replay, or two writes to one key in one
+  stage) carries the existing intent's own prior, never the transaction's own
+  provisional value.
+- A **v1 intent** (tag `1`, written before this change and still unresolved
+  across an upgrade) decodes with `IntentPrior::Unknown` and keeps the old
+  lookback — the only information its writer left. That residual is bounded
+  to intents in flight at upgrade time; it is documented, not closed.
+- The write-push guard (PR6) is unchanged and still required: it is what makes
+  the v1 lookback safe, and it keeps a stage from capturing another
+  transaction's intent as a "prior".
+
+**Rejected alternatives.** (a) *Cap the GC floor at the oldest unresolved
+intent on the engine* (a hold, like held snapshots): needs an engine API, a
+per-replica hold set maintained on stage/resolve, recomputed on every open and
+every snapshot install, ordered against compaction; and it still does not fix
+mechanism 2, which would separately need the image to ship each intent key's
+prior version (and an install path that writes two versions of one key, which
+`merge_batch` deduplicates). Several interacting invariants versus one local
+one. (c) *Raise the grace*: narrows the race, does not close it (an abandoned
+prepare is aborted after `RECOVERY_GRACE`, seconds later), and does nothing
+for mechanism 2.
+
+**Format.** `txn-envelope` is a new ADR 0073 inventory row (it was untagged
+in the inventory; tag `1` is its v1). v1 stays readable forever via
+`txn::legacy::v1`; fixtures `crates/animus-cp-data/tests/fixtures/formats/
+txn-envelope/v1.bin` + `v2.bin`. Intent size grows by the prior value; the Raft
+log command is unchanged (the prior is computed at apply).
+
+**Not changed here, filed separately:** the 1 ms default GC grace also breaks
+every *other* historical read below the floor — `read_at`/`scan_at`
+(`TransactGetItems`' snapshot reads) and the on-demand backup capture's
+pinned-`cut_version` `local_scan_kind_snapshot`, which spans many ticks. Those
+need a retention hold or a time-denominated grace, a separate design.
+
+**Tests.** `crates/animus-cp-data/tests/it/txn_abort_restore_history.rs`
+(abort after LSM compaction: put, delete and absent-key intents, plus the
+pending-window eventual read; abort on a snapshot-caught-up follower on
+`MemoryEngine`) — three of four failed before the fix (the absent-key control
+passed both ways). `animus-test`'s `txn_serializable.rs` gained an
+`LsmEngine<SimEnv>` tier under compaction pressure (`lsm_compaction_*` cells):
+`lsm_compaction_abandon_prepare` failed before the fix with exactly the chaos
+finding ("lost acknowledged append ... absent from final state"). Envelope
+decode/round-trip and fixture tests in `txn.rs` and `format_fixture_tests.rs`.

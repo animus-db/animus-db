@@ -496,3 +496,160 @@ fn cp_engine_layout_refuses_other_epochs_by_name() {
 fn generate_fixture_cp_engine_layout() {
     write_new_fixture(&formats_dir("cp-engine-layout"), 1, &v1_layout_bytes());
 }
+
+// ---------------------------------------------------------------------------
+// txn-envelope (ADR 0018 §2's 2026-10-04 amendment)
+//
+// The 1-byte-tagged value envelope every base-row value is wrapped in
+// (`txn.rs`). Tag `0` = committed (every version); tag `1` = a v1 intent
+// (retired, `txn::legacy::v1`: no prior value); tag `2` = a v2 intent (the v1
+// body plus a trailing `prior` — the committed value the intent shadows).
+// Container: `u32`-BE-length-prefixed envelope values, to EOF.
+
+fn txn_fixture_id() -> crate::txn::TxnId {
+    crate::txn::TxnId {
+        ts: HlcTimestamp {
+            wall_ms: 1_700_000_000_123,
+            logical: 7,
+        },
+        node: nid(3),
+    }
+}
+
+fn txn_fixture_record_key() -> Vec<u8> {
+    crate::txn::record_key(&[0xA5; animus_tablet::TOKEN_BYTES], &txn_fixture_id())
+}
+
+fn txn_fixture_kind_writes() -> Vec<crate::KindWrite> {
+    vec![
+        (1u8, b"lsi-key".to_vec(), Some(b"lsi-row".to_vec())),
+        (1u8, b"lsi-old".to_vec(), None),
+    ]
+}
+
+fn txn_fixture_change_log() -> (Vec<u8>, Vec<u8>) {
+    (b"change-prefix".to_vec(), b"change-record".to_vec())
+}
+
+fn v1_txn_envelope_bytes() -> Vec<u8> {
+    use crate::txn;
+    let (id, rk) = (txn_fixture_id(), txn_fixture_record_key());
+    pack_frames(&[
+        txn::encode_committed(b"hello"),
+        txn::encode_committed(b""),
+        txn::legacy::v1::encode_intent(
+            &id,
+            &rk,
+            "orders",
+            Some(b"staged"),
+            &txn_fixture_kind_writes(),
+            Some(&txn_fixture_change_log()),
+        ),
+        txn::legacy::v1::encode_intent(&id, &rk, "orders", None, &[], None),
+    ])
+}
+
+fn v2_txn_envelope_bytes() -> Vec<u8> {
+    use crate::txn;
+    let (id, rk) = (txn_fixture_id(), txn_fixture_record_key());
+    pack_frames(&[
+        txn::encode_committed(b"hello"),
+        txn::encode_committed(b""),
+        txn::encode_intent(
+            &id,
+            &rk,
+            "orders",
+            Some(b"staged"),
+            &txn_fixture_kind_writes(),
+            Some(&txn_fixture_change_log()),
+            Some(b"was"),
+        ),
+        txn::encode_intent(&id, &rk, "orders", None, &[], None, None),
+        txn::encode_intent(&id, &rk, "orders", Some(b"x"), &[], None, Some(b"")),
+    ])
+}
+
+fn txn_intent(
+    staged: Option<&[u8]>,
+    with_derived: bool,
+    prior: crate::txn::IntentPrior,
+) -> crate::txn::Envelope {
+    crate::txn::Envelope::Intent {
+        txn_id: txn_fixture_id(),
+        record_key: txn_fixture_record_key(),
+        record_table: "orders".to_string(),
+        staged_value: staged.map(<[u8]>::to_vec),
+        kind_writes: if with_derived {
+            txn_fixture_kind_writes()
+        } else {
+            Vec::new()
+        },
+        change_log: with_derived.then(txn_fixture_change_log),
+        prior,
+    }
+}
+
+#[test]
+fn txn_envelope_decodes_every_checked_in_fixture_structurally() {
+    use crate::txn::{Envelope, IntentPrior, decode_envelope};
+    for (version, bytes) in fixture_files(&formats_dir("txn-envelope")) {
+        let decoded: Vec<Envelope> = unpack_frames(&bytes)
+            .iter()
+            .map(|b| decode_envelope(b))
+            .collect();
+        let expected = match version {
+            // A v1 intent translates to the current shape with an unknown
+            // prior: the reader falls back to the MVCC lookback (step 6).
+            1 => vec![
+                Envelope::Committed(b"hello".to_vec()),
+                Envelope::Committed(Vec::new()),
+                txn_intent(Some(b"staged"), true, IntentPrior::Unknown),
+                txn_intent(None, false, IntentPrior::Unknown),
+            ],
+            2 => vec![
+                Envelope::Committed(b"hello".to_vec()),
+                Envelope::Committed(Vec::new()),
+                txn_intent(
+                    Some(b"staged"),
+                    true,
+                    IntentPrior::Known(Some(b"was".to_vec())),
+                ),
+                txn_intent(None, false, IntentPrior::Known(None)),
+                txn_intent(Some(b"x"), false, IntentPrior::Known(Some(Vec::new()))),
+            ],
+            other => panic!(
+                "txn-envelope fixture v{other} has no expected value — add one (ADR 0073 checklist step 4)"
+            ),
+        };
+        assert_eq!(decoded, expected, "txn-envelope v{version}");
+    }
+}
+
+#[test]
+fn txn_envelope_encoders_match_the_fixture_bytes() {
+    for (version, bytes) in fixture_files(&formats_dir("txn-envelope")) {
+        let want = match version {
+            // Checklist step 7: the test-only legacy encoder reproduces v1.
+            1 => v1_txn_envelope_bytes(),
+            // Checklist step 5: the current writer reproduces v2.
+            2 => v2_txn_envelope_bytes(),
+            other => panic!("txn-envelope fixture v{other} has no encoder arm"),
+        };
+        assert_eq!(
+            want, bytes,
+            "txn-envelope v{version}: encoder emits the fixture"
+        );
+    }
+}
+
+/// `cargo test -p animus-cp-data --lib generate_fixture_txn_envelope -- --ignored`.
+/// Refuses to overwrite an existing fixture (ADR 0073 Phase 0).
+#[test]
+#[ignore]
+fn generate_fixture_txn_envelope() {
+    let dir = formats_dir("txn-envelope");
+    if !dir.join("v1.bin").exists() {
+        write_new_fixture(&dir, 1, &v1_txn_envelope_bytes());
+    }
+    write_new_fixture(&dir, 2, &v2_txn_envelope_bytes());
+}

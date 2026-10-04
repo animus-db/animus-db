@@ -205,6 +205,17 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   reclaimed tombstones (`MemoryEngine` never GCs). Set the grace **above the max
   anti-entropy lag** so a delete propagates before its tombstone is reclaimed (ADR
   0010). `lsm_gc.rs` is the dedicated test.
+  **The floor is in version units, and the CP data plane's versions are packed
+  HLC timestamps (`wall_ms << 20`)**: the default grace (`1 << 20`) is about
+  **one millisecond** of history there, not "generous". GC also collapses a
+  *live* key's history below the floor to its newest record at or below it, so
+  a `get_at(key, v)` with `v` below the floor can return nothing for a key that
+  has a committed value. A caller that needs older history must hold it (an
+  `LsmSnapshot` pins the floor) or not depend on it: `animus-cp-data`'s
+  aborted-intent restore did depend on it and lost acked writes (ADR 0018's
+  2026-10-04 amendment; intents now carry their prior value). The other
+  below-floor readers (`read_at`/`scan_at`, backup capture's pinned
+  `cut_version`) are a known, separately tracked gap.
 - **Two read gates skip an SSTable before any disk read** (`sstable.rs`
   `SsTableMeta::may_contain`): the key range `[min_key, max_key]`, then the
   per-table **Bloom filter** (`lsm/bloom.rs` — a hand-rolled FNV-1a

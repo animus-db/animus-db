@@ -37,4 +37,6 @@ animus-cp-data = { workspace = true, features = ["legacy-encoders"] }
 animus-dynamo.workspace = true
 animus-item.workspace = true
 animus-tablet.workspace = true
+# `txn_serializable.rs`'s `CorpusEngine` (a delegating `StorageEngine` over either tier).
+async-trait.workspace = true
 flate2.workspace = true

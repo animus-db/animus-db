@@ -115,7 +115,8 @@ Phase 2, a replicated cluster version / feature gate, is next). The
 first real bumps have landed (2026-10-03, #1140/#1141/#1142): `control-wal`,
 `shared-wal` and the LSM WAL (`lsm-wal`, `LWL1`) are v2 (WAL sync markers) and
 the harness transcodes them to v1 for real; `raftkv-wal` is v2 too (embedded
-in the control-wal carrier); every other format is still v1, transcoded as
+in the control-wal carrier); `txn-envelope` (the value-envelope intent tag) is v2
+since 2026-10-04 (an intent carries its prior value, ADR 0018); every other format is still v1, transcoded as
 the identity. **A format change follows ADR 0073's "Phase 1 design"
 checklist** ([`docs/adr/0073-upgrade-compatibility.md`](docs/adr/0073-upgrade-compatibility.md):
 bump, keep the vN decoder under `legacy`, new no-overwrite fixture,

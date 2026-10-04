@@ -484,6 +484,18 @@ retrievable from git history.)
   `animusd/tests/cp_txn.rs`'s real multi-process `ProdEnv` cluster is the
   separate acceptance test for the actual wire coordinator; the two are
   complementary, not overlapping.
+- **Engine tiers (2026-10-04).** Every original cell runs on `MemoryEngine`
+  (which keeps every MVCC version forever). The `lsm_compaction_*` cells
+  (`Scenario::engine = EngineTier::LsmCompacting`, built by `lsm_cell`) run
+  each replica on its own `LsmEngine<SimEnv>` with tiny flush/compaction
+  thresholds and the production-default GC grace, behind `CorpusEngine` (a
+  plain delegating `StorageEngine` enum, so the `MemoryEngine` cells' runs are
+  unchanged). `lsm_compaction_abandon_prepare` reproduced the chaos harness's
+  "acked write lost on a key an aborted transaction touched" before ADR 0018's
+  2026-10-04 amendment: the resolver aborts an abandoned prepare after
+  `RECOVERY_GRACE`, long after compaction had GC'd the history the old abort
+  read. A protocol step that silently depends on MVCC history is invisible to
+  a `MemoryEngine`-only corpus; add an LSM cell when touching one.
 - **Topology**: 3 independent tablet Raft groups (`t0`/`t1`/`t2`, 3 replicas
   each), so a transaction spans 2–3 *independent leaders, independent `Hlc`
   clocks, independent commit pipelines* — unlike the single-Raft-group

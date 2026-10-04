@@ -414,6 +414,17 @@ pub static EMBEDDED: &[Embedded] = &[
         Carrier::Table("lsm-sstable"),
         "animus-cp-data",
     ),
+    // v2 (ADR 0018 §2's 2026-10-04 amendment): an intent carries the
+    // committed value it shadows. Engine-resident row values: no carrier
+    // transcode re-encodes them yet (none exists for any row value), so the
+    // v1 path is covered by its fixture plus `txn::legacy::v1`'s decode test;
+    // the v1 shape survives only on an intent still unresolved at upgrade.
+    emb_v(
+        "txn-envelope",
+        Carrier::Table("lsm-sstable"),
+        "animus-cp-data",
+        2,
+    ),
     emb("segment", Carrier::OffDisk, "animus-cp-data"),
     emb("backup-manifest", Carrier::OffDisk, "animus-cp-data"),
     emb("backup-data", Carrier::OffDisk, "animus-cp-data"),
