@@ -11900,3 +11900,21 @@ fed into emitters); `Release(N-1) -> Release(N)` cells over real gates.
 **Gotcha**: the member-down cell crashes a node the shared client loop keeps
 routing 1/4 of its ops to (each stalls for the wire timeout), so acks *during* its
 roll are legitimately sparse; non-vacuity there is asserted after the era.
+
+## WAN timing config and the region-aware control-voter check (ADR 0075 section 3.4)
+
+`cluster_settings.max_region_rtt_ms` (additive, `skip_serializing_if` unset so
+the frozen cluster-config v1 fixture is unchanged; default 150) and
+`--max-region-rtt-ms MS` (needs `--config`) set the inter-region round-trip
+bound that sizes the WAN Raft profile; `ClusterConfig::max_region_rtt()` reads
+it and `Bound*Node::with_max_region_rtt` plumbs it to the control group
+(`RaftNode::enable_region_timing`) and the tablet-host reconciler
+(`set_max_region_rtt`). Inert unless some group's replicas span more than one
+`topology.kubernetes.io/region` label. `tablet_host_reconciler_loop` and
+`SimCluster` build `MetadataView::regions` from `Metadata.members` labels
+(`SimCluster` does not run the control loop, to keep fixed-seed timelines).
+`admin_add_control_member`/`admin_remove_control_member` call
+`animus_control::timing::control_voter_change_check` (remove accepts `--force`).
+**Gaps:** control-only voters' labels are not in `Metadata` (no `Member` row);
+`gen-config` cannot warn about a region-concentrated control set until G-a
+supplies labels.

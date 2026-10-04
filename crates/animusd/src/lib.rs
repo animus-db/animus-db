@@ -2948,6 +2948,11 @@ pub struct BoundNode {
     /// This node's advertised hostname (ADR 0060), from the [`RoleAddrs`]
     /// [`Node::bind`] was given — see [`advertised_addr`] and
     /// [`RoleAddrs::advertise_host`]'s own doc.
+    /// ADR 0075 section 3.4: the configured max inter-region round trip, sizing
+    /// the WAN Raft timing profile of every group this node hosts that spans
+    /// more than one region. Defaults to 150 ms; set from
+    /// `cluster_settings.max_region_rtt_ms` via `with_max_region_rtt`.
+    max_region_rtt: Duration,
     advertise_host: Option<String>,
     /// This node's TLS material (ADR 0064, S-01 commit 2), loaded once at
     /// bind time from `RoleAddrs::tls` — `None` is plain TCP on every port.
@@ -5533,6 +5538,15 @@ impl Drop for StartupTasks {
 }
 
 impl BoundNode {
+    /// Set the max inter-region round trip (ADR 0075 section 3.4) — see
+    /// `ClusterSettings::max_region_rtt_ms`. Inert unless some group spans more
+    /// than one `topology.kubernetes.io/region` label value.
+    #[must_use]
+    pub fn with_max_region_rtt(mut self, rtt: Duration) -> Self {
+        self.max_region_rtt = rtt;
+        self
+    }
+
     /// This node's own identity, as bound — the same [`NodeId`] [`Node::bind`]
     /// was given. Lets a caller holding a bag of already-bound nodes (e.g. a
     /// test fixture binding every node before starting any of them, issue
@@ -6012,6 +6026,10 @@ impl BoundNode {
         // `--cluster N` in-process node now exercises it too instead of always
         // finding the leader's handle locally.
         edge.register_control(raft.clone());
+        // ADR 0075 section 3.4: the control group derives its Raft timing
+        // profile from its own voters' region labels (a no-op on an unlabelled
+        // cluster). Opt-in, spawned after everything `RaftNode::start` spawns.
+        raft.enable_region_timing(self.max_region_rtt);
 
         // **Leaderful CP per-tablet Raft group** (ADR 0017 #3a) — the v1 data plane
         // (ADR 0019). Stage 3a hosts a single, statically-placed CP group spanning
@@ -6169,6 +6187,9 @@ impl BoundNode {
         // `--quiesce-after` CLI flag on top of this same knob):
         // `Duration::ZERO` (every existing call site) disables it entirely —
         // zero behavior change. Data-plane groups only (fork G).
+        // ADR 0075 section 3.4: per-group WAN timing input (inert unless a hosted
+        // tablet's replicas span more than one region label).
+        reconciler.set_max_region_rtt(self.max_region_rtt);
         if !quiesce_after.is_zero() {
             // See `MIN_QUIESCE_AFTER`'s own doc for the full argument. The
             // CLI's own parser is the primary enforcement (a release build
@@ -6718,6 +6739,7 @@ impl Node {
             intra_addr,
             console_listener,
             console_addr,
+            max_region_rtt: animus_control::timing::DEFAULT_MAX_REGION_RTT,
             advertise_host: addrs.advertise_host,
             tls,
             encryption_key,
@@ -6772,6 +6794,7 @@ impl Node {
             admin_addr,
             intra_listener,
             intra_addr,
+            max_region_rtt: animus_control::timing::DEFAULT_MAX_REGION_RTT,
             advertise_host: addrs.advertise_host,
             tls,
             encryption_key,
@@ -6835,6 +6858,7 @@ impl Node {
             intra_addr,
             console_listener,
             console_addr,
+            max_region_rtt: animus_control::timing::DEFAULT_MAX_REGION_RTT,
             advertise_host: addrs.advertise_host,
             tls,
             encryption_key,
@@ -7360,6 +7384,11 @@ pub struct BoundControlNode {
     intra_listener: Arc<TcpListener>,
     intra_addr: SocketAddr,
     /// See [`BoundNode::advertise_host`]'s doc.
+    /// ADR 0075 section 3.4: the configured max inter-region round trip, sizing
+    /// the WAN Raft timing profile of every group this node hosts that spans
+    /// more than one region. Defaults to 150 ms; set from
+    /// `cluster_settings.max_region_rtt_ms` via `with_max_region_rtt`.
+    max_region_rtt: Duration,
     advertise_host: Option<String>,
     /// This node's TLS material (ADR 0064, S-01 commit 2), loaded once at
     /// bind time from `RoleAddrs::tls` — `None` is plain TCP on every port.
@@ -7369,6 +7398,15 @@ pub struct BoundControlNode {
 }
 
 impl BoundControlNode {
+    /// Set the max inter-region round trip (ADR 0075 section 3.4) — see
+    /// `ClusterSettings::max_region_rtt_ms`. Inert unless some group spans more
+    /// than one `topology.kubernetes.io/region` label value.
+    #[must_use]
+    pub fn with_max_region_rtt(mut self, rtt: Duration) -> Self {
+        self.max_region_rtt = rtt;
+        self
+    }
+
     /// The address clients connect to.
     pub fn client_addr(&self) -> SocketAddr {
         self.client_addr
@@ -7588,6 +7626,8 @@ impl BoundControlNode {
         // propose locally when this node is the control leader.
         let edge = ClusterEdgeState::new();
         edge.register_control(raft.clone());
+        // ADR 0075 section 3.4 — see `BoundNode::start_with_growth`'s identical call.
+        raft.enable_region_timing(self.max_region_rtt);
 
         // This node's stream-shard segment store (ADR 0043 §A7b) — see
         // `BoundNode::start_with_streams`'s identical construction; `control`
@@ -7797,6 +7837,11 @@ pub struct BoundDataNode {
     console_listener: TcpListener,
     console_addr: SocketAddr,
     /// See [`BoundNode::advertise_host`]'s doc.
+    /// ADR 0075 section 3.4: the configured max inter-region round trip, sizing
+    /// the WAN Raft timing profile of every group this node hosts that spans
+    /// more than one region. Defaults to 150 ms; set from
+    /// `cluster_settings.max_region_rtt_ms` via `with_max_region_rtt`.
+    max_region_rtt: Duration,
     advertise_host: Option<String>,
     /// This node's TLS material (ADR 0064, S-01 commit 2), loaded once at
     /// bind time from `RoleAddrs::tls` — `None` is plain TCP on every port.
@@ -7806,6 +7851,15 @@ pub struct BoundDataNode {
 }
 
 impl BoundDataNode {
+    /// Set the max inter-region round trip (ADR 0075 section 3.4) — see
+    /// `ClusterSettings::max_region_rtt_ms`. Inert unless some group spans more
+    /// than one `topology.kubernetes.io/region` label value.
+    #[must_use]
+    pub fn with_max_region_rtt(mut self, rtt: Duration) -> Self {
+        self.max_region_rtt = rtt;
+        self
+    }
+
     /// The address clients connect to.
     pub fn client_addr(&self) -> SocketAddr {
         self.client_addr
@@ -8235,6 +8289,9 @@ impl BoundDataNode {
         // start_with_growth`'s own quiescence gate above — `Duration::ZERO`
         // (every pre-S-06 call site) disables it entirely, zero behavior
         // change.
+        // ADR 0075 section 3.4: per-group WAN timing input (inert unless a hosted
+        // tablet's replicas span more than one region label).
+        reconciler.set_max_region_rtt(self.max_region_rtt);
         if !quiesce_after.is_zero() {
             // Two asserts, not one — identical contract/rationale to
             // `BoundNode::start_with_growth`'s own gate above: the
@@ -11821,6 +11878,22 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             return Ok(node);
         }
 
+        // ADR 0075 section 3.4: refuse a voter set that would put a strict
+        // majority of control voters in one region (a no-op on an unlabelled or
+        // single-region cluster). Checked before any registration side effect so
+        // a refusal leaves nothing half-done.
+        {
+            let mut after = current.clone();
+            after.insert(node.clone());
+            animus_control::timing::control_voter_change_check(
+                &self.control.metadata_cached(),
+                &current,
+                &after,
+                Some((&node, &labels)),
+            )
+            .map_err(|e| format!("refusing to add control voter {node}: {e}"))?;
+        }
+
         // **Issue #406/#450 (Bug B), read-your-writes barrier.** This
         // leader's own `metadata_cached()` is gated on its own async apply
         // task (ADR 0038), which can lag its own already-committed Raft log
@@ -12078,6 +12151,18 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         }
         let remaining: BTreeSet<NodeId> =
             current.iter().filter(|&id| *id != node).cloned().collect();
+        // ADR 0075 section 3.4: same region-majority guard as the add path;
+        // `--force` bypasses it (it can leave a region-concentrated quorum, so
+        // it must be explicit).
+        if !force {
+            animus_control::timing::control_voter_change_check(
+                &self.control.metadata_cached(),
+                &current,
+                &remaining,
+                None,
+            )
+            .map_err(|e| format!("refusing to remove control voter {node}: {e}; retry with --force to remove anyway"))?;
+        }
         // Liveness-aware quorum-loss guard (ADR 0037 hardening PR2). The
         // original ADR 0037 guard counted only the *resulting* voter count
         // (refuse `< 1`, warn `== 1`) — which looks complete but misses the
@@ -13328,6 +13413,14 @@ impl CpReconciler {
         }
     }
 
+    /// ADR 0075 section 3.4 — see [`Reconciler::set_max_region_rtt`]'s doc.
+    fn set_max_region_rtt(&mut self, rtt: Duration) {
+        match self {
+            CpReconciler::Lsm(r) => r.set_max_region_rtt(rtt),
+            CpReconciler::Mem(r) => r.set_max_region_rtt(rtt),
+        }
+    }
+
     /// ADR 0044 phase 2 (C-02 PR 2) production wiring — see
     /// [`Reconciler::enable_heartbeat_batching`]'s doc.
     fn enable_heartbeat_batching(&mut self) {
@@ -13523,9 +13616,12 @@ async fn tablet_host_reconciler_loop(ctx: ClientCtx, mut reconciler: CpReconcile
             .map(|(id, _)| id.clone())
             .collect();
         inplace_split_active = meta.tablets.values().any(|t| t.inplace_split.is_some());
+        let regions =
+            animus_control::timing::region_map(meta.members.iter().map(|(id, m)| (id, &m.labels)));
         let view = MetadataView {
             tablets: meta.tablets,
             down,
+            regions,
         };
         reconciler.tick(&view).await;
     }
@@ -16228,7 +16324,9 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
     // — this node can never see itself as a member of its own genesis
     // config, so it never campaigns and the group never elects a leader. See
     // `docs/engineering-lessons.md` for the incident this fixes.
-    let bound = Node::bind(addrs.id.clone(), addrs, dir).await?;
+    let bound = Node::bind(addrs.id.clone(), addrs, dir)
+        .await?
+        .with_max_region_rtt(config.max_region_rtt());
     start_bound_node_with_streams_quiesce_and_ttl_sweep_interval(
         bound,
         config,
@@ -16610,7 +16708,9 @@ pub async fn run_node_control_with_stores(
     // See `run_node_with_streams_quiesce_and_ttl_sweep_interval`'s matching
     // comment: the node's own identity must be `addrs.id`, not the unrelated
     // `config::node_id(index)` minting convention.
-    let bound = Node::bind_control(addrs.id.clone(), addrs, dir).await?;
+    let bound = Node::bind_control(addrs.id.clone(), addrs, dir)
+        .await?
+        .with_max_region_rtt(config.max_region_rtt());
 
     // Cross-node routing (ADR 0017 #3b / ADR 0013): map every node's id to
     // its client API address, so a data op or a schema-DDL relay landing on
@@ -16833,7 +16933,9 @@ pub async fn run_node_data_with_cluster_settings(
     // See `run_node_with_streams_quiesce_and_ttl_sweep_interval`'s matching
     // comment: the node's own identity must be `addrs.id`, not the unrelated
     // `config::node_id(index)` minting convention.
-    let bound = Node::bind_data(addrs.id.clone(), addrs, dir).await?;
+    let bound = Node::bind_data(addrs.id.clone(), addrs, dir)
+        .await?
+        .with_max_region_rtt(config.max_region_rtt());
 
     // The control deployment's **intra**-cluster addresses (ADR 0047) — the
     // mirror/leader-hint discovery root (ADR 0035 §1/§4; `WatchMetadata` is
@@ -16962,7 +17064,9 @@ pub async fn run_node_growth(
     // See `run_node_with_streams_quiesce_and_ttl_sweep_interval`'s matching
     // comment: the node's own identity must be `addrs.id`, not the unrelated
     // `config::node_id(index)` minting convention.
-    let bound = Node::bind(addrs.id.clone(), addrs, dir).await?;
+    let bound = Node::bind(addrs.id.clone(), addrs, dir)
+        .await?
+        .with_max_region_rtt(config.max_region_rtt());
     let mut client_route: BTreeMap<NodeId, String> = BTreeMap::new();
     for (i, addrs) in config.nodes.iter().enumerate() {
         client_route.insert(

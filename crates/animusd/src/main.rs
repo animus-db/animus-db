@@ -5,7 +5,7 @@
 //! ```text
 //! animusd gen-config --nodes N [--host H] [--base-port P]   # print a combined-mode cluster config (JSON)
 //! animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P] # print a split-deployment config (ADR 0035)
-//! animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] [--encryption-key PATH] # run node I of a cluster (one process)
+//! animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--max-region-rtt-ms MS] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] [--encryption-key PATH] # run node I of a cluster (one process)
 //! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] [--encryption-key PATH] # run an N-node cluster in one process
 //! animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--dynamo-auth PATH] # run a whole split deployment in one process (ADR 0035)
 //! animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--dir D] [--ephemeral] [--advertise-host NAME] [--encryption-key PATH] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] # seed/join startup (ADR 0032 PR2; ADR 0040 PR4 self-minting if --id is omitted)
@@ -320,7 +320,7 @@ fn otel_instance_label(args: &[String]) -> String {
 const USAGE: &str = "usage:\n  \
     animusd gen-config --nodes N [--host H] [--base-port P]\n  \
     animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P]\n  \
-    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH] [--encryption-key PATH]\n  \
+    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--max-region-rtt-ms MS] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH] [--encryption-key PATH]\n  \
     animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] [--encryption-key PATH]\n  \
     animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--dynamo-auth PATH]\n  \
     animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral] [--advertise-host NAME] [--encryption-key PATH] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3]\n  \
@@ -515,6 +515,15 @@ async fn run(args: &[String]) -> Result<(), String> {
     // with its own `ProvisionedThroughput`.
     let mut tablet_max_read_units: Option<u64> = None;
     let mut tablet_max_write_units: Option<u64> = None;
+    // `--max-region-rtt-ms MS` (ADR 0075 section 3.4, G-01 stage G-c
+    // groundwork): the upper bound on the round trip between any two
+    // `topology.kubernetes.io/region` regions, sizing the WAN Raft timing
+    // profile of every group that spans more than one region. Inert on an
+    // unlabelled/single-region cluster. Reaches `--config`/`--node` (merged
+    // with `cluster_settings.max_region_rtt_ms`, conflict = hard error) — the
+    // config file is the route for every other shape, same partial CLI reach
+    // as `--export-s3-endpoint`.
+    let mut max_region_rtt_ms: Option<u64> = None;
     // `--dynamo-auth PATH` (ADR 0057): a JSON file of the same shape as a
     // `ClusterConfig`'s `dynamo_auth` section (`{"credentials": {"AKID":
     // "secret", ...}}`) — the client DynamoDB port's SigV4 credential store.
@@ -641,6 +650,13 @@ async fn run(args: &[String]) -> Result<(), String> {
             "--tablet-max-write-units" => {
                 tablet_max_write_units = Some(parse_next(&mut it, "--tablet-max-write-units")?);
             }
+            "--max-region-rtt-ms" => {
+                let ms: u64 = parse_next(&mut it, "--max-region-rtt-ms")?;
+                if ms == 0 {
+                    return Err("--max-region-rtt-ms must be at least 1".into());
+                }
+                max_region_rtt_ms = Some(ms);
+            }
             "--dynamo-auth" => {
                 dynamo_auth_path = Some(parse_next(&mut it, "--dynamo-auth")?);
             }
@@ -680,6 +696,7 @@ async fn run(args: &[String]) -> Result<(), String> {
         throttle_write_units,
         tablet_max_read_units,
         tablet_max_write_units,
+        max_region_rtt_ms,
     };
     let orphan_sweep_after =
         orphan_sweep_after_duration(cli_cluster_settings.orphan_sweep_after_secs);
@@ -709,6 +726,13 @@ async fn run(args: &[String]) -> Result<(), String> {
     )?;
     let quiesce_after = quiesce_after_duration(cli_cluster_settings.quiesce_after_secs);
     validate_quiesce_after(quiesce_after)?;
+    if max_region_rtt_ms.is_some() && config_path.is_none() {
+        return Err(
+            "--max-region-rtt-ms is only supported with --config/--node (set \
+             cluster_settings.max_region_rtt_ms in the config file for the other shapes)"
+                .into(),
+        );
+    }
     let dynamo_auth_flag = dynamo_auth_path
         .as_deref()
         .map(load_dynamo_auth_file)
@@ -1568,6 +1592,7 @@ fn resolve_cluster_settings(
     merge_field!(throttle_write_units, "--throttle-write-units");
     merge_field!(tablet_max_read_units, "--tablet-max-read-units");
     merge_field!(tablet_max_write_units, "--tablet-max-write-units");
+    merge_field!(max_region_rtt_ms, "--max-region-rtt-ms");
     Ok(effective)
 }
 
@@ -1646,6 +1671,15 @@ async fn run_single(
     let dir = dir.unwrap_or_else(|| std::env::temp_dir().join(format!("animusd-node-{index}")));
 
     let settings = resolve_cluster_settings(config.cluster_settings.as_ref(), &cli_settings)?;
+    // ADR 0075 section 3.4: the node-start paths read `max_region_rtt` straight
+    // off the config (`ClusterConfig::max_region_rtt`), so fold a CLI-supplied
+    // value into it (the merge above already refused a both-sides conflict).
+    if let Some(ms) = settings.max_region_rtt_ms {
+        config
+            .cluster_settings
+            .get_or_insert_with(Default::default)
+            .max_region_rtt_ms = Some(ms);
+    }
     let orphan_sweep_after = orphan_sweep_after_duration(settings.orphan_sweep_after_secs);
     let stream_seal_knobs_val =
         stream_seal_knobs(settings.stream_seal_bytes, settings.stream_seal_age_secs);

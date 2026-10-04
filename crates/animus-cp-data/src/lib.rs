@@ -3193,6 +3193,28 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         }
     }
 
+    /// Install `profile`'s `(election_base, heartbeat_interval)` on this group
+    /// (ADR 0075 section 3.4, G-01 stage G-c groundwork) — see
+    /// [`RaftCore::set_timing`]. Idempotent (no RNG draw, no deadline touched
+    /// when the group already runs `profile`); on a real change the driver is
+    /// woken so it re-evaluates `next_deadline` at once. Returns whether the
+    /// timing changed. Called by the tablet-host reconciler
+    /// ([`host::Reconciler`]) with a profile derived from the tablet's replica
+    /// regions; a node-local, non-replicated decision.
+    pub fn set_timing_profile(&self, profile: animus_control::timing::TimingProfile) -> bool {
+        let want = profile.durations();
+        if self.lock().timing() == want {
+            return false;
+        }
+        let now = self.env.now();
+        let entropy = self.env.next_u64();
+        let changed = self.lock().set_timing(want.0, want.1, now, entropy);
+        if changed {
+            self.wake();
+        }
+        changed
+    }
+
     /// Opt this group into quiescence (ADR 0044 phase-1 PR3): once its leader
     /// has had no local activity for `after` and every other entry-predicate
     /// clause holds (see [`RaftCore::enable_quiescence`]'s doc), it stops
@@ -7175,6 +7197,12 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// The group's current Raft term.
     pub fn term(&self) -> u64 {
         self.lock().term()
+    }
+
+    /// The group's installed election-timeout base (ADR 0075 section 3.4:
+    /// 150 ms on the LAN profile, wider on the WAN one). Read-only.
+    pub fn election_timeout(&self) -> Duration {
+        self.lock().election_timeout()
     }
 
     /// This node's own observability sink (ADR 0015) — the same

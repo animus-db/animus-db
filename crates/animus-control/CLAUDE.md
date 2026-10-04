@@ -3061,3 +3061,26 @@ rounds while the apply task is behind.
   until the next round syncs.
 
 **Upgrade-harness class (ADR 0073 P1-D):** `control-wal`/`shared-wal` are whole-file `TABLE` entries in `animus-test`'s transcode table (a bump edits that entry; legacy encoders must be `pub` + `legacy-encoders`-gated); `control-snapshot`, `metadata`, `mirror-version` and `mirror-entities` are `EMBEDDED` (a bump edits their carrier's transcode).
+
+## Per-group Raft timing profile (`timing.rs`, ADR 0075 section 3.4)
+
+`timing::TimingProfile {Lan, Wan{max_region_rtt}}` is a pure function to
+`(election_base, heartbeat_interval)`: LAN is the historical 150 ms / 50 ms; WAN
+is `election = max(150 ms, 5 x max_region_rtt)`, `heartbeat = max(50 ms,
+election / 10)` (750 / 75 ms at the 150 ms default). A group is WAN iff its
+voters **and learners** carry more than one distinct
+`topology.kubernetes.io/region` label (`REGION_LABEL`, local copy: keep it equal
+to G-a's). `RaftCore::set_timing(election_base, heartbeat_interval, now,
+entropy)` installs the pair: zero refused, unchanged is a no-op, a follower
+re-arms its election deadline from the new base, a leader only ever pulls its
+heartbeat deadline in. **Callers compare first** (`RaftNode::set_timing_profile`
+reads `RaftCore::timing()` before drawing `now`/entropy) because an extra RNG
+draw desyncs fixed seeds. Everything derived from the pair follows it:
+`transfer_leadership`'s deadline, `election_timeout()` (and animusd's health
+grace), the cluster-check resend, the departing-peer gap, snapshot backoff.
+`RaftNode::enable_region_timing(rtt)` is the opt-in control-group loop (a
+spawned task, nothing in `start*` changed). **Control-only nodes have no
+`Member` row, so their labels are invisible here** until G-a's config-borne
+labels exist; `ControlHandle::Remote::election_timeout` still says 150 ms.
+`timing::control_voter_change_check` is the admin add/remove region-majority
+guard (see ADR 0075's 2026-10-04 amendment); tests `tests/it/set_timing.rs`.

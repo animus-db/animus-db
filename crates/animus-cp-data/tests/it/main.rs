@@ -81,5 +81,6 @@ mod voter_history_reconfigure_diff;
 mod wal_rewrite_crash;
 mod wal_rewrite_no_stall;
 mod wal_round_single_append;
+mod wan_timing_corpus;
 mod wiped_tablet_voter_boot_check;
 mod witnessing;

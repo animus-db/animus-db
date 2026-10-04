@@ -1265,14 +1265,13 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     incoming_snapshot: Option<IncomingSnapshot>,
 
     // Timing (virtual). Election timeout is randomized in `[base, 2*base)`.
-    // Fixed at 150ms for every constructor — issue #313 removed the
-    // `set_election_timeout` setter this comment used to point to: it had
-    // zero call sites (no assembly layer was ever built to widen this for a
-    // node doing real disk I/O, the use case its own doc described), so it
-    // was dead, aspirational API rather than a documented-but-unwired
-    // knob worth keeping. See `election_timeout()` for the read-only
-    // accessor, still used by `transfer_leadership`'s deadline and by
-    // driver-side observability.
+    // Every constructor starts at the LAN pair (150ms / 50ms). Issue #313
+    // removed the dead `set_election_timeout` setter (zero call sites);
+    // ADR 0075 section 3.4 (roadmap G-01 stage G-c) adds back ONE narrow,
+    // used replacement, `set_timing`, whose callers pick the pair from
+    // `crate::timing::TimingProfile` (a group spanning regions gets the WAN
+    // pair). See `election_timeout()` for the read-only accessor, used by
+    // `transfer_leadership`'s deadline and by driver-side observability.
     election_base: Duration,
     heartbeat_interval: Duration,
     election_deadline: Nanos,
@@ -2815,6 +2814,67 @@ where
         self.quiesced = false;
         self.last_activity = now;
         true
+    }
+
+    /// Install a new `(election_base, heartbeat_interval)` pair (ADR 0075
+    /// section 3.4: the per-group timing profile, see
+    /// [`crate::timing::TimingProfile::durations`]). Returns whether anything
+    /// changed.
+    ///
+    /// **Idempotent**: re-installing the current pair is a no-op that touches
+    /// no deadline, so a reconciler may call it on every tick without ever
+    /// postponing an election. A zero duration is refused (returns `false`).
+    ///
+    /// On a real change the deadlines are re-armed from `now` so the new pair
+    /// takes effect immediately rather than after the old, possibly much
+    /// longer or shorter, wait: a non-leader draws a fresh randomized election
+    /// deadline from the new base (`entropy` is the caller's `env.next_u64()`);
+    /// a leader pulls its next heartbeat in to at most `now + heartbeat` (never
+    /// pushes it out, so a WAN widening cannot starve followers still timing
+    /// out on the old base) and leaves an armed `transfer_deadline` alone.
+    /// A quiesced group's deadlines are not consulted at all. Everything that
+    /// derives from the pair (`transfer_leadership`'s deadline,
+    /// `next_cluster_check_resend`, the departing-peer backoff gap,
+    /// [`election_timeout`](Self::election_timeout) and its
+    /// `health` grace consumers) reads the fields, so it follows automatically.
+    ///
+    /// The driver sleeps until [`next_deadline`](Self::next_deadline) and
+    /// recomputes it every iteration, so a caller that SHORTENS the timing
+    /// should also wake the driver (the data plane's `RaftKvNode::wake`);
+    /// lengthening needs nothing (an early wake just finds nothing due).
+    pub fn set_timing(
+        &mut self,
+        election_base: Duration,
+        heartbeat_interval: Duration,
+        now: Nanos,
+        entropy: u64,
+    ) -> bool {
+        if election_base.is_zero() || heartbeat_interval.is_zero() {
+            return false;
+        }
+        if self.election_base == election_base && self.heartbeat_interval == heartbeat_interval {
+            return false;
+        }
+        self.election_base = election_base;
+        self.heartbeat_interval = heartbeat_interval;
+        if self.role == Role::Leader {
+            let next = Nanos(now.0.saturating_add(self.heartbeat_nanos()));
+            if next.0 < self.heartbeat_deadline.0 {
+                self.heartbeat_deadline = next;
+            }
+        } else {
+            self.reset_election_timer(now, entropy);
+        }
+        true
+    }
+
+    /// The current `(election_base, heartbeat_interval)` pair — what
+    /// [`set_timing`](Self::set_timing) last installed (the LAN defaults
+    /// otherwise). Lets a caller skip an entropy draw when nothing would
+    /// change.
+    #[must_use]
+    pub fn timing(&self) -> (Duration, Duration) {
+        (self.election_base, self.heartbeat_interval)
     }
 
     /// The current election-timeout base (the low end of the randomized

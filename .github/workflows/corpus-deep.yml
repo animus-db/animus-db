@@ -104,6 +104,10 @@ on:
         description: "Seeds per scenario (ANIMUS_HEARTBEAT_SEEDS, ADR 0044 phase 2 heartbeat-batcher fault corpus)"
         required: false
         default: "40"
+      wan_timing_seeds:
+        description: "Seeds per cell (ANIMUS_WAN_TIMING_SEEDS, ADR 0075 section 3.4 per-group WAN Raft timing corpus with a LAN-forced negative control)"
+        required: false
+        default: "40"
       sharedwal_seeds:
         description: "Seeds per cell (ANIMUS_SHAREDWAL_SEEDS, ADR 0028 C-05 PR 2 SharedWal cross-tablet ordering/crash-safety/GC fault corpus)"
         required: false
@@ -523,6 +527,21 @@ jobs:
         run: |
           cargo test -p animus-cp-data --test it heartbeat_batch_corpus:: -- --nocapture
 
+      # ADR 0075 section 3.4 (G-01 stage G-c groundwork): the per-group WAN
+      # Raft timing profile. Three regions at 60-90ms one-way with a noisy
+      # tail; the WAN cells (steady, leader-node kill, leader-region
+      # partition + heal) must keep bounded term churn and commit durably,
+      # and the LAN-forced negative control must show election churn on the
+      # fault cells. Each cell is a pure function of its seed.
+      - name: deep WAN-timing corpus (ADR 0075 section 3.4)
+        id: wan_timing
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          ANIMUS_WAN_TIMING_SEEDS: ${{ github.event.inputs.wan_timing_seeds || '40' }}
+        run: |
+          cargo test -p animus-cp-data --test it wan_timing_corpus:: -- --nocapture
+
       # ADR 0028's C-05 PR 2 SharedWal persist-path wiring: cross-tablet
       # coalescing under a burst of concurrent hosted-group writes, a crash
       # mid-round proving no cross-tablet contamination and whole-or-absent
@@ -673,6 +692,7 @@ jobs:
             [dynamo_wire]="${{ steps.dynamo_wire.outcome }}"
             [export_import]="${{ steps.export_import.outcome }}"
             [heartbeat]="${{ steps.heartbeat.outcome }}"
+            [wan_timing]="${{ steps.wan_timing.outcome }}"
             [sharedwal]="${{ steps.sharedwal.outcome }}"
             [wal_rewrite_crash]="${{ steps.wal_rewrite_crash.outcome }}"
             [upgrade_restart]="${{ steps.upgrade_restart.outcome }}"
@@ -683,7 +703,7 @@ jobs:
           )
           failed=0
           failed_names=()
-          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner reconfigure_drop inplace_split backup pitr lsm_crash lsm_disk_fault lsm_encrypted segment_store_encrypted control simcluster dynamo_wire export_import heartbeat sharedwal wal_rewrite_crash upgrade_restart upgrade_restart_cluster upgrade_mixed upgrade_mixed_cluster learner_snapshot_livelock; do
+          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner reconfigure_drop inplace_split backup pitr lsm_crash lsm_disk_fault lsm_encrypted segment_store_encrypted control simcluster dynamo_wire export_import heartbeat wan_timing sharedwal wal_rewrite_crash upgrade_restart upgrade_restart_cluster upgrade_mixed upgrade_mixed_cluster learner_snapshot_livelock; do
             outcome="${outcomes[$name]}"
             echo "${name}: ${outcome}"
             if [ "${outcome}" != "success" ]; then
