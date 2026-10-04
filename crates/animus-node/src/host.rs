@@ -368,6 +368,15 @@ pub trait AdminHost: Send + Sync {
     /// transfer arm — this route lets an operator move leadership without
     /// also removing anyone.
     async fn action_transfer_control_leadership(&self, body: &[u8]) -> (u16, Value);
+    /// `GET /admin/cluster-version` (ADR 0073 Phase 2, P2-C) — the active
+    /// cluster version, every node's recorded range and build, the safe
+    /// target and the Finalize blockers. Served by any node; the control
+    /// leader additionally reports its live observation table.
+    async fn cluster_version_view(&self) -> Value;
+    /// `POST /admin/cluster-version/finalize` (ADR 0073 Phase 2, P2-C) —
+    /// raise the cluster version by one. Local-control-leader-only, not
+    /// relayed (the ADR 0037 `admin_remove_member` pattern).
+    async fn action_finalize_cluster_version(&self, body: &[u8]) -> (u16, Value);
     /// `POST /admin/data/dynamo` — the admin dashboard's `execute_routed`
     /// proxy (ADR 0021); reaches `dynamo.rs`, unmoved, unmodified.
     async fn action_data_dynamo(&self, body: &[u8]) -> (u16, Value);

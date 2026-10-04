@@ -46,7 +46,7 @@ Last verified against the tree: 2026-10-04.
 | X-8 | Backup, restore and PITR implemented and fault-injection tested | Met | `docs/adr/0059-backup-restore.md` | X |
 | X-9 | The Kubernetes operator is smoke-tested on a real `kind` cluster in CI (create, bootstrap, scale, delete; plain and TLS) | Met | `scripts/e2e-kind.sh`, `.github/workflows/e2e-kind.yml`, `docs/adr/0060-kubernetes-operator.md` | X |
 | X-10 | Dependency licences and advisories are gated per push | Met | `deny.toml`, the `cargo-deny check` step in `.github/workflows/ci.yml` | X |
-| X-11 | Rolling (mixed-version) upgrades are supported and tested | Pending-dependency | ADR 0073 Phase 2 (design in review) then Phase 3 (planned); today only whole-cluster restart is supported | X |
+| X-11 | Rolling (mixed-version) upgrades are supported and tested | Pending-dependency | ADR 0073 Phase 2 (P2-A and P2-C landed: era live, admin/CLI present; P2-B and P2-D not yet) then Phase 3 (planned); rolling upgrade is not yet supported, only whole-cluster restart | X |
 
 ## (a) Soak
 

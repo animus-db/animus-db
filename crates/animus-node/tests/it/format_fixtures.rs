@@ -404,6 +404,9 @@ fn every_response() -> Vec<(&'static str, ClientResponse)> {
                     .into_iter()
                     .collect(),
                 admin_addrs: vec!["127.0.0.1:9301".parse().unwrap()],
+                // P2-C's additive field at its default: skipped on the wire, so
+                // the bytes stay equal to the Phase 1 fixture.
+                cluster_version: 0,
             },
         ),
         (
@@ -705,12 +708,16 @@ fn nested_relay_requests_take_their_payloads_gate() {
     assert_eq!(fwd(ClientRequest::Status).required_gate(), Gate::Base);
 }
 
-/// ADR 0073 P2-B relay decision: both era commands may ride `ProposeSchema`
-/// (they are refused before the era by the gate checks, not by the allowlist).
+/// ADR 0073 relay decision (P2-B draft amended by P2-C): `ReportNodeVersion`
+/// rides `ProposeSchema` (the data-only boot self-report needs a route);
+/// `FinalizeClusterVersion` is a leader-local admin action and is NOT
+/// relayable. Both are era-gated, so the gate check refuses them before the
+/// era either way.
 #[test]
-fn era_commands_are_relayable_but_gated() {
+fn era_commands_relay_classification_and_gate() {
+    assert!(animus_node::is_relayable_command(&era_report()));
+    assert!(!animus_node::is_relayable_command(&era_finalize()));
     for c in [era_report(), era_finalize()] {
-        assert!(animus_node::is_relayable_command(&c));
         assert_eq!(
             animus_control::version::GatedCommand::required_gate(&c),
             Gate::Era

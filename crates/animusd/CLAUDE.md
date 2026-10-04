@@ -7319,6 +7319,58 @@ attempted here.
 `=25` depths on the first complete run; the `ConsistentRead: false`
 prefix check and both direct probes never found a violation.
 
+## Cluster version wiring (ADR 0073 Phase 2, P2-C)
+
+`version_wiring.rs` (module carries `#[deny(clippy::disallowed_methods)]`) is
+everything `animusd` does with `animus-control`'s cluster-version machinery.
+**The era is live in production**: `apply_profile_to_raft` sets each control
+`RaftNode`'s own range/build at both start sites (`BoundNode::start_with_growth`,
+`BoundControlNode::start_control_with`), and `Node::bind*` gives the `ProdEnv`
+its handshake `ext` (`own_ext()`, a pure function of constants; always
+non-empty, presence is the Phase 2 signal). Known benign race: the accept loop
+is spawned before `set_own_ext`, so a connection in those microseconds answers
+with an empty `ext`; an era-on peer refuses and redials (closing it needs an
+`animus-env` `bind*` parameter).
+
+- **Per-node state**: `ClusterEdgeState::version()` -> `VersionState {
+  features (ClusterFeatures), halt (VersionHalt), profile (range + build) }`.
+  `Node::features()` / `version_halt_reason()` / `wait_version_halt()` expose
+  it. P2-B's emitters consult `ctx.edge.version().features`.
+- **`version_wiring_loop`** (spawned from `spawn_common_tail` and every
+  `SimCluster` node; one generic task, every role): feeds `ClusterFeatures`
+  from `effective_metadata()` once metadata is ready, flips
+  `require_peer_ext` for nodes with no local apply task (data-only), latches
+  the out-of-range halt, and **self-reports `ReportNodeVersion` only once the
+  node's own applied view shows the era** (never pre-era: a Phase 1 voter
+  cannot decode it). `ReportNodeVersion` is on the relay allowlist; Finalize
+  is not (leader-local).
+- **CHS1**: dials advertise `own_ext()` and never require the peer's; the
+  accept side advertises the node's profile `ext` and, era on, requires the
+  peer's **on `ListenerKind::Intra` only** (CLI/external clients dial the client
+  port with an empty `ext`).
+- **Admin**: `GET /admin/cluster-version` (any node) and
+  `POST /admin/cluster-version/finalize` (`ClientCtx::admin_finalize_cluster_version`:
+  leadership first, era, one-step, `expected` CAS, blockers, propose, confirm on
+  the version value). Blockers include Down/Leaving/never-activated Joining
+  members strictly; `Metadata::apply` does not enforce that half (issue #1168).
+  `animus cluster version|finalize` (`animus-cli`) wraps them.
+- **Admission/joins**: `admin_add_control_member` refuses (era on) a voter with
+  no known range or an excluding one (so the voter must be up, connected or
+  self-reported, **before** the admin add once the era is on);
+  `discover_join_info` refuses an
+  out-of-range cluster from `JoinInfo.cluster_version` before claiming anything.
+- **Halt**: `main.rs` `wait_for_shutdown` races the signal against every node's
+  `wait_version_halt`; a halt prints `animusd: FATAL: <reason>` and exits 78
+  (`EX_CONFIG`), no usage text.
+- **Tests**: `sim_cluster_cluster_version.rs` (`SimCluster::set_node_version` /
+  `set_all_node_versions` are the per-node "binary" hook; synthetic `[1, 2]`
+  ranges stand in for a second release; `set_raft_own_range` switches the
+  leader's own upkeep off so the relay-arm test is red without the arm) and
+  `tests/cluster_version_prod.rs` (real sockets: era, view, by-name Finalize
+  refusal, CHS1 client-vs-intra, data-only node learning the era). The default
+  `SimCluster` node stays a Phase 1 `RaftNode`, so existing sim tests never start
+  an era.
+
 ## Versioned formats (ADR 0073 Phase 0, Workstream E)
 
 `ClusterConfig` is the config JSON file's top-level type and carries a

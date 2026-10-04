@@ -51,6 +51,8 @@
 //! - `GET  /admin/control/members`     — live control-plane voters + address book (ADR 0037 PR3)
 //! - `POST /admin/control/member/add`    — `{node?, addr}` — grow the control group (ADR 0037 PR3; `node` optional since the ADR 0037 hardening trio's PR3, allocator-minted)
 //! - `POST /admin/control/member/remove` — `{node}` — shrink the control group (ADR 0037 PR3)
+//! - `GET  /admin/cluster-version`       — ADR 0073 Phase 2: active cluster version, per-node recorded range + build, safe target, Finalize blockers (any node; the control leader adds its live observation table)
+//! - `POST /admin/cluster-version/finalize` — `{to?, expected?}` — raise the cluster version one step (local-control-leader-only, not relayed; 409 names every blocker, and the leader on a non-leader)
 //! - `POST /admin/data/dynamo`         — run a DynamoDB op `{op, payload}` (ADR 0021), item API or Streams read API alike (ADR 0042)
 //! - `POST /admin/data/drop-table`     — drop a table's schema `{table}` (ADR 0021)
 //! - `POST /admin/data/seed`           — bulk-write synthetic DynamoDB items `{count, …}` (ADR 0021)
@@ -573,6 +575,12 @@ impl AdminHost for ClientCtx {
     async fn action_transfer_control_leadership(&self, body: &[u8]) -> (u16, Value) {
         action_transfer_control_leadership(self, body).await
     }
+    async fn cluster_version_view(&self) -> Value {
+        self.admin_cluster_version_view()
+    }
+    async fn action_finalize_cluster_version(&self, body: &[u8]) -> (u16, Value) {
+        action_finalize_cluster_version(self, body).await
+    }
     async fn action_data_dynamo(&self, body: &[u8]) -> (u16, Value) {
         action_data_dynamo_concrete(self, body).await
     }
@@ -739,6 +747,12 @@ impl<E: Env, R: RelayClient> AdminHost for GenericAdminHost<E, R> {
     }
     async fn action_transfer_control_leadership(&self, body: &[u8]) -> (u16, Value) {
         action_transfer_control_leadership(&self.0, body).await
+    }
+    async fn cluster_version_view(&self) -> Value {
+        self.0.admin_cluster_version_view()
+    }
+    async fn action_finalize_cluster_version(&self, body: &[u8]) -> (u16, Value) {
+        action_finalize_cluster_version(&self.0, body).await
     }
     async fn action_data_dynamo(&self, body: &[u8]) -> (u16, Value) {
         action_data_dynamo(&self.0, body).await
@@ -2777,6 +2791,39 @@ async fn action_transfer_control_leadership<E: Env, R: RelayClient>(
         Ok(()) => (200, json!({"ok": true, "to": req.to})),
         Err(e) => (409, json!({"error": e})),
     }
+}
+
+/// `POST /admin/cluster-version/finalize {to?, expected?}` (ADR 0073 Phase 2,
+/// P2-C). **Local-control-leader-only, not relayed** — see
+/// [`crate::ClientCtx::admin_finalize_cluster_version`].
+#[derive(Deserialize)]
+struct FinalizeClusterVersionReq {
+    /// The version to raise to; must be `active + 1` when given.
+    #[serde(default)]
+    to: Option<u32>,
+    /// Optional CAS on the currently active version.
+    #[serde(default)]
+    expected: Option<u32>,
+}
+
+async fn action_finalize_cluster_version<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    body: &[u8],
+) -> (u16, Value) {
+    // An empty body is a plain "finalize the next version".
+    let req: FinalizeClusterVersionReq = if body.iter().all(u8::is_ascii_whitespace) {
+        FinalizeClusterVersionReq {
+            to: None,
+            expected: None,
+        }
+    } else {
+        match parse_body(body) {
+            Ok(r) => r,
+            Err(e) => return e,
+        }
+    };
+    ctx.admin_finalize_cluster_version(req.to, req.expected)
+        .await
 }
 
 // ---- data write proxies (ADR 0021 dashboard) ----------------------------

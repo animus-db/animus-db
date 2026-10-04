@@ -455,8 +455,12 @@
 <span class="p">$</span> <span class="k">animus admin reconfigure &lt;admin-addr&gt; &lt;tablet&gt; &lt;voter,voter,...&gt;</span>
 <span class="p">$</span> <span class="k">animus admin drain|drain-status|remove|decommission &lt;admin-addr&gt; &lt;node-id&gt;</span>
 
-<span class="c"># control-plane membership</span>
+<span class="c"># control-plane membership (once the version era is on, start the new control voter first: it must be up to be admitted)</span>
 <span class="p">$</span> <span class="k">animus admin control-add|control-remove|control-grow|control-transfer &lt;leader-admin-addr&gt; …</span>
+
+<span class="c"># cluster version (ADR 0073 Phase 2)</span>
+<span class="p">$</span> <span class="k">animus cluster version &lt;admin-addr&gt; [--json]</span>
+<span class="p">$</span> <span class="k">animus cluster finalize &lt;leader-admin-addr&gt; [--to N] [--yes]</span>
 
 <span class="c"># backup, restore, PITR, TTL, streams</span>
 <span class="p">$</span> <span class="k">animus admin backup-create &lt;admin-addr&gt; &lt;table&gt; &lt;backup-name&gt;</span>
@@ -637,7 +641,13 @@
         <li><strong>No rolling upgrades or mixed-version clusters.</strong> A full-cluster stop,
           upgrade and restart across versions is supported and tested (on-disk formats stay
           readable across versions), but nodes on different versions cannot talk to each
-          other yet, so upgrade every node at once.</li>
+          other yet, so upgrade every node at once. Rolling upgrade is in progress, not
+          supported: each node now advertises the cluster versions its binary supports,
+          <code>animus cluster version</code> shows the active version, every node's range
+          and what blocks raising it, and <code>animus cluster finalize</code> raises it (one
+          step, leader only, irreversible, refused while any member is down or does not
+          support the target). The mixed-version safety gates and their test corpus are not
+          in yet.</li>
         <li><strong>Restore always creates a brand-new table, never in-place</strong> — matching
           real DynamoDB, for both on-demand backups (<code>RestoreTableFromBackup</code>) and
           continuous backups (<code>RestoreTableToPointInTime</code>); a source table's backup
