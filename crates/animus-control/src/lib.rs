@@ -85,4 +85,6 @@ pub use raft::{
     RaftCore, RaftMsg, RemovalStats, Role, StateMachine,
 };
 pub use shared_wal::SharedWal;
-pub use version::{ClusterFeatures, ClusterVersion, Gate, NodeVersion, VersionRange};
+pub use version::{
+    ClusterFeatures, ClusterVersion, Gate, GateSurface, GatedCommand, NodeVersion, VersionRange,
+};

@@ -25,7 +25,6 @@ use std::sync::{Arc, Mutex};
 use animus_env::handshake::encode_ext;
 use animus_env::{Nanos, NodeId};
 
-use crate::MetaCommand;
 use crate::raft::RaftMsg;
 use crate::version::{ClusterVersion, Gate, VersionRange, own_range};
 
@@ -85,33 +84,17 @@ impl BinaryProfile {
     /// Whether this binary can decode a message that requires `g`.
     #[must_use]
     pub fn accepts(self, g: Gate) -> bool {
+        // `Gate::Base` is everything Phase 1 itself emits: always decodable,
+        // by every profile (including Phase 1, whose max known version is 0).
+        if g == Gate::Base {
+            return true;
+        }
         match g.version() {
             // The era gate: every binary that knows versioning (anything but
             // Phase 1).
             None => self != BinaryProfile::Phase1,
             Some(v) => v <= self.max_known_gate_version(),
         }
-    }
-}
-
-/// **The provisional single-call-site classifier P2-B replaces** with
-/// `msg.required_gate()` (its exhaustive tables). Until then the only gated
-/// control form is the era pair: an `AppendEntries` carrying
-/// `ReportNodeVersion` or `FinalizeClusterVersion` requires `Gate::Era`.
-#[must_use]
-pub fn provisional_required_gate(msg: &RaftMsg) -> Option<Gate> {
-    match msg {
-        RaftMsg::AppendEntries { entries, .. } => entries
-            .iter()
-            .any(|e| {
-                matches!(
-                    e.command,
-                    MetaCommand::ReportNodeVersion { .. }
-                        | MetaCommand::FinalizeClusterVersion { .. }
-                )
-            })
-            .then_some(Gate::Era),
-        _ => None,
     }
 }
 
@@ -164,25 +147,27 @@ pub struct SimCap {
 impl SimCap {
     /// Whether `msg` must be rejected; logs it when so.
     pub(crate) fn rejects(&self, from: &NodeId, to: &NodeId, at: Nanos, msg: &RaftMsg) -> bool {
-        match provisional_required_gate(msg) {
-            Some(g) if !self.profile.accepts(g) => {
-                self.log.push(CapRejection {
-                    at,
-                    from: from.clone(),
-                    to: to.clone(),
-                    gate: g,
-                    profile: self.profile,
-                });
-                true
-            }
-            _ => false,
+        // P2-B's full-message table: the envelope joined with every entry
+        // command of an `AppendEntries`.
+        let g = msg.required_gate();
+        if self.profile.accepts(g) {
+            return false;
         }
+        self.log.push(CapRejection {
+            at,
+            from: from.clone(),
+            to: to.clone(),
+            gate: g,
+            profile: self.profile,
+        });
+        true
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MetaCommand;
 
     #[test]
     fn profile_derivations() {
@@ -202,13 +187,14 @@ mod tests {
 
     #[test]
     fn era_gate_accepted_by_all_but_phase1() {
+        assert!(BinaryProfile::Phase1.accepts(Gate::Base));
         assert!(!BinaryProfile::Phase1.accepts(Gate::Era));
         assert!(BinaryProfile::B2.accepts(Gate::Era));
         assert!(BinaryProfile::Release(2).accepts(Gate::Era));
     }
 
     #[test]
-    fn classifier_flags_only_the_era_commands() {
+    fn required_gate_flags_only_the_era_commands() {
         use crate::raft::LogEntry;
         let entry = |command: MetaCommand| LogEntry {
             term: 1,
@@ -230,17 +216,11 @@ mod tests {
             range: VersionRange::new(1, 1),
             build: "b2".into(),
         };
-        assert_eq!(
-            provisional_required_gate(&ae(entry(report))),
-            Some(Gate::Era)
-        );
-        assert_eq!(
-            provisional_required_gate(&ae(entry(MetaCommand::NoOp))),
-            None
-        );
+        assert_eq!(ae(entry(report)).required_gate(), Gate::Era);
+        assert_eq!(ae(entry(MetaCommand::NoOp)).required_gate(), Gate::Base);
         let hb = RaftMsg::<MetaCommand>::Heartbeat {
             node: animus_env::nid(0),
         };
-        assert_eq!(provisional_required_gate(&hb), None);
+        assert_eq!(hb.required_gate(), Gate::Base);
     }
 }

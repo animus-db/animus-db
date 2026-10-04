@@ -768,11 +768,14 @@ fn run_n1(seed: u64) -> bool {
     // The buggy emitter.
     for _ in 0..50 {
         let leader = w.leader().expect("leader");
-        let _ = w.nodes[&leader].propose(MetaCommand::ReportNodeVersion {
-            node: nid(0),
-            range: VersionRange::new(1, 1),
-            build: "b2".into(),
-        });
+        // Ungated on purpose: the buggy emitter (P2-B's `propose` would
+        // refuse a closed-gate era variant and the control would be vacuous).
+        let _ =
+            w.nodes[&leader].propose_ungated_for_negative_control(MetaCommand::ReportNodeVersion {
+                node: nid(0),
+                range: VersionRange::new(1, 1),
+                build: "b2".into(),
+            });
         w.run(Duration::from_millis(100), &mut |_| {});
         if era(&w.nodes[&0].metadata()) {
             break;
