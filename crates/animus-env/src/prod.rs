@@ -1021,6 +1021,66 @@ impl Rng for PreBindRng {
     }
 }
 
+/// A standalone real `Clock + Rng` with no node, listener or data directory —
+/// for the few process-boundary constructors that need only time and
+/// randomness (an `S3SegmentStore` built by a test harness or tool outside a
+/// bound node). A bound node passes its own [`ProdEnv`] instead. Real wall
+/// clock, real monotonic clock, `tokio` sleep and OS randomness, byte-for-byte
+/// what [`ProdEnv`]'s own `Clock`/`Rng` impls use.
+#[derive(Clone)]
+pub struct ProdClockRng {
+    start: std::time::Instant,
+}
+
+impl ProdClockRng {
+    /// A fresh clock anchored at "now".
+    #[must_use]
+    pub fn new() -> Self {
+        ProdClockRng {
+            start: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Default for ProdClockRng {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl Clock for ProdClockRng {
+    fn now(&self) -> Nanos {
+        Nanos(self.start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64)
+    }
+
+    fn wall_now(&self) -> UnixMillis {
+        UnixMillis(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis().min(u128::from(u64::MAX)) as u64),
+        )
+    }
+
+    async fn sleep(&self, dur: Duration) {
+        tokio::time::sleep(dur).await;
+    }
+}
+
+#[allow(
+    clippy::disallowed_types,
+    reason = "OsRng is the sanctioned real-randomness source ProdClockRng wraps, like ProdEnv's and PreBindRng's own Rng impls (ADR 0061 Decision 4)"
+)]
+impl Rng for ProdClockRng {
+    fn next_u64(&self) -> u64 {
+        rand::RngCore::next_u64(&mut rand::rngs::OsRng)
+    }
+
+    fn fill_bytes(&self, dst: &mut [u8]) {
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, dst);
+    }
+}
+
 #[async_trait::async_trait]
 impl Network for ProdEnv {
     async fn send_stream(&self, to: NodeId, stream: u64, payload: Vec<u8>) {

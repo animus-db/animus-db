@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "prod")]
 pub mod prod;
 #[cfg(feature = "prod")]
-pub use prod::{FsSegmentStore, InboxStats, ProdEnv, StreamInboxStats};
+pub use prod::{FsSegmentStore, InboxStats, ProdClockRng, ProdEnv, StreamInboxStats};
 /// The shared per-connection preamble-exchange primitives (ADR 0073 Phase 0,
 /// workstream D, layer 3): [`prod::exchange_preamble`] (the one
 /// implementation — write our own preamble, then read and check the
@@ -84,15 +84,16 @@ pub use encrypted_segment_store::{
 };
 
 /// S3-backed [`SegmentStore`] (S-04 PR 2, `docs/adr/0059-backup-restore.md`'s
-/// 2026-09-06 amendment) — gated alongside `prod.rs` for the identical
-/// reason: it wraps `animus_s3::client::S3Client<T>`, generic over
+/// 2026-09-06 amendment) — gated behind the `s3` feature (implied by `prod`;
+/// no tokio, generic over `E: Clock + Rng` so `SimEnv` can drive it,
+/// S-08 M3): it wraps `animus_s3::client::S3Client<T>`, generic over
 /// `T: animus_s3::client::Transport`, so it is testable against
 /// `animus_s3::fake::FakeS3` (no sockets) and driven in production by
 /// `animus_s3::prod::HyperRustlsTransport`. See the module's own doc.
-#[cfg(feature = "prod")]
+#[cfg(feature = "s3")]
 pub mod s3_store;
-#[cfg(feature = "prod")]
-pub use s3_store::{MultipartConfig, S3SegmentStore};
+#[cfg(feature = "s3")]
+pub use s3_store::{MultipartConfig, RetryPolicy, S3SegmentStore};
 
 pub mod metrics;
 pub use metrics::{Metric, MetricSink, MetricSnapshot, MetricsHandle};

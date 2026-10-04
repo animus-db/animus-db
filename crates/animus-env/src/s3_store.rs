@@ -31,16 +31,24 @@
 //! [`SegmentStore`] contract (write-once, read-after-put) assumes — see the
 //! ADR amendment's "Consistency assumptions" section for the full argument.
 //!
-//! # Retry
+//! # Retry (S-08 M3)
 //!
-//! A small, bounded retry ([`MAX_RETRY_ATTEMPTS`]) on a transport failure or
-//! a `5xx` service error — never on a `4xx` (a client-side mistake retrying
-//! won't fix, e.g. `AccessDenied`) or [`animus_s3::client::S3Error::NotFound`]
-//! (a defined outcome, not a failure). This store is **not** `Env`-generic
-//! (it mirrors [`crate::FsSegmentStore`]'s own shape: a concrete,
-//! `prod`-feature-gated type with no `E: Env` parameter), so the backoff
-//! sleep is a plain `tokio::time::sleep` rather than `env.sleep()` — see the
-//! module-level `#[allow(...)]` below.
+//! One retry helper ([`S3SegmentStore::retry_op`]) wraps every S3 request.
+//! The store is generic over the env's time and randomness
+//! (`E: Clock + Rng`): the SigV4 timestamp and credential-provider `now`
+//! come from `env.wall_now()`, the backoff sleeps from `env.sleep()`, and the
+//! jitter from `env.gen_below()` — so under `SimEnv` the whole retry
+//! schedule is a pure function of the seed (`animus-test`'s
+//! `s3_fault_corpus`). Policy ([`RetryPolicy`], default 5 retries): delay
+//! before retry `n` (0-based) is drawn uniformly from
+//! `[0, min(cap, base * 2^n)]` ("full jitter", default base 100 ms, cap
+//! 5 s). Retried: a transport failure (incl. timeouts), `5xx`, `429`,
+//! `RequestTimeout` (`408`) and `SlowDown`. Never retried: any other `4xx`
+//! (a client-side mistake retrying won't fix, e.g. `AccessDenied`) and
+//! [`animus_s3::client::S3Error::NotFound`] (a defined outcome).
+//!
+//! Retrying a `PUT` after a lost ack is safe: the key is write-once and the
+//! bytes identical, so a replay is an idempotent overwrite.
 //!
 //! # Multipart (S-08 M2)
 //!
@@ -51,7 +59,10 @@
 //! any part (or the complete) finally fails, the upload is aborted (best
 //! effort) and the error returned. Multipart is **transport only**: the
 //! object id, key and bytes are identical to a single `PUT`, so no durable
-//! format is involved (ADR 0073). An abort that itself fails (or a process
+//! format is involved (ADR 0073). A `Complete` whose ack was lost (retry sees
+//! `NoSuchUpload`) is resolved by checking the object holds exactly our bytes.
+//! A `Create` whose ack was lost orphans an upload id nobody knows (only the
+//! lifecycle rule below reaps it). An abort that itself fails (or a process
 //! killed mid-upload) leaves an incomplete upload that bills for storage —
 //! operators should add a bucket lifecycle rule
 //! `AbortIncompleteMultipartUpload` (e.g. after 1 day).
@@ -67,31 +78,47 @@
 //! from a config file or environment variables) already-built; this store
 //! never touches the filesystem or environment for them.
 
-#![allow(
-    clippy::disallowed_methods,
-    reason = "this module is S-04 PR 2's one real-time site: SystemTime::now() \
-              supplies the SigV4 request timestamp every S3 call needs \
-              (animus_s3::client::S3Client's own `now_epoch_ms` parameter), \
-              and tokio::time::sleep paces this store's own small bounded \
-              retry — the identical real-I/O-boundary justification \
-              animus-env's own prod.rs module carries for the same calls \
-              (ADR 0061 rung B5). This store deliberately is not `Env`- \
-              generic (mirrors FsSegmentStore's own shape), so there is no \
-              env.now()/env.sleep() to route through instead."
-)]
-
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use animus_s3::client::{ListObjectsPage, S3Client, S3Config, S3Error, Transport};
+use animus_s3::client::{S3Client, S3Config, S3Error, Transport};
 
-/// Bounded retry budget for a transport error or `5xx` — small and fixed,
-/// not configurable: this is a store-level reliability seatbelt, not a
-/// substitute for a caller's own retry policy on genuine unavailability.
-const MAX_RETRY_ATTEMPTS: u32 = 3;
+use crate::{Clock, Rng};
 
-/// Linear backoff step between retry attempts (`attempt * RETRY_BASE_DELAY`).
-const RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
+/// Retry/backoff policy for every S3 request (S-08 M3). Set with
+/// [`S3SegmentStore::with_retry_policy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryPolicy {
+    /// Retries after the first attempt (so up to `max_retries + 1` requests).
+    pub max_retries: u32,
+    /// Backoff ceiling before the first retry; doubles per retry.
+    pub base_delay: Duration,
+    /// Upper bound on the backoff ceiling.
+    pub max_delay: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        RetryPolicy {
+            max_retries: 5,
+            base_delay: Duration::from_millis(100),
+            max_delay: Duration::from_secs(5),
+        }
+    }
+}
+
+impl RetryPolicy {
+    /// The full-jitter ceiling for 0-based retry `attempt`:
+    /// `min(max_delay, base_delay * 2^attempt)`. The actual sleep is drawn
+    /// uniformly from `[0, ceiling]`.
+    #[must_use]
+    pub fn backoff_ceiling(&self, attempt: u32) -> Duration {
+        let factor = 1u32.checked_shl(attempt).unwrap_or(u32::MAX);
+        self.base_delay
+            .checked_mul(factor)
+            .map_or(self.max_delay, |d| d.min(self.max_delay))
+    }
+}
 
 /// S3's hard minimum for every non-last part of a multipart upload.
 pub const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
@@ -162,54 +189,50 @@ impl MultipartConfig {
 const LIST_PAGE_CAP: usize = 10_000;
 
 /// An S3-backed [`SegmentStore`](crate::SegmentStore) — see the module doc.
-pub struct S3SegmentStore<T: Transport> {
+pub struct S3SegmentStore<T: Transport, E: Clock + Rng> {
     client: Arc<S3Client<T>>,
     /// Key prefix every id is joined under (`{prefix}/{id}`), or `None` for
     /// no prefix — mirrors `s3://bucket[/prefix]`'s own optional-prefix
     /// shape. Never empty (`new` normalizes `Some("")` to `None`).
     prefix: Option<String>,
-    /// Supplies `now_epoch_ms` for every S3 call. Defaults to the real wall
-    /// clock (`new`); overridable via [`Self::with_clock`] for a test that
-    /// wants a deterministic timestamp (this store's own contract test
-    /// doesn't need one — `animus_s3::fake::FakeS3` doesn't check clock
-    /// skew — but the hook costs nothing and keeps a future caller that does
-    /// care from needing a second constructor).
-    clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// Supplies `now_epoch_ms` (`wall_now`), backoff sleeps and jitter.
+    env: E,
     multipart: MultipartConfig,
+    retry: RetryPolicy,
 }
 
-// Manual `Clone`, not `#[derive(Clone)]`: every field is already cheap to
-// clone (an `Arc` or an `Option<String>`) regardless of whether `T` itself
-// is `Clone` — `#[derive(Clone)]` on a generic struct adds a `T: Clone`
-// bound unconditionally, which would wrongly require `HyperRustlsTransport`/
-// `FakeS3` to implement `Clone` just to clone this handle.
-impl<T: Transport> Clone for S3SegmentStore<T> {
+// Manual `Clone`, not `#[derive(Clone)]`: every field is cheap to clone
+// regardless of whether `T` itself is `Clone` — `#[derive(Clone)]` on a
+// generic struct adds a `T: Clone` bound unconditionally, which would
+// wrongly require `HyperRustlsTransport`/`FakeS3` to implement `Clone` just
+// to clone this handle.
+impl<T: Transport, E: Clock + Rng + Clone> Clone for S3SegmentStore<T, E> {
     fn clone(&self) -> Self {
         S3SegmentStore {
             client: self.client.clone(),
             prefix: self.prefix.clone(),
-            clock: self.clock.clone(),
+            env: self.env.clone(),
             multipart: self.multipart,
+            retry: self.retry,
         }
     }
 }
 
-fn real_now_epoch_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 /// Whether a failed S3 call is worth retrying: a transport failure (the
-/// request never got a well-formed response at all) or a `5xx` service
-/// error — never [`S3Error::NotFound`]/[`S3Error::AccessDenied`], and never a
-/// non-5xx [`S3Error::Service`] (a client-side mistake, e.g. a malformed
-/// request — retrying changes nothing).
+/// request never got a well-formed response at all, incl. a timeout), a
+/// `5xx`, `429`, `408` or `SlowDown`/`RequestTimeout` service error — never
+/// [`S3Error::NotFound`]/[`S3Error::AccessDenied`], and never any other
+/// [`S3Error::Service`] (a client-side mistake, e.g. a malformed request —
+/// retrying changes nothing).
 fn is_retryable(err: &S3Error) -> bool {
     match err {
         S3Error::Transport(_) => true,
-        S3Error::Service { status, .. } => *status >= 500,
+        S3Error::Service { status, code, .. } => {
+            *status >= 500
+                || *status == 429
+                || *status == 408
+                || matches!(code.as_str(), "SlowDown" | "RequestTimeout")
+        }
         S3Error::NotFound
         | S3Error::AccessDenied
         | S3Error::CredentialsExpired
@@ -248,17 +271,13 @@ fn write_once_violation(id: &str) -> std::io::Error {
     )
 }
 
-impl<T: Transport> S3SegmentStore<T> {
+impl<T: Transport, E: Clock + Rng> S3SegmentStore<T, E> {
     /// Build a store over `transport`/`config`, joining every id under
     /// `prefix` (if given — an empty string is treated as "no prefix").
+    /// `env` supplies the wall clock, backoff sleeps and jitter.
     #[must_use]
-    pub fn new(transport: T, config: S3Config, prefix: Option<String>) -> Self {
-        S3SegmentStore {
-            client: Arc::new(S3Client::new(transport, config)),
-            prefix: prefix.filter(|p| !p.is_empty()),
-            clock: Arc::new(real_now_epoch_ms),
-            multipart: MultipartConfig::default(),
-        }
+    pub fn new(transport: T, config: S3Config, prefix: Option<String>, env: E) -> Self {
+        Self::from_client(S3Client::new(transport, config), prefix, env)
     }
 
     /// Build a store over an already-constructed [`S3Client`] — the entry
@@ -266,24 +285,14 @@ impl<T: Transport> S3SegmentStore<T> {
     /// virtual-hosted addressing (S-08 M1; see `S3Client::with_provider`/
     /// `with_addressing`).
     #[must_use]
-    pub fn from_client(client: S3Client<T>, prefix: Option<String>) -> Self {
+    pub fn from_client(client: S3Client<T>, prefix: Option<String>, env: E) -> Self {
         S3SegmentStore {
             client: Arc::new(client),
             prefix: prefix.filter(|p| !p.is_empty()),
-            clock: Arc::new(real_now_epoch_ms),
+            env,
             multipart: MultipartConfig::default(),
+            retry: RetryPolicy::default(),
         }
-    }
-
-    /// Override the clock this store reads `now_epoch_ms` from — a test-only
-    /// hook (production always takes [`Self::new`]'s real-wall-clock
-    /// default); `#[doc(hidden)]` since it is not part of this store's real
-    /// API surface.
-    #[must_use]
-    #[doc(hidden)]
-    pub fn with_clock(mut self, clock: Arc<dyn Fn() -> u64 + Send + Sync>) -> Self {
-        self.clock = clock;
-        self
     }
 
     /// Override the multipart threshold/part size (default: 64 MiB / 16 MiB).
@@ -293,8 +302,16 @@ impl<T: Transport> S3SegmentStore<T> {
         self
     }
 
+    /// Override the retry/backoff policy (default: 5 retries, 100 ms base,
+    /// 5 s cap, full jitter).
+    #[must_use]
+    pub fn with_retry_policy(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
+        self
+    }
+
     fn now_ms(&self) -> u64 {
-        (self.clock)()
+        self.env.wall_now().0
     }
 
     /// `id` -> S3 object key: `{prefix}/{id}` (or bare `id` with no
@@ -320,8 +337,9 @@ impl<T: Transport> S3SegmentStore<T> {
         }
     }
 
-    /// The one bounded-retry loop the multipart/ranged operations share:
-    /// `op` is called with a fresh `now_epoch_ms` per attempt.
+    /// The one bounded-retry loop every S3 request goes through: `op` is
+    /// called with a fresh `now_epoch_ms` per attempt (so SigV4 timestamps
+    /// and credential expiry track the env's wall clock across backoffs).
     async fn retry_op<R, F, Fut>(&self, op: F) -> Result<R, S3Error>
     where
         F: Fn(u64) -> Fut,
@@ -331,9 +349,13 @@ impl<T: Transport> S3SegmentStore<T> {
         loop {
             match op(self.now_ms()).await {
                 Ok(v) => return Ok(v),
-                Err(e) if attempt < MAX_RETRY_ATTEMPTS && is_retryable(&e) => {
+                Err(e) if attempt < self.retry.max_retries && is_retryable(&e) => {
+                    let ceiling = self.retry.backoff_ceiling(attempt);
+                    let ceiling_ns = u64::try_from(ceiling.as_nanos()).unwrap_or(u64::MAX - 1);
+                    // Uniform in [0, ceiling] inclusive.
+                    let jittered = self.env.gen_below(ceiling_ns + 1);
+                    self.env.sleep(Duration::from_nanos(jittered)).await;
                     attempt += 1;
-                    tokio::time::sleep(RETRY_BASE_DELAY * attempt).await;
                 }
                 Err(e) => return Err(e),
             }
@@ -359,11 +381,24 @@ impl<T: Transport> S3SegmentStore<T> {
                     .await?;
                 parts.push((n, etag));
             }
-            self.retry_op(|now| {
-                self.client
-                    .complete_multipart_upload(key, &upload_id, &parts, now)
-            })
-            .await
+            let completed = self
+                .retry_op(|now| {
+                    self.client
+                        .complete_multipart_upload(key, &upload_id, &parts, now)
+                })
+                .await;
+            match completed {
+                // A lost `Complete` ack: the first attempt assembled the
+                // object, so the retry finds the upload gone. If the object
+                // now holds exactly our bytes, the put succeeded.
+                Err(S3Error::Service { ref code, .. }) if code == "NoSuchUpload" => {
+                    match self.existing_equals(key, bytes).await {
+                        Ok(Some(true)) => Ok(()),
+                        _ => completed,
+                    }
+                }
+                other => other,
+            }
         }
         .await;
         if result.is_err() {
@@ -410,74 +445,10 @@ impl<T: Transport> S3SegmentStore<T> {
         }
         Ok(Some(true))
     }
-
-    async fn retry_get(&self, key: &str) -> Result<Vec<u8>, S3Error> {
-        let mut attempt = 0u32;
-        loop {
-            let now = self.now_ms();
-            match self.client.get_object(key, now).await {
-                Ok(bytes) => return Ok(bytes),
-                Err(e) if attempt < MAX_RETRY_ATTEMPTS && is_retryable(&e) => {
-                    attempt += 1;
-                    tokio::time::sleep(RETRY_BASE_DELAY * attempt).await;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    }
-
-    async fn retry_put(&self, key: &str, bytes: &[u8]) -> Result<(), S3Error> {
-        let mut attempt = 0u32;
-        loop {
-            let now = self.now_ms();
-            match self.client.put_object(key, bytes.to_vec(), now).await {
-                Ok(()) => return Ok(()),
-                Err(e) if attempt < MAX_RETRY_ATTEMPTS && is_retryable(&e) => {
-                    attempt += 1;
-                    tokio::time::sleep(RETRY_BASE_DELAY * attempt).await;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    }
-
-    async fn retry_delete(&self, key: &str) -> Result<(), S3Error> {
-        let mut attempt = 0u32;
-        loop {
-            let now = self.now_ms();
-            match self.client.delete_object(key, now).await {
-                Ok(()) => return Ok(()),
-                Err(e) if attempt < MAX_RETRY_ATTEMPTS && is_retryable(&e) => {
-                    attempt += 1;
-                    tokio::time::sleep(RETRY_BASE_DELAY * attempt).await;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    }
-
-    async fn retry_list_page(
-        &self,
-        prefix: &str,
-        continuation: Option<&str>,
-    ) -> Result<ListObjectsPage, S3Error> {
-        let mut attempt = 0u32;
-        loop {
-            let now = self.now_ms();
-            match self.client.list_objects_v2(prefix, continuation, now).await {
-                Ok(page) => return Ok(page),
-                Err(e) if attempt < MAX_RETRY_ATTEMPTS && is_retryable(&e) => {
-                    attempt += 1;
-                    tokio::time::sleep(RETRY_BASE_DELAY * attempt).await;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    }
 }
 
 #[async_trait::async_trait]
-impl<T: Transport> crate::SegmentStore for S3SegmentStore<T> {
+impl<T: Transport, E: Clock + Rng + Clone + 'static> crate::SegmentStore for S3SegmentStore<T, E> {
     async fn put(&self, id: &str, bytes: &[u8]) -> std::io::Result<()> {
         if id.is_empty() {
             return Err(std::io::Error::new(
@@ -505,13 +476,15 @@ impl<T: Transport> crate::SegmentStore for S3SegmentStore<T> {
         if bytes.len() as u64 > self.multipart.threshold {
             self.put_multipart(&key, bytes).await.map_err(map_io_error)
         } else {
-            self.retry_put(&key, bytes).await.map_err(map_io_error)
+            self.retry_op(|now| self.client.put_object(&key, bytes.to_vec(), now))
+                .await
+                .map_err(map_io_error)
         }
     }
 
     async fn get(&self, id: &str) -> std::io::Result<Option<Vec<u8>>> {
         let key = self.object_key(id);
-        match self.retry_get(&key).await {
+        match self.retry_op(|now| self.client.get_object(&key, now)).await {
             Ok(bytes) => Ok(Some(bytes)),
             Err(S3Error::NotFound) => Ok(None),
             Err(e) => Err(map_io_error(e)),
@@ -523,7 +496,9 @@ impl<T: Transport> crate::SegmentStore for S3SegmentStore<T> {
         // `S3Client::delete_object` already treats a 404 as `Ok` (real S3's
         // own idempotent-delete behavior), so no extra handling is needed
         // here for "deleting an absent id."
-        self.retry_delete(&key).await.map_err(map_io_error)
+        self.retry_op(|now| self.client.delete_object(&key, now))
+            .await
+            .map_err(map_io_error)
     }
 
     async fn list(&self, prefix: &str) -> std::io::Result<Vec<String>> {
@@ -532,7 +507,10 @@ impl<T: Transport> crate::SegmentStore for S3SegmentStore<T> {
         let mut continuation: Option<String> = None;
         for _ in 0..LIST_PAGE_CAP {
             let page = self
-                .retry_list_page(&full_prefix, continuation.as_deref())
+                .retry_op(|now| {
+                    self.client
+                        .list_objects_v2(&full_prefix, continuation.as_deref(), now)
+                })
                 .await
                 .map_err(map_io_error)?;
             out.extend(page.objects.into_iter().map(|o| self.strip_prefix(&o.key)));
@@ -557,14 +535,16 @@ impl<T: Transport> crate::SegmentStore for S3SegmentStore<T> {
     async fn is_empty(&self, prefix: &str) -> std::io::Result<bool> {
         let full_prefix = self.object_key(prefix);
         let page = self
-            .retry_list_page(&full_prefix, None)
+            .retry_op(|now| self.client.list_objects_v2(&full_prefix, None, now))
             .await
             .map_err(map_io_error)?;
         Ok(page.objects.is_empty())
     }
 }
 
-#[cfg(test)]
+// `#[tokio::test]` needs the `prod` feature (tokio); the seed-driven retry
+// tests live in `animus-test`'s `s3_fault_corpus` over `SimEnv`.
+#[cfg(all(test, feature = "prod"))]
 mod tests {
     use animus_s3::client::S3Config;
     use animus_s3::fake::FakeS3;
@@ -572,7 +552,39 @@ mod tests {
 
     use super::S3SegmentStore;
 
-    fn test_store(prefix: Option<&str>) -> S3SegmentStore<FakeS3> {
+    /// A minimal `Clock + Rng` env for these unit tests: fixed wall clock,
+    /// `sleep` returns immediately (backoff pacing is exercised under
+    /// `SimEnv` in `animus-test`), counter-seeded randomness.
+    #[derive(Clone)]
+    struct TestEnv(std::sync::Arc<CounterRng>);
+
+    impl TestEnv {
+        fn new() -> Self {
+            TestEnv(std::sync::Arc::new(CounterRng::new()))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::Clock for TestEnv {
+        fn now(&self) -> crate::Nanos {
+            crate::Nanos(0)
+        }
+        fn wall_now(&self) -> crate::UnixMillis {
+            crate::UnixMillis(1_700_000_000_000)
+        }
+        async fn sleep(&self, _dur: std::time::Duration) {}
+    }
+
+    impl crate::Rng for TestEnv {
+        fn next_u64(&self) -> u64 {
+            self.0.next_u64()
+        }
+        fn fill_bytes(&self, dst: &mut [u8]) {
+            self.0.fill_bytes(dst);
+        }
+    }
+
+    fn test_store(prefix: Option<&str>) -> S3SegmentStore<FakeS3, TestEnv> {
         let fake = FakeS3::new("test-bucket").with_credential("AKIDTEST", "secret");
         let config = S3Config {
             endpoint: "http://fake.example:9000".to_string(),
@@ -580,7 +592,7 @@ mod tests {
             region: "us-east-1".to_string(),
             credentials: Credentials::new("AKIDTEST", "secret"),
         };
-        S3SegmentStore::new(fake, config, prefix.map(str::to_string))
+        S3SegmentStore::new(fake, config, prefix.map(str::to_string), TestEnv::new())
     }
 
     /// The load-bearing test: the shared `SegmentStore` contract holds
@@ -737,7 +749,7 @@ mod tests {
             inner: fake,
             list_calls: list_calls.clone(),
         };
-        let store = S3SegmentStore::new(counting, config, None);
+        let store = S3SegmentStore::new(counting, config, None, TestEnv::new());
         for i in 0..5 {
             store
                 .put(&format!("page-test/{i}"), format!("v{i}").as_bytes())
@@ -774,7 +786,7 @@ mod tests {
             inner: fake,
             list_calls: list_calls.clone(),
         };
-        let store = S3SegmentStore::new(counting, config, None);
+        let store = S3SegmentStore::new(counting, config, None, TestEnv::new());
 
         let empty = store.is_empty("").await.expect("is_empty");
 
@@ -802,7 +814,7 @@ mod tests {
             region: "us-east-1".to_string(),
             credentials: Credentials::new("AKIDTEST", "secret"),
         };
-        let store = S3SegmentStore::new(fake, config, None);
+        let store = S3SegmentStore::new(fake, config, None, TestEnv::new());
         use crate::SegmentStore as _;
         for i in 0..5 {
             store
@@ -832,14 +844,14 @@ mod tests {
 
     const PART: usize = 16;
 
-    fn mp_store(fake: Arc<FakeS3>) -> S3SegmentStore<Arc<FakeS3>> {
+    fn mp_store(fake: Arc<FakeS3>) -> S3SegmentStore<Arc<FakeS3>, TestEnv> {
         let config = S3Config {
             endpoint: "http://fake.example:9000".to_string(),
             bucket: "test-bucket".to_string(),
             region: "us-east-1".to_string(),
             credentials: Credentials::new("AKIDTEST", "secret"),
         };
-        S3SegmentStore::new(fake, config, None)
+        S3SegmentStore::new(fake, config, None, TestEnv::new())
             .with_multipart(MultipartConfig::new_unchecked(40, PART as u64))
     }
 

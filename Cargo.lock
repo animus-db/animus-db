@@ -274,6 +274,7 @@ dependencies = [
  "animus-dynamo",
  "animus-env",
  "animus-item",
+ "animus-s3",
  "animus-sim",
  "animus-storage",
  "animus-tablet",

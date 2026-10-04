@@ -68,6 +68,7 @@ async fn s3_segment_store_contract_against_a_real_endpoint() {
         transport,
         config,
         Some("animus-env-contract-test".to_string()),
+        animus_env::ProdClockRng::new(),
     )
     // S-08 M2: a 6 MiB threshold with 5 MiB parts makes the 11 MiB object
     // below a 3-part multipart upload (5 + 5 + 1 MiB) on the real endpoint.

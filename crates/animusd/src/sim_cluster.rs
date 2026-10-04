@@ -2345,7 +2345,10 @@ impl SimCluster {
                 // object store) is the right variant here, matching
                 // `segment_store`'s own `S3` shape immediately above.
                 backup_store: BackupStoreHandle::S3(Arc::new(backup_store.clone())),
-                export_store_factory: Arc::new(Mutex::new(default_export_store_factory(None))),
+                export_store_factory: Arc::new(Mutex::new(default_export_store_factory(
+                    None,
+                    sim.env(id.clone()),
+                ))),
                 backup_janitor_progress: Arc::new(Mutex::new(
                     animus_node::backup_janitor::JanitorProgress::default(),
                 )),
@@ -5656,7 +5659,10 @@ impl SimCluster {
             // bucket would.
             segment_store: SegmentStoreHandle::S3(Arc::new(self.segment_store.clone())),
             backup_store: BackupStoreHandle::S3(Arc::new(self.backup_store.clone())),
-            export_store_factory: Arc::new(Mutex::new(default_export_store_factory(None))),
+            export_store_factory: Arc::new(Mutex::new(default_export_store_factory(
+                None,
+                env.clone(),
+            ))),
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),
@@ -5991,7 +5997,10 @@ impl SimCluster {
             data: None,
             segment_store: SegmentStoreHandle::S3(Arc::new(self.segment_store.clone())),
             backup_store: BackupStoreHandle::S3(Arc::new(self.backup_store.clone())),
-            export_store_factory: Arc::new(Mutex::new(default_export_store_factory(None))),
+            export_store_factory: Arc::new(Mutex::new(default_export_store_factory(
+                None,
+                env.clone(),
+            ))),
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),
@@ -6294,7 +6303,10 @@ impl SimCluster {
             }),
             segment_store: SegmentStoreHandle::S3(Arc::new(self.segment_store.clone())),
             backup_store: BackupStoreHandle::S3(Arc::new(self.backup_store.clone())),
-            export_store_factory: Arc::new(Mutex::new(default_export_store_factory(None))),
+            export_store_factory: Arc::new(Mutex::new(default_export_store_factory(
+                None,
+                env.clone(),
+            ))),
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),
@@ -7047,7 +7059,10 @@ impl SimCluster {
             }),
             segment_store: SegmentStoreHandle::S3(Arc::new(self.segment_store.clone())),
             backup_store: BackupStoreHandle::S3(Arc::new(self.backup_store.clone())),
-            export_store_factory: Arc::new(Mutex::new(default_export_store_factory(None))),
+            export_store_factory: Arc::new(Mutex::new(default_export_store_factory(
+                None,
+                env.clone(),
+            ))),
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),

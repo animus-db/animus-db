@@ -5306,6 +5306,10 @@ fn spawn_common_tail(
     // (`ClientCtx::any_table_throughput`'s doc) — a borrow, not a move, so
     // `control` below still moves into the struct unchanged.
     let initial_any_table_throughput = control.metadata_cached().any_table_throughput();
+    let export_store_factory = Arc::new(Mutex::new(default_export_store_factory(
+        export_s3,
+        env.clone(),
+    )));
     let ctx = ClientCtx {
         control,
         edge,
@@ -5313,7 +5317,7 @@ fn spawn_common_tail(
         data,
         segment_store,
         backup_store,
-        export_store_factory: Arc::new(Mutex::new(default_export_store_factory(export_s3))),
+        export_store_factory,
         backup_janitor_progress: Arc::new(Mutex::new(
             animus_node::backup_janitor::JanitorProgress::default(),
         )),
@@ -9473,9 +9477,10 @@ fn s3_credential_provider(
 /// "already installed by this same call" is not an error), the credential
 /// provider can't be built, or virtual-hosted addressing is asked for
 /// against an IP endpoint / non-DNS bucket name.
-fn s3_segment_store(
+fn s3_segment_store<E: animus_env::Clock + animus_env::Rng>(
     s3: &S3StoreConfig,
-) -> std::io::Result<animus_env::S3SegmentStore<animus_s3::prod::HyperRustlsTransport>> {
+    env: E,
+) -> std::io::Result<animus_env::S3SegmentStore<animus_s3::prod::HyperRustlsTransport, E>> {
     let transport = if s3.insecure_http {
         animus_s3::prod::HyperRustlsTransport::new_allow_insecure_http()
     } else {
@@ -9497,6 +9502,7 @@ fn s3_segment_store(
     Ok(animus_env::S3SegmentStore::from_client(
         client,
         s3.prefix.clone(),
+        env,
     ))
 }
 
@@ -9553,7 +9559,10 @@ pub type ExportStoreFactory = Arc<
 /// `create_export` maps it to `ValidationException`) rather than a panic —
 /// a node with no `--export-s3-endpoint`/`--export-s3-region` configured
 /// simply cannot serve `ExportTableToPointInTime` yet.
-fn default_export_store_factory(export_s3: Option<ExportS3Config>) -> ExportStoreFactory {
+fn default_export_store_factory<E: animus_env::Clock + animus_env::Rng + Clone + 'static>(
+    export_s3: Option<ExportS3Config>,
+    env: E,
+) -> ExportStoreFactory {
     Arc::new(move |bucket: &str, prefix: Option<&str>| {
         let Some(cfg) = export_s3.as_ref() else {
             return Err(std::io::Error::other(
@@ -9570,7 +9579,8 @@ fn default_export_store_factory(export_s3: Option<ExportS3Config>) -> ExportStor
             credential_source: cfg.credential_source.clone(),
             virtual_hosted: cfg.virtual_hosted,
         };
-        let store: Arc<dyn animus_env::SegmentStore> = Arc::new(s3_segment_store(&s3)?);
+        let store: Arc<dyn animus_env::SegmentStore> =
+            Arc::new(s3_segment_store(&s3, env.clone())?);
         Ok(store)
     })
 }
@@ -9595,18 +9605,36 @@ mod s3_credential_wiring_tests {
 
     #[test]
     fn virtual_hosted_against_an_ip_endpoint_is_refused_at_build() {
-        let err = s3_segment_store(&cfg("http://127.0.0.1:9000", "good-bucket", true))
-            .err()
-            .expect("IP endpoint refused");
+        let err = s3_segment_store(
+            &cfg("http://127.0.0.1:9000", "good-bucket", true),
+            animus_env::ProdClockRng::new(),
+        )
+        .err()
+        .expect("IP endpoint refused");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("IP"), "{err}");
-        let err = s3_segment_store(&cfg("https://s3.example.com", "Bad_Bucket", true))
-            .err()
-            .expect("non-DNS bucket refused");
+        let err = s3_segment_store(
+            &cfg("https://s3.example.com", "Bad_Bucket", true),
+            animus_env::ProdClockRng::new(),
+        )
+        .err()
+        .expect("non-DNS bucket refused");
         assert!(err.to_string().contains("DNS-compatible"), "{err}");
         // Path-style and valid virtual-hosted both build.
-        assert!(s3_segment_store(&cfg("http://127.0.0.1:9000", "Any_Name", false)).is_ok());
-        assert!(s3_segment_store(&cfg("https://s3.example.com", "good-bucket", true)).is_ok());
+        assert!(
+            s3_segment_store(
+                &cfg("http://127.0.0.1:9000", "Any_Name", false),
+                animus_env::ProdClockRng::new()
+            )
+            .is_ok()
+        );
+        assert!(
+            s3_segment_store(
+                &cfg("https://s3.example.com", "good-bucket", true),
+                animus_env::ProdClockRng::new()
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -9680,6 +9708,7 @@ mod s3_store_handle_tests {
             fake,
             fake_config(),
             Some("backup".to_string()),
+            animus_env::ProdClockRng::new(),
         )))
     }
 
@@ -9689,6 +9718,7 @@ mod s3_store_handle_tests {
             fake,
             fake_config(),
             Some("segments".to_string()),
+            animus_env::ProdClockRng::new(),
         )))
     }
 
@@ -9842,7 +9872,7 @@ async fn build_segment_store(
             }
         }
         SegmentStoreConfig::S3(s3) => {
-            let raw = s3_segment_store(s3)?;
+            let raw = s3_segment_store(s3, env.clone())?;
             let store: Arc<dyn animus_env::SegmentStore> = match encryption_key {
                 Some(key) => Arc::new(
                     animus_env::EncryptedSegmentStore::open(raw, env.clone(), key.clone()).await?,
@@ -10126,7 +10156,7 @@ async fn build_backup_store(
             }
         }
         BackupStoreConfig::S3(s3) => {
-            let raw = s3_segment_store(s3)?;
+            let raw = s3_segment_store(s3, env.clone())?;
             let store: Arc<dyn animus_env::SegmentStore> = match encryption_key {
                 Some(key) => Arc::new(
                     animus_env::EncryptedSegmentStore::open(raw, env.clone(), key.clone()).await?,
@@ -20605,7 +20635,10 @@ mod simenv_client_ctx_tests {
             // real store or `ProdEnv` is needed just to satisfy the field.
             segment_store: SegmentStoreHandle::Fs(FsSegmentStore::new("unused-segment-store")),
             backup_store: BackupStoreHandle::Fs(FsSegmentStore::new("unused-backup-store")),
-            export_store_factory: Arc::new(Mutex::new(default_export_store_factory(None))),
+            export_store_factory: Arc::new(Mutex::new(default_export_store_factory(
+                None,
+                sim.env(nid(0)),
+            ))),
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),
@@ -21248,7 +21281,10 @@ mod two_node_relay_tests {
             data: None,
             segment_store: SegmentStoreHandle::Fs(FsSegmentStore::new("unused-segment-store-a")),
             backup_store: BackupStoreHandle::Fs(FsSegmentStore::new("unused-backup-store-a")),
-            export_store_factory: Arc::new(Mutex::new(default_export_store_factory(None))),
+            export_store_factory: Arc::new(Mutex::new(default_export_store_factory(
+                None,
+                sim.env(nid(1)),
+            ))),
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),
@@ -21318,7 +21354,10 @@ mod two_node_relay_tests {
             data: None,
             segment_store: SegmentStoreHandle::Fs(FsSegmentStore::new("unused-segment-store-b")),
             backup_store: BackupStoreHandle::Fs(FsSegmentStore::new("unused-backup-store-b")),
-            export_store_factory: Arc::new(Mutex::new(default_export_store_factory(None))),
+            export_store_factory: Arc::new(Mutex::new(default_export_store_factory(
+                None,
+                sim.env(nid(2)),
+            ))),
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),

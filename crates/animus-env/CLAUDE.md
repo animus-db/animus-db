@@ -695,7 +695,7 @@ the production implementation; the deterministic implementation lives in
   network). Every id it writes is scoped under `"contract-test/"` and
   cleaned up before returning, so it composes with a store a caller has
   already put other data into.
-- **`S3SegmentStore<T: animus_s3::client::Transport>` (`s3_store.rs`, S-04
+- **`S3SegmentStore<T: animus_s3::client::Transport, E: Clock + Rng>` (`s3_store.rs`, S-04
   PR 2, ADR 0059's 2026-09-06 amendment) is `FsSegmentStore`'s S3-backed
   sibling** — opt-in via `--segment-store`/`--backup-store
   s3://bucket[/prefix]?endpoint=...` (wired by `animusd`, a later PR at the
@@ -706,17 +706,22 @@ the production implementation; the deterministic implementation lives in
   transport in production — `animusd` is the only crate that ever
   constructs the concrete `S3SegmentStore<HyperRustlsTransport>` (the real
   process boundary; this crate never touches a real S3 socket itself).
-  `S3SegmentStore::new(transport, S3Config, prefix)` builds a path-style,
-  static-credential client; `from_client(S3Client, prefix)` (S-08 M1) takes
+  `S3SegmentStore::new(transport, S3Config, prefix, env)` builds a path-style,
+  static-credential client; `from_client(S3Client, prefix, env)` (S-08 M1) takes
   a client built with `S3Client::with_provider`/`with_addressing` (non-static
   credentials, virtual-hosted). `is_retryable` treats `CredentialsExpired`/
   `Credentials`/`InvalidConfig` as non-retryable (the client already did its
   one forced-refresh retry).
-  Gated behind the same `prod` feature as `FsSegmentStore`, pulling in
-  `animus-s3` as an optional dependency (with none of *its* own `fake`/
-  `prod` features — this crate needs only `animus_s3::client`'s
+  Gated behind the **`s3` feature** (S-08 M3; `prod` implies it), which
+  pulls in `animus-s3` as an optional dependency (with none of *its* own
+  `fake`/`prod` features — this crate needs only `animus_s3::client`'s
   `Transport`-generic pieces; the `fake`/`prod` features are dev-dependency-
-  only, for this crate's own tests). **Object layout**: `[prefix/]{id}`
+  only, for this crate's own tests). `s3` needs no tokio and no `ProdEnv`, so
+  a `SimEnv` test crate builds `S3SegmentStore<FaultyTransport<FakeS3>,
+  SimEnv>` (`animus-test`'s `s3_fault_corpus`); `cargo check -p animus-env
+  --no-default-features --features s3` must stay green. Production passes
+  its `ProdEnv` (`animusd`), tools/tests without a node pass
+  `prod::ProdClockRng`. **Object layout**: `[prefix/]{id}`
   verbatim, no escaping — every character a production id can legally
   contain is already a literal-safe S3 key byte, and `animus_s3::client::
   S3Client` percent-encodes the wire/signing forms independently and
@@ -725,16 +730,17 @@ the production implementation; the deterministic implementation lives in
   `GET`-then-compare-then-`PUT` (real S3 has no built-in "put only if
   absent" this client sends) — an identical-content re-put is a safe no-op
   skipping the network `PUT`; a differing-content re-put is a hard `Err`
-  leaving the stored bytes untouched. **Retry**: a small, fixed, non-
-  configurable bounded retry (3 attempts, linear 100ms/attempt backoff) on
-  a transport failure or a `5xx` — never on a `4xx`/`NotFound`/
-  `AccessDenied`. **Not `Env`-generic** (mirrors `FsSegmentStore`'s own
-  concrete shape, deliberately — this store answers to no one component's
-  `Env`), so the retry backoff is a plain `tokio::time::sleep` and the
-  SigV4 request timestamp a plain `SystemTime::now()`, both under this
-  file's own module-level `#[allow(clippy::disallowed_methods)]` — the
-  identical real-I/O-boundary justification `prod.rs`'s own module-level
-  allow carries. **Multipart (S-08 M2)**: a `put` larger than `MultipartConfig::threshold`
+  leaving the stored bytes untouched. **Retry (S-08 M3)**: one `retry_op` helper wraps every request.
+  `RetryPolicy` (`with_retry_policy`; default 5 retries, base 100 ms, cap
+  5 s): the sleep before retry `n` is drawn uniformly from `[0, min(cap,
+  base * 2^n)]` via `env.gen_below` and slept with `env.sleep` (full
+  jitter); the SigV4 timestamp / credential-provider `now` is
+  `env.wall_now()` per attempt. Retried: transport errors (incl.
+  `TransportError::Timeout`), 5xx, 429, 408, `SlowDown`/`RequestTimeout`;
+  never other 4xx or `NotFound`. No lint allow in `s3_store.rs` any more —
+  the module is `Env`-seam clean (the previous "not `Env`-generic" design
+  could not be seed-tested). A lost `Complete` ack is resolved by an object
+  HEAD+compare when the retry sees `NoSuchUpload`. **Multipart (S-08 M2)**: a `put` larger than `MultipartConfig::threshold`
   (default 64 MiB; parts 16 MiB, min 5 MiB, at most 10,000 parts — the part
   size grows to fit) is a multipart upload, each request through the same
   `retry_op` bounded-retry helper; a finally-failed part/complete aborts the
@@ -1109,6 +1115,10 @@ server_acceptor` imposes no client-cert requirement, unlike `acceptor`
 (mutual) on the exact same cert/key. `animusd`'s own `tests/tls_e2e.rs` is
 the real end-to-end regression net for this acceptor actually serving the
 client/dynamo/admin/console ports — see that crate's `CLAUDE.md`.
+
+**S-08 M3**: the seed-driven retry/backoff/credential-refresh tests live in
+`animus-test`'s `s3_fault_corpus` (over `SimEnv`); `s3_store::tests` use a
+no-op-sleep `TestEnv` and need `prod` only for `#[tokio::test]`.
 
 **S-04 PR 2** adds `s3_store::tests` (also `prod`-feature-gated, also part
 of the same `cargo test -p animus-env --all-features` run): the load-bearing
