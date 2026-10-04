@@ -1240,6 +1240,14 @@ const NOT_A_METRIC: &[(&str, &str)] = &[
         "storage_full",
         "a refusal-reason label in ADR 0074's overload table; its counter lands with the disk-full work (#1185)",
     ),
+    (
+        "overload_storage_full",
+        "a counter docs/resource-bounds.md proposes for the disk-full work (#1185); not exported yet",
+    ),
+    (
+        "spawned_task_panics",
+        "a ProdEnv accessor today; docs/resource-bounds.md proposes exporting it as a metric",
+    ),
 ];
 
 fn collect_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
