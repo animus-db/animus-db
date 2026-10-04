@@ -1881,6 +1881,14 @@ before applying any child resource. Every shipped `AnimusCluster` manifest
 carries `schemaVersion: 1`, and a golden fixture
 (`tests/fixtures/formats/animuscluster-spec/v1.json`) pins the format.
 
+## Amendment (2026-10-04) — multi-cluster federation is scoped (ADR 0075)
+
+[ADR 0075](0075-global-tables.md) §5.4 scopes operator federation for global
+tables (roadmap G-01 stage G-e): additive `spec.region` and `spec.peers[]`
+(endpoints, peer TLS trust), peer-egress `NetworkPolicy`, no separate
+federating CRD in v1, one `AnimusCluster` per Kubernetes cluster. Proposed;
+not implemented. Topology spread (stage G-a) is separate.
+
 ## Amendment 2026-10-04: `spec.s3.webIdentity` (S-08)
 
 `spec.s3` gains an additive `webIdentity { roleArn, serviceAccountName?, audience? }` alternative to `credentialsSecretName` (now optional; exactly one of the two is required). The operator projects a rotating service-account token into combined-role pods and writes a static `source: web_identity` credentials file, so no `Secret` is read or embedded; egress also opens 443 for STS. Existing CRs round-trip unchanged (append-only fixture `v1-s3-web-identity.json`); see ADR 0059's S-08 amendment. Separately, the kind e2e S3 leg described above now runs RustFS, not MinIO (#863).
