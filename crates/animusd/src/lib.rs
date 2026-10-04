@@ -21322,6 +21322,15 @@ mod sim_cluster_cp_route_fanout;
 mod sim_cluster_dynamo_throttle;
 #[cfg(test)]
 mod sim_cluster_lsm;
+/// C-17 Tier 1 (`docs/roadmap.md`): `SimEnv`/pure scale and density
+/// measurement — a metadata scale curve (snapshot image, mirror delta,
+/// `host::plan`, rebalance convergence, control `InstallSnapshot` catch-up)
+/// plus a real-`SimCluster` quiescence-density and split-storm corpus.
+/// Knobs `ANIMUS_SCALE_SEEDS` / `ANIMUS_SCALE_MAX_TABLETS`; run via `cargo
+/// test -p animusd --lib sim_cluster_scale -- --nocapture` for the `C17`
+/// table. See that module's own doc.
+#[cfg(test)]
+mod sim_cluster_scale;
 /// ADR 0065's own `SimEnv`-driven, virtual-time-only throttle-enforcement
 /// coverage, over the real `SimCluster` fixture — a sibling of
 /// `sim_cluster_corpus`, for the identical reason (needs `SimCluster`'s own

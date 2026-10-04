@@ -1191,6 +1191,16 @@ impl SimClusterHandle {
             .collect()
     }
 
+    /// C-17 Tier 1: `(hosted CP groups, of which quiesced)` on `node` — a
+    /// pure local read of `CpGroup::is_quiesced` (ADR 0048 fork F: never
+    /// wakes anything, and costs no virtual time, unlike an `/admin/raftkv`
+    /// call through `spawn_and_capture`).
+    pub(crate) fn quiesced_counts(&self, node: u64) -> (usize, usize) {
+        let groups = self.ctx(node).edge.hosted_groups();
+        let quiesced = groups.iter().filter(|(_, g)| g.is_quiesced()).count();
+        (groups.len(), quiesced)
+    }
+
     /// Per-replica progress of every CP group `node` hosts, read straight off
     /// its `RaftKvNode`s: `(tablet, commit_index, engine_applied_index,
     /// voter count)`. Input to [`SimCluster::await_replicas_caught_up`].
@@ -3283,6 +3293,12 @@ impl SimCluster {
             "{what}: replicas never caught up to their tablet's commit index (seed={}): {last}",
             self.seed()
         );
+    }
+
+    /// [`SimClusterHandle::quiesced_counts`]'s driver-callable twin
+    /// (C-17 Tier 1).
+    pub(crate) fn quiesced_counts(&self, node: u64) -> (usize, usize) {
+        self.shared.quiesced_counts(node)
     }
 
     /// [`SimClusterHandle::hosted_tablets`]'s own driver-callable twin.

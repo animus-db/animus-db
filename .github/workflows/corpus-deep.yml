@@ -607,6 +607,28 @@ jobs:
         run: |
           cargo test -p animus-cp-data --test it learner_snapshot_livelock_under_continuous_writer:: -- --nocapture
 
+      # C-17 Tier 1 (docs/roadmap.md): SimEnv/pure scale and density
+      # measurement. The metadata scale curve (syskv snapshot image, mirror
+      # delta, host::plan, rebalance convergence, control InstallSnapshot
+      # chunk pump) runs to 50k tablets over 3/9/30 nodes, plus the real
+      # SimCluster density cells (quiesced-group idle cost, wake-k) and the
+      # split-storm cells (concurrent in-place splits under a node restart
+      # and a control-leader transfer) at their larger sizes. Prints
+      # machine-readable `C17 metric=...` lines (--nocapture) and asserts only
+      # structural properties, never a performance threshold. Each scenario is
+      # a pure function of its seed, so a failure names one scenario + seed
+      # and is replayable (ANIMUS_SEED). Both knobs are fixed here, deliberately
+      # not workflow_dispatch inputs: GitHub caps workflow_dispatch at 25 inputs
+      # and this file is already at the cap.
+      - name: deep scale and density corpus (C-17 Tier 1)
+        id: scale
+        continue-on-error: true
+        timeout-minutes: 45
+        env:
+          ANIMUS_SCALE_SEEDS: '10'
+          ANIMUS_SCALE_MAX_TABLETS: '50000'
+        run: cargo test -p animusd --lib sim_cluster_scale -- --nocapture
+
       # Turns each corpus step's individually-recorded outcome back into one
       # overall job failure. `if: always()` makes this step run even though
       # every step above may have failed; without it, this step itself would
@@ -648,10 +670,11 @@ jobs:
             [upgrade_restart]="${{ steps.upgrade_restart.outcome }}"
             [upgrade_restart_cluster]="${{ steps.upgrade_restart_cluster.outcome }}"
             [learner_snapshot_livelock]="${{ steps.learner_snapshot_livelock.outcome }}"
+            [scale]="${{ steps.scale.outcome }}"
           )
           failed=0
           failed_names=()
-          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner reconfigure_drop inplace_split backup pitr lsm_crash lsm_disk_fault lsm_encrypted segment_store_encrypted control simcluster dynamo_wire export_import heartbeat sharedwal wal_rewrite_crash upgrade_restart upgrade_restart_cluster learner_snapshot_livelock; do
+          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner reconfigure_drop inplace_split backup pitr lsm_crash lsm_disk_fault lsm_encrypted segment_store_encrypted control simcluster dynamo_wire export_import heartbeat sharedwal wal_rewrite_crash upgrade_restart upgrade_restart_cluster learner_snapshot_livelock scale; do
             outcome="${outcomes[$name]}"
             echo "${name}: ${outcome}"
             if [ "${outcome}" != "success" ]; then
