@@ -85,6 +85,7 @@ Env knobs at a glance (details in the sections below):
 | `ANIMUS_BACKUP_SEEDS=K` | 1 | K seed variants per on-demand backup capture + restore fault-injection cell (ADR 0059 Train 1/2) |
 | `ANIMUS_PITR_SEEDS=K` | 1 | K seed variants per PITR sealing fault-injection cell (ADR 0059 Train 3) |
 | `ANIMUS_EXPORT_IMPORT_SEEDS=K` | 1 | K seed variants per S3 export/import fault-injection cell (ADR 0068, S-05 PR 3) |
+| `ANIMUS_S3_FAULT_SEEDS=K` | 1 | K seed variants per S3 store retry/fault-injection cell (S-08 M3); `ANIMUS_SEED=<seed>` replays one seed per cell |
 | `ANIMUS_SEGMENT_STORE_ENCRYPTED_SEEDS=K` | 1 | K seed variants per `EncryptedSegmentStore` fault-injection cell (ADR 0069, S-03 PR 2) |
 | `ANIMUS_SHRINK=1` | off | minimize a failed corpus scenario's parameters to a small reproducing case (ADR 0061 rung B4) |
 | `ANIMUS_SHRINK_MAX_CHECKS=N` | 500 | override the minimizer's check-count budget |
@@ -1220,6 +1221,37 @@ retrievable from git history.)
   `animusd::import`/`animus-cp-data` themselves, caught immediately by the
   very first depth-1 run (`decode_envelope`'s own "unknown envelope tag"
   panic), never shipped as a false-negative-green corpus.
+
+### S3 store retry / fault-injection corpus (S-08 M3)
+
+`tests/it/s3_fault_corpus.rs`. `animus_env::S3SegmentStore<T, E: Clock +
+Rng>` takes its wall clock, backoff sleeps and full-jitter draws from the
+env, so over `SimEnv` the retry schedule is a pure function of the seed. The
+corpus drives `S3SegmentStore<Arc<FaultyTransport<Arc<FakeS3>>>, SimEnv>`
+(`animus_s3::fake::FaultyTransport`: scripted `Fault::{Pass, Status,
+TransportError, Timeout, ApplyThenError}` keyed on request index/method/uri;
+`ApplyThenError` is the lost-ack case and is what makes idempotent retries
+testable at all) and, for the credential cells, a real
+`CachingProvider<StsWebIdentityProvider>` over `FakeCredentialService`.
+`animus-env` is a dev-dependency with the `s3` feature only (no tokio, no
+`prod`). Cells: 5xx burst within / past the retry budget (virtual time
+asserted against `RetryPolicy::backoff_ceiling` sums), 429/SlowDown/
+RequestTimeout, non-retryable 4xx (exactly one request, zero backoff),
+transport-error/timeout/lost-ack storm over a mixed single-PUT + multipart
+workload, ack-lost PUT, multipart part N failing past budget (abort, no
+leak), transient part faults, ack-lost `Complete`, session credentials
+expiring mid-run (with server-side expiry ahead of the client's, forcing the
+`ExpiredToken` refresh path; STS issuance count bounded), provider refresh
+failure + recovery, and a same-seed replay-identity check. Invariants in
+every cell: an `Ok` put reads back identically; a failed put leaves the
+object absent or exactly the intended bytes; the scenario settles within a
+step bound (no hang). Depth knob `ANIMUS_S3_FAULT_SEEDS` (default 1;
+nightly 100, `corpus-deep.yml`); `ANIMUS_SEED` replays one seed per cell.
+**Found a real bug on its first run**: an ack-lost `CompleteMultipartUpload`
+made the retry see `NoSuchUpload` and fail the put although the object had
+assembled; `put_multipart` now resolves that case with a HEAD + ranged
+compare. A lost `Create` ack still orphans an unknown upload id (only the
+bucket lifecycle rule reaps it) -- documented, not injected.
 
 ### `EncryptedSegmentStore` fault-injection corpus (ADR 0069, S-03 PR 2)
 
