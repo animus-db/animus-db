@@ -53,9 +53,11 @@ dependencies = [
  "animus-env",
  "animusd",
  "futures",
+ "rcgen",
  "rustls",
  "rustls-pki-types",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-rustls",
 ]

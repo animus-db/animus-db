@@ -35,3 +35,10 @@ animus-env = { workspace = true, features = ["prod"] }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
+
+[dev-dependencies]
+# tests/admin_real_listener.rs: a real animusd admin listener (ProdEnv, real
+# loopback socket) driven by the real animus binary, with and without
+# server-only TLS (fresh test PKI via rcgen, never shipped).
+tempfile = "3"
+rcgen = { workspace = true }
