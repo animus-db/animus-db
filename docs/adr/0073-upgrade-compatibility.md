@@ -2232,3 +2232,81 @@ release train.
    out-of-range halt is observable through `RaftNode::halt_reason()`, and
    the named process exit is P2-C. The era-on flag flip on data-only nodes
    (`ControlHandle::Remote`) is P2-C too.
+
+### Amendment 2026-10-04 — P2-C implementation notes (node wiring, admin, CLI)
+
+P2-C wires the P2-A machinery into `animusd` and adds the operator surface.
+Decisions and as-built facts the design text did not settle:
+
+1. **The era goes live in production with this change.** Production
+   assembly now sets each control `RaftNode`'s own range and build
+   (`set_own_version_range(Some(own_range()))`, `set_own_build`) and gives
+   every `ProdEnv` its handshake `ext` at bind. A cluster therefore starts
+   the era once the leader has observed every member (a single-node cluster
+   immediately). P2-A/B/D and P2-C ship as one release train, so this is not
+   live alone. `Node::features()` is the per-node `ClusterFeatures` handle;
+   it lives on `ClusterEdgeState` (zero struct-literal fan-out), fed by one
+   generic `version_wiring_loop` spawned for **every** role, including
+   `SimCluster` nodes and data-only nodes with no `RaftNode`.
+2. **Nothing new precedes the era.** The boot-time self-report
+   (`ReportNodeVersion`) is emitted only once the node's *own applied view*
+   shows `versioning_active()` (a lagging view only delays it); a test pins
+   zero reports before the era. The `JoinInfo` field is
+   `#[serde(default, skip_serializing_if)]`, so pre-era bytes equal Phase 1's;
+   the handshake `ext` is ignored by Phase 1.
+3. **`ReportNodeVersion` relays** (`is_relayable_command` arm). Without it a
+   follower-connected or data-only node's report is rejected "not allowed
+   over the relay path". The red-then-green regression switches the leader's
+   own upkeep off so only the node's self-report can land (otherwise the
+   leader's `era_on_proposals` masks a missing arm). A relayed report is not
+   authenticated against the sender id (apply validates registration and
+   range only): acceptable on the mutual-TLS intra port.
+4. **Finalize is leader-local and not relayed**, following ADR 0037's
+   `admin_remove_member` pattern (this narrows the Section 2 table, which
+   said it rides the `ProposeSchema` relay; Section 4 already said "role-gated
+   like ADR 0037"). Leadership is checked first; a non-leader answers `409`
+   naming the leader. `FinalizeClusterVersion` stays non-relayable.
+5. **CHS1 era-on refusal of an empty `ext` is on the intra port only.**
+   This narrows Section 2(b) ("refuse any peer whose `ext` is empty") to
+   node-to-node traffic: `animus-cli` and external clients dial the client
+   port, are not members, and never advertise an `ext`, so requiring one
+   there would lock operators out. Dials (`connect_client`, the pipelined
+   relay/join dial) advertise the node's `ext` and never require the peer's.
+6. **Down / Leaving / never-activated Joining members block Finalize,
+   strictly, regardless of any recorded range** (decision 6), enforced in the
+   admin pre-check and reported as named blockers by
+   `GET /admin/cluster-version`. **Known gap:** `Metadata::apply` for
+   `FinalizeClusterVersion` does not look at member status, so the pre-check
+   is racy and operator-level. Apply-level enforcement is tracked in
+   issue #1168 (an `animus-control` change, out of P2-C's scope).
+7. **Admission.** Once the era is on, `admin_add_control_member` refuses a
+   voter with no known range (a Phase 1 binary never advertises one) or a
+   range excluding the cluster version, by name, before registering anything.
+   `admin_add_member` (registers a not-yet-booted node `Down`) cannot check;
+   the new node's handshake refusal plus "a row with no record blocks
+   Finalize" cover it.
+8. **Joiner range check.** `JoinInfo` carries the raw `cluster_version`
+   (0 = era off, reads as 1); `discover_join_info` (the one funnel for
+   `animusd join`, `data --seed` and growth) refuses an out-of-range cluster
+   before claiming an identity or binding, which also covers the pre-era
+   "binary R+1 against a cluster at R-1" case `EraWatch` cannot.
+9. **Out-of-range halt -> process exit 78.** A node whose range excludes the
+   cluster version latches a named halt (a local `RaftNode`'s
+   `halt_reason()`, or the feeder's own check on a data-only node); `main`
+   races it against the shutdown signal, runs the graceful shutdown, prints
+   `animusd: FATAL: <reason>` and exits with `EX_CONFIG` (78) and no usage
+   text. Client listeners may answer for up to one feeder tick before the
+   exit. Under Kubernetes this is the intended CrashLoopBackOff.
+10. **Accepted benign race.** `ProdEnv::bind*` spawns its accept loop before
+    `set_own_ext` runs, so a connection accepted in those microseconds
+    answers with an empty `ext`; an era-on peer refuses it and redials. An
+    `ext` parameter on `ProdEnv::bind*` would close it (an `animus-env`
+    change, not made here).
+11. **Surface.** `GET /admin/cluster-version` (any node; the control leader
+    also reports its live observation table) and
+    `POST /admin/cluster-version/finalize {to?, expected?}`;
+    `animus cluster version <admin-addr> [--json]` and
+    `animus cluster finalize <leader-admin-addr> [--to N] [--yes]` (the CLI
+    shows the blockers, refuses unless `--yes`, then polls until the new
+    version is observed). Rolling upgrade remains **in progress, not
+    supported**, until P2-B (gates) and P2-D (mixed-version corpus) land.

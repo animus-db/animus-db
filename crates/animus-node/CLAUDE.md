@@ -762,3 +762,14 @@ own `CLAUDE.md`/`sim_cluster.rs`'s `dropping_the_cluster_frees_every_
 nodes_relay_and_edge_state` for the full regression (both the mid-
 scenario restart case and the final-drop case, each `Weak`-verified,
 each confirmed red-before/green-after by temporarily reverting the fix).
+
+## ADR 0073 Phase 2 (P2-C) additions
+
+`is_relayable_command`: `ReportNodeVersion => true` (boot-time self-report from a
+follower-connected or data-only node must reach the leader; `FinalizeClusterVersion`
+stays `false`, a leader-local admin action). `ClientResponse::JoinInfo` gained an
+additive `cluster_version: u32` (`#[serde(default, skip_serializing_if = "is_zero_u32")]`:
+the raw `Metadata::cluster_version`, 0 pre-era so pre-era bytes equal Phase 1's). `AdminHost`
+gained `cluster_version_view` and `action_finalize_cluster_version` (routes
+`GET /admin/cluster-version`, `POST /admin/cluster-version/finalize`); both `animusd`
+impls (`ClientCtx`, `GenericAdminHost`) implement them.
