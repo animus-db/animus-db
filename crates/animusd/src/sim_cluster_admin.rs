@@ -1236,6 +1236,10 @@ const NOT_A_METRIC: &[(&str, &str)] = &[
     ),
     ("stream_seal_knobs", "an /admin JSON field"),
     ("stream_shards", "an /admin JSON field"),
+    (
+        "storage_full",
+        "a refusal-reason label in ADR 0074's overload table; its counter lands with the disk-full work (#1185)",
+    ),
 ];
 
 fn collect_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
