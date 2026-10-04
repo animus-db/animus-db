@@ -2937,6 +2937,18 @@ mod tests {
             MetaCommand::RemoveMember { node: nid(3) },
             report(1, 2),
             report(2, 2),
+            // Finalize refuses a never-activated Joining member (issue #1168):
+            // both registered members come up before it.
+            MetaCommand::UpsertMember {
+                node: nid(1),
+                labels: BTreeMap::new(),
+                status: crate::NodeStatus::Active,
+            },
+            MetaCommand::UpsertMember {
+                node: nid(2),
+                labels: BTreeMap::new(),
+                status: crate::NodeStatus::Active,
+            },
             MetaCommand::FinalizeClusterVersion {
                 expected: 1,
                 target: 2,
@@ -2944,6 +2956,12 @@ mod tests {
             reg(4, "control"),
             report(4, 3),
             MetaCommand::RemoveMember { node: nid(4) },
+            // An Active member is not removable until it is down (drained).
+            MetaCommand::UpsertMember {
+                node: nid(2),
+                labels: BTreeMap::new(),
+                status: crate::NodeStatus::Down,
+            },
             MetaCommand::RemoveMember { node: nid(2) },
         ];
         let mut shadow = Metadata::default();
