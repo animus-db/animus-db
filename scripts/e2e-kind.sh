@@ -1670,11 +1670,11 @@ wait_for "pod ${DYNAMO_POD}'s /admin/health is 200" 60 2 -- admin_health_ready
 
 phase "check the operator annotated every pod with its node's topology and animusd registered it (G-01 stage G-a)"
 # The operator patches `animus.io/topology-{region,zone,resolved}` onto each
-# scheduled pod; animusd's `--labels-wait-secs` gated its own registration on
-# `resolved`, so by the time a pod is Ready its member row must already carry
-# the labels. (`RegisterNode` also fills labels into an already-present but
-# unlabelled row, so bootstrap's own `UpsertMember` winning the race does not
-# lose them.)
+# scheduled pod; animusd's `--labels-wait-secs` gates its own registration on
+# `resolved`, so the member row carries the labels once that registration
+# commits (eventually after Ready, hence the poll below). `RegisterNode` also
+# fills labels into an already-present but unlabelled row, so bootstrap's own
+# `UpsertMember` winning the race does not lose them.
 for pod in $(kubectl get pods -n "$NAMESPACE" \
     -l "app.kubernetes.io/instance=${AC_NAME}" -o jsonpath='{.items[*].metadata.name}'); do
     POD_ZONE="$(kubectl get pod "$pod" -n "$NAMESPACE" \
@@ -1683,10 +1683,22 @@ for pod in $(kubectl get pods -n "$NAMESPACE" \
 '${POD_ZONE:-<empty>}', expected ${E2E_TOPOLOGY_ZONE} (operator node-label resolution did not run — RBAC for nodes/pods patch?)"
 done
 log "every pod carries animus.io/topology-zone=${E2E_TOPOLOGY_ZONE}"
-STATUS_BODY="$(curl -sS -m 5 "${CURL_TLS_ARGS[@]}" \
-    "${ADMIN_SCHEME}://${ADMIN_HOST}:${ADMIN_LOCAL_PORT}/admin/status")"
-LABELLED_MEMBERS="$(jq '[.. | objects | select(has("labels")) | .labels["topology.kubernetes.io/zone"]? | select(. == "'"$E2E_TOPOLOGY_ZONE"'")] | length' <<<"$STATUS_BODY")"
-[ "${LABELLED_MEMBERS:-0}" -ge 3 ] || fail "expected >=3 members registered with \
+# Eventual property, so converged-or-timeout (never one-shot): a pod being
+# Ready does NOT mean its `RegisterNode` has committed and reached the replica
+# serving this /admin/status (registration is a background task after the
+# listeners are up, and a follower's metadata view lags the leader's). CI run
+# 37201459207 saw e2e-0 still `labels: {}` right after readiness while e2e-1/2
+# were labelled.
+count_labelled_members() {
+    STATUS_BODY="$(curl -sS -m 5 "${CURL_TLS_ARGS[@]}" \
+        "${ADMIN_SCHEME}://${ADMIN_HOST}:${ADMIN_LOCAL_PORT}/admin/status" 2>/dev/null)" || return 1
+    LABELLED_MEMBERS="$(jq '[.members[]? | .labels["topology.kubernetes.io/zone"]? | select(. == "'"$E2E_TOPOLOGY_ZONE"'")] | length' <<<"$STATUS_BODY" 2>/dev/null)" || return 1
+    [ "${LABELLED_MEMBERS:-0}" -ge 3 ]
+}
+STATUS_BODY=""
+LABELLED_MEMBERS=0
+wait_for ">=3 members labelled topology.kubernetes.io/zone=${E2E_TOPOLOGY_ZONE} in /admin/status" 90 3 -- \
+    count_labelled_members || fail "expected >=3 members registered with \
 topology.kubernetes.io/zone=${E2E_TOPOLOGY_ZONE} in /admin/status, found ${LABELLED_MEMBERS:-0}: ${STATUS_BODY}"
 log "/admin/status reports ${LABELLED_MEMBERS} members labelled topology.kubernetes.io/zone=${E2E_TOPOLOGY_ZONE}"
 
