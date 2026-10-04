@@ -1938,9 +1938,15 @@ outstanding on the wire surface at present.
 - **Tests:** each sub-track is its own test artifact (oracle-checked soak
   histories, chaos e2e legs, fuzz targets, the metrics-exist check, an
   overload test that asserts bounded queueing, a disk-full test).
-- **ADR:** new ADR (next free number, **0074** at time of writing;
-  coordinate with B-01/C-17/G-01 which may also claim one) fixing the
-  beta criteria, overload semantics (d) and the release policy (g).
+- **ADR:** [ADR 0074](adr/0074-production-readiness-exit-criteria.md)
+  fixes the beta criteria, overload semantics (d) and the release policy
+  (g). **Landed 2026-10-04**, together with the checklist
+  [`docs/production-readiness.md`](production-readiness.md) (first R-01
+  PR; docs only). Verified then: the "absent" claims in **Gap** hold
+  (the DynamoDB accept loop in `crates/animusd/src/dynamo.rs` is also
+  uncapped, and `ThrottlingException` is not emitted anywhere);
+  `ServiceUnavailable` (503) already exists on the wire. Sub-tracks a-g
+  remain open; each flips its rows in that doc.
 - **PRs:** XL overall and genuinely too large for one reviewable PR, so
   **one workstream PR per independent sub-track, each separately
   mergeable and each in its own session** (the sub-tracks share no code):
@@ -1976,11 +1982,11 @@ outstanding on the wire surface at present.
      `MultiRegionConsistency` (`EVENTUAL` for MREC, `STRONG` for MRSC) via
      `CreateTable`/`UpdateTable` `ReplicaUpdates`, which *is* a wire-level
      per-table replication mode (the legacy 2017.11.29 API,
-     `CreateGlobalTable`/`UpdateGlobalTable`, also exists). **Unverified
-     here: the exact parameter names, the MRSC region-count rule (recalled:
-     three regions, or two plus a witness) and MRSC's feature restrictions
-     (recalled: no TTL/LSI/transactions) — check AWS docs when writing the
-     ADR.** The ADR must state that each region stays CP *locally*
+     `CreateGlobalTable`/`UpdateGlobalTable`, also exists). **Verified
+     in ADR 0075 section 0 (via AWS doc search extracts; direct page fetches
+     were blocked, so a re-read is listed as open): exact parameter names,
+     MRSC = exactly three regions or two plus a witness, and MRSC's
+     restrictions (no TTL, LSI or transactions).** The ADR must state that each region stays CP *locally*
      (per-tablet Raft), that MRSC is a CP cross-region mode, and that MREC
      is the one place the system becomes AP-shaped (async, multi-active,
      last-writer-wins per item) — a per-table property now reachable from
@@ -2025,10 +2031,9 @@ outstanding on the wire surface at present.
      regions' clusters over the wire/TLS (ADR 0064), applies them with
      last-writer-wins on `(HLC, region id)` as the deterministic
      tiebreak, never re-replicating a replicated write (origin-region
-     stamp), replicates TTL deletes (as AWS does; confirm), and defines
-     stream records for replicated writes to match AWS (unverified:
-     confirm). Transactions are region-local in AWS global tables
-     (recalled; confirm): do not replicate atomically. HLC skew across
+     stamp), replicates TTL deletes (as AWS does; verified, ADR 0075 V15), and defines
+     stream records for replicated writes to match AWS (verified, ADR 0075 section 4.7 and V13/V15). Transactions are region-local in AWS global tables
+     (verified, ADR 0075 V14): do not replicate atomically. HLC skew across
      regions bounds LWW fairness; document it. Deterministic simulation
      applies: a multi-cluster `SimCluster` with a WAN partition/latency
      model is part of the work.
@@ -2047,7 +2052,8 @@ outstanding on the wire surface at present.
     already is). Tests: `desired::statefulset` unit tests, a placement
     corpus over `SimCluster` with labelled nodes (kill a zone), and the
     `kind` smoke with zone-labelled nodes.
-  - **G-b The ADR (S).** Revisit ADR 0019's premise as above, choose the
+  - **G-b The ADR (S) — WRITTEN 2026-10-04 as
+    [ADR 0075](adr/0075-global-tables.md) (Proposed).** Revisit ADR 0019's premise as above, choose the
     MRSC/MREC scope, the wire surface (`ReplicaUpdates`,
     `DescribeTable` replica fields, `MultiRegionConsistency`), the ADR 0072
     limits catalogue entries (compiled-in, AWS-faithful), and gate every
