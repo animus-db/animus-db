@@ -185,6 +185,16 @@ fn the_era_starts_and_every_role_feeds_its_cluster_features() {
     }
 }
 
+/// Switch the era upkeep (`era_on_proposals`) off on EVERY control node (after
+/// any `set_node_version`, which would otherwise restore a node's range), so a
+/// mid-test leadership change cannot hand the report to an upkeep-capable
+/// leader and mask a missing relay arm.
+fn disable_all_upkeep(cluster: &mut SimCluster) {
+    for n in 0..3u64 {
+        cluster.set_raft_own_range(n, None);
+    }
+}
+
 fn run_report_from_data_only_node_lands(seed: u64) {
     let mut cluster = new_cluster(seed);
     start_era(&mut cluster, seed, 2);
@@ -195,9 +205,8 @@ fn run_report_from_data_only_node_lands(seed: u64) {
     // changed observed range) is switched off, so ONLY the node's own
     // self-report can land: a regression for the `ReportNodeVersion` relay
     // arm (the report is otherwise rejected "not allowed over the relay path").
-    let leader = leader_node(&mut cluster);
-    cluster.set_raft_own_range(leader, None);
     cluster.set_node_version(DATA_NODE, Some(VersionRange::new(1, 1)));
+    disable_all_upkeep(&mut cluster);
     let id = cluster.handle().env(DATA_NODE).node_id();
     poll_until(
         &mut cluster,
@@ -225,9 +234,8 @@ fn run_report_from_follower_lands(seed: u64) {
     let mut cluster = new_cluster(seed);
     start_era(&mut cluster, seed, 2);
     let follower = a_follower(&mut cluster);
-    let leader = leader_node(&mut cluster);
-    cluster.set_raft_own_range(leader, None);
     cluster.set_node_version(follower, Some(VersionRange::new(1, 1)));
+    disable_all_upkeep(&mut cluster);
     let id = cluster.handle().env(follower).node_id();
     poll_until(
         &mut cluster,
@@ -330,6 +338,35 @@ fn run_finalize_success_and_refusals(seed: u64) {
 fn finalize_succeeds_on_the_leader_and_is_refused_elsewhere() {
     for seed in seeds() {
         run_finalize_success_and_refusals(seed);
+    }
+}
+
+/// Finalize on a just-elected leader: the leader's apply-task cache may lag its
+/// committed log, so the handler waits for apply to catch up (issue #406
+/// pattern) before reading the version. A stale read would answer a false
+/// "expected 1 but the active version is 1"-shaped refusal or re-propose the
+/// already-applied step.
+fn run_finalize_on_a_new_leader_sees_current_state(seed: u64) {
+    let mut cluster = new_cluster(seed);
+    start_era(&mut cluster, seed, 3);
+    let first = leader_node(&mut cluster);
+    let (status, v) = post_finalize(&mut cluster, first, r#"{"to":2,"expected":1}"#);
+    assert_eq!(status, 200, "seed={seed}: {v}");
+    cluster.crash(first);
+    // Polls (bounded) for the survivors' real election; the crashed node
+    // keeps believing it leads (muted, not stopped).
+    let idx = cluster.control_leader_index_excluding(first);
+    let second = cluster.control_node_id(idx);
+    // Immediately, with no settle: the CAS on the NEW version must hold.
+    let (status, v) = post_finalize(&mut cluster, second, r#"{"to":3,"expected":2}"#);
+    assert_eq!(status, 200, "seed={seed}: {v}");
+    assert_eq!(v["active"], 3, "seed={seed}: {v}");
+}
+
+#[test]
+fn finalize_on_a_new_leader_sees_the_previous_finalize() {
+    for seed in seeds() {
+        run_finalize_on_a_new_leader_sees_current_state(seed);
     }
 }
 

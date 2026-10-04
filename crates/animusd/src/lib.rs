@@ -12363,6 +12363,26 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         let Some(leader) = self.edge.leader_handle() else {
             return (409, serde_json::json!({"error": self.not_leader_error()}));
         };
+        // Issue #406 pattern: the leader's `metadata()` is the apply-task
+        // cache, which can lag a just-elected leader's own committed log.
+        // Bounded converged-or-timeout wait for it to catch up before any
+        // metadata-dependent refusal (or the blockers) is computed from it.
+        {
+            let deadline = self.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
+            loop {
+                if leader.engine_applied_index() >= leader.commit_index() {
+                    break;
+                }
+                if self.env.now() >= deadline {
+                    return (
+                        503,
+                        serde_json::json!({"error": "control leader's metadata has not caught up \
+                            with its committed log (apply lag); retry the finalize"}),
+                    );
+                }
+                self.env.sleep(SCHEMA_POLL_INTERVAL).await;
+            }
+        }
         let meta = leader.metadata();
         if !meta.versioning_active() {
             return (
@@ -12433,19 +12453,49 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 }),
             );
         }
-        if !matches!(
+        // A different finalize may have landed between the reads above and
+        // now: name that instead of proposing (and later mistaking its
+        // result for ours).
+        let now_active = leader.metadata().cluster_version();
+        if now_active != active {
+            return (
+                409,
+                serde_json::json!({"error": format!(
+                    "the cluster version is already {now_active} (another finalize landed \
+                     first); nothing was proposed"
+                )}),
+            );
+        }
+        let ProposeResult::Accepted { index, .. } =
             leader.propose(MetaCommand::FinalizeClusterVersion {
                 expected: active,
                 target,
-            }),
-            ProposeResult::Accepted { .. }
-        ) {
+            })
+        else {
             return (409, serde_json::json!({"error": self.not_leader_error()}));
-        }
+        };
         let deadline = self.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
         loop {
             if leader.metadata().cluster_version() >= target {
                 return (200, serde_json::json!({"ok": true, "active": target}));
+            }
+            // The apply task has merged past our entry's index yet the
+            // version did not move: the entry was applied-and-rejected by
+            // `Metadata::apply` (its own preconditions: era, expected CAS,
+            // ranges) or displaced by a leadership change. `apply`'s
+            // rejection reason is not surfaced to proposers.
+            if leader.engine_applied_index() >= index
+                && leader.metadata().cluster_version() < target
+            {
+                return (
+                    409,
+                    serde_json::json!({"error": format!(
+                        "finalize of cluster version {target} was rejected at apply (the \
+                         entry was applied but the cluster version did not move; its \
+                         preconditions no longer held, or leadership changed). Re-read \
+                         GET /admin/cluster-version before retrying"
+                    )}),
+                );
             }
             if self.env.now() >= deadline {
                 return (
