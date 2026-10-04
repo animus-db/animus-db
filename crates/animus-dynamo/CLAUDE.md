@@ -838,6 +838,14 @@ comment for its full type/method inventory.
   predicate the Streams read path filters markers and the backfill's
   `seeded` records with; change-log consumers themselves treat every
   record as a dirty-key signal and ignore both flags.
+- **Never byte-index a `str` at a position found by scanning bytes.**
+  `find_top_level` (the `OR`/`AND`/`BETWEEN` splitter behind every
+  Condition/Filter/KeyCondition expression) once looped over each byte `i` and
+  evaluated `lower[i..].starts_with(..)`, which panics when `i` falls inside a
+  multi-byte char (fuzzer-found remote panic: a U+FFFD in a `FilterExpression`).
+  Match on bytes (`bytes[i..i+n].eq_ignore_ascii_case(needle)`) over the
+  ORIGINAL string; ASCII-needle hits are always char boundaries. See
+  `docs/lessons/code-patterns/2026-10-04-str-slice-at-scanned-byte-index-panics-on-utf8.md`.
 
 ## Tests
 
