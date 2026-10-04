@@ -7326,7 +7326,9 @@ with an empty `ext`; an era-on peer refuses and redials (closing it needs an
   members strictly; `Metadata::apply` does not enforce that half (issue #1168).
   `animus cluster version|finalize` (`animus-cli`) wraps them.
 - **Admission/joins**: `admin_add_control_member` refuses (era on) a voter with
-  no known range or an excluding one; `discover_join_info` refuses an
+  no known range or an excluding one (so the voter must be up, connected or
+  self-reported, **before** the admin add once the era is on);
+  `discover_join_info` refuses an
   out-of-range cluster from `JoinInfo.cluster_version` before claiming anything.
 - **Halt**: `main.rs` `wait_for_shutdown` races the signal against every node's
   `wait_version_halt`; a halt prints `animusd: FATAL: <reason>` and exits 78

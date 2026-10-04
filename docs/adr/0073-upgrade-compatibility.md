@@ -2282,6 +2282,10 @@ Decisions and as-built facts the design text did not settle:
 7. **Admission.** Once the era is on, `admin_add_control_member` refuses a
    voter with no known range (a Phase 1 binary never advertises one) or a
    range excluding the cluster version, by name, before registering anything.
+   **Runbook:** a control voter must therefore be up (connected, so its
+   handshake range is observed, or already self-reported) *before*
+   `admin_add_control_member` is invoked once the era is on; start the node
+   first, then admit it.
    `admin_add_member` (registers a not-yet-booted node `Down`) cannot check;
    the new node's handshake refusal plus "a row with no record blocks
    Finalize" cover it.
