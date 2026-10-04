@@ -1,0 +1,24 @@
+# UNVALIDATED draft (never applied to a cluster; see deploy/chaos/README.md).
+# Slow disk: 100 ms on every filesystem call under the data dir of one pod.
+# Probes group-commit / fsync stalls (the WAL fsync path, ADR 0028) turning
+# into election timeouts or write timeouts. Needs the chaos-daemon to be able
+# to inject into the pod's PVC mount; IOChaos is the least portable Chaos Mesh
+# kind, so validate on the target storage class first.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: IOChaos
+metadata:
+  name: animus-io-latency
+  namespace: animus-chaos
+spec:
+  action: latency
+  mode: one
+  selector:
+    namespaces: [animus-chaos]
+    labelSelectors:
+      app.kubernetes.io/name: animusdb
+      app.kubernetes.io/instance: chaos
+  volumePath: /var/lib/animus
+  path: /var/lib/animus/**/*
+  delay: "100ms"
+  percent: 100
+  duration: "30s"
