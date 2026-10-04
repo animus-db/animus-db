@@ -47,6 +47,8 @@ pub mod persist_round;
 pub mod raft;
 pub mod schema;
 pub mod shared_wal;
+#[cfg(any(test, feature = "sim-versions"))]
+pub mod sim_versions;
 pub mod syskv;
 pub mod version;
 pub mod version_observe;
