@@ -469,8 +469,11 @@ truth; this map is just for navigation.
   continuously as a fifth change-log consumer beside periodic base
   snapshots) are also implemented and green** (`ANIMUS_PITR_SEEDS`, default
   1, held at `=300` in CI; see ADR 0059's Train 2/3 as-built amendments).
-  The backup/restore/PITR feature train is complete. S3 export/import and
-  an S3 `SegmentStore` backend are deferred follow-ups.
+  The backup/restore/PITR feature train is complete. S3 export/import
+  (ADR 0068) and the S3 `SegmentStore` backend (`animus-s3`,
+  `--backup-store s3://...`, ADR 0059's S-04 amendment) have both landed;
+  what remains of the S3 side (non-static credentials, multipart) is
+  `docs/roadmap.md` S-08.
 - **Observability & operations** — metrics seam (`animus-env`, ADR 0015,
   additive/no-op under sim); OTLP tracing (`animusd::otel`, ADR 0027, opt-in);
   the admin/debug HTTP-JSON interface (`animusd::admin`, ADR 0020, pure
