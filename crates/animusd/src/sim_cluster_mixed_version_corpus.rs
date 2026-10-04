@@ -879,7 +879,7 @@ fn run_ladder(c: &Cell) -> Verdict {
     // Gate 2 is open on every node, gate 3 closed.
     for n in 0..NODES {
         let f = cluster.features(n);
-        if !(f.is_open(Gate::Synthetic(2)) && !f.is_open(Gate::Synthetic(3))) {
+        if !f.is_open(Gate::Synthetic(2)) || f.is_open(Gate::Synthetic(3)) {
             w.violations
                 .push(format!("node {n}: gate 2/3 not open/closed at version 2"));
         }
