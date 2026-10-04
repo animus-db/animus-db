@@ -26,7 +26,7 @@
 //! [`ClusterFeatures`] handle.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -151,10 +151,22 @@ pub struct NodeVersion {
 }
 
 /// A cross-node feature gate. Add a variant here, give it a row in
-/// [`Gate::version`] (naming the ADR/PR that introduces it) and in
-/// [`Gate::ALL`]; the exhaustive match makes forgetting either a build error.
+/// [`Gate::version`] (naming the ADR/PR that introduces it), in
+/// [`Gate::rank`] and in [`Gate::ALL`]; the exhaustive matches make
+/// forgetting any a build error.
+///
+/// Variants are declared in **opening order** (`Base` first, then `Era`, then
+/// version gates by ascending version), which is what the derived `Ord`
+/// follows. Do not use `Ord` for "is this gate open"; use
+/// [`ClusterFeatures::is_open`]. Use [`Gate::rank`] / [`Gate::join`] to find the
+/// strictest of several gates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Gate {
+    /// Everything Phase 1 and B2 emit before the era: always open (ADR 0073
+    /// P2-B). The gate of every variant that exists today, so a
+    /// `required_gate` table can name *something* for it. Version 1, which
+    /// `cluster_version() >= 1` always satisfies.
+    Base,
     /// The *era*: open iff the cluster has started versioning
     /// (`Metadata::versioning_active()`, a sticky marker: the first applied
     /// report starts it and nothing ends it), i.e. the era-only
@@ -165,15 +177,103 @@ pub enum Gate {
 
 impl Gate {
     /// Every gate, in declaration order.
-    pub const ALL: &'static [Gate] = &[Gate::Era];
+    pub const ALL: &'static [Gate] = &[Gate::Base, Gate::Era];
 
     /// The cluster version at which this gate opens, or `None` for a gate
     /// opened by the era rather than by a version. Exhaustive: no wildcard.
     #[must_use]
     pub const fn version(self) -> Option<ClusterVersion> {
         match self {
-            // ADR 0073 P2-A (this PR): era-gated, no version.
+            // ADR 0073 P2-B: everything that exists at version 1.
+            Gate::Base => Some(1),
+            // ADR 0073 P2-A: era-gated, no version.
             Gate::Era => None,
+        }
+    }
+
+    /// Strictness rank: a higher rank opens later. `Base` is 0; `Era` is 1
+    /// (it ranks below every version gate above 1: such a gate is only
+    /// reachable once a finalize raised the version, and `Finalize` itself is
+    /// era-only); a version gate `v` ranks `v`. Exhaustive: no wildcard.
+    #[must_use]
+    pub const fn rank(self) -> u32 {
+        match self {
+            Gate::Base => 0,
+            Gate::Era => 1,
+        }
+    }
+
+    /// The stricter (later-opening) of two gates: what a composite value
+    /// (a batch, a nested message) requires.
+    #[must_use]
+    pub const fn join(self, other: Gate) -> Gate {
+        if other.rank() > self.rank() {
+            other
+        } else {
+            self
+        }
+    }
+}
+
+/// A value whose emission is gated: the gate that must be open before this
+/// value may be proposed or sent to another node (ADR 0073 section 3).
+/// Implementations are an **exhaustive match with no `_` arm** so a new
+/// variant does not compile until it names its gate.
+pub trait GatedCommand {
+    /// The gate that must be open to emit `self`.
+    fn required_gate(&self) -> Gate;
+}
+
+/// A cross-node surface a gate check guards; one violation counter each
+/// ([`ClusterFeatures::violations`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum GateSurface {
+    /// Control `RaftMsg` (JSON).
+    RaftMsg,
+    /// `MetaCommand` (control log entries, `ProposeSchema`).
+    MetaCommand,
+    /// `KvWire` (cp-data wire frames).
+    KvWire,
+    /// `KvCommand` (cp-data log entries).
+    KvCommand,
+    /// `ClientRequest` frames.
+    ClientRequest,
+    /// `ClientResponse` frames.
+    ClientResponse,
+}
+
+impl GateSurface {
+    /// Every surface, in counter-slot order.
+    pub const ALL: &'static [GateSurface] = &[
+        GateSurface::RaftMsg,
+        GateSurface::MetaCommand,
+        GateSurface::KvWire,
+        GateSurface::KvCommand,
+        GateSurface::ClientRequest,
+        GateSurface::ClientResponse,
+    ];
+
+    const fn slot(self) -> usize {
+        match self {
+            GateSurface::RaftMsg => 0,
+            GateSurface::MetaCommand => 1,
+            GateSurface::KvWire => 2,
+            GateSurface::KvCommand => 3,
+            GateSurface::ClientRequest => 4,
+            GateSurface::ClientResponse => 5,
+        }
+    }
+
+    /// A stable lowercase name (metric label / log field).
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            GateSurface::RaftMsg => "raft_msg",
+            GateSurface::MetaCommand => "meta_command",
+            GateSurface::KvWire => "kv_wire",
+            GateSurface::KvCommand => "kv_command",
+            GateSurface::ClientRequest => "client_request",
+            GateSurface::ClientResponse => "client_response",
         }
     }
 }
@@ -182,11 +282,18 @@ impl Gate {
 struct Inner {
     cluster_version: AtomicU32,
     era_active: AtomicBool,
+    violations: [AtomicU64; GateSurface::ALL.len()],
 }
 
 /// A cheap-clone, per-node handle on the cluster's feature state. All clones
 /// share one cell; there is no global. Fed from a `&Metadata` by
 /// [`update`](Self::update) (the control apply task's job, wired by P2-B/C).
+///
+/// It also holds the per-surface **gate-violation counters** (ADR 0073 section
+/// 3): [`check`](Self::check) bumps one when an emitter tries to emit
+/// something whose gate is closed. `animus-env`'s `Metric` enum is outside
+/// P2-B's scope, so the release-build "metric" is these counters; P2-C
+/// exports them through `MetricsHandle::set`.
 #[derive(Clone, Debug)]
 pub struct ClusterFeatures {
     inner: Arc<Inner>,
@@ -207,18 +314,25 @@ impl ClusterFeatures {
             inner: Arc::new(Inner {
                 cluster_version: AtomicU32::new(MIN_SUPPORTED),
                 era_active: AtomicBool::new(false),
+                violations: std::array::from_fn(|_| AtomicU64::new(0)),
             }),
         }
     }
 
     /// Refresh from the replicated `Metadata`.
+    ///
+    /// **Monotonic**: the version only rises and the era flag, once set,
+    /// stays set. Gates only ever open (ADR 0073 section 3; a finalize cannot
+    /// be undone and the era marker is sticky), and two feeders (the apply
+    /// task and a proposer re-reading the applied cache) may race, so an
+    /// older view must never close a gate a newer one opened.
     pub fn update(&self, meta: &Metadata) {
         self.inner
             .cluster_version
-            .store(meta.cluster_version(), Ordering::Release);
-        self.inner
-            .era_active
-            .store(meta.versioning_active(), Ordering::Release);
+            .fetch_max(meta.cluster_version(), Ordering::AcqRel);
+        if meta.versioning_active() {
+            self.inner.era_active.store(true, Ordering::Release);
+        }
     }
 
     /// The cluster version last observed (the floor before any update).
@@ -242,6 +356,35 @@ impl ClusterFeatures {
             Some(v) => self.cluster_version() >= v,
             None => self.era_active(),
         }
+    }
+
+    /// The emit-site check: `true` when `gate` is open. When closed, bumps
+    /// the `surface` violation counter, logs an error, and `debug_assert!`s
+    /// (a test or debug build fails loudly); in a release build it never
+    /// panics, and the caller must **refuse** to emit on `false`.
+    #[must_use]
+    pub fn check(&self, surface: GateSurface, gate: Gate) -> bool {
+        if self.is_open(gate) {
+            return true;
+        }
+        self.inner.violations[surface.slot()].fetch_add(1, Ordering::Relaxed);
+        tracing::error!(
+            surface = surface.name(),
+            ?gate,
+            "gate violation: refusing to emit a value whose feature gate is closed"
+        );
+        debug_assert!(
+            false,
+            "gate violation on {}: {gate:?} is closed",
+            surface.name()
+        );
+        false
+    }
+
+    /// Gate violations counted on `surface` since this handle was created.
+    #[must_use]
+    pub fn violations(&self, surface: GateSurface) -> u64 {
+        self.inner.violations[surface.slot()].load(Ordering::Relaxed)
     }
 }
 
@@ -315,14 +458,25 @@ mod tests {
         for &g in Gate::ALL {
             assert!(seen.insert(g), "duplicate {g:?} in Gate::ALL");
             let expected: Option<ClusterVersion> = match g {
+                Gate::Base => Some(1),
                 Gate::Era => None,
             };
             assert_eq!(g.version(), expected, "{g:?}");
             if let Some(v) = g.version() {
-                assert!(v > MIN_SUPPORTED, "{g:?}: gating at the floor is no gate");
+                // `Base` is the one gate at version 1: always open.
+                assert!(
+                    g == Gate::Base || v > MIN_SUPPORTED,
+                    "{g:?}: gating at the floor is no gate"
+                );
             }
         }
-        assert!(seen.contains(&Gate::Era));
+        assert!(seen.contains(&Gate::Base) && seen.contains(&Gate::Era));
+        // Declaration order is opening order: ranks are non-decreasing.
+        let ranks: Vec<u32> = Gate::ALL.iter().map(|g| g.rank()).collect();
+        assert!(ranks.windows(2).all(|w| w[0] < w[1]), "{ranks:?}");
+        assert_eq!(Gate::Base.join(Gate::Era), Gate::Era);
+        assert_eq!(Gate::Era.join(Gate::Base), Gate::Era);
+        assert_eq!(Gate::Base.join(Gate::Base), Gate::Base);
     }
 
     fn registered(meta: &mut Metadata, n: u64) {
@@ -347,7 +501,8 @@ mod tests {
         let g = f.clone();
         assert_eq!(f.cluster_version(), MIN_SUPPORTED);
         assert!(!f.era_active());
-        for &gate in Gate::ALL {
+        assert!(f.is_open(Gate::Base), "Base is always open");
+        for &gate in Gate::ALL.iter().filter(|g| **g != Gate::Base) {
             assert!(!f.is_open(gate), "{gate:?} must be closed at the floor");
         }
 
@@ -364,5 +519,36 @@ mod tests {
         f.update(&meta);
         assert!(g.is_open(Gate::Era), "clones share one cell");
         assert_eq!(g.cluster_version(), meta.cluster_version());
+    }
+
+    #[test]
+    fn check_counts_and_refuses_a_closed_gate_per_surface() {
+        let f = ClusterFeatures::new();
+        assert!(f.check(GateSurface::MetaCommand, Gate::Base));
+        for &s in GateSurface::ALL {
+            assert_eq!(f.violations(s), 0);
+        }
+        // A closed gate debug-asserts in a debug build; observe the counter
+        // through the release path only when assertions are off.
+        if !cfg!(debug_assertions) {
+            assert!(!f.check(GateSurface::KvWire, Gate::Era));
+            assert_eq!(f.violations(GateSurface::KvWire), 1);
+            assert_eq!(f.violations(GateSurface::RaftMsg), 0);
+        }
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "gate violation on raft_msg")]
+    fn check_debug_asserts_on_a_closed_gate() {
+        let f = ClusterFeatures::new();
+        let _ = f.check(GateSurface::RaftMsg, Gate::Era);
+    }
+
+    #[test]
+    fn surface_slots_are_distinct_and_cover_all() {
+        let mut slots: Vec<usize> = GateSurface::ALL.iter().map(|s| s.slot()).collect();
+        slots.sort_unstable();
+        assert_eq!(slots, (0..GateSurface::ALL.len()).collect::<Vec<_>>());
     }
 }

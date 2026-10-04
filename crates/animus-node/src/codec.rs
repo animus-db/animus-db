@@ -11,8 +11,11 @@
 
 use std::io;
 
+use animus_control::version::{ClusterFeatures, Gate, GateSurface};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+
+use crate::wire::{ClientRequest, ClientResponse};
 
 /// The maximum length, in bytes, of one length-prefixed frame's JSON
 /// payload — moved verbatim from `animusd::lib` (rung C3a). See that
@@ -45,6 +48,60 @@ pub fn encode_client_frame<T: Serialize>(msg: &T) -> io::Result<Vec<u8>> {
     framed.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
     framed.extend_from_slice(&bytes);
     Ok(framed)
+}
+
+/// A client-wire message whose emission is gated (ADR 0073 Phase 2, P2-B):
+/// implemented by [`ClientRequest`] and [`ClientResponse`], the two types
+/// `animusd`'s `write_frame` sends. Kept separate from
+/// [`encode_client_frame`]'s bare `T: Serialize` bound, which stays
+/// unchanged (its generic callers also frame non-wire values).
+pub trait ClientGated {
+    /// The gate that must be open before this message may be sent.
+    fn required_gate(&self) -> Gate;
+    /// Which violation counter a refusal bumps.
+    fn surface() -> GateSurface;
+}
+
+impl ClientGated for ClientRequest {
+    fn required_gate(&self) -> Gate {
+        Self::required_gate(self)
+    }
+    fn surface() -> GateSurface {
+        GateSurface::ClientRequest
+    }
+}
+
+impl ClientGated for ClientResponse {
+    fn required_gate(&self) -> Gate {
+        Self::required_gate(self)
+    }
+    fn surface() -> GateSurface {
+        GateSurface::ClientResponse
+    }
+}
+
+/// [`encode_client_frame`] behind the gate check (ADR 0073 Phase 2, P2-B): a
+/// message whose [`required_gate`](ClientGated::required_gate) is closed on
+/// `features` is **refused** with an error (after the shared
+/// [`ClusterFeatures::check`]: counted, logged, and a `debug_assert!` in debug
+/// builds) rather than put on the wire, where a Phase 1 peer would fail to
+/// decode the unknown variant and tear the connection down. For an open gate
+/// the bytes are **identical** to [`encode_client_frame`]'s.
+///
+/// # Errors
+/// A closed gate (`InvalidInput`), or any error [`encode_client_frame`] returns.
+pub fn encode_client_frame_gated<T: ClientGated + Serialize>(
+    msg: &T,
+    features: &ClusterFeatures,
+) -> io::Result<Vec<u8>> {
+    let gate = msg.required_gate();
+    if !features.check(T::surface(), gate) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing to send a client message gated on {gate:?}, which is not open"),
+        ));
+    }
+    encode_client_frame(msg)
 }
 
 /// Validate an already-read 4-byte big-endian length prefix, returning the
@@ -91,6 +148,46 @@ mod tests {
         assert_eq!(len, payload.len());
         let decoded: ClientRequest = decode_client_frame(payload).expect("decodes");
         assert!(matches!(decoded, ClientRequest::Status));
+    }
+
+    #[test]
+    fn gated_encode_is_byte_identical_to_the_plain_encoder_when_open() {
+        let f = ClusterFeatures::new();
+        let req = ClientRequest::Status;
+        assert_eq!(
+            encode_client_frame_gated(&req, &f).unwrap(),
+            encode_client_frame(&req).unwrap()
+        );
+        let resp = ClientResponse::Error("boom".to_string());
+        assert_eq!(
+            encode_client_frame_gated(&resp, &f).unwrap(),
+            encode_client_frame(&resp).unwrap()
+        );
+        assert_eq!(f.violations(GateSurface::ClientRequest), 0);
+    }
+
+    /// A closed-gate request (an era command on the `ProposeSchema` relay,
+    /// pre-era) is refused with an error. A debug build `debug_assert!`s
+    /// first, so the refusal path is asserted only without assertions.
+    #[test]
+    fn gated_encode_refuses_a_closed_gate() {
+        let f = ClusterFeatures::new();
+        let req =
+            ClientRequest::ProposeSchema(animus_control::MetaCommand::FinalizeClusterVersion {
+                expected: 1,
+                target: 2,
+            });
+        assert_eq!(req.required_gate(), Gate::Era);
+        if cfg!(debug_assertions) {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                encode_client_frame_gated(&req, &f)
+            }));
+            assert!(r.is_err(), "debug builds assert on a closed gate");
+        } else {
+            let err = encode_client_frame_gated(&req, &f).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        }
+        assert_eq!(f.violations(GateSurface::ClientRequest), 1);
     }
 
     #[test]

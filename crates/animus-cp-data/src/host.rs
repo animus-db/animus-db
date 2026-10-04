@@ -41,11 +41,14 @@ use animus_tablet::{Epoch, KeyRange, SplitChild, Tablet, TabletId};
 
 use animus_control::SharedWal;
 use animus_control::timing::{self, DEFAULT_MAX_REGION_RTT, TimingProfile};
+use animus_control::version::ClusterFeatures;
 
 use crate::heartbeat_batch::{DEFAULT_HEARTBEAT_BATCH_INTERVAL, HeartbeatBatcher};
 use crate::layout;
 use crate::trim_marker::trim_marker_key;
-use crate::{KvCommand, KvState, RaftKvNode, SHARED_WAL, StorageScope, WAL, wal_file};
+use crate::{
+    HostedOptions, KvCommand, KvState, RaftKvNode, SHARED_WAL, StorageScope, WAL, wal_file,
+};
 
 /// The per-tablet engine seam (ADR 0050, Train B rung 1): every hosted
 /// data-plane tablet gets its **own private `StorageEngine`**, opened by the
@@ -1130,6 +1133,11 @@ pub struct Reconciler<E: Env, S: StorageEngine> {
     /// [`new`](Self::new) is unaffected, and every group this reconciler
     /// hosts persists into its own private `wal_file(tablet)`, unchanged.
     shared_wal: Option<Arc<SharedWal<KvCommand, KvState>>>,
+    /// ADR 0073 Phase 2 (P2-B): the node's feature-gate handle, given to
+    /// every group this reconciler hosts from now on (and to its heartbeat
+    /// batcher). A floor handle (`ClusterFeatures::new()`) by default; see
+    /// [`set_cluster_features`](Self::set_cluster_features).
+    features: ClusterFeatures,
     /// Issue #722: has this reconciler already consulted
     /// [`EngineFactory::local_tablets`] once? `false` from [`new`](Self::new)
     /// until the first [`tick`](Self::tick) call, then permanently `true` —
@@ -1232,6 +1240,7 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
             quiesce_after: None,
             heartbeat_batcher: None,
             shared_wal: None,
+            features: ClusterFeatures::new(),
             local_engines_checked: false,
             stopping: BTreeMap::new(),
             max_region_rtt: DEFAULT_MAX_REGION_RTT,
@@ -1416,11 +1425,27 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
     /// doc). `animusd`'s `--heartbeat-batch` CLI flag calls this once at
     /// node start.
     pub fn enable_heartbeat_batching(&mut self) {
-        self.heartbeat_batcher = Some(HeartbeatBatcher::new(
+        self.heartbeat_batcher = Some(HeartbeatBatcher::new_with_features(
             self.env.clone(),
             DEFAULT_HEARTBEAT_BATCH_INTERVAL,
             self.env.metrics(),
+            self.features.clone(),
         ));
+    }
+
+    /// Inject the node's control-fed feature-gate handle (ADR 0073 Phase 2,
+    /// P2-B): every group this reconciler hosts **from now on** (and its
+    /// heartbeat batcher, if one exists) gates its wire frames, snapshot
+    /// images and proposals on `features`. Defaults to a floor handle, which
+    /// behaves exactly as before. P2-C passes `RaftNode::features()` here
+    /// (or the data-only node's mirror-fed handle) at node start, before the
+    /// first [`tick`](Self::tick); already-hosted groups keep the handle
+    /// they started with.
+    pub fn set_cluster_features(&mut self, features: ClusterFeatures) {
+        if let Some(b) = &self.heartbeat_batcher {
+            b.set_features(features.clone());
+        }
+        self.features = features;
     }
 
     /// Opt every group this reconciler hosts **from now on** into the
@@ -1442,6 +1467,22 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
     /// flag calls this once at node start.
     pub fn enable_shared_wal(&mut self, shared: Arc<SharedWal<KvCommand, KvState>>) {
         self.shared_wal = Some(shared);
+    }
+
+    /// The start options every hosted group gets: this reconciler's batcher,
+    /// shared WAL and feature-gate handle, plus the two per-call flags.
+    fn hosted_options(
+        &self,
+        campaign_immediately: bool,
+        skip_cluster_check: bool,
+    ) -> HostedOptions<E> {
+        HostedOptions {
+            campaign_immediately,
+            skip_cluster_check,
+            heartbeat_batcher: self.heartbeat_batcher.clone(),
+            shared_wal: self.shared_wal.clone(),
+            features: self.features.clone(),
+        }
     }
 
     /// The live `RaftKvNode` this reconciler hosts for `tablet`, if any.
@@ -1795,14 +1836,13 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         // witnesses this group's HLC off its engine's own `latest_version()`
         // at construction (the tablet's private engine since ADR 0050 rung 1
         // — its own data is the only history a fresh group must out-version).
-        let node = RaftKvNode::start_hosted_with_batcher_and_shared_wal(
+        let node = RaftKvNode::start_hosted_with_options(
             self.env.clone(),
             config,
             engine,
             scope,
             tablet.0,
-            self.heartbeat_batcher.clone(),
-            self.shared_wal.clone(),
+            self.hosted_options(false, false),
         );
         // ADR 0044 phase-1 PR4 production wiring: opt every freshly-hosted
         // data-plane group into quiescence if this reconciler has been
@@ -2111,14 +2151,13 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         // waiting out a cold randomized election timeout — see
         // `start_hosted_campaigning`'s own doc for why this is safe.
         let node = if campaign {
-            RaftKvNode::start_hosted_campaigning_with_batcher_and_shared_wal(
+            RaftKvNode::start_hosted_with_options(
                 self.env.clone(),
                 voters,
                 engine,
                 scope,
                 child.id.0,
-                self.heartbeat_batcher.clone(),
-                self.shared_wal.clone(),
+                self.hosted_options(true, true),
             )
         } else {
             // Issue #945: this replica doesn't campaign, but it is exactly
@@ -2133,14 +2172,13 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
             // sibling until its own cluster check resolved, silently
             // degrading ADR 0058 Train 2 rung 4's "no added latency"
             // deterministic-first-leader optimization on every split.
-            RaftKvNode::start_hosted_split_follower_with_batcher_and_shared_wal(
+            RaftKvNode::start_hosted_with_options(
                 self.env.clone(),
                 voters,
                 engine,
                 scope,
                 child.id.0,
-                self.heartbeat_batcher.clone(),
-                self.shared_wal.clone(),
+                self.hosted_options(false, true),
             )
         };
         if let Some(after) = self.quiesce_after {

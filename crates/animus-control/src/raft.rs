@@ -704,6 +704,45 @@ pub enum RaftMsg<C = MetaCommand> {
 }
 
 impl<C> RaftMsg<C> {
+    /// ADR 0073 Phase 2 (P2-B): the gate the **message itself** needs,
+    /// *excluding* the commands carried by an `AppendEntries`. Exhaustive,
+    /// no `_` arm: a new variant does not compile until it names its gate.
+    ///
+    /// Every variant that exists at cluster version 1 is [`Gate::Base`].
+    /// `InstallSnapshot` data is opaque bytes here; its *content* is gated by
+    /// the encoder of the image it carries (`CSN1`, `raftkv-image`), not by
+    /// this envelope.
+    ///
+    /// Why entries are excluded: an `AppendEntries`' entry gates cannot be
+    /// checked soundly at the send site. A leader's applied view (which feeds
+    /// `ClusterFeatures`) lags its log, era-start entries ship before they
+    /// apply, and a new leader resends entries proposed earlier under a gate
+    /// that was open then (gates only ever open). Entry gates are enforced at
+    /// the *propose* site instead (see [`RaftMsg::required_gate`] for the
+    /// full-message gate used by tests and receivers).
+    #[must_use]
+    pub fn envelope_gate(&self) -> crate::version::Gate {
+        use crate::version::Gate;
+        match self {
+            RaftMsg::PreVote { .. }
+            | RaftMsg::PreVoteResp { .. }
+            | RaftMsg::RequestVote { .. }
+            | RaftMsg::RequestVoteResp { .. }
+            | RaftMsg::AppendEntries { .. }
+            | RaftMsg::AppendEntriesResp { .. }
+            | RaftMsg::InstallSnapshot { .. }
+            | RaftMsg::InstallSnapshotResp { .. }
+            | RaftMsg::Heartbeat { .. }
+            | RaftMsg::TimeoutNow { .. }
+            | RaftMsg::Quiesce { .. }
+            | RaftMsg::WakeRequest { .. }
+            | RaftMsg::ClusterProbe
+            | RaftMsg::ClusterProbeResp { .. }
+            | RaftMsg::Removed { .. }
+            | RaftMsg::RemovedAck { .. } => Gate::Base,
+        }
+    }
+
     /// The Raft term carried by this message. A [`Heartbeat`](RaftMsg::Heartbeat)
     /// or [`WakeRequest`](RaftMsg::WakeRequest) is not consensus traffic and
     /// carries no term *authority* (it reports 0, never forcing a step-down) —
@@ -731,6 +770,39 @@ impl<C> RaftMsg<C> {
             // payload (the responder's term/commit) is read explicitly by
             // `handle_cluster_probe_resp`, never via this generic extractor.
             RaftMsg::ClusterProbe | RaftMsg::ClusterProbeResp { .. } => 0,
+        }
+    }
+}
+
+/// The full-message gate, which also covers the commands an `AppendEntries`
+/// carries. A **separate, bounded** impl on purpose: `RaftCore<C, S>` and the
+/// toy commands in tests stay unbounded.
+impl<C: crate::version::GatedCommand> RaftMsg<C> {
+    /// [`envelope_gate`](RaftMsg::envelope_gate) joined with the gate of every
+    /// entry command of an `AppendEntries` (a no-op or membership-change
+    /// entry still carries a `command`, which is gated like any other).
+    #[must_use]
+    pub fn required_gate(&self) -> crate::version::Gate {
+        let envelope = self.envelope_gate();
+        match self {
+            RaftMsg::AppendEntries { entries, .. } => entries
+                .iter()
+                .fold(envelope, |g, e| g.join(e.command.required_gate())),
+            RaftMsg::PreVote { .. }
+            | RaftMsg::PreVoteResp { .. }
+            | RaftMsg::RequestVote { .. }
+            | RaftMsg::RequestVoteResp { .. }
+            | RaftMsg::AppendEntriesResp { .. }
+            | RaftMsg::InstallSnapshot { .. }
+            | RaftMsg::InstallSnapshotResp { .. }
+            | RaftMsg::Heartbeat { .. }
+            | RaftMsg::TimeoutNow { .. }
+            | RaftMsg::Quiesce { .. }
+            | RaftMsg::WakeRequest { .. }
+            | RaftMsg::ClusterProbe
+            | RaftMsg::ClusterProbeResp { .. }
+            | RaftMsg::Removed { .. }
+            | RaftMsg::RemovedAck { .. } => envelope,
         }
     }
 }

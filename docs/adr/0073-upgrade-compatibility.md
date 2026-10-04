@@ -2233,6 +2233,197 @@ release train.
    the named process exit is P2-C. The era-on flag flip on data-only nodes
    (`ControlHandle::Remote`) is P2-C too.
 
+### Amendment 2026-10-04 — P2-B as built
+
+Gate enforcement for `animus-control`, `animus-cp-data` and `animus-node`. Claims
+below were checked against the code on the `p2b-gate-enforcement` branch (off
+`083601d`). `animusd`, `animus-cli`, `animus-test`, `animus-env`, `animus-sim`, the
+operator and `website/` are untouched; their wiring is P2-C/P2-D (handoff list at
+the end).
+
+**1. Registry.** `Gate::Base` (declared first, `version() == Some(1)`, so it is
+always open: `cluster_version() >= 1`) is the gate every variant that exists today
+names. `Gate::ALL = [Base, Era]`. Variants are declared in opening order;
+`Gate::rank` (Base 0, Era 1, a version gate `v` = `v`) and `Gate::join` find the
+strictest of several gates. Era ranks below every version gate above 1: such a gate
+is reachable only after a finalize, and Finalize is itself era-only. "Is it open"
+is always `ClusterFeatures::is_open`, never derived `Ord`. `GatedCommand` is the
+trait for `required_gate`.
+
+**2. Where `required_gate` lives.** All tables are exhaustive matches with no `_`
+arm.
+
+| Enum | Table | Notes |
+|---|---|---|
+| `MetaCommand` (50) | `impl GatedCommand`, `animus-control/src/meta.rs` | `Base` for 48; `Era` for `ReportNodeVersion`, `FinalizeClusterVersion` |
+| `RaftMsg<C>` (16) | `envelope_gate` (unbounded impl) + `required_gate` (separate `C: GatedCommand` impl), `raft.rs` | `AppendEntries` = join over `entries[].command` (a no-op or config entry still carries a command, gated like any other); `InstallSnapshot` data is opaque, its content is gated by its image encoder |
+| `KvCommand` (16), `KvWire` (4) | `animus-cp-data/src/gates.rs` | all `Base`; `KvWire` recurses into `Raft` and `HeartbeatBatch` |
+| `ClientRequest` (30), `ClientResponse` (19) | `animus-node/src/wire.rs` | `ProposeSchema(cmd)` takes `cmd`'s gate, `Forwarded` recurses; responses all `Base` (`Status`/`JoinInfo`/`MetadataDelta` carry `Metadata`/mirror writes, whose content is gated by additive skipped-at-default fields and era-only entity kinds) |
+
+The bounded impl is separate on purpose: `RaftCore<C, S>` and the toy commands in
+tests keep compiling unchanged.
+
+**3. Propose-site versus send-site enforcement.** The ADR said "send choke points
+`debug_assert!`". For `AppendEntries` entries that is unsound, so enforcement splits:
+
+- *Entry gates are enforced where the entry is created* (the propose site):
+  `propose_gated` in `animus-control/src/node.rs` (the public `RaftNode::propose`
+  and every internal loop: reconcile x3, detect, version upkeep, orphan sweep) and
+  `RaftKvNode::gated_propose` in `animus-cp-data` (the four propose paths). A closed
+  gate is **refused, never appended** (`ProposeResult::NotLeader { leader: None }`,
+  the existing not-accepted shape: adding a variant would break `animusd`'s
+  exhaustive matches).
+- *Send sites check the envelope only* (`envelope_gate`, entries excluded): a
+  leader's applied view, which feeds `ClusterFeatures`, lags its own log;
+  era-start entries ship before they apply; a new leader resends entries that an
+  earlier leader proposed under a gate that was open then (gates only ever open).
+  Send sites: `drive` (immediate, gated-release and safety-net sends) and the
+  initial cluster probe in `animus-control`; read probe, initial probe, campaign
+  outs, the three drive-loop sends and the heartbeat batcher's flush in
+  `animus-cp-data` (all via `gates::encode_for_send`). `send_heartbeat` has no
+  handle; a heartbeat is `Base`, which is open on every node, so it only
+  `debug_assert`s its classification.
+- *The one exemption*: P2-A's era-start proposals (`propose_era_start`, a separately
+  named function that debug-asserts it is only handed `ReportNodeVersion`), proposed
+  under precondition P while `Gate::Era` is still closed (section 2). Era-on upkeep
+  (`era_on_proposals`) runs only when the era is active and takes the ordinary check.
+- A closed verdict first re-reads the applied cache into the handle: the apply task
+  feeds the handle just after publishing the cache, so a proposer that reacts to the
+  cache could otherwise lose a race against its own handle. `ClusterFeatures::update`
+  is now monotonic (version only rises, era flag only sets) for the same reason.
+
+**4. The metric.** `animus-env`'s `Metric` enum is out of P2-B's scope, so the
+release-build "metric" is a per-surface violation counter inside `ClusterFeatures`
+(`GateSurface`: `RaftMsg`, `MetaCommand`, `KvWire`, `KvCommand`, `ClientRequest`,
+`ClientResponse`; `violations(surface)`). `ClusterFeatures::check` counts,
+`tracing::error!`s and `debug_assert!`s a closed gate and never panics in release;
+the caller refuses to emit. P2-C exports the counters through `MetricsHandle::set`.
+
+**5. Frame versions.** `codec.rs` holds one `(frame version, Gate)` table per frame
+kind (`WIRE_VERSIONS`, `IMAGE_VERSIONS`, both `[(1, Gate::Base)]`). `encode_wire` and
+`encode_image` take the sender's `ClusterFeatures` and write the highest version whose
+gate is open; decoders accept every version up to `VERSION`. A future frame version
+adds a table row, a body arm and a decoder arm.
+
+**6. Features plumbing.** `RaftNode::features()` is fed by `EraWatch::sync` on every
+apply pass (before its unchanged-key early return). In `animus-cp-data`,
+`RaftKvNode`/`DriveState`/the apply task/`HeartbeatBatcher`/`Reconciler` carry a
+handle, a floor `ClusterFeatures::new()` from every existing entry point.
+`RaftKvNode::start_hosted_with_options(.., HostedOptions)` and
+`Reconciler::set_cluster_features` (which also re-points the batcher) are the injection
+seams.
+
+**7. Relay decision.** `is_relayable_command`: `ReportNodeVersion => true` (a data-only
+node's era-on boot self-report has no other route) and `FinalizeClusterVersion => true`
+(the admin Finalize rides the `ProposeSchema` relay, section 2). Both are era-only, so
+the allowlist is not what protects a Phase 1 peer: the sender refuses them pre-era
+(`encode_client_frame_gated`, `RaftNode::propose`) and the *receiver* must re-check
+`required_gate` against its own handle before proposing (P2-C, `animusd`
+`forwarding.rs`). `encode_client_frame<T: Serialize>` is unchanged; the new
+`encode_client_frame_gated<T: ClientGated + Serialize>(msg, &features)` returns the
+same bytes when the gate is open and an error (plus counter) otherwise.
+`SimRelayClient`'s `RelayWire` encode is not gated: it is a sim-only stand-in with no
+handle in reach, and the production relay sender is `animusd`'s.
+
+**8. Byte-identity fixtures.** The maintainer rule ("nothing B2 emits pre-era may
+differ by a single byte from Phase 1") is pinned against **Phase 1 bytes**, not
+current output. Two new fixtures were generated from a worktree of commit `941a5ea`
+(the merge of #1152, the last commit before any P2-A code merged), by running each
+test module's `#[ignore]`d generator there:
+
+| Fixture | Content | Test |
+|---|---|---|
+| `animus-control/tests/fixtures/formats/control-raft-msg/v1.bin` | u32-BE length-prefixed `serde_json::to_vec(RaftMsg<MetaCommand>)` for all 16 variants; `AppendEntries` carries 6 non-era commands plus a config entry; `InstallSnapshot` carries a `CSN1` image | `raft_msg_fixture::raft_msg_encoding_is_byte_identical_to_the_phase1_fixture` |
+| `animus-node/tests/fixtures/formats/client-frame/v1.bin` | `encode_client_frame` of all 30 `ClientRequest` and 19 `ClientResponse` variants (`ProposeSchema` with a non-era command, `Status` with era-0 `Metadata`) | `format_fixtures::client_frames_are_byte_identical_to_the_phase1_fixture` (plain and gated encoders, floor and era-0 handles) |
+
+Already covered and untouched since `941a5ea` (checked with `git diff`): `raftkv-wire/v1.bin`
+and `raftkv-image/v1.bin` (`format_fixture_tests::pre_era_encoders_are_byte_identical_*`
+encodes both under a floor handle, one fed an era-0 `Metadata`, and one fed an era-on
+`Metadata`, asserting frame version 1 and bytes equal to the fixture), and the era-0
+`Metadata` encoding (`era_0_metadata_encoding_is_byte_identical_to_the_v1_fixture`).
+Both fixture directories are registered `OffDisk` in `animus-test`'s upgrade-restart
+registry (`animus-test/src/upgrade/transcode.rs`, `EMBEDDED`), which its tier-0
+completeness test requires of every `tests/fixtures/formats/<dir>`: a **two-line edit
+outside P2-B's crate list**, made because the per-push gate fails without it.
+Each new test also has an exhaustiveness guard (a `match` naming every variant plus a
+count), so a new variant fails to compile or fails the test until it is added.
+
+**9. G/L/F review of the section 8 inventory** (checked against the code; `animusd`
+rows were not re-read since that crate is out of scope).
+
+| Row | Result |
+|---|---|
+| Control `RaftMsg` | G confirmed. `required_gate` plus the envelope/entry split (3). |
+| `MetaCommand` | G confirmed; relay allowlist updated for the two era commands (7). |
+| `Metadata`/`Member` | G confirmed; the version record is `Metadata.node_versions`/`cluster_version` (P2-A note 1), not `Member` fields: the row text is stale. |
+| `CSN1`/`InstallSnapshot` | G confirmed. The envelope is `Base`; era content (the `NodeVersion` entity kind, the version counter) appears only once the replicated state holds it. No encoder branch exists or is needed today. |
+| `MetadataDelta`/mirror | G confirmed (P2-A note 3: unknown kinds are skipped, not panics; only a changed shape of an existing kind hits an `expect`). |
+| `KvWire`, `KvCommand`, tablet image | G confirmed; frame version from the gate (5). `KvCommand` has two encodings (binary on the wire, `serde_json` in the WAL), so a future variant needs both. |
+| `ClientRequest`/`ClientResponse` | G confirmed (2, 7). |
+| Handshakes, dynamo/admin rows | Not re-verified here (`animus-env`/`animusd`). |
+| `control-wal`, `shared-wal`, `raftkv-wal`, LSM, mirror files, `ClusterConfig` | L confirmed for the control/cp-data persisted formats: no other node reads them. |
+| Backup/PITR/export | F unchanged. |
+
+Flagged, not fixed (outside this workstream or unlisted in section 8):
+
+- **Unlisted cross-node surface: `SegmentWire`** (`animus-cp-data/src/cluster_segment_store.rs`,
+  `serde_json` enum on the reserved `SEGMENT_STREAM`/`BACKUP_SEGMENT_STREAM`). It is a
+  seventh enum with the same whole-message-failure hazard as the six gated ones and
+  is not in section 8 or in `Gate` coverage. Classify it G, or document why a new
+  variant can never ship without a split release.
+- `RelayWire` (`sim_relay.rs`) is sim-only and wraps the already-gated request and
+  response types; no action.
+- Stream ids (`reserved_streams.rs`) are a surface too: a reserved stream that a B2 node
+  starts sending on toward a Phase 1 node would be unconsumed there. Any new reserved
+  stream must be gated like a variant.
+
+**10. P2-A observations.**
+(a) *`ClusterFeatures` had no consumers on `main`*: confirmed, and this PR is its first
+(`RaftNode::features()`).
+(b) *Finalize's required set versus P's set*: confirmed in code, **real but narrow, not
+fixed here.** `Metadata::required_version_set()` is `members` union `node_addrs` keys, and
+both the era-start reports and `FinalizeClusterVersion`'s apply check use it. Precondition
+P also requires every control voter and learner (`era_start_proposals`'
+`view.required.union(control_nodes)`) to be observed on a B2 range. A control voter or
+learner that is in the Raft config but in neither `members` nor `node_addrs` therefore
+blocks P, but once the era is on it can never get a `ReportNodeVersion` record (apply
+rejects "version report from an unregistered node"), and Finalize does not count it. So a
+Finalize can pass over such a node whose range might not contain the target; it would then
+halt at startup under the range check. `Metadata` does not know the Raft voter set, so
+the pure apply check cannot close it; the fix belongs on the leader's pre-check (the
+admin `blockers` list, P2-C: also list any control voter/learner without a record) or in
+making every control node register (`animusd` self-registers every node today, which is
+why this is unlikely in production). Left to P2-C with a test.
+
+**11. Handoff.**
+- *P2-C*: switch `animusd`'s `write_frame` to `encode_client_frame_gated` (with the node's
+  handle); add the relay receiver's `required_gate` check (`forwarding.rs`, around the
+  `ProposeSchema` handler) before proposing a relayed command; inject
+  `RaftNode::features()` into `RaftKvNode`/`Reconciler`
+  (`Reconciler::set_cluster_features`, `start_hosted_with_options`) and feed a handle on
+  data-only nodes from the mirror (`ControlHandle::Remote`); export
+  `ClusterFeatures::violations` as metrics; add the control-voter/learner blockers
+  (10b); classify `SegmentWire` (9).
+- *P2-D*: a negative control that emits an ungated variant and is caught by the
+  `debug_assert!`/counter; per-gate tests can reuse `Gate::ALL`, the frame-version
+  tables' selector (`select_frame_version`, tested on a synthetic ladder) and the
+  `ClusterFeatures` counters; the delivery assertion ("no Phase 1 profile node receives
+  `required_gate > Base`") can use `RaftMsg::required_gate`/`KvWire::required_gate`, the
+  *full* (entries-included) gates, on the receiving side.
+
+**12. Integration with P2-D (added when the two branches were merged).** P2-D was built
+without P2-B; the merge made these changes. (a) `sim_versions`' provisional classifier is
+gone: the capped decode uses `RaftMsg::required_gate` (full, entries-included), and
+`BinaryProfile::accepts(Gate::Base)` is always true (a Phase 1 profile's max known
+version is 0, so the version arm alone would have rejected every `Base` message).
+(b) The N1 negative controls (control tier and `SimCluster` tier) emit the premature
+`ReportNodeVersion` through `RaftNode::propose_ungated_for_negative_control`
+(`cfg(any(test, feature = "sim-versions"))` only), because `propose` now refuses a
+closed-gate command and would also trip the `debug_assert!`, leaving the control
+vacuous. Production gating is unchanged. (c) The era-start path still goes through
+`propose_era_start`. The P2-D amendment's "P2-B is not on main" caveat is obsolete; its
+N2-N4 and data-plane/`animus-node` tiers remain open (P2-C).
+
 ### Amendment 2026-10-04 — P2-D as built (mixed-version corpus)
 
 Built against `main` plus P2-A; P2-B (gate enforcement, `required_gate` tables)

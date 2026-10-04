@@ -3087,3 +3087,29 @@ literal now needs `..Default::default()` (or a `regions` field). Corpus:
 `docs/lessons/testing/2026-10-04-measure-where-the-old-setting-fails-before-
 building-its-negative-control.md`: the LAN-forced control only bites on the
 re-election cells).
+
+## Gate enforcement (ADR 0073 Phase 2, P2-B)
+
+- **`gates.rs`**: exhaustive `GatedCommand for KvCommand` (all `Base`) and
+  `KvWire::envelope_gate`/`required_gate`; the shared helpers `encode_for_send`
+  (check the frame's envelope gate, then encode at the gate-selected frame
+  version; `None` = drop) and `check_propose`. Every `env.send_stream` of a `KvWire`
+  (read probe, initial probe, campaign outs, the three drive-loop sites, the
+  heartbeat batcher's flush) goes through `encode_for_send`; the four
+  `core.propose` sites (`propose_ordered`, `_aux`, `propose_kind_eval`,
+  `propose_kind_eval_batch`) go through `RaftKvNode::gated_propose`. As in the
+  control plane, **send sites check the envelope only; `AppendEntries` entry gates
+  are enforced at propose.**
+- **`codec.rs`**: `WIRE_VERSIONS`/`IMAGE_VERSIONS` tables `(frame version, Gate)`;
+  `encode_wire(w, &features)` / `encode_image(entries, max_ts, &features)` write
+  the highest version whose gate is open; decoders accept every version up to
+  `VERSION`. Only v1 (`Gate::Base`) exists, so a B2 encoder emits Phase 1 bytes
+  under any handle (`format_fixture_tests::pre_era_encoders_are_byte_identical_*`).
+  A new frame version = a table row + body arm + decoder arm (old one to
+  `legacy`) + fixture.
+- **Features plumbing**: `RaftKvNode::features()`; every existing `start_*` uses a
+  floor `ClusterFeatures::new()`; `RaftKvNode::start_hosted_with_options(.., HostedOptions)`
+  injects the control-fed handle; `host::Reconciler::set_cluster_features` (also
+  re-points its `HeartbeatBatcher` via `set_features`) is the production seam P2-C
+  calls with `RaftNode::features()`. A hosted group keeps the handle it started with.
+

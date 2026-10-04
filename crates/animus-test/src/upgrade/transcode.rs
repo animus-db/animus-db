@@ -407,6 +407,10 @@ pub static EMBEDDED: &[Embedded] = &[
         "animus-cp-data",
         2,
     ),
+    // ADR 0073 Phase 2 (P2-B): wire fixtures (never on disk) for the control
+    // `RaftMsg` JSON and the client frames; `OffDisk`, like `raftkv-wire`.
+    emb("control-raft-msg", Carrier::OffDisk, "animus-control"),
+    emb("client-frame", Carrier::OffDisk, "animus-node"),
     emb("raftkv-wire", Carrier::OffDisk, "animus-cp-data"),
     emb("raftkv-image", Carrier::OffDisk, "animus-cp-data"),
     emb(
