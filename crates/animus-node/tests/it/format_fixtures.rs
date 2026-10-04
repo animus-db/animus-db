@@ -404,6 +404,9 @@ fn every_response() -> Vec<(&'static str, ClientResponse)> {
                     .into_iter()
                     .collect(),
                 admin_addrs: vec!["127.0.0.1:9301".parse().unwrap()],
+                // P2-C's additive field at its default: skipped on the wire, so
+                // the bytes stay equal to the Phase 1 fixture.
+                cluster_version: 0,
             },
         ),
         (
