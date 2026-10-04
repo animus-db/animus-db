@@ -4,11 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Performance — AnimusDB</title>
-<meta name="description" content="No benchmarks yet, and why. The cost model in round trips, what scales and what doesn't, and the methodology we're committing to.">
+<meta name="description" content="No published numbers yet, and why. The cost model in round trips, what scales and what doesn't, and the benchmark methodology and load generator we will publish results with.">
 <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
 <link rel="canonical" href="https://animusdb.io/performance.html">
 <meta property="og:title" content="Performance — AnimusDB">
-<meta property="og:description" content="No benchmarks yet, and why. The cost model in round trips, what scales and what doesn't, and the methodology we're committing to.">
+<meta property="og:description" content="No published numbers yet, and why. The cost model in round trips, what scales and what doesn't, and the benchmark methodology and load generator we will publish results with.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Work+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap">
@@ -89,9 +89,9 @@
 
 <div class="wrap ref-head" style="--rh-pt:38px;--rh-pb:20px">
   <span class="kicker">Performance</span>
-  <h1>There are no benchmarks. Here's everything else.</h1>
+  <h1>There are no published numbers yet. Here's everything else.</h1>
   <p style="font-size:15.5px;color:var(--ink-78,var(--ink-72));max-width:740px;font-style:italic">A page with no numbers on it invites the assumption that the numbers are bad. The truthful position is narrower than that: AnimusDB has not been benchmarked at scale, so any figure we published today would be measuring an unfinished storage path — and would be quoted back at us for years.</p>
-  <p style="font-size:15.5px;color:var(--ink-78,var(--ink-72));max-width:740px;font-style:italic;margin-bottom:20px">What we can give you now is the cost model. It is derived from the architecture rather than measured, which means you can check it against the design instead of trusting us.</p>
+  <p style="font-size:15.5px;color:var(--ink-78,var(--ink-72));max-width:740px;font-style:italic;margin-bottom:20px">What we can give you now is the cost model, which is derived from the architecture rather than measured, so you can check it against the design instead of trusting us — and the measurement method and the load generator, which are built and in the repository, so you can check how any number will be produced before there is one.</p>
 </div>
 
 <section class="alt">
@@ -153,31 +153,68 @@
   </div>
 </section>
 
+<section class="alt">
+  <div class="wrap">
+    <span class="kicker">How we measure</span>
+    <h2>The method is built. The numbers are not.</h2>
+    <p class="body-text">The load generator is <code>animus-bench</code>, a separate client that drives a cluster over the real DynamoDB wire — HTTP/1.1 JSON, every request SigV4-signed — not an in-process shortcut. The full procedure is in <a href="https://github.com/animus-db/animus-db/blob/main/docs/benchmarks.md">docs/benchmarks.md</a> and the design record is <a href="https://github.com/animus-db/animus-db/blob/main/docs/adr/0074-published-benchmarks.md">ADR 0074</a>.</p>
+    <div class="cardgrid c2" style="margin-top:16px">
+      <div class="lcard"><h3>What it does</h3><ul>
+        <li><strong>YCSB A–F</strong> mapped onto DynamoDB operations: <code>GetItem</code>, <code>UpdateItem</code>, <code>PutItem</code>, <code>Query</code>, and workload F's <code>GetItem</code> plus a conditional <code>UpdateItem</code>. Zipfian or uniform keys; record count and item size are fixed flags and are written into the results.</li>
+        <li><strong>Open-loop arrivals.</strong> Operation <em>i</em> is scheduled at <code>start + i/rate</code> whatever the server is doing, and latency is measured from that <em>intended</em> time, so a stall is charged to every request that should have been sent during it (coordinated-omission correction). The latency a closed-loop client would have seen is recorded beside it, so you can see how much the correction matters.</li>
+        <li><strong>HdrHistogram</strong> latency to three significant figures: p50, p90, p99, p99.9, p99.99 and max per operation class. Errors are counted by kind, not folded into latency; operations the client could not even start are reported as abandoned, never dropped.</li>
+        <li><strong><code>ConsistentRead: true</code> and <code>false</code> are separate runs</strong> on the same seeded operation stream, never blended.</li>
+        <li><strong>Phases:</strong> load, a discarded warm-up, steady state (or a throughput sweep to find the knee), then a degraded run — the tablet leader, a follower or a chosen node is killed mid-run, with a healthy baseline before it and a recovery phase after — on the whole workload mix.</li>
+        <li><strong>A results file</strong> (<code>animus-bench/v1</code> JSON) with the git SHA, exact command line, seed, client host, cluster topology and replica placement read back from <code>/admin</code>, and the methodology itself.</li>
+      </ul></div>
+      <div class="lcard"><h3>What it does not do (yet)</h3><ul>
+        <li><strong>No TLS.</strong> The generator speaks plain TCP; every results file records <code>tls: false</code>, and TLS-on performance cannot be measured yet.</li>
+        <li><strong>Workload E is not YCSB's scan.</strong> A DynamoDB <code>Query</code> cannot cross partition keys, so E is a short <code>Query</code> inside one 100-record partition. It measures a range read on one tablet, not a cross-partition scan.</li>
+        <li><strong>Encryption at rest and <code>--shared-wal</code> are not reported by <code>/admin</code></strong>, so an external run records them as unknown and the publisher has to state them.</li>
+        <li><strong>Nothing about the servers' hardware is detected.</strong> The tool records the client host; instance type, disk and network of the cluster are stated alongside the file.</li>
+        <li><strong>Not measured at all:</strong> cross-partition <code>Scan</code>, transactions, batch operations, secondary indexes, Streams and TTL overhead, backup overhead.</li>
+        <li><strong>The separate-hosts topology is supported but has never been run.</strong> Only same-host development runs have.</li>
+      </ul></div>
+    </div>
+    <p class="body-text" style="margin-top:16px"><strong>What counts as a publishable run.</strong> The generator and the cluster must be on different hosts: a run where the tool launched the cluster itself, or where every endpoint is a loopback address, is marked <code>"publishable": false</code> in its own output with the reason. That flag is a necessary condition, not a certificate — it does not check the rest, which we require before publishing: three nodes at replication factor 3 as the baseline plus one scale-out point, a named instance type, disk model and network for both sides, the leader-kill and follower-kill runs present, and the raw JSON committed or attached to a release.</p>
+    <p class="body-text"><strong>Regression tracking</strong> is deliberately modest. A manually triggered workflow builds a base and a candidate and runs both on the same host, interleaved, reporting the run-to-run spread and flagging only changes beyond a stated threshold; a lone outlier is a rerun, not a verdict. A benchmark is never a pass/fail latency assertion in a test, and a trend line needs a dedicated, fixed runner that does not exist yet.</p>
+  </div>
+</section>
+
 <section>
   <div class="wrap">
     <span class="kicker">What we will publish</span>
-    <h2>The rules we're committing to before we have results.</h2>
-    <p class="body-text">Publishing the methodology first is a way of making it expensive to cherry-pick later. When benchmarks land, they will follow this shape.</p>
+    <h2>The rules we committed to before we had results.</h2>
+    <p class="body-text">Publishing the methodology first is a way of making it expensive to cherry-pick later. Where each rule stands today is in the right-hand column.</p>
     <div class="table-scroll" style="margin-top:14px">
       <table>
-        <thead><tr><th style="width:220px">Commitment</th><th>What it means</th></tr></thead>
+        <thead><tr><th style="width:220px">Commitment</th><th>What it means</th><th style="width:34%">Where it stands</th></tr></thead>
         <tbody>
-          <tr><td>Disclosed hardware</td><td>Instance types or machine specs, disk model, network topology, and the placement of every replica.</td></tr>
-          <tr><td>Tail latency, not averages</td><td>p50, p99 and p99.9 for each operation class. A mean latency figure for a distributed database is close to meaningless.</td></tr>
-          <tr><td>Both read modes, separately</td><td>Linearizable and eventually-consistent reads reported apart, never blended into one number.</td></tr>
-          <tr><td>A failure case in every run</td><td>Numbers taken while a node is down, and during a leader election, not only on a healthy cluster.</td></tr>
-          <tr><td>Reproducible</td><td>Workload definitions, configuration and raw output in the repository, so you can re-run them.</td></tr>
-          <tr><td>No comparison charts against DynamoDB</td><td>Comparing self-hosted hardware to a metered managed service produces whichever answer the author wanted. We're not going to do it.</td></tr>
+          <tr><td>Disclosed hardware</td><td>Instance types or machine specs, disk model, network topology, and the placement of every replica.</td><td>Replica placement and the client host are captured into the results file. Server instance type, disk and network are stated by whoever publishes the run; the tool does not detect them.</td></tr>
+          <tr><td>Tail latency, not averages</td><td>p50, p99 and p99.9 for each operation class. A mean latency figure for a distributed database is close to meaningless.</td><td>Built: p50 to p99.99 and max per operation class, measured from the intended send time.</td></tr>
+          <tr><td>Both read modes, separately</td><td>Linearizable and eventually-consistent reads reported apart, never blended into one number.</td><td>Built: each read workload runs once per mode.</td></tr>
+          <tr><td>A failure case in every run</td><td>Numbers taken while a node is down, and during a leader election, not only on a healthy cluster.</td><td>Built: a leader-, follower- or node-kill run with baseline, degraded and recovery phases. It needs a way to kill a node; without one the run is skipped and the file says so.</td></tr>
+          <tr><td>Reproducible</td><td>Workload definitions, configuration and raw output in the repository, so you can re-run them.</td><td>The generator, workload definitions, seed and results format are in the repository. A hardware run has not been done, so there is no raw output from one to commit yet.</td></tr>
+          <tr><td>No comparison charts against DynamoDB</td><td>Comparing self-hosted hardware to a metered managed service produces whichever answer the author wanted. We're not going to do it.</td><td>Unchanged. The tool makes no comparison, and its results say so.</td></tr>
         </tbody>
       </table>
     </div>
-    <div class="aside">Until then, the honest summary is the one on the status section of the overview: <strong>not benchmarked at scale, and therefore no performance claims.</strong> If you need numbers to proceed, AnimusDB is not ready for you yet, and that is the correct conclusion to draw.</div>
-    <p class="body-text" style="margin-top:16px">The reproducible bench suite this table commits to already lives in the repository — <code>cargo bench -p animusd</code> runs it against a real in-process cluster and prints p50/p99/p99.9/mean latency and throughput per operation class, <code>ConsistentRead</code>'s two read paths reported apart, and a failure phase (a node killed mid-run) in every pass. What isn't here yet is a published number from disclosed hardware: run it yourself and you'll see exactly what it measures, on your own machine, before we publish anything drawn from ours.</p>
+    <div class="aside">Until a run on dedicated hardware is published, the honest summary is the one on the status section of the overview: <strong>not benchmarked at scale, and therefore no performance claims.</strong> If you need numbers to proceed, AnimusDB is not ready for you yet, and that is the correct conclusion to draw.</div>
+    <p class="body-text" style="margin-top:16px">You can run the generator yourself today against a cluster you start (<code>cargo run --release -p animus-bench -- --help</code>). If it launches the cluster on the same machine it will say <code>publishable: false</code>, and you should read that as meaning it: such figures measure your machine, not the database. <code>cargo bench -p animusd</code> is a separate, older in-process smoke — unauthenticated, closed-loop, no coordinated-omission correction — and its numbers are not comparable to the generator's.</p>
     <div class="ctalink-row">
       <a class="ctalink" href="architecture.html">How the architecture produces these costs →</a>
       <a class="ctalink" href="how-it-works.html">Back to how it works →</a>
       <a class="ctalink" href="index.html#status">Where the project stands →</a>
     </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <span class="kicker">Results</span>
+    <h2>None published yet.</h2>
+    <p class="body-text">There is no results table on this page because we do not have a result we are willing to put one beside. The only runs so far were on a development machine with the load generator and the servers sharing it, which the tool itself marks non-publishable, and a figure from such a run would measure that machine.</p>
+    <p class="body-text">The first curated run needs a dedicated client host and a real multi-host cluster of named hardware, and it will be the first time the separate-hosts path is exercised end to end. When it exists, this section will carry the raw results files, the three-node baseline and a scale-out point, the leader-kill and follower-kill runs, the hardware named in full, and the exact command lines.</p>
   </div>
 </section>
 
