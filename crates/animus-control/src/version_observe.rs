@@ -146,6 +146,10 @@ pub struct OwnVersion {
     pub range: Option<VersionRange>,
     /// Build string recorded for this node.
     pub build: String,
+    /// Test-only capped decode (ADR 0073 P2-D): installed by
+    /// `RaftNode::set_binary_profile`; `None` (the default) is inert.
+    #[cfg(any(test, feature = "sim-versions"))]
+    pub sim_cap: Option<crate::sim_versions::SimCap>,
 }
 
 impl Default for OwnVersion {
@@ -153,6 +157,8 @@ impl Default for OwnVersion {
         Self {
             range: None,
             build: env!("CARGO_PKG_VERSION").to_string(),
+            #[cfg(any(test, feature = "sim-versions"))]
+            sim_cap: None,
         }
     }
 }
@@ -400,6 +406,7 @@ mod tests {
         let own = OwnVersion {
             range: None,
             build: String::new(),
+            ..OwnVersion::default()
         };
         let now = Nanos(1_000_000_000);
         let mut obs = BTreeMap::new();
