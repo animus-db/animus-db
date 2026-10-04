@@ -20,7 +20,7 @@ animus-env.workspace = true
 animus-sim.workspace = true
 # `src/upgrade/transcode.rs` (library code of this test-only crate, never a
 # production dependency) calls the `legacy-encoders`-gated `reframe_to_v1`.
-animus-control = { workspace = true, features = ["legacy-encoders"] }
+animus-control = { workspace = true, features = ["legacy-encoders", "sim-versions"] }
 # Likewise `reframe_wal_to_v1` (the `lsm-wal` v2 -> v1 transcode).
 animus-storage = { workspace = true, features = ["legacy-encoders"] }
 futures.workspace = true
@@ -35,7 +35,7 @@ animus-env = { workspace = true, features = ["legacy-encoders", "s3"] }
 # S-08 M3: `s3_fault_corpus` drives `S3SegmentStore<FaultyTransport<FakeS3>, SimEnv>`.
 # No `prod` anywhere here: the `s3` feature needs no tokio.
 animus-s3 = { workspace = true, features = ["fake"] }
-animus-control = { workspace = true, features = ["legacy-encoders"] }
+animus-control = { workspace = true, features = ["legacy-encoders", "sim-versions"] }
 animus-cp-data = { workspace = true, features = ["legacy-encoders"] }
 animus-dynamo.workspace = true
 animus-item.workspace = true

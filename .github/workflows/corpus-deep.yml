@@ -100,10 +100,6 @@ on:
         description: "Seeds per scenario (ANIMUS_EXPORT_IMPORT_SEEDS, ADR 0068 S3 export/import fault corpus)"
         required: false
         default: "40"
-      s3_fault_seeds:
-        description: "Seeds per cell (ANIMUS_S3_FAULT_SEEDS, S-08 M3 S3 store retry/fault-injection corpus)"
-        required: false
-        default: "100"
       heartbeat_seeds:
         description: "Seeds per scenario (ANIMUS_HEARTBEAT_SEEDS, ADR 0044 phase 2 heartbeat-batcher fault corpus)"
         required: false
@@ -520,7 +516,11 @@ jobs:
         continue-on-error: true
         timeout-minutes: 10
         env:
-          ANIMUS_S3_FAULT_SEEDS: ${{ github.event.inputs.s3_fault_seeds || '100' }}
+          # Fixed depth, no `workflow_dispatch` input: GitHub caps a
+          # workflow at 25 dispatch inputs and this file is at the cap.
+          # The corpus runs 12 cells x 100 seeds in ~2 s, so there is
+          # nothing to tune per dispatch.
+          ANIMUS_S3_FAULT_SEEDS: '100'
         run: |
           cargo test -p animus-test --test it s3_fault_corpus:: -- --nocapture
 
@@ -597,8 +597,8 @@ jobs:
       # catalog row), stopped cleanly / by a crash / by a torn-tail crash,
       # transcoded on every node's disk (identity today), restarted with
       # strict engine opens. It shares ANIMUS_UPGRADE_RESTART_SEEDS with tier 1
-      # (ANIMUS_UPGRADE_SEEDS is reserved for Phase 2) but takes its own
-      # workflow input, since a tier-2 seed costs ~7.6s (3 cells) against
+      # (ANIMUS_UPGRADE_SEEDS is the Phase 2 mixed-version knob, below) but
+      # takes its own step, since a tier-2 seed costs ~7.6s (3 cells) against
       # tier 1's ~1.1s. Measured: K=20 is 152s wall in debug (60 cells), so
       # the nightly K=50 is ~6.5 minutes; timeout sized ~4x that plus the
       # animusd test-binary build.
@@ -611,6 +611,36 @@ jobs:
           # workflow_dispatch at 25 inputs and this file is already at the cap.
           ANIMUS_UPGRADE_RESTART_SEEDS: '50'
         run: cargo test -p animusd --lib sim_cluster_upgrade_corpus -- --nocapture
+
+      # ADR 0073 Phase 2 (P2-D), pure tier: control-plane RaftNodes playing
+      # Phase1/B2/Release(N) binary profiles (capped decode + rejection log)
+      # through rolling upgrades with leader kills, partitions, member-down,
+      # Phase 1 arrivals after the era, early Finalize and out-of-range halts,
+      # plus negative control N1. Pure functions of their seeds; replay with
+      # ANIMUS_SEED (+ ANIMUS_UPGRADE_CELL). K=20 is ~53s wall in debug, so the
+      # nightly K=100 is ~4.5 minutes.
+      - name: deep mixed-version corpus, control tier (ADR 0073 Phase 2, P2-D)
+        id: upgrade_mixed
+        continue-on-error: true
+        timeout-minutes: 20
+        env:
+          # Fixed depth, not a workflow_dispatch input (the 25-input cap).
+          ANIMUS_UPGRADE_SEEDS: '100'
+        run: |
+          cargo test -p animus-control --test it version_mixed_corpus:: -- --nocapture
+
+      # ADR 0073 Phase 2 (P2-D), SimCluster tier: rolling Phase 1 -> B2 node by
+      # node over the linearizable DynamoDB-wire workload with control-leader
+      # kills, a data-only node down at precondition P, and negative control
+      # N1. K=20 is ~2 minutes wall in debug (2 test threads), so the nightly
+      # K=40 is ~4-5 minutes; timeout sized ~4x plus the animusd build.
+      - name: deep mixed-version corpus, SimCluster tier (ADR 0073 Phase 2, P2-D)
+        id: upgrade_mixed_cluster
+        continue-on-error: true
+        timeout-minutes: 30
+        env:
+          ANIMUS_UPGRADE_SEEDS: '40'
+        run: cargo test -p animusd --lib sim_cluster_mixed_version -- --nocapture
 
       # Issue #1064/#1092: a late-joining learner needing a real multi-chunk
       # InstallSnapshot under a writer that never stops, one corpus seed per
@@ -667,11 +697,13 @@ jobs:
             [wal_rewrite_crash]="${{ steps.wal_rewrite_crash.outcome }}"
             [upgrade_restart]="${{ steps.upgrade_restart.outcome }}"
             [upgrade_restart_cluster]="${{ steps.upgrade_restart_cluster.outcome }}"
+            [upgrade_mixed]="${{ steps.upgrade_mixed.outcome }}"
+            [upgrade_mixed_cluster]="${{ steps.upgrade_mixed_cluster.outcome }}"
             [learner_snapshot_livelock]="${{ steps.learner_snapshot_livelock.outcome }}"
           )
           failed=0
           failed_names=()
-          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner reconfigure_drop inplace_split backup pitr lsm_crash lsm_disk_fault lsm_encrypted segment_store_encrypted control simcluster dynamo_wire export_import s3_fault heartbeat sharedwal wal_rewrite_crash upgrade_restart upgrade_restart_cluster learner_snapshot_livelock; do
+          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner reconfigure_drop inplace_split backup pitr lsm_crash lsm_disk_fault lsm_encrypted segment_store_encrypted control simcluster dynamo_wire export_import s3_fault heartbeat sharedwal wal_rewrite_crash upgrade_restart upgrade_restart_cluster upgrade_mixed upgrade_mixed_cluster learner_snapshot_livelock; do
             outcome="${outcomes[$name]}"
             echo "${name}: ${outcome}"
             if [ "${outcome}" != "success" ]; then
