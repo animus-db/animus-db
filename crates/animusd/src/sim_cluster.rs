@@ -675,6 +675,7 @@ async fn discover_join_info_via_relay<E: Env, R: RelayClient>(
             client_route,
             intra_route,
             admin_addrs,
+            ..
         } => Ok((control_ids, peers, client_route, intra_route, admin_addrs)),
         other => Err(format!(
             "seed returned an unexpected reply to JoinInfo: {other:?}"
@@ -3170,6 +3171,65 @@ impl SimCluster {
             .control_index_of(node)
             .unwrap_or_else(|| panic!("node {node} is not control-bearing"));
         self.controls[idx].version_observations()
+    }
+
+    /// ADR 0073 Phase 2 (P2-C): make `node` run "a binary" supporting
+    /// `range` (`None` = a Phase 1 binary: empty handshake `ext`, never
+    /// evaluates the era, never self-reports). Does all three things a binary
+    /// is: the node's own version profile (what its `version_wiring_loop` and
+    /// admin view use), its control `RaftNode`'s own range + build (when
+    /// control-bearing; a data-only node has no `RaftNode`), and the
+    /// simulated network `ext` its peers observe (`Simulator::
+    /// set_network_ext_for`). Takes effect immediately, no restart needed.
+    pub(crate) fn set_node_version(&mut self, node: u64, range: Option<animus_control::version::VersionRange>) {
+        let ctx = self.shared.ctx(node);
+        let build = version_wiring::BUILD.to_string();
+        ctx.edge.version().set_profile(version_wiring::VersionProfile {
+            range,
+            build: build.clone(),
+        });
+        if let Some(idx) = self.control_index_of(node) {
+            self.controls[idx].set_own_build(build.clone());
+            self.controls[idx].set_own_version_range(range);
+        }
+        self.sim.set_network_ext_for(
+            ctx.env.node_id(),
+            version_wiring::ext_for(range, &build),
+        );
+    }
+
+    /// Set ONLY a control-bearing node's `RaftNode` own range, leaving its
+    /// profile and network `ext` alone — a test hook to switch the leader's
+    /// era upkeep (`era_on_proposals`) off while the (sticky) era stays on, so
+    /// a test can prove a node's own self-report lands through the relay path
+    /// and not merely through the leader noticing a changed `ext`.
+    pub(crate) fn set_raft_own_range(
+        &mut self,
+        node: u64,
+        range: Option<animus_control::version::VersionRange>,
+    ) {
+        let idx = self
+            .control_index_of(node)
+            .unwrap_or_else(|| panic!("node {node} is not control-bearing"));
+        self.controls[idx].set_own_version_range(range);
+    }
+
+    /// [`set_node_version`](Self::set_node_version) for every node.
+    pub(crate) fn set_all_node_versions(&mut self, range: Option<animus_control::version::VersionRange>) {
+        for node in 0..self.nodes as u64 {
+            self.set_node_version(node, range);
+        }
+    }
+
+    /// The node's own `ClusterFeatures` handle (ADR 0073 Phase 2, P2-C): the
+    /// one handle every gated emitter consults.
+    pub(crate) fn features(&self, node: u64) -> animus_control::version::ClusterFeatures {
+        self.shared.ctx(node).edge.version().features.clone()
+    }
+
+    /// The node's version halt reason, if its feeder latched one.
+    pub(crate) fn version_halt(&self, node: u64) -> Option<String> {
+        self.shared.ctx(node).edge.version().halt.get()
     }
 
     /// **C-13 / ADR 0061 rung M PR 6**: `(commit_index, engine_applied_index)`

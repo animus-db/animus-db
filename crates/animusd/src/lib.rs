@@ -12292,6 +12292,127 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// `admin_remove_control_member`'s own self-removal arm polls against —
     /// a transfer that never completes in time surfaces as its own,
     /// distinct timeout error rather than a bare "not the leader" refusal.
+    /// `GET /admin/cluster-version` body (ADR 0073 Phase 2, P2-C): served by
+    /// any node from its own view of `Metadata`; the control leader also
+    /// reports its live observation table (`observed_range`), every other
+    /// node reports `null` there.
+    pub(crate) fn admin_cluster_version_view(&self) -> serde_json::Value {
+        let meta = self.effective_metadata();
+        let observed = self.edge.leader_handle().map(|l| l.version_observations());
+        version_wiring::cluster_version_view(&meta, &self.edge.version().profile(), observed.as_ref())
+    }
+
+    /// `POST /admin/cluster-version/finalize` (ADR 0073 Phase 2, P2-C):
+    /// raise the cluster version by exactly one. **Local-control-leader-only,
+    /// not relayed** (the ADR 0037 `admin_remove_member` pattern; Finalize is
+    /// irreversible, so it is deliberately not reachable through the generic
+    /// relay): leadership is checked FIRST (a follower's replica lags, so any
+    /// metadata-dependent refusal there would be a false answer), then the
+    /// era, the one-step rule, the `expected` CAS and the blockers, computed
+    /// from the leader's own `Metadata`. `Accepted` only means appended, so
+    /// success is confirmed by observing the cluster version reach `target`
+    /// (the CAS target, unambiguous).
+    pub(crate) async fn admin_finalize_cluster_version(
+        &self,
+        to: Option<u32>,
+        expected: Option<u32>,
+    ) -> (u16, serde_json::Value) {
+        let Some(leader) = self.edge.leader_handle() else {
+            return (409, serde_json::json!({"error": self.not_leader_error()}));
+        };
+        let meta = leader.metadata();
+        if !meta.versioning_active() {
+            return (
+                409,
+                serde_json::json!({"error": "version era not active: not every member has reported its version yet"}),
+            );
+        }
+        let active = meta.cluster_version();
+        let target = active + 1;
+        if let Some(to) = to
+            && to != target
+        {
+            return (
+                400,
+                serde_json::json!({"error": format!(
+                    "the cluster version is raised one step at a time: the next version is \
+                     {target} (requested {to})"
+                )}),
+            );
+        }
+        if let Some(expected) = expected
+            && expected != active
+        {
+            return (
+                409,
+                serde_json::json!({"error": format!(
+                    "expected cluster version {expected} but the active version is {active}"
+                )}),
+            );
+        }
+        let own = self.edge.version().profile().range.unwrap_or_else(animus_control::version::own_range);
+        if target > own.max {
+            return (
+                409,
+                serde_json::json!({"error": format!(
+                    "this binary supports cluster versions up to {} and cannot finalize {target}",
+                    own.max
+                )}),
+            );
+        }
+        // ADR 0073 decision 6: Down / Leaving / never-activated Joining
+        // members block regardless of any recorded range. `Metadata::apply`
+        // does NOT enforce the status half, so this admin pre-check (racy,
+        // operator-level) is its only enforcement today; apply-level
+        // enforcement is tracked in issue #1168.
+        let blockers = version_wiring::finalize_blockers(&meta, target);
+        if !blockers.is_empty() {
+            let named: Vec<String> = blockers
+                .iter()
+                .map(|b| format!("{}: {}", b.node, b.reason))
+                .collect();
+            return (
+                409,
+                serde_json::json!({
+                    "error": format!(
+                        "cannot finalize cluster version {target}: {}",
+                        named.join("; ")
+                    ),
+                    "blockers": blockers
+                        .iter()
+                        .map(|b| serde_json::json!({"node": b.node.to_string(), "reason": b.reason}))
+                        .collect::<Vec<_>>(),
+                }),
+            );
+        }
+        if !matches!(
+            leader.propose(MetaCommand::FinalizeClusterVersion {
+                expected: active,
+                target,
+            }),
+            ProposeResult::Accepted { .. }
+        ) {
+            return (409, serde_json::json!({"error": self.not_leader_error()}));
+        }
+        let deadline = self.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
+        loop {
+            if leader.metadata().cluster_version() >= target {
+                return (200, serde_json::json!({"ok": true, "active": target}));
+            }
+            if self.env.now() >= deadline {
+                return (
+                    504,
+                    serde_json::json!({"error": format!(
+                        "finalize of cluster version {target} was not confirmed within {}s \
+                         (re-read GET /admin/cluster-version before retrying)",
+                        SCHEMA_COMMIT_TIMEOUT.as_secs()
+                    )}),
+                );
+            }
+            self.env.sleep(SCHEMA_POLL_INTERVAL).await;
+        }
+    }
+
     pub(crate) async fn admin_transfer_control_leadership(
         &self,
         target: NodeId,
@@ -14852,6 +14973,10 @@ async fn handle_request(
             client_route: ctx.route_snapshot(),
             intra_route: ctx.intra_route_snapshot(),
             admin_addrs: ctx.admin.admin_addrs.clone(),
+            // ADR 0073 Phase 2 (P2-C): the raw cluster version (0 = era off,
+            // so pre-era bytes equal Phase 1's); lets a joiner refuse an
+            // out-of-range cluster before claiming anything.
+            cluster_version: ctx.effective_metadata().cluster_version,
         },
         // Long-poll metadata watch (ADR 0035 PR5) — see `ClientCtx::
         // watch_metadata`'s doc.
@@ -17448,7 +17573,17 @@ async fn discover_join_info(
             client_route,
             intra_route,
             admin_addrs,
-        } => Ok((control_ids, peers, client_route, intra_route, admin_addrs)),
+            cluster_version,
+        } => {
+            // ADR 0073 Phase 2 (P2-C): refuse a cluster whose version this
+            // binary's range excludes BEFORE claiming an identity or binding
+            // anything (covers the pre-era "binary R+1 vs cluster at R-1"
+            // case, which `EraWatch` cannot: it is era-only). A Phase 1 seed
+            // omits the field (reads 0 = version 1).
+            version_wiring::check_join_range(cluster_version, &animus_control::version::own_range())
+                .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidData, msg))?;
+            Ok((control_ids, peers, client_route, intra_route, admin_addrs))
+        }
         other => Err(std::io::Error::other(format!(
             "seed returned an unexpected reply to JoinInfo: {other:?}"
         ))),
@@ -22111,6 +22246,8 @@ mod sim_cluster_seed_join;
 /// range. See `sim_cluster_version_observation.rs`'s own module doc.
 #[cfg(test)]
 mod sim_cluster_version_observation;
+#[cfg(test)]
+mod sim_cluster_cluster_version;
 
 /// C-13 / ADR 0061 rung M PR 6 — `tests/control_membership_split.rs`'s own
 /// two real-socket tests, a mixed disposition: (1)

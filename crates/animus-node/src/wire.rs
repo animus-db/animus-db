@@ -1162,12 +1162,30 @@ pub fn is_relayable_command(command: &MetaCommand) -> bool {
         // relayable for now; whether and how they relay (boot-time
         // self-report from data-only nodes, admin Finalize) is decided by
         // P2-B/P2-C per ADR 0073's P2-A implementation note 5.
-        MetaCommand::ReportNodeVersion { .. } => false,
+        // ADR 0073 Phase 2 (P2-C): `ReportNodeVersion` relays — the
+        // boot-time self-report of a follower-connected combined/control
+        // node and of every data-only node (no local `RaftNode`) must reach
+        // the control leader. Safe: era-only (the emitter checks the
+        // replicated era first), and apply validates the node is registered
+        // and the range is well-formed and contains the cluster version;
+        // the leader's own `era_on_proposals` upkeep proposes the identical
+        // command. `FinalizeClusterVersion` deliberately stays
+        // non-relayable: it is a leader-local admin action (ADR 0037
+        // pattern, `admin_remove_member`'s shape), not a client-path
+        // command.
+        MetaCommand::ReportNodeVersion { .. } => true,
         MetaCommand::FinalizeClusterVersion { .. } => false,
         MetaCommand::CompleteBackup { .. } => false,
         MetaCommand::FailBackup { .. } => false,
         MetaCommand::DeleteBackup { .. } => false,
     }
+}
+
+/// `skip_serializing_if` predicate for additive `u32` wire fields whose
+/// default must not appear on the wire (ADR 0073 Phase 2).
+#[allow(clippy::trivially_copy_pass_by_ref, reason = "serde skip predicate signature")]
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 /// A node's reply to a [`ClientRequest`].
@@ -1313,6 +1331,15 @@ pub enum ClientResponse {
         /// had a chance to tick.
         intra_route: BTreeMap<NodeId, String>,
         admin_addrs: Vec<SocketAddr>,
+        /// ADR 0073 Phase 2 (P2-C): the answering node's **raw**
+        /// `Metadata::cluster_version` (`0` = the version era has not
+        /// started), so a joiner can refuse a cluster whose version its own
+        /// binary range excludes *before* claiming an identity or binding
+        /// anything. Additive: `#[serde(default, skip_serializing_if)]`, so
+        /// pre-era bytes are identical to Phase 1's and a Phase 1 reader
+        /// ignores the field.
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        cluster_version: u32,
     },
     /// **Incremental long-poll reply to
     /// [`WatchMetadata`](ClientRequest::WatchMetadata)** (ADR 0038 PR5): the
@@ -1452,6 +1479,12 @@ mod tests {
         };
 
         let true_cases: Vec<MetaCommand> = vec![
+            // ADR 0073 Phase 2 (P2-C): relays (boot-time self-report).
+            MetaCommand::ReportNodeVersion {
+                node: nid(1),
+                range: animus_control::version::VersionRange::new(1, 1),
+                build: "t".to_string(),
+            },
             MetaCommand::CreateTableSchema {
                 table: table.clone(),
                 schema: schema.clone(),
@@ -1722,11 +1755,6 @@ mod tests {
                 remove: false,
             },
             MetaCommand::RemoveMember { node: nid(1) },
-            MetaCommand::ReportNodeVersion {
-                node: nid(1),
-                range: animus_control::version::VersionRange::new(1, 1),
-                build: "t".to_string(),
-            },
             MetaCommand::FinalizeClusterVersion {
                 expected: 1,
                 target: 2,

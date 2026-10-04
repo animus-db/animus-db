@@ -1813,6 +1813,7 @@ fn print_response(response: &ClientResponse) {
             client_route,
             intra_route,
             admin_addrs,
+            ..
         } => {
             println!("control ids: {control_ids:?}");
             println!("peers: {peers:?}");

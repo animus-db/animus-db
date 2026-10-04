@@ -1805,6 +1805,7 @@ pub(crate) async fn handle_relayed_request<E: Env, R: RelayClient>(
             client_route: ctx.route_snapshot(),
             intra_route: ctx.intra_route_snapshot(),
             admin_addrs: ctx.admin.admin_addrs.clone(),
+            cluster_version: ctx.effective_metadata().cluster_version,
         },
         _ => ClientResponse::Error("not relayable under sim".into()),
     }
