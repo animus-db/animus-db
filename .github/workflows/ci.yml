@@ -726,6 +726,12 @@ jobs:
             --test minio_real_endpoint -- --nocapture
           cargo test -p animus-env --features prod --locked \
             --test s3_segment_store_minio -- --nocapture
+          # The rest of both crates' `prod`-gated targets (the real-socket
+          # `transport_timeout` test, `s3_store`'s `#[tokio::test]` unit
+          # tests), so their coverage never hinges on workspace feature
+          # unification in the sharded gates.
+          cargo test -p animus-s3 --features prod --locked
+          cargo test -p animus-env --features prod --locked --lib s3_store
 
       - name: RustFS logs
         if: failure()
