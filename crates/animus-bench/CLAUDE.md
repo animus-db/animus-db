@@ -79,7 +79,7 @@ to this crate's.**
   off-host (not bench-launched, not all-loopback) **and** a `degraded` phase
   whose fault was injected (`fault.ok`) is in the report; the reason lists
   every unmet condition. Necessary, not sufficient (instance types, RF,
-  disk/network disclosure are the publisher's checklist, ADR 0074 §8).
+  disk/network disclosure are the publisher's checklist, ADR 0076 §8).
 - **Degraded run**: one, last, on a fresh table (it damages the cluster):
   warm-up → baseline (healthy, the comparison) → degraded (fault fires at the
   phase's start) → recovery (killed node restarted at its start when the

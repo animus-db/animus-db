@@ -17,7 +17,7 @@ pub const SCHEMA: &str = "animus-bench/v1";
 
 /// Whether a report *could* back a published number, and why not.
 ///
-/// **Necessary, not sufficient** (ADR 0074 §8): `true` means only that the
+/// **Necessary, not sufficient** (ADR 0076 §8): `true` means only that the
 /// conditions the tool can check hold — servers off the generator's host and
 /// not on loopback, and a degraded run that actually injected its fault is in
 /// the report. It does not check instance types, disk, network, replication

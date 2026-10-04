@@ -24,10 +24,13 @@ How to maintain this file:
   `U` operator surfaces, `D` docs, `B` benchmarks, `R` release/readiness,
   `G` global/geo.
 
-The next free ADR number at the time of writing is **0075** (0074 is
-[Published benchmarks](adr/0074-published-benchmarks.md), B-01's design of
+The next free ADR number at the time of writing is **0077** (0076 is
+[Published benchmarks](adr/0076-published-benchmarks.md), B-01's design of
 record — the load generator and methodology landed 2026-10-04 and its
-roadmap section is removed the same way; 0073 is
+roadmap section is removed the same way; 0075 is
+[Global tables](adr/0075-global-tables.md), G-01's stage G-b; 0074 is
+[Production-readiness exit criteria](adr/0074-production-readiness-exit-criteria.md),
+R-01's; 0073 is
 [Upgrade compatibility](adr/0073-upgrade-compatibility.md); 0065 is
 [Per-table throttling](adr/0065-per-table-throttling.md), W-08's design of
 record; 0066 is [SigV4 hardening](adr/0066-sigv4-hardening.md), S-02's;
@@ -1687,7 +1690,7 @@ outstanding on the wire surface at present.
   RSS — report counts (messages, proposals, bytes), never "it took X ms".
   **Tier 2 — `ProdEnv` multi-process (RSS, CPU, fds, tasks, latency;
   manual/scheduled, never a per-push gate).** Reuse `crates/animus-bench`'s generator
-  (ADR 0074) and topology: one data node hosting G groups for G in 100/500/1k/5k/10k,
+  (ADR 0076) and topology: one data node hosting G groups for G in 100/500/1k/5k/10k,
   each quiesced and each active at a fixed per-group write rate; record
   RSS, CPU, open fds, tokio task count (add a metric if none exists),
   heartbeat frames/s (`heartbeat_batch`), WAL fsync/s (`SharedWal`), idle
@@ -1719,7 +1722,7 @@ outstanding on the wire surface at present.
 - **Reuse:** `SimCluster` (`crates/animusd/src/sim_cluster.rs`,
   `grow`/`drain`/`remove`, the auto-split harness), `idle_engine_cost`'s
   per-engine method, `wal_fsync_bench`, `heartbeat_batch_corpus` (groups
-  per node), the metrics seam, `crates/animus-bench`'s generator and topology (ADR 0074).
+  per node), the metrics seam, `crates/animus-bench`'s generator and topology (ADR 0076).
 - **Files:** new `crates/animusd/src/sim_cluster_scale.rs` (Tier 1),
   `crates/animus-bench/` scale scenarios (Tier 2), possibly one new gauge
   for hosted-group/task counts in `crates/animus-env/src/metrics.rs`,
@@ -1729,7 +1732,7 @@ outstanding on the wire surface at present.
   fault-injecting simulation (node kill and leader transfer during a split
   storm); Tier 2 asserts nothing about timing, it records.
 - **ADR:** an amendment to ADR 0044 (C-03 outcome) and ADR 0039 (evidence),
-  or a new ADR (next free number, **0075** at time of writing) if the
+  or a new ADR (next free number, **0077** at time of writing) if the
   threshold set itself needs a home.
 - **PRs:** one workstream PR: (1) Tier 1 corpus + thresholds ADR text,
   (2) Tier 2 scenarios on `animus-bench`'s generator, (3) the first recorded run and
@@ -1737,7 +1740,7 @@ outstanding on the wire surface at present.
   as a follow-up commit after a manual run).
 - **Size:** L (Tier 1 is M; Tier 2 is mostly harness reuse plus the
   operations time to run it on real hardware).
-- **Depends:** `animus-bench` (ADR 0074; landed: the Tier 2 harness and topology; Tier 1 can start now).
+- **Depends:** `animus-bench` (ADR 0076; landed: the Tier 2 harness and topology; Tier 1 can start now).
 
 ### R-01 Production-readiness pass: exit criteria for leaving pre-alpha
 
@@ -1764,7 +1767,7 @@ outstanding on the wire surface at present.
   checkable and owned by a sub-track below. Beta means: every criterion
   is green or has an explicit, signed-off waiver listed in the doc.
   Sub-tracks, with independence marked:
-  - **(a) Soak (independent; builds on `animus-bench`'s generator, ADR 0074; M-L).** A
+  - **(a) Soak (independent; builds on `animus-bench`'s generator, ADR 0076; M-L).** A
     multi-day run on real processes (`animusd` per node, the operator on
     `kind` or bare multi-process) with a continuous recorded workload;
     record the client history and run the existing `animus-test` oracles
@@ -1810,7 +1813,7 @@ outstanding on the wire surface at present.
     cert rotation (ADR 0064 section on restart-time `TlsConfig::load()`),
     encryption key rotation (ADR 0069), upgrade procedure per ADR 0073
     (whole-cluster today; rolling after C-16 Phase 3), capacity planning
-    (numbers from `animus-bench` (ADR 0074) and C-17), disk sizing, and a game-day drill
+    (numbers from `animus-bench` (ADR 0076) and C-17), disk sizing, and a game-day drill
     checklist actually executed once on `kind`.
   - **(f) Observability completeness (independent; M).** SLO definitions
     (availability, p99 latency per op class from `animus-bench`) and alert rules as
@@ -1838,9 +1841,15 @@ outstanding on the wire surface at present.
 - **Tests:** each sub-track is its own test artifact (oracle-checked soak
   histories, chaos e2e legs, fuzz targets, the metrics-exist check, an
   overload test that asserts bounded queueing, a disk-full test).
-- **ADR:** new ADR (next free number, **0075** at time of writing;
-  coordinate with C-17/G-01 which may also claim one) fixing the
-  beta criteria, overload semantics (d) and the release policy (g).
+- **ADR:** [ADR 0074](adr/0074-production-readiness-exit-criteria.md)
+  fixes the beta criteria, overload semantics (d) and the release policy
+  (g). **Landed 2026-10-04**, together with the checklist
+  [`docs/production-readiness.md`](production-readiness.md) (first R-01
+  PR; docs only). Verified then: the "absent" claims in **Gap** hold
+  (the DynamoDB accept loop in `crates/animusd/src/dynamo.rs` is also
+  uncapped, and `ThrottlingException` is not emitted anywhere);
+  `ServiceUnavailable` (503) already exists on the wire. Sub-tracks a-g
+  remain open; each flips its rows in that doc.
 - **PRs:** XL overall and genuinely too large for one reviewable PR, so
   **one workstream PR per independent sub-track, each separately
   mergeable and each in its own session** (the sub-tracks share no code):
@@ -1850,7 +1859,7 @@ outstanding on the wire surface at present.
   allows; it is not a stack.
 - **Size:** XL in total (c, e, f, g are M each; a, b, d are L).
 - **Depends:** (e) upgrade chapter needs C-16 Phase 3 (rolling upgrades);
-  (e) capacity planning and (a) need `animus-bench` (ADR 0074; its first curated run is pending); (e)/(d) sizing use C-17;
+  (e) capacity planning and (a) need `animus-bench` (ADR 0076; its first curated run is pending); (e)/(d) sizing use C-17;
   (b) real-cluster chaos benefits from the operator e2e leg staying
   green. (c), (f), (g) depend on nothing.
 
@@ -1876,11 +1885,11 @@ outstanding on the wire surface at present.
      `MultiRegionConsistency` (`EVENTUAL` for MREC, `STRONG` for MRSC) via
      `CreateTable`/`UpdateTable` `ReplicaUpdates`, which *is* a wire-level
      per-table replication mode (the legacy 2017.11.29 API,
-     `CreateGlobalTable`/`UpdateGlobalTable`, also exists). **Unverified
-     here: the exact parameter names, the MRSC region-count rule (recalled:
-     three regions, or two plus a witness) and MRSC's feature restrictions
-     (recalled: no TTL/LSI/transactions) — check AWS docs when writing the
-     ADR.** The ADR must state that each region stays CP *locally*
+     `CreateGlobalTable`/`UpdateGlobalTable`, also exists). **Verified
+     in ADR 0075 section 0 (via AWS doc search extracts; direct page fetches
+     were blocked, so a re-read is listed as open): exact parameter names,
+     MRSC = exactly three regions or two plus a witness, and MRSC's
+     restrictions (no TTL, LSI or transactions).** The ADR must state that each region stays CP *locally*
      (per-tablet Raft), that MRSC is a CP cross-region mode, and that MREC
      is the one place the system becomes AP-shaped (async, multi-active,
      last-writer-wins per item) — a per-table property now reachable from
@@ -1925,10 +1934,9 @@ outstanding on the wire surface at present.
      regions' clusters over the wire/TLS (ADR 0064), applies them with
      last-writer-wins on `(HLC, region id)` as the deterministic
      tiebreak, never re-replicating a replicated write (origin-region
-     stamp), replicates TTL deletes (as AWS does; confirm), and defines
-     stream records for replicated writes to match AWS (unverified:
-     confirm). Transactions are region-local in AWS global tables
-     (recalled; confirm): do not replicate atomically. HLC skew across
+     stamp), replicates TTL deletes (as AWS does; verified, ADR 0075 V15), and defines
+     stream records for replicated writes to match AWS (verified, ADR 0075 section 4.7 and V13/V15). Transactions are region-local in AWS global tables
+     (verified, ADR 0075 V14): do not replicate atomically. HLC skew across
      regions bounds LWW fairness; document it. Deterministic simulation
      applies: a multi-cluster `SimCluster` with a WAN partition/latency
      model is part of the work.
@@ -1947,7 +1955,8 @@ outstanding on the wire surface at present.
     already is). Tests: `desired::statefulset` unit tests, a placement
     corpus over `SimCluster` with labelled nodes (kill a zone), and the
     `kind` smoke with zone-labelled nodes.
-  - **G-b The ADR (S).** Revisit ADR 0019's premise as above, choose the
+  - **G-b The ADR (S) — WRITTEN 2026-10-04 as
+    [ADR 0075](adr/0075-global-tables.md) (Proposed).** Revisit ADR 0019's premise as above, choose the
     MRSC/MREC scope, the wire surface (`ReplicaUpdates`,
     `DescribeTable` replica fields, `MultiRegionConsistency`), the ADR 0072
     limits catalogue entries (compiled-in, AWS-faithful), and gate every
@@ -1962,7 +1971,7 @@ outstanding on the wire surface at present.
     `reconfigure_step` path. Needs one logical cluster spanning regions
     (control plane included: quorum placement across at least 3 regions);
     this is "stretch cluster", not federation. Measured cost goes into
-    `animus-bench`'s results (ADR 0074; cross-region topology variant).
+    `animus-bench`'s results (ADR 0076; cross-region topology variant).
   - **G-d MREC async replication with LWW (XL).** The agent in item 5
     above, plus replicated-TTL, stream parity and a multi-cluster
     `SimCluster` WAN corpus (seeded partitions, duplicate/reordered
@@ -2001,7 +2010,7 @@ outstanding on the wire surface at present.
 - **Depends:** G-a and G-b: none, start now. G-c, G-d, G-e: ADR 0073
   Phase 2 (C-16: a replicated cluster version / feature gate, so the new
   `Metadata` and wire surfaces are not unguarded; P2-A has merged, P2-B..D
-  have not), G-b, and ADR 0072 limits. G-c benefits from `animus-bench` (ADR 0074) to quantify
+  have not), G-b, and ADR 0072 limits. G-c benefits from `animus-bench` (ADR 0076) to quantify
   WAN cost. Reverses the global-tables clause of section 6.
 
 ## 4. Operator surfaces: admin API, dashboard, console, CLI
@@ -2092,8 +2101,8 @@ wave are independent and can run in parallel.
 | 15 | C-14 (closed 2026-09-14 — all five PRs landed: #876, #884, #886, #887, plus PR 5 — combined control-plane voter growth under `SimCluster`, ADR 0061 rung N) | Gated on C-13 (closed) — the one residual C-13 PR 6 named precisely: a fresh `RaftNode<SimEnv>` joining the live control quorum after construction |
 | 16 | C-15 (closed 2026-09-20 — node assembly/raw `ClientRequest` assess-and-close, ADR 0061 rung O, #997) | Gated on C-14 (closed) — the last class-D group C-14's own close-out confirmed still unowned |
 | 17 | S-08 (S3 credentials/multipart); G-01 stage G-a + G-b (topology-aware operator, global-tables ADR); R-01 sub-tracks c (fuzzing), f (observability), g (release engineering) | All independent of each other and of the open C-16 phases; no ordering constraint |
-| 18 | C-17 (scale/density), R-01 sub-tracks a (soak), b (chaos), d (resource bounds), e (runbook) | C-17 Tier 2 and R-01 (a)/(e) capacity planning need `animus-bench`'s generator (landed, ADR 0074); C-17 Tier 1 and R-01 (b)/(d) can start earlier |
-| 19 | G-01 stages G-c (MRSC stretch), G-d (MREC), G-e (federation) | After C-16 Phase 2 (P2-B..D: cluster-version/feature gate) and the G-b ADR; G-c wants `animus-bench` (ADR 0074) to quantify WAN cost |
+| 18 | C-17 (scale/density), R-01 sub-tracks a (soak), b (chaos), d (resource bounds), e (runbook) | C-17 Tier 2 and R-01 (a)/(e) capacity planning need `animus-bench`'s generator (landed, ADR 0076); C-17 Tier 1 and R-01 (b)/(d) can start earlier |
+| 19 | G-01 stages G-c (MRSC stretch), G-d (MREC), G-e (federation) | After C-16 Phase 2 (P2-B..D: cluster-version/feature gate) and the G-b ADR; G-c wants `animus-bench` (ADR 0076) to quantify WAN cost |
 | 20 | R-01 runbook upgrade chapter | After C-16 Phase 3 (rolling upgrades) |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed

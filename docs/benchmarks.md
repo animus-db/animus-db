@@ -1,6 +1,6 @@
 # Benchmarks: methodology and how to reproduce a run
 
-The design record is [ADR 0074](adr/0074-published-benchmarks.md); the
+The design record is [ADR 0076](adr/0076-published-benchmarks.md); the
 tool's own guide is [`crates/animus-bench/CLAUDE.md`](../crates/animus-bench/CLAUDE.md).
 This page is the procedure.
 
@@ -266,7 +266,7 @@ strings, not whole documents.
 the report contains a degraded run whose fault was successfully injected;
 `publishable_reason` lists every unmet condition. It does **not** check that
 there are three nodes, that hardware is named, or what TLS or encryption is
-configured. It is a necessary condition, not a certificate. The rest is the publisher's checklist (ADR 0074
+configured. It is a necessary condition, not a certificate. The rest is the publisher's checklist (ADR 0076
 §8): named instance types, disk and network for both sides, replica
 placement, the leader-kill and follower-kill variants, a scale-out point, the
 raw JSON committed or attached to a release, and encryption/`--shared-wal`
@@ -295,7 +295,7 @@ the threshold **and** the base and head [min, max] ranges are disjoint; a
 delta beyond the threshold with overlapping ranges, or from a group with a
 single run, is shown as `noisy`. It is reporting only: the command exits 0 for
 any well-formed input and no latency number can fail the job. Its rules, from
-ADR 0074 §9:
+ADR 0076 §9:
 
 - Compare only runs made together on one host. A figure from another host or
   another day is not a baseline.
@@ -318,7 +318,7 @@ files; read the spread between repeats before the difference between sides.
 
 Not done, and not planned. The website commits to **no comparison charts
 against DynamoDB** and none between a managed service and self-hosted
-hardware. Were a comparison ever wanted, ADR 0074 §10 sets the rules: like for
+hardware. Were a comparison ever wanted, ADR 0076 §10 sets the rules: like for
 like (instance types and counts, item and key shape, fsync-acked durability,
 matched read consistency and replication factor), the other system's
 configuration published in full, versions pinned, and the other system driven

@@ -1,4 +1,4 @@
-# ADR 0074 — Published benchmarks: an open-loop, coordinated-omission-corrected load generator over the real DynamoDB wire, and the rules a publishable result must meet
+# ADR 0076 — Published benchmarks: an open-loop, coordinated-omission-corrected load generator over the real DynamoDB wire, and the rules a publishable result must meet
 
 - **Status:** Accepted
 - **Date:** 2026-10-04

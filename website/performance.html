@@ -157,7 +157,7 @@
   <div class="wrap">
     <span class="kicker">How we measure</span>
     <h2>The method is built. The numbers are not.</h2>
-    <p class="body-text">The load generator is <code>animus-bench</code>, a separate client that drives a cluster over the real DynamoDB wire — HTTP/1.1 JSON, every request SigV4-signed — not an in-process shortcut. The full procedure is in <a href="https://github.com/animus-db/animus-db/blob/main/docs/benchmarks.md">docs/benchmarks.md</a> and the design record is <a href="https://github.com/animus-db/animus-db/blob/main/docs/adr/0074-published-benchmarks.md">ADR 0074</a>.</p>
+    <p class="body-text">The load generator is <code>animus-bench</code>, a separate client that drives a cluster over the real DynamoDB wire — HTTP/1.1 JSON, every request SigV4-signed — not an in-process shortcut. The full procedure is in <a href="https://github.com/animus-db/animus-db/blob/main/docs/benchmarks.md">docs/benchmarks.md</a> and the design record is <a href="https://github.com/animus-db/animus-db/blob/main/docs/adr/0076-published-benchmarks.md">ADR 0076</a>.</p>
     <div class="cardgrid c2" style="margin-top:16px">
       <div class="lcard"><h3>What it does</h3><ul>
         <li><strong>YCSB A–F</strong> mapped onto DynamoDB operations: <code>GetItem</code>, <code>UpdateItem</code>, <code>PutItem</code>, <code>Query</code>, and workload F's <code>GetItem</code> plus a conditional <code>UpdateItem</code>. Zipfian or uniform keys; record count and item size are fixed flags and are written into the results.</li>

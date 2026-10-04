@@ -160,7 +160,7 @@ ANIMUS_SEED=<seed> cargo test <name>
 ## Measuring performance
 
 The load generator and its methodology live in
-[`docs/benchmarks.md`](benchmarks.md) (design record: ADR 0074). There are no
+[`docs/benchmarks.md`](benchmarks.md) (design record: ADR 0076). There are no
 published results yet; numbers from a single-host run are marked
 non-publishable by the tool itself.
 
