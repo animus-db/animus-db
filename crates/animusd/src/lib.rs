@@ -134,8 +134,8 @@ use animus_cp_data::{
 };
 use animus_env::{
     CLIENT_PROTOCOL, Clock, Disk, Env, FsSegmentStore, MaybeTlsStream, Metric, MetricsHandle,
-    Nanos, NodeId, PreambleError, ProdEnv, TlsMaterial, exchange_preamble, read_preamble,
-    write_own_preamble,
+    Nanos, NodeId, PreambleError, ProdEnv, TlsMaterial, exchange_preamble_with, read_preamble,
+    write_own_preamble_with,
 };
 use animus_storage::{
     Key, LsmEngine, MemoryEngine, SsTableView, StorageEngine, StorageError, VersionedValue,
@@ -2360,10 +2360,19 @@ async fn perform_client_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     role: &'static str,
     peer_desc: &str,
     metrics: &MetricsHandle,
+    own_ext: &[u8],
+    require_peer_ext: bool,
 ) -> std::io::Result<()> {
-    exchange_preamble(conn, &CLIENT_PROTOCOL, CLIENT_HANDSHAKE_TIMEOUT)
-        .await
-        .map_err(|err| classify_client_handshake_error(err, role, peer_desc, metrics))
+    exchange_preamble_with(
+        conn,
+        &CLIENT_PROTOCOL,
+        CLIENT_HANDSHAKE_TIMEOUT,
+        own_ext,
+        require_peer_ext,
+    )
+    .await
+    .map(|_peer| ())
+    .map_err(|err| classify_client_handshake_error(err, role, peer_desc, metrics))
 }
 
 /// The pipelined dial-side counterpart to [`perform_client_handshake`],
@@ -2402,7 +2411,12 @@ async fn client_request_pipelined<S: AsyncRead + AsyncWrite + Unpin>(
     peer_desc: &str,
     request: &ClientRequest,
 ) -> std::io::Result<ClientResponse> {
-    write_own_preamble(stream, &CLIENT_PROTOCOL)
+    // ADR 0073 Phase 2 (P2-C): advertise this binary's version `ext`
+    // (a Phase 1 peer ignores it). Never *require* the peer's on a dial: the
+    // refusal of an empty-ext peer is the accept side's job, on the intra
+    // port only.
+    let own_ext = version_wiring::own_ext();
+    write_own_preamble_with(stream, &CLIENT_PROTOCOL, &own_ext)
         .await
         .map_err(|err| {
             classify_client_handshake_error(err, "dial", peer_desc, &MetricsHandle::noop())
@@ -2415,7 +2429,9 @@ async fn client_request_pipelined<S: AsyncRead + AsyncWrite + Unpin>(
     .await
     {
         Ok(Ok(peer)) => {
-            if let Err(err) = animus_env::handshake::check_peer(&CLIENT_PROTOCOL, &peer) {
+            if let Err(err) =
+                animus_env::handshake::check_peer_ext(&CLIENT_PROTOCOL, &own_ext, &peer, false)
+            {
                 return Err(classify_client_handshake_error(
                     PreambleError::Refused(err),
                     "dial",
@@ -2481,6 +2497,8 @@ pub async fn connect_client(addr: impl tokio::net::ToSocketAddrs) -> std::io::Re
         "dial",
         "client/intra dial",
         &MetricsHandle::noop(),
+        &version_wiring::own_ext(),
+        false,
     )
     .await?;
     Ok(stream)
@@ -6700,6 +6718,14 @@ impl Node {
             encryption_key.clone(),
         )
         .await?;
+        // ADR 0073 Phase 2 (P2-C): advertise this binary's version `ext` on
+        // every connection this env dials or accepts from here on. Benign
+        // known race: `bind_with_tls_and_key` already spawned its accept
+        // loop, so a connection accepted in the microseconds before this
+        // line answers with an empty `ext`; an era-on peer refuses it and
+        // simply redials (an `ext` parameter on `ProdEnv::bind*` would close
+        // it, but that is `animus-env`).
+        env.set_own_ext(version_wiring::own_ext());
         // `Arc`-wrapped (issue #1060) — see [`BoundNode::client_listener`]'s
         // own doc for why.
         let client_listener = Arc::new(TcpListener::bind(addrs.client).await?);
@@ -6762,6 +6788,14 @@ impl Node {
             encryption_key.clone(),
         )
         .await?;
+        // ADR 0073 Phase 2 (P2-C): advertise this binary's version `ext` on
+        // every connection this env dials or accepts from here on. Benign
+        // known race: `bind_with_tls_and_key` already spawned its accept
+        // loop, so a connection accepted in the microseconds before this
+        // line answers with an empty `ext`; an era-on peer refuses it and
+        // simply redials (an `ext` parameter on `ProdEnv::bind*` would close
+        // it, but that is `animus-env`).
+        env.set_own_ext(version_wiring::own_ext());
         // `Arc`-wrapped (issue #1060) — see [`BoundNode::client_listener`]'s
         // own doc for why.
         let client_listener = Arc::new(TcpListener::bind(addrs.client).await?);
@@ -6817,6 +6851,14 @@ impl Node {
             encryption_key.clone(),
         )
         .await?;
+        // ADR 0073 Phase 2 (P2-C): advertise this binary's version `ext` on
+        // every connection this env dials or accepts from here on. Benign
+        // known race: `bind_with_tls_and_key` already spawned its accept
+        // loop, so a connection accepted in the microseconds before this
+        // line answers with an empty `ext`; an era-on peer refuses it and
+        // simply redials (an `ext` parameter on `ProdEnv::bind*` would close
+        // it, but that is `animus-env`).
+        env.set_own_ext(version_wiring::own_ext());
         // `Arc`-wrapped (issue #1060) — see [`BoundNode::client_listener`]'s
         // own doc for why.
         let client_listener = Arc::new(TcpListener::bind(addrs.client).await?);
@@ -14446,11 +14488,24 @@ async fn serve_requests(
                                 },
                             };
                             let mut stream = stream;
+                            // ADR 0073 Phase 2 (P2-C): advertise this node's
+                            // own version `ext`; once the era is on, refuse an
+                            // empty-`ext` (Phase 1) peer on the INTRA port
+                            // only. Never the client port: `animus-cli` and
+                            // external clients are not members and dial with
+                            // an empty `ext`.
+                            let version = ctx.edge.version();
+                            let profile = version.profile();
+                            let own_ext = version_wiring::ext_for(profile.range, &profile.build);
+                            let require_peer_ext = listener == ListenerKind::Intra
+                                && version.features.era_active();
                             if perform_client_handshake(
                                 &mut stream,
                                 "accept",
                                 &peer_addr.to_string(),
                                 &ctx.env.metrics(),
+                                &own_ext,
+                                require_peer_ext,
                             )
                             .await
                             .is_err()
