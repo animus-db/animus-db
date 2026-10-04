@@ -165,7 +165,10 @@ assumed.
 
 Every workload with reads runs **once per `--consistent-read` mode** (default
 `both`) as separate results with the same seed, so the op stream is identical
-across modes. They are never blended (ADR 0055: `true` is the linearizable
+across modes. **Each mode runs on its own freshly created and loaded table**
+(`ycsb<epoch>_<w>_cr` / `_ev`, dropped afterwards), so the second mode never
+measures a table the first already mutated, compacted or warmed; the results
+file says so in `params.table_state`. They are never blended (ADR 0055: `true` is the linearizable
 ReadIndex read, `false` — the wire default — the replica-local one). A read
 that finds nothing is a completed op counted separately as `empty_reads`:
 under `false` a lagging replica may legitimately miss a just-loaded record.
@@ -190,7 +193,7 @@ under `false` a lagging replica may legitimately miss a just-loaded record.
   `connection`, `other` (a timeout is not a latency sample). A bounded
   number of error samples is kept verbatim.
 - **Abandoned ops.** After the phase window the workers drain the queue for
-  up to a 30 s grace; ops still unstarted by then are `abandoned` — flagged
+  up to a grace (`--drain-secs`, default 30 s, recorded in `params.drain_secs`); ops still unstarted by then are `abandoned` — flagged
   in the result, never silently dropped. A non-zero `abandoned` or an
   `achieved_rate` below `target_rate` means the offered rate exceeded what
   the system (or the client pool) could carry; the point is past the knee.
@@ -252,8 +255,9 @@ checks and what the publication process checks):
   hosts**. `environment.client_and_server_colocated` is true — and
   `publishable` is false, with `publishable_reason` — if the bench launched
   the cluster itself, or if every endpoint address is loopback.
-  `publishable` is `!colocated` and **nothing else**: it does not check that
-  a degraded run was included, that TLS posture is acceptable, that the
+  `publishable` additionally requires that the report contain a **degraded
+  run whose fault was actually injected**; `publishable_reason` lists every
+  unmet condition. It does not check that TLS posture is acceptable, that the
   cluster has three nodes, or that the hardware is named. Treat it as a
   necessary condition, not a certificate.
 - *Required by this ADR and checked at publication time:* three nodes at
@@ -290,12 +294,20 @@ shape kept readable, on a breaking change.
 - A **`workflow_dispatch`** workflow (`.github/workflows/bench.yml`) builds a
   base ref and a candidate ref and runs the generator against both **in the
   same job on the same host**, interleaved, uploading the raw JSON as
-  workflow artifacts. It is manual: it is **not** a per-push gate, and on a
+  workflow artifacts. The generator is built once from the dispatched ref so
+  both sides share it; inputs are `runner`, `base_ref`, `workloads`, `rates`,
+  `records`, `value_bytes`, `warmup_secs`, `steady_secs`, `consistent_read`,
+  `degraded`, `repeats` and `threshold_pct`. It is manual: it is **not** a per-push gate, and on a
   GitHub-hosted runner it is a smoke of the harness, not a source of numbers.
 - Comparison is **only** between runs executed together on one host. The
   workflow reports run-to-run **spread** (it repeats rather than trusting one
   run) and flags a change only beyond a disclosed threshold; a single
   outlier is a rerun, not a verdict. The flags are advisory output.
+  `animus-bench compare` builds the table (median, spread, delta per run,
+  phase and metric): a row is flagged only when `|delta|` exceeds the
+  threshold **and** the base and head [min, max] ranges are disjoint;
+  otherwise it is `noisy` (also for a single-run group). It exits 0 on any
+  well-formed input.
 - **A benchmark never becomes a latency or throughput assertion in a test or a
   required check.** `crates/animus-bench/tests/smoke.rs` asserts wire shapes
   and correctness only (zero unexpected errors, every arrival completes,
@@ -392,6 +404,32 @@ not land results.
 - `website/performance.html` and `docs/benchmarks.md` describe this method and
   say plainly that no results are published.
 
+## Known server-side findings from the harness's first colocated runs
+
+Observations from development runs on a 4-vCPU colocated dev box (generator
+and three `animusd` processes sharing it). **They are not results**, and no
+figure from such a run is publishable; they are recorded because the harness
+surfaced them and they bear on how future numbers should be read.
+
+- **Periodic write-path stalls** (#1196). Under any workload that writes, all
+  operations on the tablet freeze together for roughly 200-700 ms every few
+  seconds; the stall length grows with table size and its period shrinks with
+  write rate, and read-only workloads show none. A plain sequential Python
+  HTTP client with no SigV4 against an unauthenticated cluster reproduces it,
+  so it is not a generator artifact (service-time and corrected percentiles
+  agree, all connections stall in the same instant). Suspected cause, not
+  profiled: inline LSM flush/compaction on the apply path
+  (`background_maintenance: false`).
+- **~21 ms `ConsistentRead: true` floor** (#1197). A linearizable GetItem takes
+  about 21-23 ms even at 50 ops/s on an idle cluster, against about 1 ms for
+  `ConsistentRead: false`; latencies cluster at multiples of about 21 ms,
+  which looks tick-quantised.
+
+Until these are understood, p99 and above of write-bearing workloads and every
+`ConsistentRead: true` latency on a published run should be read with them in
+mind, and a regression flagged by the A/B workflow in the stall tail may be the
+stall's phase rather than a change.
+
 ## Testing
 
 - `recorder.rs`: the CO property on a fake-clock FIFO model; the views agree
@@ -401,6 +439,10 @@ not land results.
   `ycsb.rs`: request shapes, error classification.
 - `tests/smoke.rs`: a real 3-node in-process cluster with SigV4 on; workloads
   A–F × both read modes and a follower-kill run; asserts wire shapes and
-  correctness only, never a rate or latency. Runs in `cargo test -p
-  animus-bench` and CI's `gates` tier.
+  correctness only, never a rate or latency. A `prod-heavy` test
+  (`required-features`): it runs once, in CI's `prod-liveness-scattered` job
+  (`--test-threads=1`), not in the per-push `gates` tier, because it is a real
+  `ProdEnv` cluster. `compare.rs`, `report.rs` (publishability), `cli.rs`
+  (degraded victim parsing, `--drain-secs`) and `scenario.rs` (per-mode table
+  names) have pure unit tests.
 - Nothing validates absolute performance; that is by design.

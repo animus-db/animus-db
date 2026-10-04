@@ -124,10 +124,14 @@ true|false|both` (both); `--seed N` (42).
 **Load shape:** `--rate R` ops/s (1000); `--sweep R1,R2,...` (replaces the
 single steady phase); `--warmup-secs` (10, discarded); `--steady-secs` (30,
 each sweep point); `--connections N` (64, client concurrency cap);
-`--op-timeout-secs` (10).
+`--op-timeout-secs` (10); `--drain-secs` (30, grace after each phase for queued
+ops to start; unstarted ops are `abandoned`).
 
 **Degraded run:** `--degraded none|leader|follower|node:N` (leader when a kill
-mechanism exists, else none); `--degraded-workload W` (first of
+mechanism exists, else none). `leader` kills the node leading the table's first
+tablet, `follower` a node hosting a non-leader replica of it, `node:N` node
+index N whatever it hosts (it may be the leader or hold no replica); a bare
+`node` is rejected; `--degraded-workload W` (first of
 `--workloads`); `--degraded-consistent-read true|false` (true);
 `--baseline-secs/--degraded-secs/--recovery-secs` (15/20/20); `--kill-cmd`,
 `--restart-cmd`, `--no-restart`.
@@ -201,7 +205,7 @@ Top level:
 | `git_sha`, `git_dirty` | the checkout's HEAD and whether it had changes; `ANIMUS_BENCH_GIT_SHA` overrides; `"unknown"` if neither is available |
 | `args` | the exact command line |
 | `seed` | seeds the op/key stream |
-| `publishable`, `publishable_reason` | **false** if the generator and servers share a host (the bench launched the cluster, or all endpoints are loopback). This is the only thing it checks; see below |
+| `publishable`, `publishable_reason` | `true` only if the servers are off the generator's host (not bench-launched, not all-loopback) **and** a degraded run whose fault was actually injected is in the report; otherwise `false` with every unmet condition listed. Necessary, not sufficient; see below |
 | `environment` | `client_host` (hostname, kernel, cpu_model, cpu_count, memory_total_kb), `client_and_server_colocated`, `launch_mode` (`external`/`processes`/`in-process`), `target_endpoints`, `node_count`, `sigv4`, `tls` (always `false`) and `tls_note` |
 | `methodology` | fixed disclosures: load model, latency definition, histogram, error handling, phases, retries (none), comparison (none) |
 | `topology_start`, `topology_end` | what `/admin` reports before and after: node count, per-node `auth_enabled`/`quiesce_after_ms`/auto-split and throttle thresholds, membership, `encryption_at_rest`, `shared_wal`, `tls` |
@@ -212,6 +216,7 @@ Each `runs[]` entry: `name` (`ycsb-A/consistent_read=true`,
 `ycsb-A/degraded/consistent_read=true`), `params` (workload, mix, table,
 record count, value size, distribution, scan length, `consistent_read`, seed,
 arrival rate, sweep rates, warm-up/steady seconds, connections, op timeout,
+`drain_secs`, `table_state`,
 `key_layout`, `table_topology_after_load` with tablet count, RF policy,
 replica placement and leaders; a degraded run adds `degraded` with the
 victim, phase lengths and whether the node was restarted), `load` (records,
@@ -245,7 +250,7 @@ strings, not whole documents.
   the honest one.
 - Histograms are HdrHistogram, microseconds, 3 significant figures, up to 1 h.
 - `achieved_rate` below `target_rate`, or any `abandoned` ops (queued and not
-  started within the 30 s grace after the phase), means the offered rate is
+  started within the `--drain-secs` grace, default 30 s, after the phase), means the offered rate is
   past what was sustainable: that point is beyond the knee, and its latencies
   describe a queue.
 - Errors are **counted, not timed**; a run with timeouts and a clean latency
@@ -256,10 +261,12 @@ strings, not whole documents.
 
 ### What `publishable` does and does not mean
 
-`publishable` is `true` only when the servers are not on the generator's host.
-It does **not** check that a degraded run is present, that there are three
-nodes, that hardware is named, or what TLS or encryption is configured.
-It is a necessary condition. The rest is the publisher's checklist (ADR 0074
+`publishable` is `true` only when the servers are not on the generator's host
+(the bench did not launch them and the endpoints are not all loopback) **and**
+the report contains a degraded run whose fault was successfully injected;
+`publishable_reason` lists every unmet condition. It does **not** check that
+there are three nodes, that hardware is named, or what TLS or encryption is
+configured. It is a necessary condition, not a certificate. The rest is the publisher's checklist (ADR 0074
 §8): named instance types, disk and network for both sides, replica
 placement, the leader-kill and follower-kill variants, a scale-out point, the
 raw JSON committed or attached to a release, and encryption/`--shared-wal`
@@ -267,10 +274,28 @@ stated by hand.
 
 ## Regression tracking (A/B)
 
-The manual `workflow_dispatch` workflow `.github/workflows/bench.yml` runs a
-base ref and a candidate ref **interleaved in the same job on the same host**
-and uploads the raw results as artifacts; open the workflow file for its inputs
-and thresholds. Its rules, from ADR 0074 §9:
+The manual `workflow_dispatch` workflow `.github/workflows/bench.yml` (no
+schedule, no push/PR trigger) builds the generator once from the dispatched
+ref, builds `animusd` for an optional `base_ref` and for the dispatched ref in
+the same job, runs them **interleaved** (base, head, base, head, ...) on one
+runner, uploads the raw JSON and text summaries as artifacts and appends the
+comparison table to the job summary. Inputs: `runner` (runs-on label, default
+`ubuntu-latest`), `base_ref` (empty = measure the dispatched ref only),
+`workloads`, `rates` (one value = steady, a comma list = sweep), `records`,
+`value_bytes`, `warmup_secs`, `steady_secs`, `consistent_read`
+(both/true/false), `degraded` (none/leader/follower), `repeats` (interleaved
+pairs, default 2) and `threshold_pct` (default 10).
+
+The table comes from `animus-bench compare [--threshold-pct P] [--out F]
+--base A1.json A2.json --head B1.json B2.json`: per run, phase and metric
+(corrected p50/p99/p99.9 and achieved rate; sweep points too) the median, the
+spread across repeats (`(max-min)/median`) and the median delta. **Flagging
+rule:** a row is flagged `REGRESSION`/`improvement` only when `|delta|` exceeds
+the threshold **and** the base and head [min, max] ranges are disjoint; a
+delta beyond the threshold with overlapping ranges, or from a group with a
+single run, is shown as `noisy`. It is reporting only: the command exits 0 for
+any well-formed input and no latency number can fail the job. Its rules, from
+ADR 0074 §9:
 
 - Compare only runs made together on one host. A figure from another host or
   another day is not a baseline.
@@ -278,15 +303,16 @@ and thresholds. Its rules, from ADR 0074 §9:
   threshold; a single outlier is a rerun, not a verdict.
 - It is advisory. A benchmark is never a latency or throughput assertion in
   a test or required check, and `crates/animus-bench/tests/smoke.rs` asserts
-  only wire shapes and correctness.
+  only wire shapes and correctness. The smoke is a `prod-heavy` test and runs
+  once, in CI's `prod-liveness-scattered` job, not in the per-push `gates`
+  tier.
 - A GitHub-hosted runner is shared and noisy: its output validates that the
   harness runs, not what the server's absolute performance is. A trend line
   needs a dedicated, fixed runner, which does not exist yet.
 
 To run an A/B by hand: build both refs, run the same `animus-bench` command
-against each (alternating, several times), and compare `corrected`
-percentiles and `achieved_rate` of matching phases across the files, looking
-at the spread between repeats before the difference between sides.
+against each (alternating, several times), then `animus-bench compare` the
+files; read the spread between repeats before the difference between sides.
 
 ## Comparing with another system
 
