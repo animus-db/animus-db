@@ -27,7 +27,7 @@ use crate::persist::{CONTROL_SNAPSHOT, CONTROL_WAL, PersistedState};
 use crate::persist_round::{self, GatedOuts, PersistArm, PersistFut, PersistProgress, PersistWake};
 use crate::raft::{Out, ProposeResult, RaftCore, RaftMsg, Role};
 use crate::syskv;
-use crate::version::VersionRange;
+use crate::version::{ClusterFeatures, GateSurface, GatedCommand, VersionRange};
 use crate::version_observe::{
     OBSERVATION_WINDOW, OwnVersion, VersionObservation, VersionObservations, VersionView,
     command_node, era_on_proposals, era_start_proposals,
@@ -638,6 +638,10 @@ pub struct RaftNode<E: Env> {
     /// startup/install range check); `None` otherwise. See
     /// [`halt_reason`](Self::halt_reason).
     halt_reason: Arc<Mutex<Option<String>>>,
+    /// ADR 0073 Phase 2 (P2-B): this node's feature-gate handle. Fed from
+    /// the applied `Metadata` by the apply task (`EraWatch::sync`); read by
+    /// every propose and send site that must refuse a closed-gate value.
+    features: ClusterFeatures,
 }
 
 impl<E: Env> RaftNode<E> {
@@ -749,6 +753,7 @@ impl<E: Env> RaftNode<E> {
         let observations = Arc::new(Mutex::new(VersionObservations::default()));
         let own_version = Arc::new(Mutex::new(OwnVersion::default()));
         let halt_reason = Arc::new(Mutex::new(None));
+        let features = ClusterFeatures::new();
         let node = Self {
             env: env.clone(),
             core: Arc::clone(&core),
@@ -764,6 +769,7 @@ impl<E: Env> RaftNode<E> {
             observations: Arc::clone(&observations),
             own_version: Arc::clone(&own_version),
             halt_reason: Arc::clone(&halt_reason),
+            features: features.clone(),
         };
         env.spawn_task(drive(
             env.clone(),
@@ -783,6 +789,7 @@ impl<E: Env> RaftNode<E> {
             Arc::clone(&observations),
             Arc::clone(&own_version),
             Arc::clone(&halt_reason),
+            features.clone(),
         ));
         // The placement reconciler runs alongside the driver; it only ever
         // *proposes* on the core (no I/O of its own), and proposals are honored
@@ -791,6 +798,7 @@ impl<E: Env> RaftNode<E> {
             env.clone(),
             Arc::clone(&core),
             Arc::clone(&cache),
+            features.clone(),
         ));
         // The failure detector evaluates member liveness on a timer and, when
         // leader, proposes `UpsertMember` transitions (ADR 0012). Like the
@@ -801,6 +809,7 @@ impl<E: Env> RaftNode<E> {
             Arc::clone(&cache),
             detector,
             metrics.clone(),
+            features.clone(),
         ));
         // The orphan-member sweep (ADR 0040 PR6): same "only proposes, safe
         // on every node, only acts when leader" shape as the two loops
@@ -814,6 +823,7 @@ impl<E: Env> RaftNode<E> {
                 Arc::clone(&cache),
                 orphan_sweep_after,
                 metrics,
+                features.clone(),
             ));
         }
         // Leader-local version observation consumer (ADR 0073 Phase 2, P2-A):
@@ -828,6 +838,7 @@ impl<E: Env> RaftNode<E> {
             observations,
             own_version,
             halted,
+            features,
         ));
         node
     }
@@ -984,8 +995,40 @@ impl<E: Env> RaftNode<E> {
     }
 
     /// Propose a metadata command. See [`ProposeResult`].
+    ///
+    /// **Gate-checked (ADR 0073 Phase 2, P2-B).** A command whose
+    /// [`required_gate`](GatedCommand::required_gate) is closed on this
+    /// node's [`features`](Self::features) is **refused, never appended**
+    /// (`NotLeader { leader: None }`, the least surprising existing shape:
+    /// the caller sees "not accepted" and, in a debug build, a
+    /// `debug_assert!` fails loudly; release builds count and log it). The
+    /// check re-reads the applied `Metadata` before refusing, so a handle
+    /// that lags the apply task never produces a false refusal.
     pub fn propose(&self, command: MetaCommand) -> ProposeResult {
-        self.lock().propose(command)
+        propose_gated(&self.core, &self.cache, &self.features, command)
+    }
+
+    /// Test-only (ADR 0073 P2-B x P2-D): propose `command` **without** the
+    /// gate check. The mixed-version corpus's negative controls play a buggy
+    /// emitter that emits an era variant before the era is open; routing them
+    /// through [`propose`](Self::propose) would be refused (and panic on the
+    /// debug assertion), so the control would no longer exercise the wedge it
+    /// must detect. Compiled only under `cfg(any(test, feature =
+    /// "sim-versions"))`: production gating is unaffected.
+    #[cfg(any(test, feature = "sim-versions"))]
+    pub fn propose_ungated_for_negative_control(&self, command: MetaCommand) -> ProposeResult {
+        self.core
+            .lock()
+            .expect("raft core poisoned")
+            .propose(command)
+    }
+
+    /// This node's feature-gate handle (ADR 0073 Phase 2, P2-B). Fed by the
+    /// apply task from the applied `Metadata`; clone it into every other
+    /// emitter on the node (e.g. the CP data plane's `RaftKvNode`).
+    #[must_use]
+    pub fn features(&self) -> ClusterFeatures {
+        self.features.clone()
     }
 
     /// Drain and durably persist (append + `fsync`) any WAL records the core has
@@ -1324,6 +1367,60 @@ impl<E: Env> RaftNode<E> {
     }
 }
 
+/// Send-site gate check for a control `RaftMsg` (ADR 0073 Phase 2, P2-B):
+/// `true` when the message's [`envelope_gate`](RaftMsg::envelope_gate) is
+/// open; on `false` the caller must drop the message (never ship it). The
+/// check deliberately covers the **envelope only, not the commands an
+/// `AppendEntries` carries**: a send site cannot soundly judge entry gates,
+/// because a leader's applied view (the thing `ClusterFeatures` is fed from)
+/// lags its own log, the era-start `ReportNodeVersion` entries ship before
+/// they apply, and a new leader resends entries an earlier leader proposed
+/// under a gate that was open then (gates only ever open). Entry gates are
+/// enforced where the entry is *created*: [`propose_gated`].
+fn send_gate_ok(features: &ClusterFeatures, msg: &RaftMsg) -> bool {
+    features.check(GateSurface::RaftMsg, msg.envelope_gate())
+}
+
+/// Propose `command` iff its gate is open (ADR 0073 Phase 2, P2-B): the one
+/// choke point for every control-log proposal on this node (the public
+/// [`RaftNode::propose`] and every internal loop). A closed gate is
+/// **refused, never appended** (`NotLeader { leader: None }`, counted in
+/// [`ClusterFeatures::violations`], `debug_assert!`ed in debug builds).
+///
+/// A closed verdict first re-reads the applied `cache` into `features`
+/// (cheap, slow path only): the apply task feeds `features` just after it
+/// publishes `cache`, so a proposer that reacted to the cache could
+/// otherwise race the handle and be refused for nothing.
+fn propose_gated(
+    core: &Mutex<RaftCore>,
+    cache: &Mutex<Metadata>,
+    features: &ClusterFeatures,
+    command: MetaCommand,
+) -> ProposeResult {
+    let gate = command.required_gate();
+    if !features.is_open(gate) {
+        features.update(&cache.lock().expect("cache poisoned"));
+    }
+    if !features.check(GateSurface::MetaCommand, gate) {
+        return ProposeResult::NotLeader { leader: None };
+    }
+    core.lock().expect("raft core poisoned").propose(command)
+}
+
+/// The **one deliberate exemption** from [`propose_gated`] (ADR 0073 section
+/// 2, P2-A): the era-start `ReportNodeVersion` proposals. They are proposed
+/// while `Gate::Era` is still closed, *by design*, under the leader-local
+/// precondition P (every required node has been observed on a B2 range), which
+/// is what proves no Phase 1 voter can receive the new variant. Anything else
+/// routed here is a bug (debug-asserted).
+fn propose_era_start(core: &Mutex<RaftCore>, command: MetaCommand) -> ProposeResult {
+    debug_assert!(
+        matches!(command, MetaCommand::ReportNodeVersion { .. }),
+        "propose_era_start is only for the era-start ReportNodeVersion"
+    );
+    core.lock().expect("raft core poisoned").propose(command)
+}
+
 /// Emit a liveness heartbeat (ADR 0012) from this `env`'s node to every node in
 /// `control`, once. A member spawns [`heartbeat_loop`] (which calls this on a
 /// timer) so the control-plane leader can detect its failure. Sends are
@@ -1335,6 +1432,10 @@ pub async fn send_heartbeat<E: Env>(env: &E, control: &[NodeId]) {
     let msg: RaftMsg = RaftMsg::Heartbeat {
         node: env.node_id(),
     };
+    // ADR 0073 P2-B: a heartbeat is `Gate::Base`, which is open on every
+    // node by construction, so there is no feature handle to consult here;
+    // the assert pins the classification instead.
+    debug_assert_eq!(msg.envelope_gate(), crate::version::Gate::Base);
     let bytes = serde_json::to_vec(&msg).expect("heartbeat serializes");
     for c in control {
         env.send(c.clone(), bytes.clone()).await;
@@ -1390,6 +1491,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
     observations: Arc<Mutex<VersionObservations>>,
     own_version: Arc<Mutex<OwnVersion>>,
     halt_reason: Arc<Mutex<Option<String>>>,
+    features: ClusterFeatures,
 ) {
     // Recover from the WAL before serving anything.
     // Issue #1132: `recover` also cuts a torn tail back on disk, so this
@@ -1472,8 +1574,12 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
             .begin_cluster_check(env.now(), boot_entropy);
         if !initial_probe.is_empty() {
             let probe_env = env.clone();
+            let probe_features = features.clone();
             env.spawn_task(async move {
                 for (to, msg) in initial_probe {
+                    if !send_gate_ok(&probe_features, &msg) {
+                        continue;
+                    }
                     let bytes = serde_json::to_vec(&msg).expect("raft message serializes");
                     probe_env.send(to, bytes).await;
                 }
@@ -1532,7 +1638,14 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
     // ADR 0073 Phase 2 (P2-A): era-on handshake refusal + startup range check
     // against the freshly read `Metadata`, before the first tick.
     let mut era_watch = EraWatch::default();
-    era_watch.sync(&env, &shadow, &own_version, &halted, &halt_reason);
+    era_watch.sync(
+        &env,
+        &shadow,
+        &own_version,
+        &halted,
+        &halt_reason,
+        &features,
+    );
 
     // Now spawn the steady-state apply loop, handing it the seed's already-
     // published state — this loop does no more engine I/O than the ongoing
@@ -1555,6 +1668,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
         era_watch,
         Arc::clone(&own_version),
         halt_reason,
+        features.clone(),
     ));
 
     // Issue #279: the loop's own in-flight persist round, and the outbound
@@ -1733,6 +1847,9 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
             gated.push(round, held);
         }
         for (to, msg) in immediate {
+            if !send_gate_ok(&features, &msg) {
+                continue;
+            }
             let bytes = serde_json::to_vec(&msg).expect("raft message serializes");
             env.send(to, bytes).await;
         }
@@ -1740,6 +1857,9 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
         // compaction rewrite, or a `RaftNode::flush` from a graceful shutdown —
         // releases the acks that were waiting on it.
         for (to, msg) in gated.release(persist.durable()) {
+            if !send_gate_ok(&features, &msg) {
+                continue;
+            }
             let bytes = serde_json::to_vec(&msg).expect("raft message serializes");
             env.send(to, bytes).await;
         }
@@ -1757,6 +1877,9 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
             };
             if settled && persist_fut.is_none() {
                 for (to, msg) in gated.release(u64::MAX) {
+                    if !send_gate_ok(&features, &msg) {
+                        continue;
+                    }
                     let bytes = serde_json::to_vec(&msg).expect("raft message serializes");
                     env.send(to, bytes).await;
                 }
@@ -1787,7 +1910,13 @@ impl EraWatch {
         own: &Mutex<OwnVersion>,
         halted: &AtomicBool,
         halt_reason: &Mutex<Option<String>>,
+        features: &ClusterFeatures,
     ) {
+        // ADR 0073 Phase 2 (P2-B): feed the node's gate handle on EVERY
+        // call, before the unchanged-key early return below (the handle is
+        // the one thing every emitter reads; the rest of this function is
+        // era/range bookkeeping that only needs to run on a change).
+        features.update(meta);
         let era = meta.versioning_active();
         let cv = meta.cluster_version();
         let own_range = own.lock().expect("own version poisoned").range;
@@ -1935,6 +2064,7 @@ async fn meta_apply_loop<E: Env, S: StorageEngine>(
     mut era_watch: EraWatch,
     own_version: Arc<Mutex<OwnVersion>>,
     halt_reason: Arc<Mutex<Option<String>>>,
+    features: ClusterFeatures,
 ) {
     // Issue #898 follow-up: owned by this loop, across iterations — see
     // `SNAPSHOT_COMPACT_DEFER_IDLE_CEILING`'s own doc for why this lives
@@ -1968,7 +2098,14 @@ async fn meta_apply_loop<E: Env, S: StorageEngine>(
         // After every pass (tail apply, snapshot install, or neither): a
         // changed era/cluster version/own range re-runs the era-on refusal
         // flip and the range check. Cheap: three scalars compared.
-        era_watch.sync(&env, &shadow, &own_version, &halted, &halt_reason);
+        era_watch.sync(
+            &env,
+            &shadow,
+            &own_version,
+            &halted,
+            &halt_reason,
+            &features,
+        );
         if !did_work {
             env.sleep(APPLY_IDLE_POLL).await;
         }
@@ -2601,7 +2738,12 @@ fn record_transfer_clear(
 /// own correct logic). It never proposes `MarkSplitPlacingDone` — that is a
 /// separate, later mechanism (ADR 0062 §3) that observes live Raft
 /// convergence, not something this pure metadata-level view can see.
-async fn reconcile_loop<E: Env>(env: E, core: Arc<Mutex<RaftCore>>, cache: Arc<Mutex<Metadata>>) {
+async fn reconcile_loop<E: Env>(
+    env: E,
+    core: Arc<Mutex<RaftCore>>,
+    cache: Arc<Mutex<Metadata>>,
+    features: ClusterFeatures,
+) {
     let mut tick: u64 = 0;
     // Driver-local dwell tracking for the directed-Placing phase's
     // retarget gate (ADR 0062 §2, issue #528 fix) — see
@@ -2665,7 +2807,7 @@ async fn reconcile_loop<E: Env>(env: E, core: Arc<Mutex<RaftCore>>, cache: Arc<M
             // Off-leader transitions between the check and here are harmless:
             // a stale `CasTabletReplicas` is rejected by the epoch guard, and a
             // non-leader `propose` is dropped.
-            core.lock().expect("raft core poisoned").propose(command);
+            propose_gated(&core, &cache, &features, command);
         }
         // Load rebalancing (ADR 0029) runs only when repair proposed *nothing*
         // this tick — violation repair always takes priority over balance — and
@@ -2677,7 +2819,7 @@ async fn reconcile_loop<E: Env>(env: E, core: Arc<Mutex<RaftCore>>, cache: Arc<M
             && tick.is_multiple_of(REBALANCE_EVERY_N_TICKS)
             && let Some(command) = view.rebalance(&recently_done, &recently_down)
         {
-            core.lock().expect("raft core poisoned").propose(command);
+            propose_gated(&core, &cache, &features, command);
         }
         // ADR 0062 §2's directed-Placing phase: unconditional every tick,
         // independent of the repair/rebalance gating above. Off-leader
@@ -2685,7 +2827,7 @@ async fn reconcile_loop<E: Env>(env: E, core: Arc<Mutex<RaftCore>>, cache: Arc<M
         // just as harmless as they are for repair/rebalance, above.
         let retarget_ready = retarget_ready_this_tick(&env, &view, &mut retarget_since);
         for command in view.split_placing_reconcile(&retarget_ready) {
-            core.lock().expect("raft core poisoned").propose(command);
+            propose_gated(&core, &cache, &features, command);
         }
     }
 }
@@ -2922,6 +3064,7 @@ async fn detect_loop<E: Env>(
     cache: Arc<Mutex<Metadata>>,
     detector: Arc<Mutex<FailureDetector>>,
     metrics: MetricsHandle,
+    features: ClusterFeatures,
 ) {
     // The (term, instant) at which this node last observed itself leader. `None`
     // while not leader; re-armed on each fresh leadership/term so the cold-start
@@ -3002,7 +3145,7 @@ async fn detect_loop<E: Env>(
                     _ => {}
                 }
             }
-            core.lock().expect("raft core poisoned").propose(command);
+            propose_gated(&core, &cache, &features, command);
         }
     }
 }
@@ -3025,6 +3168,7 @@ async fn detect_loop<E: Env>(
 /// committed (`engine_applied >= commit_index`), so a leader that has just won
 /// does not judge a required set that predates entries it has already
 /// committed.
+#[allow(clippy::too_many_arguments)] // the loop's shared-state bundle, like `drive`
 async fn version_loop<E: Env>(
     env: E,
     core: Arc<Mutex<RaftCore>>,
@@ -3033,6 +3177,7 @@ async fn version_loop<E: Env>(
     observations: Arc<Mutex<VersionObservations>>,
     own_version: Arc<Mutex<OwnVersion>>,
     halted: Arc<AtomicBool>,
+    features: ClusterFeatures,
 ) {
     let self_id = env.node_id();
     let mut leader_since: Option<(u64, Nanos)> = None;
@@ -3077,7 +3222,8 @@ async fn version_loop<E: Env>(
             .lock()
             .expect("observations poisoned")
             .snapshot();
-        let proposals = if view.era_active {
+        let era_on = view.era_active;
+        let proposals = if era_on {
             era_on_proposals(&view, &obs, &self_id, &own, now, OBSERVATION_WINDOW)
         } else {
             era_start_proposals(
@@ -3100,7 +3246,15 @@ async fn version_loop<E: Env>(
                 }
                 last_proposed.insert(node.clone(), now);
             }
-            core.lock().expect("raft core poisoned").propose(command);
+            if era_on {
+                // Era-on upkeep passes the ordinary gate check (`Gate::Era`
+                // is open by definition once the era is on).
+                propose_gated(&core, &cache, &features, command);
+            } else {
+                // ADR 0073 section 2: the era-start proposals are the one
+                // deliberate exemption, see `propose_era_start`.
+                propose_era_start(&core, command);
+            }
         }
     }
 }
@@ -3231,6 +3385,7 @@ async fn orphan_sweep_loop<E: Env>(
     cache: Arc<Mutex<Metadata>>,
     orphan_sweep_after: Duration,
     metrics: MetricsHandle,
+    features: ClusterFeatures,
 ) {
     // Per-leadership-stint volatile state: when this stint first observed
     // each currently-eligible claim. Reset wholesale on any leadership/term
@@ -3278,9 +3433,12 @@ async fn orphan_sweep_loop<E: Env>(
                     grace_period_secs = orphan_sweep_after.as_secs(),
                     "orphan-member sweep: proposing removal of a never-activated claim"
                 );
-                core.lock()
-                    .expect("raft core poisoned")
-                    .propose(MetaCommand::RemoveMember { node: id.clone() });
+                propose_gated(
+                    &core,
+                    &cache,
+                    &features,
+                    MetaCommand::RemoveMember { node: id.clone() },
+                );
             }
         }
     }

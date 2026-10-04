@@ -25,6 +25,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 
+use animus_control::version::{Gate, GatedCommand};
 use animus_control::{MetaCommand, Metadata, NodeStatus};
 use animus_cp_data::hlc::HlcTimestamp;
 use animus_cp_data::{
@@ -1158,15 +1159,101 @@ pub fn is_relayable_command(command: &MetaCommand) -> bool {
         MetaCommand::ExpireStreamShards { .. } => false,
         MetaCommand::ExpirePitrSegments { .. } => false,
         MetaCommand::RemoveMember { .. } => false,
-        // ADR 0073 Phase 2 (P2-A): version commands are era-only and not
-        // relayable for now; whether and how they relay (boot-time
-        // self-report from data-only nodes, admin Finalize) is decided by
-        // P2-B/P2-C per ADR 0073's P2-A implementation note 5.
-        MetaCommand::ReportNodeVersion { .. } => false,
-        MetaCommand::FinalizeClusterVersion { .. } => false,
+        // ADR 0073 Phase 2 (P2-B): both version commands are relayable.
+        // `ReportNodeVersion`: a data-only node's era-on boot self-report has
+        // no other route to the control leader. `FinalizeClusterVersion`: the
+        // admin Finalize rides the existing `ProposeSchema` relay (ADR 0073
+        // section 2, "no new variant"). Both are **era-only**
+        // (`MetaCommand::required_gate` is `Gate::Era`): the sender side
+        // refuses them before the era (`animus_node::encode_client_frame_gated`
+        // and `RaftNode::propose`'s gate check), and the relay *receiver* in
+        // `animusd` (`forwarding.rs`) must re-check `required_gate` against its
+        // own `ClusterFeatures` before proposing (P2-C), because a Phase 1
+        // receiver cannot decode them at all.
+        MetaCommand::ReportNodeVersion { .. } => true,
+        MetaCommand::FinalizeClusterVersion { .. } => true,
         MetaCommand::CompleteBackup { .. } => false,
         MetaCommand::FailBackup { .. } => false,
         MetaCommand::DeleteBackup { .. } => false,
+    }
+}
+
+/// ADR 0073 Phase 2 (P2-B): the gate each [`ClientRequest`] needs before it may be
+/// sent to another node. **Exhaustive, no `_` arm**: a new variant does not compile
+/// until it names its gate (an unknown variant tears the receiving connection down,
+/// ADR 0073 section 3). Every variant that exists at cluster version 1 is
+/// [`Gate::Base`]; the two carriers that embed a `MetaCommand` take their payload's
+/// gate (`ProposeSchema`, and `Forwarded` recursively), which is how an era-only
+/// command is refused on the relay path before the era.
+impl ClientRequest {
+    /// See the impl's doc.
+    #[must_use]
+    pub fn required_gate(&self) -> Gate {
+        match self {
+            ClientRequest::ProposeSchema(command) => command.required_gate(),
+            ClientRequest::Forwarded { request, .. } => request.required_gate(),
+            ClientRequest::Status
+            | ClientRequest::Put { .. }
+            | ClientRequest::PutBatch { .. }
+            | ClientRequest::KindWrite { .. }
+            | ClientRequest::KindScan { .. }
+            | ClientRequest::ForceSeal { .. }
+            | ClientRequest::ForcePitrSeal { .. }
+            | ClientRequest::TriggerAutoSplit { .. }
+            | ClientRequest::StreamHotRead { .. }
+            | ClientRequest::StreamHotChangeMax { .. }
+            | ClientRequest::ClearBackfillCursor { .. }
+            | ClientRequest::KindWriteItem { .. }
+            | ClientRequest::KindWriteBatch { .. }
+            | ClientRequest::CpLeaderHintProbe { .. }
+            | ClientRequest::Get { .. }
+            | ClientRequest::GetSnapshot { .. }
+            | ClientRequest::Delete { .. }
+            | ClientRequest::Scan { .. }
+            | ClientRequest::SplitTablet { .. }
+            | ClientRequest::JoinInfo
+            | ClientRequest::WatchMetadata { .. }
+            | ClientRequest::Txn { .. }
+            | ClientRequest::TxnPrepare { .. }
+            | ClientRequest::TxnDecide { .. }
+            | ClientRequest::TxnResolve { .. }
+            | ClientRequest::TxnStatus { .. }
+            | ClientRequest::TxnRecordView { .. }
+            | ClientRequest::TxnVerify { .. } => Gate::Base,
+        }
+    }
+}
+
+/// ADR 0073 Phase 2 (P2-B): the gate each [`ClientResponse`] needs. Exhaustive, no `_`
+/// arm. All `Base` today. `Status`/`JoinInfo`/`MetadataDelta` carry `Metadata` or its
+/// mirror writes, whose *content* is gated by its additive skipped-at-default fields
+/// and by the era-only entity kinds (a Phase 1 reader ignores an unknown kind), not by
+/// this envelope, so they stay `Base`.
+impl ClientResponse {
+    /// See the impl's doc.
+    #[must_use]
+    pub fn required_gate(&self) -> Gate {
+        match self {
+            ClientResponse::Status { .. }
+            | ClientResponse::PutOk
+            | ClientResponse::Value(_)
+            | ClientResponse::KindWriteOk { .. }
+            | ClientResponse::ConditionFailed
+            | ClientResponse::KindWriteBatchOk { .. }
+            | ClientResponse::Unresolved
+            | ClientResponse::CpLeaderHint { .. }
+            | ClientResponse::Pairs(_)
+            | ClientResponse::Error(_)
+            | ClientResponse::JoinInfo { .. }
+            | ClientResponse::MetadataDelta { .. }
+            | ClientResponse::TxnCommitted { .. }
+            | ClientResponse::TxnPrepared { .. }
+            | ClientResponse::TxnDecided { .. }
+            | ClientResponse::TxnStatusReply { .. }
+            | ClientResponse::TxnRecordViewReply { .. }
+            | ClientResponse::TxnVerifyReply { .. }
+            | ClientResponse::TxnResolved { .. } => Gate::Base,
+        }
     }
 }
 
@@ -1691,6 +1778,16 @@ mod tests {
             MetaCommand::RevokeCredential {
                 id: "AKID1".to_string(),
             },
+            // ADR 0073 Phase 2 (P2-B): era-only, relayable (see the match arm).
+            MetaCommand::ReportNodeVersion {
+                node: nid(1),
+                range: animus_control::version::VersionRange::new(1, 1),
+                build: "t".to_string(),
+            },
+            MetaCommand::FinalizeClusterVersion {
+                expected: 1,
+                target: 2,
+            },
         ];
         for cmd in &true_cases {
             assert!(is_relayable_command(cmd), "expected relayable: {cmd:?}");
@@ -1722,15 +1819,6 @@ mod tests {
                 remove: false,
             },
             MetaCommand::RemoveMember { node: nid(1) },
-            MetaCommand::ReportNodeVersion {
-                node: nid(1),
-                range: animus_control::version::VersionRange::new(1, 1),
-                build: "t".to_string(),
-            },
-            MetaCommand::FinalizeClusterVersion {
-                expected: 1,
-                target: 2,
-            },
             MetaCommand::CompleteBackup {
                 backup_id: "b1".to_string(),
             },

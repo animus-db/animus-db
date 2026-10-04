@@ -3590,6 +3590,14 @@ impl SimCluster {
         self.controls[leader].propose(command)
     }
 
+    /// ADR 0073 P2-B x P2-D negative-control helper: like [`Self::propose_meta`]
+    /// but **bypassing the gate check**, so a buggy emitter's closed-gate
+    /// variant is actually appended (the wedge N1 must detect).
+    pub(crate) fn propose_meta_ungated(&mut self, command: MetaCommand) -> ProposeResult {
+        let leader = self.control_leader_index();
+        self.controls[leader].propose_ungated_for_negative_control(command)
+    }
+
     /// **Issue #994 regression helper.** Propose the ADR 0050 split-cutover
     /// freeze (`RaftKvNode::propose_freeze`) directly on `tablet`'s CP-data
     /// group as hosted on `node`, and drive the simulator until it is
