@@ -734,7 +734,20 @@ the production implementation; the deterministic implementation lives in
   SigV4 request timestamp a plain `SystemTime::now()`, both under this
   file's own module-level `#[allow(clippy::disallowed_methods)]` — the
   identical real-I/O-boundary justification `prod.rs`'s own module-level
-  allow carries. `list` paginates via `ListObjectsV2`'s own continuation
+  allow carries. **Multipart (S-08 M2)**: a `put` larger than `MultipartConfig::threshold`
+  (default 64 MiB; parts 16 MiB, min 5 MiB, at most 10,000 parts — the part
+  size grows to fit) is a multipart upload, each request through the same
+  `retry_op` bounded-retry helper; a finally-failed part/complete aborts the
+  upload best-effort and returns the error. Transport-only: ids/keys/bytes
+  are identical to a single PUT, so no durable format changes (ADR 0073).
+  Set via `S3SegmentStore::with_multipart` (builder, not an `S3Config`
+  field); `MultipartConfig::new` enforces the 5 MiB minimum,
+  `new_unchecked` (doc-hidden) is for `FakeS3` with a lowered minimum.
+  **The write-once check is now `HEAD` + bounded ranged compares** (size
+  mismatch = violation without any GET), never a whole-object download;
+  `get` stays whole-object. Abandoned uploads need a bucket lifecycle rule
+  `AbortIncompleteMultipartUpload`.
+  `list` paginates via `ListObjectsV2`'s own continuation
   token, capped at `LIST_PAGE_CAP` (10,000 pages) as a safety backstop
   against a misbehaving endpoint, never truncating silently within that
   bound. See `crates/animusd/CLAUDE.md`'s own S-04 entry for the `s3:` URI

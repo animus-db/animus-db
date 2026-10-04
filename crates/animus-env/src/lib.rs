@@ -92,7 +92,7 @@ pub use encrypted_segment_store::{
 #[cfg(feature = "prod")]
 pub mod s3_store;
 #[cfg(feature = "prod")]
-pub use s3_store::S3SegmentStore;
+pub use s3_store::{MultipartConfig, S3SegmentStore};
 
 pub mod metrics;
 pub use metrics::{Metric, MetricSink, MetricSnapshot, MetricsHandle};

@@ -42,6 +42,24 @@
 //! sleep is a plain `tokio::time::sleep` rather than `env.sleep()` — see the
 //! module-level `#[allow(...)]` below.
 //!
+//! # Multipart (S-08 M2)
+//!
+//! A `put` larger than [`MultipartConfig::threshold`] is sent as a multipart
+//! upload (`CreateMultipartUpload`, one `UploadPart` per
+//! [`MultipartConfig::part_size`] slice, `CompleteMultipartUpload`); every
+//! request goes through the same bounded retry helper as a plain `PUT`. If
+//! any part (or the complete) finally fails, the upload is aborted (best
+//! effort) and the error returned. Multipart is **transport only**: the
+//! object id, key and bytes are identical to a single `PUT`, so no durable
+//! format is involved (ADR 0073). An abort that itself fails (or a process
+//! killed mid-upload) leaves an incomplete upload that bills for storage —
+//! operators should add a bucket lifecycle rule
+//! `AbortIncompleteMultipartUpload` (e.g. after 1 day).
+//!
+//! The write-once check no longer downloads the whole existing object: it
+//! `HEAD`s it (size mismatch is a violation) and compares in
+//! `part_size`-bounded ranged `GET`s.
+//!
 //! # Credentials
 //!
 //! Never read, generated, or logged by this module — `animus_s3::client::
@@ -75,6 +93,68 @@ const MAX_RETRY_ATTEMPTS: u32 = 3;
 /// Linear backoff step between retry attempts (`attempt * RETRY_BASE_DELAY`).
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
 
+/// S3's hard minimum for every non-last part of a multipart upload.
+pub const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
+
+/// S3's hard maximum number of parts in one multipart upload.
+pub const MAX_PARTS: u64 = 10_000;
+
+/// When and how [`S3SegmentStore`] splits a `put` into a multipart upload
+/// (S-08 M2). Set with [`S3SegmentStore::with_multipart`]; the default
+/// (64 MiB threshold, 16 MiB parts) is what production uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MultipartConfig {
+    /// Objects strictly larger than this many bytes are uploaded multipart.
+    pub threshold: u64,
+    /// Size of each part (the last may be smaller). Grown automatically so
+    /// an object never needs more than [`MAX_PARTS`] parts.
+    pub part_size: u64,
+}
+
+impl Default for MultipartConfig {
+    fn default() -> Self {
+        MultipartConfig {
+            threshold: 64 * 1024 * 1024,
+            part_size: 16 * 1024 * 1024,
+        }
+    }
+}
+
+impl MultipartConfig {
+    /// A validated config: `part_size` must be at least S3's 5 MiB minimum.
+    ///
+    /// # Errors
+    /// A human-readable reason.
+    pub fn new(threshold: u64, part_size: u64) -> Result<Self, String> {
+        if part_size < MIN_PART_SIZE {
+            return Err(format!(
+                "multipart part size {part_size} is below S3's {MIN_PART_SIZE}-byte minimum"
+            ));
+        }
+        Ok(MultipartConfig {
+            threshold,
+            part_size,
+        })
+    }
+
+    /// Skips the 5 MiB minimum — for tests against a `FakeS3` whose own
+    /// minimum was lowered. Never use against a real endpoint.
+    #[must_use]
+    #[doc(hidden)]
+    pub fn new_unchecked(threshold: u64, part_size: u64) -> Self {
+        MultipartConfig {
+            threshold,
+            part_size: part_size.max(1),
+        }
+    }
+
+    /// The slice size to use for an object of `len` bytes: `part_size`,
+    /// grown so `len` fits in [`MAX_PARTS`] parts.
+    fn effective_part_size(&self, len: u64) -> u64 {
+        self.part_size.max(len.div_ceil(MAX_PARTS)).max(1)
+    }
+}
+
 /// Safety cap on `list`'s own pagination loop — real S3 usage never needs
 /// more than a handful of 1000-key pages for one prefix; this exists so a
 /// misbehaving/malicious endpoint returning an unbounded `IsTruncated: true`
@@ -95,6 +175,7 @@ pub struct S3SegmentStore<T: Transport> {
     /// skew — but the hook costs nothing and keeps a future caller that does
     /// care from needing a second constructor).
     clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    multipart: MultipartConfig,
 }
 
 // Manual `Clone`, not `#[derive(Clone)]`: every field is already cheap to
@@ -108,6 +189,7 @@ impl<T: Transport> Clone for S3SegmentStore<T> {
             client: self.client.clone(),
             prefix: self.prefix.clone(),
             clock: self.clock.clone(),
+            multipart: self.multipart,
         }
     }
 }
@@ -175,6 +257,7 @@ impl<T: Transport> S3SegmentStore<T> {
             client: Arc::new(S3Client::new(transport, config)),
             prefix: prefix.filter(|p| !p.is_empty()),
             clock: Arc::new(real_now_epoch_ms),
+            multipart: MultipartConfig::default(),
         }
     }
 
@@ -188,6 +271,7 @@ impl<T: Transport> S3SegmentStore<T> {
             client: Arc::new(client),
             prefix: prefix.filter(|p| !p.is_empty()),
             clock: Arc::new(real_now_epoch_ms),
+            multipart: MultipartConfig::default(),
         }
     }
 
@@ -199,6 +283,13 @@ impl<T: Transport> S3SegmentStore<T> {
     #[doc(hidden)]
     pub fn with_clock(mut self, clock: Arc<dyn Fn() -> u64 + Send + Sync>) -> Self {
         self.clock = clock;
+        self
+    }
+
+    /// Override the multipart threshold/part size (default: 64 MiB / 16 MiB).
+    #[must_use]
+    pub fn with_multipart(mut self, multipart: MultipartConfig) -> Self {
+        self.multipart = multipart;
         self
     }
 
@@ -227,6 +318,97 @@ impl<T: Transport> S3SegmentStore<T> {
                 .to_string(),
             None => key.to_string(),
         }
+    }
+
+    /// The one bounded-retry loop the multipart/ranged operations share:
+    /// `op` is called with a fresh `now_epoch_ms` per attempt.
+    async fn retry_op<R, F, Fut>(&self, op: F) -> Result<R, S3Error>
+    where
+        F: Fn(u64) -> Fut,
+        Fut: std::future::Future<Output = Result<R, S3Error>>,
+    {
+        let mut attempt = 0u32;
+        loop {
+            match op(self.now_ms()).await {
+                Ok(v) => return Ok(v),
+                Err(e) if attempt < MAX_RETRY_ATTEMPTS && is_retryable(&e) => {
+                    attempt += 1;
+                    tokio::time::sleep(RETRY_BASE_DELAY * attempt).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Upload `bytes` as a multipart upload; abort it (best effort) if any
+    /// step finally fails.
+    async fn put_multipart(&self, key: &str, bytes: &[u8]) -> Result<(), S3Error> {
+        let part_size = self.multipart.effective_part_size(bytes.len() as u64) as usize;
+        let upload_id = self
+            .retry_op(|now| self.client.create_multipart_upload(key, now))
+            .await?;
+        let result: Result<(), S3Error> = async {
+            let mut parts = Vec::new();
+            for (i, chunk) in bytes.chunks(part_size).enumerate() {
+                let n = u32::try_from(i + 1).unwrap_or(u32::MAX);
+                let etag = self
+                    .retry_op(|now| {
+                        self.client
+                            .upload_part(key, &upload_id, n, chunk.to_vec(), now)
+                    })
+                    .await?;
+                parts.push((n, etag));
+            }
+            self.retry_op(|now| {
+                self.client
+                    .complete_multipart_upload(key, &upload_id, &parts, now)
+            })
+            .await
+        }
+        .await;
+        if result.is_err() {
+            // Best effort: a failed abort leaves an incomplete upload that
+            // a bucket lifecycle rule (AbortIncompleteMultipartUpload) reaps.
+            let _ = self
+                .retry_op(|now| self.client.abort_multipart_upload(key, &upload_id, now))
+                .await;
+        }
+        result
+    }
+
+    /// Whether the object at `key` already holds exactly `bytes`:
+    /// `Ok(None)` when absent, `Ok(Some(equal))` otherwise. `HEAD` first
+    /// (size mismatch short-circuits), then bounded-memory ranged compares.
+    async fn existing_equals(&self, key: &str, bytes: &[u8]) -> Result<Option<bool>, S3Error> {
+        let meta = match self.retry_op(|now| self.client.head_object(key, now)).await {
+            Ok(m) => m,
+            Err(S3Error::NotFound) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if meta.size != bytes.len() as u64 {
+            return Ok(Some(false));
+        }
+        let slice = self.multipart.effective_part_size(bytes.len() as u64) as usize;
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            let want = slice.min(bytes.len() - offset);
+            let got = match self
+                .retry_op(|now| {
+                    self.client
+                        .get_object_range(key, offset as u64, want as u64, now)
+                })
+                .await
+            {
+                Ok(g) => g,
+                Err(S3Error::NotFound) => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            if got != bytes[offset..offset + want] {
+                return Ok(Some(false));
+            }
+            offset += want;
+        }
+        Ok(Some(true))
     }
 
     async fn retry_get(&self, key: &str) -> Result<Vec<u8>, S3Error> {
@@ -305,21 +487,26 @@ impl<T: Transport> crate::SegmentStore for S3SegmentStore<T> {
         }
         let key = self.object_key(id);
         // Write-once (SegmentStore::put's own contract, mirroring
-        // FsSegmentStore::put exactly): fetch whatever is already there
+        // FsSegmentStore::put exactly): look at whatever is already there
         // first. An identical-content re-put is a safe no-op that skips the
         // network PUT entirely; a differing-content re-put is a hard error.
-        // Real S3 has no built-in "PUT only if absent," so this GET-then-PUT
-        // is how that contract is enforced at this layer — every real
+        // Real S3 has no built-in "PUT only if absent," so this check-then-
+        // PUT is how that contract is enforced at this layer — every real
         // caller writes each attempt at its own unique id (see the module
         // doc), so this should never actually observe a differing-content
-        // collision in practice.
-        match self.retry_get(&key).await {
-            Ok(existing) if existing == bytes => return Ok(()),
-            Ok(_) => return Err(write_once_violation(id)),
-            Err(S3Error::NotFound) => {}
+        // collision in practice. The check is a HEAD plus ranged compares,
+        // never a whole-object download (S-08 M2).
+        match self.existing_equals(&key, bytes).await {
+            Ok(Some(true)) => return Ok(()),
+            Ok(Some(false)) => return Err(write_once_violation(id)),
+            Ok(None) => {}
             Err(e) => return Err(map_io_error(e)),
         }
-        self.retry_put(&key, bytes).await.map_err(map_io_error)
+        if bytes.len() as u64 > self.multipart.threshold {
+            self.put_multipart(&key, bytes).await.map_err(map_io_error)
+        } else {
+            self.retry_put(&key, bytes).await.map_err(map_io_error)
+        }
     }
 
     async fn get(&self, id: &str) -> std::io::Result<Option<Vec<u8>>> {
@@ -635,5 +822,154 @@ mod tests {
                 "page-test/4".to_string(),
             ]
         );
+    }
+
+    // --- S-08 M2: multipart + ranged write-once -------------------------
+
+    use super::MultipartConfig;
+    use crate::SegmentStore as _;
+    use std::sync::Arc;
+
+    const PART: usize = 16;
+
+    fn mp_store(fake: Arc<FakeS3>) -> S3SegmentStore<Arc<FakeS3>> {
+        let config = S3Config {
+            endpoint: "http://fake.example:9000".to_string(),
+            bucket: "test-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            credentials: Credentials::new("AKIDTEST", "secret"),
+        };
+        S3SegmentStore::new(fake, config, None)
+            .with_multipart(MultipartConfig::new_unchecked(40, PART as u64))
+    }
+
+    fn mp_fake() -> Arc<FakeS3> {
+        Arc::new(
+            FakeS3::new("test-bucket")
+                .with_credential("AKIDTEST", "secret")
+                .with_min_part_size(PART),
+        )
+    }
+
+    fn payload(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i * 13 % 247) as u8).collect()
+    }
+
+    fn count(fake: &FakeS3, needle: &str) -> usize {
+        fake.request_log()
+            .iter()
+            .filter(|l| l.contains(needle))
+            .count()
+    }
+
+    #[test]
+    fn multipart_config_validates_part_size_and_caps_part_count() {
+        assert!(MultipartConfig::new(64, 5 * 1024 * 1024 - 1).is_err());
+        let ok = MultipartConfig::new(64, 5 * 1024 * 1024).expect("5 MiB is the minimum");
+        // 10_000 parts of 5 MiB cover 50_000 MiB; beyond that parts grow.
+        let big = 10_000u64 * 5 * 1024 * 1024 * 2;
+        assert!(ok.effective_part_size(big) * 10_000 >= big);
+        assert_eq!(ok.effective_part_size(1024), 5 * 1024 * 1024);
+        let d = MultipartConfig::default();
+        assert_eq!((d.threshold, d.part_size), (64 << 20, 16 << 20));
+    }
+
+    #[tokio::test]
+    async fn put_above_threshold_goes_multipart_and_below_does_not() {
+        let fake = mp_fake();
+        let store = mp_store(fake.clone());
+        let small = payload(40); // == threshold: single PUT
+        store.put("s/small", &small).await.expect("small");
+        assert_eq!(count(&fake, "uploads"), 0);
+
+        let big = payload(PART * 3 + 5);
+        store.put("s/big", &big).await.expect("big");
+        assert_eq!(count(&fake, "POST /test-bucket/s/big?uploads"), 1);
+        assert_eq!(
+            count(&fake, "partNumber"),
+            4,
+            "3 full parts + a 5-byte tail"
+        );
+        assert_eq!(count(&fake, "POST /test-bucket/s/big?uploadId"), 1);
+        assert_eq!(fake.open_upload_count(), 0);
+        assert_eq!(store.get("s/big").await.expect("get"), Some(big));
+        assert_eq!(store.get("s/small").await.expect("get"), Some(small));
+    }
+
+    #[tokio::test]
+    async fn failed_part_aborts_the_upload_and_returns_the_error() {
+        let fake = mp_fake();
+        let store = mp_store(fake.clone());
+        fake.fail_upload_part(2, 1_000);
+        let err = store
+            .put("s/big", &payload(PART * 3))
+            .await
+            .expect_err("a permanently failing part must fail the put");
+        assert!(err.to_string().contains("InternalError"), "{err}");
+        assert_eq!(fake.open_upload_count(), 0, "upload must be aborted");
+        assert_eq!(store.get("s/big").await.expect("get"), None);
+        assert_eq!(count(&fake, "DELETE /test-bucket/s/big?uploadId"), 1);
+    }
+
+    #[tokio::test]
+    async fn transient_part_failure_is_retried_within_budget() {
+        let fake = mp_fake();
+        let store = mp_store(fake.clone());
+        fake.fail_upload_part(2, 2);
+        let big = payload(PART * 3);
+        store.put("s/big", &big).await.expect("retried");
+        assert_eq!(store.get("s/big").await.expect("get"), Some(big));
+        assert_eq!(fake.open_upload_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn error_in_200_on_complete_aborts_and_fails() {
+        let fake = mp_fake();
+        let store = mp_store(fake.clone());
+        fake.set_complete_error_in_200(Some("InvalidPart"));
+        store
+            .put("s/big", &payload(PART * 3))
+            .await
+            .expect_err("a 200 carrying <Error> must fail the put");
+        assert_eq!(fake.open_upload_count(), 0);
+        assert_eq!(store.get("s/big").await.expect("get"), None);
+    }
+
+    #[tokio::test]
+    async fn multipart_sized_write_once_uses_head_and_ranged_compare() {
+        let fake = mp_fake();
+        let store = mp_store(fake.clone());
+        let big = payload(PART * 3 + 5);
+        store.put("s/big", &big).await.expect("first");
+
+        let uploads_before = count(&fake, "uploads");
+        let puts_before = count(&fake, "PUT ");
+        // Identical re-put: a no-op, compared via HEAD + ranged GETs.
+        store.put("s/big", &big).await.expect("idempotent re-put");
+        assert_eq!(count(&fake, "uploads"), uploads_before, "no new upload");
+        assert_eq!(count(&fake, "PUT "), puts_before, "no new part/PUT");
+        assert!(count(&fake, "HEAD ") >= 1);
+
+        // Same size, different content: violation, found via ranged GET.
+        let mut other = big.clone();
+        *other.last_mut().expect("non-empty") ^= 0xff;
+        let err = store.put("s/big", &other).await.expect_err("violation");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        // Different size: violation, found via HEAD alone (no ranged GET).
+        let gets = count(&fake, "GET ");
+        let err = store
+            .put("s/big", &payload(PART * 3))
+            .await
+            .expect_err("size mismatch");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(count(&fake, "GET "), gets, "size mismatch needs no GET");
+        assert_eq!(store.get("s/big").await.expect("get"), Some(big));
+    }
+
+    #[tokio::test]
+    async fn contract_holds_with_multipart_forced_on() {
+        let fake = mp_fake();
+        let store = mp_store(fake).with_multipart(MultipartConfig::new_unchecked(0, PART as u64));
+        crate::test_support::assert_segment_store_contract(&store).await;
     }
 }

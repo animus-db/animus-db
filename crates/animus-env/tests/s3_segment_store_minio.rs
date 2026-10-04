@@ -23,7 +23,7 @@
 //! ```
 #![cfg(feature = "prod")]
 
-use animus_env::S3SegmentStore;
+use animus_env::{MultipartConfig, S3SegmentStore, SegmentStore as _};
 use animus_s3::client::S3Config;
 use animus_s3::prod::HyperRustlsTransport;
 use animus_s3::sigv4::Credentials;
@@ -68,6 +68,32 @@ async fn s3_segment_store_contract_against_a_real_endpoint() {
         transport,
         config,
         Some("animus-env-contract-test".to_string()),
-    );
+    )
+    // S-08 M2: a 6 MiB threshold with 5 MiB parts makes the 11 MiB object
+    // below a 3-part multipart upload (5 + 5 + 1 MiB) on the real endpoint.
+    .with_multipart(MultipartConfig::new(6 * MIB, 5 * MIB).expect("valid multipart config"));
     animus_env::test_support::assert_segment_store_contract(&store).await;
+
+    let id = "multipart/object-11mib";
+    let payload: Vec<u8> = (0..(11 * MIB) as usize)
+        .map(|i| (i * 17 % 251) as u8)
+        .collect();
+    store.put(id, &payload).await.expect("multipart put");
+    assert!(
+        store.get(id).await.expect("get").as_deref() == Some(payload.as_slice()),
+        "multipart object content mismatch"
+    );
+    // Idempotent re-put (HEAD + ranged compare), then a same-size differing
+    // re-put must be a write-once violation.
+    store.put(id, &payload).await.expect("idempotent re-put");
+    let mut other = payload.clone();
+    *other.last_mut().expect("non-empty") ^= 0xff;
+    let err = store
+        .put(id, &other)
+        .await
+        .expect_err("write-once violation");
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    store.delete(id).await.expect("cleanup");
 }
+
+const MIB: u64 = 1024 * 1024;
