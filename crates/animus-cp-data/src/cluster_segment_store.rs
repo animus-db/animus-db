@@ -93,6 +93,7 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use animus_control::version::Gate;
 use animus_env::{Env, EnvExt, NodeId, SegmentStore};
 use animus_placement::{Candidate, PlacementPolicy, select_replicas};
 use serde::{Deserialize, Serialize};
@@ -248,7 +249,33 @@ enum WireOptResult {
     Err(String),
 }
 
+impl SegmentWire {
+    /// ADR 0073 Phase 2 (section 8, class **G**): the gate this message needs.
+    /// An **exhaustive match with no `_` arm**: a new variant (or a changed
+    /// field set) does not compile until it names its gate. Every variant
+    /// that exists today is `Gate::Base` (Phase 1 already emits exactly
+    /// these), so nothing is gated today. [`encode`] debug-asserts it, so the
+    /// first non-`Base` variant cannot ship through the ungated sender: its
+    /// author must add a feature-handle check at the send site (this store
+    /// has no `ClusterFeatures` yet) and then relax the assertion.
+    fn required_gate(&self) -> Gate {
+        match self {
+            SegmentWire::Store { .. }
+            | SegmentWire::StoreAck { .. }
+            | SegmentWire::Fetch { .. }
+            | SegmentWire::FetchReply { .. }
+            | SegmentWire::Delete { .. }
+            | SegmentWire::DeleteAck { .. } => Gate::Base,
+        }
+    }
+}
+
 fn encode(msg: &SegmentWire) -> Vec<u8> {
+    debug_assert_eq!(
+        msg.required_gate(),
+        Gate::Base,
+        "a gated SegmentWire variant needs a gated send path (ADR 0073 section 8)"
+    );
     serde_json::to_vec(msg).expect("SegmentWire always serializes")
 }
 
@@ -923,6 +950,68 @@ async fn serve_loop<E: Env, S: SegmentStore>(
             SegmentWire::DeleteAck { req_id, result } => {
                 stash_reply(&pending, req_id, PendingReply::Delete(result));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    /// ADR 0073 section 8: `SegmentWire` is class G and every variant is
+    /// `Gate::Base`; the exact JSON of each is pinned, so a changed variant
+    /// or field (which a Phase 1 peer would fail to decode, whole-message)
+    /// shows up here and must be gated before it ships.
+    #[test]
+    fn every_segment_wire_variant_is_base_and_byte_pinned() {
+        let cases: [(SegmentWire, &str); 6] = [
+            (
+                SegmentWire::Store {
+                    req_id: 1,
+                    id: "a".into(),
+                    bytes: vec![7],
+                },
+                r#"{"Store":{"req_id":1,"id":"a","bytes":[7]}}"#,
+            ),
+            (
+                SegmentWire::StoreAck {
+                    req_id: 1,
+                    result: WireResult::Ok,
+                },
+                r#"{"StoreAck":{"req_id":1,"result":"Ok"}}"#,
+            ),
+            (
+                SegmentWire::Fetch {
+                    req_id: 2,
+                    id: "a".into(),
+                },
+                r#"{"Fetch":{"req_id":2,"id":"a"}}"#,
+            ),
+            (
+                SegmentWire::FetchReply {
+                    req_id: 2,
+                    result: WireOptResult::NotFound,
+                },
+                r#"{"FetchReply":{"req_id":2,"result":"NotFound"}}"#,
+            ),
+            (
+                SegmentWire::Delete {
+                    req_id: 3,
+                    id: "a".into(),
+                },
+                r#"{"Delete":{"req_id":3,"id":"a"}}"#,
+            ),
+            (
+                SegmentWire::DeleteAck {
+                    req_id: 3,
+                    result: WireResult::Err("e".into()),
+                },
+                r#"{"DeleteAck":{"req_id":3,"result":{"Err":"e"}}}"#,
+            ),
+        ];
+        for (msg, json) in cases {
+            assert_eq!(msg.required_gate(), Gate::Base, "{msg:?}");
+            assert_eq!(String::from_utf8(encode(&msg)).unwrap(), json);
         }
     }
 }
