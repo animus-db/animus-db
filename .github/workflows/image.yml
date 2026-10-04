@@ -194,7 +194,11 @@ jobs:
         if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
         with:
-          name: digests-${{ matrix.target }}-${{ matrix.suffix }}
+          # `--` delimits the target: with a single `-`, the `runtime`
+          # merge job's `digests-runtime-*` pattern also matched the
+          # operator's `digests-runtime-operator-amd64`, and `imagetools
+          # create` then failed on a digest absent from the animusd repo.
+          name: digests--${{ matrix.target }}--${{ matrix.suffix }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
@@ -222,7 +226,7 @@ jobs:
       - name: Download digests
         uses: actions/download-artifact@v4
         with:
-          pattern: digests-${{ matrix.target }}-*
+          pattern: digests--${{ matrix.target }}--*
           path: /tmp/digests
           merge-multiple: true
 
