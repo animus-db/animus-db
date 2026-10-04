@@ -41,14 +41,32 @@
 //!   variant through the control leader while a Phase 1 voter exists; the oracle
 //!   MUST fail with the exact expected violations.
 //!
-//! # Pending (not registered, so nothing passes vacuously)
+//! - `ladder_finalize_each_gate`: the synthetic gate ladder over `SimCluster`
+//!   (every node `Release(3)` except one `Release(2)`): gate 2 opens at the
+//!   first finalize on every node (the data-only node through its mirror),
+//!   gate 3 stays closed and the second finalize is refused by name while the
+//!   `[1,2]` node is recorded, opens after it rolls, and each gate's command is
+//!   accepted everywhere with no capped rejection;
+//! - `negative_control_ungated_variant` / `_ungated_field` / `_stale_view`
+//!   (N2-N4): at cluster version 2 a gate-3 value is emitted the wrong way
+//!   (gate check skipped, a payload field the classifier does not know, a
+//!   feature handle opened on a forged view). The oracle MUST report the
+//!   capped rejection at the `Release(2)` node, exactly that node wedged and
+//!   the value applied before its gate;
+//! - `joiner_phase1_after_era` / `joiner_phase1_dials_data_only_node`: a Phase
+//!   1 joiner is refused at the seed's handshake (counted, never registered);
+//!   the data-only variant dials a node whose require-peer-ext flag is latched
+//!   by the version feeder from the mirror (`ControlHandle::Remote`); a B2
+//!   joiner through the same seed is admitted and recorded;
+//! - `joiner_range_checks`: the joiner's discovery check against
+//!   `JoinInfo.cluster_version` (above max / below min refused by name before
+//!   a `RegisterNode`, in-range joiners recorded with their range; a disjoint
+//!   range is refused one layer earlier, at the handshake).
 //!
-//! - Phase 1 *joiners* after the era and the data-only node's own era flag: P2-C
-//!   (`ControlHandle::Remote` flips `require_peer_ext`; `RegisterNode` joiners).
-//! - "Gate 2 opens only after every row reports" with a real emitter, and the
-//!   synthetic gate ladder: P2-B (`required_gate` tables) + P2-C (`ClusterFeatures`
-//!   fed into emitters).
-//! - `Release(N-1) -> Release(N)` rolls over real gates: first real gate.
+//! # Not covered (needs a real gate)
+//!
+//! - `Release(N-1) -> Release(N)` rolls over real gates: the first real gate
+//!   (ADR 0073 section 7 rule 3). The synthetic ladder stands in until then.
 //!
 //! Each cell runs on its own OS thread under a wall-clock watchdog
 //! ([`CELL_WATCHDOG`], a bound on a hang, never a verdict).
@@ -96,6 +114,27 @@ enum Kind {
     KillB2Leader,
     MemberDown,
     NegativeControl,
+    /// The synthetic gate ladder: gate 2 then gate 3 open at their finalizes.
+    Ladder,
+    /// N2/N3/N4 over the ladder at cluster version 2.
+    LadderNegative(Neg),
+    /// A Phase 1 joiner after the era (`via_data`: dialing the data-only node).
+    Phase1Joiner {
+        via_data: bool,
+    },
+    /// Joiner range checks at discovery (`RegisterNode` joiners).
+    JoinerRange,
+}
+
+/// The three ladder negative controls (ADR 0073 section 7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Neg {
+    /// The emitter skips the gate check.
+    UngatedVariant,
+    /// A payload field the classifier does not know (`required_gate` = Base).
+    UngatedField,
+    /// The emitter's feature handle opened on a forged, newer view.
+    StaleView,
 }
 
 const ORDERS: [[u64; 4]; 4] = [[0, 1, 2, 3], [3, 2, 1, 0], [3, 0, 1, 2], [2, 3, 0, 1]];
@@ -141,6 +180,28 @@ fn cells() -> Vec<Cell> {
             "negative_control_premature_era_variant",
             Kind::NegativeControl,
         ),
+        cell("ladder_finalize_each_gate", Kind::Ladder),
+        cell(
+            "negative_control_ungated_variant",
+            Kind::LadderNegative(Neg::UngatedVariant),
+        ),
+        cell(
+            "negative_control_ungated_field",
+            Kind::LadderNegative(Neg::UngatedField),
+        ),
+        cell(
+            "negative_control_stale_view",
+            Kind::LadderNegative(Neg::StaleView),
+        ),
+        cell(
+            "joiner_phase1_after_era",
+            Kind::Phase1Joiner { via_data: false },
+        ),
+        cell(
+            "joiner_phase1_dials_data_only_node",
+            Kind::Phase1Joiner { via_data: true },
+        ),
+        cell("joiner_range_checks", Kind::JoinerRange),
     ]
 }
 
@@ -241,6 +302,10 @@ fn assert_ok(v: &Verdict) {
 fn run(c: &Cell) -> Verdict {
     match c.kind {
         Kind::NegativeControl => run_negative_control(c),
+        Kind::Ladder => run_ladder(c),
+        Kind::LadderNegative(n) => run_ladder_negative(c, n),
+        Kind::Phase1Joiner { via_data } => run_phase1_joiner(c, via_data),
+        Kind::JoinerRange => run_joiner_range(c),
         _ => run_roll(c),
     }
 }
@@ -266,6 +331,27 @@ fn instant_violations(cluster: &SimCluster, delivery: bool) -> Vec<String> {
             v.push(format!(
                 "Phase 1 node {n}'s applied Metadata shows versioning fields"
             ));
+        }
+    }
+    // Gate discipline at apply: a value carrying a synthetic gate/field label
+    // `n` is applied only once the cluster version reached `n`.
+    for n in CONTROL {
+        let m = cluster.metadata(n);
+        for (node, mem) in &m.members {
+            for k in [
+                animus_control::version::SYNTHETIC_GATE_LABEL,
+                animus_control::sim_versions::SYNTHETIC_FIELD_LABEL,
+            ] {
+                if let Some(need) = mem.labels.get(k).and_then(|x| x.parse::<u32>().ok())
+                    && m.cluster_version() < need
+                {
+                    v.push(format!(
+                        "gate applied early: node {n} applied {k}={need} on {node:?} at \
+                         cluster version {}",
+                        m.cluster_version()
+                    ));
+                }
+            }
         }
     }
     if delivery {
@@ -485,7 +571,11 @@ fn run_roll(c: &Cell) -> Verdict {
             cluster.heal_all();
             roll(&mut cluster, &mut w, 3, true);
         }
-        Kind::NegativeControl => unreachable!(),
+        Kind::NegativeControl
+        | Kind::Ladder
+        | Kind::LadderNegative(_)
+        | Kind::Phase1Joiner { .. }
+        | Kind::JoinerRange => unreachable!(),
     }
 
     // Liveness: the era starts once the last node is B2, every node recorded.
@@ -693,6 +783,465 @@ fn run_negative_control(c: &Cell) -> Verdict {
 }
 
 // ---------------------------------------------------------------------------
+// P2-D cells that need no workload: the synthetic gate ladder, N2-N4, joiners
+// ---------------------------------------------------------------------------
+
+/// The previous-release node of the ladder cells: `Release(2)`, range `[1,2]`.
+const OLD: u64 = 2;
+/// The data-only node.
+const DATA: u64 = 3;
+
+fn light_cluster(seed: u64) -> SimCluster {
+    let mut cluster = SimCluster::new_with_roles(seed, &ROLES, 2);
+    let _ = cluster.control_leader_index();
+    cluster
+}
+
+fn control_leader(cluster: &mut SimCluster) -> u64 {
+    let idx = cluster.control_leader_index();
+    cluster.control_node_id(idx)
+}
+
+/// Every node plays a `Release(n)` binary: `OLD` is `[1,2]`, the rest `[1,3]`.
+fn play_ladder_binaries(cluster: &mut SimCluster) {
+    for n in 0..NODES {
+        let (lo, hi) = if n == OLD { (1, 2) } else { (1, 3) };
+        cluster.set_binary_profile(n, BinaryProfile::Release(hi));
+        cluster.set_node_version(n, Some(VersionRange::new(lo, hi)));
+    }
+}
+
+fn marked(label: &str, gate: u32) -> MetaCommand {
+    MetaCommand::UpsertMember {
+        node: nid(DATA),
+        labels: [(label.to_string(), gate.to_string())].into(),
+        status: animus_control::NodeStatus::Active,
+    }
+}
+
+fn marked_applied(m: &animus_control::Metadata, label: &str, gate: u32) -> bool {
+    m.members
+        .get(&nid(DATA))
+        .is_some_and(|mem| mem.labels.get(label) == Some(&gate.to_string()))
+}
+
+fn finalize(cluster: &mut SimCluster, node: u64, body: &str) -> (u16, String) {
+    cluster.admin(
+        node,
+        "POST",
+        "/admin/cluster-version/finalize",
+        "",
+        body.as_bytes(),
+    )
+}
+
+/// Era on and every node recorded, then finalize to 2 and wait for every
+/// node's feature handle (the data-only node's through its mirror) to show it.
+fn ladder_to_v2(cluster: &mut SimCluster, w: &mut Watch) {
+    play_ladder_binaries(cluster);
+    if !converge(cluster, |c| {
+        w.sample(c);
+        (0..NODES).all(|n| c.features(n).era_active())
+            && (0..NODES).all(|n| c.metadata(n).node_versions.len() == NODES as usize)
+    }) {
+        w.violations.push("the era never started".into());
+    }
+    let l = control_leader(cluster);
+    let (status, body) = finalize(cluster, l, r#"{"to":2,"expected":1}"#);
+    if status != 200 {
+        w.violations
+            .push(format!("finalize 1 -> 2: {status} {body}"));
+    }
+    if !converge(cluster, |c| {
+        w.sample(c);
+        (0..NODES).all(|n| c.features(n).cluster_version() == 2)
+    }) {
+        w.violations
+            .push("not every node observed cluster version 2".into());
+    }
+}
+
+fn verdict_of(c: &Cell, violations: Vec<String>, cap_fired: bool) -> Verdict {
+    Verdict {
+        cell: c.name.clone(),
+        seed: c.seed,
+        violations,
+        acks: (0, 0, 0),
+        cap_fired,
+    }
+}
+
+fn run_ladder(c: &Cell) -> Verdict {
+    use animus_control::version::{Gate, SYNTHETIC_GATE_LABEL};
+    let mut cluster = light_cluster(c.seed);
+    let mut w = Watch::new(true);
+    ladder_to_v2(&mut cluster, &mut w);
+    // Gate 2 is open on every node, gate 3 closed.
+    for n in 0..NODES {
+        let f = cluster.features(n);
+        if !(f.is_open(Gate::Synthetic(2)) && !f.is_open(Gate::Synthetic(3))) {
+            w.violations
+                .push(format!("node {n}: gate 2/3 not open/closed at version 2"));
+        }
+    }
+    if !matches!(
+        cluster.propose_meta(marked(SYNTHETIC_GATE_LABEL, 2)),
+        ProposeResult::Accepted { .. }
+    ) {
+        w.violations
+            .push("a gate-2 command was refused at version 2".into());
+    }
+    if !converge(&mut cluster, |c| {
+        w.sample(c);
+        CONTROL
+            .iter()
+            .all(|&n| marked_applied(&c.metadata(n), SYNTHETIC_GATE_LABEL, 2))
+    }) {
+        w.violations
+            .push("the gate-2 command never applied everywhere".into());
+    }
+    // Finalize to 3 is blocked, by name, by the previous-release node.
+    let l = control_leader(&mut cluster);
+    let old_id = cluster.handle().env(OLD).node_id();
+    let (status, body) = finalize(&mut cluster, l, "{}");
+    if status != 409 || !body.contains(&old_id.to_string()) || !body.contains("excludes target 3") {
+        w.violations.push(format!(
+            "finalize 2 -> 3 not blocked by name: {status} {body}"
+        ));
+    }
+    w.run(&mut cluster, Duration::from_secs(1));
+    if (0..NODES).any(|n| cluster.features(n).is_open(Gate::Synthetic(3))) {
+        w.violations
+            .push("gate 3 opened with a [1,2] node recorded".into());
+    }
+    // The node rolls to the next release; gate 3 opens at the finalize.
+    cluster.set_binary_profile(OLD, BinaryProfile::Release(3));
+    cluster.set_node_version(OLD, Some(VersionRange::new(2, 3)));
+    if !converge(&mut cluster, |c| {
+        w.sample(c);
+        let l = (0..NODES).find(|&n| c.is_control_leader(n));
+        l.is_some_and(|l| {
+            c.metadata(l)
+                .node_versions
+                .get(&old_id)
+                .is_some_and(|v| v.range == VersionRange::new(2, 3))
+        })
+    }) {
+        w.violations
+            .push("the rolled node's [2,3] record never landed".into());
+    }
+    let l = control_leader(&mut cluster);
+    let (status, body) = finalize(&mut cluster, l, r#"{"to":3,"expected":2}"#);
+    if status != 200 {
+        w.violations
+            .push(format!("finalize 2 -> 3: {status} {body}"));
+    }
+    if !converge(&mut cluster, |c| {
+        w.sample(c);
+        (0..NODES).all(|n| c.features(n).is_open(Gate::Synthetic(3)))
+    }) {
+        w.violations
+            .push("gate 3 never opened on every node".into());
+    }
+    if !matches!(
+        cluster.propose_meta(marked(SYNTHETIC_GATE_LABEL, 3)),
+        ProposeResult::Accepted { .. }
+    ) {
+        w.violations
+            .push("a gate-3 command was refused at version 3".into());
+    }
+    if !converge(&mut cluster, |c| {
+        w.sample(c);
+        CONTROL
+            .iter()
+            .all(|&n| marked_applied(&c.metadata(n), SYNTHETIC_GATE_LABEL, 3))
+    }) {
+        w.violations
+            .push("the gate-3 command never applied everywhere".into());
+    }
+    // Every hosted CP group's handle (fed from the same control view) agrees.
+    for n in 0..NODES {
+        let hosted = cluster.hosted_group_features(n);
+        if hosted.iter().any(|f| !f.is_open(Gate::Synthetic(3))) {
+            w.violations.push(format!(
+                "a group hosted on node {n} still has gate 3 closed"
+            ));
+        }
+    }
+    let wedged = {
+        let mut last = wedged_control(&cluster);
+        let _ = converge(&mut cluster, |c| {
+            last = wedged_control(c);
+            last.is_empty()
+        });
+        last
+    };
+    if !wedged.is_empty() {
+        w.violations
+            .push(format!("control replicas {wedged:?} wedged"));
+    }
+    w.sample(&cluster);
+    verdict_of(c, w.violations, false)
+}
+
+/// At cluster version 2 with a `Release(2)` voter, emit a gate-3 value the
+/// wrong way. The verdict lists every shortfall of the oracle (an empty list
+/// is the pass: the oracle caught the bad emit with the exact violations).
+fn run_ladder_negative(c: &Cell, neg: Neg) -> Verdict {
+    use animus_control::sim_versions::SYNTHETIC_FIELD_LABEL;
+    use animus_control::version::SYNTHETIC_GATE_LABEL;
+    let mut cluster = light_cluster(c.seed);
+    let mut w = Watch::new(true);
+    ladder_to_v2(&mut cluster, &mut w);
+    let setup = std::mem::take(&mut w.violations);
+    // A leader that is not the previous-release node.
+    if control_leader(&mut cluster) == OLD {
+        let _ = cluster.transfer_leadership(OLD, 0);
+        w.run(&mut cluster, Duration::from_secs(2));
+    }
+    let leader = control_leader(&mut cluster);
+    let mut v: Vec<String> = setup;
+    if leader == OLD {
+        v.push("could not move leadership off the previous-release node".into());
+    }
+    let pre = instant_violations(&cluster, true);
+    if !pre.is_empty() {
+        v.push(format!("violations before the bad emit: {pre:?}"));
+    }
+    let pre_log = cluster.control_last_log_index(OLD);
+    let accepted = match neg {
+        Neg::UngatedVariant => cluster.propose_meta_ungated(marked(SYNTHETIC_GATE_LABEL, 3)),
+        Neg::UngatedField => {
+            let cmd = marked(SYNTHETIC_FIELD_LABEL, 3);
+            if animus_control::version::GatedCommand::required_gate(&cmd)
+                != animus_control::version::Gate::Base
+            {
+                v.push("the field marker is classified: the control is vacuous".into());
+            }
+            cluster.propose_meta(cmd)
+        }
+        Neg::StaleView => {
+            let mut forged = cluster.metadata(leader);
+            let old_id = cluster.handle().env(OLD).node_id();
+            if let Some(nv) = forged.node_versions.get_mut(&old_id) {
+                nv.range = VersionRange::new(2, 3);
+            }
+            let out = forged.apply(&MetaCommand::FinalizeClusterVersion {
+                expected: 2,
+                target: 3,
+            });
+            if format!("{out:?}") != "Applied" {
+                v.push(format!("the forged view did not finalize: {out:?}"));
+            }
+            cluster.control_features(leader).update(&forged);
+            cluster.propose_meta(marked(SYNTHETIC_GATE_LABEL, 3))
+        }
+    };
+    if !matches!(accepted, ProposeResult::Accepted { .. }) {
+        v.push(format!("the bad emit was not accepted: {accepted:?}"));
+    }
+    w.run(&mut cluster, Duration::from_secs(6));
+    let wedged = wedged_control(&cluster);
+    if wedged != vec![OLD] {
+        v.push(format!("expected only node {OLD} wedged, got {wedged:?}"));
+    }
+    let cap_fired = w
+        .violations
+        .iter()
+        .any(|s| s.starts_with(&format!("delivery: node {OLD} (Release(2))")));
+    if !cap_fired {
+        v.push(format!(
+            "the cap never rejected the gate-3 value: {:?}",
+            w.violations
+        ));
+    }
+    if !w
+        .violations
+        .iter()
+        .any(|s| s.starts_with("gate applied early"))
+    {
+        v.push(format!(
+            "early application did not trip: {:?}",
+            w.violations
+        ));
+    }
+    if cluster.control_last_log_index(OLD) != pre_log {
+        v.push("the previous-release replica appended the gate-3 value".into());
+    }
+    verdict_of(c, v, cap_fired)
+}
+
+/// A Phase 1 binary joining after the era is refused at the seed's handshake
+/// (counted, never a member); the cluster is unaffected; a versioned joiner
+/// through the same seed is admitted and recorded. `via_data` dials the
+/// data-only node, whose require-peer-ext flag is latched by the version
+/// feeder from the mirror (`ControlHandle::Remote`), not by a local apply task.
+fn run_phase1_joiner(c: &Cell, via_data: bool) -> Verdict {
+    let mut cluster = light_cluster(c.seed);
+    let mut w = Watch::new(true);
+    for n in 0..NODES {
+        cluster.set_binary_profile(n, BinaryProfile::B2);
+        cluster.set_node_version(n, Some(VersionRange::new(1, 1)));
+    }
+    if !converge(&mut cluster, |cl| {
+        w.sample(cl);
+        (0..NODES).all(|n| cl.features(n).era_active())
+            && (0..NODES).all(|n| cl.metadata(n).node_versions.len() == NODES as usize)
+    }) {
+        w.violations.push("the era never started".into());
+    }
+    let seed_node = if via_data { DATA } else { 0 };
+    let leader = control_leader(&mut cluster);
+    let members_before = cluster.metadata(leader).node_addrs.len();
+    let nodes_before = cluster.node_count();
+    let refusals_before = cluster.simulator().protocol_refusals(&nid(seed_node));
+    let r = cluster.try_join_via_seed_as(seed_node as usize, NodeRole::Data, None);
+    if r.is_ok() {
+        w.violations
+            .push("a Phase 1 joiner was admitted after the era".into());
+    }
+    if cluster.simulator().protocol_refusals(&nid(seed_node)) <= refusals_before {
+        w.violations.push(format!(
+            "node {seed_node} never refused the Phase 1 joiner at the handshake"
+        ));
+    }
+    let leader = control_leader(&mut cluster);
+    if cluster.node_count() != nodes_before
+        || cluster.metadata(leader).node_addrs.len() != members_before
+    {
+        w.violations
+            .push("the refused Phase 1 joiner was registered".into());
+    }
+    // The cluster keeps committing.
+    let probe = MetaCommand::UpsertMember {
+        node: nid(DATA),
+        labels: [("probe".to_string(), "1".to_string())].into(),
+        status: animus_control::NodeStatus::Active,
+    };
+    if !matches!(cluster.propose_meta(probe), ProposeResult::Accepted { .. }) {
+        w.violations
+            .push("the cluster stopped committing after the refusal".into());
+    }
+    // Control: a versioned joiner through the same seed is admitted + recorded.
+    match cluster.try_join_via_seed_as(
+        seed_node as usize,
+        NodeRole::Data,
+        Some(VersionRange::new(1, 1)),
+    ) {
+        Err(e) => w
+            .violations
+            .push(format!("a B2 joiner was refused after the era: {e}")),
+        Ok(idx) => {
+            let id = cluster.handle().env(idx).node_id();
+            if !converge(&mut cluster, |cl| {
+                w.sample(cl);
+                let l = (0..NODES).find(|&n| cl.is_control_leader(n));
+                l.is_some_and(|l| cl.metadata(l).node_versions.contains_key(&id))
+            }) {
+                w.violations
+                    .push("the B2 joiner's version record never landed".into());
+            }
+        }
+    }
+    w.sample(&cluster);
+    verdict_of(c, w.violations, false)
+}
+
+/// The joiner's range check at discovery (`JoinInfo.cluster_version`): a
+/// binary whose range excludes the cluster version is refused by name before
+/// it claims an identity (`RegisterNode`); an in-range one joins and is
+/// recorded with its range.
+fn run_joiner_range(c: &Cell) -> Verdict {
+    let mut w = Watch::new(true);
+    let mut v = Vec::new();
+    // At cluster version 2, every node a `[1,3]` binary (so a joiner whose
+    // range merely excludes 2 still passes the handshake's range-overlap
+    // check and reaches the discovery check).
+    let mut cluster = light_cluster(c.seed);
+    for n in 0..NODES {
+        cluster.set_binary_profile(n, BinaryProfile::Release(3));
+        cluster.set_node_version(n, Some(VersionRange::new(1, 3)));
+    }
+    if !converge(&mut cluster, |cl| {
+        w.sample(cl);
+        (0..NODES).all(|n| cl.features(n).era_active())
+            && (0..NODES).all(|n| cl.metadata(n).node_versions.len() == NODES as usize)
+    }) {
+        v.push("the era never started".into());
+    }
+    let l = control_leader(&mut cluster);
+    let (status, body) = finalize(&mut cluster, l, r#"{"to":2,"expected":1}"#);
+    if status != 200 {
+        v.push(format!("finalize 1 -> 2: {status} {body}"));
+    }
+    if !converge(&mut cluster, |cl| {
+        w.sample(cl);
+        (0..NODES).all(|n| cl.features(n).cluster_version() == 2)
+    }) {
+        v.push("not every node observed cluster version 2".into());
+    }
+    let nodes = cluster.node_count();
+    for (range, want) in [
+        (
+            VersionRange::new(3, 4),
+            "cluster version 2 is below this binary's min 3",
+        ),
+        (
+            VersionRange::new(1, 1),
+            "cluster version 2 is above this binary's max 1 (downgrade is not supported)",
+        ),
+    ] {
+        match cluster.try_join_via_seed_as(0, NodeRole::Data, Some(range)) {
+            Ok(_) => v.push(format!("a {range:?} joiner joined a version-2 cluster")),
+            Err(e) if e.contains(want) => {}
+            Err(e) => v.push(format!("{range:?}: expected {want:?}, got {e}")),
+        }
+    }
+    if cluster.node_count() != nodes {
+        v.push("a refused joiner was assembled into the cluster".into());
+    }
+    // A range disjoint from every node's is refused one layer earlier, by the
+    // handshake (counted at the seed; discovery never answers).
+    let before = cluster.simulator().protocol_refusals(&nid(0));
+    if cluster
+        .try_join_via_seed_as(0, NodeRole::Data, Some(VersionRange::new(4, 5)))
+        .is_ok()
+    {
+        v.push("a disjoint-range joiner joined".into());
+    }
+    if cluster.simulator().protocol_refusals(&nid(0)) <= before {
+        v.push("the handshake never refused the disjoint-range joiner".into());
+    }
+    let leader = control_leader(&mut cluster);
+    let registered = cluster.metadata(leader).node_addrs.len();
+    if registered != NODES as usize {
+        v.push(format!("a refused joiner registered ({registered} rows)"));
+    }
+    for range in [VersionRange::new(1, 2), VersionRange::new(2, 3)] {
+        match cluster.try_join_via_seed_as(0, NodeRole::Data, Some(range)) {
+            Err(e) => v.push(format!("an in-range {range:?} joiner was refused: {e}")),
+            Ok(idx) => {
+                let id = cluster.handle().env(idx).node_id();
+                if !converge(&mut cluster, |cl| {
+                    w.sample(cl);
+                    let l = (0..NODES).find(|&n| cl.is_control_leader(n));
+                    l.is_some_and(|l| {
+                        cl.metadata(l)
+                            .node_versions
+                            .get(&id)
+                            .is_some_and(|nv| nv.range == range)
+                    })
+                }) {
+                    v.push(format!("the {range:?} joiner's record never landed"));
+                }
+            }
+        }
+    }
+    v.extend(w.violations);
+    verdict_of(c, v, false)
+}
+
+// ---------------------------------------------------------------------------
 // The tests
 // ---------------------------------------------------------------------------
 
@@ -722,7 +1271,8 @@ fn run_family(prefix: &str) {
     // N1: the capped decode must have rejected the premature variant on at
     // least one seed (it can lose a race to the era-on handshake refusal on
     // another, which wedges the replica just the same).
-    if prefix == "negative_control" && !narrowed && std::env::var("ANIMUS_SEED").is_err() {
+    if prefix == "negative_control_premature" && !narrowed && std::env::var("ANIMUS_SEED").is_err()
+    {
         assert!(
             fired,
             "the capped decode never rejected the premature variant"
@@ -749,7 +1299,42 @@ fn sim_cluster_mixed_version_corpus_member_down() {
 /// the oracle should have caught but did not; an empty list is the pass.
 #[test]
 fn sim_cluster_mixed_version_corpus_negative_control_is_caught() {
-    run_family("negative_control");
+    run_family("negative_control_premature");
+}
+
+#[test]
+fn sim_cluster_mixed_version_corpus_ladder() {
+    run_family("ladder_");
+}
+
+#[test]
+fn sim_cluster_mixed_version_corpus_negative_control_ungated_variant() {
+    run_family("negative_control_ungated_variant");
+}
+
+#[test]
+fn sim_cluster_mixed_version_corpus_negative_control_ungated_field() {
+    run_family("negative_control_ungated_field");
+}
+
+#[test]
+fn sim_cluster_mixed_version_corpus_negative_control_stale_view() {
+    run_family("negative_control_stale_view");
+}
+
+#[test]
+fn sim_cluster_mixed_version_corpus_phase1_joiner_after_era() {
+    run_family("joiner_phase1_after_era");
+}
+
+#[test]
+fn sim_cluster_mixed_version_corpus_data_only_node_refuses_phase1_joiner() {
+    run_family("joiner_phase1_dials_data_only_node");
+}
+
+#[test]
+fn sim_cluster_mixed_version_corpus_joiner_range_checks() {
+    run_family("joiner_range_checks");
 }
 
 #[test]
@@ -761,7 +1346,19 @@ fn sim_cluster_mixed_version_cell_names_and_seeds_are_unique() {
     assert_eq!(seeds.len(), cs.len(), "duplicate cell seed");
     // Every family test selects at least one cell (a filter that matches
     // nothing must not pass green).
-    for prefix in ["roll_", "kill_", "member_down", "negative_control"] {
+    for prefix in [
+        "roll_",
+        "kill_",
+        "member_down",
+        "negative_control_premature",
+        "ladder_",
+        "negative_control_ungated_variant",
+        "negative_control_ungated_field",
+        "negative_control_stale_view",
+        "joiner_phase1_after_era",
+        "joiner_phase1_dials_data_only_node",
+        "joiner_range_checks",
+    ] {
         assert!(
             cells().iter().any(|c| c.name.starts_with(prefix)),
             "family {prefix} is empty"
