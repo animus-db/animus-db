@@ -14,12 +14,18 @@ How to maintain this file:
 - When a new gap is found, add it with the same fields: **Gap**, **Plan**,
   **Reuse**, **Files**, **Tests**, **ADR**, **PRs**, **Size**, **Depends**.
 - Sizes are S (hours), M (a day or two), L (a week), XL (multi-week). They
-  are estimates for a stacked PR series delivered per `CLAUDE.md`'s session
+  are estimates for one workstream delivered per `CLAUDE.md`'s session
   operating mode, gates green throughout.
-- "PRs" is the suggested `gh-stack` shape. Anything with more than one
-  reviewable step stacks by default.
+- "PRs" is the internal milestones (commits) of that **one bigger PR per
+  workstream** (Session operating mode item 3 — no `gh-stack` series for
+  new work). An entry lists several PRs only where it is genuinely too big
+  for one, as independently mergeable workstream PRs, and says why.
+- ID prefixes: `W` wire, `S` security/storage/deploy, `C` core design,
+  `U` operator surfaces, `D` docs, `B` benchmarks, `R` release/readiness,
+  `G` global/geo.
 
-The next free ADR number at the time of writing is **0069** (0065 is
+The next free ADR number at the time of writing is **0074** (0073 is
+[Upgrade compatibility](adr/0073-upgrade-compatibility.md); 0065 is
 [Per-table throttling](adr/0065-per-table-throttling.md), W-08's design of
 record; 0066 is [SigV4 hardening](adr/0066-sigv4-hardening.md), S-02's;
 0067 is [Throughput-derived minimum tablet count](adr/0067-throughput-derived-minimum-tablet-count.md),
@@ -44,75 +50,9 @@ rows this section used to carry were fixed by the stale-prose sweep.
 
 ## 1. Wire surface (DynamoDB API)
 
-### W-07 PartiQL (`ExecuteStatement`, `BatchExecuteStatement`, `ExecuteTransaction`)
-
-- **Gap:** absent. Deliberately sized honestly: a new parser, a new error
-  surface, and a WHERE-to-key-bound-or-filter compiler that must not
-  diverge from `ConditionExpression` semantics.
-- **Plan:** new `crates/animus-dynamo/src/partiql.rs`, minimal grammar
-  (SELECT/INSERT/UPDATE/DELETE with WHERE on key attributes, `?`
-  placeholders only, never string interpolation), lowering onto the
-  existing `Operation` variants so `animusd` needs no new primitive.
-- **Reuse:** `SortKeyCondition` comparators for key WHERE clauses;
-  `decode_condition` for non-key WHERE as a filter; `TransactWriteItems`
-  for `ExecuteTransaction`.
-- **Tests:** new `dynamo_partiql.rs` end-to-end; unit tests in the module.
-- **ADR:** **yes** — pins the supported subset and the placeholder-only
-  discipline.
-- **PRs:** (1) ADR; (2) SELECT → Query/Scan; (3) INSERT/UPDATE/DELETE;
-  (4) Batch; (5) ExecuteTransaction. **Size:** XL.
-- **Depends:** soft: reuse W-01's `UpdateExpression` tokenizer (landed
-  2026-09-04) if it generalises.
-- **Status (2026-09-07):** PR 1, PR 2, and PR 3 landed. ADR
-  [0071](adr/0071-partiql-subset.md) pins the grammar, the placeholder-only
-  discipline, and the key-versus-filter lowering rule; concludes the W-01
-  tokenizer does *not* generalise, a hand-written lexer instead. PR 2 adds
-  `ExecuteStatement` with a PartiQL `SELECT` subset
-  (`crates/animus-dynamo/src/partiql.rs`), lowered onto `Operation::Query`/
-  `Operation::Scan` by building `animus-item::condition` types directly
-  from the parsed AST (not by round-tripping through `wire.rs`'s string
-  decoders), with an opaque versioned/statement-hashed `NextToken`. **PR 3**
-  adds `INSERT`/`UPDATE`/`DELETE`, lowered onto real `Operation::PutItem`/
-  `UpdateItem`/`DeleteItem` values and run through the exact same
-  `run_operation` dispatcher a client-built request of that shape already
-  uses (`animusd::dynamo::execute_statement`) — conditions, index
-  maintenance, streams, and throttling are all inherited with no new
-  write-path code. `INSERT`'s implicit `attribute_not_exists(pk)` maps a
-  `ConditionalCheckFailedException` to a new `DuplicateItemException` (or
-  swallows it under `ON CONFLICT DO NOTHING`); `UPDATE`'s implicit
-  `attribute_exists(pk)` fails a missing item; `DELETE` has no implicit
-  condition (matching plain `DeleteItem`'s own silent-no-op-on-missing-key
-  semantics). **A conservative widening past PR 1's own original scope**:
-  `RETURNING ALL OLD *`/`ALL NEW *` (`UPDATE`, both; `DELETE`, `ALL OLD`
-  only) is implemented in PR 3 rather than deferred, since it costs nothing
-  beyond wiring the statement's own clause onto the already-existing
-  `ReturnValues`/`UpdateReturnValues` fields — see ADR 0071's "As-built: PR
-  3" amendment. **PR 4** adds `BatchExecuteStatement`: 1 to 25 statements
-  (AWS's own cap), each the identical `parse_statement`/per-kind lowering
-  PR 2/3 already built, run independently through `execute_statement`
-  (`INSERT`/`UPDATE`/`DELETE`) or a restricted `SELECT` path
-  (`partiql::select_is_exact_key` — AWS limits a batch statement to a
-  single-item operation, so a range/filtered `SELECT` is a per-statement
-  error rather than lowering to a real `Query`/`Scan`) — no cross-statement
-  atomicity, mirroring `BatchWriteItem`/`BatchGetItem`'s own contract, with
-  a per-statement `AccessDenied` (not a whole-request rejection) on a
-  denied table. See ADR 0071's "As-built: PR 4" amendment for the full
-  response shape and error-code mapping. **PR 5** (`ExecuteTransaction`) is
-  implemented too: 1–25 statements parsed with the identical grammar, all-
-  `SELECT` lowered to one `TransactGet` per statement and run as one
-  `TransactGetItems` (each `SELECT` must be an exact-key read — no index,
-  no `ORDER BY`, no non-key `WHERE` term, since `TransactGetItems` has
-  nothing else to lower onto), all-`INSERT`/`UPDATE`/`DELETE` lowered to
-  one `TransactAction` per statement and run as one atomic
-  `TransactWriteItems` (`ClientRequestToken` idempotency and per-statement
-  `CancellationReasons` inherited unchanged from that existing machinery);
-  mixing `SELECT` with a mutation is a `ValidationException`; a
-  transaction statement's own `RETURNING`/`ON CONFLICT DO NOTHING` is
-  rejected rather than honored, since `TransactWriteItems` reports no item
-  image on a successful action and a transaction's condition failure
-  always cancels the whole transaction — see ADR 0071's "As-built: PR 5"
-  amendment. **The W-07 PartiQL train is now fully implemented and
-  complete** — PRs 1–5 all landed; this gap entry is closed.
+W-07 (PartiQL) is complete: all five PRs landed; the decision of record is
+[ADR 0071](adr/0071-partiql-subset.md) and its as-built amendments. Nothing
+outstanding on the wire surface at present.
 
 ---
 
@@ -248,6 +188,85 @@ rows this section used to carry were fixed by the stale-prose sweep.
   0060's own "Amendment (2026-09-06): S-07d" section.) **This closes
   S-07's whole item list (b/c/d/e all landed).**
 
+### S-08 S3 store credentials and large-object hardening (residual of S-04; assessed 2026-10-04)
+
+- **Gap (mostly closed — read this first):** root `CLAUDE.md` used to say
+  "an S3 `SegmentStore` backend [is a] deferred follow-up". **That was
+  stale: S-04 landed in full** (ADR 0059's 2026-09-06 amendment and
+  "As-built: PR 2"). Verified in code: the `SegmentStore` trait is
+  `crates/animus-env/src/lib.rs` (`put`/`get`/`delete`/`list`/`is_empty`);
+  `animus-s3` is a **client** (pure SigV4 signer, `S3Client` over a
+  `Transport` seam, a real `HyperRustlsTransport` behind its `prod`
+  feature, and an in-memory `FakeS3` that verifies signatures);
+  `animus_env::S3SegmentStore<T: Transport>`
+  (`crates/animus-env/src/s3_store.rs`) implements the trait with a
+  bounded retry (3 attempts, linear 100 ms step, transport errors and 5xx
+  only); `animusd` accepts `--segment-store`/`--backup-store
+  s3://bucket[/prefix]?endpoint=...&region=...[&path_style=true]
+  [&insecure_http=true]` plus `--s3-credentials PATH`/`--allow-insecure-s3`
+  (`crates/animusd/src/main.rs`, `parse_s3_uri`); `BackupStoreHandle::S3`
+  (`crates/animusd/src/lib.rs`) holds an `Arc<dyn SegmentStore>` that is
+  `S3SegmentStore<HyperRustlsTransport>` in production and a
+  `SimSegmentStore` only under `SimCluster`; `EncryptedSegmentStore`
+  (ADR 0069) wraps it with no extra variant; the operator wires
+  `spec.s3` (S-04 PR 3, `crates/animus-operator/src/crd.rs`
+  `S3StoreSpec`, credentials `Secret` mounted at `/etc/animus/s3`, egress
+  `NetworkPolicy` rule). S3 export/import (S-05, ADR 0068) landed too. An
+  opt-in MinIO/localstack test exists
+  (env-gated on `ANIMUS_S3_TEST_ENDPOINT`...) and
+  `.github/workflows/e2e-kind.yml` has a MinIO-backed `spec.s3.backupStore`
+  leg (CreateBackup/DescribeBackup against MinIO in `kind`). The
+  `cargo test` MinIO tests themselves are not run by any workflow.
+- **What genuinely remains** (each verified absent by grep of
+  `crates/animus-s3/src` and `crates/animus-env/src/s3_store.rs`):
+  1. **Credentials are static only.** `sigv4::Credentials` is
+     `{access_key_id, secret_access_key}` — no session token
+     (`X-Amz-Security-Token`), so STS/temporary credentials cannot be
+     signed at all; no IRSA/web-identity, IMDS/ECS, or credential refresh.
+     On EKS the only route is a long-lived key in a `Secret`.
+  2. **Single-PUT, whole-object GET.** No multipart upload (S3's 5 GiB
+     single-PUT ceiling, and one failed 3-attempt PUT restarts the whole
+     object); no ranged GET.
+  3. **Retry sleeps with `tokio::time::sleep`, not `env.sleep()`**
+     (`s3_store.rs` carries a module-level `#[allow(disallowed_methods)]`
+     because the store is deliberately not `Env`-generic), so the
+     retry/backoff policy has no seed-reproducible fault-injection
+     coverage; backoff is linear without jitter.
+  4. Path-style addressing only (`animus-s3` guide); virtual-hosted style
+     (needed by some GCS-interop/R2 setups) is unimplemented.
+  5. The `cargo test` MinIO tests (`crates/animus-s3/tests/minio_real_endpoint.rs`,
+     `crates/animus-env/tests/s3_segment_store_minio.rs`) are not CI-gated;
+     only the `kind` leg touches MinIO.
+- **Plan (one PR, M):** (a) add an optional `session_token` to
+  `Credentials` and sign it; a `CredentialProvider` trait in `animus-s3`
+  (static, env, file-with-refresh for projected service-account tokens,
+  web-identity `AssumeRoleWithWebIdentity` over the same `Transport`) with
+  expiry-aware refresh; `animusd` selects it via the `--s3-credentials`
+  file shape (additive `#[serde(default)]` fields, ADR 0035 discipline);
+  operator gains an optional `spec.s3` service-account/web-identity mode.
+  (b) multipart upload for objects over a threshold (create/upload-part/
+  complete/abort, abort on failure) behind `S3Client`, ranged GET if a
+  consumer needs it. (c) move the retry loop's sleep behind the seam (a
+  small `Sleeper` parameter or an `Env`-generic wrapper) and add a
+  `SimEnv` corpus over a fault-injecting `FakeS3` (5xx bursts, timeouts,
+  partial multipart, expired credentials) at a seed knob
+  `ANIMUS_S3_FAULT_SEEDS`; (d) a CI job running the two MinIO tests against a
+  service container (cheaper than the `kind` leg). Internal milestones: credentials, multipart, seam +
+  corpus, CI job. Real HTTP stays in `animus-s3`'s `prod` feature (ADR
+  0003; `crates/animus-env/CLAUDE.md`'s `prod` breakdown).
+- **Reuse:** `FakeS3`, `Transport`, `S3SegmentStore`'s contract test,
+  `S3StoreSpec`, `parse_s3_uri`.
+- **Files:** `crates/animus-s3/src/{sigv4,client,fake,prod}.rs`,
+  `crates/animus-env/src/s3_store.rs`, `crates/animusd/src/main.rs`,
+  `crates/animus-operator/src/{crd.rs,desired/}`, `.github/workflows/ci.yml`.
+- **Tests:** `animus-s3` signer vectors for the token header; the fault
+  corpus above; an operator CRD validation test; the MinIO job.
+- **ADR:** an amendment to ADR 0059 (S-04) is enough.
+- **PRs:** one PR, four commits as above.
+- **Size:** M (credentials + multipart are the bulk; most users on
+  MinIO/static keys are unaffected, so this is not urgent).
+- **Depends:** none.
+
 ---
 
 ## 3. Core design items still proposed
@@ -282,7 +301,8 @@ rows this section used to carry were fixed by the stale-prose sweep.
   (hundreds to thousands of hosted groups — untested at that scale
   anywhere in this codebase); or (b) a deployment need for RF > 3 driven
   by failure-domain spread rather than read scaling. Neither holds today.
-  No PRs planned.
+  No PRs planned. **C-17 now owns the measurement** (proposed
+  thresholds for reopening this item are stated there).
 
 ### C-04 Testability phases D and E (ADR 0061)
 
@@ -1519,7 +1539,7 @@ rows this section used to carry were fixed by the stale-prose sweep.
   amendment's own "what remains unowned" accounting and `crates/animusd/
   CLAUDE.md`'s consolidated closed-C-15 appendix.
 
-### C-16 Upgrade compatibility (ADR 0073) — Phases 0 and 1 done; Phase 2 design in review
+### C-16 Upgrade compatibility (ADR 0073) — Phases 0 and 1 done; Phase 2 in progress (P2-A merged)
 
 - **Gap (closed):** `website/index.html` listed "On-disk format stability,
   then rolling upgrades" as Planned with no ADR, roadmap entry, or issue
@@ -1584,8 +1604,8 @@ rows this section used to carry were fixed by the stale-prose sweep.
   rolling upgrades. The first real format bumps have landed
   (CWL/SWL v2 WAL sync markers, #1140/#1141, plus `raftkv-wal` v2), and the
   harness transcodes them to v1 for real; every other format is still v1. **Next: Phase 2** (replicated cluster version /
-  feature gate; **design in review 2026-10-03**, ADR 0073's "Phase 2 design"
-  amendment: workstreams P2-A..P2-D, knob `ANIMUS_UPGRADE_SEEDS`, no rollback
+  feature gate; design accepted in ADR 0073's "Phase 2 design"
+  amendment, **P2-A merged**: workstreams P2-A..P2-D, knob `ANIMUS_UPGRADE_SEEDS`, no rollback
   once a node has run the new binary; rolling-installable from today's
   Phase 1 binaries, never a stop-the-world step), then Phase 3. Phase 4 (lifting/rewriting root `CLAUDE.md`'s
   no-back-compat rule) is **already done** by this same maintainer
@@ -1617,8 +1637,468 @@ rows this section used to carry were fixed by the stale-prose sweep.
   its orchestration primitives, and on ADR 0060 for the operator's own
   `spec.image` handling.
 - **Status:** Phase 0 done (workstreams A-E merged, baseline `9a9f972f`);
-  Phase 1 done (2026-10-03); Phase 2 design in review (2026-10-03),
-  not started; Phase 3 not started, no owner or target wave yet.
+  Phase 1 done (2026-10-03); **Phase 2 in progress: P2-A has merged on
+  `main`** (`c4948113` version module + `Metadata` `node_versions`/
+  `cluster_version` + `ReportNodeVersion`/`FinalizeClusterVersion`,
+  `54c6c81a` handshake extension TLV and era-on refusal hook,
+  `04c2bef4` leader-local version observation / precondition P / era
+  start, `acf54d7f` era-on refusal of Phase 1 peers and the startup
+  cluster-version range check; `crates/animus-control/src/version.rs`,
+  `version_observe.rs`). **P2-B, P2-C and P2-D are not started** — no
+  `required_gate` exists in the code yet (ADR 0073 designs it as an
+  exhaustive match on the wire enums). Open issue #1168: the
+  `FinalizeClusterVersion` apply does not block on Down/Leaving/
+  never-activated Joining members (Decision 6). Phase 3 not started, no
+  owner or target wave yet.
+
+### B-01 Published benchmarks with disclosed methodology
+
+- **Gap:** `website/index.html` lists "Published benchmarks with disclosed
+  methodology" as Planned and `website/performance.html` commits to a
+  methodology (disclosed hardware, tail percentiles, both read modes
+  apart, a failure case in every run, reproducible, no DynamoDB
+  comparison charts) but there are no numbers and no roadmap entry. What
+  exists is a developer tool, not a publishable suite:
+  `crates/animusd/benches/cluster_bench.rs` (in-process 3-node `ProdEnv`
+  cluster on one host; raw HTTP/1.1 over `TcpStream`, **unauthenticated**
+  — no SigV4; sequential connect-per-request latency classes `PutItem`/
+  `GetItem` (both `ConsistentRead` modes)/`Query`/`Scan`; a **closed-loop**
+  concurrent-`PutItem` sweep; a leader-kill degraded phase; percentiles
+  over sorted samples, so **no coordinated-omission correction**; no
+  workload mix; no warm-up/steady-state split; manual, not in CI),
+  `crates/animus-storage/benches/engine_bench.rs` (single-threaded
+  storage-engine macro-bench, explicitly "not statistical rigor"), and
+  `crates/animus-cp-data/benches/wal_fsync_bench.rs` (a C-05 gating
+  bench: per-group files vs `SharedWal`, `ANIMUS_BENCH_GROUPS`).
+- **Plan:** a separate load-generator binary (new workspace member,
+  proposed `animus-bench`; a real-socket process boundary like
+  `animus-cli`, so it carries individually justified
+  `disallowed_methods` allows) that drives a
+  cluster **as a client** over the real DynamoDB wire with AWS-SDK-shaped,
+  SigV4-signed requests (reuse `animus_dynamo::sigv4::sign` or the AWS SDK as a
+  dependency — decide in the ADR).
+  1. **Workloads:** YCSB A–F mapped onto DynamoDB ops (A 50/50 read/update,
+     B 95/5, C read-only, D read-latest with inserts, E short scans via
+     `Query` on a sort key, F read-modify-write via conditional `UpdateItem`
+     or `TransactWriteItems`), zipfian and uniform key distributions,
+     item size and key count fixed and disclosed. Each read workload runs
+     twice, `ConsistentRead: true` and `false`, reported apart (ADR 0055).
+  2. **Open-loop generation with coordinated-omission correction:** a
+     fixed arrival-rate scheduler (intended send time, not actual), latency
+     measured from the intended time, recorded into an HdrHistogram
+     (`hdrhistogram` crate) — p50/p99/p99.9/p99.99/max; a throughput-vs-
+     latency sweep that finds the knee rather than a single closed-loop
+     number.
+  3. **Phases per run:** load, warm-up (discarded, length disclosed),
+     steady state, **degraded** (kill a node mid-run; a second variant
+     kills the tablet leader), recovery. Extends the existing degraded
+     phase from two op classes to the whole mix.
+  4. **Topology, fixed and disclosed:** separate client and server hosts
+     (not in-process on one box), a named instance type / disk model /
+     network, three nodes RF 3 as the baseline plus one scale-out point,
+     replica placement printed from `/admin` into the results file, TLS and
+     encryption at rest state recorded, `--shared-wal`/quiesce defaults
+     recorded. Results JSON carries git SHA, flags, kernel and hardware.
+  5. **Publication:** a methodology doc (`docs/benchmarks.md`) and a
+     results page generated into `website/` (extend `performance.html`;
+     keep its commitments table true — its "No comparison charts against
+     DynamoDB" row stays unless the maintainer reverses it in the ADR),
+     with raw output committed or attached to a release.
+  6. **Regression tracking:** a scheduled workflow on a **fixed, dedicated
+     runner** (self-hosted or a pinned bare-metal instance), never a shared
+     GitHub-hosted runner — `cluster_bench`'s own doc and the lessons log
+     ("a historical bench figure from a different host is not a baseline")
+     say shared-runner noise makes absolute numbers meaningless. Honest
+     handling: compare only against a baseline run **re-executed on the
+     same host in the same job** (A/B the base commit and the PR), report
+     the run-to-run spread, flag only changes beyond a disclosed
+     threshold, and treat a single outlier as a rerun, not a verdict.
+     Until the dedicated runner exists, the job is manual
+     (`workflow_dispatch`) and uploads artifacts only.
+  7. **Comparison rules (if the maintainer ever wants any):** like for
+     like only — same instance types and counts, same item/key shape,
+     same durability (fsync-acked writes vs the other system's setting),
+     `ConsistentRead` mode matched to the other system's read
+     consistency, replication factor matched, the other system's
+     configuration published in full and ideally reviewed by its own
+     community, versions pinned, and **no managed-service-vs-self-hosted
+     charts** (per `performance.html`). Not planned by default.
+- **Reuse:** `cluster_bench.rs`'s cluster bring-up, leader-kill helper and
+  JSON output shape; the `animusd` `ProdEnv` multi-process launch used by
+  its integration tests; `animus-dynamo`'s SigV4 code; `animus-test`'s
+  history recording for correctness-under-load cross-checks (B-01 can
+  optionally feed R-01's soak).
+- **Files:** new `crates/animus-bench/` (+ its `CLAUDE.md` row in root
+  `CLAUDE.md`), `crates/animusd/benches/cluster_bench.rs` (kept as the
+  in-process smoke), `docs/benchmarks.md`, `website/performance.html`,
+  `website/index.html` (Planned pill), `.github/workflows/bench.yml`.
+- **Tests:** unit tests for the open-loop scheduler and CO correction (a
+  stalled server must show a tail, a property a closed-loop loop hides);
+  the generator's own wire shapes against `animusd` in a `--cluster 3`
+  smoke at tiny sizes; no latency assertions anywhere (that is the
+  flakiness the green invariant forbids) — the regression job reports, a
+  human decides.
+- **ADR:** new ADR (next free number at time of writing: **0074**; renumber
+  if another session claims it first) pinning the workloads, the
+  topology, the CO method and the comparison rules.
+- **PRs:** one workstream PR with milestones: (1) generator crate +
+  workloads A–F + HDR histogram + CO tests, (2) phases incl. node kill +
+  results JSON, (3) methodology doc, ADR, website page, (4) bench workflow
+  (manual dispatch first). The first published numbers need a dedicated
+  host and are a follow-on run, not part of the code PR.
+- **Size:** L for the code and docs; the dedicated runner and the first
+  curated results are an operations task on top.
+- **Depends:** none to start. Feeds C-17 and R-01 (capacity planning).
+
+### C-17 Scale and density testing (per-node tablet density, metadata growth)
+
+- **Gap:** two documented decisions are waiting on measurements nobody has
+  taken. (1) **C-03** (log-only replicas, ADR 0044 phase 3) is deferred
+  because the per-group `RaftCore`/`RaftKvNode` in-memory bookkeeping and
+  its one `drive` task are unmeasured, and "hundreds to thousands of
+  hosted groups per node" has been produced nowhere in the repo (ADR 0044
+  2026-09-07 amendment). Only the per-engine idle footprint is measured
+  (`crates/animus-storage/tests/idle_engine_cost.rs`, ~8.1 KB/engine) and
+  the WAL fsync sweep (`wal_fsync_bench`, `ANIMUS_BENCH_GROUPS`
+  1/8/32/128 by default). (2) **ADR 0039** (Metadata as a tablet, section
+  6 "not planned") names two revisit criteria in its section 5 — control
+  voter `InstallSnapshot` catch-up taking multi-seconds-to-minutes
+  (`snapshot_installs`, `Metric::SnapshotInstalls`/`CpSnapshotInstalls` in
+  `crates/animus-env/src/metrics.rs`), and control-leader proposal-queue
+  growth (`append_entries_sent` plus control-WAL fsync) — and estimates
+  that only happens at tens of thousands of tablet+member+schema entities.
+  No test grows `Metadata` anywhere near that.
+- **Plan:** two tiers, because the tools prove different things.
+  **Tier 1 — `SimEnv`/`SimCluster` (logical scale, ordering, sizes; in
+  CI at small K, deep nightly).** Create N tables / force N tablets via
+  provisioned-throughput minimum tablet count (ADR 0067) and in-place
+  splits, then assert: control `Metadata` snapshot size and encode time vs
+  entity count (curve, not a threshold test), reconciler tick cost
+  (`host::Reconciler::plan` input/outputs per tick), `reconfigure_step`/
+  rebalance convergence in virtual time at 100/1k/10k tablets over 3/9/30
+  nodes, split storms, the mirror long-poll delta size on a 1-tablet change
+  at 10k tablets (`watch_deltas`), and quiesced-vs-active group counts
+  (ADR 0048). Knob `ANIMUS_SCALE_SEEDS=K`. `SimEnv` virtual time proves
+  *operation counts and message volume per tick*, not wall-clock CPU or
+  RSS — report counts (messages, proposals, bytes), never "it took X ms".
+  **Tier 2 — `ProdEnv` multi-process (RSS, CPU, fds, tasks, latency;
+  manual/scheduled, never a per-push gate).** Reuse B-01's generator and
+  topology: one data node hosting G groups for G in 100/500/1k/5k/10k,
+  each quiesced and each active at a fixed per-group write rate; record
+  RSS, CPU, open fds, tokio task count (add a metric if none exists),
+  heartbeat frames/s (`heartbeat_batch`), WAL fsync/s (`SharedWal`), idle
+  wake latency (quiesced group first-write), restart time (recover G
+  groups), and p99 client latency for a hot tablet while the other G-1 are
+  idle vs active. Then cluster node-count scaling 3/6/12/24 with data
+  proportional.
+- **Decisions this produces (proposed thresholds, to be ratified in the
+  ADR before the run, so results cannot move the goalposts):**
+  - **Reopens C-03** if, at 1,000 hosted groups per node, *quiesced*
+    per-group overhead exceeds 64 KB RSS or any nonzero steady CPU, or
+    *active* per-group overhead (excluding engine memtables) exceeds
+    1 MB RSS or a hot tablet's p99 degrades by more than 2x versus the
+    1-group baseline — i.e. the per-group `RaftCore`/task cost bites at a
+    realistic density. Below that, C-03 stays deferred and ADR 0044's
+    amendment is updated with the measured numbers (also a valid outcome).
+    Condition (b) of C-03 (RF > 3 for failure-domain spread) is
+    independent and not tested here.
+  - **Reopens ADR 0039** only if a Tier 1 or Tier 2 run shows either (i) a
+    control voter's `InstallSnapshot` catch-up above 10 s at the largest
+    entity count a plausible deployment reaches (propose 50k tablets), or
+    (ii) control-leader proposal queue growing without bound under the
+    steady `reconcile_loop`/`detect_loop`/heartbeat cadence at the same
+    count; and ADR 0018 stability still gates it. Otherwise ADR 0039 stays
+    section 6 and gains the measured curve as its evidence.
+  - Any other cliff found (a loop whose cost is O(tablets) per tick, an
+    unbounded per-group task) is filed as an issue with the seed or run
+    config, not folded in (CLAUDE.md conventions).
+- **Reuse:** `SimCluster` (`crates/animusd/src/sim_cluster.rs`,
+  `grow`/`drain`/`remove`, the auto-split harness), `idle_engine_cost`'s
+  per-engine method, `wal_fsync_bench`, `heartbeat_batch_corpus` (groups
+  per node), the metrics seam, B-01's generator and topology.
+- **Files:** new `crates/animusd/src/sim_cluster_scale.rs` (Tier 1),
+  `crates/animus-bench/` scale scenarios (Tier 2), possibly one new gauge
+  for hosted-group/task counts in `crates/animus-env/src/metrics.rs`,
+  `docs/adr/0044` and `docs/adr/0039` amendments, `docs/roadmap.md`
+  (C-03 and section 6 updated with the outcome).
+- **Tests:** the Tier 1 corpus is itself a seed-reproducible
+  fault-injecting simulation (node kill and leader transfer during a split
+  storm); Tier 2 asserts nothing about timing, it records.
+- **ADR:** an amendment to ADR 0044 (C-03 outcome) and ADR 0039 (evidence),
+  or a new ADR (next free number, **0074** at time of writing) if the
+  threshold set itself needs a home.
+- **PRs:** one workstream PR: (1) Tier 1 corpus + thresholds ADR text,
+  (2) Tier 2 scenarios on B-01's generator, (3) the first recorded run and
+  the C-03/ADR 0039 outcome amendments (needs a real host, so it may land
+  as a follow-up commit after a manual run).
+- **Size:** L (Tier 1 is M; Tier 2 is mostly harness reuse plus the
+  operations time to run it on real hardware).
+- **Depends:** B-01 (Tier 2 harness and topology; Tier 1 can start now).
+
+### R-01 Production-readiness pass: exit criteria for leaving pre-alpha
+
+- **Gap:** the project is "pre-alpha" (root `CLAUDE.md`, `website/index.html`
+  meta description) with no written definition of what would end that.
+  Correctness is strong in simulation (ADR 0003 and the corpora) but the
+  following were checked absent by grep/ls this session: no `cargo-fuzz`
+  target or `fuzz/` directory (the word appears only in in-crate
+  decoder tests such as `crates/animus-cp-data/src/codec.rs` and
+  `crates/animus-env/src/handshake.rs`); no `CHANGELOG`, `SECURITY.md`,
+  SBOM, image signing or attestation (`.github/workflows/image.yml` builds
+  and pushes to GHCR on `main` and `v*` tags, nothing more; workspace
+  version is `0.0.0`); no operations runbook (`docs/` has only
+  `getting-started.md`, `wal.md`, `streams-notes.md`, ADRs and design
+  notes; quorum-loss appears only as lesson files); no chaos or
+  multi-day soak tooling (grep for chaos/toxiproxy/netem: none outside
+  simulation); no connection cap or admission control found on the
+  DynamoDB edge beyond the 1 MiB `MAX_BODY` request cap
+  (`crates/animus-node/src/http.rs`) and per-table throttling (ADR 0065).
+  Disk-full is injected in simulation (`animus-sim` `DiskConfig`,
+  `StorageFull`) but its behaviour on real nodes is untested.
+- **Plan:** define **beta exit criteria** as a checklist in a new
+  `docs/production-readiness.md` (ratified by the ADR), each item
+  checkable and owned by a sub-track below. Beta means: every criterion
+  is green or has an explicit, signed-off waiver listed in the doc.
+  Sub-tracks, with independence marked:
+  - **(a) Soak (independent after B-01's generator exists; M-L).** A
+    multi-day run on real processes (`animusd` per node, the operator on
+    `kind` or bare multi-process) with a continuous recorded workload;
+    record the client history and run the existing `animus-test` oracles
+    (`check_cycles`, `check_durability`, `check_convergence`,
+    `crates/animus-test/src/check.rs`) over it; add resource-trend
+    assertions (RSS, fds, disk, WAL/compaction backlog stay bounded).
+    Exit: 7 consecutive days, zero oracle violations, no monotone growth.
+  - **(b) Real-cluster chaos (independent; L).** Process kill,
+    network partition, clock skew, disk full, slow disk. On k8s via the
+    operator (Chaos Mesh `PodChaos`/`NetworkChaos`/`IOChaos`/`TimeChaos`
+    as a pinned dev dependency of a new e2e leg beside
+    `scripts/e2e-kind.sh`) and/or bare multi-process with `tc netem` and
+    a loopback fault proxy. Each scenario records a history and runs the
+    oracles; the sim corpora remain the correctness proof, this checks
+    the `ProdEnv` seams the sim cannot (ADR 0003: sim proves logic and
+    ordering, not real-thread liveness).
+  - **(c) Fuzzing (independent; M).** `cargo-fuzz` targets for every
+    untrusted parser: DynamoDB JSON request decode and expression
+    parsers (`animus-dynamo`: UpdateExpression, ConditionExpression,
+    projection), the PartiQL lexer/parser (ADR 0071), SigV4
+    header/credential parsing, the HTTP request parser
+    (`animus-node/src/http.rs`), and each durable-format decoder with a
+    `legacy` seam (ADR 0073: LSM WAL/SSTable/manifest, Raft WAL/snapshot,
+    RaftKV codec, segment and backup chunk codecs, encryption envelope),
+    seeded from the golden fixtures (`tests/fixtures/formats/`). Property:
+    never panic, never allocate unboundedly, decode-or-named-error. CI:
+    a short smoke (e.g. 60 s per target) per push, long runs nightly in
+    `corpus-deep.yml`; crashes become regression tests (and, for
+    format decoders, are filed as bugs under the green invariant).
+  - **(d) Resource bounds and overload (independent; L).** Audit and
+    bound memory (per-connection buffers, scan/batch result sizes,
+    streaming snapshot buffers, unbounded channels), add connection
+    limits and admission control with a defined overload response (a DynamoDB-shaped throttling/unavailable error code as W-08 already
+    does per table, never unbounded queuing), and define disk-full behaviour (the node goes
+    read-only or refuses writes with a named error and recovers when
+    space returns; never corrupts or acks a write it cannot fsync). Each
+    bound gets a sim test with fault injection where possible and a
+    `ProdEnv` test where not.
+  - **(e) Operations runbook (independent; M).** `docs/runbook/`: node
+    replace and decommission (ADR 0032 drain), control-plane quorum
+    loss and the unsafe-recovery procedure (decide whether a tool is
+    needed; none exists today), backup/restore and PITR drill (ADR 0059),
+    cert rotation (ADR 0064 section on restart-time `TlsConfig::load()`),
+    encryption key rotation (ADR 0069), upgrade procedure per ADR 0073
+    (whole-cluster today; rolling after C-16 Phase 3), capacity planning
+    (numbers from B-01 and C-17), disk sizing, and a game-day drill
+    checklist actually executed once on `kind`.
+  - **(f) Observability completeness (independent; M).** SLO definitions
+    (availability, p99 latency per op class from B-01) and alert rules as
+    shipped YAML (Prometheus rules) plus a dashboard JSON; a test that
+    every metric name referenced in `docs/` and `website/` exists in
+    `crates/animus-env/src/metrics.rs` and appears in `/admin/metrics`
+    output (grep-driven, in CI); runbook alerts link to runbook pages.
+  - **(g) Release engineering (independent; M).** Real versioning (SemVer
+    for the binary plus the ADR 0073 format versions, bump policy
+    documented), a changelog generated per release, signed multi-arch
+    images and binaries (cosign keyless) with SBOM (`cargo cyclonedx` or
+    syft) and provenance attestation in `image.yml`, a supported-platform
+    matrix (OS, kernel, filesystem — ext4/xfs and fsync semantics —
+    architectures, Kubernetes versions via the `kind` matrix), a
+    `SECURITY.md` with a disclosure process, and a deprecation policy for
+    wire/format changes.
+- **Reuse:** `animus-test` oracles and `History`; `corpus-deep.yml`;
+  `scripts/e2e-kind.sh`; golden fixtures as fuzz seeds; `cargo deny`;
+  metrics seam (ADR 0015); the operator's admin-port drain sequence.
+- **Files:** new `fuzz/` (excluded from the workspace build),
+  `docs/production-readiness.md`, `docs/runbook/`, `deploy/observability/`,
+  `.github/workflows/{fuzz,soak,release}.yml`, `SECURITY.md`,
+  `CHANGELOG.md`, plus targeted hardening edits in `animus-node`/`animusd`
+  from (d).
+- **Tests:** each sub-track is its own test artifact (oracle-checked soak
+  histories, chaos e2e legs, fuzz targets, the metrics-exist check, an
+  overload test that asserts bounded queueing, a disk-full test).
+- **ADR:** new ADR (next free number, **0074** at time of writing;
+  coordinate with B-01/C-17/G-01 which may also claim one) fixing the
+  beta criteria, overload semantics (d) and the release policy (g).
+- **PRs:** XL overall and genuinely too large for one reviewable PR, so
+  **one workstream PR per independent sub-track, each separately
+  mergeable and each in its own session** (the sub-tracks share no code):
+  R-01 criteria doc + ADR first (small, unblocks the rest), then c, g, f,
+  d, e, a, b in whatever order owners are free. Splitting here is by
+  independent change, which `CLAUDE.md` Session operating mode item 3
+  allows; it is not a stack.
+- **Size:** XL in total (c, e, f, g are M each; a, b, d are L).
+- **Depends:** (e) upgrade chapter needs C-16 Phase 3 (rolling upgrades);
+  (e) capacity planning and (a) need B-01; (e)/(d) sizing use C-17;
+  (b) real-cluster chaos benefits from the operator e2e leg staying
+  green. (c), (f), (g) depend on nothing.
+
+### G-01 Global tables (multi-region) and a topology-aware operator
+
+- **Gap:** multi-region replication is absent, and until this entry it was
+  filed under section 6 "Deliberately not planned" (as "a property of the
+  managed service"). That framing is no longer right: DynamoDB global
+  tables are an **API-visible** feature with two modes, and a self-hosted
+  multi-region deployment is a legitimate residency/DR need (ADR 0005's
+  motivation). Verified state today: `UpdateTable` with `ReplicaUpdates`
+  is rejected by name (`crates/animus-dynamo/src/wire.rs`,
+  `UNSUPPORTED_UPDATE_TABLE_KEYS`, error "ReplicaUpdates is not
+  supported"); no `CreateGlobalTable`/`UpdateGlobalTable`/
+  `DescribeGlobalTable` handlers and no `MultiRegionConsistency` handling
+  (grep of `crates/animus-dynamo/src` and `crates/animusd/src`);
+  `website/compatibility.html` and `docs.html` say "no global tables".
+- **Design observations to carry into the ADR (verified where marked):**
+  1. **ADR 0019's 2026-08-23 amendment closed AP because "DynamoDB's wire
+     cannot express a per-table replication mode"** (verified in the ADR
+     text). That premise needs revisiting, not just ignoring: as I recall
+     AWS's global tables v2 (version 2019.11.21) expose
+     `MultiRegionConsistency` (`EVENTUAL` for MREC, `STRONG` for MRSC) via
+     `CreateTable`/`UpdateTable` `ReplicaUpdates`, which *is* a wire-level
+     per-table replication mode (the legacy 2017.11.29 API,
+     `CreateGlobalTable`/`UpdateGlobalTable`, also exists). **Unverified
+     here: the exact parameter names, the MRSC region-count rule (recalled:
+     three regions, or two plus a witness) and MRSC's feature restrictions
+     (recalled: no TTL/LSI/transactions) — check AWS docs when writing the
+     ADR.** The ADR must state that each region stays CP *locally*
+     (per-tablet Raft), that MRSC is a CP cross-region mode, and that MREC
+     is the one place the system becomes AP-shaped (async, multi-active,
+     last-writer-wins per item) — a per-table property now reachable from
+     the wire, which is the precise thing ADR 0019 said could not happen.
+     It does not revive the old `ReplicationMode`/Accord machinery (deleted;
+     see git history), it scopes a new cross-region layer on top of the
+     CP tablets.
+  2. **What the existing code gives us.** Placement has residency
+     `required_labels` and `SpreadPolicy` failure-domain spread
+     (`crates/animus-placement/src/lib.rs`, ADR 0005); members carry
+     `labels` in replicated `Metadata` (`crates/animus-control/src/meta.rs`,
+     `Member.labels`); `HlcTimestamp` exists (`crates/animus-cp-data/src/
+     hlc.rs`) and every row version carries one; the per-tablet change log
+     records old/new images (`animus_item::index::ChangeRecord`) and feeds
+     Streams, GSIs, TTL, backup and PITR consumers (ADR 0041-0043).
+  3. **But nothing sets labels or policies in production today**
+     (verified): self-registration passes `BTreeMap::new()`
+     (`crates/animusd/src/lib.rs`, the `register_node` call in the node
+     startup tail); the only label inputs are the admin
+     `/admin/member/add` / `admin_add_control_member` calls; and table
+     creation always installs `PlacementPolicy::simple("cp-rf", ..)` with
+     no residency and no spread (`crates/animusd/src/schema.rs`
+     `SetTabletPolicy`). `ClusterConfig` has no labels field. The
+     operator emits no pod anti-affinity, topology spread constraints or
+     node selectors (grep of `crates/animus-operator/src`: only the
+     `NetworkPolicy` and resource `Quantity` hits). So even single-cluster
+     zone spreading is not wired end to end, regardless of the placement
+     engine's capability.
+  4. **MRSC cost (design constraint, quantify in the ADR).** One Raft
+     group spanning regions means every write waits for the nearest-peer
+     RTT (tens of ms between nearby regions, ~70-100 ms transatlantic),
+     and every `ConsistentRead: true` read pays a ReadIndex quorum
+     confirmation across regions, because the ReadIndex path needs a
+     majority round trip (ADR 0016/0017). `ConsistentRead: false` reads
+     stay local (ADR 0055). Leader placement matters: no leader-locality
+     preference was found in the tree by grep, so leadership lands where an
+     election timeout fires first; the ADR must decide on a preferred-
+     leader/transfer mechanism and on election timeouts tuned for WAN RTT.
+  5. **MREC design sketch.** Per-region cluster (full CP locally);
+     per-table, per-tablet replication agent reads the change log (the
+     same consumer shape as the backup/PITR sealer), ships records to peer
+     regions' clusters over the wire/TLS (ADR 0064), applies them with
+     last-writer-wins on `(HLC, region id)` as the deterministic
+     tiebreak, never re-replicating a replicated write (origin-region
+     stamp), replicates TTL deletes (as AWS does; confirm), and defines
+     stream records for replicated writes to match AWS (unverified:
+     confirm). Transactions are region-local in AWS global tables
+     (recalled; confirm): do not replicate atomically. HLC skew across
+     regions bounds LWW fairness; document it. Deterministic simulation
+     applies: a multi-cluster `SimCluster` with a WAN partition/latency
+     model is part of the work.
+- **Plan (staged, each stage independently valuable and mergeable):**
+  - **G-a Topology-aware single-cluster operator (S-M, independent, do
+    now).** Add a labels input to `ClusterConfig`/`animusd` flags
+    (additive `#[serde(default)]`, ADR 0035 discipline, ADR 0073 format
+    rules) so a node self-registers with labels; have the operator inject
+    the pod's node `topology.kubernetes.io/region` and `/zone` labels
+    (downward API cannot read node labels directly — use an init
+    container or the operator resolving pod-to-node after scheduling;
+    decide in the ADR) and emit `topologySpreadConstraints` /
+    pod anti-affinity on the `StatefulSet`; make table creation use a
+    policy with `SpreadPolicy` over the zone key when the cluster has
+    >= RF distinct zones (best-effort otherwise, as `replan_repair`
+    already is). Tests: `desired::statefulset` unit tests, a placement
+    corpus over `SimCluster` with labelled nodes (kill a zone), and the
+    `kind` smoke with zone-labelled nodes.
+  - **G-b The ADR (S).** Revisit ADR 0019's premise as above, choose the
+    MRSC/MREC scope, the wire surface (`ReplicaUpdates`,
+    `DescribeTable` replica fields, `MultiRegionConsistency`), the ADR 0072
+    limits catalogue entries (compiled-in, AWS-faithful), and gate every
+    new `Metadata`/wire surface behind the ADR 0073 Phase 2 cluster-version
+    gate. Next free ADR number: **0074** at time of writing.
+  - **G-c MRSC as a geo-distributed per-tablet Raft group (L, likely the
+    cheapest wire-visible mode).** Reuses the CP machinery: a table whose
+    replicas are placed across regions by residency/failure-domain labels
+    (region key), WAN-tuned election and heartbeat timeouts per group,
+    preferred-leader placement, `ReplicaUpdates` on `UpdateTable` mapping
+    to replica additions via the existing `CasTabletReplicas` /
+    `reconfigure_step` path. Needs one logical cluster spanning regions
+    (control plane included: quorum placement across at least 3 regions);
+    this is "stretch cluster", not federation. Measured cost goes into
+    B-01's results (cross-region topology variant).
+  - **G-d MREC async replication with LWW (XL).** The agent in item 5
+    above, plus replicated-TTL, stream parity and a multi-cluster
+    `SimCluster` WAN corpus (seeded partitions, duplicate/reordered
+    delivery, region failure and heal, concurrent conflicting writes from
+    both regions: convergence and LWW determinism asserted by
+    `check_convergence`-style oracles).
+  - **G-e Operator multi-cluster federation (L).** One `AnimusCluster` per
+    Kubernetes cluster/region plus a federating resource or peer spec
+    (cross-cluster endpoint discovery, peer TLS trust per ADR 0064,
+    NetworkPolicy/egress for the peer ports, ordered replica-add on
+    `ReplicaUpdates`); only needed for G-d (G-c's stretch cluster could be
+    one `AnimusCluster` over a mesh, but multi-k8s-cluster pod networking
+    is the same problem — decide in the ADR).
+- **Reuse:** placement `required_labels`/`SpreadPolicy`; `Member.labels`;
+  `CasTabletReplicas`/`reconfigure_step`; `HlcTimestamp`; the change log
+  and its consumer pattern; `SimCluster` fault model; operator
+  `desired::*` builders; ADR 0073 Phase 2 gate; `limits` (ADR 0072).
+- **Files:** `crates/animus-operator/src/{crd.rs,desired/}`,
+  `crates/animusd/src/{config.rs,schema.rs,main.rs}`,
+  `crates/animus-dynamo/src/wire.rs` (the `ReplicaUpdates` rejection),
+  `crates/animus-placement`, `crates/animus-control/src/meta.rs`, a new
+  replication-agent module (G-d), `website/compatibility.html`,
+  `docs.html`, `index.html`.
+- **Tests:** per stage as above; every distributed stage lands with a
+  seeded fault-injecting simulation (CLAUDE.md conventions), G-c/G-d with
+  region-level partitions; `kind` e2e for G-a and G-e.
+- **ADR:** G-b is the new ADR; amend ADR 0019 (the AP-closure premise),
+  ADR 0005 (labels become populated), ADR 0060 (operator), ADR 0072.
+- **PRs:** **multi-PR, one workstream PR per stage** (G-a, G-b, G-c, G-d,
+  G-e), each independently mergeable and delivered in its own session.
+  This is not a stack: the stages are separable by value (G-a is useful to
+  every multi-AZ deployment, G-c alone gives a strongly-consistent
+  multi-region table), and a single PR would span the operator, the
+  control plane, the data plane and the wire.
+- **Size:** XL in total (G-a S-M, G-b S, G-c L, G-d XL, G-e L).
+- **Depends:** G-a and G-b: none, start now. G-c, G-d, G-e: ADR 0073
+  Phase 2 (C-16: a replicated cluster version / feature gate, so the new
+  `Metadata` and wire surfaces are not unguarded; P2-A has merged, P2-B..D
+  have not), G-b, and ADR 0072 limits. G-c benefits from B-01 to quantify
+  WAN cost. Reverses the global-tables clause of section 6.
 
 ## 4. Operator surfaces: admin API, dashboard, console, CLI
 
@@ -1666,11 +2146,14 @@ documentation-lagging-code gap turns up.
   first re-litigate the merge rejection in a new ADR. No PR without that.
 - **Metadata as a real tablet (ADR 0039).** Gated on operational evidence
   that control-plane scale is the bottleneck and on ADR 0018 stability.
-  Not a sizing question yet.
-- **Global tables, on-demand/provisioned billing, Lambda triggers, DAX,
-  CloudWatch, Kinesis destinations, Contributor Insights, replica
-  auto-scaling.** Properties of the managed service, declared out of scope
-  on `website/compatibility.html`. W-08 (landed 2026-09-05, ADR 0065) gives
+  Not a sizing question yet; C-17 proposes the measured thresholds that
+  would reopen it.
+- **On-demand/provisioned billing, Lambda triggers, DAX, CloudWatch,
+  Kinesis destinations, Contributor Insights, replica auto-scaling.**
+  Properties of the managed service, declared out of scope on
+  `website/compatibility.html`. (**Global tables were removed from this
+  list 2026-10-04** — they are API-visible, not a billing property; see
+  G-01.) W-08 (landed 2026-09-05, ADR 0065) gives
   real per-table throttling in DynamoDB capacity units without a billing
   meter — `BillingMode`/`ProvisionedThroughput` are supported and enforced,
   but nothing here meters or invoices.
@@ -1693,7 +2176,7 @@ wave are independent and can run in parallel.
 | 3 | *U-05, U-07, U-08(ii) landed 2026-09-06* | No ordering constraint remains |
 | 4 | *landed 2026-09-05* (S-02) | Highest blast radius (C-01 landed 2026-09-05 — see ADR 0054; S-01 landed 2026-09-05 — see ADR 0064; S-02 — see ADR 0066) |
 | 5 | *S-04, S-05, S-07b–d, C-02, C-05 all landed 2026-09-06* | S-05 strictly after S-04 |
-| 6 | *S-03 complete 2026-09-07 (all 3 PRs, ADR 0069)*; *S-07e/S-07 complete 2026-09-07 (ADR 0070)*; *C-03 assessed 2026-09-07 — deferred, no PRs planned (see ADR 0044's matching amendment)*; W-07 | XL or gated on earlier waves |
+| 6 | *S-03 complete 2026-09-07 (all 3 PRs, ADR 0069)*; *S-07e/S-07 complete 2026-09-07 (ADR 0070)*; *C-03 assessed 2026-09-07 — deferred, no PRs planned (see ADR 0044's matching amendment; reopen thresholds now in C-17)*; *W-07 landed (PRs 1-5, ADR 0071)* | XL or gated on earlier waves |
 | 7 | C-06 (closed 2026-09-08 — all seven PRs landed: #728, #729, #732, #748, #750, #756, plus this PR; issues #731 and #737 both fixed 2026-09-07) | Gated on C-04 (closed 2026-09-07) — the D4 `Reconciler` and D3 generic dispatch cores it builds on |
 | 8 | C-07 (closed 2026-09-08 — all six PRs landed: #758, #759, #760, #761, #762, plus PR 6) | Gated on C-04 (closed) and C-06 (closed) — the same generic dispatch cores, plus C-06's own Transact widening |
 | 9 | C-08 (closed 2026-09-08 — all eight PRs landed: #764, #765, #766, #767, #773, #776, #777, PR 8) | Gated on C-04 (closed), C-06 (closed), and C-07 (closed) — the same generic dispatch cores, plus rung C5's own widening of `ClientCtx`'s field types |
@@ -1704,6 +2187,10 @@ wave are independent and can run in parallel.
 | 14 | C-13 (closed 2026-09-13 — all seven PRs landed — seed/join discovery under `SimCluster`, ADR 0061 rung M) | Gated on C-12 (closed) — the next unowned residual group per C-08's through C-12's own close-outs |
 | 15 | C-14 (closed 2026-09-14 — all five PRs landed: #876, #884, #886, #887, plus PR 5 — combined control-plane voter growth under `SimCluster`, ADR 0061 rung N) | Gated on C-13 (closed) — the one residual C-13 PR 6 named precisely: a fresh `RaftNode<SimEnv>` joining the live control quorum after construction |
 | 16 | C-15 (closed 2026-09-20 — node assembly/raw `ClientRequest` assess-and-close, ADR 0061 rung O, #997) | Gated on C-14 (closed) — the last class-D group C-14's own close-out confirmed still unowned |
+| 17 | B-01 (benchmarks); S-08 (S3 credentials/multipart); G-01 stage G-a + G-b (topology-aware operator, global-tables ADR); R-01 sub-tracks c (fuzzing), f (observability), g (release engineering) | All independent of each other and of the open C-16 phases; no ordering constraint |
+| 18 | C-17 (scale/density), R-01 sub-tracks a (soak), b (chaos), d (resource bounds), e (runbook) | C-17 Tier 2 and R-01 (a)/(e) capacity planning need B-01's generator; C-17 Tier 1 and R-01 (b)/(d) can start earlier |
+| 19 | G-01 stages G-c (MRSC stretch), G-d (MREC), G-e (federation) | After C-16 Phase 2 (P2-B..D: cluster-version/feature gate) and the G-b ADR; G-c wants B-01 to quantify WAN cost |
+| 20 | R-01 runbook upgrade chapter | After C-16 Phase 3 (rolling upgrades) |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted
