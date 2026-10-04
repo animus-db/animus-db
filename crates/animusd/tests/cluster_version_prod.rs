@@ -56,7 +56,10 @@ async fn admin(
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|code| code.parse().ok())
         .expect("status line");
-    (status, serde_json::from_str(payload).expect("admin body is JSON"))
+    (
+        status,
+        serde_json::from_str(payload).expect("admin body is JSON"),
+    )
 }
 
 /// A dial that advertises NO `ext`, exactly what a Phase 1 binary (or the
@@ -132,7 +135,10 @@ async fn the_era_starts_over_real_sockets_and_the_admin_surface_works() {
         // Finalize: a follower is refused as not-the-leader; the leader
         // refuses by name (this binary supports only version 1) and the
         // cluster stays at 1.
-        let leader = nodes.iter().position(Node::is_control_leader).expect("leader");
+        let leader = nodes
+            .iter()
+            .position(Node::is_control_leader)
+            .expect("leader");
         let follower = (0..nodes.len()).find(|i| *i != leader).unwrap();
         let (status, v) = admin(
             nodes[follower].admin_addr(),
@@ -143,7 +149,10 @@ async fn the_era_starts_over_real_sockets_and_the_admin_surface_works() {
         .await;
         assert_eq!(status, 409, "{v}");
         assert!(
-            v["error"].as_str().unwrap().contains("not the control-plane leader"),
+            v["error"]
+                .as_str()
+                .unwrap()
+                .contains("not the control-plane leader"),
             "{v}"
         );
         let (status, v) = admin(
@@ -155,15 +164,22 @@ async fn the_era_starts_over_real_sockets_and_the_admin_surface_works() {
         .await;
         assert_eq!(status, 409, "{v}");
         assert!(
-            v["error"].as_str().unwrap().contains("supports cluster versions up to 1"),
+            v["error"]
+                .as_str()
+                .unwrap()
+                .contains("supports cluster versions up to 1"),
             "{v}"
         );
         assert_eq!(nodes[leader].metadata().cluster_version, 1);
 
         // CHS1: an empty-`ext` dial is still welcome on the CLIENT port (the
         // CLI and external clients) ...
-        let mut s = phase1_dial(nodes[0].client_addr()).await.expect("client-port dial");
-        write_frame(&mut s, &ClientRequest::Status).await.expect("send");
+        let mut s = phase1_dial(nodes[0].client_addr())
+            .await
+            .expect("client-port dial");
+        write_frame(&mut s, &ClientRequest::Status)
+            .await
+            .expect("send");
         match read_frame::<ClientResponse, _>(&mut s).await {
             Ok(Some(ClientResponse::Status { .. })) => {}
             other => panic!("client port must still serve a Phase 1 dial: {other:?}"),
@@ -171,7 +187,9 @@ async fn the_era_starts_over_real_sockets_and_the_admin_surface_works() {
         // ... and refused on the INTRA port (node-to-node), where the era
         // requires every peer to advertise one. The refusal is a closed
         // connection, never a frame.
-        let mut s = phase1_dial(nodes[0].intra_addr()).await.expect("intra preamble exchange");
+        let mut s = phase1_dial(nodes[0].intra_addr())
+            .await
+            .expect("intra preamble exchange");
         let _ = write_frame(&mut s, &ClientRequest::Status).await;
         match read_frame::<ClientResponse, _>(&mut s).await {
             Ok(None) | Err(_) => {}
@@ -209,7 +227,10 @@ async fn the_era_starts_over_real_sockets_and_the_admin_surface_works() {
             Some("{}"),
         )
         .await;
-        assert_eq!(status, 409, "a data-only node is never the control leader: {v}");
+        assert_eq!(
+            status, 409,
+            "a data-only node is never the control leader: {v}"
+        );
 
         data.shutdown_graceful().await;
         for node in &nodes {
