@@ -1175,3 +1175,15 @@ straight off the real `ProdEnv`'s own `Env::metrics()` handle.
 test that dials a hostname (e.g. `localhost:PORT`) must hold
 `hosts_resolution_lock()` across the dial, or a torn read drops the
 fire-and-forget frame. See `docs/lessons/testing/2026-09-29-tests-that-rewrite-etc-hosts-*`.
+
+## Staged replace (issue #1116)
+
+`Disk` has a split `replace`: `stage_replace` (write + fsync `{file}.tmp`),
+`stage_extend` (append + fsync to it), `commit_staged` (rename + directory
+fsync), `discard_staged`. They exist so a caller that serializes a file's
+writers behind a lock (the cp-data WAL) can run the slow fsync unlocked and
+hold the lock only for the swap. Trait defaults are correct for any `Disk`
+(built from `remove`/`append`/`sync`/`read`/`replace`); `ProdEnv`'s plain disk
+and `SimEnv` override them natively. `EncryptedDisk` deliberately uses the
+defaults (its per-file frame index makes a native rename-based swap
+non-trivial), so under `--encryption-key` the swap re-reads and `replace`s.

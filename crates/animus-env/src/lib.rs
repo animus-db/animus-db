@@ -726,6 +726,59 @@ pub trait Disk: Send + Sync {
     /// rename). Used for log/WAL compaction.
     async fn replace(&self, file: &str, bytes: &[u8]) -> std::io::Result<()>;
 
+    /// **Phase 1 of a split [`replace`](Disk::replace)** (issue #1116): write
+    /// `bytes` to `file`'s staging file and make them durable (discarding any
+    /// previously staged content), **without touching `file`**. This is the
+    /// slow part of a replace (a whole-file write + `fsync`), exposed on its
+    /// own so a caller that serializes writers of `file` behind a lock can run
+    /// it *outside* that lock and take the lock only for
+    /// [`commit_staged`](Disk::commit_staged). A crash at any point leaves
+    /// `file` exactly as it was; the staged file is an orphan that the next
+    /// `stage_replace` overwrites.
+    ///
+    /// The default implementation stages through ordinary `remove`/`append`/
+    /// `sync` on `{file}.tmp`, so every `Disk` is correct without opting in;
+    /// `ProdEnv` and `SimEnv` override the trio with their native temp-file
+    /// handling.
+    async fn stage_replace(&self, file: &str, bytes: &[u8]) -> std::io::Result<()> {
+        let tmp = format!("{file}.tmp");
+        self.remove(&tmp).await?;
+        if !bytes.is_empty() {
+            self.append(&tmp, bytes).await?;
+        }
+        self.sync(&tmp).await
+    }
+
+    /// Append `bytes` to `file`'s staging file and make them durable. A
+    /// no-op for empty `bytes`. Must follow a [`stage_replace`](Disk::stage_replace).
+    async fn stage_extend(&self, file: &str, bytes: &[u8]) -> std::io::Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let tmp = format!("{file}.tmp");
+        self.append(&tmp, bytes).await?;
+        self.sync(&tmp).await
+    }
+
+    /// **Phase 2 of a split [`replace`](Disk::replace)**: atomically swap the
+    /// staged contents over `file` and consume the staging file. On return the
+    /// new contents are durable; a crash before sees the whole old file, after
+    /// sees the whole staged one. Everything staged (`stage_replace` +
+    /// `stage_extend`s) is already durable, so this is only the swap (rename +
+    /// directory `fsync` in production).
+    async fn commit_staged(&self, file: &str) -> std::io::Result<()> {
+        let tmp = format!("{file}.tmp");
+        let bytes = self.read(&tmp).await?;
+        self.replace(file, &bytes).await?;
+        self.remove(&tmp).await
+    }
+
+    /// Drop `file`'s staging file, if any (a failed or abandoned rewrite).
+    /// Best-effort cleanup: never required for correctness.
+    async fn discard_staged(&self, file: &str) -> std::io::Result<()> {
+        self.remove(&format!("{file}.tmp")).await
+    }
+
     /// The names of every file on this env's disk, in lexicographic order (empty
     /// if none exist yet). Only files this handle's `Disk` methods could open —
     /// production lists the env's own data directory, non-recursively. The

@@ -41,6 +41,63 @@ pub struct FairMutex {
     /// rides with the lock that serializes the file's writers so the two cannot
     /// be separated; only touch it while holding the lock.
     markers: crate::persist::SyncMarkerState,
+    /// The bytes appended to the guarded file while a compaction rewrite is
+    /// staging its replacement outside the lock (issue #1116). See
+    /// [`RewriteTail`].
+    tail: RewriteTail,
+}
+
+/// The records durably appended to the live WAL **since a rewrite's image was
+/// captured**, recorded so the rewrite can re-append them to its staged file
+/// before swapping it in (issue #1116).
+///
+/// A WAL compaction used to hold the lock across the whole `Disk::replace`
+/// (temp write + `fsync` + rename + directory `fsync`), so one slow `fsync`
+/// froze every persist round. Now the rewrite stages the image outside the
+/// lock; persist rounds that land meanwhile append to the *live* file as
+/// usual (so they stay durable-before-ack) and push the same encoded bytes
+/// here. The rewrite then drains this tail into the staged file and swaps, so
+/// the result is byte-identical to a rewrite done under the lock. Inactive
+/// (`None`) outside a rewrite, so [`push`](Self::push) costs nothing then.
+///
+/// Only [`begin`](Self::begin)/[`take`](Self::take) under the lock are
+/// ordering-significant; the inner `Mutex` is just interior mutability.
+#[derive(Default)]
+pub struct RewriteTail {
+    inner: Mutex<Option<Vec<u8>>>,
+}
+
+impl RewriteTail {
+    /// Start recording. **Call while holding the lock, in the same hold that
+    /// captured the rewrite's image**, so no persisted round falls between.
+    pub fn begin(&self) {
+        *self.inner.lock().expect("rewrite tail poisoned") = Some(Vec::new());
+    }
+
+    /// Record `bytes` (one durable persist round's encoded records) if a
+    /// rewrite is staging. **Call while holding the lock**, after the round's
+    /// `fsync` succeeded.
+    pub fn push(&self, bytes: &[u8]) {
+        if let Some(t) = self.inner.lock().expect("rewrite tail poisoned").as_mut() {
+            t.extend_from_slice(bytes);
+        }
+    }
+
+    /// Take everything recorded so far (recording continues). **Call while
+    /// holding the lock.**
+    pub fn take(&self) -> Vec<u8> {
+        self.inner
+            .lock()
+            .expect("rewrite tail poisoned")
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+
+    /// Stop recording (the rewrite swapped or was abandoned).
+    pub fn end(&self) {
+        *self.inner.lock().expect("rewrite tail poisoned") = None;
+    }
 }
 
 impl Default for FairMutex {
@@ -60,6 +117,7 @@ impl FairMutex {
                 queue: VecDeque::new(),
             }),
             markers: crate::persist::SyncMarkerState::default(),
+            tail: RewriteTail::default(),
         }
     }
 
@@ -67,6 +125,11 @@ impl FairMutex {
     /// [`crate::persist::SyncMarkerState`]). Use only while holding the lock.
     pub fn markers(&self) -> &crate::persist::SyncMarkerState {
         &self.markers
+    }
+
+    /// The guarded file's [`RewriteTail`] (issue #1116).
+    pub fn tail(&self) -> &RewriteTail {
+        &self.tail
     }
 
     /// Acquire the lock, queueing behind every earlier caller.
@@ -163,6 +226,23 @@ mod tests {
     use super::*;
     use futures::FutureExt;
     use futures::task::noop_waker_ref;
+
+    #[test]
+    fn rewrite_tail_records_only_while_active_and_takes_in_order() {
+        let t = RewriteTail::default();
+        t.push(b"ignored");
+        assert!(t.take().is_empty());
+        t.begin();
+        t.push(b"ab");
+        t.push(b"cd");
+        assert_eq!(t.take(), b"abcd");
+        assert!(t.take().is_empty());
+        t.push(b"ef");
+        assert_eq!(t.take(), b"ef");
+        t.end();
+        t.push(b"gone");
+        assert!(t.take().is_empty());
+    }
 
     fn poll<F: Future + Unpin>(f: &mut F) -> Poll<F::Output> {
         f.poll_unpin(&mut Context::from_waker(noop_waker_ref()))

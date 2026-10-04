@@ -223,6 +223,16 @@ pub struct DiskConfig {
     /// trace event ordering beyond the timer it schedules, so it composes
     /// cleanly with the other knobs.
     sync_delay: Option<Duration>,
+    /// Virtual-time latency of the **data-write + fsync half of a
+    /// [`Disk::replace`]** (the temp-file content phase — the slow part of a
+    /// real `replace`, whose cost scales with a whole-file fsync), separate
+    /// from [`sync_delay`](Self::sync_delay) (which models every other
+    /// fsync, including the rename's directory fsync). `None` (default)
+    /// injects nothing, so every existing config is byte-identical. Exists
+    /// for issue #1116: proving a WAL-compaction rewrite's slow temp-file
+    /// fsync no longer stalls persist rounds. The delay elapses **before**
+    /// the swap lands, so a crash inside it sees the whole old contents.
+    replace_data_delay: Option<Duration>,
     /// **fsync-acked-but-lost**: on a hit (`rng.next_u64() < fsync_lie_threshold`,
     /// sampled independently inside [`Disk::sync`], only after the
     /// `error_threshold`/`enospc_threshold` roll above has already missed —
@@ -276,6 +286,13 @@ impl DiskConfig {
     /// setter, no RNG involved.
     pub fn set_sync_delay(&mut self, dur: Duration) {
         self.sync_delay = Some(dur);
+    }
+
+    /// Inject `dur` of virtual-time latency into the temp-file data-write +
+    /// fsync half of every subsequent [`Disk::replace`] — see
+    /// [`replace_data_delay`](Self::replace_data_delay).
+    pub fn set_replace_data_delay(&mut self, dur: Duration) {
+        self.replace_data_delay = Some(dur);
     }
 
     /// Set the independent per-`sync` fsync-acked-but-lost probability in
@@ -2374,14 +2391,111 @@ impl Disk for SimEnv {
         // un-synced remainder. A crash keeps exactly the new contents. An injected
         // fault fails the swap cleanly (temp-file + rename semantics: the old
         // contents remain fully intact).
-        let mut st = self.shared.lock();
-        if let Some(e) = st.inject_disk_fault(self.node_id.clone(), "replace", file) {
-            return Err(e);
+        let delay = {
+            let mut st = self.shared.lock();
+            if let Some(e) = st.inject_disk_fault(self.node_id.clone(), "replace", file) {
+                return Err(e);
+            }
+            st.disk_cfg_for(&self.node_id).replace_data_delay
+        };
+        // The temp-file write + fsync elapses BEFORE the swap lands (a crash
+        // inside it sees the whole old contents), and `self.shared` is not
+        // held across the await.
+        if let Some(dur) = delay {
+            self.sleep(dur).await;
         }
+        let mut st = self.shared.lock();
         let key = (self.node_id.clone(), file.to_owned());
         let f = st.disks.entry(key).or_default();
         f.durable = bytes.to_vec();
         f.buffered.clear();
+        Ok(())
+    }
+
+    // Issue #1116: the split `replace`. The staging file is an ordinary
+    // `{file}.tmp` entry in the per-node disk map, so a crash keeps exactly
+    // its synced bytes (it is an orphan the next `stage_replace` overwrites)
+    // and never touches `file`. Staged writes are atomic-and-durable on
+    // return (no un-synced remainder), like `replace` itself.
+    async fn stage_replace(&self, file: &str, bytes: &[u8]) -> std::io::Result<()> {
+        let delay = {
+            let mut st = self.shared.lock();
+            if let Some(e) = st.inject_disk_fault(self.node_id.clone(), "stage_replace", file) {
+                return Err(e);
+            }
+            st.disk_cfg_for(&self.node_id).replace_data_delay
+        };
+        if let Some(dur) = delay {
+            self.sleep(dur).await;
+        }
+        let mut st = self.shared.lock();
+        let f = st
+            .disks
+            .entry((self.node_id.clone(), format!("{file}.tmp")))
+            .or_default();
+        f.durable = bytes.to_vec();
+        f.buffered.clear();
+        Ok(())
+    }
+
+    async fn stage_extend(&self, file: &str, bytes: &[u8]) -> std::io::Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let delay = {
+            let mut st = self.shared.lock();
+            if let Some(e) = st.inject_disk_fault(self.node_id.clone(), "stage_extend", file) {
+                return Err(e);
+            }
+            st.disk_cfg_for(&self.node_id).sync_delay
+        };
+        if let Some(dur) = delay {
+            self.sleep(dur).await;
+        }
+        let mut st = self.shared.lock();
+        let f = st
+            .disks
+            .entry((self.node_id.clone(), format!("{file}.tmp")))
+            .or_default();
+        f.durable.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    async fn commit_staged(&self, file: &str) -> std::io::Result<()> {
+        let delay = {
+            let mut st = self.shared.lock();
+            if let Some(e) = st.inject_disk_fault(self.node_id.clone(), "commit_staged", file) {
+                return Err(e);
+            }
+            st.disk_cfg_for(&self.node_id).sync_delay
+        };
+        // The rename + directory fsync: the swap lands only after it elapses.
+        if let Some(dur) = delay {
+            self.sleep(dur).await;
+        }
+        let mut st = self.shared.lock();
+        let Some(staged) = st
+            .disks
+            .remove(&(self.node_id.clone(), format!("{file}.tmp")))
+        else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("commit_staged: nothing staged for {file}"),
+            ));
+        };
+        let f = st
+            .disks
+            .entry((self.node_id.clone(), file.to_owned()))
+            .or_default();
+        f.durable = staged.durable;
+        f.buffered.clear();
+        Ok(())
+    }
+
+    async fn discard_staged(&self, file: &str) -> std::io::Result<()> {
+        let mut st = self.shared.lock();
+        st.disks
+            .remove(&(self.node_id.clone(), format!("{file}.tmp")));
         Ok(())
     }
 

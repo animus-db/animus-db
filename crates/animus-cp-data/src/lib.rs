@@ -7354,7 +7354,9 @@ fn record_kv_outbound(metrics: &MetricsHandle, outs: &[(NodeId, KvWire)]) {
 /// (the slow work that used to share this pass) now run on the separate apply task,
 /// so this loop stays responsive to Raft messages / heartbeats within the election
 /// timeout (ADR 0017 — the driver-liveness fix). Holds `wal_lock` so the append
-/// cannot interleave with the apply task's compaction rewrite of the same file.
+/// cannot interleave with the compaction rewrite's capture and final swap of the
+/// same file (issue #1116: the rewrite's slow staged write runs outside the lock,
+/// recording rounds persisted meanwhile via `wal_lock.tail()`).
 /// `wal_lock` is a FIFO-fair [`FairMutex`]: this loop starts the next round as
 /// soon as the last lands, so an unfair lock lets it re-lock ahead of the apply
 /// task's compaction wait forever and freeze the engine-applied frontier (ADR
@@ -7446,9 +7448,11 @@ async fn persist_wal<E: Env>(
             .markers()
             .take_marker(env, &animus_control::persist::CONTROL_WAL, wal)
             .await;
+        let mut record_bytes = Vec::new();
         for record in &records {
-            buf.extend(PersistedState::encode_record(record));
+            record_bytes.extend(PersistedState::encode_record(record));
         }
+        buf.extend_from_slice(&record_bytes);
         if let Err(e) = env.append(wal, &buf).await {
             assert!(
                 halted.load(Ordering::SeqCst),
@@ -7464,6 +7468,10 @@ async fn persist_wal<E: Env>(
             return;
         }
         wal_lock.markers().mark_synced();
+        // Issue #1116: a compaction rewrite staging its replacement outside
+        // the lock must re-append this durable round before it swaps (the
+        // records, not the piggybacked marker, which describes the live file).
+        wal_lock.tail().push(&record_bytes);
     }
     // Durable now: advance the log watermark and the round watermark under one
     // acquisition, then release whatever the consensus loop buffered on this
@@ -8011,7 +8019,8 @@ fn surface_suspicious_merge_noop(
 /// Install any received snapshot, apply committed-and-durable commands to the
 /// engine in commit order, and compact when the engine has merged enough past the
 /// snapshot base. **Runs on the apply task only** — off the consensus loop, so a
-/// slow batch of engine merges or a compaction rewrite never stalls heartbeats /
+/// slow batch of engine merges never stalls heartbeats (the WAL rewrite runs in a
+/// background task, issue #1116) /
 /// append processing (the driver-liveness fix). Returns whether it did any work, so
 /// the caller can back off when idle. `engine_applied` publishes engine progress
 /// (linearizable reads gate on it), and `wal_lock` guards the compaction rewrite.
@@ -8036,8 +8045,8 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     kind_eval_batch_results: &Arc<Mutex<KindEvalBatchResults>>,
     engine_applied: &AtomicU64,
     applied_watch: &AppliedWatch,
-    wal_lock: &FairMutex,
-    halted: &AtomicBool,
+    wal_lock: &Arc<FairMutex>,
+    halted: &Arc<AtomicBool>,
     metrics: &MetricsHandle,
     scope: &StorageScope,
     // `kind_scopes`: every row kind (ADR 0041 §3). Only the snapshot image
@@ -8098,6 +8107,8 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     hot_change_max: &Arc<Mutex<Option<(HlcTimestamp, u32)>>>,
     // Issue #1064 part-2 test seam — see [`CompactTuning`]'s own doc.
     compact_tuning: &CompactTuning,
+    // Issue #1116: the in-flight background WAL rewrite (per-group-file path).
+    rewrite: &WalRewriteSlot,
 ) -> bool {
     let mut did_work = false;
 
@@ -10520,8 +10531,20 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     // optimization (the engine + un-truncated WAL stay consistent without it), and
     // starting a full WAL rewrite while the env is being torn down races the task
     // abort — the `replace` can then fail on a half-gone data dir.
+    //
+    // Issue #1116: at most one background WAL rewrite is in flight. A
+    // threshold-only trigger is recomputed fresh every pass, so it simply
+    // waits (the finishing rewrite raises `apply_signal`). `image_needed` and
+    // `just_installed_snapshot` are TAKE-ONCE events that cannot be deferred
+    // without losing them, so those wait out the running rewrite instead.
+    if rewrite.is_busy() && (image_needed || just_installed_snapshot_needs_wal_rewrite) {
+        while rewrite.is_busy() && !halted.load(Ordering::SeqCst) {
+            env.sleep(WAL_REWRITE_WAIT_POLL).await;
+        }
+    }
     if (threshold_hit || image_needed || just_installed_snapshot_needs_wal_rewrite)
         && !halted.load(Ordering::SeqCst)
+        && !rewrite.is_busy()
     {
         // The on-demand image: a slow whole-engine scan, done with no locks held,
         // and only when a follower is actually waiting on a snapshot.
@@ -10571,7 +10594,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         let image_installed = image.is_some();
         // Serialize the WAL rewrite against the consensus loop's appends. The
         // lock is FIFO-fair so back-to-back persist rounds cannot starve this.
-        let _wal = wal_lock.lock().await;
+        let mut wal_guard = Some(wal_lock.lock().await);
         let (bytes, lli) = {
             let mut c = core.lock().expect("raftkv core poisoned");
             // Advance the base to exactly the engine state (`snapshot_upto` drops
@@ -10652,15 +10675,52 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // no round was ever started, and the ack sat undelivered for
                 // seconds. Now compaction completes the round it consumed (after
                 // its `replace` lands, below), and the buffered acks go out.
-                let (_superseded, round) = persist_round::drain_for_round(&mut c, persist);
-                (Some((records, round, c.snapshot_index())), lli)
+                let (superseded, round) = persist_round::drain_for_round(&mut c, persist);
+                (Some((records, round, c.snapshot_index(), superseded)), lli)
             }
         };
         // Captured before `bytes` is moved into the `if let` below — the
         // other half of this attempt's own "did anything provably happen"
         // verdict (see `image_installed`'s doc above).
         let bytes_produced = bytes.is_some();
-        if let Some((records, round, new_snapshot_index)) = bytes {
+        if let Some((records, round, new_snapshot_index, superseded)) = bytes {
+            // Issue #1116: on the per-group-file path the slow half of the
+            // rewrite runs OUTSIDE `wal_lock`, so before releasing it the
+            // records the drain above took must be made durable in the LIVE
+            // WAL exactly as a persist round would (the image alone only
+            // becomes the WAL at the swap, and a later round may complete and
+            // ack before then — it must never do so over a gap). This is one
+            // ordinary append + fsync under the lock, the same cost a persist
+            // round already pays; the rewrite's temp-file write + fsync is
+            // what moves out. Then recording of later rounds begins (still
+            // under the lock) so the swap can re-append them.
+            let mut early: std::io::Result<()> = Ok(());
+            if shared.is_none() {
+                if let Some(round) = round {
+                    let mut buf = wal_lock
+                        .markers()
+                        .take_marker(env, &animus_control::persist::CONTROL_WAL, wal)
+                        .await;
+                    for record in &superseded {
+                        buf.extend(PersistedState::encode_record(record));
+                    }
+                    early = async {
+                        env.append(wal, &buf).await?;
+                        env.sync(wal).await
+                    }
+                    .await;
+                    if early.is_ok() {
+                        wal_lock.markers().mark_synced();
+                        let mut c = core.lock().expect("raftkv core poisoned");
+                        c.mark_durable_through(lli);
+                        persist.complete_drain(round);
+                    }
+                }
+                if early.is_ok() {
+                    wal_lock.tail().begin();
+                }
+                drop(wal_guard.take());
+            }
             // Issue #554: the durable applied-watermark marker is written
             // ONLY here (compaction/on-demand-image time), never on every
             // ordinary apply pass. Two reasons:
@@ -10706,14 +10766,20 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
             // wasteful) opposite: a crash leaving `snapshot_index` already
             // advanced but the marker stale, falsely requesting a fresh
             // snapshot this replica didn't need.
-            storage
-                .merge(
-                    &applied::applied_marker_key(tablet),
-                    &applied::encode_applied_value(new_snapshot_index),
-                    new_snapshot_index,
-                )
-                .await
-                .expect("raftkv applied watermark marker (compaction)");
+            //
+            // (Issue #1116: on the per-group-file path these markers now run
+            // after `wal_lock` is released — they still precede the swap
+            // below, which is the only ordering that matters.)
+            if early.is_ok() {
+                storage
+                    .merge(
+                        &applied::applied_marker_key(tablet),
+                        &applied::encode_applied_value(new_snapshot_index),
+                        new_snapshot_index,
+                    )
+                    .await
+                    .expect("raftkv applied watermark marker (compaction)");
+            }
             // Issue #804 (ADR 0018 §2 amendment): durably raise
             // `storage.latest_version()` to cover the highest `ts` ANY
             // entry through this compaction's own base has committed —
@@ -10725,7 +10791,9 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
             // exists and why compaction time, not every apply, is the right
             // cadence). `None` only for a tablet that has never applied a
             // single ts-bearing entry — nothing to raise the mark to yet.
-            if let Some(ts) = *max_applied_ts {
+            if early.is_ok()
+                && let Some(ts) = *max_applied_ts
+            {
                 storage
                     .merge(
                         &hwm::hwm_marker_key(tablet),
@@ -10739,15 +10807,34 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 shared
                     .compact_group(env, wal, TabletId(tablet), records)
                     .await
+            } else if early.is_err() {
+                early
             } else {
-                let mut buf = Vec::new();
-                for record in &records {
-                    buf.extend(PersistedState::encode_record(record));
-                }
-                // Issue #1132: rebuilt from records — any pending piggybacked
-                // marker no longer describes this file.
-                wal_lock.markers().invalidate();
-                env.replace(wal, &buf).await
+                // The staged write + swap runs in the background so the apply
+                // task keeps applying (a read confirms off the engine, which
+                // only this task advances) while the rewrite's `fsync` stalls.
+                // The slot is claimed here, before the spawn, and released by
+                // the guard's `Drop` even if the task panics or is aborted.
+                let guard = rewrite.claim();
+                let (env, wal, wal_lock, halted) = (
+                    env.clone(),
+                    wal.to_owned(),
+                    Arc::clone(wal_lock),
+                    Arc::clone(halted),
+                );
+                env.clone().spawn_task(async move {
+                    let _release = guard;
+                    if let Err(e) = rewrite_wal_staged(&env, &wal, &wal_lock, &records).await {
+                        // Same rule as the persist path: tolerated only while
+                        // halted (the pre-compaction WAL is intact, so recovery
+                        // is unaffected); a live failure is a real fault.
+                        assert!(
+                            halted.load(Ordering::SeqCst),
+                            "raftkv wal compaction failed while running: {e}"
+                        );
+                    }
+                });
+                Ok(())
             };
             match write_result {
                 Ok(()) => {
@@ -10785,6 +10872,116 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     }
 
     did_work
+}
+
+/// How often a take-once compaction trigger (`image_needed`, a just-installed
+/// snapshot) re-checks whether the in-flight background WAL rewrite finished.
+const WAL_REWRITE_WAIT_POLL: Duration = Duration::from_millis(2);
+
+/// The apply task's handle on its (at most one) background WAL rewrite.
+struct WalRewriteSlot {
+    inflight: Arc<AtomicBool>,
+    /// Raised when a rewrite finishes, so an idle apply task re-checks a
+    /// compaction trigger that was deferred behind it.
+    apply_signal: Arc<ApplySignal>,
+}
+
+impl WalRewriteSlot {
+    fn new(apply_signal: Arc<ApplySignal>) -> Self {
+        Self {
+            inflight: Arc::new(AtomicBool::new(false)),
+            apply_signal,
+        }
+    }
+
+    fn is_busy(&self) -> bool {
+        self.inflight.load(Ordering::Acquire)
+    }
+
+    fn claim(&self) -> WalRewriteGuard {
+        self.inflight.store(true, Ordering::Release);
+        WalRewriteGuard {
+            inflight: Arc::clone(&self.inflight),
+            apply_signal: Arc::clone(&self.apply_signal),
+        }
+    }
+}
+
+/// Releases a [`WalRewriteSlot`] on drop (task end, panic or abort alike).
+struct WalRewriteGuard {
+    inflight: Arc<AtomicBool>,
+    apply_signal: Arc<ApplySignal>,
+}
+
+impl Drop for WalRewriteGuard {
+    fn drop(&mut self) {
+        self.inflight.store(false, Ordering::Release);
+        self.apply_signal.notify();
+    }
+}
+
+/// The per-group-file WAL compaction rewrite, with its slow half **outside
+/// `wal_lock`** (issue #1116).
+///
+/// `Disk::replace` is a temp-file write + `fsync` + rename + directory
+/// `fsync`. Run under `wal_lock` (as it used to be) one slow `fsync` froze
+/// every persist round of the group — on a shared CI runner a 2s tail turned a
+/// write confirm into a 2s one. Here:
+///
+/// 1. [`Disk::stage_replace`] writes + fsyncs the image to the staging file
+///    with **no lock held**. Persist rounds keep appending to the live WAL
+///    (still durable-before-ack) and record their encoded bytes in
+///    [`FairMutex::tail`] (armed by the caller under the lock that captured
+///    `records`).
+/// 2. A bounded catch-up loop drains that tail into the staging file, still
+///    unlocked, so the final locked step usually has nothing left to sync.
+/// 3. Under the lock: drain the tail one last time into the staging file
+///    (an `fsync` only if rounds raced in since step 2), invalidate the
+///    piggybacked sync marker (the file is being rebuilt), and
+///    [`Disk::commit_staged`] (rename + directory `fsync`).
+///
+/// The swapped-in file is `image ++ every round persisted since the image`, the
+/// same bytes a rewrite under the lock would have produced. A crash before the
+/// swap leaves the live WAL, which holds every acked record; after it, the new
+/// file, whose tail is already durable (it was synced before the rename).
+async fn rewrite_wal_staged<E: Env>(
+    env: &E,
+    wal: &str,
+    wal_lock: &FairMutex,
+    records: &[animus_control::persist::WalRecord<KvCommand, KvState>],
+) -> std::io::Result<()> {
+    /// Unlocked catch-up passes before the final locked drain.
+    const CATCH_UP_PASSES: usize = 2;
+    let result = async {
+        let mut buf = Vec::new();
+        for record in records {
+            buf.extend(PersistedState::encode_record(record));
+        }
+        env.stage_replace(wal, &buf).await?;
+        for _ in 0..CATCH_UP_PASSES {
+            let delta = {
+                let _wal = wal_lock.lock().await;
+                wal_lock.tail().take()
+            };
+            if delta.is_empty() {
+                break;
+            }
+            env.stage_extend(wal, &delta).await?;
+        }
+        let _wal = wal_lock.lock().await;
+        let delta = wal_lock.tail().take();
+        env.stage_extend(wal, &delta).await?;
+        // Issue #1132: rebuilt from records — any pending piggybacked marker
+        // no longer describes this file.
+        wal_lock.markers().invalidate();
+        env.commit_staged(wal).await
+    }
+    .await;
+    wal_lock.tail().end();
+    if result.is_err() {
+        let _ = env.discard_staged(wal).await;
+    }
+    result
 }
 
 /// Apply and clear an accumulated run of per-key LWW merges under a single WAL
@@ -12187,8 +12384,15 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     // last genuine forward progress, never total transfer duration.
     let mut compact_defer_since: Option<Nanos> = None;
     let mut compact_defer_progress: Option<u64> = None;
+    let rewrite = WalRewriteSlot::new(Arc::clone(&apply_signal));
     loop {
         if halted.load(Ordering::SeqCst) {
+            // Issue #1116: a background WAL rewrite is part of this task's
+            // work — `is_stopped()` (which gates deleting the group's files)
+            // must not turn true while one is still writing `{wal}.tmp`.
+            while rewrite.is_busy() {
+                env.sleep(WAL_REWRITE_WAIT_POLL).await;
+            }
             apply_stopped.store(true, Ordering::SeqCst);
             return;
         }
@@ -12227,6 +12431,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
             &mut compact_defer_progress,
             &hot_change_max,
             &compact_tuning,
+            &rewrite,
         )
         .await;
         if !did_work {

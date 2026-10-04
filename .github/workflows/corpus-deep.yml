@@ -540,6 +540,20 @@ jobs:
         run: |
           cargo test -p animus-cp-data --test it sharedwal_fault_corpus:: -- --nocapture
 
+      # Issue #1116: whole-cluster power-cut at 12 offsets into a stalled
+      # staged WAL-compaction rewrite (plain + torn/corrupt tails), requiring
+      # every acked write to survive. Each cell is a pure function of its
+      # seed. K=10 is ~27s in debug, so K=50 is ~2-3 minutes.
+      - name: deep WAL-rewrite crash corpus (issue #1116)
+        id: wal_rewrite_crash
+        continue-on-error: true
+        timeout-minutes: 15
+        env:
+          # Fixed depth, not a workflow_dispatch input (the 25-input cap).
+          ANIMUS_WAL_REWRITE_CRASH_SEEDS: '50'
+        run: |
+          cargo test -p animus-cp-data --test it wal_rewrite_crash:: -- --nocapture
+
       # ADR 0073 P1-D tier 1: a live workload on LsmEngine/SharedWal disks,
       # stopped cleanly / by a crash / by a torn-tail crash, run through the
       # per-format transcode table (identity today), restarted with strict
@@ -630,13 +644,14 @@ jobs:
             [export_import]="${{ steps.export_import.outcome }}"
             [heartbeat]="${{ steps.heartbeat.outcome }}"
             [sharedwal]="${{ steps.sharedwal.outcome }}"
+            [wal_rewrite_crash]="${{ steps.wal_rewrite_crash.outcome }}"
             [upgrade_restart]="${{ steps.upgrade_restart.outcome }}"
             [upgrade_restart_cluster]="${{ steps.upgrade_restart_cluster.outcome }}"
             [learner_snapshot_livelock]="${{ steps.learner_snapshot_livelock.outcome }}"
           )
           failed=0
           failed_names=()
-          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner reconfigure_drop inplace_split backup pitr lsm_crash lsm_disk_fault lsm_encrypted segment_store_encrypted control simcluster dynamo_wire export_import heartbeat sharedwal upgrade_restart upgrade_restart_cluster learner_snapshot_livelock; do
+          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner reconfigure_drop inplace_split backup pitr lsm_crash lsm_disk_fault lsm_encrypted segment_store_encrypted control simcluster dynamo_wire export_import heartbeat sharedwal wal_rewrite_crash upgrade_restart upgrade_restart_cluster learner_snapshot_livelock; do
             outcome="${outcomes[$name]}"
             echo "${name}: ${outcome}"
             if [ "${outcome}" != "success" ]; then

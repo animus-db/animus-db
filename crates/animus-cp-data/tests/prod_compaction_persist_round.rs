@@ -216,6 +216,9 @@ async fn writes_keep_confirming_while_compaction_drains_the_wal() {
          longer holds"
     );
 
+    // Printed (visible with `--nocapture`) so a CI log of a near-miss shows how
+    // close the run came to the limit.
+    eprintln!("worst confirm: {worst:?} at write {worst_at} (limit {WORST_CONFIRM:?})");
     assert!(
         worst < WORST_CONFIRM,
         "worst confirm was {worst:?} at write {worst_at} (limit {WORST_CONFIRM:?})"
