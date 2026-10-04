@@ -1,9 +1,8 @@
 //! A minimal S3 client (`put`/`get`/`delete`/`head`/`list_objects_v2`) over
 //! an explicit [`Transport`] seam, so the client itself stays testable
-//! without sockets (S-04 PR 1). No retries here — the `SegmentStore` layer
-//! this crate is built for (a future PR) owns retry policy, exactly like
-//! `animus_env::SegmentStore`'s own doc describes for its production
-//! implementors.
+//! without sockets (S-04 PR 1). No retries here — `animus_env::
+//! S3SegmentStore` owns retry policy (backoff and jitter drawn from the
+//! `Env` seam).
 //!
 //! # Why every method takes `now_epoch_ms`
 //!
@@ -61,6 +60,10 @@ pub enum TransportError {
     Connect(String),
     #[error("i/o error: {0}")]
     Io(String),
+    /// The transport gave up waiting (connect or whole-request deadline).
+    /// Retryable, like every transport-level failure.
+    #[error("timed out: {0}")]
+    Timeout(String),
 }
 
 /// The seam a real socket sits behind: a minimal async

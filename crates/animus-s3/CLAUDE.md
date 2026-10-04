@@ -51,11 +51,10 @@ landed too — see "Multipart and ranged GET" below; the rest of S-08 is in
   `async fn send(HttpRequest) -> Result<HttpResponse, TransportError>` over
   owned bytes — no socket type anywhere in the trait, so the client is
   testable without one. [`client::S3Error`] distinguishes `NotFound`/
-  `AccessDenied`/`Service{code,message,status}`/`Transport(..)`. **No
-  retries in this PR** — deliberately: a future `SegmentStore` layer over
-  this client owns retry policy, exactly like `animus_env::SegmentStore`'s
-  own doc frames the split between "a store's own consistency contract" and
-  "what a caller does about a transient failure."
+  `AccessDenied`/`Service{code,message,status}`/`Transport(..)`;
+  `TransportError` is `Connect`/`Io`/`Timeout`. **No retries in the client**
+  — `animus_env::S3SegmentStore` owns retry policy (S-08 M3: Env-seamed
+  exponential backoff with full jitter), so it is seed-testable.
 - `creds` — **pure** credential sourcing (S-08 M1): the async
   [`creds::CredentialProvider`] trait (`credentials(now_epoch_ms)` +
   `refresh(stale, now)`; never reads a clock), [`creds::StaticProvider`],
@@ -74,8 +73,19 @@ landed too — see "Multipart and ranged GET" below; the rest of S-08 is in
   in-memory `Transport` implementor with real SigV4 signature verification
   (see its own doc). Available to a downstream crate's tests too, via the
   `fake` feature.
+- `fake::FaultyTransport<T>` (S-08 M3) — wraps any transport with a scripted
+  `FaultPlan` (`FnMut(request index, &HttpRequest) -> Fault`); faults: `Pass`,
+  `Status{status, code}` (S3 error body, not applied), `TransportError`,
+  `Timeout`, `ApplyThenError` (applied to the inner transport, response
+  replaced by a transport error — the lost-ack case). Used by
+  `animus-test`'s `s3_fault_corpus`.
 - `prod` (`#[cfg(feature = "prod")]`) — [`prod::HyperRustlsTransport`], the
   one real-socket/TLS `Transport`. One connection per request, no pooling.
+  **Timeouts (S-08 M3)**: `TransportTimeouts` (default 10 s connect = TCP +
+  TLS handshake, 60 s whole request — multipart parts are 16 MiB; set with
+  `with_timeouts`) via `tokio::time::timeout`, surfacing as the retryable
+  `TransportError::Timeout`. Real-socket test: `tests/transport_timeout.rs`
+  (a listener that accepts and never answers).
 
 ## Feature flags
 
@@ -100,18 +110,15 @@ landed too — see "Multipart and ranged GET" below; the rest of S-08 is in
 
 ## Determinism posture
 
-This crate is **not** `animus-env`-seamed (no `Env`, no `SimEnv` story) —
-and that is deliberate for this PR, not an oversight to fix later. `sigv4`
+This crate is **not** `animus-env`-seamed (no `Env`) — deliberate: `sigv4`
 and `client::S3Client` are pure functions of their inputs (including
-`now_epoch_ms`, always a parameter); the only place real time, real
-sockets, or real randomness could enter is `prod::HyperRustlsTransport`,
-which does nothing this crate's own tests exercise. When PR 2 wraps this
-client in a `SegmentStore` impl, *that* wrapper is where `env.wall_now()`
-and `env.spawn_task`/`ProdEnv`'s real transport get threaded in — this
-crate stays exactly as pure as it is today. Don't add an `animus-env`
-dependency here "to save a parameter" in a future PR; that would reopen the
-seam violation ADR 0003 exists to prevent, one layer earlier than it needs
-to.
+`now_epoch_ms`, always a parameter), `creds` never reads a clock, and the
+only real time/sockets are in `prod::HyperRustlsTransport` (module-level
+justified allow; its timeouts are real-time by nature). The *seam* is one
+layer up: `animus_env::S3SegmentStore<T, E: Clock + Rng>` supplies
+`env.wall_now()`, `env.sleep()` and jitter, so retry behaviour is
+seed-reproducible under `SimEnv` (`FaultyTransport` + `s3_fault_corpus`).
+Don't add an `animus-env` dependency here "to save a parameter".
 
 ## Why no XML dependency
 

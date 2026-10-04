@@ -136,6 +136,7 @@ pub fn parse_complete_multipart(xml: &str) -> Result<(), ErrorBody> {
 
 /// Parse a `CompleteMultipartUpload` request body into `(part number,
 /// etag)` pairs in document order (used by `crate::fake`).
+#[cfg(any(test, feature = "fake"))]
 #[must_use]
 pub fn parse_complete_request(xml: &str) -> Vec<(u32, String)> {
     between(xml, "Part")

@@ -1001,3 +1001,128 @@ impl Transport for FakeCredentialService {
         Ok(self.handle(request))
     }
 }
+
+// --- scripted fault injection ---------------------------------------------
+
+/// What a [`FaultyTransport`] does to one request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fault {
+    /// Forward to the inner transport untouched.
+    Pass,
+    /// Answer `status` with an S3 `<Error><Code>code</Code>` body **without**
+    /// forwarding (the request is not applied).
+    Status { status: u16, code: String },
+    /// Fail with a connection-level transport error; not applied.
+    TransportError,
+    /// Fail with [`TransportError::Timeout`]; not applied.
+    Timeout,
+    /// The ack-lost case: forward the request (it IS applied to the inner
+    /// transport), discard the response, and fail with a transport error.
+    ApplyThenError,
+}
+
+impl Fault {
+    /// Shorthand for [`Fault::Status`].
+    #[must_use]
+    pub fn status(status: u16, code: &str) -> Self {
+        Fault::Status {
+            status,
+            code: code.to_string(),
+        }
+    }
+}
+
+/// A scripted fault plan: called once per request with the 0-based request
+/// index and the request itself (method / uri incl. query are available to
+/// key on), returns the [`Fault`] to inject.
+pub type FaultPlan = Box<dyn FnMut(u64, &HttpRequest) -> Fault + Send>;
+
+/// A [`Transport`] wrapper injecting deterministic, scripted faults in front
+/// of any inner transport (typically [`FakeS3`]). Pure function of the plan
+/// and the request sequence: no clock, no randomness of its own — a seeded
+/// test builds its plan from its seed.
+pub struct FaultyTransport<T> {
+    inner: T,
+    plan: Mutex<FaultPlan>,
+    seen: Mutex<u64>,
+    injected: Mutex<u64>,
+}
+
+impl<T: Transport> FaultyTransport<T> {
+    /// Wrap `inner`, consulting `plan` for every request.
+    #[must_use]
+    pub fn new(inner: T, plan: FaultPlan) -> Self {
+        FaultyTransport {
+            inner,
+            plan: Mutex::new(plan),
+            seen: Mutex::new(0),
+            injected: Mutex::new(0),
+        }
+    }
+
+    /// Wrap `inner` with a plan that never injects anything (swap it later
+    /// with [`Self::set_plan`]).
+    #[must_use]
+    pub fn passthrough(inner: T) -> Self {
+        Self::new(inner, Box::new(|_, _| Fault::Pass))
+    }
+
+    /// Replace the plan. The request index keeps counting.
+    pub fn set_plan(&self, plan: FaultPlan) {
+        *self.plan.lock().expect("faulty plan lock") = plan;
+    }
+
+    /// The wrapped transport.
+    #[must_use]
+    pub fn inner(&self) -> &T {
+        &self.inner
+    }
+
+    /// Requests received so far (the next request's plan index).
+    #[must_use]
+    pub fn requests_seen(&self) -> u64 {
+        *self.seen.lock().expect("faulty seen lock")
+    }
+
+    /// Requests that got any fault other than [`Fault::Pass`].
+    #[must_use]
+    pub fn faults_injected(&self) -> u64 {
+        *self.injected.lock().expect("faulty injected lock")
+    }
+}
+
+#[async_trait]
+impl<T: Transport> Transport for FaultyTransport<T> {
+    async fn send(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
+        let index = {
+            let mut seen = self.seen.lock().expect("faulty seen lock");
+            let i = *seen;
+            *seen += 1;
+            i
+        };
+        let fault = (self.plan.lock().expect("faulty plan lock"))(index, &request);
+        if fault != Fault::Pass {
+            *self.injected.lock().expect("faulty injected lock") += 1;
+        }
+        match fault {
+            Fault::Pass => self.inner.send(request).await,
+            Fault::Status { status, code } => Ok(HttpResponse {
+                status,
+                headers: BTreeMap::new(),
+                body: format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{code}</Code>\
+                     <Message>injected fault</Message></Error>"
+                )
+                .into_bytes(),
+            }),
+            Fault::TransportError => Err(TransportError::Io("injected connection reset".into())),
+            Fault::Timeout => Err(TransportError::Timeout("injected timeout".into())),
+            Fault::ApplyThenError => {
+                let _ = self.inner.send(request).await;
+                Err(TransportError::Io(
+                    "injected connection reset after the request was applied".into(),
+                ))
+            }
+        }
+    }
+}
