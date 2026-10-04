@@ -334,9 +334,10 @@ its one implementor.
 
 - **`sim_relay::SimRelayClient<E: Env>`** — a second `RelayClient`
   implementor, this one over the `Network` seam (ADR 0026) instead of a
-  socket. Reserves `RELAY_STREAM = u64::MAX - 2` (the module doc's own
-  table gathers every other reserved-stream constant in the workspace and
-  explains the choice); addresses a peer by `NodeId::to_string()` (a
+  socket. Reserves `RELAY_STREAM = u64::MAX - 3` (the `reserved_streams` module's
+  table is the one authoritative allocation of every reserved stream, with a
+  `const` pairwise-distinct assertion; it was `- 2` until #1055 found that
+  equal to `HEARTBEAT_BATCH_STREAM`); addresses a peer by `NodeId::to_string()` (a
   `SimEnv` node has no host:port, and `NodeId` is fundamentally a string,
   so this needs no separate lookup table — `SimRelayClient::relay` parses
   `addr` back via `NodeId::new_unchecked`, the literal inverse of

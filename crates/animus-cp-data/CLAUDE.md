@@ -178,7 +178,9 @@ amendment — the shape predates and outlives it.)
   `RaftCore::heartbeat_interval` tick, on the reserved
   `HEARTBEAT_BATCH_STREAM = u64::MAX - 2` (this crate's fourth reserved
   stream constant, alongside `cluster_segment_store::SEGMENT_STREAM` and
-  `backup::BACKUP_SEGMENT_STREAM`) — instead of one `env.send_stream` call
+  `backup::BACKUP_SEGMENT_STREAM`; the authoritative table of all reserved
+  streams, with a `const` distinctness assertion, is
+  `animus_node::reserved_streams`) — instead of one `env.send_stream` call
   per group per tick. **The mechanism itself is unchanged by the cutover
   — only which production caller reaches for `None` vs. `Some` flipped**,
   entirely in `animusd` (`main::DEFAULT_HEARTBEAT_BATCH = true`; see that
