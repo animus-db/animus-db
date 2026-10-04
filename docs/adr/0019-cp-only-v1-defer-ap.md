@@ -175,3 +175,16 @@ The new precondition is the one that closed the hatch — **a wire adapter that 
 express a replication mode.** Reviving AP under a DynamoDB-only surface would
 mean either a second adapter or a deliberate, documented departure from
 DynamoDB's `CreateTable` contract; neither is a decision to make in advance.
+
+## Amendment (2026-10-04) — the premise above was wrong about global tables; see ADR 0075
+
+The 2026-08-23 argument ("DynamoDB's `CreateTable` has no replication-mode
+field, so AP is unselectable") missed that DynamoDB's own multi-Region feature
+*is* a per-table, wire-level replication mode: `UpdateTable` `ReplicaUpdates`
+plus `MultiRegionConsistency` (`EVENTUAL` or `STRONG`), fixed at global-table
+creation. [ADR 0075](0075-global-tables.md) revisits this: each region stays CP
+locally, MRSC is a CP cross-region mode (a stretch cluster), and MREC is a new
+asynchronous per-item last-writer-wins layer between clusters on top of CP
+tablets. This amendment does **not** restore `ReplicationMode`, `animus-data` or
+Accord, which stay deleted; the AP *data plane* closure stands. Status: ADR 0075
+is Proposed; nothing is implemented.

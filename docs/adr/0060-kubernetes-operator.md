@@ -1880,3 +1880,11 @@ installed without the webhook the reconciler sets the
 before applying any child resource. Every shipped `AnimusCluster` manifest
 carries `schemaVersion: 1`, and a golden fixture
 (`tests/fixtures/formats/animuscluster-spec/v1.json`) pins the format.
+
+## Amendment (2026-10-04) — multi-cluster federation is scoped (ADR 0075)
+
+[ADR 0075](0075-global-tables.md) §5.4 scopes operator federation for global
+tables (roadmap G-01 stage G-e): additive `spec.region` and `spec.peers[]`
+(endpoints, peer TLS trust), peer-egress `NetworkPolicy`, no separate
+federating CRD in v1, one `AnimusCluster` per Kubernetes cluster. Proposed;
+not implemented. Topology spread (stage G-a) is separate.
