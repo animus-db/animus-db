@@ -1771,3 +1771,10 @@ first before debugging anything else.
 - Operator and `animusd` image ship together (an old image rejects the flags).
   kind e2e labels the node and asserts annotations + registered member labels
   (could not be run in the authoring sandbox).
+
+**e2e topology assertion is polled, not one-shot (2026-10-04).** The G-01 G-a
+check that `/admin/status` shows >=3 members labelled with the kind node's zone
+runs under `wait_for`: pod Ready does not imply each node's background
+`RegisterNode` has committed and reached the serving replica (run 37201459207
+saw e2e-0 with empty labels right after readiness). See
+`docs/lessons/testing/2026-10-04-e2e-pod-ready-does-not-mean-registered.md`.
