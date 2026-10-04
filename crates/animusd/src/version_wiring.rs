@@ -155,6 +155,19 @@ pub(crate) fn check_join_range(raw_cluster_version: u32, own: &VersionRange) -> 
     }
 }
 
+/// Opt a freshly started control `RaftNode` into versioning: its own build and
+/// range come from the node's profile (this binary's, in production). Until
+/// this is set a `RaftNode` is a Phase 1 profile (never evaluates the era,
+/// proposes nothing). Called right after `RaftNode::start*`, before the node
+/// is registered anywhere.
+pub(crate) fn apply_profile_to_raft<E: Env>(
+    raft: &animus_control::RaftNode<E>,
+    profile: &VersionProfile,
+) {
+    raft.set_own_build(profile.build.clone());
+    raft.set_own_version_range(profile.range);
+}
+
 /// The era-on admission check for `change_membership` (ADR 0073 section 2(c)):
 /// refuse a control voter with no known version range (a Phase 1 binary
 /// never advertises one) or whose range excludes the cluster version. The

@@ -6038,6 +6038,11 @@ impl BoundNode {
         // one-process-per-node mode (`tests/schema_ddl_relay.rs`); a
         // `--cluster N` in-process node now exercises it too instead of always
         // finding the leader's handle locally.
+        // ADR 0073 Phase 2 (P2-C): THE flip — this binary's own range and
+        // build go onto the control `RaftNode`, which from here on evaluates
+        // the era-start precondition P and (era on) reports/refuses by
+        // version. Everything before this line in the wiring is inert.
+        version_wiring::apply_profile_to_raft(&raft, &edge.version().profile());
         edge.register_control(raft.clone());
 
         // **Leaderful CP per-tablet Raft group** (ADR 0017 #3a) — the v1 data plane
@@ -7658,6 +7663,9 @@ impl BoundControlNode {
         // still lets `propose_schema` (and the client dispatch paths above)
         // propose locally when this node is the control leader.
         let edge = ClusterEdgeState::new();
+        // ADR 0073 Phase 2 (P2-C): the flip, control-only assembly — see
+        // `BoundNode::start_with_growth`'s identical call.
+        version_wiring::apply_profile_to_raft(&raft, &edge.version().profile());
         edge.register_control(raft.clone());
 
         // This node's stream-shard segment store (ADR 0043 §A7b) — see
