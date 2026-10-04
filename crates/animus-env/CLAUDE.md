@@ -1187,3 +1187,7 @@ hold the lock only for the swap. Trait defaults are correct for any `Disk`
 and `SimEnv` override them natively. `EncryptedDisk` deliberately uses the
 defaults (its per-file frame index makes a native rename-based swap
 non-trivial), so under `--encryption-key` the swap re-reads and `replace`s.
+
+## Fuzzing (roadmap R-01 (c))
+
+The `ADE1` encryption envelope and the handshake preamble/extension parsers are the `encryption_envelope` and `net_frames` fuzz targets; the private envelope scan/open is exposed through the off-by-default `fuzzing` feature (`encrypted::fuzzing`). See `fuzz/README.md` (stable smoke: `cd fuzz && cargo test --release --test smoke`).

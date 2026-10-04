@@ -1,0 +1,22 @@
+# target	decoder-name	repo-relative file or directory (recursive)
+# Every file becomes a seed for <target>, prefixed with the "<decoder-name>\n"
+# routing line. The ADR 0073 golden fixtures are read in place; nothing is
+# copied into the repo.
+lsm_formats	wal	crates/animus-storage/tests/fixtures/formats/lsm-wal
+lsm_formats	manifest	crates/animus-storage/tests/fixtures/formats/lsm-manifest
+lsm_formats	sstable_image	crates/animus-storage/tests/fixtures/formats/lsm-sstable
+control_formats	control_wal	crates/animus-control/tests/fixtures/formats/control-wal
+control_formats	control_snapshot	crates/animus-control/tests/fixtures/formats/control-snapshot
+control_formats	shared_wal	crates/animus-control/tests/fixtures/formats/shared-wal
+control_formats	metadata	crates/animus-control/tests/fixtures/formats/metadata
+cp_data_formats	raftkv_image	crates/animus-cp-data/tests/fixtures/formats/raftkv-image
+cp_data_formats	raftkv_wal	crates/animus-cp-data/tests/fixtures/formats/raftkv-wal
+cp_data_formats	segment	crates/animus-cp-data/tests/fixtures/formats/segment
+cp_data_formats	backup_data	crates/animus-cp-data/tests/fixtures/formats/backup-data
+cp_data_formats	backup_manifest	crates/animus-cp-data/tests/fixtures/formats/backup-manifest
+cp_data_formats	layout	crates/animus-cp-data/tests/fixtures/formats/cp-engine-layout
+net_frames	handshake	crates/animus-env/tests/fixtures/formats/network-handshake
+net_frames	handshake	crates/animus-env/tests/fixtures/formats/client-handshake
+encryption_envelope	file	crates/animus-env/tests/fixtures/formats/encryption-envelope
+item_codecs	stored_item	crates/animus-item/tests/fixtures/formats/stored-item
+item_codecs	change_record	crates/animus-item/tests/fixtures/formats/change-record

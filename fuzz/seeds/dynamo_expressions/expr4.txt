@@ -1,0 +1,5 @@
+SET #a = list_append(:l, :l), b = :m
+NOT (a = :s)
+#a, #b
+pk = :p AND sk < :v
+contains(ss, :s) AND NOT a = :v

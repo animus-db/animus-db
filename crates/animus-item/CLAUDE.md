@@ -216,3 +216,7 @@ Raft/apply machinery to integration-test against.
   pinned input -> bytes vectors, not tagged formats. Editing an expected
   vector is a key-space break; add cases by a new `vN.json`, never by editing.
 - Each fixture has an `#[ignore]`d no-overwrite `generate_fixture_*`.
+
+## Fuzzing (roadmap R-01 (c))
+
+The stored-item / `ChangeRecord` / footprint codecs, `numkey` and the GSI/LSI row-key parsers are the `item_codecs` fuzz target (golden fixtures seed it). A format change per ADR 0073 keeps the old decoder, which stays fuzzed. See `fuzz/README.md` (stable smoke: `cd fuzz && cargo test --release --test smoke`).

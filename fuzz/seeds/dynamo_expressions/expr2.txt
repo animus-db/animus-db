@@ -1,0 +1,4 @@
+REMOVE a, b, c
+
+
+#a = :p AND #b >= :v

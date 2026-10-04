@@ -1,0 +1,2 @@
+BatchWriteItem
+{"RequestItems": {"t": [{"PutRequest": {"Item": {"pk": {"S": "a"}}}}, {"DeleteRequest": {"Key": {"pk": {"S": "b"}}}}]}}

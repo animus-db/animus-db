@@ -1,0 +1,2 @@
+streams:GetRecords
+{"ShardIterator": "abc", "Limit": 10}

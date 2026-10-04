@@ -41,6 +41,9 @@ pub(crate) fn fixture_file_version(path: &std::path::Path) -> u32 {
         .unwrap_or_else(|| panic!("fixture {} is not named v<N>.bin", path.display()))
 }
 
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub use lsm::fuzzing;
 #[cfg(any(test, feature = "legacy-encoders"))]
 pub use lsm::reframe_wal_to_v1;
 pub use lsm::{LsmEngine, LsmOptions, LsmSnapshot, SsTableView, WalRecordView};

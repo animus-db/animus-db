@@ -1,0 +1,2 @@
+not_leader
+not leader; leader hint: n2 at 10.0.0.2:7000

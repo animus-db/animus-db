@@ -69,6 +69,9 @@ mod codec;
 pub mod cursor;
 #[cfg(test)]
 mod format_fixture_tests;
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing;
 pub mod heartbeat_batch;
 pub mod hlc;
 pub mod host;

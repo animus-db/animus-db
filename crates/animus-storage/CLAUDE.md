@@ -796,3 +796,7 @@ section — expected to scale with table count, not data volume, since it
 hard-links rather than copies.
 
 **Upgrade-harness class (ADR 0073 P1-D):** `lsm-wal`, `lsm-manifest` and `lsm-sstable` are whole-file `TABLE` entries in `animus-test`'s transcode table (a bump edits that entry; legacy encoders must be `pub` + `legacy-encoders`-gated); `lsm-sstable` is also the carrier of every engine-resident `EMBEDDED` format.
+
+## Fuzzing (roadmap R-01 (c))
+
+The LSM WAL/manifest/SSTable decoders are the `lsm_formats` fuzz target, reached through the off-by-default `fuzzing` feature's `#[doc(hidden)] lsm::fuzzing` module (thin entry points only — no behaviour lives there). Adding a format version = keep the `legacy::vN` decoder reachable from that module. See `fuzz/README.md` (stable smoke: `cd fuzz && cargo test --release --test smoke`).
