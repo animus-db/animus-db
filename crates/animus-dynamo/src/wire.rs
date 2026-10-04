@@ -4864,9 +4864,17 @@ fn decode_predicate(
 /// combinator: it belongs to the term. That one is handled by refusing to split
 /// on an ` AND ` that a `BETWEEN` at the same depth is still waiting for.
 fn find_top_level(haystack: &str, needle: &str) -> Option<usize> {
-    let lower = haystack.to_ascii_lowercase();
-    let needle = needle.to_ascii_lowercase();
-    let bytes = lower.as_bytes();
+    // Byte-based, ASCII-case-insensitive matching on the ORIGINAL bytes: never
+    // slice the `str` at a byte index that may fall inside a multi-byte char
+    // (that panics), and the returned offsets index `haystack` itself. Every
+    // needle starts with an ASCII space, so a hit is always a char boundary.
+    let bytes = haystack.as_bytes();
+    let at = |i: usize, pat: &[u8]| {
+        bytes
+            .get(i..i + pat.len())
+            .is_some_and(|w| w.eq_ignore_ascii_case(pat))
+    };
+    let needle = needle.as_bytes();
     let mut depth = 0i32;
     // Positions of the token, recorded left to right, then chosen from the right.
     let mut hits: Vec<usize> = Vec::new();
@@ -4880,11 +4888,11 @@ fn find_top_level(haystack: &str, needle: &str) -> Option<usize> {
             _ => {}
         }
         if depth == 0 {
-            if lower[i..].starts_with(" between ") {
+            if at(i, b" between ") {
                 pending_between += 1;
             }
-            if lower[i..].starts_with(&needle) {
-                if needle == " and " && pending_between > 0 {
+            if at(i, needle) {
+                if needle.eq_ignore_ascii_case(b" and ") && pending_between > 0 {
                     // This AND closes a BETWEEN rather than joining two terms.
                     pending_between -= 1;
                 } else {
@@ -13231,5 +13239,70 @@ mod byte_cap_tests {
         let err = decode_request("DynamoDB_20120810.TransactWriteItems", over_cap.as_bytes())
             .expect_err("one over the cap is rejected");
         assert_eq!(err.code, "ValidationException");
+    }
+}
+
+// Regression tests for the fuzzer-found `find_top_level` panic: a non-ASCII
+// char at paren depth 0 made `lower[i..]` slice inside a multi-byte char.
+// Own module, same conflict-avoidance convention as `byte_cap_tests`.
+#[cfg(test)]
+mod find_top_level_utf8_tests {
+    use super::*;
+
+    fn scan_with_filter(filter: &str) -> Result<Operation, WireError> {
+        let body = serde_json::json!({
+            "TableName": "tbl",
+            "FilterExpression": filter,
+            "ExpressionAttributeValues": {":v": {"S": "x"}, ":x": {"N": "1"}, ":y": {"N": "2"}},
+        });
+        decode_request("DynamoDB_20120810.Scan", body.to_string().as_bytes())
+    }
+
+    #[test]
+    fn non_ascii_at_depth_zero_never_panics() {
+        for filter in [
+            "a = :v OR b\u{FFFD}c = :v",
+            "\u{FFFD} OR \u{FFFD} AND \u{FFFD}",
+            "a = :v AND \u{130}x = :v OR b = :v",
+            "\u{130}\u{130}\u{130} BETWEEN :x AND :y",
+            "a = :v \u{1F600} OR \u{1F600} b = :v AND \u{1F600}",
+            "\u{1F600}",
+            "a \u{130} between :x and :y",
+        ] {
+            // Ok or a named validation error are both fine; a panic is not.
+            if let Err(e) = scan_with_filter(filter) {
+                assert!(!e.code.is_empty(), "{filter:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn find_top_level_offsets_index_the_original_string() {
+        let s = "\u{130}\u{130} = :v OR b = :v";
+        let at = find_top_level(s, " OR ").expect("top-level OR");
+        assert!(s.is_char_boundary(at));
+        assert_eq!(&s[at..at + 4], " OR ");
+    }
+
+    /// The exact libFuzzer `dynamo_request` crash input (body after the
+    /// `Scan\n` routing line), including a U+FFFD at depth 0.
+    #[test]
+    fn fuzzer_crash_input_does_not_panic() {
+        let body = "{\"TableName\": \"tExporthhhhhhhhhhhhhhhhhhhheqhhhhhhhhKeyhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhxhhhhhhhhhhhhhhhhhhhhhhhhhhTa\", \"FilterExpression\": \"not aimmmmmmmmmmmmmmshardId-aBatchGBatch\u{FFFD}etI------mNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNmmmmmmmmmmmmmmmmmmmmmmns(anul, >s2 OR NOT (b IN s:v, ,v))\", \"EApressionAttributeValues\": {\":s\": {\"S\": \"x\"}, \":v\": {\"2\": \"2\"}}, \"Segment\": 0, \"TotalSegments\": 4}";
+        let _ = decode_request("DynamoDB_20120810.Scan", body.as_bytes());
+    }
+
+    #[test]
+    fn legit_or_between_filter_still_parses_identically() {
+        let a = scan_with_filter("a = :v OR b BETWEEN :x AND :y").expect("parses");
+        let b = scan_with_filter("a = :v or b between :x and :y").expect("parses");
+        let dbg = format!("{a:?}");
+        assert_eq!(dbg, format!("{b:?}"), "keyword case must not matter");
+        assert!(dbg.contains("Or("), "{dbg}");
+        assert!(dbg.contains("Between"), "{dbg}");
+        assert!(
+            !dbg.contains("And("),
+            "BETWEEN's AND is not a combinator: {dbg}"
+        );
     }
 }
