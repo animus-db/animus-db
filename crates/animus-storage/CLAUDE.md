@@ -480,6 +480,13 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   pre-sizing a
   `Vec`" entry (found and fixed first in `animus-cp-data::codec`) for the
   full account.
+- **Never `lz4_flex::decompress_size_prepended` on an SSTable block.** It
+  allocates the untrusted 4-byte size prefix up front (a CRC-valid corrupt
+  block declaring ~3.8 GB aborts). `decompress_lz4_block` in `lsm/sstable.rs`
+  bounds the prefix by `255 * compressed_len` (LZ4's max expansion; the LSM
+  caps no record size, so no fixed bound is safe) then calls
+  `lz4_flex::decompress`. See
+  `docs/lessons/code-patterns/2026-10-04-size-prepended-decompress-allocates-the-untrusted-prefix.md`.
 - **A `snapshot()`'s pinned version must floor compaction's tombstone-GC
   window, not just its own read path.** `LsmSnapshot` used to be a bare
   `(engine, version)` pair with no registration anywhere — a long-held snapshot

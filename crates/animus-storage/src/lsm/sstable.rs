@@ -110,8 +110,7 @@ fn decode_block_v1(framed: &[u8]) -> Result<Vec<Record>> {
     match tag {
         BLOCK_STORED => decode_block(payload),
         BLOCK_LZ4 => {
-            let rec_bytes = lz4_flex::decompress_size_prepended(payload)
-                .map_err(|e| StorageError::Backend(format!("sstable block decompress: {e}")))?;
+            let rec_bytes = decompress_lz4_block(payload)?;
             decode_block(&rec_bytes)
         }
         other => Err(StorageError::Backend(format!(
@@ -119,6 +118,37 @@ fn decode_block_v1(framed: &[u8]) -> Result<Vec<Record>> {
         ))),
     }
 }
+/// Upper bound on the LZ4 expansion ratio: in the LZ4 block format a run of N
+/// repeated bytes costs at least ~N/255 bytes of length continuation, so no
+/// input of `n` compressed bytes can decompress to more than `255 * n` bytes.
+const LZ4_MAX_EXPANSION: usize = 255;
+
+/// Decompress a `compress_prepend_size` payload (`u32 LE declared size ||
+/// lz4 data`) **without trusting the declared size**. `lz4_flex`'s
+/// `decompress_size_prepended` pre-allocates `vec![0; declared]`, so a CRC-valid
+/// corrupt/hostile block declaring ~4 GB aborts the process (OOM) before any
+/// byte is decoded. The LSM layer imposes no cap on a single record (a value is
+/// length-prefixed by a `u32`), so there is no fixed legal maximum block size to
+/// compare against; instead the declared size is bounded by what the actual
+/// compressed bytes can possibly expand to ([`LZ4_MAX_EXPANSION`]), which no
+/// legitimately-written block can exceed. The allocation is therefore
+/// proportional to the block's real on-disk length.
+fn decompress_lz4_block(payload: &[u8]) -> Result<Vec<u8>> {
+    let corrupt = |why: String| StorageError::Backend(format!("sstable block decompress: {why}"));
+    let (prefix, data) = payload
+        .split_first_chunk::<4>()
+        .ok_or_else(|| corrupt("missing size prefix".into()))?;
+    let declared = u32::from_le_bytes(*prefix) as usize;
+    let max = data.len().saturating_mul(LZ4_MAX_EXPANSION);
+    if declared > max {
+        return Err(corrupt(format!(
+            "declared size {declared} exceeds the {max}-byte maximum expansion of {} compressed bytes",
+            data.len()
+        )));
+    }
+    lz4_flex::decompress(data, declared).map_err(|e| corrupt(e.to_string()))
+}
+
 /// Fixed footer size: `index_offset(8) + index_len(8) + magic(8)`.
 const FOOTER_LEN: u64 = 24;
 /// Soft target for a block's (uncompressed) record bytes before starting a new
@@ -1129,6 +1159,60 @@ mod tests {
                 Err(other) => panic!("cut={cut}: wrong error class: {other:?}"),
                 Ok(decoded) => panic!("cut={cut}: truncated bytes decoded as {decoded:?}"),
             }
+        }
+    }
+
+    /// Fuzzer-found (R-01): a CRC-valid LZ4 block whose 4-byte size prefix
+    /// claims ~3.8 GB used to be pre-allocated by `decompress_size_prepended`
+    /// (OOM abort). It must now fail as a named corruption error.
+    #[test]
+    fn lz4_block_with_hostile_size_prefix_is_rejected_without_allocating() {
+        // The libFuzzer crash input minus its `sstable_block\n` header.
+        const BLOCK: &[u8] = &[
+            1, 128, 215, 217, 227, 51, 16, 0, 0, 240, 10, 0, 0, 0, 0, 16, 0, 0, 0, 102, 248, 120,
+            116, 117, 114, 101, 45, 107, 101, 121, 45, 48, 48, 48, 48, 0, 0, 0, 0, 0, 0, 1, 70, 1,
+            25, 0, 0, 2, 0, 95, 64, 0, 0, 0, 65, 1, 0, 60, 64, 15, 0, 0, 216, 0, 81, 0, 32, 49, 2,
+            82, 0, 0, 2, 0, 0, 86, 0, 31, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 66, 1, 49, 0, 44, 4, 86, 0, 32, 50, 3, 82, 0, 93, 3, 15, 2, 1, 45,
+            4, 93, 3, 26, 52, 93, 3, 15, 3, 1, 53, 10, 93, 3, 15, 3, 1, 53, 10, 93, 3, 15, 3, 1,
+            45, 15, 93, 3, 3, 15, 2, 1, 53, 10, 93, 3, 15, 2, 1, 53, 10, 93, 3, 15, 2, 1, 53, 10,
+            93, 3, 15, 2, 1, 53, 10, 93, 3, 15, 2, 1, 39, 96, 67, 67, 67, 67, 67, 67,
+        ];
+        assert_eq!(BLOCK[0], BLOCK_LZ4);
+        assert_eq!(
+            u32::from_le_bytes(BLOCK[1..5].try_into().unwrap()),
+            0xe3d9_d780
+        );
+        match decode_block_v1(BLOCK) {
+            Err(StorageError::Backend(m)) => {
+                assert!(m.contains("sstable block decompress"), "{m}");
+                assert!(m.contains("exceeds"), "{m}");
+            }
+            other => panic!("expected a corruption error, got {other:?}"),
+        }
+    }
+
+    /// The expansion bound rejects only impossible blocks: a single record far
+    /// past `TARGET_BLOCK_BYTES` with a best-case (max-ratio) compressible
+    /// payload still round-trips through the real framing.
+    #[test]
+    fn maximal_legit_lz4_block_round_trips_under_the_bound() {
+        for value in [vec![0u8; 8 << 20], vec![7u8; 1 << 20], vec![0u8; 5000]] {
+            let mut raw = Vec::new();
+            let rec = Record {
+                key: b"k".to_vec(),
+                version: 1,
+                value: Some(value),
+            };
+            encode_record(&rec, &[], &mut raw);
+            let compressed = lz4_flex::compress_prepend_size(&raw);
+            assert!(compressed.len() < raw.len());
+            assert!(raw.len() <= (compressed.len() - 4) * LZ4_MAX_EXPANSION);
+            let mut framed = vec![BLOCK_LZ4];
+            framed.extend_from_slice(&compressed);
+            assert_eq!(decode_block_v1(&framed).unwrap(), vec![rec]);
         }
     }
 
