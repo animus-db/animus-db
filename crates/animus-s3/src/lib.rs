@@ -17,6 +17,7 @@
 //! off) is the one real-socket/TLS `Transport` implementor.
 
 pub mod client;
+pub mod creds;
 pub mod sigv4;
 mod xml;
 
@@ -25,6 +26,9 @@ pub mod fake;
 
 #[cfg(feature = "prod")]
 pub mod prod;
+
+#[cfg(feature = "prod")]
+pub mod creds_prod;
 
 /// The `host[:port]` portion of an `S3Config::endpoint` (`scheme://host` or
 /// `scheme://host:port`, no trailing slash) — used both for the `Host`

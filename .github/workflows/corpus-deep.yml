@@ -505,6 +505,25 @@ jobs:
         run: |
           cargo test -p animus-test --test it export_import_fault_corpus:: -- --nocapture
 
+      # S-08 M3: the S3 store's Env-seamed retry/backoff under scripted
+      # transport faults (5xx / 429 / timeout / lost-ack bursts, multipart
+      # part and Complete failures, expiring and failing credential
+      # providers); every acked put must read back identically and no op
+      # may hang. Each cell is a pure function of its seed, so a failure
+      # names one cell + seed and is replayable (ANIMUS_SEED).
+      - name: deep S3 store fault corpus (S-08 M3)
+        id: s3_fault
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          # Fixed depth, no `workflow_dispatch` input: GitHub caps a
+          # workflow at 25 dispatch inputs and this file is at the cap.
+          # The corpus runs 12 cells x 100 seeds in ~2 s, so there is
+          # nothing to tune per dispatch.
+          ANIMUS_S3_FAULT_SEEDS: '100'
+        run: |
+          cargo test -p animus-test --test it s3_fault_corpus:: -- --nocapture
+
       # ADR 0044 phase 2's per-node heartbeat batcher (C-02 PR 2):
       # frame-vs-logical scaling, every per-group invariant under batching,
       # a genuine partition losing a whole batched frame at once (elections
@@ -694,6 +713,7 @@ jobs:
             [simcluster]="${{ steps.simcluster.outcome }}"
             [dynamo_wire]="${{ steps.dynamo_wire.outcome }}"
             [export_import]="${{ steps.export_import.outcome }}"
+            [s3_fault]="${{ steps.s3_fault.outcome }}"
             [heartbeat]="${{ steps.heartbeat.outcome }}"
             [sharedwal]="${{ steps.sharedwal.outcome }}"
             [wal_rewrite_crash]="${{ steps.wal_rewrite_crash.outcome }}"
@@ -706,7 +726,7 @@ jobs:
           )
           failed=0
           failed_names=()
-          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner reconfigure_drop inplace_split backup pitr lsm_crash lsm_disk_fault lsm_encrypted segment_store_encrypted control simcluster dynamo_wire export_import heartbeat sharedwal wal_rewrite_crash upgrade_restart upgrade_restart_cluster upgrade_mixed upgrade_mixed_cluster learner_snapshot_livelock scale; do
+          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner reconfigure_drop inplace_split backup pitr lsm_crash lsm_disk_fault lsm_encrypted segment_store_encrypted control simcluster dynamo_wire export_import s3_fault heartbeat sharedwal wal_rewrite_crash upgrade_restart upgrade_restart_cluster upgrade_mixed upgrade_mixed_cluster learner_snapshot_livelock scale; do
             outcome="${outcomes[$name]}"
             echo "${name}: ${outcome}"
             if [ "${outcome}" != "success" ]; then
