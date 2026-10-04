@@ -22,13 +22,14 @@
 //! the handshake `ext` is ignored by Phase 1 binaries.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use animus_control::meta::{MetaCommand, Metadata, NodeStatus};
 use animus_control::version::{ClusterFeatures, NodeVersion, VersionRange, own_range};
 use animus_control::version_observe::{OBSERVATION_WINDOW, VersionObservation};
-use animus_env::{Env, NodeId, handshake};
+use animus_env::{Env, EnvExt, NodeId, handshake};
 use animus_node::control_handle::ControlHandle;
 use animus_node::host::RelayClient;
 use serde_json::{Value, json};
@@ -331,6 +332,7 @@ pub(crate) async fn version_wiring_loop<E: Env, R: RelayClient>(ctx: ClientCtx<E
     let mut last_seen = watch.latest();
     let mut flipped = false;
     let mut last_report_attempt: Option<animus_env::Nanos> = None;
+    let report_in_flight = Arc::new(AtomicBool::new(false));
     loop {
         // Skip until this node has some trustworthy view of `Metadata`
         // (otherwise a default `Metadata` would read as cv 1).
@@ -385,27 +387,39 @@ pub(crate) async fn version_wiring_loop<E: Env, R: RelayClient>(ctx: ClientCtx<E
                         .is_none_or(|t| now.duration_since(t) >= SELF_REPORT_RETRY);
                     // Only report once registered (apply rejects unknown
                     // nodes); a node not yet in the required set retries.
-                    if due && meta.required_version_set().contains(&me) {
+                    if due
+                        && meta.required_version_set().contains(&me)
+                        && !report_in_flight.swap(true, Ordering::AcqRel)
+                    {
                         last_report_attempt = Some(now);
                         let cmd = MetaCommand::ReportNodeVersion {
                             node: me.clone(),
                             range,
                             build: profile.build.clone(),
                         };
+                        // Spawned (never awaited inline): the report can
+                        // block up to SCHEMA_COMMIT_TIMEOUT and must not
+                        // stall the feeder's features/halt/era handling.
+                        // `report_in_flight` keeps at most one outstanding.
                         let c = ctx.clone();
                         let me2 = me.clone();
                         let want2 = want.clone();
-                        let _ = ctx
-                            .propose_and_await(cmd, SCHEMA_COMMIT_TIMEOUT, || {
-                                let c = c.clone();
-                                let me = me2.clone();
-                                let want = want2.clone();
-                                async move {
-                                    (c.effective_metadata().node_versions.get(&me) == Some(&want))
+                        let flag = report_in_flight.clone();
+                        ctx.env.spawn_task(async move {
+                            let _ = c
+                                .propose_and_await(cmd, SCHEMA_COMMIT_TIMEOUT, || {
+                                    let c = c.clone();
+                                    let me = me2.clone();
+                                    let want = want2.clone();
+                                    async move {
+                                        (c.effective_metadata().node_versions.get(&me)
+                                            == Some(&want))
                                         .then_some(())
-                                }
-                            })
-                            .await;
+                                    }
+                                })
+                                .await;
+                            flag.store(false, Ordering::Release);
+                        });
                     }
                 }
             }
