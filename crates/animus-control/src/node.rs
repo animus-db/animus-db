@@ -3116,6 +3116,7 @@ async fn detect_loop<E: Env>(
 /// committed (`engine_applied >= commit_index`), so a leader that has just won
 /// does not judge a required set that predates entries it has already
 /// committed.
+#[allow(clippy::too_many_arguments)] // the loop's shared-state bundle, like `drive`
 async fn version_loop<E: Env>(
     env: E,
     core: Arc<Mutex<RaftCore>>,
