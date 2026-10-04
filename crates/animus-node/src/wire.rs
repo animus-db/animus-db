@@ -25,6 +25,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 
+use animus_control::version::{Gate, GatedCommand};
 use animus_control::{MetaCommand, Metadata, NodeStatus};
 use animus_cp_data::hlc::HlcTimestamp;
 use animus_cp_data::{
@@ -1158,21 +1159,28 @@ pub fn is_relayable_command(command: &MetaCommand) -> bool {
         MetaCommand::ExpireStreamShards { .. } => false,
         MetaCommand::ExpirePitrSegments { .. } => false,
         MetaCommand::RemoveMember { .. } => false,
-        // ADR 0073 Phase 2 (P2-A): version commands are era-only and not
-        // relayable for now; whether and how they relay (boot-time
-        // self-report from data-only nodes, admin Finalize) is decided by
-        // P2-B/P2-C per ADR 0073's P2-A implementation note 5.
-        // ADR 0073 Phase 2 (P2-C): `ReportNodeVersion` relays — the
-        // boot-time self-report of a follower-connected combined/control
-        // node and of every data-only node (no local `RaftNode`) must reach
-        // the control leader. Safe: era-only (the emitter checks the
-        // replicated era first), and apply validates the node is registered
-        // and the range is well-formed and contains the cluster version;
-        // the leader's own `era_on_proposals` upkeep proposes the identical
-        // command. `FinalizeClusterVersion` deliberately stays
-        // non-relayable: it is a leader-local admin action (ADR 0037
-        // pattern, `admin_remove_member`'s shape), not a client-path
-        // command.
+        // ADR 0073 Phase 2 (P2-A/B/C): both version commands are era-only
+        // (`MetaCommand::required_gate` is `Gate::Era`): the sender side
+        // refuses them before the era (`animus_node::encode_client_frame_gated`
+        // and `RaftNode::propose`'s gate check), and the relay *receiver* in
+        // `animusd` (`forwarding.rs`) re-checks `required_gate` against its own
+        // `ClusterFeatures` before proposing, because a Phase 1 receiver cannot
+        // decode them at all.
+        //
+        // `ReportNodeVersion` relays: the boot-time self-report of a
+        // follower-connected combined/control node and of every data-only node
+        // (no local `RaftNode`) must reach the control leader. Safe: apply
+        // validates the node is registered and the range is well-formed and
+        // contains the cluster version; the leader's own `era_on_proposals`
+        // upkeep proposes the identical command.
+        //
+        // `FinalizeClusterVersion` deliberately stays NON-relayable (P2-C wins
+        // over P2-B's draft decision): it is a leader-local admin action (ADR
+        // 0037 pattern, `admin_remove_member`'s shape). The admin endpoint
+        // checks the blocker table on the control leader and answers 409
+        // naming the leader on any other node, so no sanctioned path relays
+        // it; leaving it off the allowlist means a peer cannot raise the
+        // cluster version by relaying a Finalize that skips that check.
         MetaCommand::ReportNodeVersion { .. } => true,
         MetaCommand::FinalizeClusterVersion { .. } => false,
         MetaCommand::CompleteBackup { .. } => false,
@@ -1189,6 +1197,85 @@ pub fn is_relayable_command(command: &MetaCommand) -> bool {
 )]
 fn is_zero_u32(v: &u32) -> bool {
     *v == 0
+}
+
+/// ADR 0073 Phase 2 (P2-B): the gate each [`ClientRequest`] needs before it may be
+/// sent to another node. **Exhaustive, no `_` arm**: a new variant does not compile
+/// until it names its gate (an unknown variant tears the receiving connection down,
+/// ADR 0073 section 3). Every variant that exists at cluster version 1 is
+/// [`Gate::Base`]; the two carriers that embed a `MetaCommand` take their payload's
+/// gate (`ProposeSchema`, and `Forwarded` recursively), which is how an era-only
+/// command is refused on the relay path before the era.
+impl ClientRequest {
+    /// See the impl's doc.
+    #[must_use]
+    pub fn required_gate(&self) -> Gate {
+        match self {
+            ClientRequest::ProposeSchema(command) => command.required_gate(),
+            ClientRequest::Forwarded { request, .. } => request.required_gate(),
+            ClientRequest::Status
+            | ClientRequest::Put { .. }
+            | ClientRequest::PutBatch { .. }
+            | ClientRequest::KindWrite { .. }
+            | ClientRequest::KindScan { .. }
+            | ClientRequest::ForceSeal { .. }
+            | ClientRequest::ForcePitrSeal { .. }
+            | ClientRequest::TriggerAutoSplit { .. }
+            | ClientRequest::StreamHotRead { .. }
+            | ClientRequest::StreamHotChangeMax { .. }
+            | ClientRequest::ClearBackfillCursor { .. }
+            | ClientRequest::KindWriteItem { .. }
+            | ClientRequest::KindWriteBatch { .. }
+            | ClientRequest::CpLeaderHintProbe { .. }
+            | ClientRequest::Get { .. }
+            | ClientRequest::GetSnapshot { .. }
+            | ClientRequest::Delete { .. }
+            | ClientRequest::Scan { .. }
+            | ClientRequest::SplitTablet { .. }
+            | ClientRequest::JoinInfo
+            | ClientRequest::WatchMetadata { .. }
+            | ClientRequest::Txn { .. }
+            | ClientRequest::TxnPrepare { .. }
+            | ClientRequest::TxnDecide { .. }
+            | ClientRequest::TxnResolve { .. }
+            | ClientRequest::TxnStatus { .. }
+            | ClientRequest::TxnRecordView { .. }
+            | ClientRequest::TxnVerify { .. } => Gate::Base,
+        }
+    }
+}
+
+/// ADR 0073 Phase 2 (P2-B): the gate each [`ClientResponse`] needs. Exhaustive, no `_`
+/// arm. All `Base` today. `Status`/`JoinInfo`/`MetadataDelta` carry `Metadata` or its
+/// mirror writes, whose *content* is gated by its additive skipped-at-default fields
+/// and by the era-only entity kinds (a Phase 1 reader ignores an unknown kind), not by
+/// this envelope, so they stay `Base`.
+impl ClientResponse {
+    /// See the impl's doc.
+    #[must_use]
+    pub fn required_gate(&self) -> Gate {
+        match self {
+            ClientResponse::Status { .. }
+            | ClientResponse::PutOk
+            | ClientResponse::Value(_)
+            | ClientResponse::KindWriteOk { .. }
+            | ClientResponse::ConditionFailed
+            | ClientResponse::KindWriteBatchOk { .. }
+            | ClientResponse::Unresolved
+            | ClientResponse::CpLeaderHint { .. }
+            | ClientResponse::Pairs(_)
+            | ClientResponse::Error(_)
+            | ClientResponse::JoinInfo { .. }
+            | ClientResponse::MetadataDelta { .. }
+            | ClientResponse::TxnCommitted { .. }
+            | ClientResponse::TxnPrepared { .. }
+            | ClientResponse::TxnDecided { .. }
+            | ClientResponse::TxnStatusReply { .. }
+            | ClientResponse::TxnRecordViewReply { .. }
+            | ClientResponse::TxnVerifyReply { .. }
+            | ClientResponse::TxnResolved { .. } => Gate::Base,
+        }
+    }
 }
 
 /// A node's reply to a [`ClientRequest`].
@@ -1758,6 +1845,7 @@ mod tests {
                 remove: false,
             },
             MetaCommand::RemoveMember { node: nid(1) },
+            // P2-C: leader-local admin action, never relayed (see the match arm).
             MetaCommand::FinalizeClusterVersion {
                 expected: 1,
                 target: 2,
