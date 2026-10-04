@@ -904,7 +904,11 @@ fn run_ladder(c: &Cell) -> Verdict {
     let l = control_leader(&mut cluster);
     let old_id = cluster.handle().env(OLD).node_id();
     let (status, body) = finalize(&mut cluster, l, "{}");
-    if status != 409 || !body.contains(&old_id.to_string()) || !body.contains("excludes target 3") {
+    // Named either way: a leader that is not the old node names it as the
+    // blocker; when the old node itself leads, its own max (2) refuses first.
+    let named = (body.contains(&old_id.to_string()) && body.contains("excludes target 3"))
+        || (l == OLD && body.contains("cannot finalize 3"));
+    if status != 409 || !named {
         w.violations.push(format!(
             "finalize 2 -> 3 not blocked by name: {status} {body}"
         ));
