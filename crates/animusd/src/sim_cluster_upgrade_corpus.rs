@@ -72,7 +72,8 @@
 //!
 //! Fault timing is drawn from `splitmix64(cell seed, tag)`, never the
 //! simulator RNG. Depth: `ANIMUS_UPGRADE_RESTART_SEEDS=K` (shared with tier 1,
-//! ADR 0073; `ANIMUS_UPGRADE_SEEDS` is reserved for Phase 2). Replay:
+//! ADR 0073; `ANIMUS_UPGRADE_SEEDS` is the separate Phase 2 mixed-version knob, see
+//! `sim_cluster_mixed_version_corpus`). Replay:
 //! `ANIMUS_SEED=<seed> ANIMUS_UPGRADE_RESTART_CELL=<cell substring> cargo test
 //! -p animusd --lib sim_cluster_upgrade_corpus -- --nocapture`. Each cell runs
 //! on its own OS thread under a wall-clock watchdog ([`CELL_WATCHDOG`]).
@@ -108,33 +109,33 @@ const ROLES: [NodeRole; 4] = [
     NodeRole::Both,
     NodeRole::Data,
 ];
-const NODES: u64 = 4;
+pub(super) const NODES: u64 = 4;
 const REPLICATION: usize = 3;
-const CLIENTS: u64 = 3;
-const KEYSPACE: u64 = 6;
-const READ_PCT: u64 = 30;
-const PARTITIONS: u64 = 2;
+pub(super) const CLIENTS: u64 = 3;
+pub(super) const KEYSPACE: u64 = 6;
+pub(super) const READ_PCT: u64 = 30;
+pub(super) const PARTITIONS: u64 = 2;
 const ROUNDS_CLEAN: u64 = 10;
 const ROUNDS_CRASH: u64 = 40;
 const ROUNDS_PHASE2: u64 = 6;
-const POLL: Duration = Duration::from_millis(80);
-const SETTLE: Duration = Duration::from_millis(300);
-const DRAIN: Duration = Duration::from_secs(3);
+pub(super) const POLL: Duration = Duration::from_millis(80);
+pub(super) const SETTLE: Duration = Duration::from_millis(300);
+pub(super) const DRAIN: Duration = Duration::from_secs(3);
 /// A slow sync on every disk of a crash cell, so an un-synced tail exists at
 /// the crash instant (set only after bring-up: a `block_on` open under a sync
 /// delay would wait on a timer the simulator never fires).
 const SYNC_DELAY: Duration = Duration::from_millis(15);
-const WORKLOAD_BUDGET: Duration = Duration::from_secs(180);
-const CONVERGENCE_STEP: Duration = Duration::from_secs(1);
-const CONVERGENCE_BUDGET: Duration = Duration::from_secs(90);
+pub(super) const WORKLOAD_BUDGET: Duration = Duration::from_secs(180);
+pub(super) const CONVERGENCE_STEP: Duration = Duration::from_secs(1);
+pub(super) const CONVERGENCE_BUDGET: Duration = Duration::from_secs(90);
 
 /// Real wall-clock bound on one cell: a diagnostic bound on a hang (a livelock
 /// that never advances virtual time can never hit an in-sim budget), never a
 /// timeout that decides a verdict. See `animus-test/CLAUDE.md`.
-const CELL_WATCHDOG: Duration = Duration::from_secs(300);
+pub(super) const CELL_WATCHDOG: Duration = Duration::from_secs(300);
 
-const TBL: &str = "tbl0";
-const AUX: &str = "tbl1";
+pub(super) const TBL: &str = "tbl0";
+pub(super) const AUX: &str = "tbl1";
 const BACKUP_ID: &str = "upgrade-backup-0";
 
 // ---------------------------------------------------------------------------
@@ -420,11 +421,11 @@ fn assert_cell_ok(v: &CellVerdict) {
 // Wire helpers
 // ---------------------------------------------------------------------------
 
-fn pk_sk(key: Key) -> (String, String) {
+pub(super) fn pk_sk(key: Key) -> (String, String) {
     (format!("part-{}", key % PARTITIONS), format!("item-{key}"))
 }
 
-fn decode_items_attr(item: &Value) -> Vec<u64> {
+pub(super) fn decode_items_attr(item: &Value) -> Vec<u64> {
     item.get("items")
         .and_then(|v| v.get("L"))
         .and_then(Value::as_array)
@@ -437,7 +438,7 @@ fn decode_items_attr(item: &Value) -> Vec<u64> {
         .unwrap_or_default()
 }
 
-fn decode_engine_items(bytes: &[u8]) -> Vec<u64> {
+pub(super) fn decode_engine_items(bytes: &[u8]) -> Vec<u64> {
     let Ok(Some(item)) = animus_item::decode_stored_item(bytes) else {
         return Vec::new();
     };
@@ -453,7 +454,7 @@ fn decode_engine_items(bytes: &[u8]) -> Vec<u64> {
     }
 }
 
-fn create_table_body(table: &str, stream: bool) -> String {
+pub(super) fn create_table_body(table: &str, stream: bool) -> String {
     let mut body = json!({
         "TableName": table,
         "KeySchema": [
@@ -472,7 +473,7 @@ fn create_table_body(table: &str, stream: bool) -> String {
     body.to_string()
 }
 
-fn get_body(key: Key) -> String {
+pub(super) fn get_body(key: Key) -> String {
     let (pk, sk) = pk_sk(key);
     json!({
         "ConsistentRead": true,
@@ -483,7 +484,7 @@ fn get_body(key: Key) -> String {
 }
 
 /// A consistent wire read of `key` from `node`: `Some(list)` on a 200.
-fn wire_read(cluster: &mut SimCluster, node: u64, key: Key) -> Option<Vec<u64>> {
+pub(super) fn wire_read(cluster: &mut SimCluster, node: u64, key: Key) -> Option<Vec<u64>> {
     let (status, body) =
         cluster.dynamo_fast(node, "DynamoDB_20120810.GetItem", get_body(key).as_bytes());
     if status != 200 {
@@ -497,19 +498,19 @@ fn wire_read(cluster: &mut SimCluster, node: u64, key: Key) -> Option<Vec<u64>> 
 // The workload
 // ---------------------------------------------------------------------------
 
-struct Shared {
-    rec: Mutex<Recorder>,
-    next_value: Mutex<u64>,
-    done: Mutex<usize>,
+pub(super) struct Shared {
+    pub(super) rec: Mutex<Recorder>,
+    pub(super) next_value: Mutex<u64>,
+    pub(super) done: Mutex<usize>,
 }
 
 impl Shared {
-    fn fresh_value(&self) -> u64 {
+    pub(super) fn fresh_value(&self) -> u64 {
         let mut v = self.next_value.lock().expect("next_value poisoned");
         *v += 1;
         *v
     }
-    fn history(&self) -> History {
+    pub(super) fn history(&self) -> History {
         self.rec
             .lock()
             .expect("recorder poisoned")
@@ -518,7 +519,7 @@ impl Shared {
     }
 }
 
-async fn run_write(
+pub(super) async fn run_write(
     env: &SimEnv,
     handle: &SimClusterHandle,
     shared: &Arc<Shared>,
@@ -556,7 +557,7 @@ async fn run_write(
     }
 }
 
-async fn run_read(
+pub(super) async fn run_read(
     env: &SimEnv,
     handle: &SimClusterHandle,
     shared: &Arc<Shared>,
@@ -585,7 +586,7 @@ async fn run_read(
     rec.ok(proc, env.now().0, read(Some(list)));
 }
 
-async fn client_loop(
+pub(super) async fn client_loop(
     env: SimEnv,
     handle: SimClusterHandle,
     shared: Arc<Shared>,
@@ -610,7 +611,7 @@ async fn client_loop(
 
 /// Spawn the clients of `phase`; returns the node ids of their envs so the
 /// caller can stop them. Phase `p` uses client env indices `p*10 + c`.
-fn spawn_clients(
+pub(super) fn spawn_clients(
     cluster: &SimCluster,
     shared: &Arc<Shared>,
     phase: u64,
@@ -631,7 +632,7 @@ fn spawn_clients(
     ids
 }
 
-fn run_until_clients_done(cluster: &mut SimCluster, shared: &Shared) -> bool {
+pub(super) fn run_until_clients_done(cluster: &mut SimCluster, shared: &Shared) -> bool {
     let mut waited = Duration::ZERO;
     while *shared.done.lock().expect("done poisoned") < CLIENTS as usize {
         if waited >= WORKLOAD_BUDGET {
@@ -643,7 +644,7 @@ fn run_until_clients_done(cluster: &mut SimCluster, shared: &Shared) -> bool {
     true
 }
 
-fn ok_appends(h: &History) -> usize {
+pub(super) fn ok_appends(h: &History) -> usize {
     h.ok_entries()
         .flat_map(|e| &e.mops)
         .filter(|m| matches!(m, Mop::Append { .. }))
@@ -653,7 +654,7 @@ fn ok_appends(h: &History) -> usize {
 /// Every acknowledged append, per key, in acknowledgement order. Under the
 /// single-writer-per-key discipline and a sequential per-client loop, ack
 /// order is commit order.
-fn acked_by_key(h: &History) -> BTreeMap<Key, Vec<u64>> {
+pub(super) fn acked_by_key(h: &History) -> BTreeMap<Key, Vec<u64>> {
     let mut out: BTreeMap<Key, Vec<u64>> = BTreeMap::new();
     for e in h.ok_entries() {
         for m in &e.mops {
@@ -665,12 +666,12 @@ fn acked_by_key(h: &History) -> BTreeMap<Key, Vec<u64>> {
     out
 }
 
-fn is_subsequence(needle: &[u64], hay: &[u64]) -> bool {
+pub(super) fn is_subsequence(needle: &[u64], hay: &[u64]) -> bool {
     let mut it = hay.iter();
     needle.iter().all(|n| it.any(|h| h == n))
 }
 
-fn combine(seed: u64, reports: impl Iterator<Item = CheckReport>) -> CheckReport {
+pub(super) fn combine(seed: u64, reports: impl Iterator<Item = CheckReport>) -> CheckReport {
     let mut violations = Vec::new();
     for r in reports {
         violations.extend(r.violations);
@@ -686,7 +687,7 @@ fn combine(seed: u64, reports: impl Iterator<Item = CheckReport>) -> CheckReport
 // Cluster inspection
 // ---------------------------------------------------------------------------
 
-fn tablet_of(cluster: &SimCluster, node: u64, table: &str) -> Option<TabletId> {
+pub(super) fn tablet_of(cluster: &SimCluster, node: u64, table: &str) -> Option<TabletId> {
     cluster
         .metadata(node)
         .tablets_for_table(table)
@@ -694,13 +695,17 @@ fn tablet_of(cluster: &SimCluster, node: u64, table: &str) -> Option<TabletId> {
         .map(|(id, _)| *id)
 }
 
-fn live_replicas(cluster: &SimCluster, tablet: TabletId) -> Vec<u64> {
+pub(super) fn live_replicas(cluster: &SimCluster, tablet: TabletId) -> Vec<u64> {
     (0..NODES)
         .filter(|&n| cluster.hosted_tablets(n).contains(&tablet))
         .collect()
 }
 
-fn final_state(handle: &SimClusterHandle, tablet: TabletId, node: u64) -> BTreeMap<Key, Vec<u64>> {
+pub(super) fn final_state(
+    handle: &SimClusterHandle,
+    tablet: TabletId,
+    node: u64,
+) -> BTreeMap<Key, Vec<u64>> {
     (0..KEYSPACE)
         .map(|key| {
             let (pk, sk) = pk_sk(key);
@@ -715,7 +720,10 @@ fn final_state(handle: &SimClusterHandle, tablet: TabletId, node: u64) -> BTreeM
 /// Poll `cond` (advancing virtual time) until it holds or `CONVERGENCE_BUDGET`
 /// elapses. Returns whether it held. Eventual properties are never a one-shot
 /// fixed-deadline assert (root `CLAUDE.md`).
-fn converge(cluster: &mut SimCluster, mut cond: impl FnMut(&mut SimCluster) -> bool) -> bool {
+pub(super) fn converge(
+    cluster: &mut SimCluster,
+    mut cond: impl FnMut(&mut SimCluster) -> bool,
+) -> bool {
     let mut waited = Duration::ZERO;
     loop {
         if cond(cluster) {

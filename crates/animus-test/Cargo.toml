@@ -20,7 +20,7 @@ animus-env.workspace = true
 animus-sim.workspace = true
 # `src/upgrade/transcode.rs` (library code of this test-only crate, never a
 # production dependency) calls the `legacy-encoders`-gated `reframe_to_v1`.
-animus-control = { workspace = true, features = ["legacy-encoders"] }
+animus-control = { workspace = true, features = ["legacy-encoders", "sim-versions"] }
 # Likewise `reframe_wal_to_v1` (the `lsm-wal` v2 -> v1 transcode).
 animus-storage = { workspace = true, features = ["legacy-encoders"] }
 futures.workspace = true
@@ -32,7 +32,7 @@ serde_json.workspace = true
 # `legacy::vN::encode` functions the transcode table calls. Enabled here, on
 # dev-dependency entries only, so no production build ever compiles them.
 animus-env = { workspace = true, features = ["legacy-encoders"] }
-animus-control = { workspace = true, features = ["legacy-encoders"] }
+animus-control = { workspace = true, features = ["legacy-encoders", "sim-versions"] }
 animus-cp-data = { workspace = true, features = ["legacy-encoders"] }
 animus-dynamo.workspace = true
 animus-item.workspace = true

@@ -88,6 +88,32 @@ per-tablet CP data plane (`animus-cp-data`).
   Tests: `tests/it/version_era_on.rs` (mutation-checked: removing the flag flip
   or the halt fails them).
 
+- **`sim_versions.rs` + `tests/it/version_mixed_corpus.rs`** (ADR 0073 Phase 2,
+  P2-D). Test-only (`cfg(any(test, feature = "sim-versions"))`; `animus-test`
+  enables the feature for every dev-dependent crate), inert unless a profile is
+  installed. `BinaryProfile {Phase1, B2, Release(N)}` derives own range, build,
+  handshake `ext` and `accepts(Gate)`; `RaftNode::set_binary_profile(p) -> CapLog`
+  applies own range + build + a **capped decode** atomically: the control recv
+  arm (`node.rs`, one match guard before `Ok(msg)`) takes the SAME branch as an
+  undecodable message (warn, drop, nothing reaches the core) when
+  `provisional_required_gate(msg)` is a gate the profile does not know, and
+  records a `CapRejection`. `provisional_required_gate` is a single-call-site
+  stub (an `AppendEntries` carrying `ReportNodeVersion`/`FinalizeClusterVersion`
+  => `Gate::Era`) that **P2-B's exhaustive `required_gate` tables replace**. The
+  cap state lives in `OwnVersion::sim_cap` (cfg-gated field, `None` by default).
+  Pure-tier corpus: the `version_world` harness has a *faithful* mode
+  (`World::new_faithful`, `profiles`, `cap_logs`, `downgrade_to_phase1`) that P2-A's
+  cells never use; cells and the oracle (era safety, delivery = empty cap log,
+  Phase 1 state, wedge) are documented in the module doc. N1 acts as the buggy
+  proposer from the test body (never a production switch): while a Phase 1 voter
+  exists it proposes `ReportNodeVersion` directly, bypassing P. Two facts worth
+  knowing: the era-on dial-side handshake refusal (`network_protocol_refused`
+  refuses *sending to* an empty-ext peer once the sender's flag is set) also
+  protects a Phase 1 node, so N1 requires the cap to have fired on at least one
+  seed; and the pure N1 additionally asserts the Phase 1 replica's
+  `last_log_index` did not move, which is what makes a "cap logs but delivers"
+  mutation fail.
+
 - **`lib.rs`** — the public surface: re-exports the core types (`SharedWal`,
   `RaftCore`, `RaftNode`, `Metadata`/`MetaCommand`, the schema types,
   `FailureDetector`) plus `animus_placement::PlacementPolicy` (so a downstream
