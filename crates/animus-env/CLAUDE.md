@@ -1200,6 +1200,17 @@ itself sees 2 separate connections) rather than caching anything after
 the first failure. All three read `Metric::NetworkHandshakeRefused`
 straight off the real `ProdEnv`'s own `Env::metrics()` handle.
 
+## Gotcha: `read_frames` length caps (security)
+
+`read_frames` (internal `Network` wire) reads peer-declared `u32` lengths
+and must reject them *before* allocating: sender id `MAX_FROM_LEN` (1 KiB),
+payload `MAX_FRAME_PAYLOAD_LEN` (64 MiB, equal to `animus_node::MAX_FRAME_LEN`,
+duplicated because `animus-node` depends on this crate). Over-cap closes the
+connection with an `InvalidData` error and a `warn` log (no metric). `read_frames`
+is generic over `AsyncRead` so tests drive it over a `tokio::io::duplex`
+(`read_frames_rejects_oversized_*`). The wire format is unchanged. See
+`docs/lessons/code-patterns/2026-10-04-a-peer-supplied-length-prefix-needs-a-cap-before-the-allocation.md`.
+
 ## Gotcha: `/etc/hosts` is process-global in tests (#1107)
 
 `HostsEntryGuard` (prod.rs tests) rewrites `/etc/hosts` non-atomically. Any
