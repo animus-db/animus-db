@@ -7,14 +7,25 @@ name: CI
 # `main` pushes keep their run: that is what the README's CI badge reports,
 # and it is the only signal for a commit that reaches `main` without a PR.
 # A branch pushed with no PR open now gets no CI until the PR exists.
+#
+# `merge_group` runs the same jobs on the merge queue's candidate commit (the
+# PR merged onto current `main`, plus any PRs queued ahead of it). With the
+# queue enabled, a PR no longer needs `main` merged in before it lands: the
+# queue proves the combined commit green once, right before the merge, so
+# every merge to `main` stops restarting CI on every open PR. The required
+# checks (`gates`, `prod-liveness`) must report on this event too, or the
+# queue waits on them forever.
 on:
   push:
     branches: [main]
   pull_request:
+  merge_group:
 
 # At most one in-flight CI run per branch. A `pull_request` event's
 # `github.ref` is that PR's own `refs/pull/N/merge`, so this keys per-PR
-# without needing the PR number.
+# without needing the PR number. A `merge_group` run's ref is its own
+# `refs/heads/gh-readonly-queue/main/pr-N-<sha>`, unique per queue entry, and
+# is never cancelled (the queue itself discards entries it no longer needs).
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   # Superseded PR runs are cancelled — only the newest head is worth a
