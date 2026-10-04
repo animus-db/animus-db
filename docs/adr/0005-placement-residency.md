@@ -213,3 +213,11 @@ untouched by rebalance. See `node::REPAIR_DWELL`'s own doc for the dwell
 value and trade-off, `crates/animus-control/CLAUDE.md`'s matching entry, and
 `docs/lessons/code-patterns/` for the general "protect an existing replica
 without offering it for fresh placement" pattern this established.
+
+## Amendment (2026-10-04) — region labels become load-bearing (ADR 0074)
+
+[ADR 0074](0074-global-tables.md) (global tables, Proposed) uses the
+`topology.kubernetes.io/region` label as the definition of a "region" for
+multi-region strongly consistent tables: one replica per region via
+`required_labels`/`SpreadPolicy` over the region key, plus a preferred-leader
+region in the placement policy. Labels are populated by roadmap G-01 stage G-a.
