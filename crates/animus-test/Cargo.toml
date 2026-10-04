@@ -23,6 +23,9 @@ animus-sim.workspace = true
 animus-control = { workspace = true, features = ["legacy-encoders", "sim-versions"] }
 # Likewise `reframe_wal_to_v1` (the `lsm-wal` v2 -> v1 transcode).
 animus-storage = { workspace = true, features = ["legacy-encoders"] }
+# Likewise `downgrade_txn_envelope_to_v1` (the `txn-envelope` v2 -> v1 engine-row
+# transcode, `ROW_TABLE`).
+animus-cp-data = { workspace = true, features = ["legacy-encoders"] }
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -33,7 +36,6 @@ serde_json.workspace = true
 # dev-dependency entries only, so no production build ever compiles them.
 animus-env = { workspace = true, features = ["legacy-encoders"] }
 animus-control = { workspace = true, features = ["legacy-encoders", "sim-versions"] }
-animus-cp-data = { workspace = true, features = ["legacy-encoders"] }
 animus-dynamo.workspace = true
 animus-item.workspace = true
 animus-tablet.workspace = true

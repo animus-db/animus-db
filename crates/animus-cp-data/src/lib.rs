@@ -84,6 +84,15 @@ mod txn;
 use heartbeat_batch::{HeartbeatBatcher, HeartbeatPending};
 use hlc::{Hlc, HlcTimestamp, bump_strictly_above};
 use ts_cache::TsCache;
+/// The upgrade-restart harness's `txn-envelope` row-value transcode (ADR 0073
+/// P1-D, `animus-test`'s `upgrade::transcode`): the v1 down-conversion of one
+/// stored engine row value — `Some(v1 bytes)` iff `value` is exactly one
+/// well-formed v2 intent envelope, `None` (leave the row alone) otherwise.
+#[cfg(any(test, feature = "legacy-encoders"))]
+#[must_use]
+pub fn downgrade_txn_envelope_to_v1(value: &[u8]) -> Option<Vec<u8>> {
+    txn::legacy::v1::downgrade_intent_to_v1(value)
+}
 pub use txn::{
     PendingTxnWrite, ResolveOutcome, StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome, TxnWrite,
 };

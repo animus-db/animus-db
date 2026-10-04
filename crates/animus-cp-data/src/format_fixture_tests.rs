@@ -629,7 +629,7 @@ fn txn_envelope_decodes_every_checked_in_fixture_structurally() {
 fn txn_envelope_encoders_match_the_fixture_bytes() {
     for (version, bytes) in fixture_files(&formats_dir("txn-envelope")) {
         let want = match version {
-            // Checklist step 7: the test-only legacy encoder reproduces v1.
+            // Checklist step 7: the `legacy-encoders` v1 encoder reproduces v1.
             1 => v1_txn_envelope_bytes(),
             // Checklist step 5: the current writer reproduces v2.
             2 => v2_txn_envelope_bytes(),
@@ -652,4 +652,36 @@ fn generate_fixture_txn_envelope() {
         write_new_fixture(&dir, 1, &v1_txn_envelope_bytes());
     }
     write_new_fixture(&dir, 2, &v2_txn_envelope_bytes());
+}
+
+/// The harness's engine-row transcode (`animus-test`'s `ROW_TABLE`): a v2 intent
+/// down-converts to exactly the v1 bytes the `legacy-encoders` v1 encoder
+/// writes for the same fields (which `txn_envelope_encoders_match_the_fixture_bytes`
+/// anchors to `v1.bin`), and anything that is not exactly one v2 intent is left
+/// alone.
+#[test]
+fn txn_envelope_v2_intents_downgrade_to_the_v1_fixture_bytes() {
+    use crate::downgrade_txn_envelope_to_v1 as down;
+    let v1 = unpack_frames(&std::fs::read(formats_dir("txn-envelope").join("v1.bin")).unwrap());
+    let v2 = unpack_frames(&std::fs::read(formats_dir("txn-envelope").join("v2.bin")).unwrap());
+    // Frames 0/1 are committed values: untouched. Frames 2/3 of v2 are the
+    // v1 fixture's frames 2/3 plus a prior.
+    assert_eq!(down(&v2[0]), None);
+    assert_eq!(down(&v2[1]), None);
+    assert_eq!(down(&v2[2]).as_deref(), Some(v1[2].as_slice()));
+    assert_eq!(down(&v2[3]).as_deref(), Some(v1[3].as_slice()));
+    // Frame 4 (staged `x`, prior empty) has no v1 fixture twin: it must equal
+    // the v1 encoder over the same fields.
+    let (id, rk) = (txn_fixture_id(), txn_fixture_record_key());
+    let want = crate::txn::legacy::v1::encode_intent(&id, &rk, "orders", Some(b"x"), &[], None);
+    assert_eq!(down(&v2[4]), Some(want));
+    // Not a v2 intent: left alone (`None`), never rewritten or panicked on.
+    for not_v2 in [&v1[2][..], &[2u8][..], &[2u8, 1, 2, 3][..], &[][..]] {
+        assert_eq!(down(not_v2), None, "{not_v2:02x?}");
+    }
+    // A v2 intent with a byte appended or removed is not exactly one intent.
+    let mut longer = v2[2].clone();
+    longer.push(0);
+    assert_eq!(down(&longer), None);
+    assert_eq!(down(&v2[2][..v2[2].len() - 1]), None);
 }

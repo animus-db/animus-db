@@ -4123,6 +4123,20 @@ in the inventory; tag `1` is its v1). v1 stays readable forever via
 txn-envelope/v1.bin` + `v2.bin`. Intent size grows by the prior value; the Raft
 log command is unchanged (the prior is computed at apply).
 
+**Upgrade harness (ADR 0073 P1-D).** A stored intent is an engine row value, so the
+harness needed a transcode that reaches *inside* engine files, not only whole-file
+formats: `animus-test`'s `upgrade::transcode::ROW_TABLE` carries `txn-envelope`'s
+real v2 -> v1 down-conversion (the v1 encoder is behind the `legacy-encoders`
+feature like every other legacy encoder), applied by
+`animus_storage::rewrite_row_values` to every WAL segment and SSTable of a stopped
+node (`TranscodeOpts::row_back`, per-file mixed-version fraction included).
+`upgrade_restart_txn_envelope.rs` (tier 1b) stages a transaction, leaves it
+unresolved across the stop, down-converts the stored intents, restarts and resolves
+over v1 intents, asserting the rewrite really happened (non-zero rewritten count,
+raw envelope tag `2` -> `1`). It also pins the residual gap above as a control: the
+same abort under a compaction burst keeps the value for a v2 intent and loses it for
+a v1 intent.
+
 **Not changed here, filed separately:** the 1 ms default GC grace also breaks
 every *other* historical read below the floor — `read_at`/`scan_at`
 (`TransactGetItems`' snapshot reads) and the on-demand backup capture's

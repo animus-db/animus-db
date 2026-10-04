@@ -958,13 +958,13 @@ pub(crate) mod legacy {
             decode_intent_v1_body(c)
         }
 
-        /// Test-only v1 encoder (ADR 0073 checklist step 7), anchored to
+        /// Legacy v1 encoder (ADR 0073 checklist step 7), anchored to
         /// `tests/fixtures/formats/txn-envelope/v1.bin` by a byte-equality
-        /// test. `cfg(test)` rather than the `legacy-encoders` feature: an
-        /// intent is an engine-resident row value and no upgrade-harness
-        /// carrier transcode re-encodes row values yet, so nothing outside
-        /// this crate's own tests calls it (see `animus-test`'s `EMBEDDED`).
-        #[cfg(test)]
+        /// test. Behind `legacy-encoders` (not `cfg(test)`) because the
+        /// upgrade-restart harness's row-value transcode
+        /// ([`downgrade_intent_to_v1`]) re-encodes every stored v2 intent
+        /// through it when it restarts a node on "older-version" state.
+        #[cfg(any(test, feature = "legacy-encoders"))]
         #[must_use]
         pub(crate) fn encode_intent(
             txn_id: &super::super::TxnId,
@@ -985,6 +985,46 @@ pub(crate) mod legacy {
                 change_log,
             );
             out
+        }
+
+        /// The harness's `txn-envelope` v2 -> v1 row-value transcode: `Some(v1
+        /// bytes)` iff `value` is, byte for byte, exactly one well-formed v2
+        /// intent envelope (tag `2`, every field, the trailing `prior`, and
+        /// nothing after it); `None` for anything else — a committed value, a
+        /// v1 intent, a transaction record or any non-envelope row value —
+        /// which the transcode must leave untouched. Strict by construction:
+        /// an engine's rows carry no type marker beyond the envelope tag, so
+        /// the *whole* shape has to parse before a row is rewritten. Drops
+        /// the `prior`, the one field v1 cannot express.
+        #[cfg(any(test, feature = "legacy-encoders"))]
+        #[must_use]
+        pub(crate) fn downgrade_intent_to_v1(value: &[u8]) -> Option<Vec<u8>> {
+            use super::super::{Cursor, TAG_INTENT};
+            if value.first() != Some(&TAG_INTENT) {
+                return None;
+            }
+            let mut c = Cursor {
+                bytes: &value[1..],
+                pos: 0,
+            };
+            let txn_id = c.txn_id()?;
+            let record_key = c.bytes()?;
+            let record_table = String::from_utf8(c.bytes()?).ok()?;
+            let staged_value = c.opt_bytes()?;
+            let kind_writes = c.kind_writes()?;
+            let change_log = c.change_log()?;
+            let _prior = c.opt_bytes()?;
+            if c.pos != c.bytes.len() {
+                return None;
+            }
+            Some(encode_intent(
+                &txn_id,
+                &record_key,
+                &record_table,
+                staged_value.as_deref(),
+                &kind_writes,
+                change_log.as_ref(),
+            ))
         }
     }
 }

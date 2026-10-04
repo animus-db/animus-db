@@ -2894,9 +2894,14 @@ wire/image codec is `pub(crate)`; new formats add a section in whichever fits.
 - **`txn-envelope` v2** (`txn.rs`, ADR 0018's 2026-10-04 amendment): the
   per-value tag byte is the version (`0` committed, `1` v1 intent, `2` v2
   intent = v1 body + trailing `prior`). `decode_envelope` dispatches on it;
-  `txn::legacy::v1` holds the frozen v1 decoder and a `cfg(test)` encoder
-  (no harness transcode re-encodes engine row values, so the
-  `legacy-encoders` feature would only produce dead code). Fixtures
+  `txn::legacy::v1` holds the frozen v1 decoder and the v1 encoder behind
+  `legacy-encoders` (like every legacy encoder), plus `downgrade_intent_to_v1`
+  (re-exported as `downgrade_txn_envelope_to_v1`): the strict whole-value v2 -> v1
+  down-conversion the upgrade harness's engine-row transcode
+  (`animus-test`'s `ROW_TABLE`) applies to every stored row. It parses the *entire*
+  v2 shape (tag, every field, the trailing `prior`, nothing after) before touching a
+  value, because an engine holds many unrelated value kinds and a row carries no
+  type marker beyond the tag. Fixtures
   `txn-envelope/v1.bin` + `v2.bin` (`u32`-BE-length-prefixed envelope
   values), tests in `src/format_fixture_tests.rs`. The shared v1 body codec
   (`put_intent_v1_body`/`decode_intent_v1_body`) is frozen: a future version
