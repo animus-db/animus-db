@@ -726,10 +726,10 @@ the production implementation; the deterministic implementation lives in
   contain is already a literal-safe S3 key byte, and `animus_s3::client::
   S3Client` percent-encodes the wire/signing forms independently and
   exactly once already (see that crate's own "Encode exactly once" doc).
-  **Write-once**, matching `FsSegmentStore::put`'s own shape exactly: a
-  `GET`-then-compare-then-`PUT` (real S3 has no built-in "put only if
-  absent" this client sends) — an identical-content re-put is a safe no-op
-  skipping the network `PUT`; a differing-content re-put is a hard `Err`
+  **Write-once**, matching `FsSegmentStore::put`'s own shape: a `HEAD`,
+  bounded ranged-`GET` compare, then `PUT` (real S3 has no built-in "put
+  only if absent" this client sends; see the HEAD+ranged note below) — an
+  identical-content re-put is a safe no-op skipping the network `PUT`; a differing-content re-put is a hard `Err`
   leaving the stored bytes untouched. **Retry (S-08 M3)**: one `retry_op` helper wraps every request.
   `RetryPolicy` (`with_retry_policy`; default 5 retries, base 100 ms, cap
   5 s): the sleep before retry `n` is drawn uniformly from `[0, min(cap,
@@ -1118,7 +1118,8 @@ client/dynamo/admin/console ports — see that crate's `CLAUDE.md`.
 
 **S-08 M3**: the seed-driven retry/backoff/credential-refresh tests live in
 `animus-test`'s `s3_fault_corpus` (over `SimEnv`); `s3_store::tests` use a
-no-op-sleep `TestEnv` and need `prod` only for `#[tokio::test]`.
+no-op-sleep `TestEnv` and need `prod` only for `#[tokio::test]`. CI's
+`s3-real-endpoint` job runs the `prod`-gated tests against RustFS.
 
 **S-04 PR 2** adds `s3_store::tests` (also `prod`-feature-gated, also part
 of the same `cargo test -p animus-env --all-features` run): the load-bearing
@@ -1139,8 +1140,9 @@ for the full-listing bug `verify_or_init_segment_store_marker` used to hit.
 mirroring `animus-s3`'s own `tests/minio_real_endpoint.rs` down to the exact
 `ANIMUS_S3_TEST_ENDPOINT`/`_BUCKET`/`_ACCESS_KEY_ID`/`_SECRET_ACCESS_KEY`
 environment variables — unset, it prints a skip line and does nothing (never
-`#[ignore]`d), so this crate's own gates stay green with no MinIO/localstack
-infrastructure.
+`#[ignore]`d), so this crate's own gates stay green with no S3 infrastructure;
+`ANIMUS_S3_REQUIRE_ENDPOINT=1` (set by CI's `s3-real-endpoint` job, RustFS)
+turns that skip into a failure. The `*_minio*` file names are historical.
 
 **S-03 PR 2** adds `EncryptedSegmentStore` coverage in three places, all
 part of the same `cargo test -p animus-env --all-features` run:

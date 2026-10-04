@@ -324,7 +324,9 @@ first label of the `Host` header when it equals its bucket.
   - `ANIMUS_S3_TEST_ENDPOINT` — e.g. `http://127.0.0.1:9000`. **Unset ⇒ the
     test prints a skip line and returns immediately** (never `#[ignore]`d —
     `cargo test -p animus-s3 --all-features` always runs it, it just does
-    nothing without this variable).
+    nothing without this variable) — unless `ANIMUS_S3_REQUIRE_ENDPOINT=1`,
+    which makes the skip a panic (CI's `s3-real-endpoint` job sets it, so the
+    test can never pass vacuously there).
   - `ANIMUS_S3_TEST_BUCKET` — bucket name (must already exist).
   - `ANIMUS_S3_TEST_ACCESS_KEY_ID` / `ANIMUS_S3_TEST_SECRET_ACCESS_KEY` —
     credentials for that endpoint. **Never printed, never included in a
@@ -334,11 +336,14 @@ first label of the `Host` header when it equals its bucket.
     new_allow_insecure_http()` when `ANIMUS_S3_TEST_ENDPOINT` starts with
     `http://` (a real MinIO dev instance is commonly plaintext); anything
     else requires TLS.
-  - To actually run it: start a local MinIO (`docker run -p 9000:9000
-    minio/minio server /data`), create a bucket, then `ANIMUS_S3_TEST_ENDPOINT=
+  - To actually run it: start a local S3-compatible store (CI uses RustFS:
+    `docker run -p 9000:9000 -e RUSTFS_VOLUMES=/data -e RUSTFS_ADDRESS=0.0.0.0:9000
+    -e RUSTFS_ACCESS_KEY=... -e RUSTFS_SECRET_KEY=... rustfs/rustfs:1.0.0-rc.6`,
+    data dir writable by uid 10001; the `minio/minio` image no longer
+    resolves, #863), create a bucket, then `ANIMUS_S3_TEST_ENDPOINT=
     http://127.0.0.1:9000 ANIMUS_S3_TEST_BUCKET=test-bucket
-    ANIMUS_S3_TEST_ACCESS_KEY_ID=minioadmin
-    ANIMUS_S3_TEST_SECRET_ACCESS_KEY=minioadmin cargo test -p animus-s3
+    ANIMUS_S3_TEST_ACCESS_KEY_ID=<access key>
+    ANIMUS_S3_TEST_SECRET_ACCESS_KEY=<secret> cargo test -p animus-s3
     --features prod --test minio_real_endpoint -- --nocapture`.
 
 ## What's non-obvious

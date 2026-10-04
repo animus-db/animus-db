@@ -473,8 +473,9 @@ truth; this map is just for navigation.
   The backup/restore/PITR feature train is complete. S3 export/import
   (ADR 0068) and the S3 `SegmentStore` backend (`animus-s3`,
   `--backup-store s3://...`, ADR 0059's S-04 amendment) have both landed;
-  what remains of the S3 side (non-static credentials, multipart) is
-  `docs/roadmap.md` S-08.
+  the S3 side's credential sources (static/env/web-identity/container/IMDS),
+  multipart upload, `Env`-seamed retry and real-endpoint CI landed as S-08
+  (ADR 0059's 2026-10-04 amendment; residuals in `docs/roadmap.md`).
 - **Observability & operations** — metrics seam (`animus-env`, ADR 0015,
   additive/no-op under sim); OTLP tracing (`animusd::otel`, ADR 0027, opt-in);
   the admin/debug HTTP-JSON interface (`animusd::admin`, ADR 0020, pure
