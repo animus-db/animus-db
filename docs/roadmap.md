@@ -1934,9 +1934,15 @@ outstanding on the wire surface at present.
 - **Tests:** each sub-track is its own test artifact (oracle-checked soak
   histories, chaos e2e legs, fuzz targets, the metrics-exist check, an
   overload test that asserts bounded queueing, a disk-full test).
-- **ADR:** new ADR (next free number, **0074** at time of writing;
-  coordinate with B-01/C-17/G-01 which may also claim one) fixing the
-  beta criteria, overload semantics (d) and the release policy (g).
+- **ADR:** [ADR 0074](adr/0074-production-readiness-exit-criteria.md)
+  fixes the beta criteria, overload semantics (d) and the release policy
+  (g). **Landed 2026-10-04**, together with the checklist
+  [`docs/production-readiness.md`](production-readiness.md) (first R-01
+  PR; docs only). Verified then: the "absent" claims in **Gap** hold
+  (the DynamoDB accept loop in `crates/animusd/src/dynamo.rs` is also
+  uncapped, and `ThrottlingException` is not emitted anywhere);
+  `ServiceUnavailable` (503) already exists on the wire. Sub-tracks a-g
+  remain open; each flips its rows in that doc.
 - **PRs:** XL overall and genuinely too large for one reviewable PR, so
   **one workstream PR per independent sub-track, each separately
   mergeable and each in its own session** (the sub-tracks share no code):
