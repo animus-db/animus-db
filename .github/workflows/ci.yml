@@ -610,6 +610,11 @@ jobs:
           cargo test -p animus-storage --features prod-heavy --locked \
             --test lsm_concurrent --test idle_engine_cost \
             -- --test-threads=1
+          # B-01's smoke: a real 3-node in-process ProdEnv cluster driven
+          # over the SigV4 DynamoDB wire (~45 s). Real threads + a whole
+          # cluster => same contention rules as the binaries above.
+          cargo test -p animus-bench --features prod-heavy --locked \
+            --test smoke -- --test-threads=1
 
       - name: sccache stats
         if: always()

@@ -19,6 +19,18 @@ path = "src/lib.rs"
 name = "animus-bench"
 path = "src/main.rs"
 
+# Real-thread `ProdEnv` cluster tests are opt-in behind `prod-heavy` and run in
+# CI's `prod-liveness-scattered` job (`--test-threads=1`), never in the
+# per-push `gates` tier — the same convention as animus-control /
+# animus-cp-data / animus-storage (see `.github/workflows/ci.yml`).
+[features]
+prod-heavy = []
+
+[[test]]
+name = "smoke"
+path = "tests/smoke.rs"
+required-features = ["prod-heavy"]
+
 [dependencies]
 # SigV4 client-side signing (`animus_dynamo::sigv4::sign`, already `pub`,
 # ADR 0057) — reused rather than pulling in the AWS SDK.
