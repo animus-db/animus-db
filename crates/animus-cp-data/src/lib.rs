@@ -11642,6 +11642,11 @@ fn witness_append_entries(hlc: &Hlc, msg: &RaftMsg<KvCommand>, now: Nanos) {
 /// degrades to today's (pre-fix) latency at worst, never a stall. Under load
 /// `apply_and_compact` keeps returning `true`, so the task never sleeps and apply
 /// stays close behind commit — this only bounds latency (and CPU) while idle.
+///
+/// **Not armed while the group is quiesced** (issue #1180, ADR 0048): a quiesced
+/// group's apply task parks on [`ApplySignal`] alone, and the consensus loop
+/// raises the signal on every quiesced/awake transition, so the poll is re-armed
+/// the moment the group wakes.
 const APPLY_SAFETY_POLL: Duration = Duration::from_millis(250);
 
 /// The per-node **consensus loop**: recover from the WAL, spawn the apply task, then
@@ -12059,6 +12064,9 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         }
     }
 
+    // The quiesced flag as this loop last observed it (issue #1180) -- see the
+    // `apply_signal.notify()` on transitions below.
+    let mut quiesced_seen = false;
     loop {
         // A requested shutdown exits *between* persist rounds so the WAL is never
         // left mid-write; `stopped` (paired with the apply task's `apply_stopped`)
@@ -12483,6 +12491,19 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             (true, false) => metrics.incr(Metric::CpUnquiesces),
             _ => {}
         }
+        // Issue #1180: the apply task parks WITHOUT its safety-poll timer
+        // while quiesced, so every quiesced <-> awake transition must raise
+        // `apply_signal` (awake: re-arm the poll for signal-less work such as
+        // `take_snapshot_needed`; quiesced: let a still-armed poll drop).
+        // `quiesced_seen` is this loop's own last-observed state, compared
+        // against both samples of this iteration, so an un-quiesce performed
+        // OUTSIDE this loop (a local propose, `wake()`, `read_barrier`) is
+        // still caught at the top of the next iteration -- every such trigger
+        // also wakes this loop, so one always follows.
+        if quiesced_seen != was_quiesced || was_quiesced != is_quiesced_now {
+            apply_signal.notify();
+        }
+        quiesced_seen = is_quiesced_now;
         // Wake-on-commit (ADR 0044 phase-1 PR1): a commit-index advance covers both
         // a follower's in-line apply on `AppendEntries` (gated on `commit_index`
         // alone, so it can create apply work with no separate `mark_durable_through`
@@ -12682,13 +12703,41 @@ async fn apply_loop<E: Env, S: StorageEngine>(
         )
         .await;
         if !did_work {
-            select(
+            // Issue #1180 / ADR 0048: a quiesced group parks on `ApplySignal`
+            // ALONE -- no safety-poll timer -- so it posts zero timeline events
+            // while idle. Sound because (a) a quiesced group cannot reach any
+            // signal-less transition without first un-quiescing (the entry
+            // predicate requires `!snapshot_needed`, no pending/incoming
+            // snapshot, every peer fully matched, engine caught up; and
+            // `take_snapshot_needed` is only ever set by a leader's
+            // replicate cycle, which a quiesced leader does not run), and
+            // (b) the consensus loop raises `apply_signal` on every
+            // quiesced <-> awake transition it observes (see its
+            // `quiesced_seen` bookkeeping), so un-quiescing re-arms the poll.
+            //
+            // Lost-wakeup safety: the flag is read under the core lock AFTER
+            // `apply_and_compact` returned. If the group is awake here we use
+            // the poll as before. If it is quiesced here and un-quiesces
+            // afterwards, the consensus loop (which always runs after any
+            // un-quiesce trigger) sets `ApplySignal.pending` *after* the
+            // flag flipped; `ApplyPending::poll` registers its waker and
+            // then swaps the flag, so the notify is observed whether it
+            // lands before or after we park.
+            let quiesced = core.lock().expect("raftkv core poisoned").is_quiesced();
+            if quiesced {
                 ApplyPending {
                     signal: &apply_signal,
-                },
-                env.sleep(APPLY_SAFETY_POLL),
-            )
-            .await;
+                }
+                .await;
+            } else {
+                select(
+                    ApplyPending {
+                        signal: &apply_signal,
+                    },
+                    env.sleep(APPLY_SAFETY_POLL),
+                )
+                .await;
+            }
         }
     }
 }

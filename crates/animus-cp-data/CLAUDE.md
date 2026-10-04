@@ -2258,7 +2258,22 @@ disambiguation is needed.
     on-demand snapshot-image build `RaftCore::take_snapshot_needed` sets,
     purely off the leader's own heartbeat/replicate cycle with no commit
     advance) still converges off the safety poll alone — see
-    `tests/apply_signal.rs`.
+    `tests/apply_signal.rs`. **The safety poll is not armed while the group
+    is quiesced (issue #1180):** `apply_loop` checks `is_quiesced()` under
+    the core lock after each idle pass and, if quiesced, parks on
+    `ApplyPending` alone, so a quiesced group has an empty `SimEnv` timeline
+    (`tests/it/quiesced_apply_no_poll.rs`). The consensus loop keeps a
+    loop-local `quiesced_seen` and raises `apply_signal` on every
+    quiesced/awake transition it observes (comparing the previous
+    iteration's state, this iteration's top sample, and its post-step
+    sample, so an un-quiesce done outside the loop — local propose, `wake()`,
+    `read_barrier` — is still caught, since each also wakes the loop). That
+    notify is what re-arms the poll for signal-less work
+    (`take_snapshot_needed` can only be set by a leader's replicate cycle,
+    and `quiesce_entry_ok` requires `!snapshot_needed` / no snapshot
+    machinery, so a quiesced group cannot reach it without first
+    un-quiescing). A new apply-task wake source that can fire while
+    quiesced must raise `apply_signal` itself.
   - **`Freeze` and `SplitTablet`'s own whole-range seal-marker writes are
     halted-gated too (issue #939)** — the same class of bare `.expect(..)`
     hard panic `flush_pending`/the WAL-compaction `replace` path above were
