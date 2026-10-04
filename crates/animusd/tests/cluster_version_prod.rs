@@ -93,8 +93,8 @@ async fn the_era_starts_over_real_sockets_and_the_admin_surface_works() {
         .expect("the version era never became active on every node");
 
         // GET /admin/cluster-version converges on every node: era on, version
-        // 1, every member reported, nothing blocking, but Finalize is out of
-        // reach for this binary (its own max is the current MAX_SUPPORTED).
+        // 1, every member reported, and Finalize is out of reach (every
+        // binary's max is the current MAX_SUPPORTED).
         for node in &nodes {
             let addr = node.admin_addr();
             timeout(Duration::from_secs(30), async {
@@ -107,7 +107,19 @@ async fn the_era_starts_over_real_sockets_and_the_admin_surface_works() {
                             n.len() == 3 && n.iter().all(|x| x["reported"] == true)
                         })
                     {
-                        assert_eq!(v["blockers"].as_array().unwrap().len(), 0, "{v}");
+                        // Every member's range is [1,1] (the real MAX_SUPPORTED),
+                        // so each one is a named blocker for target 2 and the
+                        // safe target is the active version itself.
+                        assert_eq!(v["can_finalize"], false, "{v}");
+                        assert_eq!(v["safe_target"], 1, "{v}");
+                        let blockers = v["blockers"].as_array().unwrap();
+                        assert_eq!(blockers.len(), 3, "{v}");
+                        assert!(
+                            blockers
+                                .iter()
+                                .all(|b| b["reason"] == "range [1,1] excludes target 2"),
+                            "{v}"
+                        );
                         return;
                     }
                     sleep(Duration::from_millis(100)).await;
