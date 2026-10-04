@@ -2411,6 +2411,19 @@ why this is unlikely in production). Left to P2-C with a test.
   `required_gate > Base`") can use `RaftMsg::required_gate`/`KvWire::required_gate`, the
   *full* (entries-included) gates, on the receiving side.
 
+**12. Integration with P2-D (added when the two branches were merged).** P2-D was built
+without P2-B; the merge made these changes. (a) `sim_versions`' provisional classifier is
+gone: the capped decode uses `RaftMsg::required_gate` (full, entries-included), and
+`BinaryProfile::accepts(Gate::Base)` is always true (a Phase 1 profile's max known
+version is 0, so the version arm alone would have rejected every `Base` message).
+(b) The N1 negative controls (control tier and `SimCluster` tier) emit the premature
+`ReportNodeVersion` through `RaftNode::propose_ungated_for_negative_control`
+(`cfg(any(test, feature = "sim-versions"))` only), because `propose` now refuses a
+closed-gate command and would also trip the `debug_assert!`, leaving the control
+vacuous. Production gating is unchanged. (c) The era-start path still goes through
+`propose_era_start`. The P2-D amendment's "P2-B is not on main" caveat is obsolete; its
+N2-N4 and data-plane/`animus-node` tiers remain open (P2-C).
+
 ### Amendment 2026-10-04 — P2-D as built (mixed-version corpus)
 
 Built against `main` plus P2-A; P2-B (gate enforcement, `required_gate` tables)

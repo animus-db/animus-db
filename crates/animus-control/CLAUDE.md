@@ -3096,3 +3096,10 @@ rounds while the apply task is behind.
   was open then). Tests: `tests/it/gate_enforcement.rs`, `tests/it/raft_msg_fixture.rs`
   (fixture `control-raft-msg/v1.bin`, **Phase 1 bytes from commit `941a5ea`**).
 
+
+- **Negative controls vs P2-B gating (ADR 0073).** `RaftNode::propose` refuses a
+  closed-gate command and `debug_assert!`s. A test that must emit a premature variant
+  (mixed-version corpus N1) uses `propose_ungated_for_negative_control`
+  (`cfg(any(test, feature = "sim-versions"))`). `sim_versions::BinaryProfile::accepts`
+  treats `Gate::Base` as always accepted; the capped decode classifies with
+  `RaftMsg::required_gate`.
