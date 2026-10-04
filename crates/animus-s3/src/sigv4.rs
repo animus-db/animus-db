@@ -56,26 +56,56 @@ use std::fmt;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
-/// Static AWS-style credentials: an access key id (not secret — it already
-/// travels in plaintext on every signed request) and a secret access key.
-/// **`Debug` never renders the secret** — mirrors `animus_control::
-/// meta::SecretKey`'s redaction discipline exactly; never add a `Display`
-/// impl or a raw accessor with a name that invites logging it.
+/// AWS-style credentials: an access key id (not secret — it already
+/// travels in plaintext on every signed request), a secret access key, and —
+/// for temporary credentials (STS `AssumeRoleWithWebIdentity`, ECS/EKS Pod
+/// Identity, IMDS; S-08 M1) — an optional session token and an optional
+/// expiry. **`Debug` never renders the secret or the session token** —
+/// mirrors `animus_control::meta::SecretKey`'s redaction discipline exactly;
+/// never add a `Display` impl or a raw accessor with a name that invites
+/// logging either value.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Credentials {
     /// The access key id. Not secret.
     pub access_key_id: String,
     secret_access_key: String,
+    session_token: Option<String>,
+    /// When these credentials expire, epoch milliseconds. `None` for
+    /// long-lived (static) credentials, which never expire.
+    expiry_epoch_ms: Option<u64>,
 }
 
 impl Credentials {
-    /// Wrap a raw access-key-id/secret pair.
+    /// Wrap a raw access-key-id/secret pair (long-lived, no session token).
     #[must_use]
     pub fn new(access_key_id: impl Into<String>, secret_access_key: impl Into<String>) -> Self {
         Credentials {
             access_key_id: access_key_id.into(),
             secret_access_key: secret_access_key.into(),
+            session_token: None,
+            expiry_epoch_ms: None,
         }
+    }
+
+    /// Attach a session token (temporary credentials) and, optionally, the
+    /// instant they expire (epoch milliseconds).
+    #[must_use]
+    pub fn with_session_token(
+        mut self,
+        session_token: impl Into<String>,
+        expiry_epoch_ms: Option<u64>,
+    ) -> Self {
+        self.session_token = Some(session_token.into());
+        self.expiry_epoch_ms = expiry_epoch_ms;
+        self
+    }
+
+    /// Set only the expiry (a credential with an expiry but no session token
+    /// is unusual but harmless — used by tests).
+    #[must_use]
+    pub fn with_expiry(mut self, expiry_epoch_ms: Option<u64>) -> Self {
+        self.expiry_epoch_ms = expiry_epoch_ms;
+        self
     }
 
     /// The raw secret bytes — the one legitimate reason to look inside this
@@ -84,6 +114,20 @@ impl Credentials {
     pub fn secret_access_key(&self) -> &str {
         &self.secret_access_key
     }
+
+    /// The raw session token, if any — signed as `x-amz-security-token`.
+    /// Never log, print, or format this value.
+    #[must_use]
+    pub fn session_token(&self) -> Option<&str> {
+        self.session_token.as_deref()
+    }
+
+    /// When these credentials expire (epoch milliseconds), or `None` if they
+    /// never do.
+    #[must_use]
+    pub fn expiry_epoch_ms(&self) -> Option<u64> {
+        self.expiry_epoch_ms
+    }
 }
 
 impl fmt::Debug for Credentials {
@@ -91,6 +135,11 @@ impl fmt::Debug for Credentials {
         f.debug_struct("Credentials")
             .field("access_key_id", &self.access_key_id)
             .field("secret_access_key", &"REDACTED")
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "REDACTED"),
+            )
+            .field("expiry_epoch_ms", &self.expiry_epoch_ms)
             .finish()
     }
 }
@@ -186,11 +235,16 @@ pub struct SignedHeaders {
     pub authorization: String,
     pub x_amz_date: String,
     pub x_amz_content_sha256: String,
+    /// `Some` iff the credentials carry a session token: the value of the
+    /// `x-amz-security-token` header, which [`sign_request`] has already
+    /// folded into `SignedHeaders` — a caller must send it verbatim.
+    pub x_amz_security_token: Option<String>,
 }
 
 /// Sign `req` under `scope`, using `creds`. Adds `host`/`x-amz-date`/
-/// `x-amz-content-sha256` to the signed-header set automatically (real S3
-/// always signs all three); `SignedHeaders` is emitted in sorted order.
+/// `x-amz-content-sha256` (and `x-amz-security-token`, when `creds` carry a
+/// session token) to the signed-header set automatically (real S3
+/// always signs the first three); `SignedHeaders` is emitted in sorted order.
 #[must_use]
 pub fn sign_request(
     creds: &Credentials,
@@ -202,6 +256,11 @@ pub fn sign_request(
     headers.insert("x-amz-date".to_string(), req.timestamp.to_string());
     let payload_hash = req.payload_sha256_hex.as_str().to_string();
     headers.insert("x-amz-content-sha256".to_string(), payload_hash.clone());
+    // Temporary credentials: the session token is a *signed* header (AWS
+    // requires `x-amz-security-token` in SignedHeaders for S3 SigV4).
+    if let Some(token) = creds.session_token() {
+        headers.insert("x-amz-security-token".to_string(), token.to_string());
+    }
 
     // `BTreeMap::keys()` yields sorted order already — exactly the
     // alphabetical `SignedHeaders` convention real AWS SDKs emit.
@@ -237,6 +296,7 @@ pub fn sign_request(
         authorization,
         x_amz_date: req.timestamp.to_string(),
         x_amz_content_sha256: payload_hash,
+        x_amz_security_token: creds.session_token().map(str::to_string),
     }
 }
 
@@ -929,5 +989,134 @@ mod tests {
         assert!(!rendered.contains("super-secret-value"));
         assert!(rendered.contains("REDACTED"));
         assert!(rendered.contains("AKID"));
+    }
+
+    // --- S-08 M1: session-token signing --------------------------------
+
+    #[test]
+    fn session_token_is_a_signed_header_and_verifies() {
+        let creds = Credentials::new("ASIATEST", "topsecret")
+            .with_session_token("TOKEN/with+chars==", None);
+        let scope = SigningScope {
+            region: "us-east-1".to_string(),
+            service: "s3".to_string(),
+        };
+        let payload_hash = PayloadHash::signed(b"");
+        let empty = BTreeMap::new();
+        let req = RequestToSign {
+            method: "GET",
+            uri: "/examplebucket/test.txt",
+            host: "examplebucket.s3.amazonaws.com",
+            query: &[],
+            headers: &empty,
+            payload_sha256_hex: &payload_hash,
+            timestamp: "20130524T000000Z",
+        };
+        let signed = sign_request(&creds, &scope, &req);
+        assert_eq!(
+            signed.x_amz_security_token.as_deref(),
+            Some("TOKEN/with+chars==")
+        );
+        assert!(
+            signed.authorization.contains(
+                "SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-security-token"
+            ),
+            "{}",
+            signed.authorization
+        );
+
+        // Independent derivation: hand-build the canonical request, so a
+        // regression in header folding cannot hide behind sign/verify
+        // sharing the same code path.
+        let hash = payload_hash.as_str();
+        let creq = format!(
+            "GET\n/examplebucket/test.txt\n\nhost:examplebucket.s3.amazonaws.com\n\
+             x-amz-content-sha256:{hash}\nx-amz-date:20130524T000000Z\n\
+             x-amz-security-token:TOKEN/with+chars==\n\n\
+             host;x-amz-content-sha256;x-amz-date;x-amz-security-token\n{hash}"
+        );
+        let sts = string_to_sign(
+            "20130524T000000Z",
+            "20130524/us-east-1/s3/aws4_request",
+            &creq,
+        );
+        let expected = compute_signature("topsecret", "20130524", "us-east-1", "s3", &sts);
+        assert!(
+            signed
+                .authorization
+                .ends_with(&format!("Signature={expected}")),
+            "{}",
+            signed.authorization
+        );
+        // Pinned regression vector (self-derived, not an AWS-published
+        // value): any change to canonicalization of the token header flips it.
+        assert_eq!(
+            expected,
+            "f691f11639dd43a05f3c7cf518891a45aa8d351ca79d2fbe932b9a36898a966f"
+        );
+
+        let mut wire = BTreeMap::new();
+        wire.insert("host".to_string(), req.host.to_string());
+        wire.insert("x-amz-date".to_string(), signed.x_amz_date.clone());
+        wire.insert("x-amz-content-sha256".to_string(), hash.to_string());
+        wire.insert(
+            "x-amz-security-token".to_string(),
+            "TOKEN/with+chars==".to_string(),
+        );
+        let parsed = parse_authorization(&signed.authorization).expect("parses");
+        assert!(verify_signature(
+            &parsed,
+            "topsecret",
+            "GET",
+            req.uri,
+            &[],
+            &wire,
+            hash
+        ));
+        // A different token on the wire must fail verification.
+        wire.insert("x-amz-security-token".to_string(), "other".to_string());
+        assert!(!verify_signature(
+            &parsed,
+            "topsecret",
+            "GET",
+            req.uri,
+            &[],
+            &wire,
+            hash
+        ));
+    }
+
+    #[test]
+    fn credentials_without_a_token_sign_exactly_as_before() {
+        let creds = Credentials::new("AKID", "topsecret");
+        let scope = SigningScope {
+            region: "us-east-1".to_string(),
+            service: "s3".to_string(),
+        };
+        let payload_hash = PayloadHash::signed(b"");
+        let empty = BTreeMap::new();
+        let req = RequestToSign {
+            method: "GET",
+            uri: "/b/k",
+            host: "h",
+            query: &[],
+            headers: &empty,
+            payload_sha256_hex: &payload_hash,
+            timestamp: "20130524T000000Z",
+        };
+        let signed = sign_request(&creds, &scope, &req);
+        assert!(signed.x_amz_security_token.is_none());
+        assert!(!signed.authorization.contains("x-amz-security-token"));
+    }
+
+    #[test]
+    fn credentials_debug_redacts_the_session_token() {
+        let creds = Credentials::new("AKID", "super-secret-value")
+            .with_session_token("super-secret-token", Some(1_700_000_000_000));
+        let rendered = format!("{creds:?}");
+        assert!(!rendered.contains("super-secret-value"), "{rendered}");
+        assert!(!rendered.contains("super-secret-token"), "{rendered}");
+        assert!(rendered.contains("REDACTED"));
+        assert!(rendered.contains("1700000000000"));
     }
 }

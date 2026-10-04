@@ -1,0 +1,5 @@
+# CARGO_BIN_EXE_<name> is compile-time; archived nextest runs need NEXTEST_BIN_EXE_<name>
+
+**Context.** `animus-cli::admin_real_listener` passed locally but failed in CI with `spawn animus: Os { code: 2, NotFound }`. `env!("CARGO_BIN_EXE_animus")` bakes the absolute build-time path of the binary into the test executable. CI builds a `cargo nextest archive` on one runner and runs it on another with `--workspace-remap`, where that path does not exist (nextest extracts and remaps binaries, but cannot rewrite a string already compiled in). nextest exports `NEXTEST_BIN_EXE_<name>` at runtime with the remapped path.
+
+**Rule.** A test that spawns a workspace binary must read `NEXTEST_BIN_EXE_<name>` at runtime and fall back to `env!("CARGO_BIN_EXE_<name>")` for plain `cargo test`. Reproduce locally by archiving into one target dir, extracting elsewhere with `--extract-to`/`--workspace-remap`, and hiding the original binary; plain `cargo test` and a same-machine nextest run both hide this class of bug.

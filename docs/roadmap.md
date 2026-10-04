@@ -188,84 +188,32 @@ outstanding on the wire surface at present.
   0060's own "Amendment (2026-09-06): S-07d" section.) **This closes
   S-07's whole item list (b/c/d/e all landed).**
 
-### S-08 S3 store credentials and large-object hardening (residual of S-04; assessed 2026-10-04)
+### S-08 S3 store credentials and large-object hardening — landed 2026-10-04, complete (PR #1175)
 
-- **Gap (mostly closed — read this first):** root `CLAUDE.md` used to say
-  "an S3 `SegmentStore` backend [is a] deferred follow-up". **That was
-  stale: S-04 landed in full** (ADR 0059's 2026-09-06 amendment and
-  "As-built: PR 2"). Verified in code: the `SegmentStore` trait is
-  `crates/animus-env/src/lib.rs` (`put`/`get`/`delete`/`list`/`is_empty`);
-  `animus-s3` is a **client** (pure SigV4 signer, `S3Client` over a
-  `Transport` seam, a real `HyperRustlsTransport` behind its `prod`
-  feature, and an in-memory `FakeS3` that verifies signatures);
-  `animus_env::S3SegmentStore<T: Transport>`
-  (`crates/animus-env/src/s3_store.rs`) implements the trait with a
-  bounded retry (3 attempts, linear 100 ms step, transport errors and 5xx
-  only); `animusd` accepts `--segment-store`/`--backup-store
-  s3://bucket[/prefix]?endpoint=...&region=...[&path_style=true]
-  [&insecure_http=true]` plus `--s3-credentials PATH`/`--allow-insecure-s3`
-  (`crates/animusd/src/main.rs`, `parse_s3_uri`); `BackupStoreHandle::S3`
-  (`crates/animusd/src/lib.rs`) holds an `Arc<dyn SegmentStore>` that is
-  `S3SegmentStore<HyperRustlsTransport>` in production and a
-  `SimSegmentStore` only under `SimCluster`; `EncryptedSegmentStore`
-  (ADR 0069) wraps it with no extra variant; the operator wires
-  `spec.s3` (S-04 PR 3, `crates/animus-operator/src/crd.rs`
-  `S3StoreSpec`, credentials `Secret` mounted at `/etc/animus/s3`, egress
-  `NetworkPolicy` rule). S3 export/import (S-05, ADR 0068) landed too. An
-  opt-in MinIO/localstack test exists
-  (env-gated on `ANIMUS_S3_TEST_ENDPOINT`...) and
-  `.github/workflows/e2e-kind.yml` has a MinIO-backed `spec.s3.backupStore`
-  leg (CreateBackup/DescribeBackup against MinIO in `kind`). The
-  `cargo test` MinIO tests themselves are not run by any workflow.
-- **What genuinely remains** (each verified absent by grep of
-  `crates/animus-s3/src` and `crates/animus-env/src/s3_store.rs`):
-  1. **Credentials are static only.** `sigv4::Credentials` is
-     `{access_key_id, secret_access_key}` — no session token
-     (`X-Amz-Security-Token`), so STS/temporary credentials cannot be
-     signed at all; no IRSA/web-identity, IMDS/ECS, or credential refresh.
-     On EKS the only route is a long-lived key in a `Secret`.
-  2. **Single-PUT, whole-object GET.** No multipart upload (S3's 5 GiB
-     single-PUT ceiling, and one failed 3-attempt PUT restarts the whole
-     object); no ranged GET.
-  3. **Retry sleeps with `tokio::time::sleep`, not `env.sleep()`**
-     (`s3_store.rs` carries a module-level `#[allow(disallowed_methods)]`
-     because the store is deliberately not `Env`-generic), so the
-     retry/backoff policy has no seed-reproducible fault-injection
-     coverage; backoff is linear without jitter.
-  4. Path-style addressing only (`animus-s3` guide); virtual-hosted style
-     (needed by some GCS-interop/R2 setups) is unimplemented.
-  5. The `cargo test` MinIO tests (`crates/animus-s3/tests/minio_real_endpoint.rs`,
-     `crates/animus-env/tests/s3_segment_store_minio.rs`) are not CI-gated;
-     only the `kind` leg touches MinIO.
-- **Plan (one PR, M):** (a) add an optional `session_token` to
-  `Credentials` and sign it; a `CredentialProvider` trait in `animus-s3`
-  (static, env, file-with-refresh for projected service-account tokens,
-  web-identity `AssumeRoleWithWebIdentity` over the same `Transport`) with
-  expiry-aware refresh; `animusd` selects it via the `--s3-credentials`
-  file shape (additive `#[serde(default)]` fields, ADR 0035 discipline);
-  operator gains an optional `spec.s3` service-account/web-identity mode.
-  (b) multipart upload for objects over a threshold (create/upload-part/
-  complete/abort, abort on failure) behind `S3Client`, ranged GET if a
-  consumer needs it. (c) move the retry loop's sleep behind the seam (a
-  small `Sleeper` parameter or an `Env`-generic wrapper) and add a
-  `SimEnv` corpus over a fault-injecting `FakeS3` (5xx bursts, timeouts,
-  partial multipart, expired credentials) at a seed knob
-  `ANIMUS_S3_FAULT_SEEDS`; (d) a CI job running the two MinIO tests against a
-  service container (cheaper than the `kind` leg). Internal milestones: credentials, multipart, seam +
-  corpus, CI job. Real HTTP stays in `animus-s3`'s `prod` feature (ADR
-  0003; `crates/animus-env/CLAUDE.md`'s `prod` breakdown).
-- **Reuse:** `FakeS3`, `Transport`, `S3SegmentStore`'s contract test,
-  `S3StoreSpec`, `parse_s3_uri`.
-- **Files:** `crates/animus-s3/src/{sigv4,client,fake,prod}.rs`,
-  `crates/animus-env/src/s3_store.rs`, `crates/animusd/src/main.rs`,
-  `crates/animus-operator/src/{crd.rs,desired/}`, `.github/workflows/ci.yml`.
-- **Tests:** `animus-s3` signer vectors for the token header; the fault
-  corpus above; an operator CRD validation test; the MinIO job.
-- **ADR:** an amendment to ADR 0059 (S-04) is enough.
-- **PRs:** one PR, four commits as above.
-- **Size:** M (credentials + multipart are the bulk; most users on
-  MinIO/static keys are unaffected, so this is not urgent).
-- **Depends:** none.
+- **Landed** (ADR 0059's "Amendment (2026-10-04): S-08 as-built" is the
+  design of record): `animus-s3` `CredentialProvider` with static, env,
+  web-identity (STS `AssumeRoleWithWebIdentity`), container (ECS / EKS Pod
+  Identity) and IMDSv2 sources, session-token signing and single-flight
+  refresh 5 minutes before expiry; `animusd --s3-credentials` `source`
+  field; operator `spec.s3.webIdentity`; virtual-hosted addressing
+  (`path_style=false`); multipart upload (over 64 MiB, 16 MiB parts) and a
+  `HEAD` + ranged-`GET` write-once check; `S3SegmentStore<T, E: Clock +
+  Rng>` over the `Env` seam with a jittered exponential `RetryPolicy`
+  (module-level lint allow removed); transport connect/request timeouts;
+  `FaultyTransport` plus the `s3_fault_corpus` at `ANIMUS_S3_FAULT_SEEDS`
+  (nightly 100); and the `s3-real-endpoint` CI job running the real-endpoint
+  tests against RustFS (never vacuously). No durable format changed
+  (ADR 0073).
+- **Residuals** (accepted, documented): a lost `CreateMultipartUpload` ack
+  orphans an upload id (the bucket lifecycle rule
+  `AbortIncompleteMultipartUpload` reaps it); an expired token on `HEAD` is
+  not detectable (no response body); operator `Secret` rotation needs a pod
+  restart; `spec.s3.webIdentity` reaches combined-role pods only, like all
+  of `spec.s3`; an `http://` STS endpoint is accepted as a test knob.
+- **Files:** `crates/animus-s3/src/{creds,creds_prod,sigv4,client,fake,prod}.rs`,
+  `crates/animus-env/src/s3_store.rs`, `crates/animusd/src/{main,lib}.rs`,
+  `crates/animus-operator/src/{crd.rs,desired/}`,
+  `crates/animus-test/tests/it/s3_fault_corpus.rs`, `.github/workflows/ci.yml`.
 
 ---
 
@@ -1923,7 +1871,11 @@ outstanding on the wire surface at present.
     matrix (OS, kernel, filesystem — ext4/xfs and fsync semantics —
     architectures, Kubernetes versions via the `kind` matrix), a
     `SECURITY.md` with a disclosure process, and a deprecation policy for
-    wire/format changes.
+    wire/format changes. **Mechanism landed** (`docs/release.md`,
+    `CHANGELOG.md` + `cliff.toml`, `SECURITY.md`, `.github/workflows/
+    release.yml`, multi-arch signed `image.yml`, `animusd --version`, the
+    `e2e-kind-k8s-compat` job); unvalidated until the first real `v*` tag
+    push, and third-party actions are still pinned by major tag, not SHA.
 - **Reuse:** `animus-test` oracles and `History`; `corpus-deep.yml`;
   `scripts/e2e-kind.sh`; golden fixtures as fuzz seeds; `cargo deny`;
   metrics seam (ADR 0015); the operator's admin-port drain sequence.
@@ -2194,7 +2146,7 @@ wave are independent and can run in parallel.
 | 14 | C-13 (closed 2026-09-13 — all seven PRs landed — seed/join discovery under `SimCluster`, ADR 0061 rung M) | Gated on C-12 (closed) — the next unowned residual group per C-08's through C-12's own close-outs |
 | 15 | C-14 (closed 2026-09-14 — all five PRs landed: #876, #884, #886, #887, plus PR 5 — combined control-plane voter growth under `SimCluster`, ADR 0061 rung N) | Gated on C-13 (closed) — the one residual C-13 PR 6 named precisely: a fresh `RaftNode<SimEnv>` joining the live control quorum after construction |
 | 16 | C-15 (closed 2026-09-20 — node assembly/raw `ClientRequest` assess-and-close, ADR 0061 rung O, #997) | Gated on C-14 (closed) — the last class-D group C-14's own close-out confirmed still unowned |
-| 17 | B-01 (benchmarks); S-08 (S3 credentials/multipart); G-01 stage G-a + G-b (topology-aware operator, global-tables ADR); R-01 sub-tracks c (fuzzing), f (observability), g (release engineering) | All independent of each other and of the open C-16 phases; no ordering constraint |
+| 17 | B-01 (benchmarks); S-08 (S3 credentials/multipart; landed 2026-10-04); G-01 stage G-a + G-b (topology-aware operator, global-tables ADR); R-01 sub-tracks c (fuzzing), f (observability), g (release engineering) | All independent of each other and of the open C-16 phases; no ordering constraint |
 | 18 | C-17 (scale/density), R-01 sub-tracks a (soak), b (chaos), d (resource bounds), e (runbook) | C-17 Tier 2 and R-01 (a)/(e) capacity planning need B-01's generator; C-17 Tier 1 and R-01 (b)/(d) can start earlier |
 | 19 | G-01 stages G-c (MRSC stretch), G-d (MREC), G-e (federation) | After C-16 Phase 2 (P2-B and P2-D remaining: cluster-version/feature gate) and the G-b ADR; G-c wants B-01 to quantify WAN cost |
 | 20 | R-01 runbook upgrade chapter | After C-16 Phase 3 (rolling upgrades) |
