@@ -1973,7 +1973,7 @@ outstanding on the wire surface at present.
      `CreateTable`/`UpdateTable` `ReplicaUpdates`, which *is* a wire-level
      per-table replication mode (the legacy 2017.11.29 API,
      `CreateGlobalTable`/`UpdateGlobalTable`, also exists). **Verified
-     in ADR 0074 section 0 (via AWS doc search extracts; direct page fetches
+     in ADR 0075 section 0 (via AWS doc search extracts; direct page fetches
      were blocked, so a re-read is listed as open): exact parameter names,
      MRSC = exactly three regions or two plus a witness, and MRSC's
      restrictions (no TTL, LSI or transactions).** The ADR must state that each region stays CP *locally*
@@ -2021,9 +2021,9 @@ outstanding on the wire surface at present.
      regions' clusters over the wire/TLS (ADR 0064), applies them with
      last-writer-wins on `(HLC, region id)` as the deterministic
      tiebreak, never re-replicating a replicated write (origin-region
-     stamp), replicates TTL deletes (as AWS does; verified, ADR 0074 V15), and defines
-     stream records for replicated writes to match AWS (verified, ADR 0074 section 4.7 and V13/V15). Transactions are region-local in AWS global tables
-     (verified, ADR 0074 V14): do not replicate atomically. HLC skew across
+     stamp), replicates TTL deletes (as AWS does; verified, ADR 0075 V15), and defines
+     stream records for replicated writes to match AWS (verified, ADR 0075 section 4.7 and V13/V15). Transactions are region-local in AWS global tables
+     (verified, ADR 0075 V14): do not replicate atomically. HLC skew across
      regions bounds LWW fairness; document it. Deterministic simulation
      applies: a multi-cluster `SimCluster` with a WAN partition/latency
      model is part of the work.
@@ -2043,7 +2043,7 @@ outstanding on the wire surface at present.
     corpus over `SimCluster` with labelled nodes (kill a zone), and the
     `kind` smoke with zone-labelled nodes.
   - **G-b The ADR (S) — WRITTEN 2026-10-04 as
-    [ADR 0074](adr/0074-global-tables.md) (Proposed).** Revisit ADR 0019's premise as above, choose the
+    [ADR 0075](adr/0075-global-tables.md) (Proposed).** Revisit ADR 0019's premise as above, choose the
     MRSC/MREC scope, the wire surface (`ReplicaUpdates`,
     `DescribeTable` replica fields, `MultiRegionConsistency`), the ADR 0072
     limits catalogue entries (compiled-in, AWS-faithful), and gate every

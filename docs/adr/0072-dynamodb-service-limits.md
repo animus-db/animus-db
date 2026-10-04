@@ -314,9 +314,9 @@ tests/` for the layers that touch the write/read/batch paths (the
 `Query`/`Scan` page cap and the aggregate byte caps in particular, since
 both change response *shape*, not just accept/reject).
 
-## Amendment (2026-10-04) — global-tables catalogue entries (ADR 0074)
+## Amendment (2026-10-04) — global-tables catalogue entries (ADR 0075)
 
-[ADR 0074](0074-global-tables.md) §6 lists the entries to add to
+[ADR 0075](0075-global-tables.md) §6 lists the entries to add to
 `animus_dynamo::limits` when global tables land (MRSC requires exactly three
 regions, at most one witness, global-tables version `2019.11.21`; MREC has no
 separate AWS numeric cap found). Proposed; no code yet.

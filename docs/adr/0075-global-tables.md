@@ -1,4 +1,4 @@
-# ADR 0074 — Global tables (multi-region): MRSC as a stretch cluster, MREC as async per-item LWW between clusters
+# ADR 0075 — Global tables (multi-region): MRSC as a stretch cluster, MREC as async per-item LWW between clusters
 
 - **Status:** Proposed
 - **Date:** 2026-10-04
