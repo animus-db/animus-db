@@ -5,8 +5,11 @@
 //! or `tokio::spawn` call at all.
 //!
 //! One TCP (+ optional TLS) connection **per request** — no pooling, no
-//! retries (the `SegmentStore` layer this crate is built for, a future PR,
-//! owns both). This module is never exercised by the workspace gates: its
+//! retries (`animus_env::S3SegmentStore` owns retry policy). Every request is
+//! bounded by a connect timeout (TCP connect + TLS handshake) and an overall
+//! request timeout ([`TransportTimeouts`]); an expiry surfaces as the
+//! retryable [`TransportError::Timeout`], so a stalled endpoint can never
+//! hang a caller forever. This module is never exercised by the workspace gates: its
 //! own test (`tests/minio_real_endpoint.rs`) is opt-in, gated on the
 //! `ANIMUS_S3_TEST_ENDPOINT` environment variable being set, and prints a
 //! skip line and returns immediately otherwise — see `CLAUDE.md` for how to
@@ -15,12 +18,14 @@
     clippy::disallowed_methods,
     reason = "this module is the crate's one real-I/O process boundary: a \
               real TCP/TLS connection per S3 request (tokio::spawn to drive \
-              the hyper connection future) — exactly the same justification \
-              animus-env's ProdEnv carries for the identical call, ADR 0061 \
-              rung B5"
+              the hyper connection future) and the real-time connect/request \
+              deadlines (tokio::time::timeout) that bound it — exactly the \
+              same justification animus-env's ProdEnv carries for the \
+              identical calls, ADR 0061 rung B5"
 )]
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -43,6 +48,27 @@ use crate::client::{HttpRequest, HttpResponse, Transport, TransportError};
 /// silently downgrading a production config to plaintext.
 pub struct HyperRustlsTransport {
     insecure_http: bool,
+    timeouts: TransportTimeouts,
+}
+
+/// Deadlines for one request. Defaults are deliberately generous for the
+/// request as a whole — a multipart part is 16 MiB over a possibly slow
+/// link — and tight for connection establishment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportTimeouts {
+    /// TCP connect plus TLS handshake.
+    pub connect: Duration,
+    /// The whole request: connect, send, and reading the full response.
+    pub request: Duration,
+}
+
+impl Default for TransportTimeouts {
+    fn default() -> Self {
+        TransportTimeouts {
+            connect: Duration::from_secs(10),
+            request: Duration::from_secs(60),
+        }
+    }
 }
 
 impl HyperRustlsTransport {
@@ -57,6 +83,7 @@ impl HyperRustlsTransport {
         install_crypto_provider()?;
         Ok(HyperRustlsTransport {
             insecure_http: false,
+            timeouts: TransportTimeouts::default(),
         })
     }
 
@@ -69,7 +96,15 @@ impl HyperRustlsTransport {
         install_crypto_provider()?;
         Ok(HyperRustlsTransport {
             insecure_http: true,
+            timeouts: TransportTimeouts::default(),
         })
+    }
+
+    /// Override the connect/request deadlines (see [`TransportTimeouts`]).
+    #[must_use]
+    pub fn with_timeouts(mut self, timeouts: TransportTimeouts) -> Self {
+        self.timeouts = timeouts;
+        self
     }
 }
 
@@ -92,31 +127,64 @@ fn install_crypto_provider() -> Result<(), TransportError> {
 #[async_trait::async_trait]
 impl Transport for HyperRustlsTransport {
     async fn send(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
+        let host = request.headers.get("host").cloned().unwrap_or_default();
+        match tokio::time::timeout(self.timeouts.request, self.send_inner(request)).await {
+            Ok(result) => result,
+            Err(_) => Err(TransportError::Timeout(format!(
+                "request to {host} exceeded {:?}",
+                self.timeouts.request
+            ))),
+        }
+    }
+}
+
+impl HyperRustlsTransport {
+    async fn send_inner(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
         let host = request
             .headers
             .get("host")
             .cloned()
             .ok_or_else(|| TransportError::Io("request has no host header".to_string()))?;
         let use_tls = !self.insecure_http;
+        let connect_timeout = self.timeouts.connect;
 
-        let tcp = TcpStream::connect(&host)
-            .await
-            .map_err(|e| TransportError::Connect(format!("{host}: {e}")))?;
-        tcp.set_nodelay(true).ok();
-
-        let response = if use_tls {
-            let server_name = server_name_for(&host)?;
-            let connector = build_tls_connector();
-            let tls_stream = connector
-                .connect(server_name, tcp)
+        // TCP connect + (optional) TLS handshake share the connect deadline.
+        let connect = async {
+            let tcp = TcpStream::connect(&host)
                 .await
-                .map_err(|e| TransportError::Connect(format!("TLS handshake with {host}: {e}")))?;
-            send_over(tls_stream, &host, request).await?
-        } else {
-            send_over(tcp, &host, request).await?
+                .map_err(|e| TransportError::Connect(format!("{host}: {e}")))?;
+            tcp.set_nodelay(true).ok();
+            if use_tls {
+                let server_name = server_name_for(&host)?;
+                let tls = build_tls_connector()
+                    .connect(server_name, tcp)
+                    .await
+                    .map_err(|e| {
+                        TransportError::Connect(format!("TLS handshake with {host}: {e}"))
+                    })?;
+                Ok(Conn::Tls(Box::new(tls)))
+            } else {
+                Ok(Conn::Plain(tcp))
+            }
         };
-        Ok(response)
+        let conn = match tokio::time::timeout(connect_timeout, connect).await {
+            Ok(conn) => conn?,
+            Err(_) => {
+                return Err(TransportError::Timeout(format!(
+                    "connecting to {host} exceeded {connect_timeout:?}"
+                )));
+            }
+        };
+        match conn {
+            Conn::Tls(tls) => send_over(*tls, &host, request).await,
+            Conn::Plain(tcp) => send_over(tcp, &host, request).await,
+        }
     }
+}
+
+enum Conn {
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+    Plain(TcpStream),
 }
 
 /// Perform one HTTP/1 request/response round trip over an already-connected

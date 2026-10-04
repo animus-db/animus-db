@@ -225,6 +225,35 @@ accepts no S3-store flags today (a pre-existing `animusd` gap, not
 introduced here; see `crates/animus-operator/CLAUDE.md`'s CLI-flag-support
 table).
 
+**Temporary credentials instead of a `Secret` (S-08 M1).** Set exactly one
+of `credentialsSecretName` or `webIdentity`:
+
+```yaml
+spec:
+  s3:
+    backupStore: "s3://my-backups-bucket?endpoint=https://s3.us-east-1.amazonaws.com&region=us-east-1"
+    webIdentity:
+      roleArn: arn:aws:iam::123456789012:role/animus-s3
+      serviceAccountName: animus        # optional; the namespace default SA otherwise
+      audience: sts.amazonaws.com       # optional (this is the default)
+```
+
+The operator mounts a `serviceAccountToken` projected volume (audience as
+above, kubelet-rotated) read-only at
+`/var/run/secrets/animus/s3-web-identity/token` on every pod, runs the pods
+under `serviceAccountName` if given, and generates an `--s3-credentials`
+file with `source: web_identity` naming the role and that token path.
+`animusd` exchanges the token with STS `AssumeRoleWithWebIdentity` (an
+unsigned call), caches the temporary credentials, refreshes them five
+minutes before expiry, and re-reads the token file on every exchange. No
+secret is stored anywhere; the role's trust policy must trust the cluster's
+OIDC provider for `serviceAccountName`. The generated `NetworkPolicy` also
+opens egress port 443 (STS) to `egressCidrs`.
+
+Add `&path_style=false` to a store URI for **virtual-hosted** addressing
+(`bucket.endpoint/key`); it needs a DNS endpoint (not an IP) and a
+DNS-compatible bucket name, and is validated at admission/reconcile.
+
 Setting `spec.s3` also adds an `Egress` section to the generated
 `NetworkPolicy` (every cluster now gets one, `spec.s3` or not — see below):
 a third rule, scoped to `egressCidrs`, opens the configured store URIs' own

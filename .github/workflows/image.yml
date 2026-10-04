@@ -7,6 +7,17 @@ name: image
 # `main` and version tags additionally push to GHCR so `main` and tagged
 # releases always have a corresponding image for both.
 #
+# Multi-arch, signed, attested (docs/release.md). Structure:
+#   build - one leg per (image, platform). amd64 always; arm64 only on a `v*`
+#           tag (a native arm runner, so no QEMU-emulated Rust compile), so
+#           `main` pushes stay as cheap as before. Each pushed leg is pushed
+#           *by digest* only; no tag points at a single-arch image.
+#   merge - (push events only) joins the per-platform digests into one
+#           manifest list carrying the tags below, then signs it by digest
+#           with cosign (keyless), and attaches an SBOM attestation and a
+#           SLSA build-provenance attestation.
+# Path filters are not evaluated for tag pushes, so a `v*` tag always builds.
+#
 # The path filter below is deliberately narrower than "anything under
 # `crates/`": the Dockerfile's builder stage runs `cargo build --release
 # -p animusd -p animus-cli -p animus-operator`, so a change that cannot
@@ -72,26 +83,22 @@ env:
 
 jobs:
   build:
-    name: build (${{ matrix.image }})
-    runs-on: ubuntu-latest
+    name: build (${{ matrix.image }}, ${{ matrix.suffix }})
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       # Only needed to push; a `pull_request` run never reaches the push
       # step but the token is still scoped narrowly either way.
       packages: write
     strategy:
-      # One image failing to build must not cancel the other.
+      # One image/platform failing to build must not cancel the others.
       fail-fast: false
-      matrix:
-        include:
-          # The default `runtime` stage — unchanged image/tag shape.
-          - image: animus-db/animusd
-            target: runtime
-          # The `animus-operator` controller (ADR 0060 Part 3, S-07a) — the
-          # `runtime-operator` stage of the same Dockerfile.
-          - image: animus-db/animus-operator
-            target: runtime-operator
+      # amd64 always; arm64 added only for a `v*` tag push (see header).
+      matrix: ${{ fromJSON(startsWith(github.ref, 'refs/tags/v') && '{"include":[{"image":"animus-db/animusd","target":"runtime","platform":"linux/amd64","suffix":"amd64","runner":"ubuntu-latest"},{"image":"animus-db/animusd","target":"runtime","platform":"linux/arm64","suffix":"arm64","runner":"ubuntu-24.04-arm"},{"image":"animus-db/animus-operator","target":"runtime-operator","platform":"linux/amd64","suffix":"amd64","runner":"ubuntu-latest"},{"image":"animus-db/animus-operator","target":"runtime-operator","platform":"linux/arm64","suffix":"arm64","runner":"ubuntu-24.04-arm"}]}' || '{"include":[{"image":"animus-db/animusd","target":"runtime","platform":"linux/amd64","suffix":"amd64","runner":"ubuntu-latest"},{"image":"animus-db/animus-operator","target":"runtime-operator","platform":"linux/amd64","suffix":"amd64","runner":"ubuntu-latest"}]}') }}
     steps:
+      # `runtime` is the animusd node image (default Dockerfile target);
+      # `runtime-operator` is the animus-operator controller (ADR 0060 Part
+      # 3, S-07a).
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -108,17 +115,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # `latest` and the tag name only apply to push events; a PR build
-      # tags nothing (push: false below).
-      - name: Compute image tags
+      # Only used for the OCI labels here; the merge job computes the tags.
+      - name: Compute image labels
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ matrix.image }}
-          tags: |
-            type=sha,format=long
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=ref,event=tag
 
       # Build into the local daemon first so the image can be started
       # before anything is published. The push step below is a cache hit
@@ -128,11 +130,12 @@ jobs:
         with:
           context: .
           target: ${{ matrix.target }}
+          platforms: ${{ matrix.platform }}
           load: true
           tags: animus-smoke:${{ matrix.target }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=${{ matrix.target }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.target }}
+          cache-from: type=gha,scope=${{ matrix.target }}-${{ matrix.suffix }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.target }}-${{ matrix.suffix }}
 
       # The binary must actually start inside its runtime stage. This is
       # what catches a builder/runtime glibc skew (a `rust:<ver>` builder
@@ -140,7 +143,7 @@ jobs:
       # then fails with `version GLIBC_x.y not found` before main runs, so
       # a real usage line or CRD document on the output proves the binary
       # loaded and ran our code, whatever the exit status of the argument
-      # used to get it there.
+      # used to get it there. The arm64 leg runs natively on an arm runner.
       - name: Smoke-start the image
         run: |
           set -euo pipefail
@@ -160,13 +163,138 @@ jobs:
               ;;
           esac
 
-      - name: Build and push
+      # Push by digest only; the manifest list (and every tag) is created
+      # by the merge job. Provenance/SBOM are attached there as signed
+      # attestations on the final index digest rather than as per-platform
+      # buildkit attestation manifests, which `imagetools create` would drop.
+      - name: Build and push by digest
+        id: push
+        if: github.event_name != 'pull_request'
         uses: docker/build-push-action@v6
         with:
           context: .
           target: ${{ matrix.target }}
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
+          platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=${{ matrix.target }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.target }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=${{ matrix.target }}-${{ matrix.suffix }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.target }}-${{ matrix.suffix }}
+
+      - name: Export digest
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          digest="${{ steps.push.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.target }}-${{ matrix.suffix }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: publish (${{ matrix.image }})
+    # Tags are only ever created for push events (never for a PR).
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # cosign keyless + attestations
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: animus-db/animusd
+            target: runtime
+          - image: animus-db/animus-operator
+            target: runtime-operator
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digests-${{ matrix.target }}-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # `latest` and the tag name only apply to push events. Tag pushes
+      # additionally get the bare SemVer (`0.1.0-alpha.0`; `major.minor` is
+      # not emitted for a pre-release).
+      - name: Compute image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ matrix.image }}
+          tags: |
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Create the manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<<"$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY }}/${{ matrix.image }}@sha256:%s ' *)
+
+      - name: Resolve the index digest
+        id: digest
+        run: |
+          set -euo pipefail
+          first_tag="$(jq -r '.tags[0]' <<<"$DOCKER_METADATA_OUTPUT_JSON")"
+          docker buildx imagetools inspect "$first_tag"
+          digest="$(docker buildx imagetools inspect "$first_tag" --format '{{json .Manifest}}' | jq -r '.digest')"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      # Sign the manifest list by digest, never by tag (tags are mutable).
+      # Keyless: identity is this workflow run via Sigstore OIDC.
+      - name: Sign the image (cosign keyless)
+        run: cosign sign --yes "${{ env.REGISTRY }}/${{ matrix.image }}@${{ steps.digest.outputs.digest }}"
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ matrix.image }}@${{ steps.digest.outputs.digest }}
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+          upload-artifact: false
+
+      - name: Attest SBOM
+        uses: actions/attest-sbom@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ matrix.image }}
+          subject-digest: ${{ steps.digest.outputs.digest }}
+          sbom-path: sbom.cdx.json
+          push-to-registry: true
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ matrix.image }}
+          subject-digest: ${{ steps.digest.outputs.digest }}
+          push-to-registry: true

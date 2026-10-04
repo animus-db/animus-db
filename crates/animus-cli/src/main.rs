@@ -43,6 +43,11 @@ use tokio::time::sleep;
 #[tokio::main]
 async fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // `--version`/`-V` (docs/release.md): sole argument only.
+    if matches!(args.as_slice(), [a] if a == "--version" || a == "-V") {
+        println!("animus {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
     // `--tls-ca PATH` (ADR 0064, S-01 commit 2) is a *global* flag,
     // recognized only as a prefix before the subcommand name — never as, or
     // after, positional data (issue #840: a positional argument that happens
@@ -158,22 +163,16 @@ const CLIENT_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// server-only TLS handshake first, deriving the `ServerName` to verify the
 /// peer against from exactly the address string dialed
 /// (`animus_env::tls::server_name_for`) — the node's certificate SAN must
-/// cover whatever string `addr` names it by. Once the (possibly TLS-
-/// wrapped) stream is established, runs this build's half of the
-/// client/intra handshake preamble (ADR 0073 Phase 0, workstream D) —
-/// `animus_env::exchange_preamble`, the same shared implementation
-/// `animusd`'s own accept/dial paths use — before returning the stream to
-/// the caller. A mismatch, refusal, or timeout is a plain, named
-/// `Err(String)`, never a panic and never a hang past
-/// [`CLIENT_HANDSHAKE_TIMEOUT`].
-async fn maybe_tls_connect(
+/// cover whatever string `addr` names it by. Runs **no** application-level
+/// preamble; see [`maybe_tls_connect`] for the client-protocol one.
+async fn dial(
     addr: &str,
     tls: Option<&tokio_rustls::TlsConnector>,
 ) -> Result<MaybeTlsStream, String> {
     let stream = TcpStream::connect(addr)
         .await
         .map_err(|e| format!("cannot connect to {addr}: {e}"))?;
-    let mut stream = match tls {
+    let stream = match tls {
         None => MaybeTlsStream::Plain(stream),
         Some(connector) => {
             let server_name = animus_env::tls::server_name_for(addr)
@@ -185,6 +184,22 @@ async fn maybe_tls_connect(
             MaybeTlsStream::Tls(Box::new(tls_stream.into()))
         }
     };
+    Ok(stream)
+}
+
+/// Dial the node's **client-protocol** port: [`dial`] plus this build's half
+/// of the client/intra handshake preamble (ADR 0073 Phase 0, workstream D) —
+/// `animus_env::exchange_preamble`, the same shared implementation
+/// `animusd`'s own accept/dial paths use. A mismatch, refusal, or timeout is
+/// a plain, named `Err(String)`, never a panic and never a hang past
+/// [`CLIENT_HANDSHAKE_TIMEOUT`]. **Only the client port speaks the
+/// preamble**: the admin port is plain HTTP (optionally server-only TLS) and
+/// never answers one, so `http_call` uses [`dial`] directly.
+async fn maybe_tls_connect(
+    addr: &str,
+    tls: Option<&tokio_rustls::TlsConnector>,
+) -> Result<MaybeTlsStream, String> {
+    let mut stream = dial(addr, tls).await?;
     animus_env::exchange_preamble(
         &mut stream,
         &animus_env::CLIENT_PROTOCOL,
@@ -1929,7 +1944,8 @@ async fn http_call(
     body: Option<String>,
     tls: Option<&tokio_rustls::TlsConnector>,
 ) -> Result<(u16, String), String> {
-    let mut stream = maybe_tls_connect(addr, tls).await?;
+    // Plain HTTP (optionally server-only TLS): no client-protocol preamble.
+    let mut stream = dial(addr, tls).await?;
     let body = body.unwrap_or_default();
     let request = format!(
         "{method} {path} HTTP/1.0\r\n\
@@ -1947,10 +1963,16 @@ async fn http_call(
         .map_err(|e| format!("send failed: {e}"))?;
     stream.flush().await.ok();
     let mut buf = Vec::new();
-    stream
-        .read_to_end(&mut buf)
-        .await
-        .map_err(|e| format!("recv failed: {e}"))?;
+    // The admin server frames by closing the connection (`Connection: close`),
+    // and over TLS it drops the socket without a `close_notify` alert, which
+    // rustls surfaces as `UnexpectedEof`. Bytes read before the error are
+    // already in `buf`; a truncated response still fails the head/status
+    // parse below, so treat that EOF as a plain end-of-stream.
+    match stream.read_to_end(&mut buf).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+        Err(e) => return Err(format!("recv failed: {e}")),
+    }
     let text = String::from_utf8_lossy(&buf).into_owned();
     let (head, body) = text
         .split_once("\r\n\r\n")
