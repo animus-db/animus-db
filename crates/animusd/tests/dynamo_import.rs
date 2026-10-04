@@ -64,6 +64,7 @@ fn fake_store_factory(fake: Arc<FakeS3>) -> ExportStoreFactory {
             transport,
             config,
             prefix.map(str::to_owned),
+            animus_env::ProdClockRng::new(),
         ));
         Ok(store)
     })

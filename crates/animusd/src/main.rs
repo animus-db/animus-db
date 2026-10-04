@@ -268,6 +268,13 @@ use animusd::{ClusterConfig, RoleAddrs};
 #[tokio::main]
 async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `--version`/`-V` (docs/release.md): the build's SemVer string, handled
+    // before tracing init so it has no side effects. Matches only as the sole
+    // argument, never as a value of another flag.
+    if matches!(args.as_slice(), [a] if a == "--version" || a == "-V") {
+        println!("animusd {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
     let tracer_provider = animusd::otel::init_tracing(&otel_instance_label(&args));
 
     let result = match args.first().map(String::as_str) {
@@ -1023,7 +1030,7 @@ fn parse_seed_arg(seed_arg: &str) -> Result<Vec<String>, String> {
 /// below for how credentials and the plaintext-HTTP gate are resolved.
 fn parse_segment_store(
     value: Option<&str>,
-    s3_credentials: Option<&animus_s3::sigv4::Credentials>,
+    s3_credentials: Option<&animusd::S3CredentialSource>,
     allow_insecure_s3: bool,
 ) -> Result<animusd::SegmentStoreConfig, String> {
     match value {
@@ -1051,7 +1058,7 @@ fn parse_segment_store(
 /// see [`parse_s3_uri`]).
 fn parse_backup_store(
     value: Option<&str>,
-    s3_credentials: Option<&animus_s3::sigv4::Credentials>,
+    s3_credentials: Option<&animusd::S3CredentialSource>,
     allow_insecure_s3: bool,
 ) -> Result<animusd::BackupStoreConfig, String> {
     match value {
@@ -1078,12 +1085,12 @@ fn parse_backup_store(
 /// silently defaulted or panicked on.
 fn resolve_s3_store_config(
     v: &str,
-    s3_credentials: Option<&animus_s3::sigv4::Credentials>,
+    s3_credentials: Option<&animusd::S3CredentialSource>,
     allow_insecure_s3: bool,
     flag_name: &str,
 ) -> Result<animusd::S3StoreConfig, String> {
     let uri = parse_s3_uri(v, allow_insecure_s3)?;
-    let credentials = s3_credentials.cloned().ok_or_else(|| {
+    let credential_source = s3_credentials.cloned().ok_or_else(|| {
         format!(
             "{flag_name} {v:?}: S3 credentials are required — pass --s3-credentials PATH or set \
              the ANIMUS_S3_ACCESS_KEY_ID/ANIMUS_S3_SECRET_ACCESS_KEY environment variables"
@@ -1095,7 +1102,8 @@ fn resolve_s3_store_config(
         endpoint: uri.endpoint,
         region: uri.region,
         insecure_http: uri.insecure_http,
-        credentials,
+        credential_source,
+        virtual_hosted: uri.virtual_hosted,
     })
 }
 
@@ -1113,11 +1121,11 @@ fn resolve_s3_store_config(
 /// - `region` — defaults to `"us-east-1"` if omitted (harmless against a
 ///   real AWS bucket only ever addressed path-style, and MinIO/localstack
 ///   ignore the region entirely).
-/// - `path_style` — this client only ever addresses path-style
-///   (`animus_s3::client::S3Config`'s own documented scope), so the only
-///   accepted value is `true` (or omit the key entirely); `path_style=false`
-///   (virtual-hosted addressing) is rejected as unimplemented rather than
-///   silently ignored.
+/// - `path_style` — `true` (the default when omitted) addresses
+///   `endpoint/bucket/key`; `false` selects virtual-hosted addressing
+///   (`bucket.endpoint/key`, S-08 M1), which needs a DNS endpoint (an IP is
+///   rejected) and a DNS-compatible bucket name. Any other value is an
+///   error.
 /// - `insecure_http` — `true` allows a plain-HTTP endpoint. Refused outright
 ///   unless the endpoint's own host is loopback (`localhost`/`127.0.0.0/8`/
 ///   `::1`) **or** the caller also passed `--allow-insecure-s3`
@@ -1141,6 +1149,7 @@ fn parse_s3_uri(v: &str, allow_insecure_s3: bool) -> Result<S3UriParts, String> 
     let mut endpoint: Option<String> = None;
     let mut region: Option<String> = None;
     let mut insecure_http = false;
+    let mut virtual_hosted = false;
     for pair in query_part.split('&').filter(|s| !s.is_empty()) {
         let (key, val) = pair
             .split_once('=')
@@ -1148,15 +1157,16 @@ fn parse_s3_uri(v: &str, allow_insecure_s3: bool) -> Result<S3UriParts, String> 
         match key {
             "endpoint" => endpoint = Some(val.to_string()),
             "region" => region = Some(val.to_string()),
-            "path_style" => {
-                if val != "true" {
+            "path_style" => match val {
+                "true" => virtual_hosted = false,
+                "false" => virtual_hosted = true,
+                other => {
                     return Err(format!(
-                        "{v:?}: path_style={val:?} is not supported — this client only \
-                         implements path-style S3 addressing (omit the parameter, or pass \
-                         path_style=true)"
+                        "{v:?}: path_style={other:?} must be `true` (path-style, the default) \
+                         or `false` (virtual-hosted)"
                     ));
                 }
-            }
+            },
             "insecure_http" => insecure_http = val == "true",
             other => return Err(format!("{v:?}: unknown s3:// query parameter {other:?}")),
         }
@@ -1195,12 +1205,18 @@ fn parse_s3_uri(v: &str, allow_insecure_s3: bool) -> Result<S3UriParts, String> 
         }
     }
 
+    if virtual_hosted {
+        animus_s3::client::validate_virtual_hosted(&endpoint, bucket)
+            .map_err(|e| format!("{v:?}: path_style=false: {e}"))?;
+    }
+
     Ok(S3UriParts {
         bucket: bucket.to_string(),
         prefix,
         endpoint,
         region,
         insecure_http,
+        virtual_hosted,
     })
 }
 
@@ -1211,6 +1227,7 @@ struct S3UriParts {
     endpoint: String,
     region: String,
     insecure_http: bool,
+    virtual_hosted: bool,
 }
 
 /// Whether `host` (a bare hostname, no scheme, `:port` stripped by the
@@ -1239,7 +1256,7 @@ fn is_loopback_host(host: &str) -> bool {
 fn resolve_export_s3(
     endpoint: Option<&str>,
     region: Option<&str>,
-    s3_credentials: Option<&animus_s3::sigv4::Credentials>,
+    s3_credentials: Option<&animusd::S3CredentialSource>,
     allow_insecure_s3: bool,
 ) -> Result<Option<animusd::ExportS3Config>, String> {
     let (endpoint, region) = match (endpoint, region) {
@@ -1268,7 +1285,7 @@ fn resolve_export_s3(
             ));
         }
     }
-    let credentials = s3_credentials.cloned().ok_or_else(|| {
+    let credential_source = s3_credentials.cloned().ok_or_else(|| {
         "--export-s3-endpoint/--export-s3-region need S3 credentials — pass \
          --s3-credentials PATH or set ANIMUS_S3_ACCESS_KEY_ID/ANIMUS_S3_SECRET_ACCESS_KEY"
             .to_string()
@@ -1277,30 +1294,69 @@ fn resolve_export_s3(
         endpoint: endpoint.to_string(),
         region: region.to_string(),
         insecure_http,
-        credentials,
+        credential_source,
+        virtual_hosted: false,
     }))
 }
 
-/// One S3 credential (S-04 PR 2): `access_key_id` plus exactly one of
+/// Where `--s3-credentials` says credentials come from (S-08 M1).
+#[derive(serde::Deserialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum S3CredentialsKind {
+    /// `access_key_id` + a secret via file/env indirection (the S-04 shape;
+    /// the default, so an existing file keeps working unchanged).
+    #[default]
+    Static,
+    /// `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN`.
+    Env,
+    /// STS `AssumeRoleWithWebIdentity` (EKS IRSA): `role_arn` (or
+    /// `AWS_ROLE_ARN`), `web_identity_token_file` (or
+    /// `AWS_WEB_IDENTITY_TOKEN_FILE`), optional `session_name`/
+    /// `sts_endpoint`.
+    WebIdentity,
+    /// ECS task role / EKS Pod Identity (`AWS_CONTAINER_CREDENTIALS_*`).
+    Container,
+    /// EC2 instance profile (IMDSv2).
+    Imds,
+}
+
+/// One S3 credential source (S-04 PR 2, extended by S-08 M1). For the
+/// default `source = "static"`: `access_key_id` plus exactly one of
 /// `secret_access_key_file`/`secret_access_key_env` — file/env indirection
 /// only, mirroring ADR 0064's `tls` section's own cert/key-**path**
 /// precedent (never an inline secret in a config file, unlike
 /// `dynamo_auth`'s in-`ClusterConfig` static credential map, which this
 /// deliberately does not follow — see `main.rs`'s own module doc for why
 /// this file is a separate, standalone JSON document rather than a new
-/// `ClusterConfig` field). Loaded from `--s3-credentials PATH`.
-#[derive(serde::Deserialize)]
+/// `ClusterConfig` field), optionally with a literal `session_token`. Every
+/// field added by S-08 is `#[serde(default)]`: an S-04-era file parses
+/// byte-for-byte as before. Loaded from `--s3-credentials PATH`.
+#[derive(serde::Deserialize, Default)]
 struct S3CredentialsFile {
+    #[serde(default)]
+    source: S3CredentialsKind,
+    #[serde(default)]
     access_key_id: String,
     #[serde(default)]
     secret_access_key_file: Option<String>,
     #[serde(default)]
     secret_access_key_env: Option<String>,
+    /// Static source only: a literal session token for temporary keys.
+    #[serde(default)]
+    session_token: Option<String>,
+    #[serde(default)]
+    role_arn: Option<String>,
+    #[serde(default)]
+    web_identity_token_file: Option<String>,
+    #[serde(default)]
+    session_name: Option<String>,
+    #[serde(default)]
+    sts_endpoint: Option<String>,
 }
 
 impl S3CredentialsFile {
     /// Resolve the secret via whichever indirection this file names, then
-    /// build the [`animus_s3::sigv4::Credentials`] pair.
+    /// build the [`animus_s3::sigv4::Credentials`] pair (static source).
     ///
     /// # Errors
     /// A message naming the missing/conflicting field — never a panic —
@@ -1308,6 +1364,11 @@ impl S3CredentialsFile {
     /// `secret_access_key_env` are set, the named file can't be read, or the
     /// named environment variable isn't set.
     fn resolve(&self) -> Result<animus_s3::sigv4::Credentials, String> {
+        if self.access_key_id.is_empty() {
+            return Err(
+                "--s3-credentials: access_key_id is required for source=static".to_string(),
+            );
+        }
         let secret = match (&self.secret_access_key_file, &self.secret_access_key_env) {
             (Some(_), Some(_)) => {
                 return Err(
@@ -1330,21 +1391,109 @@ impl S3CredentialsFile {
                 );
             }
         };
-        Ok(animus_s3::sigv4::Credentials::new(
-            self.access_key_id.clone(),
-            secret,
-        ))
+        let creds = animus_s3::sigv4::Credentials::new(self.access_key_id.clone(), secret);
+        Ok(match &self.session_token {
+            Some(t) if !t.is_empty() => creds.with_session_token(t.clone(), None),
+            _ => creds,
+        })
+    }
+
+    /// Resolve this file into an [`animusd::S3CredentialSource`].
+    ///
+    /// # Errors
+    /// A message naming the field: static fields set on a non-static
+    /// source, or a `web_identity` source missing its role/token file
+    /// (neither in the file nor in `AWS_ROLE_ARN`/
+    /// `AWS_WEB_IDENTITY_TOKEN_FILE`), plus every [`Self::resolve`] error.
+    fn resolve_source(&self) -> Result<animusd::S3CredentialSource, String> {
+        let static_fields_set = !self.access_key_id.is_empty()
+            || self.secret_access_key_file.is_some()
+            || self.secret_access_key_env.is_some()
+            || self.session_token.is_some();
+        let wi_fields_set = self.role_arn.is_some()
+            || self.web_identity_token_file.is_some()
+            || self.session_name.is_some()
+            || self.sts_endpoint.is_some();
+        match self.source {
+            S3CredentialsKind::Static => {
+                if wi_fields_set {
+                    return Err("--s3-credentials: role_arn/web_identity_token_file/\
+                         session_name/sts_endpoint need source=web_identity"
+                        .to_string());
+                }
+                self.resolve().map(animusd::S3CredentialSource::Static)
+            }
+            S3CredentialsKind::WebIdentity => {
+                if static_fields_set {
+                    return Err("--s3-credentials: access_key_id/secret_access_key_*/\
+                         session_token do not apply to source=web_identity"
+                        .to_string());
+                }
+                let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+                let role_arn = self
+                    .role_arn
+                    .clone()
+                    .or_else(|| env("AWS_ROLE_ARN"))
+                    .ok_or_else(|| {
+                        "--s3-credentials: source=web_identity needs role_arn (or AWS_ROLE_ARN)"
+                            .to_string()
+                    })?;
+                let token_file = self
+                    .web_identity_token_file
+                    .clone()
+                    .or_else(|| env("AWS_WEB_IDENTITY_TOKEN_FILE"))
+                    .ok_or_else(|| {
+                        "--s3-credentials: source=web_identity needs web_identity_token_file \
+                         (or AWS_WEB_IDENTITY_TOKEN_FILE)"
+                            .to_string()
+                    })?;
+                if let Some(ep) = &self.sts_endpoint
+                    && !(ep.starts_with("https://") || ep.starts_with("http://"))
+                {
+                    return Err(format!(
+                        "--s3-credentials: sts_endpoint {ep:?} must start with https:// or http://"
+                    ));
+                }
+                Ok(animusd::S3CredentialSource::WebIdentity {
+                    role_arn,
+                    token_file,
+                    session_name: self
+                        .session_name
+                        .clone()
+                        .unwrap_or_else(|| "animusd".to_string()),
+                    sts_endpoint: self.sts_endpoint.clone(),
+                })
+            }
+            kind @ (S3CredentialsKind::Env
+            | S3CredentialsKind::Container
+            | S3CredentialsKind::Imds) => {
+                let (name, source) = match kind {
+                    S3CredentialsKind::Env => ("env", animusd::S3CredentialSource::Env),
+                    S3CredentialsKind::Container => {
+                        ("container", animusd::S3CredentialSource::Container)
+                    }
+                    _ => ("imds", animusd::S3CredentialSource::Imds),
+                };
+                if static_fields_set || wi_fields_set {
+                    return Err(format!(
+                        "--s3-credentials: source={name} takes no other credential fields"
+                    ));
+                }
+                Ok(source)
+            }
+        }
     }
 }
 
-/// Resolve S3 credentials (S-04 PR 2) for `--segment-store`/`--backup-store
-/// s3://...`: a `--s3-credentials PATH` file (see [`S3CredentialsFile`]) if
-/// given, else the `ANIMUS_S3_ACCESS_KEY_ID`/`ANIMUS_S3_SECRET_ACCESS_KEY`
-/// environment variables, else `None` — meaning "no credentials configured
-/// at all," which is only an error once an `s3://` store actually needs one
-/// (`resolve_s3_store_config`'s own error, not this function's — a process
-/// with neither store set to `s3://` should never fail startup just because
-/// no S3 credentials happen to be configured).
+/// Resolve S3 credentials (S-04 PR 2, S-08 M1) for `--segment-store`/
+/// `--backup-store s3://...`: a `--s3-credentials PATH` file (see
+/// [`S3CredentialsFile`]) if given, else the
+/// `ANIMUS_S3_ACCESS_KEY_ID`/`ANIMUS_S3_SECRET_ACCESS_KEY` environment
+/// variables (static keys — unchanged), else `None` — meaning "no
+/// credentials configured at all," which is only an error once an `s3://`
+/// store actually needs one (`resolve_s3_store_config`'s own error, not this
+/// function's — a process with neither store set to `s3://` should never
+/// fail startup just because no S3 credentials happen to be configured).
 ///
 /// # Errors
 /// The credentials file can't be read/parsed/resolved, or exactly one of
@@ -1352,19 +1501,21 @@ impl S3CredentialsFile {
 /// operator mistake, not a "missing" case).
 fn resolve_s3_credentials(
     path: Option<&str>,
-) -> Result<Option<animus_s3::sigv4::Credentials>, String> {
+) -> Result<Option<animusd::S3CredentialSource>, String> {
     if let Some(path) = path {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("reading --s3-credentials {path}: {e}"))?;
         let file: S3CredentialsFile = serde_json::from_str(&text)
             .map_err(|e| format!("parsing --s3-credentials {path}: {e}"))?;
-        return file.resolve().map(Some);
+        return file.resolve_source().map(Some);
     }
     match (
         std::env::var("ANIMUS_S3_ACCESS_KEY_ID"),
         std::env::var("ANIMUS_S3_SECRET_ACCESS_KEY"),
     ) {
-        (Ok(id), Ok(secret)) => Ok(Some(animus_s3::sigv4::Credentials::new(id, secret))),
+        (Ok(id), Ok(secret)) => Ok(Some(animusd::S3CredentialSource::Static(
+            animus_s3::sigv4::Credentials::new(id, secret),
+        ))),
         (Err(_), Err(_)) => Ok(None),
         (Ok(_), Err(_)) => {
             Err("ANIMUS_S3_ACCESS_KEY_ID is set but ANIMUS_S3_SECRET_ACCESS_KEY is not".to_string())
@@ -3108,8 +3259,10 @@ mod tests {
 
     // --- `s3://` (S-04 PR 2) ---------------------------------------------
 
-    fn test_creds() -> animus_s3::sigv4::Credentials {
-        animus_s3::sigv4::Credentials::new("AKIDTEST", "secret")
+    fn test_creds() -> animusd::S3CredentialSource {
+        animusd::S3CredentialSource::Static(animus_s3::sigv4::Credentials::new(
+            "AKIDTEST", "secret",
+        ))
     }
 
     #[test]
@@ -3128,7 +3281,7 @@ mod tests {
                 assert_eq!(s3.endpoint, "https://s3.example.com");
                 assert_eq!(s3.region, "us-west-2");
                 assert!(!s3.insecure_http);
-                assert_eq!(s3.credentials, creds);
+                assert_eq!(s3.credential_source, creds);
             }
             other => panic!("expected S3, got {other:?}"),
         }
@@ -3249,14 +3402,64 @@ mod tests {
     }
 
     #[test]
-    fn segment_store_s3_rejects_path_style_false() {
+    fn segment_store_s3_path_style_false_selects_virtual_hosted() {
         let creds = test_creds();
-        let err = parse_segment_store(
-            Some("s3://my-bucket?endpoint=https://s3.example.com&path_style=false"),
+        let cfg = parse_segment_store(
+            Some("s3://my-bucket/p?endpoint=https://s3.example.com&path_style=false"),
             Some(&creds),
             false,
         )
-        .expect_err("path_style=false is not implemented");
+        .expect("virtual-hosted parses");
+        match cfg {
+            animusd::SegmentStoreConfig::S3(s3) => {
+                assert!(s3.virtual_hosted);
+                assert_eq!(s3.bucket, "my-bucket");
+            }
+            other => panic!("expected S3, got {other:?}"),
+        }
+        // Default and explicit path_style=true stay path-style.
+        for uri in [
+            "s3://my-bucket?endpoint=https://s3.example.com",
+            "s3://my-bucket?endpoint=https://s3.example.com&path_style=true",
+        ] {
+            let cfg = parse_segment_store(Some(uri), Some(&creds), false).expect("parses");
+            match cfg {
+                animusd::SegmentStoreConfig::S3(s3) => assert!(!s3.virtual_hosted, "{uri}"),
+                other => panic!("expected S3, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn segment_store_s3_virtual_hosted_rejects_ip_endpoints_and_non_dns_buckets() {
+        let creds = test_creds();
+        let err = parse_segment_store(
+            Some(
+                "s3://my-bucket?endpoint=http://127.0.0.1:9000&insecure_http=true&path_style=false",
+            ),
+            Some(&creds),
+            false,
+        )
+        .expect_err("IP endpoint");
+        assert!(err.contains("IP"), "{err}");
+        let err = parse_segment_store(
+            Some("s3://My_Bucket?endpoint=https://s3.example.com&path_style=false"),
+            Some(&creds),
+            false,
+        )
+        .expect_err("non-DNS bucket");
+        assert!(err.contains("DNS-compatible"), "{err}");
+    }
+
+    #[test]
+    fn segment_store_s3_rejects_a_non_boolean_path_style() {
+        let creds = test_creds();
+        let err = parse_segment_store(
+            Some("s3://my-bucket?endpoint=https://s3.example.com&path_style=maybe"),
+            Some(&creds),
+            false,
+        )
+        .expect_err("garbage path_style");
         assert!(err.contains("path_style"), "{err}");
     }
 
@@ -3289,7 +3492,8 @@ mod tests {
                 endpoint: "https://s3.example.com".to_string(),
                 region: "us-east-1".to_string(),
                 insecure_http: false,
-                credentials: creds,
+                credential_source: creds,
+                virtual_hosted: false,
             })
         );
     }
@@ -3317,7 +3521,7 @@ mod tests {
         let file = S3CredentialsFile {
             access_key_id: "AKID".to_string(),
             secret_access_key_file: Some(secret_path.to_string_lossy().to_string()),
-            secret_access_key_env: None,
+            ..Default::default()
         };
         let creds = file.resolve().expect("resolves via file");
         assert_eq!(creds.access_key_id, "AKID");
@@ -3330,8 +3534,8 @@ mod tests {
     fn s3_credentials_file_names_the_missing_env_var() {
         let file = S3CredentialsFile {
             access_key_id: "AKID".to_string(),
-            secret_access_key_file: None,
             secret_access_key_env: Some("ANIMUS_S3_CREDS_TEST_DEFINITELY_UNSET".to_string()),
+            ..Default::default()
         };
         let err = file
             .resolve()
@@ -3346,8 +3550,7 @@ mod tests {
     fn s3_credentials_file_requires_exactly_one_secret_source() {
         let neither = S3CredentialsFile {
             access_key_id: "AKID".to_string(),
-            secret_access_key_file: None,
-            secret_access_key_env: None,
+            ..Default::default()
         };
         assert!(neither.resolve().is_err());
 
@@ -3355,11 +3558,99 @@ mod tests {
             access_key_id: "AKID".to_string(),
             secret_access_key_file: Some("/dev/null".to_string()),
             secret_access_key_env: Some("SOME_VAR".to_string()),
+            ..Default::default()
         };
         let err = both
             .resolve()
             .expect_err("both sources set must be rejected");
         assert!(err.contains("not both"), "{err}");
+    }
+
+    fn parse_creds_file(json: &str) -> Result<animusd::S3CredentialSource, String> {
+        serde_json::from_str::<S3CredentialsFile>(json)
+            .map_err(|e| e.to_string())?
+            .resolve_source()
+    }
+
+    #[test]
+    fn s3_credentials_file_without_source_is_static_as_before() {
+        let dir = std::env::temp_dir().join(format!("animusd-s3-src-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let secret_path = dir.join("secret");
+        std::fs::write(&secret_path, "shh\n").expect("write");
+        let json = format!(
+            r#"{{"access_key_id":"AKID","secret_access_key_file":{:?}}}"#,
+            secret_path.to_string_lossy()
+        );
+        assert_eq!(
+            parse_creds_file(&json).expect("static"),
+            animusd::S3CredentialSource::Static(animus_s3::sigv4::Credentials::new("AKID", "shh"))
+        );
+        // A literal session token rides along (temporary static keys).
+        let json = format!(
+            r#"{{"source":"static","access_key_id":"ASIA","secret_access_key_file":{:?},"session_token":"tok"}}"#,
+            secret_path.to_string_lossy()
+        );
+        match parse_creds_file(&json).expect("static+token") {
+            animusd::S3CredentialSource::Static(c) => assert_eq!(c.session_token(), Some("tok")),
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn s3_credentials_file_web_identity_source() {
+        let src = parse_creds_file(
+            r#"{"source":"web_identity","role_arn":"arn:aws:iam::1:role/r",
+                "web_identity_token_file":"/var/run/t","sts_endpoint":"https://sts.example.com"}"#,
+        )
+        .expect("web identity");
+        assert_eq!(
+            src,
+            animusd::S3CredentialSource::WebIdentity {
+                role_arn: "arn:aws:iam::1:role/r".to_string(),
+                token_file: "/var/run/t".to_string(),
+                session_name: "animusd".to_string(),
+                sts_endpoint: Some("https://sts.example.com".to_string()),
+            }
+        );
+        let err = parse_creds_file(
+            r#"{"source":"web_identity","role_arn":"r","web_identity_token_file":"/t",
+                "sts_endpoint":"ftp://x"}"#,
+        )
+        .expect_err("bad sts endpoint");
+        assert!(err.contains("sts_endpoint"), "{err}");
+        let err = parse_creds_file(
+            r#"{"source":"web_identity","role_arn":"r","web_identity_token_file":"/t",
+                "access_key_id":"AKID"}"#,
+        )
+        .expect_err("static fields on web identity");
+        assert!(err.contains("web_identity"), "{err}");
+    }
+
+    #[test]
+    fn s3_credentials_file_other_sources_and_conflicts() {
+        assert_eq!(
+            parse_creds_file(r#"{"source":"env"}"#).expect("env"),
+            animusd::S3CredentialSource::Env
+        );
+        assert_eq!(
+            parse_creds_file(r#"{"source":"container"}"#).expect("container"),
+            animusd::S3CredentialSource::Container
+        );
+        assert_eq!(
+            parse_creds_file(r#"{"source":"imds"}"#).expect("imds"),
+            animusd::S3CredentialSource::Imds
+        );
+        let err = parse_creds_file(r#"{"source":"imds","access_key_id":"A"}"#).expect_err("mixed");
+        assert!(err.contains("imds"), "{err}");
+        let err = parse_creds_file(r#"{"access_key_id":"A","role_arn":"r"}"#)
+            .expect_err("static + role_arn");
+        assert!(err.contains("web_identity"), "{err}");
+        assert!(parse_creds_file(r#"{"source":"nonsense"}"#).is_err());
+        // Static with no access key id at all.
+        let err = parse_creds_file("{}").expect_err("empty static");
+        assert!(err.contains("access_key_id"), "{err}");
     }
 
     #[test]

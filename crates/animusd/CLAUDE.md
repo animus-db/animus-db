@@ -5279,9 +5279,38 @@ ADR itself for the full design/rationale.
   silently downgrade a production config), and `insecure_http=true` against
   a non-loopback host (`is_loopback_host` — a conservative literal
   `localhost`/`127.0.0.0/8`/`::1` match, never a DNS resolution) is refused
-  unless `--allow-insecure-s3` is also given. `path_style=false`
-  (virtual-hosted addressing) is rejected as unimplemented — this client
-  only ever addresses path-style — rather than silently ignored.
+  unless `--allow-insecure-s3` is also given. `path_style` (S-08 M1):
+  omitted/`true` = path-style (unchanged default), `false` = virtual-hosted
+  (`bucket.endpoint/key`) — `parse_s3_uri` runs
+  `animus_s3::client::validate_virtual_hosted` (DNS endpoint, not an IP;
+  DNS-compatible bucket) at parse time, `S3StoreConfig::virtual_hosted`
+  carries the choice to `s3_segment_store`, which builds the client with
+  `with_addressing`. Any other value is an error. The export store
+  (`ExportS3Config`) stays path-style (`virtual_hosted: false`; its bucket
+  is per request).
+
+  **Non-static credentials (S-08 M1).** `S3CredentialsFile` gained
+  additive, `#[serde(default)]` fields: `source` (`static` default | `env`
+  | `web_identity` | `container` | `imds`), `session_token` (static only),
+  `role_arn`/`web_identity_token_file` (fall back to `AWS_ROLE_ARN`/
+  `AWS_WEB_IDENTITY_TOKEN_FILE`), `session_name` (default `animusd`),
+  `sts_endpoint` (default `https://sts.<store region>.amazonaws.com`). An
+  S-04-era file and the `ANIMUS_S3_*` env fallback resolve exactly as
+  before (`S3CredentialSource::Static`). `resolve_s3_credentials` now
+  returns `Option<animusd::S3CredentialSource>`; `S3StoreConfig`/
+  `ExportS3Config` carry `credential_source` (+ `virtual_hosted`) instead of
+  a bare `Credentials`. `lib.rs::s3_credential_provider` builds the
+  `CredentialProvider` (non-static ones wrapped in `CachingProvider`;
+  STS/container/IMDS each get their own `HyperRustlsTransport` — TLS for
+  `https://`, plain for `http://` link-local endpoints) and
+  `s3_segment_store` assembles `S3Client::with_provider` →
+  `S3SegmentStore::from_client`. `StoreView`/admin never render the
+  credential source (tests: `s3_view_never_exposes_a_non_static_credential_source`,
+  `s3_config_debug_redacts_static_and_session_secrets`); tokens are never
+  logged (provider errors carry codes/status only). Tests:
+  `main.rs` `s3_credentials_file_*`/`segment_store_s3_*virtual_hosted*`,
+  `lib.rs` `s3_credential_wiring_tests`; the provider mechanics are covered
+  in `animus-s3`'s `tests/it/credentials.rs` over fake STS/IMDS.
 
   **Admin surface**: `GET /admin/segment-store`/`GET /admin/backup-store`
   render `"kind": "s3"` with a `location` of `s3://bucket[/prefix]@host`

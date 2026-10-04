@@ -24,8 +24,11 @@ alone, and — the first real downstream consumer of the `fake` feature
 described below — takes it as a `[dev-dependencies]` feature for its own
 `S3SegmentStore` contract test. PR 3 (landed) did the
 Kubernetes-operator egress/credential-secret side (`spec.s3`,
-`animus-operator`'s `S3StoreSpec`). What remains — non-static credentials,
-multipart upload — is `docs/roadmap.md` S-08.
+`animus-operator`'s `S3StoreSpec`). S-08 M1 (non-static credentials +
+virtual-hosted addressing) has landed — see "Credential providers" and
+"Addressing" below; S-08 M2 (multipart upload + ranged GET) has
+landed too — see "Multipart and ranged GET" below; the rest of S-08 is in
+`docs/roadmap.md`.
 
 ## Entry points
 
@@ -48,11 +51,20 @@ multipart upload — is `docs/roadmap.md` S-08.
   `async fn send(HttpRequest) -> Result<HttpResponse, TransportError>` over
   owned bytes — no socket type anywhere in the trait, so the client is
   testable without one. [`client::S3Error`] distinguishes `NotFound`/
-  `AccessDenied`/`Service{code,message,status}`/`Transport(..)`. **No
-  retries in this PR** — deliberately: a future `SegmentStore` layer over
-  this client owns retry policy, exactly like `animus_env::SegmentStore`'s
-  own doc frames the split between "a store's own consistency contract" and
-  "what a caller does about a transient failure."
+  `AccessDenied`/`Service{code,message,status}`/`Transport(..)`;
+  `TransportError` is `Connect`/`Io`/`Timeout`. **No retries in the client**
+  — `animus_env::S3SegmentStore` owns retry policy (S-08 M3: Env-seamed
+  exponential backoff with full jitter), so it is seed-testable.
+- `creds` — **pure** credential sourcing (S-08 M1): the async
+  [`creds::CredentialProvider`] trait (`credentials(now_epoch_ms)` +
+  `refresh(stale, now)`; never reads a clock), [`creds::StaticProvider`],
+  [`creds::CachingProvider`] (refresh 5 min before expiry, single flight),
+  and the `Transport`-driven sources [`creds::StsWebIdentityProvider`]
+  (unsigned `AssumeRoleWithWebIdentity`), [`creds::ContainerProvider`]
+  (ECS / EKS Pod Identity) and [`creds::ImdsV2Provider`]. Tokens (web
+  identity JWT, container auth) arrive as injected [`creds::TokenSource`]
+  closures — no `std::fs`/`std::env` here. `creds_prod` (`prod`-gated) holds
+  the env-var provider and file/env token sources.
 - `xml` — a small, tolerant tag-scanning extractor for the four things this
   crate's responses need (`Contents/Key`, `Contents/Size`, `IsTruncated`,
   `NextContinuationToken`, and an `Error/Code`+`Message` body). **No XML
@@ -61,8 +73,19 @@ multipart upload — is `docs/roadmap.md` S-08.
   in-memory `Transport` implementor with real SigV4 signature verification
   (see its own doc). Available to a downstream crate's tests too, via the
   `fake` feature.
+- `fake::FaultyTransport<T>` (S-08 M3) — wraps any transport with a scripted
+  `FaultPlan` (`FnMut(request index, &HttpRequest) -> Fault`); faults: `Pass`,
+  `Status{status, code}` (S3 error body, not applied), `TransportError`,
+  `Timeout`, `ApplyThenError` (applied to the inner transport, response
+  replaced by a transport error — the lost-ack case). Used by
+  `animus-test`'s `s3_fault_corpus`.
 - `prod` (`#[cfg(feature = "prod")]`) — [`prod::HyperRustlsTransport`], the
   one real-socket/TLS `Transport`. One connection per request, no pooling.
+  **Timeouts (S-08 M3)**: `TransportTimeouts` (default 10 s connect = TCP +
+  TLS handshake, 60 s whole request — multipart parts are 16 MiB; set with
+  `with_timeouts`) via `tokio::time::timeout`, surfacing as the retryable
+  `TransportError::Timeout`. Real-socket test: `tests/transport_timeout.rs`
+  (a listener that accepts and never answers).
 
 ## Feature flags
 
@@ -87,18 +110,15 @@ multipart upload — is `docs/roadmap.md` S-08.
 
 ## Determinism posture
 
-This crate is **not** `animus-env`-seamed (no `Env`, no `SimEnv` story) —
-and that is deliberate for this PR, not an oversight to fix later. `sigv4`
+This crate is **not** `animus-env`-seamed (no `Env`) — deliberate: `sigv4`
 and `client::S3Client` are pure functions of their inputs (including
-`now_epoch_ms`, always a parameter); the only place real time, real
-sockets, or real randomness could enter is `prod::HyperRustlsTransport`,
-which does nothing this crate's own tests exercise. When PR 2 wraps this
-client in a `SegmentStore` impl, *that* wrapper is where `env.wall_now()`
-and `env.spawn_task`/`ProdEnv`'s real transport get threaded in — this
-crate stays exactly as pure as it is today. Don't add an `animus-env`
-dependency here "to save a parameter" in a future PR; that would reopen the
-seam violation ADR 0003 exists to prevent, one layer earlier than it needs
-to.
+`now_epoch_ms`, always a parameter), `creds` never reads a clock, and the
+only real time/sockets are in `prod::HyperRustlsTransport` (module-level
+justified allow; its timeouts are real-time by nature). The *seam* is one
+layer up: `animus_env::S3SegmentStore<T, E: Clock + Rng>` supplies
+`env.wall_now()`, `env.sleep()` and jitter, so retry behaviour is
+seed-reproducible under `SimEnv` (`FaultyTransport` + `s3_fault_corpus`).
+Don't add an `animus-env` dependency here "to save a parameter".
 
 ## Why no XML dependency
 
@@ -173,14 +193,74 @@ percent-decoding (safe by construction, since an already-encoded value's own
 string first and then splitting the result, which would reopen the
 identical bug on the verification side.
 
-## Path-style addressing only (this PR)
+## Addressing
 
-`client::S3Config` builds `scheme://host/{bucket}/{key}` — path-style,
-which is what makes an explicit `--endpoint`-style config work against
-MinIO/localstack (the ADR amendment's own stated goal). Virtual-hosted
-style (`bucket.host/key`) is a documented, unimplemented option for a later
-PR — not a real-AWS correctness gap (path-style still works against real
-S3 for a non-`us-east-1`-created bucket).
+Default is **path-style** (`scheme://host/{bucket}/{key}`) — what makes an
+explicit `--endpoint` config work against MinIO/RustFS/localstack.
+`S3Client::with_addressing(Addressing::VirtualHosted)` switches to
+`bucket.host/key` (the `Host` header and the SigV4-signed host both become
+`bucket.host`; the path is just the key; list is `GET /`). It is a client
+builder, **not** an `S3Config` field, so every existing `S3Config { .. }`
+struct literal keeps compiling. `validate_virtual_hosted` rejects an IP
+endpoint (no `bucket.1.2.3.4`) and a non-DNS-compatible bucket (3-63 chars
+`[a-z0-9-]`, alnum ends; dots rejected too — they break the wildcard TLS
+cert) with `S3Error::InvalidConfig`. `FakeS3` recovers the bucket from the
+first label of the `Host` header when it equals its bucket.
+
+## Credential providers (S-08 M1)
+
+- `S3Client` holds an `Arc<dyn CredentialProvider>`: `new(transport,
+  S3Config)` wraps `config.credentials` in a `StaticProvider`;
+  `with_provider(transport, S3Target, provider)` is the non-static entry.
+- **Wrap fetching providers in `CachingProvider`.** `Sts…`/`Container…`/
+  `Imds…` fetch on every call by design; the cache supplies refresh-at-
+  expiry-5min and single flight (a tiny hand-rolled async gate, so the pure
+  crate needs no runtime). A failed refresh inside the 5-minute window
+  serves the still-unexpired cached credentials.
+- **Expired-token retry**: an S3 error body coded `ExpiredToken`/
+  `ExpiredTokenException`/`InvalidToken`/`TokenRefreshRequired` makes the
+  client call `provider.refresh(&stale, now)` and retry the identical
+  request **once**; a second rejection is `S3Error::CredentialsExpired`.
+  `HEAD` errors carry no body, so an expired token on `HEAD` is not
+  detected (it surfaces as a plain status error) — known limitation.
+- Temporary credentials add `x-amz-security-token` as a **signed** header
+  (`sigv4::sign_request`); `Credentials` `Debug` redacts both secret and
+  token. Provider errors never embed a token or raw response body.
+- STS is called **unsigned** (the JWT is the authenticator); a test asserts
+  no `Authorization` header is sent. `FakeCredentialService` (fake.rs) is
+  the STS/ECS/IMDS double; `FakeS3::register_session_credential` makes S3
+  demand the token and answer `400 ExpiredToken` by the request's own
+  signed timestamp (the caller-supplied `now`).
+
+## Multipart and ranged GET (S-08 M2)
+
+- `S3Client::{create_multipart_upload, upload_part, complete_multipart_upload,
+  abort_multipart_upload, get_object_range}` all go through the same
+  `execute` path as every other call (path-style and virtual-hosted, session
+  tokens, ExpiredToken refresh-once). `upload_part` returns the `ETag`
+  header verbatim (quoted); `complete` sends parts in the order given.
+- **`CompleteMultipartUpload` can answer HTTP 200 with an `<Error>` body**
+  (S3 flushes headers, then fails assembly). `xml::parse_complete_multipart`
+  treats that — and any 200 that is not a `CompleteMultipartUploadResult` —
+  as a failure; `InternalError`/`SlowDown` inside a 200 surface as
+  `Service { status: 500 }` so a caller's 5xx retry applies.
+- `abort_multipart_upload` is idempotent (404 `NoSuchUpload` is `Ok`).
+- `get_object_range(key, start, len)` signs `range: bytes=a-b`, requires
+  `206` (a `200` means the server ignored the range and is refused), and a
+  range past the end is truncated by S3 (short final slice); `start` past
+  the end is `Service { status: 416, code: "InvalidRange" }`.
+- **Abandoned uploads**: a failed abort or a killed process leaves an
+  incomplete upload that is billed. Operators should set a bucket lifecycle
+  rule `AbortIncompleteMultipartUpload` (e.g. `DaysAfterInitiation: 1`).
+- `FakeS3` knobs: `with_min_part_size` (default `S3_MIN_PART_SIZE` = 5 MiB,
+  non-last parts below it fail `EntityTooSmall` at complete),
+  `open_upload_count()`, `request_log()` (`"METHOD uri"` of every
+  authenticated object request), `fail_upload_part(n, times)`,
+  `set_complete_error_in_200(code)`. It validates ascending part order
+  (`InvalidPartOrder`), part existence/ETag (`InvalidPart`), and answers
+  `206` + `Content-Range` / `416`. ETags are truncated SHA-256, not MD5.
+- Tests: `tests/it/multipart.rs`; the real-endpoint test has a multipart
+  (2x5 MiB + 1 MiB) and ranged-GET leg.
 
 ## Testing
 
@@ -244,7 +324,9 @@ S3 for a non-`us-east-1`-created bucket).
   - `ANIMUS_S3_TEST_ENDPOINT` — e.g. `http://127.0.0.1:9000`. **Unset ⇒ the
     test prints a skip line and returns immediately** (never `#[ignore]`d —
     `cargo test -p animus-s3 --all-features` always runs it, it just does
-    nothing without this variable).
+    nothing without this variable) — unless `ANIMUS_S3_REQUIRE_ENDPOINT=1`,
+    which makes the skip a panic (CI's `s3-real-endpoint` job sets it, so the
+    test can never pass vacuously there).
   - `ANIMUS_S3_TEST_BUCKET` — bucket name (must already exist).
   - `ANIMUS_S3_TEST_ACCESS_KEY_ID` / `ANIMUS_S3_TEST_SECRET_ACCESS_KEY` —
     credentials for that endpoint. **Never printed, never included in a
@@ -254,11 +336,14 @@ S3 for a non-`us-east-1`-created bucket).
     new_allow_insecure_http()` when `ANIMUS_S3_TEST_ENDPOINT` starts with
     `http://` (a real MinIO dev instance is commonly plaintext); anything
     else requires TLS.
-  - To actually run it: start a local MinIO (`docker run -p 9000:9000
-    minio/minio server /data`), create a bucket, then `ANIMUS_S3_TEST_ENDPOINT=
+  - To actually run it: start a local S3-compatible store (CI uses RustFS:
+    `docker run -p 9000:9000 -e RUSTFS_VOLUMES=/data -e RUSTFS_ADDRESS=0.0.0.0:9000
+    -e RUSTFS_ACCESS_KEY=... -e RUSTFS_SECRET_KEY=... rustfs/rustfs:1.0.0-rc.6`,
+    data dir writable by uid 10001; the `minio/minio` image no longer
+    resolves, #863), create a bucket, then `ANIMUS_S3_TEST_ENDPOINT=
     http://127.0.0.1:9000 ANIMUS_S3_TEST_BUCKET=test-bucket
-    ANIMUS_S3_TEST_ACCESS_KEY_ID=minioadmin
-    ANIMUS_S3_TEST_SECRET_ACCESS_KEY=minioadmin cargo test -p animus-s3
+    ANIMUS_S3_TEST_ACCESS_KEY_ID=<access key>
+    ANIMUS_S3_TEST_SECRET_ACCESS_KEY=<secret> cargo test -p animus-s3
     --features prod --test minio_real_endpoint -- --nocapture`.
 
 ## What's non-obvious
