@@ -269,3 +269,11 @@ ADR 0075).
   forever for that table. A node added later without the zone label is not
   eligible for spread-policy tables. Verified by the seed-reproducible
   `sim_cluster_zone_placement` corpus (`ANIMUS_ZONE_PLACEMENT_SEEDS`).
+
+## Amendment (2026-10-04) — region labels become load-bearing (ADR 0075)
+
+[ADR 0075](0075-global-tables.md) (global tables, Proposed) uses the
+`topology.kubernetes.io/region` label as the definition of a "region" for
+multi-region strongly consistent tables: one replica per region via
+`required_labels`/`SpreadPolicy` over the region key, plus a preferred-leader
+region in the placement policy. Labels are populated by roadmap G-01 stage G-a.

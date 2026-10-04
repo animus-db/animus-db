@@ -1933,3 +1933,11 @@ node with a region/zone and asserts the annotations and the registered member
 labels (it runs the operator out-of-cluster, so the RBAC itself is not
 exercised there). Cross-zone placement is proven by the `SimCluster` corpus,
 not by kind. The multi-region ADR is 0075.
+
+## Amendment (2026-10-04) — multi-cluster federation is scoped (ADR 0075)
+
+[ADR 0075](0075-global-tables.md) §5.4 scopes operator federation for global
+tables (roadmap G-01 stage G-e): additive `spec.region` and `spec.peers[]`
+(endpoints, peer TLS trust), peer-egress `NetworkPolicy`, no separate
+federating CRD in v1, one `AnimusCluster` per Kubernetes cluster. Proposed;
+not implemented. Topology spread (stage G-a) is separate.
