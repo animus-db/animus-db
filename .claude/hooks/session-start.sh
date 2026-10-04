@@ -7,10 +7,10 @@
 #      instruction instead of a mid-file bullet sessions read past — the
 #      maintainer was having to re-issue it by hand every session (see
 #      docs/engineering-lessons.md, Parallel-agent orchestration).
-#   2. Make `gh stack` available to Claude Code on the web. This repo ships
-#      larger work as a stacked PR series (see CLAUDE.md's Conventions). The
-#      tooling for that is github/gh-stack, a `gh` CLI extension, plus its
-#      agent skill — neither of which is present in a fresh web container.
+#   2. Make `gh stack` available to Claude Code on the web. New work ships as
+#      one bigger PR per workstream (CLAUDE.md, Session operating mode item 3);
+#      the tooling (github/gh-stack, a `gh` CLI extension, plus its
+#      agent skill) is kept for driving older stacks.
 #      Without them an agent hand-rolls the stack, which strands the top PR
 #      when the base merges first (issue #279; see
 #      docs/engineering-lessons.md).
@@ -32,9 +32,9 @@ full text in CLAUDE.md "Session operating mode"):
 2. Run subagents in the BACKGROUND. The main thread stays responsive to the
    maintainer throughout — brief progress notes while agents work, never a
    silent session blocked on a foreground agent.
-3. Deliver work as a gh-stack PR series whenever it has more than one
-   reviewable logical step; a single flat PR is the exception and its
-   description says why.
+3. Deliver each workstream as ONE bigger PR (a single branch off main, kept
+   current by merging main in) — no gh-stack PR series for new work
+   (maintainer decision 2026-10-04).
 4. Green is an invariant: main passes every test all the time and nothing
    merges on red. Flakiness is a bug — root-cause it, never retry/widen a
    timeout/ignore/quarantine. "Not my bug" is not a reason to discard a
