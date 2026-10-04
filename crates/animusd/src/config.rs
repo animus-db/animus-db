@@ -782,6 +782,26 @@ impl ClusterConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn overload_section_rejects_zero_and_unknown_fields_and_fills_defaults() {
+        let zero = OverloadSection {
+            max_connections: Some(0),
+            ..Default::default()
+        };
+        assert!(zero.validate().unwrap_err().contains("max_connections"));
+        assert!(
+            serde_json::from_str::<OverloadSection>(r#"{"max_conns": 1}"#).is_err(),
+            "a misspelled key must not silently mean the default"
+        );
+        let r = OverloadSection::resolve(Some(&OverloadSection {
+            max_inflight_requests: Some(7),
+            ..Default::default()
+        }));
+        assert_eq!(r.max_inflight_requests, 7);
+        assert_eq!(r.max_connections, DEFAULT_MAX_CONNECTIONS);
+        assert_eq!(OverloadSection::resolve(None), ResolvedLimits::default());
+    }
+
     use super::*;
 
     #[test]
