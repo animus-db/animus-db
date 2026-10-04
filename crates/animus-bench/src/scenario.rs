@@ -32,6 +32,9 @@ pub struct PhasePlan {
     pub sweep: Vec<f64>,
     pub connections: usize,
     pub op_timeout: Duration,
+    /// Grace after each phase window for queued ops to start; ops still
+    /// unstarted after it are `abandoned` (CLI `--drain-secs`, default 30 s).
+    pub drain_timeout: Duration,
 }
 
 impl PhasePlan {
@@ -39,6 +42,7 @@ impl PhasePlan {
         let mut s = PhaseSpec::new(name, duration, rate);
         s.connections = self.connections;
         s.op_timeout = self.op_timeout;
+        s.drain_timeout = self.drain_timeout;
         s
     }
 }
@@ -94,6 +98,7 @@ pub struct DegradedPlan {
     pub restart: bool,
     pub connections: usize,
     pub op_timeout: Duration,
+    pub drain_timeout: Duration,
 }
 
 /// Run the degraded sequence. The fault fires at the very start of the
@@ -113,6 +118,7 @@ where
         let mut s = PhaseSpec::new(name, d, plan.rate);
         s.connections = plan.connections;
         s.op_timeout = plan.op_timeout;
+        s.drain_timeout = plan.drain_timeout;
         s
     };
     let mut phases = Vec::new();
@@ -195,7 +201,10 @@ pub enum DegradedKind {
     Leader,
     /// A node hosting a non-leader replica of it.
     Follower,
-    /// A specific node index.
+    /// A specific node index (`node:N`), whatever it hosts: it may be the
+    /// tablet's leader, a follower, or a node holding no replica of the
+    /// table at all. Distinct from [`Self::Follower`], which resolves to a
+    /// node that is verifiably a non-leader replica.
     Node(usize),
 }
 
@@ -266,12 +275,24 @@ fn params_of(cfg: &YcsbConfig, kind: WorkloadKind, table: &str, cr: bool) -> ser
         "steady_secs": cfg.plan.steady.as_secs_f64(),
         "connections": cfg.plan.connections,
         "op_timeout_secs": cfg.plan.op_timeout.as_secs_f64(),
+        "drain_secs": cfg.plan.drain_timeout.as_secs_f64(),
+        "table_state": "this measurement ran on a table freshly created and loaded for it alone (never one a previous read mode or workload already mutated or warmed)",
         "key_layout": "pk S=user<10-digit idx/100>, sk N=idx%100; item {pk,sk,version:N,data:S(value_bytes)}; E scans = Query pk=:p AND sk>=:s Limit=len, within one partition",
     })
 }
 
-/// Run every configured workload (each on its own freshly created and
-/// loaded table, once per read mode), then the optional degraded run.
+/// The table one `(workload, read mode)` measurement runs on.
+#[must_use]
+pub fn table_name(prefix: &str, kind: WorkloadKind, consistent_read: bool) -> String {
+    format!(
+        "{prefix}_{}_{}",
+        kind.name().to_lowercase(),
+        if consistent_read { "cr" } else { "ev" }
+    )
+}
+
+/// Run every configured workload — each `(workload, read mode)` on its own
+/// freshly created and loaded table — then the optional degraded run.
 ///
 /// # Errors
 /// If table creation or the load fails (a bench that cannot set up measures
@@ -283,19 +304,23 @@ pub async fn run_ycsb(
 ) -> Result<Vec<RunResult>, String> {
     let mut runs = Vec::new();
     for &kind in &cfg.workloads {
-        let table = format!("{}_{}", cfg.table_prefix, kind.name().to_lowercase());
-        ycsb::create_table(cluster, &table, cfg.setup_timeout).await?;
-        let load = ycsb::load_table(
-            cluster,
-            &table,
-            cfg.record_count,
-            cfg.value_bytes,
-            cfg.load_parallelism,
-            cfg.setup_timeout,
-        )
-        .await?;
-        let placement = envinfo::capture_topology(cluster, Some(&table)).await["table"].clone();
-        for (n, cr) in cfg.read_modes.list().into_iter().enumerate() {
+        // Each read mode gets its own freshly created and loaded table, so
+        // the second mode never measures a table the first already mutated
+        // (updates, inserts), compacted or warmed. The op stream is the
+        // same seeded one for both.
+        for cr in cfg.read_modes.list() {
+            let table = table_name(&cfg.table_prefix, kind, cr);
+            ycsb::create_table(cluster, &table, cfg.setup_timeout).await?;
+            let load = ycsb::load_table(
+                cluster,
+                &table,
+                cfg.record_count,
+                cfg.value_bytes,
+                cfg.load_parallelism,
+                cfg.setup_timeout,
+            )
+            .await?;
+            let placement = envinfo::capture_topology(cluster, Some(&table)).await["table"].clone();
             let mut source = OpStream::new(spec_of(cfg, kind), cfg.seed);
             let exec = Arc::new(YcsbExecutor {
                 table: table.clone(),
@@ -306,14 +331,13 @@ pub async fn run_ycsb(
             runs.push(RunResult {
                 name: format!("ycsb-{}/consistent_read={cr}", kind.name()),
                 params: with_placement(params_of(cfg, kind, &table, cr), &placement),
-                // The load happened once per table; attach it to the first run.
-                load: (n == 0).then(|| load.clone()),
+                load: Some(load),
                 phases,
                 sweep,
             });
-        }
-        if !cfg.keep_tables {
-            ycsb::drop_table(cluster, &table).await;
+            if !cfg.keep_tables {
+                ycsb::drop_table(cluster, &table).await;
+            }
         }
     }
     if let Some(d) = &cfg.degraded {
@@ -333,6 +357,15 @@ async fn run_ycsb_degraded(
         cfg.table_prefix,
         d.workload.name().to_lowercase()
     );
+    if let DegradedKind::Node(n) = &d.kind
+        && *n >= cluster.nodes().len()
+    {
+        return Err(format!(
+            "--degraded node:{n}: the cluster has {} nodes (indices 0..{})",
+            cluster.nodes().len(),
+            cluster.nodes().len()
+        ));
+    }
     ycsb::create_table(cluster, &table, cfg.setup_timeout).await?;
     let load = ycsb::load_table(
         cluster,
@@ -362,6 +395,7 @@ async fn run_ycsb_degraded(
         restart: d.restart,
         connections: cfg.plan.connections,
         op_timeout: cfg.plan.op_timeout,
+        drain_timeout: cfg.plan.drain_timeout,
     };
     let mut source = OpStream::new(spec_of(cfg, d.workload), cfg.seed);
     let exec = Arc::new(YcsbExecutor {
@@ -396,4 +430,27 @@ async fn run_ycsb_degraded(
         phases,
         sweep: Vec::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_workload_and_read_mode_gets_its_own_table() {
+        let names: Vec<String> = [WorkloadKind::A, WorkloadKind::B]
+            .into_iter()
+            .flat_map(|k| [true, false].map(|cr| table_name("ycsb1", k, cr)))
+            .collect();
+        let uniq: std::collections::BTreeSet<_> = names.iter().collect();
+        assert_eq!(uniq.len(), names.len(), "{names:?}");
+        assert_eq!(table_name("p", WorkloadKind::A, true), "p_a_cr");
+        assert_eq!(table_name("p", WorkloadKind::A, false), "p_a_ev");
+    }
+
+    #[test]
+    fn read_modes_expand_in_order() {
+        assert_eq!(ReadModes::Both.list(), vec![true, false]);
+        assert_eq!(ReadModes::Eventual.list(), vec![false]);
+    }
 }

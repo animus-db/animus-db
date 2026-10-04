@@ -15,6 +15,53 @@ use crate::ycsb::LoadResult;
 /// breaking change to this document's shape.
 pub const SCHEMA: &str = "animus-bench/v1";
 
+/// Whether a report *could* back a published number, and why not.
+///
+/// **Necessary, not sufficient** (ADR 0074 §8): `true` means only that the
+/// conditions the tool can check hold — servers off the generator's host and
+/// not on loopback, and a degraded run that actually injected its fault is in
+/// the report. It does not check instance types, disk, network, replication
+/// factor or anything else a publication also requires. `false` lists every
+/// unmet condition.
+#[must_use]
+pub fn publishability(
+    launched_here: bool,
+    all_loopback: bool,
+    runs: &[RunResult],
+) -> (bool, Option<String>) {
+    let mut why = Vec::new();
+    if launched_here {
+        why.push(
+            "client and server colocated: the bench launched the cluster on this host, so the load generator and the servers compete for the same CPUs, disk and loopback",
+        );
+    } else if all_loopback {
+        why.push(
+            "every endpoint is loopback, so client and server share this host; publishable runs need a separate client host",
+        );
+    }
+    let degraded_ok = runs.iter().any(|r| {
+        r.phases
+            .iter()
+            .any(|p| p.name == "degraded" && p.fault.as_ref().is_some_and(|f| f.ok))
+    });
+    if !degraded_ok {
+        why.push(
+            "no degraded run with a successfully injected fault is in the report (a publishable result must include the leader-kill run)",
+        );
+    }
+    if why.is_empty() {
+        (true, None)
+    } else {
+        (
+            false,
+            Some(format!(
+                "{}; development/smoke numbers only",
+                why.join("; ")
+            )),
+        )
+    }
+}
+
 /// One row of a throughput sweep: enough to plot latency vs. throughput and
 /// find the knee.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -306,6 +353,38 @@ mod tests {
         let back = Report::from_json(&r.to_json()).unwrap();
         assert_eq!(back, r);
         assert!(back.render_text().contains("NOT PUBLISHABLE"));
+    }
+
+    fn degraded_run(fault_ok: bool) -> RunResult {
+        RunResult {
+            phases: vec![PhaseResult {
+                name: "degraded".into(),
+                fault: Some(crate::cluster::FaultRecord {
+                    ok: fault_ok,
+                    ..Default::default()
+                }),
+                ..PhaseResult::default()
+            }],
+            ..RunResult::default()
+        }
+    }
+
+    #[test]
+    fn publishable_needs_remote_endpoints_and_a_degraded_run() {
+        let (ok, why) = publishability(false, false, &[degraded_run(true)]);
+        assert!(ok && why.is_none());
+        // Launched here + no degraded run: both reasons listed.
+        let (ok, why) = publishability(true, true, &[]);
+        let why = why.unwrap();
+        assert!(!ok);
+        assert!(why.contains("bench launched the cluster") && why.contains("no degraded run"));
+        // External but loopback.
+        let (ok, why) = publishability(false, true, &[degraded_run(true)]);
+        assert!(!ok && why.unwrap().contains("loopback"));
+        // Remote but no degraded run / a fault that failed.
+        assert!(!publishability(false, false, &[]).0);
+        let (ok, why) = publishability(false, false, &[degraded_run(false)]);
+        assert!(!ok && why.unwrap().contains("degraded"));
     }
 
     #[test]

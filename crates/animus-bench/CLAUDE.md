@@ -61,7 +61,10 @@ to this crate's.**
   zipfian-distance-from-newest, inserts sequential new keys.
 - **`ConsistentRead`**: every workload runs once per `--consistent-read` mode
   (default `both`), as separate `RunResult`s with the same seed so the op
-  stream is identical across modes. Reads that find nothing are counted as
+  stream is identical across modes. **Each mode gets its own freshly created
+  and loaded table** (`scenario::table_name`: `<prefix>_<w>_cr` / `_ev`), so
+  the second mode never measures a table the first mutated or warmed;
+  `params.table_state` says so. Reads that find nothing are counted as
   `empty_reads` (legitimate under `false`).
 - **Launch modes (`cluster.rs`)**: `external` (`--nodes D@A,...`; the
   publishable shape), `processes` (spawns real `animusd --config FILE --node I
@@ -72,12 +75,22 @@ to this crate's.**
   credential (`dynamo_auth` is put in the generated config) so SigV4 is always
   exercised. **Any bench-launched cluster, or an all-loopback external one, is
   `client_and_server_colocated: true` ⇒ `publishable: false` with a reason.**
+  `publishable` (`report::publishability`) is true only if the servers are
+  off-host (not bench-launched, not all-loopback) **and** a `degraded` phase
+  whose fault was injected (`fault.ok`) is in the report; the reason lists
+  every unmet condition. Necessary, not sufficient (instance types, RF,
+  disk/network disclosure are the publisher's checklist, ADR 0074 §8).
 - **Degraded run**: one, last, on a fresh table (it damages the cluster):
   warm-up → baseline (healthy, the comparison) → degraded (fault fires at the
   phase's start) → recovery (killed node restarted at its start when the
   cluster supports it: `processes`, or `--restart-cmd`). Victim = the
   tablet's leader (`/admin/status` finds the table's first tablet, each node's
-  `/admin/raftkv` `is_leader` finds the node), a follower, or `node:N`. For an
+  `/admin/raftkv` `is_leader` finds the node), a follower (a node hosting a
+  verifiably non-leader replica), or `node:N` (index N, whatever it hosts —
+  may be the leader or hold no replica; out-of-range is an error). A bare
+  `--degraded node` is rejected (it used to silently mean follower).
+  `--drain-secs` (default 30) is the post-phase grace after which unstarted
+  ops are `abandoned`; recorded in `params.drain_secs`. For an
   external cluster the fault is a `--kill-cmd` `sh -c` template (`{node}`,
   `{host}`, `{dynamo}`, `{admin}`); with none, the degraded run is skipped and
   a `notes` entry says so.

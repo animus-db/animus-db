@@ -173,8 +173,18 @@ async fn every_workload_speaks_the_wire_in_both_read_modes_then_survives_a_follo
                 >= 1
         );
     }
-    // Each table was loaded once and the load is reported.
-    assert_eq!(report.runs.iter().filter(|r| r.load.is_some()).count(), 6);
+    // Each (workload, read mode) ran on its own freshly loaded table, and
+    // every run reports its load.
+    assert_eq!(report.runs.iter().filter(|r| r.load.is_some()).count(), 12);
+    let tables: std::collections::BTreeSet<_> = report
+        .runs
+        .iter()
+        .map(|r| r.params["table"].as_str().expect("table").to_owned())
+        .collect();
+    assert_eq!(tables.len(), 12, "tables must not be shared across modes");
+    for r in &report.runs {
+        assert_eq!(r.params["drain_secs"], 30.0);
+    }
     // The text summary renders the disclosure.
     let text = report.render_text();
     assert!(text.contains("NOT PUBLISHABLE") && text.contains("ycsb-F/consistent_read=false"));

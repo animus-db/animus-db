@@ -12,7 +12,7 @@ use crate::client::Credentials;
 use crate::cluster::{Cluster, NodeEndpoints};
 use crate::dist::Distribution;
 use crate::envinfo::{self, HostInfo};
-use crate::report::{Environment, Report, SCHEMA};
+use crate::report::{Environment, Report, SCHEMA, publishability};
 use crate::rt::{self, Clock};
 use crate::scenario::{DegradedConfig, DegradedKind, PhasePlan, ReadModes, YcsbConfig, run_ycsb};
 use crate::workload::WorkloadKind;
@@ -48,8 +48,12 @@ load shape:
   --steady-secs S             measured steady phase / each sweep point (default 30)
   --connections N             client connections (default 64)
   --op-timeout-secs S         per-operation timeout (default 10)
+  --drain-secs S              grace after each phase for queued ops to start; unstarted ops are
+                              reported as `abandoned` (default 30)
 degraded run (one, last, on a fresh table):
   --degraded none|leader|follower|node:N   (default leader when a kill mechanism exists, else none)
+                              leader = the node leading the table's first tablet; follower = a node
+                              hosting a non-leader replica of it; node:N = node index N, whatever it hosts
   --degraded-workload A       (default: first --workloads)
   --degraded-consistent-read true|false   (default true)
   --baseline-secs S --degraded-secs S --recovery-secs S   (default 15 / 20 / 20)
@@ -138,6 +142,7 @@ pub fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut sweep: Vec<f64> = Vec::new();
     let (mut warmup, mut steady) = (Duration::from_secs(10), Duration::from_secs(30));
     let (mut connections, mut op_timeout) = (64usize, Duration::from_secs(10));
+    let mut drain = Duration::from_secs(30);
     let mut degraded_arg: Option<String> = None;
     let mut degraded_workload: Option<WorkloadKind> = None;
     let mut degraded_cr = true;
@@ -204,6 +209,7 @@ pub fn parse_args(args: &[String]) -> Result<Options, String> {
             "--steady-secs" => steady = secs(&val(flag)?, flag)?,
             "--connections" => connections = num(&val(flag)?, flag)?,
             "--op-timeout-secs" => op_timeout = secs(&val(flag)?, flag)?,
+            "--drain-secs" => drain = secs(&val(flag)?, flag)?,
             "--degraded" => degraded_arg = Some(val(flag)?),
             "--degraded-workload" => degraded_workload = Some(WorkloadKind::parse(&val(flag)?)?),
             "--degraded-consistent-read" => degraded_cr = num(&val(flag)?, flag)?,
@@ -250,8 +256,14 @@ pub fn parse_args(args: &[String]) -> Result<Options, String> {
         None => can_kill.then_some(DegradedKind::Leader),
         Some("none") => None,
         Some("leader") => Some(DegradedKind::Leader),
-        Some("follower" | "node") => Some(DegradedKind::Follower),
+        Some("follower") => Some(DegradedKind::Follower),
         Some(s) if s.starts_with("node:") => Some(DegradedKind::Node(num(&s[5..], "--degraded")?)),
+        Some("node") => {
+            return Err(
+                "--degraded node needs an index (node:N); use `follower` to kill a non-leader replica"
+                    .into(),
+            );
+        }
         Some(o) => {
             return Err(format!(
                 "--degraded wants none|leader|follower|node:N, got `{o}`"
@@ -288,6 +300,7 @@ pub fn parse_args(args: &[String]) -> Result<Options, String> {
                 sweep,
                 connections,
                 op_timeout,
+                drain_timeout: drain,
             },
             seed,
             table_prefix,
@@ -392,13 +405,7 @@ async fn run_with_cluster(
     let loopback = cluster.nodes().iter().all(|n| n.dynamo.ip().is_loopback());
     let colocated = cluster.launched_here() || loopback;
     let (git_sha, git_dirty) = envinfo::git_state();
-    let reason = colocated.then(|| {
-        if cluster.launched_here() {
-            "client and server colocated: the bench launched the cluster on this host, so the load generator and the servers compete for the same CPUs, disk and loopback; development/smoke numbers only".to_owned()
-        } else {
-            "every endpoint is loopback, so client and server share this host; publishable runs need a separate client host".to_owned()
-        }
-    });
+    let (publishable, reason) = publishability(cluster.launched_here(), loopback, &runs);
     Ok(Report {
         schema: SCHEMA.to_owned(),
         generated_at_epoch_secs: rt::wall_epoch_secs(),
@@ -407,7 +414,7 @@ async fn run_with_cluster(
         git_dirty,
         args: argv,
         seed: cfg.seed,
-        publishable: !colocated,
+        publishable,
         publishable_reason: reason,
         environment: Environment {
             client_host: HostInfo::capture(),
@@ -441,4 +448,37 @@ fn methodology() -> serde_json::Value {
         "retries": "none: the generator never retries a failed operation",
         "comparison": "no comparison against any other database is made or implied",
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(a: &[&str]) -> Result<Options, String> {
+        let v: Vec<String> = a.iter().map(|s| (*s).to_owned()).collect();
+        parse_args(&v)
+    }
+
+    #[test]
+    fn degraded_victims_are_distinct_and_bare_node_is_rejected() {
+        let kind = |d: &str| {
+            parse(&["--launch", "processes", "--degraded", d])
+                .map(|o| o.ycsb.degraded.map(|c| c.kind))
+        };
+        assert!(matches!(kind("follower"), Ok(Some(DegradedKind::Follower))));
+        assert!(matches!(kind("node:2"), Ok(Some(DegradedKind::Node(2)))));
+        assert!(matches!(kind("leader"), Ok(Some(DegradedKind::Leader))));
+        assert!(matches!(kind("none"), Ok(None)));
+        assert!(kind("node").unwrap_err().contains("node:N"));
+        assert!(kind("node:x").is_err());
+    }
+
+    #[test]
+    fn drain_grace_defaults_to_30s_and_is_a_flag() {
+        let d = parse(&["--launch", "processes"]).unwrap();
+        assert_eq!(d.ycsb.plan.drain_timeout, Duration::from_secs(30));
+        let d = parse(&["--launch", "processes", "--drain-secs", "2.5"]).unwrap();
+        assert_eq!(d.ycsb.plan.drain_timeout, Duration::from_millis(2500));
+        assert!(parse(&["--launch", "processes", "--drain-secs", "-1"]).is_err());
+    }
 }
