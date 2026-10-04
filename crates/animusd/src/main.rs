@@ -268,6 +268,13 @@ use animusd::{ClusterConfig, RoleAddrs};
 #[tokio::main]
 async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `--version`/`-V` (docs/release.md): the build's SemVer string, handled
+    // before tracing init so it has no side effects. Matches only as the sole
+    // argument, never as a value of another flag.
+    if matches!(args.as_slice(), [a] if a == "--version" || a == "-V") {
+        println!("animusd {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
     let tracer_provider = animusd::otel::init_tracing(&otel_instance_label(&args));
 
     let result = match args.first().map(String::as_str) {

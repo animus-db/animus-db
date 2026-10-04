@@ -1922,7 +1922,11 @@ outstanding on the wire surface at present.
     matrix (OS, kernel, filesystem — ext4/xfs and fsync semantics —
     architectures, Kubernetes versions via the `kind` matrix), a
     `SECURITY.md` with a disclosure process, and a deprecation policy for
-    wire/format changes.
+    wire/format changes. **Mechanism landed** (`docs/release.md`,
+    `CHANGELOG.md` + `cliff.toml`, `SECURITY.md`, `.github/workflows/
+    release.yml`, multi-arch signed `image.yml`, `animusd --version`, the
+    `e2e-kind-k8s-compat` job); unvalidated until the first real `v*` tag
+    push, and third-party actions are still pinned by major tag, not SHA.
 - **Reuse:** `animus-test` oracles and `History`; `corpus-deep.yml`;
   `scripts/e2e-kind.sh`; golden fixtures as fuzz seeds; `cargo deny`;
   metrics seam (ADR 0015); the operator's admin-port drain sequence.
