@@ -899,6 +899,26 @@ impl<E: Env> RaftNode<E> {
         self.own_version.lock().expect("own version poisoned").range = range;
     }
 
+    /// Test-only (ADR 0073 P2-D): play `profile` atomically — own range, build
+    /// and the capped decode — so a profile is never half-applied. Returns the
+    /// rejection log (the delivery assertion's observable). Inert for a node
+    /// that never calls it.
+    #[cfg(any(test, feature = "sim-versions"))]
+    pub fn set_binary_profile(
+        &self,
+        profile: crate::sim_versions::BinaryProfile,
+    ) -> crate::sim_versions::CapLog {
+        let log = crate::sim_versions::CapLog::default();
+        let mut own = self.own_version.lock().expect("own version poisoned");
+        own.range = profile.own_range();
+        own.build = profile.build();
+        own.sim_cap = Some(crate::sim_versions::SimCap {
+            profile,
+            log: log.clone(),
+        });
+        log
+    }
+
     /// Set the build string this node's own version record carries (display
     /// only). Defaults to this crate's package version.
     pub fn set_own_build(&self, build: impl Into<String>) {
@@ -1533,7 +1553,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
         shadow,
         watermark,
         era_watch,
-        own_version,
+        Arc::clone(&own_version),
         halt_reason,
     ));
 
@@ -1617,6 +1637,23 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
                                 .lock()
                                 .expect("detector poisoned")
                                 .observe(node, env.now());
+                            (Vec::new(), None)
+                        }
+                        // ADR 0073 P2-D (test-only, inert unless a profile is
+                        // installed): an older simulated binary drops what the real
+                        // one could not decode, via the SAME branch as the `Err` arm.
+                        #[cfg(any(test, feature = "sim-versions"))]
+                        Ok(ref msg)
+                            if own_version
+                                .lock()
+                                .expect("own version poisoned")
+                                .sim_cap
+                                .as_ref()
+                                .is_some_and(|c| {
+                                    c.rejects(&envelope.from, &env.node_id(), env.now(), msg)
+                                }) =>
+                        {
+                            tracing::warn!("undecodable raft message dropped (sim cap)");
                             (Vec::new(), None)
                         }
                         Ok(msg) => {

@@ -21636,6 +21636,11 @@ mod sim_cluster_cp_route_fanout;
 mod sim_cluster_dynamo_throttle;
 #[cfg(test)]
 mod sim_cluster_lsm;
+/// ADR 0073 Phase 2, P2-D: the mixed-version (rolling Phase 1 -> B2) corpus over
+/// `SimCluster`. Run via `cargo test -p animusd --lib sim_cluster_mixed_version`;
+/// depth knob `ANIMUS_UPGRADE_SEEDS`. See that module's doc.
+#[cfg(test)]
+mod sim_cluster_mixed_version_corpus;
 /// ADR 0065's own `SimEnv`-driven, virtual-time-only throttle-enforcement
 /// coverage, over the real `SimCluster` fixture — a sibling of
 /// `sim_cluster_corpus`, for the identical reason (needs `SimCluster`'s own
