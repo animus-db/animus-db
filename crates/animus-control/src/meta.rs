@@ -6208,6 +6208,69 @@ impl crate::raft::StateMachine<MetaCommand> for Metadata {
     }
 }
 
+/// ADR 0073 Phase 2 (P2-B): the gate each `MetaCommand` needs before it may be
+/// proposed. **Exhaustive, no `_` arm**: a new variant does not compile until
+/// it names its gate. Every variant that exists at cluster version 1 is
+/// [`Gate::Base`]; the two era-only commands are [`Gate::Era`] (a Phase 1
+/// voter cannot decode them).
+impl crate::version::GatedCommand for MetaCommand {
+    fn required_gate(&self) -> crate::version::Gate {
+        use crate::version::Gate;
+        match self {
+            MetaCommand::NoOp
+            | MetaCommand::UpsertMember { .. }
+            | MetaCommand::CreateTablet { .. }
+            | MetaCommand::CasTabletReplicas { .. }
+            | MetaCommand::BeginSplitInPlace { .. }
+            | MetaCommand::CutoverSplit { .. }
+            | MetaCommand::MarkSplitPlacingDone { .. }
+            | MetaCommand::RetargetSplitPlacing { .. }
+            | MetaCommand::SetTabletPolicy { .. }
+            | MetaCommand::CreateTableSchema { .. }
+            | MetaCommand::DropTableSchema { .. }
+            | MetaCommand::ReplaceTableSchema { .. }
+            | MetaCommand::DropTableTablets { .. }
+            | MetaCommand::CreateTableIndex { .. }
+            | MetaCommand::DropTableIndex { .. }
+            | MetaCommand::SetIndexStatus { .. }
+            | MetaCommand::MarkIndexBackfilled { .. }
+            | MetaCommand::SetTableStream { .. }
+            | MetaCommand::SetTableTtl { .. }
+            | MetaCommand::SetTableThroughput { .. }
+            | MetaCommand::TagResource { .. }
+            | MetaCommand::UntagResource { .. }
+            | MetaCommand::UpdateContinuousBackups { .. }
+            | MetaCommand::SealStreamShard { .. }
+            | MetaCommand::ExpireStreamShards { .. }
+            | MetaCommand::SealPitrSegment { .. }
+            | MetaCommand::ExpirePitrSegments { .. }
+            | MetaCommand::RegisterNodeAddrs { .. }
+            | MetaCommand::RemoveMember { .. }
+            | MetaCommand::RegisterNode { .. }
+            | MetaCommand::BeginBackup { .. }
+            | MetaCommand::RecordBackupTabletComplete { .. }
+            | MetaCommand::CompleteBackup { .. }
+            | MetaCommand::FailBackup { .. }
+            | MetaCommand::DeleteBackup { .. }
+            | MetaCommand::MarkBackupDeleted { .. }
+            | MetaCommand::BeginExport { .. }
+            | MetaCommand::CompleteExport { .. }
+            | MetaCommand::FailExport { .. }
+            | MetaCommand::BeginRestore { .. }
+            | MetaCommand::CompleteRestore { .. }
+            | MetaCommand::FailRestore { .. }
+            | MetaCommand::BeginImport { .. }
+            | MetaCommand::CompleteImport { .. }
+            | MetaCommand::FailImport { .. }
+            | MetaCommand::PutCredential { .. }
+            | MetaCommand::RotateCredential { .. }
+            | MetaCommand::RevokeCredential { .. } => Gate::Base,
+            MetaCommand::ReportNodeVersion { .. } | MetaCommand::FinalizeClusterVersion { .. } => {
+                Gate::Era
+            }
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
