@@ -67,6 +67,7 @@ fn fake_export_store_factory(fake: Arc<FakeS3>) -> ExportStoreFactory {
             transport,
             config,
             prefix.map(str::to_owned),
+            animus_env::ProdClockRng::new(),
         ));
         Ok(store)
     })
@@ -306,7 +307,8 @@ async fn get_object(fake: &Arc<FakeS3>, key: &str) -> Option<Vec<u8>> {
         region: FAKE_REGION.to_string(),
         credentials: Credentials::new(FAKE_ACCESS_KEY, FAKE_SECRET),
     };
-    let store = animus_env::S3SegmentStore::new(transport, config, None);
+    let store =
+        animus_env::S3SegmentStore::new(transport, config, None, animus_env::ProdClockRng::new());
     store.get(key).await.expect("get object")
 }
 

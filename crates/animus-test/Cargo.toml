@@ -31,7 +31,10 @@ serde_json.workspace = true
 # `legacy-encoders` (ADR 0073 "Legacy encoders are test-only"): the test-only
 # `legacy::vN::encode` functions the transcode table calls. Enabled here, on
 # dev-dependency entries only, so no production build ever compiles them.
-animus-env = { workspace = true, features = ["legacy-encoders"] }
+animus-env = { workspace = true, features = ["legacy-encoders", "s3"] }
+# S-08 M3: `s3_fault_corpus` drives `S3SegmentStore<FaultyTransport<FakeS3>, SimEnv>`.
+# No `prod` anywhere here: the `s3` feature needs no tokio.
+animus-s3 = { workspace = true, features = ["fake"] }
 animus-control = { workspace = true, features = ["legacy-encoders", "sim-versions"] }
 animus-cp-data = { workspace = true, features = ["legacy-encoders"] }
 animus-dynamo.workspace = true

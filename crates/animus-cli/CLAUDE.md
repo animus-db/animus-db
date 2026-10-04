@@ -49,12 +49,17 @@ wrapper `maybe_tls_connect` returns, so `write_frame`/`read_frame`/
 `read`/`write_all` all work unchanged) and `tls::server_name_for` (the
 identical `ServerName` derivation `animus-env`'s own internal wire and
 `animusd`'s intra dialer use) — this crate never constructs a `ProdEnv`
-itself. **`maybe_tls_connect` also runs this build's half of the
-client-protocol handshake preamble (ADR 0073 Phase 0, workstream D,
-layer 3)** — `animus_env::exchange_preamble` against `animus_env::
+itself. **Two dial helpers, deliberately split.** `dial` is the bare
+(optionally TLS) connect; `maybe_tls_connect` = `dial` + this build's half
+of the client-protocol handshake preamble (ADR 0073 Phase 0, workstream D,
+layer 3) — `animus_env::exchange_preamble` against `animus_env::
 CLIENT_PROTOCOL`, the identical shared implementation `animusd`'s own
-`connect_client`/accept path use — right after the (optional) TLS
-handshake and before returning the stream to `run`/`run_admin`; a
+`connect_client`/accept path use. **Only the client port (`status`/`put`/
+`get`) uses `maybe_tls_connect`. `http_call` (every admin-port call) must
+use `dial`: the admin listener is plain HTTP and never answers a preamble,
+so running one made every `animus admin ...` fail with `client handshake
+... TimedOut`.** `http_call` also treats a rustls `UnexpectedEof` on read
+as end-of-stream (the admin server closes without `close_notify`). A
 mismatch or timeout is a plain `Err(String)`, the same shape a TLS or
 connect failure already surfaces as. A missing/invalid `--tls-ca` file, a
 TLS handshake failure, or a client-protocol handshake failure is a
@@ -401,7 +406,16 @@ control-grow <leader-admin-addr> <node-id> <admin-addr> [<node-id> <admin-addr>.
 
 ## Tests
 
-The client path (`status`/`put`/`get`) and the admin surface's actual HTTP
+`tests/admin_real_listener.rs` runs the real `animus` binary
+(`CARGO_BIN_EXE_animus`) against a real in-process `animusd` admin listener
+(`ProdEnv`, real loopback socket), plain and server-only TLS, converged-or-
+deadline polled — the regression net for the admin dial/preamble bug
+(`docs/lessons/testing/2026-10-04-cli-admin-path-never-ran-against-real-admin-listener.md`).
+Any change to `dial`/`maybe_tls_connect`/`http_call` must keep it green.
+It resolves the binary through `animus_bin()` (runtime `NEXTEST_BIN_EXE_animus`, falling back to compile-time `CARGO_BIN_EXE_animus`): CI runs nextest archives on another runner, where the compile-time path does not exist (`docs/lessons/testing/2026-10-04-cargo-bin-exe-is-compile-time-archived-nextest.md`). Any new test spawning a workspace binary must do the same.
+(This crate may host such tests because it depends on `animusd`; the reverse
+is not possible.) The older note that follows predates it: the client path
+(`status`/`put`/`get`) and the rest of the admin surface's HTTP
 behavior have no tests of their own here; they're covered end-to-end by
 `animusd`'s `tests/cluster.rs`, and by `animusd`'s admin/decommission tests
 (`tests/decommission.rs` among others). `main.rs` does carry a `#[cfg(test)]`

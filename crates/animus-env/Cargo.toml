@@ -27,14 +27,18 @@ legacy-encoders = []
 # `#[doc(hidden)]` decoder entry points for the `fuzz/` cargo-fuzz project (roadmap
 # R-01 (c)). Off by default; never enabled by a production build.
 fuzzing = []
+# `s3_store.rs`'s `S3SegmentStore<T, E: Clock + Rng>` (S-04/S-08): needs only
+# `animus-s3`'s pure client, no tokio and no `ProdEnv`, so a `SimEnv` test
+# crate can build it over `FakeS3` (S-08 M3). `prod` implies it.
+s3 = ["dep:animus-s3"]
 prod = [
+    "s3",
     "dep:tokio",
     "dep:rand",
     "dep:tracing",
     "dep:rustls",
     "dep:tokio-rustls",
     "dep:rustls-pki-types",
-    "dep:animus-s3",
     "dep:socket2",
     "dep:futures",
 ]

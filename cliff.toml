@@ -1,0 +1,69 @@
+# git-cliff configuration (https://git-cliff.org). Generates the per-release
+# section of CHANGELOG.md in Keep a Changelog format. See docs/release.md.
+#
+#   git cliff --unreleased --tag vX.Y.Z --prepend CHANGELOG.md   # at release time
+#   git cliff --latest --strip header                            # release notes (release.yml)
+#
+# The repository's history mixes Conventional Commits (`feat(scope):`,
+# `fix(scope):`, `docs:`, `ci:`, `build:`, `test:`) with plain imperative
+# subjects ("Fix colliding reserved streams ...") and GitHub merge commits.
+# Merge commits are dropped; plain subjects that start with Fix/Add are mapped
+# by the second parser block; every other plain subject is listed under
+# "Changed" so nothing user-visible is silently lost. docs/test/ci/build/chore
+# commits are omitted from release notes (they remain in git history).
+
+[changelog]
+header = """
+# Changelog
+
+All notable changes to AnimusDB are documented in this file. The format is
+based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
+binary's version follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
+as described in [docs/release.md](docs/release.md). On-disk and wire format
+versions (ADR 0073) are versioned separately.
+
+"""
+body = """
+{% if version -%}
+## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else -%}
+## [Unreleased]
+{% endif -%}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim | upper_first }}
+{% for commit in commits %}
+- {% if commit.scope %}**{{ commit.scope }}:** {% endif %}\
+  {% if commit.breaking %}**BREAKING** {% endif %}\
+  {{ commit.message | upper_first }} ([{{ commit.id | truncate(length=8, end="") }}])
+{%- endfor %}
+{% endfor %}\n
+"""
+footer = ""
+trim = true
+
+[git]
+conventional_commits = true
+filter_unconventional = false
+split_commits = false
+protect_breaking_commits = true
+filter_commits = false
+tag_pattern = "v[0-9]*"
+sort_commits = "oldest"
+commit_parsers = [
+  # Noise: merges and our own housekeeping.
+  { message = "^Merge ", skip = true },
+  { message = "^Revert \"", skip = true },
+  { message = "^(docs|test|ci|build|chore|style)(\\(.+\\))?!?:", skip = true },
+  # Conventional prefixes.
+  { message = "^feat", group = "Added" },
+  { message = "^fix", group = "Fixed" },
+  { message = "^(perf|refactor)", group = "Changed" },
+  { message = "^deprecate", group = "Deprecated" },
+  { message = "^remove", group = "Removed" },
+  { message = "^sec(urity)?", group = "Security" },
+  # Plain imperative subjects used by older commits.
+  { message = "^[Ff]ix", group = "Fixed" },
+  { message = "^[Aa]dd", group = "Added" },
+  { message = "^[Rr]emove", group = "Removed" },
+  { message = ".*", group = "Changed" },
+]
