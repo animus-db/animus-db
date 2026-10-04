@@ -63,10 +63,10 @@ Needs B-01's workload generator.
 
 | ID | Criterion | Status | Evidence | Owner |
 |---|---|---|---|---|
-| B-1 | Chaos scenarios run against real processes: process kill, network partition, clock skew, slow disk, disk full | Not met | None yet. Only simulated faults exist (`crates/animus-sim`) and the operator smoke `scripts/e2e-kind.sh` has no fault leg | b |
-| B-2 | Each scenario records a client history and passes the `animus-test` oracles | Not met | Oracles exist (`crates/animus-test/src/check.rs`); no real-cluster history capture | b |
-| B-3 | A failure reproducible from a seed is converted into a seeded sim corpus cell | Not met | Process not yet exercised (no chaos failures yet); policy in ADR 0074 section 1 | b |
-| B-4 | A chaos leg runs in CI or nightly beside the `kind` e2e | Not met | `.github/workflows/e2e-kind.yml` exists; no chaos leg | b |
+| B-1 | Chaos scenarios run against real processes: process kill, network partition, clock skew, slow disk, disk full | Not met | Real-process harness `crates/animusd/tests/chaos.rs` covers process kill (incl. control leader, full power cut), network partition (incl. one-way), delay and SIGSTOP stall, see `docs/chaos.md`. Missing from the criterion: clock skew, slow disk (Kubernetes-only designs in `deploy/chaos/`, unvalidated) and disk full (blocked on #1185) | b |
+| B-2 | Each scenario records a client history and passes the `animus-test` oracles | Not met | History capture and oracle feed exist (`crates/animusd/tests/chaos_support/workload.rs`, oracles `crates/animus-test/src/check.rs`) but the first runs found a violation (`docs/chaos.md`, Findings), so the scenarios do not pass | b |
+| B-3 | A failure reproducible from a seed is converted into a seeded sim corpus cell | Not met | Policy in ADR 0074 section 1. The first finding is timing-dependent (not seed-reproducible, ~1 in 12 smoke runs) and has not been reduced to a sim cell yet; the engine-level mechanism is reproducible deterministically (`docs/chaos.md`, Findings) | b |
+| B-4 | A chaos leg runs in CI or nightly beside the `kind` e2e | Met | `.github/workflows/chaos.yml` (PR smoke + nightly, non-required) beside `.github/workflows/e2e-kind.yml` | b |
 
 ## (c) Fuzzing
 
@@ -153,7 +153,7 @@ date. Waivers are re-reviewed at every release.
 
 ## Summary (2026-10-04)
 
-Met: X-1 to X-10, D-1, D-2, F-1, G-8. Pending-dependency: X-11, A-1 to
-A-4, E-7, E-8, F-2, F-5. Not met: every remaining row (all of B and C, D-3
+Met: X-1 to X-10, B-4, D-1, D-2, F-1, G-8. Pending-dependency: X-11, A-1 to
+A-4, E-7, E-8, F-2, F-5. Not met: every remaining row (B-1 to B-3, all of C, D-3
 to D-8, E-1 to E-6 and E-9, F-3, F-4, G-1 to G-7, G-9). The project is therefore
 **pre-alpha**.

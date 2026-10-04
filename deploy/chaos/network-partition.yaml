@@ -1,0 +1,28 @@
+# UNVALIDATED draft (never applied to a cluster; see deploy/chaos/README.md).
+# Partition ONE pod from every other pod of the cluster, both directions.
+# `partition` drops packets at the pod's netns (a real CNI-level cut, which the
+# bare harness's userspace proxy only approximates). Client traffic through the
+# Service still reaches the isolated pod, so a stale-leader read is exercised.
+# NOTE: the operator's NetworkPolicy (ADR 0060) is separate and unaffected.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: animus-isolate-one
+  namespace: animus-chaos
+spec:
+  action: partition
+  mode: one
+  direction: both
+  selector:
+    namespaces: [animus-chaos]
+    labelSelectors:
+      app.kubernetes.io/name: animusdb
+      app.kubernetes.io/instance: chaos
+  target:
+    mode: all
+    selector:
+      namespaces: [animus-chaos]
+      labelSelectors:
+        app.kubernetes.io/name: animusdb
+        app.kubernetes.io/instance: chaos
+  duration: "30s"

@@ -1,0 +1,22 @@
+# UNVALIDATED draft (never applied to a cluster; see deploy/chaos/README.md).
+# 300 ms +/- 100 ms on every pod's egress. Raft election timeouts are in the
+# 150-300 ms range, so this probes spurious elections and leader flapping
+# under a slow-but-live network (the bare harness's `Fault::Delay`).
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: animus-delay
+  namespace: animus-chaos
+spec:
+  action: delay
+  mode: all
+  selector:
+    namespaces: [animus-chaos]
+    labelSelectors:
+      app.kubernetes.io/name: animusdb
+      app.kubernetes.io/instance: chaos
+  delay:
+    latency: "300ms"
+    jitter: "100ms"
+    correlation: "50"
+  duration: "30s"
