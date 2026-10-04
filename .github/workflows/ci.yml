@@ -654,3 +654,90 @@ jobs:
             echo "::error::one or more prod-liveness shards failed"
             exit 1
           fi
+
+  # Real S3-compatible endpoint round trips (roadmap S-08 M4). The two
+  # env-gated tests below SKIP (and pass) when `ANIMUS_S3_TEST_ENDPOINT` is
+  # unset, so a job that merely invokes them proves nothing — this job sets
+  # `ANIMUS_S3_REQUIRE_ENDPOINT=1`, which turns a missing endpoint into a
+  # panic. The server is RustFS (the same pinned image and settings as
+  # `scripts/e2e-kind.sh`; MinIO images stopped resolving, issue #863), and
+  # the bucket is created with the same pinned aws-cli image. Credentials
+  # are throwaway, for this one ephemeral container only. Not part of the
+  # `gates`/`prod-liveness` aggregates.
+  s3-real-endpoint:
+    name: s3-real-endpoint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTFS_IMAGE: rustfs/rustfs:1.0.0-rc.6
+      AWSCLI_IMAGE: amazon/aws-cli:2.36.44
+      S3_ACCESS_KEY: ciaccesskey
+      S3_SECRET_KEY: cisecretkey123
+      S3_BUCKET: ci-real-endpoint
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (1.96)
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Start RustFS
+        run: |
+          data_dir="$(mktemp -d)"
+          # The container runs as uid 10001; its data dir must be writable.
+          sudo chown 10001:10001 "$data_dir"
+          docker run -d --name rustfs --network host \
+            -v "$data_dir:/data" \
+            -e RUSTFS_VOLUMES=/data \
+            -e RUSTFS_ADDRESS=0.0.0.0:9000 \
+            -e RUSTFS_ACCESS_KEY="$S3_ACCESS_KEY" \
+            -e RUSTFS_SECRET_KEY="$S3_SECRET_KEY" \
+            "$RUSTFS_IMAGE"
+          ready=0
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:9000/health >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$ready" != "1" ]; then
+            echo "::error::RustFS did not become healthy within 120s"
+            docker logs rustfs || true
+            exit 1
+          fi
+
+      - name: Create bucket
+        run: |
+          docker run --rm --network host \
+            -e AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY" \
+            -e AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY" \
+            -e AWS_DEFAULT_REGION=us-east-1 \
+            "$AWSCLI_IMAGE" \
+            --endpoint-url http://127.0.0.1:9000 s3 mb "s3://$S3_BUCKET"
+
+      - name: Run real-endpoint tests
+        env:
+          ANIMUS_S3_REQUIRE_ENDPOINT: "1"
+          ANIMUS_S3_TEST_ENDPOINT: http://127.0.0.1:9000
+          ANIMUS_S3_TEST_BUCKET: ${{ env.S3_BUCKET }}
+          ANIMUS_S3_TEST_ACCESS_KEY_ID: ${{ env.S3_ACCESS_KEY }}
+          ANIMUS_S3_TEST_SECRET_ACCESS_KEY: ${{ env.S3_SECRET_KEY }}
+        run: |
+          cargo test -p animus-s3 --features prod --locked \
+            --test minio_real_endpoint -- --nocapture
+          cargo test -p animus-env --features prod --locked \
+            --test s3_segment_store_minio -- --nocapture
+          # The rest of both crates' `prod`-gated targets (the real-socket
+          # `transport_timeout` test, `s3_store`'s `#[tokio::test]` unit
+          # tests), so their coverage never hinges on workspace feature
+          # unification in the sharded gates.
+          cargo test -p animus-s3 --features prod --locked
+          cargo test -p animus-env --features prod --locked --lib s3_store
+
+      - name: RustFS logs
+        if: failure()
+        run: docker logs rustfs || true

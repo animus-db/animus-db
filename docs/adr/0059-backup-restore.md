@@ -1685,6 +1685,86 @@ shapes PR 2 built changed to accommodate this — the operator is a pure
 consumer of the same command-line contract every other deployment shape
 (bare-metal `--config FILE --node I`, `animusd control`) already used.
 
+## Amendment (2026-10-04): S-08 as-built — S3 credentials, multipart, retry seam, real-endpoint CI
+
+`docs/roadmap.md`'s S-08 (the residual of S-04 above) landed as one PR in
+four milestones. What it changed, as built:
+
+- **Credential sources** (`animus-s3`'s `CredentialProvider`; `animusd`'s
+  `--s3-credentials` file gains a `source` field). `static` (default, the
+  S-04 shape, plus an optional literal `session_token`), `env`
+  (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN`, re-read
+  on every call), `web_identity` (an unsigned STS
+  `AssumeRoleWithWebIdentity` POST; the token file is re-read on every
+  exchange so kubelet rotation needs no restart; `role_arn`/token path fall
+  back to `AWS_ROLE_ARN`/`AWS_WEB_IDENTITY_TOKEN_FILE`), `container`
+  (`AWS_CONTAINER_CREDENTIALS_{FULL,RELATIVE}_URI`, ECS and EKS Pod
+  Identity) and `imds` (EC2 IMDSv2). **Refresh**: a `CachingProvider`
+  refreshes single-flight once `now + 5 min >= expiry`
+  (`creds::REFRESH_SKEW_MS`); credentials with no expiry are cached forever.
+  A response of `ExpiredToken`/`InvalidToken` maps to
+  `S3Error::CredentialsExpired` and triggers exactly one forced refresh and
+  retry inside `S3Client`; it is not retried again by the store.
+- **Session token**: `Credentials` carries an optional token and expiry,
+  `x-amz-security-token` is a signed header, and `Debug` redacts the secret
+  and token.
+- **Addressing**: path-style stays the default; `&path_style=false` selects
+  virtual-hosted (`bucket.<endpoint host>`), rejected for IP endpoints and
+  non-DNS-compatible bucket names (the operator's `s3_uri` validates the same
+  rules).
+- **Multipart** (`S3SegmentStore`, transport-level): a `put` larger than
+  64 MiB uses create / upload-part / complete with 16 MiB parts (5 MiB S3
+  minimum enforced; the part size grows so no object exceeds 10,000 parts).
+  Each request goes through the same bounded-retry helper; a finally-failed
+  part or complete aborts the upload best-effort and returns the error. A
+  `200` carrying an `<Error>` body on `Complete` is a failure. Operators
+  should add a bucket lifecycle rule `AbortIncompleteMultipartUpload`: a lost
+  `CreateMultipartUpload` ack orphans an upload id nobody knows, and a crash
+  (or a failing abort) strands one.
+- **Write-once check** is now `HEAD` + bounded ranged `GET` compares (a size
+  mismatch is a violation with no GET at all), not the whole-object download
+  PR 2 described; the identical-content re-put still skips the `PUT`.
+- **Env-generic store and retry**: `S3SegmentStore<T: Transport, E: Clock +
+  Rng>` (PR 2's "not `Env`-generic" design could not be seed-tested). It
+  uses `env.sleep` and `env.wall_now()` (the SigV4 timestamp), so the
+  module-level `disallowed_methods` allow is gone. `RetryPolicy` default:
+  5 retries (6 attempts), base 100 ms, cap 5 s, sleep drawn uniformly from
+  `[0, min(cap, base * 2^n)]` (full jitter via `env.gen_below`), superseding
+  PR 2's 3 attempts / linear 100 ms. Retried: transport errors (including
+  timeouts), 5xx, 429, 408, `SlowDown`/`RequestTimeout`; never other 4xx,
+  `NotFound`, `AccessDenied` or credential errors. A lost `Complete` ack is
+  resolved by a HEAD + ranged compare when the retry sees `NoSuchUpload`.
+  `animus-env` gains an `s3` feature (implied by `prod`) that needs no tokio.
+- **Transport timeouts**: `HyperRustlsTransport` bounds connect (TCP + TLS,
+  default 10 s) and the whole request (default 60 s); expiry is
+  `TransportError::Timeout`, which the store retries. This is the one
+  remaining justified `disallowed_methods` allow (`tokio::time::timeout` in
+  `animus-s3/src/prod.rs`, a real-socket process boundary).
+- **Testing**: `FakeS3` gained multipart, `Range`, session-credential expiry
+  and a `FaultyTransport` (scripted pass / status / transport error /
+  apply-then-error for a lost ack). The `animus-test` corpus
+  `s3_fault_corpus` (knob `ANIMUS_S3_FAULT_SEEDS`, default 1, nightly 100 in
+  `corpus-deep.yml`) runs the store over `SimEnv`; its first run found the
+  lost-`Complete`-ack bug above.
+- **CI**: a `s3-real-endpoint` job in `ci.yml` starts RustFS
+  (`rustfs/rustfs:1.0.0-rc.6`), creates a bucket, and runs the real-endpoint
+  tests with `ANIMUS_S3_REQUIRE_ENDPOINT=1`, so an unset endpoint is a
+  failure rather than a vacuous pass. The `*_minio*` test file names are
+  historical; the endpoint is RustFS.
+
+**No durable format changes (ADR 0073).** Multipart is transport-level: keys,
+ids and object bytes are identical to a single PUT. The `--s3-credentials`
+JSON is operator configuration, not a persisted format; its new fields are
+additive `#[serde(default)]` and an S-04-era file parses unchanged.
+
+**Residuals.** A lost `CreateMultipartUpload` ack orphans an upload (the
+lifecycle rule reaps it). An expired token on `HEAD` is not detectable
+because `HEAD` responses carry no body. Operator `Secret` rotation still needs a pod restart (static
+credentials are read once at container start), and `spec.s3.webIdentity`
+reaches combined-role pods only, like all of `spec.s3`. A `web_identity`
+`sts_endpoint` beginning `http://` is accepted as a test knob. See
+`docs/roadmap.md`'s S-08 entry.
+
 ## As-built amendment (2026-09-07, ADR 0061 rung D4 PR 5 — deterministic coverage for the backup janitor's own loop)
 
 The backup janitor (§3, `animus_node::backup_janitor::backup_janitor_loop`)

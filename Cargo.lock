@@ -63,21 +63,23 @@ dependencies = [
 
 [[package]]
 name = "animus-cli"
-version = "0.0.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "animus-env",
  "animusd",
  "futures",
+ "rcgen",
  "rustls",
  "rustls-pki-types",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-rustls",
 ]
 
 [[package]]
 name = "animus-control"
-version = "0.0.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "animus-env",
  "animus-placement",
@@ -96,7 +98,7 @@ dependencies = [
 
 [[package]]
 name = "animus-cp-data"
-version = "0.0.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "animus-control",
  "animus-env",
@@ -117,7 +119,7 @@ dependencies = [
 
 [[package]]
 name = "animus-dynamo"
-version = "0.0.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "animus-control",
  "animus-item",
@@ -132,7 +134,7 @@ dependencies = [
 
 [[package]]
 name = "animus-env"
-version = "0.0.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "animus-s3",
  "async-trait",
@@ -153,7 +155,7 @@ dependencies = [
 
 [[package]]
 name = "animus-item"
-version = "0.0.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "bigdecimal",
  "proptest",
@@ -163,7 +165,7 @@ dependencies = [
 
 [[package]]
 name = "animus-node"
-version = "0.0.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "animus-control",
  "animus-cp-data",
@@ -180,7 +182,7 @@ dependencies = [
 
 [[package]]
 name = "animus-operator"
-version = "0.0.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -208,7 +210,7 @@ dependencies = [
 
 [[package]]
 name = "animus-placement"
-version = "0.0.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "animus-env",
  "proptest",
@@ -218,7 +220,7 @@ dependencies = [
 
 [[package]]
 name = "animus-s3"
-version = "0.0.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "animus-dynamo",
  "animus-s3",
@@ -231,6 +233,8 @@ dependencies = [
  "rustls",
  "rustls-native-certs",
  "rustls-pki-types",
+ "serde",
+ "serde_json",
  "sha2",
  "thiserror",
  "tokio",
@@ -240,7 +244,7 @@ dependencies = [
 
 [[package]]
 name = "animus-sim"
-version = "0.0.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "animus-env",
  "async-trait",
@@ -251,7 +255,7 @@ dependencies = [
 
 [[package]]
 name = "animus-storage"
-version = "0.0.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "animus-env",
  "animus-sim",
@@ -270,7 +274,7 @@ dependencies = [
 
 [[package]]
 name = "animus-tablet"
-version = "0.0.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "animus-env",
  "proptest",
@@ -280,13 +284,14 @@ dependencies = [
 
 [[package]]
 name = "animus-test"
-version = "0.0.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "animus-control",
  "animus-cp-data",
  "animus-dynamo",
  "animus-env",
  "animus-item",
+ "animus-s3",
  "animus-sim",
  "animus-storage",
  "animus-tablet",
@@ -298,7 +303,7 @@ dependencies = [
 
 [[package]]
 name = "animusd"
-version = "0.0.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "animus-control",
  "animus-cp-data",
