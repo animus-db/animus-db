@@ -1,0 +1,192 @@
+name: release
+
+# Tag-driven release of the `animusd` and `animus` (CLI) binaries. Policy and
+# the checklist live in docs/release.md; the container images are built,
+# signed and attested by image.yml on the same `v*` tag.
+#
+#   1. verify  - the tag must equal the workspace version (`v` + version).
+#   2. build   - linux/amd64 + linux/arm64 release binaries, built in the same
+#                `rust:1.96-bookworm` image the Dockerfile uses so the glibc
+#                floor (2.36) matches the container runtime stage.
+#   3. publish - SBOM (CycloneDX), changelog section (git-cliff), cosign
+#                keyless `sign-blob` of every artifact, GitHub build
+#                provenance attestation, then the GitHub release.
+#
+# Nothing here has been exercised by a real tag push yet; the first
+# `v0.1.0-alpha.0` tag is the first full run (see docs/release.md).
+on:
+  push:
+    tags: ["v*"]
+
+# Never cancel a release mid-flight.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: verify tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check the tag matches the workspace version
+        id: v
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          want="$(sed -n '/^\[workspace.package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p}' Cargo.toml | head -1)"
+          echo "tag=${tag} workspace-version=${want}"
+          [ -n "$want" ] || { echo "could not read workspace version"; exit 1; }
+          [ "$tag" = "v${want}" ] \
+            || { echo "tag ${tag} does not match Cargo.toml version v${want}"; exit 1; }
+          echo "version=${want}" >> "$GITHUB_OUTPUT"
+          case "$want" in
+            *-*) echo "prerelease=true" >> "$GITHUB_OUTPUT" ;;
+            *)   echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+  build:
+    name: build (${{ matrix.arch }})
+    needs: verify
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    # Same toolchain image as the Dockerfile's builder stage: -bookworm keeps
+    # the glibc floor at 2.36 (see the Dockerfile comment on GLIBC skew).
+    container: rust:1.96-bookworm
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build release binaries
+        run: cargo build --release --locked -p animusd -p animus-cli
+
+      - name: Smoke-run the binaries
+        run: |
+          set -eu
+          ./target/release/animusd --version
+          ./target/release/animus --version
+
+      - name: Package
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -eu
+          name="animusdb-${VERSION}-linux-${{ matrix.arch }}"
+          mkdir -p "dist/${name}"
+          cp target/release/animusd target/release/animus LICENSE README.md "dist/${name}/"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          rm -rf "dist/${name}"
+          ls -l dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: sign and publish
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub release
+      id-token: write # cosign keyless (Sigstore OIDC) and attestations
+      attestations: write # actions/attest-build-provenance
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # git-cliff needs the tag history
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Install Rust toolchain (1.96)
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Install cargo-cyclonedx
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-cyclonedx@0.5.7
+
+      # Source-level dependency SBOM (CycloneDX 1.5) for the two shipped
+      # binaries, from the committed Cargo.lock.
+      - name: Generate SBOMs
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          cargo cyclonedx --format json --spec-version 1.5 --locked
+          cp crates/animusd/animusd.cdx.json "dist/animusdb-${VERSION}-animusd.cdx.json"
+          cp crates/animus-cli/animus-cli.cdx.json "dist/animusdb-${VERSION}-animus.cdx.json"
+          cd dist
+          sha256sum ./*.tar.gz ./*.cdx.json | sed 's# \./# #' > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      # Keyless: the signing identity is this workflow run, recorded in the
+      # Sigstore transparency log; no long-lived key exists to leak.
+      - name: Sign artifacts (cosign keyless)
+        run: |
+          set -euo pipefail
+          cd dist
+          for f in *.tar.gz *.cdx.json SHA256SUMS; do
+            cosign sign-blob --yes --bundle "${f}.sigstore.json" "$f"
+          done
+          ls -l
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+
+      - name: Generate release notes
+        uses: orhun/git-cliff-action@v4
+        id: cliff
+        with:
+          config: cliff.toml
+          args: --latest --strip header
+        env:
+          OUTPUT: RELEASE_NOTES.md
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ needs.verify.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          flags=()
+          [ "$PRERELEASE" = "true" ] && flags+=(--prerelease)
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file RELEASE_NOTES.md \
+            --verify-tag \
+            "${flags[@]}"

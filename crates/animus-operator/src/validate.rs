@@ -409,7 +409,8 @@ mod tests {
     fn s3_with_no_store_set_is_a_violation() {
         let mut spec = base_spec(3, None);
         spec.s3 = Some(S3StoreSpec {
-            credentials_secret_name: "creds".to_string(),
+            credentials_secret_name: Some("creds".to_string()),
+            web_identity: None,
             ..Default::default()
         });
         let violations = validate_spec(None, &spec).unwrap_err();

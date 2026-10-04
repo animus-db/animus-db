@@ -1,0 +1,29 @@
+{
+  "apiVersion": "animusdb.io/v1alpha1",
+  "kind": "AnimusCluster",
+  "metadata": {
+    "name": "golden-wi",
+    "namespace": "animus"
+  },
+  "spec": {
+    "schemaVersion": 1,
+    "image": "ghcr.io/animus-db/animusd:0.1.0",
+    "nodes": 3,
+    "storage": {
+      "size": "10Gi"
+    },
+    "s3": {
+      "backupStore": "s3://backups-bucket/animus?endpoint=https://s3.us-east-1.amazonaws.com&region=us-east-1&path_style=false",
+      "webIdentity": {
+        "roleArn": "arn:aws:iam::123456789012:role/animus-s3",
+        "serviceAccountName": "animus",
+        "audience": "sts.amazonaws.com"
+      },
+      "allowInsecureHttp": false,
+      "egressCidrs": [
+        "0.0.0.0/0"
+      ]
+    },
+    "clientService": {}
+  }
+}

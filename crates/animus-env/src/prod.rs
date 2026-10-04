@@ -762,6 +762,35 @@ async fn open_append(path: &std::path::Path) -> std::io::Result<tokio::fs::File>
         .await
 }
 
+/// Upper bound on a frame's declared sender-id length. A node id is a short
+/// string, so 1 KiB is far above any real one.
+const MAX_FROM_LEN: usize = 1024;
+
+/// Upper bound on a frame's declared payload length: 64 MiB, the same value
+/// as `animus_node::MAX_FRAME_LEN` (the client protocol's cap). Duplicated
+/// here because `animus-node` depends on this crate, not the reverse.
+const MAX_FRAME_PAYLOAD_LEN: usize = 64 << 20;
+
+/// Reject a peer-declared length over `max` *before* anything is allocated
+/// for it: the length is untrusted (this port is open unless mutual TLS is
+/// configured), and an unchecked `vec![0; len]` of a `u32` is a ~4 GiB
+/// allocation per frame.
+fn check_frame_len(what: &str, len: usize, max: usize) -> std::io::Result<()> {
+    if len > max {
+        tracing::warn!(
+            what,
+            len,
+            max,
+            "refusing oversized frame; closing connection"
+        );
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("declared {what} length {len} exceeds cap {max}"),
+        ));
+    }
+    Ok(())
+}
+
 /// Read length-prefixed `[from_len: u32][from: utf8 bytes][stream: u64][len:
 /// u32][payload]` frames until EOF (ADR 0040 PR3 changed `from` from a fixed
 /// `u64` to a length-prefixed UTF-8 string, since node ids are strings now;
@@ -781,8 +810,8 @@ async fn open_append(path: &std::path::Path) -> std::io::Result<tokio::fs::File>
 /// connection on failure, never reaching this function) — so the frame
 /// layout here, and the receive side in general, needs no change: the
 /// handshake is a connection-setup step, not a per-frame one.
-async fn read_frames(
-    mut stream: MaybeTlsStream,
+async fn read_frames<S: AsyncRead + Unpin>(
+    mut stream: S,
     tx: mpsc::UnboundedSender<Envelope>,
     peer_ext: Arc<[u8]>,
     hs: Arc<HandshakeCfg>,
@@ -794,6 +823,7 @@ async fn read_frames(
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
         };
+        check_frame_len("sender id", from_len, MAX_FROM_LEN)?;
         let mut from_bytes = vec![0u8; from_len];
         stream.read_exact(&mut from_bytes).await?;
         let from_str = String::from_utf8(from_bytes)
@@ -805,6 +835,7 @@ async fn read_frames(
         let from = NodeId::new_unchecked(from_str);
         let msg_stream = stream.read_u64().await?;
         let len = stream.read_u32().await? as usize;
+        check_frame_len("payload", len, MAX_FRAME_PAYLOAD_LEN)?;
         let mut payload = vec![0u8; len];
         stream.read_exact(&mut payload).await?;
         // The era-on refusal reaches connections opened before the flag
@@ -1012,6 +1043,66 @@ pub struct PreBindRng;
     reason = "OsRng is the sanctioned real-randomness source PreBindRng wraps at the pre-bind CLI boundary (ADR 0040 PR4); see ADR 0061 Decision 4"
 )]
 impl Rng for PreBindRng {
+    fn next_u64(&self) -> u64 {
+        rand::RngCore::next_u64(&mut rand::rngs::OsRng)
+    }
+
+    fn fill_bytes(&self, dst: &mut [u8]) {
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, dst);
+    }
+}
+
+/// A standalone real `Clock + Rng` with no node, listener or data directory —
+/// for the few process-boundary constructors that need only time and
+/// randomness (an `S3SegmentStore` built by a test harness or tool outside a
+/// bound node). A bound node passes its own [`ProdEnv`] instead. Real wall
+/// clock, real monotonic clock, `tokio` sleep and OS randomness, byte-for-byte
+/// what [`ProdEnv`]'s own `Clock`/`Rng` impls use.
+#[derive(Clone)]
+pub struct ProdClockRng {
+    start: std::time::Instant,
+}
+
+impl ProdClockRng {
+    /// A fresh clock anchored at "now".
+    #[must_use]
+    pub fn new() -> Self {
+        ProdClockRng {
+            start: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Default for ProdClockRng {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl Clock for ProdClockRng {
+    fn now(&self) -> Nanos {
+        Nanos(self.start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64)
+    }
+
+    fn wall_now(&self) -> UnixMillis {
+        UnixMillis(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis().min(u128::from(u64::MAX)) as u64),
+        )
+    }
+
+    async fn sleep(&self, dur: Duration) {
+        tokio::time::sleep(dur).await;
+    }
+}
+
+#[allow(
+    clippy::disallowed_types,
+    reason = "OsRng is the sanctioned real-randomness source ProdClockRng wraps, like ProdEnv's and PreBindRng's own Rng impls (ADR 0061 Decision 4)"
+)]
+impl Rng for ProdClockRng {
     fn next_u64(&self) -> u64 {
         rand::RngCore::next_u64(&mut rand::rngs::OsRng)
     }
@@ -5456,5 +5547,85 @@ mod tests {
 
         a.shutdown();
         let _ = std::fs::remove_dir_all(&dir_a);
+    }
+
+    /// Drive `read_frames` over an in-memory stream carrying `header` (and
+    /// nothing after it, never EOF), returning its result. A reader that
+    /// trusted the declared length would allocate it and then block forever
+    /// in `read_exact` waiting for bytes that never come, so the 5s timeout
+    /// failing is the "not rejected before allocating" signal.
+    async fn run_read_frames(header: Vec<u8>) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        client.write_all(&header).await.unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_frames(
+                server,
+                tx,
+                Arc::from(Vec::<u8>::new()),
+                Arc::new(HandshakeCfg::default()),
+                MetricsHandle::recording(),
+            ),
+        )
+        .await
+        .expect("read_frames must reject an oversized length promptly, not allocate and wait");
+        drop(client);
+        res
+    }
+
+    /// A peer claiming a ~4 GiB sender id is refused before any allocation.
+    #[tokio::test]
+    async fn read_frames_rejects_oversized_sender_id_length() {
+        let err = run_read_frames(u32::MAX.to_be_bytes().to_vec())
+            .await
+            .expect_err("oversized sender id must close the connection");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("sender id"), "{err}");
+    }
+
+    /// A valid sender id followed by a ~4 GiB payload length is refused
+    /// before the payload buffer is allocated.
+    #[tokio::test]
+    async fn read_frames_rejects_oversized_payload_length() {
+        let mut h = Vec::new();
+        h.extend_from_slice(&2u32.to_be_bytes());
+        h.extend_from_slice(b"n0");
+        h.extend_from_slice(&7u64.to_be_bytes());
+        h.extend_from_slice(&u32::MAX.to_be_bytes());
+        let err = run_read_frames(h)
+            .await
+            .expect_err("oversized payload must close the connection");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("payload"), "{err}");
+    }
+
+    /// A normal small frame still flows through the capped reader.
+    #[tokio::test]
+    async fn read_frames_still_delivers_a_normal_frame() {
+        use tokio::io::AsyncWriteExt;
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let mut h = Vec::new();
+        h.extend_from_slice(&2u32.to_be_bytes());
+        h.extend_from_slice(b"n0");
+        h.extend_from_slice(&7u64.to_be_bytes());
+        h.extend_from_slice(&3u32.to_be_bytes());
+        h.extend_from_slice(b"abc");
+        client.write_all(&h).await.unwrap();
+        drop(client); // EOF after the one frame
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        read_frames(
+            server,
+            tx,
+            Arc::from(Vec::<u8>::new()),
+            Arc::new(HandshakeCfg::default()),
+            MetricsHandle::recording(),
+        )
+        .await
+        .expect("clean EOF");
+        let env = rx.recv().await.expect("frame delivered");
+        assert_eq!(env.stream, 7);
+        assert_eq!(env.payload, b"abc");
     }
 }
