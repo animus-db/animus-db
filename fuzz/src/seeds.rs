@@ -1,4 +1,4 @@
-//! Seed inputs, shared by the corpus generator (`seed-corpus`) and the stable
+//! Seed inputs, shared by the corpus generator (the `seed_corpus` example) and the stable
 //! smoke test so both see exactly the same set.
 //!
 //! Three sources:

@@ -52,7 +52,7 @@ Real libFuzzer (nightly + `cargo install cargo-fuzz --locked`; the repo pins 1.9
 
 ```sh
 fuzz/seed-corpus.sh                       # corpus from the golden fixtures + fuzz/seeds/
-cargo +nightly fuzz list
+cargo +nightly fuzz list                   # targets only: seed_corpus is an example, not a bin
 cargo +nightly fuzz run lsm_formats -- -max_total_time=60 -timeout=20 -rss_limit_mb=2048 -max_len=65536
 cargo +nightly fuzz run dynamo_expressions -- -dict=fuzz/dict/dynamo.dict
 cargo +nightly fuzz tmin <target> fuzz/artifacts/<target>/crash-<hash>   # minimize a crash

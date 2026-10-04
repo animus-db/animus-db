@@ -106,9 +106,7 @@ test = false
 doc = false
 bench = false
 
-[[bin]]
-name = "seed-corpus"
-path = "src/bin/seed_corpus.rs"
-test = false
-doc = false
-bench = false
+# Not a fuzz target: an `[[example]]` so `cargo fuzz list` does not list it.
+[[example]]
+name = "seed_corpus"
+path = "examples/seed_corpus.rs"

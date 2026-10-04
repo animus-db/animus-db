@@ -1,5 +1,5 @@
 //! Writes `fuzz/corpus/<target>/<seed>` for every seed (see
-//! `animus_fuzz::seeds`). Run via `fuzz/seed-corpus.sh`; the output directory
+//! `animus_fuzz::seeds`). Run via `fuzz/seed-corpus.sh` (an example, so `cargo fuzz list` ignores it); the output directory
 //! is git-ignored, so no fixture bytes are ever checked in twice.
 
 use std::path::Path;

@@ -8,4 +8,4 @@
 # Idempotent: rerun after adding a fixture or a seed. Runs on stable.
 set -euo pipefail
 cd "$(dirname "$0")"
-exec cargo run --quiet --release --bin seed-corpus
+exec cargo run --quiet --release --example seed_corpus
