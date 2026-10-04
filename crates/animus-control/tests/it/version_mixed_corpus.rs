@@ -66,6 +66,10 @@ const CELLS: &[(&str, usize)] = &[
     ("phase1_after_the_era_is_refused", 6),
     ("finalize_and_range", 4),
     ("negative_control_premature_era_variant", 4),
+    ("synthetic_gate_ladder", 4),
+    ("negative_control_ungated_variant", 2),
+    ("negative_control_ungated_field", 2),
+    ("negative_control_stale_view", 2),
 ];
 
 /// The seeds a cell runs: `ANIMUS_UPGRADE_CELL` (substring) filters cells,
@@ -183,6 +187,26 @@ fn violations_with(w: &World, era_onset_safety: bool) -> Vec<String> {
             v.push(format!(
                 "Phase 1 node {id}'s applied Metadata shows versioning fields"
             ));
+        }
+    }
+    // gate discipline at apply: a value carrying a synthetic gate/field label
+    // `n` is applied only once the cluster version reached `n`.
+    for (id, n) in &w.nodes {
+        let m = n.metadata();
+        for (node, mem) in &m.members {
+            for k in [
+                animus_control::version::SYNTHETIC_GATE_LABEL,
+                animus_control::sim_versions::SYNTHETIC_FIELD_LABEL,
+            ] {
+                if let Some(need) = mem.labels.get(k).and_then(|x| x.parse::<u32>().ok())
+                    && m.cluster_version() < need
+                {
+                    v.push(format!(
+                        "gate applied early: node {id} applied {k}={need} on {node:?} at cluster version {}",
+                        m.cluster_version()
+                    ));
+                }
+            }
         }
     }
     for (id, r) in w.cap_rejections() {
@@ -830,4 +854,263 @@ fn negative_control_premature_era_variant() {
             "the capped decode never rejected the premature era variant"
         );
     }
+}
+
+// ---- synthetic_gate_ladder + N2-N4 ----
+
+/// Node 2 is the "previous release" voter: `Release(2)`, range `[1, 2]`.
+const OLD: u64 = 2;
+
+/// Roll everything to a range-`[1,3]` binary except `OLD` (`[1,2]`), wait for
+/// the era and every record, then finalize to 2 (every range contains 2).
+fn ladder_world(seed: u64) -> World {
+    let mut w = World::new_faithful(seed, &VOTERS, &[LEARNER], &MEMBERS);
+    w.bootstrap();
+    let mut c = |w: &World| check(w);
+    w.run(Duration::from_millis(500), &mut c);
+    for id in all_ids() {
+        w.flip_range(id, if id == OLD { (1, 2) } else { (1, 3) }, false);
+    }
+    w.poll(
+        Duration::from_secs(40),
+        "era on, every record present",
+        &mut c,
+        &|w| {
+            w.nodes.values().all(|n| {
+                let m = n.metadata();
+                era(&m) && m.node_versions.len() == all_ids().len()
+            })
+        },
+    );
+    w.propose_confirmed(
+        &MetaCommand::FinalizeClusterVersion {
+            expected: 1,
+            target: 2,
+        },
+        &|m| m.cluster_version() == 2,
+        "finalize 1 -> 2",
+    );
+    w.poll(
+        Duration::from_secs(30),
+        "every node at cluster version 2",
+        &mut c,
+        &|w| {
+            w.nodes
+                .values()
+                .all(|n| n.metadata().cluster_version() == 2)
+        },
+    );
+    w
+}
+
+fn marked(label: &str, gate: u32) -> MetaCommand {
+    MetaCommand::UpsertMember {
+        node: nid(10),
+        labels: [(label.to_string(), gate.to_string())].into(),
+        status: NodeStatus::Active,
+    }
+}
+
+fn marked_applied(m: &animus_control::Metadata, label: &str, gate: u32) -> bool {
+    m.members
+        .get(&nid(10))
+        .is_some_and(|mem| mem.labels.get(label) == Some(&gate.to_string()))
+}
+
+fn run_ladder(seed: u64) {
+    use animus_control::version::{Gate, SYNTHETIC_GATE_LABEL};
+    let mut w = ladder_world(seed);
+    let mut c = |w: &World| check(w);
+    // Gate 2 is open (and known to every binary), gate 3 is closed.
+    let leader = w.leader().expect("leader");
+    let f = w.nodes[&leader].features();
+    assert!(f.is_open(Gate::Synthetic(2)) && !f.is_open(Gate::Synthetic(3)));
+    w.propose_confirmed(
+        &marked(SYNTHETIC_GATE_LABEL, 2),
+        &|m| marked_applied(m, SYNTHETIC_GATE_LABEL, 2),
+        "a gate-2 command at cluster version 2",
+    );
+    // Finalize to 3 is blocked by the previous-release node's range, by name.
+    let m = w.leader_meta().expect("leader");
+    assert_eq!(
+        rejected_by(
+            &m,
+            &MetaCommand::FinalizeClusterVersion {
+                expected: 2,
+                target: 3,
+            }
+        ),
+        "Rejected(\"blocked: a registered node's range excludes the target version\")",
+        "seed={seed}"
+    );
+    w.run(Duration::from_secs(1), &mut c);
+    assert!(
+        !w.nodes[&w.leader().expect("leader")]
+            .features()
+            .is_open(Gate::Synthetic(3)),
+        "seed={seed}: gate 3 opened with a [1,2] node recorded"
+    );
+    // The node rolls to the next release; gate 3 opens at the finalize, not before.
+    w.flip_range(OLD, (2, 3), true);
+    w.poll(
+        Duration::from_secs(40),
+        "the rolled node's [2,3] record",
+        &mut c,
+        &|w| {
+            w.nodes.values().all(|n| {
+                n.metadata()
+                    .node_versions
+                    .get(&nid(OLD))
+                    .is_some_and(|v| v.range == VersionRange::new(2, 3))
+            })
+        },
+    );
+    assert!(
+        !w.nodes[&w.leader().expect("leader")]
+            .features()
+            .is_open(Gate::Synthetic(3)),
+        "seed={seed}: gate 3 opened before the finalize"
+    );
+    w.propose_confirmed(
+        &MetaCommand::FinalizeClusterVersion {
+            expected: 2,
+            target: 3,
+        },
+        &|m| m.cluster_version() == 3,
+        "finalize 2 -> 3",
+    );
+    w.propose_confirmed(
+        &marked(SYNTHETIC_GATE_LABEL, 3),
+        &|m| marked_applied(m, SYNTHETIC_GATE_LABEL, 3),
+        "a gate-3 command at cluster version 3",
+    );
+    w.poll(
+        Duration::from_secs(30),
+        "every replica applied it",
+        &mut c,
+        &|w| {
+            wedged_replicas(w).is_empty()
+                && w.nodes
+                    .values()
+                    .all(|n| marked_applied(&n.metadata(), SYNTHETIC_GATE_LABEL, 3))
+        },
+    );
+    let rej = w.cap_rejections();
+    assert!(rej.is_empty(), "seed={seed}: {rej:?}");
+    check(&w);
+}
+
+#[test]
+fn synthetic_gate_ladder() {
+    run_cell("synthetic_gate_ladder", |seed, _| run_ladder(seed));
+}
+
+#[derive(Clone, Copy)]
+enum Neg {
+    /// The emitter skips the gate check (`propose_ungated_for_negative_control`).
+    UngatedVariant,
+    /// A new payload field the classifier does not know: `required_gate` says
+    /// `Base`, so the normal `propose` passes, but the older binary's decode
+    /// cannot read it.
+    UngatedField,
+    /// The emitter's feature handle was opened on a view that is not the
+    /// replicated state (a forged cluster version 3).
+    StaleView,
+}
+
+/// At cluster version 2 with a `Release(2)` voter, emit a gate-3 value the
+/// wrong way; the oracle MUST report the delivery to the old binary, the
+/// wedge, and the early application.
+fn run_neg(seed: u64, neg: Neg) {
+    use animus_control::sim_versions::SYNTHETIC_FIELD_LABEL;
+    use animus_control::version::SYNTHETIC_GATE_LABEL;
+    let mut w = ladder_world(seed);
+    // A leader that is not the previous-release node.
+    for _ in 0..10 {
+        if matches!(w.leader(), Some(l) if l != OLD) {
+            break;
+        }
+        if let Some(h) = w.inject(Fault::LeaderKill) {
+            w.run(Duration::from_secs(2), &mut |_| {});
+            w.heal(h);
+            w.run(Duration::from_secs(1), &mut |_| {});
+        }
+    }
+    let l = w.leader().expect("leader");
+    assert_ne!(l, OLD, "seed={seed}: could not get a non-old leader");
+    assert!(
+        instant_violations(&w).is_empty(),
+        "seed={seed}: violations before the bad emit"
+    );
+    let pre_log = w.nodes[&OLD].last_log_index();
+    let leader = &w.nodes[&l];
+    match neg {
+        Neg::UngatedVariant => {
+            let _ = leader.propose_ungated_for_negative_control(marked(SYNTHETIC_GATE_LABEL, 3));
+        }
+        Neg::UngatedField => {
+            // Base-classified: the production `propose` accepts it.
+            let cmd = marked(SYNTHETIC_FIELD_LABEL, 3);
+            assert_eq!(
+                animus_control::version::GatedCommand::required_gate(&cmd),
+                animus_control::version::Gate::Base
+            );
+            let _ = leader.propose(cmd);
+        }
+        Neg::StaleView => {
+            let mut forged = w.leader_meta().expect("leader");
+            let mut v = forged.node_versions[&nid(OLD)].clone();
+            v.range = VersionRange::new(2, 3);
+            forged.node_versions.insert(nid(OLD), v);
+            let out = forged.apply(&MetaCommand::FinalizeClusterVersion {
+                expected: 2,
+                target: 3,
+            });
+            assert_eq!(format!("{out:?}"), "Applied", "seed={seed}: forge failed");
+            leader.features().update(&forged);
+            let _ = leader.propose(marked(SYNTHETIC_GATE_LABEL, 3));
+        }
+    }
+    w.run(Duration::from_secs(5), &mut |_| {});
+    let v = instant_violations(&w);
+    assert_eq!(
+        wedged_replicas(&w),
+        vec![OLD],
+        "seed={seed}: only the previous-release replica is wedged"
+    );
+    assert!(
+        v.iter()
+            .any(|s| s.starts_with("delivery: node 2 (Release(2))")),
+        "seed={seed}: the cap never rejected the gate-3 value: {v:#?}"
+    );
+    assert!(
+        v.iter().any(|s| s.starts_with("gate applied early")),
+        "seed={seed}: early application did not trip: {v:#?}"
+    );
+    assert_eq!(
+        w.nodes[&OLD].last_log_index(),
+        pre_log,
+        "seed={seed}: the old replica appended the gate-3 value"
+    );
+}
+
+#[test]
+fn negative_control_ungated_variant() {
+    run_cell("negative_control_ungated_variant", |seed, _| {
+        run_neg(seed, Neg::UngatedVariant)
+    });
+}
+
+#[test]
+fn negative_control_ungated_field() {
+    run_cell("negative_control_ungated_field", |seed, _| {
+        run_neg(seed, Neg::UngatedField)
+    });
+}
+
+#[test]
+fn negative_control_stale_view() {
+    run_cell("negative_control_stale_view", |seed, _| {
+        run_neg(seed, Neg::StaleView)
+    });
 }

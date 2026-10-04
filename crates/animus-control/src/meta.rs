@@ -6253,6 +6253,17 @@ impl crate::version::GatedCommand for MetaCommand {
     fn required_gate(&self) -> crate::version::Gate {
         use crate::version::Gate;
         match self {
+            // Test/sim builds: the `synthetic.gate` label makes an
+            // `UpsertMember` require a synthetic gate (the gate ladder).
+            #[cfg(any(test, feature = "sim-versions"))]
+            MetaCommand::UpsertMember { labels, .. }
+                if labels.contains_key(crate::version::SYNTHETIC_GATE_LABEL) =>
+            {
+                labels
+                    .get(crate::version::SYNTHETIC_GATE_LABEL)
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .map_or(Gate::Base, Gate::Synthetic)
+            }
             MetaCommand::NoOp
             | MetaCommand::UpsertMember { .. }
             | MetaCommand::CreateTablet { .. }
