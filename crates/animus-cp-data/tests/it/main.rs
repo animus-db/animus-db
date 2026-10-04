@@ -70,6 +70,7 @@ mod stale_read;
 mod stream_addressing;
 mod timerless_park;
 mod ts_cache;
+mod txn_abort_restore_history;
 mod txn_conditions;
 mod txn_kind_writes;
 mod txn_multi;

@@ -217,6 +217,7 @@ fn fresh_combined_addrs(index: usize, encryption_key_path: Option<String>) -> Ro
         advertise_host: None,
         tls: None,
         encryption_key_path,
+        overload: None,
     }
 }
 
@@ -527,6 +528,7 @@ async fn data_seed_join_threads_quiesce_after_to_admin_config() {
         advertise_host: None,
         tls: None,
         encryption_key_path: None,
+        overload: None,
     };
     let joined = animusd::run_node_data_join_with_settings(
         seeds.iter().map(ToString::to_string).collect(),

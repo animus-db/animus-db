@@ -140,13 +140,183 @@ use animus_cp_data::hlc::HlcTimestamp;
 use animus_cp_data::{FastRead, RaftKvNode, StorageScope, TxnDecisionStatus, TxnId, TxnOutcome};
 use animus_env::{Clock, EnvExt, Rng, nid};
 use animus_sim::{DiskConfig, NetConfig, SimEnv, Simulator};
-use animus_storage::MemoryEngine;
+use animus_storage::{
+    Key as EngineKey, LsmEngine, LsmOptions, MemoryEngine, MergeOp, Result as StorageResult,
+    StorageEngine, Value, Version, VersionedValue, WriteBatch,
+};
 use animus_tablet::KeyRange;
 use animus_test::corpus::{self, SeedVariant};
 use animus_test::history::{Key, Mop, Process};
 use animus_test::{History, Recorder, check_convergence, check_cycles, check_durability};
 
-type Node = RaftKvNode<SimEnv, MemoryEngine>;
+type Node = RaftKvNode<SimEnv, CorpusEngine>;
+
+// ---------------------------------------------------------------------------
+// Engine tiers: `MemoryEngine` (every frozen cell) or `LsmEngine<SimEnv>` under
+// compaction pressure (the `lsm_compaction_*` cells, ADR 0018 §2's
+// 2026-10-04 amendment).
+// ---------------------------------------------------------------------------
+
+/// Which `StorageEngine` a scenario's replicas run on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EngineTier {
+    /// `MemoryEngine`: keeps every MVCC version forever. Every original cell.
+    Memory,
+    /// `LsmEngine<SimEnv>` with tiny flush/compaction thresholds and the
+    /// production-default `tombstone_grace_versions` — the engine `animusd`
+    /// actually runs, whose compaction GC discards MVCC history about a
+    /// millisecond of HLC time behind the newest write. A `MemoryEngine`-only
+    /// corpus could never see a protocol step that silently depends on that
+    /// history (an aborted intent's restore once did: acked writes lost).
+    LsmCompacting,
+}
+
+/// `LsmOptions` for [`EngineTier::LsmCompacting`]: flush and compact after a
+/// handful of small writes; the GC grace stays at the production default.
+fn compacting_lsm_options() -> LsmOptions {
+    LsmOptions {
+        flush_threshold_bytes: 512,
+        compaction_trigger: 2,
+        target_table_bytes: 2048,
+        level_fanout: 2,
+        wal_segment_bytes: 1024,
+        background_maintenance: false,
+        ..LsmOptions::default()
+    }
+}
+
+/// One replica's engine, of either tier — a plain delegating enum so the
+/// corpus keeps one concrete `Node` type for both tiers (a `MemoryEngine`
+/// replica behaves exactly as it did before this wrapper existed: no added
+/// I/O, randomness or awaits, so every frozen cell's run is unchanged).
+#[derive(Clone)]
+enum CorpusEngine {
+    Memory(MemoryEngine),
+    Lsm(LsmEngine<SimEnv>),
+}
+
+/// [`CorpusEngine`]'s snapshot.
+enum CorpusSnapshot {
+    Memory(<MemoryEngine as StorageEngine>::Snapshot),
+    Lsm(<LsmEngine<SimEnv> as StorageEngine>::Snapshot),
+}
+
+#[async_trait::async_trait]
+impl animus_storage::Snapshot for CorpusSnapshot {
+    fn version(&self) -> Version {
+        match self {
+            CorpusSnapshot::Memory(s) => s.version(),
+            CorpusSnapshot::Lsm(s) => s.version(),
+        }
+    }
+    async fn get(&self, key: &[u8]) -> StorageResult<Option<VersionedValue>> {
+        match self {
+            CorpusSnapshot::Memory(s) => s.get(key).await,
+            CorpusSnapshot::Lsm(s) => s.get(key).await,
+        }
+    }
+    async fn scan(
+        &self,
+        start: &[u8],
+        end: &[u8],
+    ) -> StorageResult<Vec<(EngineKey, VersionedValue)>> {
+        match self {
+            CorpusSnapshot::Memory(s) => s.scan(start, end).await,
+            CorpusSnapshot::Lsm(s) => s.scan(start, end).await,
+        }
+    }
+}
+
+/// Forward one `StorageEngine` call to whichever engine this replica runs.
+macro_rules! delegate {
+    ($self:ident, $e:ident => $call:expr) => {
+        match $self {
+            CorpusEngine::Memory($e) => $call,
+            CorpusEngine::Lsm($e) => $call,
+        }
+    };
+}
+
+#[async_trait::async_trait]
+impl StorageEngine for CorpusEngine {
+    type Snapshot = CorpusSnapshot;
+
+    async fn put(&self, key: &[u8], value: &[u8], version: Version) -> StorageResult<()> {
+        delegate!(self, e => e.put(key, value, version).await)
+    }
+    async fn merge(&self, key: &[u8], value: &[u8], version: Version) -> StorageResult<bool> {
+        delegate!(self, e => e.merge(key, value, version).await)
+    }
+    async fn merge_tombstone(&self, key: &[u8], version: Version) -> StorageResult<bool> {
+        delegate!(self, e => e.merge_tombstone(key, version).await)
+    }
+    async fn merge_batch(&self, ops: Vec<MergeOp>) -> StorageResult<()> {
+        delegate!(self, e => e.merge_batch(ops).await)
+    }
+    async fn delete(&self, key: &[u8], version: Version) -> StorageResult<()> {
+        delegate!(self, e => e.delete(key, version).await)
+    }
+    async fn delete_range(&self, start: &[u8], end: &[u8], version: Version) -> StorageResult<()> {
+        delegate!(self, e => e.delete_range(start, end, version).await)
+    }
+    async fn write_batch(&self, batch: WriteBatch) -> StorageResult<()> {
+        delegate!(self, e => e.write_batch(batch).await)
+    }
+    async fn get(&self, key: &[u8]) -> StorageResult<Option<VersionedValue>> {
+        delegate!(self, e => e.get(key).await)
+    }
+    async fn get_at(&self, key: &[u8], version: Version) -> StorageResult<Option<VersionedValue>> {
+        delegate!(self, e => e.get_at(key, version).await)
+    }
+    async fn scan(
+        &self,
+        start: &[u8],
+        end: &[u8],
+    ) -> StorageResult<Vec<(EngineKey, VersionedValue)>> {
+        delegate!(self, e => e.scan(start, end).await)
+    }
+    async fn scan_at(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        version: Version,
+    ) -> StorageResult<Vec<(EngineKey, VersionedValue)>> {
+        delegate!(self, e => e.scan_at(start, end, version).await)
+    }
+    async fn entries(&self) -> StorageResult<Vec<(EngineKey, VersionedValue)>> {
+        delegate!(self, e => e.entries().await)
+    }
+    async fn entries_at(
+        &self,
+        version: Version,
+    ) -> StorageResult<Vec<(EngineKey, VersionedValue)>> {
+        delegate!(self, e => e.entries_at(version).await)
+    }
+    async fn entries_with_tombstones(
+        &self,
+    ) -> StorageResult<Vec<(EngineKey, Option<Value>, Version)>> {
+        delegate!(self, e => e.entries_with_tombstones().await)
+    }
+    async fn scan_with_tombstones(
+        &self,
+        start: &[u8],
+        end: &[u8],
+    ) -> StorageResult<Vec<(EngineKey, Option<Value>, Version)>> {
+        delegate!(self, e => e.scan_with_tombstones(start, end).await)
+    }
+    async fn approx_bytes_in_range(&self, start: &[u8], end: Option<&[u8]>) -> StorageResult<u64> {
+        delegate!(self, e => e.approx_bytes_in_range(start, end).await)
+    }
+    fn snapshot(&self) -> CorpusSnapshot {
+        match self {
+            CorpusEngine::Memory(e) => CorpusSnapshot::Memory(e.snapshot()),
+            CorpusEngine::Lsm(e) => CorpusSnapshot::Lsm(e.snapshot()),
+        }
+    }
+    fn latest_version(&self) -> Version {
+        delegate!(self, e => e.latest_version())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Topology: three independent tablet groups, 3 replicas each.
@@ -283,7 +453,7 @@ struct Topology {
 }
 
 impl Topology {
-    fn start(sim: &Simulator) -> Topology {
+    fn start(sim: &Simulator, tier: EngineTier) -> Topology {
         let mut nodes = Vec::with_capacity(NUM_GROUPS);
         for ids in GROUP_IDS.iter().take(NUM_GROUPS) {
             let scope = StorageScope::new(KeyRange::whole());
@@ -301,10 +471,23 @@ impl Topology {
                     // skips the `TxnTracker` update. Mirrors
                     // `raftkv_linearizable.rs`'s `Group::start`
                     // (`factory(&sim, id)` per node id).
+                    let engine = match tier {
+                        EngineTier::Memory => CorpusEngine::Memory(MemoryEngine::new()),
+                        // Each replica's own disk (`sim.env(nid(id))`), so
+                        // one prefix per replica is private by construction.
+                        EngineTier::LsmCompacting => CorpusEngine::Lsm(
+                            futures::executor::block_on(LsmEngine::open_with(
+                                sim.env(nid(id)),
+                                "txn-corpus/",
+                                compacting_lsm_options(),
+                            ))
+                            .expect("open the replica's LsmEngine"),
+                        ),
+                    };
                     RaftKvNode::start_scoped(
                         sim.env(nid(id)),
                         ids.iter().copied().map(nid).collect(),
-                        MemoryEngine::new(),
+                        engine,
                         scope.clone(),
                     )
                 })
@@ -508,6 +691,9 @@ struct Scenario {
     /// Outage window held before healing — zero for scenarios with no
     /// timed fault.
     window: Duration,
+    /// The replicas' storage engine. [`EngineTier::Memory`] for every cell
+    /// built by [`cell`]; the `lsm_compaction_*` cells use [`lsm_cell`].
+    engine: EngineTier,
 }
 
 impl SeedVariant for Scenario {
@@ -535,6 +721,20 @@ fn cell(
         workload,
         faults,
         window,
+        engine: EngineTier::Memory,
+    }
+}
+
+/// [`cell`] over [`EngineTier::LsmCompacting`].
+fn lsm_cell(
+    name: &str,
+    workload: Workload,
+    faults: Vec<(Duration, Nemesis)>,
+    window: Duration,
+) -> Scenario {
+    Scenario {
+        engine: EngineTier::LsmCompacting,
+        ..cell(name, workload, faults, window)
     }
 }
 
@@ -745,6 +945,31 @@ fn corpus_cells() -> Vec<Scenario> {
             (MID, Nemesis::ParticipantLeaderKill { group: 1 }),
         ],
         WINDOW,
+    ));
+
+    // LSM tier (ADR 0018 §2's 2026-10-04 amendment): the durable engine
+    // under compaction pressure. An abandoned prepare is aborted by the
+    // resolver only after `RECOVERY_GRACE` (5s) — thousands of HLC
+    // milliseconds past the LSM GC floor — so its abort-restore must not
+    // depend on MVCC history below the intent. Before the fix these cells
+    // lost acknowledged appends (`check_durability`).
+    out.push(lsm_cell(
+        "lsm_compaction_abandon_prepare",
+        Workload::with_abandon(30, 0),
+        vec![],
+        Duration::ZERO,
+    ));
+    out.push(lsm_cell(
+        "lsm_compaction_abandon_prepare_and_anchor_kill",
+        Workload::with_abandon(25, 0),
+        vec![(MID, Nemesis::AnchorLeaderKill)],
+        WINDOW,
+    ));
+    out.push(lsm_cell(
+        "lsm_compaction_baseline_rmw_heavy",
+        Workload::rmw_heavy(),
+        vec![],
+        Duration::ZERO,
     ));
 
     out
@@ -2230,7 +2455,7 @@ fn force_resolve_all_owned_keys(sim: &mut Simulator, topo: &Arc<Topology>) {
 
 fn run_scenario(scenario: &Scenario) -> ScenarioResult {
     let mut sim = Simulator::new(scenario.seed);
-    let topo = Arc::new(Topology::start(&sim));
+    let topo = Arc::new(Topology::start(&sim, scenario.engine));
     sim.run_for(ELECT);
 
     let shared = Arc::new(Shared {
@@ -2809,7 +3034,7 @@ async fn tight_pair_reader(
 /// writer, the exact shape that reproduced the production bug).
 fn run_tight_pair_scenario(seed: u64) {
     let mut sim = Simulator::new(seed);
-    let topo = Arc::new(Topology::start(&sim));
+    let topo = Arc::new(Topology::start(&sim, EngineTier::Memory));
     sim.run_for(ELECT);
 
     let key_a = owned_key(0, 0);

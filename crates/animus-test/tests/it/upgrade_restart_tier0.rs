@@ -1137,3 +1137,316 @@ fn transcode_disk_classifies_refuses_unsupported_and_is_deterministic() {
         "the seed must influence which files are kept"
     );
 }
+
+// ---------------------------------------------------------------------------
+// txn-envelope: the engine-row transcode (ROW_TABLE)
+//
+// `txn-envelope` values live inside engine rows (WAL records and SSTable
+// blocks), so no whole-file transcode reaches them. `transcode::transcode_rows`
+// (via `TranscodeOpts::row_back`, or directly) rewrites them through
+// `animus_storage::rewrite_row_values`; these tests pin that it does, in both
+// carriers, at every MVCC version, and only for exact v2 intents.
+
+/// The fixture's `u32`-BE-length-prefixed frames.
+fn unpack_frames(bytes: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos < bytes.len() {
+        let n = u32::from_be_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        out.push(bytes[pos + 4..pos + 4 + n].to_vec());
+        pos += 4 + n;
+    }
+    out
+}
+
+type Row = (Vec<u8>, u64, Option<Vec<u8>>);
+
+/// Seeded stopped-node state: one engine at `prefix` holding committed
+/// envelopes, v2 intents (one key at two MVCC versions, one in the SSTable and
+/// one in the WAL), a v1 intent, malformed tag-2 junk and a tombstone.
+/// Returns every row written as `(key, version, value)`.
+fn seed_txn_engine(env: &SimEnv, prefix: &str) -> Vec<Row> {
+    let v2 = unpack_frames(&fixtures("txn-envelope")[&2]);
+    let v1 = unpack_frames(&fixtures("txn-envelope")[&1]);
+    assert_eq!((v2.len(), v1.len()), (5, 4));
+    let engine = block_on(LsmEngine::open_with(env.clone(), prefix, lsm_opts())).expect("open");
+    let mut rows: Vec<Row> = vec![
+        (b"k0-committed".to_vec(), 5, Some(v2[0].clone())),
+        (b"k1-committed-empty".to_vec(), 6, Some(v2[1].clone())),
+        (b"k2-intent".to_vec(), 10, Some(v2[2].clone())),
+        (b"k3-intent-delete".to_vec(), 11, Some(v2[3].clone())),
+        (b"k5-v1-intent".to_vec(), 12, Some(v1[2].clone())),
+        // Tag 2 but not a v2 intent: must never be touched.
+        (b"k6-junk".to_vec(), 13, Some(vec![2, 1, 2, 3])),
+        (b"k7-gone".to_vec(), 14, None),
+    ];
+    for (k, v, val) in &rows {
+        match val {
+            Some(val) => assert!(block_on(engine.merge(k, val, *v)).unwrap()),
+            None => assert!(block_on(engine.merge_tombstone(k, *v)).unwrap()),
+        }
+    }
+    // Everything so far goes to an SSTable; what follows lives only in the WAL.
+    block_on(engine.flush_now()).expect("flush");
+    let wal_rows: Vec<Row> = vec![
+        // The same key again at a newer version: BOTH versions are rewritten.
+        (b"k2-intent".to_vec(), 20, Some(v2[2].clone())),
+        (b"k4-intent-prior-empty".to_vec(), 21, Some(v2[4].clone())),
+    ];
+    for (k, v, val) in &wal_rows {
+        assert!(block_on(engine.merge(k, val.as_ref().unwrap(), *v)).unwrap());
+    }
+    rows.extend(wal_rows);
+    drop(engine);
+    rows
+}
+
+/// What `rows` must read back as after a v2 -> v1 row transcode: every v2
+/// intent minus its trailing `prior` field, re-tagged `1`; nothing else moves.
+fn expected_after_downgrade(rows: &[Row]) -> Vec<Option<Vec<u8>>> {
+    let v2 = unpack_frames(&fixtures("txn-envelope")[&2]);
+    // v2 frames 2/3/4 carry priors "was" / None / "" — the `opt_bytes` suffix
+    // a v1 intent does not have (`0` | `1 len:u32 bytes`).
+    let suffix = |val: &[u8]| -> Option<usize> {
+        if val == v2[2].as_slice() {
+            Some(1 + 4 + 3)
+        } else if val == v2[3].as_slice() {
+            Some(1)
+        } else if val == v2[4].as_slice() {
+            Some(1 + 4)
+        } else {
+            None
+        }
+    };
+    rows.iter()
+        .map(|(_, _, val)| {
+            val.as_ref().map(|val| match suffix(val) {
+                Some(n) => {
+                    let mut out = vec![1u8];
+                    out.extend_from_slice(&val[1..val.len() - n]);
+                    out
+                }
+                None => val.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Read every `(key, version)` of `rows` back through a freshly opened engine.
+fn read_rows(env: &SimEnv, prefix: &str, rows: &[Row]) -> Vec<Option<Vec<u8>>> {
+    let engine = block_on(LsmEngine::open_with(env.clone(), prefix, lsm_opts())).expect("reopen");
+    rows.iter()
+        .map(|(k, v, _)| block_on(engine.get_at(k, *v)).unwrap().map(|vv| vv.value))
+        .collect()
+}
+
+#[test]
+fn txn_envelope_row_transcode_registration_is_complete() {
+    for r in transcode::ROW_TABLE {
+        let emb = transcode::EMBEDDED
+            .iter()
+            .find(|e| e.name == r.name)
+            .unwrap_or_else(|| panic!("{}: ROW_TABLE entry has no EMBEDDED row", r.name));
+        assert_eq!(emb.current_version, r.current_version, "{}", r.name);
+        assert_eq!(
+            r.versions.last().map(|v| v.version),
+            Some(r.current_version),
+            "{}: versions must end with current",
+            r.name
+        );
+    }
+    // Every embedded format past v1 needs a real transcode: either its
+    // carrier's own transcode already reaches that version (a `TABLE` entry at
+    // least that new), or it is a `ROW_TABLE` row. An engine-resident format
+    // bumped without either would be untested by every tier.
+    for e in transcode::EMBEDDED.iter().filter(|e| e.current_version > 1) {
+        let carried = match e.carrier {
+            transcode::Carrier::Table(t) => {
+                transcode::entry(t).is_some_and(|c| c.current_version >= e.current_version)
+            }
+            transcode::Carrier::OffDisk => false,
+        };
+        assert!(
+            carried || transcode::row_entry(e.name).is_some(),
+            "{}: v{} has neither a carrier transcode at that version nor a ROW_TABLE entry",
+            e.name,
+            e.current_version
+        );
+    }
+    assert_eq!(transcode::supported_row_back(), vec![0, 1]);
+}
+
+#[test]
+fn txn_envelope_v2_intents_are_rewritten_to_v1_in_sstables_and_wal() {
+    each_seed("txn_envelope_row_transcode", |seed| {
+        let sc = Scenario::new(seed);
+        let env = sc.env();
+        let rows = seed_txn_engine(&env, sc.prefix);
+        let want_before: Vec<_> = rows.iter().map(|r| r.2.clone()).collect();
+        assert_eq!(
+            read_rows(&env, sc.prefix, &rows),
+            want_before,
+            "seed={seed}: seeding"
+        );
+        let want_after = expected_after_downgrade(&rows);
+        assert_ne!(
+            want_before, want_after,
+            "seed={seed}: the control is vacuous"
+        );
+
+        // The harness entry point: file pass at 0 (identity), row pass at 1.
+        let opts = TranscodeOpts {
+            row_back: 1,
+            ..TranscodeOpts::default()
+        };
+        let report = transcode::transcode_disk(&env, 0, &opts)
+            .unwrap_or_else(|e| panic!("seed={seed}: transcode_disk: {e}"));
+        // SSTable: k2@10 + k3. WAL: the active segment survives the flush, so it
+        // still holds the first half too: k2@10 + k3 + k2@20 + k4.
+        assert_eq!(
+            report.rows.values_rewritten, 6,
+            "seed={seed}: {:?}",
+            report.rows
+        );
+        assert_eq!(
+            report.rows.values_seen, 14,
+            "seed={seed}: {:?}",
+            report.rows
+        );
+        let sst = report
+            .rows
+            .files_rewritten
+            .iter()
+            .filter(|f| f.contains("sst-"))
+            .count();
+        let wal = report
+            .rows
+            .files_rewritten
+            .iter()
+            .filter(|f| f.contains("wal-"))
+            .count();
+        assert!(
+            sst >= 1 && wal >= 1,
+            "seed={seed}: both carriers must be rewritten: {:?}",
+            report.rows
+        );
+        println!(
+            "seed={seed} prefix={:?}: row transcode rewrote {} of {} values over files {:?}",
+            sc.prefix,
+            report.rows.values_rewritten,
+            report.rows.values_seen,
+            report.rows.files_rewritten
+        );
+
+        if sc.crash_first {
+            sc.sim.crash(sc.node.clone());
+        }
+        assert_eq!(
+            read_rows(&env, sc.prefix, &rows),
+            want_after,
+            "seed={seed}: every v2 intent must read back as its v1 form, every other \
+             value untouched"
+        );
+
+        // Idempotent: nothing left to rewrite, no file touched.
+        let disk = sc.snapshot_disk();
+        let again = transcode::transcode_disk(&env, 0, &opts).expect("second pass");
+        assert_eq!(again.rows.values_rewritten, 0, "seed={seed}");
+        assert!(again.rows.files_rewritten.is_empty(), "seed={seed}");
+        assert_eq!(disk, sc.snapshot_disk(), "seed={seed}: second pass wrote");
+    });
+}
+
+/// A v1 (pre-sync-marker) WAL segment keeps its v1 header through the row
+/// rewrite, so the pass never silently upgrades what an older binary wrote.
+#[test]
+fn txn_envelope_row_transcode_keeps_a_v1_wal_a_v1_wal() {
+    each_seed("txn_envelope_row_transcode_v1_wal", |seed| {
+        let sc = Scenario::new(seed);
+        let env = sc.env();
+        let rows = seed_txn_engine(&env, sc.prefix);
+        let wals = |env: &SimEnv| -> Vec<String> {
+            block_on(env.list())
+                .unwrap()
+                .into_iter()
+                .filter(|f| transcode::classify(f, b"").is_some_and(|e| e.name == "lsm-wal"))
+                .collect()
+        };
+        assert!(!wals(&env).is_empty());
+        for f in wals(&env) {
+            let bytes = block_on(env.read(&f)).unwrap();
+            let v1 = animus_storage::reframe_wal_to_v1(&bytes).expect("reframe");
+            block_on(env.replace(&f, &v1)).unwrap();
+        }
+        let opts = TranscodeOpts {
+            row_back: 1,
+            ..TranscodeOpts::default()
+        };
+        let report = transcode::transcode_disk(&env, 0, &opts).expect("transcode");
+        assert_eq!(report.rows.values_rewritten, 6, "seed={seed}");
+        for f in wals(&env) {
+            let bytes = block_on(env.read(&f)).unwrap();
+            assert_eq!(bytes[4], 1, "seed={seed}: {f} must stay a v1 WAL");
+        }
+        assert_eq!(
+            read_rows(&env, sc.prefix, &rows),
+            expected_after_downgrade(&rows),
+            "seed={seed}"
+        );
+    });
+}
+
+#[test]
+fn txn_envelope_row_transcode_refusals_and_mixed_versions() {
+    let sc = Scenario::new(41);
+    let env = sc.env();
+    let _ = seed_txn_engine(&env, sc.prefix);
+    let before = sc.snapshot_disk();
+
+    // v2 is the newest and v1 the oldest the table lists: two back is
+    // unsupported, an error before any file is touched.
+    let err = transcode::transcode_rows(&env, 2, &TranscodeOpts::default()).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+    assert_eq!(before, sc.snapshot_disk());
+    // Zero back is the identity: no pass at all.
+    let none = transcode::transcode_rows(&env, 0, &TranscodeOpts::default()).unwrap();
+    assert_eq!(none, Default::default());
+    assert_eq!(before, sc.snapshot_disk());
+
+    // Everything kept at the current version (a fully mixed-version engine):
+    // every file is skipped and nothing changes.
+    let all_kept = TranscodeOpts {
+        keep_current_fraction_permille: 1000,
+        ..TranscodeOpts::default()
+    };
+    let r = transcode::transcode_rows(&env, 1, &all_kept).unwrap();
+    assert_eq!(r.values_rewritten, 0);
+    assert!(!r.files_skipped.is_empty());
+    assert_eq!(before, sc.snapshot_disk());
+
+    // A seeded half: some files older, some current, and the engine opens and
+    // serves every row at one shape or the other.
+    let mut saw_partial = false;
+    for seed in 0..32u64 {
+        let sc = Scenario::new(seed);
+        let env = sc.env();
+        let rows = seed_txn_engine(&env, sc.prefix);
+        let half = TranscodeOpts {
+            keep_current_fraction_permille: 500,
+            seed,
+            ..TranscodeOpts::default()
+        };
+        let r = transcode::transcode_rows(&env, 1, &half).unwrap();
+        saw_partial |= !r.files_rewritten.is_empty() && !r.files_skipped.is_empty();
+        let got = read_rows(&env, sc.prefix, &rows);
+        let current: Vec<_> = rows.iter().map(|r| r.2.clone()).collect();
+        let older = expected_after_downgrade(&rows);
+        for (i, g) in got.iter().enumerate() {
+            assert!(
+                *g == current[i] || *g == older[i],
+                "seed={seed}: row {i} is at neither version"
+            );
+        }
+    }
+    assert!(saw_partial, "no seed produced a partly-rewritten engine");
+}

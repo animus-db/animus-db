@@ -101,17 +101,19 @@ async fn accept_refuses_mismatched_version_and_keeps_serving() {
     // The server writes its own preamble first, unconditionally — read it
     // back before sending anything ourselves, and check it names the real
     // protocol/version this build actually speaks.
-    let mut header = [0u8; handshake::HEADER_LEN];
-    timeout(Duration::from_secs(5), raw.read_exact(&mut header))
-        .await
-        .expect("read within budget")
-        .expect("read the server's own preamble");
-    let (their_preamble, consumed) =
-        handshake::decode(&header).expect("decode the server's own preamble header");
-    assert_eq!(
-        consumed,
-        handshake::HEADER_LEN,
-        "v1 preamble carries no extension"
+    // `read_preamble` reads the header AND the extension area (ADR 0073
+    // Phase 2: a node now advertises its supported cluster-version range in
+    // the `ext`, so a bare `HEADER_LEN` read would leave those bytes behind).
+    let their_preamble = timeout(
+        Duration::from_secs(5),
+        animus_env::read_preamble(&mut raw, &handshake::CLIENT_PROTOCOL),
+    )
+    .await
+    .expect("read within budget")
+    .expect("read the server's own preamble");
+    assert!(
+        !their_preamble.extensions.is_empty(),
+        "a Phase 2 node advertises its version range in the preamble ext"
     );
     assert_eq!(their_preamble.magic, handshake::CLIENT_PROTOCOL.magic);
     assert_eq!(their_preamble.version, handshake::CLIENT_PROTOCOL.version);
@@ -195,11 +197,13 @@ async fn accept_refuses_a_pre_baseline_frame_with_no_preamble() {
 
     // Read (and discard) the server's own preamble — present regardless of
     // what the client does.
-    let mut header = [0u8; handshake::HEADER_LEN];
-    timeout(Duration::from_secs(5), raw.read_exact(&mut header))
-        .await
-        .expect("read within budget")
-        .expect("read the server's own preamble");
+    timeout(
+        Duration::from_secs(5),
+        animus_env::read_preamble(&mut raw, &handshake::CLIENT_PROTOCOL),
+    )
+    .await
+    .expect("read within budget")
+    .expect("read the server's own preamble");
 
     // A pre-baseline client's own first bytes: a plain, unversioned
     // length-prefixed `ClientRequest::Status` frame, never this preamble.

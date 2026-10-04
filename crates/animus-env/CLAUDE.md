@@ -1235,3 +1235,5 @@ non-trivial), so under `--encryption-key` the swap re-reads and `replace`s.
 `animusd` test `sim_cluster_admin::metric_references_exist_in_exposition`
 fails if any name in `docs/`, `website/` or `deploy/observability/` is not in
 the live exposition. Exported names are unprefixed (no `animus_`).
+
+- **Overload counters (R-01 (d))**: `Metric::OverloadShed{ConnCap,Admission,AdminConnCap,PeerConnCap}` (`overload_shed_*`), appended after `CpGroupsRefusedAsVoter`, recorded by `animusd::overload` users. Known issue: `prod.rs::read_frames` allocates `vec![0; len]` from a peer-supplied `u32` with no cap (see `docs/resource-bounds.md` section 4).

@@ -289,7 +289,7 @@
     <h2>The list we'd want to be shown.</h2>
     <ul style="font-size:14.5px;max-width:720px">
       <li>TLS is config-gated and off by default; no authentication beyond opt-in SigV4 on the client DynamoDB port either way.</li>
-      <li>No rolling upgrades or mixed-version clusters yet. Upgrading means stopping the whole cluster and restarting it on the new version; on-disk formats are readable across versions, the node-to-node wire is not.</li>
+      <li>No rolling upgrades or mixed-version clusters yet. Upgrading means stopping the whole cluster and restarting it on the new version; on-disk formats are readable across versions, the node-to-node wire is not. Rolling upgrade is in progress: nodes now advertise the cluster versions their binary supports and an operator-driven, irreversible <code>animus cluster finalize</code> step exists, but the mixed-version gates and corpus are not in yet, so it remains unsupported.</li>
       <li>Restore always creates a brand-new table, never in-place.</li>
       <li>Tablets never merge, so a table that shrinks keeps its tablet count.</li>
       <li>Not benchmarked at scale, and no performance claims are made for that reason.</li>

@@ -630,8 +630,10 @@ Three things about them that a doc comment cannot enforce:
   claim (no wake, checked against a real quiesced 3-node group's own
   timeline/metrics rather than just structurally) is `tests/
   quiesced_eventual_read.rs`'s regression.
-- **An unresolved intent reads back one MVCC version**
-  (`stale_value` → `prior_committed`), never as absent. `local_get`'s raw
+- **An unresolved intent reads back the key's last committed value**
+  (`stale_value` → `prior_committed`, which takes it from the v2 intent's own
+  carried `prior` — never from MVCC history, see the envelope bullet in Key
+  invariants), never as absent. `local_get`'s raw
   peek reports it as absent — correct for its admin/debug callers, a
   fabricated deletion for a client-visible read. `stale_scan_rows` applies
   the same rule row-by-row, where `resolve_scan_rows` drops the row.
@@ -1108,8 +1110,10 @@ State once here; cross-referenced from the sections below.
   including a mid-commit leader kill).
 - **The value envelope + transactions (`txn.rs`).** Every value the apply
   path merges into the engine is 1-byte-tagged: `0` = committed (raw value
-  follows), `1` = an intent naming the staging `TxnId`, its record's
-  logical key, and the staged value (`None` = a staged delete). Every read
+  follows), `2` = an intent (`txn-envelope` v2) naming the staging `TxnId`,
+  its record's logical key, the staged value (`None` = a staged delete) and
+  the **prior** committed value it shadows (`None` = absent); `1` is the
+  retired v1 intent with no prior (`txn::legacy::v1`, still decoded). Every read
   path unwraps it before a value reaches a caller: point reads resolve via
   `RaftKvNode::read_resolved` (bounded retry while `Pending`); scans resolve
   via `resolve_scan_rows`, **non-blocking** — a still-`Pending` row is
@@ -1121,9 +1125,20 @@ State once here; cross-referenced from the sections below.
   regardless of caller:
 
   - `Aborted` (or a later `Committed`) resolution serves the value the key
-    held immediately before the intent, restored by rewinding to
-    `get_at(key, intent_version - 1)` — **never** a tombstone, which would
-    incorrectly shadow that older, still-live committed value.
+    held immediately before the intent — **never** a tombstone over a
+    committed value. **That value comes from the intent itself**
+    (`IntentPrior::Known`, captured by `TxnStage`'s apply from the key's
+    latest record via `stage_intent_prior`), **never from MVCC history**:
+    the old `get_at(key, intent_version - 1)` lookback lost acked writes
+    (ADR 0018's 2026-10-04 amendment) because `LsmEngine` compaction GC drops
+    versions below a floor about 1 ms of HLC behind the newest write, and an
+    `InstallSnapshot` image ships latest records only. Only a legacy v1
+    intent (`IntentPrior::Unknown`) still uses the lookback. **General rule:
+    no apply or read path may depend on `get_at` below the newest version
+    unless something holds that history** (a held `LsmSnapshot`); the
+    `MemoryEngine`-only corpora cannot catch a violation — see
+    `tests/it/txn_abort_restore_history.rs` and `animus-test`'s
+    `lsm_compaction_*` txn-corpus cells.
   - **`erase_scope` deliberately does NOT go through `local_scan`** (which
     filters record keys and resolves values) — it uses `raw_scoped_keys`,
     since drop-table GC must physically erase everything this scope ever
@@ -2876,6 +2891,21 @@ wire/image codec is `pub(crate)`; new formats add a section in whichever fits.
     build must not touch (pre-baseline or newer-version data). Keep the
     refusal a plain `return None` before that `match` arm.
 
+- **`txn-envelope` v2** (`txn.rs`, ADR 0018's 2026-10-04 amendment): the
+  per-value tag byte is the version (`0` committed, `1` v1 intent, `2` v2
+  intent = v1 body + trailing `prior`). `decode_envelope` dispatches on it;
+  `txn::legacy::v1` holds the frozen v1 decoder and the v1 encoder behind
+  `legacy-encoders` (like every legacy encoder), plus `downgrade_intent_to_v1`
+  (re-exported as `downgrade_txn_envelope_to_v1`): the strict whole-value v2 -> v1
+  down-conversion the upgrade harness's engine-row transcode
+  (`animus-test`'s `ROW_TABLE`) applies to every stored row. It parses the *entire*
+  v2 shape (tag, every field, the trailing `prior`, nothing after) before touching a
+  value, because an engine holds many unrelated value kinds and a row carries no
+  type marker beyond the tag. Fixtures
+  `txn-envelope/v1.bin` + `v2.bin` (`u32`-BE-length-prefixed envelope
+  values), tests in `src/format_fixture_tests.rs`. The shared v1 body codec
+  (`put_intent_v1_body`/`decode_intent_v1_body`) is frozen: a future version
+  that changes those fields copies them into `legacy::v1` first.
 - **Decoder dispatch + `legacy` seam (ADR 0073 Phase 1, P1-A).** Every
   format here (`backup-manifest`, `backup-data`, `segment`, `raftkv-wire`,
   `raftkv-image`, `cp-engine-layout`) keeps its `0`/`> CURRENT` named error
@@ -3053,7 +3083,7 @@ different host/session/media (the bench prints the resolved `/proc/mounts`
 filesystem type + device for whatever directory it writes into, so a
 reader never has to take the media on faith).
 
-**Upgrade-harness class (ADR 0073 P1-D):** none of this crate's formats is a whole-file `TABLE` entry; `raftkv-wal` and `cp-engine-layout` are `EMBEDDED` in a whole-file carrier (`control-wal`/`lsm-sstable`), and `raftkv-wire`, `raftkv-image`, `segment`, `backup-manifest`, `backup-data` are `EMBEDDED` off-disk (`animus-test`'s `upgrade::transcode::EMBEDDED`).
+**Upgrade-harness class (ADR 0073 P1-D):** none of this crate's formats is a whole-file `TABLE` entry; `raftkv-wal`, `cp-engine-layout` and `txn-envelope` (v2) are `EMBEDDED` in a whole-file carrier (`control-wal`/`lsm-sstable`), and `raftkv-wire`, `raftkv-image`, `segment`, `backup-manifest`, `backup-data` are `EMBEDDED` off-disk (`animus-test`'s `upgrade::transcode::EMBEDDED`).
 
 ## `wal_lock` is a FIFO-fair `FairMutex` (apply-task starvation fix)
 
@@ -3070,3 +3100,29 @@ own internal mutex (in `animus-control`) is only taken inside `append_tagged`/
 `tests/apply_not_starved_by_wal_lock.rs` (both paths, asserts on
 `engine_applied_index`, never core `last_applied`). ADR 0017's and ADR 0038's
 2026-09-30 amendments.
+
+## Gate enforcement (ADR 0073 Phase 2, P2-B)
+
+- **`gates.rs`**: exhaustive `GatedCommand for KvCommand` (all `Base`) and
+  `KvWire::envelope_gate`/`required_gate`; the shared helpers `encode_for_send`
+  (check the frame's envelope gate, then encode at the gate-selected frame
+  version; `None` = drop) and `check_propose`. Every `env.send_stream` of a `KvWire`
+  (read probe, initial probe, campaign outs, the three drive-loop sites, the
+  heartbeat batcher's flush) goes through `encode_for_send`; the four
+  `core.propose` sites (`propose_ordered`, `_aux`, `propose_kind_eval`,
+  `propose_kind_eval_batch`) go through `RaftKvNode::gated_propose`. As in the
+  control plane, **send sites check the envelope only; `AppendEntries` entry gates
+  are enforced at propose.**
+- **`codec.rs`**: `WIRE_VERSIONS`/`IMAGE_VERSIONS` tables `(frame version, Gate)`;
+  `encode_wire(w, &features)` / `encode_image(entries, max_ts, &features)` write
+  the highest version whose gate is open; decoders accept every version up to
+  `VERSION`. Only v1 (`Gate::Base`) exists, so a B2 encoder emits Phase 1 bytes
+  under any handle (`format_fixture_tests::pre_era_encoders_are_byte_identical_*`).
+  A new frame version = a table row + body arm + decoder arm (old one to
+  `legacy`) + fixture.
+- **Features plumbing**: `RaftKvNode::features()`; every existing `start_*` uses a
+  floor `ClusterFeatures::new()`; `RaftKvNode::start_hosted_with_options(.., HostedOptions)`
+  injects the control-fed handle; `host::Reconciler::set_cluster_features` (also
+  re-points its `HeartbeatBatcher` via `set_features`) is the production seam P2-C
+  calls with `RaftNode::features()`. A hosted group keeps the handle it started with.
+

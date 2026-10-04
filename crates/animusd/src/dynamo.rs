@@ -476,12 +476,35 @@ pub(crate) async fn serve(
     ctx: ClientCtx,
     tls: Option<tokio_rustls::TlsAcceptor>,
 ) {
+    // R-01 (d), ADR 0074 §2: a connection beyond `max_connections` is answered
+    // `503 ServiceUnavailable` and closed (plain HTTP only — a TLS listener
+    // cannot speak HTTP before its handshake, so it closes outright), never
+    // parked and never given a task of its own.
+    let shed_response = (tls.is_none()).then(|| {
+        crate::overload::shed_response(
+            "application/x-amz-json-1.0",
+            &WireError::service_unavailable(
+                "the node is at its connection limit (max_connections); retry",
+            )
+            .to_json(),
+        )
+    });
     loop {
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
+                let Some(conn_permit) = ctx.overload.dynamo_conns.try_acquire() else {
+                    ctx.overload.metrics.incr(Metric::OverloadShedConnCap);
+                    crate::overload::shed_connection(
+                        stream,
+                        shed_response.clone(),
+                        &ctx.overload.shed_tasks,
+                    );
+                    continue;
+                };
                 let ctx = ctx.clone();
                 let tls = tls.clone();
                 tokio::spawn(async move {
+                    let _conn_permit = conn_permit;
                     let stream = match tls {
                         None => MaybeTlsStream::Plain(stream),
                         Some(acceptor) => match acceptor.accept(stream).await {
@@ -590,7 +613,31 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
         } else {
             Principal::unrestricted()
         };
+        // R-01 (d), ADR 0074 §2: node-wide admission control. A request over
+        // `max_inflight_requests` is refused immediately with the retryable
+        // `ServiceUnavailable` — never queued. The permit is held for exactly
+        // the work (`dispatch`), not the response write. (Pipelining is
+        // bounded per connection by construction: this loop reads, runs and
+        // answers one request before reading the next.)
+        let Some(inflight) = ctx.overload.inflight.try_acquire() else {
+            ctx.overload.metrics.incr(Metric::OverloadShedAdmission);
+            let err = WireError::service_unavailable(
+                "the node is at its in-flight request limit (max_inflight_requests); retry",
+            );
+            http::write_amz_json_response(
+                &mut stream,
+                error_status(&err),
+                &err.to_json(),
+                keep_alive,
+            )
+            .await?;
+            if !keep_alive {
+                return Ok(());
+            }
+            continue;
+        };
         let (status, body) = dispatch(&ctx, &request, &principal).await;
+        drop(inflight);
         // R-01 (f): request-outcome counters for the 5xx-ratio alert.
         if let Some(data) = ctx.data.as_ref() {
             data.raftkv_metrics.incr(Metric::DynamoRequestsTotal);
@@ -11091,6 +11138,7 @@ mod stream_write_path_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                overload: None,
             }],
             dynamo_auth: None,
             cluster_settings: None,

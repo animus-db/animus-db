@@ -70,7 +70,7 @@ async fn main() -> ExitCode {
         Err(msg) => {
             eprintln!("animus: {msg}");
             eprintln!(
-                "\nusage:\n  animus [--tls-ca PATH] status <node-addr>\n  animus [--tls-ca PATH] put <node-addr> <table> <key> <value>\n  animus [--tls-ca PATH] get <node-addr> <table> <key>\n  animus [--tls-ca PATH] get-eventual <node-addr> <table> <key>\n{SEED_USAGE}\n{ADMIN_USAGE}"
+                "\nusage:\n  animus [--tls-ca PATH] status <node-addr>\n  animus [--tls-ca PATH] put <node-addr> <table> <key> <value>\n  animus [--tls-ca PATH] get <node-addr> <table> <key>\n  animus [--tls-ca PATH] get-eventual <node-addr> <table> <key>\n{SEED_USAGE}\n{CLUSTER_USAGE}\n{ADMIN_USAGE}"
             );
             ExitCode::FAILURE
         }
@@ -213,6 +213,9 @@ async fn maybe_tls_connect(
 const SEED_USAGE: &str = "  seed <admin-addr> <table> <count> [--start N] [--key-prefix P] \
     [--value-bytes B] [--concurrency C] [--batch N]";
 
+const CLUSTER_USAGE: &str = "  cluster version <admin-addr> [--json]\n  \
+    cluster finalize <leader-admin-addr> [--to N] [--yes]";
+
 const ADMIN_USAGE: &str = "  admin <subcommand> <admin-addr> [args]:\n    \
     config|status|raft|raftkv|metrics|health <admin-addr>\n    \
     peers|txns|backups|restores|backup-store|ttl-reaper|gc|segment-store|control-members|storage-control <admin-addr>\n    \
@@ -269,6 +272,13 @@ async fn run(args: &[String], tls: Option<&tokio_rustls::TlsConnector>) -> Resul
     // `admin` subcommand, not a client address like `put`/`get`.
     if cmd == "seed" {
         return run_seed(&args[1..], tls).await;
+    }
+    // `cluster version|finalize` (ADR 0073 Phase 2, P2-C): the cluster's
+    // active version, per-node supported ranges, and the manual,
+    // irreversible Finalize step. Admin-port commands like `seed`, so the
+    // address is an **admin** address.
+    if cmd == "cluster" {
+        return run_cluster(&args[1..], tls).await;
     }
     let addr = args.get(1).ok_or("missing <node-addr>")?;
 
@@ -1680,6 +1690,229 @@ async fn run_control_remove(
     Ok(())
 }
 
+// ---- `cluster version` / `cluster finalize` (ADR 0073 Phase 2, P2-C) -----
+
+/// Parsed `cluster finalize` arguments.
+#[derive(Debug, PartialEq, Eq)]
+struct FinalizeArgs {
+    addr: String,
+    to: Option<u32>,
+    yes: bool,
+}
+
+/// Pure argument parsing for `cluster finalize <leader-admin-addr> [--to N]
+/// [--yes]` (unit-testable, no socket I/O). `args` excludes the leading
+/// `finalize`.
+fn parse_finalize_args(args: &[String]) -> Result<FinalizeArgs, String> {
+    let addr = args
+        .first()
+        .filter(|a| !a.starts_with("--"))
+        .ok_or("cluster finalize needs <leader-admin-addr>")?
+        .clone();
+    let mut to = None;
+    let mut yes = false;
+    let mut it = args[1..].iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--yes" => yes = true,
+            "--to" => {
+                let v = it.next().ok_or("--to needs a version number")?;
+                to = Some(
+                    v.parse::<u32>()
+                        .map_err(|_| format!("--to: {v:?} is not a version number"))?,
+                );
+            }
+            other => return Err(format!("cluster finalize: unknown argument {other:?}")),
+        }
+    }
+    Ok(FinalizeArgs { addr, to, yes })
+}
+
+fn range_str(v: &serde_json::Value) -> String {
+    if v.is_null() {
+        "-".to_string()
+    } else {
+        format!("[{},{}]", v["min"], v["max"])
+    }
+}
+
+/// Human rendering of `GET /admin/cluster-version` (pure).
+fn format_cluster_version(v: &serde_json::Value) -> String {
+    let mut out = String::new();
+    let era = v["era_active"].as_bool().unwrap_or(false);
+    if !era {
+        out.push_str("version era: not started (every member must run a versioned binary and report in first)\n");
+    }
+    out.push_str(&format!("active cluster version: {}\n", v["active"]));
+    out.push_str(&format!(
+        "this node's binary: range {} build {}\n",
+        range_str(&v["own_range"]),
+        v["own_build"].as_str().unwrap_or("-")
+    ));
+    match v["safe_target"].as_u64() {
+        Some(t) => out.push_str(&format!("safe target: {t}\n")),
+        None => out.push_str("safe target: none (a member has not reported)\n"),
+    }
+    out.push_str("nodes:\n");
+    for n in v["nodes"].as_array().map_or(&[][..], Vec::as_slice) {
+        out.push_str(&format!(
+            "  {:<12} {:<8} {:<8} range {:<8} build {}\n",
+            n["node"].as_str().unwrap_or("?"),
+            n["role"].as_str().unwrap_or("?"),
+            n["status"].as_str().unwrap_or("-"),
+            range_str(&n["range"]),
+            n["build"].as_str().unwrap_or("-"),
+        ));
+    }
+    let blockers = v["blockers"].as_array().map_or(&[][..], Vec::as_slice);
+    if blockers.is_empty() {
+        if v["can_finalize"].as_bool().unwrap_or(false) {
+            out.push_str(&format!("can finalize to {}: yes\n", v["target"]));
+        } else {
+            out.push_str(&format!(
+                "can finalize to {}: no (no member blocks it; this binary or the era does not allow it)\n",
+                v["target"]
+            ));
+        }
+    } else {
+        out.push_str(&format!("cannot finalize to {}; blockers:\n", v["target"]));
+        for b in blockers {
+            out.push_str(&format!(
+                "  {}: {}\n",
+                b["node"].as_str().unwrap_or("?"),
+                b["reason"].as_str().unwrap_or("?")
+            ));
+        }
+    }
+    out
+}
+
+/// The Finalize pre-flight over a fetched view (pure): the `(active,
+/// target)` pair if finalizing is allowed, else the refusal text naming
+/// every blocker. `to`, when given, must be exactly `active + 1`.
+fn finalize_preflight(v: &serde_json::Value, to: Option<u32>) -> Result<(u32, u32), String> {
+    if !v["era_active"].as_bool().unwrap_or(false) {
+        return Err(
+            "the version era has not started: not every member has reported its version yet".into(),
+        );
+    }
+    let active = u32::try_from(
+        v["active"]
+            .as_u64()
+            .ok_or("malformed view: no active version")?,
+    )
+    .map_err(|_| "malformed view: active version out of range")?;
+    let target = active + 1;
+    if let Some(to) = to
+        && to != target
+    {
+        return Err(format!(
+            "the cluster version is raised one step at a time: the next version is {target} (--to {to})"
+        ));
+    }
+    let blockers = v["blockers"].as_array().map_or(&[][..], Vec::as_slice);
+    if !blockers.is_empty() {
+        let named: Vec<String> = blockers
+            .iter()
+            .map(|b| {
+                format!(
+                    "{}: {}",
+                    b["node"].as_str().unwrap_or("?"),
+                    b["reason"].as_str().unwrap_or("?")
+                )
+            })
+            .collect();
+        return Err(format!(
+            "cannot finalize cluster version {target}: {}",
+            named.join("; ")
+        ));
+    }
+    if !v["can_finalize"].as_bool().unwrap_or(false) {
+        return Err(format!(
+            "cannot finalize cluster version {target}: this node's binary does not support it"
+        ));
+    }
+    Ok((active, target))
+}
+
+const FINALIZE_WARNING: &str = "Finalizing a cluster version CANNOT be undone: once raised, no \
+node may run a binary that does not support it, and there is no rollback. Re-run with --yes to proceed.";
+
+async fn run_cluster(
+    args: &[String],
+    tls: Option<&tokio_rustls::TlsConnector>,
+) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("version") => {
+            let addr = args.get(1).ok_or("cluster version needs <admin-addr>")?;
+            let raw_json = args.get(2).map(String::as_str) == Some("--json");
+            let (status, resp) =
+                http_call(addr, "GET", "/admin/cluster-version", None, tls).await?;
+            if !(200..300).contains(&status) {
+                println!("{resp}");
+                return Err(format!("admin request failed (HTTP {status})"));
+            }
+            if raw_json {
+                println!("{resp}");
+            } else {
+                let v: serde_json::Value =
+                    serde_json::from_str(&resp).map_err(|e| format!("malformed reply: {e}"))?;
+                print!("{}", format_cluster_version(&v));
+            }
+            Ok(())
+        }
+        Some("finalize") => {
+            let fa = parse_finalize_args(&args[1..])?;
+            let (status, resp) =
+                http_call(&fa.addr, "GET", "/admin/cluster-version", None, tls).await?;
+            if !(200..300).contains(&status) {
+                println!("{resp}");
+                return Err(format!("admin request failed (HTTP {status})"));
+            }
+            let view: serde_json::Value =
+                serde_json::from_str(&resp).map_err(|e| format!("malformed reply: {e}"))?;
+            print!("{}", format_cluster_version(&view));
+            let (active, target) = finalize_preflight(&view, fa.to)?;
+            if !fa.yes {
+                return Err(FINALIZE_WARNING.into());
+            }
+            println!("finalizing cluster version {active} -> {target} ...");
+            let body = serde_json::json!({"to": target, "expected": active}).to_string();
+            let (status, resp) = http_call(
+                &fa.addr,
+                "POST",
+                "/admin/cluster-version/finalize",
+                Some(body),
+                tls,
+            )
+            .await?;
+            println!("{resp}");
+            if !(200..300).contains(&status) {
+                // A non-leader's 409 names the leader to retry on.
+                return Err(format!("cluster-version/finalize failed (HTTP {status})"));
+            }
+            // Poll until the version is observed at the target (bounded).
+            for _ in 0..60 {
+                let (st, r) =
+                    http_call(&fa.addr, "GET", "/admin/cluster-version", None, tls).await?;
+                if (200..300).contains(&st)
+                    && let Ok(v) = serde_json::from_str::<serde_json::Value>(&r)
+                    && v["active"].as_u64() == Some(u64::from(target))
+                {
+                    println!("cluster version is now {target}");
+                    return Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            Err(format!(
+                "finalize was accepted but cluster version {target} was not observed within 30s; \
+                 check `cluster version`"
+            ))
+        }
+        _ => Err("cluster needs a subcommand: version | finalize".into()),
+    }
+}
+
 /// `animus admin control-grow <leader-admin-addr> <node-id> <new-node-admin-addr>
 /// [<node-id> <new-node-admin-addr>...]` (ADR 0037 PR3): the "3→5" composite —
 /// `RaftCore::change_membership` is single-server-at-a-time (ADR 0017 C), so
@@ -1835,6 +2068,7 @@ fn print_response(response: &ClientResponse) {
             client_route,
             intra_route,
             admin_addrs,
+            ..
         } => {
             println!("control ids: {control_ids:?}");
             println!("peers: {peers:?}");
@@ -1911,6 +2145,89 @@ mod tests {
             .chain(rest.iter().copied())
             .map(String::from)
             .collect()
+    }
+
+    fn sargs(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn finalize_args_parse() {
+        assert_eq!(
+            parse_finalize_args(&sargs(&["10.0.0.1:8080"])).unwrap(),
+            FinalizeArgs {
+                addr: "10.0.0.1:8080".into(),
+                to: None,
+                yes: false
+            }
+        );
+        assert_eq!(
+            parse_finalize_args(&sargs(&["h:1", "--to", "3", "--yes"])).unwrap(),
+            FinalizeArgs {
+                addr: "h:1".into(),
+                to: Some(3),
+                yes: true
+            }
+        );
+        assert!(parse_finalize_args(&sargs(&[])).is_err());
+        assert!(parse_finalize_args(&sargs(&["--yes"])).is_err());
+        assert!(parse_finalize_args(&sargs(&["h:1", "--to"])).is_err());
+        assert!(parse_finalize_args(&sargs(&["h:1", "--to", "x"])).is_err());
+        assert!(parse_finalize_args(&sargs(&["h:1", "--wat"])).is_err());
+    }
+
+    fn sample_view(blockers: serde_json::Value, can: bool) -> serde_json::Value {
+        serde_json::json!({
+            "era_active": true, "active": 1, "target": 2, "safe_target": 2,
+            "own_range": {"min": 1, "max": 2}, "own_build": "t",
+            "can_finalize": can, "blockers": blockers,
+            "nodes": [
+                {"node": "n0", "role": "combined", "status": "Active",
+                 "range": {"min": 1, "max": 2}, "build": "t", "reported": true},
+                {"node": "n1", "role": "data", "status": "Down",
+                 "range": null, "build": null, "reported": false}
+            ]
+        })
+    }
+
+    #[test]
+    fn cluster_version_output_names_nodes_and_blockers() {
+        let blockers = serde_json::json!([{"node": "n1", "reason": "member is Down"}]);
+        let text = format_cluster_version(&sample_view(blockers, false));
+        assert!(text.contains("active cluster version: 1"), "{text}");
+        assert!(text.contains("safe target: 2"), "{text}");
+        assert!(text.contains("n1"), "{text}");
+        assert!(text.contains("n1: member is Down"), "{text}");
+        assert!(text.contains("cannot finalize to 2"), "{text}");
+        let ok = format_cluster_version(&sample_view(serde_json::json!([]), true));
+        assert!(ok.contains("can finalize to 2: yes"), "{ok}");
+    }
+
+    #[test]
+    fn finalize_preflight_enforces_the_one_step_rule_and_names_blockers() {
+        let ok = sample_view(serde_json::json!([]), true);
+        assert_eq!(finalize_preflight(&ok, None).unwrap(), (1, 2));
+        assert_eq!(finalize_preflight(&ok, Some(2)).unwrap(), (1, 2));
+        assert!(
+            finalize_preflight(&ok, Some(3))
+                .unwrap_err()
+                .contains("one step")
+        );
+        let blocked = sample_view(
+            serde_json::json!([{"node": "n1", "reason": "member is Down"}]),
+            false,
+        );
+        let e = finalize_preflight(&blocked, None).unwrap_err();
+        assert!(e.contains("n1: member is Down"), "{e}");
+        let mut no_era = ok.clone();
+        no_era["era_active"] = serde_json::json!(false);
+        assert!(
+            finalize_preflight(&no_era, None)
+                .unwrap_err()
+                .contains("era")
+        );
+        let cannot = sample_view(serde_json::json!([]), false);
+        assert!(finalize_preflight(&cannot, None).is_err());
     }
 
     #[test]
