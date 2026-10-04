@@ -571,6 +571,16 @@
         groups and deletes their storage. The process is convergent — it finishes correctly even
         if nodes restart partway through.
       </p>
+      <h3>Runbook</h3>
+      <p>
+        Procedures for replacing or decommissioning a node, losing the control quorum, backup
+        and restore drills, certificate rotation, upgrades, disk sizing and overload live in the
+        <a href="https://github.com/animus-db/animus-db/blob/main/docs/runbook/README.md">operations
+        runbook</a>. It states plainly where a procedure has no tool yet (there is no recovery
+        tool for a permanently lost control quorum, no in-place encryption-key rotation, and
+        disk-full behaviour on a real node is untested) and which procedures have not yet been
+        exercised on a real cluster.
+      </p>
     </section>
 
     <section id="observability">
