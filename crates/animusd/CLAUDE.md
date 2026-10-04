@@ -1879,6 +1879,21 @@ a literal `:0`.
   `table_detail_with_no_pitr_or_backups_is_null_and_empty`/
   `table_detail_shows_pitr_status_and_backups`.
 
+## Overload and resource bounds (R-01 (d), ADR 0074 §2)
+
+`overload.rs` holds `CountGate` (non-blocking atomic permit counter),
+`OverloadState` (on `ClientCtx::overload`) and `shed_connection` (bounded
+refusal tasks). Limits come from `RoleAddrs::overload` (`config::
+OverloadSection`, per node, absent = defaults; `--max-connections`/
+`--max-inflight` on `--config/--node`, `data`, `join`; zero rejected). The
+DynamoDB listener sheds over `max_connections` with a 503 and closes; `handle_conn`
+sheds over `max_inflight_requests` with `ServiceUnavailable` around `dispatch`
+(`/metrics` exempt). Admin/console and the client/intra listeners have their own
+caps. Counters `overload_shed_{conn_cap,admission,admin_conn_cap,peer_conn_cap}`.
+Full table, memory audit, disk-full trace and design: `docs/resource-bounds.md`.
+Adding a field to `RoleAddrs` hits the usual ~80-literal `E0063` fan-out.
+Real-TCP regression: `tests/overload.rs`.
+
 ## CLI reference
 
 `main.rs --help` (or the `gen-config`/`join`/`control`/`data` subcommand

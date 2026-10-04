@@ -73,14 +73,36 @@ pub(crate) async fn serve(
     tables: TableSnapshotFn,
     backend: Arc<dyn ConsoleBackend>,
     tls: Option<tokio_rustls::TlsAcceptor>,
+    overload: crate::overload::OverloadState,
 ) {
+    // R-01 (d), ADR 0074 §2: bounded like the admin listener, against
+    // `max_admin_connections` (a `503`, then close; TLS closes outright).
+    let gate = crate::overload::CountGate::new(overload.limits.max_admin_connections);
+    let shed_response = tls.is_none().then(|| {
+        crate::overload::shed_response(
+            "text/plain; charset=utf-8",
+            "the console listener is at its connection limit (max_admin_connections); retry",
+        )
+    });
     loop {
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
+                let Some(conn_permit) = gate.try_acquire() else {
+                    overload
+                        .metrics
+                        .incr(animus_env::Metric::OverloadShedAdminConnCap);
+                    crate::overload::shed_connection(
+                        stream,
+                        shed_response.clone(),
+                        &overload.shed_tasks,
+                    );
+                    continue;
+                };
                 let tables = tables.clone();
                 let backend = backend.clone();
                 let tls = tls.clone();
                 tokio::spawn(async move {
+                    let _conn_permit = conn_permit;
                     let stream = match tls {
                         None => MaybeTlsStream::Plain(stream),
                         Some(acceptor) => match acceptor.accept(stream).await {

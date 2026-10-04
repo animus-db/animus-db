@@ -105,6 +105,7 @@ mod http;
 mod import;
 #[deny(clippy::disallowed_methods)]
 mod index_backfill;
+mod overload;
 #[deny(clippy::disallowed_methods)]
 mod pitr_janitor;
 #[deny(clippy::disallowed_methods)]
@@ -2898,6 +2899,12 @@ pub struct RoleAddrs {
     /// loaded and handed to `ProdEnv::bind_with_tls_and_key`.
     #[serde(default)]
     pub encryption_key_path: Option<String>,
+    /// This node's resource bounds / overload limits (R-01 (d), ADR 0074
+    /// §2) — `None` (every pre-existing config) means every default, see
+    /// [`config::OverloadSection`]. Not serialized when absent, so existing
+    /// configs and the `cluster-config` v1 fixture round-trip unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overload: Option<config::OverloadSection>,
 }
 
 /// Fallback endpoint for configs written before a field existed: an ephemeral
@@ -2981,6 +2988,8 @@ pub struct BoundNode {
     /// own tail (`start_with_growth`) reaches them — see that constructor's
     /// own doc for the cluster-wide key-scope contract this relies on.
     encryption_key: Option<animus_env::EncryptionKey>,
+    /// This node's overload limits (R-01 (d)), from `RoleAddrs::overload`.
+    overload: Option<config::OverloadSection>,
 }
 
 /// A node's identity + bound addresses, captured for the admin `/admin/config`
@@ -5304,6 +5313,7 @@ fn spawn_common_tail(
     dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
     tls: Option<TlsMaterial>,
     export_s3: Option<ExportS3Config>,
+    overload_limits: config::ResolvedLimits,
 ) -> (ClientCtx, Vec<tokio::task::JoinHandle<()>>) {
     // The seed `route_sync_loop` (below) re-overlays `Metadata.node_addrs[*].client`
     // onto every tick (ADR 0032 PR1) — the same static-base pattern
@@ -5326,6 +5336,7 @@ fn spawn_common_tail(
     // (`ClientCtx::any_table_throughput`'s doc) — a borrow, not a move, so
     // `control` below still moves into the struct unchanged.
     let initial_any_table_throughput = control.metadata_cached().any_table_throughput();
+    let overload_metrics = env.metrics();
     let export_store_factory = Arc::new(Mutex::new(default_export_store_factory(
         export_s3,
         env.clone(),
@@ -5364,6 +5375,7 @@ fn spawn_common_tail(
         any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(
             initial_any_table_throughput,
         )),
+        overload: overload::OverloadState::new(overload_limits, overload_metrics),
     };
     // ADR 0066 §1 (S-02 step 3): seed the lock-free "any catalog
     // credentials" fast path from whatever this node's control handle
@@ -5481,6 +5493,7 @@ fn spawn_common_tail(
             table_source,
             backend,
             tls.as_ref().map(|m| m.server_acceptor.clone()),
+            ctx.overload.clone(),
         )));
     }
 
@@ -6172,6 +6185,7 @@ impl BoundNode {
             dynamo_auth,
             self.tls,
             export_s3,
+            config::OverloadSection::resolve(self.overload.as_ref()),
         );
         // Adopted into the `StartupTasks` guard so the fallible
         // `check_wal_layout`/`SharedWal::open` steps below are covered too
@@ -6799,6 +6813,7 @@ impl Node {
             advertise_host: addrs.advertise_host,
             tls,
             encryption_key,
+            overload: addrs.overload,
         })
     }
 
@@ -6861,6 +6876,7 @@ impl Node {
             advertise_host: addrs.advertise_host,
             tls,
             encryption_key,
+            overload: addrs.overload,
         })
     }
 
@@ -6932,6 +6948,7 @@ impl Node {
             advertise_host: addrs.advertise_host,
             tls,
             encryption_key,
+            overload: addrs.overload,
         })
     }
 
@@ -7480,6 +7497,8 @@ pub struct BoundControlNode {
     tls: Option<TlsMaterial>,
     /// See [`BoundNode::encryption_key`]'s doc.
     encryption_key: Option<animus_env::EncryptionKey>,
+    /// This node's overload limits (R-01 (d)), from `RoleAddrs::overload`.
+    overload: Option<config::OverloadSection>,
 }
 
 impl BoundControlNode {
@@ -7771,6 +7790,7 @@ impl BoundControlNode {
             // never serves `ExportTableToPointInTime` either — nothing
             // here would ever call `ClientCtx::export_store_factory`.
             None,
+            config::OverloadSection::resolve(self.overload.as_ref()),
         );
         startup.extend(common_tail_tasks);
         // No fallible step remains in this assembly past this point (issue
@@ -7920,6 +7940,8 @@ pub struct BoundDataNode {
     tls: Option<TlsMaterial>,
     /// See [`BoundNode::encryption_key`]'s doc.
     encryption_key: Option<animus_env::EncryptionKey>,
+    /// This node's overload limits (R-01 (d)), from `RoleAddrs::overload`.
+    overload: Option<config::OverloadSection>,
 }
 
 impl BoundDataNode {
@@ -8298,6 +8320,7 @@ impl BoundDataNode {
             // this entry point) — a data-only node's own export factory
             // stays the "not configured" default until this is wired.
             None,
+            config::OverloadSection::resolve(self.overload.as_ref()),
         );
         // Adopted into the `StartupTasks` guard so the fallible
         // `check_wal_layout`/`SharedWal::open` steps below are covered too
@@ -11541,6 +11564,10 @@ pub(crate) struct ClientCtx<E: Env = ProdEnv, R: RelayClient = AnimusdRelayClien
     /// applied/fetched — never guessed from the request that triggered it.
     /// `Arc`-shared for the same reason `throttle_defaults` is.
     any_table_throughput: Arc<std::sync::atomic::AtomicBool>,
+    /// R-01 (d), ADR 0074 §2: this node's connection caps and in-flight
+    /// request bound (see [`overload`]). `Arc`-backed atomics inside, so
+    /// every per-connection clone shares one set of counters.
+    pub(crate) overload: overload::OverloadState,
 }
 
 impl<E: Env, R: RelayClient> ClientCtx<E, R> {
@@ -14913,14 +14940,25 @@ async fn serve_requests(
     tls: Option<tokio_rustls::TlsAcceptor>,
 ) {
     let mut handlers: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    // R-01 (d), ADR 0074 §2: this listener serves peers and the CLI, speaks a
+    // framed protocol rather than HTTP, and a peer reconnects on its own — so
+    // an over-cap connection is simply closed (no response to write).
+    let gate = overload::CountGate::new(ctx.overload.limits.max_peer_connections);
     loop {
         tokio::select! {
             accepted = listener_socket.accept() => {
                 match accepted {
                     Ok((stream, peer_addr)) => {
+                        let Some(conn_permit) = gate.try_acquire() else {
+                            ctx.overload.metrics.incr(Metric::OverloadShedPeerConnCap);
+                            tracing::warn!(%peer_addr, ?listener, "peer connection refused: at max_peer_connections");
+                            drop(stream);
+                            continue;
+                        };
                         let ctx = ctx.clone();
                         let tls = tls.clone();
                         handlers.spawn(async move {
+                            let _conn_permit = conn_permit;
                             let stream = match tls {
                                 None => MaybeTlsStream::Plain(stream),
                                 Some(acceptor) => match acceptor.accept(stream).await {
@@ -15585,6 +15623,7 @@ pub async fn bind_cluster_with_advertise_host_and_key(
             advertise_host: advertise_host.clone(),
             tls: None,
             encryption_key_path: encryption_key_path.clone(),
+            overload: None,
         };
         let node = Node::bind(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?;
         nodes.push(node);
@@ -16189,6 +16228,7 @@ pub async fn start_split_cluster_with_growth(
             advertise_host: None,
             tls: None,
             encryption_key_path: None,
+            overload: None,
         };
         control_bound.push(
             Node::bind_control(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?,
@@ -16208,6 +16248,7 @@ pub async fn start_split_cluster_with_growth(
             advertise_host: None,
             tls: None,
             encryption_key_path: None,
+            overload: None,
         };
         data_bound
             .push(Node::bind_data(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?);
@@ -18775,6 +18816,7 @@ mod confirm_futility_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                overload: None,
             }],
             dynamo_auth: None,
             cluster_settings: None,
@@ -19015,6 +19057,7 @@ mod forward_transport_failure_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                overload: None,
             })
             .collect();
         ClusterConfig {
@@ -19398,6 +19441,7 @@ mod forward_hop_timeout_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                overload: None,
             })
             .collect();
         ClusterConfig {
@@ -20227,6 +20271,7 @@ mod client_cancellation_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                overload: None,
             })
             .collect();
         ClusterConfig {
@@ -20591,6 +20636,7 @@ mod halted_shutdown_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                overload: None,
             }],
             dynamo_auth: None,
             cluster_settings: None,
@@ -20974,6 +21020,7 @@ mod simenv_client_ctx_tests {
             throttle: ThrottleTracker::new(),
             throttle_defaults: Arc::new(ThrottleDefaults::default()),
             any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            overload: Default::default(),
         };
 
         (sim, ctx, control, kv)
@@ -21621,6 +21668,7 @@ mod two_node_relay_tests {
             throttle: ThrottleTracker::new(),
             throttle_defaults: Arc::new(ThrottleDefaults::default()),
             any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            overload: Default::default(),
         };
 
         // Node A answers relayed requests through the generic dispatcher
@@ -21693,6 +21741,7 @@ mod two_node_relay_tests {
             throttle: ThrottleTracker::new(),
             throttle_defaults: Arc::new(ThrottleDefaults::default()),
             any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            overload: Default::default(),
         };
 
         (sim, ctx_a, ctx_b, control)
@@ -22718,6 +22767,7 @@ mod issue_298_conflict_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                overload: None,
                 console: addrs[5],
             }],
             dynamo_auth: None,

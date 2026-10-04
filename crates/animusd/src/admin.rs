@@ -282,12 +282,33 @@ pub(crate) async fn serve(
     ctx: ClientCtx,
     tls: Option<tokio_rustls::TlsAcceptor>,
 ) {
+    // R-01 (d), ADR 0074 §2: bounded like the DynamoDB listener (a `503`, then
+    // close; TLS closes outright), against `max_admin_connections`.
+    let gate = crate::overload::CountGate::new(ctx.overload.limits.max_admin_connections);
+    let shed_response = tls.is_none().then(|| {
+        crate::overload::shed_response(
+            "text/plain; charset=utf-8",
+            "the admin listener is at its connection limit (max_admin_connections); retry",
+        )
+    });
     loop {
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
+                let Some(conn_permit) = gate.try_acquire() else {
+                    ctx.overload
+                        .metrics
+                        .incr(animus_env::Metric::OverloadShedAdminConnCap);
+                    crate::overload::shed_connection(
+                        stream,
+                        shed_response.clone(),
+                        &ctx.overload.shed_tasks,
+                    );
+                    continue;
+                };
                 let ctx = ctx.clone();
                 let tls = tls.clone();
                 tokio::spawn(async move {
+                    let _conn_permit = conn_permit;
                     let stream = match tls {
                         None => MaybeTlsStream::Plain(stream),
                         Some(acceptor) => match acceptor.accept(stream).await {
@@ -3980,6 +4001,7 @@ mod system_table_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                overload: None,
             }],
             dynamo_auth: None,
             cluster_settings: None,
