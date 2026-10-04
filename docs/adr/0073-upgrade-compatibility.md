@@ -2233,3 +2233,51 @@ release train.
    out-of-range halt is observable through `RaftNode::halt_reason()`, and
    the named process exit is P2-C. The era-on flag flip on data-only nodes
    (`ControlHandle::Remote`) is P2-C too.
+
+### Amendment 2026-10-04 — P2-D as built (mixed-version corpus)
+
+Built against `main` plus P2-A; P2-B (gate enforcement, `required_gate` tables)
+and P2-C (node wiring, `ClusterFeatures` fed into emitters) are not on `main`, so
+this is the part of section 7 that does not depend on them.
+
+**Landed.**
+- `sim-versions` feature on `animus-control` (enabled via `animus-test`) with
+  `BinaryProfile {Phase1, B2, Release(N)}`, `RaftNode::set_binary_profile` (own
+  range + build + decode cap in one call) and a receive-site **rejection log**
+  (`CapLog`). The delivery assertion is read at the production drop point, not in
+  a `SimEnv` tap, because an `InstallSnapshot` payload is a chunk, not a parseable
+  message; a **state assertion** (a Phase 1 node's applied `Metadata` never shows
+  versioning fields) covers what the cap cannot see. Capped decode classifies with
+  a provisional single-call-site `provisional_required_gate` (era variants =>
+  `Gate::Era`): **P2-B replaces it with `required_gate`**.
+- Pure tier (`animus-control/tests/it/version_mixed_corpus.rs`): Phase1 -> B2 rolls
+  in several orders with leader kills, deterministic Phase1-leader and
+  B2-leader cells, kills swept around precondition P, member-down, a Phase 1
+  binary after the era (refused, counted, never recorded, Finalize blocked by
+  name), early Finalize and out-of-range halts, and negative control N1.
+- Cluster tier (`animusd` `sim_cluster_mixed_version_corpus`): rolling over
+  `SimCluster` under the linearizable DynamoDB-wire workload with control-leader
+  kills and a partition mid-roll, the same deterministic leader-by-profile cells,
+  a data-only node down at P, and N1. `SimCluster::set_binary_profile` applies a
+  profile through one `apply_profile` helper that `restart` also calls.
+- Knobs `ANIMUS_UPGRADE_SEEDS` (default 1), `ANIMUS_UPGRADE_CELL`, `ANIMUS_SEED`;
+  per-push at K=1, nightly deep in `corpus-deep.yml` (fixed depths, no new
+  `workflow_dispatch` input).
+- Mutation checks recorded in the PR: M1 (cap logs but delivers), M2 (P accepts a
+  `range: None` peer), M3 (the require-peer-ext flag never flipped), M4 (observe
+  only heartbeats) each fail the corpus; M4 only in the pure tier, because every
+  `SimCluster` control node is `Both` and heartbeats.
+
+**Pending, not registered as tests (nothing passes vacuously).**
+- Synthetic gate ladder, `required_gate`-exhaustiveness and byte-identity
+  per-gate tests, `ungated variant/field` and `stale view` negative controls
+  (N2-N4), the data-plane and `animus-node` tiers: **P2-B**.
+- Phase 1 joiners after the era, the data-only node's era flag
+  (`ControlHandle::Remote`), `RegisterNode` joiner range checks, and
+  `Release(N-1) -> Release(N)` cells over real gates: **P2-C** and the first
+  real gate.
+
+**Observed, not fixed (P2-A, unchanged).** `EraWatch::sync` sets the require flag
+even for an own range of `None`; the sim keeps `require_peer_ext` across
+`Simulator::stop`, so the restart window ProdEnv has is not modelled; the sim's
+disjoint-range check reads the sender's *current* ext. None blocks a cell here.
