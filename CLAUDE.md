@@ -101,17 +101,23 @@ baseline is set: `9a9f972f` (2026-09-29, see ADR 0073)**. From it on:
 older post-baseline binary wrote, an existing golden fixture is never edited
 or deleted (`scripts/check-format-fixtures.sh` enforces this in CI), and a
 format change is a new version tag plus a new fixture, never a rewrite of an
-old one. **Wire formats** join the same rule once Phase 2 (a replicated
-cluster version / feature gate) lands; **rolling upgrades** once Phase 3
-lands; **Support window: every post-baseline version stays readable forever**
+old one. **Wire formats** follow the same rule as of Phase 2 (done: a
+replicated cluster version and feature gates, below); an operator-orchestrated
+**rolling upgrade** waits for Phase 3; **Support window: every post-baseline version stays readable forever**
 (2026-09-30) — old decoders and fixtures are never deleted. **Phase 1 is done (2026-10-03):** every durable format has a
 version-dispatching decoder with a `legacy` seam and a per-version fixture
 test, and the upgrade-restart harness (`animus-test` tiers 0/1,
 `animusd` `sim_cluster_upgrade_corpus` tier 2; per-push at K=1, nightly in
 `corpus-deep.yml`) restarts on state transcoded to older versions. So a
 **whole-cluster stop → upgrade → restart is supported and tested**;
-**mixed-version wire and rolling upgrades are not** (Phases 2 and 3 —
-Phase 2, a replicated cluster version / feature gate, is next). The
+**Phase 2 is done (2026-10-04):** a replicated cluster version and feature
+gates (`Gate`, `ClusterFeatures`, `GatedCommand::required_gate`, ADR 0073
+sections 1-4 and 8), a mixed-version corpus (both tiers, negative controls,
+`ANIMUS_UPGRADE_SEEDS`), and a **manual node-by-node rolling upgrade with no
+stop, from today's Phase 1 binaries to B2 and from release R-1 to R**
+(`animus cluster version` / `animus cluster finalize`; skipping a release,
+rolling a node back and a Phase 1 binary joining after the era started are
+not supported). The operator-orchestrated roll is Phase 3. The
 first real bumps have landed (2026-10-03, #1140/#1141/#1142): `control-wal`,
 `shared-wal` and the LSM WAL (`lsm-wal`, `LWL1`) are v2 (WAL sync markers) and
 the harness transcodes them to v1 for real; `raftkv-wal` is v2 too (embedded
@@ -120,7 +126,12 @@ the identity. **A format change follows ADR 0073's "Phase 1 design"
 checklist** ([`docs/adr/0073-upgrade-compatibility.md`](docs/adr/0073-upgrade-compatibility.md):
 bump, keep the vN decoder under `legacy`, new no-overwrite fixture,
 per-version expected value, round-trip and old-input tests, test-only legacy
-encoder, inventory row). Wire changes stay free until Phase 2. See ADR 0073 for the phase
+encoder, inventory row) **plus, for any cross-node surface (a wire or
+replicated shape), the Phase 2 step: classify it G (gated on the cluster
+version or the era), L (node-local) or F (outlives the cluster), and for G
+name its `Gate` (an exhaustive `required_gate` row, no `_` arm; emit sites
+check it, a per-gate test and a mixed-version corpus cell cover it); a new
+cross-node variant or field without a gate wedges older replicas**. See ADR 0073 for the phase
 plan, the conventions (tag shape, fixture layout), and the open questions
 (support window length, the hash-ring/key-encoding layer). A break that
 can't be made compatible needs an explicit ADR amendment naming it and its

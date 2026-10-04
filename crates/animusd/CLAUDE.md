@@ -7323,7 +7323,8 @@ with an empty `ext`; an era-on peer refuses and redials (closing it needs an
   `POST /admin/cluster-version/finalize` (`ClientCtx::admin_finalize_cluster_version`:
   leadership first, era, one-step, `expected` CAS, blockers, propose, confirm on
   the version value). Blockers include Down/Leaving/never-activated Joining
-  members strictly; `Metadata::apply` does not enforce that half (issue #1168).
+  members strictly; `Metadata::apply` enforces that half too since issue #1168
+  (the pre-check is operator-level, apply is authoritative).
   `animus cluster version|finalize` (`animus-cli`) wraps them.
 - **Admission/joins**: `admin_add_control_member` refuses (era on) a voter with
   no known range or an excluding one (so the voter must be up, connected or
@@ -7333,6 +7334,37 @@ with an empty `ext`; an era-on peer refuses and redials (closing it needs an
 - **Halt**: `main.rs` `wait_for_shutdown` races the signal against every node's
   `wait_version_halt`; a halt prints `animusd: FATAL: <reason>` and exits 78
   (`EX_CONFIG`), no usage text.
+- **Gated emit/receive sites (P2-B handoffs, closed out)**: every client frame
+  is written through `write_frame_gated` (`ClientGated` + the node's
+  `ClusterFeatures`; the ungated `write_frame` stays for tests and raw clients);
+  `AnimusdRelayClient`/`relay_request_with_timeout` carry the handle and map an
+  `InvalidInput` (closed gate) to `relay refused: ...`, never a wire write. The
+  relay **receiver** (`forwarding.rs` `ProposeSchema`) calls
+  `version_wiring::relay_gate_verdict` after the relayable check: it re-reads
+  `effective_metadata` once before refusing, counts
+  `Metric::ClusterGateRelayRefused`, and answers a named `ClientResponse::Error`
+  (without it a closed-gate relayed command reaches `RaftNode::propose`, which
+  debug-asserts). Both reconciler sites call `set_cluster_features` so every
+  hosted `RaftKvNode` runs on the node's control-fed handle (data-only nodes
+  included, fed from the mirror). `ClusterFeatures::violations` is exported as
+  `Metric::ClusterGateViolations*` by the feeder loop and on every
+  `/admin/metrics` scrape. **Gotcha: `SimEnv::env.metrics()` is a per-(sim,
+  node) sink, NOT the exported sink** (in `ProdEnv` they coincide); anything a
+  metric test must observe goes through `ClientCtx::exported_metrics()`.
+  `SimCluster::control_features(n)` is the `RaftNode`'s own handle (what
+  `propose` consults), distinct from `features(n)` (the node-level handle the
+  wire/relay emitters use).
+- **Mixed-version corpus cluster tier** (`sim_cluster_mixed_version_corpus.rs`):
+  besides the rolling cells, the workload-free cells `ladder_finalize_each_gate`,
+  `negative_control_ungated_{variant,field}` / `_stale_view`,
+  `joiner_phase1_after_era`, `joiner_phase1_dials_data_only_node` (the data-only
+  node's require-peer-ext flag comes from the feeder via
+  `ControlHandle::Remote`) and `joiner_range_checks`.
+  `SimCluster::try_join_via_seed_as(seed, role, range)` plays a joiner binary
+  (its `ext` on the throwaway dial identity, the production `check_join_range`
+  at discovery) and returns the refusal instead of panicking; a joiner range
+  disjoint from the cluster's is refused earlier, by the handshake, so the
+  discovery check is only reachable by a range that overlaps it.
 - **Tests**: `sim_cluster_cluster_version.rs` (`SimCluster::set_node_version` /
   `set_all_node_versions` are the per-node "binary" hook; synthetic `[1, 2]`
   ranges stand in for a second release; `set_raft_own_range` switches the
