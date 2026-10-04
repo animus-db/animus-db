@@ -173,12 +173,18 @@ fn operator_peer(operator_labels: BTreeMap<String, String>) -> NetworkPolicyPeer
 /// (`crd::S3StoreSpec::validate`) or stripped the field entirely — this
 /// builder stays a total function of its input regardless.
 fn s3_endpoint_ports(s3: &crate::crd::S3StoreSpec) -> BTreeSet<i32> {
-    [s3.backup_store.as_deref(), s3.segment_store.as_deref()]
+    let mut ports: BTreeSet<i32> = [s3.backup_store.as_deref(), s3.segment_store.as_deref()]
         .into_iter()
         .flatten()
         .filter_map(|uri| s3_uri::parse(uri).ok())
         .filter_map(|info| info.port)
-        .collect()
+        .collect();
+    // `webIdentity` (S-08 M1) calls STS over HTTPS: open 443 to the same
+    // `egressCidrs` (a NetworkPolicy cannot express a hostname allowlist).
+    if s3.web_identity.is_some() {
+        ports.insert(443);
+    }
+    ports
 }
 
 /// Build the `NetworkPolicy` for `cluster`.
@@ -393,7 +399,8 @@ mod tests {
         crate::crd::S3StoreSpec {
             backup_store: Some(backup.to_string()),
             segment_store: None,
-            credentials_secret_name: "my-s3-creds".to_string(),
+            credentials_secret_name: Some("my-s3-creds".to_string()),
+            web_identity: None,
             allow_insecure_http: true,
             egress_cidrs: egress_cidrs.into_iter().map(str::to_string).collect(),
         }
@@ -491,6 +498,32 @@ mod tests {
     }
 
     #[test]
+    fn web_identity_opens_443_for_sts_alongside_the_endpoint_port() {
+        let mut cluster = test_cluster("demo", "ns", 3, None);
+        let mut s3 = test_s3_spec(
+            "s3://bucket?endpoint=http://minio.ns.svc:9000&insecure_http=true",
+            vec!["10.0.0.0/8"],
+        );
+        s3.credentials_secret_name = None;
+        s3.web_identity = Some(crate::crd::S3WebIdentitySpec {
+            role_arn: "arn:aws:iam::1:role/r".to_string(),
+            ..Default::default()
+        });
+        cluster.spec.s3 = Some(s3);
+        let np = build(&cluster, &cluster.spec);
+        let egress = np.spec.unwrap().egress.unwrap();
+        let ports: Vec<_> = egress[2]
+            .ports
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|p| p.port.clone())
+            .collect();
+        assert!(ports.contains(&Some(IntOrString::Int(9000))), "{ports:?}");
+        assert!(ports.contains(&Some(IntOrString::Int(443))), "{ports:?}");
+    }
+
+    #[test]
     fn s3_egress_rule_uses_the_endpoints_explicit_port() {
         let mut cluster = test_cluster("c", "ns", 3, None);
         cluster.spec.s3 = Some(test_s3_spec(
@@ -539,7 +572,8 @@ mod tests {
         cluster.spec.s3 = Some(crate::crd::S3StoreSpec {
             backup_store: Some("s3://bucket/backups?endpoint=https://s3.example.com".to_string()),
             segment_store: Some("s3://bucket/streams?endpoint=https://s3.example.com".to_string()),
-            credentials_secret_name: "my-s3-creds".to_string(),
+            credentials_secret_name: Some("my-s3-creds".to_string()),
+            web_identity: None,
             allow_insecure_http: false,
             egress_cidrs: crate::crd::S3StoreSpec::default_egress_cidrs(),
         });
@@ -562,7 +596,8 @@ mod tests {
                 "s3://bucket/streams?endpoint=http://minio.ns.svc:9000&insecure_http=true"
                     .to_string(),
             ),
-            credentials_secret_name: "my-s3-creds".to_string(),
+            credentials_secret_name: Some("my-s3-creds".to_string()),
+            web_identity: None,
             allow_insecure_http: true,
             egress_cidrs: crate::crd::S3StoreSpec::default_egress_cidrs(),
         });

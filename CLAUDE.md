@@ -228,6 +228,7 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 | `ANIMUS_WAL_REWRITE_CRASH_SEEDS=K` | 1 | staged WAL-compaction-rewrite crash corpus depth (`animus-cp-data`, issue #1116) — whole-cluster power-cut at 12 offsets into a stalled rewrite, plain and torn/corrupt tails; every acked write must survive — `cargo test -p animus-cp-data --test it wal_rewrite_crash::` |
 | `ANIMUS_ZONE_PLACEMENT_SEEDS=K` | 1 | zone-labelled placement + whole-zone-loss corpus depth over `SimCluster` (`animusd`, G-01 stage G-a) — 6 nodes, 2 per zone, RF 3: every tablet spans 3 zones, kill a zone, no acked write lost, repair re-converges — `cargo test -p animusd --lib sim_cluster_zone_placement` |
 | `ANIMUS_EXPORT_IMPORT_SEEDS=K` | 1 | S3 export/import fault-injection corpus depth (`animus-test`, ADR 0068, S-05 PR 3) |
+| `ANIMUS_S3_FAULT_SEEDS=K` | 1 | S3 store retry/backoff fault-injection corpus depth (`animus-test`, `tests/it/s3_fault_corpus.rs`, S-08 M3) — `S3SegmentStore<FaultyTransport<FakeS3>, SimEnv>`: 5xx/429/timeout/lost-ack bursts, multipart part/Complete failures, expiring and failing credential providers; `ANIMUS_SEED=<seed>` replays one seed per cell — `cargo test -p animus-test --test it s3_fault_corpus::` |
 | `ANIMUS_HEARTBEAT_SEEDS=K` | 1 | per-node heartbeat-batcher fault-injection corpus depth (`animus-cp-data`, ADR 0044 phase 2, C-02 PR 2) — run via `cargo test -p animus-cp-data --test it heartbeat_batch_corpus::` |
 | `ANIMUS_DIRECTED_PLACING_LOAD_SEEDS=K` | 1 | directed-Placing (2-of-3 replica diff) learner-promotion-under-a-continuous-writer corpus depth (`animus-cp-data`, issue #1064) — `cargo test -p animus-cp-data --test it directed_placing_under_sustained_load::` |
 | `ANIMUS_LEARNER_SNAPSHOT_LIVELOCK_SEEDS=K` | 1 | late-joining-learner-needing-a-real-InstallSnapshot-under-a-continuous-writer corpus depth (`animus-cp-data`, issue #1064 part 2) — `cargo test -p animus-cp-data --test it learner_snapshot_livelock_under_continuous_writer::` |
@@ -474,8 +475,9 @@ truth; this map is just for navigation.
   The backup/restore/PITR feature train is complete. S3 export/import
   (ADR 0068) and the S3 `SegmentStore` backend (`animus-s3`,
   `--backup-store s3://...`, ADR 0059's S-04 amendment) have both landed;
-  what remains of the S3 side (non-static credentials, multipart) is
-  `docs/roadmap.md` S-08.
+  the S3 side's credential sources (static/env/web-identity/container/IMDS),
+  multipart upload, `Env`-seamed retry and real-endpoint CI landed as S-08
+  (ADR 0059's 2026-10-04 amendment; residuals in `docs/roadmap.md`).
 - **Observability & operations** — metrics seam (`animus-env`, ADR 0015,
   additive/no-op under sim); OTLP tracing (`animusd::otel`, ADR 0027, opt-in);
   the admin/debug HTTP-JSON interface (`animusd::admin`, ADR 0020, pure

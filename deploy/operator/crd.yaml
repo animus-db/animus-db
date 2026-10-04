@@ -239,6 +239,9 @@ spec:
                       (`crate::desired::cluster_config::entrypoint_script`) — the secret
                       value itself is never copied into the `ConfigMap` or `cluster.json`,
                       only read out of the mounted `Secret` at runtime, inside the pod.
+                      **Exactly one of this and [`Self::web_identity`] must be set**
+                      (S-08 M1; previously this field was required).
+                    nullable: true
                     type: string
                   egressCidrs:
                     default:
@@ -262,8 +265,30 @@ spec:
                     description: '`--segment-store` value for every combined-role pod.'
                     nullable: true
                     type: string
-                required:
-                - credentialsSecretName
+                  webIdentity:
+                    description: |-
+                      Temporary credentials via the pod's projected service-account token
+                      exchanged with STS `AssumeRoleWithWebIdentity` (EKS IRSA) instead of
+                      a long-lived `Secret`. See [`S3WebIdentitySpec`]. Exactly one of this
+                      and [`Self::credentials_secret_name`].
+                    nullable: true
+                    properties:
+                      audience:
+                        description: Audience of the projected token. Defaults to `sts.amazonaws.com`.
+                        nullable: true
+                        type: string
+                      roleArn:
+                        description: The IAM role to assume (`arn:aws:iam::<account>:role/<name>`).
+                        type: string
+                      serviceAccountName:
+                        description: |-
+                          `serviceAccountName` for every pod (the SA the role's trust policy
+                          names). `None` keeps the namespace's `default` ServiceAccount.
+                        nullable: true
+                        type: string
+                    required:
+                    - roleArn
+                    type: object
                 type: object
               schemaVersion:
                 description: |-

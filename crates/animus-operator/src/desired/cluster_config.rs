@@ -331,6 +331,13 @@ pub const S3_MOUNT_DIR: &str = "/etc/animus/s3";
 /// — the secret value itself is read out of the mounted `Secret` at
 /// runtime, inside the pod, see `crate::crd::S3StoreSpec`'s own doc).
 pub const S3_CREDENTIALS_RUNTIME_PATH: &str = "/tmp/animus-s3-credentials.json";
+/// Where `spec.s3.webIdentity`'s projected service-account-token volume is
+/// mounted (S-08 M1), and the token file name inside it.
+pub const S3_WEB_IDENTITY_MOUNT_DIR: &str = "/var/run/secrets/animus/s3-web-identity";
+pub const S3_WEB_IDENTITY_TOKEN_FILE: &str = "token";
+/// Requested token lifetime; the kubelet rotates at 80% of it and
+/// `animusd` re-reads the file on every STS call.
+pub const S3_WEB_IDENTITY_TOKEN_EXPIRY_SECS: i64 = 3600;
 
 /// The [`RoleAddrs::tls`] section every node gets when `spec.tls` is set —
 /// every field points into [`TLS_MOUNT_DIR`], the one `Secret` mounted
@@ -403,6 +410,11 @@ pub fn encryption_key_mount_path() -> String {
 /// even though it's the less sensitive of the two (AWS access key ids are
 /// `[A-Za-z0-9]+`, so no JSON-escaping surprises from a well-formed one).
 ///
+/// **`spec.s3.webIdentity` (S-08 M1)** replaces that `Secret` read with a
+/// static JSON file (`source: web_identity`, the role ARN, and the path of
+/// the projected token mounted at [`S3_WEB_IDENTITY_MOUNT_DIR`]) — nothing
+/// secret is read or embedded.
+///
 /// **`spec.backupStore`/`spec.segmentStore` (S-07b) — the non-S3
 /// `cluster`/`fs:`/`dir:` forms — share the same `--backup-store`/
 /// `--segment-store` flag emission as `spec.s3`'s own two fields above (see
@@ -471,9 +483,26 @@ pub fn entrypoint_script(spec: &AnimusClusterSpec) -> String {
         // `access_key_id` is likewise read out of the mount at runtime,
         // never baked into this generated script by the operator — see
         // this function's own doc.
-        both_preamble.push_str(&format!(
-            "\x20\x20printf '{{\"access_key_id\":\"%s\",\"secret_access_key_file\":\"{S3_MOUNT_DIR}/secret_access_key\"}}' \"$(cat {S3_MOUNT_DIR}/access_key_id)\" > {S3_CREDENTIALS_RUNTIME_PATH}\n"
-        ));
+        if let Some(wi) = &s3.web_identity {
+            // S-08 M1: no secret exists to read — the file just names the
+            // role and the projected token's path (re-read by `animusd` on
+            // every STS call, so kubelet rotation needs no restart).
+            let json = serde_json::json!({
+                "source": "web_identity",
+                "role_arn": wi.role_arn,
+                "web_identity_token_file":
+                    format!("{S3_WEB_IDENTITY_MOUNT_DIR}/{S3_WEB_IDENTITY_TOKEN_FILE}"),
+            })
+            .to_string();
+            both_preamble.push_str(&format!(
+                "\x20\x20printf '%s' {} > {S3_CREDENTIALS_RUNTIME_PATH}\n",
+                shell_single_quote(&json)
+            ));
+        } else {
+            both_preamble.push_str(&format!(
+                "\x20\x20printf '{{\"access_key_id\":\"%s\",\"secret_access_key_file\":\"{S3_MOUNT_DIR}/secret_access_key\"}}' \"$(cat {S3_MOUNT_DIR}/access_key_id)\" > {S3_CREDENTIALS_RUNTIME_PATH}\n"
+            ));
+        }
         both_flags.push_str(&format!(" --s3-credentials {S3_CREDENTIALS_RUNTIME_PATH}"));
         if s3.allow_insecure_http {
             both_flags.push_str(" --allow-insecure-s3");
@@ -943,7 +972,8 @@ mod tests {
                     .to_string(),
             ),
             segment_store: Some("s3://bucket/streams?endpoint=https://s3.example.com".to_string()),
-            credentials_secret_name: "my-s3-creds".to_string(),
+            credentials_secret_name: Some("my-s3-creds".to_string()),
+            web_identity: None,
             allow_insecure_http: true,
             egress_cidrs: crate::crd::S3StoreSpec::default_egress_cidrs(),
         });
@@ -1013,10 +1043,57 @@ mod tests {
         crate::crd::S3StoreSpec {
             backup_store: backup.map(str::to_string),
             segment_store: segment.map(str::to_string),
-            credentials_secret_name: "my-s3-creds".to_string(),
+            credentials_secret_name: Some("my-s3-creds".to_string()),
+            web_identity: None,
             allow_insecure_http: allow_insecure,
             egress_cidrs: crate::crd::S3StoreSpec::default_egress_cidrs(),
         }
+    }
+
+    fn web_identity_s3() -> crate::crd::S3StoreSpec {
+        crate::crd::S3StoreSpec {
+            credentials_secret_name: None,
+            web_identity: Some(crate::crd::S3WebIdentitySpec {
+                role_arn: "arn:aws:iam::123456789012:role/animus".to_string(),
+                service_account_name: None,
+                audience: None,
+            }),
+            ..s3_spec(
+                Some("s3://bucket/backups?endpoint=https://s3.example.com"),
+                None,
+                false,
+            )
+        }
+    }
+
+    #[test]
+    fn entrypoint_web_identity_writes_a_static_credentials_file() {
+        let mut s = spec(3);
+        s.s3 = Some(web_identity_s3());
+        let script = entrypoint_script(&s);
+        let (both_branch, data_branch) = script.split_once("else").unwrap();
+        assert!(both_branch.contains("--s3-credentials /tmp/animus-s3-credentials.json"));
+        assert!(!data_branch.contains("--s3-credentials"));
+        // No Secret read, no secret mount path.
+        assert!(!script.contains("/etc/animus/s3"), "{script}");
+        assert!(!script.contains("$(cat"), "{script}");
+        // The generated JSON names the source, role and token path.
+        let json_line = script
+            .lines()
+            .find(|l| l.contains("printf '%s'"))
+            .expect("credentials preamble");
+        assert!(
+            json_line.contains("\"source\":\"web_identity\""),
+            "{json_line}"
+        );
+        assert!(
+            json_line.contains("arn:aws:iam::123456789012:role/animus"),
+            "{json_line}"
+        );
+        assert!(
+            json_line.contains("/var/run/secrets/animus/s3-web-identity/token"),
+            "{json_line}"
+        );
     }
 
     #[test]

@@ -50,8 +50,8 @@ use k8s_openapi::api::core::v1::{
     Affinity, ConfigMapVolumeSource, Container, DownwardAPIVolumeFile, DownwardAPIVolumeSource,
     EmptyDirVolumeSource, EnvVar, HTTPGetAction, ObjectFieldSelector, PersistentVolumeClaim,
     PersistentVolumeClaimSpec, PodAffinityTerm, PodAntiAffinity, PodSpec, PodTemplateSpec, Probe,
-    ResourceRequirements, SecretVolumeSource, TopologySpreadConstraint, Volume, VolumeMount,
-    WeightedPodAffinityTerm,
+    ProjectedVolumeSource, ResourceRequirements, SecretVolumeSource, ServiceAccountTokenProjection,
+    TopologySpreadConstraint, Volume, VolumeMount, VolumeProjection, WeightedPodAffinityTerm,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
@@ -60,7 +60,8 @@ use serde::Serialize;
 
 use super::cluster_config::{
     self, CONFIG_MOUNT_DIR, DATA_DIR, DYNAMO_AUTH_MOUNT_DIR, ENCRYPTION_KEY_MOUNT_DIR,
-    ENTRYPOINT_FILE_NAME, S3_MOUNT_DIR, TLS_MOUNT_DIR,
+    ENTRYPOINT_FILE_NAME, S3_MOUNT_DIR, S3_WEB_IDENTITY_MOUNT_DIR,
+    S3_WEB_IDENTITY_TOKEN_EXPIRY_SECS, S3_WEB_IDENTITY_TOKEN_FILE, TLS_MOUNT_DIR,
 };
 use super::{
     common_labels, config_map_name, internal_service_name, owner_reference, selector_labels,
@@ -249,6 +250,8 @@ const DATA_VOLUME: &str = "data";
 const DYNAMO_AUTH_VOLUME: &str = "dynamo-auth";
 const TLS_VOLUME: &str = "tls";
 const S3_VOLUME: &str = "s3";
+/// `spec.s3.webIdentity`'s projected service-account-token volume.
+const S3_WEB_IDENTITY_VOLUME: &str = "s3-web-identity";
 const ENCRYPTION_KEY_VOLUME: &str = "encryption-key";
 const TOPOLOGY_VOLUME: &str = "topology";
 /// `defaultMode` for the encryption-key `Secret` volume (ADR 0069, S-03 PR
@@ -423,20 +426,48 @@ pub fn build(cluster: &AnimusCluster, spec: &AnimusClusterSpec) -> StatefulSet {
     // own "no per-pod port striding" doc for why every pod's spec here is
     // otherwise identical).
     if let Some(s3) = &spec.s3 {
-        volumes.push(Volume {
-            name: S3_VOLUME.to_string(),
-            secret: Some(SecretVolumeSource {
-                secret_name: Some(s3.credentials_secret_name.clone()),
+        if let Some(secret_name) = &s3.credentials_secret_name {
+            volumes.push(Volume {
+                name: S3_VOLUME.to_string(),
+                secret: Some(SecretVolumeSource {
+                    secret_name: Some(secret_name.clone()),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
-            ..Default::default()
-        });
-        volume_mounts.push(VolumeMount {
-            name: S3_VOLUME.to_string(),
-            mount_path: S3_MOUNT_DIR.to_string(),
-            read_only: Some(true),
-            ..Default::default()
-        });
+            });
+            volume_mounts.push(VolumeMount {
+                name: S3_VOLUME.to_string(),
+                mount_path: S3_MOUNT_DIR.to_string(),
+                read_only: Some(true),
+                ..Default::default()
+            });
+        }
+        // S-08 M1: `webIdentity` — a short-lived, kubelet-rotated projected
+        // service-account token (no Secret anywhere); `animusd` re-reads
+        // it from `S3_WEB_IDENTITY_TOKEN_PATH` on every STS call.
+        if let Some(wi) = &s3.web_identity {
+            volumes.push(Volume {
+                name: S3_WEB_IDENTITY_VOLUME.to_string(),
+                projected: Some(ProjectedVolumeSource {
+                    sources: Some(vec![VolumeProjection {
+                        service_account_token: Some(ServiceAccountTokenProjection {
+                            audience: Some(wi.audience_or_default().to_string()),
+                            expiration_seconds: Some(S3_WEB_IDENTITY_TOKEN_EXPIRY_SECS),
+                            path: S3_WEB_IDENTITY_TOKEN_FILE.to_string(),
+                        }),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            volume_mounts.push(VolumeMount {
+                name: S3_WEB_IDENTITY_VOLUME.to_string(),
+                mount_path: S3_WEB_IDENTITY_MOUNT_DIR.to_string(),
+                read_only: Some(true),
+                ..Default::default()
+            });
+        }
     }
 
     // ADR 0069 S-03 PR 3: `spec.encryptionKeySecretName`'s `Secret` — never
@@ -590,6 +621,11 @@ pub fn build(cluster: &AnimusCluster, spec: &AnimusClusterSpec) -> StatefulSet {
                 }),
                 spec: Some(PodSpec {
                     containers: vec![container],
+                    service_account_name: spec
+                        .s3
+                        .as_ref()
+                        .and_then(|s3| s3.web_identity.as_ref())
+                        .and_then(|wi| wi.service_account_name.clone()),
                     volumes: Some(volumes),
                     topology_spread_constraints,
                     affinity,
@@ -1010,7 +1046,8 @@ mod tests {
         crate::crd::S3StoreSpec {
             backup_store: Some("s3://bucket?endpoint=https://s3.example.com".to_string()),
             segment_store: None,
-            credentials_secret_name: "my-s3-creds".to_string(),
+            credentials_secret_name: Some("my-s3-creds".to_string()),
+            web_identity: None,
             allow_insecure_http: false,
             egress_cidrs: crate::crd::S3StoreSpec::default_egress_cidrs(),
         }
@@ -1049,6 +1086,57 @@ mod tests {
         let sts = build(&cluster, &cluster.spec);
         let pod_spec = sts.spec.unwrap().template.spec.unwrap();
         assert!(!pod_spec.volumes.unwrap().iter().any(|v| v.name == "s3"));
+    }
+
+    #[test]
+    fn s3_web_identity_projects_a_service_account_token_and_sets_the_sa() {
+        let mut cluster = test_cluster("c", "ns", 3, None);
+        let mut s3 = test_s3_spec();
+        s3.credentials_secret_name = None;
+        s3.web_identity = Some(crate::crd::S3WebIdentitySpec {
+            role_arn: "arn:aws:iam::1:role/r".to_string(),
+            service_account_name: Some("animus-sa".to_string()),
+            audience: None,
+        });
+        cluster.spec.s3 = Some(s3);
+        let sts = build(&cluster, &cluster.spec);
+        let pod_spec = sts.spec.unwrap().template.spec.unwrap();
+        assert_eq!(pod_spec.service_account_name.as_deref(), Some("animus-sa"));
+        let vols = pod_spec.volumes.unwrap();
+        assert!(!vols.iter().any(|v| v.name == "s3"), "no Secret volume");
+        let vol = vols
+            .iter()
+            .find(|v| v.name == "s3-web-identity")
+            .expect("projected volume");
+        let proj = &vol.projected.as_ref().unwrap().sources.as_ref().unwrap()[0];
+        let tok = proj.service_account_token.as_ref().unwrap();
+        assert_eq!(tok.audience.as_deref(), Some("sts.amazonaws.com"));
+        assert_eq!(tok.path, "token");
+        let mount = pod_spec.containers[0]
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.name == "s3-web-identity")
+            .expect("mount");
+        assert_eq!(mount.mount_path, "/var/run/secrets/animus/s3-web-identity");
+        assert_eq!(mount.read_only, Some(true));
+    }
+
+    #[test]
+    fn s3_secret_credentials_leave_the_service_account_alone() {
+        let mut cluster = test_cluster("c", "ns", 3, None);
+        cluster.spec.s3 = Some(test_s3_spec());
+        let sts = build(&cluster, &cluster.spec);
+        let pod_spec = sts.spec.unwrap().template.spec.unwrap();
+        assert!(pod_spec.service_account_name.is_none());
+        assert!(
+            !pod_spec
+                .volumes
+                .unwrap()
+                .iter()
+                .any(|v| v.name == "s3-web-identity")
+        );
     }
 
     // --- `encryptionKeySecretName` (ADR 0069, S-03 PR 3) -------------------

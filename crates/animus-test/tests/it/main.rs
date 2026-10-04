@@ -8,6 +8,7 @@ mod export_import_fault_corpus;
 mod negative_control;
 mod pitr_fault_corpus;
 mod raftkv_linearizable;
+mod s3_fault_corpus;
 mod segment_store_encrypted_fault_corpus;
 mod stream_lineage_corpus;
 mod txn_serializable;

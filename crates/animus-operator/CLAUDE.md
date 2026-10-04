@@ -784,6 +784,30 @@ exists and defaults open (`["0.0.0.0/0"]`): narrow it to your object
 store's real address range — `deploy/operator/example.yaml`'s commented
 `s3:` section says so inline.
 
+### `spec.s3.webIdentity` (S-08 M1)
+
+`S3StoreSpec` takes **exactly one** of `credentialsSecretName` (now
+`Option<String>`, still serialized when set, so existing CRs/fixtures
+round-trip unchanged) or `webIdentity { roleArn, serviceAccountName?,
+audience? (default sts.amazonaws.com) }` (`S3WebIdentitySpec`);
+`S3StoreSpec::validate` enforces it (and `roleArn` starting `arn:`).
+`statefulset::build` mounts a `serviceAccountToken` projected volume
+(`s3-web-identity`, 3600s, read-only at
+`/var/run/secrets/animus/s3-web-identity/token`) instead of the Secret
+volume and sets `serviceAccountName` when given.
+`cluster_config::entrypoint_script` writes a *static* credentials JSON via
+`printf '%s' '<json>'` (`{"source":"web_identity","role_arn":...,
+"web_identity_token_file":...}`) — no Secret is read or embedded.
+`networkpolicy::s3_endpoint_ports` adds 443 (STS) to the S3 egress rule.
+`s3_uri::parse` now validates `path_style=true|false` and, for `false`,
+the same DNS-endpoint/DNS-bucket rules as `animus_s3::client::
+validate_virtual_hosted` (duplicated, pinned by `virtual_hosted_rules_match_animusd`).
+`deploy/operator/crd.yaml` was regenerated (`crd_manifest_pinned`), and the
+append-only fixture `tests/fixtures/formats/animuscluster-spec/
+v1-s3-web-identity.json` was added (the fixture test accepts
+`vN-<variant>.json` names). Still combined-role pods only, like all of
+`spec.s3`.
+
 ## Non-S3 stores (S-07b, closes `docs/roadmap.md`'s S-07 item b)
 
 `AnimusClusterSpec.backup_store`/`.segment_store: Option<String>` (`crd.rs`)

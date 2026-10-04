@@ -523,7 +523,7 @@
         inbound, only the cluster's own pods (plus the operator, for admin polling) and the
         DynamoDB port from anywhere; outbound, the cluster's own pods on the Raft/RPC ports
         plus DNS by default, and — only when an S3-compatible backup/segment store is
-        configured (<code>spec.s3</code>) — that store's own endpoint port, scoped to an
+        configured (<code>spec.s3</code>) — that store's own endpoint port (plus 443 for STS when <code>spec.s3.webIdentity</code> is used), scoped to an
         explicit, operator-set CIDR list. <code>spec.tls</code> turns TLS on for every port
         the cluster binds (a pre-existing <code>Secret</code>, or one the operator asks
         cert-manager to issue) and <code>spec.encryptionKeySecretName</code> mounts a

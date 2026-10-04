@@ -222,7 +222,16 @@ pub struct S3StoreSpec {
     /// (`crate::desired::cluster_config::entrypoint_script`) — the secret
     /// value itself is never copied into the `ConfigMap` or `cluster.json`,
     /// only read out of the mounted `Secret` at runtime, inside the pod.
-    pub credentials_secret_name: String,
+    /// **Exactly one of this and [`Self::web_identity`] must be set**
+    /// (S-08 M1; previously this field was required).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials_secret_name: Option<String>,
+    /// Temporary credentials via the pod's projected service-account token
+    /// exchanged with STS `AssumeRoleWithWebIdentity` (EKS IRSA) instead of
+    /// a long-lived `Secret`. See [`S3WebIdentitySpec`]. Exactly one of this
+    /// and [`Self::credentials_secret_name`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_identity: Option<S3WebIdentitySpec>,
     /// Whether a plain-`http://` `endpoint=` (`insecure_http=true` in
     /// either store URI's own query string) is allowed. Defaults to
     /// `false`; a URI setting `insecure_http=true` while this is `false` is
@@ -264,8 +273,44 @@ impl S3StoreSpec {
                 "spec.s3: at least one of backupStore/segmentStore must be set".to_string(),
             );
         }
-        if self.credentials_secret_name.trim().is_empty() {
-            return Err("spec.s3.credentialsSecretName must not be empty".to_string());
+        match (&self.credentials_secret_name, &self.web_identity) {
+            (Some(_), Some(_)) => {
+                return Err(
+                    "spec.s3: set exactly one of credentialsSecretName/webIdentity, not both"
+                        .to_string(),
+                );
+            }
+            (None, None) => {
+                return Err(
+                    "spec.s3: one of credentialsSecretName/webIdentity is required".to_string(),
+                );
+            }
+            (Some(name), None) => {
+                if name.trim().is_empty() {
+                    return Err("spec.s3.credentialsSecretName must not be empty".to_string());
+                }
+            }
+            (None, Some(wi)) => {
+                if !wi.role_arn.starts_with("arn:") || wi.role_arn.trim() != wi.role_arn {
+                    return Err(format!(
+                        "spec.s3.webIdentity.roleArn {:?} must be an IAM role ARN \
+                         (arn:aws:iam::<account>:role/<name>)",
+                        wi.role_arn
+                    ));
+                }
+                if wi.audience.as_deref().is_some_and(|a| a.trim().is_empty()) {
+                    return Err("spec.s3.webIdentity.audience must not be empty".to_string());
+                }
+                if wi
+                    .service_account_name
+                    .as_deref()
+                    .is_some_and(|a| a.trim().is_empty())
+                {
+                    return Err(
+                        "spec.s3.webIdentity.serviceAccountName must not be empty".to_string()
+                    );
+                }
+            }
         }
         for (field, value) in [
             ("backupStore", &self.backup_store),
@@ -291,10 +336,43 @@ impl Default for S3StoreSpec {
         Self {
             backup_store: None,
             segment_store: None,
-            credentials_secret_name: String::new(),
+            credentials_secret_name: None,
+            web_identity: None,
             allow_insecure_http: false,
             egress_cidrs: Self::default_egress_cidrs(),
         }
+    }
+}
+
+/// `spec.s3.webIdentity` (S-08 M1): obtain S3 credentials by exchanging a
+/// projected service-account token with STS `AssumeRoleWithWebIdentity`
+/// (the mechanism behind EKS IRSA). The operator mounts a
+/// `serviceAccountToken` projected volume (audience [`Self::audience`],
+/// default `sts.amazonaws.com`) on every pod, optionally runs the pods under
+/// `serviceAccountName`, and generates an `--s3-credentials` file with
+/// `source: web_identity`. No secret is stored anywhere: `animusd` re-reads
+/// the rotating token file on every STS call. Pods need egress to STS —
+/// HTTPS 443 is added to the generated `NetworkPolicy`'s S3 egress rule.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct S3WebIdentitySpec {
+    /// The IAM role to assume (`arn:aws:iam::<account>:role/<name>`).
+    pub role_arn: String,
+    /// `serviceAccountName` for every pod (the SA the role's trust policy
+    /// names). `None` keeps the namespace's `default` ServiceAccount.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_account_name: Option<String>,
+    /// Audience of the projected token. Defaults to `sts.amazonaws.com`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audience: Option<String>,
+}
+
+impl S3WebIdentitySpec {
+    pub const DEFAULT_AUDIENCE: &'static str = "sts.amazonaws.com";
+
+    #[must_use]
+    pub fn audience_or_default(&self) -> &str {
+        self.audience.as_deref().unwrap_or(Self::DEFAULT_AUDIENCE)
     }
 }
 
@@ -1008,7 +1086,8 @@ mod tests {
                 "s3://my-bucket/backups?endpoint=https://s3.example.com".to_string(),
             ),
             segment_store: None,
-            credentials_secret_name: "my-s3-creds".to_string(),
+            credentials_secret_name: Some("my-s3-creds".to_string()),
+            web_identity: None,
             allow_insecure_http: false,
             egress_cidrs: S3StoreSpec::default_egress_cidrs(),
         }
@@ -1038,7 +1117,7 @@ mod tests {
     #[test]
     fn s3_spec_rejects_empty_credentials_secret_name() {
         let mut s3 = valid_s3_spec();
-        s3.credentials_secret_name = String::new();
+        s3.credentials_secret_name = Some(String::new());
         let err = s3.validate().unwrap_err();
         assert!(err.contains("credentialsSecretName"), "{err}");
     }
@@ -1046,8 +1125,73 @@ mod tests {
     #[test]
     fn s3_spec_rejects_blank_credentials_secret_name() {
         let mut s3 = valid_s3_spec();
-        s3.credentials_secret_name = "   ".to_string();
+        s3.credentials_secret_name = Some("   ".to_string());
         assert!(s3.validate().is_err());
+    }
+
+    fn web_identity() -> S3WebIdentitySpec {
+        S3WebIdentitySpec {
+            role_arn: "arn:aws:iam::123456789012:role/animus".to_string(),
+            service_account_name: Some("animus".to_string()),
+            audience: None,
+        }
+    }
+
+    #[test]
+    fn s3_spec_valid_with_web_identity_alone() {
+        let mut s3 = valid_s3_spec();
+        s3.credentials_secret_name = None;
+        s3.web_identity = Some(web_identity());
+        assert!(s3.validate().is_ok());
+        assert_eq!(
+            s3.web_identity.as_ref().unwrap().audience_or_default(),
+            "sts.amazonaws.com"
+        );
+    }
+
+    #[test]
+    fn s3_spec_requires_exactly_one_credential_source() {
+        let mut s3 = valid_s3_spec();
+        s3.web_identity = Some(web_identity());
+        let err = s3.validate().unwrap_err();
+        assert!(err.contains("exactly one"), "{err}");
+        s3.credentials_secret_name = None;
+        s3.web_identity = None;
+        let err = s3.validate().unwrap_err();
+        assert!(err.contains("credentialsSecretName/webIdentity"), "{err}");
+    }
+
+    #[test]
+    fn s3_spec_rejects_a_malformed_web_identity() {
+        let mut s3 = valid_s3_spec();
+        s3.credentials_secret_name = None;
+        let mut wi = web_identity();
+        wi.role_arn = "not-an-arn".to_string();
+        s3.web_identity = Some(wi);
+        assert!(s3.validate().unwrap_err().contains("roleArn"));
+        let mut wi = web_identity();
+        wi.audience = Some(" ".to_string());
+        s3.web_identity = Some(wi);
+        assert!(s3.validate().unwrap_err().contains("audience"));
+        let mut wi = web_identity();
+        wi.service_account_name = Some(String::new());
+        s3.web_identity = Some(wi);
+        assert!(s3.validate().unwrap_err().contains("serviceAccountName"));
+    }
+
+    #[test]
+    fn s3_spec_legacy_json_without_web_identity_still_decodes() {
+        let json = serde_json::json!({
+            "backupStore": "s3://b?endpoint=https://s3.example.com",
+            "credentialsSecretName": "creds",
+        });
+        let s3: S3StoreSpec = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(s3.credentials_secret_name.as_deref(), Some("creds"));
+        assert!(s3.web_identity.is_none());
+        // Serializes back with the same keys (no new null fields).
+        let back = serde_json::to_value(&s3).unwrap();
+        assert!(back.get("webIdentity").is_none());
+        assert_eq!(back["credentialsSecretName"], "creds");
     }
 
     #[test]
