@@ -118,6 +118,8 @@ mod ttl_reaper;
 #[deny(clippy::disallowed_methods)]
 mod txn_coordinator;
 #[deny(clippy::disallowed_methods)]
+mod version_wiring;
+#[deny(clippy::disallowed_methods)]
 mod write_path;
 
 use control_handle::{AnimusdRelayClient, ControlHandle, RemoteControlClient};
@@ -8531,6 +8533,13 @@ pub struct ClusterEdgeState<E: Env = ProdEnv> {
     /// security hole, since the gate still runs whenever `ctx.dynamo_auth`
     /// is configured regardless of this flag.
     has_catalog_credentials: Arc<std::sync::atomic::AtomicBool>,
+    /// This node's own ADR 0073 Phase 2 version state: its `ClusterFeatures`
+    /// handle (the one per-node handle every gated emitter consults), its own
+    /// version profile (range + build) and the halt cell the process exit
+    /// waits on. Lives here, not on `ClientCtx`, so every construction site
+    /// that already builds one `ClusterEdgeState` per node gets it with zero
+    /// struct-literal fan-out. Fed by `version_wiring::version_wiring_loop`.
+    version: version_wiring::VersionState,
 }
 
 impl<E: Env> Default for ClusterEdgeState<E> {
@@ -8547,7 +8556,14 @@ impl<E: Env> ClusterEdgeState<E> {
             dynamo_registry: Arc::new(Mutex::new(animus_dynamo::SchemaRegistry::new())),
             raftkv: Arc::new(Mutex::new(BTreeMap::new())),
             has_catalog_credentials: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            version: version_wiring::VersionState::default(),
         }
+    }
+
+    /// This node's version state (ADR 0073 Phase 2): `version().features` is
+    /// the per-node `ClusterFeatures` handle.
+    pub(crate) fn version(&self) -> &version_wiring::VersionState {
+        &self.version
     }
 
     /// The current best-effort answer to "does the replicated credential
