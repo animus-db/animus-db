@@ -627,7 +627,7 @@ fn run_negative_control(c: &Cell) -> Verdict {
     let mut era_idx = None;
     for _ in 0..40 {
         let ok = matches!(
-            cluster.propose_meta(MetaCommand::ReportNodeVersion {
+            cluster.propose_meta_ungated(MetaCommand::ReportNodeVersion {
                 node: nid(leader),
                 range: VersionRange::new(1, 1),
                 build: "b2".into(),

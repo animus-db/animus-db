@@ -1008,6 +1008,21 @@ impl<E: Env> RaftNode<E> {
         propose_gated(&self.core, &self.cache, &self.features, command)
     }
 
+    /// Test-only (ADR 0073 P2-B x P2-D): propose `command` **without** the
+    /// gate check. The mixed-version corpus's negative controls play a buggy
+    /// emitter that emits an era variant before the era is open; routing them
+    /// through [`propose`](Self::propose) would be refused (and panic on the
+    /// debug assertion), so the control would no longer exercise the wedge it
+    /// must detect. Compiled only under `cfg(any(test, feature =
+    /// "sim-versions"))`: production gating is unaffected.
+    #[cfg(any(test, feature = "sim-versions"))]
+    pub fn propose_ungated_for_negative_control(&self, command: MetaCommand) -> ProposeResult {
+        self.core
+            .lock()
+            .expect("raft core poisoned")
+            .propose(command)
+    }
+
     /// This node's feature-gate handle (ADR 0073 Phase 2, P2-B). Fed by the
     /// apply task from the applied `Metadata`; clone it into every other
     /// emitter on the node (e.g. the CP data plane's `RaftKvNode`).
