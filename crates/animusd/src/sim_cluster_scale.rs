@@ -1348,16 +1348,11 @@ fn run_split_storm(s: &Scenario) {
     }
 
     // Settle: every node's map converges to the same consistent tiling.
-    // The restarted node (`victim`) is deliberately NOT in the comparison:
-    // a `SimCluster::restart`ed control node whose catch-up spans more than
-    // a few dozen log entries reports commit == applied == the leader's yet
-    // serves an incomplete `Metadata` (reproduced without any storm: 5
-    // nodes, 40 tables, restart the last node -> 1 of 40 tablets visible).
-    // Whether that is a fixture artifact of `restart`'s fresh-RaftNode
-    // shape or a control-plane catch-up defect is NOT established here; it
-    // is reported (`storm_restarted_node_metadata_tablets`) so the C-17
-    // report can file it, and the storm's own checks use the other nodes.
-    let compared: Vec<u64> = node_ids.iter().copied().filter(|&x| x != victim).collect();
+    // The restarted node (`victim`) is compared like every other node:
+    // `SimCluster::restart` keeps its control syskv engine next to the
+    // retained WAL, so a restarted node's `Metadata` must converge to the
+    // same content (not merely the same indices) as the rest.
+    let compared: Vec<u64> = node_ids.clone();
     let mut waited = 0u64;
     loop {
         let ref_meta = cluster.metadata(0);
@@ -1398,12 +1393,6 @@ fn run_split_storm(s: &Scenario) {
     let meta = cluster.metadata(0);
     assert_tablet_map_consistent(&meta, &tables, &s.name);
 
-    emit(
-        "storm_restarted_node_metadata_tablets",
-        g,
-        n,
-        cluster.metadata(victim).tablets.len(),
-    );
     emit(
         "storm_reference_node_metadata_tablets",
         g,
@@ -1508,6 +1497,38 @@ fn sim_cluster_scale_split_storm_corpus() {
     {
         eprintln!("scenario={} seed={}", s.name, s.seed);
         run_split_storm(&s);
+    }
+}
+
+/// Regression: restarting a combined control node after well over the
+/// 64-entry snapshot threshold of control entries must leave its
+/// `Metadata` content-equal to the leader's (the restarted node keeps its
+/// control syskv engine next to its retained WAL).
+#[test]
+fn sim_cluster_scale_restart_past_compaction_matches_leader() {
+    let seed = 0xC17_5EED;
+    let mut cluster = SimCluster::new(seed, 5, 3);
+    for i in 0..40 {
+        cluster.create_table_with_replication(&format!("t{i}"), 3);
+    }
+    cluster.run_for(Duration::from_secs(5));
+    let victim = 4u64;
+    cluster.restart(victim);
+    let mut waited = 0;
+    loop {
+        let reference = cluster.metadata(0);
+        if cluster.metadata(victim).tablets == reference.tablets && !reference.tablets.is_empty() {
+            assert!(reference.tablets.len() >= 40, "seed={seed}");
+            break;
+        }
+        waited += 1;
+        assert!(
+            waited < 60,
+            "restarted node never converged (seed={seed}): victim {} vs leader {} tablets",
+            cluster.metadata(victim).tablets.len(),
+            reference.tablets.len()
+        );
+        cluster.run_for(Duration::from_secs(1));
     }
 }
 

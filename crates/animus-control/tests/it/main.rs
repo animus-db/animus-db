@@ -43,6 +43,7 @@ mod quiescence;
 mod register_node_cas;
 mod removal_notice;
 mod restart;
+mod restart_retained_syskv_engine;
 mod restart_seed_before_election;
 mod schema_catalog;
 mod schema_indexes;

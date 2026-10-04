@@ -11893,9 +11893,10 @@ at `--test-threads=2` in a debug build; the N=50000 run is ~150 s in `--release`
   full Status; a quiesced group still costs 12 timer fires/s (4 Hz per RF-3 replica, `APPLY_SAFETY_POLL`);
   `rebalance_step` is O(tablets) per move, so convergence is O(moves×tablets); control heartbeat traffic is
   O(nodes²).
-- **Open question, not resolved here**: a `SimCluster::restart`ed control node whose catch-up spans more than
-  a few dozen log entries reports `commit == applied == the leader's` yet serves an incomplete `Metadata`
-  (5 nodes, 40 tables, restart the last node: 1 of 40 tablets). The storm cell excludes the restarted node
-  from its map comparison and reports `storm_restarted_node_metadata_tablets` instead.
+- Resolved (fixture artifact): a `SimCluster::restart`ed control node used to get a fresh syskv
+  `MemoryEngine` over its retained, compacted WAL, so it served only the post-snapshot tail of `Metadata`
+  while reporting `commit == applied`. `SimCluster` now keeps `control_syskv` per control node and re-hands
+  the same engine on restart; the storm cell compares every node. Lesson:
+  `docs/lessons/testing/2026-10-04-a-sim-restart-must-preserve-the-wal-and-engine-pair.md`.
 - Lessons: `docs/lessons/testing/2026-10-04-quiescent-means-silent-on-the-wire-…`,
   `docs/lessons/code-patterns/2026-10-04-a-scale-fixture-built-past-an-o-n-apply-…`.
