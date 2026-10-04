@@ -43,6 +43,11 @@ use tokio::time::sleep;
 #[tokio::main]
 async fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // `--version`/`-V` (docs/release.md): sole argument only.
+    if matches!(args.as_slice(), [a] if a == "--version" || a == "-V") {
+        println!("animus {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
     // `--tls-ca PATH` (ADR 0064, S-01 commit 2) is a *global* flag,
     // recognized only as a prefix before the subcommand name — never as, or
     // after, positional data (issue #840: a positional argument that happens
