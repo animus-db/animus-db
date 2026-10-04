@@ -22,8 +22,10 @@ entry and `crates/animusd/CLAUDE.md`'s S-04 entry for the full design.
 optional dependency for `client::S3Client`/`Transport`/`sigv4::Credentials`
 alone, and — the first real downstream consumer of the `fake` feature
 described below — takes it as a `[dev-dependencies]` feature for its own
-`S3SegmentStore` contract test. PR 3 (not yet started) does the
-Kubernetes-operator egress/credential-secret side.
+`S3SegmentStore` contract test. PR 3 (landed) did the
+Kubernetes-operator egress/credential-secret side (`spec.s3`,
+`animus-operator`'s `S3StoreSpec`). What remains — non-static credentials,
+multipart upload — is `docs/roadmap.md` S-08.
 
 ## Entry points
 
