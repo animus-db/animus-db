@@ -50,6 +50,7 @@ use animus_control::persist_round::{
     self, GatedOuts, PersistArm, PersistFut, PersistProgress, PersistWake,
 };
 use animus_control::raft::{Out, RaftCore, RaftMsg, StateMachine};
+use animus_control::version::ClusterFeatures;
 use animus_control::{PersistedState, ProposeResult};
 use animus_env::{Env, EnvExt, Metric, MetricsHandle, Nanos, NodeId, PRIMARY_STREAM};
 // ADR 0054 step 2: the pure item model/evaluation crate below the wire
@@ -72,6 +73,7 @@ mod format_fixture_tests;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub mod fuzzing;
+mod gates;
 pub mod heartbeat_batch;
 pub mod hlc;
 pub mod host;
@@ -2592,6 +2594,11 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// public setter below and the apply task (which reads it every pass)
     /// need their own handle, mirroring every other cross-task field here.
     compact_tuning: Arc<CompactTuning>,
+    /// ADR 0073 Phase 2 (P2-B): this group's feature-gate handle. A floor
+    /// handle (`ClusterFeatures::new()`) unless the caller injected the
+    /// node's control-fed one (`start_hosted_with_options`); read by every
+    /// wire-send, snapshot-image and propose site (see `gates.rs`).
+    features: ClusterFeatures,
 }
 
 /// A bounded, in-process ring of every distinct value of `T` a
@@ -2666,6 +2673,35 @@ impl VoterHistory {
     }
 }
 
+/// Every knob of [`RaftKvNode::start_hosted_with_options`]. `Default` is
+/// today's plain [`start_hosted`](RaftKvNode::start_hosted): no campaign, a
+/// boot-time cluster check, no batcher, private WAL, floor features.
+pub struct HostedOptions<E: Env> {
+    /// Campaign immediately (see `start_hosted_campaigning`'s doc).
+    pub campaign_immediately: bool,
+    /// Skip the issue #900/#667 boot-time cluster check (a split child's
+    /// replicas; see `DriveState::skip_cluster_check`).
+    pub skip_cluster_check: bool,
+    /// Coalesce bare heartbeats through this per-node batcher.
+    pub heartbeat_batcher: Option<HeartbeatBatcher<E>>,
+    /// Route the group's Raft log through the per-node shared WAL.
+    pub shared_wal: Option<Arc<SharedWal<KvCommand, KvState>>>,
+    /// The node's feature-gate handle.
+    pub features: ClusterFeatures,
+}
+
+impl<E: Env> Default for HostedOptions<E> {
+    fn default() -> Self {
+        Self {
+            campaign_immediately: false,
+            skip_cluster_check: false,
+            heartbeat_batcher: None,
+            shared_wal: None,
+            features: ClusterFeatures::new(),
+        }
+    }
+}
+
 impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// Start a tablet group node over `env`, backed by `storage`. `all_nodes` is
     /// the group's full replica set (including this node). Spawns the driver loop.
@@ -2689,6 +2725,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             false,
             None,
             None,
+            ClusterFeatures::new(),
         )
     }
 
@@ -2709,6 +2746,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             false,
             None,
             None,
+            ClusterFeatures::new(),
         )
     }
 
@@ -2730,7 +2768,17 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     ) -> Self {
         let metrics = env.metrics();
         Self::start_inner(
-            env, all_nodes, storage, metrics, scope, stream, false, false, None, None,
+            env,
+            all_nodes,
+            storage,
+            metrics,
+            scope,
+            stream,
+            false,
+            false,
+            None,
+            None,
+            ClusterFeatures::new(),
         )
     }
 
@@ -2776,7 +2824,17 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     ) -> Self {
         let metrics = env.metrics();
         Self::start_inner(
-            env, all_nodes, storage, metrics, scope, stream, false, false, batcher, shared_wal,
+            env,
+            all_nodes,
+            storage,
+            metrics,
+            scope,
+            stream,
+            false,
+            false,
+            batcher,
+            shared_wal,
+            ClusterFeatures::new(),
         )
     }
 
@@ -2806,7 +2864,17 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     ) -> Self {
         let metrics = env.metrics();
         Self::start_inner(
-            env, all_nodes, storage, metrics, scope, stream, false, true, batcher, shared_wal,
+            env,
+            all_nodes,
+            storage,
+            metrics,
+            scope,
+            stream,
+            false,
+            true,
+            batcher,
+            shared_wal,
+            ClusterFeatures::new(),
         )
     }
 
@@ -2882,7 +2950,17 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     ) -> Self {
         let metrics = env.metrics();
         Self::start_inner(
-            env, all_nodes, storage, metrics, scope, stream, true, true, None, None,
+            env,
+            all_nodes,
+            storage,
+            metrics,
+            scope,
+            stream,
+            true,
+            true,
+            None,
+            None,
+            ClusterFeatures::new(),
         )
     }
 
@@ -2924,7 +3002,47 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     ) -> Self {
         let metrics = env.metrics();
         Self::start_inner(
-            env, all_nodes, storage, metrics, scope, stream, true, true, batcher, shared_wal,
+            env,
+            all_nodes,
+            storage,
+            metrics,
+            scope,
+            stream,
+            true,
+            true,
+            batcher,
+            shared_wal,
+            ClusterFeatures::new(),
+        )
+    }
+
+    /// The general hosted constructor: every knob the specialised
+    /// `start_hosted*` wrappers set, as [`HostedOptions`] — including the
+    /// control-fed [`ClusterFeatures`] handle (ADR 0073 Phase 2, P2-B), which
+    /// no wrapper takes (they all start at the floor). `host::Reconciler`
+    /// uses this once its handle is set; P2-C wires `RaftNode::features()`
+    /// into it.
+    pub fn start_hosted_with_options(
+        env: E,
+        all_nodes: Vec<NodeId>,
+        storage: S,
+        scope: StorageScope,
+        stream: u64,
+        options: HostedOptions<E>,
+    ) -> Self {
+        let metrics = env.metrics();
+        Self::start_inner(
+            env,
+            all_nodes,
+            storage,
+            metrics,
+            scope,
+            stream,
+            options.campaign_immediately,
+            options.skip_cluster_check,
+            options.heartbeat_batcher,
+            options.shared_wal,
+            options.features,
         )
     }
 
@@ -2949,6 +3067,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             false,
             None,
             None,
+            ClusterFeatures::new(),
         )
     }
 
@@ -2964,6 +3083,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         skip_cluster_check: bool,
         heartbeat_batcher: Option<HeartbeatBatcher<E>>,
         shared_wal: Option<Arc<SharedWal<KvCommand, KvState>>>,
+        features: ClusterFeatures,
     ) -> Self {
         // ADR 0041 §3: callers hand in the tablet's **parent** scope
         // (`escape(table)` + this tablet's range); the group owns one sibling
@@ -3092,6 +3212,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             voter_history: Arc::clone(&voter_history),
             hot_change_max: Arc::clone(&hot_change_max),
             compact_tuning: Arc::clone(&compact_tuning),
+            features: features.clone(),
         };
         // The consensus loop recovers from the WAL, then spawns the apply task
         // (so the apply task sees the recovered core + the correct
@@ -3136,8 +3257,18 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             shared_wal,
             hot_change_max,
             compact_tuning,
+            features,
         }));
         node
+    }
+
+    /// This group's feature-gate handle (ADR 0073 Phase 2, P2-B). A floor
+    /// handle unless one was injected with
+    /// [`start_hosted_with_options`](Self::start_hosted_with_options); every
+    /// wire-send, snapshot-image and propose site consults it.
+    #[must_use]
+    pub fn features(&self) -> ClusterFeatures {
+        self.features.clone()
     }
 
     /// Ask the driver loop to exit: the node stops participating in its group
@@ -3347,12 +3478,25 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// (Self::mint_pushed)'s per-term ceiling absorption uses, since
     /// `mint_pushed` itself cannot call [`term`](Self::term) (it would try to
     /// lock `core` a second time from inside this same held lock).
+    /// The single `KvCore::propose` choke point of this node (ADR 0073 Phase 2,
+    /// P2-B): a command whose `GatedCommand::required_gate`
+    /// is closed is **refused, never appended** (`NotLeader { leader: None }`,
+    /// the existing not-accepted shape; counted in
+    /// [`ClusterFeatures::violations`] and `debug_assert!`ed in debug builds).
+    /// Every `KvCommand` is `Gate::Base` today, so this never refuses yet.
+    fn gated_propose(&self, core: &mut KvCore, command: KvCommand) -> ProposeResult {
+        if !gates::check_propose(&self.features, &command) {
+            return ProposeResult::NotLeader { leader: None };
+        }
+        core.propose(command)
+    }
+
     fn propose_ordered<F: FnOnce(u64) -> KvCommand>(&self, build: F) -> ProposeResult {
         let mut core = self.lock();
         let term = core.term();
         let command = build(term);
         let ts = command_ts(&command);
-        let result = record_propose(&self.metrics, core.propose(command));
+        let result = record_propose(&self.metrics, self.gated_propose(&mut core, command));
         if matches!(result, ProposeResult::Accepted { .. }) {
             if let Some(ts) = ts {
                 self.last_proposed_ts.store(hlc::pack(ts), Ordering::SeqCst);
@@ -3392,7 +3536,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let term = core.term();
         let (command, aux) = build(term);
         let ts = command_ts(&command);
-        let result = record_propose(&self.metrics, core.propose(command));
+        let result = record_propose(&self.metrics, self.gated_propose(&mut core, command));
         if matches!(result, ProposeResult::Accepted { .. }) {
             if let Some(ts) = ts {
                 self.last_proposed_ts.store(hlc::pack(ts), Ordering::SeqCst);
@@ -3694,7 +3838,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             ttl_expired,
             ts,
         };
-        let result = record_propose(&self.metrics, core.propose(command));
+        let result = record_propose(&self.metrics, self.gated_propose(&mut core, command));
         if let ProposeResult::Accepted { index, .. } = result {
             self.last_proposed_ts.store(hlc::pack(ts), Ordering::SeqCst);
             // See `propose_ordered`'s identical note.
@@ -3760,7 +3904,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             .collect();
         let ts = self.mint_pushed(term, &keys);
         let command = KvCommand::KindEvalBatch { entries, ts };
-        let result = record_propose(&self.metrics, core.propose(command));
+        let result = record_propose(&self.metrics, self.gated_propose(&mut core, command));
         if let ProposeResult::Accepted { index, .. } = result {
             self.last_proposed_ts.store(hlc::pack(ts), Ordering::SeqCst);
             core.note_local_activity(self.env.now());
@@ -6987,9 +7131,11 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // (see `majority`'s doc), not the static `all_nodes` — else a rebalanced
         // group's read barrier would probe peers that are no longer voters and
         // never reach the ones that are.
-        let probe = codec::encode_wire(&KvWire::ReadProbe { term, epoch });
+        let probe = gates::encode_for_send(&KvWire::ReadProbe { term, epoch }, &self.features);
         for p in self.config() {
-            if p != self.env.node_id() {
+            if p != self.env.node_id()
+                && let Some(probe) = &probe
+            {
                 self.env.send_stream(p, self.stream, probe.clone()).await;
             }
         }
@@ -8112,6 +8258,8 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
     compact_tuning: &CompactTuning,
     // Issue #1116: the in-flight background WAL rewrite (per-group-file path).
     rewrite: &WalRewriteSlot,
+    // ADR 0073 P2-B: selects the snapshot image's frame version.
+    features: &ClusterFeatures,
 ) -> bool {
     let mut did_work = false;
 
@@ -10578,7 +10726,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 Some(ts) => ts.max(engine_mark),
                 None => engine_mark,
             });
-            Some(engine_image(storage, kind_scopes, header_ts).await)
+            Some(engine_image(storage, kind_scopes, header_ts, features).await)
         } else {
             None
         };
@@ -11125,6 +11273,7 @@ async fn engine_image<S: StorageEngine>(
     storage: &S,
     kind_scopes: &[StorageScope; ALL_KINDS.len()],
     max_applied_ts: Option<HlcTimestamp>,
+    features: &ClusterFeatures,
 ) -> Vec<u8> {
     // One pass over the engine, classified by kind (ADR 0041 §3): a tablet's
     // scopes are disjoint, so each physical key is claimed by at most one of
@@ -11144,7 +11293,7 @@ async fn engine_image<S: StorageEngine>(
             entries.push((kind, logical, v, version));
         }
     }
-    codec::encode_image(&entries, max_applied_ts)
+    codec::encode_image(&entries, max_applied_ts, features)
 }
 
 /// Write a received snapshot image into the engine (a follower catching up),
@@ -11327,6 +11476,9 @@ struct DriveState<E: Env, S: StorageEngine> {
     /// See [`RaftKvNode::compact_tuning`]'s doc — threaded through so the
     /// apply task can read the same override the public setter writes.
     compact_tuning: Arc<CompactTuning>,
+    /// See [`RaftKvNode::features`] — the gate handle every send site in
+    /// `drive` (and the apply task's snapshot-image build) consults.
+    features: ClusterFeatures,
 }
 
 /// One split-build seed row (ADR 0050 Train B rung 4): `(kind index into
@@ -11464,6 +11616,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         shared_wal,
         hot_change_max,
         compact_tuning,
+        features,
     } = st;
 
     // ADR 0044 phase 2 (C-02 PR 2): register this group's own stream with
@@ -11593,11 +11746,13 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             // completing risks a mutual stall under real scheduling.
             let probe_env = env.clone();
             let probe_stream = stream;
+            let probe_features = features.clone();
             env.spawn_task(async move {
                 for (to, msg) in initial_probe {
-                    probe_env
-                        .send_stream(to, probe_stream, codec::encode_wire(&KvWire::Raft(msg)))
-                        .await;
+                    if let Some(bytes) = gates::encode_for_send(&KvWire::Raft(msg), &probe_features)
+                    {
+                        probe_env.send_stream(to, probe_stream, bytes).await;
+                    }
                 }
             });
         }
@@ -11748,6 +11903,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         shared_wal.clone(),
         Arc::clone(&hot_change_max),
         Arc::clone(&compact_tuning),
+        features.clone(),
     ));
 
     // Issue #279: the loop's own in-flight persist round, and the outbound
@@ -11805,7 +11961,9 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             // the pre-vote/vote round trip itself.
             None => {
                 for (to, wire) in campaign_outs {
-                    env.send_stream(to, stream, codec::encode_wire(&wire)).await;
+                    if let Some(bytes) = gates::encode_for_send(&wire, &features) {
+                        env.send_stream(to, stream, bytes).await;
+                    }
                 }
             }
             // Only reachable for a degenerate single-voter bootstrap set,
@@ -12279,12 +12437,16 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             gated.push(round, held);
         }
         for (to, wire) in immediate {
-            env.send_stream(to, stream, codec::encode_wire(&wire)).await;
+            if let Some(bytes) = gates::encode_for_send(&wire, &features) {
+                env.send_stream(to, stream, bytes).await;
+            }
         }
         // Whatever round landed — this loop's own `fsync` or the apply task's
         // compaction rewrite — releases the acks that were waiting on it.
         for (to, wire) in gated.release(persist.durable()) {
-            env.send_stream(to, stream, codec::encode_wire(&wire)).await;
+            if let Some(bytes) = gates::encode_for_send(&wire, &features) {
+                env.send_stream(to, stream, bytes).await;
+            }
         }
         // Safety net, and the reason a stranded ack is structurally impossible
         // rather than merely unlikely (issue #279's second bug): if this node
@@ -12301,7 +12463,9 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             };
             if settled && persist_fut.is_none() {
                 for (to, wire) in gated.release(u64::MAX) {
-                    env.send_stream(to, stream, codec::encode_wire(&wire)).await;
+                    if let Some(bytes) = gates::encode_for_send(&wire, &features) {
+                        env.send_stream(to, stream, bytes).await;
+                    }
                 }
             }
         }
@@ -12355,6 +12519,8 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     hot_change_max: Arc<Mutex<Option<(HlcTimestamp, u32)>>>,
     // Issue #1064 part-2 test seam — see [`CompactTuning`]'s own doc.
     compact_tuning: Arc<CompactTuning>,
+    // ADR 0073 P2-B: selects the snapshot image's frame version.
+    features: ClusterFeatures,
 ) {
     // This apply task's own sequential, single-writer bookkeeping (see
     // `apply_and_compact`'s doc): `sealed` is seeded from the engine-durable
@@ -12435,6 +12601,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
             &hot_change_max,
             &compact_tuning,
             &rewrite,
+            &features,
         )
         .await;
         if !did_work {
@@ -12540,7 +12707,8 @@ mod kind_scope_tests {
                 wall_ms: 4300,
                 logical: 101,
             };
-            let image = engine_image(&src, &src_scopes, Some(max_ts)).await;
+            let image =
+                engine_image(&src, &src_scopes, Some(max_ts), &ClusterFeatures::new()).await;
             let dst = MemoryEngine::new();
             let dst_scopes = kind_scopes(&StorageScope::new(KeyRange::new(
                 Vec::new(),

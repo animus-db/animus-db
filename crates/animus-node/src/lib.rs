@@ -39,7 +39,10 @@ pub mod topology;
 pub mod ttl_reaper;
 mod wire;
 
-pub use codec::{MAX_FRAME_LEN, decode_client_frame, encode_client_frame, frame_payload_len};
+pub use codec::{
+    ClientGated, MAX_FRAME_LEN, decode_client_frame, encode_client_frame,
+    encode_client_frame_gated, frame_payload_len,
+};
 pub use control_handle::{ControlHandle, RemoteControlClient};
 pub use sigv4_gate::sigv4_gate;
 pub use sim_relay::{RELAY_STREAM, SimRelayClient};

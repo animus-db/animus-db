@@ -766,3 +766,28 @@ each confirmed red-before/green-after by temporarily reverting the fix).
 ## Fuzzing (roadmap R-01 (c))
 
 `http::parse_request_head` (+ `query_param`/`percent_decode`), `sigv4_gate`'s inputs and `decode_client_frame` are fuzz targets (`http_sigv4`, `net_frames`); keep them panic-free on arbitrary bytes. See `fuzz/README.md` (stable smoke: `cd fuzz && cargo test --release --test smoke`).
+
+## Gate enforcement (ADR 0073 Phase 2, P2-B)
+
+- `ClientRequest::required_gate` / `ClientResponse::required_gate` (`wire.rs`):
+  exhaustive, no `_` arm. `ProposeSchema(cmd)` takes `cmd`'s gate and `Forwarded`
+  recurses, so an era command is `Gate::Era` on the relay path at any depth. All
+  other variants are `Base` (a response that embeds `Metadata`/mirror writes is
+  `Base`: its content is gated by additive skipped-at-default fields and
+  era-only entity kinds).
+- `codec::ClientGated` + `encode_client_frame_gated(msg, &features)`: refuses a
+  closed-gate message (error + counter + debug_assert) and otherwise returns the
+  **same bytes** as `encode_client_frame`, which is unchanged (animusd's generic
+  `write_frame` still uses it until P2-C switches).
+- `is_relayable_command`: `ReportNodeVersion` and `FinalizeClusterVersion` are now
+  relayable (data-only boot self-report; admin Finalize over `ProposeSchema`). They
+  are era-only: the relay *receiver* in `animusd` must check `required_gate` against
+  its own `ClusterFeatures` before proposing (P2-C), since a Phase 1 receiver cannot
+  decode them at all.
+- `SimRelayClient` (`sim_relay.rs`) does **not** gate its `RelayWire` encode: it is a
+  sim-only `RelayClient` stand-in with no feature handle in reach, and the production
+  relay sender is `animusd`'s, which uses the gated encoder from P2-C.
+- Fixture `tests/fixtures/formats/client-frame/v1.bin` (every request + response
+  variant) is **Phase 1 bytes generated from commit `941a5ea`**; `tests/it/format_fixtures.rs`
+  holds the byte-identity, exhaustiveness and gate-pin tests.
+

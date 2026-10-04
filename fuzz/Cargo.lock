@@ -14,7 +14,7 @@ dependencies = [
 
 [[package]]
 name = "animus-control"
-version = "0.0.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "animus-env",
  "animus-placement",
@@ -29,7 +29,7 @@ dependencies = [
 
 [[package]]
 name = "animus-cp-data"
-version = "0.0.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "animus-control",
  "animus-env",
@@ -46,7 +46,7 @@ dependencies = [
 
 [[package]]
 name = "animus-dynamo"
-version = "0.0.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "animus-control",
  "animus-item",
@@ -60,7 +60,7 @@ dependencies = [
 
 [[package]]
 name = "animus-env"
-version = "0.0.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "async-trait",
  "chacha20poly1305",
@@ -90,7 +90,7 @@ dependencies = [
 
 [[package]]
 name = "animus-item"
-version = "0.0.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -98,7 +98,7 @@ dependencies = [
 
 [[package]]
 name = "animus-node"
-version = "0.0.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "animus-control",
  "animus-cp-data",
@@ -113,7 +113,7 @@ dependencies = [
 
 [[package]]
 name = "animus-placement"
-version = "0.0.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "animus-env",
  "serde",
@@ -122,7 +122,7 @@ dependencies = [
 
 [[package]]
 name = "animus-sim"
-version = "0.0.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "animus-env",
  "async-trait",
@@ -133,7 +133,7 @@ dependencies = [
 
 [[package]]
 name = "animus-storage"
-version = "0.0.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "animus-env",
  "async-trait",
@@ -147,7 +147,7 @@ dependencies = [
 
 [[package]]
 name = "animus-tablet"
-version = "0.0.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "animus-env",
  "serde",
