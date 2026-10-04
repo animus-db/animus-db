@@ -22,6 +22,7 @@ use std::time::Duration;
 use animus_control::meta::NodeAddrs;
 use animus_control::node::heartbeat_loop;
 use animus_control::raft::ProposeResult;
+use animus_control::sim_versions::{BinaryProfile, CapLog, CapRejection};
 use animus_control::version::{VersionRange, own_range};
 use animus_control::{MetaCommand, Metadata, NodeStatus, RaftNode};
 use animus_env::handshake::encode_ext;
@@ -108,6 +109,14 @@ pub struct World {
     /// Control nodes restarted since start (their `Metadata` view resets).
     pub restarted: BTreeSet<u64>,
     pub rng: Rng,
+    /// P2-D: when set, every control node plays a [`BinaryProfile`] through
+    /// `RaftNode::set_binary_profile` (capped decode + rejection log). Off for
+    /// P2-A's cells, which keep their exact behavior.
+    pub faithful: bool,
+    /// P2-D: the profile each node currently plays (default `Phase1`).
+    pub profiles: BTreeMap<u64, BinaryProfile>,
+    /// P2-D: every rejection log ever installed (a restart installs a new one).
+    pub cap_logs: Vec<(u64, CapLog)>,
 }
 
 impl World {
@@ -126,6 +135,9 @@ impl World {
             ranges: BTreeMap::new(),
             restarted: BTreeSet::new(),
             rng: Rng(seed ^ 0xA5A5_5A5A_1234_4321),
+            faithful: false,
+            profiles: BTreeMap::new(),
+            cap_logs: Vec::new(),
         };
         for &id in voters.iter().chain(learners) {
             w.engines.insert(id, MemoryEngine::new());
@@ -135,6 +147,53 @@ impl World {
             w.start_heartbeat(id);
         }
         w
+    }
+
+    /// [`World::new`] with every control node playing its profile faithfully
+    /// (capped decode + rejection log). Start state: all `Phase1`.
+    pub fn new_faithful(seed: u64, voters: &[u64], learners: &[u64], members: &[u64]) -> Self {
+        let mut w = Self::new(seed, voters, learners, members);
+        w.faithful = true;
+        // Nodes were started before the flag existed; install the Phase1
+        // profile on each now, before any simulated time passes.
+        for id in w.control_ids() {
+            let log = w.nodes[&id].set_binary_profile(BinaryProfile::Phase1);
+            w.cap_logs.push((id, log));
+        }
+        w
+    }
+
+    /// Every delivery a capped node rejected, with the node that rejected it.
+    pub fn cap_rejections(&self) -> Vec<(u64, CapRejection)> {
+        self.cap_logs
+            .iter()
+            .flat_map(|(id, l)| l.rejections().into_iter().map(move |r| (*id, r)))
+            .collect()
+    }
+
+    /// The profile `id` plays.
+    pub fn profile_of(&self, id: u64) -> BinaryProfile {
+        self.profiles
+            .get(&id)
+            .copied()
+            .unwrap_or(BinaryProfile::Phase1)
+    }
+
+    /// Downgrade `id` back to a Phase 1 binary: empty `ext`, Phase1 profile,
+    /// stop + fresh start of a control node.
+    pub fn downgrade_to_phase1(&mut self, id: u64) {
+        self.flipped.remove(&id);
+        self.ranges.remove(&id);
+        self.profiles.insert(id, BinaryProfile::Phase1);
+        self.sim.set_network_ext_for(nid(id), Vec::new());
+        if self.nodes.contains_key(&id) {
+            self.sim.stop(nid(id));
+            self.restarted.insert(id);
+            self.start_control(id);
+        } else if self.members.contains(&id) {
+            self.sim.stop(nid(id));
+            self.start_heartbeat(id);
+        }
     }
 
     pub fn control_ids(&self) -> Vec<u64> {
@@ -147,11 +206,21 @@ impl World {
             self.voters.iter().copied().map(nid).collect(),
             self.engines[&id].clone(),
         );
-        self.apply_profile(id, &node);
+        if let Some(log) = self.apply_profile(id, &node) {
+            self.cap_logs.push((id, log));
+        }
         self.nodes.insert(id, node);
     }
 
-    fn apply_profile(&self, id: u64, node: &RaftNode<SimEnv>) {
+    fn apply_profile(&self, id: u64, node: &RaftNode<SimEnv>) -> Option<CapLog> {
+        if self.faithful {
+            let p = self.profile_of(id);
+            let log = node.set_binary_profile(p);
+            if let Some(&(a, b)) = self.ranges.get(&id) {
+                node.set_own_version_range(Some(VersionRange::new(a, b)));
+            }
+            return Some(log);
+        }
         if self.flipped.contains(&id) {
             let r = self
                 .ranges
@@ -162,6 +231,7 @@ impl World {
         } else {
             node.set_own_version_range(None);
         }
+        None
     }
 
     fn start_heartbeat(&self, id: u64) {
@@ -264,6 +334,14 @@ impl World {
     pub fn flip(&mut self, id: u64, restart: bool) {
         self.sim.set_network_ext_for(nid(id), b2_ext());
         self.flipped.insert(id);
+        self.profiles
+            .entry(id)
+            .and_modify(|p| {
+                if *p == BinaryProfile::Phase1 {
+                    *p = BinaryProfile::B2;
+                }
+            })
+            .or_insert(BinaryProfile::B2);
         if restart {
             if self.nodes.contains_key(&id) {
                 self.sim.stop(nid(id));
@@ -273,8 +351,8 @@ impl World {
                 self.sim.stop(nid(id));
                 self.start_heartbeat(id);
             }
-        } else if let Some(n) = self.nodes.get(&id) {
-            self.apply_profile(id, n);
+        } else if let Some(log) = self.nodes.get(&id).and_then(|n| self.apply_profile(id, n)) {
+            self.cap_logs.push((id, log));
         }
     }
 
@@ -283,6 +361,9 @@ impl World {
     /// range).
     pub fn flip_range(&mut self, id: u64, range: (u32, u32), restart: bool) {
         self.ranges.insert(id, range);
+        if range != (1, 1) {
+            self.profiles.insert(id, BinaryProfile::Release(range.1));
+        }
         self.flip(id, restart);
         self.sim
             .set_network_ext_for(nid(id), encode_ext(Some(range), Some("b2")));
