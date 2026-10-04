@@ -29,6 +29,39 @@ pub struct S3UriInfo {
     pub port: Option<i32>,
 }
 
+/// The virtual-hosted (`path_style=false`) preconditions `animusd`'s own
+/// `parse_s3_uri` enforces (via `animus_s3::client::validate_virtual_hosted`),
+/// duplicated here because this crate does not depend on `animus-s3`: a DNS
+/// endpoint host (not an IP) and a DNS-compatible bucket name (3-63 chars of
+/// `[a-z0-9-]`, alphanumeric at both ends). The test
+/// `virtual_hosted_rules_match_animusd` pins the shared cases.
+fn validate_virtual_hosted(host_port: &str, bucket: &str) -> Result<(), String> {
+    let host = if let Some(rest) = host_port.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        host_port.rsplit_once(':').map_or(host_port, |(h, _)| h)
+    };
+    if host_port.starts_with('[') || host.parse::<std::net::IpAddr>().is_ok() {
+        return Err(format!(
+            "virtual-hosted addressing needs a DNS endpoint, but {host_port:?} is an IP address"
+        ));
+    }
+    let ok_chars = bucket
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    let ends_ok = bucket
+        .bytes()
+        .next()
+        .zip(bucket.bytes().last())
+        .is_some_and(|(f, l)| f.is_ascii_alphanumeric() && l.is_ascii_alphanumeric());
+    if !(3..=63).contains(&bucket.len()) || !ok_chars || !ends_ok {
+        return Err(format!(
+            "bucket name {bucket:?} is not DNS-compatible for virtual-hosted addressing"
+        ));
+    }
+    Ok(())
+}
+
 /// `Ok` iff `uri` has the shape `s3://<bucket>[/prefix][?...&endpoint=
 /// scheme://host[:port]&...]` — a non-empty bucket name and a query
 /// parameter named `endpoint` whose value starts with `http://` or
@@ -51,10 +84,19 @@ pub fn parse(uri: &str) -> Result<S3UriInfo, String> {
 
     let mut endpoint: Option<&str> = None;
     let mut insecure_http = false;
+    let mut virtual_hosted = false;
     for pair in query_part.split('&').filter(|s| !s.is_empty()) {
         match pair.split_once('=') {
             Some(("endpoint", v)) => endpoint = Some(v),
             Some(("insecure_http", v)) => insecure_http = v == "true",
+            Some(("path_style", "true")) => virtual_hosted = false,
+            Some(("path_style", "false")) => virtual_hosted = true,
+            Some(("path_style", other)) => {
+                return Err(format!(
+                    "{uri:?}: path_style={other:?} must be `true` (path-style, the default) or \
+                     `false` (virtual-hosted)"
+                ));
+            }
             _ => {}
         }
     }
@@ -73,6 +115,10 @@ pub fn parse(uri: &str) -> Result<S3UriInfo, String> {
     // Defensive only: a well-formed endpoint value has no path component,
     // but don't let one confuse the port extraction below if it does.
     let host_port = host_port.split('/').next().unwrap_or(host_port);
+    if virtual_hosted {
+        validate_virtual_hosted(host_port, bucket)
+            .map_err(|e| format!("{uri:?}: path_style=false: {e}"))?;
+    }
     let explicit_port = host_port
         .rsplit_once(':')
         .and_then(|(_, p)| p.parse::<i32>().ok());
@@ -137,6 +183,30 @@ mod tests {
     fn insecure_http_defaults_to_false_when_absent() {
         let info = parse("s3://bucket?endpoint=https://s3.example.com").unwrap();
         assert!(!info.insecure_http);
+    }
+
+    #[test]
+    fn path_style_accepts_true_false_and_rejects_garbage() {
+        assert!(parse("s3://my-bucket?endpoint=https://s3.example.com&path_style=true").is_ok());
+        assert!(parse("s3://my-bucket?endpoint=https://s3.example.com&path_style=false").is_ok());
+        let err = parse("s3://my-bucket?endpoint=https://s3.example.com&path_style=x").unwrap_err();
+        assert!(err.contains("path_style"), "{err}");
+    }
+
+    #[test]
+    fn virtual_hosted_rules_match_animusd() {
+        for bad in [
+            "s3://my-bucket?endpoint=http://127.0.0.1:9000&insecure_http=true&path_style=false",
+            "s3://my-bucket?endpoint=https://10.0.0.5&path_style=false",
+            "s3://My_Bucket?endpoint=https://s3.example.com&path_style=false",
+            "s3://ab?endpoint=https://s3.example.com&path_style=false",
+            "s3://has.dot?endpoint=https://s3.example.com&path_style=false",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+        // The same inputs are fine path-style (the default).
+        assert!(parse("s3://My_Bucket?endpoint=https://s3.example.com").is_ok());
+        assert!(parse("s3://my-bucket?endpoint=http://127.0.0.1:9000&insecure_http=true").is_ok());
     }
 
     #[test]
