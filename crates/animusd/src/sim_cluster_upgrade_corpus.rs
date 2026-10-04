@@ -72,7 +72,8 @@
 //!
 //! Fault timing is drawn from `splitmix64(cell seed, tag)`, never the
 //! simulator RNG. Depth: `ANIMUS_UPGRADE_RESTART_SEEDS=K` (shared with tier 1,
-//! ADR 0073; `ANIMUS_UPGRADE_SEEDS` is reserved for Phase 2). Replay:
+//! ADR 0073; `ANIMUS_UPGRADE_SEEDS` is the separate Phase 2 mixed-version knob, see
+//! `sim_cluster_mixed_version_corpus`). Replay:
 //! `ANIMUS_SEED=<seed> ANIMUS_UPGRADE_RESTART_CELL=<cell substring> cargo test
 //! -p animusd --lib sim_cluster_upgrade_corpus -- --nocapture`. Each cell runs
 //! on its own OS thread under a wall-clock watchdog ([`CELL_WATCHDOG`]).
