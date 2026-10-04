@@ -227,7 +227,7 @@ async fn one_density_run(g: usize, rf: usize, window: Duration, page: u64, hz: u
         // Optional staggered bring-up (`ANIMUS_DENSITY_BATCH=N`): wait until
         // every group hosted so far is led before hosting the next N. Separates
         // a bootstrap thundering herd from steady-state cost.
-        if batch > 0 && (s as usize + 1) % batch == 0 {
+        if batch > 0 && (s as usize + 1).is_multiple_of(batch) {
             let dl = Instant::now() + Duration::from_secs(300);
             let (mut lg, mut lt) = (Instant::now(), cpu_ticks());
             loop {
