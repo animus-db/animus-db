@@ -648,6 +648,13 @@ fn seeds_per_cell() -> usize {
     corpus::seeds_from_env("ANIMUS_LSM_DISK_FAULT_SEEDS")
 }
 
+/// A synced WAL frame before a v2 sync marker, damaged at rest, is real
+/// corruption: a loud refusal (issue #1142's counterpart to the coalesced-tear
+/// cell in `lsm_crash.rs`, which must reopen).
+fn scenario_synced_wal_frame_before_a_marker_corrupted_is_refused(seed: u64) {
+    crate::lsm_wal_sync_markers::synced_frame_corruption_is_refused(seed);
+}
+
 macro_rules! scenario {
     ($name:expr, $f:ident) => {
         Scenario {
@@ -707,6 +714,10 @@ fn scenario_cells() -> Vec<Scenario> {
         scenario!(
             "corrupted_durable_wal_record_surfaces_loudly",
             scenario_corrupted_durable_wal_record_surfaces_loudly
+        ),
+        scenario!(
+            "synced_wal_frame_before_a_marker_corrupted_is_refused",
+            scenario_synced_wal_frame_before_a_marker_corrupted_is_refused
         ),
     ]
 }

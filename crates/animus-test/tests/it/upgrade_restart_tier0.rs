@@ -337,7 +337,7 @@ type Entries = Vec<(Vec<u8>, Option<Vec<u8>>, u64)>;
 /// (put, delete, delete-keys) and a `MergeBatch` (value + tombstone).
 fn lsm_wal_expected(version: u32) -> (Entries, u64) {
     match version {
-        1 => {
+        1 | 2 => {
             let put =
                 |k: &str, v: &str, ver| (k.as_bytes().to_vec(), Some(v.as_bytes().to_vec()), ver);
             let del = |k: &str, ver| (k.as_bytes().to_vec(), None, ver);
@@ -449,6 +449,24 @@ fn lsm_wal_negative_controls_are_caught() {
             got,
             lsm_wal_expected(1),
             "seed={seed}: truncation went unnoticed"
+        );
+
+        // v2 (sync markers): a flipped byte before a marker is refused as
+        // corruption; a truncated tail after the last marker is tolerated.
+        let v2 = fixtures("lsm-wal")[&2].clone();
+        let mut flipped = v2.clone();
+        flipped[5 + 12] ^= 0xff;
+        match lsm_wal_run(seed, &flipped).1 {
+            Err(StorageError::Backend(m)) if m.contains("sync marker") => {}
+            other => panic!("seed={seed}: v2 mid-file corruption must be refused, got {other:?}"),
+        }
+        let got = lsm_wal_run(seed, &v2[..v2.len() - 9])
+            .1
+            .unwrap_or_else(|e| panic!("seed={seed}: v2 truncated tail is tolerated, got {e}"));
+        assert_ne!(
+            got,
+            lsm_wal_expected(2),
+            "seed={seed}: v2 truncation went unnoticed"
         );
     });
 }
@@ -780,6 +798,22 @@ fn control_wal_v2_transcodes_to_a_v1_file_with_the_same_records() {
     // (Not byte-equal to the v1 fixture: its `Snapshot` line embeds a
     // `Metadata` serialized before `Metadata` grew its `"v"` field; the
     // records are what must match.)
+}
+
+/// `LWL1` (LSM WAL) mirror: the table's v2 -> v1 transcode of the v2 fixture is
+/// byte-identical to the checked-in v1 fixture (same records, v1 header, no
+/// sync markers), and a v1 request on a current-version entry is not an
+/// identity.
+#[test]
+fn lsm_wal_v2_transcodes_to_the_v1_fixture() {
+    let entry = transcode::TABLE
+        .iter()
+        .find(|e| e.name == "lsm-wal")
+        .expect("lsm-wal entry");
+    let v2 = fixtures("lsm-wal")[&2].clone();
+    let v1 = entry.transcode_to(&v2, 1).expect("v2 -> v1");
+    assert_ne!(v1, v2);
+    assert_eq!(v1, fixtures("lsm-wal")[&1].clone());
 }
 
 /// `SWL1` mirror of the CWL1 v2 -> v1 transcode check.
