@@ -2341,6 +2341,10 @@ and `raftkv-image/v1.bin` (`format_fixture_tests::pre_era_encoders_are_byte_iden
 encodes both under a floor handle, one fed an era-0 `Metadata`, and one fed an era-on
 `Metadata`, asserting frame version 1 and bytes equal to the fixture), and the era-0
 `Metadata` encoding (`era_0_metadata_encoding_is_byte_identical_to_the_v1_fixture`).
+Both fixture directories are registered `OffDisk` in `animus-test`'s upgrade-restart
+registry (`animus-test/src/upgrade/transcode.rs`, `EMBEDDED`), which its tier-0
+completeness test requires of every `tests/fixtures/formats/<dir>`: a **two-line edit
+outside P2-B's crate list**, made because the per-push gate fails without it.
 Each new test also has an exhaustiveness guard (a `match` naming every variant plus a
 count), so a new variant fails to compile or fails the test until it is added.
 
