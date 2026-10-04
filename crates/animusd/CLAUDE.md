@@ -11858,7 +11858,6 @@ violations); a truncated LSM file on every node must fail the strict open
 bump) need no change here: they land as one `transcode::TABLE` entry and the
 cells grow with `transcode::supported_back()`.
 
-<<<<<<< HEAD
 
 ## Observability kit and the metrics-exist check (R-01 (f))
 
@@ -11873,7 +11872,7 @@ A false positive (a backticked identifier that only looks like a metric)
 goes in its `NOT_A_METRIC` allowlist with a reason. `dynamo_requests_total` /
 `dynamo_responses_5xx` are bumped per dispatched request in `handle_conn`
 (test: `dynamo::..::request_outcome_counters_count_requests_and_only_5xx_faults`).
-=======
+
 ## Appendix — `sim_cluster_mixed_version_corpus`: rolling Phase 1 -> B2 over `SimCluster` (ADR 0073 Phase 2, P2-D, 2026-10-04)
 
 The cluster tier of the mixed-version corpus (the pure tier is
@@ -11916,4 +11915,3 @@ fed into emitters); `Release(N-1) -> Release(N)` cells over real gates.
 **Gotcha**: the member-down cell crashes a node the shared client loop keeps
 routing 1/4 of its ops to (each stalls for the wire timeout), so acks *during* its
 roll are legitimately sparse; non-vacuity there is asserted after the era.
->>>>>>> origin/main
