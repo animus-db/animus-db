@@ -886,6 +886,16 @@ type GetResult = Result<Option<Vec<u8>>, String>;
 /// `Vec` of these behind an `Arc<Mutex<..>>`.
 type SimNodeCtx = ClientCtx<SimEnv, SimRelayClient<SimEnv>>;
 
+/// ADR 0073 Phase 2 (P2-C): spawn one node's version feeder
+/// (`version_wiring::version_wiring_loop`) — the same generic task production's
+/// `spawn_common_tail` spawns on every role. Spawned on every `SimCluster`
+/// node (construction, restart, every growth/join path); `Simulator::stop`
+/// drops it with the rest of the node's tasks, so `restart` respawns it.
+fn spawn_version_loop(ctx: &SimNodeCtx) {
+    let env = ctx.env.clone();
+    env.spawn_task(version_wiring::version_wiring_loop(ctx.clone()));
+}
+
 /// An `E`-free, plain-data projection of [`CpRoute`] — issue #950's own
 /// [`SimClusterHandle::cp_route`]/[`SimCluster::cp_route_timed`] use this
 /// instead of `CpRoute<SimEnv>` directly, since the real type's `Local`
@@ -2447,6 +2457,11 @@ impl SimCluster {
                 reconciler.enable_quiescence(after);
             }
             spawn_reconciler_loop(ctxs[i].clone(), reconciler);
+        }
+
+        // ADR 0073 Phase 2 (P2-C): the per-node version feeder, every role.
+        for ctx in ctxs.iter() {
+            spawn_version_loop(ctx);
         }
 
         // ADR 0061 rung D4 PR 5: one `animus_node::backup_janitor::
@@ -5300,6 +5315,7 @@ impl SimCluster {
             });
 
             self.controls[idx] = fresh_control;
+            spawn_version_loop(&ctx);
             self.shared.set_ctx(node, ctx);
         } else {
             // ---- data-only node (NodeRole::Data), constructed or grown (ADR 0061 rung L, C-12 PR 3) ----
@@ -5381,6 +5397,7 @@ impl SimCluster {
             });
 
             self.shared.set_ctx(node, ctx.clone());
+            spawn_version_loop(&ctx);
 
             // The one genuinely new mechanism a `NodeRole::Data` node's
             // restart needs — a fresh `SimEnv`-native mirror-sync loop over
@@ -5689,6 +5706,7 @@ impl SimCluster {
         });
 
         self.shared.push_ctx(ctx.clone());
+        spawn_version_loop(&ctx);
         self.engines.push(MemoryTabletEngines::new());
         // ADR 0061 rung L, C-12 PR 2: keeps `self.roles` index-aligned with
         // `self.engines`/`self.shared`'s own ctxs — `grow` supports
@@ -6022,6 +6040,7 @@ impl SimCluster {
         });
 
         self.shared.push_ctx(ctx.clone());
+        spawn_version_loop(&ctx);
         self.engines.push(MemoryTabletEngines::new());
         self.roles.push(NodeRole::Control);
         self.nodes += 1;
@@ -6325,6 +6344,7 @@ impl SimCluster {
         });
 
         self.shared.push_ctx(ctx.clone());
+        spawn_version_loop(&ctx);
         self.engines.push(MemoryTabletEngines::new());
         self.roles.push(NodeRole::Both);
         self.nodes += 1;
@@ -7078,6 +7098,7 @@ impl SimCluster {
         });
 
         self.shared.push_ctx(ctx.clone());
+        spawn_version_loop(&ctx);
         self.engines.push(MemoryTabletEngines::new());
         // See this method's own doc on why `NodeRole::Data`, not `Both`.
         self.roles.push(NodeRole::Data);

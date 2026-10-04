@@ -5342,6 +5342,13 @@ fn spawn_common_tail(
     // a control-only node's snapshot is just the control sink (`metrics_text`/
     // `metrics_json` skip the raftkv sink when `ctx.data` is `None`).
     tasks.push(tokio::spawn(metrics_sample_loop(ctx.clone())));
+    // ADR 0073 Phase 2 (P2-C): the per-node version feeder — feeds this
+    // node's `ClusterFeatures`, flips `require_peer_ext` once the era is on
+    // (nodes with no local apply task), latches the out-of-range halt and
+    // self-reports `ReportNodeVersion` once the era is active. Every role.
+    tasks.push(tokio::spawn(version_wiring::version_wiring_loop(
+        ctx.clone(),
+    )));
     // This node's own identity self-registration (ADR 0032 PR1; ADR 0040
     // Decision C since PR4 — the registration CAS is now the mechanism, not
     // just an address-book update): one-shot, so peer-sync (internal
