@@ -74,15 +74,6 @@ impl VersionProfile {
             build: BUILD.to_string(),
         }
     }
-
-    /// A Phase 1 binary (tests / `SimCluster` skew cells only).
-    #[cfg(test)]
-    pub(crate) fn phase1() -> Self {
-        Self {
-            range: None,
-            build: BUILD.to_string(),
-        }
-    }
 }
 
 /// The once-set cell a halted node's process exit waits on (first reason
@@ -148,6 +139,7 @@ impl VersionState {
             .clone()
     }
 
+    #[cfg(test)]
     pub(crate) fn set_profile(&self, p: VersionProfile) {
         *self.profile.lock().expect("version profile poisoned") = p;
     }

@@ -265,6 +265,17 @@ use animus_env::NodeId;
 use animusd::config::TlsSection;
 use animusd::{ClusterConfig, RoleAddrs};
 
+/// `sysexits.h` `EX_CONFIG`: the exit code of a version halt (ADR 0073
+/// Phase 2, P2-C) — the binary and the cluster's version disagree.
+const EX_CONFIG: u8 = 78;
+
+/// The reason a running node latched a version halt, set by
+/// [`wait_for_shutdown`] and read by `main` to pick the exit code. A
+/// write-once cell in the process-boundary binary (never in a library
+/// crate), deliberately not threaded through every `run_*`'s `Result<(),
+/// String>`: those map every `Err` to "usage".
+static VERSION_HALT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -284,6 +295,16 @@ async fn main() -> ExitCode {
         && let Err(err) = provider.shutdown()
     {
         tracing::warn!(%err, "failed to flush OpenTelemetry tracer provider on exit");
+    }
+
+    // ADR 0073 Phase 2 (P2-C): a node whose binary's version range does not
+    // contain the cluster's version exits loudly with a named code and NO
+    // usage text (the cause is the cluster/binary pairing, not the command
+    // line); under Kubernetes this is the intended CrashLoopBackOff.
+    if let Some(reason) = VERSION_HALT.get() {
+        eprintln!("animusd: FATAL: {reason}");
+        tracing::error!(%reason, "exiting: this binary does not support the cluster version");
+        return ExitCode::from(EX_CONFIG);
     }
 
     match result {
@@ -1710,7 +1731,7 @@ async fn run_single(
         );
     }
     println!("animusd: ready — Ctrl-C to stop");
-    wait_for_ctrl_c().await;
+    wait_for_shutdown(std::slice::from_ref(&node)).await;
     node.shutdown_graceful().await;
     Ok(())
 }
@@ -1826,7 +1847,7 @@ async fn run_control(args: &[String]) -> Result<(), String> {
         node.admin_addr(),
     );
     println!("animusd: ready — Ctrl-C to stop");
-    wait_for_ctrl_c().await;
+    wait_for_shutdown(std::slice::from_ref(&node)).await;
     node.shutdown_graceful().await;
     Ok(())
 }
@@ -2140,7 +2161,7 @@ async fn run_data_config(
         println!("animusd: data node {index} auto-split at {b} bytes/tablet");
     }
     println!("animusd: ready — Ctrl-C to stop");
-    wait_for_ctrl_c().await;
+    wait_for_shutdown(std::slice::from_ref(&node)).await;
     node.shutdown_graceful().await;
     Ok(())
 }
@@ -2232,7 +2253,7 @@ async fn run_data_join(
         node.console_addr(),
     );
     println!("animusd: ready — Ctrl-C to stop");
-    wait_for_ctrl_c().await;
+    wait_for_shutdown(std::slice::from_ref(&node)).await;
     node.shutdown_graceful().await;
     Ok(())
 }
@@ -2408,7 +2429,7 @@ async fn run_join(args: &[String]) -> Result<(), String> {
         node.console_addr(),
     );
     println!("animusd: ready — Ctrl-C to stop");
-    wait_for_ctrl_c().await;
+    wait_for_shutdown(std::slice::from_ref(&node)).await;
     node.shutdown_graceful().await;
     Ok(())
 }
@@ -2606,7 +2627,7 @@ async fn run_in_process_cluster(
         );
     }
     println!("animusd: ready — Ctrl-C to stop");
-    wait_for_ctrl_c().await;
+    wait_for_shutdown(&nodes).await;
     for node in &nodes {
         node.shutdown_graceful().await;
     }
@@ -2697,12 +2718,37 @@ async fn run_in_process_split_cluster(
         );
     }
     println!("animusd: ready — Ctrl-C to stop");
-    wait_for_ctrl_c().await;
+    wait_for_shutdown(&nodes).await;
     for node in &nodes {
         node.shutdown_graceful().await;
     }
     remove_ephemeral_dir_on_clean_shutdown(cli_dir.as_deref(), ephemeral, &dir, pid);
     Ok(())
+}
+
+/// Waits for a shutdown signal OR for any of `nodes` to latch a version halt
+/// (ADR 0073 Phase 2, P2-C: the node's binary does not support the cluster
+/// version). On a halt the reason is recorded for `main`'s exit code; either
+/// way the caller then runs its ordinary graceful shutdown.
+async fn wait_for_shutdown(nodes: &[animusd::Node]) {
+    let halt = async {
+        let waits: Vec<_> = nodes
+            .iter()
+            .map(|n| Box::pin(n.wait_version_halt()))
+            .collect();
+        if waits.is_empty() {
+            std::future::pending::<String>().await
+        } else {
+            futures::future::select_all(waits).await.0
+        }
+    };
+    tokio::select! {
+        () = wait_for_ctrl_c() => {}
+        reason = halt => {
+            println!("animusd: shutting down: {reason}");
+            let _ = VERSION_HALT.set(reason);
+        }
+    }
 }
 
 /// Waits for either Ctrl-C (SIGINT, an interactive stop) or SIGTERM (a

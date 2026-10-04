@@ -6908,6 +6908,26 @@ impl Node {
             .expect("dynamo_addr: this node has no data role (ADR 0035 PR3 control-only)")
     }
 
+    /// This node's own cluster-feature handle (ADR 0073 Phase 2): the single
+    /// per-node handle every gated emitter consults, fed by the version
+    /// feeder. Floor (era off) until the first `Metadata` read.
+    pub fn features(&self) -> animus_control::version::ClusterFeatures {
+        self.edge.version().features.clone()
+    }
+
+    /// The named reason this node must exit (its binary's version range does
+    /// not contain the cluster version), if its feeder latched one.
+    pub fn version_halt_reason(&self) -> Option<String> {
+        self.edge.version().halt.get()
+    }
+
+    /// Resolves with the halt reason once this node's feeder latches one;
+    /// never resolves otherwise. `main` races it against the shutdown
+    /// signal and exits with a named code.
+    pub async fn wait_version_halt(&self) -> String {
+        self.edge.version().halt.wait().await
+    }
+
     /// The address the admin / debug HTTP endpoint listens on (ADR 0020).
     pub fn admin_addr(&self) -> SocketAddr {
         self.admin_addr
