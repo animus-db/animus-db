@@ -321,11 +321,11 @@ fn build_reconciler(
     edge: ClusterEdgeState<SimEnv>,
 ) -> SimReconciler {
     let host_edge = edge.clone();
-    let teardown_edge = edge;
+    let teardown_edge = edge.clone();
     let base_id = node_id.clone();
-    if backend == SimEngineBackend::Lsm {
+    let mut reconciler = if backend == SimEngineBackend::Lsm {
         let factory = SimLsmTabletFactory::new(env.clone());
-        return SimReconciler::Lsm(Reconciler::new(
+        SimReconciler::Lsm(Reconciler::new(
             env,
             factory,
             node_id,
@@ -335,19 +335,25 @@ fn build_reconciler(
             move |tablet| {
                 teardown_edge.unregister_raftkv(tablet, base_id.clone());
             },
-        ));
-    }
-    SimReconciler::Mem(Reconciler::new(
-        env,
-        engines,
-        node_id,
-        move |tablet, node: &RaftKvNode<SimEnv, MemoryEngine>| {
-            host_edge.register_raftkv(tablet, CpGroup::Mem(node.clone()));
-        },
-        move |tablet| {
-            teardown_edge.unregister_raftkv(tablet, base_id.clone());
-        },
-    ))
+        ))
+    } else {
+        SimReconciler::Mem(Reconciler::new(
+            env,
+            engines,
+            node_id,
+            move |tablet, node: &RaftKvNode<SimEnv, MemoryEngine>| {
+                host_edge.register_raftkv(tablet, CpGroup::Mem(node.clone()));
+            },
+            move |tablet| {
+                teardown_edge.unregister_raftkv(tablet, base_id.clone());
+            },
+        ))
+    };
+    // ADR 0073 Phase 2 (P2-C): the same injection production's node assembly
+    // makes, so the sim exercises the control-fed handle on every hosted
+    // group.
+    reconciler.set_cluster_features(edge.version().features.clone());
+    reconciler
 }
 
 /// Drive `reconciler`'s per-tick lifecycle on `ctx`'s own node — this
@@ -1379,6 +1385,21 @@ impl SimClusterHandle {
             body,
         )
         .await
+    }
+
+    /// Send `request` from node `from` to node `to` through `from`'s own
+    /// `ClientCtx::relay` (the sim's `SimRelayClient`, whose receiving end is
+    /// `forwarding::handle_relayed_request`: the very function production's
+    /// relay receiver runs). The way a test plays "a follower-connected node
+    /// relays this to its peer" without a socket. ADR 0073 Phase 2 (P2-C).
+    pub(crate) async fn relay_request(
+        &self,
+        from: u64,
+        to: u64,
+        request: ClientRequest,
+    ) -> ClientResponse {
+        let target = self.ctx(to).env.node_id().to_string();
+        self.ctx(from).relay(target, request).await
     }
 
     /// Call `node`'s own `ClientCtx::propose_schema` directly, bypassing a
@@ -3245,6 +3266,28 @@ impl SimCluster {
         self.shared.ctx(node).edge.version().features.clone()
     }
 
+    /// The feature-gate handle of every CP group `node` currently hosts, in
+    /// tablet order (ADR 0073 Phase 2, P2-C): what the node's reconciler
+    /// injected into each `RaftKvNode`.
+    pub(crate) fn hosted_group_features(
+        &self,
+        node: u64,
+    ) -> Vec<animus_control::version::ClusterFeatures> {
+        self.shared
+            .ctx(node)
+            .edge
+            .hosted_groups()
+            .iter()
+            .map(|(_, g)| g.features())
+            .collect()
+    }
+
+    /// One metric's current value on `node` (the node's aggregated control +
+    /// data sinks, as `/admin/metrics` reports it).
+    pub(crate) fn metric(&self, node: u64, metric: animus_env::Metric) -> u64 {
+        self.shared.ctx(node).metrics_json().0[metric.name()]
+    }
+
     /// The node's version halt reason, if its feeder latched one.
     pub(crate) fn version_halt(&self, node: u64) -> Option<String> {
         self.shared.ctx(node).edge.version().halt.get()
@@ -4195,6 +4238,20 @@ impl SimCluster {
                 500,
                 format!("dynamo request on node {node} did not complete within {OP_BUDGET:?}"),
             )
+        })
+    }
+
+    /// [`SimClusterHandle::relay_request`]'s `&mut self` driver sibling.
+    /// `None` when the relay never resolved within the op budget.
+    pub(crate) fn relay_request(
+        &mut self,
+        from: u64,
+        to: u64,
+        request: ClientRequest,
+    ) -> Option<ClientResponse> {
+        let handle = self.shared.clone();
+        self.spawn_and_capture(from, async move {
+            handle.relay_request(from, to, request).await
         })
     }
 

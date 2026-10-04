@@ -959,12 +959,37 @@ pub enum Metric {
     /// sustained non-zero value needs an operator (`/admin/raftkv`'s
     /// per-group `refused_as_voter` names which tablet).
     CpGroupsRefusedAsVoter,
+
+    // --- Cluster-version feature-gate observability (ADR 0073 Phase 2, P2-C;
+    // appended, same slot-stability discipline). Each is a **level** mirrored
+    // from `animus_control::version::ClusterFeatures::violations(surface)` via
+    // `MetricsHandle::set` (the handle, not this crate, owns the count: this
+    // crate cannot depend on `animus-control`). A violation is an emitter
+    // that tried to put a value on the wire (or into a proposal) whose
+    // feature gate was closed on this node; the emit is refused and a debug
+    // build asserts, so any non-zero value is a bug to chase. Expected `0`.
+    /// Gate violations on control `RaftMsg` sends.
+    ClusterGateViolationsRaftMsg,
+    /// Gate violations on `MetaCommand` proposals and relays.
+    ClusterGateViolationsMetaCommand,
+    /// Gate violations on tablet `KvWire` sends.
+    ClusterGateViolationsKvWire,
+    /// Gate violations on tablet `KvCommand` proposals.
+    ClusterGateViolationsKvCommand,
+    /// Gate violations on `ClientRequest` frames this node sent.
+    ClusterGateViolationsClientRequest,
+    /// Gate violations on `ClientResponse` frames this node sent.
+    ClusterGateViolationsClientResponse,
+    /// A relayed `ProposeSchema` this node *received* and refused because the
+    /// command's gate is closed in this node's own view (`animusd`'s relay
+    /// receiver). A counter, not a level: the sender is another node.
+    ClusterGateRelayRefused,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 110] = [
+    pub const ALL: [Metric; 117] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -1075,6 +1100,13 @@ impl Metric {
         Metric::CpRemovalNoticesIgnored,
         Metric::CpDepartingPeersDropped,
         Metric::CpGroupsRefusedAsVoter,
+        Metric::ClusterGateViolationsRaftMsg,
+        Metric::ClusterGateViolationsMetaCommand,
+        Metric::ClusterGateViolationsKvWire,
+        Metric::ClusterGateViolationsKvCommand,
+        Metric::ClusterGateViolationsClientRequest,
+        Metric::ClusterGateViolationsClientResponse,
+        Metric::ClusterGateRelayRefused,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -1192,6 +1224,15 @@ impl Metric {
             Metric::CpRemovalNoticesIgnored => "cp_removal_notices_ignored",
             Metric::CpDepartingPeersDropped => "cp_departing_peers_dropped",
             Metric::CpGroupsRefusedAsVoter => "cp_groups_refused_as_voter",
+            Metric::ClusterGateViolationsRaftMsg => "cluster_gate_violations_raft_msg",
+            Metric::ClusterGateViolationsMetaCommand => "cluster_gate_violations_meta_command",
+            Metric::ClusterGateViolationsKvWire => "cluster_gate_violations_kv_wire",
+            Metric::ClusterGateViolationsKvCommand => "cluster_gate_violations_kv_command",
+            Metric::ClusterGateViolationsClientRequest => "cluster_gate_violations_client_request",
+            Metric::ClusterGateViolationsClientResponse => {
+                "cluster_gate_violations_client_response"
+            }
+            Metric::ClusterGateRelayRefused => "cluster_gate_relay_refused",
         }
     }
 
