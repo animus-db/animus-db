@@ -1,0 +1,42 @@
+[package]
+name = "animus-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "AnimusDB open-loop (coordinated-omission-corrected) DynamoDB-wire load generator."
+
+[lints]
+workspace = true
+
+[lib]
+name = "animus_bench"
+path = "src/lib.rs"
+
+[[bin]]
+name = "animus-bench"
+path = "src/main.rs"
+
+[dependencies]
+# SigV4 client-side signing (`animus_dynamo::sigv4::sign`, already `pub`,
+# ADR 0057) — reused rather than pulling in the AWS SDK.
+animus-dynamo.workspace = true
+# In-process cluster launcher (`Node::bind` + `run_bound_node`) — the same
+# bring-up the integration tests use; a bench-launched cluster is always
+# labeled non-publishable.
+animusd.workspace = true
+tokio = { workspace = true, features = ["process"] }
+serde.workspace = true
+serde_json.workspace = true
+# Seeded op/key stream (the generator is a process-boundary binary, but a
+# seeded stream makes a run's operation sequence reproducible).
+rand.workspace = true
+rand_chacha.workspace = true
+# HdrHistogram (`record_correct`-free: the intended-time correction is done
+# by the recorder itself, see `recorder.rs`). No `serialization` feature.
+hdrhistogram = { version = "7", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"
