@@ -256,6 +256,7 @@
     <div class="warnbox">
       <span class="label">Before you point anything at it</span>
       <p><strong>TLS and encryption at rest are both available but off by default, and SigV4 is still the only caller-identity story on the DynamoDB port.</strong> A cluster with no TLS configured is plain TCP end to end, exactly as before; turning TLS on gets you mutual authentication between cluster members plus encryption everywhere. Encryption at rest, when a key is configured, covers the Raft WAL and per-tablet engine files, plus backup/PITR/stream-segment objects on every segment/backup store — the default replicated one included, not just the <code>fs:</code>/<code>s3://</code> opt-ins (every node sharing a store needs the identical key file). SigV4 has a replicated credential catalog and rotation now, but is still not a full IAM policy language. Don't put an unconfigured cluster on the public internet, and don't store data you can't recreate.</p>
+      <p>What would end pre-alpha is written down: every item in the <a href="https://github.com/animus-db/animus-db/blob/main/docs/production-readiness.md">beta exit-criteria checklist</a> must be met or explicitly waived. Today most of the soak, chaos, fuzzing, overload, runbook and release-signing items are not met.</p>
     </div>
     <div class="ctalink-row">
       <a class="ctalink" href="compatibility.html">Full API compatibility →</a>
