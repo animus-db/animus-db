@@ -3,6 +3,7 @@
 
 mod client_fake;
 mod credentials;
+mod multipart;
 mod query_encoding;
 mod sigv4_chain_matches_dynamo;
 mod sigv4_known_answers;

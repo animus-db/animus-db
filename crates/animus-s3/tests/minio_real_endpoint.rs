@@ -108,4 +108,74 @@ async fn real_endpoint_put_get_list_delete_round_trip() {
         Err(animus_s3::client::S3Error::NotFound) => {}
         other => panic!("expected NotFound after delete, got {other:?}"),
     }
+
+    // S-08 M2: multipart upload (2 x 5 MiB + a 1 MiB tail) and ranged GETs.
+    const MIB: usize = 1024 * 1024;
+    let mp_key = format!("{key}.multipart");
+    let payload: Vec<u8> = (0..11 * MIB).map(|i| (i * 31 % 251) as u8).collect();
+    let upload_id = client
+        .create_multipart_upload(&mp_key, now_epoch_ms)
+        .await
+        .expect("create_multipart_upload");
+    let mut parts = Vec::new();
+    for (i, chunk) in payload.chunks(5 * MIB).enumerate() {
+        let n = u32::try_from(i + 1).expect("part number");
+        let etag = client
+            .upload_part(&mp_key, &upload_id, n, chunk.to_vec(), now_epoch_ms)
+            .await
+            .expect("upload_part");
+        parts.push((n, etag));
+    }
+    client
+        .complete_multipart_upload(&mp_key, &upload_id, &parts, now_epoch_ms)
+        .await
+        .expect("complete_multipart_upload");
+    let meta = client
+        .head_object(&mp_key, now_epoch_ms)
+        .await
+        .expect("head multipart object");
+    assert_eq!(meta.size, payload.len() as u64);
+    assert!(
+        client
+            .get_object(&mp_key, now_epoch_ms)
+            .await
+            .expect("get multipart object")
+            == payload,
+        "multipart object content mismatch"
+    );
+    // Ranged GET: a mid-object slice spanning a part boundary, and a short tail.
+    let mid = client
+        .get_object_range(&mp_key, 5 * MIB as u64 - 7, 14, now_epoch_ms)
+        .await
+        .expect("ranged get across a part boundary");
+    assert_eq!(mid, payload[5 * MIB - 7..5 * MIB + 7]);
+    let tail = client
+        .get_object_range(&mp_key, 10 * MIB as u64, 4 * MIB as u64, now_epoch_ms)
+        .await
+        .expect("ranged get with a short final range");
+    assert_eq!(tail, payload[10 * MIB..]);
+    match client
+        .get_object_range(&mp_key, payload.len() as u64, 1, now_epoch_ms)
+        .await
+    {
+        Err(animus_s3::client::S3Error::Service { status: 416, .. }) => {}
+        other => panic!("expected 416 past the end, got {other:?}"),
+    }
+    // An aborted upload leaves nothing behind.
+    let abort_id = client
+        .create_multipart_upload(&mp_key, now_epoch_ms)
+        .await
+        .expect("create second upload");
+    client
+        .upload_part(&mp_key, &abort_id, 1, vec![1; 5 * MIB], now_epoch_ms)
+        .await
+        .expect("upload part to be aborted");
+    client
+        .abort_multipart_upload(&mp_key, &abort_id, now_epoch_ms)
+        .await
+        .expect("abort_multipart_upload");
+    client
+        .delete_object(&mp_key, now_epoch_ms)
+        .await
+        .expect("delete multipart object");
 }

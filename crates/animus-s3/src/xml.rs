@@ -99,6 +99,77 @@ pub fn parse_error(xml: &str) -> Option<ErrorBody> {
     })
 }
 
+/// `InitiateMultipartUploadResult` -> its `<UploadId>` (S-08 M2).
+#[must_use]
+pub fn parse_initiate_multipart(xml: &str) -> Option<String> {
+    between(xml, "UploadId")
+        .into_iter()
+        .next()
+        .map(|v| xml_unescape(v.trim()))
+        .filter(|v| !v.is_empty())
+}
+
+/// A `CompleteMultipartUpload` response body. S3 may answer HTTP `200` and
+/// then put an `<Error>` document in the body (the assembly failed after the
+/// headers were flushed), so a `200` is only a success when the body is a
+/// `CompleteMultipartUploadResult` and carries no `<Error>`.
+///
+/// # Errors
+/// The embedded error (or a synthetic `MalformedResponse` when the body is
+/// neither shape).
+pub fn parse_complete_multipart(xml: &str) -> Result<(), ErrorBody> {
+    if xml.contains("<Error>") {
+        return Err(parse_error(xml).unwrap_or(ErrorBody {
+            code: "UnknownError".to_string(),
+            message: "unparseable <Error> in a 200 response".to_string(),
+        }));
+    }
+    if xml.contains("<CompleteMultipartUploadResult") {
+        Ok(())
+    } else {
+        Err(ErrorBody {
+            code: "MalformedResponse".to_string(),
+            message: "CompleteMultipartUpload response was not a result document".to_string(),
+        })
+    }
+}
+
+/// Parse a `CompleteMultipartUpload` request body into `(part number,
+/// etag)` pairs in document order (used by `crate::fake`).
+#[must_use]
+pub fn parse_complete_request(xml: &str) -> Vec<(u32, String)> {
+    between(xml, "Part")
+        .into_iter()
+        .filter_map(|p| {
+            let n = between(p, "PartNumber")
+                .into_iter()
+                .next()?
+                .trim()
+                .parse()
+                .ok()?;
+            let e = xml_unescape(between(p, "ETag").into_iter().next()?.trim());
+            Some((n, e))
+        })
+        .collect()
+}
+
+/// Escape the five predefined XML entities for element text.
+#[must_use]
+pub fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// The `<Credentials>` block of an STS `AssumeRoleWithWebIdentityResponse`
 /// (S-08 M1). The session token is a secret: this type has no `Debug`.
 pub struct StsCredentials {
@@ -398,5 +469,46 @@ mod tests {
         assert_eq!(parse_iso8601_epoch_ms("garbage"), None);
         assert_eq!(parse_iso8601_epoch_ms("2019-13-09T13:34:41Z"), None);
         assert_eq!(parse_iso8601_epoch_ms("2019-11-09 13:34:41Z"), None);
+    }
+}
+
+#[cfg(test)]
+mod multipart_tests {
+    use super::*;
+
+    #[test]
+    fn initiate_and_complete_shapes() {
+        let init = "<InitiateMultipartUploadResult><Bucket>b</Bucket><Key>k</Key>\
+                    <UploadId>abc&amp;1</UploadId></InitiateMultipartUploadResult>";
+        assert_eq!(parse_initiate_multipart(init).as_deref(), Some("abc&1"));
+        assert_eq!(parse_initiate_multipart("<x/>"), None);
+
+        let ok = "<?xml version=\"1.0\"?>\n<CompleteMultipartUploadResult><ETag>\"e-2\"</ETag>\
+                  </CompleteMultipartUploadResult>";
+        assert!(parse_complete_multipart(ok).is_ok());
+        let err = "   <?xml version=\"1.0\"?><Error><Code>InternalError</Code>\
+                   <Message>boom</Message></Error>";
+        assert_eq!(
+            parse_complete_multipart(err).unwrap_err().code,
+            "InternalError"
+        );
+        assert_eq!(
+            parse_complete_multipart("<html/>").unwrap_err().code,
+            "MalformedResponse"
+        );
+    }
+
+    #[test]
+    fn complete_request_round_trips_through_escaping() {
+        let body = format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part>\
+             <Part><PartNumber>2</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+            xml_escape("\"a\""),
+            xml_escape("\"b\"")
+        );
+        assert_eq!(
+            parse_complete_request(&body),
+            vec![(1, "\"a\"".to_string()), (2, "\"b\"".to_string())]
+        );
     }
 }

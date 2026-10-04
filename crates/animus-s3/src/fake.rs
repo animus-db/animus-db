@@ -43,7 +43,30 @@ pub struct FakeS3 {
     /// test can force pagination across more than one page without
     /// uploading a thousand objects.
     page_size: usize,
+    /// In-flight multipart uploads (S-08 M2), by upload id.
+    uploads: Mutex<BTreeMap<String, Upload>>,
+    next_upload: Mutex<u64>,
+    /// Smallest size S3 accepts for a non-last part (real S3: 5 MiB).
+    min_part_size: usize,
+    /// `METHOD uri` of every authenticated object request (not lists), in
+    /// order — lets a test assert which operations a caller issued.
+    request_log: Mutex<Vec<String>>,
+    /// `(part number, remaining failures)`: `UploadPart` of that part
+    /// answers `500 InternalError` while the count is non-zero.
+    part_failure: Mutex<Option<(u32, u32)>>,
+    /// Make `CompleteMultipartUpload` answer `200` with an `<Error>` body.
+    complete_error_in_200: Mutex<Option<String>>,
 }
+
+/// One in-flight multipart upload.
+struct Upload {
+    key: String,
+    /// part number -> (etag, bytes)
+    parts: BTreeMap<u32, (String, Vec<u8>)>,
+}
+
+/// Real S3's minimum size of a non-last multipart part.
+pub const S3_MIN_PART_SIZE: usize = 5 * 1024 * 1024;
 
 impl FakeS3 {
     /// A fresh, empty bucket double named `bucket`, with no registered
@@ -57,7 +80,45 @@ impl FakeS3 {
             request_count: Mutex::new(0),
             objects: Mutex::new(std::collections::BTreeMap::new()),
             page_size: 1000,
+            uploads: Mutex::new(BTreeMap::new()),
+            next_upload: Mutex::new(0),
+            min_part_size: S3_MIN_PART_SIZE,
+            request_log: Mutex::new(Vec::new()),
+            part_failure: Mutex::new(None),
+            complete_error_in_200: Mutex::new(None),
         }
+    }
+
+    /// Lower the minimum non-last part size (default 5 MiB, like S3) so a
+    /// test can exercise multipart with tiny parts.
+    #[must_use]
+    pub fn with_min_part_size(mut self, bytes: usize) -> Self {
+        self.min_part_size = bytes;
+        self
+    }
+
+    /// Multipart uploads started and neither completed nor aborted.
+    #[must_use]
+    pub fn open_upload_count(&self) -> usize {
+        self.uploads.lock().expect("fake uploads lock").len()
+    }
+
+    /// `METHOD uri` of every authenticated request so far, in order.
+    #[must_use]
+    pub fn request_log(&self) -> Vec<String> {
+        self.request_log.lock().expect("fake log lock").clone()
+    }
+
+    /// Make the next `times` `UploadPart` calls for `part_number` answer
+    /// `500 InternalError` (use a large `times` for a permanent failure).
+    pub fn fail_upload_part(&self, part_number: u32, times: u32) {
+        *self.part_failure.lock().expect("fake part failure lock") = Some((part_number, times));
+    }
+
+    /// Make every `CompleteMultipartUpload` answer HTTP 200 with an `<Error>`
+    /// body carrying `code` (what S3 does when assembly fails late).
+    pub fn set_complete_error_in_200(&self, code: Option<&str>) {
+        *self.complete_error_in_200.lock().expect("fake lock") = code.map(str::to_string);
     }
 
     /// Register a credential this double will accept.
@@ -193,9 +254,34 @@ impl FakeS3 {
         let Some(key) = key.filter(|k| !k.is_empty()) else {
             return error_response(400, "InvalidRequest", "missing object key");
         };
+        self.request_log
+            .lock()
+            .expect("fake log lock")
+            .push(format!("{} {}", req.method, req.uri));
+        let q = |name: &str| {
+            query_pairs
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        };
+        let upload_id = q("uploadId");
+        let part_number = q("partNumber");
         match req.method {
+            "POST" if q("uploads").is_some() => self.handle_create_upload(&key),
+            "POST" if upload_id.is_some() => {
+                self.handle_complete_upload(&key, &upload_id.unwrap_or_default(), &req.body)
+            }
+            "PUT" if upload_id.is_some() && part_number.is_some() => self.handle_upload_part(
+                &key,
+                &upload_id.unwrap_or_default(),
+                part_number.as_deref().unwrap_or(""),
+                req.body,
+            ),
+            "DELETE" if upload_id.is_some() => {
+                self.handle_abort_upload(&key, &upload_id.unwrap_or_default())
+            }
             "PUT" => self.handle_put(&key, req.body),
-            "GET" => self.handle_get(&key),
+            "GET" => self.handle_get(&key, req.headers.get("range").map(String::as_str)),
             "HEAD" => self.handle_head(&key),
             "DELETE" => self.handle_delete(&key),
             other => error_response(
@@ -303,15 +389,200 @@ impl FakeS3 {
         }
     }
 
-    fn handle_get(&self, key: &str) -> HttpResponse {
+    fn handle_get(&self, key: &str, range: Option<&str>) -> HttpResponse {
         let objects = self.objects.lock().expect("fake objects lock");
-        match objects.get(key) {
-            Some(bytes) => HttpResponse {
+        let Some(bytes) = objects.get(key) else {
+            return no_such_key_response();
+        };
+        let Some(range) = range else {
+            return HttpResponse {
                 status: 200,
                 headers: std::collections::BTreeMap::new(),
                 body: bytes.clone(),
+            };
+        };
+        // Only `bytes=a-b` (both ends) — all this crate ever sends.
+        let parsed = range
+            .strip_prefix("bytes=")
+            .and_then(|r| r.split_once('-'))
+            .and_then(|(a, b)| Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?)));
+        let Some((start, end)) = parsed.filter(|(a, b)| a <= b) else {
+            return error_response(
+                416,
+                "InvalidRange",
+                "The requested range is not satisfiable",
+            );
+        };
+        if start >= bytes.len() {
+            return error_response(
+                416,
+                "InvalidRange",
+                "The requested range is not satisfiable",
+            );
+        }
+        let end = end.min(bytes.len() - 1);
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            "content-range".to_string(),
+            format!("bytes {start}-{end}/{}", bytes.len()),
+        );
+        HttpResponse {
+            status: 206,
+            headers,
+            body: bytes[start..=end].to_vec(),
+        }
+    }
+
+    fn handle_create_upload(&self, key: &str) -> HttpResponse {
+        let id = {
+            let mut n = self.next_upload.lock().expect("fake upload counter lock");
+            *n += 1;
+            format!("upload-{n}")
+        };
+        self.uploads.lock().expect("fake uploads lock").insert(
+            id.clone(),
+            Upload {
+                key: key.to_string(),
+                parts: BTreeMap::new(),
             },
-            None => no_such_key_response(),
+        );
+        let xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<InitiateMultipartUploadResult \
+             xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>{}</Bucket><Key>{}</Key>\
+             <UploadId>{id}</UploadId></InitiateMultipartUploadResult>",
+            xml_escape(&self.bucket),
+            xml_escape(key)
+        );
+        HttpResponse {
+            status: 200,
+            headers: BTreeMap::new(),
+            body: xml.into_bytes(),
+        }
+    }
+
+    fn handle_upload_part(
+        &self,
+        key: &str,
+        upload_id: &str,
+        part_number: &str,
+        body: Vec<u8>,
+    ) -> HttpResponse {
+        let Some(n) = part_number
+            .parse::<u32>()
+            .ok()
+            .filter(|n| (1..=10_000).contains(n))
+        else {
+            return error_response(400, "InvalidArgument", "Part number must be 1..=10000");
+        };
+        {
+            let mut inj = self.part_failure.lock().expect("fake part failure lock");
+            if let Some((pn, left)) = inj.as_mut()
+                && *pn == n
+                && *left > 0
+            {
+                *left -= 1;
+                return error_response(500, "InternalError", "injected part failure");
+            }
+        }
+        let mut uploads = self.uploads.lock().expect("fake uploads lock");
+        let Some(up) = uploads.get_mut(upload_id).filter(|u| u.key == key) else {
+            return no_such_upload();
+        };
+        let etag = opaque_etag(&body);
+        up.parts.insert(n, (etag.clone(), body));
+        let mut headers = BTreeMap::new();
+        headers.insert("etag".to_string(), etag);
+        HttpResponse {
+            status: 200,
+            headers,
+            body: Vec::new(),
+        }
+    }
+
+    fn handle_complete_upload(&self, key: &str, upload_id: &str, body: &[u8]) -> HttpResponse {
+        let mut uploads = self.uploads.lock().expect("fake uploads lock");
+        let Some(up) = uploads.get(upload_id).filter(|u| u.key == key) else {
+            return no_such_upload();
+        };
+        if let Some(code) = self
+            .complete_error_in_200
+            .lock()
+            .expect("fake lock")
+            .clone()
+        {
+            // Real S3 answers 200 and fails inside the body; the upload
+            // stays open.
+            let mut r = error_response(200, &code, "injected late assembly failure");
+            r.status = 200;
+            return r;
+        }
+        let listed = crate::xml::parse_complete_request(&String::from_utf8_lossy(body));
+        if listed.is_empty() {
+            return error_response(400, "MalformedXML", "no parts listed");
+        }
+        if listed.windows(2).any(|w| w[0].0 >= w[1].0) {
+            return error_response(
+                400,
+                "InvalidPartOrder",
+                "The list of parts was not in ascending order",
+            );
+        }
+        let mut assembled = Vec::new();
+        let mut etags = String::new();
+        for (i, (n, etag)) in listed.iter().enumerate() {
+            let Some((have, bytes)) = up.parts.get(n) else {
+                return error_response(400, "InvalidPart", "part was not uploaded");
+            };
+            if have != etag {
+                return error_response(400, "InvalidPart", "part ETag does not match");
+            }
+            if i + 1 < listed.len() && bytes.len() < self.min_part_size {
+                return error_response(
+                    400,
+                    "EntityTooSmall",
+                    "Your proposed upload is smaller than the minimum allowed size",
+                );
+            }
+            assembled.extend_from_slice(bytes);
+            etags.push_str(etag);
+        }
+        let final_etag = format!(
+            "\"{}-{}\"",
+            opaque_etag(etags.as_bytes()).trim_matches('"'),
+            listed.len()
+        );
+        uploads.remove(upload_id);
+        drop(uploads);
+        self.objects
+            .lock()
+            .expect("fake objects lock")
+            .insert(key.to_string(), assembled);
+        let xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CompleteMultipartUploadResult \
+             xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>{}</Bucket><Key>{}</Key>\
+             <ETag>{}</ETag></CompleteMultipartUploadResult>",
+            xml_escape(&self.bucket),
+            xml_escape(key),
+            xml_escape(&final_etag)
+        );
+        HttpResponse {
+            status: 200,
+            headers: BTreeMap::new(),
+            body: xml.into_bytes(),
+        }
+    }
+
+    fn handle_abort_upload(&self, key: &str, upload_id: &str) -> HttpResponse {
+        let mut uploads = self.uploads.lock().expect("fake uploads lock");
+        if uploads.get(upload_id).is_some_and(|u| u.key == key) {
+            uploads.remove(upload_id);
+            HttpResponse {
+                status: 204,
+                headers: BTreeMap::new(),
+                body: Vec::new(),
+            }
+        } else {
+            no_such_upload()
         }
     }
 
@@ -418,6 +689,23 @@ fn amz_date_to_epoch_ms(d: &str) -> Option<u64> {
 
 fn split_uri(uri: &str) -> (&str, &str) {
     uri.split_once('?').unwrap_or((uri, ""))
+}
+
+fn no_such_upload() -> HttpResponse {
+    error_response(
+        404,
+        "NoSuchUpload",
+        "The specified multipart upload does not exist.",
+    )
+}
+
+/// A stable opaque quoted ETag (truncated SHA-256 — S3 uses MD5, but clients
+/// treat it as opaque).
+fn opaque_etag(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    let hex: String = digest.iter().take(16).map(|b| format!("{b:02x}")).collect();
+    format!("\"{hex}\"")
 }
 
 fn no_such_key_response() -> HttpResponse {

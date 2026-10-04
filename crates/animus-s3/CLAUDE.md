@@ -26,8 +26,9 @@ described below — takes it as a `[dev-dependencies]` feature for its own
 Kubernetes-operator egress/credential-secret side (`spec.s3`,
 `animus-operator`'s `S3StoreSpec`). S-08 M1 (non-static credentials +
 virtual-hosted addressing) has landed — see "Credential providers" and
-"Addressing" below; what remains of S-08 (multipart upload) is
-`docs/roadmap.md` S-08.
+"Addressing" below; S-08 M2 (multipart upload + ranged GET) has
+landed too — see "Multipart and ranged GET" below; the rest of S-08 is in
+`docs/roadmap.md`.
 
 ## Entry points
 
@@ -223,6 +224,36 @@ first label of the `Host` header when it equals its bucket.
   the STS/ECS/IMDS double; `FakeS3::register_session_credential` makes S3
   demand the token and answer `400 ExpiredToken` by the request's own
   signed timestamp (the caller-supplied `now`).
+
+## Multipart and ranged GET (S-08 M2)
+
+- `S3Client::{create_multipart_upload, upload_part, complete_multipart_upload,
+  abort_multipart_upload, get_object_range}` all go through the same
+  `execute` path as every other call (path-style and virtual-hosted, session
+  tokens, ExpiredToken refresh-once). `upload_part` returns the `ETag`
+  header verbatim (quoted); `complete` sends parts in the order given.
+- **`CompleteMultipartUpload` can answer HTTP 200 with an `<Error>` body**
+  (S3 flushes headers, then fails assembly). `xml::parse_complete_multipart`
+  treats that — and any 200 that is not a `CompleteMultipartUploadResult` —
+  as a failure; `InternalError`/`SlowDown` inside a 200 surface as
+  `Service { status: 500 }` so a caller's 5xx retry applies.
+- `abort_multipart_upload` is idempotent (404 `NoSuchUpload` is `Ok`).
+- `get_object_range(key, start, len)` signs `range: bytes=a-b`, requires
+  `206` (a `200` means the server ignored the range and is refused), and a
+  range past the end is truncated by S3 (short final slice); `start` past
+  the end is `Service { status: 416, code: "InvalidRange" }`.
+- **Abandoned uploads**: a failed abort or a killed process leaves an
+  incomplete upload that is billed. Operators should set a bucket lifecycle
+  rule `AbortIncompleteMultipartUpload` (e.g. `DaysAfterInitiation: 1`).
+- `FakeS3` knobs: `with_min_part_size` (default `S3_MIN_PART_SIZE` = 5 MiB,
+  non-last parts below it fail `EntityTooSmall` at complete),
+  `open_upload_count()`, `request_log()` (`"METHOD uri"` of every
+  authenticated object request), `fail_upload_part(n, times)`,
+  `set_complete_error_in_200(code)`. It validates ascending part order
+  (`InvalidPartOrder`), part existence/ETag (`InvalidPart`), and answers
+  `206` + `Content-Range` / `416`. ETags are truncated SHA-256, not MD5.
+- Tests: `tests/it/multipart.rs`; the real-endpoint test has a multipart
+  (2x5 MiB + 1 MiB) and ranged-GET leg.
 
 ## Testing
 

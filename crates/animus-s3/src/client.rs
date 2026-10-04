@@ -415,6 +415,177 @@ impl<T: Transport> S3Client<T> {
         }
     }
 
+    /// `POST /{bucket}/{key}?uploads` — start a multipart upload and return
+    /// its upload id (S-08 M2).
+    pub async fn create_multipart_upload(
+        &self,
+        key: &str,
+        now_epoch_ms: u64,
+    ) -> Result<String, S3Error> {
+        let resp = self
+            .execute_object("POST", key, &[("uploads", "")], Vec::new(), now_epoch_ms)
+            .await?;
+        match resp.status {
+            200..=299 => xml::parse_initiate_multipart(&String::from_utf8_lossy(&resp.body))
+                .ok_or_else(|| S3Error::Service {
+                    code: "MalformedResponse".to_string(),
+                    message: "CreateMultipartUpload response carried no UploadId".to_string(),
+                    status: resp.status,
+                }),
+            _ => Err(self.map_error(resp)),
+        }
+    }
+
+    /// `PUT /{bucket}/{key}?partNumber=N&uploadId=ID` — upload one part and
+    /// return its `ETag` (the quoted header value, verbatim) for the final
+    /// [`Self::complete_multipart_upload`]. `part_number` is `1..=10000`.
+    pub async fn upload_part(
+        &self,
+        key: &str,
+        upload_id: &str,
+        part_number: u32,
+        body: Vec<u8>,
+        now_epoch_ms: u64,
+    ) -> Result<String, S3Error> {
+        let pn = part_number.to_string();
+        let resp = self
+            .execute_object(
+                "PUT",
+                key,
+                &[("partNumber", pn.as_str()), ("uploadId", upload_id)],
+                body,
+                now_epoch_ms,
+            )
+            .await?;
+        match resp.status {
+            200..=299 => resp
+                .headers
+                .get("etag")
+                .cloned()
+                .ok_or_else(|| S3Error::Service {
+                    code: "MalformedResponse".to_string(),
+                    message: "UploadPart response carried no ETag header".to_string(),
+                    status: resp.status,
+                }),
+            _ => Err(self.map_error(resp)),
+        }
+    }
+
+    /// `POST /{bucket}/{key}?uploadId=ID` with the ordered part list. S3 can
+    /// answer `200` and then fail the assembly with an `<Error>` document in
+    /// the body; that is a **failure** here, not a success.
+    pub async fn complete_multipart_upload(
+        &self,
+        key: &str,
+        upload_id: &str,
+        parts: &[(u32, String)],
+        now_epoch_ms: u64,
+    ) -> Result<(), S3Error> {
+        let mut body = String::from("<CompleteMultipartUpload>");
+        for (n, etag) in parts {
+            body.push_str(&format!(
+                "<Part><PartNumber>{n}</PartNumber><ETag>{}</ETag></Part>",
+                xml::xml_escape(etag)
+            ));
+        }
+        body.push_str("</CompleteMultipartUpload>");
+        let resp = self
+            .execute_object(
+                "POST",
+                key,
+                &[("uploadId", upload_id)],
+                body.into_bytes(),
+                now_epoch_ms,
+            )
+            .await?;
+        match resp.status {
+            200..=299 => {
+                match xml::parse_complete_multipart(&String::from_utf8_lossy(&resp.body)) {
+                    Ok(()) => Ok(()),
+                    Err(e) => Err(match e.code.as_str() {
+                        c if is_expired_token_code(c) => S3Error::CredentialsExpired,
+                        // S3 documents an in-200 InternalError/SlowDown as
+                        // retryable: surface it as the 5xx it stands for.
+                        "InternalError" | "SlowDown" | "ServiceUnavailable" => S3Error::Service {
+                            code: e.code,
+                            message: e.message,
+                            status: 500,
+                        },
+                        _ => S3Error::Service {
+                            code: e.code,
+                            message: e.message,
+                            status: resp.status,
+                        },
+                    }),
+                }
+            }
+            _ => Err(self.map_error(resp)),
+        }
+    }
+
+    /// `DELETE /{bucket}/{key}?uploadId=ID` — abort a multipart upload.
+    /// Idempotent: an already-gone upload (`404 NoSuchUpload`) is `Ok`.
+    pub async fn abort_multipart_upload(
+        &self,
+        key: &str,
+        upload_id: &str,
+        now_epoch_ms: u64,
+    ) -> Result<(), S3Error> {
+        let resp = self
+            .execute_object(
+                "DELETE",
+                key,
+                &[("uploadId", upload_id)],
+                Vec::new(),
+                now_epoch_ms,
+            )
+            .await?;
+        match resp.status {
+            200..=299 | 404 => Ok(()),
+            _ => Err(self.map_error(resp)),
+        }
+    }
+
+    /// `GET /{bucket}/{key}` with `Range: bytes=start-(start+len-1)`;
+    /// expects `206`. A range running past the end of the object is
+    /// truncated by S3, so the result may be shorter than `len` (the final
+    /// slice); a `start` at or past the end is `416` and surfaces as
+    /// [`S3Error::Service`] with `status: 416`. A `200` (server ignored the
+    /// range) is refused rather than silently returning the whole object.
+    pub async fn get_object_range(
+        &self,
+        key: &str,
+        start: u64,
+        len: u64,
+        now_epoch_ms: u64,
+    ) -> Result<Vec<u8>, S3Error> {
+        if len == 0 {
+            return Err(S3Error::InvalidConfig(
+                "get_object_range needs len >= 1".to_string(),
+            ));
+        }
+        let end = start.saturating_add(len - 1);
+        let mut headers = BTreeMap::new();
+        headers.insert("range".to_string(), format!("bytes={start}-{end}"));
+        let raw_path = match self.addressing {
+            Addressing::Path => format!("/{}/{}", self.target.bucket, key),
+            Addressing::VirtualHosted => format!("/{key}"),
+        };
+        let resp = self
+            .execute("GET", &raw_path, &[], Vec::new(), headers, now_epoch_ms)
+            .await?;
+        match resp.status {
+            206 => Ok(resp.body),
+            404 => Err(S3Error::NotFound),
+            200..=299 => Err(S3Error::Service {
+                code: "RangeIgnored".to_string(),
+                message: format!("server answered {} to a ranged GET", resp.status),
+                status: resp.status,
+            }),
+            _ => Err(self.map_error(resp)),
+        }
+    }
+
     fn map_error(&self, resp: HttpResponse) -> S3Error {
         let body = String::from_utf8_lossy(&resp.body);
         if let Some(err) = xml::parse_error(&body) {
