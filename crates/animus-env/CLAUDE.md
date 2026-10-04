@@ -706,6 +706,12 @@ the production implementation; the deterministic implementation lives in
   transport in production — `animusd` is the only crate that ever
   constructs the concrete `S3SegmentStore<HyperRustlsTransport>` (the real
   process boundary; this crate never touches a real S3 socket itself).
+  `S3SegmentStore::new(transport, S3Config, prefix)` builds a path-style,
+  static-credential client; `from_client(S3Client, prefix)` (S-08 M1) takes
+  a client built with `S3Client::with_provider`/`with_addressing` (non-static
+  credentials, virtual-hosted). `is_retryable` treats `CredentialsExpired`/
+  `Credentials`/`InvalidConfig` as non-retryable (the client already did its
+  one forced-refresh retry).
   Gated behind the same `prod` feature as `FsSegmentStore`, pulling in
   `animus-s3` as an optional dependency (with none of *its* own `fake`/
   `prod` features — this crate needs only `animus_s3::client`'s
