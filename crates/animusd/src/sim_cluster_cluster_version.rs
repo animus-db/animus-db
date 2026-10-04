@@ -1,8 +1,9 @@
 //! ADR 0073 Phase 2 (P2-C): node wiring and the admin surface, under
 //! `SimCluster` (seed-reproducible; replay one seed with `ANIMUS_SEED=<seed>`).
 //!
-//! A per-node "binary" is `SimCluster::set_node_version` (own version profile
-//! + the control `RaftNode`'s own range + the simulated handshake `ext`).
+//! A per-node "binary" is `SimCluster::set_node_version` (own version profile,
+//! the control `RaftNode`'s own range and the simulated handshake `ext`).
+//!
 //! Synthetic ranges `[1, 2]` stand in for a real second release, since the
 //! real `MAX_SUPPORTED` is still 1 (no gate has shipped).
 //!
