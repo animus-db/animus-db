@@ -28,8 +28,10 @@
 
 use std::path::{Path, PathBuf};
 
+use animus_control::Metadata;
 use animus_control::format::FormatError;
 use animus_control::persist::{PersistedState, WalRecord};
+use animus_control::version::ClusterFeatures;
 use animus_env::nid;
 
 use crate::codec::tests::{sample_entries, sample_wires};
@@ -97,7 +99,10 @@ fn unpack_frames(mut bytes: &[u8]) -> Vec<Vec<u8>> {
 }
 
 fn v1_wire_bytes() -> Vec<u8> {
-    let frames: Vec<Vec<u8>> = sample_wires().iter().map(codec::encode_wire).collect();
+    let frames: Vec<Vec<u8>> = sample_wires()
+        .iter()
+        .map(|w| codec::encode_wire(w, &ClusterFeatures::new()))
+        .collect();
     pack_frames(&frames)
 }
 
@@ -154,7 +159,12 @@ fn raftkv_wire_round_trips_and_matches_the_fixture_bytes() {
         }
         let re: Vec<Vec<u8>> = unpack_frames(&bytes)
             .iter()
-            .map(|f| codec::encode_wire(&codec::decode_wire(f).expect("decode")))
+            .map(|f| {
+                codec::encode_wire(
+                    &codec::decode_wire(f).expect("decode"),
+                    &ClusterFeatures::new(),
+                )
+            })
             .collect();
         assert_eq!(
             pack_frames(&re),
@@ -247,13 +257,72 @@ fn raftkv_image_round_trips_and_matches_the_fixture_bytes() {
             continue;
         }
         let (max_ts, rows) = codec::decode_image(&bytes).expect("decode");
-        assert_eq!(codec::encode_image(&rows, max_ts), bytes, "v1 round trip");
+        assert_eq!(
+            codec::encode_image(&rows, max_ts, &ClusterFeatures::new()),
+            bytes,
+            "v1 round trip"
+        );
         let (m, r) = v1_image();
         assert_eq!(
-            codec::encode_image(&r, m),
+            codec::encode_image(&r, m, &ClusterFeatures::new()),
             bytes,
             "v1: current encoder emits the fixture"
         );
+    }
+}
+
+/// ADR 0073 Phase 2 (P2-B) byte-identity proof: before the era, a B2 encoder
+/// emits **exactly the Phase 1 bytes** for both gate-selected frame kinds, whatever
+/// the sender's feature handle says. The handles here are the floor handle
+/// (`ClusterFeatures::new()`, what a node holds before it first reads
+/// `Metadata`) and one fed from an **era-0** `Metadata` (versioning off, cluster
+/// version 1), plus one fed from an era-on `Metadata` (no frame version exists
+/// beyond v1 yet, so even an open era must still select v1). The fixtures are the
+/// Phase 0/1 `raftkv-wire/v1.bin` and `raftkv-image/v1.bin`, which no P2 change
+/// may touch (`scripts/check-format-fixtures.sh`).
+#[test]
+fn pre_era_encoders_are_byte_identical_to_the_phase1_fixtures_under_every_handle() {
+    let era0 = ClusterFeatures::new();
+    era0.update(&Metadata::default());
+    assert!(!era0.era_active() && era0.cluster_version() == 1);
+    let era_on_meta = crate::gates::era_on_metadata();
+    let era_on = ClusterFeatures::new();
+    era_on.update(&era_on_meta);
+    assert!(era_on.era_active());
+    let handles = [
+        ("floor", ClusterFeatures::new()),
+        ("era-0 metadata", era0),
+        ("era-on metadata", era_on),
+    ];
+
+    let wire_fixture = fixture_files(&formats_dir("raftkv-wire"))
+        .into_iter()
+        .find(|(v, _)| *v == 1)
+        .expect("raftkv-wire/v1.bin")
+        .1;
+    let image_fixture = fixture_files(&formats_dir("raftkv-image"))
+        .into_iter()
+        .find(|(v, _)| *v == 1)
+        .expect("raftkv-image/v1.bin")
+        .1;
+    let (max_ts, rows) = v1_image();
+    for (name, f) in &handles {
+        let frames: Vec<Vec<u8>> = sample_wires()
+            .iter()
+            .map(|w| codec::encode_wire(w, f))
+            .collect();
+        assert!(
+            frames.iter().all(|fr| fr[0] == 0xCB && fr[1] == 1),
+            "{name}"
+        );
+        assert_eq!(
+            pack_frames(&frames),
+            wire_fixture,
+            "{name}: wire != Phase 1"
+        );
+        let image = codec::encode_image(&rows, max_ts, f);
+        assert_eq!(&image[..2], &[0xCB, 1], "{name}");
+        assert_eq!(image, image_fixture, "{name}: image != Phase 1");
     }
 }
 
@@ -262,7 +331,11 @@ fn raftkv_image_round_trips_and_matches_the_fixture_bytes() {
 #[ignore]
 fn generate_fixture_raftkv_image() {
     let (m, r) = v1_image();
-    write_new_fixture(&formats_dir("raftkv-image"), 1, &codec::encode_image(&r, m));
+    write_new_fixture(
+        &formats_dir("raftkv-image"),
+        1,
+        &codec::encode_image(&r, m, &ClusterFeatures::new()),
+    );
 }
 
 // ---------------------------------------------------------------------------

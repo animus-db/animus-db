@@ -57,6 +57,7 @@ use std::collections::BTreeSet;
 
 use animus_control::format::FormatError;
 use animus_control::raft::{LogEntry, RaftMsg};
+use animus_control::version::{ClusterFeatures, Gate};
 use animus_env::NodeId;
 #[cfg(test)]
 use animus_env::nid;
@@ -75,6 +76,43 @@ const MAGIC: u8 = 0xCB;
 /// `32`) was dropped. From the baseline on, an incompatible layout change is a
 /// new version with a new golden fixture, never a rewrite of `1`.
 const VERSION: u8 = 1;
+
+/// Gate-selected frame versions (ADR 0073 Phase 2, P2-B, section 3 "Binary
+/// codecs"): one table per frame kind of `(frame version, gate that must be
+/// open before an encoder may emit it)`, ascending. The encoder writes the
+/// highest version whose gate is open on the sender's [`ClusterFeatures`]
+/// ([`select_frame_version`]); decoders keep accepting every version up to
+/// [`VERSION`]. Only v1 exists, behind [`Gate::Base`] (always open), so
+/// today's encoders emit exactly the Phase 1 bytes whatever the handle says.
+/// A new frame version adds a row here (with its gate), a body encoder arm, a
+/// decoder arm (the old one moving to `legacy`) and a fixture.
+const WIRE_VERSIONS: &[(u8, Gate)] = &[(1, Gate::Base)];
+/// See [`WIRE_VERSIONS`], for `raftkv-image` frames.
+const IMAGE_VERSIONS: &[(u8, Gate)] = &[(1, Gate::Base)];
+
+/// The highest version in `table` whose gate is open on `features`; the first
+/// row is the floor and always `Gate::Base` (open), so there is always one.
+fn select_frame_version(table: &[(u8, Gate)], features: &ClusterFeatures) -> u8 {
+    debug_assert!(
+        table.first().is_some_and(|(_, g)| *g == Gate::Base),
+        "a frame-version table starts with an always-open Base row"
+    );
+    table
+        .iter()
+        .rev()
+        .find(|(_, g)| features.is_open(*g))
+        .map_or(table[0].0, |(v, _)| *v)
+}
+
+/// The `raftkv-wire` frame version an encoder emits under `features`.
+pub(crate) fn wire_frame_version(features: &ClusterFeatures) -> u8 {
+    select_frame_version(WIRE_VERSIONS, features)
+}
+
+/// The `raftkv-image` frame version an encoder emits under `features`.
+pub(crate) fn image_frame_version(features: &ClusterFeatures) -> u8 {
+    select_frame_version(IMAGE_VERSIONS, features)
+}
 
 /// Internal detail of a framing failure below the version header (what was
 /// malformed); the public entry points wrap it as `FormatError::Malformed`.
@@ -1170,11 +1208,15 @@ fn read_raft(c: &mut Cursor<'_>) -> Result<RaftMsg<KvCommand>, DecodeError> {
 
 // ---- KvWire --------------------------------------------------------------
 
-/// Encode a [`KvWire`] message to its binary frame.
-pub(crate) fn encode_wire(w: &KvWire) -> Vec<u8> {
+/// Encode a [`KvWire`] message to its binary frame, at the frame version the
+/// sender's `features` select ([`wire_frame_version`]).
+pub(crate) fn encode_wire(w: &KvWire, features: &ClusterFeatures) -> Vec<u8> {
+    let version = wire_frame_version(features);
     let mut out = Vec::new();
     put_u8(&mut out, MAGIC);
-    put_u8(&mut out, VERSION);
+    put_u8(&mut out, version);
+    // v1 is the only body layout today; a v2 adds a `match version` arm here.
+    debug_assert!(WIRE_VERSIONS.iter().any(|(v, _)| *v == version));
     match w {
         KvWire::Raft(m) => {
             put_u8(&mut out, 0);
@@ -1261,10 +1303,17 @@ fn decode_wire_body(mut c: Cursor<'_>) -> Result<KvWire, DecodeError> {
 /// `max_applied_ts` at image-build time — an upper bound on every `ts` any
 /// entry folded into this tablet has ever committed, whether or not that
 /// entry's apply wrote a row. See `lib.rs`'s `engine_image` doc.
-pub(crate) fn encode_image(entries: &[ImageEntry], max_ts: Option<HlcTimestamp>) -> Vec<u8> {
+pub(crate) fn encode_image(
+    entries: &[ImageEntry],
+    max_ts: Option<HlcTimestamp>,
+    features: &ClusterFeatures,
+) -> Vec<u8> {
+    let version = image_frame_version(features);
     let mut out = Vec::new();
     put_u8(&mut out, MAGIC);
-    put_u8(&mut out, VERSION);
+    put_u8(&mut out, version);
+    // v1 is the only body layout today; a v2 adds a `match version` arm here.
+    debug_assert!(IMAGE_VERSIONS.iter().any(|(v, _)| *v == version));
     put_opt_ts(&mut out, &max_ts);
     out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
     for (kind, key, value, version) in entries {
@@ -1319,6 +1368,50 @@ pub(crate) mod tests {
     use proptest::prelude::*;
 
     use super::*;
+
+    /// Floor-handle shims shadowing the production signatures (which take
+    /// the sender's `ClusterFeatures`), so the pre-existing codec tests keep
+    /// exercising the pre-era (Phase 1) encoding unchanged.
+    fn encode_wire(w: &KvWire) -> Vec<u8> {
+        super::encode_wire(w, &ClusterFeatures::new())
+    }
+    fn encode_image(entries: &[ImageEntry], max_ts: Option<HlcTimestamp>) -> Vec<u8> {
+        super::encode_image(entries, max_ts, &ClusterFeatures::new())
+    }
+
+    /// The gate-selected frame-version tables (ADR 0073 P2-B): ascending,
+    /// floored at an always-open `Base` row, topping out at `VERSION` (every
+    /// emitted version is one the decoder accepts), and the selector picks the
+    /// highest open row (checked on a synthetic ladder, since only v1 exists).
+    #[test]
+    fn frame_version_tables_are_well_formed_and_the_selector_picks_the_highest_open() {
+        for (name, table) in [("wire", WIRE_VERSIONS), ("image", IMAGE_VERSIONS)] {
+            assert_eq!(table[0], (1, Gate::Base), "{name}: v1 is the Base floor");
+            assert!(
+                table.windows(2).all(|w| w[0].0 < w[1].0),
+                "{name}: ascending"
+            );
+            assert_eq!(
+                table.last().unwrap().0,
+                VERSION,
+                "{name}: top row == VERSION"
+            );
+            for (v, _) in table {
+                assert!(*v >= 1 && *v <= VERSION, "{name}: decoder accepts v{v}");
+            }
+        }
+        let floor = ClusterFeatures::new();
+        assert_eq!(wire_frame_version(&floor), 1);
+        assert_eq!(image_frame_version(&floor), 1);
+        let ladder = [(1, Gate::Base), (2, Gate::Era)];
+        assert_eq!(select_frame_version(&ladder, &floor), 1, "era closed");
+        let era = crate::gates::era_on_metadata();
+        let open = ClusterFeatures::new();
+        open.update(&era);
+        assert!(open.is_open(Gate::Era));
+        assert_eq!(select_frame_version(&ladder, &open), 2, "era open");
+        assert_eq!(wire_frame_version(&open), 1, "no v2 row yet");
+    }
 
     fn roundtrip(w: &KvWire) {
         let bytes = encode_wire(w);
