@@ -11886,6 +11886,17 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             return Ok(node);
         }
 
+        // ADR 0073 Phase 2 (P2-C): once the version era is on, refuse a voter
+        // whose version range is unknown (a Phase 1 binary) or excludes the
+        // cluster version, by name, before anything is registered or
+        // proposed. Pre-era: no check.
+        version_wiring::check_member_admission(
+            &leader.metadata(),
+            &leader.version_observations(),
+            self.env.now(),
+            &node,
+        )?;
+
         // **Issue #406/#450 (Bug B), read-your-writes barrier.** This
         // leader's own `metadata_cached()` is gated on its own async apply
         // task (ADR 0038), which can lag its own already-committed Raft log

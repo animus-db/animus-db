@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use animus_control::meta::{MetaCommand, Metadata, NodeStatus};
 use animus_control::version::{ClusterFeatures, NodeVersion, VersionRange, own_range};
-use animus_control::version_observe::VersionObservation;
+use animus_control::version_observe::{OBSERVATION_WINDOW, VersionObservation};
 use animus_env::{Env, NodeId, handshake};
 use animus_node::control_handle::ControlHandle;
 use animus_node::host::RelayClient;
@@ -160,6 +160,42 @@ pub(crate) fn check_join_range(raw_cluster_version: u32, own: &VersionRange) -> 
     match own.exclusion_message(cv) {
         Some(msg) => Err(format!("cannot join: {msg}")),
         None => Ok(()),
+    }
+}
+
+/// The era-on admission check for `change_membership` (ADR 0073 section 2(c)):
+/// refuse a control voter with no known version range (a Phase 1 binary
+/// never advertises one) or whose range excludes the cluster version. The
+/// range is the replicated record if there is one, else a *fresh* leader
+/// observation (within [`OBSERVATION_WINDOW`] of `now`). A pre-era cluster is
+/// never checked here (nothing to refuse against yet).
+pub(crate) fn check_member_admission(
+    meta: &Metadata,
+    observed: &BTreeMap<NodeId, VersionObservation>,
+    now: animus_env::Nanos,
+    node: &NodeId,
+) -> Result<(), String> {
+    if !meta.versioning_active() {
+        return Ok(());
+    }
+    let cv = meta.cluster_version();
+    let range = meta.node_versions.get(node).map(|v| v.range).or_else(|| {
+        observed
+            .get(node)
+            .filter(|o| now.duration_since(o.observed_at) <= OBSERVATION_WINDOW)
+            .and_then(|o| o.range)
+    });
+    match range {
+        None => Err(format!(
+            "node {node} has no known version range (a Phase 1 binary, or not yet heard \
+             from): the cluster is versioned, so it cannot be added; start it on a \
+             current binary and retry"
+        )),
+        Some(r) if !r.contains(cv) => Err(format!(
+            "node {node}'s version range [{},{}] excludes cluster version {cv}",
+            r.min, r.max
+        )),
+        Some(_) => Ok(()),
     }
 }
 
@@ -421,6 +457,40 @@ mod tests {
         assert!(check_join_range(3, &own).is_ok());
         assert!(check_join_range(9, &own).unwrap_err().contains("above"));
         assert!(check_join_range(0, &VersionRange::new(1, 1)).is_ok());
+    }
+
+    #[test]
+    fn member_admission_is_era_gated_and_names_the_problem() {
+        use animus_env::Nanos;
+        let node = nid("x");
+        let mut meta = Metadata::default();
+        let mut obs = BTreeMap::new();
+        // Pre-era: never checked.
+        assert!(check_member_admission(&meta, &obs, Nanos(0), &node).is_ok());
+        meta.cluster_version = 1;
+        let e = check_member_admission(&meta, &obs, Nanos(0), &node).unwrap_err();
+        assert!(e.contains("no known version range"), "{e}");
+        // A fresh observation with a range admits; a stale one does not.
+        obs.insert(
+            node.clone(),
+            VersionObservation {
+                range: Some(VersionRange::new(1, 2)),
+                build: None,
+                observed_at: Nanos(0),
+            },
+        );
+        assert!(check_member_admission(&meta, &obs, Nanos(1_000), &node).is_ok());
+        let far = Nanos(OBSERVATION_WINDOW.as_nanos() as u64 * 10);
+        assert!(check_member_admission(&meta, &obs, far, &node).is_err());
+        // A Phase 1 observation (no range) does not admit.
+        obs.get_mut(&node).unwrap().range = None;
+        assert!(check_member_admission(&meta, &obs, Nanos(1_000), &node).is_err());
+        // A recorded range wins and must contain the cluster version.
+        meta.node_versions.insert(node.clone(), rec(3, 4));
+        let e = check_member_admission(&meta, &obs, Nanos(1_000), &node).unwrap_err();
+        assert!(e.contains("excludes cluster version 1"), "{e}");
+        meta.node_versions.insert(node.clone(), rec(1, 4));
+        assert!(check_member_admission(&meta, &obs, Nanos(1_000), &node).is_ok());
     }
 
     #[test]

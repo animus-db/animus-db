@@ -489,3 +489,36 @@ fn join_info_carries_the_cluster_version_only_when_the_era_is_on() {
     let era = serde_json::to_string(&on).unwrap();
     assert!(era.contains("\"cluster_version\":2"), "{era}");
 }
+
+fn run_admission_refuses_an_unversioned_control_voter(seed: u64) {
+    let mut cluster = new_cluster(seed);
+    start_era(&mut cluster, seed, 1);
+    let leader = leader_node(&mut cluster);
+    // A node nobody has ever heard a range from (a Phase 1 binary would look
+    // exactly like this): refused by name, nothing registered.
+    let (status, body) = cluster.admin(
+        leader,
+        "POST",
+        "/admin/control/member/add",
+        "",
+        br#"{"node":"ghost","addr":"127.0.0.1:1"}"#,
+    );
+    assert_eq!(status, 409, "seed={seed}: {body}");
+    assert!(
+        body.contains("ghost") && body.contains("no known version range"),
+        "seed={seed}: {body}"
+    );
+    let meta = cluster.metadata(leader);
+    let ghost = animus_env::NodeId::propose("ghost").unwrap();
+    assert!(
+        !meta.node_addrs.contains_key(&ghost) && !meta.members.contains_key(&ghost),
+        "seed={seed}: a refused admission must register nothing"
+    );
+}
+
+#[test]
+fn an_era_on_cluster_refuses_a_control_voter_with_no_known_range() {
+    for seed in seeds() {
+        run_admission_refuses_an_unversioned_control_voter(seed);
+    }
+}
