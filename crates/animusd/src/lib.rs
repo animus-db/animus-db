@@ -22490,6 +22490,11 @@ mod sim_cluster_kind_batch_outcome;
 /// raw 2PC coordinator primitives, never the DynamoDB wire.
 #[cfg(test)]
 mod sim_cluster_txn_conflict;
+/// G-01 stage G-d M0: multi-cluster `SimWorld` + `PeerBridge` WAN model (test-only).
+#[cfg(test)]
+mod sim_world;
+#[cfg(test)]
+mod sim_world_tests;
 
 /// ADR 0061 rung D3 PR 2a (C-04 D3): base-table DDL over the real DynamoDB
 /// wire, driven through the new `dynamo::dispatch_table_op` generic core —
