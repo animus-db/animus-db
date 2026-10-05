@@ -142,8 +142,13 @@ const RECORD_TAG: u8 = 0x02;
 /// A transaction's identity: its own commit-attempt timestamp plus the node
 /// that minted it (ADR 0018 §2/PR3) — the node tiebreak is load-bearing:
 /// different tablet groups run independent `Hlc` instances that never
-/// witness each other directly, so two different groups' leaders can in
-/// principle mint the identical `(wall_ms, logical)` pair. `Ord` derives in
+/// witness each other directly, so two different groups can mint the
+/// identical `(wall_ms, logical)` pair — **including two groups led by the
+/// same node** (routine), which is why a group's minted `node` is qualified
+/// with its stream (`RaftKvNode::txn_id_node`, `n0#100`; the primary stream
+/// keeps the bare node id) rather than being the plain node id. Without that,
+/// two transactions anchored on two same-led tablets shared a `TxnId` and one's
+/// resolve acted on the other's intent (R-01 F-2). `Ord` derives in
 /// field order (`ts`, then `node`), giving a total, deterministic order with
 /// no separate tiebreak logic. Serializable for the Raft WAL (it rides
 /// inside `KvCommand`, which the shared control-plane `serde_json`

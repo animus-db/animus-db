@@ -3193,3 +3193,5 @@ it then sends a *learner* no log (it raises `snapshot_needed` instead, so the en
 image is built and shipped). Never route a new replica of a fork child through log
 replay. Regression: `animusd` `sim_cluster_split_relocation`. ADR 0058's
 2026-10-05 amendment; lesson `docs/lessons/code-patterns/2026-10-05-state-seeded-outside-the-log-needs-a-snapshot-for-every-new-replica.md`.
+
+- **TxnId uniqueness (R-01 F-2).** `TxnId.node` is the node qualified by the group stream (`n0#100`; primary stream = bare node id), because `ts` is per-group `Hlc` state and one node leads many groups. `txn_stage_local` (animusd) also refuses, before proposing, a stage group with any key outside the leader range (stale grouping across a split). See `docs/lessons/testing/2026-10-05-a-txn-id-must-be-unique-per-group-not-per-node.md`.

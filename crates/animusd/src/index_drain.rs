@@ -3340,11 +3340,13 @@ mod gsi_drain_cursor_tests {
                     .expect("a tablet owns the key")
                     .0
             };
-            let mut expected_tablets = 1;
-            for at in [token.to_vec(), next_token.to_vec(), split_key.clone()] {
+            for (n, at) in [token.to_vec(), next_token.to_vec(), split_key.clone()]
+                .into_iter()
+                .enumerate()
+            {
+                let expected_tablets = n + 2;
                 let parent = cut(&node, &at);
                 split(client_addr, parent, at).await;
-                expected_tablets += 1;
                 await_true(20, "split produced a further tablet", || {
                     tablets_of(&node, table).len() == expected_tablets
                 })

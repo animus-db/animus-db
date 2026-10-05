@@ -62,6 +62,21 @@ fn recovery_grace_now_ms<E: Env>(env: &E, route: &CpRoute<E>) -> u64 {
     }
 }
 
+/// The allowlisted "nothing of this transaction was applied" stage refusal
+/// (`TxnAbortReason::is_safe_to_retry_fresh` matches its middle phrase): a
+/// stale route, an out-of-fence range, a group whose keys no longer share one
+/// tablet after a split, or a concurrent in-doubt-recovery decision. One
+/// source for both the apply-time `StageOutcome::Fenced` arm and the
+/// pre-propose range check in `txn_stage_local`, so the two can never drift
+/// out of the allowlist.
+fn stage_rejected_stale_route(table: &str) -> String {
+    format!(
+        "txn prepare: stage on table `{table}` was rejected (a stale route, an \
+         already-sealed/out-of-fence range, or a concurrent in-doubt-recovery \
+         decision); retry"
+    )
+}
+
 impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// **The one place a stage actually executes on the leader's own node**
     /// (ADR 0046 U3, `TxnStage` kind-writes stack PR2) — shared by
@@ -169,6 +184,24 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     },
                 ));
             }
+        }
+        // R-01 F-2: the coordinator groups a transaction's keys by tablet from
+        // ONE metadata snapshot, but this stage is routed (`cp_route`) by the
+        // group's FIRST key against the live tablet map. A split cutting the
+        // table between the two (the in-place fork of a provisioned table's
+        // min-tablet split, or an auto-split) leaves a group whose keys now
+        // span both children; staging it whole on the first key's child
+        // landed the other key's intent and, at resolve, its committed value
+        // in a tablet that does not own that key (apply checks seals, not
+        // ranges), so the txn "committed" with one half unreadable. A group
+        // is only valid on a tablet whose range holds EVERY key: refuse before
+        // proposing, with the allowlisted nothing-was-proposed refusal that
+        // `run_transact` retries with a fresh grouping. A range is immutable
+        // per group (ADR 0050), so this check is exact and replicates no new
+        // apply behavior.
+        let range = leader.scope_range();
+        if writes.iter().any(|w| !range.contains(&w.key)) {
+            return Err(TxnAbortReason::Other(stage_rejected_stale_route(table)));
         }
         match anchor {
             None => {
@@ -541,11 +574,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     )));
                 }
                 StageOutcome::Fenced => {
-                    return Err(TxnAbortReason::Other(format!(
-                        "txn prepare: stage on table `{table}` was rejected (a stale route, an \
-                         already-sealed/out-of-fence range, or a concurrent in-doubt-recovery \
-                         decision); retry"
-                    )));
+                    return Err(TxnAbortReason::Other(stage_rejected_stale_route(table)));
                 }
             }
             if attempt + 1 < TXN_STAGE_PUSH_ATTEMPTS {

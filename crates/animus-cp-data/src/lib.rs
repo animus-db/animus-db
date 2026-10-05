@@ -3718,6 +3718,24 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         }
     }
 
+    /// The `node` half of a [`TxnId`] this group mints. `ts` comes from the
+    /// **group's own** `Hlc`, so two groups led by one node (routine: a node
+    /// leads many tablets) can mint the identical `(ts, node)` for two
+    /// different transactions at the same instant, and a resolve for one then
+    /// acts on the other's intent (R-01 F-2). A non-primary group therefore
+    /// qualifies the node with its stream (`n0#100`), making the id unique per
+    /// group; the primary stream keeps the bare node id, so every previously
+    /// written id and fixture is unchanged. `TxnId.node` is an opaque
+    /// tiebreak (decoded unchecked), never matched against a real node id.
+    fn txn_id_node(&self) -> NodeId {
+        let node = self.env.node_id();
+        if self.stream == PRIMARY_STREAM {
+            node
+        } else {
+            NodeId::new_unchecked(format!("{node}#{}", self.stream))
+        }
+    }
+
     /// Mint a write's `ts`, **pushed** above any read this group's
     /// [`ts_cache`](Self::ts_cache) or committed read ceiling has already
     /// served for `keys` (ADR 0018 §2/PR2b, amended by the `mint_pushed`
@@ -4280,7 +4298,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             let ts = self.mint_pushed(term, &keys);
             let txn_id = TxnId {
                 ts,
-                node: self.env.node_id(),
+                node: self.txn_id_node(),
             };
             let record_key = txn::record_key(&token, &txn_id);
             let mut spans: Vec<(String, KeyRange)> = keys

@@ -12119,3 +12119,5 @@ wholesale off the parent's replicas by directed Placing; every pre-split key mus
 read back (`ConsistentRead`). Two cells (`MemoryEngine`; `LsmEngine` + rotating
 crash/restart). `ANIMUS_SPLIT_RELOCATION_SEEDS=K`, `ANIMUS_SEED=<s>`. Nightly at 20.
 See `crates/animus-cp-data/CLAUDE.md` for the root cause.
+
+- **TxnId uniqueness (R-01 F-2).** `TxnId.node` is the node qualified by the group stream (`n0#100`; primary stream = bare node id), because `ts` is per-group `Hlc` state and one node leads many groups. `txn_stage_local` (animusd) also refuses, before proposing, a stage group with any key outside the leader range (stale grouping across a split). See `docs/lessons/testing/2026-10-05-a-txn-id-must-be-unique-per-group-not-per-node.md`.
