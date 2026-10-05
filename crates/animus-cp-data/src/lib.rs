@@ -3283,7 +3283,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // The consensus loop recovers from the WAL, then spawns the apply task
         // (so the apply task sees the recovered core + the correct
         // `engine_applied` base before it merges anything), then runs.
-        env.spawn_task(drive(DriveState {
+        env.spawn_critical_task(drive(DriveState {
             env: env.clone(),
             core,
             all_nodes,
@@ -12158,7 +12158,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
     // Spawn the apply task now — after recovery seeded the core + `engine_applied`
     // + `sealed` + `committed_ceiling` + `txn_tracker` + `hot_change_max`, so it
     // never merges against pre-recovery state.
-    env.spawn_task(apply_loop(
+    env.spawn_critical_task(apply_loop(
         env.clone(),
         wal.clone(),
         Arc::clone(&core),

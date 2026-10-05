@@ -1024,12 +1024,26 @@ pub enum Metric {
     /// ENOSPC and has not yet been rewritten onto free space. Reason
     /// `storage_full`. Reads are never refused for this reason.
     OverloadStorageFull,
+
+    // --- Issue #1220 (R-01 / production-readiness D-7; resource-bounds §3
+    // item 6; appended, same slot-stability discipline) ---
+    /// Count of spawned background tasks (any, through `Spawner::spawn`) that
+    /// panicked (`ProdEnv::spawned_task_panics`). Always 0 under `SimEnv`.
+    /// Any nonzero value is a bug; alert on it.
+    SpawnedTaskPanics,
+    /// Count of **consensus-loop** tasks that panicked: the control-plane Raft
+    /// driver and `Metadata` apply loop, and each CP-data group's Raft driver
+    /// and apply loop (spawned via `Spawner::spawn_critical`). Such a task
+    /// never restarts, so the node is silently dead for that group; nonzero
+    /// flips `/admin/health` to 503 (`consensus_task_panics` field) for the
+    /// life of the process.
+    ConsensusTaskPanics,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 124] = [
+    pub const ALL: [Metric; 126] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -1154,6 +1168,8 @@ impl Metric {
         Metric::ClusterGateViolationsClientResponse,
         Metric::ClusterGateRelayRefused,
         Metric::OverloadStorageFull,
+        Metric::SpawnedTaskPanics,
+        Metric::ConsensusTaskPanics,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -1287,6 +1303,8 @@ impl Metric {
             }
             Metric::ClusterGateRelayRefused => "cluster_gate_relay_refused",
             Metric::OverloadStorageFull => "overload_storage_full",
+            Metric::SpawnedTaskPanics => "spawned_task_panics",
+            Metric::ConsensusTaskPanics => "consensus_task_panics",
         }
     }
 

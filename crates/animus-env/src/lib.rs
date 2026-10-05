@@ -963,6 +963,17 @@ pub trait SegmentStore: Send + Sync {
 pub trait Spawner: Send + Sync {
     /// Spawn a future to run concurrently. The future must be `Send + 'static`.
     fn spawn(&self, fut: BoxFuture<'static, ()>);
+
+    /// Spawn a **consensus-loop** task (issue #1220): one whose death leaves
+    /// a Raft group on this node silently dead (the control-plane driver and
+    /// `Metadata` apply loop, a CP-data group's driver and apply loop).
+    /// Identical to [`spawn`](Self::spawn) except that `ProdEnv` additionally
+    /// counts a panic in it as a `Metric::ConsensusTaskPanics`, which flips
+    /// `/admin/health` to 503. The default delegates to `spawn`, so an env
+    /// with no panic observation (`SimEnv`, test wrappers) is unchanged.
+    fn spawn_critical(&self, fut: BoxFuture<'static, ()>) {
+        self.spawn(fut);
+    }
 }
 
 /// The environment supertrait: a cheap-to-clone handle, scoped to one node,
@@ -1029,6 +1040,14 @@ pub trait EnvExt: Env {
         F: Future<Output = ()> + Send + 'static,
     {
         self.spawn(Box::pin(fut));
+    }
+
+    /// [`Spawner::spawn_critical`] for an `async` block (issue #1220).
+    fn spawn_critical_task<F>(&self, fut: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.spawn_critical(Box::pin(fut));
     }
 }
 

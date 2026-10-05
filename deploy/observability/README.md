@@ -7,7 +7,7 @@ code really exports: see [The metrics-exist check](#the-metrics-exist-check).
 
 | File | What it is |
 |------|------------|
-| `animus-alerts.yml` | 7 recording rules plus 31 alert rules. Every alert has a `runbook_url`. `promtool check rules` passes. |
+| `animus-alerts.yml` | 7 recording rules plus 33 alert rules. Every alert has a `runbook_url`. `promtool check rules` passes. |
 | `animus-dashboard.json` | Grafana 10+ dashboard (import it, pick the Prometheus datasource). |
 
 ## How animusd exposes metrics

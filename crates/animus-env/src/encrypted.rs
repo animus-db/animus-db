@@ -902,6 +902,10 @@ impl<E: Env> Spawner for EncryptedEnv<E> {
     fn spawn(&self, fut: BoxFuture<'static, ()>) {
         self.env.spawn(fut);
     }
+
+    fn spawn_critical(&self, fut: BoxFuture<'static, ()>) {
+        self.env.spawn_critical(fut);
+    }
 }
 
 impl<E: Env> Env for EncryptedEnv<E> {

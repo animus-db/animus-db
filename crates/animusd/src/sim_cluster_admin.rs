@@ -1244,10 +1244,6 @@ const NOT_A_METRIC: &[(&str, &str)] = &[
         "cluster_wide_throttle_default_is_overridden_by_a_tables_own_throughput",
         "a Rust test name cited in ADR 0061; it only looks like a metric since the cluster_gate_* family introduced the `cluster` prefix",
     ),
-    (
-        "spawned_task_panics",
-        "a ProdEnv accessor today; docs/resource-bounds.md proposes exporting it as a metric",
-    ),
 ];
 
 fn collect_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {

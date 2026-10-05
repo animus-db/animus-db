@@ -37,7 +37,7 @@
 //! - `GET  /admin/restores`            — the replicated restore catalog: id, backup id, source/target table, status, destination tablet + its live state (ADR 0059 §7, Train 2; pure observer — the DynamoDB wire surface, `RestoreTableFromBackup`, is `animusd::dynamo::restore_table_from_backup`)
 //! - `GET  /admin/metrics`             — the metrics snapshot as JSON, plus per-tablet `stream_change_rates` (ADR 0042 §14, growth PR3 Fork F) and `request_rates` (W-09, ADR 0034 amendment)
 //! - `GET  /admin/metrics/history`     — periodic snapshots, ~2h ring buffer (ADR 0021 sparklines)
-//! - `GET  /admin/health`              — readiness: 503 until the control plane has had a RECENT leader (`leader_within` hysteresis, issue #595) — the Kubernetes readiness probe (ADR 0060)
+//! - `GET  /admin/health`              — readiness: 503 until the control plane has had a RECENT leader, and 503 for good once a consensus-loop task has panicked (`consensus_task_panics`, issue #1220) (`leader_within` hysteresis, issue #595) — the Kubernetes readiness probe (ADR 0060)
 //! - `GET  /admin/live`                — liveness: 200 whenever this admin server can answer at all, independent of control-leader knowledge, hosting, or role — the Kubernetes liveness probe (ADR 0060's 2026-09-07 amendment, issue #710; `/admin/health` must never back a liveness probe, since a healthy joining process can go a full `advance_control_growth` reconcile cycle with no known leader)
 //! - `POST /admin/tablet/split`        — `{tablet, split_key}`
 //! - `POST /admin/stream/grow`         — `{table}` — split every tablet of a streamed table at its byte-weighted median (ADR 0042 §14, growth PR3)
@@ -2265,8 +2265,20 @@ fn health<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> (u16, Value) {
         .collect();
     let control_storage_full = r.is_storage_full();
     let storage_full = control_storage_full || !storage_full_groups.is_empty();
+    // Issue #1220: a panicked consensus-loop task (control Raft driver /
+    // Metadata apply loop, a CP-data group's driver / apply loop) is never
+    // restarted, so the node is permanently dead for that group while every
+    // other signal looks fine. Unlike `storage_full` this DOES fail
+    // readiness: only a restart repairs it, so pull the node from rotation.
+    // Read from this node's own env sink (what `ProdEnv` records into).
+    let consensus_task_panics = ctx
+        .env
+        .metrics()
+        .get(animus_env::metrics::Metric::ConsensusTaskPanics);
+    let healthy = leader_recent && consensus_task_panics == 0;
     let body = json!({
-        "ok": leader_recent,
+        "ok": healthy,
+        "consensus_task_panics": consensus_task_panics,
         "control_leader_known": leader_known,
         "control_leader_recent": leader_recent,
         "is_control_leader": r.is_leader(),
@@ -2278,7 +2290,7 @@ fn health<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> (u16, Value) {
     // 503 until the control plane has had a RECENT leader (the readiness
     // signal, hysteresis-gated per issue #595); 200 once it does (whether
     // this node leads or follows).
-    (if leader_recent { 200 } else { 503 }, body)
+    (if healthy { 200 } else { 503 }, body)
 }
 
 /// `GET /admin/live` (ADR 0060's 2026-09-07 amendment, issue #710): the

@@ -81,16 +81,23 @@ Read the node's log (`RUST_LOG=debug` for more). Known named refusals at boot
 | Data tablets on a restarted node replicate but never vote: metric `cp_groups_refused_as_voter` > 0, and `/admin/raftkv` shows `refused_as_voter` per group | the same check applied to a tablet replica whose persisted state was empty | [node-replace.md](node-replace.md); expect to need the learner/rejoin path |
 | Hostname does not resolve / TLS name mismatch at join | advertise host or certificate SAN wrong | check `--advertise-host` / `spec` and the certificate SANs |
 
-**A hung or half-dead process.** `ProdEnv` wraps every spawned background task
-so a panic in it is logged at `error` level and counted, and then the task
-simply stops; the process keeps running. Nothing exports that counter as a
-metric. A node whose per-tablet driver or apply task has panicked (the
-documented example is a failed WAL group-commit sync under disk pressure,
-issue #939) can therefore keep answering `/admin/live` and `/admin/health`
-while serving nothing for that tablet. If logs contain `panicked`, treat the
-node as failed: capture the log, then restart it
-(`kubectl delete pod`, or stop and start the process). Check
-[disk-full.md](disk-full.md) first, because the usual trigger is the disk.
+### A task panicked on a live node
+
+`ProdEnv` wraps every spawned background task so a panic in it is logged at
+`error` level and counted, and then that task simply stops; the process keeps
+running. Two metrics export the count (issue #1220): `spawned_task_panics` (any
+task) and `consensus_task_panics` (a control-plane Raft driver or `Metadata`
+apply loop, or a tablet group's Raft driver or apply loop, none of which is ever
+restarted). A node with a dead consensus-loop task is silently dead for that group
+(the documented example is a failed WAL group-commit sync under disk pressure,
+issue #939), so `GET /admin/health` returns **503** with `consensus_task_panics`
+greater than 0 (`/admin/live` stays 200: restarting is what repairs it, and the
+kubelet liveness probe is deliberately independent of this). Alerts:
+`AnimusConsensusTaskPanicked` (critical), `AnimusBackgroundTaskPanicked`
+(warning, any other task). Treat the node as failed: capture the log (grep
+`panicked`), then restart it (`kubectl delete pod`, or stop and start the
+process). Check [disk-full.md](disk-full.md) first, because the usual trigger is
+the disk. A panic is always a bug: attach the log to an issue.
 
 ## 4. Decide: restart, wait, or replace
 

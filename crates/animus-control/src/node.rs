@@ -771,7 +771,7 @@ impl<E: Env> RaftNode<E> {
             halt_reason: Arc::clone(&halt_reason),
             features: features.clone(),
         };
-        env.spawn_task(drive(
+        env.spawn_critical_task(drive(
             env.clone(),
             Arc::clone(&core),
             Arc::clone(&detector),
@@ -1707,7 +1707,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
     // apply/compact work `meta_apply_and_compact` was always doing (ADR 0038
     // PR3: this loop has no business deciding when `Metadata` first becomes
     // visible — `meta_apply_seed`, above, already decided that).
-    env.spawn_task(meta_apply_loop(
+    env.spawn_critical_task(meta_apply_loop(
         env.clone(),
         Arc::clone(&core),
         engine,
