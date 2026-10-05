@@ -1016,6 +1016,14 @@ pub enum Metric {
     /// receiver). A counter, not a level: the sender is another node.
     ClusterGateRelayRefused,
 
+    // --- Disk-full semantics (R-01 (d), ADR 0074 §2 / `docs/resource-bounds.md`
+    // §3; appended, same slot-stability discipline) ---
+    /// A mutating request was refused with a named `StorageFull` error
+    /// (HTTP 503 `ServiceUnavailable`, message begins `StorageFull:`) because
+    /// the hosted tablet group's own write-ahead log is suspect after an
+    /// ENOSPC and has not yet been rewritten onto free space. Reason
+    /// `storage_full`. Reads are never refused for this reason.
+    OverloadStorageFull,
     // --- Preferred-leader mechanism (ADR 0075 section 3.3, G-01 stage G-c) ---
     /// A leader this node held was handed to a voter in the table's preferred
     /// region (or away from a witness region) by the tablet-host reconciler's
@@ -1031,7 +1039,7 @@ pub enum Metric {
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 125] = [
+    pub const ALL: [Metric; 126] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -1155,6 +1163,7 @@ impl Metric {
         Metric::ClusterGateViolationsClientRequest,
         Metric::ClusterGateViolationsClientResponse,
         Metric::ClusterGateRelayRefused,
+        Metric::OverloadStorageFull,
         Metric::CpPreferredLeaderTransfers,
         Metric::CpPreferredLeaderTransferRejected,
     ];
@@ -1289,6 +1298,7 @@ impl Metric {
                 "cluster_gate_violations_client_response"
             }
             Metric::ClusterGateRelayRefused => "cluster_gate_relay_refused",
+            Metric::OverloadStorageFull => "overload_storage_full",
             Metric::CpPreferredLeaderTransfers => "cp_preferred_leader_transfers",
             Metric::CpPreferredLeaderTransferRejected => "cp_preferred_leader_transfer_rejected",
         }

@@ -1710,7 +1710,8 @@ outstanding on the wire surface at present.
   DynamoDB edge beyond the 1 MiB `MAX_BODY` request cap
   (`crates/animus-node/src/http.rs`) and per-table throttling (ADR 0065).
   Disk-full is injected in simulation (`animus-sim` `DiskConfig`,
-  `StorageFull`) but its behaviour on real nodes is untested.
+  `StorageFull`); handling landed with (d) (issue #1185), but its behaviour on
+  real nodes is still untested.
 - **Plan:** define **beta exit criteria** as a checklist in a new
   `docs/production-readiness.md` (ratified by the ADR), each item
   checkable and owned by a sub-track below. Beta means: every criterion
@@ -1754,7 +1755,8 @@ outstanding on the wire surface at present.
     prefix and transaction-atomicity checks, `.github/workflows/chaos.yml`
     (non-required). **Not done:** clock skew, slow disk and packet loss
     (Kubernetes-only designs in `deploy/chaos/`, pinned and unvalidated),
-    disk full (blocked on #1185). **Its first runs found a real
+    real-process disk full (the node-side handling landed with (d), #1185;
+    the real size-limited-filesystem leg is still open). **Its first runs found a real
     violation** (acknowledged writes lost on keys touched by an aborted
     cross-tablet transaction; see `docs/chaos.md`, "Findings").
   - **(c) Fuzzing (independent; M).** `cargo-fuzz` targets for every
@@ -1776,7 +1778,13 @@ outstanding on the wire surface at present.
     limits and admission control with a defined overload response (a DynamoDB-shaped throttling/unavailable error code as W-08 already
     does per table, never unbounded queuing), and define disk-full behaviour (the node goes
     read-only or refuses writes with a named error and recovers when
-    space returns; never corrupts or acks a write it cannot fsync). Each
+    space returns; never corrupts or acks a write it cannot fsync).
+    **Disk-full landed (issue #1185, 2026-10-05):** ENOSPC marks the WAL suspect,
+    writes are refused with a named 503 `StorageFull`, and the WAL is rewritten
+    from the in-memory log onto free space without a restart (sim corpus
+    `ANIMUS_DISK_FULL_SEEDS`; `docs/resource-bounds.md` section 3). **Still
+    open:** LSM-engine ENOSPC, leader step-down, exporting `spawned_task_panics`,
+    and a `ProdEnv` tmpfs test. Each
     bound gets a sim test with fault injection where possible and a
     `ProdEnv` test where not.
   - **(e) Operations runbook (independent; M).** `docs/runbook/`: node

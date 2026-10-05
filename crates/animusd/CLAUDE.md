@@ -12096,3 +12096,18 @@ both targets, so a helper only one uses needs `#[allow(dead_code)]` (clippy
 `data_dir` exist for the soak; the soak never arms the proxy faults, so a
 `[node-exit]` or `[node-panic]` there is always a finding; node logs are not
 rotated, so a multi-day run needs disk for them.
+
+## StorageFull on the client path and in `/admin/health` (R-01 (d), issue #1185)
+
+`CpGroup::is_storage_full` + `refuse_if_storage_full` (`lib.rs`) refuse a write
+before it is proposed when the hosted group's WAL is suspect; `write_path.rs`
+and `txn_coordinator.rs` call it and stop their retry loops on
+`is_storage_full_refusal`. `dynamo::map_throttleable_error` maps the refusal to
+a 503 `ServiceUnavailable` whose message starts `StorageFull:` and ends
+`; retry` (test: `map_throttleable_error_tests`), counted as
+`overload_storage_full`. `/admin/health` adds `storage_full`,
+`storage_full_control`, `storage_full_tablets` without flipping the status code
+(readiness would also pull reads); `/admin/raftkv` gets a per-group
+`storage_full` field. `sim_cluster_admin`'s NOT_A_METRIC list no longer holds
+`overload_storage_full`; `storage_full` stays (it is a JSON field, not a metric)
+and `spawned_task_panics` stays (still not exported).

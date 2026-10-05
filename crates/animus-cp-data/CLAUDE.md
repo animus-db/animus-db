@@ -3188,3 +3188,19 @@ The RaftKV codec (wire/image/WAL), segment codec, backup chunk/manifest codecs, 
   re-points its `HeartbeatBatcher` via `set_features`) is the production seam P2-C
   calls with `RaftNode::features()`. A hosted group keeps the handle it started with.
 
+
+## StorageFull: per-tablet WAL recovery (R-01 (d), issue #1185)
+
+`persist_wal` no longer `assert!`s on an ENOSPC append/sync (per-group file or
+`SharedWal::append_tagged`): it calls `PersistProgress::mark_suspect` and runs
+`recover_kv_wal`, which wraps `animus_control::persist_round::recover_suspect_wal`
+with a `write_image` of `Disk::replace` (removing the `.tmp` sibling on failure)
+on the per-group path or `SharedWal::compact_group` on the shared path. A
+suspect group refuses writes before proposing (`RaftKvNode::is_storage_full`,
+`record_storage_full_refusal` feeds `overload_storage_full`), keeps serving
+reads of applied state, and `apply_and_compact` skips compaction while suspect
+(an ENOSPC compaction rewrite also marks suspect; the staged-rewrite path
+tolerates ENOSPC). The `persist` field on `RaftKvNode` exposes the progress
+handle. A non-ENOSPC failure stays `assert!(halted)`. Gap: engine-side ENOSPC
+(LSM flush/compaction, apply-time `merge_batch`) is NOT handled; the corpus
+runs `MemoryEngine` only. See `docs/resource-bounds.md` section 3.

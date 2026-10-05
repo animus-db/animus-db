@@ -237,3 +237,20 @@ a silent hang.** Concretely:
   C-17's per-node density numbers when available).
 - Whether disk-full should additionally flip `/admin/health` readiness;
   decided in (d) with the runbook author.
+
+## Amendment 2026-10-05: disk-full implemented (issue #1185)
+
+Disk-full (D-7) is implemented for the WAL path. As built: ENOSPC marks the
+group's WAL suspect (never appended to or fsynced again), the group refuses
+writes with a named 503 `StorageFull ...; retry` (`overload_storage_full`), and a
+backoff probe rewrites the WAL from the in-memory log onto a fresh file and
+resumes without a restart; no persisted-format change. This differs from the
+design sketched in `docs/resource-bounds.md` before the change in two ways:
+there is no `requeue_unpersisted` (the in-memory log is a superset of every
+drained round, so a whole-image rewrite suffices) and there is no leader
+step-down (`RaftCore` has none; the leader refuses writes instead). The open
+question above is decided: `/admin/health` reports a degraded `storage_full`
+field but its status code does not flip, because readiness would also pull the
+node's reads. Still open: LSM-engine ENOSPC, leader step-down, exporting
+`spawned_task_panics`, and a `ProdEnv` size-limited-filesystem test. Proven by
+`ANIMUS_DISK_FULL_SEEDS`; see `docs/resource-bounds.md` section 3.

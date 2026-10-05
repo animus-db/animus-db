@@ -868,6 +868,16 @@ impl<E: Env> RaftNode<E> {
         self.halted.load(Ordering::SeqCst)
     }
 
+    /// Whether this node's control WAL is suspect after an ENOSPC and awaiting
+    /// its rewrite onto free space (R-01 (d), ADR 0074 §2). While true the
+    /// node cannot make control-plane state durable: it does not ack, and
+    /// `/admin/health` reports `storage_full`. Clears itself, without a
+    /// restart, when the rewrite lands.
+    #[must_use]
+    pub fn is_storage_full(&self) -> bool {
+        self.persist.is_suspect()
+    }
+
     /// Why this node halted for a version reason (ADR 0073 Phase 2 range
     /// check), if it did: `cluster version A is above this binary's max M
     /// (downgrade is not supported)` or `cluster version A is below this
@@ -1731,7 +1741,10 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
         // it runs is raced *inside* the `select` below rather than awaited before
         // it, so this node keeps heartbeating (as leader) and keeps re-arming its
         // election deadline (as follower) while the disk is slow.
-        if persist_fut.is_none() && core.lock().expect("raft core poisoned").has_unflushed_wal() {
+        if persist_fut.is_none()
+            && (core.lock().expect("raft core poisoned").has_unflushed_wal()
+                || persist.is_suspect())
+        {
             // `persist_wal`'s record count is `flush`'s return value, not this
             // loop's business — drop it so the boxed future matches `PersistFut`.
             persist_fut = Some(Box::pin(async {
@@ -2434,6 +2447,13 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
         // wait to the rounds already ahead of us in the queue, so
         // compaction still always happens.
         let _wal = wal_lock.lock().await;
+        // Disk-full (R-01 (d)): never compact over a suspect WAL — the
+        // consensus loop's recovery is about to rewrite the whole file from the
+        // in-memory log anyway, and a compaction that drained records into a
+        // failing rewrite would only add a second writer to the mess.
+        if persist.is_suspect() {
+            return did_work;
+        }
         let (bytes, lli) = {
             let mut c = core.lock().expect("raft core poisoned");
             c.snapshot_upto(ea);
@@ -2485,10 +2505,23 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
                     }
                 }
                 Err(e) => {
-                    assert!(
-                        halted.load(Ordering::SeqCst),
-                        "system-keyspace wal compaction failed while running: {e}"
-                    );
+                    if animus_env::is_storage_full(&e) && !halted.load(Ordering::SeqCst) {
+                        // ENOSPC on the compaction rewrite: the old WAL is
+                        // intact (`replace` is atomic), but `drain_for_round`
+                        // above took the loop's pending records and numbered a
+                        // round that will now never complete here. Hand it to
+                        // the consensus loop's recovery, which rewrites the
+                        // whole file from the in-memory log and completes
+                        // every drained round.
+                        tracing::error!(error = %e, "control WAL compaction hit ENOSPC; node is StorageFull until it is rewritten");
+                        let _ = env.remove(&format!("{WAL}.tmp")).await;
+                        persist.mark_suspect();
+                    } else {
+                        assert!(
+                            halted.load(Ordering::SeqCst),
+                            "system-keyspace wal compaction failed while running: {e}"
+                        );
+                    }
                 }
             }
         }
@@ -3559,7 +3592,14 @@ async fn persist_wal<E: Env>(
     progress: &PersistProgress,
     halted: &AtomicBool,
 ) -> usize {
-    let _wal = wal_lock.lock().await;
+    let wal_guard = wal_lock.lock().await;
+    // Disk-full (R-01 (d), ADR 0074 §2): a suspect WAL is never appended to
+    // again — a compaction rewrite (or an earlier round) hit ENOSPC, so go
+    // straight to the rewrite recovery, even with nothing new to drain.
+    if progress.is_suspect() {
+        drop(wal_guard);
+        return recover_control_wal(env, core, wal_lock, progress, halted).await;
+    }
     // Capture the log high-water under the same lock as the drain: after we sync
     // the drained records, every entry up to here is durable. Entries appended
     // after this point ride the next flush.
@@ -3580,17 +3620,26 @@ async fn persist_wal<E: Env>(
     for record in &records {
         buf.extend(PersistedState::encode_record(record));
     }
-    if let Err(e) = env.append(WAL, &buf).await {
-        assert!(
-            halted.load(Ordering::SeqCst),
-            "wal append failed while running: {e}"
-        );
-        return 0;
+    let io = async {
+        env.append(WAL, &buf).await?;
+        env.sync(WAL).await
     }
-    if let Err(e) = env.sync(WAL).await {
+    .await;
+    if let Err(e) = io {
+        if animus_env::is_storage_full(&e) && !halted.load(Ordering::SeqCst) {
+            // ENOSPC: the file's tail is now unknown (a torn partial append,
+            // or bytes a failed fsync may have dropped), so it is marked
+            // suspect and rewritten from the in-memory log onto a fresh file
+            // once space returns. The round is NOT marked durable and nothing
+            // is acked until that rewrite lands.
+            tracing::error!(error = %e, "control WAL write hit ENOSPC; node is StorageFull until it is rewritten");
+            progress.mark_suspect();
+            drop(wal_guard);
+            return recover_control_wal(env, core, wal_lock, progress, halted).await;
+        }
         assert!(
             halted.load(Ordering::SeqCst),
-            "wal sync failed while running: {e}"
+            "wal append failed while running (append or sync): {e}"
         );
         return 0;
     }
@@ -3605,6 +3654,47 @@ async fn persist_wal<E: Env>(
         progress.complete_drain(round);
     }
     records.len()
+}
+
+/// Rewrite a suspect control WAL from the in-memory log onto a fresh file
+/// (`Disk::replace`), polling for free space — see
+/// [`persist_round::recover_suspect_wal`]. Returns 0 (the whole image was
+/// written, not an ordinary round's records).
+async fn recover_control_wal<E: Env>(
+    env: &E,
+    core: &Arc<Mutex<RaftCore>>,
+    wal_lock: &FairMutex,
+    progress: &PersistProgress,
+    halted: &AtomicBool,
+) -> usize {
+    let result = persist_round::recover_suspect_wal(
+        env,
+        core,
+        wal_lock,
+        progress,
+        halted,
+        |image: Vec<crate::persist::WalRecord>| async move {
+            let mut buf = Vec::new();
+            for record in &image {
+                buf.extend(PersistedState::encode_record(record));
+            }
+            let r = env.replace(WAL, &buf).await;
+            if r.is_err() {
+                // Free the half-written temp sibling so the space it holds
+                // can return to the volume.
+                let _ = env.remove(&format!("{WAL}.tmp")).await;
+            }
+            r
+        },
+    )
+    .await;
+    if let Err(e) = result {
+        assert!(
+            halted.load(Ordering::SeqCst),
+            "control wal rewrite failed while running: {e}"
+        );
+    }
+    0
 }
 
 #[cfg(test)]

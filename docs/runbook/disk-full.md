@@ -3,39 +3,46 @@
 Conventions are in [README.md](README.md). Alert entry point:
 [disk-space.md](disk-space.md).
 
-## Honest status: real-node behaviour on a full disk is UNTESTED and UNDEFINED
+## Status: handled in simulation, not yet proven on a real full disk
 
-Disk-full (`ENOSPC`, `ErrorKind::StorageFull`) is injected only in simulation
-(`animus-sim` `DiskConfig`). No code in the node, storage or data-plane crates
-branches on it: there is no read-only mode, no named "disk full" error, no
-low-space guard that refuses writes early. Roadmap R-01(d) will define this
-behaviour; until then, what follows is what the code would do, by reading it, and
-none of it has been reproduced on a real full disk.
+Disk-full (`ENOSPC`, `ErrorKind::StorageFull`) on a WAL write is handled
+(roadmap R-01(d), issue #1185; design in `docs/resource-bounds.md` section 3). It is
+proven by a seeded `SimEnv` corpus (`ANIMUS_DISK_FULL_SEEDS`), **not** yet on a real
+size-limited filesystem. What a node does:
 
-By code reading (`animus-cp-data/CLAUDE.md`, `ProdEnv::spawn_task`):
+- A group (a tablet's Raft group, or the control group) whose WAL write hits ENOSPC
+  marks that WAL **suspect**: it is never appended to or `fsync`ed again. Nothing the
+  failed round covered is applied or acknowledged.
+- Writes to that group are **refused** with HTTP 503 `ServiceUnavailable`, message
+  `StorageFull: ...; retry`, and `overload_storage_full` increments on `/metrics`.
+  Reads of already-applied state keep working. The process does not die.
+- `GET /admin/health` shows `storage_full: true` (with `storage_full_control` and the
+  list `storage_full_tablets`); its status code is unchanged on purpose, so alert on
+  the field or on `overload_storage_full`, not on readiness. `/admin/raftkv` shows
+  `storage_full` per group.
+- The node **probes for free space by itself** (backoff 50 ms to 2 s) and, once a
+  fresh WAL file can be written, rewrites the WAL from the in-memory log and resumes
+  with no restart. Space returning is therefore enough; you do not need to restart.
 
-- A failed WAL append or sync on a live tablet group, or a failed engine write during
-  apply, is treated as a durability fault. It is a hard `panic!` inside a background
-  task, deliberately "crash-stop before ack": the write is not acknowledged, so no
-  acked write is lost.
-- But `ProdEnv` catches that panic per task, logs it at `error` level, counts it
-  internally (the counter is not exported as a metric) and lets the process keep
-  running. There is no process-level fail-stop. A node can therefore stay up with
-  that tablet's driver or apply task dead: `/admin/live` stays 200, and `/admin/health`
-  stays 200 while the control plane is fine. Clients see timeouts or 5xx for those
-  tablets. A past occurrence under disk pressure is documented in `ProdEnv`'s own
-  comments (issue #939: "wal group-commit sync failed").
-- The LSM engine applies write backpressure when maintenance falls behind and fails
-  loudly after a bounded wait (`BACKPRESSURE_MAX_POLLS`) rather than queueing
-  without bound, but flush and compaction need free space to make progress.
-- Recovery after space returns is the ordinary restart path (WAL replay, torn-tail
-  repair); with the zombie behaviour above, **restart the node** rather than waiting
-  for it to heal.
+Known gaps (file or check issues before relying on them):
+
+- **The LSM engine is not covered.** A flush, compaction or apply-time engine write
+  that hits ENOSPC is still a hard `panic!` inside a background task; `ProdEnv` catches
+  it per task, logs it and keeps the process up, with that tablet's apply task dead
+  (`/admin/live` stays 200 and the panic count is not exported). If you see `panicked`
+  or `No space left` in the log without a `StorageFull` refusal, **restart the node**
+  after freeing space.
+- **No leader step-down.** A leader whose own disk is full keeps leadership and
+  refuses writes, so its tablets are unavailable for writes until space returns or
+  you move leadership/load away.
+- The LSM engine also needs free space to make progress (write backpressure fails
+  loudly after `BACKPRESSURE_MAX_POLLS` rather than queueing without bound).
 
 ## If a disk is full or nearly full now
 
 1. Confirm: `df -h` on the data volume (Kubernetes: `kubectl exec <pod> -- df -h
-   /var/lib/animus`), node log for `panicked`, `No space left`, `sync failed`.
+   /var/lib/animus`), `storage_full` on `/admin/health`, node log for `StorageFull`,
+   `panicked`, `No space left`, `sync failed`.
 2. Do not delete files under `--dir` by hand. WAL segments, SSTables and the manifest
    are one consistent set; removing any of them corrupts the replica.
 3. Free space the safe way, in this order:
@@ -50,7 +57,10 @@ By code reading (`animus-cp-data/CLAUDE.md`, `ProdEnv::spawn_task`):
      {"op":"DeleteTable",...}`); the convergent GC reclaims it on each node (ADR 0024).
    - Delete old backups (`DeleteBackup`) if the backup store is the default `cluster`
      store or a local `fs:` path on that volume ([backup-restore-pitr.md](backup-restore-pitr.md)).
-4. Restart the affected node and verify with [node-down.md](node-down.md) step 5.
+4. Once space is back, a WAL-suspect group recovers on its own (watch `storage_full`
+   clear on `/admin/health`). Restart the node only if the log shows an LSM-engine
+   `panicked`/`No space left` with no `StorageFull` refusal, then verify with
+   [node-down.md](node-down.md) step 5.
 5. If the disk was full while the node was a leader, check the other replicas of its
    tablets did not diverge: all `commit_index` values converge on `/admin/raftkv`.
 
@@ -104,5 +114,5 @@ engineering estimate, **not a measured number**.
 
 ## Maturity
 
-Untested on a real full disk. The sizing text is derived from constants and comments in
+The WAL path is sim-tested only; nothing here has been reproduced on a real full disk. The sizing text is derived from constants and comments in
 `animus-storage`, `animus-cp-data` and `animusd`; no measurement backs the 2x rule.

@@ -176,6 +176,12 @@ pub(crate) struct CpRaftView {
     /// replica is re-admitted through the learner path. A pure observer;
     /// `Metric::CpGroupsRefusedAsVoter` counts these per node.
     pub(crate) refused_as_voter: bool,
+    /// Whether this replica's WAL is suspect after an ENOSPC
+    /// (`RaftKvNode::is_storage_full`, R-01 (d)): the group refuses writes with
+    /// a named `StorageFull` error and acks nothing until it has rewritten its
+    /// WAL onto free space, which it does by itself, without a restart. A pure
+    /// observer.
+    pub(crate) storage_full: bool,
     /// Every distinct voter configuration this replica has adopted, in
     /// adoption order (issue #596) — each entry the sorted `String` node ids
     /// of one voter set, oldest first, dropping the timestamp `RaftKvNode::
@@ -2245,13 +2251,29 @@ fn health<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> (u16, Value) {
     // the full account.
     let health_grace = r.election_timeout() * HEALTH_LEADER_GRACE_ELECTION_TIMEOUTS;
     let leader_recent = r.leader_within(health_grace).is_some();
-    let hosts_cp = !ctx.edge.hosted_groups().is_empty();
+    let hosted = ctx.edge.hosted_groups();
+    let hosts_cp = !hosted.is_empty();
+    // R-01 (d), ADR 0074 §2: a degraded `storage_full` signal while this node's
+    // control WAL, or any hosted tablet group's WAL, is suspect after an ENOSPC.
+    // The status code deliberately does NOT flip: the node still serves reads
+    // (and the readiness probe pulling it out of rotation would take those
+    // away too) — what it refuses is writes, with a named 503 `StorageFull`.
+    let storage_full_groups: Vec<u64> = hosted
+        .iter()
+        .filter(|(_, g)| g.is_storage_full())
+        .map(|(t, _)| t.0)
+        .collect();
+    let control_storage_full = r.is_storage_full();
+    let storage_full = control_storage_full || !storage_full_groups.is_empty();
     let body = json!({
         "ok": leader_recent,
         "control_leader_known": leader_known,
         "control_leader_recent": leader_recent,
         "is_control_leader": r.is_leader(),
         "hosts_cp": hosts_cp,
+        "storage_full": storage_full,
+        "storage_full_control": control_storage_full,
+        "storage_full_tablets": storage_full_groups,
     });
     // 503 until the control plane has had a RECENT leader (the readiness
     // signal, hysteresis-gated per issue #595); 200 once it does (whether
