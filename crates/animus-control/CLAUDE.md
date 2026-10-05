@@ -34,7 +34,8 @@ per-tablet CP data plane (`animus-cp-data`).
   record as `EntityKind::NodeVersion` and the version as counter
   `CLUSTER_VERSION_COUNTER`; both are era-only (a Phase 1 reader ignores
   unknown kinds/counters). `ReportNodeVersion`/`FinalizeClusterVersion` are
-  deliberately not relayable in `animus-node` until P2-B/P2-C decide.
+  relayable in `animus-node` since P2-B (era-only; refused pre-era by the gate
+  checks below).
 
 - **`version_observe.rs` + `RaftNode`'s `version_loop`** (ADR 0073 Phase 2,
   P2-A section 2). Leader-local, passive, **no wire change**: the driver loop
@@ -3061,3 +3062,44 @@ rounds while the apply task is behind.
   until the next round syncs.
 
 **Upgrade-harness class (ADR 0073 P1-D):** `control-wal`/`shared-wal` are whole-file `TABLE` entries in `animus-test`'s transcode table (a bump edits that entry; legacy encoders must be `pub` + `legacy-encoders`-gated); `control-snapshot`, `metadata`, `mirror-version` and `mirror-entities` are `EMBEDDED` (a bump edits their carrier's transcode).
+
+## Gate enforcement (ADR 0073 Phase 2, P2-B)
+
+- **`version.rs`**: `Gate::Base` (declared first, version 1, always open) and
+  `Gate::Era`; `Gate::rank`/`join` find the strictest of several gates (never
+  use derived `Ord` for "is open": use `ClusterFeatures::is_open`);
+  `GatedCommand::required_gate`; `GateSurface` + per-surface violation counters
+  inside `ClusterFeatures` (`check(surface, gate)` counts, `tracing::error!`s and
+  `debug_assert!`s a closed gate, never panics in release; the caller refuses to
+  emit on `false`). The counters are the release-build "metric" because the
+  `Metric` enum lives in `animus-env`; P2-C exports them via
+  `MetricsHandle::set`. `ClusterFeatures::update` is **monotonic** (version
+  `fetch_max`, era flag only ever set): two feeders race (the apply task and a
+  proposer re-reading the cache) and an older view must never close a gate.
+- **Tables**: `impl GatedCommand for MetaCommand` (`meta.rs`, bottom, exhaustive,
+  no `_`; Base for all but the two era commands) and `RaftMsg::envelope_gate`
+  (unbounded impl, exhaustive) + `RaftMsg<C: GatedCommand>::required_gate`
+  (separate bounded impl, joins `AppendEntries` entry gates). Do not add a
+  `GatedCommand` bound to `RaftCore`/`StateMachine`: toy test commands must keep
+  compiling.
+- **Enforcement points in `node.rs`**: `RaftNode::features()` (fed in
+  `EraWatch::sync` on every apply pass, before its unchanged-key early return);
+  every control proposal (`RaftNode::propose` and the reconcile/detect/orphan/
+  version loops) goes through `propose_gated` (closed gate -> `NotLeader {
+  leader: None}`, never appended; a closed verdict first re-reads the applied
+  cache, so a lagging handle cannot refuse spuriously). The **one exemption** is
+  `propose_era_start` (the era-start `ReportNodeVersion`s, proposed while
+  `Gate::Era` is closed under precondition P). Send sites (`drive`'s three, the
+  initial probe) check `msg.envelope_gate()` only: **entry gates are enforced at
+  propose, not send** (a leader's applied view lags its log; era-start entries
+  ship before they apply; a new leader resends entries proposed under a gate that
+  was open then). Tests: `tests/it/gate_enforcement.rs`, `tests/it/raft_msg_fixture.rs`
+  (fixture `control-raft-msg/v1.bin`, **Phase 1 bytes from commit `941a5ea`**).
+
+
+- **Negative controls vs P2-B gating (ADR 0073).** `RaftNode::propose` refuses a
+  closed-gate command and `debug_assert!`s. A test that must emit a premature variant
+  (mixed-version corpus N1) uses `propose_ungated_for_negative_control`
+  (`cfg(any(test, feature = "sim-versions"))`). `sim_versions::BinaryProfile::accepts`
+  treats `Gate::Base` as always accepted; the capped decode classifies with
+  `RaftMsg::required_gate`.

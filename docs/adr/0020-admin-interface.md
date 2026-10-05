@@ -854,3 +854,19 @@ names.
   once per-node debug is proven.
 - A small web dashboard served on the admin port (static, self-contained) is a
   natural later addition now that the JSON exists.
+
+### As-built (2026-10-04, ADR 0073 Phase 2 / P2-C) — the cluster-version routes
+
+Two routes join the table: `GET /admin/cluster-version` — the active cluster
+version, whether the version era has started, this binary's own range and
+build, every required node's recorded range/build/status/role, the safe
+target, `can_finalize` and the named `blockers`; served by **any** node from
+its own view of `Metadata`, and the control leader additionally fills each
+node's `observed_range` from its live observation table (`null` elsewhere) —
+and `POST /admin/cluster-version/finalize {to?, expected?}`, which raises the
+version one step. Finalize is **local-control-leader-only and not relayed**
+(`409` naming the leader elsewhere, including on a data-only node; `400` for
+`to != active + 1`; `409` for an `expected` mismatch, an inactive era, a
+target above this binary's max, or any blocker, named; `504` if the new
+version was not observed within the commit timeout). `animus cluster
+version|finalize` consume them. See ADR 0073's P2-C implementation notes.

@@ -28,8 +28,10 @@
 
 use std::path::{Path, PathBuf};
 
+use animus_control::Metadata;
 use animus_control::format::FormatError;
 use animus_control::persist::{PersistedState, WalRecord};
+use animus_control::version::ClusterFeatures;
 use animus_env::nid;
 
 use crate::codec::tests::{sample_entries, sample_wires};
@@ -97,7 +99,10 @@ fn unpack_frames(mut bytes: &[u8]) -> Vec<Vec<u8>> {
 }
 
 fn v1_wire_bytes() -> Vec<u8> {
-    let frames: Vec<Vec<u8>> = sample_wires().iter().map(codec::encode_wire).collect();
+    let frames: Vec<Vec<u8>> = sample_wires()
+        .iter()
+        .map(|w| codec::encode_wire(w, &ClusterFeatures::new()))
+        .collect();
     pack_frames(&frames)
 }
 
@@ -154,7 +159,12 @@ fn raftkv_wire_round_trips_and_matches_the_fixture_bytes() {
         }
         let re: Vec<Vec<u8>> = unpack_frames(&bytes)
             .iter()
-            .map(|f| codec::encode_wire(&codec::decode_wire(f).expect("decode")))
+            .map(|f| {
+                codec::encode_wire(
+                    &codec::decode_wire(f).expect("decode"),
+                    &ClusterFeatures::new(),
+                )
+            })
             .collect();
         assert_eq!(
             pack_frames(&re),
@@ -247,13 +257,72 @@ fn raftkv_image_round_trips_and_matches_the_fixture_bytes() {
             continue;
         }
         let (max_ts, rows) = codec::decode_image(&bytes).expect("decode");
-        assert_eq!(codec::encode_image(&rows, max_ts), bytes, "v1 round trip");
+        assert_eq!(
+            codec::encode_image(&rows, max_ts, &ClusterFeatures::new()),
+            bytes,
+            "v1 round trip"
+        );
         let (m, r) = v1_image();
         assert_eq!(
-            codec::encode_image(&r, m),
+            codec::encode_image(&r, m, &ClusterFeatures::new()),
             bytes,
             "v1: current encoder emits the fixture"
         );
+    }
+}
+
+/// ADR 0073 Phase 2 (P2-B) byte-identity proof: before the era, a B2 encoder
+/// emits **exactly the Phase 1 bytes** for both gate-selected frame kinds, whatever
+/// the sender's feature handle says. The handles here are the floor handle
+/// (`ClusterFeatures::new()`, what a node holds before it first reads
+/// `Metadata`) and one fed from an **era-0** `Metadata` (versioning off, cluster
+/// version 1), plus one fed from an era-on `Metadata` (no frame version exists
+/// beyond v1 yet, so even an open era must still select v1). The fixtures are the
+/// Phase 0/1 `raftkv-wire/v1.bin` and `raftkv-image/v1.bin`, which no P2 change
+/// may touch (`scripts/check-format-fixtures.sh`).
+#[test]
+fn pre_era_encoders_are_byte_identical_to_the_phase1_fixtures_under_every_handle() {
+    let era0 = ClusterFeatures::new();
+    era0.update(&Metadata::default());
+    assert!(!era0.era_active() && era0.cluster_version() == 1);
+    let era_on_meta = crate::gates::era_on_metadata();
+    let era_on = ClusterFeatures::new();
+    era_on.update(&era_on_meta);
+    assert!(era_on.era_active());
+    let handles = [
+        ("floor", ClusterFeatures::new()),
+        ("era-0 metadata", era0),
+        ("era-on metadata", era_on),
+    ];
+
+    let wire_fixture = fixture_files(&formats_dir("raftkv-wire"))
+        .into_iter()
+        .find(|(v, _)| *v == 1)
+        .expect("raftkv-wire/v1.bin")
+        .1;
+    let image_fixture = fixture_files(&formats_dir("raftkv-image"))
+        .into_iter()
+        .find(|(v, _)| *v == 1)
+        .expect("raftkv-image/v1.bin")
+        .1;
+    let (max_ts, rows) = v1_image();
+    for (name, f) in &handles {
+        let frames: Vec<Vec<u8>> = sample_wires()
+            .iter()
+            .map(|w| codec::encode_wire(w, f))
+            .collect();
+        assert!(
+            frames.iter().all(|fr| fr[0] == 0xCB && fr[1] == 1),
+            "{name}"
+        );
+        assert_eq!(
+            pack_frames(&frames),
+            wire_fixture,
+            "{name}: wire != Phase 1"
+        );
+        let image = codec::encode_image(&rows, max_ts, f);
+        assert_eq!(&image[..2], &[0xCB, 1], "{name}");
+        assert_eq!(image, image_fixture, "{name}: image != Phase 1");
     }
 }
 
@@ -262,7 +331,11 @@ fn raftkv_image_round_trips_and_matches_the_fixture_bytes() {
 #[ignore]
 fn generate_fixture_raftkv_image() {
     let (m, r) = v1_image();
-    write_new_fixture(&formats_dir("raftkv-image"), 1, &codec::encode_image(&r, m));
+    write_new_fixture(
+        &formats_dir("raftkv-image"),
+        1,
+        &codec::encode_image(&r, m, &ClusterFeatures::new()),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -495,4 +568,193 @@ fn cp_engine_layout_refuses_other_epochs_by_name() {
 #[ignore]
 fn generate_fixture_cp_engine_layout() {
     write_new_fixture(&formats_dir("cp-engine-layout"), 1, &v1_layout_bytes());
+}
+
+// ---------------------------------------------------------------------------
+// txn-envelope (ADR 0018 §2's 2026-10-04 amendment)
+//
+// The 1-byte-tagged value envelope every base-row value is wrapped in
+// (`txn.rs`). Tag `0` = committed (every version); tag `1` = a v1 intent
+// (retired, `txn::legacy::v1`: no prior value); tag `2` = a v2 intent (the v1
+// body plus a trailing `prior` — the committed value the intent shadows).
+// Container: `u32`-BE-length-prefixed envelope values, to EOF.
+
+fn txn_fixture_id() -> crate::txn::TxnId {
+    crate::txn::TxnId {
+        ts: HlcTimestamp {
+            wall_ms: 1_700_000_000_123,
+            logical: 7,
+        },
+        node: nid(3),
+    }
+}
+
+fn txn_fixture_record_key() -> Vec<u8> {
+    crate::txn::record_key(&[0xA5; animus_tablet::TOKEN_BYTES], &txn_fixture_id())
+}
+
+fn txn_fixture_kind_writes() -> Vec<crate::KindWrite> {
+    vec![
+        (1u8, b"lsi-key".to_vec(), Some(b"lsi-row".to_vec())),
+        (1u8, b"lsi-old".to_vec(), None),
+    ]
+}
+
+fn txn_fixture_change_log() -> (Vec<u8>, Vec<u8>) {
+    (b"change-prefix".to_vec(), b"change-record".to_vec())
+}
+
+fn v1_txn_envelope_bytes() -> Vec<u8> {
+    use crate::txn;
+    let (id, rk) = (txn_fixture_id(), txn_fixture_record_key());
+    pack_frames(&[
+        txn::encode_committed(b"hello"),
+        txn::encode_committed(b""),
+        txn::legacy::v1::encode_intent(
+            &id,
+            &rk,
+            "orders",
+            Some(b"staged"),
+            &txn_fixture_kind_writes(),
+            Some(&txn_fixture_change_log()),
+        ),
+        txn::legacy::v1::encode_intent(&id, &rk, "orders", None, &[], None),
+    ])
+}
+
+fn v2_txn_envelope_bytes() -> Vec<u8> {
+    use crate::txn;
+    let (id, rk) = (txn_fixture_id(), txn_fixture_record_key());
+    pack_frames(&[
+        txn::encode_committed(b"hello"),
+        txn::encode_committed(b""),
+        txn::encode_intent(
+            &id,
+            &rk,
+            "orders",
+            Some(b"staged"),
+            &txn_fixture_kind_writes(),
+            Some(&txn_fixture_change_log()),
+            Some(b"was"),
+        ),
+        txn::encode_intent(&id, &rk, "orders", None, &[], None, None),
+        txn::encode_intent(&id, &rk, "orders", Some(b"x"), &[], None, Some(b"")),
+    ])
+}
+
+fn txn_intent(
+    staged: Option<&[u8]>,
+    with_derived: bool,
+    prior: crate::txn::IntentPrior,
+) -> crate::txn::Envelope {
+    crate::txn::Envelope::Intent {
+        txn_id: txn_fixture_id(),
+        record_key: txn_fixture_record_key(),
+        record_table: "orders".to_string(),
+        staged_value: staged.map(<[u8]>::to_vec),
+        kind_writes: if with_derived {
+            txn_fixture_kind_writes()
+        } else {
+            Vec::new()
+        },
+        change_log: with_derived.then(txn_fixture_change_log),
+        prior,
+    }
+}
+
+#[test]
+fn txn_envelope_decodes_every_checked_in_fixture_structurally() {
+    use crate::txn::{Envelope, IntentPrior, decode_envelope};
+    for (version, bytes) in fixture_files(&formats_dir("txn-envelope")) {
+        let decoded: Vec<Envelope> = unpack_frames(&bytes)
+            .iter()
+            .map(|b| decode_envelope(b))
+            .collect();
+        let expected = match version {
+            // A v1 intent translates to the current shape with an unknown
+            // prior: the reader falls back to the MVCC lookback (step 6).
+            1 => vec![
+                Envelope::Committed(b"hello".to_vec()),
+                Envelope::Committed(Vec::new()),
+                txn_intent(Some(b"staged"), true, IntentPrior::Unknown),
+                txn_intent(None, false, IntentPrior::Unknown),
+            ],
+            2 => vec![
+                Envelope::Committed(b"hello".to_vec()),
+                Envelope::Committed(Vec::new()),
+                txn_intent(
+                    Some(b"staged"),
+                    true,
+                    IntentPrior::Known(Some(b"was".to_vec())),
+                ),
+                txn_intent(None, false, IntentPrior::Known(None)),
+                txn_intent(Some(b"x"), false, IntentPrior::Known(Some(Vec::new()))),
+            ],
+            other => panic!(
+                "txn-envelope fixture v{other} has no expected value — add one (ADR 0073 checklist step 4)"
+            ),
+        };
+        assert_eq!(decoded, expected, "txn-envelope v{version}");
+    }
+}
+
+#[test]
+fn txn_envelope_encoders_match_the_fixture_bytes() {
+    for (version, bytes) in fixture_files(&formats_dir("txn-envelope")) {
+        let want = match version {
+            // Checklist step 7: the `legacy-encoders` v1 encoder reproduces v1.
+            1 => v1_txn_envelope_bytes(),
+            // Checklist step 5: the current writer reproduces v2.
+            2 => v2_txn_envelope_bytes(),
+            other => panic!("txn-envelope fixture v{other} has no encoder arm"),
+        };
+        assert_eq!(
+            want, bytes,
+            "txn-envelope v{version}: encoder emits the fixture"
+        );
+    }
+}
+
+/// `cargo test -p animus-cp-data --lib generate_fixture_txn_envelope -- --ignored`.
+/// Refuses to overwrite an existing fixture (ADR 0073 Phase 0).
+#[test]
+#[ignore]
+fn generate_fixture_txn_envelope() {
+    let dir = formats_dir("txn-envelope");
+    if !dir.join("v1.bin").exists() {
+        write_new_fixture(&dir, 1, &v1_txn_envelope_bytes());
+    }
+    write_new_fixture(&dir, 2, &v2_txn_envelope_bytes());
+}
+
+/// The harness's engine-row transcode (`animus-test`'s `ROW_TABLE`): a v2 intent
+/// down-converts to exactly the v1 bytes the `legacy-encoders` v1 encoder
+/// writes for the same fields (which `txn_envelope_encoders_match_the_fixture_bytes`
+/// anchors to `v1.bin`), and anything that is not exactly one v2 intent is left
+/// alone.
+#[test]
+fn txn_envelope_v2_intents_downgrade_to_the_v1_fixture_bytes() {
+    use crate::downgrade_txn_envelope_to_v1 as down;
+    let v1 = unpack_frames(&std::fs::read(formats_dir("txn-envelope").join("v1.bin")).unwrap());
+    let v2 = unpack_frames(&std::fs::read(formats_dir("txn-envelope").join("v2.bin")).unwrap());
+    // Frames 0/1 are committed values: untouched. Frames 2/3 of v2 are the
+    // v1 fixture's frames 2/3 plus a prior.
+    assert_eq!(down(&v2[0]), None);
+    assert_eq!(down(&v2[1]), None);
+    assert_eq!(down(&v2[2]).as_deref(), Some(v1[2].as_slice()));
+    assert_eq!(down(&v2[3]).as_deref(), Some(v1[3].as_slice()));
+    // Frame 4 (staged `x`, prior empty) has no v1 fixture twin: it must equal
+    // the v1 encoder over the same fields.
+    let (id, rk) = (txn_fixture_id(), txn_fixture_record_key());
+    let want = crate::txn::legacy::v1::encode_intent(&id, &rk, "orders", Some(b"x"), &[], None);
+    assert_eq!(down(&v2[4]), Some(want));
+    // Not a v2 intent: left alone (`None`), never rewritten or panicked on.
+    for not_v2 in [&v1[2][..], &[2u8][..], &[2u8, 1, 2, 3][..], &[][..]] {
+        assert_eq!(down(not_v2), None, "{not_v2:02x?}");
+    }
+    // A v2 intent with a byte appended or removed is not exactly one intent.
+    let mut longer = v2[2].clone();
+    longer.push(0);
+    assert_eq!(down(&longer), None);
+    assert_eq!(down(&v2[2][..v2[2].len() - 1]), None);
 }

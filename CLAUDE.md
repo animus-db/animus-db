@@ -115,8 +115,10 @@ Phase 2, a replicated cluster version / feature gate, is next). The
 first real bumps have landed (2026-10-03, #1140/#1141/#1142): `control-wal`,
 `shared-wal` and the LSM WAL (`lsm-wal`, `LWL1`) are v2 (WAL sync markers) and
 the harness transcodes them to v1 for real; `raftkv-wal` is v2 too (embedded
-in the control-wal carrier); every other format is still v1, transcoded as
-the identity. **A format change follows ADR 0073's "Phase 1 design"
+in the control-wal carrier); `txn-envelope` (the value-envelope intent tag) is v2
+since 2026-10-04 (an intent carries its prior value, ADR 0018; an engine-row value, so the harness
+down-converts it to v1 with a row transcode, `animus-test` `ROW_TABLE`); every other format is still v1,
+transcoded as the identity. **A format change follows ADR 0073's "Phase 1 design"
 checklist** ([`docs/adr/0073-upgrade-compatibility.md`](docs/adr/0073-upgrade-compatibility.md):
 bump, keep the vN decoder under `legacy`, new no-overwrite fixture,
 per-version expected value, round-trip and old-input tests, test-only legacy
@@ -234,6 +236,8 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 | `ANIMUS_DIRECTED_PLACING_LOAD_SEEDS=K` | 1 | directed-Placing (2-of-3 replica diff) learner-promotion-under-a-continuous-writer corpus depth (`animus-cp-data`, issue #1064) — `cargo test -p animus-cp-data --test it directed_placing_under_sustained_load::` |
 | `ANIMUS_LEARNER_SNAPSHOT_LIVELOCK_SEEDS=K` | 1 | late-joining-learner-needing-a-real-InstallSnapshot-under-a-continuous-writer corpus depth (`animus-cp-data`, issue #1064 part 2) — `cargo test -p animus-cp-data --test it learner_snapshot_livelock_under_continuous_writer::` |
 | `ANIMUS_RELEASE_RACE_SEEDS=K` | 1 | release-vs-promote race corpus depth (`animus-cp-data`, `tests/release_race_corpus.rs`, ADR 0031's 2026-09-30 amendment) — a mid-catch-up learner must never be released/erased by the host reconciler nor refused as a voter on re-host |
+| `ANIMUS_CHAOS_SEED=S` | per-scenario name hash | seed of the real-cluster chaos harness's **fault schedule** (`animusd`, `tests/chaos.rs`, R-01 b, `docs/chaos.md`); the processes are real, so a replay is the same faults against a similar, not identical, execution. Opt-in: `cargo test -p animusd --features chaos --test chaos -- --test-threads=1` |
+| `ANIMUS_CHAOS_SECS=N` | 90 (smoke) / 150 | length of the chaos fault window in seconds (the long run: `ANIMUS_CHAOS_SECS=900 … chaos_mixed`); also `ANIMUS_CHAOS_NODES` (3), `ANIMUS_CHAOS_TABLETS` (4), `ANIMUS_CHAOS_RECOVERY_SECS` (60), `ANIMUS_CHAOS_TXN=0`, `ANIMUS_CHAOS_DIR`, `ANIMUS_CHAOS_OUT` |
 | `ANIMUS_SHRINK=1` | off | when a corpus scenario fails, delta-debug it to a minimal reproducing case and print a replayable handle (`animus-test::shrink`, ADR 0061 rung B4) |
 | `ANIMUS_SHRINK_MAX_CHECKS=N` | 500 | iteration budget for `ANIMUS_SHRINK`'s search (a plain check count, not wall-clock time — see `animus-test/CLAUDE.md`) |
 | `ANIMUS_SHRINK_REPLAY=<json>` | unset | replay a minimized scenario a shrink run printed (per-corpus entry point, e.g. `raftkv_shrink_replay` in `raftkv_linearizable.rs`) |

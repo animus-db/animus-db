@@ -675,6 +675,7 @@ async fn discover_join_info_via_relay<E: Env, R: RelayClient>(
             client_route,
             intra_route,
             admin_addrs,
+            ..
         } => Ok((control_ids, peers, client_route, intra_route, admin_addrs)),
         other => Err(format!(
             "seed returned an unexpected reply to JoinInfo: {other:?}"
@@ -885,6 +886,16 @@ type GetResult = Result<Option<Vec<u8>>, String>;
 /// reason as [`ScanRows`] — [`SimClusterHandle`]'s own `ctxs` field is a
 /// `Vec` of these behind an `Arc<Mutex<..>>`.
 type SimNodeCtx = ClientCtx<SimEnv, SimRelayClient<SimEnv>>;
+
+/// ADR 0073 Phase 2 (P2-C): spawn one node's version feeder
+/// (`version_wiring::version_wiring_loop`) — the same generic task production's
+/// `spawn_common_tail` spawns on every role. Spawned on every `SimCluster`
+/// node (construction, restart, every growth/join path); `Simulator::stop`
+/// drops it with the rest of the node's tasks, so `restart` respawns it.
+fn spawn_version_loop(ctx: &SimNodeCtx) {
+    let env = ctx.env.clone();
+    env.spawn_task(version_wiring::version_wiring_loop(ctx.clone()));
+}
 
 /// An `E`-free, plain-data projection of [`CpRoute`] — issue #950's own
 /// [`SimClusterHandle::cp_route`]/[`SimCluster::cp_route_timed`] use this
@@ -2379,6 +2390,7 @@ impl SimCluster {
                 throttle: ThrottleTracker::new(),
                 throttle_defaults: Arc::new(ThrottleDefaults::default()),
                 any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                overload: Default::default(),
             };
             ctxs.push(ctx);
         }
@@ -2459,6 +2471,11 @@ impl SimCluster {
                 reconciler.enable_quiescence(after);
             }
             spawn_reconciler_loop(ctxs[i].clone(), reconciler);
+        }
+
+        // ADR 0073 Phase 2 (P2-C): the per-node version feeder, every role.
+        for ctx in ctxs.iter() {
+            spawn_version_loop(ctx);
         }
 
         // ADR 0061 rung D4 PR 5: one `animus_node::backup_janitor::
@@ -3171,6 +3188,72 @@ impl SimCluster {
         self.controls[idx].version_observations()
     }
 
+    /// ADR 0073 Phase 2 (P2-C): make `node` run "a binary" supporting
+    /// `range` (`None` = a Phase 1 binary: empty handshake `ext`, never
+    /// evaluates the era, never self-reports). Does all three things a binary
+    /// is: the node's own version profile (what its `version_wiring_loop` and
+    /// admin view use), its control `RaftNode`'s own range + build (when
+    /// control-bearing; a data-only node has no `RaftNode`), and the
+    /// simulated network `ext` its peers observe (`Simulator::
+    /// set_network_ext_for`). Takes effect immediately, no restart needed.
+    pub(crate) fn set_node_version(
+        &mut self,
+        node: u64,
+        range: Option<animus_control::version::VersionRange>,
+    ) {
+        let ctx = self.shared.ctx(node);
+        let build = version_wiring::BUILD.to_string();
+        ctx.edge
+            .version()
+            .set_profile(version_wiring::VersionProfile {
+                range,
+                build: build.clone(),
+            });
+        if let Some(idx) = self.control_index_of(node) {
+            self.controls[idx].set_own_build(build.clone());
+            self.controls[idx].set_own_version_range(range);
+        }
+        self.sim
+            .set_network_ext_for(ctx.env.node_id(), version_wiring::ext_for(range, &build));
+    }
+
+    /// Set ONLY a control-bearing node's `RaftNode` own range, leaving its
+    /// profile and network `ext` alone — a test hook to switch the leader's
+    /// era upkeep (`era_on_proposals`) off while the (sticky) era stays on, so
+    /// a test can prove a node's own self-report lands through the relay path
+    /// and not merely through the leader noticing a changed `ext`.
+    pub(crate) fn set_raft_own_range(
+        &mut self,
+        node: u64,
+        range: Option<animus_control::version::VersionRange>,
+    ) {
+        let idx = self
+            .control_index_of(node)
+            .unwrap_or_else(|| panic!("node {node} is not control-bearing"));
+        self.controls[idx].set_own_version_range(range);
+    }
+
+    /// [`set_node_version`](Self::set_node_version) for every node.
+    pub(crate) fn set_all_node_versions(
+        &mut self,
+        range: Option<animus_control::version::VersionRange>,
+    ) {
+        for node in 0..self.nodes as u64 {
+            self.set_node_version(node, range);
+        }
+    }
+
+    /// The node's own `ClusterFeatures` handle (ADR 0073 Phase 2, P2-C): the
+    /// one handle every gated emitter consults.
+    pub(crate) fn features(&self, node: u64) -> animus_control::version::ClusterFeatures {
+        self.shared.ctx(node).edge.version().features.clone()
+    }
+
+    /// The node's version halt reason, if its feeder latched one.
+    pub(crate) fn version_halt(&self, node: u64) -> Option<String> {
+        self.shared.ctx(node).edge.version().halt.get()
+    }
+
     /// **C-13 / ADR 0061 rung M PR 6**: `(commit_index, engine_applied_index)`
     /// read directly off `node`'s own local control `RaftNode<SimEnv>` —
     /// bypasses the `/admin/raft` HTTP-JSON round trip entirely (unlike
@@ -3558,6 +3641,14 @@ impl SimCluster {
     pub(crate) fn propose_meta(&mut self, command: MetaCommand) -> ProposeResult {
         let leader = self.control_leader_index();
         self.controls[leader].propose(command)
+    }
+
+    /// ADR 0073 P2-B x P2-D negative-control helper: like [`Self::propose_meta`]
+    /// but **bypassing the gate check**, so a buggy emitter's closed-gate
+    /// variant is actually appended (the wedge N1 must detect).
+    pub(crate) fn propose_meta_ungated(&mut self, command: MetaCommand) -> ProposeResult {
+        let leader = self.control_leader_index();
+        self.controls[leader].propose_ungated_for_negative_control(command)
     }
 
     /// **Issue #994 regression helper.** Propose the ADR 0050 split-cutover
@@ -5379,6 +5470,7 @@ impl SimCluster {
             });
 
             self.controls[idx] = fresh_control;
+            spawn_version_loop(&ctx);
             self.shared.set_ctx(node, ctx);
         } else {
             // ---- data-only node (NodeRole::Data), constructed or grown (ADR 0061 rung L, C-12 PR 3) ----
@@ -5460,6 +5552,7 @@ impl SimCluster {
             });
 
             self.shared.set_ctx(node, ctx.clone());
+            spawn_version_loop(&ctx);
 
             // The one genuinely new mechanism a `NodeRole::Data` node's
             // restart needs — a fresh `SimEnv`-native mirror-sync loop over
@@ -5760,6 +5853,7 @@ impl SimCluster {
             throttle: ThrottleTracker::new(),
             throttle_defaults: Arc::new(ThrottleDefaults::default()),
             any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            overload: Default::default(),
         };
 
         // Install the relay server, exactly like `SimCluster::new`/
@@ -5771,6 +5865,7 @@ impl SimCluster {
         });
 
         self.shared.push_ctx(ctx.clone());
+        spawn_version_loop(&ctx);
         self.engines.push(MemoryTabletEngines::new());
         // ADR 0061 rung L, C-12 PR 2: keeps `self.roles` index-aligned with
         // `self.engines`/`self.shared`'s own ctxs — `grow` supports
@@ -6098,6 +6193,7 @@ impl SimCluster {
             throttle: ThrottleTracker::new(),
             throttle_defaults: Arc::new(ThrottleDefaults::default()),
             any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            overload: Default::default(),
         };
 
         let ctx_for_server = ctx.clone();
@@ -6107,6 +6203,7 @@ impl SimCluster {
         });
 
         self.shared.push_ctx(ctx.clone());
+        spawn_version_loop(&ctx);
         self.engines.push(MemoryTabletEngines::new());
         self.roles.push(NodeRole::Control);
         self.nodes += 1;
@@ -6404,6 +6501,7 @@ impl SimCluster {
             throttle: ThrottleTracker::new(),
             throttle_defaults: Arc::new(ThrottleDefaults::default()),
             any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            overload: Default::default(),
         };
 
         let ctx_for_server = ctx.clone();
@@ -6413,6 +6511,7 @@ impl SimCluster {
         });
 
         self.shared.push_ctx(ctx.clone());
+        spawn_version_loop(&ctx);
         self.engines.push(MemoryTabletEngines::new());
         self.roles.push(NodeRole::Both);
         self.nodes += 1;
@@ -7160,6 +7259,7 @@ impl SimCluster {
             throttle: ThrottleTracker::new(),
             throttle_defaults: Arc::new(ThrottleDefaults::default()),
             any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            overload: Default::default(),
         };
 
         let ctx_for_server = ctx.clone();
@@ -7169,6 +7269,7 @@ impl SimCluster {
         });
 
         self.shared.push_ctx(ctx.clone());
+        spawn_version_loop(&ctx);
         self.engines.push(MemoryTabletEngines::new());
         // See this method's own doc on why `NodeRole::Data`, not `Both`.
         self.roles.push(NodeRole::Data);

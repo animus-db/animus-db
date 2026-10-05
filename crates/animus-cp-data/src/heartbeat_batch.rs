@@ -108,6 +108,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use animus_control::raft::RaftMsg;
+use animus_control::version::ClusterFeatures;
 use animus_env::{Env, EnvExt, Metric, MetricsHandle, NodeId};
 use futures::task::AtomicWaker;
 
@@ -222,6 +223,12 @@ struct BatcherInner<E: Env> {
     /// working under a bare `SimEnv` test with no `animusd` in the loop at
     /// all).
     hosted: Mutex<BTreeMap<u64, Arc<HeartbeatInbox>>>,
+    /// ADR 0073 Phase 2 (P2-B): the node's feature-gate handle, consulted
+    /// by the flush task before it encodes and sends a frame. Behind a
+    /// mutex so [`HeartbeatBatcher::set_features`] can re-point it after the
+    /// batcher (and its tasks) already exist: a `ClusterFeatures` is an
+    /// `Arc`-shared cell and cannot be re-pointed in place.
+    features: Mutex<ClusterFeatures>,
 }
 
 /// A per-node heartbeat batcher (ADR 0044 phase 2) — construct **one** per
@@ -262,16 +269,38 @@ impl<E: Env> HeartbeatBatcher<E> {
     /// convention.
     #[must_use]
     pub fn new(env: E, interval: Duration, metrics: MetricsHandle) -> Self {
+        Self::new_with_features(env, interval, metrics, ClusterFeatures::new())
+    }
+
+    /// Like [`new`](Self::new), with the node's feature-gate handle (ADR
+    /// 0073 Phase 2, P2-B) instead of a floor one.
+    pub fn new_with_features(
+        env: E,
+        interval: Duration,
+        metrics: MetricsHandle,
+        features: ClusterFeatures,
+    ) -> Self {
         let inner = Arc::new(BatcherInner {
             env: env.clone(),
             interval,
             metrics,
             pending: Mutex::new(BTreeMap::new()),
             hosted: Mutex::new(BTreeMap::new()),
+            features: Mutex::new(features),
         });
         env.spawn_task(flush_loop(Arc::clone(&inner)));
         env.spawn_task(demux_loop(Arc::clone(&inner)));
         Self { inner }
+    }
+
+    /// Re-point the gate handle the flush task consults (ADR 0073 Phase 2,
+    /// P2-B); every clone of this batcher sees it.
+    pub fn set_features(&self, features: ClusterFeatures) {
+        *self
+            .inner
+            .features
+            .lock()
+            .expect("heartbeat batcher features poisoned") = features;
     }
 
     /// Register `stream` (a bare, no-entries `RaftMsg::AppendEntries`
@@ -358,7 +387,16 @@ async fn flush_loop<E: Env>(inner: Arc<BatcherInner<E>>) {
                 continue;
             }
             inner.metrics.incr(Metric::CpHeartbeatFramesSent);
-            let payload = codec::encode_wire(&KvWire::HeartbeatBatch(entries));
+            let features = inner
+                .features
+                .lock()
+                .expect("heartbeat batcher features poisoned")
+                .clone();
+            let Some(payload) =
+                crate::gates::encode_for_send(&KvWire::HeartbeatBatch(entries), &features)
+            else {
+                continue;
+            };
             inner
                 .env
                 .send_stream(to, HEARTBEAT_BATCH_STREAM, payload)

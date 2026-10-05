@@ -205,7 +205,7 @@ a silent hang.** Concretely:
      deprecated by a changelog notice in release N and removed no earlier
      than the next MINOR (pre-1.0) or MAJOR (post-1.0).
    - *Internal node-to-node wire*: governed by ADR 0073 Phase 2/3 (a
-     replicated cluster version and feature gate); until Phase 2 lands,
+     replicated cluster version and feature gate); until Phase 2 completes (P2-A and P2-C have landed; P2-B and P2-D have not),
      mixed-version clusters are unsupported and release notes say so.
    - *CLI flags, config keys, metric names*: deprecated for at least one
      MINOR with a warning before removal (pre-1.0).
