@@ -335,8 +335,10 @@ mod tests {
         assert!(!floor.is_open(Gate::MrecReplication));
         assert!(check_propose(&floor, &kind_eval(false, KindEvalOp::Delete)));
         let open = ClusterFeatures::new();
-        let mut m3 = animus_control::Metadata::default();
-        m3.cluster_version = 3;
+        let m3 = animus_control::Metadata {
+            cluster_version: 3,
+            ..Default::default()
+        };
         open.update(&m3);
         assert!(open.is_open(Gate::MrecReplication));
         assert!(check_propose(&open, &kind_eval(true, replicate)));
