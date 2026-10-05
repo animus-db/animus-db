@@ -12076,6 +12076,21 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         .unwrap_or(0);
     engine_applied.store(engine_watermark, Ordering::SeqCst);
     applied_watch.bump(engine_watermark);
+    // Issue #1229: an in-place split child's engine was cloned from its
+    // parent (ADR 0058), so its pre-fork rows are in no log entry. The
+    // durable trim marker identifies such a group (it survives restarts,
+    // unlike how the group was started); tell the core, so a learner is
+    // shipped the engine image instead of a log that lacks those rows.
+    if storage
+        .get(&trim_marker::trim_marker_key(stream))
+        .await
+        .expect("system-keyspace engine read (cp split trim marker)")
+        .is_some()
+    {
+        core.lock()
+            .expect("raftkv core poisoned")
+            .set_log_omits_base(true);
+    }
     // Needs-snapshot state (issue #554): the engine's own watermark is below
     // the log's own compacted start — the prefix through `snapshot_index` is
     // gone from both the log (compacted) and the engine (never merged, or

@@ -22358,6 +22358,10 @@ mod sim_cluster_lsm;
 /// depth knob `ANIMUS_UPGRADE_SEEDS`. See that module's doc.
 #[cfg(test)]
 mod sim_cluster_mixed_version_corpus;
+/// Issue #1229: a split child relocated wholesale by directed Placing keeps
+/// its pre-split rows (`SimCluster`).
+#[cfg(test)]
+mod sim_cluster_split_relocation;
 /// ADR 0065's own `SimEnv`-driven, virtual-time-only throttle-enforcement
 /// coverage, over the real `SimCluster` fixture — a sibling of
 /// `sim_cluster_corpus`, for the identical reason (needs `SimCluster`'s own

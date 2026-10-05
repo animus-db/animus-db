@@ -873,14 +873,6 @@ fn cell_split_under_mrsc(seed: u64) {
             "seed={seed}: child {id:?} lost the Region pin: {p:?}"
         );
     }
-    // KNOWN PRE-EXISTING BUG (issue #1229, reproduces on `main` with a plain
-    // table): a split child whose replicas ALL move to other nodes (directed
-    // Placing, routine on a 6-node cluster) loses its pre-split rows. The
-    // durability oracle therefore starts afresh after the split instead of
-    // covering writes acked before it; everything acked after the split must
-    // still be durable. Delete these two lines when #1229 is fixed.
-    run.acked.clear();
-    run.register.clear();
     run.workload("glob1", &all_nodes());
     run.caught_up();
 }

@@ -1961,8 +1961,7 @@ outstanding on the wire surface at present.
     `DescribeTable` fields, `/admin/global-tables`, `animus table
     preferred-leader`, the decommission guard, `spec.maxRegionRttMs`, and the
     `sim_cluster_mrsc` + `preferred_leader_corpus` corpora (nightly in
-    `corpus-deep.yml`). **Residuals:** a split child whose replicas all move
-    loses its pre-split rows (#1229, pre-existing); no quiescence benefit on
+    `corpus-deep.yml`). **Residuals:** no quiescence benefit on
     WAN groups (#1226); witness may transiently lead (no campaign
     suppression); control-voter region placement is not enforced (only
     warned about); AWS field names/error texts unverified against the live

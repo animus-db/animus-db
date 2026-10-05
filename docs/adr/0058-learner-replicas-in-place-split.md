@@ -1786,3 +1786,28 @@ has reported its issue #667 cluster check resolved (`AppendEntriesResp::
 check_pending == false`): a node with a pending check refuses every vote, so
 promoting it adds a voter that cannot vote. See ADR 0009's 2026-09-30
 amendment for the mechanism and safety argument.
+
+## 2026-10-05 amendment: a fork child's log does not reproduce its engine (issue #1229)
+
+A fork child's engine is *cloned* from the parent's, so its pre-fork rows
+are in no entry of the child's own Raft log. The design assumed any new
+replica of a child catches up "via `InstallSnapshot`", but a leader ships a
+snapshot only when a peer's `next_index <= snapshot_index`, and a fresh
+child's `snapshot_index` is 0 until its first compaction (64 applies): a
+learner recruited by directed Placing (ADR 0062) in that window was
+replicated the log from entry 1, reported itself caught up on the post-fork
+writes alone, was promoted, and the old homes then reclaimed the only copies
+of the pre-fork rows. Acked data was really lost (any child whose placement
+moved a replica, not just a wholesale move; a wholesale move loses it all).
+
+Fix: `RaftCore::log_omits_base` (local, never persisted). The data-plane
+driver sets it at start from the durable split-trim marker (so it survives
+restarts and covers both the materialize and the plain re-host paths). While
+set and `snapshot_index == 0`, the leader sends a *learner* nothing from the
+log; it raises `snapshot_needed` so the driver builds the engine image and
+moves the base to the engine's applied index, after which the ordinary
+`next <= snapshot_index` branch ships the image. Bootstrap voters are
+unaffected (they hold the identical cloned engine, so no snapshot at birth).
+Regression: `animusd` `sim_cluster_split_relocation`
+(`ANIMUS_SPLIT_RELOCATION_SEEDS`).
+

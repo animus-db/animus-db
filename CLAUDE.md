@@ -244,6 +244,7 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 | `ANIMUS_SHAREDWAL_SEEDS=K` | 1 | `SharedWal` cross-tablet ordering/crash-safety/GC fault-injection corpus depth (`animus-cp-data`, ADR 0028, C-05 — on by default since PR 3's cutover) — `cargo test -p animus-cp-data --test it sharedwal_fault_corpus::` |
 | `ANIMUS_WAL_REWRITE_CRASH_SEEDS=K` | 1 | staged WAL-compaction-rewrite crash corpus depth (`animus-cp-data`, issue #1116) — whole-cluster power-cut at 12 offsets into a stalled rewrite, plain and torn/corrupt tails; every acked write must survive — `cargo test -p animus-cp-data --test it wal_rewrite_crash::` |
 | `ANIMUS_ZONE_PLACEMENT_SEEDS=K` | 1 | zone-labelled placement + whole-zone-loss corpus depth over `SimCluster` (`animusd`, G-01 stage G-a) — 6 nodes, 2 per zone, RF 3: every tablet spans 3 zones, kill a zone, no acked write lost, repair re-converges — `cargo test -p animusd --lib sim_cluster_zone_placement` |
+| `ANIMUS_SPLIT_RELOCATION_SEEDS=K` | 1 | split-child wholesale-relocation corpus depth over `SimCluster` (`animusd`, issue #1229) — a child moved entirely off the parent's replicas by directed Placing must keep its pre-split rows; two cells (`MemoryEngine`; `LsmEngine` + rotating node restarts) — `cargo test -p animusd --lib sim_cluster_split_relocation` |
 | `ANIMUS_EXPORT_IMPORT_SEEDS=K` | 1 | S3 export/import fault-injection corpus depth (`animus-test`, ADR 0068, S-05 PR 3) |
 | `ANIMUS_S3_FAULT_SEEDS=K` | 1 | S3 store retry/backoff fault-injection corpus depth (`animus-test`, `tests/it/s3_fault_corpus.rs`, S-08 M3) — `S3SegmentStore<FaultyTransport<FakeS3>, SimEnv>`: 5xx/429/timeout/lost-ack bursts, multipart part/Complete failures, expiring and failing credential providers; `ANIMUS_SEED=<seed>` replays one seed per cell — `cargo test -p animus-test --test it s3_fault_corpus::` |
 | `ANIMUS_HEARTBEAT_SEEDS=K` | 1 | per-node heartbeat-batcher fault-injection corpus depth (`animus-cp-data`, ADR 0044 phase 2, C-02 PR 2) — run via `cargo test -p animus-cp-data --test it heartbeat_batch_corpus::` |
@@ -451,8 +452,7 @@ truth; this map is just for navigation.
   replicas never serve eventual reads, and `animusd::global_tables` is the wire
   edge + `/admin/global-tables` + the decommission guard. Corpora:
   `preferred_leader_corpus` (pure) and `sim_cluster_mrsc` (cluster), knob
-  `ANIMUS_MRSC_SEEDS`. Known gaps: #1229 (split child moved wholesale loses
-  pre-split rows, pre-existing), #1226 (WAN groups never quiesce).
+  `ANIMUS_MRSC_SEEDS`. Known gap: #1226 (WAN groups never quiesce).
 - **Transaction consensus** — 2PC/HLC over the per-tablet Raft groups (ADR
   0018), the only transaction story. The Accord slice that used to sit here
   (`animus-consensus`, ADR 0011) is **deleted** — rejected for CP by ADR 0018 in

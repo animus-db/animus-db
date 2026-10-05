@@ -12114,9 +12114,9 @@ negative controls. Harness gotchas it cost to learn:
 - `await_replicas_caught_up` skips crashed nodes (a dead node's stale replica
   is not progress); `group_states(node)` prints role@term/known leader per
   hosted group for a convergence-timeout dump.
-- `split_under_mrsc` restarts its durability oracle after the split because of
-  issue #1229 (a split child whose replicas all move loses pre-split rows,
-  pre-existing). Remove those two lines when #1229 is fixed.
+- `split_under_mrsc` checks writes acked before and after the split; it found
+  issue #1229 (a split child whose replicas all move lost pre-split rows),
+  fixed by #1231.
 
 ## Real-process soak (R-01 (a), `docs/soak.md`)
 
@@ -12150,3 +12150,11 @@ a 503 `ServiceUnavailable` whose message starts `StorageFull:` and ends
 `storage_full` field. `sim_cluster_admin`'s NOT_A_METRIC list no longer holds
 `overload_storage_full`; `storage_full` stays (it is a JSON field, not a metric)
 and `spawned_task_panics` stays (still not exported).
+
+## `sim_cluster_split_relocation` (issue #1229)
+
+`sim_cluster_split_relocation.rs`: 6-node RF 3 `SimCluster`, auto-split, child moved
+wholesale off the parent's replicas by directed Placing; every pre-split key must
+read back (`ConsistentRead`). Two cells (`MemoryEngine`; `LsmEngine` + rotating
+crash/restart). `ANIMUS_SPLIT_RELOCATION_SEEDS=K`, `ANIMUS_SEED=<s>`. Nightly at 20.
+See `crates/animus-cp-data/CLAUDE.md` for the root cause.

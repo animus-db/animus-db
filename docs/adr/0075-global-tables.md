@@ -835,10 +835,10 @@ controls above are the checks for the preferred-leader step, the pin and the
 register checker.
 
 **Known limitations found while building it (not fixed here):**
-- Issue #1229 (pre-existing, reproduces on `main` with a plain table): a split
-  child whose replicas all move to other nodes loses its pre-split rows. The
-  `split_under_mrsc` cell therefore restarts its durability oracle after the
-  split and says so in the code; writes acked after the split are covered.
+- Issue #1229 (pre-existing, reproduced on `main` with a plain table): a split
+  child whose replicas all move to other nodes lost its pre-split rows. Fixed
+  separately by #1231 (ADR 0058's 2026-10-05 amendment); `split_under_mrsc`
+  covers writes acked both before and after the split.
 - Issue #1226 (pre-existing): quiescence never settles on links whose RTT
   exceeds the heartbeat interval, so stretch groups get no quiescence benefit.
 - The control quorum across Regions is only checked at admin time; a cluster
