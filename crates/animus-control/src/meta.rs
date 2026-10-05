@@ -5542,7 +5542,10 @@ impl Metadata {
     #[must_use]
     pub fn table_ready_regions(&self, table: &str) -> BTreeSet<String> {
         let mut ready: Option<BTreeSet<String>> = None;
-        for (_, tablet) in self.tablets_for_table(table).filter(|(_, t)| t.is_routable()) {
+        for (_, tablet) in self
+            .tablets_for_table(table)
+            .filter(|(_, t)| t.is_routable())
+        {
             let here: BTreeSet<String> = tablet
                 .replicas
                 .iter()

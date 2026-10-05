@@ -710,3 +710,50 @@ fault cells exercise.
 Preferred-leader placement (3.3), `ReplicaUpdates` mapping (3.5), the MRSC
 table mode and its wire surface, and any replicated stretch-cluster state:
 blocked on ADR 0073 Phase 2 P2-B/P2-C per section 8.
+
+## Amendment (2026-10-05): the MRSC wire surface as built (G-c, M3)
+
+`UpdateTable` with `ReplicaUpdates` routes to a new typed
+`Operation::UpdateTableGlobal` (a separate variant, so no existing
+`UpdateTable` literal changed). The decoder is pure and never rejects on the
+gate: `animusd` (`global_tables::update_table_global`) checks
+`Gate::GlobalTables` first and, while it is closed, returns the pre-G-c text
+byte for byte (`UpdateTable: ReplicaUpdates is not supported`; `...:
+GlobalTableWitnessUpdates is not supported` / `MultiRegionConsistency is not
+supported` for the other two keys). Then, in order: the table exists; the
+request shape (`animus_dynamo::global`); not already global; the receiving
+node carries a `REGION_LABEL` (D11) and is the table's own Region (the
+preferred-leader Region, D3); every named Region is carried by an `Active`
+member; the table is `ACTIVE`, has no TTL and no LSI; the table is empty (a
+quorum scan, D6: AWS fidelity, not safety). It proposes one
+`ConvertTableToGlobal` and waits for `schema.global` to show.
+
+Wire shapes: request `ReplicaUpdates[].Create.RegionName`,
+`MultiRegionConsistency` (`STRONG`), `GlobalTableWitnessUpdates[].Create.
+RegionName`; response `TableDescription` (and `DescribeTable`'s `Table`)
+gains, for a global table only, `GlobalTableVersion` ("2019.11.21"),
+`MultiRegionConsistency`, `Replicas[{RegionName, ReplicaStatus}]` (the local
+Region included, status derived per D4) and `GlobalTableWitnesses[{RegionName,
+WitnessStatus}]`. A regional table's output is byte-identical to before.
+Rejected by name, all `ValidationException`: absent/`EVENTUAL` consistency
+(stage G-d), a Region count other than three, a repeated or unknown Region,
+the own Region named, `Update`/`Delete` actions and per-replica overrides
+(`KMSMasterKeyId`, `ProvisionedThroughputOverride`, `OnDemandThroughputOverride`,
+`GlobalSecondaryIndexes`, `TableClassOverride`), a witness without a replica
+Create, more than one witness, a second change in the same call, a non-empty
+table, TTL or LSI present, an already-global table; on a global table
+`UpdateTimeToLive` enabling TTL, `TransactWriteItems` and `TransactGetItems`
+(hence `ExecuteTransaction`). The six legacy 2017.11.29 operations are
+rejected by name, ungated. The `limits` catalogue gained `MRSC_REQUIRED_REGIONS`,
+`MRSC_MAX_WITNESSES`, `MRSC_MIN_FULL_REPLICAS` and `GLOBAL_TABLE_VERSION`.
+
+**Unverified against AWS:** docs.aws.amazon.com was unreachable from the
+build environment, so the field names above (`ReplicaUpdates`,
+`GlobalTableWitnessUpdates`, `MultiRegionConsistency`, `GlobalTableVersion`,
+`GlobalTableWitnesses`, `ReplicaStatus`/`WitnessStatus`) come from the plan's
+earlier search extracts (section 0), and every error *text* is AnimusDB's own
+(N1). Re-read the API reference for `UpdateTable`/`ReplicationGroupUpdate`/
+`TableDescription` before G-c ships.
+
+Still open for M4: the cluster corpus, admin/CLI/dashboard visibility, the
+decommission guard (D10), the operator shape and `docs/roadmap.md`.

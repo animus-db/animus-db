@@ -22411,6 +22411,9 @@ mod sim_cluster_dynamo_eventual_read;
 mod sim_cluster_dynamo_expression_surface;
 #[cfg(test)]
 mod sim_cluster_dynamo_extended;
+/// G-01 stage G-c M3: the MRSC global-table wire surface over `SimCluster`.
+#[cfg(test)]
+mod sim_cluster_dynamo_global_table;
 #[cfg(test)]
 mod sim_cluster_dynamo_item_size_cap;
 #[cfg(test)]

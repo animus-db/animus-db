@@ -360,6 +360,36 @@ impl GlobalTableUpdate {
         if let Some(e) = &self.conflicting_change {
             return Err(WireError::validation(e.clone()));
         }
+        // `Update`/`Delete` are refused whatever the consistency says: they are
+        // never supported, so the named reason beats the EVENTUAL one.
+        for action in &self.replica_actions {
+            match action {
+                ReplicaAction::Update => {
+                    return Err(WireError::validation(
+                        "UpdateTable: ReplicaUpdates Update is not supported (no per-replica \
+                         setting can be overridden)",
+                    ));
+                }
+                ReplicaAction::Delete => {
+                    return Err(WireError::validation(
+                        "UpdateTable: ReplicaUpdates Delete is not supported: replicas cannot \
+                         be removed from a multi-Region strongly consistent table, and no other \
+                         kind of global table is supported yet",
+                    ));
+                }
+                ReplicaAction::Create { .. } => {}
+            }
+        }
+        if self
+            .witness_actions
+            .iter()
+            .any(|a| matches!(a, WitnessAction::Delete))
+        {
+            return Err(WireError::validation(
+                "UpdateTable: GlobalTableWitnessUpdates Delete is not supported: the \
+                 witness of a multi-Region strongly consistent table cannot be removed",
+            ));
+        }
         // The consistency mode is fixed at creation and a Create is required
         // for it to mean anything (V3). Absent means EVENTUAL (the AWS
         // default), which is MREC: not supported until stage G-d, rejected by
@@ -436,7 +466,7 @@ impl GlobalTableUpdate {
         // V6: exactly three Regions in total (the table's own, the Creates,
         // the witness) — three replicas, or two replicas plus one witness.
         let total = 1 + replicas.len() + witnesses.len();
-        debug_assert!(MRSC_MIN_FULL_REPLICAS + MRSC_MAX_WITNESSES == MRSC_REQUIRED_REGIONS);
+        const { assert!(MRSC_MIN_FULL_REPLICAS + MRSC_MAX_WITNESSES == MRSC_REQUIRED_REGIONS) };
         if total != MRSC_REQUIRED_REGIONS {
             return Err(WireError::validation(format!(
                 "UpdateTable: a multi-Region strongly consistent global table spans exactly \
@@ -521,7 +551,10 @@ impl GlobalTableDescription {
                     .map(|(region, status)| {
                         let mut r = Map::new();
                         r.insert("RegionName".into(), Value::String(region.clone()));
-                        r.insert("ReplicaStatus".into(), Value::String(status.as_str().into()));
+                        r.insert(
+                            "ReplicaStatus".into(),
+                            Value::String(status.as_str().into()),
+                        );
                         Value::Object(r)
                     })
                     .collect(),
@@ -530,7 +563,10 @@ impl GlobalTableDescription {
         if let Some((region, status)) = &self.witness {
             let mut w = Map::new();
             w.insert("RegionName".into(), Value::String(region.clone()));
-            w.insert("WitnessStatus".into(), Value::String(status.as_str().into()));
+            w.insert(
+                "WitnessStatus".into(),
+                Value::String(status.as_str().into()),
+            );
             desc.insert(
                 "GlobalTableWitnesses".into(),
                 Value::Array(vec![Value::Object(w)]),
@@ -546,11 +582,8 @@ mod tests {
     use serde_json::json;
 
     fn decode(body: &Value) -> Operation {
-        decode_request(
-            "DynamoDB_20120810.UpdateTable",
-            body.to_string().as_bytes(),
-        )
-        .expect("decodes")
+        decode_request("DynamoDB_20120810.UpdateTable", body.to_string().as_bytes())
+            .expect("decodes")
     }
 
     fn update_of(body: &Value) -> GlobalTableUpdate {
@@ -616,12 +649,20 @@ mod tests {
                    "MultiRegionConsistency":"EVENTUAL"}),
         ] {
             let msg = validate_err(&body);
-            assert!(msg.contains("EVENTUAL") && msg.contains("not supported yet"), "{msg}");
+            assert!(
+                msg.contains("EVENTUAL") && msg.contains("not supported yet"),
+                "{msg}"
+            );
             assert!(msg.contains("MultiRegionConsistency STRONG"), "{msg}");
         }
-        let msg = validate_err(&json!({"TableName":"tbl","ReplicaUpdates":[create("b"),create("c")],
-                                       "MultiRegionConsistency":"WHATEVER"}));
-        assert!(msg.contains("unsupported MultiRegionConsistency `WHATEVER`"), "{msg}");
+        let msg = validate_err(
+            &json!({"TableName":"tbl","ReplicaUpdates":[create("b"),create("c")],
+                                       "MultiRegionConsistency":"WHATEVER"}),
+        );
+        assert!(
+            msg.contains("unsupported MultiRegionConsistency `WHATEVER`"),
+            "{msg}"
+        );
     }
 
     #[test]
@@ -681,14 +722,23 @@ mod tests {
     fn replica_update_and_delete_and_witness_delete_are_rejected() {
         let msg = validate_err(&json!({"TableName":"tbl","MultiRegionConsistency":"STRONG",
             "ReplicaUpdates":[{"Update":{"RegionName":"b"}}]}));
-        assert!(msg.contains("ReplicaUpdates Update is not supported"), "{msg}");
+        assert!(
+            msg.contains("ReplicaUpdates Update is not supported"),
+            "{msg}"
+        );
         let msg = validate_err(&json!({"TableName":"tbl","MultiRegionConsistency":"STRONG",
             "ReplicaUpdates":[{"Delete":{"RegionName":"b"}}]}));
-        assert!(msg.contains("ReplicaUpdates Delete is not supported"), "{msg}");
+        assert!(
+            msg.contains("ReplicaUpdates Delete is not supported"),
+            "{msg}"
+        );
         let msg = validate_err(&json!({"TableName":"tbl","MultiRegionConsistency":"STRONG",
             "ReplicaUpdates":[create("b")],
             "GlobalTableWitnessUpdates":[{"Delete":{"RegionName":"c"}}]}));
-        assert!(msg.contains("GlobalTableWitnessUpdates Delete is not supported"), "{msg}");
+        assert!(
+            msg.contains("GlobalTableWitnessUpdates Delete is not supported"),
+            "{msg}"
+        );
     }
 
     #[test]
@@ -704,7 +754,12 @@ mod tests {
         ] {
             let u = update_of(&body);
             assert!(u.shape_error.is_some(), "{body}");
-            assert!(u.validate().unwrap_err().message.starts_with("UpdateTable: "));
+            assert!(
+                u.validate()
+                    .unwrap_err()
+                    .message
+                    .starts_with("UpdateTable: ")
+            );
         }
     }
 

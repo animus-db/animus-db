@@ -9247,7 +9247,12 @@ mod tests {
             None,
         );
         assert_eq!(plain, args(None, "Table"));
-        for key in ["GlobalTableVersion", "Replicas", "MultiRegionConsistency", "GlobalTableWitnesses"] {
+        for key in [
+            "GlobalTableVersion",
+            "Replicas",
+            "MultiRegionConsistency",
+            "GlobalTableWitnesses",
+        ] {
             assert!(!plain.contains(key), "{key} leaked into a non-global table");
         }
         let g = crate::global::GlobalTableDescription {
