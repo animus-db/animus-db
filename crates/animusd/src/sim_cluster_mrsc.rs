@@ -60,6 +60,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use animus_control::sim_versions::BinaryProfile;
 use animus_control::version::VersionRange;
 use animus_control::{MetaCommand, Metadata};
 use animus_env::{NodeId, nid};
@@ -303,6 +304,14 @@ impl Run {
         apply_wan(&mut c);
         let _ = c.control_leader_index();
         c.set_all_node_versions(Some(VersionRange::new(1, 2)));
+        // A restart re-applies the node's recorded profile (default `Phase1`,
+        // a binary that cannot decode the version-2 batches), so every node
+        // is also given `Release(2)` — the current binary — or a restarted
+        // node would never rejoin (harness bug found in M4, see the lessons
+        // log).
+        for n in 0..NODES {
+            c.set_binary_profile(n, BinaryProfile::Release(2));
+        }
         let mut run = Run {
             c,
             seed,
