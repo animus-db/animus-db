@@ -817,3 +817,13 @@ wire maps it to a 503, and retry loops stop on `is_storage_full_refusal`
 instead of spinning to a timeout. `ControlHandle::is_storage_full()` reports the
 local control WAL (always `false` for `Remote`, which has no local WAL). Unit
 tests in `decide::tests`.
+
+## `AdminHost` global-table methods (G-01 G-c M4, 2026-10-05)
+
+`AdminHost` gained `global_tables_view` (`GET /admin/global-tables`) and
+`action_set_preferred_leader` (`POST /admin/table/preferred-leader`); both
+`animusd` impls (`ClientCtx`, `GenericAdminHost`) implement them and the
+`FakeHost` in `admin.rs`'s tests stubs them (`global_table_routes_dispatch_to_the_host`).
+No new relayed command or wire shape: the action proposes the existing
+`SetGlobalPreferredLeader` (M1/M2, `Gate::GlobalTables`).
+

@@ -870,3 +870,23 @@ version one step. Finalize is **local-control-leader-only and not relayed**
 target above this binary's max, or any blocker, named; `504` if the new
 version was not observed within the commit timeout). `animus cluster
 version|finalize` consume them. See ADR 0073's P2-C implementation notes.
+
+### As-built (2026-10-05, ADR 0075 G-c) — the global-table routes
+
+Two routes join the table. `GET /admin/global-tables` is a pure observer:
+per MRSC global table its Regions, witness, preferred-leader Region, derived
+replica status, per-tablet replicas by Region, and the node-local known leader
+with a `leader_off_preferred` flag (`null` for a tablet this node does not
+host), plus Active members per Region and `warnings` (a pinned Region with no
+Active member; a control quorum a single Region's loss would break).
+`POST /admin/table/preferred-leader {table, region}` re-points the preferred
+Region: relayed like a schema proposal (any node), refused by name with `409`
+while `Gate::GlobalTables` is closed, `404` for a non-global table, `400` for
+a Region that is not one of the table's or is its witness, `200` (`changed:
+false`) when already preferred, `504` if the change was not observed within
+the commit timeout. `POST /admin/drain` gains an optional `force` (the
+decommission guard of ADR 0075 D10: without it the last Active member of a
+Region a global table pins is refused with a `409` naming the Region and
+table). `animus table preferred-leader`, `animus admin global-tables` and
+`animus admin drain --force` consume them; the dashboard Placement tab reads
+`schemas.tables[t].global` from `/admin/status`.
