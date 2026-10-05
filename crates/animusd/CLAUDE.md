@@ -12175,3 +12175,13 @@ needed to close the residual mirror-lag window). Never reintroduce
 `let _ = ctx.register_node(..)`. Regression: `sim_cluster_register_retry.rs`
 (partition a follower from the control quorum for 25 s > `SCHEMA_COMMIT_TIMEOUT`;
 `ANIMUS_SEED=<seed>` replays). Lesson: `docs/lessons/code-patterns/2026-10-05-a-fire-and-forget-let-underscore-turns-a-bounded-timeout-into-a-permanent-silent-failure.md`.
+
+## `SimWorld` (multi-cluster sim, G-01 stage G-d M0)
+
+`src/sim_world.rs` (+ `sim_world_tests.rs`, `cargo test -p animusd --lib
+sim_world`, `ANIMUS_SIMWORLD_SEEDS=K`): N independent `SimCluster`s, each its own
+`Simulator`, advanced in lockstep by `SimWorld::run_for`, plus `PeerBridge`
+(per-link latency/jitter/loss/duplicate, partition/heal incl. one-way) behind the
+`PeerClient` trait seam. Drive it only through `SimWorld` methods (`dynamo`,
+`peer_call`, `drive`, `run_for`), never a member cluster's own `run_for`/`dynamo`.
+See `docs/lessons/testing/2026-10-05-multi-cluster-sim-is-two-simulators-in-lockstep.md`.

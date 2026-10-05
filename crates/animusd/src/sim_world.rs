@@ -525,10 +525,10 @@ impl SimWorld {
         self.pump();
         while self.now.0 < target {
             let mut step = (self.now.0 + dur_nanos(self.quantum)).min(target);
-            if let Some(due) = self.bridge.next_due() {
-                if due > self.now.0 {
-                    step = step.min(due);
-                }
+            if let Some(due) = self.bridge.next_due()
+                && due > self.now.0
+            {
+                step = step.min(due);
             }
             self.advance_all(Nanos(step));
             self.now = Nanos(step);
