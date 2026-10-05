@@ -411,7 +411,7 @@ fn run_script(seed: u64, mode: Mode, script: Script) -> Report {
         w.run(Duration::from_secs(10), true);
         w.leader_samples.clear();
         w.run(Duration::from_secs(15), true);
-        let witness_led_steady = w.leader_samples.iter().any(|s| *s == Some(2));
+        let witness_led_steady = w.leader_samples.contains(&Some(2));
         let declines = w
             .handle(2)
             .is_some_and(|h| h.is_witness() && !h.stale_read_ready());
