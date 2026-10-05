@@ -112,10 +112,12 @@ async fn the_era_starts_over_real_sockets_and_the_admin_surface_works() {
                             n.len() == 3 && n.iter().all(|x| x["reported"] == true)
                         })
                     {
-                        // Every member's range is [1,3], so nothing blocks
-                        // target 2 and it is the safe target.
+                        // Every member's range is [1,3], so nothing blocks the
+                        // next step (target 2) and the safe target (the highest
+                        // version every member supports) is the binary's max.
                         assert_eq!(v["can_finalize"], true, "{v}");
-                        assert_eq!(v["safe_target"], 2, "{v}");
+                        assert_eq!(v["target"], 2, "{v}");
+                        assert_eq!(v["safe_target"], 3, "{v}");
                         assert!(v["blockers"].as_array().unwrap().is_empty(), "{v}");
                         return;
                     }
