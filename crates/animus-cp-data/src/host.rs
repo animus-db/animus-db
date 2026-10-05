@@ -40,6 +40,7 @@ use animus_storage::{MemoryEngine, StorageEngine, WriteBatch};
 use animus_tablet::{Epoch, KeyRange, SplitChild, Tablet, TabletId};
 
 use animus_control::SharedWal;
+use animus_control::timing::{self, DEFAULT_MAX_REGION_RTT, TimingProfile};
 use animus_control::version::ClusterFeatures;
 
 use crate::heartbeat_batch::{DEFAULT_HEARTBEAT_BATCH_INTERVAL, HeartbeatBatcher};
@@ -298,6 +299,14 @@ pub struct MetadataView {
     /// executing `reconfigure_step` can tell a failure repair from a healthy
     /// rebalance move (ADR 0029).
     pub down: BTreeSet<NodeId>,
+    /// Member id -> that member's `topology.kubernetes.io/region` label value
+    /// (`animus_control::timing::REGION_LABEL`), for the members that carry one
+    /// (build with [`animus_control::timing::region_map`]). Drives the per-group
+    /// Raft timing profile (ADR 0075 section 3.4): a hosted tablet whose
+    /// replicas span more than one distinct region runs the WAN profile.
+    /// Empty (the `Default`) means "no region labels anywhere" and every group
+    /// keeps the LAN timing — exactly the behaviour before this field existed.
+    pub regions: BTreeMap<NodeId, String>,
 }
 
 /// Per-tablet facts the caller gathers from live, impure state (a registered
@@ -1155,6 +1164,13 @@ pub struct Reconciler<E: Env, S: StorageEngine> {
     /// keeps it from being re-`Host`ed for exactly this reason (see
     /// `plan`'s own doc).
     stopping: BTreeMap<TabletId, StoppingNode<E, S>>,
+    /// ADR 0075 section 3.4: the configured upper bound on the round trip
+    /// between any two regions — input to a WAN group's timing profile. See
+    /// [`set_max_region_rtt`](Self::set_max_region_rtt).
+    max_region_rtt: Duration,
+    /// The latest tick's [`MetadataView::regions`], kept so a group hosted or
+    /// materialized mid-tick starts on the right timing profile.
+    regions: BTreeMap<NodeId, String>,
 }
 
 /// One tablet parked mid-teardown — see [`Reconciler::stopping`]'s doc.
@@ -1227,7 +1243,25 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
             features: ClusterFeatures::new(),
             local_engines_checked: false,
             stopping: BTreeMap::new(),
+            max_region_rtt: DEFAULT_MAX_REGION_RTT,
+            regions: BTreeMap::new(),
         }
+    }
+
+    /// Set the cluster's `max_region_rtt` (ADR 0075 section 3.4;
+    /// `animusd`'s `max_region_rtt_ms` config) — the input to a stretch
+    /// group's WAN timing profile. Defaults to
+    /// [`DEFAULT_MAX_REGION_RTT`] (150 ms). Only matters for a group whose
+    /// replicas span more than one region label; an unlabelled cluster never
+    /// leaves the LAN profile regardless of this value.
+    pub fn set_max_region_rtt(&mut self, rtt: Duration) {
+        self.max_region_rtt = rtt;
+    }
+
+    /// The timing profile for a group whose replica set (voters + learners) is
+    /// `replicas`, under the regions of the latest tick.
+    fn timing_profile_for(&self, replicas: &[NodeId]) -> TimingProfile {
+        timing::profile_for_replicas(replicas.iter(), &self.regions, self.max_region_rtt)
     }
 
     /// [`EngineFactory::flush_engine`], logging (never propagating) a failure
@@ -1525,6 +1559,14 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         // (see `sweep_stopping`'s own doc).
         self.sweep_stopping().await;
 
+        // ADR 0075 section 3.4: remember this tick's region map so every group
+        // hosted below (and the per-tick re-apply at the end) agrees on it.
+        // Only cloned when it actually changed (it is empty on every
+        // unlabelled cluster).
+        if self.regions != view.regions {
+            self.regions = view.regions.clone();
+        }
+
         // ADR 0044 phase-1 PR4, fork H: proactively wake any hosted group
         // whose replica set intersects the failure detector's `down` set —
         // the TiKV-hibernate-regions lesson (a quiesced leader that dies
@@ -1620,6 +1662,17 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         // parked here; the next tick that actually hosts it just re-opens.
         let hosted: BTreeSet<TabletId> = self.hosted.keys().copied().collect();
         self.engines.retain(|t, _| hosted.contains(t));
+
+        // ADR 0075 section 3.4: (re-)apply the per-group timing profile to every
+        // hosted group the view knows — a reconfigure that makes a group span a
+        // second region (or leave one) flips its profile. Idempotent and free
+        // when nothing changed (`RaftKvNode::set_timing_profile` compares first,
+        // no RNG draw), and a no-op for every group on an unlabelled cluster.
+        for (tablet, node) in &self.hosted {
+            if let Some(t) = view.tablets.get(tablet) {
+                node.set_timing_profile(self.timing_profile_for(&t.replicas));
+            }
+        }
     }
 
     /// Gather the [`TabletFacts`] [`plan`] needs: every currently-hosted
@@ -1797,6 +1850,9 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         if let Some(after) = self.quiesce_after {
             node.enable_quiescence(after);
         }
+        // ADR 0075 section 3.4: start the group on its region-derived timing
+        // profile (`t.replicas` is the full voter+learner target set).
+        node.set_timing_profile(self.timing_profile_for(&t.replicas));
         (self.on_host)(tablet, &node);
         self.hosted.insert(tablet, node);
     }
@@ -2089,6 +2145,7 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         self.engines.insert(child.id, engine.clone());
         let scope = StorageScope::new(range);
         let voters: Vec<NodeId> = bootstrap_voters.into_iter().collect();
+        let profile = self.timing_profile_for(&voters);
         // ADR 0058 Train 2 rung 4: the parent-leader-at-fork replica
         // campaigns for this child's leadership immediately instead of
         // waiting out a cold randomized election timeout — see
@@ -2127,6 +2184,10 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         if let Some(after) = self.quiesce_after {
             node.enable_quiescence(after);
         }
+        // ADR 0075 section 3.4: a fork child inherits the parent's replicas
+        // (`bootstrap_voters`), so it starts on the same profile; the per-tick
+        // re-apply corrects it once the child's own row exists.
+        node.set_timing_profile(profile);
         (self.on_host)(child.id, &node);
         self.hosted.insert(child.id, node);
     }

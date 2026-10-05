@@ -1119,6 +1119,51 @@ impl<E: Env> RaftNode<E> {
         self.lock().election_timeout()
     }
 
+    /// Install `profile`'s `(election_base, heartbeat_interval)` on this
+    /// node's control group (ADR 0075 section 3.4) — see
+    /// [`RaftCore::set_timing`]. Idempotent; returns whether the timing
+    /// changed. The caller derives the profile from the control voter set's
+    /// region labels ([`crate::timing::profile_for_replicas`]).
+    ///
+    /// The control driver loop re-reads `next_deadline` every iteration and
+    /// the heartbeat/inbound traffic wakes it at least every old heartbeat
+    /// period, so a shortened timing takes effect within one old period.
+    pub fn set_timing_profile(&self, profile: crate::timing::TimingProfile) -> bool {
+        let want = profile.durations();
+        // No entropy draw on the (overwhelmingly common) no-change path: an
+        // idle reconciler must not shift the seeded RNG stream.
+        if self.lock().timing() == want {
+            return false;
+        }
+        let now = self.env.now();
+        let entropy = self.env.next_u64();
+        self.lock().set_timing(want.0, want.1, now, entropy)
+    }
+
+    /// Opt this node's **control group** into region-derived timing (ADR 0075
+    /// section 3.4): spawns [`region_timing_loop`], which re-derives the
+    /// group's [`TimingProfile`](crate::timing::TimingProfile) from its own
+    /// voter+learner set and the replicated member labels whenever `Metadata`
+    /// changes (and every [`REGION_TIMING_FALLBACK`]), and installs it with
+    /// [`set_timing_profile`](Self::set_timing_profile). A group whose
+    /// voters/learners carry more than one distinct
+    /// `topology.kubernetes.io/region` label value runs the WAN pair, else LAN
+    /// (the unlabelled default is therefore unchanged).
+    ///
+    /// **Opt-in and spawned last** (`animusd` calls it once after
+    /// [`start`](Self::start)): nothing in `start*` changed, so no existing
+    /// task ordering or seeded timeline moves. Call at most once per node.
+    ///
+    /// Known gap: a control-only voter has no `Member` row (`RegisterNode`
+    /// never claims `members` for `role == "control"`), so its region is not in
+    /// `Metadata` and does not count; only combined-role voters contribute.
+    /// A config-borne label source (G-a's `RoleAddrs.labels`) closes this once
+    /// that stage lands.
+    pub fn enable_region_timing(&self, max_region_rtt: Duration) {
+        self.env
+            .spawn_task(region_timing_loop(self.clone(), max_region_rtt));
+    }
+
     /// Issue #667: whether this node is still resolving the boot-time
     /// "genesis bootstrap or wiped-voter restart?" check — `true` means it
     /// currently grants no votes and starts no elections. See
@@ -3323,6 +3368,46 @@ fn transition(node: NodeId, member: &Member, status: NodeStatus) -> MetaCommand 
         node,
         labels: member.labels.clone(),
         status,
+    }
+}
+
+/// How often [`region_timing_loop`] re-derives its profile when no `Metadata`
+/// change woke it — a voter-set change is a log config entry that also bumps
+/// the applied index, so this is only a belt for a missed wake.
+const REGION_TIMING_FALLBACK: Duration = Duration::from_secs(5);
+
+/// The control group's timing-profile loop (ADR 0075 section 3.4) — see
+/// [`RaftNode::enable_region_timing`]. Pure derivation (a function of the
+/// group's voter+learner set and the replicated member labels) plus the
+/// idempotent [`RaftNode::set_timing_profile`], so it draws no RNG and
+/// touches no deadline unless the profile actually changes.
+async fn region_timing_loop<E: Env>(node: RaftNode<E>, max_region_rtt: Duration) {
+    let watch = node.metadata_watch();
+    let mut last_seen = watch.latest();
+    loop {
+        let regions = crate::timing::region_map(
+            node.members()
+                .iter()
+                .map(|(id, m)| (id, &m.labels))
+                .collect::<Vec<_>>(),
+        );
+        if !regions.is_empty() {
+            let mut replicas = node.config();
+            replicas.extend(node.learners());
+            let profile =
+                crate::timing::profile_for_replicas(replicas.iter(), &regions, max_region_rtt);
+            node.set_timing_profile(profile);
+        } else {
+            // No region labels anywhere: LAN. (A cluster that LOSES all labels
+            // returns to LAN too; a never-labelled one is a no-op compare.)
+            node.set_timing_profile(crate::timing::TimingProfile::Lan);
+        }
+        let _ = select(
+            Box::pin(watch.changed(last_seen)),
+            Box::pin(node.env().sleep(REGION_TIMING_FALLBACK)),
+        )
+        .await;
+        last_seen = watch.latest();
     }
 }
 

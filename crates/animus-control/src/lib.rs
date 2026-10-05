@@ -50,6 +50,7 @@ pub mod shared_wal;
 #[cfg(any(test, feature = "sim-versions"))]
 pub mod sim_versions;
 pub mod syskv;
+pub mod timing;
 pub mod version;
 pub mod version_observe;
 

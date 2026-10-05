@@ -402,9 +402,13 @@ fn spawn_reconciler_loop(ctx: SimNodeCtx, mut reconciler: SimReconciler) {
                 .filter(|(_, m)| m.status == NodeStatus::Down)
                 .map(|(id, _)| id.clone())
                 .collect();
+            let regions = animus_control::timing::region_map(
+                meta.members.iter().map(|(id, m)| (id, &m.labels)),
+            );
             let view = MetadataView {
                 tablets: meta.tablets,
                 down,
+                regions,
             };
             reconciler.tick(&view).await;
         }

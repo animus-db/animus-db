@@ -1953,6 +1953,17 @@ outstanding on the wire surface at present.
     (control plane included: quorum placement across at least 3 regions);
     this is "stretch cluster", not federation. Measured cost goes into
     `animus-bench`'s results (ADR 0076; cross-region topology variant).
+    **Groundwork landed (branch `g01-c-wan-groundwork`, ADR 0075's
+    2026-10-04 amendment):** the per-group WAN Raft timing profile
+    (`animus_control::timing`, `RaftCore::set_timing`, wired into the cp-data
+    reconciler and the control group, `max_region_rtt_ms` /
+    `--max-region-rtt-ms`), the region-aware control-voter admin check, and the
+    `ANIMUS_WAN_TIMING_SEEDS` corpus with a LAN-forced negative control. It is
+    node-local and derived from existing `Member.labels`: no replicated field,
+    command or format change. **Still gated on P2-B/P2-C:** preferred-leader
+    placement, `ReplicaUpdates` mapping, the MRSC table mode and wire surface;
+    **still open independent of the gate:** control-only voters' labels (need
+    G-a's config-borne labels) and the `gen-config` warning.
   - **G-d MREC async replication with LWW (XL).** The agent in item 5
     above, plus replicated-TTL, stream parity and a multi-cluster
     `SimCluster` WAN corpus (seeded partitions, duplicate/reordered

@@ -2329,6 +2329,7 @@ fn metadata_view(meta: &Metadata) -> MetadataView {
     MetadataView {
         tablets: meta.tablets.clone(),
         down: BTreeSet::new(),
+        ..Default::default()
     }
 }
 

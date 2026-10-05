@@ -13,8 +13,11 @@
   dropped), 0055 (`ConsistentRead: false`), 0059 (backup/PITR change-log
   consumer), 0060 (operator), 0064 (TLS), 0072 (limits), 0073 (upgrade
   compatibility, Phase 2 design).
-- **Implementation status:** none. Nothing in this ADR is built. G-c, G-d and
-  G-e are **blocked on ADR 0073 Phase 2 P2-B and P2-C** (see section 8).
+- **Implementation status:** only the ungated G-c groundwork (the per-group WAN
+  timing profile of 3.4 and the region-aware control-voter check) is built; see
+  the 2026-10-04 amendment at the end. Nothing else in this ADR is built. G-c,
+  G-d and G-e proper are **blocked on ADR 0073 Phase 2 P2-B and P2-C** (see
+  section 8).
 
 ## 0. Verification note (read first)
 
@@ -605,3 +608,105 @@ interim is **not** permitted.
   and backup catalogs needs a follow-up section when G-d starts.
 - Q8: How MRSC and PITR/backup interact (a backup of a stretch table is taken
   from the leader region; the restore target must be non-global).
+
+## Amendment (2026-10-04): section 3.4 and the control-voter check as built (G-c groundwork)
+
+Branch `g01-c-wan-groundwork`. This is the **ungated** groundwork of stage G-c:
+everything here is node-local behaviour derived from the existing
+`Member.labels`, plus additive config. Per section 8 it adds **no replicated
+`Metadata` field, no `MetaCommand`/`KvCommand` variant and no wire or durable
+format change**, so it needs no cluster-version gate and is not blocked on
+P2-B/P2-C. What stays gated is listed at the end.
+
+### Timing profile (section 3.4)
+
+- **Formula** (`animus_control::timing::TimingProfile::durations`, pure,
+  saturating): `Lan = (150 ms election base, 50 ms heartbeat)` (the historical
+  constants); `Wan{max_region_rtt} = (election, heartbeat)` with
+  `election = max(150 ms, 5 x max_region_rtt)` and
+  `heartbeat = max(50 ms, election / 10)`. At the 150 ms default this is
+  750 ms / 75 ms. The design text above says ">= 10x one-way RTT"; `5 x` the
+  *round trip* is the same quantity (one RTT is two one-way trips) with the
+  randomised `[base, 2 x base)` window supplying the rest of the margin.
+- **A group is WAN iff its replicas (voters and learners) carry more than one
+  distinct `topology.kubernetes.io/region` label value** (`REGION_LABEL`,
+  defined locally with a note that it must equal G-a's constant). An
+  unlabelled or single-region cluster is always LAN: **no behaviour change**.
+- **Setter:** `RaftCore::set_timing(election_base, heartbeat_interval, now,
+  entropy)` (the deleted `set_election_timeout` of issue #313 came back only
+  with a caller). It refuses zero, is a no-op when unchanged, and on a change
+  re-arms a follower's election deadline from the new base or pulls a leader's
+  heartbeat deadline in (never pushes one out). `RaftNode::set_timing_profile`
+  / `RaftKvNode::set_timing_profile` compare first, so the idempotent
+  no-change path **draws no entropy** (extra RNG draws desync fixed seeds), and
+  `RaftKvNode` wakes its driver on a real change so `next_deadline` is
+  re-read.
+- **Wiring:** the cp-data tablet-host reconciler (`host::Reconciler`) derives
+  the profile from `MetadataView::regions` (the member id -> region projection
+  `animusd` builds from `Metadata.members`) for every hosted tablet, on `host`,
+  on `materialize_split_child`, and re-applies it every tick (a label or
+  replica-set change converges). The control group runs an opt-in spawned
+  loop, `RaftNode::enable_region_timing`, woken by `metadata_watch` with a 5 s
+  fallback. Nothing in `RaftNode::start*` changed, so no existing seeded
+  timeline moved.
+- **Derived deadlines** all read the installed pair: `transfer_leadership`'s
+  one-election-timeout budget, the next cluster-check resend, the
+  departing-peer backoff gap, snapshot-resend backoff (heartbeat ticks),
+  `election_timeout()` and so animusd's `3 x election_timeout()` health grace.
+  The **ADR 0044 heartbeat batcher** cadence is unchanged: its 50 ms tick is
+  `<=` every profile's heartbeat, so batching adds at most one 50 ms tick to a
+  heartbeat's latency, which is small against the WAN election base (at the
+  default, 75 ms + 50 ms against 750 ms).
+- **Config:** additive `cluster_settings.max_region_rtt_ms` (default 150,
+  `skip_serializing_if` unset, so the frozen cluster-config v1 fixture is
+  untouched) and `--max-region-rtt-ms` (needs `--config`). Plumbed via
+  `Bound*Node::with_max_region_rtt`.
+
+### Region-aware control-voter check (sections 3.1/3.4)
+
+`animus_control::timing::control_voter_change_check` runs in
+`admin_add_control_member` (before any registration side effect, over the
+candidate's supplied labels) and `admin_remove_control_member` (`--force`
+bypasses it, like the liveness guard). It refuses a voter set that puts a
+strict majority of control voters in one region **when the cluster's members
+carry labels from more than one region** and the change does not strictly
+reduce that region's share relative to the current voters. The second clause
+is deliberate: a one-region bootstrap must stay growable voter by voter, so a
+step that dilutes an existing concentration is allowed; one that adds to it is
+refused.
+
+**Known gaps, stated plainly:**
+
+- Control-only nodes have no `Member` row (`RegisterNode` with role `control`
+  never claims `members`), so their labels are not in `Metadata`. Only
+  combined-role voters contribute to the control profile and to this check;
+  control-only voters count as unlabelled (they dilute, never create, a
+  majority). A config-borne label source (G-a's `RoleAddrs.labels`) closes
+  this when G-a lands.
+- `animusd gen-config` cannot warn about a region-concentrated control set,
+  because it cannot know labels yet (they arrive with G-a). The warning is
+  added with G-a.
+- `ControlHandle::Remote::election_timeout` still reports the hard-coded
+  150 ms (a data-only node has no local control `RaftCore`); only the health
+  grace reads it, and a too-tight grace is a spurious "no leader" report, not
+  a safety issue.
+
+### Evidence
+
+`wan_timing_corpus` (`ANIMUS_WAN_TIMING_SEEDS`): three regions, 60/75/90 ms
+one-way, a noisy tail. Under the WAN profile steady state shows zero term
+growth and the leader-node kill and leader-region partition+heal cells grow
+the term by 1 (at most 2 over 100 seeds) with writes committing and every
+acked write durable on all replicas. The LAN-forced negative control on the
+same links shows term growth up to 30 and writes stalling on the fault cells.
+**Measured finding worth keeping:** with only a few ms of jitter the LAN
+profile survives 60-90 ms links too (pre-vote and its lease absorb late
+heartbeats, and pipelined heartbeats keep arriving every 50 ms), so the
+profile's value is in *re-election over a noisy WAN*, which is what the
+fault cells exercise.
+
+### Still gated (not done here)
+
+Preferred-leader placement (3.3), `ReplicaUpdates` mapping (3.5), the MRSC
+table mode and its wire surface, and any replicated stretch-cluster state:
+blocked on ADR 0073 Phase 2 P2-B/P2-C per section 8.

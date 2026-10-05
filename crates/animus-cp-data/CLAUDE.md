@@ -3121,6 +3121,23 @@ own internal mutex (in `animus-control`) is only taken inside `append_tagged`/
 `engine_applied_index`, never core `last_applied`). ADR 0017's and ADR 0038's
 2026-09-30 amendments.
 
+## Per-group WAN timing in the host reconciler (ADR 0075 section 3.4)
+
+`MetadataView::regions` (member id -> region label, empty by default: no
+behaviour change) and `Reconciler::set_max_region_rtt` feed
+`Reconciler::timing_profile_for(replicas)`; the profile is applied on `host`,
+on `materialize_split_child` and re-applied every `tick` to each hosted tablet
+(a label or replica-set change converges; the no-change path draws no
+entropy). `RaftKvNode::set_timing_profile` wakes the driver on a real change;
+`RaftKvNode::election_timeout()` reads the installed base. **The ADR 0044
+heartbeat batcher is unchanged**: its 50 ms tick (`DEFAULT_HEARTBEAT_BATCH_
+INTERVAL`) is `<=` every profile's heartbeat. Every `MetadataView { .. }`
+literal now needs `..Default::default()` (or a `regions` field). Corpus:
+`tests/it/wan_timing_corpus.rs`, `ANIMUS_WAN_TIMING_SEEDS` (see the lesson
+`docs/lessons/testing/2026-10-04-measure-where-the-old-setting-fails-before-
+building-its-negative-control.md`: the LAN-forced control only bites on the
+re-election cells).
+
 ## Fuzzing (roadmap R-01 (c))
 
 The RaftKV codec (wire/image/WAL), segment codec, backup chunk/manifest codecs, layout marker, cursors and engine marker values are the `cp_data_formats` fuzz target; the `pub(crate)` ones are reached through the off-by-default `fuzzing` feature (`src/fuzzing.rs`). See `fuzz/README.md` (stable smoke: `cd fuzz && cargo test --release --test smoke`).

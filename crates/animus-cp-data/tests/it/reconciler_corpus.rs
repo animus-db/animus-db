@@ -131,6 +131,7 @@ fn view_with_down(
     MetadataView {
         tablets: tablets.into_iter().map(|t| (t.id, t)).collect(),
         down: down.into_iter().collect(),
+        ..Default::default()
     }
 }
 
