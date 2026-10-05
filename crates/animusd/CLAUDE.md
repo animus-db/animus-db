@@ -12158,3 +12158,16 @@ wholesale off the parent's replicas by directed Placing; every pre-split key mus
 read back (`ConsistentRead`). Two cells (`MemoryEngine`; `LsmEngine` + rotating
 crash/restart). `ANIMUS_SPLIT_RELOCATION_SEEDS=K`, `ANIMUS_SEED=<s>`. Nightly at 20.
 See `crates/animus-cp-data/CLAUDE.md` for the root cause.
+
+## Startup self-registration is retried (issue #1230)
+
+`spawn_common_tail`'s `RegisterNode` and the growth/data-only `admin_add_member`
+claims run `ClientCtx::register_node_until_settled` /
+`admin_add_member_until_settled` (`schema.rs`): bounded-backoff retry via
+`env.sleep`, a log line per failure, stops on `Registered`/`Collision` or on
+first sight of the node's own entry in its local view (so a retry can never
+resurrect a node `RemoveMember` just removed; a replicated tombstone would be
+needed to close the residual mirror-lag window). Never reintroduce
+`let _ = ctx.register_node(..)`. Regression: `sim_cluster_register_retry.rs`
+(partition a follower from the control quorum for 25 s > `SCHEMA_COMMIT_TIMEOUT`;
+`ANIMUS_SEED=<seed>` replays). Lesson: `docs/lessons/code-patterns/2026-10-05-a-fire-and-forget-let-underscore-turns-a-bounded-timeout-into-a-permanent-silent-failure.md`.
