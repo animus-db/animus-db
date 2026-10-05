@@ -1,0 +1,2 @@
+UpdateTable
+{"TableName": "tbl", "MultiRegionConsistency": "STRONG", "ReplicaUpdates": [{"Create": {"RegionName": "b"}}, {"Create": {"RegionName": "c", "KMSMasterKeyId": "k"}}], "GlobalTableWitnessUpdates": [{"Create": {"RegionName": "d"}}]}

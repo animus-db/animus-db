@@ -26,7 +26,7 @@ use animus_env::handshake::encode_ext;
 use animus_env::{Nanos, NodeId};
 
 use crate::raft::RaftMsg;
-use crate::version::{ClusterVersion, Gate, VersionRange, own_range};
+use crate::version::{ClusterVersion, Gate, VersionRange};
 
 /// Which release a simulated node is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,7 +34,8 @@ pub enum BinaryProfile {
     /// Today's (pre-Phase-2) binary: empty `ext`, no own range, decodes only
     /// today's variants.
     Phase1,
-    /// The Phase 2 release: range `[1, 1]` ([`own_range`]).
+    /// The Phase 2 release: range `[1, 1]` (a literal, see `own_range`'s
+    /// pin below: it must not track `MAX_SUPPORTED`).
     B2,
     /// A later release `N`: range `[max(N-1, 1), N]`, knows every gate up to
     /// version `N`.
@@ -47,7 +48,12 @@ impl BinaryProfile {
     pub fn own_range(self) -> Option<VersionRange> {
         match self {
             BinaryProfile::Phase1 => None,
-            BinaryProfile::B2 => Some(own_range()),
+            // Pinned to a literal, NOT `own_range()`: `own_range()` tracks
+            // `MAX_SUPPORTED`, so the first real bump (G-01 G-c, version 2)
+            // would silently turn the B2 profile into a `[1, 2]` binary and
+            // the mixed-version corpus would stop testing a B2 node at all.
+            // B2 is the Phase 2 release as it shipped: `[1, 1]`.
+            BinaryProfile::B2 => Some(VersionRange::new(1, 1)),
             BinaryProfile::Release(n) => Some(VersionRange::new(n.saturating_sub(1).max(1), n)),
         }
     }
@@ -215,6 +221,23 @@ mod tests {
         );
     }
 
+    /// B2 is pinned to the literal `[1, 1]`, not `own_range()`: the real
+    /// `MAX_SUPPORTED` is 2 now, and a B2 that silently became `[1, 2]` would
+    /// stop modelling the Phase 2 release the mixed-version corpus rolls from.
+    #[test]
+    fn b2_is_pinned_to_one_one_and_release_two_is_the_current_binary() {
+        assert_eq!(BinaryProfile::B2.own_range(), Some(VersionRange::new(1, 1)));
+        assert_eq!(
+            BinaryProfile::Release(crate::version::MAX_SUPPORTED).own_range(),
+            Some(crate::version::own_range()),
+            "Release(MAX_SUPPORTED) is what the real binary advertises"
+        );
+        assert_ne!(
+            BinaryProfile::B2.own_range(),
+            Some(crate::version::own_range())
+        );
+    }
+
     #[test]
     fn era_gate_accepted_by_all_but_phase1() {
         assert!(BinaryProfile::Phase1.accepts(Gate::Base));
@@ -241,6 +264,7 @@ mod tests {
             let want = match g {
                 Gate::Base => [true, true, true, true],
                 Gate::Era => [false, true, true, true],
+                Gate::GlobalTables => [false, false, true, true],
                 Gate::Synthetic(2) => [false, false, true, true],
                 Gate::Synthetic(3) => [false, false, false, true],
                 Gate::Synthetic(_) => unreachable!(),

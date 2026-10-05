@@ -317,7 +317,7 @@ fn run_phase1_profile(seed: u64, variant: u64) {
     if variant == 0 {
         // Everyone gets a B2 profile.
         for n in w.nodes.values() {
-            n.set_own_version_range(Some(animus_control::version::own_range()));
+            n.set_own_version_range(Some(animus_control::version::VersionRange::new(1, 1)));
             n.set_own_build("b2");
         }
     } else {
@@ -325,7 +325,7 @@ fn run_phase1_profile(seed: u64, variant: u64) {
         // never proposes ...
         for (&i, n) in &w.nodes {
             if i != l {
-                n.set_own_version_range(Some(animus_control::version::own_range()));
+                n.set_own_version_range(Some(animus_control::version::VersionRange::new(1, 1)));
                 n.set_own_build("b2");
             }
         }
@@ -345,7 +345,7 @@ fn run_phase1_profile(seed: u64, variant: u64) {
             &|w| w.leader().is_some_and(|x| x != l),
         );
         w.sim.restart(nid(l));
-        w.nodes[&l].set_own_version_range(Some(animus_control::version::own_range()));
+        w.nodes[&l].set_own_version_range(Some(animus_control::version::VersionRange::new(1, 1)));
         w.nodes[&l].set_own_build("b2");
     }
     let ids = all_ids();

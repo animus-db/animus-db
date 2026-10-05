@@ -102,6 +102,8 @@ mod dynamo;
 mod dynamo_streams;
 #[deny(clippy::disallowed_methods)]
 mod forwarding;
+#[deny(clippy::disallowed_methods)]
+mod global_tables;
 mod http;
 mod import;
 #[deny(clippy::disallowed_methods)]
@@ -568,6 +570,15 @@ enum CpGroup<E: Env = ProdEnv> {
 }
 
 impl<E: Env> CpGroup<E> {
+    /// Test-only: `role@term` for a corpus's convergence-timeout dump.
+    #[cfg(test)]
+    fn role_term(&self) -> String {
+        match self {
+            CpGroup::Lsm(n) => format!("{:?}@{}", n.role(), n.term()),
+            CpGroup::Mem(n) => format!("{:?}@{}", n.role(), n.term()),
+        }
+    }
+
     /// The group's feature-gate handle (ADR 0073 Phase 2): the node's own
     /// control-fed handle when the reconciler injected it, else a private
     /// floor handle. Test-only: nothing in production reads it back.
@@ -5487,7 +5498,7 @@ fn spawn_common_tail(
     )));
     // This node's own identity self-registration (ADR 0032 PR1; ADR 0040
     // Decision C since PR4 — the registration CAS is now the mechanism, not
-    // just an address-book update): one-shot, so peer-sync (internal
+    // just an address-book update): retried until registered (issue #1230), so peer-sync (internal
     // addresses) and any node's route/peers views (client/admin addresses)
     // can resolve it regardless of when this node joined relative to the
     // reader. Every node shape reaches this — a fresh bootstrap node whose
@@ -5506,7 +5517,18 @@ fn spawn_common_tail(
         let ctx = ctx.clone();
         let (node, addrs, labels) = self_addrs;
         tasks.push(tokio::spawn(async move {
-            let _ = ctx.register_node(node, addrs, labels).await;
+            // Retried until a terminal outcome (issue #1230): a single
+            // attempt with its error discarded left a pod that started
+            // before the control group had a leader unregistered forever.
+            if let RegisterOutcome::Collision = ctx
+                .register_node_until_settled(node.clone(), addrs, labels)
+                .await
+            {
+                eprintln!(
+                    "animusd: self-registration of {node} found a different registration \
+                     already claiming this identity; not retrying"
+                );
+            }
         }));
     }
     // The two client-protocol listeners (ADR 0047): one parameterized
@@ -6519,7 +6541,7 @@ impl BoundNode {
                 let node = my_id;
                 let labels = self.labels.clone();
                 tasks.push(tokio::spawn(async move {
-                    let _ = ctx.admin_add_member(node, labels).await;
+                    ctx.admin_add_member_until_settled(node, labels).await;
                 }));
             }
         }
@@ -8611,7 +8633,7 @@ impl BoundDataNode {
             let node = my_id;
             let labels = self.labels.clone();
             tasks.push(tokio::spawn(async move {
-                let _ = ctx.admin_add_member(node, labels).await;
+                ctx.admin_add_member_until_settled(node, labels).await;
             }));
         }
 
@@ -12067,7 +12089,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// this requires the receiving node to be the control leader; a follower
     /// returns an error and the operator retries on the leader). Preserves the
     /// member's existing labels. Returns the accepted state or an error.
-    pub(crate) fn admin_drain(&self, node: NodeId) -> Result<(), String> {
+    /// Refuses (unless `force`) to drain the last Active member of a Region a
+    /// global table pins — see [`global_tables::drain_strands_region`].
+    pub(crate) fn admin_drain(&self, node: NodeId, force: bool) -> Result<(), String> {
         // Check leadership BEFORE reading `self.control.metadata_cached()`
         // for the member lookup below (ADR 0035 PR5 staleness-audit fix,
         // mirroring `admin_remove_member`'s already-fixed ordering — same
@@ -12083,6 +12107,14 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         let Some(member) = meta.members.get(&node) else {
             return Err(format!("node {node} is not a cluster member"));
         };
+        // Decommission guard (ADR 0075 plan D10): the last Active member of a
+        // Region a global table pins cannot be drained (the strict region pin
+        // would never re-place its replica) unless forced.
+        if !force && let Some((region, table)) = global_tables::drain_strands_region(&meta, &node) {
+            return Err(global_tables::drain_strands_region_error(
+                &node, &region, &table,
+            ));
+        }
         let labels = member.labels.clone();
         match leader.propose(MetaCommand::UpsertMember {
             node,
@@ -14277,13 +14309,38 @@ async fn tablet_host_reconciler_loop(ctx: ClientCtx, mut reconciler: CpReconcile
         inplace_split_active = meta.tablets.values().any(|t| t.inplace_split.is_some());
         let regions =
             animus_control::timing::region_map(meta.members.iter().map(|(id, m)| (id, &m.labels)));
+        let preferred_leader = leader_preferences(&meta);
         let view = MetadataView {
             tablets: meta.tablets,
             down,
             regions,
+            preferred_leader,
         };
         reconciler.tick(&view).await;
     }
+}
+
+/// Every tablet of a **global (MRSC) table** -> its leader preference (ADR 0075
+/// section 3.3, 3.6), derived from `TableSchema.global` x `Tablet.table`, for
+/// the tablet-host reconciler's preferred-leader step. A table's preference
+/// follows its splits for free (a child carries the same `Tablet.table`). Empty
+/// for a cluster with no global table.
+pub(crate) fn leader_preferences(
+    meta: &animus_control::Metadata,
+) -> std::collections::BTreeMap<animus_tablet::TabletId, animus_cp_data::host::LeaderPreference> {
+    meta.tablets
+        .iter()
+        .filter_map(|(id, t)| {
+            let g = meta.schemas.get(t.table.as_deref()?)?.global.as_ref()?;
+            Some((
+                *id,
+                animus_cp_data::host::LeaderPreference {
+                    region: g.preferred_leader_region.clone(),
+                    witness: g.witness.clone(),
+                },
+            ))
+        })
+        .collect()
 }
 
 /// How often [`txn_resolver_loop`] sweeps this node's locally-led tablet
@@ -22333,6 +22390,11 @@ mod sim_cluster_upgrade_corpus;
 #[cfg(test)]
 mod sim_cluster_zone_placement;
 
+/// G-01 stage G-c, M4: the MRSC stretch-table cluster corpus
+/// (`ANIMUS_MRSC_SEEDS`) — see that module's own doc.
+#[cfg(test)]
+mod sim_cluster_mrsc;
+
 /// A first deterministic smoke over `SimClusterHandle::dynamo`/`SimCluster::
 /// dynamo` (ADR 0061 rung D2 PR 1) — the DynamoDB wire edge, decoded by
 /// `animus_dynamo::wire::decode_request` and run through `dynamo::
@@ -22388,6 +22450,9 @@ mod sim_cluster_dynamo_eventual_read;
 mod sim_cluster_dynamo_expression_surface;
 #[cfg(test)]
 mod sim_cluster_dynamo_extended;
+/// G-01 stage G-c M3: the MRSC global-table wire surface over `SimCluster`.
+#[cfg(test)]
+mod sim_cluster_dynamo_global_table;
 #[cfg(test)]
 mod sim_cluster_dynamo_item_size_cap;
 #[cfg(test)]
@@ -22952,6 +23017,13 @@ mod sim_cluster_control_only;
 /// `crates/animusd/CLAUDE.md`'s matching SimCluster-roles entry.
 #[cfg(test)]
 mod sim_cluster_data_only;
+
+/// Issue #1230: a node's self-registration must survive a control plane that
+/// is unreachable for longer than `SCHEMA_COMMIT_TIMEOUT` at start, and a
+/// still-running retry loop must never resurrect a removed node. See the
+/// module's own doc.
+#[cfg(test)]
+mod sim_cluster_register_retry;
 
 /// ADR 0061 rung L (C-12 PR 4a): the first conversion PR built on top of the
 /// PR 2/3 mechanism — `tests/control_only.rs` (3 tests), `tests/

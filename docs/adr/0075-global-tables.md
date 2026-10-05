@@ -13,11 +13,11 @@
   dropped), 0055 (`ConsistentRead: false`), 0059 (backup/PITR change-log
   consumer), 0060 (operator), 0064 (TLS), 0072 (limits), 0073 (upgrade
   compatibility, Phase 2 design).
-- **Implementation status:** only the ungated G-c groundwork (the per-group WAN
-  timing profile of 3.4 and the region-aware control-voter check) is built; see
-  the 2026-10-04 amendment at the end. Nothing else in this ADR is built. G-c,
-  G-d and G-e proper are **blocked on ADR 0073 Phase 2 P2-B and P2-C** (see
-  section 8).
+- **Implementation status:** **stage G-c (MRSC, the stretch cluster) is built**
+  behind `Gate::GlobalTables` (cluster version 2); see the 2026-10-05
+  amendments at the end ("the MRSC wire surface as built" and "G-c as built").
+  Stages G-d (MREC) and G-e (federation) are not built. ADR 0073 Phase 2
+  (P2-B/C/D) is done, so the "blocked on P2" note in section 8 is historical.
 
 ## 0. Verification note (read first)
 
@@ -710,3 +710,142 @@ fault cells exercise.
 Preferred-leader placement (3.3), `ReplicaUpdates` mapping (3.5), the MRSC
 table mode and its wire surface, and any replicated stretch-cluster state:
 blocked on ADR 0073 Phase 2 P2-B/P2-C per section 8.
+
+## Amendment (2026-10-05): the MRSC wire surface as built (G-c, M3)
+
+`UpdateTable` with `ReplicaUpdates` routes to a new typed
+`Operation::UpdateTableGlobal` (a separate variant, so no existing
+`UpdateTable` literal changed). The decoder is pure and never rejects on the
+gate: `animusd` (`global_tables::update_table_global`) checks
+`Gate::GlobalTables` first and, while it is closed, returns the pre-G-c text
+byte for byte (`UpdateTable: ReplicaUpdates is not supported`; `...:
+GlobalTableWitnessUpdates is not supported` / `MultiRegionConsistency is not
+supported` for the other two keys). Then, in order: the table exists; the
+request shape (`animus_dynamo::global`); not already global; the receiving
+node carries a `REGION_LABEL` (D11) and is the table's own Region (the
+preferred-leader Region, D3); every named Region is carried by an `Active`
+member; the table is `ACTIVE`, has no TTL and no LSI; the table is empty (a
+quorum scan, D6: AWS fidelity, not safety). It proposes one
+`ConvertTableToGlobal` and waits for `schema.global` to show.
+
+Wire shapes: request `ReplicaUpdates[].Create.RegionName`,
+`MultiRegionConsistency` (`STRONG`), `GlobalTableWitnessUpdates[].Create.
+RegionName`; response `TableDescription` (and `DescribeTable`'s `Table`)
+gains, for a global table only, `GlobalTableVersion` ("2019.11.21"),
+`MultiRegionConsistency`, `Replicas[{RegionName, ReplicaStatus}]` (the local
+Region included, status derived per D4) and `GlobalTableWitnesses[{RegionName,
+WitnessStatus}]`. A regional table's output is byte-identical to before.
+Rejected by name, all `ValidationException`: absent/`EVENTUAL` consistency
+(stage G-d), a Region count other than three, a repeated or unknown Region,
+the own Region named, `Update`/`Delete` actions and per-replica overrides
+(`KMSMasterKeyId`, `ProvisionedThroughputOverride`, `OnDemandThroughputOverride`,
+`GlobalSecondaryIndexes`, `TableClassOverride`), a witness without a replica
+Create, more than one witness, a second change in the same call, a non-empty
+table, TTL or LSI present, an already-global table; on a global table
+`UpdateTimeToLive` enabling TTL, `TransactWriteItems` and `TransactGetItems`
+(hence `ExecuteTransaction`). The six legacy 2017.11.29 operations are
+rejected by name, ungated. The `limits` catalogue gained `MRSC_REQUIRED_REGIONS`,
+`MRSC_MAX_WITNESSES`, `MRSC_MIN_FULL_REPLICAS` and `GLOBAL_TABLE_VERSION`.
+
+**Unverified against AWS:** docs.aws.amazon.com was unreachable from the
+build environment, so the field names above (`ReplicaUpdates`,
+`GlobalTableWitnessUpdates`, `MultiRegionConsistency`, `GlobalTableVersion`,
+`GlobalTableWitnesses`, `ReplicaStatus`/`WitnessStatus`) come from the plan's
+earlier search extracts (section 0), and every error *text* is AnimusDB's own
+(N1). Re-read the API reference for `UpdateTable`/`ReplicationGroupUpdate`/
+`TableDescription` before G-c ships.
+
+(The M4 items listed here as open were completed; see the next amendment.)
+
+## Amendment (2026-10-05): G-c as built (MRSC stretch cluster)
+
+Stage G-c is implemented in one workstream. What shipped and the decisions the
+sections above left open:
+
+- **One gate, `Gate::GlobalTables` (cluster version 2).** Section 8's four
+  provisional names collapse into one because everything ships in one release:
+  `MetaCommand::ConvertTableToGlobal` and `SetGlobalPreferredLeader`
+  (`required_gate` rows, relay allowlist, mirror, golden fixtures), the
+  `TableSchema.global` field, the placement-policy region pin, and the client
+  acceptance of `ReplicaUpdates`. `MrecReplication` stays for G-d. This is the
+  first real gate, so it is also the first bump: `MAX_SUPPORTED = 2`, and the B2
+  sim profile is pinned to the literal `[1, 1]` (ADR 0073 amendment). An
+  operator unlocks MRSC with `animus cluster finalize` after the last node is
+  upgraded; until then `ReplicaUpdates` is refused with the pre-G-c text.
+- **Preferred Region lives in the spec, not the placement policy (D2).**
+  `GlobalTableSpec.preferred_leader_region`, one source of truth that splits
+  follow for free (a child carries `Tablet.table`); the policy only gains the
+  region pin (`allowed_values`, ADR 0005 pointer below). The default is the
+  Region of the node that received the converting `UpdateTable` (D3, AWS has no
+  wire field to choose it); `POST /admin/table/preferred-leader` /
+  `animus table preferred-leader` re-points it (`SetGlobalPreferredLeader`).
+- **Placement (D5, D8).** The conversion is one command whose apply sets
+  `schema.global` and replaces every tablet's policy in the same apply. The
+  pin is strict: repair never moves a lost Region's replica to another Region
+  (`InsufficientDomains`, no command), so a lost Region's replicas wait for it,
+  while repair *within* a Region (a dead node replaced by its Region-mate)
+  works. Consequence to state plainly: with a Region down the table is
+  under-replicated for as long as it is down, by design.
+- **Preferred-leader reconciler step (3.3).** Acts only on a real violation,
+  after a stability window, with a per-group minimum interval, targeting the
+  best caught-up voter of the preferred Region with the same threshold the
+  actuator arms at. A witness-Region leader is always transferred away (D7:
+  the witness is a full voter that may lead transiently during a failover; it
+  never serves eventual reads, 3.6). Not implemented: campaign suppression for
+  the witness (a follow-up if review wants "never leads").
+- **Replica status is derived, not stored (D4):** `ACTIVE` iff every routable
+  tablet has a desired replica in that Region, else `CREATING`. It reflects the
+  desired set, not Raft voter promotion.
+- **Strong reads keep ReadIndex through the leader (D9);** no lease reads.
+- **Decommission guard (D10).** `admin_drain` refuses the last `Active` member
+  of a Region a global table pins, by Region and table name; `force` (`animus
+  admin drain ... --force`) overrides it. With the override the replica stays
+  in its Region (the strict pin), nothing crosses Regions.
+- **Operator.** `spec.maxRegionRttMs` (additive, optional, schema version
+  unchanged) is rendered into `cluster_settings.max_region_rtt_ms`. The
+  supported stretch shape is one `AnimusCluster` on a Kubernetes cluster that
+  spans the Regions (3.8); federation is G-e.
+- **Visibility.** `GET /admin/global-tables` (per global table: Regions,
+  witness, preferred Region, derived replica status, per-tablet replica
+  placement by Region, the node-local leader and whether it is off the
+  preferred Region, Active members per Region, and warnings: a pinned Region
+  with no Active member, a control quorum a single Region's loss would break);
+  the dashboard Placement tab shows the preferred Region per tablet and a
+  "leader off preferred" badge, derived from `/admin/status`.
+
+**Evidence.** `animusd` `sim_cluster_mrsc` (`ANIMUS_MRSC_SEEDS`,
+`ANIMUS_MRSC_CELL`, `ANIMUS_SEED`): six combined nodes over the LSM engine,
+three Regions at 60/75/90 ms with jitter and a heavy tail, cluster finalized
+to version 2 through the real admin path, a table converted over the real
+DynamoDB wire. Cells: `steady` (preferred Region moved twice through the admin
+action, from a client on every node), `region_loss_leader_region`,
+`region_loss_follower_region`, `region_partition_heal`, `split_under_mrsc`,
+`in_region_node_replacement`, `witness_form_region_loss`,
+`drain_last_node_of_region_refused`; oracles are durability of every acked
+write, a `ConsistentRead: true` register that never goes backwards, the
+one-replica-per-Region placement invariant at every phase boundary, and
+convergence of the leader to the preferred Region. Negative controls (each
+must fail the oracle it names): preferred-leader disabled, an unpinned policy,
+and a register checker that must reject a stale read. The pure tier
+(`animus-cp-data` `preferred_leader_corpus`, same knob) covers the reconciler
+step alone. Both run per push at depth 1 and nightly in `corpus-deep.yml`
+(`mrsc_leader`, `mrsc_cluster`). Mutation checked in M4: removing the
+decommission guard fails `drain_last_node_of_region_refused`; the negative
+controls above are the checks for the preferred-leader step, the pin and the
+register checker.
+
+**Known limitations found while building it (not fixed here):**
+- Issue #1229 (pre-existing, reproduced on `main` with a plain table): a split
+  child whose replicas all move to other nodes lost its pre-split rows. Fixed
+  separately by #1231 (ADR 0058's 2026-10-05 amendment); `split_under_mrsc`
+  covers writes acked both before and after the split.
+- Issue #1226 (pre-existing): quiescence never settles on links whose RTT
+  exceeds the heartbeat interval, so stretch groups get no quiescence benefit.
+- The control quorum across Regions is only checked at admin time; a cluster
+  whose control majority sits in one Region loses DDL when that Region fails.
+  `/admin/global-tables` warns; placement of control voters is the operator's.
+- The AWS field names and error texts are unverified against the live API
+  (see the M3 amendment); a docs re-read is still owed before release.
+- Cost numbers of section 3.2 are unmeasured; an `animus-bench` cross-region
+  variant (ADR 0076) is a follow-up.
+

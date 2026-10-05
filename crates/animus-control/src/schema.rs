@@ -171,6 +171,113 @@ pub struct TtlSpec {
     pub attribute_name: String,
 }
 
+/// The consistency mode of a global table (ADR 0075). Only
+/// [`Strong`](Self::Strong) (MRSC) exists in stage G-c; the eventual mode
+/// (MREC) is stage G-d and will add a variant behind its own gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MultiRegionConsistency {
+    /// Multi-Region strong consistency: one Raft group per tablet, one
+    /// replica per Region, linearizable.
+    Strong,
+}
+
+/// A table's replicated **global-table** configuration (ADR 0075 section 3),
+/// recorded by `MetaCommand::ConvertTableToGlobal`.
+///
+/// Invariants ([`validate`](Self::validate)): exactly
+/// [`MRSC_REGIONS`](Self::MRSC_REGIONS) distinct, non-empty Regions;
+/// the witness (when present) is one of them; the preferred-leader Region is
+/// one of them and is never the witness.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GlobalTableSpec {
+    /// The consistency mode.
+    pub consistency: MultiRegionConsistency,
+    /// Every Region of the table (witness included), in declaration order.
+    /// Each is a value of the `topology.kubernetes.io/region` member label.
+    pub regions: Vec<String>,
+    /// The witness Region, if the table was created in the
+    /// two-replicas-plus-witness form. A witness holds a voting replica but
+    /// is never a leader target and never serves reads (ADR 0075 3.6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub witness: Option<String>,
+    /// The Region the preferred-leader mechanism steers each tablet's leader
+    /// to (ADR 0075 3.3; plan decision D2/D3: lives here, not on the
+    /// placement policy).
+    pub preferred_leader_region: String,
+}
+
+/// Why a [`GlobalTableSpec`] was rejected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GlobalSpecError {
+    /// Not exactly three Regions.
+    WrongRegionCount,
+    /// A Region name is empty.
+    EmptyRegion,
+    /// Two Regions are equal.
+    DuplicateRegion,
+    /// The witness is not one of the Regions.
+    WitnessNotInRegions,
+    /// The preferred-leader Region is not one of the Regions.
+    PreferredNotInRegions,
+    /// The preferred-leader Region is the witness.
+    PreferredIsWitness,
+}
+
+impl GlobalSpecError {
+    /// A stable, human-readable reason (used as the `Rejected` message).
+    #[must_use]
+    pub const fn message(self) -> &'static str {
+        match self {
+            GlobalSpecError::WrongRegionCount => "global table needs exactly three regions",
+            GlobalSpecError::EmptyRegion => "global table region name is empty",
+            GlobalSpecError::DuplicateRegion => "global table regions are not distinct",
+            GlobalSpecError::WitnessNotInRegions => {
+                "global table witness is not one of its regions"
+            }
+            GlobalSpecError::PreferredNotInRegions => {
+                "global table preferred-leader region is not one of its regions"
+            }
+            GlobalSpecError::PreferredIsWitness => {
+                "global table preferred-leader region is the witness"
+            }
+        }
+    }
+}
+
+impl GlobalTableSpec {
+    /// The number of Regions an MRSC table spans (ADR 0075 V6).
+    pub const MRSC_REGIONS: usize = 3;
+
+    /// Check the spec's internal consistency.
+    ///
+    /// # Errors
+    /// The first violated invariant.
+    pub fn validate(&self) -> Result<(), GlobalSpecError> {
+        if self.regions.len() != Self::MRSC_REGIONS {
+            return Err(GlobalSpecError::WrongRegionCount);
+        }
+        if self.regions.iter().any(String::is_empty) {
+            return Err(GlobalSpecError::EmptyRegion);
+        }
+        let distinct: BTreeSet<&String> = self.regions.iter().collect();
+        if distinct.len() != self.regions.len() {
+            return Err(GlobalSpecError::DuplicateRegion);
+        }
+        if let Some(w) = &self.witness
+            && !self.regions.contains(w)
+        {
+            return Err(GlobalSpecError::WitnessNotInRegions);
+        }
+        if !self.regions.contains(&self.preferred_leader_region) {
+            return Err(GlobalSpecError::PreferredNotInRegions);
+        }
+        if self.witness.as_ref() == Some(&self.preferred_leader_region) {
+            return Err(GlobalSpecError::PreferredIsWitness);
+        }
+        Ok(())
+    }
+}
+
 /// A table's replicated **point-in-time recovery (PITR)** configuration (ADR
 /// 0059 §9), when enabled via `UpdateContinuousBackups { Enabled: true }`.
 ///
@@ -407,6 +514,16 @@ pub struct TableSchema {
     /// table (`TagResource` overwrites an existing key's value).
     #[serde(default)]
     pub tags: BTreeMap<String, String>,
+    /// This table's **global-table** (multi-Region) configuration (ADR 0075
+    /// section 3), if it has been converted. `None` for every ordinary table
+    /// and every schema persisted before this field existed. **Class G
+    /// (replicated), gated by `Gate::GlobalTables`** (cluster version 2): it
+    /// is `skip_serializing_if = "Option::is_none"` so a cluster with no
+    /// global table writes byte-identical schemas (an older binary's strict
+    /// decode never sees the key), and it is set only by
+    /// `MetaCommand::ConvertTableToGlobal`, which is itself gated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub global: Option<GlobalTableSpec>,
 }
 
 /// Why a [`TableSchema`] was rejected as malformed.
@@ -446,6 +563,7 @@ impl TableSchema {
             pitr: None,
             throughput: None,
             tags: BTreeMap::new(),
+            global: None,
         }
     }
 
@@ -473,6 +591,7 @@ impl TableSchema {
             pitr: None,
             throughput: None,
             tags: BTreeMap::new(),
+            global: None,
         }
     }
 
@@ -496,6 +615,7 @@ impl TableSchema {
             pitr: None,
             throughput: None,
             tags: BTreeMap::new(),
+            global: None,
         }
     }
 

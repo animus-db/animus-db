@@ -1947,3 +1947,16 @@ not implemented. Topology spread (stage G-a) is separate.
 ## Amendment 2026-10-04: `spec.s3.webIdentity` (S-08)
 
 `spec.s3` gains an additive `webIdentity { roleArn, serviceAccountName?, audience? }` alternative to `credentialsSecretName` (now optional; exactly one of the two is required). The operator projects a rotating service-account token into combined-role pods and writes a static `source: web_identity` credentials file, so no `Secret` is read or embedded; egress also opens 443 for STS. Existing CRs round-trip unchanged (append-only fixture `v1-s3-web-identity.json`); see ADR 0059's S-08 amendment. Separately, the kind e2e S3 leg described above now runs RustFS, not MinIO (#863).
+
+## Amendment (2026-10-05) — `spec.maxRegionRttMs` and the stretch shape (ADR 0075, G-c)
+
+`spec.maxRegionRttMs` (additive, optional; `schemaVersion` unchanged, the
+committed `crd.yaml` regenerated) is rendered into the generated
+`cluster.json`'s `cluster_settings.max_region_rtt_ms`, which sizes the WAN Raft
+timing profile of every group spanning more than one
+`topology.kubernetes.io/region` (ADR 0075 section 3.4). It is inert on a
+single-region or unlabelled cluster. The supported multi-region shape in G-c is
+one `AnimusCluster` on a Kubernetes cluster whose nodes span the Regions
+(ADR 0075 section 3.8); federation across Kubernetes clusters is G-e. The
+`kind` e2e cannot exercise a stretch topology; stretch behaviour is proven in
+`SimEnv` (`sim_cluster_mrsc`).
