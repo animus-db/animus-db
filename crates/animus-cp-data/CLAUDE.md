@@ -2913,9 +2913,16 @@ wire/image codec is `pub(crate)`; new formats add a section in whichever fits.
 
 - **`txn-envelope` v2** (`txn.rs`, ADR 0018's 2026-10-04 amendment): the
   per-value tag byte is the version (`0` committed, `1` v1 intent, `2` v2
-  intent = v1 body + trailing `prior`). `decode_envelope` dispatches on it;
-  `txn::legacy::v1` holds the frozen v1 decoder and the v1 encoder behind
-  `legacy-encoders` (like every legacy encoder), plus `downgrade_intent_to_v1`
+  intent = v1 body + trailing `prior`). **Class G too (ADR 0073's 2026-10-05
+  amendment, #1237): apply always writes v2 into the node's own engine, but
+  `engine_image` (the `InstallSnapshot` image, the one place engine values leave
+  a node) ships every v2 intent down-converted to v1 — plus its prior as the
+  committed row one MVCC version below the intent, where the v1 lookback reads
+  it — until `Gate::GlobalTables` (cluster version 2) is open; an N-1 replica
+  panics on tag 2. Never branch apply on the gate; never ship an engine value
+  without asking what an N-1 reader does with it.** `decode_envelope` dispatches on it;
+  `txn::legacy::v1` holds the frozen v1 decoder and the v1 encoder (production
+  code now, the snapshot sender uses it; not `legacy-encoders`-gated), plus `downgrade_intent_to_v1`
   (re-exported as `downgrade_txn_envelope_to_v1`): the strict whole-value v2 -> v1
   down-conversion the upgrade harness's engine-row transcode
   (`animus-test`'s `ROW_TABLE`) applies to every stored row. It parses the *entire*

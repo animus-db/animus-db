@@ -11631,8 +11631,9 @@ async fn engine_image<S: StorageEngine>(
     // closed — which includes "this node has not read the cluster version
     // yet" (floor) — every v2 intent in a base row ships down-converted to
     // v1 (v1 cannot express the carried `prior`, so it ships as the committed
-    // row one MVCC version below the intent, where the old lookback reads it). The local engine is untouched and apply never branches on the
-    // gate, so replicas stay deterministic; a finalized cluster ships v2 as is.
+    // row one MVCC version below the intent, where the old lookback reads it).
+    // The local engine is untouched and apply never branches on the gate, so
+    // replicas stay deterministic; a finalized cluster ships v2 as is.
     let ship_v1_intents = !features.is_open(Gate::GlobalTables);
     let mut entries: Vec<ImageEntry> = Vec::new();
     for (k, v, version) in rows {
