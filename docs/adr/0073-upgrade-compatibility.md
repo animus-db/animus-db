@@ -2071,6 +2071,7 @@ first start of the new binary (Option B); **F** outlives the cluster, Phase 1 ru
 | Admin/dashboard/console HTTP JSON | `animusd/src/admin.rs`, `dashboard*`, `console.rs` | G (additive) | new fields only; new action routes gated |
 | Handshakes `NHS1`/`CHS1` | `animus-env/src/handshake.rs`, `prod.rs`, `animusd/src/lib.rs` | version fixed at 1 forever | `ext` TLVs; `check_peer` + disjoint-range refusal; `Envelope.peer_ext` |
 | `ReportNodeVersion`, `FinalizeClusterVersion` | new | `Gate::Era` | era-only variants |
+| `SegmentWire` (replicated segment/backup store RPCs on the reserved `SEGMENT_STREAM`/`BACKUP_SEGMENT_STREAM`) | `animus-cp-data/src/cluster_segment_store.rs` | G (all `Gate::Base` today) | `SegmentWire::required_gate`, exhaustive, no `_` arm; `encode` debug-asserts `Base`; a test pins every variant's JSON. A new variant or field needs a gate and a gated send path (the store holds no `ClusterFeatures` yet) |
 | `control-wal`/`shared-wal`/`raftkv-wal`, LSM WAL/SSTable/manifest, key-layout marker, `ADE1` | `animus-control/src/persist.rs`, `animus-storage`, `animus-cp-data/src/layout.rs`, `animus-env/src/encrypted.rs` | L | next bump at first start; checklist applies |
 | Mirror files, `ClusterConfig` | `mirror.rs`, `animusd/src/config.rs` | L | only that node reads them |
 | Backup manifest/data, PITR/stream segments, S3 export | `animus-cp-data/src/backup.rs`, `segment.rs`, `animusd/src/import.rs` | F | forever-readable; no gate |
@@ -2369,7 +2370,7 @@ rows were not re-read since that crate is out of scope).
 
 Flagged, not fixed (outside this workstream or unlisted in section 8):
 
-- **Unlisted cross-node surface: `SegmentWire`** (`animus-cp-data/src/cluster_segment_store.rs`,
+- **Unlisted cross-node surface: `SegmentWire`** (**resolved in the P2 close-out below: class G, all `Base`, section 8 row added**; original finding:) (`animus-cp-data/src/cluster_segment_store.rs`,
   `serde_json` enum on the reserved `SEGMENT_STREAM`/`BACKUP_SEGMENT_STREAM`). It is a
   seventh enum with the same whole-message-failure hazard as the six gated ones and
   is not in section 8 or in `Gate` coverage. Classify it G, or document why a new
@@ -2469,10 +2470,10 @@ Decisions and as-built facts the design text did not settle:
 6. **Down / Leaving / never-activated Joining members block Finalize,
    strictly, regardless of any recorded range** (decision 6), enforced in the
    admin pre-check and reported as named blockers by
-   `GET /admin/cluster-version`. **Known gap:** `Metadata::apply` for
-   `FinalizeClusterVersion` does not look at member status, so the pre-check
-   is racy and operator-level. Apply-level enforcement is tracked in
-   issue #1168 (an `animus-control` change, out of P2-C's scope).
+   `GET /admin/cluster-version`. **Former gap, closed by the P2 close-out
+   (issue #1168):** `Metadata::apply` for `FinalizeClusterVersion` now rejects
+   on member status too, so the pre-check is operator-level and apply is
+   authoritative.
 7. **Admission.** Once the era is on, `admin_add_control_member` refuses a
    voter with no known range (a Phase 1 binary never advertises one) or a
    range excluding the cluster version, by name, before registering anything.
@@ -2507,7 +2508,8 @@ Decisions and as-built facts the design text did not settle:
     `animus cluster finalize <leader-admin-addr> [--to N] [--yes]` (the CLI
     shows the blockers, refuses unless `--yes`, then polls until the new
     version is observed). Rolling upgrade remains **in progress, not
-    supported**, until P2-B (gates) and P2-D (mixed-version corpus) land.
+    supported**, until P2-B (gates) and P2-D (mixed-version corpus) land
+    (*they have: see the P2 close-out*).
 
 ### Amendment 2026-10-04 — P2-D as built (mixed-version corpus)
 
@@ -2543,16 +2545,115 @@ this is the part of section 7 that does not depend on them.
   only heartbeats) each fail the corpus; M4 only in the pure tier, because every
   `SimCluster` control node is `Both` and heartbeats.
 
-**Pending, not registered as tests (nothing passes vacuously).**
-- Synthetic gate ladder, `required_gate`-exhaustiveness and byte-identity
-  per-gate tests, `ungated variant/field` and `stale view` negative controls
-  (N2-N4), the data-plane and `animus-node` tiers: **P2-B**.
-- Phase 1 joiners after the era, the data-only node's era flag
-  (`ControlHandle::Remote`), `RegisterNode` joiner range checks, and
-  `Release(N-1) -> Release(N)` cells over real gates: **P2-C** and the first
-  real gate.
+**Pending, not registered as tests (nothing passes vacuously).** *Closed by the
+P2 close-out below*, except `Release(N-1) -> Release(N)` cells over real gates,
+which need the first real gate (the synthetic ladder stands in).
 
 **Observed, not fixed (P2-A, unchanged).** `EraWatch::sync` sets the require flag
 even for an own range of `None`; the sim keeps `require_peer_ext` across
 `Simulator::stop`, so the restart window ProdEnv has is not modelled; the sim's
 disjoint-range check reads the sender's *current* ext. None blocks a cell here.
+
+### Amendment 2026-10-04 — Phase 2 close-out (P2-B/P2-C handoffs, #1168, P2-D deferred tests)
+
+Branch `adr0073-phase2-closeout` (on top of the merged P2-A/B/C/D work). Phase 2
+is done; this records what the last pass did and how each test was shown to bite.
+
+**1. P2-B -> P2-C handoffs.**
+(a) *`write_frame` gated.* Every client frame is written through
+`write_frame_gated` (`ClientGated` + the node's `ClusterFeatures`);
+`AnimusdRelayClient`, `client_request_pipelined` and `relay_request_with_timeout`
+carry the handle, and a closed-gate request never reaches the wire (an
+`InvalidInput` becomes `relay refused: ...`). `join_request` uses a floor handle
+(`JoinInfo` is `Base`). The ungated `write_frame` remains for tests and raw
+clients. Test: `the_relay_sender_never_puts_a_closed_gate_request_on_the_wire`
+(real sockets) and the `write_frame_gated` open/closed unit test.
+(b) *Relay receiver.* `forwarding.rs`' `ProposeSchema` arm calls
+`version_wiring::relay_gate_verdict` after the relayable check; a closed gate
+(after one re-read of the node's metadata) is refused by name, counted in
+`ClusterGateRelayRefused`, and never reaches `RaftNode::propose`. Test:
+`a_relayed_command_whose_gate_is_closed_is_refused_by_the_receiving_node`
+(`SimCluster`, request relayed from a follower-connected node).
+(c) *Control-fed features in every hosted group.* The reconciler gets the node's
+handle at both production sites and in `SimCluster::build_reconciler`
+(`Reconciler::set_cluster_features`); verified on a 4-node cluster with RF = all
+nodes, so the data-only node's groups are covered (fed from the mirror). Test:
+`every_hosted_group_runs_on_its_nodes_control_fed_feature_handle`.
+(d) *Violation metrics.* `Metric::ClusterGateViolations{RaftMsg,MetaCommand,KvWire,
+KvCommand,ClientRequest,ClientResponse}` and `ClusterGateRelayRefused` (`Metric::ALL`
+is now 117), set from `ClusterFeatures::violations` by the feeder loop and on
+every `/admin/metrics` scrape. `SimEnv`'s `env.metrics()` is a per-(sim, node)
+sink and is **not** the exported sink, so the exporting code goes through
+`ClientCtx::exported_metrics()` (data role's sink, else the control's). Test:
+`gate_violation_counters_are_exported_per_surface_as_metrics`.
+
+**2. Issue #1168.** `Member::finalize_block_reason()` (Down, Leaving, never-activated
+Joining) is checked by `Metadata::apply` for `FinalizeClusterVersion` after the
+target check and before the required-set range loop, and by the admin pre-check
+(same function). Tests: `finalize_apply_blocks_on_each_member_status`,
+`a_member_flipped_down_between_precheck_and_apply_blocks_the_finalize` (a `World`
+race: `UpsertMember{Down}` then Finalize back to back), the apply corpus's
+independent oracle, and the mixed corpus' Phase 1 cell (assertion relaxed to any
+`blocked: a ...` name).
+
+**3. P2-D deferred tests (both corpora, section 7).**
+- *Synthetic ladder.* `Gate::Synthetic(n)` (`cfg(any(test, feature = "sim-versions"))`,
+  never in `Gate::ALL`; version `n`, rank `n`), attached only through the
+  `synthetic.gate=n` label of an `UpsertMember`; unit tests pin opening one finalize
+  at a time and the classification. Cells `synthetic_gate_ladder` (pure) and
+  `ladder_finalize_each_gate` (cluster): every node `Release(3)` but one
+  `Release(2)`; gate 2 opens at the first finalize on every node (the data-only
+  node through its mirror), gate 3 stays closed and the second finalize is refused
+  by name (`excludes target 3`) while the `[1,2]` node is recorded, opens after it
+  rolls, each gate's command is accepted everywhere, no capped rejection, no wedge.
+- *Per-gate tests.* `profiles_accept_gates_exactly_up_to_their_known_version` (every
+  profile x every gate incl. the ladder), `content_gate_sees_an_unclassified_field`,
+  the exhaustive `gate_table_is_exhaustive`, and `SegmentWire`'s pinned bytes.
+- *N2-N4.* `negative_control_ungated_variant` (gate check skipped),
+  `_ungated_field` (a `synthetic.field=3` payload that `required_gate` classifies
+  `Base`, so the normal `propose` accepts it; the cap's `content_gate` models the
+  older binary's strict decode), `_stale_view` (the proposer's handle fed a forged
+  newer view). Each, at cluster version 2 with a `Release(2)` voter, asserts the
+  exact expected oracle outcome: the capped rejection at that node, only it
+  wedged, its log unmoved, and the value applied early elsewhere ("gate applied
+  early"). Pure and cluster tier.
+- *Phase 1 joiners after the era.* `joiner_phase1_after_era` /
+  `joiner_phase1_dials_data_only_node`: refused at the seed's handshake (counted),
+  never registered, cluster keeps committing; a B2 joiner through the same seed is
+  admitted and recorded. The data-only variant dials a node whose flag comes from
+  the version feeder via `ControlHandle::Remote`.
+- *`RegisterNode` joiner range checks.* `joiner_range_checks`: above max and
+  below min refused by name at discovery (`SimCluster::try_join_via_seed_as`
+  applies the production `check_join_range`), in-range joiners recorded with
+  their range, a disjoint range refused earlier by the handshake. (A pre-era
+  cluster cannot be set up with an overlapping range at this tier: the era starts
+  as soon as every node is versioned; the pre-era arithmetic is the
+  `join_range_check_reads_zero_as_one` unit test.)
+- *Skipped:* `Release(N-1) -> Release(N)` over a **real** gate: no real gate
+  exists (rule 3 makes it mandatory with the first one).
+
+**4. `SegmentWire`** (section 8 row added): class G, every variant `Gate::Base`;
+`required_gate` is exhaustive, `encode` debug-asserts `Base`, a test pins each
+variant's JSON. Nothing needs gating today; a later variant must name a gate and
+add a gated send path (no feature handle in the store yet).
+
+**5. Mutation results** (each reverted after the run; every new control must fail
+under its mutation):
+
+| Mutation | Cells that failed |
+|---|---|
+| status check removed from the Finalize apply arm | `finalize_apply_blocks_on_each_member_status`, the race test, the apply corpus |
+| relay receiver gate check removed | the relay-receiver test (debug_assert panic in `RaftNode::propose`; a named-refusal mismatch in release) |
+| `set_cluster_features` removed from `build_reconciler` | the hosted-group test (never converges) |
+| `export_gate_metrics` made a no-op | the counter test |
+| relay sender uses the ungated `write_frame` | the relay-sender test |
+| capped decode accepts everything | N1, N2, N3, N4 (pure and cluster tier) |
+| cap blind to `synthetic.field` | N3 only (pure tier) |
+| `Gate::Synthetic(n)` opens at `n - 1` | ladder + N2-N4 (pure and cluster tier) |
+| data-only node never flips `require_peer_ext` | `joiner_phase1_dials_data_only_node` |
+| discovery skips `check_join_range` | `joiner_range_checks` |
+
+**6. Docs.** Per section 10: root `CLAUDE.md` (Phase 2 done; the format-change
+checklist gains the class G/L/F + gate step), ADR 0060 "Upgrades", the website
+(manual node-by-node rolling upgrade supported; operator orchestration is Phase 3),
+the crate guides (`animus-control`, `animusd`, `animus-cp-data`).

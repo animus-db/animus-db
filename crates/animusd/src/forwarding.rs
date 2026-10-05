@@ -1764,6 +1764,13 @@ pub(crate) async fn handle_relayed_request<E: Env, R: RelayClient>(
         ClientRequest::ProposeSchema(command) => {
             if !crate::is_relayable_command(&command) {
                 ClientResponse::Error("command not allowed over the relay path".into())
+            } else if let Err(refusal) = crate::version_wiring::relay_gate_verdict(ctx, &command) {
+                // ADR 0073 Phase 2 (P2-C): the sender gates its own emit, but
+                // the receiver's view is the one that proposes — a command
+                // whose feature gate is closed here (an era-only command on a
+                // pre-era node) is refused by name and never reaches the
+                // control log, where a peer that cannot decode it would wedge.
+                ClientResponse::Error(refusal)
             } else {
                 // `propose_schema_local_or_hinted`, never the full
                 // `propose_schema` — issue #610's own fd-exhaustion

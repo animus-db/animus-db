@@ -89,7 +89,12 @@ amendment — the shape predates and outlives it.)
   module's own 69-line `//!` doc has the full design (replica selection,
   the request/reply correlation, `repair`); wired into `animusd`
   (`animusd::build_segment_store`, `SegmentStoreHandle` — see that crate's
-  `CLAUDE.md`).
+  `CLAUDE.md`). **ADR 0073 section 8: class G, every `SegmentWire` variant is
+  `Gate::Base`** (`SegmentWire::required_gate`, exhaustive, no `_` arm; `encode`
+  debug-asserts it and `gate_tests` pins each variant's JSON). A new variant or
+  field is a wedge for an older replica: it must name a non-`Base` gate, which
+  then needs a gated send path (this store has no `ClusterFeatures` yet) before
+  the assertion is relaxed.
 - **`codec.rs`** — the crate's compact binary wire/image codec (ADR 0017
   A.2): length-prefixed, magic/version-checked framing for `KvWire`
   messages and engine images (`serde_json`'s decimal-array `Vec<u8>`
