@@ -27,6 +27,9 @@
 //!   version), refused by name with a Down member and with a member whose
 //!   recorded range excludes the target, refused on a non-leader (including a
 //!   data-only node), one-step / CAS validation;
+//! - ADR 0073 Phase 3 (P3-A): the derived `roll` object of `GET /admin/cluster-version`
+//!   across a node-by-node roll, and `GET /admin/roll-health`'s verdict
+//!   agreeing with the dashboard's tablet ladder on the same state;
 //! - the joiner's pure range check and the `JoinInfo` additive-field shape.
 
 use std::time::Duration;
@@ -751,5 +754,174 @@ fn run_violation_levels_are_exported(seed: u64) {
 fn gate_violation_counters_are_exported_per_surface_as_metrics() {
     for seed in seeds() {
         run_violation_levels_are_exported(seed);
+    }
+}
+
+// ---- ADR 0073 Phase 3, P3-A: roll status and roll health ----
+
+fn get_roll_health(cluster: &mut SimCluster, node: u64) -> Value {
+    let (status, body) = cluster.admin(node, "GET", "/admin/roll-health", "", b"");
+    assert_eq!(status, 200, "GET /admin/roll-health on node {node}: {body}");
+    serde_json::from_str(&body).expect("roll-health json")
+}
+
+fn run_roll_object_tracks_a_node_by_node_roll(seed: u64) {
+    let mut cluster = new_cluster(seed);
+    // The era is on with every node on the "old" binary: range [1,1].
+    start_era(&mut cluster, seed, 1);
+    let leader = leader_node(&mut cluster);
+    let v = get_view(&mut cluster, leader);
+    assert_eq!(v["roll"]["phase"], "not_started", "seed={seed}: {v}");
+    assert_eq!(v["roll"]["on_new"], 0, "seed={seed}: {v}");
+    assert_eq!(v["roll"]["total"], ROLES.len(), "seed={seed}: {v}");
+
+    // Roll order: the data-only node first, the control leader last.
+    let order: Vec<String> = v["roll"]["remaining"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap().to_string())
+        .collect();
+    let data_id = cluster.handle().env(DATA_NODE).node_id().to_string();
+    let leader_id = cluster.handle().env(leader).node_id().to_string();
+    assert_eq!(order.len(), ROLES.len(), "seed={seed}: {order:?}");
+    assert_eq!(order.first(), Some(&data_id), "seed={seed}: {order:?}");
+    assert_eq!(order.last(), Some(&leader_id), "seed={seed}: {order:?}");
+
+    // Roll the nodes in that order: each re-reports a [1,2] range.
+    let node_of = |c: &SimCluster, id: &str| -> u64 {
+        (0..ROLES.len() as u64)
+            .find(|n| c.handle().env(*n).node_id().to_string() == id)
+            .expect("node by id")
+    };
+    for (i, id) in order.iter().enumerate() {
+        let n = node_of(&cluster, id);
+        cluster.set_node_version(n, Some(VersionRange::new(1, 2)));
+        let want = i + 1;
+        poll_until(
+            &mut cluster,
+            Duration::from_secs(60),
+            seed,
+            "the rolled node's new range to be recorded and visible",
+            |c| get_view(c, leader)["roll"]["on_new"] == want,
+        );
+        let v = get_view(&mut cluster, leader);
+        let phase = v["roll"]["phase"].as_str().unwrap().to_string();
+        if want < ROLES.len() {
+            assert_eq!(phase, "rolling", "seed={seed} after {want}: {v}");
+            assert_eq!(
+                v["roll"]["remaining"].as_array().unwrap().len(),
+                ROLES.len() - want,
+                "seed={seed}: {v}"
+            );
+        } else {
+            assert_eq!(phase, "ready_to_finalize", "seed={seed}: {v}");
+            assert_eq!(v["can_finalize"], true, "seed={seed}: {v}");
+            assert!(v["roll"]["remaining"].as_array().unwrap().is_empty());
+        }
+    }
+    // The same object is served by a follower and the data-only node.
+    for node in [a_follower(&mut cluster), DATA_NODE] {
+        let v = get_view(&mut cluster, node);
+        assert_eq!(v["roll"]["phase"], "ready_to_finalize", "seed={seed}: {v}");
+        assert!(v["roll"]["health"]["ok"].is_boolean(), "seed={seed}: {v}");
+    }
+}
+
+#[test]
+fn the_roll_object_tracks_a_node_by_node_roll() {
+    for seed in seeds() {
+        run_roll_object_tracks_a_node_by_node_roll(seed);
+    }
+}
+
+/// The server verdict equals the dashboard ladder on the same state: with a
+/// healthy cluster `ok` is true on every node (the data-only one included);
+/// after a member dies the verdict names it, and the tablet counts equal what
+/// the shared ladder (`roll_health::tablet_status`, itself proven equal to
+/// `dashboard_core.js` by `roll_health`'s oracle test) computes from the
+/// leader's own `Metadata`.
+fn run_roll_health_matches_dashboard_ladder(seed: u64) {
+    use crate::roll_health::{TabletStatus, tablet_status};
+    let mut cluster = new_cluster(seed);
+    start_era(&mut cluster, seed, 2);
+    let tablet = cluster.create_table("rolled");
+    let leader = leader_node(&mut cluster);
+
+    // Healthy and converged: ok everywhere, with the data-only node's own
+    // answer coming off its mirror.
+    for node in 0..ROLES.len() as u64 {
+        poll_until(
+            &mut cluster,
+            Duration::from_secs(60),
+            seed,
+            "roll-health to report ok on a healthy cluster",
+            |c| get_roll_health(c, node)["ok"] == true,
+        );
+    }
+
+    // Kill a non-leader member that hosts a replica of the table's tablet.
+    let replicas = cluster.metadata(leader).tablets[&tablet].replicas.clone();
+    let victim = (0..ROLES.len() as u64)
+        .find(|n| *n != leader && replicas.contains(&cluster.handle().env(*n).node_id()))
+        .expect("a non-leader replica");
+    let victim_id = cluster.handle().env(victim).node_id();
+    cluster.crash(victim);
+    poll_until(
+        &mut cluster,
+        Duration::from_secs(60),
+        seed,
+        "the crashed member to be marked Down",
+        |c| {
+            c.metadata(leader)
+                .members
+                .get(&victim_id)
+                .is_some_and(|m| m.status == animus_control::meta::NodeStatus::Down)
+        },
+    );
+    // One snapshot, one verdict over it, no simulated time between (the
+    // repair loop would otherwise move the replica away mid-assertion).
+    let meta = cluster.metadata(leader);
+    let h = cluster.roll_health_over(leader, &meta);
+    assert_eq!(h["ok"], false, "seed={seed}: {h}");
+    let reasons = h["reasons"].as_array().unwrap();
+    assert!(
+        reasons.iter().any(
+            |r| r["kind"] == "member_not_active" && r["node"] == victim_id.to_string().as_str()
+        ),
+        "seed={seed}: {h}"
+    );
+    assert_eq!(h["members"]["not_active"][0]["status"], "Down", "{h}");
+
+    // Ladder agreement, on the very same snapshot.
+    let (mut ql, mut ur) = (0u64, 0u64);
+    for t in meta.tablets.values() {
+        match tablet_status(&t.replicas, &meta.members, true, t.replicas.len()) {
+            TabletStatus::QuorumLost => ql += 1,
+            TabletStatus::UnderReplicated => ur += 1,
+            _ => {}
+        }
+    }
+    assert!(
+        ur + ql > 0,
+        "seed={seed}: the victim hosted no tablet replica, the scenario proves nothing: {meta:?}"
+    );
+    assert_eq!(h["tablets"]["quorum_lost"], ql, "seed={seed}: {h}");
+    assert_eq!(h["tablets"]["under_replicated"], ur, "seed={seed}: {h}");
+    // The embedded summary in cluster-version is the same verdict.
+    // (The member stays Down: nothing restarts it, and repair only moves
+    // replicas.) The endpoint serves the same shape as the snapshot verdict.
+    let v = get_view(&mut cluster, leader);
+    assert_eq!(v["roll"]["health"]["ok"], false, "seed={seed}: {v}");
+    assert_eq!(v["roll"]["down"][0], victim_id.to_string().as_str(), "{v}");
+    assert_eq!(v["roll"]["phase"], "blocked", "seed={seed}: {v}");
+    let h2 = get_roll_health(&mut cluster, leader);
+    assert_eq!(h2["ok"], false, "seed={seed}: {h2}");
+}
+
+#[test]
+fn roll_health_matches_dashboard_ladder() {
+    for seed in seeds() {
+        run_roll_health_matches_dashboard_ladder(seed);
     }
 }

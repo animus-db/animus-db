@@ -114,6 +114,8 @@ mod pitr_janitor;
 #[deny(clippy::disallowed_methods)]
 mod read_path;
 #[deny(clippy::disallowed_methods)]
+mod roll_health;
+#[deny(clippy::disallowed_methods)]
 mod schema;
 mod segment_janitor;
 mod split_placing_completion;
@@ -1424,6 +1426,28 @@ impl<E: Env> CpGroup<E> {
         match self {
             CpGroup::Lsm(n) => view!(n),
             CpGroup::Mem(n) => view!(n),
+        }
+    }
+
+    /// The cheap subset of [`raft_view`](Self::raft_view) the roll-health
+    /// verdict needs (ADR 0073 Phase 3, D2): leader belief, learners, commit
+    /// vs. engine-applied. Lock-and-read only (no byte-size estimate), since
+    /// `GET /admin/cluster-version` is polled while a roll is in flight.
+    fn roll_group(&self, tablet: TabletId) -> roll_health::LocalGroup {
+        macro_rules! g {
+            ($n:expr) => {
+                roll_health::LocalGroup {
+                    tablet: tablet.0,
+                    leader_known: $n.leader().is_some(),
+                    learners: $n.learners().len(),
+                    commit_index: $n.commit_index(),
+                    engine_applied_index: $n.engine_applied_index(),
+                }
+            };
+        }
+        match self {
+            CpGroup::Lsm(n) => g!(n),
+            CpGroup::Mem(n) => g!(n),
         }
     }
 
@@ -12821,11 +12845,53 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     pub(crate) fn admin_cluster_version_view(&self) -> serde_json::Value {
         let meta = self.effective_metadata();
         let observed = self.edge.leader_handle().map(|l| l.version_observations());
+        let health = self.roll_health_verdict(&meta);
         version_wiring::cluster_version_view(
             &meta,
             &self.edge.version().profile(),
             observed.as_ref(),
+            self.control.leader().as_ref(),
+            Some(&health),
         )
+    }
+
+    /// The ADR 0073 Phase 3 D2 verdict from this node's own view (see
+    /// [`roll_health`]): replicated `Metadata`, the control group's liveness,
+    /// and this node's hosted groups. Shared by `GET /admin/roll-health` and
+    /// the `roll.health` field of `GET /admin/cluster-version`.
+    pub(crate) fn roll_health_verdict(&self, meta: &Metadata) -> roll_health::RollHealth {
+        let r = &self.control;
+        let grace = r.election_timeout() * admin::HEALTH_LEADER_GRACE_ELECTION_TIMEOUTS;
+        let voters = r.config();
+        // Reachability is observable only on the control leader (a follower's
+        // contact table is empty); elsewhere a recent leader is the evidence.
+        let reachable = match (r, &voters) {
+            (animus_node::control_handle::ControlHandle::Local(raft), Some(v))
+                if raft.is_leader() =>
+            {
+                Some(
+                    v.iter()
+                        .filter(|id| raft.control_peer_believed_alive((*id).clone()))
+                        .count(),
+                )
+            }
+            _ => None,
+        };
+        let control = roll_health::ControlView {
+            voters: voters.as_ref().map(|v| v.len()),
+            reachable,
+            leader_recent: r.leader_within(grace).is_some(),
+        };
+        let local = roll_health::LocalView {
+            node: self.env.node_id(),
+            groups: self
+                .edge
+                .hosted_groups()
+                .iter()
+                .map(|(t, g)| g.roll_group(*t))
+                .collect(),
+        };
+        roll_health::roll_health(meta, &control, &local)
     }
 
     /// `POST /admin/cluster-version/finalize` (ADR 0073 Phase 2, P2-C):

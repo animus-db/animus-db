@@ -827,3 +827,8 @@ tests in `decide::tests`.
 No new relayed command or wire shape: the action proposes the existing
 `SetGlobalPreferredLeader` (M1/M2, `Gate::GlobalTables`).
 
+
+## `AdminHost::roll_health_view` (ADR 0073 Phase 3, P3-A)
+
+New required method behind `GET /admin/roll-health` (always 200; `ok` in the body is the
+verdict). Both `animusd` impls delegate to `roll_health::roll_health` (see `animusd`'s guide).

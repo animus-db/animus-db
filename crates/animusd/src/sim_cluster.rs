@@ -1233,6 +1233,13 @@ impl SimClusterHandle {
         self.ctx(node).effective_metadata()
     }
 
+    /// The ADR 0073 Phase 3 roll-health verdict body `node` computes over the
+    /// **given** metadata snapshot, with no simulated time passing — so a test
+    /// can compare it to a ladder computed over the very same snapshot.
+    pub(crate) fn roll_health_over(&self, node: u64, meta: &Metadata) -> serde_json::Value {
+        self.ctx(node).roll_health_verdict(meta).to_json()
+    }
+
     /// Every tablet id `node`'s own `ClusterEdgeState` currently holds a
     /// live CP group handle for (ADR 0061 rung D4 PR 1) — regardless of a
     /// tablet's origin (hand-hosted via [`SimCluster::
@@ -3517,6 +3524,11 @@ impl SimCluster {
     /// assert on tablet placement / schema visibility per node.
     pub(crate) fn metadata(&self, node: u64) -> Metadata {
         self.shared.metadata(node)
+    }
+
+    /// See `SimClusterHandle::roll_health_over` (verdict over a snapshot).
+    pub(crate) fn roll_health_over(&self, node: u64, meta: &Metadata) -> serde_json::Value {
+        self.shared.roll_health_over(node, meta)
     }
 
     /// Whether **every replica of every tablet** hosted across the cluster's

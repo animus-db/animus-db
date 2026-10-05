@@ -12171,3 +12171,21 @@ needed to close the residual mirror-lag window). Never reintroduce
 `let _ = ctx.register_node(..)`. Regression: `sim_cluster_register_retry.rs`
 (partition a follower from the control quorum for 25 s > `SCHEMA_COMMIT_TIMEOUT`;
 `ANIMUS_SEED=<seed>` replays). Lesson: `docs/lessons/code-patterns/2026-10-05-a-fire-and-forget-let-underscore-turns-a-bounded-timeout-into-a-permanent-silent-failure.md`.
+
+## Roll health and the `roll` object (ADR 0073 Phase 3, P3-A)
+
+`roll_health.rs` is the one server-side definition of "safe to touch the next node":
+`GET /admin/roll-health` (`AdminHost::roll_health_view`, route in `animus-node`),
+the `roll.health` summary inside `GET /admin/cluster-version`, and the dashboard Version
+card all read it. It is **pure** (`Metadata` + `ControlView` + `LocalView` in, verdict
+out); `ClientCtx::roll_health_verdict` snapshots the inputs (`CpGroup::roll_group` is the
+cheap, no-byte-estimate group read; control reachability is observable only on the control
+leader, elsewhere a recent leader is the evidence). `version_wiring::roll_view` derives the
+`roll` object (phase/total/on_new/remaining/down/blockers/health) from `Metadata` alone:
+**never stored**, so a leader change loses nothing. `tablet_status` is a line-for-line
+port of `dashboard_core.js::tabletStatus`; `roll_health::tests::
+ladder_equals_the_dashboard_tablet_status` runs the real JS under `node` over an enumerated
+state table and fails if they diverge (it skips loudly without a `node` binary): change the
+ladder in both places or the test fails. Adding an `ok` clause means a new `Reason` kind, a
+one-clause unit test, and a line in `docs/runbook/upgrade.md`. Not a readiness probe, by
+design (issues #595/#710).
