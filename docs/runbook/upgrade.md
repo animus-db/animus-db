@@ -68,15 +68,21 @@ not tested; the reasoning is:
   Do not change anything else in the spec in the same step.
   Recreate keeps identity because ids derive from the name and ordinal.
 
-## Rolling upgrade, node by node (manual; ADR 0073 Phase 2 supported, Phase 3 P3-A tooling)
+## Rolling upgrade, node by node (ADR 0073 Phase 2 supported; Phase 3 `animus cluster roll`)
 
 A cluster whose cluster-version era is on (Phase 2) runs mixed N-1 and N builds safely,
 so you can restart nodes one at a time with no client outage. **N-1 to N only**: never
 skip a release. A cluster still on Phase 1 binaries has no era, so the first roll onto a
 Phase 2 build has no version observation; use the health gate below and nothing else.
-The orchestration (a CLI `animus cluster roll` and operator-driven `spec.image` rolls)
-is later Phase 3 work; until then you drive the loop below by hand with `curl` against
-each node's admin port (`ADMIN` below is a node's admin address).
+`animus cluster roll` is a **supervisor that restarts nothing itself**: you (systemd,
+ansible, a pod revision) replace the process; the CLI says which node is next (`plan`),
+blocks until the node you just replaced is healthy and has reported the new range
+(`wait`), and renders the derived roll state (`status`). Its decisions are the shared
+`animus-roll` state machine, the same one the operator will use; it keeps no state, so
+re-running any command after an interruption is always safe. Operator-driven `spec.image`
+rolls are later Phase 3 work. `ADMIN` below is a node's admin address (`--tls-ca PATH`
+goes before the command when the admin port uses TLS); the `curl` forms are the same
+endpoints the CLI reads, shown as an alternative.
 
 **Read this before step 1: a node's first start of the new binary is its point of no
 return.** From that moment it writes the new on-disk formats. There is no rollback for
@@ -89,35 +95,57 @@ replica off the node, leaves the member `Leaving` (which blocks Finalize) and th
 must re-register ([node-decommission.md](node-decommission.md)). A roll is a restart in
 place.
 
-1. **Plan.** `curl -s http://ADMIN/admin/cluster-version`:
-   - `era_active` must be `true` and `active` is the version you are on;
-   - `roll.phase` is `not_started`; `roll.remaining` is the order to follow: data-only
-     nodes first, then control voters, **the control leader last**;
-   - `roll.down` should be empty; bring any `Down` member back (on the new binary) or
-     decommission it first, because Finalize refuses while one exists.
-2. **Gate.** `curl -s http://ADMIN/admin/roll-health` must say `"ok": true`. If not,
-   `reasons[]` names why (see the table below). Do not touch the next node until it is
-   `ok`.
-3. **If the node is the control leader** (`curl -s http://NODE_ADMIN/admin/health` shows
-   `"is_control_leader": true`), move leadership first:
-   `curl -s -X POST http://NODE_ADMIN/admin/control/transfer -d '{"to":"<another voter>"}'`
-   and wait until `control_leader_recent` is true on another node. Data-plane (tablet)
-   leaders re-elect on their own; clients see brief retries.
+1. **Plan.** `animus cluster roll plan ADMIN` (`--json` for scripts) prints the active
+   and goal cluster versions, each node's role, status and whether it already reports the
+   new range, the control leader, the point-of-no-return warning, and the **roll order**:
+   data-only nodes first, then control voters, **the control leader last** after a
+   leadership transfer. It exits 1 and prints `refused: ...` if a precondition fails (a
+   member not `Active`, roll-health not `ok`, no control leader known, nobody to take
+   leadership), and touches nothing either way. It works mid-roll: the order is
+   recomputed from what the cluster reports. Equivalent by hand: `curl -s
+   http://ADMIN/admin/cluster-version` (`era_active` true, `roll.remaining` is the order,
+   `roll.down` empty: bring any `Down` member back on the new binary or decommission it
+   first, because Finalize refuses while one exists). On a first roll over **Phase 1**
+   binaries there is no `cluster-version` endpoint on the old nodes; `plan` then reads
+   `/admin/status` and treats every node as not yet rolled.
+2. **Gate.** `animus cluster roll status ADMIN` shows `roll health:` (the server-side
+   `/admin/roll-health` verdict, `curl -s http://ADMIN/admin/roll-health`) and the next
+   step. Do not touch the next node until it is `ok`; `reasons[]` names why when it is not
+   (table below).
+3. **If the node is the control leader**, move leadership first (`plan` lists this step;
+   `animus admin control-transfer LEADER_ADMIN <another voter id>`, or `curl -s -X POST
+   http://LEADER_ADMIN/admin/control/transfer -d '{"to":"<another voter>"}'`) and wait
+   until a leader is known elsewhere. Data-plane (tablet) leaders re-elect on their own;
+   clients see brief retries.
 4. **Restart the node on the new binary or image** (`systemctl restart`, a new container
    image, ...). Keep `--dir`, keys, TLS files and flags unchanged. Send SIGTERM and let it
    shut down cleanly.
-5. **Wait for it to be healthy.** Poll **the restarted node's own** admin port
-   (`/admin/roll-health` has a node-local clause, so asking another node is not enough)
-   until `"ok": true` *and* `/admin/cluster-version` shows that node reporting the new
-   range (its row's `range.max` is now the new version). The node flips `Down` to
-   `Active` within seconds, long before its groups catch up: `local.caught_up_groups`
-   equal to `local.hosted_groups` is what stops you opening the gate too early.
+5. **Wait for it to be healthy.** `animus cluster roll wait NODE_ADMIN [--timeout 10m]`
+   polls **the restarted node's own** admin port (`/admin/roll-health` has a node-local
+   clause, so asking another node is not enough) until it answers as the new build, is
+   `Active`, has reported the new range, and roll-health is `ok`, printing each reason it
+   is still waiting for; it exits 0 on success and 1 on timeout (default 10m;
+   `--interval` sets the poll period; `--node ID` asserts which node that address is). On
+   success it prints the node that follows. The node flips `Down` to `Active` within
+   seconds, long before its groups catch up: `local.caught_up_groups` equal to
+   `local.hosted_groups` is what stops the gate opening too early.
 6. **Repeat** 2-5 for every remaining node, **including `Down` ones**.
 7. **Finalize** when `roll.phase` is `ready_to_finalize` (`can_finalize` is `true`):
-   `animus cluster finalize <admin-addr>`, or `curl -s -X POST
-   http://LEADER_ADMIN/admin/cluster-version/finalize`. Finalize is manual, irreversible,
-   and one version step at a time. Until you finalize, the cluster still behaves as the
-   old version (a soak window), even though each upgraded node already writes new files.
+   `animus cluster finalize <control-leader-admin-addr>`, or `curl -s -X POST
+   http://LEADER_ADMIN/admin/cluster-version/finalize`. `roll wait` on the last node says
+   `all members report the new range; run animus cluster finalize ...`. Finalize is
+   manual by default, irreversible, and one version step at a time. Until you finalize,
+   the cluster still behaves as the old version (a soak window), even though each upgraded
+   node already writes new files. **Opt-in:** `animus cluster roll wait NODE_ADMIN
+   --finalize --yes` on the *last* node finalizes for you (it finds the control leader's
+   admin address itself, since the last node rolled was the former leader); on any other
+   node `--finalize` does nothing, so a script may pass it on every call. `--finalize`
+   without `--yes` is refused. There is no `--soak`: sleep before the last `wait` if you
+   want a soak.
+
+`animus cluster roll status ADMIN [--json]` can be run at any time, from any node: phase,
+`N of M` nodes on the new version, remaining nodes in roll order, down members, Finalize
+blockers, the roll-health verdict, and the next step the state machine would take.
 
 The dashboard Overview shows the same state in a Version card (cluster version, `N of M`
 nodes on the new build, roll phase, what is next, blockers and the roll-health verdict,
@@ -160,15 +188,15 @@ the upgrade are lost unless exported. Test this rehearsal before you need it.
   the handshake range, Finalize); N-1 and N can run in one cluster, N-1 to N only. See the
   rolling procedure above. Two *unrelated* builds, or skipping a release, remain
   unsupported; a node whose range excludes the cluster version refuses to start by name.
-- **Rolling upgrade (Phase 3):** the manual per-node procedure, `GET /admin/roll-health`,
-  the `roll` status object and the dashboard Version card are documented above (P3-A). The
-  `animus cluster roll` CLI and operator `spec.image` orchestration are not built yet; the
-  operator still does **not** gate a pod roll (see "Kubernetes" above: do not edit
+- **Rolling upgrade (Phase 3):** the per-node procedure, `animus cluster roll
+  plan|wait|status` (P3-B), `GET /admin/roll-health`, the `roll` status object and the
+  dashboard Version card are documented above. Operator `spec.image` orchestration is not
+  built yet; the operator still does **not** gate a pod roll (see "Kubernetes" above: do not edit
   `spec.image` on a running cluster). The roll's core: restart one node at a time, wait
   until healthy, then `cluster finalize`; **there is no rollback once a node has run the new
   binary**.
-- Criterion E-7 (rolling-upgrade procedure) stays open until the CLI and operator pieces
-  land and the manual procedure has been exercised on real nodes.
+- Criterion E-7 (rolling-upgrade procedure) stays open until the operator piece lands and
+  the procedure has been exercised on real nodes.
 
 Distinguish from rotation restarts: restarting nodes one at a time on the **same** build
 (certificate rotation, flag changes) is fine ([cert-rotation.md](cert-rotation.md)).

@@ -71,6 +71,7 @@ name = "animus-cli"
 version = "0.1.0-alpha.0"
 dependencies = [
  "animus-env",
+ "animus-roll",
  "animusd",
  "futures",
  "rcgen",

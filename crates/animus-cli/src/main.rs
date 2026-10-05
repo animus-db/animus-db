@@ -28,6 +28,8 @@
     reason = "animus-cli is a real-socket client CLI outside the Env seam, not system logic (ADR 0003); see ADR 0061 Decision 4"
 )]
 
+mod roll;
+
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -216,7 +218,10 @@ const SEED_USAGE: &str = "  seed <admin-addr> <table> <count> [--start N] [--key
 const TABLE_USAGE: &str = "  table preferred-leader <admin-addr> <table> <region>";
 
 const CLUSTER_USAGE: &str = "  cluster version <admin-addr> [--json]\n  \
-    cluster finalize <leader-admin-addr> [--to N] [--yes]";
+    cluster finalize <leader-admin-addr> [--to N] [--yes]\n  \
+    cluster roll plan <admin-addr> [--json]\n  \
+    cluster roll status <admin-addr> [--json]\n  \
+    cluster roll wait <node-admin-addr> [--node ID] [--timeout 10m] [--interval 2s] [--finalize --yes]";
 
 const ADMIN_USAGE: &str = "  admin <subcommand> <admin-addr> [args]:\n    \
     config|status|raft|raftkv|metrics|health <admin-addr>\n    \
@@ -1905,6 +1910,60 @@ async fn run_table(
     }
 }
 
+/// The finalize flow shared by `cluster finalize` and `cluster roll wait
+/// --finalize`: show the view, pre-flight it, require `yes`, POST, and poll
+/// for the new version.
+pub(crate) async fn run_finalize(
+    addr: &str,
+    to: Option<u32>,
+    yes: bool,
+    tls: Option<&tokio_rustls::TlsConnector>,
+) -> Result<(), String> {
+    let (status, resp) = http_call(addr, "GET", "/admin/cluster-version", None, tls).await?;
+    if !(200..300).contains(&status) {
+        println!("{resp}");
+        return Err(format!("admin request failed (HTTP {status})"));
+    }
+    let view: serde_json::Value =
+        serde_json::from_str(&resp).map_err(|e| format!("malformed reply: {e}"))?;
+    print!("{}", format_cluster_version(&view));
+    let (active, target) = finalize_preflight(&view, to)?;
+    if !yes {
+        return Err(FINALIZE_WARNING.into());
+    }
+    println!("finalizing cluster version {active} -> {target} ...");
+    let body = serde_json::json!({"to": target, "expected": active}).to_string();
+    let (status, resp) = http_call(
+        addr,
+        "POST",
+        "/admin/cluster-version/finalize",
+        Some(body),
+        tls,
+    )
+    .await?;
+    println!("{resp}");
+    if !(200..300).contains(&status) {
+        // A non-leader's 409 names the leader to retry on.
+        return Err(format!("cluster-version/finalize failed (HTTP {status})"));
+    }
+    // Poll until the version is observed at the target (bounded).
+    for _ in 0..60 {
+        let (st, r) = http_call(addr, "GET", "/admin/cluster-version", None, tls).await?;
+        if (200..300).contains(&st)
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&r)
+            && v["active"].as_u64() == Some(u64::from(target))
+        {
+            println!("cluster version is now {target}");
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    Err(format!(
+        "finalize was accepted but cluster version {target} was not observed within 30s; \
+         check `cluster version`"
+    ))
+}
+
 async fn run_cluster(
     args: &[String],
     tls: Option<&tokio_rustls::TlsConnector>,
@@ -1930,53 +1989,10 @@ async fn run_cluster(
         }
         Some("finalize") => {
             let fa = parse_finalize_args(&args[1..])?;
-            let (status, resp) =
-                http_call(&fa.addr, "GET", "/admin/cluster-version", None, tls).await?;
-            if !(200..300).contains(&status) {
-                println!("{resp}");
-                return Err(format!("admin request failed (HTTP {status})"));
-            }
-            let view: serde_json::Value =
-                serde_json::from_str(&resp).map_err(|e| format!("malformed reply: {e}"))?;
-            print!("{}", format_cluster_version(&view));
-            let (active, target) = finalize_preflight(&view, fa.to)?;
-            if !fa.yes {
-                return Err(FINALIZE_WARNING.into());
-            }
-            println!("finalizing cluster version {active} -> {target} ...");
-            let body = serde_json::json!({"to": target, "expected": active}).to_string();
-            let (status, resp) = http_call(
-                &fa.addr,
-                "POST",
-                "/admin/cluster-version/finalize",
-                Some(body),
-                tls,
-            )
-            .await?;
-            println!("{resp}");
-            if !(200..300).contains(&status) {
-                // A non-leader's 409 names the leader to retry on.
-                return Err(format!("cluster-version/finalize failed (HTTP {status})"));
-            }
-            // Poll until the version is observed at the target (bounded).
-            for _ in 0..60 {
-                let (st, r) =
-                    http_call(&fa.addr, "GET", "/admin/cluster-version", None, tls).await?;
-                if (200..300).contains(&st)
-                    && let Ok(v) = serde_json::from_str::<serde_json::Value>(&r)
-                    && v["active"].as_u64() == Some(u64::from(target))
-                {
-                    println!("cluster version is now {target}");
-                    return Ok(());
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            }
-            Err(format!(
-                "finalize was accepted but cluster version {target} was not observed within 30s; \
-                 check `cluster version`"
-            ))
+            run_finalize(&fa.addr, fa.to, fa.yes, tls).await
         }
-        _ => Err("cluster needs a subcommand: version | finalize".into()),
+        Some("roll") => roll::run_roll(&args[1..], tls).await,
+        _ => Err("cluster needs a subcommand: version | finalize | roll".into()),
     }
 }
 

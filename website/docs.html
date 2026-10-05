@@ -468,6 +468,11 @@
 <span class="p">$</span> <span class="k">animus cluster version &lt;admin-addr&gt; [--json]</span>
 <span class="p">$</span> <span class="k">animus cluster finalize &lt;leader-admin-addr&gt; [--to N] [--yes]</span>
 
+<span class="c"># rolling upgrade supervisor (ADR 0073 Phase 3): you restart each node; the CLI orders, gates and waits</span>
+<span class="p">$</span> <span class="k">animus cluster roll plan &lt;admin-addr&gt; [--json]</span>     <span class="c"># the roll order; exits 1 if a precondition fails</span>
+<span class="p">$</span> <span class="k">animus cluster roll wait &lt;node-admin-addr&gt; [--timeout 10m]</span>   <span class="c"># until that node is healthy and reports the new range</span>
+<span class="p">$</span> <span class="k">animus cluster roll status &lt;admin-addr&gt; [--json]</span>
+
 <span class="c"># multi-Region strongly consistent global tables (cluster version 2)</span>
 <span class="p">$</span> <span class="k">animus admin global-tables &lt;admin-addr&gt;</span>
 <span class="p">$</span> <span class="k">animus table preferred-leader &lt;admin-addr&gt; &lt;table&gt; &lt;region&gt;</span>
@@ -660,18 +665,23 @@
           config-gated per cluster. A cluster with no TLS configured is unauthenticated plain TCP,
           exactly as before; caller identity on the DynamoDB port is opt-in SigV4 either way, not
           affected by TLS.</li>
-        <li><strong>Rolling upgrades are manual, one node at a time.</strong> Restart one node
-          at a time, waiting until it is <code>Active</code> and no tablet is under-replicated,
-          then run <code>animus cluster finalize</code> once every member (down ones too)
-          reports the new version range. Each node advertises the cluster versions its binary
+        <li><strong>Rolling upgrades are driven by hand, one node at a time, with CLI support.</strong>
+          <code>animus cluster roll plan</code> prints the order (data-only nodes, then control voters,
+          the control leader last) and refuses if the cluster is not healthy; you restart one node on the
+          new binary; <code>animus cluster roll wait</code> blocks until that node is <code>Active</code>,
+          has reported the new range and the server-side roll-health check passes (no tablet
+          under-replicated, its own groups caught up); then run <code>animus cluster finalize</code>
+          once every member (down ones too) reports the new version range
+          (<code>roll wait --finalize --yes</code> on the last node does it for you, opt-in).
+          <code>animus cluster roll status</code> shows progress. Each node advertises the cluster versions its binary
           supports; <code>animus cluster version</code> shows the active version, every node's
           range and what blocks raising it; finalize raises it one step, on the leader only,
           irreversibly, and is refused while any member is down, leaving, never activated or
           does not support the target. A mixed-version simulation corpus covers the roll.
           Supported: from today's binaries to this release, and from one release to the next.
           Not supported: skipping a release, rolling a node back after it ran the new binary,
-          and an old binary joining once versioning has started (refused by name). The
-          Kubernetes operator does not orchestrate this yet.</li>
+          and an old binary joining once versioning has started (refused by name). The CLI
+          restarts nothing itself, and the Kubernetes operator does not orchestrate this yet.</li>
         <li><strong>Restore always creates a brand-new table, never in-place</strong> — matching
           real DynamoDB, for both on-demand backups (<code>RestoreTableFromBackup</code>) and
           continuous backups (<code>RestoreTableToPointInTime</code>); a source table's backup
