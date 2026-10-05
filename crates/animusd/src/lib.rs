@@ -12069,7 +12069,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// this requires the receiving node to be the control leader; a follower
     /// returns an error and the operator retries on the leader). Preserves the
     /// member's existing labels. Returns the accepted state or an error.
-    pub(crate) fn admin_drain(&self, node: NodeId) -> Result<(), String> {
+    /// Refuses (unless `force`) to drain the last Active member of a Region a
+    /// global table pins — see [`global_tables::drain_strands_region`].
+    pub(crate) fn admin_drain(&self, node: NodeId, force: bool) -> Result<(), String> {
         // Check leadership BEFORE reading `self.control.metadata_cached()`
         // for the member lookup below (ADR 0035 PR5 staleness-audit fix,
         // mirroring `admin_remove_member`'s already-fixed ordering — same
@@ -12085,6 +12087,14 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         let Some(member) = meta.members.get(&node) else {
             return Err(format!("node {node} is not a cluster member"));
         };
+        // Decommission guard (ADR 0075 plan D10): the last Active member of a
+        // Region a global table pins cannot be drained (the strict region pin
+        // would never re-place its replica) unless forced.
+        if !force && let Some((region, table)) = global_tables::drain_strands_region(&meta, &node) {
+            return Err(global_tables::drain_strands_region_error(
+                &node, &region, &table,
+            ));
+        }
         let labels = member.labels.clone();
         match leader.propose(MetaCommand::UpsertMember {
             node,

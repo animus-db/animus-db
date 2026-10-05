@@ -7629,7 +7629,7 @@ impl SimCluster {
     pub(crate) fn drain(&mut self, node: u64) {
         let leader = self.control_leader_index();
         let ctx = self.shared.ctx(leader as u64);
-        ctx.admin_drain(nid(node)).unwrap_or_else(|e| {
+        ctx.admin_drain(nid(node), false).unwrap_or_else(|e| {
             panic!("admin_drain(node={node}) must be accepted by the control leader: {e}")
         });
         self.poll_until(Duration::from_secs(20), |c| {

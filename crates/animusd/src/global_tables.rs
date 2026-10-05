@@ -294,3 +294,245 @@ pub(crate) async fn update_table_global<E: Env, R: RelayClient>(
         ctx.env.sleep(SCHEMA_POLL_INTERVAL).await;
     }
 }
+
+// ---- operations: decommission guard, admin view, preferred-leader action ----
+
+/// The decommission guard (plan decision D10): draining `node` would strand a
+/// global table when `node` is the **last `Active` member of a Region** the
+/// table pins. The strict region pin (D8) never re-places a replica into
+/// another Region, so the replica `node` holds could never leave it and the
+/// drain would stall forever. Returns the first `(region, table)` so
+/// affected, `None` when the drain is safe (or `node` carries no Region
+/// label, or no global table pins its Region).
+#[must_use]
+pub(crate) fn drain_strands_region(
+    meta: &Metadata,
+    node: &animus_env::NodeId,
+) -> Option<(String, String)> {
+    let region = meta.members.get(node)?.labels.get(REGION_LABEL)?.clone();
+    let other_active = meta.members.iter().any(|(id, m)| {
+        id != node && m.status == NodeStatus::Active && m.labels.get(REGION_LABEL) == Some(&region)
+    });
+    if other_active {
+        return None;
+    }
+    meta.schemas
+        .iter()
+        .find(|(_, s)| {
+            s.global
+                .as_ref()
+                .is_some_and(|g| g.regions.contains(&region))
+        })
+        .map(|(table, _)| (region, table.clone()))
+}
+
+/// The refusal text of the decommission guard.
+#[must_use]
+pub(crate) fn drain_strands_region_error(
+    node: &animus_env::NodeId,
+    region: &str,
+    table: &str,
+) -> String {
+    format!(
+        "node {node} is the last Active member of Region `{region}`, which the multi-Region \
+         strongly consistent table `{table}` pins a replica to: a drain could never re-place \
+         that replica (placement never moves a replica to another Region) and would stall; add \
+         another node in `{region}` first, or drain anyway with `force` (`animus admin drain <addr> \
+         <node> --force`)"
+    )
+}
+
+/// `GET /admin/global-tables` (ADR 0075 section 8): every global table's
+/// Regions, witness, preferred-leader Region, derived replica status and
+/// per-tablet placement by Region, plus the cluster's Active members per
+/// Region and the warnings an operator needs (a pinned Region with no Active
+/// member, a control quorum a single Region's loss would break). Leader
+/// identity is **node-local**: a tablet this node hosts reports its known
+/// leader and whether that leader sits off the preferred Region; any other
+/// tablet reports `null` (a fleet view fans out over `/admin/global-tables`
+/// on every node, like `/admin/raftkv`).
+#[must_use]
+pub(crate) fn admin_global_tables_view<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+) -> serde_json::Value {
+    use serde_json::json;
+    let meta = ctx.effective_metadata();
+    let region_of = |n: &animus_env::NodeId| -> Option<String> {
+        meta.members.get(n)?.labels.get(REGION_LABEL).cloned()
+    };
+    let hosted: std::collections::BTreeMap<_, _> = ctx.edge.hosted_groups().into_iter().collect();
+
+    let mut active_by_region: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for (id, m) in &meta.members {
+        if let Some(r) = m.labels.get(REGION_LABEL) {
+            let e = active_by_region.entry(r.clone()).or_default();
+            if m.status == NodeStatus::Active {
+                e.push(id.to_string());
+            }
+        }
+    }
+
+    let mut warnings: Vec<String> = Vec::new();
+    let mut tables = Vec::new();
+    for (name, schema) in meta.schemas.iter() {
+        let Some(spec) = &schema.global else { continue };
+        let ready = meta.table_ready_regions(name);
+        let mut tablets = Vec::new();
+        for (id, t) in meta
+            .tablets_for_table(name)
+            .filter(|(_, t)| t.is_routable())
+        {
+            let replicas: Vec<_> = t
+                .replicas
+                .iter()
+                .map(|n| json!({"node": n.to_string(), "region": region_of(n)}))
+                .collect();
+            let leader = hosted.get(id).and_then(|g| g.leader());
+            let leader_region = leader.as_ref().and_then(&region_of);
+            tablets.push(json!({
+                "tablet": id.0,
+                "state": format!("{:?}", t.state),
+                "replicas": replicas,
+                "leader": leader.map(|l| l.to_string()),
+                "leader_region": leader_region,
+                "leader_off_preferred": leader_region
+                    .as_ref()
+                    .map(|r| *r != spec.preferred_leader_region),
+            }));
+        }
+        for r in &spec.regions {
+            if active_by_region.get(r).is_none_or(Vec::is_empty) {
+                warnings.push(format!(
+                    "table `{name}`: Region `{r}` has no Active member; its replicas wait for the \
+                     Region to return (the strict region pin never repairs across Regions)"
+                ));
+            }
+        }
+        tables.push(json!({
+            "table": name,
+            "consistency": "STRONG",
+            "regions": spec.regions,
+            "witness": spec.witness,
+            "preferred_leader_region": spec.preferred_leader_region,
+            "replica_status": spec
+                .regions
+                .iter()
+                .map(|r| (r.clone(), if ready.contains(r) { "ACTIVE" } else { "CREATING" }))
+                .collect::<std::collections::BTreeMap<_, _>>(),
+            "tablets": tablets,
+        }));
+    }
+
+    // The control quorum: losing the Region that holds the most voters must
+    // leave a majority (ADR 0075 section 3.4).
+    if !tables.is_empty()
+        && let Some(voters) = ctx.control.config()
+        && voters.len() >= 3
+    {
+        let mut per: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        for v in &voters {
+            if let Some(r) = region_of(v) {
+                *per.entry(r).or_default() += 1;
+            }
+        }
+        let quorum = voters.len() / 2 + 1;
+        for (r, k) in per {
+            if voters.len() - k < quorum {
+                warnings.push(format!(
+                    "control plane: Region `{r}` holds {k} of {} control voters; losing it loses \
+                     the control quorum (no DDL or placement changes until it returns)",
+                    voters.len()
+                ));
+            }
+        }
+    }
+
+    json!({
+        "enabled": ctx.edge.version().features.is_open(Gate::GlobalTables),
+        "tables": tables,
+        "regions": active_by_region
+            .into_iter()
+            .map(|(r, n)| (r, json!({"active_members": n})))
+            .collect::<std::collections::BTreeMap<_, _>>(),
+        "warnings": warnings,
+    })
+}
+
+/// `POST /admin/table/preferred-leader {table, region}` (plan decision D3):
+/// re-point a global table's preferred-leader Region (`MetaCommand::
+/// SetGlobalPreferredLeader`). Refused with the same reasons the apply
+/// rejects (not global, Region not one of the table's, the witness Region),
+/// but **before** proposing, so the operator gets a named error rather than a
+/// bare `Rejected`. Relayed like any schema proposal (`propose_schema`), then
+/// confirmed by observing the new preferred Region in replicated `Metadata`.
+pub(crate) async fn admin_set_preferred_leader<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    table: &str,
+    region: &str,
+) -> (u16, serde_json::Value) {
+    use serde_json::json;
+    if !ctx.edge.version().features.is_open(Gate::GlobalTables) {
+        return (
+            409,
+            json!({"error": "global tables are not enabled: finalize the cluster version to 2 \
+                (`animus cluster finalize`) first"}),
+        );
+    }
+    let meta = ctx.metadata_fresh().await;
+    let Some(spec) = meta.table_global(table) else {
+        return (
+            404,
+            json!({"error": format!("table `{table}` is not a global table")}),
+        );
+    };
+    if !spec.regions.iter().any(|r| r == region) {
+        return (
+            400,
+            json!({"error": format!(
+                "Region `{region}` is not one of table `{table}`'s Regions {:?}",
+                spec.regions
+            )}),
+        );
+    }
+    if spec.witness.as_deref() == Some(region) {
+        return (
+            400,
+            json!({"error": format!(
+                "Region `{region}` is the witness of table `{table}`; a witness never leads"
+            )}),
+        );
+    }
+    if spec.preferred_leader_region == region {
+        return (
+            200,
+            json!({"ok": true, "table": table, "preferred_leader_region": region, "changed": false}),
+        );
+    }
+    let deadline = ctx.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
+    loop {
+        ctx.propose_schema(&MetaCommand::SetGlobalPreferredLeader {
+            table: table.to_owned(),
+            region: region.to_owned(),
+        })
+        .await;
+        let fresh = ctx.metadata_fresh().await;
+        if fresh
+            .table_global(table)
+            .is_some_and(|g| g.preferred_leader_region == region)
+        {
+            return (
+                200,
+                json!({"ok": true, "table": table, "preferred_leader_region": region, "changed": true}),
+            );
+        }
+        if ctx.env.now() >= deadline {
+            return (
+                504,
+                json!({"error": "SetGlobalPreferredLeader did not commit to the control plane in \
+                    time (no leader reachable, or the cluster refused it)"}),
+            );
+        }
+        ctx.env.sleep(SCHEMA_POLL_INTERVAL).await;
+    }
+}
