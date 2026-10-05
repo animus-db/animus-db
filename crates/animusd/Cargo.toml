@@ -65,11 +65,22 @@ chaos = []
 # the same reason as `chaos`.
 # Run: `ANIMUS_SOAK_DURATION=15m cargo test -p animusd --features soak --test soak -- --nocapture`.
 soak = []
+# ADR 0073 Phase 3 (P3-E, D10): the previous-release rolling-upgrade test
+# (`tests/upgrade_previous_release.rs`). Opt-in because it needs the reference
+# R-1 binary (`scripts/build-upgrade-from.sh`); with the feature on, a missing
+# binary FAILS the test, it never skips. Still compiled by `clippy --all-features`.
+# Run: `ANIMUS_UPGRADE_FROM_BIN=$(scripts/build-upgrade-from.sh) cargo test -p animusd --features upgrade-from --test upgrade_previous_release -- --nocapture --test-threads=1`.
+upgrade-from = []
 
 [[test]]
 name = "chaos"
 path = "tests/chaos.rs"
 required-features = ["chaos"]
+
+[[test]]
+name = "upgrade_previous_release"
+path = "tests/upgrade_previous_release.rs"
+required-features = ["upgrade-from"]
 
 [[test]]
 name = "soak"

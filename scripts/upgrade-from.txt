@@ -1,0 +1,11 @@
+# The pinned reference "R-1" for the previous-release cross-version job
+# (ADR 0073 Phase 3, D10; docs/release.md checklist). One git ref (a tag or a
+# commit SHA) on the first non-comment line; nothing else.
+#
+# Until the first `v*` tag exists this is the last Phase 1 tree, ac57d56a (an
+# ancestor of main): no version era, no `cluster-version` endpoint, the oldest
+# build a rolling upgrade must still take over (maintainer decision 7,
+# 2026-10-05). Once a release R-1 is tagged, cutting release R moves this to
+# R-1's tag in the release PR and re-runs the `upgrade-previous-release` job
+# green BEFORE tagging R (docs/release.md).
+ac57d56a0dad5da338dd70f03ac24b260833dc3f

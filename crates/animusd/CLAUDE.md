@@ -12136,6 +12136,40 @@ both targets, so a helper only one uses needs `#[allow(dead_code)]` (clippy
 `[node-exit]` or `[node-panic]` there is always a finding; node logs are not
 rotated, so a multi-day run needs disk for them.
 
+## Previous-release rolling upgrade (ADR 0073 Phase 3 P3-E, D10)
+
+`tests/upgrade_previous_release.rs` (opt-in `upgrade-from` cargo feature; CI job
+`upgrade-previous-release`) starts a real multi-process cluster of the pinned
+**R-1** `animusd` (`scripts/upgrade-from.txt`, built from source and cached by
+SHA by `scripts/build-upgrade-from.sh`; `ANIMUS_UPGRADE_FROM_BIN`), runs the
+chaos harness's recorded workload and oracles (`chaos_support`, reused as in the
+soak), then rolls it onto this tree with the real `animus cluster roll
+plan/wait` and `finalize` CLI (`animus` is found next to `animusd`, or
+`ANIMUS_CLI_BIN`), restarts the whole cluster on the current build, and checks
+durability/cycles/convergence, a bounded write stall, the era, `can_finalize`,
+finalize, and that the state only grew across the whole-cluster restart. Four
+variants (SIGTERM+transfer on 3 nodes; the same on 4 nodes with a restart gap
+past the 5 s repair dwell, which is the **D4 repair-churn measurement**; SIGKILL
+of the control leader; SIGKILL + a torn control/shared WAL tail). **Gotchas**:
+with the feature on a missing R-1 binary **panics** (never skips: a skipped
+cross-version job is a silent pass); `roll plan` is taken once, over the Phase 1
+cluster, and followed in order (it is not re-entrant mid-roll over Phase 1
+binaries, no node has a recorded range until the era starts); a node restarted
+for less than the repair dwell causes no churn even with a spare node, so the
+measurement needs `ANIMUS_UPGRADE_FROM_RESTART_GAP_SECS`; a write the client
+timed out on can commit after the workload stopped, so "unchanged after a
+restart" is wrong, "grew, in order, only by writes this workload issued" is
+right; **Known findings** against the pinned `ac57d56a` (module doc): its own
+abort-tombstone defect (`efcaa6cb`), legacy v1 intents aborted by the new
+binary, and the ungated `txn-envelope` v2 intent (an R-1 replica panics on an
+upgraded node's repair snapshot), so the workload runs without multi-key
+transactions unless `ANIMUS_UPGRADE_FROM_TXN=1` (CI runs one such variant as an
+informational, non-blocking step);
+`ANIMUS_UPGRADE_FROM_CONTROL=same-binary|current-only` runs the same
+roll with no binary change, to tell a mixed-version defect from a restart/repair
+defect; a failure writes history, op trace, violations and node logs under
+`$ANIMUS_UPGRADE_FROM_REPORT_DIR/<variant>-failure/`.
+
 ## StorageFull on the client path and in `/admin/health` (R-01 (d), issue #1185)
 
 `CpGroup::is_storage_full` + `refuse_if_storage_full` (`lib.rs`) refuse a write
