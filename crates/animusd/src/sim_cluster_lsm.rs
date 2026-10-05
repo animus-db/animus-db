@@ -131,6 +131,18 @@ impl SimReconciler {
         }
     }
 
+    /// ADR 0073 Phase 2 (P2-C): inject the node's control-fed handle, exactly
+    /// as production's node assembly does.
+    pub(crate) fn set_cluster_features(
+        &mut self,
+        features: animus_control::version::ClusterFeatures,
+    ) {
+        match self {
+            SimReconciler::Mem(r) => r.set_cluster_features(features),
+            SimReconciler::Lsm(r) => r.set_cluster_features(features),
+        }
+    }
+
     pub(crate) async fn tick(&mut self, view: &MetadataView) {
         match self {
             SimReconciler::Mem(r) => r.tick(view).await,

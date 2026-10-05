@@ -14,7 +14,8 @@
 //! the replica (lossless incl. `node_versions`/`cluster_version`); a
 //! non-`Applied` command changes nothing; `cluster_version` only ever rises,
 //! by exactly one; a `Finalize` succeeds only if no registered node blocks it
-//! (checked against the pre-state independently of `apply`); once finalized no
+//! (checked against the pre-state independently of `apply`, including the
+//! member-status half, issue #1168); once finalized no
 //! entry's `max` is below the version; `UpsertMember` never touches
 //! `node_versions`; a removed node leaves no record and never blocks; the era
 //! never turns off once on (sticky marker, even if every reporter is removed).
@@ -125,6 +126,13 @@ fn finalize_has_no_blocker(pre: &Metadata, expected: u32, target: u32) -> bool {
     pre.versioning_active()
         && expected == pre.cluster_version()
         && expected.checked_add(1) == Some(target)
+        // Decision 6 (issue #1168), spelled out independently of
+        // `Member::finalize_block_reason`.
+        && pre.members.values().all(|m| match m.status {
+            NodeStatus::Active => true,
+            NodeStatus::Joining => m.has_activated,
+            NodeStatus::Down | NodeStatus::Leaving => false,
+        })
         && pre.members.keys().chain(pre.node_addrs.keys()).all(|n| {
             pre.node_versions
                 .get(n)
