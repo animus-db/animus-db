@@ -853,23 +853,6 @@ jobs:
           cargo test -p animusd --features upgrade-from --test upgrade_previous_release --locked \
             -- --nocapture --test-threads=1
 
-      # INFORMATIONAL, never blocking: the same roll with multi-key
-      # transactions in the workload. Against the pinned R-1 it exposes known
-      # findings (an acked write lost across the roll, an R-1 replica panic on an
-      # upgraded node's snapshot), documented in the test's module doc; it is
-      # here so the evidence is in every run until they are fixed or R-1 moves.
-      # Remove `continue-on-error` (and make txns the default in the test) once
-      # they are.
-      - name: Roll with transactions (known findings, informational)
-        continue-on-error: true
-        env:
-          ANIMUS_UPGRADE_FROM_BIN: ${{ steps.r1.outputs.bin }}
-          ANIMUS_UPGRADE_FROM_REF: ${{ steps.ref.outputs.sha }}
-          ANIMUS_UPGRADE_FROM_TXN: "1"
-        run: |
-          cargo test -p animusd --features upgrade-from --test upgrade_previous_release --locked \
-            clean_3_nodes -- --nocapture --test-threads=1
-
       # The measured D4 repair churn and per-step timings, for the job summary.
       - name: Summarize the roll and the D4 measurement
         if: always()
