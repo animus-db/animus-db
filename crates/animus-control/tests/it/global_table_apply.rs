@@ -326,3 +326,75 @@ fn global_spec_validation_matrix() {
     s.regions.push("d".into());
     assert_eq!(s.validate(), Err(E::WrongRegionCount));
 }
+
+fn set_preferred(table: &str, region: &str) -> MetaCommand {
+    MetaCommand::SetGlobalPreferredLeader {
+        table: table.to_string(),
+        region: region.to_string(),
+    }
+}
+
+/// `SetGlobalPreferredLeader` (ADR 0075 section 3.3): applies to a global
+/// table, is idempotent, and every rejection is state-based and named.
+#[test]
+fn set_global_preferred_leader_apply_matrix() {
+    let mut m = world(&[1, 3, 5]);
+    // Not global yet.
+    assert_eq!(
+        m.apply(&set_preferred("t", "b")),
+        ApplyOutcome::Rejected("table is not a global table")
+    );
+    assert_eq!(
+        m.apply(&set_preferred("nope", "b")),
+        ApplyOutcome::Rejected("no such table schema")
+    );
+    let mut with_witness = spec();
+    with_witness.witness = Some("c".into());
+    assert_eq!(m.apply(&convert("t", with_witness)), ApplyOutcome::Applied);
+    // Same region: no-op.
+    assert_eq!(m.apply(&set_preferred("t", "a")), ApplyOutcome::NoOp);
+    // Unknown region, and the witness region: rejected, state untouched.
+    assert_eq!(
+        m.apply(&set_preferred("t", "z")),
+        ApplyOutcome::Rejected("preferred-leader region is not one of the table's regions")
+    );
+    assert_eq!(
+        m.apply(&set_preferred("t", "c")),
+        ApplyOutcome::Rejected("preferred-leader region is the witness")
+    );
+    assert_eq!(
+        m.schemas
+            .get("t")
+            .unwrap()
+            .global
+            .as_ref()
+            .unwrap()
+            .preferred_leader_region,
+        "a"
+    );
+    // A valid move applies and leaves the placement policy alone.
+    let policy_before = m.policies[&TabletId(1)].clone();
+    assert_eq!(m.apply(&set_preferred("t", "b")), ApplyOutcome::Applied);
+    assert_eq!(
+        m.schemas
+            .get("t")
+            .unwrap()
+            .global
+            .as_ref()
+            .unwrap()
+            .preferred_leader_region,
+        "b"
+    );
+    assert_eq!(m.policies[&TabletId(1)], policy_before);
+}
+
+/// Same single gate as the conversion (mutation: downgrade to `Base`), and the
+/// pinned JSON shape.
+#[test]
+fn set_global_preferred_leader_gate_and_pinned_json() {
+    assert_eq!(set_preferred("t", "b").required_gate(), Gate::GlobalTables);
+    assert_eq!(
+        serde_json::to_string(&set_preferred("t", "b")).unwrap(),
+        r#"{"SetGlobalPreferredLeader":{"table":"t","region":"b"}}"#
+    );
+}

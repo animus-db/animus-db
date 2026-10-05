@@ -981,6 +981,10 @@ pub fn is_relayable_command(command: &MetaCommand) -> bool {
         // (`version_wiring::relay_gate_verdict`), so relaying while the gate
         // is closed is refused by name, never appended.
         | MetaCommand::ConvertTableToGlobal { .. }
+        // Preferred-leader re-point (ADR 0075 section 3.3): same class and
+        // relay reason as `ConvertTableToGlobal` (the admin action may land
+        // on a follower); the receiver re-checks `Gate::GlobalTables`.
+        | MetaCommand::SetGlobalPreferredLeader { .. }
         // Resource tagging (roadmap W-06): schema-catalog class, same relay
         // reason as `SetTableTtl` — a follower-connected `TagResource`/
         // `UntagResource` must reach the control leader.
@@ -1639,6 +1643,10 @@ mod tests {
                     witness: None,
                     preferred_leader_region: "a".to_string(),
                 },
+            },
+            MetaCommand::SetGlobalPreferredLeader {
+                table: table.clone(),
+                region: "b".to_string(),
             },
             MetaCommand::TagResource {
                 table: table.clone(),

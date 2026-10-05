@@ -1193,20 +1193,33 @@ fn seed_table(w: &mut World) {
 /// build the `debug_assert!` in `ClusterFeatures::check` fires first, which is
 /// the point of the assert; see `gate_enforcement.rs`.)
 fn propose_while_closed(w: &World, seed: u64) {
+    propose_cmd_while_closed(w, seed, convert_cmd);
+    propose_cmd_while_closed(w, seed, preferred_cmd);
+}
+
+/// `SetGlobalPreferredLeader` (same gate as the conversion: one gate per
+/// release surface, ADR 0075 plan D1).
+fn preferred_cmd() -> MetaCommand {
+    MetaCommand::SetGlobalPreferredLeader {
+        table: TABLE.to_string(),
+        region: "b".to_string(),
+    }
+}
+
+fn propose_cmd_while_closed(w: &World, seed: u64, cmd: fn() -> MetaCommand) {
     let l = w.leader().expect("leader");
     let before = w.nodes[&l]
         .features()
         .violations(animus_control::version::GateSurface::MetaCommand);
     let last = w.nodes[&l].last_log_index();
     if cfg!(debug_assertions) {
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            w.nodes[&l].propose(convert_cmd())
-        }));
+        let r =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| w.nodes[&l].propose(cmd())));
         assert!(r.is_err(), "seed={seed}: a closed gate must debug_assert");
     } else {
         assert!(
             matches!(
-                w.nodes[&l].propose(convert_cmd()),
+                w.nodes[&l].propose(cmd()),
                 animus_control::raft::ProposeResult::NotLeader { leader: None }
             ),
             "seed={seed}: a closed gate must refuse"
@@ -1327,6 +1340,32 @@ fn run_global_gate(seed: u64, variant: u64) {
                         && m.policies
                             .values()
                             .all(|p| p.is_pinned() && p.allowed_values.len() == 1)
+                })
+        },
+    );
+    // The preferred-leader command shares the gate: accepted now.
+    w.propose_confirmed(
+        &preferred_cmd(),
+        &|m| {
+            m.schemas
+                .get(TABLE)
+                .and_then(|s| s.global.as_ref())
+                .is_some_and(|g| g.preferred_leader_region == "b")
+        },
+        "SetGlobalPreferredLeader at version 2",
+    );
+    w.poll(
+        Duration::from_secs(30),
+        "every replica applied the preferred-leader change and agrees",
+        &mut c,
+        &|w| {
+            wedged_replicas(w).is_empty()
+                && w.nodes.values().all(|n| {
+                    n.metadata()
+                        .schemas
+                        .get(TABLE)
+                        .and_then(|s| s.global.as_ref())
+                        .is_some_and(|g| g.preferred_leader_region == "b")
                 })
         },
     );

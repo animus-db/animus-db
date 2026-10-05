@@ -370,7 +370,10 @@ pub fn apply_and_derive_mirror(
         | MetaCommand::SetTableThroughput { table, .. }
         // W-06: a table's tags are likewise part of its schema entry.
         | MetaCommand::TagResource { table, .. }
-        | MetaCommand::UntagResource { table, .. } => {
+        | MetaCommand::UntagResource { table, .. }
+        // ADR 0075 section 3.3: the preferred-leader Region lives in the
+        // schema entry's `global` spec.
+        | MetaCommand::SetGlobalPreferredLeader { table, .. } => {
             if let Some(schema) = meta.schemas.get(table) {
                 writes.push(put_json(syskv::schema_key(table), schema));
             }
@@ -2673,6 +2676,10 @@ mod tests {
                     witness: None,
                     preferred_leader_region: "a".to_string(),
                 },
+            },
+            MetaCommand::SetGlobalPreferredLeader {
+                table: "t".to_string(),
+                region: "b".to_string(),
             },
             MetaCommand::RegisterNode {
                 node: nid(2),

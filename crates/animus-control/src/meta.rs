@@ -2261,6 +2261,21 @@ pub enum MetaCommand {
         table: TableName,
         spec: crate::schema::GlobalTableSpec,
     },
+    /// **Re-point a global table's preferred-leader Region** (ADR 0075 section
+    /// 3.3, G-01 stage G-c): sets `schema.global.preferred_leader_region`, which
+    /// each node's tablet-host reconciler reads (via `MetadataView`) to steer
+    /// the table's leaders. Placement is untouched — the replica set is already
+    /// one per Region.
+    ///
+    /// Rejected (state-based) when the table has no schema or is not global,
+    /// the Region is not one of the table's Regions, or it is the table's
+    /// witness. Setting the Region it already has is a no-op.
+    ///
+    /// **Gate: `Gate::GlobalTables`** — the same single gate as
+    /// [`ConvertTableToGlobal`](Self::ConvertTableToGlobal) (everything in
+    /// G-c ships at cluster version 2; a table can only be global once that
+    /// gate is open, so this command is meaningless before it).
+    SetGlobalPreferredLeader { table: TableName, region: String },
     /// Enable, reconfigure, or disable a table's **provisioned throughput**
     /// (ADR 0065 §5(b)) — the `CreateTable`/`UpdateTable` `BillingMode`/
     /// `ProvisionedThroughput` wire fields' own catalog mutation. Rejected
@@ -4915,6 +4930,27 @@ impl Metadata {
                 }
                 ApplyOutcome::Applied
             }
+            MetaCommand::SetGlobalPreferredLeader { table, region } => {
+                let Some(schema) = self.schemas.get_mut(table) else {
+                    return ApplyOutcome::Rejected("no such table schema");
+                };
+                let Some(global) = schema.global.as_mut() else {
+                    return ApplyOutcome::Rejected("table is not a global table");
+                };
+                if !global.regions.contains(region) {
+                    return ApplyOutcome::Rejected(
+                        "preferred-leader region is not one of the table's regions",
+                    );
+                }
+                if global.witness.as_ref() == Some(region) {
+                    return ApplyOutcome::Rejected("preferred-leader region is the witness");
+                }
+                if global.preferred_leader_region == *region {
+                    return ApplyOutcome::NoOp;
+                }
+                global.preferred_leader_region.clone_from(region);
+                ApplyOutcome::Applied
+            }
             MetaCommand::SetTableThroughput { table, spec } => {
                 let Some(schema) = self.schemas.get_mut(table) else {
                     return ApplyOutcome::Rejected("no such table schema");
@@ -6440,7 +6476,8 @@ impl crate::version::GatedCommand for MetaCommand {
             // ADR 0075 (G-01 stage G-c): the first real gate. An older voter
             // cannot decode the variant nor the `TableSchema.global` /
             // `PlacementPolicy.allowed_values` fields it writes.
-            MetaCommand::ConvertTableToGlobal { .. } => Gate::GlobalTables,
+            MetaCommand::ConvertTableToGlobal { .. }
+            | MetaCommand::SetGlobalPreferredLeader { .. } => Gate::GlobalTables,
             MetaCommand::ReportNodeVersion { .. } | MetaCommand::FinalizeClusterVersion { .. } => {
                 Gate::Era
             }
