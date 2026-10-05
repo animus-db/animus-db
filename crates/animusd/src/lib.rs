@@ -22356,6 +22356,11 @@ mod sim_cluster_upgrade_corpus;
 #[cfg(test)]
 mod sim_cluster_zone_placement;
 
+/// G-01 stage G-c, M4: the MRSC stretch-table cluster corpus
+/// (`ANIMUS_MRSC_SEEDS`) — see that module's own doc.
+#[cfg(test)]
+mod sim_cluster_mrsc;
+
 /// A first deterministic smoke over `SimClusterHandle::dynamo`/`SimCluster::
 /// dynamo` (ADR 0061 rung D2 PR 1) — the DynamoDB wire edge, decoded by
 /// `animus_dynamo::wire::decode_request` and run through `dynamo::

@@ -356,6 +356,24 @@ fn build_reconciler(
     reconciler
 }
 
+thread_local! {
+    /// Test-only negative-control switch (`sim_cluster_mrsc`): while set, every
+    /// node's reconciler loop feeds an EMPTY preferred-leader map, so the
+    /// preferred-leader step has nothing to act on. `SimEnv` runs on the
+    /// calling thread, so a thread-local scopes it to one test.
+    static PREFERRED_LEADER_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Switch the preferred-leader step off (`true`) or back on for this test's
+/// cluster (see [`PREFERRED_LEADER_DISABLED`]).
+pub(crate) fn set_preferred_leader_disabled(disabled: bool) {
+    PREFERRED_LEADER_DISABLED.with(|c| c.set(disabled));
+}
+
+fn preferred_leader_disabled() -> bool {
+    PREFERRED_LEADER_DISABLED.with(std::cell::Cell::get)
+}
+
 /// Drive `reconciler`'s per-tick lifecycle on `ctx`'s own node — this
 /// fixture's ONE tablet-hosting path since ADR 0061 rung D4 PR 1 (closing
 /// issue #715, see the module doc's own "Updated since D3" section),
@@ -405,7 +423,11 @@ fn spawn_reconciler_loop(ctx: SimNodeCtx, mut reconciler: SimReconciler) {
             let regions = animus_control::timing::region_map(
                 meta.members.iter().map(|(id, m)| (id, &m.labels)),
             );
-            let preferred_leader = crate::leader_preferences(&meta);
+            let preferred_leader = if preferred_leader_disabled() {
+                BTreeMap::new()
+            } else {
+                crate::leader_preferences(&meta)
+            };
             let view = MetadataView {
                 tablets: meta.tablets,
                 down,
