@@ -109,6 +109,26 @@ pub struct Member {
     pub has_activated: bool,
 }
 
+impl Member {
+    /// Why this member alone blocks [`MetaCommand::FinalizeClusterVersion`]
+    /// (ADR 0073 decision 6), if it does: a `Down` or `Leaving` member, or a
+    /// `Joining` one that never activated. Such a node still holds replicas
+    /// and maybe a vote, and returning on an old binary after a finalize it
+    /// would be refused for good. The one source of truth for the apply arm
+    /// and `animusd`'s admin pre-check (issue #1168).
+    #[must_use]
+    pub fn finalize_block_reason(&self) -> Option<&'static str> {
+        match self.status {
+            NodeStatus::Down => Some("member is Down"),
+            NodeStatus::Leaving => Some("member is Leaving"),
+            NodeStatus::Joining if !self.has_activated => {
+                Some("member is Joining (never activated)")
+            }
+            NodeStatus::Joining | NodeStatus::Active => None,
+        }
+    }
+}
+
 /// A member's full address book (ADR 0032 PR1): every listen address a node
 /// exposes, replicated so any node can forward/relay to any other regardless
 /// of when it joined. Keyed by the member's node id in
@@ -2568,7 +2588,9 @@ pub enum MetaCommand {
     /// step. Rejected unless the era is active, `expected` is the current
     /// [`Metadata::cluster_version`] (a CAS), `target == expected + 1`, and
     /// every node in the required set has a `node_versions` entry whose
-    /// range contains `target`. Apply never reads a feature gate.
+    /// range contains `target`, and no member is `Down`, `Leaving` or a
+    /// never-activated `Joining` ([`Member::finalize_block_reason`], issue
+    /// #1168). Apply never reads a feature gate.
     FinalizeClusterVersion {
         expected: ClusterVersion,
         target: ClusterVersion,
@@ -5208,6 +5230,20 @@ impl Metadata {
                 if expected.checked_add(1) != Some(*target) {
                     return ApplyOutcome::Rejected("target must be exactly expected + 1");
                 }
+                // Decision 6 (issue #1168): the status half is enforced here,
+                // not only in the admin pre-check, which reads an applied
+                // cache and so can race a concurrent status flip. Apply is a
+                // pure function of the replicated state, so every replica
+                // agrees; this is a state check, never a feature gate.
+                if self
+                    .members
+                    .values()
+                    .any(|m| m.finalize_block_reason().is_some())
+                {
+                    return ApplyOutcome::Rejected(
+                        "blocked: a member is Down, Leaving, or a never-activated Joining",
+                    );
+                }
                 for node in self.required_version_set() {
                     match self.node_versions.get(&node) {
                         None => {
@@ -6263,6 +6299,17 @@ impl crate::version::GatedCommand for MetaCommand {
     fn required_gate(&self) -> crate::version::Gate {
         use crate::version::Gate;
         match self {
+            // Test/sim builds: the `synthetic.gate` label makes an
+            // `UpsertMember` require a synthetic gate (the gate ladder).
+            #[cfg(any(test, feature = "sim-versions"))]
+            MetaCommand::UpsertMember { labels, .. }
+                if labels.contains_key(crate::version::SYNTHETIC_GATE_LABEL) =>
+            {
+                labels
+                    .get(crate::version::SYNTHETIC_GATE_LABEL)
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .map_or(Gate::Base, Gate::Synthetic)
+            }
             MetaCommand::NoOp
             | MetaCommand::UpsertMember { .. }
             | MetaCommand::CreateTablet { .. }

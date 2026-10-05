@@ -1230,6 +1230,10 @@ and `SimEnv` override them natively. `EncryptedDisk` deliberately uses the
 defaults (its per-file frame index makes a native rename-based swap
 non-trivial), so under `--encryption-key` the swap re-reads and `replace`s.
 
+## Fuzzing (roadmap R-01 (c))
+
+The `ADE1` encryption envelope and the handshake preamble/extension parsers are the `encryption_envelope` and `net_frames` fuzz targets; the private envelope scan/open is exposed through the off-by-default `fuzzing` feature (`encrypted::fuzzing`). See `fuzz/README.md` (stable smoke: `cd fuzz && cargo test --release --test smoke`).
+
 **Adding a `Metric` (R-01 (f)):** append the variant, its `ALL` row and its
 `name()` arm, then update every doc/alert that should reference it; the
 `animusd` test `sim_cluster_admin::metric_references_exist_in_exposition`

@@ -1,0 +1,1 @@
+INSERT INTO t VALUE {'pk': <<'a', 'b'>>} ON CONFLICT DO NOTHING

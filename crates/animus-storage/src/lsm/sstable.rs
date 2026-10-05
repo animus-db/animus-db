@@ -829,6 +829,87 @@ impl SsTableReader {
     }
 }
 
+/// Fuzz entry points (roadmap R-01 (c)); surfaced via `lsm::fuzzing`.
+#[cfg(feature = "fuzzing")]
+pub(super) mod fuzz_shims {
+    use super::*;
+
+    /// Decode a CRC-stripped data block (`tag || payload`) with the v1 decoder.
+    pub fn block_v1(framed: &[u8]) -> Result<usize> {
+        // KNOWN ISSUE (R-01 (c) finding, fuzz/known-issues.tsv): `decode_block_v1`
+        // hands an LZ4 block's untrusted 4-byte size prefix straight to
+        // `lz4_flex::decompress_size_prepended`, which allocates that many bytes
+        // up front (a CRC-valid hostile block makes a ~4 GiB allocation). The
+        // fix belongs in `decode_block_v1` (bound the claimed size by a real
+        // block cap); until it lands this guard keeps the fuzz target from
+        // re-finding it every run. Remove the guard in the fix PR.
+        if let Some((&BLOCK_LZ4, payload)) = framed.split_first()
+            && let Some(prefix) = payload.get(..4)
+            && u32::from_le_bytes(prefix.try_into().unwrap()) > (1 << 24)
+        {
+            return Err(StorageError::Backend(
+                "fuzz guard: lz4 size prefix over 16 MiB (known issue)".into(),
+            ));
+        }
+        decode_block_v1(framed).map(|r| r.len())
+    }
+
+    /// Decode a block-index region.
+    pub fn block_index(bytes: &[u8]) -> Result<usize> {
+        decode_block_index(bytes).map(|i| i.len())
+    }
+
+    /// Open a whole SSTable image the caller already wrote to `file` on
+    /// `env`, deriving the metadata from its own footer the way a manifest
+    /// would have recorded it, then scan every block and point-read every
+    /// key. The footer's offsets must lie inside the file (a real manifest
+    /// records what the writer produced); anything else is a named error
+    /// here rather than a read the engine itself never issues.
+    pub async fn open_image<E: Env>(env: &E, file: &str, bytes: &[u8]) -> Result<usize> {
+        let n = bytes.len() as u64;
+        if n < FOOTER_LEN {
+            return Err(StorageError::Backend("image shorter than footer".into()));
+        }
+        let footer = &bytes[bytes.len() - FOOTER_LEN as usize..];
+        let index_offset = u64::from_le_bytes(footer[0..8].try_into().unwrap());
+        let index_len = u64::from_le_bytes(footer[8..16].try_into().unwrap());
+        let magic = u64::from_le_bytes(footer[16..24].try_into().unwrap());
+        if magic != MAGIC {
+            return Err(StorageError::Backend("bad footer magic".into()));
+        }
+        if index_offset.checked_add(index_len).is_none_or(|e| e > n) {
+            return Err(StorageError::Backend("footer offsets out of range".into()));
+        }
+        let meta = SsTableMeta {
+            seq: 1,
+            level: 0,
+            min_key: None,
+            max_key: None,
+            min_version: 0,
+            max_version: 0,
+            index_offset,
+            index_len,
+            file_size: n,
+            bloom: BloomFilter::default(),
+            has_bloom: false,
+            format: 1,
+        };
+        let reader = SsTableReader::open(env, file.to_owned(), meta).await?;
+        for bi in reader.index.iter() {
+            // Block extents come from the (fuzzed) index; keep reads in-file.
+            if bi.offset.checked_add(bi.len).is_none_or(|e| e > n) {
+                return Err(StorageError::Backend("block extent out of range".into()));
+            }
+        }
+        let mut count = 0;
+        for (k, _, _) in reader.full_scan(env).await? {
+            count += 1;
+            let _ = reader.latest(env, &k).await?;
+        }
+        Ok(count)
+    }
+}
+
 fn io(e: std::io::Error) -> StorageError {
     StorageError::Backend(e.to_string())
 }

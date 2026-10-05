@@ -1,0 +1,177 @@
+name: fuzz
+
+# Fuzzing of every untrusted parser (roadmap R-01 (c); see fuzz/README.md).
+#
+#  * `smoke-stable`   per push/PR, stable 1.96: the deterministic smoke
+#                     (seeds + seeded mutations, no libFuzzer). Fast, fully
+#                     reproducible, catches a regression a seed already covers.
+#  * `libfuzzer-smoke` per push/PR, nightly cargo-fuzz: every target for
+#                     FUZZ_SMOKE_SECS (60) on top of the seed corpus
+#                     generated from the golden format fixtures.
+#  * `libfuzzer-nightly` on a schedule (and on demand): each target gets a long
+#                     run (default 20 min) in its own job, with the corpus
+#                     carried between nights through the Actions cache so
+#                     coverage accumulates.
+#
+# A crash uploads fuzz/artifacts/ (the minimized-able crash-* inputs) and goes
+# red. Green is an invariant: a crash is a filed bug with a regression test, not
+# a re-run. Format-decoder crashes in particular are bugs under ADR 0073's
+# "every post-baseline version stays readable" rule.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "fuzz/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/fuzz.yml"
+  pull_request:
+    paths:
+      - "crates/**"
+      - "fuzz/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/fuzz.yml"
+  schedule:
+    # 04:17 UTC nightly, after corpus-deep (03:17), off the hour.
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+    inputs:
+      secs_per_target:
+        description: "libFuzzer seconds per target for the long run (default 1200)"
+        required: false
+        default: "1200"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  FUZZ_SMOKE_SECS: "60"
+
+jobs:
+  smoke-stable:
+    name: smoke-stable
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: fmt + clippy (the fuzz crate is outside the workspace gates)
+        working-directory: fuzz
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+      - name: Deterministic smoke (every target over seeds + seeded mutations)
+        working-directory: fuzz
+        run: cargo test --release --test smoke -- --nocapture
+
+  libfuzzer-smoke:
+    name: libfuzzer-smoke
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      # The repo pins 1.96 (rust-toolchain.toml): the seed generator runs on it;
+      # cargo-fuzz itself runs `cargo +nightly`.
+      - name: Install pinned toolchain (1.96)
+        uses: dtolnay/rust-toolchain@1.96.0
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          key: libfuzzer
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Generate seed corpus from the golden fixtures
+        run: fuzz/seed-corpus.sh
+      - name: Build all targets
+        run: cargo +nightly fuzz build
+      - name: Run every target for ${{ env.FUZZ_SMOKE_SECS }}s
+        run: |
+          failed=0
+          for t in $(cargo +nightly fuzz list); do
+            echo "::group::fuzz $t"
+            if ! cargo +nightly fuzz run "$t" -- \
+                -max_total_time="$FUZZ_SMOKE_SECS" -timeout=20 -rss_limit_mb=2048 -max_len=65536; then
+              echo "::error::fuzz target $t found a crash (see the uploaded fuzz-artifacts)"
+              failed=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $failed
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-smoke
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+
+  libfuzzer-nightly:
+    name: libfuzzer-nightly (${{ matrix.target }})
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - dynamo_request
+          - dynamo_expressions
+          - partiql
+          - http_sigv4
+          - item_codecs
+          - net_frames
+          - lsm_formats
+          - control_formats
+          - cp_data_formats
+          - encryption_envelope
+    steps:
+      - uses: actions/checkout@v4
+      # The repo pins 1.96 (rust-toolchain.toml): the seed generator runs on it;
+      # cargo-fuzz itself runs `cargo +nightly`.
+      - name: Install pinned toolchain (1.96)
+        uses: dtolnay/rust-toolchain@1.96.0
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          key: libfuzzer
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Generate seed corpus from the golden fixtures
+        run: fuzz/seed-corpus.sh
+      # The grown corpus persists between nights: restore the newest one for
+      # this target, save a fresh one after the run.
+      - name: Restore grown corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - name: Fuzz ${{ matrix.target }}
+        run: |
+          secs="${{ github.event.inputs.secs_per_target || '1200' }}"
+          cargo +nightly fuzz run "${{ matrix.target }}" -- \
+            -max_total_time="$secs" -timeout=20 -rss_limit_mb=2048 -max_len=65536
+      - name: Minimize the grown corpus
+        if: success()
+        run: cargo +nightly fuzz cmin "${{ matrix.target }}"
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore

@@ -21,8 +21,8 @@
   `ConsistentRead` paths that must be reported apart),
   [ADR 0057](0057-sigv4-client-auth.md) and
   [ADR 0066](0066-sigv4-hardening.md) (the SigV4 edge the generator signs
-  for), [ADR 0064](0064-tls-on-every-port.md) (why "no TLS client" is a stated
-  limit), [ADR 0067](0067-throughput-derived-minimum-tablet-count.md) (why the
+  for), [ADR 0064](0064-tls-on-every-port.md) (the server-only TLS the client
+  speaks; originally why "no TLS client" was a stated limit), [ADR 0067](0067-throughput-derived-minimum-tablet-count.md) (why the
   bench tables start as one tablet), [ADR 0072](0072-dynamodb-service-limits.md)
   (the generator runs under the same compiled-in limits as any client).
 - **Consumers:** the library API of `crates/animus-bench` is the reusable
@@ -105,13 +105,27 @@ tiny fixed subset (`POST /`, `Content-Length`, `X-Amz-Target`), and nothing
 already in `Cargo.lock` is needed to speak it (hyper is present only for the
 OTLP/S3 paths). A worker redials the next endpoint after a socket error.
 
-**Consequence: there is no TLS client yet.** The generator dials the DynamoDB
-and admin ports in plain TCP, and the results file says so (`environment.tls`
-is always `false` with an explanatory `tls_note`). The cluster under test
-must therefore have TLS off on those ports (it is off by default, ADR 0064).
-Benchmarking the TLS posture is a named follow-up ("What is *not* done"); `animus-env`'s
-`MaybeTlsStream`, which `animus-cli` already uses, is the intended
-mechanism. Until then no published result may be read as a TLS-on number.
+**Consequence (as first built): no TLS client.** The generator dialled the
+DynamoDB and admin ports in plain TCP and the file said so (`tls: false`).
+
+**As-built update (TLS client added).** `client.rs` now runs over `animus-env`'s
+`MaybeTlsStream` (the mechanism this section named): `--tls-ca PATH` (and
+optionally `--tls-server-name`) makes every DynamoDB and admin dial a
+**server-only** rustls handshake (ADR 0064), exactly as `animus-cli --tls-ca`
+does: workspace `ring` provider, no client certificate, no new dependency
+tree. Endpoints are `SocketAddr`s, so the verified name is the node's IP
+unless overridden. The handshake is done at connection setup (`Conn::connect`),
+and the engine pre-dials the worker pool before each phase's clock starts, so
+a healthy operation's latency contains no handshake; only a redial after a
+broken connection does, which is how a TCP reconnect already behaved.
+`--launch processes|in-process` serve TLS when given `--tls-cert/--tls-key`
+with `--tls-ca`; an external cluster takes `--tls-ca` alone. The results file
+records the real `environment.tls`/`tls_note` and `topology.tls`. The schema
+stays `animus-bench/v1`: no field was added or renamed, the existing `tls`
+boolean stops being constant, and a new crate is outside ADR 0073's durable
+formats. Still absent: mutual TLS toward the DynamoDB port, and any published
+TLS-on versus TLS-off comparison. A result is a TLS-on number only when its
+file says `tls: true`.
 
 ### 4. Workloads: YCSB A–F mapped onto DynamoDB operations
 
@@ -272,7 +286,7 @@ checks and what the publication process checks):
 - The tool records: git SHA (and dirty flag; `ANIMUS_BENCH_GIT_SHA`
   overrides), the exact argv, the seed, the client host (hostname, kernel, CPU
   model and count, memory), `launch_mode`, the target endpoints, whether
-  requests were SigV4-signed, TLS state (always off), the cluster topology
+  requests were SigV4-signed, TLS state (on/off, and the server name verified), the cluster topology
   before and after the run from `/admin` (`/admin/config`, `/admin/status`,
   `/admin/raftkv`: membership, per-node `auth_enabled`/`quiesce_after_ms`/
   split and throttle thresholds, per-table tablet count, replication-factor
@@ -355,7 +369,7 @@ not land results.
    it and may surface defects.
 3. **No dedicated runner.** The regression workflow is manual with artifacts
    only (§9).
-4. **No TLS client** (§3): a TLS-on result cannot be produced yet.
+4. **No published TLS-on numbers** (§3): the client supports server-only TLS, but no TLS-on versus TLS-off run has been made or published.
 5. **Encryption at rest and `--shared-wal` are not reported by `/admin`**, so
    an external run records them as unknown (§8). Surfacing both in
    `/admin/config` is a small `animusd` change (the website's performance
@@ -393,7 +407,7 @@ not land results.
 
 - A repeatable, disclosed, coordinated-omission-corrected measurement exists
   and ships with a fake-clock test of the correction itself.
-- Honest limits are in the file the reader gets: `publishable`, `tls: false`,
+- Honest limits are in the file the reader gets: `publishable`, `tls` (true/false),
   "unknown: not reported", `notes` for a skipped degraded run, `abandoned`
   and `achieved_rate` for saturation.
 - `animus-bench` is a new workspace member and brings one new dependency,

@@ -89,7 +89,12 @@ amendment — the shape predates and outlives it.)
   module's own 69-line `//!` doc has the full design (replica selection,
   the request/reply correlation, `repair`); wired into `animusd`
   (`animusd::build_segment_store`, `SegmentStoreHandle` — see that crate's
-  `CLAUDE.md`).
+  `CLAUDE.md`). **ADR 0073 section 8: class G, every `SegmentWire` variant is
+  `Gate::Base`** (`SegmentWire::required_gate`, exhaustive, no `_` arm; `encode`
+  debug-asserts it and `gate_tests` pins each variant's JSON). A new variant or
+  field is a wedge for an older replica: it must name a non-`Base` gate, which
+  then needs a gated send path (this store has no `ClusterFeatures` yet) before
+  the assertion is relaxed.
 - **`codec.rs`** — the crate's compact binary wire/image codec (ADR 0017
   A.2): length-prefixed, magic/version-checked framing for `KvWire`
   messages and engine images (`serde_json`'s decimal-array `Vec<u8>`
@@ -3115,6 +3120,10 @@ own internal mutex (in `animus-control`) is only taken inside `append_tagged`/
 `tests/apply_not_starved_by_wal_lock.rs` (both paths, asserts on
 `engine_applied_index`, never core `last_applied`). ADR 0017's and ADR 0038's
 2026-09-30 amendments.
+
+## Fuzzing (roadmap R-01 (c))
+
+The RaftKV codec (wire/image/WAL), segment codec, backup chunk/manifest codecs, layout marker, cursors and engine marker values are the `cp_data_formats` fuzz target; the `pub(crate)` ones are reached through the off-by-default `fuzzing` feature (`src/fuzzing.rs`). See `fuzz/README.md` (stable smoke: `cd fuzz && cargo test --release --test smoke`).
 
 ## Gate enforcement (ADR 0073 Phase 2, P2-B)
 

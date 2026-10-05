@@ -37,6 +37,15 @@ per-tablet CP data plane (`animus-cp-data`).
   relayable in `animus-node` since P2-B (era-only; refused pre-era by the gate
   checks below).
 
+- **Finalize at apply** (issue #1168): `Metadata::apply` for
+  `FinalizeClusterVersion` rejects (`"blocked: a member is Down, Leaving, or a
+  never-activated Joining"`) on any `members` row for which
+  `Member::finalize_block_reason()` is `Some`, after the target check and
+  before the required-set range loop; `animusd`'s admin pre-check calls the same
+  method, so the two cannot drift. `tests/it/version_finalize_status.rs` pins
+  each status and the pre-check/apply race (a member flipped `Down` between
+  them); the apply corpus's independent oracle carries the status half.
+
 - **`version_observe.rs` + `RaftNode`'s `version_loop`** (ADR 0073 Phase 2,
   P2-A section 2). Leader-local, passive, **no wire change**: the driver loop
   records `Envelope.from -> (Option<VersionRange>, build, observed_at)` for
@@ -96,11 +105,21 @@ per-tablet CP data plane (`animus-cp-data`).
   applies own range + build + a **capped decode** atomically: the control recv
   arm (`node.rs`, one match guard before `Ok(msg)`) takes the SAME branch as an
   undecodable message (warn, drop, nothing reaches the core) when
-  `provisional_required_gate(msg)` is a gate the profile does not know, and
-  records a `CapRejection`. `provisional_required_gate` is a single-call-site
-  stub (an `AppendEntries` carrying `ReportNodeVersion`/`FinalizeClusterVersion`
-  => `Gate::Era`) that **P2-B's exhaustive `required_gate` tables replace**. The
-  cap state lives in `OwnVersion::sim_cap` (cfg-gated field, `None` by default).
+  `RaftMsg::required_gate(msg).join(content_gate(msg))` is a gate the profile
+  does not know, and records a `CapRejection`. `required_gate` is the emitter's
+  classification (P2-B); `content_gate` is what an older binary's strict decode
+  would need whatever the classifier says (it reads the synthetic gate/field
+  labels), which is what lets the "ungated field" negative control (N3) fail the
+  oracle: the cap, not the classifier, models the old binary. The cap state
+  lives in `OwnVersion::sim_cap` (cfg-gated field, `None` by default).
+  **Synthetic gate ladder**: `Gate::Synthetic(n)` (same cfg; version `n`,
+  rank `n`; never in `Gate::ALL`) is attached to a command only through the
+  `synthetic.gate=n` label of an `UpsertMember` (`SYNTHETIC_GATE_LABEL`, read by
+  `MetaCommand::required_gate`); the `synthetic.field=n` label
+  (`SYNTHETIC_FIELD_LABEL`) is the deliberately *unclassified* twin. `Release(N)`
+  profiles accept `Synthetic(k <= N)`. A new match on `Gate` anywhere in the
+  workspace must cope with the cfg'd variant (features unify: `animus-test`
+  enables `sim-versions` for every dev-dependent crate).
   Pure-tier corpus: the `version_world` harness has a *faithful* mode
   (`World::new_faithful`, `profiles`, `cap_logs`, `downgrade_to_phase1`) that P2-A's
   cells never use; cells and the oracle (era safety, delivery = empty cap log,
@@ -3075,6 +3094,10 @@ unsupported (would need a new non-relayable command). See ADR 0005's
 2026-10-04 amendment.
 
 - `Metadata::apply(UpsertMember)` keeps an existing non-empty label set when the incoming one is empty (status-only proposers like the detector build from stale reads that can predate a `RegisterNode` label fill-in); see `docs/lessons/testing/2026-10-04-status-only-upsert-built-from-a-stale-read-wipes-fields.md`.
+
+## Fuzzing (roadmap R-01 (c))
+
+The control WAL / shared WAL / snapshot image / `Metadata::from_json` / syskv key decoders are the `control_formats` fuzz target. The line-framed formats carry a CRC, so the target re-stamps CRCs (`fix_line_crcs`) to reach the payload decoders. `mirror::apply_key_write` still `.expect`s on a corrupt mirrored value (node-local data, by design) and is deliberately not fuzzed. See `fuzz/README.md` (stable smoke: `cd fuzz && cargo test --release --test smoke`).
 
 ## Gate enforcement (ADR 0073 Phase 2, P2-B)
 

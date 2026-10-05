@@ -1,0 +1,1 @@
+SELECT * FROM t WHERE pk = 'a' AND sk > 3 ORDER BY sk DESC

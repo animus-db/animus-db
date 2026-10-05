@@ -1,0 +1,2 @@
+PutItem
+{"TableName": "t", "Item": {"pk": {"S": "k"}, "n": {"N": "1"}, "l": {"L": [{"S": "a"}, {"NULL": true}]}}, "ConditionExpression": "attribute_not_exists(pk)"}

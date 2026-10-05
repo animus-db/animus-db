@@ -72,11 +72,11 @@ Can build on B-01's workload generator (`animus-bench`, ADR 0076).
 
 | ID | Criterion | Status | Evidence | Owner |
 |---|---|---|---|---|
-| C-1 | A `cargo-fuzz` target exists for every untrusted parser: DynamoDB JSON request decode, UpdateExpression/ConditionExpression/projection parsers, PartiQL lexer/parser, SigV4 header/credential parsing, the HTTP request parser | Not met | No `fuzz/` directory. Parsers live in `crates/animus-dynamo/src/wire.rs`, `crates/animus-node/src/http.rs` | c |
-| C-2 | A fuzz target exists for each durable-format decoder with a `legacy` seam (LSM WAL/SSTable/manifest, Raft WAL/snapshot, RaftKV codec, segment and backup chunk codecs, encryption envelope), seeded from the golden fixtures | Not met | Seeds exist: `crates/*/tests/fixtures/formats/`; no targets | c |
-| C-3 | Property held: never panic, never allocate unboundedly, decode-or-named-error | Not met | No targets to hold it yet | c |
-| C-4 | A short fuzz smoke (about 60 s per target) runs per push and long runs nightly | Not met | Nightly infra exists: `.github/workflows/corpus-deep.yml`; no fuzz job | c |
-| C-5 | Every crash found becomes a regression test (format-decoder crashes are filed as bugs under the green invariant) | Not met | Process, nothing found yet | c |
+| C-1 | A `cargo-fuzz` target exists for every untrusted parser: DynamoDB JSON request decode, UpdateExpression/ConditionExpression/projection parsers, PartiQL lexer/parser, SigV4 header/credential parsing, the HTTP request parser | Met | `fuzz/fuzz_targets/{dynamo_request,dynamo_expressions,partiql,http_sigv4,net_frames}.rs`; stable smoke `fuzz/tests/smoke.rs`; see `fuzz/README.md` | c |
+| C-2 | A fuzz target exists for each durable-format decoder with a `legacy` seam (LSM WAL/SSTable/manifest, Raft WAL/snapshot, RaftKV codec, segment and backup chunk codecs, encryption envelope), seeded from the golden fixtures | Met | `fuzz/fuzz_targets/{lsm_formats,control_formats,cp_data_formats,encryption_envelope,item_codecs}.rs`, seeded in place from `crates/*/tests/fixtures/formats/` via `fuzz/seeds.tsv` | c |
+| C-3 | Property held: never panic, never allocate unboundedly, decode-or-named-error | Not met | Held on every target except one known violation: an LZ4 SSTable block's untrusted size prefix allocates ~4 GiB (`animus-storage` `decode_block_v1`), fenced by a guard in `fuzz_shims::block_v1` and listed in `fuzz/known-issues.tsv`; flips when its fix PR lands | c |
+| C-4 | A short fuzz smoke (about 60 s per target) runs per push and long runs nightly | Not met | `.github/workflows/fuzz.yml` (60 s per target per push, long nightly matrix) is in the tree; flips on its first green run | c |
+| C-5 | Every crash found becomes a regression test (format-decoder crashes are filed as bugs under the green invariant) | Not met | One finding so far (the LZ4 size-prefix allocation above); its regression test lands with the fix | c |
 
 ## (d) Resource bounds and overload
 

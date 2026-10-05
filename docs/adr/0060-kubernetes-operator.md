@@ -420,22 +420,24 @@ just because it sits outside the `Env` seam.
 
 ### Upgrades
 
-**No operator-driven upgrade yet; rolling upgrades wait on ADR 0073
-Phase 3.** The repository's compatibility rule is now staged (root
-`CLAUDE.md`, [ADR 0073](0073-upgrade-compatibility.md)): as of Phase 1
-(done 2026-10-03) a **whole-cluster stop → upgrade → restart** across
-post-baseline versions is supported and tested by the upgrade-restart
-harness, but there is **no wire compatibility and no rolling-upgrade
-story** until Phases 2 and 3. For this operator that means the supported
-way to move to a new `animusd` build is a whole-cluster restart, never a
-pod-by-pod mix of versions. The operator does not enforce this: it does
-not reject a `spec.image` edit (a `validate_spec` test allows one), and
-the `StatefulSet` controller rolls it like any pod-template change, which
-is precisely the mixed-version window that is unsupported before Phase 3.
-Treat `spec.image` changes as unsupported until the operator orchestrates
-upgrades (Phase 3), or recreate the `AnimusCluster`. (Earlier text claimed
-an image change was "either rejected by the operator's own validation or
-requires recreating the cluster"; the validation half was never true.)
+**No operator-driven upgrade yet; the operator orchestrating a roll waits
+on ADR 0073 Phase 3.** The repository's compatibility rule is staged (root
+`CLAUDE.md`, [ADR 0073](0073-upgrade-compatibility.md)): Phase 1 (done
+2026-10-03) supports a **whole-cluster stop -> upgrade -> restart**, and
+Phase 2 (done 2026-10-04) adds a replicated cluster version, feature gates and
+a mixed-version corpus, which make a **manual node-by-node rolling upgrade**
+supported (from today's Phase 1 binaries to B2, and from release R-1 to R):
+restart one node at a time, wait until it is `Active` and no tablet is
+under-replicated, then `animus cluster finalize`. Not supported: skipping a
+release, rolling a node back, a Phase 1 binary joining after the era started.
+The **operator does not orchestrate any of this**: it does not reject a
+`spec.image` edit (a `validate_spec` test allows one), and the `StatefulSet`
+controller rolls it like any pod-template change, one pod at a time with no
+wait-healthy gate, no PDB-aware ordering and no finalize step. Until Phase 3
+treat `spec.image` changes as unsupported and roll by hand as above, or
+recreate the `AnimusCluster`. (Earlier text claimed an image change was
+"either rejected by the operator's own validation or requires recreating the
+cluster"; the validation half was never true.)
 
 ### End-to-end testing
 

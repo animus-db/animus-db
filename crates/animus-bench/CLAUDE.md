@@ -28,9 +28,25 @@ to this crate's.**
 - **HTTP client: hand-rolled keep-alive HTTP/1.1 over a tokio `TcpStream`**
   (`client.rs`), one connection per worker. The server speaks a tiny fixed
   subset (`POST /`, `Content-Length`); nothing in `Cargo.lock` (hyper is only
-  there for the OTLP/S3 paths) is needed. **No TLS client yet** — the report
-  records `tls: false`; a TLS target is a future addition (animus-env's
-  `MaybeTlsStream` is what `animus-cli` uses).
+  there for the OTLP/S3 paths) is needed.
+- **TLS (ADR 0064 server-only; `tls.rs`)**: `--tls-ca PATH` (+ optional
+  `--tls-server-name NAME`) makes every DynamoDB **and admin** dial a rustls
+  client handshake, modelled on `animus-cli`: CA-only root store, no client
+  cert, workspace `ring` provider (no new crypto backend, nothing new in
+  `Cargo.lock`). `Conn` wraps `animus_env::MaybeTlsStream` (an enum: plain
+  path unchanged, TLS = one `match` per poll). Endpoints are `SocketAddr`s,
+  so the verified name is the node **IP** unless `--tls-server-name` is given
+  (the node cert needs an IP SAN, or pass the DNS name). **The handshake is
+  at connection setup, never in a measured op:** `Conn::connect` does it and
+  `engine::run_phase` calls `Cluster::prewarm(connections)` *before* the phase
+  clock starts, so workers begin with handshaken pooled connections; only a
+  redial after a broken connection pays a handshake inside an op (as a TCP
+  connect always did). Launch modes: `--launch processes|in-process` serve TLS
+  when given `--tls-cert/--tls-key` (one leaf for all nodes, SAN `127.0.0.1`)
+  plus `--tls-ca` (also the nodes' mutual-TLS CA) via `cluster::LaunchTls`;
+  `--nodes` takes `--tls-ca` only. The report records the real
+  `environment.tls` (+ `tls_note`) and `topology.tls`; schema stays
+  `animus-bench/v1` (the existing field just stops being always false).
 - **New dependency: `hdrhistogram` 7 (default-features off)** — MIT/Apache-2.0,
   plus its `byteorder`/`num-traits` deps. `rand`/`rand_chacha` (already in the
   workspace) seed the op/key stream.
@@ -101,8 +117,9 @@ to this crate's.**
 
 ## Entry points / library API (what C-17 reuses)
 
-- `cluster::Cluster` — `external(..)`, `launch_in_process(..)`,
-  `launch_processes(..)`; `nodes()`, `dynamo_endpoints()`, `await_ready`,
+- `cluster::Cluster` — `external(nodes, creds, tls, kill, restart)`,
+  `launch_in_process(n, dir, creds, Option<LaunchTls>)`,
+  `launch_processes(.., Option<LaunchTls>, extra_args)`, `tls()`, `prewarm(n)`; `nodes()`, `dynamo_endpoints()`, `await_ready`,
   `tablet_roles(table)`, `apply_fault(FaultAction)`, `shutdown()`.
 - `engine::run_phase(cluster, clock, &PhaseSpec, &mut impl OpSource,
   Arc<impl OpExecutor>) -> PhaseResult` — the open-loop shell. A scenario
@@ -113,7 +130,7 @@ to this crate's.**
 - `report::{Report, RunResult, SweepPoint}` — plain serde; push your own
   `RunResult { name, params: Value, load, phases, sweep }` into a `Report`.
 - `envinfo::{HostInfo, git_state, capture_topology}`; `ycsb::{create_table,
-  load_table, drop_table}`; `client::Conn` (`call(op, json)`, SigV4-signed).
+  load_table, drop_table}`; `client::Conn` (`connect(addr, creds, Option<&TlsClient>)`, `call(op, json)`, SigV4-signed); `tls::TlsClient`.
 - **Add a scenario**: implement `OpSource` + `OpExecutor`, create/load your
   tables with `Conn`, call `run_steady`/`run_degraded` (or `run_phase`
   directly), wrap the phases in a `RunResult`, add it to a `Report`. No CLI
@@ -154,7 +171,13 @@ used only at the edges (`cluster.rs` port probing/config files, `envinfo.rs`).
   intended times, no drift. `dist.rs`: zipfian/uniform/latest sanity (seeded,
   loose bounds). `workload.rs`: op-mix proportions per workload, seeded
   reproducibility, key layout. `ycsb.rs`: request shapes, error classification.
-- `tests/smoke.rs`: a real 3-node in-process cluster **with SigV4 on**; A-F x
+- `tests/smoke.rs` (second test): the same 3-node in-process shape with
+  **server-only TLS on every port** (throwaway rcgen CA + leaf); workloads
+  A/E/F through the TLS client with zero errors, the report says `tls: true`,
+  the admin port is reachable over TLS, and three negative controls: an
+  untrusting CA fails the handshake, and a plain-TCP client is not served by
+  a TLS port. Same `prod-heavy` tier as the first test.
+- `tests/smoke.rs` (first test): a real 3-node in-process cluster **with SigV4 on**; A-F x
   both read modes at ~300 ops each plus a follower-kill run. Asserts **wire
   shapes and correctness only** (zero unexpected errors, every arrival
   completes, JSON round-trips) — **never a latency or rate**. It is a

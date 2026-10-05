@@ -1,0 +1,2 @@
+Query
+{"TableName": "t", "KeyConditionExpression": "pk = :p AND sk BETWEEN :a AND :b", "FilterExpression": "size(x) > :z", "Limit": 10, "ExpressionAttributeValues": {":p": {"S": "k"}, ":a": {"N": "1"}, ":b": {"N": "9"}, ":z": {"N": "0"}}}

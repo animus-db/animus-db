@@ -542,10 +542,10 @@
         tears down everything it owns through ordinary Kubernetes garbage collection. A
         CI-gated smoke test exercises a real <code>kind</code> cluster end-to-end — create,
         bootstrap, scale, delete — on every change to this surface. Kubernetes' own rolling
-        update would replace pods one at a time on an image change, but AnimusDB does not yet
-        support running two versions in one cluster (no wire compatibility, no rolling
-        upgrades), so the operator does not orchestrate upgrades: the supported path is a
-        whole-cluster stop, upgrade and restart.
+        update would replace pods one at a time on an image change, but the operator does not
+        yet orchestrate upgrades (no wait-healthy gate between pods, no finalize step): roll
+        by hand, node by node (see the cluster version notes below), or do a whole-cluster
+        stop, upgrade and restart.
       </p>
     </section>
 
@@ -655,16 +655,18 @@
           config-gated per cluster. A cluster with no TLS configured is unauthenticated plain TCP,
           exactly as before; caller identity on the DynamoDB port is opt-in SigV4 either way, not
           affected by TLS.</li>
-        <li><strong>No rolling upgrades or mixed-version clusters.</strong> A full-cluster stop,
-          upgrade and restart across versions is supported and tested (on-disk formats stay
-          readable across versions), but nodes on different versions cannot talk to each
-          other yet, so upgrade every node at once. Rolling upgrade is in progress, not
-          supported: each node now advertises the cluster versions its binary supports,
-          <code>animus cluster version</code> shows the active version, every node's range
-          and what blocks raising it, and <code>animus cluster finalize</code> raises it (one
-          step, leader only, irreversible, refused while any member is down or does not
-          support the target). The mixed-version safety gates and their test corpus are not
-          in yet.</li>
+        <li><strong>Rolling upgrades are manual, one node at a time.</strong> Restart one node
+          at a time, waiting until it is <code>Active</code> and no tablet is under-replicated,
+          then run <code>animus cluster finalize</code> once every member (down ones too)
+          reports the new version range. Each node advertises the cluster versions its binary
+          supports; <code>animus cluster version</code> shows the active version, every node's
+          range and what blocks raising it; finalize raises it one step, on the leader only,
+          irreversibly, and is refused while any member is down, leaving, never activated or
+          does not support the target. A mixed-version simulation corpus covers the roll.
+          Supported: from today's binaries to this release, and from one release to the next.
+          Not supported: skipping a release, rolling a node back after it ran the new binary,
+          and an old binary joining once versioning has started (refused by name). The
+          Kubernetes operator does not orchestrate this yet.</li>
         <li><strong>Restore always creates a brand-new table, never in-place</strong> — matching
           real DynamoDB, for both on-demand backups (<code>RestoreTableFromBackup</code>) and
           continuous backups (<code>RestoreTableToPointInTime</code>); a source table's backup

@@ -1,0 +1,2 @@
+UpdateItem
+{"TableName": "t", "Key": {"pk": {"S": "k"}}, "UpdateExpression": "SET a = :v, b = b + :one, l = list_append(l, :l) REMOVE c ADD s :ss DELETE t :ss", "ConditionExpression": "attribute_exists(pk) AND b < :v", "ExpressionAttributeValues": {":v": {"N": "5"}, ":one": {"N": "1"}, ":l": {"L": []}, ":ss": {"SS": ["x"]}}, "ReturnValues": "ALL_NEW"}

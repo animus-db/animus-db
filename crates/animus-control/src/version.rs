@@ -173,7 +173,21 @@ pub enum Gate {
     /// commands/entities may be emitted. Not tied to
     /// a cluster version (ADR 0073 section 2, P2-A).
     Era,
+    /// A **synthetic** version gate `n` (test/sim builds only): opens at
+    /// cluster version `n`, ranks `n`. It exists so the gate *ladder*
+    /// (several version gates, each opening at its own finalize) can be
+    /// exercised before a real release adds a second gate; no production
+    /// `required_gate` row names it. Reached only through the
+    /// `synthetic.gate` member label ([`SYNTHETIC_GATE_LABEL`]).
+    #[cfg(any(test, feature = "sim-versions"))]
+    Synthetic(ClusterVersion),
 }
+
+/// The `UpsertMember` label that marks a command as requiring
+/// `Gate::Synthetic(n)` (value: the decimal `n`, `>= 2`); the only way a
+/// synthetic gate is attached to a real command. Test/sim builds only.
+#[cfg(any(test, feature = "sim-versions"))]
+pub const SYNTHETIC_GATE_LABEL: &str = "synthetic.gate";
 
 impl Gate {
     /// Every gate, in declaration order.
@@ -188,6 +202,8 @@ impl Gate {
             Gate::Base => Some(1),
             // ADR 0073 P2-A: era-gated, no version.
             Gate::Era => None,
+            #[cfg(any(test, feature = "sim-versions"))]
+            Gate::Synthetic(n) => Some(n),
         }
     }
 
@@ -200,6 +216,14 @@ impl Gate {
         match self {
             Gate::Base => 0,
             Gate::Era => 1,
+            #[cfg(any(test, feature = "sim-versions"))]
+            Gate::Synthetic(n) => {
+                if n > 1 {
+                    n
+                } else {
+                    1
+                }
+            }
         }
     }
 
@@ -460,6 +484,8 @@ mod tests {
             let expected: Option<ClusterVersion> = match g {
                 Gate::Base => Some(1),
                 Gate::Era => None,
+                // Never in `ALL` (parametric, test/sim only): see the ladder test.
+                Gate::Synthetic(_) => unreachable!("synthetic gates are not in Gate::ALL"),
             };
             assert_eq!(g.version(), expected, "{g:?}");
             if let Some(v) = g.version() {
@@ -550,5 +576,69 @@ mod tests {
         let mut slots: Vec<usize> = GateSurface::ALL.iter().map(|s| s.slot()).collect();
         slots.sort_unstable();
         assert_eq!(slots, (0..GateSurface::ALL.len()).collect::<Vec<_>>());
+    }
+
+    /// The synthetic gate ladder (ADR 0073 P2-D): several version gates, each
+    /// opening at its own finalize, observed through one `ClusterFeatures`.
+    /// Only `Gate::Base` and `Gate::Era` exist in production, so the ladder
+    /// is the only place `is_open` on a version gate above the era is
+    /// exercised end to end.
+    #[test]
+    fn synthetic_gates_open_one_finalize_at_a_time() {
+        let (g2, g3) = (Gate::Synthetic(2), Gate::Synthetic(3));
+        assert_eq!((g2.version(), g3.version()), (Some(2), Some(3)));
+        assert!(Gate::Era.rank() < g2.rank() && g2.rank() < g3.rank());
+        assert_eq!(Gate::Era.join(g3), g3);
+        assert_eq!(g3.join(g2), g3);
+        assert_eq!(g2.join(Gate::Base), g2);
+
+        let f = ClusterFeatures::new();
+        let mut meta = Metadata::default();
+        registered(&mut meta, 1);
+        meta.apply(&MetaCommand::ReportNodeVersion {
+            node: nid(1),
+            range: VersionRange::new(1, 3),
+            build: "r3".into(),
+        });
+        f.update(&meta);
+        assert!(f.is_open(Gate::Era) && !f.is_open(g2) && !f.is_open(g3));
+
+        for (expected, target) in [(1, 2), (2, 3)] {
+            let out = meta.apply(&MetaCommand::FinalizeClusterVersion { expected, target });
+            assert_eq!(out, crate::meta::ApplyOutcome::Applied, "finalize {target}");
+            f.update(&meta);
+            assert_eq!(f.is_open(g2), target >= 2, "g2 at {target}");
+            assert_eq!(f.is_open(g3), target >= 3, "g3 at {target}");
+        }
+        // A later view never closes a gate an earlier one opened.
+        f.update(&Metadata::default());
+        assert!(f.is_open(g3));
+    }
+
+    /// `required_gate` classification of the synthetic marker: the label
+    /// raises an `UpsertMember`, and a `RaftMsg` carrying one joins to it.
+    #[test]
+    fn synthetic_label_classifies_commands_and_carrying_messages() {
+        use crate::meta::NodeStatus;
+        let plain = MetaCommand::UpsertMember {
+            node: nid(1),
+            labels: Default::default(),
+            status: NodeStatus::Active,
+        };
+        assert_eq!(plain.required_gate(), Gate::Base);
+        for n in [2u32, 3] {
+            let marked = MetaCommand::UpsertMember {
+                node: nid(1),
+                labels: [(SYNTHETIC_GATE_LABEL.to_owned(), n.to_string())].into(),
+                status: NodeStatus::Active,
+            };
+            assert_eq!(marked.required_gate(), Gate::Synthetic(n));
+        }
+        let garbage = MetaCommand::UpsertMember {
+            node: nid(1),
+            labels: [(SYNTHETIC_GATE_LABEL.to_owned(), "x".to_owned())].into(),
+            status: NodeStatus::Active,
+        };
+        assert_eq!(garbage.required_gate(), Gate::Base, "unparsable is no gate");
     }
 }

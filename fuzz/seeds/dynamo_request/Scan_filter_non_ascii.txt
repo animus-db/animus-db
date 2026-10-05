@@ -1,0 +1,2 @@
+Scan
+{"TableName": "tExporthhhhhhhhhhhhhhhhhhhheqhhhhhhhhKeyhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhxhhhhhhhhhhhhhhhhhhhhhhhhhhTa", "FilterExpression": "not aimmmmmmmmmmmmmmshardId-aBatchGBatch�etI------mNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNmmmmmmmmmmmmmmmmmmmmmmns(anul, >s2 OR NOT (b IN s:v, ,v))", "EApressionAttributeValues": {":s": {"S": "x"}, ":v": {"2": "2"}}, "Segment": 0, "TotalSegments": 4}
