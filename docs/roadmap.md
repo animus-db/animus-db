@@ -1712,7 +1712,8 @@ outstanding on the wire surface at present.
   DynamoDB edge beyond the 1 MiB `MAX_BODY` request cap
   (`crates/animus-node/src/http.rs`) and per-table throttling (ADR 0065).
   Disk-full is injected in simulation (`animus-sim` `DiskConfig`,
-  `StorageFull`) but its behaviour on real nodes is untested.
+  `StorageFull`); handling landed with (d) (issue #1185), but its behaviour on
+  real nodes is still untested.
 - **Plan:** define **beta exit criteria** as a checklist in a new
   `docs/production-readiness.md` (ratified by the ADR), each item
   checkable and owned by a sub-track below. Beta means: every criterion
@@ -1726,6 +1727,16 @@ outstanding on the wire surface at present.
     `crates/animus-test/src/check.rs`) over it; add resource-trend
     assertions (RSS, fds, disk, WAL/compaction backlog stay bounded).
     Exit: 7 consecutive days, zero oracle violations, no monotone growth.
+    **Harness landed 2026-10-05** ([`docs/soak.md`](soak.md)): bare
+    multi-process leg (`crates/animusd/tests/soak.rs`, opt-in `soak`
+    feature, reusing `chaos_support/`), epoch-bounded history with the three
+    oracles plus cold-data re-verification per epoch, per-node RSS/fd/
+    thread/disk/WAL/SSTable-count/queue-gauge sampling with the pure
+    `animus_test::soak` trend detector (unit-tested), and
+    `.github/workflows/soak.yml` (short leg; non-required). **Not done:**
+    the 7-day run itself (dedicated hardware), the operator-on-`kind` leg,
+    reuse of `animus-bench`'s generator (it records latency, not an
+    oracle-checkable history; the chaos recorder is used instead).
   - **(b) Real-cluster chaos (independent; L).** Process kill,
     network partition, clock skew, disk full, slow disk. On k8s via the
     operator (Chaos Mesh `PodChaos`/`NetworkChaos`/`IOChaos`/`TimeChaos`
@@ -1746,7 +1757,8 @@ outstanding on the wire surface at present.
     prefix and transaction-atomicity checks, `.github/workflows/chaos.yml`
     (non-required). **Not done:** clock skew, slow disk and packet loss
     (Kubernetes-only designs in `deploy/chaos/`, pinned and unvalidated),
-    disk full (blocked on #1185). **Its first runs found a real
+    real-process disk full (the node-side handling landed with (d), #1185;
+    the real size-limited-filesystem leg is still open). **Its first runs found a real
     violation** (acknowledged writes lost on keys touched by an aborted
     cross-tablet transaction; see `docs/chaos.md`, "Findings").
   - **(c) Fuzzing (independent; M).** `cargo-fuzz` targets for every
@@ -1768,7 +1780,13 @@ outstanding on the wire surface at present.
     limits and admission control with a defined overload response (a DynamoDB-shaped throttling/unavailable error code as W-08 already
     does per table, never unbounded queuing), and define disk-full behaviour (the node goes
     read-only or refuses writes with a named error and recovers when
-    space returns; never corrupts or acks a write it cannot fsync). Each
+    space returns; never corrupts or acks a write it cannot fsync).
+    **Disk-full landed (issue #1185, 2026-10-05):** ENOSPC marks the WAL suspect,
+    writes are refused with a named 503 `StorageFull`, and the WAL is rewritten
+    from the in-memory log onto free space without a restart (sim corpus
+    `ANIMUS_DISK_FULL_SEEDS`; `docs/resource-bounds.md` section 3). **Still
+    open:** LSM-engine ENOSPC, leader step-down, exporting `spawned_task_panics`,
+    and a `ProdEnv` tmpfs test. Each
     bound gets a sim test with fault injection where possible and a
     `ProdEnv` test where not.
   - **(e) Operations runbook (independent; M).** `docs/runbook/`: node
@@ -1911,7 +1929,11 @@ outstanding on the wire surface at present.
      model is part of the work.
 - **Plan (staged, each stage independently valuable and mergeable):**
   - **G-a Topology-aware single-cluster operator (S-M, independent, do
-    now).** Add a labels input to `ClusterConfig`/`animusd` flags
+    now). LANDED 2026-10-04 (branch `g01-a-topology-placement`; see the ADR 0005/0060
+    2026-10-04 amendments): labels input (`--label`/`--labels-file`/config
+    `labels`), operator node-topology annotations + spread hints, zone-spread
+    default policy, `sim_cluster_zone_placement` corpus. Known limits: policy
+    fixed at table creation; labels fixed at first registration.** Add a labels input to `ClusterConfig`/`animusd` flags
     (additive `#[serde(default)]`, ADR 0035 discipline, ADR 0073 format
     rules) so a node self-registers with labels; have the operator inject
     the pod's node `topology.kubernetes.io/region` and `/zone` labels
@@ -1931,7 +1953,23 @@ outstanding on the wire surface at present.
     limits catalogue entries (compiled-in, AWS-faithful), and gate every
     new `Metadata`/wire surface behind the ADR 0073 Phase 2 cluster-version
     gate. Next free ADR number: **0075** at time of writing.
-  - **G-c MRSC as a geo-distributed per-tablet Raft group (L, likely the
+  - **G-c MRSC as a geo-distributed per-tablet Raft group — LANDED
+    2026-10-05 (ADR 0075 "G-c as built"; one PR, #1225).** `UpdateTable`
+    `ReplicaUpdates` + `MultiRegionConsistency: STRONG` (3 regions, or 2 +
+    a witness) on an empty table converts it; behind `Gate::GlobalTables`
+    (cluster version 2, `animus cluster finalize`). Region-pinned one-per-
+    region placement with in-region repair, the preferred-leader mechanism,
+    witness hiding, MRSC restrictions (no TTL/LSI/transactions), the
+    `DescribeTable` fields, `/admin/global-tables`, `animus table
+    preferred-leader`, the decommission guard, `spec.maxRegionRttMs`, and the
+    `sim_cluster_mrsc` + `preferred_leader_corpus` corpora (nightly in
+    `corpus-deep.yml`). **Residuals:** no quiescence benefit on
+    WAN groups (#1226); witness may transiently lead (no campaign
+    suppression); control-voter region placement is not enforced (only
+    warned about); AWS field names/error texts unverified against the live
+    API; no WAN cost numbers (`animus-bench` cross-region variant); no lease
+    reads. The original design notes follow.
+  - **(Design notes) G-c MRSC as a geo-distributed per-tablet Raft group (L, likely the
     cheapest wire-visible mode).** Reuses the CP machinery: a table whose
     replicas are placed across regions by residency/failure-domain labels
     (region key), WAN-tuned election and heartbeat timeouts per group,
@@ -1941,6 +1979,17 @@ outstanding on the wire surface at present.
     (control plane included: quorum placement across at least 3 regions);
     this is "stretch cluster", not federation. Measured cost goes into
     `animus-bench`'s results (ADR 0076; cross-region topology variant).
+    **Groundwork landed (branch `g01-c-wan-groundwork`, ADR 0075's
+    2026-10-04 amendment):** the per-group WAN Raft timing profile
+    (`animus_control::timing`, `RaftCore::set_timing`, wired into the cp-data
+    reconciler and the control group, `max_region_rtt_ms` /
+    `--max-region-rtt-ms`), the region-aware control-voter admin check, and the
+    `ANIMUS_WAN_TIMING_SEEDS` corpus with a LAN-forced negative control. It is
+    node-local and derived from existing `Member.labels`: no replicated field,
+    command or format change. **Still gated on P2-B/P2-C:** preferred-leader
+    placement, `ReplicaUpdates` mapping, the MRSC table mode and wire surface;
+    **still open independent of the gate:** control-only voters' labels (need
+    G-a's config-borne labels) and the `gen-config` warning.
   - **G-d MREC async replication with LWW (XL).** The agent in item 5
     above, plus replicated-TTL, stream parity and a multi-cluster
     `SimCluster` WAN corpus (seeded partitions, duplicate/reordered
@@ -2071,7 +2120,7 @@ wave are independent and can run in parallel.
 | 16 | C-15 (closed 2026-09-20 — node assembly/raw `ClientRequest` assess-and-close, ADR 0061 rung O, #997) | Gated on C-14 (closed) — the last class-D group C-14's own close-out confirmed still unowned |
 | 17 | S-08 (S3 credentials/multipart; landed 2026-10-04); G-01 stage G-a + G-b (topology-aware operator, global-tables ADR); R-01 sub-tracks c (fuzzing), f (observability), g (release engineering) | All independent of each other and of the open C-16 phases; no ordering constraint |
 | 18 | C-17 (scale/density), R-01 sub-tracks a (soak), b (chaos), d (resource bounds), e (runbook) | C-17 Tier 2 and R-01 (a)/(e) capacity planning need `animus-bench`'s generator (landed, ADR 0076); C-17 Tier 1 and R-01 (b)/(d) can start earlier |
-| 19 | G-01 stages G-c (MRSC stretch), G-d (MREC), G-e (federation) | After C-16 Phase 2 (P2-B and P2-D remaining: cluster-version/feature gate) and the G-b ADR; G-c wants `animus-bench` (ADR 0076) to quantify WAN cost |
+| 19 | G-01 stages G-d (MREC), G-e (federation); G-c (MRSC stretch) landed 2026-10-05 | G-c: done (ADR 0075 "G-c as built"; residuals under G-01 above). G-d/G-e: C-16 Phase 2 is done and the first gate has shipped (`GlobalTables`, version 2); they add their own gates. `animus-bench` (ADR 0076) cross-region variant still owed to quantify WAN cost |
 | 20 | R-01 runbook upgrade chapter | After C-16 Phase 3 (rolling upgrades) |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed

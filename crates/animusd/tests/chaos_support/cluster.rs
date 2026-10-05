@@ -163,6 +163,18 @@ impl ChaosCluster {
         self.port(i, PORT_ADMIN)
     }
 
+    #[allow(dead_code, reason = "used by the soak target, not chaos")]
+    /// The OS pid of node `i`, if it is running.
+    pub fn pid(&self, i: usize) -> Option<u32> {
+        self.children[i].as_ref().map(Child::id)
+    }
+
+    #[allow(dead_code, reason = "used by the soak target, not chaos")]
+    /// Node `i`'s data directory (`--dir`).
+    pub fn data_dir(&self, i: usize) -> PathBuf {
+        self.root.join(format!("data{i}"))
+    }
+
     pub fn log_path(&self, i: usize) -> PathBuf {
         self.root.join("logs").join(format!("n{i}.log"))
     }

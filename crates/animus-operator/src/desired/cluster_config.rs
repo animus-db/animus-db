@@ -100,8 +100,8 @@ pub struct RoleAddrs {
 /// orphan-sweep, stream-seal) `animusd` now reads from a config file's own
 /// `cluster_settings` section on every deployment shape, not just
 /// `--cluster N`'s dev-only in-process CLI flags. This crate only ever
-/// populates the two fields the CRD exposes today
-/// (`auto_split_bytes`/`quiesce_after_secs`, see
+/// populates the three fields the CRD exposes today
+/// (`auto_split_bytes`/`quiesce_after_secs`/`max_region_rtt_ms`, see
 /// [`build_cluster_config`]) — the rest stay `None`, `#[serde(skip_
 /// serializing_if = "Option::is_none")]` so an unset field is simply
 /// absent from the emitted JSON rather than a null, exactly like every
@@ -148,6 +148,10 @@ pub struct ClusterSettings {
     pub tablet_max_read_units: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tablet_max_write_units: Option<u64>,
+    /// ADR 0075 section 3.4: the cluster-wide upper bound on the inter-region
+    /// round trip, populated from `spec.maxRegionRttMs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_region_rtt_ms: Option<u64>,
 }
 
 impl ClusterSettings {
@@ -267,6 +271,7 @@ pub fn cluster_settings_or_none(spec: &AnimusClusterSpec) -> Option<ClusterSetti
     let settings = ClusterSettings {
         auto_split_bytes: spec.auto_split_bytes,
         quiesce_after_secs: spec.quiesce_after_secs,
+        max_region_rtt_ms: spec.max_region_rtt_ms,
         ..ClusterSettings::default()
     };
     if settings.is_empty() {
@@ -453,6 +458,18 @@ pub fn entrypoint_script(spec: &AnimusClusterSpec) -> String {
     let mut both_flags = String::new();
     let mut data_flags = String::new();
     let mut both_preamble = String::new();
+
+    // G-01 stage G-a: this node's topology labels, resolved by the operator
+    // onto the pod's annotations and projected to a file (see
+    // `super::topology`). Both branches accept the flags.
+    let labels_flags = format!(
+        " --labels-file {}/{} --labels-file-annotations --labels-wait-secs {}",
+        super::topology::TOPOLOGY_MOUNT_DIR,
+        super::topology::TOPOLOGY_FILE_NAME,
+        super::topology::LABELS_WAIT_SECS,
+    );
+    both_flags.push_str(&labels_flags);
+    data_flags.push_str(&labels_flags);
 
     if ephemeral {
         both_flags.push_str(" --ephemeral");
@@ -745,6 +762,22 @@ mod tests {
     }
 
     #[test]
+    fn max_region_rtt_ms_reaches_cluster_settings_and_is_absent_when_unset() {
+        let mut s = spec(3);
+        s.max_region_rtt_ms = Some(220);
+        let cfg = build_cluster_config("c", "ns", &s);
+        let value: serde_json::Value = serde_json::from_str(&to_json(&cfg)).unwrap();
+        assert_eq!(
+            value["cluster_settings"],
+            serde_json::json!({"max_region_rtt_ms": 220}),
+            "got {value}"
+        );
+        // Unset: the section stays absent, the pre-existing bytes.
+        let cfg = build_cluster_config("c", "ns", &spec(3));
+        assert!(cfg.cluster_settings.is_none());
+    }
+
+    #[test]
     fn mixed_role_split_at_control_nodes() {
         let mut s = spec(5);
         s.control_nodes = Some(2);
@@ -931,6 +964,9 @@ mod tests {
         "--quiesce-after",
         "--dynamo-auth",
         "--advertise-host",
+        "--labels-file",
+        "--labels-file-annotations",
+        "--labels-wait-secs",
         "--seed",
         "--id",
         "--base-port",
@@ -977,6 +1013,18 @@ mod tests {
             "entrypoint script emitted flag(s) `animusd` does not accept: {unknown:?}\n\
              script:\n{script}"
         );
+    }
+
+    #[test]
+    fn entrypoint_passes_the_topology_labels_flags_on_both_branches() {
+        let script = entrypoint_script(&spec(3));
+        let (both_branch, data_branch) = script.split_once("else").unwrap();
+        for branch in [both_branch, data_branch] {
+            assert!(branch.contains(
+                "--labels-file /etc/animus/topology/annotations --labels-file-annotations \
+                 --labels-wait-secs 180"
+            ));
+        }
     }
 
     #[test]

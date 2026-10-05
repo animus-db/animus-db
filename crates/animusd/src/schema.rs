@@ -23,6 +23,13 @@ use crate::{
     median_split_key, topology,
 };
 
+/// First/maximum pause between self-registration attempts
+/// ([`ClientCtx::register_node_until_settled`], issue #1230). Each attempt
+/// already waits up to `SCHEMA_COMMIT_TIMEOUT`, so this only paces a
+/// fast-failing leaderless cluster.
+const REGISTER_RETRY_BACKOFF_INITIAL: Duration = Duration::from_millis(500);
+const REGISTER_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(5);
+
 impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// Serve a long-poll [`ClientRequest::WatchMetadata`] (ADR 0035 PR5 for
     /// the long-poll mechanism itself; ADR 0038 PR5 for the incremental
@@ -393,7 +400,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     let sent = self
                         .propose_schema(&MetaCommand::SetTabletPolicy {
                             tablet,
-                            policy: Some(PlacementPolicy::simple("cp-rf", MAX_REPLICATION_FACTOR)),
+                            policy: Some(default_table_policy(&meta)),
                         })
                         .await;
                     last_proposed_create = Some(false);
@@ -412,7 +419,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     .filter(|(_, m)| m.status == NodeStatus::Active)
                     .map(|(id, _)| id.clone())
                     .collect();
-                replicas.truncate(MAX_REPLICATION_FACTOR);
+                replicas = zone_aware_initial_replicas(&meta, replicas);
                 let now = self.env.now();
                 if !replicas.is_empty()
                     && (last_proposed_create != Some(true) || now >= next_propose_at)
@@ -746,6 +753,113 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                  (no control-plane leader reachable?)",
                 SCHEMA_COMMIT_TIMEOUT.as_secs()
             )),
+        }
+    }
+
+    /// Self-registration that survives a slow control-plane start (issue
+    /// #1230): [`register_node`](Self::register_node) in a bounded-backoff
+    /// loop until it reaches a **terminal** outcome. `register_node` alone
+    /// gives up after `SCHEMA_COMMIT_TIMEOUT`, and its sole production caller
+    /// used to be a fire-and-forget `let _ = ...` — so a pod that started
+    /// before the control group had a leader stayed unregistered (empty
+    /// labels, no `node_addrs` entry) for the life of the process, silently.
+    ///
+    /// Terminal outcomes: `Registered` / `Collision` (a durable fact, see
+    /// `register_node`). A timeout is logged and retried after an
+    /// exponentially growing, capped backoff. Every `Env` interaction is the
+    /// seam's (`env.sleep`), so the loop is `SimEnv`-testable; the caller
+    /// stops it by dropping/aborting the task (process shutdown) — every
+    /// wait here is an `.await`.
+    ///
+    /// **Resurrection safety.** A retry is only ever a *fresh* claim, and
+    /// `RegisterNode`'s apply cannot tell a fresh claim from a re-registration
+    /// of an identity `RemoveMember` just decommissioned (see
+    /// `register_node`'s doc: a stale re-propose after the removal silently
+    /// resurrects the node). So this loop never proposes blind after
+    /// registration became observable: `register_node` itself returns the
+    /// instant `node_addrs[node]` is visible, and during every backoff the
+    /// node's own view is re-read each `SCHEMA_POLL_INTERVAL` tick and the
+    /// loop returns on the first sight of the entry. The loop therefore
+    /// only keeps proposing while this node has *never observed* its own
+    /// entry — i.e. the registration it is retrying has, as far as this node
+    /// can tell, never committed. The residual window (a registration that
+    /// committed *and* was removed entirely inside this node's mirror lag
+    /// without the entry ever being visible locally) would need a replicated
+    /// tombstone to close; it is the same window the pre-existing single
+    /// attempt had.
+    pub(crate) async fn register_node_until_settled(
+        &self,
+        node: NodeId,
+        addrs: NodeAddrs,
+        labels: BTreeMap<String, String>,
+    ) -> RegisterOutcome {
+        let mut backoff = REGISTER_RETRY_BACKOFF_INITIAL;
+        let mut failures = 0u32;
+        loop {
+            match self
+                .register_node(node.clone(), addrs.clone(), labels.clone())
+                .await
+            {
+                Ok(outcome) => return outcome,
+                Err(e) => {
+                    failures += 1;
+                    eprintln!(
+                        "animusd: self-registration attempt {failures} failed ({e}); \
+                         retrying in {}ms",
+                        backoff.as_millis()
+                    );
+                }
+            }
+            let wake = self.env.now().saturating_add(backoff);
+            while self.env.now() < wake {
+                if let Some(outcome) = Self::register_outcome_from(
+                    &self.effective_metadata().node_addrs,
+                    &node,
+                    &addrs,
+                ) {
+                    return outcome;
+                }
+                self.env.sleep(SCHEMA_POLL_INTERVAL).await;
+            }
+            backoff = (backoff * 2).min(REGISTER_RETRY_BACKOFF_MAX);
+        }
+    }
+
+    /// [`admin_add_member`](Self::admin_add_member) retried until it
+    /// succeeds — the growth/data-only nodes' own `Down`-member claim, which
+    /// used to be the same fire-and-forget single attempt as
+    /// [`register_node_until_settled`](Self::register_node_until_settled)'s
+    /// predecessor (issue #1230). Same resurrection argument: `admin_add_member`
+    /// is a no-op once `members[node]` is visible, and every backoff tick
+    /// re-reads the node's own view and returns on first sight of the row, so
+    /// a retry never re-adds a member that was seen and then removed.
+    pub(crate) async fn admin_add_member_until_settled(
+        &self,
+        node: NodeId,
+        labels: BTreeMap<String, String>,
+    ) {
+        let mut backoff = REGISTER_RETRY_BACKOFF_INITIAL;
+        let mut failures = 0u32;
+        loop {
+            match self.admin_add_member(node.clone(), labels.clone()).await {
+                Ok(()) => return,
+                Err(e) => {
+                    failures += 1;
+                    eprintln!(
+                        "animusd: self member-claim attempt {failures} failed ({e}); \
+                         retrying in {}ms",
+                        backoff.as_millis()
+                    );
+                }
+            }
+            let wake = self.env.now().saturating_add(backoff);
+            while self.env.now() < wake {
+                if self.effective_metadata().members.contains_key(&node) {
+                    return;
+                }
+                self.env.sleep(SCHEMA_POLL_INTERVAL).await;
+            }
+            backoff = (backoff * 2).min(REGISTER_RETRY_BACKOFF_MAX);
         }
     }
 
@@ -1536,5 +1650,132 @@ mod grow_stream_classify_tests {
                 "message {msg:?} must not be reclassified"
             );
         }
+    }
+}
+
+/// The placement policy a freshly created table's first tablet gets (G-01
+/// stage G-a): RF [`MAX_REPLICATION_FACTOR`], with a best-effort spread over
+/// `topology.kubernetes.io/zone` iff the live membership (every member not
+/// `Leaving`) all carry a zone label and span at least RF distinct zones —
+/// else the plain `cp-rf` policy exactly as before. Evaluated at creation
+/// time only; a cluster that gains zones later does not retro-upgrade
+/// existing tables. See [`animus_placement::zone_spread_policy`].
+pub(crate) fn default_table_policy(meta: &crate::Metadata) -> PlacementPolicy {
+    animus_placement::zone_spread_policy(
+        "cp-rf",
+        MAX_REPLICATION_FACTOR,
+        meta.members
+            .values()
+            .filter(|m| m.status != NodeStatus::Leaving)
+            .map(|m| &m.labels),
+    )
+}
+
+/// The first tablet's initial replica set from the `Active` members
+/// `active` (id order): zone-spread and load-aware when the table's policy
+/// is a spread one and enough `Active` members exist to satisfy it, else the
+/// historical first-`RF`-by-id truncation. The reconciler never *repairs* a
+/// best-effort spread that merely started skewed (it is not a hard
+/// violation), so the initial pick has to be right.
+pub(crate) fn zone_aware_initial_replicas(
+    meta: &crate::Metadata,
+    mut active: Vec<NodeId>,
+) -> Vec<NodeId> {
+    let policy = default_table_policy(meta);
+    if policy.spread.is_some() {
+        let cands: Vec<animus_placement::Candidate> = active
+            .iter()
+            .filter_map(|id| {
+                meta.members
+                    .get(id)
+                    .map(|m| animus_placement::Candidate::new(id.clone(), m.labels.clone()))
+            })
+            .collect();
+        let mut load: BTreeMap<NodeId, usize> = BTreeMap::new();
+        for t in meta.tablets.values() {
+            for r in &t.replicas {
+                *load.entry(r.clone()).or_default() += 1;
+            }
+        }
+        if let Ok(set) = animus_placement::select_replicas_balanced(&cands, &policy, &load) {
+            return set;
+        }
+    }
+    active.truncate(MAX_REPLICATION_FACTOR);
+    active
+}
+
+#[cfg(test)]
+mod default_table_policy_tests {
+    use super::*;
+    use animus_control::Member;
+    use animus_env::nid;
+    use animus_placement::ZONE_LABEL;
+
+    fn meta_with(zones: &[Option<&str>], status: NodeStatus) -> crate::Metadata {
+        let mut meta = crate::Metadata::default();
+        for (i, z) in zones.iter().enumerate() {
+            meta.members.insert(
+                nid(i as u64),
+                Member {
+                    labels: z
+                        .map(|z| BTreeMap::from([(ZONE_LABEL.to_owned(), z.to_owned())]))
+                        .unwrap_or_default(),
+                    status,
+                    has_activated: true,
+                },
+            );
+        }
+        meta
+    }
+
+    #[test]
+    fn spread_with_three_zones_simple_with_fewer_or_unlabelled() {
+        let three = meta_with(
+            &[Some("a"), Some("b"), Some("c"), Some("a")],
+            NodeStatus::Active,
+        );
+        assert!(default_table_policy(&three).spread.is_some());
+        let two = meta_with(&[Some("a"), Some("b"), Some("a")], NodeStatus::Active);
+        assert_eq!(
+            default_table_policy(&two),
+            PlacementPolicy::simple("cp-rf", MAX_REPLICATION_FACTOR)
+        );
+        let partial = meta_with(&[Some("a"), Some("b"), Some("c"), None], NodeStatus::Active);
+        assert!(default_table_policy(&partial).spread.is_none());
+        assert!(
+            default_table_policy(&crate::Metadata::default())
+                .spread
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn initial_replicas_span_zones_when_spreading_else_first_by_id() {
+        // ids 0..6, two per zone, interleaved so the first three ids share zones.
+        let zones = [
+            Some("a"),
+            Some("a"),
+            Some("b"),
+            Some("b"),
+            Some("c"),
+            Some("c"),
+        ];
+        let meta = meta_with(&zones, NodeStatus::Active);
+        let active: Vec<NodeId> = (0..6).map(nid).collect();
+        let picked = zone_aware_initial_replicas(&meta, active.clone());
+        let picked_zones: BTreeSet<_> = picked
+            .iter()
+            .map(|n| meta.members[n].labels[ZONE_LABEL].clone())
+            .collect();
+        assert_eq!(picked.len(), 3);
+        assert_eq!(picked_zones.len(), 3, "{picked:?}");
+        // Not enough Active members to satisfy RF: falls back to first-N by id.
+        let few = zone_aware_initial_replicas(&meta, active[..2].to_vec());
+        assert_eq!(few, vec![nid(0), nid(1)]);
+        // Unlabelled cluster: historical truncation.
+        let plain = meta_with(&[None, None, None, None], NodeStatus::Active);
+        let got = zone_aware_initial_replicas(&plain, (0..4).map(nid).collect());
+        assert_eq!(got, vec![nid(0), nid(1), nid(2)]);
     }
 }

@@ -697,8 +697,19 @@ mod tests {
         let v = cluster_version_view(&ok, &VersionProfile::current(), None);
         assert_eq!(v["active"], 1);
         assert_eq!(v["era_active"], true);
-        // own max is 1 (MAX_SUPPORTED), so target 2 is out of reach here.
-        assert_eq!(v["can_finalize"], false);
+        // own max is `MAX_SUPPORTED` (2 since G-01 G-c, the first real gate),
+        // so target 2 is within reach and every recorded range contains it.
+        assert_eq!(v["can_finalize"], true);
+        // A binary whose own max is still 1 (a B2 node) cannot reach it.
+        let v1 = cluster_version_view(
+            &ok,
+            &VersionProfile {
+                range: Some(VersionRange::new(1, 1)),
+                build: "b2".to_string(),
+            },
+            None,
+        );
+        assert_eq!(v1["can_finalize"], false);
         assert_eq!(v["nodes"].as_array().unwrap().len(), 2);
         assert!(v["nodes"][0]["observed_range"].is_null());
     }

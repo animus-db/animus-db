@@ -2526,6 +2526,10 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// write/txn helpers consult). Never cleared: a frozen parent's only
     /// future is retirement at cutover.
     frozen: Arc<AtomicBool>,
+    /// Persist-round accounting shared with the consensus loop and the apply
+    /// task's compaction rewrite — here only so [`is_storage_full`](Self::is_storage_full)
+    /// can read the group's WAL-suspect (ENOSPC) state.
+    persist: Arc<PersistProgress>,
     /// The highest `ReadCeiling` **candidate** this leader has ever
     /// proposed (whether committed yet or not), packed via [`hlc::pack`] —
     /// disambiguates two `ensure_ceiling_above` calls that independently
@@ -2585,6 +2589,13 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// Defaults `false` — zero behavior change for every caller that never
     /// touches it.
     external_quiesce_veto: Arc<AtomicBool>,
+    /// Node-local: this replica sits in its table's **witness** Region (ADR
+    /// 0075 section 3.6) and so must never serve a replica-local eventual
+    /// read. Set by the tablet-host reconciler from the replicated global-table
+    /// spec ([`set_witness`](Self::set_witness)); [`stale_read_ready`]
+    /// (Self::stale_read_ready) then declines, so every eventual read falls
+    /// back to (or forwards to) a full replica. Defaults `false`.
+    witness: Arc<AtomicBool>,
     /// Freshness stamp for `external_quiesce_veto` (issue #302 fix): the
     /// value of [`engine_applied_index`](Self::engine_applied_index) the
     /// external caller's own observation is valid through — see
@@ -3213,6 +3224,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // ordering.
         let txn_tracker = Arc::new(Mutex::new(TxnTracker::default()));
         let external_quiesce_veto = Arc::new(AtomicBool::new(false));
+        let witness = Arc::new(AtomicBool::new(false));
         // See the field's own doc: `u64::MAX` is the "never engaged" sentinel,
         // not `0` — a caller that never calls `set_quiesce_veto` for this
         // group must impose no freshness requirement at all.
@@ -3257,11 +3269,13 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             ts_cache: Arc::clone(&ts_cache),
             committed_ceiling: Arc::clone(&committed_ceiling),
             frozen: Arc::clone(&frozen),
+            persist: Arc::clone(&persist),
             last_ceiling_candidate,
             last_proposed_ts,
             last_absorbed_term,
             txn_tracker: Arc::clone(&txn_tracker),
             external_quiesce_veto: Arc::clone(&external_quiesce_veto),
+            witness: Arc::clone(&witness),
             external_quiesce_veto_fresh_through: Arc::clone(&external_quiesce_veto_fresh_through),
             voter_history: Arc::clone(&voter_history),
             hot_change_max: Arc::clone(&hot_change_max),
@@ -3379,6 +3393,44 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         ForkPending {
             signal: &self.fork_signal,
         }
+    }
+
+    /// Install `profile`'s `(election_base, heartbeat_interval)` on this group
+    /// (ADR 0075 section 3.4, G-01 stage G-c groundwork) — see
+    /// [`RaftCore::set_timing`]. Idempotent (no RNG draw, no deadline touched
+    /// when the group already runs `profile`); on a real change the driver is
+    /// woken so it re-evaluates `next_deadline` at once. Returns whether the
+    /// timing changed. Called by the tablet-host reconciler
+    /// ([`host::Reconciler`]) with a profile derived from the tablet's replica
+    /// regions; a node-local, non-replicated decision.
+    pub fn set_timing_profile(&self, profile: animus_control::timing::TimingProfile) -> bool {
+        let want = profile.durations();
+        if self.lock().timing() == want {
+            return false;
+        }
+        let now = self.env.now();
+        let entropy = self.env.next_u64();
+        let changed = self.lock().set_timing(want.0, want.1, now, entropy);
+        if changed {
+            self.wake();
+        }
+        changed
+    }
+
+    /// Mark (or unmark) this replica as sitting in its table's witness Region
+    /// (ADR 0075 section 3.6). Node-local and idempotent; called by the
+    /// tablet-host reconciler every tick from replicated `Metadata`. A witness
+    /// still votes and replicates normally — only the replica-local eventual
+    /// read ([`stale_read_ready`](Self::stale_read_ready)) is refused.
+    pub fn set_witness(&self, witness: bool) {
+        self.witness.store(witness, Ordering::Relaxed);
+    }
+
+    /// Whether this replica is currently marked as a witness (see
+    /// [`set_witness`](Self::set_witness)).
+    #[must_use]
+    pub fn is_witness(&self) -> bool {
+        self.witness.load(Ordering::Relaxed)
     }
 
     /// Opt this group into quiescence (ADR 0044 phase-1 PR3): once its leader
@@ -4051,6 +4103,24 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// degraded latency, never a false ack).
     pub fn is_frozen(&self) -> bool {
         self.frozen.load(Ordering::SeqCst)
+    }
+
+    /// Whether this group's WAL is suspect after an ENOSPC (R-01 (d), ADR 0074
+    /// §2) — the **`StorageFull`** state. A pure flag read, never a wake or a
+    /// propose. While true the group cannot make anything durable: it acks no
+    /// write, and `animusd`'s write/txn helpers refuse mutating requests
+    /// **before proposing** with a named `StorageFull` error (503
+    /// `ServiceUnavailable`), counting `Metric::OverloadStorageFull`. Reads
+    /// keep being served. It clears itself — no restart — once the consensus
+    /// loop has rewritten the WAL from the in-memory log onto a fresh file.
+    pub fn is_storage_full(&self) -> bool {
+        self.persist.is_suspect()
+    }
+
+    /// Record one `StorageFull` refusal on this group's metrics handle
+    /// (`overload_storage_full`); the caller returns the refusal itself.
+    pub fn record_storage_full_refusal(&self) {
+        self.metrics.incr(Metric::OverloadStorageFull);
     }
 
     /// Propose the **split-cutover freeze** (ADR 0050 rung 5, stage 3 — see
@@ -5810,6 +5880,10 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// hence fully applied, hence current.
     #[must_use]
     pub fn stale_read_ready(&self) -> bool {
+        // ADR 0075 section 3.6: a witness replica never serves an eventual read.
+        if self.witness.load(Ordering::Relaxed) {
+            return false;
+        }
         // One lock acquisition for both core facts. `engine_applied` is read
         // *after* releasing it and only ever grows, so a concurrent apply can
         // make this false-negative (a read that falls back to the strong
@@ -7390,6 +7464,12 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         self.lock().term()
     }
 
+    /// The group's installed election-timeout base (ADR 0075 section 3.4:
+    /// 150 ms on the LAN profile, wider on the WAN one). Read-only.
+    pub fn election_timeout(&self) -> Duration {
+        self.lock().election_timeout()
+    }
+
     /// This node's own observability sink (ADR 0015) — the same
     /// [`MetricsHandle`] `record_propose` increments `CpProposalsAccepted`
     /// into (see that function's doc). Exposed so a caller that proposes a
@@ -7618,7 +7698,19 @@ async fn persist_wal<E: Env>(
     tablet: TabletId,
     metrics: &MetricsHandle,
 ) {
-    let _wal = wal_lock.lock().await;
+    let wal_guard = wal_lock.lock().await;
+    // Disk-full (R-01 (d), ADR 0074 §2): a suspect WAL is never appended to
+    // again — a compaction rewrite (or an earlier round) hit ENOSPC, so go
+    // straight to the rewrite recovery, even with nothing new to drain.
+    if progress.is_suspect() {
+        drop(wal_guard);
+        recover_kv_wal(
+            env, wal, core, wal_lock, progress, halted, shared, tablet, metrics,
+        )
+        .await;
+        apply_signal.notify();
+        return;
+    }
     // The round number is claimed in the *same* core-lock acquisition as the
     // drain (issue #279): that is what lets the consensus loop ask "which round
     // covers the mutation I just made?" and get an answer no concurrent
@@ -7636,6 +7728,25 @@ async fn persist_wal<E: Env>(
     };
     if let Some(shared) = shared {
         if let Err(e) = shared.append_tagged(env, wal, tablet, &records).await {
+            if animus_env::is_storage_full(&e) && !halted.load(Ordering::SeqCst) {
+                tracing::error!(error = %e, "raftkv shared wal append hit ENOSPC; group is StorageFull until the WAL is rewritten");
+                progress.mark_suspect();
+                drop(wal_guard);
+                recover_kv_wal(
+                    env,
+                    wal,
+                    core,
+                    wal_lock,
+                    progress,
+                    halted,
+                    Some(shared),
+                    tablet,
+                    metrics,
+                )
+                .await;
+                apply_signal.notify();
+                return;
+            }
             assert!(
                 halted.load(Ordering::SeqCst),
                 "raftkv shared wal append failed while running: {e}"
@@ -7666,17 +7777,32 @@ async fn persist_wal<E: Env>(
             record_bytes.extend(PersistedState::encode_record(record));
         }
         buf.extend_from_slice(&record_bytes);
-        if let Err(e) = env.append(wal, &buf).await {
-            assert!(
-                halted.load(Ordering::SeqCst),
-                "raftkv wal append failed while running: {e}"
-            );
-            return;
+        let io = async {
+            env.append(wal, &buf).await?;
+            env.sync(wal).await
         }
-        if let Err(e) = env.sync(wal).await {
+        .await;
+        if let Err(e) = io {
+            if animus_env::is_storage_full(&e) && !halted.load(Ordering::SeqCst) {
+                // ENOSPC: the file's tail is now unknown (a torn partial
+                // append, or bytes a failed fsync may have dropped), so it is
+                // marked suspect and rewritten from the in-memory log onto a
+                // fresh file once space returns. Never retry the fsync on this
+                // file and assume success (fsyncgate). The round is NOT marked
+                // durable and nothing is acked until that rewrite lands.
+                tracing::error!(error = %e, "raftkv wal write hit ENOSPC; group is StorageFull until the WAL is rewritten");
+                progress.mark_suspect();
+                drop(wal_guard);
+                recover_kv_wal(
+                    env, wal, core, wal_lock, progress, halted, shared, tablet, metrics,
+                )
+                .await;
+                apply_signal.notify();
+                return;
+            }
             assert!(
                 halted.load(Ordering::SeqCst),
-                "raftkv wal sync failed while running: {e}"
+                "raftkv wal append failed while running (append or sync): {e}"
             );
             return;
         }
@@ -7695,6 +7821,64 @@ async fn persist_wal<E: Env>(
         progress.complete_drain(round);
     }
     apply_signal.notify();
+}
+
+/// Rewrite a suspect per-tablet WAL from the group's in-memory log onto a
+/// fresh file and clear the `StorageFull` state — see
+/// [`persist_round::recover_suspect_wal`]. The write is `Disk::replace` on the
+/// per-group-file path (a temp file + rename: new descriptor, a torn tail
+/// simply disappears) and the coordinator's whole-file `compact_group` on the
+/// shared-WAL path (which replaces this tablet's cached tail with the image and
+/// rewrites the one shared file from every tablet's tail). A non-ENOSPC
+/// failure of the rewrite is a real durability fault and stays a hard panic
+/// (tolerated only while `halted`).
+#[allow(clippy::too_many_arguments)] // mirrors `persist_wal`'s own parameter list
+async fn recover_kv_wal<E: Env>(
+    env: &E,
+    wal: &str,
+    core: &Arc<Mutex<KvCore>>,
+    wal_lock: &FairMutex,
+    progress: &PersistProgress,
+    halted: &AtomicBool,
+    shared: Option<&SharedWal<KvCommand, KvState>>,
+    tablet: TabletId,
+    metrics: &MetricsHandle,
+) {
+    let result = persist_round::recover_suspect_wal(
+        env,
+        core,
+        wal_lock,
+        progress,
+        halted,
+        |image: Vec<animus_control::persist::WalRecord<KvCommand, KvState>>| async move {
+            if let Some(shared) = shared {
+                let r = shared.compact_group(env, wal, tablet, image).await;
+                if r.is_ok() {
+                    metrics.incr(Metric::CpSharedWalGcRewrites);
+                }
+                r
+            } else {
+                let mut buf = Vec::new();
+                for record in &image {
+                    buf.extend(PersistedState::encode_record(record));
+                }
+                let r = env.replace(wal, &buf).await;
+                if r.is_err() {
+                    // Free the half-written temp sibling so the space it holds
+                    // can return to the volume.
+                    let _ = env.remove(&format!("{wal}.tmp")).await;
+                }
+                r
+            }
+        },
+    )
+    .await;
+    if let Err(e) = result {
+        assert!(
+            halted.load(Ordering::SeqCst),
+            "raftkv wal rewrite failed while running: {e}"
+        );
+    }
 }
 
 /// Whether `key` falls inside any range this group has already sealed
@@ -10826,6 +11010,11 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         // Serialize the WAL rewrite against the consensus loop's appends. The
         // lock is FIFO-fair so back-to-back persist rounds cannot starve this.
         let mut wal_guard = Some(wal_lock.lock().await);
+        // Disk-full (R-01 (d)): never compact over a suspect WAL; the consensus
+        // loop is about to rewrite the whole file from the in-memory log.
+        if persist.is_suspect() {
+            return did_work;
+        }
         let (bytes, lli) = {
             let mut c = core.lock().expect("raftkv core poisoned");
             // Advance the base to exactly the engine state (`snapshot_upto` drops
@@ -11056,13 +11245,24 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 env.clone().spawn_task(async move {
                     let _release = guard;
                     if let Err(e) = rewrite_wal_staged(&env, &wal, &wal_lock, &records).await {
-                        // Same rule as the persist path: tolerated only while
-                        // halted (the pre-compaction WAL is intact, so recovery
-                        // is unaffected); a live failure is a real fault.
-                        assert!(
-                            halted.load(Ordering::SeqCst),
-                            "raftkv wal compaction failed while running: {e}"
-                        );
+                        if animus_env::is_storage_full(&e) && !halted.load(Ordering::SeqCst) {
+                            // ENOSPC on the staged rewrite: the live WAL is
+                            // untouched and already holds every acked record
+                            // (the round that drained `records` was made
+                            // durable by the `early` append above), so this is
+                            // only a deferred shrink — no durability claim
+                            // hangs on it. The next compaction retries.
+                            tracing::warn!(error = %e, "raftkv wal compaction rewrite hit ENOSPC; deferred");
+                        } else {
+                            // Same rule as the persist path: tolerated only
+                            // while halted (the pre-compaction WAL is intact,
+                            // so recovery is unaffected); a live failure is a
+                            // real fault.
+                            assert!(
+                                halted.load(Ordering::SeqCst),
+                                "raftkv wal compaction failed while running: {e}"
+                            );
+                        }
                     }
                 });
                 Ok(())
@@ -11087,10 +11287,22 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // the pre-compaction WAL is still intact, so recovery is unaffected.
                 // A failure while *not* halted is a real durability fault → surface.
                 Err(e) => {
-                    assert!(
-                        halted.load(Ordering::SeqCst),
-                        "raftkv wal compaction failed while running: {e}"
-                    );
+                    if animus_env::is_storage_full(&e) && !halted.load(Ordering::SeqCst) {
+                        // ENOSPC on the compaction's early append (or the
+                        // shared WAL's whole-file rewrite): the drain above
+                        // took the loop's pending records and numbered a round
+                        // that will now never complete here. Hand it to the
+                        // consensus loop's recovery, which rewrites the whole
+                        // file from the in-memory log (snapshot base included)
+                        // and completes every drained round.
+                        tracing::error!(error = %e, "raftkv wal compaction hit ENOSPC; group is StorageFull until its WAL is rewritten");
+                        persist.mark_suspect();
+                    } else {
+                        assert!(
+                            halted.load(Ordering::SeqCst),
+                            "raftkv wal compaction failed while running: {e}"
+                        );
+                    }
                 }
             }
         }
@@ -11864,6 +12076,21 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         .unwrap_or(0);
     engine_applied.store(engine_watermark, Ordering::SeqCst);
     applied_watch.bump(engine_watermark);
+    // Issue #1229: an in-place split child's engine was cloned from its
+    // parent (ADR 0058), so its pre-fork rows are in no log entry. The
+    // durable trim marker identifies such a group (it survives restarts,
+    // unlike how the group was started); tell the core, so a learner is
+    // shipped the engine image instead of a log that lacks those rows.
+    if storage
+        .get(&trim_marker::trim_marker_key(stream))
+        .await
+        .expect("system-keyspace engine read (cp split trim marker)")
+        .is_some()
+    {
+        core.lock()
+            .expect("raftkv core poisoned")
+            .set_log_omits_base(true);
+    }
     // Needs-snapshot state (issue #554): the engine's own watermark is below
     // the log's own compacted start — the prefix through `snapshot_index` is
     // gone from both the log (compacted) and the engine (never merged, or
@@ -12102,10 +12329,11 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         // than blocking the loop before it, so heartbeats keep flowing and the
         // election deadline keeps being re-armed while the disk is slow.
         if persist_fut.is_none()
-            && core
+            && (core
                 .lock()
                 .expect("raftkv core poisoned")
                 .has_unflushed_wal()
+                || persist.is_suspect())
         {
             persist_fut = Some(Box::pin(persist_wal(
                 &env,

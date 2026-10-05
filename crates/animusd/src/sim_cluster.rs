@@ -356,6 +356,24 @@ fn build_reconciler(
     reconciler
 }
 
+thread_local! {
+    /// Test-only negative-control switch (`sim_cluster_mrsc`): while set, every
+    /// node's reconciler loop feeds an EMPTY preferred-leader map, so the
+    /// preferred-leader step has nothing to act on. `SimEnv` runs on the
+    /// calling thread, so a thread-local scopes it to one test.
+    static PREFERRED_LEADER_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Switch the preferred-leader step off (`true`) or back on for this test's
+/// cluster (see [`PREFERRED_LEADER_DISABLED`]).
+pub(crate) fn set_preferred_leader_disabled(disabled: bool) {
+    PREFERRED_LEADER_DISABLED.with(|c| c.set(disabled));
+}
+
+fn preferred_leader_disabled() -> bool {
+    PREFERRED_LEADER_DISABLED.with(std::cell::Cell::get)
+}
+
 /// Drive `reconciler`'s per-tick lifecycle on `ctx`'s own node — this
 /// fixture's ONE tablet-hosting path since ADR 0061 rung D4 PR 1 (closing
 /// issue #715, see the module doc's own "Updated since D3" section),
@@ -402,9 +420,19 @@ fn spawn_reconciler_loop(ctx: SimNodeCtx, mut reconciler: SimReconciler) {
                 .filter(|(_, m)| m.status == NodeStatus::Down)
                 .map(|(id, _)| id.clone())
                 .collect();
+            let regions = animus_control::timing::region_map(
+                meta.members.iter().map(|(id, m)| (id, &m.labels)),
+            );
+            let preferred_leader = if preferred_leader_disabled() {
+                BTreeMap::new()
+            } else {
+                crate::leader_preferences(&meta)
+            };
             let view = MetadataView {
                 tablets: meta.tablets,
                 down,
+                regions,
+                preferred_leader,
             };
             reconciler.tick(&view).await;
         }
@@ -1224,6 +1252,17 @@ impl SimClusterHandle {
             .collect()
     }
 
+    /// Each CP group `node` hosts as `tablet:role@term->known leader`, for a
+    /// corpus's convergence-timeout dump.
+    pub(crate) fn group_states(&self, node: u64) -> Vec<String> {
+        self.ctx(node)
+            .edge
+            .hosted_groups()
+            .into_iter()
+            .map(|(t, g)| format!("{}:{}->{:?}", t.0, g.role_term(), g.leader()))
+            .collect()
+    }
+
     /// Per-replica progress of every CP group `node` hosts, read straight off
     /// its `RaftKvNode`s: `(tablet, commit_index, engine_applied_index,
     /// voter count)`. Input to [`SimCluster::await_replicas_caught_up`].
@@ -1416,6 +1455,32 @@ impl SimClusterHandle {
     ) -> ClientResponse {
         let target = self.ctx(to).env.node_id().to_string();
         self.ctx(from).relay(target, request).await
+    }
+
+    /// Issue #1230: `node`'s own `ClientCtx::register_node` — the single
+    /// bounded attempt (10 s) the pre-fix self-registration task made.
+    pub(crate) async fn register_node_once(
+        &self,
+        node: u64,
+        id: NodeId,
+        addrs: NodeAddrs,
+        labels: BTreeMap<String, String>,
+    ) -> Result<RegisterOutcome, String> {
+        self.ctx(node).register_node(id, addrs, labels).await
+    }
+
+    /// Issue #1230: `node`'s own `ClientCtx::register_node_until_settled` —
+    /// what production's self-registration task runs.
+    pub(crate) async fn register_node_retrying(
+        &self,
+        node: u64,
+        id: NodeId,
+        addrs: NodeAddrs,
+        labels: BTreeMap<String, String>,
+    ) -> RegisterOutcome {
+        self.ctx(node)
+            .register_node_until_settled(id, addrs, labels)
+            .await
     }
 
     /// Call `node`'s own `ClientCtx::propose_schema` directly, bypassing a
@@ -1692,6 +1757,9 @@ pub(crate) struct SimCluster {
     /// a different factor for one table uses
     /// [`SimCluster::create_table_with_replication`] instead.
     replication: usize,
+    /// Per-node topology labels registered by `seed_members` (G-01 stage G-a);
+    /// empty for every constructor but `new_with_node_labels`.
+    node_labels: BTreeMap<u64, BTreeMap<String, String>>,
     /// One control `RaftNode<SimEnv>` per node id, index == node id — the
     /// real multi-voter quorum (see the module doc's DDL-bypass bullet for
     /// why this fixture proposes on these handles directly rather than
@@ -2041,6 +2109,62 @@ impl SimCluster {
             segment_janitor_retention,
             cp_quiesce_after,
             SimEngineBackend::Memory,
+            BTreeMap::new(),
+        )
+    }
+
+    /// An all-`Both`, in-memory cluster whose members carry topology labels
+    /// (G-01 stage G-a): `node_labels[i]` is node `i`'s label set, registered
+    /// through both `RegisterNode` and the founding `UpsertMember`, exactly
+    /// as production self-registration does. Tables created over the wire
+    /// (`CreateTable`, i.e. `ClientCtx::provision_tablet`) then get the
+    /// zone-spread policy when the labels span >= RF zones.
+    pub(crate) fn new_with_node_labels(
+        seed: u64,
+        replication: usize,
+        node_labels: Vec<BTreeMap<String, String>>,
+    ) -> Self {
+        let roles = vec![NodeRole::Both; node_labels.len()];
+        Self::new_with_engine_backend(
+            seed,
+            &roles,
+            replication,
+            DEFAULT_SIM_SEGMENT_JANITOR_RETENTION,
+            None,
+            SimEngineBackend::Memory,
+            node_labels
+                .into_iter()
+                .enumerate()
+                .map(|(i, l)| (i as u64, l))
+                .collect(),
+        )
+    }
+
+    /// [`SimCluster::new_with_node_labels`] over real `LsmEngine<SimEnv>`s
+    /// (see [`SimEngineBackend::Lsm`]): a restarted node reopens its retained
+    /// disk, so its tablet groups' Raft state survives the restart exactly as
+    /// in production. With the `Memory` backend a restarted data group replays
+    /// an EMPTY Raft state, which the issue #667 boot-time cluster check
+    /// (correctly) treats as a wiped voter that never campaigns again — right
+    /// for a wiped disk, wrong for a model of a plain process restart.
+    pub(crate) fn new_with_node_labels_lsm(
+        seed: u64,
+        replication: usize,
+        node_labels: Vec<BTreeMap<String, String>>,
+    ) -> Self {
+        let roles = vec![NodeRole::Both; node_labels.len()];
+        Self::new_with_engine_backend(
+            seed,
+            &roles,
+            replication,
+            DEFAULT_SIM_SEGMENT_JANITOR_RETENTION,
+            None,
+            SimEngineBackend::Lsm,
+            node_labels
+                .into_iter()
+                .enumerate()
+                .map(|(i, l)| (i as u64, l))
+                .collect(),
         )
     }
 
@@ -2061,6 +2185,7 @@ impl SimCluster {
             DEFAULT_SIM_SEGMENT_JANITOR_RETENTION,
             cp_quiesce_after,
             SimEngineBackend::Lsm,
+            BTreeMap::new(),
         )
     }
 
@@ -2073,6 +2198,7 @@ impl SimCluster {
         segment_janitor_retention: Duration,
         cp_quiesce_after: Option<Duration>,
         backend: SimEngineBackend,
+        node_labels: BTreeMap<u64, BTreeMap<String, String>>,
     ) -> Self {
         let nodes = roles.len();
         assert!(nodes >= 1, "a cluster needs at least one node");
@@ -2657,6 +2783,7 @@ impl SimCluster {
             backend,
             control_index,
             control_node_ids,
+            node_labels,
         };
         // Let the control group elect before any caller touches it —
         // generous for up to a handful of voters under `SimEnv`'s
@@ -2754,7 +2881,7 @@ impl SimCluster {
                     self.controls[leader].propose(MetaCommand::RegisterNode {
                         node: id.clone(),
                         addrs,
-                        labels: BTreeMap::new(),
+                        labels: self.node_labels.get(&n).cloned().unwrap_or_default(),
                     }),
                     ProposeResult::Accepted { .. }
                 ),
@@ -2767,7 +2894,7 @@ impl SimCluster {
                 matches!(
                     self.controls[leader].propose(MetaCommand::UpsertMember {
                         node: id.clone(),
-                        labels: BTreeMap::new(),
+                        labels: self.node_labels.get(&n).cloned().unwrap_or_default(),
                         status: NodeStatus::Active,
                     }),
                     ProposeResult::Accepted { .. }
@@ -3405,6 +3532,11 @@ impl SimCluster {
         // tablet -> (max commit, per-node applied, max voter count)
         let mut tablets: BTreeMap<TabletId, TabletProgress> = BTreeMap::new();
         for node in 0..self.node_count() as u64 {
+            // A crashed (muted) node cannot catch up; its stale replica of a
+            // group that was repaired away from it is not a progress signal.
+            if self.crashed.contains(&node) {
+                continue;
+            }
             for (t, commit, applied, voters) in self.shared.replica_progress(node) {
                 let e = tablets.entry(t).or_insert((0, Vec::new(), 0));
                 e.0 = e.0.max(commit);
@@ -3459,6 +3591,11 @@ impl SimCluster {
             "{what}: replicas never caught up to their tablet's commit index (seed={}): {last}",
             self.seed()
         );
+    }
+
+    /// [`SimClusterHandle::group_states`]'s driver-callable twin.
+    pub(crate) fn group_states(&self, node: u64) -> Vec<String> {
+        self.shared.group_states(node)
     }
 
     /// [`SimClusterHandle::hosted_tablets`]'s own driver-callable twin.
@@ -7567,7 +7704,7 @@ impl SimCluster {
     pub(crate) fn drain(&mut self, node: u64) {
         let leader = self.control_leader_index();
         let ctx = self.shared.ctx(leader as u64);
-        ctx.admin_drain(nid(node)).unwrap_or_else(|e| {
+        ctx.admin_drain(nid(node), false).unwrap_or_else(|e| {
             panic!("admin_drain(node={node}) must be accepted by the control leader: {e}")
         });
         self.poll_until(Duration::from_secs(20), |c| {

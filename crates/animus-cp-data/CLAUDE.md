@@ -3121,6 +3121,44 @@ own internal mutex (in `animus-control`) is only taken inside `append_tagged`/
 `engine_applied_index`, never core `last_applied`). ADR 0017's and ADR 0038's
 2026-09-30 amendments.
 
+## Per-group WAN timing in the host reconciler (ADR 0075 section 3.4)
+
+`MetadataView::regions` (member id -> region label, empty by default: no
+behaviour change) and `Reconciler::set_max_region_rtt` feed
+`Reconciler::timing_profile_for(replicas)`; the profile is applied on `host`,
+on `materialize_split_child` and re-applied every `tick` to each hosted tablet
+(a label or replica-set change converges; the no-change path draws no
+entropy). `RaftKvNode::set_timing_profile` wakes the driver on a real change;
+`RaftKvNode::election_timeout()` reads the installed base. **The ADR 0044
+heartbeat batcher is unchanged**: its 50 ms tick (`DEFAULT_HEARTBEAT_BATCH_
+INTERVAL`) is `<=` every profile's heartbeat. Every `MetadataView { .. }`
+literal now needs `..Default::default()` (or a `regions` field). Corpus:
+`tests/it/wan_timing_corpus.rs`, `ANIMUS_WAN_TIMING_SEEDS` (see the lesson
+`docs/lessons/testing/2026-10-04-measure-where-the-old-setting-fails-before-
+building-its-negative-control.md`: the LAN-forced control only bites on the
+re-election cells).
+
+## Preferred leader and witness replicas (ADR 0075 section 3.3/3.6, G-c M2)
+
+`MetadataView::preferred_leader` (tablet -> `LeaderPreference { region, witness }`,
+empty = no behaviour change; `animusd::leader_preferences` derives it from
+`TableSchema.global` x `Tablet.table`) feeds `Reconciler::preferred_leader_step`
+(end of `tick`). It acts only when this node **leads a tablet from a Region it must
+not** (not the preferred one, or the witness one): the violation must hold for
+`PREFERRED_LEADER_STABILITY_TIMEOUTS` (2) election timeouts and transfers are at
+least `PREFERRED_LEADER_MIN_INTERVAL_TIMEOUTS` (10) apart per group; target = non-`Down`
+voter in the preferred Region with the best `peer_match >= commit_index` (the exact
+arm gate of `RaftCore::transfer_leadership`; its `bool` is checked and a refusal is
+retried without resetting the window; metrics `CpPreferredLeaderTransfers`/`...Rejected`).
+A witness-region leader falls back to any other caught-up non-witness voter. Idle
+correct groups are never touched, so quiescence is not fought (arming a transfer is
+the only wake). The same pass calls `RaftKvNode::set_witness`, which makes
+`stale_read_ready()` false so a witness never serves a replica-local eventual read
+(`animusd` `cp_stale_forward_target` also skips witness replicas). Corpus:
+`tests/it/preferred_leader_corpus.rs`, `ANIMUS_MRSC_SEEDS`. Known: quiescence does not
+settle on links with RTT above the heartbeat interval (issue #1226), so the quiescence
+cell runs on 1 ms links.
+
 ## Fuzzing (roadmap R-01 (c))
 
 The RaftKV codec (wire/image/WAL), segment codec, backup chunk/manifest codecs, layout marker, cursors and engine marker values are the `cp_data_formats` fuzz target; the `pub(crate)` ones are reached through the off-by-default `fuzzing` feature (`src/fuzzing.rs`). See `fuzz/README.md` (stable smoke: `cd fuzz && cargo test --release --test smoke`).
@@ -3150,3 +3188,29 @@ The RaftKV codec (wire/image/WAL), segment codec, backup chunk/manifest codecs, 
   re-points its `HeartbeatBatcher` via `set_features`) is the production seam P2-C
   calls with `RaftNode::features()`. A hosted group keeps the handle it started with.
 
+
+## StorageFull: per-tablet WAL recovery (R-01 (d), issue #1185)
+
+`persist_wal` no longer `assert!`s on an ENOSPC append/sync (per-group file or
+`SharedWal::append_tagged`): it calls `PersistProgress::mark_suspect` and runs
+`recover_kv_wal`, which wraps `animus_control::persist_round::recover_suspect_wal`
+with a `write_image` of `Disk::replace` (removing the `.tmp` sibling on failure)
+on the per-group path or `SharedWal::compact_group` on the shared path. A
+suspect group refuses writes before proposing (`RaftKvNode::is_storage_full`,
+`record_storage_full_refusal` feeds `overload_storage_full`), keeps serving
+reads of applied state, and `apply_and_compact` skips compaction while suspect
+(an ENOSPC compaction rewrite also marks suspect; the staged-rewrite path
+tolerates ENOSPC). The `persist` field on `RaftKvNode` exposes the progress
+handle. A non-ENOSPC failure stays `assert!(halted)`. Gap: engine-side ENOSPC
+(LSM flush/compaction, apply-time `merge_batch`) is NOT handled; the corpus
+runs `MemoryEngine` only. See `docs/resource-bounds.md` section 3.
+
+## A split child's log does not reproduce its engine (issue #1229)
+
+A fork child's engine is cloned from the parent's, so its pre-fork rows are in no
+log entry. `RaftKvNode`'s driver reads the durable split-trim marker at start and
+calls `RaftCore::set_log_omits_base(true)`; while the leader's `snapshot_index` is 0
+it then sends a *learner* no log (it raises `snapshot_needed` instead, so the engine
+image is built and shipped). Never route a new replica of a fork child through log
+replay. Regression: `animusd` `sim_cluster_split_relocation`. ADR 0058's
+2026-10-05 amendment; lesson `docs/lessons/code-patterns/2026-10-05-state-seeded-outside-the-log-needs-a-snapshot-for-every-new-replica.md`.

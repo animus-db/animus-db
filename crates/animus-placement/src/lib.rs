@@ -74,6 +74,17 @@ pub struct PlacementPolicy {
     /// Residency: a node is eligible only if, for every `(key, value)` here, its
     /// label `key` equals `value`. Empty ⇒ no residency restriction.
     pub required_labels: BTreeMap<String, String>,
+    /// Residency **IN-set** (ADR 0075, G-01 stage G-c): a node is eligible only
+    /// if, for every `(key, values)` here, its label `key` is *one of*
+    /// `values`. Unlike [`required_labels`](Self::required_labels) (key ==
+    /// one value) this can name "exactly these regions" — together with a
+    /// strict [`SpreadPolicy`] over the same key it pins a tablet to one
+    /// replica in each of a fixed set of regions
+    /// ([`PlacementPolicy::mrsc`]). Empty ⇒ no restriction. **Replicated
+    /// (class G, `Gate::GlobalTables`)**: `skip_serializing_if` empty, so a
+    /// cluster with no pinned policy writes byte-identical policies.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub allowed_values: BTreeMap<String, BTreeSet<String>>,
     /// Optional failure-domain spread. `None` ⇒ replicas may share any domain.
     pub spread: Option<SpreadPolicy>,
 }
@@ -85,8 +96,46 @@ impl PlacementPolicy {
             name: name.into(),
             replication_factor,
             required_labels: BTreeMap::new(),
+            allowed_values: BTreeMap::new(),
             spread: None,
         }
+    }
+
+    /// Builder: restrict placement to nodes whose label `key` is one of
+    /// `values` (see [`allowed_values`](Self::allowed_values)).
+    #[must_use]
+    pub fn allow_values<I, V>(mut self, key: impl Into<String>, values: I) -> Self
+    where
+        I: IntoIterator<Item = V>,
+        V: Into<String>,
+    {
+        self.allowed_values
+            .insert(key.into(), values.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// The **MRSC** policy (ADR 0075 section 3.1): RF 3, restricted to nodes
+    /// in exactly `regions` ([`REGION_LABEL`] IN-set), strictly one replica per
+    /// region. With exactly three regions this is a perfect pin: the only
+    /// admissible replica sets have one node in each named region.
+    pub fn mrsc<I, V>(name: impl Into<String>, regions: I) -> Self
+    where
+        I: IntoIterator<Item = V>,
+        V: Into<String>,
+    {
+        Self::simple(name, 3)
+            .allow_values(REGION_LABEL, regions)
+            .spread_across(REGION_LABEL, true)
+    }
+
+    /// Whether this policy **pins** placement: an IN-set residency restriction
+    /// combined with a strict spread. Pinned policies are repaired with
+    /// [`replan_pinned`], which also fixes a survivor set that violates the
+    /// strict spread (plain [`replan`] seeds survivors without re-validating
+    /// it).
+    #[must_use]
+    pub fn is_pinned(&self) -> bool {
+        !self.allowed_values.is_empty() && self.spread.as_ref().is_some_and(|s| s.strict)
     }
 
     /// Builder: restrict placement to nodes whose label `key` equals `value`.
@@ -112,6 +161,56 @@ impl PlacementPolicy {
         self.required_labels
             .iter()
             .all(|(k, v)| candidate.labels.get(k).is_some_and(|cv| cv == v))
+            && self
+                .allowed_values
+                .iter()
+                .all(|(k, vs)| candidate.labels.get(k).is_some_and(|cv| vs.contains(cv)))
+    }
+}
+
+/// The well-known Kubernetes label key naming a node's region (G-01 stage G-a).
+pub const REGION_LABEL: &str = "topology.kubernetes.io/region";
+
+/// The well-known Kubernetes label key naming a node's zone, and the default
+/// failure-domain key [`zone_spread_policy`] spreads over (G-01 stage G-a).
+pub const ZONE_LABEL: &str = "topology.kubernetes.io/zone";
+
+/// The default table placement policy: `replication_factor` replicas,
+/// **best-effort spread** over [`ZONE_LABEL`] iff the live membership (`members`'
+/// label maps) can actually honour it, otherwise [`PlacementPolicy::simple`].
+///
+/// "Can honour" means **every** member carries a non-empty zone value (a
+/// spread policy excludes a node lacking the domain label from placement
+/// entirely — see [`SpreadPolicy::domain`] — so installing one on a
+/// partially-labelled cluster would silently shrink the candidate pool) and
+/// there are at least `replication_factor` distinct zone values. The spread is
+/// best-effort (`strict: false`), so after a whole zone is lost the repair pass
+/// may double up in a surviving zone rather than refuse to heal.
+///
+/// Evaluated once, against the membership at table-creation time: a cluster
+/// that gains zones later does not retro-upgrade existing tables' policies.
+pub fn zone_spread_policy<'a>(
+    name: impl Into<String>,
+    replication_factor: usize,
+    members: impl IntoIterator<Item = &'a BTreeMap<String, String>>,
+) -> PlacementPolicy {
+    let mut zones: BTreeSet<&str> = BTreeSet::new();
+    let mut all_labelled = true;
+    let mut any = false;
+    for labels in members {
+        any = true;
+        match labels.get(ZONE_LABEL).map(String::as_str) {
+            Some(z) if !z.is_empty() => {
+                zones.insert(z);
+            }
+            _ => all_labelled = false,
+        }
+    }
+    let policy = PlacementPolicy::simple(name, replication_factor);
+    if any && all_labelled && zones.len() >= replication_factor && replication_factor > 1 {
+        policy.spread_across(ZONE_LABEL, false)
+    } else {
+        policy
     }
 }
 
@@ -275,6 +374,49 @@ pub fn replan_repair(
     } else {
         choose(&eligible, &keep, policy)
     }
+}
+
+/// [`replan_repair`]'s sibling for a **pinned** policy
+/// ([`PlacementPolicy::is_pinned`]; ADR 0075, G-01 stage G-c): recompute a
+/// replica set keeping the eligible survivors, but first **drop survivors that
+/// duplicate a strict spread domain** (keeping the lowest node id per domain)
+/// so a skewed starting set (two replicas in one region) converges to one per
+/// region. Plain [`replan`]/[`replan_repair`] deliberately seed survivors
+/// without re-validating the strict spread (documented, tested behaviour for
+/// unpinned policies, which this leaves untouched); a pinned policy cannot
+/// afford that, because there is no other path that would ever fix the set.
+///
+/// There is **no best-effort growth**: a pinned policy that cannot be
+/// satisfied (a pinned region has no eligible node) is an error
+/// ([`PlacementError::InsufficientDomains`]), and the caller proposes
+/// nothing. The replica waits for its region rather than moving to another
+/// (the MRSC contract is one replica per region). Repair *within* a region
+/// (a node replaced by another node of the same region) works.
+///
+/// For a policy with no strict spread this equals [`replan`].
+///
+/// # Errors
+/// As [`replan`].
+pub fn replan_pinned(
+    current: &[NodeId],
+    candidates: &[Candidate],
+    policy: &PlacementPolicy,
+) -> Result<Vec<NodeId>> {
+    let eligible = eligible_domains(candidates, policy);
+    let domain_of: BTreeMap<&NodeId, &Domain> = eligible.iter().map(|(n, d)| (n, d)).collect();
+    let strict = policy.spread.as_ref().is_some_and(|s| s.strict);
+    let mut keep: BTreeSet<NodeId> = BTreeSet::new();
+    let mut taken_domains: BTreeSet<&Domain> = BTreeSet::new();
+    // BTreeSet iteration is ascending, so the lowest id per domain wins.
+    let survivors: BTreeSet<&NodeId> = current.iter().collect();
+    for n in survivors {
+        let Some(d) = domain_of.get(n) else { continue };
+        if strict && !taken_domains.insert(*d) {
+            continue; // a second survivor in a strict domain: dropped
+        }
+        keep.insert(n.clone());
+    }
+    choose(&eligible, &keep, policy)
 }
 
 /// One step of **load rebalancing** across the candidate nodes (ADR 0029): move a

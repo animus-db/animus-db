@@ -70,6 +70,8 @@ pub async fn dispatch<H: AdminHost + ?Sized>(
         ("POST", "/admin/cluster-version/finalize") => {
             host.action_finalize_cluster_version(body).await
         }
+        ("GET", "/admin/global-tables") => (200, host.global_tables_view().await),
+        ("POST", "/admin/table/preferred-leader") => host.action_set_preferred_leader(body).await,
         ("POST", "/admin/data/dynamo") => host.action_data_dynamo(body).await,
         ("POST", "/admin/data/drop-table") => host.action_drop_table(body).await,
         ("POST", "/admin/data/seed") => host.action_data_seed(body).await,
@@ -260,6 +262,13 @@ mod tests {
             assert_eq!(body, b"the-body");
             (200, self.record())
         }
+        async fn global_tables_view(&self) -> Value {
+            self.record()
+        }
+        async fn action_set_preferred_leader(&self, body: &[u8]) -> (u16, Value) {
+            assert_eq!(body, b"the-body");
+            (200, self.record())
+        }
         async fn action_data_dynamo(&self, _body: &[u8]) -> (u16, Value) {
             unreachable!()
         }
@@ -374,6 +383,22 @@ mod tests {
             &host,
             "POST",
             "/admin/cluster-version/finalize",
+            "",
+            b"the-body",
+        ));
+        assert_eq!(status, 200);
+        assert_eq!(host.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn global_table_routes_dispatch_to_the_host() {
+        let host = FakeHost::new();
+        let (status, _) = block_on(dispatch(&host, "GET", "/admin/global-tables", "", b""));
+        assert_eq!(status, 200);
+        let (status, _) = block_on(dispatch(
+            &host,
+            "POST",
+            "/admin/table/preferred-leader",
             "",
             b"the-body",
         ));

@@ -58,6 +58,33 @@ pub fn frozen_refusal(is_frozen: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// R-01 (d), ADR 0074 §2 (`docs/resource-bounds.md` §3): the named refusal a
+/// mutating propose helper returns while the tablet group's own write-ahead
+/// log is suspect after an ENOSPC (`RaftKvNode::is_storage_full`). Begins with
+/// `StorageFull:` so a client/operator reading the 503 body sees the cause,
+/// and ends in the house `"; retry"` suffix so every relay allowlist and
+/// `WireError::service_unavailable` mapping treats it as a transient
+/// `ServiceUnavailable` — the condition clears, without a restart, once space
+/// returns and the group has rewritten its WAL. Never returned for a read.
+pub const STORAGE_FULL_REFUSAL: &str = "StorageFull: this tablet's disk is full and its write-ahead log is awaiting a rewrite onto free space; writes are refused until space returns; retry";
+
+/// The shared pre-propose disk-full refusal (see [`STORAGE_FULL_REFUSAL`]).
+/// `is_storage_full` is `CpGroup::is_storage_full()`'s own value.
+pub fn storage_full_refusal(is_storage_full: bool) -> Result<(), String> {
+    if is_storage_full {
+        return Err(STORAGE_FULL_REFUSAL.into());
+    }
+    Ok(())
+}
+
+/// Whether `e` is the [`STORAGE_FULL_REFUSAL`] (or a relayed copy of it). A
+/// retry loop must **not** spin on it inline for its whole client budget — the
+/// condition lasts until an operator frees space — so the retry decision
+/// excludes it and the client backs off on the 503 instead.
+pub fn is_storage_full_refusal(e: &str) -> bool {
+    e.contains("StorageFull:")
+}
+
 /// Whether a CP read error is a **transient routing/leadership/scope race**
 /// the reader should retry with re-resolved routing (the `"; retry"` shape
 /// every such error in this file carries), as opposed to a genuine failure
@@ -389,6 +416,26 @@ mod tests {
         // "retry" appearing mid-message (not as the trailing shape) must not
         // count — only the exact house convention does.
         assert!(!read_should_retry("please retry later"));
+    }
+
+    // --- storage_full_refusal (R-01 (d), ADR 0074 §2) -------------------------
+
+    #[test]
+    fn storage_full_refusal_ok_when_the_wal_is_healthy() {
+        assert_eq!(storage_full_refusal(false), Ok(()));
+    }
+
+    #[test]
+    fn storage_full_refusal_is_named_and_retryable_when_suspect() {
+        let e = storage_full_refusal(true).unwrap_err();
+        assert!(e.starts_with("StorageFull:"), "{e}");
+        assert!(read_should_retry(&e), "must map to a 503, not a 500: {e}");
+        assert!(is_storage_full_refusal(&e));
+    }
+
+    #[test]
+    fn is_storage_full_refusal_ignores_other_retryable_errors() {
+        assert!(!is_storage_full_refusal("CP group leader moved; retry"));
     }
 
     // --- ok_or_err ---------------------------------------------------------

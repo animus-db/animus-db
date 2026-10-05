@@ -448,7 +448,26 @@ pub struct ClusterSettings {
     /// minimum.
     #[serde(default)]
     pub tablet_max_write_units: Option<u64>,
+    /// `--max-region-rtt-ms MS` (ADR 0075 section 3.4, G-01 stage G-c
+    /// groundwork): the cluster-wide upper bound on the round trip between any
+    /// two **regions** (`topology.kubernetes.io/region` member labels). It sizes
+    /// the WAN Raft timing profile (election base `max(150ms, 5 x rtt)`,
+    /// heartbeat `max(50ms, election / 10)`, see
+    /// `animus_control::timing::TimingProfile`) of every group — the control
+    /// group and each tablet group — whose replicas span more than one region.
+    /// `None` resolves to [`DEFAULT_MAX_REGION_RTT_MS`] (150). **Inert on an
+    /// unlabelled or single-region cluster** (every group stays on the LAN
+    /// timing). Additive and skipped when unset (ADR 0035 / ADR 0073: an old
+    /// config and the frozen fixture are byte-identical); it is a node-local
+    /// timing choice, never replicated, so it must merely be set sensibly (and
+    /// ideally identically) on every node. Applies to every role that runs a
+    /// Raft group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_region_rtt_ms: Option<u64>,
 }
+
+/// The default [`ClusterSettings::max_region_rtt_ms`] (ADR 0075 section 3.4).
+pub const DEFAULT_MAX_REGION_RTT_MS: u64 = 150;
 
 /// The `"v"` this build writes and the highest it reads (ADR 0073 Phase 0,
 /// Workstream E). The Phase 0 baseline is `1`.
@@ -513,6 +532,18 @@ pub struct ClusterConfig {
 }
 
 impl ClusterConfig {
+    /// The effective `max_region_rtt` ([`ClusterSettings::max_region_rtt_ms`],
+    /// default [`DEFAULT_MAX_REGION_RTT_MS`]).
+    #[must_use]
+    pub fn max_region_rtt(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.cluster_settings
+                .as_ref()
+                .and_then(|s| s.max_region_rtt_ms)
+                .unwrap_or(DEFAULT_MAX_REGION_RTT_MS),
+        )
+    }
+
     /// Generate a **combined-mode** config for `n` nodes on `host`, assigning
     /// each node six consecutive ports starting at `base_port` (node `i`
     /// uses `base_port + 6*i .. +6`): internal, client, dynamo, admin
@@ -539,6 +570,7 @@ impl ClusterConfig {
                     advertise_host: None,
                     tls: None,
                     encryption_key_path: None,
+                    labels: Default::default(),
                     overload: None,
                 }
             })
@@ -579,6 +611,7 @@ impl ClusterConfig {
                     advertise_host: None,
                     tls: None,
                     encryption_key_path: None,
+                    labels: Default::default(),
                     overload: None,
                 }
             })
@@ -1009,6 +1042,7 @@ mod tests {
             throttle_write_units: Some(25),
             tablet_max_read_units: Some(100),
             tablet_max_write_units: Some(100),
+            max_region_rtt_ms: Some(220),
         });
         let parsed = ClusterConfig::from_json(&cfg.to_json()).unwrap();
         assert_eq!(parsed.cluster_settings, cfg.cluster_settings);
@@ -1133,5 +1167,25 @@ mod tests {
         };
         cfg.validate_tls()
             .expect("no nodes means nothing to disagree");
+    }
+
+    /// G-01 stage G-a: a node entry's `labels` is additive — absent parses as
+    /// empty, empty is skipped on serialize (existing config bytes, and the
+    /// golden fixture, are unchanged), a populated map round-trips.
+    #[test]
+    fn node_labels_are_additive_and_round_trip() {
+        let mut cfg = ClusterConfig::generate(2, "127.0.0.1".parse().unwrap(), 7000);
+        assert!(
+            !cfg.to_json().contains("\"labels\""),
+            "empty labels skipped"
+        );
+        let bare = ClusterConfig::from_json(&cfg.to_json()).unwrap();
+        assert!(bare.nodes.iter().all(|n| n.labels.is_empty()));
+        cfg.nodes[1]
+            .labels
+            .insert("topology.kubernetes.io/zone".to_owned(), "z1".to_owned());
+        let parsed = ClusterConfig::from_json(&cfg.to_json()).unwrap();
+        assert!(parsed.nodes[0].labels.is_empty());
+        assert_eq!(parsed.nodes[1].labels["topology.kubernetes.io/zone"], "z1");
     }
 }

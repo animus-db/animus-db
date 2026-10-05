@@ -15,7 +15,9 @@
 //! seam.
 
 use k8s_openapi::api::apps::v1::StatefulSet;
-use k8s_openapi::api::core::v1::{ConfigMap, Secret, Service};
+use std::collections::BTreeMap;
+
+use k8s_openapi::api::core::v1::{ConfigMap, Node, Pod, Secret, Service};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use kube::api::{Patch, PatchParams};
@@ -98,6 +100,27 @@ pub trait ClusterApi: Send + Sync {
     /// `Secret` for the admin client's TLS connector (`crate::controller`'s
     /// scale-down drain sequence).
     async fn get_secret(&self, ns: &str, name: &str) -> Result<Option<Secret>, ReconcileError>;
+    /// `LIST` the pods in `ns` matching every `selector` label (G-01 stage
+    /// G-a: the cluster's own pods, to resolve their nodes' topology).
+    async fn list_pods(
+        &self,
+        ns: &str,
+        selector: &BTreeMap<String, String>,
+    ) -> Result<Vec<Pod>, ReconcileError>;
+    /// The labels of the cluster-scoped `Node` named `name`, or `None` if it
+    /// does not exist (G-01 stage G-a).
+    async fn get_node_labels(
+        &self,
+        name: &str,
+    ) -> Result<Option<BTreeMap<String, String>>, ReconcileError>;
+    /// Merge-patch `annotations` onto the pod `name` (G-01 stage G-a: the
+    /// node's topology, see `crate::desired::topology`).
+    async fn patch_pod_annotations(
+        &self,
+        ns: &str,
+        name: &str,
+        annotations: &BTreeMap<String, String>,
+    ) -> Result<(), ReconcileError>;
 }
 
 /// The production [`ClusterApi`]: every method is exactly the `kube::Api`
@@ -239,5 +262,44 @@ impl ClusterApi for RealClusterApi {
         Ok(Api::<Secret>::namespaced(self.client.clone(), ns)
             .get_opt(name)
             .await?)
+    }
+
+    async fn list_pods(
+        &self,
+        ns: &str,
+        selector: &BTreeMap<String, String>,
+    ) -> Result<Vec<Pod>, ReconcileError> {
+        let sel = selector
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let pods = Api::<Pod>::namespaced(self.client.clone(), ns)
+            .list(&kube::api::ListParams::default().labels(&sel))
+            .await?;
+        Ok(pods.items)
+    }
+
+    async fn get_node_labels(
+        &self,
+        name: &str,
+    ) -> Result<Option<BTreeMap<String, String>>, ReconcileError> {
+        Ok(Api::<Node>::all(self.client.clone())
+            .get_opt(name)
+            .await?
+            .map(|n| n.metadata.labels.unwrap_or_default()))
+    }
+
+    async fn patch_pod_annotations(
+        &self,
+        ns: &str,
+        name: &str,
+        annotations: &BTreeMap<String, String>,
+    ) -> Result<(), ReconcileError> {
+        let patch = json!({ "metadata": { "annotations": annotations } });
+        Api::<Pod>::namespaced(self.client.clone(), ns)
+            .patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await?;
+        Ok(())
     }
 }

@@ -1348,3 +1348,36 @@ bucket lifecycle rule reaps it) -- documented, not injected.
   `docs/engineering-lessons.md`'s matching entry for the general lesson
   (a fault enabled before a multi-step setup sequence finishes can corrupt
   the setup itself, not just the operation under test).
+
+## `soak` (R-01 (a), `docs/soak.md`)
+
+`src/soak.rs` is the pure resource-trend detector the real-process soak
+(`animusd` `tests/soak.rs`) uses: `evaluate(samples, &TrendConfig)` drops a
+warm-up, cuts the rest into equal windows, takes per-window medians (robust to
+a compaction sawtooth shorter than a window) and reports `Growing` for a new
+high in the last window (rule A) or a steady climb (rule B), `Bounded`
+otherwise, `Insufficient` when a window is too thin (never a failure). No I/O,
+no clock: deterministic from the samples. **Gotcha**: tolerances are relative
+to the *first window's median*, so size test series so a genuine leak exceeds
+`rel_tol` over the span (a leak of a few percent per day is, by design, below
+a 10% tolerance); `parse_duration` reads the `ANIMUS_SOAK_DURATION` syntax.
+
+## Disk-full (ENOSPC) corpus (R-01 (d), issue #1185)
+
+`tests/it/raftkv_linearizable.rs` has a dedicated ENOSPC family. The earlier
+notes that `set_enospc_prob` stays out of the other corpora still hold (their
+scenarios never call `shutdown()`, and most run the LSM engine whose ENOSPC path
+is unhandled); this one is safe because the persist path now recovers instead of
+panicking. Nemeses: `DiskFull` (100% ENOSPC on every replica), `LeaderDiskFull`
+(100% on the current leader's node only, via the per-node
+`Simulator::set_disk_config_for` override that `heal_all` resets per node) and
+`DiskFlaky` (30% per op). `disk_full_cells()` (8 cells; early/mid window x 3/5
+replicas) runs a `DISK_FULL_WINDOW` (3.5 s) window and asserts linearizability
+(no acked write lost or duplicated), progress after the window with no restart,
+and seed determinism (`raftkv_disk_full_corpus_is_linearizable`,
+`..._covers_its_matrix`, `..._run_is_deterministic`). Depth:
+`ANIMUS_DISK_FULL_SEEDS=K` (default 1); `ANIMUS_SEED` replays one.
+**MemoryEngine only; never combine with `ANIMUS_RAFTKV_LSM=1`.** Do not add a
+`StopRestart` during a 100% window: SimEnv injects ENOSPC on reads too, so the
+WAL would read back empty. A flaky-disk workload can finish inside its window, so
+assert progress only where the workload outlives it.

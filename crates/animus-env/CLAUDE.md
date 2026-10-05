@@ -1241,3 +1241,15 @@ fails if any name in `docs/`, `website/` or `deploy/observability/` is not in
 the live exposition. Exported names are unprefixed (no `animus_`).
 
 - **Overload counters (R-01 (d))**: `Metric::OverloadShed{ConnCap,Admission,AdminConnCap,PeerConnCap}` (`overload_shed_*`), appended after `CpGroupsRefusedAsVoter`, recorded by `animusd::overload` users. Known issue: `prod.rs::read_frames` allocates `vec![0; len]` from a peer-supplied `u32` with no cap (see `docs/resource-bounds.md` section 4).
+
+## `is_storage_full` and `Metric::OverloadStorageFull` (R-01 (d), issue #1185)
+
+`animus_env::is_storage_full(&io::Error)` is the one classifier for ENOSPC
+(`ErrorKind::StorageFull`); `ProdEnv` surfaces the real errno as that kind and
+`SimEnv`'s `DiskConfig::set_enospc_prob` injects it, so both exercise the same
+match. Every WAL writer branches on it (persist rounds, compaction rewrites,
+`SharedWal`) instead of treating it as a generic durability fault. A new
+`Metric::OverloadStorageFull` (`overload_storage_full`) is appended at the END
+of the enum (the ordering is a stable export contract), bumped by the wire
+edge when it refuses a write for a StorageFull group. Design:
+`docs/resource-bounds.md` section 3.

@@ -146,6 +146,21 @@ spec:
                   [`DEFAULT_IMAGE`](Self::DEFAULT_IMAGE) when omitted.
                 nullable: true
                 type: string
+              maxRegionRttMs:
+                description: |-
+                  An upper bound, in milliseconds, on the round trip between any two
+                  **regions** of a stretch cluster (ADR 0075 section 3.4, G-01 G-c; ADR
+                  0060 stretch shape). Emitted into the generated `cluster.json`'s
+                  `cluster_settings.max_region_rtt_ms`, where it sizes the WAN Raft
+                  timing profile of every group whose replicas span more than one
+                  `topology.kubernetes.io/region`. `None` (default) leaves the node's own
+                  default (150 ms); **inert on a single-region or unlabelled cluster**.
+                  Additive and skipped when unset, so an existing spec's `cluster.json`
+                  is byte-identical.
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
               nodes:
                 description: Total pod count (`StatefulSet.spec.replicas`). Must be at least 1.
                 format: int32
@@ -431,6 +446,26 @@ spec:
                       placed by hand. Mutually exclusive with `certManager`.
                     nullable: true
                     type: string
+                type: object
+              topology:
+                description: |-
+                  Topology-aware scheduling (G-01 stage G-a, ADR 0060's 2026-10-04
+                  amendment). `None` (default) is [`TopologySpec::default`]: the
+                  `StatefulSet` carries a zone `topologySpreadConstraints` entry and a
+                  preferred hostname pod anti-affinity. Node region/zone label
+                  resolution (the operator patching each scheduled pod's node labels
+                  onto the pod as annotations, projected to `--labels-file`) is **not**
+                  controlled by this field: it is always on.
+                nullable: true
+                properties:
+                  spread:
+                    description: |-
+                      Emit the pod `topologySpreadConstraints` (zone, `maxSkew: 1`,
+                      `whenUnsatisfiable: ScheduleAnyway`) and the preferred hostname pod
+                      anti-affinity. Default `true`; `false` leaves scheduling entirely to
+                      the cluster's defaults.
+                    nullable: true
+                    type: boolean
                 type: object
             required:
             - nodes

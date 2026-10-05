@@ -489,6 +489,27 @@ jobs:
           ANIMUS_DYNAMO_WIRE_SEEDS: ${{ github.event.inputs.dynamo_wire_seeds || '25' }}
         run: cargo test -p animusd --lib sim_cluster_dynamo_corpus -- --nocapture
 
+      # G-01 stage G-a: six zone-labelled nodes (two per zone), RF 3 —
+      # every tablet must span 3 zones, a whole zone is then killed, and
+      # every acked write must survive with the repair pass re-converging.
+      - name: deep zone-placement corpus (G-01 stage G-a)
+        id: zone_placement
+        continue-on-error: true
+        timeout-minutes: 30
+        env:
+          ANIMUS_ZONE_PLACEMENT_SEEDS: '25'
+        run: cargo test -p animusd --lib sim_cluster_zone_placement -- --nocapture
+
+      # Issue #1229: a split child relocated wholesale by directed Placing
+      # keeps its pre-split rows (learner shipped the engine image, not the log).
+      - name: split-child relocation corpus (issue #1229)
+        id: split_relocation
+        continue-on-error: true
+        timeout-minutes: 30
+        env:
+          ANIMUS_SPLIT_RELOCATION_SEEDS: '20'
+        run: cargo test -p animusd --lib sim_cluster_split_relocation -- --nocapture
+
       # ADR 0068's S3 export/import job driver + import driver: multi-tablet
       # export content fidelity, concurrent writes racing the pin, bucket
       # faults, a crash mid-export/mid-import (the ADR's own named
@@ -541,6 +562,52 @@ jobs:
           ANIMUS_HEARTBEAT_SEEDS: ${{ github.event.inputs.heartbeat_seeds || '40' }}
         run: |
           cargo test -p animus-cp-data --test it heartbeat_batch_corpus:: -- --nocapture
+
+      # ADR 0075 section 3.4 (G-01 stage G-c groundwork): the per-group WAN
+      # Raft timing profile. Three regions at 60-90ms one-way with a noisy
+      # tail; the WAN cells (steady, leader-node kill, leader-region
+      # partition + heal) must keep bounded term churn and commit durably,
+      # and the LAN-forced negative control must show election churn on the
+      # fault cells. Each cell is a pure function of its seed.
+      - name: deep WAN-timing corpus (ADR 0075 section 3.4)
+        id: wan_timing
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          ANIMUS_WAN_TIMING_SEEDS: '40'
+        run: |
+          cargo test -p animus-cp-data --test it wan_timing_corpus:: -- --nocapture
+
+      # ADR 0075 sections 3.3/3.6 (G-01 stage G-c, M2): the preferred-leader
+      # reconciler step over three regions on WAN links. Steady convergence of
+      # the leader into the preferred region, leader-region kill + return,
+      # preferred-region partition + heal, the witness region never leading,
+      # an unready transfer target, and hysteresis under a flapping link, with
+      # a statistical negative control (empty preferred map) and a no-
+      # hysteresis control. Fixed depth, no workflow_dispatch input (the cap
+      # of 25 is full). Each cell is a pure function of its seed.
+      - name: deep MRSC preferred-leader corpus (ADR 0075 section 3.3)
+        id: mrsc_leader
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          ANIMUS_MRSC_SEEDS: '40'
+        run: |
+          cargo test -p animus-cp-data --test it preferred_leader_corpus:: -- --nocapture
+
+      # ADR 0075 (G-01 stage G-c, M4): the MRSC stretch-cluster corpus over
+      # SimCluster: six nodes, three regions, WAN links, a table converted over
+      # the real DynamoDB wire, then region loss / partition / split / node
+      # replacement / witness-form / decommission-guard cells and three
+      # negative controls. Fixed depth, no workflow_dispatch input. Each cell
+      # is a pure function of its seed.
+      - name: deep MRSC stretch-cluster corpus (ADR 0075)
+        id: mrsc_cluster
+        continue-on-error: true
+        timeout-minutes: 30
+        env:
+          ANIMUS_MRSC_SEEDS: '10'
+        run: cargo test -p animusd --lib sim_cluster_mrsc -- --nocapture
 
       # ADR 0028's C-05 PR 2 SharedWal persist-path wiring: cross-tablet
       # coalescing under a burst of concurrent hosted-group writes, a crash
@@ -690,9 +757,14 @@ jobs:
             [control]="${{ steps.control.outcome }}"
             [simcluster]="${{ steps.simcluster.outcome }}"
             [dynamo_wire]="${{ steps.dynamo_wire.outcome }}"
+            [zone_placement]="${{ steps.zone_placement.outcome }}"
+            [split_relocation]="${{ steps.split_relocation.outcome }}"
             [export_import]="${{ steps.export_import.outcome }}"
             [s3_fault]="${{ steps.s3_fault.outcome }}"
             [heartbeat]="${{ steps.heartbeat.outcome }}"
+            [wan_timing]="${{ steps.wan_timing.outcome }}"
+            [mrsc_leader]="${{ steps.mrsc_leader.outcome }}"
+            [mrsc_cluster]="${{ steps.mrsc_cluster.outcome }}"
             [sharedwal]="${{ steps.sharedwal.outcome }}"
             [wal_rewrite_crash]="${{ steps.wal_rewrite_crash.outcome }}"
             [upgrade_restart]="${{ steps.upgrade_restart.outcome }}"
@@ -703,7 +775,7 @@ jobs:
           )
           failed=0
           failed_names=()
-          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner reconfigure_drop inplace_split backup pitr lsm_crash lsm_disk_fault lsm_encrypted segment_store_encrypted control simcluster dynamo_wire export_import s3_fault heartbeat sharedwal wal_rewrite_crash upgrade_restart upgrade_restart_cluster upgrade_mixed upgrade_mixed_cluster learner_snapshot_livelock; do
+          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner reconfigure_drop inplace_split backup pitr lsm_crash lsm_disk_fault lsm_encrypted segment_store_encrypted control simcluster dynamo_wire zone_placement split_relocation export_import s3_fault heartbeat wan_timing mrsc_leader mrsc_cluster sharedwal wal_rewrite_crash upgrade_restart upgrade_restart_cluster upgrade_mixed upgrade_mixed_cluster learner_snapshot_livelock; do
             outcome="${outcomes[$name]}"
             echo "${name}: ${outcome}"
             if [ "${outcome}" != "success" ]; then

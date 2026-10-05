@@ -86,10 +86,19 @@ pub struct Shared {
     pub stats: Stats,
     pub stop: AtomicBool,
     pub start: Instant,
+    /// Added to every key a client picks (0 for chaos). The soak harness
+    /// gives each epoch a fresh key range so histories stay bounded.
+    pub key_base: u64,
+    /// Inter-op pause: `base + below(spread)` ms (chaos: 5 + below(20)).
+    pub pace_ms: (u64, u64),
 }
 
 impl Shared {
     pub fn new(seed: u64) -> Self {
+        Self::with_base(seed, 0, (5, 20))
+    }
+
+    pub fn with_base(seed: u64, key_base: u64, pace_ms: (u64, u64)) -> Self {
         Self {
             seed,
             rec: Mutex::new(Recorder::new(seed)),
@@ -101,6 +110,8 @@ impl Shared {
             stats: Stats::default(),
             stop: AtomicBool::new(false),
             start: Instant::now(),
+            key_base,
+            pace_ms,
         }
     }
 
@@ -127,10 +138,14 @@ fn conclude_write(
             Ok((s, b)) => format!("{s} {}", b.chars().take(160).collect::<String>()),
             Err(e) => e.to_string(),
         };
-        sh.trace.lock().expect("trace").push(format!(
-            "t={:.2}s p{proc} via {node} {mops:?} -> {what}",
-            sh.start.elapsed().as_secs_f64()
-        ));
+        let mut trace = sh.trace.lock().expect("trace");
+        // Bounded: a multi-day soak must not grow this without limit.
+        if trace.len() < 50_000 {
+            trace.push(format!(
+                "t={:.2}s p{proc} via {node} {mops:?} -> {what}",
+                sh.start.elapsed().as_secs_f64()
+            ));
+        }
     }
     let mut rec = sh.rec.lock().expect("recorder");
     match res {
@@ -309,7 +324,11 @@ async fn run_txn_get(sh: &Shared, proc: Process, keys: [Key; 2], node: SocketAdd
 /// One client: owns `key % CLIENTS == proc - 1`, runs until `stop`.
 pub async fn client_loop(sh: &Shared, proc: Process, nodes: Vec<SocketAddr>) {
     let mut rng = Rng::new(sh.seed ^ proc.wrapping_mul(0xA24B_AED4_963E_E407));
-    let owned: Vec<Key> = (0..KEYS).filter(|k| k % CLIENTS == proc - 1).collect();
+    let base = sh.key_base;
+    let owned: Vec<Key> = (0..KEYS)
+        .filter(|k| k % CLIENTS == proc - 1)
+        .map(|k| k + base)
+        .collect();
     while !sh.stop.load(Ordering::Relaxed) {
         let node = nodes[rng.below(nodes.len() as u64) as usize];
         let roll = rng.below(100);
@@ -329,18 +348,21 @@ pub async fn client_loop(sh: &Shared, proc: Process, nodes: Vec<SocketAddr>) {
             }
             run_txn_write(sh, proc, [owned[a], owned[b]], node).await;
         } else if roll < 80 {
-            run_get(sh, proc, rng.below(KEYS), true, node).await;
+            run_get(sh, proc, base + rng.below(KEYS), true, node).await;
         } else if roll < 90 && sh.txn_ops {
             let a = rng.below(KEYS);
             let mut b = rng.below(KEYS - 1);
             if b >= a {
                 b += 1;
             }
-            run_txn_get(sh, proc, [a, b], node).await;
+            run_txn_get(sh, proc, [base + a, base + b], node).await;
         } else {
-            run_get(sh, proc, rng.below(KEYS), false, node).await;
+            run_get(sh, proc, base + rng.below(KEYS), false, node).await;
         }
-        tokio::time::sleep(Duration::from_millis(5 + rng.below(20))).await;
+        tokio::time::sleep(Duration::from_millis(
+            sh.pace_ms.0 + rng.below(sh.pace_ms.1),
+        ))
+        .await;
     }
 }
 

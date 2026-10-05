@@ -1337,14 +1337,13 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     incoming_snapshot: Option<IncomingSnapshot>,
 
     // Timing (virtual). Election timeout is randomized in `[base, 2*base)`.
-    // Fixed at 150ms for every constructor — issue #313 removed the
-    // `set_election_timeout` setter this comment used to point to: it had
-    // zero call sites (no assembly layer was ever built to widen this for a
-    // node doing real disk I/O, the use case its own doc described), so it
-    // was dead, aspirational API rather than a documented-but-unwired
-    // knob worth keeping. See `election_timeout()` for the read-only
-    // accessor, still used by `transfer_leadership`'s deadline and by
-    // driver-side observability.
+    // Every constructor starts at the LAN pair (150ms / 50ms). Issue #313
+    // removed the dead `set_election_timeout` setter (zero call sites);
+    // ADR 0075 section 3.4 (roadmap G-01 stage G-c) adds back ONE narrow,
+    // used replacement, `set_timing`, whose callers pick the pair from
+    // `crate::timing::TimingProfile` (a group spanning regions gets the WAN
+    // pair). See `election_timeout()` for the read-only accessor, used by
+    // `transfer_leadership`'s deadline and by driver-side observability.
     election_base: Duration,
     heartbeat_interval: Duration,
     election_deadline: Nanos,
@@ -1603,6 +1602,16 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     /// their group. Purely diagnostic: never read by any protocol decision.
     /// `None` for the control group itself.
     group_label: Option<String>,
+    /// Issue #1229: the state machine's base state (index 0) was seeded
+    /// **outside the log** (an in-place split child's engine is cloned from
+    /// its parent's, ADR 0058), so while `snapshot_index == 0` the log does
+    /// NOT reproduce the state machine and replaying it from entry 1 would
+    /// give a brand-new replica only the post-fork writes. While set, a
+    /// learner is never sent `AppendEntries` until a snapshot base exists —
+    /// it gets the engine image instead. Purely local, never persisted
+    /// (re-derived from the engine at driver start); `false` for every
+    /// ordinary group.
+    log_omits_base: bool,
 }
 
 impl<C, S> RaftCore<C, S>
@@ -1691,9 +1700,17 @@ where
             cluster_check_saw_established_with_me: false,
             cluster_check_refused: false,
             group_label: None,
+            log_omits_base: false,
         };
         core.reset_election_timer(now, entropy);
         core
+    }
+
+    /// Issue #1229: declare that this group's base state was seeded outside
+    /// its log (see the `log_omits_base` field). Set by the data-plane
+    /// driver for a split child; idempotent.
+    pub fn set_log_omits_base(&mut self, omits: bool) {
+        self.log_omits_base = omits;
     }
 
     /// Recover a node from its durable state, then resume as a follower.
@@ -2887,6 +2904,67 @@ where
         self.quiesced = false;
         self.last_activity = now;
         true
+    }
+
+    /// Install a new `(election_base, heartbeat_interval)` pair (ADR 0075
+    /// section 3.4: the per-group timing profile, see
+    /// [`crate::timing::TimingProfile::durations`]). Returns whether anything
+    /// changed.
+    ///
+    /// **Idempotent**: re-installing the current pair is a no-op that touches
+    /// no deadline, so a reconciler may call it on every tick without ever
+    /// postponing an election. A zero duration is refused (returns `false`).
+    ///
+    /// On a real change the deadlines are re-armed from `now` so the new pair
+    /// takes effect immediately rather than after the old, possibly much
+    /// longer or shorter, wait: a non-leader draws a fresh randomized election
+    /// deadline from the new base (`entropy` is the caller's `env.next_u64()`);
+    /// a leader pulls its next heartbeat in to at most `now + heartbeat` (never
+    /// pushes it out, so a WAN widening cannot starve followers still timing
+    /// out on the old base) and leaves an armed `transfer_deadline` alone.
+    /// A quiesced group's deadlines are not consulted at all. Everything that
+    /// derives from the pair (`transfer_leadership`'s deadline,
+    /// `next_cluster_check_resend`, the departing-peer backoff gap,
+    /// [`election_timeout`](Self::election_timeout) and its
+    /// `health` grace consumers) reads the fields, so it follows automatically.
+    ///
+    /// The driver sleeps until [`next_deadline`](Self::next_deadline) and
+    /// recomputes it every iteration, so a caller that SHORTENS the timing
+    /// should also wake the driver (the data plane's `RaftKvNode::wake`);
+    /// lengthening needs nothing (an early wake just finds nothing due).
+    pub fn set_timing(
+        &mut self,
+        election_base: Duration,
+        heartbeat_interval: Duration,
+        now: Nanos,
+        entropy: u64,
+    ) -> bool {
+        if election_base.is_zero() || heartbeat_interval.is_zero() {
+            return false;
+        }
+        if self.election_base == election_base && self.heartbeat_interval == heartbeat_interval {
+            return false;
+        }
+        self.election_base = election_base;
+        self.heartbeat_interval = heartbeat_interval;
+        if self.role == Role::Leader {
+            let next = Nanos(now.0.saturating_add(self.heartbeat_nanos()));
+            if next.0 < self.heartbeat_deadline.0 {
+                self.heartbeat_deadline = next;
+            }
+        } else {
+            self.reset_election_timer(now, entropy);
+        }
+        true
+    }
+
+    /// The current `(election_base, heartbeat_interval)` pair — what
+    /// [`set_timing`](Self::set_timing) last installed (the LAN defaults
+    /// otherwise). Lets a caller skip an entropy draw when nothing would
+    /// change.
+    #[must_use]
+    pub fn timing(&self) -> (Duration, Duration) {
+        (self.election_base, self.heartbeat_interval)
     }
 
     /// The current election-timeout base (the low end of the randomized
@@ -5967,6 +6045,19 @@ where
             return None;
         }
         let next = self.next_index.get(&peer).copied().unwrap_or(1).max(1);
+        // Issue #1229: a learner of a group whose base state lives outside
+        // its log must be shipped the engine image, never the log from
+        // entry 1 — the log alone lacks the pre-fork rows. Nothing flows to
+        // it until a snapshot base exists (`snapshot_upto` at the image
+        // build below moves `snapshot_index` off 0, after which the
+        // ordinary `next <= snapshot_index` branch ships it). Raising
+        // `snapshot_needed` needs something applied to snapshot at.
+        if self.log_omits_base && self.snapshot_index == 0 && self.learners.contains(&peer) {
+            if self.last_applied > 0 {
+                self.snapshot_needed = true;
+            }
+            return None;
+        }
         // The entry before `next` is in our snapshot (or earlier) — we can't form
         // a valid `prev_log_term`, so ship the snapshot instead, as the next
         // offset-addressed chunk for this peer.

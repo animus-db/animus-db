@@ -34,6 +34,7 @@ pub mod config;
 #[deny(clippy::disallowed_methods)]
 mod index_drain;
 mod min_tablets;
+pub mod node_labels;
 pub mod otel;
 pub use config::{ClusterConfig, DynamoAuthConfig};
 // Re-exported so callers (CLI, tests, operators) can inspect a node's cached
@@ -101,6 +102,8 @@ mod dynamo;
 mod dynamo_streams;
 #[deny(clippy::disallowed_methods)]
 mod forwarding;
+#[deny(clippy::disallowed_methods)]
+mod global_tables;
 mod http;
 mod import;
 #[deny(clippy::disallowed_methods)]
@@ -567,6 +570,15 @@ enum CpGroup<E: Env = ProdEnv> {
 }
 
 impl<E: Env> CpGroup<E> {
+    /// Test-only: `role@term` for a corpus's convergence-timeout dump.
+    #[cfg(test)]
+    fn role_term(&self) -> String {
+        match self {
+            CpGroup::Lsm(n) => format!("{:?}@{}", n.role(), n.term()),
+            CpGroup::Mem(n) => format!("{:?}@{}", n.role(), n.term()),
+        }
+    }
+
     /// The group's feature-gate handle (ADR 0073 Phase 2): the node's own
     /// control-fed handle when the reconciler injected it, else a private
     /// floor handle. Test-only: nothing in production reads it back.
@@ -1016,6 +1028,34 @@ impl<E: Env> CpGroup<E> {
         }
     }
 
+    /// Whether this group's WAL is suspect after an ENOSPC (R-01 (d), ADR 0074
+    /// §2) — the `StorageFull` state. A pure flag read; see
+    /// [`RaftKvNode::is_storage_full`].
+    pub(crate) fn is_storage_full(&self) -> bool {
+        match self {
+            CpGroup::Lsm(n) => n.is_storage_full(),
+            CpGroup::Mem(n) => n.is_storage_full(),
+        }
+    }
+
+    /// The pre-propose disk-full refusal every mutating local write/txn helper
+    /// consults beside [`decide::frozen_refusal`]: while this group is
+    /// `StorageFull` it can make nothing durable, so a write is refused
+    /// **before proposing** with the named, `"; retry"`-suffixed
+    /// [`decide::STORAGE_FULL_REFUSAL`] (surfaced as a 503
+    /// `ServiceUnavailable` naming `StorageFull`) and `overload_storage_full`
+    /// is counted. Reads are never gated.
+    pub(crate) fn refuse_if_storage_full(&self) -> Result<(), String> {
+        let full = self.is_storage_full();
+        if full {
+            match self {
+                CpGroup::Lsm(n) => n.record_storage_full_refusal(),
+                CpGroup::Mem(n) => n.record_storage_full_refusal(),
+            }
+        }
+        decide::storage_full_refusal(full)
+    }
+
     /// Propose the split-cutover freeze directly (`RaftKvNode::
     /// propose_freeze`) — leader-only, idempotent. `SimCluster`'s own
     /// `freeze_tablet` (issue #994 regression) is the sole caller today: a
@@ -1362,6 +1402,7 @@ impl<E: Env> CpGroup<E> {
                     byte_size,
                     quiesced: $n.is_quiesced(),
                     refused_as_voter: $n.refused_as_voter(),
+                    storage_full: $n.is_storage_full(),
                     voter_history: self
                         .voter_history()
                         .into_iter()
@@ -2914,6 +2955,17 @@ pub struct RoleAddrs {
     /// loaded and handed to `ProdEnv::bind_with_tls_and_key`.
     #[serde(default)]
     pub encryption_key_path: Option<String>,
+    /// This node's topology labels (G-01 stage G-a) — e.g.
+    /// `topology.kubernetes.io/zone`. Passed to the node's own
+    /// `register_node`/`admin_add_member` self-registration, so they land in
+    /// replicated `Metadata::members[*].labels` where the placement engine's
+    /// residency/spread policies read them. **Fixed at first registration**:
+    /// `Metadata`'s `RegisterNode`/`admin_add_member` never overwrite an
+    /// existing member row's labels (see ADR 0005's 2026-10-04 amendment).
+    /// Empty (every pre-G-a config, `#[serde(default)]`, skipped on
+    /// serialize so existing config bytes are unchanged) registers none.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
     /// This node's resource bounds / overload limits (R-01 (d), ADR 0074
     /// §2) — `None` (every pre-existing config) means every default, see
     /// [`config::OverloadSection`]. Not serialized when absent, so existing
@@ -2990,7 +3042,16 @@ pub struct BoundNode {
     /// This node's advertised hostname (ADR 0060), from the [`RoleAddrs`]
     /// [`Node::bind`] was given — see [`advertised_addr`] and
     /// [`RoleAddrs::advertise_host`]'s own doc.
+    /// ADR 0075 section 3.4: the configured max inter-region round trip, sizing
+    /// the WAN Raft timing profile of every group this node hosts that spans
+    /// more than one region. Defaults to 150 ms; set from
+    /// `cluster_settings.max_region_rtt_ms` via `with_max_region_rtt`.
+    max_region_rtt: Duration,
     advertise_host: Option<String>,
+    /// This node's own topology labels, from [`RoleAddrs::labels`] — handed
+    /// to its self-registration (`spawn_common_tail`'s `register_node`, a
+    /// growth node's `admin_add_member`).
+    labels: BTreeMap<String, String>,
     /// This node's TLS material (ADR 0064, S-01 commit 2), loaded once at
     /// bind time from `RoleAddrs::tls` — `None` is plain TCP on every port.
     tls: Option<TlsMaterial>,
@@ -5316,7 +5377,7 @@ fn spawn_common_tail(
     admin_info: Arc<AdminInfo>,
     client_route: BTreeMap<NodeId, String>,
     intra_route: BTreeMap<NodeId, String>,
-    self_addrs: (NodeId, NodeAddrs),
+    self_addrs: (NodeId, NodeAddrs, BTreeMap<String, String>),
     // `Arc`-wrapped (issue #1060) — see [`BoundNode::client_listener`]'s own
     // doc for why; `serve_requests` below takes the same type.
     client_listener: Arc<TcpListener>,
@@ -5437,7 +5498,7 @@ fn spawn_common_tail(
     )));
     // This node's own identity self-registration (ADR 0032 PR1; ADR 0040
     // Decision C since PR4 — the registration CAS is now the mechanism, not
-    // just an address-book update): one-shot, so peer-sync (internal
+    // just an address-book update): retried until registered (issue #1230), so peer-sync (internal
     // addresses) and any node's route/peers views (client/admin addresses)
     // can resolve it regardless of when this node joined relative to the
     // reader. Every node shape reaches this — a fresh bootstrap node whose
@@ -5447,16 +5508,27 @@ fn spawn_common_tail(
     // already owns) and a growth node with no other claim path at all (e.g.
     // a control-only permanently-non-voter — `BoundControlNode::
     // start_control_with` has no `admin_add_member` call of its own; this is
-    // its *only* claim). No labels here (this is a bare identity/address
-    // claim, not an operator-labeled add) — `admin_add_member`/
-    // `admin_add_control_member` are where real labels are set, and
-    // `RegisterNode`'s apply never overwrites an already-`members`-present
-    // entry's labels, so this can never clobber them.
+    // its *only* claim). Carries this node's own topology labels (G-01 stage
+    // G-a, `RoleAddrs::labels`; empty unless configured). `RegisterNode`'s apply
+    // never overwrites a non-empty label set, and only *fills in* an unlabelled
+    // already-present row — which closes the race where `bootstrap`'s
+    // `UpsertMember{labels: {}}` lands before this registration.
     {
         let ctx = ctx.clone();
-        let (node, addrs) = self_addrs;
+        let (node, addrs, labels) = self_addrs;
         tasks.push(tokio::spawn(async move {
-            let _ = ctx.register_node(node, addrs, BTreeMap::new()).await;
+            // Retried until a terminal outcome (issue #1230): a single
+            // attempt with its error discarded left a pod that started
+            // before the control group had a leader unregistered forever.
+            if let RegisterOutcome::Collision = ctx
+                .register_node_until_settled(node.clone(), addrs, labels)
+                .await
+            {
+                eprintln!(
+                    "animusd: self-registration of {node} found a different registration \
+                     already claiming this identity; not retrying"
+                );
+            }
         }));
     }
     // The two client-protocol listeners (ADR 0047): one parameterized
@@ -5629,6 +5701,15 @@ impl Drop for StartupTasks {
 }
 
 impl BoundNode {
+    /// Set the max inter-region round trip (ADR 0075 section 3.4) — see
+    /// `ClusterSettings::max_region_rtt_ms`. Inert unless some group spans more
+    /// than one `topology.kubernetes.io/region` label value.
+    #[must_use]
+    pub fn with_max_region_rtt(mut self, rtt: Duration) -> Self {
+        self.max_region_rtt = rtt;
+        self
+    }
+
     /// This node's own identity, as bound — the same [`NodeId`] [`Node::bind`]
     /// was given. Lets a caller holding a bag of already-bound nodes (e.g. a
     /// test fixture binding every node before starting any of them, issue
@@ -6113,6 +6194,10 @@ impl BoundNode {
         // version. Everything before this line in the wiring is inert.
         version_wiring::apply_profile_to_raft(&raft, &edge.version().profile());
         edge.register_control(raft.clone());
+        // ADR 0075 section 3.4: the control group derives its Raft timing
+        // profile from its own voters' region labels (a no-op on an unlabelled
+        // cluster). Opt-in, spawned after everything `RaftNode::start` spawns.
+        raft.enable_region_timing(self.max_region_rtt);
 
         // **Leaderful CP per-tablet Raft group** (ADR 0017 #3a) — the v1 data plane
         // (ADR 0019). Stage 3a hosts a single, statically-placed CP group spanning
@@ -6193,6 +6278,7 @@ impl BoundNode {
                     intra: advertised_addr(self.advertise_host.as_deref(), my_intra_addr),
                     role: "combined".to_string(),
                 },
+                self.labels.clone(),
             ),
             self.client_listener,
             self.admin_listener,
@@ -6278,6 +6364,9 @@ impl BoundNode {
         // `--quiesce-after` CLI flag on top of this same knob):
         // `Duration::ZERO` (every existing call site) disables it entirely —
         // zero behavior change. Data-plane groups only (fork G).
+        // ADR 0075 section 3.4: per-group WAN timing input (inert unless a hosted
+        // tablet's replicas span more than one region label).
+        reconciler.set_max_region_rtt(self.max_region_rtt);
         if !quiesce_after.is_zero() {
             // See `MIN_QUIESCE_AFTER`'s own doc for the full argument. The
             // CLI's own parser is the primary enforcement (a release build
@@ -6450,8 +6539,9 @@ impl BoundNode {
             {
                 let ctx = ctx.clone();
                 let node = my_id;
+                let labels = self.labels.clone();
                 tasks.push(tokio::spawn(async move {
-                    let _ = ctx.admin_add_member(node, BTreeMap::new()).await;
+                    ctx.admin_add_member_until_settled(node, labels).await;
                 }));
             }
         }
@@ -6835,7 +6925,9 @@ impl Node {
             intra_addr,
             console_listener,
             console_addr,
+            max_region_rtt: animus_control::timing::DEFAULT_MAX_REGION_RTT,
             advertise_host: addrs.advertise_host,
+            labels: addrs.labels,
             tls,
             encryption_key,
             overload: addrs.overload,
@@ -6898,7 +6990,9 @@ impl Node {
             admin_addr,
             intra_listener,
             intra_addr,
+            max_region_rtt: animus_control::timing::DEFAULT_MAX_REGION_RTT,
             advertise_host: addrs.advertise_host,
+            labels: addrs.labels,
             tls,
             encryption_key,
             overload: addrs.overload,
@@ -6970,7 +7064,9 @@ impl Node {
             intra_addr,
             console_listener,
             console_addr,
+            max_region_rtt: animus_control::timing::DEFAULT_MAX_REGION_RTT,
             advertise_host: addrs.advertise_host,
+            labels: addrs.labels,
             tls,
             encryption_key,
             overload: addrs.overload,
@@ -7516,7 +7612,14 @@ pub struct BoundControlNode {
     intra_listener: Arc<TcpListener>,
     intra_addr: SocketAddr,
     /// See [`BoundNode::advertise_host`]'s doc.
+    /// ADR 0075 section 3.4: the configured max inter-region round trip, sizing
+    /// the WAN Raft timing profile of every group this node hosts that spans
+    /// more than one region. Defaults to 150 ms; set from
+    /// `cluster_settings.max_region_rtt_ms` via `with_max_region_rtt`.
+    max_region_rtt: Duration,
     advertise_host: Option<String>,
+    /// See [`BoundNode::labels`]'s doc.
+    labels: BTreeMap<String, String>,
     /// This node's TLS material (ADR 0064, S-01 commit 2), loaded once at
     /// bind time from `RoleAddrs::tls` — `None` is plain TCP on every port.
     tls: Option<TlsMaterial>,
@@ -7527,6 +7630,15 @@ pub struct BoundControlNode {
 }
 
 impl BoundControlNode {
+    /// Set the max inter-region round trip (ADR 0075 section 3.4) — see
+    /// `ClusterSettings::max_region_rtt_ms`. Inert unless some group spans more
+    /// than one `topology.kubernetes.io/region` label value.
+    #[must_use]
+    pub fn with_max_region_rtt(mut self, rtt: Duration) -> Self {
+        self.max_region_rtt = rtt;
+        self
+    }
+
     /// The address clients connect to.
     pub fn client_addr(&self) -> SocketAddr {
         self.client_addr
@@ -7749,6 +7861,8 @@ impl BoundControlNode {
         // `BoundNode::start_with_growth`'s identical call.
         version_wiring::apply_profile_to_raft(&raft, &edge.version().profile());
         edge.register_control(raft.clone());
+        // ADR 0075 section 3.4 — see `BoundNode::start_with_growth`'s identical call.
+        raft.enable_region_timing(self.max_region_rtt);
 
         // This node's stream-shard segment store (ADR 0043 §A7b) — see
         // `BoundNode::start_with_streams`'s identical construction; `control`
@@ -7800,6 +7914,7 @@ impl BoundControlNode {
                     intra: advertised_addr(self.advertise_host.as_deref(), self.intra_addr),
                     role: "control".to_string(),
                 },
+                self.labels.clone(),
             ),
             self.client_listener,
             self.admin_listener,
@@ -7959,7 +8074,14 @@ pub struct BoundDataNode {
     console_listener: TcpListener,
     console_addr: SocketAddr,
     /// See [`BoundNode::advertise_host`]'s doc.
+    /// ADR 0075 section 3.4: the configured max inter-region round trip, sizing
+    /// the WAN Raft timing profile of every group this node hosts that spans
+    /// more than one region. Defaults to 150 ms; set from
+    /// `cluster_settings.max_region_rtt_ms` via `with_max_region_rtt`.
+    max_region_rtt: Duration,
     advertise_host: Option<String>,
+    /// See [`BoundNode::labels`]'s doc.
+    labels: BTreeMap<String, String>,
     /// This node's TLS material (ADR 0064, S-01 commit 2), loaded once at
     /// bind time from `RoleAddrs::tls` — `None` is plain TCP on every port.
     tls: Option<TlsMaterial>,
@@ -7970,6 +8092,15 @@ pub struct BoundDataNode {
 }
 
 impl BoundDataNode {
+    /// Set the max inter-region round trip (ADR 0075 section 3.4) — see
+    /// `ClusterSettings::max_region_rtt_ms`. Inert unless some group spans more
+    /// than one `topology.kubernetes.io/region` label value.
+    #[must_use]
+    pub fn with_max_region_rtt(mut self, rtt: Duration) -> Self {
+        self.max_region_rtt = rtt;
+        self
+    }
+
     /// The address clients connect to.
     pub fn client_addr(&self) -> SocketAddr {
         self.client_addr
@@ -8326,6 +8457,7 @@ impl BoundDataNode {
                     intra: advertised_addr(self.advertise_host.as_deref(), my_intra_addr),
                     role: "data".to_string(),
                 },
+                self.labels.clone(),
             ),
             self.client_listener,
             self.admin_listener,
@@ -8405,6 +8537,9 @@ impl BoundDataNode {
         // start_with_growth`'s own quiescence gate above — `Duration::ZERO`
         // (every pre-S-06 call site) disables it entirely, zero behavior
         // change.
+        // ADR 0075 section 3.4: per-group WAN timing input (inert unless a hosted
+        // tablet's replicas span more than one region label).
+        reconciler.set_max_region_rtt(self.max_region_rtt);
         if !quiesce_after.is_zero() {
             // Two asserts, not one — identical contract/rationale to
             // `BoundNode::start_with_growth`'s own gate above: the
@@ -8496,8 +8631,9 @@ impl BoundDataNode {
         {
             let ctx = ctx.clone();
             let node = my_id;
+            let labels = self.labels.clone();
             tasks.push(tokio::spawn(async move {
-                let _ = ctx.admin_add_member(node, BTreeMap::new()).await;
+                ctx.admin_add_member_until_settled(node, labels).await;
             }));
         }
 
@@ -11953,7 +12089,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// this requires the receiving node to be the control leader; a follower
     /// returns an error and the operator retries on the leader). Preserves the
     /// member's existing labels. Returns the accepted state or an error.
-    pub(crate) fn admin_drain(&self, node: NodeId) -> Result<(), String> {
+    /// Refuses (unless `force`) to drain the last Active member of a Region a
+    /// global table pins — see [`global_tables::drain_strands_region`].
+    pub(crate) fn admin_drain(&self, node: NodeId, force: bool) -> Result<(), String> {
         // Check leadership BEFORE reading `self.control.metadata_cached()`
         // for the member lookup below (ADR 0035 PR5 staleness-audit fix,
         // mirroring `admin_remove_member`'s already-fixed ordering — same
@@ -11969,6 +12107,14 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         let Some(member) = meta.members.get(&node) else {
             return Err(format!("node {node} is not a cluster member"));
         };
+        // Decommission guard (ADR 0075 plan D10): the last Active member of a
+        // Region a global table pins cannot be drained (the strict region pin
+        // would never re-place its replica) unless forced.
+        if !force && let Some((region, table)) = global_tables::drain_strands_region(&meta, &node) {
+            return Err(global_tables::drain_strands_region_error(
+                &node, &region, &table,
+            ));
+        }
         let labels = member.labels.clone();
         match leader.propose(MetaCommand::UpsertMember {
             node,
@@ -12224,6 +12370,21 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             return Ok(node);
         }
 
+        // ADR 0075 section 3.4: refuse a voter set that would put a strict
+        // majority of control voters in one region (a no-op on an unlabelled or
+        // single-region cluster). Checked before any registration side effect so
+        // a refusal leaves nothing half-done.
+        {
+            let mut after = current.clone();
+            after.insert(node.clone());
+            animus_control::timing::control_voter_change_check(
+                &self.control.metadata_cached(),
+                &current,
+                &after,
+                Some((&node, &labels)),
+            )
+            .map_err(|e| format!("refusing to add control voter {node}: {e}"))?;
+        }
         // ADR 0073 Phase 2 (P2-C): once the version era is on, refuse a voter
         // whose version range is unknown (a Phase 1 binary) or excludes the
         // cluster version, by name, before anything is registered or
@@ -12492,6 +12653,18 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         }
         let remaining: BTreeSet<NodeId> =
             current.iter().filter(|&id| *id != node).cloned().collect();
+        // ADR 0075 section 3.4: same region-majority guard as the add path;
+        // `--force` bypasses it (it can leave a region-concentrated quorum, so
+        // it must be explicit).
+        if !force {
+            animus_control::timing::control_voter_change_check(
+                &self.control.metadata_cached(),
+                &current,
+                &remaining,
+                None,
+            )
+            .map_err(|e| format!("refusing to remove control voter {node}: {e}; retry with --force to remove anyway"))?;
+        }
         // Liveness-aware quorum-loss guard (ADR 0037 hardening PR2). The
         // original ADR 0037 guard counted only the *resulting* voter count
         // (refuse `< 1`, warn `== 1`) — which looks complete but misses the
@@ -13920,6 +14093,14 @@ impl CpReconciler {
         }
     }
 
+    /// ADR 0075 section 3.4 — see [`Reconciler::set_max_region_rtt`]'s doc.
+    fn set_max_region_rtt(&mut self, rtt: Duration) {
+        match self {
+            CpReconciler::Lsm(r) => r.set_max_region_rtt(rtt),
+            CpReconciler::Mem(r) => r.set_max_region_rtt(rtt),
+        }
+    }
+
     /// ADR 0044 phase 2 (C-02 PR 2) production wiring — see
     /// [`Reconciler::enable_heartbeat_batching`]'s doc.
     fn enable_heartbeat_batching(&mut self) {
@@ -14126,12 +14307,40 @@ async fn tablet_host_reconciler_loop(ctx: ClientCtx, mut reconciler: CpReconcile
             .map(|(id, _)| id.clone())
             .collect();
         inplace_split_active = meta.tablets.values().any(|t| t.inplace_split.is_some());
+        let regions =
+            animus_control::timing::region_map(meta.members.iter().map(|(id, m)| (id, &m.labels)));
+        let preferred_leader = leader_preferences(&meta);
         let view = MetadataView {
             tablets: meta.tablets,
             down,
+            regions,
+            preferred_leader,
         };
         reconciler.tick(&view).await;
     }
+}
+
+/// Every tablet of a **global (MRSC) table** -> its leader preference (ADR 0075
+/// section 3.3, 3.6), derived from `TableSchema.global` x `Tablet.table`, for
+/// the tablet-host reconciler's preferred-leader step. A table's preference
+/// follows its splits for free (a child carries the same `Tablet.table`). Empty
+/// for a cluster with no global table.
+pub(crate) fn leader_preferences(
+    meta: &animus_control::Metadata,
+) -> std::collections::BTreeMap<animus_tablet::TabletId, animus_cp_data::host::LeaderPreference> {
+    meta.tablets
+        .iter()
+        .filter_map(|(id, t)| {
+            let g = meta.schemas.get(t.table.as_deref()?)?.global.as_ref()?;
+            Some((
+                *id,
+                animus_cp_data::host::LeaderPreference {
+                    region: g.preferred_leader_region.clone(),
+                    witness: g.witness.clone(),
+                },
+            ))
+        })
+        .collect()
 }
 
 /// How often [`txn_resolver_loop`] sweeps this node's locally-led tablet
@@ -15690,6 +15899,7 @@ pub async fn bind_cluster_with_advertise_host_and_key(
             advertise_host: advertise_host.clone(),
             tls: None,
             encryption_key_path: encryption_key_path.clone(),
+            labels: Default::default(),
             overload: None,
         };
         let node = Node::bind(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?;
@@ -16295,6 +16505,7 @@ pub async fn start_split_cluster_with_growth(
             advertise_host: None,
             tls: None,
             encryption_key_path: None,
+            labels: Default::default(),
             overload: None,
         };
         control_bound.push(
@@ -16315,6 +16526,7 @@ pub async fn start_split_cluster_with_growth(
             advertise_host: None,
             tls: None,
             encryption_key_path: None,
+            labels: Default::default(),
             overload: None,
         };
         data_bound
@@ -16866,7 +17078,9 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
     // — this node can never see itself as a member of its own genesis
     // config, so it never campaigns and the group never elects a leader. See
     // `docs/engineering-lessons.md` for the incident this fixes.
-    let bound = Node::bind(addrs.id.clone(), addrs, dir).await?;
+    let bound = Node::bind(addrs.id.clone(), addrs, dir)
+        .await?
+        .with_max_region_rtt(config.max_region_rtt());
     start_bound_node_with_streams_quiesce_and_ttl_sweep_interval(
         bound,
         config,
@@ -17248,7 +17462,9 @@ pub async fn run_node_control_with_stores(
     // See `run_node_with_streams_quiesce_and_ttl_sweep_interval`'s matching
     // comment: the node's own identity must be `addrs.id`, not the unrelated
     // `config::node_id(index)` minting convention.
-    let bound = Node::bind_control(addrs.id.clone(), addrs, dir).await?;
+    let bound = Node::bind_control(addrs.id.clone(), addrs, dir)
+        .await?
+        .with_max_region_rtt(config.max_region_rtt());
 
     // Cross-node routing (ADR 0017 #3b / ADR 0013): map every node's id to
     // its client API address, so a data op or a schema-DDL relay landing on
@@ -17471,7 +17687,9 @@ pub async fn run_node_data_with_cluster_settings(
     // See `run_node_with_streams_quiesce_and_ttl_sweep_interval`'s matching
     // comment: the node's own identity must be `addrs.id`, not the unrelated
     // `config::node_id(index)` minting convention.
-    let bound = Node::bind_data(addrs.id.clone(), addrs, dir).await?;
+    let bound = Node::bind_data(addrs.id.clone(), addrs, dir)
+        .await?
+        .with_max_region_rtt(config.max_region_rtt());
 
     // The control deployment's **intra**-cluster addresses (ADR 0047) — the
     // mirror/leader-hint discovery root (ADR 0035 §1/§4; `WatchMetadata` is
@@ -17600,7 +17818,9 @@ pub async fn run_node_growth(
     // See `run_node_with_streams_quiesce_and_ttl_sweep_interval`'s matching
     // comment: the node's own identity must be `addrs.id`, not the unrelated
     // `config::node_id(index)` minting convention.
-    let bound = Node::bind(addrs.id.clone(), addrs, dir).await?;
+    let bound = Node::bind(addrs.id.clone(), addrs, dir)
+        .await?
+        .with_max_region_rtt(config.max_region_rtt());
     let mut client_route: BTreeMap<NodeId, String> = BTreeMap::new();
     for (i, addrs) in config.nodes.iter().enumerate() {
         client_route.insert(
@@ -19032,6 +19252,7 @@ mod confirm_futility_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                labels: Default::default(),
                 overload: None,
             }],
             dynamo_auth: None,
@@ -19273,6 +19494,7 @@ mod forward_transport_failure_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                labels: Default::default(),
                 overload: None,
             })
             .collect();
@@ -19657,6 +19879,7 @@ mod forward_hop_timeout_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                labels: Default::default(),
                 overload: None,
             })
             .collect();
@@ -20487,6 +20710,7 @@ mod client_cancellation_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                labels: Default::default(),
                 overload: None,
             })
             .collect();
@@ -20852,6 +21076,7 @@ mod halted_shutdown_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                labels: Default::default(),
                 overload: None,
             }],
             dynamo_auth: None,
@@ -22144,6 +22369,10 @@ mod sim_cluster_lsm;
 /// depth knob `ANIMUS_UPGRADE_SEEDS`. See that module's doc.
 #[cfg(test)]
 mod sim_cluster_mixed_version_corpus;
+/// Issue #1229: a split child relocated wholesale by directed Placing keeps
+/// its pre-split rows (`SimCluster`).
+#[cfg(test)]
+mod sim_cluster_split_relocation;
 /// ADR 0065's own `SimEnv`-driven, virtual-time-only throttle-enforcement
 /// coverage, over the real `SimCluster` fixture — a sibling of
 /// `sim_cluster_corpus`, for the identical reason (needs `SimCluster`'s own
@@ -22156,6 +22385,15 @@ mod sim_cluster_throttle;
 /// `ANIMUS_UPGRADE_RESTART_SEEDS` (shared with tier 1). See that module's doc.
 #[cfg(test)]
 mod sim_cluster_upgrade_corpus;
+/// G-01 stage G-a: zone-labelled placement + whole-zone loss over `SimCluster`
+/// (`ANIMUS_ZONE_PLACEMENT_SEEDS`) — see that module's own doc.
+#[cfg(test)]
+mod sim_cluster_zone_placement;
+
+/// G-01 stage G-c, M4: the MRSC stretch-table cluster corpus
+/// (`ANIMUS_MRSC_SEEDS`) — see that module's own doc.
+#[cfg(test)]
+mod sim_cluster_mrsc;
 
 /// A first deterministic smoke over `SimClusterHandle::dynamo`/`SimCluster::
 /// dynamo` (ADR 0061 rung D2 PR 1) — the DynamoDB wire edge, decoded by
@@ -22212,6 +22450,9 @@ mod sim_cluster_dynamo_eventual_read;
 mod sim_cluster_dynamo_expression_surface;
 #[cfg(test)]
 mod sim_cluster_dynamo_extended;
+/// G-01 stage G-c M3: the MRSC global-table wire surface over `SimCluster`.
+#[cfg(test)]
+mod sim_cluster_dynamo_global_table;
 #[cfg(test)]
 mod sim_cluster_dynamo_item_size_cap;
 #[cfg(test)]
@@ -22777,6 +23018,13 @@ mod sim_cluster_control_only;
 #[cfg(test)]
 mod sim_cluster_data_only;
 
+/// Issue #1230: a node's self-registration must survive a control plane that
+/// is unreachable for longer than `SCHEMA_COMMIT_TIMEOUT` at start, and a
+/// still-running retry loop must never resurrect a removed node. See the
+/// module's own doc.
+#[cfg(test)]
+mod sim_cluster_register_retry;
+
 /// ADR 0061 rung L (C-12 PR 4a): the first conversion PR built on top of the
 /// PR 2/3 mechanism — `tests/control_only.rs` (3 tests), `tests/
 /// data_only.rs` (5 tests), and `tests/cluster_split.rs` (3 tests), pure
@@ -22983,6 +23231,7 @@ mod issue_298_conflict_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                labels: Default::default(),
                 overload: None,
                 console: addrs[5],
             }],

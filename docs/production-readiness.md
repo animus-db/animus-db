@@ -50,20 +50,20 @@ Last verified against the tree: 2026-10-04.
 
 ## (a) Soak
 
-Can build on B-01's workload generator (`animus-bench`, ADR 0076).
+Harness: [`docs/soak.md`](soak.md). (It uses the chaos history recorder, not B-01's `animus-bench` generator, which yields latency rather than an oracle-checkable history.)
 
 | ID | Criterion | Status | Evidence | Owner |
 |---|---|---|---|---|
-| A-1 | A multi-day soak harness runs real `animusd` processes (bare multi-process and/or the operator on `kind`) under a continuous recorded workload | Pending-dependency | None yet (no soak tooling in the tree); needs B-01 | a |
-| A-2 | A 7-consecutive-day soak completes with zero violations from the `animus-test` oracles (`check_cycles`, `check_durability`, `check_convergence`) over the recorded history | Pending-dependency | Oracles exist: `crates/animus-test/src/check.rs`; no soak run yet | a |
-| A-3 | Resource trends stay bounded over the soak: RSS, open fds, disk, WAL and compaction backlog show no monotone growth | Pending-dependency | None yet; metrics seam `crates/animus-env/src/metrics.rs` | a |
-| A-4 | Soak is re-runnable from CI or one documented command | Pending-dependency | None yet (`.github/workflows/soak.yml` planned) | a |
+| A-1 | A multi-day soak harness runs real `animusd` processes (bare multi-process and/or the operator on `kind`) under a continuous recorded workload | Not met | Bare multi-process harness `crates/animusd/tests/soak.rs` (opt-in `soak` feature), [`docs/soak.md`](soak.md); operator-on-`kind` leg not built; uses the chaos recorder rather than `animus-bench` | a |
+| A-2 | A 7-consecutive-day soak completes with zero violations from the `animus-test` oracles (`check_cycles`, `check_durability`, `check_convergence`) over the recorded history | Not met | Oracles run per epoch inside the harness (`docs/soak.md`); only short legs run so far, no 7-day run | a |
+| A-3 | Resource trends stay bounded over the soak: RSS, open fds, disk, WAL and compaction backlog show no monotone growth | Not met | Trend detector `crates/animus-test/src/soak.rs` (unit-tested) and per-node sampling in `tests/soak.rs`; no 7-day run | a |
+| A-4 | Soak is re-runnable from CI or one documented command | Met | `.github/workflows/soak.yml` (short leg, weekly + dispatch) and the one command in `docs/soak.md` | a |
 
 ## (b) Real-cluster chaos
 
 | ID | Criterion | Status | Evidence | Owner |
 |---|---|---|---|---|
-| B-1 | Chaos scenarios run against real processes: process kill, network partition, clock skew, slow disk, disk full | Not met | Real-process harness `crates/animusd/tests/chaos.rs` covers process kill (incl. control leader, full power cut), network partition (incl. one-way), delay and SIGSTOP stall, see `docs/chaos.md`. Missing from the criterion: clock skew, slow disk (Kubernetes-only designs in `deploy/chaos/`, unvalidated) and disk full (blocked on #1185) | b |
+| B-1 | Chaos scenarios run against real processes: process kill, network partition, clock skew, slow disk, disk full | Not met | Real-process harness `crates/animusd/tests/chaos.rs` covers process kill (incl. control leader, full power cut), network partition (incl. one-way), delay and SIGSTOP stall, see `docs/chaos.md`. Missing from the criterion: clock skew, slow disk (Kubernetes-only designs in `deploy/chaos/`, unvalidated) and real-process disk full (the sim side landed with #1185, see D-7; a real size-limited-filesystem leg is still missing) | b |
 | B-2 | Each scenario records a client history and passes the `animus-test` oracles | Not met | History capture and oracle feed exist (`crates/animusd/tests/chaos_support/workload.rs`, oracles `crates/animus-test/src/check.rs`) but the first runs found a violation (`docs/chaos.md`, Findings), so the scenarios do not pass | b |
 | B-3 | A failure reproducible from a seed is converted into a seeded sim corpus cell | Not met | Policy in ADR 0074 section 1. The first finding is timing-dependent (not seed-reproducible, ~1 in 12 smoke runs) and has not been reduced to a sim cell yet; the engine-level mechanism is reproducible deterministically (`docs/chaos.md`, Findings) | b |
 | B-4 | A chaos leg runs in CI or nightly beside the `kind` e2e | Met | `.github/workflows/chaos.yml` (PR smoke + nightly, non-required) beside `.github/workflows/e2e-kind.yml` | b |
@@ -93,7 +93,7 @@ uses C-17.
 | D-4 | Every client-facing listener has a finite connection cap; an excess connection is refused with 503 `ServiceUnavailable`, never queued | Not met | The accept loop in `crates/animusd/src/dynamo.rs` spawns a task per connection with no cap; no cap in `crates/animus-node/src/http.rs` | d |
 | D-5 | A node-wide in-flight request bound and a per-connection pipelining bound shed with `ServiceUnavailable`, before queuing | Not met | None; error plumbing exists (`error_status`, `WireError::service_unavailable`) | d |
 | D-6 | Memory-bound audit done: per-connection buffers, scan/batch result sizes, snapshot streaming buffers and channels on untrusted paths are bounded and documented, each with a test | Not met | No audit recorded | d |
-| D-7 | Disk-full: a write that cannot be fsynced is refused with a named `StorageFull` error and never acked, reads continue, and the node recovers without restart when space returns; proven in sim and on a real size-limited filesystem | Not met | Sim primitive exists (`ErrorKind::StorageFull` in `crates/animus-sim/src/lib.rs`, `crates/animus-sim/tests/it/disk_faults.rs`); no handling or `ProdEnv` test on a real node | d |
+| D-7 | Disk-full: a write that cannot be fsynced is refused with a named `StorageFull` error and never acked, reads continue, and the node recovers without restart when space returns; proven in sim and on a real size-limited filesystem | Partially met | Handled (R-01 (d), #1185): ENOSPC marks the WAL suspect, refuses writes with a named 503 `StorageFull` (`overload_storage_full`), reports `storage_full` on `/admin/health`, and rewrites the WAL onto free space without a restart; sim corpus `ANIMUS_DISK_FULL_SEEDS` (`raftkv_linearizable.rs`). **Not met yet:** no `ProdEnv` test on a real size-limited filesystem, LSM-engine ENOSPC unhandled, no leader step-down (`docs/resource-bounds.md` section 3) | d |
 | D-8 | Each overload refusal is counted by reason in the metrics seam | Not met | None; metrics seam `crates/animus-env/src/metrics.rs` | d |
 
 ## (e) Operations runbook
@@ -153,7 +153,7 @@ date. Waivers are re-reviewed at every release.
 
 ## Summary (2026-10-04)
 
-Met: X-1 to X-10, B-4, D-1, D-2, F-1, G-8. Pending-dependency: X-11, A-1 to
-A-4, E-7, E-8, F-2, F-5. Not met: every remaining row (B-1 to B-3, all of C, D-3
+Met: X-1 to X-10, A-4, B-4, D-1, D-2, F-1, G-8. Pending-dependency: X-11,
+E-7, E-8, F-2, F-5. Not met: every remaining row (A-1 to A-3, B-1 to B-3, all of C, D-3
 to D-8, E-1 to E-6 and E-9, F-3, F-4, G-1 to G-7, G-9). The project is therefore
 **pre-alpha**.

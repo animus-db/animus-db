@@ -515,6 +515,17 @@ pub struct AnimusClusterSpec {
     /// instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_split_bytes: Option<u64>,
+    /// An upper bound, in milliseconds, on the round trip between any two
+    /// **regions** of a stretch cluster (ADR 0075 section 3.4, G-01 G-c; ADR
+    /// 0060 stretch shape). Emitted into the generated `cluster.json`'s
+    /// `cluster_settings.max_region_rtt_ms`, where it sizes the WAN Raft
+    /// timing profile of every group whose replicas span more than one
+    /// `topology.kubernetes.io/region`. `None` (default) leaves the node's own
+    /// default (150 ms); **inert on a single-region or unlabelled cluster**.
+    /// Additive and skipped when unset, so an existing spec's `cluster.json`
+    /// is byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_region_rtt_ms: Option<u64>,
     /// Name of a `Secret` (in the same namespace) holding the DynamoDB
     /// SigV4 credential store (`{"credentials": {"AKID...": "secret...",
     /// ...}}`, ADR 0057). Mounted read-only at `/etc/animus/dynamo-auth/`
@@ -599,6 +610,39 @@ pub struct AnimusClusterSpec {
     /// nothing else about the pod template would otherwise change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption_key_secret_name: Option<String>,
+    /// Topology-aware scheduling (G-01 stage G-a, ADR 0060's 2026-10-04
+    /// amendment). `None` (default) is [`TopologySpec::default`]: the
+    /// `StatefulSet` carries a zone `topologySpreadConstraints` entry and a
+    /// preferred hostname pod anti-affinity. Node region/zone label
+    /// resolution (the operator patching each scheduled pod's node labels
+    /// onto the pod as annotations, projected to `--labels-file`) is **not**
+    /// controlled by this field: it is always on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topology: Option<TopologySpec>,
+}
+
+/// `spec.topology` (G-01 stage G-a).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TopologySpec {
+    /// Emit the pod `topologySpreadConstraints` (zone, `maxSkew: 1`,
+    /// `whenUnsatisfiable: ScheduleAnyway`) and the preferred hostname pod
+    /// anti-affinity. Default `true`; `false` leaves scheduling entirely to
+    /// the cluster's defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spread: Option<bool>,
+}
+
+impl AnimusClusterSpec {
+    /// Whether the generated `StatefulSet` carries topology spread /
+    /// anti-affinity scheduling hints (default on).
+    #[must_use]
+    pub fn topology_spread_enabled(&self) -> bool {
+        self.topology
+            .as_ref()
+            .and_then(|t| t.spread)
+            .unwrap_or(true)
+    }
 }
 
 impl Default for AnimusClusterSpec {
@@ -617,12 +661,14 @@ impl Default for AnimusClusterSpec {
             client_service: ClientServiceSpec::default(),
             quiesce_after_secs: None,
             auto_split_bytes: None,
+            max_region_rtt_ms: None,
             dynamo_auth_secret_name: None,
             tls: None,
             s3: None,
             backup_store: None,
             segment_store: None,
             encryption_key_secret_name: None,
+            topology: None,
         }
     }
 }

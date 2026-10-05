@@ -11987,6 +11987,23 @@ bump) need no change here: they land as one `transcode::TABLE` entry and the
 cells grow with `transcode::supported_back()`.
 
 
+## G-01 stage G-a: node labels and the zone-spread default (2026-10-04)
+
+- `RoleAddrs::labels` (additive, skip-if-empty) is each node's topology labels;
+  `Bound{,Control,Data}Node` keep them and pass them to `register_node` /
+  `admin_add_member`. Inputs and merge order: `node_labels::LabelFlags`
+  (`--label`, `--labels-file`, `--labels-file-annotations`,
+  `--labels-wait-secs`; flag > file > config). `--cluster N` rejects them.
+  `node_labels.rs` is process-boundary startup code (real `std::fs` and a real
+  bounded wait) and deliberately not a `#[deny(disallowed_methods)]` module.
+- `schema.rs::default_table_policy` / `zone_aware_initial_replicas`: the
+  zone-spread policy decision at table creation (see
+  `animus_placement::zone_spread_policy`). Computed once at creation.
+- `sim_cluster_zone_placement.rs` (`ANIMUS_ZONE_PLACEMENT_SEEDS`,
+  `SimCluster::new_with_node_labels`): 6 nodes / 3 zones, RF 3, wire
+  `CreateTable`, zone kill. Negative-controlled: disabling the zone-aware
+  initial pick fails it at placement.
+
 ## Observability kit and the metrics-exist check (R-01 (f))
 
 `deploy/observability/` (alert + recording rules, Grafana dashboard, SLO
@@ -12043,3 +12060,114 @@ fed into emitters); `Release(N-1) -> Release(N)` cells over real gates.
 **Gotcha**: the member-down cell crashes a node the shared client loop keeps
 routing 1/4 of its ops to (each stalls for the wire timeout), so acks *during* its
 roll are legitimately sparse; non-vacuity there is asserted after the era.
+
+## WAN timing config and the region-aware control-voter check (ADR 0075 section 3.4)
+
+`cluster_settings.max_region_rtt_ms` (additive, `skip_serializing_if` unset so
+the frozen cluster-config v1 fixture is unchanged; default 150) and
+`--max-region-rtt-ms MS` (needs `--config`) set the inter-region round-trip
+bound that sizes the WAN Raft profile; `ClusterConfig::max_region_rtt()` reads
+it and `Bound*Node::with_max_region_rtt` plumbs it to the control group
+(`RaftNode::enable_region_timing`) and the tablet-host reconciler
+(`set_max_region_rtt`). Inert unless some group's replicas span more than one
+`topology.kubernetes.io/region` label. `tablet_host_reconciler_loop` and
+`SimCluster` build `MetadataView::regions` from `Metadata.members` labels
+(`SimCluster` does not run the control loop, to keep fixed-seed timelines).
+`admin_add_control_member`/`admin_remove_control_member` call
+`animus_control::timing::control_voter_change_check` (remove accepts `--force`).
+**Gaps:** control-only voters' labels are not in `Metadata` (no `Member` row);
+`gen-config` cannot warn about a region-concentrated control set until G-a
+supplies labels.
+
+## MRSC global tables: `global_tables.rs` and `sim_cluster_mrsc` (ADR 0075, G-01 G-c)
+
+`global_tables.rs` is the `E: Env`-generic client/admin edge of MRSC (deny-
+`disallowed_methods` on its `mod` line): `update_table_global` (the wire
+conversion, shared by `run_operation` and `SimCluster`'s `dispatch_table_op`),
+`global_description` (DescribeTable fields, replica status derived), the MRSC
+restriction guards, and, since M4, `admin_global_tables_view`
+(`GET /admin/global-tables`), `admin_set_preferred_leader`
+(`POST /admin/table/preferred-leader`, relayed like a schema proposal and
+confirmed by observing `schema.global`) and the **decommission guard**
+`drain_strands_region` (`ClientCtx::admin_drain(node, force)` refuses the last
+`Active` member of a pinned Region; `force` overrides). Both admin routes have
+an `AdminHost` method (animus-node) and an arm in each of the two `impl`s in
+`admin.rs`. The dashboard needs no new fetch: `schemas.tables[t].global` is in
+`/admin/status`.
+
+`sim_cluster_mrsc.rs` (`ANIMUS_MRSC_SEEDS`, shared with `animus-cp-data`'s
+`preferred_leader_corpus`; `ANIMUS_MRSC_CELL`, `ANIMUS_SEED`): one `#[test]`
+per cell (`sim_cluster_mrsc_corpus_<cell>`, parallel under nextest) plus three
+negative controls. Harness gotchas it cost to learn:
+- **Give every node a recorded profile.** `SimCluster::restart` re-applies the
+  node's *recorded* binary profile (default `Phase1`); `set_all_node_versions`
+  alone does not record one, so a restarted node came back as a Phase 1 binary
+  that cannot decode version-2 batches and never rejoined. Call
+  `set_binary_profile(n, BinaryProfile::Release(2))` for every node.
+- **Use the LSM backend (`new_with_node_labels_lsm`) for any cell that
+  restarts a node.** With `Memory` a restarted tablet group replays an empty
+  Raft state; the issue #667 boot-time cluster check then (correctly) refuses
+  to let it vote or campaign, so a leadership transfer to it silently never
+  completes. That is right for a wiped disk, wrong for a process restart.
+- **`SimCluster` has no background split driver:** drive
+  `drive_inplace_split_cutover(node)` on every node each poll tick.
+- `await_replicas_caught_up` skips crashed nodes (a dead node's stale replica
+  is not progress); `group_states(node)` prints role@term/known leader per
+  hosted group for a convergence-timeout dump.
+- `split_under_mrsc` checks writes acked before and after the split; it found
+  issue #1229 (a split child whose replicas all move lost pre-split rows),
+  fixed by #1231.
+
+## Real-process soak (R-01 (a), `docs/soak.md`)
+
+`tests/soak.rs` (opt-in `soak` cargo feature, like `chaos`) runs the chaos
+harness's cluster/workload/oracle machinery (`tests/chaos_support/`) with no
+faults for hours or days, in **epochs**: each epoch has a fresh key range
+(`Shared::with_base`'s `key_base`), is verified (final reads through two nodes,
+the three oracles plus eventual-prefix and txn-atomicity) and its history is
+dropped; the previous epoch and epoch 0 are re-read as cold data; keys two
+epochs old are deleted so live data stays bounded. Per-node RSS/threads/fds
+(`/proc/<pid>`), data-dir/WAL bytes, `sst-*` file count and the
+`demux_*`/`spawned_task_handles_tracked` gauges feed
+`animus_test::soak::evaluate`. **Gotchas**: `chaos_support` is `mod`-included by
+both targets, so a helper only one uses needs `#[allow(dead_code)]` (clippy
+`-D warnings` over `--all-features` builds both); `ChaosCluster::pid`/
+`data_dir` exist for the soak; the soak never arms the proxy faults, so a
+`[node-exit]` or `[node-panic]` there is always a finding; node logs are not
+rotated, so a multi-day run needs disk for them.
+
+## StorageFull on the client path and in `/admin/health` (R-01 (d), issue #1185)
+
+`CpGroup::is_storage_full` + `refuse_if_storage_full` (`lib.rs`) refuse a write
+before it is proposed when the hosted group's WAL is suspect; `write_path.rs`
+and `txn_coordinator.rs` call it and stop their retry loops on
+`is_storage_full_refusal`. `dynamo::map_throttleable_error` maps the refusal to
+a 503 `ServiceUnavailable` whose message starts `StorageFull:` and ends
+`; retry` (test: `map_throttleable_error_tests`), counted as
+`overload_storage_full`. `/admin/health` adds `storage_full`,
+`storage_full_control`, `storage_full_tablets` without flipping the status code
+(readiness would also pull reads); `/admin/raftkv` gets a per-group
+`storage_full` field. `sim_cluster_admin`'s NOT_A_METRIC list no longer holds
+`overload_storage_full`; `storage_full` stays (it is a JSON field, not a metric)
+and `spawned_task_panics` stays (still not exported).
+
+## `sim_cluster_split_relocation` (issue #1229)
+
+`sim_cluster_split_relocation.rs`: 6-node RF 3 `SimCluster`, auto-split, child moved
+wholesale off the parent's replicas by directed Placing; every pre-split key must
+read back (`ConsistentRead`). Two cells (`MemoryEngine`; `LsmEngine` + rotating
+crash/restart). `ANIMUS_SPLIT_RELOCATION_SEEDS=K`, `ANIMUS_SEED=<s>`. Nightly at 20.
+See `crates/animus-cp-data/CLAUDE.md` for the root cause.
+
+## Startup self-registration is retried (issue #1230)
+
+`spawn_common_tail`'s `RegisterNode` and the growth/data-only `admin_add_member`
+claims run `ClientCtx::register_node_until_settled` /
+`admin_add_member_until_settled` (`schema.rs`): bounded-backoff retry via
+`env.sleep`, a log line per failure, stops on `Registered`/`Collision` or on
+first sight of the node's own entry in its local view (so a retry can never
+resurrect a node `RemoveMember` just removed; a replicated tombstone would be
+needed to close the residual mirror-lag window). Never reintroduce
+`let _ = ctx.register_node(..)`. Regression: `sim_cluster_register_retry.rs`
+(partition a follower from the control quorum for 25 s > `SCHEMA_COMMIT_TIMEOUT`;
+`ANIMUS_SEED=<seed>` replays). Lesson: `docs/lessons/code-patterns/2026-10-05-a-fire-and-forget-let-underscore-turns-a-bounded-timeout-into-a-permanent-silent-failure.md`.

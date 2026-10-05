@@ -10,11 +10,12 @@
 //! timeout-guarded (`ProdEnv` determinism guarantees do not apply, so a hang
 //! must fail loudly rather than stall CI).
 //!
-//! The real `MAX_SUPPORTED` is 1 (no gate has shipped), so Finalize cannot
-//! succeed here: the success path, the blocker matrix and the one-step rules
-//! are proven over seeds in `sim_cluster_cluster_version.rs` with synthetic
-//! `[1, 2]` binaries. What this test pins is the live wiring: the era, the
-//! view, the by-name refusal and the leader-only routing.
+//! The real `MAX_SUPPORTED` is 2 (G-01 stage G-c shipped the first real gate,
+//! `Gate::GlobalTables`), so every real binary advertises `[1, 2]` and a live
+//! Finalize to 2 succeeds here: the era, the view, the leader-only routing
+//! and the finalize that opens `Gate::GlobalTables` on every node (a
+//! data-only node's mirror included). The blocker matrix and the one-step
+//! rules are proven over seeds in `sim_cluster_cluster_version.rs`.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -96,8 +97,8 @@ async fn the_era_starts_over_real_sockets_and_the_admin_surface_works() {
         .expect("the version era never became active on every node");
 
         // GET /admin/cluster-version converges on every node: era on, version
-        // 1, every member reported, and Finalize is out of reach (every
-        // binary's max is the current MAX_SUPPORTED).
+        // 1, every member reported, and Finalize to 2 is within reach (every
+        // binary's range is [MIN_SUPPORTED, MAX_SUPPORTED] = [1, 2]).
         for node in &nodes {
             let addr = node.admin_addr();
             timeout(Duration::from_secs(30), async {
@@ -110,19 +111,11 @@ async fn the_era_starts_over_real_sockets_and_the_admin_surface_works() {
                             n.len() == 3 && n.iter().all(|x| x["reported"] == true)
                         })
                     {
-                        // Every member's range is [1,1] (the real MAX_SUPPORTED),
-                        // so each one is a named blocker for target 2 and the
-                        // safe target is the active version itself.
-                        assert_eq!(v["can_finalize"], false, "{v}");
-                        assert_eq!(v["safe_target"], 1, "{v}");
-                        let blockers = v["blockers"].as_array().unwrap();
-                        assert_eq!(blockers.len(), 3, "{v}");
-                        assert!(
-                            blockers
-                                .iter()
-                                .all(|b| b["reason"] == "range [1,1] excludes target 2"),
-                            "{v}"
-                        );
+                        // Every member's range is [1,2], so nothing blocks
+                        // target 2 and it is the safe target.
+                        assert_eq!(v["can_finalize"], true, "{v}");
+                        assert_eq!(v["safe_target"], 2, "{v}");
+                        assert!(v["blockers"].as_array().unwrap().is_empty(), "{v}");
                         return;
                     }
                     sleep(Duration::from_millis(100)).await;
@@ -133,8 +126,8 @@ async fn the_era_starts_over_real_sockets_and_the_admin_surface_works() {
         }
 
         // Finalize: a follower is refused as not-the-leader; the leader
-        // refuses by name (this binary supports only version 1) and the
-        // cluster stays at 1.
+        // accepts (one step, 1 -> 2) and every node then opens
+        // `Gate::GlobalTables`.
         let leader = nodes
             .iter()
             .position(Node::is_control_leader)
@@ -155,22 +148,38 @@ async fn the_era_starts_over_real_sockets_and_the_admin_surface_works() {
                 .contains("not the control-plane leader"),
             "{v}"
         );
+        // A beyond-one-step target is refused by name first.
         let (status, v) = admin(
             nodes[leader].admin_addr(),
             "POST",
             "/admin/cluster-version/finalize",
-            Some("{}"),
+            Some(r#"{"to":3}"#),
         )
         .await;
-        assert_eq!(status, 409, "{v}");
-        assert!(
-            v["error"]
-                .as_str()
-                .unwrap()
-                .contains("supports cluster versions up to 1"),
-            "{v}"
-        );
+        assert_eq!(status, 400, "{v}");
         assert_eq!(nodes[leader].metadata().cluster_version, 1);
+        let (status, v) = admin(
+            nodes[leader].admin_addr(),
+            "POST",
+            "/admin/cluster-version/finalize",
+            Some(r#"{"to":2,"expected":1}"#),
+        )
+        .await;
+        assert_eq!(status, 200, "{v}");
+        assert_eq!(v["active"], 2, "{v}");
+        timeout(Duration::from_secs(60), async {
+            loop {
+                if nodes.iter().all(|n| {
+                    n.features()
+                        .is_open(animus_control::version::Gate::GlobalTables)
+                }) {
+                    return;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("Gate::GlobalTables never opened on every node after the finalize");
 
         // CHS1: an empty-`ext` dial is still welcome on the CLIENT port (the
         // CLI and external clients) ...
@@ -220,6 +229,19 @@ async fn the_era_starts_over_real_sockets_and_the_admin_surface_works() {
         let (status, v) = admin(data.admin_addr(), "GET", "/admin/cluster-version", None).await;
         assert_eq!(status, 200, "{v}");
         assert_eq!(v["era_active"], true, "{v}");
+        timeout(Duration::from_secs(60), async {
+            loop {
+                if data
+                    .features()
+                    .is_open(animus_control::version::Gate::GlobalTables)
+                {
+                    return;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("the data-only node never opened Gate::GlobalTables through its mirror");
         let (status, v) = admin(
             data.admin_addr(),
             "POST",

@@ -1883,6 +1883,59 @@ before applying any child resource. Every shipped `AnimusCluster` manifest
 carries `schemaVersion: 1`, and a golden fixture
 (`tests/fixtures/formats/animuscluster-spec/v1.json`) pins the format.
 
+## Amendment 2026-10-04: node topology resolution and spread hints (G-01 stage G-a)
+
+**Spread hints.** The `StatefulSet` pod template carries a
+`topologySpreadConstraints` entry over `topology.kubernetes.io/zone`
+(`maxSkew: 1`, `whenUnsatisfiable: ScheduleAnyway`, so a single-zone kind or
+dev cluster still schedules) and a *preferred* pod anti-affinity over
+`kubernetes.io/hostname`, both selecting the cluster's own pods. On by
+default; `spec.topology.spread: false` (additive optional CRD field) turns
+both off.
+
+**Resolving a node's region/zone.** The downward API cannot expose a *node's*
+labels, so `animusd` cannot read them itself. Decision: the **operator**
+resolves them. After applying children, every reconcile lists the cluster's
+pods; for each scheduled pod it reads the `Node` named by `spec.nodeName`
+and merge-patches `animus.io/topology-region`, `animus.io/topology-zone` (only
+those the node has) and `animus.io/topology-resolved: "true"` onto the pod
+(`desired::topology::pod_annotation_patch`, a pure function; a node with no
+topology labels still gets the marker, an unreadable node patches nothing and
+is retried). The reconcile requeues after 3 s while any pod is unscheduled.
+The pod template mounts a downward-API volume projecting
+`metadata.annotations` to `/etc/animus/topology/annotations`, and the
+entrypoint passes `--labels-file ... --labels-file-annotations
+--labels-wait-secs 180` on both role branches. `animusd` keeps only the
+`animus.io/topology-*` keys, translates them back to the canonical
+`topology.kubernetes.io/{region,zone}` label keys
+(`animusd::node_labels`), and waits (bounded, polling the file) for the
+`resolved` marker before registering; on timeout it logs a warning and
+registers with whatever is there (labels are then fixed until a restart that
+finds them, ADR 0005's 2026-10-04 amendment). RBAC added in
+`deploy/operator/rbac.yaml`: `nodes` get/list/watch (cluster-scoped) and
+`pods` patch.
+
+**Why not an init container.** An init container would have to read the Node
+itself, i.e. every cluster pod's ServiceAccount would need cluster-wide `nodes`
+read access, a far wider grant than the one operator doing it once; it also
+needs a new image or a `kubectl`-capable one and still has to hand the result
+to `animusd` through a shared volume. The operator already watches the pods
+and has the permissions' natural home. The cost: the kubelet refreshes a
+downward-API volume on its own sync period (up to about a minute after the
+annotation lands), hence the generous default wait; and the startup path
+depends on the operator being up (bounded by the wait, never a hard failure).
+
+**Compatibility and rollout.** The operator and the `animusd` image ship
+together: an old image rejects the new flags. The pod template (volume, spread
+hints, entrypoint) changes, so every existing cluster rolls once on the
+operator upgrade that ships this. The `rbac.yaml` update is needed for
+resolution; without it pods still start (after the wait) unlabelled and the
+operator logs a warning per reconcile. `scripts/e2e-kind.sh` labels the kind
+node with a region/zone and asserts the annotations and the registered member
+labels (it runs the operator out-of-cluster, so the RBAC itself is not
+exercised there). Cross-zone placement is proven by the `SimCluster` corpus,
+not by kind. The multi-region ADR is 0075.
+
 ## Amendment (2026-10-04) — multi-cluster federation is scoped (ADR 0075)
 
 [ADR 0075](0075-global-tables.md) §5.4 scopes operator federation for global
@@ -1894,3 +1947,16 @@ not implemented. Topology spread (stage G-a) is separate.
 ## Amendment 2026-10-04: `spec.s3.webIdentity` (S-08)
 
 `spec.s3` gains an additive `webIdentity { roleArn, serviceAccountName?, audience? }` alternative to `credentialsSecretName` (now optional; exactly one of the two is required). The operator projects a rotating service-account token into combined-role pods and writes a static `source: web_identity` credentials file, so no `Secret` is read or embedded; egress also opens 443 for STS. Existing CRs round-trip unchanged (append-only fixture `v1-s3-web-identity.json`); see ADR 0059's S-08 amendment. Separately, the kind e2e S3 leg described above now runs RustFS, not MinIO (#863).
+
+## Amendment (2026-10-05) — `spec.maxRegionRttMs` and the stretch shape (ADR 0075, G-c)
+
+`spec.maxRegionRttMs` (additive, optional; `schemaVersion` unchanged, the
+committed `crd.yaml` regenerated) is rendered into the generated
+`cluster.json`'s `cluster_settings.max_region_rtt_ms`, which sizes the WAN Raft
+timing profile of every group spanning more than one
+`topology.kubernetes.io/region` (ADR 0075 section 3.4). It is inert on a
+single-region or unlabelled cluster. The supported multi-region shape in G-c is
+one `AnimusCluster` on a Kubernetes cluster whose nodes span the Regions
+(ADR 0075 section 3.8); federation across Kubernetes clusters is G-e. The
+`kind` e2e cannot exercise a stretch topology; stretch behaviour is proven in
+`SimEnv` (`sim_cluster_mrsc`).

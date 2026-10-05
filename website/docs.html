@@ -188,7 +188,12 @@
         Which nodes hold which replicas is a <strong>placement</strong> decision made by the
         control plane. The placement engine honours the replication factor, spreads replicas
         across failure domains, and respects residency labels — so you can require that a
-        group's data never leaves a given region or jurisdiction.
+        group's data never leaves a given region or jurisdiction. A node's labels are set at
+        its first registration with <code>--label key=value</code>, <code>--labels-file</code>,
+        or a node entry's <code>labels</code> in the cluster config; on Kubernetes the operator
+        supplies the node's <code>topology.kubernetes.io/region</code> and <code>/zone</code>
+        automatically, and a table created while the members span at least as many zones as
+        its replication factor spreads its replicas across zones (best effort).
       </p>
       <p>
         When a node fails, the control plane notices through heartbeats, re-plans the affected
@@ -391,7 +396,7 @@
             <tr><td><code>ExportTableToPointInTime</code> · <code>DescribeExport</code> · <code>ListExports</code></td><td><span class="pill yes">Yes</span></td><td>Export to a customer-named S3 bucket in DynamoDB's own JSON layout. <code>DYNAMODB_JSON</code> format and a full (not incremental) export only</td></tr>
             <tr><td><code>ImportTable</code> · <code>DescribeImport</code> · <code>ListImports</code></td><td><span class="pill yes">Yes</span></td><td>Import from a customer-named S3 bucket in DynamoDB's own JSON layout into a brand-new table. <code>DYNAMODB_JSON</code> format only, <code>GZIP</code> or uncompressed; a malformed item is skipped and counted rather than failing the whole import, up to a bounded cap</td></tr>
             <tr><td>Provisioned throughput / throttling</td><td><span class="pill yes">Yes</span></td><td>A table's declared <code>ProvisionedThroughput</code>, or a cluster-wide default, is enforced as a real per-tablet admission budget — an exhausted budget returns <code>ProvisionedThroughputExceededException</code> (or a <code>ThrottlingError</code> cancellation reason for <code>TransactWriteItems</code>). Declaring throughput also sizes tablet count up front, DynamoDB's own <code>ceil(RCU/3000 + WCU/1000)</code> formula. A transient unavailability that outlasts the server's own retry budget (a tablet split cutover, not a capacity refusal) returns <code>ServiceUnavailable</code> (HTTP 503) instead, retried by every AWS SDK's default policy. A node at its connection cap (<code>--max-connections</code>, default 4096) or in-flight request bound (<code>--max-inflight</code>, default 2048) sheds with the same <code>ServiceUnavailable</code> rather than queueing</td></tr>
-            <tr><td>Global tables</td><td><span class="pill no">No</span></td><td>Not implemented yet — planned (multi-region replication; design proposed in ADR 0075)</td></tr>
+            <tr><td>Global tables</td><td><span class="pill part">Partial</span></td><td>Multi-Region strongly consistent (MRSC) only: <code>UpdateTable</code> <code>ReplicaUpdates</code> + <code>MultiRegionConsistency: STRONG</code> on an empty table (three Regions, or two plus a witness). Eventual-consistency global tables and the legacy 2017.11.29 operations are not supported (ADR 0075)</td></tr>
             <tr><td>On-demand billing metering</td><td><span class="pill no">No</span></td><td>Out of scope for now — throttling is admission control, not an invoice</td></tr>
           </tbody>
         </table>
@@ -454,6 +459,7 @@
 <span class="p">$</span> <span class="k">animus admin flush|compact &lt;admin-addr&gt; &lt;tablet&gt;</span>
 <span class="p">$</span> <span class="k">animus admin reconfigure &lt;admin-addr&gt; &lt;tablet&gt; &lt;voter,voter,...&gt;</span>
 <span class="p">$</span> <span class="k">animus admin drain|drain-status|remove|decommission &lt;admin-addr&gt; &lt;node-id&gt;</span>
+<span class="p">$</span> <span class="k">animus admin drain &lt;admin-addr&gt; &lt;node-id&gt; --force</span>   <span class="c"># override the guard on the last Active node of a Region a global table pins</span>
 
 <span class="c"># control-plane membership (once the version era is on, start the new control voter first: it must be up to be admitted)</span>
 <span class="p">$</span> <span class="k">animus admin control-add|control-remove|control-grow|control-transfer &lt;leader-admin-addr&gt; …</span>
@@ -461,6 +467,10 @@
 <span class="c"># cluster version (ADR 0073 Phase 2)</span>
 <span class="p">$</span> <span class="k">animus cluster version &lt;admin-addr&gt; [--json]</span>
 <span class="p">$</span> <span class="k">animus cluster finalize &lt;leader-admin-addr&gt; [--to N] [--yes]</span>
+
+<span class="c"># multi-Region strongly consistent global tables (cluster version 2)</span>
+<span class="p">$</span> <span class="k">animus admin global-tables &lt;admin-addr&gt;</span>
+<span class="p">$</span> <span class="k">animus table preferred-leader &lt;admin-addr&gt; &lt;table&gt; &lt;region&gt;</span>
 
 <span class="c"># backup, restore, PITR, TTL, streams</span>
 <span class="p">$</span> <span class="k">animus admin backup-create &lt;admin-addr&gt; &lt;table&gt; &lt;backup-name&gt;</span>
@@ -578,7 +588,7 @@
         <a href="https://github.com/animus-db/animus-db/blob/main/docs/runbook/README.md">operations
         runbook</a>. It states plainly where a procedure has no tool yet (there is no recovery
         tool for a permanently lost control quorum, no in-place encryption-key rotation, and
-        disk-full behaviour on a real node is untested) and which procedures have not yet been
+        disk-full handling is proven in simulation only, not yet on a real size-limited filesystem) and which procedures have not yet been
         exercised on a real cluster.
       </p>
     </section>

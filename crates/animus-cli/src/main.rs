@@ -70,7 +70,7 @@ async fn main() -> ExitCode {
         Err(msg) => {
             eprintln!("animus: {msg}");
             eprintln!(
-                "\nusage:\n  animus [--tls-ca PATH] status <node-addr>\n  animus [--tls-ca PATH] put <node-addr> <table> <key> <value>\n  animus [--tls-ca PATH] get <node-addr> <table> <key>\n  animus [--tls-ca PATH] get-eventual <node-addr> <table> <key>\n{SEED_USAGE}\n{CLUSTER_USAGE}\n{ADMIN_USAGE}"
+                "\nusage:\n  animus [--tls-ca PATH] status <node-addr>\n  animus [--tls-ca PATH] put <node-addr> <table> <key> <value>\n  animus [--tls-ca PATH] get <node-addr> <table> <key>\n  animus [--tls-ca PATH] get-eventual <node-addr> <table> <key>\n{SEED_USAGE}\n{CLUSTER_USAGE}\n{TABLE_USAGE}\n{ADMIN_USAGE}"
             );
             ExitCode::FAILURE
         }
@@ -213,12 +213,14 @@ async fn maybe_tls_connect(
 const SEED_USAGE: &str = "  seed <admin-addr> <table> <count> [--start N] [--key-prefix P] \
     [--value-bytes B] [--concurrency C] [--batch N]";
 
+const TABLE_USAGE: &str = "  table preferred-leader <admin-addr> <table> <region>";
+
 const CLUSTER_USAGE: &str = "  cluster version <admin-addr> [--json]\n  \
     cluster finalize <leader-admin-addr> [--to N] [--yes]";
 
 const ADMIN_USAGE: &str = "  admin <subcommand> <admin-addr> [args]:\n    \
     config|status|raft|raftkv|metrics|health <admin-addr>\n    \
-    peers|txns|backups|restores|backup-store|ttl-reaper|gc|segment-store|control-members|storage-control <admin-addr>\n    \
+    peers|txns|backups|restores|backup-store|ttl-reaper|gc|segment-store|control-members|global-tables|storage-control <admin-addr>\n    \
     lsm|wal <admin-addr> [tablet]\n    \
     wal-segment <admin-addr> <seg> [tablet]\n    \
     key <admin-addr> <key> [tablet]\n    \
@@ -233,7 +235,7 @@ const ADMIN_USAGE: &str = "  admin <subcommand> <admin-addr> [args]:\n    \
     stream-grow <admin-addr> <table>\n    \
     flush|compact <admin-addr> <tablet>\n    \
     reconfigure <admin-addr> <tablet> <voter,voter,...>\n    \
-    drain <admin-addr> <node-id>\n    \
+    drain <admin-addr> <node-id> [--force]\n    \
     drain-status <admin-addr> <node-id>\n    \
     remove <admin-addr> <node-id>\n    \
     decommission <admin-addr> <node-id> [--force-control-remove]\n    \
@@ -279,6 +281,11 @@ async fn run(args: &[String], tls: Option<&tokio_rustls::TlsConnector>) -> Resul
     // address is an **admin** address.
     if cmd == "cluster" {
         return run_cluster(&args[1..], tls).await;
+    }
+    // `table preferred-leader` (ADR 0075 plan D3): re-point a global table's
+    // preferred-leader Region over the admin port.
+    if cmd == "table" {
+        return run_table(&args[1..], tls).await;
     }
     let addr = args.get(1).ok_or("missing <node-addr>")?;
 
@@ -881,6 +888,10 @@ fn admin_request(
         // object count/bytes.
         "segment-store" => ("GET", "/admin/segment-store".into(), None),
         "control-members" => ("GET", "/admin/control/members".into(), None),
+        // `GET /admin/global-tables` (ADR 0075 section 8, G-01 G-c): every
+        // MRSC global table's Regions, preferred leader, placement and
+        // warnings.
+        "global-tables" => ("GET", "/admin/global-tables".into(), None),
         // `POST /admin/control/transfer {to}` (ADR 0020/0037, roadmap U-05):
         // a single request/response, unlike `control-add`/`control-remove`/
         // `control-grow` above — the server itself does the bounded arm-
@@ -993,7 +1004,21 @@ fn admin_request(
         }
         "drain" => {
             let node = arg(2).ok_or("drain needs <node-id>")?;
-            let body = serde_json::json!({"node": node}).to_string();
+            // `--force` overrides the decommission guard (ADR 0075 plan D10:
+            // the last Active member of a Region a global table pins).
+            let force = match arg(3) {
+                None => false,
+                Some("--force") => true,
+                Some(other) => return Err(format!("drain: unknown argument {other:?}")),
+            };
+            // `force` is sent only when set, so the body an older server
+            // already accepts is byte-identical.
+            let body = if force {
+                serde_json::json!({"node": node, "force": true})
+            } else {
+                serde_json::json!({"node": node})
+            }
+            .to_string();
             ("POST", "/admin/drain".into(), Some(body))
         }
         "drain-status" => {
@@ -1838,6 +1863,48 @@ fn finalize_preflight(v: &serde_json::Value, to: Option<u32>) -> Result<(u32, u3
 const FINALIZE_WARNING: &str = "Finalizing a cluster version CANNOT be undone: once raised, no \
 node may run a binary that does not support it, and there is no rollback. Re-run with --yes to proceed.";
 
+/// Pure argument parsing for `table preferred-leader <admin-addr> <table>
+/// <region>`: `(admin address, JSON body)` for
+/// `POST /admin/table/preferred-leader`.
+fn preferred_leader_request(args: &[String]) -> Result<(String, String), String> {
+    if args.first().map(String::as_str) != Some("preferred-leader") {
+        return Err("table needs a subcommand: preferred-leader".into());
+    }
+    let addr = args
+        .get(1)
+        .ok_or("table preferred-leader needs <admin-addr>")?;
+    let table = args.get(2).ok_or("table preferred-leader needs <table>")?;
+    let region = args.get(3).ok_or("table preferred-leader needs <region>")?;
+    if let Some(extra) = args.get(4) {
+        return Err(format!(
+            "table preferred-leader: unknown argument {extra:?}"
+        ));
+    }
+    let body = serde_json::json!({"table": table, "region": region}).to_string();
+    Ok((addr.clone(), body))
+}
+
+async fn run_table(
+    args: &[String],
+    tls: Option<&tokio_rustls::TlsConnector>,
+) -> Result<(), String> {
+    let (addr, body) = preferred_leader_request(args)?;
+    let (status, resp) = http_call(
+        &addr,
+        "POST",
+        "/admin/table/preferred-leader",
+        Some(body),
+        tls,
+    )
+    .await?;
+    println!("{resp}");
+    if (200..300).contains(&status) {
+        Ok(())
+    } else {
+        Err(format!("table/preferred-leader failed (HTTP {status})"))
+    }
+}
+
 async fn run_cluster(
     args: &[String],
     tls: Option<&tokio_rustls::TlsConnector>,
@@ -2149,6 +2216,40 @@ mod tests {
 
     fn sargs(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn preferred_leader_request_parses_and_rejects() {
+        let (addr, body) = preferred_leader_request(&sargs(&[
+            "preferred-leader",
+            "10.0.0.1:8080",
+            "orders",
+            "eu-west-1",
+        ]))
+        .unwrap();
+        assert_eq!(addr, "10.0.0.1:8080");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["table"], "orders");
+        assert_eq!(v["region"], "eu-west-1");
+        assert!(preferred_leader_request(&sargs(&[])).is_err());
+        assert!(preferred_leader_request(&sargs(&["wat", "a", "t", "r"])).is_err());
+        assert!(preferred_leader_request(&sargs(&["preferred-leader", "a", "t"])).is_err());
+        assert!(
+            preferred_leader_request(&sargs(&["preferred-leader", "a", "t", "r", "x"])).is_err()
+        );
+    }
+
+    #[test]
+    fn global_tables_and_drain_force_admin_requests() {
+        let (m, p, b) = admin_request("global-tables", &sargs(&["global-tables", "a:1"])).unwrap();
+        assert_eq!((m, p.as_str(), b), ("GET", "/admin/global-tables", None));
+        let (m, p, b) = admin_request("drain", &sargs(&["drain", "a:1", "n3", "--force"])).unwrap();
+        assert_eq!((m, p.as_str()), ("POST", "/admin/drain"));
+        let v: serde_json::Value = serde_json::from_str(&b.unwrap()).unwrap();
+        assert_eq!(v["force"], true);
+        let (_, _, b) = admin_request("drain", &sargs(&["drain", "a:1", "n3"])).unwrap();
+        assert_eq!(b.as_deref(), Some(r#"{"node":"n3"}"#));
+        assert!(admin_request("drain", &sargs(&["drain", "a:1", "n3", "--wat"])).is_err());
     }
 
     #[test]

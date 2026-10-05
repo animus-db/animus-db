@@ -50,6 +50,7 @@ pub mod shared_wal;
 #[cfg(any(test, feature = "sim-versions"))]
 pub mod sim_versions;
 pub mod syskv;
+pub mod timing;
 pub mod version;
 pub mod version_observe;
 
@@ -65,9 +66,9 @@ pub use meta::{
 };
 pub use node::{DeltaReply, MetadataChanged, MetadataWatch, RaftNode};
 pub use schema::{
-    ColumnDef, ColumnType, IndexDef, IndexKind, IndexProjection, IndexStatus, PitrSpec,
-    ProvisionedThroughput, SchemaCatalog, SchemaError, StreamSpec, StreamViewType, TableName,
-    TableSchema, TtlSpec,
+    ColumnDef, ColumnType, GlobalSpecError, GlobalTableSpec, IndexDef, IndexKind, IndexProjection,
+    IndexStatus, MultiRegionConsistency, PitrSpec, ProvisionedThroughput, SchemaCatalog,
+    SchemaError, StreamSpec, StreamViewType, TableName, TableSchema, TtlSpec,
 };
 // Re-exported so downstream assemblers (e.g. `animusd`) can set a tablet's
 // placement policy via `SetTabletPolicy` without taking a direct

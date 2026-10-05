@@ -1778,3 +1778,43 @@ reasons. If `scripts/e2e-kind.sh` fails at the `kind create cluster` phase
 with this exact `runc`/`EOF` signature in the diagnostics dump, this is
 almost certainly it — check `docker run --cap-add SYS_RESOURCE ... echo ok`
 first before debugging anything else.
+
+## G-01 stage G-a: topology (2026-10-04)
+
+- `desired::topology`: constants + the pure `pod_annotation_patch`. The
+  controller's `resolve_pod_topology` (end of `finish_reconcile`, best effort)
+  lists the cluster's pods, reads each scheduled pod's Node labels and patches
+  `animus.io/topology-{region,zone,resolved}` onto the pod; new `ClusterApi`
+  methods `list_pods`/`get_node_labels`/`patch_pod_annotations` (+ fakes).
+  RBAC: `nodes` get/list/watch, `pods` patch (`deploy/operator/rbac.yaml`).
+- StatefulSet: zone `topologySpreadConstraints` (ScheduleAnyway) + preferred
+  hostname anti-affinity (`spec.topology.spread`, default true), and a
+  downward-API volume of `metadata.annotations` at `/etc/animus/topology`;
+  the entrypoint passes `--labels-file ... --labels-file-annotations
+  --labels-wait-secs 180`. The config-hash literal changed on purpose.
+- Operator and `animusd` image ship together (an old image rejects the flags).
+  kind e2e labels the node and asserts annotations + registered member labels
+  (could not be run in the authoring sandbox).
+
+**e2e topology assertion is polled, not one-shot (2026-10-04).** The G-01 G-a
+check that `/admin/status` shows >=3 members labelled with the kind node's zone
+runs under `wait_for`: pod Ready does not imply each node's background
+`RegisterNode` has committed and reached the serving replica (run 37201459207
+saw e2e-0 with empty labels right after readiness). See
+`docs/lessons/testing/2026-10-04-e2e-pod-ready-does-not-mean-registered.md`.
+
+## `spec.maxRegionRttMs` (ADR 0075 section 3.4, G-01 G-c)
+
+Additive optional `AnimusClusterSpec.max_region_rtt_ms` (`maxRegionRttMs`),
+rendered into `cluster.json`'s `cluster_settings.max_region_rtt_ms` through the
+`ClusterSettings` mirror (`desired::cluster_config`), exactly like
+`quiesceAfterSecs`. Unset keeps `cluster_settings` absent (byte-identical to
+before); `schemaVersion` stays 1 (an additive optional field needs no new
+version, and the golden fixture is untouched). `deploy/operator/crd.yaml` is
+regenerated (`cargo run -p animus-operator -- crd > deploy/operator/crd.yaml`;
+`crd_manifest_pinned` fails otherwise). Inert on a single-region or unlabelled
+cluster. The supported stretch shape is one `AnimusCluster` on a Kubernetes
+cluster spanning the Regions; the `kind` e2e cannot run a stretch topology (and
+cannot run at all in the sandbox), so stretch behaviour is proven only in
+`SimEnv` (`animusd` `sim_cluster_mrsc`).
+

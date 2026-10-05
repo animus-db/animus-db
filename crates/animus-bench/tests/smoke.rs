@@ -11,9 +11,18 @@
 //! `it` binary. All waiting is a converged-or-timeout poll inside the library
 //! (`await_ready`, `create_table`'s ACTIVE poll, load retry) — no fixed sleep
 //! gates correctness here.
+//!
+//! The second test runs the same cluster shape with **server-only TLS** on
+//! every port (ADR 0064) and drives workloads through the TLS client.
+
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use animus_bench::cli::{execute, parse_args};
+use animus_bench::client::{Conn, Credentials};
+use animus_bench::cluster::{Cluster, LaunchTls};
 use animus_bench::report::{Report, SCHEMA};
+use animus_bench::tls::TlsClient;
 
 fn args(extra: &[&str], dir: &std::path::Path, out: &std::path::Path) -> Vec<String> {
     let mut v: Vec<String> = [
@@ -239,4 +248,155 @@ async fn every_workload_speaks_the_wire_in_both_read_modes_then_survives_a_follo
         "no op completed after the kill"
     );
     assert!(Report::from_json(&std::fs::read_to_string(&out2).unwrap()).is_ok());
+}
+
+/// A throwaway CA plus one leaf (SAN `127.0.0.1`, which is what the client
+/// verifies for an IP endpoint), written as PEM files under `dir`.
+fn write_pki(dir: &std::path::Path) -> (PathBuf, PathBuf, PathBuf) {
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "animus-bench test CA");
+    let ca_key = KeyPair::generate().expect("ca key");
+    let ca = ca_params.self_signed(&ca_key).expect("self-sign");
+    let mut leaf_params = CertificateParams::new(vec!["127.0.0.1".to_owned()]).expect("leaf");
+    leaf_params
+        .distinguished_name
+        .push(DnType::CommonName, "127.0.0.1");
+    let leaf_key = KeyPair::generate().expect("leaf key");
+    let leaf = leaf_params
+        .signed_by(&leaf_key, &ca, &ca_key)
+        .expect("sign leaf");
+    let (ca_p, cert_p, key_p) = (
+        dir.join("ca.pem"),
+        dir.join("node.cert.pem"),
+        dir.join("node.key.pem"),
+    );
+    std::fs::write(&ca_p, ca.pem()).expect("ca.pem");
+    std::fs::write(&cert_p, leaf.pem()).expect("cert");
+    std::fs::write(&key_p, leaf_key.serialize_pem()).expect("key");
+    (ca_p, cert_p, key_p)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workloads_run_over_server_only_tls_and_a_plain_or_untrusting_client_is_refused() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (ca, cert, key) = write_pki(tmp.path());
+    let out = tmp.path().join("tls.json");
+    let tls_args = [
+        "--tls-ca",
+        ca.to_str().expect("utf8"),
+        "--tls-cert",
+        cert.to_str().expect("utf8"),
+        "--tls-key",
+        key.to_str().expect("utf8"),
+    ];
+    // A (read/update), E (scan + insert) and F (read-modify-write) cover
+    // GetItem, UpdateItem, Query, PutItem and the conditional write path.
+    let mut extra = vec![
+        "--workloads",
+        "A,E,F",
+        "--consistent-read",
+        "true",
+        "--steady-secs",
+        "2",
+        "--degraded",
+        "none",
+    ];
+    extra.extend(tls_args);
+    let argv = args(&extra, &tmp.path().join("data"), &out);
+    let opts = parse_args(&argv).expect("parse");
+    let report = execute(&opts, argv).await.expect("TLS run");
+
+    assert!(report.environment.tls, "report must record tls: true");
+    assert!(report.environment.tls_note.starts_with("on:"));
+    assert!(report.environment.sigv4);
+    assert!(
+        report.topology_start["tls"]
+            .as_str()
+            .expect("tls")
+            .contains("server-only TLS")
+    );
+    assert!(
+        report.topology_start["nodes"]
+            .as_array()
+            .expect("nodes")
+            .iter()
+            .all(|n| n["reachable"] == true && n["auth_enabled"] == true),
+        "the admin port must be reachable over TLS: {}",
+        report.topology_start["nodes"]
+    );
+    assert_eq!(report.runs.len(), 3);
+    for run in &report.runs {
+        let steady = run
+            .phases
+            .iter()
+            .find(|p| p.name == "steady")
+            .unwrap_or_else(|| panic!("{}: no steady phase", run.name));
+        assert_eq!(steady.dispatched, 300, "{}", run.name);
+        assert_eq!(
+            steady.errors.total(),
+            0,
+            "{}: unexpected errors {:?} {:?}",
+            run.name,
+            steady.errors,
+            steady.error_samples
+        );
+        assert_eq!(steady.completed, steady.dispatched, "{}", run.name);
+    }
+    let on_disk = Report::from_json(&std::fs::read_to_string(&out).expect("read")).expect("parse");
+    assert!(on_disk.environment.tls);
+
+    // The negative controls need a live TLS cluster; launch one directly.
+    let creds = Credentials::new("animus-bench", "animus-bench-secret");
+    let client = TlsClient::from_ca_file(&ca, None).expect("client");
+    let cluster = Cluster::launch_in_process(
+        3,
+        &tmp.path().join("neg"),
+        Some(creds.clone()),
+        Some(LaunchTls {
+            cert_path: cert,
+            key_path: key,
+            ca_path: ca.clone(),
+            client: client.clone(),
+        }),
+    )
+    .await
+    .expect("launch");
+    cluster
+        .await_ready(std::time::Duration::from_secs(60))
+        .await
+        .expect("ready");
+    let addr = cluster.dynamo_endpoints()[0];
+    // Trusted client: a signed call gets a response (any status proves the
+    // wire works end to end; ListTables is a valid, authorised call).
+    let mut ok = Conn::connect(addr, Some(Arc::new(creds.clone())), Some(&client))
+        .await
+        .expect("TLS connect");
+    let r = ok.call("ListTables", "{}").await.expect("call over TLS");
+    assert_eq!(r.status, 200, "{}", r.text());
+    // A client trusting a different CA must fail the handshake.
+    let other = tempfile::tempdir().expect("tempdir");
+    let (other_ca, _, _) = write_pki(other.path());
+    let stranger = TlsClient::from_ca_file(&other_ca, None).expect("client");
+    assert!(
+        Conn::connect(addr, Some(Arc::new(creds.clone())), Some(&stranger))
+            .await
+            .is_err(),
+        "an untrusted server certificate must be rejected"
+    );
+    // A plain-TCP client is refused by the TLS listener (the exchange fails
+    // rather than being served).
+    let plain = Conn::connect(addr, Some(Arc::new(creds)), None).await;
+    let plain_ok = match plain {
+        Ok(mut c) => c
+            .call("ListTables", "{}")
+            .await
+            .is_ok_and(|r| r.status == 200),
+        Err(_) => false,
+    };
+    assert!(!plain_ok, "a plain client must not be served by a TLS port");
+    cluster.shutdown().await;
 }
