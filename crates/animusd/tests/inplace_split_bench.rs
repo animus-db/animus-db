@@ -58,6 +58,7 @@ async fn bring_up_inplace(n: usize, dir: &std::path::Path) -> (Vec<Node>, Cluste
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                overload: None,
             })
             .collect();
         let config = ClusterConfig {

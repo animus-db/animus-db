@@ -1826,6 +1826,20 @@ outstanding on the wire surface at present.
     oracles; the sim corpora remain the correctness proof, this checks
     the `ProdEnv` seams the sim cannot (ADR 0003: sim proves logic and
     ordering, not real-thread liveness).
+    **First PR landed 2026-10-04** ([`docs/chaos.md`](chaos.md)): the bare
+    multi-process leg only (no root needed: a userspace loopback fault
+    proxy instead of `tc netem`), `crates/animusd/tests/chaos.rs` +
+    `chaos_support/` behind the opt-in `chaos` feature, scenarios `smoke`/
+    `kill`/`partition`/`pause`/`delay`/`mixed` (process `kill -9` incl. the
+    control leader and a full power cut, per-link partitions incl. one-way,
+    SIGSTOP, delay), the recorded DynamoDB-wire history fed unchanged to
+    `check_cycles`/`check_durability`/`check_convergence` plus eventual-read
+    prefix and transaction-atomicity checks, `.github/workflows/chaos.yml`
+    (non-required). **Not done:** clock skew, slow disk and packet loss
+    (Kubernetes-only designs in `deploy/chaos/`, pinned and unvalidated),
+    disk full (blocked on #1185). **Its first runs found a real
+    violation** (acknowledged writes lost on keys touched by an aborted
+    cross-tablet transaction; see `docs/chaos.md`, "Findings").
   - **(c) Fuzzing (independent; M).** `cargo-fuzz` targets for every
     untrusted parser: DynamoDB JSON request decode and expression
     parsers (`animus-dynamo`: UpdateExpression, ConditionExpression,

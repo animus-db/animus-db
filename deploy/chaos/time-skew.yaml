@@ -1,0 +1,26 @@
+# UNVALIDATED draft (never applied to a cluster; see deploy/chaos/README.md).
+# Clock skew on one pod: wall clock jumps by +10 minutes. Real clock skew needs
+# this (or libfaketime); the bare multi-process harness cannot do it without
+# either. What it should probe: the node must keep using monotonic time for
+# every deadline/election/backoff (ADR 0003: `env.now()`), and use the wall
+# clock only for DynamoDB TTL (`env.wall_now()`, ADR 0051) and HLC wall
+# components (a +10 min node must not poison the cluster's HLC or expire
+# unexpired TTL items on the other replicas). A skewed TTL reaper on a leader
+# is the expected visible effect: items it deems expired are deleted through
+# the normal write path (a real finding if clients see data vanish early).
+# `clockIds` is left at the default (CLOCK_REALTIME).
+apiVersion: chaos-mesh.org/v1alpha1
+kind: TimeChaos
+metadata:
+  name: animus-clock-skew
+  namespace: animus-chaos
+spec:
+  mode: one
+  selector:
+    namespaces: [animus-chaos]
+    labelSelectors:
+      app.kubernetes.io/name: animusdb
+      app.kubernetes.io/instance: chaos
+  timeOffset: "+10m"
+  clockIds: ["CLOCK_REALTIME"]
+  duration: "60s"

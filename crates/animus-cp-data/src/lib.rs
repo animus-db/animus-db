@@ -86,6 +86,15 @@ mod txn;
 use heartbeat_batch::{HeartbeatBatcher, HeartbeatPending};
 use hlc::{Hlc, HlcTimestamp, bump_strictly_above};
 use ts_cache::TsCache;
+/// The upgrade-restart harness's `txn-envelope` row-value transcode (ADR 0073
+/// P1-D, `animus-test`'s `upgrade::transcode`): the v1 down-conversion of one
+/// stored engine row value — `Some(v1 bytes)` iff `value` is exactly one
+/// well-formed v2 intent envelope, `None` (leave the row alone) otherwise.
+#[cfg(any(test, feature = "legacy-encoders"))]
+#[must_use]
+pub fn downgrade_txn_envelope_to_v1(value: &[u8]) -> Option<Vec<u8>> {
+    txn::legacy::v1::downgrade_intent_to_v1(value)
+}
 pub use txn::{
     PendingTxnWrite, ResolveOutcome, StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome, TxnWrite,
 };
@@ -2141,6 +2150,51 @@ impl TxnTracker {
                 self.recently_resolved.remove(&old_key);
             }
         }
+    }
+}
+
+/// The committed value `physical_key` holds right now, as the `prior` a
+/// freshly staged intent of `txn_id` must carry (ADR 0018 §2's 2026-10-04
+/// amendment; see [`txn::IntentPrior`]). Called by `TxnStage`'s apply right
+/// before it writes the intent, after flushing the pending run, so "right
+/// now" is exactly the state immediately below the intent's own version on
+/// every replica (every replica applies the same log prefix to the same
+/// latest-record state; neither compaction GC nor snapshot install ever
+/// changes a key's latest record).
+///
+/// - a committed value → that value; absent/tombstoned → `None`;
+/// - **this same transaction's own intent** (a WAL-replay re-application, or
+///   a second write to one key within a stage) → that intent's own prior, so
+///   re-staging never captures the transaction's own provisional value; a
+///   legacy v1 own intent (no carried prior) falls back to the old
+///   one-MVCC-version lookback below it;
+/// - another transaction's intent is unreachable here (`blocked_by` rejects
+///   the whole stage first); it is treated like a v1 own intent rather than
+///   asserted, never capturing raw envelope bytes as a value.
+async fn stage_intent_prior<S: StorageEngine>(
+    storage: &S,
+    physical_key: &[u8],
+    txn_id: &TxnId,
+) -> Option<Vec<u8>> {
+    let vv = storage
+        .get(physical_key)
+        .await
+        .expect("raftkv txn stage prior read")?;
+    match txn::decode_envelope(&vv.value) {
+        txn::Envelope::Committed(v) => Some(v),
+        txn::Envelope::Intent {
+            txn_id: owner,
+            prior: txn::IntentPrior::Known(prior),
+            ..
+        } if &owner == txn_id => prior,
+        txn::Envelope::Intent { .. } => storage
+            .get_at(physical_key, vv.version.saturating_sub(1))
+            .await
+            .expect("raftkv txn stage prior lookback read")
+            .and_then(|pvv| match txn::decode_envelope(&pvv.value) {
+                txn::Envelope::Committed(v) => Some(v),
+                txn::Envelope::Intent { .. } => None,
+            }),
     }
 }
 
@@ -5468,14 +5522,16 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// `Committed` at or before `read_ts` (`None` = "latest") serves
     /// `staged_value`; `Committed` strictly after `read_ts`, or `Aborted`,
     /// serves whatever `physical_key` held immediately before this intent
-    /// (rewinding to `vv_version - 1` — never a tombstone, which would
-    /// incorrectly shadow an older, still-live committed value — see
-    /// `txn.rs`'s module doc).
+    /// (the intent's carried `prior`, see
+    /// [`prior_committed`](Self::prior_committed) — never a tombstone, which
+    /// would incorrectly shadow an older, still-live committed value — see
+    /// `txn.rs`'s module doc). The staged value served on commit is
+    /// `pending.staged_value`.
     async fn resolve_decided(
         &self,
         physical_key: &[u8],
         vv_version: u64,
-        staged_value: Option<Vec<u8>>,
+        prior: &txn::IntentPrior,
         read_ts: Option<HlcTimestamp>,
         status: &txn::TxnDecisionStatus,
         pending: IntentInfo,
@@ -5484,43 +5540,54 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             txn::TxnDecisionStatus::Committed { commit_ts }
                 if read_ts.is_none_or(|rt| *commit_ts <= rt) =>
             {
-                ResolveStep::Value(staged_value)
+                ResolveStep::Value(pending.staged_value)
             }
             txn::TxnDecisionStatus::Committed { .. } | txn::TxnDecisionStatus::Aborted => {
-                ResolveStep::Value(self.prior_committed(physical_key, vv_version).await)
+                ResolveStep::Value(self.prior_committed(physical_key, vv_version, prior).await)
             }
             txn::TxnDecisionStatus::Pending => ResolveStep::Pending(pending),
         }
     }
 
-    /// The key's **last committed value**, read one MVCC version below
-    /// `version` — the "one hop back from this intent" lookup shared by
-    /// [`resolve_decided`](Self::resolve_decided)'s aborted/too-late branch
-    /// and the ADR 0055 eventually-consistent read path.
+    /// The key's **last committed value** before an intent at engine
+    /// `version` — the value shared by [`resolve_decided`](Self::resolve_decided)'s
+    /// aborted/too-late branch and the ADR 0055 eventually-consistent read
+    /// path.
     ///
-    /// A *prior intent* one hop back **should be unreachable since ADR 0018
-    /// §2/PR6 (task #16)** — `KvCommand::TxnStage`'s apply-time
-    /// writer-push-intents guard rejects a stage over any key still holding
-    /// another transaction's unresolved intent, so one hop back from an
-    /// intent's own version can only ever be a genuinely committed value or
-    /// true absence (see `KvCommand::TxnStage`'s doc for the durability
-    /// argument this closes — a corpus depth run found a corrupted MVCC
-    /// version chain that made an already-committed value permanently
-    /// unreadable). Kept as a defensive fallback rather than an assert: this
-    /// function has no way to distinguish "the invariant broke" from "an
-    /// older, pre-fix WAL entry replayed on recovery" — conservatively
-    /// treating it as absent (never leaking raw envelope bytes to a caller)
-    /// is still correct either way.
-    async fn prior_committed(&self, physical_key: &[u8], version: u64) -> Option<Vec<u8>> {
-        self.storage
-            .get_at(physical_key, version.saturating_sub(1))
-            .await
-            .ok()
-            .flatten()
-            .and_then(|pvv| match txn::decode_envelope(&pvv.value) {
-                txn::Envelope::Committed(v) => Some(v),
-                txn::Envelope::Intent { .. } => None,
-            })
+    /// A current (`txn-envelope` v2) intent carries it
+    /// ([`txn::IntentPrior::Known`]), captured when the intent was staged, so
+    /// this never depends on the engine still holding MVCC history below the
+    /// intent — `LsmEngine` compaction GC and a latest-only `InstallSnapshot`
+    /// image both discard it (ADR 0018 §2's 2026-10-04 amendment: reading it
+    /// back made an aborted transaction tombstone, and an eventual read
+    /// report as absent, a key with an acknowledged committed value).
+    ///
+    /// Only a legacy v1 intent ([`txn::IntentPrior::Unknown`]) still reads
+    /// one MVCC version below `version`. A *prior intent* one hop back is
+    /// unreachable since ADR 0018 §2/PR6 (task #16) — `KvCommand::TxnStage`'s
+    /// apply-time writer-push-intents guard rejects a stage over any key still
+    /// holding another transaction's unresolved intent — but is still treated
+    /// as absent rather than asserted (never leaking raw envelope bytes to a
+    /// caller).
+    async fn prior_committed(
+        &self,
+        physical_key: &[u8],
+        version: u64,
+        prior: &txn::IntentPrior,
+    ) -> Option<Vec<u8>> {
+        match prior {
+            txn::IntentPrior::Known(prior) => prior.clone(),
+            txn::IntentPrior::Unknown => self
+                .storage
+                .get_at(physical_key, version.saturating_sub(1))
+                .await
+                .ok()
+                .flatten()
+                .and_then(|pvv| match txn::decode_envelope(&pvv.value) {
+                    txn::Envelope::Committed(v) => Some(v),
+                    txn::Envelope::Intent { .. } => None,
+                }),
+        }
     }
 
     /// The outcome of resolving one raw, envelope-tagged stored value
@@ -5539,6 +5606,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 record_key,
                 record_table,
                 staged_value,
+                prior,
                 ..
             } => {
                 // The record lives in the **anchor's** tablet, which is
@@ -5572,13 +5640,13 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                             txn_id: txn_id.clone(),
                             record_key: record_key.clone(),
                             record_table: record_table.clone(),
-                            staged_value: staged_value.clone(),
+                            staged_value,
                             version: hlc::unpack(vv.version),
                         };
                         self.resolve_decided(
                             physical_key,
                             vv.version,
-                            staged_value,
+                            &prior,
                             read_ts,
                             &r.status.to_public(),
                             pending,
@@ -5886,7 +5954,9 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     ) -> Option<Vec<u8>> {
         match txn::decode_envelope(&vv.value) {
             txn::Envelope::Committed(v) => Some(v),
-            txn::Envelope::Intent { .. } => self.prior_committed(physical_key, vv.version).await,
+            txn::Envelope::Intent { prior, .. } => {
+                self.prior_committed(physical_key, vv.version, &prior).await
+            }
         }
     }
 
@@ -6536,6 +6606,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 record_key,
                 record_table,
                 staged_value,
+                prior,
                 ..
             } if &found == txn_id => {
                 // Built for parity with `resolve_once_step`'s own call —
@@ -6547,18 +6618,11 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                     txn_id: found.clone(),
                     record_key,
                     record_table,
-                    staged_value: staged_value.clone(),
+                    staged_value,
                     version: hlc::unpack(vv.version),
                 };
                 match self
-                    .resolve_decided(
-                        &physical,
-                        vv.version,
-                        staged_value,
-                        read_ts,
-                        &status,
-                        pending,
-                    )
+                    .resolve_decided(&physical, vv.version, &prior, read_ts, &status, pending)
                     .await
                 {
                     ResolveStep::Value(v) => Some(v),
@@ -9620,6 +9684,16 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                 w.change_log.as_ref(),
                             ),
                         };
+                        let physical_key = scope.physical(&w.key);
+                        // ADR 0018 §2's 2026-10-04 amendment: the intent
+                        // carries the committed value it shadows, so an
+                        // abort (or a reader predating the commit) never
+                        // has to find it in MVCC history below the intent,
+                        // which compaction GC and a latest-only snapshot
+                        // image both discard. `pending` was flushed above,
+                        // so this read sees every earlier entry of this
+                        // apply pass.
+                        let prior = stage_intent_prior(storage, &physical_key, &txn_id).await;
                         let intent_env = txn::encode_intent(
                             &txn_id,
                             &record_key,
@@ -9627,8 +9701,8 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                             value,
                             kind_writes,
                             change_log,
+                            prior.as_deref(),
                         );
-                        let physical_key = scope.physical(&w.key);
                         let took_effect = storage
                             .merge(&physical_key, &intent_env, version)
                             .await
@@ -10068,6 +10142,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         intent_version: Version,
                         kind_writes: Vec<KindWrite>,
                         change_log: Option<(Vec<u8>, Vec<u8>)>,
+                        prior: txn::IntentPrior,
                     }
                     let mut resolved: Vec<Option<ResolvedIntent>> = Vec::with_capacity(keys.len());
                     for key in &keys {
@@ -10081,12 +10156,14 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                     staged_value,
                                     kind_writes,
                                     change_log,
+                                    prior,
                                     ..
                                 } if found == txn_id => Some(ResolvedIntent {
                                     staged_value,
                                     intent_version: vv.version,
                                     kind_writes,
                                     change_log,
+                                    prior,
                                 }),
                                 // Already resolved, or a different/newer
                                 // txn's intent has since overwritten this
@@ -10231,6 +10308,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                             intent_version,
                             kind_writes,
                             change_log,
+                            prior,
                         }) = resolved_intent
                         else {
                             continue; // nothing left here to resolve (idempotent no-op)
@@ -10327,47 +10405,49 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                             None => {
                                 // Aborted: restore whatever this key held
                                 // immediately before the intent — never a
-                                // tombstone, which would incorrectly shadow
-                                // that older, still-live committed value
-                                // (see `txn.rs`'s module doc). Every
-                                // version this group has ever applied is
-                                // strictly increasing
-                                // (`assert_ts_monotonic`), so
-                                // `intent_version - 1` is guaranteed to sit
-                                // strictly below the intent's own version
-                                // and at/above this key's true prior
-                                // version. **This one-hop-back lookback is
-                                // sound only because ADR 0018 §2/PR6 (task
-                                // #16)'s apply-time writer-push-intents
-                                // guard (`KvCommand::TxnStage`'s doc)
-                                // structurally rules out another
-                                // transaction's own unresolved intent ever
-                                // having been written at that prior
-                                // version** — before that fix, an
-                                // overwriting transaction's own later abort
-                                // could land here on a still-live intent
-                                // from the transaction it overwrote,
-                                // blindly re-merging its raw envelope bytes
-                                // (a corpus depth run's original finding:
-                                // the corrupted-MVCC-chain durability
-                                // hole). `pvv.value` below is therefore
-                                // always either a `Committed` envelope or
-                                // (via the `None` arm) genuinely absent —
-                                // never another live `Intent`.
-                                let prior = storage
-                                    .get_at(&physical_key, intent_version.saturating_sub(1))
-                                    .await
-                                    .expect("raftkv txn resolve prior read");
+                                // tombstone over a committed value, which
+                                // would lose an acknowledged write (see
+                                // `txn.rs`'s module doc). A current
+                                // (`txn-envelope` v2) intent carries that
+                                // value itself (`IntentPrior::Known`,
+                                // captured by `TxnStage`'s apply from the
+                                // key's latest record when the intent was
+                                // written), so the restore never depends on
+                                // the engine still holding MVCC history
+                                // below the intent — which `LsmEngine`
+                                // compaction GC and a latest-only
+                                // `InstallSnapshot` image both discard (ADR
+                                // 0018 §2's 2026-10-04 amendment: an
+                                // aborted transaction tombstoned acked
+                                // writes). Only a legacy v1 intent
+                                // (`IntentPrior::Unknown`) still falls back
+                                // to the one-MVCC-version lookback; that is
+                                // sound only while the history is retained,
+                                // and only because ADR 0018 §2/PR6's
+                                // writer-push-intents guard
+                                // (`KvCommand::TxnStage`'s doc) rules out
+                                // another transaction's live intent sitting
+                                // one version below.
+                                let restored: Option<Vec<u8>> = match prior {
+                                    txn::IntentPrior::Known(prior) => {
+                                        prior.map(|v| txn::encode_committed(&v))
+                                    }
+                                    txn::IntentPrior::Unknown => storage
+                                        .get_at(&physical_key, intent_version.saturating_sub(1))
+                                        .await
+                                        .expect("raftkv txn resolve prior read")
+                                        .map(|pvv| pvv.value),
+                                };
                                 // Issue #834: queued onto `pending` like the
                                 // commit branch above — see this match's own
                                 // doc for why `took_effect`/
                                 // `surface_suspicious_merge_noop` are no
                                 // longer checked here.
-                                match prior {
-                                    Some(pvv) => {
+                                match restored {
+                                    Some(committed_envelope) => {
                                         pending.push(MergeOp::put(
                                             physical_key.clone(),
-                                            pvv.value,
+                                            committed_envelope,
                                             version,
                                         ));
                                     }
@@ -11562,6 +11642,11 @@ fn witness_append_entries(hlc: &Hlc, msg: &RaftMsg<KvCommand>, now: Nanos) {
 /// degrades to today's (pre-fix) latency at worst, never a stall. Under load
 /// `apply_and_compact` keeps returning `true`, so the task never sleeps and apply
 /// stays close behind commit — this only bounds latency (and CPU) while idle.
+///
+/// **Not armed while the group is quiesced** (issue #1180, ADR 0048): a quiesced
+/// group's apply task parks on [`ApplySignal`] alone, and the consensus loop
+/// raises the signal on every quiesced/awake transition, so the poll is re-armed
+/// the moment the group wakes.
 const APPLY_SAFETY_POLL: Duration = Duration::from_millis(250);
 
 /// The per-node **consensus loop**: recover from the WAL, spawn the apply task, then
@@ -11979,6 +12064,9 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         }
     }
 
+    // The quiesced flag as this loop last observed it (issue #1180) -- see the
+    // `apply_signal.notify()` on transitions below.
+    let mut quiesced_seen = false;
     loop {
         // A requested shutdown exits *between* persist rounds so the WAL is never
         // left mid-write; `stopped` (paired with the apply task's `apply_stopped`)
@@ -12403,6 +12491,19 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             (true, false) => metrics.incr(Metric::CpUnquiesces),
             _ => {}
         }
+        // Issue #1180: the apply task parks WITHOUT its safety-poll timer
+        // while quiesced, so every quiesced <-> awake transition must raise
+        // `apply_signal` (awake: re-arm the poll for signal-less work such as
+        // `take_snapshot_needed`; quiesced: let a still-armed poll drop).
+        // `quiesced_seen` is this loop's own last-observed state, compared
+        // against both samples of this iteration, so an un-quiesce performed
+        // OUTSIDE this loop (a local propose, `wake()`, `read_barrier`) is
+        // still caught at the top of the next iteration -- every such trigger
+        // also wakes this loop, so one always follows.
+        if quiesced_seen != was_quiesced || was_quiesced != is_quiesced_now {
+            apply_signal.notify();
+        }
+        quiesced_seen = is_quiesced_now;
         // Wake-on-commit (ADR 0044 phase-1 PR1): a commit-index advance covers both
         // a follower's in-line apply on `AppendEntries` (gated on `commit_index`
         // alone, so it can create apply work with no separate `mark_durable_through`
@@ -12602,13 +12703,41 @@ async fn apply_loop<E: Env, S: StorageEngine>(
         )
         .await;
         if !did_work {
-            select(
+            // Issue #1180 / ADR 0048: a quiesced group parks on `ApplySignal`
+            // ALONE -- no safety-poll timer -- so it posts zero timeline events
+            // while idle. Sound because (a) a quiesced group cannot reach any
+            // signal-less transition without first un-quiescing (the entry
+            // predicate requires `!snapshot_needed`, no pending/incoming
+            // snapshot, every peer fully matched, engine caught up; and
+            // `take_snapshot_needed` is only ever set by a leader's
+            // replicate cycle, which a quiesced leader does not run), and
+            // (b) the consensus loop raises `apply_signal` on every
+            // quiesced <-> awake transition it observes (see its
+            // `quiesced_seen` bookkeeping), so un-quiescing re-arms the poll.
+            //
+            // Lost-wakeup safety: the flag is read under the core lock AFTER
+            // `apply_and_compact` returned. If the group is awake here we use
+            // the poll as before. If it is quiesced here and un-quiesces
+            // afterwards, the consensus loop (which always runs after any
+            // un-quiesce trigger) sets `ApplySignal.pending` *after* the
+            // flag flipped; `ApplyPending::poll` registers its waker and
+            // then swaps the flag, so the notify is observed whether it
+            // lands before or after we park.
+            let quiesced = core.lock().expect("raftkv core poisoned").is_quiesced();
+            if quiesced {
                 ApplyPending {
                     signal: &apply_signal,
-                },
-                env.sleep(APPLY_SAFETY_POLL),
-            )
-            .await;
+                }
+                .await;
+            } else {
+                select(
+                    ApplyPending {
+                        signal: &apply_signal,
+                    },
+                    env.sleep(APPLY_SAFETY_POLL),
+                )
+                .await;
+            }
         }
     }
 }

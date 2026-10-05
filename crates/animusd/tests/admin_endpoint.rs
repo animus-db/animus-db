@@ -43,6 +43,7 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::Clust
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                overload: None,
             })
             .collect();
         let config = animusd::ClusterConfig {
@@ -117,6 +118,7 @@ async fn bring_up_with_streams(
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                overload: None,
             })
             .collect();
         let config = animusd::ClusterConfig {
@@ -188,6 +190,7 @@ async fn bring_up_with_fs_segment_store(
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                overload: None,
             })
             .collect();
         let config = animusd::ClusterConfig {
@@ -1125,6 +1128,7 @@ async fn bring_up_with_auth(
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                overload: None,
             }],
             dynamo_auth: Some(DynamoAuthConfig {
                 credentials: credentials.clone(),
@@ -1532,6 +1536,7 @@ async fn bring_up_lone_voter_of(n: usize, dir: &std::path::Path) -> Node {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                overload: None,
             })
             .collect();
         let config = animusd::ClusterConfig {
