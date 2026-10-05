@@ -145,7 +145,7 @@ recorded workload, and a ballast file that fills a mount to ENOSPC.
 
 It **skips with a message** where the process cannot mount (needs root or
 passwordless `sudo -n mount`); `ANIMUS_CHAOS_REQUIRE_MOUNT=1` (set in CI) turns
-the skip into a failure. Knobs: `ANIMUS_CHAOS_DISK_MB`, `ANIMUS_CHAOS_DISK_TXN=1`.
+the skip into a failure. Knobs: `ANIMUS_CHAOS_DISK_MB`, `ANIMUS_CHAOS_DISK_TXN=0` (drop the 2PC ops, on by default).
 
 What tmpfs does not prove: tmpfs reports ENOSPC at `write`/`pwrite`; a
 delayed-allocation filesystem (ext4/xfs) can report it at `fsync` or on a page
@@ -161,15 +161,77 @@ for the kernel's ENOSPC, not for every filesystem's timing of it.
   section 3, "Follower side"), so a full leader loses quorum contact and neither
   the ReadIndex nor the freshness-gated replica read can serve. The documented
   "reads continue" holds in the one-full-node window only.
-- **F-2: with the multi-key transaction workload on, a disk-full window leaves a
-  2PC intent that is never resolved.** After space returns, a final consistent
-  read of one key times out indefinitely and the durability and txn-atomicity
-  oracles fire (2 of 2 runs with `ANIMUS_CHAOS_DISK_TXN=1`; 0 of 2 without). The
-  node log shows recovery creating an orphan-abort tombstone for a txn whose
+- **F-2 (resolved): with the multi-key transaction workload on, a disk-full
+  window left a 2PC intent that was never resolved.** After space returned, a
+  final consistent read of one key timed out indefinitely and the durability and
+  txn-atomicity oracles fired (2 of 2 runs with 2PC ops on; 0 of 2 without). The
+  node log showed recovery creating an orphan-abort tombstone for a txn whose
   anchor stage never landed, a later `TxnCommit` losing to that abort, and
   `TxnResolve's carried outcome does not match the anchor's own decided record
-  - skipping resolve`, after which every `TxnStage` on that key is blocked by
-  the stale intent. The scenario therefore runs with 2PC ops **off** by default.
+  - skipping resolve`. **Root cause: not disk-full at all, and not introduced by
+  the disk-full commits.** The provisioned table's min-tablet split picked the
+  byte-weighted median of the live rows, i.e. an item's own key, and only a
+  *streamed* table's split key was rounded to a token boundary. With one item per
+  partition key that item is the first row of its token, and a txn record (key
+  `token || ...`, derived from the anchor's token) sorts *below* every item of
+  that token, so the split put the anchor's item on the right child and its
+  record's key range on the left one. The anchor stage applied on the right
+  child, every `TxnCommit` and recovery was routed (by record key) to the left
+  child where no record existed. The 2PC workload simply made the split key land
+  on a txn-touched token. Fix: `decide::align_split_key` rounds every table's
+  split key to its token boundary (down, else up). Regression:
+  `sim_cluster_auto_split::h_a_split_never_separates_an_item_from_its_txn_record`
+  (red before the fix with `anchor commit failed ... CP group leader moved after
+  decide`), and `chaos_disk_full` now runs the 2PC ops by default. The same
+  mechanism is what failed `chaos-smoke` on this PR's head (`lost acknowledged
+  append` plus `txn-atomicity` half-applied, on the one partition key sitting on
+  a split boundary) and is the likely actual cause of "Finding 1" below, whose
+  tombstone-GC attribution was only "probable". One residual: a tablet whose
+  range holds a single token still splits by sort key (the raw key is kept), and
+  a transaction anchored on that token can straddle the cut.
+  **Three further, independent root causes** turned up while driving the
+  remaining failures to zero, all pre-existing and all fixed here:
+  (2) *stale grouping across a split*: the coordinator groups a txn's keys by
+  tablet from one metadata snapshot, but a stage is routed by the group's first
+  key against the live map; a split in between let a two-key group stage whole
+  on one child, so the other key's intent and committed value landed in a
+  tablet that does not own it. `txn_stage_local` now refuses (before proposing)
+  any group with a key outside the leader's range, with the allowlisted
+  safe-to-retry-fresh refusal (`sim_cluster_auto_split` scenario (i), red
+  before). (3) *`TxnId` collision across groups led by one node*: a `TxnId` was
+  `(group's own Hlc ts, node)`, so two transactions anchored on two tablets
+  led by the same node could mint the identical id; one's participant resolve
+  then committed the other's freshly staged intent early and lost its other
+  half. A non-primary group now qualifies the node with its stream
+  (`n0#100`). Regression:
+  `animus-cp-data` `txn_id_across_groups::two_groups_led_by_one_node_never_mint_the_same_txn_id`
+  (red before).
+  (4) *a txn decision ordered after the fork entry was applied to the frozen
+  parent*: `TxnCommit`/`TxnAbort` (and the orphan-abort tombstone) were the one
+  mutating apply arm without the seal check. The children of an in-place fork
+  are cloned from the parent's **current** engine by the host reconciler,
+  asynchronously and per replica, so a replica that cloned after the decision
+  applied held the record `Committed` while one that cloned before held it
+  `Pending` (seen live: the same tablet-3 resolve saw `cur=Pending` on two
+  replicas and `cur=Committed` on the third) -- replica-divergent children and
+  an acked commit whose participant intents never resolved, after which the key
+  reverted to its prior value (every later append to it lost; the earlier
+  unexplained "key 22 loses all appends" runs). The seal now makes a decision
+  on a sealed record key a deterministic no-op (apply stays a pure function of
+  the entry and state, ADR 0073 "apply never branches on a gate"), and the
+  coordinator, seeing the record still `Pending` on a frozen group after its own
+  decide, re-routes the same decision to the record's new owner
+  (`txn_decide_anchor`). Regression:
+  `split_tablet::a_txn_decision_ordered_after_the_fork_is_a_sealed_no_op`
+  (red before: the frozen parent's record flipped to `Committed`).
+- **F-3: with every disk full, "some probe saw the 503" is a race, so it is
+  measured, not asserted.** All-full means every follower acks nothing and
+  each group loses its leader within about a second (F-1), after which a write
+  times out instead of returning a 503 (observed with and without the 2PC
+  clients, ~1 run in 3). The refusal path stays asserted without the race: the
+  single-full-node phase requires the 503 strictly and `overload_storage_full`
+  must increment on some node. Fixing F-1 itself (a full node must keep acking
+  heartbeats so leaders survive) is a separate product change.
 
 ### Faults not implemented, and why
 
@@ -195,7 +257,9 @@ for the kernel's ENOSPC, not for every filesystem's timing of it.
 Reported, not fixed: the harness PR does not change product code.
 
 **Finding 1: acknowledged writes lost on keys touched by an aborted cross-tablet transaction
-(probable root cause identified, not yet confirmed end to end).** Seen in 2 of ~25 `smoke`
+(probable root cause identified, not yet confirmed end to end; the 2026-10-05 F-2 root cause above, a
+split key inside a token, produces this same signature and is the more likely culprit for runs after
+the prior-value fix).** Seen in 2 of ~25 `smoke`
 runs (seeds 2799062427773259430 at 45 s, and 308 at 90 s; ~1 in 12 for a given window, not
 seed-reproducible). Symptom: one client's keys (those it transacts over) read as empty
 mid-run after a `TransactionCanceledException`, then restart their list; the oracle reports

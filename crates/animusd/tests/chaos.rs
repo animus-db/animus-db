@@ -12,8 +12,8 @@
 //! and **skips with a message** where mounting is not permitted
 //! (`ANIMUS_CHAOS_REQUIRE_MOUNT=1` turns that skip into a failure, for CI);
 //! its own knobs are `ANIMUS_CHAOS_DISK_MB` (per-node mount size, default 64)
-//! and `ANIMUS_CHAOS_DISK_TXN=1` (include the 2PC ops; off by default, see F-2
-//! in `docs/chaos.md`).
+//! and `ANIMUS_CHAOS_DISK_TXN=0` (drop the 2PC ops, which are on by default
+//! since F-2 in `docs/chaos.md` was fixed).
 //!
 //! The fault *schedule* is a pure function of the seed; the processes are
 //! real and not deterministic (ADR 0003 determinism is `SimEnv`-only). The
@@ -456,12 +456,11 @@ async fn run_disk_full() -> Option<Outcome> {
         .expect("seed write");
     let pids: Vec<Option<u32>> = (0..n).map(|i| cluster.pid(i)).collect();
 
-    // The multi-key transaction ops are OFF here by default: with them on, a
-    // disk-full window leaves a 2PC intent that is never resolved (finding
-    // F-2 in docs/chaos.md: a key then times out forever and the txn-atomicity
-    // oracle fires). `ANIMUS_CHAOS_DISK_TXN=1` turns them back on to reproduce.
+    // The multi-key transaction ops are ON by default (finding F-2 in
+    // docs/chaos.md, a split cutting a txn record off its anchor's item, is
+    // fixed); `ANIMUS_CHAOS_DISK_TXN=0` drops them.
     let mut sh0 = Shared::new(seed);
-    sh0.txn_ops = std::env::var("ANIMUS_CHAOS_DISK_TXN").is_ok_and(|v| v.trim() == "1");
+    sh0.txn_ops = std::env::var("ANIMUS_CHAOS_DISK_TXN").map_or(true, |v| v.trim() != "0");
     let shared = Arc::new(sh0);
     let clients: Vec<_> = (1..=CLIENTS)
         .map(|proc| {
@@ -555,11 +554,21 @@ async fn run_disk_full() -> Option<Outcome> {
             "phase 2: StorageFull refusals per node {refused:?}; other answers {other_answers:?}"
         ),
     );
-    // Which node refuses (rather than times out or forwards to a leader that
-    // is mid step-down) is timing-dependent; that some node does is the contract.
+    // Whether a probe SEES the named 503 is a race against leadership loss,
+    // not a contract: with every disk full each group loses its leader within
+    // about a second (finding F-1, docs/chaos.md -- a full follower acks
+    // nothing and a full node never campaigns), and a leaderless group times
+    // out instead of refusing. So the per-probe observation is measured and
+    // reported (like the F-1 reads below), not asserted. The refusal path
+    // itself is asserted two ways that do not race: the single-full-node
+    // phase above requires the 503 strictly, and `overload_storage_full`
+    // must have incremented on some node below.
     if refused.iter().sum::<u32>() == 0 {
-        violations
-            .push("[disk-full/all-nodes] no write was ever refused with 503 StorageFull".into());
+        note(
+            &mut events,
+            "phase 2: no probe saw 503 StorageFull before the groups lost their leaders (finding F-1)"
+                .into(),
+        );
     }
     let mut overload = 0;
     for i in 0..n {
