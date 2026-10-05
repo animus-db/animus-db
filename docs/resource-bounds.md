@@ -232,11 +232,23 @@ refusing every write until space returns.
 - ~~LSM engine ENOSPC is not handled.~~ Handled (issue #1218), see "LSM-engine
   ENOSPC" below.
 - ~~No leader step-down.~~ Done (issue #1219), see "Leader step-down" below.
-- **`spawned_task_panics` is still not exported** through `/metrics`, and
-  `/admin/health` does not fail on a panicked consensus task.
-- **No `ProdEnv` test on a size-limited filesystem** (a tmpfs mount needs
-  `CAP_SYS_ADMIN`, so it is CI-only). The sim proves logic and ordering, not the
-  kernel's real ENOSPC/`fsync` behaviour.
+- ~~`spawned_task_panics` is not exported, and `/admin/health` does not fail on a
+  panicked consensus task.~~ Done (issue #1220): `spawned_task_panics` (any
+  spawned task) and `consensus_task_panics` (a `Spawner::spawn_critical` task: the
+  control Raft driver and `Metadata` apply loop, each CP-data group's driver and
+  apply loop) are `Metric`s; a nonzero `consensus_task_panics` makes
+  `/admin/health` return 503 with a `consensus_task_panics` field (a dead consensus
+  loop is never restarted, so only a restart repairs it; `/admin/live` is
+  unchanged). Alerts `AnimusConsensusTaskPanicked` / `AnimusBackgroundTaskPanicked`
+  in `deploy/observability/animus-alerts.yml`; test
+  `crates/animusd/tests/consensus_task_panic_health.rs`.
+- ~~No `ProdEnv` test on a size-limited filesystem.~~ Done (issue #1221):
+  `chaos_disk_full` in the real-process chaos harness (`docs/chaos.md`, "Disk full
+  on real filesystems"), per-node tmpfs mounts, CI job `chaos-disk-full`. It found
+  two defects, still open: **F-1** reads are not reliably served while every node is
+  full (a full follower acks nothing, so a full leader loses quorum contact), and
+  **F-2** a disk-full window with 2PC ops on leaves an unresolved intent that blocks
+  a key after space returns.
 - SimEnv injects ENOSPC on reads as well, so a `StopRestart` during a 100%
   window would read an empty WAL; the corpus never combines the two.
 

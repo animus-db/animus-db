@@ -11,6 +11,10 @@ name: chaos
 #
 #   - pull_request / push: the ~3 minute smoke (one control-leader kill + one
 #     partition), path-filtered to the surfaces it exercises.
+#   - the `chaos-disk-full` job (pull_request / push, same path filters): the
+#     disk-full scenario (issue #1221) on real size-limited tmpfs mounts, which
+#     needs `sudo mount` (CAP_SYS_ADMIN); ANIMUS_CHAOS_REQUIRE_MOUNT=1 makes a
+#     runner that cannot mount a failure instead of a silent skip.
 #   - nightly: the smoke plus every longer scenario at the chaos defaults,
 #     each with a fresh random seed (printed; replay with ANIMUS_CHAOS_SEED).
 #   - workflow_dispatch: pick a scenario, window and seed.
@@ -21,7 +25,7 @@ on:
   workflow_dispatch:
     inputs:
       scenario:
-        description: "smoke | kill | partition | pause | delay | mixed | all"
+        description: "smoke | kill | partition | pause | delay | mixed | disk_full | all"
         required: false
         default: "smoke"
       secs:
@@ -57,6 +61,7 @@ jobs:
   chaos:
     name: chaos-${{ github.event_name == 'schedule' && 'nightly' || (github.event.inputs.scenario || 'smoke') }}
     runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.scenario != 'disk_full'
     # Smoke is ~3 min of run + a debug animusd build; the nightly runs six
     # scenarios of ~2.5-4 min each. Generous on purpose: this is real
     # wall-clock work, not a deterministic SimEnv suite.
@@ -109,5 +114,47 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: chaos-failure
+          path: ${{ runner.temp }}/chaos-out
+          if-no-files-found: ignore
+
+  chaos-disk-full:
+    name: chaos-disk-full
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || github.event.inputs.scenario == 'disk_full')
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (1.96)
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Cache cargo registry + build output
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check the runner can mount a tmpfs
+        run: |
+          sudo -n true
+          d="$(mktemp -d)"
+          sudo mount -t tmpfs -o size=1m tmpfs "$d"
+          sudo umount "$d"
+
+      # Each node's data dir sits on its own 64 MiB tmpfs; the test fills it
+      # with a ballast file, asserts the 503 StorageFull refusal and the
+      # recovery after the ballast is deleted (no restart), then runs the
+      # oracles over the history. See docs/chaos.md.
+      - name: Run chaos_disk_full
+        env:
+          ANIMUS_CHAOS_REQUIRE_MOUNT: "1"
+          ANIMUS_CHAOS_OUT: ${{ runner.temp }}/chaos-out
+        run: |
+          cargo test -p animusd --features chaos --test chaos --locked \
+            chaos_disk_full -- --nocapture --test-threads=1
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-disk-full-failure
           path: ${{ runner.temp }}/chaos-out
           if-no-files-found: ignore

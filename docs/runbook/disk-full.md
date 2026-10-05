@@ -3,19 +3,21 @@
 Conventions are in [README.md](README.md). Alert entry point:
 [disk-space.md](disk-space.md).
 
-## Status: handled in simulation, not yet proven on a real full disk
+## Status: handled in simulation and on a real size-limited filesystem (two open defects)
 
 Disk-full (`ENOSPC`, `ErrorKind::StorageFull`) on a WAL write is handled
 (roadmap R-01(d), issue #1185; design in `docs/resource-bounds.md` section 3). It is
-proven by a seeded `SimEnv` corpus (`ANIMUS_DISK_FULL_SEEDS`), **not** yet on a real
-size-limited filesystem. What a node does:
+proven by a seeded `SimEnv` corpus (`ANIMUS_DISK_FULL_SEEDS`) and by the real-process
+chaos scenario `chaos_disk_full` on size-limited tmpfs mounts (`docs/chaos.md`). What a node does:
 
 - A group (a tablet's Raft group, or the control group) whose WAL write hits ENOSPC
   marks that WAL **suspect**: it is never appended to or `fsync`ed again. Nothing the
   failed round covered is applied or acknowledged.
 - Writes to that group are **refused** with HTTP 503 `ServiceUnavailable`, message
   `StorageFull: ...; retry`, and `overload_storage_full` increments on `/metrics`.
-  Reads of already-applied state keep working. The process does not die.
+  Reads of already-applied state keep working while at least one replica of the
+  group still has disk; **if every node is full they are not reliably served**
+  (F-1 in `docs/chaos.md`). The process does not die.
 - `GET /admin/health` shows `storage_full: true` (with `storage_full_control` and the
   list `storage_full_tablets`); its status code is unchanged on purpose, so alert on
   the field or on `overload_storage_full`, not on readiness. `/admin/raftkv` shows
@@ -26,15 +28,18 @@ size-limited filesystem. What a node does:
 
 Known gaps (file or check issues before relying on them):
 
-- **The LSM engine is not covered.** A flush, compaction or apply-time engine write
-  that hits ENOSPC is still a hard `panic!` inside a background task; `ProdEnv` catches
-  it per task, logs it and keeps the process up, with that tablet's apply task dead
-  (`/admin/live` stays 200 and the panic count is not exported). If you see `panicked`
-  or `No space left` in the log without a `StorageFull` refusal, **restart the node**
-  after freeing space.
-- **No leader step-down.** A leader whose own disk is full keeps leadership and
-  refuses writes, so its tablets are unavailable for writes until space returns or
-  you move leadership/load away.
+- **A tablet leader whose own disk is full steps down** to a replica with free disk
+  (issue #1219), so a one-node disk-full window keeps writes flowing. When every
+  replica is full the leader stays leader and refuses writes.
+- **LSM-engine ENOSPC** is handled (issue #1218): the apply task pauses and retries.
+  If you still see `panicked` or `No space left` in the log without a `StorageFull`
+  refusal, restart the node after freeing space. A panicked consensus task now fails
+  `/admin/health` (503, `consensus_task_panics`) and fires `AnimusConsensusTaskPanicked`
+  ([node-down.md](node-down.md), "A task panicked on a live node").
+- **F-2 (open):** on a real full disk, a multi-key transaction in flight can leave an
+  intent that is never resolved, blocking reads and writes of that key after space
+  returns. A key that times out after recovery is this; restart does not obviously
+  clear it. See `docs/chaos.md`.
 - The LSM engine also needs free space to make progress (write backpressure fails
   loudly after `BACKPRESSURE_MAX_POLLS` rather than queueing without bound).
 
@@ -114,5 +119,5 @@ engineering estimate, **not a measured number**.
 
 ## Maturity
 
-The WAL path is sim-tested only; nothing here has been reproduced on a real full disk. The sizing text is derived from constants and comments in
+The WAL path is sim-tested and exercised on real tmpfs mounts by `chaos_disk_full` (one node full, every node full, recovery without restart); tmpfs reports ENOSPC at `write`, so ext4/xfs timing of the error is not covered. The sizing text is derived from constants and comments in
 `animus-storage`, `animus-cp-data` and `animusd`; no measurement backs the 2x rule.

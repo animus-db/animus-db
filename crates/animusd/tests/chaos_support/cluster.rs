@@ -37,6 +37,9 @@ pub struct ChaosCluster {
     root: PathBuf,
     pub faults: Arc<Faults>,
     children: Vec<Option<Child>>,
+    /// Per-node `--dir` overrides (the disk-full scenario puts each data dir
+    /// on its own size-limited tmpfs); `None` = `<root>/data<i>`.
+    data_dirs: Vec<Option<PathBuf>>,
     paused: Vec<bool>,
     proxies: Vec<JoinHandle<()>>,
 }
@@ -143,6 +146,7 @@ impl ChaosCluster {
             root: root.to_path_buf(),
             faults,
             children: (0..n).map(|_| None).collect(),
+            data_dirs: (0..n).map(|_| None).collect(),
             paused: vec![false; n],
             proxies,
         }
@@ -172,7 +176,16 @@ impl ChaosCluster {
     #[allow(dead_code, reason = "used by the soak target, not chaos")]
     /// Node `i`'s data directory (`--dir`).
     pub fn data_dir(&self, i: usize) -> PathBuf {
-        self.root.join(format!("data{i}"))
+        self.data_dirs[i]
+            .clone()
+            .unwrap_or_else(|| self.root.join(format!("data{i}")))
+    }
+
+    #[allow(dead_code, reason = "used by the disk-full scenario only")]
+    /// Put node `i`'s data directory somewhere else (before it first starts).
+    pub fn set_data_dir(&mut self, i: usize, dir: PathBuf) {
+        assert!(self.children[i].is_none(), "node {i} already running");
+        self.data_dirs[i] = Some(dir);
     }
 
     pub fn log_path(&self, i: usize) -> PathBuf {
@@ -194,7 +207,7 @@ impl ChaosCluster {
             .arg("--node")
             .arg(i.to_string())
             .arg("--dir")
-            .arg(self.root.join(format!("data{i}")))
+            .arg(self.data_dir(i))
             .env("RUST_BACKTRACE", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))

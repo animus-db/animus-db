@@ -122,13 +122,62 @@ the node logs.
 | `delay` | 100-600 ms added latency on every link | spurious elections and leader flapping under a slow network do not lose or reorder acked writes | asymmetric slowness; bandwidth limits |
 | `mixed` | random mix of all of the above | everything above in combination, for `ANIMUS_CHAOS_SECS` (use for the long run) | |
 
+### Disk full on real filesystems
+
+`chaos_disk_full` (`cargo test -p animusd --features chaos --test chaos chaos_disk_full -- --nocapture`;
+CI job `chaos-disk-full`, also part of the nightly `chaos_` run) is a different
+shape from the schedule-driven scenarios above: three real nodes, each with its
+data dir on its **own 64 MiB tmpfs** (`ANIMUS_CHAOS_DISK_MB`), a continuous
+recorded workload, and a ballast file that fills a mount to ENOSPC.
+
+1. **One node full.** Fill node 0. Asserts `storage_full` shows on its
+   `/admin/health`, writes keep being acknowledged through nodes 1 and 2 across
+   several keys (a full tablet leader hands leadership over, #1219), a read
+   through the full node is served; then the ballast is deleted and the node
+   must report `storage_full: false` and accept a write with no restart.
+2. **Every node full.** Fill all three. Asserts at least one write is refused
+   with a named 503 `StorageFull` and `overload_storage_full` moved. Reads are
+   sampled and reported, **not** asserted (F-1).
+3. **Recovery.** Delete every ballast. Asserts `storage_full` clears on every
+   node, a write is acknowledged through each node, and every process kept its
+   pid (no restart). Then the usual final reads and oracles, a `panicked at`
+   scan of the node logs and the non-vacuity floor.
+
+It **skips with a message** where the process cannot mount (needs root or
+passwordless `sudo -n mount`); `ANIMUS_CHAOS_REQUIRE_MOUNT=1` (set in CI) turns
+the skip into a failure. Knobs: `ANIMUS_CHAOS_DISK_MB`, `ANIMUS_CHAOS_DISK_TXN=1`.
+
+What tmpfs does not prove: tmpfs reports ENOSPC at `write`/`pwrite`; a
+delayed-allocation filesystem (ext4/xfs) can report it at `fsync` or on a page
+writeback, and a copy-on-write one can fail on overwrite. The mount is a stand-in
+for the kernel's ENOSPC, not for every filesystem's timing of it.
+
+**Findings (first runs, seed 283777889631356264, 2026-10-05):**
+
+- **F-1: reads are not reliably served while every node's disk is full.** An
+  eventually-consistent `GetItem` of an already-written key timed out on every
+  node in two of three runs (0 of 12 served), and was served in the third. A full
+  follower acks nothing, not even a bare heartbeat (`docs/resource-bounds.md`
+  section 3, "Follower side"), so a full leader loses quorum contact and neither
+  the ReadIndex nor the freshness-gated replica read can serve. The documented
+  "reads continue" holds in the one-full-node window only.
+- **F-2: with the multi-key transaction workload on, a disk-full window leaves a
+  2PC intent that is never resolved.** After space returns, a final consistent
+  read of one key times out indefinitely and the durability and txn-atomicity
+  oracles fire (2 of 2 runs with `ANIMUS_CHAOS_DISK_TXN=1`; 0 of 2 without). The
+  node log shows recovery creating an orphan-abort tombstone for a txn whose
+  anchor stage never landed, a later `TxnCommit` losing to that abort, and
+  `TxnResolve's carried outcome does not match the anchor's own decided record
+  - skipping resolve`, after which every `TxnStage` on that key is blocked by
+  the stale intent. The scenario therefore runs with 2PC ops **off** by default.
+
 ### Faults not implemented, and why
 
 | Fault | Status |
 |---|---|
 | **Clock skew** | Not in the bare harness. A real skew needs `libfaketime` (not assumed present) or Chaos Mesh `TimeChaos`; `deploy/chaos/time-skew.yaml` is the Kubernetes design. The node uses monotonic time for every deadline (ADR 0003), so the interesting surface is `env.wall_now()` (DynamoDB TTL, HLC wall component), not election timing. |
 | **Slow disk** | Not in the bare harness: needs a FUSE/`dm-delay`/cgroup IO throttle (root). `deploy/chaos/io-latency.yaml` is the Kubernetes design. |
-| **Disk full** | **Pending, deliberately not added.** Behaviour on a real node is undefined today (issue #1185; ADR 0074 section 2 / criterion D-7 define the contract it must meet). A scenario that can only fail is not a chaos test. `deploy/chaos/io-disk-full.yaml` exists only as a "DO NOT RUN" draft. |
+| **Disk full** | **Implemented as `chaos_disk_full`** (issue #1221), see "Disk full on real filesystems" below. The Kubernetes draft `deploy/chaos/io-disk-full.yaml` is still a "DO NOT RUN" design. |
 | **Packet loss / reordering** | Loopback TCP cannot lose packets; `deploy/chaos/network-loss.yaml` is the Kubernetes design. |
 | **Power loss (unsynced writes)** | `kill -9` does not discard the page cache. Needs a VM-level power cut or `dm-flakey`. |
 
@@ -136,7 +185,7 @@ the node logs.
 
 | ID | Status | Why |
 |---|---|---|
-| B-1 | **Not met** | Implemented against real processes: process kill, network partition, delay, SIGSTOP stall. Clock skew, slow disk and disk full (the other three named by the criterion) are not: see the table above. |
+| B-1 | **Not met** | Implemented against real processes: process kill, network partition, delay, SIGSTOP stall, disk full (real tmpfs, needs `CAP_SYS_ADMIN`). Clock skew and slow disk (the other two named by the criterion) are not: see the table above. |
 | B-2 | **Not met** | Every scenario records a history and runs the oracles, but see the findings below: the criterion says "passes". |
 | B-3 | Not met | Policy in ADR 0074 section 1. Finding 1 is not seed-reproducible, but its engine-level mechanism reproduces deterministically (below); converting that into a regression cell is the fix PR's job. |
 | B-4 | Met | `.github/workflows/chaos.yml` (PR smoke + nightly). |
