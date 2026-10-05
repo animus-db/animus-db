@@ -849,3 +849,58 @@ register checker.
 - Cost numbers of section 3.2 are unmeasured; an `animus-bench` cross-region
   variant (ADR 0076) is a follow-up.
 
+
+## Amendment (2026-10-05): G-d M1 as built (formats and gate, no behaviour change)
+
+The first milestone of stage G-d lands the shapes and the gate; nothing emits them
+yet. Decisions that differ from, or pin down, sections 4 and 8 above (the plan
+`g01/g-d-plan.md` D1/D3 are adopted):
+
+- **The LWW stamp is a calendar `MrecVersion`, not the node HLC (D1; deviates from
+  4.4's `(hlc, region id)`).** The item HLC is relative to the `Env` clock's epoch
+  (process start under `ProdEnv`), so it is not comparable between clusters.
+  `MrecVersion { wall_ms: u64, logical: u32, region_id: u32 }` (derived `Ord` = tuple
+  order, total across Regions) lives **inside the base-row value**: stored-item gains
+  the additive variants `VersionedItem { item, ver }` and `VersionedTombstone { ver }`
+  inside v1. An unversioned row compares as `MrecVersion::ZERO`. A delete already
+  writes a real tombstone *value* (nothing GCs it), so carrying the stamp on the
+  tombstone is all "no resurrection" needs. `region_id` is the 32-bit FNV-1a of the
+  Region name (`animus_control::mrec_region_id`, vectors pinned in a test): ADR 4.4
+  asked for "a small integer", but only a total order is needed and a name-derived id
+  needs no cross-cluster allocation protocol.
+- **Gate: a new `Gate::MrecReplication` at cluster version 3 (D3), not version 2.** G-c
+  is on `main` at 2; a binary at 2 cannot decode the new shapes. The gate guards the
+  commands, the `Eventual` mode with its replica set, and the data-plane shapes
+  (`WriteSchema.mrec`, `KindEvalOp::Replicate`). `MIN_SUPPORTED` stays 1 (ADR 0073's
+  2026-10-05 amendment: the era starts at version 1, so a floor of 2 would stop fresh
+  clusters from starting an era).
+- **Spec shape.** `GlobalTableSpec.consistency` gains `Eventual`; for an MREC table
+  `regions`/`witness`/`preferred_leader_region` are empty and a new
+  `replicas: Vec<MrecReplica { region, region_id, status, local }>` (additive, skipped
+  when empty) holds every replica *including this cluster's own* (exactly one
+  `local`), capped at `MREC_MAX_REPLICAS = 16`. MREC Regions are **peer names** (the
+  `cluster_settings.region` namespace of ADR 0075 D6), not member labels. The status
+  (`Creating`/`Active`/`Deleting`/`CreationFailed`) is stored, not derived, because
+  it depends on a remote cluster. `validate` is mode-aware and rejects mixed shapes.
+- **Commands.** Four, not three: `ConvertTableToMrec { table, local_region,
+  region_id }` (the table need not be empty; placement untouched; the local replica
+  starts `Active`), `AddMrecReplica` (starts `Creating`), `RemoveMrecReplica` (the
+  local replica cannot be removed) and `SetMrecReplicaStatus`. Their apply is real
+  but inert until M4 (state-based rejections only, never gate-based). The MRSC-only
+  restrictions (no TTL, no LSI) now test `is_mrsc()`; an MREC table keeps both (4.6).
+  Consumers that treat `TableSchema.global.is_some()` as MRSC (`animusd`'s read
+  path, `global_tables`, the preferred-leader view) must test `is_mrsc()` before M4
+  emits an MREC spec; they are untouched in M1 because nothing can produce one.
+- **Data plane.** `WriteSchema.mrec: Option<MrecWriteStamp { region_id, wall_ms }>` and
+  `KindEvalOp::Replicate { item: Option<Item>, ver }` ride as JSON blobs inside
+  `KindEval`/`KindEvalBatch`/`TxnStage`, so there is **no binary `KvCommand` codec
+  bump and no new `KvCommand` variant**. `KvCommand::required_gate` is therefore
+  content-dependent (an exhaustive match whose three carriers fold their entries'
+  content), enforced at the single `gated_propose` choke point. Apply of a
+  `Replicate` that arrives anyway is a deterministic rejection until M2 gives it
+  last-writer-wins semantics.
+- **Section 8's provisional gate table is superseded** by one gate per release
+  surface (as in G-c): `GlobalTablesSpec`/`PreferredLeader`/`GlobalTablesWire` shipped
+  as `GlobalTables`, and `MrecReplication` is the MREC gate (it will also cover the
+  intra replication frames M3 adds, which are cross-node variants and get their own
+  `required_gate` row then).

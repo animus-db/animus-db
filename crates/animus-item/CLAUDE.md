@@ -220,3 +220,14 @@ Raft/apply machinery to integration-test against.
 ## Fuzzing (roadmap R-01 (c))
 
 The stored-item / `ChangeRecord` / footprint codecs, `numkey` and the GSI/LSI row-key parsers are the `item_codecs` fuzz target (golden fixtures seed it). A format change per ADR 0073 keeps the old decoder, which stays fuzzed. See `fuzz/README.md` (stable smoke: `cd fuzz && cargo test --release --test smoke`).
+
+## MREC row stamp (G-01 stage G-d M1, ADR 0075)
+
+`stored.rs`: `MrecVersion { wall_ms, logical, region_id }` (derived `Ord` is the
+cross-Region LWW order; it is a **calendar** stamp, never the node HLC) and the
+additive stored-item v1 variants `VersionedItem`/`VersionedTombstone`
+(`encode_*_versioned`, `decode_stored_item_versioned`); `decode_stored_item` still
+returns just the item and an unversioned row decodes unchanged with no stamp (compare
+as `MrecVersion::ZERO`). `write_schema.rs`: `WriteSchema.mrec: Option<MrecWriteStamp>`
+(additive, skipped when `None`, class G). Shaped fixtures `stored-item/v1-versioned*.json`
+(the loader skips `vN-<shape>` files; `versioned_stored_item_shape_fixtures_...` reads them).

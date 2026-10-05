@@ -3218,3 +3218,12 @@ replay. Regression: `animusd` `sim_cluster_split_relocation`. ADR 0058's
 - **TxnId uniqueness (R-01 F-2).** `TxnId.node` is the node qualified by the group stream (`n0#100`; primary stream = bare node id), because `ts` is per-group `Hlc` state and one node leads many groups. `txn_stage_local` (animusd) also refuses, before proposing, a stage group with any key outside the leader range (stale grouping across a split). See `docs/lessons/testing/2026-10-05-a-txn-id-must-be-unique-per-group-not-per-node.md`.
 
 - **Seal check on every mutating apply arm (R-01 F-2).** `TxnCommit`/`TxnAbort` (and the orphan tombstone) are deterministic no-ops on a sealed record key, like every other mutation: a fork clones the parent's CURRENT engine per replica, asynchronously, so a post-fork decision landing in the parent diverges the children. Regression: `tests/it/split_tablet.rs::a_txn_decision_ordered_after_the_fork_is_a_sealed_no_op`; see `docs/lessons/testing/2026-10-05-every-mutating-apply-arm-needs-the-seal-check.md`.
+
+- **MREC shapes (G-01 stage G-d M1).** `KindEvalOp::Replicate { item, ver }` and
+  `WriteSchema.mrec` ride as JSON blobs inside `KindEval`/`KindEvalBatch`/`TxnStage`
+  (no binary codec bump, wire stays v1, WAL v2). `KvCommand::required_gate` is
+  **content-dependent** for those three carriers (`gates.rs::eval_gate`: MREC content
+  joins to `Gate::MrecReplication`), enforced at the one `gated_propose` choke point;
+  `evaluate_kind_eval` rejects a `Replicate` deterministically until M2 gives it LWW
+  apply semantics. Shaped fixtures `raftkv-wire/v1-mrec.bin`, `raftkv-wal/v2-mrec.bin`
+  (built by `codec::tests::mrec_sample_wires`; `fixture_files` skips `vN-<shape>` names).
