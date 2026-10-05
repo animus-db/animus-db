@@ -3743,6 +3743,24 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         }
     }
 
+    /// The `node` half of a [`TxnId`] this group mints. `ts` comes from the
+    /// **group's own** `Hlc`, so two groups led by one node (routine: a node
+    /// leads many tablets) can mint the identical `(ts, node)` for two
+    /// different transactions at the same instant, and a resolve for one then
+    /// acts on the other's intent (R-01 F-2). A non-primary group therefore
+    /// qualifies the node with its stream (`n0#100`), making the id unique per
+    /// group; the primary stream keeps the bare node id, so every previously
+    /// written id and fixture is unchanged. `TxnId.node` is an opaque
+    /// tiebreak (decoded unchecked), never matched against a real node id.
+    fn txn_id_node(&self) -> NodeId {
+        let node = self.env.node_id();
+        if self.stream == PRIMARY_STREAM {
+            node
+        } else {
+            NodeId::new_unchecked(format!("{node}#{}", self.stream))
+        }
+    }
+
     /// Mint a write's `ts`, **pushed** above any read this group's
     /// [`ts_cache`](Self::ts_cache) or committed read ceiling has already
     /// served for `keys` (ADR 0018 §2/PR2b, amended by the `mint_pushed`
@@ -4305,7 +4323,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             let ts = self.mint_pushed(term, &keys);
             let txn_id = TxnId {
                 ts,
-                node: self.env.node_id(),
+                node: self.txn_id_node(),
             };
             let record_key = txn::record_key(&token, &txn_id);
             let mut spans: Vec<(String, KeyRange)> = keys
@@ -10014,6 +10032,37 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     .expect("stage outcomes poisoned")
                     .outcomes
                     .insert(index, (term, outcome));
+            }
+            // R-01 F-2 (fourth mechanism): a txn DECISION whose record key falls
+            // in a range this group has already sealed (the whole-range seal a
+            // `Freeze` or the in-place `SplitTablet` fork applies) is a
+            // deterministic no-op, exactly like every other mutating arm. This
+            // was the one arm missing the check, and it is not harmless: the
+            // children of a fork are cloned from the parent's CURRENT engine by
+            // the host reconciler, asynchronously and per replica, so a decision
+            // ordered after the fork entry landed in the clone of the replicas
+            // that cloned late and not in the others -- replica-divergent
+            // children, plus an acked commit the record's real owner never saw
+            // (its participants' intents then never resolved and the keys
+            // reverted to their prior values). The proposer's own post-decide
+            // status read sees the record still `Pending` on the frozen group and
+            // re-routes the SAME decision to the child that now owns the record
+            // (`txn_decide_anchor_retrying`). Apply stays a pure function of the
+            // entry and the state machine (ADR 0073 "apply never branches on a
+            // gate"); no new variant is needed, since the sealed window is the
+            // one place the old behaviour was replica-dependent.
+            KvCommand::TxnCommit { record_key, ts, .. }
+            | KvCommand::TxnAbort { record_key, ts, .. }
+                if is_sealed(sealed, &record_key) =>
+            {
+                assert_ts_monotonic(
+                    max_applied_ts,
+                    last_applied_ts_entry,
+                    ts,
+                    index,
+                    term,
+                    variant,
+                );
             }
             KvCommand::TxnCommit {
                 txn_id,

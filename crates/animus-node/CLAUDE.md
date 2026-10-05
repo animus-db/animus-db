@@ -75,7 +75,9 @@ makes the constraint **compiler-enforced**:
   inputs and executes the decision.
 - **`decide`** — the pure predicates ADR 0061 rung A6 lifted out of
   `animusd`'s `impl ClientCtx`: `frozen_refusal`, `read_should_retry`,
-  `ok_or_err`, `align_split_key`,
+  `ok_or_err`, `align_split_key` (rounds **every** table's split key to a
+  token boundary, R-01 F-2: a split inside a token cuts a txn record off its
+  anchor's item — see `docs/lessons/testing/2026-10-05-a-split-inside-a-token-*`),
   `byte_weighted_median`, `other_tablet_replica_addr`/
   `decide_forward_retry`/`ForwardRetryStep`. Every function takes plain
   values (no `&self`, no `&CpGroup`, no `ProdEnv`) and returns a plain
