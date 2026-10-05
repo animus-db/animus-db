@@ -176,6 +176,7 @@ dependencies = [
  "animus-cp-data",
  "animus-dynamo",
  "animus-env",
+ "animus-item",
  "animus-sim",
  "animus-storage",
  "animus-tablet",

@@ -154,7 +154,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                             crate::KindWriteOp::Put(item) => {
                                 capacity::write_units(capacity::item_size(item))
                             }
-                            crate::KindWriteOp::Delete | crate::KindWriteOp::Update { .. } => 1.0,
+                            crate::KindWriteOp::Delete
+                            | crate::KindWriteOp::Update { .. }
+                            | crate::KindWriteOp::Replicate { .. } => 1.0,
                         };
                     if !self
                         .throttle

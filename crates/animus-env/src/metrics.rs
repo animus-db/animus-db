@@ -1034,12 +1034,19 @@ pub enum Metric {
     /// refused to arm (target not caught up, config change in flight, ...).
     /// Retried on the next tick without resetting the stability window.
     CpPreferredLeaderTransferRejected,
+    // --- MREC global tables (ADR 0075 section 4, G-01 stage G-d M3) ---
+    /// The MREC receiver answered `Retry` for a replicated record because its
+    /// stamp's wall part was further ahead of this node's `wall_now` than
+    /// `cluster_settings.mrec_max_clock_skew_ms` (a fast-clocked peer region,
+    /// or a bug). A counter: the shipper re-sends until local time catches up,
+    /// so a sustained non-zero rate is the skew alarm. Expected `0`.
+    MrecSkewRejectedTotal,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 126] = [
+    pub const ALL: [Metric; 127] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -1166,6 +1173,7 @@ impl Metric {
         Metric::OverloadStorageFull,
         Metric::CpPreferredLeaderTransfers,
         Metric::CpPreferredLeaderTransferRejected,
+        Metric::MrecSkewRejectedTotal,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -1301,6 +1309,7 @@ impl Metric {
             Metric::OverloadStorageFull => "overload_storage_full",
             Metric::CpPreferredLeaderTransfers => "cp_preferred_leader_transfers",
             Metric::CpPreferredLeaderTransferRejected => "cp_preferred_leader_transfer_rejected",
+            Metric::MrecSkewRejectedTotal => "mrec_skew_rejected_total",
         }
     }
 

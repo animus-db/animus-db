@@ -2561,6 +2561,7 @@ impl SimCluster {
                 backup_janitor_progress: Arc::new(Mutex::new(
                     animus_node::backup_janitor::JanitorProgress::default(),
                 )),
+                mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
                 ttl_reaper_progress: Arc::new(Mutex::new(
                     animus_node::ttl_reaper::TtlReaperProgress::default(),
                 )),
@@ -6109,6 +6110,7 @@ impl SimCluster {
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),
+            mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             ttl_reaper_progress: Arc::new(Mutex::new(
                 animus_node::ttl_reaper::TtlReaperProgress::default(),
             )),
@@ -6449,6 +6451,7 @@ impl SimCluster {
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),
+            mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             ttl_reaper_progress: Arc::new(Mutex::new(
                 animus_node::ttl_reaper::TtlReaperProgress::default(),
             )),
@@ -6757,6 +6760,7 @@ impl SimCluster {
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),
+            mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             ttl_reaper_progress: Arc::new(Mutex::new(
                 animus_node::ttl_reaper::TtlReaperProgress::default(),
             )),
@@ -7573,6 +7577,7 @@ impl SimCluster {
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),
+            mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             ttl_reaper_progress: Arc::new(Mutex::new(
                 animus_node::ttl_reaper::TtlReaperProgress::default(),
             )),

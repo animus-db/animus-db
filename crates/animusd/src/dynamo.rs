@@ -1310,6 +1310,9 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
                 KindWriteOutcome::ConditionFailed => Err(WireError::conditional_check_failed(
                     "the conditional request failed",
                 )),
+                KindWriteOutcome::Superseded => Err(internal(
+                    "a client write came back superseded (MREC replicate result on a client path)",
+                )),
                 KindWriteOutcome::Ok {
                     old,
                     collection_bytes,
@@ -1372,6 +1375,9 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
             {
                 KindWriteOutcome::ConditionFailed => Err(WireError::conditional_check_failed(
                     "the conditional request failed",
+                )),
+                KindWriteOutcome::Superseded => Err(internal(
+                    "a client write came back superseded (MREC replicate result on a client path)",
                 )),
                 KindWriteOutcome::Ok {
                     old,
@@ -1654,6 +1660,9 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
             {
                 KindWriteOutcome::ConditionFailed => Err(WireError::conditional_check_failed(
                     "the conditional request failed",
+                )),
+                KindWriteOutcome::Superseded => Err(internal(
+                    "a client write came back superseded (MREC replicate result on a client path)",
                 )),
                 KindWriteOutcome::Ok {
                     old,
@@ -5944,7 +5953,7 @@ async fn transact_write_idempotency_preflight<E: Env, R: RelayClient>(
     loop {
         match idempotency_claim_put(ctx, &meta, token, &fingerprint).await? {
             KindWriteOutcome::Ok { .. } => return Ok(None),
-            KindWriteOutcome::ConditionFailed => {}
+            KindWriteOutcome::ConditionFailed | KindWriteOutcome::Superseded => {}
         }
         let Some(record) = read_idempotency_record(ctx, &meta, token).await? else {
             // A concurrent commit/cancel already flipped the outcome and the
@@ -6614,6 +6623,10 @@ fn lsi_key_names(base: &TableSchema, idx: &IndexDef) -> BTreeSet<String> {
 pub(crate) fn kind_write_is_idempotent(op: &KindWriteOp) -> bool {
     match op {
         KindWriteOp::Put(_) | KindWriteOp::Delete => true,
+        // A replicate is idempotent as *state* (LWW), but its confirm must be
+        // its own entry: value equality does not prove *this* entry won
+        // (ADR 0075 G-d M2 note), so it is classed `RequiresOwnEntry`.
+        KindWriteOp::Replicate { .. } => false,
         KindWriteOp::Update { actions, .. } => !actions
             .iter()
             .any(|a| matches!(a, UpdateAction::Add(_, AttributeValue::N(_)))),
@@ -9414,6 +9427,11 @@ pub(crate) enum KindWriteOutcome {
     /// The caller's own `condition` did not match the leader's own read of
     /// the current item — no diff was ever computed, nothing was proposed.
     ConditionFailed,
+    /// A [`KindWriteOp::Replicate`] whose stamp did not beat the stored one:
+    /// it lost last-writer-wins (or was an idempotent re-delivery) and wrote
+    /// nothing. Only the MREC receiver's batch path produces it (ADR 0075 G-d
+    /// M3); every client write path treats it as an internal error.
+    Superseded,
 }
 
 /// **The evaluate-AT-APPLY write path (ADR 0054, Accepted)** for `PutItem`/
@@ -9670,6 +9688,7 @@ pub(crate) fn kind_write_outcome_to_reply(
             collection_bytes,
         },
         Ok(KindWriteOutcome::ConditionFailed) => KindWriteItemReply::ConditionFailed,
+        Ok(KindWriteOutcome::Superseded) => KindWriteItemReply::Superseded,
         Err(e) => KindWriteItemReply::Rejected {
             code: e.code.to_string(),
             message: e.message,
@@ -9694,6 +9713,7 @@ pub(crate) fn kind_write_item_reply_to_outcome(
             collection_bytes,
         }),
         KindWriteItemReply::ConditionFailed => Ok(KindWriteOutcome::ConditionFailed),
+        KindWriteItemReply::Superseded => Ok(KindWriteOutcome::Superseded),
         KindWriteItemReply::Rejected { code, message } => {
             Err(wire_error_from_batch_rejected(code, message))
         }
@@ -9746,7 +9766,17 @@ pub(crate) async fn kind_write_batch_at_leader<E: Env, R: RelayClient>(
     if items.is_empty() {
         return Vec::new();
     }
-    let schema = write_schema_for(meta, table);
+    let mut schema = write_schema_for(meta, table);
+    // ADR 0075 G-d M3: a batch of replicated records is stamped with this
+    // cluster's region context at the proposing leader (apply rejects a
+    // `Replicate` whose entry carries none). Ordinary client batches on an
+    // MREC table take the M4 stamping path.
+    if items
+        .iter()
+        .any(|i| matches!(i.op, KindWriteOp::Replicate { .. }))
+    {
+        schema.mrec = mrec_write_stamp(meta, table, ctx.env.wall_now().0);
+    }
     let write_limit = ctx.throttle_limits_for(meta, table).write_units;
     let tablet_count = meta.tablets_for_table(table).count().max(1);
 
@@ -9856,10 +9886,9 @@ pub(crate) async fn kind_write_batch_at_leader<E: Env, R: RelayClient>(
                         KindEvalApplied::Rejected { code, message } => {
                             Err(rejected_wire_error(&code, message))
                         }
-                        KindEvalApplied::Superseded { .. } => Err(internal(
-                            "a client write came back superseded (MREC replicate result on a \
-                             client path)",
-                        )),
+                        // A replicate that lost LWW (the MREC receiver's batch,
+                        // ADR 0075 G-d M3); a client write never produces one.
+                        KindEvalApplied::Superseded { .. } => Ok(KindWriteOutcome::Superseded),
                     };
                     results[a.original_index] = Some(outcome);
                 }
@@ -9974,6 +10003,7 @@ pub(crate) fn kind_write_op_to_eval_op(op: KindWriteOp) -> animus_cp_data::KindE
         KindWriteOp::Update { key_item, actions } => {
             animus_cp_data::KindEvalOp::Update { key_item, actions }
         }
+        KindWriteOp::Replicate { item, ver } => animus_cp_data::KindEvalOp::Replicate { item, ver },
     }
 }
 
@@ -9986,7 +10016,10 @@ pub(crate) fn kind_write_op_to_eval_op(op: KindWriteOp) -> animus_cp_data::KindE
 fn kind_write_precharge_units(op: &KindWriteOp) -> f64 {
     match op {
         KindWriteOp::Put(item) => capacity::write_units(capacity::item_size(item)),
-        KindWriteOp::Delete | KindWriteOp::Update { .. } => 1.0,
+        KindWriteOp::Replicate {
+            item: Some(item), ..
+        } => capacity::write_units(capacity::item_size(item)),
+        KindWriteOp::Delete | KindWriteOp::Update { .. } | KindWriteOp::Replicate { .. } => 1.0,
     }
 }
 
@@ -10682,6 +10715,23 @@ pub(crate) fn write_schema_for(meta: &Metadata, table: &str) -> animus_item::Wri
         change_records_carry_images: table_change_records_carry_images(meta, table),
         mrec: None,
     }
+}
+
+/// The MREC write stamp context for `table` at `wall_ms` (the leader's
+/// `Env::wall_now` milliseconds): `Some` iff the table is an MREC global table,
+/// carrying this cluster's own region id (the `local` replica's). The one
+/// place a producer derives `WriteSchema::mrec` (ADR 0075 section 4.4, G-d).
+pub(crate) fn mrec_write_stamp(
+    meta: &Metadata,
+    table: &str,
+    wall_ms: u64,
+) -> Option<animus_item::write_schema::MrecWriteStamp> {
+    let spec = meta.table_global(table).filter(|g| g.is_mrec())?;
+    let local = spec.replicas.iter().find(|r| r.local)?;
+    Some(animus_item::write_schema::MrecWriteStamp {
+        region_id: local.region_id,
+        wall_ms,
+    })
 }
 
 /// `animus_control::schema::IndexProjection` -> `animus_item::write_schema::

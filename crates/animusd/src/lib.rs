@@ -108,6 +108,13 @@ mod http;
 mod import;
 #[deny(clippy::disallowed_methods)]
 mod index_backfill;
+#[allow(
+    dead_code,
+    reason = "G-d M3: first production caller is the M4 shipper"
+)]
+pub(crate) mod mrec_peer;
+#[deny(clippy::disallowed_methods)]
+mod mrec_receiver;
 mod overload;
 #[deny(clippy::disallowed_methods)]
 mod pitr_janitor;
@@ -3047,6 +3054,8 @@ pub struct BoundNode {
     /// more than one region. Defaults to 150 ms; set from
     /// `cluster_settings.max_region_rtt_ms` via `with_max_region_rtt`.
     max_region_rtt: Duration,
+    /// MREC peer settings (`cluster_settings.{region,peers,..}`, G-d M3) via `with_mrec`.
+    mrec: Arc<crate::mrec_peer::MrecConfig>,
     advertise_host: Option<String>,
     /// This node's own topology labels, from [`RoleAddrs::labels`] — handed
     /// to its self-registration (`spawn_common_tail`'s `register_node`, a
@@ -5390,6 +5399,7 @@ fn spawn_common_tail(
     tls: Option<TlsMaterial>,
     export_s3: Option<ExportS3Config>,
     overload_limits: config::ResolvedLimits,
+    mrec: Arc<crate::mrec_peer::MrecConfig>,
 ) -> (ClientCtx, Vec<tokio::task::JoinHandle<()>>) {
     // The seed `route_sync_loop` (below) re-overlays `Metadata.node_addrs[*].client`
     // onto every tick (ADR 0032 PR1) — the same static-base pattern
@@ -5421,6 +5431,7 @@ fn spawn_common_tail(
         env.clone(),
     )));
     let ctx = ClientCtx {
+        mrec,
         control,
         edge,
         env,
@@ -5707,6 +5718,14 @@ impl BoundNode {
     #[must_use]
     pub fn with_max_region_rtt(mut self, rtt: Duration) -> Self {
         self.max_region_rtt = rtt;
+        self
+    }
+
+    /// Install the node's MREC peer settings (`cluster_settings.region`/
+    /// `peers`/`allow_insecure_peers`/`mrec_max_clock_skew_ms`, ADR 0075
+    /// section 4.3, G-d M3): read by the MREC receiver. Default: no MREC.
+    pub(crate) fn with_mrec(mut self, mrec: crate::mrec_peer::MrecConfig) -> Self {
+        self.mrec = Arc::new(mrec);
         self
     }
 
@@ -6290,6 +6309,7 @@ impl BoundNode {
             self.tls,
             export_s3,
             config::OverloadSection::resolve(self.overload.as_ref()),
+            self.mrec.clone(),
         );
         // Adopted into the `StartupTasks` guard so the fallible
         // `check_wal_layout`/`SharedWal::open` steps below are covered too
@@ -6926,6 +6946,7 @@ impl Node {
             console_listener,
             console_addr,
             max_region_rtt: animus_control::timing::DEFAULT_MAX_REGION_RTT,
+            mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             advertise_host: addrs.advertise_host,
             labels: addrs.labels,
             tls,
@@ -6991,6 +7012,7 @@ impl Node {
             intra_listener,
             intra_addr,
             max_region_rtt: animus_control::timing::DEFAULT_MAX_REGION_RTT,
+            mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             advertise_host: addrs.advertise_host,
             labels: addrs.labels,
             tls,
@@ -7065,6 +7087,7 @@ impl Node {
             console_listener,
             console_addr,
             max_region_rtt: animus_control::timing::DEFAULT_MAX_REGION_RTT,
+            mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             advertise_host: addrs.advertise_host,
             labels: addrs.labels,
             tls,
@@ -7617,6 +7640,8 @@ pub struct BoundControlNode {
     /// more than one region. Defaults to 150 ms; set from
     /// `cluster_settings.max_region_rtt_ms` via `with_max_region_rtt`.
     max_region_rtt: Duration,
+    /// MREC peer settings (`cluster_settings.{region,peers,..}`, G-d M3) via `with_mrec`.
+    mrec: Arc<crate::mrec_peer::MrecConfig>,
     advertise_host: Option<String>,
     /// See [`BoundNode::labels`]'s doc.
     labels: BTreeMap<String, String>,
@@ -7636,6 +7661,14 @@ impl BoundControlNode {
     #[must_use]
     pub fn with_max_region_rtt(mut self, rtt: Duration) -> Self {
         self.max_region_rtt = rtt;
+        self
+    }
+
+    /// Install the node's MREC peer settings (`cluster_settings.region`/
+    /// `peers`/`allow_insecure_peers`/`mrec_max_clock_skew_ms`, ADR 0075
+    /// section 4.3, G-d M3): read by the MREC receiver. Default: no MREC.
+    pub(crate) fn with_mrec(mut self, mrec: crate::mrec_peer::MrecConfig) -> Self {
+        self.mrec = Arc::new(mrec);
         self
     }
 
@@ -7931,6 +7964,7 @@ impl BoundControlNode {
             // here would ever call `ClientCtx::export_store_factory`.
             None,
             config::OverloadSection::resolve(self.overload.as_ref()),
+            self.mrec.clone(),
         );
         startup.extend(common_tail_tasks);
         // No fallible step remains in this assembly past this point (issue
@@ -8079,6 +8113,8 @@ pub struct BoundDataNode {
     /// more than one region. Defaults to 150 ms; set from
     /// `cluster_settings.max_region_rtt_ms` via `with_max_region_rtt`.
     max_region_rtt: Duration,
+    /// MREC peer settings (`cluster_settings.{region,peers,..}`, G-d M3) via `with_mrec`.
+    mrec: Arc<crate::mrec_peer::MrecConfig>,
     advertise_host: Option<String>,
     /// See [`BoundNode::labels`]'s doc.
     labels: BTreeMap<String, String>,
@@ -8098,6 +8134,14 @@ impl BoundDataNode {
     #[must_use]
     pub fn with_max_region_rtt(mut self, rtt: Duration) -> Self {
         self.max_region_rtt = rtt;
+        self
+    }
+
+    /// Install the node's MREC peer settings (`cluster_settings.region`/
+    /// `peers`/`allow_insecure_peers`/`mrec_max_clock_skew_ms`, ADR 0075
+    /// section 4.3, G-d M3): read by the MREC receiver. Default: no MREC.
+    pub(crate) fn with_mrec(mut self, mrec: crate::mrec_peer::MrecConfig) -> Self {
+        self.mrec = Arc::new(mrec);
         self
     }
 
@@ -8476,6 +8520,7 @@ impl BoundDataNode {
             // stays the "not configured" default until this is wired.
             None,
             config::OverloadSection::resolve(self.overload.as_ref()),
+            self.mrec.clone(),
         );
         // Adopted into the `StartupTasks` guard so the fallible
         // `check_wal_layout`/`SharedWal::open` steps below are covered too
@@ -11470,6 +11515,10 @@ struct DataRole {
 /// than inventing a new one.
 #[derive(Clone)]
 pub(crate) struct ClientCtx<E: Env = ProdEnv, R: RelayClient = AnimusdRelayClient> {
+    /// This node's MREC peer settings and receiver concurrency gauge (ADR 0075
+    /// section 4.3, G-d M3). Default (no region, no peers) outside a
+    /// configured production node.
+    pub(crate) mrec: Arc<crate::mrec_peer::MrecConfig>,
     control: GenericControlHandle<E, R>,
     pub(crate) edge: ClusterEdgeState<E>,
     /// This node's one internal `ProdEnv` (ADR 0040 PR1) — every role's
@@ -15453,6 +15502,7 @@ fn request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::KindWrite { .. } => "kind_write",
         ClientRequest::KindWriteItem { .. } => "kind_write_item",
         ClientRequest::KindWriteBatch { .. } => "kind_write_batch",
+        ClientRequest::MrecApply(_) => "mrec_apply",
         ClientRequest::CpLeaderHintProbe { .. } => "cp_leader_hint_probe",
         ClientRequest::KindScan { .. } => "kind_scan",
         ClientRequest::ForceSeal { .. } => "force_seal",
@@ -15675,6 +15725,14 @@ async fn handle_request(
              in `Forwarded`"
                 .into(),
         ),
+        // ADR 0075 G-d M3: a peer cluster's MREC replication batch. Intra-only
+        // (`surface_of`, refused on the client listener by the guard above),
+        // received **bare** — it is the one request here that is not wrapped in
+        // `Forwarded`, because a peer cluster has no cluster-internal route to
+        // the tablet leader; the receiver routes it itself.
+        ClientRequest::MrecApply(req) => {
+            ClientResponse::MrecApply(mrec_receiver::handle_mrec_apply(ctx, &ctx.mrec, req).await)
+        }
         // Issue #996 layer 2: the batched evaluate-at-leader write RPC,
         // refused bare for the identical reason `KindWriteItem` just above
         // is — see `ClientRequest::KindWriteBatch`'s own doc. Real handling
@@ -17080,7 +17138,8 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
     // `docs/engineering-lessons.md` for the incident this fixes.
     let bound = Node::bind(addrs.id.clone(), addrs, dir)
         .await?
-        .with_max_region_rtt(config.max_region_rtt());
+        .with_max_region_rtt(config.max_region_rtt())
+        .with_mrec(crate::mrec_peer::MrecConfig::from_cluster(config));
     start_bound_node_with_streams_quiesce_and_ttl_sweep_interval(
         bound,
         config,
@@ -17464,7 +17523,8 @@ pub async fn run_node_control_with_stores(
     // `config::node_id(index)` minting convention.
     let bound = Node::bind_control(addrs.id.clone(), addrs, dir)
         .await?
-        .with_max_region_rtt(config.max_region_rtt());
+        .with_max_region_rtt(config.max_region_rtt())
+        .with_mrec(crate::mrec_peer::MrecConfig::from_cluster(config));
 
     // Cross-node routing (ADR 0017 #3b / ADR 0013): map every node's id to
     // its client API address, so a data op or a schema-DDL relay landing on
@@ -17689,7 +17749,8 @@ pub async fn run_node_data_with_cluster_settings(
     // `config::node_id(index)` minting convention.
     let bound = Node::bind_data(addrs.id.clone(), addrs, dir)
         .await?
-        .with_max_region_rtt(config.max_region_rtt());
+        .with_max_region_rtt(config.max_region_rtt())
+        .with_mrec(crate::mrec_peer::MrecConfig::from_cluster(config));
 
     // The control deployment's **intra**-cluster addresses (ADR 0047) — the
     // mirror/leader-hint discovery root (ADR 0035 §1/§4; `WatchMetadata` is
@@ -17820,7 +17881,8 @@ pub async fn run_node_growth(
     // `config::node_id(index)` minting convention.
     let bound = Node::bind(addrs.id.clone(), addrs, dir)
         .await?
-        .with_max_region_rtt(config.max_region_rtt());
+        .with_max_region_rtt(config.max_region_rtt())
+        .with_mrec(crate::mrec_peer::MrecConfig::from_cluster(config));
     let mut client_route: BTreeMap<NodeId, String> = BTreeMap::new();
     for (i, addrs) in config.nodes.iter().enumerate() {
         client_route.insert(
@@ -21444,6 +21506,7 @@ mod simenv_client_ctx_tests {
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),
+            mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             ttl_reaper_progress: Arc::new(Mutex::new(
                 animus_node::ttl_reaper::TtlReaperProgress::default(),
             )),
@@ -22091,6 +22154,7 @@ mod two_node_relay_tests {
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),
+            mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             ttl_reaper_progress: Arc::new(Mutex::new(
                 animus_node::ttl_reaper::TtlReaperProgress::default(),
             )),
@@ -22165,6 +22229,7 @@ mod two_node_relay_tests {
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),
+            mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             ttl_reaper_progress: Arc::new(Mutex::new(
                 animus_node::ttl_reaper::TtlReaperProgress::default(),
             )),
