@@ -49,6 +49,18 @@ rand_chacha.workspace = true
 # HdrHistogram (`record_correct`-free: the intended-time correction is done
 # by the recorder itself, see `recorder.rs`). No `serialization` feature.
 hdrhistogram = { version = "7", default-features = false }
+# Server-only TLS on the DynamoDB and admin dials (ADR 0064, ADR 0076
+# as-built note): `--tls-ca PATH`, modelled on `animus-cli`. `animus-env`'s
+# `MaybeTlsStream` / `server_name_for` are reused verbatim; the rustls trio
+# is the workspace's pinned `ring` feature set (one crypto backend, ADR
+# 0064 Decision 5) — nothing new enters `Cargo.lock`.
+animus-env = { workspace = true, features = ["prod"] }
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pki-types.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# Throwaway CA + leaf for the TLS tests (workspace dev-dep, as animusd's
+# own `tests/support::tls_pki` uses it).
+rcgen.workspace = true

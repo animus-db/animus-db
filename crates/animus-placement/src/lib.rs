@@ -115,6 +115,52 @@ impl PlacementPolicy {
     }
 }
 
+/// The well-known Kubernetes label key naming a node's region (G-01 stage G-a).
+pub const REGION_LABEL: &str = "topology.kubernetes.io/region";
+
+/// The well-known Kubernetes label key naming a node's zone, and the default
+/// failure-domain key [`zone_spread_policy`] spreads over (G-01 stage G-a).
+pub const ZONE_LABEL: &str = "topology.kubernetes.io/zone";
+
+/// The default table placement policy: `replication_factor` replicas,
+/// **best-effort spread** over [`ZONE_LABEL`] iff the live membership (`members`'
+/// label maps) can actually honour it, otherwise [`PlacementPolicy::simple`].
+///
+/// "Can honour" means **every** member carries a non-empty zone value (a
+/// spread policy excludes a node lacking the domain label from placement
+/// entirely — see [`SpreadPolicy::domain`] — so installing one on a
+/// partially-labelled cluster would silently shrink the candidate pool) and
+/// there are at least `replication_factor` distinct zone values. The spread is
+/// best-effort (`strict: false`), so after a whole zone is lost the repair pass
+/// may double up in a surviving zone rather than refuse to heal.
+///
+/// Evaluated once, against the membership at table-creation time: a cluster
+/// that gains zones later does not retro-upgrade existing tables' policies.
+pub fn zone_spread_policy<'a>(
+    name: impl Into<String>,
+    replication_factor: usize,
+    members: impl IntoIterator<Item = &'a BTreeMap<String, String>>,
+) -> PlacementPolicy {
+    let mut zones: BTreeSet<&str> = BTreeSet::new();
+    let mut all_labelled = true;
+    let mut any = false;
+    for labels in members {
+        any = true;
+        match labels.get(ZONE_LABEL).map(String::as_str) {
+            Some(z) if !z.is_empty() => {
+                zones.insert(z);
+            }
+            _ => all_labelled = false,
+        }
+    }
+    let policy = PlacementPolicy::simple(name, replication_factor);
+    if any && all_labelled && zones.len() >= replication_factor && replication_factor > 1 {
+        policy.spread_across(ZONE_LABEL, false)
+    } else {
+        policy
+    }
+}
+
 /// Why a satisfying replica set could not be chosen.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PlacementError {

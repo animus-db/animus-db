@@ -43,6 +43,7 @@ fn role_addrs(tls: Option<TlsSection>) -> RoleAddrs {
         advertise_host: None,
         tls,
         encryption_key_path: None,
+        labels: Default::default(),
         overload: None,
     }
 }
@@ -71,6 +72,7 @@ async fn start_node(dir: &Path, tls: Option<TlsSection>) -> Node {
             advertise_host: None,
             tls,
             encryption_key_path: None,
+            labels: Default::default(),
             overload: None,
         }],
         dynamo_auth: None,

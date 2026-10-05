@@ -599,6 +599,39 @@ pub struct AnimusClusterSpec {
     /// nothing else about the pod template would otherwise change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption_key_secret_name: Option<String>,
+    /// Topology-aware scheduling (G-01 stage G-a, ADR 0060's 2026-10-04
+    /// amendment). `None` (default) is [`TopologySpec::default`]: the
+    /// `StatefulSet` carries a zone `topologySpreadConstraints` entry and a
+    /// preferred hostname pod anti-affinity. Node region/zone label
+    /// resolution (the operator patching each scheduled pod's node labels
+    /// onto the pod as annotations, projected to `--labels-file`) is **not**
+    /// controlled by this field: it is always on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topology: Option<TopologySpec>,
+}
+
+/// `spec.topology` (G-01 stage G-a).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TopologySpec {
+    /// Emit the pod `topologySpreadConstraints` (zone, `maxSkew: 1`,
+    /// `whenUnsatisfiable: ScheduleAnyway`) and the preferred hostname pod
+    /// anti-affinity. Default `true`; `false` leaves scheduling entirely to
+    /// the cluster's defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spread: Option<bool>,
+}
+
+impl AnimusClusterSpec {
+    /// Whether the generated `StatefulSet` carries topology spread /
+    /// anti-affinity scheduling hints (default on).
+    #[must_use]
+    pub fn topology_spread_enabled(&self) -> bool {
+        self.topology
+            .as_ref()
+            .and_then(|t| t.spread)
+            .unwrap_or(true)
+    }
 }
 
 impl Default for AnimusClusterSpec {
@@ -623,6 +656,7 @@ impl Default for AnimusClusterSpec {
             backup_store: None,
             segment_store: None,
             encryption_key_secret_name: None,
+            topology: None,
         }
     }
 }

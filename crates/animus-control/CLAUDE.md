@@ -3082,6 +3082,19 @@ rounds while the apply task is behind.
 
 **Upgrade-harness class (ADR 0073 P1-D):** `control-wal`/`shared-wal` are whole-file `TABLE` entries in `animus-test`'s transcode table (a bump edits that entry; legacy encoders must be `pub` + `legacy-encoders`-gated); `control-snapshot`, `metadata`, `mirror-version` and `mirror-entities` are `EMBEDDED` (a bump edits their carrier's transcode).
 
+## G-01 stage G-a: `RegisterNode` label fill-in (2026-10-04)
+
+`RegisterNode`'s apply still never overwrites a *non-empty* member label set,
+but now fills in an already-present member row whose labels are *empty*
+(`fill_empty_labels`; status/`has_activated` untouched), on both the
+unclaimed-address and the idempotent same-addresses arms. Reason: bootstrap's
+`UpsertMember { labels: {} }` can beat the node's own registration, and no
+relayable command can repair the row afterwards. Changing non-empty labels is
+unsupported (would need a new non-relayable command). See ADR 0005's
+2026-10-04 amendment.
+
+- `Metadata::apply(UpsertMember)` keeps an existing non-empty label set when the incoming one is empty (status-only proposers like the detector build from stale reads that can predate a `RegisterNode` label fill-in); see `docs/lessons/testing/2026-10-04-status-only-upsert-built-from-a-stale-read-wipes-fields.md`.
+
 ## Fuzzing (roadmap R-01 (c))
 
 The control WAL / shared WAL / snapshot image / `Metadata::from_json` / syskv key decoders are the `control_formats` fuzz target. The line-framed formats carry a CRC, so the target re-stamps CRCs (`fix_line_crcs`) to reach the payload decoders. `mirror::apply_key_write` still `.expect`s on a corrupt mirrored value (node-local data, by design) and is deliberately not fuzzed. See `fuzz/README.md` (stable smoke: `cd fuzz && cargo test --release --test smoke`).

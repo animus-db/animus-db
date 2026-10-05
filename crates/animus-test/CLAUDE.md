@@ -1349,6 +1349,19 @@ bucket lifecycle rule reaps it) -- documented, not injected.
   (a fault enabled before a multi-step setup sequence finishes can corrupt
   the setup itself, not just the operation under test).
 
+## `soak` (R-01 (a), `docs/soak.md`)
+
+`src/soak.rs` is the pure resource-trend detector the real-process soak
+(`animusd` `tests/soak.rs`) uses: `evaluate(samples, &TrendConfig)` drops a
+warm-up, cuts the rest into equal windows, takes per-window medians (robust to
+a compaction sawtooth shorter than a window) and reports `Growing` for a new
+high in the last window (rule A) or a steady climb (rule B), `Bounded`
+otherwise, `Insufficient` when a window is too thin (never a failure). No I/O,
+no clock: deterministic from the samples. **Gotcha**: tolerances are relative
+to the *first window's median*, so size test series so a genuine leak exceeds
+`rel_tol` over the span (a leak of a few percent per day is, by design, below
+a 10% tolerance); `parse_duration` reads the `ANIMUS_SOAK_DURATION` syntax.
+
 ## Disk-full (ENOSPC) corpus (R-01 (d), issue #1185)
 
 `tests/it/raftkv_linearizable.rs` has a dedicated ENOSPC family. The earlier

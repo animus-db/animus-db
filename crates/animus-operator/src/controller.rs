@@ -14,6 +14,7 @@
 //! no DNS record, nothing an orphaned finalizer could leak) and it keeps a
 //! stuck-finalizer failure mode out of a v1 operator entirely.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,6 +47,10 @@ use crate::validate;
 /// ([`crate::cluster_api::RealClusterApi`]'s own `PatchParams::apply`).
 pub const FIELD_MANAGER: &str = "animus-operator";
 /// Requeue interval after a clean reconcile.
+/// Requeue while some pod's node topology is not resolved yet (unscheduled
+/// pod) — short, since `animusd` is waiting on it (G-01 stage G-a).
+const REQUEUE_TOPOLOGY_PENDING: Duration = Duration::from_secs(3);
+
 const REQUEUE_OK: Duration = Duration::from_secs(30);
 /// Requeue interval after a reconcile error (kube's `Controller` also
 /// backs this off internally, but a fixed floor keeps a persistently
@@ -1368,7 +1373,56 @@ async fn finish_reconcile<C: ClusterApi, A: AdminOps>(
         .patch_cluster_status(ns, &name, &status)
         .await?;
 
-    Ok(Action::requeue(REQUEUE_OK))
+    // G-01 stage G-a: resolve each scheduled pod's node topology onto the
+    // pod's annotations. Best effort — a failure (e.g. an operator upgraded
+    // without the new `nodes`/`pods patch` RBAC) must never block the rest of
+    // the reconcile; `animusd` times out its own wait and starts unlabelled.
+    match resolve_pod_topology(&ctx.cluster_api, &name, ns).await {
+        Ok(0) => Ok(Action::requeue(REQUEUE_OK)),
+        Ok(_pending) => Ok(Action::requeue(REQUEUE_TOPOLOGY_PENDING)),
+        Err(e) => {
+            tracing::warn!(cluster = %name, error = %e, "resolving pod node topology failed");
+            Ok(Action::requeue(REQUEUE_ERR))
+        }
+    }
+}
+
+/// For every pod of cluster `name`: if scheduled, read its node's labels and
+/// patch the topology annotations ([`desired::topology::pod_annotation_patch`])
+/// that `animusd` reads back through the downward API. Returns how many pods
+/// are still *unresolved* (unscheduled, or their node unreadable) so the
+/// caller can requeue quickly.
+async fn resolve_pod_topology<C: ClusterApi>(
+    cluster_api: &C,
+    name: &str,
+    ns: &str,
+) -> Result<usize, ReconcileError> {
+    let pods = cluster_api
+        .list_pods(ns, &desired::selector_labels(name))
+        .await?;
+    let mut node_cache: BTreeMap<String, Option<BTreeMap<String, String>>> = BTreeMap::new();
+    let mut pending = 0usize;
+    for pod in &pods {
+        let Some(node) = desired::topology::node_name(pod) else {
+            pending += 1;
+            continue;
+        };
+        if !node_cache.contains_key(node) {
+            let labels = cluster_api.get_node_labels(node).await?;
+            node_cache.insert(node.to_string(), labels);
+        }
+        let labels = node_cache[node].as_ref();
+        if labels.is_none() {
+            pending += 1;
+            continue;
+        }
+        if let Some(patch) = desired::topology::pod_annotation_patch(pod, labels) {
+            cluster_api
+                .patch_pod_annotations(ns, &pod.name_any(), &patch)
+                .await?;
+        }
+    }
+    Ok(pending)
 }
 
 fn error_policy<C: ClusterApi, A: AdminOps>(
@@ -1488,6 +1542,59 @@ mod tests {
             desired::cluster_config::to_json(&config),
         )]));
         cm
+    }
+
+    // --- G-01 stage G-a: pod node-topology resolution ---------------------
+
+    fn topo_pod(name: &str, node: Option<&str>) -> k8s_openapi::api::core::v1::Pod {
+        let mut pod = k8s_openapi::api::core::v1::Pod::default();
+        pod.metadata.name = Some(name.to_string());
+        pod.spec = Some(k8s_openapi::api::core::v1::PodSpec {
+            node_name: node.map(str::to_string),
+            ..Default::default()
+        });
+        pod
+    }
+
+    #[tokio::test]
+    async fn reconcile_annotates_scheduled_pods_with_their_nodes_topology() {
+        let cluster = Arc::new(test_cluster("demo", "ns1", 3, None));
+        let fake = FakeClusterApi::new();
+        fake.seed_pod(topo_pod("demo-0", Some("node-a")));
+        fake.seed_pod(topo_pod("demo-1", Some("node-b")));
+        fake.seed_pod(topo_pod("demo-2", None));
+        fake.seed_node_labels(
+            "node-a",
+            &[
+                ("topology.kubernetes.io/region", "r1"),
+                ("topology.kubernetes.io/zone", "r1-a"),
+            ],
+        );
+        fake.seed_node_labels("node-b", &[]);
+        let ctx = make_ctx(fake, FakeAdminClient::new());
+
+        let action = reconcile(Arc::clone(&cluster), Arc::clone(&ctx))
+            .await
+            .expect("reconcile succeeds");
+        assert_eq!(
+            action,
+            Action::requeue(REQUEUE_TOPOLOGY_PENDING),
+            "an unscheduled pod requeues quickly"
+        );
+        let patches = ctx.cluster_api.pod_patches();
+        assert_eq!(patches.len(), 2, "{patches:?}");
+        let a = &patches.iter().find(|(n, _)| n == "demo-0").unwrap().1;
+        assert_eq!(a["animus.io/topology-zone"], "r1-a");
+        assert_eq!(a["animus.io/topology-region"], "r1");
+        assert_eq!(a["animus.io/topology-resolved"], "true");
+        let b = &patches.iter().find(|(n, _)| n == "demo-1").unwrap().1;
+        assert_eq!(b.len(), 1, "unlabelled node: marker only");
+
+        // Second reconcile: scheduled pods are left alone (idempotent).
+        let _ = reconcile(Arc::clone(&cluster), Arc::clone(&ctx))
+            .await
+            .unwrap();
+        assert_eq!(ctx.cluster_api.pod_patches().len(), 2);
     }
 
     // --- (1) a fresh cluster reconcile creates the expected children -----

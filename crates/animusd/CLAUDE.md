@@ -11987,6 +11987,23 @@ bump) need no change here: they land as one `transcode::TABLE` entry and the
 cells grow with `transcode::supported_back()`.
 
 
+## G-01 stage G-a: node labels and the zone-spread default (2026-10-04)
+
+- `RoleAddrs::labels` (additive, skip-if-empty) is each node's topology labels;
+  `Bound{,Control,Data}Node` keep them and pass them to `register_node` /
+  `admin_add_member`. Inputs and merge order: `node_labels::LabelFlags`
+  (`--label`, `--labels-file`, `--labels-file-annotations`,
+  `--labels-wait-secs`; flag > file > config). `--cluster N` rejects them.
+  `node_labels.rs` is process-boundary startup code (real `std::fs` and a real
+  bounded wait) and deliberately not a `#[deny(disallowed_methods)]` module.
+- `schema.rs::default_table_policy` / `zone_aware_initial_replicas`: the
+  zone-spread policy decision at table creation (see
+  `animus_placement::zone_spread_policy`). Computed once at creation.
+- `sim_cluster_zone_placement.rs` (`ANIMUS_ZONE_PLACEMENT_SEEDS`,
+  `SimCluster::new_with_node_labels`): 6 nodes / 3 zones, RF 3, wire
+  `CreateTable`, zone kill. Negative-controlled: disabling the zone-aware
+  initial pick fails it at placement.
+
 ## Observability kit and the metrics-exist check (R-01 (f))
 
 `deploy/observability/` (alert + recording rules, Grafana dashboard, SLO
@@ -12043,6 +12060,24 @@ fed into emitters); `Release(N-1) -> Release(N)` cells over real gates.
 **Gotcha**: the member-down cell crashes a node the shared client loop keeps
 routing 1/4 of its ops to (each stalls for the wire timeout), so acks *during* its
 roll are legitimately sparse; non-vacuity there is asserted after the era.
+
+## Real-process soak (R-01 (a), `docs/soak.md`)
+
+`tests/soak.rs` (opt-in `soak` cargo feature, like `chaos`) runs the chaos
+harness's cluster/workload/oracle machinery (`tests/chaos_support/`) with no
+faults for hours or days, in **epochs**: each epoch has a fresh key range
+(`Shared::with_base`'s `key_base`), is verified (final reads through two nodes,
+the three oracles plus eventual-prefix and txn-atomicity) and its history is
+dropped; the previous epoch and epoch 0 are re-read as cold data; keys two
+epochs old are deleted so live data stays bounded. Per-node RSS/threads/fds
+(`/proc/<pid>`), data-dir/WAL bytes, `sst-*` file count and the
+`demux_*`/`spawned_task_handles_tracked` gauges feed
+`animus_test::soak::evaluate`. **Gotchas**: `chaos_support` is `mod`-included by
+both targets, so a helper only one uses needs `#[allow(dead_code)]` (clippy
+`-D warnings` over `--all-features` builds both); `ChaosCluster::pid`/
+`data_dir` exist for the soak; the soak never arms the proxy faults, so a
+`[node-exit]` or `[node-panic]` there is always a finding; node logs are not
+rotated, so a multi-day run needs disk for them.
 
 ## StorageFull on the client path and in `/admin/health` (R-01 (d), issue #1185)
 

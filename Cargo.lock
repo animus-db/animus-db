@@ -51,14 +51,19 @@ name = "animus-bench"
 version = "0.1.0-alpha.0"
 dependencies = [
  "animus-dynamo",
+ "animus-env",
  "animusd",
  "hdrhistogram",
  "rand 0.8.8",
  "rand_chacha 0.3.1",
+ "rcgen",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]
@@ -312,6 +317,7 @@ dependencies = [
  "animus-env",
  "animus-item",
  "animus-node",
+ "animus-placement",
  "animus-s3",
  "animus-sim",
  "animus-storage",

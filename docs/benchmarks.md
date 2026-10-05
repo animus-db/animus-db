@@ -59,8 +59,16 @@ every endpoint is a loopback address is also marked colocated.
 2. Start a **three-node cluster at RF 3** as the baseline. Run a second
    measurement against a larger cluster (the **scale-out point**) with the
    same workload.
-3. Leave **TLS off** on the client and admin ports. The generator has no TLS
-   client; the results file records `tls: false`.
+3. TLS is optional. To benchmark a cluster running server-only TLS on the
+   `dynamo` and `admin` ports (ADR 0064), pass `--tls-ca PATH` (the CA that
+   signed the nodes' certificates; add `--tls-server-name NAME` if the
+   certificates carry a DNS SAN rather than an IP SAN, since endpoints are
+   addresses). The client presents no certificate. The results file records
+   `tls: true`. The TLS handshake happens when a connection is set up, before
+   each phase starts (the connection pool is pre-dialled), never inside a
+   measured operation; only a redial after a broken connection pays it, as a
+   TCP connect always did. State TLS-on or TLS-off next to any number you
+   publish: they are different measurements.
 4. Configure the cluster with SigV4 (`--dynamo-auth`; ADR 0057/0066) and pass
    the same credentials with `--access-key/--secret-key` (or
    `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`). `--no-auth` skips signing;
@@ -113,6 +121,8 @@ processes|in-process` (+ `--cluster-size N` (3), `--animusd-bin PATH`,
 `--animusd-arg ARG` repeatable for extra `animusd` flags such as
 `--animusd-arg --no-shared-wal`, `--data-dir DIR`).
 
+**TLS:** `--tls-ca PATH` [`--tls-server-name NAME`] for `--nodes`; `--tls-ca
+PATH --tls-cert PATH --tls-key PATH` for `--launch`.
 **Auth:** `--access-key`/`--secret-key` (or the `AWS_*` env vars); `--no-auth`.
 A launched cluster signs with a built-in default credential unless `--no-auth`.
 
@@ -206,7 +216,7 @@ Top level:
 | `args` | the exact command line |
 | `seed` | seeds the op/key stream |
 | `publishable`, `publishable_reason` | `true` only if the servers are off the generator's host (not bench-launched, not all-loopback) **and** a degraded run whose fault was actually injected is in the report; otherwise `false` with every unmet condition listed. Necessary, not sufficient; see below |
-| `environment` | `client_host` (hostname, kernel, cpu_model, cpu_count, memory_total_kb), `client_and_server_colocated`, `launch_mode` (`external`/`processes`/`in-process`), `target_endpoints`, `node_count`, `sigv4`, `tls` (always `false`) and `tls_note` |
+| `environment` | `client_host` (hostname, kernel, cpu_model, cpu_count, memory_total_kb), `client_and_server_colocated`, `launch_mode` (`external`/`processes`/`in-process`), `target_endpoints`, `node_count`, `sigv4`, `tls` (`true` when the DynamoDB and admin ports were dialled over TLS) and `tls_note` (mode, server name verified, when the handshake happens) |
 | `methodology` | fixed disclosures: load model, latency definition, histogram, error handling, phases, retries (none), comparison (none) |
 | `topology_start`, `topology_end` | what `/admin` reports before and after: node count, per-node `auth_enabled`/`quiesce_after_ms`/auto-split and throttle thresholds, membership, `encryption_at_rest`, `shared_wal`, `tls` |
 | `notes` | anything skipped or not possible, e.g. no degraded run |
@@ -350,8 +360,11 @@ by this same open-loop generator.
   yet".
 - **The multi-host external topology has never been run** (only
   in-process/processes clusters have).
-- **No TLS client**, so TLS-on performance cannot be measured. The results
-  record `tls: false`.
+- **TLS is server-only.** Mutual TLS on the DynamoDB port is not supported (the
+  server does not ask for a client certificate there). `--launch
+  processes|in-process` serve TLS only with `--tls-cert/--tls-key/--tls-ca`
+  (one shared leaf certificate, SAN `127.0.0.1`); like every launched
+  cluster these are colocated and non-publishable.
 - **Encryption at rest and `--shared-wal`** are not reported by `/admin`, so an
   external run records them as unknown.
 - **No server-side hardware capture**, and no single command that runs the whole
@@ -359,7 +372,8 @@ by this same open-loop generator.
   kill).
 - **No dedicated regression runner**; the A/B workflow is manual.
 - **Not measured at all:** cross-partition `Scan`, transactions, batch
-  operations, secondary indexes, Streams/TTL/backup overhead, TLS and
-  encryption-at-rest overhead. The library API (`animus_bench::{engine,
+  operations, secondary indexes, Streams/TTL/backup overhead and
+  encryption-at-rest overhead (TLS-on is now measurable, but no TLS-on versus
+  TLS-off comparison has been published). The library API (`animus_bench::{engine,
   scenario, report, cluster}`) is the extension point; C-17 builds scale
   scenarios on it.

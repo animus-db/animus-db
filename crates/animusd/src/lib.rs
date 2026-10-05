@@ -34,6 +34,7 @@ pub mod config;
 #[deny(clippy::disallowed_methods)]
 mod index_drain;
 mod min_tablets;
+pub mod node_labels;
 pub mod otel;
 pub use config::{ClusterConfig, DynamoAuthConfig};
 // Re-exported so callers (CLI, tests, operators) can inspect a node's cached
@@ -2943,6 +2944,17 @@ pub struct RoleAddrs {
     /// loaded and handed to `ProdEnv::bind_with_tls_and_key`.
     #[serde(default)]
     pub encryption_key_path: Option<String>,
+    /// This node's topology labels (G-01 stage G-a) — e.g.
+    /// `topology.kubernetes.io/zone`. Passed to the node's own
+    /// `register_node`/`admin_add_member` self-registration, so they land in
+    /// replicated `Metadata::members[*].labels` where the placement engine's
+    /// residency/spread policies read them. **Fixed at first registration**:
+    /// `Metadata`'s `RegisterNode`/`admin_add_member` never overwrite an
+    /// existing member row's labels (see ADR 0005's 2026-10-04 amendment).
+    /// Empty (every pre-G-a config, `#[serde(default)]`, skipped on
+    /// serialize so existing config bytes are unchanged) registers none.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
     /// This node's resource bounds / overload limits (R-01 (d), ADR 0074
     /// §2) — `None` (every pre-existing config) means every default, see
     /// [`config::OverloadSection`]. Not serialized when absent, so existing
@@ -3020,6 +3032,10 @@ pub struct BoundNode {
     /// [`Node::bind`] was given — see [`advertised_addr`] and
     /// [`RoleAddrs::advertise_host`]'s own doc.
     advertise_host: Option<String>,
+    /// This node's own topology labels, from [`RoleAddrs::labels`] — handed
+    /// to its self-registration (`spawn_common_tail`'s `register_node`, a
+    /// growth node's `admin_add_member`).
+    labels: BTreeMap<String, String>,
     /// This node's TLS material (ADR 0064, S-01 commit 2), loaded once at
     /// bind time from `RoleAddrs::tls` — `None` is plain TCP on every port.
     tls: Option<TlsMaterial>,
@@ -5345,7 +5361,7 @@ fn spawn_common_tail(
     admin_info: Arc<AdminInfo>,
     client_route: BTreeMap<NodeId, String>,
     intra_route: BTreeMap<NodeId, String>,
-    self_addrs: (NodeId, NodeAddrs),
+    self_addrs: (NodeId, NodeAddrs, BTreeMap<String, String>),
     // `Arc`-wrapped (issue #1060) — see [`BoundNode::client_listener`]'s own
     // doc for why; `serve_requests` below takes the same type.
     client_listener: Arc<TcpListener>,
@@ -5476,16 +5492,16 @@ fn spawn_common_tail(
     // already owns) and a growth node with no other claim path at all (e.g.
     // a control-only permanently-non-voter — `BoundControlNode::
     // start_control_with` has no `admin_add_member` call of its own; this is
-    // its *only* claim). No labels here (this is a bare identity/address
-    // claim, not an operator-labeled add) — `admin_add_member`/
-    // `admin_add_control_member` are where real labels are set, and
-    // `RegisterNode`'s apply never overwrites an already-`members`-present
-    // entry's labels, so this can never clobber them.
+    // its *only* claim). Carries this node's own topology labels (G-01 stage
+    // G-a, `RoleAddrs::labels`; empty unless configured). `RegisterNode`'s apply
+    // never overwrites a non-empty label set, and only *fills in* an unlabelled
+    // already-present row — which closes the race where `bootstrap`'s
+    // `UpsertMember{labels: {}}` lands before this registration.
     {
         let ctx = ctx.clone();
-        let (node, addrs) = self_addrs;
+        let (node, addrs, labels) = self_addrs;
         tasks.push(tokio::spawn(async move {
-            let _ = ctx.register_node(node, addrs, BTreeMap::new()).await;
+            let _ = ctx.register_node(node, addrs, labels).await;
         }));
     }
     // The two client-protocol listeners (ADR 0047): one parameterized
@@ -6222,6 +6238,7 @@ impl BoundNode {
                     intra: advertised_addr(self.advertise_host.as_deref(), my_intra_addr),
                     role: "combined".to_string(),
                 },
+                self.labels.clone(),
             ),
             self.client_listener,
             self.admin_listener,
@@ -6479,8 +6496,9 @@ impl BoundNode {
             {
                 let ctx = ctx.clone();
                 let node = my_id;
+                let labels = self.labels.clone();
                 tasks.push(tokio::spawn(async move {
-                    let _ = ctx.admin_add_member(node, BTreeMap::new()).await;
+                    let _ = ctx.admin_add_member(node, labels).await;
                 }));
             }
         }
@@ -6865,6 +6883,7 @@ impl Node {
             console_listener,
             console_addr,
             advertise_host: addrs.advertise_host,
+            labels: addrs.labels,
             tls,
             encryption_key,
             overload: addrs.overload,
@@ -6928,6 +6947,7 @@ impl Node {
             intra_listener,
             intra_addr,
             advertise_host: addrs.advertise_host,
+            labels: addrs.labels,
             tls,
             encryption_key,
             overload: addrs.overload,
@@ -7000,6 +7020,7 @@ impl Node {
             console_listener,
             console_addr,
             advertise_host: addrs.advertise_host,
+            labels: addrs.labels,
             tls,
             encryption_key,
             overload: addrs.overload,
@@ -7546,6 +7567,8 @@ pub struct BoundControlNode {
     intra_addr: SocketAddr,
     /// See [`BoundNode::advertise_host`]'s doc.
     advertise_host: Option<String>,
+    /// See [`BoundNode::labels`]'s doc.
+    labels: BTreeMap<String, String>,
     /// This node's TLS material (ADR 0064, S-01 commit 2), loaded once at
     /// bind time from `RoleAddrs::tls` — `None` is plain TCP on every port.
     tls: Option<TlsMaterial>,
@@ -7829,6 +7852,7 @@ impl BoundControlNode {
                     intra: advertised_addr(self.advertise_host.as_deref(), self.intra_addr),
                     role: "control".to_string(),
                 },
+                self.labels.clone(),
             ),
             self.client_listener,
             self.admin_listener,
@@ -7989,6 +8013,8 @@ pub struct BoundDataNode {
     console_addr: SocketAddr,
     /// See [`BoundNode::advertise_host`]'s doc.
     advertise_host: Option<String>,
+    /// See [`BoundNode::labels`]'s doc.
+    labels: BTreeMap<String, String>,
     /// This node's TLS material (ADR 0064, S-01 commit 2), loaded once at
     /// bind time from `RoleAddrs::tls` — `None` is plain TCP on every port.
     tls: Option<TlsMaterial>,
@@ -8355,6 +8381,7 @@ impl BoundDataNode {
                     intra: advertised_addr(self.advertise_host.as_deref(), my_intra_addr),
                     role: "data".to_string(),
                 },
+                self.labels.clone(),
             ),
             self.client_listener,
             self.admin_listener,
@@ -8525,8 +8552,9 @@ impl BoundDataNode {
         {
             let ctx = ctx.clone();
             let node = my_id;
+            let labels = self.labels.clone();
             tasks.push(tokio::spawn(async move {
-                let _ = ctx.admin_add_member(node, BTreeMap::new()).await;
+                let _ = ctx.admin_add_member(node, labels).await;
             }));
         }
 
@@ -15719,6 +15747,7 @@ pub async fn bind_cluster_with_advertise_host_and_key(
             advertise_host: advertise_host.clone(),
             tls: None,
             encryption_key_path: encryption_key_path.clone(),
+            labels: Default::default(),
             overload: None,
         };
         let node = Node::bind(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?;
@@ -16324,6 +16353,7 @@ pub async fn start_split_cluster_with_growth(
             advertise_host: None,
             tls: None,
             encryption_key_path: None,
+            labels: Default::default(),
             overload: None,
         };
         control_bound.push(
@@ -16344,6 +16374,7 @@ pub async fn start_split_cluster_with_growth(
             advertise_host: None,
             tls: None,
             encryption_key_path: None,
+            labels: Default::default(),
             overload: None,
         };
         data_bound
@@ -19061,6 +19092,7 @@ mod confirm_futility_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                labels: Default::default(),
                 overload: None,
             }],
             dynamo_auth: None,
@@ -19302,6 +19334,7 @@ mod forward_transport_failure_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                labels: Default::default(),
                 overload: None,
             })
             .collect();
@@ -19686,6 +19719,7 @@ mod forward_hop_timeout_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                labels: Default::default(),
                 overload: None,
             })
             .collect();
@@ -20516,6 +20550,7 @@ mod client_cancellation_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                labels: Default::default(),
                 overload: None,
             })
             .collect();
@@ -20881,6 +20916,7 @@ mod halted_shutdown_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                labels: Default::default(),
                 overload: None,
             }],
             dynamo_auth: None,
@@ -22185,6 +22221,10 @@ mod sim_cluster_throttle;
 /// `ANIMUS_UPGRADE_RESTART_SEEDS` (shared with tier 1). See that module's doc.
 #[cfg(test)]
 mod sim_cluster_upgrade_corpus;
+/// G-01 stage G-a: zone-labelled placement + whole-zone loss over `SimCluster`
+/// (`ANIMUS_ZONE_PLACEMENT_SEEDS`) — see that module's own doc.
+#[cfg(test)]
+mod sim_cluster_zone_placement;
 
 /// A first deterministic smoke over `SimClusterHandle::dynamo`/`SimCluster::
 /// dynamo` (ADR 0061 rung D2 PR 1) — the DynamoDB wire edge, decoded by
@@ -23012,6 +23052,7 @@ mod issue_298_conflict_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                labels: Default::default(),
                 overload: None,
                 console: addrs[5],
             }],

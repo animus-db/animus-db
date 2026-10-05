@@ -267,7 +267,7 @@ pub async fn create_table(
     while clock.now_ns() < limit {
         let addr = endpoints[i % endpoints.len()];
         i += 1;
-        let Ok(mut conn) = Conn::connect(addr, cluster.credentials()).await else {
+        let Ok(mut conn) = Conn::connect(addr, cluster.credentials(), cluster.tls()).await else {
             last = format!("connect {addr} failed");
             rt::sleep(Duration::from_millis(100)).await;
             continue;
@@ -302,7 +302,7 @@ pub async fn create_table(
 /// Best-effort `DeleteTable` (cleanup; failures are ignored).
 pub async fn drop_table(cluster: &Cluster, table: &str) {
     for addr in cluster.dynamo_endpoints() {
-        if let Ok(mut c) = Conn::connect(addr, cluster.credentials()).await
+        if let Ok(mut c) = Conn::connect(addr, cluster.credentials(), cluster.tls()).await
             && let Ok(r) = c
                 .call("DeleteTable", &json!({"TableName": table}).to_string())
                 .await
@@ -347,7 +347,11 @@ pub async fn load_table(
     let mut tasks = Vec::new();
     for w in 0..parallelism.max(1) {
         let (next, retried, table) = (next.clone(), retried.clone(), table.to_owned());
-        let (creds, endpoints) = (cluster.credentials(), endpoints.clone());
+        let (creds, endpoints, tls) = (
+            cluster.credentials(),
+            endpoints.clone(),
+            cluster.tls().cloned(),
+        );
         tasks.push(rt::spawn(async move {
             let mut conn: Option<Conn> = None;
             let mut cursor = w;
@@ -366,9 +370,13 @@ pub async fn load_table(
                 let mut first = true;
                 loop {
                     if conn.as_ref().is_none_or(Conn::is_broken) {
-                        conn = Conn::connect(endpoints[cursor % endpoints.len()], creds.clone())
-                            .await
-                            .ok();
+                        conn = Conn::connect(
+                            endpoints[cursor % endpoints.len()],
+                            creds.clone(),
+                            tls.as_ref(),
+                        )
+                        .await
+                        .ok();
                         cursor += 1;
                     }
                     let mut last = String::from("no connection");

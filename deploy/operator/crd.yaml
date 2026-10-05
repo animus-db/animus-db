@@ -432,6 +432,26 @@ spec:
                     nullable: true
                     type: string
                 type: object
+              topology:
+                description: |-
+                  Topology-aware scheduling (G-01 stage G-a, ADR 0060's 2026-10-04
+                  amendment). `None` (default) is [`TopologySpec::default`]: the
+                  `StatefulSet` carries a zone `topologySpreadConstraints` entry and a
+                  preferred hostname pod anti-affinity. Node region/zone label
+                  resolution (the operator patching each scheduled pod's node labels
+                  onto the pod as annotations, projected to `--labels-file`) is **not**
+                  controlled by this field: it is always on.
+                nullable: true
+                properties:
+                  spread:
+                    description: |-
+                      Emit the pod `topologySpreadConstraints` (zone, `maxSkew: 1`,
+                      `whenUnsatisfiable: ScheduleAnyway`) and the preferred hostname pod
+                      anti-affinity. Default `true`; `false` leaves scheduling entirely to
+                      the cluster's defaults.
+                    nullable: true
+                    type: boolean
+                type: object
             required:
             - nodes
             - schemaVersion

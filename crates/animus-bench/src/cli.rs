@@ -9,12 +9,13 @@ use std::time::Duration;
 use serde_json::json;
 
 use crate::client::Credentials;
-use crate::cluster::{Cluster, NodeEndpoints};
+use crate::cluster::{Cluster, LaunchTls, NodeEndpoints};
 use crate::dist::Distribution;
 use crate::envinfo::{self, HostInfo};
 use crate::report::{Environment, Report, SCHEMA, publishability};
 use crate::rt::{self, Clock};
 use crate::scenario::{DegradedConfig, DegradedKind, PhasePlan, ReadModes, YcsbConfig, run_ycsb};
+use crate::tls::TlsClient;
 use crate::workload::WorkloadKind;
 
 /// Usage text.
@@ -33,6 +34,14 @@ cluster (pick one):
 auth:
   --access-key ID --secret-key SECRET   SigV4 credentials (or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY)
   --no-auth                   do not sign (launched clusters sign by default)
+tls (server-only, ADR 0064; the client presents no certificate):
+  --tls-ca PATH               dial the DynamoDB and admin ports over TLS, verifying each node
+                              against this CA (PEM). Without it the client speaks plain TCP.
+  --tls-server-name NAME      verify every node against NAME instead of its IP address (use when
+                              the node certificates carry a DNS SAN rather than an IP SAN)
+  --tls-cert PATH --tls-key PATH   launch modes only: serve TLS from the launched nodes with this
+                              leaf cert/key (SAN must cover 127.0.0.1 or --tls-server-name);
+                              requires --tls-ca (also the nodes' mutual-TLS CA)
 workload:
   --workloads A,B,..|all      (default A)
   --records N                 records loaded per table (default 10000)
@@ -82,10 +91,22 @@ pub struct Options {
     pub animusd_args: Vec<String>,
     pub data_dir: Option<PathBuf>,
     pub creds: Option<Credentials>,
+    pub tls: Option<TlsOptions>,
     pub ycsb: YcsbConfig,
     pub kill_cmd: Option<String>,
     pub restart_cmd: Option<String>,
     pub out: PathBuf,
+}
+
+/// The `--tls-*` flags (paths are read at [`execute`] time, so parsing stays
+/// pure).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TlsOptions {
+    /// CA the client trusts (and, for launched nodes, the mutual-TLS CA).
+    pub ca: PathBuf,
+    pub server_name: Option<String>,
+    /// Launch modes only: the nodes' leaf certificate and key.
+    pub node_cert: Option<(PathBuf, PathBuf)>,
 }
 
 fn secs(s: &str, flag: &str) -> Result<Duration, String> {
@@ -152,6 +173,8 @@ pub fn parse_args(args: &[String]) -> Result<Options, String> {
         Duration::from_secs(20),
     );
     let (mut kill_cmd, mut restart_cmd, mut no_restart) = (None, None, false);
+    let (mut tls_ca, mut tls_name): (Option<PathBuf>, Option<String>) = (None, None);
+    let (mut tls_cert, mut tls_key): (Option<PathBuf>, Option<PathBuf>) = (None, None);
     let mut out: Option<PathBuf> = None;
     let mut table_prefix = format!("ycsb{epoch}");
     let mut keep_tables = false;
@@ -182,6 +205,10 @@ pub fn parse_args(args: &[String]) -> Result<Options, String> {
             "--access-key" => access = Some(val(flag)?),
             "--secret-key" => secret = Some(val(flag)?),
             "--no-auth" => no_auth = true,
+            "--tls-ca" => tls_ca = Some(PathBuf::from(val(flag)?)),
+            "--tls-server-name" => tls_name = Some(val(flag)?),
+            "--tls-cert" => tls_cert = Some(PathBuf::from(val(flag)?)),
+            "--tls-key" => tls_key = Some(PathBuf::from(val(flag)?)),
             "--workloads" => {
                 let v = val(flag)?;
                 workloads = if v.eq_ignore_ascii_case("all") {
@@ -250,6 +277,35 @@ pub fn parse_args(args: &[String]) -> Result<Options, String> {
         },
         _ => return Err("--access-key and --secret-key go together".into()),
     };
+    let tls = match (tls_ca, tls_cert, tls_key) {
+        (None, None, None) if tls_name.is_none() => None,
+        (None, ..) => return Err("--tls-server-name/--tls-cert/--tls-key need --tls-ca".into()),
+        (Some(ca), None, None) if !launched => Some(TlsOptions {
+            ca,
+            server_name: tls_name,
+            node_cert: None,
+        }),
+        (Some(_), None, None) => {
+            return Err(
+                "a launched cluster serves plain TCP unless --tls-cert and --tls-key are given \
+                 (with --tls-ca); --tls-ca alone is for --nodes"
+                    .into(),
+            );
+        }
+        (Some(ca), Some(c), Some(k)) if launched => Some(TlsOptions {
+            ca,
+            server_name: tls_name,
+            node_cert: Some((c, k)),
+        }),
+        (Some(..), Some(_), Some(_)) => {
+            return Err(
+                "--tls-cert/--tls-key configure launched nodes (--launch); an external cluster \
+                 (--nodes) has its own certificates, give only --tls-ca"
+                    .into(),
+            );
+        }
+        _ => return Err("--tls-cert and --tls-key go together".into()),
+    };
     let can_kill = launched || kill_cmd.is_some();
     let can_restart = matches!(launch, Launch::Processes) || restart_cmd.is_some();
     let degraded_kind = match degraded_arg.as_deref() {
@@ -286,6 +342,7 @@ pub fn parse_args(args: &[String]) -> Result<Options, String> {
         animusd_args,
         data_dir,
         creds,
+        tls,
         ycsb: YcsbConfig {
             workloads,
             record_count: records,
@@ -341,15 +398,36 @@ pub async fn execute(opts: &Options, argv: Vec<String>) -> Result<Report, String
             rt::wall_epoch_secs()
         ))
     });
+    let client_tls = match &opts.tls {
+        Some(t) => Some(TlsClient::from_ca_file(&t.ca, t.server_name.as_deref())?),
+        None => None,
+    };
+    let launch_tls = match (&opts.tls, &client_tls) {
+        (
+            Some(TlsOptions {
+                ca,
+                node_cert: Some((cert, key)),
+                ..
+            }),
+            Some(client),
+        ) => Some(LaunchTls {
+            cert_path: cert.clone(),
+            key_path: key.clone(),
+            ca_path: ca.clone(),
+            client: client.clone(),
+        }),
+        _ => None,
+    };
     let cluster = match &opts.launch {
         Launch::External(nodes) => Cluster::external(
             nodes.clone(),
             opts.creds.clone(),
+            client_tls,
             opts.kill_cmd.clone(),
             opts.restart_cmd.clone(),
         ),
         Launch::InProcess => {
-            Cluster::launch_in_process(opts.cluster_size, &dir, opts.creds.clone())
+            Cluster::launch_in_process(opts.cluster_size, &dir, opts.creds.clone(), launch_tls)
                 .await
                 .map_err(|e| format!("in-process launch: {e}"))?
         }
@@ -363,6 +441,7 @@ pub async fn execute(opts: &Options, argv: Vec<String>) -> Result<Report, String
                 &dir,
                 &bin,
                 opts.creds.clone(),
+                launch_tls,
                 opts.animusd_args.clone(),
             )
             .await
@@ -423,9 +502,8 @@ async fn run_with_cluster(
             target_endpoints: cluster.nodes().to_vec(),
             node_count: cluster.nodes().len(),
             sigv4: cluster.credentials().is_some(),
-            tls: false,
-            tls_note: "this client speaks plain TCP only (TLS client support not implemented)"
-                .to_owned(),
+            tls: cluster.tls().is_some(),
+            tls_note: tls_note(cluster),
         },
         methodology: methodology(),
         topology_start,
@@ -433,6 +511,20 @@ async fn run_with_cluster(
         notes,
         runs,
     })
+}
+
+fn tls_note(cluster: &Cluster) -> String {
+    match cluster.tls() {
+        None => "off: the DynamoDB and admin ports were dialled in plain TCP".to_owned(),
+        Some(t) => format!(
+            "on: server-only TLS (rustls, ring provider) on the DynamoDB and admin ports, \
+             every node certificate verified against the supplied CA with server name = {}; \
+             the client presents no certificate. The handshake is done at connection setup \
+             (before each phase starts), not inside a measured operation; only a redial after \
+             a broken connection pays it inside an operation",
+            t.server_name_note()
+        ),
+    }
 }
 
 fn methodology() -> serde_json::Value {
@@ -480,5 +572,48 @@ mod tests {
         let d = parse(&["--launch", "processes", "--drain-secs", "2.5"]).unwrap();
         assert_eq!(d.ycsb.plan.drain_timeout, Duration::from_millis(2500));
         assert!(parse(&["--launch", "processes", "--drain-secs", "-1"]).is_err());
+    }
+
+    #[test]
+    fn tls_flags_are_validated_per_launch_mode() {
+        let ext = ["--nodes", "127.0.0.1:1@127.0.0.1:2"];
+        let with = |base: &[&str], extra: &[&str]| {
+            let all: Vec<&str> = base.iter().chain(extra).copied().collect();
+            parse(&all)
+        };
+        // Off by default.
+        assert!(with(&ext, &[]).unwrap().tls.is_none());
+        // External: --tls-ca (+ optional name) only.
+        let o = with(
+            &ext,
+            &["--tls-ca", "ca.pem", "--tls-server-name", "db.internal"],
+        )
+        .unwrap();
+        let t = o.tls.unwrap();
+        assert_eq!(t.ca, PathBuf::from("ca.pem"));
+        assert_eq!(t.server_name.as_deref(), Some("db.internal"));
+        assert!(t.node_cert.is_none());
+        assert!(
+            with(
+                &ext,
+                &["--tls-ca", "ca.pem", "--tls-cert", "c", "--tls-key", "k"]
+            )
+            .is_err()
+        );
+        // Anything else needs the CA.
+        assert!(with(&ext, &["--tls-server-name", "x"]).is_err());
+        // Launch modes: --tls-ca alone is a mistake; cert+key+ca is TLS.
+        let l = ["--launch", "in-process"];
+        assert!(with(&l, &["--tls-ca", "ca.pem"]).is_err());
+        assert!(with(&l, &["--tls-ca", "ca.pem", "--tls-cert", "c"]).is_err());
+        let o = with(
+            &l,
+            &["--tls-ca", "ca.pem", "--tls-cert", "c", "--tls-key", "k"],
+        )
+        .unwrap();
+        assert_eq!(
+            o.tls.unwrap().node_cert,
+            Some((PathBuf::from("c"), PathBuf::from("k")))
+        );
     }
 }

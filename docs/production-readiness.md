@@ -50,14 +50,14 @@ Last verified against the tree: 2026-10-04.
 
 ## (a) Soak
 
-Can build on B-01's workload generator (`animus-bench`, ADR 0076).
+Harness: [`docs/soak.md`](soak.md). (It uses the chaos history recorder, not B-01's `animus-bench` generator, which yields latency rather than an oracle-checkable history.)
 
 | ID | Criterion | Status | Evidence | Owner |
 |---|---|---|---|---|
-| A-1 | A multi-day soak harness runs real `animusd` processes (bare multi-process and/or the operator on `kind`) under a continuous recorded workload | Pending-dependency | None yet (no soak tooling in the tree); needs B-01 | a |
-| A-2 | A 7-consecutive-day soak completes with zero violations from the `animus-test` oracles (`check_cycles`, `check_durability`, `check_convergence`) over the recorded history | Pending-dependency | Oracles exist: `crates/animus-test/src/check.rs`; no soak run yet | a |
-| A-3 | Resource trends stay bounded over the soak: RSS, open fds, disk, WAL and compaction backlog show no monotone growth | Pending-dependency | None yet; metrics seam `crates/animus-env/src/metrics.rs` | a |
-| A-4 | Soak is re-runnable from CI or one documented command | Pending-dependency | None yet (`.github/workflows/soak.yml` planned) | a |
+| A-1 | A multi-day soak harness runs real `animusd` processes (bare multi-process and/or the operator on `kind`) under a continuous recorded workload | Not met | Bare multi-process harness `crates/animusd/tests/soak.rs` (opt-in `soak` feature), [`docs/soak.md`](soak.md); operator-on-`kind` leg not built; uses the chaos recorder rather than `animus-bench` | a |
+| A-2 | A 7-consecutive-day soak completes with zero violations from the `animus-test` oracles (`check_cycles`, `check_durability`, `check_convergence`) over the recorded history | Not met | Oracles run per epoch inside the harness (`docs/soak.md`); only short legs run so far, no 7-day run | a |
+| A-3 | Resource trends stay bounded over the soak: RSS, open fds, disk, WAL and compaction backlog show no monotone growth | Not met | Trend detector `crates/animus-test/src/soak.rs` (unit-tested) and per-node sampling in `tests/soak.rs`; no 7-day run | a |
+| A-4 | Soak is re-runnable from CI or one documented command | Met | `.github/workflows/soak.yml` (short leg, weekly + dispatch) and the one command in `docs/soak.md` | a |
 
 ## (b) Real-cluster chaos
 
@@ -153,7 +153,7 @@ date. Waivers are re-reviewed at every release.
 
 ## Summary (2026-10-04)
 
-Met: X-1 to X-10, B-4, D-1, D-2, F-1, G-8. Pending-dependency: X-11, A-1 to
-A-4, E-7, E-8, F-2, F-5. Not met: every remaining row (B-1 to B-3, all of C, D-3
+Met: X-1 to X-10, A-4, B-4, D-1, D-2, F-1, G-8. Pending-dependency: X-11,
+E-7, E-8, F-2, F-5. Not met: every remaining row (A-1 to A-3, B-1 to B-3, all of C, D-3
 to D-8, E-1 to E-6 and E-9, F-3, F-4, G-1 to G-7, G-9). The project is therefore
 **pre-alpha**.
