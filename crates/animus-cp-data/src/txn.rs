@@ -84,16 +84,16 @@
 //! there, and no analogous "reserved partition key" mechanism exists for
 //! user data — hence the different, `escape`-structural argument above.)
 //!
-//! **A residual, documented, not closed by PR3**: a tablet split's
-//! `split_key` is an arbitrary existing row's own key
-//! (`animusd::auto_split_loop`'s byte-weighted median), not necessarily
-//! token-aligned, so in principle a single token's rows (and, per this
-//! design, its txn record) could end up split across two sibling tablets by
-//! a split racing an in-flight transaction. PR3 is deliberately
-//! single-participant/single-tablet in scope; split-vs.-in-flight-txn
-//! interaction is a PR4+ concern (mirroring how the range seal itself
-//! needed a dedicated amendment once genuine concurrent splits were
-//! exercised) and is not solved here.
+//! **A residual, documented**: a tablet split must not land *inside* a token,
+//! or a token's rows (and, per this design, its txn record, which sorts below
+//! every item of the token) end up on two sibling tablets: the anchor stage
+//! applies on the item's tablet while `TxnCommit`/recovery are routed by record
+//! key to the other, where no record exists (R-01 F-2: an orphan-abort
+//! tombstone and a never-resolved intent). `animusd`'s one split choke point,
+//! `decide::align_split_key`, therefore rounds **every** table's split key to a
+//! token boundary (down, else up). What stays open is a range holding a
+//! *single* token, which can still be split by sort key (the raw key is kept):
+//! a transaction anchored on that token can straddle the cut.
 //!
 //! ## Resolution semantics
 //!
@@ -142,8 +142,13 @@ const RECORD_TAG: u8 = 0x02;
 /// A transaction's identity: its own commit-attempt timestamp plus the node
 /// that minted it (ADR 0018 §2/PR3) — the node tiebreak is load-bearing:
 /// different tablet groups run independent `Hlc` instances that never
-/// witness each other directly, so two different groups' leaders can in
-/// principle mint the identical `(wall_ms, logical)` pair. `Ord` derives in
+/// witness each other directly, so two different groups can mint the
+/// identical `(wall_ms, logical)` pair — **including two groups led by the
+/// same node** (routine), which is why a group's minted `node` is qualified
+/// with its stream (`RaftKvNode::txn_id_node`, `n0#100`; the primary stream
+/// keeps the bare node id) rather than being the plain node id. Without that,
+/// two transactions anchored on two same-led tablets shared a `TxnId` and one's
+/// resolve acted on the other's intent (R-01 F-2). `Ord` derives in
 /// field order (`ts`, then `node`), giving a total, deterministic order with
 /// no separate tiebreak logic. Serializable for the Raft WAL (it rides
 /// inside `KvCommand`, which the shared control-plane `serde_json`

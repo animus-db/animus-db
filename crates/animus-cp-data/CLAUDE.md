@@ -3204,3 +3204,21 @@ re-evaluates; arming un-quiesces. A full follower never acks (the failed round
 gates every ack; `persist_round` unit test + corpus pin). Do not make the step-down
 conditional on follower health knowledge: there is no wire signal for it, an
 aborted transfer to a full target is the (cheap) negative answer.
+
+handle. A non-ENOSPC failure stays `assert!(halted)`. Gap: engine-side ENOSPC
+(LSM flush/compaction, apply-time `merge_batch`) is NOT handled; the corpus
+runs `MemoryEngine` only. See `docs/resource-bounds.md` section 3.
+
+## A split child's log does not reproduce its engine (issue #1229)
+
+A fork child's engine is cloned from the parent's, so its pre-fork rows are in no
+log entry. `RaftKvNode`'s driver reads the durable split-trim marker at start and
+calls `RaftCore::set_log_omits_base(true)`; while the leader's `snapshot_index` is 0
+it then sends a *learner* no log (it raises `snapshot_needed` instead, so the engine
+image is built and shipped). Never route a new replica of a fork child through log
+replay. Regression: `animusd` `sim_cluster_split_relocation`. ADR 0058's
+2026-10-05 amendment; lesson `docs/lessons/code-patterns/2026-10-05-state-seeded-outside-the-log-needs-a-snapshot-for-every-new-replica.md`.
+
+- **TxnId uniqueness (R-01 F-2).** `TxnId.node` is the node qualified by the group stream (`n0#100`; primary stream = bare node id), because `ts` is per-group `Hlc` state and one node leads many groups. `txn_stage_local` (animusd) also refuses, before proposing, a stage group with any key outside the leader range (stale grouping across a split). See `docs/lessons/testing/2026-10-05-a-txn-id-must-be-unique-per-group-not-per-node.md`.
+
+- **Seal check on every mutating apply arm (R-01 F-2).** `TxnCommit`/`TxnAbort` (and the orphan tombstone) are deterministic no-ops on a sealed record key, like every other mutation: a fork clones the parent's CURRENT engine per replica, asynchronously, so a post-fork decision landing in the parent diverges the children. Regression: `tests/it/split_tablet.rs::a_txn_decision_ordered_after_the_fork_is_a_sealed_no_op`; see `docs/lessons/testing/2026-10-05-every-mutating-apply-arm-needs-the-seal-check.md`.

@@ -1611,6 +1611,16 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     /// their group. Purely diagnostic: never read by any protocol decision.
     /// `None` for the control group itself.
     group_label: Option<String>,
+    /// Issue #1229: the state machine's base state (index 0) was seeded
+    /// **outside the log** (an in-place split child's engine is cloned from
+    /// its parent's, ADR 0058), so while `snapshot_index == 0` the log does
+    /// NOT reproduce the state machine and replaying it from entry 1 would
+    /// give a brand-new replica only the post-fork writes. While set, a
+    /// learner is never sent `AppendEntries` until a snapshot base exists —
+    /// it gets the engine image instead. Purely local, never persisted
+    /// (re-derived from the engine at driver start); `false` for every
+    /// ordinary group.
+    log_omits_base: bool,
 }
 
 impl<C, S> RaftCore<C, S>
@@ -1700,9 +1710,17 @@ where
             cluster_check_saw_established_with_me: false,
             cluster_check_refused: false,
             group_label: None,
+            log_omits_base: false,
         };
         core.reset_election_timer(now, entropy);
         core
+    }
+
+    /// Issue #1229: declare that this group's base state was seeded outside
+    /// its log (see the `log_omits_base` field). Set by the data-plane
+    /// driver for a split child; idempotent.
+    pub fn set_log_omits_base(&mut self, omits: bool) {
+        self.log_omits_base = omits;
     }
 
     /// Recover a node from its durable state, then resume as a follower.
@@ -6040,6 +6058,19 @@ where
             return None;
         }
         let next = self.next_index.get(&peer).copied().unwrap_or(1).max(1);
+        // Issue #1229: a learner of a group whose base state lives outside
+        // its log must be shipped the engine image, never the log from
+        // entry 1 — the log alone lacks the pre-fork rows. Nothing flows to
+        // it until a snapshot base exists (`snapshot_upto` at the image
+        // build below moves `snapshot_index` off 0, after which the
+        // ordinary `next <= snapshot_index` branch ships it). Raising
+        // `snapshot_needed` needs something applied to snapshot at.
+        if self.log_omits_base && self.snapshot_index == 0 && self.learners.contains(&peer) {
+            if self.last_applied > 0 {
+                self.snapshot_needed = true;
+            }
+            return None;
+        }
         // The entry before `next` is in our snapshot (or earlier) — we can't form
         // a valid `prev_log_term`, so ship the snapshot instead, as the next
         // offset-addressed chunk for this peer.

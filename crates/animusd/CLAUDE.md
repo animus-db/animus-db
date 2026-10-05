@@ -12143,3 +12143,17 @@ with a message when it cannot mount (`ANIMUS_CHAOS_REQUIRE_MOUNT=1` fails
 instead; the CI job `chaos-disk-full` sets it). **Gotcha:** a leaked mount on a
 crashed run is `mount | grep animus-chaos` + `sudo umount -l`; `Tmpfs`'s `Drop`
 unmounts after the nodes are killed, so drop the cluster before the mounts.
+
+and `spawned_task_panics` stays (still not exported).
+
+## `sim_cluster_split_relocation` (issue #1229)
+
+`sim_cluster_split_relocation.rs`: 6-node RF 3 `SimCluster`, auto-split, child moved
+wholesale off the parent's replicas by directed Placing; every pre-split key must
+read back (`ConsistentRead`). Two cells (`MemoryEngine`; `LsmEngine` + rotating
+crash/restart). `ANIMUS_SPLIT_RELOCATION_SEEDS=K`, `ANIMUS_SEED=<s>`. Nightly at 20.
+See `crates/animus-cp-data/CLAUDE.md` for the root cause.
+
+- **TxnId uniqueness (R-01 F-2).** `TxnId.node` is the node qualified by the group stream (`n0#100`; primary stream = bare node id), because `ts` is per-group `Hlc` state and one node leads many groups. `txn_stage_local` (animusd) also refuses, before proposing, a stage group with any key outside the leader range (stale grouping across a split). See `docs/lessons/testing/2026-10-05-a-txn-id-must-be-unique-per-group-not-per-node.md`.
+
+- **Decide on a frozen group re-routes (R-01 F-2).** `txn_decide_anchor` returns the retryable `FROZEN_REFUSAL` when the record is still `Pending` on a group that is now frozen (the decision applied as a sealed no-op); `txn_decide_anchor_retrying` then re-routes the SAME decision to the record's new owner.
