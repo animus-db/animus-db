@@ -15,7 +15,9 @@ architecture map calls out: seed/intra node-to-node traffic stays
 cluster-internal, only the DynamoDB wire edge is exposed.
 
 **This crate does not depend on `animusd`, `animus-env`, or any other
-workspace crate.** It only has to *emit* JSON `animusd` can parse and a
+workspace crate — with one exception: `animus-roll` (ADR 0073 Phase 3), the
+pure, I/O-free rolling-upgrade state machine `animus cluster roll` shares with
+the operator's partition driver (`src/roll.rs`).** It only has to *emit* JSON `animusd` can parse and a
 shell script that execs the right `animusd` invocation — a hand-written
 mirror of `animusd::config::ClusterConfig`/`RoleAddrs`'s serde shape avoids
 pulling the whole node-server dependency tree into a Kubernetes-controller
@@ -25,6 +27,7 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
 
 ## Entry points
 
+- `src/roll.rs` — the rolling-upgrade driver (see "Rolling upgrades" below).
 - `src/crd.rs` — the `AnimusCluster` type (`kube::CustomResource` derive):
   `AnimusClusterSpec`/`AnimusClusterStatus`/`StorageSpec`/
   `ClientServiceSpec`/`ClusterCondition`/`ClusterPhase`/`TlsSpec`/
@@ -1320,6 +1323,62 @@ name, per-version expected value, `panic!` on an unrecognised version. Every `An
 (`deploy/operator/example.yaml`, `scripts/e2e-kind.sh`'s heredoc) carries
 `schemaVersion: 1`; regenerate `deploy/operator/crd.yaml` after touching the
 spec type.
+
+## Rolling upgrades (ADR 0073 Phase 3, P3-D)
+
+Every pod-template change (a `spec.image` edit **and** a config-hash change such as a
+`spec.controlNodes` growth) is rolled one pod at a time under the `animus-roll` gate; there is
+no ungated window. Mechanism: `src/roll.rs` (pure `stage`/`drive`/`hold_edits`/`pdb_start_gate`
+plus the `observe`/`execute`/`step` shell), wired in `controller::finish_reconcile` (partition
+decided *before* the `StatefulSet` apply) and `controller::reconcile` (edit holds at the top).
+
+- **`RollingUpdate` with an operator-owned `partition`, never `OnDelete`** (no pod-delete RBAC;
+  `deploy/operator/rbac.yaml` is unchanged). Every apply carries `updateStrategy`
+  (`desired::statefulset::build_with_partition`).
+- **The first apply of a changed template carries `partition = replicas`** (`Stage::Start`).
+  "Changed" is a fingerprint of the whole pod template stamped on the StatefulSet's *metadata*
+  (`TEMPLATE_HASH_ANNOTATION`, deliberately not on the template so it never rolls a pod). A
+  StatefulSet from an older operator has none: it is compared by image + config hash, and a
+  template with neither is adopted as unchanged (never guess a roll into existence).
+- **Never read stale controller status as "done".** `StsView::status_current` compares
+  `observedGeneration` to `metadata.generation`; until it holds the partition is left exactly as
+  stored (`Stage::Hold`). Resetting it to 0 off stale revisions would roll everything ungated.
+- **One step per `ok`**: `animus_roll::decide_with_target` is asked about the pod the partition
+  is about to admit (the highest old ordinal below it; the StatefulSet's order, not the
+  machine's own), then `Restart` lowers the partition to that ordinal, `Wait`/`Blocked`/`Soak`/
+  `AwaitEra` hold, `Complete`/`ReadyToFinalize`/`Finalize` mean partition 0. A control leader that
+  is next gets `POST /admin/control/transfer` first; the partition holds that reconcile.
+- **Fail closed**: an unobservable gate (no `Ready` pod answers, admin unreachable) holds the
+  partition and sets `UpgradeBlocked`. A pod that is not `Ready` is `Unreachable` without a call;
+  a `404` on `roll-health`/`cluster-version` is `Unavailable` (a previous-release node). A first
+  roll over Phase 1 binaries has no `cluster-version` at all: the members come from `GET
+  /admin/status`, the era is reported inactive, the roll ends in "waiting for the era".
+- **`goal` is derived from live truth**: the highest `own_range.max` a *new-binary* pod reports,
+  floored at `active`. A config-only roll therefore has `goal == active` and waits for no era and
+  no finalize. Soak (`spec.upgrade.soakSeconds`) and stall (15 min) are the operator's own wall
+  clocks, recorded as epoch seconds in `status.upgrade` (`WallClock`; fixed in tests).
+- **Holds, not rejections**: while a roll is in flight (`partition > 0` or revisions differ) a
+  `spec.nodes` / `spec.controlNodes` edit is pinned to what is running, and a `spec.image` revert
+  after a pod reported the new range is pinned to the roll's target (`UpgradeChangesHeld`; the
+  webhook refuses the same revert outright via `validate_image_revert`, which needs the old
+  object's `status.upgrade`). A revert before any pod reported is free. A *different* image
+  mid-roll is the fix-forward path: `Start` again, partition back to `replicas`.
+- **PDB `maxUnavailable` 0 refuses to start** (`pdb_start_gate`): the template is staged with
+  `partition = replicas` (nothing rolls), `UpgradeBlocked` says why. Consequence: a `controlNodes`
+  growth that lands on a PDB-0 shape (e.g. 1 -> 2) is also staged and never rolls; use the
+  whole-cluster stop-upgrade-restart. `spec.upgrade.finalize: Auto` finalizes only when the
+  machine says `Finalize` (`can_finalize`, no blocker, soak elapsed): on the leader's
+  `POST /admin/cluster-version/finalize {to, expected}`; a failure is retried, never forced.
+- `status.upgrade` is additive and never removed (a merge patch cannot drop a key): its fields
+  serialize as explicit `null`s so clearing a clock really clears it. Conditions:
+  `UpgradeInProgress`, `UpgradeBlocked`, `UpgradeFinalizePending`, `RollComplete`,
+  `UpgradeChangesHeld`. Fixture: `tests/fixtures/formats/animuscluster-spec/v1-upgrade.json`.
+- **Operator upgrade side effect**: the first reconcile by this version over an existing cluster
+  stamps the fingerprint (metadata only, no roll). A later template-builder change rolls the
+  cluster through the gate like any other template change (it used to roll ungated).
+- Tests: `src/controller/roll_tests.rs` (reconcile level over the fakes), `src/roll.rs` tests
+  (pure), `desired::statefulset` tests. They prove the operator's decisions, **not** Kubernetes'
+  partition semantics (the kind e2e is the only thing that does).
 
 ## Tests
 

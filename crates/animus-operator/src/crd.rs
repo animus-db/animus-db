@@ -619,6 +619,58 @@ pub struct AnimusClusterSpec {
     /// controlled by this field: it is always on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topology: Option<TopologySpec>,
+    /// Rolling-upgrade behaviour (ADR 0073 Phase 3, P3-D, additive). `None`
+    /// is [`UpgradeSpec::default`]: finalize stays manual, no soak.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgrade: Option<UpgradeSpec>,
+}
+
+/// `spec.upgrade` (ADR 0073 Phase 3, D6): how the operator ends a roll it
+/// drove. Every pod-template change (image **and** restart-relevant config)
+/// is rolled one pod at a time under the `animus-roll` gate regardless of this
+/// section; it only chooses what happens once every pod is on the new
+/// revision.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UpgradeSpec {
+    /// `Manual` (default): the operator never raises the cluster version; it
+    /// reports `UpgradeFinalizePending` and a human runs `animus cluster
+    /// finalize` (irreversible). `Auto` (opt-in): the operator finalizes once
+    /// the roll it drove is complete, `can_finalize` is true and every
+    /// verdict has been `ok` for [`soak_seconds`](Self::soak_seconds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalize: Option<FinalizePolicy>,
+    /// With `finalize: Auto`: how long the finished roll must stay healthy
+    /// before the operator finalizes. Default `0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soak_seconds: Option<u32>,
+}
+
+/// `spec.upgrade.finalize`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum FinalizePolicy {
+    Manual,
+    Auto,
+}
+
+impl AnimusClusterSpec {
+    /// The resolved `spec.upgrade.finalize` (default [`FinalizePolicy::Manual`]).
+    #[must_use]
+    pub fn finalize_policy(&self) -> FinalizePolicy {
+        self.upgrade
+            .as_ref()
+            .and_then(|u| u.finalize)
+            .unwrap_or(FinalizePolicy::Manual)
+    }
+
+    /// The resolved `spec.upgrade.soakSeconds` (default `0`).
+    #[must_use]
+    pub fn soak_seconds_or_default(&self) -> u32 {
+        self.upgrade
+            .as_ref()
+            .and_then(|u| u.soak_seconds)
+            .unwrap_or(0)
+    }
 }
 
 /// `spec.topology` (G-01 stage G-a).
@@ -669,6 +721,7 @@ impl Default for AnimusClusterSpec {
             segment_store: None,
             encryption_key_secret_name: None,
             topology: None,
+            upgrade: None,
         }
     }
 }
@@ -835,6 +888,74 @@ pub struct AnimusClusterStatus {
     /// Typed conditions (`status.conditions[]`), the usual Kubernetes shape.
     #[serde(default)]
     pub conditions: Vec<ClusterCondition>,
+    /// The rolling upgrade the operator is driving, or last drove (ADR 0073
+    /// Phase 3, D7). Additive; once present it is never removed (a merge
+    /// patch cannot drop it), it ends in [`UpgradePhase::Complete`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgrade: Option<UpgradeStatus>,
+}
+
+/// `status.upgrade`. **Derived state, with one exception**: every field except
+/// the three clocks and the two image names is re-derived from live truth (the
+/// `StatefulSet`'s revisions and partition, the pods, the admin endpoints) on
+/// every reconcile; a restarted operator resumes from those, not from here.
+/// The clocks (`inFlightSince`, `settledSince`, epoch seconds on the operator's
+/// own wall clock) exist because "how long has this node been in flight" and
+/// "how long has the roll been settled" are the operator's own measurements,
+/// and the images because a revert (`spec.image` back to `fromImage`) must be
+/// recognisable. The fields serialize as explicit `null`s (no
+/// `skip_serializing_if`) so the status merge patch clears them.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UpgradeStatus {
+    pub phase: UpgradePhase,
+    /// The cluster version in force when the roll was first observed.
+    #[serde(default)]
+    pub from_version: Option<u32>,
+    /// The cluster version the roll finalizes to (the new binaries' own range
+    /// max), once a pod on the new binary has reported it.
+    #[serde(default)]
+    pub to_version: Option<u32>,
+    /// Pods on the new revision that are `Ready`.
+    #[serde(default)]
+    pub on_new: Option<i32>,
+    /// Pods the roll covers (`StatefulSet` replicas).
+    #[serde(default)]
+    pub total: Option<i32>,
+    /// The cluster version currently active (`GET /admin/cluster-version`).
+    #[serde(default)]
+    pub active_cluster_version: Option<u32>,
+    /// The container image before the roll started.
+    #[serde(default)]
+    pub from_image: Option<String>,
+    /// The container image the roll is rolling to.
+    #[serde(default)]
+    pub to_image: Option<String>,
+    /// The node currently in flight (restarting or not yet healthy) and since
+    /// when (epoch seconds): the stall clock.
+    #[serde(default)]
+    pub in_flight_node: Option<String>,
+    #[serde(default)]
+    pub in_flight_since: Option<i64>,
+    /// Since when (epoch seconds) every node has been done and healthy: the
+    /// `spec.upgrade.soakSeconds` clock.
+    #[serde(default)]
+    pub settled_since: Option<i64>,
+}
+
+/// `status.upgrade.phase`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum UpgradePhase {
+    /// Rolling (or waiting for the next safe step).
+    InProgress,
+    /// Paused on a named reason (`UpgradeBlocked`); nothing moves until it
+    /// clears or the spec is fixed forward.
+    Blocked,
+    /// Every pod is on the new revision; finalize is the human's (or, with
+    /// `finalize: Auto`, the operator's after the soak).
+    FinalizePending,
+    /// Finished (finalized, or no cluster-version change was involved).
+    Complete,
 }
 
 /// The cluster's coarse lifecycle phase (`AnimusClusterStatus.phase`).
@@ -996,6 +1117,26 @@ pub const CONDITION_NODES_SPEC_INVALID: &str = "NodesSpecInvalid";
 /// content this operator cannot interpret must not be partially applied)
 /// and waits for a spec change rather than backing off.
 pub const CONDITION_SCHEMA_VERSION_INVALID: &str = "SchemaVersionInvalid";
+
+/// A rolling upgrade is under way (ADR 0073 Phase 3, D7): a pod-template
+/// change (image or restart-relevant config) is being rolled one pod at a
+/// time under the `animus-roll` gate. Message names the next step.
+pub const CONDITION_UPGRADE_IN_PROGRESS: &str = "UpgradeInProgress";
+/// The roll is paused or refused, with the named reason (D2 health reason,
+/// unobservable admin port, PDB `maxUnavailable` 0, a stalled node, a
+/// finalize blocker). Nothing rolls further; the cluster serves normally at
+/// its old cluster version (D9). Fix forward by editing `spec.image` again.
+pub const CONDITION_UPGRADE_BLOCKED: &str = "UpgradeBlocked";
+/// Every pod is on the new revision and `can_finalize` holds; finalize is
+/// irreversible and is the human's (`finalize: Manual`) or, after the soak,
+/// the operator's (`finalize: Auto`).
+pub const CONDITION_UPGRADE_FINALIZE_PENDING: &str = "UpgradeFinalizePending";
+/// The roll finished. Stays until the next roll starts.
+pub const CONDITION_ROLL_COMPLETE: &str = "RollComplete";
+/// A spec edit was held or refused because a roll is in flight: `nodes` /
+/// `controlNodes` changes wait for `RollComplete`; reverting `spec.image` to
+/// the pre-roll image after a pod reported the new range is refused (D8/D9).
+pub const CONDITION_UPGRADE_CHANGES_HELD: &str = "UpgradeChangesHeld";
 
 #[cfg(test)]
 mod tests {

@@ -467,6 +467,34 @@ spec:
                     nullable: true
                     type: boolean
                 type: object
+              upgrade:
+                description: |-
+                  Rolling-upgrade behaviour (ADR 0073 Phase 3, P3-D, additive). `None`
+                  is [`UpgradeSpec::default`]: finalize stays manual, no soak.
+                nullable: true
+                properties:
+                  finalize:
+                    description: |-
+                      `Manual` (default): the operator never raises the cluster version; it
+                      reports `UpgradeFinalizePending` and a human runs `animus cluster
+                      finalize` (irreversible). `Auto` (opt-in): the operator finalizes once
+                      the roll it drove is complete, `can_finalize` is true and every
+                      verdict has been `ok` for [`soak_seconds`](Self::soak_seconds).
+                    enum:
+                    - Manual
+                    - Auto
+                    - null
+                    nullable: true
+                    type: string
+                  soakSeconds:
+                    description: |-
+                      With `finalize: Auto`: how long the finished roll must stay healthy
+                      before the operator finalizes. Default `0`.
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                type: object
             required:
             - nodes
             - schemaVersion
@@ -529,6 +557,79 @@ spec:
                 format: int32
                 nullable: true
                 type: integer
+              upgrade:
+                description: |-
+                  The rolling upgrade the operator is driving, or last drove (ADR 0073
+                  Phase 3, D7). Additive; once present it is never removed (a merge
+                  patch cannot drop it), it ends in [`UpgradePhase::Complete`].
+                nullable: true
+                properties:
+                  activeClusterVersion:
+                    description: The cluster version currently active (`GET /admin/cluster-version`).
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                  fromImage:
+                    description: The container image before the roll started.
+                    nullable: true
+                    type: string
+                  fromVersion:
+                    description: The cluster version in force when the roll was first observed.
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                  inFlightNode:
+                    description: |-
+                      The node currently in flight (restarting or not yet healthy) and since
+                      when (epoch seconds): the stall clock.
+                    nullable: true
+                    type: string
+                  inFlightSince:
+                    format: int64
+                    nullable: true
+                    type: integer
+                  onNew:
+                    description: Pods on the new revision that are `Ready`.
+                    format: int32
+                    nullable: true
+                    type: integer
+                  phase:
+                    description: '`status.upgrade.phase`.'
+                    enum:
+                    - InProgress
+                    - Blocked
+                    - FinalizePending
+                    - Complete
+                    type: string
+                  settledSince:
+                    description: |-
+                      Since when (epoch seconds) every node has been done and healthy: the
+                      `spec.upgrade.soakSeconds` clock.
+                    format: int64
+                    nullable: true
+                    type: integer
+                  toImage:
+                    description: The container image the roll is rolling to.
+                    nullable: true
+                    type: string
+                  toVersion:
+                    description: |-
+                      The cluster version the roll finalizes to (the new binaries' own range
+                      max), once a pod on the new binary has reported it.
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                  total:
+                    description: Pods the roll covers (`StatefulSet` replicas).
+                    format: int32
+                    nullable: true
+                    type: integer
+                required:
+                - phase
+                type: object
             type: object
         required:
         - spec

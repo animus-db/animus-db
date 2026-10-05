@@ -451,6 +451,34 @@ sat unapplied on already-running pods until an unrelated restart.
 its own *presence* (add/remove), never a same-name content rotation; see
 the "Encryption at rest" section above.
 
+## Rolling upgrades (ADR 0073 Phase 3)
+
+Editing `spec.image` (or any pod-template field, including a `controlNodes` growth) rolls the
+cluster **one pod at a time under a health gate**, never ungated: the operator owns the
+`StatefulSet`'s `updateStrategy.rollingUpdate.partition`, applies a changed template together with
+`partition = nodes`, then lowers it one ordinal at a time only while every member is `Active`,
+`GET /admin/roll-health` is `ok` everywhere, and the previous pod is `Ready`, healthy and has
+reported the new version range. The control leader is handed leadership away (`POST
+/admin/control/transfer`) before its pod restarts. No new RBAC is needed (the operator never
+deletes pods). Progress is on `status.upgrade` and the `UpgradeInProgress` / `UpgradeBlocked` /
+`UpgradeFinalizePending` / `RollComplete` / `UpgradeChangesHeld` conditions.
+
+- **Finalize is irreversible and manual by default** (`spec.upgrade.finalize: Manual`): when
+  every pod is on the new binary the operator sets `UpgradeFinalizePending`; run `animus cluster
+  finalize`. `spec.upgrade.finalize: Auto` (opt-in) finalizes once the roll is complete,
+  `can_finalize` holds and the cluster has stayed healthy for `spec.upgrade.soakSeconds`
+  (default 0).
+- **Fix forward, no rollback.** A pod that never becomes healthy stops the roll at that pod
+  (`UpgradeBlocked` names why); set `spec.image` to a fixed image. Reverting `spec.image` to the
+  pre-roll image is refused (webhook) / pinned (reconciler) once any pod ran the new binary.
+- While a roll is in flight, `spec.nodes` / `spec.controlNodes` edits are held until it completes
+  (`UpgradeChangesHeld`).
+- **A cluster whose PodDisruptionBudget `maxUnavailable` is 0** (one control node, or fewer than
+  three nodes) is not rolled: the new template is staged, nothing restarts, and `UpgradeBlocked`
+  says so. Use the whole-cluster stop-upgrade-restart for such shapes.
+- Skipping a release (R-1 to R+1) is not supported; the first upgraded pod's startup range check
+  refuses it and the roll pauses there.
+
 ## Admission webhook (S-07e, ADR 0070)
 
 An opt-in `ValidatingWebhookConfiguration` that rejects an invalid
