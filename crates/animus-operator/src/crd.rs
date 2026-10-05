@@ -515,6 +515,17 @@ pub struct AnimusClusterSpec {
     /// instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_split_bytes: Option<u64>,
+    /// An upper bound, in milliseconds, on the round trip between any two
+    /// **regions** of a stretch cluster (ADR 0075 section 3.4, G-01 G-c; ADR
+    /// 0060 stretch shape). Emitted into the generated `cluster.json`'s
+    /// `cluster_settings.max_region_rtt_ms`, where it sizes the WAN Raft
+    /// timing profile of every group whose replicas span more than one
+    /// `topology.kubernetes.io/region`. `None` (default) leaves the node's own
+    /// default (150 ms); **inert on a single-region or unlabelled cluster**.
+    /// Additive and skipped when unset, so an existing spec's `cluster.json`
+    /// is byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_region_rtt_ms: Option<u64>,
     /// Name of a `Secret` (in the same namespace) holding the DynamoDB
     /// SigV4 credential store (`{"credentials": {"AKID...": "secret...",
     /// ...}}`, ADR 0057). Mounted read-only at `/etc/animus/dynamo-auth/`
@@ -650,6 +661,7 @@ impl Default for AnimusClusterSpec {
             client_service: ClientServiceSpec::default(),
             quiesce_after_secs: None,
             auto_split_bytes: None,
+            max_region_rtt_ms: None,
             dynamo_auth_secret_name: None,
             tls: None,
             s3: None,
