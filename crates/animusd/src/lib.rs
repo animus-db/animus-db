@@ -22435,6 +22435,12 @@ mod sim_cluster_lsm;
 /// depth knob `ANIMUS_UPGRADE_SEEDS`. See that module's doc.
 #[cfg(test)]
 mod sim_cluster_mixed_version_corpus;
+/// ADR 0073 Phase 3, P3-C: the roll driver (`animus-roll`'s pure state
+/// machine) over `SimCluster` with fault injection. Run via `cargo test -p
+/// animusd --lib sim_cluster_roll_orchestrator`; depth knob
+/// `ANIMUS_UPGRADE_SEEDS`. See that module's doc.
+#[cfg(test)]
+mod sim_cluster_roll_orchestrator;
 /// Issue #1229: a split child relocated wholesale by directed Placing keeps
 /// its pre-split rows (`SimCluster`).
 #[cfg(test)]

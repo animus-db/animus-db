@@ -185,6 +185,10 @@ animus-sim.workspace = true
 # as a dev-dependency; no cycle — `animus-test`'s own `Cargo.toml` does not
 # depend on `animusd`).
 animus-test.workspace = true
+# ADR 0073 Phase 3 (P3-C): the pure rolling-upgrade state machine the
+# `sim_cluster_roll_orchestrator` corpus drives over SimCluster (the CLI and the
+# operator are its production consumers).
+animus-roll.workspace = true
 # S-04 PR 2's own in-crate `s3_store_tests` (`lib.rs`): exercises the
 # `SegmentStoreConfig::S3`/`BackupStoreHandle::S3` wiring against
 # `animus_s3::fake::FakeS3` — no real sockets. The normal (non-dev)

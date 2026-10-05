@@ -100,17 +100,17 @@ use super::sim_cluster_upgrade_corpus::{
 use super::*;
 use crate::config::NodeRole;
 
-const ROLES: [NodeRole; 4] = [
+pub(super) const ROLES: [NodeRole; 4] = [
     NodeRole::Both,
     NodeRole::Both,
     NodeRole::Both,
     NodeRole::Data,
 ];
-const REPLICATION: usize = 3;
-const CONTROL: [u64; 3] = [0, 1, 2];
+pub(super) const REPLICATION: usize = 3;
+pub(super) const CONTROL: [u64; 3] = [0, 1, 2];
 const ROUNDS_ROLL: u64 = 120;
 const ROUNDS_PHASE2: u64 = 6;
-const TICK: Duration = Duration::from_millis(50);
+pub(super) const TICK: Duration = Duration::from_millis(50);
 
 // ---------------------------------------------------------------------------
 // Cells
@@ -336,7 +336,7 @@ fn run(c: &Cell) -> Verdict {
 // ---------------------------------------------------------------------------
 
 /// Instantaneous safety violations.
-fn instant_violations(cluster: &SimCluster, delivery: bool) -> Vec<String> {
+pub(super) fn instant_violations(cluster: &SimCluster, delivery: bool) -> Vec<String> {
     let mut v = Vec::new();
     let any_phase1 = (0..NODES).any(|n| cluster.profile_of(n) == BinaryProfile::Phase1);
     for n in CONTROL {
@@ -387,7 +387,7 @@ fn instant_violations(cluster: &SimCluster, delivery: bool) -> Vec<String> {
 }
 
 /// Control replicas whose applied index trails the (live) leader's commit.
-fn wedged_control(cluster: &SimCluster) -> Vec<u64> {
+pub(super) fn wedged_control(cluster: &SimCluster) -> Vec<u64> {
     let commit = CONTROL
         .iter()
         .filter(|&&n| cluster.is_control_leader(n))
@@ -403,7 +403,7 @@ fn wedged_control(cluster: &SimCluster) -> Vec<u64> {
         .collect()
 }
 
-fn era_fully_recorded(cluster: &SimCluster) -> bool {
+pub(super) fn era_fully_recorded(cluster: &SimCluster) -> bool {
     (0..NODES).all(|n| {
         let m = cluster.metadata(n);
         m.versioning_active() && m.node_versions.len() == NODES as usize
@@ -412,14 +412,14 @@ fn era_fully_recorded(cluster: &SimCluster) -> bool {
 
 /// Advance `dur` in 50 ms slices, collecting instant violations (once each)
 /// and which leader profiles were seen (bit 0 Phase 1, bit 1 B2).
-struct Watch {
-    violations: Vec<String>,
-    leaders: u8,
+pub(super) struct Watch {
+    pub(super) violations: Vec<String>,
+    pub(super) leaders: u8,
     delivery: bool,
 }
 
 impl Watch {
-    fn new(delivery: bool) -> Self {
+    pub(super) fn new(delivery: bool) -> Self {
         Self {
             violations: Vec::new(),
             leaders: 0,
@@ -427,7 +427,7 @@ impl Watch {
         }
     }
 
-    fn run(&mut self, cluster: &mut SimCluster, dur: Duration) {
+    pub(super) fn run(&mut self, cluster: &mut SimCluster, dur: Duration) {
         let mut left = dur;
         while !left.is_zero() {
             let d = left.min(TICK);
@@ -437,7 +437,7 @@ impl Watch {
         }
     }
 
-    fn sample(&mut self, cluster: &SimCluster) {
+    pub(super) fn sample(&mut self, cluster: &SimCluster) {
         for s in instant_violations(cluster, self.delivery) {
             if !self.violations.contains(&s) {
                 self.violations.push(s);
@@ -464,7 +464,7 @@ impl Watch {
     }
 }
 
-fn leader_of_control(cluster: &SimCluster, down: &BTreeSet<u64>) -> Option<u64> {
+pub(super) fn leader_of_control(cluster: &SimCluster, down: &BTreeSet<u64>) -> Option<u64> {
     CONTROL
         .iter()
         .copied()
@@ -483,7 +483,7 @@ fn roll(cluster: &mut SimCluster, w: &mut Watch, node: u64, restart: bool) {
 // Rolling cells
 // ---------------------------------------------------------------------------
 
-fn setup(seed: u64) -> (SimCluster, Arc<Shared>) {
+pub(super) fn setup(seed: u64) -> (SimCluster, Arc<Shared>) {
     let mut cluster = SimCluster::new_with_roles_and_segment_janitor_retention_and_cp_quiescence(
         seed,
         &ROLES,

@@ -225,6 +225,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "animus-roll"
+version = "0.1.0-alpha.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "animus-s3"
 version = "0.1.0-alpha.0"
 dependencies = [
@@ -319,6 +326,7 @@ dependencies = [
  "animus-item",
  "animus-node",
  "animus-placement",
+ "animus-roll",
  "animus-s3",
  "animus-sim",
  "animus-storage",

@@ -709,6 +709,24 @@ jobs:
           ANIMUS_UPGRADE_SEEDS: '40'
         run: cargo test -p animusd --lib sim_cluster_mixed_version -- --nocapture
 
+      # ADR 0073 Phase 3 (P3-C): the roll driver (`animus-roll`'s pure state
+      # machine, shared by the CLI and the operator) over SimCluster's LSM
+      # backend: Release(1) -> Release(2) and Phase 1 -> B2 rolls with a
+      # control-leader transfer first, leader kills, partitions, a crash after
+      # restart, a member that stays down (the driver must hold), a node that
+      # cannot catch up (NodeStalled), driver restarts, manual vs opt-in
+      # auto-finalize, and two negative controls. Shares ANIMUS_UPGRADE_SEEDS
+      # with the mixed-version corpus; K=20 is ~2.5 minutes wall in debug, so
+      # the nightly K=40 is ~5 minutes. Replay with ANIMUS_SEED (+
+      # ANIMUS_UPGRADE_CELL); a failing cell prints its decision trace.
+      - name: deep roll-orchestrator corpus, SimCluster tier (ADR 0073 Phase 3, P3-C)
+        id: upgrade_roll
+        continue-on-error: true
+        timeout-minutes: 30
+        env:
+          ANIMUS_UPGRADE_SEEDS: '40'
+        run: cargo test -p animusd --lib sim_cluster_roll_orchestrator -- --nocapture
+
       # Issue #1064/#1092: a late-joining learner needing a real multi-chunk
       # InstallSnapshot under a writer that never stops, one corpus seed per
       # scenario. Each seed is a pure function of its seed, so a failure names
@@ -771,11 +789,12 @@ jobs:
             [upgrade_restart_cluster]="${{ steps.upgrade_restart_cluster.outcome }}"
             [upgrade_mixed]="${{ steps.upgrade_mixed.outcome }}"
             [upgrade_mixed_cluster]="${{ steps.upgrade_mixed_cluster.outcome }}"
+            [upgrade_roll]="${{ steps.upgrade_roll.outcome }}"
             [learner_snapshot_livelock]="${{ steps.learner_snapshot_livelock.outcome }}"
           )
           failed=0
           failed_names=()
-          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner reconfigure_drop inplace_split backup pitr lsm_crash lsm_disk_fault lsm_encrypted segment_store_encrypted control simcluster dynamo_wire zone_placement split_relocation export_import s3_fault heartbeat wan_timing mrsc_leader mrsc_cluster sharedwal wal_rewrite_crash upgrade_restart upgrade_restart_cluster upgrade_mixed upgrade_mixed_cluster learner_snapshot_livelock; do
+          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner reconfigure_drop inplace_split backup pitr lsm_crash lsm_disk_fault lsm_encrypted segment_store_encrypted control simcluster dynamo_wire zone_placement split_relocation export_import s3_fault heartbeat wan_timing mrsc_leader mrsc_cluster sharedwal wal_rewrite_crash upgrade_restart upgrade_restart_cluster upgrade_mixed upgrade_mixed_cluster upgrade_roll learner_snapshot_livelock; do
             outcome="${outcomes[$name]}"
             echo "${name}: ${outcome}"
             if [ "${outcome}" != "success" ]; then

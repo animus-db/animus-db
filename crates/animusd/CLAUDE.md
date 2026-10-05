@@ -12189,3 +12189,36 @@ state table and fails if they diverge (it skips loudly without a `node` binary):
 ladder in both places or the test fails. Adding an `ok` clause means a new `Reason` kind, a
 one-clause unit test, and a line in `docs/runbook/upgrade.md`. Not a readiness probe, by
 design (issues #595/#710).
+
+## `sim_cluster_roll_orchestrator`: the roll driver over `SimCluster` (ADR 0073 Phase 3, P3-C)
+
+`sim_cluster_roll_orchestrator.rs` drives `animus_roll::decide` (the pure roll state
+machine the CLI and operator share, see `crates/animus-roll/CLAUDE.md`) over a 4-node
+`SimCluster` (`[Both, Both, Both, Data]`, RF 3) under the linearizable DynamoDB workload.
+The harness is "the platform": it executes `Restart` (crash, a seeded 0.3-2 s of
+downtime, then the new binary), the real `POST /admin/control/transfer` and `POST
+/admin/cluster-version/finalize`, and observes through the same bodies the endpoints serve
+(`SimCluster::{cluster_version_view, roll_health_view}`, synchronous, no simulated time).
+The oracle re-derives the truth at each decision (independent `roll-health` on every other
+node, members `Active`, one node below the gate, not the leader, data before control,
+`roll.remaining[0]` parity in clean cells) and then runs the mixed corpus's end checks.
+Cells, knobs and replay: `ANIMUS_UPGRADE_SEEDS`, `ANIMUS_UPGRADE_CELL`, `ANIMUS_SEED`; a
+failing cell prints its last 40 decisions. Four things that cost time:
+
+- **Faults land between ticks, before the observation**, never between a decision and its
+  execution: a fault injected after `decide` makes the oracle blame a decision for state it
+  never saw.
+- **LSM backend, not Memory.** A roll restarts every node; the `Memory` backend's restart is
+  a wiped disk (the control system-keyspace mirror comes back empty, so a restarted control
+  node with a compacted log serves a partial `Metadata` at the leader's applied index).
+  `lsm_setup` uses `SimCluster::new_with_lsm_engines`.
+- **Client ops are capped on the client's own env** (`bounded_dynamo`): a request issued to a
+  node the harness has stopped never completes in the simulator (its timers die with the old
+  process), so the shared `client_loop` hangs. The copy here records a capped op as
+  indeterminate. Do not "fix" it by sharing the loop with the other corpora (it perturbs
+  their schedules).
+- The soak clock and the stall clock are the *caller's*: a "restarted driver" restarts them
+  (`driver_restarts` drops them every 13 ticks, so its soak is 2 s < 2.6 s).
+
+Mixed-version `Watch`, `setup`, `wedged_control` and friends are `pub(super)` for this reuse.
+Lessons: `docs/lessons/testing/2026-10-05-a-restart-heavy-simcluster-corpus-needs-the-lsm-backend-and-client-side-op-caps.md`.
