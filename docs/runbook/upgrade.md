@@ -48,13 +48,45 @@ Plan a maintenance window; clients cannot be served during it.
 A node that refuses to start with a named version error is running an older
 binary than the data on its disk: start the newer binary on it.
 
-### Kubernetes (operator-managed): honest limits
+### Kubernetes (operator-managed)
 
-The operator does not orchestrate upgrades. It does **not reject a `spec.image` edit**, and
-the StatefulSet controller then rolls the pods one by one, which is exactly the
-unsupported mixed-version window. **Do not edit `spec.image` on a running cluster.**
-Documented ADR 0060 alternative: recreate the `AnimusCluster`. The mechanics are
-not tested; the reasoning is:
+Editing `spec.image` on an `AnimusCluster` (or any other pod-template field, including a
+`controlNodes` growth) is a **gated rolling upgrade driven by the operator** (ADR 0073 Phase 3,
+ADR 0060 "Upgrades"). There is no ungated window: the operator owns the StatefulSet's
+`updateStrategy.rollingUpdate.partition`, applies a changed template together with
+`partition = nodes`, then lowers it one ordinal at a time, only while every member is `Active`,
+`GET /admin/roll-health` is `ok` everywhere and the previous pod is `Ready`, healthy and has
+reported the new range. A control leader that is next gets a leadership transfer first. The
+operator never deletes a pod (no new RBAC).
+
+1. **Before.** Same preparation as the whole-cluster procedure: a verified backup or export
+   (the first start of the new binary on a pod is its point of no return). The cluster must be
+   healthy, have at least three nodes and a PodDisruptionBudget `maxUnavailable >= 1`
+   (not one control node); smaller shapes are *not rolled* (the template is staged, nothing
+   restarts, `UpgradeBlocked` says why: use the whole-cluster procedure).
+2. **Edit** `spec.image` to the new release's image (one release step only; a skipped release is
+   refused by the first upgraded pod's startup range check and the roll pauses there). Optionally
+   set `spec.upgrade.finalize: Auto` (and `spec.upgrade.soakSeconds`) to let the operator finalize.
+3. **Watch** `kubectl get animuscluster NAME -o yaml`: `status.upgrade` (`phase`, `onNew`/`total`,
+   `activeClusterVersion`, `inFlightNode`) and the conditions `UpgradeInProgress`, `UpgradeBlocked`
+   (names the reason: a D2 health reason, an unobservable admin port, a node stalled for 15
+   minutes, a finalize blocker), `UpgradeFinalizePending`, `RollComplete`, `UpgradeChangesHeld`.
+   `animus cluster roll status ADMIN` shows the same derived state from inside the cluster.
+4. **Finalize.** With the default `finalize: Manual`, when every pod is on the new binary the
+   operator sets `UpgradeFinalizePending`: run `animus cluster finalize <control-leader-admin-addr>`
+   (irreversible). With `Auto` the operator finalizes once the roll is complete, `can_finalize`
+   holds and the cluster has stayed healthy for `soakSeconds`; a failure (a `Down` member) is
+   retried, never forced.
+5. **If a pod never becomes healthy** the roll stops at that pod and the rest stay on the old
+   binary (the cluster serves normally at the old cluster version). **Fix forward**: set
+   `spec.image` to a fixed image and the gate re-targets it; or wipe that pod's PVC and let it
+   rebuild from peers; or restore from backup. **Reverting `spec.image` to the pre-roll image is
+   refused** (webhook) or pinned (reconciler, `UpgradeChangesHeld`) once any pod has run the new
+   binary. `spec.nodes` / `spec.controlNodes` edits are held until `RollComplete`.
+6. Not covered: `spec.storage.ephemeral` clusters (a restarted pod has lost its data by design).
+
+The whole-cluster path for Kubernetes (recreate the `AnimusCluster`, mechanics untested) remains
+the fallback for shapes the operator will not roll:
 
 - Pods' volumes are StatefulSet claim templates (`data-<name>-<ordinal>`), and no
   retention policy is set, so deleting the StatefulSet leaves the PVCs.
@@ -68,84 +100,15 @@ not tested; the reasoning is:
   Do not change anything else in the spec in the same step.
   Recreate keeps identity because ids derive from the name and ordinal.
 
-## Rolling upgrade, node by node (ADR 0073 Phase 2 supported; Phase 3 `animus cluster roll`)
-
-A cluster whose cluster-version era is on (Phase 2) runs mixed N-1 and N builds safely,
-so you can restart nodes one at a time with no client outage. **N-1 to N only**: never
-skip a release. A cluster still on Phase 1 binaries has no era, so the first roll onto a
-Phase 2 build has no version observation; use the health gate below and nothing else.
-`animus cluster roll` is a **supervisor that restarts nothing itself**: you (systemd,
-ansible, a pod revision) replace the process; the CLI says which node is next (`plan`),
-blocks until the node you just replaced is healthy and has reported the new range
-(`wait`), and renders the derived roll state (`status`). Its decisions are the shared
-`animus-roll` state machine, the same one the operator will use; it keeps no state, so
-re-running any command after an interruption is always safe. Operator-driven `spec.image`
-rolls are later Phase 3 work. `ADMIN` below is a node's admin address (`--tls-ca PATH`
-goes before the command when the admin port uses TLS); the `curl` forms are the same
-endpoints the CLI reads, shown as an alternative.
-
-**Read this before step 1: a node's first start of the new binary is its point of no
-return.** From that moment it writes the new on-disk formats. There is no rollback for
-that node (ADR 0073 Option B, fix forward): the only way back is the restore procedure
-under "Rollback". Take and verify the backup/export first, exactly as for the
-whole-cluster procedure.
-
-Never use `drain` to roll a node. `drain` is the decommission path: it moves every
-replica off the node, leaves the member `Leaving` (which blocks Finalize) and the node
-must re-register ([node-decommission.md](node-decommission.md)). A roll is a restart in
-place.
-
-1. **Plan.** `animus cluster roll plan ADMIN` (`--json` for scripts) prints the active
-   and goal cluster versions, each node's role, status and whether it already reports the
-   new range, the control leader, the point-of-no-return warning, and the **roll order**:
-   data-only nodes first, then control voters, **the control leader last** after a
-   leadership transfer. It exits 1 and prints `refused: ...` if a precondition fails (a
-   member not `Active`, roll-health not `ok`, no control leader known, nobody to take
-   leadership), and touches nothing either way. It works mid-roll: the order is
-   recomputed from what the cluster reports. Equivalent by hand: `curl -s
-   http://ADMIN/admin/cluster-version` (`era_active` true, `roll.remaining` is the order,
-   `roll.down` empty: bring any `Down` member back on the new binary or decommission it
-   first, because Finalize refuses while one exists). On a first roll over **Phase 1**
-   binaries there is no `cluster-version` endpoint on the old nodes; `plan` then reads
-   `/admin/status` and treats every node as not yet rolled.
-2. **Gate.** `animus cluster roll status ADMIN` shows `roll health:` (the server-side
-   `/admin/roll-health` verdict, `curl -s http://ADMIN/admin/roll-health`) and the next
-   step. Do not touch the next node until it is `ok`; `reasons[]` names why when it is not
-   (table below).
-3. **If the node is the control leader**, move leadership first (`plan` lists this step;
-   `animus admin control-transfer LEADER_ADMIN <another voter id>`, or `curl -s -X POST
-   http://LEADER_ADMIN/admin/control/transfer -d '{"to":"<another voter>"}'`) and wait
-   until a leader is known elsewhere. Data-plane (tablet) leaders re-elect on their own;
-   clients see brief retries.
-4. **Restart the node on the new binary or image** (`systemctl restart`, a new container
-   image, ...). Keep `--dir`, keys, TLS files and flags unchanged. Send SIGTERM and let it
-   shut down cleanly.
-5. **Wait for it to be healthy.** `animus cluster roll wait NODE_ADMIN [--timeout 10m]`
-   polls **the restarted node's own** admin port (`/admin/roll-health` has a node-local
-   clause, so asking another node is not enough) until it answers as the new build, is
-   `Active`, has reported the new range, and roll-health is `ok`, printing each reason it
-   is still waiting for; it exits 0 on success and 1 on timeout (default 10m;
-   `--interval` sets the poll period; `--node ID` asserts which node that address is). On
-   success it prints the node that follows. The node flips `Down` to `Active` within
-   seconds, long before its groups catch up: `local.caught_up_groups` equal to
-   `local.hosted_groups` is what stops the gate opening too early.
-6. **Repeat** 2-5 for every remaining node, **including `Down` ones**.
-7. **Finalize** when `roll.phase` is `ready_to_finalize` (`can_finalize` is `true`):
-   `animus cluster finalize <control-leader-admin-addr>`, or `curl -s -X POST
-   http://LEADER_ADMIN/admin/cluster-version/finalize`. `roll wait` on the last node says
-   `all members report the new range; run animus cluster finalize ...`. Finalize is
-   manual by default, irreversible, and one version step at a time. Until you finalize,
-   the cluster still behaves as the old version (a soak window), even though each upgraded
-   node already writes new files. **Opt-in:** `animus cluster roll wait NODE_ADMIN
-   --finalize --yes` on the *last* node finalizes for you (it finds the control leader's
-   admin address itself, since the last node rolled was the former leader); on any other
-   node `--finalize` does nothing, so a script may pass it on every call. `--finalize`
-   without `--yes` is refused. There is no `--soak`: sleep before the last `wait` if you
-   want a soak.
-
-`animus cluster roll status ADMIN [--json]` can be run at any time, from any node: phase,
-`N of M` nodes on the new version, remaining nodes in roll order, down members, Finalize
-blockers, the roll-health verdict, and the next step the state machine would take.
+**Maturity of the operator path.** The operator's decisions are proven by fakes-level tests, the
+shared `animus-roll` machine by the `sim_cluster_roll_orchestrator` corpus, and a real-process
+previous-release roll by the `upgrade-previous-release` CI job. Kubernetes' own partition
+semantics are exercised only by the nightly `kind` job (`upgrade-kind-nightly`, `E2E_UPGRADE=1`
+in `scripts/e2e-kind.sh`), which has not yet had a verified run. **Known issue: do not roll
+while multi-item transactions are in use** (issues #1237, #1238, found by the previous-release
+test: an ungated transaction-envelope version can crash an N-1 replica, and acknowledged writes
+were lost across a roll with transactions); use the whole-cluster procedure, or stop
+transactional traffic, until they are fixed.
 
 The dashboard Overview shows the same state in a Version card (cluster version, `N of M`
 nodes on the new build, roll phase, what is next, blockers and the roll-health verdict,
@@ -182,21 +145,23 @@ binary"). To roll back: stand up a fresh cluster on the old version and restore 
 pre-upgrade backup/export ([backup-restore-pitr.md](backup-restore-pitr.md)); writes after
 the upgrade are lost unless exported. Test this rehearsal before you need it.
 
-## PENDING ADR 0073 Phase 2/3: mixed-version and rolling upgrades are not supported
+## ADR 0073 Phase 2/3 status: mixed-version and rolling upgrades
 
-- **Mixed-version running (Phase 2):** landed (a replicated cluster version, feature gates,
-  the handshake range, Finalize); N-1 and N can run in one cluster, N-1 to N only. See the
-  rolling procedure above. Two *unrelated* builds, or skipping a release, remain
-  unsupported; a node whose range excludes the cluster version refuses to start by name.
-- **Rolling upgrade (Phase 3):** the per-node procedure, `animus cluster roll
-  plan|wait|status` (P3-B), `GET /admin/roll-health`, the `roll` status object and the
-  dashboard Version card are documented above. Operator `spec.image` orchestration is not
-  built yet; the operator still does **not** gate a pod roll (see "Kubernetes" above: do not edit
-  `spec.image` on a running cluster). The roll's core: restart one node at a time, wait
-  until healthy, then `cluster finalize`; **there is no rollback once a node has run the new
-  binary**.
-- Criterion E-7 (rolling-upgrade procedure) stays open until the operator piece lands and
-  the procedure has been exercised on real nodes.
+- **Mixed-version running (Phase 2):** a replicated cluster version, feature gates, the handshake
+  range and Finalize; N-1 and N can run in one cluster, N-1 to N only. See the rolling procedure
+  above. Two *unrelated* builds, or skipping a release, remain unsupported; a node whose range
+  excludes the cluster version refuses to start by name.
+- **Rolling upgrade (Phase 3, done 2026-10-05):** the per-node procedure with `animus cluster roll
+  plan|wait|status`, `GET /admin/roll-health`, the `roll` status object, the dashboard Version
+  card, and the operator-driven roll from a `spec.image` edit (above). The roll's core: restart one
+  node at a time, wait until healthy, then `cluster finalize`; **there is no rollback once a node
+  has run the new binary**.
+- Criterion E-7 (rolling-upgrade procedure) is partially met by this page; the operator path's
+  Kubernetes-semantics evidence is the nightly `kind` job, not yet run (see "Maturity" above).
+- **Open (Phase 3 findings):** issues #1237 and #1238 (rolling with transactions), #1235
+  (a `SimCluster` Memory-backend restart oddity, test-only). D4(b), a replicated maintenance mark
+  that suppresses repair churn during a roll, is a pending maintainer decision now that
+  the churn has been measured (ADR 0073's Phase 3 as-built amendment).
 
 Distinguish from rotation restarts: restarting nodes one at a time on the **same** build
 (certificate rotation, flag changes) is fine ([cert-rotation.md](cert-rotation.md)).

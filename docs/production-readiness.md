@@ -99,7 +99,7 @@ uses C-17.
 ## (e) Operations runbook
 
 Capacity planning needs B-01 and C-17; the upgrade chapter's rolling part
-needs ADR 0073 Phase 3.
+landed with ADR 0073 Phase 3 (E-7, partially met).
 
 | ID | Criterion | Status | Evidence | Owner |
 |---|---|---|---|---|
@@ -109,7 +109,7 @@ needs ADR 0073 Phase 3.
 | E-4 | Certificate rotation procedure (restart-time `TlsConfig::load()`) | Not met | Mechanism: `docs/adr/0064-tls-on-every-port.md` | e |
 | E-5 | Encryption key rotation procedure | Not met | Mechanism: `docs/adr/0069-encryption-at-rest.md` | e |
 | E-6 | Upgrade chapter: whole-cluster procedure per ADR 0073 | Not met | Supported and tested (X-3); no runbook page | e |
-| E-7 | Upgrade chapter: rolling-upgrade procedure | Pending-dependency | ADR 0073 Phase 3 | e |
+| E-7 | Upgrade chapter: rolling-upgrade procedure | Partially met | `docs/runbook/upgrade.md` (manual and operator paths); exercised on real processes by the `upgrade-previous-release` CI job (`crates/animusd/tests/upgrade_previous_release.rs`); the operator path's nightly `kind` leg (`E2E_UPGRADE=1`) has not yet had a verified run; **not met yet:** rolling with transactions has open defects (#1237, #1238) and the `kind` leg is unverified | e |
 | E-8 | Capacity planning and disk sizing with published numbers | Pending-dependency | B-01 and C-17 | e |
 | E-9 | A game-day drill checklist is executed once on `kind` | Not met | `scripts/e2e-kind.sh` is the substrate; no checklist | e |
 
@@ -154,6 +154,6 @@ date. Waivers are re-reviewed at every release.
 ## Summary (2026-10-04)
 
 Met: X-1 to X-10, A-4, B-4, D-1, D-2, F-1, G-8. Pending-dependency: X-11,
-E-7, E-8, F-2, F-5. Not met: every remaining row (A-1 to A-3, B-1 to B-3, all of C, D-3
+E-8, F-2, F-5. Partially met: D-7, E-7 (ADR 0073 Phase 3 landed 2026-10-05). Not met: every remaining row (A-1 to A-3, B-1 to B-3, all of C, D-3
 to D-8, E-1 to E-6 and E-9, F-3, F-4, G-1 to G-7, G-9). The project is therefore
 **pre-alpha**.

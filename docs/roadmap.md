@@ -1493,7 +1493,7 @@ outstanding on the wire surface at present.
   amendment's own "what remains unowned" accounting and `crates/animusd/
   CLAUDE.md`'s consolidated closed-C-15 appendix.
 
-### C-16 Upgrade compatibility (ADR 0073) — Phases 0 and 1 done; Phase 2 in progress (P2-A and P2-C landed)
+### C-16 Upgrade compatibility (ADR 0073) — Phases 0-3 done (Phase 3, rolling-upgrade orchestration, 2026-10-05); open: rolling with transactions, the D4(b) decision
 
 - **Gap (closed):** `website/index.html` listed "On-disk format stability,
   then rolling upgrades" as Planned with no ADR, roadmap entry, or issue
@@ -1578,10 +1578,9 @@ outstanding on the wire surface at present.
   per Phase 0 workstream); a new `SimCluster`-based upgrade/restart/
   finalize corpus with a per-node selectable version knob (proposed depth
   knob `ANIMUS_UPGRADE_SEEDS`, Phase 2/3 work); a `kind` e2e for the
-  operator's rolling-restart path, once Phase 3 exists.
+  operator's rolling-restart path (done as the nightly `E2E_UPGRADE=1` leg, unverified).
 - **ADR:** [0073](adr/0073-upgrade-compatibility.md) (Accepted, 2026-09-27
-  — Phases 0 and 1 done, baseline `9a9f972f`; Phase 2 in progress (P2-A, P2-C landed); Phase 3
-  planned).
+  — Phases 0-3 done, baseline `9a9f972f`; Phase 3 as built 2026-10-05).
 - **Size:** XL overall across all four phases; Phase 0 alone is roughly M
   (mechanical, one format at a time, no design risk), now split five ways
   across independent sessions.
@@ -1591,7 +1590,7 @@ outstanding on the wire surface at present.
   its orchestration primitives, and on ADR 0060 for the operator's own
   `spec.image` handling.
 - **Status:** Phase 0 done (workstreams A-E merged, baseline `9a9f972f`);
-  Phase 1 done (2026-10-03); **Phase 2 in progress: P2-A has merged on
+  Phase 1 done (2026-10-03); **Phase 2 (history; now done): P2-A had merged on
   `main` and P2-C (node wiring, era live, `/admin/cluster-version` and
   `animus cluster version|finalize`) has landed** (`c4948113` version module + `Metadata` `node_versions`/
   `cluster_version` + `ReportNodeVersion`/`FinalizeClusterVersion`,
@@ -1603,8 +1602,32 @@ outstanding on the wire surface at present.
   `required_gate` exists in the code yet (ADR 0073 designs it as an
   exhaustive match on the wire enums). Open issue #1168: the
   `FinalizeClusterVersion` apply does not block on Down/Leaving/
-  never-activated Joining members (Decision 6). Phase 3 not started, no
-  owner or target wave yet.
+  never-activated Joining members (Decision 6) — closed by the P2
+  close-out. **Phase 2 is done (2026-10-04) and Phase 3 is done
+  (2026-10-05)**; see ADR 0073's two 2026-10-05 Phase 3 amendments (design,
+  then as built).
+- **Phase 3 as built (P3-A..P3-F):** `GET /admin/roll-health` (one
+  server-side verdict), the `roll` object in `/admin/cluster-version` and a
+  dashboard Version card (P3-A); `animus cluster roll plan|wait|status`
+  (+ `wait --finalize --yes`; `plan` is re-entrant mid-roll) (P3-B); the new
+  pure `animus-roll` crate and the `sim_cluster_roll_orchestrator` corpus
+  (P3-C); the operator's gated `spec.image` roll behind an operator-owned
+  `StatefulSet` partition, `spec.upgrade`/`status.upgrade` (P3-D); the
+  `upgrade-previous-release` `ProdEnv` CI job (R-1 pinned in
+  `scripts/upgrade-from.txt`, `ac57d56a` until a `v*` tag exists) and the
+  nightly `kind` leg `E2E_UPGRADE=1` (P3-E); docs close-out (P3-F). Supported:
+  a manual or operator-driven rolling upgrade R-1 -> R of a cluster of at
+  least three nodes, ending in an explicit (or opted-in automatic) finalize;
+  no rollback once a node ran the new binary. **Open items:** issues #1237
+  (ungated `txn-envelope` v2 intent panics an N-1 replica) and #1238
+  (acknowledged writes lost across a roll with transactions), found by the
+  previous-release job and fixed in a separate PR (the transactional roll
+  variant returns to that job once they land); #1235 (a `SimCluster` Memory
+  backend restart oddity); the nightly `kind` leg has not had a verified run;
+  **D4(b)** (a replicated, expiring per-node maintenance mark that suppresses
+  repair churn during a roll, a `Gate::Era` command) is a **pending
+  maintainer decision** now that the D4 measurement exists (ADR 0073 as-built
+  amendment); `roll run --exec` is deferred (maintainer decision 8).
 
 ### C-17 Scale and density testing (per-node tablet density, metadata growth)
 
@@ -1793,7 +1816,7 @@ outstanding on the wire surface at present.
     needed; none exists today), backup/restore and PITR drill (ADR 0059),
     cert rotation (ADR 0064 section on restart-time `TlsConfig::load()`),
     encryption key rotation (ADR 0069), upgrade procedure per ADR 0073
-    (whole-cluster today; rolling after C-16 Phase 3), capacity planning
+    (whole-cluster and rolling, C-16 Phase 3 done), capacity planning
     (numbers from `animus-bench` (ADR 0076) and C-17), disk sizing, and a game-day drill
     checklist actually executed once on `kind`.
   - **(f) Observability completeness (independent; M).** SLO definitions
@@ -1843,7 +1866,7 @@ outstanding on the wire surface at present.
   independent change, which `CLAUDE.md` Session operating mode item 3
   allows; it is not a stack.
 - **Size:** XL in total (c, e, f, g are M each; a, b, d are L).
-- **Depends:** (e) upgrade chapter needs C-16 Phase 3 (rolling upgrades);
+- **Depends:** (e) upgrade chapter needs C-16 Phase 3 (rolling upgrades, done);
   (e) capacity planning and (a) need `animus-bench` (ADR 0076; its first curated run is pending); (e)/(d) sizing use C-17;
   (b) real-cluster chaos benefits from the operator e2e leg staying
   green. (c), (f), (g) depend on nothing.
@@ -2119,7 +2142,7 @@ wave are independent and can run in parallel.
 | 17 | S-08 (S3 credentials/multipart; landed 2026-10-04); G-01 stage G-a + G-b (topology-aware operator, global-tables ADR); R-01 sub-tracks c (fuzzing), f (observability), g (release engineering) | All independent of each other and of the open C-16 phases; no ordering constraint |
 | 18 | C-17 (scale/density), R-01 sub-tracks a (soak), b (chaos), d (resource bounds), e (runbook) | C-17 Tier 2 and R-01 (a)/(e) capacity planning need `animus-bench`'s generator (landed, ADR 0076); C-17 Tier 1 and R-01 (b)/(d) can start earlier |
 | 19 | G-01 stages G-d (MREC), G-e (federation); G-c (MRSC stretch) landed 2026-10-05 | G-c: done (ADR 0075 "G-c as built"; residuals under G-01 above). G-d/G-e: C-16 Phase 2 is done and the first gate has shipped (`GlobalTables`, version 2); they add their own gates. `animus-bench` (ADR 0076) cross-region variant still owed to quantify WAN cost |
-| 20 | R-01 runbook upgrade chapter | After C-16 Phase 3 (rolling upgrades) |
+| 20 | R-01 runbook upgrade chapter | C-16 Phase 3 (rolling upgrades) is done: `docs/runbook/upgrade.md` carries the rolling and operator procedures |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted

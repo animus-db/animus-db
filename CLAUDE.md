@@ -102,8 +102,8 @@ older post-baseline binary wrote, an existing golden fixture is never edited
 or deleted (`scripts/check-format-fixtures.sh` enforces this in CI), and a
 format change is a new version tag plus a new fixture, never a rewrite of an
 old one. **Wire formats** follow the same rule as of Phase 2 (done: a
-replicated cluster version and feature gates, below); an operator-orchestrated
-**rolling upgrade** waits for Phase 3; **Support window: every post-baseline version stays readable forever**
+replicated cluster version and feature gates, below); **rolling upgrades**
+are supported as of Phase 3 (done, below); **Support window: every post-baseline version stays readable forever**
 (2026-09-30) — old decoders and fixtures are never deleted. **Phase 1 is done (2026-10-03):** every durable format has a
 version-dispatching decoder with a `legacy` seam and a per-version fixture
 test, and the upgrade-restart harness (`animus-test` tiers 0/1,
@@ -117,7 +117,23 @@ sections 1-4 and 8), a mixed-version corpus (both tiers, negative controls,
 stop, from today's Phase 1 binaries to B2 and from release R-1 to R**
 (`animus cluster version` / `animus cluster finalize`; skipping a release,
 rolling a node back and a Phase 1 binary joining after the era started are
-not supported). The operator-orchestrated roll is Phase 3. The
+not supported). **Phase 3 is done (2026-10-05): rolling-upgrade orchestration**
+(ADR 0073's Phase 3 design and as-built amendments). Supported: a **manual roll
+with the CLI** (`animus cluster roll plan|wait|status`, `GET /admin/roll-health`,
+`animus cluster finalize`; one node at a time, control leader last after a
+leadership transfer, no drain) and an **operator-orchestrated roll** (a
+`spec.image` or other pod-template edit rolls an `AnimusCluster` of at least
+three nodes one pod at a time behind an operator-owned `StatefulSet` partition and
+the shared `animus-roll` gate; finalize manual by default, `spec.upgrade.finalize:
+Auto` opt-in; `docs/runbook/upgrade.md`). Still no rollback once a node has run the
+new binary, no skipped release, no mid-roll image revert. **Open:** issues
+#1237 (ungated `txn-envelope` v2 intent can panic an N-1 replica) and #1238 (acked
+writes lost across a roll with transactions), found by the `upgrade-previous-release`
+CI job and fixed separately — until they land, do not roll while multi-key
+transactions are in use; #1235 (a `SimCluster` Memory-backend restart oddity,
+test-only); the nightly `kind` operator-roll leg (`E2E_UPGRADE=1`) has not had a
+verified run; D4(b), a replicated maintenance mark that suppresses repair churn during
+a roll, is a pending maintainer decision (measured: ADR 0073 as-built). The
 first real bumps have landed (2026-10-03, #1140/#1141/#1142): `control-wal`,
 `shared-wal` and the LSM WAL (`lsm-wal`, `LWL1`) are v2 (WAL sync markers) and
 the harness transcodes them to v1 for real; `raftkv-wal` is v2 too (embedded
@@ -222,6 +238,7 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 | `ANIMUS_RAFTKV_WAL_FAULTS=1` | off | run a second pass of the raftkv corpus's crash-based cells (`LeaderKill`/`FollowerKill`) with `torn_tail_on_crash`+`corrupt_on_crash` armed for the whole run |
 | `ANIMUS_UPGRADE_RESTART_SEEDS=K` | 1 | upgrade-restart corpus depth, tiers 1 and 2 (ADR 0073 P1-D): tier 1 `animus-test` `tests/it/upgrade_restart_corpus.rs` — K seeds per cell (21 cells); tier 2 `animusd` `sim_cluster_upgrade_corpus` (whole-cluster restart over `SimCluster`'s `LsmEngine` backend + the DynamoDB wire, 3 cells; `cargo test -p animusd --lib sim_cluster_upgrade_corpus`); `ANIMUS_UPGRADE_RESTART_CELL=<substring>` narrows to matching cells (combine with `ANIMUS_SEED=<seed>` to replay one). |
 | `ANIMUS_UPGRADE_SEEDS=K` | 1 | mixed-version corpus depth (ADR 0073 Phase 2, P2-D; distinct from `ANIMUS_UPGRADE_RESTART_SEEDS`): pure tier `animus-control` `tests/it/version_mixed_corpus.rs` (`cargo test -p animus-control --test it version_mixed_corpus::`, 8 cells) and `animusd` `sim_cluster_mixed_version_corpus` (rolling Phase 1 -> B2 over `SimCluster`, `cargo test -p animusd --lib sim_cluster_mixed_version`) and, since ADR 0073 Phase 3 P3-C, `animusd` `sim_cluster_roll_orchestrator` (the `animus-roll` roll driver over `SimCluster`'s LSM backend, 12 cells, `cargo test -p animusd --lib sim_cluster_roll_orchestrator`); `ANIMUS_UPGRADE_CELL=<substring>` narrows cells, `ANIMUS_SEED=<seed>` replays one. Needs `animus-control`'s `sim-versions` feature (enabled via `animus-test`) |
+| `E2E_UPGRADE`, `ANIMUSD_IMAGE_PREV`, `E2E_UPGRADE_ROLL_TIMEOUT`, `UPGRADE_CLIENT_IMAGE` | 0 / `animusd:e2e-prev` / 1500 / `curlimages/curl:8.10.1` | `kind` operator-driven rolling-upgrade leg of `scripts/e2e-kind.sh` (ADR 0073 Phase 3, D10; nightly `.github/workflows/upgrade-kind-nightly.yml`, not per-push): `E2E_UPGRADE=1` bootstraps on `ANIMUSD_IMAGE_PREV` (the previous release, built from `scripts/upgrade-from.txt`) with `spec.upgrade.finalize: Auto`, starts an in-cluster retrying write client, edits `spec.image` to `ANIMUSD_IMAGE`, and asserts a gated roll (one pod unavailable at most), finalize, and no lost/stalled acked write; plain-TCP only; **unverified** (kind cannot run in the sandbox) |
 | `ANIMUS_UPGRADE_FROM_BIN` / `_REF` / `_REPORT_DIR` / `_RESTART_GAP_SECS` / `_TXN` / `_CONTROL`, `ANIMUS_CLI_BIN` | required / — / — / 0 (12 on the 4-node variant) / unset | previous-release rolling-upgrade `ProdEnv` test (ADR 0073 Phase 3 P3-E, D10; `animusd` `tests/upgrade_previous_release.rs`, `upgrade-from` feature, CI job `upgrade-previous-release`): `_BIN` = the pinned R-1 `animusd` (`scripts/build-upgrade-from.sh`, pin in `scripts/upgrade-from.txt`; **a missing binary fails the test, it never skips**); `_REF` labels it in the report; `_REPORT_DIR` receives the per-variant JSON (rolling steps, D4 repair churn) and, on a failure, history/op-trace/node logs; `_RESTART_GAP_SECS` keeps each node down that long before it restarts (past the 5 s repair dwell the D4 rebuild traffic shows); `_TXN=1` turns multi-key transactions on (off by default: against the pinned `ac57d56a` they expose three known defects, see the test's "Known findings"); `_CONTROL=same-binary\|current-only` runs the same roll with no binary change (triage: mixed-version vs restart/repair defect); `ANIMUS_CLI_BIN` overrides the `animus` binary (default: next to `animusd`). Run: `ANIMUS_UPGRADE_FROM_BIN=$(scripts/build-upgrade-from.sh) cargo test -p animusd --features upgrade-from --test upgrade_previous_release -- --nocapture --test-threads=1` |
 | `ANIMUS_MRSC_SEEDS=K` | 1 | **two corpora share this knob** (ADR 0075, G-01 G-c; each corpus step in `corpus-deep.yml` sets it separately): (1) pure tier, `animus-cp-data` `preferred_leader_corpus` (M2) — 3 regions x 1 node over WAN links, real `host::Reconciler` with `MetadataView.preferred_leader`; cells + negative control (empty preferred map leaves the leader outside the preferred region) — `cargo test -p animus-cp-data --test it preferred_leader_corpus::`; (2) cluster tier, `animusd` `sim_cluster_mrsc` (M4) — 6 nodes, 3 regions x 2, WAN links, LSM engine, table converted over the DynamoDB wire; one `sim_cluster_mrsc_corpus_<cell>` test per cell (steady, region loss leader/follower, partition heal, split, in-region replacement, witness form, decommission guard) + 3 negative controls — `cargo test -p animusd --lib sim_cluster_mrsc`; one seed is ~8 CPU-minutes in a debug build. `ANIMUS_MRSC_CELL=<substring>` narrows (both), `ANIMUS_SEED=<seed>` replays one |
 | `ANIMUS_RECONCILER_SEEDS=K` | 1 | reconciler-corpus depth (`animus-cp-data`) |
@@ -548,7 +565,10 @@ truth; this map is just for navigation.
   cluster. Only the client-facing wire edge (DynamoDB) is exposed outside
   the cluster; this is what motivated the ADR 0047 client/intra port split
   — review any design touching listeners, ports, or address resolution
-  against this shape. `spec.tls` (ADR 0064) turns TLS on for the whole
+  against this shape. A pod-template edit (`spec.image`, a `controlNodes`
+  growth) is a gated rolling upgrade the operator drives through its own
+  `StatefulSet` partition (ADR 0073 Phase 3, `crates/animus-operator/src/roll.rs`).
+  `spec.tls` (ADR 0064) turns TLS on for the whole
   cluster from either a pre-existing `Secret` or a cert-manager
   `Certificate`/`Issuer` this operator only references, mounted read-only
   on every pod and wired into the generated `cluster.json`; the scale-down

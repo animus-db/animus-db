@@ -217,9 +217,9 @@
         <li>Continuous backups (point-in-time recovery to any second, <code>UpdateContinuousBackups</code>/<code>RestoreTableToPointInTime</code>)</li>
         <li>Export a table's data to a customer-named S3 bucket in DynamoDB's own JSON layout (<code>ExportTableToPointInTime</code>), and import it back into a brand-new table (<code>ImportTable</code>) — either this adapter's own export, or real AWS's identical layout</li>
         <li>Metrics, OpenTelemetry tracing, admin JSON endpoints and a built-in dashboard</li>
+        <li>Rolling upgrades — a node-by-node roll with <code>animus cluster roll plan|wait|status</code> and <code>animus cluster finalize</code>, or on Kubernetes from a <code>spec.image</code> edit, with the operator rolling pods one at a time behind a health gate (not yet safe while multi-item transactions are in use)</li>
       </ul></div>
       <div class="lcard"><h3>Day two, missing</h3><ul>
-        <li>Operator-orchestrated rolling upgrades — a node-by-node roll with <code>animus cluster roll plan|wait|status</code> and <code>animus cluster finalize</code> is supported, but the operator does not yet drive it from a <code>spec.image</code> change</li>
         <li>Authentication beyond SigV4 — TLS (below) adds encryption and, on the internal ports, cluster-membership authentication, but caller identity on the client port is still just opt-in SigV4</li>
       </ul></div>
     </div>

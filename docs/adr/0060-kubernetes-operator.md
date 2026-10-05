@@ -420,24 +420,65 @@ just because it sits outside the `Env` seam.
 
 ### Upgrades
 
-**No operator-driven upgrade yet; the operator orchestrating a roll waits
-on ADR 0073 Phase 3.** The repository's compatibility rule is staged (root
-`CLAUDE.md`, [ADR 0073](0073-upgrade-compatibility.md)): Phase 1 (done
-2026-10-03) supports a **whole-cluster stop -> upgrade -> restart**, and
-Phase 2 (done 2026-10-04) adds a replicated cluster version, feature gates and
-a mixed-version corpus, which make a **manual node-by-node rolling upgrade**
-supported (from today's Phase 1 binaries to B2, and from release R-1 to R):
-restart one node at a time, wait until it is `Active` and no tablet is
-under-replicated, then `animus cluster finalize`. Not supported: skipping a
-release, rolling a node back, a Phase 1 binary joining after the era started.
-The **operator does not orchestrate any of this**: it does not reject a
-`spec.image` edit (a `validate_spec` test allows one), and the `StatefulSet`
-controller rolls it like any pod-template change, one pod at a time with no
-wait-healthy gate, no PDB-aware ordering and no finalize step. Until Phase 3
-treat `spec.image` changes as unsupported and roll by hand as above, or
-recreate the `AnimusCluster`. (Earlier text claimed an image change was
-"either rejected by the operator's own validation or requires recreating the
-cluster"; the validation half was never true.)
+**The operator orchestrates rolling upgrades** (ADR 0073 Phase 3, done
+2026-10-05; the design and as-built record are in
+[ADR 0073](0073-upgrade-compatibility.md)'s two 2026-10-05 Phase 3
+amendments). The repository's compatibility rule is staged (root
+`CLAUDE.md`): Phase 1 supports a whole-cluster stop -> upgrade -> restart,
+Phase 2 adds a replicated cluster version and feature gates so a
+node-by-node rolling upgrade (R-1 -> R, never skipping a release) is
+supported, and Phase 3 makes that roll something a CLI and this operator
+drive with a health gate between nodes and an explicit, irreversible
+finalize step.
+
+- **Every pod-template change is a gated roll** — a `spec.image` edit *and* a
+  restart-relevant config change such as a `spec.controlNodes` growth. There
+  is no ungated window: the operator owns the `StatefulSet`'s
+  `updateStrategy.rollingUpdate.partition` (a `RollingUpdate`, not
+  `OnDelete`, so no pod-`delete` RBAC), applies a changed template together
+  with `partition = replicas` in the same server-side apply, then lowers it one
+  ordinal at a time, only while every member is `Active`,
+  `GET /admin/roll-health` is `ok` everywhere (the one server-side verdict the
+  CLI, dashboard and operator share) and the previous pod is `Ready`, healthy
+  and has reported the new range. The decision is `animus-roll`'s pure
+  `decide_with_target` (the operator fixes the order: a `StatefulSet` replaces
+  highest ordinal first); the control leader is handed leadership away
+  (`POST /admin/control/transfer`) before its pod restarts. Fail closed: an
+  unobservable gate holds the partition.
+- **Finalize** is irreversible and manual by default (`spec.upgrade.finalize:
+  Manual`; the operator reports `UpgradeFinalizePending`, a human runs
+  `animus cluster finalize`). `Auto` is opt-in and finalizes only when the roll
+  is complete, `can_finalize` holds and the cluster has been healthy for
+  `spec.upgrade.soakSeconds` (default 0); a blocker is retried, never forced.
+- **Fix forward, no rollback.** A pod that never becomes healthy stops the roll
+  at that pod (`UpgradeBlocked`); the fix is a fixed `spec.image`. Reverting
+  `spec.image` to the pre-roll image after any pod ran the new binary is
+  refused by the webhook and pinned by the reconciler
+  (`UpgradeChangesHeld`); `spec.nodes`/`spec.controlNodes` edits are held until
+  `RollComplete`. A shape whose PodDisruptionBudget `maxUnavailable` is 0 (one
+  control node, fewer than three nodes) is not rolled: the template is staged,
+  `UpgradeBlocked` says why, and the whole-cluster stop-upgrade-restart
+  applies. A skipped release is caught by the first upgraded pod's startup
+  range check (no image-label pre-check, ADR 0073 maintainer decision 5).
+- **Observability**: additive `status.upgrade` (`phase`, versions, `onNew`/
+  `total`, images and the stall/soak clocks) and the conditions
+  `UpgradeInProgress`, `UpgradeBlocked`, `UpgradeFinalizePending`,
+  `RollComplete`, `UpgradeChangesHeld`; additive optional `spec.upgrade`; the
+  CRD schema version stays 1 (new fixture `v1-upgrade.json`).
+- **Evidence and limits**: fakes-level tests prove the operator's decisions;
+  the shared machine is proven by the `sim_cluster_roll_orchestrator` corpus
+  and a real-process previous-release roll by the `upgrade-previous-release`
+  CI job; Kubernetes' own partition semantics are exercised only by the
+  nightly `kind` leg (`E2E_UPGRADE=1`, `.github/workflows/upgrade-kind-
+  nightly.yml`), which has not yet had a verified run. **Open:** rolling
+  while multi-item transactions are in use (issues #1237, #1238). Mechanism:
+  `crates/animus-operator/CLAUDE.md`; user-facing steps:
+  `docs/runbook/upgrade.md` and `deploy/operator/README.md`.
+
+(Earlier text said the operator did not orchestrate upgrades and that an image
+change was "either rejected by the operator's own validation or requires
+recreating the cluster"; the validation half was never true, and the rest was
+superseded by Phase 3.)
 
 ### End-to-end testing
 
