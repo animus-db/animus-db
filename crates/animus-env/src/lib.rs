@@ -309,6 +309,22 @@ pub fn nid(n: u64) -> NodeId {
     NodeId::new_unchecked(format!("n{n}"))
 }
 
+/// Whether a disk-seam error means the volume is out of space (ENOSPC, or a
+/// quota exhaustion, EDQUOT) — the one I/O failure class the Raft persist
+/// path treats as **recoverable** (R-01 (d) / ADR 0074 §2): the group's WAL is
+/// marked suspect, rewritten from the in-memory log once space returns, and
+/// writes resume without a restart. Every other disk error stays a loud
+/// crash-stop. `ProdEnv` surfaces ENOSPC as `ErrorKind::StorageFull` (std maps
+/// raw 28 to it) and `SimEnv`'s injector produces the same kind; the raw-errno
+/// arm covers a wrapper that rebuilt the error from an OS code alone.
+#[must_use]
+pub fn is_storage_full(e: &std::io::Error) -> bool {
+    /// Linux `ENOSPC` / `EDQUOT`.
+    const ENOSPC: i32 = 28;
+    const EDQUOT: i32 = 122;
+    e.kind() == std::io::ErrorKind::StorageFull || matches!(e.raw_os_error(), Some(ENOSPC | EDQUOT))
+}
+
 /// A monotonic instant, measured in nanoseconds since the environment started.
 ///
 /// Under simulation this is virtual time; under production it is measured from a

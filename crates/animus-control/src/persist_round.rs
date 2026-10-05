@@ -99,12 +99,15 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
-use animus_env::NodeId;
+use animus_env::{Env, NodeId, is_storage_full};
 use futures::task::AtomicWaker;
 
+use crate::fair_lock::FairMutex;
 use crate::persist::WalRecord;
 use crate::raft::{RaftCore, RaftMsg, StateMachine};
 
@@ -134,6 +137,15 @@ pub struct PersistProgress {
     durable: AtomicU64,
     /// The consensus loop's waker, registered by [`PersistArm`] each park.
     waker: AtomicWaker,
+    /// The group's WAL is **suspect** (R-01 (d), ADR 0074 §2 disk-full
+    /// semantics): a write to it failed with ENOSPC, so its on-disk state is
+    /// unknown (a torn partial append, or bytes a failed `fsync` may have
+    /// dropped from the page cache). Nothing may append to it again, and no
+    /// `fsync` on it may be retried and trusted (fsyncgate); the only way out
+    /// is [`recover_suspect_wal`], which rewrites the whole file from the
+    /// in-memory log onto a **fresh** file. While set the group refuses writes
+    /// with a named `StorageFull` error and `/admin/health` reports it.
+    suspect: AtomicBool,
 }
 
 impl PersistProgress {
@@ -171,7 +183,31 @@ impl PersistProgress {
     /// message's records are on disk no matter which task put them there or
     /// whether it numbered the round correctly.
     pub fn fully_durable(&self, dirty: bool) -> bool {
-        !dirty && self.durable() >= self.drained()
+        !dirty && self.durable() >= self.drained() && !self.is_suspect()
+    }
+
+    /// Mark this group's WAL suspect after an ENOSPC (see the field doc) and
+    /// wake the consensus loop so it starts [`recover_suspect_wal`] even when
+    /// it owes the WAL nothing new (a compaction rewrite that failed after
+    /// draining). Callable from any task.
+    pub fn mark_suspect(&self) {
+        self.suspect.store(true, Ordering::SeqCst);
+        self.waker.wake();
+    }
+
+    /// Whether the WAL is suspect — i.e. the group is in the `StorageFull`
+    /// state: refusing writes, awaiting a rewrite onto free space.
+    pub fn is_suspect(&self) -> bool {
+        self.suspect.load(Ordering::SeqCst)
+    }
+
+    /// Declare every drained round durable. **Only for a successful
+    /// whole-image rewrite** ([`recover_suspect_wal`]), called under the core
+    /// lock in the capture's acquisition, with the group's `wal_lock` held
+    /// (so no drainer can have a round in flight): the image contains the
+    /// whole in-memory log, so every record any round ever drained is on disk.
+    fn complete_all_drained(&self) {
+        self.complete_drain(self.drained());
     }
 
     /// Record that `round`'s records are now durable, and wake the consensus
@@ -246,6 +282,93 @@ where
     let records = core.drain_persist();
     let round = (!records.is_empty()).then(|| progress.begin_drain());
     (records, round)
+}
+
+/// First delay of the free-space probe in [`recover_suspect_wal`].
+const STORAGE_FULL_PROBE_MIN: Duration = Duration::from_millis(50);
+/// Cap of the probe's exponential backoff. Each probe is a whole-WAL rewrite,
+/// so a disk that stays full for minutes must not be hammered.
+const STORAGE_FULL_PROBE_MAX: Duration = Duration::from_secs(2);
+
+/// **Recover a suspect WAL without a restart** (R-01 (d), ADR 0074 §2;
+/// `docs/resource-bounds.md` §3). Run by the consensus loop's persist future
+/// after an ENOSPC (its own, or a compaction rewrite's that raised
+/// [`PersistProgress::mark_suspect`]).
+///
+/// The suspect file is never appended to or `fsync`ed again. Instead, on each
+/// probe (an `env.sleep` backoff, so it is deterministic under `SimEnv`) it
+/// takes the group's `wal_lock`, drains whatever the core owes (numbering a
+/// round like any drainer), captures [`RaftCore::wal_image`] (snapshot + hard
+/// state + the **whole** in-memory log, a superset of everything any failed or
+/// stranded round tried to write) and hands it to `write_image`, which must
+/// write it as a **fresh file** (`Disk::replace`, or the shared WAL's
+/// `compact_group`): a new descriptor, no reliance on the old file's state, a
+/// torn partial append simply disappears. Only after that returns `Ok` does it
+/// advance the durable watermark and declare every drained round durable
+/// (durable-before-visible: nothing is acked before this point), then clear the
+/// suspect flag.
+///
+/// `write_image` failing with ENOSPC just means space has not come back: keep
+/// probing. Any other error is returned for the caller to treat as the real
+/// durability fault it is. `Ok(false)` means `halted` was observed (teardown)
+/// and nothing was made durable. An attempt is deferred (not failed) while a
+/// staged compaction rewrite is in flight, since it shares the file's `.tmp`
+/// sibling.
+pub async fn recover_suspect_wal<E, C, S, F, Fut>(
+    env: &E,
+    core: &Mutex<RaftCore<C, S>>,
+    wal_lock: &FairMutex,
+    progress: &PersistProgress,
+    halted: &AtomicBool,
+    mut write_image: F,
+) -> std::io::Result<bool>
+where
+    E: Env,
+    C: Clone + std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned,
+    S: StateMachine<C>,
+    F: FnMut(Vec<WalRecord<C, S>>) -> Fut,
+    Fut: Future<Output = std::io::Result<()>>,
+{
+    progress.suspect.store(true, Ordering::SeqCst);
+    let mut backoff = STORAGE_FULL_PROBE_MIN;
+    loop {
+        if halted.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        env.sleep(backoff).await;
+        backoff = (backoff * 2).min(STORAGE_FULL_PROBE_MAX);
+        if halted.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        let _wal = wal_lock.lock().await;
+        if wal_lock.tail().is_active() {
+            // A staged compaction rewrite is mid-flight outside the lock;
+            // writing the same `.tmp` now would clobber it. It finishes (or
+            // fails and ends the tail) on its own: retry after it.
+            continue;
+        }
+        let (image, through) = {
+            let mut c = core.lock().expect("raft core poisoned");
+            // Whatever accumulated since is subsumed by the image; number the
+            // drain so the invariant "every drain is a round" holds.
+            let _ = drain_for_round(&mut c, progress);
+            (c.wal_image(), c.last_log_index())
+        };
+        match write_image(image).await {
+            Ok(()) => {
+                wal_lock.markers().invalidate();
+                let mut c = core.lock().expect("raft core poisoned");
+                c.mark_durable_through(through);
+                progress.complete_all_drained();
+                progress.suspect.store(false, Ordering::SeqCst);
+                return Ok(true);
+            }
+            Err(e) if is_storage_full(&e) => {
+                tracing::warn!(error = %e, "wal rewrite still hits ENOSPC; group stays StorageFull");
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Outbound messages held back until their persist round lands, owned solely by
@@ -365,10 +488,14 @@ impl Future for PersistArm<'_, '_> {
         {
             return Poll::Ready(PersistWake::Durable);
         }
-        if let Some(own) = this.own.as_mut()
-            && own.as_mut().poll(cx).is_ready()
-        {
-            return Poll::Ready(PersistWake::OwnRoundDone);
+        if let Some(own) = this.own.as_mut() {
+            if own.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(PersistWake::OwnRoundDone);
+            }
+        } else if this.progress.is_suspect() {
+            // The WAL went suspect outside the loop's own round (a failed
+            // compaction rewrite): resolve so the loop starts the recovery.
+            return Poll::Ready(PersistWake::Durable);
         }
         // Nothing buffered and no round of our own: this arm is inert, and the
         // loop parks on its other four sources exactly as before.
@@ -518,6 +645,30 @@ mod tests {
             "with pending empty and no round in flight the node owes nothing, \
              so a buffered ack must be releasable"
         );
+    }
+
+    #[test]
+    fn a_suspect_wal_is_never_fully_durable_until_the_rewrite_completes() {
+        let p = PersistProgress::default();
+        assert!(!p.is_suspect());
+        assert!(p.fully_durable(false));
+        p.mark_suspect();
+        assert!(p.is_suspect());
+        // Even with nothing owed and nothing in flight: the file's state is
+        // unknown, so no buffered ack may ship on its strength.
+        assert!(!p.fully_durable(false));
+        // The rewrite's success path: every drained round is declared durable
+        // and the flag cleared, in that order.
+        let r = p.begin_drain();
+        assert!(!p.fully_durable(false));
+        p.complete_all_drained();
+        assert!(p.durable() >= r);
+        assert!(
+            !p.fully_durable(false),
+            "still suspect until the flag clears"
+        );
+        p.suspect.store(false, Ordering::SeqCst);
+        assert!(p.fully_durable(false));
     }
 
     #[test]

@@ -97,6 +97,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         pending_kind_writes: Vec<PendingKindWrite>,
     ) -> Result<(TxnId, Vec<u8>, String, HlcTimestamp, StageOutcome), TxnAbortReason> {
         decide::frozen_refusal(leader.is_frozen()).map_err(TxnAbortReason::Other)?;
+        leader
+            .refuse_if_storage_full()
+            .map_err(TxnAbortReason::Other)?;
         if !pending_kind_writes.is_empty() {
             let meta = self.effective_metadata();
             let schema = dynamo::write_schema_for(&meta, table);
@@ -653,6 +656,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         match self.cp_route(table, &record_key, deadline).await {
             CpRoute::Local(leader) => {
                 decide::frozen_refusal(leader.is_frozen())?;
+                leader.refuse_if_storage_full()?;
                 if let Some(created_ts) = orphan_created_ts {
                     leader
                         .txn_abort_orphan(txn_id.clone(), record_key.clone(), created_ts)
@@ -817,6 +821,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 // resolve re-routes to the child, which holds the copied
                 // intent + record and materializes at its own position.
                 decide::frozen_refusal(leader.is_frozen())?;
+                leader.refuse_if_storage_full()?;
                 match leader.txn_resolve(txn_id, record_key, keys, outcome).await {
                     Some((_, outcome)) => Ok(outcome),
                     None => Err("CP group leader moved during resolve; retry".into()),

@@ -94,6 +94,12 @@ impl RewriteTail {
             .unwrap_or_default()
     }
 
+    /// Whether a staged rewrite is recording right now. **Call while holding
+    /// the lock** (the answer is only stable under it).
+    pub fn is_active(&self) -> bool {
+        self.inner.lock().expect("rewrite tail poisoned").is_some()
+    }
+
     /// Stop recording (the rewrite swapped or was abandoned).
     pub fn end(&self) {
         *self.inner.lock().expect("rewrite tail poisoned") = None;

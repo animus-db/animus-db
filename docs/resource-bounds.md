@@ -86,85 +86,79 @@ No other `unbounded_channel`/`mpsc::unbounded` exists outside tests
 (`grep -rn unbounded_channel crates/*/src`). Std/other channels in the tree are
 `oneshot`.
 
-## 3. Disk-full (D-7): what happens today, and the design
+## 3. Disk-full (D-7): implemented (R-01 (d), issue #1185)
 
-Traced on a real node (`ProdEnv`):
+**Status: implemented in simulation; not yet proven on a real size-limited
+filesystem** (see Residuals). Before this change an ENOSPC on a WAL `append`/
+`sync` hit an `assert!` in `animus_cp_data::persist_wal` /
+`animus_control::node::persist_wal` and silently killed that group's consensus
+task until a process restart (the node still looked healthy). Now:
 
-1. `ProdEnv::append` and `sync` return `std::io::Error`; ENOSPC surfaces as
-   `ErrorKind::StorageFull`. Nothing in `animus-env`, `animus-storage`,
-   `animus-cp-data` or `animus-control` inspects it. There is no named
-   `StorageFull` error anywhere outside the `SimEnv` fault injector.
-2. The per-tablet Raft consensus loop persists with `animus_cp_data::persist_wal`
-   (and the `SharedWal` variant), the control plane with
-   `animus_control::node::persist_wal`. On an `append` or `sync` error while the
-   group is not `halted`, both `assert!` (a hard panic): "a real durability
-   fault on a live leader (crash-stop-before-ack)".
-3. A panic inside a task spawned through `env.spawn_task` is caught by
-   `ProdEnv` (issue #939), logged ("spawned task panicked"), counted on the env
-   and the process stays up. There is no `panic = abort` in any profile.
+1. **Classification.** `animus_env::is_storage_full(&io::Error)` names
+   `ErrorKind::StorageFull` at the `Disk` seam, so every layer matches the same
+   thing and `SimEnv`'s `DiskConfig::set_enospc_prob` injector exercises it.
+2. **Suspect WAL, never retried.** On ENOSPC in a persist round the group calls
+   `PersistProgress::mark_suspect`. A suspect WAL is never appended to again and
+   its `fsync` is never retried on the old descriptor (fsyncgate: after a
+   failed `fsync` the kernel may have dropped the dirty pages, and a torn
+   partial append may sit in the file). The round is never marked durable, so
+   nothing it covers is applied, visible or acked.
+3. **Recovery without a restart** (`persist_round::recover_suspect_wal`). The
+   persist future probes on `env.sleep` with exponential backoff (50 ms up to a
+   2 s cap, so a disk that stays full for minutes is not hammered). Each probe
+   takes the group's `wal_lock`, skips if a staged compaction rewrite is in
+   flight, drains whatever the core owes, captures `RaftCore::wal_image()`
+   (snapshot + hard state + the whole in-memory log, a superset of everything any
+   failed or stranded round tried to write) and writes it as a **fresh file**:
+   `Disk::replace` on the per-group path (a failed replace removes its `.tmp`
+   sibling so the space can return), `SharedWal::compact_group` on the shared-WAL
+   path. Only after that succeeds does it `mark_durable_through`, declare every
+   drained round durable and clear the suspect flag; ENOSPC on the rewrite keeps
+   probing, any other error is still a hard failure. No persisted-format change
+   (the rewritten file is an ordinary WAL; `scripts/check-format-fixtures.sh`
+   passes untouched). A compaction rewrite that hits ENOSPC also marks suspect,
+   and compaction is skipped while suspect.
+4. **Shared WAL.** `SharedWal` carries a `needs_rewrite` flag armed only by an
+   ENOSPC append/sync failure; while armed every `Append` is refused with a
+   StorageFull error until a `Compact` succeeds, so a healthy sibling tablet
+   cannot stack bytes after the suspect tail.
+5. **Wire.** A suspect group refuses writes before proposing with
+   `decide::STORAGE_FULL_REFUSAL` ("StorageFull: ...; retry"), mapped by
+   `map_throttleable_error` (and `read_should_retry`) to a 503
+   `WireError::service_unavailable`, the same house `; retry` suffix as every
+   transient refusal. The write and 2PC retry loops stop on
+   `is_storage_full_refusal` instead of spinning to a timeout, and each refusal
+   bumps `Metric::OverloadStorageFull` (`overload_storage_full`). Reads of
+   already-applied state continue.
+6. **Admin.** `/admin/health` gains `storage_full`, `storage_full_control` and
+   `storage_full_tablets` (degraded signal; the status code deliberately does not
+   flip, because pulling the node out of rotation would also take its reads
+   away), and `/admin/raftkv` gains a per-group `storage_full` field.
+7. **Tests.** The raftkv corpus gains an ENOSPC family
+   (`crates/animus-test/tests/it/raftkv_linearizable.rs`, knob
+   `ANIMUS_DISK_FULL_SEEDS`): full disk on every replica, on the leader only, and
+   a flaky disk (30% per op), each opening and closing a window mid-workload. It
+   asserts the linearizability oracle (no acked write lost or duplicated), that
+   progress resumes after the window with no restart, and seed determinism.
 
-Consequences:
+### Residuals (not done; file as issues)
 
-- **Never acks an unsynced write.** The round is drained from the core but
-  `mark_durable_through`/`complete_drain` never run, so the entry is never
-  durable, never applied, never visible, never acked. This half of ADR 0074
-  holds today, by crash-stop.
-- **Not a named error, not a 503 naming StorageFull.** The client sees its
-  request time out and then the generic transient `ServiceUnavailable` (HTTP
-  503) produced by an exhausted retry budget, with no mention of storage.
-- **The group is dead until restart.** The consensus-loop task has exited. That
-  replica neither acks nor heartbeats (the rest of the group elects around it if
-  a quorum remains). Space returning does not revive it; only a process restart
-  (which replays the WAL) does. Compaction or an LSM flush that hits ENOSPC on
-  the apply task is a separate path with the same expect/assert shape.
-- **The node looks healthy.** `/admin/live` and `/admin/health` stay 200 (the
-  process and the control leader belief are fine), and the spawned-task panic
-  count is a `ProdEnv` inherent method (`spawned_task_panics`), not exported by
-  `/metrics`. An operator sees a log line only. Reads of already-applied state
-  keep working from the surviving apply task, but a leader whose loop died
-  serves nothing consistent.
-- **Control-plane WAL has the same shape**, and is shared by the whole node,
-  so ENOSPC there kills control Raft participation for the node.
-
-Why this PR stops at the audit and a design: the recovery ADR 0074 requires
-("resumes without a restart, nothing acked lost or duplicated") cannot be done by
-mapping an error. The records of a failed round were already drained out of the
-core (`drain_for_round`), the WAL file may hold a torn partial append that a
-retry must not stack onto, and after a failed `fsync` the kernel may have
-dropped the dirty pages, so retrying `fsync` on the same descriptor and trusting
-it is wrong (fsyncgate). It needs a redesign of the persist round, not a patch.
-
-Design (not implemented):
-
-1. Add `animus_env::DiskError`-style classification: `ErrorKind::StorageFull`
-   becomes a named `StorageFull` kind at the `Disk` seam boundary, so every layer
-   can match it and `SimEnv`'s existing ENOSPC injector exercises the same match.
-2. Persist round becomes fallible and re-queueable. On an append/sync error the
-   driver (a) never marks the round durable, (b) restores the drained records to
-   the front of the core's pending queue (new `RaftCore::requeue_unpersisted`),
-   (c) records `storage_full` on the group and steps a leader down (and makes a
-   follower not ack), and (d) marks the WAL file "suspect".
-3. Recovery: a suspect WAL is never appended to again. When free space is
-   available (probe: a small staged write plus sync on a scratch file, polled
-   by the driver on `env.sleep`), the driver truncates the WAL back to the last
-   fully synced offset it tracked (`SyncMarkerState` already tracks synced
-   rounds) via `replace`/`stage_replace`, or rewrites it whole from the core's
-   in-memory log, then retries the requeued round on the new file. Never retry
-   `fsync` on the old descriptor and assume success.
-4. Wire: `StorageFull` maps to `WireError::service_unavailable("StorageFull: ...
-   ; retry")` (503, house suffix) at the same sites that map a transient refusal
-   today (`map_throttleable_error`, `cp_kind_write_item`), and bumps a new
-   `overload_storage_full` counter. `/admin/health` reports a degraded
-   `storage_full` field while any hosted group is suspect.
-5. Tests: a `SimEnv` cell (extending the raftkv corpus, `DiskConfig::
-   set_enospc_prob` windows) asserting no acked write is lost or duplicated and
-   that writes resume without restart after the window; then a `ProdEnv` test on a
-   size-limited filesystem (tmpfs mount, needs `CAP_SYS_ADMIN`, so CI-only).
-   Note the current corpus excludes ENOSPC injection precisely because of the
-   panic in item 2 above (`animus-test/CLAUDE.md`).
-6. Small related fix: export `spawned_task_panics` through the metrics seam
-   (needs the `Env` trait or a metric slot fed by the spawn wrapper) and make
-   `/admin/health` fail when a consensus-loop task has panicked.
+- **LSM engine ENOSPC is not handled.** The apply task's `merge_batch` and the
+  applied-marker write still `expect`/`assert` on an engine error (an LSM flush
+  or compaction hitting ENOSPC is a separate path). The corpus therefore runs over
+  `MemoryEngine` only; do not enable ENOSPC over `ANIMUS_RAFTKV_LSM=1`.
+- **No leader step-down.** A StorageFull leader keeps leadership (`RaftCore` has
+  no step-down API) and refuses writes; its followers' disks are healthy but the
+  group cannot make progress through a leader that cannot persist. A follower
+  with a full disk simply does not ack (its rounds stay gated), which a quorum
+  tolerates.
+- **`spawned_task_panics` is still not exported** through `/metrics`, and
+  `/admin/health` does not fail on a panicked consensus task.
+- **No `ProdEnv` test on a size-limited filesystem** (a tmpfs mount needs
+  `CAP_SYS_ADMIN`, so it is CI-only). The sim proves logic and ordering, not the
+  kernel's real ENOSPC/`fsync` behaviour.
+- SimEnv injects ENOSPC on reads as well, so a `StopRestart` during a 100%
+  window would read an empty WAL; the corpus never combines the two.
 
 ## 4. Findings to triage (not fixed here)
 
@@ -176,7 +170,7 @@ Design (not implemented):
    cap `len` (the largest legitimate frame is a 64 KiB snapshot chunk plus
    overhead, or a 512-entry append) and `from_len` (node ids are short) and drop
    the connection above it. Needs its own PR and test.
-2. **Disk-full is a silent group death** (section 3).
+2. ~~Disk-full is a silent group death~~ fixed for the WAL path (section 3); the LSM-engine ENOSPC path remains open.
 3. `Query`/`Scan` byte cap is applied at the coordinator after the per-tablet
    scan RPC returns, so one tablet round trip can still materialize more than a
    page of raw pairs (already noted in `crates/animusd/CLAUDE.md`).
