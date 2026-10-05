@@ -37,7 +37,7 @@ use crate::meta::Metadata;
 pub type ClusterVersion = u32;
 
 /// The highest cluster version this binary can run at.
-pub const MAX_SUPPORTED: ClusterVersion = 1;
+pub const MAX_SUPPORTED: ClusterVersion = 2;
 
 /// The lowest cluster version this binary can still emit for: `max - 1`,
 /// floored at `1` (ADR 0073 decision 7, N-1 and N skew only). Raised only by
@@ -173,6 +173,15 @@ pub enum Gate {
     /// commands/entities may be emitted. Not tied to
     /// a cluster version (ADR 0073 section 2, P2-A).
     Era,
+    /// **Global tables** (ADR 0075, G-01 stage G-c): the first real version
+    /// gate, opening at cluster version 2. Guards `MetaCommand::
+    /// ConvertTableToGlobal` and the replicated shapes it writes
+    /// (`TableSchema.global`, `PlacementPolicy.allowed_values`) plus client
+    /// acceptance of the multi-Region `UpdateTable` surface. One gate for the
+    /// whole release surface (everything ships at one version: one finalize
+    /// step, one set of mixed-version cells); `MrecReplication` (stage G-d)
+    /// will be its own gate.
+    GlobalTables,
     /// A **synthetic** version gate `n` (test/sim builds only): opens at
     /// cluster version `n`, ranks `n`. It exists so the gate *ladder*
     /// (several version gates, each opening at its own finalize) can be
@@ -191,7 +200,7 @@ pub const SYNTHETIC_GATE_LABEL: &str = "synthetic.gate";
 
 impl Gate {
     /// Every gate, in declaration order.
-    pub const ALL: &'static [Gate] = &[Gate::Base, Gate::Era];
+    pub const ALL: &'static [Gate] = &[Gate::Base, Gate::Era, Gate::GlobalTables];
 
     /// The cluster version at which this gate opens, or `None` for a gate
     /// opened by the era rather than by a version. Exhaustive: no wildcard.
@@ -202,6 +211,8 @@ impl Gate {
             Gate::Base => Some(1),
             // ADR 0073 P2-A: era-gated, no version.
             Gate::Era => None,
+            // ADR 0075 (G-01 stage G-c): the first real version gate.
+            Gate::GlobalTables => Some(2),
             #[cfg(any(test, feature = "sim-versions"))]
             Gate::Synthetic(n) => Some(n),
         }
@@ -216,6 +227,7 @@ impl Gate {
         match self {
             Gate::Base => 0,
             Gate::Era => 1,
+            Gate::GlobalTables => 2,
             #[cfg(any(test, feature = "sim-versions"))]
             Gate::Synthetic(n) => {
                 if n > 1 {
@@ -484,6 +496,8 @@ mod tests {
             let expected: Option<ClusterVersion> = match g {
                 Gate::Base => Some(1),
                 Gate::Era => None,
+                // ADR 0075 (G-01 G-c): the first real version gate.
+                Gate::GlobalTables => Some(2),
                 // Never in `ALL` (parametric, test/sim only): see the ladder test.
                 Gate::Synthetic(_) => unreachable!("synthetic gates are not in Gate::ALL"),
             };
@@ -497,6 +511,14 @@ mod tests {
             }
         }
         assert!(seen.contains(&Gate::Base) && seen.contains(&Gate::Era));
+        assert!(seen.contains(&Gate::GlobalTables));
+        assert_eq!(Gate::Era.join(Gate::GlobalTables), Gate::GlobalTables);
+        assert_eq!(Gate::GlobalTables.join(Gate::Base), Gate::GlobalTables);
+        assert_eq!(
+            MAX_SUPPORTED, 2,
+            "G-01 G-c is the release that takes MAX to 2"
+        );
+        assert_eq!(MIN_SUPPORTED, 1);
         // Declaration order is opening order: ranks are non-decreasing.
         let ranks: Vec<u32> = Gate::ALL.iter().map(|g| g.rank()).collect();
         assert!(ranks.windows(2).all(|w| w[0] < w[1]), "{ranks:?}");

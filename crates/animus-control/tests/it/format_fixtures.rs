@@ -457,6 +457,58 @@ fn v1_era_metadata() -> Metadata {
     m
 }
 
+/// The global-table shape (ADR 0073 Phase 2 / ADR 0075, gate
+/// `GlobalTables`): a table converted to MRSC through the real
+/// `ConvertTableToGlobal` command over three region-labelled members, so the
+/// fixture carries `schema.global` and the pinned `allowed_values` policy.
+/// Built through real commands, like [`v1_metadata`].
+fn v1_global_metadata() -> Metadata {
+    use animus_control::schema::{GlobalTableSpec, MultiRegionConsistency};
+    let mut m = Metadata::default();
+    let mut commands = Vec::new();
+    for (n, region) in [(1, "a"), (2, "b"), (3, "c")] {
+        commands.push(MetaCommand::UpsertMember {
+            node: nid(n),
+            labels: BTreeMap::from([(
+                animus_placement::REGION_LABEL.to_string(),
+                region.to_string(),
+            )]),
+            status: NodeStatus::Active,
+        });
+    }
+    commands.extend([
+        MetaCommand::CreateTableSchema {
+            table: "orders".to_string(),
+            schema: TableSchema::simple("id", ColumnType::String),
+        },
+        MetaCommand::CreateTablet {
+            tablet: TabletId(1),
+            table: Some("orders".to_string()),
+            range: KeyRange::whole(),
+            replicas: vec![nid(1), nid(2), nid(3)],
+        },
+        MetaCommand::ConvertTableToGlobal {
+            table: "orders".to_string(),
+            spec: GlobalTableSpec {
+                consistency: MultiRegionConsistency::Strong,
+                regions: vec!["a".into(), "b".into(), "c".into()],
+                witness: Some("c".to_string()),
+                preferred_leader_region: "a".to_string(),
+            },
+        },
+    ]);
+    for command in &commands {
+        assert_eq!(
+            m.apply(command),
+            ApplyOutcome::Applied,
+            "fixture premise: every command applies cleanly"
+        );
+    }
+    assert!(m.schemas.get("orders").unwrap().global.is_some());
+    assert!(m.policies[&TabletId(1)].is_pinned());
+    m
+}
+
 /// ADR 0073 Phase 2 (P2-A): era-0 serialization is byte-identical to Phase 1's.
 /// `v1_metadata` carries no version record, so its current encoding must equal
 /// the frozen `v1.json` (pretty-printed, as the generator wrote it) exactly,
@@ -533,6 +585,7 @@ fn decodes_every_checked_in_metadata_fixture_to_its_per_version_value() {
         let expected = match (version, shape) {
             (1, None) => v1_metadata(),
             (1, Some("era")) => v1_era_metadata(),
+            (1, Some("global")) => v1_global_metadata(),
             (other, _) => panic!(
                 "{name}: no expected value for metadata v{other} shape {shape:?}; add a match arm (and a \
                  frozen legacy decoder) before adding the fixture file"
@@ -648,6 +701,33 @@ fn generate_fixture_metadata_era() {
     }
     let bytes = serde_json::to_vec_pretty(&v1_era_metadata()).expect("metadata serializes");
     std::fs::write(&path, &bytes).unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
+}
+
+/// Writes `v1-global.json` from [`v1_global_metadata`]; refuses to overwrite.
+/// `cargo test -p animus-control --test it format_fixtures::generate_fixture_metadata_global -- --ignored`.
+#[test]
+#[ignore]
+fn generate_fixture_metadata_global() {
+    let path = metadata_fixtures_dir().join("v1-global.json");
+    if std::fs::metadata(&path).is_ok() {
+        panic!(
+            "{} already exists — never regenerated in place",
+            path.display()
+        );
+    }
+    let bytes = serde_json::to_vec_pretty(&v1_global_metadata()).expect("metadata serializes");
+    std::fs::write(&path, &bytes).unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
+}
+
+/// A table with no global spec encodes without the `global` key and without a
+/// pinned policy field, so a cluster that never converts a table writes
+/// bytes an older binary's strict decode accepts (the gated-additive rule).
+#[test]
+fn global_fields_are_absent_from_an_ordinary_metadata_encoding() {
+    let plain = serde_json::to_string(&v1_metadata()).unwrap();
+    assert!(!plain.contains("global") && !plain.contains("allowed_values"));
+    let global = serde_json::to_string(&v1_global_metadata()).unwrap();
+    assert!(global.contains("\"global\"") && global.contains("allowed_values"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1350,15 +1430,159 @@ fn entity_ext(kind: EntityKind) -> &'static str {
     }
 }
 
-/// Parse `v<N>` out of a fixture file name (`v1.json` -> `1`).
+/// Parse `v<N>` out of a fixture file name (`v1.json` -> `1`,
+/// `v1-global.json` -> `1`).
 fn fixture_version(path: &Path) -> u32 {
     let stem = path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or_else(|| panic!("fixture {} has no file stem", path.display()));
-    stem.strip_prefix('v')
+    let num = stem.split_once('-').map_or(stem, |(n, _)| n);
+    num.strip_prefix('v')
         .and_then(|n| n.parse().ok())
-        .unwrap_or_else(|| panic!("fixture {} is not named v<N>.<ext>", path.display()))
+        .unwrap_or_else(|| panic!("fixture {} is not named v<N>[-shape].<ext>", path.display()))
+}
+
+/// The optional `-<shape>` of a fixture file name (`v1-global.json` ->
+/// `Some("global")`): a gated additive field inside the same mirror version.
+fn fixture_shape(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    stem.split_once('-').map(|(_, s)| s.to_owned())
+}
+
+/// The ADR 0075 global-table mirror scenario: the rows the real mirror
+/// encoder writes for `ConvertTableToGlobal` (the schema entry carrying
+/// `global`, and the pinned policy of the table's tablet).
+fn v1_global_mirror_scenario() -> (Metadata, Live) {
+    use animus_control::schema::{GlobalTableSpec, MultiRegionConsistency};
+    let mut meta = Metadata::default();
+    let mut live = Live::new();
+    let (m, l) = (&mut meta, &mut live);
+    for (n, region) in [(1, "a"), (2, "b"), (3, "c")] {
+        run_mirror(
+            m,
+            l,
+            MetaCommand::UpsertMember {
+                node: nid(n),
+                labels: BTreeMap::from([(
+                    animus_placement::REGION_LABEL.to_string(),
+                    region.to_string(),
+                )]),
+                status: NodeStatus::Active,
+            },
+        );
+    }
+    run_mirror(
+        m,
+        l,
+        MetaCommand::CreateTableSchema {
+            table: "orders".to_string(),
+            schema: TableSchema::simple("id", ColumnType::String),
+        },
+    );
+    run_mirror(
+        m,
+        l,
+        MetaCommand::CreateTablet {
+            tablet: TabletId(12),
+            table: Some("orders".to_string()),
+            range: KeyRange::whole(),
+            replicas: vec![nid(1), nid(2), nid(3)],
+        },
+    );
+    run_mirror(
+        m,
+        l,
+        MetaCommand::ConvertTableToGlobal {
+            table: "orders".to_string(),
+            spec: GlobalTableSpec {
+                consistency: MultiRegionConsistency::Strong,
+                regions: vec!["a".into(), "b".into(), "c".into()],
+                witness: Some("c".to_string()),
+                preferred_leader_region: "a".to_string(),
+            },
+        },
+    );
+    (meta, live)
+}
+
+/// The kinds that have a gated-additive `-<shape>` mirror fixture, with the
+/// shape name, their key and the expected `Metadata` after decoding exactly
+/// that row onto an empty `Metadata`.
+fn global_shape_entity(kind: EntityKind, shape: &str, full: &Metadata) -> (Vec<u8>, Metadata) {
+    let mut m = Metadata::default();
+    match (kind, shape) {
+        (EntityKind::Schema, "global") => {
+            assert_eq!(
+                m.apply(&MetaCommand::CreateTableSchema {
+                    table: "orders".to_string(),
+                    schema: full.schemas.get("orders").unwrap().clone(),
+                }),
+                ApplyOutcome::Applied
+            );
+            (syskv::schema_key("orders"), m)
+        }
+        (EntityKind::Policy, "pinned") => {
+            let id = TabletId(12);
+            m.policies.insert(id, full.policies[&id].clone());
+            (syskv::policy_key(id), m)
+        }
+        other => panic!("no expected value for mirror fixture shape {other:?}"),
+    }
+}
+
+const GLOBAL_SHAPES: [(EntityKind, &str); 2] = [
+    (EntityKind::Schema, "global"),
+    (EntityKind::Policy, "pinned"),
+];
+
+/// The gated-additive mirror shapes decode through the real read path, and
+/// the current encoder reproduces what the checked-in fixture decodes to.
+#[test]
+fn global_table_mirror_shape_fixtures_decode_and_round_trip() {
+    let (full, live) = v1_global_mirror_scenario();
+    for (kind, shape) in GLOBAL_SHAPES {
+        let (key, expected) = global_shape_entity(kind, shape, &full);
+        // Round trip through the live encoder.
+        let mut decoded = Metadata::default();
+        apply_key_write(
+            &mut decoded,
+            &KeyWrite::Put(key.clone(), live[&key].clone()),
+        );
+        assert_eq!(decoded, expected, "{kind:?}/{shape} round trip");
+        // The checked-in fixture.
+        let path = mirror_entities_root()
+            .join(kind.as_str())
+            .join(format!("v{SYSKV_MIRROR_VERSION}-{shape}.json"));
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let mut from_fixture = Metadata::default();
+        apply_key_write(&mut from_fixture, &KeyWrite::Put(key, bytes));
+        assert_eq!(from_fixture, expected, "{} decoded wrongly", path.display());
+    }
+    let schema = full.schemas.get("orders").unwrap();
+    assert!(schema.global.is_some());
+}
+
+/// Writes the `-<shape>` mirror fixtures; refuses to overwrite.
+/// `cargo test -p animus-control --test it format_fixtures::generate_fixture_mirror_global_shapes -- --ignored`.
+#[test]
+#[ignore]
+fn generate_fixture_mirror_global_shapes() {
+    let (full, live) = v1_global_mirror_scenario();
+    for (kind, shape) in GLOBAL_SHAPES {
+        let (key, _) = global_shape_entity(kind, shape, &full);
+        let path = mirror_entities_root()
+            .join(kind.as_str())
+            .join(format!("v{SYSKV_MIRROR_VERSION}-{shape}.json"));
+        if std::fs::metadata(&path).is_ok() {
+            panic!(
+                "{} already exists — never regenerated in place",
+                path.display()
+            );
+        }
+        std::fs::write(&path, &live[&key])
+            .unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
+    }
 }
 
 fn fixture_files(dir: &Path) -> Vec<PathBuf> {
@@ -1437,6 +1661,16 @@ fn decodes_every_checked_in_mirror_entity_fixture_structurally() {
         let dir = mirror_entities_root().join(kind.as_str());
         for path in fixture_files(&dir) {
             let version = fixture_version(&path);
+            if let Some(shape) = fixture_shape(&path) {
+                // A gated-additive shape inside the same version: decoded by
+                // `global_table_mirror_shape_fixtures_decode_and_round_trip`.
+                assert!(
+                    GLOBAL_SHAPES.contains(&(kind, shape.as_str())),
+                    "unrecognized mirror fixture shape {shape:?} ({}): add an expected-value arm",
+                    path.display()
+                );
+                continue;
+            }
             let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             match version {
                 1 => {

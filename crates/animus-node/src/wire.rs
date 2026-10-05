@@ -974,6 +974,13 @@ pub fn is_relayable_command(command: &MetaCommand) -> bool {
         // `CreateTable`/`UpdateTable` carrying `BillingMode`/
         // `ProvisionedThroughput` must reach the control leader.
         | MetaCommand::SetTableThroughput { .. }
+        // Global-table conversion (ADR 0075, G-01 stage G-c): schema-catalog
+        // class, same relay reason as `SetTableTtl` — a follower-connected
+        // `UpdateTable` (multi-Region `ReplicaUpdates`) must reach the
+        // control leader. The receiver re-checks `Gate::GlobalTables`
+        // (`version_wiring::relay_gate_verdict`), so relaying while the gate
+        // is closed is refused by name, never appended.
+        | MetaCommand::ConvertTableToGlobal { .. }
         // Resource tagging (roadmap W-06): schema-catalog class, same relay
         // reason as `SetTableTtl` — a follower-connected `TagResource`/
         // `UntagResource` must reach the control leader.
@@ -1623,6 +1630,15 @@ mod tests {
                     read_units: 5,
                     write_units: 5,
                 }),
+            },
+            MetaCommand::ConvertTableToGlobal {
+                table: table.clone(),
+                spec: animus_control::GlobalTableSpec {
+                    consistency: animus_control::MultiRegionConsistency::Strong,
+                    regions: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+                    witness: None,
+                    preferred_leader_region: "a".to_string(),
+                },
             },
             MetaCommand::TagResource {
                 table: table.clone(),

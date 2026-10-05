@@ -14,7 +14,8 @@ use animus_env::NodeId;
 #[cfg(test)]
 use animus_env::nid;
 use animus_placement::{
-    Candidate, PlacementPolicy, rebalance_step, replan, replan_repair, select_replicas,
+    Candidate, PlacementPolicy, rebalance_step, replan, replan_pinned, replan_repair,
+    select_replicas,
 };
 use animus_tablet::{
     Epoch, InPlaceSplitIntent, KeyRange, SplitChild, TOKEN_BYTES, Tablet, TabletId, TabletState,
@@ -22,7 +23,7 @@ use animus_tablet::{
 use serde::{Deserialize, Serialize};
 
 use crate::schema::{
-    IndexDef, IndexStatus, PitrSpec, ProvisionedThroughput, SchemaCatalog, StreamSpec,
+    IndexDef, IndexKind, IndexStatus, PitrSpec, ProvisionedThroughput, SchemaCatalog, StreamSpec,
     StreamViewType, TableName, TableSchema, TtlSpec,
 };
 use crate::version::{ClusterVersion, NodeVersion, VersionRange};
@@ -2239,6 +2240,27 @@ pub enum MetaCommand {
         table: TableName,
         spec: Option<TtlSpec>,
     },
+    /// **Convert an empty table to a global table** (ADR 0075 section 3, G-01
+    /// stage G-c): record its [`GlobalTableSpec`](crate::schema::GlobalTableSpec)
+    /// in `schema.global` **and**, in the same apply, replace the
+    /// placement policy of every tablet of the table with the pinned
+    /// [`PlacementPolicy::mrsc`] over `spec.regions` (one command, one apply:
+    /// there is never a window where the table is global with a simple policy,
+    /// or pinned with no spec). Replica movement then converges through the
+    /// ordinary reconcile path (`reconcile_placement`'s pinned branch).
+    ///
+    /// Rejected (deterministically, state-based, never gate-based) when the
+    /// table has no schema, is already global with a *different* spec, the
+    /// spec is invalid, TTL is enabled, the table has an LSI, or it has no
+    /// tablets. Re-applying an identical spec is a no-op.
+    ///
+    /// **Gate: `Gate::GlobalTables`** (cluster version 2). An older voter
+    /// cannot decode this variant, so it is emitted only once the cluster
+    /// version reaches 2.
+    ConvertTableToGlobal {
+        table: TableName,
+        spec: crate::schema::GlobalTableSpec,
+    },
     /// Enable, reconfigure, or disable a table's **provisioned throughput**
     /// (ADR 0065 §5(b)) — the `CreateTable`/`UpdateTable` `BillingMode`/
     /// `ProvisionedThroughput` wire fields' own catalog mutation. Rejected
@@ -3231,12 +3253,28 @@ fn reconcile_placement(
             // genuinely can, rather than refusing to make any progress —
             // see that function's own doc for the growth-only contract
             // (it never shrinks an already-at-capacity set).
+            //
+            // A **pinned** policy (ADR 0075 MRSC, `PlacementPolicy::
+            // is_pinned`) is repaired with `replan_pinned` instead: plain
+            // `replan_repair` seeds survivors without re-validating the strict
+            // spread, so it can never fix a skewed set (two replicas in one
+            // region), and its best-effort growth would trade away the pin.
+            // A pinned region with no eligible node is an `Err` here (no
+            // command): the replica waits for its region rather than moving
+            // to another.
+            let repair = |pool: &[Candidate]| {
+                if policy.is_pinned() {
+                    replan_pinned(&t.replicas, pool, policy)
+                } else {
+                    replan_repair(&t.replicas, pool, policy)
+                }
+            };
             let desired = if dwelling.is_empty() {
-                replan_repair(&t.replicas, &candidates, policy).ok()?
+                repair(&candidates).ok()?
             } else {
                 let mut augmented = candidates.clone();
                 augmented.extend(dwelling);
-                replan_repair(&t.replicas, &augmented, policy).ok()?
+                repair(&augmented).ok()?
             };
             // `replan_repair` returns a sorted set; `t.replicas` is
             // normalized (sorted + deduped) by `Tablet::new` /
@@ -4077,6 +4115,9 @@ impl Metadata {
                 // Tentatively apply, then validate the resulting schema so a
                 // malformed index (e.g. an LSI with no sort attribute) is rejected
                 // deterministically and leaves the schema unchanged.
+                if schema.global.is_some() && index.kind == IndexKind::Local {
+                    return ApplyOutcome::Rejected("global table cannot have a local index");
+                }
                 let mut candidate = schema.clone();
                 candidate.upsert_index(index.clone());
                 if candidate.validate().is_err() {
@@ -4826,6 +4867,9 @@ impl Metadata {
                 let Some(schema) = self.schemas.get_mut(table) else {
                     return ApplyOutcome::Rejected("no such table schema");
                 };
+                if spec.is_some() && schema.global.is_some() {
+                    return ApplyOutcome::Rejected("global table cannot have TTL enabled");
+                }
                 if schema.ttl == *spec {
                     // Covers both idempotent shapes at once: re-enabling
                     // with the same attribute name, and disabling when
@@ -4834,6 +4878,41 @@ impl Metadata {
                     return ApplyOutcome::NoOp;
                 }
                 schema.ttl = spec.clone();
+                ApplyOutcome::Applied
+            }
+            MetaCommand::ConvertTableToGlobal { table, spec } => {
+                let Some(schema) = self.schemas.get(table) else {
+                    return ApplyOutcome::Rejected("no such table schema");
+                };
+                if let Some(existing) = &schema.global {
+                    return if existing == spec {
+                        ApplyOutcome::NoOp
+                    } else {
+                        ApplyOutcome::Rejected("table is already a global table")
+                    };
+                }
+                if let Err(e) = spec.validate() {
+                    return ApplyOutcome::Rejected(e.message());
+                }
+                if schema.ttl.is_some() {
+                    return ApplyOutcome::Rejected("global table cannot have TTL enabled");
+                }
+                if schema.indexes.iter().any(|i| i.kind == IndexKind::Local) {
+                    return ApplyOutcome::Rejected("global table cannot have a local index");
+                }
+                let tablet_ids: Vec<TabletId> =
+                    self.tablets_for_table(table).map(|(&id, _)| id).collect();
+                if tablet_ids.is_empty() {
+                    return ApplyOutcome::Rejected("table has no tablets to convert");
+                }
+                let policy =
+                    PlacementPolicy::mrsc(format!("mrsc:{table}"), spec.regions.iter().cloned());
+                for id in tablet_ids {
+                    self.policies.insert(id, policy.clone());
+                }
+                if let Some(schema) = self.schemas.get_mut(table) {
+                    schema.global = Some(spec.clone());
+                }
                 ApplyOutcome::Applied
             }
             MetaCommand::SetTableThroughput { table, spec } => {
@@ -6358,6 +6437,10 @@ impl crate::version::GatedCommand for MetaCommand {
             | MetaCommand::PutCredential { .. }
             | MetaCommand::RotateCredential { .. }
             | MetaCommand::RevokeCredential { .. } => Gate::Base,
+            // ADR 0075 (G-01 stage G-c): the first real gate. An older voter
+            // cannot decode the variant nor the `TableSchema.global` /
+            // `PlacementPolicy.allowed_values` fields it writes.
+            MetaCommand::ConvertTableToGlobal { .. } => Gate::GlobalTables,
             MetaCommand::ReportNodeVersion { .. } | MetaCommand::FinalizeClusterVersion { .. } => {
                 Gate::Era
             }

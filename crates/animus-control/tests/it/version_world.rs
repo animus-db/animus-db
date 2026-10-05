@@ -23,7 +23,7 @@ use animus_control::meta::NodeAddrs;
 use animus_control::node::heartbeat_loop;
 use animus_control::raft::ProposeResult;
 use animus_control::sim_versions::{BinaryProfile, CapLog, CapRejection};
-use animus_control::version::{VersionRange, own_range};
+use animus_control::version::VersionRange;
 use animus_control::{MetaCommand, Metadata, NodeStatus, RaftNode};
 use animus_env::handshake::encode_ext;
 use animus_env::{EnvExt, NodeId, nid};
@@ -103,7 +103,7 @@ pub struct World {
     engines: BTreeMap<u64, MemoryEngine>,
     /// Nodes currently upgraded to B2.
     pub flipped: BTreeSet<u64>,
-    /// Per-node B2 range override (default [`own_range`]); set by
+    /// Per-node B2 range override (default `BinaryProfile::B2`'s `[1, 1]`); set by
     /// [`World::flip_range`].
     pub ranges: BTreeMap<u64, (u32, u32)>,
     /// Control nodes restarted since start (their `Metadata` view resets).
@@ -225,7 +225,13 @@ impl World {
             let r = self
                 .ranges
                 .get(&id)
-                .map_or_else(own_range, |&(a, b)| VersionRange::new(a, b));
+                // B2 is pinned (`BinaryProfile::B2.own_range()` is the literal
+                // `[1, 1]`), never the real `own_range()`: that tracks
+                // `MAX_SUPPORTED`, which is 2 since G-01 G-c.
+                .map_or_else(
+                    || BinaryProfile::B2.own_range().expect("B2 has a range"),
+                    |&(a, b)| VersionRange::new(a, b),
+                );
             node.set_own_version_range(Some(r));
             node.set_own_build("b2");
         } else {
