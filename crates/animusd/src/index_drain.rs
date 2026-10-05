@@ -3322,12 +3322,34 @@ mod gsi_drain_cursor_tests {
                 split_key.len()
             );
 
-            let parent = only_tablet(&node, table);
-            split(client_addr, parent, split_key.clone()).await;
-            await_true(20, "split produced two tablets", || {
-                tablets_of(&node, table).len() == 2
-            })
-            .await;
+            // R-01 F-2: every split key is now rounded to its token boundary
+            // (`decide::align_split_key`), so a non-token-aligned boundary only
+            // survives where the range holds a SINGLE token (the raw key is
+            // kept there so one hot partition can still split by sort key).
+            // Build exactly that range: cut at the row's token `T`, then at
+            // `T+1`, leaving a child `[T, T+1)`, and finally split THAT child
+            // at the row's own (longer, non-aligned) physical key.
+            let token: [u8; TOKEN_BYTES] = split_key[..TOKEN_BYTES].try_into().expect("token");
+            let next_token = (u64::from_be_bytes(token) + 1).to_be_bytes();
+            let cut = |node: &Node, key: &[u8]| -> TabletId {
+                let m = node.metadata();
+                *m.tablets
+                    .iter()
+                    .filter(|(_, t)| t.table.as_deref() == Some(table))
+                    .find(|(_, t)| t.range.contains(key))
+                    .expect("a tablet owns the key")
+                    .0
+            };
+            let mut expected_tablets = 1;
+            for at in [token.to_vec(), next_token.to_vec(), split_key.clone()] {
+                let parent = cut(&node, &at);
+                split(client_addr, parent, at).await;
+                expected_tablets += 1;
+                await_true(20, "split produced a further tablet", || {
+                    tablets_of(&node, table).len() == expected_tablets
+                })
+                .await;
+            }
 
             let (left, right) = {
                 let m = node.metadata();
@@ -3340,8 +3362,8 @@ mod gsi_drain_cursor_tests {
                 let left = ts
                     .iter()
                     .copied()
-                    .find(|t| *t != right)
-                    .expect("the sibling tablet");
+                    .find(|t| m.tablets[t].range.end.as_deref() == Some(split_key.as_slice()))
+                    .expect("the sibling tablet ending at the split key");
                 (left, right)
             };
 

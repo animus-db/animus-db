@@ -1047,3 +1047,94 @@ fn g_a_sub_floor_quiesce_after_hides_the_crossing_forever_over_seeds() {
         run_g_a_sub_floor_quiesce_after_hides_the_crossing_forever(0xA5F1_7000 + i);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Scenario (h): a split must never separate a partition's item from its txn
+// record (R-01 F-2 / chaos smoke `txn-atomicity`).
+// ---------------------------------------------------------------------------
+
+/// A two-key transaction whose **anchor** is the partition key sitting exactly
+/// on an auto-split boundary must commit and be atomic.
+///
+/// The byte-weighted-median trigger picks an existing row's own key as the
+/// split key. With one item per partition key that key is the *first row of
+/// its token*, and a transaction's record row (`token || ...`, the "anchor-
+/// token-derived record key", `txn.rs`) sorts **below** the item inside the
+/// same token. An un-aligned split at that key therefore put the item on the
+/// right child and its record on the left one: the anchor stage landed on the
+/// right child, every `TxnCommit` was routed (by record key) to the left child
+/// where no record existed, recovery then minted an orphan-abort tombstone, and
+/// the intent was never resolved (acked write lost, half-applied txn). The fix
+/// (`decide::align_split_key`) rounds every split key to its token boundary.
+fn run_h_a_split_never_separates_an_item_from_its_txn_record(seed: u64) {
+    use animus_dynamo::AttributeValue;
+
+    let mut cluster = SimCluster::new(seed, 3, 3);
+    let (status, body) = create_table(&mut cluster, 0, "orders");
+    assert_eq!(status, 200, "seed={seed}: CreateTable failed: {body}");
+
+    let keys: Vec<String> = (0..NUM_KEYS).map(|i| format!("k{i}")).collect();
+    for pk in &keys {
+        let (status, body) = put_item(&mut cluster, 0, "orders", pk, PAD_LEN);
+        assert_eq!(status, 200, "seed={seed}: PutItem({pk}) failed: {body}");
+    }
+    cluster.set_auto_split_thresholds(thresholds());
+    let nodes: Vec<u64> = (0..cluster.node_count() as u64).collect();
+    poll_split_converged(&mut cluster, "orders", &nodes, SETTLE_FLOOR);
+
+    // The right child's start is the boundary; the partition key whose item is
+    // the first row at/after it is the one a transaction anchored there
+    // exercises (pre-fix: boundary == that item's own key).
+    let item_key = |pk: &str| crate::dynamo::item_key(&AttributeValue::S(pk.to_string()), None);
+    let meta = cluster.metadata(0);
+    let boundary = meta
+        .tablets_for_table("orders")
+        .map(|(_, t)| t.range.start.clone())
+        .find(|s| !s.is_empty())
+        .expect("a split has a non-empty boundary");
+    let anchor_pk = keys
+        .iter()
+        .filter(|pk| item_key(pk) >= boundary)
+        .min_by_key(|pk| item_key(pk))
+        .expect("the right child holds at least one key")
+        .clone();
+    let other_pk = keys
+        .iter()
+        .find(|pk| item_key(pk) < boundary)
+        .expect("the left child holds at least one key")
+        .clone();
+
+    // Anchor first => the boundary partition's tablet owns the txn record.
+    let body = format!(
+        r#"{{"TransactItems":[
+            {{"Put":{{"TableName":"orders","Item":{{"pk":{{"S":"{anchor_pk}"}},"v":{{"S":"t1"}}}}}}}},
+            {{"Put":{{"TableName":"orders","Item":{{"pk":{{"S":"{other_pk}"}},"v":{{"S":"t1"}}}}}}}}]}}"#
+    );
+    let (status, resp) = cluster.dynamo(0, "DynamoDB_20120810.TransactWriteItems", body.as_bytes());
+    assert_eq!(
+        status, 200,
+        "seed={seed}: a txn anchored on the split boundary partition {anchor_pk} \
+         (boundary {boundary:?}) must commit: {resp}"
+    );
+    for pk in [&anchor_pk, &other_pk] {
+        let (status, resp) = get_item(&mut cluster, 1, "orders", pk);
+        assert_eq!(status, 200, "seed={seed}: GetItem({pk}) failed: {resp}");
+        assert!(
+            resp.contains(r#""v":{"S":"t1"}"#),
+            "seed={seed}: the committed txn's write to {pk} must be visible \
+             (one half only = atomicity violation): {resp}"
+        );
+    }
+}
+
+#[test]
+fn h_a_split_never_separates_an_item_from_its_txn_record() {
+    run_h_a_split_never_separates_an_item_from_its_txn_record(env_seed(0xA5F1_0008));
+}
+
+#[test]
+fn h_a_split_never_separates_an_item_from_its_txn_record_over_seeds() {
+    for i in 0..5 {
+        run_h_a_split_never_separates_an_item_from_its_txn_record(0xA5F1_8000 + i);
+    }
+}

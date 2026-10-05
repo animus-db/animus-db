@@ -84,16 +84,16 @@
 //! there, and no analogous "reserved partition key" mechanism exists for
 //! user data — hence the different, `escape`-structural argument above.)
 //!
-//! **A residual, documented, not closed by PR3**: a tablet split's
-//! `split_key` is an arbitrary existing row's own key
-//! (`animusd::auto_split_loop`'s byte-weighted median), not necessarily
-//! token-aligned, so in principle a single token's rows (and, per this
-//! design, its txn record) could end up split across two sibling tablets by
-//! a split racing an in-flight transaction. PR3 is deliberately
-//! single-participant/single-tablet in scope; split-vs.-in-flight-txn
-//! interaction is a PR4+ concern (mirroring how the range seal itself
-//! needed a dedicated amendment once genuine concurrent splits were
-//! exercised) and is not solved here.
+//! **A residual, documented**: a tablet split must not land *inside* a token,
+//! or a token's rows (and, per this design, its txn record, which sorts below
+//! every item of the token) end up on two sibling tablets: the anchor stage
+//! applies on the item's tablet while `TxnCommit`/recovery are routed by record
+//! key to the other, where no record exists (R-01 F-2: an orphan-abort
+//! tombstone and a never-resolved intent). `animusd`'s one split choke point,
+//! `decide::align_split_key`, therefore rounds **every** table's split key to a
+//! token boundary (down, else up). What stays open is a range holding a
+//! *single* token, which can still be split by sort key (the raw key is kept):
+//! a transaction anchored on that token can straddle the cut.
 //!
 //! ## Resolution semantics
 //!
