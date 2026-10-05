@@ -2657,3 +2657,516 @@ under its mutation):
 checklist gains the class G/L/F + gate step), ADR 0060 "Upgrades", the website
 (manual node-by-node rolling upgrade supported; operator orchestration is Phase 3),
 the crate guides (`animus-control`, `animusd`, `animus-cp-data`).
+
+## Amendment 2026-10-05 — Phase 3 design: rolling-upgrade orchestration
+
+Design only; no code. Status: **PROPOSED, in review.** Every decision below is a
+recommendation for the maintainer, not a decision: nothing is DECIDED unless the
+Phase 2 amendment already decided it (and then it says so). Phase 3 turns the
+**manual** node-by-node roll that Phase 2 made supported into something a
+runbook, a CLI and the Kubernetes operator can drive, with a health gate between
+nodes and an explicit, irreversible finalize step. It adds no format, no gate and
+no wire change by default (D4 is the one exception and is optional). Claims below
+were checked against `main` at `d2d96c7e` (Phase 2 close-out merged); line
+references are to that tree.
+
+**Inherited, binding rules (not reopened here):** Option B, **fix forward**: no
+rollback once a node has run the new binary (Phase 2 section 5, DECIDED);
+Finalize is manual and one step at a time, Down / Leaving / never-activated
+members block it, no override (sections 4, 6, DECIDED); skew is N-1 <-> N only
+(section 6); an upgrade never needs a whole-cluster restart (maintainer rule,
+2026-10-03).
+
+### What the code does today
+
+| Fact | Evidence |
+|---|---|
+| The operator accepts a `spec.image` edit: `image` is a plain `Option<String>`, nothing in `validate_spec` rejects a change (a test asserts an update with a new image is `Ok`) | `animus-operator/src/crd.rs:459-462`; `validate.rs:526-531` |
+| The `StatefulSet` sets **no `updateStrategy`** (so the Kubernetes default `RollingUpdate`, `partition` 0) and `podManagementPolicy: Parallel`; any pod-template change rolls pods highest ordinal first, one at a time, gated only on the pod's readiness probe | `desired/statefulset.rs:540-541` (no `update_strategy` anywhere in the file); the module doc `:21-25` says exactly this for the config-hash annotation |
+| **The ungated roll is not only an image problem**: the config-hash annotation (`CONFIG_HASH_ANNOTATION`, from `restart_relevant_projection`) is on the pod template, so a `spec.controlNodes` growth or any restart-relevant config change rolls every pod the same way | `desired/statefulset.rs:13-25`, `:122`, `:547-551`; `animus-operator/CLAUDE.md` (the "controlNodes growth's own config-hash roll" note) |
+| The pod **readiness** probe is `GET /admin/health`, which is 200 once the node has had a *recent control leader* (`leader_within`, 3 election timeouts). It says nothing about this node's tablet groups being caught up, its member status, or cluster-wide replication | `animusd/src/admin.rs:40`, `:2230-2260` (`health`); probe wiring `desired/statefulset.rs:515` |
+| `/admin/health` body: `ok`, `control_leader_known`, `control_leader_recent`, `is_control_leader`, `hosts_cp` | `admin.rs:2245-2255` |
+| **"Under-replicated" exists only as client-side dashboard JavaScript** (`tabletStatus` ladder: `quorum-lost` / `under-replicated` / `healthy` / `forming`, computed from `/admin/status` members + each node's `/admin/raftkv` fan-out). There is no server-side or CLI-visible equivalent. The Phase 2 "wait until `Active` and no tablet is under-replicated" instruction therefore has no machine-checkable form today | `animusd/src/dashboard_core.js:336-380`; no Rust hit for it in `admin.rs` |
+| `GET /admin/cluster-version` returns `era_active`, `active`, per-node `{role, status, range, build, reported, observed_range}`, `safe_target`, `can_finalize`, `target`, `blockers[]`; `POST /admin/cluster-version/finalize {to?, expected?}` is local-control-leader-only (409 names the leader) | `animusd/src/version_wiring.rs:261-310`; `admin.rs:54-55`, `:2830` |
+| The CLI binary is **`animus`** (crate `animus-cli`); `animus cluster version <admin-addr> [--json]` and `animus cluster finalize <admin-addr> [--to N] [--yes]` exist and finalize polls up to 30s for the new version. `run_cluster` knows only `version` and `finalize` | `animus-cli/Cargo.toml:14-16`; `animus-cli/src/main.rs:280`, `:1840-1925` |
+| `drain` (ADR 0032) is a **decommission** primitive: it marks the member `Leaving`, `member/remove` deletes the row. A drained, restarted node is not a restarted member: it is `Leaving` (which blocks Finalize, section 4) and would have to re-join under a new registration | `admin.rs:2618-2635` (`action_drain` returns `"status": "Leaving"`), `:2643-2665`; ADR 0032 PR3; `animus-operator/src/controller.rs:821-880` uses it for scale-down only |
+| Control-plane leadership transfer without removal exists: `POST /admin/control/transfer {to}` (local-control-leader-only) | `admin.rs:2409`, `:2803`; `animusd/src/lib.rs:12589-12612` |
+| A restarting node is marked `Down` by the failure detector after `DETECT_TIMEOUT` = 500 ms; placement repair evicts its replicas only after it has been continuously `Down` for `REPAIR_DWELL` = 5 s. A pod restart (SIGTERM, up to `TERMINATION_GRACE_PERIOD_SECS` = 90 s, plus boot) can easily exceed 5 s, so on a cluster with spare candidate nodes **every roll step can trigger a full replica rebuild** for the restarted node's tablets | `animus-control/src/node.rs:281`, `:291`; `desired/statefulset.rs:102` |
+| The operator's RBAC on pods is **`get/list/watch` only** plus `pods/proxy get/create` (the admin-port path); it cannot delete a pod. It can patch `statefulsets` and read their status | `deploy/operator/rbac.yaml:25-27`, `:57-75` |
+| The operator's status carries `observedGeneration`, `readyNodes`, `phase` (`Pending/Bootstrapping/Ready/Degraded/Deleting`) and typed `conditions`; `phase` is computed from the `StatefulSet`'s `readyReplicas` only | `crd.rs:775-802`; `controller.rs:1334-1372` |
+| The operator already calls `animusd`'s admin port per pod through the `AdminOps` seam (`get_json`/`post_json`; proxy or direct; TLS-aware) for scale-down drain and control growth | `animus-operator/src/admin_client.rs`; `controller.rs:821-880` |
+| The PDB is `maxUnavailable` derived from quorum math (`min(floor((controlNodes-1)/2), floor((rf-1)/2))`, `rf = min(nodes, 3)`), re-applied every reconcile from `spec`, never from live replica counts. It bounds *voluntary evictions*; a StatefulSet rolling update deletes pods through the controller and **is not subject to the PDB** | `desired/poddisruptionbudget.rs:1-80`; `controller.rs:117-144` |
+| ADR 0060 "Upgrades" and the website say the operator "does not orchestrate" an upgrade; note that **ADR 0073's own Phase 3 text in the roadmap section (line ~290) still says "ADR 0060 currently rejects any image change outright"**, which was never true (see ADR 0060 "Upgrades") | `docs/adr/0060-kubernetes-operator.md:421-440`; this file |
+| No `v*` tag exists yet (`git tag` is empty); `release.yml`/`image.yml` fire on `v*` tags and publish `ghcr.io/animus-db/animusd`; the Phase 1 binary is reproducible from `ac57d56a` (the commit the Phase 2 design was checked against, an ancestor of `main`) | `.github/workflows/release.yml`, `image.yml:46-97`; `docs/release.md` |
+| Stale website copy: `architecture.html:277,292` and `how-it-works.html:222` still say mixed-version clusters are unsupported, contradicting `docs.html:653` and the Phase 2 close-out | website |
+
+### Decisions (all PROPOSED)
+
+| # | Decision | Recommendation |
+|---|---|---|
+| D1 | The roll primitive for one node | **Restart in place, never drain.** Control-leader node: transfer leadership first |
+| D2 | The wait-healthy signal | A **server-side** `GET /admin/roll-health` (new), one definition used by CLI, operator and dashboard |
+| D3 | CLI shape | `animus cluster roll` as a **supervisor that does not restart anything itself**: `roll plan`, `roll status`, `roll wait`; the restart is the platform's (systemd, k8s) |
+| D4 | Do not let repair churn fight the roll | Optional: a replicated, expiring per-node `maintenance` mark that lengthens `REPAIR_DWELL` for that node. Default: ship without it, document the cost |
+| D5 | Roll status view | `GET /admin/cluster-version` grows a `roll` section; dashboard Overview card; CLI `roll status` |
+| D6 | Auto-finalize | Opt-in only, never default; operator field `spec.upgrade.finalize: Manual|Auto`; CLI `--finalize` stays a flag |
+| D7 | Operator orchestration mechanism | `RollingUpdate` with a **`partition` the operator owns** (not `OnDelete`) |
+| D8 | Closing the ungated-roll hole | Every pod-template change (image **and** config hash) goes through the same gated roll; the first apply sets the partition atomically |
+| D9 | Failed pod, abort and rollback | Pause and surface; **no automatic rollback**; documented fix-forward paths only |
+| D10 | Previous-release cross-version CI | A `ProdEnv` job (mandatory) and a `kind` job (nightly), running R-1 against R; `ac57d56a` stands in until a tag exists |
+
+#### D1. The per-node roll runbook and whether to drain
+
+Options: (a) **ADR 0032 drain -> remove -> re-join** per node; (b) **restart in
+place**, relying on Raft and the failure detector; (c) restart in place with a
+preceding leadership transfer.
+
+(a) is wrong for a roll: the drain moves every replica off the node (a full
+rebuild of all its data, twice), leaves the member `Leaving`, which **blocks
+Finalize** (Phase 2 section 4), and a removed node must re-register. It is the
+decommission path and stays that. (b) is what Phase 2 already declared supported
+and tested (the mixed corpus kills and restarts nodes under load). (c) adds one
+cheap step that removes the avoidable election: if the node is the control leader
+(`/admin/health` `is_control_leader`), call `POST /admin/control/transfer` to a
+healthy voter and wait for `control_leader_recent` elsewhere before touching it.
+Data-plane tablet leaders re-elect on their own (ADR 0016/0017); transferring
+those is out of scope (see Open question 3).
+
+**Recommendation: (c).** The per-node runbook, in order (this is also the manual
+procedure, to be put in `docs/` by P3-A and on the website):
+
+1. `animus cluster roll plan <admin-addr>`: print the order (see below), the
+   current versions, and refuse if the preconditions fail (era active, no
+   blockers other than "node has not reported yet", cluster healthy by D2).
+2. For the next node: if it is the control leader, transfer leadership.
+3. Install the new binary/image and restart the process. **This is the node's
+   point of no return (Option B)**: from its first start of the new binary it
+   writes class-L formats at the new version. The runbook says so before step 1.
+4. `animus cluster roll wait <that-node's-admin-addr>`: block until the node is
+   healthy (D2) *and* has reported the new range (`/admin/cluster-version`
+   `nodes[].range`/`build` for it).
+5. Repeat for every member **including `Down` ones** (bring them back on the new
+   binary or `decommission` them; Finalize refuses otherwise).
+6. `animus cluster finalize <admin-addr>` (manual, D6) when `can_finalize`.
+
+Order: data-only nodes first, then control voters, the **control leader last**
+(it is the node whose restart costs an election and whose admin endpoint serves
+Finalize); within a class, any order. This matches the StatefulSet's
+highest-ordinal-first order in the operator, where ordinals `0..controlNodes-1`
+are the voters (`desired/poddisruptionbudget.rs:5-12`).
+
+#### D2. The wait-healthy signal
+
+Today's pieces are not enough: pod readiness (`/admin/health`) is "had a recent
+control leader" only; the Phase 2 prose ("`Active` and no tablet is
+under-replicated") has no implementation outside dashboard JavaScript.
+
+Options: (a) the operator and CLI each re-implement the dashboard ladder over
+`/admin/status` + a `/admin/raftkv` fan-out; (b) one **server-side** endpoint
+that computes the verdict from the node's own replicated `Metadata` plus its own
+hosted groups; (c) fold it into `/admin/health` so the kubelet readiness probe
+carries it.
+
+(a) duplicates a subtle ladder in two more languages and needs a fan-out from the
+operator. (c) is tempting (it also makes a plain StatefulSet roll safer) but
+makes readiness depend on cluster-wide state, so one degraded tablet marks every
+pod NotReady and removes the whole cluster from its Service: it was already
+tried in spirit and rejected by issue #710 / #595 (readiness must not couple to
+things the node cannot fix). **Recommendation: (b), a new read-only
+`GET /admin/roll-health`, never used by a probe.** Body (additive, versioned
+JSON, class "Admin (additive)" in the section 8 inventory):
+
+```
+{ "ok": bool,
+  "reasons": [ {"kind": "...", "node"?: "...", "tablet"?: N} ],
+  "control_quorum": {"voters": N, "reachable": M},         // from live control view
+  "members": {"active": N, "not_active": [{"node","status"}]},
+  "tablets": {"total": N, "quorum_lost": N, "under_replicated": N,
+              "forming": N, "learners_pending": N},
+  "local": {"node","status","hosted_groups","caught_up_groups"} }
+```
+
+`ok` is true iff: the control group has a quorum of reachable voters **and** a
+recent leader; every `Metadata` member is `Active` (no `Down`/`Leaving`/
+`Joining`); every tablet has all configured replicas on non-`Down` members and no
+tablet is `quorum-lost`/`under-replicated`; **and** the answering node's own
+hosted groups are caught up (each has a leader known and `commit_index -
+engine_applied_index` within a small bound, from the same view as
+`/admin/raftkv`, `admin.rs:100-140`). The first three come from metadata and are
+answerable by any node; the last is node-local, which is why `roll wait` queries
+the **restarted node** (and, for the cluster-wide part, any one other node).
+`tablets.forming` is reported but does not by itself fail `ok` (it is a
+transition, per the dashboard's own ladder), except that a node that was just
+restarted must have `local.caught_up_groups == local.hosted_groups`. Moving the
+ladder into Rust means the dashboard should consume the same function (a
+follow-up in P3-A, not a new copy).
+
+The restarted node flips `Down -> Active` on its first heartbeat, long before its
+groups catch up; the `local` clause is what stops a gate from opening during
+catch-up. That clause is the part most likely to need tuning in the real-process
+test (D10).
+
+#### D3. The CLI
+
+`animus cluster roll` cannot restart a process it does not own, and the CLI must
+not grow k8s/systemd drivers. **Recommendation: `roll` is a verified-handoff
+supervisor with three subcommands** (all admin-port, TLS-aware like `cluster
+version`):
+
+- `animus cluster roll plan <admin-addr> [--json]`: the order, preconditions, what
+  is already on the new range, what is down, and the Option B warning.
+- `animus cluster roll wait <admin-addr> [--node ID] [--timeout 10m]`: poll D2
+  and the node's reported range until healthy, exit 0/1 (scriptable between
+  `systemctl restart` calls; the operator reuses the same predicate).
+- `animus cluster roll status <admin-addr> [--json]`: D5.
+
+Optionally `animus cluster roll run <admin-addr> --exec 'CMD {node}'` runs a
+user-supplied restart command per node in plan order with `wait` between (so a
+systemd/ansible shop gets one command). Not in the first slice; listed as P3-B
+stretch. `cluster finalize` is unchanged; `roll wait` on the last node prints
+"all members report the new range; run `animus cluster finalize`" (or finalizes
+under D6 `--finalize`).
+
+#### D4. Repair churn during a roll (optional)
+
+Per the table, a restart that outlasts `REPAIR_DWELL` (5 s) can evict the node's
+replicas and start rebuilds on any cluster with spare nodes; on an RF-3 cluster
+of 3 nodes there is no spare candidate and nothing happens. Options: (a) accept
+it (correct, only wasteful, and the corpora already exercise it); (b) a
+replicated, **expiring** per-node `maintenance {node, until}` marker that placement
+repair honours by treating that node as "dwelling" until `until`; set by `roll
+wait`/the operator before the restart, cleared at healthy; (c) raise `REPAIR_DWELL`
+globally (hurts real failure repair, rejected). (b) is a new `MetaCommand`, so it
+is a **Gate::Era-class addition** under the Phase 2 rules (gated, relay allowlist,
+mixed corpus, N-1 profile): a real cost. **Recommendation: ship Phase 3 with (a),
+document the cost, measure it in the D10 job, and take (b) as a follow-up only if
+the measurement shows rebuild traffic that matters.** Listed as Open question 2.
+
+#### D5. The roll status view
+
+Admin endpoint: extend `GET /admin/cluster-version` (additive, class "Admin
+(additive)") with a `roll` object computed from data already there: `phase`
+(`not_started` / `rolling` / `ready_to_finalize` / `blocked`), `total`, `on_new`
+(nodes whose recorded range max >= target, per `nodes[].range`), `remaining`
+(ordered), `down`, `blockers`, and the D2 verdict. `not_started` is "every node
+reports the old range"; `rolling` is a mix; `ready_to_finalize` equals `can_finalize`.
+It is **derived**, never stored: there is no roll state to persist or lose in a
+leader change, which is the point (D7 repeats this for the operator). The CLI
+`roll status` renders it; the dashboard Overview gets a "Version" card (active
+version, N of M nodes on the new build, blockers, a Finalize link role-gated like
+ADR 0037's membership actions). The operator mirrors it into status (D7).
+
+#### D6. Auto-finalize
+
+Phase 2 section 4 allowed it "as a Phase 3 option once an orchestrator knows the
+roll is complete". Finalize is the one irreversible step, and a human may want to
+soak the new binary at the *old* cluster version first (that soak is the only
+window in which the cluster's behaviour is still the previous release's, even if
+files are already written new). **Recommendation: opt-in, never default.**
+Operator: `spec.upgrade.finalize: Manual` (default) `| Auto`; with `Auto` the
+operator calls finalize only when the roll it drove has completed (every pod on
+the new revision, `can_finalize` true, D2 `ok` for a configurable
+`spec.upgrade.soakSeconds`, default 0) and records a status condition naming the
+version. Non-operator: `roll wait --finalize` on the last node, still printing the
+irreversibility warning, requiring `--yes`. Failure to finalize (a blocker such as
+a `Down` member) leaves the cluster serving normally and a condition naming the
+blocker; it is retried every reconcile, never forced.
+
+#### D7. Operator `spec.image` orchestration
+
+Goal: an edit to `spec.image` (or any restart-relevant spec) rolls one pod at a
+time, each gated on D2, with the operator able to stop at any point, and finalize
+as D6.
+
+Options:
+- **(a) `OnDelete` + operator deletes pods.** Maximum control. Needs `delete` on
+  `pods` (the RBAC today is `get/list/watch`, `deploy/operator/rbac.yaml:57-62`,
+  a deliberate "pods are owned by the StatefulSet" statement), and pod deletion
+  goes around any PDB the operator should still honour (eviction API vs delete).
+- **(b) `RollingUpdate` with the operator driving `partition`.** The operator
+  server-side-applies `updateStrategy.rollingUpdate.partition = N`. Kubernetes
+  updates only ordinals >= `partition`; the operator lowers it by one (N-1) only
+  after the previous pod is `Ready` **and** D2 is `ok` **and** the pod reports the
+  new range. It needs no new RBAC (it already patches `statefulsets`), uses the
+  StatefulSet controller's own pod replacement (graceful termination, volume
+  reuse), and a pod deleted or evicted below the partition comes back on the **old**
+  revision, which is the right behaviour mid-roll and for scale-up of an old
+  ordinal. The cost: Kubernetes has no "pause" beyond `partition`, and with
+  `podManagementPolicy: Parallel` (`statefulset.rs:541`) rolling-update ordering
+  is still one pod at a time, highest first, which is what we want.
+- (c) Keep ungated `RollingUpdate`, add `minReadySeconds`. Rejected: it measures
+  pod stability, not cluster health, and finalize remains manual with no gate.
+
+**Recommendation: (b).** It is the smallest change that makes the existing roll
+gate-able, needs no new privilege, and the roll state is *derived* from two
+observable facts (the StatefulSet's `updatedReplicas`/`currentRevision`/
+`updateRevision` and each pod's reported version), so a restarted operator
+resumes from live truth the same way `advance_control_growth` does (ADR 0060
+S-07d). `OnDelete` stays the fallback if a platform's partition semantics prove
+unusable (Open question 1).
+
+Sequence, one reconcile pass at a time (all in `controller.rs`, new module
+`roll.rs`; pure decision function + imperative `ClusterApi`/`AdminOps` calls, same
+split as `advance_control_growth`):
+
+1. Detect a template change: `updateRevision != currentRevision` on the observed
+   StatefulSet, or a not-yet-applied template (spec hash differs).
+2. Preconditions (else surface a condition `UpgradeBlocked`, do nothing): era is
+   active (`/admin/cluster-version` `era_active`; the first Phase 1 -> B2 roll is
+   special, see D8); every member `Active`; D2 `ok`; the new image's binary
+   range is known (see below).
+3. Apply the template **with `partition = nodes`** in the same server-side apply
+   (D8). Then for ordinal = nodes-1 down to 0: lower the partition to `ordinal`;
+   wait for that pod `Ready`; wait for D2 `ok` and for the node to report the new
+   `build`/range in `/admin/cluster-version`; if the pod is the control leader,
+   call `/admin/control/transfer` before lowering to its ordinal.
+4. When `partition == 0` and every pod is on `updateRevision`: if D6 is `Auto` and
+   `can_finalize`, finalize; else set condition `RollComplete` (message: "run
+   `animus cluster finalize` ... irreversible").
+
+The pod's *binary range* is read from the live `/admin/cluster-version` after the
+pod is up; the operator cannot know it before the roll starts. To fail early on an
+out-of-range image (a skipped release, R+2 over R), P3-D adds the supported range
+to the **image**: an OCI label `io.animusdb.cluster-version-range` (set by the
+`Dockerfile`/`image.yml` build from the same constant as `own_range`), which the
+operator can read from the registry manifest only if it can pull one; otherwise
+the first upgraded pod's startup refusal (`startup range check`, Phase 2 P2-A) is
+the backstop and the roll pauses there (D9). Whether to build the label path or
+rely on the backstop is Open question 5.
+
+PDB interaction: the rolling update does not consult the PDB (above), so the
+operator's own health gate **is** the protection: at most one pod is ever below
+the partition, which is the same cardinality as the PDB's `maxUnavailable` for the
+cluster shapes where it is `>= 1`, and the D2 gate keeps it at one pod even if the
+PDB would allow more. Where the PDB is `0` (an under-replicated shape: one control
+node, or fewer than 3 nodes), the operator **refuses to start** a roll and reports
+`UpgradeBlocked: cluster cannot tolerate losing a node (PDB maxUnavailable 0)`,
+since a roll there is an outage by construction; the maintainer can still do the
+whole-cluster stop-upgrade-restart (Phase 1). Voluntary evictions by a node-pool
+upgrade during a roll are the PDB's job and remain so.
+
+Status: add to `AnimusClusterStatus` (`crd.rs:778`) additive, `skip_serializing_if`
+fields (CRD schema version unchanged, ADR 0073 Phase 0 E): `upgrade { phase,
+fromVersion, toVersion, onNew, total, activeClusterVersion }`, plus conditions
+`UpgradeInProgress`, `UpgradeBlocked`, `UpgradeFinalizePending`, `RollComplete`. The
+CRD change is additive (a new optional `spec.upgrade` and status block), so the
+schema-version marker is not bumped; the existing CRD schema fixtures get a new
+no-overwrite fixture per the format-change checklist.
+
+#### D8. Closing today's ungated roll
+
+Today: edit `spec.image` (or change `controlNodes`) -> new pod template ->
+Kubernetes starts rolling immediately, no gate (table, rows 2-3). The fix must
+leave **no window** in which a template change is applied with `partition 0`.
+Options: (a) the operator only ever applies a changed template together with
+`partition = nodes` in the *same* server-side-apply patch (atomic: the API server
+sees one revision of the StatefulSet spec); (b) a validating-webhook rejection of
+image edits unless a roll annotation is present (blocks the user instead of
+orchestrating, and the webhook is optional, `webhook.rs`); (c) leave it and
+document. **Recommendation: (a), always on for every template change**, including
+the config-hash roll (a `controlNodes` growth) which also should not roll every pod
+ungated; first creation applies `partition 0`. `apply_statefulset` is already
+unconditional and idempotent every reconcile (`controller.rs:89-170`), so the
+partition is computed from observed state each pass (never stored in the CR):
+`partition = nodes` when `updateRevision` differs from what the gate has already
+admitted, else the current gate position. A reconcile that finds a template change
+but cannot read the live state (admin unreachable, no era) **holds `partition =
+nodes`** (nothing rolls) and sets `UpgradeBlocked`; fail closed.
+
+Two special cases: (1) the **first** roll over Phase 1 binaries (to B2, section 2):
+no era, so no `/admin/cluster-version` `era_active`. Here D2's metadata-only part
+and the "node reports `ReportNodeVersion` once the era is on" are not available;
+the operator uses D2 `ok` + pod `Ready` + the era-start observation, and finalize
+does not apply until the era is active. This is a one-time rule: it is the
+sentence "from a Phase 1 cluster, the operator rolls with the D2 gate and no
+version observation; era start is automatic after the last member is B2". (2) A
+`spec.nodes` scale-down or `controlNodes` change **during** a roll is refused
+(`UpgradeInProgress` blocks other topology changes; scale-up of a *new* ordinal
+uses the new revision because ordinals >= partition are updated; the operator holds
+the other changes until `RollComplete`). Which of these is cheapest to enforce is
+a P3-D detail.
+
+#### D9. A failed pod, abort, and rollback
+
+Option B is fixed: there is no rollback of a node that has run the new binary. The
+operator's job is to **stop, surface and not make it worse**.
+
+- *New pod never becomes Ready / crashloops:* the roll stops at that ordinal
+  (partition does not move); the remaining pods are on the old binary and keep
+  quorum (the gate only moved one pod). Condition `UpgradeBlocked` with the pod
+  name, last restart reason and the D2 reasons. The cluster serves normally at its
+  old cluster version. The remedy is the fix-forward set in section 5: ship a
+  fixed image and edit `spec.image` again (the partition logic re-targets the new
+  `updateRevision`, the already-rolled pods roll once more), wipe that node's
+  PVC and let it rebuild from peers, or restore from backup.
+- *New pod Ready but D2 never `ok`* (catch-up stalls): same; the gate holds.
+- *Reverting `spec.image` to the old image mid-roll:* **refused by the operator**
+  (webhook `validate_spec` and the reconciler's own check) once any pod has
+  reported the new range: a revert would re-roll new-binary nodes to the old
+  binary, which the new nodes' formats may not read (class L, Option B). Before
+  the first pod is touched (partition still `nodes`), a revert is free and just
+  clears the pending roll.
+- *Operator restart mid-roll:* nothing is lost: the state is derived (D7).
+- *A pod evicted/restarted below the partition:* comes back on the old revision;
+  harmless.
+- *A bad finalize attempt (blocker):* surfaced, retried, never forced (D6).
+
+#### D10. The previous-release cross-version CI job
+
+Phase 2's corpus models gate discipline with `BinaryProfile`; it does not run the
+old bytes (Phase 2 residual risk 3). The job that closes that: build release R-1's
+real `animusd` (a pinned tag, or until the first `v*` tag exists, `ac57d56a`, the
+last Phase 1 tree) and run it against the current tree's binary.
+
+Two tiers, because they cost differently:
+
+- **`ProdEnv` real-process roll** (mandatory, per-push at a small scale or nightly
+  if slow; `animusd` `tests/` target, `prod-heavy`): start a 3-node cluster
+  (combined role) of R-1 binaries from artifacts, run a DynamoDB-wire workload
+  with a verifier (acked puts must be readable; reuse `animus-test`'s cycle
+  checker where possible), then for each node in D1 order: stop, start the R
+  binary, `roll wait`; run through finalize; assert workload continuity (retries
+  allowed, no lost ack), `cluster version` converges, then restart-all on R.
+  Include the **kill-the-leader mid-roll** and **torn-tail** variants the mixed
+  corpus already has. This job also measures D4 (rebuild traffic per step).
+- **`kind` operator roll** (nightly, `e2e-kind`-style, `scripts/e2e-kind.sh` +
+  `E2E_UPGRADE_FROM=<image>`): create the `AnimusCluster` at R-1's published
+  image, run the existing `PutItem`/`GetItem` loop, edit `spec.image` to R, assert
+  the D7 sequence (one pod at a time, `UpgradeInProgress` -> `RollComplete`,
+  partition steps observed), then finalize (or `Auto`), and the data check passes
+  throughout. A second leg injects a **bad image** (crashloops) and asserts the
+  roll stops at the first pod, the cluster stays up, and a fixed image resumes it
+  (D9). The kind job cannot run in this repo's sandbox (see `animus-operator/
+  CLAUDE.md`'s e2e section); it is CI-verified only, like the others.
+
+Artifact sourcing: before a `v*` tag exists, the R-1 binary/image is built by CI
+from `ac57d56a` and cached by SHA; after the first tag, the job pulls the previous
+tag's release binary (`release.yml`) and image (`image.yml`). The pinned-reference
+file (`scripts/upgrade-from.txt`: tag or SHA) is edited by the release checklist
+(`docs/release.md`): cutting R means moving the pointer to R-1 and re-running the
+job green **before** tagging. This is Phase 2 rule 3's "N-1 -> N for every later
+release is mandatory", now enforced by real bytes.
+
+### Testing
+
+Principle (root `CLAUDE.md`): every distributed behaviour lands with a
+seed-reproducible fault-injecting simulation test; process-boundary behaviour gets
+a `ProdEnv`/`kind` test.
+
+| Layer | Test | Asserts |
+|---|---|---|
+| `animusd` pure | `roll_health` unit tests over crafted `Metadata` + group views | every `ok` clause independently: control quorum, a `Down`/`Leaving`/`Joining` member, an under-replicated tablet, a quorum-lost tablet, a learner pending, a restarted node with an uncaught-up group; a table-driven oracle that equals the dashboard ladder (so the JS and Rust cannot diverge); mutation: drop each clause, a unit fails |
+| `animusd` `SimCluster` | `sim_cluster_roll_orchestrator` (new, in the P2 corpus family, `ANIMUS_UPGRADE_SEEDS`, replay with `ANIMUS_SEED`) | the **roll driver** (the pure state machine shared by CLI and operator) over a rolling `Phase1 -> B2` and `Release(N-1) -> N` with leader kills, partitions, a node that crashes after restart, a node that stays Down, a bad node that never catches up; the driver never has more than one node below the gate, never starts with `ok` false, stops on a blocker, never calls finalize with a blocker, resumes identically after the driver is "restarted" (state derived), and the cluster passes `check_cycles`/`check_durability` |
+| `animusd` `SimCluster` | `roll_health_matches_dashboard_ladder` | server verdict = the ladder on the same state |
+| `animus-operator` pure (`fakes.rs`) | `roll.rs` decision tests | template change -> partition = nodes in the same apply; partition lowers one step per `ok` observation; blocked on each D2 reason and on era not active; fail closed on unreachable admin; resume from observed `updatedReplicas`; image revert refused after a pod reported new range; topology changes held during a roll; PDB `maxUnavailable 0` refuses to start; `Auto` finalizes only with `can_finalize`; control leader gets a transfer first |
+| `animus-operator` | `statefulset` builder tests | `updateStrategy` present in every apply, `partition` computed, config-hash change gated exactly like an image change |
+| `animus-cli` | `roll plan/wait/status` unit + `animusd` `tests/` `ProdEnv` target | exit codes, `--json`, `--timeout`, TLS path, parity with the Phase 2 `cluster` tests |
+| `ProdEnv` process | D10 first tier | see D10 |
+| `kind` | D10 second tier | see D10 |
+| mutation runs | recorded in the as-built amendment | skip the D2 gate; lower partition without `ok`; apply the template without `partition`; finalize with a blocker: each must fail a named test |
+
+### Inventory of surfaces touched
+
+| Surface | Code | Change | Class |
+|---|---|---|---|
+| `GET /admin/roll-health` (new) | `animusd/src/admin.rs` | read-only, additive | Admin (additive), no gate |
+| `GET /admin/cluster-version` | `animusd/src/version_wiring.rs` | new additive `roll` object | Admin (additive) |
+| Dashboard Version card, ladder reuse | `animusd/src/dashboard_*.js` | consume the server verdict | n/a |
+| CLI `cluster roll plan/wait/status` | `animus-cli/src/main.rs` | new subcommands | n/a (client) |
+| `AnimusCluster` CRD: `spec.upgrade`, `status.upgrade`, new conditions | `animus-operator/src/crd.rs`, `deploy/operator/crd.yaml` | additive optional fields; new no-overwrite fixture | CRD schema (Phase 0 E), version unchanged |
+| StatefulSet `updateStrategy`/`partition`, controller roll module | `desired/statefulset.rs`, `controller.rs`, new `roll.rs` | new | operator-internal |
+| Operator RBAC | `deploy/operator/rbac.yaml` | **none** under D7(b); pods `delete` only if OnDelete is chosen | n/a |
+| Image label (optional, Open q 5) | `Dockerfile`, `image.yml` | `io.animusdb.cluster-version-range` | n/a |
+| `maintenance` marker (optional, D4) | `animus-control/src/meta.rs`, gate registry | new `MetaCommand` | **G, Gate::Era**; only if D4(b) is taken |
+| Docs | ADR 0060 "Upgrades", website (`docs.html:541,653`, **and the stale `architecture.html:277,292`, `how-it-works.html:222`**), root and crate `CLAUDE.md`s, `docs/release.md`, roadmap C-16, a runbook | updated in the final P3 PR |  |
+
+### Workstreams (one session/PR series each)
+
+| WS | Crates | Scope | Depends on | Do not touch |
+|---|---|---|---|---|
+| **P3-A** health + status server side | `animusd` | `roll_health` (Rust, shared with the dashboard), `GET /admin/roll-health`, the `roll` object in `/admin/cluster-version`, dashboard Version card, unit tests + oracle, runbook text | none | `animus-control` (no new command), operator |
+| **P3-B** CLI | `animus-cli` | `cluster roll plan/wait/status` (+ `--finalize`, stretch `run --exec`), parity tests | P3-A | `animusd` internals |
+| **P3-C** roll driver + sim corpus | `animusd`, `animus-test` | the pure roll state machine (a library module reused by B and D), `sim_cluster_roll_orchestrator`, mutation runs, `ANIMUS_UPGRADE_SEEDS` cells, nightly step in `corpus-deep.yml` | P3-A | production emit/apply logic (report bugs) |
+| **P3-D** operator orchestration | `animus-operator`, `deploy/` | D7/D8/D9: `updateStrategy`+`partition`, `roll.rs`, status/conditions/CRD additive fields + fixture, `validate_spec` image-revert refusal, webhook mirror, PDB-0 refusal, fakes tests | P3-A, P3-C (driver) | `animusd`, `animus-control` |
+| **P3-E** cross-version CI | `animusd` `tests/`, `scripts/`, `.github/workflows/`, `animus-operator` e2e | D10 both tiers, the pinned-reference file, `docs/release.md` checklist step | P3-A, P3-B (and P3-D for the kind tier) | production code |
+| **P3-F** docs close-out | docs, `website/` | ADR 0060 "Upgrades", website claims (incl. the stale pages), CLAUDE.md files, roadmap | all | code |
+| **P3-G (optional)** repair maintenance mark | `animus-control`, `animusd` | D4(b), only if measured necessary | P3-E measurement | n/a |
+
+Waves: P3-A first; P3-B and P3-C concurrent; P3-D after C's driver is stable; P3-E
+starts its `ProdEnv` tier with B and its `kind` tier with D. As with Phase 2, P3-D
+must not merge alone: until P3-E's job proves a real R-1 -> R roll, the operator
+path is unverified; they release as one train. P3-F lands last.
+
+### What Phase 3 "done" means, and what is supported
+
+Done when: the runbook and `roll plan/wait/status` exist and are tested; the server
+side `roll-health` is the single definition used by CLI, operator and dashboard;
+the operator rolls a `spec.image` (and config-hash) change one pod at a time under
+the D2 gate with no ungated window, stops on failure and surfaces it, and finalizes
+only as configured; the sim roll-driver corpus is in the per-push gate at K=1 and
+nightly deep; the `ProdEnv` previous-release job is in CI and green, the `kind`
+roll job is green nightly; ADR 0060 "Upgrades" and the website are corrected
+(including the pages that still say mixed-version is unsupported).
+
+**Supported after Phase 3:** a rolling upgrade from R-1 to R either by the manual
+runbook/CLI or by editing `spec.image` on an operator-managed cluster of at least
+3 nodes with PDB `maxUnavailable >= 1`, with zero downtime beyond client retries,
+and an explicit (or opted-in automatic) finalize. **Not supported (unchanged or
+new):** skipping a release; rolling a node back after it ran the new binary;
+reverting `spec.image` mid-roll; a roll on a cluster that cannot lose a node
+(1 control node, fewer than 3 nodes); topology changes (`nodes`, `controlNodes`,
+storage) during a roll; operator-driven roll with `spec.storage.ephemeral`
+(a restarted ephemeral pod has lost its data by design); a roll that crosses a
+raised `min_supported` without the stepping-stone release.
+
+### Residual risks (not closed by design)
+
+1. *The D2 definition is a heuristic.* "Caught up" is read from group views and
+   can be wrong in either direction under load; too strict stalls a roll (fail
+   closed, safe), too loose can let a second node go while the first is still
+   catching up (the PDB and the one-pod-below-partition rule bound the harm to one
+   extra concurrent restart). Tuned only by the real-process job.
+2. *Repair churn* (D4): a slow restart can trigger replica rebuilds on clusters with
+   spare nodes. Correct, but costly; measured, not prevented, unless P3-G.
+3. *Partition semantics are a Kubernetes contract the operator now depends on.* A
+   k8s behaviour change (or a platform that mutates StatefulSets) breaks the gate;
+   the kind job is the only guard, and only for the versions it runs on.
+4. *The first roll from Phase 1 binaries* (D8 case 1) has no version observation to
+   gate on; it relies on D2 plus the era-start precondition and is exercised only by
+   the `ProdEnv` tier against `ac57d56a`.
+5. *Option B's blast radius.* A bad release that passes D2 and the first pod still
+   sends every following pod through its point of no return one by one; the gate
+   catches crashes and catch-up failures, not subtle data bugs. That is the price of
+   fix-forward and the reason auto-finalize stays opt-in and the soak window exists.
+6. *The operator cannot see pods' admin ports when NetworkPolicy or proxy access
+   is misconfigured:* the roll then fails closed forever. Surfaced as
+   `UpgradeBlocked`, indistinguishable from a real health failure without the
+   message.
+7. *`OnDelete` fallback* (Open q 1) would need pod `delete` RBAC and a PDB-aware
+   eviction call, a privilege expansion.
+
+### Open questions for the maintainer
+
+1. **Partition vs `OnDelete` (D7).** The Phase 2 sketch said `OnDelete`; this design
+   recommends `RollingUpdate` + operator-owned `partition` (no new RBAC, uses the
+   StatefulSet's own replacement, old revision on recreate). OK to go with
+   partition, or do you want `OnDelete` and the pod-delete privilege?
+2. **Repair churn (D4).** Ship without a maintenance mark and measure (recommended),
+   or build the replicated expiring `maintenance` marker now (a new gated
+   `MetaCommand`)?
+3. **Tablet leader transfer before restart.** Only the control leader is moved
+   first (cheap, exposed). Should the roll also move data-plane tablet leaders off
+   the node (no admin route exists for that today), trading complexity for fewer
+   client-visible retries?
+4. **Auto-finalize default and soak (D6).** Confirm opt-in only, and whether the
+   operator should support a minimum soak time at all.
+5. **Image range label (D7).** Build the OCI label and registry read so the operator
+   refuses a skipped release before touching a pod, or rely on the startup range
+   refusal of the first upgraded pod (the roll stops there either way)?
+6. **Cluster-shape floor.** Is "operator rolls only when PDB `maxUnavailable >= 1`"
+   the right bar, with the Phase 1 stop-upgrade-restart documented for smaller
+   clusters, or should a 1- or 2-node roll be allowed with a loud warning?
+7. **First tag.** No `v*` tag exists. Should P3-E wait for the first alpha tag as R-1,
+   or pin `ac57d56a` (a Phase 1 binary) as the stand-in for the first-roll test?
+8. **`animus cluster roll run --exec`.** In scope for P3-B or deliberately left to
+   users' own tooling?
