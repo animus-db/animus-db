@@ -156,6 +156,12 @@ jobs:
       - name: format fixtures are append-only (ADR 0073)
         run: scripts/check-format-fixtures.sh
 
+      # GitHub rejects a workflow with more than 25 `workflow_dispatch`
+      # inputs, silently killing every run of it (corpus-deep.yml crossed
+      # the cap twice through merges).
+      - name: workflow_dispatch inputs within GitHub's cap of 25
+        run: scripts/check-workflow-dispatch-inputs.sh
+
       # `--all-features` here (unlike the plain `cargo test` the test jobs run)
       # turns on every crate's opt-in `prod-heavy` feature too, so the
       # real-thread test binaries gated behind it (see `prod-liveness`) still
