@@ -596,7 +596,7 @@ jobs:
         continue-on-error: true
         timeout-minutes: 30
         env:
-          ANIMUS_MRSC_SEEDS: '5'
+          ANIMUS_MRSC_SEEDS: '10'
         run: cargo test -p animusd --lib sim_cluster_mrsc -- --nocapture
 
       # ADR 0028's C-05 PR 2 SharedWal persist-path wiring: cross-tablet
