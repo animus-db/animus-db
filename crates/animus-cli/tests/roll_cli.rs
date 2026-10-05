@@ -204,6 +204,22 @@ fn plan_order_and_status_match_the_servers_roll_state() {
 }
 
 #[test]
+fn plan_after_finalize_is_empty_not_a_roll_toward_an_unsupported_version() {
+    // Finalized at the newest version this build speaks (2): every node's
+    // range max is 2 and `active + 1` = 3 is a version nothing supports. The
+    // server's own `roll.remaining` still lists every node (it is relative to
+    // `target`); `plan` must not turn that into a restart-everything order.
+    let v = view(2, [Some(2); 4], &["d", "a", "b", "c"], false);
+    let f = fixed(v, "a", health_ok("a"));
+    let o = run(&["cluster", "roll", "plan", &f.addr.to_string(), "--json"]);
+    assert!(o.status.success(), "{} {}", out(&o), err(&o));
+    let p: Value = serde_json::from_str(out(&o).trim()).unwrap();
+    assert!(p["steps"].as_array().is_none_or(|s| s.is_empty()), "{p}");
+    let s = run(&["cluster", "roll", "status", &f.addr.to_string(), "--json"]);
+    assert!(s.status.success(), "{} {}", out(&s), err(&s));
+}
+
+#[test]
 fn plan_refuses_when_roll_health_is_not_ok_and_exits_nonzero() {
     let bad = json!({"ok": false, "reasons": [{"kind": "tablet_under_replicated", "tablet": 7}],
                      "local": {"node": "d"}});

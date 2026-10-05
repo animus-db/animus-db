@@ -146,7 +146,35 @@ pub(crate) fn parse_roll_args(args: &[String]) -> Result<RollCmd, String> {
 
 /// The roll's goal: the next cluster version. Fixed by the view's `active`.
 fn goal_of(view: &Value) -> u32 {
-    view["active"].as_u64().unwrap_or(0) as u32 + 1
+    view["roll_goal"]
+        .as_u64()
+        .unwrap_or_else(|| view["active"].as_u64().unwrap_or(0) + 1) as u32
+}
+
+/// Settle the roll's goal once every binary the CLI can see is known.
+/// `active + 1` is the goal only if some binary can actually reach it: the
+/// asked node's own range, a probed node's own range, or this CLI's own build
+/// (the release being rolled to ships its own CLI). When none can, the cluster
+/// is at rest on the newest version any of its binaries speaks (e.g. just
+/// after `finalize`), not at the start of a roll toward a version nothing
+/// supports: pin the goal to `active` so `plan`/`status` say "complete"
+/// instead of listing every node for a pointless restart.
+pub(crate) fn settle_goal(view: &mut Value, probed_max: u32, cli_max: u32) {
+    if !view["era_active"].as_bool().unwrap_or(false) {
+        return;
+    }
+    let goal = goal_of(view);
+    let reach = [
+        view["own_range"]["max"].as_u64().unwrap_or(0),
+        u64::from(probed_max),
+        u64::from(cli_max),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0);
+    if reach < u64::from(goal) {
+        view["roll_goal"] = json!(view["active"].as_u64().unwrap_or(0));
+    }
 }
 
 fn node_id(n: &Value) -> Option<&str> {
@@ -684,7 +712,12 @@ async fn fetch_snapshot(
             ));
         }
     };
-    let (view, new_admins) = probe_nodes(addr, view, tls).await;
+    let (mut view, new_admins, probed_max) = probe_nodes(addr, view, tls).await;
+    settle_goal(
+        &mut view,
+        probed_max,
+        animus_control::version::own_range().max,
+    );
     // The verdict is cluster-wide, so any node on the new binary can give it:
     // the asked node first, then the nodes the probes found on the new binary
     // (a previous-release node has no `roll-health`).
@@ -720,7 +753,7 @@ async fn probe_nodes(
     addr: &str,
     mut view: Value,
     tls: Option<&tokio_rustls::TlsConnector>,
-) -> (Value, Vec<String>) {
+) -> (Value, Vec<String>, u32) {
     let goal = goal_of(&view);
     let old: Vec<String> = view["nodes"]
         .as_array()
@@ -730,11 +763,12 @@ async fn probe_nodes(
         .filter_map(|n| node_id(n).map(str::to_string))
         .collect();
     if old.is_empty() {
-        return (view, Vec::new());
+        return (view, Vec::new(), 0);
     }
     let Ok((200..=299, Some(status))) = get_json(addr, "/admin/status", tls).await else {
-        return (view, Vec::new());
+        return (view, Vec::new(), 0);
     };
+    let mut probed_max = 0;
     let mut probes = BTreeMap::new();
     let mut new_admins = Vec::new();
     for id in old {
@@ -748,11 +782,12 @@ async fn probe_nodes(
         .await;
         if let Ok(Ok((200..=299, Some(body)))) = probe {
             new_admins.push(admin.to_string());
+            probed_max = probed_max.max(body["own_range"]["max"].as_u64().unwrap_or(0) as u32);
             probes.insert(id, body);
         }
     }
     apply_probes(&mut view, &probes);
-    (view, new_admins)
+    (view, new_admins, probed_max)
 }
 
 /// The control leader's admin address: its id from this node's `/admin/raft`,
@@ -1032,6 +1067,28 @@ mod tests {
         v["can_finalize"] = json!(true);
         let obs = build_observation(&v, &Health::Ok, Some("a"), None).unwrap();
         assert!(matches!(plan(&obs), PlanOutcome::Nothing(_)));
+    }
+
+    #[test]
+    fn plan_after_finalize_is_nothing_to_restart() {
+        // Finalized at 2 with every binary at [1, 2]: `active + 1` = 3 is a
+        // version no binary supports, so this is a cluster at rest, not a roll
+        // toward 3 (every node is "old" for goal 3, so the unsettled goal
+        // would plan a restart of all of them).
+        let mut v = view(2, [Some(2); 4], all_active());
+        let unsettled = build_observation(&v, &Health::Ok, Some("a"), None).unwrap();
+        assert!(matches!(plan(&unsettled), PlanOutcome::Steps(_)));
+        settle_goal(&mut v, 2, 2);
+        let obs = build_observation(&v, &Health::Ok, Some("a"), None).unwrap();
+        assert!(matches!(plan(&obs), PlanOutcome::Nothing(_)));
+        // A binary that does reach version 3 (a newer CLI, or a probed node)
+        // keeps the goal, so a roll to it plans normally.
+        for (probed, cli) in [(3, 2), (0, 3)] {
+            let mut v = view(2, [Some(2); 4], all_active());
+            settle_goal(&mut v, probed, cli);
+            let obs = build_observation(&v, &Health::Ok, Some("a"), None).unwrap();
+            assert!(matches!(plan(&obs), PlanOutcome::Steps(_)));
+        }
     }
 
     #[test]
