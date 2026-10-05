@@ -18,6 +18,8 @@ use animus_env::{ProdEnv, TlsMaterial};
 use animus_node::host::RelayClient;
 use animus_node::{ClientRequest, ClientResponse};
 
+use animus_control::version::ClusterFeatures;
+
 use crate::relay_request_with_timeout;
 
 /// This node's control-plane access — see `animus_node::control_handle::
@@ -51,9 +53,22 @@ pub(crate) type RemoteControlClient =
 /// `intra` port of a separately-deployed control plane exactly like every
 /// other cross-node relay in this crate — see [`relay_request_with_timeout`]'s
 /// own TLS doc.
+///
+/// **Carries the node's `ClusterFeatures` (ADR 0073 Phase 2, P2-C)** so every
+/// relayed request frame goes out through the gated encoder: a request whose
+/// gate is closed on this node is refused here, never put on the wire. A
+/// default-constructed client holds a floor handle (every era/version gate
+/// closed), which only the era-free joiner/test paths use.
 #[derive(Clone, Default)]
 pub(crate) struct AnimusdRelayClient {
     pub(crate) tls: Option<TlsMaterial>,
+    pub(crate) features: ClusterFeatures,
+}
+
+impl AnimusdRelayClient {
+    pub(crate) fn new(tls: Option<TlsMaterial>, features: ClusterFeatures) -> Self {
+        Self { tls, features }
+    }
 }
 
 #[async_trait::async_trait]
@@ -64,6 +79,6 @@ impl RelayClient for AnimusdRelayClient {
         request: &ClientRequest,
         timeout: Duration,
     ) -> ClientResponse {
-        relay_request_with_timeout(addr, request, timeout, self.tls.as_ref()).await
+        relay_request_with_timeout(addr, request, timeout, self.tls.as_ref(), &self.features).await
     }
 }

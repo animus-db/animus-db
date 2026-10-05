@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use animusd::config::{DynamoAuthConfig, NodeRole};
+use animusd::config::{DynamoAuthConfig, NodeRole, TlsSection};
 use animusd::{ClusterConfig, Node};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -32,6 +32,7 @@ use tokio::sync::Mutex;
 
 use crate::client::{Conn, Credentials, admin_get};
 use crate::rt;
+use crate::tls::TlsClient;
 
 /// One node's client-facing and admin addresses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,6 +72,29 @@ pub struct FaultRecord {
     pub detail: String,
 }
 
+/// TLS for a cluster this process launches (`--launch processes|in-process`):
+/// every node serves the same leaf certificate (its SAN must cover the name
+/// the client verifies: `127.0.0.1`, or `--tls-server-name`), the CA both
+/// secures the mutual intra-cluster ports and is what the client trusts.
+#[derive(Clone, Debug)]
+pub struct LaunchTls {
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+    pub ca_path: PathBuf,
+    /// The client side of the same PKI (used for every dial the bench makes).
+    pub client: TlsClient,
+}
+
+impl LaunchTls {
+    fn section(&self) -> TlsSection {
+        TlsSection {
+            cert_path: self.cert_path.clone(),
+            key_path: self.key_path.clone(),
+            ca_path: Some(self.ca_path.clone()),
+        }
+    }
+}
+
 struct ProcSpec {
     bin: PathBuf,
     config_path: PathBuf,
@@ -98,6 +122,8 @@ enum Control {
 struct Inner {
     nodes: Vec<NodeEndpoints>,
     creds: Option<Arc<Credentials>>,
+    /// Server-only TLS on the DynamoDB and admin dials, when configured.
+    tls: Option<TlsClient>,
     control: Control,
     /// Idle keep-alive connections carried across phases, like a real
     /// client's connection pool: a node killed at a phase boundary is then
@@ -124,6 +150,7 @@ impl Cluster {
     pub fn external(
         nodes: Vec<NodeEndpoints>,
         creds: Option<Credentials>,
+        tls: Option<TlsClient>,
         kill_cmd: Option<String>,
         restart_cmd: Option<String>,
     ) -> Self {
@@ -139,6 +166,7 @@ impl Cluster {
             inner: Arc::new(Inner {
                 nodes,
                 creds: creds.map(Arc::new),
+                tls,
                 control,
                 pool: std::sync::Mutex::default(),
             }),
@@ -167,6 +195,7 @@ impl Cluster {
         n: usize,
         dir: &Path,
         creds: Option<Credentials>,
+        tls: Option<LaunchTls>,
     ) -> std::io::Result<Self> {
         let mut config = ClusterConfig::generate(n, "127.0.0.1".parse().expect("ip"), 40_000);
         let any: SocketAddr = "127.0.0.1:0".parse().expect("addr");
@@ -181,6 +210,11 @@ impl Cluster {
         }
         if let Some(c) = &creds {
             config.dynamo_auth = Some(auth_config(c));
+        }
+        if let Some(t) = &tls {
+            for r in &mut config.nodes {
+                r.tls = Some(t.section());
+            }
         }
         let mut bounds = Vec::with_capacity(n);
         for (i, r) in config.nodes.clone().into_iter().enumerate() {
@@ -213,6 +247,7 @@ impl Cluster {
             inner: Arc::new(Inner {
                 nodes: endpoints,
                 creds: creds.map(Arc::new),
+                tls: tls.map(|t| t.client),
                 control: Control::InProcess {
                     nodes: Mutex::new(nodes),
                 },
@@ -232,6 +267,7 @@ impl Cluster {
         dir: &Path,
         bin: &Path,
         creds: Option<Credentials>,
+        tls: Option<LaunchTls>,
         extra_args: Vec<String>,
     ) -> std::io::Result<Self> {
         let mut last = String::new();
@@ -242,6 +278,7 @@ impl Cluster {
                 &attempt_dir,
                 bin,
                 creds.clone(),
+                tls.clone(),
                 extra_args.clone(),
             )
             .await
@@ -263,6 +300,7 @@ impl Cluster {
         dir: &Path,
         bin: &Path,
         creds: Option<Credentials>,
+        tls: Option<LaunchTls>,
         extra_args: Vec<String>,
     ) -> std::io::Result<Self> {
         std::fs::create_dir_all(dir)?;
@@ -288,6 +326,11 @@ impl Cluster {
         }
         if let Some(c) = &creds {
             config.dynamo_auth = Some(auth_config(c));
+        }
+        if let Some(t) = &tls {
+            for r in &mut config.nodes {
+                r.tls = Some(t.section());
+            }
         }
         let config_path = dir.join("cluster.json");
         std::fs::write(
@@ -318,6 +361,7 @@ impl Cluster {
                     })
                     .collect(),
                 creds: creds.map(Arc::new),
+                tls: tls.map(|t| t.client),
                 control: Control::Processes {
                     spec,
                     children: Mutex::new(children),
@@ -344,6 +388,37 @@ impl Cluster {
     #[must_use]
     pub fn dynamo_endpoints(&self) -> Vec<SocketAddr> {
         self.inner.nodes.iter().map(|n| n.dynamo).collect()
+    }
+
+    /// The server-only TLS client config every dial uses, if any.
+    #[must_use]
+    pub fn tls(&self) -> Option<&TlsClient> {
+        self.inner.tls.as_ref()
+    }
+
+    /// Dial up to `target` connections into the pool before a phase starts,
+    /// so workers begin with established (and, under TLS, already
+    /// handshaken) connections and no handshake lands inside a measured
+    /// op. Best-effort: an unreachable endpoint is skipped (the worker's
+    /// redial path handles it, and its cost is then charged, as for any
+    /// reconnect after a failure).
+    pub async fn prewarm(&self, target: usize) {
+        let have = self.inner.pool.lock().map_or(target, |p| p.len());
+        let eps = self.dynamo_endpoints();
+        if eps.is_empty() {
+            return;
+        }
+        for k in have..target {
+            let addr = eps[k % eps.len()];
+            if let Some(Ok(c)) = rt::timeout(
+                Duration::from_secs(2),
+                Conn::connect(addr, self.credentials(), self.tls()),
+            )
+            .await
+            {
+                self.checkin(c);
+            }
+        }
     }
 
     /// The SigV4 credentials requests are signed with, if any.
@@ -383,7 +458,7 @@ impl Cluster {
         loop {
             let mut not_ready = Vec::new();
             for n in &self.inner.nodes {
-                match admin_get(n.admin, "/admin/health").await {
+                match admin_get(n.admin, "/admin/health", self.tls()).await {
                     Ok((200, _)) => {}
                     Ok((s, _)) => not_ready.push(format!("node {} health {s}", n.index)),
                     Err(e) => not_ready.push(format!("node {} admin: {e}", n.index)),
@@ -408,7 +483,7 @@ impl Cluster {
     pub async fn tablet_roles(&self, table: &str) -> Option<TabletRoles> {
         let mut tablet = None;
         for n in &self.inner.nodes {
-            if let Ok((200, v)) = admin_get(n.admin, "/admin/status").await {
+            if let Ok((200, v)) = admin_get(n.admin, "/admin/status", self.tls()).await {
                 tablet = first_tablet_of(&v, table);
                 if tablet.is_some() {
                     break;
@@ -418,7 +493,7 @@ impl Cluster {
         let tablet = tablet?;
         let (mut leader, mut hosts) = (None, Vec::new());
         for n in &self.inner.nodes {
-            let Ok((200, v)) = admin_get(n.admin, "/admin/raftkv").await else {
+            let Ok((200, v)) = admin_get(n.admin, "/admin/raftkv", self.tls()).await else {
                 continue;
             };
             let Some(groups) = v["groups"].as_array() else {

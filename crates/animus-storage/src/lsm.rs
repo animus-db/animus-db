@@ -3243,6 +3243,59 @@ fn wal_resync_point(bytes: &[u8], start: usize) -> Option<usize> {
     (start..bytes.len()).find(|&p| try_parse_wal_frame(bytes, p).is_some())
 }
 
+/// Thin, `#[doc(hidden)]` decoder entry points for the `fuzz/` cargo-fuzz
+/// project (roadmap R-01 (c)); compiled only under the `fuzzing` feature.
+/// Each returns a count or a rendered error: the property under test is
+/// "never panics, never allocates unboundedly, decode-or-named-error".
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing {
+    use super::*;
+
+    /// Whole WAL file (`LWL1` header + framed records): version dispatch.
+    pub fn wal(bytes: &[u8]) -> std::result::Result<(usize, usize), String> {
+        decode_wal(bytes)
+            .map(|(r, n)| (r.len(), n))
+            .map_err(|e| e.to_string())
+    }
+
+    /// One WAL record payload, skipping the length/CRC framing a fuzzer
+    /// could not otherwise get past.
+    pub fn wal_record(bytes: &[u8]) -> std::result::Result<(), String> {
+        decode_wal_record(bytes)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Manifest file: magic/version dispatch plus the body decoder.
+    pub fn manifest(bytes: &[u8]) -> std::result::Result<usize, String> {
+        decode_manifest(bytes)
+            .map(|m| m.tables.len())
+            .map_err(|e| e.to_string())
+    }
+
+    /// CRC-stripped SSTable data block (`tag || payload`).
+    pub fn sstable_block(framed: &[u8]) -> std::result::Result<usize, String> {
+        sstable::fuzz_shims::block_v1(framed).map_err(|e| e.to_string())
+    }
+
+    /// SSTable block-index region.
+    pub fn sstable_index(bytes: &[u8]) -> std::result::Result<usize, String> {
+        sstable::fuzz_shims::block_index(bytes).map_err(|e| e.to_string())
+    }
+
+    /// Open a whole SSTable image already written to `file` on `env`, then
+    /// scan and point-read it.
+    pub async fn sstable_image<E: Env>(
+        env: &E,
+        file: &str,
+        bytes: &[u8],
+    ) -> std::result::Result<usize, String> {
+        sstable::fuzz_shims::open_image(env, file, bytes)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
 /// Decode a WAL segment's raw bytes: first the file-level header (magic +
 /// version, ADR 0073 Phase 0 — see `wal`'s module docs for why this is
 /// file-level rather than per-record), then its records. Returns the decoded

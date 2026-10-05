@@ -1,0 +1,2 @@
+BatchGetItem
+{"RequestItems": {"t": {"Keys": [{"pk": {"S": "a"}}], "ProjectionExpression": "pk"}}}

@@ -1,0 +1,10 @@
+POST / HTTP/1.1
+Host: localhost:8000
+Content-Type: application/x-amz-json-1.0
+X-Amz-Date: 20150830T123600Z
+X-Amz-Target: DynamoDB_20120810.GetItem
+Authorization: AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/dynamodb/aws4_request, SignedHeaders=content-type;host;x-amz-date;x-amz-target, Signature=5d672d79c15b13162d9279b0855cfba6789a8edb4c82c400e06b5924a6f2b5d7
+Content-Length: 40
+Connection: keep-alive
+
+{"TableName":"t","Key":{"pk":{"S":"k"}}}

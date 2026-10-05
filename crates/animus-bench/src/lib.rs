@@ -27,5 +27,6 @@ pub mod report;
 pub mod rt;
 pub mod scenario;
 pub mod schedule;
+pub mod tls;
 pub mod workload;
 pub mod ycsb;

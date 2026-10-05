@@ -21,6 +21,10 @@ workspace = true
 # ADR 0073 (Phase 1, "Legacy encoders are test-only"): gates `legacy::vN::encode`.
 # Off by default; enabled only by test crates (animus-test's dev-dependencies).
 legacy-encoders = []
+# Exposes a `#[doc(hidden)]` `fuzzing` module of thin decoder entry points for
+# the `fuzz/` cargo-fuzz project (roadmap R-01 (c)). Off by default; never
+# enabled by a production build.
+fuzzing = []
 prod-heavy = []
 
 [dependencies]

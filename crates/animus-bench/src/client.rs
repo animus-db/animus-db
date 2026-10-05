@@ -6,8 +6,15 @@
 //! workspace already owns the signer ([`animus_dynamo::sigv4::sign`], the
 //! same code the server's verifier is tested against), and a generator whose
 //! measurements ride on the client's own overhead should keep that overhead
-//! small and legible. No new HTTP dependency enters the tree. TLS is not
-//! supported by this client yet (the results file records `tls: false`).
+//! small and legible. No new HTTP dependency enters the tree.
+//!
+//! **TLS (ADR 0064, server-only):** a [`Conn`] runs over `animus-env`'s
+//! `MaybeTlsStream` (plain TCP or a rustls client stream; an enum, so the
+//! plain path is unchanged and TLS costs one `match` per poll). The TLS
+//! handshake is part of [`Conn::connect`] — connection setup — never of a
+//! request, so a healthy op's latency contains none of it; only a redial
+//! after a broken connection does (as the TCP connect always did). See
+//! [`crate::tls`].
 
 use std::collections::BTreeMap;
 use std::io;
@@ -15,10 +22,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use animus_dynamo::sigv4::{self, SigV4Request};
+use animus_env::MaybeTlsStream;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
 
 use crate::rt;
+use crate::tls::{self, TlsClient};
 
 /// Static SigV4 credentials (ADR 0057's bootstrap credential map).
 #[derive(Clone, Debug)]
@@ -58,20 +66,24 @@ impl Response {
 
 /// One keep-alive connection to a node's DynamoDB port.
 pub struct Conn {
-    reader: BufReader<TcpStream>,
+    reader: BufReader<MaybeTlsStream>,
     addr: SocketAddr,
     creds: Option<Arc<Credentials>>,
     broken: bool,
 }
 
 impl Conn {
-    /// Connect (TCP_NODELAY on).
+    /// Connect (TCP_NODELAY on), through a server-only TLS handshake when
+    /// `tls` is given.
     ///
     /// # Errors
-    /// On a connect failure.
-    pub async fn connect(addr: SocketAddr, creds: Option<Arc<Credentials>>) -> io::Result<Self> {
-        let stream = TcpStream::connect(addr).await?;
-        stream.set_nodelay(true)?;
+    /// On a connect or TLS handshake failure.
+    pub async fn connect(
+        addr: SocketAddr,
+        creds: Option<Arc<Credentials>>,
+        tls: Option<&TlsClient>,
+    ) -> io::Result<Self> {
+        let stream = tls::dial(addr, tls).await?;
         Ok(Self {
             reader: BufReader::new(stream),
             addr,
@@ -221,18 +233,30 @@ async fn read_response<R: AsyncBufReadExt + Unpin>(r: &mut R) -> io::Result<(u16
     Ok((status, body, close))
 }
 
-/// `GET path` against an admin address (HTTP/1.0, one shot) → `(status, JSON)`.
-/// `Value::Null` if the body is not JSON.
+/// `GET path` against an admin address (HTTP/1.0, one shot, through `tls`
+/// when the cluster has it) → `(status, JSON)`. `Value::Null` if the body is
+/// not JSON.
 ///
 /// # Errors
-/// On a socket error.
-pub async fn admin_get(addr: SocketAddr, path: &str) -> io::Result<(u16, serde_json::Value)> {
-    let mut stream = TcpStream::connect(addr).await?;
+/// On a socket or TLS handshake error.
+pub async fn admin_get(
+    addr: SocketAddr,
+    path: &str,
+    tls: Option<&TlsClient>,
+) -> io::Result<(u16, serde_json::Value)> {
+    let mut stream = tls::dial(addr, tls).await?;
     let req = format!("GET {path} HTTP/1.0\r\nHost: animus\r\nConnection: close\r\n\r\n");
     stream.write_all(req.as_bytes()).await?;
     stream.flush().await?;
     let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).await?;
+    match stream.read_to_end(&mut raw).await {
+        Ok(_) => {}
+        // A one-shot `Connection: close` server may drop the socket without
+        // a TLS close_notify; the body is delimited by EOF here, and a
+        // truncated one fails the header/JSON parse below.
+        Err(e) if tls.is_some() && e.kind() == io::ErrorKind::UnexpectedEof => {}
+        Err(e) => return Err(e),
+    }
     let text = String::from_utf8_lossy(&raw);
     let (head, payload) = text
         .split_once("\r\n\r\n")

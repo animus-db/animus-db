@@ -1,0 +1,1 @@
+INSERT INTO t VALUE {'pk': 'a', 'n': 1, 'l': [1, 'x', {'k': ?}], 'b': true, 'z': null}

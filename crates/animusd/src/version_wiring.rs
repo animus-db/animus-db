@@ -26,10 +26,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use animus_control::meta::{MetaCommand, Metadata, NodeStatus};
-use animus_control::version::{ClusterFeatures, NodeVersion, VersionRange, own_range};
+use animus_control::meta::{MetaCommand, Metadata};
+use animus_control::version::{
+    ClusterFeatures, GateSurface, GatedCommand, NodeVersion, VersionRange, own_range,
+};
 use animus_control::version_observe::{OBSERVATION_WINDOW, VersionObservation};
-use animus_env::{Env, EnvExt, NodeId, handshake};
+use animus_env::{Env, EnvExt, Metric, MetricsHandle, NodeId, handshake};
 use animus_node::control_handle::ControlHandle;
 use animus_node::host::RelayClient;
 use serde_json::{Value, json};
@@ -214,23 +216,19 @@ pub(crate) struct Blocker {
 
 /// Every node that blocks `FinalizeClusterVersion { target }` right now.
 ///
-/// Superset of what `Metadata::apply` enforces (no record; range excludes
-/// `target`): ADR 0073 decision 6 also makes `Down`, `Leaving` and
-/// never-activated `Joining` members block regardless of any recorded range.
-/// Apply does NOT enforce the status half; this pre-check does, on the
-/// leader's own view (racy, operator-level). Apply-level enforcement is a
-/// known gap tracked in issue #1168.
+/// Mirrors what `Metadata::apply` enforces (no record; range excludes
+/// `target`; and, since issue #1168, a `Down`, `Leaving` or never-activated
+/// `Joining` member via `Member::finalize_block_reason`) but names every
+/// blocker. It reads the leader's applied cache, so it is operator-level
+/// only: apply is the authoritative check.
 pub(crate) fn finalize_blockers(meta: &Metadata, target: u32) -> Vec<Blocker> {
     let mut out = Vec::new();
     for node in meta.required_version_set() {
-        let status_reason = meta.members.get(&node).and_then(|m| match m.status {
-            NodeStatus::Down => Some("member is Down".to_string()),
-            NodeStatus::Leaving => Some("member is Leaving".to_string()),
-            NodeStatus::Joining if !m.has_activated => {
-                Some("member is Joining (never activated)".to_string())
-            }
-            _ => None,
-        });
+        let status_reason = meta
+            .members
+            .get(&node)
+            .and_then(|m| m.finalize_block_reason())
+            .map(str::to_string);
         let reason = status_reason.or_else(|| match meta.node_versions.get(&node) {
             None => Some("not reported".to_string()),
             Some(v) if !v.range.contains(target) => Some(format!(
@@ -316,6 +314,65 @@ pub(crate) fn cluster_version_view(
     })
 }
 
+/// The relay receiver's gate check (ADR 0073 Phase 2, P2-C): may this node
+/// propose a relayed `command` on the sender's behalf?
+///
+/// The sender gates its own emit, but a relayed command also crosses a hop,
+/// and the receiver's view is the one that proposes it: a command whose gate
+/// is closed **here** is refused by name, never proposed (a closed-gate
+/// command appended to the control log would be fatal to any peer that cannot
+/// decode it). Unlike an emit-site `ClusterFeatures::check` this is a verdict
+/// on **received** input, so it neither counts a violation nor asserts: it
+/// bumps `Metric::ClusterGateRelayRefused` and returns the refusal text.
+///
+/// A closed verdict first re-reads this node's applied view into its handle
+/// (the feeder runs on a tick, so the handle can lag the cache the way a
+/// proposer's can, see `ClusterFeatures::update`), then re-checks, so a relay
+/// that races the feeder is not refused spuriously.
+pub(crate) fn relay_gate_verdict<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    command: &MetaCommand,
+) -> Result<(), String> {
+    let features = &ctx.edge.version().features;
+    let gate = command.required_gate();
+    if features.is_open(gate) {
+        return Ok(());
+    }
+    features.update(&ctx.effective_metadata());
+    if features.is_open(gate) {
+        return Ok(());
+    }
+    ctx.exported_metrics().incr(Metric::ClusterGateRelayRefused);
+    Err(format!(
+        "relayed command refused: it requires feature gate {gate:?}, which is not open on this \
+         node (cluster version {}, versioning {})",
+        features.cluster_version(),
+        if features.era_active() { "on" } else { "off" },
+    ))
+}
+
+/// The metric a surface's violation level is exported under.
+pub(crate) const fn gate_violation_metric(surface: GateSurface) -> Metric {
+    match surface {
+        GateSurface::RaftMsg => Metric::ClusterGateViolationsRaftMsg,
+        GateSurface::MetaCommand => Metric::ClusterGateViolationsMetaCommand,
+        GateSurface::KvWire => Metric::ClusterGateViolationsKvWire,
+        GateSurface::KvCommand => Metric::ClusterGateViolationsKvCommand,
+        GateSurface::ClientRequest => Metric::ClusterGateViolationsClientRequest,
+        GateSurface::ClientResponse => Metric::ClusterGateViolationsClientResponse,
+    }
+}
+
+/// Mirror every per-surface gate-violation counter of `features` into
+/// `metrics` (levels, via `MetricsHandle::set`: the handle owns the count).
+/// Called by the feeder on every pass and on every metrics read, so a scrape
+/// never shows a stale level.
+pub(crate) fn export_gate_metrics(features: &ClusterFeatures, metrics: &MetricsHandle) {
+    for &surface in GateSurface::ALL {
+        metrics.set(gate_violation_metric(surface), features.violations(surface));
+    }
+}
+
 /// How often the feeder re-evaluates with no metadata change (a fallback; the
 /// metadata watch normally wakes it).
 const FEED_FALLBACK_INTERVAL: Duration = Duration::from_millis(500);
@@ -334,6 +391,9 @@ pub(crate) async fn version_wiring_loop<E: Env, R: RelayClient>(ctx: ClientCtx<E
     let mut last_report_attempt: Option<animus_env::Nanos> = None;
     let report_in_flight = Arc::new(AtomicBool::new(false));
     loop {
+        // Mirror the gate-violation levels into the metrics sink every pass
+        // (also refreshed on every scrape, see `ClientCtx::metrics_text`).
+        export_gate_metrics(&state.features, &ctx.exported_metrics());
         // Skip until this node has some trustworthy view of `Metadata`
         // (otherwise a default `Metadata` would read as cv 1).
         let ready = ctx.control.last_applied() > 0
@@ -435,7 +495,7 @@ pub(crate) async fn version_wiring_loop<E: Env, R: RelayClient>(ctx: ClientCtx<E
 #[cfg(test)]
 mod tests {
     use super::*;
-    use animus_control::meta::{Member, NodeAddrs};
+    use animus_control::meta::{Member, NodeAddrs, NodeStatus};
 
     fn nid(s: &str) -> NodeId {
         NodeId::propose(s).unwrap()
@@ -446,6 +506,77 @@ mod tests {
             labels: Default::default(),
             status,
             has_activated: activated,
+        }
+    }
+
+    // ---- P2-C close-out: the gated send path (ADR 0073 Phase 2) ----
+
+    /// An era-on `Metadata`, so `Gate::Era` is open on a handle fed from it.
+    fn era_on_features() -> ClusterFeatures {
+        let mut meta = Metadata::default();
+        meta.members
+            .insert(nid("a"), member(NodeStatus::Active, true));
+        meta.node_versions.insert(nid("a"), rec(1, 1));
+        meta.cluster_version = 1;
+        let f = ClusterFeatures::new();
+        f.update(&meta);
+        assert!(f.era_active());
+        f
+    }
+
+    fn era_request() -> animus_node::ClientRequest {
+        animus_node::ClientRequest::ProposeSchema(MetaCommand::ReportNodeVersion {
+            node: nid("a"),
+            range: VersionRange::new(1, 1),
+            build: "t".into(),
+        })
+    }
+
+    /// Run `f`, tolerating the debug-build `debug_assert!` a closed gate
+    /// trips (`ClusterFeatures::check` counts first, then asserts).
+    fn tolerate_debug_assert<T>(f: impl FnOnce() -> T) -> Option<T> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).ok()
+    }
+
+    #[tokio::test]
+    async fn write_frame_gated_matches_write_frame_when_open_and_refuses_when_closed() {
+        let req = era_request();
+        // Open: byte-identical to the ungated writer.
+        let mut gated = Vec::new();
+        crate::write_frame_gated(&mut gated, &req, &era_on_features())
+            .await
+            .expect("open gate writes");
+        let mut plain = Vec::new();
+        crate::write_frame(&mut plain, &req).await.unwrap();
+        assert_eq!(gated, plain);
+
+        // Closed (a floor handle, pre-era): nothing is written, the counter
+        // moves, and a release build returns the named error.
+        let floor = ClusterFeatures::new();
+        let mut out = Vec::new();
+        let r = tolerate_debug_assert(|| {
+            futures_lite_block_on(crate::write_frame_gated(&mut out, &req, &floor))
+        });
+        assert!(out.is_empty(), "a refused frame must write no byte");
+        assert_eq!(floor.violations(GateSurface::ClientRequest), 1);
+        if let Some(r) = r {
+            assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+        } else if !cfg!(debug_assertions) {
+            panic!("only a debug build asserts");
+        }
+    }
+
+    /// Minimal single-future executor for the closed-gate arm above, which
+    /// must run inside `catch_unwind` (a debug build panics inside the
+    /// future). The future never awaits anything pending.
+    fn futures_lite_block_on<F: std::future::Future>(f: F) -> F::Output {
+        use std::task::{Context, Poll, Waker};
+        let mut f = std::pin::pin!(f);
+        let mut cx = Context::from_waker(Waker::noop());
+        loop {
+            if let Poll::Ready(v) = f.as_mut().poll(&mut cx) {
+                return v;
+            }
         }
     }
 

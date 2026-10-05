@@ -1,0 +1,5 @@
+SET a = :v, #n.x = if_not_exists(b, :w) + :v, l[1] = :s REMOVE m.x, l[0] ADD ss :ss
+attribute_exists(a) AND (b > :v OR NOT contains(a, :s))
+a, #n.x, l[0], m.x
+pk = :p AND begins_with(sk, :s)
+size(a) BETWEEN :v AND :w

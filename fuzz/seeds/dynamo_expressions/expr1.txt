@@ -1,0 +1,5 @@
+SET a = a - :v
+a IN (:v, :w) AND attribute_type(b, :s)
+pk
+pk = :p
+attribute_not_exists(zz)

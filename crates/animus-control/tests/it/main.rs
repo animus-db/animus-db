@@ -59,6 +59,7 @@ mod tablet_split;
 mod transfer_third_voter_wins;
 mod version_apply_corpus;
 mod version_era_on;
+mod version_finalize_status;
 mod version_mixed_corpus;
 mod version_observe_corpus;
 mod version_world;

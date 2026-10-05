@@ -321,11 +321,11 @@ fn build_reconciler(
     edge: ClusterEdgeState<SimEnv>,
 ) -> SimReconciler {
     let host_edge = edge.clone();
-    let teardown_edge = edge;
+    let teardown_edge = edge.clone();
     let base_id = node_id.clone();
-    if backend == SimEngineBackend::Lsm {
+    let mut reconciler = if backend == SimEngineBackend::Lsm {
         let factory = SimLsmTabletFactory::new(env.clone());
-        return SimReconciler::Lsm(Reconciler::new(
+        SimReconciler::Lsm(Reconciler::new(
             env,
             factory,
             node_id,
@@ -335,19 +335,25 @@ fn build_reconciler(
             move |tablet| {
                 teardown_edge.unregister_raftkv(tablet, base_id.clone());
             },
-        ));
-    }
-    SimReconciler::Mem(Reconciler::new(
-        env,
-        engines,
-        node_id,
-        move |tablet, node: &RaftKvNode<SimEnv, MemoryEngine>| {
-            host_edge.register_raftkv(tablet, CpGroup::Mem(node.clone()));
-        },
-        move |tablet| {
-            teardown_edge.unregister_raftkv(tablet, base_id.clone());
-        },
-    ))
+        ))
+    } else {
+        SimReconciler::Mem(Reconciler::new(
+            env,
+            engines,
+            node_id,
+            move |tablet, node: &RaftKvNode<SimEnv, MemoryEngine>| {
+                host_edge.register_raftkv(tablet, CpGroup::Mem(node.clone()));
+            },
+            move |tablet| {
+                teardown_edge.unregister_raftkv(tablet, base_id.clone());
+            },
+        ))
+    };
+    // ADR 0073 Phase 2 (P2-C): the same injection production's node assembly
+    // makes, so the sim exercises the control-fed handle on every hosted
+    // group.
+    reconciler.set_cluster_features(edge.version().features.clone());
+    reconciler
 }
 
 /// Drive `reconciler`'s per-tick lifecycle on `ctx`'s own node — this
@@ -654,6 +660,7 @@ async fn discover_join_info_via_relay<E: Env, R: RelayClient>(
     env: &E,
     relay: &R,
     seeds: &[String],
+    own_range: Option<&animus_control::version::VersionRange>,
 ) -> Result<
     (
         Vec<NodeId>,
@@ -679,8 +686,16 @@ async fn discover_join_info_via_relay<E: Env, R: RelayClient>(
             client_route,
             intra_route,
             admin_addrs,
-            ..
-        } => Ok((control_ids, peers, client_route, intra_route, admin_addrs)),
+            cluster_version,
+        } => {
+            // ADR 0073 P2-C / P2-D: production's `discover_join_info` refuses
+            // a cluster this binary's range excludes before claiming an
+            // identity. `None` (every pre-P2-D caller) skips the check.
+            if let Some(own) = own_range {
+                crate::version_wiring::check_join_range(cluster_version, own)?;
+            }
+            Ok((control_ids, peers, client_route, intra_route, admin_addrs))
+        }
         other => Err(format!(
             "seed returned an unexpected reply to JoinInfo: {other:?}"
         )),
@@ -822,6 +837,7 @@ fn spawn_self_mint_dial(
     mint_relay: SimRelayClient<SimEnv>,
     forced_first_candidate: Option<NodeId>,
     outcome: Arc<Mutex<Option<JoinDialOutcome>>>,
+    own_range: Option<animus_control::version::VersionRange>,
 ) {
     let dial_env = mint_env.clone();
     let dial_relay = mint_relay.clone();
@@ -829,7 +845,13 @@ fn spawn_self_mint_dial(
     mint_env.spawn_task(async move {
         let result = async {
             let (control_ids, _peers, client_route, intra_route, _admin_addrs) =
-                discover_join_info_via_relay(&dial_env, &dial_relay, &dial_seeds).await?;
+                discover_join_info_via_relay(
+                    &dial_env,
+                    &dial_relay,
+                    &dial_seeds,
+                    own_range.as_ref(),
+                )
+                .await?;
             let (id, addrs) = claim_join_identity_via_relay(
                 &dial_env,
                 &dial_relay,
@@ -1383,6 +1405,21 @@ impl SimClusterHandle {
             body,
         )
         .await
+    }
+
+    /// Send `request` from node `from` to node `to` through `from`'s own
+    /// `ClientCtx::relay` (the sim's `SimRelayClient`, whose receiving end is
+    /// `forwarding::handle_relayed_request`: the very function production's
+    /// relay receiver runs). The way a test plays "a follower-connected node
+    /// relays this to its peer" without a socket. ADR 0073 Phase 2 (P2-C).
+    pub(crate) async fn relay_request(
+        &self,
+        from: u64,
+        to: u64,
+        request: ClientRequest,
+    ) -> ClientResponse {
+        let target = self.ctx(to).env.node_id().to_string();
+        self.ctx(from).relay(target, request).await
     }
 
     /// Call `node`'s own `ClientCtx::propose_schema` directly, bypassing a
@@ -3253,6 +3290,38 @@ impl SimCluster {
         self.shared.ctx(node).edge.version().features.clone()
     }
 
+    /// The control `RaftNode`'s own feature handle (the one its `propose`
+    /// consults), distinct from the node-level handle of
+    /// [`features`](Self::features) that the wire/relay emitters use.
+    pub(crate) fn control_features(&self, node: u64) -> animus_control::version::ClusterFeatures {
+        let idx = self
+            .control_index_of(node)
+            .unwrap_or_else(|| panic!("node {node} is not control-bearing"));
+        self.controls[idx].features()
+    }
+
+    /// The feature-gate handle of every CP group `node` currently hosts, in
+    /// tablet order (ADR 0073 Phase 2, P2-C): what the node's reconciler
+    /// injected into each `RaftKvNode`.
+    pub(crate) fn hosted_group_features(
+        &self,
+        node: u64,
+    ) -> Vec<animus_control::version::ClusterFeatures> {
+        self.shared
+            .ctx(node)
+            .edge
+            .hosted_groups()
+            .iter()
+            .map(|(_, g)| g.features())
+            .collect()
+    }
+
+    /// One metric's current value on `node` (the node's aggregated control +
+    /// data sinks, as `/admin/metrics` reports it).
+    pub(crate) fn metric(&self, node: u64, metric: animus_env::Metric) -> u64 {
+        self.shared.ctx(node).metrics_json().0[metric.name()]
+    }
+
     /// The node's version halt reason, if its feeder latched one.
     pub(crate) fn version_halt(&self, node: u64) -> Option<String> {
         self.shared.ctx(node).edge.version().halt.get()
@@ -4203,6 +4272,20 @@ impl SimCluster {
                 500,
                 format!("dynamo request on node {node} did not complete within {OP_BUDGET:?}"),
             )
+        })
+    }
+
+    /// [`SimClusterHandle::relay_request`]'s `&mut self` driver sibling.
+    /// `None` when the relay never resolved within the op budget.
+    pub(crate) fn relay_request(
+        &mut self,
+        from: u64,
+        to: u64,
+        request: ClientRequest,
+    ) -> Option<ClientResponse> {
+        let handle = self.shared.clone();
+        self.spawn_and_capture(from, async move {
+            handle.relay_request(from, to, request).await
         })
     }
 
@@ -6701,6 +6784,62 @@ impl SimCluster {
         new_n
     }
 
+    /// ADR 0073 Phase 2 (P2-D): one join dial played by a binary of `joiner`'s
+    /// range (`None` = a Phase 1 binary: empty handshake `ext`, no range
+    /// check), **returning** the outcome instead of panicking, so a refusal can
+    /// be asserted. The dial's `ext` is installed on its throwaway pre-bind
+    /// identity (what the seed's handshake sees), the joiner applies the
+    /// production `check_join_range` at discovery, and on success the claimed
+    /// node is given the same `ext` and version profile before `finish_join`
+    /// (its heartbeats must pass an era-on cluster's handshake).
+    pub(crate) fn try_join_via_seed_as(
+        &mut self,
+        seed_node: usize,
+        role: NodeRole,
+        joiner: Option<animus_control::version::VersionRange>,
+    ) -> Result<u64, String> {
+        let wire_role = match role {
+            NodeRole::Both => "combined",
+            NodeRole::Data => "data",
+            NodeRole::Control => panic!("try_join_via_seed_as: NodeRole::Control is not joinable"),
+        };
+        let build = version_wiring::BUILD.to_string();
+        let mint_id = nid(self.nodes as u64);
+        self.sim
+            .set_network_ext_for(mint_id.clone(), version_wiring::ext_for(joiner, &build));
+        let mint_env = self.sim.env(mint_id);
+        let mint_relay: SimRelayClient<SimEnv> = SimRelayClient::new(mint_env.clone());
+        let outcome: Arc<Mutex<Option<JoinDialOutcome>>> = Arc::new(Mutex::new(None));
+        spawn_self_mint_dial(
+            &[nid(seed_node as u64).to_string()],
+            wire_role,
+            mint_env,
+            mint_relay,
+            None,
+            outcome.clone(),
+            joiner,
+        );
+        self.sim.run_for(JOIN_DIAL_DRIVE_BUDGET);
+        let (id, _addrs, discovered) = outcome
+            .lock()
+            .expect("join dial result slot poisoned")
+            .take()
+            .ok_or_else(|| {
+                format!("the dial did not resolve within {JOIN_DIAL_DRIVE_BUDGET:?}")
+            })??;
+        self.sim
+            .set_network_ext_for(id.clone(), version_wiring::ext_for(joiner, &build));
+        let idx = self.finish_join(
+            id,
+            wire_role,
+            discovered.control_ids,
+            discovered.client_route,
+            discovered.intra_route,
+        );
+        self.set_node_version(idx, joiner);
+        Ok(idx)
+    }
+
     /// **C-13 / ADR 0061 rung M PR 2: the real seed/join dial.** Combined-
     /// mode-only entry point, kept unchanged for every existing caller —
     /// delegates to [`join_via_seed_with_role`](Self::join_via_seed_with_role)
@@ -6858,6 +6997,7 @@ impl SimCluster {
                 mint_relay,
                 None,
                 outcome.clone(),
+                None,
             );
         }
 
@@ -6970,6 +7110,7 @@ impl SimCluster {
             mint_relay,
             Some(colliding_with.clone()),
             outcome.clone(),
+            None,
         );
         self.sim.run_for(JOIN_DIAL_DRIVE_BUDGET);
         let (id, _addrs, discovered) = outcome
@@ -7080,7 +7221,7 @@ impl SimCluster {
         mint_env.spawn_task(async move {
             let result = async {
                 let (control_ids, _peers, client_route, intra_route, _admin_addrs) =
-                    discover_join_info_via_relay(&dial_env, &dial_relay, &dial_seeds).await?;
+                    discover_join_info_via_relay(&dial_env, &dial_relay, &dial_seeds, None).await?;
                 let register_outcome = register_node_over_wire_via_relay(
                     &dial_env,
                     &dial_relay,

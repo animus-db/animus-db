@@ -1,0 +1,7 @@
+GET /?Action=List&X-Amz-Signature=abc%20def+g&a=%zz&b= HTTP/1.0
+Host: h
+Authorization: AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/dynamodb/aws4_request,SignedHeaders=host;x-amz-date,Signature=00
+X-Amz-Date: 20150830T123600Z
+X-Custom: a
+X-Custom: b
+

@@ -82,7 +82,7 @@ pub async fn capture_topology(cluster: &Cluster, table: Option<&str>) -> Value {
     let mut nodes = Vec::new();
     let mut status: Option<Value> = None;
     for n in cluster.nodes() {
-        match admin_get(n.admin, "/admin/config").await {
+        match admin_get(n.admin, "/admin/config", cluster.tls()).await {
             Ok((200, cfg)) => {
                 nodes.push(json!({
                     "index": n.index,
@@ -99,7 +99,7 @@ pub async fn capture_topology(cluster: &Cluster, table: Option<&str>) -> Value {
                     "throttle_write_units": cfg["throttle_write_units"],
                 }));
                 if status.is_none()
-                    && let Ok((200, s)) = admin_get(n.admin, "/admin/status").await
+                    && let Ok((200, s)) = admin_get(n.admin, "/admin/status", cluster.tls()).await
                 {
                     status = Some(s);
                 }
@@ -126,7 +126,7 @@ pub async fn capture_topology(cluster: &Cluster, table: Option<&str>) -> Value {
             "unknown: not reported by /admin"
         },
         "quiesce": "see nodes[].quiesce_after_ms (null = off or not applicable)",
-        "tls": "plain TCP (this client has no TLS support; the admin and DynamoDB ports were dialled without TLS)",
+        "tls": tls_description(cluster),
     });
     if let Some(s) = status {
         out["membership"] = s["members"].clone();
@@ -158,7 +158,7 @@ pub async fn capture_topology(cluster: &Cluster, table: Option<&str>) -> Value {
             }
             let mut leaders = Vec::new();
             for n in cluster.nodes() {
-                if let Ok((200, v)) = admin_get(n.admin, "/admin/raftkv").await {
+                if let Ok((200, v)) = admin_get(n.admin, "/admin/raftkv", cluster.tls()).await {
                     for g in v["groups"].as_array().into_iter().flatten() {
                         if g["is_leader"].as_bool() == Some(true)
                             && tablets.iter().any(|tb| tb["id"] == g["tablet"])
@@ -187,6 +187,17 @@ pub async fn capture_topology(cluster: &Cluster, table: Option<&str>) -> Value {
         out["note"] = json!("no node answered /admin/status");
     }
     out
+}
+
+fn tls_description(cluster: &Cluster) -> String {
+    match cluster.tls() {
+        None => "off: the admin and DynamoDB ports were dialled in plain TCP".to_owned(),
+        Some(t) => format!(
+            "server-only TLS (rustls, ring provider) on the admin and DynamoDB ports, verified \
+             against the supplied CA, server name = {}; the client presents no certificate",
+            t.server_name_note()
+        ),
+    }
 }
 
 #[cfg(test)]
