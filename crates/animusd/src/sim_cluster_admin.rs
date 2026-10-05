@@ -1208,3 +1208,218 @@ fn admin_metrics_reports_nonzero_throttled_counters_over_seeds() {
         run_admin_metrics_reports_nonzero_throttled_counters(0xC085_0900 + i);
     }
 }
+
+// ---------------------------------------------------------------------------
+// (R-01 (f), exit criterion F-4) every metric name that `docs/`, `website/` or
+// `deploy/observability/` references exists in the code's metric registry AND
+// in the real exposition a node serves.
+// ---------------------------------------------------------------------------
+
+/// Backticked/`<code>` identifiers in `docs/`+`website/` that look like a
+/// metric (family prefix, on a metrics-flavoured line) but are not exposition
+/// names. Each carries its reason; a new prose reference that trips the check
+/// either is a real stale/invented metric name (fix the doc) or belongs here.
+const NOT_A_METRIC: &[(&str, &str)] = &[
+    (
+        "control_voters",
+        "an /admin or CLI JSON field, not a Prometheus metric",
+    ),
+    ("cp_get_local", "a Rust function name"),
+    ("cp_kind_write_raw_once", "a Rust function name"),
+    ("cp_serve_forwarded", "a Rust function name"),
+    ("cp_split_here", "a Rust function name"),
+    ("cp_txn", "a Rust module/prefix reference"),
+    ("change_consumer_loop", "a Rust function name"),
+    (
+        "stream_change_rates",
+        "a field of the /admin/metrics JSON, not a Prometheus metric",
+    ),
+    ("stream_seal_knobs", "an /admin JSON field"),
+    ("stream_shards", "an /admin JSON field"),
+    (
+        "storage_full",
+        "a refusal-reason label in ADR 0074's overload table; its counter lands with the disk-full work (#1185)",
+    ),
+    (
+        "overload_storage_full",
+        "a counter docs/resource-bounds.md proposes for the disk-full work (#1185); not exported yet",
+    ),
+    (
+        "spawned_task_panics",
+        "a ProdEnv accessor today; docs/resource-bounds.md proposes exporting it as a metric",
+    ),
+];
+
+fn collect_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<_> = rd.filter_map(Result::ok).map(|e| e.path()).collect();
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            collect_files(&path, out);
+        } else if matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("md" | "html" | "yml" | "yaml" | "json" | "txt")
+        ) {
+            out.push(path);
+        }
+    }
+}
+
+/// `(token, byte_start, byte_end)` for every `[A-Za-z0-9_:]+` word in `line`.
+fn words(line: &str) -> Vec<(&str, usize, usize)> {
+    let mut out = Vec::new();
+    let mut start = None;
+    for (i, c) in line.char_indices() {
+        let w = c.is_ascii_alphanumeric() || c == '_' || c == ':';
+        match (w, start) {
+            (true, None) => start = Some(i),
+            (false, Some(s)) => {
+                out.push((&line[s..i], s, i));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        out.push((&line[s..], s, line.len()));
+    }
+    out
+}
+
+fn run_metric_references_exist_in_exposition(seed: u64) {
+    let cluster = SimCluster::new(seed, 3, 3);
+
+    // The real exposition (`GET /metrics` text): `name value` per line.
+    let text = cluster.metrics_text(0);
+    let exposed: std::collections::BTreeSet<String> = text
+        .lines()
+        .filter_map(|l| l.split_once(' ').map(|(n, _)| n.to_owned()))
+        .collect();
+    // The registry: every closed-enum name, plus the one gauge.
+    let mut registry: std::collections::BTreeSet<String> = animus_env::metrics::Metric::ALL
+        .iter()
+        .map(|m| m.name().to_owned())
+        .collect();
+    registry.insert("control_is_leader".to_owned());
+    assert_eq!(
+        exposed, registry,
+        "seed={seed}: the /metrics exposition and the registry (Metric::ALL + control_is_leader) disagree"
+    );
+    // The JSON admin view is the same surface (counters + `is_leader`).
+    let mut cluster = cluster;
+    let (status, body) = cluster.admin(0, "GET", "/admin/metrics", "", &[]);
+    assert_eq!(status, 200, "seed={seed}: {body}");
+    let v = json(&body);
+    let mut json_names: std::collections::BTreeSet<String> = v["counters"]
+        .as_object()
+        .expect("counters object")
+        .keys()
+        .cloned()
+        .collect();
+    assert!(v.get("is_leader").is_some(), "seed={seed}: {v}");
+    json_names.insert("control_is_leader".to_owned());
+    assert_eq!(
+        json_names, exposed,
+        "seed={seed}: /admin/metrics and /metrics expose different names"
+    );
+
+    // Family prefixes = the first `_` segment of every exposed name.
+    let prefixes: std::collections::BTreeSet<&str> =
+        exposed.iter().filter_map(|n| n.split('_').next()).collect();
+    let looks_like_metric = |w: &str| {
+        w.contains('_')
+            && !w.contains(':')
+            && w.split('_').next().is_some_and(|p| prefixes.contains(p))
+    };
+
+    let root = std::path::PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").into()),
+    )
+    .join("../..");
+    let mut files = Vec::new();
+    for d in ["docs", "website", "deploy/observability"] {
+        collect_files(&root.join(d), &mut files);
+    }
+    assert!(
+        files
+            .iter()
+            .any(|f| f.to_string_lossy().contains("deploy/observability")),
+        "seed={seed}: no files found under deploy/observability (root {root:?})"
+    );
+
+    let allow: std::collections::BTreeSet<&str> = NOT_A_METRIC.iter().map(|(n, _)| *n).collect();
+    let mut bad: Vec<String> = Vec::new();
+    for file in &files {
+        let Ok(content) = std::fs::read_to_string(file) else {
+            continue;
+        };
+        let rel = file
+            .strip_prefix(&root)
+            .unwrap_or(file)
+            .display()
+            .to_string();
+        let strict = rel.contains("deploy/observability");
+        let mut in_metric_table = false;
+        for (ln, line) in content.lines().enumerate() {
+            let lower = line.to_ascii_lowercase();
+            let trimmed = line.trim_start();
+            if trimmed.starts_with('|') {
+                let first = trimmed.trim_start_matches('|').trim().to_ascii_lowercase();
+                if first.starts_with("metric") {
+                    in_metric_table = true;
+                }
+            } else {
+                in_metric_table = false;
+            }
+            let flavoured = ["metric", "counter", "gauge", "prometheus", "scrape"]
+                .iter()
+                .any(|k| lower.contains(k));
+            // In a metrics table only the first cell names a metric.
+            let scan_end = if in_metric_table && trimmed.starts_with('|') {
+                let off = line.len() - trimmed.len();
+                trimmed[1..]
+                    .find('|')
+                    .map_or(line.len(), |p| off + 1 + p + 1)
+            } else {
+                line.len()
+            };
+            for (w, s, e) in words(line) {
+                // A trailing `_` or a following `*` is a wildcard glob in prose
+                // (`cp_engine_*`), not a metric name.
+                if e > scan_end
+                    || !looks_like_metric(w)
+                    || w.ends_with('_')
+                    || line[e..].starts_with('*')
+                {
+                    continue;
+                }
+                let strict_hit = strict;
+                let prose_hit = !strict && {
+                    let before = line[..s].chars().next_back();
+                    let after = line[e..].chars().next();
+                    let quoted =
+                        matches!(before, Some('`' | '>')) && matches!(after, Some('`' | '<'));
+                    quoted && (flavoured || in_metric_table)
+                };
+                if (strict_hit || prose_hit) && !exposed.contains(w) && !allow.contains(w) {
+                    bad.push(format!("{rel}:{}: `{w}`", ln + 1));
+                }
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "seed={seed}: these files reference metric names that are not in the exposition \
+         (a stale/invented metric name: fix the doc; a non-metric identifier that merely \
+         looks like one: add it to NOT_A_METRIC with a reason):\n{}",
+        bad.join("\n")
+    );
+}
+
+#[test]
+fn metric_references_exist_in_exposition() {
+    run_metric_references_exist_in_exposition(env_seed(0xC085_0F04));
+}

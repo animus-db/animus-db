@@ -28,7 +28,7 @@ Last verified against the tree: 2026-10-04.
 
 | Needs | Blocks |
 |---|---|
-| B-01 (benchmark harness / workload generator, `docs/roadmap.md`) | (a) soak workload; (e) capacity-planning numbers; (f) per-op-class p99 SLO targets |
+| B-01 (benchmark harness / workload generator: `crates/animus-bench`, ADR 0076; published numbers still pending) | (a) soak workload; (e) capacity-planning numbers; (f) per-op-class p99 SLO targets |
 | C-17 (scale/density, `docs/roadmap.md`) | (d) default connection/in-flight bounds sizing; (e) disk and node sizing |
 | ADR 0073 Phase 2 (replicated cluster version / feature gate) and Phase 3 (rolling upgrades) | (e) the rolling-upgrade chapter; criterion G-7 mixed-version support statement |
 
@@ -50,7 +50,7 @@ Last verified against the tree: 2026-10-04.
 
 ## (a) Soak
 
-Needs B-01's workload generator.
+Can build on B-01's workload generator (`animus-bench`, ADR 0076).
 
 | ID | Criterion | Status | Evidence | Owner |
 |---|---|---|---|---|
