@@ -11,11 +11,13 @@
 //! Deterministic and seed-reproducible (ADR 0003): drive with `run_for`,
 //! never `run()`.
 
+use std::future::Future;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use animus_control::ProposeResult;
-use animus_cp_data::{KIND_BASE, RaftKvNode};
-use animus_env::nid;
+use animus_cp_data::{KIND_BASE, RaftKvNode, TxnDecisionStatus};
+use animus_env::{EnvExt, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 use animus_tablet::{SplitChild, TabletId};
@@ -325,4 +327,99 @@ fn pre_fork_base_write_lands_before_the_fork() {
         Some(b"v".to_vec()),
         "seed={seed}"
     );
+}
+
+/// Run `fut` on the sim to completion within `budget` (the txn helpers are
+/// async and need the simulated clock driven).
+fn drive<T: Send + 'static>(
+    sim: &mut Simulator,
+    env: &SimEnv,
+    budget: Duration,
+    fut: impl Future<Output = T> + Send + 'static,
+) -> Option<T> {
+    let slot: Arc<Mutex<Option<T>>> = Arc::new(Mutex::new(None));
+    let s = Arc::clone(&slot);
+    env.clone().spawn_task(async move {
+        let v = fut.await;
+        *s.lock().unwrap() = Some(v);
+    });
+    sim.run_for(budget);
+    slot.lock().unwrap().take()
+}
+
+/// R-01 F-2 (fourth mechanism): a `TxnCommit`/`TxnAbort` ordered AFTER the
+/// fork entry used to apply to the frozen parent's engine (it was the one
+/// mutating arm without the seal check). The children's engines are cloned
+/// from the parent's CURRENT engine by the host reconciler, asynchronously
+/// and per replica, so a replica that cloned before the decision applied
+/// held the record `Pending` while one that cloned after held it
+/// `Committed`: replica-divergent children, and a decision the coordinator
+/// had acked that the record's real owner never saw (its participants'
+/// intents were never resolved, so the key later reverted to its prior
+/// value). The seal must make a post-fork decision a deterministic no-op,
+/// like every other post-fork mutation.
+#[test]
+fn a_txn_decision_ordered_after_the_fork_is_a_sealed_no_op() {
+    for (name, commit) in [("commit", true), ("abort", false)] {
+        let seed = if commit { 0x5713_0010 } else { 0x5713_0011 };
+        let (mut sim, nodes) = group(seed);
+        sim.run_for(Duration::from_secs(2));
+        let l = leader(&nodes, seed);
+
+        let mut key = animus_tablet::partition_token(b"acct").to_vec();
+        key.extend_from_slice(&animus_tablet::escape(b"acct"));
+        key.extend_from_slice(b"row");
+        let n = nodes[l].clone();
+        let k = key.clone();
+        let (txn_id, record_key, _outcome) = drive(
+            &mut sim,
+            nodes[l].env(),
+            Duration::from_secs(2),
+            async move { n.txn_stage("t", vec![(k, Some(b"v".to_vec()))]).await },
+        )
+        .flatten()
+        .expect("stage completes");
+
+        fork_and_settle(&mut sim, &nodes, l, b"m", &test_children(), seed);
+
+        // The decision proposal lands after the fork entry (a stale-routed
+        // coordinator, or a recovery push, racing the fork).
+        let n = nodes[l].clone();
+        let (t, r) = (txn_id.clone(), record_key.clone());
+        let proposed = drive(
+            &mut sim,
+            nodes[l].env(),
+            Duration::from_secs(2),
+            async move {
+                if commit {
+                    n.txn_commit_at_least(t, r, animus_cp_data::hlc::HlcTimestamp::zero())
+                        .await
+                } else {
+                    n.txn_abort(t, r).await
+                }
+            },
+        )
+        .flatten();
+        assert!(
+            proposed.is_some(),
+            "{name}: the entry itself applies (seed={seed})"
+        );
+
+        let n = nodes[l].clone();
+        let r = record_key.clone();
+        let status = drive(
+            &mut sim,
+            nodes[l].env(),
+            Duration::from_secs(2),
+            async move { n.txn_status_local(&r).await },
+        )
+        .flatten();
+        assert_eq!(
+            status,
+            Some(TxnDecisionStatus::Pending),
+            "{name}: a decision ordered after the fork must not change the frozen parent's \
+             record (the children clone it; a replica-dependent decision diverges them) \
+             (seed={seed})"
+        );
+    }
 }

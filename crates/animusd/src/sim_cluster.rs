@@ -1696,6 +1696,32 @@ impl SimClusterHandle {
         .await
     }
 
+    /// A single anchor stage attempt for a **multi-key group** — the shape the
+    /// coordinator stages for every key it grouped onto one tablet from a
+    /// metadata snapshot, issued from `node`'s own `ClientCtx` with no retry.
+    /// A test uses it to stage a group that a later split has made span two
+    /// tablets (R-01 F-2).
+    pub(crate) async fn txn_prepare_group_once(
+        &self,
+        node: u64,
+        table: &str,
+        group: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    ) -> Result<(TxnId, Vec<u8>, String, HlcTimestamp, StageOutcome), TxnAbortReason> {
+        let ctx = self.ctx(node);
+        ctx.txn_prepare(
+            table,
+            None,
+            group
+                .into_iter()
+                .map(|(k, v)| TxnWrite::plain(k, v))
+                .collect(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+    }
+
     /// Decide `txn_id`'s anchor record `commit`/abort — `ClientCtx::
     /// txn_decide_anchor`, issued from `node`'s own `ClientCtx`. Never
     /// resolves the transaction's own intents (matching production: decide
@@ -4807,6 +4833,26 @@ impl SimCluster {
         .unwrap_or_else(|| {
             Err(TxnAbortReason::Other(format!(
                 "txn_prepare_once on node {node} did not complete within {OP_BUDGET:?}"
+            )))
+        })
+    }
+
+    /// [`SimClusterHandle::txn_prepare_group_once`], driven from a test's own
+    /// `&mut self` call exactly like [`SimCluster::put`] above.
+    pub(crate) fn txn_prepare_group_once(
+        &mut self,
+        node: u64,
+        table: &str,
+        group: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    ) -> Result<(TxnId, Vec<u8>, String, HlcTimestamp, StageOutcome), TxnAbortReason> {
+        let handle = self.shared.clone();
+        let table = table.to_owned();
+        self.spawn_and_capture(node, async move {
+            handle.txn_prepare_group_once(node, &table, group).await
+        })
+        .unwrap_or_else(|| {
+            Err(TxnAbortReason::Other(format!(
+                "txn_prepare_group_once on node {node} did not complete within {OP_BUDGET:?}"
             )))
         })
     }
