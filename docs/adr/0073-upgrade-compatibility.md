@@ -2660,9 +2660,11 @@ the crate guides (`animus-control`, `animusd`, `animus-cp-data`).
 
 ## Amendment 2026-10-05 — Phase 3 design: rolling-upgrade orchestration
 
-Design only; no code. Status: **PROPOSED, in review.** Every decision below is a
-recommendation for the maintainer, not a decision: nothing is DECIDED unless the
-Phase 2 amendment already decided it (and then it says so). Phase 3 turns the
+Design only; no code. Status: **DECIDED (maintainer, 2026-10-05).** The
+maintainer accepted every recommendation below, D1-D10, and answered the eight
+open questions at the end of this amendment with the recommended option (recorded
+there as "Maintainer decisions"). Where a decision row says "recommendation", read
+"decision". Phase 3 turns the
 **manual** node-by-node roll that Phase 2 made supported into something a
 runbook, a CLI and the Kubernetes operator can drive, with a health gate between
 nodes and an explicit, irreversible finalize step. It adds no format, no gate and
@@ -2700,7 +2702,7 @@ members block it, no override (sections 4, 6, DECIDED); skew is N-1 <-> N only
 | No `v*` tag exists yet (`git tag` is empty); `release.yml`/`image.yml` fire on `v*` tags and publish `ghcr.io/animus-db/animusd`; the Phase 1 binary is reproducible from `ac57d56a` (the commit the Phase 2 design was checked against, an ancestor of `main`) | `.github/workflows/release.yml`, `image.yml:46-97`; `docs/release.md` |
 | Stale website copy: `architecture.html:277,292` and `how-it-works.html:222` still say mixed-version clusters are unsupported, contradicting `docs.html:653` and the Phase 2 close-out | website |
 
-### Decisions (all PROPOSED)
+### Decisions (all DECIDED 2026-10-05)
 
 | # | Decision | Recommendation |
 |---|---|---|
@@ -2730,7 +2732,7 @@ cheap step that removes the avoidable election: if the node is the control leade
 (`/admin/health` `is_control_leader`), call `POST /admin/control/transfer` to a
 healthy voter and wait for `control_leader_recent` elsewhere before touching it.
 Data-plane tablet leaders re-elect on their own (ADR 0016/0017); transferring
-those is out of scope (see Open question 3).
+those is out of scope (maintainer decision 3: not done).
 
 **Recommendation: (c).** The per-node runbook, in order (this is also the manual
 procedure, to be put in `docs/` by P3-A and on the website):
@@ -2840,7 +2842,7 @@ globally (hurts real failure repair, rejected). (b) is a new `MetaCommand`, so i
 is a **Gate::Era-class addition** under the Phase 2 rules (gated, relay allowlist,
 mixed corpus, N-1 profile): a real cost. **Recommendation: ship Phase 3 with (a),
 document the cost, measure it in the D10 job, and take (b) as a follow-up only if
-the measurement shows rebuild traffic that matters.** Listed as Open question 2.
+the measurement shows rebuild traffic that matters.** Maintainer decision 2: measure first.
 
 #### D5. The roll status view
 
@@ -2903,7 +2905,7 @@ observable facts (the StatefulSet's `updatedReplicas`/`currentRevision`/
 `updateRevision` and each pod's reported version), so a restarted operator
 resumes from live truth the same way `advance_control_growth` does (ADR 0060
 S-07d). `OnDelete` stays the fallback if a platform's partition semantics prove
-unusable (Open question 1).
+unusable (maintainer decision 1).
 
 Sequence, one reconcile pass at a time (all in `controller.rs`, new module
 `roll.rs`; pure decision function + imperative `ClusterApi`/`AdminOps` calls, same
@@ -2932,7 +2934,7 @@ to the **image**: an OCI label `io.animusdb.cluster-version-range` (set by the
 operator can read from the registry manifest only if it can pull one; otherwise
 the first upgraded pod's startup refusal (`startup range check`, Phase 2 P2-A) is
 the backstop and the roll pauses there (D9). Whether to build the label path or
-rely on the backstop is Open question 5.
+rely on the backstop: maintainer decision 5, rely on the backstop.
 
 PDB interaction: the rolling update does not consult the PDB (above), so the
 operator's own health gate **is** the protection: at most one pod is ever below
@@ -3076,7 +3078,7 @@ a `ProdEnv`/`kind` test.
 | `AnimusCluster` CRD: `spec.upgrade`, `status.upgrade`, new conditions | `animus-operator/src/crd.rs`, `deploy/operator/crd.yaml` | additive optional fields; new no-overwrite fixture | CRD schema (Phase 0 E), version unchanged |
 | StatefulSet `updateStrategy`/`partition`, controller roll module | `desired/statefulset.rs`, `controller.rs`, new `roll.rs` | new | operator-internal |
 | Operator RBAC | `deploy/operator/rbac.yaml` | **none** under D7(b); pods `delete` only if OnDelete is chosen | n/a |
-| Image label (optional, Open q 5) | `Dockerfile`, `image.yml` | `io.animusdb.cluster-version-range` | n/a |
+| Image label (dropped, maintainer decision 5) | `Dockerfile`, `image.yml` | `io.animusdb.cluster-version-range` | n/a |
 | `maintenance` marker (optional, D4) | `animus-control/src/meta.rs`, gate registry | new `MetaCommand` | **G, Gate::Era**; only if D4(b) is taken |
 | Docs | ADR 0060 "Upgrades", website (`docs.html:541,653`, **and the stale `architecture.html:277,292`, `how-it-works.html:222`**), root and crate `CLAUDE.md`s, `docs/release.md`, roadmap C-16, a runbook | updated in the final P3 PR |  |
 
@@ -3085,7 +3087,7 @@ a `ProdEnv`/`kind` test.
 | WS | Crates | Scope | Depends on | Do not touch |
 |---|---|---|---|---|
 | **P3-A** health + status server side | `animusd` | `roll_health` (Rust, shared with the dashboard), `GET /admin/roll-health`, the `roll` object in `/admin/cluster-version`, dashboard Version card, unit tests + oracle, runbook text | none | `animus-control` (no new command), operator |
-| **P3-B** CLI | `animus-cli` | `cluster roll plan/wait/status` (+ `--finalize`, stretch `run --exec`), parity tests | P3-A | `animusd` internals |
+| **P3-B** CLI | `animus-cli` | `cluster roll plan/wait/status` (+ `--finalize`; `run --exec` deferred, maintainer decision 8), parity tests | P3-A | `animusd` internals |
 | **P3-C** roll driver + sim corpus | `animusd`, `animus-test` | the pure roll state machine (a library module reused by B and D), `sim_cluster_roll_orchestrator`, mutation runs, `ANIMUS_UPGRADE_SEEDS` cells, nightly step in `corpus-deep.yml` | P3-A | production emit/apply logic (report bugs) |
 | **P3-D** operator orchestration | `animus-operator`, `deploy/` | D7/D8/D9: `updateStrategy`+`partition`, `roll.rs`, status/conditions/CRD additive fields + fixture, `validate_spec` image-revert refusal, webhook mirror, PDB-0 refusal, fakes tests | P3-A, P3-C (driver) | `animusd`, `animus-control` |
 | **P3-E** cross-version CI | `animusd` `tests/`, `scripts/`, `.github/workflows/`, `animus-operator` e2e | D10 both tiers, the pinned-reference file, `docs/release.md` checklist step | P3-A, P3-B (and P3-D for the kind tier) | production code |
@@ -3142,31 +3144,29 @@ raised `min_supported` without the stepping-stone release.
    is misconfigured:* the roll then fails closed forever. Surfaced as
    `UpgradeBlocked`, indistinguishable from a real health failure without the
    message.
-7. *`OnDelete` fallback* (Open q 1) would need pod `delete` RBAC and a PDB-aware
+7. *`OnDelete` fallback* (rejected, maintainer decision 1) would need pod `delete` RBAC and a PDB-aware
    eviction call, a privilege expansion.
 
-### Open questions for the maintainer
+### Maintainer decisions (2026-10-05; formerly open questions)
 
-1. **Partition vs `OnDelete` (D7).** The Phase 2 sketch said `OnDelete`; this design
-   recommends `RollingUpdate` + operator-owned `partition` (no new RBAC, uses the
-   StatefulSet's own replacement, old revision on recreate). OK to go with
-   partition, or do you want `OnDelete` and the pod-delete privilege?
-2. **Repair churn (D4).** Ship without a maintenance mark and measure (recommended),
-   or build the replicated expiring `maintenance` marker now (a new gated
-   `MetaCommand`)?
-3. **Tablet leader transfer before restart.** Only the control leader is moved
-   first (cheap, exposed). Should the roll also move data-plane tablet leaders off
-   the node (no admin route exists for that today), trading complexity for fewer
-   client-visible retries?
-4. **Auto-finalize default and soak (D6).** Confirm opt-in only, and whether the
-   operator should support a minimum soak time at all.
-5. **Image range label (D7).** Build the OCI label and registry read so the operator
-   refuses a skipped release before touching a pod, or rely on the startup range
-   refusal of the first upgraded pod (the roll stops there either way)?
-6. **Cluster-shape floor.** Is "operator rolls only when PDB `maxUnavailable >= 1`"
-   the right bar, with the Phase 1 stop-upgrade-restart documented for smaller
-   clusters, or should a 1- or 2-node roll be allowed with a loud warning?
-7. **First tag.** No `v*` tag exists. Should P3-E wait for the first alpha tag as R-1,
-   or pin `ac57d56a` (a Phase 1 binary) as the stand-in for the first-roll test?
-8. **`animus cluster roll run --exec`.** In scope for P3-B or deliberately left to
-   users' own tooling?
+Each was answered with the recommended option:
+
+1. **Partition, not `OnDelete` (D7).** `RollingUpdate` with an operator-owned
+   `partition`; no pod-delete privilege.
+2. **Repair churn (D4): measure first.** Ship without the maintenance mark,
+   document the cost, measure rebuild traffic in the D10 job; the expiring
+   `maintenance` marker is a follow-up only if the measurement warrants it.
+3. **No tablet leader transfer before restart.** Only the control leader is moved
+   first; data-plane leaders re-elect on their own (clients see retries).
+4. **Auto-finalize (D6): opt-in, with soak.** `spec.upgrade.finalize: Manual`
+   (default) `| Auto`, and `spec.upgrade.soakSeconds` (default 0) is supported.
+5. **No image range label (D7).** No OCI label or registry read; the first
+   upgraded pod's startup range refusal (P2-A) is the skipped-release backstop and
+   the roll pauses there (D9). The `Dockerfile`/`image.yml` label row is dropped.
+6. **Cluster-shape floor: refuse.** The operator rolls only when the PDB
+   `maxUnavailable >= 1`; smaller shapes get `UpgradeBlocked` and the documented
+   Phase 1 whole-cluster stop-upgrade-restart.
+7. **First tag: pin `ac57d56a`.** P3-E uses the Phase 1 build from `ac57d56a` as
+   R-1 until the first `v*` tag exists, then switches to the previous tag.
+8. **`roll run --exec`: later.** Out of the first P3-B slice; users script the
+   restart with their own tooling. It stays a possible follow-up.
