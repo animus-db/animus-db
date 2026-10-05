@@ -927,6 +927,33 @@ impl<E: Env> Env for EncryptedEnv<E> {
 /// single-poll `block_on` — deliberately not `SimEnv` or `#[tokio::test]` —
 /// so these tests run under a plain `cargo test -p animus-env`, no features
 /// required, exactly like every other per-push gate in this crate.
+/// Thin, `#[doc(hidden)]` decoder entry points for the `fuzz/` cargo-fuzz
+/// project (roadmap R-01 (c)); compiled only under the off-by-default
+/// `fuzzing` feature.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing {
+    use super::*;
+
+    /// Scan a whole `ADE1` file image under `key`: header/version dispatch
+    /// plus every frame's length/auth check. `Ok(frames)` for a parseable
+    /// (possibly torn) file, `Err(kind)` for the named refusals.
+    pub fn scan_file(key: [u8; 32], raw: &[u8]) -> Result<usize, &'static str> {
+        match scan(&EncryptionKey::from_bytes(key), raw) {
+            Scan::Absent => Ok(0),
+            Scan::NotEncrypted => Err("not-encrypted"),
+            Scan::UnsupportedVersion(_) => Err("unsupported-version"),
+            Scan::Ok { index, .. } => Ok(index.frames.len()),
+            Scan::Corrupted => Err("corrupted"),
+        }
+    }
+
+    /// Open a whole sealed object (the `SegmentStore` / marker shape).
+    pub fn open_object(key: [u8; 32], raw: &[u8]) -> Option<usize> {
+        open_whole(&EncryptionKey::from_bytes(key), raw).map(|v| v.len())
+    }
+}
+
 #[cfg(test)]
 mod format_fixture_tests {
     use std::collections::BTreeMap;

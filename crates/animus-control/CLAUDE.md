@@ -3063,6 +3063,10 @@ rounds while the apply task is behind.
 
 **Upgrade-harness class (ADR 0073 P1-D):** `control-wal`/`shared-wal` are whole-file `TABLE` entries in `animus-test`'s transcode table (a bump edits that entry; legacy encoders must be `pub` + `legacy-encoders`-gated); `control-snapshot`, `metadata`, `mirror-version` and `mirror-entities` are `EMBEDDED` (a bump edits their carrier's transcode).
 
+## Fuzzing (roadmap R-01 (c))
+
+The control WAL / shared WAL / snapshot image / `Metadata::from_json` / syskv key decoders are the `control_formats` fuzz target. The line-framed formats carry a CRC, so the target re-stamps CRCs (`fix_line_crcs`) to reach the payload decoders. `mirror::apply_key_write` still `.expect`s on a corrupt mirrored value (node-local data, by design) and is deliberately not fuzzed. See `fuzz/README.md` (stable smoke: `cd fuzz && cargo test --release --test smoke`).
+
 ## Gate enforcement (ADR 0073 Phase 2, P2-B)
 
 - **`version.rs`**: `Gate::Base` (declared first, version 1, always open) and

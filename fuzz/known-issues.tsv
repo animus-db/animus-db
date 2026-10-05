@@ -1,0 +1,12 @@
+# target	panic-message substring	note (issue link / owner)
+# A row here lets tests/smoke.rs report -- but not fail on -- a panic that
+# matches, for a *filed* defect whose fix is in flight. Delete the row in the
+# fix PR. Never use this to hide an unfiled crash; green is an invariant.
+#
+# Crashes that are not panics (OOM / timeout) cannot be matched here; they are
+# instead fenced by an explicit, commented guard in the fuzz shim so the
+# libFuzzer jobs stay green until the fix lands:
+#   - lsm_formats / sstable_block: lz4 size-prefix OOM in
+#     animus-storage `decode_block_v1` -- guard in
+#     crates/animus-storage/src/lsm/sstable.rs `fuzz_shims::block_v1`
+#     (remove it in the fix PR).

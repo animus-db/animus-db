@@ -763,6 +763,10 @@ nodes_relay_and_edge_state` for the full regression (both the mid-
 scenario restart case and the final-drop case, each `Weak`-verified,
 each confirmed red-before/green-after by temporarily reverting the fix).
 
+## Fuzzing (roadmap R-01 (c))
+
+`http::parse_request_head` (+ `query_param`/`percent_decode`), `sigv4_gate`'s inputs and `decode_client_frame` are fuzz targets (`http_sigv4`, `net_frames`); keep them panic-free on arbitrary bytes. See `fuzz/README.md` (stable smoke: `cd fuzz && cargo test --release --test smoke`).
+
 ## Gate enforcement (ADR 0073 Phase 2, P2-B)
 
 - `ClientRequest::required_gate` / `ClientResponse::required_gate` (`wire.rs`):

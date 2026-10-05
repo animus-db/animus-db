@@ -1,0 +1,2 @@
+stored_item
+{"item": {"a": {"S": "x"}}}

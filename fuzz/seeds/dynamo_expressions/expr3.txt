@@ -1,0 +1,5 @@
+DELETE ss :ss ADD b :v
+b <> :v
+l[0][1].x
+pk=:p
+(((a = :v)))

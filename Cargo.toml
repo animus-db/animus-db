@@ -5,6 +5,9 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# The cargo-fuzz project (roadmap R-01 (c)) is its own workspace: libFuzzer and
+# its build needs stay out of every normal gate. See fuzz/README.md.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0-alpha.0"

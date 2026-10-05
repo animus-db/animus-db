@@ -167,6 +167,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all --check
 cargo deny check                                   # licenses + advisories (cargo install cargo-deny)
 scripts/check-format-fixtures.sh                   # ADR 0073 Phase 0: fails if a checked-in format fixture was edited/deleted
+(cd fuzz && cargo test --release --test smoke)    # R-01 (c): deterministic stable smoke of every fuzz target (real libFuzzer: fuzz/README.md)
 cargo bench -p animus-storage                      # ProdEnv smoke of the write/IO path
 cargo bench -p animusd                             # cluster wire benchmark: latency percentiles + degraded phase
 cargo run --release -p animus-bench -- --help      # open-loop YCSB A-F load generator over the DynamoDB wire (docs/benchmarks.md, ADR 0076)

@@ -3116,6 +3116,10 @@ own internal mutex (in `animus-control`) is only taken inside `append_tagged`/
 `engine_applied_index`, never core `last_applied`). ADR 0017's and ADR 0038's
 2026-09-30 amendments.
 
+## Fuzzing (roadmap R-01 (c))
+
+The RaftKV codec (wire/image/WAL), segment codec, backup chunk/manifest codecs, layout marker, cursors and engine marker values are the `cp_data_formats` fuzz target; the `pub(crate)` ones are reached through the off-by-default `fuzzing` feature (`src/fuzzing.rs`). See `fuzz/README.md` (stable smoke: `cd fuzz && cargo test --release --test smoke`).
+
 ## Gate enforcement (ADR 0073 Phase 2, P2-B)
 
 - **`gates.rs`**: exhaustive `GatedCommand for KvCommand` (all `Base`) and

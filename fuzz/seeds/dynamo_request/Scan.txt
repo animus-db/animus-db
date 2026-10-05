@@ -1,0 +1,2 @@
+Scan
+{"TableName": "t", "FilterExpression": "contains(a, :s) OR NOT (b IN (:v, :v))", "ExpressionAttributeValues": {":s": {"S": "x"}, ":v": {"N": "1"}}, "Segment": 0, "TotalSegments": 4}
