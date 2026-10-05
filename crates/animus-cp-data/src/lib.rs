@@ -63,6 +63,7 @@ use futures::task::AtomicWaker;
 use serde::{Deserialize, Serialize};
 
 mod applied;
+mod apply_stall;
 pub mod backup;
 mod ceiling;
 pub mod cluster_segment_store;
@@ -2432,6 +2433,10 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// ([`is_stopped`](Self::is_stopped)) — the teardown path (drop-table GC) waits
     /// on that before deleting the engine/WAL.
     apply_stopped: Arc<AtomicBool>,
+    /// True while the apply task is **paused on ENOSPC** (R-01 (d) residual,
+    /// issue #1218; see `apply_stall`). Reported by
+    /// [`is_storage_full`](Self::is_storage_full) alongside the suspect WAL.
+    apply_stalled: Arc<AtomicBool>,
     /// **Wake-on-propose** signal: a proposer raises it to make the consensus loop
     /// replicate a freshly appended entry immediately, cutting single-write latency
     /// (ADR 0017) — no waiting on the next heartbeat tick.
@@ -3170,6 +3175,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let halted = Arc::new(AtomicBool::new(false));
         let stopped = Arc::new(AtomicBool::new(false));
         let apply_stopped = Arc::new(AtomicBool::new(false));
+        let apply_stalled = Arc::new(AtomicBool::new(false));
         let engine_applied = Arc::new(AtomicU64::new(0));
         let applied_watch = AppliedWatch::default();
         let wal_lock = Arc::new(FairMutex::new());
@@ -3249,6 +3255,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             halted: Arc::clone(&halted),
             stopped: Arc::clone(&stopped),
             apply_stopped: Arc::clone(&apply_stopped),
+            apply_stalled: Arc::clone(&apply_stalled),
             propose_signal: Arc::clone(&propose_signal),
             apply_signal: Arc::clone(&apply_signal),
             wake_signal: Arc::clone(&wake_signal),
@@ -3294,6 +3301,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             halted,
             stopped,
             apply_stopped,
+            apply_stalled,
             propose_signal,
             apply_signal,
             wake_signal,
@@ -4080,16 +4088,20 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         self.frozen.load(Ordering::SeqCst)
     }
 
-    /// Whether this group's WAL is suspect after an ENOSPC (R-01 (d), ADR 0074
-    /// §2) — the **`StorageFull`** state. A pure flag read, never a wake or a
+    /// Whether this group is out of disk (R-01 (d), ADR 0074 §2): its WAL is
+    /// suspect after an ENOSPC, **or** its apply task is paused on an engine
+    /// ENOSPC (a `merge_batch`/marker/flush/compaction write that hit a full
+    /// volume, retried until space returns — issue #1218, `apply_stall`) — the
+    /// **`StorageFull`** state. A pure flag read, never a wake or a
     /// propose. While true the group cannot make anything durable: it acks no
     /// write, and `animusd`'s write/txn helpers refuse mutating requests
     /// **before proposing** with a named `StorageFull` error (503
     /// `ServiceUnavailable`), counting `Metric::OverloadStorageFull`. Reads
     /// keep being served. It clears itself — no restart — once the consensus
-    /// loop has rewritten the WAL from the in-memory log onto a fresh file.
+    /// loop has rewritten the WAL from the in-memory log onto a fresh file, and
+    /// once the paused apply call finally succeeds.
     pub fn is_storage_full(&self) -> bool {
-        self.persist.is_suspect()
+        self.persist.is_suspect() || self.apply_stalled.load(Ordering::SeqCst)
     }
 
     /// Record one `StorageFull` refusal on this group's metrics handle
@@ -11674,6 +11686,7 @@ struct DriveState<E: Env, S: StorageEngine> {
     halted: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
     apply_stopped: Arc<AtomicBool>,
+    apply_stalled: Arc<AtomicBool>,
     propose_signal: Arc<ProposeSignal>,
     apply_signal: Arc<ApplySignal>,
     wake_signal: Arc<WakeSignal>,
@@ -11862,6 +11875,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         halted,
         stopped,
         apply_stopped,
+        apply_stalled,
         propose_signal,
         apply_signal,
         wake_signal,
@@ -12156,6 +12170,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         Arc::clone(&wal_lock),
         Arc::clone(&halted),
         apply_stopped,
+        apply_stalled,
         metrics.clone(),
         scope,
         kind_scopes,
@@ -12785,6 +12800,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     wal_lock: Arc<FairMutex>,
     halted: Arc<AtomicBool>,
     apply_stopped: Arc<AtomicBool>,
+    apply_stalled: Arc<AtomicBool>,
     metrics: MetricsHandle,
     scope: StorageScope,
     kind_scopes: [StorageScope; ALL_KINDS.len()],
@@ -12807,6 +12823,15 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     // ADR 0073 P2-B: selects the snapshot image's frame version.
     features: ClusterFeatures,
 ) {
+    // R-01 (d) residual (#1218): every engine call this task makes pauses and
+    // retries on ENOSPC instead of panicking — see `apply_stall`.
+    let storage = apply_stall::StallingEngine::new(
+        storage,
+        env.clone(),
+        Arc::clone(&halted),
+        Arc::clone(&apply_stopped),
+        apply_stalled,
+    );
     // This apply task's own sequential, single-writer bookkeeping (see
     // `apply_and_compact`'s doc): `sealed` is seeded from the engine-durable
     // recovery scan `drive` already did; `max_applied_ts` starts `None` each

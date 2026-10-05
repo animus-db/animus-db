@@ -141,12 +141,50 @@ task until a process restart (the node still looked healthy). Now:
    asserts the linearizability oracle (no acked write lost or duplicated), that
    progress resumes after the window with no restart, and seed determinism.
 
+### LSM-engine ENOSPC (issue #1218)
+
+ENOSPC inside `LsmEngine` no longer panics the apply task:
+
+1. **Classification.** `StorageError::StorageFull` (built from
+   `animus_env::is_storage_full` at every disk-seam error site) is the
+   recoverable class; its contract is that the failed operation changed nothing
+   durable or visible, so the identical call may be retried.
+2. **WAL commit.** A failed group commit applies nothing and surfaces
+   `StorageFull` to every writer in the lost batch. After an ENOSPC the segment
+   is cut back (`replace`) to its last known-durable length before the next
+   batch rides it, so a short write left by the failed `append` can never sit in
+   front of an acked record. (Only ENOSPC arms this; other errors are unchanged.)
+3. **Flush and compaction** fail cleanly: a failed flush leaves the memtable and
+   WAL untouched, a failed compaction leaves its inputs authoritative, and both
+   remove their partial/complete-but-unreferenced outputs (seqs are only
+   consumed by the manifest swap, so the retry reuses them). Inline post-write
+   maintenance ENOSPC is **deferred, not surfaced**: the write that triggered it
+   is already durable and applied, so it must not fail; the next write retries
+   the maintenance. `flush_now`/`compact_now` and the background-maintenance
+   backpressure error still return `StorageFull`.
+4. **Apply pause.** The apply task's engine handle (`animus-cp-data`
+   `apply_stall::StallingEngine`) retries any `StorageFull` call on the `Env`
+   clock instead of panicking. The task is blocked inside that one call, so
+   nothing is lost, duplicated or reordered. While paused,
+   `RaftKvNode::is_storage_full()` is true, so `animusd` refuses new writes with
+   the existing 503 `StorageFull` and `/admin/health` reports `storage_full`;
+   the flag clears when the call succeeds, with no restart. On shutdown a paused
+   call raises `apply_stopped` and parks (no panic).
+5. **Tests.** `animus-storage` `tests/it/lsm_disk_full.rs` (WAL commit applies
+   nothing and retries, torn-tail repair, flush/compaction ENOSPC leave no
+   orphans and retry, deferred inline maintenance; depth
+   `ANIMUS_LSM_DISK_FAULT_SEEDS`), and the disk-full corpus now also runs over
+   `LsmEngine<SimEnv>` (three representative cells always on; the whole corpus
+   under `ANIMUS_RAFTKV_LSM=1`).
+
+Not covered: engine reads and other non-apply engine users (read path, TTL
+reaper, reconciler) still propagate the error to their caller, and a
+`ProdEnv` size-limited filesystem test is still outstanding.
+
 ### Residuals (not done; file as issues)
 
-- **LSM engine ENOSPC is not handled.** The apply task's `merge_batch` and the
-  applied-marker write still `expect`/`assert` on an engine error (an LSM flush
-  or compaction hitting ENOSPC is a separate path). The corpus therefore runs over
-  `MemoryEngine` only; do not enable ENOSPC over `ANIMUS_RAFTKV_LSM=1`.
+- ~~LSM engine ENOSPC is not handled.~~ Handled (issue #1218), see "LSM-engine
+  ENOSPC" below.
 - **No leader step-down.** A StorageFull leader keeps leadership (`RaftCore` has
   no step-down API) and refuses writes; its followers' disks are healthy but the
   group cannot make progress through a leader that cannot persist. A follower
@@ -170,7 +208,7 @@ task until a process restart (the node still looked healthy). Now:
    cap `len` (the largest legitimate frame is a 64 KiB snapshot chunk plus
    overhead, or a 512-entry append) and `from_len` (node ids are short) and drop
    the connection above it. Needs its own PR and test.
-2. ~~Disk-full is a silent group death~~ fixed for the WAL path (section 3); the LSM-engine ENOSPC path remains open.
+2. ~~Disk-full is a silent group death~~ fixed for the WAL path and the LSM-engine path (section 3).
 3. `Query`/`Scan` byte cap is applied at the coordinator after the per-tablet
    scan RPC returns, so one tablet round trip can still materialize more than a
    page of raw pairs (already noted in `crates/animusd/CLAUDE.md`).

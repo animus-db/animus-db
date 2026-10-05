@@ -715,6 +715,25 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   outgrow `wal_segment_bytes` across restarts. Pinned by
   `reopen_reseeds_active_segment_bytes` (`tests/lsm_wal_rotation.rs`).
 
+- **ENOSPC is a recoverable class (issue #1218, ADR 0074 amendment).**
+  Every disk-seam error goes through `StorageError::from_io`, which turns
+  ENOSPC/EDQUOT (`animus_env::is_storage_full`) into `StorageError::StorageFull`
+  (`is_storage_full()`); the contract is that such a call changed nothing durable
+  or visible, so a caller may pause and retry it (`animus-cp-data`'s
+  `apply_stall::StallingEngine` does). Mechanisms: a failed WAL batch applies
+  nothing and arms `GroupCommit::repair_to` so the next leader cuts the segment
+  back (`replace`) to its pre-batch length before appending (a short write left
+  by a failed `append` must never sit in front of an acked record; ENOSPC only,
+  other failures keep the old behaviour, and a repair needs a rotation-free
+  lead since sealing a torn or empty segment would leave a gap in discovery);
+  `flush`/`run_compaction` remove their unreferenced outputs on failure (seqs
+  are only consumed by the manifest swap, so a retry reuses them; the file is
+  only removed after a *known-unswapped* manifest failure, i.e. ENOSPC);
+  `after_write_maintenance` swallows an inline `StorageFull` (the write is
+  already durable, counted by `maintenance_deferral_count`) while
+  `flush_now`/`compact_now`/backpressure still return it. Tests:
+  `tests/it/lsm_disk_full.rs` (depth `ANIMUS_LSM_DISK_FAULT_SEEDS`).
+
 ## Tests & benchmark
 
 `cargo test -p animus-storage` (proptest semantics + units). The

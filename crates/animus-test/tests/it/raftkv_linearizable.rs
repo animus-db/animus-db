@@ -2676,10 +2676,11 @@ fn raftkv_shrink_replay() {
 //
 // A separate corpus (own cells, own seed knob `ANIMUS_DISK_FULL_SEEDS`) rather
 // than more `corpus_cells()`: the frozen corpus's names/seeds/runs must stay
-// byte-identical, and ENOSPC is meaningful on `MemoryEngine` only (an ENOSPC on
-// `LsmEngine`'s own files is the engine's failure path, a separate piece of
-// work, `docs/resource-bounds.md` section 3), so these cells never run on the
-// LSM tier. The nemeses are `Nemesis::{DiskFull, LeaderDiskFull, DiskFlaky}`.
+// byte-identical. It runs over `MemoryEngine` (ENOSPC on the Raft WAL only) and,
+// since #1218, over `LsmEngine<SimEnv>` too (a representative subset always on,
+// the whole corpus under `ANIMUS_RAFTKV_LSM=1`) where ENOSPC also hits the
+// engine's own WAL/flush/compaction and the apply task's pause-and-retry. The
+// nemeses are `Nemesis::{DiskFull, LeaderDiskFull, DiskFlaky}`.
 //
 // What every cell asserts, beyond the shared `assert_scenario_ok`:
 //   * the injector actually fired (`DiskFault{kind:"enospc"}` in the trace);
@@ -2748,7 +2749,17 @@ struct DiskFullObservation {
 /// [`run_scenario_on`]'s shape over `MemoryEngine`, plus the disk-full
 /// observations above.
 fn run_disk_full_scenario(scenario: &Scenario) -> (ScenarioResult, DiskFullObservation) {
-    let mut group = Group::start(scenario.seed, scenario.replicas, mem_engine);
+    run_disk_full_scenario_on(scenario, mem_engine)
+}
+
+/// The disk-full run over any engine tier (`MemoryEngine`, or
+/// `LsmEngine<SimEnv>` — where the injected ENOSPC also lands on the engine's
+/// own WAL/flush/compaction, #1218).
+fn run_disk_full_scenario_on<S: StorageEngine + 'static>(
+    scenario: &Scenario,
+    factory: EngineFactory<S>,
+) -> (ScenarioResult, DiskFullObservation) {
+    let mut group = Group::start(scenario.seed, scenario.replicas, factory);
     group.sim.run_for(SETTLE);
     group.spawn_workload(
         scenario.clients,
@@ -2767,8 +2778,7 @@ fn run_disk_full_scenario(scenario: &Scenario) -> (ScenarioResult, DiskFullObser
         group.apply(nem);
     }
     group.sim.run_for(scenario.window);
-    let any_full =
-        |g: &Group<MemoryEngine>| g.nodes.lock().unwrap().iter().any(|n| n.is_storage_full());
+    let any_full = |g: &Group<S>| g.nodes.lock().unwrap().iter().any(|n| n.is_storage_full());
     let storage_full_during_window = any_full(&group);
 
     // "Space returns".
@@ -2804,12 +2814,15 @@ fn run_disk_full_scenario(scenario: &Scenario) -> (ScenarioResult, DiskFullObser
 
 /// Run one disk-full cell under `run_scenario_identified`'s seed-naming panic
 /// wrapper, returning both the Elle result and the observations.
-fn run_disk_full_identified(s: &Scenario) -> (ScenarioResult, DiskFullObservation) {
+fn run_disk_full_identified_on<S: StorageEngine + 'static>(
+    s: &Scenario,
+    factory: EngineFactory<S>,
+) -> (ScenarioResult, DiskFullObservation) {
     let obs: Arc<Mutex<Option<DiskFullObservation>>> = Arc::new(Mutex::new(None));
     let slot = Arc::clone(&obs);
     let scenario = s.clone();
     let result = run_scenario_identified(s, move || {
-        let (r, o) = run_disk_full_scenario(&scenario);
+        let (r, o) = run_disk_full_scenario_on(&scenario, factory);
         *slot.lock().unwrap() = Some(o);
         r
     });
@@ -2823,11 +2836,19 @@ fn run_disk_full_identified(s: &Scenario) -> (ScenarioResult, DiskFullObservatio
 /// `scenario=<name> seed=<seed>` and a failure names both.
 #[test]
 fn raftkv_disk_full_corpus_is_linearizable() {
-    let scenarios = disk_full_corpus();
+    check_disk_full_corpus("mem+disk-full", &disk_full_corpus(), mem_engine);
+}
+
+/// Run `scenarios` over `factory` and assert the disk-full properties.
+fn check_disk_full_corpus<S: StorageEngine + 'static>(
+    tier: &str,
+    scenarios: &[Scenario],
+    factory: EngineFactory<S>,
+) {
     let mut total_ok_writes = 0usize;
-    for s in &scenarios {
-        let (r, obs) = run_disk_full_identified(s);
-        assert_scenario_ok("mem+disk-full", s, &r);
+    for s in scenarios {
+        let (r, obs) = run_disk_full_identified_on(s, factory);
+        assert_scenario_ok(tier, s, &r);
         let full_disk = matches!(s.faults[0].1, Nemesis::DiskFull | Nemesis::LeaderDiskFull);
         assert!(
             obs.enospc_faults > 0,
@@ -2874,6 +2895,48 @@ fn raftkv_disk_full_corpus_is_linearizable() {
         "disk-full corpus too vacuous: only {total_ok_writes} acked writes across {} scenarios",
         scenarios.len()
     );
+}
+
+/// Always-on representative subset of the disk-full cells over
+/// `LsmEngine<SimEnv>` (#1218): one cell per ENOSPC shape. Here the injected
+/// ENOSPC also lands on the engine's own WAL, flushes and compactions (the
+/// corpus's tiny `lsm_opts` thresholds make those fire constantly), so this is
+/// the proof the apply task pauses (`apply_stall`) and the engine defers/
+/// retries instead of panicking, with nothing lost, duplicated or reordered
+/// (Elle) — and that the group leaves `StorageFull` after space returns.
+const LSM_DISK_FULL_REPRESENTATIVE: [&str; 3] = [
+    "disk_full_mid_3",
+    "leader_disk_full_mid_3",
+    "disk_flaky_mid_3",
+];
+
+#[test]
+fn raftkv_disk_full_lsm_representative_is_linearizable() {
+    let cells = disk_full_cells();
+    let picked: Vec<Scenario> = LSM_DISK_FULL_REPRESENTATIVE
+        .iter()
+        .map(|name| {
+            cells
+                .iter()
+                .find(|s| s.name == *name)
+                .unwrap_or_else(|| panic!("disk-full LSM cell {name} not in the corpus"))
+                .clone()
+        })
+        .collect();
+    check_disk_full_corpus("lsm+disk-full", &picked, lsm_engine);
+}
+
+/// The **whole disk-full corpus over the LSM engine** — deep tier
+/// (`ANIMUS_RAFTKV_LSM=1`, depth `ANIMUS_DISK_FULL_SEEDS=K`).
+#[test]
+fn raftkv_disk_full_lsm_full_corpus_is_linearizable() {
+    if !lsm_full_enabled() {
+        eprintln!(
+            "raftkv_disk_full_lsm_full_corpus_is_linearizable: skipped (set ANIMUS_RAFTKV_LSM=1)"
+        );
+        return;
+    }
+    check_disk_full_corpus("lsm+disk-full", &disk_full_corpus(), lsm_engine);
 }
 
 /// Structural guard: the disk-full corpus keeps covering all three ENOSPC

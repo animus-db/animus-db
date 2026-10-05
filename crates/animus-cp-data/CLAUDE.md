@@ -3180,6 +3180,13 @@ suspect group refuses writes before proposing (`RaftKvNode::is_storage_full`,
 reads of applied state, and `apply_and_compact` skips compaction while suspect
 (an ENOSPC compaction rewrite also marks suspect; the staged-rewrite path
 tolerates ENOSPC). The `persist` field on `RaftKvNode` exposes the progress
-handle. A non-ENOSPC failure stays `assert!(halted)`. Gap: engine-side ENOSPC
-(LSM flush/compaction, apply-time `merge_batch`) is NOT handled; the corpus
-runs `MemoryEngine` only. See `docs/resource-bounds.md` section 3.
+handle. A non-ENOSPC failure stays `assert!(halted)`. Engine-side ENOSPC (issue #1218):
+`apply_loop` wraps its engine in `apply_stall::StallingEngine`, which retries
+any `StorageError::StorageFull` call (after `Env::sleep`) instead of panicking
+at the apply task's many `.expect`s; `RaftKvNode::is_storage_full()` is
+`persist.is_suspect() || apply_stalled`. Soundness rests on the engine contract
+that a `StorageFull` call changed nothing, and on the task being blocked inside
+that call (order preserved). On `halted` a paused call sets `apply_stopped` and
+parks (never panics a caller's `.expect`). Only the apply task's handle is
+wrapped; other engine users still propagate. See `docs/resource-bounds.md`
+section 3.

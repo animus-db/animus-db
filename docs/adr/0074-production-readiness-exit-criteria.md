@@ -251,6 +251,21 @@ drained round, so a whole-image rewrite suffices) and there is no leader
 step-down (`RaftCore` has none; the leader refuses writes instead). The open
 question above is decided: `/admin/health` reports a degraded `storage_full`
 field but its status code does not flip, because readiness would also pull the
-node's reads. Still open: LSM-engine ENOSPC, leader step-down, exporting
+node's reads. Still open: leader step-down, exporting
 `spawned_task_panics`, and a `ProdEnv` size-limited-filesystem test. Proven by
 `ANIMUS_DISK_FULL_SEEDS`; see `docs/resource-bounds.md` section 3.
+
+## Amendment 2026-10-05: LSM-engine ENOSPC (issue #1218)
+
+The residual "ENOSPC inside the LSM engine still panics" is closed. As built:
+`StorageError::StorageFull` is the recoverable class (a failed call changed
+nothing durable or visible); the apply task pauses and retries the identical
+engine call instead of panicking, which preserves apply order by construction
+and surfaces as the existing `StorageFull` state (writes refused with the 503,
+`/admin/health` `storage_full`) until the call succeeds; flush and compaction
+fail cleanly and remove their orphan outputs; inline post-write maintenance
+ENOSPC is deferred rather than failing the already-durable write; and an
+ENOSPC-failed WAL batch cuts the segment back to its last durable length before
+the next batch. The disk-full semantics for clients are unchanged. No
+persisted-format change. The disk-full corpus now also runs over
+`LsmEngine<SimEnv>`.
