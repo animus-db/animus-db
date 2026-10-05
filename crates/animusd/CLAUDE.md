@@ -12011,3 +12011,18 @@ fed into emitters); `Release(N-1) -> Release(N)` cells over real gates.
 **Gotcha**: the member-down cell crashes a node the shared client loop keeps
 routing 1/4 of its ops to (each stalls for the wire timeout), so acks *during* its
 roll are legitimately sparse; non-vacuity there is asserted after the era.
+
+## StorageFull on the client path and in `/admin/health` (R-01 (d), issue #1185)
+
+`CpGroup::is_storage_full` + `refuse_if_storage_full` (`lib.rs`) refuse a write
+before it is proposed when the hosted group's WAL is suspect; `write_path.rs`
+and `txn_coordinator.rs` call it and stop their retry loops on
+`is_storage_full_refusal`. `dynamo::map_throttleable_error` maps the refusal to
+a 503 `ServiceUnavailable` whose message starts `StorageFull:` and ends
+`; retry` (test: `map_throttleable_error_tests`), counted as
+`overload_storage_full`. `/admin/health` adds `storage_full`,
+`storage_full_control`, `storage_full_tablets` without flipping the status code
+(readiness would also pull reads); `/admin/raftkv` gets a per-group
+`storage_full` field. `sim_cluster_admin`'s NOT_A_METRIC list no longer holds
+`overload_storage_full`; `storage_full` stays (it is a JSON field, not a metric)
+and `spawned_task_panics` stays (still not exported).

@@ -346,6 +346,28 @@ enum Nemesis {
     /// misclassify a genuinely-stale deposed leader as confirmed, or a
     /// genuinely-committed read as `info` inside its `OP_BUDGET`.
     HeavyTail,
+    /// **Disk full on every replica** (R-01 (d), ADR 0074 §2, roadmap D-7):
+    /// `DiskConfig::set_enospc_prob(1.0)` globally — every `append`/`sync`/
+    /// `replace` on every node fails with `ErrorKind::StorageFull` until
+    /// `HealAll` ("space returns"). The persist path must mark each group's
+    /// WAL suspect (never append to it or retry its `fsync` again), keep the
+    /// node alive, ack nothing it could not make durable, and — once the
+    /// window closes — rewrite the WAL from its in-memory log onto a fresh file
+    /// and resume **without a restart**. Only the dedicated disk-full corpus
+    /// ([`disk_full_cells`]) schedules this: it runs over `MemoryEngine`
+    /// exclusively, since an ENOSPC on the LSM engine's own files is a
+    /// different (still-open) failure path (`docs/resource-bounds.md` §3).
+    DiskFull,
+    /// **Disk full on the current leader's node only** — the same ENOSPC
+    /// injector scoped to one node (`Simulator::set_disk_config_for`). The
+    /// leader cannot make its own log durable (so it applies and acks nothing),
+    /// its followers keep their healthy disks, and after `HealAll` the leader's
+    /// recovery must complete the stranded rounds without a restart.
+    LeaderDiskFull,
+    /// **Intermittent ENOSPC on every replica** (30% per `append`/`sync`/
+    /// `replace`): a disk hovering at the edge of full, where a recovery
+    /// rewrite itself fails and is retried repeatedly before it lands.
+    DiskFlaky,
 }
 
 /// A seed-reproducible scenario: a named group size + workload + an explicit fault
@@ -974,6 +996,10 @@ struct Group<S: StorageEngine + 'static> {
     /// calling `factory` again (see [`run_snapshot_caught_up_follower_
     /// restart_scenario`]).
     engines: Vec<S>,
+    /// Replica ids whose node-scoped disk override `LeaderDiskFull` set, so
+    /// `heal_all` resets exactly those (and no scenario that never fired it
+    /// gains a per-node override).
+    disk_full_nodes: BTreeSet<u64>,
 }
 
 impl<S: StorageEngine + 'static> Group<S> {
@@ -1029,6 +1055,7 @@ impl<S: StorageEngine + 'static> Group<S> {
             crashed: BTreeSet::new(),
             factory,
             engines,
+            disk_full_nodes: BTreeSet::new(),
         }
     }
 
@@ -1150,6 +1177,24 @@ impl<S: StorageEngine + 'static> Group<S> {
                 cfg.heavy_tail_max_jitter = Duration::from_secs(3);
                 self.sim.set_net_config(cfg);
             }
+            Nemesis::DiskFull => {
+                let mut cfg = DiskConfig::default();
+                cfg.set_enospc_prob(1.0);
+                self.sim.set_disk_config(cfg);
+            }
+            Nemesis::LeaderDiskFull => {
+                if let Some((li, _)) = leader_slot(&self.nodes) {
+                    let mut cfg = DiskConfig::default();
+                    cfg.set_enospc_prob(1.0);
+                    self.sim.set_disk_config_for(nid(ids[li]), cfg);
+                    self.disk_full_nodes.insert(ids[li]);
+                }
+            }
+            Nemesis::DiskFlaky => {
+                let mut cfg = DiskConfig::default();
+                cfg.set_enospc_prob(0.3);
+                self.sim.set_disk_config(cfg);
+            }
         }
     }
 
@@ -1175,6 +1220,11 @@ impl<S: StorageEngine + 'static> Group<S> {
         // previously only ever touched `NetConfig`/partitions/crashes, so
         // this reset was a no-op by construction until `FsyncLie` existed).
         self.sim.set_disk_config(DiskConfig::default());
+        // `LeaderDiskFull`'s node-scoped override shadows the global config
+        // above, so it is reset per node ("space returns on that disk").
+        for id in std::mem::take(&mut self.disk_full_nodes) {
+            self.sim.set_disk_config_for(nid(id), DiskConfig::default());
+        }
     }
 }
 
@@ -2618,5 +2668,265 @@ fn raftkv_shrink_replay() {
         r.cycles.ok,
         r.durability.ok,
         r.convergence.ok
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The disk-full (ENOSPC) corpus: R-01 (d), ADR 0074 section 2, roadmap D-7 (#1185).
+//
+// A separate corpus (own cells, own seed knob `ANIMUS_DISK_FULL_SEEDS`) rather
+// than more `corpus_cells()`: the frozen corpus's names/seeds/runs must stay
+// byte-identical, and ENOSPC is meaningful on `MemoryEngine` only (an ENOSPC on
+// `LsmEngine`'s own files is the engine's failure path, a separate piece of
+// work, `docs/resource-bounds.md` section 3), so these cells never run on the
+// LSM tier. The nemeses are `Nemesis::{DiskFull, LeaderDiskFull, DiskFlaky}`.
+//
+// What every cell asserts, beyond the shared `assert_scenario_ok`:
+//   * the injector actually fired (`DiskFault{kind:"enospc"}` in the trace);
+//   * for the full-disk cells, a replica really entered the `StorageFull`
+//     state while the disk was full and left it after space returned, with no
+//     restart;
+//   * writes made progress after the window.
+// ---------------------------------------------------------------------------
+
+/// Seeds per disk-full cell (`ANIMUS_DISK_FULL_SEEDS`, default 1).
+fn disk_full_seeds_per_cell() -> usize {
+    corpus::seeds_from_env("ANIMUS_DISK_FULL_SEEDS")
+}
+
+/// How long the disk stays full: long enough for several failed recovery
+/// probes (50ms doubling to a 2s cap) and for client ops to stall inside it.
+const DISK_FULL_WINDOW: Duration = Duration::from_millis(3500);
+
+fn disk_full_workload(name: &str, replicas: usize, at: Duration, nem: Nemesis) -> Scenario {
+    Scenario {
+        rounds: 16,
+        window: DISK_FULL_WINDOW,
+        ..base_workload(name, replicas, vec![(at, nem)])
+    }
+}
+
+/// Early/mid timing only: a `late` fault can land after the workload drained,
+/// leaving the window with no persist round to fail.
+fn disk_full_cells() -> Vec<Scenario> {
+    let early = Duration::from_millis(700);
+    let mid = Duration::from_millis(2200);
+    vec![
+        disk_full_workload("disk_full_early_3", 3, early, Nemesis::DiskFull),
+        disk_full_workload("disk_full_mid_3", 3, mid, Nemesis::DiskFull),
+        disk_full_workload("disk_full_mid_5", 5, mid, Nemesis::DiskFull),
+        disk_full_workload(
+            "leader_disk_full_early_3",
+            3,
+            early,
+            Nemesis::LeaderDiskFull,
+        ),
+        disk_full_workload("leader_disk_full_mid_3", 3, mid, Nemesis::LeaderDiskFull),
+        disk_full_workload("leader_disk_full_mid_5", 5, mid, Nemesis::LeaderDiskFull),
+        disk_full_workload("disk_flaky_early_3", 3, early, Nemesis::DiskFlaky),
+        disk_full_workload("disk_flaky_mid_3", 3, mid, Nemesis::DiskFlaky),
+    ]
+}
+
+fn disk_full_corpus() -> Vec<Scenario> {
+    corpus::seed_expand(disk_full_cells(), disk_full_seeds_per_cell())
+}
+
+/// What a disk-full run observed beyond the Elle checks.
+struct DiskFullObservation {
+    /// `DiskFault{kind:"enospc"}` events the injector fired.
+    enospc_faults: usize,
+    /// Some replica reported `is_storage_full()` at the end of the window.
+    storage_full_during_window: bool,
+    /// Some replica still reported `is_storage_full()` after the post-heal
+    /// drain (the recovery never completed).
+    storage_full_after_drain: bool,
+    /// Acked appends whose completion timestamp is after `heal_all`.
+    acked_writes_after_heal: usize,
+}
+
+/// [`run_scenario_on`]'s shape over `MemoryEngine`, plus the disk-full
+/// observations above.
+fn run_disk_full_scenario(scenario: &Scenario) -> (ScenarioResult, DiskFullObservation) {
+    let mut group = Group::start(scenario.seed, scenario.replicas, mem_engine);
+    group.sim.run_for(SETTLE);
+    group.spawn_workload(
+        scenario.clients,
+        scenario.rounds,
+        scenario.keyspace,
+        scenario.read_pct,
+    );
+    let mut faults = scenario.faults.clone();
+    faults.sort_by_key(|(at, _)| *at);
+    let base = group.sim.now().0;
+    for (at, nem) in faults {
+        let target = base + at.as_nanos() as u64;
+        if target > group.sim.now().0 {
+            group.sim.run_until(animus_env::Nanos(target));
+        }
+        group.apply(nem);
+    }
+    group.sim.run_for(scenario.window);
+    let any_full =
+        |g: &Group<MemoryEngine>| g.nodes.lock().unwrap().iter().any(|n| n.is_storage_full());
+    let storage_full_during_window = any_full(&group);
+
+    // "Space returns".
+    group.heal_all();
+    let healed_at = group.sim.now().0;
+    group.sim.run_for(DRAIN);
+    let storage_full_after_drain = any_full(&group);
+
+    let enospc_faults = group
+        .sim
+        .trace()
+        .iter()
+        .filter(|e| matches!(e, animus_sim::TraceEvent::DiskFault { kind: "enospc", .. }))
+        .count();
+    let result = finalize_scenario_result(&mut group, scenario.seed, scenario.keyspace);
+    let acked_writes_after_heal = result
+        .history
+        .ok_entries()
+        .filter(|e| e.time > healed_at)
+        .flat_map(|e| &e.mops)
+        .filter(|m| matches!(m, Mop::Append { .. }))
+        .count();
+    (
+        result,
+        DiskFullObservation {
+            enospc_faults,
+            storage_full_during_window,
+            storage_full_after_drain,
+            acked_writes_after_heal,
+        },
+    )
+}
+
+/// Run one disk-full cell under `run_scenario_identified`'s seed-naming panic
+/// wrapper, returning both the Elle result and the observations.
+fn run_disk_full_identified(s: &Scenario) -> (ScenarioResult, DiskFullObservation) {
+    let obs: Arc<Mutex<Option<DiskFullObservation>>> = Arc::new(Mutex::new(None));
+    let slot = Arc::clone(&obs);
+    let scenario = s.clone();
+    let result = run_scenario_identified(s, move || {
+        let (r, o) = run_disk_full_scenario(&scenario);
+        *slot.lock().unwrap() = Some(o);
+        r
+    });
+    let o = obs.lock().unwrap().take().expect("observation recorded");
+    (result, o)
+}
+
+/// The disk-full corpus: linearizable, no acked write lost, converges, enters
+/// and leaves `StorageFull` without a restart, and writes resume after the
+/// window. Deepen with `ANIMUS_DISK_FULL_SEEDS=K`; every cell prints
+/// `scenario=<name> seed=<seed>` and a failure names both.
+#[test]
+fn raftkv_disk_full_corpus_is_linearizable() {
+    let scenarios = disk_full_corpus();
+    let mut total_ok_writes = 0usize;
+    for s in &scenarios {
+        let (r, obs) = run_disk_full_identified(s);
+        assert_scenario_ok("mem+disk-full", s, &r);
+        let full_disk = matches!(s.faults[0].1, Nemesis::DiskFull | Nemesis::LeaderDiskFull);
+        assert!(
+            obs.enospc_faults > 0,
+            "scenario {} (seed={}): the ENOSPC injector never fired (vacuous cell)",
+            s.name,
+            s.seed
+        );
+        if full_disk {
+            assert!(
+                obs.storage_full_during_window,
+                "scenario {} (seed={}): no replica entered StorageFull while its disk was full",
+                s.name, s.seed
+            );
+        }
+        assert!(
+            !obs.storage_full_after_drain,
+            "scenario {} (seed={}): a replica stayed StorageFull after space returned \
+             (the WAL rewrite never completed; recovery needed a restart)",
+            s.name, s.seed
+        );
+        if full_disk {
+            // Only a fully-unavailable disk strands the workload past the
+            // window; a flaky one lets the (short) workload finish inside it,
+            // which is progress in its own right (asserted just below).
+            assert!(
+                obs.acked_writes_after_heal > 0,
+                "scenario {} (seed={}): no write was acked after the disk-full window; \
+                 writes did not resume without a restart",
+                s.name,
+                s.seed
+            );
+        } else {
+            assert!(
+                r.ok_writes > 0,
+                "scenario {} (seed={}): a flaky disk acked no write at all",
+                s.name,
+                s.seed
+            );
+        }
+        total_ok_writes += r.ok_writes;
+    }
+    assert!(
+        total_ok_writes > scenarios.len(),
+        "disk-full corpus too vacuous: only {total_ok_writes} acked writes across {} scenarios",
+        scenarios.len()
+    );
+}
+
+/// Structural guard: the disk-full corpus keeps covering all three ENOSPC
+/// shapes and both group sizes, names/seeds stay unique, and seed expansion is
+/// additive (variant 0 keeps the frozen name and seed).
+#[test]
+fn raftkv_disk_full_corpus_covers_its_matrix() {
+    let cells = disk_full_cells();
+    let mut seen: BTreeSet<Nemesis> = BTreeSet::new();
+    let mut sizes: BTreeSet<usize> = BTreeSet::new();
+    for s in &cells {
+        assert!(!s.window.is_zero(), "{} has no outage window", s.name);
+        sizes.insert(s.replicas);
+        for (_, f) in &s.faults {
+            seen.insert(*f);
+        }
+    }
+    for f in [
+        Nemesis::DiskFull,
+        Nemesis::LeaderDiskFull,
+        Nemesis::DiskFlaky,
+    ] {
+        assert!(seen.contains(&f), "{f:?} not covered by any disk-full cell");
+    }
+    assert!(sizes.contains(&3) && sizes.contains(&5), "{sizes:?}");
+    let names: BTreeSet<&str> = cells.iter().map(|s| s.name.as_str()).collect();
+    let seeds: BTreeSet<u64> = cells.iter().map(|s| s.seed).collect();
+    assert_eq!(names.len(), cells.len());
+    assert_eq!(seeds.len(), cells.len());
+    let expanded = corpus::seed_expand(cells.clone(), 3);
+    assert_eq!(expanded.len(), cells.len() * 3);
+    for (i, c) in cells.iter().enumerate() {
+        assert_eq!(expanded[i * 3].name, c.name, "variant 0 keeps the name");
+        assert_eq!(expanded[i * 3].seed, c.seed, "variant 0 keeps the seed");
+    }
+}
+
+/// A disk-full run is a pure function of its seed (ADR 0003): the same cell
+/// twice yields an identical history.
+#[test]
+fn raftkv_disk_full_run_is_deterministic() {
+    let s = disk_full_workload(
+        "disk_full_mid_3",
+        3,
+        Duration::from_millis(2200),
+        Nemesis::DiskFull,
+    );
+    let (a, _) = run_disk_full_scenario(&s);
+    let (b, _) = run_disk_full_scenario(&s);
+    assert_eq!(
+        serde_json::to_string(&a.history).unwrap(),
+        serde_json::to_string(&b.history).unwrap(),
+        "history not reproducible for seed {}",
+        s.seed
     );
 }

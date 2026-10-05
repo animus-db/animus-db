@@ -1238,11 +1238,7 @@ const NOT_A_METRIC: &[(&str, &str)] = &[
     ("stream_shards", "an /admin JSON field"),
     (
         "storage_full",
-        "a refusal-reason label in ADR 0074's overload table; its counter lands with the disk-full work (#1185)",
-    ),
-    (
-        "overload_storage_full",
-        "a counter docs/resource-bounds.md proposes for the disk-full work (#1185); not exported yet",
+        "a refusal-reason label in ADR 0074's overload table and a /admin/health + /admin/raftkv JSON field (its counter is overload_storage_full)",
     ),
     (
         "spawned_task_panics",

@@ -120,8 +120,9 @@ nobody discovers them during an incident.
 
 1. No unsafe-recovery tool for a lost control-plane quorum
    ([control-plane-quorum-loss.md](control-plane-quorum-loss.md)).
-2. Disk-full behaviour on a real node is untested and, by code reading, may
-   leave a live-but-wedged process ([disk-full.md](disk-full.md)).
+2. Disk-full on a WAL write is handled (named 503 `StorageFull`, self-recovery) but
+   proven in simulation only; an LSM-engine ENOSPC is still unhandled and may leave a
+   live-but-wedged process ([disk-full.md](disk-full.md)).
 3. No rolling or mixed-version upgrade
    ([upgrade.md](upgrade.md)); no encryption-key rotation
    ([encryption-key-rotation.md](encryption-key-rotation.md)); no

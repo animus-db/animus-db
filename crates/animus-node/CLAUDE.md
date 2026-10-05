@@ -801,3 +801,13 @@ the raw `Metadata::cluster_version`, 0 pre-era so pre-era bytes equal Phase 1's)
 gained `cluster_version_view` and `action_finalize_cluster_version` (routes
 `GET /admin/cluster-version`, `POST /admin/cluster-version/finalize`); both `animusd`
 impls (`ClientCtx`, `GenericAdminHost`) implement them.
+
+## StorageFull refusal (R-01 (d), issue #1185)
+
+`decide::STORAGE_FULL_REFUSAL` ("StorageFull: ...; retry"), `storage_full_refusal(bool)`
+(pre-propose gate: `Ok(())` when healthy) and `is_storage_full_refusal(&str)`
+are the pure pieces; `read_should_retry` treats the refusal as transient so the
+wire maps it to a 503, and retry loops stop on `is_storage_full_refusal`
+instead of spinning to a timeout. `ControlHandle::is_storage_full()` reports the
+local control WAL (always `false` for `Remote`, which has no local WAL). Unit
+tests in `decide::tests`.

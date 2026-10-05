@@ -223,7 +223,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             // re-apply on its own. A non-idempotent write therefore gets one
             // attempt, and any transient failure is surfaced for the caller to
             // decide about, exactly as DynamoDB would.
-            if !idempotent || !decide::read_should_retry(&err.message) || self.env.now() >= deadline
+            if !idempotent
+                || !decide::read_should_retry(&err.message)
+                || decide::is_storage_full_refusal(&err.message)
+                || self.env.now() >= deadline
             {
                 // Issue #994: a caller that reaches here after being told to
                 // retry (the message it just failed the `read_should_retry`
@@ -350,7 +353,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 }
                 CpRoute::None => dynamo::internal("no CP group leader reachable"),
             };
-            if !decide::read_should_retry(&err.message) || self.env.now() >= deadline {
+            if !decide::read_should_retry(&err.message)
+                || decide::is_storage_full_refusal(&err.message)
+                || self.env.now() >= deadline
+            {
                 // Issue #994: a caller that reaches here after being told to
                 // retry (the message it just failed the `read_should_retry`
                 // check on ends `"; retry"`) exhausted its budget on a
@@ -611,7 +617,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 }
                 CpRoute::None => "no CP group leader reachable".to_string(),
             };
-            if !decide::read_should_retry(&err) || self.env.now() >= retry_until {
+            if !decide::read_should_retry(&err)
+                || decide::is_storage_full_refusal(&err)
+                || self.env.now() >= retry_until
+            {
                 return Err(err);
             }
             self.env.sleep(SCHEMA_POLL_INTERVAL).await;
@@ -753,6 +762,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         }) {
             decide::frozen_refusal(leader.is_frozen())?;
         }
+        // R-01 (d): a StorageFull group can make nothing durable, bookkeeping
+        // included — refuse before proposing rather than park the proposal.
+        leader.refuse_if_storage_full()?;
         let fence = leader.scope_range();
         for (_, key, _) in &writes {
             if !fence.contains(key) {
@@ -870,6 +882,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         identity: ProbeIdentity,
     ) -> Result<KindEvalApplied, String> {
         decide::frozen_refusal(leader.is_frozen())?;
+        leader.refuse_if_storage_full()?;
         // Pre-propose range check — the identical routing-bug tripwire
         // `cp_batch_local`/`cp_batch_propose` already carry (ADR 0050 Train
         // B rung 7: ranges are immutable now, so this is belt-and-
@@ -1074,6 +1087,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         base_keys: Vec<Vec<u8>>,
     ) -> Result<Vec<KindEvalApplied>, String> {
         decide::frozen_refusal(leader.is_frozen())?;
+        leader.refuse_if_storage_full()?;
         // Pre-propose range check — the identical routing-bug tripwire
         // `cp_kind_eval_local`/`cp_batch_local` already carry, checked over
         // EVERY item's own base key (every item is expected to share this
@@ -1258,6 +1272,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         group: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> Result<Option<(u64, u64, KvPair)>, String> {
         decide::frozen_refusal(leader.is_frozen())?;
+        leader.refuse_if_storage_full()?;
         let probe = group.last().cloned();
         let fence = leader.scope_range();
         if let Some((bad_key, _)) = group.iter().find(|(k, _)| !fence.contains(k)) {
@@ -1535,6 +1550,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         value: Vec<u8>,
     ) -> Result<(), String> {
         decide::frozen_refusal(leader.is_frozen())?;
+        leader.refuse_if_storage_full()?;
         let fence = leader.scope_range();
         if !fence.contains(&key) {
             return Err(
@@ -1596,6 +1612,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// the actual guard).
     pub(crate) async fn cp_delete_local(leader: &CpGroup<E>, key: Vec<u8>) -> Result<(), String> {
         decide::frozen_refusal(leader.is_frozen())?;
+        leader.refuse_if_storage_full()?;
         let fence = leader.scope_range();
         if !fence.contains(&key) {
             return Err(

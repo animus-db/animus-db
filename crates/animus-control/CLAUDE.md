@@ -3107,3 +3107,26 @@ The control WAL / shared WAL / snapshot image / `Metadata::from_json` / syskv ke
   (`cfg(any(test, feature = "sim-versions"))`). `sim_versions::BinaryProfile::accepts`
   treats `Gate::Base` as always accepted; the capped decode classifies with
   `RaftMsg::required_gate`.
+
+## StorageFull: suspect WAL and in-place recovery (R-01 (d), issue #1185)
+
+`persist_round::PersistProgress` carries a `suspect` flag (`mark_suspect`/
+`is_suspect`/`complete_all_drained`; `fully_durable` is false while suspect, so
+no buffered ack ships on a file whose state is unknown). On ENOSPC in
+`node.rs`'s `persist_wal` (and in a compaction rewrite) the group marks the WAL
+suspect: it is **never appended to or `fsync`ed again** (fsyncgate, a torn
+partial append may sit in it). `persist_round::recover_suspect_wal` (shared with
+`animus-cp-data`) then probes on `env.sleep` (50 ms backoff to a 2 s cap; each
+probe takes `wal_lock`, defers while `RewriteTail::is_active()` since a staged
+rewrite shares the `.tmp` sibling, drains, captures `RaftCore::wal_image()` and
+hands it to a `write_image` closure that must write a **fresh file**). Only on
+success does it `mark_durable_through`, `complete_all_drained` and clear the
+flag; ENOSPC on the rewrite keeps probing, any other error stays a hard failure.
+No persisted-format change. `RaftNode::is_storage_full()` feeds `/admin/health`.
+`SharedWal` has a `needs_rewrite` flag armed ONLY by an ENOSPC append/sync
+failure; while armed `Append` is refused (StorageFull error) until a `Compact`
+succeeds, so a healthy sibling tablet cannot stack bytes after a suspect tail.
+Known gaps: no leader step-down (`RaftCore` has no step-down API), and the
+apply task's engine `merge_batch`/applied-marker `.expect` on ENOSPC is
+unchanged (LSM path). Tests: `persist_round` unit tests; end-to-end by the
+`animus-test` disk-full corpus (`ANIMUS_DISK_FULL_SEEDS`).

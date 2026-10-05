@@ -237,6 +237,16 @@ pub struct SharedWal<C = MetaCommand, S = Metadata> {
     /// [`crate::persist::SyncMarkerState`]). Only touched from the exclusive
     /// `drive` loop's `flush`.
     markers: crate::persist::SyncMarkerState,
+    /// Disk-full (R-01 (d), ADR 0074 §2): a physical append/sync failed with
+    /// ENOSPC, so the file's tail is unknown (a torn partial append, or bytes
+    /// a failed `fsync` may have dropped) and the best-effort strip repair in
+    /// `flush` may itself have failed for lack of space. Until a whole-file
+    /// `Compact` (`Disk::replace`: a fresh file) succeeds, **no further
+    /// `Append` is written** — it is refused with a `StorageFull` error, since
+    /// stacking records after a torn partial line would corrupt durable
+    /// history. Only ENOSPC arms it: every other error keeps its pre-existing
+    /// handling (the #838/#883 repairs).
+    needs_rewrite: std::sync::atomic::AtomicBool,
 }
 
 // `C: Clone, S: Clone` here (not previously required) is issue #838's
@@ -252,6 +262,7 @@ impl<C: Clone, S: Clone> SharedWal<C, S> {
             inner: AsyncMutex::new(SharedWalState::default()),
             physical_writes: std::sync::atomic::AtomicU64::new(0),
             markers: crate::persist::SyncMarkerState::default(),
+            needs_rewrite: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -409,7 +420,7 @@ impl<C: Clone, S: Clone> SharedWal<C, S> {
                 }
             };
 
-            let result = Self::flush(&self.markers, env, file, &batch).await;
+            let result = Self::flush(&self.markers, &self.needs_rewrite, env, file, &batch).await;
             if result.is_ok() {
                 self.physical_writes
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -438,6 +449,7 @@ impl<C: Clone, S: Clone> SharedWal<C, S> {
 
     async fn flush<E: Env>(
         markers: &crate::persist::SyncMarkerState,
+        needs_rewrite: &std::sync::atomic::AtomicBool,
         env: &E,
         file: &str,
         batch: &[Pending<C, S>],
@@ -452,9 +464,25 @@ impl<C: Clone, S: Clone> SharedWal<C, S> {
                 // Issue #1132: rebuilt from records — any pending piggybacked
                 // marker no longer describes this file.
                 markers.invalidate();
-                env.replace(file, image).await.map_err(SharedWalError::from)
+                let r = env.replace(file, image).await.map_err(SharedWalError::from);
+                if r.is_ok() {
+                    // A fresh file built from records: whatever a torn append
+                    // left behind is gone.
+                    needs_rewrite.store(false, std::sync::atomic::Ordering::SeqCst);
+                } else if r.as_ref().is_err_and(|e| animus_env::is_storage_full(&e.0)) {
+                    // Free the half-written temp sibling so its space can
+                    // return to the volume.
+                    let _ = env.remove(&format!("{file}.tmp")).await;
+                }
+                r
             }
             WalOp::Append(_) => {
+                if needs_rewrite.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(SharedWalError::from(io::Error::new(
+                        io::ErrorKind::StorageFull,
+                        "shared wal suspect after ENOSPC: awaiting a whole-file rewrite",
+                    )));
+                }
                 // Issue #1132: the previous round's `SWL1` v2 sync marker (if
                 // its fsync succeeded) is prepended to THIS round's single
                 // append — never its own append (see `SyncMarkerState`). Only
@@ -476,10 +504,16 @@ impl<C: Clone, S: Clone> SharedWal<C, S> {
                 }
                 if let Err(e) = env.append(file, &merged).await {
                     markers.invalidate();
+                    if animus_env::is_storage_full(&e) {
+                        needs_rewrite.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
                     return Err(SharedWalError::from(e));
                 }
                 if let Err(e) = env.sync(file).await {
                     markers.invalidate();
+                    if animus_env::is_storage_full(&e) {
+                        needs_rewrite.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
                     // Issue #883: `env.append` above already landed `merged`
                     // in the file's un-synced buffered region before this
                     // round's own `sync` failed — `Disk::append`/`Disk::sync`
@@ -565,6 +599,7 @@ where
             }),
             physical_writes: std::sync::atomic::AtomicU64::new(0),
             markers: crate::persist::SyncMarkerState::default(),
+            needs_rewrite: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 

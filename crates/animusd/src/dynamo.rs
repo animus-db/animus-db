@@ -11067,6 +11067,16 @@ mod map_throttleable_error_tests {
         assert_eq!(err.message, forward_exhausted);
     }
 
+    /// R-01 (d), ADR 0074 §2: the disk-full refusal is a named 503
+    /// `ServiceUnavailable` carrying the `StorageFull:` cause, never a 500.
+    #[test]
+    fn the_storage_full_refusal_maps_to_a_named_service_unavailable() {
+        let err = map_throttleable_error(animus_node::decide::STORAGE_FULL_REFUSAL.to_owned());
+        assert_eq!(err.code, "ServiceUnavailable");
+        assert!(err.message.starts_with("StorageFull:"), "{}", err.message);
+        assert!(err.message.ends_with("; retry"), "{}", err.message);
+    }
+
     /// A throttle refusal is unchanged — it must never be conflated with a
     /// transient/retryable condition (ADR 0065 §6: the client, not this
     /// server, backs off).

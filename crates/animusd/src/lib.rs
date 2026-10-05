@@ -1005,6 +1005,34 @@ impl<E: Env> CpGroup<E> {
         }
     }
 
+    /// Whether this group's WAL is suspect after an ENOSPC (R-01 (d), ADR 0074
+    /// §2) — the `StorageFull` state. A pure flag read; see
+    /// [`RaftKvNode::is_storage_full`].
+    pub(crate) fn is_storage_full(&self) -> bool {
+        match self {
+            CpGroup::Lsm(n) => n.is_storage_full(),
+            CpGroup::Mem(n) => n.is_storage_full(),
+        }
+    }
+
+    /// The pre-propose disk-full refusal every mutating local write/txn helper
+    /// consults beside [`decide::frozen_refusal`]: while this group is
+    /// `StorageFull` it can make nothing durable, so a write is refused
+    /// **before proposing** with the named, `"; retry"`-suffixed
+    /// [`decide::STORAGE_FULL_REFUSAL`] (surfaced as a 503
+    /// `ServiceUnavailable` naming `StorageFull`) and `overload_storage_full`
+    /// is counted. Reads are never gated.
+    pub(crate) fn refuse_if_storage_full(&self) -> Result<(), String> {
+        let full = self.is_storage_full();
+        if full {
+            match self {
+                CpGroup::Lsm(n) => n.record_storage_full_refusal(),
+                CpGroup::Mem(n) => n.record_storage_full_refusal(),
+            }
+        }
+        decide::storage_full_refusal(full)
+    }
+
     /// Propose the split-cutover freeze directly (`RaftKvNode::
     /// propose_freeze`) — leader-only, idempotent. `SimCluster`'s own
     /// `freeze_tablet` (issue #994 regression) is the sole caller today: a
@@ -1351,6 +1379,7 @@ impl<E: Env> CpGroup<E> {
                     byte_size,
                     quiesced: $n.is_quiesced(),
                     refused_as_voter: $n.refused_as_voter(),
+                    storage_full: $n.is_storage_full(),
                     voter_history: self
                         .voter_history()
                         .into_iter()

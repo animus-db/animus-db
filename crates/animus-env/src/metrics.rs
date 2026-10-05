@@ -990,12 +990,20 @@ pub enum Metric {
     /// (`InternalServerError`/`ServiceUnavailable`: the server, not the client
     /// or a throttle, failed it).
     DynamoResponses5xx,
+    // --- Disk-full semantics (R-01 (d), ADR 0074 §2 / `docs/resource-bounds.md`
+    // §3; appended, same slot-stability discipline) ---
+    /// A mutating request was refused with a named `StorageFull` error
+    /// (HTTP 503 `ServiceUnavailable`, message begins `StorageFull:`) because
+    /// the hosted tablet group's own write-ahead log is suspect after an
+    /// ENOSPC and has not yet been rewritten onto free space. Reason
+    /// `storage_full`. Reads are never refused for this reason.
+    OverloadStorageFull,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 116] = [
+    pub const ALL: [Metric; 117] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -1112,6 +1120,7 @@ impl Metric {
         Metric::OverloadShedPeerConnCap,
         Metric::DynamoRequestsTotal,
         Metric::DynamoResponses5xx,
+        Metric::OverloadStorageFull,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -1235,6 +1244,7 @@ impl Metric {
             Metric::OverloadShedPeerConnCap => "overload_shed_peer_conn_cap",
             Metric::DynamoRequestsTotal => "dynamo_requests_total",
             Metric::DynamoResponses5xx => "dynamo_responses_5xx",
+            Metric::OverloadStorageFull => "overload_storage_full",
         }
     }
 
