@@ -344,11 +344,12 @@ mod tests {
         assert!(check_propose(&open, &kind_eval(true, replicate)));
     }
 
-    /// M1 ships the shape only: a `Replicate` that reaches apply anyway (it
-    /// cannot through a gated proposer) is a deterministic rejection that
-    /// writes nothing, never a panic or a divergent write.
+    /// A `Replicate` that reaches apply on a table whose entry carries no
+    /// `mrec` context (it cannot through a correct proposer) is a
+    /// deterministic rejection that writes nothing, never a panic or a
+    /// versioned row on a non-MREC table.
     #[test]
-    fn replicate_reaching_apply_is_a_deterministic_rejection_in_m1() {
+    fn replicate_without_mrec_context_is_a_deterministic_rejection() {
         let op = KindEvalOp::Replicate {
             item: Some(animus_item::Item::new()),
             ver: animus_item::MrecVersion::ZERO,
@@ -358,6 +359,7 @@ mod tests {
             &animus_item::AttributeValue::S("a".into()),
             None,
             &[0u8; 8],
+            None,
             None,
             &op,
             None,

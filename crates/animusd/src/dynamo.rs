@@ -9611,6 +9611,12 @@ pub(crate) async fn kind_write_item_at_leader<E: Env, R: RelayClient>(
         }
         KindEvalApplied::ConditionFailed => Ok(KindWriteOutcome::ConditionFailed),
         KindEvalApplied::Rejected { code, message } => Err(rejected_wire_error(&code, message)),
+        // ADR 0075 G-d M2: only a `KindEvalOp::Replicate` is ever superseded,
+        // and no client write path proposes one (M3's receiver handler has its
+        // own caller).
+        KindEvalApplied::Superseded { .. } => Err(internal(
+            "a client write came back superseded (MREC replicate result on a client path)",
+        )),
     }
 }
 
@@ -9850,6 +9856,10 @@ pub(crate) async fn kind_write_batch_at_leader<E: Env, R: RelayClient>(
                         KindEvalApplied::Rejected { code, message } => {
                             Err(rejected_wire_error(&code, message))
                         }
+                        KindEvalApplied::Superseded { .. } => Err(internal(
+                            "a client write came back superseded (MREC replicate result on a \
+                             client path)",
+                        )),
                     };
                     results[a.original_index] = Some(outcome);
                 }
@@ -10306,6 +10316,16 @@ pub(crate) async fn marker_batch_write_raw<E: Env, R: RelayClient>(
     // back with nothing observable in between, discarding the first clone
     // whenever the tablet already existed.
     let mut route_meta = ctx.effective_metadata();
+    // ADR 0075 G-d M2: an edge-valued (raw) base-row write cannot carry an
+    // MREC stamp, so it is refused outright on an MREC table. Defence in
+    // depth: the Dynamo fast arms never reach here for one
+    // (`table_change_records_carry_images` is true for MREC), and the raw
+    // client protocol's values are not items anyway.
+    if route_meta.table_global(table).is_some_and(|g| g.is_mrec()) {
+        return Err(format!(
+            "table `{table}` is an MREC global table: raw (unstamped) writes are not supported"
+        ));
+    }
     if provision_if_absent && !route_meta.has_table_tablet(table) {
         ctx.provision_tablet(table).await?;
         route_meta = ctx.effective_metadata();
@@ -10449,6 +10469,13 @@ pub(crate) fn table_change_records_carry_images(meta: &Metadata, table: &str) ->
         // marker-write arm — real DynamoDB's own PITR carries an
         // analogous (if internally different) continuous-capture cost.
         || meta.table_pitr(table).is_some()
+        // ADR 0075 G-d M2: an MREC table's rows carry a last-writer-wins stamp
+        // that only the evaluate-at-apply path (`KindEval`) can compute from
+        // the stored row, so such a table must never take an edge-valued fast
+        // arm (`fast_marker_write`/`marker_batch_write`), which would write an
+        // unstamped base row. (MREC also forces a stream with images on at
+        // conversion, M4; this is the structural guarantee, not a courtesy.)
+        || meta.table_global(table).is_some_and(|g| g.is_mrec())
 }
 
 /// Whether `cp_txn` must **await** its post-commit resolve under the ADR

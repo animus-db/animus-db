@@ -1593,6 +1593,24 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             )));
         }
 
+        // ADR 0075 G-d M2: a plain (edge-valued, non-`pending`) write carries
+        // its base value as opaque bytes and so cannot be MREC-stamped at
+        // apply; refuse it on an MREC table. Every Dynamo transaction write is
+        // `pending` (evaluated and stamped at `TxnStage` apply), so only the
+        // raw client protocol's `Txn` can land here.
+        {
+            let meta = self.effective_metadata();
+            if let Some(w) = writes.iter().find(|w| {
+                w.pending.is_none() && meta.table_global(&w.table).is_some_and(|g| g.is_mrec())
+            }) {
+                return Err(TxnAbortReason::Other(format!(
+                    "table `{}` is an MREC global table: raw (unstamped) transactional writes \
+                     are not supported",
+                    w.table
+                )));
+            }
+        }
+
         // Auto-provision every distinct table's first tablet on demand, like
         // `cp_write`.
         let mut seen_tables: BTreeSet<String> = BTreeSet::new();

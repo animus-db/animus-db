@@ -79,6 +79,8 @@ pub mod hlc;
 pub mod host;
 mod hwm;
 pub mod layout;
+#[cfg(test)]
+mod mrec_props;
 mod seal;
 pub mod segment;
 mod split;
@@ -599,9 +601,14 @@ pub enum KindEvalOp {
     /// **Class G, gated by `Gate::MrecReplication`** (cluster version 3):
     /// [`KvCommand::required_gate`](crate::gates) is content-dependent, so a
     /// `KindEval`/`KindEvalBatch`/`TxnStage` carrying this op is refused at
-    /// the propose site until the gate opens. **M1 ships the shape only**:
-    /// nothing emits it and apply rejects it deterministically (M2 gives it
-    /// the last-writer-wins semantics).
+    /// the propose site until the gate opens. **Apply (M2)**: applied only if
+    /// `ver` is strictly greater than the stored stamp (an unversioned row
+    /// compares as zero), through the ordinary `derive_kind_writes` path (LSI
+    /// rows, change record with images) with `ver` written verbatim;
+    /// otherwise the leader-local `Superseded` result and no writes. A key
+    /// holding a foreign transaction intent yields the entry's
+    /// `ConditionFailed` outcome (the shipper's `Retry`). Rejected
+    /// deterministically when the entry's `WriteSchema::mrec` is `None`.
     Replicate {
         item: Option<Item>,
         ver: animus_item::MrecVersion,
@@ -1859,6 +1866,10 @@ pub struct KindEvalResult {
     /// The item immediately after this entry applied — `None` for a
     /// delete.
     pub new: Option<Item>,
+    /// ADR 0075 G-d M2: the entry was a [`KindEvalOp::Replicate`] that lost
+    /// last-writer-wins (`ver <= stored`) and wrote nothing; `old == new` is
+    /// then the item as stored. Always `false` for every other op.
+    pub superseded: bool,
 }
 
 /// The leader-local slot map [`KvCommand::KindEval`]'s apply arm fills
@@ -1958,6 +1969,10 @@ pub enum KindEvalItemResult {
     /// [`KindBatchOutcome::Rejected`]'s doc for the two cases this covers.
     /// Like `ConditionFailed`, scoped to this one item.
     Rejected { code: String, message: String },
+    /// ADR 0075 G-d M2: a [`KindEvalOp::Replicate`] that lost last-writer-wins
+    /// (`ver <= stored`): nothing was written for this item; `current` is the
+    /// item as stored. Scoped to this one item like `ConditionFailed`.
+    Superseded { current: Option<Item> },
 }
 
 /// The leader-local result payload of one `KvCommand::KindEvalBatch` entry
@@ -8211,7 +8226,21 @@ enum KindEvalDecision {
         change_log: (Vec<u8>, Vec<u8>),
         old: Option<Item>,
         new: Option<Item>,
+        /// The MREC stamp the base row was written with: `Some` exactly when
+        /// the entry's `WriteSchema::mrec` is `Some` (a local write stamped
+        /// by [`animus_item::MrecVersion::next_local`], or a replicated
+        /// record's own stamp written verbatim); `None` for every ordinary
+        /// table, whose base row stays byte-identical to the pre-MREC
+        /// encoding.
+        new_ver: Option<animus_item::MrecVersion>,
     },
+    /// ADR 0075 G-d M2: a [`KindEvalOp::Replicate`] whose stamp does not beat
+    /// the stored one (last-writer-wins: `ver <= stored`, including the
+    /// idempotent equal re-delivery). **No writes of any kind** — not even a
+    /// change record: the receiver's streams/PITR/GSI drain see nothing for a
+    /// record that changed nothing. `current` is the item as stored (the
+    /// leader-local result's `old == new`).
+    Superseded { current: Option<Item> },
     /// `condition` evaluated to `Ok(false)` — an ordinary
     /// `ConditionalCheckFailedException`-shaped no-op.
     ConditionFailed,
@@ -8237,10 +8266,40 @@ fn evaluate_kind_eval(
     sk: Option<&AttributeValue>,
     token_prefix: &[u8],
     old: Option<Item>,
+    stored_ver: Option<animus_item::MrecVersion>,
     op: &KindEvalOp,
     condition: Option<&ConditionExpression>,
     ttl_expired: bool,
 ) -> KindEvalDecision {
+    // ADR 0075 G-d M2: a replicated MREC record is **unconditional** (the
+    // shipper never sets a condition; one that rides anyway is ignored by
+    // construction) and is decided by last-writer-wins on the stored stamp
+    // alone, before anything else is evaluated.
+    if let KindEvalOp::Replicate { item, ver } = op {
+        // A replicate only makes sense on an MREC table. The proposer builds
+        // the receiver's own `WriteSchema` (so `mrec` is `Some` on every
+        // legitimate one); a deterministic rejection, never a panic or a
+        // versioned row on a table that is not MREC.
+        if schema.mrec.is_none() {
+            return KindEvalDecision::Rejected {
+                code: "ValidationException".to_owned(),
+                message: "MREC replicate on a table that is not an MREC global table".to_owned(),
+            };
+        }
+        if !ver.supersedes(stored_ver) {
+            return KindEvalDecision::Superseded { current: old };
+        }
+        return kind_eval_applied(
+            schema,
+            pk,
+            sk,
+            token_prefix,
+            old,
+            item.clone(),
+            Some(*ver),
+            ttl_expired,
+        );
+    }
     if let Some(cond) = condition {
         match cond.evaluate(old.as_ref()) {
             Ok(true) => {}
@@ -8256,16 +8315,7 @@ fn evaluate_kind_eval(
     let new = match op {
         KindEvalOp::Put(item) => Some(item.clone()),
         KindEvalOp::Delete => None,
-        // ADR 0075 G-d M1: the shape exists, the semantics land in M2. The
-        // gate keeps every proposer from emitting it; a deterministic
-        // rejection (never a panic: apply must not diverge or crash) is what
-        // a replica does with one that arrives anyway.
-        KindEvalOp::Replicate { .. } => {
-            return KindEvalDecision::Rejected {
-                code: "InternalServerError".to_owned(),
-                message: "MREC replicate is not implemented in this build".to_owned(),
-            };
-        }
+        KindEvalOp::Replicate { .. } => unreachable!("handled above"),
         KindEvalOp::Update { key_item, actions } => {
             let base = old.clone().unwrap_or_else(|| key_item.clone());
             match animus_item::apply_update(base, actions) {
@@ -8279,9 +8329,36 @@ fn evaluate_kind_eval(
             }
         }
     };
-    let base_value = match &new {
-        Some(item) => animus_item::encode_stored_item(item),
-        None => animus_item::encode_tombstone(),
+    // ADR 0075 G-d M2: a local write on an MREC table stamps its row from the
+    // frozen `WriteSchema::mrec` and the stored stamp — a pure function of
+    // `(entry, engine state)`, so every replica writes identical bytes.
+    let new_ver = schema
+        .mrec
+        .map(|m| animus_item::MrecVersion::next_local(stored_ver, m.wall_ms, m.region_id));
+    kind_eval_applied(schema, pk, sk, token_prefix, old, new, new_ver, ttl_expired)
+}
+
+/// The shared tail of [`evaluate_kind_eval`]: encode the base row (versioned
+/// iff `new_ver` is `Some`) and derive every companion write and the change
+/// record through `animus_item::derive_kind_writes` — the one derivation
+/// every writer shares, so LSI rows, change-log images, Streams and PITR see
+/// a replicated write exactly as they see a local one.
+#[allow(clippy::too_many_arguments)] // one item write's full identity + before/after
+fn kind_eval_applied(
+    schema: &WriteSchema,
+    pk: &AttributeValue,
+    sk: Option<&AttributeValue>,
+    token_prefix: &[u8],
+    old: Option<Item>,
+    new: Option<Item>,
+    new_ver: Option<animus_item::MrecVersion>,
+    ttl_expired: bool,
+) -> KindEvalDecision {
+    let base_value = match (&new, new_ver) {
+        (Some(item), None) => animus_item::encode_stored_item(item),
+        (None, None) => animus_item::encode_tombstone(),
+        (Some(item), Some(ver)) => animus_item::encode_stored_item_versioned(item, ver),
+        (None, Some(ver)) => animus_item::encode_tombstone_versioned(ver),
     };
     let derived = animus_item::derive_kind_writes(
         schema,
@@ -8300,6 +8377,7 @@ fn evaluate_kind_eval(
         change_log: derived.change_log,
         old,
         new,
+        new_ver,
     }
 }
 
@@ -9015,20 +9093,27 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         // never guess, mirroring `KindBatch.conditions`'
                         // and `Cas`'s identical discipline for a foreign
                         // intent. The proposer's cue is the same as any
-                        // other no-op: retry.
+                        // other no-op: retry. (A `KindEvalOp::Replicate`
+                        // gets the same outcome: it carries no condition,
+                        // so for it `ConditionFailed` can only mean
+                        // "intent on the key", which the MREC shipper
+                        // treats as `Retry`, ADR 0075 G-d M2.)
                         Some(txn::Envelope::Intent { .. }) => KindBatchOutcome::ConditionFailed {
                             key: base_key.clone(),
                         },
                         committed => {
-                            let old: Option<Item> = match committed {
+                            let (old, stored_ver): (
+                                Option<Item>,
+                                Option<animus_item::MrecVersion>,
+                            ) = match committed {
                                 Some(txn::Envelope::Committed(bytes)) => {
-                                    animus_item::decode_stored_item(&bytes)
+                                    animus_item::decode_stored_item_versioned(&bytes)
                                         .expect("raftkv kind eval decode")
                                 }
                                 Some(txn::Envelope::Intent { .. }) => {
                                     unreachable!("handled by the arm above")
                                 }
-                                None => None,
+                                None => (None, None),
                             };
                             match evaluate_kind_eval(
                                 &schema,
@@ -9036,6 +9121,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                 sk.as_ref(),
                                 &token,
                                 old,
+                                stored_ver,
                                 &op,
                                 condition.as_ref(),
                                 ttl_expired,
@@ -9052,11 +9138,34 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                         message,
                                     }
                                 }
+                                KindEvalDecision::Superseded { current } => {
+                                    // ADR 0075 G-d M2: LWW lost — no writes,
+                                    // not even a change record. The entry
+                                    // itself applied (it is committed and
+                                    // deterministic on every replica), so
+                                    // the replicated outcome is `Applied`;
+                                    // `Superseded` is only the leader-local
+                                    // result payload.
+                                    kind_eval_results
+                                        .lock()
+                                        .expect("kind eval results poisoned")
+                                        .fill(
+                                            index,
+                                            term,
+                                            KindEvalResult {
+                                                old: current.clone(),
+                                                new: current,
+                                                superseded: true,
+                                            },
+                                        );
+                                    KindBatchOutcome::Applied
+                                }
                                 KindEvalDecision::Applied {
                                     writes,
                                     change_log,
                                     old,
                                     new,
+                                    ..
                                 } => {
                                     // ADR 0046 binding decision, reused
                                     // verbatim: the ONE shared
@@ -9088,7 +9197,15 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                     kind_eval_results
                                         .lock()
                                         .expect("kind eval results poisoned")
-                                        .fill(index, term, KindEvalResult { old, new });
+                                        .fill(
+                                            index,
+                                            term,
+                                            KindEvalResult {
+                                                old,
+                                                new,
+                                                superseded: false,
+                                            },
+                                        );
                                     KindBatchOutcome::Applied
                                 }
                             }
@@ -9153,7 +9270,13 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     // behavior for a duplicate `BatchWriteItem` key — with
                     // zero extra `merge_batch`/sync calls in the common
                     // (all-distinct-keys) case.
-                    let mut overlay: BTreeMap<Vec<u8>, Option<Item>> = BTreeMap::new();
+                    // ADR 0075 G-d M2: the overlay also carries the stamp the earlier
+                    // item wrote, so a second local write to the same MREC key in one
+                    // entry bumps from it (and a replicate sees it).
+                    let mut overlay: BTreeMap<
+                        Vec<u8>,
+                        (Option<Item>, Option<animus_item::MrecVersion>),
+                    > = BTreeMap::new();
                     let mut next_ordinal: u32 = 0;
                     let mut items: Vec<KindEvalItemResult> = Vec::with_capacity(entries.len());
                     for entry in &entries {
@@ -9161,38 +9284,40 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         let token = animus_tablet::partition_token(&animus_item::storage_key(
                             &entry.pk, None,
                         ));
-                        let old: Option<Item> = if let Some(cached) = overlay.get(&base_key) {
-                            cached.clone()
-                        } else {
-                            let raw = storage
-                                .get(&scope.physical(&base_key))
-                                .await
-                                .expect("raftkv kind eval batch read");
-                            match raw.map(|vv| txn::decode_envelope(&vv.value)) {
-                                // An unresolved intent from a concurrent
-                                // transaction makes "the current committed
-                                // value" ambiguous for THIS item only —
-                                // never guess; siblings still evaluate on
-                                // their own merits (see this variant's own
-                                // doc: one item's no-op never aborts
-                                // another's).
-                                Some(txn::Envelope::Intent { .. }) => {
-                                    items.push(KindEvalItemResult::ConditionFailed);
-                                    continue;
+                        let (old, stored_ver): (Option<Item>, Option<animus_item::MrecVersion>) =
+                            if let Some(cached) = overlay.get(&base_key) {
+                                cached.clone()
+                            } else {
+                                let raw = storage
+                                    .get(&scope.physical(&base_key))
+                                    .await
+                                    .expect("raftkv kind eval batch read");
+                                match raw.map(|vv| txn::decode_envelope(&vv.value)) {
+                                    // An unresolved intent from a concurrent
+                                    // transaction makes "the current committed
+                                    // value" ambiguous for THIS item only —
+                                    // never guess; siblings still evaluate on
+                                    // their own merits (see this variant's own
+                                    // doc: one item's no-op never aborts
+                                    // another's).
+                                    Some(txn::Envelope::Intent { .. }) => {
+                                        items.push(KindEvalItemResult::ConditionFailed);
+                                        continue;
+                                    }
+                                    Some(txn::Envelope::Committed(bytes)) => {
+                                        animus_item::decode_stored_item_versioned(&bytes)
+                                            .expect("raftkv kind eval batch decode")
+                                    }
+                                    None => (None, None),
                                 }
-                                Some(txn::Envelope::Committed(bytes)) => {
-                                    animus_item::decode_stored_item(&bytes)
-                                        .expect("raftkv kind eval batch decode")
-                                }
-                                None => None,
-                            }
-                        };
+                            };
                         match evaluate_kind_eval(
                             &entry.schema,
                             &entry.pk,
                             entry.sk.as_ref(),
                             &token,
                             old,
+                            stored_ver,
                             &entry.op,
                             entry.condition.as_ref(),
                             entry.ttl_expired,
@@ -9203,16 +9328,24 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                             KindEvalDecision::Rejected { code, message } => {
                                 items.push(KindEvalItemResult::Rejected { code, message });
                             }
+                            KindEvalDecision::Superseded { current } => {
+                                // ADR 0075 G-d M2: LWW lost, nothing written
+                                // (the overlay is unchanged: the stored row
+                                // is still what a later same-key item sees).
+                                items.push(KindEvalItemResult::Superseded { current });
+                            }
                             KindEvalDecision::Applied {
                                 writes,
                                 change_log,
                                 old,
                                 new,
+                                new_ver,
                             } => {
-                                // Record this item's own `new` image in the
-                                // overlay BEFORE moving on — a later item
-                                // sharing this same key must see it.
-                                overlay.insert(base_key, new.clone());
+                                // Record this item's own `new` image (and
+                                // stamp) in the overlay BEFORE moving on — a
+                                // later item sharing this same key must see
+                                // it.
+                                overlay.insert(base_key, (new.clone(), new_ver));
                                 // ADR 0046 binding decision, reused
                                 // verbatim: the ONE shared materialization
                                 // helper `KindBatch`'s/`KindEval`'s own arms
@@ -9818,43 +9951,43 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                             .get(&scope.physical(&w.key))
                             .await
                             .expect("raftkv txn stage pending-eval read");
-                        let old: Option<Item> = match raw.map(|vv| txn::decode_envelope(&vv.value))
-                        {
-                            None => None,
-                            Some(txn::Envelope::Committed(bytes)) => {
-                                animus_item::decode_stored_item(&bytes)
-                                    .expect("raftkv txn stage pending-eval decode")
-                            }
-                            // Same-txn re-staging (a WAL-replay
-                            // re-application): this exact stage already
-                            // landed this exact intent at this exact key —
-                            // reuse its already-computed payload verbatim
-                            // instead of re-evaluating `op`/`condition`
-                            // against it as though it were the pre-stage
-                            // value (which would, e.g., double-apply a
-                            // non-idempotent `ADD` against its own prior
-                            // result). A *foreign* intent here is
-                            // unreachable: `blocked_by` above already
-                            // rejected the whole stage (`all_in_fence ==
-                            // false`) before this loop ever runs.
-                            Some(txn::Envelope::Intent {
-                                txn_id: owner,
-                                staged_value,
-                                kind_writes,
-                                change_log,
-                                ..
-                            }) if owner == txn_id => {
-                                evaluated_payload[i] =
-                                    Some((staged_value, kind_writes, change_log));
-                                continue;
-                            }
-                            Some(txn::Envelope::Intent { .. }) => {
-                                unreachable!(
-                                    "a foreign intent here was already caught by `blocked_by` \
+                        let (old, stored_ver): (Option<Item>, Option<animus_item::MrecVersion>) =
+                            match raw.map(|vv| txn::decode_envelope(&vv.value)) {
+                                None => (None, None),
+                                Some(txn::Envelope::Committed(bytes)) => {
+                                    animus_item::decode_stored_item_versioned(&bytes)
+                                        .expect("raftkv txn stage pending-eval decode")
+                                }
+                                // Same-txn re-staging (a WAL-replay
+                                // re-application): this exact stage already
+                                // landed this exact intent at this exact key —
+                                // reuse its already-computed payload verbatim
+                                // instead of re-evaluating `op`/`condition`
+                                // against it as though it were the pre-stage
+                                // value (which would, e.g., double-apply a
+                                // non-idempotent `ADD` against its own prior
+                                // result). A *foreign* intent here is
+                                // unreachable: `blocked_by` above already
+                                // rejected the whole stage (`all_in_fence ==
+                                // false`) before this loop ever runs.
+                                Some(txn::Envelope::Intent {
+                                    txn_id: owner,
+                                    staged_value,
+                                    kind_writes,
+                                    change_log,
+                                    ..
+                                }) if owner == txn_id => {
+                                    evaluated_payload[i] =
+                                        Some((staged_value, kind_writes, change_log));
+                                    continue;
+                                }
+                                Some(txn::Envelope::Intent { .. }) => {
+                                    unreachable!(
+                                        "a foreign intent here was already caught by `blocked_by` \
                                      above (all_in_fence would be false)"
-                                )
-                            }
-                        };
+                                    )
+                                }
+                            };
                         let token =
                             animus_tablet::partition_token(&animus_item::storage_key(&p.pk, None));
                         match evaluate_kind_eval(
@@ -9863,6 +9996,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                             p.sk.as_ref(),
                             &token,
                             old,
+                            stored_ver,
                             &p.op,
                             p.condition.as_ref(),
                             p.ttl_expired,
@@ -9877,6 +10011,21 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                     key: w.key.clone(),
                                     code,
                                     message,
+                                });
+                                break 'pending_eval;
+                            }
+                            // ADR 0075 G-d M2: a replicated record is never
+                            // part of a transaction (transactions are
+                            // region-local); a stage carrying one is a
+                            // deterministic validation rejection, same
+                            // structural bucket as a failed evaluation.
+                            KindEvalDecision::Superseded { .. } => {
+                                pending_failure = Some(txn::StageOutcome::Rejected {
+                                    key: w.key.clone(),
+                                    code: "ValidationException".to_owned(),
+                                    message: "an MREC replicate cannot be staged in a \
+                                              transaction"
+                                        .to_owned(),
                                 });
                                 break 'pending_eval;
                             }

@@ -81,6 +81,56 @@ impl MrecVersion {
         logical: 0,
         region_id: 0,
     };
+
+    /// The stamp a **local** write of Region `region_id` takes at apply, given
+    /// the version the item currently stores (`None` = an unversioned row or
+    /// an absent key, which compares as [`ZERO`](Self::ZERO)) and the write's
+    /// own wall clock `wall_ms` (the leader's `Env::wall_now`, frozen into
+    /// `WriteSchema::mrec` at propose time; a TTL delete uses the expiry
+    /// instant).
+    ///
+    /// `wall = max(wall_ms, stored.wall_ms)`; `logical` is `0` when the write's
+    /// clock is strictly ahead of the stored stamp and `stored.logical + 1`
+    /// otherwise (a clock behind or tied with the stored stamp, including a
+    /// remote Region's stamp this Region has already applied). The result is
+    /// therefore **strictly greater than the stored stamp, whatever its
+    /// `region_id`**: a local write made after observing a remote one always
+    /// beats it (causality per item). It is a pure function of its arguments
+    /// (no clock state, no witness), so every replica applying the same entry
+    /// to the same stored row computes identical bytes. On `logical`
+    /// overflow the wall part is bumped by one (still strictly greater).
+    #[must_use]
+    pub fn next_local(stored: Option<MrecVersion>, wall_ms: u64, region_id: u32) -> MrecVersion {
+        let s = stored.unwrap_or(Self::ZERO);
+        if wall_ms > s.wall_ms {
+            return MrecVersion {
+                wall_ms,
+                logical: 0,
+                region_id,
+            };
+        }
+        match s.logical.checked_add(1) {
+            Some(logical) => MrecVersion {
+                wall_ms: s.wall_ms,
+                logical,
+                region_id,
+            },
+            None => MrecVersion {
+                wall_ms: s.wall_ms.saturating_add(1),
+                logical: 0,
+                region_id,
+            },
+        }
+    }
+
+    /// The last-writer-wins rule for a **replicated** write: an incoming stamp
+    /// is applied only if it is strictly greater than the stored one
+    /// (`None` = [`ZERO`](Self::ZERO)). Equal means "already applied" (an
+    /// idempotent re-delivery) and is not applied.
+    #[must_use]
+    pub fn supersedes(self, stored: Option<MrecVersion>) -> bool {
+        self > stored.unwrap_or(Self::ZERO)
+    }
 }
 
 /// The version of the stored-item encoding `bytes` is written in, sniffed
@@ -235,6 +285,54 @@ mod tests {
         assert!(v(2, 0, 9) < v(2, 1, 0));
         assert!(v(2, 1, 1) < v(2, 1, 2));
         assert_eq!(v(2, 1, 2).cmp(&v(2, 1, 2)), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn next_local_is_strictly_above_the_stored_stamp_and_deterministic() {
+        let v = |wall_ms, logical, region_id| MrecVersion {
+            wall_ms,
+            logical,
+            region_id,
+        };
+        // No stored stamp: the write's own clock, logical 0.
+        assert_eq!(MrecVersion::next_local(None, 100, 7), v(100, 0, 7));
+        // Clock ahead of the stored stamp: logical resets.
+        assert_eq!(
+            MrecVersion::next_local(Some(v(90, 5, 9)), 100, 7),
+            v(100, 0, 7)
+        );
+        // Tie on the wall part: logical bumps, region is the local one.
+        assert_eq!(
+            MrecVersion::next_local(Some(v(100, 5, 9)), 100, 7),
+            v(100, 6, 7)
+        );
+        // Clock behind (skew / a remote stamp from the future): causality wins.
+        assert_eq!(
+            MrecVersion::next_local(Some(v(150, 2, 9)), 100, 7),
+            v(150, 3, 7)
+        );
+        // Always strictly greater, whatever the stored region id.
+        for stored in [v(100, 0, 0), v(100, 0, u32::MAX), v(200, 3, 1), v(0, 0, 0)] {
+            assert!(MrecVersion::next_local(Some(stored), 100, 1) > stored);
+        }
+        // Logical overflow bumps the wall part instead of wrapping.
+        let top = v(100, u32::MAX, 3);
+        assert!(MrecVersion::next_local(Some(top), 50, 1) > top);
+    }
+
+    #[test]
+    fn supersedes_is_strict_and_treats_unversioned_as_zero() {
+        let v = |wall_ms, logical, region_id| MrecVersion {
+            wall_ms,
+            logical,
+            region_id,
+        };
+        assert!(v(1, 0, 0).supersedes(None));
+        assert!(!MrecVersion::ZERO.supersedes(None));
+        assert!(v(2, 0, 0).supersedes(Some(v(1, 9, 9))));
+        assert!(!v(2, 0, 1).supersedes(Some(v(2, 0, 1))));
+        assert!(!v(2, 0, 1).supersedes(Some(v(2, 0, 2))));
+        assert!(v(2, 0, 3).supersedes(Some(v(2, 0, 2))));
     }
 
     #[test]
