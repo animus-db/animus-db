@@ -130,7 +130,7 @@ pub struct Environment {
     pub node_count: usize,
     /// Requests are SigV4-signed.
     pub sigv4: bool,
-    /// This client speaks plain TCP only; always false today.
+    /// The DynamoDB and admin ports were dialled over server-only TLS.
     pub tls: bool,
     pub tls_note: String,
 }

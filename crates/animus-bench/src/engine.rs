@@ -264,7 +264,7 @@ async fn worker<X: OpExecutor>(
                 let i = (cursor + attempt) % endpoints.len();
                 if let Some(Ok(c)) = rt::timeout(
                     Duration::from_secs(2),
-                    Conn::connect(endpoints[i], creds.clone()),
+                    Conn::connect(endpoints[i], creds.clone(), cluster.tls()),
                 )
                 .await
                 {
@@ -338,6 +338,9 @@ where
     S: OpSource,
     X: OpExecutor<Op = S::Op>,
 {
+    // Establish (and TLS-handshake) the worker connections before the phase
+    // clock starts, so no handshake sits inside a measured op.
+    cluster.prewarm(spec.connections.max(1)).await;
     let t0 = clock.now_ns();
     let duration_ns = u64::try_from(spec.duration.as_nanos()).unwrap_or(u64::MAX);
     let schedule = Schedule::new(t0, spec.rate);

@@ -168,7 +168,7 @@
         <li><strong>A results file</strong> (<code>animus-bench/v1</code> JSON) with the git SHA, exact command line, seed, client host, cluster topology and replica placement read back from <code>/admin</code>, and the methodology itself.</li>
       </ul></div>
       <div class="lcard"><h3>What it does not do (yet)</h3><ul>
-        <li><strong>No TLS.</strong> The generator speaks plain TCP; every results file records <code>tls: false</code>, and TLS-on performance cannot be measured yet.</li>
+        <li><strong>TLS is opt-in and server-only.</strong> With <code>--tls-ca</code> the generator verifies each node over TLS (no client certificate) and the results file records <code>tls: true</code>; without it, plain TCP and <code>tls: false</code>. No TLS-on versus TLS-off comparison has been published yet, so state which one a number is.</li>
         <li><strong>Workload E is not YCSB's scan.</strong> A DynamoDB <code>Query</code> cannot cross partition keys, so E is a short <code>Query</code> inside one 100-record partition. It measures a range read on one tablet, not a cross-partition scan.</li>
         <li><strong>Encryption at rest and <code>--shared-wal</code> are not reported by <code>/admin</code></strong>, so an external run records them as unknown and the publisher has to state them.</li>
         <li><strong>Nothing about the servers' hardware is detected.</strong> The tool records the client host; instance type, disk and network of the cluster are stated alongside the file.</li>
