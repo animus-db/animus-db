@@ -12079,6 +12079,45 @@ it and `Bound*Node::with_max_region_rtt` plumbs it to the control group
 `gen-config` cannot warn about a region-concentrated control set until G-a
 supplies labels.
 
+## MRSC global tables: `global_tables.rs` and `sim_cluster_mrsc` (ADR 0075, G-01 G-c)
+
+`global_tables.rs` is the `E: Env`-generic client/admin edge of MRSC (deny-
+`disallowed_methods` on its `mod` line): `update_table_global` (the wire
+conversion, shared by `run_operation` and `SimCluster`'s `dispatch_table_op`),
+`global_description` (DescribeTable fields, replica status derived), the MRSC
+restriction guards, and, since M4, `admin_global_tables_view`
+(`GET /admin/global-tables`), `admin_set_preferred_leader`
+(`POST /admin/table/preferred-leader`, relayed like a schema proposal and
+confirmed by observing `schema.global`) and the **decommission guard**
+`drain_strands_region` (`ClientCtx::admin_drain(node, force)` refuses the last
+`Active` member of a pinned Region; `force` overrides). Both admin routes have
+an `AdminHost` method (animus-node) and an arm in each of the two `impl`s in
+`admin.rs`. The dashboard needs no new fetch: `schemas.tables[t].global` is in
+`/admin/status`.
+
+`sim_cluster_mrsc.rs` (`ANIMUS_MRSC_SEEDS`, shared with `animus-cp-data`'s
+`preferred_leader_corpus`; `ANIMUS_MRSC_CELL`, `ANIMUS_SEED`): one `#[test]`
+per cell (`sim_cluster_mrsc_corpus_<cell>`, parallel under nextest) plus three
+negative controls. Harness gotchas it cost to learn:
+- **Give every node a recorded profile.** `SimCluster::restart` re-applies the
+  node's *recorded* binary profile (default `Phase1`); `set_all_node_versions`
+  alone does not record one, so a restarted node came back as a Phase 1 binary
+  that cannot decode version-2 batches and never rejoined. Call
+  `set_binary_profile(n, BinaryProfile::Release(2))` for every node.
+- **Use the LSM backend (`new_with_node_labels_lsm`) for any cell that
+  restarts a node.** With `Memory` a restarted tablet group replays an empty
+  Raft state; the issue #667 boot-time cluster check then (correctly) refuses
+  to let it vote or campaign, so a leadership transfer to it silently never
+  completes. That is right for a wiped disk, wrong for a process restart.
+- **`SimCluster` has no background split driver:** drive
+  `drive_inplace_split_cutover(node)` on every node each poll tick.
+- `await_replicas_caught_up` skips crashed nodes (a dead node's stale replica
+  is not progress); `group_states(node)` prints role@term/known leader per
+  hosted group for a convergence-timeout dump.
+- `split_under_mrsc` restarts its durability oracle after the split because of
+  issue #1229 (a split child whose replicas all move loses pre-split rows,
+  pre-existing). Remove those two lines when #1229 is fixed.
+
 ## Real-process soak (R-01 (a), `docs/soak.md`)
 
 `tests/soak.rs` (opt-in `soak` cargo feature, like `chaos`) runs the chaos
