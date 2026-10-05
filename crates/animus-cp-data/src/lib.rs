@@ -9988,6 +9988,22 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                     )
                                 }
                             };
+                        // ADR 0075 G-d M2: a replicated MREC record is never
+                        // part of a transaction (transactions are
+                        // region-local, each committed item takes a local
+                        // stamp); a stage carrying one is a deterministic
+                        // validation rejection, same structural bucket as a
+                        // failed evaluation — whether or not its stamp would
+                        // have won.
+                        if matches!(p.op, KindEvalOp::Replicate { .. }) {
+                            pending_failure = Some(txn::StageOutcome::Rejected {
+                                key: w.key.clone(),
+                                code: "ValidationException".to_owned(),
+                                message: "an MREC replicate cannot be staged in a transaction"
+                                    .to_owned(),
+                            });
+                            break 'pending_eval;
+                        }
                         let token =
                             animus_tablet::partition_token(&animus_item::storage_key(&p.pk, None));
                         match evaluate_kind_eval(
@@ -10014,11 +10030,9 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                 });
                                 break 'pending_eval;
                             }
-                            // ADR 0075 G-d M2: a replicated record is never
-                            // part of a transaction (transactions are
-                            // region-local); a stage carrying one is a
-                            // deterministic validation rejection, same
-                            // structural bucket as a failed evaluation.
+                            // Only a `Replicate` can be superseded, and one was
+                            // rejected above; kept total (never a panic in a
+                            // replicated apply) with the same rejection.
                             KindEvalDecision::Superseded { .. } => {
                                 pending_failure = Some(txn::StageOutcome::Rejected {
                                     key: w.key.clone(),

@@ -22427,6 +22427,9 @@ mod sim_cluster_dynamo;
 #[cfg(test)]
 mod sim_cluster_dynamo_corpus;
 
+/// G-01 stage G-d M2: the structural MREC writer guards (test-only).
+#[cfg(test)]
+mod mrec_writer_guard_tests;
 /// ADR 0061 rung D3 PR 1 (C-04 D3): the first batch of "B class"
 /// `ProdEnv` DynamoDB logic tests converted to `SimCluster` — base-table
 /// tests that `dynamo::dispatch_item_op` can already drive, needing no
