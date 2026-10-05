@@ -45,8 +45,11 @@
 )]
 
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use animus_control::ProposeResult;
@@ -72,6 +75,66 @@ const WORST_CONFIRM: Duration = Duration::from_millis(1500);
 /// than running until the harness kills it.
 const RUN_BUDGET: Duration = Duration::from_secs(120);
 const POLL: Duration = Duration::from_millis(5);
+/// A probe `write + fsync` slower than this marks the disk as stalled for the
+/// interval it took (a healthy `fsync` here is well under a millisecond to a
+/// few milliseconds, even under moderate contention).
+const DISK_STALL: Duration = Duration::from_millis(100);
+const PROBE_EVERY: Duration = Duration::from_millis(10);
+
+type Window = (std::time::Instant, std::time::Instant);
+
+/// Independent disk-health probe (issue #1222). Every write this test times
+/// commits through quorum `fsync`s on a *shared* filesystem, so a confirm
+/// latency is `release-path cost + however long the disk stalled`. The bound
+/// exists to catch the former (an ack released late, a lost wake) and cannot
+/// be met by any implementation when the latter is whole seconds -- CI's
+/// `prod-liveness-scattered` job runs straight after a heavy `rm -rf` on the
+/// same runner disk. This thread does nothing but `write + fsync` one byte in
+/// the same temp directory tree every 10ms on its own OS thread (independent of
+/// the tokio runtime and of the group under test) and records every interval in
+/// which one such `fsync` took >= [`DISK_STALL`]; a timed write whose window
+/// overlaps one is attributed to the disk, not to the release path.
+struct DiskProbe {
+    stalls: Arc<Mutex<Vec<Window>>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DiskProbe {
+    fn start() -> Self {
+        let dir = unique_tmp_dir();
+        let stalls = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (st, sp) = (stalls.clone(), stop.clone());
+        let thread = std::thread::spawn(move || {
+            let mut f = std::fs::File::create(dir.join("probe")).expect("probe file");
+            while !sp.load(Ordering::Relaxed) {
+                let t0 = std::time::Instant::now();
+                let _ = f.write_all(b"x");
+                let _ = f.sync_all();
+                let t1 = std::time::Instant::now();
+                if t1 - t0 >= DISK_STALL {
+                    st.lock().expect("probe lock").push((t0, t1));
+                }
+                std::thread::sleep(PROBE_EVERY);
+            }
+        });
+        Self {
+            stalls,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// Stop the probe and return every recorded stall interval.
+    fn finish(mut self) -> Vec<Window> {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+        self.stalls.lock().expect("probe lock").clone()
+    }
+}
 
 fn unique_tmp_dir() -> std::path::PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -139,24 +202,71 @@ async fn current_leader(nodes: &[KvNode], deadline: Instant) -> Option<KvNode> {
     }
 }
 
-/// Put and confirm by reading the value back. Returns how long it took, or
+/// Per-write phase timings, so a tripped latency bound is attributable to an
+/// election, a stalled commit (fsync / quorum) or a read barrier instead of
+/// just "the loop was slow" (issue #1222). Cheap: a few `Instant` reads.
+#[derive(Clone, Debug, Default)]
+struct Phases {
+    /// Start until the first leader was resolved.
+    resolve: Duration,
+    /// Time spent in `put` proposals (including retries after a rejection).
+    put_attempts: u32,
+    /// First `put` accepted (appended locally on the leader), from start.
+    accepted: Duration,
+    /// `linearizable_get` calls until the value read back, and the time the
+    /// calls spent inside the read barrier in total.
+    reads: u32,
+    read_barrier: Duration,
+    /// Accepted until the read-back returned the value (commit + apply +
+    /// barrier), i.e. the cost that a slow quorum fsync shows up in.
+    commit_to_readback: Duration,
+    /// Leader node index / term when the put was accepted and when the value
+    /// was read back; a differing pair means an election ran inside the write.
+    leader_at_put: (usize, u64),
+    leader_at_read: (usize, u64),
+    total: Duration,
+}
+
+fn leader_ix(nodes: &[KvNode]) -> (usize, u64) {
+    nodes
+        .iter()
+        .position(KvNode::is_leader)
+        .map_or((usize::MAX, 0), |i| (i, nodes[i].term()))
+}
+
+/// Put and confirm by reading the value back. Returns the phase timings, or
 /// `None` if it never confirmed inside `WRITE_BUDGET`.
-async fn put_then_confirm(nodes: &[KvNode], key: &[u8], value: &[u8]) -> Option<Duration> {
+async fn put_then_confirm(nodes: &[KvNode], key: &[u8], value: &[u8]) -> Option<Phases> {
     let start = Instant::now();
     let deadline = start + WRITE_BUDGET;
+    let mut ph = Phases::default();
     loop {
         let leader = current_leader(nodes, deadline).await?;
+        if ph.put_attempts == 0 {
+            ph.resolve = start.elapsed();
+        }
+        ph.put_attempts += 1;
         if matches!(
             leader.put(key.to_vec(), value.to_vec()),
             ProposeResult::Accepted { .. }
         ) {
+            let accepted_at = Instant::now();
+            ph.accepted = start.elapsed();
+            ph.leader_at_put = leader_ix(nodes);
             // Confirm the write actually committed and applied. Re-putting the
             // same key/value is idempotent, so a stale read just retries.
             loop {
-                if let Some(l) = current_leader(nodes, deadline).await
-                    && l.linearizable_get(key).await.as_deref() == Some(value)
-                {
-                    return Some(start.elapsed());
+                if let Some(l) = current_leader(nodes, deadline).await {
+                    let t = Instant::now();
+                    let got = l.linearizable_get(key).await;
+                    ph.reads += 1;
+                    ph.read_barrier += t.elapsed();
+                    if got.as_deref() == Some(value) {
+                        ph.commit_to_readback = accepted_at.elapsed();
+                        ph.leader_at_read = leader_ix(nodes);
+                        ph.total = start.elapsed();
+                        return Some(ph);
+                    }
                 }
                 if Instant::now() >= deadline {
                     return None;
@@ -174,14 +284,22 @@ async fn put_then_confirm(nodes: &[KvNode], key: &[u8], value: &[u8]) -> Option<
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn writes_keep_confirming_while_compaction_drains_the_wal() {
     let run_start = Instant::now();
+    let probe = DiskProbe::start();
     let (nodes, handles) = start_group().await;
 
+    // Every write's (index, window, phases), judged after the run against the
+    // probe's recorded disk stalls.
+    let mut samples: Vec<(usize, Window, Phases)> = Vec::new();
     let mut worst = Duration::ZERO;
     let mut worst_at = 0usize;
+    let mut worst_ph = Phases::default();
+    let mut term_changes = 0u32;
+    let mut last_term = leader_ix(&nodes).1;
     for i in 0..WRITES {
         let key = format!("k{i:04}").into_bytes();
         let value = vec![b'v'; 256];
-        let took = put_then_confirm(&nodes, &key, &value)
+        let w0 = std::time::Instant::now();
+        let ph = put_then_confirm(&nodes, &key, &value)
             .await
             .unwrap_or_else(|| {
                 panic!(
@@ -190,9 +308,20 @@ async fn writes_keep_confirming_while_compaction_drains_the_wal() {
                  exactly like this (worst confirm so far: {worst:?} at write {worst_at})"
                 )
             });
+        let took = ph.total;
+        samples.push((i, (w0, std::time::Instant::now()), ph.clone()));
+        if ph.leader_at_read.1 != last_term {
+            term_changes += 1;
+            eprintln!("write {i}: term {last_term} -> {:?}", ph.leader_at_read);
+            last_term = ph.leader_at_read.1;
+        }
+        if took > Duration::from_millis(250) {
+            eprintln!("slow write {i}: {ph:?}");
+        }
         if took > worst {
             worst = took;
             worst_at = i;
+            worst_ph = ph;
         }
         assert!(
             run_start.elapsed() < RUN_BUDGET,
@@ -216,12 +345,52 @@ async fn writes_keep_confirming_while_compaction_drains_the_wal() {
          longer holds"
     );
 
+    // Attribute each write: one whose window overlaps a probe `fsync` stall
+    // is charged to the disk and judged only against `WRITE_BUDGET` (it must
+    // still confirm); every other write must beat `WORST_CONFIRM`. A lost
+    // wake or a late ack release strands a write with a *healthy* disk, so it
+    // lands in the second class and still fails the bound.
+    let stalls = probe.finish();
+    let mut disk_attributed = 0usize;
+    let mut worst_clean = Duration::ZERO;
+    let mut worst_clean_at = 0usize;
+    let mut worst_clean_ph = Phases::default();
+    for (i, (w0, w1), ph) in &samples {
+        let overlap = stalls
+            .iter()
+            .filter(|(a, b)| a < w1 && w0 < b)
+            .map(|(a, b)| *b - *a)
+            .max();
+        if let Some(stall) = overlap {
+            disk_attributed += 1;
+            eprintln!(
+                "write {i}: confirm {:?} overlapped a {stall:?} probe fsync stall -> \
+                 attributed to the disk",
+                ph.total
+            );
+        } else if ph.total > worst_clean {
+            worst_clean = ph.total;
+            worst_clean_at = *i;
+            worst_clean_ph = ph.clone();
+        }
+    }
+
     // Printed (visible with `--nocapture`) so a CI log of a near-miss shows how
     // close the run came to the limit.
-    eprintln!("worst confirm: {worst:?} at write {worst_at} (limit {WORST_CONFIRM:?})");
+    eprintln!(
+        "worst confirm overall: {worst:?} at write {worst_at}; worst on a healthy \
+         disk: {worst_clean:?} at write {worst_clean_at} (limit {WORST_CONFIRM:?}); \
+         {disk_attributed}/{WRITES} writes overlapped a disk stall ({} probe stalls); \
+         term changes during writes: {term_changes}; phases of the worst write: {worst_ph:?}",
+        stalls.len()
+    );
     assert!(
-        worst < WORST_CONFIRM,
-        "worst confirm was {worst:?} at write {worst_at} (limit {WORST_CONFIRM:?})"
+        worst_clean < WORST_CONFIRM,
+        "worst confirm on a healthy disk was {worst_clean:?} at write {worst_clean_at} \
+         (limit {WORST_CONFIRM:?}); term changes during writes: {term_changes}; phases: \
+         {worst_clean_ph:?}; overall worst {worst:?} at write {worst_at} (phases \
+         {worst_ph:?}); {disk_attributed} writes attributed to {} probe disk stalls",
+        stalls.len()
     );
     for node in &nodes {
         node.shutdown();
