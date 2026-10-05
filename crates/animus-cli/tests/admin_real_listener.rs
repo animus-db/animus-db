@@ -212,10 +212,17 @@ async fn roll_commands_work(addr: SocketAddr, ca: Option<&Path>) {
     assert!(status.contains("next:"), "{status}");
     // A one-node cluster cannot hand its control leadership to anyone, so the
     // plan is refused (exit 1) by name; the cluster state is still printed.
+    // (Once the node is seen on the new binary, via its recorded range or its
+    // own `cluster-version` probe, there is nothing to restart at all.)
     let plan = run_cli_stdout_until(
         ["cluster", "roll", "plan", &a].map(String::from).to_vec(),
         ca,
-        |s| s.contains("nodes:") && (s.contains("refused:") || s.contains("roll order:")),
+        |s| {
+            s.contains("nodes:")
+                && (s.contains("refused:")
+                    || s.contains("roll order:")
+                    || s.contains("nothing to restart"))
+        },
     )
     .await;
     assert!(plan.contains("cluster version: active"), "{plan}");

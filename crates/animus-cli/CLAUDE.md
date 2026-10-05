@@ -506,7 +506,12 @@ here and no state is stored (re-running is always safe).
   the machine's next step.
 - Every node's health is the asked node's one verdict (cluster-wide clauses are the
   same anywhere); a node is "on the new binary" iff its recorded range max reaches
-  `active + 1` (the platform fact is not visible to the CLI). A previous-release node
+  `active + 1` (the platform fact is not visible to the CLI). **Before the era no node
+  has a recorded range**, so `fetch_snapshot` probes every node the view still calls old
+  (`probe_nodes`/`apply_probes`: address from `/admin/status` `node_addrs`, its own
+  `GET /admin/cluster-version`, 3 s bound; `own_range.max >= goal` = new, 404/unreachable
+  = old) which makes `plan` re-entrant mid-roll over Phase 1; `roll-health` is taken from
+  the asked node, else from a probed new node. A previous-release node
   (no `cluster-version`, 404) falls back to `/admin/status` (`legacy_view`): members and
   roles, every node old, health `Unavailable`.
 - Tests: pure unit tests in `roll.rs`; `tests/roll_cli.rs` drives the real binary against

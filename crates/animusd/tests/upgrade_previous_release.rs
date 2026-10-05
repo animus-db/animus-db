@@ -672,13 +672,12 @@ async fn roll_scenario(
 
     // ---- the roll, as the runbook says --------------------------------------------
     let mut steps: Vec<Value> = Vec::new();
-    // The plan is taken ONCE, over the Phase-1 cluster, and followed in order.
-    // It cannot be re-asked mid-roll: until the version era starts (after the
-    // last member is on the new binary) no node has a recorded range, so a
-    // second `roll plan` over a half-rolled R-1 -> R cluster still lists every
-    // node as "old" (see the report: `plan` is not re-entrant for the first
-    // Phase 1 -> Phase 2 roll). `roll wait` is judged from the restarted node's
-    // own range and does work step by step.
+    // The plan is taken over the Phase-1 cluster and followed in order; after
+    // every step it is asked again (from a node that is up) and must name
+    // exactly the steps that are left: `plan` is re-entrant mid-roll because
+    // it probes each node's own `cluster-version` (before the era starts no
+    // node has a recorded range). `roll wait` is judged from the restarted
+    // node's own range.
     let admin0 = c.nodes[0].admin.to_string();
     let order: Vec<Value> = if control.is_some() {
         // No plan to take: followers in index order, node 0 last.
@@ -808,6 +807,41 @@ async fn roll_scenario(
         row["restart_to_healthy_ms"] = json!(healthy_after.saturating_sub(down).as_millis() as u64);
         eprintln!("upgrade[{name}]: step {id}: {row}");
         steps.push(row);
+        if control.is_none() {
+            // Re-entrancy: a fresh plan, asked of a node that is up, lists
+            // exactly the restarts still to do (the not-yet-rolled nodes).
+            let left: Vec<String> = order
+                .iter()
+                .skip_while(|st| st["node"].as_str() != Some(id.as_str()))
+                .skip(1)
+                .filter(|st| st["action"] == "restart")
+                .map(|st| st["node"].as_str().expect("node").to_string())
+                .collect();
+            let asked = c.nodes[i].admin.to_string();
+            let p: Value = poll_until("re-plan accepted", Duration::from_secs(120), || async {
+                let (_, out, err) =
+                    cli(&refs.cli, &["cluster", "roll", "plan", &asked, "--json"]).await;
+                let p: Value = serde_json::from_str(out.trim())
+                    .map_err(|e| format!("re-plan output is not JSON ({e}): {out} {err}"))?;
+                if p["ok"] != true {
+                    return Err(format!("re-plan refused: {}", p["refused"]));
+                }
+                Ok(p)
+            })
+            .await;
+            let got: Vec<String> = p["steps"]
+                .as_array()
+                .map(|v| v.as_slice())
+                .unwrap_or_default()
+                .iter()
+                .filter(|st| st["action"] == "restart")
+                .map(|st| st["node"].as_str().expect("node").to_string())
+                .collect();
+            assert_eq!(
+                got, left,
+                "re-plan after rolling {id} must list exactly the remaining nodes: {p}"
+            );
+        }
         // Let repair settle so its traffic is attributed to this step, and
         // give the workload a window on the new mix before the next one.
         tokio::time::sleep(Duration::from_secs(8)).await;
@@ -863,6 +897,18 @@ async fn roll_scenario(
             },
         )
         .await;
+        // Post-era: nothing is left to restart.
+        let (_, out, err) = cli(
+            &refs.cli,
+            &["cluster", "roll", "plan", &leader_admin, "--json"],
+        )
+        .await;
+        let p: Value = serde_json::from_str(out.trim())
+            .unwrap_or_else(|e| panic!("final plan output is not JSON ({e}): {out} {err}"));
+        assert!(
+            p["steps"].as_array().is_none_or(|v| v.is_empty()),
+            "a plan after finalize must be empty: {p}"
+        );
         target_v
     };
     // The workload runs on across the finalize.

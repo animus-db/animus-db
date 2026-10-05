@@ -253,6 +253,54 @@ fn plan_on_a_phase1_cluster_uses_admin_status() {
 }
 
 #[test]
+fn plan_mid_roll_over_a_pre_era_cluster_skips_nodes_already_on_the_new_binary() {
+    // Pre-era: no node has a recorded range, so the replicated view calls all
+    // of them old. Each node's own admin endpoint tells the truth: a node on
+    // the new binary answers `cluster-version` with its own range, a previous
+    // release answers 404. Nodes: n0 (the asked node, old), n1 (new), n2 (old).
+    let new_node = |own: &'static str| {
+        fake(Box::new(move |_m, path, _b| match path {
+            "/admin/cluster-version" => (
+                200,
+                json!({"era_active": false, "active": 0, "own_range": {"min": 1, "max": 2},
+                       "own_build": own, "nodes": []}),
+            ),
+            "/admin/roll-health" => (200, health_ok(own)),
+            _ => (404, json!({"error": "not found"})),
+        }))
+    };
+    let old_node = || fake(Box::new(|_m, _p, _b| (404, json!({"error": "not found"}))));
+    let n1 = new_node("n1");
+    let n2 = old_node();
+    let n1_addr = n1.addr.to_string();
+    let n2_addr = n2.addr.to_string();
+    let main = fake(Box::new(move |_m, path, _b| match path {
+        "/admin/status" => (
+            200,
+            json!({"members": {"n0": {"status": "Active"}, "n1": {"status": "Active"}, "n2": {"status": "Active"}},
+                   "node_addrs": {"n0": {"role": "combined", "admin": "127.0.0.1:1"},
+                                  "n1": {"role": "combined", "admin": n1_addr},
+                                  "n2": {"role": "combined", "admin": n2_addr}}}),
+        ),
+        "/admin/raft" => (200, json!({"leader": "n0"})),
+        _ => (404, json!({"error": "not found"})),
+    }));
+    let o = run(&["cluster", "roll", "plan", &main.addr.to_string(), "--json"]);
+    assert!(o.status.success(), "{} {}", out(&o), err(&o));
+    let p: Value = serde_json::from_str(out(&o).trim()).unwrap();
+    let order: Vec<&str> = p["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["action"] == "restart")
+        .map(|s| s["node"].as_str().unwrap())
+        .collect();
+    // n1 is already on the new binary: only n2 then the leader n0 remain.
+    assert_eq!(order, ["n2", "n0"], "{p}");
+    assert_eq!(n1.count("GET", "/admin/cluster-version"), 1);
+}
+
+#[test]
 fn wait_blocks_until_healthy_and_reports_the_next_node() {
     // roll-health: not ok twice (catching up), then ok.
     let polls = Arc::new(Mutex::new(0u32));

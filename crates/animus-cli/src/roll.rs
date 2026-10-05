@@ -17,6 +17,7 @@
 //! `cluster-version` endpoint: the view is then built from `/admin/status`
 //! (members, roles) and every node counts as not yet on the new binary.
 
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use animus_roll::json::{Inputs, observation, parse_health};
@@ -32,6 +33,8 @@ binary; a bad roll is fixed forward (see docs/runbook/upgrade.md).";
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(2);
+/// Bound on one per-node `cluster-version` probe (a restarting node must not stall `plan`).
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum RollCmd {
@@ -218,6 +221,35 @@ pub(crate) fn legacy_view(status: &Value) -> Value {
         "can_finalize": false,
         "legacy": true,
     })
+}
+
+/// Fold per-node probes into `view`: `probes` maps a node id to the body that
+/// node's own `GET /admin/cluster-version` returned. Before the version era
+/// starts no node has a *recorded* range, so the replicated view calls every
+/// node old; a node that answers its own endpoint with `own_range.max` at the
+/// goal is running the new binary (a Phase 1 binary has no such endpoint), so
+/// its range is filled in from its own answer. A node the view already places
+/// on the new binary is left alone.
+pub(crate) fn apply_probes(view: &mut Value, probes: &BTreeMap<String, Value>) {
+    let goal = goal_of(view);
+    let Some(nodes) = view["nodes"].as_array_mut() else {
+        return;
+    };
+    for n in nodes {
+        if on_new(n, goal) {
+            continue;
+        }
+        let Some(own) = node_id(n)
+            .and_then(|id| probes.get(id))
+            .map(|b| &b["own_range"])
+        else {
+            continue;
+        };
+        if own["max"].as_u64().is_some_and(|m| m >= u64::from(goal)) {
+            n["range"] = own.clone();
+            n["probed"] = json!(true);
+        }
+    }
 }
 
 // ---- plan (pure) ------------------------------------------------------------
@@ -652,11 +684,22 @@ async fn fetch_snapshot(
             ));
         }
     };
-    let (health, health_body) = match get_json(addr, "/admin/roll-health", tls).await {
-        Ok((200..=299, Some(b))) => (parse_health(&b), Some(b)),
-        Ok(_) => (Health::Unavailable, None),
-        Err(_) => (Health::Unreachable, None),
-    };
+    let (view, new_admins) = probe_nodes(addr, view, tls).await;
+    // The verdict is cluster-wide, so any node on the new binary can give it:
+    // the asked node first, then the nodes the probes found on the new binary
+    // (a previous-release node has no `roll-health`).
+    let (mut health, mut health_body) = (Health::Unavailable, None);
+    for a in std::iter::once(addr.to_string()).chain(new_admins) {
+        match get_json(&a, "/admin/roll-health", tls).await {
+            Ok((200..=299, Some(b))) => {
+                (health, health_body) = (parse_health(&b), Some(b));
+                break;
+            }
+            Ok(_) => {}
+            Err(_) if a == addr => health = Health::Unreachable,
+            Err(_) => {}
+        }
+    }
     let leader = match get_json(addr, "/admin/raft", tls).await {
         Ok((200..=299, Some(r))) => r["leader"].as_str().map(str::to_string),
         _ => None,
@@ -667,6 +710,49 @@ async fn fetch_snapshot(
         health_body,
         leader,
     })
+}
+
+/// Ask every node the view still calls old for its own `cluster-version` (see
+/// [`apply_probes`]); a node that is down, or a previous-release binary (404),
+/// stays old. Best effort: an unreadable `/admin/status` leaves the view as is.
+/// Also returns the admin addresses of the nodes found on the new binary.
+async fn probe_nodes(
+    addr: &str,
+    mut view: Value,
+    tls: Option<&tokio_rustls::TlsConnector>,
+) -> (Value, Vec<String>) {
+    let goal = goal_of(&view);
+    let old: Vec<String> = view["nodes"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .filter(|n| !on_new(n, goal))
+        .filter_map(|n| node_id(n).map(str::to_string))
+        .collect();
+    if old.is_empty() {
+        return (view, Vec::new());
+    }
+    let Ok((200..=299, Some(status))) = get_json(addr, "/admin/status", tls).await else {
+        return (view, Vec::new());
+    };
+    let mut probes = BTreeMap::new();
+    let mut new_admins = Vec::new();
+    for id in old {
+        let Some(admin) = status["node_addrs"][&id]["admin"].as_str() else {
+            continue;
+        };
+        let probe = tokio::time::timeout(
+            PROBE_TIMEOUT,
+            get_json(admin, "/admin/cluster-version", tls),
+        )
+        .await;
+        if let Ok(Ok((200..=299, Some(body)))) = probe {
+            new_admins.push(admin.to_string());
+            probes.insert(id, body);
+        }
+    }
+    apply_probes(&mut view, &probes);
+    (view, new_admins)
 }
 
 /// The control leader's admin address: its id from this node's `/admin/raft`,
@@ -858,6 +944,32 @@ mod tests {
         assert!(parse_roll_args(&args(&["wait", "h:1", "--finalize"])).is_err());
         assert!(parse_roll_args(&args(&["wait", "h:1", "--yes"])).is_err());
         assert!(parse_roll_args(&args(&["wait", "h:1", "--finalize", "--yes"])).is_ok());
+    }
+
+    #[test]
+    fn probes_place_pre_era_new_nodes_on_the_new_range() {
+        // Before the era no node has a recorded range: all four look old.
+        let mut v = view(0, [None; 4], ["Active"; 4]);
+        // b answered its own endpoint with a range reaching the goal (1);
+        // c's answer is for an older range; a/d did not answer.
+        let probes = BTreeMap::from([
+            ("b".to_string(), json!({"own_range": {"min": 1, "max": 2}})),
+            ("c".to_string(), json!({"own_range": {"min": 1, "max": 0}})),
+        ]);
+        apply_probes(&mut v, &probes);
+        let obs = build_observation(&v, &Health::Ok, Some("a"), None).unwrap();
+        let PlanOutcome::Steps(steps) = plan(&obs) else {
+            panic!("expected steps")
+        };
+        let order: Vec<&str> = steps
+            .iter()
+            .filter_map(|s| match s {
+                PlanStep::Restart { node, .. } => Some(node.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(!order.contains(&"b"), "{order:?}");
+        assert!(order.contains(&"c") && order.contains(&"d") && order.contains(&"a"));
     }
 
     #[test]

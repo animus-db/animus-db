@@ -12152,9 +12152,11 @@ variants (SIGTERM+transfer on 3 nodes; the same on 4 nodes with a restart gap
 past the 5 s repair dwell, which is the **D4 repair-churn measurement**; SIGKILL
 of the control leader; SIGKILL + a torn control/shared WAL tail). **Gotchas**:
 with the feature on a missing R-1 binary **panics** (never skips: a skipped
-cross-version job is a silent pass); `roll plan` is taken once, over the Phase 1
-cluster, and followed in order (it is not re-entrant mid-roll over Phase 1
-binaries, no node has a recorded range until the era starts); a node restarted
+cross-version job is a silent pass); `roll plan` is taken over the Phase 1
+cluster and re-asked after every step (it is re-entrant: before the era no node
+has a recorded range, so the CLI probes each node's own `cluster-version`; the
+test asserts the re-plan lists exactly the remaining nodes, and is empty after
+finalize); a node restarted
 for less than the repair dwell causes no churn even with a spare node, so the
 measurement needs `ANIMUS_UPGRADE_FROM_RESTART_GAP_SECS`; a write the client
 timed out on can commit after the workload stopped, so "unchanged after a
