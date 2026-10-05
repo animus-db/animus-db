@@ -1495,6 +1495,8 @@ outstanding on the wire surface at present.
 
 ### C-16 Upgrade compatibility (ADR 0073) — Phases 0 and 1 done; Phase 2 in progress (P2-A and P2-C landed)
 
+- **Phase 3 design (PROPOSED, 2026-10-05):** rolling-upgrade orchestration (`animus cluster roll`, a server-side `roll-health` signal, operator `spec.image` roll via StatefulSet `partition`, opt-in auto-finalize, previous-release cross-version CI) is designed in [ADR 0073's "Phase 3 design" amendment](adr/0073-upgrade-compatibility.md); workstreams P3-A..P3-G, open questions for the maintainer listed there.
+
 - **Gap (closed):** `website/index.html` listed "On-disk format stability,
   then rolling upgrades" as Planned with no ADR, roadmap entry, or issue
   behind it. [ADR 0073](adr/0073-upgrade-compatibility.md) is now
