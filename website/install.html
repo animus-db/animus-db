@@ -441,7 +441,10 @@ table.put_item(Item={<span class="s">"id"</span>: <span class="s">"a-2"</span>, 
           To update AnimusDB, stop every node, install the new version, and start them all again;
           on-disk formats are readable across versions and this path is tested. Do not run two
           versions in one cluster (even briefly): the node-to-node wire has no cross-version
-          compatibility yet, so a rolling, node-by-node upgrade is not supported.
+          compatibility yet, so a rolling, node-by-node upgrade is not supported. Rolling
+          upgrade is in progress: nodes already report the cluster versions they support
+          (<code>animus cluster version</code>), but the mixed-version gates and their test
+          corpus have not landed.
         </p>
       </div>
     </section>

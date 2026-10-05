@@ -176,6 +176,7 @@ async fn bring_up_split_durable(
                     advertise_host: None,
                     tls: None,
                     encryption_key_path: None,
+                    overload: None,
                 }
             })
             .collect();

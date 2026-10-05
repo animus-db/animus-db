@@ -30,6 +30,109 @@ use serde::{Deserialize, Serialize};
 
 use crate::RoleAddrs;
 
+/// Default [`OverloadSection::max_connections`]: concurrent connections the
+/// DynamoDB listener holds before shedding (R-01 (d), ADR 0074 §2).
+pub const DEFAULT_MAX_CONNECTIONS: usize = 4096;
+/// Default [`OverloadSection::max_inflight_requests`]: DynamoDB requests a
+/// node executes concurrently before shedding with `ServiceUnavailable`.
+/// Deliberately below [`DEFAULT_MAX_CONNECTIONS`]: a connection serves one
+/// request at a time, so a bound at or above the connection cap could never
+/// fire.
+pub const DEFAULT_MAX_INFLIGHT_REQUESTS: usize = 2048;
+/// Default [`OverloadSection::max_admin_connections`], applied to the admin
+/// and the console listener each.
+pub const DEFAULT_MAX_ADMIN_CONNECTIONS: usize = 256;
+/// Default [`OverloadSection::max_peer_connections`], applied to the
+/// client-protocol and the intra-cluster listener each. A safety backstop,
+/// far above any real cluster's peer count.
+pub const DEFAULT_MAX_PEER_CONNECTIONS: usize = 16_384;
+
+/// Per-node resource bounds and overload limits (R-01 sub-track (d), ADR
+/// 0074 §2): every field is `None` = the matching `DEFAULT_MAX_*` constant;
+/// **`0` is rejected** (the DynamoDB port has no "unlimited" setting, and a
+/// zero cap would refuse every connection). Absent from a config (every
+/// pre-existing one) means all defaults. Per-node, like `tls` — each node
+/// sheds on its own load. CLI: `--max-connections`/`--max-inflight`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OverloadSection {
+    /// Max concurrent connections on the DynamoDB listener; the next one is
+    /// answered `503 ServiceUnavailable` and closed.
+    #[serde(default)]
+    pub max_connections: Option<usize>,
+    /// Max DynamoDB requests executing at once on this node; one more is
+    /// answered `503 ServiceUnavailable` immediately (never queued).
+    #[serde(default)]
+    pub max_inflight_requests: Option<usize>,
+    /// Max concurrent connections on each of the admin and console
+    /// listeners.
+    #[serde(default)]
+    pub max_admin_connections: Option<usize>,
+    /// Max concurrent connections on each of the client-protocol and intra
+    /// listeners (peers and the CLI); an excess connection is closed.
+    #[serde(default)]
+    pub max_peer_connections: Option<usize>,
+}
+
+impl OverloadSection {
+    /// Reject a zero bound (see the type's doc).
+    ///
+    /// # Errors
+    /// A message naming the zero field.
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, v) in [
+            ("max_connections", self.max_connections),
+            ("max_inflight_requests", self.max_inflight_requests),
+            ("max_admin_connections", self.max_admin_connections),
+            ("max_peer_connections", self.max_peer_connections),
+        ] {
+            if v == Some(0) {
+                return Err(format!(
+                    "overload.{name} must be at least 1 (there is no \"unlimited\" setting)"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The resolved limits, defaults filled in.
+    #[must_use]
+    pub fn resolve(section: Option<&Self>) -> ResolvedLimits {
+        let s = section.cloned().unwrap_or_default();
+        ResolvedLimits {
+            max_connections: s.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS),
+            max_inflight_requests: s
+                .max_inflight_requests
+                .unwrap_or(DEFAULT_MAX_INFLIGHT_REQUESTS),
+            max_admin_connections: s
+                .max_admin_connections
+                .unwrap_or(DEFAULT_MAX_ADMIN_CONNECTIONS),
+            max_peer_connections: s
+                .max_peer_connections
+                .unwrap_or(DEFAULT_MAX_PEER_CONNECTIONS),
+        }
+    }
+}
+
+/// [`OverloadSection`] with every default filled in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolvedLimits {
+    /// See [`OverloadSection::max_connections`].
+    pub max_connections: usize,
+    /// See [`OverloadSection::max_inflight_requests`].
+    pub max_inflight_requests: usize,
+    /// See [`OverloadSection::max_admin_connections`].
+    pub max_admin_connections: usize,
+    /// See [`OverloadSection::max_peer_connections`].
+    pub max_peer_connections: usize,
+}
+
+impl Default for ResolvedLimits {
+    fn default() -> Self {
+        OverloadSection::resolve(None)
+    }
+}
+
 /// The conventional (unpadded) node id for config index `index` — `"n{index}"`
 /// (ADR 0040 PR3: `NodeId` is now a validated string, not an arithmetic
 /// `u64`). This is the *default minting convention* every generator in this
@@ -467,6 +570,7 @@ impl ClusterConfig {
                     advertise_host: None,
                     tls: None,
                     encryption_key_path: None,
+                    overload: None,
                 }
             })
             .collect();
@@ -506,6 +610,7 @@ impl ClusterConfig {
                     advertise_host: None,
                     tls: None,
                     encryption_key_path: None,
+                    overload: None,
                 }
             })
             .collect();
@@ -660,6 +765,11 @@ impl ClusterConfig {
             auth.validate().map_err(ConfigError::Invalid)?;
         }
         cfg.validate_tls().map_err(ConfigError::Invalid)?;
+        for n in &cfg.nodes {
+            if let Some(o) = &n.overload {
+                o.validate().map_err(ConfigError::Invalid)?;
+            }
+        }
         Ok(cfg)
     }
 
@@ -703,6 +813,26 @@ impl ClusterConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn overload_section_rejects_zero_and_unknown_fields_and_fills_defaults() {
+        let zero = OverloadSection {
+            max_connections: Some(0),
+            ..Default::default()
+        };
+        assert!(zero.validate().unwrap_err().contains("max_connections"));
+        assert!(
+            serde_json::from_str::<OverloadSection>(r#"{"max_conns": 1}"#).is_err(),
+            "a misspelled key must not silently mean the default"
+        );
+        let r = OverloadSection::resolve(Some(&OverloadSection {
+            max_inflight_requests: Some(7),
+            ..Default::default()
+        }));
+        assert_eq!(r.max_inflight_requests, 7);
+        assert_eq!(r.max_connections, DEFAULT_MAX_CONNECTIONS);
+        assert_eq!(OverloadSection::resolve(None), ResolvedLimits::default());
+    }
+
     use super::*;
 
     #[test]

@@ -959,12 +959,31 @@ pub enum Metric {
     /// sustained non-zero value needs an operator (`/admin/raftkv`'s
     /// per-group `refused_as_voter` names which tablet).
     CpGroupsRefusedAsVoter,
+
+    // --- Overload shedding (R-01 (d), ADR 0074 §2; appended, same slot-stability
+    // discipline) --- One counter per refusal reason; recorded by `animusd`'s
+    // listeners (`overload` module). A shed is always a prompt refusal, never a
+    // queue, so these are the only trace an operator has of load being turned away.
+    /// A new connection on the DynamoDB listener was refused (answered
+    /// `503 ServiceUnavailable` and closed, or closed outright) because the
+    /// listener was at its `max_connections` cap. Reason `conn_cap`.
+    OverloadShedConnCap,
+    /// A DynamoDB request was answered `503 ServiceUnavailable` immediately
+    /// because the node was already executing `max_inflight_requests`
+    /// requests. Reason `admission`.
+    OverloadShedAdmission,
+    /// A new connection on the admin or console listener was refused because
+    /// that listener was at its `max_admin_connections` cap.
+    OverloadShedAdminConnCap,
+    /// A new connection on the client-protocol or intra listener was closed
+    /// because that listener was at its `max_peer_connections` cap.
+    OverloadShedPeerConnCap,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 110] = [
+    pub const ALL: [Metric; 114] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -1075,6 +1094,10 @@ impl Metric {
         Metric::CpRemovalNoticesIgnored,
         Metric::CpDepartingPeersDropped,
         Metric::CpGroupsRefusedAsVoter,
+        Metric::OverloadShedConnCap,
+        Metric::OverloadShedAdmission,
+        Metric::OverloadShedAdminConnCap,
+        Metric::OverloadShedPeerConnCap,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -1192,6 +1215,10 @@ impl Metric {
             Metric::CpRemovalNoticesIgnored => "cp_removal_notices_ignored",
             Metric::CpDepartingPeersDropped => "cp_departing_peers_dropped",
             Metric::CpGroupsRefusedAsVoter => "cp_groups_refused_as_voter",
+            Metric::OverloadShedConnCap => "overload_shed_conn_cap",
+            Metric::OverloadShedAdmission => "overload_shed_admission",
+            Metric::OverloadShedAdminConnCap => "overload_shed_admin_conn_cap",
+            Metric::OverloadShedPeerConnCap => "overload_shed_peer_conn_cap",
         }
     }
 

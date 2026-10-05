@@ -775,11 +775,11 @@ each confirmed red-before/green-after by temporarily reverting the fix).
   closed-gate message (error + counter + debug_assert) and otherwise returns the
   **same bytes** as `encode_client_frame`, which is unchanged (animusd's generic
   `write_frame` still uses it until P2-C switches).
-- `is_relayable_command`: `ReportNodeVersion` and `FinalizeClusterVersion` are now
-  relayable (data-only boot self-report; admin Finalize over `ProposeSchema`). They
-  are era-only: the relay *receiver* in `animusd` must check `required_gate` against
-  its own `ClusterFeatures` before proposing (P2-C), since a Phase 1 receiver cannot
-  decode them at all.
+- `is_relayable_command`: `ReportNodeVersion` is relayable (data-only boot
+  self-report); `FinalizeClusterVersion` is NOT (P2-C: leader-local admin action;
+  P2-B had drafted it as relayable). Both are era-only: the relay *receiver* in
+  `animusd` must check `required_gate` against its own `ClusterFeatures` before
+  proposing, since a Phase 1 receiver cannot decode them at all.
 - `SimRelayClient` (`sim_relay.rs`) does **not** gate its `RelayWire` encode: it is a
   sim-only `RelayClient` stand-in with no feature handle in reach, and the production
   relay sender is `animusd`'s, which uses the gated encoder from P2-C.
@@ -787,3 +787,13 @@ each confirmed red-before/green-after by temporarily reverting the fix).
   variant) is **Phase 1 bytes generated from commit `941a5ea`**; `tests/it/format_fixtures.rs`
   holds the byte-identity, exhaustiveness and gate-pin tests.
 
+## ADR 0073 Phase 2 (P2-C) additions
+
+`is_relayable_command`: `ReportNodeVersion => true` (boot-time self-report from a
+follower-connected or data-only node must reach the leader; `FinalizeClusterVersion`
+stays `false`, a leader-local admin action). `ClientResponse::JoinInfo` gained an
+additive `cluster_version: u32` (`#[serde(default, skip_serializing_if = "is_zero_u32")]`:
+the raw `Metadata::cluster_version`, 0 pre-era so pre-era bytes equal Phase 1's). `AdminHost`
+gained `cluster_version_view` and `action_finalize_cluster_version` (routes
+`GET /admin/cluster-version`, `POST /admin/cluster-version/finalize`); both `animusd`
+impls (`ClientCtx`, `GenericAdminHost`) implement them.

@@ -465,3 +465,17 @@ DynamoDB wire suites, and `/admin/data/seed`'s own server-side proxy
 behavior (the same operation, driven from the dashboard instead of this
 CLI) is covered by `animusd`'s `tests/admin_endpoint.rs`/
 `sim_cluster_admin_actions.rs`.
+
+## `cluster version` / `cluster finalize` (ADR 0073 Phase 2, P2-C)
+
+A top-level `cluster` group (admin-port commands like `seed`, so the address is an
+**admin** address; `--tls-ca` applies as everywhere). `cluster version <admin-addr>
+[--json]` prints a human summary of `GET /admin/cluster-version` (active version,
+this binary's range, safe target, per-node range/build/status, blockers).
+`cluster finalize <leader-admin-addr> [--to N] [--yes]` fetches the view, shows it,
+aborts with the named blockers if it cannot finalize (`--to` must be `active + 1`),
+requires `--yes` (finalize cannot be undone; never an interactive prompt), POSTs
+`{to, expected}`, then polls until the new version is observed. A non-leader's 409
+names the leader to retry on. Pure, unit-tested pieces: `parse_finalize_args`,
+`format_cluster_version`, `finalize_preflight`; no socket tests (this crate has no
+integration tree).

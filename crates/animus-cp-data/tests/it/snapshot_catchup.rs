@@ -189,8 +189,8 @@ fn snapshot_catchup_carries_txn_records_and_intents() {
     // including the just-caught-up follower, via its `InstallSnapshot`
     // image, not the (already-truncated) log tail. `local_get` reports a
     // `Pending` intent as absent (its documented, non-blocking-peek
-    // contract), so confirm the *raw* stored bytes instead: tag `1`
-    // (`Envelope::Intent`, `txn.rs`), never a bare/undecorated value.
+    // contract), so confirm the *raw* stored bytes instead: tag `2`
+    // (`Envelope::Intent`, `txn-envelope` v2, `txn.rs`), never a bare/undecorated value.
     let raw = block_on(
         nodes[lagging]
             .storage()
@@ -200,9 +200,9 @@ fn snapshot_catchup_carries_txn_records_and_intents() {
     .unwrap_or_else(|| panic!("follower {lagging} missing the staged intent (seed={seed})"));
     assert_eq!(
         raw.value.first().copied(),
-        Some(1u8),
+        Some(2u8),
         "follower {lagging}'s snapshot-caught-up copy of the staged key must still be \
-         an intent envelope (tag 1), not a bare value or absent (seed={seed})"
+         an intent envelope (tag 2), not a bare value or absent (seed={seed})"
     );
 
     // Resolving the transaction now converges normally on every replica,

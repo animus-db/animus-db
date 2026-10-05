@@ -265,6 +265,17 @@ use animus_env::NodeId;
 use animusd::config::TlsSection;
 use animusd::{ClusterConfig, RoleAddrs};
 
+/// `sysexits.h` `EX_CONFIG`: the exit code of a version halt (ADR 0073
+/// Phase 2, P2-C) — the binary and the cluster's version disagree.
+const EX_CONFIG: u8 = 78;
+
+/// The reason a running node latched a version halt, set by
+/// [`wait_for_shutdown`] and read by `main` to pick the exit code. A
+/// write-once cell in the process-boundary binary (never in a library
+/// crate), deliberately not threaded through every `run_*`'s `Result<(),
+/// String>`: those map every `Err` to "usage".
+static VERSION_HALT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -291,6 +302,16 @@ async fn main() -> ExitCode {
         && let Err(err) = provider.shutdown()
     {
         tracing::warn!(%err, "failed to flush OpenTelemetry tracer provider on exit");
+    }
+
+    // ADR 0073 Phase 2 (P2-C): a node whose binary's version range does not
+    // contain the cluster's version exits loudly with a named code and NO
+    // usage text (the cause is the cluster/binary pairing, not the command
+    // line); under Kubernetes this is the intended CrashLoopBackOff.
+    if let Some(reason) = VERSION_HALT.get() {
+        eprintln!("animusd: FATAL: {reason}");
+        tracing::error!(%reason, "exiting: this binary does not support the cluster version");
+        return ExitCode::from(EX_CONFIG);
     }
 
     match result {
@@ -587,6 +608,11 @@ async fn run(args: &[String]) -> Result<(), String> {
     // dev-only path has no per-node config entries to apply the flag to,
     // the same posture `--tls-*` has there.
     let mut encryption_key_path: Option<String> = None;
+    // `--max-connections N` / `--max-inflight N` (R-01 (d), ADR 0074 §2): this
+    // node's DynamoDB connection cap and in-flight request bound; see
+    // `animusd::config::OverloadSection`. Omitted: the documented defaults.
+    let mut max_connections: Option<usize> = None;
+    let mut max_inflight: Option<usize> = None;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -676,10 +702,17 @@ async fn run(args: &[String]) -> Result<(), String> {
             "--encryption-key" => {
                 encryption_key_path = Some(parse_next(&mut it, "--encryption-key")?);
             }
+            "--max-connections" => {
+                max_connections = Some(parse_next(&mut it, "--max-connections")?);
+            }
+            "--max-inflight" => {
+                max_inflight = Some(parse_next(&mut it, "--max-inflight")?);
+            }
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
     let tls_flag = resolve_tls_flags(tls_cert, tls_key, tls_ca)?;
+    let overload_flag = resolve_overload_flags(max_connections, max_inflight)?;
     // S-06: the raw (un-defaulted) CLI values for every knob
     // `animusd::config::ClusterSettings` can also carry in a config file's
     // own `cluster_settings` section — `--config`/`--node`'s dispatch below
@@ -758,6 +791,14 @@ async fn run(args: &[String]) -> Result<(), String> {
                  whose own node entries carry a tls section (ADR 0064)"
                 .into());
         }
+        if overload_flag.is_some() {
+            return Err(
+                "--max-connections/--max-inflight are not yet supported with \
+                 --cluster-control/--cluster-data — use --config/--node against a config file \
+                 whose own node entries carry an overload section (ADR 0074)"
+                    .into(),
+            );
+        }
         if encryption_key_path.is_some() {
             return Err("--encryption-key is not yet supported with \
                  --cluster-control/--cluster-data — use --config/--node against a config file \
@@ -813,10 +854,19 @@ async fn run(args: &[String]) -> Result<(), String> {
                 tls_flag,
                 export_s3_config.clone(),
                 encryption_key_path,
+                overload_flag,
             )
             .await
         }
         (None, Some(n)) => {
+            if overload_flag.is_some() {
+                return Err(
+                    "--max-connections/--max-inflight are not yet supported with --cluster N — \
+                     use --config/--node against a config file whose own node entries carry an \
+                     overload section (ADR 0074)"
+                        .into(),
+                );
+            }
             if tls_flag.is_some() {
                 return Err(
                     "--tls-cert/--tls-key/--tls-ca are not yet supported with --cluster N — \
@@ -1587,6 +1637,66 @@ fn resolve_tls_flags(
     }
 }
 
+/// Build the `overload` section the `--max-connections`/`--max-inflight` flags
+/// describe (R-01 (d), ADR 0074 §2). `None` when neither was given; a zero is
+/// refused (there is no "unlimited" setting).
+fn resolve_overload_flags(
+    max_connections: Option<usize>,
+    max_inflight: Option<usize>,
+) -> Result<Option<animusd::config::OverloadSection>, String> {
+    if max_connections.is_none() && max_inflight.is_none() {
+        return Ok(None);
+    }
+    let section = animusd::config::OverloadSection {
+        max_connections,
+        max_inflight_requests: max_inflight,
+        ..Default::default()
+    };
+    section.validate()?;
+    Ok(Some(section))
+}
+
+/// Merge the `--max-connections`/`--max-inflight` flags onto
+/// `config.nodes[index].overload`, per field: a field set both in the config
+/// file and by a flag is a hard error ("specify it one way, not both"), the
+/// other fields of the file's own section are kept.
+fn apply_overload_flag(
+    config: &mut ClusterConfig,
+    index: usize,
+    flag: Option<animusd::config::OverloadSection>,
+) -> Result<(), String> {
+    let Some(flag) = flag else { return Ok(()) };
+    let entry = config
+        .nodes
+        .get_mut(index)
+        .ok_or_else(|| format!("node index {index} out of range"))?;
+    let merged = entry.overload.get_or_insert_with(Default::default);
+    for (name, file, cli) in [
+        (
+            "max_connections",
+            &mut merged.max_connections,
+            flag.max_connections,
+        ),
+        (
+            "max_inflight_requests",
+            &mut merged.max_inflight_requests,
+            flag.max_inflight_requests,
+        ),
+    ] {
+        match (*file, cli) {
+            (Some(_), Some(_)) => {
+                return Err(format!(
+                    "node {index}'s overload.{name} is set both in the config file and via a \
+                     flag — specify it one way, not both"
+                ));
+            }
+            (None, Some(v)) => *file = Some(v),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Apply a parsed `--tls-*` flag (ADR 0064, S-01 commit 2) onto
 /// `config.nodes[index]` — this process's own entry only, mirroring
 /// [`apply_advertise_host_flag`]'s exact shape (**not**
@@ -1803,12 +1913,14 @@ async fn run_single(
     tls_flag: Option<TlsSection>,
     export_s3: Option<animusd::ExportS3Config>,
     encryption_key_path: Option<String>,
+    overload_flag: Option<animusd::config::OverloadSection>,
 ) -> Result<(), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?;
     let mut config = ClusterConfig::from_json(&text).map_err(|e| format!("parsing {path}: {e}"))?;
     apply_dynamo_auth_flag(&mut config, dynamo_auth_flag)?;
     apply_advertise_host_flag(&mut config, index, advertise_host)?;
     apply_encryption_key_flag(&mut config, index, encryption_key_path)?;
+    apply_overload_flag(&mut config, index, overload_flag)?;
     // Deliberately NOT re-running `ClusterConfig::validate_tls` after this
     // per-node merge: that check is the whole-file, all-nodes-or-none
     // invariant (already enforced once, above, by `from_json` against the
@@ -1895,7 +2007,7 @@ async fn run_single(
         );
     }
     println!("animusd: ready — Ctrl-C to stop");
-    wait_for_ctrl_c().await;
+    wait_for_shutdown(std::slice::from_ref(&node)).await;
     node.shutdown_graceful().await;
     Ok(())
 }
@@ -2011,7 +2123,7 @@ async fn run_control(args: &[String]) -> Result<(), String> {
         node.admin_addr(),
     );
     println!("animusd: ready — Ctrl-C to stop");
-    wait_for_ctrl_c().await;
+    wait_for_shutdown(std::slice::from_ref(&node)).await;
     node.shutdown_graceful().await;
     Ok(())
 }
@@ -2109,6 +2221,11 @@ async fn run_data(args: &[String]) -> Result<(), String> {
     // route has no `apply_encryption_key_flag`-shaped merge point for a
     // data-only node's own config entry to widen here, unlike `--tls-*`).
     let mut encryption_key_path: Option<String> = None;
+    // `--max-connections N` / `--max-inflight N` (R-01 (d), ADR 0074 §2): this
+    // node's DynamoDB connection cap and in-flight request bound; see
+    // `animusd::config::OverloadSection`. Omitted: the documented defaults.
+    let mut max_connections: Option<usize> = None;
+    let mut max_inflight: Option<usize> = None;
     // `--quiesce-after SECS` / `--heartbeat-batch`/`--no-heartbeat-batch` /
     // `--shared-wal`/`--no-shared-wal` (issue #676): threaded onto
     // `data --seed`, the same data-plane knobs `--config`/`--node` and
@@ -2153,6 +2270,12 @@ async fn run_data(args: &[String]) -> Result<(), String> {
             "--encryption-key" => {
                 encryption_key_path = Some(parse_next(&mut it, "--encryption-key")?);
             }
+            "--max-connections" => {
+                max_connections = Some(parse_next(&mut it, "--max-connections")?);
+            }
+            "--max-inflight" => {
+                max_inflight = Some(parse_next(&mut it, "--max-inflight")?);
+            }
             "--quiesce-after" => {
                 quiesce_after = Some(parse_next(&mut it, "--quiesce-after")?);
             }
@@ -2178,6 +2301,7 @@ async fn run_data(args: &[String]) -> Result<(), String> {
         .map(load_dynamo_auth_file)
         .transpose()?;
     let tls_flag = resolve_tls_flags(tls_cert, tls_key, tls_ca)?;
+    let overload_flag = resolve_overload_flags(max_connections, max_inflight)?;
 
     match (config_path, seed_arg) {
         (Some(_), Some(_)) => Err("use either --config or --seed, not both".into()),
@@ -2199,6 +2323,7 @@ async fn run_data(args: &[String]) -> Result<(), String> {
                 dynamo_auth_flag,
                 advertise_host,
                 tls_flag,
+                overload_flag,
             )
             .await
         }
@@ -2237,6 +2362,7 @@ async fn run_data(args: &[String]) -> Result<(), String> {
                 advertise_host,
                 tls_flag,
                 encryption_key_path,
+                overload_flag,
                 quiesce_after,
                 heartbeat_batch,
                 shared_wal,
@@ -2263,6 +2389,7 @@ async fn run_data(args: &[String]) -> Result<(), String> {
 /// secs` are ignored — see [`animusd::config::ClusterSettings`]'s own doc)
 /// is applied straight through [`animusd::run_node_data_with_cluster_
 /// settings`].
+#[allow(clippy::too_many_arguments)] // one flag per CLI knob, like run_single
 async fn run_data_config(
     path: &str,
     index: usize,
@@ -2271,11 +2398,13 @@ async fn run_data_config(
     dynamo_auth_flag: Option<animusd::DynamoAuthConfig>,
     advertise_host: Option<String>,
     tls_flag: Option<TlsSection>,
+    overload_flag: Option<animusd::config::OverloadSection>,
 ) -> Result<(), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?;
     let mut config = ClusterConfig::from_json(&text).map_err(|e| format!("parsing {path}: {e}"))?;
     apply_dynamo_auth_flag(&mut config, dynamo_auth_flag)?;
     apply_advertise_host_flag(&mut config, index, advertise_host)?;
+    apply_overload_flag(&mut config, index, overload_flag)?;
     // See `run_single`'s identical note: deliberately not re-checking the
     // whole-config all-or-none TLS invariant after this per-node merge.
     apply_tls_flag(&mut config, index, tls_flag)?;
@@ -2325,7 +2454,7 @@ async fn run_data_config(
         println!("animusd: data node {index} auto-split at {b} bytes/tablet");
     }
     println!("animusd: ready — Ctrl-C to stop");
-    wait_for_ctrl_c().await;
+    wait_for_shutdown(std::slice::from_ref(&node)).await;
     node.shutdown_graceful().await;
     Ok(())
 }
@@ -2350,6 +2479,7 @@ async fn run_data_join(
     advertise_host: Option<String>,
     tls_flag: Option<TlsSection>,
     encryption_key_path: Option<String>,
+    overload_flag: Option<animusd::config::OverloadSection>,
     quiesce_after: Duration,
     heartbeat_batch: bool,
     shared_wal: bool,
@@ -2384,6 +2514,9 @@ async fn run_data_join(
         // config file, so no conflict to check" shape as `tls` just above.
         // Closes issue #676's reach gap for this flag.
         encryption_key_path,
+        // `--max-connections`/`--max-inflight` (R-01 (d)) — same shape, no
+        // config file to conflict with.
+        overload: overload_flag,
     };
     let dir_name = id
         .as_ref()
@@ -2417,7 +2550,7 @@ async fn run_data_join(
         node.console_addr(),
     );
     println!("animusd: ready — Ctrl-C to stop");
-    wait_for_ctrl_c().await;
+    wait_for_shutdown(std::slice::from_ref(&node)).await;
     node.shutdown_graceful().await;
     Ok(())
 }
@@ -2458,6 +2591,11 @@ async fn run_join(args: &[String]) -> Result<(), String> {
     // encryption_key_path` directly, the same shape `--tls-*` already has
     // on `data --seed`. Closes issue #676's reach gap for this flag.
     let mut encryption_key_path: Option<String> = None;
+    // `--max-connections N` / `--max-inflight N` (R-01 (d), ADR 0074 §2): this
+    // node's DynamoDB connection cap and in-flight request bound; see
+    // `animusd::config::OverloadSection`. Omitted: the documented defaults.
+    let mut max_connections: Option<usize> = None;
+    let mut max_inflight: Option<usize> = None;
     // `--quiesce-after SECS` / `--heartbeat-batch`/`--no-heartbeat-batch` /
     // `--shared-wal`/`--no-shared-wal` (issue #676): the same data-plane
     // knobs `--config`/`--node` and `--cluster N` already resolve, threaded
@@ -2490,6 +2628,12 @@ async fn run_join(args: &[String]) -> Result<(), String> {
             }
             "--encryption-key" => {
                 encryption_key_path = Some(parse_next(&mut it, "--encryption-key")?);
+            }
+            "--max-connections" => {
+                max_connections = Some(parse_next(&mut it, "--max-connections")?);
+            }
+            "--max-inflight" => {
+                max_inflight = Some(parse_next(&mut it, "--max-inflight")?);
             }
             "--quiesce-after" => {
                 quiesce_after = Some(parse_next(&mut it, "--quiesce-after")?);
@@ -2542,6 +2686,7 @@ async fn run_join(args: &[String]) -> Result<(), String> {
     )?;
 
     let p = |role: u16| SocketAddr::new(ip, base_port.wrapping_add(role));
+    let overload_flag = resolve_overload_flags(max_connections, max_inflight)?;
     let addrs = RoleAddrs {
         // Unread placeholder: `Node::bind` takes the real (proposed or
         // self-minted) id as its own separate argument, never `addrs.id` —
@@ -2560,6 +2705,7 @@ async fn run_join(args: &[String]) -> Result<(), String> {
         // `--node` against a config file with a `tls` section instead).
         tls: None,
         encryption_key_path,
+        overload: overload_flag,
     };
     let dir_name = id
         .as_ref()
@@ -2593,7 +2739,7 @@ async fn run_join(args: &[String]) -> Result<(), String> {
         node.console_addr(),
     );
     println!("animusd: ready — Ctrl-C to stop");
-    wait_for_ctrl_c().await;
+    wait_for_shutdown(std::slice::from_ref(&node)).await;
     node.shutdown_graceful().await;
     Ok(())
 }
@@ -2791,7 +2937,7 @@ async fn run_in_process_cluster(
         );
     }
     println!("animusd: ready — Ctrl-C to stop");
-    wait_for_ctrl_c().await;
+    wait_for_shutdown(&nodes).await;
     for node in &nodes {
         node.shutdown_graceful().await;
     }
@@ -2882,12 +3028,37 @@ async fn run_in_process_split_cluster(
         );
     }
     println!("animusd: ready — Ctrl-C to stop");
-    wait_for_ctrl_c().await;
+    wait_for_shutdown(&nodes).await;
     for node in &nodes {
         node.shutdown_graceful().await;
     }
     remove_ephemeral_dir_on_clean_shutdown(cli_dir.as_deref(), ephemeral, &dir, pid);
     Ok(())
+}
+
+/// Waits for a shutdown signal OR for any of `nodes` to latch a version halt
+/// (ADR 0073 Phase 2, P2-C: the node's binary does not support the cluster
+/// version). On a halt the reason is recorded for `main`'s exit code; either
+/// way the caller then runs its ordinary graceful shutdown.
+async fn wait_for_shutdown(nodes: &[animusd::Node]) {
+    let halt = async {
+        let waits: Vec<_> = nodes
+            .iter()
+            .map(|n| Box::pin(n.wait_version_halt()))
+            .collect();
+        if waits.is_empty() {
+            std::future::pending::<String>().await
+        } else {
+            futures::future::select_all(waits).await.0
+        }
+    };
+    tokio::select! {
+        () = wait_for_ctrl_c() => {}
+        reason = halt => {
+            println!("animusd: shutting down: {reason}");
+            let _ = VERSION_HALT.set(reason);
+        }
+    }
 }
 
 /// Waits for either Ctrl-C (SIGINT, an interactive stop) or SIGTERM (a

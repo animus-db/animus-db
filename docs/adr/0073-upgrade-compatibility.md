@@ -224,6 +224,7 @@ range a format needs:
 | Encryption envelope (ADR 0069) | `crates/animus-env/src/encrypted.rs` | `MAGIC = b"ADE1"`, `VERSION: u8 = 1` | durable, node-local (wraps every other on-disk format transparently at the `Disk` seam) | Versioned, magic-guarded, same discipline as the LSM manifest and the RaftKV/segment codecs — this is the second format in the table (after the LSM manifest) that already meets the Phase 0 bar. |
 | Stored-item codec (base-row value; ADR 0054 step 1) | `crates/animus-item/src/stored.rs` (`encode_stored_item`/`decode_stored_item`/`encode_tombstone`/`stored_item_version`) | **untagged JSON, frozen serde shape** (2026-09-30 decision, see "Row-value formats: freeze, don't tag"): `{"item": {..}}` / the bare JSON string `"tombstone"` over `AttributeValue`'s derived serde form (externally tagged, e.g. `{"S":"x"}`, `"Null"`, `{"B":[0,255]}`); fixture `crates/animus-item/tests/fixtures/formats/stored-item/v1.json`; v1 is identified by a first non-whitespace byte of `{` (live item) or `\"` (tombstone) | **durable, outlives the cluster** (every base row, and therefore every backup, PITR segment and export carrying one) | Opaque inside `raftkv-wal`/`segment`/`backup-data` payloads until the P1-A fixture. `AttributeValue`/`Item` are part of this format: changing their serde shape is a format change. |
 | Change record (`ChangeRecord`, change-log value; ADR 0041/0049) | `crates/animus-item/src/index.rs` (`ChangeRecord::encode`/`decode`/`version_of`) | **untagged JSON, frozen serde shape** (same decision): `{"base_sk":[..],"old_image":..,"new_image":..,"seeded":..,"marker":..,"staged":..,"ttl_expired":..}`; additions are `#[serde(default)]` only; fixture `crates/animus-item/tests/fixtures/formats/change-record/v1.json`; v1 identified by a leading `{` | **durable, outlives the cluster** (PITR segments and backups carry change records; Streams reads them) | A new `#[serde(default)]` must mean "what the old writer meant" (review-enforced; the fixture test also pins a pre-flag record). |
+| Txn value envelope (`txn-envelope`, every base-row value; ADR 0018 §2) | `crates/animus-cp-data/src/txn.rs` (`encode_committed`/`encode_intent`/`decode_envelope`, `legacy::v1`) | the leading tag byte is the version: `0` committed (every version), `1` v1 intent (retired; decoded by `txn::legacy::v1` to `IntentPrior::Unknown`), `2` v2 intent (**current**, 2026-10-04: the v1 body plus a trailing `prior`, the committed value the intent shadows); fixtures `crates/animus-cp-data/tests/fixtures/formats/txn-envelope/v1.bin` + `v2.bin` (`src/format_fixture_tests.rs`) | durable, node-local (engine row values; also inside `raftkv-image` snapshot images). Backups/PITR/export carry only resolved committed values | Added to the inventory with its first bump (ADR 0018's 2026-10-04 amendment: aborted transactions lost acked writes because the abort read the prior value out of MVCC history). Engine-resident: it lives inside row values that no whole-file transcode can reach, so the upgrade harness gives it a **row-value transcode** (`animus-test` `upgrade::transcode::ROW_TABLE`, v2 -> v1: every stored v2 intent loses its `prior`), applied to a stopped node's WAL segments and SSTables by `animus_storage::rewrite_row_values` (`TranscodeOpts::row_back`); the v1 encoder is `legacy-encoders`-gated like the others, and the format is listed in `EMBEDDED` (carrier `lsm-sstable`, v2) beside its `ROW_TABLE` entry (`tier 0`: `upgrade_restart_tier0.rs`; `tier 1b`: `upgrade_restart_txn_envelope.rs`). Purely additive: v1 bytes decode unchanged. |
 | `numkey` (DynamoDB `N` key encoding, ADR 0063) — **pinned vectors, not a tagged format** | `crates/animus-item/src/numkey.rs` | **none by design**; pinned by fixture `crates/animus-item/tests/fixtures/formats/numkey/v1.json` (input → `encode`/`encode_checked`/`decode`, edge cases from the unit tests: zero forms, ordering regressions, range extremes, 38-digit cap, malformed text), checked by `tests/numkey_vectors.rs` | durable, outlives the cluster (inside every stored `N` key) | The fixture is the compatibility pin; a vector change is a breaking key-space change needing an ADR amendment. See the open question on the hash-ring/key-encoding layer. |
 | `AttributeValue::key_bytes` — **pinned vectors, not a tagged format** | `crates/animus-item/src/lib.rs` (`pub(crate)`; test in `src/key_bytes_vectors.rs`) | **none by design**; fixture `crates/animus-item/tests/fixtures/formats/key-bytes/v1.json` (every `AttributeValue` variant → key bytes, incl. the malformed-`N` raw-text fallback and the empty encoding of non-key types) | durable, outlives the cluster | As above; the fixture's `value` side also pins `AttributeValue`'s serde shape. |
 | Hash-ring token + key `escape` — **pinned vectors, not a tagged format** | `crates/animus-tablet/src/lib.rs` (`partition_token`/`murmur3_x64_128`, `escape`) | **none by design**; fixtures `crates/animus-tablet/tests/fixtures/formats/partition-token/v1.json` and `.../escape/v1.json` (every murmur3 tail length and block boundary, embedded `0x00`s), checked by `tests/format_fixtures.rs`; the canonical-reference unit test stays | durable, outlives the cluster | Refines the "Hash-ring token / key encoding" row above: the pin now lives in checked-in fixtures covered by the append-only guard, not only in in-source vectors. Whether the layer ever gets a version tag remains the open question below. |
@@ -2315,7 +2316,9 @@ seams.
 
 **7. Relay decision.** `is_relayable_command`: `ReportNodeVersion => true` (a data-only
 node's era-on boot self-report has no other route) and `FinalizeClusterVersion => true`
-(the admin Finalize rides the `ProposeSchema` relay, section 2). Both are era-only, so
+(the admin Finalize rides the `ProposeSchema` relay, section 2). **Superseded by P2-C
+(see its note 3 and 7): `FinalizeClusterVersion` is a leader-local admin action and is
+NOT relayable; only `ReportNodeVersion` is.** Both are era-only, so
 the allowlist is not what protects a Phase 1 peer: the sender refuses them pre-era
 (`encode_client_frame_gated`, `RaftNode::propose`) and the *receiver* must re-check
 `required_gate` against its own handle before proposing (P2-C, `animusd`
@@ -2423,6 +2426,88 @@ closed-gate command and would also trip the `debug_assert!`, leaving the control
 vacuous. Production gating is unchanged. (c) The era-start path still goes through
 `propose_era_start`. The P2-D amendment's "P2-B is not on main" caveat is obsolete; its
 N2-N4 and data-plane/`animus-node` tiers remain open (P2-C).
+
+### Amendment 2026-10-04 — P2-C implementation notes (node wiring, admin, CLI)
+
+P2-C wires the P2-A machinery into `animusd` and adds the operator surface.
+Decisions and as-built facts the design text did not settle:
+
+1. **The era goes live in production with this change.** Production
+   assembly now sets each control `RaftNode`'s own range and build
+   (`set_own_version_range(Some(own_range()))`, `set_own_build`) and gives
+   every `ProdEnv` its handshake `ext` at bind. A cluster therefore starts
+   the era once the leader has observed every member (a single-node cluster
+   immediately). P2-A/B/D and P2-C ship as one release train, so this is not
+   live alone. `Node::features()` is the per-node `ClusterFeatures` handle;
+   it lives on `ClusterEdgeState` (zero struct-literal fan-out), fed by one
+   generic `version_wiring_loop` spawned for **every** role, including
+   `SimCluster` nodes and data-only nodes with no `RaftNode`.
+2. **Nothing new precedes the era.** The boot-time self-report
+   (`ReportNodeVersion`) is emitted only once the node's *own applied view*
+   shows `versioning_active()` (a lagging view only delays it); a test pins
+   zero reports before the era. The `JoinInfo` field is
+   `#[serde(default, skip_serializing_if)]`, so pre-era bytes equal Phase 1's;
+   the handshake `ext` is ignored by Phase 1.
+3. **`ReportNodeVersion` relays** (`is_relayable_command` arm). Without it a
+   follower-connected or data-only node's report is rejected "not allowed
+   over the relay path". The red-then-green regression switches the leader's
+   own upkeep off so only the node's self-report can land (otherwise the
+   leader's `era_on_proposals` masks a missing arm). A relayed report is not
+   authenticated against the sender id (apply validates registration and
+   range only): acceptable on the mutual-TLS intra port.
+4. **Finalize is leader-local and not relayed**, following ADR 0037's
+   `admin_remove_member` pattern (this narrows the Section 2 table, which
+   said it rides the `ProposeSchema` relay; Section 4 already said "role-gated
+   like ADR 0037"). Leadership is checked first; a non-leader answers `409`
+   naming the leader. `FinalizeClusterVersion` stays non-relayable.
+5. **CHS1 era-on refusal of an empty `ext` is on the intra port only.**
+   This narrows Section 2(b) ("refuse any peer whose `ext` is empty") to
+   node-to-node traffic: `animus-cli` and external clients dial the client
+   port, are not members, and never advertise an `ext`, so requiring one
+   there would lock operators out. Dials (`connect_client`, the pipelined
+   relay/join dial) advertise the node's `ext` and never require the peer's.
+6. **Down / Leaving / never-activated Joining members block Finalize,
+   strictly, regardless of any recorded range** (decision 6), enforced in the
+   admin pre-check and reported as named blockers by
+   `GET /admin/cluster-version`. **Known gap:** `Metadata::apply` for
+   `FinalizeClusterVersion` does not look at member status, so the pre-check
+   is racy and operator-level. Apply-level enforcement is tracked in
+   issue #1168 (an `animus-control` change, out of P2-C's scope).
+7. **Admission.** Once the era is on, `admin_add_control_member` refuses a
+   voter with no known range (a Phase 1 binary never advertises one) or a
+   range excluding the cluster version, by name, before registering anything.
+   **Runbook:** a control voter must therefore be up (connected, so its
+   handshake range is observed, or already self-reported) *before*
+   `admin_add_control_member` is invoked once the era is on; start the node
+   first, then admit it.
+   `admin_add_member` (registers a not-yet-booted node `Down`) cannot check;
+   the new node's handshake refusal plus "a row with no record blocks
+   Finalize" cover it.
+8. **Joiner range check.** `JoinInfo` carries the raw `cluster_version`
+   (0 = era off, reads as 1); `discover_join_info` (the one funnel for
+   `animusd join`, `data --seed` and growth) refuses an out-of-range cluster
+   before claiming an identity or binding, which also covers the pre-era
+   "binary R+1 against a cluster at R-1" case `EraWatch` cannot.
+9. **Out-of-range halt -> process exit 78.** A node whose range excludes the
+   cluster version latches a named halt (a local `RaftNode`'s
+   `halt_reason()`, or the feeder's own check on a data-only node); `main`
+   races it against the shutdown signal, runs the graceful shutdown, prints
+   `animusd: FATAL: <reason>` and exits with `EX_CONFIG` (78) and no usage
+   text. Client listeners may answer for up to one feeder tick before the
+   exit. Under Kubernetes this is the intended CrashLoopBackOff.
+10. **Accepted benign race.** `ProdEnv::bind*` spawns its accept loop before
+    `set_own_ext` runs, so a connection accepted in those microseconds
+    answers with an empty `ext`; an era-on peer refuses it and redials. An
+    `ext` parameter on `ProdEnv::bind*` would close it (an `animus-env`
+    change, not made here).
+11. **Surface.** `GET /admin/cluster-version` (any node; the control leader
+    also reports its live observation table) and
+    `POST /admin/cluster-version/finalize {to?, expected?}`;
+    `animus cluster version <admin-addr> [--json]` and
+    `animus cluster finalize <leader-admin-addr> [--to N] [--yes]` (the CLI
+    shows the blockers, refuses unless `--yes`, then polls until the new
+    version is observed). Rolling upgrade remains **in progress, not
+    supported**, until P2-B (gates) and P2-D (mixed-version corpus) land.
 
 ### Amendment 2026-10-04 — P2-D as built (mixed-version corpus)
 

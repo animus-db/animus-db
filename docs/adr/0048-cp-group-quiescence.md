@@ -9,6 +9,12 @@
   narrowed (immutable tablet ranges leave no scope transition to latch),
   and adds the storage-side sibling of this ADR's concern: the idle cost of
   a per-tablet engine, measured as a gating item in 0050's first rung.
+- **2026-10-04 note (issue #1180):** the apply task's 250ms
+  `APPLY_SAFETY_POLL` is no longer armed while a group is quiesced —
+  `apply_loop` parks on `ApplySignal` alone, and the consensus loop raises the
+  signal on every quiesced/awake transition (re-arming the poll). The
+  "zero timeline events" claim below now holds for the whole group, not just
+  the consensus loop. Regression: `tests/it/quiesced_apply_no_poll.rs`.
 - **Date:** 2026-08-16
 - **Amends:** [ADR 0017](0017-per-tablet-raft-data-plane.md) (the per-tablet
   Raft data plane); closes [ADR 0044](0044-split-only-tablets.md)'s

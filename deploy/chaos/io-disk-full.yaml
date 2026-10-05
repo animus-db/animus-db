@@ -1,0 +1,28 @@
+# DO NOT RUN. Blocked on issue #1185 (disk-full behaviour on a real node is
+# undefined today; docs/production-readiness.md D-7 / ADR 0074 section 2 define
+# the contract it must meet: refuse writes with a named StorageFull error, never
+# ack an un-fsynced write, recover without restart). Until D-7 lands this
+# scenario can only fail, and a scenario that cannot pass is not a chaos test.
+# Kept here so the leg's shape is complete and the manifest is reviewed in
+# advance. UNVALIDATED draft (never applied to a cluster).
+#
+# ENOSPC (errno 28) on every write under the data dir of one pod.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: IOChaos
+metadata:
+  name: animus-io-disk-full
+  namespace: animus-chaos
+spec:
+  action: fault
+  mode: one
+  selector:
+    namespaces: [animus-chaos]
+    labelSelectors:
+      app.kubernetes.io/name: animusdb
+      app.kubernetes.io/instance: chaos
+  volumePath: /var/lib/animus
+  path: /var/lib/animus/**/*
+  errno: 28
+  methods: [WRITE, FSYNC]
+  percent: 100
+  duration: "30s"
