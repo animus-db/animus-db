@@ -710,7 +710,7 @@ fn push_declines_before_grace_elapses() {
 /// follow-up fix, §2b): PR4's prepare phase stages every participant
 /// concurrently, so a participant's own stage can genuinely land while the
 /// *anchor's* own `TxnStage` — which would create the record — never
-/// actually writes it (here: the anchor's whole range is sealed first, so
+/// actually writes it (here: a foreign pending intent blocks the anchor's key, so
 /// its stage entry applies as a whole-or-nothing no-op; `wait_applied` only
 /// confirms the ENTRY applied, never that its content check succeeded, the
 /// same gap `txn_multi.rs` already documents for a *participant's* stage,
@@ -747,13 +747,21 @@ fn push_aborts_an_orphan_intent_with_no_record_anywhere() {
         Some(b"prior".to_vec())
     );
 
-    // Freeze the anchor's group FIRST (ADR 0050's terminal whole-range
-    // seal) — its own stage entry (the one that would normally create the
-    // record) silently no-ops against it at apply, a whole-or-nothing
-    // seal miss (`txn_single.rs`'s already-frozen shape).
-    let sealed = nodes_a[la].propose_freeze();
-    assert!(matches!(sealed, ProposeResult::Accepted { .. }));
-    sim.run_for(ELECT);
+    // A foreign PENDING intent already sits on the anchor's key, so the
+    // anchor's own stage entry (the one that would normally create the
+    // record) applies as a whole-or-nothing `IntentBlocked` no-op. (This used
+    // to freeze the anchor group instead, but a decision/tombstone on a
+    // sealed group is now a deterministic no-op -- the record's owner after a
+    // fork is the child -- so a seal is no longer a way to get an orphan
+    // tombstone created on THIS group.)
+    stage_anchor(
+        &mut sim,
+        &nodes_a[la],
+        "orders",
+        vec![(ka.clone(), Some(b"blocker".to_vec()))],
+        Vec::new(),
+    )
+    .expect("the blocking transaction's anchor stage");
 
     let (txn_id, record_key) = stage_anchor(
         &mut sim,
@@ -840,8 +848,8 @@ fn push_aborts_an_orphan_intent_with_no_record_anywhere() {
         "kb must revert to its pre-transaction committed value, never a tombstone or \
          the staged one (seed={seed})"
     );
-    // The anchor's own key never existed to begin with (the seal blocked
-    // it) — confirm recovery didn't fabricate it.
+    // The anchor's own key never got this transaction's value (the foreign
+    // intent blocked it) — confirm recovery didn't fabricate it.
     assert_eq!(block_on(nodes_a[la].local_get(&ka)), None);
 }
 

@@ -707,6 +707,16 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         Ok(TxnOutcome::Committed { commit_ts })
                     }
                     Some(TxnDecisionStatus::Aborted) => Ok(TxnOutcome::Aborted),
+                    // A fork sealed this group between the pre-propose frozen
+                    // check and the apply (the propose-vs-apply sliver): the
+                    // decision entry applied as a sealed no-op (`animus-cp-data`'s
+                    // seal check on `TxnCommit`/`TxnAbort`), so the record is
+                    // legitimately still `Pending` HERE and now lives on a child.
+                    // Refuse retryably so `txn_decide_anchor_retrying` re-routes
+                    // the SAME decision to the record's new owner.
+                    Some(TxnDecisionStatus::Pending) if leader.is_frozen() => {
+                        Err(decide::FROZEN_REFUSAL.to_string())
+                    }
                     Some(TxnDecisionStatus::Pending) => Err(
                         "txn decide: record still Pending immediately after its own decide \
                          applied — protocol bug"

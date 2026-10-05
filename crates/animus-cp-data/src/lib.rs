@@ -10004,6 +10004,37 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     .outcomes
                     .insert(index, (term, outcome));
             }
+            // R-01 F-2 (fourth mechanism): a txn DECISION whose record key falls
+            // in a range this group has already sealed (the whole-range seal a
+            // `Freeze` or the in-place `SplitTablet` fork applies) is a
+            // deterministic no-op, exactly like every other mutating arm. This
+            // was the one arm missing the check, and it is not harmless: the
+            // children of a fork are cloned from the parent's CURRENT engine by
+            // the host reconciler, asynchronously and per replica, so a decision
+            // ordered after the fork entry landed in the clone of the replicas
+            // that cloned late and not in the others -- replica-divergent
+            // children, plus an acked commit the record's real owner never saw
+            // (its participants' intents then never resolved and the keys
+            // reverted to their prior values). The proposer's own post-decide
+            // status read sees the record still `Pending` on the frozen group and
+            // re-routes the SAME decision to the child that now owns the record
+            // (`txn_decide_anchor_retrying`). Apply stays a pure function of the
+            // entry and the state machine (ADR 0073 "apply never branches on a
+            // gate"); no new variant is needed, since the sealed window is the
+            // one place the old behaviour was replica-dependent.
+            KvCommand::TxnCommit { record_key, ts, .. }
+            | KvCommand::TxnAbort { record_key, ts, .. }
+                if is_sealed(sealed, &record_key) =>
+            {
+                assert_ts_monotonic(
+                    max_applied_ts,
+                    last_applied_ts_entry,
+                    ts,
+                    index,
+                    term,
+                    variant,
+                );
+            }
             KvCommand::TxnCommit {
                 txn_id,
                 record_key,
