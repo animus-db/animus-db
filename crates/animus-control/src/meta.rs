@@ -5519,6 +5519,44 @@ impl Metadata {
         self.schemas.get(table).and_then(|s| s.ttl.as_ref())
     }
 
+    /// This table's global-table configuration (ADR 0075), if it is one.
+    /// `None` for an unknown table or a regional one. A read accessor for the
+    /// wire adapter (`DescribeTable`, the MRSC restrictions) and the
+    /// preferred-leader view, mirroring [`table_ttl`](Self::table_ttl).
+    #[must_use]
+    pub fn table_global(&self, table: &str) -> Option<&crate::schema::GlobalTableSpec> {
+        self.schemas.get(table).and_then(|s| s.global.as_ref())
+    }
+
+    /// The Regions in which **every** routable tablet of `table` has a replica
+    /// in its current (desired) replica set — what `DescribeTable` reports as
+    /// `ACTIVE` for a global table (ADR 0075 section 3.5, plan decision D4:
+    /// replica status is *derived*, never stored). A Region is a
+    /// `topology.kubernetes.io/region` label value of the replica's member; a
+    /// replica whose member carries no such label (or no member row) counts for
+    /// no Region. Empty for a table with no routable tablet.
+    ///
+    /// Reflects the **desired** replica set (`Tablet::replicas`), not Raft
+    /// voter promotion: honest but slightly optimistic while a learner is still
+    /// catching up.
+    #[must_use]
+    pub fn table_ready_regions(&self, table: &str) -> BTreeSet<String> {
+        let mut ready: Option<BTreeSet<String>> = None;
+        for (_, tablet) in self.tablets_for_table(table).filter(|(_, t)| t.is_routable()) {
+            let here: BTreeSet<String> = tablet
+                .replicas
+                .iter()
+                .filter_map(|n| self.members.get(n))
+                .filter_map(|m| m.labels.get(crate::timing::REGION_LABEL).cloned())
+                .collect();
+            ready = Some(match ready {
+                None => here,
+                Some(acc) => acc.intersection(&here).cloned().collect(),
+            });
+        }
+        ready.unwrap_or_default()
+    }
+
     /// This table's provisioned throughput configuration (ADR 0065 §5(b)),
     /// if `BillingMode` is `PROVISIONED`. `None` for an unknown table or one
     /// with no throughput declared (`PAY_PER_REQUEST`), mirroring

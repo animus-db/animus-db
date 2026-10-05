@@ -102,6 +102,8 @@ mod dynamo;
 mod dynamo_streams;
 #[deny(clippy::disallowed_methods)]
 mod forwarding;
+#[deny(clippy::disallowed_methods)]
+mod global_tables;
 mod http;
 mod import;
 #[deny(clippy::disallowed_methods)]

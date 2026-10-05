@@ -398,3 +398,37 @@ fn set_global_preferred_leader_gate_and_pinned_json() {
         r#"{"SetGlobalPreferredLeader":{"table":"t","region":"b"}}"#
     );
 }
+
+/// M3: `table_global` / `table_ready_regions` (what `DescribeTable` derives a
+/// replica's `ACTIVE` from — plan decision D4, derived and never stored).
+#[test]
+fn table_global_and_ready_regions_accessors() {
+    let mut m = world(&[1, 3, 5]);
+    assert_eq!(m.table_global("t"), None);
+    assert_eq!(m.table_global("absent"), None);
+    // Every region has a replica of the only tablet.
+    assert_eq!(
+        m.table_ready_regions("t"),
+        ["a", "b", "c"].iter().map(|s| s.to_string()).collect()
+    );
+    assert_eq!(m.apply(&convert("t", spec())), ApplyOutcome::Applied);
+    assert_eq!(m.table_global("t"), Some(&spec()));
+
+    // A second tablet that has no replica in region c: c is not ready for the
+    // table (every tablet must have one), a and b still are.
+    m.tablets.insert(
+        TabletId(2),
+        animus_tablet::Tablet::new_for_table(
+            TabletId(2),
+            "t",
+            KeyRange::whole(),
+            vec![nid(2), nid(4)],
+        ),
+    );
+    assert_eq!(
+        m.table_ready_regions("t"),
+        ["a", "b"].iter().map(|s| s.to_string()).collect()
+    );
+    // No tablets of the table at all: nothing is ready.
+    assert!(m.table_ready_regions("absent").is_empty());
+}
