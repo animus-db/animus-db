@@ -500,6 +500,16 @@ jobs:
           ANIMUS_ZONE_PLACEMENT_SEEDS: '25'
         run: cargo test -p animusd --lib sim_cluster_zone_placement -- --nocapture
 
+      # Issue #1229: a split child relocated wholesale by directed Placing
+      # keeps its pre-split rows (learner shipped the engine image, not the log).
+      - name: split-child relocation corpus (issue #1229)
+        id: split_relocation
+        continue-on-error: true
+        timeout-minutes: 30
+        env:
+          ANIMUS_SPLIT_RELOCATION_SEEDS: '20'
+        run: cargo test -p animusd --lib sim_cluster_split_relocation -- --nocapture
+
       # ADR 0068's S3 export/import job driver + import driver: multi-tablet
       # export content fidelity, concurrent writes racing the pin, bucket
       # faults, a crash mid-export/mid-import (the ADR's own named
@@ -717,6 +727,7 @@ jobs:
             [simcluster]="${{ steps.simcluster.outcome }}"
             [dynamo_wire]="${{ steps.dynamo_wire.outcome }}"
             [zone_placement]="${{ steps.zone_placement.outcome }}"
+            [split_relocation]="${{ steps.split_relocation.outcome }}"
             [export_import]="${{ steps.export_import.outcome }}"
             [s3_fault]="${{ steps.s3_fault.outcome }}"
             [heartbeat]="${{ steps.heartbeat.outcome }}"
@@ -731,7 +742,7 @@ jobs:
           )
           failed=0
           failed_names=()
-          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner reconfigure_drop inplace_split backup pitr lsm_crash lsm_disk_fault lsm_encrypted segment_store_encrypted control simcluster dynamo_wire zone_placement export_import s3_fault heartbeat wan_timing sharedwal wal_rewrite_crash upgrade_restart upgrade_restart_cluster upgrade_mixed upgrade_mixed_cluster learner_snapshot_livelock; do
+          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner reconfigure_drop inplace_split backup pitr lsm_crash lsm_disk_fault lsm_encrypted segment_store_encrypted control simcluster dynamo_wire zone_placement split_relocation export_import s3_fault heartbeat wan_timing sharedwal wal_rewrite_crash upgrade_restart upgrade_restart_cluster upgrade_mixed upgrade_mixed_cluster learner_snapshot_livelock; do
             outcome="${outcomes[$name]}"
             echo "${name}: ${outcome}"
             if [ "${outcome}" != "success" ]; then
