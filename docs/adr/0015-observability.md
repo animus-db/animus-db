@@ -203,6 +203,21 @@ integration; the seam itself does **no** HTTP.
   `animusd`'s aggregated `/metrics` endpoint (alongside the control/data role sinks)
   is a thin follow-up at the assembly point and is not part of this change.
 
+## Amendment (2026-10-04) — shipped alert rules, request-outcome counters, exposition check
+
+R-01 sub-track (f). `Metric` gains two appended counters,
+`dynamo_requests_total` and `dynamo_responses_5xx`, recorded once per request
+that reaches `dispatch` in `animusd::dynamo` (so an availability SLI and a 5xx
+alert exist; a 4xx such as a throttle is not a fault). `deploy/observability/`
+ships Prometheus alert and recording rules, a Grafana dashboard and the SLO
+definitions; its README lists the signals that still have no metric (latency
+histograms, per-op labels, per-tablet replica health, WAL/compaction backlog).
+The scrape endpoint is `GET /metrics` on the DynamoDB port; `/admin/metrics` is
+a JSON view, not a Prometheus endpoint. A SimCluster test
+(`sim_cluster_admin::metric_references_exist_in_exposition`) asserts the live
+exposition, `/admin/metrics` and `Metric::ALL` agree and that every metric name
+referenced in `docs/`, `website/` and `deploy/observability/` exists.
+
 ## Amendment (2026-10-02) — `SimEnv` records into a per-(simulator, node) sink
 
 The "`SimEnv` included (it does not override it)" statements above no longer

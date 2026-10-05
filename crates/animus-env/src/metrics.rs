@@ -978,6 +978,18 @@ pub enum Metric {
     /// A new connection on the client-protocol or intra listener was closed
     /// because that listener was at its `max_peer_connections` cap.
     OverloadShedPeerConnCap,
+    // --- DynamoDB wire request outcomes (R-01 (f), appended; same slot-stability discipline) ---
+    // Recorded by `animusd::dynamo`'s per-connection loop, once per request that
+    // reached `dispatch` (i.e. past the `/metrics` route and the SigV4 gate).
+    // They exist so a Prometheus alert can express a server-fault ratio
+    // (`dynamo_responses_5xx / dynamo_requests_total`); a throttled or invalid
+    // request is a 4xx and is deliberately not counted as a fault.
+    /// A DynamoDB-wire request was dispatched (every response status).
+    DynamoRequestsTotal,
+    /// A dispatched DynamoDB-wire request answered with an HTTP 5xx status
+    /// (`InternalServerError`/`ServiceUnavailable`: the server, not the client
+    /// or a throttle, failed it).
+    DynamoResponses5xx,
 
     // --- Cluster-version feature-gate observability (ADR 0073 Phase 2, P2-C;
     // appended, same slot-stability discipline). Each is a **level** mirrored
@@ -1008,7 +1020,7 @@ pub enum Metric {
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 121] = [
+    pub const ALL: [Metric; 123] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -1123,6 +1135,8 @@ impl Metric {
         Metric::OverloadShedAdmission,
         Metric::OverloadShedAdminConnCap,
         Metric::OverloadShedPeerConnCap,
+        Metric::DynamoRequestsTotal,
+        Metric::DynamoResponses5xx,
         Metric::ClusterGateViolationsRaftMsg,
         Metric::ClusterGateViolationsMetaCommand,
         Metric::ClusterGateViolationsKvWire,
@@ -1251,6 +1265,8 @@ impl Metric {
             Metric::OverloadShedAdmission => "overload_shed_admission",
             Metric::OverloadShedAdminConnCap => "overload_shed_admin_conn_cap",
             Metric::OverloadShedPeerConnCap => "overload_shed_peer_conn_cap",
+            Metric::DynamoRequestsTotal => "dynamo_requests_total",
+            Metric::DynamoResponses5xx => "dynamo_responses_5xx",
             Metric::ClusterGateViolationsRaftMsg => "cluster_gate_violations_raft_msg",
             Metric::ClusterGateViolationsMetaCommand => "cluster_gate_violations_meta_command",
             Metric::ClusterGateViolationsKvWire => "cluster_gate_violations_kv_wire",
