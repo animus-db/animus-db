@@ -12043,3 +12043,21 @@ fed into emitters); `Release(N-1) -> Release(N)` cells over real gates.
 **Gotcha**: the member-down cell crashes a node the shared client loop keeps
 routing 1/4 of its ops to (each stalls for the wire timeout), so acks *during* its
 roll are legitimately sparse; non-vacuity there is asserted after the era.
+
+## Real-process soak (R-01 (a), `docs/soak.md`)
+
+`tests/soak.rs` (opt-in `soak` cargo feature, like `chaos`) runs the chaos
+harness's cluster/workload/oracle machinery (`tests/chaos_support/`) with no
+faults for hours or days, in **epochs**: each epoch has a fresh key range
+(`Shared::with_base`'s `key_base`), is verified (final reads through two nodes,
+the three oracles plus eventual-prefix and txn-atomicity) and its history is
+dropped; the previous epoch and epoch 0 are re-read as cold data; keys two
+epochs old are deleted so live data stays bounded. Per-node RSS/threads/fds
+(`/proc/<pid>`), data-dir/WAL bytes, `sst-*` file count and the
+`demux_*`/`spawned_task_handles_tracked` gauges feed
+`animus_test::soak::evaluate`. **Gotchas**: `chaos_support` is `mod`-included by
+both targets, so a helper only one uses needs `#[allow(dead_code)]` (clippy
+`-D warnings` over `--all-features` builds both); `ChaosCluster::pid`/
+`data_dir` exist for the soak; the soak never arms the proxy faults, so a
+`[node-exit]` or `[node-panic]` there is always a finding; node logs are not
+rotated, so a multi-day run needs disk for them.
