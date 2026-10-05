@@ -35,6 +35,15 @@ async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
 
 /// Bring up an `n`-node per-process cluster (each node its own edge state).
 async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::ClusterConfig) {
+    bring_up_with_labels(n, dir, |_| Default::default()).await
+}
+
+/// [`bring_up`] with per-node topology labels (`labels(i)` for node `i`).
+async fn bring_up_with_labels(
+    n: usize,
+    dir: &std::path::Path,
+    labels: impl Fn(usize) -> std::collections::BTreeMap<String, String>,
+) -> (Vec<Node>, animusd::ClusterConfig) {
     // Documented port-TOCTOU retry: `free_addrs` releases the probed ports before
     // `run_node` rebinds them, so a concurrent test binary can steal one —
     // re-allocate fresh ports and retry the whole bring-up as a unit.
@@ -54,7 +63,7 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::Clust
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
-                labels: Default::default(),
+                labels: labels(i),
                 overload: None,
             })
             .collect();
@@ -953,4 +962,173 @@ async fn restore_table_from_backup_on_a_follower_is_relayed_to_the_leader() {
     for n in &nodes {
         n.shutdown_graceful().await;
     }
+}
+
+/// ADR 0075 (G-01 stage G-c, M3): the `is_relayable_command` regression class
+/// for `MetaCommand::ConvertTableToGlobal`. `UpdateTable` with `ReplicaUpdates`
+/// issued against a DynamoDB listener on a node that is **not** the
+/// control-plane leader must commit through the relay (once `Gate::
+/// GlobalTables` is open, here by a real finalize), replicate to every node,
+/// and `DescribeTable` on a different node must show the global fields.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn update_table_replica_updates_on_a_follower_is_relayed_to_the_leader() {
+    let dir = support::panic_safe_tempdir();
+    let (nodes, config) = bring_up_with_labels(3, dir.path(), |i| {
+        std::collections::BTreeMap::from([(
+            animus_placement::REGION_LABEL.to_owned(),
+            format!("r-{i}"),
+        )])
+    })
+    .await;
+
+    // Open the gate: wait for the era, finalize on the leader.
+    timeout(Duration::from_secs(60), async {
+        while !nodes.iter().all(|n| n.features().era_active()) {
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the version era never became active");
+    let leader = nodes.iter().position(Node::is_control_leader).unwrap();
+    let follower = (0..nodes.len()).find(|&i| i != leader).unwrap();
+    let other = (0..nodes.len())
+        .find(|&i| i != leader && i != follower)
+        .unwrap();
+    timeout(Duration::from_secs(60), async {
+        loop {
+            let (status, body) = http_admin(
+                config.nodes[leader].admin,
+                "/admin/cluster-version/finalize",
+                r#"{"to":2,"expected":1}"#,
+            )
+            .await;
+            if status == 200 {
+                return;
+            }
+            let _ = body;
+            sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("finalize to 2 never succeeded");
+    timeout(Duration::from_secs(60), async {
+        while !nodes.iter().all(|n| {
+            n.features()
+                .is_open(animus_control::version::Gate::GlobalTables)
+        }) {
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("Gate::GlobalTables never opened on every node");
+
+    let follower_dynamo = config.nodes[follower].dynamo;
+    let create = r#"{"TableName":"mrsc_relay_t","KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}]}"#;
+    timeout(Duration::from_secs(30), async {
+        loop {
+            let (status, _) =
+                dynamo(follower_dynamo, "DynamoDB_20120810.CreateTable", create).await;
+            if status == 200 {
+                return;
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("CreateTable never succeeded");
+
+    let convert = r#"{"TableName":"mrsc_relay_t","MultiRegionConsistency":"STRONG","ReplicaUpdates":[{"Create":{"RegionName":"r-0"}},{"Create":{"RegionName":"r-2"}}]}"#;
+    // The follower's own Region is `r-<follower>`; name the other two.
+    let regions: Vec<String> = (0..3)
+        .filter(|i| *i != follower)
+        .map(|i| format!("r-{i}"))
+        .collect();
+    let convert = convert
+        .replace("r-0", &regions[0])
+        .replace("r-2", &regions[1]);
+    let (status, body) = timeout(Duration::from_secs(60), async {
+        loop {
+            let (status, body) =
+                dynamo(follower_dynamo, "DynamoDB_20120810.UpdateTable", &convert).await;
+            if status == 200 {
+                return (status, body);
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("follower-issued UpdateTable ReplicaUpdates did not commit via relay in 60s");
+    assert_eq!(status, 200, "body: {body}");
+    assert!(
+        body.contains("\"MultiRegionConsistency\":\"STRONG\""),
+        "{body}"
+    );
+    assert!(
+        body.contains("\"GlobalTableVersion\":\"2019.11.21\""),
+        "{body}"
+    );
+
+    for (i, n) in nodes.iter().enumerate() {
+        timeout(Duration::from_secs(30), async {
+            loop {
+                if n.metadata().table_global("mrsc_relay_t").is_some() {
+                    return;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("node {i}: global spec missing after the relayed conversion"));
+    }
+
+    // `DescribeTable` on a different node shows the global fields (a pure
+    // catalog read), converging to every Region ACTIVE.
+    let other_dynamo = config.nodes[other].dynamo;
+    let body = timeout(Duration::from_secs(60), async {
+        loop {
+            let (status, body) = dynamo(
+                other_dynamo,
+                "DynamoDB_20120810.DescribeTable",
+                r#"{"TableName":"mrsc_relay_t"}"#,
+            )
+            .await;
+            if status == 200 && body.matches("\"ReplicaStatus\":\"ACTIVE\"").count() == 3 {
+                return body;
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("DescribeTable never showed three ACTIVE replicas");
+    assert!(
+        body.contains("\"MultiRegionConsistency\":\"STRONG\""),
+        "{body}"
+    );
+
+    for n in &nodes {
+        n.shutdown_graceful().await;
+    }
+}
+
+/// One HTTP/1.0 `POST` to an admin endpoint; `(status, body)`.
+async fn http_admin(addr: SocketAddr, path: &str, body: &str) -> (u16, String) {
+    let mut stream = TcpStream::connect(addr).await.expect("connect to admin");
+    let request = format!(
+        "POST {path} HTTP/1.0\r\nHost: animus\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len(),
+    );
+    stream.write_all(request.as_bytes()).await.expect("send");
+    stream.flush().await.expect("flush");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.expect("read");
+    let text = String::from_utf8(raw).expect("utf8");
+    let (head, payload) = text.split_once("\r\n\r\n").expect("body");
+    let status = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse().ok())
+        .expect("status");
+    (status, payload.to_owned())
 }

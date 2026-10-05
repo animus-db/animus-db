@@ -39,6 +39,10 @@
 //!   pages via `UnprocessedKeys`) for `BatchGetItem`'s own response-size
 //!   cap. See each constant's own doc for the exact accounting/boundary
 //!   rule and, for the two currently-unreachable-via-the-wire caps, why.
+//! - [`MRSC_REQUIRED_REGIONS`], [`MRSC_MAX_WITNESSES`],
+//!   [`MRSC_MIN_FULL_REPLICAS`] and [`GLOBAL_TABLE_VERSION`] (ADR 0075 section
+//!   6, G-01 stage G-c) are enforced by the `UpdateTable` `ReplicaUpdates`
+//!   decoder/validator ([`crate::global`]) and emitted by `DescribeTable`.
 //! - [`MAX_PARTITION_KEY_BYTES`], [`MAX_SORT_KEY_BYTES`],
 //!   [`MAX_KEY_ATTRIBUTE_NAME_CHARS`], [`MAX_ATTRIBUTE_NAME_BYTES`],
 //!   [`MAX_NESTING_DEPTH`], [`MAX_EXPRESSION_BYTES`],
@@ -154,6 +158,35 @@ pub const MAX_BATCH_WRITE_REQUEST_BYTES: usize = 16_777_216;
 ///   it against the **fetched result** instead, after its own quiescent
 ///   read — a transaction has no partial result, so the whole call fails.
 pub const MAX_TRANSACT_BYTES: usize = 4_194_304;
+
+/// A multi-Region strongly consistent (MRSC) global table spans **exactly
+/// three** Regions: three replicas, or two replicas plus one witness (ADR
+/// 0075 V6, AWS "Global tables - how it works").
+///
+/// **Enforced** (ADR 0075 section 3.5, G-01 stage G-c) by
+/// [`crate::global::GlobalTableUpdate::validate`] at the wire edge and,
+/// independently, by the replicated `GlobalTableSpec::validate` at apply.
+pub const MRSC_REQUIRED_REGIONS: usize = 3;
+
+/// An MRSC table has at most **one** witness Region, in a Region different
+/// from the replicas (ADR 0075 V4/V6).
+///
+/// **Enforced** by [`crate::global::GlobalTableUpdate::validate`].
+pub const MRSC_MAX_WITNESSES: usize = 1;
+
+/// An MRSC table has at least **two** full replicas: three replicas, or two
+/// replicas plus a witness (ADR 0075 V6).
+///
+/// **Enforced** by [`crate::global::GlobalTableUpdate::validate`] (the
+/// Region-count arithmetic: `replicas + witnesses == 3` with at most one
+/// witness leaves at least two replicas).
+pub const MRSC_MIN_FULL_REPLICAS: usize = 2;
+
+/// The `GlobalTableVersion` a global table reports in `DescribeTable`: AWS's
+/// current ("2019.11.21") global-tables version, the only one this adapter
+/// serves (ADR 0075 V1/section 5.3 — the legacy 2017.11.29 operations are
+/// rejected by name). **Emitted** by `DescribeTable` for a global table only.
+pub const GLOBAL_TABLE_VERSION: &str = "2019.11.21";
 
 #[cfg(test)]
 mod tests {

@@ -7,8 +7,42 @@
 // Click a card to see that node's tablets. Depends on `dashboard_core.js`
 // (STATE, $, esc, pill, dot, idSpan, nodeIdOf, cpGroupsByTablet, tabletStatus,
 // gotoStorage) having loaded first.
+//
+// MRSC global tables (ADR 0075, G-01 G-c): a table with a replicated
+// `schemas.tables[t].global` spec shows its Region, whether the leader this
+// node can see sits outside the table's preferred-leader Region (witness
+// Region included), and the preferred Region itself. All of it is derived from
+// `/admin/status` (the full replicated `Metadata`) and the per-tablet groups
+// already polled — nothing is invented, and a cluster with no global table
+// renders exactly as before.
 
 let placementSelectedNode = null;
+
+// `{preferred_leader_region, witness, regions}` of a global table, else null.
+function globalSpecOf(status, table) {
+  const t = status && status.schemas && status.schemas.tables && status.schemas.tables[table];
+  return (t && t.global) || null;
+}
+
+// The `topology.kubernetes.io/region` label of member `nodeId`, else null.
+function regionOfMember(members, nodeId) {
+  const m = members && members[nodeId];
+  return (m && m.labels && m.labels["topology.kubernetes.io/region"]) || null;
+}
+
+// Tablets of global tables whose visible leader is off the preferred Region.
+function leadersOffPreferred(status, tablets, groups, members) {
+  const off = [];
+  Object.keys(tablets).forEach((id) => {
+    const spec = globalSpecOf(status, tablets[id].table);
+    if (!spec) return;
+    const lead = (groups[id] || []).find((x) => x.g && x.g.is_leader);
+    if (!lead) return;
+    const region = regionOfMember(members, nodeIdOf(lead.node));
+    if (region && region !== spec.preferred_leader_region) off.push(id);
+  });
+  return off;
+}
 
 // This node's tablets, from the *configured* replica set (`t.replicas`) —
 // not just the currently-reachable hosting groups — so a down node still
@@ -21,7 +55,13 @@ function tabletsForNode(nodeId, tablets, groups) {
       const gs = groups[id] || [];
       const rep = gs.find((x) => nodeIdOf(x.node) === nodeId);
       const role = rep ? (rep.g.is_leader ? "leader" : "follower") : "unreachable";
-      return { id, table: t.table || "—", role, status: tabletStatus(t, gs) };
+      const spec = globalSpecOf(STATE.status, t.table);
+      return {
+        id, table: t.table || "—", role, status: tabletStatus(t, gs),
+        preferred: spec ? spec.preferred_leader_region : null,
+        witness: !!(spec && spec.witness && spec.witness === regionOfMember(
+          (STATE.status && STATE.status.members) || {}, nodeId)),
+      };
     });
 }
 
@@ -34,7 +74,11 @@ function renderPlacement() {
   // identical comment for why a numeric sort/coercion would break here.
   const memberIds = Object.keys(members).sort();
 
-  $("pl-summary").textContent = `${memberIds.length} node(s) · ${Object.keys(tablets).length} tablet(s)`;
+  const offPreferred = leadersOffPreferred(status, tablets, groups, members);
+  $("pl-summary").innerHTML = esc(`${memberIds.length} node(s) · ${Object.keys(tablets).length} tablet(s)`) +
+    (offPreferred.length
+      ? ` ${pill("warn", "leader off preferred: " + offPreferred.length)}`
+      : "");
 
   if (!memberIds.length) {
     $("pl-grid").innerHTML = `<div class="empty">no members yet</div>`;
@@ -76,11 +120,12 @@ function renderPlacement() {
   $("pl-node-title").innerHTML = `Tablets on node ${esc(placementSelectedNode)}
     ${consoleLink(selNode && selNode.ok ? selNode.base : null, placementSelectedNode)}`;
   $("pl-node-tablets").innerHTML = forNode.length ? `<table>
-    <thead><tr><th>Tablet</th><th>Table</th><th>Role</th><th>Status</th></tr></thead>
+    <thead><tr><th>Tablet</th><th>Table</th><th>Role</th><th>Status</th><th>Global</th></tr></thead>
     <tbody>${forNode.map((t) => `<tr class="clickable" data-tablet="${esc(t.id)}">
       <td class="mono">${esc(t.id)}</td><td>${esc(t.table)}</td>
       <td style="color:${t.role === "leader" ? "var(--accent)" : "var(--text2)"};font-weight:500">${esc(t.role)}</td>
       <td>${pill(t.status, t.status)}</td>
+      <td>${t.preferred ? esc("preferred " + t.preferred + (t.witness ? " · witness here" : "")) : "—"}</td>
     </tr>`).join("")}</tbody></table>`
     : `<div class="empty">no tablets configured on this node</div>`;
   document.querySelectorAll("#pl-node-tablets tr[data-tablet]").forEach((tr) =>

@@ -3163,6 +3163,21 @@ The control WAL / shared WAL / snapshot image / `Metadata::from_json` / syskv ke
   treats `Gate::Base` as always accepted; the capped decode classifies with
   `RaftMsg::required_gate`.
 
+## G-01 stage G-c M1: `GlobalTableSpec`, `ConvertTableToGlobal`, `Gate::GlobalTables` (2026-10-05)
+
+- `MAX_SUPPORTED` is **2**; `Gate::GlobalTables` (version 2) gates
+  `MetaCommand::ConvertTableToGlobal` (exhaustive `required_gate` row). The
+  command sets `TableSchema.global` and pins every tablet's policy
+  (`PlacementPolicy::mrsc`, IN-set + strict REGION spread) in one apply; an
+  identical spec is a `NoOp`. State guards reject TTL/LSI on a global table.
+- `reconcile_placement` uses `replan_pinned` for a pinned policy: no
+  best-effort growth, never repairs across regions (a region with no node gives
+  no command).
+- **`BinaryProfile::B2` is the literal `[1,1]`**, not `own_range()`; test
+  harnesses that flip a node to B2 must do the same (see the lessons log).
+- New fields are skipped at default; shaped fixtures `v1-global.json` /
+  `v1-pinned.json` cover them (the version tag does not change).
+
 ## StorageFull: suspect WAL and in-place recovery (R-01 (d), issue #1185)
 
 `persist_round::PersistProgress` carries a `suspect` flag (`mark_suspect`/

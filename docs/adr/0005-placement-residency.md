@@ -277,3 +277,15 @@ ADR 0075).
 multi-region strongly consistent tables: one replica per region via
 `required_labels`/`SpreadPolicy` over the region key, plus a preferred-leader
 region in the placement policy. Labels are populated by roadmap G-01 stage G-a.
+
+## Amendment (2026-10-05) — `allowed_values` and region-pinned repair (ADR 0075, G-c)
+
+`PlacementPolicy` gained an additive, skipped-at-default `allowed_values`
+(label key to the exact set of acceptable values: an IN-set, which the single
+value of `required_labels` cannot express) and `PlacementPolicy::mrsc(regions)`,
+which pins a multi-region strongly consistent table to exactly its three
+Regions with one replica each. Repair under such a policy is `replan_pinned`:
+it re-validates the surviving replicas against the pin and spread, and never
+moves a replica to a Region outside the set, so a lost Region's replica waits
+for its Region (the strict pin; ADR 0075 decision D8) while a node of the same
+Region can replace a dead one. See ADR 0075's 2026-10-05 "G-c as built".

@@ -35,13 +35,9 @@ use std::time::Duration;
 use animus_env::NodeId;
 
 /// The node-label key whose value defines a node's "region" for MRSC (ADR 0075
-/// section 3.1/7).
-///
-/// **Must match G-a's `REGION_LABEL`** (`animus_placement`, roadmap G-01 stage
-/// G-a, PR #1183: `topology.kubernetes.io/region`). Defined locally so this
-/// groundwork does not depend on that unmerged PR; deduplicate to the
-/// `animus_placement` constant once #1183 lands.
-pub const REGION_LABEL: &str = "topology.kubernetes.io/region";
+/// section 3.1/7): the one `animus_placement` constant (G-01 stage G-a),
+/// re-exported so `animus_control::timing::REGION_LABEL` keeps resolving.
+pub use animus_placement::REGION_LABEL;
 
 /// The LAN election-timeout base (the low end of the randomized
 /// `[base, 2*base)` range) — what every group used before profiles existed.

@@ -377,6 +377,17 @@ pub trait AdminHost: Send + Sync {
     /// raise the cluster version by one. Local-control-leader-only, not
     /// relayed (the ADR 0037 `admin_remove_member` pattern).
     async fn action_finalize_cluster_version(&self, body: &[u8]) -> (u16, Value);
+    /// `GET /admin/global-tables` (ADR 0075 section 8, G-01 G-c) — every MRSC
+    /// global table's Regions, witness, preferred-leader Region, derived
+    /// replica status and per-tablet placement by Region, with the node-local
+    /// leader view and the operator warnings. Pure observer; empty `tables`
+    /// on a cluster with no global table.
+    async fn global_tables_view(&self) -> Value;
+    /// `POST /admin/table/preferred-leader {table, region}` (ADR 0075 3.3,
+    /// plan D3) — re-point a global table's preferred-leader Region
+    /// (`MetaCommand::SetGlobalPreferredLeader`). Relayed like a schema
+    /// proposal, so it works from any node.
+    async fn action_set_preferred_leader(&self, body: &[u8]) -> (u16, Value);
     /// `POST /admin/data/dynamo` — the admin dashboard's `execute_routed`
     /// proxy (ADR 0021); reaches `dynamo.rs`, unmoved, unmodified.
     async fn action_data_dynamo(&self, body: &[u8]) -> (u16, Value);

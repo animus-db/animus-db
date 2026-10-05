@@ -479,3 +479,18 @@ requires `--yes` (finalize cannot be undone; never an interactive prompt), POSTs
 names the leader to retry on. Pure, unit-tested pieces: `parse_finalize_args`,
 `format_cluster_version`, `finalize_preflight`; no socket tests (this crate has no
 integration tree).
+
+## `table preferred-leader`, `admin global-tables`, `admin drain --force` (ADR 0075, G-c)
+
+`table preferred-leader <admin-addr> <table> <region>` (a top-level `table`
+group, admin address like `seed`/`cluster`) POSTs `{table, region}` to
+`/admin/table/preferred-leader` (pure parser `preferred_leader_request`, unit
+tested) and prints the reply; a refusal (not a global table, a Region that is
+not one of the table's, the witness Region) is the server's named 4xx.
+`admin global-tables <admin-addr>` is a flat GET of `/admin/global-tables`.
+`admin drain <admin-addr> <node> [--force]` sends `force: true` only when set
+(older servers see the unchanged body); `--force` overrides the decommission
+guard (last Active node of a Region a global table pins). `decommission` does
+not take `--force`: it surfaces the guard's 409 and the operator drains with
+`--force` deliberately.
+

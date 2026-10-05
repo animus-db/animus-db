@@ -1,0 +1,107 @@
+{
+  "v": 1,
+  "members": {
+    "n1": {
+      "labels": {
+        "topology.kubernetes.io/region": "a"
+      },
+      "status": "Active",
+      "has_activated": true
+    },
+    "n2": {
+      "labels": {
+        "topology.kubernetes.io/region": "b"
+      },
+      "status": "Active",
+      "has_activated": true
+    },
+    "n3": {
+      "labels": {
+        "topology.kubernetes.io/region": "c"
+      },
+      "status": "Active",
+      "has_activated": true
+    }
+  },
+  "tablets": {
+    "1": {
+      "id": 1,
+      "table": "orders",
+      "range": {
+        "start": [],
+        "end": null
+      },
+      "replicas": [
+        "n1",
+        "n2",
+        "n3"
+      ],
+      "epoch": 1,
+      "state": "Active",
+      "inplace_split": null
+    }
+  },
+  "policies": {
+    "1": {
+      "name": "mrsc:orders",
+      "replication_factor": 3,
+      "required_labels": {},
+      "allowed_values": {
+        "topology.kubernetes.io/region": [
+          "a",
+          "b",
+          "c"
+        ]
+      },
+      "spread": {
+        "domain": "topology.kubernetes.io/region",
+        "strict": true
+      }
+    }
+  },
+  "schemas": {
+    "tables": {
+      "orders": {
+        "partition_key": "id",
+        "clustering_keys": [],
+        "columns": [
+          {
+            "name": "id",
+            "ty": "String"
+          }
+        ],
+        "indexes": [],
+        "stream": null,
+        "ttl": null,
+        "pitr": null,
+        "throughput": null,
+        "tags": {},
+        "global": {
+          "consistency": "Strong",
+          "regions": [
+            "a",
+            "b",
+            "c"
+          ],
+          "witness": "c",
+          "preferred_leader_region": "a"
+        }
+      }
+    }
+  },
+  "next_tablet_id": 2,
+  "node_addrs": {},
+  "split_lineage": {},
+  "split_placing": {},
+  "stream_shards": [],
+  "index_backfill": [],
+  "backups": {},
+  "backup_tablet_progress": [],
+  "restores": {},
+  "pitr_segments": [],
+  "pitr_generation": {},
+  "pitr_base_backups": [],
+  "credentials": {},
+  "exports": {},
+  "imports": {}
+}

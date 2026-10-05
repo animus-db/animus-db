@@ -37,6 +37,16 @@
 //! - `finalize_and_range`: early Finalize rejected by name (era off; blocker
 //!   present), finalize to 2 once every row reports, a node whose range
 //!   excludes the new version halts by name.
+//! - `release1_to_release2_global_gate` (G-01 stage G-c, the first **real**
+//!   gate, `Gate::GlobalTables` at cluster version 2): the whole cluster rolls
+//!   `Phase1 -> B2 (= Release(1)) -> Release(2)` under faults; a
+//!   `ConvertTableToGlobal` proposed mid-roll is refused at the proposer and
+//!   counted (never appended, no capped node ever rejects a delivery); after
+//!   the last node the cluster finalizes to 2 and only then is the command
+//!   accepted, applied identically by every replica.
+//! - `negative_control_global_gate_emitted_early` (N5): `ConvertTableToGlobal`
+//!   emitted with the gate check skipped while a `Release(1)` voter exists
+//!   wedges exactly that voter; the oracle MUST report it.
 //! - `negative_control_premature_era_variant`: N1. A buggy proposer emits an
 //!   era variant while a Phase 1 voter exists (bypassing P); the oracle MUST
 //!   fail with the exact expected violations.
@@ -70,6 +80,8 @@ const CELLS: &[(&str, usize)] = &[
     ("negative_control_ungated_variant", 2),
     ("negative_control_ungated_field", 2),
     ("negative_control_stale_view", 2),
+    ("release1_to_release2_global_gate", 6),
+    ("negative_control_global_gate_emitted_early", 2),
 ];
 
 /// The seeds a cell runs: `ANIMUS_UPGRADE_CELL` (substring) filters cells,
@@ -1112,5 +1124,340 @@ fn negative_control_ungated_field() {
 fn negative_control_stale_view() {
     run_cell("negative_control_stale_view", |seed, _| {
         run_neg(seed, Neg::StaleView)
+    });
+}
+
+// ---- release1_to_release2_global_gate + N5 (G-01 stage G-c) ----
+
+const TABLE: &str = "orders";
+
+fn global_spec() -> animus_control::GlobalTableSpec {
+    animus_control::GlobalTableSpec {
+        consistency: animus_control::MultiRegionConsistency::Strong,
+        regions: vec!["a".into(), "b".into(), "c".into()],
+        witness: None,
+        preferred_leader_region: "a".into(),
+    }
+}
+
+fn convert_cmd() -> MetaCommand {
+    MetaCommand::ConvertTableToGlobal {
+        table: TABLE.to_string(),
+        spec: global_spec(),
+    }
+}
+
+/// Every id in `ids` is recorded with exactly `range` on every control node.
+fn all_recorded_with(w: &World, ids: &[u64], range: VersionRange) -> bool {
+    let want = nid_set(ids);
+    w.nodes.values().all(|n| {
+        let m = n.metadata();
+        let r = records(&m);
+        era(&m)
+            && r.keys().cloned().collect::<BTreeSet<_>>() == want
+            && r.values().all(|(got, _)| *got == range)
+    })
+}
+
+fn is_global(m: &animus_control::Metadata) -> bool {
+    m.schemas
+        .get(TABLE)
+        .is_some_and(|s| s.global == Some(global_spec()))
+}
+
+/// A table with one tablet, created before any version era (both commands are
+/// `Gate::Base`), so there is something for `ConvertTableToGlobal` to convert.
+fn seed_table(w: &mut World) {
+    w.propose_confirmed(
+        &MetaCommand::CreateTableSchema {
+            table: TABLE.to_string(),
+            schema: animus_control::TableSchema::simple("id", animus_control::ColumnType::String),
+        },
+        &|m| m.schemas.get(TABLE).is_some(),
+        "table schema",
+    );
+    w.propose_confirmed(
+        &MetaCommand::CreateTablet {
+            tablet: animus_tablet::TabletId(1),
+            table: Some(TABLE.to_string()),
+            range: animus_tablet::KeyRange::whole(),
+            replicas: vec![nid(10), nid(11), nid(0)],
+        },
+        &|m| m.has_table_tablet(TABLE),
+        "table tablet",
+    );
+}
+
+/// Propose `ConvertTableToGlobal` while the gate is closed, through the
+/// production proposer: refused and counted, never appended. (In a debug
+/// build the `debug_assert!` in `ClusterFeatures::check` fires first, which is
+/// the point of the assert; see `gate_enforcement.rs`.)
+fn propose_while_closed(w: &World, seed: u64) {
+    propose_cmd_while_closed(w, seed, convert_cmd);
+    propose_cmd_while_closed(w, seed, preferred_cmd);
+}
+
+/// `SetGlobalPreferredLeader` (same gate as the conversion: one gate per
+/// release surface, ADR 0075 plan D1).
+fn preferred_cmd() -> MetaCommand {
+    MetaCommand::SetGlobalPreferredLeader {
+        table: TABLE.to_string(),
+        region: "b".to_string(),
+    }
+}
+
+fn propose_cmd_while_closed(w: &World, seed: u64, cmd: fn() -> MetaCommand) {
+    let l = w.leader().expect("leader");
+    let before = w.nodes[&l]
+        .features()
+        .violations(animus_control::version::GateSurface::MetaCommand);
+    let last = w.nodes[&l].last_log_index();
+    if cfg!(debug_assertions) {
+        let r =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| w.nodes[&l].propose(cmd())));
+        assert!(r.is_err(), "seed={seed}: a closed gate must debug_assert");
+    } else {
+        assert!(
+            matches!(
+                w.nodes[&l].propose(cmd()),
+                animus_control::raft::ProposeResult::NotLeader { leader: None }
+            ),
+            "seed={seed}: a closed gate must refuse"
+        );
+    }
+    assert_eq!(
+        w.nodes[&l]
+            .features()
+            .violations(animus_control::version::GateSurface::MetaCommand),
+        before + 1,
+        "seed={seed}: the refusal is counted"
+    );
+    assert_eq!(
+        w.nodes[&l].last_log_index(),
+        last,
+        "seed={seed}: a refused command was appended"
+    );
+}
+
+fn run_global_gate(seed: u64, variant: u64) {
+    use animus_control::version::Gate;
+    let mut w = World::new_faithful(seed, &VOTERS, &[LEARNER], &MEMBERS);
+    w.bootstrap();
+    let mut c = |w: &World| check(w);
+    w.run(Duration::from_millis(500), &mut c);
+    seed_table(&mut w);
+
+    // Phase 1 -> B2 (= Release(1), range [1, 1]) everywhere; the era starts.
+    for id in all_ids() {
+        w.flip(id, false);
+    }
+    let ids = all_ids();
+    finish_with(&mut w, &ids, &mut c);
+    assert!(
+        w.nodes
+            .values()
+            .all(|n| !n.features().is_open(Gate::GlobalTables)),
+        "seed={seed}: the gate is closed at cluster version 1"
+    );
+
+    // B2 -> Release(2) (range [1, 2]), in a seed-dependent order, with faults;
+    // a mid-roll proposal of the gated command must be refused at the proposer.
+    let order = match variant % 3 {
+        0 => vec![0, 1, 2, 3, 10, 11],
+        1 => vec![10, 11, 3, 2, 1, 0],
+        _ => shuffled(&mut w.rng.fork(), all_ids()),
+    };
+    for (n, id) in order.into_iter().enumerate() {
+        if n == 3 {
+            // A genuine mix: three Release(2) binaries, three B2 binaries.
+            w.run(Duration::from_millis(300), &mut c);
+            propose_while_closed(&w, seed);
+        }
+        for _ in 0..w.rng.below(2) {
+            let f = pick_fault(&mut w.rng);
+            if let Some(h) = w.inject(f) {
+                let d = ms(&mut w.rng, 100, 700);
+                w.run(d, &mut c);
+                w.heal(h);
+            }
+            let d = ms(&mut w.rng, 50, 300);
+            w.run(d, &mut c);
+        }
+        let restart = w.rng.chance(50);
+        w.flip_range(id, (1, 2), restart);
+        let d = ms(&mut w.rng, 50, 500);
+        w.run(d, &mut c);
+    }
+    w.heal_all();
+    w.poll(
+        Duration::from_secs(60),
+        "every node recorded as a [1,2] binary",
+        &mut c,
+        &|w| all_recorded_with(w, &ids, VersionRange::new(1, 2)),
+    );
+    // Rolled but not finalized: the gate is still closed.
+    let l = w.leader().expect("leader");
+    assert!(
+        !w.nodes[&l].features().is_open(Gate::GlobalTables),
+        "seed={seed}: the gate opened before the finalize"
+    );
+    propose_while_closed(&w, seed);
+
+    // Finalize 1 -> 2: the gate opens on every node, and only then is the
+    // command accepted.
+    w.propose_confirmed(
+        &MetaCommand::FinalizeClusterVersion {
+            expected: 1,
+            target: 2,
+        },
+        &|m| m.cluster_version() == 2,
+        "finalize 1 -> 2",
+    );
+    w.poll(
+        Duration::from_secs(30),
+        "every node at cluster version 2 with the gate open",
+        &mut c,
+        &|w| {
+            w.nodes.values().all(|n| {
+                n.metadata().cluster_version() == 2 && n.features().is_open(Gate::GlobalTables)
+            })
+        },
+    );
+    w.propose_confirmed(
+        &convert_cmd(),
+        &is_global,
+        "ConvertTableToGlobal at version 2",
+    );
+    w.poll(
+        Duration::from_secs(30),
+        "every replica applied the conversion and agrees",
+        &mut c,
+        &|w| {
+            wedged_replicas(w).is_empty()
+                && w.nodes.values().all(|n| {
+                    let m = n.metadata();
+                    is_global(&m)
+                        && m.policies
+                            .values()
+                            .all(|p| p.is_pinned() && p.allowed_values.len() == 1)
+                })
+        },
+    );
+    // The preferred-leader command shares the gate: accepted now.
+    w.propose_confirmed(
+        &preferred_cmd(),
+        &|m| {
+            m.schemas
+                .get(TABLE)
+                .and_then(|s| s.global.as_ref())
+                .is_some_and(|g| g.preferred_leader_region == "b")
+        },
+        "SetGlobalPreferredLeader at version 2",
+    );
+    w.poll(
+        Duration::from_secs(30),
+        "every replica applied the preferred-leader change and agrees",
+        &mut c,
+        &|w| {
+            wedged_replicas(w).is_empty()
+                && w.nodes.values().all(|n| {
+                    n.metadata()
+                        .schemas
+                        .get(TABLE)
+                        .and_then(|s| s.global.as_ref())
+                        .is_some_and(|g| g.preferred_leader_region == "b")
+                })
+        },
+    );
+    let metas: Vec<_> = w.nodes.values().map(|n| n.metadata()).collect();
+    assert!(
+        metas
+            .windows(2)
+            .all(|p| p[0].schemas == p[1].schemas && p[0].policies == p[1].policies),
+        "seed={seed}: replicas disagree on the global schema/policy"
+    );
+    // Delivery: no capped binary ever rejected anything in a clean roll.
+    let rej = w.cap_rejections();
+    assert!(rej.is_empty(), "seed={seed}: {rej:?}");
+    check(&w);
+}
+
+#[test]
+fn release1_to_release2_global_gate() {
+    run_cell("release1_to_release2_global_gate", run_global_gate);
+}
+
+/// N5: at cluster version 1 with one `Release(1)` (B2) voter, emit
+/// `ConvertTableToGlobal` with the gate check skipped. The oracle MUST report
+/// the delivery to the old binary and exactly that replica wedged.
+fn run_n5(seed: u64) {
+    let mut w = World::new_faithful(seed, &VOTERS, &[LEARNER], &MEMBERS);
+    w.bootstrap();
+    let mut c = |w: &World| check(w);
+    w.run(Duration::from_millis(500), &mut c);
+    seed_table(&mut w);
+    for id in all_ids() {
+        w.flip_range(id, if id == OLD { (1, 1) } else { (1, 2) }, false);
+    }
+    w.poll(
+        Duration::from_secs(40),
+        "era on, every record present",
+        &mut c,
+        &|w| {
+            w.nodes.values().all(|n| {
+                let m = n.metadata();
+                era(&m) && m.node_versions.len() == all_ids().len()
+            })
+        },
+    );
+    // A leader that is not the old node (the cluster stays at version 1: the
+    // old node's [1,1] range blocks every finalize).
+    for _ in 0..10 {
+        if matches!(w.leader(), Some(l) if l != OLD) {
+            break;
+        }
+        if let Some(h) = w.inject(Fault::LeaderKill) {
+            w.run(Duration::from_secs(2), &mut |_| {});
+            w.heal(h);
+            w.run(Duration::from_secs(1), &mut |_| {});
+        }
+    }
+    let l = w.leader().expect("leader");
+    assert_ne!(l, OLD, "seed={seed}: could not get a non-old leader");
+    assert!(
+        w.nodes
+            .values()
+            .all(|n| n.metadata().cluster_version() == 1),
+        "seed={seed}: the cluster must still be at version 1"
+    );
+    assert!(
+        instant_violations(&w).is_empty(),
+        "seed={seed}: violations before the bad emit"
+    );
+    let pre_log = w.nodes[&OLD].last_log_index();
+    let _ = w.nodes[&l].propose_ungated_for_negative_control(convert_cmd());
+    w.run(Duration::from_secs(5), &mut |_| {});
+    let v = instant_violations(&w);
+    assert_eq!(
+        wedged_replicas(&w),
+        vec![OLD],
+        "seed={seed}: only the Release(1) replica is wedged"
+    );
+    assert!(
+        v.iter()
+            .any(|s| s.starts_with("delivery: node 2 (B2) rejected a GlobalTables")),
+        "seed={seed}: the cap never rejected the ConvertTableToGlobal entry: {v:#?}"
+    );
+    assert_eq!(
+        w.nodes[&OLD].last_log_index(),
+        pre_log,
+        "seed={seed}: the old replica appended the gated command"
+    );
+}
+
+#[test]
+fn negative_control_global_gate_emitted_early() {
+    run_cell("negative_control_global_gate_emitted_early", |seed, _| {
+        run_n5(seed)
     });
 }

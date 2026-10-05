@@ -788,6 +788,7 @@ fn is_ddl_mutation(op: &Operation) -> bool {
         op,
         Operation::CreateTable { .. }
             | Operation::UpdateTable { .. }
+            | Operation::UpdateTableGlobal { .. }
             | Operation::DeleteTable { .. }
             | Operation::UpdateTimeToLive { .. }
             | Operation::UpdateContinuousBackups { .. }
@@ -903,6 +904,11 @@ async fn run_operation(
                 throughput_update,
             )
             .await
+        }
+        // ADR 0075 (G-01 stage G-c): `ReplicaUpdates` / witness /
+        // `MultiRegionConsistency` — the global-table conversion, gate first.
+        Operation::UpdateTableGlobal { table, update } => {
+            crate::global_tables::update_table_global(ctx, &table, update).await
         }
         Operation::DescribeTable { table } => describe_table(ctx, meta, &table),
         Operation::DeleteTable { table } => delete_table(ctx, &table).await,
@@ -2027,6 +2033,11 @@ async fn dispatch_table_op<E: Env, R: RelayClient>(
             exclusive_start_table_name,
             limit,
         } => list_tables(meta, exclusive_start_table_name.as_deref(), limit),
+        // ADR 0075 (G-01 stage G-c): the global-table conversion — the same
+        // generic handler `run_operation` reaches.
+        Operation::UpdateTableGlobal { table, update } => {
+            crate::global_tables::update_table_global(ctx, &table, update).await
+        }
         // ADR 0061 rung D3 PR 2b + rung G (C-07 PR 2) + rung J (C-10 PR 2):
         // the throughput-only, stream-only, and (since rung J) index-change
         // shapes of `UpdateTable` are all covered now — see `update_table`'s
@@ -2149,6 +2160,7 @@ pub(crate) async fn execute_item_op_as<E: Env, R: RelayClient>(
                     | Operation::ListTables { .. }
                     | Operation::DescribeTable { .. }
                     | Operation::UpdateTable { .. }
+                    | Operation::UpdateTableGlobal { .. }
             ) {
                 dispatch_table_op(ctx, meta, op).await
             } else {
@@ -2254,6 +2266,9 @@ async fn update_time_to_live<E: Env, R: RelayClient>(
              `{table}`'s currently-enabled TTL attribute `{}`",
             current.attribute_name
         )));
+    }
+    if enabled {
+        crate::global_tables::reject_ttl_on_global(&meta, table)?;
     }
     let spec = enabled.then(|| TtlSpec {
         attribute_name: attribute_name.to_owned(),
@@ -5048,7 +5063,7 @@ async fn drop_table_index<E: Env, R: RelayClient>(
 /// every table before this derivation existed and nothing here should
 /// change that default. Derived fresh from the live tablet map every call,
 /// never stored redundantly on the schema/catalog row.
-fn table_status(meta: &Metadata, table: &str) -> &'static str {
+pub(crate) fn table_status(meta: &Metadata, table: &str) -> &'static str {
     if meta
         .tablets_for_table(table)
         .any(|(_, t)| t.state != TabletState::Active)
@@ -5072,6 +5087,20 @@ fn describe_table<E: Env, R: RelayClient>(
     meta: &Metadata,
     table: &str,
 ) -> Result<String, WireError> {
+    describe_table_wrapped(meta, table, "Table")
+}
+
+/// [`describe_table`]'s body, parameterized on the key the description is
+/// wrapped under (`"Table"` for `DescribeTable`, `"TableDescription"` for the
+/// global-table `UpdateTable`, AWS's shape for each) and extended with a
+/// global table's `GlobalTableVersion`/`Replicas`/`MultiRegionConsistency`/
+/// `GlobalTableWitnesses` (ADR 0075 section 5.1) — emitted **only** for a
+/// global table, so every other table's output is byte-identical to before.
+pub(crate) fn describe_table_wrapped(
+    meta: &Metadata,
+    table: &str,
+    wrapper: &str,
+) -> Result<String, WireError> {
     let Some(control_schema) = meta.table_schema(table) else {
         return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
             table.to_owned(),
@@ -5094,7 +5123,8 @@ fn describe_table<E: Env, R: RelayClient>(
         .map(|d| (d.name.clone(), d.status))
         .collect();
     let stream_desc = meta.table_stream(table).map(stream_description);
-    Ok(wire::describe_table_response(
+    let global = crate::global_tables::global_description(meta, table);
+    Ok(wire::table_description_response(
         table,
         &dynamo_schema,
         &key_types,
@@ -5103,6 +5133,8 @@ fn describe_table<E: Env, R: RelayClient>(
         stream_desc.as_ref(),
         table_status(meta, table),
         meta.table_throughput(table),
+        global.as_ref(),
+        wrapper,
     ))
 }
 
@@ -5474,6 +5506,13 @@ async fn run_transact<E: Env, R: RelayClient>(
         animus_control::OpClass::Write,
         actions.iter().map(TransactAction::table),
     )?;
+    for action in actions {
+        crate::global_tables::reject_transaction_on_global(
+            meta,
+            action.table(),
+            "TransactWriteItems",
+        )?;
+    }
     // Cheap, pure validation up front (ADR 0018's 2026-08-24 amendment): every
     // action's table must not be the reserved internal table, and no two
     // actions may target the same item — both checked **before** the
@@ -6277,6 +6316,9 @@ async fn run_transact_get<E: Env, R: RelayClient>(
         animus_control::OpClass::Read,
         gets.iter().map(|g| g.table.as_str()),
     )?;
+    for get in gets {
+        crate::global_tables::reject_transaction_on_global(meta, &get.table, "TransactGetItems")?;
+    }
 
     let mut keys: Vec<(String, Vec<u8>)> = Vec::with_capacity(gets.len());
     let mut seen: BTreeSet<(String, Vec<u8>)> = BTreeSet::new();
@@ -9297,7 +9339,7 @@ fn key_item_of<E: Env, R: RelayClient>(
 }
 
 /// Map a registry error to a DynamoDB wire error code.
-fn registry_error(err: animus_dynamo::RegistryError) -> WireError {
+pub(crate) fn registry_error(err: animus_dynamo::RegistryError) -> WireError {
     use animus_dynamo::RegistryError as R;
     match err {
         R::NoSuchTable(t) => WireError {

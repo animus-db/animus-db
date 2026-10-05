@@ -30,6 +30,7 @@
 use animus_storage::{StorageEngine, Version};
 
 pub mod capacity;
+pub mod global;
 pub mod internal_tables;
 pub mod limits;
 pub mod partiql;
