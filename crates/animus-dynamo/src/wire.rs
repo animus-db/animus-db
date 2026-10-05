@@ -759,6 +759,21 @@ pub enum Operation {
         /// this call doesn't touch throughput at all.
         throughput_update: Option<Option<ProvisionedThroughput>>,
     },
+    /// `UpdateTable` carrying `ReplicaUpdates` / `GlobalTableWitnessUpdates` /
+    /// `MultiRegionConsistency` (ADR 0075 section 5.1, G-01 stage G-c): the
+    /// global-table conversion. A **separate variant** from
+    /// [`UpdateTable`](Self::UpdateTable) so no existing struct literal gains
+    /// a field. The payload is the *undigested* request
+    /// ([`crate::global::GlobalTableUpdate`]): `animusd` checks
+    /// `Gate::GlobalTables` first (a closed gate keeps the pre-G-c
+    /// `ReplicaUpdates is not supported` text byte for byte) and only then
+    /// validates it.
+    UpdateTableGlobal {
+        /// Target table name.
+        table: String,
+        /// What the request said.
+        update: crate::global::GlobalTableUpdate,
+    },
     /// `DescribeTable` (ADR 0042 §2): a pure read of the replicated catalog
     /// (key schema, secondary-index definitions, stream configuration).
     DescribeTable {
@@ -1402,6 +1417,7 @@ impl Operation {
         match self {
             Operation::CreateTable { table, .. }
             | Operation::UpdateTable { table, .. }
+            | Operation::UpdateTableGlobal { table, .. }
             | Operation::DescribeTable { table, .. }
             | Operation::DeleteTable { table, .. }
             | Operation::PutItem { table, .. }
@@ -2028,6 +2044,12 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
         }),
         "DescribeLimits" => Ok(Operation::DescribeLimits),
         "DescribeEndpoints" => Ok(Operation::DescribeEndpoints),
+        // ADR 0075 section 5.3: the legacy (2017.11.29) global tables control
+        // plane is rejected by name, ungated (rejecting is not a new
+        // surface).
+        legacy if crate::global::LEGACY_GLOBAL_TABLE_OPERATIONS.contains(&legacy) => {
+            Err(crate::global::legacy_global_table_operation_error(legacy))
+        }
         _ => Err(WireError::unknown_operation(target)),
     }
 }
@@ -4269,7 +4291,9 @@ pub(crate) fn stream_view_type_str(vt: StreamViewType) -> &'static str {
 }
 
 /// `UpdateTable` top-level keys this adapter never implements a change for —
-/// no encryption-at-rest toggle, and no global-tables replica set (see
+/// no encryption-at-rest toggle (`ReplicaUpdates` used to be listed here too;
+/// since G-01 stage G-c it routes to [`Operation::UpdateTableGlobal`] and the
+/// `animusd` edge decides, gate first; see
 /// `website/compatibility.html`'s "no billing meter" framing — provisioned
 /// throughput itself **is** now supported, ADR 0065 §5(b); `BillingMode`/
 /// `ProvisionedThroughput` are handled separately, by
@@ -4277,7 +4301,7 @@ pub(crate) fn stream_view_type_str(vt: StreamViewType) -> &'static str {
 /// unconditionally, so a body carrying either of these is a clear
 /// `ValidationException` naming the key rather than the generic "requires
 /// either..." fallback or, worse, a silent no-op.
-const UNSUPPORTED_UPDATE_TABLE_KEYS: &[&str] = &["SSESpecification", "ReplicaUpdates"];
+const UNSUPPORTED_UPDATE_TABLE_KEYS: &[&str] = &["SSESpecification"];
 
 /// Reject any `UpdateTable` top-level key this adapter doesn't model at all,
 /// each with its own named `ValidationException` (mirroring
@@ -4355,6 +4379,15 @@ fn decode_update_table_throughput(
 /// new key attribute.
 fn decode_update_table(obj: &Map<String, Value>) -> Result<Operation, WireError> {
     let table = table_name(obj)?;
+    // ADR 0075 (G-01 stage G-c): a global-table conversion is its own typed
+    // operation; the gate decision and the validation are `animusd`'s (see
+    // `crate::global`'s module doc for why the decoder never rejects here).
+    if crate::global::is_global_table_update(obj) {
+        return Ok(Operation::UpdateTableGlobal {
+            table,
+            update: crate::global::decode_update_table_global(obj),
+        });
+    }
     reject_unsupported_update_table_keys(obj)?;
     let has_index_updates = obj.contains_key("GlobalSecondaryIndexUpdates");
     let has_stream_spec = obj.contains_key("StreamSpecification");
@@ -6393,6 +6426,41 @@ pub fn describe_table_response(
     status: &str,
     throughput: Option<&ProvisionedThroughput>,
 ) -> String {
+    table_description_response(
+        table,
+        schema,
+        key_types,
+        indexes,
+        index_statuses,
+        stream,
+        status,
+        throughput,
+        None,
+        "Table",
+    )
+}
+
+/// [`describe_table_response`] generalized for a global table (ADR 0075
+/// section 5.1): `global` adds `GlobalTableVersion`/`MultiRegionConsistency`/
+/// `Replicas`/`GlobalTableWitnesses` (and is `None` for every non-global
+/// table, whose output is byte-identical to [`describe_table_response`]'s),
+/// and `wrapper` is the key the description sits under — `"Table"` for
+/// `DescribeTable`, `"TableDescription"` for `UpdateTable`/`CreateTable`/
+/// `DeleteTable` (AWS's shape for each).
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn table_description_response(
+    table: &str,
+    schema: &TableSchema,
+    key_types: &[(String, String)],
+    indexes: &[SecondaryIndex],
+    index_statuses: &[(String, IndexStatus)],
+    stream: Option<&StreamDescription>,
+    status: &str,
+    throughput: Option<&ProvisionedThroughput>,
+    global: Option<&crate::global::GlobalTableDescription>,
+    wrapper: &str,
+) -> String {
     let mut desc = table_description_object(
         table,
         schema,
@@ -6406,8 +6474,11 @@ pub fn describe_table_response(
         "AttributeDefinitions".into(),
         Value::Array(attribute_definitions(schema, key_types, indexes)),
     );
+    if let Some(global) = global {
+        global.apply_to(&mut desc);
+    }
     let mut obj = Map::new();
-    obj.insert("Table".into(), Value::Object(desc));
+    obj.insert(wrapper.into(), Value::Object(desc));
     serde_json::to_string(&Value::Object(obj)).expect("describe-table response serializes")
 }
 
@@ -9145,13 +9216,72 @@ mod tests {
         );
     }
 
+    /// G-01 stage G-c: a non-global table's `DescribeTable` is unchanged (no
+    /// `GlobalTableVersion`/`Replicas`/`MultiRegionConsistency`), and a global
+    /// one gains exactly those fields, under either wrapper key.
     #[test]
-    fn update_table_rejects_replica_updates() {
+    fn table_description_response_global_fields_are_additive() {
+        let schema = TableSchema::simple("id");
+        let args = |global: Option<&crate::global::GlobalTableDescription>, wrapper: &str| {
+            table_description_response(
+                "tbl",
+                &schema,
+                &[("id".into(), "S".into())],
+                &[],
+                &[],
+                None,
+                "ACTIVE",
+                None,
+                global,
+                wrapper,
+            )
+        };
+        let plain = describe_table_response(
+            "tbl",
+            &schema,
+            &[("id".into(), "S".into())],
+            &[],
+            &[],
+            None,
+            "ACTIVE",
+            None,
+        );
+        assert_eq!(plain, args(None, "Table"));
+        for key in [
+            "GlobalTableVersion",
+            "Replicas",
+            "MultiRegionConsistency",
+            "GlobalTableWitnesses",
+        ] {
+            assert!(!plain.contains(key), "{key} leaked into a non-global table");
+        }
+        let g = crate::global::GlobalTableDescription {
+            replicas: vec![("a".into(), crate::global::RegionStatus::Active)],
+            witness: None,
+        };
+        let v: Value = serde_json::from_str(&args(Some(&g), "TableDescription")).unwrap();
+        assert_eq!(v["TableDescription"]["GlobalTableVersion"], "2019.11.21");
+        assert_eq!(v["TableDescription"]["MultiRegionConsistency"], "STRONG");
+        assert_eq!(v["TableDescription"]["Replicas"][0]["RegionName"], "a");
+        assert!(v.get("Table").is_none());
+    }
+
+    /// G-01 stage G-c: `ReplicaUpdates` decodes to the typed
+    /// `UpdateTableGlobal` op (the gate and the validation are `animusd`'s);
+    /// the gate-closed text is the pre-G-c text byte for byte.
+    #[test]
+    fn update_table_routes_replica_updates_to_the_global_op() {
         let body =
             br#"{"TableName":"tbl","ReplicaUpdates":[{"Create":{"RegionName":"us-west-2"}}]}"#;
-        let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
-        assert_eq!(err.code, "ValidationException");
-        assert_eq!(err.message, "UpdateTable: ReplicaUpdates is not supported");
+        match decode_request("DynamoDB_20120810.UpdateTable", body).unwrap() {
+            Operation::UpdateTableGlobal { table, update } => {
+                assert_eq!(table, "tbl");
+                let err = update.closed_gate_error();
+                assert_eq!(err.code, "ValidationException");
+                assert_eq!(err.message, "UpdateTable: ReplicaUpdates is not supported");
+            }
+            other => panic!("expected UpdateTableGlobal, got {other:?}"),
+        }
     }
 
     /// ADR 0065 §5(b): a bare `ProvisionedThroughput`, no `BillingMode`

@@ -608,6 +608,12 @@ impl AdminHost for ClientCtx {
     async fn action_finalize_cluster_version(&self, body: &[u8]) -> (u16, Value) {
         action_finalize_cluster_version(self, body).await
     }
+    async fn global_tables_view(&self) -> Value {
+        crate::global_tables::admin_global_tables_view(self)
+    }
+    async fn action_set_preferred_leader(&self, body: &[u8]) -> (u16, Value) {
+        action_set_preferred_leader(self, body).await
+    }
     async fn action_data_dynamo(&self, body: &[u8]) -> (u16, Value) {
         action_data_dynamo_concrete(self, body).await
     }
@@ -780,6 +786,12 @@ impl<E: Env, R: RelayClient> AdminHost for GenericAdminHost<E, R> {
     }
     async fn action_finalize_cluster_version(&self, body: &[u8]) -> (u16, Value) {
         action_finalize_cluster_version(&self.0, body).await
+    }
+    async fn global_tables_view(&self) -> Value {
+        crate::global_tables::admin_global_tables_view(&self.0)
+    }
+    async fn action_set_preferred_leader(&self, body: &[u8]) -> (u16, Value) {
+        action_set_preferred_leader(&self.0, body).await
     }
     async fn action_data_dynamo(&self, body: &[u8]) -> (u16, Value) {
         action_data_dynamo(&self.0, body).await
@@ -2349,6 +2361,10 @@ struct ReconfigureReq {
 #[derive(Deserialize)]
 struct DrainReq {
     node: NodeId,
+    /// Drain even when `node` is the last Active member of a Region a global
+    /// table pins (the decommission guard, ADR 0075 plan D10).
+    #[serde(default)]
+    force: bool,
 }
 
 /// `POST /admin/member/remove` request body (ADR 0032 PR3 decommission):
@@ -2654,7 +2670,7 @@ fn action_drain<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>, body: &[u8]) -> (
         Ok(r) => r,
         Err(e) => return e,
     };
-    match ctx.admin_drain(req.node.clone()) {
+    match ctx.admin_drain(req.node.clone(), req.force) {
         Ok(()) => (
             200,
             json!({"ok": true, "node": req.node, "status": "Leaving"}),
@@ -2846,6 +2862,24 @@ async fn action_transfer_control_leadership<E: Env, R: RelayClient>(
         Ok(()) => (200, json!({"ok": true, "to": req.to})),
         Err(e) => (409, json!({"error": e})),
     }
+}
+
+/// `POST /admin/table/preferred-leader {table, region}` (ADR 0075 plan D3).
+#[derive(Deserialize)]
+struct PreferredLeaderReq {
+    table: String,
+    region: String,
+}
+
+async fn action_set_preferred_leader<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    body: &[u8],
+) -> (u16, Value) {
+    let req: PreferredLeaderReq = match parse_body(body) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    crate::global_tables::admin_set_preferred_leader(ctx, &req.table, &req.region).await
 }
 
 /// `POST /admin/cluster-version/finalize {to?, expected?}` (ADR 0073 Phase 2,

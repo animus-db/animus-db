@@ -149,7 +149,9 @@ pub(crate) fn classify(op: &Operation) -> (&'static str, OpClass) {
         Operation::TransactWriteItems { .. } => ("TransactWriteItems", OpClass::Write),
 
         Operation::CreateTable { .. } => ("CreateTable", OpClass::Ddl),
-        Operation::UpdateTable { .. } => ("UpdateTable", OpClass::Ddl),
+        Operation::UpdateTable { .. } | Operation::UpdateTableGlobal { .. } => {
+            ("UpdateTable", OpClass::Ddl)
+        }
         Operation::DeleteTable { .. } => ("DeleteTable", OpClass::Ddl),
         Operation::UpdateTimeToLive { .. } => ("UpdateTimeToLive", OpClass::Ddl),
         Operation::TagResource { .. } => ("TagResource", OpClass::Ddl),
@@ -282,6 +284,7 @@ pub(crate) fn authorize_op<E: Env, R: RelayClient>(
 
         Operation::CreateTable { table, .. }
         | Operation::UpdateTable { table, .. }
+        | Operation::UpdateTableGlobal { table, .. }
         | Operation::DescribeTable { table, .. }
         | Operation::DeleteTable { table, .. }
         | Operation::PutItem { table, .. }
@@ -493,6 +496,18 @@ mod tests {
                     index_update: None,
                     key_types: vec![],
                     throughput_update: None,
+                },
+                "UpdateTable",
+                OpClass::Ddl,
+            ),
+            (
+                Operation::UpdateTableGlobal {
+                    table: table(),
+                    update: animus_dynamo::global::decode_update_table_global(
+                        serde_json::json!({"ReplicaUpdates": []})
+                            .as_object()
+                            .expect("object"),
+                    ),
                 },
                 "UpdateTable",
                 OpClass::Ddl,

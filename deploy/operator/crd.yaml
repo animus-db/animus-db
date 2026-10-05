@@ -146,6 +146,21 @@ spec:
                   [`DEFAULT_IMAGE`](Self::DEFAULT_IMAGE) when omitted.
                 nullable: true
                 type: string
+              maxRegionRttMs:
+                description: |-
+                  An upper bound, in milliseconds, on the round trip between any two
+                  **regions** of a stretch cluster (ADR 0075 section 3.4, G-01 G-c; ADR
+                  0060 stretch shape). Emitted into the generated `cluster.json`'s
+                  `cluster_settings.max_region_rtt_ms`, where it sizes the WAN Raft
+                  timing profile of every group whose replicas span more than one
+                  `topology.kubernetes.io/region`. `None` (default) leaves the node's own
+                  default (150 ms); **inert on a single-region or unlabelled cluster**.
+                  Additive and skipped when unset, so an existing spec's `cluster.json`
+                  is byte-identical.
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
               nodes:
                 description: Total pod count (`StatefulSet.spec.replicas`). Must be at least 1.
                 format: int32

@@ -4,8 +4,10 @@
 //! A per-node "binary" is `SimCluster::set_node_version` (own version profile,
 //! the control `RaftNode`'s own range and the simulated handshake `ext`).
 //!
-//! Synthetic ranges `[1, 2]` stand in for a real second release, since the
-//! real `MAX_SUPPORTED` is still 1 (no gate has shipped).
+//! Synthetic ranges `[1, 2]` stand in for a second release. The real
+//! `MAX_SUPPORTED` is 2 since G-01 stage G-c shipped the first real gate
+//! (`Gate::GlobalTables`), so a real binary's own range is `[1, 2]` too; the
+//! synthetic ranges here keep these cells independent of the real constant.
 //!
 //! Covered here:
 //! - the era starts and every role (control-only, combined, **data-only**,

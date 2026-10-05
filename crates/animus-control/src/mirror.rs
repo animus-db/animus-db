@@ -370,9 +370,25 @@ pub fn apply_and_derive_mirror(
         | MetaCommand::SetTableThroughput { table, .. }
         // W-06: a table's tags are likewise part of its schema entry.
         | MetaCommand::TagResource { table, .. }
-        | MetaCommand::UntagResource { table, .. } => {
+        | MetaCommand::UntagResource { table, .. }
+        // ADR 0075 section 3.3: the preferred-leader Region lives in the
+        // schema entry's `global` spec.
+        | MetaCommand::SetGlobalPreferredLeader { table, .. } => {
             if let Some(schema) = meta.schemas.get(table) {
                 writes.push(put_json(syskv::schema_key(table), schema));
+            }
+        }
+        MetaCommand::ConvertTableToGlobal { table, .. } => {
+            // ADR 0075 (G-01 stage G-c): the schema entry (`global` set) plus
+            // the pinned policy this apply wrote for every tablet of the
+            // table, in the same derived batch.
+            if let Some(schema) = meta.schemas.get(table) {
+                writes.push(put_json(syskv::schema_key(table), schema));
+            }
+            for (tablet, _) in meta.tablets_for_table(table) {
+                if let Some(policy) = meta.policies.get(tablet) {
+                    writes.push(put_json(syskv::policy_key(*tablet), policy));
+                }
             }
         }
         MetaCommand::UpdateContinuousBackups { table, .. } => {
@@ -2648,6 +2664,22 @@ mod tests {
                 cut_version: 10,
                 bytes: 100,
                 chunk_count: 1,
+            },
+            // ADR 0075: a global-table conversion rewrites the schema entry
+            // AND the table's tablet policy in one apply; the rebuilt
+            // `Metadata` must agree on both.
+            MetaCommand::ConvertTableToGlobal {
+                table: "t".to_string(),
+                spec: crate::schema::GlobalTableSpec {
+                    consistency: crate::schema::MultiRegionConsistency::Strong,
+                    regions: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+                    witness: None,
+                    preferred_leader_region: "a".to_string(),
+                },
+            },
+            MetaCommand::SetGlobalPreferredLeader {
+                table: "t".to_string(),
+                region: "b".to_string(),
             },
             MetaCommand::RegisterNode {
                 node: nid(2),

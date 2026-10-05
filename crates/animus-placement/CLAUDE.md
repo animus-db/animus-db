@@ -131,3 +131,13 @@ A cluster-default policy and operator-facing policy management are future work.
   must be able to double up rather than refuse. The reconciler never repairs a
   best-effort spread that merely started skewed, so the *initial* pick must use
   the spread too (`animusd::schema::zone_aware_initial_replicas`).
+
+## G-01 stage G-c M1 additions (2026-10-05)
+
+- `PlacementPolicy.allowed_values` (label key -> IN-set, serde-skipped when
+  empty), `mrsc(name, regions)` (RF 3 + IN-set + strict `REGION_LABEL` spread)
+  and `is_pinned()`.
+- `replan_pinned(current, candidates, policy)`: drops survivors duplicating a
+  strict domain (lowest node id kept), then fills; **no best-effort growth** and
+  `InsufficientDomains` when a pinned region has no node (never repair across
+  regions). Property tests start from violating sets (`tests/it/pinned.rs`).

@@ -63,10 +63,20 @@
 //!   a `RegisterNode`, in-range joiners recorded with their range; a disjoint
 //!   range is refused one layer earlier, at the handshake).
 //!
-//! # Not covered (needs a real gate)
+//! - `release1_to_release2_global_gate`: the first real gate (`Gate::
+//!   GlobalTables`, cluster version 2): B2 (`[1,1]`) -> `Release(2)` (`[1,2]`)
+//!   with a table present; a relayed `ConvertTableToGlobal` is refused by name
+//!   by the receiver before the finalize (counted, nothing appended), accepted
+//!   after it, and the conversion (spec + pinned policies) lands on every node
+//!   including the data-only node's mirror, with no capped rejection;
+//! - `negative_control_global_gate_emitted_early` (N5): the same command
+//!   appended ungated with a B2 voter present; the oracle MUST report the
+//!   capped rejection at exactly that voter, wedged and never appended.
 //!
-//! - `Release(N-1) -> Release(N)` rolls over real gates: the first real gate
-//!   (ADR 0073 section 7 rule 3). The synthetic ladder stands in until then.
+//! # Not covered
+//!
+//! - Roll orders / leader kills over `Release(1) -> Release(2)`: the pure
+//!   tier covers the per-node matrix; the ladder covers the finalize flow.
 //!
 //! Each cell runs on its own OS thread under a wall-clock watchdog
 //! ([`CELL_WATCHDOG`], a bound on a hang, never a verdict).
@@ -124,6 +134,10 @@ enum Kind {
     },
     /// Joiner range checks at discovery (`RegisterNode` joiners).
     JoinerRange,
+    /// B2 -> Release(2) over `Gate::GlobalTables` (the first real gate).
+    GlobalGate,
+    /// N5: `ConvertTableToGlobal` emitted ungated with a B2 voter.
+    GlobalGateNegative,
 }
 
 /// The three ladder negative controls (ADR 0073 section 7).
@@ -202,6 +216,11 @@ fn cells() -> Vec<Cell> {
             Kind::Phase1Joiner { via_data: true },
         ),
         cell("joiner_range_checks", Kind::JoinerRange),
+        cell("release1_to_release2_global_gate", Kind::GlobalGate),
+        cell(
+            "negative_control_global_gate_emitted_early",
+            Kind::GlobalGateNegative,
+        ),
     ]
 }
 
@@ -306,6 +325,8 @@ fn run(c: &Cell) -> Verdict {
         Kind::LadderNegative(n) => run_ladder_negative(c, n),
         Kind::Phase1Joiner { via_data } => run_phase1_joiner(c, via_data),
         Kind::JoinerRange => run_joiner_range(c),
+        Kind::GlobalGate => run_global_gate(c),
+        Kind::GlobalGateNegative => run_global_negative(c),
         _ => run_roll(c),
     }
 }
@@ -575,7 +596,9 @@ fn run_roll(c: &Cell) -> Verdict {
         | Kind::Ladder
         | Kind::LadderNegative(_)
         | Kind::Phase1Joiner { .. }
-        | Kind::JoinerRange => unreachable!(),
+        | Kind::JoinerRange
+        | Kind::GlobalGate
+        | Kind::GlobalGateNegative => unreachable!(),
     }
 
     // Liveness: the era starts once the last node is B2, every node recorded.
@@ -1075,6 +1098,227 @@ fn run_ladder_negative(c: &Cell, neg: Neg) -> Verdict {
     verdict_of(c, v, cap_fired)
 }
 
+// ---------------------------------------------------------------------------
+// The first real gate: `Gate::GlobalTables` (cluster version 2, G-01 stage G-c)
+// ---------------------------------------------------------------------------
+
+const GLOBAL_TABLE: &str = "g1";
+
+fn global_spec() -> animus_control::GlobalTableSpec {
+    animus_control::GlobalTableSpec {
+        consistency: animus_control::MultiRegionConsistency::Strong,
+        regions: vec!["a".into(), "b".into(), "c".into()],
+        witness: None,
+        preferred_leader_region: "a".into(),
+    }
+}
+
+fn convert_cmd() -> MetaCommand {
+    MetaCommand::ConvertTableToGlobal {
+        table: GLOBAL_TABLE.to_string(),
+        spec: global_spec(),
+    }
+}
+
+/// The table is global with its tablets' policies pinned to the spec's regions.
+fn converted(m: &animus_control::Metadata) -> bool {
+    m.schemas
+        .get(GLOBAL_TABLE)
+        .is_some_and(|s| s.global == Some(global_spec()))
+        && m.tablets_for_table(GLOBAL_TABLE).count() > 0
+        && m.tablets_for_table(GLOBAL_TABLE)
+            .all(|(id, _)| m.policies.get(id).is_some_and(|p| p.is_pinned()))
+}
+
+/// Every node plays B2 (`[1,1]`, the previous release), the era starts, and a
+/// table exists (created pre-era, `Gate::Base`). `OLD` stays B2; every other
+/// node rolls to `Release(2)` (`[1,2]`) when `roll_all` is false, all of them
+/// when true.
+fn global_setup(cluster: &mut SimCluster, w: &mut Watch, roll_all: bool) {
+    let _ = cluster.create_table(GLOBAL_TABLE);
+    for n in 0..NODES {
+        cluster.set_binary_profile(n, BinaryProfile::B2);
+        cluster.set_node_version(n, Some(VersionRange::new(1, 1)));
+    }
+    if !converge(cluster, |c| {
+        w.sample(c);
+        (0..NODES).all(|n| c.features(n).era_active())
+            && (0..NODES).all(|n| c.metadata(n).node_versions.len() == NODES as usize)
+    }) {
+        w.violations.push("the era never started".into());
+    }
+    for n in 0..NODES {
+        if roll_all || n != OLD {
+            cluster.set_binary_profile(n, BinaryProfile::Release(2));
+            cluster.set_node_version(n, Some(VersionRange::new(1, 2)));
+            w.run(cluster, Duration::from_millis(500));
+        }
+    }
+}
+
+fn propose_convert_request() -> animus_node::ClientRequest {
+    animus_node::ClientRequest::ProposeSchema(convert_cmd())
+}
+
+/// Roll B2 -> Release(2) over a table; before the finalize a relayed
+/// `ConvertTableToGlobal` is refused by name by the receiver (counted,
+/// nothing appended); after it the identical relay is accepted and the
+/// conversion (spec + pinned policies) lands on every node, the data-only
+/// node's mirror included. No capped rejection, no wedged control replica.
+fn run_global_gate(c: &Cell) -> Verdict {
+    use animus_control::version::Gate;
+    let mut cluster = light_cluster(c.seed);
+    let mut w = Watch::new(true);
+    global_setup(&mut cluster, &mut w, true);
+    if !converge(&mut cluster, |c| {
+        w.sample(c);
+        (0..NODES).all(|n| {
+            c.metadata(n)
+                .node_versions
+                .values()
+                .all(|v| v.range == VersionRange::new(1, 2))
+                && c.metadata(n).node_versions.len() == NODES as usize
+        })
+    }) {
+        w.violations
+            .push("the [1,2] records never landed on every node".into());
+    }
+    let leader = control_leader(&mut cluster);
+    let follower = (0..3u64).find(|n| *n != leader).expect("a follower");
+    // Version 1: the gate is closed everywhere.
+    if (0..NODES).any(|n| cluster.features(n).is_open(Gate::GlobalTables)) {
+        w.violations
+            .push("GlobalTables open before the finalize".into());
+    }
+    let pre_log: Vec<u64> = CONTROL
+        .iter()
+        .map(|&n| cluster.control_last_log_index(n))
+        .collect();
+    for (from, to) in [(follower, leader), (leader, follower)] {
+        let before = cluster.metric(to, animus_env::Metric::ClusterGateRelayRefused);
+        match cluster.relay_request(from, to, propose_convert_request()) {
+            Some(animus_node::ClientResponse::Error(msg))
+                if msg.contains("relayed command refused") && msg.contains("GlobalTables") => {}
+            other => w
+                .violations
+                .push(format!("relay {from}->{to} not refused by name: {other:?}")),
+        }
+        if cluster.metric(to, animus_env::Metric::ClusterGateRelayRefused) != before + 1 {
+            w.violations
+                .push(format!("refusal not counted on node {to}"));
+        }
+    }
+    w.run(&mut cluster, Duration::from_secs(2));
+    let post_log: Vec<u64> = CONTROL
+        .iter()
+        .map(|&n| cluster.control_last_log_index(n))
+        .collect();
+    if post_log != pre_log {
+        w.violations
+            .push("a refused relay appended to the control log".into());
+    }
+    if (0..NODES).any(|n| {
+        cluster
+            .metadata(n)
+            .schemas
+            .get(GLOBAL_TABLE)
+            .is_some_and(|s| s.global.is_some())
+    }) {
+        w.violations
+            .push("the table became global before the gate opened".into());
+    }
+    // Finalize to 2: the gate opens on every node (the data-only one through
+    // its mirror) and on every hosted group's handle.
+    let l = control_leader(&mut cluster);
+    let (status, body) = finalize(&mut cluster, l, r#"{"to":2,"expected":1}"#);
+    if status != 200 {
+        w.violations
+            .push(format!("finalize 1 -> 2: {status} {body}"));
+    }
+    if !converge(&mut cluster, |c| {
+        w.sample(c);
+        (0..NODES).all(|n| c.features(n).is_open(Gate::GlobalTables))
+    }) {
+        w.violations
+            .push("GlobalTables never opened on every node".into());
+    }
+    // The identical relay is now accepted and lands everywhere.
+    let leader = control_leader(&mut cluster);
+    let follower = (0..3u64).find(|n| *n != leader).expect("a follower");
+    match cluster.relay_request(follower, leader, propose_convert_request()) {
+        Some(animus_node::ClientResponse::PutOk) => {}
+        other => w
+            .violations
+            .push(format!("the post-finalize relay was refused: {other:?}")),
+    }
+    if !converge(&mut cluster, |c| {
+        w.sample(c);
+        (0..NODES).all(|n| converted(&c.metadata(n)))
+    }) {
+        w.violations
+            .push("the conversion never landed on every node (mirror included)".into());
+    }
+    let wedged = {
+        let mut last = wedged_control(&cluster);
+        let _ = converge(&mut cluster, |c| {
+            last = wedged_control(c);
+            last.is_empty()
+        });
+        last
+    };
+    if !wedged.is_empty() {
+        w.violations
+            .push(format!("control replicas {wedged:?} wedged"));
+    }
+    w.sample(&cluster);
+    verdict_of(c, w.violations, false)
+}
+
+/// N5: a buggy emitter appends `ConvertTableToGlobal` at cluster version 1
+/// with a previous-release (B2) voter. The cap must reject it at exactly that
+/// voter, which is wedged and never appended the entry.
+fn run_global_negative(c: &Cell) -> Verdict {
+    let mut cluster = light_cluster(c.seed);
+    let mut w = Watch::new(true);
+    global_setup(&mut cluster, &mut w, false);
+    let setup = std::mem::take(&mut w.violations);
+    if control_leader(&mut cluster) == OLD {
+        let _ = cluster.transfer_leadership(OLD, 0);
+        w.run(&mut cluster, Duration::from_secs(2));
+    }
+    let mut v: Vec<String> = setup;
+    if control_leader(&mut cluster) == OLD {
+        v.push("could not move leadership off the previous-release node".into());
+    }
+    let pre = instant_violations(&cluster, true);
+    if !pre.is_empty() {
+        v.push(format!("violations before the bad emit: {pre:?}"));
+    }
+    let pre_log = cluster.control_last_log_index(OLD);
+    let accepted = cluster.propose_meta_ungated(convert_cmd());
+    if !matches!(accepted, ProposeResult::Accepted { .. }) {
+        v.push(format!("the bad emit was not accepted: {accepted:?}"));
+    }
+    w.run(&mut cluster, Duration::from_secs(6));
+    let wedged = wedged_control(&cluster);
+    if wedged != vec![OLD] {
+        v.push(format!("expected only node {OLD} wedged, got {wedged:?}"));
+    }
+    let cap_fired = w.violations.iter().any(|s| {
+        s.starts_with(&format!("delivery: node {OLD} (B2)")) && s.contains("GlobalTables")
+    });
+    if !cap_fired {
+        v.push(format!(
+            "the cap never rejected the GlobalTables value: {:?}",
+            w.violations
+        ));
+    }
+    if cluster.control_last_log_index(OLD) != pre_log {
+        v.push("the previous-release replica appended the GlobalTables value".into());
+    }
+    verdict_of(c, v, cap_fired)
+}
+
 /// A Phase 1 binary joining after the era is refused at the seed's handshake
 /// (counted, never a member); the cluster is unaffected; a versioned joiner
 /// through the same seed is admitted and recorded. `via_data` dials the
@@ -1342,6 +1586,16 @@ fn sim_cluster_mixed_version_corpus_joiner_range_checks() {
 }
 
 #[test]
+fn sim_cluster_mixed_version_corpus_global_gate() {
+    run_family("release1_to_release2_global_gate");
+}
+
+#[test]
+fn sim_cluster_mixed_version_corpus_negative_control_global_gate() {
+    run_family("negative_control_global_gate_emitted_early");
+}
+
+#[test]
 fn sim_cluster_mixed_version_cell_names_and_seeds_are_unique() {
     let cs = corpus::seed_expand(cells(), 3);
     let names: BTreeSet<_> = cs.iter().map(|c| c.name.clone()).collect();
@@ -1362,6 +1616,8 @@ fn sim_cluster_mixed_version_cell_names_and_seeds_are_unique() {
         "joiner_phase1_after_era",
         "joiner_phase1_dials_data_only_node",
         "joiner_range_checks",
+        "release1_to_release2_global_gate",
+        "negative_control_global_gate_emitted_early",
     ] {
         assert!(
             cells().iter().any(|c| c.name.starts_with(prefix)),

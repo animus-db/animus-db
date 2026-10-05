@@ -2594,6 +2594,13 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// Defaults `false` — zero behavior change for every caller that never
     /// touches it.
     external_quiesce_veto: Arc<AtomicBool>,
+    /// Node-local: this replica sits in its table's **witness** Region (ADR
+    /// 0075 section 3.6) and so must never serve a replica-local eventual
+    /// read. Set by the tablet-host reconciler from the replicated global-table
+    /// spec ([`set_witness`](Self::set_witness)); [`stale_read_ready`]
+    /// (Self::stale_read_ready) then declines, so every eventual read falls
+    /// back to (or forwards to) a full replica. Defaults `false`.
+    witness: Arc<AtomicBool>,
     /// Freshness stamp for `external_quiesce_veto` (issue #302 fix): the
     /// value of [`engine_applied_index`](Self::engine_applied_index) the
     /// external caller's own observation is valid through — see
@@ -3223,6 +3230,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // ordering.
         let txn_tracker = Arc::new(Mutex::new(TxnTracker::default()));
         let external_quiesce_veto = Arc::new(AtomicBool::new(false));
+        let witness = Arc::new(AtomicBool::new(false));
         // See the field's own doc: `u64::MAX` is the "never engaged" sentinel,
         // not `0` — a caller that never calls `set_quiesce_veto` for this
         // group must impose no freshness requirement at all.
@@ -3274,6 +3282,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             last_absorbed_term,
             txn_tracker: Arc::clone(&txn_tracker),
             external_quiesce_veto: Arc::clone(&external_quiesce_veto),
+            witness: Arc::clone(&witness),
             external_quiesce_veto_fresh_through: Arc::clone(&external_quiesce_veto_fresh_through),
             voter_history: Arc::clone(&voter_history),
             hot_change_max: Arc::clone(&hot_change_max),
@@ -3414,6 +3423,22 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             self.wake();
         }
         changed
+    }
+
+    /// Mark (or unmark) this replica as sitting in its table's witness Region
+    /// (ADR 0075 section 3.6). Node-local and idempotent; called by the
+    /// tablet-host reconciler every tick from replicated `Metadata`. A witness
+    /// still votes and replicates normally — only the replica-local eventual
+    /// read ([`stale_read_ready`](Self::stale_read_ready)) is refused.
+    pub fn set_witness(&self, witness: bool) {
+        self.witness.store(witness, Ordering::Relaxed);
+    }
+
+    /// Whether this replica is currently marked as a witness (see
+    /// [`set_witness`](Self::set_witness)).
+    #[must_use]
+    pub fn is_witness(&self) -> bool {
+        self.witness.load(Ordering::Relaxed)
     }
 
     /// Opt this group into quiescence (ADR 0044 phase-1 PR3): once its leader
@@ -5889,6 +5914,10 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// hence fully applied, hence current.
     #[must_use]
     pub fn stale_read_ready(&self) -> bool {
+        // ADR 0075 section 3.6: a witness replica never serves an eventual read.
+        if self.witness.load(Ordering::Relaxed) {
+            return false;
+        }
         // One lock acquisition for both core facts. `engine_applied` is read
         // *after* releasing it and only ever grows, so a concurrent apply can
         // make this false-negative (a read that falls back to the strong

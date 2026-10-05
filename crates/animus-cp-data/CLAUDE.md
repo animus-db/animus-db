@@ -3138,6 +3138,27 @@ literal now needs `..Default::default()` (or a `regions` field). Corpus:
 building-its-negative-control.md`: the LAN-forced control only bites on the
 re-election cells).
 
+## Preferred leader and witness replicas (ADR 0075 section 3.3/3.6, G-c M2)
+
+`MetadataView::preferred_leader` (tablet -> `LeaderPreference { region, witness }`,
+empty = no behaviour change; `animusd::leader_preferences` derives it from
+`TableSchema.global` x `Tablet.table`) feeds `Reconciler::preferred_leader_step`
+(end of `tick`). It acts only when this node **leads a tablet from a Region it must
+not** (not the preferred one, or the witness one): the violation must hold for
+`PREFERRED_LEADER_STABILITY_TIMEOUTS` (2) election timeouts and transfers are at
+least `PREFERRED_LEADER_MIN_INTERVAL_TIMEOUTS` (10) apart per group; target = non-`Down`
+voter in the preferred Region with the best `peer_match >= commit_index` (the exact
+arm gate of `RaftCore::transfer_leadership`; its `bool` is checked and a refusal is
+retried without resetting the window; metrics `CpPreferredLeaderTransfers`/`...Rejected`).
+A witness-region leader falls back to any other caught-up non-witness voter. Idle
+correct groups are never touched, so quiescence is not fought (arming a transfer is
+the only wake). The same pass calls `RaftKvNode::set_witness`, which makes
+`stale_read_ready()` false so a witness never serves a replica-local eventual read
+(`animusd` `cp_stale_forward_target` also skips witness replicas). Corpus:
+`tests/it/preferred_leader_corpus.rs`, `ANIMUS_MRSC_SEEDS`. Known: quiescence does not
+settle on links with RTT above the heartbeat interval (issue #1226), so the quiescence
+cell runs on 1 ms links.
+
 ## Fuzzing (roadmap R-01 (c))
 
 The RaftKV codec (wire/image/WAL), segment codec, backup chunk/manifest codecs, layout marker, cursors and engine marker values are the `cp_data_formats` fuzz target; the `pub(crate)` ones are reached through the off-by-default `fuzzing` feature (`src/fuzzing.rs`). See `fuzz/README.md` (stable smoke: `cd fuzz && cargo test --release --test smoke`).
