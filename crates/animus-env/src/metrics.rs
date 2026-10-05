@@ -1015,12 +1015,23 @@ pub enum Metric {
     /// command's gate is closed in this node's own view (`animusd`'s relay
     /// receiver). A counter, not a level: the sender is another node.
     ClusterGateRelayRefused,
+
+    // --- Preferred-leader mechanism (ADR 0075 section 3.3, G-01 stage G-c) ---
+    /// A leader this node held was handed to a voter in the table's preferred
+    /// region (or away from a witness region) by the tablet-host reconciler's
+    /// preferred-leader step: the transfer was **armed**. A counter, bumped
+    /// once per armed transfer; steady state is zero.
+    CpPreferredLeaderTransfers,
+    /// The preferred-leader step chose a target but `transfer_leadership`
+    /// refused to arm (target not caught up, config change in flight, ...).
+    /// Retried on the next tick without resetting the stability window.
+    CpPreferredLeaderTransferRejected,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 123] = [
+    pub const ALL: [Metric; 125] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -1144,6 +1155,8 @@ impl Metric {
         Metric::ClusterGateViolationsClientRequest,
         Metric::ClusterGateViolationsClientResponse,
         Metric::ClusterGateRelayRefused,
+        Metric::CpPreferredLeaderTransfers,
+        Metric::CpPreferredLeaderTransferRejected,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -1276,6 +1289,8 @@ impl Metric {
                 "cluster_gate_violations_client_response"
             }
             Metric::ClusterGateRelayRefused => "cluster_gate_relay_refused",
+            Metric::CpPreferredLeaderTransfers => "cp_preferred_leader_transfers",
+            Metric::CpPreferredLeaderTransferRejected => "cp_preferred_leader_transfer_rejected",
         }
     }
 

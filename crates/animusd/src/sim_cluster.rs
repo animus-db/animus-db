@@ -405,10 +405,12 @@ fn spawn_reconciler_loop(ctx: SimNodeCtx, mut reconciler: SimReconciler) {
             let regions = animus_control::timing::region_map(
                 meta.members.iter().map(|(id, m)| (id, &m.labels)),
             );
+            let preferred_leader = crate::leader_preferences(&meta);
             let view = MetadataView {
                 tablets: meta.tablets,
                 down,
                 regions,
+                preferred_leader,
             };
             reconciler.tick(&view).await;
         }

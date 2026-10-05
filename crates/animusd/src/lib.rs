@@ -14248,13 +14248,38 @@ async fn tablet_host_reconciler_loop(ctx: ClientCtx, mut reconciler: CpReconcile
         inplace_split_active = meta.tablets.values().any(|t| t.inplace_split.is_some());
         let regions =
             animus_control::timing::region_map(meta.members.iter().map(|(id, m)| (id, &m.labels)));
+        let preferred_leader = leader_preferences(&meta);
         let view = MetadataView {
             tablets: meta.tablets,
             down,
             regions,
+            preferred_leader,
         };
         reconciler.tick(&view).await;
     }
+}
+
+/// Every tablet of a **global (MRSC) table** -> its leader preference (ADR 0075
+/// section 3.3, 3.6), derived from `TableSchema.global` x `Tablet.table`, for
+/// the tablet-host reconciler's preferred-leader step. A table's preference
+/// follows its splits for free (a child carries the same `Tablet.table`). Empty
+/// for a cluster with no global table.
+pub(crate) fn leader_preferences(
+    meta: &animus_control::Metadata,
+) -> std::collections::BTreeMap<animus_tablet::TabletId, animus_cp_data::host::LeaderPreference> {
+    meta.tablets
+        .iter()
+        .filter_map(|(id, t)| {
+            let g = meta.schemas.get(t.table.as_deref()?)?.global.as_ref()?;
+            Some((
+                *id,
+                animus_cp_data::host::LeaderPreference {
+                    region: g.preferred_leader_region.clone(),
+                    witness: g.witness.clone(),
+                },
+            ))
+        })
+        .collect()
 }
 
 /// How often [`txn_resolver_loop`] sweeps this node's locally-led tablet
