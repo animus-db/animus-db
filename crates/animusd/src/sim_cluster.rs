@@ -4274,6 +4274,14 @@ impl SimCluster {
         })
     }
 
+    /// `node`'s real `GET /metrics` text exposition — the exact string
+    /// production's DynamoDB listener serves (`ClientCtx::metrics_text`), read
+    /// synchronously (no simulated I/O). Used by the R-01 (f) metrics-reference
+    /// check (`sim_cluster_admin::metric_references_exist_in_exposition`).
+    pub(crate) fn metrics_text(&self, node: u64) -> String {
+        self.shared.ctx(node).metrics_text()
+    }
+
     /// Run an admin HTTP-JSON request against `node`'s own `ClientCtx` (ADR
     /// 0061 rung H, C-08 PR 2) — [`SimClusterHandle::admin`]'s synchronous
     /// sibling, driven from a test's own `&mut self` call exactly like

@@ -638,6 +638,13 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
         };
         let (status, body) = dispatch(&ctx, &request, &principal).await;
         drop(inflight);
+        // R-01 (f): request-outcome counters for the 5xx-ratio alert.
+        if let Some(data) = ctx.data.as_ref() {
+            data.raftkv_metrics.incr(Metric::DynamoRequestsTotal);
+            if status >= 500 {
+                data.raftkv_metrics.incr(Metric::DynamoResponses5xx);
+            }
+        }
         http::write_amz_json_response(&mut stream, status, &body, keep_alive).await?;
         if !keep_alive {
             // The client asked us to close (HTTP/1.0 default, or an explicit
@@ -11247,6 +11254,40 @@ mod stream_write_path_tests {
         })
         .await
         .expect("table's tablet never hosted locally")
+    }
+
+    /// R-01 (f): every request that reaches `dispatch` bumps
+    /// `dynamo_requests_total`; only a 5xx bumps `dynamo_responses_5xx`
+    /// (a 4xx validation error is a request but not a server fault).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn request_outcome_counters_count_requests_and_only_5xx_faults() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let node = single_node(dir.path()).await;
+        let before = metrics_value(node.dynamo_addr(), "dynamo_requests_total").await;
+        let (status, body) = dynamo(
+            node.dynamo_addr(),
+            "DynamoDB_20120810.CreateTable",
+            r#"{"TableName":"rqt",
+                "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
+                "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "CreateTable failed: {body}");
+        // A request for a table that does not exist: a 4xx, not a fault.
+        let (status, _) = dynamo(
+            node.dynamo_addr(),
+            "DynamoDB_20120810.GetItem",
+            r#"{"TableName":"nope","Key":{"id":{"S":"a"}}}"#,
+        )
+        .await;
+        assert!((400..500).contains(&status), "expected a 4xx, got {status}");
+        let after = metrics_value(node.dynamo_addr(), "dynamo_requests_total").await;
+        assert_eq!(after - before, 2, "both requests must be counted");
+        assert_eq!(
+            metrics_value(node.dynamo_addr(), "dynamo_responses_5xx").await,
+            0,
+            "a 2xx and a 4xx are not server faults"
+        );
     }
 
     /// A streamed-but-unindexed table's `PutItem`/`UpdateItem`/`DeleteItem`
