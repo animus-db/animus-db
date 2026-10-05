@@ -3,7 +3,7 @@
 //! Eight modes:
 //!
 //! ```text
-//! animusd gen-config --nodes N [--host H] [--base-port P]   # print a combined-mode cluster config (JSON)
+//! animusd gen-config --nodes N [--host H] [--base-port P] [--region NAME] [--peer REGION=host:port[,..]]... [--allow-insecure-peers] [--mrec-max-clock-skew-ms MS]   # print a combined-mode cluster config (JSON)
 //! animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P] # print a split-deployment config (ADR 0035)
 //! animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--max-region-rtt-ms MS] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] [--encryption-key PATH] # run node I of a cluster (one process)
 //! animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] [--encryption-key PATH] # run an N-node cluster in one process
@@ -346,9 +346,9 @@ fn otel_instance_label(args: &[String]) -> String {
 }
 
 const USAGE: &str = "usage:\n  \
-    animusd gen-config --nodes N [--host H] [--base-port P]\n  \
+    animusd gen-config --nodes N [--host H] [--base-port P] [--region NAME] [--peer REGION=host:port[,..]]... [--allow-insecure-peers] [--mrec-max-clock-skew-ms MS]\n  \
     animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P]\n  \
-    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--max-region-rtt-ms MS] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH] [--encryption-key PATH]\n  \
+    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--max-region-rtt-ms MS] [--region NAME] [--peer REGION=host:port[,host:port...]]... [--allow-insecure-peers] [--mrec-max-clock-skew-ms MS] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH] [--encryption-key PATH]\n  \
     animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] [--encryption-key PATH]\n  \
     animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--dynamo-auth PATH]\n  \
     animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral] [--advertise-host NAME] [--label K=V]... [--labels-file PATH [--labels-file-annotations]] [--labels-wait-secs N] [--encryption-key PATH] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3]\n  \
@@ -365,9 +365,22 @@ fn gen_config(args: &[String]) -> Result<(), String> {
     let mut data_nodes: Option<usize> = None;
     let mut host: IpAddr = "127.0.0.1".parse().unwrap();
     let mut base_port: u16 = 7100;
+    // MREC peer settings (G-d M3): emitted as `cluster_settings` keys.
+    let mut mrec = animusd::config::ClusterSettings::default();
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
+            "--region" => mrec.region = Some(parse_next::<String>(&mut it, "--region")?),
+            "--peer" => {
+                let v = parse_next::<String>(&mut it, "--peer")?;
+                mrec.peers
+                    .push(animusd::config::ClusterSettings::parse_peer_flag(&v)?);
+            }
+            "--allow-insecure-peers" => mrec.allow_insecure_peers = Some(true),
+            "--mrec-max-clock-skew-ms" => {
+                mrec.mrec_max_clock_skew_ms =
+                    Some(parse_next(&mut it, "--mrec-max-clock-skew-ms")?);
+            }
             "--nodes" => nodes = Some(parse_next(&mut it, "--nodes")?),
             "--control-nodes" => control_nodes = Some(parse_next(&mut it, "--control-nodes")?),
             "--data-nodes" => data_nodes = Some(parse_next(&mut it, "--data-nodes")?),
@@ -383,10 +396,9 @@ fn gen_config(args: &[String]) -> Result<(), String> {
         if nodes == 0 {
             return Err("--nodes must be at least 1".into());
         }
-        println!(
-            "{}",
-            ClusterConfig::generate(nodes, host, base_port).to_json()
-        );
+        let mut cfg = ClusterConfig::generate(nodes, host, base_port);
+        attach_mrec_settings(&mut cfg, mrec)?;
+        println!("{}", cfg.to_json());
         return Ok(());
     }
     let control_n =
@@ -395,10 +407,24 @@ fn gen_config(args: &[String]) -> Result<(), String> {
     if control_n == 0 || data_n == 0 {
         return Err("--control-nodes and --data-nodes must each be at least 1".into());
     }
-    println!(
-        "{}",
-        ClusterConfig::generate_split(control_n, data_n, host, base_port).to_json()
-    );
+    let mut cfg = ClusterConfig::generate_split(control_n, data_n, host, base_port);
+    attach_mrec_settings(&mut cfg, mrec)?;
+    println!("{}", cfg.to_json());
+    Ok(())
+}
+
+/// `gen-config`'s MREC flags (G-d M3): validate and attach them as the
+/// generated config's `cluster_settings` (a no-op when none was given, so the
+/// default output is byte-identical to before).
+fn attach_mrec_settings(
+    cfg: &mut ClusterConfig,
+    mrec: animusd::config::ClusterSettings,
+) -> Result<(), String> {
+    if mrec == animusd::config::ClusterSettings::default() {
+        return Ok(());
+    }
+    mrec.validate_mrec()?;
+    cfg.cluster_settings = Some(mrec);
     Ok(())
 }
 
@@ -552,6 +578,17 @@ async fn run(args: &[String]) -> Result<(), String> {
     // config file is the route for every other shape, same partial CLI reach
     // as `--export-s3-endpoint`.
     let mut max_region_rtt_ms: Option<u64> = None;
+    // MREC global-table peer settings (ADR 0075 section 4, G-01 stage G-d M3):
+    // `--region NAME`, repeatable `--peer REGION=host:port[,host:port...]`,
+    // `--allow-insecure-peers` (dev only) and `--mrec-max-clock-skew-ms MS`.
+    // Like `--max-region-rtt-ms` they reach `--config`/`--node` only (merged
+    // with `cluster_settings.{region,peers,allow_insecure_peers,
+    // mrec_max_clock_skew_ms}`; a field set on both sides is a hard error, a
+    // `--peer` adds to the config's list).
+    let mut mrec_region: Option<String> = None;
+    let mut mrec_peers: Vec<animusd::config::PeerCluster> = Vec::new();
+    let mut allow_insecure_peers: Option<bool> = None;
+    let mut mrec_max_clock_skew_ms: Option<u64> = None;
     // `--dynamo-auth PATH` (ADR 0057): a JSON file of the same shape as a
     // `ClusterConfig`'s `dynamo_auth` section (`{"credentials": {"AKID":
     // "secret", ...}}`) — the client DynamoDB port's SigV4 credential store.
@@ -693,6 +730,19 @@ async fn run(args: &[String]) -> Result<(), String> {
                 }
                 max_region_rtt_ms = Some(ms);
             }
+            "--region" => mrec_region = Some(parse_next::<String>(&mut it, "--region")?),
+            "--peer" => {
+                let v = parse_next::<String>(&mut it, "--peer")?;
+                mrec_peers.push(animusd::config::ClusterSettings::parse_peer_flag(&v)?);
+            }
+            "--allow-insecure-peers" => allow_insecure_peers = Some(true),
+            "--mrec-max-clock-skew-ms" => {
+                let ms: u64 = parse_next(&mut it, "--mrec-max-clock-skew-ms")?;
+                if ms == 0 {
+                    return Err("--mrec-max-clock-skew-ms must be at least 1".into());
+                }
+                mrec_max_clock_skew_ms = Some(ms);
+            }
             "--dynamo-auth" => {
                 dynamo_auth_path = Some(parse_next(&mut it, "--dynamo-auth")?);
             }
@@ -749,6 +799,10 @@ async fn run(args: &[String]) -> Result<(), String> {
         tablet_max_read_units,
         tablet_max_write_units,
         max_region_rtt_ms,
+        region: mrec_region.clone(),
+        peers: mrec_peers.clone(),
+        allow_insecure_peers,
+        mrec_max_clock_skew_ms,
     };
     let orphan_sweep_after =
         orphan_sweep_after_duration(cli_cluster_settings.orphan_sweep_after_secs);
@@ -782,6 +836,19 @@ async fn run(args: &[String]) -> Result<(), String> {
         return Err(
             "--max-region-rtt-ms is only supported with --config/--node (set \
              cluster_settings.max_region_rtt_ms in the config file for the other shapes)"
+                .into(),
+        );
+    }
+    if (mrec_region.is_some()
+        || !mrec_peers.is_empty()
+        || allow_insecure_peers.is_some()
+        || mrec_max_clock_skew_ms.is_some())
+        && config_path.is_none()
+    {
+        return Err(
+            "--region/--peer/--allow-insecure-peers/--mrec-max-clock-skew-ms are only supported \
+             with --config/--node (set the cluster_settings keys in the config file for the \
+             other shapes)"
                 .into(),
         );
     }
@@ -1892,6 +1959,22 @@ fn resolve_cluster_settings(
     merge_field!(tablet_max_read_units, "--tablet-max-read-units");
     merge_field!(tablet_max_write_units, "--tablet-max-write-units");
     merge_field!(max_region_rtt_ms, "--max-region-rtt-ms");
+    merge_field!(allow_insecure_peers, "--allow-insecure-peers");
+    merge_field!(mrec_max_clock_skew_ms, "--mrec-max-clock-skew-ms");
+    if let Some(r) = &cli.region {
+        if config_settings.region.is_some() {
+            return Err(
+                "cluster_settings.region is set both in the config file and via \
+                        --region — specify it one way, not both"
+                    .into(),
+            );
+        }
+        effective.region = Some(r.clone());
+    }
+    // `--peer` adds to the config file's list; a region named on both sides
+    // surfaces as `validate_mrec`'s duplicate-region error.
+    effective.peers.extend(cli.peers.iter().cloned());
+    effective.validate_mrec()?;
     Ok(effective)
 }
 
@@ -1982,6 +2065,19 @@ async fn run_single(
             .cluster_settings
             .get_or_insert_with(Default::default)
             .max_region_rtt_ms = Some(ms);
+    }
+    // G-d M3: the MREC peer settings likewise travel on the config (the
+    // merge above validated them, region/peers/duplicates included).
+    if settings.region.is_some()
+        || !settings.peers.is_empty()
+        || settings.allow_insecure_peers.is_some()
+        || settings.mrec_max_clock_skew_ms.is_some()
+    {
+        let cs = config.cluster_settings.get_or_insert_with(Default::default);
+        cs.region.clone_from(&settings.region);
+        cs.peers.clone_from(&settings.peers);
+        cs.allow_insecure_peers = settings.allow_insecure_peers;
+        cs.mrec_max_clock_skew_ms = settings.mrec_max_clock_skew_ms;
     }
     let orphan_sweep_after = orphan_sweep_after_duration(settings.orphan_sweep_after_secs);
     let stream_seal_knobs_val =
