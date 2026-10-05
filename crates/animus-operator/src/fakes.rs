@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Mutex;
 
 use k8s_openapi::api::apps::v1::{StatefulSet, StatefulSetSpec, StatefulSetStatus};
-use k8s_openapi::api::core::v1::{ConfigMap, Secret, Service};
+use k8s_openapi::api::core::v1::{ConfigMap, Pod, Secret, Service};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use kube::core::DynamicObject;
@@ -50,6 +50,9 @@ pub struct FakeClusterApi {
     secrets: Mutex<BTreeMap<String, Secret>>,
     networkpolicies: Mutex<BTreeMap<String, NetworkPolicy>>,
     poddisruptionbudgets: Mutex<BTreeMap<String, PodDisruptionBudget>>,
+    pods: Mutex<BTreeMap<String, Pod>>,
+    node_labels: Mutex<BTreeMap<String, BTreeMap<String, String>>>,
+    pod_patches: Mutex<Vec<(String, BTreeMap<String, String>)>>,
 }
 
 impl FakeClusterApi {
@@ -130,6 +133,30 @@ impl FakeClusterApi {
     #[must_use]
     pub fn networkpolicy(&self, name: &str) -> Option<NetworkPolicy> {
         self.networkpolicies.lock().unwrap().get(name).cloned()
+    }
+
+    /// Seed a pod (by its `metadata.name`) for `list_pods` (G-01 stage G-a).
+    pub fn seed_pod(&self, pod: Pod) {
+        let name = pod.metadata.name.clone().unwrap();
+        self.pods.lock().unwrap().insert(name, pod);
+    }
+
+    /// Seed a `Node`'s labels for `get_node_labels` (G-01 stage G-a).
+    pub fn seed_node_labels(&self, node: &str, labels: &[(&str, &str)]) {
+        self.node_labels.lock().unwrap().insert(
+            node.to_string(),
+            labels
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        );
+    }
+
+    /// Every `patch_pod_annotations` call recorded so far (pod name,
+    /// annotations), in call order.
+    #[must_use]
+    pub fn pod_patches(&self) -> Vec<(String, BTreeMap<String, String>)> {
+        self.pod_patches.lock().unwrap().clone()
     }
 
     /// The `PodDisruptionBudget` currently stored under `name` (the most
@@ -263,6 +290,40 @@ impl ClusterApi for FakeClusterApi {
 
     async fn get_secret(&self, _ns: &str, name: &str) -> Result<Option<Secret>, ReconcileError> {
         Ok(self.secrets.lock().unwrap().get(name).cloned())
+    }
+
+    async fn list_pods(
+        &self,
+        _ns: &str,
+        _selector: &BTreeMap<String, String>,
+    ) -> Result<Vec<Pod>, ReconcileError> {
+        Ok(self.pods.lock().unwrap().values().cloned().collect())
+    }
+
+    async fn get_node_labels(
+        &self,
+        name: &str,
+    ) -> Result<Option<BTreeMap<String, String>>, ReconcileError> {
+        Ok(self.node_labels.lock().unwrap().get(name).cloned())
+    }
+
+    async fn patch_pod_annotations(
+        &self,
+        _ns: &str,
+        name: &str,
+        annotations: &BTreeMap<String, String>,
+    ) -> Result<(), ReconcileError> {
+        self.pod_patches
+            .lock()
+            .unwrap()
+            .push((name.to_string(), annotations.clone()));
+        if let Some(pod) = self.pods.lock().unwrap().get_mut(name) {
+            pod.metadata
+                .annotations
+                .get_or_insert_with(BTreeMap::new)
+                .extend(annotations.clone());
+        }
+        Ok(())
     }
 }
 

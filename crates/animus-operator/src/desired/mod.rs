@@ -16,6 +16,7 @@ pub mod services;
 pub mod statefulset;
 #[cfg(test)]
 pub mod test_support;
+pub mod topology;
 
 use std::collections::BTreeMap;
 

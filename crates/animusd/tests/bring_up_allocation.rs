@@ -71,6 +71,7 @@ async fn a_late_start_failure_leaks_no_task_or_port() {
         advertise_host: None,
         tls: None,
         encryption_key_path: None,
+        labels: Default::default(),
         overload: None,
     };
     let bound = animusd::Node::bind(unbound.id.clone(), unbound, dir.path())
@@ -92,6 +93,7 @@ async fn a_late_start_failure_leaks_no_task_or_port() {
         advertise_host: None,
         tls: None,
         encryption_key_path: None,
+        labels: Default::default(),
         overload: None,
     };
     let config = animusd::ClusterConfig {

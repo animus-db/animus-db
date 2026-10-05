@@ -11138,6 +11138,7 @@ mod stream_write_path_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                labels: Default::default(),
                 overload: None,
             }],
             dynamo_auth: None,

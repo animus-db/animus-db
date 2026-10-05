@@ -317,6 +317,7 @@ dependencies = [
  "animus-env",
  "animus-item",
  "animus-node",
+ "animus-placement",
  "animus-s3",
  "animus-sim",
  "animus-storage",

@@ -35,6 +35,7 @@ async fn start(dir: &std::path::Path, overload: OverloadSection) -> (Node, Socke
         advertise_host: None,
         tls: None,
         encryption_key_path: None,
+        labels: Default::default(),
         overload: Some(overload),
     };
     let bound = Node::bind(animusd::config::node_id(0), addrs.clone(), dir)

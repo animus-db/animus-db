@@ -352,6 +352,7 @@ fn unbound_role_addrs(index: usize) -> RoleAddrs {
         advertise_host: None,
         tls: None,
         encryption_key_path: None,
+        labels: Default::default(),
         overload: None,
     }
 }
@@ -373,6 +374,7 @@ fn bound_role_addrs(node: &animusd::BoundNode) -> RoleAddrs {
         advertise_host: None,
         tls: None,
         encryption_key_path: None,
+        labels: Default::default(),
         overload: None,
     }
 }
@@ -652,6 +654,7 @@ pub async fn grow_deadline(
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                labels: Default::default(),
                 overload: None,
             });
         }
@@ -865,6 +868,7 @@ pub async fn join_allocated_fresh_deadline(
             advertise_host: None,
             tls: None,
             encryption_key_path: None,
+            labels: Default::default(),
             overload: None,
         };
         let node_dir = dir.join(format!("join-alloc-{label}-{attempt}"));
@@ -919,6 +923,7 @@ pub async fn join_data_allocated_fresh_deadline(
             advertise_host: None,
             tls: None,
             encryption_key_path: None,
+            labels: Default::default(),
             overload: None,
         };
         let node_dir = dir.join(format!("data-join-alloc-{label}-{attempt}"));
@@ -982,6 +987,7 @@ pub async fn bring_up_split(
                     advertise_host: None,
                     tls: None,
                     encryption_key_path: None,
+                    labels: Default::default(),
                     overload: None,
                 }
             })
