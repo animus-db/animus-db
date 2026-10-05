@@ -1422,6 +1422,15 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // doc for why a latch produced a real livelock). Default `false`; only
     // ever set via that method.
     state_machine_behind: bool,
+    // This node is **out of disk** (R-01 (d), ADR 0074 §2 / issue #1219): its
+    // driver's WAL is suspect after an ENOSPC, or its apply task is paused on
+    // an engine ENOSPC. Such a node cannot make anything durable, so it must
+    // not campaign (a won election would only churn leadership onto a node
+    // that refuses every write) and ignores `TimeoutNow`. Fed LIVE by the
+    // driver every loop iteration via
+    // [`set_storage_full`](Self::set_storage_full); default `false`, and
+    // always `false` on the in-core control plane.
+    storage_full: bool,
     // The `last_index` of the most recently fully-received `InstallSnapshot`
     // THIS node installed, this process lifetime (never persisted — `None`
     // on every fresh/recovered core, exactly like `incoming_snapshot`
@@ -1675,6 +1684,7 @@ where
             pending_install: None,
             snapshot_needed: false,
             state_machine_behind: false,
+            storage_full: false,
             last_installed_index: None,
             pending: Vec::new(),
             persisted_hard: (0, None),
@@ -3452,6 +3462,9 @@ where
         if term != self.current_term || self.role == Role::Leader || !self.is_voter() {
             return Vec::new();
         }
+        // `start_election`'s own `storage_full` gate declines (and re-arms the
+        // election timer), so a storage-full transfer target simply lets the
+        // leader's transfer deadline abort — no special case needed here.
         self.start_election(now, entropy)
     }
 
@@ -5073,7 +5086,7 @@ where
         // discarded, which (unlike a learner) it CAN do here since its log
         // is otherwise fully caught up. Mirrors that gate exactly; see
         // `state_machine_behind`'s own doc.
-        if !self.is_voter() || self.state_machine_behind {
+        if !self.is_voter() || self.state_machine_behind || self.storage_full {
             // Issue #1019: a non-voter (learner, or a node not yet added at
             // all) can never itself campaign — but its belief that a
             // particular node is the live leader, and its own lease on a
@@ -5193,7 +5206,7 @@ where
             self.reset_election_timer(now, entropy);
             return Vec::new();
         }
-        if !self.is_voter() || self.state_machine_behind {
+        if !self.is_voter() || self.state_machine_behind || self.storage_full {
             self.reset_election_timer(now, entropy);
             return Vec::new();
         }
@@ -6270,6 +6283,64 @@ where
     /// control plane never raises it.
     pub fn take_snapshot_needed(&mut self) -> bool {
         std::mem::replace(&mut self.snapshot_needed, false)
+    }
+
+    /// Whether this node's driver reported itself out of disk (issue #1219) —
+    /// see [`set_storage_full`](Self::set_storage_full).
+    #[must_use]
+    pub fn storage_full(&self) -> bool {
+        self.storage_full
+    }
+
+    /// Feed the **storage-full** state (R-01 (d), ADR 0074 §2, issue #1219).
+    /// Only a `DRIVER_APPLIED` plane's driver calls this (`animus-cp-data`'s
+    /// consensus loop, **live, every iteration**, in the same lock acquisition
+    /// as `set_state_machine_behind`); the control plane keeps it `false`.
+    ///
+    /// While set, the node never starts a pre-vote or an election and declines
+    /// a `TimeoutNow` (both fall into the same gate as `state_machine_behind`):
+    /// it cannot persist the term bump and self-vote an election needs, and a
+    /// leader that cannot make anything durable would refuse every write
+    /// anyway. This is what keeps leadership from ping-ponging back to a node
+    /// that just handed it off. It is **not** a liveness hole: a node that is
+    /// *already* leader keeps leading until a healthy target really wins
+    /// ([`storage_full_step_down`](Self::storage_full_step_down) only arms a
+    /// transfer, and an aborted transfer leaves it leader), and a cluster that
+    /// is full everywhere recovers as soon as any node's space returns and its
+    /// flag clears.
+    pub fn set_storage_full(&mut self, full: bool) {
+        self.storage_full = full;
+    }
+
+    /// Leader-side: hand leadership to the most up-to-date healthy-looking
+    /// voter because this node is storage-full (issue #1219). Arms
+    /// [`transfer_leadership`](Self::transfer_leadership) toward the voter with
+    /// the highest `peer_match` (at least `commit_index`, the arm gate), the
+    /// voter in `avoid` (the previous, un-answered target) ordered last so a
+    /// target that is itself full — it declines `TimeoutNow` — is rotated away
+    /// from on the next attempt. Returns the armed target; `None` if this node
+    /// is not the leader, a transfer is already armed, or no voter qualifies.
+    /// Idempotence is the caller's: it re-invokes only after the previous
+    /// transfer aborted.
+    pub fn storage_full_step_down(&mut self, now: Nanos, avoid: Option<&NodeId>) -> Option<NodeId> {
+        if self.role != Role::Leader || self.transfer_target.is_some() {
+            return None;
+        }
+        let mut cands: Vec<NodeId> = self
+            .config
+            .iter()
+            .filter(|n| **n != self.id && self.peer_match(n) >= self.commit_index)
+            .cloned()
+            .collect();
+        cands.sort_by(|a, b| {
+            (Some(a) == avoid)
+                .cmp(&(Some(b) == avoid))
+                .then(self.peer_match(b).cmp(&self.peer_match(a)))
+                .then(a.cmp(b))
+        });
+        cands
+            .into_iter()
+            .find(|t| self.transfer_leadership(t.clone(), now))
     }
 
     /// Whether this node's own state machine is behind its own log's

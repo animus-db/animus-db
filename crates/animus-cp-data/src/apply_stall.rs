@@ -47,6 +47,10 @@ pub(crate) struct StallingEngine<E: Env, S: StorageEngine> {
     apply_stopped: Arc<AtomicBool>,
     /// Shared with the node: true while a call is paused on ENOSPC.
     stalled: Arc<AtomicBool>,
+    /// The node's consensus-loop wake (issue #1219): raised on every
+    /// `stalled` transition so a leader that just went storage-full steps
+    /// down promptly, even from a parked/quiesced loop.
+    wake: Arc<crate::WakeSignal>,
 }
 
 impl<E: Env, S: StorageEngine> Clone for StallingEngine<E, S> {
@@ -57,6 +61,7 @@ impl<E: Env, S: StorageEngine> Clone for StallingEngine<E, S> {
             halted: Arc::clone(&self.halted),
             apply_stopped: Arc::clone(&self.apply_stopped),
             stalled: Arc::clone(&self.stalled),
+            wake: Arc::clone(&self.wake),
         }
     }
 }
@@ -68,6 +73,7 @@ impl<E: Env, S: StorageEngine> StallingEngine<E, S> {
         halted: Arc<AtomicBool>,
         apply_stopped: Arc<AtomicBool>,
         stalled: Arc<AtomicBool>,
+        wake: Arc<crate::WakeSignal>,
     ) -> Self {
         Self {
             inner,
@@ -75,6 +81,7 @@ impl<E: Env, S: StorageEngine> StallingEngine<E, S> {
             halted,
             apply_stopped,
             stalled,
+            wake,
         }
     }
 
@@ -93,6 +100,7 @@ impl<E: Env, S: StorageEngine> StallingEngine<E, S> {
                         std::future::pending::<()>().await;
                     }
                     if !self.stalled.swap(true, Ordering::SeqCst) {
+                        self.wake.notify();
                         tracing::error!(
                             error = %e,
                             op = what,

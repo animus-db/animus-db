@@ -647,6 +647,25 @@ mod tests {
         );
     }
 
+    /// Issue #1219: a follower whose append/`fsync` hit ENOSPC owes a round
+    /// that never completes, so *every* later step -- even a bare heartbeat
+    /// that dirties nothing -- gates its ack behind that round. Pins the
+    /// "acks nothing it could not persist" half of the disk-full contract.
+    #[test]
+    fn a_failed_round_gates_every_later_ack_until_the_rewrite() {
+        let p = PersistProgress::default();
+        let failed = p.begin_drain(); // the round whose append/fsync hit ENOSPC
+        p.mark_suspect();
+        assert_eq!(p.gate(true), Some(failed + 1), "new records wait");
+        assert_eq!(
+            p.gate(false),
+            Some(failed),
+            "a heartbeat ack with nothing dirty still waits for the failed round"
+        );
+        p.complete_all_drained(); // the recovery rewrite lands
+        assert_eq!(p.gate(false), None, "released once the rewrite is durable");
+    }
+
     #[test]
     fn a_suspect_wal_is_never_fully_durable_until_the_rewrite_completes() {
         let p = PersistProgress::default();

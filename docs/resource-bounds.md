@@ -102,7 +102,9 @@ task until a process restart (the node still looked healthy). Now:
    its `fsync` is never retried on the old descriptor (fsyncgate: after a
    failed `fsync` the kernel may have dropped the dirty pages, and a torn
    partial append may sit in the file). The round is never marked durable, so
-   nothing it covers is applied, visible or acked.
+   nothing it covers is applied, visible or acked. A leader in this state
+   (or with a stalled apply task) hands leadership off, see "Leader step-down
+   (issue #1219)" below.
 3. **Recovery without a restart** (`persist_round::recover_suspect_wal`). The
    persist future probes on `env.sleep` with exponential backoff (50 ms up to a
    2 s cap, so a disk that stays full for minutes is not hammered). Each probe
@@ -181,15 +183,55 @@ Not covered: engine reads and other non-apply engine users (read path, TTL
 reaper, reconciler) still propagate the error to their caller, and a
 `ProdEnv` size-limited filesystem test is still outstanding.
 
+### Leader step-down (issue #1219)
+
+A StorageFull tablet leader now hands leadership to a replica with free disk, so
+the group stays writable through a leader-only disk-full window instead of
+refusing every write until space returns.
+
+1. **Mechanism.** The per-tablet consensus loop (`animus-cp-data`) feeds
+   `RaftKvNode::is_storage_full()` into the core every pass
+   (`RaftCore::set_storage_full`). A storage-full **leader** calls
+   `RaftCore::storage_full_step_down`, which arms the existing
+   `transfer_leadership` (Raft section 3.10, `TimeoutNow`) toward the voter with
+   the highest `match_index` (at least `commit_index`, the arm gate), then wakes
+   the loop so `TimeoutNow` ships at once. No new wire message, no persisted
+   state.
+2. **No ping-pong.** A storage-full node never starts a pre-vote or an election
+   and declines `TimeoutNow` (the same gate as `state_machine_behind`): it
+   could not persist the term bump anyway, and winning would put leadership back
+   on a node that refuses writes. It recovers its WAL in place and campaigns
+   normally again once space returns.
+3. **No permanent leaderlessness.** A transfer only arms; the leader keeps
+   leading until a target actually wins. A target that is itself full declines
+   `TimeoutNow`, the transfer aborts at its one-election-timeout deadline, and
+   the retry (after a two-election-timeout cooldown) rotates to the next voter.
+   When every replica is full the leader simply stays leader and refuses writes
+   as before; when space returns on any node the group converges (a recovered
+   node campaigns, or the leader recovers and serves). The control-plane group is
+   unchanged: it never calls `set_storage_full`.
+4. **Quiesced groups.** A group that is storage-full vetoes quiescence, arming
+   a transfer un-quiesces the leader, and both the apply task's ENOSPC stall
+   transition and each refused write (`record_storage_full_refusal`) wake the
+   consensus loop, so a parked leader still steps down.
+5. **Follower side (already true, now pinned).** A follower whose WAL is suspect
+   acks nothing it could not persist: the failed round never completes, so
+   `PersistProgress::gate` holds every later `AppendEntriesResp`, even a bare
+   heartbeat's, until the rewrite lands. Pinned by the `persist_round` unit test
+   and the `raftkv_disk_full_follower_acks_nothing_it_could_not_persist` sim
+   test.
+6. **Tests.** `animus-control` `tests/it/storage_full_step_down.rs` (pure core),
+   `animus-cp-data` `tests/it/quiescence.rs` (viii) (quiesced leader), and the
+   disk-full corpus: every cell runs a probe writer outside the Elle history and
+   the `LeaderDiskFull` cells assert probe writes are acked **inside** the window
+   (past a 1.5 s grace), plus linearizability; the all-replica `DiskFull` cells
+   still assert recovery after the window.
+
 ### Residuals (not done; file as issues)
 
 - ~~LSM engine ENOSPC is not handled.~~ Handled (issue #1218), see "LSM-engine
   ENOSPC" below.
-- **No leader step-down.** A StorageFull leader keeps leadership (`RaftCore` has
-  no step-down API) and refuses writes; its followers' disks are healthy but the
-  group cannot make progress through a leader that cannot persist. A follower
-  with a full disk simply does not ack (its rounds stay gated), which a quorum
-  tolerates.
+- ~~No leader step-down.~~ Done (issue #1219), see "Leader step-down" below.
 - **`spawned_task_panics` is still not exported** through `/metrics`, and
   `/admin/health` does not fail on a panicked consensus task.
 - **No `ProdEnv` test on a size-limited filesystem** (a tmpfs mount needs

@@ -134,6 +134,7 @@
 //! bug needs. See `docs/engineering-lessons.md`'s matching entry.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
@@ -362,7 +363,9 @@ enum Nemesis {
     /// injector scoped to one node (`Simulator::set_disk_config_for`). The
     /// leader cannot make its own log durable (so it applies and acks nothing),
     /// its followers keep their healthy disks, and after `HealAll` the leader's
-    /// recovery must complete the stranded rounds without a restart.
+    /// recovery must complete the stranded rounds without a restart. Since
+    /// #1219 the StorageFull leader also hands leadership to a healthy replica,
+    /// so the group must stay writable **during** the window (the probe writer).
     LeaderDiskFull,
     /// **Intermittent ENOSPC on every replica** (30% per `append`/`sync`/
     /// `replace`): a disk hovering at the edge of full, where a recovery
@@ -941,6 +944,11 @@ fn leader_slot<S: StorageEngine + 'static>(nodes: &Nodes<S>) -> Option<(usize, A
         .iter()
         .position(|n| n.is_leader())
         .map(|i| (i, Arc::clone(&guard[i])))
+}
+
+/// [`leader_slot`] over an already-locked node list.
+fn leader_slot_in<S: StorageEngine + 'static>(guard: &[Arc<Node<S>>]) -> Option<Arc<Node<S>>> {
+    guard.iter().find(|n| n.is_leader()).map(Arc::clone)
 }
 
 /// Sentinel `expected` for [`poison_cas`] below — 1 byte, so it can never
@@ -2744,6 +2752,62 @@ struct DiskFullObservation {
     storage_full_after_drain: bool,
     /// Acked appends whose completion timestamp is after `heal_all`.
     acked_writes_after_heal: usize,
+    /// Probe writes (see [`spawn_window_probe`]) acked inside the disk-full
+    /// window, at least [`STEP_DOWN_GRACE`] after the fault was applied (issue
+    /// #1219): with the leader's disk alone full these only exist if
+    /// leadership moved to a replica with free space.
+    acked_writes_in_window: usize,
+}
+
+/// Time a storage-full leader gets to notice (its next failed persist) and
+/// hand leadership off before [`DiskFullObservation::acked_writes_in_window`]
+/// starts counting.
+const STEP_DOWN_GRACE: Duration = Duration::from_millis(1500);
+
+/// A probe writer on its own key, outside the Elle history: appends an
+/// increasing counter through whichever replica currently leads and waits for a
+/// linearizable read to show it, recording the sim time of every ack. Runs the
+/// whole scenario; the caller filters the acks to the window it cares about.
+fn spawn_window_probe<S: StorageEngine + 'static>(
+    group: &Group<S>,
+) -> (Arc<Mutex<Vec<u64>>>, Arc<AtomicBool>) {
+    const PROBE_ID: u64 = 150;
+    let acks: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    let env = group.sim.env(nid(PROBE_ID));
+    let nodes = Arc::clone(&group.nodes);
+    let out = Arc::clone(&acks);
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopped = Arc::clone(&stop);
+    env.clone().spawn_task(async move {
+        let kb = b"__window_probe__".to_vec();
+        let mut counter = 1u64;
+        while !stopped.load(Ordering::SeqCst) {
+            let want = counter.to_be_bytes().to_vec();
+            let deadline = env.now().0 + Duration::from_secs(2).as_nanos() as u64;
+            let mut proposed_on: Option<usize> = None;
+            let mut acked = false;
+            while env.now().0 < deadline && !stopped.load(Ordering::SeqCst) {
+                if let Some((li, node)) = leader_slot(&nodes)
+                    && proposed_on != Some(li)
+                    && let ProposeResult::Accepted { .. } = node.put(kb.clone(), want.clone())
+                {
+                    proposed_on = Some(li);
+                }
+                env.sleep(POLL).await;
+                if let Some((_, node)) = leader_slot(&nodes)
+                    && node.linearizable_get(&kb).await.as_deref() == Some(want.as_slice())
+                {
+                    acked = true;
+                    break;
+                }
+            }
+            if acked {
+                out.lock().unwrap().push(env.now().0);
+                counter += 1;
+            }
+        }
+    });
+    (acks, stop)
 }
 
 /// [`run_scenario_on`]'s shape over `MemoryEngine`, plus the disk-full
@@ -2770,12 +2834,18 @@ fn run_disk_full_scenario_on<S: StorageEngine + 'static>(
     let mut faults = scenario.faults.clone();
     faults.sort_by_key(|(at, _)| *at);
     let base = group.sim.now().0;
+    let mut fault_applied_at = base;
+    // The Elle workload cannot witness in-window availability (its reads of a
+    // never-written key legitimately block for a whole `OP_BUDGET`, parking
+    // every client regardless of the fault), so a dedicated probe writer does.
+    let (probe, probe_stop) = spawn_window_probe(&group);
     for (at, nem) in faults {
         let target = base + at.as_nanos() as u64;
         if target > group.sim.now().0 {
             group.sim.run_until(animus_env::Nanos(target));
         }
         group.apply(nem);
+        fault_applied_at = group.sim.now().0;
     }
     group.sim.run_for(scenario.window);
     let any_full = |g: &Group<S>| g.nodes.lock().unwrap().iter().any(|n| n.is_storage_full());
@@ -2785,6 +2855,8 @@ fn run_disk_full_scenario_on<S: StorageEngine + 'static>(
     group.heal_all();
     let healed_at = group.sim.now().0;
     group.sim.run_for(DRAIN);
+    // Quiet the probe before the convergence checks read the replicas.
+    probe_stop.store(true, Ordering::SeqCst);
     let storage_full_after_drain = any_full(&group);
 
     let enospc_faults = group
@@ -2801,6 +2873,13 @@ fn run_disk_full_scenario_on<S: StorageEngine + 'static>(
         .flat_map(|e| &e.mops)
         .filter(|m| matches!(m, Mop::Append { .. }))
         .count();
+    let window_from = fault_applied_at + STEP_DOWN_GRACE.as_nanos() as u64;
+    let acked_writes_in_window = probe
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|t| **t > window_from && **t <= healed_at)
+        .count();
     (
         result,
         DiskFullObservation {
@@ -2808,6 +2887,7 @@ fn run_disk_full_scenario_on<S: StorageEngine + 'static>(
             storage_full_during_window,
             storage_full_after_drain,
             acked_writes_after_heal,
+            acked_writes_in_window,
         },
     )
 }
@@ -2869,7 +2949,20 @@ fn check_disk_full_corpus<S: StorageEngine + 'static>(
              (the WAL rewrite never completed; recovery needed a restart)",
             s.name, s.seed
         );
-        if full_disk {
+        if matches!(s.faults[0].1, Nemesis::LeaderDiskFull) {
+            // Issue #1219: the leader's own disk is full but a quorum of
+            // replicas is healthy, so the group must stay writable *during*
+            // the window -- the StorageFull leader hands leadership to a
+            // replica with free space rather than keeping it and refusing.
+            assert!(
+                obs.acked_writes_in_window > 0,
+                "scenario {} (seed={}): no write was acked inside the leader-only disk-full \
+                 window; the StorageFull leader did not step down",
+                s.name,
+                s.seed
+            );
+        }
+        if matches!(s.faults[0].1, Nemesis::DiskFull) {
             // Only a fully-unavailable disk strands the workload past the
             // window; a flaky one lets the (short) workload finish inside it,
             // which is progress in its own right (asserted just below).
@@ -2992,4 +3085,74 @@ fn raftkv_disk_full_run_is_deterministic() {
         "history not reproducible for seed {}",
         s.seed
     );
+}
+
+/// Issue #1219 pin: a **follower** whose disk is full acks nothing it could
+/// not persist. Its WAL goes suspect on the first failed append/`fsync`, and
+/// every `AppendEntriesResp` for an entry past that point is gated behind the
+/// round that never completes (`persist_round`'s durable-before-send rule), so
+/// the leader's `match_index` for it freezes while the two healthy replicas
+/// keep committing a probe writer's acks. After space returns it catches up
+/// with no restart.
+#[test]
+fn raftkv_disk_full_follower_acks_nothing_it_could_not_persist() {
+    for k in 0..disk_full_seeds_per_cell() as u64 {
+        let seed = 0xD15C_F011_u64 + k;
+        let mut group = Group::start(seed, 3, mem_engine);
+        group.sim.run_for(SETTLE);
+        let (probe, probe_stop) = spawn_window_probe(&group);
+        group.sim.run_for(Duration::from_millis(1500));
+        let (li, leader) = leader_slot(&group.nodes)
+            .unwrap_or_else(|| panic!("seed={seed}: no leader before the fault"));
+        let ids: Vec<u64> = GROUP_IDS[..3].to_vec();
+        let followers: Vec<usize> = (0..3).filter(|&i| i != li).collect();
+        let (full, healthy) = (followers[0], followers[1]);
+        let mut cfg = DiskConfig::default();
+        cfg.set_enospc_prob(1.0);
+        group.sim.set_disk_config_for(nid(ids[full]), cfg);
+        // Let every ack already in flight land, then freeze the reference.
+        group.sim.run_for(Duration::from_millis(500));
+        let frozen = leader.peer_match(&nid(ids[full]));
+        let healthy_before = leader.peer_match(&nid(ids[healthy]));
+        group.sim.run_for(DISK_FULL_WINDOW);
+        let (full_node, leader_after) = {
+            let g = group.nodes.lock().unwrap();
+            (Arc::clone(&g[full]), leader_slot_in(&g))
+        };
+        assert!(
+            full_node.is_storage_full(),
+            "seed={seed}: the follower never entered StorageFull (vacuous)"
+        );
+        let leader_after = leader_after.expect("a leader through a follower-only disk-full window");
+        assert_eq!(
+            leader_after.peer_match(&nid(ids[full])),
+            frozen,
+            "seed={seed}: the leader's match_index for a storage-full follower advanced -- it acked \
+             an append it could not persist"
+        );
+        assert!(
+            leader_after.peer_match(&nid(ids[healthy])) > healthy_before,
+            "seed={seed}: the healthy quorum made no progress during the window (vacuous)"
+        );
+        assert!(
+            probe.lock().unwrap().len() > 3,
+            "seed={seed}: the probe writer was not acked through a healthy quorum"
+        );
+        // Space returns: the follower recovers its WAL in place and catches up.
+        group
+            .sim
+            .set_disk_config_for(nid(ids[full]), DiskConfig::default());
+        group.sim.run_for(Duration::from_secs(10));
+        probe_stop.store(true, Ordering::SeqCst);
+        group.sim.run_for(Duration::from_secs(5));
+        assert!(
+            !full_node.is_storage_full(),
+            "seed={seed}: the follower stayed StorageFull after space returned"
+        );
+        let (_, leader_final) = leader_slot(&group.nodes).expect("leader after heal");
+        assert!(
+            leader_final.peer_match(&nid(ids[full])) > frozen,
+            "seed={seed}: the recovered follower never caught up"
+        );
+    }
 }

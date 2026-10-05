@@ -1386,3 +1386,15 @@ retries (`animus-cp-data` `apply_stall`). Do not add a
 `StopRestart` during a 100% window: SimEnv injects ENOSPC on reads too, so the
 WAL would read back empty. A flaky-disk workload can finish inside its window, so
 assert progress only where the workload outlives it.
+
+Issue #1219: every disk-full run also spawns a **probe writer**
+(`spawn_window_probe`, own key, outside the Elle history; stopped before the
+convergence checks) because the Elle workload cannot witness in-window
+availability: its reads of a never-written key legitimately block for a whole
+`OP_BUDGET`, parking every client regardless of the fault. The `LeaderDiskFull`
+cells assert probe writes acked inside the window, past `STEP_DOWN_GRACE`
+(1.5 s) after the fault, i.e. the StorageFull leader stepped down to a healthy
+replica (removing the step-down fails them). Only the all-replica `DiskFull`
+cells assert acked writes after the heal (a leader-only run can drain its whole
+workload inside the window). `raftkv_disk_full_follower_acks_nothing_it_could_
+not_persist` pins that a full follower's `match_index` on the leader freezes.

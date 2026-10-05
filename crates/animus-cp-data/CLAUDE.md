@@ -3190,3 +3190,17 @@ that call (order preserved). On `halted` a paused call sets `apply_stopped` and
 parks (never panics a caller's `.expect`). Only the apply task's handle is
 wrapped; other engine users still propagate. See `docs/resource-bounds.md`
 section 3.
+
+**Leader step-down (issue #1219).** The consensus loop computes
+`storage_full = persist.is_suspect() || apply_stalled` every pass, in the same
+lock acquisition as `set_state_machine_behind`: it calls
+`RaftCore::set_storage_full` (no campaigning, `TimeoutNow` declined), vetoes
+quiescence while full, and on a **leader** arms `RaftCore::storage_full_step_down`
+(rotating `stepdown_last`, cooldown `2 * election_timeout`, then
+`propose_signal.notify()` so `TimeoutNow` ships immediately). A refused write
+(`record_storage_full_refusal`) and the apply task's ENOSPC stall start
+(`StallingEngine`'s `wake`) raise `wake_signal`, so a parked/quiesced leader
+re-evaluates; arming un-quiesces. A full follower never acks (the failed round
+gates every ack; `persist_round` unit test + corpus pin). Do not make the step-down
+conditional on follower health knowledge: there is no wire signal for it, an
+aborted transfer to a full target is the (cheap) negative answer.

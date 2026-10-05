@@ -4108,6 +4108,10 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// (`overload_storage_full`); the caller returns the refusal itself.
     pub fn record_storage_full_refusal(&self) {
         self.metrics.incr(Metric::OverloadStorageFull);
+        // Issue #1219: the refused write never reaches the log, so nothing else
+        // would wake a parked (quiesced) storage-full leader to hand off
+        // leadership -- this wake makes its consensus loop re-evaluate.
+        self.wake_signal.notify();
     }
 
     /// Propose the **split-cutover freeze** (ADR 0050 rung 5, stage 3 — see
@@ -12170,7 +12174,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         Arc::clone(&wal_lock),
         Arc::clone(&halted),
         apply_stopped,
-        apply_stalled,
+        Arc::clone(&apply_stalled),
         metrics.clone(),
         scope,
         kind_scopes,
@@ -12187,6 +12191,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         Arc::clone(&hot_change_max),
         Arc::clone(&compact_tuning),
         features.clone(),
+        Arc::clone(&wake_signal),
     ));
 
     // Issue #279: the loop's own in-flight persist round, and the outbound
@@ -12268,6 +12273,13 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
     // The quiesced flag as this loop last observed it (issue #1180) -- see the
     // `apply_signal.notify()` on transitions below.
     let mut quiesced_seen = false;
+    // Issue #1219 storage-full step-down bookkeeping (consensus-loop-local): the
+    // target of the last transfer this leader armed because it is out of disk
+    // (rotated away from on the next attempt, so a target that is itself full --
+    // it declines `TimeoutNow` -- cannot pin the handoff), and the earliest
+    // time a further attempt may be armed.
+    let mut stepdown_last: Option<NodeId> = None;
+    let mut stepdown_next = animus_env::Nanos(0);
     loop {
         // A requested shutdown exits *between* persist rounds so the WAL is never
         // left mid-write; `stopped` (paired with the apply task's `apply_stopped`)
@@ -12363,6 +12375,41 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             // it in the very same tick, before any response can go out.
             let engine_behind = engine_applied.load(Ordering::SeqCst) < c.snapshot_index();
             c.set_state_machine_behind(engine_behind);
+            // Issue #1219 (R-01 (d), ADR 0074 §2): feed the storage-full state
+            // live, like `state_machine_behind` just above. A storage-full node
+            // never campaigns (`RaftCore::set_storage_full`), and a storage-full
+            // **leader** hands leadership to its most up-to-date follower so a
+            // replica with free disk serves writes. This runs on every loop
+            // pass -- including the one a refused write's `wake()` (or the
+            // apply task's stall transition) forces on a parked, quiesced
+            // leader; arming the transfer un-quiesces it. A transfer to a target
+            // that is also full simply aborts at its deadline (the leader keeps
+            // leading, never leaderless) and the retry rotates to the next
+            // voter after a cooldown.
+            let storage_full = persist.is_suspect() || apply_stalled.load(Ordering::SeqCst);
+            c.set_storage_full(storage_full);
+            if storage_full {
+                let at = env.now();
+                if c.is_leader()
+                    && at.0 >= stepdown_next.0
+                    && let Some(target) = c.storage_full_step_down(at, stepdown_last.as_ref())
+                {
+                    tracing::warn!(
+                        tablet = tablet.0,
+                        target = %target,
+                        "raftkv leader is StorageFull; transferring leadership to a replica with free disk"
+                    );
+                    stepdown_last = Some(target);
+                    // Past the transfer's own election-timeout deadline.
+                    stepdown_next = animus_env::Nanos(
+                        at.0.saturating_add(2 * c.election_timeout().as_nanos() as u64),
+                    );
+                    // Ship the `TimeoutNow` now rather than at the next heartbeat.
+                    propose_signal.notify();
+                }
+            } else {
+                stepdown_last = None;
+            }
             // ADR 0044 phase-1 PR5, fork D: feed the quiesce veto — a
             // non-empty `TxnTracker` (this group has a pending 2PC intent or
             // a decided-but-unresolved record still owed a resolve) always
@@ -12387,7 +12434,10 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             // bound that matters: "as of what index did the last real
             // observation of this tablet's own obligation state land."
             c.set_quiesce_veto(
-                txn_veto || persist_veto || external_quiesce_veto.load(Ordering::SeqCst),
+                txn_veto
+                    || persist_veto
+                    || storage_full
+                    || external_quiesce_veto.load(Ordering::SeqCst),
                 external_quiesce_veto_fresh_through.load(Ordering::SeqCst),
             );
             // Issue #596: same "recompute live, once per consensus-loop
@@ -12822,6 +12872,9 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     compact_tuning: Arc<CompactTuning>,
     // ADR 0073 P2-B: selects the snapshot image's frame version.
     features: ClusterFeatures,
+    // Issue #1219: raised when an ENOSPC stall begins/ends so the consensus
+    // loop (possibly parked, quiesced) re-evaluates the storage-full state.
+    wake_signal: Arc<WakeSignal>,
 ) {
     // R-01 (d) residual (#1218): every engine call this task makes pauses and
     // retries on ENOSPC instead of panicking — see `apply_stall`.
@@ -12831,6 +12884,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
         Arc::clone(&halted),
         Arc::clone(&apply_stopped),
         apply_stalled,
+        wake_signal,
     );
     // This apply task's own sequential, single-writer bookkeeping (see
     // `apply_and_compact`'s doc): `sealed` is seeded from the engine-durable

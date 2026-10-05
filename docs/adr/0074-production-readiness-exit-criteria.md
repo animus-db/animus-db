@@ -247,11 +247,11 @@ backoff probe rewrites the WAL from the in-memory log onto a fresh file and
 resumes without a restart; no persisted-format change. This differs from the
 design sketched in `docs/resource-bounds.md` before the change in two ways:
 there is no `requeue_unpersisted` (the in-memory log is a superset of every
-drained round, so a whole-image rewrite suffices) and there is no leader
-step-down (`RaftCore` has none; the leader refuses writes instead). The open
+drained round, so a whole-image rewrite suffices) and there was initially no
+leader step-down (added by the issue #1219 amendment below). The open
 question above is decided: `/admin/health` reports a degraded `storage_full`
 field but its status code does not flip, because readiness would also pull the
-node's reads. Still open: leader step-down, exporting
+node's reads. Still open: exporting
 `spawned_task_panics`, and a `ProdEnv` size-limited-filesystem test. Proven by
 `ANIMUS_DISK_FULL_SEEDS`; see `docs/resource-bounds.md` section 3.
 
@@ -269,3 +269,23 @@ ENOSPC-failed WAL batch cuts the segment back to its last durable length before
 the next batch. The disk-full semantics for clients are unchanged. No
 persisted-format change. The disk-full corpus now also runs over
 `LsmEngine<SimEnv>`.
+
+## Amendment 2026-10-05: leader step-down on StorageFull (issue #1219)
+
+The residual "a StorageFull leader keeps leadership" is closed, which makes the
+earlier clause in section 2 item 3 ("a leader steps down") true as written. As
+built: the per-tablet consensus loop feeds the group's storage-full state
+(suspect WAL or ENOSPC-stalled apply task) into `RaftCore::set_storage_full`; a
+storage-full leader arms the existing `transfer_leadership` toward its most
+up-to-date voter (`RaftCore::storage_full_step_down`), and a storage-full node
+never campaigns and declines `TimeoutNow`, so leadership cannot ping-pong back.
+A transfer only arms: the leader keeps leading until a healthy target wins, an
+unanswered transfer (a full target) aborts at its deadline and the retry rotates
+to the next voter, so there is no permanent leaderlessness and a whole-cluster
+disk-full still converges when space returns. A follower with a suspect WAL
+already acked nothing it could not persist (the failed round gates every later
+ack); that is now pinned by tests. No wire or persisted-format change; the
+control-plane group is unchanged. Proven by the disk-full corpus (writes acked
+inside a leader-only window, plus linearizability); see
+`docs/resource-bounds.md` section 3. Still open: exporting `spawned_task_panics`
+and a `ProdEnv` size-limited-filesystem test.

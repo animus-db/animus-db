@@ -3181,7 +3181,7 @@ No persisted-format change. `RaftNode::is_storage_full()` feeds `/admin/health`.
 `SharedWal` has a `needs_rewrite` flag armed ONLY by an ENOSPC append/sync
 failure; while armed `Append` is refused (StorageFull error) until a `Compact`
 succeeds, so a healthy sibling tablet cannot stack bytes after a suspect tail.
-Known gaps: no leader step-down (`RaftCore` has no step-down API). (The apply
+Leader step-down (issue #1219): `RaftCore::set_storage_full` (fed live by a DRIVER_APPLIED driver, `animus-cp-data`'s consensus loop; the control plane never sets it) makes `start_pre_vote`/`start_election` (and so `TimeoutNow`) no-ops, the same gate as `state_machine_behind`; `RaftCore::storage_full_step_down(now, avoid)` arms `transfer_leadership` toward the highest-`peer_match` voter (rotating away from `avoid`, the previous unanswered target). The control group's own storage-full handling is unchanged (no step-down). Tests: `tests/it/storage_full_step_down.rs`. (The apply
 task's engine ENOSPC, formerly a gap, is handled by `animus-cp-data`'s
 `apply_stall`, issue #1218.) Tests: `persist_round` unit tests; end-to-end by the
 `animus-test` disk-full corpus (`ANIMUS_DISK_FULL_SEEDS`).
