@@ -225,13 +225,21 @@ mod tests {
     /// `MAX_SUPPORTED` is 2 now, and a B2 that silently became `[1, 2]` would
     /// stop modelling the Phase 2 release the mixed-version corpus rolls from.
     #[test]
-    fn b2_is_pinned_to_one_one_and_release_two_is_the_current_binary() {
+    fn b2_is_pinned_to_one_one_and_release_two_is_pinned_to_one_two() {
         assert_eq!(BinaryProfile::B2.own_range(), Some(VersionRange::new(1, 1)));
+        // Release(2) is the G-c binary as it shipped: a literal, never the
+        // real range (which is `[1, 3]` since G-d).
         assert_eq!(
-            BinaryProfile::Release(crate::version::MAX_SUPPORTED).own_range(),
-            Some(crate::version::own_range()),
-            "Release(MAX_SUPPORTED) is what the real binary advertises"
+            BinaryProfile::Release(2).own_range(),
+            Some(VersionRange::new(1, 2))
         );
+        // Release(MAX_SUPPORTED) is the current binary's top; the model
+        // applies the stricter N-1 floor, the real floor is held at 1.
+        let cur = BinaryProfile::Release(crate::version::MAX_SUPPORTED)
+            .own_range()
+            .unwrap();
+        assert_eq!(cur.max, crate::version::own_range().max);
+        assert!(cur.min >= crate::version::own_range().min);
         assert_ne!(
             BinaryProfile::B2.own_range(),
             Some(crate::version::own_range())
@@ -265,6 +273,7 @@ mod tests {
                 Gate::Base => [true, true, true, true],
                 Gate::Era => [false, true, true, true],
                 Gate::GlobalTables => [false, false, true, true],
+                Gate::MrecReplication => [false, false, false, true],
                 Gate::Synthetic(2) => [false, false, true, true],
                 Gate::Synthetic(3) => [false, false, false, true],
                 Gate::Synthetic(_) => unreachable!(),

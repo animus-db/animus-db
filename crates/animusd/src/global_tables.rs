@@ -260,6 +260,7 @@ pub(crate) async fn update_table_global<E: Env, R: RelayClient>(
         regions,
         witness: request.witness,
         preferred_leader_region: local,
+        replicas: Vec::new(),
     };
     spec.validate()
         .map_err(|e| WireError::validation(format!("UpdateTable: {}", e.message())))?;

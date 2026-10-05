@@ -171,29 +171,96 @@ pub struct TtlSpec {
     pub attribute_name: String,
 }
 
-/// The consistency mode of a global table (ADR 0075). Only
-/// [`Strong`](Self::Strong) (MRSC) exists in stage G-c; the eventual mode
-/// (MREC) is stage G-d and will add a variant behind its own gate.
+/// The consistency mode of a global table (ADR 0075).
+///
+/// [`Strong`](Self::Strong) (MRSC, stage G-c) is `Gate::GlobalTables`;
+/// [`Eventual`](Self::Eventual) (MREC, stage G-d) is its own gate,
+/// `Gate::MrecReplication` (cluster version 3): a Release(2) voter decodes the
+/// G-c shapes but would fail to decode this variant, so a spec carrying it is
+/// only ever written by a command that is itself gated on version 3.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MultiRegionConsistency {
     /// Multi-Region strong consistency: one Raft group per tablet, one
     /// replica per Region, linearizable.
     Strong,
+    /// Multi-Region eventual consistency: each Region is an independent
+    /// cluster holding its own full copy; writes are asynchronously
+    /// replicated between them and conflicts resolve last-writer-wins on an
+    /// [`animus_item::MrecVersion`]-shaped stamp (ADR 0075 section 4).
+    Eventual,
+}
+
+/// The lifecycle status of one MREC replica (ADR 0075 section 4.3; the
+/// DynamoDB `ReplicaStatus` names). Unlike MRSC's derived status it is
+/// **stored**, because it depends on a remote cluster.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MrecReplicaStatus {
+    /// Being created: the initial copy has not completed.
+    Creating,
+    /// Serving and replicating.
+    Active,
+    /// Being removed.
+    Deleting,
+    /// Creation failed (visible until the replica is deleted).
+    CreationFailed,
+}
+
+/// One replica (Region) of an MREC global table, as recorded in
+/// [`GlobalTableSpec::replicas`].
+///
+/// `region` is an MREC **peer name** (the `cluster_settings.region` of that
+/// cluster), a different namespace from MRSC's member-label Regions (plan
+/// decision D6). `region_id` is [`mrec_region_id`] of the name, stored (and
+/// checked by [`GlobalTableSpec::validate`]) so every cluster agrees on the
+/// last-writer-wins tie-break by construction.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MrecReplica {
+    /// The peer's Region name.
+    pub region: String,
+    /// `mrec_region_id(region)`.
+    pub region_id: u32,
+    /// Lifecycle status.
+    pub status: MrecReplicaStatus,
+    /// `true` for this cluster's own replica (exactly one entry).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub local: bool,
+}
+
+/// The MREC Region id of a Region name: 32-bit **FNV-1a** over the name's
+/// UTF-8 bytes (ADR 0075 4.4 asks only for a small integer giving a total
+/// order; a name-derived id needs no cross-cluster allocation protocol and is
+/// identical everywhere by construction). Frozen: it is persisted in every
+/// versioned row's stamp.
+#[must_use]
+pub fn mrec_region_id(name: &str) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in name.as_bytes() {
+        h ^= u32::from(*b);
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
 }
 
 /// A table's replicated **global-table** configuration (ADR 0075 section 3),
-/// recorded by `MetaCommand::ConvertTableToGlobal`.
+/// recorded by `MetaCommand::ConvertTableToGlobal` (MRSC) or
+/// `MetaCommand::ConvertTableToMrec` (MREC).
 ///
-/// Invariants ([`validate`](Self::validate)): exactly
-/// [`MRSC_REGIONS`](Self::MRSC_REGIONS) distinct, non-empty Regions;
-/// the witness (when present) is one of them; the preferred-leader Region is
-/// one of them and is never the witness.
+/// Invariants ([`validate`](Self::validate)), **MRSC** ([`Strong`]
+/// (MultiRegionConsistency::Strong)): exactly [`MRSC_REGIONS`]
+/// (Self::MRSC_REGIONS) distinct, non-empty Regions; the witness (when
+/// present) is one of them; the preferred-leader Region is one of them and is
+/// never the witness; no `replicas`. **MREC** ([`Eventual`]
+/// (MultiRegionConsistency::Eventual)): `regions` empty, no witness, empty
+/// preferred-leader, and `replicas` holds 1..=[`MREC_MAX_REPLICAS`]
+/// (Self::MREC_MAX_REPLICAS) distinct, named entries with name-derived ids,
+/// exactly one of them `local`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GlobalTableSpec {
     /// The consistency mode.
     pub consistency: MultiRegionConsistency,
     /// Every Region of the table (witness included), in declaration order.
     /// Each is a value of the `topology.kubernetes.io/region` member label.
+    /// MRSC only: empty for an MREC table (see [`replicas`](Self::replicas)).
     pub regions: Vec<String>,
     /// The witness Region, if the table was created in the
     /// two-replicas-plus-witness form. A witness holds a voting replica but
@@ -202,8 +269,14 @@ pub struct GlobalTableSpec {
     pub witness: Option<String>,
     /// The Region the preferred-leader mechanism steers each tablet's leader
     /// to (ADR 0075 3.3; plan decision D2/D3: lives here, not on the
-    /// placement policy).
+    /// placement policy). MRSC only: empty for an MREC table.
     pub preferred_leader_region: String,
+    /// The MREC replica set, this cluster's own replica included (flagged
+    /// `local`). **Class G, `Gate::MrecReplication`**: additive and skipped
+    /// when empty, so an MRSC spec encodes byte-identically to before and
+    /// only an MREC table carries it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replicas: Vec<MrecReplica>,
 }
 
 /// Why a [`GlobalTableSpec`] was rejected.
@@ -221,6 +294,18 @@ pub enum GlobalSpecError {
     PreferredNotInRegions,
     /// The preferred-leader Region is the witness.
     PreferredIsWitness,
+    /// An MRSC spec carries MREC `replicas`, or an MREC spec carries MRSC
+    /// fields (`regions`, `witness`, `preferred_leader_region`).
+    ModeFieldsMixed,
+    /// An MREC spec has no replicas, or more than the cap.
+    MrecReplicaCount,
+    /// An MREC replica name is empty or two replicas share a name.
+    MrecReplicaName,
+    /// An MREC replica's `region_id` is not `mrec_region_id(region)`, or two
+    /// replicas collide on an id.
+    MrecRegionId,
+    /// An MREC spec does not have exactly one `local` replica.
+    MrecLocalReplica,
 }
 
 impl GlobalSpecError {
@@ -240,6 +325,13 @@ impl GlobalSpecError {
             GlobalSpecError::PreferredIsWitness => {
                 "global table preferred-leader region is the witness"
             }
+            GlobalSpecError::ModeFieldsMixed => {
+                "global table spec mixes strong and eventual fields"
+            }
+            GlobalSpecError::MrecReplicaCount => "global table has no replicas or too many",
+            GlobalSpecError::MrecReplicaName => "global table replica names are empty or repeated",
+            GlobalSpecError::MrecRegionId => "global table replica region id is wrong or collides",
+            GlobalSpecError::MrecLocalReplica => "global table needs exactly one local replica",
         }
     }
 }
@@ -248,11 +340,33 @@ impl GlobalTableSpec {
     /// The number of Regions an MRSC table spans (ADR 0075 V6).
     pub const MRSC_REGIONS: usize = 3;
 
+    /// The most replicas an MREC table may have (a defensive AnimusDB cap,
+    /// ADR 0075 section 6).
+    pub const MREC_MAX_REPLICAS: usize = 16;
+
+    /// Whether this is a multi-Region **strong** (MRSC) spec.
+    #[must_use]
+    pub fn is_mrsc(&self) -> bool {
+        self.consistency == MultiRegionConsistency::Strong
+    }
+
+    /// Whether this is a multi-Region **eventual** (MREC) spec.
+    #[must_use]
+    pub fn is_mrec(&self) -> bool {
+        self.consistency == MultiRegionConsistency::Eventual
+    }
+
     /// Check the spec's internal consistency.
     ///
     /// # Errors
     /// The first violated invariant.
     pub fn validate(&self) -> Result<(), GlobalSpecError> {
+        if self.is_mrec() {
+            return self.validate_mrec();
+        }
+        if !self.replicas.is_empty() {
+            return Err(GlobalSpecError::ModeFieldsMixed);
+        }
         if self.regions.len() != Self::MRSC_REGIONS {
             return Err(GlobalSpecError::WrongRegionCount);
         }
@@ -273,6 +387,35 @@ impl GlobalTableSpec {
         }
         if self.witness.as_ref() == Some(&self.preferred_leader_region) {
             return Err(GlobalSpecError::PreferredIsWitness);
+        }
+        Ok(())
+    }
+
+    fn validate_mrec(&self) -> Result<(), GlobalSpecError> {
+        if !self.regions.is_empty()
+            || self.witness.is_some()
+            || !self.preferred_leader_region.is_empty()
+        {
+            return Err(GlobalSpecError::ModeFieldsMixed);
+        }
+        if self.replicas.is_empty() || self.replicas.len() > Self::MREC_MAX_REPLICAS {
+            return Err(GlobalSpecError::MrecReplicaCount);
+        }
+        let names: BTreeSet<&str> = self.replicas.iter().map(|r| r.region.as_str()).collect();
+        if names.contains("") || names.len() != self.replicas.len() {
+            return Err(GlobalSpecError::MrecReplicaName);
+        }
+        let ids: BTreeSet<u32> = self.replicas.iter().map(|r| r.region_id).collect();
+        if ids.len() != self.replicas.len()
+            || self
+                .replicas
+                .iter()
+                .any(|r| r.region_id != mrec_region_id(&r.region))
+        {
+            return Err(GlobalSpecError::MrecRegionId);
+        }
+        if self.replicas.iter().filter(|r| r.local).count() != 1 {
+            return Err(GlobalSpecError::MrecLocalReplica);
         }
         Ok(())
     }

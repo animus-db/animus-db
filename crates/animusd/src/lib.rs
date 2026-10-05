@@ -19360,6 +19360,7 @@ mod confirm_futility_tests {
             key: TableSchema::simple("pk"),
             lsis: Vec::new(),
             change_records_carry_images: false,
+            mrec: None,
         };
         let pk = AttributeValue::S("cf-target".to_owned());
         let base_key = crate::dynamo::item_key(&pk, None);

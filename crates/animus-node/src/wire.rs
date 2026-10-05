@@ -985,6 +985,15 @@ pub fn is_relayable_command(command: &MetaCommand) -> bool {
         // relay reason as `ConvertTableToGlobal` (the admin action may land
         // on a follower); the receiver re-checks `Gate::GlobalTables`.
         | MetaCommand::SetGlobalPreferredLeader { .. }
+        // MREC global tables (ADR 0075 section 4, G-01 stage G-d): the replica
+        // set is catalog state mutated from a wire `UpdateTable` on any node
+        // (and by the create/delete saga on the control leader), so all four
+        // relay like `ConvertTableToGlobal`; the receiver re-checks
+        // `Gate::MrecReplication` (`version_wiring::relay_gate_verdict`).
+        | MetaCommand::ConvertTableToMrec { .. }
+        | MetaCommand::AddMrecReplica { .. }
+        | MetaCommand::RemoveMrecReplica { .. }
+        | MetaCommand::SetMrecReplicaStatus { .. }
         // Resource tagging (roadmap W-06): schema-catalog class, same relay
         // reason as `SetTableTtl` — a follower-connected `TagResource`/
         // `UntagResource` must reach the control leader.
@@ -1642,11 +1651,31 @@ mod tests {
                     regions: vec!["a".to_string(), "b".to_string(), "c".to_string()],
                     witness: None,
                     preferred_leader_region: "a".to_string(),
+                    replicas: Vec::new(),
                 },
             },
             MetaCommand::SetGlobalPreferredLeader {
                 table: table.clone(),
                 region: "b".to_string(),
+            },
+            MetaCommand::ConvertTableToMrec {
+                table: table.clone(),
+                local_region: "us".to_string(),
+                region_id: animus_control::mrec_region_id("us"),
+            },
+            MetaCommand::AddMrecReplica {
+                table: table.clone(),
+                region: "eu".to_string(),
+                region_id: animus_control::mrec_region_id("eu"),
+            },
+            MetaCommand::RemoveMrecReplica {
+                table: table.clone(),
+                region: "eu".to_string(),
+            },
+            MetaCommand::SetMrecReplicaStatus {
+                table: table.clone(),
+                region: "eu".to_string(),
+                status: animus_control::MrecReplicaStatus::Active,
             },
             MetaCommand::TagResource {
                 table: table.clone(),

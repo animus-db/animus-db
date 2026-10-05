@@ -2276,6 +2276,51 @@ pub enum MetaCommand {
     /// G-c ships at cluster version 2; a table can only be global once that
     /// gate is open, so this command is meaningless before it).
     SetGlobalPreferredLeader { table: TableName, region: String },
+    /// **Convert a table to an MREC (multi-Region eventual-consistency) global
+    /// table** (ADR 0075 section 4, G-01 stage G-d): records
+    /// `schema.global = GlobalTableSpec { consistency: Eventual, replicas:
+    /// [the local replica, Active] }`. `region_id` must equal
+    /// [`mrec_region_id`](crate::schema::mrec_region_id)`(local_region)` (a
+    /// deterministic state-based rejection otherwise). Placement is untouched
+    /// (an MREC table's data stays inside this cluster; the replicas are
+    /// *other clusters*). The table need not be empty. Re-applying the
+    /// identical conversion is a no-op.
+    ///
+    /// **M1 ships the shape and a real, inert apply; nothing emits it yet**
+    /// (the wire surface and replica-create saga are M4).
+    ///
+    /// **Gate: `Gate::MrecReplication`** (cluster version 3).
+    ConvertTableToMrec {
+        table: TableName,
+        local_region: String,
+        region_id: u32,
+    },
+    /// **Add a peer replica to an MREC table** (status `Creating`). `region_id`
+    /// must be `mrec_region_id(region)`. Rejected (state-based) when the table
+    /// is not MREC, the id is wrong or collides, or the replica cap is hit;
+    /// adding an identical replica is a no-op.
+    ///
+    /// **Gate: `Gate::MrecReplication`.**
+    AddMrecReplica {
+        table: TableName,
+        region: String,
+        region_id: u32,
+    },
+    /// **Remove a peer replica from an MREC table.** Removing an absent replica
+    /// is a no-op; removing the local replica is rejected.
+    ///
+    /// **Gate: `Gate::MrecReplication`.**
+    RemoveMrecReplica { table: TableName, region: String },
+    /// **Set an MREC replica's lifecycle status** (stored, not derived: it
+    /// depends on a remote cluster). Rejected for an unknown replica; setting
+    /// the status it already has is a no-op.
+    ///
+    /// **Gate: `Gate::MrecReplication`.**
+    SetMrecReplicaStatus {
+        table: TableName,
+        region: String,
+        status: crate::schema::MrecReplicaStatus,
+    },
     /// Enable, reconfigure, or disable a table's **provisioned throughput**
     /// (ADR 0065 §5(b)) — the `CreateTable`/`UpdateTable` `BillingMode`/
     /// `ProvisionedThroughput` wire fields' own catalog mutation. Rejected
@@ -4130,7 +4175,9 @@ impl Metadata {
                 // Tentatively apply, then validate the resulting schema so a
                 // malformed index (e.g. an LSI with no sort attribute) is rejected
                 // deterministically and leaves the schema unchanged.
-                if schema.global.is_some() && index.kind == IndexKind::Local {
+                if schema.global.as_ref().is_some_and(|g| g.is_mrsc())
+                    && index.kind == IndexKind::Local
+                {
                     return ApplyOutcome::Rejected("global table cannot have a local index");
                 }
                 let mut candidate = schema.clone();
@@ -4882,7 +4929,7 @@ impl Metadata {
                 let Some(schema) = self.schemas.get_mut(table) else {
                     return ApplyOutcome::Rejected("no such table schema");
                 };
-                if spec.is_some() && schema.global.is_some() {
+                if spec.is_some() && schema.global.as_ref().is_some_and(|g| g.is_mrsc()) {
                     return ApplyOutcome::Rejected("global table cannot have TTL enabled");
                 }
                 if schema.ttl == *spec {
@@ -4905,6 +4952,11 @@ impl Metadata {
                     } else {
                         ApplyOutcome::Rejected("table is already a global table")
                     };
+                }
+                if !spec.is_mrsc() {
+                    return ApplyOutcome::Rejected(
+                        "ConvertTableToGlobal takes a strong spec (use ConvertTableToMrec)",
+                    );
                 }
                 if let Err(e) = spec.validate() {
                     return ApplyOutcome::Rejected(e.message());
@@ -4949,6 +5001,115 @@ impl Metadata {
                     return ApplyOutcome::NoOp;
                 }
                 global.preferred_leader_region.clone_from(region);
+                ApplyOutcome::Applied
+            }
+            MetaCommand::ConvertTableToMrec {
+                table,
+                local_region,
+                region_id,
+            } => {
+                let Some(schema) = self.schemas.get_mut(table) else {
+                    return ApplyOutcome::Rejected("no such table schema");
+                };
+                let spec = crate::schema::GlobalTableSpec {
+                    consistency: crate::schema::MultiRegionConsistency::Eventual,
+                    regions: Vec::new(),
+                    witness: None,
+                    preferred_leader_region: String::new(),
+                    replicas: vec![crate::schema::MrecReplica {
+                        region: local_region.clone(),
+                        region_id: *region_id,
+                        status: crate::schema::MrecReplicaStatus::Active,
+                        local: true,
+                    }],
+                };
+                if let Some(existing) = &schema.global {
+                    return if existing.is_mrec()
+                        && existing.replicas.iter().any(|r| {
+                            r.local && r.region == *local_region && r.region_id == *region_id
+                        }) {
+                        ApplyOutcome::NoOp
+                    } else {
+                        ApplyOutcome::Rejected("table is already a global table")
+                    };
+                }
+                if let Err(e) = spec.validate() {
+                    return ApplyOutcome::Rejected(e.message());
+                }
+                schema.global = Some(spec);
+                ApplyOutcome::Applied
+            }
+            MetaCommand::AddMrecReplica {
+                table,
+                region,
+                region_id,
+            } => {
+                let Some(spec) = self
+                    .schemas
+                    .get_mut(table)
+                    .and_then(|s| s.global.as_mut())
+                    .filter(|g| g.is_mrec())
+                else {
+                    return ApplyOutcome::Rejected("table is not an MREC global table");
+                };
+                if let Some(existing) = spec.replicas.iter().find(|r| r.region == *region) {
+                    return if existing.region_id == *region_id {
+                        ApplyOutcome::NoOp
+                    } else {
+                        ApplyOutcome::Rejected("replica already exists with a different region id")
+                    };
+                }
+                let mut candidate = spec.clone();
+                candidate.replicas.push(crate::schema::MrecReplica {
+                    region: region.clone(),
+                    region_id: *region_id,
+                    status: crate::schema::MrecReplicaStatus::Creating,
+                    local: false,
+                });
+                if let Err(e) = candidate.validate() {
+                    return ApplyOutcome::Rejected(e.message());
+                }
+                *spec = candidate;
+                ApplyOutcome::Applied
+            }
+            MetaCommand::RemoveMrecReplica { table, region } => {
+                let Some(spec) = self
+                    .schemas
+                    .get_mut(table)
+                    .and_then(|s| s.global.as_mut())
+                    .filter(|g| g.is_mrec())
+                else {
+                    return ApplyOutcome::Rejected("table is not an MREC global table");
+                };
+                let Some(pos) = spec.replicas.iter().position(|r| r.region == *region) else {
+                    return ApplyOutcome::NoOp;
+                };
+                if spec.replicas[pos].local {
+                    return ApplyOutcome::Rejected("cannot remove the local replica");
+                }
+                spec.replicas.remove(pos);
+                ApplyOutcome::Applied
+            }
+            MetaCommand::SetMrecReplicaStatus {
+                table,
+                region,
+                status,
+            } => {
+                let Some(spec) = self
+                    .schemas
+                    .get_mut(table)
+                    .and_then(|s| s.global.as_mut())
+                    .filter(|g| g.is_mrec())
+                else {
+                    return ApplyOutcome::Rejected("table is not an MREC global table");
+                };
+                let Some(replica) = spec.replicas.iter_mut().find(|r| r.region == *region) else {
+                    return ApplyOutcome::Rejected("no such MREC replica");
+                };
+                if replica.status == *status {
+                    return ApplyOutcome::NoOp;
+                }
+                replica.status = *status;
                 ApplyOutcome::Applied
             }
             MetaCommand::SetTableThroughput { table, spec } => {
@@ -6517,8 +6678,21 @@ impl crate::version::GatedCommand for MetaCommand {
             // ADR 0075 (G-01 stage G-c): the first real gate. An older voter
             // cannot decode the variant nor the `TableSchema.global` /
             // `PlacementPolicy.allowed_values` fields it writes.
+            // A `ConvertTableToGlobal` whose spec is `Eventual` would smuggle an
+            // MREC shape through the version-2 gate (apply rejects it, but a
+            // Release(2) voter would fail to *decode* it): classify by content.
+            MetaCommand::ConvertTableToGlobal { spec, .. } if spec.is_mrec() => {
+                Gate::MrecReplication
+            }
             MetaCommand::ConvertTableToGlobal { .. }
             | MetaCommand::SetGlobalPreferredLeader { .. } => Gate::GlobalTables,
+            // ADR 0075 (G-01 stage G-d): the MREC commands, one gate; an older
+            // voter cannot decode the variants nor `Eventual` /
+            // `GlobalTableSpec.replicas`.
+            MetaCommand::ConvertTableToMrec { .. }
+            | MetaCommand::AddMrecReplica { .. }
+            | MetaCommand::RemoveMrecReplica { .. }
+            | MetaCommand::SetMrecReplicaStatus { .. } => Gate::MrecReplication,
             MetaCommand::ReportNodeVersion { .. } | MetaCommand::FinalizeClusterVersion { .. } => {
                 Gate::Era
             }

@@ -588,6 +588,24 @@ pub enum KindEvalOp {
         key_item: Item,
         actions: Vec<UpdateAction>,
     },
+    /// **Apply a replicated MREC write** (ADR 0075 section 4, G-01 stage
+    /// G-d): another Region's already-resolved result for this item, shipped
+    /// as the resulting image (never the expression). `item: None` is a
+    /// tombstone. `ver` is the originating Region's stamp; apply (M2) writes
+    /// the row only when `ver` beats the stored stamp, otherwise it reports
+    /// the leader-local `Superseded` result. Unconditional: the entry's
+    /// `condition` is ignored by construction (the shipper never sets one).
+    ///
+    /// **Class G, gated by `Gate::MrecReplication`** (cluster version 3):
+    /// [`KvCommand::required_gate`](crate::gates) is content-dependent, so a
+    /// `KindEval`/`KindEvalBatch`/`TxnStage` carrying this op is refused at
+    /// the propose site until the gate opens. **M1 ships the shape only**:
+    /// nothing emits it and apply rejects it deterministically (M2 gives it
+    /// the last-writer-wins semantics).
+    Replicate {
+        item: Option<Item>,
+        ver: animus_item::MrecVersion,
+    },
 }
 
 /// One item's evaluate-at-apply write inside a [`KvCommand::KindEvalBatch`]
@@ -8238,6 +8256,16 @@ fn evaluate_kind_eval(
     let new = match op {
         KindEvalOp::Put(item) => Some(item.clone()),
         KindEvalOp::Delete => None,
+        // ADR 0075 G-d M1: the shape exists, the semantics land in M2. The
+        // gate keeps every proposer from emitting it; a deterministic
+        // rejection (never a panic: apply must not diverge or crash) is what
+        // a replica does with one that arrives anyway.
+        KindEvalOp::Replicate { .. } => {
+            return KindEvalDecision::Rejected {
+                code: "InternalServerError".to_owned(),
+                message: "MREC replicate is not implemented in this build".to_owned(),
+            };
+        }
         KindEvalOp::Update { key_item, actions } => {
             let base = old.clone().unwrap_or_else(|| key_item.clone());
             match animus_item::apply_update(base, actions) {

@@ -6,6 +6,14 @@
 //! A live item is `{"item": {..}}`; a deleted item is recorded as a
 //! tombstone (the bare JSON string `"tombstone"`) because the data plane has no native
 //! delete yet (ADR 0010). A read treats a tombstone as absent.
+//!
+//! A row of a **multi-Region eventual-consistency (MREC) global table** (ADR
+//! 0075, G-01 stage G-d) additionally carries the [`MrecVersion`] that decides
+//! last-writer-wins across Regions: `{"versioned_item": {"item": {..}, "ver":
+//! {..}}}` / `{"versioned_tombstone": {"ver": {..}}}`. These two variants are
+//! additive within v1 (a new variant plus golden fixtures, as the frozen-format
+//! note on [`StoredItem`] prescribes); an unversioned row decodes exactly as it
+//! always has and compares as [`MrecVersion::ZERO`].
 
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +36,51 @@ use crate::Item;
 enum StoredItem {
     Item(Item),
     Tombstone,
+    /// A live item of an MREC table with its last-writer-wins stamp (ADR
+    /// 0075 G-d; additive within v1). Written only on MREC tables, which are
+    /// gated on `Gate::MrecReplication`, so no pre-MREC binary ever reads one
+    /// out of a cluster that did not opt in (it still outlives the cluster in
+    /// backups/exports: class F).
+    VersionedItem {
+        item: Item,
+        ver: MrecVersion,
+    },
+    /// A delete tombstone of an MREC table with its stamp: the stamp is what
+    /// stops a stale replicated put from resurrecting the item.
+    VersionedTombstone {
+        ver: MrecVersion,
+    },
+}
+
+/// The cross-Region last-writer-wins stamp of one item of an MREC global table
+/// (ADR 0075 section 4.4, G-01 stage G-d decision D1).
+///
+/// It is a **calendar** stamp, deliberately not the node HLC: the HLC's wall
+/// part is relative to the `Env` clock's epoch (process start under
+/// `ProdEnv`), so it is not comparable between clusters. The total order is
+/// the tuple order of the fields as declared (`wall_ms`, then `logical`, then
+/// `region_id`), which is what the derived `Ord` gives; `region_id` makes the
+/// order total across Regions (same-millisecond ties break the same way
+/// everywhere). An unversioned row compares as [`ZERO`](Self::ZERO).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct MrecVersion {
+    /// Calendar milliseconds (`Env::wall_now`) of the originating write.
+    pub wall_ms: u64,
+    /// Tie-break counter for writes within one millisecond / causally after a
+    /// stored stamp.
+    pub logical: u32,
+    /// The originating Region (FNV-1a of its name, `animus_control::
+    /// mrec_region_id`), the final tie-break.
+    pub region_id: u32,
+}
+
+impl MrecVersion {
+    /// The stamp an unversioned row compares as: below every real stamp.
+    pub const ZERO: MrecVersion = MrecVersion {
+        wall_ms: 0,
+        logical: 0,
+        region_id: 0,
+    };
 }
 
 /// The version of the stored-item encoding `bytes` is written in, sniffed
@@ -61,14 +114,45 @@ pub fn encode_tombstone() -> Vec<u8> {
     serde_json::to_vec(&StoredItem::Tombstone).expect("tombstone serializes")
 }
 
+/// Serialize a live item together with its MREC stamp (ADR 0075 G-d).
+#[must_use]
+pub fn encode_stored_item_versioned(item: &Item, ver: MrecVersion) -> Vec<u8> {
+    serde_json::to_vec(&StoredItem::VersionedItem {
+        item: item.clone(),
+        ver,
+    })
+    .expect("versioned stored item serializes")
+}
+
+/// Serialize a delete tombstone together with its MREC stamp (ADR 0075 G-d).
+#[must_use]
+pub fn encode_tombstone_versioned(ver: MrecVersion) -> Vec<u8> {
+    serde_json::to_vec(&StoredItem::VersionedTombstone { ver })
+        .expect("versioned tombstone serializes")
+}
+
 /// Decode bytes read from the data plane back into an item, or `None` for an
-/// absent key or a tombstone.
+/// absent key or a tombstone. A versioned row (MREC) decodes to its item; use
+/// [`decode_stored_item_versioned`] to also see the stamp.
 ///
 /// # Errors
 /// Returns a message describing the decode failure if the stored bytes are
 /// not a valid encoded item. The caller (`animus_dynamo::wire::
 /// decode_stored_item`) wraps this into its own `WireError::serialization`.
 pub fn decode_stored_item(bytes: &[u8]) -> Result<Option<Item>, String> {
+    decode_stored_item_versioned(bytes).map(|(item, _)| item)
+}
+
+/// Decode a stored row into `(item or tombstone, MREC stamp)`: the stamp is
+/// `None` for an unversioned row (every row of a non-MREC table, and an MREC
+/// table's rows from before it was converted), which a caller orders as
+/// [`MrecVersion::ZERO`].
+///
+/// # Errors
+/// As [`decode_stored_item`].
+pub fn decode_stored_item_versioned(
+    bytes: &[u8],
+) -> Result<(Option<Item>, Option<MrecVersion>), String> {
     let stored: StoredItem = match stored_item_version(bytes) {
         Some(1) => serde_json::from_slice(bytes).map_err(|e| e.to_string())?,
         _ => {
@@ -79,8 +163,10 @@ pub fn decode_stored_item(bytes: &[u8]) -> Result<Option<Item>, String> {
         }
     };
     Ok(match stored {
-        StoredItem::Item(item) => Some(item),
-        StoredItem::Tombstone => None,
+        StoredItem::Item(item) => (Some(item), None),
+        StoredItem::Tombstone => (None, None),
+        StoredItem::VersionedItem { item, ver } => (Some(item), Some(ver)),
+        StoredItem::VersionedTombstone { ver } => (None, Some(ver)),
     })
 }
 
@@ -101,6 +187,54 @@ mod tests {
         assert_eq!(decode_stored_item(&bytes).unwrap(), Some(item));
         let tomb = encode_tombstone();
         assert_eq!(decode_stored_item(&tomb).unwrap(), None);
+    }
+
+    #[test]
+    fn versioned_rows_round_trip_and_unversioned_rows_decode_unchanged() {
+        let mut item = Item::new();
+        item.insert("id".into(), s("u1"));
+        let ver = MrecVersion {
+            wall_ms: 1_700_000_000_123,
+            logical: 2,
+            region_id: 0xdead_beef,
+        };
+        let live = encode_stored_item_versioned(&item, ver);
+        assert_eq!(stored_item_version(&live), Some(1));
+        assert_eq!(
+            decode_stored_item_versioned(&live).unwrap(),
+            (Some(item.clone()), Some(ver))
+        );
+        assert_eq!(decode_stored_item(&live).unwrap(), Some(item.clone()));
+        let tomb = encode_tombstone_versioned(ver);
+        assert_eq!(stored_item_version(&tomb), Some(1));
+        assert_eq!(
+            decode_stored_item_versioned(&tomb).unwrap(),
+            (None, Some(ver))
+        );
+        assert_eq!(decode_stored_item(&tomb).unwrap(), None);
+        // The unversioned encodings are byte-identical to before and carry no stamp.
+        assert_eq!(
+            decode_stored_item_versioned(&encode_stored_item(&item)).unwrap(),
+            (Some(item), None)
+        );
+        assert_eq!(
+            decode_stored_item_versioned(&encode_tombstone()).unwrap(),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn mrec_version_total_order_is_wall_then_logical_then_region() {
+        let v = |wall_ms, logical, region_id| MrecVersion {
+            wall_ms,
+            logical,
+            region_id,
+        };
+        assert!(MrecVersion::ZERO < v(0, 0, 1));
+        assert!(v(1, 9, 9) < v(2, 0, 0));
+        assert!(v(2, 0, 9) < v(2, 1, 0));
+        assert!(v(2, 1, 1) < v(2, 1, 2));
+        assert_eq!(v(2, 1, 2).cmp(&v(2, 1, 2)), std::cmp::Ordering::Equal);
     }
 
     #[test]

@@ -2068,6 +2068,7 @@ mod kind_eval_confirm_wake_tests {
                     key: TableSchema::simple("pk"),
                     lsis: Vec::new(),
                     change_records_carry_images: false,
+                    mrec: None,
                 };
                 let outcome = ClientCtx::<SimEnv, NeverRelay>::cp_kind_eval_local(
                     &leader,
@@ -3095,6 +3096,7 @@ mod cp_kind_eval_local_genuine_loss_tests {
             key: TableSchema::simple("pk"),
             lsis: Vec::new(),
             change_records_carry_images: false,
+            mrec: None,
         };
         let slot: Arc<Mutex<Option<Result<(), String>>>> = Arc::new(Mutex::new(None));
         let out = slot.clone();

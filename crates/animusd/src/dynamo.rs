@@ -10653,6 +10653,7 @@ pub(crate) fn write_schema_for(meta: &Metadata, table: &str) -> animus_item::Wri
         key,
         lsis,
         change_records_carry_images: table_change_records_carry_images(meta, table),
+        mrec: None,
     }
 }
 

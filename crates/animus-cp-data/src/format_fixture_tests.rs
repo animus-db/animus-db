@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use animus_control::Metadata;
 use animus_control::format::FormatError;
 use animus_control::persist::{PersistedState, WalRecord};
-use animus_control::version::ClusterFeatures;
+use animus_control::version::{ClusterFeatures, Gate};
 use animus_env::nid;
 
 use crate::codec::tests::{sample_entries, sample_wires};
@@ -52,6 +52,11 @@ fn fixture_files(dir: &Path) -> Vec<(u8, Vec<u8>)> {
     {
         let path = entry.expect("dir entry").path();
         let stem = path.file_stem().and_then(|s| s.to_str()).expect("stem");
+        // `v<N>-<shape>.bin`: an additive shape inside the same version (ADR
+        // 0073 Phase 2), read by its own test, never by a per-version loop.
+        if stem.contains('-') {
+            continue;
+        }
         let version: u8 = stem
             .strip_prefix('v')
             .and_then(|v| v.parse().ok())
@@ -194,6 +199,68 @@ fn raftkv_wire_fixture_refuses_other_versions_by_name() {
             }
         );
     }
+}
+
+fn mrec_wire_bytes() -> Vec<u8> {
+    let frames: Vec<Vec<u8>> = codec::tests::mrec_sample_wires()
+        .iter()
+        .map(|w| codec::encode_wire(w, &ClusterFeatures::new()))
+        .collect();
+    pack_frames(&frames)
+}
+
+/// ADR 0075 (G-01 stage G-d): `raftkv-wire/v1-mrec.bin` — the additive MREC
+/// content (`WriteSchema.mrec`, `KindEvalOp::Replicate`) inside wire v1. It
+/// decodes to the hand-built value, the current encoder reproduces its bytes,
+/// and every frame is still a v1 frame (no version bump: the content is JSON
+/// inside the envelope, gated by `Gate::MrecReplication` at the propose site).
+#[test]
+fn raftkv_wire_mrec_shape_fixture_decodes_and_round_trips() {
+    let bytes = std::fs::read(formats_dir("raftkv-wire").join("v1-mrec.bin"))
+        .expect("raftkv-wire/v1-mrec.bin is checked in");
+    let expected = codec::tests::mrec_sample_wires();
+    let frames = unpack_frames(&bytes);
+    assert_eq!(frames.len(), expected.len());
+    for (i, (frame, want)) in frames.iter().zip(&expected).enumerate() {
+        assert_eq!((frame[0], frame[1]), (0xCB, 1), "frame {i}: still wire v1");
+        let got = codec::decode_wire(frame).unwrap_or_else(|e| panic!("frame {i}: {e}"));
+        assert_eq!(format!("{got:?}"), format!("{want:?}"), "frame {i}");
+        // The content the gate keys on is really there.
+        assert_eq!(got.required_gate(), Gate::MrecReplication, "frame {i}");
+    }
+    assert_eq!(
+        mrec_wire_bytes(),
+        bytes,
+        "the current encoder emits the fixture"
+    );
+}
+
+/// Old-input test: the pre-MREC v1 frames carry no MREC content, so every one
+/// of them needs only `Base` (the content-dependent `required_gate` must not
+/// change any existing entry's gate).
+#[test]
+fn pre_mrec_wire_fixture_needs_no_gate() {
+    for (version, bytes) in fixture_files(&formats_dir("raftkv-wire")) {
+        for frame in unpack_frames(&bytes) {
+            let w = codec::decode_wire(&frame).expect("decodes");
+            assert_eq!(w.required_gate(), Gate::Base, "v{version}");
+        }
+    }
+}
+
+/// `cargo test -p animus-cp-data --lib generate_fixture_raftkv_wire_mrec -- --ignored`.
+/// Refuses to overwrite an existing fixture.
+#[test]
+#[ignore]
+fn generate_fixture_raftkv_wire_mrec() {
+    let path = formats_dir("raftkv-wire").join("v1-mrec.bin");
+    if std::fs::metadata(&path).is_ok() {
+        panic!(
+            "{} already exists — never regenerated in place",
+            path.display()
+        );
+    }
+    std::fs::write(&path, mrec_wire_bytes()).expect("write fixture");
 }
 
 /// `cargo test -p animus-cp-data --lib generate_fixture_raftkv_wire -- --ignored`.
@@ -452,6 +519,64 @@ fn raftkv_wal_round_trips_and_matches_the_fixture_bytes() {
             other => panic!("raftkv-wal v{other} fixture has no byte expectation yet"),
         }
     }
+}
+
+/// The MREC records of `raftkv-wal/v2-mrec.bin` (ADR 0075 G-d): the entries of
+/// [`codec::tests::mrec_sample_wires`]' `AppendEntries` as `Append` records, in
+/// one persist round plus its sync marker (the v2 layout). `KvCommand` is
+/// stored as `serde_json` in the WAL, so this is where `WriteSchema.mrec` and
+/// `KindEvalOp::Replicate` become durable.
+fn mrec_wal_records() -> Vec<Rec> {
+    let mut recs = vec![Rec::Hard {
+        term: 9,
+        voted_for: Some(nid(2)),
+    }];
+    for w in codec::tests::mrec_sample_wires() {
+        let KvWire::Raft(animus_control::raft::RaftMsg::AppendEntries { entries, .. }) = w else {
+            panic!("mrec_sample_wires is an AppendEntries frame");
+        };
+        recs.extend(entries.into_iter().map(Rec::Append));
+    }
+    recs
+}
+
+fn mrec_wal_bytes() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for r in &mrec_wal_records() {
+        bytes.extend(PersistedState::<KvCommand, KvState>::encode_record(r));
+    }
+    bytes.extend(animus_control::format::encode_sync_marker(
+        &animus_control::persist::CONTROL_WAL,
+        bytes.len() as u64,
+    ));
+    bytes
+}
+
+#[test]
+fn raftkv_wal_mrec_shape_fixture_decodes_and_round_trips() {
+    let bytes = std::fs::read(formats_dir("raftkv-wal").join("v2-mrec.bin"))
+        .expect("raftkv-wal/v2-mrec.bin is checked in");
+    let got = PersistedState::<KvCommand, KvState>::decode(&bytes).expect("decodes");
+    assert_eq!(got, mrec_wal_records());
+    assert_eq!(
+        mrec_wal_bytes(),
+        bytes,
+        "the current encoder emits the fixture"
+    );
+}
+
+/// `cargo test -p animus-cp-data --lib generate_fixture_raftkv_wal_mrec -- --ignored`.
+#[test]
+#[ignore]
+fn generate_fixture_raftkv_wal_mrec() {
+    let path = formats_dir("raftkv-wal").join("v2-mrec.bin");
+    if std::fs::metadata(&path).is_ok() {
+        panic!(
+            "{} already exists — never regenerated in place",
+            path.display()
+        );
+    }
+    std::fs::write(&path, mrec_wal_bytes()).expect("write fixture");
 }
 
 /// The required fields of `TxnWrite` (ADR 0073 Phase 0 dropped their

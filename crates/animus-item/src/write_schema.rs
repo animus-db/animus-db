@@ -89,6 +89,31 @@ pub struct WriteSchema {
     /// consumes them) or are image-less markers (ADR 0049 §1). A frozen
     /// snapshot of `animusd::table_change_records_carry_images`'s own rule.
     pub change_records_carry_images: bool,
+    /// The MREC (multi-Region eventual-consistency) write context (ADR 0075
+    /// section 4, G-01 stage G-d): `Some` only for a write to a table with
+    /// `GlobalTableSpec { consistency: Eventual, .. }`, where apply must
+    /// stamp the row with an [`crate::stored::MrecVersion`] (M2). Frozen at
+    /// propose time like every other field, so apply stays a pure function of
+    /// `(entry, engine state)`. **Class G (replicated data entry), gated by
+    /// `Gate::MrecReplication`**: `animus-cp-data`'s `KvCommand::
+    /// required_gate` for `KindEval`/`KindEvalBatch` is content-dependent and
+    /// the propose sites refuse it while the gate is closed; an older binary
+    /// would silently ignore the unknown field and write an unstamped row.
+    /// `skip_serializing_if` keeps every ordinary table's entry
+    /// byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mrec: Option<MrecWriteStamp>,
+}
+
+/// The MREC context of one local write (see [`WriteSchema::mrec`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MrecWriteStamp {
+    /// This cluster's own Region id (`animus_control::mrec_region_id` of its
+    /// configured region name).
+    pub region_id: u32,
+    /// The leader's `Env::wall_now` milliseconds at propose time: the wall
+    /// part of the stamp apply computes (the rule lives in `animus-cp-data`).
+    pub wall_ms: u64,
 }
 
 /// The attributes one LSI row keeps, per its declared projection —
@@ -253,6 +278,7 @@ mod tests {
             key: TableSchema::simple("pk"),
             lsis: Vec::new(),
             change_records_carry_images: carries_images,
+            mrec: None,
         }
     }
 
@@ -295,6 +321,7 @@ mod tests {
             key: TableSchema::simple("pk"),
             lsis: vec![lsi],
             change_records_carry_images: true,
+            mrec: None,
         };
         let mut old_item = Item::new();
         old_item.insert("pk".to_owned(), pk.clone());
@@ -342,6 +369,7 @@ mod tests {
             key: TableSchema::simple("pk"),
             lsis: vec![lsi],
             change_records_carry_images: true,
+            mrec: None,
         };
         let mut item = Item::new();
         item.insert("pk".to_owned(), pk.clone());
