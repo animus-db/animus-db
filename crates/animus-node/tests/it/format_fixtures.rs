@@ -743,10 +743,12 @@ fn mrec_ver(wall_ms: u64) -> animus_item::MrecVersion {
     }
 }
 
-fn mrec_messages() -> (
+type MrecMessages = (
     Vec<(&'static str, ClientRequest)>,
     Vec<(&'static str, ClientResponse)>,
-) {
+);
+
+fn mrec_messages() -> MrecMessages {
     let rec = |item: Option<animus_dynamo::Item>, ms| MrecRecord {
         pk: pk(),
         sk: sk(),

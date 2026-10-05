@@ -2121,6 +2121,10 @@ fn print_response(response: &ClientResponse) {
                 println!("  [{i}] {result:?}");
             }
         }
+        // Internal intra-only MREC replication reply (ADR 0075, G-01 stage
+        // G-d M3): consumed by a peer cluster's shipper, never requested by a
+        // CLI subcommand — printed raw if one ever surfaces here.
+        ClientResponse::MrecApply(resp) => println!("mrec apply: {resp:?}"),
         // Internal TxnResolve RPC reply (ADR 0018 §3/§6, torn-pair-fix
         // stack PR2): consumed programmatically by `txn_resolve_participant_retrying`,
         // not requested by any CLI subcommand of its own — printed raw if

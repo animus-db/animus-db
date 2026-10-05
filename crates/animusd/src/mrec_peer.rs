@@ -31,12 +31,6 @@
 //! (`sim_world.rs`) and this crate's real client are interchangeable; `to` is
 //! an index into the configured peer list ([`MrecConfig::peers`]).
 
-#![allow(
-    dead_code,
-    reason = "the M4 shipper is this module's first production caller; M3 ships the config view, \
-              the seam and the real client, exercised by tests"
-)]
-
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;

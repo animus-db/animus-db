@@ -92,12 +92,7 @@ impl Fnv {
     }
 }
 
-/// Why a cross-cluster call failed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PeerError {
-    /// No reply within the caller's timeout (lost, partitioned, or too slow).
-    Timeout,
-}
+pub(crate) use crate::mrec_peer::{PeerClient, PeerError};
 
 /// One directed WAN link's model.
 #[derive(Debug, Clone, Copy)]
@@ -322,18 +317,6 @@ impl PeerBridge {
     }
 }
 
-/// The peer-client seam: what MREC's cross-cluster shipper will call. The real
-/// implementation (M3) dials intra ports over TLS; this one is the sim bridge.
-pub(crate) trait PeerClient: Send + Sync {
-    /// Send `payload` to cluster `to` and await its response.
-    fn call(
-        &self,
-        to: usize,
-        payload: Vec<u8>,
-        timeout: Duration,
-    ) -> BoxFuture<'static, Result<Vec<u8>, PeerError>>;
-}
-
 /// [`PeerClient`] over a [`PeerBridge`]; lives in the sender's simulator.
 #[derive(Clone)]
 pub(crate) struct BridgeClient {
@@ -425,6 +408,23 @@ impl SimWorld {
         );
         world.advance_all(world.now);
         world
+    }
+
+    /// Re-align every member simulator to the latest clock any of them reached.
+    /// A setup phase may drive one member cluster alone (its own `run_for`,
+    /// finalizing the cluster version, DDL) *before* the world carries any
+    /// traffic; call this once afterwards so lockstep resumes from a common
+    /// time. (Never call it while bridge traffic is in flight.)
+    pub(crate) fn sync_clocks(&mut self) {
+        self.now = Nanos(
+            self.clusters
+                .iter()
+                .map(|c| c.simulator().now().0)
+                .max()
+                .unwrap_or(0)
+                .max(self.now.0),
+        );
+        self.advance_all(self.now);
     }
 
     pub(crate) fn bridge(&self) -> &PeerBridge {

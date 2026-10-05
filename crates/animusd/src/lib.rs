@@ -22562,6 +22562,9 @@ mod sim_cluster_txn_conflict;
 /// G-01 stage G-d M0: multi-cluster `SimWorld` + `PeerBridge` WAN model (test-only).
 #[cfg(test)]
 mod sim_world;
+/// G-01 stage G-d M3: the MREC receiver over `SimWorld` (test-only).
+#[cfg(test)]
+mod sim_world_mrec_tests;
 #[cfg(test)]
 mod sim_world_tests;
 
