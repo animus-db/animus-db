@@ -1,0 +1,222 @@
+name: bench
+
+# B-01 (docs/roadmap.md) Plan item 6: a manual, reporting-only A/B benchmark
+# job. `workflow_dispatch` only: no schedule and no push/PR trigger, on
+# purpose. Numbers from a shared GitHub-hosted runner are noisy and are NOT a
+# baseline and NOT publishable — the load generator and the cluster share the
+# runner's CPUs/disk/loopback, so every results file this job produces says
+# `"publishable": false`. What this job *is* for is spotting build-to-build
+# movement on one runner: it builds the generator once (from the dispatched
+# ref, so both sides are driven by the same load generator), builds `animusd`
+# for `base_ref` and for the dispatched ref in the same job, runs them
+# interleaved (base, head, base, head, ...) so run-to-run spread is visible,
+# and prints a comparison table. It NEVER fails on a latency number: the
+# comparison is informational (`animus-bench compare` exits 0), and the
+# threshold below only decides which rows are flagged.
+#
+# Publishable numbers come from a dedicated client host against an external
+# cluster (an operations task), not from this workflow. To use one, point
+# `runner` at a self-hosted label; the job still launches the cluster on that
+# runner, so it stays colocated and non-publishable either way.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: >-
+          runs-on label. ubuntu-latest is a shared hosted runner: numbers from
+          it are not a baseline and not publishable. Use a self-hosted label
+          for less noise.
+        type: string
+        default: ubuntu-latest
+      base_ref:
+        description: >-
+          Optional branch, tag or SHA to A/B against. Empty = measure the
+          dispatched ref only (no comparison table).
+        type: string
+        default: ""
+      workloads:
+        description: "YCSB workloads, e.g. A or A,B,F or all"
+        type: string
+        default: "A"
+      rates:
+        description: >-
+          Arrival rate in ops/s; one value = a steady run, a comma list
+          (e.g. 100,200,400) = a throughput sweep.
+        type: string
+        default: "300"
+      records:
+        description: Records loaded per table
+        type: string
+        default: "10000"
+      value_bytes:
+        description: Item `data` attribute size in bytes
+        type: string
+        default: "256"
+      warmup_secs:
+        description: Discarded warm-up seconds per run
+        type: string
+        default: "10"
+      steady_secs:
+        description: Measured seconds per run (per point for a sweep)
+        type: string
+        default: "30"
+      consistent_read:
+        description: "ConsistentRead mode: true, false or both"
+        type: choice
+        options: ["both", "true", "false"]
+        default: "both"
+      degraded:
+        description: "Add a degraded run: none, leader or follower (kills a node, restarts it)"
+        type: choice
+        options: ["none", "leader", "follower"]
+        default: "none"
+      repeats:
+        description: Interleaved repetitions per side (>= 2 to measure run-to-run spread)
+        type: string
+        default: "2"
+      threshold_pct:
+        description: >-
+          Flag a median delta only beyond this percent AND beyond the
+          observed run-to-run spread. Reporting only, never fails the job.
+        type: string
+        default: "10"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  bench:
+    name: bench (${{ inputs.base_ref != '' && format('{0} vs head', inputs.base_ref) || 'head only' }})
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 180
+    steps:
+      - name: Checkout head
+        uses: actions/checkout@v4
+        with:
+          path: head
+
+      - name: Checkout base
+        if: inputs.base_ref != ''
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.base_ref }}
+          path: base
+
+      - name: Install Rust toolchain (1.96)
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Cache cargo artifacts (head)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: head -> target
+
+      - name: Cache cargo artifacts (base)
+        if: inputs.base_ref != ''
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: base -> target
+
+      # One generator for both sides (the dispatched ref's), so a difference
+      # between base and head is the server build, never the load generator.
+      - name: Build generator and head animusd
+        working-directory: head
+        run: cargo build --release --locked -p animus-bench -p animusd
+
+      - name: Build base animusd
+        if: inputs.base_ref != ''
+        working-directory: base
+        run: cargo build --release --locked -p animusd
+
+      - name: Host facts
+        run: |
+          {
+            echo "### Host"
+            echo '```'
+            uname -a
+            lscpu | grep -E 'Model name|^CPU\(s\)' || true
+            free -h | head -2
+            echo "head: $(git -C head rev-parse HEAD)"
+            if [ -n "${BASE_REF}" ]; then echo "base: ${BASE_REF} = $(git -C base rev-parse HEAD)"; fi
+            echo '```'
+            echo "> Shared-runner numbers are not a baseline and are not publishable."
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+        env:
+          BASE_REF: ${{ inputs.base_ref }}
+
+      - name: Run benchmarks (interleaved)
+        env:
+          BASE_REF: ${{ inputs.base_ref }}
+          WORKLOADS: ${{ inputs.workloads }}
+          RATES: ${{ inputs.rates }}
+          RECORDS: ${{ inputs.records }}
+          VALUE_BYTES: ${{ inputs.value_bytes }}
+          WARMUP: ${{ inputs.warmup_secs }}
+          STEADY: ${{ inputs.steady_secs }}
+          CONSISTENT_READ: ${{ inputs.consistent_read }}
+          DEGRADED: ${{ inputs.degraded }}
+          REPEATS: ${{ inputs.repeats }}
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          GEN="$PWD/head/target/release/animus-bench"
+          case "$RATES" in
+            *,*) rate_args=(--sweep "$RATES") ;;
+            *)   rate_args=(--rate "$RATES") ;;
+          esac
+          sides=(head)
+          if [ -n "$BASE_REF" ]; then sides=(base head); fi
+          for i in $(seq 1 "$REPEATS"); do
+            for side in "${sides[@]}"; do
+              echo "::group::run $i/$REPEATS side=$side"
+              "$GEN" --launch processes --cluster-size 3 \
+                --animusd-bin "$PWD/$side/target/release/animusd" \
+                --workloads "$WORKLOADS" "${rate_args[@]}" \
+                --records "$RECORDS" --value-bytes "$VALUE_BYTES" \
+                --warmup-secs "$WARMUP" --steady-secs "$STEADY" \
+                --consistent-read "$CONSISTENT_READ" --degraded "$DEGRADED" \
+                --out "results/$side-$i.json" | tee "results/$side-$i.txt"
+              echo "::endgroup::"
+            done
+          done
+
+      - name: Compare (reporting only)
+        if: inputs.base_ref != ''
+        env:
+          THRESHOLD: ${{ inputs.threshold_pct }}
+        run: |
+          set -euo pipefail
+          # `compare` exits 0 on any well-formed input: no latency number
+          # can fail this step.
+          head/target/release/animus-bench compare \
+            --threshold-pct "$THRESHOLD" \
+            --out results/comparison.md \
+            --base results/base-*.json --head results/head-*.json \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Summaries
+        if: always()
+        run: |
+          {
+            for f in results/*.txt; do
+              [ -e "$f" ] || continue
+              echo "<details><summary>$(basename "$f")</summary>"
+              echo
+              echo '```'
+              cat "$f"
+              echo '```'
+              echo "</details>"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: results/
+          retention-days: 30
