@@ -1877,3 +1877,29 @@ cluster spanning the Regions; the `kind` e2e cannot run a stretch topology (and
 cannot run at all in the sandbox), so stretch behaviour is proven only in
 `SimEnv` (`animusd` `sim_cluster_mrsc`).
 
+
+## `E2E_UPGRADE=1`: the nightly operator-driven roll on `kind` (ADR 0073 Phase 3, D10)
+
+`scripts/e2e-kind.sh`'s `E2E_UPGRADE=1` leg (workflow
+`.github/workflows/upgrade-kind-nightly.yml`, nightly 04:07 UTC +
+`workflow_dispatch`; NOT per push, it builds two release images and rolls a
+4-node cluster) bootstraps the cluster on the **previous-release** image
+(`ANIMUSD_IMAGE_PREV`, built from the ref in `scripts/upgrade-from.txt` with
+that ref's own `Dockerfile`), applies `spec.upgrade.finalize: Auto`, runs the
+usual plain-TCP phases (so the table exists, the cluster is scaled to 4 and
+`controlNodes` grown), then starts an **in-cluster** `curlimages/curl` write
+loop against `svc/{name}-dynamo` (each write retried up to 60 s, then a STALL;
+in-cluster because a host port-forward pins one pod and dies when it restarts),
+patches `spec.image` to `ANIMUSD_IMAGE`, and polls every 2 s until
+`status.upgrade.phase=Complete`. It asserts: the partition was held at
+`replicas` and reached 0, `InProgress` was seen, the minimum `readyReplicas`
+across the roll was `>= replicas-1`, every pod is on the new image,
+`RollComplete=True`, `GET /admin/cluster-version` shows `era_active` and
+`active == own_range.max` (the operator finalized), and after the client stops
+every acked write reads back with `ConsistentRead` and none stalled.
+**UNVERIFIED in the sandbox** (`kind` cannot run here): `bash -n` and a YAML
+parse only (no `shellcheck`/`actionlint` installed); a first nightly failure is
+this leg's first real run. It is plain-TCP only (fails fast with
+`E2E_TLS`/`E2E_S3_TLS`). Known risk: the previous-release (Phase 1) binary must
+accept the config this operator renders; a rejected flag would show as a pod
+that never goes Ready *before* the roll starts.
