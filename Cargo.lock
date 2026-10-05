@@ -189,6 +189,7 @@ dependencies = [
 name = "animus-operator"
 version = "0.1.0-alpha.0"
 dependencies = [
+ "animus-roll",
  "async-trait",
  "bytes",
  "futures",

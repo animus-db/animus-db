@@ -65,6 +65,10 @@ rustls-pki-types = { workspace = true }
 # dependency graph transitively via `hyper-util`/`kube`, named directly here
 # only because this crate implements the trait itself, not just calls it.
 tower-service = "0.3"
+# ADR 0073 Phase 3 (P3-D): the pure rolling-upgrade state machine (gate, wait,
+# control-leader-last, finalize rules) the partition driver in `roll.rs` reuses
+# instead of re-implementing; pure and I/O-free, so no new transitive weight.
+animus-roll.workspace = true
 
 [dev-dependencies]
 # `tokio::time::pause`/`start_paused = true`, for the `drain_and_remove_node`

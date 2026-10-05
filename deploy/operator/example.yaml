@@ -22,6 +22,12 @@ spec:
   clientService:
     type: ClusterIP
   quiesceAfterSecs: 5
+  # Rolling upgrades (ADR 0073 Phase 3): editing `image` (or any pod-template
+  # field) rolls one pod at a time under a health gate. Finalizing the new
+  # cluster version is irreversible and manual by default.
+  # upgrade:
+  #   finalize: Manual   # or Auto: finalize after the roll + soak
+  #   soakSeconds: 0
   # dynamoAuthSecretName: example-dynamo-credentials
   # S3-compatible backup/segment stores (S-04 PR 3). Either or both of
   # backupStore/segmentStore may be set; credentialsSecretName must name a

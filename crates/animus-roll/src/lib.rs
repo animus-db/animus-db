@@ -329,6 +329,20 @@ fn pending_reasons(n: &NodeObs, obs: &Observation) -> Vec<String> {
 /// The next action for this observation. Pure: equal observations give equal
 /// actions, whatever was decided before.
 pub fn decide(cfg: &Config, obs: &Observation) -> Action {
+    decide_with_target(cfg, obs, None)
+}
+
+/// [`decide`] for a driver that fixes the order itself: `next` names the node
+/// the driver will restart next, and the machine evaluates **that** node (the
+/// gate excludes its own, about-to-be-stale verdict; a control leader gets its
+/// [`Action::TransferControlLeadership`]) instead of the one its own D1 order
+/// would pick. The Kubernetes operator needs this: a `StatefulSet` replaces
+/// pods highest ordinal first, whatever the machine would prefer, so the gate
+/// has to be judged for the pod the partition is about to admit. `next` is
+/// honoured only if it names a node still on the old binary
+/// ([`Platform::Old`]); anything else falls back to the machine's own order,
+/// so `decide_with_target(cfg, obs, None)` is exactly [`decide`].
+pub fn decide_with_target(cfg: &Config, obs: &Observation, next: Option<&str>) -> Action {
     if obs.nodes.is_empty() {
         return Action::Blocked(Block::NoNodes);
     }
@@ -368,7 +382,8 @@ pub fn decide(cfg: &Config, obs: &Observation) -> Action {
             .cmp(&class_of(b, leader))
             .then_with(|| a.id.cmp(&b.id))
     });
-    let Some(target) = pending.first() else {
+    let forced = next.and_then(|id| pending.iter().copied().find(|n| n.id == id));
+    let Some(target) = forced.or_else(|| pending.first().copied()) else {
         return finish(cfg, obs);
     };
 
@@ -637,6 +652,40 @@ mod tests {
             decide(&cfg(), &o),
             Action::Blocked(Block::NodeStalled { ref node, .. }) if node == "d"
         ));
+    }
+
+    #[test]
+    fn a_driver_chosen_target_is_the_one_the_gate_excludes_and_transfers_for() {
+        // Machine order would pick `b` (leader a is last, data d first, then b).
+        let mut o = obs();
+        node(&mut o, "d").platform = Platform::New;
+        assert_eq!(decide(&cfg(), &o), restart("b"));
+        // The driver restarts `c` next (highest ordinal first): judged for c.
+        assert_eq!(decide_with_target(&cfg(), &o, Some("c")), restart("c"));
+        // b's own verdict is NOT excluded any more: unhealthy b closes the gate
+        // for restarting c (the machine's pick would have ignored it).
+        node(&mut o, "b").health = not_ok("tablet_under_replicated");
+        assert!(matches!(
+            decide_with_target(&cfg(), &o, Some("c")),
+            Action::Blocked(Block::Unhealthy { ref node, .. }) if node == "b"
+        ));
+        // ... while c's own verdict is excluded (about to be stale).
+        node(&mut o, "b").health = Health::Ok;
+        node(&mut o, "c").health = not_ok("whatever");
+        assert_eq!(decide_with_target(&cfg(), &o, Some("c")), restart("c"));
+        // The control leader as the driver's target gets its transfer first.
+        node(&mut o, "c").health = Health::Ok;
+        assert_eq!(
+            decide_with_target(&cfg(), &o, Some("a")),
+            Action::TransferControlLeadership {
+                from: "a".into(),
+                to: "b".into()
+            }
+        );
+        // A target that is not on the old binary falls back to the machine's order.
+        assert_eq!(decide_with_target(&cfg(), &o, Some("d")), restart("b"));
+        assert_eq!(decide_with_target(&cfg(), &o, Some("nope")), restart("b"));
+        assert_eq!(decide_with_target(&cfg(), &o, None), decide(&cfg(), &o));
     }
 
     #[test]

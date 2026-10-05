@@ -37,6 +37,11 @@ partition driver). `animusd` uses it as a dev-dependency (`sim_cluster_roll_orch
 - The gate: every member `Active`; every other node's roll-health `Ok` (`NotOk` and `Unreachable`
   block; `Unavailable` is tolerated only from a node still on the old binary, and only until a
   node is on the new one: then at least one verdict must exist).
+- `decide_with_target(cfg, obs, Some(id))` (P3-D): a driver that fixes the order itself (the
+  operator: a `StatefulSet` replaces pods highest ordinal first) names the node it will restart
+  next; the gate then excludes *that* node's verdict and a control leader target gets its
+  transfer. A target not on the old binary is ignored (the machine's own order). `decide` is
+  `decide_with_target(.., None)`.
 - A control leader is never restarted: `TransferControlLeadership` to an Active control node
   (preferring one already on the new binary) first; tablet leaders are never moved.
 - Finalize: never with a blocker, a false `can_finalize`, or an unhealthy verdict; `Manual`
