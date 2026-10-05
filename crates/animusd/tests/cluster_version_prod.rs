@@ -10,10 +10,11 @@
 //! timeout-guarded (`ProdEnv` determinism guarantees do not apply, so a hang
 //! must fail loudly rather than stall CI).
 //!
-//! The real `MAX_SUPPORTED` is 2 (G-01 stage G-c shipped the first real gate,
-//! `Gate::GlobalTables`), so every real binary advertises `[1, 2]` and a live
-//! Finalize to 2 succeeds here: the era, the view, the leader-only routing
-//! and the finalize that opens `Gate::GlobalTables` on every node (a
+//! The real `MAX_SUPPORTED` is 3 (G-01 stage G-c shipped `Gate::GlobalTables`
+//! at 2, stage G-d `Gate::MrecReplication` at 3), so every real binary
+//! advertises `[1, 3]` and live Finalizes to 2 and then 3 succeed here: the
+//! era, the view, the leader-only routing and the finalizes that open
+//! `Gate::GlobalTables` and `Gate::MrecReplication` on every node (a
 //! data-only node's mirror included). The blocker matrix and the one-step
 //! rules are proven over seeds in `sim_cluster_cluster_version.rs`.
 
@@ -98,7 +99,7 @@ async fn the_era_starts_over_real_sockets_and_the_admin_surface_works() {
 
         // GET /admin/cluster-version converges on every node: era on, version
         // 1, every member reported, and Finalize to 2 is within reach (every
-        // binary's range is [MIN_SUPPORTED, MAX_SUPPORTED] = [1, 2]).
+        // binary's range is [MIN_SUPPORTED, MAX_SUPPORTED] = [1, 3]).
         for node in &nodes {
             let addr = node.admin_addr();
             timeout(Duration::from_secs(30), async {
@@ -111,7 +112,7 @@ async fn the_era_starts_over_real_sockets_and_the_admin_surface_works() {
                             n.len() == 3 && n.iter().all(|x| x["reported"] == true)
                         })
                     {
-                        // Every member's range is [1,2], so nothing blocks
+                        // Every member's range is [1,3], so nothing blocks
                         // target 2 and it is the safe target.
                         assert_eq!(v["can_finalize"], true, "{v}");
                         assert_eq!(v["safe_target"], 2, "{v}");
@@ -181,6 +182,31 @@ async fn the_era_starts_over_real_sockets_and_the_admin_surface_works() {
         .await
         .expect("Gate::GlobalTables never opened on every node after the finalize");
 
+        // The second step, 2 -> 3, opens `Gate::MrecReplication` (G-01 stage
+        // G-d) on every node, a data-only node's mirror included.
+        let (status, v) = admin(
+            nodes[leader].admin_addr(),
+            "POST",
+            "/admin/cluster-version/finalize",
+            Some(r#"{"to":3,"expected":2}"#),
+        )
+        .await;
+        assert_eq!(status, 200, "{v}");
+        assert_eq!(v["active"], 3, "{v}");
+        timeout(Duration::from_secs(60), async {
+            loop {
+                if nodes.iter().all(|n| {
+                    n.features()
+                        .is_open(animus_control::version::Gate::MrecReplication)
+                }) {
+                    return;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("Gate::MrecReplication never opened on every node after the finalize");
+
         // CHS1: an empty-`ext` dial is still welcome on the CLIENT port (the
         // CLI and external clients) ...
         let mut s = phase1_dial(nodes[0].client_addr())
@@ -242,6 +268,19 @@ async fn the_era_starts_over_real_sockets_and_the_admin_surface_works() {
         })
         .await
         .expect("the data-only node never opened Gate::GlobalTables through its mirror");
+        timeout(Duration::from_secs(60), async {
+            loop {
+                if data
+                    .features()
+                    .is_open(animus_control::version::Gate::MrecReplication)
+                {
+                    return;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("the data-only node never opened Gate::MrecReplication through its mirror");
         let (status, v) = admin(
             data.admin_addr(),
             "POST",

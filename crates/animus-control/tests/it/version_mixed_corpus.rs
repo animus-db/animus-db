@@ -82,6 +82,8 @@ const CELLS: &[(&str, usize)] = &[
     ("negative_control_stale_view", 2),
     ("release1_to_release2_global_gate", 6),
     ("negative_control_global_gate_emitted_early", 2),
+    ("release2_to_release3_mrec_gate", 6),
+    ("negative_control_mrec_gate_emitted_early", 2),
 ];
 
 /// The seeds a cell runs: `ANIMUS_UPGRADE_CELL` (substring) filters cells,
@@ -219,6 +221,17 @@ fn violations_with(w: &World, era_onset_safety: bool) -> Vec<String> {
                     ));
                 }
             }
+        }
+    }
+    // ADR 0075 G-d: an MREC spec is applied only once the cluster version
+    // reached 3 (`Gate::MrecReplication`).
+    for (id, n) in &w.nodes {
+        let m = n.metadata();
+        if m.cluster_version() < 3 && m.table_global(TABLE).is_some_and(|g| g.is_mrec()) {
+            v.push(format!(
+                "gate applied early: node {id} holds an MREC spec at cluster version {}",
+                m.cluster_version()
+            ));
         }
     }
     for (id, r) in w.cap_rejections() {
@@ -1460,5 +1473,358 @@ fn run_n5(seed: u64) {
 fn negative_control_global_gate_emitted_early() {
     run_cell("negative_control_global_gate_emitted_early", |seed, _| {
         run_n5(seed)
+    });
+}
+
+// ---- release2_to_release3_mrec_gate + N6 (G-01 stage G-d) ----
+
+fn mrec_convert_cmd() -> MetaCommand {
+    MetaCommand::ConvertTableToMrec {
+        table: TABLE.to_string(),
+        local_region: "us".to_string(),
+        region_id: animus_control::mrec_region_id("us"),
+    }
+}
+
+fn mrec_add_cmd() -> MetaCommand {
+    MetaCommand::AddMrecReplica {
+        table: TABLE.to_string(),
+        region: "eu".to_string(),
+        region_id: animus_control::mrec_region_id("eu"),
+    }
+}
+
+fn mrec_remove_cmd() -> MetaCommand {
+    MetaCommand::RemoveMrecReplica {
+        table: TABLE.to_string(),
+        region: "eu".to_string(),
+    }
+}
+
+fn mrec_status_cmd() -> MetaCommand {
+    MetaCommand::SetMrecReplicaStatus {
+        table: TABLE.to_string(),
+        region: "eu".to_string(),
+        status: animus_control::MrecReplicaStatus::Active,
+    }
+}
+
+/// An `Eventual` spec smuggled through the version-2 command: classified by
+/// content as `MrecReplication`, so the proposer refuses it while closed.
+fn mrec_via_convert_to_global_cmd() -> MetaCommand {
+    MetaCommand::ConvertTableToGlobal {
+        table: TABLE.to_string(),
+        spec: animus_control::GlobalTableSpec {
+            consistency: animus_control::MultiRegionConsistency::Eventual,
+            regions: Vec::new(),
+            witness: None,
+            preferred_leader_region: String::new(),
+            replicas: vec![animus_control::MrecReplica {
+                region: "us".into(),
+                region_id: animus_control::mrec_region_id("us"),
+                status: animus_control::MrecReplicaStatus::Active,
+                local: true,
+            }],
+        },
+    }
+}
+
+fn is_mrec(m: &animus_control::Metadata) -> bool {
+    m.schemas
+        .get(TABLE)
+        .and_then(|s| s.global.as_ref())
+        .is_some_and(|g| g.is_mrec() && g.replicas.iter().any(|r| r.local && r.region == "us"))
+}
+
+fn has_eu(m: &animus_control::Metadata, status: animus_control::MrecReplicaStatus) -> bool {
+    m.schemas
+        .get(TABLE)
+        .and_then(|s| s.global.as_ref())
+        .is_some_and(|g| {
+            g.replicas
+                .iter()
+                .any(|r| r.region == "eu" && r.status == status)
+        })
+}
+
+/// Every MREC-carrying proposal while `Gate::MrecReplication` is closed:
+/// refused at the proposer, counted, never appended.
+fn propose_mrec_while_closed(w: &World, seed: u64) {
+    for cmd in [
+        mrec_convert_cmd as fn() -> MetaCommand,
+        mrec_add_cmd,
+        mrec_remove_cmd,
+        mrec_status_cmd,
+        mrec_via_convert_to_global_cmd,
+    ] {
+        propose_cmd_while_closed(w, seed, cmd);
+    }
+}
+
+/// Phase 1 -> B2 -> Release(2) everywhere, then finalize 1 -> 2 (the G-c
+/// release as it shipped), leaving the cluster at version 2 with every node a
+/// `[1, 2]` binary. The table exists (seeded while still pre-era).
+fn world_at_release2(seed: u64, c: &mut dyn FnMut(&World)) -> World {
+    let mut w = World::new_faithful(seed, &VOTERS, &[LEARNER], &MEMBERS);
+    w.bootstrap();
+    w.run(Duration::from_millis(500), c);
+    seed_table(&mut w);
+    for id in all_ids() {
+        w.flip(id, false);
+    }
+    let ids = all_ids();
+    finish_with(&mut w, &ids, c);
+    for id in all_ids() {
+        w.flip_range(id, (1, 2), false);
+    }
+    w.poll(
+        Duration::from_secs(60),
+        "every node recorded as a [1,2] binary",
+        c,
+        &|w| all_recorded_with(w, &ids, VersionRange::new(1, 2)),
+    );
+    w.propose_confirmed(
+        &MetaCommand::FinalizeClusterVersion {
+            expected: 1,
+            target: 2,
+        },
+        &|m| m.cluster_version() == 2,
+        "finalize 1 -> 2",
+    );
+    w.poll(
+        Duration::from_secs(30),
+        "every node at cluster version 2",
+        c,
+        &|w| {
+            w.nodes
+                .values()
+                .all(|n| n.metadata().cluster_version() == 2)
+        },
+    );
+    w
+}
+
+fn run_mrec_gate(seed: u64, variant: u64) {
+    use animus_control::version::Gate;
+    let mut c = |w: &World| check(w);
+    let mut w = world_at_release2(seed, &mut c);
+    let ids = all_ids();
+    assert!(
+        w.nodes
+            .values()
+            .all(|n| n.features().is_open(Gate::GlobalTables)
+                && !n.features().is_open(Gate::MrecReplication)),
+        "seed={seed}: at version 2 GlobalTables is open and MrecReplication closed"
+    );
+
+    // Release(2) -> Release(3) (range [1, 3]) in a seed-dependent order, with
+    // faults; mid-roll, every MREC proposal is refused at the proposer and a
+    // finalize to 3 is refused by apply (an old range excludes 3).
+    let order = match variant % 3 {
+        0 => vec![0, 1, 2, 3, 10, 11],
+        1 => vec![10, 11, 3, 2, 1, 0],
+        _ => shuffled(&mut w.rng.fork(), all_ids()),
+    };
+    for (n, id) in order.into_iter().enumerate() {
+        if n == 3 {
+            w.run(Duration::from_millis(300), &mut c);
+            propose_mrec_while_closed(&w, seed);
+            if let Some(l) = w.leader() {
+                let _ = w.nodes[&l].propose(MetaCommand::FinalizeClusterVersion {
+                    expected: 2,
+                    target: 3,
+                });
+            }
+            w.run(Duration::from_millis(500), &mut c);
+            assert!(
+                w.nodes
+                    .values()
+                    .all(|n| n.metadata().cluster_version() == 2),
+                "seed={seed}: a finalize to 3 applied with a [1,2] binary registered"
+            );
+        }
+        for _ in 0..w.rng.below(2) {
+            let f = pick_fault(&mut w.rng);
+            if let Some(h) = w.inject(f) {
+                let d = ms(&mut w.rng, 100, 700);
+                w.run(d, &mut c);
+                w.heal(h);
+            }
+            let d = ms(&mut w.rng, 50, 300);
+            w.run(d, &mut c);
+        }
+        let restart = w.rng.chance(50);
+        w.flip_range(id, (1, 3), restart);
+        let d = ms(&mut w.rng, 50, 500);
+        w.run(d, &mut c);
+    }
+    w.heal_all();
+    w.poll(
+        Duration::from_secs(60),
+        "every node recorded as a [1,3] binary",
+        &mut c,
+        &|w| all_recorded_with(w, &ids, VersionRange::new(1, 3)),
+    );
+    // Rolled but not finalized: the gate is still closed.
+    let l = w.leader().expect("leader");
+    assert!(
+        !w.nodes[&l].features().is_open(Gate::MrecReplication),
+        "seed={seed}: the gate opened before the finalize"
+    );
+    propose_mrec_while_closed(&w, seed);
+
+    // Finalize 2 -> 3: the gate opens on every node, and only then are the
+    // MREC commands accepted.
+    w.propose_confirmed(
+        &MetaCommand::FinalizeClusterVersion {
+            expected: 2,
+            target: 3,
+        },
+        &|m| m.cluster_version() == 3,
+        "finalize 2 -> 3",
+    );
+    w.poll(
+        Duration::from_secs(30),
+        "every node at cluster version 3 with the gate open",
+        &mut c,
+        &|w| {
+            w.nodes.values().all(|n| {
+                n.metadata().cluster_version() == 3 && n.features().is_open(Gate::MrecReplication)
+            })
+        },
+    );
+    w.propose_confirmed(
+        &mrec_convert_cmd(),
+        &is_mrec,
+        "ConvertTableToMrec at version 3",
+    );
+    w.propose_confirmed(
+        &mrec_add_cmd(),
+        &|m| has_eu(m, animus_control::MrecReplicaStatus::Creating),
+        "AddMrecReplica at version 3",
+    );
+    w.propose_confirmed(
+        &mrec_status_cmd(),
+        &|m| has_eu(m, animus_control::MrecReplicaStatus::Active),
+        "SetMrecReplicaStatus at version 3",
+    );
+    w.poll(
+        Duration::from_secs(30),
+        "every replica applied the MREC commands and agrees",
+        &mut c,
+        &|w| {
+            wedged_replicas(w).is_empty()
+                && w.nodes.values().all(|n| {
+                    let m = n.metadata();
+                    is_mrec(&m) && has_eu(&m, animus_control::MrecReplicaStatus::Active)
+                })
+        },
+    );
+    let metas: Vec<_> = w.nodes.values().map(|n| n.metadata()).collect();
+    assert!(
+        metas
+            .windows(2)
+            .all(|p| p[0].schemas == p[1].schemas && p[0].policies == p[1].policies),
+        "seed={seed}: replicas disagree on the MREC schema"
+    );
+    // An MREC conversion never touches placement.
+    assert!(
+        metas[0].policies.values().all(|p| !p.is_pinned()),
+        "seed={seed}: MREC pinned a policy"
+    );
+    // Delivery: no capped binary ever rejected anything in a clean roll.
+    let rej = w.cap_rejections();
+    assert!(rej.is_empty(), "seed={seed}: {rej:?}");
+    check(&w);
+}
+
+#[test]
+fn release2_to_release3_mrec_gate() {
+    run_cell("release2_to_release3_mrec_gate", run_mrec_gate);
+}
+
+/// N6: at cluster version 2 with one `Release(2)` voter, emit
+/// `ConvertTableToMrec` with the gate check skipped. The oracle MUST report
+/// the delivery to the old binary and exactly that replica wedged (and the
+/// early application on the others).
+fn run_n6(seed: u64) {
+    let mut c = |w: &World| check(w);
+    let mut w = world_at_release2(seed, &mut c);
+    for id in all_ids() {
+        if id != OLD {
+            w.flip_range(id, (1, 3), false);
+        }
+    }
+    w.poll(
+        Duration::from_secs(40),
+        "every non-old node recorded as [1,3]",
+        &mut c,
+        &|w| {
+            w.nodes.values().all(|n| {
+                let r = records(&n.metadata());
+                all_ids().iter().all(|id| {
+                    r.get(&nid(*id)).is_some_and(|(range, _)| {
+                        *range
+                            == if *id == OLD {
+                                VersionRange::new(1, 2)
+                            } else {
+                                VersionRange::new(1, 3)
+                            }
+                    })
+                })
+            })
+        },
+    );
+    for _ in 0..10 {
+        if matches!(w.leader(), Some(l) if l != OLD) {
+            break;
+        }
+        if let Some(h) = w.inject(Fault::LeaderKill) {
+            w.run(Duration::from_secs(2), &mut |_| {});
+            w.heal(h);
+            w.run(Duration::from_secs(1), &mut |_| {});
+        }
+    }
+    let l = w.leader().expect("leader");
+    assert_ne!(l, OLD, "seed={seed}: could not get a non-old leader");
+    assert!(
+        w.nodes
+            .values()
+            .all(|n| n.metadata().cluster_version() == 2),
+        "seed={seed}: the cluster must still be at version 2 (the old node blocks 3)"
+    );
+    assert!(
+        instant_violations(&w).is_empty(),
+        "seed={seed}: violations before the bad emit"
+    );
+    let pre_log = w.nodes[&OLD].last_log_index();
+    let _ = w.nodes[&l].propose_ungated_for_negative_control(mrec_convert_cmd());
+    w.run(Duration::from_secs(5), &mut |_| {});
+    let v = instant_violations(&w);
+    assert_eq!(
+        wedged_replicas(&w),
+        vec![OLD],
+        "seed={seed}: only the Release(2) replica is wedged"
+    );
+    assert!(
+        v.iter()
+            .any(|s| s.starts_with("delivery: node 2 (Release(2)) rejected a MrecReplication")),
+        "seed={seed}: the cap never rejected the ConvertTableToMrec entry: {v:#?}"
+    );
+    assert!(
+        v.iter().any(|s| s.starts_with("gate applied early")),
+        "seed={seed}: the early MREC application went unnoticed: {v:#?}"
+    );
+    assert_eq!(
+        w.nodes[&OLD].last_log_index(),
+        pre_log,
+        "seed={seed}: the old replica appended the gated command"
+    );
+}
+
+#[test]
+fn negative_control_mrec_gate_emitted_early() {
+    run_cell("negative_control_mrec_gate_emitted_early", |seed, _| {
+        run_n6(seed)
     });
 }

@@ -173,6 +173,17 @@ pub fn content_gate(msg: &RaftMsg) -> Gate {
                 .filter_map(|k| labels.get(*k)?.parse::<u32>().ok())
                 .fold(g, |g, n| g.join(Gate::Synthetic(n)))
         }
+        // ADR 0075 (G-01 stage G-d): what a Release(2) binary's strict decode
+        // cannot read, named by *content* (the variant / the `Eventual` mode),
+        // independent of `required_gate`'s classification, so a mis-classified
+        // emitter still trips the capped decode.
+        crate::MetaCommand::ConvertTableToMrec { .. }
+        | crate::MetaCommand::AddMrecReplica { .. }
+        | crate::MetaCommand::RemoveMrecReplica { .. }
+        | crate::MetaCommand::SetMrecReplicaStatus { .. } => g.join(Gate::MrecReplication),
+        crate::MetaCommand::ConvertTableToGlobal { spec, .. } if spec.is_mrec() => {
+            g.join(Gate::MrecReplication)
+        }
         _ => g,
     })
 }
