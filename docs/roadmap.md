@@ -1724,6 +1724,16 @@ outstanding on the wire surface at present.
     `crates/animus-test/src/check.rs`) over it; add resource-trend
     assertions (RSS, fds, disk, WAL/compaction backlog stay bounded).
     Exit: 7 consecutive days, zero oracle violations, no monotone growth.
+    **Harness landed 2026-10-05** ([`docs/soak.md`](soak.md)): bare
+    multi-process leg (`crates/animusd/tests/soak.rs`, opt-in `soak`
+    feature, reusing `chaos_support/`), epoch-bounded history with the three
+    oracles plus cold-data re-verification per epoch, per-node RSS/fd/
+    thread/disk/WAL/SSTable-count/queue-gauge sampling with the pure
+    `animus_test::soak` trend detector (unit-tested), and
+    `.github/workflows/soak.yml` (short leg; non-required). **Not done:**
+    the 7-day run itself (dedicated hardware), the operator-on-`kind` leg,
+    reuse of `animus-bench`'s generator (it records latency, not an
+    oracle-checkable history; the chaos recorder is used instead).
   - **(b) Real-cluster chaos (independent; L).** Process kill,
     network partition, clock skew, disk full, slow disk. On k8s via the
     operator (Chaos Mesh `PodChaos`/`NetworkChaos`/`IOChaos`/`TimeChaos`
@@ -1909,7 +1919,11 @@ outstanding on the wire surface at present.
      model is part of the work.
 - **Plan (staged, each stage independently valuable and mergeable):**
   - **G-a Topology-aware single-cluster operator (S-M, independent, do
-    now).** Add a labels input to `ClusterConfig`/`animusd` flags
+    now). LANDED 2026-10-04 (branch `g01-a-topology-placement`; see the ADR 0005/0060
+    2026-10-04 amendments): labels input (`--label`/`--labels-file`/config
+    `labels`), operator node-topology annotations + spread hints, zone-spread
+    default policy, `sim_cluster_zone_placement` corpus. Known limits: policy
+    fixed at table creation; labels fixed at first registration.** Add a labels input to `ClusterConfig`/`animusd` flags
     (additive `#[serde(default)]`, ADR 0035 discipline, ADR 0073 format
     rules) so a node self-registers with labels; have the operator inject
     the pod's node `topology.kubernetes.io/region` and `/zone` labels

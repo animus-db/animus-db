@@ -104,10 +104,6 @@ on:
         description: "Seeds per scenario (ANIMUS_HEARTBEAT_SEEDS, ADR 0044 phase 2 heartbeat-batcher fault corpus)"
         required: false
         default: "40"
-      wan_timing_seeds:
-        description: "Seeds per cell (ANIMUS_WAN_TIMING_SEEDS, ADR 0075 section 3.4 per-group WAN Raft timing corpus with a LAN-forced negative control)"
-        required: false
-        default: "40"
       sharedwal_seeds:
         description: "Seeds per cell (ANIMUS_SHAREDWAL_SEEDS, ADR 0028 C-05 PR 2 SharedWal cross-tablet ordering/crash-safety/GC fault corpus)"
         required: false
@@ -493,6 +489,17 @@ jobs:
           ANIMUS_DYNAMO_WIRE_SEEDS: ${{ github.event.inputs.dynamo_wire_seeds || '25' }}
         run: cargo test -p animusd --lib sim_cluster_dynamo_corpus -- --nocapture
 
+      # G-01 stage G-a: six zone-labelled nodes (two per zone), RF 3 —
+      # every tablet must span 3 zones, a whole zone is then killed, and
+      # every acked write must survive with the repair pass re-converging.
+      - name: deep zone-placement corpus (G-01 stage G-a)
+        id: zone_placement
+        continue-on-error: true
+        timeout-minutes: 30
+        env:
+          ANIMUS_ZONE_PLACEMENT_SEEDS: '25'
+        run: cargo test -p animusd --lib sim_cluster_zone_placement -- --nocapture
+
       # ADR 0068's S3 export/import job driver + import driver: multi-tablet
       # export content fidelity, concurrent writes racing the pin, bucket
       # faults, a crash mid-export/mid-import (the ADR's own named
@@ -557,7 +564,7 @@ jobs:
         continue-on-error: true
         timeout-minutes: 10
         env:
-          ANIMUS_WAN_TIMING_SEEDS: ${{ github.event.inputs.wan_timing_seeds || '40' }}
+          ANIMUS_WAN_TIMING_SEEDS: '40'
         run: |
           cargo test -p animus-cp-data --test it wan_timing_corpus:: -- --nocapture
 
@@ -709,6 +716,7 @@ jobs:
             [control]="${{ steps.control.outcome }}"
             [simcluster]="${{ steps.simcluster.outcome }}"
             [dynamo_wire]="${{ steps.dynamo_wire.outcome }}"
+            [zone_placement]="${{ steps.zone_placement.outcome }}"
             [export_import]="${{ steps.export_import.outcome }}"
             [s3_fault]="${{ steps.s3_fault.outcome }}"
             [heartbeat]="${{ steps.heartbeat.outcome }}"
@@ -723,7 +731,7 @@ jobs:
           )
           failed=0
           failed_names=()
-          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner reconfigure_drop inplace_split backup pitr lsm_crash lsm_disk_fault lsm_encrypted segment_store_encrypted control simcluster dynamo_wire export_import s3_fault heartbeat wan_timing sharedwal wal_rewrite_crash upgrade_restart upgrade_restart_cluster upgrade_mixed upgrade_mixed_cluster learner_snapshot_livelock; do
+          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner reconfigure_drop inplace_split backup pitr lsm_crash lsm_disk_fault lsm_encrypted segment_store_encrypted control simcluster dynamo_wire zone_placement export_import s3_fault heartbeat wan_timing sharedwal wal_rewrite_crash upgrade_restart upgrade_restart_cluster upgrade_mixed upgrade_mixed_cluster learner_snapshot_livelock; do
             outcome="${outcomes[$name]}"
             echo "${name}: ${outcome}"
             if [ "${outcome}" != "success" ]; then

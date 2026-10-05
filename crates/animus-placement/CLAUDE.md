@@ -117,3 +117,17 @@ Residency across read-repair / anti-entropy / hinted handoff / backup. (Policy
 replication in `Metadata` and the in-node automatic reconciler now exist — see
 `animus-control`'s `SetTabletPolicy` + `Metadata::reconcile` + `reconcile_loop`.)
 A cluster-default policy and operator-facing policy management are future work.
+
+## G-01 stage G-a additions (2026-10-04)
+
+- `REGION_LABEL`/`ZONE_LABEL` (`topology.kubernetes.io/{region,zone}`) are the
+  one place the well-known keys live; `animusd::node_labels` and the operator
+  mirror the strings (the operator's `desired::topology` has a drift test).
+- `zone_spread_policy(name, rf, members)` — the default table policy: simple
+  unless *every* member has a zone label and there are >= RF distinct zones,
+  then a best-effort (`strict: false`) `ZONE_LABEL` spread. Why
+  all-members-labelled: a spread policy *excludes* an unlabelled candidate
+  (`eligible_domains`). Why best-effort: after a zone loss `replan_repair`
+  must be able to double up rather than refuse. The reconciler never repairs a
+  best-effort spread that merely started skewed, so the *initial* pick must use
+  the spread too (`animusd::schema::zone_aware_initial_replicas`).

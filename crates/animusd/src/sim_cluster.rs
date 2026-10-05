@@ -1696,6 +1696,9 @@ pub(crate) struct SimCluster {
     /// a different factor for one table uses
     /// [`SimCluster::create_table_with_replication`] instead.
     replication: usize,
+    /// Per-node topology labels registered by `seed_members` (G-01 stage G-a);
+    /// empty for every constructor but `new_with_node_labels`.
+    node_labels: BTreeMap<u64, BTreeMap<String, String>>,
     /// One control `RaftNode<SimEnv>` per node id, index == node id — the
     /// real multi-voter quorum (see the module doc's DDL-bypass bullet for
     /// why this fixture proposes on these handles directly rather than
@@ -2045,6 +2048,34 @@ impl SimCluster {
             segment_janitor_retention,
             cp_quiesce_after,
             SimEngineBackend::Memory,
+            BTreeMap::new(),
+        )
+    }
+
+    /// An all-`Both`, in-memory cluster whose members carry topology labels
+    /// (G-01 stage G-a): `node_labels[i]` is node `i`'s label set, registered
+    /// through both `RegisterNode` and the founding `UpsertMember`, exactly
+    /// as production self-registration does. Tables created over the wire
+    /// (`CreateTable`, i.e. `ClientCtx::provision_tablet`) then get the
+    /// zone-spread policy when the labels span >= RF zones.
+    pub(crate) fn new_with_node_labels(
+        seed: u64,
+        replication: usize,
+        node_labels: Vec<BTreeMap<String, String>>,
+    ) -> Self {
+        let roles = vec![NodeRole::Both; node_labels.len()];
+        Self::new_with_engine_backend(
+            seed,
+            &roles,
+            replication,
+            DEFAULT_SIM_SEGMENT_JANITOR_RETENTION,
+            None,
+            SimEngineBackend::Memory,
+            node_labels
+                .into_iter()
+                .enumerate()
+                .map(|(i, l)| (i as u64, l))
+                .collect(),
         )
     }
 
@@ -2065,6 +2096,7 @@ impl SimCluster {
             DEFAULT_SIM_SEGMENT_JANITOR_RETENTION,
             cp_quiesce_after,
             SimEngineBackend::Lsm,
+            BTreeMap::new(),
         )
     }
 
@@ -2077,6 +2109,7 @@ impl SimCluster {
         segment_janitor_retention: Duration,
         cp_quiesce_after: Option<Duration>,
         backend: SimEngineBackend,
+        node_labels: BTreeMap<u64, BTreeMap<String, String>>,
     ) -> Self {
         let nodes = roles.len();
         assert!(nodes >= 1, "a cluster needs at least one node");
@@ -2661,6 +2694,7 @@ impl SimCluster {
             backend,
             control_index,
             control_node_ids,
+            node_labels,
         };
         // Let the control group elect before any caller touches it —
         // generous for up to a handful of voters under `SimEnv`'s
@@ -2758,7 +2792,7 @@ impl SimCluster {
                     self.controls[leader].propose(MetaCommand::RegisterNode {
                         node: id.clone(),
                         addrs,
-                        labels: BTreeMap::new(),
+                        labels: self.node_labels.get(&n).cloned().unwrap_or_default(),
                     }),
                     ProposeResult::Accepted { .. }
                 ),
@@ -2771,7 +2805,7 @@ impl SimCluster {
                 matches!(
                     self.controls[leader].propose(MetaCommand::UpsertMember {
                         node: id.clone(),
-                        labels: BTreeMap::new(),
+                        labels: self.node_labels.get(&n).cloned().unwrap_or_default(),
                         status: NodeStatus::Active,
                     }),
                     ProposeResult::Accepted { .. }

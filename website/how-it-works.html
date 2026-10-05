@@ -219,7 +219,7 @@
         <li>Metrics, OpenTelemetry tracing, admin JSON endpoints and a built-in dashboard</li>
       </ul></div>
       <div class="lcard"><h3>Day two, missing</h3><ul>
-        <li>Rolling upgrades — a full-cluster stop, upgrade and restart is supported and tested, but nodes on different versions cannot yet run together</li>
+        <li>Operator-orchestrated rolling upgrades — a manual node-by-node roll with <code>animus cluster finalize</code> is supported, but the operator does not yet drive it from a <code>spec.image</code> change</li>
         <li>Authentication beyond SigV4 — TLS (below) adds encryption and, on the internal ports, cluster-membership authentication, but caller identity on the client port is still just opt-in SigV4</li>
       </ul></div>
     </div>

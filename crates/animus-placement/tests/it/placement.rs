@@ -309,3 +309,90 @@ fn balanced_selection_prefers_least_loaded_within_policy() {
         Err(PlacementError::InsufficientCandidates { .. })
     ));
 }
+
+// --- G-01 stage G-a: the default zone-spread table policy -------------------
+
+fn zl(zone: Option<&str>) -> BTreeMap<String, String> {
+    zone.map(|z| (animus_placement::ZONE_LABEL.to_owned(), z.to_owned()))
+        .into_iter()
+        .collect()
+}
+
+#[test]
+fn zone_spread_policy_spreads_when_enough_zones() {
+    let members = [zl(Some("a")), zl(Some("a")), zl(Some("b")), zl(Some("c"))];
+    let p = animus_placement::zone_spread_policy("cp-rf", 3, members.iter());
+    let sp = p.spread.expect("3 zones >= RF 3 spreads");
+    assert_eq!(sp.domain, animus_placement::ZONE_LABEL);
+    assert!(
+        !sp.strict,
+        "best-effort so a zone loss can still be repaired"
+    );
+    assert_eq!(p.replication_factor, 3);
+}
+
+#[test]
+fn zone_spread_policy_is_simple_with_too_few_zones() {
+    let members = [zl(Some("a")), zl(Some("a")), zl(Some("b"))];
+    let p = animus_placement::zone_spread_policy("cp-rf", 3, members.iter());
+    assert!(p.spread.is_none());
+    assert_eq!(p, PlacementPolicy::simple("cp-rf", 3));
+}
+
+#[test]
+fn zone_spread_policy_is_simple_when_any_member_lacks_the_label() {
+    // A spread policy would exclude the unlabelled node from placement.
+    let members = [zl(Some("a")), zl(Some("b")), zl(Some("c")), zl(None)];
+    let p = animus_placement::zone_spread_policy("cp-rf", 3, members.iter());
+    assert!(p.spread.is_none());
+    let empty = [zl(Some("a")), zl(Some("b")), zl(Some("")), zl(Some("c"))];
+    assert!(
+        animus_placement::zone_spread_policy("cp-rf", 3, empty.iter())
+            .spread
+            .is_none()
+    );
+}
+
+#[test]
+fn zone_spread_policy_is_simple_for_no_members_or_rf_one() {
+    let none: [BTreeMap<String, String>; 0] = [];
+    assert!(
+        animus_placement::zone_spread_policy("p", 3, none.iter())
+            .spread
+            .is_none()
+    );
+    let members = [zl(Some("a")), zl(Some("b"))];
+    assert!(
+        animus_placement::zone_spread_policy("p", 1, members.iter())
+            .spread
+            .is_none()
+    );
+}
+
+#[test]
+fn zone_spread_places_one_replica_per_zone_then_repairs_after_a_zone_loss() {
+    let policy = animus_placement::zone_spread_policy(
+        "cp-rf",
+        3,
+        [zl(Some("a")), zl(Some("b")), zl(Some("c"))].iter(),
+    );
+    let cands: Vec<Candidate> = (0..6)
+        .map(|i| Candidate::new(nid(i), zl(Some(["a", "b", "c"][(i % 3) as usize]))))
+        .collect();
+    let set = select_replicas(&cands, &policy).unwrap();
+    let zones: std::collections::BTreeSet<_> = set
+        .iter()
+        .map(|n| cands.iter().find(|c| &c.node == n).unwrap().labels.clone())
+        .collect();
+    assert_eq!(zones.len(), 3, "one replica per zone: {set:?}");
+    // Zone "a" (nodes 0 and 3) is lost: the pool shrinks to 4 nodes in 2
+    // zones; repair keeps the 2 survivors and doubles up rather than refusing.
+    let alive: Vec<Candidate> = cands
+        .iter()
+        .filter(|c| c.labels != zl(Some("a")))
+        .cloned()
+        .collect();
+    let repaired = animus_placement::replan_repair(&set, &alive, &policy).unwrap();
+    assert_eq!(repaired.len(), 3, "{repaired:?}");
+    assert!(repaired.iter().all(|n| alive.iter().any(|c| &c.node == n)));
+}

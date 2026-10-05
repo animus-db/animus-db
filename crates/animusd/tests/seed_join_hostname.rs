@@ -60,6 +60,7 @@ async fn node_joins_via_a_hostname_seed() {
             advertise_host: None,
             tls: None,
             encryption_key_path: None,
+            labels: Default::default(),
             overload: None,
         };
         let node_dir = dir.path().join(format!("join-{join_index}-{attempt}"));
