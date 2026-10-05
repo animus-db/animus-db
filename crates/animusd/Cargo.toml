@@ -61,11 +61,20 @@ harness = false
 # Run: `cargo test -p animusd --features chaos --test chaos -- --test-threads=1`.
 [features]
 chaos = []
+# R-01 sub-track (a): multi-hour/day soak harness (docs/soak.md). Opt-in for
+# the same reason as `chaos`.
+# Run: `ANIMUS_SOAK_DURATION=15m cargo test -p animusd --features soak --test soak -- --nocapture`.
+soak = []
 
 [[test]]
 name = "chaos"
 path = "tests/chaos.rs"
 required-features = ["chaos"]
+
+[[test]]
+name = "soak"
+path = "tests/soak.rs"
+required-features = ["soak"]
 
 [dependencies]
 async-trait.workspace = true

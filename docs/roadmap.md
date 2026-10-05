@@ -1724,6 +1724,16 @@ outstanding on the wire surface at present.
     `crates/animus-test/src/check.rs`) over it; add resource-trend
     assertions (RSS, fds, disk, WAL/compaction backlog stay bounded).
     Exit: 7 consecutive days, zero oracle violations, no monotone growth.
+    **Harness landed 2026-10-05** ([`docs/soak.md`](soak.md)): bare
+    multi-process leg (`crates/animusd/tests/soak.rs`, opt-in `soak`
+    feature, reusing `chaos_support/`), epoch-bounded history with the three
+    oracles plus cold-data re-verification per epoch, per-node RSS/fd/
+    thread/disk/WAL/SSTable-count/queue-gauge sampling with the pure
+    `animus_test::soak` trend detector (unit-tested), and
+    `.github/workflows/soak.yml` (short leg; non-required). **Not done:**
+    the 7-day run itself (dedicated hardware), the operator-on-`kind` leg,
+    reuse of `animus-bench`'s generator (it records latency, not an
+    oracle-checkable history; the chaos recorder is used instead).
   - **(b) Real-cluster chaos (independent; L).** Process kill,
     network partition, clock skew, disk full, slow disk. On k8s via the
     operator (Chaos Mesh `PodChaos`/`NetworkChaos`/`IOChaos`/`TimeChaos`
