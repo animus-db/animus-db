@@ -570,6 +570,15 @@ enum CpGroup<E: Env = ProdEnv> {
 }
 
 impl<E: Env> CpGroup<E> {
+    /// Test-only: `role@term` for a corpus's convergence-timeout dump.
+    #[cfg(test)]
+    fn role_term(&self) -> String {
+        match self {
+            CpGroup::Lsm(n) => format!("{:?}@{}", n.role(), n.term()),
+            CpGroup::Mem(n) => format!("{:?}@{}", n.role(), n.term()),
+        }
+    }
+
     /// The group's feature-gate handle (ADR 0073 Phase 2): the node's own
     /// control-fed handle when the reconciler injected it, else a private
     /// floor handle. Test-only: nothing in production reads it back.

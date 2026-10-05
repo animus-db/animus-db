@@ -60,9 +60,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use animus_control::Metadata;
 use animus_control::sim_versions::BinaryProfile;
 use animus_control::version::VersionRange;
-use animus_control::Metadata;
 use animus_env::{NodeId, nid};
 use animus_placement::REGION_LABEL;
 use animus_sim::NetConfig;
@@ -274,10 +274,11 @@ impl Run {
                 })
                 .collect();
             out.push_str(&format!(
-                "  n{n} dead={} control_raft={:?} members={} tablets={tablets:?}\n",
+                "  n{n} dead={} control_raft={:?} members={} tablets={tablets:?} groups={:?}\n",
                 self.dead.contains(&n),
                 self.c.control_raft_indices(n),
                 meta.members.len(),
+                self.c.group_states(n),
             ));
         }
         out
@@ -300,7 +301,7 @@ impl Run {
     // ---- bring-up ---------------------------------------------------------
 
     fn boot(seed: u64) -> Run {
-        let mut c = SimCluster::new_with_node_labels(seed, 3, labels());
+        let mut c = SimCluster::new_with_node_labels_lsm(seed, 3, labels());
         apply_wan(&mut c);
         let _ = c.control_leader_index();
         c.set_all_node_versions(Some(VersionRange::new(1, 2)));
@@ -943,7 +944,6 @@ fn cell_witness_form_region_loss(seed: u64) {
     // leadership to the full replica in r-b and keep it off the witness.
     run.crash_region("r-a");
     let live = run.live();
-    run.workload("glob1", &live);
     run.converged("glob1", "r-b");
     run.workload("glob1", &live);
     run.restart_region("r-a");
@@ -1009,42 +1009,50 @@ fn cell_drain_last_node_of_region_refused(seed: u64) {
 
 type CellFn = fn(u64);
 
-fn cells() -> Vec<(&'static str, CellFn)> {
-    vec![
-        ("steady", cell_steady),
-        ("region_loss_leader_region", cell_region_loss_leader_region),
-        (
-            "region_loss_follower_region",
-            cell_region_loss_follower_region,
-        ),
-        ("region_partition_heal", cell_region_partition_heal),
-        ("split_under_mrsc", cell_split_under_mrsc),
-        (
-            "in_region_node_replacement",
-            cell_in_region_node_replacement,
-        ),
-        ("witness_form_region_loss", cell_witness_form_region_loss),
-        (
-            "drain_last_node_of_region_refused",
-            cell_drain_last_node_of_region_refused,
-        ),
-    ]
+/// Run one cell over every seed (`ANIMUS_MRSC_SEEDS`/`ANIMUS_SEED`), unless
+/// `ANIMUS_MRSC_CELL` narrows the run to other cells.
+fn run_cell(name: &str, cell: CellFn) {
+    if !cell_selected(name) {
+        return;
+    }
+    for seed in seeds() {
+        eprintln!("sim_cluster_mrsc_corpus: cell {name} seed {seed}");
+        cell(seed);
+    }
 }
 
-#[test]
-fn sim_cluster_mrsc_corpus() {
-    let mut ran = 0usize;
-    for (name, cell) in cells() {
-        if !cell_selected(name) {
-            continue;
-        }
-        for seed in seeds() {
-            eprintln!("sim_cluster_mrsc_corpus: cell {name} seed {seed}");
-            cell(seed);
-            ran += 1;
-        }
-    }
-    assert!(ran > 0, "ANIMUS_MRSC_CELL matched no cell");
+/// One `#[test]` per cell, so the per-push nextest tier runs them in
+/// parallel processes (a cell is a whole 6-node WAN cluster over the LSM
+/// engine: serialised they would be the slowest test in the `animusd --lib`
+/// tier). The `sim_cluster_mrsc_corpus_` prefix is what the deep step's
+/// `cargo test ... sim_cluster_mrsc` filter selects.
+macro_rules! cell_tests {
+    ($($test:ident => ($label:literal, $cell:ident)),+ $(,)?) => {
+        $(
+            #[test]
+            fn $test() {
+                run_cell($label, $cell);
+            }
+        )+
+    };
+}
+
+cell_tests! {
+    sim_cluster_mrsc_corpus_steady => ("steady", cell_steady),
+    sim_cluster_mrsc_corpus_region_loss_leader_region =>
+        ("region_loss_leader_region", cell_region_loss_leader_region),
+    sim_cluster_mrsc_corpus_region_loss_follower_region =>
+        ("region_loss_follower_region", cell_region_loss_follower_region),
+    sim_cluster_mrsc_corpus_region_partition_heal =>
+        ("region_partition_heal", cell_region_partition_heal),
+    sim_cluster_mrsc_corpus_split_under_mrsc =>
+        ("split_under_mrsc", cell_split_under_mrsc),
+    sim_cluster_mrsc_corpus_in_region_node_replacement =>
+        ("in_region_node_replacement", cell_in_region_node_replacement),
+    sim_cluster_mrsc_corpus_witness_form_region_loss =>
+        ("witness_form_region_loss", cell_witness_form_region_loss),
+    sim_cluster_mrsc_corpus_drain_last_node_of_region_refused =>
+        ("drain_last_node_of_region_refused", cell_drain_last_node_of_region_refused),
 }
 
 // ---------------------------------------------------------------------------

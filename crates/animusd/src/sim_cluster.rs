@@ -1252,6 +1252,17 @@ impl SimClusterHandle {
             .collect()
     }
 
+    /// Each CP group `node` hosts as `tablet:role@term->known leader`, for a
+    /// corpus's convergence-timeout dump.
+    pub(crate) fn group_states(&self, node: u64) -> Vec<String> {
+        self.ctx(node)
+            .edge
+            .hosted_groups()
+            .into_iter()
+            .map(|(t, g)| format!("{}:{}->{:?}", t.0, g.role_term(), g.leader()))
+            .collect()
+    }
+
     /// Per-replica progress of every CP group `node` hosts, read straight off
     /// its `RaftKvNode`s: `(tablet, commit_index, engine_applied_index,
     /// voter count)`. Input to [`SimCluster::await_replicas_caught_up`].
@@ -2095,6 +2106,34 @@ impl SimCluster {
             DEFAULT_SIM_SEGMENT_JANITOR_RETENTION,
             None,
             SimEngineBackend::Memory,
+            node_labels
+                .into_iter()
+                .enumerate()
+                .map(|(i, l)| (i as u64, l))
+                .collect(),
+        )
+    }
+
+    /// [`SimCluster::new_with_node_labels`] over real `LsmEngine<SimEnv>`s
+    /// (see [`SimEngineBackend::Lsm`]): a restarted node reopens its retained
+    /// disk, so its tablet groups' Raft state survives the restart exactly as
+    /// in production. With the `Memory` backend a restarted data group replays
+    /// an EMPTY Raft state, which the issue #667 boot-time cluster check
+    /// (correctly) treats as a wiped voter that never campaigns again — right
+    /// for a wiped disk, wrong for a model of a plain process restart.
+    pub(crate) fn new_with_node_labels_lsm(
+        seed: u64,
+        replication: usize,
+        node_labels: Vec<BTreeMap<String, String>>,
+    ) -> Self {
+        let roles = vec![NodeRole::Both; node_labels.len()];
+        Self::new_with_engine_backend(
+            seed,
+            &roles,
+            replication,
+            DEFAULT_SIM_SEGMENT_JANITOR_RETENTION,
+            None,
+            SimEngineBackend::Lsm,
             node_labels
                 .into_iter()
                 .enumerate()
@@ -3467,6 +3506,11 @@ impl SimCluster {
         // tablet -> (max commit, per-node applied, max voter count)
         let mut tablets: BTreeMap<TabletId, TabletProgress> = BTreeMap::new();
         for node in 0..self.node_count() as u64 {
+            // A crashed (muted) node cannot catch up; its stale replica of a
+            // group that was repaired away from it is not a progress signal.
+            if self.crashed.contains(&node) {
+                continue;
+            }
             for (t, commit, applied, voters) in self.shared.replica_progress(node) {
                 let e = tablets.entry(t).or_insert((0, Vec::new(), 0));
                 e.0 = e.0.max(commit);
@@ -3521,6 +3565,11 @@ impl SimCluster {
             "{what}: replicas never caught up to their tablet's commit index (seed={}): {last}",
             self.seed()
         );
+    }
+
+    /// [`SimClusterHandle::group_states`]'s driver-callable twin.
+    pub(crate) fn group_states(&self, node: u64) -> Vec<String> {
+        self.shared.group_states(node)
     }
 
     /// [`SimClusterHandle::hosted_tablets`]'s own driver-callable twin.
