@@ -53,8 +53,22 @@ properties; it also hosts cross-crate fault sweeps.
   with `Disk::replace`; per-file keep/skip from splitmix64 of `(seed, file)`,
   never the simulator RNG; `stop_after_files` models a crash mid-window).
   `control-wal`, `shared-wal` and `lsm-wal` are v2 (transcoded to v1 for real);
-  every other format is v1 (identity only), and an unlisted target is an
+  every other whole-file format is v1 (identity only), and an unlisted target is an
   `UnsupportedTarget` error, never a silent identity.
+  **Formats that live inside engine row values** (no whole-file transcode reaches
+  them: `txn-envelope`, v2) have a `ROW_TABLE` entry (`RowFormat`: `(key, value,
+  target) -> Option<new value>`, strict about recognising its own shape) applied by
+  `transcode_rows`/`transcode_rows_async` through `animus_storage::
+  rewrite_row_values`, which walks every `<prefix>wal-NNNNNN` segment (re-encoded at
+  the version it already has, so a v1 WAL stays v1) and every SSTable a
+  `MANIFEST` names (rewritten whole, manifest entry updated in the same swap).
+  `TranscodeOpts::row_back` (versions back for row formats, independent of
+  `target_back`, since the whole-file table cannot go back a version as a whole yet)
+  makes `transcode_disk` run the row pass after the file pass; per-file
+  participation follows `keep_current_fraction_permille`. **A bump of an
+  engine-resident format edits its `ROW_TABLE` entry, its `EMBEDDED` row and the
+  encoder behind `legacy-encoders`**; `tier0` fails if an `EMBEDDED` format past v1
+  has neither a carrier transcode at that version nor a `ROW_TABLE` entry.
   **Checklist step 7 is editing one `FormatEntry`** (bump `current_version`,
   add a `VersionSpec`, point `transcode` at the `legacy::vK::encode` calls);
   a format that is *not* a whole node-disk file is listed in
@@ -251,6 +265,25 @@ workload continues. One `Recorder` spans both phases.
   `ANIMUS_SEED=<seed> ANIMUS_UPGRADE_RESTART_CELL=<cell name substring> cargo test -p
   animus-test --test it upgrade_restart_corpus:: -- --nocapture`. Depth: `ANIMUS_UPGRADE_RESTART_SEEDS=K`
   (K=50 is ~55s in debug; nightly runs 100 via `corpus-deep.yml`).
+
+**Tier 1b: an intent unresolved across the upgrade** (`tests/it/upgrade_restart_txn_envelope.rs`,
+`txn-envelope` v2). The generic cells write no transaction, so this dedicated corpus runs a
+3-replica `RaftKvNode` over `LsmEngine`: commit values, `txn_stage` and leave it unresolved,
+flush (intent in an SSTable *and* the WAL), stop/crash, **down-convert every stored intent to
+v1** (`TranscodeOpts::row_back`), restart strictly, then resolve. 54 cells = {commit, abort} x
+{leader, follower, whole group} x {clean, crash, torn tail} x `row_back` {0 control, 1, 1 with a
+seeded fraction of files left at v2}; per cell it asserts the rewritten count is non-zero, the raw
+row's envelope tag byte (`2` -> `1`), an eventual read under the pending v1 intent still serves the
+committed value (the legacy lookback), the resolution on every replica (converged-or-timeout), every
+acked write, and a fresh post-restart transaction (v2 intents beside v1 history). Engines use
+default LSM thresholds so nothing compacts between stage and resolve: **a v1 intent unresolved
+across the upgrade still depends on MVCC history** (the documented residual gap), and
+`v1_intent_under_compaction_is_the_documented_residual_gap` pins it (same abort under a compaction
+burst keeps the value at `row_back=0`, loses it at `row_back=1`; when the gap is closed that control
+must be updated with the ADR). Mutation-checked: a down-conversion that drops the staged value fails
+16 cells. Shares `ANIMUS_UPGRADE_RESTART_SEEDS`/`_CELL`. Tiers 1 and 2 pass `row_back = 1` too (their
+workloads write no intent, so it rewrites nothing, but every cell restarts on the result of a pass
+that walked every engine file).
 
 **Tier 2** (whole-cluster restart over `SimCluster`'s `LsmEngine` backend and the DynamoDB wire) lives in
 `animusd` (`src/sim_cluster_upgrade_corpus.rs`, shares `ANIMUS_UPGRADE_RESTART_SEEDS`), reusing this crate's
@@ -485,6 +518,18 @@ retrievable from git history.)
   `animusd/tests/cp_txn.rs`'s real multi-process `ProdEnv` cluster is the
   separate acceptance test for the actual wire coordinator; the two are
   complementary, not overlapping.
+- **Engine tiers (2026-10-04).** Every original cell runs on `MemoryEngine`
+  (which keeps every MVCC version forever). The `lsm_compaction_*` cells
+  (`Scenario::engine = EngineTier::LsmCompacting`, built by `lsm_cell`) run
+  each replica on its own `LsmEngine<SimEnv>` with tiny flush/compaction
+  thresholds and the production-default GC grace, behind `CorpusEngine` (a
+  plain delegating `StorageEngine` enum, so the `MemoryEngine` cells' runs are
+  unchanged). `lsm_compaction_abandon_prepare` reproduced the chaos harness's
+  "acked write lost on a key an aborted transaction touched" before ADR 0018's
+  2026-10-04 amendment: the resolver aborts an abandoned prepare after
+  `RECOVERY_GRACE`, long after compaction had GC'd the history the old abort
+  read. A protocol step that silently depends on MVCC history is invisible to
+  a `MemoryEngine`-only corpus; add an LSM cell when touching one.
 - **Topology**: 3 independent tablet Raft groups (`t0`/`t1`/`t2`, 3 replicas
   each), so a transaction spans 2–3 *independent leaders, independent `Hlc`
   clocks, independent commit pipelines* — unlike the single-Raft-group

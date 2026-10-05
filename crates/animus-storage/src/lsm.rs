@@ -3442,6 +3442,181 @@ pub fn reframe_wal_to_v1(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(legacy::v1::encode_file(&records))
 }
 
+/// A row-value mapper for [`rewrite_row_values`]: `(key, value)` -> the new
+/// value, or `None` to leave the row alone.
+#[cfg(any(test, feature = "legacy-encoders"))]
+pub type RowMapper<'a> = dyn Fn(&[u8], &[u8]) -> Option<Vec<u8>> + 'a;
+
+/// What [`rewrite_row_values`] did to one node disk.
+#[cfg(any(test, feature = "legacy-encoders"))]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RowRewriteReport {
+    /// Row values the mapper was offered (every version of every key in every
+    /// file it visited; tombstones excluded).
+    pub values_seen: usize,
+    /// Row values the mapper replaced.
+    pub values_rewritten: usize,
+    /// Files rewritten, in visit order: WAL segments and SSTables, by name.
+    pub files_rewritten: Vec<String>,
+    /// Files left alone because the keep filter said so (mixed-version).
+    pub files_skipped: Vec<String>,
+}
+
+/// Rewrite the **row values** of every LSM engine on a *stopped* node's disk,
+/// leaving file formats and versions as they are: the upgrade-restart
+/// harness's transcode for formats that live *inside* engine rows (ADR 0073
+/// P1-D), such as `animus-cp-data`'s `txn-envelope`, which no whole-file
+/// transcode can reach because a row value is opaque to the file formats
+/// that carry it.
+///
+/// Walks every `<prefix>wal-NNNNNN` segment and every SSTable a
+/// `<prefix>MANIFEST` names, offering each non-tombstone `(key, value)` to
+/// `map` (`Some(new)` replaces the value). A WAL segment is re-encoded at the
+/// version it already has; an SSTable is rewritten whole and its manifest
+/// entry (index offset/length, size, Bloom filter) is updated in the same
+/// manifest swap. `rewrite_file(name)` decides per file whether it takes part
+/// at all (`false` = left byte-for-byte untouched, a mixed-version engine).
+///
+/// Not crash-atomic across files, like the rest of the harness: the node must
+/// be stopped, and any prefix of the pass is itself a valid mixed-version
+/// state (every value decodes at either shape).
+///
+/// # Errors
+/// A malformed WAL/manifest/SSTable, or a disk error.
+#[cfg(any(test, feature = "legacy-encoders"))]
+pub async fn rewrite_row_values<E: Env>(
+    env: &E,
+    map: &RowMapper<'_>,
+    rewrite_file: &dyn Fn(&str) -> bool,
+) -> Result<RowRewriteReport> {
+    fn numbered(file: &str, stem: &str) -> bool {
+        file.rfind(stem).is_some_and(|i| {
+            let d = &file[i + stem.len()..];
+            d.len() == 6 && d.bytes().all(|b| b.is_ascii_digit())
+        })
+    }
+    let mut report = RowRewriteReport::default();
+    let mut files = env.list().await.map_err(io)?;
+    files.sort();
+    files.dedup();
+
+    let apply = |key: &[u8], value: &mut Vec<u8>, seen: &mut usize, changed: &mut usize| {
+        *seen += 1;
+        if let Some(new) = map(key, value) {
+            *value = new;
+            *changed += 1;
+        }
+    };
+
+    // WAL segments.
+    for file in files.iter().filter(|f| numbered(f, "wal-")) {
+        let bytes = env.read(file).await.map_err(io)?;
+        if bytes.len() < WAL_HEADER_LEN {
+            continue;
+        }
+        if !rewrite_file(file) {
+            report.files_skipped.push(file.clone());
+            continue;
+        }
+        let version = bytes[4];
+        let (mut records, _) = decode_wal(&bytes)?;
+        let (mut seen, mut changed) = (0usize, 0usize);
+        for r in &mut records {
+            match r {
+                WalRecord::Put { key, value, .. } => apply(key, value, &mut seen, &mut changed),
+                WalRecord::Batch { ops, .. } => {
+                    for op in ops {
+                        if let BatchOp::Put { key, value } = op {
+                            apply(key, value, &mut seen, &mut changed);
+                        }
+                    }
+                }
+                WalRecord::MergeBatch { ops } => {
+                    for op in ops {
+                        if let Some(value) = &mut op.value {
+                            apply(&op.key, value, &mut seen, &mut changed);
+                        }
+                    }
+                }
+                WalRecord::Delete { .. } | WalRecord::DeleteRange { .. } => {}
+            }
+        }
+        report.values_seen += seen;
+        report.values_rewritten += changed;
+        if changed == 0 {
+            continue;
+        }
+        let out = match version {
+            WAL_VERSION_V1 => legacy::v1::encode_file(&records),
+            _ => {
+                // Current version: header, frames, and one closing sync marker
+                // (everything before it was fsynced when it was written).
+                let mut out = wal::encode_wal_header_version(version).to_vec();
+                for r in &records {
+                    out.extend_from_slice(&encode_wal(r));
+                }
+                let at = out.len() as u64;
+                out.extend_from_slice(&wal::encode_wal_marker(at));
+                out
+            }
+        };
+        env.replace(file, &out).await.map_err(io)?;
+        report.files_rewritten.push(file.clone());
+    }
+
+    // SSTables, through each engine's manifest.
+    for mfile in files.iter().filter(|f| f.ends_with("MANIFEST")) {
+        let prefix = &mfile[..mfile.len() - "MANIFEST".len()];
+        let bytes = env.read(mfile).await.map_err(io)?;
+        if bytes.is_empty() {
+            continue;
+        }
+        let mut manifest = decode_manifest(&bytes)?;
+        let mut manifest_dirty = false;
+        for i in 0..manifest.tables.len() {
+            let meta = manifest.tables[i].clone();
+            let file = format!("{prefix}sst-{:06}", meta.seq);
+            if !rewrite_file(&file) {
+                report.files_skipped.push(file);
+                continue;
+            }
+            let reader = SsTableReader::open(env, file.clone(), meta.clone()).await?;
+            let mut records: Vec<Record> = reader
+                .full_scan(env)
+                .await?
+                .into_iter()
+                .map(|(key, version, value)| Record {
+                    key,
+                    version,
+                    value,
+                })
+                .collect();
+            let (mut seen, mut changed) = (0usize, 0usize);
+            for r in &mut records {
+                if let Some(value) = &mut r.value {
+                    apply(&r.key, value, &mut seen, &mut changed);
+                }
+            }
+            report.values_seen += seen;
+            report.values_rewritten += changed;
+            if changed == 0 {
+                continue;
+            }
+            let new_meta = SsTableWriter::write(env, &file, meta.seq, meta.level, &records).await?;
+            env.sync(&file).await.map_err(io)?;
+            manifest.tables[i] = new_meta;
+            manifest_dirty = true;
+            report.files_rewritten.push(file);
+        }
+        if manifest_dirty {
+            env.replace(mfile, &encode_manifest(&manifest))
+                .await
+                .map_err(io)?;
+        }
+    }
+    Ok(report)
+}
+
 /// Parse a sync-marker frame at `bytes[pos..]`: `Some((claimed_offset, next))`
 /// for a complete, checksum-valid frame whose payload is exactly the marker tag
 /// plus a `u64`. (A marker is not a [`WalRecord`], so [`try_parse_wal_frame`]

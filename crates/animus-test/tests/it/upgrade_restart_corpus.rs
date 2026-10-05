@@ -253,6 +253,12 @@ fn transcode_opts(seed: u64, victim: u64) -> TranscodeOpts {
         keep_current_fraction_permille: keep,
         stop_after_files: stop_after,
         seed: mix(seed, &format!("{tag}/files")),
+        // The engine-row pass (ADR 0073 P1-D): these workloads write no
+        // transaction intent, so it rewrites nothing here, but it walks every
+        // engine file on the disk and restarts on the result, so a row pass
+        // that damaged an engine is caught by every cell. The cells that DO
+        // carry intents are `upgrade_restart_txn_envelope`.
+        row_back: transcode::supported_row_back().last().copied().unwrap_or(0),
     }
 }
 

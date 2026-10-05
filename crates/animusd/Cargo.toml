@@ -55,6 +55,18 @@ path = "src/main.rs"
 name = "cluster_bench"
 harness = false
 
+# R-01 sub-track (b): real-process chaos harness (docs/chaos.md). Opt-in so
+# the per-push gates never schedule a multi-minute multi-process run; it is
+# still compiled by `clippy --all-features`.
+# Run: `cargo test -p animusd --features chaos --test chaos -- --test-threads=1`.
+[features]
+chaos = []
+
+[[test]]
+name = "chaos"
+path = "tests/chaos.rs"
+required-features = ["chaos"]
+
 [dependencies]
 async-trait.workspace = true
 # `animusd` is the real node process — it's the one place that actually

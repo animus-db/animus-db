@@ -59,25 +59,13 @@
 //! node, so they are out of scope for this crate's tests entirely, not just
 //! this file's.
 //!
-//! **On property (i)'s "genuine event-quiescence" and why this file does not
-//! call `Simulator::run_until_quiescent` and expect `true`:** the apply
-//! task's own idle back-off (ADR 0044 phase-1 PR1) races `ApplyPending`
-//! against a **250ms safety-poll `env.sleep`, forever, independent of Raft
-//! activity** — a deliberate, already-shipped design (a missed/lost
-//! `ApplySignal` must still converge). That safety poll keeps one scheduled
-//! `SimEnv` timeline event per node alive at all times, so `run_until_
-//! quiescent` can never observe a truly empty timeline for a live group,
-//! quiesced or not — this is not a PR3 defect, it is PR1's own accepted
-//! trade-off surfacing at a different observation point. Per
-//! `docs/engineering-lessons.md`'s note that a raw `TraceEvent::Timer` tally
-//! is unreliable once anything else races a sleep (a lost-race sleep still
-//! logs a stale `Timer` line at its original deadline), the **strongest
-//! available, unfakeable proof of the consensus loop's own timerlessness**
-//! is exactly what phase-1 PR2/PR3 added for that purpose:
-//! `RaftCore::next_deadline() == None` — checked directly on every replica,
-//! not inferred from trace event counts. Property (ii)'s flat
-//! `CpAppendEntriesSent` is the corroborating, still-unambiguous quantitative
-//! proof that the reduced timer activity actually stopped real Raft traffic.
+//! **On property (i)'s "genuine event-quiescence":** since issue #1180 the
+//! apply task of a *quiesced* group parks on `ApplySignal` alone (no 250ms
+//! `APPLY_SAFETY_POLL` timer), so a fully quiesced group leaves an empty
+//! `SimEnv` timeline and `Simulator::run_until_quiescent` does return `true`
+//! (asserted in `quiesced_apply_no_poll.rs`). This file still checks
+//! `is_quiesced()` directly on every replica, with property (ii)'s flat
+//! `CpAppendEntriesSent` as the corroborating quantitative proof.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

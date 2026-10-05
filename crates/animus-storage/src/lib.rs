@@ -44,9 +44,9 @@ pub(crate) fn fixture_file_version(path: &std::path::Path) -> u32 {
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub use lsm::fuzzing;
-#[cfg(any(test, feature = "legacy-encoders"))]
-pub use lsm::reframe_wal_to_v1;
 pub use lsm::{LsmEngine, LsmOptions, LsmSnapshot, SsTableView, WalRecordView};
+#[cfg(any(test, feature = "legacy-encoders"))]
+pub use lsm::{RowMapper, RowRewriteReport, reframe_wal_to_v1, rewrite_row_values};
 pub use memory::{MemoryEngine, MemorySnapshot};
 
 /// A storage key.

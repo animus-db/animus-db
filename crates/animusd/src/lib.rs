@@ -105,6 +105,7 @@ mod http;
 mod import;
 #[deny(clippy::disallowed_methods)]
 mod index_backfill;
+mod overload;
 #[deny(clippy::disallowed_methods)]
 mod pitr_janitor;
 #[deny(clippy::disallowed_methods)]
@@ -117,6 +118,8 @@ mod split_placing_completion;
 mod ttl_reaper;
 #[deny(clippy::disallowed_methods)]
 mod txn_coordinator;
+#[deny(clippy::disallowed_methods)]
+mod version_wiring;
 #[deny(clippy::disallowed_methods)]
 mod write_path;
 
@@ -132,8 +135,8 @@ use animus_cp_data::{
 };
 use animus_env::{
     CLIENT_PROTOCOL, Clock, Disk, Env, FsSegmentStore, MaybeTlsStream, Metric, MetricsHandle,
-    Nanos, NodeId, PreambleError, ProdEnv, TlsMaterial, exchange_preamble, read_preamble,
-    write_own_preamble,
+    Nanos, NodeId, PreambleError, ProdEnv, TlsMaterial, exchange_preamble_with, read_preamble,
+    write_own_preamble_with,
 };
 use animus_storage::{
     Key, LsmEngine, MemoryEngine, SsTableView, StorageEngine, StorageError, VersionedValue,
@@ -2358,10 +2361,19 @@ async fn perform_client_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     role: &'static str,
     peer_desc: &str,
     metrics: &MetricsHandle,
+    own_ext: &[u8],
+    require_peer_ext: bool,
 ) -> std::io::Result<()> {
-    exchange_preamble(conn, &CLIENT_PROTOCOL, CLIENT_HANDSHAKE_TIMEOUT)
-        .await
-        .map_err(|err| classify_client_handshake_error(err, role, peer_desc, metrics))
+    exchange_preamble_with(
+        conn,
+        &CLIENT_PROTOCOL,
+        CLIENT_HANDSHAKE_TIMEOUT,
+        own_ext,
+        require_peer_ext,
+    )
+    .await
+    .map(|_peer| ())
+    .map_err(|err| classify_client_handshake_error(err, role, peer_desc, metrics))
 }
 
 /// The pipelined dial-side counterpart to [`perform_client_handshake`],
@@ -2400,7 +2412,12 @@ async fn client_request_pipelined<S: AsyncRead + AsyncWrite + Unpin>(
     peer_desc: &str,
     request: &ClientRequest,
 ) -> std::io::Result<ClientResponse> {
-    write_own_preamble(stream, &CLIENT_PROTOCOL)
+    // ADR 0073 Phase 2 (P2-C): advertise this binary's version `ext`
+    // (a Phase 1 peer ignores it). Never *require* the peer's on a dial: the
+    // refusal of an empty-ext peer is the accept side's job, on the intra
+    // port only.
+    let own_ext = version_wiring::own_ext();
+    write_own_preamble_with(stream, &CLIENT_PROTOCOL, &own_ext)
         .await
         .map_err(|err| {
             classify_client_handshake_error(err, "dial", peer_desc, &MetricsHandle::noop())
@@ -2413,7 +2430,9 @@ async fn client_request_pipelined<S: AsyncRead + AsyncWrite + Unpin>(
     .await
     {
         Ok(Ok(peer)) => {
-            if let Err(err) = animus_env::handshake::check_peer(&CLIENT_PROTOCOL, &peer) {
+            if let Err(err) =
+                animus_env::handshake::check_peer_ext(&CLIENT_PROTOCOL, &own_ext, &peer, false)
+            {
                 return Err(classify_client_handshake_error(
                     PreambleError::Refused(err),
                     "dial",
@@ -2479,6 +2498,8 @@ pub async fn connect_client(addr: impl tokio::net::ToSocketAddrs) -> std::io::Re
         "dial",
         "client/intra dial",
         &MetricsHandle::noop(),
+        &version_wiring::own_ext(),
+        false,
     )
     .await?;
     Ok(stream)
@@ -2878,6 +2899,12 @@ pub struct RoleAddrs {
     /// loaded and handed to `ProdEnv::bind_with_tls_and_key`.
     #[serde(default)]
     pub encryption_key_path: Option<String>,
+    /// This node's resource bounds / overload limits (R-01 (d), ADR 0074
+    /// §2) — `None` (every pre-existing config) means every default, see
+    /// [`config::OverloadSection`]. Not serialized when absent, so existing
+    /// configs and the `cluster-config` v1 fixture round-trip unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overload: Option<config::OverloadSection>,
 }
 
 /// Fallback endpoint for configs written before a field existed: an ephemeral
@@ -2961,6 +2988,8 @@ pub struct BoundNode {
     /// own tail (`start_with_growth`) reaches them — see that constructor's
     /// own doc for the cluster-wide key-scope contract this relies on.
     encryption_key: Option<animus_env::EncryptionKey>,
+    /// This node's overload limits (R-01 (d)), from `RoleAddrs::overload`.
+    overload: Option<config::OverloadSection>,
 }
 
 /// A node's identity + bound addresses, captured for the admin `/admin/config`
@@ -5284,6 +5313,7 @@ fn spawn_common_tail(
     dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
     tls: Option<TlsMaterial>,
     export_s3: Option<ExportS3Config>,
+    overload_limits: config::ResolvedLimits,
 ) -> (ClientCtx, Vec<tokio::task::JoinHandle<()>>) {
     // The seed `route_sync_loop` (below) re-overlays `Metadata.node_addrs[*].client`
     // onto every tick (ADR 0032 PR1) — the same static-base pattern
@@ -5306,6 +5336,7 @@ fn spawn_common_tail(
     // (`ClientCtx::any_table_throughput`'s doc) — a borrow, not a move, so
     // `control` below still moves into the struct unchanged.
     let initial_any_table_throughput = control.metadata_cached().any_table_throughput();
+    let overload_metrics = env.metrics();
     let export_store_factory = Arc::new(Mutex::new(default_export_store_factory(
         export_s3,
         env.clone(),
@@ -5344,6 +5375,7 @@ fn spawn_common_tail(
         any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(
             initial_any_table_throughput,
         )),
+        overload: overload::OverloadState::new(overload_limits, overload_metrics),
     };
     // ADR 0066 §1 (S-02 step 3): seed the lock-free "any catalog
     // credentials" fast path from whatever this node's control handle
@@ -5378,6 +5410,13 @@ fn spawn_common_tail(
     // a control-only node's snapshot is just the control sink (`metrics_text`/
     // `metrics_json` skip the raftkv sink when `ctx.data` is `None`).
     tasks.push(tokio::spawn(metrics_sample_loop(ctx.clone())));
+    // ADR 0073 Phase 2 (P2-C): the per-node version feeder — feeds this
+    // node's `ClusterFeatures`, flips `require_peer_ext` once the era is on
+    // (nodes with no local apply task), latches the out-of-range halt and
+    // self-reports `ReportNodeVersion` once the era is active. Every role.
+    tasks.push(tokio::spawn(version_wiring::version_wiring_loop(
+        ctx.clone(),
+    )));
     // This node's own identity self-registration (ADR 0032 PR1; ADR 0040
     // Decision C since PR4 — the registration CAS is now the mechanism, not
     // just an address-book update): one-shot, so peer-sync (internal
@@ -5454,6 +5493,7 @@ fn spawn_common_tail(
             table_source,
             backend,
             tls.as_ref().map(|m| m.server_acceptor.clone()),
+            ctx.overload.clone(),
         )));
     }
 
@@ -6049,6 +6089,11 @@ impl BoundNode {
         // one-process-per-node mode (`tests/schema_ddl_relay.rs`); a
         // `--cluster N` in-process node now exercises it too instead of always
         // finding the leader's handle locally.
+        // ADR 0073 Phase 2 (P2-C): THE flip — this binary's own range and
+        // build go onto the control `RaftNode`, which from here on evaluates
+        // the era-start precondition P and (era on) reports/refuses by
+        // version. Everything before this line in the wiring is inert.
+        version_wiring::apply_profile_to_raft(&raft, &edge.version().profile());
         edge.register_control(raft.clone());
 
         // **Leaderful CP per-tablet Raft group** (ADR 0017 #3a) — the v1 data plane
@@ -6140,6 +6185,7 @@ impl BoundNode {
             dynamo_auth,
             self.tls,
             export_s3,
+            config::OverloadSection::resolve(self.overload.as_ref()),
         );
         // Adopted into the `StartupTasks` guard so the fallible
         // `check_wal_layout`/`SharedWal::open` steps below are covered too
@@ -6729,6 +6775,14 @@ impl Node {
             encryption_key.clone(),
         )
         .await?;
+        // ADR 0073 Phase 2 (P2-C): advertise this binary's version `ext` on
+        // every connection this env dials or accepts from here on. Benign
+        // known race: `bind_with_tls_and_key` already spawned its accept
+        // loop, so a connection accepted in the microseconds before this
+        // line answers with an empty `ext`; an era-on peer refuses it and
+        // simply redials (an `ext` parameter on `ProdEnv::bind*` would close
+        // it, but that is `animus-env`).
+        env.set_own_ext(version_wiring::own_ext());
         // `Arc`-wrapped (issue #1060) — see [`BoundNode::client_listener`]'s
         // own doc for why.
         let client_listener = Arc::new(TcpListener::bind(addrs.client).await?);
@@ -6759,6 +6813,7 @@ impl Node {
             advertise_host: addrs.advertise_host,
             tls,
             encryption_key,
+            overload: addrs.overload,
         })
     }
 
@@ -6791,6 +6846,14 @@ impl Node {
             encryption_key.clone(),
         )
         .await?;
+        // ADR 0073 Phase 2 (P2-C): advertise this binary's version `ext` on
+        // every connection this env dials or accepts from here on. Benign
+        // known race: `bind_with_tls_and_key` already spawned its accept
+        // loop, so a connection accepted in the microseconds before this
+        // line answers with an empty `ext`; an era-on peer refuses it and
+        // simply redials (an `ext` parameter on `ProdEnv::bind*` would close
+        // it, but that is `animus-env`).
+        env.set_own_ext(version_wiring::own_ext());
         // `Arc`-wrapped (issue #1060) — see [`BoundNode::client_listener`]'s
         // own doc for why.
         let client_listener = Arc::new(TcpListener::bind(addrs.client).await?);
@@ -6813,6 +6876,7 @@ impl Node {
             advertise_host: addrs.advertise_host,
             tls,
             encryption_key,
+            overload: addrs.overload,
         })
     }
 
@@ -6846,6 +6910,14 @@ impl Node {
             encryption_key.clone(),
         )
         .await?;
+        // ADR 0073 Phase 2 (P2-C): advertise this binary's version `ext` on
+        // every connection this env dials or accepts from here on. Benign
+        // known race: `bind_with_tls_and_key` already spawned its accept
+        // loop, so a connection accepted in the microseconds before this
+        // line answers with an empty `ext`; an era-on peer refuses it and
+        // simply redials (an `ext` parameter on `ProdEnv::bind*` would close
+        // it, but that is `animus-env`).
+        env.set_own_ext(version_wiring::own_ext());
         // `Arc`-wrapped (issue #1060) — see [`BoundNode::client_listener`]'s
         // own doc for why.
         let client_listener = Arc::new(TcpListener::bind(addrs.client).await?);
@@ -6876,6 +6948,7 @@ impl Node {
             advertise_host: addrs.advertise_host,
             tls,
             encryption_key,
+            overload: addrs.overload,
         })
     }
 
@@ -6893,6 +6966,26 @@ impl Node {
     pub fn dynamo_addr(&self) -> SocketAddr {
         self.dynamo_addr
             .expect("dynamo_addr: this node has no data role (ADR 0035 PR3 control-only)")
+    }
+
+    /// This node's own cluster-feature handle (ADR 0073 Phase 2): the single
+    /// per-node handle every gated emitter consults, fed by the version
+    /// feeder. Floor (era off) until the first `Metadata` read.
+    pub fn features(&self) -> animus_control::version::ClusterFeatures {
+        self.edge.version().features.clone()
+    }
+
+    /// The named reason this node must exit (its binary's version range does
+    /// not contain the cluster version), if its feeder latched one.
+    pub fn version_halt_reason(&self) -> Option<String> {
+        self.edge.version().halt.get()
+    }
+
+    /// Resolves with the halt reason once this node's feeder latches one;
+    /// never resolves otherwise. `main` races it against the shutdown
+    /// signal and exits with a named code.
+    pub async fn wait_version_halt(&self) -> String {
+        self.edge.version().halt.wait().await
     }
 
     /// The address the admin / debug HTTP endpoint listens on (ADR 0020).
@@ -7404,6 +7497,8 @@ pub struct BoundControlNode {
     tls: Option<TlsMaterial>,
     /// See [`BoundNode::encryption_key`]'s doc.
     encryption_key: Option<animus_env::EncryptionKey>,
+    /// This node's overload limits (R-01 (d)), from `RoleAddrs::overload`.
+    overload: Option<config::OverloadSection>,
 }
 
 impl BoundControlNode {
@@ -7625,6 +7720,9 @@ impl BoundControlNode {
         // still lets `propose_schema` (and the client dispatch paths above)
         // propose locally when this node is the control leader.
         let edge = ClusterEdgeState::new();
+        // ADR 0073 Phase 2 (P2-C): the flip, control-only assembly — see
+        // `BoundNode::start_with_growth`'s identical call.
+        version_wiring::apply_profile_to_raft(&raft, &edge.version().profile());
         edge.register_control(raft.clone());
 
         // This node's stream-shard segment store (ADR 0043 §A7b) — see
@@ -7692,6 +7790,7 @@ impl BoundControlNode {
             // never serves `ExportTableToPointInTime` either — nothing
             // here would ever call `ClientCtx::export_store_factory`.
             None,
+            config::OverloadSection::resolve(self.overload.as_ref()),
         );
         startup.extend(common_tail_tasks);
         // No fallible step remains in this assembly past this point (issue
@@ -7841,6 +7940,8 @@ pub struct BoundDataNode {
     tls: Option<TlsMaterial>,
     /// See [`BoundNode::encryption_key`]'s doc.
     encryption_key: Option<animus_env::EncryptionKey>,
+    /// This node's overload limits (R-01 (d)), from `RoleAddrs::overload`.
+    overload: Option<config::OverloadSection>,
 }
 
 impl BoundDataNode {
@@ -8219,6 +8320,7 @@ impl BoundDataNode {
             // this entry point) — a data-only node's own export factory
             // stays the "not configured" default until this is wired.
             None,
+            config::OverloadSection::resolve(self.overload.as_ref()),
         );
         // Adopted into the `StartupTasks` guard so the fallible
         // `check_wal_layout`/`SharedWal::open` steps below are covered too
@@ -8569,6 +8671,13 @@ pub struct ClusterEdgeState<E: Env = ProdEnv> {
     /// security hole, since the gate still runs whenever `ctx.dynamo_auth`
     /// is configured regardless of this flag.
     has_catalog_credentials: Arc<std::sync::atomic::AtomicBool>,
+    /// This node's own ADR 0073 Phase 2 version state: its `ClusterFeatures`
+    /// handle (the one per-node handle every gated emitter consults), its own
+    /// version profile (range + build) and the halt cell the process exit
+    /// waits on. Lives here, not on `ClientCtx`, so every construction site
+    /// that already builds one `ClusterEdgeState` per node gets it with zero
+    /// struct-literal fan-out. Fed by `version_wiring::version_wiring_loop`.
+    version: version_wiring::VersionState,
 }
 
 impl<E: Env> Default for ClusterEdgeState<E> {
@@ -8585,7 +8694,14 @@ impl<E: Env> ClusterEdgeState<E> {
             dynamo_registry: Arc::new(Mutex::new(animus_dynamo::SchemaRegistry::new())),
             raftkv: Arc::new(Mutex::new(BTreeMap::new())),
             has_catalog_credentials: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            version: version_wiring::VersionState::default(),
         }
+    }
+
+    /// This node's version state (ADR 0073 Phase 2): `version().features` is
+    /// the per-node `ClusterFeatures` handle.
+    pub(crate) fn version(&self) -> &version_wiring::VersionState {
+        &self.version
     }
 
     /// The current best-effort answer to "does the replicated credential
@@ -11448,6 +11564,10 @@ pub(crate) struct ClientCtx<E: Env = ProdEnv, R: RelayClient = AnimusdRelayClien
     /// applied/fetched — never guessed from the request that triggered it.
     /// `Arc`-shared for the same reason `throttle_defaults` is.
     any_table_throughput: Arc<std::sync::atomic::AtomicBool>,
+    /// R-01 (d), ADR 0074 §2: this node's connection caps and in-flight
+    /// request bound (see [`overload`]). `Arc`-backed atomics inside, so
+    /// every per-connection clone shares one set of counters.
+    pub(crate) overload: overload::OverloadState,
 }
 
 impl<E: Env, R: RelayClient> ClientCtx<E, R> {
@@ -12050,6 +12170,17 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             return Ok(node);
         }
 
+        // ADR 0073 Phase 2 (P2-C): once the version era is on, refuse a voter
+        // whose version range is unknown (a Phase 1 binary) or excludes the
+        // cluster version, by name, before anything is registered or
+        // proposed. Pre-era: no check.
+        version_wiring::check_member_admission(
+            &leader.metadata(),
+            &leader.version_observations(),
+            self.env.now(),
+            &node,
+        )?;
+
         // **Issue #406/#450 (Bug B), read-your-writes barrier.** This
         // leader's own `metadata_cached()` is gated on its own async apply
         // task (ADR 0038), which can lag its own already-committed Raft log
@@ -12456,6 +12587,186 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// `admin_remove_control_member`'s own self-removal arm polls against —
     /// a transfer that never completes in time surfaces as its own,
     /// distinct timeout error rather than a bare "not the leader" refusal.
+    /// `GET /admin/cluster-version` body (ADR 0073 Phase 2, P2-C): served by
+    /// any node from its own view of `Metadata`; the control leader also
+    /// reports its live observation table (`observed_range`), every other
+    /// node reports `null` there.
+    pub(crate) fn admin_cluster_version_view(&self) -> serde_json::Value {
+        let meta = self.effective_metadata();
+        let observed = self.edge.leader_handle().map(|l| l.version_observations());
+        version_wiring::cluster_version_view(
+            &meta,
+            &self.edge.version().profile(),
+            observed.as_ref(),
+        )
+    }
+
+    /// `POST /admin/cluster-version/finalize` (ADR 0073 Phase 2, P2-C):
+    /// raise the cluster version by exactly one. **Local-control-leader-only,
+    /// not relayed** (the ADR 0037 `admin_remove_member` pattern; Finalize is
+    /// irreversible, so it is deliberately not reachable through the generic
+    /// relay): leadership is checked FIRST (a follower's replica lags, so any
+    /// metadata-dependent refusal there would be a false answer), then the
+    /// era, the one-step rule, the `expected` CAS and the blockers, computed
+    /// from the leader's own `Metadata`. `Accepted` only means appended, so
+    /// success is confirmed by observing the cluster version reach `target`
+    /// (the CAS target, unambiguous).
+    pub(crate) async fn admin_finalize_cluster_version(
+        &self,
+        to: Option<u32>,
+        expected: Option<u32>,
+    ) -> (u16, serde_json::Value) {
+        let Some(leader) = self.edge.leader_handle() else {
+            return (409, serde_json::json!({"error": self.not_leader_error()}));
+        };
+        // Issue #406 pattern: the leader's `metadata()` is the apply-task
+        // cache, which can lag a just-elected leader's own committed log.
+        // Bounded converged-or-timeout wait for it to catch up before any
+        // metadata-dependent refusal (or the blockers) is computed from it.
+        {
+            let deadline = self.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
+            loop {
+                if leader.engine_applied_index() >= leader.commit_index() {
+                    break;
+                }
+                if self.env.now() >= deadline {
+                    return (
+                        503,
+                        serde_json::json!({"error": "control leader's metadata has not caught up \
+                            with its committed log (apply lag); retry the finalize"}),
+                    );
+                }
+                self.env.sleep(SCHEMA_POLL_INTERVAL).await;
+            }
+        }
+        let meta = leader.metadata();
+        if !meta.versioning_active() {
+            return (
+                409,
+                serde_json::json!({"error": "version era not active: not every member has reported its version yet"}),
+            );
+        }
+        let active = meta.cluster_version();
+        let target = active + 1;
+        if let Some(to) = to
+            && to != target
+        {
+            return (
+                400,
+                serde_json::json!({"error": format!(
+                    "the cluster version is raised one step at a time: the next version is \
+                     {target} (requested {to})"
+                )}),
+            );
+        }
+        if let Some(expected) = expected
+            && expected != active
+        {
+            return (
+                409,
+                serde_json::json!({"error": format!(
+                    "expected cluster version {expected} but the active version is {active}"
+                )}),
+            );
+        }
+        let own = self
+            .edge
+            .version()
+            .profile()
+            .range
+            .unwrap_or_else(animus_control::version::own_range);
+        if target > own.max {
+            return (
+                409,
+                serde_json::json!({"error": format!(
+                    "this binary supports cluster versions up to {} and cannot finalize {target}",
+                    own.max
+                )}),
+            );
+        }
+        // ADR 0073 decision 6: Down / Leaving / never-activated Joining
+        // members block regardless of any recorded range. `Metadata::apply`
+        // does NOT enforce the status half, so this admin pre-check (racy,
+        // operator-level) is its only enforcement today; apply-level
+        // enforcement is tracked in issue #1168.
+        let blockers = version_wiring::finalize_blockers(&meta, target);
+        if !blockers.is_empty() {
+            let named: Vec<String> = blockers
+                .iter()
+                .map(|b| format!("{}: {}", b.node, b.reason))
+                .collect();
+            return (
+                409,
+                serde_json::json!({
+                    "error": format!(
+                        "cannot finalize cluster version {target}: {}",
+                        named.join("; ")
+                    ),
+                    "blockers": blockers
+                        .iter()
+                        .map(|b| serde_json::json!({"node": b.node.to_string(), "reason": b.reason}))
+                        .collect::<Vec<_>>(),
+                }),
+            );
+        }
+        // A different finalize may have landed between the reads above and
+        // now: name that instead of proposing (and later mistaking its
+        // result for ours).
+        let now_active = leader.metadata().cluster_version();
+        if now_active != active {
+            return (
+                409,
+                serde_json::json!({"error": format!(
+                    "the cluster version is already {now_active} (another finalize landed \
+                     first); nothing was proposed"
+                )}),
+            );
+        }
+        let ProposeResult::Accepted { index, .. } =
+            leader.propose(MetaCommand::FinalizeClusterVersion {
+                expected: active,
+                target,
+            })
+        else {
+            return (409, serde_json::json!({"error": self.not_leader_error()}));
+        };
+        let deadline = self.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
+        loop {
+            if leader.metadata().cluster_version() >= target {
+                return (200, serde_json::json!({"ok": true, "active": target}));
+            }
+            // The apply task has merged past our entry's index yet the
+            // version did not move: the entry was applied-and-rejected by
+            // `Metadata::apply` (its own preconditions: era, expected CAS,
+            // ranges) or displaced by a leadership change. `apply`'s
+            // rejection reason is not surfaced to proposers.
+            if leader.engine_applied_index() >= index
+                && leader.metadata().cluster_version() < target
+            {
+                return (
+                    409,
+                    serde_json::json!({"error": format!(
+                        "finalize of cluster version {target} was rejected at apply (the \
+                         entry was applied but the cluster version did not move; its \
+                         preconditions no longer held, or leadership changed). Re-read \
+                         GET /admin/cluster-version before retrying"
+                    )}),
+                );
+            }
+            if self.env.now() >= deadline {
+                return (
+                    504,
+                    serde_json::json!({"error": format!(
+                        "finalize of cluster version {target} was not confirmed within {}s \
+                         (re-read GET /admin/cluster-version before retrying)",
+                        SCHEMA_COMMIT_TIMEOUT.as_secs()
+                    )}),
+                );
+            }
+            self.env.sleep(SCHEMA_POLL_INTERVAL).await;
+        }
+    }
+
     pub(crate) async fn admin_transfer_control_leadership(
         &self,
         target: NodeId,
@@ -14629,14 +14940,25 @@ async fn serve_requests(
     tls: Option<tokio_rustls::TlsAcceptor>,
 ) {
     let mut handlers: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    // R-01 (d), ADR 0074 §2: this listener serves peers and the CLI, speaks a
+    // framed protocol rather than HTTP, and a peer reconnects on its own — so
+    // an over-cap connection is simply closed (no response to write).
+    let gate = overload::CountGate::new(ctx.overload.limits.max_peer_connections);
     loop {
         tokio::select! {
             accepted = listener_socket.accept() => {
                 match accepted {
                     Ok((stream, peer_addr)) => {
+                        let Some(conn_permit) = gate.try_acquire() else {
+                            ctx.overload.metrics.incr(Metric::OverloadShedPeerConnCap);
+                            tracing::warn!(%peer_addr, ?listener, "peer connection refused: at max_peer_connections");
+                            drop(stream);
+                            continue;
+                        };
                         let ctx = ctx.clone();
                         let tls = tls.clone();
                         handlers.spawn(async move {
+                            let _conn_permit = conn_permit;
                             let stream = match tls {
                                 None => MaybeTlsStream::Plain(stream),
                                 Some(acceptor) => match acceptor.accept(stream).await {
@@ -14652,11 +14974,24 @@ async fn serve_requests(
                                 },
                             };
                             let mut stream = stream;
+                            // ADR 0073 Phase 2 (P2-C): advertise this node's
+                            // own version `ext`; once the era is on, refuse an
+                            // empty-`ext` (Phase 1) peer on the INTRA port
+                            // only. Never the client port: `animus-cli` and
+                            // external clients are not members and dial with
+                            // an empty `ext`.
+                            let version = ctx.edge.version();
+                            let profile = version.profile();
+                            let own_ext = version_wiring::ext_for(profile.range, &profile.build);
+                            let require_peer_ext = listener == ListenerKind::Intra
+                                && version.features.era_active();
                             if perform_client_handshake(
                                 &mut stream,
                                 "accept",
                                 &peer_addr.to_string(),
                                 &ctx.env.metrics(),
+                                &own_ext,
+                                require_peer_ext,
                             )
                             .await
                             .is_err()
@@ -15003,6 +15338,10 @@ async fn handle_request(
             client_route: ctx.route_snapshot(),
             intra_route: ctx.intra_route_snapshot(),
             admin_addrs: ctx.admin.admin_addrs.clone(),
+            // ADR 0073 Phase 2 (P2-C): the raw cluster version (0 = era off,
+            // so pre-era bytes equal Phase 1's); lets a joiner refuse an
+            // out-of-range cluster before claiming anything.
+            cluster_version: ctx.effective_metadata().cluster_version,
         },
         // Long-poll metadata watch (ADR 0035 PR5) — see `ClientCtx::
         // watch_metadata`'s doc.
@@ -15284,6 +15623,7 @@ pub async fn bind_cluster_with_advertise_host_and_key(
             advertise_host: advertise_host.clone(),
             tls: None,
             encryption_key_path: encryption_key_path.clone(),
+            overload: None,
         };
         let node = Node::bind(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?;
         nodes.push(node);
@@ -15888,6 +16228,7 @@ pub async fn start_split_cluster_with_growth(
             advertise_host: None,
             tls: None,
             encryption_key_path: None,
+            overload: None,
         };
         control_bound.push(
             Node::bind_control(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?,
@@ -15907,6 +16248,7 @@ pub async fn start_split_cluster_with_growth(
             advertise_host: None,
             tls: None,
             encryption_key_path: None,
+            overload: None,
         };
         data_bound
             .push(Node::bind_data(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?);
@@ -17599,7 +17941,20 @@ async fn discover_join_info(
             client_route,
             intra_route,
             admin_addrs,
-        } => Ok((control_ids, peers, client_route, intra_route, admin_addrs)),
+            cluster_version,
+        } => {
+            // ADR 0073 Phase 2 (P2-C): refuse a cluster whose version this
+            // binary's range excludes BEFORE claiming an identity or binding
+            // anything (covers the pre-era "binary R+1 vs cluster at R-1"
+            // case, which `EraWatch` cannot: it is era-only). A Phase 1 seed
+            // omits the field (reads 0 = version 1).
+            version_wiring::check_join_range(
+                cluster_version,
+                &animus_control::version::own_range(),
+            )
+            .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidData, msg))?;
+            Ok((control_ids, peers, client_route, intra_route, admin_addrs))
+        }
         other => Err(std::io::Error::other(format!(
             "seed returned an unexpected reply to JoinInfo: {other:?}"
         ))),
@@ -18461,6 +18816,7 @@ mod confirm_futility_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                overload: None,
             }],
             dynamo_auth: None,
             cluster_settings: None,
@@ -18701,6 +19057,7 @@ mod forward_transport_failure_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                overload: None,
             })
             .collect();
         ClusterConfig {
@@ -19084,6 +19441,7 @@ mod forward_hop_timeout_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                overload: None,
             })
             .collect();
         ClusterConfig {
@@ -19913,6 +20271,7 @@ mod client_cancellation_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                overload: None,
             })
             .collect();
         ClusterConfig {
@@ -20277,6 +20636,7 @@ mod halted_shutdown_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                overload: None,
             }],
             dynamo_auth: None,
             cluster_settings: None,
@@ -20660,6 +21020,7 @@ mod simenv_client_ctx_tests {
             throttle: ThrottleTracker::new(),
             throttle_defaults: Arc::new(ThrottleDefaults::default()),
             any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            overload: Default::default(),
         };
 
         (sim, ctx, control, kv)
@@ -21307,6 +21668,7 @@ mod two_node_relay_tests {
             throttle: ThrottleTracker::new(),
             throttle_defaults: Arc::new(ThrottleDefaults::default()),
             any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            overload: Default::default(),
         };
 
         // Node A answers relayed requests through the generic dispatcher
@@ -21379,6 +21741,7 @@ mod two_node_relay_tests {
             throttle: ThrottleTracker::new(),
             throttle_defaults: Arc::new(ThrottleDefaults::default()),
             any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            overload: Default::default(),
         };
 
         (sim, ctx_a, ctx_b, control)
@@ -22269,6 +22632,8 @@ mod sim_cluster_control_membership_admin;
 #[cfg(test)]
 mod sim_cluster_seed_join;
 
+#[cfg(test)]
+mod sim_cluster_cluster_version;
 /// ADR 0073 Phase 2 (P2-A) residual risk #1 at the node-assembly level: every
 /// node role `SimCluster` can build (control-only, combined, data-only, a
 /// runtime-grown control voter, `join_via_seed` joiners of both kinds) is in
@@ -22402,6 +22767,7 @@ mod issue_298_conflict_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                overload: None,
                 console: addrs[5],
             }],
             dynamo_auth: None,

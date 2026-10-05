@@ -1233,3 +1233,5 @@ non-trivial), so under `--encryption-key` the swap re-reads and `replace`s.
 ## Fuzzing (roadmap R-01 (c))
 
 The `ADE1` encryption envelope and the handshake preamble/extension parsers are the `encryption_envelope` and `net_frames` fuzz targets; the private envelope scan/open is exposed through the off-by-default `fuzzing` feature (`encrypted::fuzzing`). See `fuzz/README.md` (stable smoke: `cd fuzz && cargo test --release --test smoke`).
+
+- **Overload counters (R-01 (d))**: `Metric::OverloadShed{ConnCap,Admission,AdminConnCap,PeerConnCap}` (`overload_shed_*`), appended after `CpGroupsRefusedAsVoter`, recorded by `animusd::overload` users. Known issue: `prod.rs::read_frames` allocates `vec![0; len]` from a peer-supplied `u32` with no cap (see `docs/resource-bounds.md` section 4).

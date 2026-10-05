@@ -1,0 +1,20 @@
+# UNVALIDATED draft (never applied to a cluster; see deploy/chaos/README.md).
+# 20 % packet loss on one pod: real retransmits, which the bare harness's
+# userspace proxy cannot produce (TCP on loopback does not lose packets).
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: animus-loss
+  namespace: animus-chaos
+spec:
+  action: loss
+  mode: one
+  selector:
+    namespaces: [animus-chaos]
+    labelSelectors:
+      app.kubernetes.io/name: animusdb
+      app.kubernetes.io/instance: chaos
+  loss:
+    loss: "20"
+    correlation: "25"
+  duration: "30s"

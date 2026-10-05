@@ -205,6 +205,17 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   reclaimed tombstones (`MemoryEngine` never GCs). Set the grace **above the max
   anti-entropy lag** so a delete propagates before its tombstone is reclaimed (ADR
   0010). `lsm_gc.rs` is the dedicated test.
+  **The floor is in version units, and the CP data plane's versions are packed
+  HLC timestamps (`wall_ms << 20`)**: the default grace (`1 << 20`) is about
+  **one millisecond** of history there, not "generous". GC also collapses a
+  *live* key's history below the floor to its newest record at or below it, so
+  a `get_at(key, v)` with `v` below the floor can return nothing for a key that
+  has a committed value. A caller that needs older history must hold it (an
+  `LsmSnapshot` pins the floor) or not depend on it: `animus-cp-data`'s
+  aborted-intent restore did depend on it and lost acked writes (ADR 0018's
+  2026-10-04 amendment; intents now carry their prior value). The other
+  below-floor readers (`read_at`/`scan_at`, backup capture's pinned
+  `cut_version`) are a known, separately tracked gap.
 - **Two read gates skip an SSTable before any disk read** (`sstable.rs`
   `SsTableMeta::may_contain`): the key range `[min_key, max_key]`, then the
   per-table **Bloom filter** (`lsm/bloom.rs` — a hand-rolled FNV-1a
@@ -480,6 +491,13 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   pre-sizing a
   `Vec`" entry (found and fixed first in `animus-cp-data::codec`) for the
   full account.
+- **Never `lz4_flex::decompress_size_prepended` on an SSTable block.** It
+  allocates the untrusted 4-byte size prefix up front (a CRC-valid corrupt
+  block declaring ~3.8 GB aborts). `decompress_lz4_block` in `lsm/sstable.rs`
+  bounds the prefix by `255 * compressed_len` (LZ4's max expansion; the LSM
+  caps no record size, so no fixed bound is safe) then calls
+  `lz4_flex::decompress`. See
+  `docs/lessons/code-patterns/2026-10-04-size-prepended-decompress-allocates-the-untrusted-prefix.md`.
 - **A `snapshot()`'s pinned version must floor compaction's tombstone-GC
   window, not just its own read path.** `LsmSnapshot` used to be a bare
   `(engine, version)` pair with no registration anywhere — a long-held snapshot
@@ -795,7 +813,7 @@ the CP-data Raft apply pattern). Also reports `clone_to`'s own cost
 section — expected to scale with table count, not data volume, since it
 hard-links rather than copies.
 
-**Upgrade-harness class (ADR 0073 P1-D):** `lsm-wal`, `lsm-manifest` and `lsm-sstable` are whole-file `TABLE` entries in `animus-test`'s transcode table (a bump edits that entry; legacy encoders must be `pub` + `legacy-encoders`-gated); `lsm-sstable` is also the carrier of every engine-resident `EMBEDDED` format.
+**Upgrade-harness class (ADR 0073 P1-D):** `lsm-wal`, `lsm-manifest` and `lsm-sstable` are whole-file `TABLE` entries in `animus-test`'s transcode table (a bump edits that entry; legacy encoders must be `pub` + `legacy-encoders`-gated); `lsm-sstable` is also the carrier of every engine-resident `EMBEDDED` format. `rewrite_row_values` (+ `RowRewriteReport`, `legacy-encoders`-gated) is the offline primitive for those: with the node stopped it offers every non-tombstone `(key, value)` of every WAL segment and manifest-listed SSTable to a mapper (WAL segments re-encoded at their existing version, SSTables rewritten whole with the manifest entry swapped), under a per-file keep filter for mixed-version engines; `animus-test`'s `transcode_rows` is its caller.
 
 ## Fuzzing (roadmap R-01 (c))
 
