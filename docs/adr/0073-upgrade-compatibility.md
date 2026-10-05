@@ -2664,10 +2664,14 @@ the crate guides (`animus-control`, `animusd`, `animus-cp-data`).
 `MAX_SUPPORTED` is now **2** and `Gate::GlobalTables` (version 2) is the first
 gate that is not synthetic and not `Era`. It gates exactly one cross-node
 surface, `MetaCommand::ConvertTableToGlobal` (plus its additive, skipped-at-default
-`TableSchema.global` / `PlacementPolicy.allowed_values` fields). One gate per
-release surface: the multi-region preferred-leader arm is a *separate* later
-surface and gets its own gate when it ships (ADR 0075 D1 deviation: M1 lands a
-single gate, not two).
+`TableSchema.global` / `PlacementPolicy.allowed_values` fields) **and
+`MetaCommand::SetGlobalPreferredLeader`** (M2, the preferred-leader re-point). One
+gate per release surface: everything in G-c ships at cluster version 2 in one PR,
+so the preferred-leader arm is covered by the *same* `Gate::GlobalTables` (an
+exhaustive `required_gate` row, a relay-allowlist entry and a mixed-version
+assertion in `release1_to_release2_global_gate`), not a second gate (ADR 0075 D1
+deviation: a single gate, not two). The preferred-leader reconciler step and
+witness read hiding are node-local (class L) and need no gate.
 
 - **B2 is pinned to the literal `[1, 1]`.** `BinaryProfile::B2` used to ask
   `own_range()`, which tracks `MAX_SUPPORTED`; the bump would have silently made
