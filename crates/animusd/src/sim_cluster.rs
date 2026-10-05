@@ -1422,6 +1422,32 @@ impl SimClusterHandle {
         self.ctx(from).relay(target, request).await
     }
 
+    /// Issue #1230: `node`'s own `ClientCtx::register_node` — the single
+    /// bounded attempt (10 s) the pre-fix self-registration task made.
+    pub(crate) async fn register_node_once(
+        &self,
+        node: u64,
+        id: NodeId,
+        addrs: NodeAddrs,
+        labels: BTreeMap<String, String>,
+    ) -> Result<RegisterOutcome, String> {
+        self.ctx(node).register_node(id, addrs, labels).await
+    }
+
+    /// Issue #1230: `node`'s own `ClientCtx::register_node_until_settled` —
+    /// what production's self-registration task runs.
+    pub(crate) async fn register_node_retrying(
+        &self,
+        node: u64,
+        id: NodeId,
+        addrs: NodeAddrs,
+        labels: BTreeMap<String, String>,
+    ) -> RegisterOutcome {
+        self.ctx(node)
+            .register_node_until_settled(id, addrs, labels)
+            .await
+    }
+
     /// Call `node`'s own `ClientCtx::propose_schema` directly, bypassing a
     /// full DynamoDB `CreateTable`'s own confirmation-poll loop — issue
     /// #610's own regression needs to measure `propose_schema`'s latency

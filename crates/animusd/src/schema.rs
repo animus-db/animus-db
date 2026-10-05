@@ -23,6 +23,13 @@ use crate::{
     median_split_key, topology,
 };
 
+/// First/maximum pause between self-registration attempts
+/// ([`ClientCtx::register_node_until_settled`], issue #1230). Each attempt
+/// already waits up to `SCHEMA_COMMIT_TIMEOUT`, so this only paces a
+/// fast-failing leaderless cluster.
+const REGISTER_RETRY_BACKOFF_INITIAL: Duration = Duration::from_millis(500);
+const REGISTER_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(5);
+
 impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// Serve a long-poll [`ClientRequest::WatchMetadata`] (ADR 0035 PR5 for
     /// the long-poll mechanism itself; ADR 0038 PR5 for the incremental
@@ -746,6 +753,113 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                  (no control-plane leader reachable?)",
                 SCHEMA_COMMIT_TIMEOUT.as_secs()
             )),
+        }
+    }
+
+    /// Self-registration that survives a slow control-plane start (issue
+    /// #1230): [`register_node`](Self::register_node) in a bounded-backoff
+    /// loop until it reaches a **terminal** outcome. `register_node` alone
+    /// gives up after `SCHEMA_COMMIT_TIMEOUT`, and its sole production caller
+    /// used to be a fire-and-forget `let _ = ...` — so a pod that started
+    /// before the control group had a leader stayed unregistered (empty
+    /// labels, no `node_addrs` entry) for the life of the process, silently.
+    ///
+    /// Terminal outcomes: `Registered` / `Collision` (a durable fact, see
+    /// `register_node`). A timeout is logged and retried after an
+    /// exponentially growing, capped backoff. Every `Env` interaction is the
+    /// seam's (`env.sleep`), so the loop is `SimEnv`-testable; the caller
+    /// stops it by dropping/aborting the task (process shutdown) — every
+    /// wait here is an `.await`.
+    ///
+    /// **Resurrection safety.** A retry is only ever a *fresh* claim, and
+    /// `RegisterNode`'s apply cannot tell a fresh claim from a re-registration
+    /// of an identity `RemoveMember` just decommissioned (see
+    /// `register_node`'s doc: a stale re-propose after the removal silently
+    /// resurrects the node). So this loop never proposes blind after
+    /// registration became observable: `register_node` itself returns the
+    /// instant `node_addrs[node]` is visible, and during every backoff the
+    /// node's own view is re-read each `SCHEMA_POLL_INTERVAL` tick and the
+    /// loop returns on the first sight of the entry. The loop therefore
+    /// only keeps proposing while this node has *never observed* its own
+    /// entry — i.e. the registration it is retrying has, as far as this node
+    /// can tell, never committed. The residual window (a registration that
+    /// committed *and* was removed entirely inside this node's mirror lag
+    /// without the entry ever being visible locally) would need a replicated
+    /// tombstone to close; it is the same window the pre-existing single
+    /// attempt had.
+    pub(crate) async fn register_node_until_settled(
+        &self,
+        node: NodeId,
+        addrs: NodeAddrs,
+        labels: BTreeMap<String, String>,
+    ) -> RegisterOutcome {
+        let mut backoff = REGISTER_RETRY_BACKOFF_INITIAL;
+        let mut failures = 0u32;
+        loop {
+            match self
+                .register_node(node.clone(), addrs.clone(), labels.clone())
+                .await
+            {
+                Ok(outcome) => return outcome,
+                Err(e) => {
+                    failures += 1;
+                    eprintln!(
+                        "animusd: self-registration attempt {failures} failed ({e}); \
+                         retrying in {}ms",
+                        backoff.as_millis()
+                    );
+                }
+            }
+            let wake = self.env.now().saturating_add(backoff);
+            while self.env.now() < wake {
+                if let Some(outcome) = Self::register_outcome_from(
+                    &self.effective_metadata().node_addrs,
+                    &node,
+                    &addrs,
+                ) {
+                    return outcome;
+                }
+                self.env.sleep(SCHEMA_POLL_INTERVAL).await;
+            }
+            backoff = (backoff * 2).min(REGISTER_RETRY_BACKOFF_MAX);
+        }
+    }
+
+    /// [`admin_add_member`](Self::admin_add_member) retried until it
+    /// succeeds — the growth/data-only nodes' own `Down`-member claim, which
+    /// used to be the same fire-and-forget single attempt as
+    /// [`register_node_until_settled`](Self::register_node_until_settled)'s
+    /// predecessor (issue #1230). Same resurrection argument: `admin_add_member`
+    /// is a no-op once `members[node]` is visible, and every backoff tick
+    /// re-reads the node's own view and returns on first sight of the row, so
+    /// a retry never re-adds a member that was seen and then removed.
+    pub(crate) async fn admin_add_member_until_settled(
+        &self,
+        node: NodeId,
+        labels: BTreeMap<String, String>,
+    ) {
+        let mut backoff = REGISTER_RETRY_BACKOFF_INITIAL;
+        let mut failures = 0u32;
+        loop {
+            match self.admin_add_member(node.clone(), labels.clone()).await {
+                Ok(()) => return,
+                Err(e) => {
+                    failures += 1;
+                    eprintln!(
+                        "animusd: self member-claim attempt {failures} failed ({e}); \
+                         retrying in {}ms",
+                        backoff.as_millis()
+                    );
+                }
+            }
+            let wake = self.env.now().saturating_add(backoff);
+            while self.env.now() < wake {
+                if self.effective_metadata().members.contains_key(&node) {
+                    return;
+                }
+                self.env.sleep(SCHEMA_POLL_INTERVAL).await;
+            }
+            backoff = (backoff * 2).min(REGISTER_RETRY_BACKOFF_MAX);
         }
     }
 

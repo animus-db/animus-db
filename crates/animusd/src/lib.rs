@@ -5487,7 +5487,7 @@ fn spawn_common_tail(
     )));
     // This node's own identity self-registration (ADR 0032 PR1; ADR 0040
     // Decision C since PR4 — the registration CAS is now the mechanism, not
-    // just an address-book update): one-shot, so peer-sync (internal
+    // just an address-book update): retried until registered (issue #1230), so peer-sync (internal
     // addresses) and any node's route/peers views (client/admin addresses)
     // can resolve it regardless of when this node joined relative to the
     // reader. Every node shape reaches this — a fresh bootstrap node whose
@@ -5506,7 +5506,18 @@ fn spawn_common_tail(
         let ctx = ctx.clone();
         let (node, addrs, labels) = self_addrs;
         tasks.push(tokio::spawn(async move {
-            let _ = ctx.register_node(node, addrs, labels).await;
+            // Retried until a terminal outcome (issue #1230): a single
+            // attempt with its error discarded left a pod that started
+            // before the control group had a leader unregistered forever.
+            if let RegisterOutcome::Collision = ctx
+                .register_node_until_settled(node.clone(), addrs, labels)
+                .await
+            {
+                eprintln!(
+                    "animusd: self-registration of {node} found a different registration \
+                     already claiming this identity; not retrying"
+                );
+            }
         }));
     }
     // The two client-protocol listeners (ADR 0047): one parameterized
@@ -6519,7 +6530,7 @@ impl BoundNode {
                 let node = my_id;
                 let labels = self.labels.clone();
                 tasks.push(tokio::spawn(async move {
-                    let _ = ctx.admin_add_member(node, labels).await;
+                    ctx.admin_add_member_until_settled(node, labels).await;
                 }));
             }
         }
@@ -8611,7 +8622,7 @@ impl BoundDataNode {
             let node = my_id;
             let labels = self.labels.clone();
             tasks.push(tokio::spawn(async move {
-                let _ = ctx.admin_add_member(node, labels).await;
+                ctx.admin_add_member_until_settled(node, labels).await;
             }));
         }
 
@@ -22948,6 +22959,13 @@ mod sim_cluster_control_only;
 /// `crates/animusd/CLAUDE.md`'s matching SimCluster-roles entry.
 #[cfg(test)]
 mod sim_cluster_data_only;
+
+/// Issue #1230: a node's self-registration must survive a control plane that
+/// is unreachable for longer than `SCHEMA_COMMIT_TIMEOUT` at start, and a
+/// still-running retry loop must never resurrect a removed node. See the
+/// module's own doc.
+#[cfg(test)]
+mod sim_cluster_register_retry;
 
 /// ADR 0061 rung L (C-12 PR 4a): the first conversion PR built on top of the
 /// PR 2/3 mechanism — `tests/control_only.rs` (3 tests), `tests/

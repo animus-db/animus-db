@@ -12111,3 +12111,16 @@ a 503 `ServiceUnavailable` whose message starts `StorageFull:` and ends
 `storage_full` field. `sim_cluster_admin`'s NOT_A_METRIC list no longer holds
 `overload_storage_full`; `storage_full` stays (it is a JSON field, not a metric)
 and `spawned_task_panics` stays (still not exported).
+
+## Startup self-registration is retried (issue #1230)
+
+`spawn_common_tail`'s `RegisterNode` and the growth/data-only `admin_add_member`
+claims run `ClientCtx::register_node_until_settled` /
+`admin_add_member_until_settled` (`schema.rs`): bounded-backoff retry via
+`env.sleep`, a log line per failure, stops on `Registered`/`Collision` or on
+first sight of the node's own entry in its local view (so a retry can never
+resurrect a node `RemoveMember` just removed; a replicated tombstone would be
+needed to close the residual mirror-lag window). Never reintroduce
+`let _ = ctx.register_node(..)`. Regression: `sim_cluster_register_retry.rs`
+(partition a follower from the control quorum for 25 s > `SCHEMA_COMMIT_TIMEOUT`;
+`ANIMUS_SEED=<seed>` replays). Lesson: `docs/lessons/code-patterns/2026-10-05-a-fire-and-forget-let-underscore-turns-a-bounded-timeout-into-a-permanent-silent-failure.md`.
