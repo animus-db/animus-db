@@ -2071,6 +2071,7 @@ first start of the new binary (Option B); **F** outlives the cluster, Phase 1 ru
 | Admin/dashboard/console HTTP JSON | `animusd/src/admin.rs`, `dashboard*`, `console.rs` | G (additive) | new fields only; new action routes gated |
 | Handshakes `NHS1`/`CHS1` | `animus-env/src/handshake.rs`, `prod.rs`, `animusd/src/lib.rs` | version fixed at 1 forever | `ext` TLVs; `check_peer` + disjoint-range refusal; `Envelope.peer_ext` |
 | `ReportNodeVersion`, `FinalizeClusterVersion` | new | `Gate::Era` | era-only variants |
+| `ConvertTableToGlobal` (`MetaCommand`), `TableSchema.global` (`GlobalTableSpec`), `PlacementPolicy.allowed_values` | `animus-control/src/{meta,schema}.rs`, `animus-placement/src/lib.rs`, relay arm in `animus-node/src/wire.rs` | G, `Gate::GlobalTables` (cluster version 2) | the variant is gated (`required_gate` row, relay allowlist); both fields are additive and skipped at their default, so an ordinary table/policy encodes byte-identically and only a converted table carries them (shaped fixtures `metadata/v1-global.json`, `mirror-entities/schema/v1-global.json`, `mirror-entities/policy/v1-pinned.json`) |
 | `SegmentWire` (replicated segment/backup store RPCs on the reserved `SEGMENT_STREAM`/`BACKUP_SEGMENT_STREAM`) | `animus-cp-data/src/cluster_segment_store.rs` | G (all `Gate::Base` today) | `SegmentWire::required_gate`, exhaustive, no `_` arm; `encode` debug-asserts `Base`; a test pins every variant's JSON. A new variant or field needs a gate and a gated send path (the store holds no `ClusterFeatures` yet) |
 | `control-wal`/`shared-wal`/`raftkv-wal`, LSM WAL/SSTable/manifest, key-layout marker, `ADE1` | `animus-control/src/persist.rs`, `animus-storage`, `animus-cp-data/src/layout.rs`, `animus-env/src/encrypted.rs` | L | next bump at first start; checklist applies |
 | Mirror files, `ClusterConfig` | `mirror.rs`, `animusd/src/config.rs` | L | only that node reads them |
@@ -2657,3 +2658,29 @@ under its mutation):
 checklist gains the class G/L/F + gate step), ADR 0060 "Upgrades", the website
 (manual node-by-node rolling upgrade supported; operator orchestration is Phase 3),
 the crate guides (`animus-control`, `animusd`, `animus-cp-data`).
+
+## Amendment 2026-10-05 — the first real gate: `Gate::GlobalTables`, `MAX_SUPPORTED = 2` (G-01 stage G-c, M1)
+
+`MAX_SUPPORTED` is now **2** and `Gate::GlobalTables` (version 2) is the first
+gate that is not synthetic and not `Era`. It gates exactly one cross-node
+surface, `MetaCommand::ConvertTableToGlobal` (plus its additive, skipped-at-default
+`TableSchema.global` / `PlacementPolicy.allowed_values` fields). One gate per
+release surface: the multi-region preferred-leader arm is a *separate* later
+surface and gets its own gate when it ships (ADR 0075 D1 deviation: M1 lands a
+single gate, not two).
+
+- **B2 is pinned to the literal `[1, 1]`.** `BinaryProfile::B2` used to ask
+  `own_range()`, which tracks `MAX_SUPPORTED`; the bump would have silently made
+  the "previous release" binary `[1, 2]` and every rolling-upgrade cell vacuous.
+  The sim profile, `version_world` and `version_observe_corpus` now spell the range
+  out; a unit test (`b2_is_pinned_to_one_one_and_release_two_is_the_current_binary`)
+  guards it.
+- **Cells.** Pure tier `version_mixed_corpus::release1_to_release2_global_gate`
+  and `negative_control_global_gate_emitted_early` (N5); cluster tier
+  `release1_to_release2_global_gate` and the same N5 in
+  `sim_cluster_mixed_version_corpus` (relay refused by name before finalize,
+  accepted after, mirror included; N5 wedges exactly the B2 voter).
+- **Mutation:** downgrading the `required_gate` row to `Base` fails the new
+  cells in both tiers and `global_table_apply::convert_requires...`.
+- `cluster_version_prod` now finalizes 1 -> 2 for real and asserts the gate opens
+  on every node including a data-only one.

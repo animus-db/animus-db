@@ -801,3 +801,9 @@ the raw `Metadata::cluster_version`, 0 pre-era so pre-era bytes equal Phase 1's)
 gained `cluster_version_view` and `action_finalize_cluster_version` (routes
 `GET /admin/cluster-version`, `POST /admin/cluster-version/finalize`); both `animusd`
 impls (`ClientCtx`, `GenericAdminHost`) implement them.
+
+## `ConvertTableToGlobal` is relayable (G-01 G-c M1, 2026-10-05)
+
+`is_relayable_command` includes `MetaCommand::ConvertTableToGlobal` (a follower-
+connected node must be able to forward it); the receiver refuses it by name
+until `Gate::GlobalTables` is open. It is in the `true_cases` round-trip table.
