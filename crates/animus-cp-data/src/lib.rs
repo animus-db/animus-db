@@ -50,7 +50,7 @@ use animus_control::persist_round::{
     self, GatedOuts, PersistArm, PersistFut, PersistProgress, PersistWake,
 };
 use animus_control::raft::{Out, RaftCore, RaftMsg, StateMachine};
-use animus_control::version::ClusterFeatures;
+use animus_control::version::{ClusterFeatures, Gate};
 use animus_control::{PersistedState, ProposeResult};
 use animus_env::{Env, EnvExt, Metric, MetricsHandle, Nanos, NodeId, PRIMARY_STREAM};
 // ADR 0054 step 2: the pure item model/evaluation crate below the wire
@@ -11624,6 +11624,16 @@ async fn engine_image<S: StorageEngine>(
         .entries_with_tombstones()
         .await
         .expect("raftkv engine scan");
+    // ADR 0073 (class G, `txn-envelope` v2, 2026-10-05 amendment): engine
+    // values cross nodes inside this image, and a previous-release replica
+    // panics on an intent whose tag it does not know (`txn: unknown envelope
+    // tag 2`). While the version that introduces v2 (`Gate::GlobalTables`) is
+    // closed — which includes "this node has not read the cluster version
+    // yet" (floor) — every v2 intent in a base row ships down-converted to
+    // v1 (v1 cannot express the carried `prior`, so it ships as the committed
+    // row one MVCC version below the intent, where the old lookback reads it). The local engine is untouched and apply never branches on the
+    // gate, so replicas stay deterministic; a finalized cluster ships v2 as is.
+    let ship_v1_intents = !features.is_open(Gate::GlobalTables);
     let mut entries: Vec<ImageEntry> = Vec::new();
     for (k, v, version) in rows {
         let claimed = ALL_KINDS
@@ -11631,6 +11641,30 @@ async fn engine_image<S: StorageEngine>(
             .zip(kind_scopes)
             .find_map(|(kind, scope)| scope.strip_in_range(&k).map(|l| (*kind, l.to_vec())));
         if let Some((kind, logical)) = claimed {
+            let v = match v {
+                Some(bytes) if ship_v1_intents && kind == KIND_BASE => {
+                    match txn::legacy::v1::downgrade_intent_to_v1_with_prior(&bytes) {
+                        Some((v1, prior)) => {
+                            // v1 cannot carry the prior, but a v1 reader
+                            // looks one MVCC version below the intent for
+                            // it: ship it there, so a replica that rebuilds
+                            // from this image can still restore the value on
+                            // an abort (as far as that lookback reaches).
+                            if let (Some(p), Some(below)) = (prior, version.checked_sub(1)) {
+                                entries.push((
+                                    kind,
+                                    logical.clone(),
+                                    Some(txn::encode_committed(&p)),
+                                    below,
+                                ));
+                            }
+                            Some(v1)
+                        }
+                        None => Some(bytes),
+                    }
+                }
+                other => other,
+            };
             entries.push((kind, logical, v, version));
         }
     }

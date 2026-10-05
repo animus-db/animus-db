@@ -965,11 +965,12 @@ pub(crate) mod legacy {
 
         /// Legacy v1 encoder (ADR 0073 checklist step 7), anchored to
         /// `tests/fixtures/formats/txn-envelope/v1.bin` by a byte-equality
-        /// test. Behind `legacy-encoders` (not `cfg(test)`) because the
-        /// upgrade-restart harness's row-value transcode
-        /// ([`downgrade_intent_to_v1`]) re-encodes every stored v2 intent
-        /// through it when it restarts a node on "older-version" state.
-        #[cfg(any(test, feature = "legacy-encoders"))]
+        /// test. **Not** behind `legacy-encoders` any more: the production
+        /// snapshot sender ([`downgrade_intent_to_v1`], class G, ADR 0073's
+        /// 2026-10-05 `txn-envelope` amendment) re-encodes every v2 intent
+        /// through it while `Gate::GlobalTables` is closed, and the
+        /// upgrade-restart harness's row-value transcode uses the same
+        /// function.
         #[must_use]
         pub(crate) fn encode_intent(
             txn_id: &super::super::TxnId,
@@ -1001,9 +1002,24 @@ pub(crate) mod legacy {
         /// an engine's rows carry no type marker beyond the envelope tag, so
         /// the *whole* shape has to parse before a row is rewritten. Drops
         /// the `prior`, the one field v1 cannot express.
-        #[cfg(any(test, feature = "legacy-encoders"))]
+        ///
+        /// Production caller: `engine_image` (the snapshot a leader ships to a
+        /// follower) while the cluster has not finalized to the version that
+        /// introduces v2 — an N-1 reader panics on tag 2.
         #[must_use]
         pub(crate) fn downgrade_intent_to_v1(value: &[u8]) -> Option<Vec<u8>> {
+            downgrade_intent_to_v1_with_prior(value).map(|(v1, _prior)| v1)
+        }
+
+        /// [`downgrade_intent_to_v1`], also returning the dropped `prior`
+        /// (`Some(Some(v))` = the committed value the intent shadowed,
+        /// `Some(None)` = it shadowed nothing) so the snapshot sender can ship
+        /// it where a v1 reader's lookback finds it (the MVCC version just below
+        /// the intent) instead of losing it.
+        #[must_use]
+        pub(crate) fn downgrade_intent_to_v1_with_prior(
+            value: &[u8],
+        ) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
             use super::super::{Cursor, TAG_INTENT};
             if value.first() != Some(&TAG_INTENT) {
                 return None;
@@ -1018,17 +1034,20 @@ pub(crate) mod legacy {
             let staged_value = c.opt_bytes()?;
             let kind_writes = c.kind_writes()?;
             let change_log = c.change_log()?;
-            let _prior = c.opt_bytes()?;
+            let prior = c.opt_bytes()?;
             if c.pos != c.bytes.len() {
                 return None;
             }
-            Some(encode_intent(
-                &txn_id,
-                &record_key,
-                &record_table,
-                staged_value.as_deref(),
-                &kind_writes,
-                change_log.as_ref(),
+            Some((
+                encode_intent(
+                    &txn_id,
+                    &record_key,
+                    &record_table,
+                    staged_value.as_deref(),
+                    &kind_writes,
+                    change_log.as_ref(),
+                ),
+                prior,
             ))
         }
     }
