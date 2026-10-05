@@ -857,7 +857,7 @@ fn cell_split_under_mrsc(seed: u64) {
         let body = format!(
             r#"{{"TableName":"glob1","Item":{{"pk":{{"S":"pad{i}"}},"v":{{"S":"{pad}"}}}}}}"#
         );
-        let _ = call(c, (i % NODES) as u64, "PutItem", &body);
+        let _ = call(c, i % NODES, "PutItem", &body);
         Err(format!("{n} tablet(s)"))
     });
     run.converged("glob1", "r-a");
