@@ -141,6 +141,7 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, ClusterConfig)
                     tls: None,
                     encryption_key_path: None,
                     labels: Default::default(),
+                    overload: None,
                 })
                 .collect(),
             dynamo_auth: None,

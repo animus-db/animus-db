@@ -41,6 +41,7 @@ fn node(i: u16, role: NodeRole, tls: bool) -> RoleAddrs {
         }),
         encryption_key_path: (i == 0).then(|| "/etc/animus/enc/key".to_string()),
         labels: Default::default(),
+        overload: None,
     }
 }
 

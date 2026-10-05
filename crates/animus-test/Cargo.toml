@@ -23,6 +23,9 @@ animus-sim.workspace = true
 animus-control = { workspace = true, features = ["legacy-encoders", "sim-versions"] }
 # Likewise `reframe_wal_to_v1` (the `lsm-wal` v2 -> v1 transcode).
 animus-storage = { workspace = true, features = ["legacy-encoders"] }
+# Likewise `downgrade_txn_envelope_to_v1` (the `txn-envelope` v2 -> v1 engine-row
+# transcode, `ROW_TABLE`).
+animus-cp-data = { workspace = true, features = ["legacy-encoders"] }
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -36,8 +39,9 @@ animus-env = { workspace = true, features = ["legacy-encoders", "s3"] }
 # No `prod` anywhere here: the `s3` feature needs no tokio.
 animus-s3 = { workspace = true, features = ["fake"] }
 animus-control = { workspace = true, features = ["legacy-encoders", "sim-versions"] }
-animus-cp-data = { workspace = true, features = ["legacy-encoders"] }
 animus-dynamo.workspace = true
 animus-item.workspace = true
 animus-tablet.workspace = true
+# `txn_serializable.rs`'s `CorpusEngine` (a delegating `StorageEngine` over either tier).
+async-trait.workspace = true
 flate2.workspace = true

@@ -144,6 +144,7 @@ fn role_addrs_at(id: usize, addrs: &[SocketAddr], advertise_host: Option<&str>) 
         tls: None,
         encryption_key_path: None,
         labels: Default::default(),
+        overload: None,
     }
 }
 
@@ -311,6 +312,7 @@ async fn same_identity_restart_on_a_different_bind_ip_keeps_the_same_advertised_
         tls: None,
         encryption_key_path: None,
         labels: Default::default(),
+        overload: None,
     };
     // Updating this node's own config entry in place is enough: every
     // other node's own peer/route books re-derive from replicated

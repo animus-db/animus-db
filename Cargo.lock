@@ -280,6 +280,7 @@ dependencies = [
  "animus-sim",
  "animus-storage",
  "animus-tablet",
+ "async-trait",
  "flate2",
  "futures",
  "serde",

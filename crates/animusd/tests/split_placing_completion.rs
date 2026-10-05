@@ -86,6 +86,7 @@ async fn bring_up_inplace(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig) {
                 tls: None,
                 encryption_key_path: None,
                 labels: Default::default(),
+                overload: None,
             })
             .collect();
         let config = ClusterConfig {
@@ -320,6 +321,7 @@ async fn join_extra(core_intra: &[SocketAddr], ids: &[&str], dir: &Path) -> Vec<
                 tls: None,
                 encryption_key_path: None,
                 labels: Default::default(),
+                overload: None,
             };
             match animusd::run_node_join(
                 core_intra.iter().map(ToString::to_string).collect(),

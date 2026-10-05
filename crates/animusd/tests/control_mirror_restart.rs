@@ -68,6 +68,7 @@ fn role_addrs(id: NodeId) -> animusd::RoleAddrs {
         tls: None,
         encryption_key_path: None,
         labels: Default::default(),
+        overload: None,
     }
 }
 

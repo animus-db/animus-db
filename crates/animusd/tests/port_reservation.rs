@@ -82,6 +82,7 @@ async fn control_only_node_ports_stay_claimed_across_a_restart_gap() {
             tls: None,
             encryption_key_path: None,
             labels: Default::default(),
+            overload: None,
         }],
         dynamo_auth: None,
         cluster_settings: None,

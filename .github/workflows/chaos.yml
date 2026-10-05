@@ -1,0 +1,113 @@
+name: chaos
+
+# Real-cluster chaos (R-01 sub-track b, docs/chaos.md): real `animusd`
+# processes on loopback, a recorded DynamoDB-wire workload, real faults
+# (kill -9, SIGSTOP, a userspace loopback fault proxy for partitions/delay),
+# the animus-test oracles over the recorded history.
+#
+# NOT a required check. A red run here is a finding (the sim corpora are the
+# correctness proof; this checks the ProdEnv seams), so a failure must be
+# triaged, never retried or quarantined: see docs/chaos.md "When it fails".
+#
+#   - pull_request / push: the ~3 minute smoke (one control-leader kill + one
+#     partition), path-filtered to the surfaces it exercises.
+#   - nightly: the smoke plus every longer scenario at the chaos defaults,
+#     each with a fresh random seed (printed; replay with ANIMUS_CHAOS_SEED).
+#   - workflow_dispatch: pick a scenario, window and seed.
+on:
+  schedule:
+    # 04:41 UTC nightly (off the hour, after corpus-deep's 03:17).
+    - cron: "41 4 * * *"
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: "smoke | kill | partition | pause | delay | mixed | all"
+        required: false
+        default: "smoke"
+      secs:
+        description: "Fault-window seconds (ANIMUS_CHAOS_SECS); empty = the scenario default"
+        required: false
+        default: ""
+      seed:
+        description: "Fault-schedule seed (ANIMUS_CHAOS_SEED); empty = random"
+        required: false
+        default: ""
+  push:
+    branches: [main]
+    paths:
+      - "crates/animusd/tests/chaos.rs"
+      - "crates/animusd/tests/chaos_support/**"
+      - "crates/animusd/Cargo.toml"
+      - ".github/workflows/chaos.yml"
+  pull_request:
+    paths:
+      - "crates/animusd/tests/chaos.rs"
+      - "crates/animusd/tests/chaos_support/**"
+      - "crates/animusd/Cargo.toml"
+      - ".github/workflows/chaos.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  chaos:
+    name: chaos-${{ github.event_name == 'schedule' && 'nightly' || (github.event.inputs.scenario || 'smoke') }}
+    runs-on: ubuntu-latest
+    # Smoke is ~3 min of run + a debug animusd build; the nightly runs six
+    # scenarios of ~2.5-4 min each. Generous on purpose: this is real
+    # wall-clock work, not a deterministic SimEnv suite.
+    timeout-minutes: 75
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (1.96)
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Cache cargo registry + build output
+        uses: Swatinem/rust-cache@v2
+
+      - name: Pick scenarios and a seed
+        id: pick
+        run: |
+          scenario="${{ github.event.inputs.scenario }}"
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${scenario}" = "all" ]; then
+            tests="chaos_"
+          elif [ -n "${scenario}" ]; then
+            tests="chaos_${scenario}"
+          else
+            tests="chaos_smoke"
+          fi
+          seed="${{ github.event.inputs.seed }}"
+          if [ -z "${seed}" ] && { [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; }; then
+            seed="$(( (RANDOM << 30) ^ (RANDOM << 15) ^ RANDOM ))"
+          fi
+          echo "tests=${tests}" >> "$GITHUB_OUTPUT"
+          echo "seed=${seed}" >> "$GITHUB_OUTPUT"
+          echo "scenarios: ${tests}  seed: ${seed:-<per-scenario default>}"
+
+      - name: Run chaos
+        env:
+          ANIMUS_CHAOS_SEED: ${{ steps.pick.outputs.seed }}
+          ANIMUS_CHAOS_SECS: ${{ github.event.inputs.secs }}
+          ANIMUS_CHAOS_OUT: ${{ runner.temp }}/chaos-out
+        # `chaos_` as the filter matches every scenario; `--test-threads=1`
+        # because the scenarios share one fixed-shape loopback port budget
+        # (they also serialize on an in-process lock).
+        run: |
+          cargo test -p animusd --features chaos --test chaos --locked \
+            "${{ steps.pick.outputs.tests }}" -- --nocapture --test-threads=1
+
+      # A failure leaves history.json, events.txt, op-trace.txt, violations.txt
+      # and every node's log here (written by the harness only on failure).
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-failure
+          path: ${{ runner.temp }}/chaos-out
+          if-no-files-found: ignore

@@ -1487,7 +1487,7 @@ outstanding on the wire surface at present.
   amendment's own "what remains unowned" accounting and `crates/animusd/
   CLAUDE.md`'s consolidated closed-C-15 appendix.
 
-### C-16 Upgrade compatibility (ADR 0073) — Phases 0 and 1 done; Phase 2 in progress (P2-A merged)
+### C-16 Upgrade compatibility (ADR 0073) — Phases 0 and 1 done; Phase 2 in progress (P2-A and P2-C landed)
 
 - **Gap (closed):** `website/index.html` listed "On-disk format stability,
   then rolling upgrades" as Planned with no ADR, roadmap entry, or issue
@@ -1553,7 +1553,7 @@ outstanding on the wire surface at present.
   (CWL/SWL v2 WAL sync markers, #1140/#1141, plus `raftkv-wal` v2), and the
   harness transcodes them to v1 for real; every other format is still v1. **Next: Phase 2** (replicated cluster version /
   feature gate; design accepted in ADR 0073's "Phase 2 design"
-  amendment, **P2-A merged**: workstreams P2-A..P2-D, knob `ANIMUS_UPGRADE_SEEDS`, no rollback
+  amendment, **P2-A and P2-C landed**: workstreams P2-A..P2-D, knob `ANIMUS_UPGRADE_SEEDS`, no rollback
   once a node has run the new binary; rolling-installable from today's
   Phase 1 binaries, never a stop-the-world step), then Phase 3. Phase 4 (lifting/rewriting root `CLAUDE.md`'s
   no-back-compat rule) is **already done** by this same maintainer
@@ -1574,7 +1574,7 @@ outstanding on the wire surface at present.
   knob `ANIMUS_UPGRADE_SEEDS`, Phase 2/3 work); a `kind` e2e for the
   operator's rolling-restart path, once Phase 3 exists.
 - **ADR:** [0073](adr/0073-upgrade-compatibility.md) (Accepted, 2026-09-27
-  — Phases 0 and 1 done, baseline `9a9f972f`; Phase 2 next; Phase 3
+  — Phases 0 and 1 done, baseline `9a9f972f`; Phase 2 in progress (P2-A, P2-C landed); Phase 3
   planned).
 - **Size:** XL overall across all four phases; Phase 0 alone is roughly M
   (mechanical, one format at a time, no design risk), now split five ways
@@ -1586,13 +1586,14 @@ outstanding on the wire surface at present.
   `spec.image` handling.
 - **Status:** Phase 0 done (workstreams A-E merged, baseline `9a9f972f`);
   Phase 1 done (2026-10-03); **Phase 2 in progress: P2-A has merged on
-  `main`** (`c4948113` version module + `Metadata` `node_versions`/
+  `main` and P2-C (node wiring, era live, `/admin/cluster-version` and
+  `animus cluster version|finalize`) has landed** (`c4948113` version module + `Metadata` `node_versions`/
   `cluster_version` + `ReportNodeVersion`/`FinalizeClusterVersion`,
   `54c6c81a` handshake extension TLV and era-on refusal hook,
   `04c2bef4` leader-local version observation / precondition P / era
   start, `acf54d7f` era-on refusal of Phase 1 peers and the startup
   cluster-version range check; `crates/animus-control/src/version.rs`,
-  `version_observe.rs`). **P2-B, P2-C and P2-D are not started** — no
+  `version_observe.rs`). **P2-B and P2-D have not landed** (P2-C's Finalize apply-level status check is tracked in #1168) — no
   `required_gate` exists in the code yet (ADR 0073 designs it as an
   exhaustive match on the wire enums). Open issue #1168: the
   `FinalizeClusterVersion` apply does not block on Down/Leaving/
@@ -1825,6 +1826,20 @@ outstanding on the wire surface at present.
     oracles; the sim corpora remain the correctness proof, this checks
     the `ProdEnv` seams the sim cannot (ADR 0003: sim proves logic and
     ordering, not real-thread liveness).
+    **First PR landed 2026-10-04** ([`docs/chaos.md`](chaos.md)): the bare
+    multi-process leg only (no root needed: a userspace loopback fault
+    proxy instead of `tc netem`), `crates/animusd/tests/chaos.rs` +
+    `chaos_support/` behind the opt-in `chaos` feature, scenarios `smoke`/
+    `kill`/`partition`/`pause`/`delay`/`mixed` (process `kill -9` incl. the
+    control leader and a full power cut, per-link partitions incl. one-way,
+    SIGSTOP, delay), the recorded DynamoDB-wire history fed unchanged to
+    `check_cycles`/`check_durability`/`check_convergence` plus eventual-read
+    prefix and transaction-atomicity checks, `.github/workflows/chaos.yml`
+    (non-required). **Not done:** clock skew, slow disk and packet loss
+    (Kubernetes-only designs in `deploy/chaos/`, pinned and unvalidated),
+    disk full (blocked on #1185). **Its first runs found a real
+    violation** (acknowledged writes lost on keys touched by an aborted
+    cross-tablet transaction; see `docs/chaos.md`, "Findings").
   - **(c) Fuzzing (independent; M).** `cargo-fuzz` targets for every
     untrusted parser: DynamoDB JSON request decode and expression
     parsers (`animus-dynamo`: UpdateExpression, ConditionExpression,
@@ -2058,8 +2073,8 @@ outstanding on the wire surface at present.
 - **Size:** XL in total (G-a S-M, G-b S, G-c L, G-d XL, G-e L).
 - **Depends:** G-a and G-b: none, start now. G-c, G-d, G-e: ADR 0073
   Phase 2 (C-16: a replicated cluster version / feature gate, so the new
-  `Metadata` and wire surfaces are not unguarded; P2-A has merged, P2-B..D
-  have not), G-b, and ADR 0072 limits. G-c benefits from B-01 to quantify
+  `Metadata` and wire surfaces are not unguarded; P2-A and P2-C have landed, P2-B and
+  P2-D have not), G-b, and ADR 0072 limits. G-c benefits from B-01 to quantify
   WAN cost. Reverses the global-tables clause of section 6.
 
 ## 4. Operator surfaces: admin API, dashboard, console, CLI
@@ -2151,7 +2166,7 @@ wave are independent and can run in parallel.
 | 16 | C-15 (closed 2026-09-20 — node assembly/raw `ClientRequest` assess-and-close, ADR 0061 rung O, #997) | Gated on C-14 (closed) — the last class-D group C-14's own close-out confirmed still unowned |
 | 17 | B-01 (benchmarks); S-08 (S3 credentials/multipart; landed 2026-10-04); G-01 stage G-a + G-b (topology-aware operator, global-tables ADR); R-01 sub-tracks c (fuzzing), f (observability), g (release engineering) | All independent of each other and of the open C-16 phases; no ordering constraint |
 | 18 | C-17 (scale/density), R-01 sub-tracks a (soak), b (chaos), d (resource bounds), e (runbook) | C-17 Tier 2 and R-01 (a)/(e) capacity planning need B-01's generator; C-17 Tier 1 and R-01 (b)/(d) can start earlier |
-| 19 | G-01 stages G-c (MRSC stretch), G-d (MREC), G-e (federation) | After C-16 Phase 2 (P2-B..D: cluster-version/feature gate) and the G-b ADR; G-c wants B-01 to quantify WAN cost |
+| 19 | G-01 stages G-c (MRSC stretch), G-d (MREC), G-e (federation) | After C-16 Phase 2 (P2-B and P2-D remaining: cluster-version/feature gate) and the G-b ADR; G-c wants B-01 to quantify WAN cost |
 | 20 | R-01 runbook upgrade chapter | After C-16 Phase 3 (rolling upgrades) |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed

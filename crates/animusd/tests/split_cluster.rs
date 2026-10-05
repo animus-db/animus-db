@@ -177,6 +177,7 @@ async fn bring_up_split_durable(
                     tls: None,
                     encryption_key_path: None,
                     labels: Default::default(),
+                    overload: None,
                 }
             })
             .collect();
