@@ -567,6 +567,17 @@ enum CpGroup<E: Env = ProdEnv> {
 }
 
 impl<E: Env> CpGroup<E> {
+    /// The group's feature-gate handle (ADR 0073 Phase 2): the node's own
+    /// control-fed handle when the reconciler injected it, else a private
+    /// floor handle. Test-only: nothing in production reads it back.
+    #[cfg(test)]
+    fn features(&self) -> animus_control::version::ClusterFeatures {
+        match self {
+            CpGroup::Lsm(n) => n.features(),
+            CpGroup::Mem(n) => n.features(),
+        }
+    }
+
     /// Propose a write to the group (honored on the leader), stamping `fence`
     /// Propose a write to this group. See [`RaftKvNode::put`].
     fn put(&self, key: Vec<u8>, value: Vec<u8>) -> ProposeResult {
@@ -2440,6 +2451,7 @@ async fn client_request_pipelined<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     peer_desc: &str,
     request: &ClientRequest,
+    features: &animus_control::version::ClusterFeatures,
 ) -> std::io::Result<ClientResponse> {
     // ADR 0073 Phase 2 (P2-C): advertise this binary's version `ext`
     // (a Phase 1 peer ignores it). Never *require* the peer's on a dial: the
@@ -2451,7 +2463,10 @@ async fn client_request_pipelined<S: AsyncRead + AsyncWrite + Unpin>(
         .map_err(|err| {
             classify_client_handshake_error(err, "dial", peer_desc, &MetricsHandle::noop())
         })?;
-    write_frame(stream, request).await?;
+    // Gated (ADR 0073 Phase 2, P2-C): a request whose gate is closed on this
+    // node is refused before it reaches the wire (the preamble above is
+    // harmless: every binary reads it).
+    write_frame_gated(stream, request, features).await?;
     match tokio::time::timeout(
         CLIENT_HANDSHAKE_TIMEOUT,
         read_preamble(stream, &CLIENT_PROTOCOL),
@@ -5365,6 +5380,9 @@ fn spawn_common_tail(
     // (`ClientCtx::any_table_throughput`'s doc) — a borrow, not a move, so
     // `control` below still moves into the struct unchanged.
     let initial_any_table_throughput = control.metadata_cached().any_table_throughput();
+    // The relay client's gated encoder reads this node's own feature handle
+    // (ADR 0073 Phase 2, P2-C); cloned before `edge` moves into the ctx.
+    let relay_features = edge.version().features.clone();
     let overload_metrics = env.metrics();
     let export_store_factory = Arc::new(Mutex::new(default_export_store_factory(
         export_s3,
@@ -5395,7 +5413,7 @@ fn spawn_common_tail(
         control_storage,
         dynamo_auth,
         tls: tls.clone(),
-        relay: AnimusdRelayClient { tls: tls.clone() },
+        relay: AnimusdRelayClient::new(tls.clone(), relay_features),
         throttle: ThrottleTracker::new(),
         throttle_defaults: Arc::new(ThrottleDefaults::new(
             throttle_read_units,
@@ -6278,6 +6296,13 @@ impl BoundNode {
                 )),
             }
         };
+        // ADR 0073 Phase 2 (P2-C): inject this node's control-fed
+        // `ClusterFeatures` handle (the one `version_wiring_loop` feeds from
+        // the applied view or, on a data-only node, the mirror) before the
+        // first tick, so every hosted group, its heartbeat batcher and its
+        // snapshot images gate on the cluster's real version. Without this
+        // each group would run on a private floor handle forever.
+        reconciler.set_cluster_features(edge.version().features.clone());
         // ADR 0044 phase-1 PR4 production wiring (PR7 layers the
         // `--quiesce-after` CLI flag on top of this same knob):
         // `Duration::ZERO` (every existing call site) disables it entirely —
@@ -8212,9 +8237,7 @@ impl BoundDataNode {
 
         let control = ControlHandle::Remote(RemoteControlClient::new(
             control_seeds.clone(),
-            AnimusdRelayClient {
-                tls: self.tls.clone(),
-            },
+            AnimusdRelayClient::new(self.tls.clone(), edge.version().features.clone()),
             CLIENT_TIMEOUT,
         ));
 
@@ -8399,6 +8422,13 @@ impl BoundDataNode {
                 )),
             }
         };
+        // ADR 0073 Phase 2 (P2-C): inject this node's control-fed
+        // `ClusterFeatures` handle (the one `version_wiring_loop` feeds from
+        // the applied view or, on a data-only node, the mirror) before the
+        // first tick, so every hosted group, its heartbeat batcher and its
+        // snapshot images gate on the cluster's real version. Without this
+        // each group would run on a private floor handle forever.
+        reconciler.set_cluster_features(edge.version().features.clone());
         // ADR 0044 phase-1 / ADR 0048 (S-06 closes the documented gap this
         // path used to have): identical contract to `BoundNode::
         // start_with_growth`'s own quiescence gate above — `Duration::ZERO`
@@ -11730,6 +11760,22 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     // `ok_or_err` moved to [`decide::ok_or_err`] (ADR 0061 A6) — a plain
     // `ClientResponse -> Result` map with nothing to gather from `self`.
 
+    /// The sink this node's metrics are **exported** from (what
+    /// [`metrics_text`](Self::metrics_text)/[`metrics_json`](Self::metrics_json)
+    /// read): the data role's sink when there is one, else the control
+    /// handle's (a data-only node's control handle is a permanent no-op, a
+    /// control-only node has no data role). A combined node's two are the
+    /// same sink. Metrics that no `Env`-level recorder owns (the ADR 0073
+    /// gate levels and the relay-refusal counter) record here, so they are
+    /// exported identically under `ProdEnv` and `SimEnv`, whose
+    /// `env.metrics()` are not the exported sinks.
+    pub(crate) fn exported_metrics(&self) -> MetricsHandle {
+        match &self.data {
+            Some(data) => data.raftkv_metrics.clone(),
+            None => self.control.metrics().clone(),
+        }
+    }
+
     /// Render this node's **live** metrics as the ADR 0015 text export
     /// (`name value` lines), aggregated across the node's role sink(s).
     ///
@@ -11745,6 +11791,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// activity rather than a cached value.
     pub(crate) fn metrics_text(&self) -> String {
         self.env.refresh_inbox_metrics();
+        version_wiring::export_gate_metrics(
+            &self.edge.version().features,
+            &self.exported_metrics(),
+        );
         let mut snaps = vec![self.control.metrics().snapshot()];
         if let Some(data) = &self.data
             && !data.raftkv_metrics.is_same_sink(self.control.metrics())
@@ -11780,6 +11830,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// sink(s), exactly as the text export.
     pub(crate) fn metrics_json(&self) -> (BTreeMap<String, u64>, i64) {
         self.env.refresh_inbox_metrics();
+        version_wiring::export_gate_metrics(
+            &self.edge.version().features,
+            &self.exported_metrics(),
+        );
         let mut snaps = vec![self.control.metrics().snapshot()];
         if let Some(data) = &self.data
             && !data.raftkv_metrics.is_same_sink(self.control.metrics())
@@ -13462,9 +13516,7 @@ async fn remote_metadata_sync_loop(ctx: ClientCtx, seeds: Vec<String>) {
     let remote = RemoteControlClient::with_mirror(
         seeds.clone(),
         ctx.remote_metadata.clone(),
-        AnimusdRelayClient {
-            tls: ctx.tls.clone(),
-        },
+        AnimusdRelayClient::new(ctx.tls.clone(), ctx.edge.version().features.clone()),
         CLIENT_TIMEOUT,
     );
     remote_metadata_watch_loop(remote, seeds).await
@@ -13912,6 +13964,17 @@ impl CpReconciler {
         match self {
             CpReconciler::Lsm(r) => r.enable_shared_wal(shared),
             CpReconciler::Mem(r) => r.enable_shared_wal(shared),
+        }
+    }
+
+    /// ADR 0073 Phase 2 (P2-C) — see [`Reconciler::set_cluster_features`]'s
+    /// doc: every hosted group (and the heartbeat batcher) gates its wire
+    /// frames, snapshot images and proposals on this node's control-fed
+    /// handle.
+    fn set_cluster_features(&mut self, features: animus_control::version::ClusterFeatures) {
+        match self {
+            CpReconciler::Lsm(r) => r.set_cluster_features(features),
+            CpReconciler::Mem(r) => r.set_cluster_features(features),
         }
     }
 
@@ -15192,7 +15255,11 @@ async fn handle_connection(
                 return Ok(());
             }
         };
-        write_frame(&mut write_half, &response).await?;
+        // ADR 0073 Phase 2 (P2-C): every reply goes out through the node's own
+        // gated encoder (a `ClientResponse` is `Base` today, so this changes
+        // no byte; a future gated variant cannot reach a peer that cannot
+        // decode it).
+        write_frame_gated(&mut write_half, &response, &ctx.edge.version().features).await?;
     }
 }
 
@@ -17627,10 +17694,14 @@ const JOIN_DISCOVERY_BUDGET: Duration = SCHEMA_COMMIT_TIMEOUT;
 /// helper's own doc names, so pipelining the handshake with the request
 /// frame here saves one round trip per attempt.
 async fn join_request(seeds: &[String], request: &ClientRequest) -> Option<ClientResponse> {
+    // A joiner has no `Metadata` yet, so it sends at the **floor** (every era
+    // and version gate closed): its requests are `Status`/`JoinInfo` and the
+    // `RegisterNode` registration, all `Base`.
+    let floor = animus_control::version::ClusterFeatures::new();
     for addr in seeds {
         let reply = tokio::time::timeout(JOIN_ATTEMPT_TIMEOUT, async {
             let mut stream = TcpStream::connect(addr.as_str()).await.ok()?;
-            client_request_pipelined(&mut stream, addr.as_str(), request)
+            client_request_pipelined(&mut stream, addr.as_str(), request, &floor)
                 .await
                 .ok()
         })
@@ -18408,6 +18479,7 @@ async fn relay_request_with_timeout(
     request: &ClientRequest,
     timeout: Duration,
     tls: Option<&TlsMaterial>,
+    features: &animus_control::version::ClusterFeatures,
 ) -> ClientResponse {
     match tokio::time::timeout(timeout, async {
         let stream = TcpStream::connect(addr.as_str()).await.ok()?;
@@ -18419,14 +18491,18 @@ async fn relay_request_with_timeout(
                 MaybeTlsStream::Tls(Box::new(tls_stream.into()))
             }
         };
-        client_request_pipelined(&mut stream, &addr, request)
-            .await
-            .ok()
+        Some(client_request_pipelined(&mut stream, &addr, request, features).await)
     })
     .await
     {
-        Ok(Some(resp)) => resp,
-        Ok(None) => ClientResponse::Error(RELAY_TRANSPORT_FAILURE.into()),
+        Ok(Some(Ok(resp))) => resp,
+        // A request this node's own feature gate refuses to send (ADR 0073
+        // Phase 2): named, not folded into the transport sentinel, so it is
+        // neither retried as a transient failure nor mistaken for one.
+        Ok(Some(Err(err))) if err.kind() == std::io::ErrorKind::InvalidInput => {
+            ClientResponse::Error(format!("relay refused: {err}"))
+        }
+        Ok(Some(Err(_)) | None) => ClientResponse::Error(RELAY_TRANSPORT_FAILURE.into()),
         Err(_) => ClientResponse::Error(RELAY_HOP_TIMEOUT.into()),
     }
 }
@@ -18503,6 +18579,110 @@ mod client_request_pipelining_tests {
 
     use crate::{ClientRequest, ClientResponse};
 
+    // ---- ADR 0073 Phase 2 (P2-C close-out): the gated relay sender ----
+
+    fn era_request() -> ClientRequest {
+        use animus_control::MetaCommand;
+        use animus_control::version::VersionRange;
+        ClientRequest::ProposeSchema(MetaCommand::ReportNodeVersion {
+            node: animus_env::NodeId::propose("a").unwrap(),
+            range: VersionRange::new(1, 1),
+            build: "t".into(),
+        })
+    }
+
+    /// A handle fed from an era-on `Metadata`, so `Gate::Era` is open.
+    fn era_on_features() -> animus_control::version::ClusterFeatures {
+        use animus_control::meta::{Member, NodeStatus};
+        use animus_control::version::{NodeVersion, VersionRange};
+        let a = animus_env::NodeId::propose("a").unwrap();
+        let mut meta = animus_control::Metadata::default();
+        meta.members.insert(
+            a.clone(),
+            Member {
+                labels: Default::default(),
+                status: NodeStatus::Active,
+                has_activated: true,
+            },
+        );
+        meta.node_versions.insert(
+            a,
+            NodeVersion {
+                range: VersionRange::new(1, 1),
+                build: "t".into(),
+            },
+        );
+        meta.cluster_version = 1;
+        let f = animus_control::version::ClusterFeatures::new();
+        f.update(&meta);
+        assert!(f.era_active());
+        f
+    }
+
+    /// Dial `addr` through the production relay sender with `features` and
+    /// return `(what the relay returned, every byte the peer received)`.
+    async fn relay_and_capture(
+        features: animus_control::version::ClusterFeatures,
+    ) -> (Option<ClientResponse>, Vec<u8>) {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let peer = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut got = Vec::new();
+            // Until the sender hangs up (it never gets a reply).
+            let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut got)).await;
+            got
+        });
+        let relay = crate::control_handle::AnimusdRelayClient::new(None, features);
+        let sender = tokio::spawn(async move {
+            animus_node::host::RelayClient::relay(
+                &relay,
+                addr,
+                &era_request(),
+                Duration::from_millis(600),
+            )
+            .await
+        });
+        // A debug build's closed-gate `debug_assert!` panics the sender task.
+        let resp = sender.await.ok();
+        (resp, peer.await.unwrap())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_relay_sender_never_puts_a_closed_gate_request_on_the_wire() {
+        let marker = b"ReportNodeVersion";
+        let contains = |hay: &[u8]| hay.windows(marker.len()).any(|w| w == marker);
+
+        // Pre-era (floor handle): the request is refused at the sender.
+        let floor = animus_control::version::ClusterFeatures::new();
+        let (resp, got) = relay_and_capture(floor.clone()).await;
+        assert!(
+            !contains(&got),
+            "the era-only request reached the peer: {}",
+            String::from_utf8_lossy(&got)
+        );
+        assert_eq!(
+            floor.violations(animus_control::version::GateSurface::ClientRequest),
+            1
+        );
+        match resp {
+            Some(ClientResponse::Error(m)) => {
+                assert!(m.contains("relay refused"), "{m}");
+            }
+            Some(other) => panic!("not refused: {other:?}"),
+            None => {
+                if !cfg!(debug_assertions) {
+                    panic!("only a debug build asserts");
+                }
+            }
+        }
+
+        // Era on: the identical request goes out (positive control).
+        let (_, got) = relay_and_capture(era_on_features()).await;
+        assert!(contains(&got), "an open-gate request must be sent");
+    }
+
     /// A correct accept-side stub: writes its own genuine `CLIENT_PROTOCOL`
     /// preamble eagerly (exactly like the real `serve_requests`/
     /// `perform_client_handshake` accept path — it never waits on the
@@ -18553,6 +18733,7 @@ mod client_request_pipelining_tests {
             &ClientRequest::Status,
             Duration::from_secs(5),
             None,
+            &animus_control::version::ClusterFeatures::new(),
         )
         .await;
         assert!(
@@ -18604,6 +18785,7 @@ mod client_request_pipelining_tests {
             &ClientRequest::Status,
             Duration::from_secs(5),
             None,
+            &animus_control::version::ClusterFeatures::new(),
         )
         .await;
         assert!(
@@ -18683,6 +18865,7 @@ mod client_request_pipelining_tests {
             &ClientRequest::Status,
             Duration::from_secs(8),
             None,
+            &animus_control::version::ClusterFeatures::new(),
         )
         .await;
         let elapsed = started.elapsed();
@@ -18736,6 +18919,39 @@ pub async fn write_frame<T: Serialize, S: AsyncWrite + Unpin>(
     msg: &T,
 ) -> std::io::Result<()> {
     let framed = animus_node::codec::encode_client_frame(msg)?;
+    stream.write_all(&framed).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// [`write_frame`] behind the ADR 0073 Phase 2 feature gate (P2-C): the frame
+/// is built by [`animus_node::codec::encode_client_frame_gated`] with the
+/// sending node's own `ClusterFeatures`, so a message whose
+/// [`required_gate`](animus_node::ClientGated::required_gate) is closed on
+/// this node is **refused** (an `InvalidInput` error, counted on the
+/// features handle's per-surface violation counter and mirrored to
+/// `Metric::ClusterGateViolations*`) instead of being sent to a peer that may
+/// not be able to decode it. For an open gate the bytes are identical to
+/// [`write_frame`]'s.
+///
+/// **Every production send goes through this**: the accept side's reply in
+/// [`handle_connection`] (`ClientResponse`) and the dial side's request in
+/// [`client_request_pipelined`] (`ClientRequest`, including the relayed
+/// `ProposeSchema`). The ungated [`write_frame`] stays for callers that have
+/// no node (test clients, raw probes) and for non-wire values.
+///
+/// # Errors
+/// A closed gate, or anything [`write_frame`] returns.
+pub async fn write_frame_gated<T, S>(
+    stream: &mut S,
+    msg: &T,
+    features: &animus_control::version::ClusterFeatures,
+) -> std::io::Result<()>
+where
+    T: animus_node::ClientGated + Serialize,
+    S: AsyncWrite + Unpin,
+{
+    let framed = animus_node::codec::encode_client_frame_gated(msg, features)?;
     stream.write_all(&framed).await?;
     stream.flush().await?;
     Ok(())

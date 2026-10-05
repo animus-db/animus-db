@@ -29,8 +29,10 @@
 
 use std::time::Duration;
 
-use animus_control::version::VersionRange;
-use animus_env::Env;
+use animus_control::MetaCommand;
+use animus_control::version::{Gate, GateSurface, VersionRange};
+use animus_env::{Env, Metric};
+use animus_node::{ClientRequest, ClientResponse};
 use serde_json::Value;
 
 use super::sim_cluster::SimCluster;
@@ -558,5 +560,194 @@ fn run_admission_refuses_an_unversioned_control_voter(seed: u64) {
 fn an_era_on_cluster_refuses_a_control_voter_with_no_known_range() {
     for seed in seeds() {
         run_admission_refuses_an_unversioned_control_voter(seed);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P2-B -> P2-C handoffs (close-out): relay receiver gate check, the control-fed
+// handle in every hosted group, and the exported violation levels.
+
+/// A relayed era-only command, as a follower-connected node would forward it.
+fn report_for(cluster: &SimCluster, node: u64) -> ClientRequest {
+    ClientRequest::ProposeSchema(MetaCommand::ReportNodeVersion {
+        node: cluster.handle().env(node).node_id(),
+        range: VersionRange::new(1, 1),
+        build: "relay-gate-test".into(),
+    })
+}
+
+fn run_relay_receiver_refuses_a_closed_gate(seed: u64) {
+    let mut cluster = new_cluster(seed);
+    let leader = leader_node(&mut cluster);
+    let follower = a_follower(&mut cluster);
+    // Pre-era: every gate above Base is closed on every node. A follower-
+    // connected node relaying an era-only command to the leader, and the
+    // leader relaying to a follower, are both refused by name by the
+    // RECEIVER (the sender here is a sim relay, which has no gate of its own:
+    // production's sender gate is `AnimusdRelayClient`, tested separately).
+    for (from, to) in [(follower, leader), (leader, follower)] {
+        let before = cluster.metric(to, Metric::ClusterGateRelayRefused);
+        let resp = cluster
+            .relay_request(from, to, report_for(&cluster, from))
+            .unwrap_or_else(|| panic!("seed={seed}: relay {from}->{to} never resolved"));
+        match resp {
+            ClientResponse::Error(msg) => assert!(
+                msg.contains("relayed command refused") && msg.contains("Era"),
+                "seed={seed}: {from}->{to}: {msg}"
+            ),
+            other => panic!("seed={seed}: {from}->{to} was not refused: {other:?}"),
+        }
+        assert_eq!(
+            cluster.metric(to, Metric::ClusterGateRelayRefused),
+            before + 1,
+            "seed={seed}: refusal not counted on node {to}"
+        );
+    }
+    // Nothing was proposed: no record, no era, anywhere.
+    cluster.run_for(Duration::from_secs(5));
+    for node in 0..ROLES.len() as u64 {
+        let meta = cluster.metadata(node);
+        assert!(
+            meta.node_versions.is_empty() && meta.cluster_version == 0,
+            "seed={seed}: node {node} saw a version record from a refused relay"
+        );
+    }
+
+    // Positive control: with the era on (every gate the command needs open),
+    // the identical relay is accepted and lands.
+    start_era(&mut cluster, seed, 2);
+    disable_all_upkeep(&mut cluster);
+    let resp = cluster
+        .relay_request(follower, leader, report_for(&cluster, follower))
+        .unwrap_or_else(|| panic!("seed={seed}: era-on relay never resolved"));
+    assert!(
+        matches!(resp, ClientResponse::PutOk),
+        "seed={seed}: an era-on relay was refused: {resp:?}"
+    );
+}
+
+#[test]
+fn a_relayed_command_whose_gate_is_closed_is_refused_by_the_receiving_node() {
+    for seed in seeds() {
+        run_relay_receiver_refuses_a_closed_gate(seed);
+    }
+}
+
+fn run_hosted_groups_share_the_nodes_handle(seed: u64) {
+    // Replication over every node, the data-only one included, so every role
+    // (a local `RaftNode`'s applied view, and the mirror-fed data-only node)
+    // hosts at least one group.
+    let mut cluster = SimCluster::new_with_roles(seed, &ROLES, ROLES.len());
+    let _ = cluster.control_leader_index();
+    cluster.create_table("gate_handles");
+    for node in 0..ROLES.len() as u64 {
+        assert!(
+            !cluster.hosted_group_features(node).is_empty(),
+            "seed={seed}: node {node} hosts no group"
+        );
+    }
+    // The groups were started pre-era, on a floor view. A group on a private
+    // handle would never learn the era; one on the node's control-fed handle
+    // must.
+    for node in 0..ROLES.len() as u64 {
+        for f in cluster.hosted_group_features(node) {
+            assert!(!f.era_active(), "seed={seed}: node {node} era before start");
+        }
+    }
+    start_era(&mut cluster, seed, 2);
+    poll_until(
+        &mut cluster,
+        Duration::from_secs(30),
+        seed,
+        "every hosted group's handle to see the era",
+        |c| {
+            (0..ROLES.len() as u64).all(|n| {
+                c.hosted_group_features(n)
+                    .iter()
+                    .all(|f| f.era_active() && f.cluster_version() == 1)
+            })
+        },
+    );
+    // And a finalize reaches them too (the version, not only the era flag).
+    let leader = leader_node(&mut cluster);
+    let (status, v) = post_finalize(&mut cluster, leader, r#"{"to":2,"expected":1}"#);
+    assert_eq!(status, 200, "seed={seed}: {v}");
+    poll_until(
+        &mut cluster,
+        Duration::from_secs(30),
+        seed,
+        "every hosted group's handle to see cluster version 2",
+        |c| {
+            (0..ROLES.len() as u64).all(|n| {
+                c.hosted_group_features(n)
+                    .iter()
+                    .all(|f| f.cluster_version() == 2)
+            })
+        },
+    );
+}
+
+#[test]
+fn every_hosted_group_runs_on_its_nodes_control_fed_feature_handle() {
+    for seed in seeds() {
+        run_hosted_groups_share_the_nodes_handle(seed);
+    }
+}
+
+fn run_violation_levels_are_exported(seed: u64) {
+    let cluster = new_cluster(seed);
+    let f = cluster.features(1);
+    let all = [
+        (GateSurface::RaftMsg, Metric::ClusterGateViolationsRaftMsg),
+        (
+            GateSurface::MetaCommand,
+            Metric::ClusterGateViolationsMetaCommand,
+        ),
+        (GateSurface::KvWire, Metric::ClusterGateViolationsKvWire),
+        (
+            GateSurface::KvCommand,
+            Metric::ClusterGateViolationsKvCommand,
+        ),
+        (
+            GateSurface::ClientRequest,
+            Metric::ClusterGateViolationsClientRequest,
+        ),
+        (
+            GateSurface::ClientResponse,
+            Metric::ClusterGateViolationsClientResponse,
+        ),
+    ];
+    for (_, m) in all {
+        assert_eq!(cluster.metric(1, m), 0, "seed={seed}: {m:?} starts at 0");
+    }
+    // `check` counts BEFORE its `debug_assert!`, so the counter moves in both
+    // build profiles; the panic of a debug build is caught here.
+    for (i, (surface, _)) in all.iter().enumerate() {
+        for _ in 0..=i {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                f.check(*surface, Gate::Era)
+            }));
+        }
+    }
+    for (i, (surface, metric)) in all.iter().enumerate() {
+        assert_eq!(f.violations(*surface), i as u64 + 1);
+        assert_eq!(
+            cluster.metric(1, *metric),
+            i as u64 + 1,
+            "seed={seed}: {metric:?} is not the surface's counter"
+        );
+        // Per-node: another node's levels are its own.
+        assert_eq!(
+            cluster.metric(0, *metric),
+            0,
+            "seed={seed}: {metric:?} leaked"
+        );
+    }
+}
+
+#[test]
+fn gate_violation_counters_are_exported_per_surface_as_metrics() {
+    for seed in seeds() {
+        run_violation_levels_are_exported(seed);
     }
 }
