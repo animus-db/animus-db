@@ -12111,3 +12111,11 @@ a 503 `ServiceUnavailable` whose message starts `StorageFull:` and ends
 `storage_full` field. `sim_cluster_admin`'s NOT_A_METRIC list no longer holds
 `overload_storage_full`; `storage_full` stays (it is a JSON field, not a metric)
 and `spawned_task_panics` stays (still not exported).
+
+## `sim_cluster_split_relocation` (issue #1229)
+
+`sim_cluster_split_relocation.rs`: 6-node RF 3 `SimCluster`, auto-split, child moved
+wholesale off the parent's replicas by directed Placing; every pre-split key must
+read back (`ConsistentRead`). Two cells (`MemoryEngine`; `LsmEngine` + rotating
+crash/restart). `ANIMUS_SPLIT_RELOCATION_SEEDS=K`, `ANIMUS_SEED=<s>`. Nightly at 20.
+See `crates/animus-cp-data/CLAUDE.md` for the root cause.

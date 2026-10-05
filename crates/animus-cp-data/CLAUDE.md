@@ -3183,3 +3183,13 @@ tolerates ENOSPC). The `persist` field on `RaftKvNode` exposes the progress
 handle. A non-ENOSPC failure stays `assert!(halted)`. Gap: engine-side ENOSPC
 (LSM flush/compaction, apply-time `merge_batch`) is NOT handled; the corpus
 runs `MemoryEngine` only. See `docs/resource-bounds.md` section 3.
+
+## A split child's log does not reproduce its engine (issue #1229)
+
+A fork child's engine is cloned from the parent's, so its pre-fork rows are in no
+log entry. `RaftKvNode`'s driver reads the durable split-trim marker at start and
+calls `RaftCore::set_log_omits_base(true)`; while the leader's `snapshot_index` is 0
+it then sends a *learner* no log (it raises `snapshot_needed` instead, so the engine
+image is built and shipped). Never route a new replica of a fork child through log
+replay. Regression: `animusd` `sim_cluster_split_relocation`. ADR 0058's
+2026-10-05 amendment; lesson `docs/lessons/code-patterns/2026-10-05-state-seeded-outside-the-log-needs-a-snapshot-for-every-new-replica.md`.
