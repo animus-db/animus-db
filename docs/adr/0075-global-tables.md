@@ -904,3 +904,67 @@ yet. Decisions that differ from, or pin down, sections 4 and 8 above (the plan
   as `GlobalTables`, and `MrecReplication` is the MREC gate (it will also cover the
   intra replication frames M3 adds, which are cross-node variants and get their own
   `required_gate` row then).
+
+## Amendment (2026-10-05): G-d M2 as built (last-writer-wins apply)
+
+M2 gives the M1 shapes their semantics; nothing emits `WriteSchema.mrec` or
+`KindEvalOp::Replicate` from the wire yet (M4), so every existing table is
+byte-identical and the work is driven by tests.
+
+- **The stamp rule (local writes).** A write to a table whose entry carries
+  `WriteSchema.mrec { region_id, wall_ms }` stamps its base row at apply:
+  `MrecVersion::next_local(stored, wall_ms, region_id)` = `wall = max(wall_ms,
+  stored.wall_ms)`, `logical = 0` when `wall_ms` is strictly ahead of the stored
+  stamp and `stored.logical + 1` otherwise (a `u32` overflow bumps the wall part), the
+  local `region_id`. It is **strictly greater than the stored stamp whatever its
+  region id**, so a local write made after observing a remote one beats it
+  (causality per item, also under a slow or skewed local clock), and it is a pure
+  function of `(entry, stored row)`, so every replica writes identical bytes. A delete
+  writes a *versioned tombstone*. An unversioned row (a pre-conversion row, or a
+  restored/imported one) compares as `MrecVersion::ZERO`.
+- **The LWW rule (replicated writes).** `KindEvalOp::Replicate { item, ver }` is
+  unconditional (a condition that rides anyway is ignored). It applies **iff
+  `ver > stored`** (strict: equal is an idempotent re-delivery), through the ordinary
+  `derive_kind_writes` path, so LSI rows, the change record with images, Streams and
+  PITR see it like any local write, and `ver` is written verbatim. Otherwise the
+  entry applies as a no-op that writes **nothing, not even a change record**, and the
+  leader-local result says `superseded` (`KindEvalResult::superseded`,
+  `KindEvalItemResult::Superseded`, animusd's `KindEvalApplied::Superseded`; the
+  replicated outcome stays `Applied`, so nothing about the replicated slot maps
+  changed). A `Replicate` whose entry has `mrec: None` is a deterministic rejection
+  (never a versioned row on a non-MREC table).
+- **Intents.** A key holding a foreign transaction intent already yields the entry's
+  `ConditionFailed` outcome for every op; for a `Replicate`, which carries no
+  condition, that outcome can only mean "intent on the key", and is the shipper's
+  `Retry` (no separate outcome variant was added). Transactions are region-local:
+  every Dynamo transaction write is a `pending` write evaluated by `evaluate_kind_eval`
+  at `TxnStage` apply, so it is **stamped at stage** from the stored stamp and the
+  stage entry's `mrec.wall_ms`; because an intent blocks both local and replicated
+  writes to the key until resolve, nothing can change the stored stamp between stage
+  and resolve, so stage-time stamping is exact (no re-stamping at `TxnResolve`). A
+  `Replicate` staged in a transaction is a validation rejection.
+- **TTL.** The reaper's delete is an ordinary local `Delete`; its proposer (M4) puts
+  the **expiry instant** in `mrec.wall_ms`, and `max(wall_ms, stored.wall_ms)` keeps it
+  causal. No apply special case.
+- **Writer audit and structural guards.** The base-row writers of an MREC table are:
+  `KindEval`/`KindEvalBatch`/`TxnStage` (stamped), the TTL reaper (a `KindEval`), and
+  the edge-valued writers that cannot stamp: the Dynamo fast arms and the raw client
+  protocol. Those are closed structurally: `table_change_records_carry_images` is
+  `true` for an MREC table (so the fast arms are never taken), `marker_batch_write_raw`
+  refuses an MREC table, and `cp_txn` refuses a non-`pending` write to one. Restore
+  and import write into a freshly created table (unversioned rows, `ZERO`); the M4
+  convert must refuse a table that is still restoring/importing. Backfill/seed copies
+  write derived GSI rows and markers, never base rows.
+- **Evidence.** `animus-cp-data/src/mrec_props.rs`: a pure convergence proptest
+  (random interleavings of local writes and deliveries, then every record to every
+  region in random order with duplication; all regions byte-identical, equal to the
+  max-version record per key, no resurrection, causality, idempotence) with two
+  negative controls that must be caught (arrival-order LWW, a dropped region
+  tiebreak); `tests/it/mrec_apply.rs`: the same rule through the real apply arms over
+  a 3-replica Raft group; `ANIMUS_MREC_PROP_CASES=K` (default 256).
+- **For later milestones.** M3's receiver handler maps the leader-local results to
+  the per-record `Applied`/`Superseded`/`Retry`/`Rejected` answers; `ProbeIdentity::
+  ValueProves` confirm fallbacks decode a versioned row correctly but are weak for a
+  replicate (value equality does not prove *this* entry won), so the receiver must use
+  `RequiresOwnEntry`.
+

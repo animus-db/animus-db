@@ -12185,3 +12185,15 @@ sim_world`, `ANIMUS_SIMWORLD_SEEDS=K`): N independent `SimCluster`s, each its ow
 `PeerClient` trait seam. Drive it only through `SimWorld` methods (`dynamo`,
 `peer_call`, `drive`, `run_for`), never a member cluster's own `run_for`/`dynamo`.
 See `docs/lessons/testing/2026-10-05-multi-cluster-sim-is-two-simulators-in-lockstep.md`.
+
+## MREC writer guards (G-01 stage G-d M2)
+
+An MREC table's base row is stamped at apply, so no edge-valued writer may touch it:
+`dynamo::table_change_records_carry_images` is `true` for an MREC table (the
+`fast_marker_write`/`marker_batch_write` arms are never taken), `marker_batch_write_raw`
+refuses one, and `cp_txn` refuses its non-`pending` writes (the raw client `Put`/
+`PutBatch`/`Delete`/`Txn`). **Every `write_schema_for` call site (3 in `dynamo.rs`, 1 in
+`txn_coordinator.rs`) must set `mrec` once M4 emits it**, and the TTL reaper's must carry
+the expiry instant as `wall_ms`. `KindEvalApplied::Superseded` is the replicate's lost-LWW
+result (unused until the M3 receiver handler). Pinned by `mrec_writer_guard_tests.rs`.
+

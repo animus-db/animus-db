@@ -3224,6 +3224,19 @@ replay. Regression: `animusd` `sim_cluster_split_relocation`. ADR 0058's
   (no binary codec bump, wire stays v1, WAL v2). `KvCommand::required_gate` is
   **content-dependent** for those three carriers (`gates.rs::eval_gate`: MREC content
   joins to `Gate::MrecReplication`), enforced at the one `gated_propose` choke point;
-  `evaluate_kind_eval` rejects a `Replicate` deterministically until M2 gives it LWW
-  apply semantics. Shaped fixtures `raftkv-wire/v1-mrec.bin`, `raftkv-wal/v2-mrec.bin`
+  `evaluate_kind_eval` gives a `Replicate` its LWW semantics (M2, below). Shaped fixtures `raftkv-wire/v1-mrec.bin`, `raftkv-wal/v2-mrec.bin`
   (built by `codec::tests::mrec_sample_wires`; `fixture_files` skips `vN-<shape>` names).
+
+- **MREC apply (G-01 stage G-d M2, ADR 0075 amendment).** `evaluate_kind_eval` takes
+  the stored stamp (`decode_stored_item_versioned`; the `KindEvalBatch` overlay carries
+  it too). `KindEvalOp::Replicate` applies iff `ver > stored` via the normal
+  `derive_kind_writes` path, else `KindEvalDecision::Superseded` (no writes, not even a
+  change record; leader-local `KindEvalResult::superseded` /
+  `KindEvalItemResult::Superseded`, the replicated outcome stays `Applied`); a key with
+  an intent gives `ConditionFailed` (the shipper's Retry); `mrec: None` rejects. A local
+  op with `WriteSchema.mrec` stamps via `MrecVersion::next_local`. A `Replicate` in a
+  `TxnStage` is rejected before evaluation. Tests: `src/mrec_props.rs` (pure convergence
+  proptest + two negative controls, `ANIMUS_MREC_PROP_CASES`), `tests/it/mrec_apply.rs`
+  (a group opened with `HostedOptions { features }` at cluster version 3: the propose
+  gate panics in tests otherwise). **Adding a base-row writer for an MREC table means
+  stamping it** (see the ADR's writer audit).

@@ -231,3 +231,6 @@ returns just the item and an unversioned row decodes unchanged with no stamp (co
 as `MrecVersion::ZERO`). `write_schema.rs`: `WriteSchema.mrec: Option<MrecWriteStamp>`
 (additive, skipped when `None`, class G). Shaped fixtures `stored-item/v1-versioned*.json`
 (the loader skips `vN-<shape>` files; `versioned_stored_item_shape_fixtures_...` reads them).
+M2 adds the pure arithmetic: `MrecVersion::next_local(stored, wall_ms, region_id)` (strictly
+above the stored stamp, deterministic: the stamp every replica computes at apply) and
+`MrecVersion::supersedes(stored)` (the strict `>` LWW test; `None` is `ZERO`).
