@@ -117,7 +117,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             .map_err(TxnAbortReason::Other)?;
         if !pending_kind_writes.is_empty() {
             let meta = self.effective_metadata();
-            let schema = dynamo::write_schema_for(&meta, table);
+            let mut schema = dynamo::write_schema_for(&meta, table);
+            // ADR 0075 V14: a transaction on an MREC table is region-local; its
+            // rows carry the same last-writer-wins stamp as any other write.
+            schema.mrec = dynamo::mrec_write_stamp(&meta, table, self.env.wall_now().0);
             // Both halves of the throttle pre-charge below are loop-invariant:
             // they depend only on `meta` (just snapshotted) and `table` (fixed
             // for this call), never on the per-item key. Hoisted so a 100-action

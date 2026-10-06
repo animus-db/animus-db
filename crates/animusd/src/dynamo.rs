@@ -9571,6 +9571,20 @@ pub(crate) async fn kind_write_item_at_leader<E: Env, R: RelayClient>(
     let mut schema = write_schema_for(meta, table);
     // G-d M4: stamp an MREC table's write (inert for a regional table).
     schema.mrec = mrec_write_stamp(meta, table, ctx.env.wall_now().0);
+    // ADR 0075 4.6 / V15: the TTL reaper's delete is stamped at the item's
+    // expiry instant (the reaper's condition pins the TTL attribute to its
+    // epoch-second value), so every region's concurrent reap is the same
+    // tombstone modulo region id. Apply takes max(stamp, stored), so an item
+    // rewritten after expiry is never lost to it.
+    if ttl_expired
+        && let Some(stamp) = schema.mrec.as_mut()
+        && let Some(ConditionExpression::Compare(_, _, AttributeValue::N(n))) = condition
+        && let Ok(secs) = n.parse::<f64>()
+        && secs.is_finite()
+        && secs >= 0.0
+    {
+        stamp.wall_ms = ((secs * 1000.0) as u64).min(stamp.wall_ms);
+    }
     let eval_op = kind_write_op_to_eval_op(op);
     // Turbofish required (ADR 0061 rung C5 step 3a): `cp_kind_eval_local`
     // takes no `self`/`R`-typed argument, so nothing here pins down `R` for
