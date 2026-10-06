@@ -52,6 +52,19 @@ fn decode_items(item: &Value) -> Vec<u64> {
         .unwrap_or_default()
 }
 
+/// One `ConsistentRead: false` observation, with enough context to tell a
+/// permanently diverged replica from a transient read anomaly: which node
+/// the client asked (the node serves from its own replica when it can, else
+/// forwards to another replica, so this bounds the serving replica to
+/// "this node or a peer") and when (ns since the run started).
+#[derive(Clone, Debug)]
+pub struct EventualRead {
+    pub key: Key,
+    pub list: Vec<u64>,
+    pub node: SocketAddr,
+    pub at_ns: u64,
+}
+
 /// A two-key transaction's appends, for the atomicity check.
 #[derive(Clone, Debug)]
 pub struct TxnPair {
@@ -77,7 +90,7 @@ pub struct Stats {
 pub struct Shared {
     pub seed: u64,
     pub rec: Mutex<Recorder>,
-    pub eventual: Mutex<Vec<(Key, Vec<u64>)>>,
+    pub eventual: Mutex<Vec<EventualRead>>,
     pub txns: Mutex<Vec<TxnPair>>,
     pub trace: Mutex<Vec<String>>,
     /// `ANIMUS_CHAOS_TXN=0` drops the multi-key transaction ops (bisecting aid).
@@ -264,7 +277,12 @@ async fn run_get(sh: &Shared, proc: Process, key: Key, consistent: bool, node: S
             }
         }
         (false, Some(l)) => {
-            sh.eventual.lock().expect("eventual").push((key, l));
+            sh.eventual.lock().expect("eventual").push(EventualRead {
+                key,
+                list: l,
+                node,
+                at_ns: sh.now(),
+            });
             sh.stats.eventual_reads.fetch_add(1, Ordering::Relaxed);
         }
         (false, None) => {}
@@ -441,6 +459,76 @@ pub async fn final_read(
     ))
 }
 
+/// A `ConsistentRead: false` read of `key` through `node` (which serves it
+/// from its own replica when that replica passes the freshness gate). `None`
+/// when the node did not answer cleanly.
+pub async fn eventual_read(node: SocketAddr, key: Key) -> Option<Vec<ListVal>> {
+    let body = json!({"ConsistentRead": false, "TableName": TABLE, "Key": pk(key)}).to_string();
+    match dynamo_call(node, "GetItem", &body, Duration::from_secs(10)).await {
+        Ok((200, b)) => serde_json::from_str::<Value>(&b)
+            .ok()
+            .map(|v| v.get("Item").map(decode_items).unwrap_or_default()),
+        _ => None,
+    }
+}
+
+/// One (node, key) whose own eventual read never reached the final state.
+pub struct Divergence {
+    pub node: usize,
+    pub addr: SocketAddr,
+    pub key: Key,
+    pub lacks: Vec<u64>,
+    pub extra: Vec<u64>,
+}
+
+impl Divergence {
+    /// The full violation line (the failure artifact `violations.txt`).
+    pub fn violation(&self, budget: Duration) -> String {
+        format!(
+            "[replica-convergence] node n{} ({}) key {}: eventual read did not converge to the \
+             final state within {budget:?}; lacks {:?}, extra {:?}",
+            self.node, self.addr, self.key, self.lacks, self.extra
+        )
+    }
+}
+
+/// Post-heal replica-convergence probe: after everything is healed and the
+/// final state is known, every node's own eventual read of every key must
+/// converge to that final state within `budget`. A node that stays different
+/// is a **permanently diverged replica**, which this separates from a
+/// transient read anomaly (a stale read that later catches up passes).
+pub async fn replica_convergence(
+    nodes: &[SocketAddr],
+    fin: &BTreeMap<Key, Vec<ListVal>>,
+    budget: Duration,
+) -> Vec<Divergence> {
+    let mut out = Vec::new();
+    for (i, node) in nodes.iter().enumerate() {
+        for (key, want) in fin {
+            let deadline = Instant::now() + budget;
+            let mut last: Option<Vec<ListVal>> = None;
+            loop {
+                last = eventual_read(*node, *key).await.or(last);
+                if last.as_ref() == Some(want) || Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            if last.as_ref() != Some(want) {
+                let got = last.unwrap_or_default();
+                out.push(Divergence {
+                    node: i,
+                    addr: *node,
+                    key: *key,
+                    lacks: want.iter().copied().filter(|v| !got.contains(v)).collect(),
+                    extra: got.iter().copied().filter(|v| !want.contains(v)).collect(),
+                });
+            }
+        }
+    }
+    out
+}
+
 /// Post-heal availability probe: a write plus a consistent read-back through
 /// `node` (its own probe key, outside the checked history). Returns the time
 /// it took to first succeed.
@@ -481,6 +569,12 @@ pub async fn probe_available(
 
 pub struct Verdict {
     pub violations: Vec<String>,
+    /// One structured record per `[eventual-prefix]` violation, for the
+    /// compact failure summary (the full lists live in `violations`).
+    pub prefix: Vec<PrefixViolation>,
+    /// The recorded history's writer index, so a caller can classify any set
+    /// of values by who wrote them (see [`Verdict::classes`]).
+    writers: BTreeMap<u64, Writer>,
     pub reports: Vec<(&'static str, CheckReport)>,
 }
 
@@ -495,6 +589,8 @@ pub fn run_oracles(
     let mut history = sh.rec.lock().expect("recorder").history().clone();
     let mut verdict = Verdict {
         violations: Vec::new(),
+        prefix: Vec::new(),
+        writers: BTreeMap::new(),
         reports: Vec::new(),
     };
     let seed = sh.seed;
@@ -543,12 +639,57 @@ pub fn run_oracles(
         verdict.reports.push((name, r));
     }
 
-    // Eventual reads must be prefixes of the converged state.
-    for (k, l) in sh.eventual.lock().expect("eventual").iter() {
-        let fin = final_a.get(k).cloned().unwrap_or_default();
-        if !fin.starts_with(l) {
+    // Eventual reads must be prefixes of the converged state. A violation
+    // names the node asked and the read time, and classifies every value the
+    // read lacks (or has out of place) by the op that wrote it, so one failing
+    // run says whether the lost values are transaction halves, plain
+    // `UpdateItem`s, acked or indeterminate, and when they were written.
+    let writers = writer_index(&history);
+    for r in sh.eventual.lock().expect("eventual").iter() {
+        let fin = final_a.get(&r.key).cloned().unwrap_or_default();
+        if !fin.starts_with(&r.list) {
+            let missing: Vec<u64> = fin
+                .iter()
+                .copied()
+                .take_while(|v| *v <= r.list.last().copied().unwrap_or(0))
+                .filter(|v| !r.list.contains(v))
+                .collect();
+            let extra: Vec<u64> = r
+                .list
+                .iter()
+                .copied()
+                .filter(|v| !fin.contains(v))
+                .collect();
+            let describe = |v: &u64| match writers.get(v) {
+                Some(w) => format!(
+                    "{v}={}{}@{:.2}s..{}",
+                    if w.txn { "txn" } else { "single" },
+                    w.outcome,
+                    w.invoked_ns as f64 / 1e9,
+                    w.done_ns
+                        .map_or("?".to_owned(), |d| format!("{:.2}s", d as f64 / 1e9)),
+                ),
+                None => format!("{v}=unknown-writer"),
+            };
+            verdict.prefix.push(PrefixViolation {
+                key: r.key,
+                node: r.node,
+                at_s: r.at_ns as f64 / 1e9,
+                lacks: missing.clone(),
+                extra: extra.clone(),
+            });
             verdict.violations.push(format!(
-                "[eventual-prefix] key {k}: eventual read {l:?} is not a prefix of final {fin:?}"
+                "[eventual-prefix] key {k}: eventual read via {node} at t={t:.2}s is not a prefix \
+                 of final; lacks {nm} value(s) [{miss}], has {ne} value(s) absent from final \
+                 [{extra}]; read {l:?}; final {fin:?}",
+                k = r.key,
+                node = r.node,
+                t = r.at_ns as f64 / 1e9,
+                nm = missing.len(),
+                miss = missing.iter().map(describe).collect::<Vec<_>>().join(", "),
+                ne = extra.len(),
+                extra = extra.iter().map(describe).collect::<Vec<_>>().join(", "),
+                l = r.list,
             ));
         }
     }
@@ -564,7 +705,105 @@ pub fn run_oracles(
             ));
         }
     }
+    verdict.writers = writers;
     (history, verdict)
+}
+
+/// One `[eventual-prefix]` violation, structured.
+pub struct PrefixViolation {
+    pub key: Key,
+    pub node: SocketAddr,
+    pub at_s: f64,
+    pub lacks: Vec<u64>,
+    pub extra: Vec<u64>,
+}
+
+impl Verdict {
+    /// `"txnok=16 singleok=2"`: how many of `vals` each writer class wrote
+    /// (`txn`/`single` x the recorded outcome `ok`/`info`/`fail`/`pending`).
+    pub fn classes(&self, vals: &[u64]) -> String {
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        for v in vals {
+            let class = match self.writers.get(v) {
+                Some(w) => format!("{}{}", if w.txn { "txn" } else { "single" }, w.outcome),
+                None => "unknown".to_owned(),
+            };
+            *counts.entry(class).or_default() += 1;
+        }
+        if counts.is_empty() {
+            return "-".to_owned();
+        }
+        counts
+            .iter()
+            .map(|(k, n)| format!("{k}={n}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The compact failure summary, one line per violation *group* (kind,
+    /// key, serving node), never the value lists: what the CI annotation
+    /// shows, since a few hundred-element lists would blow its size cap and
+    /// bury the decisive lines (the failing mechanism's shape is in the node,
+    /// the missing count and the writer classes).
+    pub fn summary_lines(&self, divergences: &[Divergence]) -> Vec<String> {
+        let mut out = Vec::new();
+        // [eventual-prefix]: group by (key, node).
+        let mut groups: BTreeMap<(Key, SocketAddr), Vec<&PrefixViolation>> = BTreeMap::new();
+        for v in &self.prefix {
+            groups.entry((v.key, v.node)).or_default().push(v);
+        }
+        for ((key, node), vs) in &groups {
+            let first = vs.iter().map(|v| v.at_s).fold(f64::INFINITY, f64::min);
+            let worst = vs.iter().max_by_key(|v| v.lacks.len()).expect("non-empty");
+            out.push(format!(
+                "[eventual-prefix] key {key} via {node}: {} read(s) not a prefix (first t={first:.1}s); \
+                 worst lacks {} [{}] has {} absent from final [{}]",
+                vs.len(),
+                worst.lacks.len(),
+                self.classes(&worst.lacks),
+                worst.extra.len(),
+                self.classes(&worst.extra),
+            ));
+        }
+        // Everything else: the violation's own first line, trimmed, with
+        // repeats counted.
+        let mut other: BTreeMap<String, usize> = BTreeMap::new();
+        for v in &self.violations {
+            if v.starts_with("[eventual-prefix]") || v.starts_with("[replica-convergence]") {
+                continue;
+            }
+            let line: String = v.lines().next().unwrap_or("").chars().take(240).collect();
+            *other.entry(line).or_default() += 1;
+        }
+        for (line, n) in other {
+            out.push(if n > 1 {
+                format!("{line}  (x{n})")
+            } else {
+                line
+            });
+        }
+        // [replica-convergence]: always reported, pass or fail.
+        if divergences.is_empty() {
+            out.push(
+                "[replica-convergence] ok: every node's eventual read of every key reached the \
+                 final state"
+                    .to_owned(),
+            );
+        }
+        for d in divergences {
+            out.push(format!(
+                "[replica-convergence] DIVERGED n{} ({}) key {}: lacks {} [{}] extra {} [{}]",
+                d.node,
+                d.addr,
+                d.key,
+                d.lacks.len(),
+                self.classes(&d.lacks),
+                d.extra.len(),
+                self.classes(&d.extra),
+            ));
+        }
+        out
+    }
 }
 
 fn rec_push(rec: &mut Recorder, e: &animus_test::Entry) {
@@ -574,5 +813,141 @@ fn rec_push(rec: &mut Recorder, e: &animus_test::Entry) {
         Outcome::Ok => rec.ok(e.process, e.time, e.mops.clone()),
         Outcome::Fail => rec.fail(e.process, e.time, e.mops.clone()),
         Outcome::Info => rec.info(e.process, e.time, e.mops.clone()),
+    }
+}
+
+/// Who wrote a value, from the recorded history.
+struct Writer {
+    txn: bool,
+    /// `ok` / `info` / `fail`, as recorded at completion.
+    outcome: &'static str,
+    invoked_ns: u64,
+    done_ns: Option<u64>,
+}
+
+/// value -> its writing op (a two-append entry is a `TransactWriteItems`).
+/// Values are globally unique, so the map is exact.
+fn writer_index(history: &History) -> BTreeMap<u64, Writer> {
+    use animus_test::Outcome;
+    let mut out: BTreeMap<u64, Writer> = BTreeMap::new();
+    // One client runs one op at a time, so the open invoke per process is the
+    // op the next terminal entry of that process completes.
+    let mut open: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    for e in &history.entries {
+        let appends: Vec<u64> = e
+            .mops
+            .iter()
+            .filter_map(|m| match m {
+                Mop::Append { value, .. } => Some(*value),
+                Mop::Read { .. } => None,
+            })
+            .collect();
+        match e.outcome {
+            Outcome::Invoke => {
+                open.insert(e.process, appends.clone());
+                for v in appends {
+                    out.insert(
+                        v,
+                        Writer {
+                            txn: e.mops.len() > 1,
+                            outcome: "pending",
+                            invoked_ns: e.time,
+                            done_ns: None,
+                        },
+                    );
+                }
+            }
+            Outcome::Ok | Outcome::Info | Outcome::Fail => {
+                if let Some(vals) = open.remove(&e.process) {
+                    let name = match e.outcome {
+                        Outcome::Ok => "ok",
+                        Outcome::Info => "info",
+                        _ => "fail",
+                    };
+                    for v in vals {
+                        if let Some(w) = out.get_mut(&v) {
+                            w.outcome = name;
+                            w.done_ns = Some(e.time);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+
+    fn writer(txn: bool, outcome: &'static str) -> Writer {
+        Writer {
+            txn,
+            outcome,
+            invoked_ns: 1_000_000_000,
+            done_ns: Some(2_000_000_000),
+        }
+    }
+
+    /// A failing run's annotation must show the decisive facts in a few lines,
+    /// not the (hundreds of values long) read and final lists.
+    #[test]
+    fn summary_is_compact_and_classified() {
+        let node: SocketAddr = "127.0.0.1:20438".parse().unwrap();
+        let mut writers = BTreeMap::new();
+        for v in 0..16u64 {
+            writers.insert(v, writer(true, "ok"));
+        }
+        writers.insert(100, writer(false, "ok"));
+        let prefix = |at_s: f64, lacks: Vec<u64>| PrefixViolation {
+            key: 0,
+            node,
+            at_s,
+            lacks,
+            extra: Vec::new(),
+        };
+        let verdict = Verdict {
+            violations: vec![
+                format!("[eventual-prefix] key 0: {}", "x".repeat(5000)),
+                "[txn-atomicity] one half".to_owned(),
+            ],
+            prefix: vec![
+                prefix(10.0, (0..16).collect()),
+                prefix(20.0, vec![100]),
+                prefix(30.0, (0..4).collect()),
+            ],
+            writers,
+            reports: Vec::new(),
+        };
+        let lines = verdict.summary_lines(&[Divergence {
+            node: 1,
+            addr: node,
+            key: 6,
+            lacks: (0..3).collect(),
+            extra: Vec::new(),
+        }]);
+        let all = lines.join("\n");
+        assert!(all.len() < 900, "compact, got {} chars:\n{all}", all.len());
+        // One group line for the three reads of (key 0, node), worst = 16.
+        let groups: Vec<_> = lines
+            .iter()
+            .filter(|l| l.starts_with("[eventual-prefix]"))
+            .collect();
+        assert_eq!(groups.len(), 1, "{all}");
+        assert!(groups[0].contains("3 read(s)"), "{all}");
+        assert!(groups[0].contains("first t=10.0s"), "{all}");
+        assert!(groups[0].contains("worst lacks 16 [txnok=16]"), "{all}");
+        assert!(all.contains("[txn-atomicity] one half"), "{all}");
+        assert!(all.contains("[replica-convergence] DIVERGED n1"), "{all}");
+        assert!(all.contains("[txnok=3]"), "{all}");
+        // A clean convergence is still reported.
+        let clean = verdict.summary_lines(&[]);
+        assert!(
+            clean
+                .iter()
+                .any(|l| l.starts_with("[replica-convergence] ok")),
+            "{clean:?}"
+        );
     }
 }
