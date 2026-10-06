@@ -52,6 +52,19 @@ fn decode_items(item: &Value) -> Vec<u64> {
         .unwrap_or_default()
 }
 
+/// One `ConsistentRead: false` observation, with enough context to tell a
+/// permanently diverged replica from a transient read anomaly: which node
+/// the client asked (the node serves from its own replica when it can, else
+/// forwards to another replica, so this bounds the serving replica to
+/// "this node or a peer") and when (ns since the run started).
+#[derive(Clone, Debug)]
+pub struct EventualRead {
+    pub key: Key,
+    pub list: Vec<u64>,
+    pub node: SocketAddr,
+    pub at_ns: u64,
+}
+
 /// A two-key transaction's appends, for the atomicity check.
 #[derive(Clone, Debug)]
 pub struct TxnPair {
@@ -77,7 +90,7 @@ pub struct Stats {
 pub struct Shared {
     pub seed: u64,
     pub rec: Mutex<Recorder>,
-    pub eventual: Mutex<Vec<(Key, Vec<u64>)>>,
+    pub eventual: Mutex<Vec<EventualRead>>,
     pub txns: Mutex<Vec<TxnPair>>,
     pub trace: Mutex<Vec<String>>,
     /// `ANIMUS_CHAOS_TXN=0` drops the multi-key transaction ops (bisecting aid).
@@ -264,7 +277,12 @@ async fn run_get(sh: &Shared, proc: Process, key: Key, consistent: bool, node: S
             }
         }
         (false, Some(l)) => {
-            sh.eventual.lock().expect("eventual").push((key, l));
+            sh.eventual.lock().expect("eventual").push(EventualRead {
+                key,
+                list: l,
+                node,
+                at_ns: sh.now(),
+            });
             sh.stats.eventual_reads.fetch_add(1, Ordering::Relaxed);
         }
         (false, None) => {}
@@ -441,6 +459,57 @@ pub async fn final_read(
     ))
 }
 
+/// A `ConsistentRead: false` read of `key` through `node` (which serves it
+/// from its own replica when that replica passes the freshness gate). `None`
+/// when the node did not answer cleanly.
+pub async fn eventual_read(node: SocketAddr, key: Key) -> Option<Vec<ListVal>> {
+    let body = json!({"ConsistentRead": false, "TableName": TABLE, "Key": pk(key)}).to_string();
+    match dynamo_call(node, "GetItem", &body, Duration::from_secs(10)).await {
+        Ok((200, b)) => serde_json::from_str::<Value>(&b)
+            .ok()
+            .map(|v| v.get("Item").map(decode_items).unwrap_or_default()),
+        _ => None,
+    }
+}
+
+/// Post-heal replica-convergence probe: after everything is healed and the
+/// final state is known, every node's own eventual read of every key must
+/// converge to that final state within `budget`. A node that stays different
+/// is a **permanently diverged replica**, which this separates from a
+/// transient read anomaly (a stale read that later catches up passes).
+/// Returns one violation line per (node, key) that never converged, naming
+/// both lists' differences.
+pub async fn replica_convergence(
+    nodes: &[SocketAddr],
+    fin: &BTreeMap<Key, Vec<ListVal>>,
+    budget: Duration,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for (i, node) in nodes.iter().enumerate() {
+        for (key, want) in fin {
+            let deadline = Instant::now() + budget;
+            let mut last: Option<Vec<ListVal>> = None;
+            loop {
+                last = eventual_read(*node, *key).await.or(last);
+                if last.as_ref() == Some(want) || Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            if last.as_ref() != Some(want) {
+                let got = last.unwrap_or_default();
+                let lacks: Vec<u64> = want.iter().copied().filter(|v| !got.contains(v)).collect();
+                let extra: Vec<u64> = got.iter().copied().filter(|v| !want.contains(v)).collect();
+                out.push(format!(
+                    "[replica-convergence] node n{i} ({node}) key {key}: eventual read did not \
+                     converge to the final state within {budget:?}; lacks {lacks:?}, extra {extra:?}"
+                ));
+            }
+        }
+    }
+    out
+}
+
 /// Post-heal availability probe: a write plus a consistent read-back through
 /// `node` (its own probe key, outside the checked history). Returns the time
 /// it took to first succeed.
@@ -543,12 +612,50 @@ pub fn run_oracles(
         verdict.reports.push((name, r));
     }
 
-    // Eventual reads must be prefixes of the converged state.
-    for (k, l) in sh.eventual.lock().expect("eventual").iter() {
-        let fin = final_a.get(k).cloned().unwrap_or_default();
-        if !fin.starts_with(l) {
+    // Eventual reads must be prefixes of the converged state. A violation
+    // names the node asked and the read time, and classifies every value the
+    // read lacks (or has out of place) by the op that wrote it, so one failing
+    // run says whether the lost values are transaction halves, plain
+    // `UpdateItem`s, acked or indeterminate, and when they were written.
+    let writers = writer_index(&history);
+    for r in sh.eventual.lock().expect("eventual").iter() {
+        let fin = final_a.get(&r.key).cloned().unwrap_or_default();
+        if !fin.starts_with(&r.list) {
+            let missing: Vec<u64> = fin
+                .iter()
+                .copied()
+                .take_while(|v| *v <= r.list.last().copied().unwrap_or(0))
+                .filter(|v| !r.list.contains(v))
+                .collect();
+            let extra: Vec<u64> = r
+                .list
+                .iter()
+                .copied()
+                .filter(|v| !fin.contains(v))
+                .collect();
+            let describe = |v: &u64| match writers.get(v) {
+                Some(w) => format!(
+                    "{v}={}{}@{:.2}s..{}",
+                    if w.txn { "txn" } else { "single" },
+                    w.outcome,
+                    w.invoked_ns as f64 / 1e9,
+                    w.done_ns
+                        .map_or("?".to_owned(), |d| format!("{:.2}s", d as f64 / 1e9)),
+                ),
+                None => format!("{v}=unknown-writer"),
+            };
             verdict.violations.push(format!(
-                "[eventual-prefix] key {k}: eventual read {l:?} is not a prefix of final {fin:?}"
+                "[eventual-prefix] key {k}: eventual read via {node} at t={t:.2}s is not a prefix \
+                 of final; lacks {nm} value(s) [{miss}], has {ne} value(s) absent from final \
+                 [{extra}]; read {l:?}; final {fin:?}",
+                k = r.key,
+                node = r.node,
+                t = r.at_ns as f64 / 1e9,
+                nm = missing.len(),
+                miss = missing.iter().map(describe).collect::<Vec<_>>().join(", "),
+                ne = extra.len(),
+                extra = extra.iter().map(describe).collect::<Vec<_>>().join(", "),
+                l = r.list,
             ));
         }
     }
@@ -575,4 +682,65 @@ fn rec_push(rec: &mut Recorder, e: &animus_test::Entry) {
         Outcome::Fail => rec.fail(e.process, e.time, e.mops.clone()),
         Outcome::Info => rec.info(e.process, e.time, e.mops.clone()),
     }
+}
+
+/// Who wrote a value, from the recorded history.
+struct Writer {
+    txn: bool,
+    /// `ok` / `info` / `fail`, as recorded at completion.
+    outcome: &'static str,
+    invoked_ns: u64,
+    done_ns: Option<u64>,
+}
+
+/// value -> its writing op (a two-append entry is a `TransactWriteItems`).
+/// Values are globally unique, so the map is exact.
+fn writer_index(history: &History) -> BTreeMap<u64, Writer> {
+    use animus_test::Outcome;
+    let mut out: BTreeMap<u64, Writer> = BTreeMap::new();
+    // One client runs one op at a time, so the open invoke per process is the
+    // op the next terminal entry of that process completes.
+    let mut open: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    for e in &history.entries {
+        let appends: Vec<u64> = e
+            .mops
+            .iter()
+            .filter_map(|m| match m {
+                Mop::Append { value, .. } => Some(*value),
+                Mop::Read { .. } => None,
+            })
+            .collect();
+        match e.outcome {
+            Outcome::Invoke => {
+                open.insert(e.process, appends.clone());
+                for v in appends {
+                    out.insert(
+                        v,
+                        Writer {
+                            txn: e.mops.len() > 1,
+                            outcome: "pending",
+                            invoked_ns: e.time,
+                            done_ns: None,
+                        },
+                    );
+                }
+            }
+            Outcome::Ok | Outcome::Info | Outcome::Fail => {
+                if let Some(vals) = open.remove(&e.process) {
+                    let name = match e.outcome {
+                        Outcome::Ok => "ok",
+                        Outcome::Info => "info",
+                        _ => "fail",
+                    };
+                    for v in vals {
+                        if let Some(w) = out.get_mut(&v) {
+                            w.outcome = name;
+                            w.done_ns = Some(e.time);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
 }

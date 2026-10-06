@@ -168,6 +168,37 @@ async fn run_scenario(scn: Scenario) -> Outcome {
         }
     }
 
+    // ---- replica convergence (diagnostic) ----------------------------
+    // Every node's own eventual read must reach the final state: a node that
+    // never does holds a permanently diverged replica (as opposed to one
+    // stale read that later caught up).
+    violations.extend(workload::replica_convergence(&nodes, &fin_a, Duration::from_secs(20)).await);
+
+    // ---- node counters (diagnostic) ------------------------------------
+    // Which recovery paths this run actually took (a snapshot install, a
+    // merge that silently took no effect, a failure-detector flap), so a red
+    // run names the mechanism it exercised instead of leaving it to a guess.
+    let mut counter_lines: Vec<String> = Vec::new();
+    for i in 0..n {
+        let c = cluster
+            .counters(
+                i,
+                &[
+                    "snapshot",
+                    "no_effect",
+                    "failure_detector",
+                    "txn_",
+                    "elections_won",
+                    "needs_snapshot",
+                ],
+            )
+            .await;
+        counter_lines.push(format!("n{i}: {}", c.join(" ")));
+    }
+    for l in &counter_lines {
+        eprintln!("chaos[{}]: counters {l}", scn.name());
+    }
+
     // ---- oracles -----------------------------------------------------
     let (history, verdict) = workload::run_oracles(&shared, &fin_a, &fin_b);
     violations.extend(verdict.violations);
@@ -213,6 +244,7 @@ async fn run_scenario(scn: Scenario) -> Outcome {
             shared.trace.lock().expect("trace").join("\n"),
         );
         let _ = std::fs::write(out_dir.join("violations.txt"), violations.join("\n"));
+        let _ = std::fs::write(out_dir.join("counters.txt"), counter_lines.join("\n"));
         for i in 0..n {
             let _ = std::fs::copy(cluster.log_path(i), out_dir.join(format!("n{i}.log")));
         }
