@@ -712,7 +712,7 @@ impl StorageScope {
         rows.map(|rows| {
             rows.iter().any(|(k, _)| {
                 self.strip_in_range(k)
-                    .is_some_and(|logical| !txn::is_record_key(logical))
+                    .is_some_and(|logical| !txn::is_internal_key(logical))
             })
         })
         .unwrap_or(false)
@@ -2094,66 +2094,6 @@ struct TxnTracker {
     /// read-path push, ADR 0018 §2/PR5 §3) — only background promptness is
     /// (very slightly) weaker in that residual case.
     unresolved_decided: BTreeMap<TxnId, (Vec<u8>, txn::TxnOutcome)>,
-    /// `physical_key -> txn_id`: the transaction whose intent at this key
-    /// was most recently resolved (`TxnResolve`, commit or abort alike) on
-    /// THIS group — populated for every participant that applies a
-    /// resolve, anchor or not, unlike `pending`/`unresolved_decided` above
-    /// (which are anchor-only by construction). A **defensive seatbelt**
-    /// against issue #298 shape A: `KvCommand::TxnStage`'s own `blocked_by`
-    /// check only ever rejects overwriting a *different* transaction's
-    /// still-live `Intent` — it has no way to reject a stage that arrives
-    /// for a key AFTER this exact transaction's own resolve already ran,
-    /// since by then the key is a plain `Committed`/restored value, not an
-    /// `Intent` at all. `KvCommand::TxnStage`'s apply arm checks this map
-    /// by **(key, txn_id) identity**, never presence alone — the same
-    /// discipline `KindBatchOutcome`'s own false-ack fix established for
-    /// "never trust an outcome without confirming it names the SAME
-    /// thing." Bounded (`record_resolution`'s own `RETAIN`), like
-    /// `KindBatchOutcomes`/`StageOutcomes`: purely a best-effort catch, not
-    /// a source of truth — an evicted (or, after a restart, simply never
-    /// rebuilt) entry only means this ONE seatbelt doesn't catch a given
-    /// resurrection attempt, never that a wrong decision gets made from a
-    /// stale one. **Deliberately not rebuilt at group start**
-    /// (`rebuild_txn_tracker`, below) — unlike `pending`/`unresolved_
-    /// decided`, which restore real transaction-lifecycle facts a restart
-    /// must not lose, this map's whole job is catching a stale stage that
-    /// arrives shortly after its own resolve within the SAME uptime window;
-    /// starting it empty after a restart is exactly as safe as any other
-    /// eviction.
-    recently_resolved: BTreeMap<Vec<u8>, TxnId>,
-    /// Insertion order for `recently_resolved`'s bounded FIFO eviction —
-    /// see `record_resolution`.
-    recently_resolved_order: std::collections::VecDeque<(Vec<u8>, TxnId)>,
-}
-
-impl TxnTracker {
-    /// Entries retained behind the newest, mirroring `KindBatchOutcomes::
-    /// RETAIN`'s own "generous next to the realistic poll/retry window,
-    /// while keeping the map small enough to be free" reasoning — a stale
-    /// re-stage this seatbelt exists to catch arrives within a bounded
-    /// retry/timeout window (seconds), never after thousands of intervening
-    /// resolves on the same busy tablet.
-    const RECENTLY_RESOLVED_RETAIN: usize = 4096;
-
-    /// Record that `txn_id`'s intent at `physical_key` was just resolved on
-    /// this group — see `recently_resolved`'s own doc.
-    fn record_resolution(&mut self, physical_key: Vec<u8>, txn_id: TxnId) {
-        self.recently_resolved
-            .insert(physical_key.clone(), txn_id.clone());
-        self.recently_resolved_order
-            .push_back((physical_key, txn_id));
-        while self.recently_resolved_order.len() > Self::RECENTLY_RESOLVED_RETAIN {
-            let Some((old_key, old_txn_id)) = self.recently_resolved_order.pop_front() else {
-                break;
-            };
-            // Only remove if it's still THIS eviction's own entry — a
-            // later resolution of the same key (a different, newer
-            // txn_id) must never be evicted by an older entry's turn.
-            if self.recently_resolved.get(&old_key) == Some(&old_txn_id) {
-                self.recently_resolved.remove(&old_key);
-            }
-        }
-    }
 }
 
 /// The committed value `physical_key` holds right now, as the `prior` a
@@ -5820,7 +5760,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     ) -> Vec<(Vec<u8>, Vec<u8>)> {
         let mut out = Vec::with_capacity(rows.len());
         for (key, vv) in rows {
-            if txn::is_record_key(&key) {
+            if txn::is_internal_key(&key) {
                 continue;
             }
             let physical = self.scope.physical(&key);
@@ -6025,7 +5965,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     ) -> Vec<(Vec<u8>, Vec<u8>)> {
         let mut out = Vec::with_capacity(rows.len());
         for (key, vv) in rows {
-            if txn::is_record_key(&key) {
+            if txn::is_internal_key(&key) {
                 continue;
             }
             let physical = self.scope.physical(&key);
@@ -6176,6 +6116,12 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             .into_iter()
             .filter_map(|(k, vv)| {
                 let logical = scope.strip_in_range(&k)?.to_vec();
+                // Internal rows (txn records, resolved markers) are never
+                // user data, and a marker's value is not an envelope: this
+                // scan feeds backup/export capture of `KIND_BASE`.
+                if kind == KIND_BASE && txn::is_internal_key(&logical) {
+                    return None;
+                }
                 match txn::decode_envelope(&vv.value) {
                     txn::Envelope::Committed(v) => Some((logical, v)),
                     txn::Envelope::Intent { .. } => None,
@@ -6291,7 +6237,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             // every ordinary scan. Checked here, before the `limit` gate,
             // so a marker interleaved in the range never silently consumes
             // one of the caller's requested chunk slots.
-            if txn::is_record_key(logical) {
+            if txn::is_internal_key(logical) {
                 continue;
             }
             if out.len() >= limit {
@@ -9637,18 +9583,31 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // resolved on this group — `blocked_by` above only ever
                 // catches a *different* transaction's still-live `Intent`,
                 // never a same-txn resurrection of an already-`Committed`/
-                // restored value (see `TxnTracker::recently_resolved`'s
-                // doc for the full argument and why checking (key, txn_id)
-                // IDENTITY, not mere presence, is load-bearing here — a
-                // *different*, genuinely later transaction reusing the same
-                // physical key is the ordinary, unrelated write path and
-                // must stage normally).
-                let resurrection_attempt = {
-                    let t = txn_tracker.lock().expect("txn tracker poisoned");
-                    writes
-                        .iter()
-                        .any(|w| t.recently_resolved.get(&scope.physical(&w.key)) == Some(&txn_id))
-                };
+                // restored value. The decision reads the durable
+                // **resolved marker** (`txn::resolved_marker_key`) that
+                // `TxnResolve`'s apply wrote beside the resolve — engine
+                // state, so it is identical on every replica whether it
+                // restarted, installed a snapshot image, or never lost
+                // anything (issue #1243: an in-memory map here made the
+                // same log entry apply differently per replica). Checking
+                // (key, txn_id) IDENTITY, not mere presence, is
+                // load-bearing: a *different*, genuinely later transaction
+                // reusing the same physical key is the ordinary, unrelated
+                // write path and must stage normally.
+                let mut resurrection_attempt = false;
+                for w in &writes {
+                    let marker = storage
+                        .get(&scope.physical(&txn::resolved_marker_key(&w.key)))
+                        .await
+                        .expect("raftkv txn stage resolved-marker read");
+                    if marker
+                        .and_then(|vv| txn::decode_resolved_marker(&vv.value))
+                        .is_some_and(|resolved| resolved == txn_id)
+                    {
+                        resurrection_attempt = true;
+                        break;
+                    }
+                }
                 if resurrection_attempt {
                     tracing::warn!(
                         ?txn_id,
@@ -10697,19 +10656,21 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                             }
                         }
                         // ADR 0018 §2/PR6 seatbelt (issue #298 shape A):
-                        // record that THIS exact transaction's intent at
-                        // this key has now been resolved here (commit or
-                        // abort — both leave nothing of `txn_id`'s own at
-                        // this key), so a stale/duplicate `TxnStage`
-                        // re-arriving for the identical `(key, txn_id)`
-                        // afterward is rejected instead of silently
-                        // resurrecting it — see `TxnTracker::recently_
-                        // resolved`'s doc and `KvCommand::TxnStage`'s own
-                        // resurrection-guard read of this map.
-                        txn_tracker
-                            .lock()
-                            .expect("txn tracker poisoned")
-                            .record_resolution(physical_key, txn_id.clone());
+                        // durably record that THIS exact transaction's
+                        // intent at this key has now been resolved here
+                        // (commit or abort — both leave nothing of
+                        // `txn_id`'s own at this key), in the SAME merge
+                        // batch as the resolve itself so the two are
+                        // atomic, so a stale/duplicate `TxnStage`
+                        // re-arriving for the identical `(key, txn_id)` is
+                        // rejected on every replica instead of
+                        // resurrecting it — see `TxnStage`'s own
+                        // resurrection guard and `txn::resolved_marker_key`.
+                        pending.push(MergeOp::put(
+                            scope.physical(&txn::resolved_marker_key(key)),
+                            txn::encode_resolved_marker(&txn_id),
+                            version,
+                        ));
                     }
                     // ADR 0018 §2/PR5, refined by the write-loss amendment
                     // §3/§6 fix: this group's own recovery-retry bookkeeping
@@ -11642,6 +11603,16 @@ async fn engine_image<S: StorageEngine>(
             .zip(kind_scopes)
             .find_map(|(kind, scope)| scope.strip_in_range(&k).map(|l| (*kind, l.to_vec())));
         if let Some((kind, logical)) = claimed {
+            // ADR 0073 (class G, `txn-resolved-marker` v1, issue #1243): a
+            // previous-release replica's scan/`has_data` filters know only
+            // record keys and would surface a marker row (`token || 0x00 0x04
+            // || key`) as a client item, so it does not ship while the
+            // introducing gate is closed. That replica keeps its own in-memory
+            // stale-restage guard, as before. Apply still writes markers
+            // unconditionally.
+            if ship_v1_intents && kind == KIND_BASE && txn::is_resolved_marker_key(&logical) {
+                continue;
+            }
             let v = match v {
                 Some(bytes) if ship_v1_intents && kind == KIND_BASE => {
                     match txn::legacy::v1::downgrade_intent_to_v1_with_prior(&bytes) {

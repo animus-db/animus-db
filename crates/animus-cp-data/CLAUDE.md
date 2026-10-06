@@ -1179,12 +1179,11 @@ State once here; cross-referenced from the sections below.
     a fresh HLC — caught live (`delivered=146/144`, one member of a
     transactional pair duplicated under a single sealed shard) during the
     same `SplitMode::InPlace`-unpinned soak that caught shape B. **Fixed**
-    via a new bounded, best-effort per-group memo, `TxnTracker::
-    recently_resolved` (`physical_key -> txn_id`, populated at every
-    `TxnResolve` apply, checked by `(key, txn_id)` identity): `TxnStage`'s
-    apply arm now rejects (folds into the same `Fenced` bucket as
-    `already_decided`) a stage whose target key was already resolved by
-    THIS EXACT transaction on this group. **Tracing the captured trace's
+    via a per-group memo, `TxnTracker::recently_resolved`, **replaced
+    2026-10-06 (issue #1243)** by a durable per-key *resolved marker* (see
+    below): `TxnStage`'s apply arm rejects (folds into the same `Fenced`
+    bucket as `already_decided`) a stage whose target key was already
+    resolved by THIS EXACT transaction on this group. **Tracing the captured trace's
     own `txn_id`s past this fix showed the LIVE trigger is narrower and
     deeper than this guard alone closes** — see `docs/engineering-
     lessons.md`'s shape A amendment for the full account: the resurrecting
@@ -1229,6 +1228,32 @@ State once here; cross-referenced from the sections below.
   Regression (whole txn suite): `tests/txn_single.rs`,
   `tests/snapshot_catchup.rs`, `tests/prod_concurrent_ts_monotonic.rs`, the
   in-crate `pr5_orphan_and_resurrection_tests` module.
+
+- **Resolved marker (issue #1243): apply decisions read durable state, never
+  process memory.** `TxnResolve`'s apply writes, for every key it actually
+  resolves, a row `txn::resolved_marker_key(key)` = `token || [0x00, 0x04] ||
+  key` in the base scope (value `[0xA1] || txn_id`, format
+  `txn-resolved-marker` v1, fixture `tests/fixtures/formats/txn-resolved-marker/v1.bin`)
+  in the same merge batch as the resolve; `TxnStage`'s apply reads it and
+  rejects a stage whose `(key, txn_id)` matches. It replaced the in-memory
+  `TxnTracker::recently_resolved` map, which made one committed log entry
+  apply differently on a restarted / snapshot-installed / cap-evicted replica
+  (stage rejected on some, intent resurrected on others; the apply-time
+  read-modify-write arms then diverged permanently). One row per key
+  (overwritten by the next resolve there), token-led so it moves with its key
+  through splits and snapshot images; every client-facing scan skips it via
+  `txn::is_internal_key` (record keys alone stay `is_record_key`, the predicate
+  for code that *decodes records*). **Class G**: `engine_image` omits marker
+  rows while `Gate::GlobalTables` is closed (an N-1 replica's filters would
+  surface them to clients; it keeps its own in-memory guard — residual), apply
+  always writes them; cell `tests/it/txn_resolved_marker_gate.rs`. Residual by design: it remembers only the
+  LAST resolver of a key, so a duplicate stage of T arriving after a *later*
+  transaction also resolved the same key is not caught — but that residual is
+  now identical on every replica (deterministic), where the old one was
+  per-process. A new internal row kind must be added to `is_internal_key` and
+  the `animus-test` `EMBEDDED` table. Regression:
+  `tests/it/resolved_restage_replica_determinism.rs` (restart + snapshot-install
+  variants, `ANIMUS_RESTAGE_SEEDS`).
 - **`engine_applied` vs `last_applied`.** The two-task split (below) means the
   core's `last_applied` (a buffer cursor the consensus loop advances) *leads*
   the engine. Linearizable reads therefore gate on the separate
