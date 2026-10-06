@@ -765,6 +765,21 @@ cleanup() {
 trap 'on_err $LINENO' ERR
 trap cleanup EXIT
 
+# True once the StatefulSet has no roll left in flight: the operator-owned
+# partition is back at 0, the controller has observed the latest generation,
+# every replica is on the update revision (current == update) and ready.
+statefulset_fully_rolled() {
+    local j
+    j="$(kubectl get statefulset "$AC_NAME" -n "$NAMESPACE" -o json 2>/dev/null)" || return 1
+    jq -e '
+        ((.spec.updateStrategy.rollingUpdate.partition // 0) == 0)
+        and ((.status.observedGeneration // 0) >= .metadata.generation)
+        and (.status.currentRevision == .status.updateRevision)
+        and ((.status.updatedReplicas // 0) == .spec.replicas)
+        and ((.status.readyReplicas // 0) == .spec.replicas)
+    ' <<<"$j" >/dev/null
+}
+
 wait_for() {
     # wait_for DESCRIPTION TIMEOUT_SECS INTERVAL_SECS -- CMD...
     local desc="$1" timeout_secs="$2" interval="$3"
@@ -1973,7 +1988,14 @@ phase "wait for the controlNodes config-hash rollout to fully finish (issue #864
 # by a controlNodes growth) for its own TLS regression to be caught at
 # all, instead of silently limping past it the way an earlier run of this
 # script's own TLS leg did.
-kubectl rollout status "statefulset/${AC_NAME}" -n "$NAMESPACE" --timeout=300s
+# ADR 0073 Phase 3 (D7/D8): the operator now gates every pod-template change
+# through an operator-owned `updateStrategy.rollingUpdate.partition`, applied
+# at `replicas` and lowered one ordinal per healthy observation. `kubectl
+# rollout status` treats a partitioned StatefulSet as done as soon as the
+# ordinals at or above the *current* partition are updated, so it returns
+# while the operator is still walking the partition down; wait for the
+# operator's roll to really finish instead.
+wait_for "the operator's gated roll of statefulset/${AC_NAME} has finished" 600 5 -- statefulset_fully_rolled
 
 phase "check the PodDisruptionBudget after controlNodes growth (S-07d)"
 # Safe to check even mid-rollout, and certainly safe now that the rollout
