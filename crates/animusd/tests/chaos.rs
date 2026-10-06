@@ -177,8 +177,50 @@ async fn run_scenario(scn: Scenario) -> Outcome {
         }
     }
 
+    // ---- replica convergence (diagnostic) ----------------------------
+    // Every node's own eventual read must reach the final state: a node that
+    // never does holds a permanently diverged replica (as opposed to one
+    // stale read that later caught up).
+    let convergence_budget = Duration::from_secs(20);
+    let divergences = workload::replica_convergence(&nodes, &fin_a, convergence_budget).await;
+    violations.extend(divergences.iter().map(|d| d.violation(convergence_budget)));
+
+    // ---- node counters (diagnostic) ------------------------------------
+    // Which recovery paths this run actually took (a snapshot install, a
+    // merge that silently took no effect, a failure-detector flap), so a red
+    // run names the mechanism it exercised instead of leaving it to a guess.
+    let mut counter_lines: Vec<String> = Vec::new();
+    for i in 0..n {
+        let c = cluster
+            .counters(
+                i,
+                &[
+                    "snapshot",
+                    "no_effect",
+                    "failure_detector",
+                    "txn_",
+                    "elections_won",
+                    "needs_snapshot",
+                ],
+            )
+            .await;
+        counter_lines.push(format!("n{i}: {}", c.join(" ")));
+    }
+    for l in &counter_lines {
+        eprintln!("chaos[{}]: counters {l}", scn.name());
+    }
+
     // ---- oracles -----------------------------------------------------
     let (history, verdict) = workload::run_oracles(&shared, &fin_a, &fin_b);
+    let oracle_summary: Vec<String> = verdict.summary_lines(&divergences);
+    // Harness-level violations (availability, final reads, node exits, and
+    // below non-vacuity and node panics): the summary lists them beside the
+    // oracle groups; the replica-convergence ones are already in there.
+    let mut harness_only: Vec<String> = violations
+        .iter()
+        .filter(|v| !v.starts_with("[replica-convergence]"))
+        .cloned()
+        .collect();
     violations.extend(verdict.violations);
 
     let st = &shared.stats;
@@ -197,14 +239,17 @@ async fn run_scenario(scn: Scenario) -> Outcome {
         history.entries.len(),
     );
     if ok_writes < 50 {
-        violations.push(format!(
-            "[non-vacuity] only {ok_writes} acknowledged writes: the workload barely ran"
-        ));
+        let v =
+            format!("[non-vacuity] only {ok_writes} acknowledged writes: the workload barely ran");
+        harness_only.push(v.clone());
+        violations.push(v);
     }
     for i in 0..n {
         if let Ok(log) = std::fs::read_to_string(cluster.log_path(i)) {
             for line in log.lines().filter(|l| l.contains("panicked at")) {
-                violations.push(format!("[node-panic] n{i}: {line}"));
+                let v = format!("[node-panic] n{i}: {line}");
+                harness_only.push(v.clone());
+                violations.push(v);
             }
         }
     }
@@ -222,6 +267,66 @@ async fn run_scenario(scn: Scenario) -> Outcome {
             shared.trace.lock().expect("trace").join("\n"),
         );
         let _ = std::fs::write(out_dir.join("violations.txt"), violations.join("\n"));
+        let _ = std::fs::write(out_dir.join("counters.txt"), counter_lines.join("\n"));
+        // The compact summary: what the CI annotation shows first. One line
+        // per violation group (never the value lists, which live in
+        // violations.txt), the replica-convergence verdict, and every node's
+        // counters, all inside the annotation's ~3,500-character cap.
+        let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
+        for v in &violations {
+            let kind = v.split(']').next().unwrap_or("?").trim_start_matches('[');
+            *kinds.entry(kind.to_owned()).or_default() += 1;
+        }
+        let header = format!(
+            "chaos[{}] seed={seed}: {} violation(s): {}",
+            scn.name(),
+            violations.len(),
+            kinds
+                .iter()
+                .map(|(k, n)| format!("{k} x{n}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        // The replica-convergence verdict and the counters are always kept;
+        // the violation groups fill whatever is left of the cap (the CI
+        // annotation shows at most ~3,500 characters), so a run with many
+        // distinct groups degrades to "first N groups + a count", never to a
+        // summary that drops the decisive lines off the end.
+        const SUMMARY_CAP: usize = 3300;
+        let (mut keep, mut groups): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+        for l in oracle_summary.into_iter().chain(
+            harness_only
+                .iter()
+                .map(|v| v.chars().take(240).collect::<String>()),
+        ) {
+            if l.starts_with("[replica-convergence]") {
+                keep.push(l);
+            } else {
+                groups.push(l);
+            }
+        }
+        keep.extend(counter_lines.iter().map(|l| format!("counters {l}")));
+        let mut budget = SUMMARY_CAP
+            .saturating_sub(header.len() + keep.iter().map(|l| l.len() + 1).sum::<usize>() + 80);
+        let mut shown = Vec::new();
+        for (i, l) in groups.iter().enumerate() {
+            if l.len() + 1 > budget {
+                shown.push(format!(
+                    "... {} more violation group(s); see violations.txt",
+                    groups.len() - i
+                ));
+                break;
+            }
+            budget -= l.len() + 1;
+            shown.push(l.clone());
+        }
+        let mut summary = vec![header];
+        summary.extend(shown);
+        summary.extend(keep);
+        let _ = std::fs::write(out_dir.join("summary.txt"), summary.join("\n"));
+        for l in &summary {
+            eprintln!("chaos[{}]: SUMMARY {l}", scn.name());
+        }
         for i in 0..n {
             let _ = std::fs::copy(cluster.log_path(i), out_dir.join(format!("n{i}.log")));
         }

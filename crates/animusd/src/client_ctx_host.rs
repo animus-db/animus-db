@@ -188,7 +188,7 @@ impl<E: Env, R: RelayClient> TtlScanHost for ClientCtx<E, R> {
         .await
         {
             Ok(KindWriteOutcome::Ok { .. }) => Ok(true),
-            Ok(KindWriteOutcome::ConditionFailed) => Ok(false),
+            Ok(KindWriteOutcome::ConditionFailed | KindWriteOutcome::Superseded) => Ok(false),
             Err(e) => Err(e.message),
         }
     }

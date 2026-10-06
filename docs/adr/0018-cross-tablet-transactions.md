@@ -4152,3 +4152,107 @@ passed both ways). `animus-test`'s `txn_serializable.rs` gained an
 `lsm_compaction_abandon_prepare` failed before the fix with exactly the chaos
 finding ("lost acknowledged append ... absent from final state"). Envelope
 decode/round-trip and fixture tests in `txn.rs` and `format_fixture_tests.rs`.
+
+## Amendment 2026-10-06 — the stale-restage guard is durable state (issue #1243)
+
+`TxnStage`'s rejection of a stage for an already-resolved `(key, txn_id)`
+(the issue #298 shape A seatbelt) was decided from `TxnTracker::
+recently_resolved`, process memory that a restart, an `InstallSnapshot` or its
+4096-entry cap emptied — so one committed entry applied differently per
+replica, and the apply-time read-modify-write arms then diverged permanently.
+It is replaced by a **durable resolved marker**: `TxnResolve`'s apply writes
+`txn::resolved_marker_key(key)` (`token || [0x00, 0x04] || key`, value
+`[0xA1] || txn_id`, format `txn-resolved-marker` v1, ADR 0073 inventory) for
+every key it resolves, in the same merge batch, and `TxnStage`'s apply reads
+it. One row per key, overwritten by the next resolve there; a duplicate stage
+of T arriving after a *later* transaction resolved the same key is not caught,
+but that residual is now identical on every replica. No command or wire format
+changed; the marker is class G (ADR 0073): `engine_image` omits it while
+`Gate::GlobalTables` is closed. Regression: `animus-cp-data` `tests/it/resolved_restage_replica_
+determinism.rs` (restart and snapshot-install variants over several seeds).
+
+## Amendment 2026-10-06 — `TxnStage` is a no-op when replayed over an engine already ahead of it (issue #1242)
+
+The #1243 amendment's closing claim — the marker's one-row-per-key residual "is
+now identical on every replica" — held for live apply and for a replica that
+installs a snapshot, but not for **WAL replay after a restart**. A restarted
+replica re-applies its log tail from `snapshot_index` over its own durable
+engine, which already holds the effects of entries past that point, so each
+`TxnStage` decision read *future* state: a stage the live apply rejected (a
+stale/duplicate stage caught by the resolved marker of one key, a stage blocked
+by a foreign intent that was resolved afterwards) was accepted on replay, and
+its intent merge landed on every key with no later write. The resurrected
+intent exists on that replica only and blocks every later stage touching the
+key there (whole-or-nothing), so the acknowledged transaction's *other* key
+never applied on that replica — a permanent `ConsistentRead: false` divergence
+that shows only transaction halves missing (the chaos smoke's
+`[eventual-prefix]`).
+
+Fix, apply-side only (no command, wire or durable format change, so no ADR 0073
+gate: the new branch is unreachable on the live path, where no row can carry a
+version above the entry being applied — with one exception: `SeedBatch`, the
+restore driver, merges rows at carried source-cluster versions, so a stage
+hitting a seeded key with a higher version is Fenced live too, deterministically
+on every replica; a liveness edge on a not-yet-served table only): `TxnStage` first checks whether any of
+its own keys, their resolved markers, or (anchor) its record key hold a
+version strictly above the entry's `ts`, **tombstones included** (a plain `get`
+hides a key deleted after the stage, so a stage rejected live by an own-key
+condition such as "A absent" would pass on replay once A is deleted); if so a later entry already ran, and the stage replays as a
+no-op (`StageOutcome::Fenced`, nobody waits on a replayed entry). Strictly
+above, not at-or-above: an equal version is this entry's own, possibly
+crash-interrupted, merge and re-applies normally. Regression:
+`animus-cp-data` `tests/it/txn_stage_replay_stability.rs` (two constructed
+shapes plus a seeded schedule corpus, `ANIMUS_TXN_REPLAY_SEEDS`). `KindEval`/`KindEvalBatch`, which re-decide from engine state
+on replay too, are fixed separately (issue #1247, ADR 0054's 2026-10-06
+amendment). `KindBatch`/`Batch` make no engine-state decision. At cluster version
+1 (marker withheld from `InstallSnapshot` images) a snapshot-installed replica
+still had the #1243 residual; the next amendment (issue #1251) closes it.
+
+## Amendment 2026-10-06 — the resolved marker crosses in every snapshot image (issue #1251)
+
+The #1243 marker is what makes `TxnStage`'s stale-restage rejection a function
+of durable state, which only holds if every replica holds the same marker set.
+`engine_image` omitted marker rows while `Gate::GlobalTables` was closed (a
+previous-release replica would surface `token || 0x00 0x04 || key` to clients),
+so a replica caught up by `InstallSnapshot` at cluster version 1 had no
+markers, accepted a stale re-stage its peers rejected, and kept a resurrected
+intent that blocked later transactions on that key there only. Every cluster
+nobody has finalized is at version 1 (the era starts there), so all of them were
+exposed. The `txn_stage_replay_stability` corpus diverged at version 1 on seed
+2882520953; the directed `resolved_restage_replica_determinism` snapshot variant
+at version 1 failed on a raw-row comparison (before: replica 1's rows differ
+from replica 0's; after: identical).
+
+Options weighed against "the apply outcome is identical on every replica, live,
+replayed or snapshot-installed, at every version, and an N-1 replica is not
+broken":
+- **Fail closed on a key with no marker** — rejected: the replica that lacks the
+  markers would reject what the others accept, the same divergence in the other
+  direction.
+- **Derive the decision from state every v1 image already carries** — nothing
+  shipped identifies the resolving transaction (the resolve rewrites the base
+  row as a plain committed value or restore; the anchor record lives on another
+  tablet), so there is nothing to derive it from without a new row anyway.
+- **Start a fresh cluster's era at the maximum version** — only a complement: it
+  would not help a cluster already running at version 1 nor one mid-upgrade.
+- **Ship the markers in the image through a channel an N-1 replica ignores** —
+  chosen. The v1 image body is unchanged; each marker entry is tagged with the
+  wire-only row kind `KIND_WIRE_RESOLVED_MARKER` (`0x80`), which is in no
+  `ALL_KINDS` scope. The previous release's `install_engine_image`
+  (`git show ac57d56a`) drops any kind it has no scope for with a warning, so it
+  never files the marker as a client row; a current receiver maps the kind back
+  to the base-scope marker row. A gate-open image still ships the marker as the
+  plain base row. Apply never branches on the gate, so the decision is identical
+  on every current replica. Classification and the residual are in ADR 0073's
+  `txn-resolved-marker` inventory row.
+
+The one thing this cannot fix: a snapshot **sent by** an N-1 leader carries no
+markers (that binary never had them), so a current replica installing it holds
+none; N-1 replicas keep their own in-memory guard (the pre-#1243 behaviour). That
+is bounded by the rolling upgrade and ends at finalize. Regression:
+`resolved_restage_replica_determinism` (snapshot-install at version 1 and 2,
+raw-row identity incl. tombstones and markers), `txn_stage_replay_stability`
+(`txn_replay_corpus_at_cluster_version_1`, known-failing seed 2882520953),
+`txn_resolved_marker_gate` (the marker reaches a current follower at both
+versions), and the in-crate image test that pins the wire kind and what an
+N-1 receiver would file.

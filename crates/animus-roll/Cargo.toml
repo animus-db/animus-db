@@ -1,0 +1,18 @@
+[package]
+name = "animus-roll"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "AnimusDB rolling-upgrade state machine: a pure, I/O-free decision function (observation in, next action out) shared by animus-cli and animus-operator (ADR 0073 Phase 3, P3-C)."
+
+[lints]
+workspace = true
+
+[dependencies]
+# Only for the thin adapters that parse `GET /admin/cluster-version` and
+# `GET /admin/roll-health` bodies into an `Observation` (`json` module); the
+# state machine itself touches no serde type.
+serde_json.workspace = true

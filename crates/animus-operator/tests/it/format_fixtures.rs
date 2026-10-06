@@ -84,6 +84,86 @@ fn assert_v1_s3_web_identity(c: &AnimusCluster, name: &str) {
     );
 }
 
+/// `v1-upgrade.json` (ADR 0073 Phase 3, P3-D): the additive `spec.upgrade` and
+/// `status.upgrade` fields, with the status block a mid-roll operator wrote.
+fn assert_v1_upgrade(c: &AnimusCluster, name: &str) {
+    use animus_operator::crd::{FinalizePolicy, UpgradePhase};
+    assert_eq!(c.spec.finalize_policy(), FinalizePolicy::Auto, "{name}");
+    assert_eq!(c.spec.soak_seconds_or_default(), 120, "{name}");
+    let u = c
+        .status
+        .as_ref()
+        .and_then(|s| s.upgrade.as_ref())
+        .expect("status.upgrade");
+    assert_eq!(u.phase, UpgradePhase::InProgress, "{name}");
+    assert_eq!((u.from_version, u.to_version), (Some(1), Some(2)), "{name}");
+    assert_eq!((u.on_new, u.total), (Some(1), Some(3)), "{name}");
+    assert_eq!(
+        u.in_flight_node.as_deref(),
+        Some("golden-upgrade-1"),
+        "{name}"
+    );
+    assert_eq!(u.in_flight_since, Some(1_700_000_000), "{name}");
+    assert_eq!(u.settled_since, None, "{name}");
+    assert_eq!(
+        u.to_image.as_deref(),
+        Some("ghcr.io/animus-db/animusd:0.2.0"),
+        "{name}"
+    );
+}
+
+/// `v1-peers.json` (ADR 0075 section 5.4, G-01 stage G-e): the additive
+/// `spec.region`/`spec.peers`/`spec.mrecMaxClockSkewMs` fields and a
+/// `PeerReachable` status condition.
+fn assert_v1_peers(c: &AnimusCluster, name: &str) {
+    use animus_operator::crd::{CONDITION_PEER_REACHABLE, ConditionStatus};
+    let s = &c.spec;
+    assert_eq!(s.region.as_deref(), Some("us-east"), "{name}");
+    assert_eq!(s.peers.len(), 2, "{name}");
+    assert_eq!(s.peers[0].region, "eu-west", "{name}");
+    assert_eq!(s.peers[0].endpoints.len(), 2, "{name}");
+    let ca = s.peers[0].ca_secret_ref.as_ref().expect("caSecretRef");
+    assert_eq!(
+        (ca.name.as_str(), ca.key_or_default()),
+        ("eu-west-ca", "tls.crt"),
+        "{name}"
+    );
+    assert!(s.peers[1].ca_secret_ref.is_none(), "{name}");
+    assert_eq!(s.mrec_max_clock_skew_ms, Some(250), "{name}");
+    assert_eq!(s.allow_insecure_peers, None, "{name}");
+    let cond = &c.status.as_ref().unwrap().conditions[0];
+    assert_eq!(cond.type_, CONDITION_PEER_REACHABLE, "{name}");
+    assert_eq!(cond.status, ConditionStatus::Unknown, "{name}");
+}
+
+#[test]
+fn v1_peers_fixture_round_trips_losslessly() {
+    let text = std::fs::read_to_string(fixtures_dir().join("v1-peers.json")).unwrap();
+    let original: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let cluster: AnimusCluster = serde_json::from_str(&text).unwrap();
+    assert_eq!(serde_json::to_value(&cluster).unwrap(), original);
+}
+
+/// An older CR (no `spec.upgrade`, no `status.upgrade`) decodes to the defaults
+/// the new fields promise: manual finalize, no soak, no roll record.
+#[test]
+fn a_cr_without_the_upgrade_fields_defaults_to_manual_finalize() {
+    use animus_operator::crd::FinalizePolicy;
+    let c = decode_cluster(v1_value()).unwrap();
+    assert_eq!(c.spec.upgrade, None);
+    assert_eq!(c.spec.finalize_policy(), FinalizePolicy::Manual);
+    assert_eq!(c.spec.soak_seconds_or_default(), 0);
+    assert!(c.status.as_ref().is_none_or(|s| s.upgrade.is_none()));
+}
+
+#[test]
+fn v1_upgrade_fixture_round_trips_losslessly() {
+    let text = std::fs::read_to_string(fixtures_dir().join("v1-upgrade.json")).unwrap();
+    let original: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let cluster: AnimusCluster = serde_json::from_str(&text).unwrap();
+    assert_eq!(serde_json::to_value(&cluster).unwrap(), original);
+}
+
 /// Per-version expected value (ADR 0073 Phase 1): the version comes from the
 /// file name (`vN.json`), the file's own `spec.schemaVersion` must agree, and
 /// an unrecognised version panics so adding a fixture forces adding its arm.
@@ -113,6 +193,8 @@ fn every_checked_in_fixture_decodes_to_its_per_version_expected_value() {
                 match name.as_str() {
                     "v1.json" => assert_v1_structure(&cluster, &name),
                     "v1-s3-web-identity.json" => assert_v1_s3_web_identity(&cluster, &name),
+                    "v1-upgrade.json" => assert_v1_upgrade(&cluster, &name),
+                    "v1-peers.json" => assert_v1_peers(&cluster, &name),
                     other => panic!("{other}: no expected value; add a match arm"),
                 }
                 validate_spec(None, &cluster.spec).unwrap_or_else(|v| panic!("{name}: {v:?}"));

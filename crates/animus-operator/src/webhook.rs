@@ -167,7 +167,16 @@ pub fn handle_review(review: AdmissionReview<AnimusCluster>) -> AdmissionReview<
     };
 
     let old = request.old_object.as_ref().map(|o| &o.spec);
-    match validate::validate_spec(old, &new.spec) {
+    // `validate_image_revert` needs the previous object's `status.upgrade`
+    // (the roll record), which the spec-only `validate_spec` cannot see.
+    let mut result = validate::validate_spec(old, &new.spec);
+    if let Some(v) = validate::validate_image_revert(request.old_object.as_ref(), &new.spec) {
+        match &mut result {
+            Ok(()) => result = Err(vec![v]),
+            Err(vs) => vs.push(v),
+        }
+    }
+    match result {
         Ok(()) => AdmissionResponse::from(&request).into_review(),
         Err(violations) => {
             let message = violations
@@ -394,6 +403,71 @@ mod tests {
             resp.result.message
         );
         assert_eq!(resp.uid, "test-uid");
+    }
+
+    fn rolling_old(on_new: i32) -> AnimusCluster {
+        let mut old_spec = spec(3, Some(3));
+        old_spec.image = Some("img:2".to_string());
+        let mut old = cluster(old_spec);
+        old.status = Some(crate::crd::AnimusClusterStatus {
+            upgrade: Some(crate::crd::UpgradeStatus {
+                phase: crate::crd::UpgradePhase::InProgress,
+                from_version: Some(1),
+                to_version: Some(2),
+                on_new: Some(on_new),
+                total: Some(3),
+                active_cluster_version: Some(1),
+                from_image: Some("img:1".to_string()),
+                to_image: Some("img:2".to_string()),
+                in_flight_node: None,
+                in_flight_since: None,
+                settled_since: None,
+            }),
+            ..Default::default()
+        });
+        old
+    }
+
+    #[test]
+    fn an_image_revert_after_a_pod_reported_the_new_range_is_denied() {
+        let mut new_spec = spec(3, Some(3));
+        new_spec.image = Some("img:1".to_string());
+        let out = handle_review(review(
+            Operation::Update,
+            Some(cluster(new_spec)),
+            Some(rolling_old(1)),
+            animuscluster_gvk(),
+        ));
+        let resp = out.response.expect("response set");
+        assert!(!resp.allowed);
+        assert!(
+            resp.result.message.contains("spec.image") && resp.result.message.contains("revert"),
+            "{}",
+            resp.result.message
+        );
+    }
+
+    #[test]
+    fn an_image_revert_before_the_first_pod_is_touched_and_a_fix_forward_are_allowed() {
+        let mut revert = spec(3, Some(3));
+        revert.image = Some("img:1".to_string());
+        let out = handle_review(review(
+            Operation::Update,
+            Some(cluster(revert)),
+            Some(rolling_old(0)),
+            animuscluster_gvk(),
+        ));
+        assert!(out.response.expect("response set").allowed);
+
+        let mut forward = spec(3, Some(3));
+        forward.image = Some("img:3".to_string());
+        let out = handle_review(review(
+            Operation::Update,
+            Some(cluster(forward)),
+            Some(rolling_old(2)),
+            animuscluster_gvk(),
+        ));
+        assert!(out.response.expect("response set").allowed);
     }
 
     #[test]

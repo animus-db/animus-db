@@ -25,7 +25,7 @@
 //! outage). Live checks stay exactly where they already were, in the
 //! reconciler, with their own condition-based fallback.
 
-use crate::crd::{AnimusClusterSpec, CONTENT_SCHEMA_VERSION, SPEC_FORMAT};
+use crate::crd::{AnimusCluster, AnimusClusterSpec, CONTENT_SCHEMA_VERSION, SPEC_FORMAT};
 
 /// One rule this spec failed, naming the field it's about (a JSON-pointer-
 /// ish dotted path, `spec.foo`/`spec.foo.bar` — not necessarily a single
@@ -198,6 +198,34 @@ pub fn validate_ephemeral_voters(new: &AnimusClusterSpec) -> Option<Violation> {
     }
 }
 
+/// Reverting `spec.image` to the pre-roll image while a roll is in flight is
+/// refused once any pod has reported the new range (ADR 0073 Phase 3, D9): it
+/// would re-roll nodes that already ran the new binary back onto the old one,
+/// whose formats may not read what the new one wrote (Option B, fix forward).
+/// Needs the **previous object's status** (the roll record), so it is separate
+/// from [`validate_spec`], which sees specs only; the webhook calls both, and
+/// the reconciler enforces the same predicate
+/// ([`crate::roll::image_revert_target`]) by pinning the image. Before the
+/// first pod is touched a revert is free and is not refused here.
+#[must_use]
+pub fn validate_image_revert(
+    old: Option<&AnimusCluster>,
+    new: &AnimusClusterSpec,
+) -> Option<Violation> {
+    let old = old?;
+    let upgrade = old.status.as_ref()?.upgrade.as_ref();
+    let keep = crate::roll::image_revert_target(upgrade, new.image_or_default())?;
+    Some(Violation {
+        field: "spec.image",
+        message: format!(
+            "refusing to revert spec.image to {}: a rolling upgrade to {keep} is in flight and a \
+             pod already runs the new binary; rolling it back onto the old one may not read what \
+             the new one wrote. Fix forward: set spec.image to a fixed image",
+            new.image_or_default()
+        ),
+    })
+}
+
 /// Every CRD-shape rule this crate enforces purely from the spec (and, for
 /// the grow-only rule, the previous spec) — the full rule list, run by both
 /// the reconciler and the webhook:
@@ -220,6 +248,9 @@ pub fn validate_ephemeral_voters(new: &AnimusClusterSpec) -> Option<Violation> {
 ///   ([`crate::crd::TlsSpec::validate`]).
 /// - `spec.s3` is internally consistent ([`crate::crd::S3StoreSpec::
 ///   validate`]).
+/// - `spec.region`/`spec.peers` are consistent and, with peers, `spec.tls` or
+///   the dev-only `spec.allowInsecurePeers` is set
+///   ([`AnimusClusterSpec::validate_peers_spec`], G-01 stage G-e).
 /// - `spec.backupStore`/`spec.segmentStore` are each a syntactically valid,
 ///   non-conflicting value ([`AnimusClusterSpec::validate_store_spec`]).
 ///
@@ -258,6 +289,13 @@ pub fn validate_spec(
     {
         violations.push(Violation {
             field: "spec.s3",
+            message: e,
+        });
+    }
+
+    if let Err(e) = new.validate_peers_spec() {
+        violations.push(Violation {
+            field: "spec.region/spec.peers",
             message: e,
         });
     }
@@ -564,5 +602,65 @@ mod tests {
         // store conflict — at least three distinct problems reported in one
         // pass, not just the first one found.
         assert!(violations.len() >= 3, "{violations:?}");
+    }
+
+    fn cluster_rolling(on_new: i32, phase: crate::crd::UpgradePhase) -> AnimusCluster {
+        let mut c = AnimusCluster::new("demo", base_spec(3, Some(3)));
+        c.status = Some(crate::crd::AnimusClusterStatus {
+            upgrade: Some(crate::crd::UpgradeStatus {
+                phase,
+                from_version: None,
+                to_version: None,
+                on_new: Some(on_new),
+                total: Some(3),
+                active_cluster_version: None,
+                from_image: Some("img:1".to_string()),
+                to_image: Some("img:2".to_string()),
+                in_flight_node: None,
+                in_flight_since: None,
+                settled_since: None,
+            }),
+            ..Default::default()
+        });
+        c
+    }
+
+    #[test]
+    fn image_revert_is_refused_only_mid_roll_after_a_pod_reported_new() {
+        let mut revert = base_spec(3, Some(3));
+        revert.image = Some("img:1".to_string());
+        let v = validate_image_revert(
+            Some(&cluster_rolling(1, crate::crd::UpgradePhase::InProgress)),
+            &revert,
+        )
+        .expect("refused");
+        assert_eq!(v.field, "spec.image");
+        assert!(v.message.contains("img:2"), "{}", v.message);
+        // free before any pod reported, after the roll, on create, and for a
+        // different image
+        assert_eq!(
+            validate_image_revert(
+                Some(&cluster_rolling(0, crate::crd::UpgradePhase::InProgress)),
+                &revert
+            ),
+            None
+        );
+        assert_eq!(
+            validate_image_revert(
+                Some(&cluster_rolling(3, crate::crd::UpgradePhase::Complete)),
+                &revert
+            ),
+            None
+        );
+        assert_eq!(validate_image_revert(None, &revert), None);
+        let mut other = base_spec(3, Some(3));
+        other.image = Some("img:3".to_string());
+        assert_eq!(
+            validate_image_revert(
+                Some(&cluster_rolling(1, crate::crd::UpgradePhase::InProgress)),
+                &other
+            ),
+            None
+        );
     }
 }

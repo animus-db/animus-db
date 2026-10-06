@@ -29,9 +29,9 @@ use animus_cp_data::{
 };
 use animus_env::nid;
 use animus_node::{
-    ClientRequest, ClientResponse, KindWriteBatchItem, KindWriteItemReply, KindWriteOp,
-    PendingKindWrite, TxnTableWrite, decode_client_frame, encode_client_frame,
-    encode_client_frame_gated,
+    ClientRequest, ClientResponse, KindWriteBatchItem, KindWriteItemReply, KindWriteOp, MREC_PROTO,
+    MrecAnswer, MrecApplyRequest, MrecApplyResponse, MrecRecord, PendingKindWrite, Surface,
+    TxnTableWrite, decode_client_frame, encode_client_frame, encode_client_frame_gated, surface_of,
 };
 use animus_tablet::KeyRange;
 
@@ -505,6 +505,7 @@ fn request_name(r: &ClientRequest) -> &'static str {
         ClientRequest::TxnStatus { .. } => "TxnStatus",
         ClientRequest::TxnRecordView { .. } => "TxnRecordView",
         ClientRequest::TxnVerify { .. } => "TxnVerify",
+        ClientRequest::MrecApply(_) => "MrecApply",
     }
 }
 
@@ -529,6 +530,7 @@ fn response_name(r: &ClientResponse) -> &'static str {
         ClientResponse::TxnRecordViewReply { .. } => "TxnRecordViewReply",
         ClientResponse::TxnVerifyReply { .. } => "TxnVerifyReply",
         ClientResponse::TxnResolved { .. } => "TxnResolved",
+        ClientResponse::MrecApply(_) => "MrecApply",
     }
 }
 
@@ -561,15 +563,17 @@ fn fixtures_dir() -> PathBuf {
 fn fixture_covers_every_client_variant_once() {
     let reqs = every_request();
     let resps = every_response();
+    // The Phase 1 baseline: 30 / 19. Post-baseline variants (MREC, G-d M3) live
+    // in `mrec_messages` with their own fixture, never in `v1.bin`.
     assert_eq!(
         reqs.len(),
         30,
-        "ClientRequest has 30 variants; add the new one"
+        "v1.bin covers the 30 Phase 1 ClientRequest variants; a new variant needs its own fixture"
     );
     assert_eq!(
         resps.len(),
         19,
-        "ClientResponse has 19 variants; add the new one"
+        "v1.bin covers the 19 Phase 1 ClientResponse variants; a new variant needs its own fixture"
     );
     let rq: BTreeSet<&str> = reqs.iter().map(|(n, _)| *n).collect();
     let rs: BTreeSet<&str> = resps.iter().map(|(n, _)| *n).collect();
@@ -723,4 +727,425 @@ fn era_commands_relay_classification_and_gate() {
             Gate::Era
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Post-baseline wire shapes: the MREC replication family (ADR 0075 G-d M3).
+// Class G, `Gate::MrecReplication`. Its own no-overwrite fixture
+// (`v1-mrec.bin`, the `vN-<shape>` convention) so the Phase 1 `v1.bin` is
+// never touched.
+
+fn mrec_ver(wall_ms: u64) -> animus_item::MrecVersion {
+    animus_item::MrecVersion {
+        wall_ms,
+        logical: 2,
+        region_id: 0xDEAD_BEEF,
+    }
+}
+
+type MrecMessages = (
+    Vec<(&'static str, ClientRequest)>,
+    Vec<(&'static str, ClientResponse)>,
+);
+
+fn mrec_messages() -> MrecMessages {
+    let rec = |item: Option<animus_dynamo::Item>, ms| MrecRecord {
+        pk: pk(),
+        sk: sk(),
+        item,
+        ver: mrec_ver(ms),
+    };
+    (
+        vec![
+            (
+                "MrecApply",
+                ClientRequest::MrecApply(MrecApplyRequest {
+                    proto: MREC_PROTO,
+                    from_region: "eu".into(),
+                    table: "orders".into(),
+                    records: vec![
+                        rec(Some(item()), 1_700_000_000_123),
+                        rec(None, 1_700_000_000_456),
+                    ],
+                    control: None,
+                }),
+            ),
+            (
+                "KindWriteItem(Replicate)",
+                ClientRequest::KindWriteItem {
+                    table: "orders".into(),
+                    pk: pk(),
+                    sk: sk(),
+                    op: KindWriteOp::Replicate {
+                        item: Some(item()),
+                        ver: mrec_ver(7),
+                    },
+                    condition: None,
+                },
+            ),
+            (
+                "KindWriteBatch(Replicate)",
+                ClientRequest::KindWriteBatch {
+                    table: "orders".into(),
+                    items: vec![KindWriteBatchItem {
+                        pk: pk(),
+                        sk: sk(),
+                        op: KindWriteOp::Replicate {
+                            item: None,
+                            ver: mrec_ver(8),
+                        },
+                        condition: None,
+                    }],
+                },
+            ),
+        ],
+        vec![
+            (
+                "MrecApply(Answers)",
+                ClientResponse::MrecApply(MrecApplyResponse::Answers(vec![
+                    MrecAnswer::Applied,
+                    MrecAnswer::Superseded,
+                    MrecAnswer::Retry,
+                    MrecAnswer::Rejected {
+                        message: "bad".into(),
+                    },
+                ])),
+            ),
+            (
+                "MrecApply(Refused)",
+                ClientResponse::MrecApply(MrecApplyResponse::Refused {
+                    message: "gate".into(),
+                    retryable: true,
+                }),
+            ),
+            (
+                "KindWriteBatchOk(Superseded)",
+                ClientResponse::KindWriteBatchOk {
+                    results: vec![KindWriteItemReply::Superseded],
+                },
+            ),
+        ],
+    )
+}
+
+fn encode_mrec() -> Vec<u8> {
+    let (reqs, resps) = mrec_messages();
+    let mut out = Vec::new();
+    for (_, r) in reqs {
+        out.extend(encode_client_frame(&r).expect("encodes"));
+    }
+    for (_, r) in resps {
+        out.extend(encode_client_frame(&r).expect("encodes"));
+    }
+    out
+}
+
+/// The MREC shapes are class G: every one needs `Gate::MrecReplication` (closed
+/// on a floor handle) and the gated encoder emits them byte-identically to the
+/// plain encoder once it is open.
+#[test]
+fn mrec_wire_shapes_are_gated_on_mrec_replication() {
+    let (reqs, resps) = mrec_messages();
+    let floor = ClusterFeatures::new();
+    for (n, r) in &reqs {
+        assert_eq!(r.required_gate(), Gate::MrecReplication, "request {n}");
+        // (The gated encoder refuses these while closed; a debug build asserts
+        // on that violation, so the closed state is asserted, not exercised.)
+        assert!(!floor.is_open(r.required_gate()), "request {n}");
+        let fwd = ClientRequest::Forwarded {
+            request: Box::new(r.clone()),
+            traceparent: None,
+        };
+        assert_eq!(fwd.required_gate(), Gate::MrecReplication, "forwarded {n}");
+    }
+    for (n, r) in &resps {
+        // A whole-batch `Refused` is `Base`: a node whose own gate is still
+        // closed must be able to say "not yet" (a debug build panics on a
+        // closed-gate emit, found by `mrec_peer_transport`). Per-record
+        // `Answers` need the gate.
+        let want = if matches!(
+            r,
+            ClientResponse::MrecApply(MrecApplyResponse::Refused { .. })
+        ) {
+            Gate::Base
+        } else {
+            Gate::MrecReplication
+        };
+        assert_eq!(r.required_gate(), want, "response {n}");
+    }
+    // Content-dependent: the same carriers without a replicate stay Base.
+    assert_eq!(
+        ClientRequest::KindWriteBatch {
+            table: "t".into(),
+            items: vec![KindWriteBatchItem {
+                pk: pk(),
+                sk: None,
+                op: KindWriteOp::Delete,
+                condition: None,
+            }],
+        }
+        .required_gate(),
+        Gate::Base
+    );
+    assert_eq!(
+        ClientResponse::KindWriteBatchOk {
+            results: vec![KindWriteItemReply::ConditionFailed],
+        }
+        .required_gate(),
+        Gate::Base
+    );
+    // Open gate (cluster version 3 profile): emitted, byte-equal to plain.
+    let mut meta = Metadata::default();
+    for c in [
+        MetaCommand::UpsertMember {
+            node: nid(1),
+            labels: BTreeMap::new(),
+            status: NodeStatus::Active,
+        },
+        era_report_range(1, 3),
+        MetaCommand::FinalizeClusterVersion {
+            expected: 1,
+            target: 2,
+        },
+        MetaCommand::FinalizeClusterVersion {
+            expected: 2,
+            target: 3,
+        },
+    ] {
+        meta.apply(&c);
+    }
+    assert_eq!(meta.cluster_version(), 3);
+    let open = ClusterFeatures::new();
+    open.update(&meta);
+    assert!(open.is_open(Gate::MrecReplication));
+    for (n, r) in &reqs {
+        assert_eq!(
+            encode_client_frame_gated(r, &open).expect("open"),
+            encode_client_frame(r).unwrap(),
+            "request {n}"
+        );
+    }
+}
+
+fn era_report_range(min: u32, max: u32) -> MetaCommand {
+    MetaCommand::ReportNodeVersion {
+        node: nid(1),
+        range: animus_control::version::VersionRange::new(min, max),
+        build: "t".into(),
+    }
+}
+
+/// `MrecApply` is intra-only (a peer cluster's mutual-TLS intra dial), never a
+/// client-listener request.
+#[test]
+fn mrec_apply_is_intra_only() {
+    let (reqs, _) = mrec_messages();
+    assert_eq!(surface_of(&reqs[0].1), Surface::Intra);
+}
+
+#[test]
+fn mrec_frames_are_byte_identical_to_the_fixture_and_decode_back() {
+    let fixture =
+        std::fs::read(fixtures_dir().join("v1-mrec.bin")).expect("v1-mrec.bin is checked in");
+    assert_eq!(
+        encode_mrec(),
+        fixture,
+        "MREC frames drifted from the fixture"
+    );
+    let (reqs, resps) = mrec_messages();
+    let frames = split_frames(&fixture);
+    assert_eq!(frames.len(), reqs.len() + resps.len());
+    for ((name, want), frame) in reqs.iter().zip(&frames) {
+        let got: ClientRequest = decode_client_frame(frame).expect("decodes");
+        assert_eq!(request_name(&got), request_name(want), "{name}");
+        assert_eq!(
+            encode_client_frame(&got).unwrap(),
+            encode_client_frame(want).unwrap(),
+            "{name}"
+        );
+    }
+    for ((name, want), frame) in resps.iter().zip(&frames[reqs.len()..]) {
+        let got: ClientResponse = decode_client_frame(frame).expect("decodes");
+        assert_eq!(&got, want, "{name}");
+    }
+}
+
+/// The Phase 1 fixture still decodes (an old frame never mentions a replicate),
+/// and its `Delete`/`Update` ops keep their pre-MREC encoding.
+#[test]
+fn replicate_is_an_additive_op_the_phase1_ops_are_unchanged() {
+    let put = serde_json::to_string(&KindWriteOp::Delete).unwrap();
+    assert_eq!(put, "\"Delete\"");
+    let rep = serde_json::to_string(&KindWriteOp::Replicate {
+        item: None,
+        ver: mrec_ver(1),
+    })
+    .unwrap();
+    assert!(rep.starts_with("{\"Replicate\":"), "{rep}");
+}
+
+/// Refuses to overwrite: run once.
+/// `cargo test -p animus-node --test it format_fixtures::generate_fixture_client_frame_mrec -- --ignored`
+#[test]
+#[ignore = "fixture generator; run explicitly, never regenerates an existing fixture"]
+fn generate_fixture_client_frame_mrec() {
+    let path = fixtures_dir().join("v1-mrec.bin");
+    assert!(
+        std::fs::metadata(&path).is_err(),
+        "{} already exists; a checked-in fixture is never regenerated in place",
+        path.display()
+    );
+    std::fs::write(&path, encode_mrec()).expect("write");
+}
+
+fn mrec_control_messages() -> Vec<(&'static str, ClientRequest)> {
+    let frame = |control| {
+        ClientRequest::MrecApply(MrecApplyRequest {
+            proto: MREC_PROTO,
+            from_region: "eu".into(),
+            table: "orders".into(),
+            records: Vec::new(),
+            control: Some(control),
+        })
+    };
+    vec![
+        (
+            "CreateReplica",
+            frame(animus_node::MrecControl::CreateReplica {
+                create_table: "{\"TableName\":\"orders\"}".into(),
+                ttl_attribute: Some("expires".into()),
+                peers: vec!["ap".into()],
+            }),
+        ),
+        ("Leave", frame(animus_node::MrecControl::Leave)),
+        (
+            "AddPeer",
+            frame(animus_node::MrecControl::AddPeer {
+                region: "ap".into(),
+            }),
+        ),
+    ]
+}
+
+fn encode_mrec_control() -> Vec<u8> {
+    let mut out = Vec::new();
+    for (_, r) in mrec_control_messages() {
+        out.extend(encode_client_frame(&r).expect("encodes"));
+    }
+    out.extend(
+        encode_client_frame(&ClientResponse::MrecApply(MrecApplyResponse::Done)).expect("encodes"),
+    );
+    out
+}
+
+/// G-d M4: the replica-lifecycle messages ride the existing class-G
+/// `MrecApply` frame (additive `control` field): same gate, same surface, and a
+/// frame written by an M3 binary (no `control`) still decodes.
+#[test]
+fn mrec_control_frames_are_byte_identical_to_the_fixture_and_gated() {
+    let fixture = std::fs::read(fixtures_dir().join("v1-mrec-control.bin"))
+        .expect("v1-mrec-control.bin is checked in");
+    assert_eq!(encode_mrec_control(), fixture, "control frames drifted");
+    let frames = split_frames(&fixture);
+    let msgs = mrec_control_messages();
+    assert_eq!(frames.len(), msgs.len() + 1);
+    for ((name, want), frame) in msgs.iter().zip(&frames) {
+        let got: ClientRequest = decode_client_frame(frame).expect("decodes");
+        assert_eq!(
+            encode_client_frame(&got).unwrap(),
+            encode_client_frame(want).unwrap(),
+            "{name}"
+        );
+        assert_eq!(want.required_gate(), Gate::MrecReplication, "{name}");
+        assert_eq!(surface_of(want), Surface::Intra, "{name}");
+    }
+    let done = ClientResponse::MrecApply(MrecApplyResponse::Done);
+    assert_eq!(done.required_gate(), Gate::MrecReplication);
+    let got: ClientResponse = decode_client_frame(frames.last().unwrap()).expect("decodes");
+    assert_eq!(got, done);
+    // Backward compatible: the plain-batch frame carries no `control` key.
+    let (reqs, _) = mrec_messages();
+    let ClientRequest::MrecApply(plain) = &reqs[0].1 else {
+        panic!("first MREC request is MrecApply")
+    };
+    assert!(
+        !serde_json::to_string(plain).unwrap().contains("control"),
+        "an absent control stays off the wire"
+    );
+}
+
+/// Refuses to overwrite: run once.
+#[test]
+#[ignore = "fixture generator; run explicitly, never regenerates an existing fixture"]
+fn generate_fixture_client_frame_mrec_control() {
+    let path = fixtures_dir().join("v1-mrec-control.bin");
+    assert!(
+        std::fs::metadata(&path).is_err(),
+        "{} already exists; a checked-in fixture is never regenerated in place",
+        path.display()
+    );
+    std::fs::write(&path, encode_mrec_control()).expect("write");
+}
+
+/// G-d M4c: `MrecControl::SetTtl` (TTL settings synchronize to every replica).
+/// Its own fixture; `v1-mrec-control.bin` is never edited.
+fn mrec_control_ttl_messages() -> Vec<(&'static str, ClientRequest)> {
+    let frame = |attribute| {
+        ClientRequest::MrecApply(MrecApplyRequest {
+            proto: MREC_PROTO,
+            from_region: "eu".into(),
+            table: "orders".into(),
+            records: Vec::new(),
+            control: Some(animus_node::MrecControl::SetTtl { attribute }),
+        })
+    };
+    vec![
+        ("SetTtl(Some)", frame(Some("expires".into()))),
+        ("SetTtl(None)", frame(None)),
+    ]
+}
+
+fn encode_mrec_control_ttl() -> Vec<u8> {
+    let mut out = Vec::new();
+    for (_, r) in mrec_control_ttl_messages() {
+        out.extend(encode_client_frame(&r).expect("encodes"));
+    }
+    out
+}
+
+#[test]
+fn mrec_control_ttl_frames_are_byte_identical_to_the_fixture_and_gated() {
+    let fixture = std::fs::read(fixtures_dir().join("v1-mrec-control-ttl.bin"))
+        .expect("v1-mrec-control-ttl.bin is checked in");
+    assert_eq!(
+        encode_mrec_control_ttl(),
+        fixture,
+        "ttl control frames drifted"
+    );
+    let frames = split_frames(&fixture);
+    let msgs = mrec_control_ttl_messages();
+    assert_eq!(frames.len(), msgs.len());
+    for ((name, want), frame) in msgs.iter().zip(&frames) {
+        let got: ClientRequest = decode_client_frame(frame).expect("decodes");
+        assert_eq!(
+            encode_client_frame(&got).unwrap(),
+            encode_client_frame(want).unwrap(),
+            "{name}"
+        );
+        assert_eq!(want.required_gate(), Gate::MrecReplication, "{name}");
+        assert_eq!(surface_of(want), Surface::Intra, "{name}");
+    }
+}
+
+/// Refuses to overwrite: run once.
+#[test]
+#[ignore = "fixture generator; run explicitly, never regenerates an existing fixture"]
+fn generate_fixture_client_frame_mrec_control_ttl() {
+    let path = fixtures_dir().join("v1-mrec-control-ttl.bin");
+    assert!(
+        std::fs::metadata(&path).is_err(),
+        "{} already exists; a checked-in fixture is never regenerated in place",
+        path.display()
+    );
+    std::fs::write(&path, encode_mrec_control_ttl()).expect("write");
 }

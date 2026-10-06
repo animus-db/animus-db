@@ -396,7 +396,7 @@
             <tr><td><code>ExportTableToPointInTime</code> · <code>DescribeExport</code> · <code>ListExports</code></td><td><span class="pill yes">Yes</span></td><td>Export to a customer-named S3 bucket in DynamoDB's own JSON layout. <code>DYNAMODB_JSON</code> format and a full (not incremental) export only</td></tr>
             <tr><td><code>ImportTable</code> · <code>DescribeImport</code> · <code>ListImports</code></td><td><span class="pill yes">Yes</span></td><td>Import from a customer-named S3 bucket in DynamoDB's own JSON layout into a brand-new table. <code>DYNAMODB_JSON</code> format only, <code>GZIP</code> or uncompressed; a malformed item is skipped and counted rather than failing the whole import, up to a bounded cap</td></tr>
             <tr><td>Provisioned throughput / throttling</td><td><span class="pill yes">Yes</span></td><td>A table's declared <code>ProvisionedThroughput</code>, or a cluster-wide default, is enforced as a real per-tablet admission budget — an exhausted budget returns <code>ProvisionedThroughputExceededException</code> (or a <code>ThrottlingError</code> cancellation reason for <code>TransactWriteItems</code>). Declaring throughput also sizes tablet count up front, DynamoDB's own <code>ceil(RCU/3000 + WCU/1000)</code> formula. A transient unavailability that outlasts the server's own retry budget (a tablet split cutover, not a capacity refusal) returns <code>ServiceUnavailable</code> (HTTP 503) instead, retried by every AWS SDK's default policy. A node at its connection cap (<code>--max-connections</code>, default 4096) or in-flight request bound (<code>--max-inflight</code>, default 2048) sheds with the same <code>ServiceUnavailable</code> rather than queueing</td></tr>
-            <tr><td>Global tables</td><td><span class="pill part">Partial</span></td><td>Multi-Region strongly consistent (MRSC) only: <code>UpdateTable</code> <code>ReplicaUpdates</code> + <code>MultiRegionConsistency: STRONG</code> on an empty table (three Regions, or two plus a witness). Eventual-consistency global tables and the legacy 2017.11.29 operations are not supported (ADR 0075)</td></tr>
+            <tr><td>Global tables</td><td><span class="pill part">Partial</span></td><td>Both modes, verified in simulation (ADR 0075). Multi-Region strongly consistent (MRSC): <code>UpdateTable</code> <code>ReplicaUpdates</code> + <code>MultiRegionConsistency: STRONG</code> on an empty table (three Regions, or two plus a witness), cluster version 2. Multi-Region eventually consistent (MREC): independent clusters configured as peers (<code>--region</code>, <code>--peer REGION=host:intra-port</code>, mutual TLS on the intra port; on Kubernetes the operator renders <code>spec.region</code>/<code>spec.peers</code> into the same config, unit-tested only, not yet run on a real cluster), <code>ReplicaUpdates</code> <code>Create</code>/<code>Delete</code> with no consistency or <code>EVENTUAL</code> on a populated table, last-writer-wins, cluster version 3; a replica's stream shows the latest state of a key, not every intermediate write. The legacy 2017.11.29 operations are not supported</td></tr>
             <tr><td>On-demand billing metering</td><td><span class="pill no">No</span></td><td>Out of scope for now — throttling is admission control, not an invoice</td></tr>
           </tbody>
         </table>
@@ -468,7 +468,12 @@
 <span class="p">$</span> <span class="k">animus cluster version &lt;admin-addr&gt; [--json]</span>
 <span class="p">$</span> <span class="k">animus cluster finalize &lt;leader-admin-addr&gt; [--to N] [--yes]</span>
 
-<span class="c"># multi-Region strongly consistent global tables (cluster version 2)</span>
+<span class="c"># rolling upgrade supervisor (ADR 0073 Phase 3): you restart each node; the CLI orders, gates and waits</span>
+<span class="p">$</span> <span class="k">animus cluster roll plan &lt;admin-addr&gt; [--json]</span>     <span class="c"># the roll order; exits 1 if a precondition fails</span>
+<span class="p">$</span> <span class="k">animus cluster roll wait &lt;node-admin-addr&gt; [--timeout 10m]</span>   <span class="c"># until that node is healthy and reports the new range</span>
+<span class="p">$</span> <span class="k">animus cluster roll status &lt;admin-addr&gt; [--json]</span>
+
+<span class="c"># global tables: MRSC regions/placement, and MREC replicas + this node's per-peer shipper health (backlog, lag, last error)</span>
 <span class="p">$</span> <span class="k">animus admin global-tables &lt;admin-addr&gt;</span>
 <span class="p">$</span> <span class="k">animus table preferred-leader &lt;admin-addr&gt; &lt;table&gt; &lt;region&gt;</span>
 
@@ -546,11 +551,19 @@
         (<code>kubectl patch</code> its <code>nodes</code> field); deleting the custom resource
         tears down everything it owns through ordinary Kubernetes garbage collection. A
         CI-gated smoke test exercises a real <code>kind</code> cluster end-to-end — create,
-        bootstrap, scale, delete — on every change to this surface. Kubernetes' own rolling
-        update would replace pods one at a time on an image change, but the operator does not
-        yet orchestrate upgrades (no wait-healthy gate between pods, no finalize step): roll
-        by hand, node by node (see the cluster version notes below), or do a whole-cluster
-        stop, upgrade and restart.
+        bootstrap, scale, delete — on every change to this surface. An image (or other
+        pod-template) edit is a gated rolling upgrade: the operator owns the StatefulSet's
+        update <code>partition</code> and lowers it one pod at a time, only while every member is
+        <code>Active</code>, the cluster-wide roll-health check passes and the previous pod has
+        reported the new version range; the control leader is handed leadership away before its
+        pod restarts. A pod that does not come back healthy stops the roll
+        (<code>UpgradeBlocked</code> names why; fix forward by editing the image again), and
+        the new cluster version is raised by <code>animus cluster finalize</code>, or by the
+        operator itself with <code>spec.upgrade.finalize: Auto</code>. Progress is on
+        <code>status.upgrade</code> and the <code>UpgradeInProgress</code> /
+        <code>UpgradeFinalizePending</code> / <code>RollComplete</code> conditions. Shapes that
+        cannot lose a node (fewer than three nodes, or one control node) are not rolled:
+        use a whole-cluster stop, upgrade and restart.
       </p>
     </section>
 
@@ -660,18 +673,28 @@
           config-gated per cluster. A cluster with no TLS configured is unauthenticated plain TCP,
           exactly as before; caller identity on the DynamoDB port is opt-in SigV4 either way, not
           affected by TLS.</li>
-        <li><strong>Rolling upgrades are manual, one node at a time.</strong> Restart one node
-          at a time, waiting until it is <code>Active</code> and no tablet is under-replicated,
-          then run <code>animus cluster finalize</code> once every member (down ones too)
-          reports the new version range. Each node advertises the cluster versions its binary
+        <li><strong>Rolling upgrades are one node at a time, by hand with CLI support or driven by the Kubernetes operator.</strong>
+          By hand, <code>animus cluster roll plan</code> prints the order (data-only nodes, then control voters,
+          the control leader last) and refuses if the cluster is not healthy; you restart one node on the
+          new binary; <code>animus cluster roll wait</code> blocks until that node is <code>Active</code>,
+          has reported the new range and the server-side roll-health check passes (no tablet
+          under-replicated, its own groups caught up); then run <code>animus cluster finalize</code>
+          once every member (down ones too) reports the new version range
+          (<code>roll wait --finalize --yes</code> on the last node does it for you, opt-in).
+          <code>animus cluster roll status</code> shows progress. On Kubernetes the operator runs the same
+          gate from a <code>spec.image</code> edit (see the operator section above); finalize stays
+          manual unless <code>spec.upgrade.finalize: Auto</code> is set. Each node advertises the cluster versions its binary
           supports; <code>animus cluster version</code> shows the active version, every node's
           range and what blocks raising it; finalize raises it one step, on the leader only,
           irreversibly, and is refused while any member is down, leaving, never activated or
-          does not support the target. A mixed-version simulation corpus covers the roll.
+          does not support the target. A mixed-version simulation corpus and a real-process
+          previous-release roll test cover it. A roll restarts each node in turn, so on a cluster
+          with spare nodes a slow restart can trigger replica rebuilds (correct, only wasteful).
           Supported: from today's binaries to this release, and from one release to the next.
           Not supported: skipping a release, rolling a node back after it ran the new binary,
-          and an old binary joining once versioning has started (refused by name). The
-          Kubernetes operator does not orchestrate this yet.</li>
+          reverting <code>spec.image</code> mid-roll, an old binary joining once versioning has started
+          (refused by name), and, for now, a roll from an older release with multi-item transactions in use (that
+          release's own abort-handling bug, open). The CLI restarts nothing itself.</li>
         <li><strong>Restore always creates a brand-new table, never in-place</strong> — matching
           real DynamoDB, for both on-demand backups (<code>RestoreTableFromBackup</code>) and
           continuous backups (<code>RestoreTableToPointInTime</code>); a source table's backup

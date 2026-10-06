@@ -436,15 +436,18 @@ table.put_item(Item={<span class="s">"id"</span>: <span class="s">"a-2"</span>, 
         give each process its own, on storage you would be happy to lose a machine's worth of.
       </p>
       <div class="callout warn">
-        <span class="label">No rolling upgrades yet</span>
+        <span class="label">Upgrading</span>
         <p>
-          To update AnimusDB, stop every node, install the new version, and start them all again;
-          on-disk formats are readable across versions and this path is tested. Do not run two
-          versions in one cluster (even briefly): the node-to-node wire has no cross-version
-          compatibility yet, so a rolling, node-by-node upgrade is not supported. Rolling
-          upgrade is in progress: nodes already report the cluster versions they support
-          (<code>animus cluster version</code>), but the mixed-version gates and their test
-          corpus have not landed.
+          Two supported paths, both tested in simulation: stop every node, install the new
+          version, and start them all again; or a node-by-node rolling upgrade (one release to
+          the next only), where <code>animus cluster roll plan</code> gives the order, you restart
+          one node at a time, <code>animus cluster roll wait</code> blocks until it is healthy,
+          and the irreversible <code>animus cluster finalize</code> comes last. The CLI restarts
+          nothing itself. On an operator-managed cluster of at least three nodes, editing
+          <code>spec.image</code> performs the same roll for you, one pod at a time behind the health
+          gate, and finalize stays yours unless you set <code>spec.upgrade.finalize: Auto</code>.
+          Rolling from an older release with multi-item transactions in use carries that release's own abort bug (open). There is no rollback
+          once a node has run the new binary. Procedure: <code>docs/runbook/upgrade.md</code>.
         </p>
       </div>
     </section>

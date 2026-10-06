@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use animus_control::meta::{MetaCommand, Metadata};
+use animus_control::meta::{MetaCommand, Metadata, NodeStatus};
 use animus_control::version::{
     ClusterFeatures, GateSurface, GatedCommand, NodeVersion, VersionRange, own_range,
 };
@@ -261,10 +261,16 @@ fn range_json(r: &VersionRange) -> Value {
 /// The `GET /admin/cluster-version` body. `observed` is the control leader's
 /// live observation table (`None` on a follower / data-only node, reported as
 /// `null`).
+///
+/// `control_leader` (this node's belief) orders the control leader last in
+/// `roll.remaining`; `health` is the ADR 0073 Phase 3 D2 verdict, embedded in
+/// `roll.health` (`null` when the caller has none). Both only add to the body.
 pub(crate) fn cluster_version_view(
     meta: &Metadata,
     own: &VersionProfile,
     observed: Option<&BTreeMap<NodeId, VersionObservation>>,
+    control_leader: Option<&NodeId>,
+    health: Option<&crate::roll_health::RollHealth>,
 ) -> Value {
     let active = meta.cluster_version();
     let era_active = meta.versioning_active();
@@ -311,6 +317,86 @@ pub(crate) fn cluster_version_view(
             .iter()
             .map(|b| json!({ "node": b.node.to_string(), "reason": b.reason }))
             .collect::<Vec<_>>(),
+        "roll": roll_view(meta, target, can_finalize, &blockers, control_leader, health),
+    })
+}
+
+/// The `roll` object of `GET /admin/cluster-version` (ADR 0073 Phase 3, D5).
+///
+/// **Derived, never stored**: a pure function of the replicated `Metadata`
+/// (each node's recorded range) plus the caller's live verdicts, so there is
+/// no roll state to lose in a leader change.
+///
+/// - `on_new`: required-set nodes whose recorded range max is `>= target`
+///   (the version `Finalize` would raise to).
+/// - `remaining`: the others, in the D1 roll order: data-only nodes first,
+///   then control voters, the control leader last; ties by id.
+/// - `phase`: `ready_to_finalize` iff `can_finalize`; else `not_started` when
+///   none is on the new range; else `blocked` when a member is
+///   `Down`/`Leaving`/`Joining` (Finalize refuses those, D1 step 5) or every
+///   node is on the new range yet Finalize is still refused; else `rolling`.
+/// - `down`: members the replicated status calls `Down`.
+/// - `blockers`: the same list as the top-level `blockers` (which, mid-roll,
+///   includes the not-yet-new nodes: "range [..] excludes target").
+fn roll_view(
+    meta: &Metadata,
+    target: u32,
+    can_finalize: bool,
+    blockers: &[Blocker],
+    control_leader: Option<&NodeId>,
+    health: Option<&crate::roll_health::RollHealth>,
+) -> Value {
+    let required = meta.required_version_set();
+    let total = required.len();
+    let on_new = |id: &NodeId| {
+        meta.node_versions
+            .get(id)
+            .is_some_and(|v| v.range.max >= target)
+    };
+    let mut remaining: Vec<(u8, NodeId)> = required
+        .iter()
+        .filter(|id| !on_new(id))
+        .map(|id| {
+            let role = meta.node_addrs.get(id).map_or("data", |a| a.role.as_str());
+            let class = if control_leader == Some(id) {
+                2
+            } else if role == "data" {
+                0
+            } else {
+                1
+            };
+            (class, id.clone())
+        })
+        .collect();
+    remaining.sort();
+    let on_new_count = total - remaining.len();
+    let down: Vec<String> = meta
+        .members
+        .iter()
+        .filter(|(_, m)| m.status == NodeStatus::Down)
+        .map(|(id, _)| id.to_string())
+        .collect();
+    let member_blocked = blockers.iter().any(|b| b.reason.starts_with("member is "));
+    let phase = if can_finalize {
+        "ready_to_finalize"
+    } else if on_new_count == 0 {
+        "not_started"
+    } else if member_blocked || remaining.is_empty() {
+        "blocked"
+    } else {
+        "rolling"
+    };
+    json!({
+        "phase": phase,
+        "total": total,
+        "on_new": on_new_count,
+        "remaining": remaining.iter().map(|(_, id)| id.to_string()).collect::<Vec<_>>(),
+        "down": down,
+        "blockers": blockers
+            .iter()
+            .map(|b| json!({ "node": b.node.to_string(), "reason": b.reason }))
+            .collect::<Vec<_>>(),
+        "health": health.map(crate::roll_health::RollHealth::summary_json),
     })
 }
 
@@ -694,7 +780,7 @@ mod tests {
         assert!(finalize_blockers(&ok, 2).is_empty());
         assert_eq!(safe_target(&ok, &VersionRange::new(1, 5)), Some(2));
         assert_eq!(safe_target(&ok, &VersionRange::new(1, 1)), Some(1));
-        let v = cluster_version_view(&ok, &VersionProfile::current(), None);
+        let v = cluster_version_view(&ok, &VersionProfile::current(), None, None, None);
         assert_eq!(v["active"], 1);
         assert_eq!(v["era_active"], true);
         // own max is `MAX_SUPPORTED` (2 since G-01 G-c, the first real gate),
@@ -708,9 +794,110 @@ mod tests {
                 build: "b2".to_string(),
             },
             None,
+            None,
+            None,
         );
         assert_eq!(v1["can_finalize"], false);
         assert_eq!(v["nodes"].as_array().unwrap().len(), 2);
         assert!(v["nodes"][0]["observed_range"].is_null());
+    }
+
+    // ---- ADR 0073 Phase 3, P3-A: the derived `roll` object ----
+
+    fn addrs(role: &str) -> NodeAddrs {
+        NodeAddrs {
+            internal: String::new(),
+            client: String::new(),
+            intra: String::new(),
+            admin: String::new(),
+            role: role.into(),
+        }
+    }
+
+    /// Era on at cluster version 1 (so target 2); `d` data-only, `v` a control
+    /// voter, `c` a combined node; every node starts on the old range [1,1].
+    fn roll_meta() -> Metadata {
+        let mut m = Metadata {
+            cluster_version: 1,
+            ..Default::default()
+        };
+        for (id, role) in [("d", "data"), ("v", "control"), ("c", "combined")] {
+            m.node_addrs.insert(nid(id), addrs(role));
+            if role != "control" {
+                m.members.insert(nid(id), member(NodeStatus::Active, true));
+            }
+            m.node_versions.insert(nid(id), rec(1, 1));
+        }
+        m
+    }
+
+    fn roll(meta: &Metadata, leader: Option<&NodeId>) -> Value {
+        cluster_version_view(meta, &VersionProfile::current(), None, leader, None)["roll"].clone()
+    }
+
+    #[test]
+    fn roll_phases_and_order() {
+        let mut m = roll_meta();
+        let leader = nid("v");
+        // Nobody on the new range: not_started; order data, then control
+        // voters (the combined node), the control leader last.
+        let r = roll(&m, Some(&leader));
+        assert_eq!(r["phase"], "not_started", "{r}");
+        assert_eq!(r["on_new"], 0);
+        assert_eq!(r["total"], 3);
+        assert_eq!(r["remaining"], json!(["d", "c", "v"]), "{r}");
+        assert!(r["health"].is_null());
+        // One node on the new range: rolling.
+        m.node_versions.insert(nid("d"), rec(1, 2));
+        let r = roll(&m, Some(&leader));
+        assert_eq!(r["phase"], "rolling", "{r}");
+        assert_eq!(r["on_new"], 1);
+        assert_eq!(r["remaining"], json!(["c", "v"]), "{r}");
+        // A Down member mid-roll: blocked, named in `down` and `blockers`.
+        m.members.insert(nid("c"), member(NodeStatus::Down, true));
+        let r = roll(&m, Some(&leader));
+        assert_eq!(r["phase"], "blocked", "{r}");
+        assert_eq!(r["down"], json!(["c"]));
+        assert!(
+            r["blockers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|b| b["node"] == "c" && b["reason"] == "member is Down")
+        );
+        // Everyone on the new range but a Down member: still blocked.
+        m.node_versions.insert(nid("c"), rec(1, 2));
+        m.node_versions.insert(nid("v"), rec(1, 2));
+        let r = roll(&m, Some(&leader));
+        assert_eq!(r["phase"], "blocked", "{r}");
+        assert!(r["remaining"].as_array().unwrap().is_empty());
+        // Member back: every node on the new range and Finalize allowed.
+        m.members.insert(nid("c"), member(NodeStatus::Active, true));
+        let r = roll(&m, Some(&leader));
+        assert_eq!(r["phase"], "ready_to_finalize", "{r}");
+        assert_eq!(r["on_new"], 3);
+        // The `roll` object is additive: the pre-existing keys are intact.
+        let v = cluster_version_view(&m, &VersionProfile::current(), None, None, None);
+        for k in [
+            "era_active",
+            "active",
+            "nodes",
+            "can_finalize",
+            "target",
+            "blockers",
+        ] {
+            assert!(v.get(k).is_some(), "missing {k}");
+        }
+    }
+
+    #[test]
+    fn roll_is_not_started_without_the_era() {
+        // Pre-era: no node has reported a range, so nobody is "on new".
+        let mut m = Metadata::default();
+        m.node_addrs.insert(nid("d"), addrs("data"));
+        m.members.insert(nid("d"), member(NodeStatus::Active, true));
+        let r = roll(&m, None);
+        assert_eq!(r["phase"], "not_started", "{r}");
+        assert_eq!(r["remaining"], json!(["d"]));
     }
 }

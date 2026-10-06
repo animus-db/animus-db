@@ -829,3 +829,20 @@ tests in `decide::tests`.
 No new relayed command or wire shape: the action proposes the existing
 `SetGlobalPreferredLeader` (M1/M2, `Gate::GlobalTables`).
 
+
+**`MrecApply` (ADR 0075 M3).** `ClientRequest::MrecApply`/`ClientResponse::MrecApply` are
+intra-only and class G (`Gate::MrecReplication`), with their own `MREC_PROTO`. The response
+gate is content-dependent: a whole-batch `Refused` is `Base` so a closed-gate node can still
+say "not yet"; `Answers` need the gate. Fixture `client-frame/v1-mrec.bin` (never edit).
+
+**MREC `MrecControl` and the admin route (ADR 0075 G-d M4-M6).** `MrecApplyRequest::control`
+carries the replica-saga peer calls (`CreateReplica`, `Leave`, `AddPeer`, and `SetTtl`, which
+was added after the first three: class G, fixtures `client-frame/v1-mrec-control.bin` and
+`v1-mrec-control-ttl.bin`, never edit). `MetaCommand::MarkMrecCopied` lives in `animus-control`
+but its relay arm is in `wire.rs`. `AdminHost::global_tables_view` serves both MRSC and MREC
+tables (`consistency` distinguishes them); `admin.rs` has the FakeHost routing test.
+
+## `AdminHost::roll_health_view` (ADR 0073 Phase 3, P3-A)
+
+New required method behind `GET /admin/roll-health` (always 200; `ok` in the body is the
+verdict). Both `animusd` impls delegate to `roll_health::roll_health` (see `animusd`'s guide).

@@ -287,7 +287,7 @@ const ORDINAL_BYTES: usize = 4;
 /// `packed_hlc || ordinal`. Every place that used to strip a bare
 /// [`HLC_BYTES`] to recover an item's own key prefix must strip this
 /// instead (issue #852 widened the suffix).
-const CHANGE_KEY_SUFFIX_BYTES: usize = HLC_BYTES + ORDINAL_BYTES;
+pub(crate) const CHANGE_KEY_SUFFIX_BYTES: usize = HLC_BYTES + ORDINAL_BYTES;
 
 /// How many change records one trim `KindBatch` entry deletes at most —
 /// bounds a large backlog's catch-up to several ticks instead of one
@@ -594,11 +594,15 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
             //   derives **zero expected terms** and its existing
             //   trim-everything rule (F10/F12-b) deletes every marker in
             //   declared range — the same rule, not a second deleter.
+            let mrec_ships = meta.table_global(&table).is_some_and(|g| {
+                g.is_mrec() && g.replicas.iter().any(crate::mrec_shipper::is_shippable)
+            });
             if gsis.is_empty()
                 && !stream_enabled
                 && !ever_streamed
                 && !pitr_enabled
                 && !ever_pitr_sealed
+                && !mrec_ships
             {
                 if splitting {
                     // Trim held for the build (the split driver above holds
@@ -1274,7 +1278,7 @@ fn record_hlc(key: &[u8]) -> Option<HlcTimestamp> {
 /// (issue #852) — the pagination-granularity read every `GetRecords`/
 /// `GetShardIterator` cursor path needs, unlike [`record_hlc`]'s
 /// HLC-only view. `None` on a malformed/too-short suffix.
-fn record_hlc_ordinal(key: &[u8]) -> Option<(HlcTimestamp, u32)> {
+pub(crate) fn record_hlc_ordinal(key: &[u8]) -> Option<(HlcTimestamp, u32)> {
     let suffix_start = key.len().checked_sub(CHANGE_KEY_SUFFIX_BYTES)?;
     let ts = cursor::decode_watermark(&key[suffix_start..suffix_start + HLC_BYTES])?;
     let ordinal_start = suffix_start + HLC_BYTES;
@@ -2589,6 +2593,13 @@ async fn trim_janitor(
             Some(w) => trim_point = Some(trim_point.map_or(w, |t| t.min(w))),
             None => blocked = true,
         }
+    }
+    // ADR 0075 section 4.2: the MREC shipper's per-peer `mrec:<region>` cursors.
+    if !blocked
+        && let Some(w) =
+            crate::mrec_shipper::trim_term(&ctx.env, &ctx.mrec, meta, table, group).await
+    {
+        trim_point = Some(trim_point.map_or(w, |t| t.min(w)));
     }
     ctx.data()
         .raftkv_metrics

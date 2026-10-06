@@ -378,6 +378,16 @@ pub fn apply_and_derive_mirror(
                 writes.push(put_json(syskv::schema_key(table), schema));
             }
         }
+        MetaCommand::ConvertTableToMrec { table, .. }
+        | MetaCommand::AddMrecReplica { table, .. }
+        | MetaCommand::RemoveMrecReplica { table, .. }
+        | MetaCommand::SetMrecReplicaStatus { table, .. }
+        | MetaCommand::MarkMrecCopied { table, .. } => {
+            // ADR 0075 (G-01 stage G-d): schema-only (placement is untouched).
+            if let Some(schema) = meta.schemas.get(table) {
+                writes.push(put_json(syskv::schema_key(table), schema));
+            }
+        }
         MetaCommand::ConvertTableToGlobal { table, .. } => {
             // ADR 0075 (G-01 stage G-c): the schema entry (`global` set) plus
             // the pinned policy this apply wrote for every tablet of the
@@ -2675,6 +2685,7 @@ mod tests {
                     regions: vec!["a".to_string(), "b".to_string(), "c".to_string()],
                     witness: None,
                     preferred_leader_region: "a".to_string(),
+                    replicas: Vec::new(),
                 },
             },
             MetaCommand::SetGlobalPreferredLeader {

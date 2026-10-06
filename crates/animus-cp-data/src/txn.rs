@@ -139,6 +139,19 @@ use crate::hlc::HlcTimestamp;
 /// as good as any other.
 const RECORD_TAG: u8 = 0x02;
 
+/// The second byte of a **resolved-marker** key's lead pair (see
+/// [`resolved_marker_key`]): like [`RECORD_TAG`], any value outside
+/// `{0x00, 0x01}` is structurally disjoint from every real key's
+/// post-token suffix (the module doc's `escape` argument), and `0x03` is
+/// reserved by `cursor.rs`'s (differently scoped) cursor rows.
+const RESOLVED_TAG: u8 = 0x04;
+
+/// Leading byte (format version) of a resolved-marker row's value
+/// (`txn-resolved-marker` v1): `[RESOLVED_MARKER_V1] || txn_id`. Chosen so
+/// an older binary's [`decode_record`] — which reads a `txn_id` first and
+/// then a status byte — has no reason to mistake it for a record.
+const RESOLVED_MARKER_V1: u8 = 0xA1;
+
 /// A transaction's identity: its own commit-attempt timestamp plus the node
 /// that minted it (ADR 0018 §2/PR3) — the node tiebreak is load-bearing:
 /// different tablet groups run independent `Hlc` instances that never
@@ -625,6 +638,76 @@ pub(crate) fn is_record_key(k: &[u8]) -> bool {
     k.len() >= TOKEN_BYTES + 2 && k[TOKEN_BYTES] == 0x00 && k[TOKEN_BYTES + 1] == RECORD_TAG
 }
 
+/// The logical key of the **resolved marker** for the base key `base_key`:
+/// `token(base_key) || [0x00, RESOLVED_TAG] || base_key`. A durable, per-key
+/// row recording *which transaction last resolved an intent at `base_key`*
+/// on this group — written by `TxnResolve`'s apply in the same merge batch
+/// as the resolve itself, read by `TxnStage`'s apply to reject a stale or
+/// duplicate stage for an already-resolved `(key, txn_id)`. Because it is
+/// engine state (not process memory) every replica — one that restarted,
+/// or installed a snapshot image — reads the identical value, which is what
+/// makes that rejection a deterministic function of (log, durable state).
+/// Token-led like [`record_key`], so it travels with its key across splits,
+/// snapshot images and range scans; it is one row per key (overwritten by
+/// the next resolve there), never one per transaction.
+///
+/// # Panics
+/// If `base_key` is shorter than [`TOKEN_BYTES`] (every real data-plane key
+/// leads with a full token, ADR 0022).
+#[must_use]
+pub(crate) fn resolved_marker_key(base_key: &[u8]) -> Vec<u8> {
+    assert!(
+        base_key.len() >= TOKEN_BYTES,
+        "txn::resolved_marker_key: key must lead with a {TOKEN_BYTES}-byte token (ADR 0022)"
+    );
+    let mut out = Vec::with_capacity(base_key.len() + 2);
+    out.extend_from_slice(&base_key[..TOKEN_BYTES]);
+    out.push(0x00);
+    out.push(RESOLVED_TAG);
+    out.extend_from_slice(base_key);
+    out
+}
+
+/// Whether logical key `k` is a [`resolved_marker_key`].
+#[must_use]
+pub(crate) fn is_resolved_marker_key(k: &[u8]) -> bool {
+    k.len() >= TOKEN_BYTES + 2 && k[TOKEN_BYTES] == 0x00 && k[TOKEN_BYTES + 1] == RESOLVED_TAG
+}
+
+/// Whether `k` is any of this module's internal bookkeeping keys (a txn
+/// record or a resolved marker) — what every client-facing scan and
+/// presence check must skip. [`is_record_key`] alone stays the predicate
+/// for code that decodes *records*.
+#[must_use]
+pub(crate) fn is_internal_key(k: &[u8]) -> bool {
+    is_record_key(k) || is_resolved_marker_key(k)
+}
+
+/// The value of a resolved-marker row naming `txn_id` (`txn-resolved-marker`
+/// v1).
+#[must_use]
+pub(crate) fn encode_resolved_marker(txn_id: &TxnId) -> Vec<u8> {
+    let mut out = vec![RESOLVED_MARKER_V1];
+    put_txn_id(&mut out, txn_id);
+    out
+}
+
+/// The dual of [`encode_resolved_marker`]; `None` on any other shape (an
+/// unknown version byte is treated as "no marker", never a panic).
+#[must_use]
+pub(crate) fn decode_resolved_marker(bytes: &[u8]) -> Option<TxnId> {
+    let (&version, body) = bytes.split_first()?;
+    if version != RESOLVED_MARKER_V1 {
+        return None;
+    }
+    let mut c = Cursor {
+        bytes: body,
+        pos: 0,
+    };
+    let id = c.txn_id()?;
+    (c.pos == body.len()).then_some(id)
+}
+
 // ---- binary encode/decode (this crate's compact style, mirroring seal.rs) -
 
 fn put_u8(out: &mut Vec<u8>, v: u8) {
@@ -965,11 +1048,12 @@ pub(crate) mod legacy {
 
         /// Legacy v1 encoder (ADR 0073 checklist step 7), anchored to
         /// `tests/fixtures/formats/txn-envelope/v1.bin` by a byte-equality
-        /// test. Behind `legacy-encoders` (not `cfg(test)`) because the
-        /// upgrade-restart harness's row-value transcode
-        /// ([`downgrade_intent_to_v1`]) re-encodes every stored v2 intent
-        /// through it when it restarts a node on "older-version" state.
-        #[cfg(any(test, feature = "legacy-encoders"))]
+        /// test. **Not** behind `legacy-encoders` any more: the production
+        /// snapshot sender ([`downgrade_intent_to_v1`], class G, ADR 0073's
+        /// 2026-10-05 `txn-envelope` amendment) re-encodes every v2 intent
+        /// through it while `Gate::GlobalTables` is closed, and the
+        /// upgrade-restart harness's row-value transcode uses the same
+        /// function.
         #[must_use]
         pub(crate) fn encode_intent(
             txn_id: &super::super::TxnId,
@@ -1001,9 +1085,24 @@ pub(crate) mod legacy {
         /// an engine's rows carry no type marker beyond the envelope tag, so
         /// the *whole* shape has to parse before a row is rewritten. Drops
         /// the `prior`, the one field v1 cannot express.
-        #[cfg(any(test, feature = "legacy-encoders"))]
+        ///
+        /// Production caller: `engine_image` (the snapshot a leader ships to a
+        /// follower) while the cluster has not finalized to the version that
+        /// introduces v2 — an N-1 reader panics on tag 2.
         #[must_use]
         pub(crate) fn downgrade_intent_to_v1(value: &[u8]) -> Option<Vec<u8>> {
+            downgrade_intent_to_v1_with_prior(value).map(|(v1, _prior)| v1)
+        }
+
+        /// [`downgrade_intent_to_v1`], also returning the dropped `prior`
+        /// (`Some(Some(v))` = the committed value the intent shadowed,
+        /// `Some(None)` = it shadowed nothing) so the snapshot sender can ship
+        /// it where a v1 reader's lookback finds it (the MVCC version just below
+        /// the intent) instead of losing it.
+        #[must_use]
+        pub(crate) fn downgrade_intent_to_v1_with_prior(
+            value: &[u8],
+        ) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
             use super::super::{Cursor, TAG_INTENT};
             if value.first() != Some(&TAG_INTENT) {
                 return None;
@@ -1018,17 +1117,20 @@ pub(crate) mod legacy {
             let staged_value = c.opt_bytes()?;
             let kind_writes = c.kind_writes()?;
             let change_log = c.change_log()?;
-            let _prior = c.opt_bytes()?;
+            let prior = c.opt_bytes()?;
             if c.pos != c.bytes.len() {
                 return None;
             }
-            Some(encode_intent(
-                &txn_id,
-                &record_key,
-                &record_table,
-                staged_value.as_deref(),
-                &kind_writes,
-                change_log.as_ref(),
+            Some((
+                encode_intent(
+                    &txn_id,
+                    &record_key,
+                    &record_table,
+                    staged_value.as_deref(),
+                    &kind_writes,
+                    change_log.as_ref(),
+                ),
+                prior,
             ))
         }
     }
@@ -1143,6 +1245,39 @@ mod tests {
                 "a real data key must never equal the txn record marker"
             );
         }
+    }
+
+    #[test]
+    fn resolved_marker_round_trips_and_is_disjoint_from_records_and_real_keys() {
+        let id = TxnId {
+            ts: ts(7, 1),
+            node: nid(4),
+        };
+        let mut base = vec![0x11; TOKEN_BYTES];
+        base.extend_from_slice(&escape(b"pk"));
+        base.extend_from_slice(b"rk");
+        let mk = resolved_marker_key(&base);
+        assert!(is_resolved_marker_key(&mk));
+        assert!(is_internal_key(&mk));
+        assert!(!is_record_key(&mk), "a marker is never decoded as a record");
+        assert!(!is_resolved_marker_key(&base));
+        assert!(!is_resolved_marker_key(&record_key(
+            &[0x11; TOKEN_BYTES],
+            &id
+        )));
+        // Led by the base key's own token, so it routes/splits with it.
+        assert_eq!(&mk[..TOKEN_BYTES], &base[..TOKEN_BYTES]);
+        let v = encode_resolved_marker(&id);
+        assert_eq!(decode_resolved_marker(&v), Some(id));
+        // Anything else is "no marker", never a panic.
+        assert_eq!(decode_resolved_marker(&[]), None);
+        assert_eq!(decode_resolved_marker(&[0x00]), None);
+        assert_eq!(decode_resolved_marker(&v[..v.len() - 1]), None);
+        let mut longer = v.clone();
+        longer.push(0);
+        assert_eq!(decode_resolved_marker(&longer), None);
+        // A txn record's own bytes are not a marker.
+        assert_eq!(decode_resolved_marker(&[0x00; 16]), None);
     }
 
     #[test]

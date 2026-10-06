@@ -619,6 +619,239 @@ pub struct AnimusClusterSpec {
     /// controlled by this field: it is always on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topology: Option<TopologySpec>,
+    /// Rolling-upgrade behaviour (ADR 0073 Phase 3, P3-D, additive). `None`
+    /// is [`UpgradeSpec::default`]: finalize stays manual, no soak.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgrade: Option<UpgradeSpec>,
+    /// This cluster's **MREC region name** (ADR 0075 section 5.4, G-01 stage
+    /// G-e): the namespace of [`peers`](Self::peers) and of an MREC global
+    /// table's replica set. Emitted into `cluster.json`'s
+    /// `cluster_settings.region`. Distinct from the `topology.kubernetes.io/
+    /// region` node label MRSC uses. Required when `peers` is non-empty.
+    /// Additive: absent on every pre-G-e spec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    /// The **peer clusters** this cluster replicates MREC global tables with
+    /// (ADR 0075 section 5.4). One `AnimusCluster` per Kubernetes cluster;
+    /// peers are symmetric (each side lists the others); there is no
+    /// federation CRD. Rendered into `cluster.json`'s
+    /// `cluster_settings.peers`. Requires `spec.tls` (mutual TLS on the
+    /// intra port authenticates the peer) unless
+    /// [`allow_insecure_peers`](Self::allow_insecure_peers). See [`PeerSpec`]
+    /// and [`AnimusClusterSpec::validate_peers_spec`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peers: Vec<PeerSpec>,
+    /// **Dev only.** Permit cross-cluster MREC traffic with no `spec.tls`
+    /// (maps to `cluster_settings.allow_insecure_peers`): the peer link is
+    /// then unauthenticated and unencrypted. Without it a spec with `peers`
+    /// and no `tls` is refused (`PeersSpecInvalid`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_insecure_peers: Option<bool>,
+    /// Bound, in milliseconds, on how far ahead of a receiver's own wall
+    /// clock a replicated MREC stamp may be (maps to
+    /// `cluster_settings.mrec_max_clock_skew_ms`). Unset keeps animusd's
+    /// default (500); `0` is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mrec_max_clock_skew_ms: Option<u64>,
+}
+
+/// One entry of `spec.peers` (ADR 0075 section 5.4, G-01 stage G-e): a peer
+/// cluster's MREC region name, the `host:port` endpoints of its nodes'
+/// **intra** ports (explicit, user-supplied LoadBalancer or multi-cluster
+/// DNS names; there is no automatic discovery), and optionally the Secret
+/// holding that peer's CA.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerSpec {
+    /// The peer's own `spec.region`.
+    pub region: String,
+    /// `host:port` of the peer's intra port (any peer data node accepts a
+    /// frame). At least one.
+    pub endpoints: Vec<String>,
+    /// A `Secret` in this namespace holding the peer cluster's CA
+    /// certificate(s), only **referenced** (never created or written by this
+    /// operator; a cert-manager user points it at the CA `Certificate`'s
+    /// Secret). Mounted read-only, added to this cluster's inbound trust
+    /// bundle and used to verify this peer's server certificate. Omit when
+    /// the peer's certificates chain to the same CA as `spec.tls`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_secret_ref: Option<PeerCaSecretRef>,
+}
+
+/// `spec.peers[].caSecretRef`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerCaSecretRef {
+    /// The `Secret`'s name (same namespace).
+    pub name: String,
+    /// The data key holding the PEM CA bundle. Defaults to `ca.crt`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+}
+
+impl PeerCaSecretRef {
+    /// The data key, defaulting to `ca.crt`.
+    #[must_use]
+    pub fn key_or_default(&self) -> &str {
+        self.key.as_deref().unwrap_or("ca.crt")
+    }
+}
+
+impl AnimusClusterSpec {
+    /// Whether any peer names a CA `Secret` (so a merged trust bundle is
+    /// needed).
+    #[must_use]
+    pub fn has_peer_ca(&self) -> bool {
+        self.peers.iter().any(|p| p.ca_secret_ref.is_some())
+    }
+
+    /// Pure validation of `spec.region`/`peers`/`allowInsecurePeers`/
+    /// `mrecMaxClockSkewMs` (G-e). Mirrors animusd's own
+    /// `ClusterSettings::validate_mrec` and adds the TLS rule: peers need
+    /// `spec.tls` unless `allowInsecurePeers`.
+    ///
+    /// # Errors
+    /// A message naming the first violated rule.
+    pub fn validate_peers_spec(&self) -> Result<(), String> {
+        if let Some(r) = &self.region
+            && !valid_region_name(r)
+        {
+            return Err(format!(
+                "spec.region \"{r}\" must be 1-63 characters of [A-Za-z0-9._-]"
+            ));
+        }
+        if self.mrec_max_clock_skew_ms == Some(0) {
+            return Err("spec.mrecMaxClockSkewMs must be at least 1".to_string());
+        }
+        if self.peers.is_empty() {
+            return Ok(());
+        }
+        let Some(own) = self.region.as_deref() else {
+            return Err("spec.peers requires spec.region (this cluster's own region name)".into());
+        };
+        let insecure = self.allow_insecure_peers.unwrap_or(false);
+        if self.tls.is_none() && !insecure {
+            return Err(
+                "spec.peers requires spec.tls: cross-cluster MREC traffic is authenticated by \
+                 mutual TLS on the intra port (ADR 0064/0075); set spec.tls, or \
+                 spec.allowInsecurePeers: true for dev only (unauthenticated, unencrypted)"
+                    .to_string(),
+            );
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for p in &self.peers {
+            if !valid_region_name(&p.region) {
+                return Err(format!(
+                    "spec.peers region \"{}\" must be 1-63 characters of [A-Za-z0-9._-]",
+                    p.region
+                ));
+            }
+            if p.region == own {
+                return Err(format!(
+                    "spec.peers names this cluster's own region \"{own}\""
+                ));
+            }
+            if !seen.insert(p.region.as_str()) {
+                return Err(format!(
+                    "spec.peers names region \"{}\" more than once",
+                    p.region
+                ));
+            }
+            if p.endpoints.is_empty() {
+                return Err(format!("spec.peers[{}] has no endpoints", p.region));
+            }
+            for e in &p.endpoints {
+                if peer_endpoint_port(e).is_none() {
+                    return Err(format!(
+                        "spec.peers[{}] endpoint \"{e}\" is not host:port",
+                        p.region
+                    ));
+                }
+            }
+            if let Some(c) = &p.ca_secret_ref {
+                if c.name.trim().is_empty() || c.key.as_deref().is_some_and(|k| k.trim().is_empty())
+                {
+                    return Err(format!(
+                        "spec.peers[{}].caSecretRef needs a non-empty name and key",
+                        p.region
+                    ));
+                }
+                if self.tls.is_none() {
+                    return Err(format!(
+                        "spec.peers[{}].caSecretRef requires spec.tls (the CA joins the TLS trust \
+                         bundle)",
+                        p.region
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn valid_region_name(r: &str) -> bool {
+    !r.is_empty()
+        && r.len() <= 63
+        && r.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// The port of a `host:port` peer endpoint, `None` when malformed.
+#[must_use]
+pub fn peer_endpoint_port(endpoint: &str) -> Option<u16> {
+    let (host, port) = endpoint.rsplit_once(':')?;
+    if host.is_empty() {
+        return None;
+    }
+    port.parse::<u16>().ok().filter(|p| *p != 0)
+}
+
+/// `spec.upgrade` (ADR 0073 Phase 3, D6): how the operator ends a roll it
+/// drove. Every pod-template change (image **and** restart-relevant config)
+/// is rolled one pod at a time under the `animus-roll` gate regardless of this
+/// section; it only chooses what happens once every pod is on the new
+/// revision.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UpgradeSpec {
+    /// `Manual` (default): the operator never raises the cluster version; it
+    /// reports `UpgradeFinalizePending` and a human runs `animus cluster
+    /// finalize` (irreversible). `Auto` (opt-in): the operator finalizes once
+    /// the roll it drove is complete, `can_finalize` is true and every
+    /// verdict has been `ok` for [`soak_seconds`](Self::soak_seconds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalize: Option<FinalizePolicy>,
+    /// With `finalize: Auto`: how long the finished roll must stay healthy
+    /// before the operator finalizes. Default `0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soak_seconds: Option<u32>,
+}
+
+/// `spec.upgrade.finalize`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum FinalizePolicy {
+    Manual,
+    Auto,
+}
+
+impl AnimusClusterSpec {
+    /// The resolved `spec.upgrade.finalize` (default [`FinalizePolicy::Manual`]).
+    #[must_use]
+    pub fn finalize_policy(&self) -> FinalizePolicy {
+        self.upgrade
+            .as_ref()
+            .and_then(|u| u.finalize)
+            .unwrap_or(FinalizePolicy::Manual)
+    }
+
+    /// The resolved `spec.upgrade.soakSeconds` (default `0`).
+    #[must_use]
+    pub fn soak_seconds_or_default(&self) -> u32 {
+        self.upgrade
+            .as_ref()
+            .and_then(|u| u.soak_seconds)
+            .unwrap_or(0)
+    }
 }
 
 /// `spec.topology` (G-01 stage G-a).
@@ -669,6 +902,11 @@ impl Default for AnimusClusterSpec {
             segment_store: None,
             encryption_key_secret_name: None,
             topology: None,
+            upgrade: None,
+            region: None,
+            peers: Vec::new(),
+            allow_insecure_peers: None,
+            mrec_max_clock_skew_ms: None,
         }
     }
 }
@@ -835,6 +1073,74 @@ pub struct AnimusClusterStatus {
     /// Typed conditions (`status.conditions[]`), the usual Kubernetes shape.
     #[serde(default)]
     pub conditions: Vec<ClusterCondition>,
+    /// The rolling upgrade the operator is driving, or last drove (ADR 0073
+    /// Phase 3, D7). Additive; once present it is never removed (a merge
+    /// patch cannot drop it), it ends in [`UpgradePhase::Complete`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgrade: Option<UpgradeStatus>,
+}
+
+/// `status.upgrade`. **Derived state, with one exception**: every field except
+/// the three clocks and the two image names is re-derived from live truth (the
+/// `StatefulSet`'s revisions and partition, the pods, the admin endpoints) on
+/// every reconcile; a restarted operator resumes from those, not from here.
+/// The clocks (`inFlightSince`, `settledSince`, epoch seconds on the operator's
+/// own wall clock) exist because "how long has this node been in flight" and
+/// "how long has the roll been settled" are the operator's own measurements,
+/// and the images because a revert (`spec.image` back to `fromImage`) must be
+/// recognisable. The fields serialize as explicit `null`s (no
+/// `skip_serializing_if`) so the status merge patch clears them.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UpgradeStatus {
+    pub phase: UpgradePhase,
+    /// The cluster version in force when the roll was first observed.
+    #[serde(default)]
+    pub from_version: Option<u32>,
+    /// The cluster version the roll finalizes to (the new binaries' own range
+    /// max), once a pod on the new binary has reported it.
+    #[serde(default)]
+    pub to_version: Option<u32>,
+    /// Pods on the new revision that are `Ready`.
+    #[serde(default)]
+    pub on_new: Option<i32>,
+    /// Pods the roll covers (`StatefulSet` replicas).
+    #[serde(default)]
+    pub total: Option<i32>,
+    /// The cluster version currently active (`GET /admin/cluster-version`).
+    #[serde(default)]
+    pub active_cluster_version: Option<u32>,
+    /// The container image before the roll started.
+    #[serde(default)]
+    pub from_image: Option<String>,
+    /// The container image the roll is rolling to.
+    #[serde(default)]
+    pub to_image: Option<String>,
+    /// The node currently in flight (restarting or not yet healthy) and since
+    /// when (epoch seconds): the stall clock.
+    #[serde(default)]
+    pub in_flight_node: Option<String>,
+    #[serde(default)]
+    pub in_flight_since: Option<i64>,
+    /// Since when (epoch seconds) every node has been done and healthy: the
+    /// `spec.upgrade.soakSeconds` clock.
+    #[serde(default)]
+    pub settled_since: Option<i64>,
+}
+
+/// `status.upgrade.phase`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum UpgradePhase {
+    /// Rolling (or waiting for the next safe step).
+    InProgress,
+    /// Paused on a named reason (`UpgradeBlocked`); nothing moves until it
+    /// clears or the spec is fixed forward.
+    Blocked,
+    /// Every pod is on the new revision; finalize is the human's (or, with
+    /// `finalize: Auto`, the operator's after the soak).
+    FinalizePending,
+    /// Finished (finalized, or no cluster-version change was involved).
+    Complete,
 }
 
 /// The cluster's coarse lifecycle phase (`AnimusClusterStatus.phase`).
@@ -975,6 +1281,22 @@ pub const CONDITION_STORE_SPEC_INVALID: &str = "StoreSpecInvalid";
 /// self-healing the moment the Secret is created) rather than actively
 /// flipping the cluster to plaintext and back.
 pub const CONDITION_ENCRYPTION_KEY_SECRET_INVALID: &str = "EncryptionKeySecretInvalid";
+/// Condition type name used when `spec.region`/`spec.peers` fail
+/// [`AnimusClusterSpec::validate_peers_spec`] (peers without a region or
+/// without `spec.tls` and the dev-only `allowInsecurePeers` opt-in, a
+/// duplicate or own-region peer, a malformed endpoint). **Refuse, not
+/// strip**: the reconciler applies no child until the spec is fixed (the
+/// last applied cluster, peers included, keeps running), since silently
+/// dropping `peers` would stop replication and silently dropping the TLS rule
+/// would open an unauthenticated link. The webhook rejects the write itself
+/// when installed.
+pub const CONDITION_PEERS_SPEC_INVALID: &str = "PeersSpecInvalid";
+/// Condition type name for peer-cluster health (G-e): `True` when every
+/// configured peer has a healthy MREC shipper, `False` when one does not,
+/// `Unknown` until an MREC table replicates with the peer (or no pod's admin
+/// endpoint answered). Positive polarity, unlike the `*Invalid` conditions.
+/// See `crate::peers::evaluate`.
+pub const CONDITION_PEER_REACHABLE: &str = "PeerReachable";
 /// Condition type name used when `spec.nodes` is below 1 (S-07e, ADR 0070 —
 /// `crate::validate::validate_nodes`). **Purely informational, unlike every
 /// other `*SpecInvalid` condition above**: there is no sane fallback value
@@ -996,6 +1318,26 @@ pub const CONDITION_NODES_SPEC_INVALID: &str = "NodesSpecInvalid";
 /// content this operator cannot interpret must not be partially applied)
 /// and waits for a spec change rather than backing off.
 pub const CONDITION_SCHEMA_VERSION_INVALID: &str = "SchemaVersionInvalid";
+
+/// A rolling upgrade is under way (ADR 0073 Phase 3, D7): a pod-template
+/// change (image or restart-relevant config) is being rolled one pod at a
+/// time under the `animus-roll` gate. Message names the next step.
+pub const CONDITION_UPGRADE_IN_PROGRESS: &str = "UpgradeInProgress";
+/// The roll is paused or refused, with the named reason (D2 health reason,
+/// unobservable admin port, PDB `maxUnavailable` 0, a stalled node, a
+/// finalize blocker). Nothing rolls further; the cluster serves normally at
+/// its old cluster version (D9). Fix forward by editing `spec.image` again.
+pub const CONDITION_UPGRADE_BLOCKED: &str = "UpgradeBlocked";
+/// Every pod is on the new revision and `can_finalize` holds; finalize is
+/// irreversible and is the human's (`finalize: Manual`) or, after the soak,
+/// the operator's (`finalize: Auto`).
+pub const CONDITION_UPGRADE_FINALIZE_PENDING: &str = "UpgradeFinalizePending";
+/// The roll finished. Stays until the next roll starts.
+pub const CONDITION_ROLL_COMPLETE: &str = "RollComplete";
+/// A spec edit was held or refused because a roll is in flight: `nodes` /
+/// `controlNodes` changes wait for `RollComplete`; reverting `spec.image` to
+/// the pre-roll image after a pod reported the new range is refused (D8/D9).
+pub const CONDITION_UPGRADE_CHANGES_HELD: &str = "UpgradeChangesHeld";
 
 #[cfg(test)]
 mod tests {
@@ -1410,5 +1752,171 @@ mod tests {
             ..valid_s3_spec()
         });
         assert!(spec.validate_store_spec().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod peers_tests {
+    use super::*;
+
+    fn peer(region: &str, ep: &str) -> PeerSpec {
+        PeerSpec {
+            region: region.to_string(),
+            endpoints: vec![ep.to_string()],
+            ca_secret_ref: None,
+        }
+    }
+
+    fn federated() -> AnimusClusterSpec {
+        AnimusClusterSpec {
+            nodes: 3,
+            region: Some("us".to_string()),
+            peers: vec![peer("eu", "eu.example.com:14004")],
+            tls: Some(TlsSpec {
+                secret_name: Some("t".to_string()),
+                cert_manager: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_spec_without_the_g_e_fields_parses_and_serializes_identically() {
+        let json = serde_json::json!({"schemaVersion": 1, "nodes": 3});
+        let spec: AnimusClusterSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(spec.region, None);
+        assert!(spec.peers.is_empty());
+        let out = serde_json::to_value(&spec).unwrap();
+        for k in [
+            "region",
+            "peers",
+            "allowInsecurePeers",
+            "mrecMaxClockSkewMs",
+        ] {
+            assert!(out.get(k).is_none(), "{k} leaked into {out}");
+        }
+        assert!(spec.validate_peers_spec().is_ok());
+    }
+
+    #[test]
+    fn peers_round_trip_with_camel_case_names() {
+        let json = serde_json::json!({
+            "schemaVersion": 1, "nodes": 3, "storage": {}, "clientService": {}, "region": "us",
+            "peers": [{"region": "eu", "endpoints": ["a:1"],
+                       "caSecretRef": {"name": "eu-ca", "key": "tls.crt"}}],
+            "allowInsecurePeers": true, "mrecMaxClockSkewMs": 250
+        });
+        let spec: AnimusClusterSpec = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&spec).unwrap(), json);
+        assert_eq!(
+            spec.peers[0]
+                .ca_secret_ref
+                .as_ref()
+                .unwrap()
+                .key_or_default(),
+            "tls.crt"
+        );
+    }
+
+    #[test]
+    fn the_ca_key_defaults_to_ca_crt() {
+        let r = PeerCaSecretRef {
+            name: "n".into(),
+            key: None,
+        };
+        assert_eq!(r.key_or_default(), "ca.crt");
+    }
+
+    #[test]
+    fn a_federated_spec_with_tls_is_valid() {
+        assert_eq!(federated().validate_peers_spec(), Ok(()));
+    }
+
+    #[test]
+    fn peers_without_tls_are_refused_unless_the_dev_opt_in_is_set() {
+        let mut s = federated();
+        s.tls = None;
+        let e = s.validate_peers_spec().unwrap_err();
+        assert!(
+            e.contains("spec.tls") && e.contains("allowInsecurePeers"),
+            "{e}"
+        );
+        s.allow_insecure_peers = Some(true);
+        assert_eq!(s.validate_peers_spec(), Ok(()));
+        s.allow_insecure_peers = Some(false);
+        assert!(s.validate_peers_spec().is_err());
+    }
+
+    #[test]
+    fn peers_need_a_region_and_must_not_repeat_or_name_the_own_region() {
+        let mut s = federated();
+        s.region = None;
+        assert!(s.validate_peers_spec().unwrap_err().contains("spec.region"));
+        let mut s = federated();
+        s.peers.push(peer("us", "x:1"));
+        assert!(s.validate_peers_spec().unwrap_err().contains("own region"));
+        let mut s = federated();
+        s.peers.push(peer("eu", "x:1"));
+        assert!(
+            s.validate_peers_spec()
+                .unwrap_err()
+                .contains("more than once")
+        );
+    }
+
+    #[test]
+    fn endpoints_must_be_host_port() {
+        for bad in ["nohost", ":14004", "h:0", "h:99999", "h:x"] {
+            let mut s = federated();
+            s.peers[0].endpoints = vec![bad.to_string()];
+            assert!(s.validate_peers_spec().is_err(), "{bad}");
+        }
+        let mut s = federated();
+        s.peers[0].endpoints.clear();
+        assert!(
+            s.validate_peers_spec()
+                .unwrap_err()
+                .contains("no endpoints")
+        );
+    }
+
+    #[test]
+    fn a_peer_ca_secret_needs_tls_and_a_name() {
+        let mut s = federated();
+        s.peers[0].ca_secret_ref = Some(PeerCaSecretRef {
+            name: " ".into(),
+            key: None,
+        });
+        assert!(s.validate_peers_spec().is_err());
+        let mut s = federated();
+        s.tls = None;
+        s.allow_insecure_peers = Some(true);
+        s.peers[0].ca_secret_ref = Some(PeerCaSecretRef {
+            name: "ca".into(),
+            key: None,
+        });
+        assert!(
+            s.validate_peers_spec()
+                .unwrap_err()
+                .contains("requires spec.tls")
+        );
+    }
+
+    #[test]
+    fn region_name_charset_and_clock_skew_are_checked() {
+        let mut s = federated();
+        s.region = Some("us east".into());
+        assert!(s.validate_peers_spec().is_err());
+        let mut s = federated();
+        s.mrec_max_clock_skew_ms = Some(0);
+        assert!(s.validate_peers_spec().is_err());
+    }
+
+    #[test]
+    fn validate_spec_reports_the_peers_violation() {
+        let mut s = federated();
+        s.tls = None;
+        let v = crate::validate::validate_spec(None, &s).unwrap_err();
+        assert!(v.iter().any(|v| v.field == "spec.region/spec.peers"));
     }
 }

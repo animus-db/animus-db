@@ -464,10 +464,159 @@ pub struct ClusterSettings {
     /// Raft group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_region_rtt_ms: Option<u64>,
+    /// `--region NAME` (ADR 0075 section 4, G-01 stage G-d M3): **this
+    /// cluster's own MREC region name** — the namespace of
+    /// [`peers`](Self::peers) and of an MREC table's replica set (a *peer
+    /// cluster* name, distinct from the `topology.kubernetes.io/region`
+    /// member label MRSC uses). Required when `peers` is non-empty. Static and
+    /// node-local (the same value on every node of the cluster, like the
+    /// address book), never replicated `Metadata`. Additive and skipped when
+    /// unset (class L: ADR 0073 Phase 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    /// `--peer REGION=host:port[,host:port...]` (repeatable; ADR 0075 section
+    /// 4.3, G-d M3): the **peer clusters** this cluster exchanges MREC
+    /// replication traffic with, each named by its own region and reached on
+    /// its nodes' **intra** ports (any peer data node accepts a frame). Static,
+    /// node-local, never replicated (G-e's operator renders it). A CLI `--peer`
+    /// *adds to* the config file's list (a region named on both sides is a
+    /// duplicate-region error, never a silent override). See [`PeerCluster`]
+    /// and [`ClusterSettings::validate_mrec`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peers: Vec<PeerCluster>,
+    /// `--allow-insecure-peers` (G-d M3, dev/sim only): permit cross-cluster
+    /// MREC traffic on a node with **no TLS configured**. Cross-cluster
+    /// authentication is ADR 0064 mutual TLS on the intra port, so without TLS
+    /// the peer link is unauthenticated and unencrypted; the default (`false`)
+    /// refuses to dial a peer, and refuses to accept a peer frame, on a
+    /// plaintext node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_insecure_peers: Option<bool>,
+    /// `--mrec-max-clock-skew-ms MS` (ADR 0075 section 4.4, G-d M3): the
+    /// receiver rejects (answers `Retry`, bumps `mrec_skew_rejected_total`) a
+    /// replicated record whose stamp's wall part is more than this far ahead
+    /// of its own `wall_now`, so a far-future stamp from a fast-clocked region
+    /// cannot win every conflict forever. `None` resolves to
+    /// [`DEFAULT_MREC_MAX_CLOCK_SKEW_MS`] (500); `0` is rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mrec_max_clock_skew_ms: Option<u64>,
 }
 
 /// The default [`ClusterSettings::max_region_rtt_ms`] (ADR 0075 section 3.4).
 pub const DEFAULT_MAX_REGION_RTT_MS: u64 = 150;
+
+/// The default [`ClusterSettings::mrec_max_clock_skew_ms`] (ADR 0075 section
+/// 4.4).
+pub const DEFAULT_MREC_MAX_CLOCK_SKEW_MS: u64 = 500;
+
+/// One **peer cluster** an MREC table replicates with (G-d M3): its region
+/// name and the intra-port endpoints of its nodes. See
+/// [`ClusterSettings::peers`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerCluster {
+    /// The peer's region name (its own `cluster_settings.region`).
+    pub region: String,
+    /// `host:port` of the peer nodes' **intra** ports, tried in order; a
+    /// frame may be sent to any peer data node (the receiver routes it).
+    pub endpoints: Vec<String>,
+    /// Optional PEM file with the peer's CA, **in addition** to this node's own
+    /// `--tls-ca` bundle, used to verify this peer's server certificate on a
+    /// dial. The peer's *inbound* trust of this cluster is the peer's own
+    /// `--tls-ca` bundle (a cross-cluster pair needs each side's CA in the
+    /// other's bundle for mutual TLS on the intra port).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_ca: Option<String>,
+}
+
+impl ClusterSettings {
+    /// Startup validation of the MREC peer settings (G-d M3): a region name
+    /// is required whenever peers are set; no peer may be this cluster's own
+    /// region or repeat another peer's; every peer needs at least one
+    /// well-formed `host:port` endpoint; the skew bound must be positive.
+    ///
+    /// # Errors
+    /// A message naming the first offending setting.
+    pub fn validate_mrec(&self) -> Result<(), String> {
+        if let Some(r) = &self.region
+            && r.trim().is_empty()
+        {
+            return Err("cluster_settings.region must not be empty".into());
+        }
+        if !self.peers.is_empty() && self.region.is_none() {
+            return Err(
+                "cluster_settings.peers requires cluster_settings.region (this cluster's own \
+                 region name)"
+                    .into(),
+            );
+        }
+        if self.mrec_max_clock_skew_ms == Some(0) {
+            return Err("cluster_settings.mrec_max_clock_skew_ms must be at least 1".into());
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for p in &self.peers {
+            if p.region.trim().is_empty() {
+                return Err("a cluster_settings.peers entry has an empty region".into());
+            }
+            if self.region.as_deref() == Some(p.region.as_str()) {
+                return Err(format!(
+                    "cluster_settings.peers names this cluster's own region `{}`",
+                    p.region
+                ));
+            }
+            if !seen.insert(p.region.as_str()) {
+                return Err(format!(
+                    "cluster_settings.peers names region `{}` more than once",
+                    p.region
+                ));
+            }
+            if p.endpoints.is_empty() {
+                return Err(format!("peer `{}` has no endpoints", p.region));
+            }
+            for e in &p.endpoints {
+                let ok = e
+                    .rsplit_once(':')
+                    .is_some_and(|(h, port)| !h.is_empty() && port.parse::<u16>().is_ok());
+                if !ok {
+                    return Err(format!(
+                        "peer `{}` endpoint `{e}` is not host:port",
+                        p.region
+                    ));
+                }
+            }
+            if p.tls_ca.as_deref().is_some_and(|c| c.trim().is_empty()) {
+                return Err(format!("peer `{}` has an empty tls_ca", p.region));
+            }
+        }
+        Ok(())
+    }
+
+    /// Parse one `--peer REGION=host:port[,host:port...]` flag value.
+    ///
+    /// # Errors
+    /// A message when the value has no `=`, an empty region, or no endpoint.
+    pub fn parse_peer_flag(value: &str) -> Result<PeerCluster, String> {
+        let (region, eps) = value
+            .split_once('=')
+            .ok_or_else(|| format!("--peer `{value}`: expected REGION=host:port[,host:port...]"))?;
+        let endpoints: Vec<String> = eps
+            .split(',')
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if region.trim().is_empty() || endpoints.is_empty() {
+            return Err(format!(
+                "--peer `{value}`: expected REGION=host:port[,host:port...]"
+            ));
+        }
+        Ok(PeerCluster {
+            region: region.trim().to_owned(),
+            endpoints,
+            tls_ca: None,
+        })
+    }
+}
 
 /// The `"v"` this build writes and the highest it reads (ADR 0073 Phase 0,
 /// Workstream E). The Phase 0 baseline is `1`.
@@ -767,6 +916,9 @@ impl ClusterConfig {
             auth.validate().map_err(ConfigError::Invalid)?;
         }
         cfg.validate_tls().map_err(ConfigError::Invalid)?;
+        if let Some(s) = &cfg.cluster_settings {
+            s.validate_mrec().map_err(ConfigError::Invalid)?;
+        }
         for n in &cfg.nodes {
             if let Some(o) = &n.overload {
                 o.validate().map_err(ConfigError::Invalid)?;
@@ -1043,9 +1195,117 @@ mod tests {
             tablet_max_read_units: Some(100),
             tablet_max_write_units: Some(100),
             max_region_rtt_ms: Some(220),
+            region: Some("us".into()),
+            peers: vec![PeerCluster {
+                region: "eu".into(),
+                endpoints: vec!["h:1".into()],
+                tls_ca: None,
+            }],
+            allow_insecure_peers: Some(false),
+            mrec_max_clock_skew_ms: Some(300),
         });
         let parsed = ClusterConfig::from_json(&cfg.to_json()).unwrap();
         assert_eq!(parsed.cluster_settings, cfg.cluster_settings);
+    }
+
+    // --- MREC peer settings (G-d M3) -------------------------------------
+
+    fn peer(region: &str, eps: &[&str]) -> PeerCluster {
+        PeerCluster {
+            region: region.into(),
+            endpoints: eps.iter().map(|e| (*e).to_owned()).collect(),
+            tls_ca: None,
+        }
+    }
+
+    #[test]
+    fn mrec_settings_are_additive_and_pinned_json() {
+        // Absent: an ordinary config's `cluster_settings` bytes carry no MREC key.
+        let plain = serde_json::to_string(&ClusterSettings::default()).unwrap();
+        for key in [
+            "region",
+            "peers",
+            "allow_insecure_peers",
+            "mrec_max_clock_skew_ms",
+        ] {
+            assert!(
+                !plain.contains(key),
+                "default settings must not emit `{key}`: {plain}"
+            );
+        }
+        let s = ClusterSettings {
+            region: Some("us".into()),
+            peers: vec![PeerCluster {
+                tls_ca: Some("/ca.pem".into()),
+                ..peer("eu", &["10.0.0.1:7004", "10.0.0.2:7004"])
+            }],
+            allow_insecure_peers: Some(true),
+            mrec_max_clock_skew_ms: Some(250),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(
+            json.ends_with(
+                r#""region":"us","peers":[{"region":"eu","endpoints":["10.0.0.1:7004","10.0.0.2:7004"],"tls_ca":"/ca.pem"}],"allow_insecure_peers":true,"mrec_max_clock_skew_ms":250}"#
+            ),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<ClusterSettings>(&json).unwrap(), s);
+        // A misspelled peer key is refused, not silently ignored.
+        assert!(
+            serde_json::from_str::<PeerCluster>(r#"{"region":"a","endpoints":[],"tls":"x"}"#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn mrec_validation_rejects_each_misconfiguration_by_name() {
+        let ok = ClusterSettings {
+            region: Some("us".into()),
+            peers: vec![peer("eu", &["h:1"]), peer("ap", &["h2:2"])],
+            ..Default::default()
+        };
+        ok.validate_mrec().expect("valid");
+        ClusterSettings::default()
+            .validate_mrec()
+            .expect("absent is valid");
+        let bad = |f: &dyn Fn(&mut ClusterSettings), needle: &str| {
+            let mut s = ok.clone();
+            f(&mut s);
+            let e = s.validate_mrec().expect_err(needle);
+            assert!(e.contains(needle), "{e} should mention {needle}");
+        };
+        bad(&|s| s.region = None, "requires cluster_settings.region");
+        bad(&|s| s.region = Some("eu".into()), "own region");
+        bad(&|s| s.peers.push(peer("eu", &["x:3"])), "more than once");
+        bad(&|s| s.peers[0].endpoints.clear(), "no endpoints");
+        bad(
+            &|s| s.peers[0].endpoints = vec!["nocolon".into()],
+            "host:port",
+        );
+        bad(
+            &|s| s.peers[0].endpoints = vec!["h:notaport".into()],
+            "host:port",
+        );
+        bad(&|s| s.peers[0].region = " ".into(), "empty region");
+        bad(&|s| s.mrec_max_clock_skew_ms = Some(0), "at least 1");
+        bad(&|s| s.region = Some(String::new()), "must not be empty");
+    }
+
+    #[test]
+    fn config_load_validates_mrec_and_peer_flag_parses() {
+        let mut cfg = ClusterConfig::generate(1, "127.0.0.1".parse().unwrap(), 7000);
+        cfg.cluster_settings = Some(ClusterSettings {
+            peers: vec![peer("eu", &["h:1"])],
+            ..Default::default()
+        });
+        let err = ClusterConfig::from_json(&cfg.to_json()).expect_err("peers need a region");
+        assert!(err.to_string().contains("requires cluster_settings.region"));
+        let p = ClusterSettings::parse_peer_flag("eu=h:1, h2:2").unwrap();
+        assert_eq!(p, peer("eu", &["h:1", "h2:2"]));
+        assert!(ClusterSettings::parse_peer_flag("eu").is_err());
+        assert!(ClusterSettings::parse_peer_flag("=h:1").is_err());
+        assert!(ClusterSettings::parse_peer_flag("eu=").is_err());
     }
 
     #[test]

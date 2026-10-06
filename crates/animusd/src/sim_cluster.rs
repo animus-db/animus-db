@@ -1048,6 +1048,20 @@ impl SimClusterHandle {
         self.ctxs.lock().expect("ctxs poisoned")[node as usize].clone()
     }
 
+    /// A clone of `node`'s own `ClientCtx` for code that runs the node's real
+    /// handlers by hand (G-d M3: the MREC receiver driven through `SimWorld`).
+    pub(crate) fn node_ctx(&self, node: u64) -> SimNodeCtx {
+        self.ctx(node)
+    }
+
+    /// Give every node's `ClientCtx` the MREC peer configuration `cfg` (G-d M4b:
+    /// the wire-edge `UpdateTable` and the saga read `ctx.mrec`).
+    pub(crate) fn set_mrec_config(&self, cfg: std::sync::Arc<crate::mrec_peer::MrecConfig>) {
+        for ctx in self.ctxs.lock().expect("ctxs poisoned").iter_mut() {
+            ctx.mrec = cfg.clone();
+        }
+    }
+
     fn set_ctx(&self, node: u64, ctx: SimNodeCtx) {
         self.ctxs.lock().expect("ctxs poisoned")[node as usize] = ctx;
     }
@@ -1231,6 +1245,27 @@ impl SimClusterHandle {
     /// `node`'s own view of the replicated control-plane `Metadata`.
     pub(crate) fn metadata(&self, node: u64) -> Metadata {
         self.ctx(node).effective_metadata()
+    }
+
+    /// The ADR 0073 Phase 3 roll-health verdict body `node` computes over the
+    /// **given** metadata snapshot, with no simulated time passing — so a test
+    /// can compare it to a ladder computed over the very same snapshot.
+    pub(crate) fn roll_health_over(&self, node: u64, meta: &Metadata) -> serde_json::Value {
+        self.ctx(node).roll_health_verdict(meta).to_json()
+    }
+
+    /// The body `GET /admin/cluster-version` serves on `node`, computed
+    /// synchronously (no simulated time passes). ADR 0073 Phase 3 (P3-C): the
+    /// roll orchestrator corpus observes the cluster once per tick.
+    pub(crate) fn cluster_version_view(&self, node: u64) -> serde_json::Value {
+        self.ctx(node).admin_cluster_version_view()
+    }
+
+    /// The body `GET /admin/roll-health` serves on `node`, computed
+    /// synchronously (no simulated time passes).
+    pub(crate) fn roll_health_view(&self, node: u64) -> serde_json::Value {
+        let ctx = self.ctx(node);
+        ctx.roll_health_verdict(&ctx.effective_metadata()).to_json()
     }
 
     /// Every tablet id `node`'s own `ClusterEdgeState` currently holds a
@@ -2561,6 +2596,7 @@ impl SimCluster {
                 backup_janitor_progress: Arc::new(Mutex::new(
                     animus_node::backup_janitor::JanitorProgress::default(),
                 )),
+                mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
                 ttl_reaper_progress: Arc::new(Mutex::new(
                     animus_node::ttl_reaper::TtlReaperProgress::default(),
                 )),
@@ -3545,6 +3581,21 @@ impl SimCluster {
         self.shared.metadata(node)
     }
 
+    /// See `SimClusterHandle::cluster_version_view` (no simulated time passes).
+    pub(crate) fn cluster_version_view(&self, node: u64) -> serde_json::Value {
+        self.shared.cluster_version_view(node)
+    }
+
+    /// See `SimClusterHandle::roll_health_view` (no simulated time passes).
+    pub(crate) fn roll_health_view(&self, node: u64) -> serde_json::Value {
+        self.shared.roll_health_view(node)
+    }
+
+    /// See `SimClusterHandle::roll_health_over` (verdict over a snapshot).
+    pub(crate) fn roll_health_over(&self, node: u64, meta: &Metadata) -> serde_json::Value {
+        self.shared.roll_health_over(node, meta)
+    }
+
     /// Whether **every replica of every tablet** hosted across the cluster's
     /// nodes has its own engine caught up to the highest commit index any
     /// replica of that tablet reports, with every voter actually reporting
@@ -4191,7 +4242,7 @@ impl SimCluster {
     /// cost by well over half relative to the pre-fix (`SimCluster::new`)
     /// baseline — see `SCENARIO_TIMER_FIRES_BUDGET`'s own doc for the exact
     /// before/after numbers this fix was measured against.
-    fn spawn_and_capture_fast<T, F>(&mut self, node: u64, fut: F) -> Option<T>
+    pub(crate) fn spawn_and_capture_fast<T, F>(&mut self, node: u64, fut: F) -> Option<T>
     where
         T: Send + 'static,
         F: std::future::Future<Output = T> + Send + 'static,
@@ -6109,6 +6160,7 @@ impl SimCluster {
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),
+            mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             ttl_reaper_progress: Arc::new(Mutex::new(
                 animus_node::ttl_reaper::TtlReaperProgress::default(),
             )),
@@ -6449,6 +6501,7 @@ impl SimCluster {
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),
+            mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             ttl_reaper_progress: Arc::new(Mutex::new(
                 animus_node::ttl_reaper::TtlReaperProgress::default(),
             )),
@@ -6757,6 +6810,7 @@ impl SimCluster {
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),
+            mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             ttl_reaper_progress: Arc::new(Mutex::new(
                 animus_node::ttl_reaper::TtlReaperProgress::default(),
             )),
@@ -7573,6 +7627,7 @@ impl SimCluster {
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),
+            mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             ttl_reaper_progress: Arc::new(Mutex::new(
                 animus_node::ttl_reaper::TtlReaperProgress::default(),
             )),

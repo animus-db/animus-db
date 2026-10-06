@@ -74,6 +74,16 @@ pub(crate) enum KindEvalApplied {
     /// client's own condition, or a malformed/oversized update — copied
     /// verbatim from `animus_cp_data::KindBatchOutcome::Rejected`.
     Rejected { code: String, message: String },
+    /// ADR 0075 G-d M2: a replicated MREC record that lost last-writer-wins
+    /// (`ver <= stored`) and wrote nothing; `current` is the item as stored.
+    /// Only a `KindEvalOp::Replicate` can produce it (the M3 receiver
+    /// handler maps it to the per-record `Superseded` answer); no client
+    /// write path ever proposes one.
+    #[allow(
+        dead_code,
+        reason = "read by the M3 receiver handler; no client path proposes a replicate"
+    )]
+    Superseded { current: Option<Item> },
 }
 
 impl<E: Env, R: RelayClient> ClientCtx<E, R> {
@@ -986,6 +996,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         identity: ProbeIdentity,
     ) -> Result<KindEvalApplied, String> {
         match leader.take_kind_eval_result(index, term) {
+            Some(result) if result.superseded => Ok(KindEvalApplied::Superseded {
+                current: result.new,
+            }),
             Some(result) => Ok(KindEvalApplied::Ok {
                 old: result.old,
                 new: result.new,
@@ -1188,6 +1201,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     }
                     animus_cp_data::KindEvalItemResult::Rejected { code, message } => {
                         KindEvalApplied::Rejected { code, message }
+                    }
+                    animus_cp_data::KindEvalItemResult::Superseded { current } => {
+                        KindEvalApplied::Superseded { current }
                     }
                 })
                 .collect()),
@@ -2068,6 +2084,7 @@ mod kind_eval_confirm_wake_tests {
                     key: TableSchema::simple("pk"),
                     lsis: Vec::new(),
                     change_records_carry_images: false,
+                    mrec: None,
                 };
                 let outcome = ClientCtx::<SimEnv, NeverRelay>::cp_kind_eval_local(
                     &leader,
@@ -3095,6 +3112,7 @@ mod cp_kind_eval_local_genuine_loss_tests {
             key: TableSchema::simple("pk"),
             lsis: Vec::new(),
             change_records_carry_images: false,
+            mrec: None,
         };
         let slot: Arc<Mutex<Option<Result<(), String>>>> = Arc::new(Mutex::new(None));
         let out = slot.clone();

@@ -1179,12 +1179,11 @@ State once here; cross-referenced from the sections below.
     a fresh HLC — caught live (`delivered=146/144`, one member of a
     transactional pair duplicated under a single sealed shard) during the
     same `SplitMode::InPlace`-unpinned soak that caught shape B. **Fixed**
-    via a new bounded, best-effort per-group memo, `TxnTracker::
-    recently_resolved` (`physical_key -> txn_id`, populated at every
-    `TxnResolve` apply, checked by `(key, txn_id)` identity): `TxnStage`'s
-    apply arm now rejects (folds into the same `Fenced` bucket as
-    `already_decided`) a stage whose target key was already resolved by
-    THIS EXACT transaction on this group. **Tracing the captured trace's
+    via a per-group memo, `TxnTracker::recently_resolved`, **replaced
+    2026-10-06 (issue #1243)** by a durable per-key *resolved marker* (see
+    below): `TxnStage`'s apply arm rejects (folds into the same `Fenced`
+    bucket as `already_decided`) a stage whose target key was already
+    resolved by THIS EXACT transaction on this group. **Tracing the captured trace's
     own `txn_id`s past this fix showed the LIVE trigger is narrower and
     deeper than this guard alone closes** — see `docs/engineering-
     lessons.md`'s shape A amendment for the full account: the resurrecting
@@ -1229,6 +1228,75 @@ State once here; cross-referenced from the sections below.
   Regression (whole txn suite): `tests/txn_single.rs`,
   `tests/snapshot_catchup.rs`, `tests/prod_concurrent_ts_monotonic.rs`, the
   in-crate `pr5_orphan_and_resurrection_tests` module.
+
+- **Resolved marker (issue #1243): apply decisions read durable state, never
+  process memory.** `TxnResolve`'s apply writes, for every key it actually
+  resolves, a row `txn::resolved_marker_key(key)` = `token || [0x00, 0x04] ||
+  key` in the base scope (value `[0xA1] || txn_id`, format
+  `txn-resolved-marker` v1, fixture `tests/fixtures/formats/txn-resolved-marker/v1.bin`)
+  in the same merge batch as the resolve; `TxnStage`'s apply reads it and
+  rejects a stage whose `(key, txn_id)` matches. It replaced the in-memory
+  `TxnTracker::recently_resolved` map, which made one committed log entry
+  apply differently on a restarted / snapshot-installed / cap-evicted replica
+  (stage rejected on some, intent resurrected on others; the apply-time
+  read-modify-write arms then diverged permanently). One row per key
+  (overwritten by the next resolve there), token-led so it moves with its key
+  through splits and snapshot images; every client-facing scan skips it via
+  `txn::is_internal_key` (record keys alone stay `is_record_key`, the predicate
+  for code that *decodes records*). **Class G**: `engine_image` omits marker
+  rows while `Gate::GlobalTables` is closed (an N-1 replica's filters would
+  surface them to clients; it keeps its own in-memory guard — residual), apply
+  always writes them; cell `tests/it/txn_resolved_marker_gate.rs`. Residual by design: it remembers only the
+  LAST resolver of a key, so a duplicate stage of T arriving after a *later*
+  transaction also resolved the same key is not caught — but that residual is
+  identical on every replica for live apply and snapshot install (but see the
+  replay bullet below), where the old one was per-process. A new internal row kind must be added to `is_internal_key` and
+  the `animus-test` `EMBEDDED` table. Regression:
+  `tests/it/resolved_restage_replica_determinism.rs` (restart + snapshot-install
+  variants, `ANIMUS_RESTAGE_SEEDS`).
+- **WAL replay re-applies over an engine that is already ahead (issue #1242).**
+  A restart replays the log tail from `snapshot_index` over the replica's own
+  durable engine, which already holds everything applied before the kill. An
+  arm whose decision reads engine state sees future state on replay; the
+  per-key `merge` version guard protects arms whose only effect is a plain
+  per-key merge, but not whole-or-nothing multi-key ones. `TxnStage`
+  therefore no-ops (`Fenced`) when any of its keys, their resolved markers, or
+  (anchor) its record key carries a version strictly above the entry's `ts`
+  (equal = its own partial merge, re-applies). The read is **tombstone-aware**
+  (`latest_version_incl_tombstone`, over `scan_with_tombstones`): `get` hides a
+  key deleted after the stage, which makes a stage rejected live by an
+  own-key condition (`A` must be absent) look acceptable on replay once `A` is
+  deleted. The branch is unreachable live except via `SeedBatch` (the restore
+  driver merges rows at carried source-cluster versions, so a stage hitting a
+  seeded key with a higher version is Fenced live too — deterministic on every
+  replica, a liveness edge on a not-yet-served table only). Without it a stage
+  the live apply rejected (stale restage caught by one key's marker; stage
+  blocked by a since-resolved intent) resurrected an intent on the restarted
+  replica only, silently dropping later acked txn appends there. The #1243
+  "residual is identical on every replica" statement above held for live apply,
+  not replay. Any new multi-key conditional arm needs the same "what if every
+  key were from the future" review. `KindBatch`/`Batch`/`Cas`/`Delete`/`SeedBatch` make no
+  engine-state decision that fans out to other keys (nothing to guard).
+  **`KindEval`/`KindEvalBatch` (issue #1247, ADR 0054's 2026-10-06 amendment)**
+  re-decide from engine state, and the derived rows `materialize_derived`
+  writes (change-log on a unique `prefix||ts||ordinal` key, LSI/footprint rows
+  keyed by item attributes) are not protected by per-key LWW. They no-op on
+  replay when the decided base key (tombstone-aware, `key_reached_by_entry`)
+  is **at or above** the entry's `ts` — at-or-above, not strictly above as for
+  `TxnStage`, because a `KindEval*` entry's whole write set is ONE atomic
+  `merge_batch` (a single WAL record), so an equal base row proves the entry
+  fully landed and re-evaluating it would read its own post-state (`ADD`
+  applied twice, a `not_exists` item failing on its own write and shifting
+  every later item's change-record ordinal). `KindEvalBatch` is
+  entry-granular (any item's key reached skips the whole entry; one pre-pass
+  `get` per key is reused by the evaluation loop). `TxnResolve` decides only
+  from an intent of its own `txn_id` (monotone: stage then resolve; a replayed
+  resolve finds none) and `TxnStage`'s pending-write evaluation sits behind
+  the `engine_ahead` gate above. Regressions:
+  `tests/it/kind_eval_replay_stability.rs` (`ANIMUS_KINDEVAL_REPLAY_SEEDS`),
+  `tests/it/txn_stage_replay_stability.rs`
+  (`ANIMUS_TXN_REPLAY_SEEDS`); lesson
+  `docs/lessons/code-patterns/2026-10-06-wal-replay-over-an-ahead-engine-must-not-re-decide-an-apply.md`.
 - **`engine_applied` vs `last_applied`.** The two-task split (below) means the
   core's `last_applied` (a buffer cursor the consensus loop advances) *leads*
   the engine. Linearizable reads therefore gate on the separate
@@ -1258,6 +1326,16 @@ State once here; cross-referenced from the sections below.
   regardless), but a real regression to that optimization on nearly every
   split instead of rarely, caught by `tests/inplace_split_dead_space.rs`.
   `drive()` reads this marker back at startup instead of `core.last_applied()`.
+  **Snapshots carry markers at every version (issue #1251).** A replica must
+  hold the sender's marker set or its stale-restage decision diverges (and
+  "fail closed where markers are missing" diverges the other way). While
+  `Gate::GlobalTables` is closed `engine_image` ships each marker under the
+  wire-only image row kind `KIND_WIRE_RESOLVED_MARKER` (`0x80`, in no
+  `ALL_KINDS` scope; the previous release drops an unknown kind) and
+  `install_engine_image` files it back as the base-scope marker row; open, it
+  is the plain base row. Never add a real row kind at `0x80`. A v1-cluster
+  replica-identity check must compare intents in their v1 form (the sender also
+  down-converts v2 intents, #1237).
 
   `RaftCore::state_machine_behind` (shared with `animus-control`, permanently
   inert there — see ADR 0009's addendum) is `true` whenever `engine_applied <
@@ -2913,9 +2991,16 @@ wire/image codec is `pub(crate)`; new formats add a section in whichever fits.
 
 - **`txn-envelope` v2** (`txn.rs`, ADR 0018's 2026-10-04 amendment): the
   per-value tag byte is the version (`0` committed, `1` v1 intent, `2` v2
-  intent = v1 body + trailing `prior`). `decode_envelope` dispatches on it;
-  `txn::legacy::v1` holds the frozen v1 decoder and the v1 encoder behind
-  `legacy-encoders` (like every legacy encoder), plus `downgrade_intent_to_v1`
+  intent = v1 body + trailing `prior`). **Class G too (ADR 0073's 2026-10-05
+  amendment, #1237): apply always writes v2 into the node's own engine, but
+  `engine_image` (the `InstallSnapshot` image, the one place engine values leave
+  a node) ships every v2 intent down-converted to v1 — plus its prior as the
+  committed row one MVCC version below the intent, where the v1 lookback reads
+  it — until `Gate::GlobalTables` (cluster version 2) is open; an N-1 replica
+  panics on tag 2. Never branch apply on the gate; never ship an engine value
+  without asking what an N-1 reader does with it.** `decode_envelope` dispatches on it;
+  `txn::legacy::v1` holds the frozen v1 decoder and the v1 encoder (production
+  code now, the snapshot sender uses it; not `legacy-encoders`-gated), plus `downgrade_intent_to_v1`
   (re-exported as `downgrade_txn_envelope_to_v1`): the strict whole-value v2 -> v1
   down-conversion the upgrade harness's engine-row transcode
   (`animus-test`'s `ROW_TABLE`) applies to every stored row. It parses the *entire*
@@ -3243,3 +3328,34 @@ replay. Regression: `animusd` `sim_cluster_split_relocation`. ADR 0058's
 - **TxnId uniqueness (R-01 F-2).** `TxnId.node` is the node qualified by the group stream (`n0#100`; primary stream = bare node id), because `ts` is per-group `Hlc` state and one node leads many groups. `txn_stage_local` (animusd) also refuses, before proposing, a stage group with any key outside the leader range (stale grouping across a split). See `docs/lessons/testing/2026-10-05-a-txn-id-must-be-unique-per-group-not-per-node.md`.
 
 - **Seal check on every mutating apply arm (R-01 F-2).** `TxnCommit`/`TxnAbort` (and the orphan tombstone) are deterministic no-ops on a sealed record key, like every other mutation: a fork clones the parent's CURRENT engine per replica, asynchronously, so a post-fork decision landing in the parent diverges the children. Regression: `tests/it/split_tablet.rs::a_txn_decision_ordered_after_the_fork_is_a_sealed_no_op`; see `docs/lessons/testing/2026-10-05-every-mutating-apply-arm-needs-the-seal-check.md`.
+
+- **MREC shapes (G-01 stage G-d M1).** `KindEvalOp::Replicate { item, ver }` and
+  `WriteSchema.mrec` ride as JSON blobs inside `KindEval`/`KindEvalBatch`/`TxnStage`
+  (no binary codec bump, wire stays v1, WAL v2). `KvCommand::required_gate` is
+  **content-dependent** for those three carriers (`gates.rs::eval_gate`: MREC content
+  joins to `Gate::MrecReplication`), enforced at the one `gated_propose` choke point;
+  `evaluate_kind_eval` gives a `Replicate` its LWW semantics (M2, below). Shaped fixtures `raftkv-wire/v1-mrec.bin`, `raftkv-wal/v2-mrec.bin`
+  (built by `codec::tests::mrec_sample_wires`; `fixture_files` skips `vN-<shape>` names).
+
+- **MREC apply (G-01 stage G-d M2, ADR 0075 amendment).** `evaluate_kind_eval` takes
+  the stored stamp (`decode_stored_item_versioned`; the `KindEvalBatch` overlay carries
+  it too). `KindEvalOp::Replicate` applies iff `ver > stored` via the normal
+  `derive_kind_writes` path, else `KindEvalDecision::Superseded` (no writes, not even a
+  change record; leader-local `KindEvalResult::superseded` /
+  `KindEvalItemResult::Superseded`, the replicated outcome stays `Applied`); a key with
+  an intent gives `ConditionFailed` (the shipper's Retry); `mrec: None` rejects. A local
+  op with `WriteSchema.mrec` stamps via `MrecVersion::next_local`. A `Replicate` in a
+  `TxnStage` is rejected before evaluation. Tests: `src/mrec_props.rs` (pure convergence
+  proptest + two negative controls, `ANIMUS_MREC_PROP_CASES`), `tests/it/mrec_apply.rs`
+  (a group opened with `HostedOptions { features }` at cluster version 3: the propose
+  gate panics in tests otherwise). **Adding a base-row writer for an MREC table means
+  stamping it** (see the ADR's writer audit).
+
+**MREC apply is the only consumer-facing piece here (ADR 0075 "G-d as built").** The
+shipper, saga and receiver live in `animusd`; this crate owns the last-writer-wins rule
+(`apply_mrec`: stored `MrecVersion` vs the incoming one, `Superseded` on a loss, stamped
+tombstones, a foreign intent is `Retry`) and the content-dependent `KvCommand::required_gate`.
+The cursor rows `mrec:<region>`/`mrecscan:<region>` are ordinary `KIND_CURSOR` rows written
+through the existing kind ops (no new command); `trim_split_child` drops them, which is why
+a split child rescans. Test-only switch `mrec_test_switch::set_lww_by_arrival` (thread-local)
+backs the M5 negative control; never reachable in a release build path.

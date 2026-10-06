@@ -50,7 +50,7 @@ use animus_control::persist_round::{
     self, GatedOuts, PersistArm, PersistFut, PersistProgress, PersistWake,
 };
 use animus_control::raft::{Out, RaftCore, RaftMsg, StateMachine};
-use animus_control::version::ClusterFeatures;
+use animus_control::version::{ClusterFeatures, Gate};
 use animus_control::{PersistedState, ProposeResult};
 use animus_env::{Env, EnvExt, Metric, MetricsHandle, Nanos, NodeId, PRIMARY_STREAM};
 // ADR 0054 step 2: the pure item model/evaluation crate below the wire
@@ -80,6 +80,8 @@ pub mod hlc;
 pub mod host;
 mod hwm;
 pub mod layout;
+#[cfg(test)]
+mod mrec_props;
 mod seal;
 pub mod segment;
 mod split;
@@ -535,6 +537,16 @@ pub const KIND_FOOTPRINT: u8 = 0x03;
 /// lineage)`, holding a packed-HLC watermark.
 pub const KIND_CURSOR: u8 = 0x04;
 
+/// Snapshot-image-only row kind (issue #1251, ADR 0073 `txn-resolved-marker`
+/// amendment): the **resolved-marker** base-scope row, shipped under a kind no
+/// [`ALL_KINDS`] scope owns while `Gate::GlobalTables` is closed. A
+/// previous-release receiver drops an unknown kind in `install_engine_image`
+/// (so it never sees the marker as a client item), a current receiver files
+/// it as the base-scope marker row. Never a storage scope and never in
+/// [`ALL_KINDS`]; reserved in the high half so a future real kind cannot
+/// collide with it.
+pub(crate) const KIND_WIRE_RESOLVED_MARKER: u8 = 0x80;
+
 /// Every row-kind scope a tablet group owns, in selector order (ADR 0041 §3,
 /// extended ADR 0042/0043).
 ///
@@ -588,6 +600,29 @@ pub enum KindEvalOp {
     Update {
         key_item: Item,
         actions: Vec<UpdateAction>,
+    },
+    /// **Apply a replicated MREC write** (ADR 0075 section 4, G-01 stage
+    /// G-d): another Region's already-resolved result for this item, shipped
+    /// as the resulting image (never the expression). `item: None` is a
+    /// tombstone. `ver` is the originating Region's stamp; apply (M2) writes
+    /// the row only when `ver` beats the stored stamp, otherwise it reports
+    /// the leader-local `Superseded` result. Unconditional: the entry's
+    /// `condition` is ignored by construction (the shipper never sets one).
+    ///
+    /// **Class G, gated by `Gate::MrecReplication`** (cluster version 3):
+    /// [`KvCommand::required_gate`](crate::gates) is content-dependent, so a
+    /// `KindEval`/`KindEvalBatch`/`TxnStage` carrying this op is refused at
+    /// the propose site until the gate opens. **Apply (M2)**: applied only if
+    /// `ver` is strictly greater than the stored stamp (an unversioned row
+    /// compares as zero), through the ordinary `derive_kind_writes` path (LSI
+    /// rows, change record with images) with `ver` written verbatim;
+    /// otherwise the leader-local `Superseded` result and no writes. A key
+    /// holding a foreign transaction intent yields the entry's
+    /// `ConditionFailed` outcome (the shipper's `Retry`). Rejected
+    /// deterministically when the entry's `WriteSchema::mrec` is `None`.
+    Replicate {
+        item: Option<Item>,
+        ver: animus_item::MrecVersion,
     },
 }
 
@@ -713,7 +748,7 @@ impl StorageScope {
         rows.map(|rows| {
             rows.iter().any(|(k, _)| {
                 self.strip_in_range(k)
-                    .is_some_and(|logical| !txn::is_record_key(logical))
+                    .is_some_and(|logical| !txn::is_internal_key(logical))
             })
         })
         .unwrap_or(false)
@@ -1842,6 +1877,10 @@ pub struct KindEvalResult {
     /// The item immediately after this entry applied — `None` for a
     /// delete.
     pub new: Option<Item>,
+    /// ADR 0075 G-d M2: the entry was a [`KindEvalOp::Replicate`] that lost
+    /// last-writer-wins (`ver <= stored`) and wrote nothing; `old == new` is
+    /// then the item as stored. Always `false` for every other op.
+    pub superseded: bool,
 }
 
 /// The leader-local slot map [`KvCommand::KindEval`]'s apply arm fills
@@ -1941,6 +1980,10 @@ pub enum KindEvalItemResult {
     /// [`KindBatchOutcome::Rejected`]'s doc for the two cases this covers.
     /// Like `ConditionFailed`, scoped to this one item.
     Rejected { code: String, message: String },
+    /// ADR 0075 G-d M2: a [`KindEvalOp::Replicate`] that lost last-writer-wins
+    /// (`ver <= stored`): nothing was written for this item; `current` is the
+    /// item as stored. Scoped to this one item like `ConditionFailed`.
+    Superseded { current: Option<Item> },
 }
 
 /// The leader-local result payload of one `KvCommand::KindEvalBatch` entry
@@ -2095,66 +2138,6 @@ struct TxnTracker {
     /// read-path push, ADR 0018 §2/PR5 §3) — only background promptness is
     /// (very slightly) weaker in that residual case.
     unresolved_decided: BTreeMap<TxnId, (Vec<u8>, txn::TxnOutcome)>,
-    /// `physical_key -> txn_id`: the transaction whose intent at this key
-    /// was most recently resolved (`TxnResolve`, commit or abort alike) on
-    /// THIS group — populated for every participant that applies a
-    /// resolve, anchor or not, unlike `pending`/`unresolved_decided` above
-    /// (which are anchor-only by construction). A **defensive seatbelt**
-    /// against issue #298 shape A: `KvCommand::TxnStage`'s own `blocked_by`
-    /// check only ever rejects overwriting a *different* transaction's
-    /// still-live `Intent` — it has no way to reject a stage that arrives
-    /// for a key AFTER this exact transaction's own resolve already ran,
-    /// since by then the key is a plain `Committed`/restored value, not an
-    /// `Intent` at all. `KvCommand::TxnStage`'s apply arm checks this map
-    /// by **(key, txn_id) identity**, never presence alone — the same
-    /// discipline `KindBatchOutcome`'s own false-ack fix established for
-    /// "never trust an outcome without confirming it names the SAME
-    /// thing." Bounded (`record_resolution`'s own `RETAIN`), like
-    /// `KindBatchOutcomes`/`StageOutcomes`: purely a best-effort catch, not
-    /// a source of truth — an evicted (or, after a restart, simply never
-    /// rebuilt) entry only means this ONE seatbelt doesn't catch a given
-    /// resurrection attempt, never that a wrong decision gets made from a
-    /// stale one. **Deliberately not rebuilt at group start**
-    /// (`rebuild_txn_tracker`, below) — unlike `pending`/`unresolved_
-    /// decided`, which restore real transaction-lifecycle facts a restart
-    /// must not lose, this map's whole job is catching a stale stage that
-    /// arrives shortly after its own resolve within the SAME uptime window;
-    /// starting it empty after a restart is exactly as safe as any other
-    /// eviction.
-    recently_resolved: BTreeMap<Vec<u8>, TxnId>,
-    /// Insertion order for `recently_resolved`'s bounded FIFO eviction —
-    /// see `record_resolution`.
-    recently_resolved_order: std::collections::VecDeque<(Vec<u8>, TxnId)>,
-}
-
-impl TxnTracker {
-    /// Entries retained behind the newest, mirroring `KindBatchOutcomes::
-    /// RETAIN`'s own "generous next to the realistic poll/retry window,
-    /// while keeping the map small enough to be free" reasoning — a stale
-    /// re-stage this seatbelt exists to catch arrives within a bounded
-    /// retry/timeout window (seconds), never after thousands of intervening
-    /// resolves on the same busy tablet.
-    const RECENTLY_RESOLVED_RETAIN: usize = 4096;
-
-    /// Record that `txn_id`'s intent at `physical_key` was just resolved on
-    /// this group — see `recently_resolved`'s own doc.
-    fn record_resolution(&mut self, physical_key: Vec<u8>, txn_id: TxnId) {
-        self.recently_resolved
-            .insert(physical_key.clone(), txn_id.clone());
-        self.recently_resolved_order
-            .push_back((physical_key, txn_id));
-        while self.recently_resolved_order.len() > Self::RECENTLY_RESOLVED_RETAIN {
-            let Some((old_key, old_txn_id)) = self.recently_resolved_order.pop_front() else {
-                break;
-            };
-            // Only remove if it's still THIS eviction's own entry — a
-            // later resolution of the same key (a different, newer
-            // txn_id) must never be evicted by an older entry's turn.
-            if self.recently_resolved.get(&old_key) == Some(&old_txn_id) {
-                self.recently_resolved.remove(&old_key);
-            }
-        }
-    }
 }
 
 /// The committed value `physical_key` holds right now, as the `prior` a
@@ -2277,6 +2260,15 @@ async fn rebuild_txn_tracker<S: StorageEngine>(storage: &S, scope: &StorageScope
 /// [`linearizable_get_served_fast`](RaftKvNode::linearizable_get_served_fast)'s
 /// doc and `animusd::ClientCtx::cp_get_local_resolving`/
 /// `cp_get_local_snapshot`, the two callers that act on this.
+/// The outcome of [`RaftKvNode::local_get_for_ship`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShipGet {
+    /// A committed value, or `None` for no such row.
+    Value(Option<Vec<u8>>),
+    /// A pending intent covers the key; the shipper must retry later.
+    Pending,
+}
+
 enum ResolveStep {
     Value(Option<Vec<u8>>),
     Pending(IntentInfo),
@@ -5836,7 +5828,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     ) -> Vec<(Vec<u8>, Vec<u8>)> {
         let mut out = Vec::with_capacity(rows.len());
         for (key, vv) in rows {
-            if txn::is_record_key(&key) {
+            if txn::is_internal_key(&key) {
                 continue;
             }
             let physical = self.scope.physical(&key);
@@ -5864,6 +5856,52 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             ResolveStep::Value(v) => v,
             ResolveStep::Pending(_) | ResolveStep::Foreign(_) => None,
         }
+    }
+
+    /// One base key's **committed** value for the MREC shipper (ADR 0075 G-d M4):
+    /// [`ShipGet::Value`] a committed value (or none), and [`ShipGet::Pending`] the key is covered by a still-`Pending` (or foreign) intent,
+    /// which [`local_get`](Self::local_get) would have silently read as absent
+    /// — the shipper must hold its cursor rather than skip the key.
+    pub async fn local_get_for_ship(&self, key: &[u8]) -> ShipGet {
+        let physical = self.scope.physical(key);
+        let Some(vv) = self.storage.get(&physical).await.ok().flatten() else {
+            return ShipGet::Value(None);
+        };
+        match self.resolve_once_step(&physical, vv, None).await {
+            ResolveStep::Value(v) => ShipGet::Value(v),
+            ResolveStep::Pending(_) | ResolveStep::Foreign(_) => ShipGet::Pending,
+        }
+    }
+
+    /// A key-ordered window of at most `limit` committed base rows from
+    /// `start` (inclusive), for the MREC shipper's scan mode: unlike
+    /// [`local_scan`](Self::local_scan) it **stops at the first row covered by
+    /// a pending intent** instead of silently omitting it, returning that
+    /// row's key as the second element so the shipper can hold its cursor in
+    /// front of it (an aborted transaction leaves no later change record, so
+    /// an omitted row would otherwise never be shipped).
+    pub async fn local_scan_for_ship(
+        &self,
+        start: &[u8],
+        limit: usize,
+    ) -> (Vec<(Vec<u8>, Vec<u8>)>, Option<Vec<u8>>) {
+        let raw = self.raw_base_rows(start, None).await;
+        let mut out = Vec::new();
+        for (key, vv) in raw {
+            if out.len() >= limit {
+                break;
+            }
+            if txn::is_internal_key(&key) {
+                continue;
+            }
+            let physical = self.scope.physical(&key);
+            match self.resolve_once_step(&physical, vv, None).await {
+                ResolveStep::Value(Some(v)) => out.push((key, v)),
+                ResolveStep::Value(None) => {}
+                ResolveStep::Pending(_) | ResolveStep::Foreign(_) => return (out, Some(key)),
+            }
+        }
+        (out, None)
     }
 
     // ---- eventually-consistent reads (ADR 0055) --------------------------
@@ -6041,7 +6079,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     ) -> Vec<(Vec<u8>, Vec<u8>)> {
         let mut out = Vec::with_capacity(rows.len());
         for (key, vv) in rows {
-            if txn::is_record_key(&key) {
+            if txn::is_internal_key(&key) {
                 continue;
             }
             let physical = self.scope.physical(&key);
@@ -6192,6 +6230,12 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             .into_iter()
             .filter_map(|(k, vv)| {
                 let logical = scope.strip_in_range(&k)?.to_vec();
+                // Internal rows (txn records, resolved markers) are never
+                // user data, and a marker's value is not an envelope: this
+                // scan feeds backup/export capture of `KIND_BASE`.
+                if kind == KIND_BASE && txn::is_internal_key(&logical) {
+                    return None;
+                }
                 match txn::decode_envelope(&vv.value) {
                     txn::Envelope::Committed(v) => Some((logical, v)),
                     txn::Envelope::Intent { .. } => None,
@@ -6307,7 +6351,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             // every ordinary scan. Checked here, before the `limit` gate,
             // so a marker interleaved in the range never silently consumes
             // one of the caller's requested chunk slots.
-            if txn::is_record_key(logical) {
+            if txn::is_internal_key(logical) {
                 continue;
             }
             if out.len() >= limit {
@@ -8209,7 +8253,21 @@ enum KindEvalDecision {
         change_log: (Vec<u8>, Vec<u8>),
         old: Option<Item>,
         new: Option<Item>,
+        /// The MREC stamp the base row was written with: `Some` exactly when
+        /// the entry's `WriteSchema::mrec` is `Some` (a local write stamped
+        /// by [`animus_item::MrecVersion::next_local`], or a replicated
+        /// record's own stamp written verbatim); `None` for every ordinary
+        /// table, whose base row stays byte-identical to the pre-MREC
+        /// encoding.
+        new_ver: Option<animus_item::MrecVersion>,
     },
+    /// ADR 0075 G-d M2: a [`KindEvalOp::Replicate`] whose stamp does not beat
+    /// the stored one (last-writer-wins: `ver <= stored`, including the
+    /// idempotent equal re-delivery). **No writes of any kind** — not even a
+    /// change record: the receiver's streams/PITR/GSI drain see nothing for a
+    /// record that changed nothing. `current` is the item as stored (the
+    /// leader-local result's `old == new`).
+    Superseded { current: Option<Item> },
     /// `condition` evaluated to `Ok(false)` — an ordinary
     /// `ConditionalCheckFailedException`-shaped no-op.
     ConditionFailed,
@@ -8219,6 +8277,31 @@ enum KindEvalDecision {
     /// [`KindBatchOutcome::Rejected`]'s own doc for the full account of
     /// the two cases this covers.
     Rejected { code: String, message: String },
+}
+
+/// Test-only negative-control switch for the G-d MREC corpus (ADR 0075 section
+/// 4.9, `animusd`'s `sim_world_mrec_corpus`): `true` makes a replicated record
+/// apply by arrival order (last delivered wins) instead of last-writer-wins on
+/// the stamp, proving the corpus oracle detects a broken LWW rule. A
+/// thread-local, so it scopes to one simulated test (`SimEnv` runs on the
+/// calling thread); it is always `false` in production (never set outside the
+/// corpus's own negative control).
+#[doc(hidden)]
+pub mod mrec_test_switch {
+    use std::cell::Cell;
+
+    thread_local! {
+        static LWW_BY_ARRIVAL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Arm (`true`) or disarm the arrival-order apply for this thread.
+    pub fn set_lww_by_arrival(on: bool) {
+        LWW_BY_ARRIVAL.with(|c| c.set(on));
+    }
+
+    pub(crate) fn lww_by_arrival() -> bool {
+        LWW_BY_ARRIVAL.with(Cell::get)
+    }
 }
 
 /// The pure evaluation core of [`KvCommand::KindEval`]'s apply arm (ADR
@@ -8235,10 +8318,40 @@ fn evaluate_kind_eval(
     sk: Option<&AttributeValue>,
     token_prefix: &[u8],
     old: Option<Item>,
+    stored_ver: Option<animus_item::MrecVersion>,
     op: &KindEvalOp,
     condition: Option<&ConditionExpression>,
     ttl_expired: bool,
 ) -> KindEvalDecision {
+    // ADR 0075 G-d M2: a replicated MREC record is **unconditional** (the
+    // shipper never sets a condition; one that rides anyway is ignored by
+    // construction) and is decided by last-writer-wins on the stored stamp
+    // alone, before anything else is evaluated.
+    if let KindEvalOp::Replicate { item, ver } = op {
+        // A replicate only makes sense on an MREC table. The proposer builds
+        // the receiver's own `WriteSchema` (so `mrec` is `Some` on every
+        // legitimate one); a deterministic rejection, never a panic or a
+        // versioned row on a table that is not MREC.
+        if schema.mrec.is_none() {
+            return KindEvalDecision::Rejected {
+                code: "ValidationException".to_owned(),
+                message: "MREC replicate on a table that is not an MREC global table".to_owned(),
+            };
+        }
+        if !ver.supersedes(stored_ver) && !mrec_test_switch::lww_by_arrival() {
+            return KindEvalDecision::Superseded { current: old };
+        }
+        return kind_eval_applied(
+            schema,
+            pk,
+            sk,
+            token_prefix,
+            old,
+            item.clone(),
+            Some(*ver),
+            ttl_expired,
+        );
+    }
     if let Some(cond) = condition {
         match cond.evaluate(old.as_ref()) {
             Ok(true) => {}
@@ -8254,6 +8367,7 @@ fn evaluate_kind_eval(
     let new = match op {
         KindEvalOp::Put(item) => Some(item.clone()),
         KindEvalOp::Delete => None,
+        KindEvalOp::Replicate { .. } => unreachable!("handled above"),
         KindEvalOp::Update { key_item, actions } => {
             let base = old.clone().unwrap_or_else(|| key_item.clone());
             match animus_item::apply_update(base, actions) {
@@ -8267,9 +8381,36 @@ fn evaluate_kind_eval(
             }
         }
     };
-    let base_value = match &new {
-        Some(item) => animus_item::encode_stored_item(item),
-        None => animus_item::encode_tombstone(),
+    // ADR 0075 G-d M2: a local write on an MREC table stamps its row from the
+    // frozen `WriteSchema::mrec` and the stored stamp — a pure function of
+    // `(entry, engine state)`, so every replica writes identical bytes.
+    let new_ver = schema
+        .mrec
+        .map(|m| animus_item::MrecVersion::next_local(stored_ver, m.wall_ms, m.region_id));
+    kind_eval_applied(schema, pk, sk, token_prefix, old, new, new_ver, ttl_expired)
+}
+
+/// The shared tail of [`evaluate_kind_eval`]: encode the base row (versioned
+/// iff `new_ver` is `Some`) and derive every companion write and the change
+/// record through `animus_item::derive_kind_writes` — the one derivation
+/// every writer shares, so LSI rows, change-log images, Streams and PITR see
+/// a replicated write exactly as they see a local one.
+#[allow(clippy::too_many_arguments)] // one item write's full identity + before/after
+fn kind_eval_applied(
+    schema: &WriteSchema,
+    pk: &AttributeValue,
+    sk: Option<&AttributeValue>,
+    token_prefix: &[u8],
+    old: Option<Item>,
+    new: Option<Item>,
+    new_ver: Option<animus_item::MrecVersion>,
+    ttl_expired: bool,
+) -> KindEvalDecision {
+    let base_value = match (&new, new_ver) {
+        (Some(item), None) => animus_item::encode_stored_item(item),
+        (None, None) => animus_item::encode_tombstone(),
+        (Some(item), Some(ver)) => animus_item::encode_stored_item_versioned(item, ver),
+        (None, Some(ver)) => animus_item::encode_tombstone_versioned_keyed(ver, pk, sk),
     };
     let derived = animus_item::derive_kind_writes(
         schema,
@@ -8288,6 +8429,7 @@ fn evaluate_kind_eval(
         change_log: derived.change_log,
         old,
         new,
+        new_ver,
     }
 }
 
@@ -8445,6 +8587,53 @@ fn surface_suspicious_merge_noop(
     // until the fresh-vs-replay distinguisher is redesigned to also
     // recognize an idempotent identical-value re-application, not just a
     // post-restart one.
+}
+
+/// The version of `physical`'s newest record, **tombstones included**
+/// (`get` hides a deleted key, so it cannot prove a later delete ran). Built on
+/// the bounded `scan_with_tombstones` over `[key, key || 0x00)`.
+async fn latest_version_incl_tombstone<S: StorageEngine>(
+    storage: &S,
+    physical: &[u8],
+) -> Option<u64> {
+    let mut end = physical.to_vec();
+    end.push(0);
+    storage
+        .scan_with_tombstones(physical, &end)
+        .await
+        .expect("raftkv replay-ahead tombstone-aware read")
+        .into_iter()
+        .find(|(k, _, _)| k.as_slice() == physical)
+        .map(|(_, _, v)| v)
+}
+
+/// Replay check for a `KindEval`/`KindEvalBatch` entry's decided key (issues
+/// #1242/#1247): `true` iff the key's newest record — tombstones included —
+/// carries a version **at or above** `entry_version` (the packed `ts` of the
+/// entry being applied), which proves this entry or a later one already wrote
+/// it. Unlike `TxnStage`'s strictly-greater check, equal counts: a `KindEval*`
+/// entry's whole write set (base row, LSI/footprint rows, change record) goes
+/// down in ONE atomic `merge_batch` (a single WAL record), so a base row at
+/// this entry's own version proves every row of the entry landed, and
+/// re-evaluating it would read its own post-state (an `Update`'s `ADD` would
+/// apply twice, a `not_exists` condition would flip). `current` is the live row
+/// the caller already read with `get` (a hit answers without a second read;
+/// only a miss pays the tombstone-aware scan, since `get` hides a deleted key).
+/// Never true on the live path (`assert_ts_monotonic`: every row is stamped at
+/// an earlier entry's strictly smaller `ts`) except for a `SeedBatch`-seeded
+/// key carrying a source-cluster version.
+async fn key_reached_by_entry<S: StorageEngine>(
+    storage: &S,
+    physical: &[u8],
+    current: Option<&animus_storage::VersionedValue>,
+    entry_version: u64,
+) -> bool {
+    match current {
+        Some(vv) => vv.version >= entry_version,
+        None => latest_version_incl_tombstone(storage, physical)
+            .await
+            .is_some_and(|v| v >= entry_version),
+    }
 }
 
 /// Install any received snapshot, apply committed-and-durable commands to the
@@ -8993,30 +9182,72 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         key: base_key.clone(),
                     }
                 } else {
+                    let physical_base = scope.physical(&base_key);
                     let raw = storage
-                        .get(&scope.physical(&base_key))
+                        .get(&physical_base)
                         .await
                         .expect("raftkv kind eval read");
+                    // Replay stability (issue #1247, the `TxnStage` #1242
+                    // shape). WAL recovery re-applies this entry over an
+                    // engine that already holds later entries' effects, so
+                    // the decision below (condition result, foreign-intent
+                    // `ConditionFailed`) would read the *future* of this
+                    // entry and could flip — and the derived rows
+                    // `materialize_derived` then writes (change-log record
+                    // on a unique `prefix||ts||ordinal` key, LSI/footprint
+                    // rows keyed by item attributes) are NOT protected by
+                    // per-key LWW the way the base row is: an orphan stream
+                    // record / index row on this replica only. A base-key
+                    // version (tombstones included) strictly above this
+                    // entry's `ts` proves a later entry already ran, and one
+                    // EQUAL to it proves this entry's own (atomic, single
+                    // `merge_batch`) write already landed, whose post-state
+                    // a re-evaluation would misread: replay as a no-op
+                    // BEFORE any derived row is written (see
+                    // `key_reached_by_entry`). Nobody waits on a replayed
+                    // entry, so `ConditionFailed` is the safe recorded
+                    // outcome. Unreachable live except a
+                    // `SeedBatch`-seeded key at a carried higher version,
+                    // where the write could not land on the base row anyway.
+                    let ahead =
+                        key_reached_by_entry(storage, &physical_base, raw.as_ref(), hlc::pack(ts))
+                            .await;
+                    if ahead {
+                        tracing::debug!(
+                            ?base_key,
+                            "raftkv: KindEval replayed over an engine already ahead of it — no-op"
+                        );
+                    }
                     match raw.map(|vv| txn::decode_envelope(&vv.value)) {
+                        _ if ahead => KindBatchOutcome::ConditionFailed {
+                            key: base_key.clone(),
+                        },
                         // An unresolved intent from a concurrent transaction
                         // makes "the current committed value" ambiguous —
                         // never guess, mirroring `KindBatch.conditions`'
                         // and `Cas`'s identical discipline for a foreign
                         // intent. The proposer's cue is the same as any
-                        // other no-op: retry.
+                        // other no-op: retry. (A `KindEvalOp::Replicate`
+                        // gets the same outcome: it carries no condition,
+                        // so for it `ConditionFailed` can only mean
+                        // "intent on the key", which the MREC shipper
+                        // treats as `Retry`, ADR 0075 G-d M2.)
                         Some(txn::Envelope::Intent { .. }) => KindBatchOutcome::ConditionFailed {
                             key: base_key.clone(),
                         },
                         committed => {
-                            let old: Option<Item> = match committed {
+                            let (old, stored_ver): (
+                                Option<Item>,
+                                Option<animus_item::MrecVersion>,
+                            ) = match committed {
                                 Some(txn::Envelope::Committed(bytes)) => {
-                                    animus_item::decode_stored_item(&bytes)
+                                    animus_item::decode_stored_item_versioned(&bytes)
                                         .expect("raftkv kind eval decode")
                                 }
                                 Some(txn::Envelope::Intent { .. }) => {
                                     unreachable!("handled by the arm above")
                                 }
-                                None => None,
+                                None => (None, None),
                             };
                             match evaluate_kind_eval(
                                 &schema,
@@ -9024,6 +9255,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                 sk.as_ref(),
                                 &token,
                                 old,
+                                stored_ver,
                                 &op,
                                 condition.as_ref(),
                                 ttl_expired,
@@ -9040,11 +9272,34 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                         message,
                                     }
                                 }
+                                KindEvalDecision::Superseded { current } => {
+                                    // ADR 0075 G-d M2: LWW lost — no writes,
+                                    // not even a change record. The entry
+                                    // itself applied (it is committed and
+                                    // deterministic on every replica), so
+                                    // the replicated outcome is `Applied`;
+                                    // `Superseded` is only the leader-local
+                                    // result payload.
+                                    kind_eval_results
+                                        .lock()
+                                        .expect("kind eval results poisoned")
+                                        .fill(
+                                            index,
+                                            term,
+                                            KindEvalResult {
+                                                old: current.clone(),
+                                                new: current,
+                                                superseded: true,
+                                            },
+                                        );
+                                    KindBatchOutcome::Applied
+                                }
                                 KindEvalDecision::Applied {
                                     writes,
                                     change_log,
                                     old,
                                     new,
+                                    ..
                                 } => {
                                     // ADR 0046 binding decision, reused
                                     // verbatim: the ONE shared
@@ -9076,7 +9331,15 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                     kind_eval_results
                                         .lock()
                                         .expect("kind eval results poisoned")
-                                        .fill(index, term, KindEvalResult { old, new });
+                                        .fill(
+                                            index,
+                                            term,
+                                            KindEvalResult {
+                                                old,
+                                                new,
+                                                superseded: false,
+                                            },
+                                        );
                                     KindBatchOutcome::Applied
                                 }
                             }
@@ -9141,138 +9404,233 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     // behavior for a duplicate `BatchWriteItem` key — with
                     // zero extra `merge_batch`/sync calls in the common
                     // (all-distinct-keys) case.
-                    let mut overlay: BTreeMap<Vec<u8>, Option<Item>> = BTreeMap::new();
-                    let mut next_ordinal: u32 = 0;
-                    let mut items: Vec<KindEvalItemResult> = Vec::with_capacity(entries.len());
-                    for entry in &entries {
-                        let base_key = kind_eval_base_key(&entry.pk, entry.sk.as_ref());
-                        let token = animus_tablet::partition_token(&animus_item::storage_key(
-                            &entry.pk, None,
-                        ));
-                        let old: Option<Item> = if let Some(cached) = overlay.get(&base_key) {
-                            cached.clone()
-                        } else {
+                    // Replay stability (issue #1247; the `TxnStage` #1242
+                    // shape). WAL recovery re-applies this entry over an
+                    // engine that already holds its own — and later entries'
+                    // — effects, so re-evaluating would read post-state and
+                    // can decide differently than the live apply did (a
+                    // `not_exists` item that passed live fails on its own
+                    // write, shifting every later item's change-record
+                    // `ordinal` onto a different key; a later delete makes a
+                    // live-rejected condition pass). Base rows are protected
+                    // by per-key LWW but the derived rows are not (a
+                    // change-log key is unique `prefix||ts||ordinal`, LSI
+                    // keys follow item attributes). The entry's write set is
+                    // one atomic `merge_batch`, so ANY item's base key at or
+                    // above this entry's `ts` (tombstones included; see
+                    // `key_reached_by_entry`) proves the whole entry already
+                    // landed: the entire entry replays as a no-op before a
+                    // single derived row is written. Entry-granular on
+                    // purpose: a per-item skip would leave later items
+                    // re-evaluating against shifted ordinals. Reads are
+                    // collected here and reused by the loop below (one `get`
+                    // per distinct key, as before). Unreachable live except
+                    // a `SeedBatch`-seeded key at a carried higher version.
+                    'eval: {
+                        let entry_version = hlc::pack(ts);
+                        let mut engine_rows: BTreeMap<
+                            Vec<u8>,
+                            Option<animus_storage::VersionedValue>,
+                        > = BTreeMap::new();
+                        let mut replayed_noop = false;
+                        for entry in &entries {
+                            let bk = kind_eval_base_key(&entry.pk, entry.sk.as_ref());
+                            if engine_rows.contains_key(&bk) {
+                                continue;
+                            }
+                            let physical_base = scope.physical(&bk);
                             let raw = storage
-                                .get(&scope.physical(&base_key))
+                                .get(&physical_base)
                                 .await
                                 .expect("raftkv kind eval batch read");
-                            match raw.map(|vv| txn::decode_envelope(&vv.value)) {
-                                // An unresolved intent from a concurrent
-                                // transaction makes "the current committed
-                                // value" ambiguous for THIS item only —
-                                // never guess; siblings still evaluate on
-                                // their own merits (see this variant's own
-                                // doc: one item's no-op never aborts
-                                // another's).
-                                Some(txn::Envelope::Intent { .. }) => {
-                                    items.push(KindEvalItemResult::ConditionFailed);
-                                    continue;
-                                }
-                                Some(txn::Envelope::Committed(bytes)) => {
-                                    animus_item::decode_stored_item(&bytes)
-                                        .expect("raftkv kind eval batch decode")
-                                }
-                                None => None,
-                            }
-                        };
-                        match evaluate_kind_eval(
-                            &entry.schema,
-                            &entry.pk,
-                            entry.sk.as_ref(),
-                            &token,
-                            old,
-                            &entry.op,
-                            entry.condition.as_ref(),
-                            entry.ttl_expired,
-                        ) {
-                            KindEvalDecision::ConditionFailed => {
-                                items.push(KindEvalItemResult::ConditionFailed);
-                            }
-                            KindEvalDecision::Rejected { code, message } => {
-                                items.push(KindEvalItemResult::Rejected { code, message });
-                            }
-                            KindEvalDecision::Applied {
-                                writes,
-                                change_log,
-                                old,
-                                new,
-                            } => {
-                                // Record this item's own `new` image in the
-                                // overlay BEFORE moving on — a later item
-                                // sharing this same key must see it.
-                                overlay.insert(base_key, new.clone());
-                                // ADR 0046 binding decision, reused
-                                // verbatim: the ONE shared materialization
-                                // helper `KindBatch`'s/`KindEval`'s own arms
-                                // and `TxnResolve`'s commit branch also
-                                // call. `next_ordinal` threads across this
-                                // loop exactly like `TxnResolve`'s own
-                                // multi-key commit loop (issue #852) so
-                                // every item's change record lands at a
-                                // distinct `(ts, ordinal)` pair.
-                                let starting = next_ordinal;
-                                next_ordinal = materialize_derived(
-                                    kind_scopes,
-                                    &writes,
-                                    std::slice::from_ref(&change_log),
-                                    ts,
-                                    &mut pending,
-                                    next_ordinal,
-                                );
-                                if next_ordinal > starting {
-                                    note_hot_change_write(hot_change_max, ts, next_ordinal - 1);
-                                }
-                                items.push(KindEvalItemResult::Applied { old, new });
+                            let reached = key_reached_by_entry(
+                                storage,
+                                &physical_base,
+                                raw.as_ref(),
+                                entry_version,
+                            )
+                            .await;
+                            engine_rows.insert(bk, raw);
+                            if reached {
+                                replayed_noop = true;
+                                break;
                             }
                         }
+                        if replayed_noop {
+                            tracing::debug!(
+                                "raftkv: KindEvalBatch replayed over an engine that already holds it \
+                             — no-op"
+                            );
+                            kind_outcomes
+                                .lock()
+                                .expect("kind batch outcomes poisoned")
+                                .record(index, term, KindBatchOutcome::Applied);
+                            kind_eval_batch_results
+                                .lock()
+                                .expect("kind eval batch results poisoned")
+                                .fill(
+                                    index,
+                                    term,
+                                    KindEvalBatchResult {
+                                        items: entries
+                                            .iter()
+                                            .map(|_| KindEvalItemResult::ConditionFailed)
+                                            .collect(),
+                                    },
+                                );
+                            break 'eval;
+                        }
+                        // ADR 0075 G-d M2: the overlay also carries the stamp the earlier
+                        // item wrote, so a second local write to the same MREC key in one
+                        // entry bumps from it (and a replicate sees it).
+                        let mut overlay: BTreeMap<
+                            Vec<u8>,
+                            (Option<Item>, Option<animus_item::MrecVersion>),
+                        > = BTreeMap::new();
+                        let mut next_ordinal: u32 = 0;
+                        let mut items: Vec<KindEvalItemResult> = Vec::with_capacity(entries.len());
+                        for entry in &entries {
+                            let base_key = kind_eval_base_key(&entry.pk, entry.sk.as_ref());
+                            let token = animus_tablet::partition_token(&animus_item::storage_key(
+                                &entry.pk, None,
+                            ));
+                            let (old, stored_ver): (
+                                Option<Item>,
+                                Option<animus_item::MrecVersion>,
+                            ) = if let Some(cached) = overlay.get(&base_key) {
+                                cached.clone()
+                            } else {
+                                // Read once up front (`engine_rows`, above).
+                                let raw = engine_rows.get(&base_key).cloned().expect(
+                                    "every item's base key was read by the replay pre-pass",
+                                );
+                                match raw.map(|vv| txn::decode_envelope(&vv.value)) {
+                                    // An unresolved intent from a concurrent
+                                    // transaction makes "the current committed
+                                    // value" ambiguous for THIS item only —
+                                    // never guess; siblings still evaluate on
+                                    // their own merits (see this variant's own
+                                    // doc: one item's no-op never aborts
+                                    // another's).
+                                    Some(txn::Envelope::Intent { .. }) => {
+                                        items.push(KindEvalItemResult::ConditionFailed);
+                                        continue;
+                                    }
+                                    Some(txn::Envelope::Committed(bytes)) => {
+                                        animus_item::decode_stored_item_versioned(&bytes)
+                                            .expect("raftkv kind eval batch decode")
+                                    }
+                                    None => (None, None),
+                                }
+                            };
+                            match evaluate_kind_eval(
+                                &entry.schema,
+                                &entry.pk,
+                                entry.sk.as_ref(),
+                                &token,
+                                old,
+                                stored_ver,
+                                &entry.op,
+                                entry.condition.as_ref(),
+                                entry.ttl_expired,
+                            ) {
+                                KindEvalDecision::ConditionFailed => {
+                                    items.push(KindEvalItemResult::ConditionFailed);
+                                }
+                                KindEvalDecision::Rejected { code, message } => {
+                                    items.push(KindEvalItemResult::Rejected { code, message });
+                                }
+                                KindEvalDecision::Superseded { current } => {
+                                    // ADR 0075 G-d M2: LWW lost, nothing written
+                                    // (the overlay is unchanged: the stored row
+                                    // is still what a later same-key item sees).
+                                    items.push(KindEvalItemResult::Superseded { current });
+                                }
+                                KindEvalDecision::Applied {
+                                    writes,
+                                    change_log,
+                                    old,
+                                    new,
+                                    new_ver,
+                                } => {
+                                    // Record this item's own `new` image (and
+                                    // stamp) in the overlay BEFORE moving on — a
+                                    // later item sharing this same key must see
+                                    // it.
+                                    overlay.insert(base_key, (new.clone(), new_ver));
+                                    // ADR 0046 binding decision, reused
+                                    // verbatim: the ONE shared materialization
+                                    // helper `KindBatch`'s/`KindEval`'s own arms
+                                    // and `TxnResolve`'s commit branch also
+                                    // call. `next_ordinal` threads across this
+                                    // loop exactly like `TxnResolve`'s own
+                                    // multi-key commit loop (issue #852) so
+                                    // every item's change record lands at a
+                                    // distinct `(ts, ordinal)` pair.
+                                    let starting = next_ordinal;
+                                    next_ordinal = materialize_derived(
+                                        kind_scopes,
+                                        &writes,
+                                        std::slice::from_ref(&change_log),
+                                        ts,
+                                        &mut pending,
+                                        next_ordinal,
+                                    );
+                                    if next_ordinal > starting {
+                                        note_hot_change_write(hot_change_max, ts, next_ordinal - 1);
+                                    }
+                                    items.push(KindEvalItemResult::Applied { old, new });
+                                }
+                            }
+                        }
+                        // Collapse this entry's own pending writes to at most ONE
+                        // op per PHYSICAL key, keeping the LAST one pushed.
+                        // `pending` holds exactly (and only) this entry's own
+                        // writes here — `flush_pending` emptied it above, and
+                        // nothing else can touch it mid-arm — so this cannot
+                        // affect any other entry.
+                        //
+                        // Needed because [`StorageEngine::merge`]'s per-key LWW
+                        // takes effect only when its `version` is STRICTLY
+                        // greater than the key's current latest: two writes to
+                        // the SAME physical key sharing this entry's one `ts`
+                        // (the same-key-duplicate case `overlay` above makes
+                        // read-consistent) would otherwise silently keep the
+                        // FIRST push and drop the second — the opposite of the
+                        // last-write-wins behavior this variant preserves for a
+                        // duplicate `BatchWriteItem` key (see this variant's own
+                        // doc). Every change-log op's own key is unique per item
+                        // (it carries that item's `ordinal`), so this can only
+                        // ever collapse a genuine BASE/LSI collision, never a
+                        // change record.
+                        let mut last_index_for_key: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
+                        for (i, op) in pending.iter().enumerate() {
+                            last_index_for_key.insert(op.key.clone(), i);
+                        }
+                        let mut keep = vec![false; pending.len()];
+                        for &i in last_index_for_key.values() {
+                            keep[i] = true;
+                        }
+                        let mut next = 0;
+                        pending.retain(|_| {
+                            let k = keep[next];
+                            next += 1;
+                            k
+                        });
+                        // ONE `KindBatchOutcome::Applied` for the whole entry —
+                        // never a per-item breakdown in the replicated map (see
+                        // this variant's own doc) — plus the ordered per-item
+                        // breakdown in the leader-local, never-replicated
+                        // `KindEvalBatchResults` slot map.
+                        kind_outcomes
+                            .lock()
+                            .expect("kind batch outcomes poisoned")
+                            .record(index, term, KindBatchOutcome::Applied);
+                        kind_eval_batch_results
+                            .lock()
+                            .expect("kind eval batch results poisoned")
+                            .fill(index, term, KindEvalBatchResult { items });
                     }
-                    // Collapse this entry's own pending writes to at most ONE
-                    // op per PHYSICAL key, keeping the LAST one pushed.
-                    // `pending` holds exactly (and only) this entry's own
-                    // writes here — `flush_pending` emptied it above, and
-                    // nothing else can touch it mid-arm — so this cannot
-                    // affect any other entry.
-                    //
-                    // Needed because [`StorageEngine::merge`]'s per-key LWW
-                    // takes effect only when its `version` is STRICTLY
-                    // greater than the key's current latest: two writes to
-                    // the SAME physical key sharing this entry's one `ts`
-                    // (the same-key-duplicate case `overlay` above makes
-                    // read-consistent) would otherwise silently keep the
-                    // FIRST push and drop the second — the opposite of the
-                    // last-write-wins behavior this variant preserves for a
-                    // duplicate `BatchWriteItem` key (see this variant's own
-                    // doc). Every change-log op's own key is unique per item
-                    // (it carries that item's `ordinal`), so this can only
-                    // ever collapse a genuine BASE/LSI collision, never a
-                    // change record.
-                    let mut last_index_for_key: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
-                    for (i, op) in pending.iter().enumerate() {
-                        last_index_for_key.insert(op.key.clone(), i);
-                    }
-                    let mut keep = vec![false; pending.len()];
-                    for &i in last_index_for_key.values() {
-                        keep[i] = true;
-                    }
-                    let mut next = 0;
-                    pending.retain(|_| {
-                        let k = keep[next];
-                        next += 1;
-                        k
-                    });
-                    // ONE `KindBatchOutcome::Applied` for the whole entry —
-                    // never a per-item breakdown in the replicated map (see
-                    // this variant's own doc) — plus the ordered per-item
-                    // breakdown in the leader-local, never-replicated
-                    // `KindEvalBatchResults` slot map.
-                    kind_outcomes
-                        .lock()
-                        .expect("kind batch outcomes poisoned")
-                        .record(index, term, KindBatchOutcome::Applied);
-                    kind_eval_batch_results
-                        .lock()
-                        .expect("kind eval batch results poisoned")
-                        .fill(index, term, KindEvalBatchResult { items });
                 }
             }
             KvCommand::Delete { key, ts } => {
@@ -9579,6 +9937,65 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // foreign-transaction block (`blocked_by`) — see
                 // `docs/lessons/` for the regression this closed.
                 flush_pending(storage, &mut pending, metrics, halted).await;
+                // Replay stability (issue #1242). WAL recovery re-applies this
+                // group's log tail from `snapshot_index` over an engine that
+                // already holds the effects of entries past it (a
+                // `kill -9` restart: the engine is durable per call, the
+                // replay start is the last compaction). Every decision below
+                // reads engine state, so on that replay it sees state from
+                // the *future* of this entry and can decide differently than
+                // the live apply did: a stage the live apply rejected (a
+                // stale/duplicate stage caught by a resolved marker, a stage
+                // blocked by a since-resolved foreign intent) is accepted,
+                // and its merge lands on every key that has no later write —
+                // an intent resurrected on this replica only, which then
+                // blocks every later stage touching that key here (the
+                // acknowledged transaction's other key silently never
+                // applies on this replica). Entries apply in strictly
+                // increasing `ts` order, so a row or resolved marker at one
+                // of this stage's own keys with a version strictly above this
+                // entry's proves a later entry already ran: this entry has
+                // been applied (or rejected) in full already and replays as a
+                // no-op, exactly as the live apply left it. Equal is NOT
+                // ahead: it is this very entry's own (possibly partial,
+                // crash-interrupted) intent merge, which re-applies normally.
+                // Never true on the live path (no row can carry a version
+                // above the entry being applied) — one exception: a
+                // `SeedBatch` (the restore driver) merges rows at carried
+                // source-cluster versions, so a stage hitting a seeded key
+                // with a higher version is Fenced live too (deterministic on
+                // every replica; a liveness edge on a not-yet-served table
+                // only). Replicas that did not restart otherwise behave
+                // exactly as before. The record key joins the check on the
+                // anchor: its version moves with every later decision.
+                let stage_version = hlc::pack(ts);
+                let mut engine_ahead = false;
+                'ahead: for physical in writes
+                    .iter()
+                    .flat_map(|w| [w.key.clone(), txn::resolved_marker_key(&w.key)])
+                    .chain(is_anchor.then(|| record_key.clone()))
+                    .map(|k| scope.physical(&k))
+                {
+                    // Tombstone-aware: a key deleted after this stage (a
+                    // resolve-as-delete, a DeleteItem, a TTL reap) has no
+                    // live row, but its tombstone's version still proves a
+                    // later entry ran.
+                    if latest_version_incl_tombstone(storage, &physical)
+                        .await
+                        .is_some_and(|v| v > stage_version)
+                    {
+                        engine_ahead = true;
+                        break 'ahead;
+                    }
+                }
+                if engine_ahead {
+                    tracing::debug!(
+                        ?txn_id,
+                        ?record_key,
+                        "raftkv: TxnStage replayed over an engine already ahead of it (a later \
+                         entry wrote one of its keys) — no-op, as the live apply left it"
+                    );
+                }
                 // ADR 0018 §2/PR5 resurrection guard: PR4's prepare phase
                 // is concurrent, so the anchor's own `TxnStage` (this
                 // entry, when `is_anchor`) can arrive **after** a recovery
@@ -9653,18 +10070,31 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // resolved on this group — `blocked_by` above only ever
                 // catches a *different* transaction's still-live `Intent`,
                 // never a same-txn resurrection of an already-`Committed`/
-                // restored value (see `TxnTracker::recently_resolved`'s
-                // doc for the full argument and why checking (key, txn_id)
-                // IDENTITY, not mere presence, is load-bearing here — a
-                // *different*, genuinely later transaction reusing the same
-                // physical key is the ordinary, unrelated write path and
-                // must stage normally).
-                let resurrection_attempt = {
-                    let t = txn_tracker.lock().expect("txn tracker poisoned");
-                    writes
-                        .iter()
-                        .any(|w| t.recently_resolved.get(&scope.physical(&w.key)) == Some(&txn_id))
-                };
+                // restored value. The decision reads the durable
+                // **resolved marker** (`txn::resolved_marker_key`) that
+                // `TxnResolve`'s apply wrote beside the resolve — engine
+                // state, so it is identical on every replica whether it
+                // restarted, installed a snapshot image, or never lost
+                // anything (issue #1243: an in-memory map here made the
+                // same log entry apply differently per replica). Checking
+                // (key, txn_id) IDENTITY, not mere presence, is
+                // load-bearing: a *different*, genuinely later transaction
+                // reusing the same physical key is the ordinary, unrelated
+                // write path and must stage normally.
+                let mut resurrection_attempt = false;
+                for w in &writes {
+                    let marker = storage
+                        .get(&scope.physical(&txn::resolved_marker_key(&w.key)))
+                        .await
+                        .expect("raftkv txn stage resolved-marker read");
+                    if marker
+                        .and_then(|vv| txn::decode_resolved_marker(&vv.value))
+                        .is_some_and(|resolved| resolved == txn_id)
+                    {
+                        resurrection_attempt = true;
+                        break;
+                    }
+                }
                 if resurrection_attempt {
                     tracing::warn!(
                         ?txn_id,
@@ -9717,6 +10147,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         && w.pending.as_ref().is_none_or(|p| pending_base_key_matches(&w.key, p))
                 });
                 let all_in_fence = !already_decided
+                    && !engine_ahead
                     && !resurrection_attempt
                     && blocked_by.is_none()
                     && kind_tokens_ok
@@ -9806,43 +10237,59 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                             .get(&scope.physical(&w.key))
                             .await
                             .expect("raftkv txn stage pending-eval read");
-                        let old: Option<Item> = match raw.map(|vv| txn::decode_envelope(&vv.value))
-                        {
-                            None => None,
-                            Some(txn::Envelope::Committed(bytes)) => {
-                                animus_item::decode_stored_item(&bytes)
-                                    .expect("raftkv txn stage pending-eval decode")
-                            }
-                            // Same-txn re-staging (a WAL-replay
-                            // re-application): this exact stage already
-                            // landed this exact intent at this exact key —
-                            // reuse its already-computed payload verbatim
-                            // instead of re-evaluating `op`/`condition`
-                            // against it as though it were the pre-stage
-                            // value (which would, e.g., double-apply a
-                            // non-idempotent `ADD` against its own prior
-                            // result). A *foreign* intent here is
-                            // unreachable: `blocked_by` above already
-                            // rejected the whole stage (`all_in_fence ==
-                            // false`) before this loop ever runs.
-                            Some(txn::Envelope::Intent {
-                                txn_id: owner,
-                                staged_value,
-                                kind_writes,
-                                change_log,
-                                ..
-                            }) if owner == txn_id => {
-                                evaluated_payload[i] =
-                                    Some((staged_value, kind_writes, change_log));
-                                continue;
-                            }
-                            Some(txn::Envelope::Intent { .. }) => {
-                                unreachable!(
-                                    "a foreign intent here was already caught by `blocked_by` \
+                        let (old, stored_ver): (Option<Item>, Option<animus_item::MrecVersion>) =
+                            match raw.map(|vv| txn::decode_envelope(&vv.value)) {
+                                None => (None, None),
+                                Some(txn::Envelope::Committed(bytes)) => {
+                                    animus_item::decode_stored_item_versioned(&bytes)
+                                        .expect("raftkv txn stage pending-eval decode")
+                                }
+                                // Same-txn re-staging (a WAL-replay
+                                // re-application): this exact stage already
+                                // landed this exact intent at this exact key —
+                                // reuse its already-computed payload verbatim
+                                // instead of re-evaluating `op`/`condition`
+                                // against it as though it were the pre-stage
+                                // value (which would, e.g., double-apply a
+                                // non-idempotent `ADD` against its own prior
+                                // result). A *foreign* intent here is
+                                // unreachable: `blocked_by` above already
+                                // rejected the whole stage (`all_in_fence ==
+                                // false`) before this loop ever runs.
+                                Some(txn::Envelope::Intent {
+                                    txn_id: owner,
+                                    staged_value,
+                                    kind_writes,
+                                    change_log,
+                                    ..
+                                }) if owner == txn_id => {
+                                    evaluated_payload[i] =
+                                        Some((staged_value, kind_writes, change_log));
+                                    continue;
+                                }
+                                Some(txn::Envelope::Intent { .. }) => {
+                                    unreachable!(
+                                        "a foreign intent here was already caught by `blocked_by` \
                                      above (all_in_fence would be false)"
-                                )
-                            }
-                        };
+                                    )
+                                }
+                            };
+                        // ADR 0075 G-d M2: a replicated MREC record is never
+                        // part of a transaction (transactions are
+                        // region-local, each committed item takes a local
+                        // stamp); a stage carrying one is a deterministic
+                        // validation rejection, same structural bucket as a
+                        // failed evaluation — whether or not its stamp would
+                        // have won.
+                        if matches!(p.op, KindEvalOp::Replicate { .. }) {
+                            pending_failure = Some(txn::StageOutcome::Rejected {
+                                key: w.key.clone(),
+                                code: "ValidationException".to_owned(),
+                                message: "an MREC replicate cannot be staged in a transaction"
+                                    .to_owned(),
+                            });
+                            break 'pending_eval;
+                        }
                         let token =
                             animus_tablet::partition_token(&animus_item::storage_key(&p.pk, None));
                         match evaluate_kind_eval(
@@ -9851,6 +10298,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                             p.sk.as_ref(),
                             &token,
                             old,
+                            stored_ver,
                             &p.op,
                             p.condition.as_ref(),
                             p.ttl_expired,
@@ -9865,6 +10313,19 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                     key: w.key.clone(),
                                     code,
                                     message,
+                                });
+                                break 'pending_eval;
+                            }
+                            // Only a `Replicate` can be superseded, and one was
+                            // rejected above; kept total (never a panic in a
+                            // replicated apply) with the same rejection.
+                            KindEvalDecision::Superseded { .. } => {
+                                pending_failure = Some(txn::StageOutcome::Rejected {
+                                    key: w.key.clone(),
+                                    code: "ValidationException".to_owned(),
+                                    message: "an MREC replicate cannot be staged in a \
+                                              transaction"
+                                        .to_owned(),
                                 });
                                 break 'pending_eval;
                             }
@@ -10019,7 +10480,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // (`IntentBlocked`) both pre-empt ever evaluating this
                 // stage's own conditions, so they take priority over
                 // `ConditionFailed` here too.
-                let outcome = if already_decided {
+                let outcome = if already_decided || engine_ahead {
                     txn::StageOutcome::Fenced
                 } else if let Some((
                     blocked_key,
@@ -10713,19 +11174,21 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                             }
                         }
                         // ADR 0018 §2/PR6 seatbelt (issue #298 shape A):
-                        // record that THIS exact transaction's intent at
-                        // this key has now been resolved here (commit or
-                        // abort — both leave nothing of `txn_id`'s own at
-                        // this key), so a stale/duplicate `TxnStage`
-                        // re-arriving for the identical `(key, txn_id)`
-                        // afterward is rejected instead of silently
-                        // resurrecting it — see `TxnTracker::recently_
-                        // resolved`'s doc and `KvCommand::TxnStage`'s own
-                        // resurrection-guard read of this map.
-                        txn_tracker
-                            .lock()
-                            .expect("txn tracker poisoned")
-                            .record_resolution(physical_key, txn_id.clone());
+                        // durably record that THIS exact transaction's
+                        // intent at this key has now been resolved here
+                        // (commit or abort — both leave nothing of
+                        // `txn_id`'s own at this key), in the SAME merge
+                        // batch as the resolve itself so the two are
+                        // atomic, so a stale/duplicate `TxnStage`
+                        // re-arriving for the identical `(key, txn_id)` is
+                        // rejected on every replica instead of
+                        // resurrecting it — see `TxnStage`'s own
+                        // resurrection guard and `txn::resolved_marker_key`.
+                        pending.push(MergeOp::put(
+                            scope.physical(&txn::resolved_marker_key(key)),
+                            txn::encode_resolved_marker(&txn_id),
+                            version,
+                        ));
                     }
                     // ADR 0018 §2/PR5, refined by the write-loss amendment
                     // §3/§6 fix: this group's own recovery-retry bookkeeping
@@ -11640,6 +12103,17 @@ async fn engine_image<S: StorageEngine>(
         .entries_with_tombstones()
         .await
         .expect("raftkv engine scan");
+    // ADR 0073 (class G, `txn-envelope` v2, 2026-10-05 amendment): engine
+    // values cross nodes inside this image, and a previous-release replica
+    // panics on an intent whose tag it does not know (`txn: unknown envelope
+    // tag 2`). While the version that introduces v2 (`Gate::GlobalTables`) is
+    // closed — which includes "this node has not read the cluster version
+    // yet" (floor) — every v2 intent in a base row ships down-converted to
+    // v1 (v1 cannot express the carried `prior`, so it ships as the committed
+    // row one MVCC version below the intent, where the old lookback reads it).
+    // The local engine is untouched and apply never branches on the gate, so
+    // replicas stay deterministic; a finalized cluster ships v2 as is.
+    let ship_v1_intents = !features.is_open(Gate::GlobalTables);
     let mut entries: Vec<ImageEntry> = Vec::new();
     for (k, v, version) in rows {
         let claimed = ALL_KINDS
@@ -11647,6 +12121,48 @@ async fn engine_image<S: StorageEngine>(
             .zip(kind_scopes)
             .find_map(|(kind, scope)| scope.strip_in_range(&k).map(|l| (*kind, l.to_vec())));
         if let Some((kind, logical)) = claimed {
+            // ADR 0073 (`txn-resolved-marker` v1, issues #1243/#1251): a
+            // previous-release replica's scan/`has_data` filters know only
+            // record keys and would surface a marker row (`token || 0x00 0x04
+            // || key`) as a client item, so while the introducing gate is
+            // closed it cannot ship as a `KIND_BASE` row. It must still
+            // ship: `TxnStage`'s stale-restage rejection reads it, so a
+            // replica that installs this image without the sender's markers
+            // would accept a stage its peers reject (a replica-divergent
+            // intent). It rides in the SAME image under the wire-only kind
+            // [`KIND_WIRE_RESOLVED_MARKER`], which no `ALL_KINDS` scope
+            // claims: a previous-release receiver drops an unknown kind
+            // (`install_engine_image`, verified at the R-1 reference), a
+            // current one files it back as the base-scope marker row. A
+            // gate-open image ships it as the plain base row, as before.
+            if ship_v1_intents && kind == KIND_BASE && txn::is_resolved_marker_key(&logical) {
+                entries.push((KIND_WIRE_RESOLVED_MARKER, logical, v, version));
+                continue;
+            }
+            let v = match v {
+                Some(bytes) if ship_v1_intents && kind == KIND_BASE => {
+                    match txn::legacy::v1::downgrade_intent_to_v1_with_prior(&bytes) {
+                        Some((v1, prior)) => {
+                            // v1 cannot carry the prior, but a v1 reader
+                            // looks one MVCC version below the intent for
+                            // it: ship it there, so a replica that rebuilds
+                            // from this image can still restore the value on
+                            // an abort (as far as that lookback reaches).
+                            if let (Some(p), Some(below)) = (prior, version.checked_sub(1)) {
+                                entries.push((
+                                    kind,
+                                    logical.clone(),
+                                    Some(txn::encode_committed(&p)),
+                                    below,
+                                ));
+                            }
+                            Some(v1)
+                        }
+                        None => Some(bytes),
+                    }
+                }
+                other => other,
+            };
             entries.push((kind, logical, v, version));
         }
     }
@@ -11708,6 +12224,14 @@ async fn install_engine_image<S: StorageEngine>(
         // build does not (ALL_KINDS grew). Dropping it is the safe read: this
         // replica has no scope to put it in, and silently mis-filing it under
         // another kind would corrupt that kind's keyspace.
+        // The wire-only marker kind (issue #1251) is the base-scope
+        // resolved-marker row, shipped under a kind a previous-release
+        // receiver ignores; anything else unknown is dropped.
+        let kind = if kind == KIND_WIRE_RESOLVED_MARKER && txn::is_resolved_marker_key(&key) {
+            KIND_BASE
+        } else {
+            kind
+        };
         let Some(scope) = kind_scopes.get(kind as usize) else {
             tracing::warn!(kind, "snapshot image entry of unknown row kind dropped");
             continue;
@@ -13155,6 +13679,24 @@ mod kind_scope_tests {
         }
     }
 
+    /// `latest_version_incl_tombstone` (issue #1242 replay-ahead check) sees a
+    /// tombstone's version where `get` sees nothing, ignores neighbouring keys
+    /// that merely share a prefix, and reports `None` for a never-written key.
+    #[test]
+    fn latest_version_incl_tombstone_sees_deletes_and_exact_key_only() {
+        use animus_storage::{MemoryEngine, StorageEngine};
+        futures::executor::block_on(async {
+            let e = MemoryEngine::new();
+            e.merge(b"k", b"v", 5).await.unwrap();
+            e.merge(b"k\x00x", b"other", 99).await.unwrap();
+            assert_eq!(latest_version_incl_tombstone(&e, b"k").await, Some(5));
+            e.merge_tombstone(b"k", 9).await.unwrap();
+            assert!(e.get(b"k").await.unwrap().is_none(), "get hides it");
+            assert_eq!(latest_version_incl_tombstone(&e, b"k").await, Some(9));
+            assert_eq!(latest_version_incl_tombstone(&e, b"nope").await, None);
+        });
+    }
+
     /// The rung-B4 seed path's foundation (ADR 0050): an `engine_image` of
     /// one tablet's private engine installs **byte-identically** — keys,
     /// values, tombstones, MVCC versions — into a different tablet's own
@@ -13237,6 +13779,102 @@ mod kind_scope_tests {
                 dst.get(&hwm_key).await.unwrap().map(|v| v.value),
                 Some(hwm::encode_hwm_value(max_ts)),
                 "the installed hwm marker must reflect the image header's own max_ts"
+            );
+        });
+    }
+
+    /// Issue #1251: a resolved marker crosses in EVERY image. While
+    /// `Gate::GlobalTables` is closed it rides under the wire-only kind
+    /// `KIND_WIRE_RESOLVED_MARKER` and never as a base row, so a
+    /// previous-release receiver (which files only `ALL_KINDS` entries and
+    /// drops an unknown kind) never holds a marker-shaped client row; once
+    /// the gate is open it ships as the plain base row. A current receiver
+    /// ends up with the sender's marker either way.
+    #[test]
+    fn engine_image_ships_resolved_markers_through_the_ignorable_kind_while_the_gate_is_closed() {
+        use animus_storage::{MemoryEngine, StorageEngine};
+        futures::executor::block_on(async {
+            let src = MemoryEngine::new();
+            let src_scopes = kind_scopes(&StorageScope::whole());
+            let base = [7u8; 12];
+            let mk = txn::resolved_marker_key(&base);
+            let marker_val = txn::encode_resolved_marker(&txn::TxnId {
+                ts: HlcTimestamp {
+                    wall_ms: 3,
+                    logical: 1,
+                },
+                node: animus_env::nid(5),
+            });
+            src.merge(
+                &src_scopes[KIND_BASE as usize].physical(&mk),
+                &marker_val,
+                40,
+            )
+            .await
+            .unwrap();
+            src.merge(
+                &src_scopes[KIND_BASE as usize].physical(&base),
+                &txn::encode_committed(b"v"),
+                41,
+            )
+            .await
+            .unwrap();
+
+            let closed = ClusterFeatures::new();
+            let image = engine_image(&src, &src_scopes, None, &closed).await;
+            let (_, entries) = codec::decode_image(&image).unwrap();
+            // What a previous-release receiver files: only `ALL_KINDS` rows.
+            assert!(
+                entries
+                    .iter()
+                    .filter(|(k, ..)| ALL_KINDS.contains(k))
+                    .all(|(_, key, ..)| !txn::is_resolved_marker_key(key)),
+                "a gate-closed image must carry no marker-shaped base row"
+            );
+            assert!(
+                entries
+                    .iter()
+                    .any(|(k, key, v, ver)| *k == KIND_WIRE_RESOLVED_MARKER
+                        && key == &mk
+                        && v.as_deref() == Some(&marker_val[..])
+                        && *ver == 40),
+                "the marker must ship under the wire kind: {entries:?}"
+            );
+            assert!(
+                !ALL_KINDS.contains(&KIND_WIRE_RESOLVED_MARKER),
+                "the wire kind must never be a storage scope"
+            );
+
+            // A current receiver files the marker back as the base-scope row.
+            let dst = MemoryEngine::new();
+            let dst_scopes = kind_scopes(&StorageScope::whole());
+            install_engine_image(&dst, &dst_scopes, &image, 1, 42).await;
+            let got = dst
+                .get(&dst_scopes[KIND_BASE as usize].physical(&mk))
+                .await
+                .unwrap()
+                .expect("receiver holds the marker");
+            assert_eq!((got.value, got.version), (marker_val.clone(), 40));
+
+            // Gate open: the plain base row, as before; same receiver result.
+            let open = ClusterFeatures::new();
+            open.update(&animus_control::Metadata {
+                cluster_version: 2,
+                ..animus_control::Metadata::default()
+            });
+            let image = engine_image(&src, &src_scopes, None, &open).await;
+            let (_, entries) = codec::decode_image(&image).unwrap();
+            assert!(
+                entries
+                    .iter()
+                    .any(|(k, key, ..)| *k == KIND_BASE && key == &mk),
+                "a gate-open image ships the marker as a base row"
+            );
+            assert!(
+                entries
+                    .iter()
+                    .all(|(k, ..)| *k != KIND_WIRE_RESOLVED_MARKER),
+                "a gate-open image never uses the wire kind"
             );
         });
     }
