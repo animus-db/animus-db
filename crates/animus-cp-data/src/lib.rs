@@ -8395,6 +8395,35 @@ async fn latest_version_incl_tombstone<S: StorageEngine>(
         .map(|(_, _, v)| v)
 }
 
+/// Replay check for a `KindEval`/`KindEvalBatch` entry's decided key (issues
+/// #1242/#1247): `true` iff the key's newest record — tombstones included —
+/// carries a version **at or above** `entry_version` (the packed `ts` of the
+/// entry being applied), which proves this entry or a later one already wrote
+/// it. Unlike `TxnStage`'s strictly-greater check, equal counts: a `KindEval*`
+/// entry's whole write set (base row, LSI/footprint rows, change record) goes
+/// down in ONE atomic `merge_batch` (a single WAL record), so a base row at
+/// this entry's own version proves every row of the entry landed, and
+/// re-evaluating it would read its own post-state (an `Update`'s `ADD` would
+/// apply twice, a `not_exists` condition would flip). `current` is the live row
+/// the caller already read with `get` (a hit answers without a second read;
+/// only a miss pays the tombstone-aware scan, since `get` hides a deleted key).
+/// Never true on the live path (`assert_ts_monotonic`: every row is stamped at
+/// an earlier entry's strictly smaller `ts`) except for a `SeedBatch`-seeded
+/// key carrying a source-cluster version.
+async fn key_reached_by_entry<S: StorageEngine>(
+    storage: &S,
+    physical: &[u8],
+    current: Option<&animus_storage::VersionedValue>,
+    entry_version: u64,
+) -> bool {
+    match current {
+        Some(vv) => vv.version >= entry_version,
+        None => latest_version_incl_tombstone(storage, physical)
+            .await
+            .is_some_and(|v| v >= entry_version),
+    }
+}
+
 /// Install any received snapshot, apply committed-and-durable commands to the
 /// engine in commit order, and compact when the engine has merged enough past the
 /// snapshot base. **Runs on the apply task only** — off the consensus loop, so a
@@ -8941,11 +8970,46 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         key: base_key.clone(),
                     }
                 } else {
+                    let physical_base = scope.physical(&base_key);
                     let raw = storage
-                        .get(&scope.physical(&base_key))
+                        .get(&physical_base)
                         .await
                         .expect("raftkv kind eval read");
+                    // Replay stability (issue #1247, the `TxnStage` #1242
+                    // shape). WAL recovery re-applies this entry over an
+                    // engine that already holds later entries' effects, so
+                    // the decision below (condition result, foreign-intent
+                    // `ConditionFailed`) would read the *future* of this
+                    // entry and could flip — and the derived rows
+                    // `materialize_derived` then writes (change-log record
+                    // on a unique `prefix||ts||ordinal` key, LSI/footprint
+                    // rows keyed by item attributes) are NOT protected by
+                    // per-key LWW the way the base row is: an orphan stream
+                    // record / index row on this replica only. A base-key
+                    // version (tombstones included) strictly above this
+                    // entry's `ts` proves a later entry already ran, and one
+                    // EQUAL to it proves this entry's own (atomic, single
+                    // `merge_batch`) write already landed, whose post-state
+                    // a re-evaluation would misread: replay as a no-op
+                    // BEFORE any derived row is written (see
+                    // `key_reached_by_entry`). Nobody waits on a replayed
+                    // entry, so `ConditionFailed` is the safe recorded
+                    // outcome. Unreachable live except a
+                    // `SeedBatch`-seeded key at a carried higher version,
+                    // where the write could not land on the base row anyway.
+                    let ahead =
+                        key_reached_by_entry(storage, &physical_base, raw.as_ref(), hlc::pack(ts))
+                            .await;
+                    if ahead {
+                        tracing::debug!(
+                            ?base_key,
+                            "raftkv: KindEval replayed over an engine already ahead of it — no-op"
+                        );
+                    }
                     match raw.map(|vv| txn::decode_envelope(&vv.value)) {
+                        _ if ahead => KindBatchOutcome::ConditionFailed {
+                            key: base_key.clone(),
+                        },
                         // An unresolved intent from a concurrent transaction
                         // makes "the current committed value" ambiguous —
                         // never guess, mirroring `KindBatch.conditions`'
@@ -9089,138 +9153,215 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     // behavior for a duplicate `BatchWriteItem` key — with
                     // zero extra `merge_batch`/sync calls in the common
                     // (all-distinct-keys) case.
-                    let mut overlay: BTreeMap<Vec<u8>, Option<Item>> = BTreeMap::new();
-                    let mut next_ordinal: u32 = 0;
-                    let mut items: Vec<KindEvalItemResult> = Vec::with_capacity(entries.len());
-                    for entry in &entries {
-                        let base_key = kind_eval_base_key(&entry.pk, entry.sk.as_ref());
-                        let token = animus_tablet::partition_token(&animus_item::storage_key(
-                            &entry.pk, None,
-                        ));
-                        let old: Option<Item> = if let Some(cached) = overlay.get(&base_key) {
-                            cached.clone()
-                        } else {
+                    // Replay stability (issue #1247; the `TxnStage` #1242
+                    // shape). WAL recovery re-applies this entry over an
+                    // engine that already holds its own — and later entries'
+                    // — effects, so re-evaluating would read post-state and
+                    // can decide differently than the live apply did (a
+                    // `not_exists` item that passed live fails on its own
+                    // write, shifting every later item's change-record
+                    // `ordinal` onto a different key; a later delete makes a
+                    // live-rejected condition pass). Base rows are protected
+                    // by per-key LWW but the derived rows are not (a
+                    // change-log key is unique `prefix||ts||ordinal`, LSI
+                    // keys follow item attributes). The entry's write set is
+                    // one atomic `merge_batch`, so ANY item's base key at or
+                    // above this entry's `ts` (tombstones included; see
+                    // `key_reached_by_entry`) proves the whole entry already
+                    // landed: the entire entry replays as a no-op before a
+                    // single derived row is written. Entry-granular on
+                    // purpose: a per-item skip would leave later items
+                    // re-evaluating against shifted ordinals. Reads are
+                    // collected here and reused by the loop below (one `get`
+                    // per distinct key, as before). Unreachable live except
+                    // a `SeedBatch`-seeded key at a carried higher version.
+                    'eval: {
+                        let entry_version = hlc::pack(ts);
+                        let mut engine_rows: BTreeMap<
+                            Vec<u8>,
+                            Option<animus_storage::VersionedValue>,
+                        > = BTreeMap::new();
+                        let mut replayed_noop = false;
+                        for entry in &entries {
+                            let bk = kind_eval_base_key(&entry.pk, entry.sk.as_ref());
+                            if engine_rows.contains_key(&bk) {
+                                continue;
+                            }
+                            let physical_base = scope.physical(&bk);
                             let raw = storage
-                                .get(&scope.physical(&base_key))
+                                .get(&physical_base)
                                 .await
                                 .expect("raftkv kind eval batch read");
-                            match raw.map(|vv| txn::decode_envelope(&vv.value)) {
-                                // An unresolved intent from a concurrent
-                                // transaction makes "the current committed
-                                // value" ambiguous for THIS item only —
-                                // never guess; siblings still evaluate on
-                                // their own merits (see this variant's own
-                                // doc: one item's no-op never aborts
-                                // another's).
-                                Some(txn::Envelope::Intent { .. }) => {
-                                    items.push(KindEvalItemResult::ConditionFailed);
-                                    continue;
-                                }
-                                Some(txn::Envelope::Committed(bytes)) => {
-                                    animus_item::decode_stored_item(&bytes)
-                                        .expect("raftkv kind eval batch decode")
-                                }
-                                None => None,
-                            }
-                        };
-                        match evaluate_kind_eval(
-                            &entry.schema,
-                            &entry.pk,
-                            entry.sk.as_ref(),
-                            &token,
-                            old,
-                            &entry.op,
-                            entry.condition.as_ref(),
-                            entry.ttl_expired,
-                        ) {
-                            KindEvalDecision::ConditionFailed => {
-                                items.push(KindEvalItemResult::ConditionFailed);
-                            }
-                            KindEvalDecision::Rejected { code, message } => {
-                                items.push(KindEvalItemResult::Rejected { code, message });
-                            }
-                            KindEvalDecision::Applied {
-                                writes,
-                                change_log,
-                                old,
-                                new,
-                            } => {
-                                // Record this item's own `new` image in the
-                                // overlay BEFORE moving on — a later item
-                                // sharing this same key must see it.
-                                overlay.insert(base_key, new.clone());
-                                // ADR 0046 binding decision, reused
-                                // verbatim: the ONE shared materialization
-                                // helper `KindBatch`'s/`KindEval`'s own arms
-                                // and `TxnResolve`'s commit branch also
-                                // call. `next_ordinal` threads across this
-                                // loop exactly like `TxnResolve`'s own
-                                // multi-key commit loop (issue #852) so
-                                // every item's change record lands at a
-                                // distinct `(ts, ordinal)` pair.
-                                let starting = next_ordinal;
-                                next_ordinal = materialize_derived(
-                                    kind_scopes,
-                                    &writes,
-                                    std::slice::from_ref(&change_log),
-                                    ts,
-                                    &mut pending,
-                                    next_ordinal,
-                                );
-                                if next_ordinal > starting {
-                                    note_hot_change_write(hot_change_max, ts, next_ordinal - 1);
-                                }
-                                items.push(KindEvalItemResult::Applied { old, new });
+                            let reached = key_reached_by_entry(
+                                storage,
+                                &physical_base,
+                                raw.as_ref(),
+                                entry_version,
+                            )
+                            .await;
+                            engine_rows.insert(bk, raw);
+                            if reached {
+                                replayed_noop = true;
+                                break;
                             }
                         }
+                        if replayed_noop {
+                            tracing::debug!(
+                                "raftkv: KindEvalBatch replayed over an engine that already holds it \
+                             — no-op"
+                            );
+                            kind_outcomes
+                                .lock()
+                                .expect("kind batch outcomes poisoned")
+                                .record(index, term, KindBatchOutcome::Applied);
+                            kind_eval_batch_results
+                                .lock()
+                                .expect("kind eval batch results poisoned")
+                                .fill(
+                                    index,
+                                    term,
+                                    KindEvalBatchResult {
+                                        items: entries
+                                            .iter()
+                                            .map(|_| KindEvalItemResult::ConditionFailed)
+                                            .collect(),
+                                    },
+                                );
+                            break 'eval;
+                        }
+                        let mut overlay: BTreeMap<Vec<u8>, Option<Item>> = BTreeMap::new();
+                        let mut next_ordinal: u32 = 0;
+                        let mut items: Vec<KindEvalItemResult> = Vec::with_capacity(entries.len());
+                        for entry in &entries {
+                            let base_key = kind_eval_base_key(&entry.pk, entry.sk.as_ref());
+                            let token = animus_tablet::partition_token(&animus_item::storage_key(
+                                &entry.pk, None,
+                            ));
+                            let old: Option<Item> = if let Some(cached) = overlay.get(&base_key) {
+                                cached.clone()
+                            } else {
+                                // Read once up front (`engine_rows`, below).
+                                let raw = engine_rows.get(&base_key).cloned().expect(
+                                    "every item's base key was read by the replay pre-pass",
+                                );
+                                match raw.map(|vv| txn::decode_envelope(&vv.value)) {
+                                    // An unresolved intent from a concurrent
+                                    // transaction makes "the current committed
+                                    // value" ambiguous for THIS item only —
+                                    // never guess; siblings still evaluate on
+                                    // their own merits (see this variant's own
+                                    // doc: one item's no-op never aborts
+                                    // another's).
+                                    Some(txn::Envelope::Intent { .. }) => {
+                                        items.push(KindEvalItemResult::ConditionFailed);
+                                        continue;
+                                    }
+                                    Some(txn::Envelope::Committed(bytes)) => {
+                                        animus_item::decode_stored_item(&bytes)
+                                            .expect("raftkv kind eval batch decode")
+                                    }
+                                    None => None,
+                                }
+                            };
+                            match evaluate_kind_eval(
+                                &entry.schema,
+                                &entry.pk,
+                                entry.sk.as_ref(),
+                                &token,
+                                old,
+                                &entry.op,
+                                entry.condition.as_ref(),
+                                entry.ttl_expired,
+                            ) {
+                                KindEvalDecision::ConditionFailed => {
+                                    items.push(KindEvalItemResult::ConditionFailed);
+                                }
+                                KindEvalDecision::Rejected { code, message } => {
+                                    items.push(KindEvalItemResult::Rejected { code, message });
+                                }
+                                KindEvalDecision::Applied {
+                                    writes,
+                                    change_log,
+                                    old,
+                                    new,
+                                } => {
+                                    // Record this item's own `new` image in the
+                                    // overlay BEFORE moving on — a later item
+                                    // sharing this same key must see it.
+                                    overlay.insert(base_key, new.clone());
+                                    // ADR 0046 binding decision, reused
+                                    // verbatim: the ONE shared materialization
+                                    // helper `KindBatch`'s/`KindEval`'s own arms
+                                    // and `TxnResolve`'s commit branch also
+                                    // call. `next_ordinal` threads across this
+                                    // loop exactly like `TxnResolve`'s own
+                                    // multi-key commit loop (issue #852) so
+                                    // every item's change record lands at a
+                                    // distinct `(ts, ordinal)` pair.
+                                    let starting = next_ordinal;
+                                    next_ordinal = materialize_derived(
+                                        kind_scopes,
+                                        &writes,
+                                        std::slice::from_ref(&change_log),
+                                        ts,
+                                        &mut pending,
+                                        next_ordinal,
+                                    );
+                                    if next_ordinal > starting {
+                                        note_hot_change_write(hot_change_max, ts, next_ordinal - 1);
+                                    }
+                                    items.push(KindEvalItemResult::Applied { old, new });
+                                }
+                            }
+                        }
+                        // Collapse this entry's own pending writes to at most ONE
+                        // op per PHYSICAL key, keeping the LAST one pushed.
+                        // `pending` holds exactly (and only) this entry's own
+                        // writes here — `flush_pending` emptied it above, and
+                        // nothing else can touch it mid-arm — so this cannot
+                        // affect any other entry.
+                        //
+                        // Needed because [`StorageEngine::merge`]'s per-key LWW
+                        // takes effect only when its `version` is STRICTLY
+                        // greater than the key's current latest: two writes to
+                        // the SAME physical key sharing this entry's one `ts`
+                        // (the same-key-duplicate case `overlay` above makes
+                        // read-consistent) would otherwise silently keep the
+                        // FIRST push and drop the second — the opposite of the
+                        // last-write-wins behavior this variant preserves for a
+                        // duplicate `BatchWriteItem` key (see this variant's own
+                        // doc). Every change-log op's own key is unique per item
+                        // (it carries that item's `ordinal`), so this can only
+                        // ever collapse a genuine BASE/LSI collision, never a
+                        // change record.
+                        let mut last_index_for_key: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
+                        for (i, op) in pending.iter().enumerate() {
+                            last_index_for_key.insert(op.key.clone(), i);
+                        }
+                        let mut keep = vec![false; pending.len()];
+                        for &i in last_index_for_key.values() {
+                            keep[i] = true;
+                        }
+                        let mut next = 0;
+                        pending.retain(|_| {
+                            let k = keep[next];
+                            next += 1;
+                            k
+                        });
+                        // ONE `KindBatchOutcome::Applied` for the whole entry —
+                        // never a per-item breakdown in the replicated map (see
+                        // this variant's own doc) — plus the ordered per-item
+                        // breakdown in the leader-local, never-replicated
+                        // `KindEvalBatchResults` slot map.
+                        kind_outcomes
+                            .lock()
+                            .expect("kind batch outcomes poisoned")
+                            .record(index, term, KindBatchOutcome::Applied);
+                        kind_eval_batch_results
+                            .lock()
+                            .expect("kind eval batch results poisoned")
+                            .fill(index, term, KindEvalBatchResult { items });
                     }
-                    // Collapse this entry's own pending writes to at most ONE
-                    // op per PHYSICAL key, keeping the LAST one pushed.
-                    // `pending` holds exactly (and only) this entry's own
-                    // writes here — `flush_pending` emptied it above, and
-                    // nothing else can touch it mid-arm — so this cannot
-                    // affect any other entry.
-                    //
-                    // Needed because [`StorageEngine::merge`]'s per-key LWW
-                    // takes effect only when its `version` is STRICTLY
-                    // greater than the key's current latest: two writes to
-                    // the SAME physical key sharing this entry's one `ts`
-                    // (the same-key-duplicate case `overlay` above makes
-                    // read-consistent) would otherwise silently keep the
-                    // FIRST push and drop the second — the opposite of the
-                    // last-write-wins behavior this variant preserves for a
-                    // duplicate `BatchWriteItem` key (see this variant's own
-                    // doc). Every change-log op's own key is unique per item
-                    // (it carries that item's `ordinal`), so this can only
-                    // ever collapse a genuine BASE/LSI collision, never a
-                    // change record.
-                    let mut last_index_for_key: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
-                    for (i, op) in pending.iter().enumerate() {
-                        last_index_for_key.insert(op.key.clone(), i);
-                    }
-                    let mut keep = vec![false; pending.len()];
-                    for &i in last_index_for_key.values() {
-                        keep[i] = true;
-                    }
-                    let mut next = 0;
-                    pending.retain(|_| {
-                        let k = keep[next];
-                        next += 1;
-                        k
-                    });
-                    // ONE `KindBatchOutcome::Applied` for the whole entry —
-                    // never a per-item breakdown in the replicated map (see
-                    // this variant's own doc) — plus the ordered per-item
-                    // breakdown in the leader-local, never-replicated
-                    // `KindEvalBatchResults` slot map.
-                    kind_outcomes
-                        .lock()
-                        .expect("kind batch outcomes poisoned")
-                        .record(index, term, KindBatchOutcome::Applied);
-                    kind_eval_batch_results
-                        .lock()
-                        .expect("kind eval batch results poisoned")
-                        .fill(index, term, KindEvalBatchResult { items });
                 }
             }
             KvCommand::Delete { key, ts } => {

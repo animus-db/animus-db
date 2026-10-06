@@ -40,22 +40,22 @@ use animus_storage::{MemoryEngine, StorageEngine};
 use animus_tablet::{escape, partition_token};
 use futures::executor::block_on;
 
-type RawRows = Vec<(Vec<u8>, Option<Vec<u8>>, u64)>;
-type KvNode = RaftKvNode<SimEnv, MemoryEngine>;
+pub(crate) type RawRows = Vec<(Vec<u8>, Option<Vec<u8>>, u64)>;
+pub(crate) type KvNode = RaftKvNode<SimEnv, MemoryEngine>;
 
-const SETTLE: Duration = Duration::from_secs(2);
-const BASE_SEED: u64 = 0x1242_0001;
+pub(crate) const SETTLE: Duration = Duration::from_secs(2);
+pub(crate) const BASE_SEED: u64 = 0x1242_0001;
 /// Seeds whose schedule diverged on `origin/main` before the fix.
-const KNOWN_FAILING_SEEDS: [u64; 1] = [2_882_513_034];
+pub(crate) const KNOWN_FAILING_SEEDS: [u64; 1] = [2_882_513_034];
 
-fn key(pk: &[u8]) -> Vec<u8> {
+pub(crate) fn key(pk: &[u8]) -> Vec<u8> {
     let mut out = partition_token(pk).to_vec();
     out.extend_from_slice(&escape(pk));
     out.extend_from_slice(b"rk");
     out
 }
 
-fn drive<T: Send + 'static>(
+pub(crate) fn drive<T: Send + 'static>(
     sim: &mut Simulator,
     env: &SimEnv,
     budget: Duration,
@@ -71,11 +71,11 @@ fn drive<T: Send + 'static>(
     slot.lock().unwrap().take()
 }
 
-fn voters() -> Vec<animus_env::NodeId> {
+pub(crate) fn voters() -> Vec<animus_env::NodeId> {
     (0..3u64).map(nid).collect()
 }
 
-fn start_node(sim: &Simulator, id: u64, engine: MemoryEngine) -> KvNode {
+pub(crate) fn start_node(sim: &Simulator, id: u64, engine: MemoryEngine) -> KvNode {
     let features = ClusterFeatures::new();
     features.update(&Metadata {
         // 2: the resolved-marker gate is open (markers ship in snapshots), so
@@ -96,16 +96,16 @@ fn start_node(sim: &Simulator, id: u64, engine: MemoryEngine) -> KvNode {
     )
 }
 
-struct Cluster {
-    sim: Simulator,
-    engines: Vec<MemoryEngine>,
-    nodes: Vec<KvNode>,
-    up: [bool; 3],
-    seed: u64,
+pub(crate) struct Cluster {
+    pub(crate) sim: Simulator,
+    pub(crate) engines: Vec<MemoryEngine>,
+    pub(crate) nodes: Vec<KvNode>,
+    pub(crate) up: [bool; 3],
+    pub(crate) seed: u64,
 }
 
 impl Cluster {
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         let mut sim = Simulator::new(seed);
         let engines: Vec<MemoryEngine> = (0..3).map(|_| MemoryEngine::new()).collect();
         let nodes = (0..3u64)
@@ -121,14 +121,14 @@ impl Cluster {
         }
     }
 
-    fn leader(&self) -> Option<usize> {
+    pub(crate) fn leader(&self) -> Option<usize> {
         let ls: Vec<usize> = (0..3)
             .filter(|&i| self.up[i] && self.nodes[i].is_leader())
             .collect();
         (ls.len() == 1).then(|| ls[0])
     }
 
-    fn stage(
+    pub(crate) fn stage(
         &mut self,
         l: usize,
         id: &TxnId,
@@ -151,7 +151,7 @@ impl Cluster {
         .flatten()
     }
 
-    fn resolve(
+    pub(crate) fn resolve(
         &mut self,
         l: usize,
         id: &TxnId,
@@ -170,7 +170,7 @@ impl Cluster {
     }
 
     /// Stage then commit-resolve one transaction on the leader.
-    fn commit(&mut self, id: &TxnId, record_key: &[u8], keys: &[Vec<u8>], value: &str) {
+    pub(crate) fn commit(&mut self, id: &TxnId, record_key: &[u8], keys: &[Vec<u8>], value: &str) {
         let l = self.leader().expect("leader");
         let (ts, outcome) = self
             .stage(l, id, record_key, keys, value)
@@ -187,7 +187,7 @@ impl Cluster {
 
     /// A fresh process over the retained engine: WAL replay of the whole log
     /// tail over an engine that already holds all of it.
-    fn restart_fresh(&mut self, i: usize) {
+    pub(crate) fn restart_fresh(&mut self, i: usize) {
         self.sim.stop(nid(i as u64));
         self.nodes[i] = start_node(&self.sim, i as u64, self.engines[i].clone());
         self.up[i] = true;
@@ -196,7 +196,7 @@ impl Cluster {
 
     /// Raw base-row state of `k` on every replica: `(version, value)` of the
     /// row itself (an intent shows as a non-committed envelope tag).
-    fn raw(&self, k: &[u8]) -> Vec<Option<(u64, Vec<u8>)>> {
+    pub(crate) fn raw(&self, k: &[u8]) -> Vec<Option<(u64, Vec<u8>)>> {
         self.engines
             .iter()
             .map(|e| {
@@ -212,7 +212,7 @@ impl Cluster {
     /// Every replica's whole raw keyspace INCLUDING tombstones, the txn anchor
     /// records and the resolved markers: `(key, value-or-tombstone, version)`
     /// (minus the per-replica `__animus_system` cursors).
-    fn raw_all(&self) -> Vec<RawRows> {
+    pub(crate) fn raw_all(&self) -> Vec<RawRows> {
         self.engines
             .iter()
             .map(|e| {
@@ -225,7 +225,7 @@ impl Cluster {
             .collect()
     }
 
-    fn assert_identical(&self, keys: &[&Vec<u8>], what: &str) {
+    pub(crate) fn assert_identical(&self, keys: &[&Vec<u8>], what: &str) {
         let all = self.raw_all();
         for (i, rows) in all.iter().enumerate().skip(1) {
             if rows != &all[0] {
@@ -249,7 +249,7 @@ impl Cluster {
     }
 }
 
-fn txn_id(n: u64) -> TxnId {
+pub(crate) fn txn_id(n: u64) -> TxnId {
     TxnId {
         ts: HlcTimestamp {
             wall_ms: n,
@@ -264,7 +264,7 @@ fn txn_id(n: u64) -> TxnId {
 /// marker names T1 any more; key A (last written before the stale stage, by
 /// T4) has no later write, so the stage's merge landed there.
 #[test]
-fn stale_two_key_restage_is_not_resurrected_by_replay() {
+pub(crate) fn stale_two_key_restage_is_not_resurrected_by_replay() {
     let mut c = Cluster::new(BASE_SEED);
     let rk = key(b"anchor-elsewhere");
     let (a, b) = (key(b"A"), key(b"B"));
@@ -299,7 +299,7 @@ fn stale_two_key_restage_is_not_resurrected_by_replay() {
 /// been resolved, nothing blocks, and the stage's merge landed an orphan
 /// intent on the partner key B.
 #[test]
-fn blocked_stage_is_not_resurrected_by_replay() {
+pub(crate) fn blocked_stage_is_not_resurrected_by_replay() {
     let mut c = Cluster::new(BASE_SEED + 1);
     let rk = key(b"anchor-elsewhere");
     let (a, b) = (key(b"A"), key(b"B"));
@@ -345,7 +345,7 @@ fn blocked_stage_is_not_resurrected_by_replay() {
 /// `get` would accept the stage: an orphan intent on B. Only a tombstone-aware
 /// version read sees that a later entry (the delete) already ran.
 #[test]
-fn condition_failed_stage_is_not_resurrected_when_the_key_was_deleted_after() {
+pub(crate) fn condition_failed_stage_is_not_resurrected_when_the_key_was_deleted_after() {
     let mut c = Cluster::new(BASE_SEED + 2);
     let rk = key(b"anchor-elsewhere");
     let (a, b) = (key(b"A"), key(b"B"));

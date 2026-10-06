@@ -32,6 +32,7 @@ mod kind_batch;
 mod kind_batch_outcome_identity;
 mod kind_eval;
 mod kind_eval_batch_fault;
+mod kind_eval_replay_stability;
 mod leader_transfer_reconfigure;
 mod learner_catchup_under_load;
 mod learner_membership;

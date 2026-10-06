@@ -1275,11 +1275,26 @@ State once here; cross-referenced from the sections below.
   replica only, silently dropping later acked txn appends there. The #1243
   "residual is identical on every replica" statement above held for live apply,
   not replay. Any new multi-key conditional arm needs the same "what if every
-  key were from the future" review. `KindBatch`/`Batch` make no engine-state
-  decision (nothing to guard); `KindEval`/`KindEvalBatch` re-decide from engine
-  state on replay and their derived rows (change-log, LSI, footprint) sit on
-  unique keys that per-key LWW does not protect — tracked in issue #1247, not
-  fixed here. Regression: `tests/it/txn_stage_replay_stability.rs`
+  key were from the future" review. `KindBatch`/`Batch`/`Cas`/`Delete`/`SeedBatch` make no
+  engine-state decision that fans out to other keys (nothing to guard).
+  **`KindEval`/`KindEvalBatch` (issue #1247, ADR 0054's 2026-10-06 amendment)**
+  re-decide from engine state, and the derived rows `materialize_derived`
+  writes (change-log on a unique `prefix||ts||ordinal` key, LSI/footprint rows
+  keyed by item attributes) are not protected by per-key LWW. They no-op on
+  replay when the decided base key (tombstone-aware, `key_reached_by_entry`)
+  is **at or above** the entry's `ts` — at-or-above, not strictly above as for
+  `TxnStage`, because a `KindEval*` entry's whole write set is ONE atomic
+  `merge_batch` (a single WAL record), so an equal base row proves the entry
+  fully landed and re-evaluating it would read its own post-state (`ADD`
+  applied twice, a `not_exists` item failing on its own write and shifting
+  every later item's change-record ordinal). `KindEvalBatch` is
+  entry-granular (any item's key reached skips the whole entry; one pre-pass
+  `get` per key is reused by the evaluation loop). `TxnResolve` decides only
+  from an intent of its own `txn_id` (monotone: stage then resolve; a replayed
+  resolve finds none) and `TxnStage`'s pending-write evaluation sits behind
+  the `engine_ahead` gate above. Regressions:
+  `tests/it/kind_eval_replay_stability.rs` (`ANIMUS_KINDEVAL_REPLAY_SEEDS`),
+  `tests/it/txn_stage_replay_stability.rs`
   (`ANIMUS_TXN_REPLAY_SEEDS`); lesson
   `docs/lessons/code-patterns/2026-10-06-wal-replay-over-an-ahead-engine-must-not-re-decide-an-apply.md`.
 - **`engine_applied` vs `last_applied`.** The two-task split (below) means the

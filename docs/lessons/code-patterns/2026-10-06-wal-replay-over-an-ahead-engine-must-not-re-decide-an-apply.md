@@ -8,7 +8,8 @@ sees future state on replay and can decide differently than the live apply (and
 than every other replica) did. The per-key `merge` version guard hides this for
 arms whose only effect is a plain per-key merge: a replayed write loses to the
 later row at its key. (Not every single-key arm: `KindEval`/`KindEvalBatch`
-re-decide from state and write derived rows on unique keys — issue #1247.) It does
+re-decide from state and write derived rows on unique keys — issue #1247, fixed
+the same way.) It does
 **not** protect a whole-or-nothing arm over several keys: the decision flips
 on one key's later state while the merge still lands on another key that has no
 later write.
@@ -47,3 +48,26 @@ Rules:
   starting at the first entry applied after its restart.
 
 Regression: `animus-cp-data` `tests/it/txn_stage_replay_stability.rs`.
+
+Follow-up, issue #1247 (`KindEval`/`KindEvalBatch`): the same bug through a
+single-key arm, because *derived* rows (change-log on `prefix||ts||ordinal`, LSI
+rows keyed by item attributes) sit on keys other than the decided one, so
+per-key LWW on the base row protects none of them. Extra rules it taught:
+- Whether to guard with `>` or `>=` depends on the atomicity of the entry's
+  writes. `TxnStage` merges key by key, so an equal version is its own possibly
+  partial write and must re-apply (`>`). `KindEval*` lands everything in one
+  atomic `merge_batch` (a single WAL record), so an equal base row proves the
+  whole entry landed and a re-evaluation would read its own post-state (`ADD`
+  applied twice, a `not_exists` item failing on its own write): use `>=`.
+- Look for decisions that feed *later items of the same entry*: a rejected item
+  consumes no change-record ordinal, so a replay that flips an earlier item's
+  outcome shifts every later item's key — an orphan row even when each item
+  "looks" idempotent. Guard such an entry at entry granularity.
+- The direction of a divergence can be the opposite of the first hypothesis
+  (the restarted replica had an extra row because of a *shifted key*, not a
+  resurrected write). Bisect with a per-step `assert_identical`, and print the
+  restarted node and each item's `old` image on live vs replay.
+- Cheap live-path cost: reuse the `get` the arm already does; only a miss
+  (absent or tombstoned) pays the tombstone-aware scan.
+
+Regression: `tests/it/kind_eval_replay_stability.rs`.
