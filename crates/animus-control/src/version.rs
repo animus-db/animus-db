@@ -188,7 +188,9 @@ pub enum Gate {
     /// acceptance of the multi-Region `UpdateTable` surface. One gate for the
     /// whole release surface (everything ships at one version: one finalize
     /// step, one set of mixed-version cells); `MrecReplication` (stage G-d)
-    /// will be its own gate.
+    /// will be its own gate. It is also the release's gate for **`txn-envelope`
+    /// v2** (ADR 0073's 2026-10-05 amendment, #1237): the tablet snapshot
+    /// image ships v1 intents until it opens.
     GlobalTables,
     /// **MREC global tables** (ADR 0075, G-01 stage G-d): the second real
     /// version gate, opening at cluster version 3. Guards the eventual

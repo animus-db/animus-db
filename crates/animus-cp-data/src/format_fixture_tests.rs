@@ -883,3 +883,78 @@ fn txn_envelope_v2_intents_downgrade_to_the_v1_fixture_bytes() {
     assert_eq!(down(&longer), None);
     assert_eq!(down(&v2[2][..v2[2].len() - 1]), None);
 }
+
+// ---------------------------------------------------------------------------
+// txn-resolved-marker (issue #1243)
+//
+// The durable per-key row `TxnResolve`'s apply writes beside every resolved
+// intent so `TxnStage`'s apply can reject a stale/duplicate stage
+// deterministically (`txn::resolved_marker_key`). Container: two
+// `u32`-BE-length-prefixed frames — the marker's logical key, then its value
+// (`[0xA1] || txn_id`).
+
+fn resolved_marker_base_key() -> Vec<u8> {
+    let mut k = vec![0xA5; animus_tablet::TOKEN_BYTES];
+    k.extend_from_slice(b"pk\x00\x00row");
+    k
+}
+
+fn v1_resolved_marker_bytes() -> Vec<u8> {
+    use crate::txn;
+    pack_frames(&[
+        txn::resolved_marker_key(&resolved_marker_base_key()),
+        txn::encode_resolved_marker(&txn_fixture_id()),
+    ])
+}
+
+#[test]
+fn txn_resolved_marker_decodes_every_checked_in_fixture() {
+    use crate::txn;
+    for (version, bytes) in fixture_files(&formats_dir("txn-resolved-marker")) {
+        let frames = unpack_frames(&bytes);
+        match version {
+            1 => {
+                assert_eq!(frames.len(), 2, "txn-resolved-marker v1 frame count");
+                assert_eq!(
+                    frames[0],
+                    txn::resolved_marker_key(&resolved_marker_base_key())
+                );
+                assert!(txn::is_resolved_marker_key(&frames[0]));
+                assert!(!txn::is_record_key(&frames[0]));
+                assert_eq!(
+                    txn::decode_resolved_marker(&frames[1]),
+                    Some(txn_fixture_id())
+                );
+            }
+            other => panic!(
+                "txn-resolved-marker fixture v{other} has no expected value — add one (ADR 0073 checklist step 4)"
+            ),
+        }
+    }
+}
+
+#[test]
+fn txn_resolved_marker_encoder_matches_the_fixture_bytes() {
+    for (version, bytes) in fixture_files(&formats_dir("txn-resolved-marker")) {
+        let want = match version {
+            1 => v1_resolved_marker_bytes(),
+            other => panic!("txn-resolved-marker fixture v{other} has no encoder arm"),
+        };
+        assert_eq!(
+            want, bytes,
+            "txn-resolved-marker v{version}: encoder emits the fixture"
+        );
+    }
+}
+
+/// `cargo test -p animus-cp-data --lib generate_fixture_txn_resolved_marker -- --ignored`.
+/// Refuses to overwrite an existing fixture (ADR 0073 Phase 0).
+#[test]
+#[ignore]
+fn generate_fixture_txn_resolved_marker() {
+    write_new_fixture(
+        &formats_dir("txn-resolved-marker"),
+        1,
+        &v1_resolved_marker_bytes(),
+    );
+}

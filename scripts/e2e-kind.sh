@@ -659,6 +659,9 @@ dump_diagnostics() {
 on_err() {
     local line="$1"
     log "FAILED at line ${line} during phase '${PHASE}'"
+    if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+        echo "::error title=e2e-kind failed (phase ${PHASE//[:,]/ })::command failed at scripts/e2e-kind.sh line ${line}"
+    fi
     dump_diagnostics
 }
 
@@ -668,6 +671,14 @@ on_err() {
 # every such check funnels through.
 fail() {
     log "FAILED (phase '${PHASE}'): $1"
+    # On GitHub Actions also surface the reason as an annotation: annotations
+    # are readable through the checks API even where the job log and the
+    # artifacts are not (e.g. a sandbox whose egress blocks blob storage).
+    if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+        local msg="${1//'%'/'%25'}"
+        msg="${msg//$'\n'/'%0A'}"
+        echo "::error title=e2e-kind failed (phase ${PHASE//[:,]/ })::${msg}"
+    fi
     dump_diagnostics
     exit 1
 }

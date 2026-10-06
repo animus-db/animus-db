@@ -1179,12 +1179,11 @@ State once here; cross-referenced from the sections below.
     a fresh HLC — caught live (`delivered=146/144`, one member of a
     transactional pair duplicated under a single sealed shard) during the
     same `SplitMode::InPlace`-unpinned soak that caught shape B. **Fixed**
-    via a new bounded, best-effort per-group memo, `TxnTracker::
-    recently_resolved` (`physical_key -> txn_id`, populated at every
-    `TxnResolve` apply, checked by `(key, txn_id)` identity): `TxnStage`'s
-    apply arm now rejects (folds into the same `Fenced` bucket as
-    `already_decided`) a stage whose target key was already resolved by
-    THIS EXACT transaction on this group. **Tracing the captured trace's
+    via a per-group memo, `TxnTracker::recently_resolved`, **replaced
+    2026-10-06 (issue #1243)** by a durable per-key *resolved marker* (see
+    below): `TxnStage`'s apply arm rejects (folds into the same `Fenced`
+    bucket as `already_decided`) a stage whose target key was already
+    resolved by THIS EXACT transaction on this group. **Tracing the captured trace's
     own `txn_id`s past this fix showed the LIVE trigger is narrower and
     deeper than this guard alone closes** — see `docs/engineering-
     lessons.md`'s shape A amendment for the full account: the resurrecting
@@ -1229,6 +1228,32 @@ State once here; cross-referenced from the sections below.
   Regression (whole txn suite): `tests/txn_single.rs`,
   `tests/snapshot_catchup.rs`, `tests/prod_concurrent_ts_monotonic.rs`, the
   in-crate `pr5_orphan_and_resurrection_tests` module.
+
+- **Resolved marker (issue #1243): apply decisions read durable state, never
+  process memory.** `TxnResolve`'s apply writes, for every key it actually
+  resolves, a row `txn::resolved_marker_key(key)` = `token || [0x00, 0x04] ||
+  key` in the base scope (value `[0xA1] || txn_id`, format
+  `txn-resolved-marker` v1, fixture `tests/fixtures/formats/txn-resolved-marker/v1.bin`)
+  in the same merge batch as the resolve; `TxnStage`'s apply reads it and
+  rejects a stage whose `(key, txn_id)` matches. It replaced the in-memory
+  `TxnTracker::recently_resolved` map, which made one committed log entry
+  apply differently on a restarted / snapshot-installed / cap-evicted replica
+  (stage rejected on some, intent resurrected on others; the apply-time
+  read-modify-write arms then diverged permanently). One row per key
+  (overwritten by the next resolve there), token-led so it moves with its key
+  through splits and snapshot images; every client-facing scan skips it via
+  `txn::is_internal_key` (record keys alone stay `is_record_key`, the predicate
+  for code that *decodes records*). **Class G**: `engine_image` omits marker
+  rows while `Gate::GlobalTables` is closed (an N-1 replica's filters would
+  surface them to clients; it keeps its own in-memory guard — residual), apply
+  always writes them; cell `tests/it/txn_resolved_marker_gate.rs`. Residual by design: it remembers only the
+  LAST resolver of a key, so a duplicate stage of T arriving after a *later*
+  transaction also resolved the same key is not caught — but that residual is
+  now identical on every replica (deterministic), where the old one was
+  per-process. A new internal row kind must be added to `is_internal_key` and
+  the `animus-test` `EMBEDDED` table. Regression:
+  `tests/it/resolved_restage_replica_determinism.rs` (restart + snapshot-install
+  variants, `ANIMUS_RESTAGE_SEEDS`).
 - **`engine_applied` vs `last_applied`.** The two-task split (below) means the
   core's `last_applied` (a buffer cursor the consensus loop advances) *leads*
   the engine. Linearizable reads therefore gate on the separate
@@ -2913,9 +2938,16 @@ wire/image codec is `pub(crate)`; new formats add a section in whichever fits.
 
 - **`txn-envelope` v2** (`txn.rs`, ADR 0018's 2026-10-04 amendment): the
   per-value tag byte is the version (`0` committed, `1` v1 intent, `2` v2
-  intent = v1 body + trailing `prior`). `decode_envelope` dispatches on it;
-  `txn::legacy::v1` holds the frozen v1 decoder and the v1 encoder behind
-  `legacy-encoders` (like every legacy encoder), plus `downgrade_intent_to_v1`
+  intent = v1 body + trailing `prior`). **Class G too (ADR 0073's 2026-10-05
+  amendment, #1237): apply always writes v2 into the node's own engine, but
+  `engine_image` (the `InstallSnapshot` image, the one place engine values leave
+  a node) ships every v2 intent down-converted to v1 — plus its prior as the
+  committed row one MVCC version below the intent, where the v1 lookback reads
+  it — until `Gate::GlobalTables` (cluster version 2) is open; an N-1 replica
+  panics on tag 2. Never branch apply on the gate; never ship an engine value
+  without asking what an N-1 reader does with it.** `decode_envelope` dispatches on it;
+  `txn::legacy::v1` holds the frozen v1 decoder and the v1 encoder (production
+  code now, the snapshot sender uses it; not `legacy-encoders`-gated), plus `downgrade_intent_to_v1`
   (re-exported as `downgrade_txn_envelope_to_v1`): the strict whole-value v2 -> v1
   down-conversion the upgrade harness's engine-row transcode
   (`animus-test`'s `ROW_TABLE`) applies to every stored row. It parses the *entire*
