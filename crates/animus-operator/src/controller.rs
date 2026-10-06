@@ -36,9 +36,10 @@ use crate::crd::{
     CONDITION_CONTROL_NODES_SHRINK_REJECTED, CONDITION_DRAIN_FAILED,
     CONDITION_ENCRYPTION_KEY_SECRET_INVALID, CONDITION_EPHEMERAL_VOTER_STORAGE_HAZARD,
     CONDITION_EPHEMERAL_VOTER_STORAGE_REJECTED, CONDITION_NODES_SPEC_INVALID,
-    CONDITION_S3_SPEC_INVALID, CONDITION_SCALE_BELOW_CONTROL_NODES_REFUSED,
-    CONDITION_SCHEMA_VERSION_INVALID, CONDITION_STORE_SPEC_INVALID, CONDITION_TLS_SPEC_INVALID,
-    CONDITION_UPGRADE_CHANGES_HELD, ClusterCondition, ClusterPhase, ConditionStatus,
+    CONDITION_PEER_REACHABLE, CONDITION_PEERS_SPEC_INVALID, CONDITION_S3_SPEC_INVALID,
+    CONDITION_SCALE_BELOW_CONTROL_NODES_REFUSED, CONDITION_SCHEMA_VERSION_INVALID,
+    CONDITION_STORE_SPEC_INVALID, CONDITION_TLS_SPEC_INVALID, CONDITION_UPGRADE_CHANGES_HELD,
+    ClusterCondition, ClusterPhase, ConditionStatus,
 };
 use crate::desired;
 use crate::roll;
@@ -755,6 +756,58 @@ async fn resolve_tls_ca<C: ClusterApi>(
     }
 }
 
+/// Set (G-e) the positive-polarity `PeerReachable` condition from every pod's
+/// `/admin/global-tables` (`crate::peers::evaluate`), or remove it when the
+/// spec has no peers. Best effort: an admin failure only makes a pod's view
+/// `None`, never fails the reconcile.
+async fn update_peer_reachable<C: ClusterApi, A: AdminOps>(
+    ctx: &Context<C, A>,
+    cluster: &AnimusCluster,
+    ns: &str,
+    status: &mut AnimusClusterStatus,
+) {
+    status
+        .conditions
+        .retain(|c| c.type_ != CONDITION_PEER_REACHABLE);
+    if cluster.spec.peers.is_empty() {
+        return;
+    }
+    let name = cluster.name_any();
+    let tls = cluster.spec.tls.is_some();
+    let tls_ca = resolve_tls_ca(&ctx.cluster_api, cluster, ns, &name)
+        .await
+        .ok()
+        .flatten();
+    let admin_port = cluster.spec.base_port_or_default() + desired::cluster_config::PORT_ADMIN;
+    let mut views = Vec::new();
+    for i in 0..cluster.spec.nodes {
+        let url = format!(
+            "{}/admin/global-tables",
+            admin_base_url(&name, ns, i, admin_port, tls)
+        );
+        views.push(ctx.admin.get_json(&url, tls_ca.as_deref()).await.ok());
+    }
+    let regions: Vec<String> = cluster
+        .spec
+        .peers
+        .iter()
+        .map(|p| p.region.clone())
+        .collect();
+    let r = crate::peers::evaluate(&regions, &views, crate::peers::PEER_ACK_BOUND_MS);
+    let reason = match r.status {
+        ConditionStatus::True => "PeersReachable",
+        ConditionStatus::False => "PeerUnreachable",
+        ConditionStatus::Unknown => "PeerHealthUnknown",
+    };
+    status.conditions.push(ClusterCondition {
+        type_: CONDITION_PEER_REACHABLE.to_string(),
+        status: r.status,
+        reason: Some(reason.to_string()),
+        message: Some(r.message),
+        last_transition_time: None,
+    });
+}
+
 /// Live-checks `spec.encryptionKeySecretName` (ADR 0069, S-03 PR 3) against
 /// the API server: the named `Secret` must exist in `ns` and carry
 /// [`desired::cluster_config::ENCRYPTION_KEY_SECRET_DATA_KEY`] as one of its
@@ -1099,6 +1152,24 @@ async fn reconcile<C: ClusterApi, A: AdminOps>(
         .conditions
         .retain(|c| c.type_ != CONDITION_TLS_SPEC_INVALID);
 
+    // Validate `spec.region`/`spec.peers` (ADR 0075 section 5.4, G-e): the
+    // webhook rejects this at write time when installed; this is the
+    // fallback. **Refuse, not strip** (see `CONDITION_PEERS_SPEC_INVALID`):
+    // nothing is applied until the spec is fixed, so the last applied
+    // federation keeps running rather than silently losing its peers or its
+    // TLS requirement.
+    if let Err(e) = cluster.spec.validate_peers_spec() {
+        warn!(cluster = %name, error = %e, "refusing invalid spec.region/spec.peers");
+        set_condition(&mut status, CONDITION_PEERS_SPEC_INVALID, e);
+        ctx.cluster_api
+            .patch_cluster_status(&ns, &name, &status)
+            .await?;
+        return Ok(Action::requeue(REQUEUE_OK));
+    }
+    status
+        .conditions
+        .retain(|c| c.type_ != CONDITION_PEERS_SPEC_INVALID);
+
     // Validate `spec.encryptionKeySecretName` (ADR 0069, S-03 PR 3): unlike
     // every check above, this one is LIVE (a Secret reference's only
     // checkable shape is whether it actually exists — nothing in the spec
@@ -1442,6 +1513,8 @@ async fn finish_reconcile<C: ClusterApi, A: AdminOps>(
     } else {
         ClusterPhase::Pending
     });
+
+    update_peer_reachable(ctx, cluster, ns, &mut status).await;
 
     ctx.cluster_api
         .patch_cluster_status(ns, &name, &status)
@@ -4102,5 +4175,119 @@ mod tests {
             "a 2-node/2-controlNode cluster must block every voluntary eviction, \
              not inherit the prior 5-node shape's budget"
         );
+    }
+}
+
+#[cfg(test)]
+mod peers_tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::crd::{PeerSpec, TlsSpec};
+    use crate::desired::test_support::test_cluster;
+    use crate::fakes::{FakeAdminClient, FakeClusterApi};
+
+    fn ctx() -> Arc<Context<FakeClusterApi, FakeAdminClient>> {
+        Arc::new(Context {
+            cluster_api: FakeClusterApi::new(),
+            admin: FakeAdminClient::new(),
+            clock: crate::roll::WallClock::fixed(1_000),
+        })
+    }
+
+    fn federated() -> AnimusCluster {
+        let mut c = test_cluster("demo", "ns1", 3, None);
+        c.spec.region = Some("us".into());
+        c.spec.peers = vec![PeerSpec {
+            region: "eu".into(),
+            endpoints: vec!["eu.example.com:14004".into()],
+            ca_secret_ref: None,
+        }];
+        c.spec.tls = Some(TlsSpec {
+            secret_name: Some("t".into()),
+            cert_manager: None,
+        });
+        c
+    }
+
+    fn condition(
+        ctx: &Context<FakeClusterApi, FakeAdminClient>,
+        t: &str,
+    ) -> Option<ClusterCondition> {
+        ctx.cluster_api
+            .status_patches()
+            .last()
+            .and_then(|s| s.conditions.iter().find(|c| c.type_ == t).cloned())
+    }
+
+    #[tokio::test]
+    async fn peers_without_tls_are_refused_with_a_condition_and_nothing_is_applied() {
+        let mut c = federated();
+        c.spec.tls = None;
+        let ctx = ctx();
+        reconcile(Arc::new(c), Arc::clone(&ctx)).await.unwrap();
+        assert!(
+            ctx.cluster_api.applies().is_empty(),
+            "{:?}",
+            ctx.cluster_api.applies()
+        );
+        let cond = condition(&ctx, CONDITION_PEERS_SPEC_INVALID).expect("condition");
+        assert!(cond.message.unwrap().contains("spec.tls"));
+    }
+
+    #[tokio::test]
+    async fn the_insecure_opt_in_reconciles_normally() {
+        let mut c = federated();
+        c.spec.tls = None;
+        c.spec.allow_insecure_peers = Some(true);
+        let ctx = ctx();
+        reconcile(Arc::new(c), Arc::clone(&ctx)).await.unwrap();
+        assert!(!ctx.cluster_api.applies().is_empty());
+        assert!(condition(&ctx, CONDITION_PEERS_SPEC_INVALID).is_none());
+    }
+
+    #[tokio::test]
+    async fn peer_reachable_is_unknown_until_a_table_replicates_then_tracks_the_shipper() {
+        let ctx = ctx();
+        reconcile(Arc::new(federated()), Arc::clone(&ctx))
+            .await
+            .unwrap();
+        let cond = condition(&ctx, CONDITION_PEER_REACHABLE).expect("PeerReachable");
+        assert_eq!(cond.status, ConditionStatus::Unknown);
+
+        let healthy = serde_json::json!({"tables": [{"shippers": [
+            {"peer": "eu", "caught_up": true, "last_error": null}]}]});
+        ctx.admin
+            .script_get(None, "/admin/global-tables", Ok(healthy));
+        reconcile(Arc::new(federated()), Arc::clone(&ctx))
+            .await
+            .unwrap();
+        assert_eq!(
+            condition(&ctx, CONDITION_PEER_REACHABLE).unwrap().status,
+            ConditionStatus::True
+        );
+
+        let broken = serde_json::json!({"tables": [{"shippers": [
+            {"peer": "eu", "caught_up": false, "last_error": "connection refused"}]}]});
+        ctx.admin
+            .script_get(None, "/admin/global-tables", Ok(broken));
+        reconcile(Arc::new(federated()), Arc::clone(&ctx))
+            .await
+            .unwrap();
+        let cond = condition(&ctx, CONDITION_PEER_REACHABLE).unwrap();
+        assert_eq!(cond.status, ConditionStatus::False);
+        assert!(cond.message.unwrap().contains("connection refused"));
+    }
+
+    #[tokio::test]
+    async fn a_cluster_without_peers_never_carries_peer_reachable() {
+        let ctx = ctx();
+        reconcile(
+            Arc::new(test_cluster("demo", "ns1", 3, None)),
+            Arc::clone(&ctx),
+        )
+        .await
+        .unwrap();
+        assert!(condition(&ctx, CONDITION_PEER_REACHABLE).is_none());
     }
 }

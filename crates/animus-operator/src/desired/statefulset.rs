@@ -62,7 +62,7 @@ use serde::Serialize;
 
 use super::cluster_config::{
     self, CONFIG_MOUNT_DIR, DATA_DIR, DYNAMO_AUTH_MOUNT_DIR, ENCRYPTION_KEY_MOUNT_DIR,
-    ENTRYPOINT_FILE_NAME, S3_MOUNT_DIR, S3_WEB_IDENTITY_MOUNT_DIR,
+    ENTRYPOINT_FILE_NAME, PEER_CA_MOUNT_DIR, S3_MOUNT_DIR, S3_WEB_IDENTITY_MOUNT_DIR,
     S3_WEB_IDENTITY_TOKEN_EXPIRY_SECS, S3_WEB_IDENTITY_TOKEN_FILE, TLS_MOUNT_DIR,
 };
 use super::{
@@ -205,7 +205,10 @@ fn restart_relevant_projection(spec: &AnimusClusterSpec) -> RestartRelevantConfi
         control_nodes: spec.control_nodes_or_default(),
         entrypoint_sh: cluster_config::entrypoint_script(spec),
         cluster_settings: cluster_config::cluster_settings_or_none(spec),
-        tls: spec.tls.as_ref().map(|_| cluster_config::tls_section()),
+        tls: spec
+            .tls
+            .as_ref()
+            .map(|_| cluster_config::tls_section_for(spec)),
         encryption_key_path: spec
             .encryption_key_secret_name
             .as_ref()
@@ -486,6 +489,34 @@ pub fn build_with_partition(
         volume_mounts.push(VolumeMount {
             name: TLS_VOLUME.to_string(),
             mount_path: TLS_MOUNT_DIR.to_string(),
+            read_only: Some(true),
+            ..Default::default()
+        });
+    }
+
+    // G-01 stage G-e: every peer's referenced CA `Secret`, read-only, the
+    // chosen key projected to `ca.crt`. Referenced only, never written.
+    for (i, peer) in spec.peers.iter().enumerate() {
+        let Some(r) = &peer.ca_secret_ref else {
+            continue;
+        };
+        let vol = format!("peer-ca-{i}");
+        volumes.push(Volume {
+            name: vol.clone(),
+            secret: Some(SecretVolumeSource {
+                secret_name: Some(r.name.clone()),
+                items: Some(vec![k8s_openapi::api::core::v1::KeyToPath {
+                    key: r.key_or_default().to_string(),
+                    path: "ca.crt".to_string(),
+                    mode: None,
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        volume_mounts.push(VolumeMount {
+            name: vol,
+            mount_path: format!("{PEER_CA_MOUNT_DIR}/{i}"),
             read_only: Some(true),
             ..Default::default()
         });
@@ -1661,6 +1692,106 @@ mod tests {
         assert_eq!(
             c.resources.unwrap().limits.unwrap()["cpu"],
             Q("2".to_string())
+        );
+    }
+}
+
+#[cfg(test)]
+mod peers_tests {
+    use super::*;
+    use crate::crd::{PeerCaSecretRef, PeerSpec, TlsSpec};
+    use crate::desired::test_support::test_cluster;
+
+    fn federated(ca: bool) -> AnimusCluster {
+        let mut c = test_cluster("c", "ns", 3, None);
+        c.spec.region = Some("us".into());
+        c.spec.tls = Some(TlsSpec {
+            secret_name: Some("t".into()),
+            cert_manager: None,
+        });
+        c.spec.peers = vec![
+            PeerSpec {
+                region: "eu".into(),
+                endpoints: vec!["eu:14004".into()],
+                ca_secret_ref: None,
+            },
+            PeerSpec {
+                region: "ap".into(),
+                endpoints: vec!["ap:14004".into()],
+                ca_secret_ref: ca.then(|| PeerCaSecretRef {
+                    name: "ap-ca".into(),
+                    key: Some("tls.crt".into()),
+                }),
+            },
+        ];
+        c
+    }
+
+    fn pod_spec(c: &AnimusCluster) -> k8s_openapi::api::core::v1::PodSpec {
+        build(c, &c.spec).spec.unwrap().template.spec.unwrap()
+    }
+
+    #[test]
+    fn a_peer_ca_secret_is_mounted_read_only_by_peer_index_with_its_key_projected() {
+        let p = pod_spec(&federated(true));
+        let vol = p
+            .volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|v| v.name == "peer-ca-1")
+            .expect("peer-ca-1 volume");
+        let sec = vol.secret.as_ref().unwrap();
+        assert_eq!(sec.secret_name.as_deref(), Some("ap-ca"));
+        let items = sec.items.as_ref().unwrap();
+        assert_eq!(
+            (items[0].key.as_str(), items[0].path.as_str()),
+            ("tls.crt", "ca.crt")
+        );
+        let mount = p.containers[0]
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.name == "peer-ca-1")
+            .expect("mount");
+        assert_eq!(mount.mount_path, "/etc/animus/peer-ca/1");
+        assert_eq!(mount.read_only, Some(true));
+        // Peer 0 names no CA: no volume for it.
+        assert!(!p.volumes.unwrap().iter().any(|v| v.name == "peer-ca-0"));
+    }
+
+    #[test]
+    fn no_peer_ca_means_no_peer_volumes() {
+        let p = pod_spec(&federated(false));
+        assert!(
+            !p.volumes
+                .unwrap()
+                .iter()
+                .any(|v| v.name.starts_with("peer-ca"))
+        );
+    }
+
+    #[test]
+    fn adding_or_changing_peers_rolls_the_pods_via_the_config_hash() {
+        let base = test_cluster("c", "ns", 3, None);
+        let h = |c: &AnimusCluster| restart_relevant_config_hash(&c.spec);
+        assert_ne!(h(&base), h(&federated(false)));
+        assert_ne!(h(&federated(false)), h(&federated(true)));
+        let mut moved = federated(true);
+        moved.spec.peers[0].endpoints = vec!["eu2:14004".into()];
+        assert_ne!(h(&federated(true)), h(&moved));
+    }
+
+    #[test]
+    fn a_spec_without_peers_keeps_its_config_hash() {
+        // The G-e fields add nothing to the projection when unset, so an
+        // existing cluster is not rolled by an operator upgrade.
+        let c = test_cluster("c", "ns", 3, None);
+        let json = serde_json::to_string(&restart_relevant_projection(&c.spec)).unwrap();
+        assert!(
+            !json.contains("peers") && !json.contains("region"),
+            "{json}"
         );
     }
 }

@@ -248,6 +248,9 @@ pub fn validate_image_revert(
 ///   ([`crate::crd::TlsSpec::validate`]).
 /// - `spec.s3` is internally consistent ([`crate::crd::S3StoreSpec::
 ///   validate`]).
+/// - `spec.region`/`spec.peers` are consistent and, with peers, `spec.tls` or
+///   the dev-only `spec.allowInsecurePeers` is set
+///   ([`AnimusClusterSpec::validate_peers_spec`], G-01 stage G-e).
 /// - `spec.backupStore`/`spec.segmentStore` are each a syntactically valid,
 ///   non-conflicting value ([`AnimusClusterSpec::validate_store_spec`]).
 ///
@@ -286,6 +289,13 @@ pub fn validate_spec(
     {
         violations.push(Violation {
             field: "spec.s3",
+            message: e,
+        });
+    }
+
+    if let Err(e) = new.validate_peers_spec() {
+        violations.push(Violation {
+            field: "spec.region/spec.peers",
             message: e,
         });
     }
