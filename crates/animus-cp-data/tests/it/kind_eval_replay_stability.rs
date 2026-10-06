@@ -55,6 +55,7 @@ fn schema() -> WriteSchema {
             projection: Projection::All,
         }],
         change_records_carry_images: true,
+        mrec: None,
     }
 }
 
