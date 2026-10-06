@@ -805,8 +805,8 @@ impl W {
         if plan.form_late {
             return;
         }
-        for i in 1..self.n {
-            let (st, r) = self.call(0, "UpdateTable", &create_body(REGIONS[i]));
+        for (i, region) in REGIONS.iter().enumerate().take(self.n).skip(1) {
+            let (st, r) = self.call(0, "UpdateTable", &create_body(region));
             assert_eq!(st, 200, "seed={}: create {i}: {r}", self.seed);
             let n = i + 1;
             self.until("the mesh to form", |w| {
