@@ -38,9 +38,10 @@ use crate::crd::{
     CONDITION_EPHEMERAL_VOTER_STORAGE_REJECTED, CONDITION_NODES_SPEC_INVALID,
     CONDITION_S3_SPEC_INVALID, CONDITION_SCALE_BELOW_CONTROL_NODES_REFUSED,
     CONDITION_SCHEMA_VERSION_INVALID, CONDITION_STORE_SPEC_INVALID, CONDITION_TLS_SPEC_INVALID,
-    ClusterCondition, ClusterPhase, ConditionStatus,
+    CONDITION_UPGRADE_CHANGES_HELD, ClusterCondition, ClusterPhase, ConditionStatus,
 };
 use crate::desired;
+use crate::roll;
 use crate::validate;
 
 /// The field manager name every server-side-apply call uses
@@ -52,6 +53,10 @@ pub const FIELD_MANAGER: &str = "animus-operator";
 const REQUEUE_TOPOLOGY_PENDING: Duration = Duration::from_secs(3);
 
 const REQUEUE_OK: Duration = Duration::from_secs(30);
+/// Requeue interval while a rolling upgrade is active (ADR 0073 Phase 3): the
+/// gate is re-evaluated this often, and the `StatefulSet`/pod watches wake the
+/// reconciler sooner on every revision or readiness change.
+const REQUEUE_ROLL: Duration = Duration::from_secs(5);
 /// Requeue interval after a reconcile error (kube's `Controller` also
 /// backs this off internally, but a fixed floor keeps a persistently
 /// failing cluster from hot-looping the operator process).
@@ -78,6 +83,9 @@ pub enum ReconcileError {
 pub struct Context<C: ClusterApi, A: AdminOps> {
     pub cluster_api: C,
     pub admin: A,
+    /// The operator's own wall clock for the rolling upgrade's stall/soak
+    /// clocks (`crate::roll::WallClock`; ADR 0073 Phase 3).
+    pub clock: crate::roll::WallClock,
 }
 
 /// Apply every desired child for `cluster`, in a fixed order (`ConfigMap`
@@ -96,6 +104,7 @@ async fn apply_children<C: ClusterApi>(
     cluster: &AnimusCluster,
     ns: &str,
     pdb_control_nodes: i32,
+    sts: &StatefulSet,
 ) -> Result<StatefulSet, ReconcileError> {
     let spec = &cluster.spec;
 
@@ -148,8 +157,10 @@ async fn apply_children<C: ClusterApi>(
     let pdb = desired::poddisruptionbudget::build(cluster, &pdb_spec);
     cluster_api.apply_poddisruptionbudget(ns, &pdb).await?;
 
-    let sts = desired::statefulset::build(cluster, spec);
-    let applied = cluster_api.apply_statefulset(ns, &sts).await?;
+    // `sts` is built by the caller (`finish_reconcile`), already carrying the
+    // roll driver's `partition` (ADR 0073 Phase 3, D7/D8): a changed pod
+    // template is only ever applied together with `partition = replicas`.
+    let applied = cluster_api.apply_statefulset(ns, sts).await?;
 
     Ok(applied)
 }
@@ -912,6 +923,40 @@ async fn reconcile<C: ClusterApi, A: AdminOps>(
     let mut status = cluster.status.clone().unwrap_or_default();
     status.observed_generation = cluster.metadata.generation;
 
+    // ADR 0073 Phase 3 (D8 case 2, D9): while a roll is in flight a
+    // `spec.nodes`/`spec.controlNodes` edit waits for `RollComplete`, and an
+    // image revert after a pod reported the new range is refused. Pin those
+    // fields to what is running and reconcile the rest; the webhook refuses
+    // the same revert at write time (`validate::validate_image_revert`).
+    let cluster = {
+        let live = ctx.cluster_api.get_statefulset(&ns, &name).await?;
+        let probe = desired::statefulset::build(&cluster, &cluster.spec);
+        let live_view = live.as_ref().map(|l| roll::StsView::of(l, &probe));
+        let prior = if live_view
+            .as_ref()
+            .is_some_and(roll::StsView::roll_in_flight)
+        {
+            previous_applied_control_nodes(&ctx.cluster_api, &ns, &cluster).await?
+        } else {
+            None
+        };
+        let (pinned, notes) = roll::hold_edits(&cluster, live_view.as_ref(), prior);
+        if notes.is_empty() {
+            status
+                .conditions
+                .retain(|c| c.type_ != CONDITION_UPGRADE_CHANGES_HELD);
+            cluster
+        } else {
+            warn!(cluster = %name, held = ?notes, "holding spec edits while a roll is in flight");
+            set_condition(
+                &mut status,
+                CONDITION_UPGRADE_CHANGES_HELD,
+                notes.join("; "),
+            );
+            Arc::new(pinned)
+        }
+    };
+
     // Validate `spec.schemaVersion` (ADR 0073 Phase 0 E): a spec whose content
     // schema this operator cannot interpret is refused before any child is
     // applied. Returns `await_change` (not `Err`, which would requeue with
@@ -1344,7 +1389,36 @@ async fn finish_reconcile<C: ClusterApi, A: AdminOps>(
     pdb_control_nodes: i32,
 ) -> Result<Action, ReconcileError> {
     let name = cluster.name_any();
-    let applied_sts = apply_children(&ctx.cluster_api, cluster, ns, pdb_control_nodes).await?;
+
+    // ADR 0073 Phase 3 (D7/D8/D9): decide the `StatefulSet`'s partition from
+    // live truth *before* applying it, so a changed pod template is applied
+    // with `partition = replicas` in the same server-side apply (no ungated
+    // window), and a roll in flight is driven one gated step at a time.
+    let mut sts = desired::statefulset::build(cluster, &cluster.spec);
+    let live_sts = ctx.cluster_api.get_statefulset(ns, &name).await?;
+    let live_view = live_sts.as_ref().map(|l| roll::StsView::of(l, &sts));
+    let tls_ca = if matches!(
+        roll::stage(live_view.as_ref(), status.upgrade.as_ref()),
+        roll::Stage::Drive { .. }
+    ) {
+        resolve_tls_ca(&ctx.cluster_api, cluster, ns, &name).await?
+    } else {
+        None
+    };
+    let roll_out = roll::step(
+        ctx,
+        cluster,
+        ns,
+        &sts,
+        live_sts.as_ref(),
+        tls_ca.as_deref(),
+        &mut status,
+    )
+    .await?;
+    desired::statefulset::set_partition(&mut sts, roll_out.partition);
+
+    let applied_sts =
+        apply_children(&ctx.cluster_api, cluster, ns, pdb_control_nodes, &sts).await?;
 
     let desired_replicas = cluster.spec.nodes;
     let ready = applied_sts
@@ -1377,8 +1451,13 @@ async fn finish_reconcile<C: ClusterApi, A: AdminOps>(
     // pod's annotations. Best effort — a failure (e.g. an operator upgraded
     // without the new `nodes`/`pods patch` RBAC) must never block the rest of
     // the reconcile; `animusd` times out its own wait and starts unlabelled.
+    let ok_requeue = if roll_out.active {
+        REQUEUE_ROLL
+    } else {
+        REQUEUE_OK
+    };
     match resolve_pod_topology(&ctx.cluster_api, &name, ns).await {
-        Ok(0) => Ok(Action::requeue(REQUEUE_OK)),
+        Ok(0) => Ok(Action::requeue(ok_requeue)),
         Ok(_pending) => Ok(Action::requeue(REQUEUE_TOPOLOGY_PENDING)),
         Err(e) => {
             tracing::warn!(cluster = %name, error = %e, "resolving pod node topology failed");
@@ -1455,6 +1534,7 @@ pub async fn run(client: Client, admin_access: AdminAccessMode) {
     let ctx = Arc::new(Context {
         cluster_api: RealClusterApi::new(client.clone()),
         admin: RealAdminClient::new(admin_access, client.clone()),
+        clock: crate::roll::WallClock::real(),
     });
 
     Controller::new(clusters, watcher::Config::default())
@@ -1497,6 +1577,9 @@ pub async fn run(client: Client, admin_access: AdminAccessMode) {
 }
 
 /// ADR 0061 rung E1: `reconcile`/`previous_applied_control_nodes`/
+#[cfg(test)]
+mod roll_tests;
+
 /// `drain_and_remove_node` exercised via `crate::fakes::{FakeClusterApi,
 /// FakeAdminClient}` — no live API server, no real socket. See that
 /// module's doc and `crates/animus-operator/CLAUDE.md`'s testing section
@@ -1517,7 +1600,11 @@ mod tests {
         cluster_api: FakeClusterApi,
         admin: FakeAdminClient,
     ) -> Arc<Context<FakeClusterApi, FakeAdminClient>> {
-        Arc::new(Context { cluster_api, admin })
+        Arc::new(Context {
+            cluster_api,
+            admin,
+            clock: crate::roll::WallClock::fixed(1_000),
+        })
     }
 
     /// The exact URL `admin_base_url` + a path suffix builds — used to

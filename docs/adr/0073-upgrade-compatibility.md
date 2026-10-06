@@ -3272,6 +3272,100 @@ Each was answered with the recommended option:
 8. **`roll run --exec`: later.** Out of the first P3-B slice; users script the
    restart with their own tooling. It stays a possible follow-up.
 
+## Amendment 2026-10-05 — Phase 3 as built: rolling-upgrade orchestration (P3-A..P3-F)
+
+Status: **Phase 3 is done.** This records what each slice shipped against the
+"Phase 3 design" amendment above (D1-D10), where it deviates, the mutation
+results, the D4 measurement, and what is still open. It adds no persisted format
+and no wire change (D4(b), the one design item that would, was not built).
+
+### What shipped, slice by slice
+
+| Slice | Shipped | Versus the design |
+|---|---|---|
+| **P3-A** health + status (`animusd`) | `roll_health.rs`: the pure verdict behind `GET /admin/roll-health` (D2; reasons `no_control_leader`, `control_quorum_lost`, `metadata_not_synced`, `member_not_active`, `tablet_quorum_lost`, `tablet_under_replicated`, `learner_pending`, `local_group_not_caught_up`); the derived `roll` object in `GET /admin/cluster-version` (D5); the dashboard Version card; `docs/runbook/upgrade.md`. | **Deviation:** the design asked the dashboard to consume the Rust ladder. The Rust `tablet_status` is a line-for-line *port* of `dashboard_core.js::tabletStatus`, and a unit test runs the real JS under `node` over an enumerated state table so the two cannot diverge (it skips loudly without `node`). One copy of the ladder was not achieved; two copies are pinned to each other. |
+| **P3-C** state machine + sim corpus | **A new crate, `animus-roll`** (pure, no `Env`, one `serde_json` dependency): `decide(&Config, &Observation) -> Action`, plus `json` adapters from the admin bodies. `sim_cluster_roll_orchestrator` (12 cells over a 4-node `SimCluster`, `ANIMUS_UPGRADE_SEEDS`; per-push at K=1 in `animusd --lib`, deeper in `corpus-deep.yml`). | **Deviation:** the design said "a library module reused by B and D". `animus-cli` depends on `animusd` and `animus-operator` on no workspace crate, so neither could host a module the other reuses; a crate of its own was the only shape. The corpus runs on the **LSM backend**, not `Memory` (see #1235 below). |
+| **P3-B** CLI (`animus-cli`) | `animus cluster roll plan|wait|status` (+ `wait --finalize --yes`), every decision `animus_roll::decide`; a supervisor that restarts nothing. `roll run --exec` deferred (maintainer decision 8). | **Addition (found by P3-E):** over a Phase 1 cluster `plan` was not re-entrant mid-roll (no node has a recorded range before the era starts, so a second `plan` still listed every node as old). The CLI now probes each node still called old at its own admin address (`/admin/cluster-version`; `own_range.max >= goal` = on the new binary, 404 / unreachable = old) and takes `roll-health` from the asked node or else from a probed new node. No `animusd` change. |
+| **P3-D** operator | `animus-operator/src/roll.rs`: every pod-template change (image **and** config hash) is applied with `partition = replicas` in the same server-side apply, then lowered one ordinal at a time under the gate; control-leader transfer first; fail closed; PDB-0 refusal; image-revert refusal (webhook `validate_image_revert` + reconciler pin); topology edits held mid-roll; opt-in auto-finalize with soak. **`animus_roll::decide_with_target`** was added: a `StatefulSet` replaces pods highest ordinal first, so the gate has to be judged for the pod the partition is about to admit, not the one the machine's own order would pick. | CRD (additive, `schemaVersion` stays 1, new fixture `v1-upgrade.json`): `spec.upgrade {finalize: Manual|Auto, soakSeconds}`; `status.upgrade {phase, fromVersion, toVersion, onNew, total, activeClusterVersion, fromImage, toImage, inFlightNode, inFlightSince, settledSince}`; conditions `UpgradeInProgress`, `UpgradeBlocked`, `UpgradeFinalizePending`, `RollComplete` and a fifth the design did not list, **`UpgradeChangesHeld`** (a held `nodes`/`controlNodes` edit or a pinned revert). The template change is detected by a fingerprint stamped on the StatefulSet's *metadata* (never the pod template). A stale controller status is never read as "done" (`status_current`). No RBAC change (D7(b)). No image range label (decision 5). |
+| **P3-E** CI | `upgrade-previous-release` job in `.github/workflows/ci.yml` (not in the prod-liveness aggregate; promotion to a required check is a ruleset decision once it has a green track record): `crates/animusd/tests/upgrade_previous_release.rs` (feature `upgrade-from`) rolls the pinned R-1 (`scripts/upgrade-from.txt`, `ac57d56a` until a `v*` tag exists; `scripts/build-upgrade-from.sh` builds and caches it by SHA) onto this tree with the real `animus cluster roll plan/wait` and `finalize` under the chaos workload and oracles. Four variants: clean (3 nodes), spare-node repair churn (4 nodes), SIGKILL of the control leader, torn WAL tail. A missing R-1 binary fails the test (never skips). `docs/release.md` gained the "move the pin, run the job green before tagging" step. The test re-asks `roll plan` after every step and asserts it names exactly the remaining nodes, and that it is empty after finalize. | Tier 2 (`kind`) is below. |
+| **P3-E** `kind` tier | Nightly job **`upgrade-kind`** (`.github/workflows/upgrade-kind-nightly.yml`, 04:07 UTC + `workflow_dispatch`; the `corpus-deep.yml` pattern) running `scripts/e2e-kind.sh` with `E2E_UPGRADE=1` (design wrote `E2E_UPGRADE_FROM=<image>`; the as-built knobs are `E2E_UPGRADE`, `ANIMUSD_IMAGE_PREV`, `E2E_UPGRADE_ROLL_TIMEOUT`). The operator bootstraps on the previous-release image (built from the pinned ref with that ref's own `Dockerfile`) with `spec.upgrade.finalize: Auto`; an in-cluster retrying write client runs throughout (in-cluster because a host port-forward pins one pod and dies with it); `spec.image` is edited to the current build; the script asserts the partition is held at `replicas` and reaches 0, `status.upgrade.phase` is `InProgress` then `Complete`, never more than one pod unready (min `readyReplicas >= replicas - 1`), `RollComplete`, `era_active` with `active == own_range.max` (the operator finalized), and, after the client stops, every acknowledged write reads back (`ConsistentRead`) and none stalled past its 60 s retry budget. | **Not shipped: the design's second leg (a bad, crash-looping image: the roll stops at the first pod, the cluster stays up, a fixed image resumes it, D9).** That behaviour is proven only by the operator's fakes-level tests. **Unverified:** `kind` cannot run in the development sandbox, so the leg has had `bash -n` and a YAML parse only; a first nightly failure is its first real run. Plain-TCP only. |
+| **P3-F** docs | This amendment; ADR 0060 "Upgrades" rewritten (the operator now orchestrates rolls); `docs/runbook/upgrade.md` (operator path, E-7 text); `docs/production-readiness.md` E-7; `deploy/operator/README.md` ("Rolling upgrades"); root `CLAUDE.md` Phase 3 status and knob rows; `docs/roadmap.md` C-16; the website (`architecture.html`, `docs.html`, `how-it-works.html`, `index.html`, `install.html`), including the pages the design flagged as stale (`architecture.html`, `how-it-works.html`), now stating the operator drives the roll and carrying the open transaction limitation. | `docs/production-readiness.md` E-7 moves from Pending-dependency to **Partially met** (the procedure and a real-process job exist; the transaction defects and the unverified `kind` leg keep it from Met). |
+
+### Mutation results
+
+The design required each of these to fail a named test. P3-C/P3-D recorded their
+runs only in the slice authors' notes, so the four named mutations were **re-run
+during P3-F** against this tree (revert after each):
+
+| Mutation | Result |
+|---|---|
+| Skip the D2 gate in `decide_with_target` (`animus-roll`) | 4 failed: `a_driver_chosen_target_is_the_one_the_gate_excludes_and_transfers_for`, `gate_blocks_on_an_unhealthy_verdict_from_any_other_node`, `gate_blocks_on_each_non_active_status`, `gate_fails_closed_on_an_unreachable_node` |
+| Finalize with a blocker / without `can_finalize` (`animus-roll` `finish`) | `never_finalizes_with_a_blocker_or_without_can_finalize` fails |
+| Apply a changed template without the partition (`Stage::Start { partition: 0 }`, `animus-operator`) | 6 failed, among them `a_changed_image_is_applied_with_partition_equal_to_replicas`, `a_config_hash_change_is_gated_exactly_like_an_image_change`, `editing_the_image_again_mid_roll_regates_from_the_top`, `pdb_zero_refuses_to_start_a_roll_and_touches_nothing`, `roll::tests::stage_classifies_every_live_shape` |
+| Lower the partition while `Blocked` (`animus-operator`: "lower without `ok`") | 4 failed: `every_d2_reason_holds_the_partition_and_is_named`, `a_node_in_flight_past_the_stall_budget_is_blocked_not_acted_on`, `a_stalled_node_is_surfaced_not_acted_on`, `blocked_on_unhealthy_member_not_active_and_unobservable` |
+
+A fifth, the stale-status mutation ("treat a stale `StatefulSet` status as done"),
+fails `a_stale_statefulset_status_never_resets_the_partition` (lesson
+`docs/lessons/code-patterns/2026-10-05-never-read-stale-controller-status-as-a-finished-rollout.md`).
+The ladder-parity test and the sim-corpus oracle's own checks are covered by their
+slices' tests, not re-mutated here.
+
+### D4 measurement (repair churn during a roll)
+
+Measured by the `spare_node_repair_churn_4_nodes` variant: 4 nodes, RF 3, each node
+kept down 12 s (past the 5 s `REPAIR_DWELL`) before it restarts. Across the whole
+roll: **2 tablet replica sets changed, 10 snapshot installs, 46 snapshot ships, 30
+reconfigurations**; the longest write stall was **0.25 to 0.5 s**. The same roll on
+**3 nodes (no spare candidate) caused zero** of each. So on a cluster with a spare
+node a slow restart does cause real rebuild traffic (correct, only wasteful), and
+nothing is rebuilt when there is nowhere to rebuild to. The longest write stall
+stayed within the 0.25 to 0.5 s range stated above.
+
+**D4(b) (the replicated, expiring `maintenance` mark, a `Gate::Era` command) is a
+pending maintainer decision, now that the measurement exists.** Phase 3 shipped, as
+decided, with D4(a): accept, document ("What a roll costs" in
+`docs/runbook/upgrade.md`), measure. Nothing here argues for or against building
+(b); the numbers above are the input to that decision.
+
+### Findings and open items
+
+- **#1237** (ungated `txn-envelope` v2 intent: an N-1 replica panics on an upgraded
+  node's repair snapshot) and **#1238** were found by the P3-E job against the pinned
+  `ac57d56a`. **#1237 is fixed** on main by #1240 (see the txn-envelope amendment
+  below): an N-1 replica caught up by snapshot receives v1 intents, with the prior
+  shipped as a committed row, until `Gate::GlobalTables` opens. **#1238 is not a roll
+  bug**: it is the previous release's own abort-lookback bug. A v1 intent (written by
+  any binary before `efcaa6cb`) carries no prior; aborting it after LSM GC collapsed
+  history tombstones an acked value. `ac57d56a` alone (R-1 -> R-1, no upgrade) loses
+  acked writes in 6/10 runs; current -> current passes 24/24. So rolling *from* a
+  release containing `efcaa6cb` with transactions in use is supported; rolling from an
+  older release (e.g. the pin `ac57d56a`) carries that release's own bug for intents it
+  wrote that are still unresolved. #1238 stays open to track a possible mitigation
+  (backfilling the prior at engine open). The job's workload runs without multi-key
+  transactions (`ANIMUS_UPGRADE_FROM_TXN=1` turns them on) and **the transactional
+  roll variant stays off pending the maintainer's decision whether to repin R-1 past
+  `efcaa6cb`**. Two further known findings against the pin, both
+  properties of `ac57d56a` itself rather than of the roll: its own abort-tombstone
+  defect and legacy v1 intents being aborted by the new binary.
+- **#1235**: `SimCluster`'s `Memory` backend restarts as a wiped disk (the control
+  system-keyspace mirror comes back empty, so a restarted control node with a
+  compacted log serves partial `Metadata`). The roll corpus therefore uses the LSM
+  backend. Test-infrastructure only; open.
+- The nightly `kind` leg is unverified, and the bad-image leg is not written (above).
+- **D4(b)** is undecided (above). `roll run --exec` is deferred. The OCI range label
+  is dropped (decision 5), so a skipped release is caught by the first upgraded pod's
+  startup refusal, not before the roll.
+
+### Supported after Phase 3 (as built)
+
+A rolling R-1 -> R upgrade, by the manual runbook and `animus cluster roll`, or by
+editing `spec.image` on an operator-managed cluster of at least three nodes with a
+PDB `maxUnavailable >= 1`, with client retries as the only visible effect and an
+explicit (or opted-in automatic) finalize. Unchanged non-support: skipping a release,
+rolling a node back, reverting `spec.image` mid-roll, a roll on a cluster that cannot
+lose a node, topology edits during a roll, ephemeral storage, and a roll *from* a release
+older than `efcaa6cb` with multi-key transactions in use (#1238, that release's own bug).
+
 ## Amendment 2026-10-05 — `txn-envelope` v2 is class G: the snapshot image is gated (#1237)
 
 `efcaa6cb` (2026-10-04) introduced `txn-envelope` v2 (intent tag 2, an intent

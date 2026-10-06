@@ -1,0 +1,87 @@
+name: upgrade-kind-nightly
+
+# ADR 0073 Phase 3 (D10): the operator-driven rolling upgrade, end to end on a
+# real `kind` cluster, nightly. A cluster is bootstrapped by the operator on
+# the PREVIOUS-release image (built from the ref pinned in
+# scripts/upgrade-from.txt), `spec.image` is edited to this tree's build, and
+# scripts/e2e-kind.sh's E2E_UPGRADE=1 leg asserts the operator rolls through
+# the gated StatefulSet partition (never more than one pod unavailable), the
+# DynamoDB wire stays available to a retrying client, the operator finalizes
+# (`spec.upgrade.finalize: Auto`), and every acknowledged write is readable
+# afterwards. Too heavy for the per-push `e2e-kind` jobs (two image builds and
+# a full roll), so it follows the corpus-deep.yml nightly pattern instead.
+on:
+  schedule:
+    # 04:07 UTC nightly (off the hour, and after corpus-deep's 03:17).
+    - cron: "7 4 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  KIND_VERSION: v0.30.0
+
+jobs:
+  upgrade-kind:
+    name: upgrade-kind
+    runs-on: ubuntu-latest
+    # Two release image builds (previous + current) and a gated roll of a
+    # 4-node cluster (each pod restarts and must re-catch-up before the next
+    # moves) on top of the plain e2e's own work.
+    timeout-minutes: 90
+    steps:
+      - name: Checkout, full history (the pinned R-1 may be an old commit)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          df -h /
+
+      - name: Install Rust toolchain (1.96)
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Cache cargo registry + build output
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Install kind
+        run: |
+          curl -Lo ./kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build this tree's animusd image
+        run: docker build -t animusd:e2e .
+
+      # The previous release, from the same pin the ProdEnv `upgrade-previous-
+      # release` job uses. Its own Dockerfile (a checked-out worktree at the
+      # pinned commit) builds the image, so it is genuinely the old binary.
+      - name: Build the previous-release (R-1) animusd image
+        run: |
+          sha="$(scripts/build-upgrade-from.sh --sha)"
+          echo "R-1 = ${sha}"
+          git worktree add --detach "${RUNNER_TEMP}/r1-src" "${sha}"
+          docker build -t animusd:e2e-prev "${RUNNER_TEMP}/r1-src"
+          git worktree remove --force "${RUNNER_TEMP}/r1-src"
+
+      - name: Run the operator-driven rolling-upgrade e2e
+        env:
+          ANIMUSD_IMAGE: animusd:e2e
+          ANIMUSD_IMAGE_PREV: animusd:e2e-prev
+          E2E_UPGRADE: "1"
+        run: bash scripts/e2e-kind.sh

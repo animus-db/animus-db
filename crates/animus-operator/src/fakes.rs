@@ -25,6 +25,9 @@ use crate::cluster_api::ClusterApi;
 use crate::controller::ReconcileError;
 use crate::crd::AnimusClusterStatus;
 
+/// [`FakeAdminClient`]'s scripted `GET` answers by `(ordinal, path)`.
+type ScriptedGets = BTreeMap<(Option<i32>, String), Result<Value, String>>;
+
 /// The kind of a recorded [`FakeClusterApi`] apply call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AppliedKind {
@@ -90,6 +93,32 @@ impl FakeClusterApi {
             .lock()
             .unwrap()
             .insert(name.to_string(), sts);
+    }
+
+    /// Seed a fully-formed `StatefulSet` (spec, metadata and status exactly as
+    /// the test built them) — the rolling-upgrade driver reads partition,
+    /// revisions, generation and the template fingerprint off it
+    /// (ADR 0073 Phase 3).
+    pub fn seed_statefulset_full(&self, sts: StatefulSet) {
+        let name = sts.metadata.name.clone().unwrap();
+        self.statefulsets.lock().unwrap().insert(name, sts);
+    }
+
+    /// The `StatefulSet` currently stored under `name` (seeded, or the most
+    /// recently applied one).
+    #[must_use]
+    pub fn statefulset(&self, name: &str) -> Option<StatefulSet> {
+        self.statefulsets.lock().unwrap().get(name).cloned()
+    }
+
+    /// Replace the seeded pods with `pods` (a test simulating the
+    /// `StatefulSet` controller replacing a pod between reconciles).
+    pub fn set_pods(&self, pods: Vec<Pod>) {
+        let mut m = self.pods.lock().unwrap();
+        m.clear();
+        for p in pods {
+            m.insert(p.metadata.name.clone().unwrap(), p);
+        }
     }
 
     /// Every apply call recorded so far, in call order.
@@ -392,6 +421,18 @@ pub struct FakeAdminClient {
     /// never a live `status.podIP`) without needing a real `AddControlMemberReq`
     /// deserialization round trip.
     member_add_addrs: Mutex<Vec<String>>,
+    /// ADR 0073 Phase 3: scripted `GET` answers for the rolling-upgrade
+    /// observation (`/admin/roll-health`, `/admin/cluster-version`,
+    /// `/admin/health`, `/admin/status`), keyed by `(ordinal, path)`; an
+    /// entry with ordinal `None` answers every ordinal that has no own entry.
+    /// `Err` is the transport/HTTP error string (e.g. `"... status 404 ..."`).
+    scripted_gets: Mutex<ScriptedGets>,
+    /// Scripted `POST` failures by path (`/admin/control/transfer`,
+    /// `/admin/cluster-version/finalize`), message as the error.
+    scripted_post_errors: Mutex<BTreeMap<String, String>>,
+    /// Every `POST` body, in call order, by `(path, body)` — the roll's
+    /// transfer/finalize calls.
+    post_bodies: Mutex<Vec<(String, Value)>>,
 }
 
 impl FakeAdminClient {
@@ -493,6 +534,35 @@ impl FakeAdminClient {
             .insert(ordinal, times);
     }
 
+    /// Script `GET {path}` (e.g. `/admin/roll-health`) on ordinal `ordinal`
+    /// (`Some`) or on every ordinal without its own entry (`None`).
+    pub fn script_get(&self, ordinal: Option<i32>, path: &str, answer: Result<Value, String>) {
+        self.scripted_gets
+            .lock()
+            .unwrap()
+            .insert((ordinal, path.to_string()), answer);
+    }
+
+    /// Drop every scripted `GET` (a test advancing the simulated cluster
+    /// rewrites the whole picture).
+    pub fn clear_scripted_gets(&self) {
+        self.scripted_gets.lock().unwrap().clear();
+    }
+
+    /// Make `POST {path}` fail with `message`.
+    pub fn script_post_error(&self, path: &str, message: &str) {
+        self.scripted_post_errors
+            .lock()
+            .unwrap()
+            .insert(path.to_string(), message.to_string());
+    }
+
+    /// Every `POST` seen so far as `(path, body)`, in call order.
+    #[must_use]
+    pub fn post_bodies(&self) -> Vec<(String, Value)> {
+        self.post_bodies.lock().unwrap().clone()
+    }
+
     /// Every `POST .../admin/control/member/add` request body's own `addr`
     /// field seen so far, in call order (issue #913).
     #[must_use]
@@ -525,6 +595,15 @@ impl AdminOps for FakeAdminClient {
             .lock()
             .unwrap()
             .push(("POST".to_string(), url.to_string()));
+        if let Some(path) = url.find("/admin/").map(|i| &url[i..]) {
+            self.post_bodies
+                .lock()
+                .unwrap()
+                .push((path.to_string(), body.clone()));
+            if let Some(msg) = self.scripted_post_errors.lock().unwrap().get(path) {
+                return Err(msg.clone());
+            }
+        }
         if url.contains("/admin/control/member/add") {
             let target_ordinal = ordinal_from_url(url);
             if target_ordinal.is_some_and(|o| {
@@ -579,6 +658,13 @@ impl AdminOps for FakeAdminClient {
             .lock()
             .unwrap()
             .push(("GET".to_string(), url.to_string()));
+        if let Some(path) = url.find("/admin/").map(|i| url[i..].to_string()) {
+            let scripted = self.scripted_gets.lock().unwrap();
+            let own = ordinal_from_url(url).and_then(|o| scripted.get(&(Some(o), path.clone())));
+            if let Some(answer) = own.or_else(|| scripted.get(&(None, path))) {
+                return answer.clone();
+            }
+        }
         if url.contains("/admin/control/members") {
             if *self.fail_control_members.lock().unwrap() {
                 return Err("control/members unreachable (fake)".to_string());

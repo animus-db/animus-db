@@ -373,6 +373,11 @@ pub trait AdminHost: Send + Sync {
     /// target and the Finalize blockers. Served by any node; the control
     /// leader additionally reports its live observation table.
     async fn cluster_version_view(&self) -> Value;
+    /// `GET /admin/roll-health` (ADR 0073 Phase 3, D2) — the server-side
+    /// "is it safe to touch the next node" verdict: control quorum, member
+    /// statuses, the tablet ladder and this node's own group catch-up. Pure
+    /// observer; never a readiness probe.
+    async fn roll_health_view(&self) -> Value;
     /// `POST /admin/cluster-version/finalize` (ADR 0073 Phase 2, P2-C) —
     /// raise the cluster version by one. Local-control-leader-only, not
     /// relayed (the ADR 0037 `admin_remove_member` pattern).

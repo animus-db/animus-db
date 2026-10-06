@@ -841,3 +841,8 @@ was added after the first three: class G, fixtures `client-frame/v1-mrec-control
 `v1-mrec-control-ttl.bin`, never edit). `MetaCommand::MarkMrecCopied` lives in `animus-control`
 but its relay arm is in `wire.rs`. `AdminHost::global_tables_view` serves both MRSC and MREC
 tables (`consistency` distinguishes them); `admin.rs` has the FakeHost routing test.
+
+## `AdminHost::roll_health_view` (ADR 0073 Phase 3, P3-A)
+
+New required method behind `GET /admin/roll-health` (always 200; `ok` in the body is the
+verdict). Both `animusd` impls delegate to `roll_health::roll_health` (see `animusd`'s guide).

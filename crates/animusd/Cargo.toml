@@ -65,11 +65,22 @@ chaos = []
 # the same reason as `chaos`.
 # Run: `ANIMUS_SOAK_DURATION=15m cargo test -p animusd --features soak --test soak -- --nocapture`.
 soak = []
+# ADR 0073 Phase 3 (P3-E, D10): the previous-release rolling-upgrade test
+# (`tests/upgrade_previous_release.rs`). Opt-in because it needs the reference
+# R-1 binary (`scripts/build-upgrade-from.sh`); with the feature on, a missing
+# binary FAILS the test, it never skips. Still compiled by `clippy --all-features`.
+# Run: `ANIMUS_UPGRADE_FROM_BIN=$(scripts/build-upgrade-from.sh) cargo test -p animusd --features upgrade-from --test upgrade_previous_release -- --nocapture --test-threads=1`.
+upgrade-from = []
 
 [[test]]
 name = "chaos"
 path = "tests/chaos.rs"
 required-features = ["chaos"]
+
+[[test]]
+name = "upgrade_previous_release"
+path = "tests/upgrade_previous_release.rs"
+required-features = ["upgrade-from"]
 
 [[test]]
 name = "soak"
@@ -185,6 +196,10 @@ animus-sim.workspace = true
 # as a dev-dependency; no cycle — `animus-test`'s own `Cargo.toml` does not
 # depend on `animusd`).
 animus-test.workspace = true
+# ADR 0073 Phase 3 (P3-C): the pure rolling-upgrade state machine the
+# `sim_cluster_roll_orchestrator` corpus drives over SimCluster (the CLI and the
+# operator are its production consumers).
+animus-roll.workspace = true
 # S-04 PR 2's own in-crate `s3_store_tests` (`lib.rs`): exercises the
 # `SegmentStoreConfig::S3`/`BackupStoreHandle::S3` wiring against
 # `animus_s3::fake::FakeS3` — no real sockets. The normal (non-dev)

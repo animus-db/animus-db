@@ -177,6 +177,34 @@
 #                       never run end to end anywhere; treat a first real
 #                       CI failure on the `e2e-kind-s3-tls` job as this leg
 #                       finding its first real bug.
+#   E2E_UPGRADE      - "1" adds the ADR 0073 Phase 3 (D10) operator-driven
+#                       rolling-upgrade leg at the END of the plain-TCP smoke
+#                       (mutually exclusive with E2E_TLS/E2E_S3_TLS: the
+#                       in-cluster client below speaks plain http). The
+#                       cluster is bootstrapped on the PREVIOUS-release image
+#                       (ANIMUSD_IMAGE_PREV, default animusd:e2e-prev, built
+#                       from the ref pinned in scripts/upgrade-from.txt — see
+#                       .github/workflows/upgrade-kind-nightly.yml) with
+#                       spec.upgrade.finalize: Auto; after the usual smoke
+#                       phases an in-cluster curl client starts a continuous
+#                       write loop (retrying each write up to 60s, then
+#                       recording a stall), `spec.image` is edited to
+#                       ANIMUSD_IMAGE (the current build), and the script
+#                       asserts the operator rolls through the gated
+#                       partition (never more than one pod unavailable), the
+#                       roll reaches status.upgrade.phase=Complete with the
+#                       cluster version finalized, and — once the client is
+#                       stopped — that every acknowledged write is readable
+#                       (ConsistentRead) and no write stalled past its retry
+#                       budget. Nightly only (a previous-release image build
+#                       plus a full roll is too heavy per push). UNVERIFIED in
+#                       this sandbox (kind cannot come up here, see
+#                       crates/animus-operator/CLAUDE.md's e2e section):
+#                       `bash -n`/shellcheck-checked, never run end to end;
+#                       treat a first real nightly failure as this leg finding
+#                       its first bug. Also: ANIMUSD_IMAGE_PREV,
+#                       E2E_UPGRADE_ROLL_TIMEOUT (default 1500s),
+#                       UPGRADE_CLIENT_IMAGE (default curlimages/curl:8.10.1).
 #   E2E_ENCRYPTION   - "1" adds an ADR 0069 S-03 PR 3 leg on top of the
 #                       plain-TCP path (mutually independent of E2E_TLS/
 #                       E2E_S3 — any combination may be set): creates a
@@ -316,6 +344,11 @@ RUSTFS_NGINX_CONFIGMAP_NAME="rustfs-nginx-tls-proxy"
 TRUSTED_IMAGE_TAG="animusd-e2e:s3-tls-trusted"
 S3_TLS_NEGATIVE_POD_NAME="s3-tls-untrusted-check"
 E2E_ENCRYPTION="${E2E_ENCRYPTION:-0}"
+E2E_UPGRADE="${E2E_UPGRADE:-0}"
+ANIMUSD_IMAGE_PREV="${ANIMUSD_IMAGE_PREV:-animusd:e2e-prev}"
+E2E_UPGRADE_ROLL_TIMEOUT="${E2E_UPGRADE_ROLL_TIMEOUT:-1500}"
+UPGRADE_CLIENT_IMAGE="${UPGRADE_CLIENT_IMAGE:-curlimages/curl:8.10.1}"
+UPGRADE_CLIENT_POD="upgrade-client"
 ENCRYPTION_KEY_SECRET_NAME="e2e-encryption-key"
 E2E_WEBHOOK="${E2E_WEBHOOK:-0}"
 OPERATOR_IMAGE="${OPERATOR_IMAGE:-animus-operator:e2e}"
@@ -732,6 +765,21 @@ cleanup() {
 trap 'on_err $LINENO' ERR
 trap cleanup EXIT
 
+# True once the StatefulSet has no roll left in flight: the operator-owned
+# partition is back at 0, the controller has observed the latest generation,
+# every replica is on the update revision (current == update) and ready.
+statefulset_fully_rolled() {
+    local j
+    j="$(kubectl get statefulset "$AC_NAME" -n "$NAMESPACE" -o json 2>/dev/null)" || return 1
+    jq -e '
+        ((.spec.updateStrategy.rollingUpdate.partition // 0) == 0)
+        and ((.status.observedGeneration // 0) >= .metadata.generation)
+        and (.status.currentRevision == .status.updateRevision)
+        and ((.status.updatedReplicas // 0) == .spec.replicas)
+        and ((.status.readyReplicas // 0) == .spec.replicas)
+    ' <<<"$j" >/dev/null
+}
+
 wait_for() {
     # wait_for DESCRIPTION TIMEOUT_SECS INTERVAL_SECS -- CMD...
     local desc="$1" timeout_secs="$2" interval="$3"
@@ -1052,6 +1100,16 @@ log "workdir: ${WORKDIR}"
 log "ANIMUSD_IMAGE=${ANIMUSD_IMAGE} KIND_NODE_IMAGE=${KIND_NODE_IMAGE:-<default>}"
 docker image inspect "$ANIMUSD_IMAGE" >/dev/null 2>&1 ||
     fail "docker image ${ANIMUSD_IMAGE} not found locally — build it first (see script header)"
+if [ "$E2E_UPGRADE" = "1" ]; then
+    if [ "$E2E_TLS" = "1" ] || [ "$E2E_S3_TLS" = "1" ]; then
+        fail "E2E_UPGRADE=1 is plain-TCP only (its in-cluster client speaks http): unset E2E_TLS/E2E_S3_TLS"
+    fi
+    docker image inspect "$ANIMUSD_IMAGE_PREV" >/dev/null 2>&1 ||
+        fail "docker image ${ANIMUSD_IMAGE_PREV} (the previous release, E2E_UPGRADE=1) not found locally"
+    [ "$ANIMUSD_IMAGE_PREV" != "$ANIMUSD_IMAGE" ] ||
+        fail "E2E_UPGRADE=1 needs two different images (ANIMUSD_IMAGE_PREV == ANIMUSD_IMAGE)"
+    AC_IMAGE="$ANIMUSD_IMAGE_PREV"
+fi
 
 phase "kind cluster create"
 # Idempotent local reruns: a stale same-named cluster from a prior failed
@@ -1086,6 +1144,9 @@ kubectl label node --all --overwrite \
 
 phase "load image"
 kind load docker-image "$ANIMUSD_IMAGE" --name "$CLUSTER_NAME"
+if [ "$E2E_UPGRADE" = "1" ]; then
+    kind load docker-image "$ANIMUSD_IMAGE_PREV" --name "$CLUSTER_NAME"
+fi
 
 phase "apply CRD + namespace"
 kubectl apply -f "${REPO_ROOT}/deploy/operator/crd.yaml"
@@ -1538,6 +1599,15 @@ fi
 # `kind` ships a default `standard` StorageClass (`rancher.io/
 # local-path`), so omitting `storage` entirely (the CRD's own `false`
 # default, a 10Gi PVC per pod) needs no further configuration here.
+UPGRADE_SPEC_YAML=""
+if [ "$E2E_UPGRADE" = "1" ]; then
+    # Auto finalize, no soak: the leg asserts the whole path including the
+    # operator raising the cluster version (the irreversible step).
+    UPGRADE_SPEC_YAML="  upgrade:
+    finalize: Auto
+    soakSeconds: 0"
+fi
+
 phase "apply AnimusCluster"
 cat >"$MANIFEST_FILE" <<EOF
 apiVersion: animusdb.io/v1alpha1
@@ -1561,6 +1631,7 @@ spec:
 ${TLS_SPEC_YAML}
 ${S3_SPEC_YAML}
 ${ENCRYPTION_SPEC_YAML}
+${UPGRADE_SPEC_YAML}
 EOF
 kubectl apply -f "$MANIFEST_FILE"
 kubectl get animuscluster "$AC_NAME" -n "$NAMESPACE" -o wide
@@ -1917,7 +1988,14 @@ phase "wait for the controlNodes config-hash rollout to fully finish (issue #864
 # by a controlNodes growth) for its own TLS regression to be caught at
 # all, instead of silently limping past it the way an earlier run of this
 # script's own TLS leg did.
-kubectl rollout status "statefulset/${AC_NAME}" -n "$NAMESPACE" --timeout=300s
+# ADR 0073 Phase 3 (D7/D8): the operator now gates every pod-template change
+# through an operator-owned `updateStrategy.rollingUpdate.partition`, applied
+# at `replicas` and lowered one ordinal per healthy observation. `kubectl
+# rollout status` treats a partitioned StatefulSet as done as soon as the
+# ordinals at or above the *current* partition are updated, so it returns
+# while the operator is still walking the partition down; wait for the
+# operator's roll to really finish instead.
+wait_for "the operator's gated roll of statefulset/${AC_NAME} has finished" 600 5 -- statefulset_fully_rolled
 
 phase "check the PodDisruptionBudget after controlNodes growth (S-07d)"
 # Safe to check even mid-rollout, and certainly safe now that the rollout
@@ -2242,6 +2320,163 @@ EOF
     [ "$ACTUAL_QUIESCE" = "7" ] ||
         fail "expected a valid write to be admitted and persisted, got quiesceAfterSecs=${ACTUAL_QUIESCE:-<empty>}"
     log "valid write correctly admitted by the admission webhook"
+fi
+
+if [ "$E2E_UPGRADE" = "1" ]; then
+    phase "upgrade: the cluster is on the previous release (ADR 0073 Phase 3, D10)"
+    pod_images() {
+        kubectl get pods -n "$NAMESPACE" -o json |
+            jq -r --arg p "${AC_NAME}-" '.items[] | select(.metadata.name | startswith($p)) | .spec.containers[0].image'
+    }
+    PODS_IMAGES="$(pod_images)"
+    [ -n "$PODS_IMAGES" ] || fail "no ${AC_NAME}-N pods found before the roll"
+    if grep -qvxF "$ANIMUSD_IMAGE_PREV" <<<"$PODS_IMAGES"; then
+        fail "expected every pod on ${ANIMUSD_IMAGE_PREV} before the roll, got: ${PODS_IMAGES}"
+    fi
+    [ "$(kubectl get animuscluster "$AC_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.upgrade.finalize}')" = "Auto" ] ||
+        fail "spec.upgrade.finalize: Auto was not persisted on the AnimusCluster"
+
+    phase "upgrade: start a continuous in-cluster write client (with client retries)"
+    UPGRADE_CLIENT_SCRIPT="${WORKDIR}/upgrade-client.sh"
+    # Quoted heredoc: nothing here is expanded by this shell. Runs in the
+    # `curl` image's own busybox sh. A write is retried for up to 60s (the
+    # AWS SDKs' own retry posture has the same shape: transient 5xx/timeouts
+    # are retried by the client) — a key that never succeeds is a STALL.
+    cat >"$UPGRADE_CLIENT_SCRIPT" <<'CLIENT'
+URL="$1"
+acked=0; stalls=0; maxwait=0; i=0
+: >/tmp/acked
+call() {
+    curl -s -m 5 -o /tmp/resp -w '%{http_code}' -X POST "$URL" \
+        -H "X-Amz-Target: $1" -H "Content-Type: application/x-amz-json-1.0" -d "$2" 2>/dev/null
+}
+while [ ! -f /tmp/stop ]; do
+    i=$((i + 1)); k="up-$i"; t=0; ok=0
+    while [ "$t" -lt 60 ]; do
+        code="$(call DynamoDB_20120810.PutItem "{\"TableName\":\"E2EItems\",\"Item\":{\"id\":{\"S\":\"$k\"},\"note\":{\"S\":\"roll\"}}}")"
+        if [ "$code" = "200" ]; then ok=1; break; fi
+        t=$((t + 1)); sleep 1
+    done
+    if [ "$ok" = "1" ]; then
+        acked=$((acked + 1)); echo "$k" >>/tmp/acked
+        [ "$t" -gt "$maxwait" ] && maxwait="$t"
+        echo "ACK $k retries=$t"
+    else
+        stalls=$((stalls + 1)); echo "STALL $k"
+    fi
+    sleep 1
+done
+echo "STOPPED acked=$acked stalls=$stalls maxwait=$maxwait"
+lost=0
+while read -r k; do
+    t=0; found=0
+    while [ "$t" -lt 60 ]; do
+        code="$(call DynamoDB_20120810.GetItem "{\"TableName\":\"E2EItems\",\"Key\":{\"id\":{\"S\":\"$k\"}},\"ConsistentRead\":true}")"
+        if [ "$code" = "200" ]; then
+            if grep -q "\"S\":\"$k\"" /tmp/resp; then found=1; fi
+            break
+        fi
+        t=$((t + 1)); sleep 1
+    done
+    if [ "$found" != "1" ]; then lost=$((lost + 1)); echo "LOST $k"; fi
+done </tmp/acked
+echo "VERIFY_DONE acked=$acked stalls=$stalls lost=$lost maxwait=$maxwait"
+CLIENT
+    kubectl delete pod "$UPGRADE_CLIENT_POD" -n "$NAMESPACE" --ignore-not-found >/dev/null
+    kubectl run "$UPGRADE_CLIENT_POD" -n "$NAMESPACE" --image="$UPGRADE_CLIENT_IMAGE" \
+        --restart=Never --command -- sh -c "$(cat "$UPGRADE_CLIENT_SCRIPT")" sh \
+        "http://${AC_NAME}-dynamo.${NAMESPACE}.svc:${DYNAMO_REMOTE_PORT}/"
+    upgrade_client_acks() {
+        kubectl logs "$UPGRADE_CLIENT_POD" -n "$NAMESPACE" 2>/dev/null | grep -c '^ACK ' || true
+    }
+    upgrade_client_warm() {
+        local n
+        n="$(upgrade_client_acks)"
+        [ -n "$n" ] && [ "$n" -ge 20 ]
+    }
+    wait_for "the client has 20 acknowledged writes on the old release" 240 5 -- upgrade_client_warm ||
+        fail "the in-cluster write client never reached 20 acknowledged writes: $(kubectl logs "$UPGRADE_CLIENT_POD" -n "$NAMESPACE" 2>&1 | tail -n 20)"
+
+    phase "upgrade: edit spec.image to the current build"
+    UPGRADE_NODES="$(kubectl get statefulset "$AC_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.replicas}')"
+    UPGRADE_T0="$(date +%s)"
+    kubectl patch animuscluster "$AC_NAME" -n "$NAMESPACE" --type merge \
+        -p "$(jq -n --arg img "$ANIMUSD_IMAGE" '{spec: {image: $img}}')"
+
+    phase "upgrade: watch the gated roll to completion"
+    # Poll (2s) the operator-owned partition, the ready count and
+    # status.upgrade.phase until Complete. A gated roll holds the partition at
+    # `replicas` first and lowers it one ordinal at a time, and never has more
+    # than ONE pod unavailable (the PDB's maxUnavailable for this shape is 1):
+    # so the lowest ready count seen across the roll must be >= replicas-1.
+    MIN_READY="$UPGRADE_NODES"
+    SAW_PARTITION_CLOSED="false"
+    SAW_IN_PROGRESS="false"
+    SEEN_PARTITIONS=""
+    UPGRADE_PHASE=""
+    while true; do
+        PART="$(kubectl get statefulset "$AC_NAME" -n "$NAMESPACE" \
+            -o jsonpath='{.spec.updateStrategy.rollingUpdate.partition}' 2>/dev/null || true)"
+        READY="$(sts_ready_replicas)"
+        READY="${READY:-0}"
+        UPGRADE_PHASE="$(kubectl get animuscluster "$AC_NAME" -n "$NAMESPACE" \
+            -o jsonpath='{.status.upgrade.phase}' 2>/dev/null || true)"
+        if [ "$READY" -lt "$MIN_READY" ]; then MIN_READY="$READY"; fi
+        if [ -n "$PART" ] && ! grep -qw -- "$PART" <<<"$SEEN_PARTITIONS"; then
+            SEEN_PARTITIONS="${SEEN_PARTITIONS} ${PART}"
+            log "partition=${PART} ready=${READY}/${UPGRADE_NODES} upgrade.phase=${UPGRADE_PHASE:-<none>}"
+        fi
+        if [ "$PART" = "$UPGRADE_NODES" ]; then SAW_PARTITION_CLOSED="true"; fi
+        if [ "$UPGRADE_PHASE" = "InProgress" ]; then SAW_IN_PROGRESS="true"; fi
+        if [ "$UPGRADE_PHASE" = "Blocked" ]; then
+            log "upgrade.phase=Blocked: $(kubectl get animuscluster "$AC_NAME" -n "$NAMESPACE" -o json | jq -c '.status.conditions[] | select(.type=="UpgradeBlocked")')"
+        fi
+        if [ "$UPGRADE_PHASE" = "Complete" ]; then break; fi
+        if [ $(($(date +%s) - UPGRADE_T0)) -ge "$E2E_UPGRADE_ROLL_TIMEOUT" ]; then
+            fail "the roll did not reach status.upgrade.phase=Complete within ${E2E_UPGRADE_ROLL_TIMEOUT}s (phase=${UPGRADE_PHASE:-<none>}, partition=${PART:-<none>})"
+        fi
+        sleep 2
+    done
+    log "roll complete in $(($(date +%s) - UPGRADE_T0))s; partitions seen:${SEEN_PARTITIONS}; min ready ${MIN_READY}/${UPGRADE_NODES}"
+    [ "$SAW_IN_PROGRESS" = "true" ] || fail "status.upgrade.phase was never InProgress during the roll"
+    [ "$SAW_PARTITION_CLOSED" = "true" ] ||
+        fail "the StatefulSet partition was never held at ${UPGRADE_NODES} (the roll was not gated); saw:${SEEN_PARTITIONS}"
+    grep -qw -- 0 <<<"$SEEN_PARTITIONS" || fail "the partition never reached 0; saw:${SEEN_PARTITIONS}"
+    [ "$MIN_READY" -ge $((UPGRADE_NODES - 1)) ] ||
+        fail "the roll took more than one pod out of service at once (min ready ${MIN_READY}/${UPGRADE_NODES})"
+
+    phase "upgrade: every pod runs the current image, the cluster version is finalized"
+    PODS_IMAGES="$(pod_images)"
+    if grep -qvxF "$ANIMUSD_IMAGE" <<<"$PODS_IMAGES"; then
+        fail "after the roll not every pod is on ${ANIMUSD_IMAGE}: ${PODS_IMAGES}"
+    fi
+    kubectl get animuscluster "$AC_NAME" -n "$NAMESPACE" -o json |
+        jq -e '.status.conditions[] | select(.type=="RollComplete" and .status=="True")' >/dev/null ||
+        fail "the RollComplete condition is not True after the roll"
+    resolve_and_forward_dynamo_pod 1
+    wait_for "the serving pod's admin is healthy" 120 3 -- admin_health_ready
+    CV="$(curl -sS -m 5 "${ADMIN_SCHEME}://${ADMIN_HOST}:${ADMIN_LOCAL_PORT}/admin/cluster-version")"
+    log "GET /admin/cluster-version: ${CV}"
+    jq -e '.era_active == true and (.active == .own_range.max)' <<<"$CV" >/dev/null ||
+        fail "spec.upgrade.finalize: Auto did not finalize the cluster version: ${CV}"
+
+    phase "upgrade: stop the client and check the acknowledged writes"
+    kubectl exec "$UPGRADE_CLIENT_POD" -n "$NAMESPACE" -- touch /tmp/stop
+    upgrade_client_done() {
+        kubectl logs "$UPGRADE_CLIENT_POD" -n "$NAMESPACE" 2>/dev/null | grep -q '^VERIFY_DONE '
+    }
+    wait_for "the client's read-back of every acknowledged write" 900 5 -- upgrade_client_done ||
+        fail "the write client never finished its read-back: $(kubectl logs "$UPGRADE_CLIENT_POD" -n "$NAMESPACE" 2>&1 | tail -n 20)"
+    kubectl logs "$UPGRADE_CLIENT_POD" -n "$NAMESPACE" >"${WORKDIR}/upgrade-client.log" 2>&1 || true
+    SUMMARY="$(grep '^VERIFY_DONE ' "${WORKDIR}/upgrade-client.log" | tail -n1)"
+    log "write client: ${SUMMARY}"
+    grep -q ' lost=0 ' <<<"${SUMMARY} " ||
+        fail "acknowledged writes were lost across the roll: ${SUMMARY}; $(grep '^LOST ' "${WORKDIR}/upgrade-client.log" | head -n 10)"
+    grep -q ' stalls=0 ' <<<"${SUMMARY} " ||
+        fail "writes stalled past the 60s client retry budget during the roll: ${SUMMARY}"
+    ACKED="$(sed -n 's/.*acked=\([0-9]*\).*/\1/p' <<<"$SUMMARY")"
+    [ "${ACKED:-0}" -ge 20 ] || fail "too few acknowledged writes to mean anything: ${SUMMARY}"
+    kubectl delete pod "$UPGRADE_CLIENT_POD" -n "$NAMESPACE" --ignore-not-found >/dev/null
 fi
 
 phase "delete AnimusCluster and verify GC"

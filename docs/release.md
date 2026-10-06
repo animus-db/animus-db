@@ -94,6 +94,24 @@ the GitHub release notes.
    if any durable/wire format changed since the last release, its ADR 0073
    checklist (new tag, fixture, legacy decoder) is complete and
    `scripts/check-format-fixtures.sh` passes.
+2a. **Previous-release rolling-upgrade check** (ADR 0073 Phase 3, D10; Phase 2
+   rule 3, "N-1 to N for every later release is mandatory", enforced with real
+   bytes). `scripts/upgrade-from.txt` pins R-1, the build the release being cut
+   must be able to take over by a rolling upgrade: the last Phase 1 tree
+   (`ac57d56a`) until the first `v*` tag exists, afterwards the **previous
+   release's tag**. In the release PR move that pointer to the previous tag
+   (for release R, R-1's tag; never skip a release, the job pins exactly one
+   step) and get the `upgrade-previous-release` CI job green on that PR
+   **before tagging**: it builds R-1's `animusd` from source (cached by commit
+   SHA), starts a real multi-process cluster on it under a recorded workload,
+   rolls it onto this tree with `animus cluster roll plan/wait`, finalizes, and
+   checks that no acked write is lost, the cluster stays available, the era
+   becomes active and Finalize succeeds (and reports the D4 repair-churn
+   measurement in the job summary). Run it locally with
+   `ANIMUS_UPGRADE_FROM_BIN=$(scripts/build-upgrade-from.sh) cargo test -p animusd --features upgrade-from --test upgrade_previous_release -- --nocapture --test-threads=1`
+   (it fails, never skips, without the binary). A red run is a finding to
+   triage, never to retry or skip; a release whose rolling-upgrade path from
+   R-1 is not green is not cut.
 3. **Release PR**: bump `[workspace.package] version` in `Cargo.toml`;
    run `cargo build --workspace` (regenerates `Cargo.lock`, never edit it by
    hand) and `cargo deny check`; prepend the changelog section

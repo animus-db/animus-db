@@ -52,6 +52,7 @@
 //! - `POST /admin/control/member/add`    — `{node?, addr}` — grow the control group (ADR 0037 PR3; `node` optional since the ADR 0037 hardening trio's PR3, allocator-minted)
 //! - `POST /admin/control/member/remove` — `{node}` — shrink the control group (ADR 0037 PR3)
 //! - `GET  /admin/cluster-version`       — ADR 0073 Phase 2: active cluster version, per-node recorded range + build, safe target, Finalize blockers (any node; the control leader adds its live observation table)
+//! - `GET  /admin/roll-health`           — ADR 0073 Phase 3 (D2): the server-side "safe to touch the next node" verdict (`ok` + named `reasons`, control quorum, member statuses, tablet ladder counts, this node's own group catch-up); read-only, never a probe; `GET /admin/cluster-version` also carries a derived `roll` object (phase, on_new, remaining, down, blockers, health)
 //! - `POST /admin/cluster-version/finalize` — `{to?, expected?}` — raise the cluster version one step (local-control-leader-only, not relayed; 409 names every blocker, and the leader on a non-leader)
 //! - `POST /admin/data/dynamo`         — run a DynamoDB op `{op, payload}` (ADR 0021), item API or Streams read API alike (ADR 0042)
 //! - `POST /admin/data/drop-table`     — drop a table's schema `{table}` (ADR 0021)
@@ -605,6 +606,9 @@ impl AdminHost for ClientCtx {
     async fn cluster_version_view(&self) -> Value {
         self.admin_cluster_version_view()
     }
+    async fn roll_health_view(&self) -> Value {
+        roll_health_view(self)
+    }
     async fn action_finalize_cluster_version(&self, body: &[u8]) -> (u16, Value) {
         action_finalize_cluster_version(self, body).await
     }
@@ -783,6 +787,9 @@ impl<E: Env, R: RelayClient> AdminHost for GenericAdminHost<E, R> {
     }
     async fn cluster_version_view(&self) -> Value {
         self.0.admin_cluster_version_view()
+    }
+    async fn roll_health_view(&self) -> Value {
+        roll_health_view(&self.0)
     }
     async fn action_finalize_cluster_version(&self, body: &[u8]) -> (u16, Value) {
         action_finalize_cluster_version(&self.0, body).await
@@ -2243,7 +2250,7 @@ fn metrics_history_view<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> Value 
 /// leaderless — small enough that a truly leaderless node (a real outage,
 /// a stuck election) still flips to `503` within roughly one second at the
 /// default 150ms election base, not tens of seconds.
-const HEALTH_LEADER_GRACE_ELECTION_TIMEOUTS: u32 = 3;
+pub(crate) const HEALTH_LEADER_GRACE_ELECTION_TIMEOUTS: u32 = 3;
 
 fn health<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> (u16, Value) {
     let r = &ctx.control;
@@ -2868,6 +2875,14 @@ async fn action_set_preferred_leader<E: Env, R: RelayClient>(
         Err(e) => return e,
     };
     crate::global_tables::admin_set_preferred_leader(ctx, &req.table, &req.region).await
+}
+
+/// `GET /admin/roll-health` (ADR 0073 Phase 3, D2): the server-side verdict
+/// from this node's own view, see [`crate::roll_health`]. Always 200: `ok`
+/// in the body is the verdict, so a caller polling it never mistakes "not
+/// healthy yet" for a transport failure.
+fn roll_health_view<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> Value {
+    ctx.roll_health_verdict(&ctx.effective_metadata()).to_json()
 }
 
 /// `POST /admin/cluster-version/finalize {to?, expected?}` (ADR 0073 Phase 2,

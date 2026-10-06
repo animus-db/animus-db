@@ -12136,6 +12136,42 @@ both targets, so a helper only one uses needs `#[allow(dead_code)]` (clippy
 `[node-exit]` or `[node-panic]` there is always a finding; node logs are not
 rotated, so a multi-day run needs disk for them.
 
+## Previous-release rolling upgrade (ADR 0073 Phase 3 P3-E, D10)
+
+`tests/upgrade_previous_release.rs` (opt-in `upgrade-from` cargo feature; CI job
+`upgrade-previous-release`) starts a real multi-process cluster of the pinned
+**R-1** `animusd` (`scripts/upgrade-from.txt`, built from source and cached by
+SHA by `scripts/build-upgrade-from.sh`; `ANIMUS_UPGRADE_FROM_BIN`), runs the
+chaos harness's recorded workload and oracles (`chaos_support`, reused as in the
+soak), then rolls it onto this tree with the real `animus cluster roll
+plan/wait` and `finalize` CLI (`animus` is found next to `animusd`, or
+`ANIMUS_CLI_BIN`), restarts the whole cluster on the current build, and checks
+durability/cycles/convergence, a bounded write stall, the era, `can_finalize`,
+finalize, and that the state only grew across the whole-cluster restart. Four
+variants (SIGTERM+transfer on 3 nodes; the same on 4 nodes with a restart gap
+past the 5 s repair dwell, which is the **D4 repair-churn measurement**; SIGKILL
+of the control leader; SIGKILL + a torn control/shared WAL tail). **Gotchas**:
+with the feature on a missing R-1 binary **panics** (never skips: a skipped
+cross-version job is a silent pass); `roll plan` is taken over the Phase 1
+cluster and re-asked after every step (it is re-entrant: before the era no node
+has a recorded range, so the CLI probes each node's own `cluster-version`; the
+test asserts the re-plan lists exactly the remaining nodes, and is empty after
+finalize); a node restarted
+for less than the repair dwell causes no churn even with a spare node, so the
+measurement needs `ANIMUS_UPGRADE_FROM_RESTART_GAP_SECS`; a write the client
+timed out on can commit after the workload stopped, so "unchanged after a
+restart" is wrong, "grew, in order, only by writes this workload issued" is
+right; **Known findings** against the pinned `ac57d56a` (module doc): its own
+abort-tombstone defect (`efcaa6cb`), legacy v1 intents aborted by the new
+binary, and the ungated `txn-envelope` v2 intent (an R-1 replica panics on an
+upgraded node's repair snapshot), so the workload runs without multi-key
+transactions unless `ANIMUS_UPGRADE_FROM_TXN=1` (CI runs one such variant as an
+informational, non-blocking step);
+`ANIMUS_UPGRADE_FROM_CONTROL=same-binary|current-only` runs the same
+roll with no binary change, to tell a mixed-version defect from a restart/repair
+defect; a failure writes history, op trace, violations and node logs under
+`$ANIMUS_UPGRADE_FROM_REPORT_DIR/<variant>-failure/`.
+
 ## StorageFull on the client path and in `/admin/health` (R-01 (d), issue #1185)
 
 `CpGroup::is_storage_full` + `refuse_if_storage_full` (`lib.rs`) refuse a write
@@ -12175,6 +12211,57 @@ needed to close the residual mirror-lag window). Never reintroduce
 `let _ = ctx.register_node(..)`. Regression: `sim_cluster_register_retry.rs`
 (partition a follower from the control quorum for 25 s > `SCHEMA_COMMIT_TIMEOUT`;
 `ANIMUS_SEED=<seed>` replays). Lesson: `docs/lessons/code-patterns/2026-10-05-a-fire-and-forget-let-underscore-turns-a-bounded-timeout-into-a-permanent-silent-failure.md`.
+
+## Roll health and the `roll` object (ADR 0073 Phase 3, P3-A)
+
+`roll_health.rs` is the one server-side definition of "safe to touch the next node":
+`GET /admin/roll-health` (`AdminHost::roll_health_view`, route in `animus-node`),
+the `roll.health` summary inside `GET /admin/cluster-version`, and the dashboard Version
+card all read it. It is **pure** (`Metadata` + `ControlView` + `LocalView` in, verdict
+out); `ClientCtx::roll_health_verdict` snapshots the inputs (`CpGroup::roll_group` is the
+cheap, no-byte-estimate group read; control reachability is observable only on the control
+leader, elsewhere a recent leader is the evidence). `version_wiring::roll_view` derives the
+`roll` object (phase/total/on_new/remaining/down/blockers/health) from `Metadata` alone:
+**never stored**, so a leader change loses nothing. `tablet_status` is a line-for-line
+port of `dashboard_core.js::tabletStatus`; `roll_health::tests::
+ladder_equals_the_dashboard_tablet_status` runs the real JS under `node` over an enumerated
+state table and fails if they diverge (it skips loudly without a `node` binary): change the
+ladder in both places or the test fails. Adding an `ok` clause means a new `Reason` kind, a
+one-clause unit test, and a line in `docs/runbook/upgrade.md`. Not a readiness probe, by
+design (issues #595/#710).
+
+## `sim_cluster_roll_orchestrator`: the roll driver over `SimCluster` (ADR 0073 Phase 3, P3-C)
+
+`sim_cluster_roll_orchestrator.rs` drives `animus_roll::decide` (the pure roll state
+machine the CLI and operator share, see `crates/animus-roll/CLAUDE.md`) over a 4-node
+`SimCluster` (`[Both, Both, Both, Data]`, RF 3) under the linearizable DynamoDB workload.
+The harness is "the platform": it executes `Restart` (crash, a seeded 0.3-2 s of
+downtime, then the new binary), the real `POST /admin/control/transfer` and `POST
+/admin/cluster-version/finalize`, and observes through the same bodies the endpoints serve
+(`SimCluster::{cluster_version_view, roll_health_view}`, synchronous, no simulated time).
+The oracle re-derives the truth at each decision (independent `roll-health` on every other
+node, members `Active`, one node below the gate, not the leader, data before control,
+`roll.remaining[0]` parity in clean cells) and then runs the mixed corpus's end checks.
+Cells, knobs and replay: `ANIMUS_UPGRADE_SEEDS`, `ANIMUS_UPGRADE_CELL`, `ANIMUS_SEED`; a
+failing cell prints its last 40 decisions. Four things that cost time:
+
+- **Faults land between ticks, before the observation**, never between a decision and its
+  execution: a fault injected after `decide` makes the oracle blame a decision for state it
+  never saw.
+- **LSM backend, not Memory.** A roll restarts every node; the `Memory` backend's restart is
+  a wiped disk (the control system-keyspace mirror comes back empty, so a restarted control
+  node with a compacted log serves a partial `Metadata` at the leader's applied index).
+  `lsm_setup` uses `SimCluster::new_with_lsm_engines`.
+- **Client ops are capped on the client's own env** (`bounded_dynamo`): a request issued to a
+  node the harness has stopped never completes in the simulator (its timers die with the old
+  process), so the shared `client_loop` hangs. The copy here records a capped op as
+  indeterminate. Do not "fix" it by sharing the loop with the other corpora (it perturbs
+  their schedules).
+- The soak clock and the stall clock are the *caller's*: a "restarted driver" restarts them
+  (`driver_restarts` drops them every 13 ticks, so its soak is 2 s < 2.6 s).
+
+Mixed-version `Watch`, `setup`, `wedged_control` and friends are `pub(super)` for this reuse.
+Lessons: `docs/lessons/testing/2026-10-05-a-restart-heavy-simcluster-corpus-needs-the-lsm-backend-and-client-side-op-caps.md`.
 
 ## `SimWorld` (multi-cluster sim, G-01 stage G-d M0)
 

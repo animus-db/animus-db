@@ -45,7 +45,9 @@
 
 use std::collections::BTreeMap;
 
-use k8s_openapi::api::apps::v1::{StatefulSet, StatefulSetSpec};
+use k8s_openapi::api::apps::v1::{
+    RollingUpdateStatefulSetStrategy, StatefulSet, StatefulSetSpec, StatefulSetUpdateStrategy,
+};
 use k8s_openapi::api::core::v1::{
     Affinity, ConfigMapVolumeSource, Container, DownwardAPIVolumeFile, DownwardAPIVolumeSource,
     EmptyDirVolumeSource, EnvVar, HTTPGetAction, ObjectFieldSelector, PersistentVolumeClaim,
@@ -303,9 +305,84 @@ fn admin_probe(
     probe
 }
 
-/// Build the `StatefulSet` for `cluster`.
+/// The `StatefulSet`'s own **metadata** annotation (not the pod template's, so
+/// adding or changing it never rolls a pod) holding the fingerprint of the
+/// pod template this operator last applied ([`template_fingerprint`]). The
+/// roll driver (`crate::roll`) compares it against the freshly built template
+/// *before* applying, which is what lets the first apply of a changed template
+/// carry `partition = replicas` atomically (ADR 0073 Phase 3, D8).
+pub const TEMPLATE_HASH_ANNOTATION: &str = "animusdb.io/template-hash";
+
+/// FNV-1a 64 over the canonical JSON of the whole pod template: **any**
+/// change to what the `StatefulSet` controller would roll pods for (image,
+/// config-hash annotation, resources, probes, volumes, ...) changes it.
+#[must_use]
+pub fn template_fingerprint(template: &PodTemplateSpec) -> String {
+    let json = serde_json::to_string(template).expect("a PodTemplateSpec always serializes");
+    format!("{:016x}", fnv1a_64(json.as_bytes()))
+}
+
+/// The container image of the pod template's first (only) container.
+#[must_use]
+pub fn template_image(sts: &StatefulSet) -> Option<String> {
+    sts.spec
+        .as_ref()?
+        .template
+        .spec
+        .as_ref()?
+        .containers
+        .first()?
+        .image
+        .clone()
+}
+
+/// The [`CONFIG_HASH_ANNOTATION`] value on the pod template of `sts`.
+#[must_use]
+pub fn template_config_hash(sts: &StatefulSet) -> Option<String> {
+    sts.spec
+        .as_ref()?
+        .template
+        .metadata
+        .as_ref()?
+        .annotations
+        .as_ref()?
+        .get(CONFIG_HASH_ANNOTATION)
+        .cloned()
+}
+
+/// Build the `StatefulSet` for `cluster` with `partition 0` (every pod the
+/// controller sees is eligible for update): a fresh cluster, and the steady
+/// state. A roll goes through [`build_with_partition`].
 #[must_use]
 pub fn build(cluster: &AnimusCluster, spec: &AnimusClusterSpec) -> StatefulSet {
+    build_with_partition(cluster, spec, 0)
+}
+
+/// Set `updateStrategy.rollingUpdate.partition` on an already-built
+/// `StatefulSet` (the roll driver decides the number after the build).
+pub fn set_partition(sts: &mut StatefulSet, partition: i32) {
+    if let Some(spec) = sts.spec.as_mut() {
+        spec.update_strategy = Some(StatefulSetUpdateStrategy {
+            type_: Some("RollingUpdate".to_string()),
+            rolling_update: Some(RollingUpdateStatefulSetStrategy {
+                partition: Some(partition),
+                max_unavailable: None,
+            }),
+        });
+    }
+}
+
+/// Build the `StatefulSet` for `cluster` with an explicit
+/// `updateStrategy.rollingUpdate.partition` (ADR 0073 Phase 3, D7/D8). The
+/// strategy is **present in every apply** (`RollingUpdate`, never `OnDelete`:
+/// the operator needs no pod-delete privilege): Kubernetes updates only
+/// ordinals `>= partition`, and the operator owns the number.
+#[must_use]
+pub fn build_with_partition(
+    cluster: &AnimusCluster,
+    spec: &AnimusClusterSpec,
+    partition: i32,
+) -> StatefulSet {
     let name = cluster
         .metadata
         .name
@@ -594,11 +671,40 @@ pub fn build(cluster: &AnimusCluster, spec: &AnimusClusterSpec) -> StatefulSet {
         ..Default::default()
     };
 
+    let labels_for_sts = labels.clone();
+    let template = PodTemplateSpec {
+        metadata: Some(ObjectMeta {
+            labels: Some(labels),
+            annotations: Some(BTreeMap::from([(
+                CONFIG_HASH_ANNOTATION.to_string(),
+                restart_relevant_config_hash(spec),
+            )])),
+            ..Default::default()
+        }),
+        spec: Some(PodSpec {
+            containers: vec![container],
+            service_account_name: spec
+                .s3
+                .as_ref()
+                .and_then(|s3| s3.web_identity.as_ref())
+                .and_then(|wi| wi.service_account_name.clone()),
+            volumes: Some(volumes),
+            topology_spread_constraints,
+            affinity,
+            termination_grace_period_seconds: Some(TERMINATION_GRACE_PERIOD_SECS),
+            ..Default::default()
+        }),
+    };
+
     StatefulSet {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
             namespace: Some(ns.to_string()),
-            labels: Some(labels.clone()),
+            labels: Some(labels_for_sts),
+            annotations: Some(BTreeMap::from([(
+                TEMPLATE_HASH_ANNOTATION.to_string(),
+                template_fingerprint(&template),
+            )])),
             owner_references: Some(vec![owner_reference(cluster)]),
             ..Default::default()
         },
@@ -606,33 +712,18 @@ pub fn build(cluster: &AnimusCluster, spec: &AnimusClusterSpec) -> StatefulSet {
             service_name: Some(internal_service_name(name)),
             replicas: Some(spec.nodes),
             pod_management_policy: Some("Parallel".to_string()),
+            update_strategy: Some(StatefulSetUpdateStrategy {
+                type_: Some("RollingUpdate".to_string()),
+                rolling_update: Some(RollingUpdateStatefulSetStrategy {
+                    partition: Some(partition),
+                    max_unavailable: None,
+                }),
+            }),
             selector: LabelSelector {
                 match_labels: Some(selector.clone()),
                 ..Default::default()
             },
-            template: PodTemplateSpec {
-                metadata: Some(ObjectMeta {
-                    labels: Some(labels),
-                    annotations: Some(BTreeMap::from([(
-                        CONFIG_HASH_ANNOTATION.to_string(),
-                        restart_relevant_config_hash(spec),
-                    )])),
-                    ..Default::default()
-                }),
-                spec: Some(PodSpec {
-                    containers: vec![container],
-                    service_account_name: spec
-                        .s3
-                        .as_ref()
-                        .and_then(|s3| s3.web_identity.as_ref())
-                        .and_then(|wi| wi.service_account_name.clone()),
-                    volumes: Some(volumes),
-                    topology_spread_constraints,
-                    affinity,
-                    termination_grace_period_seconds: Some(TERMINATION_GRACE_PERIOD_SECS),
-                    ..Default::default()
-                }),
-            },
+            template,
             volume_claim_templates: if volume_claim_templates.is_empty() {
                 None
             } else {
@@ -677,6 +768,74 @@ mod tests {
 
     fn pod_spec(sts: &StatefulSet) -> PodSpec {
         sts.spec.as_ref().unwrap().template.spec.clone().unwrap()
+    }
+
+    // --- ADR 0073 Phase 3 (P3-D): updateStrategy / partition / fingerprint --
+
+    fn partition_of(sts: &StatefulSet) -> Option<i32> {
+        sts.spec
+            .as_ref()?
+            .update_strategy
+            .as_ref()?
+            .rolling_update
+            .as_ref()?
+            .partition
+    }
+
+    #[test]
+    fn every_build_carries_a_rolling_update_strategy_never_on_delete() {
+        let cluster = test_cluster("c", "ns", 3, None);
+        for sts in [
+            build(&cluster, &cluster.spec),
+            build_with_partition(&cluster, &cluster.spec, 3),
+        ] {
+            let strategy = sts.spec.as_ref().unwrap().update_strategy.as_ref().unwrap();
+            assert_eq!(strategy.type_.as_deref(), Some("RollingUpdate"));
+        }
+        assert_eq!(partition_of(&build(&cluster, &cluster.spec)), Some(0));
+        assert_eq!(
+            partition_of(&build_with_partition(&cluster, &cluster.spec, 3)),
+            Some(3)
+        );
+        let mut sts = build(&cluster, &cluster.spec);
+        set_partition(&mut sts, 2);
+        assert_eq!(partition_of(&sts), Some(2));
+    }
+
+    fn fingerprint(c: &AnimusCluster) -> String {
+        build(c, &c.spec).metadata.annotations.unwrap()[TEMPLATE_HASH_ANNOTATION].clone()
+    }
+
+    #[test]
+    fn an_image_change_and_a_config_hash_change_both_change_the_template_fingerprint() {
+        let base = test_cluster("c", "ns", 4, Some(3));
+        let mut image = base.clone();
+        image.spec.image = Some("img:2".to_string());
+        assert_ne!(fingerprint(&base), fingerprint(&image), "image");
+        // controlNodes growth: only the config-hash annotation moves
+        let grown = test_cluster("c", "ns", 4, Some(4));
+        assert_ne!(fingerprint(&base), fingerprint(&grown), "config hash");
+        assert_ne!(config_hash(&base), config_hash(&grown));
+    }
+
+    #[test]
+    fn a_plain_scale_does_not_change_the_template_fingerprint_and_the_hash_is_not_in_the_template()
+    {
+        let base = test_cluster("c", "ns", 4, Some(3));
+        let scaled = test_cluster("c", "ns", 6, Some(3));
+        assert_eq!(fingerprint(&base), fingerprint(&scaled));
+        // The fingerprint lives on the StatefulSet's metadata: adding it can
+        // never itself roll a pod.
+        let sts = build(&base, &base.spec);
+        let template_annotations = sts
+            .spec
+            .unwrap()
+            .template
+            .metadata
+            .unwrap()
+            .annotations
+            .unwrap();
+        assert!(!template_annotations.contains_key(TEMPLATE_HASH_ANNOTATION));
     }
 
     #[test]

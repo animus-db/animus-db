@@ -1247,6 +1247,27 @@ impl SimClusterHandle {
         self.ctx(node).effective_metadata()
     }
 
+    /// The ADR 0073 Phase 3 roll-health verdict body `node` computes over the
+    /// **given** metadata snapshot, with no simulated time passing — so a test
+    /// can compare it to a ladder computed over the very same snapshot.
+    pub(crate) fn roll_health_over(&self, node: u64, meta: &Metadata) -> serde_json::Value {
+        self.ctx(node).roll_health_verdict(meta).to_json()
+    }
+
+    /// The body `GET /admin/cluster-version` serves on `node`, computed
+    /// synchronously (no simulated time passes). ADR 0073 Phase 3 (P3-C): the
+    /// roll orchestrator corpus observes the cluster once per tick.
+    pub(crate) fn cluster_version_view(&self, node: u64) -> serde_json::Value {
+        self.ctx(node).admin_cluster_version_view()
+    }
+
+    /// The body `GET /admin/roll-health` serves on `node`, computed
+    /// synchronously (no simulated time passes).
+    pub(crate) fn roll_health_view(&self, node: u64) -> serde_json::Value {
+        let ctx = self.ctx(node);
+        ctx.roll_health_verdict(&ctx.effective_metadata()).to_json()
+    }
+
     /// Every tablet id `node`'s own `ClusterEdgeState` currently holds a
     /// live CP group handle for (ADR 0061 rung D4 PR 1) — regardless of a
     /// tablet's origin (hand-hosted via [`SimCluster::
@@ -3558,6 +3579,21 @@ impl SimCluster {
     /// assert on tablet placement / schema visibility per node.
     pub(crate) fn metadata(&self, node: u64) -> Metadata {
         self.shared.metadata(node)
+    }
+
+    /// See `SimClusterHandle::cluster_version_view` (no simulated time passes).
+    pub(crate) fn cluster_version_view(&self, node: u64) -> serde_json::Value {
+        self.shared.cluster_version_view(node)
+    }
+
+    /// See `SimClusterHandle::roll_health_view` (no simulated time passes).
+    pub(crate) fn roll_health_view(&self, node: u64) -> serde_json::Value {
+        self.shared.roll_health_view(node)
+    }
+
+    /// See `SimClusterHandle::roll_health_over` (verdict over a snapshot).
+    pub(crate) fn roll_health_over(&self, node: u64, meta: &Metadata) -> serde_json::Value {
+        self.shared.roll_health_over(node, meta)
     }
 
     /// Whether **every replica of every tablet** hosted across the cluster's

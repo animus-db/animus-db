@@ -477,8 +477,48 @@ aborts with the named blockers if it cannot finalize (`--to` must be `active + 1
 requires `--yes` (finalize cannot be undone; never an interactive prompt), POSTs
 `{to, expected}`, then polls until the new version is observed. A non-leader's 409
 names the leader to retry on. Pure, unit-tested pieces: `parse_finalize_args`,
-`format_cluster_version`, `finalize_preflight`; no socket tests (this crate has no
-integration tree).
+`format_cluster_version`, `finalize_preflight`. The POST/poll flow is `run_finalize`
+(shared with `roll wait --finalize`).
+
+## `cluster roll plan|wait|status` (ADR 0073 Phase 3, P3-B; `src/roll.rs`)
+
+A verified-handoff **supervisor: it never restarts anything** (the platform does).
+Every decision is `animus_roll::decide` over an `Observation` built by
+`build_observation` from `GET /admin/cluster-version` + `/admin/roll-health` +
+`/admin/raft` (leader id) of the ONE address given; no roll rule is re-implemented
+here and no state is stored (re-running is always safe).
+
+- `plan <admin-addr> [--json]`: first `decide` over the real observation (a closed
+  gate = `Refused`, exit 1, nothing touched), then `decide` iterated with each
+  restarted node marked done and healthy to list the order (data-only, control
+  voters, control leader last after a `transfer`). Must equal the server's
+  `roll.remaining` (pinned by `plan_restart_order_matches_the_servers_roll_remaining`
+  and `tests/roll_cli.rs`).
+- `wait <node-admin-addr> [--node ID] [--timeout 10m] [--interval 2s] [--finalize --yes]`:
+  polls until `decide` (every OTHER node held back as old, so another node's trouble
+  cannot mask this one) stops saying `Wait` for the answering node (id from
+  `roll-health` `local.node`); exit 0/1. `--finalize` maps to
+  `FinalizeMode::Auto { soak: 0 }`, needs `--yes`, acts only when `decide` returns
+  `Finalize` (the last node), and POSTs to the control leader's admin address (the last
+  node rolled is the *former* leader: its id from `/admin/raft`, its address from
+  `/admin/status` `node_addrs`).
+- `status <admin-addr> [--json]`: renders the server's `roll` object + roll-health +
+  the machine's next step.
+- Every node's health is the asked node's one verdict (cluster-wide clauses are the
+  same anywhere); a node is "on the new binary" iff its recorded range max reaches
+  `active + 1` (the platform fact is not visible to the CLI). **Before the era no node
+  has a recorded range**, so `fetch_snapshot` probes every node the view still calls old
+  (`probe_nodes`/`apply_probes`: address from `/admin/status` `node_addrs`, its own
+  `GET /admin/cluster-version`, 3 s bound; `own_range.max >= goal` = new, 404/unreachable
+  = old) which makes `plan` re-entrant mid-roll over Phase 1; `roll-health` is taken from
+  the asked node, else from a probed new node. A previous-release node
+  (no `cluster-version`, 404) falls back to `/admin/status` (`legacy_view`): members and
+  roles, every node old, health `Unavailable`.
+- Tests: pure unit tests in `roll.rs`; `tests/roll_cli.rs` drives the real binary against
+  a scripted fake admin server (exit codes, `--json`, `--timeout`, wait loop,
+  `--finalize`, parity); `tests/admin_real_listener.rs` runs `roll status|plan` against a
+  real animusd admin listener, plain and TLS. `roll run --exec` is deferred (maintainer
+  decision 8).
 
 ## `table preferred-leader`, `admin global-tables`, `admin drain --force` (ADR 0075, G-c)
 

@@ -1,0 +1,46 @@
+{
+  "apiVersion": "animusdb.io/v1alpha1",
+  "kind": "AnimusCluster",
+  "metadata": {
+    "name": "golden-upgrade",
+    "namespace": "animus"
+  },
+  "spec": {
+    "schemaVersion": 1,
+    "image": "ghcr.io/animus-db/animusd:0.2.0",
+    "nodes": 3,
+    "controlNodes": 3,
+    "storage": {},
+    "clientService": {},
+    "upgrade": {
+      "finalize": "Auto",
+      "soakSeconds": 120
+    }
+  },
+  "status": {
+    "observedGeneration": 4,
+    "readyNodes": 3,
+    "phase": "Ready",
+    "conditions": [
+      {
+        "type": "UpgradeInProgress",
+        "status": "True",
+        "reason": "UpgradeInProgress",
+        "message": "gate open: lowered partition to 1; pod ordinal 1 is being restarted on the new revision"
+      }
+    ],
+    "upgrade": {
+      "phase": "InProgress",
+      "fromVersion": 1,
+      "toVersion": 2,
+      "onNew": 1,
+      "total": 3,
+      "activeClusterVersion": 1,
+      "fromImage": "ghcr.io/animus-db/animusd:0.1.0",
+      "toImage": "ghcr.io/animus-db/animusd:0.2.0",
+      "inFlightNode": "golden-upgrade-1",
+      "inFlightSince": 1700000000,
+      "settledSince": null
+    }
+  }
+}

@@ -67,6 +67,7 @@ pub async fn dispatch<H: AdminHost + ?Sized>(
         ("POST", "/admin/control/member/remove") => host.action_remove_control_member(body).await,
         ("POST", "/admin/control/transfer") => host.action_transfer_control_leadership(body).await,
         ("GET", "/admin/cluster-version") => (200, host.cluster_version_view().await),
+        ("GET", "/admin/roll-health") => (200, host.roll_health_view().await),
         ("POST", "/admin/cluster-version/finalize") => {
             host.action_finalize_cluster_version(body).await
         }
@@ -252,6 +253,9 @@ mod tests {
             unreachable!()
         }
         async fn cluster_version_view(&self) -> Value {
+            self.record()
+        }
+        async fn roll_health_view(&self) -> Value {
             self.record()
         }
         async fn action_finalize_cluster_version(&self, body: &[u8]) -> (u16, Value) {
