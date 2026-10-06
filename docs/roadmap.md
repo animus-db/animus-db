@@ -2027,8 +2027,7 @@ outstanding on the wire surface at present.
     multi-cluster corpus (`ANIMUS_MREC_SEEDS`, nightly), the `/admin/global-tables`
     MREC rows and one real-process two-cluster test over mutual TLS. **Residuals:**
     no WAN cost or latency number (the `animus-bench` cross-region variant is
-    still owed); F2 (current-state shipping, so the receiver's stream coalesces
-    intermediate writes) awaits a maintainer decision; cluster-wide lag
+    still owed); cluster-wide lag
     aggregation and alerting; AWS wire
     names unverified (ADR 0075 section 0); the other gaps are listed at the end
     of the ADR's amendment.
