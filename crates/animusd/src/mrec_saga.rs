@@ -43,9 +43,7 @@
 
 use std::time::Duration;
 
-use animus_control::schema::{
-    GlobalTableSpec, MrecReplicaStatus, StreamViewType, mrec_region_id,
-};
+use animus_control::schema::{GlobalTableSpec, MrecReplicaStatus, StreamViewType, mrec_region_id};
 use animus_control::version::Gate;
 use animus_control::{MetaCommand, Metadata};
 use animus_dynamo::global::{GlobalTableUpdate, MrecRequest};
@@ -55,13 +53,13 @@ use animus_node::host::RelayClient;
 use animus_node::{MREC_PROTO, MrecApplyRequest, MrecApplyResponse, MrecControl};
 use serde_json::{Map, Value, json};
 
+use crate::ClientCtx;
 use crate::dynamo::{
     SCHEMA_COMMIT_TIMEOUT, SCHEMA_POLL_INTERVAL, describe_table_wrapped, enable_stream, internal,
     table_status,
 };
 use crate::mrec_peer::{HealthKey, PeerClient, PeerError};
 use crate::mrec_shipper::clear_peer_cursors;
-use crate::ClientCtx;
 
 /// How long one control message waits for the peer (a `CreateTable` on the
 /// far side is included).
@@ -208,7 +206,10 @@ pub(crate) async fn update_table_mrec<E: Env, R: RelayClient>(
                     local_region: local.clone(),
                     region_id: mrec_region_id(&local),
                 },
-                move |m| mrec_spec(m, &t).is_some_and(|s| s.replicas.iter().any(|r| r.local && r.region == l)),
+                move |m| {
+                    mrec_spec(m, &t)
+                        .is_some_and(|s| s.replicas.iter().any(|r| r.local && r.region == l))
+                },
             )
             .await?;
         }
@@ -282,7 +283,10 @@ fn create_table_body(meta: &Metadata, table: &str) -> Option<String> {
     let t = v.get("Table")?;
     let mut body = Map::new();
     body.insert("TableName".into(), json!(table));
-    body.insert("AttributeDefinitions".into(), t.get("AttributeDefinitions")?.clone());
+    body.insert(
+        "AttributeDefinitions".into(),
+        t.get("AttributeDefinitions")?.clone(),
+    );
     body.insert("KeySchema".into(), t.get("KeySchema")?.clone());
     for key in ["GlobalSecondaryIndexes", "LocalSecondaryIndexes"] {
         if let Some(list) = t.get(key).and_then(Value::as_array) {
@@ -378,11 +382,11 @@ pub(crate) async fn mrec_saga_table<E: Env, R: RelayClient>(
     let Some(spec) = mrec_spec(&meta, table) else {
         return false;
     };
-    if spec
-        .replicas
-        .iter()
-        .all(|r| r.local || r.status == MrecReplicaStatus::Active || r.status == MrecReplicaStatus::CreationFailed)
-    {
+    if spec.replicas.iter().all(|r| {
+        r.local
+            || r.status == MrecReplicaStatus::Active
+            || r.status == MrecReplicaStatus::CreationFailed
+    }) {
         return false;
     }
     // The single driver: the leader of the table's lowest-id active tablet.
@@ -540,10 +544,7 @@ async fn step_deleting<E: Env, R: RelayClient>(
 
 /// A `Deleting` replica's cursors on one tablet this node leads: drop them
 /// (the shipper tick calls this; idempotent).
-pub(crate) async fn drop_deleting_cursors<E: Env>(
-    group: &crate::CpGroup<E>,
-    region: &str,
-) {
+pub(crate) async fn drop_deleting_cursors<E: Env>(group: &crate::CpGroup<E>, region: &str) {
     let start = group.scope_range().start;
     let mut present = false;
     for tag in [
@@ -640,7 +641,10 @@ async fn create_replica<E: Env, R: RelayClient>(
     peers: &[String],
 ) -> MrecApplyResponse {
     let Some(local) = ctx.mrec.region.clone() else {
-        return refused("this cluster has no cluster_settings.region configured", false);
+        return refused(
+            "this cluster has no cluster_settings.region configured",
+            false,
+        );
     };
     let Ok(wanted) = serde_json::from_str::<Value>(create_table) else {
         return refused("malformed CreateTable body", false);
@@ -665,12 +669,16 @@ async fn create_replica<E: Env, R: RelayClient>(
             .iter()
             .any(|r| r.region == from && r.status == MrecReplicaStatus::Deleting)
         {
-            return refused(format!("the replica for `{from}` is being removed here"), true);
+            return refused(
+                format!("the replica for `{from}` is being removed here"),
+                true,
+            );
         }
     }
     if meta.has_table_schema(table) {
         // Adopt only an identical shape.
-        let mine = create_table_body(&meta, table).and_then(|b| serde_json::from_str::<Value>(&b).ok());
+        let mine =
+            create_table_body(&meta, table).and_then(|b| serde_json::from_str::<Value>(&b).ok());
         if mine.is_none_or(|m| shape_of(&m) != shape_of(&wanted)) {
             return refused(
                 format!(
@@ -691,7 +699,10 @@ async fn create_replica<E: Env, R: RelayClient>(
         )
         .await;
         if s != 200 && !ctx.metadata_fresh().await.has_table_schema(table) {
-            return refused(format!("creating table `{table}` failed: {r}"), s < 500 && s != 400);
+            return refused(
+                format!("creating table `{table}` failed: {r}"),
+                s < 500 && s != 400,
+            );
         }
     }
     let meta = ctx.metadata_fresh().await;
@@ -722,7 +733,10 @@ async fn create_replica<E: Env, R: RelayClient>(
                 local_region: local.clone(),
                 region_id: mrec_region_id(&local),
             },
-            move |m| mrec_spec(m, &t).is_some_and(|s| s.replicas.iter().any(|r| r.local && r.region == l)),
+            move |m| {
+                mrec_spec(m, &t)
+                    .is_some_and(|s| s.replicas.iter().any(|r| r.local && r.region == l))
+            },
         )
         .await
         {

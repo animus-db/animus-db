@@ -4620,6 +4620,17 @@ async fn disable_stream<E: Env, R: RelayClient>(
     ctx: &ClientCtx<E, R>,
     table: &str,
 ) -> Result<(), WireError> {
+    // ADR 0075 V13: an MREC table's stream feeds its replication.
+    if metadata_fresh(ctx)
+        .await
+        .table_global(table)
+        .is_some_and(|g| g.is_mrec())
+    {
+        return Err(WireError::validation(format!(
+            "UpdateTable: the stream of table `{table}` cannot be disabled: it is part of a \
+             multi-Region eventually consistent table"
+        )));
+    }
     let tablets: Vec<TabletId> = metadata_fresh(ctx)
         .await
         .tablets_for_table(table)

@@ -1054,6 +1054,14 @@ impl SimClusterHandle {
         self.ctx(node)
     }
 
+    /// Give every node's `ClientCtx` the MREC peer configuration `cfg` (G-d M4b:
+    /// the wire-edge `UpdateTable` and the saga read `ctx.mrec`).
+    pub(crate) fn set_mrec_config(&self, cfg: std::sync::Arc<crate::mrec_peer::MrecConfig>) {
+        for ctx in self.ctxs.lock().expect("ctxs poisoned").iter_mut() {
+            ctx.mrec = cfg.clone();
+        }
+    }
+
     fn set_ctx(&self, node: u64, ctx: SimNodeCtx) {
         self.ctxs.lock().expect("ctxs poisoned")[node as usize] = ctx;
     }

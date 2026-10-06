@@ -22613,6 +22613,8 @@ mod sim_cluster_txn_conflict;
 #[cfg(test)]
 mod sim_world;
 #[cfg(test)]
+mod sim_world_mrec_saga_tests;
+#[cfg(test)]
 mod sim_world_mrec_shipper_tests;
 /// G-01 stage G-d M3: the MREC receiver over `SimWorld` (test-only).
 #[cfg(test)]
