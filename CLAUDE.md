@@ -441,8 +441,8 @@ truth; this map is just for navigation.
   placement event-driven (ADR 0031). Clusters grow online: new nodes
   self-register and mirror `Metadata` (ADR 0030), join via seed addresses, and
   are decommissioned via drain → remove (ADR 0032).
-- **Global tables (MRSC stretch tables)** — ADR 0075 (G-01 stage G-c; MREC and
-  federation are G-d/G-e, not built). One cluster whose nodes carry
+- **Global tables (MRSC stretch tables)** — ADR 0075 (G-01 stage G-c; MREC is
+  below, federation is G-e, not built). One cluster whose nodes carry
   `topology.kubernetes.io/region` labels; `UpdateTable` `ReplicaUpdates` +
   `MultiRegionConsistency: STRONG` on an empty table (three Regions, or two plus
   a witness) becomes one `ConvertTableToGlobal` (`animus-control`, behind
@@ -455,6 +455,20 @@ truth; this map is just for navigation.
   edge + `/admin/global-tables` + the decommission guard. Corpora:
   `preferred_leader_corpus` (pure) and `sim_cluster_mrsc` (cluster), knob
   `ANIMUS_MRSC_SEEDS`. Known gap: #1226 (WAN groups never quiesce).
+- **Global tables (MREC, eventual, between clusters)** — ADR 0075 section 4 and
+  its "G-d as built" amendment (G-01 stage G-d; behind `Gate::MrecReplication`,
+  cluster version 3). Independent clusters, each with `cluster_settings.region` +
+  `peers`, replicate a table by last-writer-wins on a **calendar `MrecVersion`**
+  stamped in the row value (not the cluster HLC). Per led tablet and peer a
+  shipper (`animusd::mrec_shipper`) ships each dirty key's **current row** above a
+  `mrec:<region>` cursor (a scan for the first copy, resync and split children;
+  receiver streams coalesce), the saga (`mrec_saga`) drives `UpdateTable
+  ReplicaUpdates` create/delete, the receiver (`mrec_receiver`) applies via
+  `animus-cp-data` `apply_mrec`, over the mutual-TLS intra port
+  (`MrecApply` frame). Proofs: the multi-cluster `SimWorld`
+  (`sim_world_mrec_*`, corpus knob `ANIMUS_MREC_SEEDS`) and the real-process
+  `tests/mrec_peer_transport.rs`. Admin: `/admin/global-tables` (replicas + node-local
+  shipper health).
 - **Transaction consensus** — 2PC/HLC over the per-tablet Raft groups (ADR
   0018), the only transaction story. The Accord slice that used to sit here
   (`animus-consensus`, ADR 0011) is **deleted** — rejected for CP by ADR 0018 in
