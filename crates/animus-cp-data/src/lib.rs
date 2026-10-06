@@ -8377,6 +8377,24 @@ fn surface_suspicious_merge_noop(
     // post-restart one.
 }
 
+/// The version of `physical`'s newest record, **tombstones included**
+/// (`get` hides a deleted key, so it cannot prove a later delete ran). Built on
+/// the bounded `scan_with_tombstones` over `[key, key || 0x00)`.
+async fn latest_version_incl_tombstone<S: StorageEngine>(
+    storage: &S,
+    physical: &[u8],
+) -> Option<u64> {
+    let mut end = physical.to_vec();
+    end.push(0);
+    storage
+        .scan_with_tombstones(physical, &end)
+        .await
+        .expect("raftkv replay-ahead tombstone-aware read")
+        .into_iter()
+        .find(|(k, _, _)| k.as_slice() == physical)
+        .map(|(_, _, v)| v)
+}
+
 /// Install any received snapshot, apply committed-and-durable commands to the
 /// engine in commit order, and compact when the engine has merged enough past the
 /// snapshot base. **Runs on the apply task only** — off the consensus loop, so a
@@ -9532,24 +9550,32 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // ahead: it is this very entry's own (possibly partial,
                 // crash-interrupted) intent merge, which re-applies normally.
                 // Never true on the live path (no row can carry a version
-                // above the entry being applied), so replicas that did not
-                // restart behave exactly as before.
+                // above the entry being applied) — one exception: a
+                // `SeedBatch` (the restore driver) merges rows at carried
+                // source-cluster versions, so a stage hitting a seeded key
+                // with a higher version is Fenced live too (deterministic on
+                // every replica; a liveness edge on a not-yet-served table
+                // only). Replicas that did not restart otherwise behave
+                // exactly as before. The record key joins the check on the
+                // anchor: its version moves with every later decision.
                 let stage_version = hlc::pack(ts);
                 let mut engine_ahead = false;
-                'ahead: for w in &writes {
-                    for physical in [
-                        scope.physical(&w.key),
-                        scope.physical(&txn::resolved_marker_key(&w.key)),
-                    ] {
-                        if storage
-                            .get(&physical)
-                            .await
-                            .expect("raftkv txn stage replay-ahead read")
-                            .is_some_and(|vv| vv.version > stage_version)
-                        {
-                            engine_ahead = true;
-                            break 'ahead;
-                        }
+                'ahead: for physical in writes
+                    .iter()
+                    .flat_map(|w| [w.key.clone(), txn::resolved_marker_key(&w.key)])
+                    .chain(is_anchor.then(|| record_key.clone()))
+                    .map(|k| scope.physical(&k))
+                {
+                    // Tombstone-aware: a key deleted after this stage (a
+                    // resolve-as-delete, a DeleteItem, a TTL reap) has no
+                    // live row, but its tombstone's version still proves a
+                    // later entry ran.
+                    if latest_version_incl_tombstone(storage, &physical)
+                        .await
+                        .is_some_and(|v| v > stage_version)
+                    {
+                        engine_ahead = true;
+                        break 'ahead;
                     }
                 }
                 if engine_ahead {
@@ -13132,6 +13158,24 @@ mod kind_scope_tests {
                 );
             }
         }
+    }
+
+    /// `latest_version_incl_tombstone` (issue #1242 replay-ahead check) sees a
+    /// tombstone's version where `get` sees nothing, ignores neighbouring keys
+    /// that merely share a prefix, and reports `None` for a never-written key.
+    #[test]
+    fn latest_version_incl_tombstone_sees_deletes_and_exact_key_only() {
+        use animus_storage::{MemoryEngine, StorageEngine};
+        futures::executor::block_on(async {
+            let e = MemoryEngine::new();
+            e.merge(b"k", b"v", 5).await.unwrap();
+            e.merge(b"k\x00x", b"other", 99).await.unwrap();
+            assert_eq!(latest_version_incl_tombstone(&e, b"k").await, Some(5));
+            e.merge_tombstone(b"k", 9).await.unwrap();
+            assert!(e.get(b"k").await.unwrap().is_none(), "get hides it");
+            assert_eq!(latest_version_incl_tombstone(&e, b"k").await, Some(9));
+            assert_eq!(latest_version_incl_tombstone(&e, b"nope").await, None);
+        });
     }
 
     /// The rung-B4 seed path's foundation (ADR 0050): an `engine_image` of

@@ -40,6 +40,7 @@ use animus_storage::{MemoryEngine, StorageEngine};
 use animus_tablet::{escape, partition_token};
 use futures::executor::block_on;
 
+type RawRows = Vec<(Vec<u8>, Option<Vec<u8>>, u64)>;
 type KvNode = RaftKvNode<SimEnv, MemoryEngine>;
 
 const SETTLE: Duration = Duration::from_secs(2);
@@ -135,9 +136,11 @@ impl Cluster {
         keys: &[Vec<u8>],
         value: &str,
     ) -> Option<(HlcTimestamp, StageOutcome)> {
+        // An empty `value` stages a delete (tombstone) of every key.
+        let v = (!value.is_empty()).then(|| value.as_bytes().to_vec());
         let writes: Vec<TxnWrite> = keys
             .iter()
-            .map(|k| TxnWrite::plain(k.clone(), Some(value.as_bytes().to_vec())))
+            .map(|k| TxnWrite::plain(k.clone(), v.clone()))
             .collect();
         let n = self.nodes[l].clone();
         let (id, rk) = (id.clone(), record_key.to_vec());
@@ -206,7 +209,35 @@ impl Cluster {
             .collect()
     }
 
+    /// Every replica's whole raw keyspace INCLUDING tombstones, the txn anchor
+    /// records and the resolved markers: `(key, value-or-tombstone, version)`
+    /// (minus the per-replica `__animus_system` cursors).
+    fn raw_all(&self) -> Vec<RawRows> {
+        self.engines
+            .iter()
+            .map(|e| {
+                let mut rows = block_on(e.entries_with_tombstones()).unwrap();
+                // Per-replica progress cursors (`cp_applied`, `cp_hlc_hwm`)
+                // legitimately differ in timing; everything else must match.
+                rows.retain(|(k, _, _)| !k.starts_with(b"__animus_system"));
+                rows
+            })
+            .collect()
+    }
+
     fn assert_identical(&self, keys: &[&Vec<u8>], what: &str) {
+        let all = self.raw_all();
+        for (i, rows) in all.iter().enumerate().skip(1) {
+            if rows != &all[0] {
+                let only0: Vec<_> = all[0].iter().filter(|r| !rows.contains(r)).collect();
+                let onlyi: Vec<_> = rows.iter().filter(|r| !all[0].contains(r)).collect();
+                panic!(
+                    "replica {i} raw rows (incl. tombstones, anchor records, resolved markers) \
+                     diverged from replica 0 ({what}) (seed={}): only on 0: {only0:?}; only on {i}: {onlyi:?}",
+                    self.seed
+                );
+            }
+        }
         for k in keys {
             let raw = self.raw(k);
             assert!(
@@ -306,6 +337,55 @@ fn blocked_stage_is_not_resurrected_by_replay() {
     );
 }
 
+/// Live: T2's stage {A,B} carries the own-key condition "A must be absent" and
+/// is rejected (`ConditionFailed`) because A holds T0's committed value. A
+/// plain delete then tombstones A at a version above T2's stage; B has no later
+/// write and T2 has no marker. Replay reads A through a plain `get`, where a
+/// tombstone is invisible, so "A absent" now holds and an ahead check built on
+/// `get` would accept the stage: an orphan intent on B. Only a tombstone-aware
+/// version read sees that a later entry (the delete) already ran.
+#[test]
+fn condition_failed_stage_is_not_resurrected_when_the_key_was_deleted_after() {
+    let mut c = Cluster::new(BASE_SEED + 2);
+    let rk = key(b"anchor-elsewhere");
+    let (a, b) = (key(b"A"), key(b"B"));
+    c.commit(&txn_id(1), &rk, std::slice::from_ref(&a), "t0");
+    let l = c.leader().unwrap();
+    let writes = vec![
+        TxnWrite::plain(a.clone(), Some(b"t2".to_vec())),
+        TxnWrite::plain(b.clone(), Some(b"t2".to_vec())),
+    ];
+    let (n, id, rk2, cond) = (
+        c.nodes[l].clone(),
+        txn_id(2),
+        rk.clone(),
+        vec![(a.clone(), None)],
+    );
+    let (_, outcome) = drive(&mut c.sim, c.nodes[l].env(), SETTLE, async move {
+        n.txn_stage_participant(id, rk2, "t".into(), writes, cond)
+            .await
+    })
+    .flatten()
+    .expect("stage completes");
+    assert!(
+        !matches!(outcome, StageOutcome::Staged),
+        "live: condition 'A absent' must fail, got {outcome:?}"
+    );
+    // A DeleteItem / TTL reap of A after the rejected stage.
+    let _ = c.nodes[l].delete(a.clone());
+    c.sim.run_for(SETTLE);
+    c.assert_identical(&[&a, &b], "before restart");
+
+    let follower = (0..3).find(|&i| i != c.leader().unwrap()).unwrap();
+    c.restart_fresh(follower);
+    c.sim.run_for(SETTLE);
+    c.assert_identical(&[&a, &b], "after follower replay");
+    assert!(
+        c.raw(&b).iter().all(Option::is_none),
+        "no orphan intent on B"
+    );
+}
+
 // ---- seeded corpus ---------------------------------------------------------
 
 struct Rng(u64);
@@ -333,14 +413,19 @@ fn run_schedule(seed: u64) {
             c.sim.run_for(Duration::from_secs(1));
             continue;
         };
-        match rng.below(12) {
+        match rng.below(14) {
             0..=5 => {
                 counter += 1;
                 let id = txn_id(counter);
                 let a = rng.below(3) as usize;
                 let b = (a + 1 + rng.below(2) as usize) % 3;
                 let ks = vec![keys[a].clone(), keys[b].clone()];
-                if let Some((ts, _)) = c.stage(l, &id, &rk, &ks, &format!("v{counter}")) {
+                let val = if rng.below(4) == 0 {
+                    String::new() // a delete
+                } else {
+                    format!("v{counter}")
+                };
+                if let Some((ts, _)) = c.stage(l, &id, &rk, &ks, &val) {
                     let out = if rng.below(6) == 0 {
                         TxnOutcome::Aborted
                     } else {
@@ -400,6 +485,12 @@ fn run_schedule(seed: u64) {
                     let _ = c.nodes[l].put(format!("pad{pad:06}").into_bytes(), b"x".to_vec());
                 }
                 c.sim.run_for(Duration::from_secs(3));
+            }
+            11 => {
+                // A plain delete (DeleteItem / TTL-reap shape) of a txn key.
+                let k = keys[rng.below(3) as usize].clone();
+                let _ = c.nodes[l].delete(k);
+                c.sim.run_for(Duration::from_millis(200));
             }
             _ => c.sim.run_for(Duration::from_millis(500)),
         }

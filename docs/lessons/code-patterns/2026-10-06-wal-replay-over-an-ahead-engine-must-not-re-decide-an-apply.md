@@ -6,7 +6,9 @@ holds everything applied before the kill — typically thousands of entries past
 the replay start. An apply arm whose *decision* reads engine state therefore
 sees future state on replay and can decide differently than the live apply (and
 than every other replica) did. The per-key `merge` version guard hides this for
-single-key arms: a replayed write loses to the later row at its key. It does
+arms whose only effect is a plain per-key merge: a replayed write loses to the
+later row at its key. (Not every single-key arm: `KindEval`/`KindEvalBatch`
+re-decide from state and write derived rows on unique keys — issue #1247.) It does
 **not** protect a whole-or-nothing arm over several keys: the decision flips
 on one key's later state while the merge still lands on another key that has no
 later write.
@@ -24,7 +26,16 @@ Rules:
   multi-key conditional arm, ask "what if every other key's row were from the
   future?". A version strictly above the entry's own `ts` at any key it reads
   proves a later entry ran; skip the whole entry (equal is the entry's own,
-  possibly partial, write and must re-apply).
+  possibly partial, write and must re-apply). Read that version
+  **tombstone-aware**: `get` hides a deleted key, and "deleted since" is exactly
+  the future state replay must notice (a stage rejected live by "A absent"
+  passes on replay once A is deleted).
+- The guard is unreachable live except for `SeedBatch` (restore merges rows at
+  carried source versions): a stage hitting such a key is Fenced live too,
+  deterministically on every replica — a liveness edge on a not-yet-served table.
+- A replica-identity assertion must compare raw rows **including tombstones,
+  anchor records and resolved markers**; `entries()` hides all three and so
+  hides this whole bug class.
 - A restart test must replay **over a retained engine** (`SimEnv`
   `stop` + start with the same `MemoryEngine`); wiping the engine or only
   checking after catch-up by `AppendEntries` makes it vacuous.
