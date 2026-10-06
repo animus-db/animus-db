@@ -588,6 +588,15 @@ pub static EMBEDDED: &[Embedded] = &[
         "animus-cp-data",
         2,
     ),
+    // v1 (issue #1243): the durable per-key resolved marker `TxnResolve`'s
+    // apply writes beside each resolved intent (`txn::resolved_marker_key`).
+    // An engine-resident row like the envelope; at its first version it
+    // transcodes as the identity (a pre-marker state simply has no markers).
+    emb(
+        "txn-resolved-marker",
+        Carrier::Table("lsm-sstable"),
+        "animus-cp-data",
+    ),
     emb("segment", Carrier::OffDisk, "animus-cp-data"),
     emb("backup-manifest", Carrier::OffDisk, "animus-cp-data"),
     emb("backup-data", Carrier::OffDisk, "animus-cp-data"),

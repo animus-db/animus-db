@@ -139,7 +139,8 @@ first real bumps have landed (2026-10-03, #1140/#1141/#1142): `control-wal`,
 the harness transcodes them to v1 for real; `raftkv-wal` is v2 too (embedded
 in the control-wal carrier); `txn-envelope` (the value-envelope intent tag) is v2
 since 2026-10-04 (an intent carries its prior value, ADR 0018; an engine-row value, so the harness
-down-converts it to v1 with a row transcode, `animus-test` `ROW_TABLE`); every other format is still v1,
+down-converts it to v1 with a row transcode, `animus-test` `ROW_TABLE`; class G as well since
+2026-10-05: the snapshot sender ships v1 until `Gate::GlobalTables` opens, #1237); every other format is still v1,
 transcoded as the identity. **A format change follows ADR 0073's "Phase 1 design"
 checklist** ([`docs/adr/0073-upgrade-compatibility.md`](docs/adr/0073-upgrade-compatibility.md):
 bump, keep the vN decoder under `legacy`, new no-overwrite fixture,
@@ -271,6 +272,7 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 | `ANIMUS_DIRECTED_PLACING_LOAD_SEEDS=K` | 1 | directed-Placing (2-of-3 replica diff) learner-promotion-under-a-continuous-writer corpus depth (`animus-cp-data`, issue #1064) — `cargo test -p animus-cp-data --test it directed_placing_under_sustained_load::` |
 | `ANIMUS_LEARNER_SNAPSHOT_LIVELOCK_SEEDS=K` | 1 | late-joining-learner-needing-a-real-InstallSnapshot-under-a-continuous-writer corpus depth (`animus-cp-data`, issue #1064 part 2) — `cargo test -p animus-cp-data --test it learner_snapshot_livelock_under_continuous_writer::` |
 | `ANIMUS_RELEASE_RACE_SEEDS=K` | 1 | release-vs-promote race corpus depth (`animus-cp-data`, `tests/release_race_corpus.rs`, ADR 0031's 2026-09-30 amendment) — a mid-catch-up learner must never be released/erased by the host reconciler nor refused as a voter on re-host |
+| `ANIMUS_RESTAGE_SEEDS=K` | 2 | stale-restage-after-resolve replica-determinism corpus depth (`animus-cp-data`, `tests/it/resolved_restage_replica_determinism.rs`, issue #1243) — a duplicate `TxnStage` for an already-resolved txn must apply identically on a restarted replica and on a snapshot-installed one; `ANIMUS_SEED=<seed>` replays one — `cargo test -p animus-cp-data --test it resolved_restage` |
 | `ANIMUS_CHAOS_SEED=S` | per-scenario name hash | seed of the real-cluster chaos harness's **fault schedule** (`animusd`, `tests/chaos.rs`, R-01 b, `docs/chaos.md`); the processes are real, so a replay is the same faults against a similar, not identical, execution. Opt-in: `cargo test -p animusd --features chaos --test chaos -- --test-threads=1` |
 | `ANIMUS_CHAOS_SECS=N` | 90 (smoke) / 150 | length of the chaos fault window in seconds (the long run: `ANIMUS_CHAOS_SECS=900 … chaos_mixed`); also `ANIMUS_CHAOS_NODES` (3), `ANIMUS_CHAOS_TABLETS` (4), `ANIMUS_CHAOS_RECOVERY_SECS` (60), `ANIMUS_CHAOS_TXN=0`, `ANIMUS_CHAOS_DIR`, `ANIMUS_CHAOS_OUT` |
 | `ANIMUS_SOAK_DURATION=D` | `10m` | total length of the real-process soak (`animusd`, `tests/soak.rs`, R-01 (a), opt-in `soak` feature, `docs/soak.md`); also `ANIMUS_SOAK_{SEED,NODES,TABLETS,EPOCH_SECS,SAMPLE_SECS,WARMUP,PACE_MS,RESTART_EVERY,DIR,OUT}` |
