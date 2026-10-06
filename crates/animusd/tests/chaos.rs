@@ -711,6 +711,24 @@ async fn run_disk_full() -> Option<Outcome> {
         ),
     );
 
+    // `ANIMUS_CHAOS_KEEP=1`: dump each node's per-group Raft view while every
+    // disk is still full (who leads which tablet, terms, roles), the evidence
+    // a "reads not served" or "no leader" failure needs.
+    if std::env::var("ANIMUS_CHAOS_KEEP").is_ok_and(|v| v.trim() == "1") {
+        let _ = std::fs::create_dir_all(&out_dir);
+        for i in 0..n {
+            if let Some((_, v)) = admin_json(&cluster, i, "/admin/raftkv").await {
+                let _ = std::fs::write(out_dir.join(format!("raftkv-n{i}.json")), v.to_string());
+            }
+            if let Some((_, v)) = admin_json(&cluster, i, "/admin/metrics").await {
+                let _ = std::fs::write(
+                    out_dir.join(format!("metrics-n{i}.json")),
+                    v["counters"].to_string(),
+                );
+            }
+        }
+    }
+
     // ---- phase 3: free everything, writes resume with no restart ----------
     note(&mut events, "phase 3: freeing every filesystem".into());
     for m in &mounts {
@@ -792,7 +810,8 @@ async fn run_disk_full() -> Option<Outcome> {
             }
         }
     }
-    if !violations.is_empty() {
+    let keep_artifacts = std::env::var("ANIMUS_CHAOS_KEEP").is_ok_and(|v| v.trim() == "1");
+    if !violations.is_empty() || keep_artifacts {
         let _ = std::fs::create_dir_all(&out_dir);
         let _ = std::fs::write(
             out_dir.join("history.json"),

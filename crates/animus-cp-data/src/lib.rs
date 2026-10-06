@@ -5960,10 +5960,21 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // *after* releasing it and only ever grows, so a concurrent apply can
         // make this false-negative (a read that falls back to the strong
         // path, which is always correct) but never false-positive.
-        let (has_leader, commit) = {
+        let (has_leader, had_contact, commit) = {
             let core = self.lock();
-            (core.leader().is_some(), core.commit_index())
+            (
+                core.leader().is_some(),
+                core.has_had_leader_contact(),
+                core.commit_index(),
+            )
         };
+        // Issue #1228: a storage-full replica never campaigns, so when its
+        // leader is lost while every replica is full no election can follow
+        // until space returns. Its engine still holds a genuine prefix of the
+        // log (it has had a leader in this process's lifetime, and the engine
+        // clause below still holds), so it keeps serving the eventual read it
+        // can serve rather than falling back to a barrier no leader can run.
+        let has_leader = has_leader || (had_contact && self.is_storage_full());
         Self::stale_read_ready_decision(has_leader, self.engine_applied_index(), commit)
     }
 
@@ -6494,10 +6505,9 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         if !self.read_barrier().await {
             return None;
         }
-        let ts = self.hlc.mint(self.env.now());
-        if !self.ensure_ceiling_above(ts).await {
+        let Some(ts) = self.read_serve_ts().await else {
             return None;
-        }
+        };
         let rows = self.local_scan_kind_rev(kind, start, end, limit).await;
         self.ts_cache.lock().expect("ts cache poisoned").bump(
             start.to_vec(),
@@ -6517,10 +6527,9 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         if !self.read_barrier().await {
             return None;
         }
-        let ts = self.hlc.mint(self.env.now());
-        if !self.ensure_ceiling_above(ts).await {
+        let Some(ts) = self.read_serve_ts().await else {
             return None;
-        }
+        };
         let rows = self.local_scan_kind(kind, start, end, limit).await;
         // Bump the *whole requested span*, mirroring `linearizable_scan`'s
         // identical reasoning — a future write anywhere in `[start, end)` is
@@ -6663,10 +6672,9 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // one if not — see `ensure_ceiling_above`'s doc), then bump the
         // read-timestamp cache with the *actual* ts served, so a concurrent
         // or later write to this key is pushed above it.
-        let ts = self.hlc.mint(self.env.now());
-        if !self.ensure_ceiling_above(ts).await {
+        let Some(ts) = self.read_serve_ts().await else {
             return None;
-        }
+        };
         // ADR 0018 §2/PR3: unlike `local_get`'s raw peek, a linearizable
         // read retries (bounded) a still-`Pending` intent rather than
         // reporting a false absence — see `read_resolved`'s doc.
@@ -6696,10 +6704,9 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         if !self.read_barrier().await {
             return None;
         }
-        let ts = self.hlc.mint(self.env.now());
-        if !self.ensure_ceiling_above(ts).await {
+        let Some(ts) = self.read_serve_ts().await else {
             return None;
-        }
+        };
         let physical = self.scope.physical(key);
         let Some(vv) = self.storage.get(&physical).await.ok().flatten() else {
             let (start, end) = ts_cache::point_span(key);
@@ -6811,10 +6818,9 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         if !self.read_barrier().await {
             return None;
         }
-        let ts = self.hlc.mint(self.env.now());
-        if !self.ensure_ceiling_above(ts).await {
+        let Some(ts) = self.read_serve_ts().await else {
             return None;
-        }
+        };
         let rows = self.local_scan(start, end, limit).await;
         // Bump the *whole requested span* (not just the rows a `limit`
         // happened to return): over-conservative, never wrong — a future
@@ -6848,10 +6854,9 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         if !self.read_barrier().await {
             return None;
         }
-        let ts = self.hlc.mint(self.env.now());
-        if !self.ensure_ceiling_above(ts).await {
+        let Some(ts) = self.read_serve_ts().await else {
             return None;
-        }
+        };
         let rows = self.local_scan_rev(start, end, limit).await;
         self.ts_cache.lock().expect("ts cache poisoned").bump(
             start.to_vec(),
@@ -7402,6 +7407,47 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             self.metrics.incr(Metric::CpReadBarriersTimedOut);
         }
         ok
+    }
+
+    /// The timestamp a **linearizable read** is served at, with the committed
+    /// read ceiling covering it (`None`: nothing may be served -- the caller
+    /// treats it exactly like a failed [`read_barrier`](Self::read_barrier)).
+    ///
+    /// Normally: mint a fresh `ts` and [`ensure_ceiling_above`](Self::ensure_ceiling_above)
+    /// it, proposing and waiting for a `ReadCeiling` when the committed one has
+    /// lapsed (it covers `HLC_MAX_OFFSET` of wall time per proposal).
+    ///
+    /// **Issue #1228 -- a storage-full leader cannot extend the ceiling.** A
+    /// `ReadCeiling` must commit *and apply*, and a leader that cannot persist
+    /// applies nothing new (its visible state is gated at its own durable
+    /// index); proposing one anyway would only grow a log nobody can commit and
+    /// stall the read for a whole `READ_TIMEOUT`. So once the ceiling has
+    /// lapsed such a leader serves at the **committed floor** instead: the
+    /// highest version its engine holds (`latest_version`, which includes the
+    /// ceiling marker and every applied write's commit ts), not a fresh mint.
+    ///
+    /// That is linearizable, not merely available: the read barrier already
+    /// confirmed leadership by quorum and that the engine holds everything
+    /// committed, so a read at the floor sees every write ever acknowledged
+    /// (each acked write's version is at or below the floor); and any
+    /// *future* write, on this leader or on whichever replica leads after a
+    /// change, is minted strictly above every timestamp it has applied or
+    /// witnessed -- the floor included -- so it can never land below a read
+    /// served here. The ceiling exists to cover a *fresh* mint that no
+    /// replicated entry yet bounds; the floor is bounded by committed entries
+    /// by construction.
+    async fn read_serve_ts(&self) -> Option<HlcTimestamp> {
+        let ts = self.hlc.mint(self.env.now());
+        if self.committed_ceiling() > ts {
+            return Some(ts);
+        }
+        if self.is_storage_full() {
+            if !self.is_leader() {
+                return None;
+            }
+            return Some(hlc::unpack(self.storage.latest_version()).max(self.committed_ceiling()));
+        }
+        self.ensure_ceiling_above(ts).await.then_some(ts)
     }
 
     /// Ensure this group's **committed read ceiling** (ADR 0018 §2/PR2b,
@@ -12897,6 +12943,11 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
     // time a further attempt may be armed.
     let mut stepdown_last: Option<NodeId> = None;
     let mut stepdown_next = animus_env::Nanos(0);
+    // Issue #1228: when this node entered the storage-full state. The step-down
+    // waits a settle window from then (below) so the followers -- which learn
+    // they are full from the same failed write, not before -- have reported it
+    // on their frozen acks before the leader picks a "healthy" successor.
+    let mut full_since: Option<animus_env::Nanos> = None;
     loop {
         // A requested shutdown exits *between* persist rounds so the WAL is never
         // left mid-write; `stopped` (paired with the apply task's `apply_stopped`)
@@ -13007,7 +13058,11 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             c.set_storage_full(storage_full);
             if storage_full {
                 let at = env.now();
+                let since = *full_since.get_or_insert(at);
+                let settled =
+                    at.0.saturating_sub(since.0) >= c.election_timeout().as_nanos() as u64;
                 if c.is_leader()
+                    && settled
                     && at.0 >= stepdown_next.0
                     && let Some(target) = c.storage_full_step_down(at, stepdown_last.as_ref())
                 {
@@ -13026,6 +13081,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
                 }
             } else {
                 stepdown_last = None;
+                full_since = None;
             }
             // ADR 0044 phase-1 PR5, fork D: feed the quiesce veto — a
             // non-empty `TxnTracker` (this group has a pending 2PC intent or
@@ -13394,11 +13450,26 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         // wait for their round; replication, heartbeats and pre-vote traffic go
         // out immediately, which is what keeps a group alive across a slow
         // `fsync`. Engine apply happens independently on the apply task.
+        //
+        // Issue #1228: while the WAL is suspect (ENOSPC) the round a held ack
+        // waits on may never land, and a full follower that holds every ack
+        // starves its leader of the contact leadership and read barriers need.
+        // So an `AppendEntriesResp { success: true }` whose `match_index` is
+        // already at or below this node's *durable* index ships at once: it
+        // vouches only for entries that are on disk (the core freezes a full
+        // follower's ack there, `RaftCore::handle_append_entries`), so it can
+        // never help commit an entry this node did not persist. Anything that
+        // claims more stays held, exactly as before.
+        let frozen_durable = if gate.is_some() && persist.is_suspect() {
+            Some(core.lock().expect("raftkv core poisoned").durable_index())
+        } else {
+            None
+        };
         let (immediate, held): (Vec<_>, Vec<_>) = match gate {
             None => (outs, Vec::new()),
-            Some(_) => outs
-                .into_iter()
-                .partition(|(_, wire)| ships_before_durable(wire)),
+            Some(_) => outs.into_iter().partition(|(_, wire)| {
+                ships_before_durable(wire) || frozen_durable.is_some_and(|d| is_frozen_ack(wire, d))
+            }),
         };
         if let Some(round) = gate {
             gated.push(round, held);
@@ -14367,6 +14438,17 @@ mod pr5_orphan_and_resurrection_tests {
 /// crate's own **non-consensus** variants are decided here:
 /// `ReadProbe`/`ReadProbeAck` are a ReadIndex barrier the `RaftCore` never even
 /// sees, carry no state claim, and so are never held back.
+/// Issue #1228: whether `wire` is a successful append ack that claims nothing
+/// past `durable` -- the only ack a storage-full follower may send before its
+/// WAL is rewritten (see the partition in the consensus loop).
+fn is_frozen_ack(wire: &KvWire, durable: u64) -> bool {
+    matches!(
+        wire,
+        KvWire::Raft(RaftMsg::AppendEntriesResp { success: true, match_index, .. })
+            if *match_index <= durable
+    )
+}
+
 fn ships_before_durable(wire: &KvWire) -> bool {
     match wire {
         KvWire::ReadProbe { .. } | KvWire::ReadProbeAck { .. } => true,
