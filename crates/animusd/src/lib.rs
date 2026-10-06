@@ -112,7 +112,7 @@ mod index_backfill;
     dead_code,
     reason = "G-d M3: first production caller is the M4 shipper"
 )]
-pub(crate) mod mrec_peer;
+pub mod mrec_peer;
 #[deny(clippy::disallowed_methods)]
 mod mrec_receiver;
 mod overload;
@@ -17283,6 +17283,10 @@ pub async fn start_bound_node_with_streams_quiesce_and_ttl_sweep_interval(
         .dynamo_auth
         .as_ref()
         .map(|cfg| Arc::new(cfg.credentials.clone()));
+    // The MREC peer settings (G-d M3): `Node::bind` has no config, so the
+    // start half installs them like every other `run_node*` entry point does
+    // (`tests/mrec_peer_transport.rs` caught the bound path missing them).
+    let bound = bound.with_mrec(crate::mrec_peer::MrecConfig::from_cluster(config));
     bound
         .start_with_growth(
             config.peer_book(),

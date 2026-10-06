@@ -263,3 +263,40 @@ pub(crate) fn decode_response(bytes: &[u8]) -> Result<MrecApplyResponse, PeerErr
     serde_json::from_slice(bytes)
         .map_err(|e| PeerError::Transport(format!("malformed MrecApply response: {e}")))
 }
+
+/// Test hook for `tests/mrec_peer_transport.rs` (a separate crate that cannot
+/// name the `pub(crate)` client): build a [`ProdPeerClient`] from `config`'s
+/// own `cluster_settings` and `node_index`'s TLS section, then make one
+/// [`PeerClient::call`]. The shipper (M4) is the production caller.
+///
+/// # Errors
+/// The client could not be built, or the call failed (the text names which).
+#[doc(hidden)]
+pub async fn probe_peer_for_test(
+    config: &ClusterConfig,
+    node_index: usize,
+    to: usize,
+    payload: Vec<u8>,
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
+    let section = config.nodes.get(node_index).and_then(|n| n.tls.as_ref());
+    let material = section
+        .map(|s| s.to_tls_config().load())
+        .transpose()
+        .map_err(|e| format!("tls: {e}"))?;
+    let cfg = Arc::new(MrecConfig::from_cluster(config));
+    // The sender's own gate view: a binary must not emit a class-G request
+    // below the gate (a debug panic), so the probe plays a finalized sender.
+    let features = animus_control::version::ClusterFeatures::new();
+    let mut meta = animus_control::Metadata::default();
+    meta.cluster_version = animus_control::version::Gate::MrecReplication
+        .version()
+        .unwrap_or(1);
+    features.update(&meta);
+    let client = ProdPeerClient::new(cfg, material, section, features)
+    .map_err(|e| format!("client: {e}"))?;
+    client
+        .call(to, payload, timeout)
+        .await
+        .map_err(|e| format!("{e:?}"))
+}

@@ -858,8 +858,19 @@ fn mrec_wire_shapes_are_gated_on_mrec_replication() {
         assert_eq!(fwd.required_gate(), Gate::MrecReplication, "forwarded {n}");
     }
     for (n, r) in &resps {
-        assert_eq!(r.required_gate(), Gate::MrecReplication, "response {n}");
-        assert!(!floor.is_open(r.required_gate()), "response {n}");
+        // A whole-batch `Refused` is `Base`: a node whose own gate is still
+        // closed must be able to say "not yet" (a debug build panics on a
+        // closed-gate emit, found by `mrec_peer_transport`). Per-record
+        // `Answers` need the gate.
+        let want = if matches!(
+            r,
+            ClientResponse::MrecApply(MrecApplyResponse::Refused { .. })
+        ) {
+            Gate::Base
+        } else {
+            Gate::MrecReplication
+        };
+        assert_eq!(r.required_gate(), want, "response {n}");
     }
     // Content-dependent: the same carriers without a replicate stay Base.
     assert_eq!(

@@ -141,15 +141,15 @@ pub(crate) async fn handle_mrec_apply<E: Env, R: RelayClient>(
             false,
         );
     }
+    if !cfg.transport_allowed(ctx.tls.is_some()) {
+        return refused(INSECURE_PEER_REFUSAL, false);
+    }
     if !ctx.edge.version().features.is_open(Gate::MrecReplication) {
         return refused(
             "MREC replication is not enabled on this cluster yet (cluster version below the \
              MrecReplication gate)",
             true,
         );
-    }
-    if !cfg.transport_allowed(ctx.tls.is_some()) {
-        return refused(INSECURE_PEER_REFUSAL, false);
     }
     if cfg.region.is_none() {
         return refused(

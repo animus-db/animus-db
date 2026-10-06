@@ -1389,7 +1389,12 @@ impl ClientResponse {
         match self {
             // ADR 0075 G-d M3: the replication reply, and a batch reply that
             // carries a `Superseded` slot (content-dependent).
-            ClientResponse::MrecApply(_) => Gate::MrecReplication,
+            // A whole-batch `Refused` is the one MrecApply reply a node whose
+            // own gate is still closed must be able to emit (it is how it
+            // says "not yet"); it answers a request only a new binary can
+            // send, so it is `Base`. Per-record answers need the gate open.
+            ClientResponse::MrecApply(MrecApplyResponse::Refused { .. }) => Gate::Base,
+            ClientResponse::MrecApply(MrecApplyResponse::Answers(_)) => Gate::MrecReplication,
             ClientResponse::KindWriteBatchOk { results } => {
                 if results
                     .iter()
