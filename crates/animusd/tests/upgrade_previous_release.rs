@@ -881,22 +881,41 @@ async fn roll_scenario(
             .as_u64()
             .expect("safe_target");
         let leader_admin = c.nodes[leader].admin.to_string();
-        let (ok, out, err) = cli(&refs.cli, &["cluster", "finalize", &leader_admin, "--yes"]).await;
-        assert!(ok, "finalize failed: {out} {err}");
-        poll_until(
-            "every node observes the finalized version",
-            Duration::from_secs(60),
-            || async {
-                for i in 0..n {
-                    let v = c.admin_json(i, "/admin/cluster-version").await;
-                    if v.as_ref().map(|v| &v["active"]) != Some(&json!(target_v)) {
-                        return Err(format!("node {i}: {v:?}"));
+        // The cluster version is raised one step at a time (`cluster finalize`
+        // refuses a skip), so walk `active` up to the safe target, one
+        // finalize per step: the target is this tree's `MAX_SUPPORTED`, which
+        // is above `active + 1` whenever main has bumped the version more than
+        // once since R-1's era (G-d M1 made it 3).
+        let start_v = c
+            .admin_json(leader, "/admin/cluster-version")
+            .await
+            .expect("cluster-version")["active"]
+            .as_u64()
+            .expect("active");
+        for step_to in (start_v + 1)..=target_v {
+            let step_leader = c
+                .control_leader()
+                .await
+                .expect("a control leader before finalize step");
+            let step_admin = c.nodes[step_leader].admin.to_string();
+            let (ok, out, err) =
+                cli(&refs.cli, &["cluster", "finalize", &step_admin, "--yes"]).await;
+            assert!(ok, "finalize to {step_to} failed: {out} {err}");
+            poll_until(
+                "every node observes the finalized version",
+                Duration::from_secs(60),
+                || async {
+                    for i in 0..n {
+                        let v = c.admin_json(i, "/admin/cluster-version").await;
+                        if v.as_ref().map(|v| &v["active"]) != Some(&json!(step_to)) {
+                            return Err(format!("node {i}: {v:?}"));
+                        }
                     }
-                }
-                Ok(())
-            },
-        )
-        .await;
+                    Ok(())
+                },
+            )
+            .await;
+        }
         // Post-era: nothing is left to restart.
         let (_, out, err) = cli(
             &refs.cli,
