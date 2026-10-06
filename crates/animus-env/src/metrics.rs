@@ -1041,12 +1041,29 @@ pub enum Metric {
     /// or a bug). A counter: the shipper re-sends until local time catches up,
     /// so a sustained non-zero rate is the skew alarm. Expected `0`.
     MrecSkewRejectedTotal,
+    // --- MREC shipper (G-d M4) ---
+    /// Rows the shipper delivered to a peer (applied or superseded). A counter.
+    MrecShippedRowsTotal,
+    /// Shipping attempts that failed (transport error, refusal, `Retry`
+    /// answers). A counter; a sustained rate is a peer outage or an operator
+    /// error (see `/admin/global-tables`).
+    MrecShipErrorsTotal,
+    /// A peer fell past the retention cap (or a tablet had no cursor) and the
+    /// shipper started a full resync scan. A counter; expected `0` outside an
+    /// outage longer than `mrec_max_backlog`.
+    MrecResyncTotal,
+    /// Dirty keys the shipper still owed its peers at the end of its last tick
+    /// (a gauge, node-wide sum of the last value per tablet/peer).
+    MrecPendingRecords,
+    /// Age in ms of the oldest unshipped change at the shipper's last tick (a
+    /// gauge; the AWS `ReplicationLatency` analogue, the max over peers).
+    MrecReplicationLagMs,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 127] = [
+    pub const ALL: [Metric; 132] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -1174,6 +1191,11 @@ impl Metric {
         Metric::CpPreferredLeaderTransfers,
         Metric::CpPreferredLeaderTransferRejected,
         Metric::MrecSkewRejectedTotal,
+        Metric::MrecShippedRowsTotal,
+        Metric::MrecShipErrorsTotal,
+        Metric::MrecResyncTotal,
+        Metric::MrecPendingRecords,
+        Metric::MrecReplicationLagMs,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -1310,6 +1332,11 @@ impl Metric {
             Metric::CpPreferredLeaderTransfers => "cp_preferred_leader_transfers",
             Metric::CpPreferredLeaderTransferRejected => "cp_preferred_leader_transfer_rejected",
             Metric::MrecSkewRejectedTotal => "mrec_skew_rejected_total",
+            Metric::MrecShippedRowsTotal => "mrec_shipped_rows_total",
+            Metric::MrecShipErrorsTotal => "mrec_ship_errors_total",
+            Metric::MrecResyncTotal => "mrec_resync_total",
+            Metric::MrecPendingRecords => "mrec_pending_records",
+            Metric::MrecReplicationLagMs => "mrec_replication_lag_ms",
         }
     }
 

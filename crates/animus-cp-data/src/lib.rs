@@ -2309,6 +2309,15 @@ async fn rebuild_txn_tracker<S: StorageEngine>(storage: &S, scope: &StorageScope
 /// [`linearizable_get_served_fast`](RaftKvNode::linearizable_get_served_fast)'s
 /// doc and `animusd::ClientCtx::cp_get_local_resolving`/
 /// `cp_get_local_snapshot`, the two callers that act on this.
+/// The outcome of [`RaftKvNode::local_get_for_ship`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShipGet {
+    /// A committed value, or `None` for no such row.
+    Value(Option<Vec<u8>>),
+    /// A pending intent covers the key; the shipper must retry later.
+    Pending,
+}
+
 enum ResolveStep {
     Value(Option<Vec<u8>>),
     Pending(IntentInfo),
@@ -5881,6 +5890,52 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             ResolveStep::Value(v) => v,
             ResolveStep::Pending(_) | ResolveStep::Foreign(_) => None,
         }
+    }
+
+    /// One base key's **committed** value for the MREC shipper (ADR 0075 G-d M4):
+    /// [`ShipGet::Value`] a committed value (or none), and [`ShipGet::Pending`] the key is covered by a still-`Pending` (or foreign) intent,
+    /// which [`local_get`](Self::local_get) would have silently read as absent
+    /// — the shipper must hold its cursor rather than skip the key.
+    pub async fn local_get_for_ship(&self, key: &[u8]) -> ShipGet {
+        let physical = self.scope.physical(key);
+        let Some(vv) = self.storage.get(&physical).await.ok().flatten() else {
+            return ShipGet::Value(None);
+        };
+        match self.resolve_once_step(&physical, vv, None).await {
+            ResolveStep::Value(v) => ShipGet::Value(v),
+            ResolveStep::Pending(_) | ResolveStep::Foreign(_) => ShipGet::Pending,
+        }
+    }
+
+    /// A key-ordered window of at most `limit` committed base rows from
+    /// `start` (inclusive), for the MREC shipper's scan mode: unlike
+    /// [`local_scan`](Self::local_scan) it **stops at the first row covered by
+    /// a pending intent** instead of silently omitting it, returning that
+    /// row's key as the second element so the shipper can hold its cursor in
+    /// front of it (an aborted transaction leaves no later change record, so
+    /// an omitted row would otherwise never be shipped).
+    pub async fn local_scan_for_ship(
+        &self,
+        start: &[u8],
+        limit: usize,
+    ) -> (Vec<(Vec<u8>, Vec<u8>)>, Option<Vec<u8>>) {
+        let raw = self.raw_base_rows(start, None).await;
+        let mut out = Vec::new();
+        for (key, vv) in raw {
+            if out.len() >= limit {
+                break;
+            }
+            if txn::is_record_key(&key) {
+                continue;
+            }
+            let physical = self.scope.physical(&key);
+            match self.resolve_once_step(&physical, vv, None).await {
+                ResolveStep::Value(Some(v)) => out.push((key, v)),
+                ResolveStep::Value(None) => {}
+                ResolveStep::Pending(_) | ResolveStep::Foreign(_) => return (out, Some(key)),
+            }
+        }
+        (out, None)
     }
 
     // ---- eventually-consistent reads (ADR 0055) --------------------------

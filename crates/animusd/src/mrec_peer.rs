@@ -32,8 +32,8 @@
 //! an index into the configured peer list ([`MrecConfig::peers`]).
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use animus_env::TlsMaterial;
@@ -78,6 +78,10 @@ pub(crate) trait PeerClient: Send + Sync {
 /// traffic.
 pub(crate) const MREC_MAX_INFLIGHT_APPLIES: usize = 64;
 
+/// Default retention cap: a peer cursor older than this is dropped and the
+/// peer resynced by scan (ADR 0075 4.2).
+pub(crate) const DEFAULT_MREC_MAX_BACKLOG: Duration = Duration::from_secs(24 * 3600);
+
 /// The node-local MREC view of `cluster_settings` (static, never replicated;
 /// the same on every node of the cluster). `Default` is "no MREC": no region,
 /// no peers, which makes the receiver refuse every frame.
@@ -94,6 +98,46 @@ pub(crate) struct MrecConfig {
     pub(crate) max_clock_skew_ms: u64,
     /// Receiver concurrency gauge (see [`MREC_MAX_INFLIGHT_APPLIES`]).
     pub(crate) inflight: Arc<AtomicUsize>,
+    /// How far a peer's cursor may lag before the shipper gives up on the log
+    /// and resyncs by scan (ADR 0075 4.2 retention cap; default 24 h).
+    pub(crate) max_backlog: Duration,
+    /// This node's own `tls` section, needed only to derive per-peer client
+    /// connectors (`ProdPeerClient::new`).
+    pub(crate) node_tls: Option<TlsSection>,
+    /// Per-(table, tablet, peer) shipper state, for backoff and the admin view.
+    pub(crate) health: Arc<Mutex<BTreeMap<HealthKey, PeerHealth>>>,
+}
+
+/// `(table, tablet id, peer region)`.
+pub(crate) type HealthKey = (String, u64, String);
+
+/// What this node's shipper last knew about one `(table, tablet, peer)`
+/// (in-memory, node-local, never replicated; reset on restart).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PeerHealth {
+    /// Dirty keys still owed at the end of the last tick.
+    pub(crate) backlog: u64,
+    /// Age in ms of the oldest unshipped change at the last tick.
+    pub(crate) lag_ms: u64,
+    /// Wall-clock ms of the last acknowledged batch.
+    pub(crate) last_ack_wall_ms: Option<u64>,
+    /// A full scan (initial copy or resync) is in progress or pending.
+    pub(crate) scanning: bool,
+    /// The scan is a *resync* (the peer fell past the cap, or the tablet lost
+    /// its cursor) rather than the first copy.
+    pub(crate) needs_resync: bool,
+    /// The last failure, if the last attempt failed.
+    pub(crate) last_error: Option<String>,
+    /// The failure is a configuration/operator error (`Refused` not retryable).
+    pub(crate) operator_error: bool,
+    /// Consecutive failures (drives the backoff).
+    pub(crate) failures: u32,
+    /// Monotonic nanos before which the shipper does not try again.
+    pub(crate) retry_after: u64,
+    /// Rows delivered since this node started.
+    pub(crate) shipped_rows: u64,
+    /// The tablet's work is done (cursor current, nothing pending).
+    pub(crate) caught_up: bool,
 }
 
 impl Default for MrecConfig {
@@ -104,6 +148,9 @@ impl Default for MrecConfig {
             allow_insecure: false,
             max_clock_skew_ms: DEFAULT_MREC_MAX_CLOCK_SKEW_MS,
             inflight: Arc::new(AtomicUsize::new(0)),
+            max_backlog: DEFAULT_MREC_MAX_BACKLOG,
+            node_tls: None,
+            health: Arc::default(),
         }
     }
 }
@@ -122,7 +169,30 @@ impl MrecConfig {
                 .mrec_max_clock_skew_ms
                 .unwrap_or(DEFAULT_MREC_MAX_CLOCK_SKEW_MS),
             inflight: Arc::new(AtomicUsize::new(0)),
+            max_backlog: DEFAULT_MREC_MAX_BACKLOG,
+            node_tls: None,
+            health: Arc::default(),
         }
+    }
+
+    /// Install this node's own `tls` section (see [`Self::node_tls`]).
+    #[must_use]
+    pub(crate) fn with_node_tls(mut self, tls: Option<TlsSection>) -> Self {
+        self.node_tls = tls;
+        self
+    }
+
+    /// Override the retention cap (tests; `cluster_settings` knob is M6).
+    #[must_use]
+    #[allow(dead_code)] // used by the sim tests
+    pub(crate) fn with_max_backlog(mut self, cap: Duration) -> Self {
+        self.max_backlog = cap;
+        self
+    }
+
+    /// Whether any shipping is configured at all (a region and a peer).
+    pub(crate) fn enabled(&self) -> bool {
+        self.region.is_some() && !self.peers.is_empty()
     }
 
     /// The view of a whole cluster config.

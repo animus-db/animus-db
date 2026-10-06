@@ -709,6 +709,27 @@ impl<E: Env> CpGroup<E> {
         }
     }
 
+    /// The MREC shipper's committed point read (see
+    /// [`RaftKvNode::local_get_for_ship`]).
+    pub(crate) async fn local_get_for_ship(&self, key: &[u8]) -> animus_cp_data::ShipGet {
+        match self {
+            CpGroup::Lsm(n) => n.local_get_for_ship(key).await,
+            CpGroup::Mem(n) => n.local_get_for_ship(key).await,
+        }
+    }
+
+    /// The MREC shipper's scan window (see [`RaftKvNode::local_scan_for_ship`]).
+    pub(crate) async fn local_scan_for_ship(
+        &self,
+        start: &[u8],
+        limit: usize,
+    ) -> (Vec<(Vec<u8>, Vec<u8>)>, Option<Vec<u8>>) {
+        match self {
+            CpGroup::Lsm(n) => n.local_scan_for_ship(start, limit).await,
+            CpGroup::Mem(n) => n.local_scan_for_ship(start, limit).await,
+        }
+    }
+
     /// Read one key of a non-base row-kind scope (ADR 0041 §3). See
     /// [`RaftKvNode::local_get_kind`].
     pub(crate) async fn local_get_kind(&self, kind: u8, key: &[u8]) -> Option<Vec<u8>> {
@@ -17139,7 +17160,10 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
     let bound = Node::bind(addrs.id.clone(), addrs, dir)
         .await?
         .with_max_region_rtt(config.max_region_rtt())
-        .with_mrec(crate::mrec_peer::MrecConfig::from_cluster(config));
+        .with_mrec(
+            crate::mrec_peer::MrecConfig::from_cluster(config)
+                .with_node_tls(config.nodes.get(index).and_then(|n| n.tls.clone())),
+        );
     start_bound_node_with_streams_quiesce_and_ttl_sweep_interval(
         bound,
         config,
@@ -17286,7 +17310,10 @@ pub async fn start_bound_node_with_streams_quiesce_and_ttl_sweep_interval(
     // The MREC peer settings (G-d M3): `Node::bind` has no config, so the
     // start half installs them like every other `run_node*` entry point does
     // (`tests/mrec_peer_transport.rs` caught the bound path missing them).
-    let bound = bound.with_mrec(crate::mrec_peer::MrecConfig::from_cluster(config));
+    let bound = bound.with_mrec(
+        crate::mrec_peer::MrecConfig::from_cluster(config)
+            .with_node_tls(config.nodes.get(index).and_then(|n| n.tls.clone())),
+    );
     bound
         .start_with_growth(
             config.peer_book(),
@@ -17528,7 +17555,10 @@ pub async fn run_node_control_with_stores(
     let bound = Node::bind_control(addrs.id.clone(), addrs, dir)
         .await?
         .with_max_region_rtt(config.max_region_rtt())
-        .with_mrec(crate::mrec_peer::MrecConfig::from_cluster(config));
+        .with_mrec(
+            crate::mrec_peer::MrecConfig::from_cluster(config)
+                .with_node_tls(config.nodes.get(index).and_then(|n| n.tls.clone())),
+        );
 
     // Cross-node routing (ADR 0017 #3b / ADR 0013): map every node's id to
     // its client API address, so a data op or a schema-DDL relay landing on
@@ -17754,7 +17784,10 @@ pub async fn run_node_data_with_cluster_settings(
     let bound = Node::bind_data(addrs.id.clone(), addrs, dir)
         .await?
         .with_max_region_rtt(config.max_region_rtt())
-        .with_mrec(crate::mrec_peer::MrecConfig::from_cluster(config));
+        .with_mrec(
+            crate::mrec_peer::MrecConfig::from_cluster(config)
+                .with_node_tls(config.nodes.get(index).and_then(|n| n.tls.clone())),
+        );
 
     // The control deployment's **intra**-cluster addresses (ADR 0047) — the
     // mirror/leader-hint discovery root (ADR 0035 §1/§4; `WatchMetadata` is
@@ -17886,7 +17919,10 @@ pub async fn run_node_growth(
     let bound = Node::bind(addrs.id.clone(), addrs, dir)
         .await?
         .with_max_region_rtt(config.max_region_rtt())
-        .with_mrec(crate::mrec_peer::MrecConfig::from_cluster(config));
+        .with_mrec(
+            crate::mrec_peer::MrecConfig::from_cluster(config)
+                .with_node_tls(config.nodes.get(index).and_then(|n| n.tls.clone())),
+        );
     let mut client_route: BTreeMap<NodeId, String> = BTreeMap::new();
     for (i, addrs) in config.nodes.iter().enumerate() {
         client_route.insert(
