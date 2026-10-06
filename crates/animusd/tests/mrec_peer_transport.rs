@@ -133,10 +133,7 @@ fn pkis(dir: &Path, lone_west: bool) -> [Option<TlsSection>; 2] {
     let (_d2, mut b) = support::tls_pki(&["127.0.0.1"]);
     // Move the PKI files out of the temp dirs (which drop here) into `dir`.
     let place = |s: &mut TlsSection, tag: &str| {
-        for (field, name) in [
-            (&mut s.cert_path, "cert"),
-            (&mut s.key_path, "key"),
-        ] {
+        for (field, name) in [(&mut s.cert_path, "cert"), (&mut s.key_path, "key")] {
             let to = dir.join(format!("{tag}-{name}.pem"));
             std::fs::copy(&*field, &to).expect("copy pem");
             *field = to;

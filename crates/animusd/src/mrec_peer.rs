@@ -288,13 +288,15 @@ pub async fn probe_peer_for_test(
     // The sender's own gate view: a binary must not emit a class-G request
     // below the gate (a debug panic), so the probe plays a finalized sender.
     let features = animus_control::version::ClusterFeatures::new();
-    let mut meta = animus_control::Metadata::default();
-    meta.cluster_version = animus_control::version::Gate::MrecReplication
-        .version()
-        .unwrap_or(1);
+    let meta = animus_control::Metadata {
+        cluster_version: animus_control::version::Gate::MrecReplication
+            .version()
+            .unwrap_or(1),
+        ..Default::default()
+    };
     features.update(&meta);
     let client = ProdPeerClient::new(cfg, material, section, features)
-    .map_err(|e| format!("client: {e}"))?;
+        .map_err(|e| format!("client: {e}"))?;
     client
         .call(to, payload, timeout)
         .await
