@@ -102,6 +102,28 @@ jobs:
           cargo test -p animusd --features chaos --test chaos --locked \
             "${{ steps.pick.outputs.tests }}" -- --nocapture --test-threads=1
 
+      # Surface what failed as annotations, which the checks API serves even
+      # where the job log and the artifact below cannot be downloaded: the
+      # oracle's violations and each node's panic or last log lines.
+      - name: Annotate the failure
+        if: failure()
+        env:
+          OUT: ${{ runner.temp }}/chaos-out
+        run: |
+          esc() { python3 -c 'import sys; d=sys.stdin.read()[-3500:]; print(d.replace("%","%25").replace("\r","%0D").replace("\n","%0A"), end="")'; }
+          shopt -s nullglob globstar
+          for f in "$OUT"/**/violations.txt; do
+            echo "::error title=chaos violations ($(basename "$(dirname "$f")"))::$(head -n 60 "$f" | esc)"
+          done
+          n=0
+          for f in "$OUT"/**/*.log; do
+            [ "$n" -lt 6 ] || break
+            if grep -q -m1 'panicked at' "$f"; then
+              echo "::error title=chaos node panic ($(basename "$f"))::$(grep -m1 -A20 'panicked at' "$f" | esc)"
+              n=$((n + 1))
+            fi
+          done
+
       # A failure leaves history.json, events.txt, op-trace.txt, violations.txt
       # and every node's log here (written by the harness only on failure).
       - name: Upload failure artifacts
