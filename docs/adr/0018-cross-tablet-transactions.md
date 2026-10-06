@@ -4152,3 +4152,20 @@ passed both ways). `animus-test`'s `txn_serializable.rs` gained an
 `lsm_compaction_abandon_prepare` failed before the fix with exactly the chaos
 finding ("lost acknowledged append ... absent from final state"). Envelope
 decode/round-trip and fixture tests in `txn.rs` and `format_fixture_tests.rs`.
+
+## Amendment 2026-10-06 — the stale-restage guard is durable state (issue #1243)
+
+`TxnStage`'s rejection of a stage for an already-resolved `(key, txn_id)`
+(the issue #298 shape A seatbelt) was decided from `TxnTracker::
+recently_resolved`, process memory that a restart, an `InstallSnapshot` or its
+4096-entry cap emptied — so one committed entry applied differently per
+replica, and the apply-time read-modify-write arms then diverged permanently.
+It is replaced by a **durable resolved marker**: `TxnResolve`'s apply writes
+`txn::resolved_marker_key(key)` (`token || [0x00, 0x04] || key`, value
+`[0xA1] || txn_id`, format `txn-resolved-marker` v1, ADR 0073 inventory) for
+every key it resolves, in the same merge batch, and `TxnStage`'s apply reads
+it. One row per key, overwritten by the next resolve there; a duplicate stage
+of T arriving after a *later* transaction resolved the same key is not caught,
+but that residual is now identical on every replica. No command or wire format
+changed. Regression: `animus-cp-data` `tests/it/resolved_restage_replica_
+determinism.rs` (restart and snapshot-install variants over several seeds).

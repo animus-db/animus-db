@@ -51,6 +51,7 @@ mod reconfigure_healthy_drop;
 mod reconfigure_multi_replica_diff;
 mod reconfigure_trigger;
 mod release_race_corpus;
+mod resolved_restage_replica_determinism;
 mod restart_after_install_snapshot;
 mod restart_caught_up_voter;
 mod seal_marker_halted_gate;
