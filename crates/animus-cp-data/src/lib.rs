@@ -9509,6 +9509,57 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // foreign-transaction block (`blocked_by`) — see
                 // `docs/lessons/` for the regression this closed.
                 flush_pending(storage, &mut pending, metrics, halted).await;
+                // Replay stability (issue #1242). WAL recovery re-applies this
+                // group's log tail from `snapshot_index` over an engine that
+                // already holds the effects of entries past it (a
+                // `kill -9` restart: the engine is durable per call, the
+                // replay start is the last compaction). Every decision below
+                // reads engine state, so on that replay it sees state from
+                // the *future* of this entry and can decide differently than
+                // the live apply did: a stage the live apply rejected (a
+                // stale/duplicate stage caught by a resolved marker, a stage
+                // blocked by a since-resolved foreign intent) is accepted,
+                // and its merge lands on every key that has no later write —
+                // an intent resurrected on this replica only, which then
+                // blocks every later stage touching that key here (the
+                // acknowledged transaction's other key silently never
+                // applies on this replica). Entries apply in strictly
+                // increasing `ts` order, so a row or resolved marker at one
+                // of this stage's own keys with a version strictly above this
+                // entry's proves a later entry already ran: this entry has
+                // been applied (or rejected) in full already and replays as a
+                // no-op, exactly as the live apply left it. Equal is NOT
+                // ahead: it is this very entry's own (possibly partial,
+                // crash-interrupted) intent merge, which re-applies normally.
+                // Never true on the live path (no row can carry a version
+                // above the entry being applied), so replicas that did not
+                // restart behave exactly as before.
+                let stage_version = hlc::pack(ts);
+                let mut engine_ahead = false;
+                'ahead: for w in &writes {
+                    for physical in [
+                        scope.physical(&w.key),
+                        scope.physical(&txn::resolved_marker_key(&w.key)),
+                    ] {
+                        if storage
+                            .get(&physical)
+                            .await
+                            .expect("raftkv txn stage replay-ahead read")
+                            .is_some_and(|vv| vv.version > stage_version)
+                        {
+                            engine_ahead = true;
+                            break 'ahead;
+                        }
+                    }
+                }
+                if engine_ahead {
+                    tracing::debug!(
+                        ?txn_id,
+                        ?record_key,
+                        "raftkv: TxnStage replayed over an engine already ahead of it (a later \
+                         entry wrote one of its keys) — no-op, as the live apply left it"
+                    );
+                }
                 // ADR 0018 §2/PR5 resurrection guard: PR4's prepare phase
                 // is concurrent, so the anchor's own `TxnStage` (this
                 // entry, when `is_anchor`) can arrive **after** a recovery
@@ -9660,6 +9711,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         && w.pending.as_ref().is_none_or(|p| pending_base_key_matches(&w.key, p))
                 });
                 let all_in_fence = !already_decided
+                    && !engine_ahead
                     && !resurrection_attempt
                     && blocked_by.is_none()
                     && kind_tokens_ok
@@ -9962,7 +10014,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // (`IntentBlocked`) both pre-empt ever evaluating this
                 // stage's own conditions, so they take priority over
                 // `ConditionFailed` here too.
-                let outcome = if already_decided {
+                let outcome = if already_decided || engine_ahead {
                     txn::StageOutcome::Fenced
                 } else if let Some((
                     blocked_key,
