@@ -1249,3 +1249,11 @@ with a routable, TLS-trusting path and a global table, and `kind` cannot run in
 the sandbox this was built in); **none of the rendering, mounts, NetworkPolicy
 or condition has been exercised against a real Kubernetes API server**, only
 unit tests of the builders and the reconciler over fakes.
+
+**Open security residual (issue #1253, predates G-e).** The bundled `tls.ca_path`
+trusts a peer region's CA on the whole intra port, which also serves `Forwarded`
+client requests, not only `MrecApply`. So a node holding a peer-CA certificate can
+send forwarded reads and writes to any table, bypassing the DynamoDB port's SigV4
+and table policies. G-d M3 already bundled both CAs; G-e only wires that existing
+design into the operator. The fix (per-connection trust class, or a separate
+peer-replication listener with its own CA store) is tracked there.
