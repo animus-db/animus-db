@@ -4202,10 +4202,8 @@ no-op (`StageOutcome::Fenced`, nobody waits on a replayed entry). Strictly
 above, not at-or-above: an equal version is this entry's own, possibly
 crash-interrupted, merge and re-applies normally. Regression:
 `animus-cp-data` `tests/it/txn_stage_replay_stability.rs` (two constructed
-shapes plus a seeded schedule corpus, `ANIMUS_TXN_REPLAY_SEEDS`). **Not fixed
-here:** `KindEval`/`KindEvalBatch` re-decide from engine state on replay, and
-their derived rows (change-log, LSI, footprint) are on unique keys that per-key
-LWW does not protect (issue #1247). `KindBatch`/`Batch` make no engine-state
-decision. At cluster version
+shapes plus a seeded schedule corpus, `ANIMUS_TXN_REPLAY_SEEDS`). `KindEval`/`KindEvalBatch`, which re-decide from engine state
+on replay too, are fixed separately (issue #1247, ADR 0054's 2026-10-06
+amendment). `KindBatch`/`Batch` make no engine-state decision. At cluster version
 1 (marker withheld from `InstallSnapshot` images) a snapshot-installed replica
 still has the #1243 residual.
