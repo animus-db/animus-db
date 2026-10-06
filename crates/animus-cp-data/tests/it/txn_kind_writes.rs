@@ -859,6 +859,7 @@ fn schema_with_lsi() -> WriteSchema {
             projection: Projection::All,
         }],
         change_records_carry_images: true,
+        mrec: None,
     }
 }
 

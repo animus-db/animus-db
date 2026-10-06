@@ -98,6 +98,7 @@ fn schema_no_index() -> WriteSchema {
         key: TableSchema::simple("pk"),
         lsis: Vec::new(),
         change_records_carry_images: false,
+        mrec: None,
     }
 }
 

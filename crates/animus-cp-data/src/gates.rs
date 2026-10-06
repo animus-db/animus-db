@@ -3,11 +3,13 @@
 //! the send/propose sites share.
 //!
 //! Both are **exhaustive matches with no `_` arm**: a new variant does not
-//! compile until it names its gate. Every variant that exists today is
-//! [`Gate::Base`] (cluster version 1: Phase 1 and B2 emit exactly these), so
-//! every check below is trivially satisfied today; the point is that a future
-//! variant is forced to decide, and that every emit site already routes
-//! through [`ClusterFeatures::check`].
+//! compile until it names its gate. Every variant is [`Gate::Base`] (cluster
+//! version 1: Phase 1 and B2 emit exactly these) **except** that the evaluated
+//! writes (`KindEval`, `KindEvalBatch`, a `TxnStage`'s pending writes) are
+//! [`Gate::MrecReplication`] when they carry MREC content (`WriteSchema.mrec`,
+//! `KindEvalOp::Replicate`; ADR 0075, G-01 stage G-d): the gate is
+//! content-dependent because an older voter silently ignores an unknown JSON
+//! field. Every emit site routes through [`ClusterFeatures::check`].
 //!
 //! **Send sites check the envelope only, never the entries.** An
 //! `AppendEntries`' commands are gated where they are *created* (the propose
@@ -19,28 +21,49 @@
 
 use animus_control::version::{ClusterFeatures, Gate, GateSurface, GatedCommand};
 
-use crate::{KvCommand, KvWire};
+use crate::{KindEvalOp, KvCommand, KvWire};
 
 impl GatedCommand for KvCommand {
     fn required_gate(&self) -> Gate {
         match self {
+            // ADR 0075 (G-01 stage G-d): an entry that carries MREC content
+            // (`WriteSchema.mrec`, `KindEvalOp::Replicate`) is
+            // `Gate::MrecReplication`; the same variants without it stay
+            // `Base`, so every ordinary table's write is unchanged. An older
+            // voter silently ignores the unknown `mrec` field (serde) or fails
+            // to decode the op, so the gate is the only thing that protects it.
+            KvCommand::KindEval { schema, op, .. } => eval_gate(schema, op),
+            KvCommand::KindEvalBatch { entries, .. } => entries
+                .iter()
+                .fold(Gate::Base, |g, e| g.join(eval_gate(&e.schema, &e.op))),
+            KvCommand::TxnStage { writes, .. } => writes
+                .iter()
+                .filter_map(|w| w.pending.as_ref())
+                .fold(Gate::Base, |g, p| g.join(eval_gate(&p.schema, &p.op))),
             KvCommand::Put { .. }
             | KvCommand::Batch { .. }
             | KvCommand::KindBatch { .. }
-            | KvCommand::KindEval { .. }
-            | KvCommand::KindEvalBatch { .. }
             | KvCommand::SeedBatch { .. }
             | KvCommand::Delete { .. }
             | KvCommand::Cas { .. }
             | KvCommand::Freeze { .. }
             | KvCommand::SplitTablet { .. }
             | KvCommand::ReadCeiling { .. }
-            | KvCommand::TxnStage { .. }
             | KvCommand::TxnCommit { .. }
             | KvCommand::TxnAbort { .. }
             | KvCommand::TxnResolve { .. }
             | KvCommand::NoOp => Gate::Base,
         }
+    }
+}
+
+/// The gate one evaluated write needs: `MrecReplication` when it carries MREC
+/// content, `Base` otherwise.
+fn eval_gate(schema: &animus_item::WriteSchema, op: &KindEvalOp) -> Gate {
+    if schema.mrec.is_some() || matches!(op, KindEvalOp::Replicate { .. }) {
+        Gate::MrecReplication
+    } else {
+        Gate::Base
     }
 }
 
@@ -199,6 +222,150 @@ mod tests {
             target: 2,
         };
         assert_eq!(append(vec![era]).required_gate(), Gate::Era);
+    }
+
+    fn mrec_schema(mrec: bool) -> animus_item::WriteSchema {
+        animus_item::WriteSchema {
+            key: animus_item::TableSchema::simple("pk"),
+            lsis: Vec::new(),
+            change_records_carry_images: false,
+            mrec: mrec.then_some(animus_item::MrecWriteStamp {
+                region_id: 1,
+                wall_ms: 2,
+            }),
+        }
+    }
+
+    fn kind_eval(mrec: bool, op: KindEvalOp) -> KvCommand {
+        KvCommand::KindEval {
+            schema: mrec_schema(mrec),
+            pk: animus_item::AttributeValue::S("a".into()),
+            sk: None,
+            op,
+            condition: None,
+            ttl_expired: false,
+            ts: crate::hlc::HlcTimestamp {
+                wall_ms: 1,
+                logical: 0,
+            },
+        }
+    }
+
+    /// ADR 0075 G-d, per-gate test: MREC content is `MrecReplication`, the same
+    /// variants without it stay `Base`, in every carrier (`KindEval`,
+    /// `KindEvalBatch`, a `TxnStage` pending write), and the propose-site
+    /// predicate agrees with the gate being open or closed.
+    #[test]
+    fn mrec_content_needs_the_mrec_gate_in_every_carrier() {
+        let ver = animus_item::MrecVersion::ZERO;
+        let item = animus_item::Item::new();
+        let replicate = KindEvalOp::Replicate {
+            item: Some(item.clone()),
+            ver,
+        };
+        assert_eq!(
+            kind_eval(false, KindEvalOp::Put(item.clone())).required_gate(),
+            Gate::Base
+        );
+        assert_eq!(
+            kind_eval(true, KindEvalOp::Put(item.clone())).required_gate(),
+            Gate::MrecReplication
+        );
+        assert_eq!(
+            kind_eval(false, replicate.clone()).required_gate(),
+            Gate::MrecReplication
+        );
+        let entry = |mrec: bool, op: KindEvalOp| crate::KindEvalEntry {
+            schema: mrec_schema(mrec),
+            pk: animus_item::AttributeValue::S("a".into()),
+            sk: None,
+            op,
+            condition: None,
+            ttl_expired: false,
+        };
+        let ts = crate::hlc::HlcTimestamp {
+            wall_ms: 1,
+            logical: 0,
+        };
+        let batch = |entries| KvCommand::KindEvalBatch { entries, ts };
+        assert_eq!(batch(vec![]).required_gate(), Gate::Base);
+        assert_eq!(
+            batch(vec![entry(false, KindEvalOp::Delete)]).required_gate(),
+            Gate::Base
+        );
+        assert_eq!(
+            batch(vec![
+                entry(false, KindEvalOp::Delete),
+                entry(false, replicate.clone())
+            ])
+            .required_gate(),
+            Gate::MrecReplication,
+            "one MREC entry gates the whole batch"
+        );
+        let stage = |mrec: bool| KvCommand::TxnStage {
+            txn_id: crate::txn::TxnId {
+                ts,
+                node: animus_env::nid(1),
+            },
+            record_key: Vec::new(),
+            record_table: "t".into(),
+            is_anchor: true,
+            writes: vec![crate::txn::TxnWrite::pending_eval(
+                b"k".to_vec(),
+                None,
+                crate::PendingTxnWrite {
+                    schema: mrec_schema(mrec),
+                    pk: animus_item::AttributeValue::S("a".into()),
+                    sk: None,
+                    op: KindEvalOp::Delete,
+                    condition: None,
+                    ttl_expired: false,
+                },
+            )],
+            spans: Vec::new(),
+            conditions: Vec::new(),
+            ts,
+        };
+        assert_eq!(stage(false).required_gate(), Gate::Base);
+        assert_eq!(stage(true).required_gate(), Gate::MrecReplication);
+        // Propose-site predicate: closed at the floor, open at version 3. The
+        // gate-closed path itself is `check`'s `debug_assert`, so the closed
+        // side is asserted through `is_open`, never by calling `check_propose`.
+        let floor = ClusterFeatures::new();
+        assert!(!floor.is_open(Gate::MrecReplication));
+        assert!(check_propose(&floor, &kind_eval(false, KindEvalOp::Delete)));
+        let open = ClusterFeatures::new();
+        let m3 = animus_control::Metadata {
+            cluster_version: 3,
+            ..Default::default()
+        };
+        open.update(&m3);
+        assert!(open.is_open(Gate::MrecReplication));
+        assert!(check_propose(&open, &kind_eval(true, replicate)));
+    }
+
+    /// A `Replicate` that reaches apply on a table whose entry carries no
+    /// `mrec` context (it cannot through a correct proposer) is a
+    /// deterministic rejection that writes nothing, never a panic or a
+    /// versioned row on a non-MREC table.
+    #[test]
+    fn replicate_without_mrec_context_is_a_deterministic_rejection() {
+        let op = KindEvalOp::Replicate {
+            item: Some(animus_item::Item::new()),
+            ver: animus_item::MrecVersion::ZERO,
+        };
+        let decision = crate::evaluate_kind_eval(
+            &mrec_schema(false),
+            &animus_item::AttributeValue::S("a".into()),
+            None,
+            &[0u8; 8],
+            None,
+            None,
+            &op,
+            None,
+            false,
+        );
+        assert!(matches!(decision, crate::KindEvalDecision::Rejected { .. }));
     }
 
     #[test]
