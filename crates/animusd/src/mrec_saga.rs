@@ -544,7 +544,23 @@ pub(crate) async fn drop_deleting_cursors<E: Env>(
     group: &crate::CpGroup<E>,
     region: &str,
 ) {
-    let _ = clear_peer_cursors(group, region).await;
+    let start = group.scope_range().start;
+    let mut present = false;
+    for tag in [
+        crate::mrec_shipper::cursor_tag(region),
+        crate::mrec_shipper::scan_tag(region),
+    ] {
+        present |= group
+            .local_get_kind(
+                animus_cp_data::KIND_CURSOR,
+                &animus_cp_data::cursor::cursor_key(&start, &tag),
+            )
+            .await
+            .is_some();
+    }
+    if present {
+        let _ = clear_peer_cursors(group, region).await;
+    }
 }
 
 // ---------------------------------------------------------------------------

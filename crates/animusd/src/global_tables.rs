@@ -28,7 +28,7 @@
 
 use std::collections::BTreeSet;
 
-use animus_control::schema::{GlobalTableSpec, MultiRegionConsistency};
+use animus_control::schema::{GlobalTableSpec, MrecReplicaStatus, MultiRegionConsistency};
 use animus_control::version::Gate;
 use animus_control::{IndexKind, MetaCommand, Metadata, NodeStatus};
 use animus_dynamo::global::{GlobalTableDescription, GlobalTableUpdate, RegionStatus};
@@ -55,6 +55,9 @@ const EMPTY_CHECK_PAGE: usize = 64;
 /// `Replicas` (AWS-style); the witness is listed apart.
 #[must_use]
 pub(crate) fn global_description(meta: &Metadata, table: &str) -> Option<GlobalTableDescription> {
+    if let Some(spec) = meta.table_global(table).filter(|g| g.is_mrec()) {
+        return mrec_description(spec);
+    }
     let spec = meta.table_global(table).filter(|g| g.is_mrsc())?;
     let ready = meta.table_ready_regions(table);
     let status = |region: &String| {
@@ -73,6 +76,32 @@ pub(crate) fn global_description(meta: &Metadata, table: &str) -> Option<GlobalT
             .collect(),
         witness: spec.witness.as_ref().map(|r| (r.clone(), status(r))),
         eventual: false,
+    })
+}
+
+/// The `DescribeTable` global fields of an MREC table: every replica with its
+/// stored status (the local Region included, AWS-style). A table whose only
+/// replica is the local one (every peer deleted) is standalone again.
+fn mrec_description(spec: &GlobalTableSpec) -> Option<GlobalTableDescription> {
+    if spec.replicas.iter().all(|r| r.local) {
+        return None;
+    }
+    Some(GlobalTableDescription {
+        replicas: spec
+            .replicas
+            .iter()
+            .map(|r| {
+                let status = match r.status {
+                    MrecReplicaStatus::Creating => RegionStatus::Creating,
+                    MrecReplicaStatus::Active => RegionStatus::Active,
+                    MrecReplicaStatus::Deleting => RegionStatus::Deleting,
+                    MrecReplicaStatus::CreationFailed => RegionStatus::CreationFailed,
+                };
+                (r.region.clone(), status)
+            })
+            .collect(),
+        witness: None,
+        eventual: true,
     })
 }
 
@@ -163,6 +192,20 @@ pub(crate) async fn update_table_global<E: Env, R: RelayClient>(
     table: &str,
     update: GlobalTableUpdate,
 ) -> Result<String, WireError> {
+    // ADR 0075 G-d M4b: an eventually consistent request (the AWS default) on a
+    // table that is not strongly consistent takes the MREC path when its gate
+    // is open; with the gate closed it falls through to the old rejection.
+    if update.is_eventual() && crate::mrec_saga::mrec_gate_open(ctx) {
+        let meta = ctx.metadata_fresh().await;
+        if !meta.has_table_schema(table) {
+            return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
+                table.to_owned(),
+            )));
+        }
+        if !meta.table_global(table).is_some_and(|g| g.is_mrsc()) {
+            return crate::mrec_saga::update_table_mrec(ctx, &meta, table, &update).await;
+        }
+    }
     // 1. The gate (the emit-site check; see the module doc). A closed verdict
     // first re-reads this node's applied view, since the feeder runs on a tick
     // and a finalize this node already applied may not have reached the handle.

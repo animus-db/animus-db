@@ -723,6 +723,15 @@ pub(crate) async fn mrec_ship_table<E: Env, R: RelayClient>(
         if !ours || !group.is_leader() {
             continue;
         }
+        if let Some(spec) = meta.table_global(table) {
+            for r in spec
+                .replicas
+                .iter()
+                .filter(|r| !r.local && r.status == MrecReplicaStatus::Deleting)
+            {
+                crate::mrec_saga::drop_deleting_cursors(&group, &r.region).await;
+            }
+        }
         let one = mrec_ship_tick(ctx, &meta, table, tablet, &group, client).await;
         if one != ShipOutcome::Idle && outcome != ShipOutcome::Waiting {
             outcome = one;
@@ -809,6 +818,7 @@ pub(crate) async fn mrec_ship_loop(ctx: ClientCtx) {
         }
         let Some(c) = client.as_ref() else { continue };
         for t in &tables {
+            let _ = crate::mrec_saga::mrec_saga_table(&ctx, t, c).await;
             let _ = mrec_ship_table(&ctx, t, c).await;
         }
     }

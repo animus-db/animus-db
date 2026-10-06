@@ -163,6 +163,10 @@ pub(crate) async fn handle_mrec_apply<E: Env, R: RelayClient>(
             false,
         );
     }
+    // A lifecycle message (ADR 0075 section 5.1) rather than a record batch.
+    if let Some(control) = req.control {
+        return crate::mrec_saga::handle_control(ctx, &req.from_region, &req.table, control).await;
+    }
     // Shed, never queue (see the module doc's overload section).
     let inflight = cfg.inflight.fetch_add(1, Ordering::AcqRel) + 1;
     let _guard = InflightGuard(&cfg.inflight);
