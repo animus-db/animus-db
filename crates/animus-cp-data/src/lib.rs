@@ -5278,6 +5278,20 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         self.lock().peer_match(node)
     }
 
+    /// The leader's view of a peer's health (issue #1228): the last
+    /// `check_pending` it reported on an `AppendEntriesResp` (`Some(true)` for
+    /// a storage-full follower's frozen ack), and when that ack arrived. Both
+    /// `None` until the peer has acked this leadership stint. Diagnostic: the
+    /// corpus uses it to prove a full follower keeps acking.
+    #[must_use]
+    pub fn peer_health(&self, node: &NodeId) -> (Option<bool>, Option<animus_env::Nanos>) {
+        let c = self.lock();
+        (
+            c.peer_check_pending(node),
+            c.peer_last_contact(node.clone()),
+        )
+    }
+
     /// Arm a leadership transfer to `target` (see
     /// [`RaftCore::transfer_leadership`]) and, if armed, wake the driver loop so
     /// the resulting `TimeoutNow` ships at once instead of waiting for the next
@@ -7323,7 +7337,22 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 let first = c
                     .first_term_index()
                     .expect("a leader has a first-term index");
-                (c.commit_index() >= first).then(|| (c.term(), c.commit_index()))
+                // Issue #1228: a storage-full leader can hold a commit index
+                // its own WAL never reached (a healthy follower's ack plus its
+                // own un-persisted append make a "majority"), and applies only
+                // what it has made durable, so waiting for the engine to reach
+                // `commit_index` would never finish. Every write ever
+                // *acknowledged* is applied, hence durable, so the ReadIndex
+                // that must be covered is the durable prefix of the commit:
+                // `min(commit, durable)`. (A leader holds every previously
+                // committed entry durably -- its election's own persist round
+                // covered them -- so nothing acked sits past `durable`.)
+                let covered = if self.is_storage_full() {
+                    c.commit_index().min(c.durable_index())
+                } else {
+                    c.commit_index()
+                };
+                (covered >= first).then(|| (c.term(), covered))
             };
             if let Some(state) = captured {
                 break state;

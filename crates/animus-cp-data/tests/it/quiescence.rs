@@ -326,6 +326,80 @@ fn a_storage_full_quiesced_leader_hands_leadership_to_a_healthy_replica() {
     }
 }
 
+// ---- (ix) every replica full: the quiesced leader stays up and serves -----
+
+/// Issue #1228: with EVERY replica's disk full, a group that was quiescent keeps
+/// its established leader (no healthy successor exists, so the step-down does
+/// not fire), is held awake by the storage-full quiesce veto (a parked group
+/// would have no timer left to notice space returning), serves linearizable
+/// and eventual reads of what it already held, and settles back into
+/// quiescence once space returns.
+#[test]
+fn a_quiesced_group_whose_every_disk_fills_keeps_its_leader_and_serves_reads() {
+    for seed in seeds(0xF1DE_A11F) {
+        let (mut sim, nodes, _handles) = group(seed);
+        sim.run_for(Duration::from_secs(2));
+        let first = leader_index(&nodes, seed);
+        assert!(matches!(
+            nodes[first].put(b"held".to_vec(), b"v".to_vec()),
+            ProposeResult::Accepted { .. }
+        ));
+        settle_to_quiescence(&mut sim);
+        let leader = leader_index(&nodes, seed);
+        let term = nodes[leader].term();
+        assert!(nodes[leader].is_quiesced(), "seed={seed}");
+
+        let mut cfg = DiskConfig::default();
+        cfg.set_enospc_prob(1.0);
+        sim.set_disk_config(cfg);
+        // The write that wakes the leader is the first thing to hit ENOSPC.
+        let _ = nodes[leader].put(b"poke".to_vec(), b"x".to_vec());
+        sim.run_for(Duration::from_secs(4));
+
+        for (i, n) in nodes.iter().enumerate() {
+            assert!(
+                n.is_storage_full(),
+                "node {i} never entered StorageFull (vacuous, seed={seed})"
+            );
+            assert!(
+                !n.is_quiesced(),
+                "a storage-full replica must not park (seed={seed}, node {i})"
+            );
+        }
+        assert_eq!(
+            leader_index(&nodes, seed),
+            leader,
+            "the leader moved with no healthy successor (seed={seed})"
+        );
+        assert_eq!(nodes[leader].term(), term, "seed={seed}");
+        assert_eq!(
+            lin_read(&mut sim, &nodes[leader], b"held", Duration::from_secs(3)),
+            Some(b"v".to_vec()),
+            "linearizable read not served by the full leader (seed={seed})"
+        );
+        for (i, n) in nodes.iter().enumerate() {
+            assert!(n.stale_read_ready(), "node {i} (seed={seed})");
+            assert_eq!(
+                block_on(n.stale_get_served(b"held")),
+                Some(Some(b"v".to_vec())),
+                "eventual read not served on node {i} (seed={seed})"
+            );
+        }
+
+        // Space returns: every replica recovers in place and the group parks again.
+        sim.set_disk_config(DiskConfig::default());
+        sim.run_for(Duration::from_secs(12));
+        for (i, n) in nodes.iter().enumerate() {
+            assert!(!n.is_storage_full(), "node {i} (seed={seed})");
+        }
+        let _ = leader_index(&nodes, seed);
+        assert!(
+            nodes.iter().all(|n| n.is_quiesced()),
+            "the group never re-quiesced after space returned (seed={seed})"
+        );
+    }
+}
+
 // ---- (iv) a linearizable read is served without un-quiescing --------------
 
 #[test]
