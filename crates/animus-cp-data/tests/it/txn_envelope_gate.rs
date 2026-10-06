@@ -76,8 +76,10 @@ fn follower_intent_tag_after_snapshot(
         .iter()
         .map(|&id| {
             let features = ClusterFeatures::new();
-            let mut meta = Metadata::default();
-            meta.cluster_version = cluster_version;
+            let meta = Metadata {
+                cluster_version,
+                ..Metadata::default()
+            };
             features.update(&meta);
             RaftKvNode::start_hosted_with_options(
                 sim.env(nid(id)),
