@@ -8307,6 +8307,31 @@ enum KindEvalDecision {
     Rejected { code: String, message: String },
 }
 
+/// Test-only negative-control switch for the G-d MREC corpus (ADR 0075 section
+/// 4.9, `animusd`'s `sim_world_mrec_corpus`): `true` makes a replicated record
+/// apply by arrival order (last delivered wins) instead of last-writer-wins on
+/// the stamp, proving the corpus oracle detects a broken LWW rule. A
+/// thread-local, so it scopes to one simulated test (`SimEnv` runs on the
+/// calling thread); it is always `false` in production (never set outside the
+/// corpus's own negative control).
+#[doc(hidden)]
+pub mod mrec_test_switch {
+    use std::cell::Cell;
+
+    thread_local! {
+        static LWW_BY_ARRIVAL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Arm (`true`) or disarm the arrival-order apply for this thread.
+    pub fn set_lww_by_arrival(on: bool) {
+        LWW_BY_ARRIVAL.with(|c| c.set(on));
+    }
+
+    pub(crate) fn lww_by_arrival() -> bool {
+        LWW_BY_ARRIVAL.with(Cell::get)
+    }
+}
+
 /// The pure evaluation core of [`KvCommand::KindEval`]'s apply arm (ADR
 /// 0054 step 2): given the schema slice the entry carries, the item's
 /// identity, its OWN partition token (`token_prefix`), the current item
@@ -8341,7 +8366,7 @@ fn evaluate_kind_eval(
                 message: "MREC replicate on a table that is not an MREC global table".to_owned(),
             };
         }
-        if !ver.supersedes(stored_ver) {
+        if !ver.supersedes(stored_ver) && !mrec_test_switch::lww_by_arrival() {
             return KindEvalDecision::Superseded { current: old };
         }
         return kind_eval_applied(

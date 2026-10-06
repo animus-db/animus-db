@@ -132,6 +132,55 @@ fn now_ms<E: Env>(env: &E) -> u64 {
     env.now().0 / 1_000_000
 }
 
+/// Test-only negative-control switches for `sim_world_mrec_corpus` (ADR 0075
+/// section 4.9): each disables one safety mechanism so the corpus can prove its
+/// oracle notices. Thread-locals (`SimEnv` runs on the calling thread); always
+/// off outside tests, and compiled out of production builds.
+pub(crate) mod neg {
+    #[cfg(test)]
+    use std::cell::Cell;
+
+    #[cfg(test)]
+    thread_local! {
+        static SHIP_FOREIGN: Cell<bool> = const { Cell::new(false) };
+        static ADVANCE_BEFORE_ACK: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Loop prevention off: rows another region originated are shipped too.
+    #[cfg(test)]
+    pub(crate) fn set_ship_foreign(on: bool) {
+        SHIP_FOREIGN.with(|c| c.set(on));
+    }
+
+    /// The cursor advances even when the peer did not acknowledge the batch.
+    #[cfg(test)]
+    pub(crate) fn set_advance_before_ack(on: bool) {
+        ADVANCE_BEFORE_ACK.with(|c| c.set(on));
+    }
+
+    pub(super) fn ship_foreign() -> bool {
+        #[cfg(test)]
+        {
+            SHIP_FOREIGN.with(Cell::get)
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    pub(super) fn advance_before_ack() -> bool {
+        #[cfg(test)]
+        {
+            ADVANCE_BEFORE_ACK.with(Cell::get)
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+}
+
 /// Classify one stored base row for shipping: `None` = never ship it (a row
 /// another region originated, an unversioned tombstone, a keyless tombstone).
 fn row_to_record(
@@ -142,7 +191,7 @@ fn row_to_record(
     let (item, ver) = animus_item::decode_stored_item_versioned(value).ok()?;
     match (item, ver) {
         (Some(item), Some(v)) => {
-            if v.region_id != local_id {
+            if v.region_id != local_id && !neg::ship_foreign() {
                 return None;
             }
             record_from_item(schema, item, v)
@@ -157,7 +206,7 @@ fn row_to_record(
             record_from_item(schema, item, v)
         }
         (None, Some(v)) => {
-            if v.region_id != local_id {
+            if v.region_id != local_id && !neg::ship_foreign() {
                 return None;
             }
             let (pk, sk) = animus_item::decode_tombstone_key(value)?;
@@ -657,6 +706,7 @@ async fn log_step<E: Env, R: RelayClient>(
     let n = records.len() as u64;
     if !records.is_empty()
         && let Err((m, op)) = send_batch(ctx, client, peer_idx, table, records).await
+        && !neg::advance_before_ack()
     {
         fail(ctx, key, m, op);
         return ShipOutcome::Waiting;

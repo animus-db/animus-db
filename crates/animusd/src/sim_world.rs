@@ -386,9 +386,28 @@ impl SimWorld {
     /// `n` clusters of `nodes` nodes each (RF `replication`), seeds derived
     /// from `seed`, clocks aligned before returning.
     pub(crate) fn new(seed: u64, n: usize, nodes: usize, replication: usize) -> Self {
+        Self::build(seed, n, nodes, replication, false)
+    }
+
+    /// [`SimWorld::new`] with every member cluster on the retained-disk
+    /// `LsmEngine` backend, so a node restart keeps its state (the corpus's
+    /// crash/restart cells; a `Memory` restart is a disk wipe).
+    pub(crate) fn new_lsm(seed: u64, n: usize, nodes: usize, replication: usize) -> Self {
+        Self::build(seed, n, nodes, replication, true)
+    }
+
+    fn build(seed: u64, n: usize, nodes: usize, replication: usize, lsm: bool) -> Self {
         let mut mix = seed ^ 0xA11C_E000_0000_0000;
         let clusters: Vec<SimCluster> = (0..n)
-            .map(|_| SimCluster::new(splitmix(&mut mix), nodes, replication))
+            .map(|_| {
+                let s = splitmix(&mut mix);
+                if lsm {
+                    let roles = vec![crate::config::NodeRole::Both; nodes];
+                    SimCluster::new_with_lsm_engines(s, &roles, replication, None)
+                } else {
+                    SimCluster::new(s, nodes, replication)
+                }
+            })
             .collect();
         let bridge = PeerBridge::new(splitmix(&mut mix), DEFAULT_QUANTUM);
         let mut world = SimWorld {
@@ -425,6 +444,11 @@ impl SimWorld {
                 .max(self.now.0),
         );
         self.advance_all(self.now);
+    }
+
+    /// Virtual milliseconds since the world began.
+    pub(crate) fn now_ms(&self) -> u64 {
+        self.now.0 / 1_000_000
     }
 
     pub(crate) fn bridge(&self) -> &PeerBridge {
