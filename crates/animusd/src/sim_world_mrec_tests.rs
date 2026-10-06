@@ -255,6 +255,7 @@ fn request(records: Vec<MrecRecord>) -> MrecApplyRequest {
         from_region: "a".into(),
         table: TABLE.into(),
         records,
+        control: None,
     }
 }
 

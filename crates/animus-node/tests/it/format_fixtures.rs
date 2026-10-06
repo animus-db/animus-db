@@ -767,6 +767,7 @@ fn mrec_messages() -> MrecMessages {
                         rec(Some(item()), 1_700_000_000_123),
                         rec(None, 1_700_000_000_456),
                     ],
+                    control: None,
                 }),
             ),
             (
@@ -995,4 +996,93 @@ fn generate_fixture_client_frame_mrec() {
         path.display()
     );
     std::fs::write(&path, encode_mrec()).expect("write");
+}
+
+fn mrec_control_messages() -> Vec<(&'static str, ClientRequest)> {
+    let frame = |control| {
+        ClientRequest::MrecApply(MrecApplyRequest {
+            proto: MREC_PROTO,
+            from_region: "eu".into(),
+            table: "orders".into(),
+            records: Vec::new(),
+            control: Some(control),
+        })
+    };
+    vec![
+        (
+            "CreateReplica",
+            frame(animus_node::MrecControl::CreateReplica {
+                create_table: "{\"TableName\":\"orders\"}".into(),
+                ttl_attribute: Some("expires".into()),
+                peers: vec!["ap".into()],
+            }),
+        ),
+        ("Leave", frame(animus_node::MrecControl::Leave)),
+        (
+            "AddPeer",
+            frame(animus_node::MrecControl::AddPeer {
+                region: "ap".into(),
+            }),
+        ),
+    ]
+}
+
+fn encode_mrec_control() -> Vec<u8> {
+    let mut out = Vec::new();
+    for (_, r) in mrec_control_messages() {
+        out.extend(encode_client_frame(&r).expect("encodes"));
+    }
+    out.extend(
+        encode_client_frame(&ClientResponse::MrecApply(MrecApplyResponse::Done)).expect("encodes"),
+    );
+    out
+}
+
+/// G-d M4: the replica-lifecycle messages ride the existing class-G
+/// `MrecApply` frame (additive `control` field): same gate, same surface, and a
+/// frame written by an M3 binary (no `control`) still decodes.
+#[test]
+fn mrec_control_frames_are_byte_identical_to_the_fixture_and_gated() {
+    let fixture = std::fs::read(fixtures_dir().join("v1-mrec-control.bin"))
+        .expect("v1-mrec-control.bin is checked in");
+    assert_eq!(encode_mrec_control(), fixture, "control frames drifted");
+    let frames = split_frames(&fixture);
+    let msgs = mrec_control_messages();
+    assert_eq!(frames.len(), msgs.len() + 1);
+    for ((name, want), frame) in msgs.iter().zip(&frames) {
+        let got: ClientRequest = decode_client_frame(frame).expect("decodes");
+        assert_eq!(
+            encode_client_frame(&got).unwrap(),
+            encode_client_frame(want).unwrap(),
+            "{name}"
+        );
+        assert_eq!(want.required_gate(), Gate::MrecReplication, "{name}");
+        assert_eq!(surface_of(want), Surface::Intra, "{name}");
+    }
+    let done = ClientResponse::MrecApply(MrecApplyResponse::Done);
+    assert_eq!(done.required_gate(), Gate::MrecReplication);
+    let got: ClientResponse = decode_client_frame(frames.last().unwrap()).expect("decodes");
+    assert_eq!(got, done);
+    // Backward compatible: the plain-batch frame carries no `control` key.
+    let (reqs, _) = mrec_messages();
+    let ClientRequest::MrecApply(plain) = &reqs[0].1 else {
+        panic!("first MREC request is MrecApply")
+    };
+    assert!(
+        !serde_json::to_string(plain).unwrap().contains("control"),
+        "an absent control stays off the wire"
+    );
+}
+
+/// Refuses to overwrite: run once.
+#[test]
+#[ignore = "fixture generator; run explicitly, never regenerates an existing fixture"]
+fn generate_fixture_client_frame_mrec_control() {
+    let path = fixtures_dir().join("v1-mrec-control.bin");
+    assert!(
+        std::fs::metadata(&path).is_err(),
+        "{} already exists; a checked-in fixture is never regenerated in place",
+        path.display()
+    );
+    std::fs::write(&path, encode_mrec_control()).expect("write");
 }

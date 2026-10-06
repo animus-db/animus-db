@@ -241,6 +241,33 @@ pub struct MrecApplyRequest {
     pub from_region: String,
     pub table: String,
     pub records: Vec<MrecRecord>,
+    /// A replica-lifecycle message instead of a record batch (G-d M4; `records`
+    /// is then empty and ignored). Additive: absent on every pre-M4 frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<MrecControl>,
+}
+
+/// The replica-lifecycle messages one cluster sends a peer (the create/delete
+/// saga, ADR 0075 4.3/5.1), carried by [`MrecApplyRequest::control`]. Answered
+/// with [`MrecApplyResponse::Done`] or [`MrecApplyResponse::Refused`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MrecControl {
+    /// Create the receiving cluster's replica of `table` (idempotent): a
+    /// `CreateTable` body (DynamoDB JSON) for the table, an optional TTL
+    /// attribute, and the other regions of the replica set (the sender
+    /// excluded) the receiver must also replicate with.
+    CreateReplica {
+        create_table: String,
+        ttl_attribute: Option<String>,
+        peers: Vec<String>,
+    },
+    /// The sender removed the receiving cluster from its replica set (and
+    /// asks the receiver to drop the sender from its own). The receiver's
+    /// table survives as a standalone one.
+    Leave,
+    /// The sender added `region` to the replica set; the receiver adds it too
+    /// (full mesh, ADR 0075 D8).
+    AddPeer { region: String },
 }
 
 /// The receiver's per-record verdict (same order as the request's `records`).
@@ -264,6 +291,8 @@ pub enum MrecAnswer {
 pub enum MrecApplyResponse {
     /// One answer per request record, in order.
     Answers(Vec<MrecAnswer>),
+    /// A [`MrecControl`] message was carried out (idempotent).
+    Done,
     /// The whole batch was refused before any record was looked at (gate
     /// closed, unknown peer, table not an MREC table or not replicated with
     /// the sender, an insecure link, unknown `proto`). `retryable` says
@@ -1395,7 +1424,9 @@ impl ClientResponse {
             // says "not yet"); it answers a request only a new binary can
             // send, so it is `Base`. Per-record answers need the gate open.
             ClientResponse::MrecApply(MrecApplyResponse::Refused { .. }) => Gate::Base,
-            ClientResponse::MrecApply(MrecApplyResponse::Answers(_)) => Gate::MrecReplication,
+            ClientResponse::MrecApply(
+                MrecApplyResponse::Answers(_) | MrecApplyResponse::Done,
+            ) => Gate::MrecReplication,
             ClientResponse::KindWriteBatchOk { results } => {
                 if results
                     .iter()

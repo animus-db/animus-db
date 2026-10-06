@@ -48,6 +48,6 @@ pub use sigv4_gate::sigv4_gate;
 pub use sim_relay::{RELAY_STREAM, SimRelayClient};
 pub use wire::{
     ClientRequest, ClientResponse, KindWriteBatchItem, KindWriteItemReply, KindWriteOp, MREC_PROTO,
-    MrecAnswer, MrecApplyRequest, MrecApplyResponse, MrecRecord, PendingKindWrite, Surface,
+    MrecAnswer, MrecApplyRequest, MrecControl, MrecApplyResponse, MrecRecord, PendingKindWrite, Surface,
     TxnPrecondition, TxnTableWrite, TxnWriteCondition, is_relayable_command, surface_of,
 };

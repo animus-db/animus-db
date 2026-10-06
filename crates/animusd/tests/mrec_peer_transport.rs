@@ -168,6 +168,7 @@ fn request() -> Vec<u8> {
         from_region: "east".into(),
         table: "t".into(),
         records: vec![],
+        control: None,
     })
     .unwrap()
 }
