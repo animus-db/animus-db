@@ -108,6 +108,7 @@ name = "animus-cp-data"
 version = "0.1.0-alpha.0"
 dependencies = [
  "animus-control",
+ "animus-cp-data",
  "animus-env",
  "animus-item",
  "animus-placement",

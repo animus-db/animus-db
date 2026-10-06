@@ -71,3 +71,7 @@ per-key LWW on the base row protects none of them. Extra rules it taught:
   (absent or tombstoned) pays the tombstone-aware scan.
 
 Regression: `tests/it/kind_eval_replay_stability.rs`.
+
+Follow-up, issue #1251: the same corpus at cluster version 1 found a snapshot
+path that dropped the resolved markers; see
+`2026-10-06-a-gated-snapshot-omission-is-a-replica-divergence.md`.

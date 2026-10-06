@@ -47,6 +47,10 @@ pub(crate) const SETTLE: Duration = Duration::from_secs(2);
 pub(crate) const BASE_SEED: u64 = 0x1242_0001;
 /// Seeds whose schedule diverged on `origin/main` before the fix.
 pub(crate) const KNOWN_FAILING_SEEDS: [u64; 1] = [2_882_513_034];
+/// Seeds whose schedule diverged at cluster version 1 on `origin/main`
+/// before the snapshot-marker fix (issue #1251): a replica caught up by an
+/// `InstallSnapshot` lacked the resolved markers the other replicas held.
+pub(crate) const KNOWN_FAILING_SEEDS_V1: [u64; 1] = [2_882_520_953];
 
 pub(crate) fn key(pk: &[u8]) -> Vec<u8> {
     let mut out = partition_token(pk).to_vec();
@@ -75,12 +79,18 @@ pub(crate) fn voters() -> Vec<animus_env::NodeId> {
     (0..3u64).map(nid).collect()
 }
 
-pub(crate) fn start_node(sim: &Simulator, id: u64, engine: MemoryEngine) -> KvNode {
+pub(crate) fn start_node(
+    sim: &Simulator,
+    id: u64,
+    engine: MemoryEngine,
+    cluster_version: u32,
+) -> KvNode {
     let features = ClusterFeatures::new();
     features.update(&Metadata {
-        // 2: the resolved-marker gate is open (markers ship in snapshots), so
-        // this test isolates replay stability from the snapshot-at-v1 residual.
-        cluster_version: 2,
+        // 1: `Gate::GlobalTables` closed (N-1 replicas may exist, so
+        // `engine_image` ships markers through the ignorable wire kind);
+        // 2: open (markers ship as base rows). Apply is identical either way.
+        cluster_version,
         ..Metadata::default()
     });
     RaftKvNode::start_hosted_with_options(
@@ -102,14 +112,19 @@ pub(crate) struct Cluster {
     pub(crate) nodes: Vec<KvNode>,
     pub(crate) up: [bool; 3],
     pub(crate) seed: u64,
+    pub(crate) version: u32,
 }
 
 impl Cluster {
     pub(crate) fn new(seed: u64) -> Self {
+        Self::new_at(seed, 2)
+    }
+
+    pub(crate) fn new_at(seed: u64, version: u32) -> Self {
         let mut sim = Simulator::new(seed);
         let engines: Vec<MemoryEngine> = (0..3).map(|_| MemoryEngine::new()).collect();
         let nodes = (0..3u64)
-            .map(|i| start_node(&sim, i, engines[i as usize].clone()))
+            .map(|i| start_node(&sim, i, engines[i as usize].clone(), version))
             .collect();
         sim.run_for(Duration::from_secs(2));
         Cluster {
@@ -118,6 +133,7 @@ impl Cluster {
             nodes,
             up: [true; 3],
             seed,
+            version,
         }
     }
 
@@ -189,7 +205,7 @@ impl Cluster {
     /// tail over an engine that already holds all of it.
     pub(crate) fn restart_fresh(&mut self, i: usize) {
         self.sim.stop(nid(i as u64));
-        self.nodes[i] = start_node(&self.sim, i as u64, self.engines[i].clone());
+        self.nodes[i] = start_node(&self.sim, i as u64, self.engines[i].clone(), self.version);
         self.up[i] = true;
         self.sim.run_for(Duration::from_secs(2));
     }
@@ -204,9 +220,21 @@ impl Cluster {
                     .unwrap()
                     .into_iter()
                     .find(|(pk, _)| pk.len() == k.len() + 1 && pk.ends_with(k))
-                    .map(|(_, vv)| (vv.version, vv.value))
+                    .map(|(_, vv)| (vv.version, self.v1_form(vv.value)))
             })
             .collect()
+    }
+
+    /// Below `Gate::GlobalTables` a snapshot sender ships every v2 intent as
+    /// its v1 form (#1237): an installed replica legitimately holds the same
+    /// intent in the v1 encoding, so a version-1 cluster compares in that form
+    /// and only a real divergence (a missing/extra/different row) shows.
+    fn v1_form(&self, value: Vec<u8>) -> Vec<u8> {
+        if self.version < 2 {
+            animus_cp_data::downgrade_txn_envelope_to_v1(&value).unwrap_or(value)
+        } else {
+            value
+        }
     }
 
     /// Every replica's whole raw keyspace INCLUDING tombstones, the txn anchor
@@ -220,6 +248,9 @@ impl Cluster {
                 // Per-replica progress cursors (`cp_applied`, `cp_hlc_hwm`)
                 // legitimately differ in timing; everything else must match.
                 rows.retain(|(k, _, _)| !k.starts_with(b"__animus_system"));
+                for (_, v, _) in &mut rows {
+                    *v = v.take().map(|b| self.v1_form(b));
+                }
                 rows
             })
             .collect()
@@ -401,8 +432,8 @@ impl Rng {
     }
 }
 
-fn run_schedule(seed: u64) {
-    let mut c = Cluster::new(seed);
+fn run_schedule(seed: u64, version: u32) {
+    let mut c = Cluster::new_at(seed, version);
     let keys: Vec<Vec<u8>> = (0..3).map(|i| key(format!("k{i}").as_bytes())).collect();
     let rk = key(b"anchor-elsewhere");
     let mut rng = Rng(seed | 1);
@@ -526,6 +557,34 @@ fn txn_replay_corpus() {
             .collect()
     };
     for seed in seeds {
-        run_schedule(seed);
+        run_schedule(seed, 2);
+    }
+}
+
+/// The same schedule corpus at cluster version 1 (`Gate::GlobalTables`
+/// closed: every unfinalized cluster, fresh ones included). Snapshot images
+/// must still carry the resolved markers (issue #1251), so a replica caught
+/// up by `InstallSnapshot` decides a stale re-stage exactly as its peers do.
+#[test]
+fn txn_replay_corpus_at_cluster_version_1() {
+    let seeds: Vec<u64> = if let Some(s) = std::env::var("ANIMUS_SEED")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        vec![s]
+    } else {
+        let k = std::env::var("ANIMUS_TXN_REPLAY_SEEDS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(2)
+            .max(1);
+        KNOWN_FAILING_SEEDS_V1
+            .iter()
+            .copied()
+            .chain((0..k).map(|i| BASE_SEED + i * 7919))
+            .collect()
+    };
+    for seed in seeds {
+        run_schedule(seed, 1);
     }
 }
