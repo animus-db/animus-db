@@ -1371,7 +1371,11 @@ safe because the persist path and the engine/apply path (#1218) now recover
 instead of panicking. Nemeses: `DiskFull` (100% ENOSPC on every replica), `LeaderDiskFull`
 (100% on the current leader's node only, via the per-node
 `Simulator::set_disk_config_for` override that `heal_all` resets per node) and
-`DiskFlaky` (30% per op). `disk_full_cells()` (8 cells; early/mid window x 3/5
+`DiskFlaky` (30% per op). The all-full cells (#1228,
+`raftkv_disk_full_all_replicas_*`, `check_all_full_keeps_serving`) assert stable
+leadership, reads served on every replica, StorageFull writes and per-sample ack
+freshness on the leader's own clock (`peer_health`); a trace-event bound catches
+an ack/resend spin. `disk_full_cells()` (8 cells; early/mid window x 3/5
 replicas) runs a `DISK_FULL_WINDOW` (3.5 s) window and asserts linearizability
 (no acked write lost or duplicated), progress after the window with no restart,
 and seed determinism (`raftkv_disk_full_corpus_is_linearizable`,

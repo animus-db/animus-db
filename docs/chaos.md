@@ -135,9 +135,12 @@ recorded workload, and a ballast file that fills a mount to ENOSPC.
    several keys (a full tablet leader hands leadership over, #1219), a read
    through the full node is served; then the ballast is deleted and the node
    must report `storage_full: false` and accept a write with no restart.
-2. **Every node full.** Fill all three. Asserts at least one write is refused
-   with a named 503 `StorageFull` and `overload_storage_full` moved. Reads are
-   sampled and reported, **not** asserted (F-1).
+2. **Every node full.** Fill all three. Loops until every node has refused a
+   write, then asserts a named 503 `StorageFull` on every node (promptly,
+   under 30 s), `overload_storage_full` moved, and eventual and consistent
+   reads of an already-written key are served on every node (4 of 4 each).
+   `ANIMUS_CHAOS_KEEP=1` dumps each node's `raftkv-n*.json` and
+   `metrics-n*.json` at the end of this phase for diagnosis.
 3. **Recovery.** Delete every ballast. Asserts `storage_full` clears on every
    node, a write is acknowledged through each node, and every process kept its
    pid (no restart). Then the usual final reads and oracles, a `panicked at`
@@ -154,7 +157,7 @@ for the kernel's ENOSPC, not for every filesystem's timing of it.
 
 **Findings (first runs, seed 283777889631356264, 2026-10-05):**
 
-- **F-1: reads are not reliably served while every node's disk is full.** An
+- **F-1 (resolved, #1228): reads are not reliably served while every node's disk is full.** An
   eventually-consistent `GetItem` of an already-written key timed out on every
   node in two of three runs (0 of 12 served), and was served in the third. A full
   follower acks nothing, not even a bare heartbeat (`docs/resource-bounds.md`
@@ -224,14 +227,16 @@ for the kernel's ENOSPC, not for every filesystem's timing of it.
   (`txn_decide_anchor`). Regression:
   `split_tablet::a_txn_decision_ordered_after_the_fork_is_a_sealed_no_op`
   (red before: the frozen parent's record flipped to `Committed`).
-- **F-3: with every disk full, "some probe saw the 503" is a race, so it is
+- **F-3 (resolved, #1228): with every disk full, "some probe saw the 503" is a race, so it is
   measured, not asserted.** All-full means every follower acks nothing and
   each group loses its leader within about a second (F-1), after which a write
   times out instead of returning a 503 (observed with and without the 2PC
   clients, ~1 run in 3). The refusal path stays asserted without the race: the
   single-full-node phase requires the 503 strictly and `overload_storage_full`
   must increment on some node. Fixing F-1 itself (a full node must keep acking
-  heartbeats so leaders survive) is a separate product change.
+  heartbeats so leaders survive) was done in #1228, and the refusal and the reads
+  are asserted in phase 2 again (see `docs/resource-bounds.md`, "Every replica
+  full"). Verified 6 of 6 `chaos_disk_full` and 3 of 3 `chaos_smoke` runs.
 
 ### Faults not implemented, and why
 

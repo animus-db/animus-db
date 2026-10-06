@@ -3274,6 +3274,27 @@ The RaftKV codec (wire/image/WAL), segment codec, backup chunk/manifest codecs, 
   calls with `RaftNode::features()`. A hosted group keeps the handle it started with.
 
 
+## StorageFull with every replica full (issue #1228)
+
+A suspect-WAL node ships frozen acks (`is_frozen_ack`: success acks at or below
+the frozen durable index, heartbeats) next to the `ships_before_durable`
+allowlist, so followers stay in contact and the leader keeps its seat. Reads on
+a full leader: `read_serve_ts` serves linearizable reads at the engine's highest
+version once the ceiling lapses (no unproposable ceilings), and `read_barrier`
+targets the leader's first-term entry instead of `commit_index` (the engine may
+be paused short of it). `stale_read_ready` for a full replica needs only
+`had_leader_contact` and no half-installed snapshot. Leader death with every
+replica full is not repaired until space returns (ADR 0074 amendment). G-01
+preferred-leader transfer goes through `transfer_leadership`, so it inherits the
+refuse-full-target and healthy-quorum guards, and the storage-full step-down
+wins over preference. `peer_health` is a diagnostic on the node's own clock
+(the sim has per-node clock skew; never compare it with another node's `now`).
+Tests: `animus-control` `storage_full_step_down`, `animus-test`
+`raftkv_disk_full_all_replicas_*`, `quiescence` (ix), `animusd`
+`sim_cluster_dynamo_disk_full`, `chaos_disk_full` phase 2. The `first`-based
+ReadIndex is exercised only by real-process chaos (no sim cell produces an
+engine behind commit while all are full) and is not mutation-guarded.
+
 ## StorageFull: per-tablet WAL recovery (R-01 (d), issue #1185)
 
 `persist_wal` no longer `assert!`s on an ENOSPC append/sync (per-group file or

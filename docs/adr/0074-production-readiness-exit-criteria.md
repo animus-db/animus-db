@@ -351,14 +351,18 @@ What changed (no wire or persisted-format change; ADR 0073 needs no gate):
   every acknowledged write is at or below the floor, and any future write on any
   leader is minted above everything that leader applied or witnessed, so it can
   never land below a read served here. The barrier's ReadIndex for a full leader
-  is `min(commit, durable)` (everything acknowledged is applied, hence durable;
-  a leader holds all previously committed entries durably, its election's own
-  persist round having covered them).
-- **The eventual-read gate no longer needs a *current* leader for a full
-  replica that has had one** (`has_had_leader_contact`): the engine clause still
-  requires the replica to hold everything it knows to be committed, and the
-  "never initialised" protection the leader clause exists for is unchanged for a
-  process that has never heard a leader.
+  is its first-term entry (its election no-op), not the commit index: its
+  engine can never reach a commit index its apply is paused short of, but every
+  earlier-term acknowledged write is at or below that entry (which the barrier
+  confirms committed) and every own-term acknowledged write was applied before
+  its ack, so the engine at serving time holds them all.
+- **The eventual-read gate no longer needs a current leader, nor a fully
+  caught-up engine, for a full replica that has had one**
+  (`had_leader_contact`, sticky for the process's life): a paused apply stops
+  between entries, so its engine is an in-order prefix of the log, which is what
+  an eventual read promises. The one excluded state is mid-`InstallSnapshot`
+  (`engine_applied < snapshot_index`), and the "never initialised" protection is
+  unchanged for a process that has never heard a leader.
 
 **Decision: a leader that dies while every replica is full is not replaced.**
 Allowing a full node to win an election (and merely refuse writes) was

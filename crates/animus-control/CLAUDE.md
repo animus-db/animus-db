@@ -3193,6 +3193,18 @@ hands it to a `write_image` closure that must write a **fresh file**). Only on
 success does it `mark_durable_through`, `complete_all_drained` and clear the
 flag; ENOSPC on the rewrite keeps probing, any other error stays a hard failure.
 No persisted-format change. `RaftNode::is_storage_full()` feeds `/admin/health`.
+Issue #1228 (full follower / all-full group): a full follower keeps acking, but
+`handle_append_entries` clamps the success `match_index` to `durable_index` when
+`storage_full` (and `log_truncate` lowers `durable_index`), so commit can never
+advance on an ack for entries it did not persist; `cannot_vote_yet()` includes
+`storage_full`, so every ack carries `check_pending = true`. The leader's
+step-down and `transfer_leadership` need a *healthy quorum*
+(`healthy_followers(now)`: acked `check_pending == false` within one election
+timeout) and never target a `check_pending` peer, so a full leader does not hand
+off to a full node or ping-pong. `handle_append_resp` skips the immediate resend
+for an ack that made no progress while `check_pending` (a zero-latency
+ack/resend spin otherwise; guarded by the trace-event bound in the corpus).
+`had_leader_contact` is sticky (never cleared) and feeds the eventual-read gate.
 `SharedWal` has a `needs_rewrite` flag armed ONLY by an ENOSPC append/sync
 failure; while armed `Append` is refused (StorageFull error) until a `Compact`
 succeeds, so a healthy sibling tablet cannot stack bytes after a suspect tail.

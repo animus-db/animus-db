@@ -261,14 +261,17 @@ healthy-quorum step-down described above, plus two read-path changes:
    cover per proposal); a storage-full leader cannot commit a new one. Once the
    ceiling lapses it serves at the highest version its engine holds
    (`RaftKvNode::read_serve_ts`), after the usual ReadIndex barrier whose index
-   is `min(commit, durable)`: every acknowledged write is at or below that
-   floor and every later write, on any leader, is minted above anything it
+   for a full leader is its first-term entry (the engine may be paused short of
+   the commit index and never reach it): every acknowledged write is at or below
+   that floor and every later write, on any leader, is minted above anything it
    applied or witnessed. It does not propose ceilings (they could never commit,
    and each would grow the in-memory log and stall the read a full
    `READ_TIMEOUT`).
 2. **Eventual reads without a current leader.** `stale_read_ready` accepts a
    storage-full replica that has had leader contact in this process's life even
-   when it currently knows no leader (the engine clause still applies). A full
+   when it currently knows no leader, and even with its apply paused (its engine
+   is then an in-order prefix of the log; only a half-installed snapshot is
+   excluded). A full
    node never campaigns, so after the leader's death nothing would otherwise
    re-establish the "knows a leader" condition.
 3. **Leader death while every replica is full.** Not replaced: electing needs a
