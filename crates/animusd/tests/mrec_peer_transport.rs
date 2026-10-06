@@ -11,11 +11,14 @@
 //! accept unless `allow_insecure_peers`, and the receiver handler is reached
 //! (a decoded `MrecApplyResponse`, never a transport error).
 //!
-//! What it does not: applying data. Converting a table to MREC in a real
-//! cluster needs the replica-create saga (M4), so the receiver answers
-//! `Refused { retryable: true }` ("not enabled yet" / "not an MREC global
-//! table"); LWW/skew/routing semantics are covered over `SimWorld`
-//! (`sim_world_mrec_tests.rs`). The full real-process two-cluster apply is M6.
+//! The last test (`two_real_clusters_replicate_a_table_both_ways_over_mutual_tls`,
+//! G-d M6) is the end-to-end one: it finalizes both clusters to the MREC
+//! gate, creates a table over the DynamoDB wire on east, issues
+//! `UpdateTable ReplicaUpdates Create west`, and polls until a write on each
+//! side is readable on the other, every WAN byte crossing the mutual-TLS intra
+//! port. LWW/skew/routing/fault semantics are covered over `SimWorld`
+//! (`sim_world_mrec_*`); this proves the real sockets, the TLS peer client and
+//! the shipper/saga loops under `ProdEnv`.
 //!
 //! **Real time/sockets (the `ProdEnv` edge)**, like every `animusd`
 //! integration test.
@@ -257,6 +260,242 @@ async fn plaintext_peers_are_refused_unless_allow_insecure_peers() {
         .await
         .expect("insecure peers allowed");
     assert_reached(&decode(&bytes));
+    east.node.shutdown_graceful().await;
+    west.node.shutdown_graceful().await;
+}
+
+// ---- G-d M6: the real-process two-cluster apply ----------------------------
+
+/// One HTTP/1.1 request over a server-only TLS connection (the dynamo and
+/// admin ports); `(status, body)`. Same shape as `tls_e2e.rs`'s helper.
+async fn tls_http(
+    ca_path: &Path,
+    addr: std::net::SocketAddr,
+    head: &str,
+    body: &str,
+) -> (u16, String) {
+    use rustls_pki_types::pem::PemObject;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let bytes = std::fs::read(ca_path).expect("read ca");
+    let mut roots = rustls::RootCertStore::empty();
+    for c in rustls_pki_types::CertificateDer::pem_slice_iter(&bytes) {
+        roots.add(c.expect("ca cert")).expect("add ca");
+    }
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let cfg = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(cfg));
+    let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let name = animus_env::tls::server_name_for(&addr.to_string()).expect("server name");
+    let mut stream = connector.connect(name, tcp).await.expect("tls handshake");
+    let req = format!(
+        "{head}\r\nHost: x\r\nConnection: close\r\nContent-Type: application/x-amz-json-1.0\r\n\
+         Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(req.as_bytes()).await.expect("write");
+    let mut buf = Vec::new();
+    let _ = stream.read_to_end(&mut buf).await; // no close_notify from this edge
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    let body = text.split_once("\r\n\r\n").map_or("", |(_, b)| b);
+    (status, body.to_owned())
+}
+
+struct Wire<'a> {
+    side: &'a Side,
+}
+
+impl Wire<'_> {
+    fn ca(&self) -> std::path::PathBuf {
+        self.side.config.nodes[0]
+            .tls
+            .as_ref()
+            .and_then(|t| t.ca_path.clone())
+            .expect("tls ca")
+    }
+    async fn dynamo(&self, op: &str, body: &str) -> (u16, String) {
+        tls_http(
+            &self.ca(),
+            self.side.node.dynamo_addr(),
+            &format!("POST / HTTP/1.1\r\nX-Amz-Target: DynamoDB_20120810.{op}"),
+            body,
+        )
+        .await
+    }
+    async fn admin_post(&self, path: &str, body: &str) -> (u16, String) {
+        tls_http(
+            &self.ca(),
+            self.side.config.nodes[0].admin,
+            &format!("POST {path} HTTP/1.1"),
+            body,
+        )
+        .await
+    }
+    async fn admin_get(&self, path: &str) -> (u16, String) {
+        tls_http(
+            &self.ca(),
+            self.side.config.nodes[0].admin,
+            &format!("GET {path} HTTP/1.1"),
+            "",
+        )
+        .await
+    }
+    async fn get(&self, table: &str, k: &str) -> Option<String> {
+        let (st, b) = self
+            .dynamo(
+                "GetItem",
+                &format!(r#"{{"TableName":"{table}","Key":{{"pk":{{"S":"{k}"}}}},"ConsistentRead":true}}"#),
+            )
+            .await;
+        if st != 200 {
+            return None;
+        }
+        let v: serde_json::Value = serde_json::from_str(&b).ok()?;
+        v["Item"]["v"]["S"].as_str().map(str::to_owned)
+    }
+    async fn put(&self, table: &str, k: &str, v: &str) {
+        let (st, b) = self
+            .dynamo(
+                "PutItem",
+                &format!(
+                    r#"{{"TableName":"{table}","Item":{{"pk":{{"S":"{k}"}},"v":{{"S":"{v}"}}}}}}"#
+                ),
+            )
+            .await;
+        assert_eq!(st, 200, "PutItem {k}: {b}");
+    }
+}
+
+/// Poll `f` until it yields `Some`, or panic with `what` after `secs`.
+async fn converge<T, F, Fut>(what: &str, secs: u64, mut f: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        if let Some(v) = f().await {
+            return v;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for: {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn two_real_clusters_replicate_a_table_both_ways_over_mutual_tls() {
+    use animus_control::version::Gate;
+    let dir = support::panic_safe_tempdir();
+    let (east, west) = two_clusters(dir.path(), pkis(dir.path(), false), [false, false]).await;
+    let (we, ww) = (Wire { side: &east }, Wire { side: &west });
+
+    // Open the MREC gate on each cluster: wait for the era, then finalize 1 -> 2 -> 3.
+    for (w, name) in [(&we, "east"), (&ww, "west")] {
+        converge(&format!("{name}: version era"), 60, || async {
+            w.side.node.features().era_active().then_some(())
+        })
+        .await;
+        for (from, to) in [(1, 2), (2, 3)] {
+            converge(&format!("{name}: finalize to {to}"), 60, || async {
+                let (st, _) = w
+                    .admin_post(
+                        "/admin/cluster-version/finalize",
+                        &format!(r#"{{"to":{to},"expected":{from}}}"#),
+                    )
+                    .await;
+                (st == 200).then_some(())
+            })
+            .await;
+        }
+        converge(&format!("{name}: MrecReplication gate"), 60, || async {
+            w.side
+                .node
+                .features()
+                .is_open(Gate::MrecReplication)
+                .then_some(())
+        })
+        .await;
+    }
+
+    let table = "mrec_real";
+    let create = format!(
+        r#"{{"TableName":"{table}","KeySchema":[{{"AttributeName":"pk","KeyType":"HASH"}}],"AttributeDefinitions":[{{"AttributeName":"pk","AttributeType":"S"}}]}}"#
+    );
+    converge("east CreateTable", 60, || async {
+        (we.dynamo("CreateTable", &create).await.0 == 200).then_some(())
+    })
+    .await;
+    // Pre-existing rows must be copied by the initial scan.
+    converge("east pre-existing put", 60, || async {
+        let (st, _) = we
+            .dynamo(
+                "PutItem",
+                &format!(
+                    r#"{{"TableName":"{table}","Item":{{"pk":{{"S":"pre"}},"v":{{"S":"old"}}}}}}"#
+                ),
+            )
+            .await;
+        (st == 200).then_some(())
+    })
+    .await;
+
+    let (st, body) = we
+        .dynamo(
+            "UpdateTable",
+            &format!(r#"{{"TableName":"{table}","ReplicaUpdates":[{{"Create":{{"RegionName":"west"}}}}]}}"#),
+        )
+        .await;
+    assert_eq!(st, 200, "UpdateTable Create west: {body}");
+
+    // The saga creates the peer table, copies, and both sides go ACTIVE.
+    converge("the pre-existing row reached west", 120, || async {
+        (ww.get(table, "pre").await.as_deref() == Some("old")).then_some(())
+    })
+    .await;
+    converge("both replicas ACTIVE on east", 120, || async {
+        let (_, b) = we
+            .dynamo("DescribeTable", &format!(r#"{{"TableName":"{table}"}}"#))
+            .await;
+        let v: serde_json::Value = serde_json::from_str(&b).ok()?;
+        let reps = v["Table"]["Replicas"].as_array()?;
+        (reps.len() == 2 && reps.iter().all(|r| r["ReplicaStatus"] == "ACTIVE")).then_some(())
+    })
+    .await;
+
+    // Steady state, both directions.
+    we.put(table, "from-east", "e").await;
+    ww.put(table, "from-west", "w").await;
+    converge("east's write on west", 60, || async {
+        (ww.get(table, "from-east").await.as_deref() == Some("e")).then_some(())
+    })
+    .await;
+    converge("west's write on east", 60, || async {
+        (we.get(table, "from-west").await.as_deref() == Some("w")).then_some(())
+    })
+    .await;
+
+    // The operator view names the MREC table, its replicas and the shipper.
+    let (st, body) = we.admin_get("/admin/global-tables").await;
+    assert_eq!(st, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let t = v["tables"]
+        .as_array()
+        .and_then(|a| a.iter().find(|t| t["table"] == table))
+        .unwrap_or_else(|| panic!("no MREC row: {body}"));
+    assert_eq!(t["consistency"], "EVENTUAL", "{body}");
+    assert_eq!(t["replica_status"]["west"], "ACTIVE", "{body}");
+
     east.node.shutdown_graceful().await;
     west.node.shutdown_graceful().await;
 }
