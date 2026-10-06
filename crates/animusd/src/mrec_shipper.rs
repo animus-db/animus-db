@@ -15,6 +15,21 @@
 //! receiver's stream sees *coalesced* states (a key written twice between two
 //! ticks ships once); AWS Streams make no cross-item guarantee either.
 //!
+//! # Split lineage (plan risk R1): unfiltered scan, deliberately
+//!
+//! `trim_split_child` drops a child's whole CHANGE and CURSOR scopes, so a split
+//! child has no cursor and starts a **full scan of its own current rows** (its
+//! range only), then resumes the log. That is always correct (every row of the
+//! child ships; deletes ship as tombstones; the peer's last-writer-wins apply
+//! makes re-delivery of rows it already holds a no-op) and was chosen over the
+//! plan's inherited-floor filter (`ver.wall_ms >= parent's shipped wall_ms -
+//! skew - margin`, kept in a cursor row exempt from the trim). The cost: a split
+//! of a large MREC tablet re-sends its rows once (the peer answers `Superseded`
+//! for each). The floor would need a durable cursor-exemption (an ADR 0073
+//! format change) and a skew-safety argument for modest savings; revisit only if
+//! split-time WAN volume shows up in practice. Covered end to end by
+//! `sim_world_mrec_e2e_tests::a_split_of_the_source_tablet_keeps_shipping_every_row`.
+//!
 //! Loop prevention is state-based too: a row stored with a foreign `region_id`
 //! is never shipped, so no origin flag exists on a change record.
 //!
