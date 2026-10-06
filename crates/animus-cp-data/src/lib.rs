@@ -8358,7 +8358,7 @@ fn kind_eval_applied(
         (Some(item), None) => animus_item::encode_stored_item(item),
         (None, None) => animus_item::encode_tombstone(),
         (Some(item), Some(ver)) => animus_item::encode_stored_item_versioned(item, ver),
-        (None, Some(ver)) => animus_item::encode_tombstone_versioned(ver),
+        (None, Some(ver)) => animus_item::encode_tombstone_versioned_keyed(ver, pk, sk),
     };
     let derived = animus_item::derive_kind_writes(
         schema,

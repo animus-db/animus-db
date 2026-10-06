@@ -83,8 +83,10 @@ pub use size::{
     MAX_ITEM_SIZE_BYTES, MAX_NESTING_DEPTH, item_depth, item_size, value_depth, value_size,
 };
 pub use stored::{
-    MrecVersion, decode_stored_item, decode_stored_item_versioned, encode_stored_item,
+    MrecVersion, decode_stored_item, decode_stored_item_versioned, decode_tombstone_key,
+    encode_stored_item,
     encode_stored_item_versioned, encode_tombstone, encode_tombstone_versioned,
+    encode_tombstone_versioned_keyed,
 };
 pub use update::{
     PathSegment, UpdateAction, UpdateError, UpdateExpr, UpdateOperand, apply_update,

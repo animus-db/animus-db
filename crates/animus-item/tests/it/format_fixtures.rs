@@ -13,7 +13,8 @@
 use animus_item::{
     AttributeValue, ChangeRecord, Item, MrecVersion, decode_stored_item,
     decode_stored_item_versioned, encode_stored_item, encode_stored_item_versioned,
-    encode_tombstone, encode_tombstone_versioned, stored::stored_item_version,
+    encode_tombstone, encode_tombstone_versioned, encode_tombstone_versioned_keyed,
+    stored::stored_item_version,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -151,7 +152,11 @@ fn representative_mrec_version() -> MrecVersion {
 
 /// The shapes of `stored-item` that are additive variants inside v1
 /// (`v1-<shape>.json`): every one needs an expected value here.
-const STORED_ITEM_SHAPES: [&str; 2] = ["versioned", "versioned-tombstone"];
+const STORED_ITEM_SHAPES: [&str; 3] = [
+    "versioned",
+    "versioned-tombstone",
+    "versioned-tombstone-keyed",
+];
 
 fn representative_change_record() -> ChangeRecord {
     let mut old = Item::new();
@@ -202,7 +207,7 @@ fn versioned_stored_item_shape_fixtures_decode_to_the_expected_value() {
             .unwrap_or_else(|e| panic!("stored-item v1-{shape} fails to decode: {e}"));
         let want_item = match shape {
             "versioned" => Some(representative_item()),
-            "versioned-tombstone" => None,
+            "versioned-tombstone" | "versioned-tombstone-keyed" => None,
             other => panic!("stored-item shape {other} has no hand-written expected value"),
         };
         assert_eq!(item, want_item, "{shape}");
@@ -320,5 +325,46 @@ fn generate_fixture_stored_item_versioned() {
     write_new_fixture(
         &fixtures_dir("stored-item").join("v1-versioned-tombstone.json"),
         &encode_tombstone_versioned(ver),
+    );
+}
+
+#[test]
+#[ignore = "run explicitly to (re)generate a fixture: cargo test -p animus-item --test it format_fixtures::generate_fixture_stored_item_keyed_tombstone -- --ignored --exact"]
+fn generate_fixture_stored_item_keyed_tombstone() {
+    write_new_fixture(
+        &fixtures_dir("stored-item").join("v1-versioned-tombstone-keyed.json"),
+        &keyed_tombstone(),
+    );
+}
+
+fn keyed_tombstone() -> Vec<u8> {
+    encode_tombstone_versioned_keyed(
+        representative_mrec_version(),
+        &AttributeValue::S("user#1".into()),
+        Some(&AttributeValue::N("42".into())),
+    )
+}
+
+/// The keyed tombstone (G-d M4) decodes as a tombstone with its stamp and
+/// yields its key; the keyless one yields none.
+#[test]
+fn keyed_tombstone_carries_its_key() {
+    let bytes = keyed_tombstone();
+    assert_eq!(
+        decode_stored_item_versioned(&bytes).unwrap(),
+        (None, Some(representative_mrec_version()))
+    );
+    assert_eq!(
+        animus_item::decode_tombstone_key(&bytes),
+        Some((
+            AttributeValue::S("user#1".into()),
+            Some(AttributeValue::N("42".into()))
+        ))
+    );
+    assert_eq!(
+        animus_item::decode_tombstone_key(&encode_tombstone_versioned(
+            representative_mrec_version()
+        )),
+        None
     );
 }

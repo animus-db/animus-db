@@ -17,7 +17,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::Item;
+use crate::{AttributeValue, Item};
 
 /// The serialized form of an item as stored in the data plane. See the
 /// module doc for the live/tombstone shape.
@@ -49,6 +49,15 @@ enum StoredItem {
     /// stops a stale replicated put from resurrecting the item.
     VersionedTombstone {
         ver: MrecVersion,
+        /// The deleted item's partition key, carried so a tombstone can be
+        /// *shipped* from a scan of the base rows alone (a base key is a
+        /// one-way encoding; a tombstone has no image to recover it from).
+        /// Absent on a tombstone written without it (additive within v1).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pk: Option<AttributeValue>,
+        /// The deleted item's sort key (see `pk`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sk: Option<AttributeValue>,
     },
 }
 
@@ -177,8 +186,41 @@ pub fn encode_stored_item_versioned(item: &Item, ver: MrecVersion) -> Vec<u8> {
 /// Serialize a delete tombstone together with its MREC stamp (ADR 0075 G-d).
 #[must_use]
 pub fn encode_tombstone_versioned(ver: MrecVersion) -> Vec<u8> {
-    serde_json::to_vec(&StoredItem::VersionedTombstone { ver })
-        .expect("versioned tombstone serializes")
+    serde_json::to_vec(&StoredItem::VersionedTombstone {
+        ver,
+        pk: None,
+        sk: None,
+    })
+    .expect("versioned tombstone serializes")
+}
+
+/// [`encode_tombstone_versioned`] that also records the deleted item's key
+/// (`pk`, `sk`), which an MREC shipper needs to ship the tombstone from a
+/// base-row scan (ADR 0075 G-d M4).
+#[must_use]
+pub fn encode_tombstone_versioned_keyed(
+    ver: MrecVersion,
+    pk: &AttributeValue,
+    sk: Option<&AttributeValue>,
+) -> Vec<u8> {
+    serde_json::to_vec(&StoredItem::VersionedTombstone {
+        ver,
+        pk: Some(pk.clone()),
+        sk: sk.cloned(),
+    })
+    .expect("versioned tombstone serializes")
+}
+
+/// The key a keyed versioned tombstone carries (`None` for every other row,
+/// and for a tombstone written without one).
+#[must_use]
+pub fn decode_tombstone_key(bytes: &[u8]) -> Option<(AttributeValue, Option<AttributeValue>)> {
+    match serde_json::from_slice::<StoredItem>(bytes).ok()? {
+        StoredItem::VersionedTombstone {
+            pk: Some(pk), sk, ..
+        } => Some((pk, sk)),
+        _ => None,
+    }
 }
 
 /// Decode bytes read from the data plane back into an item, or `None` for an
@@ -216,7 +258,7 @@ pub fn decode_stored_item_versioned(
         StoredItem::Item(item) => (Some(item), None),
         StoredItem::Tombstone => (None, None),
         StoredItem::VersionedItem { item, ver } => (Some(item), Some(ver)),
-        StoredItem::VersionedTombstone { ver } => (None, Some(ver)),
+        StoredItem::VersionedTombstone { ver, .. } => (None, Some(ver)),
     })
 }
 
