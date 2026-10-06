@@ -1243,7 +1243,10 @@ State once here; cross-referenced from the sections below.
   (overwritten by the next resolve there), token-led so it moves with its key
   through splits and snapshot images; every client-facing scan skips it via
   `txn::is_internal_key` (record keys alone stay `is_record_key`, the predicate
-  for code that *decodes records*). Residual by design: it remembers only the
+  for code that *decodes records*). **Class G**: `engine_image` omits marker
+  rows while `Gate::GlobalTables` is closed (an N-1 replica's filters would
+  surface them to clients; it keeps its own in-memory guard — residual), apply
+  always writes them; cell `tests/it/txn_resolved_marker_gate.rs`. Residual by design: it remembers only the
   LAST resolver of a key, so a duplicate stage of T arriving after a *later*
   transaction also resolved the same key is not caught — but that residual is
   now identical on every replica (deterministic), where the old one was

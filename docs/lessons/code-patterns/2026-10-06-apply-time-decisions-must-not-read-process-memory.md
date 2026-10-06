@@ -29,3 +29,12 @@ replica catches up by `AppendEntries`, which silently makes the test vacuous
 (it passed on the buggy code until the pad count was raised). Grep apply arms for
 `Mutex`/`Arc` reads that influence a rejection when touching apply code.
 (`animus-cp-data` `tests/it/resolved_restage_replica_determinism.rs`.)
+
+Corollary: a new durable row is a cross-node format the moment the snapshot
+image carries engine rows (class G, see
+`2026-10-05-classify-a-format-by-every-path-its-bytes-travel.md`). It broke
+nothing here only because `engine_image` omits it while the gate is closed and
+every scan that feeds clients/backups skips it; one unfiltered scan
+(`local_scan_kind_ordered`) would have panicked decoding the marker value as an
+envelope. Grep every raw `storage.scan` over the base scope when adding a row
+family.

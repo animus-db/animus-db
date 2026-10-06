@@ -6116,6 +6116,12 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             .into_iter()
             .filter_map(|(k, vv)| {
                 let logical = scope.strip_in_range(&k)?.to_vec();
+                // Internal rows (txn records, resolved markers) are never
+                // user data, and a marker's value is not an envelope: this
+                // scan feeds backup/export capture of `KIND_BASE`.
+                if kind == KIND_BASE && txn::is_internal_key(&logical) {
+                    return None;
+                }
                 match txn::decode_envelope(&vv.value) {
                     txn::Envelope::Committed(v) => Some((logical, v)),
                     txn::Envelope::Intent { .. } => None,
@@ -11597,6 +11603,16 @@ async fn engine_image<S: StorageEngine>(
             .zip(kind_scopes)
             .find_map(|(kind, scope)| scope.strip_in_range(&k).map(|l| (*kind, l.to_vec())));
         if let Some((kind, logical)) = claimed {
+            // ADR 0073 (class G, `txn-resolved-marker` v1, issue #1243): a
+            // previous-release replica's scan/`has_data` filters know only
+            // record keys and would surface a marker row (`token || 0x00 0x04
+            // || key`) as a client item, so it does not ship while the
+            // introducing gate is closed. That replica keeps its own in-memory
+            // stale-restage guard, as before. Apply still writes markers
+            // unconditionally.
+            if ship_v1_intents && kind == KIND_BASE && txn::is_resolved_marker_key(&logical) {
+                continue;
+            }
             let v = match v {
                 Some(bytes) if ship_v1_intents && kind == KIND_BASE => {
                     match txn::legacy::v1::downgrade_intent_to_v1_with_prior(&bytes) {

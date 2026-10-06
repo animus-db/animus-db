@@ -24,9 +24,11 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use animus_control::Metadata;
+use animus_control::version::ClusterFeatures;
 use animus_cp_data::hlc::HlcTimestamp;
-use animus_cp_data::{RaftKvNode, TxnId, TxnOutcome, TxnWrite};
-use animus_env::{EnvExt, nid};
+use animus_cp_data::{HostedOptions, RaftKvNode, StorageScope, TxnId, TxnOutcome, TxnWrite};
+use animus_env::{EnvExt, PRIMARY_STREAM, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 use animus_tablet::{escape, partition_token};
@@ -103,12 +105,36 @@ fn voters() -> Vec<animus_env::NodeId> {
     NODES.iter().copied().map(nid).collect()
 }
 
-fn fixture(seed: u64) -> Fixture {
+/// A node whose feature handle reads `cluster_version` (2 = the marker gate
+/// open: `engine_image` ships markers; 1 = closed, markers are withheld from
+/// the image for N-1 replicas and the residual in ADR 0073's inventory row
+/// applies, so only the open-gate cluster is expected to be divergence-free
+/// across a snapshot install).
+fn start_node(sim: &Simulator, id: u64, engine: MemoryEngine, cluster_version: u32) -> KvNode {
+    let features = ClusterFeatures::new();
+    features.update(&Metadata {
+        cluster_version,
+        ..Metadata::default()
+    });
+    RaftKvNode::start_hosted_with_options(
+        sim.env(nid(id)),
+        voters(),
+        engine,
+        StorageScope::whole(),
+        PRIMARY_STREAM,
+        HostedOptions {
+            features,
+            ..HostedOptions::default()
+        },
+    )
+}
+
+fn fixture(seed: u64, cluster_version: u32) -> Fixture {
     let mut sim = Simulator::new(seed);
     let engines: Vec<MemoryEngine> = NODES.iter().map(|_| MemoryEngine::new()).collect();
     let nodes: Vec<KvNode> = NODES
         .iter()
-        .map(|&i| RaftKvNode::start(sim.env(nid(i)), voters(), engines[i as usize].clone()))
+        .map(|&i| start_node(&sim, i, engines[i as usize].clone(), cluster_version))
         .collect();
     sim.run_for(ELECT);
     let k = key(b"acct-restage", b"balance");
@@ -199,7 +225,7 @@ impl Fixture {
 #[test]
 fn stale_restage_after_resolve_is_a_noop_on_a_restarted_replica() {
     for seed in seeds() {
-        let mut f = fixture(seed);
+        let mut f = fixture(seed, 2);
         let l = leader(&f.nodes);
         f.stage_and_resolve(l);
         for (i, n) in f.nodes.iter().enumerate() {
@@ -212,8 +238,7 @@ fn stale_restage_after_resolve_is_a_noop_on_a_restarted_replica() {
         // Restart one FOLLOWER: a fresh process, same durable engine.
         let fol = (0..3).find(|&i| i != l).unwrap();
         f.sim.stop(nid(fol as u64));
-        f.nodes[fol] =
-            RaftKvNode::start(f.sim.env(nid(fol as u64)), voters(), f.engines[fol].clone());
+        f.nodes[fol] = start_node(&f.sim, fol as u64, f.engines[fol].clone(), 2);
         f.sim.run_for(ELECT);
         f.dup_stage_then_assert_identical(&format!("restarted={fol}"));
     }
@@ -225,7 +250,7 @@ fn stale_restage_after_resolve_is_a_noop_on_a_restarted_replica() {
 #[test]
 fn stale_restage_after_resolve_is_a_noop_on_a_snapshot_installed_replica() {
     for seed in seeds() {
-        let mut f = fixture(seed);
+        let mut f = fixture(seed, 2);
         let l = leader(&f.nodes);
         let lag = (0..3).find(|&i| i != l).unwrap();
         f.sim.crash(nid(lag as u64));

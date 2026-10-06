@@ -4167,5 +4167,6 @@ every key it resolves, in the same merge batch, and `TxnStage`'s apply reads
 it. One row per key, overwritten by the next resolve there; a duplicate stage
 of T arriving after a *later* transaction resolved the same key is not caught,
 but that residual is now identical on every replica. No command or wire format
-changed. Regression: `animus-cp-data` `tests/it/resolved_restage_replica_
+changed; the marker is class G (ADR 0073): `engine_image` omits it while
+`Gate::GlobalTables` is closed. Regression: `animus-cp-data` `tests/it/resolved_restage_replica_
 determinism.rs` (restart and snapshot-install variants over several seeds).
