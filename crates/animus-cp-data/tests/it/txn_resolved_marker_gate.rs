@@ -1,10 +1,15 @@
 //! ADR 0073 class G: the `txn-resolved-marker` row (issue #1243) must not
-//! cross to a node that cannot read it while its introducing gate
-//! (`Gate::GlobalTables`) is closed. A previous-release replica's scan and
-//! `has_data` filters know only record keys and would surface a marker row
-//! (`token || 0x00 0x04 || key`) to clients, so `engine_image` omits markers
-//! while the gate is closed and ships them once it is open. Apply writes
-//! markers unconditionally, so the sender's own engine always holds one.
+//! cross to a node that cannot read it *as a base row* while its introducing
+//! gate (`Gate::GlobalTables`) is closed. A previous-release replica's scan
+//! and `has_data` filters know only record keys and would surface a marker
+//! row (`token || 0x00 0x04 || key`) to clients, so while the gate is closed
+//! `engine_image` ships markers under the wire-only kind
+//! `KIND_WIRE_RESOLVED_MARKER` (a previous-release receiver drops it; a
+//! current one files it back as the marker row, issue #1251) and ships them
+//! as plain base rows once it is open. Either way a current replica that
+//! installs the image holds the sender's markers, so `TxnStage`'s stale
+//! restage rejection is identical on every replica. Apply writes markers
+//! unconditionally, so the sender's own engine always holds one.
 //!
 //! A follower is partitioned past the log-retention cap, so it can only catch
 //! up by `InstallSnapshot` (asserted via `CpSnapshotInstalls`); a transaction
@@ -167,14 +172,15 @@ fn seeds(base: u64) -> Vec<u64> {
 }
 
 /// Gate closed (cluster version 1: a previous-release replica may be a
-/// member): the image carries no marker; the sender's own engine still does.
+/// member): the marker still reaches a current follower (through the wire
+/// kind a previous-release receiver ignores, issue #1251).
 #[test]
-fn snapshot_omits_resolved_markers_while_the_gate_is_closed() {
+fn snapshot_ships_resolved_markers_while_the_gate_is_closed() {
     for seed in seeds(0x1243_0001) {
         assert_eq!(
             markers_after_snapshot(seed, 1),
-            (true, false),
-            "leader keeps its marker, an N-1 follower must never receive one (seed={seed})"
+            (true, true),
+            "a current follower must receive the marker at version 1 too (seed={seed})"
         );
     }
 }

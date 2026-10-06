@@ -1326,6 +1326,16 @@ State once here; cross-referenced from the sections below.
   regardless), but a real regression to that optimization on nearly every
   split instead of rarely, caught by `tests/inplace_split_dead_space.rs`.
   `drive()` reads this marker back at startup instead of `core.last_applied()`.
+  **Snapshots carry markers at every version (issue #1251).** A replica must
+  hold the sender's marker set or its stale-restage decision diverges (and
+  "fail closed where markers are missing" diverges the other way). While
+  `Gate::GlobalTables` is closed `engine_image` ships each marker under the
+  wire-only image row kind `KIND_WIRE_RESOLVED_MARKER` (`0x80`, in no
+  `ALL_KINDS` scope; the previous release drops an unknown kind) and
+  `install_engine_image` files it back as the base-scope marker row; open, it
+  is the plain base row. Never add a real row kind at `0x80`. A v1-cluster
+  replica-identity check must compare intents in their v1 form (the sender also
+  down-converts v2 intents, #1237).
 
   `RaftCore::state_machine_behind` (shared with `animus-control`, permanently
   inert there — see ADR 0009's addendum) is `true` whenever `engine_applied <

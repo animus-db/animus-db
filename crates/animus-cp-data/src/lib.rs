@@ -536,6 +536,16 @@ pub const KIND_FOOTPRINT: u8 = 0x03;
 /// lineage)`, holding a packed-HLC watermark.
 pub const KIND_CURSOR: u8 = 0x04;
 
+/// Snapshot-image-only row kind (issue #1251, ADR 0073 `txn-resolved-marker`
+/// amendment): the **resolved-marker** base-scope row, shipped under a kind no
+/// [`ALL_KINDS`] scope owns while `Gate::GlobalTables` is closed. A
+/// previous-release receiver drops an unknown kind in `install_engine_image`
+/// (so it never sees the marker as a client item), a current receiver files
+/// it as the base-scope marker row. Never a storage scope and never in
+/// [`ALL_KINDS`]; reserved in the high half so a future real kind cannot
+/// collide with it.
+pub(crate) const KIND_WIRE_RESOLVED_MARKER: u8 = 0x80;
+
 /// Every row-kind scope a tablet group owns, in selector order (ADR 0041 §3,
 /// extended ADR 0042/0043).
 ///
@@ -12095,14 +12105,22 @@ async fn engine_image<S: StorageEngine>(
             .zip(kind_scopes)
             .find_map(|(kind, scope)| scope.strip_in_range(&k).map(|l| (*kind, l.to_vec())));
         if let Some((kind, logical)) = claimed {
-            // ADR 0073 (class G, `txn-resolved-marker` v1, issue #1243): a
+            // ADR 0073 (`txn-resolved-marker` v1, issues #1243/#1251): a
             // previous-release replica's scan/`has_data` filters know only
             // record keys and would surface a marker row (`token || 0x00 0x04
-            // || key`) as a client item, so it does not ship while the
-            // introducing gate is closed. That replica keeps its own in-memory
-            // stale-restage guard, as before. Apply still writes markers
-            // unconditionally.
+            // || key`) as a client item, so while the introducing gate is
+            // closed it cannot ship as a `KIND_BASE` row. It must still
+            // ship: `TxnStage`'s stale-restage rejection reads it, so a
+            // replica that installs this image without the sender's markers
+            // would accept a stage its peers reject (a replica-divergent
+            // intent). It rides in the SAME image under the wire-only kind
+            // [`KIND_WIRE_RESOLVED_MARKER`], which no `ALL_KINDS` scope
+            // claims: a previous-release receiver drops an unknown kind
+            // (`install_engine_image`, verified at the R-1 reference), a
+            // current one files it back as the base-scope marker row. A
+            // gate-open image ships it as the plain base row, as before.
             if ship_v1_intents && kind == KIND_BASE && txn::is_resolved_marker_key(&logical) {
+                entries.push((KIND_WIRE_RESOLVED_MARKER, logical, v, version));
                 continue;
             }
             let v = match v {
@@ -12190,6 +12208,14 @@ async fn install_engine_image<S: StorageEngine>(
         // build does not (ALL_KINDS grew). Dropping it is the safe read: this
         // replica has no scope to put it in, and silently mis-filing it under
         // another kind would corrupt that kind's keyspace.
+        // The wire-only marker kind (issue #1251) is the base-scope
+        // resolved-marker row, shipped under a kind a previous-release
+        // receiver ignores; anything else unknown is dropped.
+        let kind = if kind == KIND_WIRE_RESOLVED_MARKER && txn::is_resolved_marker_key(&key) {
+            KIND_BASE
+        } else {
+            kind
+        };
         let Some(scope) = kind_scopes.get(kind as usize) else {
             tracing::warn!(kind, "snapshot image entry of unknown row kind dropped");
             continue;
@@ -13674,6 +13700,102 @@ mod kind_scope_tests {
                 dst.get(&hwm_key).await.unwrap().map(|v| v.value),
                 Some(hwm::encode_hwm_value(max_ts)),
                 "the installed hwm marker must reflect the image header's own max_ts"
+            );
+        });
+    }
+
+    /// Issue #1251: a resolved marker crosses in EVERY image. While
+    /// `Gate::GlobalTables` is closed it rides under the wire-only kind
+    /// `KIND_WIRE_RESOLVED_MARKER` and never as a base row, so a
+    /// previous-release receiver (which files only `ALL_KINDS` entries and
+    /// drops an unknown kind) never holds a marker-shaped client row; once
+    /// the gate is open it ships as the plain base row. A current receiver
+    /// ends up with the sender's marker either way.
+    #[test]
+    fn engine_image_ships_resolved_markers_through_the_ignorable_kind_while_the_gate_is_closed() {
+        use animus_storage::{MemoryEngine, StorageEngine};
+        futures::executor::block_on(async {
+            let src = MemoryEngine::new();
+            let src_scopes = kind_scopes(&StorageScope::whole());
+            let base = [7u8; 12];
+            let mk = txn::resolved_marker_key(&base);
+            let marker_val = txn::encode_resolved_marker(&txn::TxnId {
+                ts: HlcTimestamp {
+                    wall_ms: 3,
+                    logical: 1,
+                },
+                node: animus_env::nid(5),
+            });
+            src.merge(
+                &src_scopes[KIND_BASE as usize].physical(&mk),
+                &marker_val,
+                40,
+            )
+            .await
+            .unwrap();
+            src.merge(
+                &src_scopes[KIND_BASE as usize].physical(&base),
+                &txn::encode_committed(b"v"),
+                41,
+            )
+            .await
+            .unwrap();
+
+            let closed = ClusterFeatures::new();
+            let image = engine_image(&src, &src_scopes, None, &closed).await;
+            let (_, entries) = codec::decode_image(&image).unwrap();
+            // What a previous-release receiver files: only `ALL_KINDS` rows.
+            assert!(
+                entries
+                    .iter()
+                    .filter(|(k, ..)| ALL_KINDS.contains(k))
+                    .all(|(_, key, ..)| !txn::is_resolved_marker_key(key)),
+                "a gate-closed image must carry no marker-shaped base row"
+            );
+            assert!(
+                entries
+                    .iter()
+                    .any(|(k, key, v, ver)| *k == KIND_WIRE_RESOLVED_MARKER
+                        && key == &mk
+                        && v.as_deref() == Some(&marker_val[..])
+                        && *ver == 40),
+                "the marker must ship under the wire kind: {entries:?}"
+            );
+            assert!(
+                !ALL_KINDS.contains(&KIND_WIRE_RESOLVED_MARKER),
+                "the wire kind must never be a storage scope"
+            );
+
+            // A current receiver files the marker back as the base-scope row.
+            let dst = MemoryEngine::new();
+            let dst_scopes = kind_scopes(&StorageScope::whole());
+            install_engine_image(&dst, &dst_scopes, &image, 1, 42).await;
+            let got = dst
+                .get(&dst_scopes[KIND_BASE as usize].physical(&mk))
+                .await
+                .unwrap()
+                .expect("receiver holds the marker");
+            assert_eq!((got.value, got.version), (marker_val.clone(), 40));
+
+            // Gate open: the plain base row, as before; same receiver result.
+            let open = ClusterFeatures::new();
+            open.update(&animus_control::Metadata {
+                cluster_version: 2,
+                ..animus_control::Metadata::default()
+            });
+            let image = engine_image(&src, &src_scopes, None, &open).await;
+            let (_, entries) = codec::decode_image(&image).unwrap();
+            assert!(
+                entries
+                    .iter()
+                    .any(|(k, key, ..)| *k == KIND_BASE && key == &mk),
+                "a gate-open image ships the marker as a base row"
+            );
+            assert!(
+                entries
+                    .iter()
+                    .all(|(k, ..)| *k != KIND_WIRE_RESOLVED_MARKER),
+                "a gate-open image never uses the wire kind"
             );
         });
     }

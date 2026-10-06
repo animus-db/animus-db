@@ -50,6 +50,10 @@ tracing.workspace = true
 async-trait.workspace = true
 
 [dev-dependencies]
+# Issue #1251: the v1-cluster replica-identity assertion normalizes a v2 intent
+# to its v1 form (a snapshot sender below `Gate::GlobalTables` down-converts it,
+# #1237), via `downgrade_txn_envelope_to_v1`.
+animus-cp-data = { path = ".", features = ["legacy-encoders"] }
 # This crate's own library never constructs a `ProdEnv` — only its real-thread
 # regression tests (`tests/prod_concurrent_ts_monotonic.rs`,
 # `tests/prod_compaction_persist_round.rs`) and, since C-05 PR 1,

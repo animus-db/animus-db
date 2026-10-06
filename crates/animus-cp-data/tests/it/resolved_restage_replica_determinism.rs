@@ -30,7 +30,7 @@ use animus_cp_data::hlc::HlcTimestamp;
 use animus_cp_data::{HostedOptions, RaftKvNode, StorageScope, TxnId, TxnOutcome, TxnWrite};
 use animus_env::{EnvExt, PRIMARY_STREAM, nid};
 use animus_sim::{SimEnv, Simulator};
-use animus_storage::MemoryEngine;
+use animus_storage::{MemoryEngine, StorageEngine};
 use animus_tablet::{escape, partition_token};
 use futures::executor::block_on;
 
@@ -106,10 +106,9 @@ fn voters() -> Vec<animus_env::NodeId> {
 }
 
 /// A node whose feature handle reads `cluster_version` (2 = the marker gate
-/// open: `engine_image` ships markers; 1 = closed, markers are withheld from
-/// the image for N-1 replicas and the residual in ADR 0073's inventory row
-/// applies, so only the open-gate cluster is expected to be divergence-free
-/// across a snapshot install).
+/// open: `engine_image` ships markers as base rows; 1 = closed: markers ship
+/// through the wire kind a previous-release replica ignores, issue #1251, so
+/// a snapshot install is divergence-free at BOTH versions).
 fn start_node(sim: &Simulator, id: u64, engine: MemoryEngine, cluster_version: u32) -> KvNode {
     let features = ClusterFeatures::new();
     features.update(&Metadata {
@@ -205,6 +204,24 @@ impl Fixture {
         let _ = self.stage(l);
         self.sim.run_for(SETTLE * 2);
         let seed = self.seed;
+        // Raw rows incl. tombstones, anchor records and resolved markers: a
+        // resurrected intent or a missing marker shows here even when a
+        // plain `local_get` still agrees (issue #1251).
+        let raw: Vec<super::txn_stage_replay_stability::RawRows> = self
+            .engines
+            .iter()
+            .map(|e| {
+                let mut rows = block_on(e.entries_with_tombstones()).unwrap();
+                rows.retain(|(k, _, _)| !k.starts_with(b"__animus_system"));
+                rows
+            })
+            .collect();
+        for (i, rows) in raw.iter().enumerate().skip(1) {
+            assert_eq!(
+                rows, &raw[0],
+                "replica {i} raw rows diverged from replica 0 after a stale re-stage ({what}) (seed={seed})"
+            );
+        }
         let heads: Vec<Option<Vec<u8>>> = self
             .nodes
             .iter()
@@ -249,8 +266,21 @@ fn stale_restage_after_resolve_is_a_noop_on_a_restarted_replica() {
 /// away), has no in-process trace that the transaction ever resolved.
 #[test]
 fn stale_restage_after_resolve_is_a_noop_on_a_snapshot_installed_replica() {
+    snapshot_installed_replica_case(2);
+}
+
+/// Issue #1251: the same at cluster version 1 (`Gate::GlobalTables` closed,
+/// every unfinalized cluster). The snapshot sender must still carry the
+/// resolved markers (through the wire kind a previous-release replica
+/// drops), or the installed replica accepts the stale stage its peers reject.
+#[test]
+fn stale_restage_after_resolve_is_a_noop_on_a_snapshot_installed_replica_at_cluster_version_1() {
+    snapshot_installed_replica_case(1);
+}
+
+fn snapshot_installed_replica_case(version: u32) {
     for seed in seeds() {
-        let mut f = fixture(seed, 2);
+        let mut f = fixture(seed, version);
         let l = leader(&f.nodes);
         let lag = (0..3).find(|&i| i != l).unwrap();
         f.sim.crash(nid(lag as u64));
