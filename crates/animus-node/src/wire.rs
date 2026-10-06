@@ -1424,9 +1424,9 @@ impl ClientResponse {
             // says "not yet"); it answers a request only a new binary can
             // send, so it is `Base`. Per-record answers need the gate open.
             ClientResponse::MrecApply(MrecApplyResponse::Refused { .. }) => Gate::Base,
-            ClientResponse::MrecApply(
-                MrecApplyResponse::Answers(_) | MrecApplyResponse::Done,
-            ) => Gate::MrecReplication,
+            ClientResponse::MrecApply(MrecApplyResponse::Answers(_) | MrecApplyResponse::Done) => {
+                Gate::MrecReplication
+            }
             ClientResponse::KindWriteBatchOk { results } => {
                 if results
                     .iter()

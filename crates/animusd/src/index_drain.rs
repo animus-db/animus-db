@@ -287,7 +287,7 @@ const ORDINAL_BYTES: usize = 4;
 /// `packed_hlc || ordinal`. Every place that used to strip a bare
 /// [`HLC_BYTES`] to recover an item's own key prefix must strip this
 /// instead (issue #852 widened the suffix).
-const CHANGE_KEY_SUFFIX_BYTES: usize = HLC_BYTES + ORDINAL_BYTES;
+pub(crate) const CHANGE_KEY_SUFFIX_BYTES: usize = HLC_BYTES + ORDINAL_BYTES;
 
 /// How many change records one trim `KindBatch` entry deletes at most —
 /// bounds a large backlog's catch-up to several ticks instead of one
@@ -1274,7 +1274,7 @@ fn record_hlc(key: &[u8]) -> Option<HlcTimestamp> {
 /// (issue #852) — the pagination-granularity read every `GetRecords`/
 /// `GetShardIterator` cursor path needs, unlike [`record_hlc`]'s
 /// HLC-only view. `None` on a malformed/too-short suffix.
-fn record_hlc_ordinal(key: &[u8]) -> Option<(HlcTimestamp, u32)> {
+pub(crate) fn record_hlc_ordinal(key: &[u8]) -> Option<(HlcTimestamp, u32)> {
     let suffix_start = key.len().checked_sub(CHANGE_KEY_SUFFIX_BYTES)?;
     let ts = cursor::decode_watermark(&key[suffix_start..suffix_start + HLC_BYTES])?;
     let ordinal_start = suffix_start + HLC_BYTES;

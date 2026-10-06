@@ -115,6 +115,7 @@ mod index_backfill;
 pub mod mrec_peer;
 #[deny(clippy::disallowed_methods)]
 mod mrec_receiver;
+mod mrec_shipper;
 mod overload;
 #[deny(clippy::disallowed_methods)]
 mod pitr_janitor;
