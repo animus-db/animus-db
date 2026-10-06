@@ -1060,7 +1060,7 @@ every write site, `DescribeTable Replicas`; M5 the fault corpus
 nightly depth 15); M6 the operator surface and the real-process test.
 
 **F2 amends section 4.2: current-state shipping, not literal change-record
-shipping (default taken; the maintainer's decision is pending).** Section 4.2
+shipping (decided 2026-10-06, see below).** Section 4.2
 describes a consumer of the change log shipping each `ChangeRecord`. As built, the
 change log only *names dirty keys*: per `(led tablet, peer)` the shipper reads the
 keys changed above the peer's cursor (`mrec:<region>`) and ships each key's
@@ -1074,8 +1074,23 @@ sees the coalesced final state, not every intermediate write (the stream keeps
 per-key ordering and old/new image parity, which the corpus's stream oracle
 checks). If the maintainer rules for literal record shipping, `ship_one`'s read step
 and the stream oracle are the places that change; the wire, stamps and apply rule do
-not. A card for that decision was posted; until it is answered this is the shipped
-behaviour.
+not.
+
+*Decision (maintainer, 2026-10-06): keep current-state shipping.* Literal
+record shipping was considered as a way for every region to process the same
+history, and rejected: it cannot give that under concurrent multi-region writes
+(arrival order differs per region and last-writer-wins drops the loser; a resync
+past the retention cap or a new replica still starts from a snapshot), while it
+would cost a new per-record version in the change log and traffic proportional to
+write rate. AWS documents the same behaviour for its own MREC tables: "The MREC
+replication process might combine multiple changes in a short period of time into a
+single replicated write, resulting in each replica's Stream containing slightly
+different records", and "Streams records on MREC replicas are always ordered on a
+per-item basis, but ordering between items might differ between replicas"; identical
+per-replica streams ("including Stream record ordering") are an MRSC property
+([global tables: how it works](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/V2globaltables_HowItWorks.html),
+read 2026-10-06). An application that needs one history in every region uses an
+MRSC table (G-c).
 
 **F1: the stamp is a calendar `MrecVersion`, not the cluster HLC.** The item HLC is
 relative to each process's `Env` clock epoch and is not comparable between clusters
@@ -1151,7 +1166,7 @@ framing work, **not** WAN behaviour.
 - The AWS wire field and error names MREC uses (`ReplicaUpdates`, `Replicas`,
   `ReplicaStatus`, the validation texts) remain unverified against the AWS docs
   (section 0); they are the shapes AWS's public API reference extracts showed.
-- F2 (above): the receiver's stream coalesces; the maintainer's decision is pending.
+- F2 (above): the receiver's stream coalesces writes made within one shipping round, as AWS MREC does; decided 2026-10-06.
 - Shipper health is per node and in memory; no cluster-wide lag aggregate or alert.
 - A TTL change made while the saga driver role moves is not re-sent until the next
   change, and two regions setting different TTL attributes concurrently end with the
