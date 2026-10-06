@@ -86,6 +86,7 @@ mod txn_recovery;
 mod txn_resolve_outcome;
 mod txn_resolved_marker_gate;
 mod txn_single;
+mod txn_stage_replay_stability;
 mod voter_history_reconfigure_diff;
 mod wal_rewrite_crash;
 mod wal_rewrite_no_stall;

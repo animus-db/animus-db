@@ -1249,11 +1249,39 @@ State once here; cross-referenced from the sections below.
   always writes them; cell `tests/it/txn_resolved_marker_gate.rs`. Residual by design: it remembers only the
   LAST resolver of a key, so a duplicate stage of T arriving after a *later*
   transaction also resolved the same key is not caught — but that residual is
-  now identical on every replica (deterministic), where the old one was
-  per-process. A new internal row kind must be added to `is_internal_key` and
+  identical on every replica for live apply and snapshot install (but see the
+  replay bullet below), where the old one was per-process. A new internal row kind must be added to `is_internal_key` and
   the `animus-test` `EMBEDDED` table. Regression:
   `tests/it/resolved_restage_replica_determinism.rs` (restart + snapshot-install
   variants, `ANIMUS_RESTAGE_SEEDS`).
+- **WAL replay re-applies over an engine that is already ahead (issue #1242).**
+  A restart replays the log tail from `snapshot_index` over the replica's own
+  durable engine, which already holds everything applied before the kill. An
+  arm whose decision reads engine state sees future state on replay; the
+  per-key `merge` version guard protects arms whose only effect is a plain
+  per-key merge, but not whole-or-nothing multi-key ones. `TxnStage`
+  therefore no-ops (`Fenced`) when any of its keys, their resolved markers, or
+  (anchor) its record key carries a version strictly above the entry's `ts`
+  (equal = its own partial merge, re-applies). The read is **tombstone-aware**
+  (`latest_version_incl_tombstone`, over `scan_with_tombstones`): `get` hides a
+  key deleted after the stage, which makes a stage rejected live by an
+  own-key condition (`A` must be absent) look acceptable on replay once `A` is
+  deleted. The branch is unreachable live except via `SeedBatch` (the restore
+  driver merges rows at carried source-cluster versions, so a stage hitting a
+  seeded key with a higher version is Fenced live too — deterministic on every
+  replica, a liveness edge on a not-yet-served table only). Without it a stage
+  the live apply rejected (stale restage caught by one key's marker; stage
+  blocked by a since-resolved intent) resurrected an intent on the restarted
+  replica only, silently dropping later acked txn appends there. The #1243
+  "residual is identical on every replica" statement above held for live apply,
+  not replay. Any new multi-key conditional arm needs the same "what if every
+  key were from the future" review. `KindBatch`/`Batch` make no engine-state
+  decision (nothing to guard); `KindEval`/`KindEvalBatch` re-decide from engine
+  state on replay and their derived rows (change-log, LSI, footprint) sit on
+  unique keys that per-key LWW does not protect — tracked in issue #1247, not
+  fixed here. Regression: `tests/it/txn_stage_replay_stability.rs`
+  (`ANIMUS_TXN_REPLAY_SEEDS`); lesson
+  `docs/lessons/code-patterns/2026-10-06-wal-replay-over-an-ahead-engine-must-not-re-decide-an-apply.md`.
 - **`engine_applied` vs `last_applied`.** The two-task split (below) means the
   core's `last_applied` (a buffer cursor the consensus loop advances) *leads*
   the engine. Linearizable reads therefore gate on the separate

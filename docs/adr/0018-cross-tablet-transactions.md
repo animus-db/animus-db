@@ -4170,3 +4170,42 @@ but that residual is now identical on every replica. No command or wire format
 changed; the marker is class G (ADR 0073): `engine_image` omits it while
 `Gate::GlobalTables` is closed. Regression: `animus-cp-data` `tests/it/resolved_restage_replica_
 determinism.rs` (restart and snapshot-install variants over several seeds).
+
+## Amendment 2026-10-06 — `TxnStage` is a no-op when replayed over an engine already ahead of it (issue #1242)
+
+The #1243 amendment's closing claim — the marker's one-row-per-key residual "is
+now identical on every replica" — held for live apply and for a replica that
+installs a snapshot, but not for **WAL replay after a restart**. A restarted
+replica re-applies its log tail from `snapshot_index` over its own durable
+engine, which already holds the effects of entries past that point, so each
+`TxnStage` decision read *future* state: a stage the live apply rejected (a
+stale/duplicate stage caught by the resolved marker of one key, a stage blocked
+by a foreign intent that was resolved afterwards) was accepted on replay, and
+its intent merge landed on every key with no later write. The resurrected
+intent exists on that replica only and blocks every later stage touching the
+key there (whole-or-nothing), so the acknowledged transaction's *other* key
+never applied on that replica — a permanent `ConsistentRead: false` divergence
+that shows only transaction halves missing (the chaos smoke's
+`[eventual-prefix]`).
+
+Fix, apply-side only (no command, wire or durable format change, so no ADR 0073
+gate: the new branch is unreachable on the live path, where no row can carry a
+version above the entry being applied — with one exception: `SeedBatch`, the
+restore driver, merges rows at carried source-cluster versions, so a stage
+hitting a seeded key with a higher version is Fenced live too, deterministically
+on every replica; a liveness edge on a not-yet-served table only): `TxnStage` first checks whether any of
+its own keys, their resolved markers, or (anchor) its record key hold a
+version strictly above the entry's `ts`, **tombstones included** (a plain `get`
+hides a key deleted after the stage, so a stage rejected live by an own-key
+condition such as "A absent" would pass on replay once A is deleted); if so a later entry already ran, and the stage replays as a
+no-op (`StageOutcome::Fenced`, nobody waits on a replayed entry). Strictly
+above, not at-or-above: an equal version is this entry's own, possibly
+crash-interrupted, merge and re-applies normally. Regression:
+`animus-cp-data` `tests/it/txn_stage_replay_stability.rs` (two constructed
+shapes plus a seeded schedule corpus, `ANIMUS_TXN_REPLAY_SEEDS`). **Not fixed
+here:** `KindEval`/`KindEvalBatch` re-decide from engine state on replay, and
+their derived rows (change-log, LSI, footprint) are on unique keys that per-key
+LWW does not protect (issue #1247). `KindBatch`/`Batch` make no engine-state
+decision. At cluster version
+1 (marker withheld from `InstallSnapshot` images) a snapshot-installed replica
+still has the #1243 residual.

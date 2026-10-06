@@ -39,7 +39,7 @@ and lints it. No root, `tc`, `ip netns` or `iptables` is needed.
 | `ANIMUS_CHAOS_RECOVERY_SECS` | 60 | budget for post-heal availability and for each final read. |
 | `ANIMUS_CHAOS_TXN` | on | `0` drops the multi-key transaction ops (bisecting aid). |
 | `ANIMUS_CHAOS_DIR` | `$TMPDIR` | scratch dir for data dirs/configs/logs. Removed after the run. |
-| `ANIMUS_CHAOS_OUT` | `$TMPDIR/animus-chaos-out` | where a **failed** run keeps `history.json`, `events.txt`, `op-trace.txt`, `violations.txt`, and each node's log. |
+| `ANIMUS_CHAOS_OUT` | `$TMPDIR/animus-chaos-out` | where a **failed** run keeps `history.json`, `events.txt`, `op-trace.txt`, `violations.txt`, `summary.txt` (compact: one line per violation group, the `[replica-convergence]` verdict, per-node counters; what the CI annotation shows first), `counters.txt`, and each node's log. |
 
 CI: [`.github/workflows/chaos.yml`](../.github/workflows/chaos.yml) runs the
 smoke on PRs/pushes that touch the harness, and every scenario nightly with a
