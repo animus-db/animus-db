@@ -1903,3 +1903,27 @@ this leg's first real run. It is plain-TCP only (fails fast with
 `E2E_TLS`/`E2E_S3_TLS`). Known risk: the previous-release (Phase 1) binary must
 accept the config this operator renders; a rejected flag would show as a pod
 that never goes Ready *before* the roll starts.
+
+## MREC peer federation (ADR 0075 section 5.4, G-01 stage G-e)
+
+- **CRD:** `spec.region`, `spec.peers[]` (`PeerSpec`: `region`, `endpoints`
+  host:port of the peer intra port, `caSecretRef{name,key}`), `spec.allowInsecurePeers`
+  (dev), `spec.mrecMaxClockSkewMs`; all additive and skipped when unset (so the
+  config hash of an existing cluster is unchanged). Golden fixture
+  `tests/fixtures/formats/animuscluster-spec/v1-peers.json`; `deploy/operator/crd.yaml`
+  regenerated (`cargo run -p animus-operator -- crd`; pinned by `crd_manifest_pinned`).
+- **Config:** `cluster_config::ClusterSettings` mirrors animusd's `region`/`peers`/
+  `allow_insecure_peers`/`mrec_max_clock_skew_ms`; `PeerCluster` has `deny_unknown_fields`
+  on the animusd side, so keep the field names exact (the operator does not link animusd,
+  so nothing compiles that for you).
+- **Trust:** the intra listener verifies client certs against the single `tls.ca_path`;
+  with any `caSecretRef`, `entrypoint.sh` merges own `ca.crt` + peer CAs into
+  `/tmp/animus-tls-ca-bundle.pem` (`tls_section_for`) and per-peer `tls_ca` points at
+  `/etc/animus/peer-ca/<index>/ca.crt`. Volumes are `peer-ca-<index>` (index, not region).
+- **NetworkPolicy:** port-scoped only (DNS names cannot be matched): egress to peer ports
+  any destination, ingress on the intra port from any source, only when peers are set; a
+  test pins that dynamo/intra are the only any-source ingress ports. mTLS is the auth.
+- **Validation:** `AnimusClusterSpec::validate_peers_spec` (webhook + reconciler);
+  reconciler refuses (applies nothing) with `PeersSpecInvalid`.
+- **`PeerReachable`:** `peers::evaluate` (pure) over every pod's `/admin/global-tables`;
+  Unknown until a shipper exists. Unverified against a real cluster; no kind e2e.

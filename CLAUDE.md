@@ -493,7 +493,13 @@ truth; this map is just for navigation.
   (`MrecApply` frame). Proofs: the multi-cluster `SimWorld`
   (`sim_world_mrec_*`, corpus knob `ANIMUS_MREC_SEEDS`) and the real-process
   `tests/mrec_peer_transport.rs`. Admin: `/admin/global-tables` (replicas + node-local
-  shipper health).
+  shipper health). **Operator federation (G-e, built, `kind` e2e unrun):**
+  `AnimusCluster` `spec.region`/`spec.peers[]`/`spec.allowInsecurePeers` render
+  into `cluster_settings` (peers need `spec.tls` or the dev opt-in, else
+  `PeersSpecInvalid`), peer CAs are mounted and merged into the intra trust
+  bundle, a port-scoped peer `NetworkPolicy` opens only the intra port, and a
+  `PeerReachable` condition reads shipper health; stretch-segment federation is
+  deferred (ADR 0075 "G-e as built").
 - **Transaction consensus** — 2PC/HLC over the per-tablet Raft groups (ADR
   0018), the only transaction story. The Accord slice that used to sit here
   (`animus-consensus`, ADR 0011) is **deleted** — rejected for CP by ADR 0018 in

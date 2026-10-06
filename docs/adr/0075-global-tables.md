@@ -19,8 +19,10 @@
   **Stage G-d (MREC, async per-item LWW between clusters) is built** behind
   `Gate::MrecReplication` (cluster version 3), simulation-proven plus one
   real-process two-cluster test over mutual TLS; see the 2026-10-06 amendments at
-  the end ("G-d M1/M2/M3 as built" and "G-d as built (M0-M6)"). Stage G-e
-  (federation: operator-rendered peers, cross-cluster admin) is not built. ADR 0073
+  the end ("G-d M1/M2/M3 as built" and "G-d as built (M0-M6)"). **Stage G-e (operator
+  federation for MREC peers) is built**, unit-tested but with its `kind` e2e
+  unrun; see the 2026-10-06 amendment "G-e as built" at the end. Stretch-segment
+  federation (MRSC over several Kubernetes clusters) remains deferred. ADR 0073
   Phase 2 (P2-B/C/D) is done, so the "blocked on P2" note in section 8 is historical.
 
 ## 0. Verification note (read first)
@@ -1147,7 +1149,7 @@ framing work, **not** WAN behaviour.
 **Known gaps and residuals.**
 - No WAN latency, bandwidth or cost measurement; the two real clusters share a host.
   `kind`/operator e2e cannot run in this sandbox, so the operator rendering peers
-  into `cluster.json` (G-e) is unbuilt and unverified.
+  into `cluster.json` (G-e, built afterwards, see "G-e as built") is unverified on a real cluster.
 - The AWS wire field and error names MREC uses (`ReplicaUpdates`, `Replicas`,
   `ReplicaStatus`, the validation texts) remain unverified against the AWS docs
   (section 0); they are the shapes AWS's public API reference extracts showed.
@@ -1166,3 +1168,84 @@ framing work, **not** WAN behaviour.
   restart; MREC's re-create path hits it only for a different shape.
 - Only the full-mesh topology exists (D8); `ReplicaUpdates[].Update` and the
   per-replica overrides (KMS, throughput) are rejected, as section 5 says.
+
+## Amendment (2026-10-06): G-e as built (operator federation for MREC peers)
+
+Section 5.4's MREC half is built in `animus-operator`; no `animusd` change was
+needed.
+
+**CRD (additive, `schemaVersion` stays 1).** `spec.region` (this cluster's MREC
+region name), `spec.peers[]` = `{region, endpoints[host:port, intra port],
+caSecretRef{name, key (default ca.crt)}?}`, `spec.allowInsecurePeers` (dev
+only) and `spec.mrecMaxClockSkewMs`. Every field is skipped when unset, so an
+existing spec serializes and hashes unchanged (no upgrade-triggered pod roll).
+A new golden fixture `v1-peers.json` pins the shape (the existing three are
+untouched). No federation CRD, as decided. The CRD offers a Secret reference
+only, **not** a cert-manager `issuerRef` as 0064 does for the cluster's own
+certificate: an `Issuer` carries no CA bytes the operator could mount, so a
+cert-manager user references the Secret holding the CA certificate (its
+`ca.crt` or `tls.crt` key, hence the `key` field).
+
+**Config mapping.** The operator renders `cluster.json`'s `cluster_settings`
+with the exact animusd shape G-d defined: `region`, `peers[{region, endpoints,
+tls_ca}]`, `allow_insecure_peers` (only when true) and
+`mrec_max_clock_skew_ms`, on every node of every role. The field names are
+pinned against animusd's own pinned-JSON test
+(`mrec_settings_are_additive_and_pinned_json`) by literal comparison; the
+operator crate does not link animusd, so no test runs animusd's parser over the
+operator's output.
+
+**Validation.** `AnimusClusterSpec::validate_peers_spec` (shared by the webhook
+and the reconciler): peers need `spec.region`; no peer repeats or equals the own
+region; each endpoint is `host:port`; **peers without `spec.tls` are refused
+unless `spec.allowInsecurePeers: true`** (a CA reference also needs `spec.tls`).
+On a violation the reconciler sets `PeersSpecInvalid` and applies nothing
+(refuse, not strip: dropping `peers` would stop replication, and dropping the
+TLS rule would open an unauthenticated link).
+
+**TLS trust.** Each referenced CA Secret is mounted read-only at
+`/etc/animus/peer-ca/<peer index>/ca.crt` (index, not region name, so any region
+string is a valid path). Two uses: the peer's `tls_ca` (animusd verifies that
+peer's server certificate against it in addition to the own CA), and the
+**inbound** side, which is the subtle one: the intra listener verifies client
+certificates against the node's single `tls.ca_path`, so a peer's client
+certificate verifies only if its CA is in that file. animusd's loader accepts a
+PEM with several certificates, so when any peer names a CA the generated
+`entrypoint.sh` concatenates the own `ca.crt` and every peer CA into
+`/tmp/animus-tls-ca-bundle.pem` before `exec` (both role branches) and
+`tls.ca_path` points there. No animusd change; the bundle is rebuilt on every
+container start, so a CA rotation in a peer Secret needs a pod restart (animusd
+does not reload TLS material either).
+
+**NetworkPolicy.** A `NetworkPolicy` cannot match a DNS name, and peer endpoints
+are user-supplied names, so the rules are port-scoped, not address-scoped, and
+only exist when `spec.peers` is set: egress to the peer endpoints' ports (the
+distinct set, any destination, `0.0.0.0/0` and `::/0`), and ingress on the
+**intra port only** from any source. Authentication is the mutual TLS handshake,
+not network location; this is weaker than a source allowlist and is stated
+rather than hidden (an operator who knows the peer's CIDRs can tighten it by
+hand, as `spec.s3.egressCidrs` allows for S3). The client (dynamo), admin,
+console, internal and client ports are never opened to peers; a test pins that
+the only any-source ingress ports are dynamo (pre-existing) and intra. With
+`allowInsecurePeers` the intra port is open and unauthenticated by construction.
+
+**`PeerReachable`.** A positive-polarity condition, set on every reconcile that
+has peers (removed when it has none), from `GET /admin/global-tables` on every
+pod through the existing admin client (the TLS-aware path the drain sequence
+uses). Shipper health is node-local (a node reports the tablets it leads), so
+the pure function `peers::evaluate` aggregates all pods. Per peer: no shipper
+entry yet gives `Unknown` (no MREC table replicates with it, so there is no
+reachability signal without a table); at least one shipper with no `last_error`
+that is `caught_up` or acknowledged within 5 minutes gives `True`; otherwise
+`False`, naming the error or the staleness. Overall: `False` if any peer is
+`False`, else `Unknown` if any is `Unknown` or no pod answered, else `True`.
+The operator does not dial peers itself and does not drive replica creation.
+
+**Not done.** Stretch-segment federation (MRSC over several Kubernetes clusters,
+remote seed addresses, flat pod networking) stays deferred as section 5.4 says.
+No automatic endpoint discovery. No source-address NetworkPolicy for peers. The
+two-cluster `kind` e2e was not written (it needs two clusters or two namespaces
+with a routable, TLS-trusting path and a global table, and `kind` cannot run in
+the sandbox this was built in); **none of the rendering, mounts, NetworkPolicy
+or condition has been exercised against a real Kubernetes API server**, only
+unit tests of the builders and the reconciler over fakes.
