@@ -12213,3 +12213,24 @@ replicate means a foreign intent and is `Retry`; a whole-batch `Refused` reply i
 panics on that); a lost confirm is `Retry`, not an error. `tests/mrec_peer_transport.rs`
 drives two real one-node clusters through `mrec_peer::probe_peer_for_test`; it cannot apply
 data until M4's replica-create saga. Never drive a `SimWorld` member cluster directly.
+
+**MREC global tables, as built (ADR 0075 "G-d as built", G-01 G-d M4-M6).** Modules:
+`mrec_peer` (config, `PeerClient`, `ProdPeerClient`, node-local `PeerHealth` memo),
+`mrec_receiver` (`handle_mrec_apply`, routed from `ClientRequest::MrecApply`),
+`mrec_shipper` (module doc = design: per `(led tablet, peer)` tick, dirty keys above
+`mrec:<region>`, scan under `mrecscan:<region>`; cursor advances only after the peer's
+ack; loop prevention is state-based, a foreign-region-stamped row is never shipped;
+split child = unfiltered rescan), `mrec_saga` (`UpdateTable ReplicaUpdates`, driver =
+leader of the table's lowest active tablet, peer-side `handle_control`, `SetTtl`). Both
+loops (`mrec_ship_loop` calls saga then ship tick) are spawned beside
+`change_consumer_loop` at the two `lib.rs` assembly sites and are inert until a table
+is MREC. Every base-row writer of an MREC table must stamp `schema.mrec`
+(`mrec_write_stamp`); `kind_writes_for_item` deliberately does not (restore/import
+create regional tables). `/admin/global-tables` shows MREC tables via
+`admin_mrec_table_view` (shipper health is node-local, in memory). Tests:
+`sim_world_mrec_{shipper,saga,edge,e2e}_tests.rs` (>=20 seeds each), the corpus
+`sim_world_mrec_corpus.rs` (`ANIMUS_MREC_SEEDS`; `cargo test -p animusd --lib
+sim_world_mrec`), and real sockets in `tests/mrec_peer_transport.rs`
+(`two_real_clusters_replicate_a_table_both_ways_over_mutual_tls`: finalize to version 3
+over the TLS admin port, TLS DynamoDB wire, converged-or-timeout polls). Gotcha: the
+saga tests' `S` harness needs a `pad` peer so peer index == bridge cluster index.

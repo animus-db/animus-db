@@ -3240,3 +3240,12 @@ replay. Regression: `animusd` `sim_cluster_split_relocation`. ADR 0058's
   (a group opened with `HostedOptions { features }` at cluster version 3: the propose
   gate panics in tests otherwise). **Adding a base-row writer for an MREC table means
   stamping it** (see the ADR's writer audit).
+
+**MREC apply is the only consumer-facing piece here (ADR 0075 "G-d as built").** The
+shipper, saga and receiver live in `animusd`; this crate owns the last-writer-wins rule
+(`apply_mrec`: stored `MrecVersion` vs the incoming one, `Superseded` on a loss, stamped
+tombstones, a foreign intent is `Retry`) and the content-dependent `KvCommand::required_gate`.
+The cursor rows `mrec:<region>`/`mrecscan:<region>` are ordinary `KIND_CURSOR` rows written
+through the existing kind ops (no new command); `trim_split_child` drops them, which is why
+a split child rescans. Test-only switch `mrec_test_switch::set_lww_by_arrival` (thread-local)
+backs the M5 negative control; never reachable in a release build path.
