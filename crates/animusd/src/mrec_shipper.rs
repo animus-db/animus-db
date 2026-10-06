@@ -518,8 +518,11 @@ async fn scan_step<E: Env, R: RelayClient>(
     }
     if reached_end {
         succeed(ctx, key, 0, 0, 0, false);
-        if !already_copied && replica.status == MrecReplicaStatus::Creating
-            || !already_copied && replica.status == MrecReplicaStatus::Active
+        if !already_copied
+            && matches!(
+                replica.status,
+                MrecReplicaStatus::Creating | MrecReplicaStatus::Active
+            )
         {
             ctx.propose_schema(&MetaCommand::MarkMrecCopied {
                 table: table.to_owned(),
@@ -594,10 +597,12 @@ async fn log_step<E: Env, R: RelayClient>(
     let mut distinct = std::collections::BTreeSet::new();
     let mut cut = 0usize;
     for (i, (ts, _, base)) in dirty.iter().enumerate() {
-        if !base.is_empty() && !distinct.contains(base) && distinct.len() >= MREC_BATCH_ROWS {
-            if dirty[cut.saturating_sub(1)].0 != *ts {
-                break;
-            }
+        if !base.is_empty()
+            && !distinct.contains(base)
+            && distinct.len() >= MREC_BATCH_ROWS
+            && dirty[cut.saturating_sub(1)].0 != *ts
+        {
+            break;
         }
         if !base.is_empty() {
             distinct.insert(base.clone());

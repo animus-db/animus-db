@@ -9568,7 +9568,9 @@ pub(crate) async fn kind_write_item_at_leader<E: Env, R: RelayClient>(
     } else {
         ProbeIdentity::RequiresOwnEntry
     };
-    let schema = write_schema_for(meta, table);
+    let mut schema = write_schema_for(meta, table);
+    // G-d M4: stamp an MREC table's write (inert for a regional table).
+    schema.mrec = mrec_write_stamp(meta, table, ctx.env.wall_now().0);
     let eval_op = kind_write_op_to_eval_op(op);
     // Turbofish required (ADR 0061 rung C5 step 3a): `cp_kind_eval_local`
     // takes no `self`/`R`-typed argument, so nothing here pins down `R` for
@@ -9770,13 +9772,10 @@ pub(crate) async fn kind_write_batch_at_leader<E: Env, R: RelayClient>(
     // ADR 0075 G-d M3: a batch of replicated records is stamped with this
     // cluster's region context at the proposing leader (apply rejects a
     // `Replicate` whose entry carries none). Ordinary client batches on an
-    // MREC table take the M4 stamping path.
-    if items
-        .iter()
-        .any(|i| matches!(i.op, KindWriteOp::Replicate { .. }))
-    {
-        schema.mrec = mrec_write_stamp(meta, table, ctx.env.wall_now().0);
-    }
+    // MREC table are stamped below.
+    // G-d M4: an ordinary client batch on an MREC table is stamped the same way
+    // (`None` for a regional table, so this is inert there).
+    schema.mrec = mrec_write_stamp(meta, table, ctx.env.wall_now().0);
     let write_limit = ctx.throttle_limits_for(meta, table).write_units;
     let tablet_count = meta.tablets_for_table(table).count().max(1);
 

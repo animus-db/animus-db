@@ -42,14 +42,14 @@ use super::mrec_receiver::handle_mrec_apply;
 use super::sim_cluster::SimCluster;
 use super::sim_world::{LinkConfig, PeerHandler, SimWorld};
 
-const A: usize = 0;
-const B: usize = 1;
-const TABLE: &str = "tbl";
-const LAT: Duration = Duration::from_millis(40);
-const TIMEOUT: Duration = Duration::from_millis(800);
-const SKEW_MS: u64 = 500;
+pub(crate) const A: usize = 0;
+pub(crate) const B: usize = 1;
+pub(crate) const TABLE: &str = "tbl";
+pub(crate) const LAT: Duration = Duration::from_millis(40);
+pub(crate) const TIMEOUT: Duration = Duration::from_millis(800);
+pub(crate) const SKEW_MS: u64 = 500;
 
-fn seeds() -> Vec<u64> {
+pub(crate) fn seeds() -> Vec<u64> {
     if let Some(s) = std::env::var("ANIMUS_SEED")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -63,7 +63,7 @@ fn seeds() -> Vec<u64> {
     (0..k).map(|i| 0x3D00_0000 + i).collect()
 }
 
-fn splitmix(state: &mut u64) -> u64 {
+pub(crate) fn splitmix(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mut z = *state;
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -74,7 +74,12 @@ fn splitmix(state: &mut u64) -> u64 {
 // ---------------------------------------------------------------------------
 // Setup
 
-fn poll(c: &mut SimCluster, what: &str, seed: u64, cond: impl Fn(&mut SimCluster) -> bool) {
+pub(crate) fn poll(
+    c: &mut SimCluster,
+    what: &str,
+    seed: u64,
+    cond: impl Fn(&mut SimCluster) -> bool,
+) {
     for _ in 0..600 {
         if cond(c) {
             return;
@@ -85,7 +90,7 @@ fn poll(c: &mut SimCluster, what: &str, seed: u64, cond: impl Fn(&mut SimCluster
 }
 
 /// Era on, every node reporting `[1,3]`, then the real admin finalize 1 -> 2 -> 3.
-fn open_mrec_gate(c: &mut SimCluster, seed: u64) {
+pub(crate) fn open_mrec_gate(c: &mut SimCluster, seed: u64) {
     let n = c.node_count() as u64;
     c.set_all_node_versions(Some(VersionRange::new(1, 3)));
     poll(c, "the era and every version record", seed, |c| {
@@ -114,7 +119,7 @@ fn open_mrec_gate(c: &mut SimCluster, seed: u64) {
     assert!((0..n).all(|i| c.features(i).is_open(Gate::MrecReplication)));
 }
 
-fn propose(c: &mut SimCluster, cmd: MetaCommand, seed: u64) {
+pub(crate) fn propose(c: &mut SimCluster, cmd: MetaCommand, seed: u64) {
     match c.propose_meta(cmd.clone()) {
         ProposeResult::Accepted { .. } => {}
         other => panic!("seed={seed}: {cmd:?} not accepted: {other:?}"),
@@ -163,11 +168,14 @@ fn receiver_cfg(allow_insecure: bool) -> MrecConfig {
         allow_insecure,
         max_clock_skew_ms: SKEW_MS,
         inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        max_backlog: Duration::from_secs(3600),
+        node_tls: None,
+        health: Arc::default(),
     }
 }
 
 /// B's `PeerHandler`: the real receiver on the entry node `entry` names.
-fn handler(cfg: MrecConfig, entry: Arc<AtomicU64>) -> PeerHandler {
+pub(crate) fn handler(cfg: MrecConfig, entry: Arc<AtomicU64>) -> PeerHandler {
     Arc::new(move |handle, payload: Vec<u8>| {
         let cfg = cfg.clone();
         let node = entry.load(Ordering::SeqCst);
