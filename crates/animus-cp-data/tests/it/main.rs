@@ -40,6 +40,7 @@ mod learner_snapshot_livelock_under_continuous_writer;
 mod membership;
 mod metrics;
 mod mrec_apply;
+mod mrec_ship_scan_markers;
 mod preferred_leader_corpus;
 mod quiesced_apply_no_poll;
 mod quiesced_eventual_read;

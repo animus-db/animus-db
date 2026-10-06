@@ -5925,7 +5925,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             if out.len() >= limit {
                 break;
             }
-            if txn::is_record_key(&key) {
+            if txn::is_internal_key(&key) {
                 continue;
             }
             let physical = self.scope.physical(&key);
