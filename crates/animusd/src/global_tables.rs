@@ -55,7 +55,7 @@ const EMPTY_CHECK_PAGE: usize = 64;
 /// `Replicas` (AWS-style); the witness is listed apart.
 #[must_use]
 pub(crate) fn global_description(meta: &Metadata, table: &str) -> Option<GlobalTableDescription> {
-    let spec = meta.table_global(table)?;
+    let spec = meta.table_global(table).filter(|g| g.is_mrsc())?;
     let ready = meta.table_ready_regions(table);
     let status = |region: &String| {
         if ready.contains(region) {
@@ -86,7 +86,7 @@ pub(crate) fn reject_transaction_on_global(
     table: &str,
     api: &str,
 ) -> Result<(), WireError> {
-    if meta.table_global(table).is_some() {
+    if meta.table_global(table).is_some_and(|g| g.is_mrsc()) {
         return Err(WireError::validation(format!(
             "{api} is not supported on table `{table}`: transactions are not supported on a \
              multi-Region strongly consistent global table"
@@ -101,7 +101,7 @@ pub(crate) fn reject_transaction_on_global(
 /// # Errors
 /// A `ValidationException` naming the table.
 pub(crate) fn reject_ttl_on_global(meta: &Metadata, table: &str) -> Result<(), WireError> {
-    if meta.table_global(table).is_some() {
+    if meta.table_global(table).is_some_and(|g| g.is_mrsc()) {
         return Err(WireError::validation(format!(
             "UpdateTimeToLive cannot enable TTL on table `{table}`: TTL is not supported on a \
              multi-Region strongly consistent global table"
@@ -377,7 +377,9 @@ pub(crate) fn admin_global_tables_view<E: Env, R: RelayClient>(
     let mut warnings: Vec<String> = Vec::new();
     let mut tables = Vec::new();
     for (name, schema) in meta.schemas.iter() {
-        let Some(spec) = &schema.global else { continue };
+        let Some(spec) = schema.global.as_ref().filter(|g| g.is_mrsc()) else {
+            continue;
+        };
         let ready = meta.table_ready_regions(name);
         let mut tablets = Vec::new();
         for (id, t) in meta
@@ -481,7 +483,7 @@ pub(crate) async fn admin_set_preferred_leader<E: Env, R: RelayClient>(
         );
     }
     let meta = ctx.metadata_fresh().await;
-    let Some(spec) = meta.table_global(table) else {
+    let Some(spec) = meta.table_global(table).filter(|g| g.is_mrsc()) else {
         return (
             404,
             json!({"error": format!("table `{table}` is not a global table")}),

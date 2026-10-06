@@ -115,6 +115,8 @@ mod index_backfill;
 pub mod mrec_peer;
 #[deny(clippy::disallowed_methods)]
 mod mrec_receiver;
+#[deny(clippy::disallowed_methods)]
+mod mrec_saga;
 mod mrec_shipper;
 mod overload;
 #[deny(clippy::disallowed_methods)]
@@ -14404,7 +14406,12 @@ pub(crate) fn leader_preferences(
     meta.tablets
         .iter()
         .filter_map(|(id, t)| {
-            let g = meta.schemas.get(t.table.as_deref()?)?.global.as_ref()?;
+            let g = meta
+                .schemas
+                .get(t.table.as_deref()?)?
+                .global
+                .as_ref()
+                .filter(|g| g.is_mrsc())?;
             Some((
                 *id,
                 animus_cp_data::host::LeaderPreference {
