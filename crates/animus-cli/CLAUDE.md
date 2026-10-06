@@ -534,3 +534,10 @@ guard (last Active node of a Region a global table pins). `decommission` does
 not take `--force`: it surfaces the guard's 409 and the operator drains with
 `--force` deliberately.
 
+
+**`animus admin global-tables <admin-addr>`** prints `GET /admin/global-tables` as served:
+MRSC tables (regions, preferred leader, placement) and, since G-d M6, MREC tables
+(`consistency: "EVENTUAL"`: replicas with status and copy progress, plus **that node's**
+per-(tablet, peer) shipper health). Shipper health is node-local, so a fleet view means
+running it against each node. The CLI has no MREC-specific rendering to keep in sync; only
+the request-shape unit test (`global_tables_and_drain_force_admin_requests`).

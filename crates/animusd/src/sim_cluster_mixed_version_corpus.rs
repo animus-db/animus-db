@@ -73,6 +73,19 @@
 //!   appended ungated with a B2 voter present; the oracle MUST report the
 //!   capped rejection at exactly that voter, wedged and never appended.
 //!
+//! - `release2_to_release3_mrec_gate`: the second real gate (`Gate::
+//!   MrecReplication`, cluster version 3, G-01 stage G-d): `Release(2)`
+//!   (`[1,2]`, finalized at 2) -> `Release(3)` (`[1,3]`); a relayed
+//!   `ConvertTableToMrec` / `AddMrecReplica` is refused by name before the
+//!   finalize (counted, nothing appended), a finalize to 3 is refused while a
+//!   `[1,2]` node is recorded, and after the finalize the identical relays
+//!   are accepted and the MREC spec lands on every node (data-only mirror
+//!   included) without pinning any placement policy;
+//! - `negative_control_mrec_gate_emitted_early` (N6): `ConvertTableToMrec`
+//!   appended ungated at version 2 with a `Release(2)` voter; the oracle MUST
+//!   report the capped rejection at exactly that voter, wedged and never
+//!   appended, and the MREC spec applied before its gate on the others.
+//!
 //! # Not covered
 //!
 //! - Roll orders / leader kills over `Release(1) -> Release(2)`: the pure
@@ -138,6 +151,10 @@ enum Kind {
     GlobalGate,
     /// N5: `ConvertTableToGlobal` emitted ungated with a B2 voter.
     GlobalGateNegative,
+    /// Release(2) -> Release(3) over `Gate::MrecReplication` (G-01 stage G-d).
+    MrecGate,
+    /// N6: `ConvertTableToMrec` emitted ungated with a Release(2) voter.
+    MrecGateNegative,
 }
 
 /// The three ladder negative controls (ADR 0073 section 7).
@@ -220,6 +237,11 @@ fn cells() -> Vec<Cell> {
         cell(
             "negative_control_global_gate_emitted_early",
             Kind::GlobalGateNegative,
+        ),
+        cell("release2_to_release3_mrec_gate", Kind::MrecGate),
+        cell(
+            "negative_control_mrec_gate_emitted_early",
+            Kind::MrecGateNegative,
         ),
     ]
 }
@@ -327,6 +349,8 @@ fn run(c: &Cell) -> Verdict {
         Kind::JoinerRange => run_joiner_range(c),
         Kind::GlobalGate => run_global_gate(c),
         Kind::GlobalGateNegative => run_global_negative(c),
+        Kind::MrecGate => run_mrec_gate(c),
+        Kind::MrecGateNegative => run_mrec_negative(c),
         _ => run_roll(c),
     }
 }
@@ -373,6 +397,17 @@ pub(super) fn instant_violations(cluster: &SimCluster, delivery: bool) -> Vec<St
                     ));
                 }
             }
+        }
+    }
+    // ADR 0075 G-d: an MREC spec is applied only once the cluster version
+    // reached 3 (`Gate::MrecReplication`).
+    for n in CONTROL {
+        let m = cluster.metadata(n);
+        if m.cluster_version() < 3 && m.table_global(GLOBAL_TABLE).is_some_and(|g| g.is_mrec()) {
+            v.push(format!(
+                "gate applied early: node {n} holds an MREC spec at cluster version {}",
+                m.cluster_version()
+            ));
         }
     }
     if delivery {
@@ -598,7 +633,9 @@ fn run_roll(c: &Cell) -> Verdict {
         | Kind::Phase1Joiner { .. }
         | Kind::JoinerRange
         | Kind::GlobalGate
-        | Kind::GlobalGateNegative => unreachable!(),
+        | Kind::GlobalGateNegative
+        | Kind::MrecGate
+        | Kind::MrecGateNegative => unreachable!(),
     }
 
     // Liveness: the era starts once the last node is B2, every node recorded.
@@ -1110,6 +1147,7 @@ fn global_spec() -> animus_control::GlobalTableSpec {
         regions: vec!["a".into(), "b".into(), "c".into()],
         witness: None,
         preferred_leader_region: "a".into(),
+        replicas: Vec::new(),
     }
 }
 
@@ -1315,6 +1353,283 @@ fn run_global_negative(c: &Cell) -> Verdict {
     }
     if cluster.control_last_log_index(OLD) != pre_log {
         v.push("the previous-release replica appended the GlobalTables value".into());
+    }
+    verdict_of(c, v, cap_fired)
+}
+
+// ---------------------------------------------------------------------------
+// The second real gate: `Gate::MrecReplication` (cluster version 3, G-01 stage G-d)
+// ---------------------------------------------------------------------------
+
+fn mrec_convert_cmd() -> MetaCommand {
+    MetaCommand::ConvertTableToMrec {
+        table: GLOBAL_TABLE.to_string(),
+        local_region: "us".to_string(),
+        region_id: animus_control::mrec_region_id("us"),
+    }
+}
+
+fn mrec_add_cmd() -> MetaCommand {
+    MetaCommand::AddMrecReplica {
+        table: GLOBAL_TABLE.to_string(),
+        region: "eu".to_string(),
+        region_id: animus_control::mrec_region_id("eu"),
+    }
+}
+
+/// The table is an MREC table with this cluster's local replica `us` and the
+/// peer `eu` recorded.
+fn mrec_converted(m: &animus_control::Metadata) -> bool {
+    m.table_global(GLOBAL_TABLE).is_some_and(|g| {
+        g.is_mrec()
+            && g.replicas.iter().any(|r| r.local && r.region == "us")
+            && g.replicas.iter().any(|r| r.region == "eu")
+    })
+}
+
+/// Every node `Release(2)` (`[1, 2]`, the G-c binary as it shipped) and the
+/// cluster finalized to version 2, a table present. `keep_old` leaves node
+/// `OLD` as the only `Release(2)` once the others roll to `Release(3)`
+/// (`[1, 3]`); otherwise nobody rolls yet (the caller rolls).
+fn mrec_setup(cluster: &mut SimCluster, w: &mut Watch) {
+    global_setup(cluster, w, true);
+    if !converge(cluster, |c| {
+        w.sample(c);
+        (0..NODES).all(|n| {
+            c.metadata(n)
+                .node_versions
+                .values()
+                .all(|v| v.range == VersionRange::new(1, 2))
+                && c.metadata(n).node_versions.len() == NODES as usize
+        })
+    }) {
+        w.violations
+            .push("the [1,2] records never landed on every node".into());
+    }
+    let l = control_leader(cluster);
+    let (status, body) = finalize(cluster, l, r#"{"to":2,"expected":1}"#);
+    if status != 200 {
+        w.violations
+            .push(format!("finalize 1 -> 2: {status} {body}"));
+    }
+    if !converge(cluster, |c| {
+        w.sample(c);
+        (0..NODES).all(|n| c.metadata(n).cluster_version() == 2)
+    }) {
+        w.violations
+            .push("cluster version 2 never reached on every node".into());
+    }
+}
+
+fn roll_to_release3(cluster: &mut SimCluster, w: &mut Watch, nodes: &[u64]) {
+    for &n in nodes {
+        cluster.set_binary_profile(n, BinaryProfile::Release(3));
+        cluster.set_node_version(n, Some(VersionRange::new(1, 3)));
+        w.run(cluster, Duration::from_millis(500));
+    }
+}
+
+/// Roll `Release(2)` -> `Release(3)` over a table; before the finalize a
+/// relayed `ConvertTableToMrec` is refused by name by the receiver (counted,
+/// nothing appended), a finalize to 3 is refused by apply while a `[1,2]`
+/// node is recorded; after the finalize the identical relay is accepted and
+/// the MREC spec lands on every node, the data-only node's mirror included,
+/// untouched placement, no capped rejection, no wedged control replica.
+fn run_mrec_gate(c: &Cell) -> Verdict {
+    use animus_control::version::Gate;
+    let mut cluster = light_cluster(c.seed);
+    let mut w = Watch::new(true);
+    mrec_setup(&mut cluster, &mut w);
+    if (0..NODES).any(|n| cluster.features(n).is_open(Gate::MrecReplication)) {
+        w.violations
+            .push("MrecReplication open at version 2".into());
+    }
+    // A half-rolled mix (nodes 0,1 and 3 are Release(3), node 2 is not): the
+    // gate is closed and a finalize to 3 is refused by name while node 2
+    // records `[1,2]`.
+    roll_to_release3(&mut cluster, &mut w, &[0, 1, DATA]);
+    let leader = control_leader(&mut cluster);
+    let (status, body) = finalize(&mut cluster, leader, r#"{"to":3,"expected":2}"#);
+    if status == 200 {
+        w.violations.push(format!(
+            "a finalize to 3 was accepted with a [1,2] node: {body}"
+        ));
+    }
+    roll_to_release3(&mut cluster, &mut w, &[OLD]);
+    if !converge(&mut cluster, |c| {
+        w.sample(c);
+        (0..NODES).all(|n| {
+            c.metadata(n)
+                .node_versions
+                .values()
+                .all(|v| v.range == VersionRange::new(1, 3))
+                && c.metadata(n).node_versions.len() == NODES as usize
+        })
+    }) {
+        w.violations
+            .push("the [1,3] records never landed on every node".into());
+    }
+    let leader = control_leader(&mut cluster);
+    let follower = (0..3u64).find(|n| *n != leader).expect("a follower");
+    if (0..NODES).any(|n| cluster.features(n).is_open(Gate::MrecReplication)) {
+        w.violations
+            .push("MrecReplication open before the finalize".into());
+    }
+    let pre_log: Vec<u64> = CONTROL
+        .iter()
+        .map(|&n| cluster.control_last_log_index(n))
+        .collect();
+    for cmd in [mrec_convert_cmd(), mrec_add_cmd()] {
+        for (from, to) in [(follower, leader), (leader, follower)] {
+            let before = cluster.metric(to, animus_env::Metric::ClusterGateRelayRefused);
+            match cluster.relay_request(
+                from,
+                to,
+                animus_node::ClientRequest::ProposeSchema(cmd.clone()),
+            ) {
+                Some(animus_node::ClientResponse::Error(msg))
+                    if msg.contains("relayed command refused")
+                        && msg.contains("MrecReplication") => {}
+                other => w
+                    .violations
+                    .push(format!("relay {from}->{to} not refused by name: {other:?}")),
+            }
+            if cluster.metric(to, animus_env::Metric::ClusterGateRelayRefused) != before + 1 {
+                w.violations
+                    .push(format!("refusal not counted on node {to}"));
+            }
+        }
+    }
+    w.run(&mut cluster, Duration::from_secs(2));
+    let post_log: Vec<u64> = CONTROL
+        .iter()
+        .map(|&n| cluster.control_last_log_index(n))
+        .collect();
+    if post_log != pre_log {
+        w.violations
+            .push("a refused relay appended to the control log".into());
+    }
+    // Finalize 2 -> 3: the gate opens on every node (the data-only one
+    // through its mirror).
+    let l = control_leader(&mut cluster);
+    let (status, body) = finalize(&mut cluster, l, r#"{"to":3,"expected":2}"#);
+    if status != 200 {
+        w.violations
+            .push(format!("finalize 2 -> 3: {status} {body}"));
+    }
+    if !converge(&mut cluster, |c| {
+        w.sample(c);
+        (0..NODES).all(|n| c.features(n).is_open(Gate::MrecReplication))
+    }) {
+        w.violations
+            .push("MrecReplication never opened on every node".into());
+    }
+    let leader = control_leader(&mut cluster);
+    let follower = (0..3u64).find(|n| *n != leader).expect("a follower");
+    for cmd in [mrec_convert_cmd(), mrec_add_cmd()] {
+        match cluster.relay_request(
+            follower,
+            leader,
+            animus_node::ClientRequest::ProposeSchema(cmd),
+        ) {
+            Some(animus_node::ClientResponse::PutOk) => {}
+            other => w
+                .violations
+                .push(format!("the post-finalize relay was refused: {other:?}")),
+        }
+        w.run(&mut cluster, Duration::from_millis(500));
+    }
+    if !converge(&mut cluster, |c| {
+        w.sample(c);
+        (0..NODES).all(|n| mrec_converted(&c.metadata(n)))
+    }) {
+        w.violations
+            .push("the MREC spec never landed on every node (mirror included)".into());
+    }
+    // MREC never pins placement.
+    if (0..NODES).any(|n| {
+        cluster
+            .metadata(n)
+            .tablets_for_table(GLOBAL_TABLE)
+            .any(|(id, _)| {
+                cluster
+                    .metadata(n)
+                    .policies
+                    .get(id)
+                    .is_some_and(|p| p.is_pinned())
+            })
+    }) {
+        w.violations
+            .push("an MREC conversion pinned a policy".into());
+    }
+    let wedged = {
+        let mut last = wedged_control(&cluster);
+        let _ = converge(&mut cluster, |c| {
+            last = wedged_control(c);
+            last.is_empty()
+        });
+        last
+    };
+    if !wedged.is_empty() {
+        w.violations
+            .push(format!("control replicas {wedged:?} wedged"));
+    }
+    w.sample(&cluster);
+    verdict_of(c, w.violations, false)
+}
+
+/// N6: a buggy emitter appends `ConvertTableToMrec` at cluster version 2 with
+/// a `Release(2)` voter. The cap must reject it at exactly that voter, which
+/// is wedged and never appended the entry; the early application on the
+/// others is reported too.
+fn run_mrec_negative(c: &Cell) -> Verdict {
+    let mut cluster = light_cluster(c.seed);
+    let mut w = Watch::new(true);
+    mrec_setup(&mut cluster, &mut w);
+    let others: Vec<u64> = (0..NODES).filter(|&n| n != OLD).collect();
+    roll_to_release3(&mut cluster, &mut w, &others);
+    let setup = std::mem::take(&mut w.violations);
+    if control_leader(&mut cluster) == OLD {
+        let _ = cluster.transfer_leadership(OLD, 0);
+        w.run(&mut cluster, Duration::from_secs(2));
+    }
+    let mut v: Vec<String> = setup;
+    if control_leader(&mut cluster) == OLD {
+        v.push("could not move leadership off the Release(2) node".into());
+    }
+    let pre = instant_violations(&cluster, true);
+    if !pre.is_empty() {
+        v.push(format!("violations before the bad emit: {pre:?}"));
+    }
+    let pre_log = cluster.control_last_log_index(OLD);
+    let accepted = cluster.propose_meta_ungated(mrec_convert_cmd());
+    if !matches!(accepted, ProposeResult::Accepted { .. }) {
+        v.push(format!("the bad emit was not accepted: {accepted:?}"));
+    }
+    w.run(&mut cluster, Duration::from_secs(6));
+    let wedged = wedged_control(&cluster);
+    if wedged != vec![OLD] {
+        v.push(format!("expected only node {OLD} wedged, got {wedged:?}"));
+    }
+    let cap_fired = w.violations.iter().any(|s| {
+        s.starts_with(&format!("delivery: node {OLD} (Release(2))"))
+            && s.contains("MrecReplication")
+    });
+    if !cap_fired {
+        v.push(format!(
+            "the cap never rejected the MrecReplication value: {:?}",
+            w.violations
+        ));
+    }
+    if !w
+        .violations
+        .iter()
+        .any(|s| s.starts_with("gate applied early"))
+    {
+        v.push("the early MREC application went unnoticed".into());
+    }
+    if cluster.control_last_log_index(OLD) != pre_log {
+        v.push("the Release(2) replica appended the MrecReplication value".into());
     }
     verdict_of(c, v, cap_fired)
 }
@@ -1596,6 +1911,16 @@ fn sim_cluster_mixed_version_corpus_negative_control_global_gate() {
 }
 
 #[test]
+fn sim_cluster_mixed_version_corpus_mrec_gate() {
+    run_family("release2_to_release3_mrec_gate");
+}
+
+#[test]
+fn sim_cluster_mixed_version_corpus_negative_control_mrec_gate() {
+    run_family("negative_control_mrec_gate_emitted_early");
+}
+
+#[test]
 fn sim_cluster_mixed_version_cell_names_and_seeds_are_unique() {
     let cs = corpus::seed_expand(cells(), 3);
     let names: BTreeSet<_> = cs.iter().map(|c| c.name.clone()).collect();
@@ -1618,6 +1943,8 @@ fn sim_cluster_mixed_version_cell_names_and_seeds_are_unique() {
         "joiner_range_checks",
         "release1_to_release2_global_gate",
         "negative_control_global_gate_emitted_early",
+        "release2_to_release3_mrec_gate",
+        "negative_control_mrec_gate_emitted_early",
     ] {
         assert!(
             cells().iter().any(|c| c.name.starts_with(prefix)),

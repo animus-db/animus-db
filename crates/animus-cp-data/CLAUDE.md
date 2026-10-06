@@ -1249,11 +1249,39 @@ State once here; cross-referenced from the sections below.
   always writes them; cell `tests/it/txn_resolved_marker_gate.rs`. Residual by design: it remembers only the
   LAST resolver of a key, so a duplicate stage of T arriving after a *later*
   transaction also resolved the same key is not caught — but that residual is
-  now identical on every replica (deterministic), where the old one was
-  per-process. A new internal row kind must be added to `is_internal_key` and
+  identical on every replica for live apply and snapshot install (but see the
+  replay bullet below), where the old one was per-process. A new internal row kind must be added to `is_internal_key` and
   the `animus-test` `EMBEDDED` table. Regression:
   `tests/it/resolved_restage_replica_determinism.rs` (restart + snapshot-install
   variants, `ANIMUS_RESTAGE_SEEDS`).
+- **WAL replay re-applies over an engine that is already ahead (issue #1242).**
+  A restart replays the log tail from `snapshot_index` over the replica's own
+  durable engine, which already holds everything applied before the kill. An
+  arm whose decision reads engine state sees future state on replay; the
+  per-key `merge` version guard protects arms whose only effect is a plain
+  per-key merge, but not whole-or-nothing multi-key ones. `TxnStage`
+  therefore no-ops (`Fenced`) when any of its keys, their resolved markers, or
+  (anchor) its record key carries a version strictly above the entry's `ts`
+  (equal = its own partial merge, re-applies). The read is **tombstone-aware**
+  (`latest_version_incl_tombstone`, over `scan_with_tombstones`): `get` hides a
+  key deleted after the stage, which makes a stage rejected live by an
+  own-key condition (`A` must be absent) look acceptable on replay once `A` is
+  deleted. The branch is unreachable live except via `SeedBatch` (the restore
+  driver merges rows at carried source-cluster versions, so a stage hitting a
+  seeded key with a higher version is Fenced live too — deterministic on every
+  replica, a liveness edge on a not-yet-served table only). Without it a stage
+  the live apply rejected (stale restage caught by one key's marker; stage
+  blocked by a since-resolved intent) resurrected an intent on the restarted
+  replica only, silently dropping later acked txn appends there. The #1243
+  "residual is identical on every replica" statement above held for live apply,
+  not replay. Any new multi-key conditional arm needs the same "what if every
+  key were from the future" review. `KindBatch`/`Batch` make no engine-state
+  decision (nothing to guard); `KindEval`/`KindEvalBatch` re-decide from engine
+  state on replay and their derived rows (change-log, LSI, footprint) sit on
+  unique keys that per-key LWW does not protect — tracked in issue #1247, not
+  fixed here. Regression: `tests/it/txn_stage_replay_stability.rs`
+  (`ANIMUS_TXN_REPLAY_SEEDS`); lesson
+  `docs/lessons/code-patterns/2026-10-06-wal-replay-over-an-ahead-engine-must-not-re-decide-an-apply.md`.
 - **`engine_applied` vs `last_applied`.** The two-task split (below) means the
   core's `last_applied` (a buffer cursor the consensus loop advances) *leads*
   the engine. Linearizable reads therefore gate on the separate
@@ -3250,3 +3278,34 @@ replay. Regression: `animusd` `sim_cluster_split_relocation`. ADR 0058's
 - **TxnId uniqueness (R-01 F-2).** `TxnId.node` is the node qualified by the group stream (`n0#100`; primary stream = bare node id), because `ts` is per-group `Hlc` state and one node leads many groups. `txn_stage_local` (animusd) also refuses, before proposing, a stage group with any key outside the leader range (stale grouping across a split). See `docs/lessons/testing/2026-10-05-a-txn-id-must-be-unique-per-group-not-per-node.md`.
 
 - **Seal check on every mutating apply arm (R-01 F-2).** `TxnCommit`/`TxnAbort` (and the orphan tombstone) are deterministic no-ops on a sealed record key, like every other mutation: a fork clones the parent's CURRENT engine per replica, asynchronously, so a post-fork decision landing in the parent diverges the children. Regression: `tests/it/split_tablet.rs::a_txn_decision_ordered_after_the_fork_is_a_sealed_no_op`; see `docs/lessons/testing/2026-10-05-every-mutating-apply-arm-needs-the-seal-check.md`.
+
+- **MREC shapes (G-01 stage G-d M1).** `KindEvalOp::Replicate { item, ver }` and
+  `WriteSchema.mrec` ride as JSON blobs inside `KindEval`/`KindEvalBatch`/`TxnStage`
+  (no binary codec bump, wire stays v1, WAL v2). `KvCommand::required_gate` is
+  **content-dependent** for those three carriers (`gates.rs::eval_gate`: MREC content
+  joins to `Gate::MrecReplication`), enforced at the one `gated_propose` choke point;
+  `evaluate_kind_eval` gives a `Replicate` its LWW semantics (M2, below). Shaped fixtures `raftkv-wire/v1-mrec.bin`, `raftkv-wal/v2-mrec.bin`
+  (built by `codec::tests::mrec_sample_wires`; `fixture_files` skips `vN-<shape>` names).
+
+- **MREC apply (G-01 stage G-d M2, ADR 0075 amendment).** `evaluate_kind_eval` takes
+  the stored stamp (`decode_stored_item_versioned`; the `KindEvalBatch` overlay carries
+  it too). `KindEvalOp::Replicate` applies iff `ver > stored` via the normal
+  `derive_kind_writes` path, else `KindEvalDecision::Superseded` (no writes, not even a
+  change record; leader-local `KindEvalResult::superseded` /
+  `KindEvalItemResult::Superseded`, the replicated outcome stays `Applied`); a key with
+  an intent gives `ConditionFailed` (the shipper's Retry); `mrec: None` rejects. A local
+  op with `WriteSchema.mrec` stamps via `MrecVersion::next_local`. A `Replicate` in a
+  `TxnStage` is rejected before evaluation. Tests: `src/mrec_props.rs` (pure convergence
+  proptest + two negative controls, `ANIMUS_MREC_PROP_CASES`), `tests/it/mrec_apply.rs`
+  (a group opened with `HostedOptions { features }` at cluster version 3: the propose
+  gate panics in tests otherwise). **Adding a base-row writer for an MREC table means
+  stamping it** (see the ADR's writer audit).
+
+**MREC apply is the only consumer-facing piece here (ADR 0075 "G-d as built").** The
+shipper, saga and receiver live in `animusd`; this crate owns the last-writer-wins rule
+(`apply_mrec`: stored `MrecVersion` vs the incoming one, `Superseded` on a loss, stamped
+tombstones, a foreign intent is `Retry`) and the content-dependent `KvCommand::required_gate`.
+The cursor rows `mrec:<region>`/`mrecscan:<region>` are ordinary `KIND_CURSOR` rows written
+through the existing kind ops (no new command); `trim_split_child` drops them, which is why
+a split child rescans. Test-only switch `mrec_test_switch::set_lww_by_arrival` (thread-local)
+backs the M5 negative control; never reachable in a release build path.

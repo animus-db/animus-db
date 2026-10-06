@@ -609,6 +609,25 @@ jobs:
           ANIMUS_MRSC_SEEDS: '10'
         run: cargo test -p animusd --lib sim_cluster_mrsc -- --nocapture
 
+      # G-01 stage G-d M5 (ADR 0075 section 4.9): the multi-cluster MREC
+      # fault-injection corpus. `SimWorld` = 2-3 real 3-node clusters on the
+      # LSM backend joined into one eventually-consistent global table, random
+      # wire workloads under WAN partition/loss/duplication, node crash and
+      # restart on both sides, tablet split while shipping, clock skew within
+      # and beyond the bound, and a peer down past max_backlog (resync); the
+      # oracle is convergence + LWW + no loss/resurrection + no re-replication
+      # + stream parity; four negative controls (LWW by arrival, cursor
+      # before ack, loop prevention off, a wrong expectation) must fail.
+      # Fixed depth (measured ~57 s per seed on 4 cores, all 17 cells + the
+      # controls in parallel), no workflow_dispatch input.
+      - name: deep MREC multi-cluster corpus (ADR 0075)
+        id: mrec_world
+        continue-on-error: true
+        timeout-minutes: 30
+        env:
+          ANIMUS_MREC_SEEDS: '15'
+        run: cargo test -p animusd --lib sim_world_mrec_corpus -- --nocapture
+
       # ADR 0028's C-05 PR 2 SharedWal persist-path wiring: cross-tablet
       # coalescing under a burst of concurrent hosted-group writes, a crash
       # mid-round proving no cross-tablet contamination and whole-or-absent
@@ -783,6 +802,7 @@ jobs:
             [wan_timing]="${{ steps.wan_timing.outcome }}"
             [mrsc_leader]="${{ steps.mrsc_leader.outcome }}"
             [mrsc_cluster]="${{ steps.mrsc_cluster.outcome }}"
+            [mrec_world]="${{ steps.mrec_world.outcome }}"
             [sharedwal]="${{ steps.sharedwal.outcome }}"
             [wal_rewrite_crash]="${{ steps.wal_rewrite_crash.outcome }}"
             [upgrade_restart]="${{ steps.upgrade_restart.outcome }}"
@@ -794,7 +814,7 @@ jobs:
           )
           failed=0
           failed_names=()
-          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner reconfigure_drop inplace_split backup pitr lsm_crash lsm_disk_fault lsm_encrypted segment_store_encrypted control simcluster dynamo_wire zone_placement split_relocation export_import s3_fault heartbeat wan_timing mrsc_leader mrsc_cluster sharedwal wal_rewrite_crash upgrade_restart upgrade_restart_cluster upgrade_mixed upgrade_mixed_cluster upgrade_roll learner_snapshot_livelock; do
+          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner reconfigure_drop inplace_split backup pitr lsm_crash lsm_disk_fault lsm_encrypted segment_store_encrypted control simcluster dynamo_wire zone_placement split_relocation export_import s3_fault heartbeat wan_timing mrsc_leader mrsc_cluster mrec_world sharedwal wal_rewrite_crash upgrade_restart upgrade_restart_cluster upgrade_mixed upgrade_mixed_cluster upgrade_roll learner_snapshot_livelock; do
             outcome="${outcomes[$name]}"
             echo "${name}: ${outcome}"
             if [ "${outcome}" != "success" ]; then

@@ -117,7 +117,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             .map_err(TxnAbortReason::Other)?;
         if !pending_kind_writes.is_empty() {
             let meta = self.effective_metadata();
-            let schema = dynamo::write_schema_for(&meta, table);
+            let mut schema = dynamo::write_schema_for(&meta, table);
+            // ADR 0075 V14: a transaction on an MREC table is region-local; its
+            // rows carry the same last-writer-wins stamp as any other write.
+            schema.mrec = dynamo::mrec_write_stamp(&meta, table, self.env.wall_now().0);
             // Both halves of the throttle pre-charge below are loop-invariant:
             // they depend only on `meta` (just snapshotted) and `table` (fixed
             // for this call), never on the per-item key. Hoisted so a 100-action
@@ -154,7 +157,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                             crate::KindWriteOp::Put(item) => {
                                 capacity::write_units(capacity::item_size(item))
                             }
-                            crate::KindWriteOp::Delete | crate::KindWriteOp::Update { .. } => 1.0,
+                            crate::KindWriteOp::Delete
+                            | crate::KindWriteOp::Update { .. }
+                            | crate::KindWriteOp::Replicate { .. } => 1.0,
                         };
                     if !self
                         .throttle
@@ -1591,6 +1596,24 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                  (ADR 0022) for a multi-participant transaction",
                 w.key, w.table
             )));
+        }
+
+        // ADR 0075 G-d M2: a plain (edge-valued, non-`pending`) write carries
+        // its base value as opaque bytes and so cannot be MREC-stamped at
+        // apply; refuse it on an MREC table. Every Dynamo transaction write is
+        // `pending` (evaluated and stamped at `TxnStage` apply), so only the
+        // raw client protocol's `Txn` can land here.
+        {
+            let meta = self.effective_metadata();
+            if let Some(w) = writes.iter().find(|w| {
+                w.pending.is_none() && meta.table_global(&w.table).is_some_and(|g| g.is_mrec())
+            }) {
+                return Err(TxnAbortReason::Other(format!(
+                    "table `{}` is an MREC global table: raw (unstamped) transactional writes \
+                     are not supported",
+                    w.table
+                )));
+            }
         }
 
         // Auto-provision every distinct table's first tablet on demand, like

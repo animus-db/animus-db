@@ -262,6 +262,31 @@ impl ChaosCluster {
         out
     }
 
+    /// Node `i`'s non-zero counters from `/admin/metrics` whose name contains
+    /// any of `needles`, as `name=value` strings (empty when the node does
+    /// not answer). Counters are per process, so a restarted node reports
+    /// only what happened since its restart.
+    pub async fn counters(&self, i: usize, needles: &[&str]) -> Vec<String> {
+        let Ok((200, body)) =
+            http_get(self.admin_addr(i), "/admin/metrics", Duration::from_secs(3)).await
+        else {
+            return Vec::new();
+        };
+        let Some(Value::Object(counters)) = serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|v| v.get("counters").cloned())
+        else {
+            return Vec::new();
+        };
+        counters
+            .iter()
+            .filter(|(k, v)| {
+                needles.iter().any(|n| k.contains(n)) && v.as_f64().is_some_and(|x| x != 0.0)
+            })
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect()
+    }
+
     /// Which live, un-paused node is the control-plane leader right now.
     pub async fn control_leader(&self) -> Option<usize> {
         for i in 0..self.n {

@@ -3200,3 +3200,22 @@ Known gaps: no leader step-down (`RaftCore` has no step-down API), and the
 apply task's engine `merge_batch`/applied-marker `.expect` on ENOSPC is
 unchanged (LSM path). Tests: `persist_round` unit tests; end-to-end by the
 `animus-test` disk-full corpus (`ANIMUS_DISK_FULL_SEEDS`).
+
+## MREC formats and `Gate::MrecReplication` (G-01 stage G-d M1, ADR 0075/0073 amendments)
+
+`MAX_SUPPORTED = 3`; **`MIN_SUPPORTED` is held at the literal `1`**, not `MAX - 1`:
+the era starts at cluster version 1 and `ReportNodeVersion` is rejected when its range
+excludes the current version, so a floor of 2 would stop a fresh cluster ever starting
+an era (raising it needs the era-start rule redesigned first). `Gate::MrecReplication`
+(version 3) guards `MetaCommand::{ConvertTableToMrec, AddMrecReplica,
+RemoveMrecReplica, SetMrecReplicaStatus}` (all relayable, mirrored as schema rows),
+`MultiRegionConsistency::Eventual` and `GlobalTableSpec.replicas` (additive, skipped
+when empty). A `ConvertTableToGlobal` carrying an `Eventual` spec is classified
+`MrecReplication` **by content** (and rejected by apply). The MRSC-only restrictions
+(no TTL/LSI) test `GlobalTableSpec::is_mrsc()`; anything that means "MRSC" must too.
+`mrec_region_id` (FNV-1a, vectors pinned) is frozen. Sim: `BinaryProfile::Release(2)`
+is `[1, 2]` as shipped (unit-tested); the sim cap's `content_gate` names the MREC
+variants by content, independent of `required_gate`. Cells:
+`version_mixed_corpus::release2_to_release3_mrec_gate` + N6; apply matrix:
+`tests/it/mrec_table_apply.rs`; fixtures `metadata/v1-mrec.json`,
+`mirror-entities/schema/v1-mrec.json` (shaped `vN-<shape>` names, read by dedicated tests).

@@ -1048,6 +1048,20 @@ impl SimClusterHandle {
         self.ctxs.lock().expect("ctxs poisoned")[node as usize].clone()
     }
 
+    /// A clone of `node`'s own `ClientCtx` for code that runs the node's real
+    /// handlers by hand (G-d M3: the MREC receiver driven through `SimWorld`).
+    pub(crate) fn node_ctx(&self, node: u64) -> SimNodeCtx {
+        self.ctx(node)
+    }
+
+    /// Give every node's `ClientCtx` the MREC peer configuration `cfg` (G-d M4b:
+    /// the wire-edge `UpdateTable` and the saga read `ctx.mrec`).
+    pub(crate) fn set_mrec_config(&self, cfg: std::sync::Arc<crate::mrec_peer::MrecConfig>) {
+        for ctx in self.ctxs.lock().expect("ctxs poisoned").iter_mut() {
+            ctx.mrec = cfg.clone();
+        }
+    }
+
     fn set_ctx(&self, node: u64, ctx: SimNodeCtx) {
         self.ctxs.lock().expect("ctxs poisoned")[node as usize] = ctx;
     }
@@ -2582,6 +2596,7 @@ impl SimCluster {
                 backup_janitor_progress: Arc::new(Mutex::new(
                     animus_node::backup_janitor::JanitorProgress::default(),
                 )),
+                mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
                 ttl_reaper_progress: Arc::new(Mutex::new(
                     animus_node::ttl_reaper::TtlReaperProgress::default(),
                 )),
@@ -4227,7 +4242,7 @@ impl SimCluster {
     /// cost by well over half relative to the pre-fix (`SimCluster::new`)
     /// baseline — see `SCENARIO_TIMER_FIRES_BUDGET`'s own doc for the exact
     /// before/after numbers this fix was measured against.
-    fn spawn_and_capture_fast<T, F>(&mut self, node: u64, fut: F) -> Option<T>
+    pub(crate) fn spawn_and_capture_fast<T, F>(&mut self, node: u64, fut: F) -> Option<T>
     where
         T: Send + 'static,
         F: std::future::Future<Output = T> + Send + 'static,
@@ -6145,6 +6160,7 @@ impl SimCluster {
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),
+            mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             ttl_reaper_progress: Arc::new(Mutex::new(
                 animus_node::ttl_reaper::TtlReaperProgress::default(),
             )),
@@ -6485,6 +6501,7 @@ impl SimCluster {
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),
+            mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             ttl_reaper_progress: Arc::new(Mutex::new(
                 animus_node::ttl_reaper::TtlReaperProgress::default(),
             )),
@@ -6793,6 +6810,7 @@ impl SimCluster {
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),
+            mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             ttl_reaper_progress: Arc::new(Mutex::new(
                 animus_node::ttl_reaper::TtlReaperProgress::default(),
             )),
@@ -7609,6 +7627,7 @@ impl SimCluster {
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),
+            mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             ttl_reaper_progress: Arc::new(Mutex::new(
                 animus_node::ttl_reaper::TtlReaperProgress::default(),
             )),

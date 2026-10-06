@@ -103,17 +103,24 @@ jobs:
             "${{ steps.pick.outputs.tests }}" -- --nocapture --test-threads=1
 
       # Surface what failed as annotations, which the checks API serves even
-      # where the job log and the artifact below cannot be downloaded: the
-      # oracle's violations and each node's panic or last log lines.
+      # where the job log and the artifact below cannot be downloaded. The
+      # first annotation is the harness's compact summary.txt: one line per
+      # violation group (kind, key, serving node, missing count and writer
+      # classes, never the value lists), the [replica-convergence] verdict and
+      # every node's counters, sized to fit the 3,500-character cap whole.
+      # Then the head of violations.txt (each line cut) and any node panic.
       - name: Annotate the failure
         if: failure()
         env:
           OUT: ${{ runner.temp }}/chaos-out
         run: |
-          esc() { python3 -c 'import sys; d=sys.stdin.read()[-3500:]; print(d.replace("%","%25").replace("\r","%0D").replace("\n","%0A"), end="")'; }
+          esc() { python3 -c 'import sys; d=sys.stdin.read()[:3500]; print(d.replace("%","%25").replace("\r","%0D").replace("\n","%0A"), end="")'; }
           shopt -s nullglob globstar
+          for f in "$OUT"/**/summary.txt; do
+            echo "::error title=chaos summary ($(basename "$(dirname "$f")"))::$(esc < "$f")"
+          done
           for f in "$OUT"/**/violations.txt; do
-            echo "::error title=chaos violations ($(basename "$(dirname "$f")"))::$(head -n 60 "$f" | esc)"
+            echo "::error title=chaos violations, first lines ($(basename "$(dirname "$f")"))::$(head -n 12 "$f" | cut -c1-280 | esc)"
           done
           n=0
           for f in "$OUT"/**/*.log; do

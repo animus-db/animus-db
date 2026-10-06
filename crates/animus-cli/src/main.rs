@@ -895,7 +895,9 @@ fn admin_request(
         "control-members" => ("GET", "/admin/control/members".into(), None),
         // `GET /admin/global-tables` (ADR 0075 section 8, G-01 G-c): every
         // MRSC global table's Regions, preferred leader, placement and
-        // warnings.
+        // warnings, plus (G-d M6) every MREC table's replicas and this node's
+        // per-(tablet, peer) shipper health (backlog, lag, last ack, resync,
+        // last error). The CLI prints the JSON as served.
         "global-tables" => ("GET", "/admin/global-tables".into(), None),
         // `POST /admin/control/transfer {to}` (ADR 0020/0037, roadmap U-05):
         // a single request/response, unlike `control-add`/`control-remove`/
@@ -2137,6 +2139,10 @@ fn print_response(response: &ClientResponse) {
                 println!("  [{i}] {result:?}");
             }
         }
+        // Internal intra-only MREC replication reply (ADR 0075, G-01 stage
+        // G-d M3): consumed by a peer cluster's shipper, never requested by a
+        // CLI subcommand — printed raw if one ever surfaces here.
+        ClientResponse::MrecApply(resp) => println!("mrec apply: {resp:?}"),
         // Internal TxnResolve RPC reply (ADR 0018 §3/§6, torn-pair-fix
         // stack PR2): consumed programmatically by `txn_resolve_participant_retrying`,
         // not requested by any CLI subcommand of its own — printed raw if

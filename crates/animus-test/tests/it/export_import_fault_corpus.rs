@@ -825,6 +825,7 @@ fn decode_and_derive_item_mirror(
         },
         lsis: Vec::new(),
         change_records_carry_images: false,
+        mrec: None,
     };
     let base_value = encode_stored_item(&item);
     let derived = derive_kind_writes(

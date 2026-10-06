@@ -2020,6 +2020,18 @@ outstanding on the wire surface at present.
     delivery, region failure and heal, concurrent conflicting writes from
     both regions: convergence and LWW determinism asserted by
     `check_convergence`-style oracles).
+    **Landed 2026-10-06 (ADR 0075 "G-d as built (M0-M6)"), simulation-proven**
+    behind `Gate::MrecReplication` (cluster version 3): `UpdateTable
+    ReplicaUpdates` create/delete saga, stamped LWW apply, per-(tablet, peer)
+    shipper, TTL sync, split lineage by unfiltered scan, the `SimWorld`
+    multi-cluster corpus (`ANIMUS_MREC_SEEDS`, nightly), the `/admin/global-tables`
+    MREC rows and one real-process two-cluster test over mutual TLS. **Residuals:**
+    no WAN cost or latency number (the `animus-bench` cross-region variant is
+    still owed); F2 (current-state shipping, so the receiver's stream coalesces
+    intermediate writes) awaits a maintainer decision; cluster-wide lag
+    aggregation and alerting; the operator wiring of `peers` (G-e); AWS wire
+    names unverified (ADR 0075 section 0); the other gaps are listed at the end
+    of the ADR's amendment.
   - **G-e Operator multi-cluster federation (L).** One `AnimusCluster` per
     Kubernetes cluster/region plus a federating resource or peer spec
     (cross-cluster endpoint discovery, peer TLS trust per ADR 0064,
@@ -2144,7 +2156,7 @@ wave are independent and can run in parallel.
 | 16 | C-15 (closed 2026-09-20 — node assembly/raw `ClientRequest` assess-and-close, ADR 0061 rung O, #997) | Gated on C-14 (closed) — the last class-D group C-14's own close-out confirmed still unowned |
 | 17 | S-08 (S3 credentials/multipart; landed 2026-10-04); G-01 stage G-a + G-b (topology-aware operator, global-tables ADR); R-01 sub-tracks c (fuzzing), f (observability), g (release engineering) | All independent of each other and of the open C-16 phases; no ordering constraint |
 | 18 | C-17 (scale/density), R-01 sub-tracks a (soak), b (chaos), d (resource bounds), e (runbook) | C-17 Tier 2 and R-01 (a)/(e) capacity planning need `animus-bench`'s generator (landed, ADR 0076); C-17 Tier 1 and R-01 (b)/(d) can start earlier |
-| 19 | G-01 stages G-d (MREC), G-e (federation); G-c (MRSC stretch) landed 2026-10-05 | G-c: done (ADR 0075 "G-c as built"; residuals under G-01 above). G-d/G-e: C-16 Phase 2 is done and the first gate has shipped (`GlobalTables`, version 2); they add their own gates. `animus-bench` (ADR 0076) cross-region variant still owed to quantify WAN cost |
+| 19 | G-01 stage G-e (federation); G-c (MRSC stretch) landed 2026-10-05, G-d (MREC) 2026-10-06 | G-c: done (ADR 0075 "G-c as built"; residuals under G-01 above). G-d: done 2026-10-06, simulation-proven (ADR 0075 "G-d as built"; gate `MrecReplication`, version 3; residuals under G-01 above). G-e: still open (C-16 Phase 2 is done; it adds its own gate if it needs one). `animus-bench` (ADR 0076) cross-region variant still owed to quantify WAN cost |
 | 20 | R-01 runbook upgrade chapter | C-16 Phase 3 (rolling upgrades) is done: `docs/runbook/upgrade.md` carries the rolling and operator procedures |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed

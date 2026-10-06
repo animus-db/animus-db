@@ -11,7 +11,9 @@
 //! edits/deletions.
 
 use animus_item::{
-    AttributeValue, ChangeRecord, Item, decode_stored_item, encode_stored_item, encode_tombstone,
+    AttributeValue, ChangeRecord, Item, MrecVersion, decode_stored_item,
+    decode_stored_item_versioned, encode_stored_item, encode_stored_item_versioned,
+    encode_tombstone, encode_tombstone_versioned, encode_tombstone_versioned_keyed,
     stored::stored_item_version,
 };
 use std::collections::BTreeMap;
@@ -24,13 +26,20 @@ fn fixtures_dir(format: &str) -> PathBuf {
         .join(format)
 }
 
-/// Every `vN.json` under `format`'s directory as `(N, bytes)`, sorted.
+/// Every `vN.json` under `format`'s directory as `(N, bytes)`, sorted;
+/// `vN-<shape>.json` files (an additive variant inside the same version, ADR
+/// 0073 Phase 2) are skipped here and read by [`shaped_fixture`].
 fn fixtures(format: &str) -> Vec<(u32, Vec<u8>)> {
     let dir = fixtures_dir(format);
     let mut out: Vec<(u32, Vec<u8>)> = fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("reading fixture dir {}: {e}", dir.display()))
         .map(|e| e.expect("dir entry").path())
         .filter(|p| p.extension().is_some_and(|ext| ext == "json"))
+        .filter(|p| {
+            !p.file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.contains('-'))
+        })
         .map(|p| {
             let stem = p.file_stem().and_then(|s| s.to_str()).expect("utf8 name");
             let version = stem
@@ -50,6 +59,12 @@ fn fixtures(format: &str) -> Vec<(u32, Vec<u8>)> {
         dir.display()
     );
     out
+}
+
+/// The bytes of `vN-<shape>.json` under `format`'s directory.
+fn shaped_fixture(format: &str, version: u32, shape: &str) -> Vec<u8> {
+    let path = fixtures_dir(format).join(format!("v{version}-{shape}.json"));
+    fs::read(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
 }
 
 #[allow(
@@ -125,6 +140,24 @@ fn expected_stored_item(version: u32) -> Item {
     }
 }
 
+/// The stamp every versioned `stored-item` fixture carries: values past
+/// `u32::MAX` / `i64::MAX` ranges exercise the width of each field.
+fn representative_mrec_version() -> MrecVersion {
+    MrecVersion {
+        wall_ms: 1_790_000_000_123,
+        logical: 7,
+        region_id: 0xe40c_292c,
+    }
+}
+
+/// The shapes of `stored-item` that are additive variants inside v1
+/// (`v1-<shape>.json`): every one needs an expected value here.
+const STORED_ITEM_SHAPES: [&str; 3] = [
+    "versioned",
+    "versioned-tombstone",
+    "versioned-tombstone-keyed",
+];
+
 fn representative_change_record() -> ChangeRecord {
     let mut old = Item::new();
     old.insert("id".into(), s("u1"));
@@ -159,6 +192,54 @@ fn stored_item_fixtures_decode_to_the_expected_value() {
             .unwrap_or_else(|e| panic!("stored-item v{version} fails to decode: {e}"));
         assert_eq!(decoded, Some(expected_stored_item(version)), "v{version}");
     }
+}
+
+/// The additive MREC variants (ADR 0075 G-d, inside v1): each checked-in
+/// shaped fixture decodes to its own hand-written item and stamp, still
+/// sniffs as v1, and the unversioned decoder ignores the stamp.
+#[test]
+fn versioned_stored_item_shape_fixtures_decode_to_the_expected_value() {
+    let ver = representative_mrec_version();
+    for shape in STORED_ITEM_SHAPES {
+        let bytes = shaped_fixture("stored-item", 1, shape);
+        assert_eq!(stored_item_version(&bytes), Some(1), "{shape}");
+        let (item, got) = decode_stored_item_versioned(&bytes)
+            .unwrap_or_else(|e| panic!("stored-item v1-{shape} fails to decode: {e}"));
+        let want_item = match shape {
+            "versioned" => Some(representative_item()),
+            "versioned-tombstone" | "versioned-tombstone-keyed" => None,
+            other => panic!("stored-item shape {other} has no hand-written expected value"),
+        };
+        assert_eq!(item, want_item, "{shape}");
+        assert_eq!(got, Some(ver), "{shape}");
+        assert_eq!(decode_stored_item(&bytes).unwrap(), want_item, "{shape}");
+    }
+}
+
+/// Old-input test: every unversioned (v1) fixture decodes exactly as before
+/// and carries no stamp — a row of a pre-MREC table (or one written before
+/// its table was converted) compares as `MrecVersion::ZERO`.
+#[test]
+fn unversioned_v1_fixtures_decode_without_a_stamp() {
+    for (version, bytes) in fixtures("stored-item") {
+        let (item, ver) = decode_stored_item_versioned(&bytes).expect("decodes");
+        assert_eq!(item, Some(expected_stored_item(version)));
+        assert_eq!(ver, None);
+    }
+}
+
+#[test]
+fn versioned_stored_item_round_trips() {
+    let ver = representative_mrec_version();
+    let item = representative_item();
+    assert_eq!(
+        decode_stored_item_versioned(&encode_stored_item_versioned(&item, ver)).unwrap(),
+        (Some(item), Some(ver))
+    );
+    assert_eq!(
+        decode_stored_item_versioned(&encode_tombstone_versioned(ver)).unwrap(),
+        (None, Some(ver))
+    );
 }
 
 #[test]
@@ -230,5 +311,60 @@ fn generate_fixture_change_record() {
     write_new_fixture(
         &fixtures_dir("change-record").join("v1.json"),
         &representative_change_record().encode(),
+    );
+}
+
+#[test]
+#[ignore = "run explicitly to (re)generate a fixture: cargo test -p animus-item --test it format_fixtures::generate_fixture_stored_item_versioned -- --ignored"]
+fn generate_fixture_stored_item_versioned() {
+    let ver = representative_mrec_version();
+    write_new_fixture(
+        &fixtures_dir("stored-item").join("v1-versioned.json"),
+        &encode_stored_item_versioned(&representative_item(), ver),
+    );
+    write_new_fixture(
+        &fixtures_dir("stored-item").join("v1-versioned-tombstone.json"),
+        &encode_tombstone_versioned(ver),
+    );
+}
+
+#[test]
+#[ignore = "run explicitly to (re)generate a fixture: cargo test -p animus-item --test it format_fixtures::generate_fixture_stored_item_keyed_tombstone -- --ignored --exact"]
+fn generate_fixture_stored_item_keyed_tombstone() {
+    write_new_fixture(
+        &fixtures_dir("stored-item").join("v1-versioned-tombstone-keyed.json"),
+        &keyed_tombstone(),
+    );
+}
+
+fn keyed_tombstone() -> Vec<u8> {
+    encode_tombstone_versioned_keyed(
+        representative_mrec_version(),
+        &AttributeValue::S("user#1".into()),
+        Some(&AttributeValue::N("42".into())),
+    )
+}
+
+/// The keyed tombstone (G-d M4) decodes as a tombstone with its stamp and
+/// yields its key; the keyless one yields none.
+#[test]
+fn keyed_tombstone_carries_its_key() {
+    let bytes = keyed_tombstone();
+    assert_eq!(
+        decode_stored_item_versioned(&bytes).unwrap(),
+        (None, Some(representative_mrec_version()))
+    );
+    assert_eq!(
+        animus_item::decode_tombstone_key(&bytes),
+        Some((
+            AttributeValue::S("user#1".into()),
+            Some(AttributeValue::N("42".into()))
+        ))
+    );
+    assert_eq!(
+        animus_item::decode_tombstone_key(&encode_tombstone_versioned(
+            representative_mrec_version()
+        )),
+        None
     );
 }
