@@ -5280,15 +5280,19 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
 
     /// The leader's view of a peer's health (issue #1228): the last
     /// `check_pending` it reported on an `AppendEntriesResp` (`Some(true)` for
-    /// a storage-full follower's frozen ack), and when that ack arrived. Both
-    /// `None` until the peer has acked this leadership stint. Diagnostic: the
-    /// corpus uses it to prove a full follower keeps acking.
+    /// a storage-full follower's frozen ack), and how long ago, **on this
+    /// node's own clock**, that ack arrived (a caller's clock may be skewed
+    /// from this node's in the sim). Both `None` until the peer has acked this
+    /// leadership stint. Diagnostic: the corpus uses it to prove a full
+    /// follower keeps acking.
     #[must_use]
-    pub fn peer_health(&self, node: &NodeId) -> (Option<bool>, Option<animus_env::Nanos>) {
+    pub fn peer_health(&self, node: &NodeId) -> (Option<bool>, Option<std::time::Duration>) {
         let c = self.lock();
+        let now = self.env.now();
         (
             c.peer_check_pending(node),
-            c.peer_last_contact(node.clone()),
+            c.peer_last_contact(node.clone())
+                .map(|at| std::time::Duration::from_nanos(now.0.saturating_sub(at.0))),
         )
     }
 
@@ -5974,21 +5978,28 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // *after* releasing it and only ever grows, so a concurrent apply can
         // make this false-negative (a read that falls back to the strong
         // path, which is always correct) but never false-positive.
-        let (has_leader, had_contact, commit) = {
+        let (has_leader, had_contact, commit, snapshot_index) = {
             let core = self.lock();
             (
                 core.leader().is_some(),
                 core.has_had_leader_contact(),
                 core.commit_index(),
+                core.snapshot_index(),
             )
         };
-        // Issue #1228: a storage-full replica never campaigns, so when its
-        // leader is lost while every replica is full no election can follow
-        // until space returns. Its engine still holds a genuine prefix of the
-        // log (it has had a leader in this process's lifetime, and the engine
-        // clause below still holds), so it keeps serving the eventual read it
-        // can serve rather than falling back to a barrier no leader can run.
-        let has_leader = has_leader || (had_contact && self.is_storage_full());
+        // Issue #1228: a storage-full replica never campaigns and its apply task
+        // may be paused on ENOSPC, so neither "knows a current leader" nor
+        // "applied everything committed" can be restored until space returns --
+        // yet its engine still holds a genuine, in-order prefix of the log
+        // (a paused apply stops between entries), which is exactly what an
+        // eventual read promises. So a full replica that has had a leader in
+        // this process's life serves unless it is mid-`InstallSnapshot`
+        // (`engine_applied < snapshot_index`: a half-written image, the one
+        // state that is not a prefix of the log). A process that has never
+        // heard a leader still serves nothing.
+        if self.is_storage_full() {
+            return had_contact && self.engine_applied_index() >= snapshot_index;
+        }
         Self::stale_read_ready_decision(has_leader, self.engine_applied_index(), commit)
     }
 
@@ -7337,22 +7348,25 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 let first = c
                     .first_term_index()
                     .expect("a leader has a first-term index");
-                // Issue #1228: a storage-full leader can hold a commit index
-                // its own WAL never reached (a healthy follower's ack plus its
-                // own un-persisted append make a "majority"), and applies only
-                // what it has made durable, so waiting for the engine to reach
-                // `commit_index` would never finish. Every write ever
-                // *acknowledged* is applied, hence durable, so the ReadIndex
-                // that must be covered is the durable prefix of the commit:
-                // `min(commit, durable)`. (A leader holds every previously
-                // committed entry durably -- its election's own persist round
-                // covered them -- so nothing acked sits past `durable`.)
-                let covered = if self.is_storage_full() {
-                    c.commit_index().min(c.durable_index())
+                // Issue #1228: a storage-full leader cannot apply what it
+                // cannot persist (the WAL is suspect, or the engine's own
+                // writes are stalled on ENOSPC), so `commit_index` can sit past
+                // what its engine will ever reach until space returns, and
+                // waiting for the engine to reach it would never finish. What
+                // the read must cover is every write ever *acknowledged*:
+                // those of this leader's own term were acked only after
+                // being applied here, and the read is served from the
+                // engine's state at serving time, which holds them; those of
+                // earlier terms are all at or below this leader's first
+                // current-term entry (its election no-op), which it
+                // confirmed committed above. So the ReadIndex that must be
+                // applied is `first`, not the (unreachable) commit index.
+                let target = if self.is_storage_full() {
+                    first
                 } else {
                     c.commit_index()
                 };
-                (covered >= first).then(|| (c.term(), covered))
+                (c.commit_index() >= first).then(|| (c.term(), target))
             };
             if let Some(state) = captured {
                 break state;

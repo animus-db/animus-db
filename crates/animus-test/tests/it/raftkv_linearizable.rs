@@ -3185,6 +3185,11 @@ struct AllFullSample {
     linearizable: Option<Option<Vec<u8>>>,
     /// Per live node: the eventual read (`None` = gate closed or not served).
     eventual: Vec<Option<Option<Vec<u8>>>>,
+    /// The (first) leader's view of each peer slot: the last reported
+    /// `check_pending` and the age in ms of its last ack.
+    acks: Vec<(usize, Option<bool>, Option<u64>)>,
+    /// Some replica had committed entries its engine had not applied yet.
+    engine_behind: bool,
 }
 
 /// Spawn the in-window sampler: every `period` it records an [`AllFullSample`]
@@ -3216,6 +3221,10 @@ fn spawn_all_full_sampler<S: StorageEngine + 'static>(
                 leaders_full: true,
                 linearizable: None,
                 eventual: Vec::new(),
+                acks: Vec::new(),
+                engine_behind: snapshot
+                    .iter()
+                    .any(|n| n.commit_index() > n.engine_applied_index()),
             };
             let dead_slot = dead.load(Ordering::SeqCst);
             for (i, n) in snapshot.iter().enumerate() {
@@ -3226,6 +3235,14 @@ fn spawn_all_full_sampler<S: StorageEngine + 'static>(
                 }
             }
             if let Some(&li) = sample.leaders.first() {
+                for j in 0..snapshot.len() {
+                    if j != li {
+                        let (flag, at) = snapshot[li].peer_health(&nid(GROUP_IDS[j]));
+                        sample
+                            .acks
+                            .push((j, flag, at.map(|a| a.as_millis() as u64)));
+                    }
+                }
                 sample.linearizable = snapshot[li].linearizable_get_served(&key).await;
             }
             for (i, n) in snapshot.iter().enumerate() {
@@ -3279,13 +3296,17 @@ struct FullWindow {
     full_slots: Vec<usize>,
     /// Per live follower: whether the original leader's last view of it
     /// (`peer_health`) was a fresh, `check_pending == true` ack at the end.
-    fresh_full_acks: Vec<(usize, bool)>,
+    fresh_full_acks: Vec<(usize, bool, String)>,
     /// Probe writes acked after the grace window (see [`spawn_window_probe`]).
     acked_in_window: usize,
     /// Every simulator trace event of the whole run (sends, deliveries,
     /// timers): a livelock between a leader and a frozen-acking follower shows
     /// up here as hundreds of thousands of events, never as a failed assertion.
     trace_events: usize,
+    /// Some replica ended the window with committed entries its engine had not
+    /// applied (the apply task paused on ENOSPC with work in hand, the state
+    /// that closes both read gates unless they allow for it).
+    engine_behind: bool,
 }
 
 /// Run a full-disk window over `set` and return the in-window samples taken at
@@ -3328,7 +3349,7 @@ fn run_full_window<S: StorageEngine + 'static>(
     // Offer a write so the replicas actually hit ENOSPC (as a client's would).
     let _ = leader.put(b"__all_full_poke__".to_vec(), b"x".to_vec());
     group.sim.run_for(ALL_FULL_WINDOW);
-    let fresh_full_acks: Vec<(usize, bool)> = {
+    let fresh_full_acks: Vec<(usize, bool, String)> = {
         let now = group.sim.now().0;
         let g = group.nodes.lock().unwrap();
         // The node that led at fault time still leads (or, if leadership moved,
@@ -3339,8 +3360,12 @@ fn run_full_window<S: StorageEngine + 'static>(
                 .filter(|&&i| i != li)
                 .map(|&i| {
                     let (flag, at) = g[li].peer_health(&nid(ids[i]));
-                    let fresh = at.is_some_and(|a| now.saturating_sub(a.0) < 500_000_000);
-                    (i, flag == Some(true) && fresh)
+                    let fresh = at.is_some_and(|a| a < Duration::from_millis(500));
+                    (
+                        i,
+                        flag == Some(true) && fresh,
+                        format!("flag={flag:?} age_ms={:?}", at.map(|a| a.as_millis())),
+                    )
                 })
                 .collect()
         } else {
@@ -3367,6 +3392,7 @@ fn run_full_window<S: StorageEngine + 'static>(
         fresh_full_acks,
         acked_in_window,
         trace_events: group.sim.trace().len(),
+        engine_behind: samples.lock().unwrap().iter().any(|s| s.engine_behind),
     }
 }
 
@@ -3382,14 +3408,31 @@ fn raftkv_disk_full_all_replicas_keep_leadership_and_serve_reads() {
 
 #[test]
 fn raftkv_disk_full_all_replicas_keep_leadership_and_serve_reads_lsm() {
-    check_all_full_keeps_serving(lsm_engine);
+    // Over `LsmEngine` the apply task can be paused on ENOSPC with committed
+    // entries in hand when the disks fill (the shape chaos hit: commit 426,
+    // engine applied 424): both read gates must allow for it. Whether a seed
+    // lands there is timing, so sweep seeds and require the sweep to hit it.
+    check_all_full_keeps_serving_seeds(lsm_engine, 24, false);
 }
 
 fn check_all_full_keeps_serving<S: StorageEngine + 'static>(factory: EngineFactory<S>) {
+    check_all_full_keeps_serving_seeds(factory, 0, false);
+}
+
+/// `extra` additional seeds per replica count (a sweep for the timing-dependent
+/// state where the apply task is paused with committed work in hand);
+/// `need_behind` then requires the sweep to have actually produced that state.
+fn check_all_full_keeps_serving_seeds<S: StorageEngine + 'static>(
+    factory: EngineFactory<S>,
+    extra: u64,
+    need_behind: bool,
+) {
+    let mut behind_seen = 0usize;
     for replicas in [3usize, 5] {
-        for k in 0..disk_full_seeds_per_cell() as u64 {
-            let seed = 0xA11_F011_u64 + k + 16 * replicas as u64;
+        for k in 0..(disk_full_seeds_per_cell() as u64 + extra) {
+            let seed = 0xA11_F011_u64 + k + 1000 * replicas as u64;
             let w = run_full_window(seed, replicas, factory, FullSet::All);
+            behind_seen += usize::from(w.engine_behind);
             assert!(
                 w.samples.len() >= 4,
                 "seed={seed}: too few samples ({})",
@@ -3426,14 +3469,30 @@ fn check_all_full_keeps_serving<S: StorageEngine + 'static>(factory: EngineFacto
                  follower are spinning (an ack that triggers an immediate resend)",
                 w.trace_events
             );
+            for sm in &w.samples {
+                for (j, flag, age) in &sm.acks {
+                    assert!(
+                        *flag == Some(true) && age.is_some_and(|a| a < 400),
+                        "seed={seed}: the leader's contact with full follower {j} went stale \
+                         (flag={flag:?} age_ms={age:?}): {sm:?}"
+                    );
+                }
+            }
             // The followers kept acking (frozen, and saying they are full): the
             // leader's contact with them is fresh at the end of the window.
             assert!(
-                !w.fresh_full_acks.is_empty() && w.fresh_full_acks.iter().all(|(_, ok)| *ok),
+                !w.fresh_full_acks.is_empty() && w.fresh_full_acks.iter().all(|(_, ok, _)| *ok),
                 "seed={seed}: a full follower stopped acking its leader: {:?}",
                 w.fresh_full_acks
             );
         }
+    }
+    if need_behind {
+        assert!(
+            behind_seen > 0,
+            "the seed sweep never produced a replica with committed-but-unapplied entries \
+             (vacuous: the paused-apply read gates were not exercised)"
+        );
     }
 }
 
