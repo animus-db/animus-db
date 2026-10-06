@@ -3235,9 +3235,9 @@ fn spawn_all_full_sampler<S: StorageEngine + 'static>(
                 }
             }
             if let Some(&li) = sample.leaders.first() {
-                for j in 0..snapshot.len() {
+                for (j, id) in GROUP_IDS.iter().enumerate().take(snapshot.len()) {
                     if j != li {
-                        let (flag, at) = snapshot[li].peer_health(&nid(GROUP_IDS[j]));
+                        let (flag, at) = snapshot[li].peer_health(&nid(*id));
                         sample
                             .acks
                             .push((j, flag, at.map(|a| a.as_millis() as u64)));
@@ -3350,7 +3350,6 @@ fn run_full_window<S: StorageEngine + 'static>(
     let _ = leader.put(b"__all_full_poke__".to_vec(), b"x".to_vec());
     group.sim.run_for(ALL_FULL_WINDOW);
     let fresh_full_acks: Vec<(usize, bool, String)> = {
-        let now = group.sim.now().0;
         let g = group.nodes.lock().unwrap();
         // The node that led at fault time still leads (or, if leadership moved,
         // it is a follower with no per-stint view): only meaningful when it does.

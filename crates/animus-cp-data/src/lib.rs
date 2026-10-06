@@ -6530,9 +6530,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         if !self.read_barrier().await {
             return None;
         }
-        let Some(ts) = self.read_serve_ts().await else {
-            return None;
-        };
+        let ts = self.read_serve_ts().await?;
         let rows = self.local_scan_kind_rev(kind, start, end, limit).await;
         self.ts_cache.lock().expect("ts cache poisoned").bump(
             start.to_vec(),
@@ -6552,9 +6550,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         if !self.read_barrier().await {
             return None;
         }
-        let Some(ts) = self.read_serve_ts().await else {
-            return None;
-        };
+        let ts = self.read_serve_ts().await?;
         let rows = self.local_scan_kind(kind, start, end, limit).await;
         // Bump the *whole requested span*, mirroring `linearizable_scan`'s
         // identical reasoning — a future write anywhere in `[start, end)` is
@@ -6697,9 +6693,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // one if not — see `ensure_ceiling_above`'s doc), then bump the
         // read-timestamp cache with the *actual* ts served, so a concurrent
         // or later write to this key is pushed above it.
-        let Some(ts) = self.read_serve_ts().await else {
-            return None;
-        };
+        let ts = self.read_serve_ts().await?;
         // ADR 0018 §2/PR3: unlike `local_get`'s raw peek, a linearizable
         // read retries (bounded) a still-`Pending` intent rather than
         // reporting a false absence — see `read_resolved`'s doc.
@@ -6729,9 +6723,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         if !self.read_barrier().await {
             return None;
         }
-        let Some(ts) = self.read_serve_ts().await else {
-            return None;
-        };
+        let ts = self.read_serve_ts().await?;
         let physical = self.scope.physical(key);
         let Some(vv) = self.storage.get(&physical).await.ok().flatten() else {
             let (start, end) = ts_cache::point_span(key);
@@ -6843,9 +6835,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         if !self.read_barrier().await {
             return None;
         }
-        let Some(ts) = self.read_serve_ts().await else {
-            return None;
-        };
+        let ts = self.read_serve_ts().await?;
         let rows = self.local_scan(start, end, limit).await;
         // Bump the *whole requested span* (not just the rows a `limit`
         // happened to return): over-conservative, never wrong — a future
@@ -6879,9 +6869,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         if !self.read_barrier().await {
             return None;
         }
-        let Some(ts) = self.read_serve_ts().await else {
-            return None;
-        };
+        let ts = self.read_serve_ts().await?;
         let rows = self.local_scan_rev(start, end, limit).await;
         self.ts_cache.lock().expect("ts cache poisoned").bump(
             start.to_vec(),

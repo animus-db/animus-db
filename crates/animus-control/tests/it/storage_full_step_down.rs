@@ -266,7 +266,7 @@ fn a_full_followers_ack_is_frozen_at_its_durable_index() {
     let last = leader.last_log_index();
     ack_with(&mut leader, 1, last - 1, true, NOW);
     assert!(
-        leader.commit_index() <= last - 1,
+        leader.commit_index() < last,
         "commit advanced past the follower's frozen match"
     );
     assert_eq!(leader.peer_match(&nid(1)), last - 1);
