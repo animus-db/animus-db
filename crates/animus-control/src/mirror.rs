@@ -381,7 +381,8 @@ pub fn apply_and_derive_mirror(
         MetaCommand::ConvertTableToMrec { table, .. }
         | MetaCommand::AddMrecReplica { table, .. }
         | MetaCommand::RemoveMrecReplica { table, .. }
-        | MetaCommand::SetMrecReplicaStatus { table, .. } => {
+        | MetaCommand::SetMrecReplicaStatus { table, .. }
+        | MetaCommand::MarkMrecCopied { table, .. } => {
             // ADR 0075 (G-01 stage G-d): schema-only (placement is untouched).
             if let Some(schema) = meta.schemas.get(table) {
                 writes.push(put_json(syskv::schema_key(table), schema));

@@ -90,6 +90,7 @@ fn convert_records_an_active_local_replica_and_leaves_placement_alone() {
             region_id: mrec_region_id("us"),
             status: MrecReplicaStatus::Active,
             local: true,
+            copied: Default::default(),
         }]
     );
     assert_eq!(m.policies, policies_before, "MREC never touches placement");
@@ -263,6 +264,7 @@ fn convert_to_global_refuses_an_eventual_spec_and_gates_it_by_content() {
             region_id: mrec_region_id("us"),
             status: MrecReplicaStatus::Active,
             local: true,
+            copied: Default::default(),
         }],
     };
     let cmd = MetaCommand::ConvertTableToGlobal {
@@ -300,6 +302,7 @@ fn spec_validation_matrix() {
         region_id: mrec_region_id(region),
         status: MrecReplicaStatus::Active,
         local,
+        copied: Default::default(),
     };
     let spec = |replicas: Vec<MrecReplica>| GlobalTableSpec {
         consistency: MultiRegionConsistency::Eventual,
@@ -386,4 +389,39 @@ fn mrec_spec_is_not_mrsc() {
         ),
         "preferred-leader region is not one of the table's regions"
     );
+}
+
+/// G-d M4: `MarkMrecCopied` records per-tablet initial-copy completion on a
+/// replica (a set, so a repeat is a no-op), is rejected for an unknown replica
+/// or a non-MREC table, and is gated like the other MREC commands.
+#[test]
+fn mark_mrec_copied_records_tablets_idempotently() {
+    let mark = |region: &str, tablet: u64| MetaCommand::MarkMrecCopied {
+        table: "t".into(),
+        region: region.into(),
+        tablet,
+    };
+    let mut m = world();
+    assert_eq!(
+        rejected(&mut m, &mark("eu", 1)),
+        "table is not an MREC global table"
+    );
+    assert_eq!(m.apply(&convert("t", "us")), ApplyOutcome::Applied);
+    assert_eq!(m.apply(&add("t", "eu")), ApplyOutcome::Applied);
+    assert_eq!(rejected(&mut m, &mark("ap", 1)), "no such MREC replica");
+    assert_eq!(m.apply(&mark("eu", 1)), ApplyOutcome::Applied);
+    assert_eq!(m.apply(&mark("eu", 1)), ApplyOutcome::NoOp);
+    assert_eq!(m.apply(&mark("eu", 7)), ApplyOutcome::Applied);
+    let g = m.table_global("t").unwrap();
+    let eu = g.replicas.iter().find(|r| r.region == "eu").unwrap();
+    assert_eq!(eu.copied.iter().copied().collect::<Vec<_>>(), vec![1, 7]);
+    assert!(
+        g.replicas
+            .iter()
+            .find(|r| r.local)
+            .unwrap()
+            .copied
+            .is_empty()
+    );
+    assert_eq!(mark("eu", 1).required_gate(), Gate::MrecReplication);
 }

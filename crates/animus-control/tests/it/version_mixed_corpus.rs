@@ -1524,6 +1524,7 @@ fn mrec_via_convert_to_global_cmd() -> MetaCommand {
                 region_id: animus_control::mrec_region_id("us"),
                 status: animus_control::MrecReplicaStatus::Active,
                 local: true,
+                copied: Default::default(),
             }],
         },
     }

@@ -180,7 +180,8 @@ pub fn content_gate(msg: &RaftMsg) -> Gate {
         crate::MetaCommand::ConvertTableToMrec { .. }
         | crate::MetaCommand::AddMrecReplica { .. }
         | crate::MetaCommand::RemoveMrecReplica { .. }
-        | crate::MetaCommand::SetMrecReplicaStatus { .. } => g.join(Gate::MrecReplication),
+        | crate::MetaCommand::SetMrecReplicaStatus { .. }
+        | crate::MetaCommand::MarkMrecCopied { .. } => g.join(Gate::MrecReplication),
         crate::MetaCommand::ConvertTableToGlobal { spec, .. } if spec.is_mrec() => {
             g.join(Gate::MrecReplication)
         }

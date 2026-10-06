@@ -84,8 +84,7 @@ pub use size::{
 };
 pub use stored::{
     MrecVersion, decode_stored_item, decode_stored_item_versioned, decode_tombstone_key,
-    encode_stored_item,
-    encode_stored_item_versioned, encode_tombstone, encode_tombstone_versioned,
+    encode_stored_item, encode_stored_item_versioned, encode_tombstone, encode_tombstone_versioned,
     encode_tombstone_versioned_keyed,
 };
 pub use update::{

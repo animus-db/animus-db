@@ -241,7 +241,11 @@ fn a_local_write_stamps_identical_bytes_on_every_replica_and_bumps_from_the_stor
     // A delete writes a *versioned tombstone* (never an unversioned one).
     assert_eq!(
         base_row(&nodes, &pk, seed),
-        Some(encode_tombstone_versioned_keyed(v(1_000, 2, LOCAL), &pk, None))
+        Some(encode_tombstone_versioned_keyed(
+            v(1_000, 2, LOCAL),
+            &pk,
+            None
+        ))
     );
     // The change records carry the images as for any local write.
     let recs = changes(&nodes, &pk);
@@ -346,7 +350,11 @@ fn a_replicated_tombstone_keeps_its_stamp_and_blocks_a_stale_put() {
     );
     assert_eq!(
         base_row(&nodes, &pk, seed),
-        Some(encode_tombstone_versioned_keyed(v(200, 0, REMOTE), &pk, None))
+        Some(encode_tombstone_versioned_keyed(
+            v(200, 0, REMOTE),
+            &pk,
+            None
+        ))
     );
     assert_eq!(lsi_rows(&nodes, &pk), 0, "the delete removed the LSI row");
 

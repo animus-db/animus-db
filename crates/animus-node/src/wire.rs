@@ -1099,6 +1099,7 @@ pub fn is_relayable_command(command: &MetaCommand) -> bool {
         | MetaCommand::AddMrecReplica { .. }
         | MetaCommand::RemoveMrecReplica { .. }
         | MetaCommand::SetMrecReplicaStatus { .. }
+        | MetaCommand::MarkMrecCopied { .. }
         // Resource tagging (roadmap W-06): schema-catalog class, same relay
         // reason as `SetTableTtl` — a follower-connected `TagResource`/
         // `UntagResource` must reach the control leader.

@@ -2321,6 +2321,19 @@ pub enum MetaCommand {
         region: String,
         status: crate::schema::MrecReplicaStatus,
     },
+    /// **Record that one tablet's initial copy to a peer replica finished**
+    /// (G-d M4): the tablet's leader-side shipper has shipped every row this
+    /// region originated in that tablet to `region` and switched to the change
+    /// log. The replica-create saga flips the replica `Active` once every
+    /// routable tablet is recorded. Rejected for an unknown replica; a repeat
+    /// is a no-op.
+    ///
+    /// **Gate: `Gate::MrecReplication`.**
+    MarkMrecCopied {
+        table: TableName,
+        region: String,
+        tablet: u64,
+    },
     /// Enable, reconfigure, or disable a table's **provisioned throughput**
     /// (ADR 0065 §5(b)) — the `CreateTable`/`UpdateTable` `BillingMode`/
     /// `ProvisionedThroughput` wire fields' own catalog mutation. Rejected
@@ -5021,6 +5034,7 @@ impl Metadata {
                         region_id: *region_id,
                         status: crate::schema::MrecReplicaStatus::Active,
                         local: true,
+                        copied: Default::default(),
                     }],
                 };
                 if let Some(existing) = &schema.global {
@@ -5065,6 +5079,7 @@ impl Metadata {
                     region_id: *region_id,
                     status: crate::schema::MrecReplicaStatus::Creating,
                     local: false,
+                    copied: Default::default(),
                 });
                 if let Err(e) = candidate.validate() {
                     return ApplyOutcome::Rejected(e.message());
@@ -5111,6 +5126,28 @@ impl Metadata {
                 }
                 replica.status = *status;
                 ApplyOutcome::Applied
+            }
+            MetaCommand::MarkMrecCopied {
+                table,
+                region,
+                tablet,
+            } => {
+                let Some(spec) = self
+                    .schemas
+                    .get_mut(table)
+                    .and_then(|s| s.global.as_mut())
+                    .filter(|g| g.is_mrec())
+                else {
+                    return ApplyOutcome::Rejected("table is not an MREC global table");
+                };
+                let Some(replica) = spec.replicas.iter_mut().find(|r| r.region == *region) else {
+                    return ApplyOutcome::Rejected("no such MREC replica");
+                };
+                if replica.copied.insert(*tablet) {
+                    ApplyOutcome::Applied
+                } else {
+                    ApplyOutcome::NoOp
+                }
             }
             MetaCommand::SetTableThroughput { table, spec } => {
                 let Some(schema) = self.schemas.get_mut(table) else {
@@ -6692,7 +6729,8 @@ impl crate::version::GatedCommand for MetaCommand {
             MetaCommand::ConvertTableToMrec { .. }
             | MetaCommand::AddMrecReplica { .. }
             | MetaCommand::RemoveMrecReplica { .. }
-            | MetaCommand::SetMrecReplicaStatus { .. } => Gate::MrecReplication,
+            | MetaCommand::SetMrecReplicaStatus { .. }
+            | MetaCommand::MarkMrecCopied { .. } => Gate::MrecReplication,
             MetaCommand::ReportNodeVersion { .. } | MetaCommand::FinalizeClusterVersion { .. } => {
                 Gate::Era
             }

@@ -224,6 +224,11 @@ pub struct MrecReplica {
     /// `true` for this cluster's own replica (exactly one entry).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub local: bool,
+    /// Tablets (ids) whose initial copy to this replica has finished
+    /// (`MetaCommand::MarkMrecCopied`, G-d M4); the saga activates the replica
+    /// once every routable tablet is here. Additive (absent = empty).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub copied: std::collections::BTreeSet<u64>,
 }
 
 /// The MREC Region id of a Region name: 32-bit **FNV-1a** over the name's
