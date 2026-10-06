@@ -1040,6 +1040,12 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // health`). Consensus continues to consult `leader_id`/`election_
     // deadline` exclusively, unchanged.
     last_leader_contact: Option<(NodeId, Nanos)>,
+    // Issue #1228: sticky companion of `last_leader_contact` -- `true` once this
+    // process has ever had a genuine leader contact (an `AppendEntries`/
+    // `InstallSnapshot` from a leader, or its own election win). Unlike
+    // `last_leader_contact` it is never cleared by a higher-term step-down. Read by
+    // the eventual-read gate for a storage-full replica; volatile by design.
+    had_leader_contact: bool,
 
     // Pre-candidate state: nodes that have granted the current pre-vote round.
     // Rebuilt each `start_pre_vote`; only read while `role == PreCandidate`.
@@ -1656,6 +1662,7 @@ where
             durable_index: 0,
             leader_id: None,
             last_leader_contact: None,
+            had_leader_contact: false,
             pre_votes: BTreeSet::new(),
             votes: BTreeSet::new(),
             next_index: BTreeMap::new(),
@@ -3212,6 +3219,7 @@ where
                     // continuously and healthily the entire time. See
                     // `last_leader_contact`'s own doc.
                     self.last_leader_contact = Some((self.id.clone(), now));
+                    self.had_leader_contact = true;
                     // Heartbeat cadence is one of the bounded retries a
                     // genuinely stuck snapshot chunk gets — but "bounded by
                     // heartbeat cadence" alone is not a bound on TOTAL
@@ -4264,6 +4272,7 @@ where
         // Issue #595: a genuine leader contact — see `last_leader_contact`'s
         // own doc for why this is recorded separately from `leader_id`.
         self.last_leader_contact = Some((leader.clone(), now));
+        self.had_leader_contact = true;
         self.reset_election_timer(now, entropy);
 
         // The leader's prev is behind our snapshot: those entries are already in
@@ -4534,6 +4543,7 @@ where
         // Issue #595: a genuine leader contact — see `last_leader_contact`'s
         // own doc for why this is recorded separately from `leader_id`.
         self.last_leader_contact = Some((leader.clone(), now));
+        self.had_leader_contact = true;
         self.reset_election_timer(now, entropy);
 
         // Already at least this far along: drop any partial transfer and just
@@ -5328,6 +5338,7 @@ where
         // Issue #595: this node itself just won an election — record itself
         // as the genuine contact (see `last_leader_contact`'s own doc).
         self.last_leader_contact = Some((self.id.clone(), now));
+        self.had_leader_contact = true;
         // A fresh leadership stint always starts un-quiesced (ADR 0044 phase-1
         // PR3) with its idle clock starting now — even if this same node was
         // quiesced as a follower a moment ago (its own `quiesced` from
@@ -6380,7 +6391,7 @@ where
     /// group's history, leader currently unknown" from "never initialised".
     #[must_use]
     pub fn has_had_leader_contact(&self) -> bool {
-        self.last_leader_contact.is_some()
+        self.had_leader_contact
     }
 
     /// Whether this node's driver reported itself out of disk (issue #1219) —

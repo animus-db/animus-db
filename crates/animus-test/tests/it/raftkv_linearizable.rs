@@ -3483,3 +3483,92 @@ fn raftkv_disk_full_step_down_requires_a_healthy_quorum() {
         }
     }
 }
+
+/// A leader that **dies while every replica is full**. Decision (ADR 0074's
+/// 2026-10-06 amendment): the survivors do **not** elect a replacement -- a full
+/// node cannot persist the term bump and self-vote an election needs, and a
+/// vote it could not make durable is a vote it could double-cast after a restart
+/// (election safety), so a full node never campaigns (`RaftCore::set_storage_full`)
+/// even when no healthy candidate exists. What the survivors do keep doing is
+/// serving the eventual reads they hold (the freshness gate accepts a
+/// storage-full replica that has had a leader), and nothing is lost or
+/// duplicated: when space returns a leader is elected and writes resume.
+#[test]
+fn raftkv_disk_full_all_replicas_leader_crash_keeps_eventual_reads_and_recovers() {
+    for k in 0..disk_full_seeds_per_cell() as u64 {
+        let seed = 0xA11_C4A5_u64 + k;
+        let mut group = Group::start(seed, 3, mem_engine);
+        group.sim.run_for(SETTLE);
+        group.sim.run_for(Duration::from_millis(1200));
+        write_sentinel(&mut group, ALL_FULL_KEY, ALL_FULL_VALUE);
+        let (li, leader) = leader_slot(&group.nodes).expect("leader before the fault");
+        let dead = Arc::new(AtomicUsize::new(usize::MAX));
+        let (samples, stop) = spawn_all_full_sampler(
+            &group,
+            ALL_FULL_KEY.to_vec(),
+            Duration::from_millis(250),
+            Arc::clone(&dead),
+        );
+        group.apply(Nemesis::DiskFull);
+        let _ = leader.put(b"__all_full_poke__".to_vec(), b"x".to_vec());
+        group.sim.run_for(Duration::from_millis(1500));
+        // The leader dies; the survivors are full.
+        dead.store(li, Ordering::SeqCst);
+        group.sim.crash(nid(GROUP_IDS[li]));
+        group.crashed.insert(GROUP_IDS[li]);
+        let crashed_at = group.sim.now().0;
+        group.sim.run_for(ALL_FULL_WINDOW);
+        stop.store(true, Ordering::SeqCst);
+        group.sim.run_for(Duration::from_millis(300));
+        let during: Vec<AllFullSample> = samples
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.at > crashed_at + Duration::from_secs(2).as_nanos() as u64)
+            .cloned()
+            .collect();
+        assert!(during.len() >= 4, "seed={seed}: too few samples");
+        for s in &during {
+            assert!(
+                s.leaders.is_empty(),
+                "seed={seed}: a full survivor won an election (it cannot persist its term/vote): {s:?}"
+            );
+            for (i, e) in s.eventual.iter().enumerate() {
+                if i == li {
+                    continue; // the crashed node
+                }
+                assert_eq!(
+                    e,
+                    &Some(Some(ALL_FULL_VALUE.to_vec())),
+                    "seed={seed}: leaderless eventual read on survivor {i} not served: {s:?}"
+                );
+            }
+        }
+        // Space returns and the dead node restarts: a leader is elected and a
+        // write goes through; the sentinel is intact.
+        group.heal_all();
+        group.sim.run_for(Duration::from_secs(8));
+        let (_, new_leader) = leader_slot(&group.nodes)
+            .unwrap_or_else(|| panic!("seed={seed}: no leader after space returned"));
+        assert!(matches!(
+            new_leader.put(b"__after_heal__".to_vec(), b"ok".to_vec()),
+            ProposeResult::Accepted { .. }
+        ));
+        group.sim.run_for(Duration::from_secs(2));
+        let nodes = Arc::clone(&group.nodes);
+        let out: Arc<Mutex<Option<Option<Vec<u8>>>>> = Arc::new(Mutex::new(None));
+        let sink = Arc::clone(&out);
+        group.sim.env(nid(152)).spawn_task(async move {
+            let n = leader_slot(&nodes).map(|(_, n)| n);
+            if let Some(n) = n {
+                *sink.lock().unwrap() = Some(n.linearizable_get(ALL_FULL_KEY).await);
+            }
+        });
+        group.sim.run_for(Duration::from_secs(2));
+        assert_eq!(
+            out.lock().unwrap().clone(),
+            Some(Some(ALL_FULL_VALUE.to_vec())),
+            "seed={seed}: sentinel lost across the all-full leader crash"
+        );
+    }
+}

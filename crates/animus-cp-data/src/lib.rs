@@ -14567,6 +14567,64 @@ mod campaign_now_tests {
     }
 }
 
+/// Issue #1228: the eventual-read gate for a **storage-full** replica that has
+/// had a leader but currently knows none. A full node never campaigns, so once
+/// its leader belief is cleared (a higher-term message deposed the leader, as in
+/// a step-down onto a voter that cannot win) nothing would ever restore "knows a
+/// leader"; the replica still holds a genuine prefix of the log and keeps serving.
+#[cfg(test)]
+mod storage_full_stale_read_tests {
+    use super::*;
+    use animus_sim::{SimEnv, Simulator};
+    use animus_storage::MemoryEngine;
+
+    #[test]
+    fn a_full_replica_that_had_a_leader_serves_an_eventual_read_leaderless() {
+        let mut sim = Simulator::new(0x5A1E_F011);
+        let ids = [0u64, 1, 2];
+        let nodes: Vec<RaftKvNode<SimEnv, MemoryEngine>> = ids
+            .iter()
+            .map(|&i| {
+                RaftKvNode::start(
+                    sim.env(animus_env::nid(i)),
+                    ids.iter().copied().map(animus_env::nid).collect(),
+                    MemoryEngine::new(),
+                )
+            })
+            .collect();
+        sim.run_for(Duration::from_secs(2));
+        let leader = nodes.iter().position(|n| n.is_leader()).expect("a leader");
+        let f = (0..3).find(|&i| i != leader).unwrap();
+        assert!(nodes[f].stale_read_ready(), "a settled follower serves");
+        // A higher-term vote request clears the follower's leader belief.
+        {
+            let mut c = nodes[f].lock();
+            let term = c.term() + 5;
+            let _ = c.handle(
+                animus_env::nid(ids[leader]),
+                RaftMsg::RequestVote {
+                    term,
+                    candidate: animus_env::nid(ids[leader]),
+                    last_log_index: 0,
+                    last_log_term: 0,
+                },
+                sim.now(),
+                7,
+            );
+            assert!(c.leader().is_none(), "the leader belief should be cleared");
+            assert!(c.has_had_leader_contact());
+        }
+        assert!(
+            !nodes[f].stale_read_ready(),
+            "healthy and leaderless: not ready (never serve from a replica that cannot tell it was ever led)"
+        );
+        // Out of disk: the same replica keeps serving what it holds.
+        nodes[f].persist.mark_suspect();
+        assert!(nodes[f].is_storage_full());
+        assert!(nodes[f].stale_read_ready());
+    }
+}
+
 /// Table-driven coverage of [`RaftKvNode::stale_read_ready_decision`] (ADR
 /// 0055's cheap eventually-consistent-read freshness gate): the full outcome
 /// table over its two real inputs (knows-a-leader, and whether the engine

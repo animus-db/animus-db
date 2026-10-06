@@ -452,18 +452,30 @@ async fn put_until_ok(node: SocketAddr, key: &str, budget: Duration) -> Result<D
     ))
 }
 
-/// An eventually-consistent read of `key` through `node`: the HTTP status.
-async fn eventual_read_status(node: SocketAddr, key: &str) -> Result<u16, String> {
+/// A read of `key` through `node` (eventually consistent unless `consistent`):
+/// `(status, body)`, or the transport error.
+async fn read_item(
+    node: SocketAddr,
+    key: &str,
+    consistent: bool,
+    budget: Duration,
+) -> Result<(u16, String), String> {
     let body = serde_json::json!({
-        "ConsistentRead": false,
+        "ConsistentRead": consistent,
         "TableName": workload::TABLE,
         "Key": {"pk": {"S": key}, "sk": {"S": "s"}},
     })
     .to_string();
-    dynamo_call(node, "GetItem", &body, Duration::from_secs(10))
+    dynamo_call(node, "GetItem", &body, budget)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// An eventually-consistent read of `key` through `node`: the HTTP status.
+async fn eventual_read_status(node: SocketAddr, key: &str) -> Result<u16, String> {
+    read_item(node, key, false, Duration::from_secs(10))
         .await
         .map(|(s, _)| s)
-        .map_err(|e| e.to_string())
 }
 
 /// Poll `cond` every 250 ms until it holds or `budget` runs out.
@@ -635,7 +647,7 @@ async fn run_disk_full() -> Option<Outcome> {
     let mut other_answers: Vec<String> = Vec::new();
     let t_full = tokio::time::Instant::now();
     let mut round = 0u32;
-    while t_full.elapsed() < Duration::from_secs(40) && refused.iter().sum::<u32>() < 3 {
+    while t_full.elapsed() < Duration::from_secs(40) && refused.contains(&0) {
         for (i, node) in nodes.iter().enumerate() {
             let r = put(*node, &format!("df-full-{round}")).await;
             if is_storage_full_refusal(&r) {
@@ -659,21 +671,26 @@ async fn run_disk_full() -> Option<Outcome> {
             "phase 2: StorageFull refusals per node {refused:?}; other answers {other_answers:?}"
         ),
     );
-    // Whether a probe SEES the named 503 is a race against leadership loss,
-    // not a contract: with every disk full each group loses its leader within
-    // about a second (finding F-1, docs/chaos.md -- a full follower acks
-    // nothing and a full node never campaigns), and a leaderless group times
-    // out instead of refusing. So the per-probe observation is measured and
-    // reported (like the F-1 reads below), not asserted. The refusal path
-    // itself is asserted two ways that do not race: the single-full-node
-    // phase above requires the 503 strictly, and `overload_storage_full`
-    // must have incremented on some node below.
-    if refused.iter().sum::<u32>() == 0 {
-        note(
-            &mut events,
-            "phase 2: no probe saw 503 StorageFull before the groups lost their leaders (finding F-1)"
-                .into(),
-        );
+    // With every disk full the established tablet leaders keep leading (a full
+    // follower keeps acking, frozen at its durable index, and a leader only
+    // steps down to a successor that can win), so a write is refused with the
+    // named 503 `StorageFull` rather than timing out (issue #1228; findings F-1
+    // and F-3 in docs/chaos.md). Every node must have seen one: a node that is
+    // not the leader forwards to it, and the leader refuses.
+    for (i, r) in refused.iter().enumerate() {
+        if *r == 0 {
+            violations.push(format!(
+                "[disk-full/all-nodes] node {i} never answered a write with a 503 StorageFull \
+                 while every disk was full (other answers {other_answers:?})"
+            ));
+        }
+    }
+    if t_full.elapsed() > Duration::from_secs(30) {
+        violations.push(format!(
+            "[disk-full/all-nodes] the refusals took {}s: a write timed out instead of being \
+             refused promptly",
+            t_full.elapsed().as_secs()
+        ));
     }
     let mut overload = 0;
     for i in 0..n {
@@ -682,34 +699,41 @@ async fn run_disk_full() -> Option<Outcome> {
     if overload == 0 {
         violations.push("[disk-full/all-nodes] overload_storage_full never incremented".into());
     }
-    // Reads of already-applied state while every disk is full. The
-    // documented contract says they continue; on a real filesystem they do
-    // NOT (finding F-1 in docs/chaos.md: a full follower acks nothing, not
-    // even a bare heartbeat, so the leader loses quorum contact and neither
-    // the ReadIndex nor the freshness-gated eventual path can serve). So this
-    // is measured and reported, not asserted, until that is fixed; the
-    // single-full-node phase above asserts reads strictly.
+    // Reads of already-applied state while every disk is full continue, on every
+    // node, eventual and linearizable: the leader keeps leading, a full follower
+    // keeps acking (so ReadIndex confirms), and a full leader serves at its
+    // committed floor instead of a ceiling it cannot commit (issue #1228).
     let mut read_ok = [0u32; 3];
     let mut read_tries = [0u32; 3];
+    let mut strong_ok = [0u32; 3];
     for _ in 0..4 {
         for (i, node) in nodes.iter().enumerate() {
             read_tries[i] += 1;
-            let r = tokio::time::timeout(
-                Duration::from_secs(3),
-                eventual_read_status(*node, "df-seed"),
-            )
-            .await;
-            if matches!(r, Ok(Ok(200))) {
+            let r = read_item(*node, "df-seed", false, Duration::from_secs(3)).await;
+            if matches!(&r, Ok((200, body)) if body.contains("\"v\"")) {
                 read_ok[i] += 1;
+            }
+            let r = read_item(*node, "df-seed", true, Duration::from_secs(8)).await;
+            if matches!(&r, Ok((200, body)) if body.contains("\"v\"")) {
+                strong_ok[i] += 1;
             }
         }
     }
     note(
         &mut events,
         format!(
-            "phase 2: eventual reads served while every disk is full {read_ok:?} of {read_tries:?} (finding F-1 if not all)"
+            "phase 2: reads served while every disk is full: eventual {read_ok:?}, consistent {strong_ok:?} of {read_tries:?}"
         ),
     );
+    for i in 0..n {
+        if read_ok[i] != read_tries[i] || strong_ok[i] != read_tries[i] {
+            violations.push(format!(
+                "[disk-full/all-nodes] node {i} served {}/{} eventual and {}/{} consistent reads of a \
+                 written key while every disk was full",
+                read_ok[i], read_tries[i], strong_ok[i], read_tries[i]
+            ));
+        }
+    }
 
     // `ANIMUS_CHAOS_KEEP=1`: dump each node's per-group Raft view while every
     // disk is still full (who leads which tablet, terms, roles), the evidence
