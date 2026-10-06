@@ -18,6 +18,7 @@ use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use animus_control::version::MAX_SUPPORTED;
 use serde_json::{Value, json};
 
 fn animus_bin() -> PathBuf {
@@ -128,8 +129,8 @@ fn view(active: u32, maxes: [Option<u32>; 4], remaining: &[&str], can_finalize: 
     let on_new = 4 - remaining.len();
     json!({
         "era_active": true, "active": active,
-        "own_range": {"min": 1, "max": 2}, "own_build": "test",
-        "nodes": nodes, "safe_target": 2, "can_finalize": can_finalize, "target": active + 1,
+        "own_range": {"min": 1, "max": MAX_SUPPORTED}, "own_build": "test",
+        "nodes": nodes, "safe_target": MAX_SUPPORTED, "can_finalize": can_finalize, "target": active + 1,
         "blockers": [],
         "roll": {"phase": if can_finalize { "ready_to_finalize" } else if on_new == 0 { "not_started" } else { "rolling" },
                  "total": 4, "on_new": on_new, "remaining": remaining,
@@ -205,11 +206,18 @@ fn plan_order_and_status_match_the_servers_roll_state() {
 
 #[test]
 fn plan_after_finalize_is_empty_not_a_roll_toward_an_unsupported_version() {
-    // Finalized at the newest version this build speaks (2): every node's
-    // range max is 2 and `active + 1` = 3 is a version nothing supports. The
+    // Finalized at the newest version this build speaks (`MAX_SUPPORTED`, read
+    // from the crate so the next version bump cannot silently stale this
+    // test): every node's range max is that and `active + 1` is a version
+    // nothing supports. The
     // server's own `roll.remaining` still lists every node (it is relative to
     // `target`); `plan` must not turn that into a restart-everything order.
-    let v = view(2, [Some(2); 4], &["d", "a", "b", "c"], false);
+    let v = view(
+        MAX_SUPPORTED,
+        [Some(MAX_SUPPORTED); 4],
+        &["d", "a", "b", "c"],
+        false,
+    );
     let f = fixed(v, "a", health_ok("a"));
     let o = run(&["cluster", "roll", "plan", &f.addr.to_string(), "--json"]);
     assert!(o.status.success(), "{} {}", out(&o), err(&o));
