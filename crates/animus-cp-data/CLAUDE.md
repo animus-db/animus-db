@@ -3292,8 +3292,11 @@ wins over preference. `peer_health` is a diagnostic on the node's own clock
 Tests: `animus-control` `storage_full_step_down`, `animus-test`
 `raftkv_disk_full_all_replicas_*`, `quiescence` (ix), `animusd`
 `sim_cluster_dynamo_disk_full`, `chaos_disk_full` phase 2. The `first`-based
-ReadIndex is exercised only by real-process chaos (no sim cell produces an
-engine behind commit while all are full) and is not mutation-guarded.
+ReadIndex is guarded by `raftkv_disk_full_paused_apply_leader_still_serves_
+linearizable_reads` (animus-test): a slow fsync on the leader alone makes a
+write commit on the two healthy followers while the leader's durable index and
+apply lag, then 100% ENOSPC is armed on all three at that instant; replacing
+the `first` target with `commit_index` makes the read return None.
 
 ## StorageFull: per-tablet WAL recovery (R-01 (d), issue #1185)
 

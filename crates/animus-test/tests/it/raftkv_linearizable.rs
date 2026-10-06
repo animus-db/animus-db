@@ -3630,3 +3630,104 @@ fn raftkv_disk_full_all_replicas_leader_crash_keeps_eventual_reads_and_recovers(
         );
     }
 }
+
+/// Issue #1228, the paused-apply read path. Arm 100% ENOSPC on every replica at
+/// the instant the leader's engine is *behind* its commit index (a write has
+/// committed -- it is in the WAL on a majority -- but the apply task has not
+/// applied it, and now cannot: `LsmEngine` hits ENOSPC and the apply pauses).
+/// A full leader's ReadIndex must then be its first-term entry, not the commit
+/// index its engine will never reach: with the commit index every linearizable
+/// read would block for the whole window. The read is served (the value is
+/// the old one or the new one -- the write was never acknowledged, since an ack
+/// follows the apply -- never anything else), and after space returns the
+/// committed write is visible.
+#[test]
+fn raftkv_disk_full_paused_apply_leader_still_serves_linearizable_reads() {
+    const NEW_VALUE: &[u8] = b"committed-but-unapplied";
+    let mut behind_seen = 0usize;
+    for seed in 0..12u64 {
+        let seed = 7_100 + seed;
+        let mut group = Group::start(seed, 3, lsm_engine);
+        group.sim.run_for(SETTLE);
+        group.sim.run_for(Duration::from_millis(1200));
+        write_sentinel(&mut group, ALL_FULL_KEY, ALL_FULL_VALUE);
+        let (li, leader) = leader_slot(&group.nodes).expect("leader before the fault");
+        // A slow fsync on the leader alone: the two healthy followers persist
+        // and ack first, so the write commits while the leader's own durable
+        // index (and so its apply) is still behind it.
+        let mut slow = DiskConfig::default();
+        slow.set_sync_delay(Duration::from_millis(80));
+        group.sim.set_disk_config_for(nid(GROUP_IDS[li]), slow);
+        assert!(matches!(
+            leader.put(ALL_FULL_KEY.to_vec(), NEW_VALUE.to_vec()),
+            ProposeResult::Accepted { .. }
+        ));
+        // Step finely until the leader has committed the write but not applied it.
+        let mut behind = false;
+        for _ in 0..300 {
+            group.sim.run_for(Duration::from_millis(1));
+            if leader.commit_index() > leader.engine_applied_index() {
+                behind = true;
+                break;
+            }
+        }
+        if !behind {
+            continue;
+        }
+        let ids: Vec<u64> = GROUP_IDS[..3].to_vec();
+        for &id in &ids {
+            let mut cfg = DiskConfig::default();
+            cfg.set_enospc_prob(1.0);
+            group.sim.set_disk_config_for(nid(id), cfg);
+            group.disk_full_nodes.insert(id);
+        }
+        group.sim.run_for(Duration::from_secs(3));
+        let (now_li, now_leader) = leader_slot(&group.nodes)
+            .unwrap_or_else(|| panic!("seed={seed}: the group lost its leader"));
+        assert_eq!(
+            now_li, li,
+            "seed={seed}: leadership moved while every replica was full"
+        );
+        if now_leader.commit_index() <= now_leader.engine_applied_index() {
+            // The apply caught up before the disk filled: not the state under test.
+            continue;
+        }
+        behind_seen += 1;
+        let out: Arc<Mutex<Option<Option<Vec<u8>>>>> = Arc::new(Mutex::new(None));
+        let sink = Arc::clone(&out);
+        let nodes = Arc::clone(&group.nodes);
+        group.sim.env(nid(152)).spawn_task(async move {
+            if let Some((_, n)) = leader_slot(&nodes) {
+                *sink.lock().unwrap() = n.linearizable_get_served(ALL_FULL_KEY).await;
+            }
+        });
+        group.sim.run_for(Duration::from_secs(8));
+        let got = out.lock().unwrap().clone();
+        assert!(
+            got == Some(Some(ALL_FULL_VALUE.to_vec())) || got == Some(Some(NEW_VALUE.to_vec())),
+            "seed={seed}: a full leader with its apply paused short of the commit index must \
+             still serve a linearizable read (old or new value), got {got:?}"
+        );
+        group.heal_all();
+        group.sim.run_for(Duration::from_secs(8));
+        let nodes = Arc::clone(&group.nodes);
+        let after: Arc<Mutex<Option<Option<Vec<u8>>>>> = Arc::new(Mutex::new(None));
+        let sink = Arc::clone(&after);
+        group.sim.env(nid(152)).spawn_task(async move {
+            if let Some((_, n)) = leader_slot(&nodes) {
+                *sink.lock().unwrap() = Some(n.linearizable_get(ALL_FULL_KEY).await);
+            }
+        });
+        group.sim.run_for(Duration::from_secs(3));
+        assert_eq!(
+            after.lock().unwrap().clone(),
+            Some(Some(NEW_VALUE.to_vec())),
+            "seed={seed}: the committed write was lost across the all-full window"
+        );
+    }
+    assert!(
+        behind_seen > 0,
+        "no seed produced a leader with committed-but-unapplied entries when the disk filled \
+         (vacuous: the paused-apply ReadIndex was not exercised)"
+    );
+}
