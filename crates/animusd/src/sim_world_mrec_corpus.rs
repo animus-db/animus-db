@@ -171,8 +171,10 @@ fn plans() -> Vec<Plan> {
     p.faults = vec![
         (10, Fault::Partition(0, 1)),
         (35, Fault::Wait(6)),
-        // No heal before the last op: quiescence heals, so nothing written
-        // during the partition is ever re-sent by a later write.
+        // No heal before the end: quiescence heals, so nothing written during
+        // the partition is ever re-sent by a later write; the last wait makes
+        // the shippers try (and fail) once more after the final write.
+        (50, Fault::Wait(4)),
     ];
     v.push(p);
     let mut p = Plan::base("asymmetric_partition_heal", 3, 60);
@@ -1154,6 +1156,16 @@ fn run(seed: u64, plan: &Plan) -> (Dump, u64) {
             let ms = w.rnd(120);
             w.w.run_for(Duration::from_millis(ms));
         }
+    }
+    // Faults scheduled at the end of the workload.
+    let tail: Vec<Fault> = plan
+        .faults
+        .iter()
+        .filter(|(at, _)| *at >= plan.ops)
+        .map(|(_, f)| f.clone())
+        .collect();
+    for f in tail {
+        w.fault(&f);
     }
     w.quiesce(plan);
     if std::env::var("ANIMUS_MREC_DEBUG").is_ok() {
