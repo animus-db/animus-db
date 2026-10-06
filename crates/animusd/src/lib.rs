@@ -108,6 +108,16 @@ mod http;
 mod import;
 #[deny(clippy::disallowed_methods)]
 mod index_backfill;
+#[allow(
+    dead_code,
+    reason = "G-d M3: first production caller is the M4 shipper"
+)]
+pub mod mrec_peer;
+#[deny(clippy::disallowed_methods)]
+mod mrec_receiver;
+#[deny(clippy::disallowed_methods)]
+mod mrec_saga;
+mod mrec_shipper;
 mod overload;
 #[deny(clippy::disallowed_methods)]
 mod pitr_janitor;
@@ -699,6 +709,27 @@ impl<E: Env> CpGroup<E> {
         match self {
             CpGroup::Lsm(n) => n.local_scan(start, None, Some(limit)).await,
             CpGroup::Mem(n) => n.local_scan(start, None, Some(limit)).await,
+        }
+    }
+
+    /// The MREC shipper's committed point read (see
+    /// [`RaftKvNode::local_get_for_ship`]).
+    pub(crate) async fn local_get_for_ship(&self, key: &[u8]) -> animus_cp_data::ShipGet {
+        match self {
+            CpGroup::Lsm(n) => n.local_get_for_ship(key).await,
+            CpGroup::Mem(n) => n.local_get_for_ship(key).await,
+        }
+    }
+
+    /// The MREC shipper's scan window (see [`RaftKvNode::local_scan_for_ship`]).
+    pub(crate) async fn local_scan_for_ship(
+        &self,
+        start: &[u8],
+        limit: usize,
+    ) -> (Vec<(Vec<u8>, Vec<u8>)>, Option<Vec<u8>>) {
+        match self {
+            CpGroup::Lsm(n) => n.local_scan_for_ship(start, limit).await,
+            CpGroup::Mem(n) => n.local_scan_for_ship(start, limit).await,
         }
     }
 
@@ -3047,6 +3078,8 @@ pub struct BoundNode {
     /// more than one region. Defaults to 150 ms; set from
     /// `cluster_settings.max_region_rtt_ms` via `with_max_region_rtt`.
     max_region_rtt: Duration,
+    /// MREC peer settings (`cluster_settings.{region,peers,..}`, G-d M3) via `with_mrec`.
+    mrec: Arc<crate::mrec_peer::MrecConfig>,
     advertise_host: Option<String>,
     /// This node's own topology labels, from [`RoleAddrs::labels`] — handed
     /// to its self-registration (`spawn_common_tail`'s `register_node`, a
@@ -5390,6 +5423,7 @@ fn spawn_common_tail(
     tls: Option<TlsMaterial>,
     export_s3: Option<ExportS3Config>,
     overload_limits: config::ResolvedLimits,
+    mrec: Arc<crate::mrec_peer::MrecConfig>,
 ) -> (ClientCtx, Vec<tokio::task::JoinHandle<()>>) {
     // The seed `route_sync_loop` (below) re-overlays `Metadata.node_addrs[*].client`
     // onto every tick (ADR 0032 PR1) — the same static-base pattern
@@ -5421,6 +5455,7 @@ fn spawn_common_tail(
         env.clone(),
     )));
     let ctx = ClientCtx {
+        mrec,
         control,
         edge,
         env,
@@ -5707,6 +5742,14 @@ impl BoundNode {
     #[must_use]
     pub fn with_max_region_rtt(mut self, rtt: Duration) -> Self {
         self.max_region_rtt = rtt;
+        self
+    }
+
+    /// Install the node's MREC peer settings (`cluster_settings.region`/
+    /// `peers`/`allow_insecure_peers`/`mrec_max_clock_skew_ms`, ADR 0075
+    /// section 4.3, G-d M3): read by the MREC receiver. Default: no MREC.
+    pub(crate) fn with_mrec(mut self, mrec: crate::mrec_peer::MrecConfig) -> Self {
+        self.mrec = Arc::new(mrec);
         self
     }
 
@@ -6290,6 +6333,7 @@ impl BoundNode {
             self.tls,
             export_s3,
             config::OverloadSection::resolve(self.overload.as_ref()),
+            self.mrec.clone(),
         );
         // Adopted into the `StartupTasks` guard so the fallible
         // `check_wal_layout`/`SharedWal::open` steps below are covered too
@@ -6590,6 +6634,7 @@ impl BoundNode {
         // per-tablet leadership-checked, exactly like `txn_resolver_loop` above
         // — a node that leads no tablet does nothing each tick.
         tasks.push(tokio::spawn(index_drain::change_consumer_loop(ctx.clone())));
+        tasks.push(tokio::spawn(mrec_shipper::mrec_ship_loop(ctx.clone())));
 
         // The TTL reaper (ADR 0051 §4/§6): deletes items whose declared TTL
         // has passed, on every led tablet of a TTL-enabled table. Same
@@ -6926,6 +6971,7 @@ impl Node {
             console_listener,
             console_addr,
             max_region_rtt: animus_control::timing::DEFAULT_MAX_REGION_RTT,
+            mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             advertise_host: addrs.advertise_host,
             labels: addrs.labels,
             tls,
@@ -6991,6 +7037,7 @@ impl Node {
             intra_listener,
             intra_addr,
             max_region_rtt: animus_control::timing::DEFAULT_MAX_REGION_RTT,
+            mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             advertise_host: addrs.advertise_host,
             labels: addrs.labels,
             tls,
@@ -7065,6 +7112,7 @@ impl Node {
             console_listener,
             console_addr,
             max_region_rtt: animus_control::timing::DEFAULT_MAX_REGION_RTT,
+            mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             advertise_host: addrs.advertise_host,
             labels: addrs.labels,
             tls,
@@ -7617,6 +7665,8 @@ pub struct BoundControlNode {
     /// more than one region. Defaults to 150 ms; set from
     /// `cluster_settings.max_region_rtt_ms` via `with_max_region_rtt`.
     max_region_rtt: Duration,
+    /// MREC peer settings (`cluster_settings.{region,peers,..}`, G-d M3) via `with_mrec`.
+    mrec: Arc<crate::mrec_peer::MrecConfig>,
     advertise_host: Option<String>,
     /// See [`BoundNode::labels`]'s doc.
     labels: BTreeMap<String, String>,
@@ -7636,6 +7686,14 @@ impl BoundControlNode {
     #[must_use]
     pub fn with_max_region_rtt(mut self, rtt: Duration) -> Self {
         self.max_region_rtt = rtt;
+        self
+    }
+
+    /// Install the node's MREC peer settings (`cluster_settings.region`/
+    /// `peers`/`allow_insecure_peers`/`mrec_max_clock_skew_ms`, ADR 0075
+    /// section 4.3, G-d M3): read by the MREC receiver. Default: no MREC.
+    pub(crate) fn with_mrec(mut self, mrec: crate::mrec_peer::MrecConfig) -> Self {
+        self.mrec = Arc::new(mrec);
         self
     }
 
@@ -7931,6 +7989,7 @@ impl BoundControlNode {
             // here would ever call `ClientCtx::export_store_factory`.
             None,
             config::OverloadSection::resolve(self.overload.as_ref()),
+            self.mrec.clone(),
         );
         startup.extend(common_tail_tasks);
         // No fallible step remains in this assembly past this point (issue
@@ -8079,6 +8138,8 @@ pub struct BoundDataNode {
     /// more than one region. Defaults to 150 ms; set from
     /// `cluster_settings.max_region_rtt_ms` via `with_max_region_rtt`.
     max_region_rtt: Duration,
+    /// MREC peer settings (`cluster_settings.{region,peers,..}`, G-d M3) via `with_mrec`.
+    mrec: Arc<crate::mrec_peer::MrecConfig>,
     advertise_host: Option<String>,
     /// See [`BoundNode::labels`]'s doc.
     labels: BTreeMap<String, String>,
@@ -8098,6 +8159,14 @@ impl BoundDataNode {
     #[must_use]
     pub fn with_max_region_rtt(mut self, rtt: Duration) -> Self {
         self.max_region_rtt = rtt;
+        self
+    }
+
+    /// Install the node's MREC peer settings (`cluster_settings.region`/
+    /// `peers`/`allow_insecure_peers`/`mrec_max_clock_skew_ms`, ADR 0075
+    /// section 4.3, G-d M3): read by the MREC receiver. Default: no MREC.
+    pub(crate) fn with_mrec(mut self, mrec: crate::mrec_peer::MrecConfig) -> Self {
+        self.mrec = Arc::new(mrec);
         self
     }
 
@@ -8476,6 +8545,7 @@ impl BoundDataNode {
             // stays the "not configured" default until this is wired.
             None,
             config::OverloadSection::resolve(self.overload.as_ref()),
+            self.mrec.clone(),
         );
         // Adopted into the `StartupTasks` guard so the fallible
         // `check_wal_layout`/`SharedWal::open` steps below are covered too
@@ -8658,6 +8728,7 @@ impl BoundDataNode {
         // per-tablet leadership-checked, exactly like `txn_resolver_loop` above
         // — a node that leads no tablet does nothing each tick.
         tasks.push(tokio::spawn(index_drain::change_consumer_loop(ctx.clone())));
+        tasks.push(tokio::spawn(mrec_shipper::mrec_ship_loop(ctx.clone())));
 
         // The TTL reaper (ADR 0051 §4/§6) — same shape as the GSI drain
         // just above. No test-tunable interval knob on this data-only path
@@ -11470,6 +11541,10 @@ struct DataRole {
 /// than inventing a new one.
 #[derive(Clone)]
 pub(crate) struct ClientCtx<E: Env = ProdEnv, R: RelayClient = AnimusdRelayClient> {
+    /// This node's MREC peer settings and receiver concurrency gauge (ADR 0075
+    /// section 4.3, G-d M3). Default (no region, no peers) outside a
+    /// configured production node.
+    pub(crate) mrec: Arc<crate::mrec_peer::MrecConfig>,
     control: GenericControlHandle<E, R>,
     pub(crate) edge: ClusterEdgeState<E>,
     /// This node's one internal `ProdEnv` (ADR 0040 PR1) — every role's
@@ -14331,7 +14406,12 @@ pub(crate) fn leader_preferences(
     meta.tablets
         .iter()
         .filter_map(|(id, t)| {
-            let g = meta.schemas.get(t.table.as_deref()?)?.global.as_ref()?;
+            let g = meta
+                .schemas
+                .get(t.table.as_deref()?)?
+                .global
+                .as_ref()
+                .filter(|g| g.is_mrsc())?;
             Some((
                 *id,
                 animus_cp_data::host::LeaderPreference {
@@ -15453,6 +15533,7 @@ fn request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::KindWrite { .. } => "kind_write",
         ClientRequest::KindWriteItem { .. } => "kind_write_item",
         ClientRequest::KindWriteBatch { .. } => "kind_write_batch",
+        ClientRequest::MrecApply(_) => "mrec_apply",
         ClientRequest::CpLeaderHintProbe { .. } => "cp_leader_hint_probe",
         ClientRequest::KindScan { .. } => "kind_scan",
         ClientRequest::ForceSeal { .. } => "force_seal",
@@ -15675,6 +15756,14 @@ async fn handle_request(
              in `Forwarded`"
                 .into(),
         ),
+        // ADR 0075 G-d M3: a peer cluster's MREC replication batch. Intra-only
+        // (`surface_of`, refused on the client listener by the guard above),
+        // received **bare** — it is the one request here that is not wrapped in
+        // `Forwarded`, because a peer cluster has no cluster-internal route to
+        // the tablet leader; the receiver routes it itself.
+        ClientRequest::MrecApply(req) => {
+            ClientResponse::MrecApply(mrec_receiver::handle_mrec_apply(ctx, &ctx.mrec, req).await)
+        }
         // Issue #996 layer 2: the batched evaluate-at-leader write RPC,
         // refused bare for the identical reason `KindWriteItem` just above
         // is — see `ClientRequest::KindWriteBatch`'s own doc. Real handling
@@ -17080,7 +17169,11 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
     // `docs/engineering-lessons.md` for the incident this fixes.
     let bound = Node::bind(addrs.id.clone(), addrs, dir)
         .await?
-        .with_max_region_rtt(config.max_region_rtt());
+        .with_max_region_rtt(config.max_region_rtt())
+        .with_mrec(
+            crate::mrec_peer::MrecConfig::from_cluster(config)
+                .with_node_tls(config.nodes.get(index).and_then(|n| n.tls.clone())),
+        );
     start_bound_node_with_streams_quiesce_and_ttl_sweep_interval(
         bound,
         config,
@@ -17224,6 +17317,13 @@ pub async fn start_bound_node_with_streams_quiesce_and_ttl_sweep_interval(
         .dynamo_auth
         .as_ref()
         .map(|cfg| Arc::new(cfg.credentials.clone()));
+    // The MREC peer settings (G-d M3): `Node::bind` has no config, so the
+    // start half installs them like every other `run_node*` entry point does
+    // (`tests/mrec_peer_transport.rs` caught the bound path missing them).
+    let bound = bound.with_mrec(
+        crate::mrec_peer::MrecConfig::from_cluster(config)
+            .with_node_tls(config.nodes.get(index).and_then(|n| n.tls.clone())),
+    );
     bound
         .start_with_growth(
             config.peer_book(),
@@ -17464,7 +17564,11 @@ pub async fn run_node_control_with_stores(
     // `config::node_id(index)` minting convention.
     let bound = Node::bind_control(addrs.id.clone(), addrs, dir)
         .await?
-        .with_max_region_rtt(config.max_region_rtt());
+        .with_max_region_rtt(config.max_region_rtt())
+        .with_mrec(
+            crate::mrec_peer::MrecConfig::from_cluster(config)
+                .with_node_tls(config.nodes.get(index).and_then(|n| n.tls.clone())),
+        );
 
     // Cross-node routing (ADR 0017 #3b / ADR 0013): map every node's id to
     // its client API address, so a data op or a schema-DDL relay landing on
@@ -17689,7 +17793,11 @@ pub async fn run_node_data_with_cluster_settings(
     // `config::node_id(index)` minting convention.
     let bound = Node::bind_data(addrs.id.clone(), addrs, dir)
         .await?
-        .with_max_region_rtt(config.max_region_rtt());
+        .with_max_region_rtt(config.max_region_rtt())
+        .with_mrec(
+            crate::mrec_peer::MrecConfig::from_cluster(config)
+                .with_node_tls(config.nodes.get(index).and_then(|n| n.tls.clone())),
+        );
 
     // The control deployment's **intra**-cluster addresses (ADR 0047) — the
     // mirror/leader-hint discovery root (ADR 0035 §1/§4; `WatchMetadata` is
@@ -17820,7 +17928,11 @@ pub async fn run_node_growth(
     // `config::node_id(index)` minting convention.
     let bound = Node::bind(addrs.id.clone(), addrs, dir)
         .await?
-        .with_max_region_rtt(config.max_region_rtt());
+        .with_max_region_rtt(config.max_region_rtt())
+        .with_mrec(
+            crate::mrec_peer::MrecConfig::from_cluster(config)
+                .with_node_tls(config.nodes.get(index).and_then(|n| n.tls.clone())),
+        );
     let mut client_route: BTreeMap<NodeId, String> = BTreeMap::new();
     for (i, addrs) in config.nodes.iter().enumerate() {
         client_route.insert(
@@ -19360,6 +19472,7 @@ mod confirm_futility_tests {
             key: TableSchema::simple("pk"),
             lsis: Vec::new(),
             change_records_carry_images: false,
+            mrec: None,
         };
         let pk = AttributeValue::S("cf-target".to_owned());
         let base_key = crate::dynamo::item_key(&pk, None);
@@ -21443,6 +21556,7 @@ mod simenv_client_ctx_tests {
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),
+            mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             ttl_reaper_progress: Arc::new(Mutex::new(
                 animus_node::ttl_reaper::TtlReaperProgress::default(),
             )),
@@ -22090,6 +22204,7 @@ mod two_node_relay_tests {
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),
+            mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             ttl_reaper_progress: Arc::new(Mutex::new(
                 animus_node::ttl_reaper::TtlReaperProgress::default(),
             )),
@@ -22164,6 +22279,7 @@ mod two_node_relay_tests {
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),
+            mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             ttl_reaper_progress: Arc::new(Mutex::new(
                 animus_node::ttl_reaper::TtlReaperProgress::default(),
             )),
@@ -22426,6 +22542,9 @@ mod sim_cluster_dynamo;
 #[cfg(test)]
 mod sim_cluster_dynamo_corpus;
 
+/// G-01 stage G-d M2: the structural MREC writer guards (test-only).
+#[cfg(test)]
+mod mrec_writer_guard_tests;
 /// ADR 0061 rung D3 PR 1 (C-04 D3): the first batch of "B class"
 /// `ProdEnv` DynamoDB logic tests converted to `SimCluster` — base-table
 /// tests that `dynamo::dispatch_item_op` can already drive, needing no
@@ -22490,6 +22609,25 @@ mod sim_cluster_kind_batch_outcome;
 /// raw 2PC coordinator primitives, never the DynamoDB wire.
 #[cfg(test)]
 mod sim_cluster_txn_conflict;
+/// G-01 stage G-d M0: multi-cluster `SimWorld` + `PeerBridge` WAN model (test-only).
+#[cfg(test)]
+mod sim_world;
+/// G-01 stage G-d M5: the multi-cluster MREC fault-injection corpus (test-only).
+#[cfg(test)]
+mod sim_world_mrec_corpus;
+#[cfg(test)]
+mod sim_world_mrec_e2e_tests;
+#[cfg(test)]
+mod sim_world_mrec_edge_tests;
+#[cfg(test)]
+mod sim_world_mrec_saga_tests;
+#[cfg(test)]
+mod sim_world_mrec_shipper_tests;
+/// G-01 stage G-d M3: the MREC receiver over `SimWorld` (test-only).
+#[cfg(test)]
+mod sim_world_mrec_tests;
+#[cfg(test)]
+mod sim_world_tests;
 
 /// ADR 0061 rung D3 PR 2a (C-04 D3): base-table DDL over the real DynamoDB
 /// wire, driven through the new `dynamo::dispatch_table_op` generic core —

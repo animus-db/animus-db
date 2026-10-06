@@ -338,7 +338,7 @@ pub fn port_holders(addr: SocketAddr) -> String {
 /// loopback ports (so a same-address restart of this node is steal-proof,
 /// issue #1094), [`NodeRole::Both`], no advertise host/TLS/encryption key.
 /// `id` is [`animusd::config::node_id(index)`].
-fn unbound_role_addrs(index: usize) -> RoleAddrs {
+pub fn unbound_role_addrs(index: usize) -> RoleAddrs {
     let a = reserve_addrs(6);
     RoleAddrs {
         id: animusd::config::node_id(index),
@@ -361,7 +361,7 @@ fn unbound_role_addrs(index: usize) -> RoleAddrs {
 /// already-[`Node::bind`]-bound `node` — its own resolved addresses, its own
 /// id, same role/advertise-host/TLS/encryption-key shape [`unbound_role_addrs`]
 /// gave it (a combined-mode bring-up fixture never sets the last three).
-fn bound_role_addrs(node: &animusd::BoundNode) -> RoleAddrs {
+pub fn bound_role_addrs(node: &animusd::BoundNode) -> RoleAddrs {
     RoleAddrs {
         id: node.id().clone(),
         role: NodeRole::Both,

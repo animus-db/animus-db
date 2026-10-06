@@ -1,0 +1,79 @@
+{
+  "v": 1,
+  "members": {},
+  "tablets": {
+    "1": {
+      "id": 1,
+      "table": "orders",
+      "range": {
+        "start": [],
+        "end": null
+      },
+      "replicas": [
+        "n1"
+      ],
+      "epoch": 1,
+      "state": "Active",
+      "inplace_split": null
+    }
+  },
+  "policies": {},
+  "schemas": {
+    "tables": {
+      "orders": {
+        "partition_key": "id",
+        "clustering_keys": [],
+        "columns": [
+          {
+            "name": "id",
+            "ty": "String"
+          }
+        ],
+        "indexes": [],
+        "stream": null,
+        "ttl": null,
+        "pitr": null,
+        "throughput": null,
+        "tags": {},
+        "global": {
+          "consistency": "Eventual",
+          "regions": [],
+          "preferred_leader_region": "",
+          "replicas": [
+            {
+              "region": "us-east",
+              "region_id": 2928563881,
+              "status": "Active",
+              "local": true
+            },
+            {
+              "region": "eu-west",
+              "region_id": 1017540389,
+              "status": "Active"
+            },
+            {
+              "region": "ap-south",
+              "region_id": 663258492,
+              "status": "Creating"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "next_tablet_id": 2,
+  "node_addrs": {},
+  "split_lineage": {},
+  "split_placing": {},
+  "stream_shards": [],
+  "index_backfill": [],
+  "backups": {},
+  "backup_tablet_progress": [],
+  "restores": {},
+  "pitr_segments": [],
+  "pitr_generation": {},
+  "pitr_base_backups": [],
+  "credentials": {},
+  "exports": {},
+  "imports": {}
+}

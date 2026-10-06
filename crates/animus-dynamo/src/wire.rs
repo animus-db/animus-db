@@ -9258,6 +9258,7 @@ mod tests {
         let g = crate::global::GlobalTableDescription {
             replicas: vec![("a".into(), crate::global::RegionStatus::Active)],
             witness: None,
+            eventual: false,
         };
         let v: Value = serde_json::from_str(&args(Some(&g), "TableDescription")).unwrap();
         assert_eq!(v["TableDescription"]["GlobalTableVersion"], "2019.11.21");

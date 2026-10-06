@@ -3278,3 +3278,34 @@ replay. Regression: `animusd` `sim_cluster_split_relocation`. ADR 0058's
 - **TxnId uniqueness (R-01 F-2).** `TxnId.node` is the node qualified by the group stream (`n0#100`; primary stream = bare node id), because `ts` is per-group `Hlc` state and one node leads many groups. `txn_stage_local` (animusd) also refuses, before proposing, a stage group with any key outside the leader range (stale grouping across a split). See `docs/lessons/testing/2026-10-05-a-txn-id-must-be-unique-per-group-not-per-node.md`.
 
 - **Seal check on every mutating apply arm (R-01 F-2).** `TxnCommit`/`TxnAbort` (and the orphan tombstone) are deterministic no-ops on a sealed record key, like every other mutation: a fork clones the parent's CURRENT engine per replica, asynchronously, so a post-fork decision landing in the parent diverges the children. Regression: `tests/it/split_tablet.rs::a_txn_decision_ordered_after_the_fork_is_a_sealed_no_op`; see `docs/lessons/testing/2026-10-05-every-mutating-apply-arm-needs-the-seal-check.md`.
+
+- **MREC shapes (G-01 stage G-d M1).** `KindEvalOp::Replicate { item, ver }` and
+  `WriteSchema.mrec` ride as JSON blobs inside `KindEval`/`KindEvalBatch`/`TxnStage`
+  (no binary codec bump, wire stays v1, WAL v2). `KvCommand::required_gate` is
+  **content-dependent** for those three carriers (`gates.rs::eval_gate`: MREC content
+  joins to `Gate::MrecReplication`), enforced at the one `gated_propose` choke point;
+  `evaluate_kind_eval` gives a `Replicate` its LWW semantics (M2, below). Shaped fixtures `raftkv-wire/v1-mrec.bin`, `raftkv-wal/v2-mrec.bin`
+  (built by `codec::tests::mrec_sample_wires`; `fixture_files` skips `vN-<shape>` names).
+
+- **MREC apply (G-01 stage G-d M2, ADR 0075 amendment).** `evaluate_kind_eval` takes
+  the stored stamp (`decode_stored_item_versioned`; the `KindEvalBatch` overlay carries
+  it too). `KindEvalOp::Replicate` applies iff `ver > stored` via the normal
+  `derive_kind_writes` path, else `KindEvalDecision::Superseded` (no writes, not even a
+  change record; leader-local `KindEvalResult::superseded` /
+  `KindEvalItemResult::Superseded`, the replicated outcome stays `Applied`); a key with
+  an intent gives `ConditionFailed` (the shipper's Retry); `mrec: None` rejects. A local
+  op with `WriteSchema.mrec` stamps via `MrecVersion::next_local`. A `Replicate` in a
+  `TxnStage` is rejected before evaluation. Tests: `src/mrec_props.rs` (pure convergence
+  proptest + two negative controls, `ANIMUS_MREC_PROP_CASES`), `tests/it/mrec_apply.rs`
+  (a group opened with `HostedOptions { features }` at cluster version 3: the propose
+  gate panics in tests otherwise). **Adding a base-row writer for an MREC table means
+  stamping it** (see the ADR's writer audit).
+
+**MREC apply is the only consumer-facing piece here (ADR 0075 "G-d as built").** The
+shipper, saga and receiver live in `animusd`; this crate owns the last-writer-wins rule
+(`apply_mrec`: stored `MrecVersion` vs the incoming one, `Superseded` on a loss, stamped
+tombstones, a foreign intent is `Retry`) and the content-dependent `KvCommand::required_gate`.
+The cursor rows `mrec:<region>`/`mrecscan:<region>` are ordinary `KIND_CURSOR` rows written
+through the existing kind ops (no new command); `trim_split_child` drops them, which is why
+a split child rescans. Test-only switch `mrec_test_switch::set_lww_by_arrival` (thread-local)
+backs the M5 negative control; never reachable in a release build path.

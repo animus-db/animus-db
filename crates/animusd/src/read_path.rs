@@ -167,6 +167,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             .and_then(|t| t.table.as_deref())
             .and_then(|t| meta.schemas.get(t))
             .and_then(|s| s.global.as_ref())
+            .filter(|g| g.is_mrsc())
             .and_then(|g| g.witness.as_deref());
         replicas
             .iter()

@@ -30,6 +30,7 @@ mod learner_promotion_pending_check;
 mod membership_commit_gate;
 mod metadata_watch;
 mod metrics;
+mod mrec_table_apply;
 mod next_deadline;
 mod non_voter_vote_lease;
 mod one_identity_multiplexing;

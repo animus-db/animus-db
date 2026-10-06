@@ -22,6 +22,7 @@ fn spec() -> GlobalTableSpec {
         regions: vec!["a".into(), "b".into(), "c".into()],
         witness: None,
         preferred_leader_region: "a".into(),
+        replicas: Vec::new(),
     }
 }
 
