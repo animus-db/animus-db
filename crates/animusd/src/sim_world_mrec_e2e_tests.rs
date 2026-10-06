@@ -206,9 +206,9 @@ impl M {
         w.sync_clocks();
         w.bridge().set_default_link(LinkConfig::new(LAT));
         let cfgs: Vec<Arc<MrecConfig>> = (0..3).map(mesh_cfg).collect();
-        for c in 0..3 {
-            w.clusters[c].handle().set_mrec_config(cfgs[c].clone());
-            let h: PeerHandler = handler(cfgs[c].as_ref().clone(), Arc::new(AtomicU64::new(0)));
+        for (c, cfg) in cfgs.iter().enumerate() {
+            w.clusters[c].handle().set_mrec_config(cfg.clone());
+            let h: PeerHandler = handler(cfg.as_ref().clone(), Arc::new(AtomicU64::new(0)));
             w.set_handler(c, h);
         }
         M { w, cfgs, seed }
