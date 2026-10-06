@@ -28,7 +28,7 @@
 
 use std::collections::BTreeSet;
 
-use animus_control::schema::{GlobalTableSpec, MultiRegionConsistency};
+use animus_control::schema::{GlobalTableSpec, MrecReplicaStatus, MultiRegionConsistency};
 use animus_control::version::Gate;
 use animus_control::{IndexKind, MetaCommand, Metadata, NodeStatus};
 use animus_dynamo::global::{GlobalTableDescription, GlobalTableUpdate, RegionStatus};
@@ -55,7 +55,10 @@ const EMPTY_CHECK_PAGE: usize = 64;
 /// `Replicas` (AWS-style); the witness is listed apart.
 #[must_use]
 pub(crate) fn global_description(meta: &Metadata, table: &str) -> Option<GlobalTableDescription> {
-    let spec = meta.table_global(table)?;
+    if let Some(spec) = meta.table_global(table).filter(|g| g.is_mrec()) {
+        return mrec_description(spec);
+    }
+    let spec = meta.table_global(table).filter(|g| g.is_mrsc())?;
     let ready = meta.table_ready_regions(table);
     let status = |region: &String| {
         if ready.contains(region) {
@@ -72,6 +75,33 @@ pub(crate) fn global_description(meta: &Metadata, table: &str) -> Option<GlobalT
             .map(|r| (r.clone(), status(r)))
             .collect(),
         witness: spec.witness.as_ref().map(|r| (r.clone(), status(r))),
+        eventual: false,
+    })
+}
+
+/// The `DescribeTable` global fields of an MREC table: every replica with its
+/// stored status (the local Region included, AWS-style). A table whose only
+/// replica is the local one (every peer deleted) is standalone again.
+fn mrec_description(spec: &GlobalTableSpec) -> Option<GlobalTableDescription> {
+    if spec.replicas.iter().all(|r| r.local) {
+        return None;
+    }
+    Some(GlobalTableDescription {
+        replicas: spec
+            .replicas
+            .iter()
+            .map(|r| {
+                let status = match r.status {
+                    MrecReplicaStatus::Creating => RegionStatus::Creating,
+                    MrecReplicaStatus::Active => RegionStatus::Active,
+                    MrecReplicaStatus::Deleting => RegionStatus::Deleting,
+                    MrecReplicaStatus::CreationFailed => RegionStatus::CreationFailed,
+                };
+                (r.region.clone(), status)
+            })
+            .collect(),
+        witness: None,
+        eventual: true,
     })
 }
 
@@ -86,7 +116,7 @@ pub(crate) fn reject_transaction_on_global(
     table: &str,
     api: &str,
 ) -> Result<(), WireError> {
-    if meta.table_global(table).is_some() {
+    if meta.table_global(table).is_some_and(|g| g.is_mrsc()) {
         return Err(WireError::validation(format!(
             "{api} is not supported on table `{table}`: transactions are not supported on a \
              multi-Region strongly consistent global table"
@@ -101,7 +131,7 @@ pub(crate) fn reject_transaction_on_global(
 /// # Errors
 /// A `ValidationException` naming the table.
 pub(crate) fn reject_ttl_on_global(meta: &Metadata, table: &str) -> Result<(), WireError> {
-    if meta.table_global(table).is_some() {
+    if meta.table_global(table).is_some_and(|g| g.is_mrsc()) {
         return Err(WireError::validation(format!(
             "UpdateTimeToLive cannot enable TTL on table `{table}`: TTL is not supported on a \
              multi-Region strongly consistent global table"
@@ -162,6 +192,20 @@ pub(crate) async fn update_table_global<E: Env, R: RelayClient>(
     table: &str,
     update: GlobalTableUpdate,
 ) -> Result<String, WireError> {
+    // ADR 0075 G-d M4b: an eventually consistent request (the AWS default) on a
+    // table that is not strongly consistent takes the MREC path when its gate
+    // is open; with the gate closed it falls through to the old rejection.
+    if update.is_eventual() && crate::mrec_saga::mrec_gate_open(ctx) {
+        let meta = ctx.metadata_fresh().await;
+        if !meta.has_table_schema(table) {
+            return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
+                table.to_owned(),
+            )));
+        }
+        if !meta.table_global(table).is_some_and(|g| g.is_mrsc()) {
+            return crate::mrec_saga::update_table_mrec(ctx, &meta, table, &update).await;
+        }
+    }
     // 1. The gate (the emit-site check; see the module doc). A closed verdict
     // first re-reads this node's applied view, since the feeder runs on a tick
     // and a finalize this node already applied may not have reached the handle.
@@ -260,6 +304,7 @@ pub(crate) async fn update_table_global<E: Env, R: RelayClient>(
         regions,
         witness: request.witness,
         preferred_leader_region: local,
+        replicas: Vec::new(),
     };
     spec.validate()
         .map_err(|e| WireError::validation(format!("UpdateTable: {}", e.message())))?;
@@ -342,6 +387,87 @@ pub(crate) fn drain_strands_region_error(
     )
 }
 
+/// One MREC (eventual) table's admin row (ADR 0075 section 8, G-d M6): its
+/// replica set with lifecycle status and the initial-copy progress, plus this
+/// node's own per-(tablet, peer) shipper health (node-local, in memory, reset on
+/// restart; a fleet view fans out like the MRSC leader fields). `lag_ms` is the
+/// age of the oldest unshipped change at the shipper's last tick, `last_ack_age_ms`
+/// the wall-clock age of the last acknowledged batch.
+fn admin_mrec_table_view<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    name: &str,
+    spec: &GlobalTableSpec,
+    warnings: &mut Vec<String>,
+) -> serde_json::Value {
+    use serde_json::json;
+    let now_ms = ctx.env.wall_now().0;
+    let mut shippers = Vec::new();
+    {
+        let h = ctx.mrec.health.lock().expect("mrec health poisoned");
+        for ((table, tablet, peer), ph) in h.iter() {
+            if table != name {
+                continue;
+            }
+            if ph.operator_error {
+                warnings.push(format!(
+                    "table `{name}`: peer `{peer}` refuses tablet {tablet}'s batches ({}); \
+                     this needs an operator (shape/config mismatch), retrying will not help",
+                    ph.last_error.as_deref().unwrap_or("no detail")
+                ));
+            }
+            shippers.push(json!({
+                "tablet": tablet,
+                "peer": peer,
+                "backlog": ph.backlog,
+                "lag_ms": ph.lag_ms,
+                "last_ack_age_ms": ph.last_ack_wall_ms.map(|t| now_ms.saturating_sub(t)),
+                "scanning": ph.scanning,
+                "needs_resync": ph.needs_resync,
+                "caught_up": ph.caught_up,
+                "failures": ph.failures,
+                "operator_error": ph.operator_error,
+                "last_error": ph.last_error,
+                "shipped_rows": ph.shipped_rows,
+            }));
+        }
+    }
+    let routable = meta_routable_tablets(ctx, name);
+    for r in spec.replicas.iter().filter(|r| !r.local) {
+        if r.status == MrecReplicaStatus::CreationFailed {
+            warnings.push(format!(
+                "table `{name}`: the replica in `{}` failed to create; delete it (`UpdateTable` \
+                 Delete) and create it again",
+                r.region
+            ));
+        }
+    }
+    json!({
+        "table": name,
+        "consistency": "EVENTUAL",
+        "local_region": ctx.mrec.region,
+        "replicas": spec.replicas.iter().map(|r| json!({
+            "region": r.region,
+            "status": format!("{:?}", r.status).to_uppercase(),
+            "local": r.local,
+            "tablets_copied": r.copied.len(),
+            "tablets_total": routable,
+        })).collect::<Vec<_>>(),
+        "replica_status": spec
+            .replicas
+            .iter()
+            .map(|r| (r.region.clone(), format!("{:?}", r.status).to_uppercase()))
+            .collect::<std::collections::BTreeMap<_, _>>(),
+        "shippers": shippers,
+    })
+}
+
+fn meta_routable_tablets<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>, table: &str) -> usize {
+    ctx.effective_metadata()
+        .tablets_for_table(table)
+        .filter(|(_, t)| t.is_routable())
+        .count()
+}
+
 /// `GET /admin/global-tables` (ADR 0075 section 8): every global table's
 /// Regions, witness, preferred-leader Region, derived replica status and
 /// per-tablet placement by Region, plus the cluster's Active members per
@@ -376,7 +502,13 @@ pub(crate) fn admin_global_tables_view<E: Env, R: RelayClient>(
     let mut warnings: Vec<String> = Vec::new();
     let mut tables = Vec::new();
     for (name, schema) in meta.schemas.iter() {
-        let Some(spec) = &schema.global else { continue };
+        if let Some(spec) = schema.global.as_ref().filter(|g| g.is_mrec()) {
+            tables.push(admin_mrec_table_view(ctx, name, spec, &mut warnings));
+            continue;
+        }
+        let Some(spec) = schema.global.as_ref().filter(|g| g.is_mrsc()) else {
+            continue;
+        };
         let ready = meta.table_ready_regions(name);
         let mut tablets = Vec::new();
         for (id, t) in meta
@@ -480,7 +612,7 @@ pub(crate) async fn admin_set_preferred_leader<E: Env, R: RelayClient>(
         );
     }
     let meta = ctx.metadata_fresh().await;
-    let Some(spec) = meta.table_global(table) else {
+    let Some(spec) = meta.table_global(table).filter(|g| g.is_mrsc()) else {
         return (
             404,
             json!({"error": format!("table `{table}` is not a global table")}),

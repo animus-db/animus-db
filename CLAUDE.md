@@ -223,6 +223,8 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 | `ANIMUS_UPGRADE_RESTART_SEEDS=K` | 1 | upgrade-restart corpus depth, tiers 1 and 2 (ADR 0073 P1-D): tier 1 `animus-test` `tests/it/upgrade_restart_corpus.rs` — K seeds per cell (21 cells); tier 2 `animusd` `sim_cluster_upgrade_corpus` (whole-cluster restart over `SimCluster`'s `LsmEngine` backend + the DynamoDB wire, 3 cells; `cargo test -p animusd --lib sim_cluster_upgrade_corpus`); `ANIMUS_UPGRADE_RESTART_CELL=<substring>` narrows to matching cells (combine with `ANIMUS_SEED=<seed>` to replay one). |
 | `ANIMUS_UPGRADE_SEEDS=K` | 1 | mixed-version corpus depth (ADR 0073 Phase 2, P2-D; distinct from `ANIMUS_UPGRADE_RESTART_SEEDS`): pure tier `animus-control` `tests/it/version_mixed_corpus.rs` (`cargo test -p animus-control --test it version_mixed_corpus::`, 8 cells) and `animusd` `sim_cluster_mixed_version_corpus` (rolling Phase 1 -> B2 over `SimCluster`, `cargo test -p animusd --lib sim_cluster_mixed_version`); `ANIMUS_UPGRADE_CELL=<substring>` narrows cells, `ANIMUS_SEED=<seed>` replays one. Needs `animus-control`'s `sim-versions` feature (enabled via `animus-test`) |
 | `ANIMUS_MRSC_SEEDS=K` | 1 | **two corpora share this knob** (ADR 0075, G-01 G-c; each corpus step in `corpus-deep.yml` sets it separately): (1) pure tier, `animus-cp-data` `preferred_leader_corpus` (M2) — 3 regions x 1 node over WAN links, real `host::Reconciler` with `MetadataView.preferred_leader`; cells + negative control (empty preferred map leaves the leader outside the preferred region) — `cargo test -p animus-cp-data --test it preferred_leader_corpus::`; (2) cluster tier, `animusd` `sim_cluster_mrsc` (M4) — 6 nodes, 3 regions x 2, WAN links, LSM engine, table converted over the DynamoDB wire; one `sim_cluster_mrsc_corpus_<cell>` test per cell (steady, region loss leader/follower, partition heal, split, in-region replacement, witness form, decommission guard) + 3 negative controls — `cargo test -p animusd --lib sim_cluster_mrsc`; one seed is ~8 CPU-minutes in a debug build. `ANIMUS_MRSC_CELL=<substring>` narrows (both), `ANIMUS_SEED=<seed>` replays one |
+| `ANIMUS_MREC_SEEDS=K` | 1 | multi-cluster MREC (eventually-consistent global table) fault-injection corpus depth (`animusd`, ADR 0075 section 4.9, G-01 G-d M5) — `SimWorld`: 2-3 real 3-node clusters on the LSM backend over a WAN bridge, random DynamoDB-wire workloads (put/update/delete/conditional/txn/TTL) under partition (incl. one-way), loss/duplication/reorder, crash/restart of the shipping and receiving leaders, split while shipping, clock skew within/beyond the bound, a peer down past `max_backlog` (resync); one `sim_world_mrec_corpus_<cell>` test per cell (17) + `sim_world_mrec_corpus_determinism` + 4 negative controls `mrec_negative_*` (LWW by arrival, cursor before ack, loop prevention off, oracle bite) — `cargo test -p animusd --lib sim_world_mrec_corpus`; ~1 CPU-minute per seed for all cells (debug). `ANIMUS_MREC_CELL=<substring>` narrows, `ANIMUS_SEED=<seed>` replays one, `ANIMUS_MREC_DEBUG=1` prints per-run dumps and failed ops |
+| `ANIMUS_MREC_WORLD_SEEDS=K` | 4 | depth of the hand-written `SimWorld` MREC suites (`animusd` `sim_world_mrec_tests`/`_shipper_tests`; the saga/edge/e2e files floor at 20 seeds) — `cargo test -p animusd --lib sim_world_mrec`; `ANIMUS_SEED=<seed>` replays one |
 | `ANIMUS_RECONCILER_SEEDS=K` | 1 | reconciler-corpus depth (`animus-cp-data`) |
 | `ANIMUS_TXN_SEEDS=K` | 1 | multi-tablet cross-transaction corpus depth (`animus-test`, ADR 0018) |
 | `ANIMUS_STREAM_SEEDS=K` | 1 | DynamoDB Streams lineage-walk corpus depth (`animus-test`, ADR 0042/0043) |
@@ -443,8 +445,8 @@ truth; this map is just for navigation.
   placement event-driven (ADR 0031). Clusters grow online: new nodes
   self-register and mirror `Metadata` (ADR 0030), join via seed addresses, and
   are decommissioned via drain → remove (ADR 0032).
-- **Global tables (MRSC stretch tables)** — ADR 0075 (G-01 stage G-c; MREC and
-  federation are G-d/G-e, not built). One cluster whose nodes carry
+- **Global tables (MRSC stretch tables)** — ADR 0075 (G-01 stage G-c; MREC is
+  below, federation is G-e, not built). One cluster whose nodes carry
   `topology.kubernetes.io/region` labels; `UpdateTable` `ReplicaUpdates` +
   `MultiRegionConsistency: STRONG` on an empty table (three Regions, or two plus
   a witness) becomes one `ConvertTableToGlobal` (`animus-control`, behind
@@ -457,6 +459,20 @@ truth; this map is just for navigation.
   edge + `/admin/global-tables` + the decommission guard. Corpora:
   `preferred_leader_corpus` (pure) and `sim_cluster_mrsc` (cluster), knob
   `ANIMUS_MRSC_SEEDS`. Known gap: #1226 (WAN groups never quiesce).
+- **Global tables (MREC, eventual, between clusters)** — ADR 0075 section 4 and
+  its "G-d as built" amendment (G-01 stage G-d; behind `Gate::MrecReplication`,
+  cluster version 3). Independent clusters, each with `cluster_settings.region` +
+  `peers`, replicate a table by last-writer-wins on a **calendar `MrecVersion`**
+  stamped in the row value (not the cluster HLC). Per led tablet and peer a
+  shipper (`animusd::mrec_shipper`) ships each dirty key's **current row** above a
+  `mrec:<region>` cursor (a scan for the first copy, resync and split children;
+  receiver streams coalesce), the saga (`mrec_saga`) drives `UpdateTable
+  ReplicaUpdates` create/delete, the receiver (`mrec_receiver`) applies via
+  `animus-cp-data` `apply_mrec`, over the mutual-TLS intra port
+  (`MrecApply` frame). Proofs: the multi-cluster `SimWorld`
+  (`sim_world_mrec_*`, corpus knob `ANIMUS_MREC_SEEDS`) and the real-process
+  `tests/mrec_peer_transport.rs`. Admin: `/admin/global-tables` (replicas + node-local
+  shipper health).
 - **Transaction consensus** — 2PC/HLC over the per-tablet Raft groups (ADR
   0018), the only transaction story. The Accord slice that used to sit here
   (`animus-consensus`, ADR 0011) is **deleted** — rejected for CP by ADR 0018 in

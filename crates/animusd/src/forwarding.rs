@@ -1037,6 +1037,11 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     Ok(dynamo::KindWriteOutcome::ConditionFailed) => {
                         ClientResponse::ConditionFailed
                     }
+                    Ok(dynamo::KindWriteOutcome::Superseded) => ClientResponse::Error(
+                        "a singular kind write came back superseded (MREC replicate rides \
+                         KindWriteBatch only)"
+                            .into(),
+                    ),
                     // Preserve the error's own code across the hop (a typed
                     // evaluation error — e.g. size() on an N attribute, a
                     // real ValidationException — must not degrade to a 500
@@ -1683,7 +1688,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             | ClientRequest::SplitTablet { .. }
             | ClientRequest::JoinInfo
             | ClientRequest::WatchMetadata { .. }
-            | ClientRequest::Txn { .. } => {
+            | ClientRequest::Txn { .. }
+            // ADR 0075 G-d M3: a peer cluster's replication batch is received
+            // bare on the intra port, never relayed inside `Forwarded`.
+            | ClientRequest::MrecApply(_) => {
                 ClientResponse::Error("unexpected forwarded request".into())
             }
         }

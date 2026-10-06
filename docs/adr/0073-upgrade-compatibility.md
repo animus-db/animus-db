@@ -2073,6 +2073,13 @@ first start of the new binary (Option B); **F** outlives the cluster, Phase 1 ru
 | Handshakes `NHS1`/`CHS1` | `animus-env/src/handshake.rs`, `prod.rs`, `animusd/src/lib.rs` | version fixed at 1 forever | `ext` TLVs; `check_peer` + disjoint-range refusal; `Envelope.peer_ext` |
 | `ReportNodeVersion`, `FinalizeClusterVersion` | new | `Gate::Era` | era-only variants |
 | `ConvertTableToGlobal` (`MetaCommand`), `TableSchema.global` (`GlobalTableSpec`), `PlacementPolicy.allowed_values` | `animus-control/src/{meta,schema}.rs`, `animus-placement/src/lib.rs`, relay arm in `animus-node/src/wire.rs` | G, `Gate::GlobalTables` (cluster version 2) | the variant is gated (`required_gate` row, relay allowlist); both fields are additive and skipped at their default, so an ordinary table/policy encodes byte-identically and only a converted table carries them (shaped fixtures `metadata/v1-global.json`, `mirror-entities/schema/v1-global.json`, `mirror-entities/policy/v1-pinned.json`) |
+| `ConvertTableToMrec`, `AddMrecReplica`, `RemoveMrecReplica`, `SetMrecReplicaStatus` (`MetaCommand`), `MultiRegionConsistency::Eventual`, `GlobalTableSpec.replicas` (`MrecReplica`/`MrecReplicaStatus`) | `animus-control/src/{meta,schema,mirror}.rs`, relay arms in `animus-node/src/wire.rs` | G, `Gate::MrecReplication` (cluster version 3) | the four variants are gated (exhaustive `required_gate` rows, relay allowlist; a `ConvertTableToGlobal` whose spec is `Eventual` is also classified `MrecReplication` by content); `replicas` is additive and skipped when empty, so an MRSC or ordinary table encodes byte-identically (shaped fixtures `metadata/v1-mrec.json`, `mirror-entities/schema/v1-mrec.json`) |
+| `WriteSchema.mrec` (`MrecWriteStamp`), `KindEvalOp::Replicate` (JSON blobs inside `KvCommand::KindEval`/`KindEvalBatch`/`TxnStage`) | `animus-item/src/write_schema.rs`, `animus-cp-data/src/{lib,gates}.rs` | G, `Gate::MrecReplication` | `KvCommand::required_gate` is **content-dependent** for the three carriers (an MREC entry joins to `MrecReplication`, everything else stays `Base`); the single propose choke point `gated_propose` refuses it while closed. `mrec` is additive/skipped when `None`. No binary codec change: the blobs are `serde_json` inside the envelope, so the wire stays v1 and the WAL stays v2 (shaped fixtures `raftkv-wire/v1-mrec.bin`, `raftkv-wal/v2-mrec.bin`) |
+| Stored item `VersionedItem`/`VersionedTombstone` (`MrecVersion`), base-row value of an MREC table | `animus-item/src/stored.rs` | F (outlives the cluster) + emitted only on MREC tables | additive variants inside stored-item **v1** (no tag change: the first byte is still `{`); `decode_stored_item` accepts all four forms, `decode_stored_item_versioned` also returns the stamp; an unversioned row decodes exactly as before and compares as `MrecVersion::ZERO` (shaped fixtures `stored-item/v1-versioned.json`, `v1-versioned-tombstone.json`) |
+| `ClientRequest::MrecApply` / `ClientResponse::MrecApply` (`MrecApplyRequest`/`MrecApplyResponse`, `MREC_PROTO = 1`), `KindWriteOp::Replicate` on the leader write RPCs, `KindWriteItemReply::Superseded` | `animus-node/src/wire.rs`, `animusd/src/{mrec_receiver,mrec_peer,forwarding}.rs` | G, `Gate::MrecReplication` (intra-only; cross-cluster) | `ClientRequest::required_gate` row (no `_` arm); `ClientResponse::required_gate` is content-dependent: per-record `Answers` and a `Superseded` slot need the gate, a whole-batch `Refused` is `Base` (the closed-gate node must be able to answer). Emit sites go through the gated encoder; the forwarding/relay allowlists and `surface_of` carry the arm. The frame has its own `MREC_PROTO` because the two clusters roll independently; a peer on a binary that predates it drops the connection on the unknown variant and the shipper backs off (fixture `client-frame/v1-mrec.bin`; `mrec_wire_shapes_are_gated_on_mrec_replication`; real-socket `tests/mrec_peer_transport.rs`) |
+| `MrecApplyRequest::control` (`MrecControl::{CreateReplica, Leave, AddPeer, SetTtl}`, the replica-saga peer calls) | `animus-node/src/wire.rs`, `animusd/src/{mrec_saga,mrec_receiver}.rs` | G, `Gate::MrecReplication` (rides the `MrecApply` frame; cross-cluster) | an optional field of the already-gated frame, so no new `required_gate` row: a frame carrying `control` is gated exactly like one carrying records. `SetTtl` was added after the first three variants (G-d M4c); a peer binary that predates a variant answers a decode refusal and the saga retries/backs off, and the sender never emits `SetTtl` unless the table is MREC (so the gate is open). Fixtures `client-frame/v1-mrec-control.bin` and `v1-mrec-control-ttl.bin` (no-overwrite; `animus-node` `format_fixtures.rs`) |
+| `MetaCommand::MarkMrecCopied` (+ `MrecReplica::copied`, additive/skipped when empty) | `animus-control/src/{meta,schema}.rs` | G, `Gate::MrecReplication` | exhaustive `required_gate` row (the gate list at `meta.rs` `MarkMrecCopied { .. } => Gate::MrecReplication`) and the relay allowlist; the `copied` set rides the existing shaped schema fixtures (`metadata/v1-mrec.json`, `mirror-entities/schema/v1-mrec.json`) because an absent/empty set encodes byte-identically to before |
+| Shipper cursor rows `mrec:<region>` (packed-HLC watermark) and `mrecscan:<region>` (`0x00` + last scanned base key) in a tablet's `KIND_CURSOR` scope | `animusd/src/mrec_shipper.rs` | F-ish: durable engine rows replicated with the tablet (WAL/snapshots), written only on an MREC table through the *existing* cursor kind ops, so no new command variant or gate | new key tags in an existing scope, not a format change: absent means "never shipped" and starts a scan, so an unreadable or dropped cursor is safe (a resync, never a loss). The trim janitor holds the change log for the `mrec:` term and drops a log-mode cursor past `max_backlog`. A split child drops its cursors (`trim_split_child`) and so rescans; keeping an inherited floor would need a cursor exemption from that trim and is deliberately not built (an ADR 0073 change if ever added). Covered by the shipper tests and the restart corpus; no byte fixture since the value is an opaque watermark/position owned by one binary |
 | `SegmentWire` (replicated segment/backup store RPCs on the reserved `SEGMENT_STREAM`/`BACKUP_SEGMENT_STREAM`) | `animus-cp-data/src/cluster_segment_store.rs` | G (all `Gate::Base` today) | `SegmentWire::required_gate`, exhaustive, no `_` arm; `encode` debug-asserts `Base`; a test pins every variant's JSON. A new variant or field needs a gate and a gated send path (the store holds no `ClusterFeatures` yet) |
 | `control-wal`/`shared-wal`/`raftkv-wal`, LSM WAL/SSTable/manifest, key-layout marker, `ADE1` | `animus-control/src/persist.rs`, `animus-storage`, `animus-cp-data/src/layout.rs`, `animus-env/src/encrypted.rs` | L | next bump at first start; checklist applies |
 | Mirror files, `ClusterConfig` | `mirror.rs`, `animusd/src/config.rs` | L | only that node reads them |
@@ -2689,6 +2696,68 @@ witness read hiding are node-local (class L) and need no gate.
   cells in both tiers and `global_table_apply::convert_requires...`.
 - `cluster_version_prod` now finalizes 1 -> 2 for real and asserts the gate opens
   on every node including a data-only one.
+
+## Amendment 2026-10-05 — the second real gate: `Gate::MrecReplication`, `MAX_SUPPORTED = 3` (G-01 stage G-d, M1)
+
+`MAX_SUPPORTED` is now **3** and `Gate::MrecReplication` (version 3) gates every
+cross-node surface of MREC global tables (ADR 0075 section 4): the four
+`MetaCommand`s above, `MultiRegionConsistency::Eventual` with
+`GlobalTableSpec.replicas`, and the data-plane shapes `WriteSchema.mrec` and
+`KindEvalOp::Replicate`. M1 ships the shapes, codecs, gate rows, fixtures and cells
+and **nothing emits them**; no behaviour changes for an existing table. It is its own
+gate, not `GlobalTables`, because a Release(2) voter (G-c) already opens `GlobalTables`
+yet cannot decode any of these.
+
+**Decision: `MIN_SUPPORTED` stays 1 (it does not move to 2).** The N-1/N formula
+(`MAX - 1`) would make a Release(3) binary advertise `[2, 3]`, but the era starts at
+cluster version 1 and `Metadata::apply` rejects a `ReportNodeVersion` whose range
+excludes the *current* cluster version, so a `min = 2` binary could never report into
+a fresh cluster and the era could never start. `MIN_SUPPORTED` is therefore a literal
+`1` with an explanatory doc; raising it needs the era-start rule redesigned first (an
+amendment naming the stepping-stone release). Safety is unaffected: gates still open
+one finalize step at a time (each needs every registered node's range to contain the
+target), decoders accept everything forever, and a v1 -> v3 skip is *unsupported and
+untested* (no cell covers it), not refused. The simulated `Release(n)` profile keeps its
+stricter `[n-1, n]` model; `Release(2)` is pinned to the literal `[1, 2]` (the G-c
+binary as shipped) and a unit test asserts it.
+
+- **Per-gate classification (Phase 2 step).**
+
+  | New shape | Class | Gate | Emit-site / propose-site check |
+  |---|---|---|---|
+  | `MetaCommand::{ConvertTableToMrec, AddMrecReplica, RemoveMrecReplica, SetMrecReplicaStatus}` | G | `MrecReplication` | exhaustive `required_gate` rows; `RaftNode::propose` choke point; receiver-side `relay_gate_verdict` via the relay allowlist |
+  | `ConvertTableToGlobal` with an `Eventual` spec | G | `MrecReplication` (by content) | same; apply additionally rejects it (the strong command takes a strong spec) |
+  | `MultiRegionConsistency::Eventual`, `GlobalTableSpec.replicas` | G | `MrecReplication` | only the gated commands write them |
+  | `WriteSchema.mrec`, `KindEvalOp::Replicate` | G | `MrecReplication` | content-dependent `KvCommand::required_gate` (`KindEval`, `KindEvalBatch`, `TxnStage` pending writes); `gated_propose` |
+  | Stored item `VersionedItem`/`VersionedTombstone` | F + G-emitted | none (stored-item v1 additive) | written only by apply of a gated entry |
+
+- **Fixtures (all new, none edited):** `stored-item/v1-versioned.json`,
+  `v1-versioned-tombstone.json`; `metadata/v1-mrec.json`;
+  `mirror-entities/schema/v1-mrec.json`; `raftkv-wire/v1-mrec.bin`;
+  `raftkv-wal/v2-mrec.bin`. The additive-variant fixtures use the `vN-<shape>` name
+  the control crate already used for `v1-global`; the per-crate loaders skip shaped
+  files in their "iterate every `vN`" loops and read them in a dedicated test with a
+  hand-written expected value. The checklist's "bump / keep the vN decoder under
+  `legacy` / test-only legacy encoder" steps do not apply: no version tag moved (an
+  additive variant or skipped-at-default field inside v1, per each format's own
+  frozen-format note), so the "old input" tests are the existing v1 fixtures decoding
+  unchanged with no stamp (`unversioned_v1_fixtures_decode_without_a_stamp`,
+  `pre_mrec_wire_fixture_needs_no_gate`, `mrec_fields_are_absent_from_non_mrec_encodings`).
+- **Cells.** Pure tier `version_mixed_corpus::release2_to_release3_mrec_gate` and
+  `negative_control_mrec_gate_emitted_early` (N6); cluster tier the same names in
+  `sim_cluster_mixed_version_corpus`. The positive cells prove: every MREC proposal
+  is refused at the proposer while closed (counted, never appended), a finalize to
+  3 is refused while a `[1,2]` node is recorded, the gate opens on every node (the
+  data-only mirror included), and the commands then apply everywhere with no capped
+  rejection and no pinned placement. N6 emits `ConvertTableToMrec` ungated with one
+  `Release(2)` voter: that voter is the only wedged replica, the cap reports the
+  rejection, and the oracle reports the spec applied before its gate on the others.
+  The sim cap's `content_gate` now names the real MREC variants by content,
+  independent of `required_gate`, so a mis-classified emitter still trips the capped
+  decode (mutation checked: downgrading the four rows to `Base` fails both positive
+  cells).
+- `cluster_version_prod` finalizes 1 -> 2 -> 3 over real sockets and asserts both gates
+  open on every node, a data-only node's mirror included.
 
 ## Amendment 2026-10-05 — Phase 3 design: rolling-upgrade orchestration
 

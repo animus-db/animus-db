@@ -185,6 +185,22 @@ impl TlsConfig {
     /// contains no usable cert/key, or if `rustls` rejects the resulting
     /// material (e.g. an unparseable key).
     pub fn load(&self) -> io::Result<TlsMaterial> {
+        self.load_with_extra_client_ca(None)
+    }
+
+    /// As [`load`](Self::load), but the **outbound** (client) side additionally
+    /// trusts the CA certificate(s) in `extra_client_ca` when verifying a
+    /// server certificate — a per-peer-cluster CA for a cross-cluster dial
+    /// (ADR 0075 section 4.3, G-d M3). The inbound side (the CA a *peer's*
+    /// client certificate must chain to) is unchanged: a peer cluster's CA is
+    /// admitted there by putting it in this node's own `ca_path` bundle.
+    ///
+    /// # Errors
+    /// As [`load`](Self::load), plus an unreadable/empty `extra_client_ca`.
+    pub fn load_with_extra_client_ca(
+        &self,
+        extra_client_ca: Option<&Path>,
+    ) -> io::Result<TlsMaterial> {
         let Some(ca_path) = self.ca_path.as_deref() else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -221,7 +237,15 @@ impl TlsConfig {
         let client_config = rustls::ClientConfig::builder_with_provider(provider.clone())
             .with_safe_default_protocol_versions()
             .map_err(to_io_error)?
-            .with_root_certificates(root_cert_store(ca_path)?)
+            .with_root_certificates({
+                let mut roots = root_cert_store(ca_path)?;
+                if let Some(extra) = extra_client_ca {
+                    for cert in load_certs(extra)? {
+                        roots.add(cert).map_err(to_io_error)?;
+                    }
+                }
+                roots
+            })
             .with_client_auth_cert(client_certs, client_key)
             .map_err(to_io_error)?;
 

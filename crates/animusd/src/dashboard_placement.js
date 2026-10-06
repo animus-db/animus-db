@@ -18,10 +18,28 @@
 
 let placementSelectedNode = null;
 
-// `{preferred_leader_region, witness, regions}` of a global table, else null.
+// `{preferred_leader_region, witness, regions}` of an MRSC global table, else
+// null. An MREC (eventual) table has no preferred leader or Region pin, so it
+// is deliberately NOT returned here (it would read as "leader off preferred").
 function globalSpecOf(status, table) {
+  const g = rawGlobalOf(status, table);
+  return g && !(g.replicas && g.replicas.length) ? g : null;
+}
+
+function rawGlobalOf(status, table) {
   const t = status && status.schemas && status.schemas.tables && status.schemas.tables[table];
   return (t && t.global) || null;
+}
+
+// MREC (ADR 0075 section 4, G-01 G-d): `"b ACTIVE, c CREATING"` of the table's
+// non-local replicas from the replicated spec, else null. Shipper health (backlog,
+// lag, last error) is node-local and lives on `/admin/global-tables`.
+function mrecReplicaText(status, table) {
+  const g = rawGlobalOf(status, table);
+  if (!g || !g.replicas || !g.replicas.length) return null;
+  const others = g.replicas.filter((r) => !r.local);
+  if (!others.length) return null;
+  return others.map((r) => `${r.region} ${String(r.status).toUpperCase()}`).join(", ");
 }
 
 // The `topology.kubernetes.io/region` label of member `nodeId`, else null.
@@ -59,6 +77,7 @@ function tabletsForNode(nodeId, tablets, groups) {
       return {
         id, table: t.table || "—", role, status: tabletStatus(t, gs),
         preferred: spec ? spec.preferred_leader_region : null,
+        mrec: mrecReplicaText(STATE.status, t.table),
         witness: !!(spec && spec.witness && spec.witness === regionOfMember(
           (STATE.status && STATE.status.members) || {}, nodeId)),
       };
@@ -125,7 +144,8 @@ function renderPlacement() {
       <td class="mono">${esc(t.id)}</td><td>${esc(t.table)}</td>
       <td style="color:${t.role === "leader" ? "var(--accent)" : "var(--text2)"};font-weight:500">${esc(t.role)}</td>
       <td>${pill(t.status, t.status)}</td>
-      <td>${t.preferred ? esc("preferred " + t.preferred + (t.witness ? " · witness here" : "")) : "—"}</td>
+      <td>${t.preferred ? esc("preferred " + t.preferred + (t.witness ? " · witness here" : ""))
+        : (t.mrec ? esc("eventual · replicas " + t.mrec) : "—")}</td>
     </tr>`).join("")}</tbody></table>`
     : `<div class="empty">no tablets configured on this node</div>`;
   document.querySelectorAll("#pl-node-tablets tr[data-tablet]").forEach((tr) =>

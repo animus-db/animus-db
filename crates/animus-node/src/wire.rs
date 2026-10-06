@@ -62,6 +62,31 @@ pub enum KindWriteOp {
         key_item: animus_dynamo::Item,
         actions: Vec<animus_dynamo::wire::UpdateAction>,
     },
+    /// **Apply a replicated MREC write** (ADR 0075 section 4, G-01 stage G-d
+    /// M3): another cluster's already-resolved result for this item (`item:
+    /// None` is a tombstone), with the originating write's stamp `ver`. The
+    /// leader proposes `KindEvalOp::Replicate` (last-writer-wins apply, M2).
+    /// Proposed only by the MREC receiver (`animusd::mrec_receiver`), never by
+    /// a DynamoDB write; refused in a transaction.
+    ///
+    /// **Class G, `Gate::MrecReplication`**: [`ClientRequest::required_gate`]
+    /// is content-dependent, so a request carrying this op is never sent to a
+    /// node that cannot decode it.
+    Replicate {
+        item: Option<animus_dynamo::Item>,
+        ver: animus_item::MrecVersion,
+    },
+}
+
+impl KindWriteOp {
+    /// The gate this op needs ([`Gate::MrecReplication`] for a replicate).
+    #[must_use]
+    pub fn required_gate(&self) -> Gate {
+        match self {
+            KindWriteOp::Put(_) | KindWriteOp::Delete | KindWriteOp::Update { .. } => Gate::Base,
+            KindWriteOp::Replicate { .. } => Gate::MrecReplication,
+        }
+    }
 }
 
 /// A `cp_txn`/`ClientRequest::Txn` write spanning tables (ADR 0018 §2/PR4;
@@ -177,6 +202,107 @@ pub enum KindWriteItemReply {
     /// domain violation (e.g. `size()` on the wrong attribute type) or a
     /// malformed/oversized update, scoped to this one item.
     Rejected { code: String, message: String },
+    /// This item was a [`KindWriteOp::Replicate`] whose stamp did not beat the
+    /// stored one (it lost last-writer-wins, or was an idempotent
+    /// re-delivery): nothing was written. **Class G, `Gate::MrecReplication`**
+    /// ([`ClientResponse::required_gate`] is content-dependent).
+    Superseded,
+}
+
+/// The MREC replication protocol version carried in an
+/// [`MrecApplyRequest`]/[`MrecApplyResponse`]: the two clusters roll
+/// independently, so the cross-cluster frame is versioned on its own (ADR
+/// 0073 Phase 2 note; a receiver refuses an unknown `proto` by name).
+pub const MREC_PROTO: u32 = 1;
+
+/// One replicated item of an [`MrecApplyRequest`]: the originating region's
+/// resulting image (`item: None` is a tombstone) and its stamp.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MrecRecord {
+    pub pk: animus_dynamo::AttributeValue,
+    pub sk: Option<animus_dynamo::AttributeValue>,
+    pub item: Option<animus_dynamo::Item>,
+    pub ver: animus_item::MrecVersion,
+}
+
+/// **Cross-cluster MREC replication batch** (ADR 0075 section 4, G-d M3): the
+/// shipper of region `from_region` offers `records` of `table` to a peer data
+/// node, which groups them by its own tablet layout and proposes one
+/// `KindEvalBatch` per destination tablet. Intra-only ([`surface_of`]); the
+/// cross-cluster authentication is ADR 0064 mutual TLS on the intra port.
+/// Answered with [`ClientResponse::MrecApply`]. **Class G,
+/// `Gate::MrecReplication`.**
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MrecApplyRequest {
+    /// [`MREC_PROTO`] of the sender.
+    pub proto: u32,
+    /// The sender's own region name (must be a configured peer of the
+    /// receiver and a replica of `table`).
+    pub from_region: String,
+    pub table: String,
+    pub records: Vec<MrecRecord>,
+    /// A replica-lifecycle message instead of a record batch (G-d M4; `records`
+    /// is then empty and ignored). Additive: absent on every pre-M4 frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<MrecControl>,
+}
+
+/// The replica-lifecycle messages one cluster sends a peer (the create/delete
+/// saga, ADR 0075 4.3/5.1), carried by [`MrecApplyRequest::control`]. Answered
+/// with [`MrecApplyResponse::Done`] or [`MrecApplyResponse::Refused`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MrecControl {
+    /// Create the receiving cluster's replica of `table` (idempotent): a
+    /// `CreateTable` body (DynamoDB JSON) for the table, an optional TTL
+    /// attribute, and the other regions of the replica set (the sender
+    /// excluded) the receiver must also replicate with.
+    CreateReplica {
+        create_table: String,
+        ttl_attribute: Option<String>,
+        peers: Vec<String>,
+    },
+    /// The sender removed the receiving cluster from its replica set (and
+    /// asks the receiver to drop the sender from its own). The receiver's
+    /// table survives as a standalone one.
+    Leave,
+    /// The sender added `region` to the replica set; the receiver adds it too
+    /// (full mesh, ADR 0075 D8).
+    AddPeer { region: String },
+    /// The sender's table now has (`Some`) or no longer has (`None`) a TTL
+    /// attribute; the receiver mirrors it (idempotent; ADR 0075 V15, TTL
+    /// settings synchronize across replicas). Added after the first three
+    /// variants, class G with the rest of the `MrecApply` frame.
+    SetTtl { attribute: Option<String> },
+}
+
+/// The receiver's per-record verdict (same order as the request's `records`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MrecAnswer {
+    /// The record won last-writer-wins and is committed on the receiver's
+    /// tablet. The shipper may advance past it.
+    Applied,
+    /// The receiver already holds an equal or newer stamp (loss, or an
+    /// idempotent re-delivery). Terminal: the shipper may advance past it.
+    Superseded,
+    /// Not applied *yet* (skew-ahead stamp, a live transaction intent on the
+    /// key, overload, leadership churn): resend later; never advance past it.
+    Retry,
+    /// Refused for good (malformed record); never retried.
+    Rejected { message: String },
+}
+
+/// Reply to [`MrecApplyRequest`] (carried by [`ClientResponse::MrecApply`]).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MrecApplyResponse {
+    /// One answer per request record, in order.
+    Answers(Vec<MrecAnswer>),
+    /// A [`MrecControl`] message was carried out (idempotent).
+    Done,
+    /// The whole batch was refused before any record was looked at (gate
+    /// closed, unknown peer, table not an MREC table or not replicated with
+    /// the sender, an insecure link, unknown `proto`). `retryable` says
+    /// whether the same batch may succeed later.
+    Refused { message: String, retryable: bool },
 }
 
 /// A request from a client to a node (length-prefixed JSON over TCP).
@@ -795,6 +921,18 @@ pub enum ClientRequest {
         span: KeyRange,
         txn_id: TxnId,
     },
+    /// **Cross-cluster MREC replication batch** (ADR 0075 section 4, G-01
+    /// stage G-d M3) — see [`MrecApplyRequest`]. The one request a *peer
+    /// cluster* sends to a data node's intra port (ADR 0064 mutual TLS is the
+    /// cross-cluster authentication, no new listener). **Intra-only, never
+    /// forwarded**: it is received bare, handled by any data node
+    /// (`animusd::mrec_receiver`), which itself proposes through the ordinary
+    /// per-tablet leader path. Answered with [`ClientResponse::MrecApply`].
+    /// Not a `MetaCommand`, so `is_relayable_command` does not apply.
+    /// **Class G, `Gate::MrecReplication`**: an older binary tears the
+    /// connection down on the unknown variant (ADR 0073 section 3), which the
+    /// shipper reads as an ordinary transport error and backs off on.
+    MrecApply(MrecApplyRequest),
 }
 
 /// Where a [`ClientRequest`] variant may be received **bare** — a
@@ -872,7 +1010,8 @@ pub fn surface_of(request: &ClientRequest) -> Surface {
         | ClientRequest::TxnResolve { .. }
         | ClientRequest::TxnStatus { .. }
         | ClientRequest::TxnRecordView { .. }
-        | ClientRequest::TxnVerify { .. } => Surface::Intra,
+        | ClientRequest::TxnVerify { .. }
+        | ClientRequest::MrecApply(_) => Surface::Intra,
     }
 }
 
@@ -985,6 +1124,16 @@ pub fn is_relayable_command(command: &MetaCommand) -> bool {
         // relay reason as `ConvertTableToGlobal` (the admin action may land
         // on a follower); the receiver re-checks `Gate::GlobalTables`.
         | MetaCommand::SetGlobalPreferredLeader { .. }
+        // MREC global tables (ADR 0075 section 4, G-01 stage G-d): the replica
+        // set is catalog state mutated from a wire `UpdateTable` on any node
+        // (and by the create/delete saga on the control leader), so all four
+        // relay like `ConvertTableToGlobal`; the receiver re-checks
+        // `Gate::MrecReplication` (`version_wiring::relay_gate_verdict`).
+        | MetaCommand::ConvertTableToMrec { .. }
+        | MetaCommand::AddMrecReplica { .. }
+        | MetaCommand::RemoveMrecReplica { .. }
+        | MetaCommand::SetMrecReplicaStatus { .. }
+        | MetaCommand::MarkMrecCopied { .. }
         // Resource tagging (roadmap W-06): schema-catalog class, same relay
         // reason as `SetTableTtl` — a follower-connected `TagResource`/
         // `UntagResource` must reach the control leader.
@@ -1224,6 +1373,15 @@ impl ClientRequest {
         match self {
             ClientRequest::ProposeSchema(command) => command.required_gate(),
             ClientRequest::Forwarded { request, .. } => request.required_gate(),
+            // ADR 0075 G-d M3: the cross-cluster replication batch, and the
+            // replicate op riding the data-plane write RPCs (content-dependent).
+            ClientRequest::MrecApply(_) => Gate::MrecReplication,
+            ClientRequest::KindWriteItem { op, .. } => op.required_gate(),
+            ClientRequest::KindWriteBatch { items, .. } => items
+                .iter()
+                .map(|i| i.op.required_gate())
+                .max()
+                .unwrap_or(Gate::Base),
             ClientRequest::Status
             | ClientRequest::Put { .. }
             | ClientRequest::PutBatch { .. }
@@ -1235,8 +1393,6 @@ impl ClientRequest {
             | ClientRequest::StreamHotRead { .. }
             | ClientRequest::StreamHotChangeMax { .. }
             | ClientRequest::ClearBackfillCursor { .. }
-            | ClientRequest::KindWriteItem { .. }
-            | ClientRequest::KindWriteBatch { .. }
             | ClientRequest::CpLeaderHintProbe { .. }
             | ClientRequest::Get { .. }
             | ClientRequest::GetSnapshot { .. }
@@ -1266,12 +1422,31 @@ impl ClientResponse {
     #[must_use]
     pub fn required_gate(&self) -> Gate {
         match self {
+            // ADR 0075 G-d M3: the replication reply, and a batch reply that
+            // carries a `Superseded` slot (content-dependent).
+            // A whole-batch `Refused` is the one MrecApply reply a node whose
+            // own gate is still closed must be able to emit (it is how it
+            // says "not yet"); it answers a request only a new binary can
+            // send, so it is `Base`. Per-record answers need the gate open.
+            ClientResponse::MrecApply(MrecApplyResponse::Refused { .. }) => Gate::Base,
+            ClientResponse::MrecApply(MrecApplyResponse::Answers(_) | MrecApplyResponse::Done) => {
+                Gate::MrecReplication
+            }
+            ClientResponse::KindWriteBatchOk { results } => {
+                if results
+                    .iter()
+                    .any(|r| matches!(r, KindWriteItemReply::Superseded))
+                {
+                    Gate::MrecReplication
+                } else {
+                    Gate::Base
+                }
+            }
             ClientResponse::Status { .. }
             | ClientResponse::PutOk
             | ClientResponse::Value(_)
             | ClientResponse::KindWriteOk { .. }
             | ClientResponse::ConditionFailed
-            | ClientResponse::KindWriteBatchOk { .. }
             | ClientResponse::Unresolved
             | ClientResponse::CpLeaderHint { .. }
             | ClientResponse::Pairs(_)
@@ -1538,6 +1713,9 @@ pub enum ClientResponse {
     /// replied `ClientResponse::PutOk`, indistinguishable from a genuine
     /// resolve — the exact gap the amendment names.
     TxnResolved { outcome: ResolveOutcome },
+    /// Reply to [`MrecApply`](ClientRequest::MrecApply) (ADR 0075 section 4,
+    /// G-d M3). **Class G, `Gate::MrecReplication`.**
+    MrecApply(MrecApplyResponse),
 }
 
 #[cfg(test)]
@@ -1642,11 +1820,31 @@ mod tests {
                     regions: vec!["a".to_string(), "b".to_string(), "c".to_string()],
                     witness: None,
                     preferred_leader_region: "a".to_string(),
+                    replicas: Vec::new(),
                 },
             },
             MetaCommand::SetGlobalPreferredLeader {
                 table: table.clone(),
                 region: "b".to_string(),
+            },
+            MetaCommand::ConvertTableToMrec {
+                table: table.clone(),
+                local_region: "us".to_string(),
+                region_id: animus_control::mrec_region_id("us"),
+            },
+            MetaCommand::AddMrecReplica {
+                table: table.clone(),
+                region: "eu".to_string(),
+                region_id: animus_control::mrec_region_id("eu"),
+            },
+            MetaCommand::RemoveMrecReplica {
+                table: table.clone(),
+                region: "eu".to_string(),
+            },
+            MetaCommand::SetMrecReplicaStatus {
+                table: table.clone(),
+                region: "eu".to_string(),
+                status: animus_control::MrecReplicaStatus::Active,
             },
             MetaCommand::TagResource {
                 table: table.clone(),

@@ -112,8 +112,11 @@ pub enum ReplicaAction {
     /// `Update{..}`: no per-replica setting is overridable (rejected).
     Update,
     /// `Delete{RegionName}`: replicas of an MRSC table cannot be removed
-    /// (rejected).
-    Delete,
+    /// (rejected there); an MREC replica can (ADR 0075 section 5.1).
+    Delete {
+        /// The `RegionName`.
+        region: String,
+    },
 }
 
 /// One element of `UpdateTable.GlobalTableWitnessUpdates`
@@ -244,7 +247,13 @@ fn decode_replica_actions(value: &Value) -> Result<Vec<ReplicaAction>, String> {
                 out.push(ReplicaAction::Create { region, overrides });
             }
             ["Update"] => out.push(ReplicaAction::Update),
-            ["Delete"] => out.push(ReplicaAction::Delete),
+            ["Delete"] => {
+                let delete = element["Delete"]
+                    .as_object()
+                    .ok_or_else(|| "`ReplicaUpdates` `Delete` must be an object".to_owned())?;
+                let region = region_name(delete, "`ReplicaUpdates` `Delete`")?;
+                out.push(ReplicaAction::Delete { region });
+            }
             _ => {
                 return Err(
                     "each `ReplicaUpdates` element must have exactly one of `Create`, `Update` or \
@@ -370,7 +379,7 @@ impl GlobalTableUpdate {
                          setting can be overridden)",
                     ));
                 }
-                ReplicaAction::Delete => {
+                ReplicaAction::Delete { .. } => {
                     return Err(WireError::validation(
                         "UpdateTable: ReplicaUpdates Delete is not supported: replicas cannot \
                          be removed from a multi-Region strongly consistent table, and no other \
@@ -430,7 +439,7 @@ impl GlobalTableUpdate {
                          setting can be overridden)",
                     ));
                 }
-                ReplicaAction::Delete => {
+                ReplicaAction::Delete { .. } => {
                     return Err(WireError::validation(
                         "UpdateTable: ReplicaUpdates Delete is not supported: replicas cannot \
                          be removed from a multi-Region strongly consistent table, and no other \
@@ -497,6 +506,104 @@ impl GlobalTableUpdate {
     }
 }
 
+/// What a *valid* MREC replica request asks for, before the
+/// cluster-dependent checks: the peers to add, or the peers to remove (never
+/// both in one call).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MrecRequest {
+    /// `Create` Regions (peer names), in request order.
+    pub creates: Vec<String>,
+    /// `Delete` Regions (peer names), in request order.
+    pub deletes: Vec<String>,
+}
+
+impl GlobalTableUpdate {
+    /// Whether this request is shaped for the MREC path: the consistency is
+    /// absent or `EVENTUAL` (the AWS default). `STRONG` and unknown values
+    /// stay on the MRSC path ([`validate`](Self::validate)).
+    #[must_use]
+    pub fn is_eventual(&self) -> bool {
+        matches!(self.consistency.as_deref(), None | Some("EVENTUAL"))
+    }
+
+    /// Apply every request-shape rule of an MREC replica change (ADR 0075
+    /// section 5.1): per-replica overrides and `Update` are named and
+    /// refused, a witness is MRSC-only, creates and deletes are not mixed,
+    /// `EVENTUAL` needs a `Create` (V3). Cluster-dependent rules (configured
+    /// peers, own Region, already a replica) are the edge's.
+    ///
+    /// # Errors
+    /// A named `ValidationException`.
+    pub fn validate_mrec(&self) -> Result<MrecRequest, WireError> {
+        if let Some(e) = &self.shape_error {
+            return Err(WireError::validation(format!("UpdateTable: {e}")));
+        }
+        if let Some(e) = &self.conflicting_change {
+            return Err(WireError::validation(e.clone()));
+        }
+        if self.has_witness_updates || !self.witness_actions.is_empty() {
+            return Err(WireError::validation(
+                "UpdateTable: GlobalTableWitnessUpdates is only valid with MultiRegionConsistency \
+                 STRONG",
+            ));
+        }
+        let mut creates: Vec<String> = Vec::new();
+        let mut deletes: Vec<String> = Vec::new();
+        for action in &self.replica_actions {
+            match action {
+                ReplicaAction::Create { region, overrides } => {
+                    if let Some(field) = overrides.first() {
+                        return Err(WireError::validation(format!(
+                            "UpdateTable: ReplicaUpdates Create does not support `{field}` \
+                             (per-replica overrides are not supported)"
+                        )));
+                    }
+                    creates.push(region.clone());
+                }
+                ReplicaAction::Update => {
+                    return Err(WireError::validation(
+                        "UpdateTable: ReplicaUpdates Update is not supported (no per-replica \
+                         setting can be overridden)",
+                    ));
+                }
+                ReplicaAction::Delete { region } => deletes.push(region.clone()),
+            }
+        }
+        if !creates.is_empty() && !deletes.is_empty() {
+            return Err(WireError::validation(
+                "UpdateTable: ReplicaUpdates cannot mix Create and Delete actions in one call",
+            ));
+        }
+        if creates.is_empty() && deletes.is_empty() {
+            return Err(WireError::validation(
+                "UpdateTable: MultiRegionConsistency EVENTUAL requires ReplicaUpdates Create \
+                 actions",
+            ));
+        }
+        if self.consistency.is_some() && creates.is_empty() {
+            return Err(WireError::validation(
+                "UpdateTable: MultiRegionConsistency is only valid when ReplicaUpdates Create \
+                 actions are specified",
+            ));
+        }
+        let mut seen: Vec<&String> = Vec::new();
+        for region in creates.iter().chain(deletes.iter()) {
+            if region.is_empty() {
+                return Err(WireError::validation(
+                    "UpdateTable: RegionName must not be empty",
+                ));
+            }
+            if seen.contains(&region) {
+                return Err(WireError::validation(format!(
+                    "UpdateTable: Region `{region}` is named more than once"
+                )));
+            }
+            seen.push(region);
+        }
+        Ok(MrecRequest { creates, deletes })
+    }
+}
+
 /// A Region's status in a `DescribeTable` response. `animusd` derives it from
 /// the tablets' replica sets (plan decision D4): `Active` once every tablet of
 /// the table has a replica in the Region, `Creating` until then.
@@ -506,6 +613,10 @@ pub enum RegionStatus {
     Creating,
     /// Every tablet has a replica in the Region.
     Active,
+    /// The replica is being removed (MREC).
+    Deleting,
+    /// The replica could not be created (MREC); `Delete` clears it.
+    CreationFailed,
 }
 
 impl RegionStatus {
@@ -516,6 +627,8 @@ impl RegionStatus {
         match self {
             RegionStatus::Creating => "CREATING",
             RegionStatus::Active => "ACTIVE",
+            RegionStatus::Deleting => "DELETING",
+            RegionStatus::CreationFailed => "CREATION_FAILED",
         }
     }
 }
@@ -528,6 +641,9 @@ pub struct GlobalTableDescription {
     pub replicas: Vec<(String, RegionStatus)>,
     /// The witness Region, if any.
     pub witness: Option<(String, RegionStatus)>,
+    /// `true` for an MREC table (`MultiRegionConsistency: EVENTUAL`), `false`
+    /// for MRSC (`STRONG`).
+    pub eventual: bool,
 }
 
 impl GlobalTableDescription {
@@ -541,7 +657,7 @@ impl GlobalTableDescription {
         );
         desc.insert(
             "MultiRegionConsistency".into(),
-            Value::String("STRONG".into()),
+            Value::String(if self.eventual { "EVENTUAL" } else { "STRONG" }.into()),
         );
         desc.insert(
             "Replicas".into(),
@@ -824,6 +940,7 @@ mod tests {
                 ("b".into(), RegionStatus::Creating),
             ],
             witness: Some(("c".into(), RegionStatus::Active)),
+            eventual: false,
         }
         .apply_to(&mut desc);
         assert_eq!(
@@ -842,6 +959,7 @@ mod tests {
         GlobalTableDescription {
             replicas: vec![("a".into(), RegionStatus::Active)],
             witness: None,
+            eventual: false,
         }
         .apply_to(&mut desc);
         assert!(!desc.contains_key("GlobalTableWitnesses"));
