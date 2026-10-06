@@ -10,6 +10,7 @@ pub mod crd;
 pub mod desired;
 #[cfg(test)]
 pub mod fakes;
+pub mod peers;
 pub mod roll;
 pub mod s3_uri;
 pub mod validate;

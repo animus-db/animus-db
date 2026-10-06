@@ -2028,10 +2028,16 @@ outstanding on the wire surface at present.
     MREC rows and one real-process two-cluster test over mutual TLS. **Residuals:**
     no WAN cost or latency number (the `animus-bench` cross-region variant is
     still owed); cluster-wide lag
-    aggregation and alerting; the operator wiring of `peers` (G-e); AWS wire
+    aggregation and alerting; AWS wire
     names unverified (ADR 0075 section 0); the other gaps are listed at the end
     of the ADR's amendment.
-  - **G-e Operator multi-cluster federation (L).** One `AnimusCluster` per
+  - **G-e Operator multi-cluster federation (L) - MREC half built
+    2026-10-06** (`spec.region`/`spec.peers`, peer CA trust, NetworkPolicy,
+    `PeerReachable`; ADR 0075 "G-e as built"). **Residuals:** the two-cluster
+    `kind` e2e is unwritten and nothing is verified against a real API server;
+    stretch-segment federation (MRSC over several Kubernetes clusters), peer
+    endpoint auto-discovery and a source-address peer NetworkPolicy stay
+    deferred. Original scope: One `AnimusCluster` per
     Kubernetes cluster/region plus a federating resource or peer spec
     (cross-cluster endpoint discovery, peer TLS trust per ADR 0064,
     NetworkPolicy/egress for the peer ports, ordered replica-add on

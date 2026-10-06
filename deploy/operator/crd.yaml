@@ -20,6 +20,14 @@ spec:
           spec:
             description: '`AnimusCluster.spec` — the desired state of one AnimusDB cluster.'
             properties:
+              allowInsecurePeers:
+                description: |-
+                  **Dev only.** Permit cross-cluster MREC traffic with no `spec.tls`
+                  (maps to `cluster_settings.allow_insecure_peers`): the peer link is
+                  then unauthenticated and unencrypted. Without it a spec with `peers`
+                  and no `tls` is refused (`PeersSpecInvalid`).
+                nullable: true
+                type: boolean
               autoSplitBytes:
                 description: |-
                   The scoped-bytes threshold that auto-splits a led tablet (ADR 0034).
@@ -161,10 +169,73 @@ spec:
                 minimum: 0.0
                 nullable: true
                 type: integer
+              mrecMaxClockSkewMs:
+                description: |-
+                  Bound, in milliseconds, on how far ahead of a receiver's own wall
+                  clock a replicated MREC stamp may be (maps to
+                  `cluster_settings.mrec_max_clock_skew_ms`). Unset keeps animusd's
+                  default (500); `0` is refused.
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
               nodes:
                 description: Total pod count (`StatefulSet.spec.replicas`). Must be at least 1.
                 format: int32
                 type: integer
+              peers:
+                description: |-
+                  The **peer clusters** this cluster replicates MREC global tables with
+                  (ADR 0075 section 5.4). One `AnimusCluster` per Kubernetes cluster;
+                  peers are symmetric (each side lists the others); there is no
+                  federation CRD. Rendered into `cluster.json`'s
+                  `cluster_settings.peers`. Requires `spec.tls` (mutual TLS on the
+                  intra port authenticates the peer) unless
+                  [`allow_insecure_peers`](Self::allow_insecure_peers). See [`PeerSpec`]
+                  and [`AnimusClusterSpec::validate_peers_spec`].
+                items:
+                  description: |-
+                    One entry of `spec.peers` (ADR 0075 section 5.4, G-01 stage G-e): a peer
+                    cluster's MREC region name, the `host:port` endpoints of its nodes'
+                    **intra** ports (explicit, user-supplied LoadBalancer or multi-cluster
+                    DNS names; there is no automatic discovery), and optionally the Secret
+                    holding that peer's CA.
+                  properties:
+                    caSecretRef:
+                      description: |-
+                        A `Secret` in this namespace holding the peer cluster's CA
+                        certificate(s), only **referenced** (never created or written by this
+                        operator; a cert-manager user points it at the CA `Certificate`'s
+                        Secret). Mounted read-only, added to this cluster's inbound trust
+                        bundle and used to verify this peer's server certificate. Omit when
+                        the peer's certificates chain to the same CA as `spec.tls`.
+                      nullable: true
+                      properties:
+                        key:
+                          description: The data key holding the PEM CA bundle. Defaults to `ca.crt`.
+                          nullable: true
+                          type: string
+                        name:
+                          description: The `Secret`'s name (same namespace).
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    endpoints:
+                      description: |-
+                        `host:port` of the peer's intra port (any peer data node accepts a
+                        frame). At least one.
+                      items:
+                        type: string
+                      type: array
+                    region:
+                      description: The peer's own `spec.region`.
+                      type: string
+                  required:
+                  - endpoints
+                  - region
+                  type: object
+                type: array
               quiesceAfterSecs:
                 description: |-
                   The idle-before-quiescing grace period for a data-plane CP group
@@ -179,6 +250,16 @@ spec:
                 minimum: 0.0
                 nullable: true
                 type: integer
+              region:
+                description: |-
+                  This cluster's **MREC region name** (ADR 0075 section 5.4, G-01 stage
+                  G-e): the namespace of [`peers`](Self::peers) and of an MREC global
+                  table's replica set. Emitted into `cluster.json`'s
+                  `cluster_settings.region`. Distinct from the `topology.kubernetes.io/
+                  region` node label MRSC uses. Required when `peers` is non-empty.
+                  Additive: absent on every pre-G-e spec.
+                nullable: true
+                type: string
               resources:
                 description: Passthrough container resource requests/limits.
                 nullable: true

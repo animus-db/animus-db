@@ -1,0 +1,52 @@
+{
+  "apiVersion": "animusdb.io/v1alpha1",
+  "kind": "AnimusCluster",
+  "metadata": {
+    "name": "golden-peers",
+    "namespace": "animus"
+  },
+  "spec": {
+    "schemaVersion": 1,
+    "nodes": 3,
+    "controlNodes": 3,
+    "storage": {},
+    "clientService": {},
+    "tls": {
+      "secretName": "animus-tls"
+    },
+    "region": "us-east",
+    "peers": [
+      {
+        "region": "eu-west",
+        "endpoints": [
+          "animus-eu.example.com:14004",
+          "animus-eu-2.example.com:14004"
+        ],
+        "caSecretRef": {
+          "name": "eu-west-ca",
+          "key": "tls.crt"
+        }
+      },
+      {
+        "region": "ap-south",
+        "endpoints": [
+          "animus-ap.example.com:14004"
+        ]
+      }
+    ],
+    "mrecMaxClockSkewMs": 250
+  },
+  "status": {
+    "observedGeneration": 2,
+    "readyNodes": 3,
+    "phase": "Ready",
+    "conditions": [
+      {
+        "type": "PeerReachable",
+        "status": "Unknown",
+        "reason": "PeerHealthUnknown",
+        "message": "eu-west: no MREC table replicates with this peer yet; ap-south: no MREC table replicates with this peer yet"
+      }
+    ]
+  }
+}

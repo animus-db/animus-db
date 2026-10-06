@@ -2002,3 +2002,16 @@ one `AnimusCluster` on a Kubernetes cluster whose nodes span the Regions
 (ADR 0075 section 3.8); federation across Kubernetes clusters is G-e. The
 `kind` e2e cannot exercise a stretch topology; stretch behaviour is proven in
 `SimEnv` (`sim_cluster_mrsc`).
+
+## Amendment (2026-10-06) — `spec.region`, `spec.peers` (ADR 0075, G-e)
+
+The CRD gains additive `spec.region`, `spec.peers[]` (`region`, `endpoints`,
+`caSecretRef`), `spec.allowInsecurePeers` (dev) and `spec.mrecMaxClockSkewMs`,
+rendered into `cluster.json`'s `cluster_settings` for MREC peer replication; a
+peer CA `Secret` per peer is mounted read-only and merged into the intra trust
+bundle by `entrypoint.sh`; the `NetworkPolicy` gains peer-port egress and
+intra-port-only ingress when peers are set; a `PeerReachable` condition reports
+shipper health. Details, the `PeersSpecInvalid` refusal and the TLS and
+NetworkPolicy reasoning: ADR 0075's "G-e as built". `schemaVersion` stays 1;
+the golden fixture `v1-peers.json` was added.
+
