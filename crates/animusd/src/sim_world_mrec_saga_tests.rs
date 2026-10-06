@@ -484,3 +484,40 @@ fn a_peer_table_of_another_shape_is_refused_for_good() {
         });
     }
 }
+
+#[test]
+fn the_admin_global_tables_view_reports_mrec_replicas_and_shipper_health() {
+    for seed in saga_seeds() {
+        let mut s = S::new(seed, true);
+        s.make_active(4);
+        s.put(A, "k", "v");
+        s.until("the write reached b", |s| s.read(B, "k").as_deref() == Some("v"));
+        s.step_both();
+        let mut ctx = s.w.clusters[A].handle().node_ctx(0);
+        ctx.mrec = s.cfgs[A].clone();
+        let v = crate::global_tables::admin_global_tables_view(&ctx);
+        let t = v["tables"]
+            .as_array()
+            .and_then(|a| a.iter().find(|t| t["table"] == TABLE))
+            .unwrap_or_else(|| panic!("seed={seed}: no MREC row in {v}"));
+        assert_eq!(t["consistency"], "EVENTUAL", "seed={seed}: {t}");
+        assert_eq!(t["replica_status"]["a"], "ACTIVE", "seed={seed}: {t}");
+        assert_eq!(t["replica_status"]["b"], "ACTIVE", "seed={seed}: {t}");
+        let reps = t["replicas"].as_array().expect("replicas");
+        assert_eq!(reps.len(), 2, "seed={seed}: {t}");
+        assert!(
+            reps.iter().all(|r| r["tablets_copied"].is_u64() && r["tablets_total"].is_u64()),
+            "seed={seed}: {t}"
+        );
+        let sh = t["shippers"].as_array().expect("shippers");
+        assert!(!sh.is_empty(), "seed={seed}: a shipper row per led (tablet, peer): {t}");
+        assert!(
+            sh.iter().all(|r| r["peer"] == "b" && r["last_error"].is_null()),
+            "seed={seed}: {t}"
+        );
+        assert!(
+            sh.iter().any(|r| r["last_ack_age_ms"].is_u64() && r["shipped_rows"].as_u64() > Some(0)),
+            "seed={seed}: some tablet acked rows: {t}"
+        );
+    }
+}

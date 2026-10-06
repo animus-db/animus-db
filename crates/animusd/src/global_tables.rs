@@ -387,6 +387,87 @@ pub(crate) fn drain_strands_region_error(
     )
 }
 
+/// One MREC (eventual) table's admin row (ADR 0075 section 8, G-d M6): its
+/// replica set with lifecycle status and the initial-copy progress, plus this
+/// node's own per-(tablet, peer) shipper health (node-local, in memory, reset on
+/// restart; a fleet view fans out like the MRSC leader fields). `lag_ms` is the
+/// age of the oldest unshipped change at the shipper's last tick, `last_ack_age_ms`
+/// the wall-clock age of the last acknowledged batch.
+fn admin_mrec_table_view<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    name: &str,
+    spec: &GlobalTableSpec,
+    warnings: &mut Vec<String>,
+) -> serde_json::Value {
+    use serde_json::json;
+    let now_ms = ctx.env.wall_now().0;
+    let mut shippers = Vec::new();
+    {
+        let h = ctx.mrec.health.lock().expect("mrec health poisoned");
+        for ((table, tablet, peer), ph) in h.iter() {
+            if table != name {
+                continue;
+            }
+            if ph.operator_error {
+                warnings.push(format!(
+                    "table `{name}`: peer `{peer}` refuses tablet {tablet}'s batches ({}); \
+                     this needs an operator (shape/config mismatch), retrying will not help",
+                    ph.last_error.as_deref().unwrap_or("no detail")
+                ));
+            }
+            shippers.push(json!({
+                "tablet": tablet,
+                "peer": peer,
+                "backlog": ph.backlog,
+                "lag_ms": ph.lag_ms,
+                "last_ack_age_ms": ph.last_ack_wall_ms.map(|t| now_ms.saturating_sub(t)),
+                "scanning": ph.scanning,
+                "needs_resync": ph.needs_resync,
+                "caught_up": ph.caught_up,
+                "failures": ph.failures,
+                "operator_error": ph.operator_error,
+                "last_error": ph.last_error,
+                "shipped_rows": ph.shipped_rows,
+            }));
+        }
+    }
+    let routable = meta_routable_tablets(ctx, name);
+    for r in spec.replicas.iter().filter(|r| !r.local) {
+        if r.status == MrecReplicaStatus::CreationFailed {
+            warnings.push(format!(
+                "table `{name}`: the replica in `{}` failed to create; delete it (`UpdateTable` \
+                 Delete) and create it again",
+                r.region
+            ));
+        }
+    }
+    json!({
+        "table": name,
+        "consistency": "EVENTUAL",
+        "local_region": ctx.mrec.region,
+        "replicas": spec.replicas.iter().map(|r| json!({
+            "region": r.region,
+            "status": format!("{:?}", r.status).to_uppercase(),
+            "local": r.local,
+            "tablets_copied": r.copied.len(),
+            "tablets_total": routable,
+        })).collect::<Vec<_>>(),
+        "replica_status": spec
+            .replicas
+            .iter()
+            .map(|r| (r.region.clone(), format!("{:?}", r.status).to_uppercase()))
+            .collect::<std::collections::BTreeMap<_, _>>(),
+        "shippers": shippers,
+    })
+}
+
+fn meta_routable_tablets<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>, table: &str) -> usize {
+    ctx.effective_metadata()
+        .tablets_for_table(table)
+        .filter(|(_, t)| t.is_routable())
+        .count()
+}
+
 /// `GET /admin/global-tables` (ADR 0075 section 8): every global table's
 /// Regions, witness, preferred-leader Region, derived replica status and
 /// per-tablet placement by Region, plus the cluster's Active members per
@@ -421,6 +502,10 @@ pub(crate) fn admin_global_tables_view<E: Env, R: RelayClient>(
     let mut warnings: Vec<String> = Vec::new();
     let mut tables = Vec::new();
     for (name, schema) in meta.schemas.iter() {
+        if let Some(spec) = schema.global.as_ref().filter(|g| g.is_mrec()) {
+            tables.push(admin_mrec_table_view(ctx, name, spec, &mut warnings));
+            continue;
+        }
         let Some(spec) = schema.global.as_ref().filter(|g| g.is_mrsc()) else {
             continue;
         };
