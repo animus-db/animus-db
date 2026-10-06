@@ -6632,6 +6632,7 @@ impl BoundNode {
         // per-tablet leadership-checked, exactly like `txn_resolver_loop` above
         // — a node that leads no tablet does nothing each tick.
         tasks.push(tokio::spawn(index_drain::change_consumer_loop(ctx.clone())));
+        tasks.push(tokio::spawn(mrec_shipper::mrec_ship_loop(ctx.clone())));
 
         // The TTL reaper (ADR 0051 §4/§6): deletes items whose declared TTL
         // has passed, on every led tablet of a TTL-enabled table. Same
@@ -8725,6 +8726,7 @@ impl BoundDataNode {
         // per-tablet leadership-checked, exactly like `txn_resolver_loop` above
         // — a node that leads no tablet does nothing each tick.
         tasks.push(tokio::spawn(index_drain::change_consumer_loop(ctx.clone())));
+        tasks.push(tokio::spawn(mrec_shipper::mrec_ship_loop(ctx.clone())));
 
         // The TTL reaper (ADR 0051 §4/§6) — same shape as the GSI drain
         // just above. No test-tunable interval knob on this data-only path

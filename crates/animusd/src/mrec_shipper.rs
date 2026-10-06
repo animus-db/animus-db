@@ -47,14 +47,14 @@
 
 use std::time::Duration;
 
+use animus_control::Metadata;
 use animus_control::schema::{MrecReplica, MrecReplicaStatus};
 use animus_control::version::Gate;
-use animus_control::{Metadata, MrecReplicaStatus as _Status};
 use animus_cp_data::cursor;
 use animus_cp_data::hlc::HlcTimestamp;
 use animus_cp_data::{KIND_CURSOR, ShipGet};
 use animus_dynamo::{AttributeValue, ChangeRecord, Item};
-use animus_env::{Env, Metric, Rng};
+use animus_env::{Env, Metric};
 use animus_item::MrecVersion;
 use animus_node::host::RelayClient;
 use animus_node::{MREC_PROTO, MrecAnswer, MrecApplyRequest, MrecApplyResponse, MrecRecord};
@@ -95,7 +95,11 @@ pub(crate) fn scan_tag(region: &str) -> String {
 /// Whether a replica is currently shipped to.
 #[must_use]
 pub(crate) fn is_shippable(r: &MrecReplica) -> bool {
-    !r.local && matches!(r.status, MrecReplicaStatus::Creating | MrecReplicaStatus::Active)
+    !r.local
+        && matches!(
+            r.status,
+            MrecReplicaStatus::Creating | MrecReplicaStatus::Active
+        )
 }
 
 /// What one tick did for one `(tablet, peer)`.
@@ -186,7 +190,6 @@ pub(crate) async fn mrec_ship_tick<E: Env, R: RelayClient>(
     group: &CpGroup<E>,
     client: &dyn PeerClient,
 ) -> ShipOutcome {
-    let cfg = &ctx.mrec;
     let Some(spec) = meta.table_global(table).filter(|g| g.is_mrec()) else {
         return ShipOutcome::Idle;
     };
@@ -284,15 +287,35 @@ async fn ship_one<E: Env, R: RelayClient>(
     match scan {
         Some(bytes) => {
             scan_step(
-                ctx, table, tablet, group, client, &schema, local_id, replica, peer_idx, &key,
-                &scan_key, &bytes, spec_copied(meta, table, region, tablet),
+                ctx,
+                table,
+                tablet,
+                group,
+                client,
+                &schema,
+                local_id,
+                replica,
+                peer_idx,
+                &key,
+                &scan_key,
+                &bytes,
+                spec_copied(meta, table, region, tablet),
             )
             .await
         }
         None => {
             log_step(
-                ctx, table, tablet, group, client, &schema, local_id, peer_idx, &key,
-                &cursor_key, watermark,
+                ctx,
+                table,
+                tablet,
+                group,
+                client,
+                &schema,
+                local_id,
+                peer_idx,
+                &key,
+                &cursor_key,
+                watermark,
             )
             .await
         }
@@ -419,9 +442,7 @@ async fn send_batch<E: Env, R: RelayClient>(
             if let Some(m) = rejected {
                 // Permanent for that record; surfaced, but the cursor moves.
                 let mut h = ctx.mrec.health.lock().expect("mrec health poisoned");
-                let e = h
-                    .entry((table.to_owned(), 0, String::new()))
-                    .or_default();
+                let e = h.entry((table.to_owned(), 0, String::new())).or_default();
                 e.last_error = Some(format!("a record was rejected: {m}"));
             }
             Ok(())
@@ -680,40 +701,110 @@ pub(crate) async fn clear_peer_cursors<E: Env>(
     .await
 }
 
-/// Whether this tablet still owes `replica` work (a scan in progress, no
-/// cursor, or dirty keys past the watermark): the loop keeps such a tablet
-/// awake. Cheap: two cursor point reads, plus the hot-log scan only when a
-/// cursor exists.
-pub(crate) async fn tablet_owes_work<E: Env>(
+/// Run one tick for every led tablet of `table` this node hosts. The shared
+/// body of the prod loop and the SimWorld tests.
+pub(crate) async fn mrec_ship_table<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    table: &str,
+    client: &dyn PeerClient,
+) -> ShipOutcome {
+    let meta = ctx.effective_metadata();
+    let mut outcome = ShipOutcome::Idle;
+    for (tablet, group) in ctx.edge.hosted_groups() {
+        let ours = meta
+            .tablets
+            .get(&tablet)
+            .is_some_and(|t| t.table.as_deref() == Some(table));
+        if !ours || !group.is_leader() {
+            continue;
+        }
+        let one = mrec_ship_tick(ctx, &meta, table, tablet, &group, client).await;
+        if one != ShipOutcome::Idle && outcome != ShipOutcome::Waiting {
+            outcome = one;
+        }
+    }
+    outcome
+}
+
+/// The trim janitor's MREC term for one tablet: the minimum packed `mrec:<region>`
+/// watermark over its shippable replicas (`None` = no MREC hold). A peer whose
+/// cursor is older than `MrecConfig::max_backlog` is dropped instead of held:
+/// both cursor rows are cleared, so the shipper resyncs it by scan rather than
+/// letting an unreachable peer pin the log forever.
+pub(crate) async fn trim_term<E: Env>(
+    env: &E,
+    cfg: &crate::mrec_peer::MrecConfig,
+    meta: &Metadata,
+    table: &str,
     group: &CpGroup<E>,
-    replica: &MrecReplica,
-    key: &HealthKey,
-    health: &std::sync::Mutex<std::collections::BTreeMap<HealthKey, crate::mrec_peer::PeerHealth>>,
-) -> bool {
-    if !is_shippable(replica) {
-        return false;
-    }
-    let known_idle = health
-        .lock()
-        .expect("mrec health poisoned")
-        .get(key)
-        .is_some_and(|h| h.caught_up && !h.scanning);
-    if !known_idle {
-        return true;
-    }
+) -> Option<u64> {
+    let spec = meta.table_global(table).filter(|g| g.is_mrec())?;
     let start = group.scope_range().start;
-    let wm = group
-        .local_get_kind(
-            KIND_CURSOR,
-            &cursor::cursor_key(&start, &cursor_tag(&replica.region)),
-        )
-        .await
-        .and_then(|b| cursor::decode_watermark(&b));
-    match wm {
-        None => true,
-        Some(w) => group
-            .hot_change_max()
+    let mut term: Option<u64> = None;
+    let cap_ms = u64::try_from(cfg.max_backlog.as_millis()).unwrap_or(u64::MAX);
+    for r in spec.replicas.iter().filter(|r| is_shippable(r)) {
+        let Some(w) = group
+            .local_get_kind(
+                KIND_CURSOR,
+                &cursor::cursor_key(&start, &cursor_tag(&r.region)),
+            )
             .await
-            .is_some_and(|(ts, _)| ts > w),
+            .and_then(|b| cursor::decode_watermark(&b))
+        else {
+            continue; // no cursor: a scan will start, the log is not needed
+        };
+        if now_ms(env).saturating_sub(w.wall_ms) > cap_ms {
+            if clear_peer_cursors(group, &r.region).await.is_ok() {
+                env.metrics().incr(Metric::MrecResyncTotal);
+            }
+            continue;
+        }
+        let p = animus_cp_data::hlc::pack(w);
+        term = Some(term.map_or(p, |t| t.min(p)));
+    }
+    term
+}
+
+/// How often the prod loop ticks.
+const MREC_LOOP_INTERVAL: Duration = Duration::from_millis(200);
+
+/// The per-node MREC shipper loop (ProdEnv): for every MREC table, ship the
+/// tablets this node leads. Inert until a table is MREC and the gate is open.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a concrete ClientCtx (E = ProdEnv) process-boundary background loop, same class as index_drain::change_consumer_loop; SimWorld drives mrec_ship_table directly"
+)]
+pub(crate) async fn mrec_ship_loop(ctx: ClientCtx) {
+    let mut client: Option<crate::mrec_peer::ProdPeerClient> = None;
+    loop {
+        tokio::time::sleep(MREC_LOOP_INTERVAL).await;
+        let meta = ctx.effective_metadata();
+        let tables: Vec<String> = meta
+            .schemas
+            .iter()
+            .filter(|(_, s)| s.global.as_ref().is_some_and(|g| g.is_mrec()))
+            .map(|(n, _)| n.clone())
+            .collect();
+        if tables.is_empty() {
+            continue;
+        }
+        if client.is_none() {
+            match crate::mrec_peer::ProdPeerClient::new(
+                ctx.mrec.clone(),
+                ctx.tls.clone(),
+                ctx.mrec.node_tls.as_ref(),
+                ctx.edge.version().features.clone(),
+            ) {
+                Ok(c) => client = Some(c),
+                Err(e) => {
+                    tracing::warn!(error = %e, "mrec shipper: cannot build the peer client");
+                    continue;
+                }
+            }
+        }
+        let Some(c) = client.as_ref() else { continue };
+        for t in &tables {
+            let _ = mrec_ship_table(&ctx, t, c).await;
+        }
     }
 }

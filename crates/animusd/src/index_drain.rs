@@ -594,11 +594,15 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
             //   derives **zero expected terms** and its existing
             //   trim-everything rule (F10/F12-b) deletes every marker in
             //   declared range — the same rule, not a second deleter.
+            let mrec_ships = meta.table_global(&table).is_some_and(|g| {
+                g.is_mrec() && g.replicas.iter().any(crate::mrec_shipper::is_shippable)
+            });
             if gsis.is_empty()
                 && !stream_enabled
                 && !ever_streamed
                 && !pitr_enabled
                 && !ever_pitr_sealed
+                && !mrec_ships
             {
                 if splitting {
                     // Trim held for the build (the split driver above holds
@@ -2589,6 +2593,13 @@ async fn trim_janitor(
             Some(w) => trim_point = Some(trim_point.map_or(w, |t| t.min(w))),
             None => blocked = true,
         }
+    }
+    // ADR 0075 section 4.2: the MREC shipper's per-peer `mrec:<region>` cursors.
+    if !blocked
+        && let Some(w) =
+            crate::mrec_shipper::trim_term(&ctx.env, &ctx.mrec, meta, table, group).await
+    {
+        trim_point = Some(trim_point.map_or(w, |t| t.min(w)));
     }
     ctx.data()
         .raftkv_metrics
