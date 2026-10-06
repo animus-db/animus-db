@@ -829,3 +829,8 @@ tests in `decide::tests`.
 No new relayed command or wire shape: the action proposes the existing
 `SetGlobalPreferredLeader` (M1/M2, `Gate::GlobalTables`).
 
+
+**`MrecApply` (ADR 0075 M3).** `ClientRequest::MrecApply`/`ClientResponse::MrecApply` are
+intra-only and class G (`Gate::MrecReplication`), with their own `MREC_PROTO`. The response
+gate is content-dependent: a whole-batch `Refused` is `Base` so a closed-gate node can still
+say "not yet"; `Answers` need the gate. Fixture `client-frame/v1-mrec.bin` (never edit).

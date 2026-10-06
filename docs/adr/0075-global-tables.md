@@ -968,3 +968,70 @@ byte-identical and the work is driven by tests.
   replicate (value equality does not prove *this* entry won), so the receiver must use
   `RequiresOwnEntry`.
 
+
+## Amendment (2026-10-06): G-d M3 as built (peer transport, config, receiver)
+
+M3 lets one cluster hand a batch of stamped records to another and have the
+receiver apply them with M2's last-writer-wins rule. Nothing ships yet (the
+shipper is M4), so every existing table is unchanged and the work is driven by
+tests (`SimWorld` for semantics, real loopback sockets for the transport).
+
+- **Config** (`cluster_settings`, all additive and skipped when unset; `--region`,
+  repeatable `--peer REGION=host:port[,host:port...]`, `--allow-insecure-peers`,
+  `--mrec-max-clock-skew-ms MS` on `animusd` and `animusd gen-config`):
+  `region` (this cluster's name), `peers: [{region, endpoints: ["host:intra-port"],
+  tls_ca?}]`, `allow_insecure_peers`, `mrec_max_clock_skew_ms` (default 500).
+  Static, node-local, identical on every node, like `peer_book`. Startup validation
+  (`ClusterSettings::validate_mrec`): peers need a region, no peer is the own region
+  or repeats, every peer has a well-formed endpoint, skew is positive; a flag
+  is rejected for a mode with no config.
+- **Wire** (`animus-node`): `ClientRequest::MrecApply(MrecApplyRequest {proto,
+  from_region, table, records})` / `ClientResponse::MrecApply(MrecApplyResponse)`,
+  intra-only (`Surface::Intra`), **class G, `Gate::MrecReplication`**; `KindWriteOp::Replicate`
+  is accepted on the leader write RPCs (`KindWriteItem`/`KindWriteBatch`, whose
+  `required_gate` is content-dependent) and `KindWriteItemReply::Superseded` is the
+  lost-LWW slot. The frame has its own `MREC_PROTO = 1` because two clusters roll
+  independently. **Correction found by the real-socket test:** a whole-batch
+  `MrecApplyResponse::Refused` is gate **Base**, not `MrecReplication`: it is how a node
+  whose own gate is still closed says "not yet", and a class-G reply could not be
+  emitted by exactly the node that needed to (a debug build panics on a closed-gate
+  emit). Per-record `Answers` stay class G. Fixture `client-frame/v1-mrec.bin`.
+- **Auth**: ADR 0064 mutual TLS on the peer's intra port is the cross-cluster
+  authentication (each side's `ca_path` bundles both CAs; a peer's optional `tls_ca` is
+  trusted in addition when verifying that peer's server cert). A node with no TLS
+  neither dials (`PeerError::Refused`) nor accepts (`Refused{retryable:false}`, checked
+  before the gate) unless `allow_insecure_peers`.
+- **Client**: `PeerClient::call(to, payload, timeout) -> Result<Vec<u8>, PeerError>`
+  (bytes in/out, so `SimWorld`'s `PeerBridge` and `ProdPeerClient` are interchangeable);
+  `ProdPeerClient` tries a peer's endpoints in order through the gated intra relay.
+- **Receiver** (`animusd::mrec_receiver::handle_mrec_apply`, `E: Env`-generic): groups
+  records by the receiver's *own* tablet layout and proposes one `KindEvalBatch` of
+  `Replicate` per tablet through the normal leader path (follower-connected nodes forward);
+  per-record `Applied | Superseded | Retry | Rejected`. A replicate is
+  `ProbeIdentity::RequiresOwnEntry` (value equality never proves it won), so a lost confirm
+  is `Retry`, which is safe because a replicate is idempotent as state; `ConditionFailed`
+  on a replicate can only be a foreign txn intent, also `Retry`. A stamp beyond
+  `wall_now + mrec_max_clock_skew_ms` is `Retry` and counted
+  (`mrec_skew_rejected_total`), decided once at the accepting node and carried as a value.
+  More than 64 in-flight batches per node answers `Retry` for all records. Whole-batch
+  refusals (`Refused`): unknown `proto`, gate closed (retryable), no TLS, no region, not a
+  peer, table not MREC here or not replicated with the sender (retryable: the replica may
+  not have reached this node's metadata yet).
+- **Bound-node gap closed**: `Node::bind` has no config, so `run_bound_node*` now installs
+  the MREC settings in its start half like the other entry points do. (The same path still
+  does not install `max_region_rtt`; filed separately, not changed here.)
+- **Tests**: `sim_world_mrec_tests.rs` (A to B over `SimWorld`, `ANIMUS_MREC_WORLD_SEEDS`,
+  default 4, run at 24: newer wins / older and equal `Superseded` / tombstones never
+  resurrect / skew rejected then accepted plus a negative control / partition then heal /
+  duplicated, shuffled and lossy delivery converge to the max stamp per key / a
+  follower-connected entry / grouping by the receiver's own layout (2 tablets) / refusals
+  / gate-closed receiver / seed determinism / the bridge is a `PeerClient`); `mrec_writer_guard_tests`
+  plus `raw_and_edge_valued_writers_refuse_an_mrec_table` (`marker_batch_write_raw`,
+  `cp_txn`); `tests/mrec_peer_transport.rs` over real sockets (two clusters with different
+  CAs, mutual TLS both directions; a stranger CA refused; plaintext refused, refused at
+  the receiver, and allowed with `allow_insecure_peers` on both sides).
+  **Not covered over real sockets:** applying data; that needs a converted table, i.e. the
+  replica-create saga (M4), so the receiver handler is reached and answers a retryable
+  refusal. The full real-process two-cluster apply is M6.
+- **Moved to later milestones**: `/admin/global-tables` peer-health fields need shipper
+  state, so they land with M4 (the receiver counts are in metrics now).

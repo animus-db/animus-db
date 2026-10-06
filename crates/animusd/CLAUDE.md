@@ -12197,3 +12197,19 @@ refuses one, and `cp_txn` refuses its non-`pending` writes (the raw client `Put`
 the expiry instant as `wall_ms`. `KindEvalApplied::Superseded` is the replicate's lost-LWW
 result (unused until the M3 receiver handler). Pinned by `mrec_writer_guard_tests.rs`.
 
+
+### MREC peer transport and receiver (ADR 0075 M3, G-01 stage G-d)
+
+`mrec_peer.rs`: `MrecConfig` (the node-local view of `cluster_settings.{region, peers,
+allow_insecure_peers, mrec_max_clock_skew_ms}`, installed by `with_mrec` on every `run_node*`
+path **and** the bound-node start half), the `PeerClient` seam (bytes in/out, `to` = index
+into the peer list) and `ProdPeerClient` (intra dial with mutual TLS, per-peer `tls_ca`).
+`mrec_receiver.rs`: `handle_mrec_apply`, `E: Env`-generic, reached from the intra
+`ClientRequest::MrecApply` arm; order of checks is proto, transport (TLS or
+`allow_insecure_peers`), `MrecReplication` gate, region, peer, in-flight cap, table. Gotchas:
+a replicate is `ProbeIdentity::RequiresOwnEntry` (never `ValueProves`); `ConditionFailed` on a
+replicate means a foreign intent and is `Retry`; a whole-batch `Refused` reply is gate
+**Base** (a class-G reply could not be emitted by a node whose gate is closed, and a debug build
+panics on that); a lost confirm is `Retry`, not an error. `tests/mrec_peer_transport.rs`
+drives two real one-node clusters through `mrec_peer::probe_peer_for_test`; it cannot apply
+data until M4's replica-create saga. Never drive a `SimWorld` member cluster directly.
