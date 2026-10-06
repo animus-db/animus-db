@@ -104,11 +104,14 @@ the fallback for shapes the operator will not roll:
 shared `animus-roll` machine by the `sim_cluster_roll_orchestrator` corpus, and a real-process
 previous-release roll by the `upgrade-previous-release` CI job. Kubernetes' own partition
 semantics are exercised only by the nightly `kind` job (`upgrade-kind-nightly`, `E2E_UPGRADE=1`
-in `scripts/e2e-kind.sh`), which has not yet had a verified run. **Known issue: do not roll
-while multi-item transactions are in use** (issues #1237, #1238, found by the previous-release
-test: an ungated transaction-envelope version can crash an N-1 replica, and acknowledged writes
-were lost across a roll with transactions); use the whole-cluster procedure, or stop
-transactional traffic, until they are fixed.
+in `scripts/e2e-kind.sh`), which has not yet had a verified run. **Transactions:** an N-1 replica
+caught up by snapshot used to be able to crash on a transaction-envelope version it could not read
+(#1237, fixed: it now receives the old format until the cluster version gate opens). Separately,
+a release older than commit `efcaa6cb` has its own bug (#1238, open): a multi-item transaction
+intent it wrote that is still unresolved can lose an acknowledged value if aborted after storage
+compaction. Rolling from a release containing `efcaa6cb` with transactions in use is supported;
+rolling from an older release carries that bug, so drain or resolve in-flight transactions first
+or use the whole-cluster procedure.
 
 The dashboard Overview shows the same state in a Version card (cluster version, `N of M`
 nodes on the new build, roll phase, what is next, blockers and the roll-health verdict,
@@ -158,7 +161,7 @@ the upgrade are lost unless exported. Test this rehearsal before you need it.
   has run the new binary**.
 - Criterion E-7 (rolling-upgrade procedure) is partially met by this page; the operator path's
   Kubernetes-semantics evidence is the nightly `kind` job, not yet run (see "Maturity" above).
-- **Open (Phase 3 findings):** issues #1237 and #1238 (rolling with transactions), #1235
+- **Open (Phase 3 findings):** issue #1238 (an older release's own abort-lookback bug when rolling from it with transactions; #1237 is fixed), #1235
   (a `SimCluster` Memory-backend restart oddity, test-only). D4(b), a replicated maintenance mark
   that suppresses repair churn during a roll, is a pending maintainer decision now that
   the churn has been measured (ADR 0073's Phase 3 as-built amendment).

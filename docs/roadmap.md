@@ -1620,11 +1620,12 @@ outstanding on the wire surface at present.
   nightly `kind` leg `E2E_UPGRADE=1` (P3-E); docs close-out (P3-F). Supported:
   a manual or operator-driven rolling upgrade R-1 -> R of a cluster of at
   least three nodes, ending in an explicit (or opted-in automatic) finalize;
-  no rollback once a node ran the new binary. **Open items:** issues #1237
-  (ungated `txn-envelope` v2 intent panics an N-1 replica) and #1238
-  (acknowledged writes lost across a roll with transactions), found by the
-  previous-release job and fixed in a separate PR (the transactional roll
-  variant returns to that job once they land); #1235 (a `SimCluster` Memory
+  no rollback once a node ran the new binary. **Open items:** #1237
+  (ungated `txn-envelope` v2 intent panics an N-1 replica) is fixed (#1240);
+  #1238 is the previous release's own abort-lookback bug (open; rolling from a
+  release older than `efcaa6cb` with transactions carries it), and the
+  transactional roll variant stays off in the previous-release job pending a
+  decision to repin R-1 past `efcaa6cb`; #1235 (a `SimCluster` Memory
   backend restart oddity); the nightly `kind` leg has not had a verified run;
   **D4(b)** (a replicated, expiring per-node maintenance mark that suppresses
   repair churn during a roll, a `Gate::Era` command) is a **pending

@@ -126,11 +126,13 @@ leadership transfer, no drain) and an **operator-orchestrated roll** (a
 three nodes one pod at a time behind an operator-owned `StatefulSet` partition and
 the shared `animus-roll` gate; finalize manual by default, `spec.upgrade.finalize:
 Auto` opt-in; `docs/runbook/upgrade.md`). Still no rollback once a node has run the
-new binary, no skipped release, no mid-roll image revert. **Open:** issues
-#1237 (ungated `txn-envelope` v2 intent can panic an N-1 replica) and #1238 (acked
-writes lost across a roll with transactions), found by the `upgrade-previous-release`
-CI job and fixed separately — until they land, do not roll while multi-key
-transactions are in use; #1235 (a `SimCluster` Memory-backend restart oddity,
+new binary, no skipped release, no mid-roll image revert. **Transactions:** #1237 (ungated
+`txn-envelope` v2 intent could panic an N-1 replica) is fixed (#1240); #1238 is the
+previous release's own abort-lookback bug (a v1 intent written before `efcaa6cb`
+carries no prior, so aborting it after LSM GC can lose an acked value), open to
+track a mitigation — rolling *from* a release containing `efcaa6cb` with
+transactions is supported, rolling from an older one (e.g. the R-1 pin `ac57d56a`)
+carries that bug for its still-unresolved intents. **Open:** #1235 (a `SimCluster` Memory-backend restart oddity,
 test-only); the nightly `kind` operator-roll leg (`E2E_UPGRADE=1`) has not had a
 verified run; D4(b), a replicated maintenance mark that suppresses repair churn during
 a roll, is a pending maintainer decision (measured: ADR 0073 as-built). The

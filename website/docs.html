@@ -693,8 +693,8 @@
           Supported: from today's binaries to this release, and from one release to the next.
           Not supported: skipping a release, rolling a node back after it ran the new binary,
           reverting <code>spec.image</code> mid-roll, an old binary joining once versioning has started
-          (refused by name), and, for now, a roll while multi-item transactions are in use (two open
-          defects found by the previous-release roll test, being fixed). The CLI restarts nothing itself.</li>
+          (refused by name), and, for now, a roll from an older release with multi-item transactions in use (that
+          release's own abort-handling bug, open). The CLI restarts nothing itself.</li>
         <li><strong>Restore always creates a brand-new table, never in-place</strong> — matching
           real DynamoDB, for both on-demand backups (<code>RestoreTableFromBackup</code>) and
           continuous backups (<code>RestoreTableToPointInTime</code>); a source table's backup

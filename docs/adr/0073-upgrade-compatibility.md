@@ -3261,13 +3261,21 @@ decided, with D4(a): accept, document ("What a roll costs" in
 ### Findings and open items
 
 - **#1237** (ungated `txn-envelope` v2 intent: an N-1 replica panics on an upgraded
-  node's repair snapshot) and **#1238** (acknowledged writes lost across a roll with
-  transactions) were found by the P3-E job against the pinned `ac57d56a`. They are
-  being fixed in a separate PR. Until then the job's workload runs without multi-key
+  node's repair snapshot) and **#1238** were found by the P3-E job against the pinned
+  `ac57d56a`. **#1237 is fixed** on main by #1240 (see the txn-envelope amendment
+  below): an N-1 replica caught up by snapshot receives v1 intents, with the prior
+  shipped as a committed row, until `Gate::GlobalTables` opens. **#1238 is not a roll
+  bug**: it is the previous release's own abort-lookback bug. A v1 intent (written by
+  any binary before `efcaa6cb`) carries no prior; aborting it after LSM GC collapsed
+  history tombstones an acked value. `ac57d56a` alone (R-1 -> R-1, no upgrade) loses
+  acked writes in 6/10 runs; current -> current passes 24/24. So rolling *from* a
+  release containing `efcaa6cb` with transactions in use is supported; rolling from an
+  older release (e.g. the pin `ac57d56a`) carries that release's own bug for intents it
+  wrote that are still unresolved. #1238 stays open to track a possible mitigation
+  (backfilling the prior at engine open). The job's workload runs without multi-key
   transactions (`ANIMUS_UPGRADE_FROM_TXN=1` turns them on) and **the transactional
-  roll variant returns to the CI job once both land**. Until then, rolling while
-  multi-key transactions are in use is not supported (stated in the runbook, the
-  website and root `CLAUDE.md`). Two further known findings against the pin, both
+  roll variant stays off pending the maintainer's decision whether to repin R-1 past
+  `efcaa6cb`**. Two further known findings against the pin, both
   properties of `ac57d56a` itself rather than of the roll: its own abort-tombstone
   defect and legacy v1 intents being aborted by the new binary.
 - **#1235**: `SimCluster`'s `Memory` backend restarts as a wiped disk (the control
@@ -3286,8 +3294,8 @@ editing `spec.image` on an operator-managed cluster of at least three nodes with
 PDB `maxUnavailable >= 1`, with client retries as the only visible effect and an
 explicit (or opted-in automatic) finalize. Unchanged non-support: skipping a release,
 rolling a node back, reverting `spec.image` mid-roll, a roll on a cluster that cannot
-lose a node, topology edits during a roll, ephemeral storage, and (until #1237/#1238
-land) a roll with multi-key transactions in use.
+lose a node, topology edits during a roll, ephemeral storage, and a roll *from* a release
+older than `efcaa6cb` with multi-key transactions in use (#1238, that release's own bug).
 
 ## Amendment 2026-10-05 — `txn-envelope` v2 is class G: the snapshot image is gated (#1237)
 

@@ -446,7 +446,7 @@ table.put_item(Item={<span class="s">"id"</span>: <span class="s">"a-2"</span>, 
           nothing itself. On an operator-managed cluster of at least three nodes, editing
           <code>spec.image</code> performs the same roll for you, one pod at a time behind the health
           gate, and finalize stays yours unless you set <code>spec.upgrade.finalize: Auto</code>.
-          Do not roll while multi-item transactions are in use (two open defects). There is no rollback
+          Rolling from an older release with multi-item transactions in use carries that release's own abort bug (open). There is no rollback
           once a node has run the new binary. Procedure: <code>docs/runbook/upgrade.md</code>.
         </p>
       </div>

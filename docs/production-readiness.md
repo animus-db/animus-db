@@ -109,7 +109,7 @@ landed with ADR 0073 Phase 3 (E-7, partially met).
 | E-4 | Certificate rotation procedure (restart-time `TlsConfig::load()`) | Not met | Mechanism: `docs/adr/0064-tls-on-every-port.md` | e |
 | E-5 | Encryption key rotation procedure | Not met | Mechanism: `docs/adr/0069-encryption-at-rest.md` | e |
 | E-6 | Upgrade chapter: whole-cluster procedure per ADR 0073 | Not met | Supported and tested (X-3); no runbook page | e |
-| E-7 | Upgrade chapter: rolling-upgrade procedure | Partially met | `docs/runbook/upgrade.md` (manual and operator paths); exercised on real processes by the `upgrade-previous-release` CI job (`crates/animusd/tests/upgrade_previous_release.rs`); the operator path's nightly `kind` leg (`E2E_UPGRADE=1`) has not yet had a verified run; **not met yet:** rolling with transactions has open defects (#1237, #1238) and the `kind` leg is unverified | e |
+| E-7 | Upgrade chapter: rolling-upgrade procedure | Partially met | `docs/runbook/upgrade.md` (manual and operator paths); exercised on real processes by the `upgrade-previous-release` CI job (`crates/animusd/tests/upgrade_previous_release.rs`); the operator path's nightly `kind` leg (`E2E_UPGRADE=1`) has not yet had a verified run; **not met yet:** rolling from a release older than `efcaa6cb` with transactions carries that release's own bug (#1238; #1237 is fixed) and the `kind` leg is unverified | e |
 | E-8 | Capacity planning and disk sizing with published numbers | Pending-dependency | B-01 and C-17 | e |
 | E-9 | A game-day drill checklist is executed once on `kind` | Not met | `scripts/e2e-kind.sh` is the substrate; no checklist | e |
 

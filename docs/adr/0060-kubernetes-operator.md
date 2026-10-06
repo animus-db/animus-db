@@ -471,7 +471,8 @@ finalize step.
   CI job; Kubernetes' own partition semantics are exercised only by the
   nightly `kind` leg (`E2E_UPGRADE=1`, `.github/workflows/upgrade-kind-
   nightly.yml`), which has not yet had a verified run. **Open:** rolling
-  while multi-item transactions are in use (issues #1237, #1238). Mechanism:
+  *from* a release older than `efcaa6cb` while multi-item transactions are in use
+  (#1238, that release's own abort-lookback bug; #1237 is fixed). Mechanism:
   `crates/animus-operator/CLAUDE.md`; user-facing steps:
   `docs/runbook/upgrade.md` and `deploy/operator/README.md`.
 
