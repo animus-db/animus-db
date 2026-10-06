@@ -268,6 +268,11 @@ pub enum MrecControl {
     /// The sender added `region` to the replica set; the receiver adds it too
     /// (full mesh, ADR 0075 D8).
     AddPeer { region: String },
+    /// The sender's table now has (`Some`) or no longer has (`None`) a TTL
+    /// attribute; the receiver mirrors it (idempotent; ADR 0075 V15, TTL
+    /// settings synchronize across replicas). Added after the first three
+    /// variants, class G with the rest of the `MrecApply` frame.
+    SetTtl { attribute: Option<String> },
 }
 
 /// The receiver's per-record verdict (same order as the request's `records`).

@@ -382,13 +382,6 @@ pub(crate) async fn mrec_saga_table<E: Env, R: RelayClient>(
     let Some(spec) = mrec_spec(&meta, table) else {
         return false;
     };
-    if spec.replicas.iter().all(|r| {
-        r.local
-            || r.status == MrecReplicaStatus::Active
-            || r.status == MrecReplicaStatus::CreationFailed
-    }) {
-        return false;
-    }
     // The single driver: the leader of the table's lowest-id active tablet.
     let active: Vec<u64> = meta
         .tablets_for_table(table)
@@ -406,7 +399,14 @@ pub(crate) async fn mrec_saga_table<E: Env, R: RelayClient>(
     if !leads_first {
         return false;
     }
-    let mut did = false;
+    let mut did = push_ttl(ctx, client, &meta, spec, table).await;
+    if spec.replicas.iter().all(|r| {
+        r.local
+            || r.status == MrecReplicaStatus::Active
+            || r.status == MrecReplicaStatus::CreationFailed
+    }) {
+        return did;
+    }
     for replica in spec.replicas.iter().filter(|r| !r.local) {
         match replica.status {
             MrecReplicaStatus::Creating => {
@@ -590,7 +590,114 @@ pub(crate) async fn handle_control<E: Env, R: RelayClient>(
         } => create_replica(ctx, from, table, &create_table, ttl_attribute, &peers).await,
         MrecControl::AddPeer { region } => add_peer(ctx, table, &region).await,
         MrecControl::Leave => leave(ctx, from, table).await,
+        MrecControl::SetTtl { attribute } => set_ttl(ctx, from, table, attribute).await,
     }
+}
+
+/// Peer side of [`MrecControl::SetTtl`]: mirror the sender's TTL setting
+/// (idempotent: already equal => nothing proposed).
+async fn set_ttl<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    from: &str,
+    table: &str,
+    attribute: Option<String>,
+) -> MrecApplyResponse {
+    let r = set_ttl_inner(ctx, table, attribute.clone()).await;
+    if r == MrecApplyResponse::Done {
+        // The sender has this setting: never echo it back to it (an echo
+        // arriving after a newer local change would revert that change).
+        let key: HealthKey = (table.to_owned(), SAGA_SLOT, from.to_owned());
+        let mut h = ctx.mrec.health.lock().expect("mrec health poisoned");
+        h.entry(key).or_default().ttl_pushed = Some(attribute);
+    }
+    r
+}
+
+async fn set_ttl_inner<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    table: &str,
+    attribute: Option<String>,
+) -> MrecApplyResponse {
+    let meta = ctx.metadata_fresh().await;
+    if !meta.has_table_schema(table) {
+        return refused(format!("table `{table}` does not exist here"), true);
+    }
+    let current = meta.table_ttl(table).map(|t| t.attribute_name.clone());
+    if current == attribute {
+        return MrecApplyResponse::Done;
+    }
+    let name = attribute.clone().or(current).unwrap_or_default();
+    let body = json!({
+        "TableName": table,
+        "TimeToLiveSpecification": {"Enabled": attribute.is_some(), "AttributeName": name},
+    });
+    let _ = crate::dynamo::execute_item_op_as(
+        ctx,
+        &crate::authz::Principal::unrestricted(),
+        "DynamoDB_20120810.UpdateTimeToLive",
+        body.to_string().as_bytes(),
+    )
+    .await;
+    let now = ctx.metadata_fresh().await;
+    if now.table_ttl(table).map(|t| t.attribute_name.clone()) == attribute {
+        MrecApplyResponse::Done
+    } else {
+        refused("the TTL change did not commit yet", true)
+    }
+}
+
+/// Sender side: push this table's TTL setting to every `Active` peer when it
+/// differs from what this node last pushed. First sight is a baseline (a
+/// table with a TTL pushes it, one without records "none" and sends nothing),
+/// so a restarted or newly-elected driver never reverts a peer's newer change
+/// with its own stale `None`. Driver-local state: a TTL change made while
+/// the driver role moves is not re-sent until the next change (documented).
+async fn push_ttl<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    client: &dyn PeerClient,
+    meta: &Metadata,
+    spec: &GlobalTableSpec,
+    table: &str,
+) -> bool {
+    let current = meta.table_ttl(table).map(|t| t.attribute_name.clone());
+    let mut did = false;
+    for r in spec
+        .replicas
+        .iter()
+        .filter(|r| !r.local && r.status == MrecReplicaStatus::Active)
+    {
+        let key: HealthKey = (table.to_owned(), SAGA_SLOT, r.region.clone());
+        let last = {
+            let h = ctx.mrec.health.lock().expect("mrec health poisoned");
+            h.get(&key).and_then(|e| e.ttl_pushed.clone())
+        };
+        let push = match &last {
+            None => current.is_some(),
+            Some(l) => *l != current,
+        };
+        let mut done = !push;
+        if push {
+            done = matches!(
+                send_control(
+                    ctx,
+                    client,
+                    &r.region,
+                    table,
+                    MrecControl::SetTtl {
+                        attribute: current.clone()
+                    }
+                )
+                .await,
+                Ok(MrecApplyResponse::Done)
+            );
+            did = true;
+        }
+        if done {
+            let mut h = ctx.mrec.health.lock().expect("mrec health poisoned");
+            h.entry(key).or_default().ttl_pushed = Some(current.clone());
+        }
+    }
+    did
 }
 
 async fn add_replica_active<E: Env, R: RelayClient>(

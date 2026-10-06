@@ -1086,3 +1086,66 @@ fn generate_fixture_client_frame_mrec_control() {
     );
     std::fs::write(&path, encode_mrec_control()).expect("write");
 }
+
+/// G-d M4c: `MrecControl::SetTtl` (TTL settings synchronize to every replica).
+/// Its own fixture; `v1-mrec-control.bin` is never edited.
+fn mrec_control_ttl_messages() -> Vec<(&'static str, ClientRequest)> {
+    let frame = |attribute| {
+        ClientRequest::MrecApply(MrecApplyRequest {
+            proto: MREC_PROTO,
+            from_region: "eu".into(),
+            table: "orders".into(),
+            records: Vec::new(),
+            control: Some(animus_node::MrecControl::SetTtl { attribute }),
+        })
+    };
+    vec![
+        ("SetTtl(Some)", frame(Some("expires".into()))),
+        ("SetTtl(None)", frame(None)),
+    ]
+}
+
+fn encode_mrec_control_ttl() -> Vec<u8> {
+    let mut out = Vec::new();
+    for (_, r) in mrec_control_ttl_messages() {
+        out.extend(encode_client_frame(&r).expect("encodes"));
+    }
+    out
+}
+
+#[test]
+fn mrec_control_ttl_frames_are_byte_identical_to_the_fixture_and_gated() {
+    let fixture = std::fs::read(fixtures_dir().join("v1-mrec-control-ttl.bin"))
+        .expect("v1-mrec-control-ttl.bin is checked in");
+    assert_eq!(
+        encode_mrec_control_ttl(),
+        fixture,
+        "ttl control frames drifted"
+    );
+    let frames = split_frames(&fixture);
+    let msgs = mrec_control_ttl_messages();
+    assert_eq!(frames.len(), msgs.len());
+    for ((name, want), frame) in msgs.iter().zip(&frames) {
+        let got: ClientRequest = decode_client_frame(frame).expect("decodes");
+        assert_eq!(
+            encode_client_frame(&got).unwrap(),
+            encode_client_frame(want).unwrap(),
+            "{name}"
+        );
+        assert_eq!(want.required_gate(), Gate::MrecReplication, "{name}");
+        assert_eq!(surface_of(want), Surface::Intra, "{name}");
+    }
+}
+
+/// Refuses to overwrite: run once.
+#[test]
+#[ignore = "fixture generator; run explicitly, never regenerates an existing fixture"]
+fn generate_fixture_client_frame_mrec_control_ttl() {
+    let path = fixtures_dir().join("v1-mrec-control-ttl.bin");
+    assert!(
+        std::fs::metadata(&path).is_err(),
+        "{} already exists; a checked-in fixture is never regenerated in place",
+        path.display()
+    );
+    std::fs::write(&path, encode_mrec_control_ttl()).expect("write");
+}

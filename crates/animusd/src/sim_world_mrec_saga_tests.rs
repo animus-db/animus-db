@@ -24,10 +24,10 @@ use super::mrec_shipper::mrec_ship_table;
 use super::sim_world::{LinkConfig, PeerHandler, SimWorld};
 use super::sim_world_mrec_tests::{A, B, LAT, TABLE, handler, open_mrec_gate, seeds};
 
-const NODES: u64 = 3;
+pub(crate) const NODES: u64 = 3;
 const MIN_SEEDS: u64 = 20;
 
-fn saga_seeds() -> Vec<u64> {
+pub(crate) fn saga_seeds() -> Vec<u64> {
     let mut v = seeds();
     let mut i = 0u64;
     while (v.len() as u64) < MIN_SEEDS && std::env::var("ANIMUS_SEED").is_err() {
@@ -37,7 +37,7 @@ fn saga_seeds() -> Vec<u64> {
     v
 }
 
-fn cfg(local: &str, peers: &[&str]) -> Arc<MrecConfig> {
+pub(crate) fn cfg(local: &str, peers: &[&str]) -> Arc<MrecConfig> {
     Arc::new(MrecConfig {
         region: Some(local.into()),
         peers: peers
@@ -57,19 +57,23 @@ fn cfg(local: &str, peers: &[&str]) -> Arc<MrecConfig> {
     })
 }
 
-struct S {
-    w: SimWorld,
-    cfgs: [Arc<MrecConfig>; 2],
-    seed: u64,
+pub(crate) struct S {
+    pub(crate) w: SimWorld,
+    pub(crate) cfgs: [Arc<MrecConfig>; 2],
+    pub(crate) seed: u64,
+    /// Nodes (of either cluster, by node index) that are crashed: skipped by `step`.
+    pub(crate) down: Vec<(usize, usize)>,
+    /// Each cluster's peer-handler entry node.
+    pub(crate) entry: [Arc<AtomicU64>; 2],
 }
 
-fn item_body(k: &str, v: &str, extra: &str) -> String {
+pub(crate) fn item_body(k: &str, v: &str, extra: &str) -> String {
     format!(
         r#"{{"TableName":"{TABLE}","Item":{{"pk":{{"S":"{k}"}},"sk":{{"S":"s"}},"v":{{"S":"{v}"}}{extra}}}}}"#
     )
 }
 
-fn key_body(k: &str, consistent: bool) -> String {
+pub(crate) fn key_body(k: &str, consistent: bool) -> String {
     let cr = if consistent {
         r#","ConsistentRead":true"#
     } else {
@@ -78,13 +82,13 @@ fn key_body(k: &str, consistent: bool) -> String {
     format!(r#"{{"TableName":"{TABLE}","Key":{{"pk":{{"S":"{k}"}},"sk":{{"S":"s"}}}}{cr}}}"#)
 }
 
-fn create_body(region: &str) -> String {
+pub(crate) fn create_body(region: &str) -> String {
     format!(
         r#"{{"TableName":"{TABLE}","ReplicaUpdates":[{{"Create":{{"RegionName":"{region}"}}}}]}}"#
     )
 }
 
-fn delete_body(region: &str) -> String {
+pub(crate) fn delete_body(region: &str) -> String {
     format!(
         r#"{{"TableName":"{TABLE}","ReplicaUpdates":[{{"Delete":{{"RegionName":"{region}"}}}}]}}"#
     )
@@ -92,7 +96,7 @@ fn delete_body(region: &str) -> String {
 
 impl S {
     /// `gate`: finalize both clusters to the MREC gate. Table on A only.
-    fn new(seed: u64, gate: bool) -> S {
+    pub(crate) fn new(seed: u64, gate: bool) -> S {
         let mut w = SimWorld::new(seed, 2, 3, 3);
         if gate {
             for c in [A, B] {
@@ -107,28 +111,51 @@ impl S {
         for c in [A, B] {
             w.clusters[c].handle().set_mrec_config(cfgs[c].clone());
         }
-        let ha: PeerHandler = handler(cfgs[A].as_ref().clone(), Arc::new(AtomicU64::new(0)));
-        let hb: PeerHandler = handler(cfgs[B].as_ref().clone(), Arc::new(AtomicU64::new(0)));
+        let entry = [Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0))];
+        let ha: PeerHandler = handler(cfgs[A].as_ref().clone(), entry[A].clone());
+        let hb: PeerHandler = handler(cfgs[B].as_ref().clone(), entry[B].clone());
         w.set_handler(A, ha);
         w.set_handler(B, hb);
-        S { w, cfgs, seed }
+        S {
+            w,
+            cfgs,
+            seed,
+            down: Vec::new(),
+            entry,
+        }
     }
 
-    fn call(&mut self, c: usize, op: &str, body: &str) -> (u16, String) {
-        self.w.dynamo(c, 0, op, body)
+    pub(crate) fn call(&mut self, c: usize, op: &str, body: &str) -> (u16, String) {
+        let n = self.up(c);
+        self.w.dynamo(c, n, op, body)
     }
 
-    fn ok(&mut self, c: usize, op: &str, body: &str) -> String {
+    /// Crash node `n` of cluster `c`; peer traffic and calls move to a live node.
+    pub(crate) fn crash(&mut self, c: usize, n: u64) {
+        self.w.clusters[c].crash(n);
+        self.down.push((c, n as usize));
+        let up = self.up(c);
+        self.entry[c].store(up, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The first node of cluster `c` that is not crashed.
+    pub(crate) fn up(&self, c: usize) -> u64 {
+        (0..NODES)
+            .find(|n| !self.down.contains(&(c, *n as usize)))
+            .expect("a live node")
+    }
+
+    pub(crate) fn ok(&mut self, c: usize, op: &str, body: &str) -> String {
         let (s, r) = self.call(c, op, body);
         assert_eq!(s, 200, "seed={}: {op} on {c}: {r}", self.seed);
         r
     }
 
-    fn put(&mut self, c: usize, k: &str, v: &str) {
+    pub(crate) fn put(&mut self, c: usize, k: &str, v: &str) {
         self.ok(c, "PutItem", &item_body(k, v, ""));
     }
 
-    fn read(&mut self, c: usize, k: &str) -> Option<String> {
+    pub(crate) fn read(&mut self, c: usize, k: &str) -> Option<String> {
         let (s, r) = self.call(c, "GetItem", &key_body(k, true));
         if s != 200 {
             return None; // table not there (yet)
@@ -138,8 +165,11 @@ impl S {
     }
 
     /// One saga + shipper pass of cluster `c` on every node.
-    fn step(&mut self, c: usize) {
+    pub(crate) fn step(&mut self, c: usize) {
         for node in 0..NODES {
+            if self.down.contains(&(c, node as usize)) {
+                continue;
+            }
             let mut ctx = self.w.clusters[c].handle().node_ctx(node);
             ctx.mrec = self.cfgs[c].clone();
             let client = self.w.peer_client(c);
@@ -154,12 +184,12 @@ impl S {
         self.w.run_for(Duration::from_millis(250));
     }
 
-    fn step_both(&mut self) {
+    pub(crate) fn step_both(&mut self) {
         self.step(A);
         self.step(B);
     }
 
-    fn until(&mut self, what: &str, cond: impl Fn(&mut S) -> bool) {
+    pub(crate) fn until(&mut self, what: &str, cond: impl Fn(&mut S) -> bool) {
         for _ in 0..240 {
             if cond(self) {
                 return;
@@ -167,7 +197,8 @@ impl S {
             self.step_both();
         }
         let (ra, rb) = (self.spec_replicas(A), self.spec_replicas(B));
-        let copied = self.w.clusters[A].metadata(0).table_global(TABLE).map(|g| {
+        let n = self.up(A);
+        let copied = self.w.clusters[A].metadata(n).table_global(TABLE).map(|g| {
             g.replicas
                 .iter()
                 .map(|r| r.copied.clone())
@@ -181,7 +212,7 @@ impl S {
 
     /// `region -> status` from `DescribeTable` on cluster `c` (empty when the
     /// table is absent or carries no replicas).
-    fn replicas(&mut self, c: usize) -> BTreeMap<String, String> {
+    pub(crate) fn replicas(&mut self, c: usize) -> BTreeMap<String, String> {
         let (s, r) = self.call(c, "DescribeTable", &format!(r#"{{"TableName":"{TABLE}"}}"#));
         let mut out = BTreeMap::new();
         if s != 200 {
@@ -199,7 +230,7 @@ impl S {
         out
     }
 
-    fn both_active(&mut self) -> bool {
+    pub(crate) fn both_active(&mut self) -> bool {
         let want: BTreeMap<String, String> = [("a", "ACTIVE"), ("b", "ACTIVE")]
             .iter()
             .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
@@ -207,9 +238,10 @@ impl S {
         self.replicas(A) == want && self.replicas(B) == want
     }
 
-    fn spec_replicas(&mut self, c: usize) -> Vec<(String, MrecReplicaStatus)> {
+    pub(crate) fn spec_replicas(&mut self, c: usize) -> Vec<(String, MrecReplicaStatus)> {
+        let n = self.up(c);
         self.w.clusters[c]
-            .metadata(0)
+            .metadata(n)
             .table_global(TABLE)
             .map(|g| {
                 g.replicas
@@ -220,7 +252,7 @@ impl S {
             .unwrap_or_default()
     }
 
-    fn make_active(&mut self, pre: usize) {
+    pub(crate) fn make_active(&mut self, pre: usize) {
         for i in 0..pre {
             self.put(A, &format!("pre{i:02}"), "old");
         }

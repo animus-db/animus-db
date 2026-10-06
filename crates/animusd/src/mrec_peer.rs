@@ -138,6 +138,9 @@ pub(crate) struct PeerHealth {
     pub(crate) shipped_rows: u64,
     /// The tablet's work is done (cursor current, nothing pending).
     pub(crate) caught_up: bool,
+    /// The TTL attribute this node's saga last pushed (or observed at first
+    /// sight) for the peer: `None` = never looked, `Some(None)` = no TTL.
+    pub(crate) ttl_pushed: Option<Option<String>>,
 }
 
 impl Default for MrecConfig {
