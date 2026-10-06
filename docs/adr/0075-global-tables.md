@@ -16,8 +16,12 @@
 - **Implementation status:** **stage G-c (MRSC, the stretch cluster) is built**
   behind `Gate::GlobalTables` (cluster version 2); see the 2026-10-05
   amendments at the end ("the MRSC wire surface as built" and "G-c as built").
-  Stages G-d (MREC) and G-e (federation) are not built. ADR 0073 Phase 2
-  (P2-B/C/D) is done, so the "blocked on P2" note in section 8 is historical.
+  **Stage G-d (MREC, async per-item LWW between clusters) is built** behind
+  `Gate::MrecReplication` (cluster version 3), simulation-proven plus one
+  real-process two-cluster test over mutual TLS; see the 2026-10-06 amendments at
+  the end ("G-d M1/M2/M3 as built" and "G-d as built (M0-M6)"). Stage G-e
+  (federation: operator-rendered peers, cross-cluster admin) is not built. ADR 0073
+  Phase 2 (P2-B/C/D) is done, so the "blocked on P2" note in section 8 is historical.
 
 ## 0. Verification note (read first)
 
@@ -1035,3 +1039,130 @@ tests (`SimWorld` for semantics, real loopback sockets for the transport).
   refusal. The full real-process two-cluster apply is M6.
 - **Moved to later milestones**: `/admin/global-tables` peer-health fields need shipper
   state, so they land with M4 (the receiver counts are in metrics now).
+
+## Amendment (2026-10-06): G-d as built (M0-M6, MREC global tables)
+
+Stage G-d is complete: a table can be made eventually consistent across independent
+clusters with `UpdateTable ReplicaUpdates` (no `MultiRegionConsistency`, or
+`EVENTUAL`), and writes on every replica converge by last-writer-wins. This
+amendment records what the milestones built and the deviations from sections 4, 5
+and 8 above. Plan: `g01/g-d-plan.md`; per-milestone detail is in the M1-M3
+amendments above and in the module docs named below.
+
+**Milestones.** M0 a multi-cluster `SimWorld` (N independent clusters on one
+virtual clock and a lossy WAN, `sim_world.rs`); M1 formats and gate; M2 the apply
+rule (`apply_mrec`: the incoming stamp wins iff it is greater than the stored one,
+a loser answers `Superseded`, deletes are stamped tombstones so nothing resurrects);
+M3 config, `MrecApply` frame, receiver, `ProdPeerClient` over the intra port;
+M4 the shipper (`mrec_shipper.rs`), replica saga (`mrec_saga.rs`), stamping at
+every write site, `DescribeTable Replicas`; M5 the fault corpus
+(`sim_world_mrec_corpus.rs`, 17 cells, 4 negative controls, `ANIMUS_MREC_SEEDS`,
+nightly depth 15); M6 the operator surface and the real-process test.
+
+**F2 amends section 4.2: current-state shipping, not literal change-record
+shipping (default taken; the maintainer's decision is pending).** Section 4.2
+describes a consumer of the change log shipping each `ChangeRecord`. As built, the
+change log only *names dirty keys*: per `(led tablet, peer)` the shipper reads the
+keys changed above the peer's cursor (`mrec:<region>`) and ships each key's
+**current row** (value or tombstone, with its `MrecVersion`). The same path serves
+steady state, the initial copy (a scan under `mrecscan:<region>`), a resync after
+the retention cap and a split child. Consequences: re-delivery is idempotent for
+free (LWW), no per-record version had to be added to `ChangeRecord`, and there is
+one code path instead of a log path plus a separate scan. The cost: **a key written
+several times between two ticks arrives once**, so the receiver's DynamoDB Stream
+sees the coalesced final state, not every intermediate write (the stream keeps
+per-key ordering and old/new image parity, which the corpus's stream oracle
+checks). If the maintainer rules for literal record shipping, `ship_one`'s read step
+and the stream oracle are the places that change; the wire, stamps and apply rule do
+not. A card for that decision was posted; until it is answered this is the shipped
+behaviour.
+
+**F1: the stamp is a calendar `MrecVersion`, not the cluster HLC.** The item HLC is
+relative to each process's `Env` clock epoch and is not comparable between clusters
+(and re-basing the cluster HLC onto wall time would change uncertainty, ceilings and
+PITR/seal ages for every table, ADR 0018). `MrecVersion { wall_ms, logical,
+region_id }` lives inside the row value (M1 amendment), stamped on the origin
+leader from `env.wall_now()` at write time (a transaction stamps at stage time; the
+TTL reaper stamps `min(expiry, now)`; the apply takes the max with the stored
+stamp). A receiver refuses a record whose wall time is more than
+`mrec_max_clock_skew_ms` ahead of its own clock (default 500 ms). This is where
+`wall_now` (ADR 0051) earns its second use, still inside the `Env` seam.
+
+**F3: gate = cluster version 3, `MIN_SUPPORTED` stays 1.** `Gate::MrecReplication`
+guards the four `MetaCommand`s plus `MarkMrecCopied`, `GlobalTableSpec.replicas`, the
+`WriteSchema.mrec` / `KindEvalOp::Replicate` data-plane shapes and the `MrecApply`
+frame (rows in ADR 0073's inventory). A cluster finalized to version 2 only
+(G-c open) keeps the old `ReplicaUpdates` rejection text and ships nothing. The
+cross-cluster frame carries its own `MREC_PROTO` since two clusters roll
+independently.
+
+**Replica lifecycle (D7/D8).** The saga driver is the leader of the table's lowest
+active tablet. Create: `Creating`, then a `MrecControl::CreateReplica` to the peer
+(which adopts an identical-shape table or refuses a different shape for good, giving
+`CreationFailed`), `AddPeer` to the other replicas (full mesh), then a shipper scan
+per tablet whose completion marks `MarkMrecCopied`, then `Active` on both sides.
+Delete: `Deleting`, `Leave` to the peer (its table survives standalone), a grace
+period, then `RemoveMrecReplica`. Streams are forced to `NEW_AND_OLD_IMAGES` and
+cannot be disabled on an MREC table.
+
+**Split lineage: an unfiltered scan, not an inherited floor.** A split child's CHANGE
+and CURSOR scopes are dropped by `trim_split_child`, so the child has no cursor and
+scans its own rows in full, then resumes the log; the peer answers `Superseded` for
+rows it already holds. The plan's inherited-floor filter would need a cursor row
+exempt from that trim (an ADR 0073 format change) and a skew argument for a modest
+saving; it is not built. Proven by `a_split_of_the_source_tablet_keeps_shipping_every_row`.
+
+**TTL: `MrecControl::SetTtl`.** The replicated `TtlSpec` is copied at create and
+re-sent on `UpdateTimeToLive` by the saga driver (class G with the frame; fixture
+`client-frame/v1-mrec-control-ttl.bin`). Every region runs its own reaper; an expiry
+is a stamped delete, so an update in another region before the expiry reaches it can
+lose to the expiry tombstone (AWS-faithful, D9).
+
+**M6 operator surface.** `GET /admin/global-tables` now lists MREC tables beside
+MRSC ones (`consistency: "EVENTUAL"`): the replica set with status and copy
+progress (`tablets_copied`/`tablets_total`) and **this node's** per-(tablet, peer)
+shipper health: `backlog`, `lag_ms` (age of the oldest unshipped change at the last
+tick), `last_ack_age_ms`, `scanning`, `needs_resync`, `caught_up`, `failures`,
+`last_error`, `operator_error`, `shipped_rows`. Health is in memory and node-local
+(reset on restart; a fleet view fans out over every node, as for MRSC leaders), and
+a refusal that retrying cannot fix (a shape mismatch) and a `CreationFailed` replica
+raise `warnings`. `animus admin global-tables` prints that JSON; the dashboard's
+Placement tab shows an MREC table's replica status in the node detail and no longer
+counts an MREC table's leaders as "off preferred" (it has no preferred Region).
+Metrics for the shipper and receiver landed in M4.
+
+**Evidence.** The semantics are proven over `SimWorld` (the M4 saga/e2e/edge tests
+at 20+ seeds each, and the M5 corpus: convergence, floor/LWW, loss, provenance, echo,
+amplification, TTL, stream-parity oracles, with negative controls that must trip).
+The real-socket evidence is `animusd/tests/mrec_peer_transport.rs`: the mutual-TLS
+handshake between two clusters with different CAs, a stranger CA refused, plaintext
+refused without `allow_insecure_peers`, and
+`two_real_clusters_replicate_a_table_both_ways_over_mutual_tls` (two single-node
+`ProdEnv` clusters, finalized to version 3, a table created over the TLS DynamoDB
+wire, `ReplicaUpdates Create`, a pre-existing row copied, a write on each side
+readable on the other, the admin view naming the table). That test runs both
+clusters on loopback in one process: it shows the real TLS client, loops and
+framing work, **not** WAN behaviour.
+
+**Known gaps and residuals.**
+- No WAN latency, bandwidth or cost measurement; the two real clusters share a host.
+  `kind`/operator e2e cannot run in this sandbox, so the operator rendering peers
+  into `cluster.json` (G-e) is unbuilt and unverified.
+- The AWS wire field and error names MREC uses (`ReplicaUpdates`, `Replicas`,
+  `ReplicaStatus`, the validation texts) remain unverified against the AWS docs
+  (section 0); they are the shapes AWS's public API reference extracts showed.
+- F2 (above): the receiver's stream coalesces; the maintainer's decision is pending.
+- Shipper health is per node and in memory; no cluster-wide lag aggregate or alert.
+- A TTL change made while the saga driver role moves is not re-sent until the next
+  change, and two regions setting different TTL attributes concurrently end with the
+  last push winning.
+- The shipper's own gate check has no discriminating test (a spec below the gate
+  cannot be forced; stamping asserts the gate); the wire check is discriminated.
+- A split child re-sends its rows once (above); a cluster with very large MREC
+  tablets pays WAN volume per split.
+- `SchemaRegistry::sync_indexes` (`animus-dynamo`, pre-existing, not fixed here)
+  does not refresh the key schema of an already-registered table, so a table dropped
+  and recreated with a *different* key schema stays unreadable on that node until a
+  restart; MREC's re-create path hits it only for a different shape.
+- Only the full-mesh topology exists (D8); `ReplicaUpdates[].Update` and the
+  per-replica overrides (KMS, throughput) are rejected, as section 5 says.
