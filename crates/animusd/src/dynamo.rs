@@ -4558,7 +4558,7 @@ async fn create_table<E: Env, R: RelayClient>(
 /// see `dispatch_table_op`'s own doc), but must still type-check for any
 /// `E`/`R`, and `update_table`'s own (unmodified, `ProdEnv`-only) call site
 /// keeps compiling unchanged, monomorphized as before.
-async fn enable_stream<E: Env, R: RelayClient>(
+pub(crate) async fn enable_stream<E: Env, R: RelayClient>(
     ctx: &ClientCtx<E, R>,
     table: &str,
     view_type: animus_control::StreamViewType,

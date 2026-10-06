@@ -541,7 +541,7 @@ async fn step_deleting<E: Env, R: RelayClient>(
 /// A `Deleting` replica's cursors on one tablet this node leads: drop them
 /// (the shipper tick calls this; idempotent).
 pub(crate) async fn drop_deleting_cursors<E: Env>(
-    group: &animus_cp_data::CpGroup<E>,
+    group: &crate::CpGroup<E>,
     region: &str,
 ) {
     let _ = clear_peer_cursors(group, region).await;

@@ -72,6 +72,7 @@ pub(crate) fn global_description(meta: &Metadata, table: &str) -> Option<GlobalT
             .map(|r| (r.clone(), status(r)))
             .collect(),
         witness: spec.witness.as_ref().map(|r| (r.clone(), status(r))),
+        eventual: false,
     })
 }
 
