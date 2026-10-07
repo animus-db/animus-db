@@ -5955,6 +5955,13 @@ impl SimCluster {
         self.sim.run_for(dur);
     }
 
+    /// Replace every node's simulated disk behavior (ENOSPC injection, issue
+    /// #1228's every-replica-full window). Applies to retained engines and WALs
+    /// alike; pass `DiskConfig::default()` to return space.
+    pub(crate) fn set_disk_config(&mut self, cfg: animus_sim::DiskConfig) {
+        self.sim.set_disk_config(cfg);
+    }
+
     /// The seed this cluster was built from — for an assertion message
     /// naming a replayable run (`ANIMUS_SEED=<seed>`, root `CLAUDE.md`'s
     /// convention).

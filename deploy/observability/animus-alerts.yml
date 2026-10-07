@@ -126,6 +126,21 @@ groups:
           description: "The control plane itself declared a member Down in the last 10m (ADR 0012); placement will repair its replicas."
           runbook_url: "https://github.com/animus-db/animus-db/blob/main/docs/runbook/node-down.md"
 
+      - alert: AnimusConsensusTaskPanicked
+        expr: max by (instance) (consensus_task_panics) > 0
+        labels: {severity: critical, component: process}
+        annotations:
+          summary: "{{ $labels.instance }} has a dead consensus-loop task (it panicked)"
+          description: "A control-plane Raft driver/apply loop or a tablet group's driver/apply loop panicked and is never restarted, so this node is silently dead for that group. /admin/health returns 503 (`consensus_task_panics`). Restart the node; keep the log for the bug report."
+          runbook_url: "https://github.com/animus-db/animus-db/blob/main/docs/runbook/node-down.md#a-task-panicked-on-a-live-node"
+      - alert: AnimusBackgroundTaskPanicked
+        expr: sum by (instance) (increase(spawned_task_panics[15m])) > 0
+        labels: {severity: warning, component: process}
+        annotations:
+          summary: "{{ $labels.instance }} had a background task panic"
+          description: "A spawned task (any kind) panicked. Consensus-loop panics also fire AnimusConsensusTaskPanicked; this one covers every other task (a request handler, a reaper, a sweeper) whose loss is partial. Any panic is a bug."
+          runbook_url: "https://github.com/animus-db/animus-db/blob/main/docs/runbook/node-down.md#a-task-panicked-on-a-live-node"
+
   - name: animus.tablets
     rules:
       - alert: AnimusTabletGroupLeaderless

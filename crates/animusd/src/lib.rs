@@ -22636,6 +22636,8 @@ mod sim_cluster_dynamo_batch_get;
 #[cfg(test)]
 mod sim_cluster_dynamo_boolean_composition;
 #[cfg(test)]
+mod sim_cluster_dynamo_disk_full;
+#[cfg(test)]
 mod sim_cluster_dynamo_eventual_read;
 #[cfg(test)]
 mod sim_cluster_dynamo_expression_surface;

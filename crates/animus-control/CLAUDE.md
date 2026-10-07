@@ -3193,12 +3193,24 @@ hands it to a `write_image` closure that must write a **fresh file**). Only on
 success does it `mark_durable_through`, `complete_all_drained` and clear the
 flag; ENOSPC on the rewrite keeps probing, any other error stays a hard failure.
 No persisted-format change. `RaftNode::is_storage_full()` feeds `/admin/health`.
+Issue #1228 (full follower / all-full group): a full follower keeps acking, but
+`handle_append_entries` clamps the success `match_index` to `durable_index` when
+`storage_full` (and `log_truncate` lowers `durable_index`), so commit can never
+advance on an ack for entries it did not persist; `cannot_vote_yet()` includes
+`storage_full`, so every ack carries `check_pending = true`. The leader's
+step-down and `transfer_leadership` need a *healthy quorum*
+(`healthy_followers(now)`: acked `check_pending == false` within one election
+timeout) and never target a `check_pending` peer, so a full leader does not hand
+off to a full node or ping-pong. `handle_append_resp` skips the immediate resend
+for an ack that made no progress while `check_pending` (a zero-latency
+ack/resend spin otherwise; guarded by the trace-event bound in the corpus).
+`had_leader_contact` is sticky (never cleared) and feeds the eventual-read gate.
 `SharedWal` has a `needs_rewrite` flag armed ONLY by an ENOSPC append/sync
 failure; while armed `Append` is refused (StorageFull error) until a `Compact`
 succeeds, so a healthy sibling tablet cannot stack bytes after a suspect tail.
-Known gaps: no leader step-down (`RaftCore` has no step-down API), and the
-apply task's engine `merge_batch`/applied-marker `.expect` on ENOSPC is
-unchanged (LSM path). Tests: `persist_round` unit tests; end-to-end by the
+Leader step-down (issue #1219): `RaftCore::set_storage_full` (fed live by a DRIVER_APPLIED driver, `animus-cp-data`'s consensus loop; the control plane never sets it) makes `start_pre_vote`/`start_election` (and so `TimeoutNow`) no-ops, the same gate as `state_machine_behind`; `RaftCore::storage_full_step_down(now, avoid)` arms `transfer_leadership` toward the highest-`peer_match` voter (rotating away from `avoid`, the previous unanswered target). The control group's own storage-full handling is unchanged (no step-down). Tests: `tests/it/storage_full_step_down.rs`. (The apply
+task's engine ENOSPC, formerly a gap, is handled by `animus-cp-data`'s
+`apply_stall`, issue #1218.) Tests: `persist_round` unit tests; end-to-end by the
 `animus-test` disk-full corpus (`ANIMUS_DISK_FULL_SEEDS`).
 
 ## MREC formats and `Gate::MrecReplication` (G-01 stage G-d M1, ADR 0075/0073 amendments)

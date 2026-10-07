@@ -102,7 +102,9 @@ task until a process restart (the node still looked healthy). Now:
    its `fsync` is never retried on the old descriptor (fsyncgate: after a
    failed `fsync` the kernel may have dropped the dirty pages, and a torn
    partial append may sit in the file). The round is never marked durable, so
-   nothing it covers is applied, visible or acked.
+   nothing it covers is applied, visible or acked. A leader in this state
+   (or with a stalled apply task) hands leadership off, see "Leader step-down
+   (issue #1219)" below.
 3. **Recovery without a restart** (`persist_round::recover_suspect_wal`). The
    persist future probes on `env.sleep` with exponential backoff (50 ms up to a
    2 s cap, so a disk that stays full for minutes is not hammered). Each probe
@@ -141,22 +143,174 @@ task until a process restart (the node still looked healthy). Now:
    asserts the linearizability oracle (no acked write lost or duplicated), that
    progress resumes after the window with no restart, and seed determinism.
 
+### LSM-engine ENOSPC (issue #1218)
+
+ENOSPC inside `LsmEngine` no longer panics the apply task:
+
+1. **Classification.** `StorageError::StorageFull` (built from
+   `animus_env::is_storage_full` at every disk-seam error site) is the
+   recoverable class; its contract is that the failed operation changed nothing
+   durable or visible, so the identical call may be retried.
+2. **WAL commit.** A failed group commit applies nothing and surfaces
+   `StorageFull` to every writer in the lost batch. After an ENOSPC the segment
+   is cut back (`replace`) to its last known-durable length before the next
+   batch rides it, so a short write left by the failed `append` can never sit in
+   front of an acked record. (Only ENOSPC arms this; other errors are unchanged.)
+3. **Flush and compaction** fail cleanly: a failed flush leaves the memtable and
+   WAL untouched, a failed compaction leaves its inputs authoritative, and both
+   remove their partial/complete-but-unreferenced outputs (seqs are only
+   consumed by the manifest swap, so the retry reuses them). Inline post-write
+   maintenance ENOSPC is **deferred, not surfaced**: the write that triggered it
+   is already durable and applied, so it must not fail; the next write retries
+   the maintenance. `flush_now`/`compact_now` and the background-maintenance
+   backpressure error still return `StorageFull`.
+4. **Apply pause.** The apply task's engine handle (`animus-cp-data`
+   `apply_stall::StallingEngine`) retries any `StorageFull` call on the `Env`
+   clock instead of panicking. The task is blocked inside that one call, so
+   nothing is lost, duplicated or reordered. While paused,
+   `RaftKvNode::is_storage_full()` is true, so `animusd` refuses new writes with
+   the existing 503 `StorageFull` and `/admin/health` reports `storage_full`;
+   the flag clears when the call succeeds, with no restart. On shutdown a paused
+   call raises `apply_stopped` and parks (no panic).
+5. **Tests.** `animus-storage` `tests/it/lsm_disk_full.rs` (WAL commit applies
+   nothing and retries, torn-tail repair, flush/compaction ENOSPC leave no
+   orphans and retry, deferred inline maintenance; depth
+   `ANIMUS_LSM_DISK_FAULT_SEEDS`), and the disk-full corpus now also runs over
+   `LsmEngine<SimEnv>` (three representative cells always on; the whole corpus
+   under `ANIMUS_RAFTKV_LSM=1`).
+
+Not covered: engine reads and other non-apply engine users (read path, TTL
+reaper, reconciler) still propagate the error to their caller, and a
+`ProdEnv` size-limited filesystem test is still outstanding.
+
+### Leader step-down (issue #1219)
+
+A StorageFull tablet leader now hands leadership to a replica with free disk, so
+the group stays writable through a leader-only disk-full window instead of
+refusing every write until space returns.
+
+1. **Mechanism.** The per-tablet consensus loop (`animus-cp-data`) feeds
+   `RaftKvNode::is_storage_full()` into the core every pass
+   (`RaftCore::set_storage_full`). A storage-full **leader** calls
+   `RaftCore::storage_full_step_down`, which arms the existing
+   `transfer_leadership` (Raft section 3.10, `TimeoutNow`) toward the voter with
+   the highest `match_index` (at least `commit_index`, the arm gate), then wakes
+   the loop so `TimeoutNow` ships at once. No new wire message, no persisted
+   state.
+2. **No ping-pong.** A storage-full node never starts a pre-vote or an election
+   and declines `TimeoutNow` (the same gate as `state_machine_behind`): it
+   could not persist the term bump anyway, and winning would put leadership back
+   on a node that refuses writes. It recovers its WAL in place and campaigns
+   normally again once space returns.
+3. **No permanent leaderlessness.** A transfer only arms; the leader keeps
+   leading until a target actually wins. Since #1228 it arms only when a
+   **majority of the other voters** reported healthy (`check_pending == false`,
+   which includes "not storage-full") on an ack within one election timeout
+   (`RaftCore::healthy_followers`), after a one-election-timeout settle from
+   entering the full state, and never toward a voter that reported it cannot
+   vote (`transfer_leadership` refuses it for every caller, including the G-01
+   preferred-leader step). With fewer healthy voters nobody could win an
+   election or commit under any leader, so the leader **stays leader**, serving
+   reads and refusing writes; stepping down would only have left the group
+   leaderless (F-1). A target that is itself full still declines `TimeoutNow`,
+   the transfer aborts at its one-election-timeout deadline, and the retry (after
+   a two-election-timeout cooldown) rotates to the next voter. When space returns
+   on any node the group converges. The control-plane group is unchanged: it
+   never calls `set_storage_full`.
+4. **Quiesced groups.** A group that is storage-full vetoes quiescence, arming
+   a transfer un-quiesces the leader, and both the apply task's ENOSPC stall
+   transition and each refused write (`record_storage_full_refusal`) wake the
+   consensus loop, so a parked leader still steps down.
+5. **Follower side (issue #1228: frozen acks).** A follower whose WAL is suspect
+   still must never vouch for an entry it could not persist, but it no longer
+   goes silent either. Before #1228 the failed round gated every later
+   `AppendEntriesResp`, even a bare heartbeat's, so a full leader lost all
+   follower contact; combined with a step-down that could not see which voters
+   were full, an every-replica-full group could lose its leader (F-1). Now the
+   follower's ack is **frozen at its own durable index**
+   (`RaftCore::handle_append_entries` clamps `match_index` to `durable_index`
+   while storage-full) and ships immediately (the consensus loop lets an
+   `AppendEntriesResp{success}` with `match_index <= durable_index` out ahead of
+   the round, while the WAL is suspect). The leader therefore keeps hearing
+   from it (leadership, `peer_last_contact`, ReadIndex probes), the commit index
+   can never advance on an entry the follower did not persist, and the ack's
+   `check_pending` flag (now also true while storage-full) tells the leader it
+   cannot vote. Rejects, vote grants and any ack claiming more than its durable
+   prefix are still held until the rewrite lands. Pinned by the
+   `a_full_followers_ack_is_frozen_at_its_durable_index` unit test, the
+   `raftkv_disk_full_follower_acks_nothing_it_could_not_persist` sim test and the
+   `fresh_full_acks` check of the all-full cells.
+6. **Tests.** `animus-control` `tests/it/storage_full_step_down.rs` (pure core),
+   `animus-cp-data` `tests/it/quiescence.rs` (viii) (quiesced leader), and the
+   disk-full corpus: every cell runs a probe writer outside the Elle history and
+   the `LeaderDiskFull` cells assert probe writes are acked **inside** the window
+   (past a 1.5 s grace), plus linearizability; the all-replica `DiskFull` cells
+   still assert recovery after the window.
+
+### Every replica full (issue #1228, F-1 / F-3)
+
+With every replica of a group full the contract is: **the established leader
+keeps leading, serves linearizable and eventual reads of what the group already
+holds, and refuses every write promptly with a named 503 `StorageFull`** (no
+timeouts); a leader that dies in that window is not replaced until space
+returns (below). The mechanism is the frozen follower ack and the
+healthy-quorum step-down described above, plus two read-path changes:
+
+1. **Linearizable reads at the committed floor.** A linearizable read needs a
+   committed `ReadCeiling` above its timestamp (ADR 0018 section 2, 500 ms of
+   cover per proposal); a storage-full leader cannot commit a new one. Once the
+   ceiling lapses it serves at the highest version its engine holds
+   (`RaftKvNode::read_serve_ts`), after the usual ReadIndex barrier whose index
+   for a full leader is its first-term entry (the engine may be paused short of
+   the commit index and never reach it): every acknowledged write is at or below
+   that floor and every later write, on any leader, is minted above anything it
+   applied or witnessed. It does not propose ceilings (they could never commit,
+   and each would grow the in-memory log and stall the read a full
+   `READ_TIMEOUT`).
+2. **Eventual reads without a current leader.** `stale_read_ready` accepts a
+   storage-full replica that has had leader contact in this process's life even
+   when it currently knows no leader, and even with its apply paused (its engine
+   is then an in-order prefix of the log; only a half-installed snapshot is
+   excluded). A full
+   node never campaigns, so after the leader's death nothing would otherwise
+   re-establish the "knows a leader" condition.
+3. **Leader death while every replica is full.** Not replaced: electing needs a
+   durable term bump and self-vote and durable grants, and a node that cannot
+   write cannot make a vote it could safely forget never to have cast (see ADR
+   0074's 2026-10-06 amendment for why a full node winning "write-refusing" is
+   rejected). The group serves eventual reads from every survivor, loses
+   nothing, and elects as soon as space returns on a quorum. A node restarted
+   *during* the window serves no eventual read until it hears a leader.
+4. **Tests.** Unit: `animus-control` `tests/it/storage_full_step_down.rs`
+   (frozen ack, healthy quorum, stale report, transfer guard). Corpus:
+   `raftkv_disk_full_all_replicas_keep_leadership_and_serve_reads[_lsm]` (RF3 and
+   RF5), `raftkv_disk_full_step_down_requires_a_healthy_quorum`,
+   `raftkv_disk_full_all_replicas_leader_crash_*`, `quiescence.rs` (ix); wire:
+   `animusd` `sim_cluster_dynamo_disk_full`; real: `chaos_disk_full` phase 2.
+
 ### Residuals (not done; file as issues)
 
-- **LSM engine ENOSPC is not handled.** The apply task's `merge_batch` and the
-  applied-marker write still `expect`/`assert` on an engine error (an LSM flush
-  or compaction hitting ENOSPC is a separate path). The corpus therefore runs over
-  `MemoryEngine` only; do not enable ENOSPC over `ANIMUS_RAFTKV_LSM=1`.
-- **No leader step-down.** A StorageFull leader keeps leadership (`RaftCore` has
-  no step-down API) and refuses writes; its followers' disks are healthy but the
-  group cannot make progress through a leader that cannot persist. A follower
-  with a full disk simply does not ack (its rounds stay gated), which a quorum
-  tolerates.
-- **`spawned_task_panics` is still not exported** through `/metrics`, and
-  `/admin/health` does not fail on a panicked consensus task.
-- **No `ProdEnv` test on a size-limited filesystem** (a tmpfs mount needs
-  `CAP_SYS_ADMIN`, so it is CI-only). The sim proves logic and ordering, not the
-  kernel's real ENOSPC/`fsync` behaviour.
+- ~~LSM engine ENOSPC is not handled.~~ Handled (issue #1218), see "LSM-engine
+  ENOSPC" below.
+- ~~No leader step-down.~~ Done (issue #1219), see "Leader step-down" below.
+- ~~`spawned_task_panics` is not exported, and `/admin/health` does not fail on a
+  panicked consensus task.~~ Done (issue #1220): `spawned_task_panics` (any
+  spawned task) and `consensus_task_panics` (a `Spawner::spawn_critical` task: the
+  control Raft driver and `Metadata` apply loop, each CP-data group's driver and
+  apply loop) are `Metric`s; a nonzero `consensus_task_panics` makes
+  `/admin/health` return 503 with a `consensus_task_panics` field (a dead consensus
+  loop is never restarted, so only a restart repairs it; `/admin/live` is
+  unchanged). Alerts `AnimusConsensusTaskPanicked` / `AnimusBackgroundTaskPanicked`
+  in `deploy/observability/animus-alerts.yml`; test
+  `crates/animusd/tests/consensus_task_panic_health.rs`.
+- ~~No `ProdEnv` test on a size-limited filesystem.~~ Done (issue #1221):
+  `chaos_disk_full` in the real-process chaos harness (`docs/chaos.md`, "Disk full
+  on real filesystems"), per-node tmpfs mounts, CI job `chaos-disk-full`. It found
+  defects, now all fixed: **F-1** reads were not reliably served while every node was
+  full and **F-3** the 503 refusal raced leadership loss (both closed by #1228, see
+  "Every replica full"), and **F-2** a disk-full window with 2PC ops on left an
+  unresolved intent that blocked a key after space returned (a split cut a txn
+  record off its anchor; `docs/chaos.md`).
 - SimEnv injects ENOSPC on reads as well, so a `StopRestart` during a 100%
   window would read an empty WAL; the corpus never combines the two.
 
@@ -170,7 +324,7 @@ task until a process restart (the node still looked healthy). Now:
    cap `len` (the largest legitimate frame is a 64 KiB snapshot chunk plus
    overhead, or a 512-entry append) and `from_len` (node ids are short) and drop
    the connection above it. Needs its own PR and test.
-2. ~~Disk-full is a silent group death~~ fixed for the WAL path (section 3); the LSM-engine ENOSPC path remains open.
+2. ~~Disk-full is a silent group death~~ fixed for the WAL path and the LSM-engine path (section 3).
 3. `Query`/`Scan` byte cap is applied at the coordinator after the per-tablet
    scan RPC returns, so one tablet round trip can still materialize more than a
    page of raw pairs (already noted in `crates/animusd/CLAUDE.md`).

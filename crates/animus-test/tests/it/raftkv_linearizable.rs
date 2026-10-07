@@ -134,6 +134,7 @@
 //! bug needs. See `docs/engineering-lessons.md`'s matching entry.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
@@ -362,7 +363,9 @@ enum Nemesis {
     /// injector scoped to one node (`Simulator::set_disk_config_for`). The
     /// leader cannot make its own log durable (so it applies and acks nothing),
     /// its followers keep their healthy disks, and after `HealAll` the leader's
-    /// recovery must complete the stranded rounds without a restart.
+    /// recovery must complete the stranded rounds without a restart. Since
+    /// #1219 the StorageFull leader also hands leadership to a healthy replica,
+    /// so the group must stay writable **during** the window (the probe writer).
     LeaderDiskFull,
     /// **Intermittent ENOSPC on every replica** (30% per `append`/`sync`/
     /// `replace`): a disk hovering at the edge of full, where a recovery
@@ -941,6 +944,11 @@ fn leader_slot<S: StorageEngine + 'static>(nodes: &Nodes<S>) -> Option<(usize, A
         .iter()
         .position(|n| n.is_leader())
         .map(|i| (i, Arc::clone(&guard[i])))
+}
+
+/// [`leader_slot`] over an already-locked node list.
+fn leader_slot_in<S: StorageEngine + 'static>(guard: &[Arc<Node<S>>]) -> Option<Arc<Node<S>>> {
+    guard.iter().find(|n| n.is_leader()).map(Arc::clone)
 }
 
 /// Sentinel `expected` for [`poison_cas`] below — 1 byte, so it can never
@@ -2676,10 +2684,11 @@ fn raftkv_shrink_replay() {
 //
 // A separate corpus (own cells, own seed knob `ANIMUS_DISK_FULL_SEEDS`) rather
 // than more `corpus_cells()`: the frozen corpus's names/seeds/runs must stay
-// byte-identical, and ENOSPC is meaningful on `MemoryEngine` only (an ENOSPC on
-// `LsmEngine`'s own files is the engine's failure path, a separate piece of
-// work, `docs/resource-bounds.md` section 3), so these cells never run on the
-// LSM tier. The nemeses are `Nemesis::{DiskFull, LeaderDiskFull, DiskFlaky}`.
+// byte-identical. It runs over `MemoryEngine` (ENOSPC on the Raft WAL only) and,
+// since #1218, over `LsmEngine<SimEnv>` too (a representative subset always on,
+// the whole corpus under `ANIMUS_RAFTKV_LSM=1`) where ENOSPC also hits the
+// engine's own WAL/flush/compaction and the apply task's pause-and-retry. The
+// nemeses are `Nemesis::{DiskFull, LeaderDiskFull, DiskFlaky}`.
 //
 // What every cell asserts, beyond the shared `assert_scenario_ok`:
 //   * the injector actually fired (`DiskFault{kind:"enospc"}` in the trace);
@@ -2743,12 +2752,78 @@ struct DiskFullObservation {
     storage_full_after_drain: bool,
     /// Acked appends whose completion timestamp is after `heal_all`.
     acked_writes_after_heal: usize,
+    /// Probe writes (see [`spawn_window_probe`]) acked inside the disk-full
+    /// window, at least [`STEP_DOWN_GRACE`] after the fault was applied (issue
+    /// #1219): with the leader's disk alone full these only exist if
+    /// leadership moved to a replica with free space.
+    acked_writes_in_window: usize,
+}
+
+/// Time a storage-full leader gets to notice (its next failed persist) and
+/// hand leadership off before [`DiskFullObservation::acked_writes_in_window`]
+/// starts counting.
+const STEP_DOWN_GRACE: Duration = Duration::from_millis(1500);
+
+/// A probe writer on its own key, outside the Elle history: appends an
+/// increasing counter through whichever replica currently leads and waits for a
+/// linearizable read to show it, recording the sim time of every ack. Runs the
+/// whole scenario; the caller filters the acks to the window it cares about.
+fn spawn_window_probe<S: StorageEngine + 'static>(
+    group: &Group<S>,
+) -> (Arc<Mutex<Vec<u64>>>, Arc<AtomicBool>) {
+    const PROBE_ID: u64 = 150;
+    let acks: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    let env = group.sim.env(nid(PROBE_ID));
+    let nodes = Arc::clone(&group.nodes);
+    let out = Arc::clone(&acks);
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopped = Arc::clone(&stop);
+    env.clone().spawn_task(async move {
+        let kb = b"__window_probe__".to_vec();
+        let mut counter = 1u64;
+        while !stopped.load(Ordering::SeqCst) {
+            let want = counter.to_be_bytes().to_vec();
+            let deadline = env.now().0 + Duration::from_secs(2).as_nanos() as u64;
+            let mut proposed_on: Option<usize> = None;
+            let mut acked = false;
+            while env.now().0 < deadline && !stopped.load(Ordering::SeqCst) {
+                if let Some((li, node)) = leader_slot(&nodes)
+                    && proposed_on != Some(li)
+                    && let ProposeResult::Accepted { .. } = node.put(kb.clone(), want.clone())
+                {
+                    proposed_on = Some(li);
+                }
+                env.sleep(POLL).await;
+                if let Some((_, node)) = leader_slot(&nodes)
+                    && node.linearizable_get(&kb).await.as_deref() == Some(want.as_slice())
+                {
+                    acked = true;
+                    break;
+                }
+            }
+            if acked {
+                out.lock().unwrap().push(env.now().0);
+                counter += 1;
+            }
+        }
+    });
+    (acks, stop)
 }
 
 /// [`run_scenario_on`]'s shape over `MemoryEngine`, plus the disk-full
 /// observations above.
 fn run_disk_full_scenario(scenario: &Scenario) -> (ScenarioResult, DiskFullObservation) {
-    let mut group = Group::start(scenario.seed, scenario.replicas, mem_engine);
+    run_disk_full_scenario_on(scenario, mem_engine)
+}
+
+/// The disk-full run over any engine tier (`MemoryEngine`, or
+/// `LsmEngine<SimEnv>` — where the injected ENOSPC also lands on the engine's
+/// own WAL/flush/compaction, #1218).
+fn run_disk_full_scenario_on<S: StorageEngine + 'static>(
+    scenario: &Scenario,
+    factory: EngineFactory<S>,
+) -> (ScenarioResult, DiskFullObservation) {
+    let mut group = Group::start(scenario.seed, scenario.replicas, factory);
     group.sim.run_for(SETTLE);
     group.spawn_workload(
         scenario.clients,
@@ -2759,22 +2834,29 @@ fn run_disk_full_scenario(scenario: &Scenario) -> (ScenarioResult, DiskFullObser
     let mut faults = scenario.faults.clone();
     faults.sort_by_key(|(at, _)| *at);
     let base = group.sim.now().0;
+    let mut fault_applied_at = base;
+    // The Elle workload cannot witness in-window availability (its reads of a
+    // never-written key legitimately block for a whole `OP_BUDGET`, parking
+    // every client regardless of the fault), so a dedicated probe writer does.
+    let (probe, probe_stop) = spawn_window_probe(&group);
     for (at, nem) in faults {
         let target = base + at.as_nanos() as u64;
         if target > group.sim.now().0 {
             group.sim.run_until(animus_env::Nanos(target));
         }
         group.apply(nem);
+        fault_applied_at = group.sim.now().0;
     }
     group.sim.run_for(scenario.window);
-    let any_full =
-        |g: &Group<MemoryEngine>| g.nodes.lock().unwrap().iter().any(|n| n.is_storage_full());
+    let any_full = |g: &Group<S>| g.nodes.lock().unwrap().iter().any(|n| n.is_storage_full());
     let storage_full_during_window = any_full(&group);
 
     // "Space returns".
     group.heal_all();
     let healed_at = group.sim.now().0;
     group.sim.run_for(DRAIN);
+    // Quiet the probe before the convergence checks read the replicas.
+    probe_stop.store(true, Ordering::SeqCst);
     let storage_full_after_drain = any_full(&group);
 
     let enospc_faults = group
@@ -2791,6 +2873,13 @@ fn run_disk_full_scenario(scenario: &Scenario) -> (ScenarioResult, DiskFullObser
         .flat_map(|e| &e.mops)
         .filter(|m| matches!(m, Mop::Append { .. }))
         .count();
+    let window_from = fault_applied_at + STEP_DOWN_GRACE.as_nanos() as u64;
+    let acked_writes_in_window = probe
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|t| **t > window_from && **t <= healed_at)
+        .count();
     (
         result,
         DiskFullObservation {
@@ -2798,18 +2887,22 @@ fn run_disk_full_scenario(scenario: &Scenario) -> (ScenarioResult, DiskFullObser
             storage_full_during_window,
             storage_full_after_drain,
             acked_writes_after_heal,
+            acked_writes_in_window,
         },
     )
 }
 
 /// Run one disk-full cell under `run_scenario_identified`'s seed-naming panic
 /// wrapper, returning both the Elle result and the observations.
-fn run_disk_full_identified(s: &Scenario) -> (ScenarioResult, DiskFullObservation) {
+fn run_disk_full_identified_on<S: StorageEngine + 'static>(
+    s: &Scenario,
+    factory: EngineFactory<S>,
+) -> (ScenarioResult, DiskFullObservation) {
     let obs: Arc<Mutex<Option<DiskFullObservation>>> = Arc::new(Mutex::new(None));
     let slot = Arc::clone(&obs);
     let scenario = s.clone();
     let result = run_scenario_identified(s, move || {
-        let (r, o) = run_disk_full_scenario(&scenario);
+        let (r, o) = run_disk_full_scenario_on(&scenario, factory);
         *slot.lock().unwrap() = Some(o);
         r
     });
@@ -2823,11 +2916,19 @@ fn run_disk_full_identified(s: &Scenario) -> (ScenarioResult, DiskFullObservatio
 /// `scenario=<name> seed=<seed>` and a failure names both.
 #[test]
 fn raftkv_disk_full_corpus_is_linearizable() {
-    let scenarios = disk_full_corpus();
+    check_disk_full_corpus("mem+disk-full", &disk_full_corpus(), mem_engine);
+}
+
+/// Run `scenarios` over `factory` and assert the disk-full properties.
+fn check_disk_full_corpus<S: StorageEngine + 'static>(
+    tier: &str,
+    scenarios: &[Scenario],
+    factory: EngineFactory<S>,
+) {
     let mut total_ok_writes = 0usize;
-    for s in &scenarios {
-        let (r, obs) = run_disk_full_identified(s);
-        assert_scenario_ok("mem+disk-full", s, &r);
+    for s in scenarios {
+        let (r, obs) = run_disk_full_identified_on(s, factory);
+        assert_scenario_ok(tier, s, &r);
         let full_disk = matches!(s.faults[0].1, Nemesis::DiskFull | Nemesis::LeaderDiskFull);
         assert!(
             obs.enospc_faults > 0,
@@ -2848,7 +2949,20 @@ fn raftkv_disk_full_corpus_is_linearizable() {
              (the WAL rewrite never completed; recovery needed a restart)",
             s.name, s.seed
         );
-        if full_disk {
+        if matches!(s.faults[0].1, Nemesis::LeaderDiskFull) {
+            // Issue #1219: the leader's own disk is full but a quorum of
+            // replicas is healthy, so the group must stay writable *during*
+            // the window -- the StorageFull leader hands leadership to a
+            // replica with free space rather than keeping it and refusing.
+            assert!(
+                obs.acked_writes_in_window > 0,
+                "scenario {} (seed={}): no write was acked inside the leader-only disk-full \
+                 window; the StorageFull leader did not step down",
+                s.name,
+                s.seed
+            );
+        }
+        if matches!(s.faults[0].1, Nemesis::DiskFull) {
             // Only a fully-unavailable disk strands the workload past the
             // window; a flaky one lets the (short) workload finish inside it,
             // which is progress in its own right (asserted just below).
@@ -2874,6 +2988,48 @@ fn raftkv_disk_full_corpus_is_linearizable() {
         "disk-full corpus too vacuous: only {total_ok_writes} acked writes across {} scenarios",
         scenarios.len()
     );
+}
+
+/// Always-on representative subset of the disk-full cells over
+/// `LsmEngine<SimEnv>` (#1218): one cell per ENOSPC shape. Here the injected
+/// ENOSPC also lands on the engine's own WAL, flushes and compactions (the
+/// corpus's tiny `lsm_opts` thresholds make those fire constantly), so this is
+/// the proof the apply task pauses (`apply_stall`) and the engine defers/
+/// retries instead of panicking, with nothing lost, duplicated or reordered
+/// (Elle) — and that the group leaves `StorageFull` after space returns.
+const LSM_DISK_FULL_REPRESENTATIVE: [&str; 3] = [
+    "disk_full_mid_3",
+    "leader_disk_full_mid_3",
+    "disk_flaky_mid_3",
+];
+
+#[test]
+fn raftkv_disk_full_lsm_representative_is_linearizable() {
+    let cells = disk_full_cells();
+    let picked: Vec<Scenario> = LSM_DISK_FULL_REPRESENTATIVE
+        .iter()
+        .map(|name| {
+            cells
+                .iter()
+                .find(|s| s.name == *name)
+                .unwrap_or_else(|| panic!("disk-full LSM cell {name} not in the corpus"))
+                .clone()
+        })
+        .collect();
+    check_disk_full_corpus("lsm+disk-full", &picked, lsm_engine);
+}
+
+/// The **whole disk-full corpus over the LSM engine** — deep tier
+/// (`ANIMUS_RAFTKV_LSM=1`, depth `ANIMUS_DISK_FULL_SEEDS=K`).
+#[test]
+fn raftkv_disk_full_lsm_full_corpus_is_linearizable() {
+    if !lsm_full_enabled() {
+        eprintln!(
+            "raftkv_disk_full_lsm_full_corpus_is_linearizable: skipped (set ANIMUS_RAFTKV_LSM=1)"
+        );
+        return;
+    }
+    check_disk_full_corpus("lsm+disk-full", &disk_full_corpus(), lsm_engine);
 }
 
 /// Structural guard: the disk-full corpus keeps covering all three ENOSPC
@@ -2928,5 +3084,650 @@ fn raftkv_disk_full_run_is_deterministic() {
         serde_json::to_string(&b.history).unwrap(),
         "history not reproducible for seed {}",
         s.seed
+    );
+}
+
+/// Issue #1219 pin: a **follower** whose disk is full acks nothing it could
+/// not persist. Its WAL goes suspect on the first failed append/`fsync`, and
+/// every `AppendEntriesResp` for an entry past that point is gated behind the
+/// round that never completes (`persist_round`'s durable-before-send rule), so
+/// the leader's `match_index` for it freezes while the two healthy replicas
+/// keep committing a probe writer's acks. After space returns it catches up
+/// with no restart.
+#[test]
+fn raftkv_disk_full_follower_acks_nothing_it_could_not_persist() {
+    for k in 0..disk_full_seeds_per_cell() as u64 {
+        let seed = 0xD15C_F011_u64 + k;
+        let mut group = Group::start(seed, 3, mem_engine);
+        group.sim.run_for(SETTLE);
+        let (probe, probe_stop) = spawn_window_probe(&group);
+        group.sim.run_for(Duration::from_millis(1500));
+        let (li, leader) = leader_slot(&group.nodes)
+            .unwrap_or_else(|| panic!("seed={seed}: no leader before the fault"));
+        let ids: Vec<u64> = GROUP_IDS[..3].to_vec();
+        let followers: Vec<usize> = (0..3).filter(|&i| i != li).collect();
+        let (full, healthy) = (followers[0], followers[1]);
+        let mut cfg = DiskConfig::default();
+        cfg.set_enospc_prob(1.0);
+        group.sim.set_disk_config_for(nid(ids[full]), cfg);
+        // Let every ack already in flight land, then freeze the reference.
+        group.sim.run_for(Duration::from_millis(500));
+        let frozen = leader.peer_match(&nid(ids[full]));
+        let healthy_before = leader.peer_match(&nid(ids[healthy]));
+        group.sim.run_for(DISK_FULL_WINDOW);
+        let (full_node, leader_after) = {
+            let g = group.nodes.lock().unwrap();
+            (Arc::clone(&g[full]), leader_slot_in(&g))
+        };
+        assert!(
+            full_node.is_storage_full(),
+            "seed={seed}: the follower never entered StorageFull (vacuous)"
+        );
+        let leader_after = leader_after.expect("a leader through a follower-only disk-full window");
+        assert_eq!(
+            leader_after.peer_match(&nid(ids[full])),
+            frozen,
+            "seed={seed}: the leader's match_index for a storage-full follower advanced -- it acked \
+             an append it could not persist"
+        );
+        assert!(
+            leader_after.peer_match(&nid(ids[healthy])) > healthy_before,
+            "seed={seed}: the healthy quorum made no progress during the window (vacuous)"
+        );
+        assert!(
+            probe.lock().unwrap().len() > 3,
+            "seed={seed}: the probe writer was not acked through a healthy quorum"
+        );
+        // Space returns: the follower recovers its WAL in place and catches up.
+        group
+            .sim
+            .set_disk_config_for(nid(ids[full]), DiskConfig::default());
+        group.sim.run_for(Duration::from_secs(10));
+        probe_stop.store(true, Ordering::SeqCst);
+        group.sim.run_for(Duration::from_secs(5));
+        assert!(
+            !full_node.is_storage_full(),
+            "seed={seed}: the follower stayed StorageFull after space returned"
+        );
+        let (_, leader_final) = leader_slot(&group.nodes).expect("leader after heal");
+        assert!(
+            leader_final.peer_match(&nid(ids[full])) > frozen,
+            "seed={seed}: the recovered follower never caught up"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Every replica full (issue #1228, chaos findings F-1 / F-3)
+// ---------------------------------------------------------------------------
+//
+// `Nemesis::DiskFull` fills every replica's disk at once. Beyond the shared
+// disk-full corpus these cells pin the *availability* contract of an
+// all-replica-full group: the established leader keeps leading (no lapse, no
+// term change), serves linearizable and eventually-consistent reads of
+// already-written data, and is `StorageFull` (so `animusd` refuses every write
+// with a named 503 instead of letting it time out). A leader that dies while
+// everyone is full is replaced by a full node (the one case where a full node
+// may campaign, see `RaftCore::set_storage_full`) and the group still serves
+// reads. Sampled inside the window by a task on its own node id.
+
+/// One in-window observation of an all-full group.
+#[derive(Clone, Debug)]
+struct AllFullSample {
+    at: u64,
+    /// Group slots that believed they led.
+    leaders: Vec<usize>,
+    /// Terms of the leaders.
+    leader_terms: Vec<u64>,
+    /// Whether every leader reported `is_storage_full()`.
+    leaders_full: bool,
+    /// The leader's linearizable read of the sentinel key (`None` = not served).
+    linearizable: Option<Option<Vec<u8>>>,
+    /// Per live node: the eventual read (`None` = gate closed or not served).
+    eventual: Vec<Option<Option<Vec<u8>>>>,
+    /// The (first) leader's view of each peer slot: the last reported
+    /// `check_pending` and the age in ms of its last ack.
+    acks: Vec<(usize, Option<bool>, Option<u64>)>,
+    /// Some replica had committed entries its engine had not applied yet.
+    engine_behind: bool,
+}
+
+/// Spawn the in-window sampler: every `period` it records an [`AllFullSample`]
+/// of `key` until `stop`. The linearizable read goes to whichever replica
+/// currently leads.
+fn spawn_all_full_sampler<S: StorageEngine + 'static>(
+    group: &Group<S>,
+    key: Vec<u8>,
+    period: Duration,
+    dead: Arc<AtomicUsize>,
+) -> (Arc<Mutex<Vec<AllFullSample>>>, Arc<AtomicBool>) {
+    let env = group.sim.env(nid(151));
+    let nodes = Arc::clone(&group.nodes);
+    let out: Arc<Mutex<Vec<AllFullSample>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&out);
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopped = Arc::clone(&stop);
+    env.clone().spawn_task(async move {
+        while !stopped.load(Ordering::SeqCst) {
+            env.sleep(period).await;
+            if stopped.load(Ordering::SeqCst) {
+                break;
+            }
+            let snapshot: Vec<Arc<Node<S>>> = nodes.lock().unwrap().clone();
+            let mut sample = AllFullSample {
+                at: env.now().0,
+                leaders: Vec::new(),
+                leader_terms: Vec::new(),
+                leaders_full: true,
+                linearizable: None,
+                eventual: Vec::new(),
+                acks: Vec::new(),
+                engine_behind: snapshot
+                    .iter()
+                    .any(|n| n.commit_index() > n.engine_applied_index()),
+            };
+            let dead_slot = dead.load(Ordering::SeqCst);
+            for (i, n) in snapshot.iter().enumerate() {
+                if i != dead_slot && n.is_leader() {
+                    sample.leaders.push(i);
+                    sample.leader_terms.push(n.term());
+                    sample.leaders_full &= n.is_storage_full();
+                }
+            }
+            if let Some(&li) = sample.leaders.first() {
+                for (j, id) in GROUP_IDS.iter().enumerate().take(snapshot.len()) {
+                    if j != li {
+                        let (flag, at) = snapshot[li].peer_health(&nid(*id));
+                        sample
+                            .acks
+                            .push((j, flag, at.map(|a| a.as_millis() as u64)));
+                    }
+                }
+                sample.linearizable = snapshot[li].linearizable_get_served(&key).await;
+            }
+            for (i, n) in snapshot.iter().enumerate() {
+                let r = if i != dead_slot && n.stale_read_ready() {
+                    n.stale_get_served(&key).await
+                } else {
+                    None
+                };
+                sample.eventual.push(r);
+            }
+            sink.lock().unwrap().push(sample);
+        }
+    });
+    (out, stop)
+}
+
+/// Write `key = value` through the current leader and wait for it to be
+/// linearizably visible.
+fn write_sentinel<S: StorageEngine + 'static>(group: &mut Group<S>, key: &[u8], value: &[u8]) {
+    let (_, leader) = leader_slot(&group.nodes).expect("a leader before the sentinel write");
+    assert!(matches!(
+        leader.put(key.to_vec(), value.to_vec()),
+        ProposeResult::Accepted { .. }
+    ));
+    group.sim.run_for(Duration::from_millis(600));
+}
+
+/// An all-full window long enough to span several `READ_TIMEOUT`s (5s), so a
+/// read that is not served shows up as a sample, not as a sampler still waiting.
+const ALL_FULL_WINDOW: Duration = Duration::from_secs(10);
+
+const ALL_FULL_KEY: &[u8] = b"__all_full_sentinel__";
+const ALL_FULL_VALUE: &[u8] = b"survives-the-outage";
+
+/// Which replicas' disks fill in an [`run_full_window`].
+#[derive(Clone, Copy, Debug)]
+enum FullSet {
+    /// Every replica.
+    All,
+    /// The leader plus this many followers (lowest slots first).
+    LeaderPlus(usize),
+}
+
+/// What an in-window run returns beyond the samples.
+struct FullWindow {
+    samples: Vec<AllFullSample>,
+    /// The leader's slot when the fault landed.
+    leader_slot: usize,
+    leader_term: u64,
+    /// Slots whose disk was filled.
+    full_slots: Vec<usize>,
+    /// Per live follower: whether the original leader's last view of it
+    /// (`peer_health`) was a fresh, `check_pending == true` ack at the end.
+    fresh_full_acks: Vec<(usize, bool, String)>,
+    /// Probe writes acked after the grace window (see [`spawn_window_probe`]).
+    acked_in_window: usize,
+    /// Every simulator trace event of the whole run (sends, deliveries,
+    /// timers): a livelock between a leader and a frozen-acking follower shows
+    /// up here as hundreds of thousands of events, never as a failed assertion.
+    trace_events: usize,
+    /// Some replica ended the window with committed entries its engine had not
+    /// applied (the apply task paused on ENOSPC with work in hand, the state
+    /// that closes both read gates unless they allow for it).
+    engine_behind: bool,
+}
+
+/// Run a full-disk window over `set` and return the in-window samples taken at
+/// least 1.5s after the fault. `crash_leader_after` kills the leader that far
+/// into the window (and does not restart it before the samples end).
+fn run_full_window<S: StorageEngine + 'static>(
+    seed: u64,
+    replicas: usize,
+    factory: EngineFactory<S>,
+    set: FullSet,
+) -> FullWindow {
+    let mut group = Group::start(seed, replicas, factory);
+    group.sim.run_for(SETTLE);
+    group.sim.run_for(Duration::from_millis(1200));
+    write_sentinel(&mut group, ALL_FULL_KEY, ALL_FULL_VALUE);
+    let (li, leader) = leader_slot(&group.nodes).expect("leader before the fault");
+    let term_before = leader.term();
+    let dead = Arc::new(AtomicUsize::new(usize::MAX));
+    let (samples, stop) = spawn_all_full_sampler(
+        &group,
+        ALL_FULL_KEY.to_vec(),
+        Duration::from_millis(250),
+        Arc::clone(&dead),
+    );
+    let (probe, probe_stop) = spawn_window_probe(&group);
+    let ids: Vec<u64> = GROUP_IDS[..replicas].to_vec();
+    let full_slots: Vec<usize> = match set {
+        FullSet::All => (0..replicas).collect(),
+        FullSet::LeaderPlus(n) => std::iter::once(li)
+            .chain((0..replicas).filter(|&i| i != li).take(n))
+            .collect(),
+    };
+    for &i in &full_slots {
+        let mut cfg = DiskConfig::default();
+        cfg.set_enospc_prob(1.0);
+        group.sim.set_disk_config_for(nid(ids[i]), cfg);
+        group.disk_full_nodes.insert(ids[i]);
+    }
+    let fault_at = group.sim.now().0;
+    // Offer a write so the replicas actually hit ENOSPC (as a client's would).
+    let _ = leader.put(b"__all_full_poke__".to_vec(), b"x".to_vec());
+    group.sim.run_for(ALL_FULL_WINDOW);
+    let fresh_full_acks: Vec<(usize, bool, String)> = {
+        let g = group.nodes.lock().unwrap();
+        // The node that led at fault time still leads (or, if leadership moved,
+        // it is a follower with no per-stint view): only meaningful when it does.
+        if g[li].is_leader() {
+            full_slots
+                .iter()
+                .filter(|&&i| i != li)
+                .map(|&i| {
+                    let (flag, at) = g[li].peer_health(&nid(ids[i]));
+                    let fresh = at.is_some_and(|a| a < Duration::from_millis(500));
+                    (
+                        i,
+                        flag == Some(true) && fresh,
+                        format!("flag={flag:?} age_ms={:?}", at.map(|a| a.as_millis())),
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        }
+    };
+    stop.store(true, Ordering::SeqCst);
+    probe_stop.store(true, Ordering::SeqCst);
+    group.sim.run_for(Duration::from_millis(300));
+    let grace = fault_at + Duration::from_millis(1500).as_nanos() as u64;
+    let taken: Vec<AllFullSample> = samples
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|s| s.at >= grace)
+        .cloned()
+        .collect();
+    let acked_in_window = probe.lock().unwrap().iter().filter(|t| **t > grace).count();
+    FullWindow {
+        samples: taken,
+        leader_slot: li,
+        leader_term: term_before,
+        full_slots,
+        fresh_full_acks,
+        acked_in_window,
+        trace_events: group.sim.trace().len(),
+        engine_behind: samples.lock().unwrap().iter().any(|s| s.engine_behind),
+    }
+}
+
+/// A healthy 10s window is a few thousand events; a zero-latency ack/resend
+/// loop between a leader and a follower that cannot persist (the first version
+/// of the frozen ack did exactly that: 1.4M events) is orders of magnitude over.
+const FULL_WINDOW_MAX_TRACE_EVENTS: usize = 40_000;
+
+#[test]
+fn raftkv_disk_full_all_replicas_keep_leadership_and_serve_reads() {
+    check_all_full_keeps_serving(mem_engine);
+}
+
+#[test]
+fn raftkv_disk_full_all_replicas_keep_leadership_and_serve_reads_lsm() {
+    // Over `LsmEngine` the apply task can be paused on ENOSPC with committed
+    // entries in hand when the disks fill (the shape chaos hit: commit 426,
+    // engine applied 424): both read gates must allow for it. Whether a seed
+    // lands there is timing, so sweep seeds and require the sweep to hit it.
+    check_all_full_keeps_serving_seeds(lsm_engine, 24, false);
+}
+
+fn check_all_full_keeps_serving<S: StorageEngine + 'static>(factory: EngineFactory<S>) {
+    check_all_full_keeps_serving_seeds(factory, 0, false);
+}
+
+/// `extra` additional seeds per replica count (a sweep for the timing-dependent
+/// state where the apply task is paused with committed work in hand);
+/// `need_behind` then requires the sweep to have actually produced that state.
+fn check_all_full_keeps_serving_seeds<S: StorageEngine + 'static>(
+    factory: EngineFactory<S>,
+    extra: u64,
+    need_behind: bool,
+) {
+    let mut behind_seen = 0usize;
+    for replicas in [3usize, 5] {
+        for k in 0..(disk_full_seeds_per_cell() as u64 + extra) {
+            let seed = 0xA11_F011_u64 + k + 1000 * replicas as u64;
+            let w = run_full_window(seed, replicas, factory, FullSet::All);
+            behind_seen += usize::from(w.engine_behind);
+            assert!(
+                w.samples.len() >= 4,
+                "seed={seed}: too few samples ({})",
+                w.samples.len()
+            );
+            for s in &w.samples {
+                assert_eq!(
+                    s.leaders,
+                    vec![w.leader_slot],
+                    "seed={seed} n={replicas}: leadership lapsed/moved while every replica was full: {s:?}"
+                );
+                assert_eq!(
+                    s.leader_terms,
+                    vec![w.leader_term],
+                    "seed={seed}: term moved: {s:?}"
+                );
+                assert!(s.leaders_full, "seed={seed}: leader not StorageFull: {s:?}");
+                assert_eq!(
+                    s.linearizable,
+                    Some(Some(ALL_FULL_VALUE.to_vec())),
+                    "seed={seed}: linearizable read not served: {s:?}"
+                );
+                for (i, e) in s.eventual.iter().enumerate() {
+                    assert_eq!(
+                        e,
+                        &Some(Some(ALL_FULL_VALUE.to_vec())),
+                        "seed={seed}: eventual read on node {i} not served: {s:?}"
+                    );
+                }
+            }
+            assert!(
+                w.trace_events < FULL_WINDOW_MAX_TRACE_EVENTS,
+                "seed={seed}: {} simulator events in one all-full window: the leader and a full \
+                 follower are spinning (an ack that triggers an immediate resend)",
+                w.trace_events
+            );
+            for sm in &w.samples {
+                for (j, flag, age) in &sm.acks {
+                    assert!(
+                        *flag == Some(true) && age.is_some_and(|a| a < 400),
+                        "seed={seed}: the leader's contact with full follower {j} went stale \
+                         (flag={flag:?} age_ms={age:?}): {sm:?}"
+                    );
+                }
+            }
+            // The followers kept acking (frozen, and saying they are full): the
+            // leader's contact with them is fresh at the end of the window.
+            assert!(
+                !w.fresh_full_acks.is_empty() && w.fresh_full_acks.iter().all(|(_, ok, _)| *ok),
+                "seed={seed}: a full follower stopped acking its leader: {:?}",
+                w.fresh_full_acks
+            );
+        }
+    }
+    if need_behind {
+        assert!(
+            behind_seen > 0,
+            "the seed sweep never produced a replica with committed-but-unapplied entries \
+             (vacuous: the paused-apply read gates were not exercised)"
+        );
+    }
+}
+
+/// The healthy-quorum rule of the storage-full step-down (issue #1228): when
+/// the leader's disk is full but too few other voters are healthy to elect or
+/// commit, the leader **stays** (a handoff would only leave the group
+/// leaderless: RF3 leader + one full follower; RF5 leader + two full
+/// followers), still serving reads. When enough remain, it **hands over** and
+/// the group keeps acking writes (RF5, leader + one full follower).
+#[test]
+fn raftkv_disk_full_step_down_requires_a_healthy_quorum() {
+    for k in 0..disk_full_seeds_per_cell() as u64 {
+        for (replicas, extra, stays) in [(3usize, 1usize, true), (5, 2, true), (5, 1, false)] {
+            let seed = 0xA11_9A0_u64 + k + 16 * (replicas + extra) as u64;
+            let w = run_full_window(seed, replicas, mem_engine, FullSet::LeaderPlus(extra));
+            assert!(w.samples.len() >= 4, "seed={seed}: too few samples");
+            let moved = w.samples.iter().any(|s| s.leaders != vec![w.leader_slot]);
+            if stays {
+                for s in &w.samples {
+                    assert_eq!(
+                        s.leaders,
+                        vec![w.leader_slot],
+                        "seed={seed} n={replicas}+{extra}: the full leader stepped down with no healthy                          quorum to take over (leaderless group): {s:?}"
+                    );
+                    assert_eq!(
+                        s.linearizable,
+                        Some(Some(ALL_FULL_VALUE.to_vec())),
+                        "seed={seed}: the full leader did not serve a linearizable read: {s:?}"
+                    );
+                }
+            } else {
+                assert!(
+                    moved,
+                    "seed={seed}: the full leader never handed leadership over"
+                );
+                let last = w.samples.last().unwrap();
+                assert_eq!(last.leaders.len(), 1, "seed={seed}: {last:?}");
+                assert!(
+                    !w.full_slots.contains(&last.leaders[0]),
+                    "seed={seed}: leadership went to a full node: {last:?}"
+                );
+                assert!(
+                    w.acked_in_window > 0,
+                    "seed={seed}: no write was acked through the healthy quorum"
+                );
+            }
+        }
+    }
+}
+
+/// A leader that **dies while every replica is full**. Decision (ADR 0074's
+/// 2026-10-06 amendment): the survivors do **not** elect a replacement -- a full
+/// node cannot persist the term bump and self-vote an election needs, and a
+/// vote it could not make durable is a vote it could double-cast after a restart
+/// (election safety), so a full node never campaigns (`RaftCore::set_storage_full`)
+/// even when no healthy candidate exists. What the survivors do keep doing is
+/// serving the eventual reads they hold (the freshness gate accepts a
+/// storage-full replica that has had a leader), and nothing is lost or
+/// duplicated: when space returns a leader is elected and writes resume.
+#[test]
+fn raftkv_disk_full_all_replicas_leader_crash_keeps_eventual_reads_and_recovers() {
+    for k in 0..disk_full_seeds_per_cell() as u64 {
+        let seed = 0xA11_C4A5_u64 + k;
+        let mut group = Group::start(seed, 3, mem_engine);
+        group.sim.run_for(SETTLE);
+        group.sim.run_for(Duration::from_millis(1200));
+        write_sentinel(&mut group, ALL_FULL_KEY, ALL_FULL_VALUE);
+        let (li, leader) = leader_slot(&group.nodes).expect("leader before the fault");
+        let dead = Arc::new(AtomicUsize::new(usize::MAX));
+        let (samples, stop) = spawn_all_full_sampler(
+            &group,
+            ALL_FULL_KEY.to_vec(),
+            Duration::from_millis(250),
+            Arc::clone(&dead),
+        );
+        group.apply(Nemesis::DiskFull);
+        let _ = leader.put(b"__all_full_poke__".to_vec(), b"x".to_vec());
+        group.sim.run_for(Duration::from_millis(1500));
+        // The leader dies; the survivors are full.
+        dead.store(li, Ordering::SeqCst);
+        group.sim.crash(nid(GROUP_IDS[li]));
+        group.crashed.insert(GROUP_IDS[li]);
+        let crashed_at = group.sim.now().0;
+        group.sim.run_for(ALL_FULL_WINDOW);
+        stop.store(true, Ordering::SeqCst);
+        group.sim.run_for(Duration::from_millis(300));
+        let during: Vec<AllFullSample> = samples
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.at > crashed_at + Duration::from_secs(2).as_nanos() as u64)
+            .cloned()
+            .collect();
+        assert!(during.len() >= 4, "seed={seed}: too few samples");
+        for s in &during {
+            assert!(
+                s.leaders.is_empty(),
+                "seed={seed}: a full survivor won an election (it cannot persist its term/vote): {s:?}"
+            );
+            for (i, e) in s.eventual.iter().enumerate() {
+                if i == li {
+                    continue; // the crashed node
+                }
+                assert_eq!(
+                    e,
+                    &Some(Some(ALL_FULL_VALUE.to_vec())),
+                    "seed={seed}: leaderless eventual read on survivor {i} not served: {s:?}"
+                );
+            }
+        }
+        // Space returns and the dead node restarts: a leader is elected and a
+        // write goes through; the sentinel is intact.
+        group.heal_all();
+        group.sim.run_for(Duration::from_secs(8));
+        let (_, new_leader) = leader_slot(&group.nodes)
+            .unwrap_or_else(|| panic!("seed={seed}: no leader after space returned"));
+        assert!(matches!(
+            new_leader.put(b"__after_heal__".to_vec(), b"ok".to_vec()),
+            ProposeResult::Accepted { .. }
+        ));
+        group.sim.run_for(Duration::from_secs(2));
+        let nodes = Arc::clone(&group.nodes);
+        let out: Arc<Mutex<Option<Option<Vec<u8>>>>> = Arc::new(Mutex::new(None));
+        let sink = Arc::clone(&out);
+        group.sim.env(nid(152)).spawn_task(async move {
+            let n = leader_slot(&nodes).map(|(_, n)| n);
+            if let Some(n) = n {
+                *sink.lock().unwrap() = Some(n.linearizable_get(ALL_FULL_KEY).await);
+            }
+        });
+        group.sim.run_for(Duration::from_secs(2));
+        assert_eq!(
+            out.lock().unwrap().clone(),
+            Some(Some(ALL_FULL_VALUE.to_vec())),
+            "seed={seed}: sentinel lost across the all-full leader crash"
+        );
+    }
+}
+
+/// Issue #1228, the paused-apply read path. Arm 100% ENOSPC on every replica at
+/// the instant the leader's engine is *behind* its commit index (a write has
+/// committed -- it is in the WAL on a majority -- but the apply task has not
+/// applied it, and now cannot: `LsmEngine` hits ENOSPC and the apply pauses).
+/// A full leader's ReadIndex must then be its first-term entry, not the commit
+/// index its engine will never reach: with the commit index every linearizable
+/// read would block for the whole window. The read is served (the value is
+/// the old one or the new one -- the write was never acknowledged, since an ack
+/// follows the apply -- never anything else), and after space returns the
+/// committed write is visible.
+#[test]
+fn raftkv_disk_full_paused_apply_leader_still_serves_linearizable_reads() {
+    const NEW_VALUE: &[u8] = b"committed-but-unapplied";
+    let mut behind_seen = 0usize;
+    for seed in 0..12u64 {
+        let seed = 7_100 + seed;
+        let mut group = Group::start(seed, 3, lsm_engine);
+        group.sim.run_for(SETTLE);
+        group.sim.run_for(Duration::from_millis(1200));
+        write_sentinel(&mut group, ALL_FULL_KEY, ALL_FULL_VALUE);
+        let (li, leader) = leader_slot(&group.nodes).expect("leader before the fault");
+        // A slow fsync on the leader alone: the two healthy followers persist
+        // and ack first, so the write commits while the leader's own durable
+        // index (and so its apply) is still behind it.
+        let mut slow = DiskConfig::default();
+        slow.set_sync_delay(Duration::from_millis(80));
+        group.sim.set_disk_config_for(nid(GROUP_IDS[li]), slow);
+        assert!(matches!(
+            leader.put(ALL_FULL_KEY.to_vec(), NEW_VALUE.to_vec()),
+            ProposeResult::Accepted { .. }
+        ));
+        // Step finely until the leader has committed the write but not applied it.
+        let mut behind = false;
+        for _ in 0..300 {
+            group.sim.run_for(Duration::from_millis(1));
+            if leader.commit_index() > leader.engine_applied_index() {
+                behind = true;
+                break;
+            }
+        }
+        if !behind {
+            continue;
+        }
+        let ids: Vec<u64> = GROUP_IDS[..3].to_vec();
+        for &id in &ids {
+            let mut cfg = DiskConfig::default();
+            cfg.set_enospc_prob(1.0);
+            group.sim.set_disk_config_for(nid(id), cfg);
+            group.disk_full_nodes.insert(id);
+        }
+        group.sim.run_for(Duration::from_secs(3));
+        let (now_li, now_leader) = leader_slot(&group.nodes)
+            .unwrap_or_else(|| panic!("seed={seed}: the group lost its leader"));
+        assert_eq!(
+            now_li, li,
+            "seed={seed}: leadership moved while every replica was full"
+        );
+        if now_leader.commit_index() <= now_leader.engine_applied_index() {
+            // The apply caught up before the disk filled: not the state under test.
+            continue;
+        }
+        behind_seen += 1;
+        let out: Arc<Mutex<Option<Option<Vec<u8>>>>> = Arc::new(Mutex::new(None));
+        let sink = Arc::clone(&out);
+        let nodes = Arc::clone(&group.nodes);
+        group.sim.env(nid(152)).spawn_task(async move {
+            if let Some((_, n)) = leader_slot(&nodes) {
+                *sink.lock().unwrap() = n.linearizable_get_served(ALL_FULL_KEY).await;
+            }
+        });
+        group.sim.run_for(Duration::from_secs(8));
+        let got = out.lock().unwrap().clone();
+        assert!(
+            got == Some(Some(ALL_FULL_VALUE.to_vec())) || got == Some(Some(NEW_VALUE.to_vec())),
+            "seed={seed}: a full leader with its apply paused short of the commit index must \
+             still serve a linearizable read (old or new value), got {got:?}"
+        );
+        group.heal_all();
+        group.sim.run_for(Duration::from_secs(8));
+        let nodes = Arc::clone(&group.nodes);
+        let after: Arc<Mutex<Option<Option<Vec<u8>>>>> = Arc::new(Mutex::new(None));
+        let sink = Arc::clone(&after);
+        group.sim.env(nid(152)).spawn_task(async move {
+            if let Some((_, n)) = leader_slot(&nodes) {
+                *sink.lock().unwrap() = Some(n.linearizable_get(ALL_FULL_KEY).await);
+            }
+        });
+        group.sim.run_for(Duration::from_secs(3));
+        assert_eq!(
+            after.lock().unwrap().clone(),
+            Some(Some(NEW_VALUE.to_vec())),
+            "seed={seed}: the committed write was lost across the all-full window"
+        );
+    }
+    assert!(
+        behind_seen > 0,
+        "no seed produced a leader with committed-but-unapplied entries when the disk filled \
+         (vacuous: the paused-apply ReadIndex was not exercised)"
     );
 }

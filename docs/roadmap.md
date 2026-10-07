@@ -1808,9 +1808,9 @@ outstanding on the wire surface at present.
     **Disk-full landed (issue #1185, 2026-10-05):** ENOSPC marks the WAL suspect,
     writes are refused with a named 503 `StorageFull`, and the WAL is rewritten
     from the in-memory log onto free space without a restart (sim corpus
-    `ANIMUS_DISK_FULL_SEEDS`; `docs/resource-bounds.md` section 3). **Still
-    open:** LSM-engine ENOSPC, leader step-down, exporting `spawned_task_panics`,
-    and a `ProdEnv` tmpfs test. Each
+    `ANIMUS_DISK_FULL_SEEDS`; `docs/resource-bounds.md` section 3). LSM-engine ENOSPC (#1218) and leader step-down (#1219)
+    have since landed. **Still open:** exporting `spawned_task_panics` and a
+    `ProdEnv` tmpfs test. Each
     bound gets a sim test with fault injection where possible and a
     `ProdEnv` test where not.
   - **(e) Operations runbook (independent; M).** `docs/runbook/`: node

@@ -3274,6 +3274,30 @@ The RaftKV codec (wire/image/WAL), segment codec, backup chunk/manifest codecs, 
   calls with `RaftNode::features()`. A hosted group keeps the handle it started with.
 
 
+## StorageFull with every replica full (issue #1228)
+
+A suspect-WAL node ships frozen acks (`is_frozen_ack`: success acks at or below
+the frozen durable index, heartbeats) next to the `ships_before_durable`
+allowlist, so followers stay in contact and the leader keeps its seat. Reads on
+a full leader: `read_serve_ts` serves linearizable reads at the engine's highest
+version once the ceiling lapses (no unproposable ceilings), and `read_barrier`
+targets the leader's first-term entry instead of `commit_index` (the engine may
+be paused short of it). `stale_read_ready` for a full replica needs only
+`had_leader_contact` and no half-installed snapshot. Leader death with every
+replica full is not repaired until space returns (ADR 0074 amendment). G-01
+preferred-leader transfer goes through `transfer_leadership`, so it inherits the
+refuse-full-target and healthy-quorum guards, and the storage-full step-down
+wins over preference. `peer_health` is a diagnostic on the node's own clock
+(the sim has per-node clock skew; never compare it with another node's `now`).
+Tests: `animus-control` `storage_full_step_down`, `animus-test`
+`raftkv_disk_full_all_replicas_*`, `quiescence` (ix), `animusd`
+`sim_cluster_dynamo_disk_full`, `chaos_disk_full` phase 2. The `first`-based
+ReadIndex is guarded by `raftkv_disk_full_paused_apply_leader_still_serves_
+linearizable_reads` (animus-test): a slow fsync on the leader alone makes a
+write commit on the two healthy followers while the leader's durable index and
+apply lag, then 100% ENOSPC is armed on all three at that instant; replacing
+the `first` target with `commit_index` makes the read return None.
+
 ## StorageFull: per-tablet WAL recovery (R-01 (d), issue #1185)
 
 `persist_wal` no longer `assert!`s on an ENOSPC append/sync (per-group file or
@@ -3286,6 +3310,31 @@ suspect group refuses writes before proposing (`RaftKvNode::is_storage_full`,
 reads of applied state, and `apply_and_compact` skips compaction while suspect
 (an ENOSPC compaction rewrite also marks suspect; the staged-rewrite path
 tolerates ENOSPC). The `persist` field on `RaftKvNode` exposes the progress
+handle. A non-ENOSPC failure stays `assert!(halted)`. Engine-side ENOSPC (issue #1218):
+`apply_loop` wraps its engine in `apply_stall::StallingEngine`, which retries
+any `StorageError::StorageFull` call (after `Env::sleep`) instead of panicking
+at the apply task's many `.expect`s; `RaftKvNode::is_storage_full()` is
+`persist.is_suspect() || apply_stalled`. Soundness rests on the engine contract
+that a `StorageFull` call changed nothing, and on the task being blocked inside
+that call (order preserved). On `halted` a paused call sets `apply_stopped` and
+parks (never panics a caller's `.expect`). Only the apply task's handle is
+wrapped; other engine users still propagate. See `docs/resource-bounds.md`
+section 3.
+
+**Leader step-down (issue #1219).** The consensus loop computes
+`storage_full = persist.is_suspect() || apply_stalled` every pass, in the same
+lock acquisition as `set_state_machine_behind`: it calls
+`RaftCore::set_storage_full` (no campaigning, `TimeoutNow` declined), vetoes
+quiescence while full, and on a **leader** arms `RaftCore::storage_full_step_down`
+(rotating `stepdown_last`, cooldown `2 * election_timeout`, then
+`propose_signal.notify()` so `TimeoutNow` ships immediately). A refused write
+(`record_storage_full_refusal`) and the apply task's ENOSPC stall start
+(`StallingEngine`'s `wake`) raise `wake_signal`, so a parked/quiesced leader
+re-evaluates; arming un-quiesces. A full follower never acks (the failed round
+gates every ack; `persist_round` unit test + corpus pin). Do not make the step-down
+conditional on follower health knowledge: there is no wire signal for it, an
+aborted transfer to a full target is the (cheap) negative answer.
+
 handle. A non-ENOSPC failure stays `assert!(halted)`. Gap: engine-side ENOSPC
 (LSM flush/compaction, apply-time `merge_batch`) is NOT handled; the corpus
 runs `MemoryEngine` only. See `docs/resource-bounds.md` section 3.

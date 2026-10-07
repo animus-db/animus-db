@@ -57,6 +57,7 @@ mod snapshot_compaction_race;
 mod snapshot_heartbeat_no_disruption_during_backoff;
 mod staggered_genesis_boot;
 mod stale_snapshot_no_rewind;
+mod storage_full_step_down;
 mod tablet_split;
 mod transfer_third_voter_wins;
 mod version_apply_corpus;

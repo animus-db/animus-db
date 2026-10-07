@@ -122,13 +122,129 @@ the node logs.
 | `delay` | 100-600 ms added latency on every link | spurious elections and leader flapping under a slow network do not lose or reorder acked writes | asymmetric slowness; bandwidth limits |
 | `mixed` | random mix of all of the above | everything above in combination, for `ANIMUS_CHAOS_SECS` (use for the long run) | |
 
+### Disk full on real filesystems
+
+`chaos_disk_full` (`cargo test -p animusd --features chaos --test chaos chaos_disk_full -- --nocapture`;
+CI job `chaos-disk-full`, also part of the nightly `chaos_` run) is a different
+shape from the schedule-driven scenarios above: three real nodes, each with its
+data dir on its **own 64 MiB tmpfs** (`ANIMUS_CHAOS_DISK_MB`), a continuous
+recorded workload, and a ballast file that fills a mount to ENOSPC.
+
+1. **One node full.** Fill node 0. Asserts `storage_full` shows on its
+   `/admin/health`, writes keep being acknowledged through nodes 1 and 2 across
+   several keys (a full tablet leader hands leadership over, #1219), a read
+   through the full node is served; then the ballast is deleted and the node
+   must report `storage_full: false` and accept a write with no restart.
+2. **Every node full.** Fill all three. Loops until every node has refused a
+   write, then asserts a named 503 `StorageFull` on every node (promptly,
+   under 30 s), `overload_storage_full` moved, and eventual and consistent
+   reads of an already-written key are served on every node (4 of 4 each).
+   `ANIMUS_CHAOS_KEEP=1` dumps each node's `raftkv-n*.json` and
+   `metrics-n*.json` at the end of this phase for diagnosis.
+3. **Recovery.** Delete every ballast. Asserts `storage_full` clears on every
+   node, a write is acknowledged through each node, and every process kept its
+   pid (no restart). Then the usual final reads and oracles, a `panicked at`
+   scan of the node logs and the non-vacuity floor.
+
+It **skips with a message** where the process cannot mount (needs root or
+passwordless `sudo -n mount`); `ANIMUS_CHAOS_REQUIRE_MOUNT=1` (set in CI) turns
+the skip into a failure. Knobs: `ANIMUS_CHAOS_DISK_MB`, `ANIMUS_CHAOS_DISK_TXN=0` (drop the 2PC ops, on by default).
+
+What tmpfs does not prove: tmpfs reports ENOSPC at `write`/`pwrite`; a
+delayed-allocation filesystem (ext4/xfs) can report it at `fsync` or on a page
+writeback, and a copy-on-write one can fail on overwrite. The mount is a stand-in
+for the kernel's ENOSPC, not for every filesystem's timing of it.
+
+**Findings (first runs, seed 283777889631356264, 2026-10-05):**
+
+- **F-1 (resolved, #1228): reads are not reliably served while every node's disk is full.** An
+  eventually-consistent `GetItem` of an already-written key timed out on every
+  node in two of three runs (0 of 12 served), and was served in the third. A full
+  follower acks nothing, not even a bare heartbeat (`docs/resource-bounds.md`
+  section 3, "Follower side"), so a full leader loses quorum contact and neither
+  the ReadIndex nor the freshness-gated replica read can serve. The documented
+  "reads continue" holds in the one-full-node window only.
+- **F-2 (resolved): with the multi-key transaction workload on, a disk-full
+  window left a 2PC intent that was never resolved.** After space returned, a
+  final consistent read of one key timed out indefinitely and the durability and
+  txn-atomicity oracles fired (2 of 2 runs with 2PC ops on; 0 of 2 without). The
+  node log showed recovery creating an orphan-abort tombstone for a txn whose
+  anchor stage never landed, a later `TxnCommit` losing to that abort, and
+  `TxnResolve's carried outcome does not match the anchor's own decided record
+  - skipping resolve`. **Root cause: not disk-full at all, and not introduced by
+  the disk-full commits.** The provisioned table's min-tablet split picked the
+  byte-weighted median of the live rows, i.e. an item's own key, and only a
+  *streamed* table's split key was rounded to a token boundary. With one item per
+  partition key that item is the first row of its token, and a txn record (key
+  `token || ...`, derived from the anchor's token) sorts *below* every item of
+  that token, so the split put the anchor's item on the right child and its
+  record's key range on the left one. The anchor stage applied on the right
+  child, every `TxnCommit` and recovery was routed (by record key) to the left
+  child where no record existed. The 2PC workload simply made the split key land
+  on a txn-touched token. Fix: `decide::align_split_key` rounds every table's
+  split key to its token boundary (down, else up). Regression:
+  `sim_cluster_auto_split::h_a_split_never_separates_an_item_from_its_txn_record`
+  (red before the fix with `anchor commit failed ... CP group leader moved after
+  decide`), and `chaos_disk_full` now runs the 2PC ops by default. The same
+  mechanism is what failed `chaos-smoke` on this PR's head (`lost acknowledged
+  append` plus `txn-atomicity` half-applied, on the one partition key sitting on
+  a split boundary) and is the likely actual cause of "Finding 1" below, whose
+  tombstone-GC attribution was only "probable". One residual: a tablet whose
+  range holds a single token still splits by sort key (the raw key is kept), and
+  a transaction anchored on that token can straddle the cut.
+  **Three further, independent root causes** turned up while driving the
+  remaining failures to zero, all pre-existing and all fixed here:
+  (2) *stale grouping across a split*: the coordinator groups a txn's keys by
+  tablet from one metadata snapshot, but a stage is routed by the group's first
+  key against the live map; a split in between let a two-key group stage whole
+  on one child, so the other key's intent and committed value landed in a
+  tablet that does not own it. `txn_stage_local` now refuses (before proposing)
+  any group with a key outside the leader's range, with the allowlisted
+  safe-to-retry-fresh refusal (`sim_cluster_auto_split` scenario (i), red
+  before). (3) *`TxnId` collision across groups led by one node*: a `TxnId` was
+  `(group's own Hlc ts, node)`, so two transactions anchored on two tablets
+  led by the same node could mint the identical id; one's participant resolve
+  then committed the other's freshly staged intent early and lost its other
+  half. A non-primary group now qualifies the node with its stream
+  (`n0#100`). Regression:
+  `animus-cp-data` `txn_id_across_groups::two_groups_led_by_one_node_never_mint_the_same_txn_id`
+  (red before).
+  (4) *a txn decision ordered after the fork entry was applied to the frozen
+  parent*: `TxnCommit`/`TxnAbort` (and the orphan-abort tombstone) were the one
+  mutating apply arm without the seal check. The children of an in-place fork
+  are cloned from the parent's **current** engine by the host reconciler,
+  asynchronously and per replica, so a replica that cloned after the decision
+  applied held the record `Committed` while one that cloned before held it
+  `Pending` (seen live: the same tablet-3 resolve saw `cur=Pending` on two
+  replicas and `cur=Committed` on the third) -- replica-divergent children and
+  an acked commit whose participant intents never resolved, after which the key
+  reverted to its prior value (every later append to it lost; the earlier
+  unexplained "key 22 loses all appends" runs). The seal now makes a decision
+  on a sealed record key a deterministic no-op (apply stays a pure function of
+  the entry and state, ADR 0073 "apply never branches on a gate"), and the
+  coordinator, seeing the record still `Pending` on a frozen group after its own
+  decide, re-routes the same decision to the record's new owner
+  (`txn_decide_anchor`). Regression:
+  `split_tablet::a_txn_decision_ordered_after_the_fork_is_a_sealed_no_op`
+  (red before: the frozen parent's record flipped to `Committed`).
+- **F-3 (resolved, #1228): with every disk full, "some probe saw the 503" is a race, so it is
+  measured, not asserted.** All-full means every follower acks nothing and
+  each group loses its leader within about a second (F-1), after which a write
+  times out instead of returning a 503 (observed with and without the 2PC
+  clients, ~1 run in 3). The refusal path stays asserted without the race: the
+  single-full-node phase requires the 503 strictly and `overload_storage_full`
+  must increment on some node. Fixing F-1 itself (a full node must keep acking
+  heartbeats so leaders survive) was done in #1228, and the refusal and the reads
+  are asserted in phase 2 again (see `docs/resource-bounds.md`, "Every replica
+  full"). Verified 6 of 6 `chaos_disk_full` and 3 of 3 `chaos_smoke` runs.
+
 ### Faults not implemented, and why
 
 | Fault | Status |
 |---|---|
 | **Clock skew** | Not in the bare harness. A real skew needs `libfaketime` (not assumed present) or Chaos Mesh `TimeChaos`; `deploy/chaos/time-skew.yaml` is the Kubernetes design. The node uses monotonic time for every deadline (ADR 0003), so the interesting surface is `env.wall_now()` (DynamoDB TTL, HLC wall component), not election timing. |
 | **Slow disk** | Not in the bare harness: needs a FUSE/`dm-delay`/cgroup IO throttle (root). `deploy/chaos/io-latency.yaml` is the Kubernetes design. |
-| **Disk full** | **Pending, deliberately not added.** Behaviour on a real node is undefined today (issue #1185; ADR 0074 section 2 / criterion D-7 define the contract it must meet). A scenario that can only fail is not a chaos test. `deploy/chaos/io-disk-full.yaml` exists only as a "DO NOT RUN" draft. |
+| **Disk full** | **Implemented as `chaos_disk_full`** (issue #1221), see "Disk full on real filesystems" below. The Kubernetes draft `deploy/chaos/io-disk-full.yaml` is still a "DO NOT RUN" design. |
 | **Packet loss / reordering** | Loopback TCP cannot lose packets; `deploy/chaos/network-loss.yaml` is the Kubernetes design. |
 | **Power loss (unsynced writes)** | `kill -9` does not discard the page cache. Needs a VM-level power cut or `dm-flakey`. |
 
@@ -136,7 +252,7 @@ the node logs.
 
 | ID | Status | Why |
 |---|---|---|
-| B-1 | **Not met** | Implemented against real processes: process kill, network partition, delay, SIGSTOP stall. Clock skew, slow disk and disk full (the other three named by the criterion) are not: see the table above. |
+| B-1 | **Not met** | Implemented against real processes: process kill, network partition, delay, SIGSTOP stall, disk full (real tmpfs, needs `CAP_SYS_ADMIN`). Clock skew and slow disk (the other two named by the criterion) are not: see the table above. |
 | B-2 | **Not met** | Every scenario records a history and runs the oracles, but see the findings below: the criterion says "passes". |
 | B-3 | Not met | Policy in ADR 0074 section 1. Finding 1 is not seed-reproducible, but its engine-level mechanism reproduces deterministically (below); converting that into a regression cell is the fix PR's job. |
 | B-4 | Met | `.github/workflows/chaos.yml` (PR smoke + nightly). |
@@ -146,7 +262,9 @@ the node logs.
 Reported, not fixed: the harness PR does not change product code.
 
 **Finding 1: acknowledged writes lost on keys touched by an aborted cross-tablet transaction
-(probable root cause identified, not yet confirmed end to end).** Seen in 2 of ~25 `smoke`
+(probable root cause identified, not yet confirmed end to end; the 2026-10-05 F-2 root cause above, a
+split key inside a token, produces this same signature and is the more likely culprit for runs after
+the prior-value fix).** Seen in 2 of ~25 `smoke`
 runs (seeds 2799062427773259430 at 45 s, and 308 at 90 s; ~1 in 12 for a given window, not
 seed-reproducible). Symptom: one client's keys (those it transacts over) read as empty
 mid-run after a `TransactionCanceledException`, then restart their list; the oracle reports

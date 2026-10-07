@@ -911,7 +911,7 @@ pub(super) mod fuzz_shims {
 }
 
 fn io(e: std::io::Error) -> StorageError {
-    StorageError::Backend(e.to_string())
+    StorageError::from_io(&e)
 }
 
 #[cfg(test)]

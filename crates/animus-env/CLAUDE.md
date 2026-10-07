@@ -579,6 +579,14 @@ the production implementation; the deterministic implementation lives in
   `std::panic::resume_unwind`ing the payload, so the default panic hook's
   own stderr print/backtrace and any real `JoinHandle` a caller does keep
   are completely unaffected — this only adds an observation point.
+  **Exported (issue #1220):** a panic also bumps `Metric::SpawnedTaskPanics`
+  (any task). A **consensus-loop** task is spawned with `Spawner::spawn_critical`
+  / `EnvExt::spawn_critical_task` (default: plain `spawn`; `ProdEnv` and
+  `EncryptedEnv` override it, and any new `Spawner` wrapper must forward it) and
+  additionally bumps `Metric::ConsensusTaskPanics` and `ProdEnv::consensus_task_panics()`.
+  Today's critical tasks: the control `drive` and `meta_apply_loop`, the CP-data
+  per-group `drive` and `apply_loop`; add a new never-restarted consensus loop here
+  too. `/admin/health` 503s on a nonzero `consensus_task_panics`.
   **`ProdEnv::spawned_task_panics()`/`first_spawned_task_panic()`** read
   that counter/message; `animusd::Node` sums/picks across its role envs.
   **An `abort()`ed (cancelled) task never counts**: cancellation drops the

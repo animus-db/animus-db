@@ -175,6 +175,19 @@ pub enum StorageError {
     /// An error from an underlying persistent backend.
     #[error("storage backend error: {0}")]
     Backend(String),
+    /// The volume is out of space (ENOSPC / EDQUOT, classified with
+    /// [`animus_env::is_storage_full`]) — R-01 (d) / ADR 0074 §2 and its
+    /// 2026-10 amendment. Unlike [`Backend`](Self::Backend) this is
+    /// **recoverable**: the failed operation made *no* durable or visible
+    /// change (a failed WAL commit applies nothing; a failed flush leaves the
+    /// memtable + WAL intact; a failed compaction leaves its inputs
+    /// authoritative and its partial outputs removed), so a caller may pause
+    /// and retry the identical call once space returns. Inline post-write
+    /// flush/compaction ENOSPC never surfaces here at all — the write that
+    /// triggered it is already durable, so the engine defers the maintenance
+    /// instead (see `LsmEngine`'s module docs).
+    #[error("storage backend error (storage full): {0}")]
+    StorageFull(String),
     /// `LsmOptions::level_fanout` was `<= 1`. The per-level table budget is
     /// `L1_TABLE_BUDGET * level_fanout^(level - 1)`, so at `level_fanout <= 1`
     /// it never grows with depth — a table set whose fully-merged size
@@ -224,6 +237,27 @@ pub enum StorageError {
 }
 
 /// Result alias for storage operations.
+impl StorageError {
+    /// Whether this is the recoverable out-of-space class
+    /// ([`StorageFull`](Self::StorageFull)).
+    #[must_use]
+    pub fn is_storage_full(&self) -> bool {
+        matches!(self, Self::StorageFull(_))
+    }
+
+    /// Classify an `io::Error` from the disk seam: ENOSPC/EDQUOT becomes
+    /// [`StorageFull`](Self::StorageFull), anything else
+    /// [`Backend`](Self::Backend).
+    #[must_use]
+    pub fn from_io(e: &std::io::Error) -> Self {
+        if animus_env::is_storage_full(e) {
+            Self::StorageFull(e.to_string())
+        } else {
+            Self::Backend(e.to_string())
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, StorageError>;
 
 /// A sorted, versioned key/value store.

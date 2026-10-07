@@ -12185,6 +12185,40 @@ a 503 `ServiceUnavailable` whose message starts `StorageFull:` and ends
 (readiness would also pull reads); `/admin/raftkv` gets a per-group
 `storage_full` field. `sim_cluster_admin`'s NOT_A_METRIC list no longer holds
 `overload_storage_full`; `storage_full` stays (it is a JSON field, not a metric)
+and `spawned_task_panics` no longer does (exported since #1220, below).
+
+## Panicked consensus task fails `/admin/health` (issue #1220)
+
+`/admin/health` (`admin::health`) reads `Metric::ConsensusTaskPanics` from
+`ctx.env.metrics()` and returns 503 with `consensus_task_panics: N` once it is
+nonzero (unlike `storage_full`, this DOES flip the status: a dead Raft driver or
+apply loop is never restarted, only a restart repairs it; `/admin/live` is
+unchanged so the kubelet can still restart the pod). The counter is bumped by
+`ProdEnv::spawn_counted` for tasks spawned with `spawn_critical_task` (control
+`drive` + `meta_apply_loop`, CP-data `drive` + `apply_loop`); `Metric::
+SpawnedTaskPanics` counts every task. `SimEnv`'s `spawn_critical` is a plain
+spawn, so sim tests cannot see a panic; the real-task proof is
+`tests/consensus_task_panic_health.rs` (its own `ProdEnv` target; injects an
+ordinary then a critical panic and polls `/admin/health` + `/admin/metrics`).
+Both metrics are in the exposition (`sim_cluster_admin`'s metrics-exist check),
+alerts `AnimusConsensusTaskPanicked`/`AnimusBackgroundTaskPanicked` are in
+`deploy/observability/animus-alerts.yml`. **Gotcha:** a new `Spawner` wrapper
+must forward `spawn_critical` or the flag is silently lost (the default
+delegates to `spawn`).
+
+## Real-filesystem disk-full chaos scenario (issue #1221)
+
+`chaos_disk_full` (`tests/chaos.rs`, helpers `chaos_support/diskfull.rs`, `ChaosCluster::set_data_dir`)
+mounts one 64 MiB tmpfs per node (`sudo -n mount` unless root), fills them with a
+ballast file and asserts refusal, step-down write continuity and no-restart
+recovery; see `docs/chaos.md` ("Disk full on real filesystems") for the phases,
+knobs, and the two open findings (F-1 reads while every node is full, F-2 an
+unresolved 2PC intent, which is why 2PC ops are off by default here). It skips
+with a message when it cannot mount (`ANIMUS_CHAOS_REQUIRE_MOUNT=1` fails
+instead; the CI job `chaos-disk-full` sets it). **Gotcha:** a leaked mount on a
+crashed run is `mount | grep animus-chaos` + `sudo umount -l`; `Tmpfs`'s `Drop`
+unmounts after the nodes are killed, so drop the cluster before the mounts.
+
 and `spawned_task_panics` stays (still not exported).
 
 ## `sim_cluster_split_relocation` (issue #1229)

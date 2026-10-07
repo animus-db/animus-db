@@ -5,6 +5,7 @@
 
 pub mod client;
 pub mod cluster;
+pub mod diskfull;
 pub mod nemesis;
 pub mod proxy;
 pub mod rng;

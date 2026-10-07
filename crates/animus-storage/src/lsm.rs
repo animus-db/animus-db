@@ -622,6 +622,15 @@ pub struct LsmEngine<E: Env> {
     /// view, so an error has nowhere else to surface; the next write that
     /// crosses the threshold retriggers maintenance regardless).
     background_error: Arc<Mutex<Option<String>>>,
+    /// Whether the latest background maintenance run failed for want of disk
+    /// space (ENOSPC/EDQUOT) — cleared by the next successful run. Lets
+    /// `await_backpressure` surface [`StorageError::StorageFull`] instead of a
+    /// generic backend error.
+    background_full: Arc<AtomicBool>,
+    /// How many times an inline post-write flush/compaction failed with
+    /// ENOSPC and was deferred (the write itself had already succeeded).
+    /// Introspection for tests.
+    maintenance_deferrals: Arc<AtomicU64>,
 }
 
 impl<E: Env> LsmEngine<E> {
@@ -909,6 +918,8 @@ impl<E: Env> LsmEngine<E> {
             metrics,
             maintenance_scheduled: Arc::new(AtomicBool::new(false)),
             background_error: Arc::new(Mutex::new(None)),
+            background_full: Arc::new(AtomicBool::new(false)),
+            maintenance_deferrals: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -1233,7 +1244,20 @@ impl<E: Env> LsmEngine<E> {
             self.trigger_background_maintenance();
             self.await_backpressure().await
         } else {
-            self.maybe_flush_and_compact().await
+            match self.maybe_flush_and_compact().await {
+                // The write that got us here is already durable and applied;
+                // failing it for want of disk for *maintenance* would make a
+                // caller retry (or report) a write that took effect. Defer the
+                // flush/compaction instead: it failed cleanly (see `flush` and
+                // `run_compaction`), the memtable and WAL are intact, and the
+                // next write (or `flush_now`/`compact_now`) re-attempts it onto
+                // whatever space has been freed by then.
+                Err(e) if e.is_storage_full() => {
+                    self.maintenance_deferrals.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                }
+                other => other,
+            }
         }
     }
 
@@ -1263,8 +1287,14 @@ impl<E: Env> LsmEngine<E> {
         }
         let engine = self.clone();
         self.env.spawn_task(async move {
-            if let Err(e) = engine.maybe_flush_and_compact().await {
-                *engine.background_error.lock().expect("poisoned") = Some(e.to_string());
+            match engine.maybe_flush_and_compact().await {
+                Ok(()) => engine.background_full.store(false, Ordering::Release),
+                Err(e) => {
+                    engine
+                        .background_full
+                        .store(e.is_storage_full(), Ordering::Release);
+                    *engine.background_error.lock().expect("poisoned") = Some(e.to_string());
+                }
             }
             engine.maintenance_scheduled.store(false, Ordering::Release);
         });
@@ -1301,11 +1331,20 @@ impl<E: Env> LsmEngine<E> {
             self.env.sleep(BACKPRESSURE_POLL).await;
         }
         let last_error = self.background_error.lock().expect("poisoned").clone();
-        Err(StorageError::Backend(format!(
+        let msg = format!(
             "write backpressure: memtable stayed over the hard cap ({cap} bytes) \
              after {BACKPRESSURE_MAX_POLLS} polls — background maintenance is not \
              keeping up (last error: {last_error:?})"
-        )))
+        );
+        // Maintenance stuck on a full disk is the recoverable class: the write
+        // that waited here is already durable and applied (LWW-idempotent on a
+        // retry), and the caller should surface/pause as storage-full, not as an
+        // engine fault.
+        Err(if self.background_full.load(Ordering::Acquire) {
+            StorageError::StorageFull(msg)
+        } else {
+            StorageError::Backend(msg)
+        })
     }
 
     /// Open a reader for `file`/`meta` with the engine's shared block-read
@@ -1369,10 +1408,28 @@ impl<E: Env> LsmEngine<E> {
 
         // Build + sync the new SSTable file (outside the lock). A flush always
         // lands at L0 (the overlapping flush tier).
+        //
+        // A failure here (ENOSPC mid-write above all) must leave the engine
+        // exactly as it was: the memtable and WAL are untouched, `next_seq` was
+        // only bumped on the *local* manifest clone, and the partial output is
+        // removed (best effort — it is an unreferenced orphan either way, but
+        // on a full disk it is also space the retry needs). The next flush
+        // attempt re-allocates the same seq and starts the file clean.
         let file = self.sst_file(seq);
-        let meta = SsTableWriter::write(&self.env, &file, seq, 0, &records).await?;
-        self.env.sync(&file).await.map_err(io)?;
-        let reader = self.open_reader(file, meta.clone()).await?;
+        let built = async {
+            let meta = SsTableWriter::write(&self.env, &file, seq, 0, &records).await?;
+            self.env.sync(&file).await.map_err(io)?;
+            let reader = self.open_reader(file.clone(), meta.clone()).await?;
+            Ok::<_, StorageError>((meta, reader))
+        }
+        .await;
+        let (meta, reader) = match built {
+            Ok(built) => built,
+            Err(e) => {
+                let _ = self.env.remove(&file).await;
+                return Err(e);
+            }
+        };
 
         // Compute the WAL segments fully covered by this flush (all their records
         // ≤ watermark, so now in the SSTable). Record the *surviving* segment set
@@ -1393,7 +1450,16 @@ impl<E: Env> LsmEngine<E> {
         // manifest + the intact WAL segments.
         new_manifest.tables.push(meta);
         new_manifest.wal_segments = surviving;
-        self.write_manifest(&new_manifest).await?;
+        if let Err(e) = self.write_manifest(&new_manifest).await {
+            // ENOSPC fails the atomic `replace` before it swaps anything, so the
+            // old manifest is still authoritative and the new table is an
+            // orphan to drop. (Any other error leaves the swap's outcome
+            // unknown — never delete a file the manifest might now name.)
+            if e.is_storage_full() {
+                let _ = self.env.remove(&file).await;
+            }
+            return Err(e);
+        }
 
         // The new manifest is durable and no longer names the covered segments, so
         // their files can be removed (bounding WAL size — no whole-file rewrite).
@@ -1579,15 +1645,38 @@ impl<E: Env> LsmEngine<E> {
         let mut new_readers: Vec<SsTableReader> = Vec::with_capacity(partitions.len());
         let mut new_files: Vec<String> = Vec::with_capacity(partitions.len());
         let mut seq = base_seq;
+        //
+        // A failure while writing the outputs (ENOSPC above all) leaves the
+        // input tables authoritative — the manifest has not changed — and every
+        // partial/complete output written so far is removed (best effort): they
+        // are unreferenced orphans, and on a full disk also exactly the space a
+        // retry needs. `next_seq` is untouched, so the retry re-allocates the
+        // same seqs and each output starts clean.
         for records in &partitions {
             seq += 1;
             let file = self.sst_file(seq);
-            let meta = SsTableWriter::write(&self.env, &file, seq, target_level, records).await?;
-            self.env.sync(&file).await.map_err(io)?;
-            let reader = self.open_reader(file.clone(), meta.clone()).await?;
-            new_metas.push(meta);
-            new_readers.push(reader);
-            new_files.push(file);
+            let built = async {
+                let meta =
+                    SsTableWriter::write(&self.env, &file, seq, target_level, records).await?;
+                self.env.sync(&file).await.map_err(io)?;
+                let reader = self.open_reader(file.clone(), meta.clone()).await?;
+                Ok::<_, StorageError>((meta, reader))
+            }
+            .await;
+            match built {
+                Ok((meta, reader)) => {
+                    new_metas.push(meta);
+                    new_readers.push(reader);
+                    new_files.push(file);
+                }
+                Err(e) => {
+                    let _ = self.env.remove(&file).await;
+                    for done in &new_files {
+                        let _ = self.env.remove(done).await;
+                    }
+                    return Err(e);
+                }
+            }
         }
 
         // Build the new manifest: survivors (not consumed) + the new runs. A crash
@@ -1619,7 +1708,15 @@ impl<E: Env> LsmEngine<E> {
             };
             (new_manifest, old_files)
         };
-        self.write_manifest(&new_manifest).await?;
+        if let Err(e) = self.write_manifest(&new_manifest).await {
+            // See `flush`: only an ENOSPC failure is known to have swapped nothing.
+            if e.is_storage_full() {
+                for f in &new_files {
+                    let _ = self.env.remove(f).await;
+                }
+            }
+            return Err(e);
+        }
 
         // Commit in-memory: rebuild the parallel readers vector to match the new
         // manifest's table order, then remove the consumed input files.
@@ -1723,6 +1820,15 @@ impl<E: Env> LsmEngine<E> {
     #[must_use]
     pub fn background_maintenance_error(&self) -> Option<String> {
         self.background_error.lock().expect("poisoned").clone()
+    }
+
+    /// How many inline post-write flushes/compactions were deferred because the
+    /// disk was full (the triggering write had already succeeded; the work is
+    /// re-attempted by the next write). Test/introspection.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn maintenance_deferral_count(&self) -> u64 {
+        self.maintenance_deferrals.load(Ordering::Relaxed)
     }
 
     /// Whether a background maintenance task is currently in flight.
@@ -4575,7 +4681,7 @@ fn decode_manifest_v1(mut c: Cursor<'_>) -> Result<Manifest> {
 }
 
 fn io(e: std::io::Error) -> StorageError {
-    StorageError::Backend(e.to_string())
+    StorageError::from_io(&e)
 }
 
 #[cfg(test)]

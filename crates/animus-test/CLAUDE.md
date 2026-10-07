@@ -1366,18 +1366,39 @@ a 10% tolerance); `parse_duration` reads the `ANIMUS_SOAK_DURATION` syntax.
 
 `tests/it/raftkv_linearizable.rs` has a dedicated ENOSPC family. The earlier
 notes that `set_enospc_prob` stays out of the other corpora still hold (their
-scenarios never call `shutdown()`, and most run the LSM engine whose ENOSPC path
-is unhandled); this one is safe because the persist path now recovers instead of
-panicking. Nemeses: `DiskFull` (100% ENOSPC on every replica), `LeaderDiskFull`
+scenarios never call `shutdown()`, and most run the LSM engine); this one is
+safe because the persist path and the engine/apply path (#1218) now recover
+instead of panicking. Nemeses: `DiskFull` (100% ENOSPC on every replica), `LeaderDiskFull`
 (100% on the current leader's node only, via the per-node
 `Simulator::set_disk_config_for` override that `heal_all` resets per node) and
-`DiskFlaky` (30% per op). `disk_full_cells()` (8 cells; early/mid window x 3/5
+`DiskFlaky` (30% per op). The all-full cells (#1228,
+`raftkv_disk_full_all_replicas_*`, `check_all_full_keeps_serving`) assert stable
+leadership, reads served on every replica, StorageFull writes and per-sample ack
+freshness on the leader's own clock (`peer_health`); a trace-event bound catches
+an ack/resend spin. `disk_full_cells()` (8 cells; early/mid window x 3/5
 replicas) runs a `DISK_FULL_WINDOW` (3.5 s) window and asserts linearizability
 (no acked write lost or duplicated), progress after the window with no restart,
 and seed determinism (`raftkv_disk_full_corpus_is_linearizable`,
 `..._covers_its_matrix`, `..._run_is_deterministic`). Depth:
 `ANIMUS_DISK_FULL_SEEDS=K` (default 1); `ANIMUS_SEED` replays one.
-**MemoryEngine only; never combine with `ANIMUS_RAFTKV_LSM=1`.** Do not add a
+Since #1218 it also runs over `LsmEngine<SimEnv>` (`check_disk_full_corpus`
+is generic over the engine factory): `raftkv_disk_full_lsm_representative_is_
+linearizable` (3 cells, always on) and `raftkv_disk_full_lsm_full_corpus_is_
+linearizable` (all 8, only under `ANIMUS_RAFTKV_LSM=1`), where the injected
+ENOSPC also hits the engine's WAL/flush/compaction and the apply task pauses and
+retries (`animus-cp-data` `apply_stall`). Do not add a
 `StopRestart` during a 100% window: SimEnv injects ENOSPC on reads too, so the
 WAL would read back empty. A flaky-disk workload can finish inside its window, so
 assert progress only where the workload outlives it.
+
+Issue #1219: every disk-full run also spawns a **probe writer**
+(`spawn_window_probe`, own key, outside the Elle history; stopped before the
+convergence checks) because the Elle workload cannot witness in-window
+availability: its reads of a never-written key legitimately block for a whole
+`OP_BUDGET`, parking every client regardless of the fault. The `LeaderDiskFull`
+cells assert probe writes acked inside the window, past `STEP_DOWN_GRACE`
+(1.5 s) after the fault, i.e. the StorageFull leader stepped down to a healthy
+replica (removing the step-down fails them). Only the all-replica `DiskFull`
+cells assert acked writes after the heal (a leader-only run can drain its whole
+workload inside the window). `raftkv_disk_full_follower_acks_nothing_it_could_
+not_persist` pins that a full follower's `match_index` on the leader freezes.

@@ -53,11 +53,16 @@
 //! the raw, unbounded form at every site). This mirrors the identical,
 //! already-documented exclusion the sibling `raftkv`/`txn` corpora apply for
 //! the same unfixed gap — re-add it here once that fix lands on `main`.
-//! `DiskConfig::set_enospc_prob`/`set_error_prob` are excluded too, for an
-//! unrelated reason: `persist_wal`'s own `assert!(halted.load(..), ...)`
-//! hard-panics the whole test process if either fires on a live (non-halted)
-//! node, so they are out of scope for this crate's tests entirely, not just
-//! this file's.
+//! `DiskConfig::set_error_prob` is excluded too, for an unrelated reason:
+//! `persist_wal`'s own `assert!(halted.load(..), ...)` hard-panics the whole
+//! test process if a non-ENOSPC error fires on a live (non-halted) node.
+//! (`set_enospc_prob` is no longer excluded — R-01 (d) made ENOSPC a handled
+//! `StorageFull` state; (viii) below uses it.)
+//!
+//! (viii) issue #1219: a **quiesced** leader whose disk then fills (the write
+//!     that wakes it fails its persist) hands leadership to a healthy
+//!     replica, which keeps the group writable; after space returns the old
+//!     leader recovers in place.
 //!
 //! **On property (i)'s "genuine event-quiescence":** since issue #1180 the
 //! apply task of a *quiesced* group parks on `ApplySignal` alone (no 250ms
@@ -250,6 +255,148 @@ fn a_write_after_quiescence_un_quiesces_and_commits() {
                 "node {i} missing the post-quiescence write (seed={seed})"
             );
         }
+    }
+}
+
+// ---- (viii) a storage-full quiesced leader steps down ----------------------
+
+#[test]
+fn a_storage_full_quiesced_leader_hands_leadership_to_a_healthy_replica() {
+    for seed in seeds(0xF1DE_F011) {
+        let (mut sim, nodes, _handles) = group(seed);
+        settle_to_quiescence(&mut sim);
+        let old = leader_index(&nodes, seed);
+        assert!(nodes[old].is_quiesced(), "seed={seed}");
+
+        // The disk fills while the group is parked; the write that wakes it
+        // is the first thing to hit ENOSPC.
+        let mut cfg = DiskConfig::default();
+        cfg.set_enospc_prob(1.0);
+        sim.set_disk_config_for(nid(NODES[old]), cfg);
+        assert!(matches!(
+            nodes[old].put(b"k".to_vec(), b"v".to_vec()),
+            ProposeResult::Accepted { .. }
+        ));
+        sim.run_for(Duration::from_secs(3));
+
+        assert!(
+            nodes[old].is_storage_full(),
+            "the old leader never entered StorageFull (vacuous, seed={seed})"
+        );
+        assert!(
+            !nodes[old].is_leader(),
+            "a storage-full leader kept leadership (seed={seed})"
+        );
+        let new = leader_index(&nodes, seed);
+        assert_ne!(new, old, "seed={seed}");
+
+        // The group stays writable through the healthy replica *during* the
+        // disk-full window.
+        assert!(matches!(
+            nodes[new].put(b"k2".to_vec(), b"v2".to_vec()),
+            ProposeResult::Accepted { .. }
+        ));
+        sim.run_for(Duration::from_secs(2));
+        let healthy: Vec<usize> = (0..3).filter(|&i| i != old).collect();
+        for &i in &healthy {
+            assert_eq!(
+                block_on(nodes[i].local_get(b"k2")),
+                Some(b"v2".to_vec()),
+                "healthy node {i} missing the in-window write (seed={seed})"
+            );
+        }
+        assert!(
+            nodes[old].is_storage_full(),
+            "still full: the old leader could not have persisted it (seed={seed})"
+        );
+
+        // Space returns: the old leader recovers its WAL in place (no
+        // restart), catches up, and the group still has exactly one leader.
+        sim.set_disk_config_for(nid(NODES[old]), DiskConfig::default());
+        sim.run_for(Duration::from_secs(10));
+        assert!(!nodes[old].is_storage_full(), "seed={seed}");
+        let _ = leader_index(&nodes, seed);
+        for (i, n) in nodes.iter().enumerate() {
+            assert_eq!(
+                block_on(n.local_get(b"k2")),
+                Some(b"v2".to_vec()),
+                "node {i} did not converge after recovery (seed={seed})"
+            );
+        }
+    }
+}
+
+// ---- (ix) every replica full: the quiesced leader stays up and serves -----
+
+/// Issue #1228: with EVERY replica's disk full, a group that was quiescent keeps
+/// its established leader (no healthy successor exists, so the step-down does
+/// not fire), is held awake by the storage-full quiesce veto (a parked group
+/// would have no timer left to notice space returning), serves linearizable
+/// and eventual reads of what it already held, and settles back into
+/// quiescence once space returns.
+#[test]
+fn a_quiesced_group_whose_every_disk_fills_keeps_its_leader_and_serves_reads() {
+    for seed in seeds(0xF1DE_A11F) {
+        let (mut sim, nodes, _handles) = group(seed);
+        sim.run_for(Duration::from_secs(2));
+        let first = leader_index(&nodes, seed);
+        assert!(matches!(
+            nodes[first].put(b"held".to_vec(), b"v".to_vec()),
+            ProposeResult::Accepted { .. }
+        ));
+        settle_to_quiescence(&mut sim);
+        let leader = leader_index(&nodes, seed);
+        let term = nodes[leader].term();
+        assert!(nodes[leader].is_quiesced(), "seed={seed}");
+
+        let mut cfg = DiskConfig::default();
+        cfg.set_enospc_prob(1.0);
+        sim.set_disk_config(cfg);
+        // The write that wakes the leader is the first thing to hit ENOSPC.
+        let _ = nodes[leader].put(b"poke".to_vec(), b"x".to_vec());
+        sim.run_for(Duration::from_secs(4));
+
+        for (i, n) in nodes.iter().enumerate() {
+            assert!(
+                n.is_storage_full(),
+                "node {i} never entered StorageFull (vacuous, seed={seed})"
+            );
+            assert!(
+                !n.is_quiesced(),
+                "a storage-full replica must not park (seed={seed}, node {i})"
+            );
+        }
+        assert_eq!(
+            leader_index(&nodes, seed),
+            leader,
+            "the leader moved with no healthy successor (seed={seed})"
+        );
+        assert_eq!(nodes[leader].term(), term, "seed={seed}");
+        assert_eq!(
+            lin_read(&mut sim, &nodes[leader], b"held", Duration::from_secs(3)),
+            Some(b"v".to_vec()),
+            "linearizable read not served by the full leader (seed={seed})"
+        );
+        for (i, n) in nodes.iter().enumerate() {
+            assert!(n.stale_read_ready(), "node {i} (seed={seed})");
+            assert_eq!(
+                block_on(n.stale_get_served(b"held")),
+                Some(Some(b"v".to_vec())),
+                "eventual read not served on node {i} (seed={seed})"
+            );
+        }
+
+        // Space returns: every replica recovers in place and the group parks again.
+        sim.set_disk_config(DiskConfig::default());
+        sim.run_for(Duration::from_secs(12));
+        for (i, n) in nodes.iter().enumerate() {
+            assert!(!n.is_storage_full(), "node {i} (seed={seed})");
+        }
+        let _ = leader_index(&nodes, seed);
+        assert!(
+            nodes.iter().all(|n| n.is_quiesced()),
+            "the group never re-quiesced after space returned (seed={seed})"
+        );
     }
 }
 
