@@ -357,3 +357,104 @@ this, since the throughput relief requires the meta tablet to actually split.
   machinery this design reuses in full.
 - `crates/animus-control/CLAUDE.md` — `meta.rs`/`syskv.rs`/`mirror.rs`, the
   pieces that carry over largely unchanged.
+
+## Amendment (2026-10-04): C-17 measurable thresholds for section 5, ratified before measurement
+
+Roadmap item C-17 turns section 5's qualitative criteria into numbers. They
+are fixed here **before** any C-17 run so that results cannot move them.
+This ADR reopens (and ADR 0018's stability still gates it, per the headline
+finding) only if a C-17 run shows either of the following:
+
+1. A lagging control voter's `InstallSnapshot` catch-up takes **more than
+   10 s** at the largest entity count a plausible deployment reaches, taken
+   as **50,000 tablets** (plus their members and schemas).
+2. The control leader's proposal queue grows **without bound** under the
+   steady `reconcile_loop`/`detect_loop`/heartbeat cadence at that same
+   count.
+
+Otherwise this ADR stays at section 6 ("not planned") and gains C-17's
+measured curves as its evidence.
+
+**Corrections to the text above, as verified against the code on
+2026-10-04:**
+
+- **The snapshot is not a whole-`Metadata` `serde_json` image.** Since ADR
+  0038, `Metadata` has been `DRIVER_APPLIED`. The control `InstallSnapshot`
+  payload is the CSN1-tagged system-keyspace image: a list of `(key,
+  value, version)` entries from the per-node syskv engine
+  (`animus_control::node::encode_syskv_image_bytes`). It ships in 64 KiB
+  chunks (`SNAPSHOT_CHUNK_BYTES`). C-17 measures that real encoder's
+  output, not the earlier estimate.
+- **The metric names are different.** What section 5 calls
+  `snapshot_installs` and `append_entries_sent` are `Metric::SnapshotInstalls`
+  (exported as `control_snapshot_installs`) and `Metric::AppendEntriesSent`
+  (`control_append_entries_sent`), in `crates/animus-env/src/metrics.rs`.
+- **Data-node mirrors usually catch up by delta.** A data node's mirror
+  follows by per-key delta (`RaftNode::watch_delta_since`, bounded by the
+  1024-entry / 4 MiB `DeltaRing`). It falls back to a full-`Metadata`
+  `Status` payload only outside that ring.
+
+**Where the measurements live.** Counts and bytes come from C-17's Tier 1
+(`crates/animusd/src/sim_cluster_scale.rs`). Criterion 1's wall-clock 10 s
+needs a `ProdEnv` run, because `SimEnv` virtual time is not wall-clock time.
+Until such a run exists, C-17 reports snapshot bytes and chunk counts at
+50k tablets as a proxy.
+
+## Amendment (2026-10-04): C-17 evidence — stays at section 6
+
+This is C-17 Tier 1 (`crates/animusd/src/sim_cluster_scale.rs`) measured
+against the thresholds fixed above. Every figure is a count or a byte size.
+None is a wall-clock time.
+
+**Criterion 1, InstallSnapshot catch-up.** The real CSN1 syskv image grows
+linearly at about 1.8 KB per tablet:
+
+| Tablets | Image size | 64 KiB chunks |
+|---|---|---|
+| 100 | 179 KB | 3 |
+| 1k | 1.79 MB | 28 |
+| 10k | 17.9 MB | 274 |
+| 50k | 90.2 MB | 1,377 |
+
+The legacy full-`Metadata` `Status` JSON is 21.5 MB at 50k tablets. Catching
+up a lagging voter at 50k tablets took 1,377 chunks, 1,377 acks and 2,756
+stop-and-wait rounds, driven through the real `RaftCore` pump with the real
+image.
+
+The 10 s wall-clock criterion is **not yet decided**. It needs a `ProdEnv`
+run of that transfer. At 90 MB stop-and-wait in 64 KiB chunks, the outcome
+is dominated by per-round latency (2,756 round trips). Bandwidth is not the
+limit.
+
+**Criterion 2, proposal-queue growth.** Real `SimCluster` clusters of 3 and
+9 nodes were left idle with quiescence on, for a 60 s virtual window:
+
+- Control commits during the window were **zero**, both with zero tablet
+  groups and with 100.
+- Control-stream traffic was a flat 170 msg/s on 3 nodes and 1,130 msg/s on
+  9. That is the failure-detector heartbeat, O(nodes²), and it does not
+  depend on the tablet count.
+
+So the steady `reconcile_loop`/`detect_loop`/heartbeat cadence proposes
+nothing when nothing changes, and criterion 2 is not met. This was not run
+on a live cluster at 50k tablets; at that size only the pure curves above
+were measured.
+
+**Outcome.** This ADR stays at section 6. Criterion 1 is open pending a
+`ProdEnv` timing run. Criterion 2 is not met.
+
+**Cliffs filed during the measurement** (each is O(tablets) or worse, none
+is a correctness bug):
+
+- **#1190:** every reconciler wake on every node clones the whole
+  `Metadata`. At 50k tablets on 30 nodes, one tablet change clones 1.5M
+  tablets cluster-wide.
+- **#1191:** a node drain overflows the 1,024-entry mirror `DeltaRing` from
+  10k tablets upward. A lagging mirror then falls back to the 21.5 MB
+  `Status`, against about 570 B for a normal delta.
+- **#1192:** rebalance convergence costs O(moves × tablets), which is 2×10⁸
+  work units at 10k tablets for 3→9 nodes. `Metadata::apply(CreateTablet)`
+  is O(tablets) per call.
+
+A related hazard, **#1194**: a control node whose syskv engine is wiped
+while its compacted WAL is retained silently serves partial `Metadata`.

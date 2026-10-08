@@ -12061,6 +12061,47 @@ fed into emitters); `Release(N-1) -> Release(N)` cells over real gates.
 routing 1/4 of its ops to (each stalls for the wire timeout), so acks *during* its
 roll are legitimately sparse; non-vacuity there is asserted after the era.
 
+## Appendix — `sim_cluster_scale`: C-17 Tier 1 scale and density measurement (2026-10-04)
+
+`src/sim_cluster_scale.rs` (`#[cfg(test)] mod`, run `cargo test -p animusd --lib sim_cluster_scale --
+--nocapture`) is a **curve, not a threshold test**: every test prints `C17 metric=<name> tablets=<n>
+nodes=<n> value=<v>` count lines (bytes, messages, proposals, timer fires, moves — never wall-clock) and
+asserts only structural properties. Knobs: `ANIMUS_SCALE_SEEDS=K` (default 1) and
+`ANIMUS_SCALE_MAX_TABLETS=N` (default 1000; nightly `corpus-deep.yml` fixes K=10, N=50000 — as a step env,
+not a dispatch input, because the file is at GitHub's 25-input cap). Default per-push cost is ~29 s wall
+at `--test-threads=2` in a debug build; the N=50000 run is ~150 s in `--release`.
+
+- **Part A (pure, no `SimCluster`).** `build_meta(tablets, nodes)` inserts tablet rows directly (the real
+  `CreateTablet` apply is O(tablets) per call) and is pinned to the real command path by
+  `..._builder_matches_real_apply_path`. Tests: `..._metadata_curve` (syskv image bytes/chunks, legacy Status
+  JSON bytes, 1-tablet mirror delta for a CAS and a split, `DeltaRing` capacity vs a node-drain's command count,
+  `host::plan` input/output sizes at boot / steady / 1-change, and the per-wake `Metadata` clone count);
+  `..._rebalance_converges` (3→9→30 nodes, moves / `rebalance_step` invocations / work units, capped at 10k
+  tablets); `..._install_snapshot_catchup` (the REAL largest-size image through a bare `RaftCore` chunk
+  pump: chunks, bytes, stop-and-wait rounds — not a live `RaftNode` cluster, because the counts are fixed by
+  image length and the 64 KiB chunk size).
+- **Part B (real `SimCluster`, `new_with_cp_quiescence`, seed-reproducible, `ANIMUS_SEED` replays one).**
+  `..._density_corpus`: G tablet groups (G capped per node count by the knob), settle until every group is
+  hosted on exactly RF nodes and quiesced, a 60 s idle window (executor `SimStats`, trace messages by
+  stream class, control commit-index delta), then wake k groups with writes and verify the acked values.
+  `..._split_storm_corpus`: concurrent in-place splits under a node restart and a control-leader transfer;
+  every acked write must survive and every table's tablets must tile its ring on every compared node.
+  `SimCluster::quiesced_counts(node)` (a pure local `CpGroup::is_quiesced` read, no virtual time) is the
+  C-17 fixture addition.
+- **Findings the curve produced** (filed as issues by the maintainer; numbers in the C-17 report): the
+  per-wake `ctx.effective_metadata()` clone is O(tablets) per node per metadata-watch wake, and a one-tablet
+  change wakes all N nodes (N·T tablets cloned); a single node drain (one command per tablet naming it)
+  overflows the 1024-entry `DeltaRing` from 10k tablets (3 and 9 nodes), forcing every lagging mirror to the
+  full Status; a quiesced group still costs 12 timer fires/s (4 Hz per RF-3 replica, `APPLY_SAFETY_POLL`);
+  `rebalance_step` is O(tablets) per move, so convergence is O(moves×tablets); control heartbeat traffic is
+  O(nodes²).
+- Resolved (fixture artifact): a `SimCluster::restart`ed control node used to get a fresh syskv
+  `MemoryEngine` over its retained, compacted WAL, so it served only the post-snapshot tail of `Metadata`
+  while reporting `commit == applied`. `SimCluster` now keeps `control_syskv` per control node and re-hands
+  the same engine on restart; the storm cell compares every node. Lesson:
+  `docs/lessons/testing/2026-10-04-a-sim-restart-must-preserve-the-wal-and-engine-pair.md`.
+- Lessons: `docs/lessons/testing/2026-10-04-quiescent-means-silent-on-the-wire-…`,
+  `docs/lessons/code-patterns/2026-10-04-a-scale-fixture-built-past-an-o-n-apply-…`.
 ## WAN timing config and the region-aware control-voter check (ADR 0075 section 3.4)
 
 `cluster_settings.max_region_rtt_ms` (additive, `skip_serializing_if` unset so

@@ -153,6 +153,8 @@ impl SimReconciler {
 
 /// Start one node's control `RaftNode` over `backend`'s engine. `metrics:
 /// None` mirrors the plain `RaftNode::start` the restart path uses;
+/// `memory_syskv` is the node's persistent syskv engine for the `Memory`
+/// backend (a clone shares state; pass the same one on restart).
 /// `Some(m)` the `start_with_metrics` the construction/growth paths use. The
 /// `Memory` arms are exactly the calls they replace.
 ///
@@ -164,11 +166,12 @@ pub(crate) fn start_control(
     env: SimEnv,
     ids: Vec<NodeId>,
     metrics: Option<MetricsHandle>,
+    memory_syskv: MemoryEngine,
 ) -> RaftNode<SimEnv> {
     match backend {
         SimEngineBackend::Memory => match metrics {
-            Some(m) => RaftNode::start_with_metrics(env, ids, m, MemoryEngine::new()),
-            None => RaftNode::start(env, ids, MemoryEngine::new()),
+            Some(m) => RaftNode::start_with_metrics(env, ids, m, memory_syskv),
+            None => RaftNode::start(env, ids, memory_syskv),
         },
         SimEngineBackend::Lsm => {
             let engine = block_on(LsmEngine::open(env.clone(), SYSKV_LSM_PREFIX))

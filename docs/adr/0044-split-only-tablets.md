@@ -658,3 +658,105 @@ batching" section.
 See ADR 0048's own 2026-09-07 amendment for `--quiesce-after`'s identical
 closure and `crates/animusd/CLAUDE.md`'s "Heartbeat batching"/"Quiescence"
 sections for the current, complete per-entry-point enumeration.
+
+## Amendment (2026-10-04): C-17 reopening thresholds for phase 3 (C-03), ratified before measurement
+
+Roadmap item C-17 (scale and density testing) owns the measurement the
+2026-09-07 amendment above left open: the per-group `RaftCore`/`RaftKvNode`
+in-memory bookkeeping and its `drive` task, at a realistic per-node density.
+So that a measurement cannot move the goalposts, the thresholds are fixed
+here **before** any C-17 run, as C-17 proposed them:
+
+- **Phase 3 (C-03) reopens** if, at **1,000 hosted groups on one node**,
+  either:
+  - *quiesced* per-group overhead exceeds **64 KB RSS**, or shows **any
+    nonzero steady CPU** attributable to the quiesced groups (measured as
+    process CPU over a fixed idle window after every group reports
+    quiesced, against the zero-group baseline); or
+  - *active* per-group overhead, excluding engine memtables, exceeds
+    **1 MB RSS**, or a hot tablet's p99 client latency degrades by more
+    than **2x** against the 1-group baseline.
+- Otherwise phase 3 stays deferred, and this ADR records the measured
+  numbers as its evidence. That is an equally valid outcome.
+- C-03's condition (b), RF > 3 for failure-domain spread, is independent of
+  density and is not tested by C-17.
+
+**How each half is measured.** The quiesced half needs no load generator. It
+is a `ProdEnv` real-thread measurement of G hosted groups in one process:
+RSS delta, CPU over an idle window, open fds, and live tokio tasks. Its
+harness is `crates/animus-cp-data/tests/group_density_cost.rs`, in the
+style of `idle_engine_cost`. The active half (a fixed per-group write rate,
+and a hot tablet's p99) needs B-01's open-loop load generator. It is
+measured on that harness once B-01 lands, never on a parallel generator.
+Counts that `SimEnv` can prove are reported by C-17's Tier 1 corpus
+(`crates/animusd/src/sim_cluster_scale.rs`). Those are timer fires, task
+polls, messages and bytes per virtual second from quiesced vs awake
+groups. `SimEnv` virtual time is never read as wall-clock CPU.
+
+## Amendment (2026-10-04): C-17 outcome for phase 3 (C-03), quiesced half
+
+Measured against the thresholds fixed in the amendment above. Harness:
+`crates/animus-cp-data/tests/group_density_cost.rs`, release build, 4 cores,
+16 GB RAM, one child process per cell. A "hosted group" on a node is one
+replica, so the per-node figure below is per replica.
+
+**RSS: below the threshold.** At 1,000 groups/node, quiesced:
+
+| Setup | RSS per replica |
+|---|---|
+| RF1 | 22.4–22.7 KB |
+| RF3 (three nodes in one process), clean bring-up, three runs | 21.8–38.9 KB |
+
+All are under the 64 KB threshold. One earlier RF3 run read 88 KB per
+replica. It was an outlier inflated by an election storm during
+simultaneous bring-up (see #1199). RSS rises with how long that storm
+lasts, and a staggered bring-up gives 21.8 KB. Tasks are 2 per replica.
+Open fds do not grow with the group count.
+
+**Steady CPU: the threshold trips.** Net process CPU over a 10 s idle window
+after every group reports quiesced:
+
+| Setup | Net CPU, 1,000 groups |
+|---|---|
+| RF1 | 20–26 ms/s |
+| RF3 | 70–83 ms/s |
+
+This scales linearly with the group count (RF1 at 10,000 groups: 167 ms/s).
+Tier 1 (`sim_cluster_scale.rs`) shows the same in counts: each quiesced
+replica adds exactly 4 timer fires per second, and quiesced groups send zero
+tablet-stream messages. The cause is a single timer. `apply_loop` still races
+`ApplySignal` against the 250 ms `APPLY_SAFETY_POLL` while the group is
+quiesced. That contradicts ADR 0048's own claim that quiescence stops the
+apply poll. It is filed as **#1180**.
+
+**Outcome: C-03 is reopened by the literal rule, with a narrower remedy
+recommended.** The ratified rule is "any nonzero steady CPU", and it is met,
+so C-03 is formally reopened. The cost that trips it is not the per-group
+`RaftCore`/`RaftKvNode` bookkeeping that phase 3 targets, though. It is one
+quiescence-unaware timer, and #1180 removes it far more cheaply than
+log-only replicas would.
+
+The recommended sequence:
+1. Fix #1180.
+2. Re-run `group_density_cost` against the same thresholds.
+3. If quiesced CPU then measures zero, return C-03 to deferred, recording
+   the re-run in a further amendment.
+
+The thresholds themselves are not changed by this amendment.
+
+**Active half: not measured.** The 1 MB/group active RSS and 2x hot-tablet
+p99 thresholds need B-01's load generator, which has not landed on `main`.
+Until it does, the active half of the C-03 decision stays open. For the
+record, two numbers from runs without a load generator, measured but not
+decision inputs:
+
+- **Awake-but-idle groups** cost 0.12–0.24 ms/s per group at RF1 and
+  1.2–1.8 ms/s at RF3 in one process.
+- **Wake latency** of a quiesced group, from propose to durable, applied and
+  read back, is about 23 ms at RF1 and 44 ms at RF3 (one or two real
+  fsyncs).
+
+**A cliff found on the way (#1199).** In one process on 4 cores, about
+2,000 awake RF3 groups need more CPU than the box delivers. Leadership is
+then lost in an election storm with no recovery. Quiescence avoids this
+only while groups are idle.

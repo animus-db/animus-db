@@ -117,3 +117,12 @@ required-features = ["prod-heavy"]
 name = "prod_wiped_voter_liveness"
 path = "tests/prod_wiped_voter_liveness.rs"
 required-features = ["prod-heavy"]
+
+# C-17 Tier 2 (roadmap): `ProdEnv` per-group density measurement — RSS, steady
+# CPU, tokio tasks, fds and idle-wake latency of G hosted tablet groups on one
+# node, awake-idle vs quiesced. An `#[ignore]`d measurement (never a gate);
+# real threads + sockets, so its own target behind `prod-heavy`.
+[[test]]
+name = "group_density_cost"
+path = "tests/group_density_cost.rs"
+required-features = ["prod-heavy"]

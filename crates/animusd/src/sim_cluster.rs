@@ -1287,6 +1287,16 @@ impl SimClusterHandle {
             .collect()
     }
 
+    /// C-17 Tier 1: `(hosted CP groups, of which quiesced)` on `node` — a
+    /// pure local read of `CpGroup::is_quiesced` (ADR 0048 fork F: never
+    /// wakes anything, and costs no virtual time, unlike an `/admin/raftkv`
+    /// call through `spawn_and_capture`).
+    pub(crate) fn quiesced_counts(&self, node: u64) -> (usize, usize) {
+        let groups = self.ctx(node).edge.hosted_groups();
+        let quiesced = groups.iter().filter(|(_, g)| g.is_quiesced()).count();
+        (groups.len(), quiesced)
+    }
+
     /// Each CP group `node` hosts as `tablet:role@term->known leader`, for a
     /// corpus's convergence-timeout dump.
     pub(crate) fn group_states(&self, node: u64) -> Vec<String> {
@@ -1826,6 +1836,15 @@ pub(crate) struct SimCluster {
     /// why this fixture proposes on these handles directly rather than
     /// through any node's own `ClientCtx`).
     controls: Vec<RaftNode<SimEnv>>,
+    /// Each control node's own system-keyspace `MemoryEngine` (the durable
+    /// home of its `Metadata` under `DRIVER_APPLIED`, ADR 0038), parallel
+    /// to `controls` (same vec index). `MemoryEngine` clones share state, so
+    /// [`SimCluster::restart`] re-hands the SAME engine to the fresh
+    /// `RaftNode`, exactly as a real node reopens its persistent syskv
+    /// engine next to its retained WAL. A fresh engine over a retained,
+    /// compacted WAL silently loses every entry below the snapshot base.
+    /// Only consulted by the `Memory` backend (`Lsm` reopens its disk).
+    control_syskv: Vec<MemoryEngine>,
     /// The `Clone`-able, `Mutex`-backed handle onto every node's own
     /// `ClientCtx<SimEnv, SimRelayClient<SimEnv>>` and the provisioned-
     /// tablet bookkeeping (ADR 0061 rung D1 step 3) — [`SimCluster::
@@ -2368,15 +2387,19 @@ impl SimCluster {
         // that `RaftNode`'s own membership is `control_ids`, never the whole
         // node set: a `NodeRole::Data` id is not, and never becomes, a
         // control-plane Raft voter.
+        let control_syskv: Vec<MemoryEngine> =
+            (0..control_count).map(|_| MemoryEngine::new()).collect();
         let controls: Vec<RaftNode<SimEnv>> = ids[..control_count]
             .iter()
             .zip(node_metrics[..control_count].iter())
-            .map(|(id, metrics)| {
+            .zip(control_syskv.iter())
+            .map(|((id, metrics), syskv)| {
                 start_control(
                     backend,
                     sim.env(id.clone()),
                     control_ids.clone(),
                     Some(metrics.clone()),
+                    syskv.clone(),
                 )
             })
             .collect();
@@ -2831,6 +2854,7 @@ impl SimCluster {
             nodes,
             replication,
             controls,
+            control_syskv,
             shared: SimClusterHandle::new(ctxs),
             engines,
             crashed: BTreeSet::new(),
@@ -3668,6 +3692,12 @@ impl SimCluster {
             "{what}: replicas never caught up to their tablet's commit index (seed={}): {last}",
             self.seed()
         );
+    }
+
+    /// [`SimClusterHandle::quiesced_counts`]'s driver-callable twin
+    /// (C-17 Tier 1).
+    pub(crate) fn quiesced_counts(&self, node: u64) -> (usize, usize) {
+        self.shared.quiesced_counts(node)
     }
 
     /// [`SimClusterHandle::group_states`]'s driver-callable twin.
@@ -5612,6 +5642,7 @@ impl SimCluster {
                 self.sim.env(id.clone()),
                 control_ids.clone(),
                 None,
+                self.control_syskv[idx].clone(),
             );
             let fresh_relay: SimRelayClient<SimEnv> = SimRelayClient::new(self.sim.env(id.clone()));
             // ADR 0073 Phase 2 (P2-D): a restart rebuilds the `RaftNode` with
@@ -6454,11 +6485,13 @@ impl SimCluster {
         // The fresh, lone standalone control-plane core — its own
         // membership excludes itself, exactly like `join_control_nonvoter`'s
         // real `bind_control`/`start_control_with` core.
+        let fresh_syskv = MemoryEngine::new();
         let fresh_control: RaftNode<SimEnv> = start_control(
             self.backend,
             env.clone(),
             control_ids.clone(),
             Some(MetricsHandle::recording()),
+            fresh_syskv.clone(),
         );
         let control = GenericControlHandle::Local(fresh_control.clone());
         let edge = ClusterEdgeState::<SimEnv>::new();
@@ -6550,6 +6583,7 @@ impl SimCluster {
         self.control_index.insert(new_n, new_index);
         self.control_node_ids.push(new_n);
         self.controls.push(fresh_control);
+        self.control_syskv.push(fresh_syskv);
 
         // Control-plane-leader-only janitors — mirrors `new_with_roles`'s
         // own `has_control()` gate for every OTHER control-bearing node
@@ -6760,11 +6794,13 @@ impl SimCluster {
 
         // The fresh, lone standalone control-plane core — identical
         // construction to `grow_control`'s own.
+        let fresh_syskv = MemoryEngine::new();
         let fresh_control: RaftNode<SimEnv> = start_control(
             self.backend,
             env.clone(),
             control_ids.clone(),
             Some(MetricsHandle::recording()),
+            fresh_syskv.clone(),
         );
         let control = GenericControlHandle::Local(fresh_control.clone());
         let edge = ClusterEdgeState::<SimEnv>::new();
@@ -6857,6 +6893,7 @@ impl SimCluster {
         self.control_index.insert(new_n, new_index);
         self.control_node_ids.push(new_n);
         self.controls.push(fresh_control);
+        self.control_syskv.push(fresh_syskv);
 
         // Self-registration: the SAME control-plane bypass `SimCluster::
         // grow`/`seed_members` use — `RegisterNode{role: "combined"}` +

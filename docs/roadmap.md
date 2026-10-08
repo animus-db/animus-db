@@ -257,6 +257,18 @@ outstanding on the wire surface at present.
   by failure-domain spread rather than read scaling. Neither holds today.
   No PRs planned. **C-17 now owns the measurement** (proposed
   thresholds for reopening this item are stated there).
+- **C-17 outcome, 2026-10-04 (quiesced half), recorded in ADR 0044's C-17
+  outcome amendment:**
+  - At 1,000 groups/node, quiesced RSS is 22–39 KB per replica, under the
+    threshold.
+  - Steady CPU is nonzero (20–26 ms/s at RF1), so the "any nonzero steady
+    CPU" rule **formally reopens this item**. The whole cost is one
+    quiescence-unaware 250 ms apply safety poll (#1180), not the per-group
+    `RaftCore` bookkeeping phase 3 would remove.
+  - Recommended: fix #1180, re-run `group_density_cost`, and return this
+    item to deferred if quiesced CPU then measures zero.
+  - The active half (1 MB/group, 2x hot p99) waits on B-01's load
+    generator.
 
 ### C-04 Testability phases D and E (ADR 0061)
 
@@ -1715,6 +1727,20 @@ outstanding on the wire surface at present.
   as a follow-up commit after a manual run).
 - **Size:** L (Tier 1 is M; Tier 2 is mostly harness reuse plus the
   operations time to run it on real hardware).
+- **Status (2026-10-04):** Tier 1 and the no-load-generator half of Tier 2
+  have landed (PR #1195).
+  - **Tier 1:** `sim_cluster_scale.rs`, knobs `ANIMUS_SCALE_SEEDS` and
+    `ANIMUS_SCALE_MAX_TABLETS`; nightly runs 50k tablets.
+  - **Tier 2, quiesced density:** `animus-cp-data`
+    `tests/group_density_cost.rs`, prod-heavy and ignored.
+  - **Thresholds** were ratified in the ADR 0044 and ADR 0039 amendments
+    before the runs; the outcomes are in their 2026-10-04 outcome
+    amendments.
+  - **Cliffs filed:** #1180 (fixed by #1207), #1190, #1191, #1192, #1194, #1199.
+  - **Remaining, needs `animus-bench` (B-01, now landed):** active groups at a fixed
+    write rate, hot-tablet p99, WAL fsync/s under load, cluster node-count
+    scaling 3/6/12/24, and a `ProdEnv` wall-clock control InstallSnapshot
+    catch-up at 50k tablets (ADR 0039 criterion 1).
 - **Depends:** `animus-bench` (ADR 0076; landed: the Tier 2 harness and topology; Tier 1 can start now).
 
 ### R-01 Production-readiness pass: exit criteria for leaving pre-alpha

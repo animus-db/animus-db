@@ -18,3 +18,9 @@ update_table_drop_index.rs::a_crash_and_retry_mid_cascade_still_
 converges` (a real single-node crash/restart test) — the fix was simply
 running the equivalent `SimCluster` scenario at `(seed, 3, 3)` instead of
 `(seed, 1, 1)`, not a fixture change.
+
+**Update 2026-10-04 (precise statement, fixed):** only the system-keyspace
+*engine* was fresh; the control WAL was retained. `SimCluster` now keeps a
+per-node `control_syskv` engine across `restart`, so this is no longer true
+for multi-node clusters, and a single-node restart keeps its own state too. See
+`2026-10-04-a-sim-restart-must-preserve-the-wal-and-engine-pair.md`.

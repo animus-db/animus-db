@@ -3206,6 +3206,22 @@ own internal mutex (in `animus-control`) is only taken inside `append_tagged`/
 `engine_applied_index`, never core `last_applied`). ADR 0017's and ADR 0038's
 2026-09-30 amendments.
 
+- **Per-group density measurement (C-17 Tier 2, `tests/group_density_cost.rs`,
+  `required-features = ["prod-heavy"]`, `#[ignore]`d).** Hosts G tablet groups
+  (RF 1 and/or 3, `MemoryEngine`) on `ProdEnv`s in one process and prints
+  `C17T2 ...` lines (RSS/group, steady CPU, tokio tasks, fds, idle-wake latency),
+  awake-idle then quiesced. Run: `ANIMUS_DENSITY_GROUPS=100,500,1000,5000,10000
+  ANIMUS_DENSITY_RF=1,3 cargo test --release -p animus-cp-data --test
+  group_density_cost --features prod-heavy -- --ignored --nocapture`
+  (`ANIMUS_DENSITY_WINDOW_SECS`, default 10, is the CPU window;
+  `ANIMUS_DENSITY_BATCH=N` hosts N groups at a time waiting for leaders, avoiding
+  the all-at-once election herd). Each (rf, G)
+  cell runs in a child process so allocator retention cannot leak between cells.
+  Assertions are liveness only; the numbers are the product. The first run found a
+  quiesced group still woke every `APPLY_SAFETY_POLL` (250 ms) via its apply
+  task (issue #1180, fixed by #1207); the quiesced CPU numbers in ADR 0044's
+  2026-10-04 outcome amendment predate that fix.
+
 ## Per-group WAN timing in the host reconciler (ADR 0075 section 3.4)
 
 `MetadataView::regions` (member id -> region label, empty by default: no

@@ -22587,6 +22587,15 @@ mod sim_cluster_mixed_version_corpus;
 /// `ANIMUS_UPGRADE_SEEDS`. See that module's doc.
 #[cfg(test)]
 mod sim_cluster_roll_orchestrator;
+/// C-17 Tier 1 (`docs/roadmap.md`): `SimEnv`/pure scale and density
+/// measurement — a metadata scale curve (snapshot image, mirror delta,
+/// `host::plan`, rebalance convergence, control `InstallSnapshot` catch-up)
+/// plus a real-`SimCluster` quiescence-density and split-storm corpus.
+/// Knobs `ANIMUS_SCALE_SEEDS` / `ANIMUS_SCALE_MAX_TABLETS`; run via `cargo
+/// test -p animusd --lib sim_cluster_scale -- --nocapture` for the `C17`
+/// table. See that module's own doc.
+#[cfg(test)]
+mod sim_cluster_scale;
 /// Issue #1229: a split child relocated wholesale by directed Placing keeps
 /// its pre-split rows (`SimCluster`).
 #[cfg(test)]
