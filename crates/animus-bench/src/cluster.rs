@@ -91,6 +91,7 @@ impl LaunchTls {
             cert_path: self.cert_path.clone(),
             key_path: self.key_path.clone(),
             ca_path: Some(self.ca_path.clone()),
+            peer_ca_path: None,
         }
     }
 }

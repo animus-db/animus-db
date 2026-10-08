@@ -72,6 +72,26 @@ pub struct TlsConfig {
     /// PEM file: the cluster CA certificate(s) trusted for both verifying an
     /// inbound peer's client cert and this node's own outbound dials.
     pub ca_path: Option<PathBuf>,
+    /// PEM file: peer-region CA certificate(s) (ADR 0075 section 4.3, issue
+    /// #1253). When set, `ca_path` is the **own** cluster CA only and this
+    /// bundle holds the CAs of peer regions: the mutual-TLS acceptor admits a
+    /// client cert chaining to either (so a peer region can still complete a
+    /// handshake), but [`TlsMaterial::classify_peer`] reports a cert that
+    /// chains only to this bundle as [`PeerTrust::PeerRegionOnly`]. `None`
+    /// keeps the pre-#1253 behaviour: every admitted cert is
+    /// [`PeerTrust::Own`].
+    pub peer_ca_path: Option<PathBuf>,
+}
+
+/// How far a verified inbound client certificate is trusted (issue #1253).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerTrust {
+    /// Chains to this cluster's own CA (or no peer CA is configured, or the
+    /// connection presented no client certificate): a full cluster member.
+    Own,
+    /// Admitted only because it chains to a peer-region CA: may speak the
+    /// cross-region replication frame and nothing else.
+    PeerRegionOnly,
 }
 
 /// The loaded, ready-to-use TLS acceptor/connector pair for one node —
@@ -107,6 +127,30 @@ pub struct TlsMaterial {
     /// at the call site instead of using this connector (see `animusd`/
     /// `animus-cli`'s own TLS plumbing).
     pub connector: tokio_rustls::TlsConnector,
+    /// Verifier over the **own** CA only; `Some` exactly when a
+    /// `peer_ca_path` was configured. Used by [`classify_peer`](Self::classify_peer).
+    own_ca_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+}
+
+impl TlsMaterial {
+    /// Classify a verified inbound client certificate chain (leaf first, as
+    /// `rustls::CommonState::peer_certificates` returns it) by whether it
+    /// chains to the own CA. Without a configured peer CA, or without a
+    /// chain, everything is [`PeerTrust::Own`] (the acceptor already
+    /// rejected any cert it does not trust).
+    #[must_use]
+    pub fn classify_peer(&self, chain: Option<&[CertificateDer<'_>]>) -> PeerTrust {
+        let Some(verifier) = &self.own_ca_verifier else {
+            return PeerTrust::Own;
+        };
+        let Some((leaf, intermediates)) = chain.and_then(<[_]>::split_first) else {
+            return PeerTrust::Own;
+        };
+        match verifier.verify_client_cert(leaf, intermediates, rustls_pki_types::UnixTime::now()) {
+            Ok(_) => PeerTrust::Own,
+            Err(_) => PeerTrust::PeerRegionOnly,
+        }
+    }
 }
 
 /// One end of the intra-node wire: either a plain [`TcpStream`] (TLS
@@ -216,8 +260,24 @@ impl TlsConfig {
         // `with_root_certificates` consumes an owned one, and re-reading
         // one small CA PEM file twice at startup is simpler than routing a
         // shared store through both call shapes.
+        let mut admit_roots = root_cert_store(ca_path)?;
+        let own_ca_verifier = if let Some(peer) = self.peer_ca_path.as_deref() {
+            for cert in load_certs(peer)? {
+                admit_roots.add(cert).map_err(to_io_error)?;
+            }
+            Some(
+                rustls::server::WebPkiClientVerifier::builder_with_provider(
+                    Arc::new(root_cert_store(ca_path)?),
+                    provider.clone(),
+                )
+                .build()
+                .map_err(to_io_error)?,
+            )
+        } else {
+            None
+        };
         let server_verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
-            Arc::new(root_cert_store(ca_path)?),
+            Arc::new(admit_roots),
             provider.clone(),
         )
         .build()
@@ -267,6 +327,7 @@ impl TlsConfig {
             acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(server_config)),
             server_acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(server_only_config)),
             connector: tokio_rustls::TlsConnector::from(Arc::new(client_config)),
+            own_ca_verifier,
         })
     }
 }
@@ -360,6 +421,69 @@ pub fn server_name_for(addr: &str) -> io::Result<ServerName<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One test CA plus one `127.0.0.1` leaf: `(ca_pem, cert_pem, key_pem)`.
+    fn pki(cn: &str) -> (String, String, String) {
+        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.distinguished_name.push(DnType::CommonName, cn);
+        let ca_key = KeyPair::generate().unwrap();
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let mut leaf = CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
+        leaf.distinguished_name
+            .push(DnType::CommonName, format!("{cn} leaf"));
+        let leaf_key = KeyPair::generate().unwrap();
+        let cert = leaf.signed_by(&leaf_key, &ca, &ca_key).unwrap();
+        (ca.pem(), cert.pem(), leaf_key.serialize_pem())
+    }
+
+    fn leaf_chain(cert_pem: &str) -> Vec<CertificateDer<'static>> {
+        CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    /// Issue #1253: `classify_peer` splits own-CA from peer-CA certificates,
+    /// and with no `peer_ca_path` everything is `Own`.
+    #[test]
+    fn classify_peer_distinguishes_own_ca_from_peer_region_ca() {
+        let dir = std::env::temp_dir().join(format!("animus-env-classify-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (own_ca, own_cert, own_key) = pki("own region CA");
+        let (peer_ca, peer_cert, _peer_key) = pki("peer region CA");
+        let write = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            p
+        };
+        let cfg = |peer: Option<&str>| TlsConfig {
+            cert_path: write("cert.pem", &own_cert),
+            key_path: write("key.pem", &own_key),
+            ca_path: Some(write("ca.pem", &own_ca)),
+            peer_ca_path: peer.map(|b| write("peer-ca.pem", b)),
+        };
+
+        let with_peer = cfg(Some(&peer_ca)).load().unwrap();
+        assert_eq!(
+            with_peer.classify_peer(Some(&leaf_chain(&own_cert))),
+            PeerTrust::Own
+        );
+        assert_eq!(
+            with_peer.classify_peer(Some(&leaf_chain(&peer_cert))),
+            PeerTrust::PeerRegionOnly
+        );
+        // No chain at all (plain or client-auth-less): nothing to demote.
+        assert_eq!(with_peer.classify_peer(None), PeerTrust::Own);
+
+        // No peer_ca_path: today's behaviour, everything is Own.
+        let without = cfg(None).load().unwrap();
+        assert_eq!(
+            without.classify_peer(Some(&leaf_chain(&peer_cert))),
+            PeerTrust::Own
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn server_name_for_numeric_v4_with_port_is_an_ip_address() {

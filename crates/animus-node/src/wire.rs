@@ -1015,6 +1015,50 @@ pub fn surface_of(request: &ClientRequest) -> Surface {
     }
 }
 
+/// Whether a connection whose client certificate chains **only** to a
+/// peer-region CA (`PeerTrust::PeerRegionOnly`, issue #1253) may send
+/// `request` on the intra port: the cross-region MREC replication frame and
+/// nothing else. **No wildcard arm** (like [`surface_of`]) so a new
+/// `ClientRequest` variant is a compile error here until it is classified;
+/// the default for a new variant is `false`. Node-local enforcement (ADR 0073
+/// class L): no wire change, a refusal reuses `ClientResponse::Error`.
+#[must_use]
+pub fn peer_region_may_send(request: &ClientRequest) -> bool {
+    match request {
+        ClientRequest::MrecApply(_) => true,
+        ClientRequest::Status
+        | ClientRequest::Put { .. }
+        | ClientRequest::PutBatch { .. }
+        | ClientRequest::Get { .. }
+        | ClientRequest::Scan { .. }
+        | ClientRequest::Delete { .. }
+        | ClientRequest::Txn { .. }
+        | ClientRequest::SplitTablet { .. }
+        | ClientRequest::Forwarded { .. }
+        | ClientRequest::ProposeSchema(_)
+        | ClientRequest::JoinInfo
+        | ClientRequest::WatchMetadata { .. }
+        | ClientRequest::KindWrite { .. }
+        | ClientRequest::KindScan { .. }
+        | ClientRequest::GetSnapshot { .. }
+        | ClientRequest::ForceSeal { .. }
+        | ClientRequest::ForcePitrSeal { .. }
+        | ClientRequest::TriggerAutoSplit { .. }
+        | ClientRequest::StreamHotRead { .. }
+        | ClientRequest::StreamHotChangeMax { .. }
+        | ClientRequest::ClearBackfillCursor { .. }
+        | ClientRequest::KindWriteItem { .. }
+        | ClientRequest::KindWriteBatch { .. }
+        | ClientRequest::CpLeaderHintProbe { .. }
+        | ClientRequest::TxnPrepare { .. }
+        | ClientRequest::TxnDecide { .. }
+        | ClientRequest::TxnResolve { .. }
+        | ClientRequest::TxnStatus { .. }
+        | ClientRequest::TxnRecordView { .. }
+        | ClientRequest::TxnVerify { .. } => false,
+    }
+}
+
 /// Whether `command` may be **relayed to the control leader** via
 /// [`ClientRequest::ProposeSchema`]: the schema-catalog mutations (ADR 0013) that a
 /// wire client drives, plus [`MetaCommand::SplitTablet`] (D2), the
@@ -1728,6 +1772,34 @@ mod tests {
     use animus_tablet::{Epoch, KeyRange, TabletId};
 
     use super::*;
+
+    /// Issue #1253: a peer-region-only certificate may send `MrecApply` and
+    /// nothing else (everything else, `Forwarded` and a bare `Get` included,
+    /// is refused).
+    #[test]
+    fn peer_region_may_send_only_mrec_apply() {
+        let mrec = ClientRequest::MrecApply(MrecApplyRequest {
+            proto: 1,
+            from_region: "west".into(),
+            table: "t".into(),
+            records: Vec::new(),
+            control: None,
+        });
+        assert!(peer_region_may_send(&mrec));
+        let get = ClientRequest::Get {
+            key: b"k".to_vec(),
+            table: "t".into(),
+            stale: false,
+        };
+        assert!(!peer_region_may_send(&get));
+        let fwd = ClientRequest::Forwarded {
+            request: Box::new(get),
+            traceparent: None,
+        };
+        assert!(!peer_region_may_send(&fwd));
+        assert!(!peer_region_may_send(&ClientRequest::Status));
+        assert!(!peer_region_may_send(&ClientRequest::JoinInfo));
+    }
 
     /// Pins `is_relayable_command`'s classification of every `MetaCommand`
     /// variant (ADR 0061 rung C1's `matches!` -> exhaustive `match`

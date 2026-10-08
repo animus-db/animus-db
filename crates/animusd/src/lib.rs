@@ -53,7 +53,7 @@ pub use animus_control::{
 pub use animus_node::{
     ClientRequest, ClientResponse, KindWriteBatchItem, KindWriteItemReply, KindWriteOp,
     PendingKindWrite, Surface, TxnPrecondition, TxnTableWrite, TxnWriteCondition, decide,
-    is_relayable_command, surface_of, topology,
+    is_relayable_command, peer_region_may_send, surface_of, topology,
 };
 // ADR 0061 rung C5 step 3a: `ClientCtx`'s own `control` field needs the
 // *generic* `ControlHandle<E, R>` (not this crate's `E = ProdEnv`/`R =
@@ -5606,12 +5606,14 @@ fn spawn_common_tail(
         ctx.clone(),
         ListenerKind::Client,
         tls.as_ref().map(|m| m.server_acceptor.clone()),
+        None,
     )));
     tasks.push(tokio::spawn(serve_requests(
         intra_listener,
         ctx.clone(),
         ListenerKind::Intra,
         tls.as_ref().map(|m| m.acceptor.clone()),
+        tls.clone(),
     )));
     // The admin / debug HTTP-JSON endpoint on its own port (ADR 0020) —
     // server-only TLS (ADR 0064 Decision 2).
@@ -15356,6 +15358,10 @@ async fn serve_requests(
     ctx: ClientCtx,
     listener: ListenerKind,
     tls: Option<tokio_rustls::TlsAcceptor>,
+    // The TLS material whose `classify_peer` splits own-CA from peer-region
+    // client certificates (issue #1253); `Some` only for the mutual `intra`
+    // listener.
+    classify: Option<animus_env::TlsMaterial>,
 ) {
     let mut handlers: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
     // R-01 (d), ADR 0074 §2: this listener serves peers and the CLI, speaks a
@@ -15375,12 +15381,19 @@ async fn serve_requests(
                         };
                         let ctx = ctx.clone();
                         let tls = tls.clone();
+                        let classify = classify.clone();
                         handlers.spawn(async move {
                             let _conn_permit = conn_permit;
+                            let mut trust = animus_env::PeerTrust::Own;
                             let stream = match tls {
                                 None => MaybeTlsStream::Plain(stream),
                                 Some(acceptor) => match acceptor.accept(stream).await {
-                                    Ok(s) => MaybeTlsStream::Tls(Box::new(s.into())),
+                                    Ok(s) => {
+                                        if let Some(material) = &classify {
+                                            trust = material.classify_peer(s.get_ref().1.peer_certificates());
+                                        }
+                                        MaybeTlsStream::Tls(Box::new(s.into()))
+                                    }
                                     Err(err) => {
                                         tracing::warn!(
                                             ?err,
@@ -15416,7 +15429,7 @@ async fn serve_requests(
                             {
                                 return; // already logged/counted by perform_client_handshake
                             }
-                            if let Err(err) = handle_connection(stream, ctx, listener).await {
+                            if let Err(err) = handle_connection(stream, ctx, listener, trust).await {
                                 tracing::debug!(?err, "connection closed");
                             }
                         });
@@ -15529,6 +15542,7 @@ async fn handle_connection(
     stream: MaybeTlsStream,
     ctx: ClientCtx,
     listener: ListenerKind,
+    trust: animus_env::PeerTrust,
 ) -> std::io::Result<()> {
     // Split so the read half can be raced against the in-flight handler
     // (issue #596) while the write half stays free for the eventual reply —
@@ -15545,6 +15559,22 @@ async fn handle_connection(
         let Some(request) = read_frame::<ClientRequest, _>(&mut read_half).await? else {
             return Ok(());
         };
+        // Issue #1253: a connection admitted only through the peer-region CA
+        // bundle may send the MREC replication frame and nothing else.
+        if trust == animus_env::PeerTrust::PeerRegionOnly && !peer_region_may_send(&request) {
+            ctx.env.metrics().incr(Metric::PeerRegionRequestRefused);
+            tracing::warn!(
+                request = request_kind(&request),
+                ?listener,
+                "peer-region certificate sent a non-MREC request (refused)"
+            );
+            let response = ClientResponse::Error(format!(
+                "{} is not permitted for a peer-region certificate (only mrec_apply)",
+                request_kind(&request)
+            ));
+            write_frame_gated(&mut write_half, &response, &ctx.edge.version().features).await?;
+            continue;
+        }
         // Every accepted request is a root span (ADR 0027): this is what gives
         // `otel::current_traceparent()` something to inject if the request's
         // handling ends up forwarding to another node (`cp_forward`), and what

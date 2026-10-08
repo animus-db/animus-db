@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use animus_node::{MREC_PROTO, MrecApplyRequest, MrecApplyResponse};
 use animusd::config::{ClusterSettings, PeerCluster, TlsSection};
-use animusd::mrec_peer::probe_peer_for_test;
+use animusd::mrec_peer::{probe_peer_for_test, probe_peer_request_for_test};
 use animusd::{ClusterConfig, Node, RoleAddrs};
 
 mod support;
@@ -52,6 +52,11 @@ fn config(
     peer_intra: std::net::SocketAddr,
     allow_insecure: bool,
 ) -> ClusterConfig {
+    let peer_ca = own
+        .tls
+        .as_ref()
+        .and_then(|t| t.peer_ca_path.as_ref())
+        .map(|p| p.to_string_lossy().into_owned());
     ClusterConfig {
         version: animusd::config::CLUSTER_CONFIG_VERSION,
         nodes: vec![own],
@@ -61,7 +66,9 @@ fn config(
             peers: vec![PeerCluster {
                 region: peer_region.into(),
                 endpoints: vec![peer_intra.to_string()],
-                tls_ca: None,
+                // The peer's CA, to verify its server certificate (the node's
+                // own `ca_path` is its own CA only).
+                tls_ca: peer_ca,
             }],
             allow_insecure_peers: allow_insecure.then_some(true),
             ..Default::default()
@@ -128,9 +135,9 @@ async fn two_clusters(
     )
 }
 
-/// Two PKIs (one per cluster), each cluster's `ca_path` a bundle of both CAs:
-/// the documented cross-cluster mutual-TLS shape. `lone_west = true` leaves
-/// east's CA out of west's bundle (a stranger).
+/// Two PKIs (one per cluster): each `ca_path` is its own CA and each
+/// `peer_ca_path` the other's (issue #1253). `lone_west = true` leaves east's
+/// CA out of west's trust entirely (a stranger).
 fn pkis(dir: &Path, lone_west: bool) -> [Option<TlsSection>; 2] {
     let (_d1, mut a) = support::tls_pki(&["127.0.0.1"]);
     let (_d2, mut b) = support::tls_pki(&["127.0.0.1"]);
@@ -148,20 +155,18 @@ fn pkis(dir: &Path, lone_west: bool) -> [Option<TlsSection>; 2] {
     };
     place(&mut a[0], "east");
     place(&mut b[0], "west");
-    let ca_a = std::fs::read(a[0].ca_path.as_ref().unwrap()).unwrap();
-    let ca_b = std::fs::read(b[0].ca_path.as_ref().unwrap()).unwrap();
-    let bundle = |own: &[u8], other: Option<&[u8]>, tag: &str| {
-        let mut v = own.to_vec();
-        if let Some(o) = other {
-            v.push(b'\n');
-            v.extend_from_slice(o);
-        }
-        let p = dir.join(format!("{tag}-bundle.pem"));
-        std::fs::write(&p, v).unwrap();
+    // Issue #1253: `ca_path` stays each cluster's OWN CA; the other cluster's
+    // CA goes in `peer_ca_path`, admitted to the handshake but trusted for
+    // MREC replication frames only.
+    let peer_file = |ca: &Path, tag: &str| {
+        let p = dir.join(format!("{tag}-peer-ca.pem"));
+        std::fs::copy(ca, &p).unwrap();
         p
     };
-    a[0].ca_path = Some(bundle(&ca_a, Some(&ca_b), "east"));
-    b[0].ca_path = Some(bundle(&ca_b, (!lone_west).then_some(&ca_a[..]), "west"));
+    let ca_a = a[0].ca_path.clone().unwrap();
+    let ca_b = b[0].ca_path.clone().unwrap();
+    a[0].peer_ca_path = Some(peer_file(&ca_b, "east"));
+    b[0].peer_ca_path = (!lone_west).then(|| peer_file(&ca_a, "west"));
     [a.pop(), b.pop()]
 }
 
@@ -260,6 +265,91 @@ async fn plaintext_peers_are_refused_unless_allow_insecure_peers() {
         .await
         .expect("insecure peers allowed");
     assert_reached(&decode(&bytes));
+    east.node.shutdown_graceful().await;
+    west.node.shutdown_graceful().await;
+}
+
+// ---- Issue #1253: a peer-region certificate is trusted for MREC only -------
+
+fn probe_get() -> animus_node::ClientRequest {
+    animus_node::ClientRequest::Get {
+        key: b"k".to_vec(),
+        table: "t".into(),
+        stale: false,
+    }
+}
+
+fn assert_gate_refused(resp: &animus_node::ClientResponse, what: &str) {
+    match resp {
+        animus_node::ClientResponse::Error(e) => assert!(
+            e.contains("not permitted for a peer-region certificate"),
+            "{what}: wrong error: {e}"
+        ),
+        other => panic!("{what}: expected the peer-region refusal, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_region_certificate_may_send_only_mrec_apply_on_the_intra_port() {
+    let dir = support::panic_safe_tempdir();
+    let (east, west) = two_clusters(dir.path(), pkis(dir.path(), false), [false, false]).await;
+    let east_intra = east.node.intra_addr().to_string();
+    // West's certificate chains only to the peer-region CA bundle on east.
+    let west_trusts_east_ca = west.config.nodes[0]
+        .tls
+        .as_ref()
+        .and_then(|t| t.peer_ca_path.clone())
+        .expect("west peer_ca_path");
+    let send = |req: animus_node::ClientRequest| {
+        probe_peer_request_for_test(
+            &west.config,
+            0,
+            Some(&west_trusts_east_ca),
+            east_intra.clone(),
+            req,
+            T,
+        )
+    };
+
+    let forwarded = animus_node::ClientRequest::Forwarded {
+        request: Box::new(probe_get()),
+        traceparent: None,
+    };
+    assert_gate_refused(&send(forwarded).await.expect("dial"), "Forwarded");
+    assert_gate_refused(&send(probe_get()).await.expect("dial"), "bare Get");
+
+    // The MREC replication frame still reaches the receiver handler.
+    let mrec = animus_node::ClientRequest::MrecApply(serde_json::from_slice(&request()).unwrap());
+    match send(mrec).await.expect("dial") {
+        animus_node::ClientResponse::MrecApply(resp) => assert_reached(&resp),
+        other => panic!("MrecApply must reach the handler, got {other:?}"),
+    }
+
+    east.node.shutdown_graceful().await;
+    west.node.shutdown_graceful().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_own_ca_certificate_is_not_gated_on_the_intra_port() {
+    let dir = support::panic_safe_tempdir();
+    let (east, west) = two_clusters(dir.path(), pkis(dir.path(), false), [false, false]).await;
+    let east_intra = east.node.intra_addr().to_string();
+    // East dials its own intra port: the certificate chains to east's own CA.
+    let forwarded = animus_node::ClientRequest::Forwarded {
+        request: Box::new(probe_get()),
+        traceparent: None,
+    };
+    for (what, req) in [("Forwarded", forwarded), ("bare Get", probe_get())] {
+        let resp = probe_peer_request_for_test(&east.config, 0, None, east_intra.clone(), req, T)
+            .await
+            .expect("dial");
+        if let animus_node::ClientResponse::Error(e) = &resp {
+            assert!(
+                !e.contains("peer-region certificate"),
+                "{what}: an own-CA certificate must not be gated: {e}"
+            );
+        }
+    }
     east.node.shutdown_graceful().await;
     west.node.shutdown_graceful().await;
 }

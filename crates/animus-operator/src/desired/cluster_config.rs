@@ -62,6 +62,10 @@ pub struct TlsSection {
     pub key_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca_path: Option<String>,
+    /// Mirrors `animusd::config::TlsSection::peer_ca_path` (issue #1253):
+    /// the peer-region CA bundle, trusted for MREC replication frames only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_ca_path: Option<String>,
 }
 
 /// Mirrors `animusd::lib::RoleAddrs`'s JSON shape field-for-field
@@ -389,6 +393,7 @@ pub fn tls_section() -> TlsSection {
         cert_path: format!("{TLS_MOUNT_DIR}/tls.crt"),
         key_path: format!("{TLS_MOUNT_DIR}/tls.key"),
         ca_path: Some(format!("{TLS_MOUNT_DIR}/ca.crt")),
+        peer_ca_path: None,
     }
 }
 
@@ -397,12 +402,12 @@ pub fn tls_section() -> TlsSection {
 /// chosen key is projected to that fixed file name). Indexed by position, not
 /// region name, so any valid region name yields a valid path and volume name.
 pub const PEER_CA_MOUNT_DIR: &str = "/etc/animus/peer-ca";
-/// The merged trust bundle `entrypoint.sh` writes at container start (own
-/// `ca.crt` plus every peer CA) when a peer names a CA `Secret`. A scratch
-/// path like [`S3_CREDENTIALS_RUNTIME_PATH`], never persisted. `animusd`'s
-/// `ca_path` accepts a PEM file with several certificates, and it is the
-/// intra listener's client-certificate trust root, so a peer's client
-/// certificate verifies only if its CA is in this bundle.
+/// The peer-only trust bundle `entrypoint.sh` writes at container start
+/// (every peer CA, and **not** the own CA) when a peer names a CA `Secret`.
+/// A scratch path like [`S3_CREDENTIALS_RUNTIME_PATH`], never persisted. It
+/// is `animusd`'s `tls.peer_ca_path` (issue #1253): the intra listener admits
+/// a client certificate chaining to it, but trusts such a certificate for
+/// MREC replication frames only. `ca_path` stays the own CA alone.
 pub const PEER_CA_BUNDLE_PATH: &str = "/tmp/animus-tls-ca-bundle.pem";
 
 /// The mounted CA file path of peer `i`.
@@ -412,12 +417,13 @@ pub fn peer_ca_path(i: usize) -> String {
 }
 
 /// [`tls_section`] for `spec`: identical, except that when a peer names a CA
-/// `Secret` the `ca_path` is the merged [`PEER_CA_BUNDLE_PATH`].
+/// `Secret` the `peer_ca_path` is the peers-only [`PEER_CA_BUNDLE_PATH`]
+/// (`ca_path` is always the own CA).
 #[must_use]
 pub fn tls_section_for(spec: &AnimusClusterSpec) -> TlsSection {
     let mut t = tls_section();
     if spec.has_peer_ca() {
-        t.ca_path = Some(PEER_CA_BUNDLE_PATH.to_string());
+        t.peer_ca_path = Some(PEER_CA_BUNDLE_PATH.to_string());
     }
     t
 }
@@ -610,18 +616,18 @@ pub fn entrypoint_script(spec: &AnimusClusterSpec) -> String {
         ));
     }
 
-    // G-e: merge this cluster's own CA with every peer CA into the one file
-    // `tls.ca_path` points at (inbound mutual-TLS trust). Both branches.
+    // G-e / issue #1253: concatenate every peer CA (NOT the own CA) into the
+    // file `tls.peer_ca_path` points at; `tls.ca_path` stays the own CA.
+    // Both branches.
     let mut common_preamble = String::new();
     if spec.tls.is_some() && spec.has_peer_ca() {
-        let mut files = vec![format!("{TLS_MOUNT_DIR}/ca.crt")];
-        files.extend(
-            spec.peers
-                .iter()
-                .enumerate()
-                .filter(|(_, p)| p.ca_secret_ref.is_some())
-                .map(|(i, _)| peer_ca_path(i)),
-        );
+        let files: Vec<String> = spec
+            .peers
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.ca_secret_ref.is_some())
+            .map(|(i, _)| peer_ca_path(i))
+            .collect();
         common_preamble.push_str(&format!(
             "for f in {}; do cat \"$f\"; echo; done > {PEER_CA_BUNDLE_PATH}\n",
             files.join(" ")
@@ -1598,25 +1604,30 @@ mod peers_tests {
     }
 
     #[test]
-    fn tls_ca_path_is_the_merged_bundle_only_when_a_peer_names_a_ca() {
+    fn ca_path_is_always_the_own_ca_and_peer_ca_path_is_the_peer_bundle() {
         let with = build_cluster_config("c", "ns", &federated(true));
         for n in &with.nodes {
+            let tls = n.tls.as_ref().unwrap();
+            // Issue #1253: the own CA alone is `ca_path`; the peer bundle is
+            // a separate, lesser trust root.
+            assert_eq!(tls.ca_path.as_deref(), Some("/etc/animus/tls/ca.crt"));
             assert_eq!(
-                n.tls.as_ref().unwrap().ca_path.as_deref(),
+                tls.peer_ca_path.as_deref(),
                 Some("/tmp/animus-tls-ca-bundle.pem")
             );
         }
         let without = build_cluster_config("c", "ns", &federated(false));
-        assert_eq!(
-            without.nodes[0].tls.as_ref().unwrap().ca_path.as_deref(),
-            Some("/etc/animus/tls/ca.crt")
-        );
+        let tls = without.nodes[0].tls.as_ref().unwrap();
+        assert_eq!(tls.ca_path.as_deref(), Some("/etc/animus/tls/ca.crt"));
+        assert_eq!(tls.peer_ca_path, None);
+        assert!(!to_json(&without).contains("peer_ca_path"));
     }
 
     #[test]
-    fn entrypoint_merges_the_own_ca_and_every_peer_ca_before_exec() {
+    fn entrypoint_concatenates_only_the_peer_cas_before_exec() {
         let script = entrypoint_script(&federated(true));
-        let merge = "for f in /etc/animus/tls/ca.crt /etc/animus/peer-ca/0/ca.crt \
+        // Issue #1253: the own CA must NOT be in the peer bundle.
+        let merge = "for f in /etc/animus/peer-ca/0/ca.crt \
                      /etc/animus/peer-ca/1/ca.crt; do cat \"$f\"; echo; done > \
                      /tmp/animus-tls-ca-bundle.pem";
         let at = script

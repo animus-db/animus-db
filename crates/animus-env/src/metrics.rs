@@ -653,6 +653,10 @@ pub enum Metric {
     /// rate under a hint-chasing forward means abandoned server-side work is
     /// piling up, not necessarily a client bug (see the issue #596 lesson).
     ClientRequestsAbandoned,
+    /// A connection authenticated only by a peer-region CA certificate (issue
+    /// #1253) sent a request other than the MREC replication frame on the
+    /// intra port and was refused.
+    PeerRegionRequestRefused,
 
     // --- Per-table throttling (ADR 0065, W-08 step 2/3) --- Appended after
     // the client-cancellation variant above; every earlier variant's slot
@@ -1077,7 +1081,7 @@ pub enum Metric {
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 134] = [
+    pub const ALL: [Metric; 135] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -1162,6 +1166,7 @@ impl Metric {
         Metric::CpEngineRebuilt,
         Metric::CpEngineRebuildFailed,
         Metric::ClientRequestsAbandoned,
+        Metric::PeerRegionRequestRefused,
         Metric::ThrottledWrites,
         Metric::ThrottledReads,
         Metric::AuthRotatedSecretUsed,
@@ -1303,6 +1308,7 @@ impl Metric {
             Metric::CpEngineRebuilt => "cp_engine_rebuilt",
             Metric::CpEngineRebuildFailed => "cp_engine_rebuild_failed",
             Metric::ClientRequestsAbandoned => "client_requests_abandoned",
+            Metric::PeerRegionRequestRefused => "peer_region_request_refused",
             Metric::ThrottledWrites => "throttled_writes",
             Metric::ThrottledReads => "throttled_reads",
             Metric::AuthRotatedSecretUsed => "auth_rotated_secret_used",

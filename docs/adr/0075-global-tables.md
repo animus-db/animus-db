@@ -1265,10 +1265,48 @@ the sandbox this was built in); **none of the rendering, mounts, NetworkPolicy
 or condition has been exercised against a real Kubernetes API server**, only
 unit tests of the builders and the reconciler over fakes.
 
-**Open security residual (issue #1253, predates G-e).** The bundled `tls.ca_path`
-trusts a peer region's CA on the whole intra port, which also serves `Forwarded`
-client requests, not only `MrecApply`. So a node holding a peer-CA certificate can
-send forwarded reads and writes to any table, bypassing the DynamoDB port's SigV4
-and table policies. G-d M3 already bundled both CAs; G-e only wires that existing
-design into the operator. The fix (per-connection trust class, or a separate
-peer-replication listener with its own CA store) is tracked there.
+**Security residual (issue #1253): resolved** by the "Peer trust class" amendment
+below.
+
+## Amendment (2026-10-08): Peer trust class (issue #1253)
+
+Before this change the bundled `tls.ca_path` trusted a peer region's CA on the
+whole intra port, which also serves `Forwarded` and bare `Get`/`Put` requests, so
+a node holding a peer-CA certificate could read and write any table, bypassing
+the DynamoDB port's SigV4 and table policies. The same acceptor also guarded the
+internal Raft wire.
+
+**Decision (per-certificate trust, no new port).** `TlsSection` gains an optional
+`peer_ca_path` (additive, default absent). `ca_path` is the **own** cluster CA;
+`peer_ca_path` is a bundle of peer-region CAs. The mutual-TLS acceptor still
+admits a client certificate chaining to either (so a peer can complete the
+handshake), but `TlsMaterial::classify_peer` (animus-env) reports a certificate
+that does not verify against the own-CA-only verifier as `PeerTrust::PeerRegionOnly`.
+
+- **Intra port.** `animusd` classifies each connection after the TLS accept and
+  threads the result into `handle_connection`. A `PeerRegionOnly` connection may
+  send only `MrecApply`, decided by `animus_node::peer_region_may_send`, an
+  exhaustive match with no wildcard arm (a new `ClientRequest` variant is a
+  compile error until classified; the safe default is `false`). Anything else gets
+  `ClientResponse::Error`, a warn log and the `peer_region_request_refused`
+  metric; the connection stays open.
+- **Internal Raft wire.** A `PeerRegionOnly` connection is dropped after the
+  handshake (peers never speak Raft). This closes a wider hole than the issue
+  text described.
+- **Back-compat.** With no `peer_ca_path`, every admitted certificate is `Own`,
+  exactly today's behaviour, so an existing merged-`ca_path` config keeps working
+  (and stays as permissive as before until it moves to `peer_ca_path`).
+- **Operator.** `ca_path` is always the own CA. When a peer names a CA `Secret`,
+  `peer_ca_path` is the peers-only bundle the entrypoint concatenates.
+- **Plaintext (`allow_insecure_peers`).** Unchanged: there is no certificate, so
+  the intra port cannot tell peers apart. It is unauthenticated and for tests and
+  trusted networks only.
+
+ADR 0073 classification: **L** (node-local enforcement). No wire or durable
+format change: the refusal reuses `ClientResponse::Error`, and the config field is
+optional. In a mixed-version cluster an older node simply does not enforce.
+
+Tests: `classify_peer` and `peer_region_may_send` unit tests; real-process
+`animusd/tests/mrec_peer_transport.rs` (a peer-region certificate's `Forwarded`
+and `Get` are refused, `MrecApply` still reaches the handler, an own-CA
+certificate is not gated); operator tests pin `ca_path` and `peer_ca_path`.

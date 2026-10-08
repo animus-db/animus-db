@@ -2032,7 +2032,7 @@ outstanding on the wire surface at present.
     names unverified (ADR 0075 section 0); the other gaps are listed at the end
     of the ADR's amendment.
   - **G-e Operator multi-cluster federation (L) - MREC half built
-    2026-10-06** (`spec.region`/`spec.peers`, peer CA trust, NetworkPolicy,
+    2026-10-06** (`spec.region`/`spec.peers`, peer CA trust (MREC-only via `peer_ca_path`, issue #1253), NetworkPolicy,
     `PeerReachable`; ADR 0075 "G-e as built"). **Residuals:** the two-cluster
     `kind` e2e is unwritten and nothing is verified against a real API server;
     stretch-segment federation (MRSC over several Kubernetes clusters), peer

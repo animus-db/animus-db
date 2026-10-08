@@ -14,3 +14,5 @@ scratch file that `ca_path` names; the cost is that CA rotation needs a restart.
 **Also.** A NetworkPolicy cannot select DNS names, so peer rules are port-scoped
 and authentication must come from the TLS layer; say so rather than imply an
 address allowlist.
+
+**Update (issue #1253, 2026-10-08).** Merging the peer CA into `ca_path` over-trusted it on the whole intra port. The peer CA now goes in `tls.peer_ca_path`, which admits the handshake but trusts the connection for `MrecApply` only; see `2026-10-08-admission-is-not-authorization-split-the-trust-root.md`.

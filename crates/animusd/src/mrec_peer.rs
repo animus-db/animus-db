@@ -375,3 +375,42 @@ pub async fn probe_peer_for_test(
         .await
         .map_err(|e| format!("{e:?}"))
 }
+
+/// Test hook for `tests/mrec_peer_transport.rs` (issue #1253): dial `endpoint`
+/// (an intra port) with `node_index`'s own TLS section as the client
+/// certificate — additionally trusting `extra_ca` for the server's
+/// certificate — and send one arbitrary [`ClientRequest`], returning the
+/// raw reply. Lets a test present a peer-region (or own-CA) certificate and
+/// send something other than `MrecApply`.
+///
+/// # Errors
+/// The TLS material could not be loaded.
+#[doc(hidden)]
+pub async fn probe_peer_request_for_test(
+    config: &ClusterConfig,
+    node_index: usize,
+    extra_ca: Option<&std::path::Path>,
+    endpoint: String,
+    request: ClientRequest,
+    timeout: Duration,
+) -> Result<ClientResponse, String> {
+    let section = config
+        .nodes
+        .get(node_index)
+        .and_then(|n| n.tls.as_ref())
+        .ok_or_else(|| "node has no TLS section".to_string())?;
+    let material = section
+        .to_tls_config()
+        .load_with_extra_client_ca(extra_ca)
+        .map_err(|e| format!("tls: {e}"))?;
+    let features = animus_control::version::ClusterFeatures::new();
+    let meta = animus_control::Metadata {
+        cluster_version: animus_control::version::Gate::MrecReplication
+            .version()
+            .unwrap_or(1),
+        ..Default::default()
+    };
+    features.update(&meta);
+    let relay = AnimusdRelayClient::new(Some(material), features);
+    Ok(relay.relay(endpoint, &request, timeout).await)
+}

@@ -57,7 +57,7 @@ pub use prod::{
 #[cfg(feature = "prod")]
 pub mod tls;
 #[cfg(feature = "prod")]
-pub use tls::{MaybeTlsStream, TlsConfig, TlsMaterial};
+pub use tls::{MaybeTlsStream, PeerTrust, TlsConfig, TlsMaterial};
 
 /// Encryption at rest (ADR 0069): the `EncryptedDisk`/`EncryptedEnv` AEAD
 /// wrapper over the `Disk` seam, the per-node `EncryptionKey`, and the

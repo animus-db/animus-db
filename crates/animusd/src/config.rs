@@ -276,6 +276,14 @@ pub struct TlsSection {
     /// `dynamo`/`admin`/`console` ports.
     #[serde(default)]
     pub ca_path: Option<PathBuf>,
+    /// PEM file: peer-region CA certificate(s) (ADR 0075 section 4.3, issue
+    /// #1253). When set, `ca_path` is this cluster's **own** CA only; a
+    /// client certificate chaining only to this bundle is admitted to the
+    /// `intra` handshake but trusted for MREC replication frames alone.
+    /// Absent (the default) keeps the old behaviour: every cert the
+    /// `ca_path` bundle admits is a full cluster member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_ca_path: Option<PathBuf>,
 }
 
 impl TlsSection {
@@ -291,6 +299,7 @@ impl TlsSection {
             cert_path: self.cert_path.clone(),
             key_path: self.key_path.clone(),
             ca_path: self.ca_path.clone(),
+            peer_ca_path: self.peer_ca_path.clone(),
         }
     }
 }
@@ -1346,6 +1355,7 @@ mod tests {
             cert_path: format!("/etc/animusd/tls/{tag}.cert.pem").into(),
             key_path: format!("/etc/animusd/tls/{tag}.key.pem").into(),
             ca_path: Some("/etc/animusd/tls/ca.pem".into()),
+            peer_ca_path: None,
         }
     }
 
@@ -1378,6 +1388,7 @@ mod tests {
             cert_path: "/etc/animusd/tls/n1.cert.pem".into(),
             key_path: "/etc/animusd/tls/n1.key.pem".into(),
             ca_path: None,
+            peer_ca_path: None,
         });
         let parsed = ClusterConfig::from_json(&cfg.to_json()).unwrap();
         assert_eq!(parsed.nodes[0].tls, cfg.nodes[0].tls);
