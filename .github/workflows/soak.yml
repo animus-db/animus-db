@@ -1,0 +1,71 @@
+name: soak
+
+# Short soak leg (R-01 sub-track a, docs/soak.md): real `animusd` processes on
+# loopback, a continuous recorded workload, the animus-test oracles per epoch
+# and per-node resource-trend assertions.
+#
+# NOT a required check, never per-push. GitHub-hosted jobs cap at 6h, so the
+# 7-day exit run is a documented command for dedicated hardware (docs/soak.md).
+# A red run is a finding: triage it, never retry or quarantine.
+on:
+  schedule:
+    # Sundays 05:23 UTC (off the hour, after corpus-deep and chaos).
+    - cron: "23 5 * * 0"
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "ANIMUS_SOAK_DURATION (e.g. 45m, 4h; keep under 5h)"
+        required: false
+        default: "45m"
+      seed:
+        description: "ANIMUS_SOAK_SEED; empty = random"
+        required: false
+        default: ""
+      restart_every:
+        description: "ANIMUS_SOAK_RESTART_EVERY epochs (kill -9 + restart a node); 0 = never"
+        required: false
+        default: "4"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (1.96)
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Cache cargo registry + build output
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run soak
+        env:
+          ANIMUS_SOAK_DURATION: ${{ github.event.inputs.duration || '45m' }}
+          ANIMUS_SOAK_SEED: ${{ github.event.inputs.seed }}
+          ANIMUS_SOAK_RESTART_EVERY: ${{ github.event.inputs.restart_every || '4' }}
+          ANIMUS_SOAK_OUT: ${{ runner.temp }}/soak-out
+        run: |
+          if [ -z "${ANIMUS_SOAK_SEED}" ]; then
+            export ANIMUS_SOAK_SEED="$(( (RANDOM << 30) ^ (RANDOM << 15) ^ RANDOM ))"
+          fi
+          echo "seed: ${ANIMUS_SOAK_SEED}"
+          cargo test -p animusd --features soak --test soak --locked -- --nocapture
+
+      # samples.csv and trend-summary.txt are always written; a failure adds
+      # history.json, op-trace.txt, violations.txt and every node's log.
+      - name: Upload artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-failure
+          path: ${{ runner.temp }}/soak-out
+          if-no-files-found: ignore

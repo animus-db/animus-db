@@ -1,0 +1,2 @@
+TransactWriteItems
+{"TransactItems": [{"Put": {"TableName": "t", "Item": {"pk": {"S": "a"}}}}, {"Update": {"TableName": "t", "Key": {"pk": {"S": "a"}}, "UpdateExpression": "SET x = :v", "ExpressionAttributeValues": {":v": {"N": "1"}}}}, {"ConditionCheck": {"TableName": "t", "Key": {"pk": {"S": "a"}}, "ConditionExpression": "attribute_exists(pk)"}}]}

@@ -252,6 +252,20 @@ struct Inner {
     /// bump but does not need its own text (the generic prefix already names the
     /// batch as failed; the point of this field is the *first* underlying cause).
     failed_error: Option<String>,
+    /// Whether the **latest** failed batch was out-of-space (ENOSPC/EDQUOT):
+    /// surfaced to its waiters as [`StorageError::StorageFull`] (recoverable,
+    /// retryable) rather than [`StorageError::Backend`].
+    failed_full: bool,
+    /// After an **ENOSPC** batch failure: `(segment, length)` the active
+    /// segment must be cut back to before the next batch rides it. A failed
+    /// `append` can leave a short write (a torn frame) at the file's tail; a
+    /// later, acked batch appended behind that garbage would make recovery
+    /// either refuse the file or drop the acked record. `length` is the
+    /// segment's byte count before the failed batch (every byte of which was
+    /// already durable). Consumed by the next leader, which repairs *first*
+    /// (and re-arms this if the repair itself fails). Never set by a
+    /// non-ENOSPC failure, whose handling is unchanged.
+    repair_to: Option<(u64, u64)>,
     /// The segment number currently being appended to.
     active_seg: u64,
     /// Bytes in the active segment so far (drives rotation): its post-repair
@@ -357,6 +371,8 @@ impl GroupCommit {
                 waiters: BTreeMap::new(),
                 failed_through: 0,
                 failed_error: None,
+                failed_full: false,
+                repair_to: None,
                 active_seg,
                 active_seg_bytes: if live_segments.is_empty() {
                     0
@@ -469,12 +485,26 @@ impl GroupCommit {
                         batch.extend_from_slice(&rec);
                         up_to = up_to.max(seq);
                     }
+                    // A pending ENOSPC tail repair (see `Inner::repair_to`) runs
+                    // before this batch: re-baseline the segment's accounting to
+                    // the known-durable length, and do NOT rotate in this lead
+                    // (sealing a segment that still carries a torn tail, or an
+                    // empty one that would leave a gap in the numbering, is
+                    // exactly what the repair avoids).
+                    let repair = inner.repair_to.take();
+                    if let Some((rseg, rlen)) = repair {
+                        inner.active_seg = rseg;
+                        inner.active_seg_bytes = rlen;
+                        // A segment cut back to nothing needs its header again
+                        // (the failed batch may have been the one carrying it).
+                        inner.active_seg_needs_header = rlen == 0;
+                    }
                     // Decide the target segment: rotate to a fresh one if the
                     // active segment is over threshold. Rotation only happens
                     // between batches (no flush is in progress here), so every
                     // record already in the active segment is durable: seal it at
                     // the current durable seq.
-                    if inner.active_seg_bytes >= self.seg_threshold {
+                    if repair.is_none() && inner.active_seg_bytes >= self.seg_threshold {
                         let sealed_seg = inner.active_seg;
                         let sealed_max = inner.durable_seq;
                         inner.sealed.insert(sealed_seg, sealed_max);
@@ -492,6 +522,9 @@ impl GroupCommit {
                     }
                     let seg = inner.active_seg;
                     let needs_header = inner.active_seg_needs_header;
+                    // The segment's known-durable length before this batch: the
+                    // length an ENOSPC failure of this batch must cut it back to.
+                    let len_before = inner.active_seg_bytes;
                     // Claim the marker flag: cleared now, re-set only if this
                     // batch's append + sync both succeed (see module docs).
                     let with_marker = inner.marker_ready && inner.markers_enabled && !needs_header;
@@ -517,6 +550,8 @@ impl GroupCommit {
                         seg,
                         needs_header,
                         with_marker,
+                        len_before,
+                        repair,
                     }
                 }
             };
@@ -531,9 +566,13 @@ impl GroupCommit {
                             .clone()
                             .unwrap_or_else(|| "unknown error".to_string())
                     };
-                    return Err(StorageError::Backend(format!(
-                        "wal group-commit sync failed: {leader_err}"
-                    )));
+                    let full = self.lock().failed_full;
+                    let msg = format!("wal group-commit sync failed: {leader_err}");
+                    return Err(if full {
+                        StorageError::StorageFull(msg)
+                    } else {
+                        StorageError::Backend(msg)
+                    });
                 }
                 Action::Wait => {
                     DurableUpTo {
@@ -548,13 +587,25 @@ impl GroupCommit {
                     seg,
                     needs_header,
                     with_marker,
+                    len_before,
+                    repair,
                 } => {
                     // Perform the single batched append + sync, lock-free, to the
-                    // chosen segment file.
+                    // chosen segment file — after cutting back any torn tail a
+                    // previous ENOSPC failure may have left on it.
                     let batch_len = batch.len();
-                    let res = self
-                        .flush_batch(env, seg, needs_header, with_marker, &batch)
-                        .await;
+                    let repaired = match repair {
+                        Some((rseg, rlen)) => self.repair_tail(env, rseg, rlen).await,
+                        None => Ok(()),
+                    };
+                    let repair_failed = repaired.is_err();
+                    let res = match repaired {
+                        Ok(()) => {
+                            self.flush_batch(env, seg, needs_header, with_marker, &batch)
+                                .await
+                        }
+                        Err(e) => Err(e),
+                    };
                     let woken = {
                         let mut inner = self.lock();
                         inner.flushing = false;
@@ -575,6 +626,20 @@ impl GroupCommit {
                             // has no way to reconstruct on its own.
                             Err(e) => {
                                 inner.failed_through = inner.failed_through.max(up_to);
+                                inner.failed_full = e.is_storage_full();
+                                if e.is_storage_full() || repair_failed {
+                                    // The tail is unknown (a short write, or
+                                    // bytes a failed fsync may drop): cut the
+                                    // segment back to its pre-batch length
+                                    // before anything else rides it, and
+                                    // re-baseline the byte accounting the
+                                    // claim already advanced past the lost
+                                    // batch. (A failed *repair* keeps its own
+                                    // target — `len_before` is that same
+                                    // length then, see the claim block.)
+                                    inner.repair_to = Some((seg, len_before));
+                                    inner.active_seg_bytes = len_before;
+                                }
                                 if inner.failed_error.is_none() {
                                     inner.failed_error = Some(e.to_string());
                                 }
@@ -606,6 +671,24 @@ impl GroupCommit {
         }
     }
 
+    /// Cut segment `seg` back to `len` bytes (its last known-durable length) if
+    /// a failed ENOSPC batch left anything longer — see [`Inner::repair_to`].
+    /// `replace` is the atomic temp-file-and-rename primitive, so a failure here
+    /// leaves the file exactly as it was and the repair simply re-arms.
+    async fn repair_tail<E: Env>(&self, env: &E, seg: u64, len: u64) -> Result<()> {
+        let file = self.segment_file(seg);
+        let bytes = env
+            .read(&file)
+            .await
+            .map_err(|e| StorageError::from_io(&e))?;
+        if bytes.len() as u64 > len {
+            env.replace(&file, &bytes[..len as usize])
+                .await
+                .map_err(|e| StorageError::from_io(&e))?;
+        }
+        Ok(())
+    }
+
     /// Append the whole batch — prefixed with the WAL file-level header when
     /// `needs_header` (this segment's first-ever batch) — to segment `seg`'s
     /// file, then `sync` it once. The lock is **not** held across the I/O;
@@ -630,11 +713,11 @@ impl GroupCommit {
             // corruption, never a crash-torn write.
             env.append(&file, &encode_wal_header())
                 .await
-                .map_err(|e| StorageError::Backend(e.to_string()))?;
+                .map_err(|e| StorageError::from_io(&e))?;
             self.lock().active_seg_needs_header = false;
             env.sync(&file)
                 .await
-                .map_err(|e| StorageError::Backend(e.to_string()))?;
+                .map_err(|e| StorageError::from_io(&e))?;
         }
         if with_marker {
             // The marker's offset is where it lands: the file's live length
@@ -647,24 +730,24 @@ impl GroupCommit {
                     buf.extend_from_slice(batch);
                     env.append(&file, &buf)
                         .await
-                        .map_err(|e| StorageError::Backend(e.to_string()))?;
+                        .map_err(|e| StorageError::from_io(&e))?;
                 }
                 Err(_) => {
                     if !batch.is_empty() {
                         env.append(&file, batch)
                             .await
-                            .map_err(|e| StorageError::Backend(e.to_string()))?;
+                            .map_err(|e| StorageError::from_io(&e))?;
                     }
                 }
             }
         } else if !batch.is_empty() {
             env.append(&file, batch)
                 .await
-                .map_err(|e| StorageError::Backend(e.to_string()))?;
+                .map_err(|e| StorageError::from_io(&e))?;
         }
         env.sync(&file)
             .await
-            .map_err(|e| StorageError::Backend(e.to_string()))?;
+            .map_err(|e| StorageError::from_io(&e))?;
         self.batch_syncs.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -704,6 +787,12 @@ enum Action {
         needs_header: bool,
         /// Prepend a sync marker to the batch's append (see module docs).
         with_marker: bool,
+        /// Segment `seg`'s known-durable byte length before this batch — what an
+        /// ENOSPC failure of the batch cuts it back to (`Inner::repair_to`).
+        len_before: u64,
+        /// A pending tail repair from an earlier ENOSPC failure, performed
+        /// before this batch's append.
+        repair: Option<(u64, u64)>,
     },
     /// Another writer is leading; park until our sequence is durable.
     Wait,

@@ -717,7 +717,10 @@ aborted → the value the key held **immediately before** the intent,
 restored forward at `ts` by rewinding to the version just below the
 intent's own applied version (`get_at(key, intent_version - 1)`) — never
 a tombstone, which would incorrectly shadow that older, still-live
-committed value. A key whose stored value is no longer that exact intent
+committed value. *(Superseded 2026-10-04: that lookback depended on MVCC
+history that LSM compaction GC and latest-only snapshot images discard, and
+aborted transactions lost acked writes; a v2 intent now carries the prior
+value itself — see the 2026-10-04 amendment at the end.)* A key whose stored value is no longer that exact intent
 (already resolved, or overwritten by something newer) is left untouched.
 
 `RaftKvNode::txn_stage`/`txn_decide`/`txn_write` are the leader-side API:
@@ -4052,3 +4055,204 @@ observe stale state a direct-write world could never produce. Grep every
 loop for a preceding `flush_pending` before converting any further
 direct-write site — see `docs/lessons/code-patterns/` for the recorded
 general form of this check.
+
+## Amendment (2026-10-04): an intent carries the committed value it shadows (aborted transactions lost acked writes)
+
+**Finding.** The real-process chaos harness (`crates/animusd/tests/chaos*.rs`,
+`docs/chaos.md`) lost acknowledged list-append writes on keys touched by an
+**aborted** cross-tablet transaction (about 2 smoke runs in 25). Root cause:
+the abort branch of `TxnResolve` (and the read path's
+`prior_committed`, used by a reader whose snapshot predates the commit and by
+every ADR 0055 eventual read under an unresolved intent) recovered the key's
+pre-intent value by reading MVCC history one version below the intent,
+`get_at(key, intent_version - 1)`, and wrote a **tombstone** when that read
+was empty. No engine promises to keep that history:
+
+1. **`LsmEngine` compaction GC.** Versions below the GC floor
+   (`max_version - tombstone_grace_versions`) collapse to the newest one at or
+   below the floor. The default grace is `1 << 20` versions and data-plane
+   versions are packed HLC timestamps (`wall_ms << 20`, §2), so the floor
+   trails the newest write by about **one millisecond**. An intent older than
+   that becomes the floor anchor at the next compaction, and the committed
+   value under it is dropped.
+2. **`InstallSnapshot`.** `engine_image` ships each key's latest record only.
+   A follower caught up by snapshot while an intent is live holds the intent
+   and nothing under it — on `MemoryEngine` too. Its later abort tombstoned the
+   key while the leader restored it: replica divergence, and an acked write
+   lost if that follower became leader.
+
+Every simulation corpus ran on `MemoryEngine` (which keeps every version
+forever), and the one snapshot-with-intent test staged over a key with no
+prior value and then *committed*, so neither mechanism was ever exercised.
+
+**Decision.** The intent itself carries the prior committed value. A new
+intent envelope version (`txn-envelope` v2, tag `2`) is the v1 body plus a
+trailing `prior: Option<bytes>`; `TxnStage`'s apply fills it from the key's
+**latest** record immediately before writing the intent (after flushing the
+pending run, so it sees every earlier entry of the pass). Every replica applies
+the same log prefix to the same latest-record state, and neither compaction GC
+nor snapshot install ever changes a key's latest record, so every replica
+captures the same prior. Abort-restore and `prior_committed` use it and never
+read history. Details:
+
+- A same-transaction re-stage (WAL replay, or two writes to one key in one
+  stage) carries the existing intent's own prior, never the transaction's own
+  provisional value.
+- A **v1 intent** (tag `1`, written before this change and still unresolved
+  across an upgrade) decodes with `IntentPrior::Unknown` and keeps the old
+  lookback — the only information its writer left. That residual is bounded
+  to intents in flight at upgrade time; it is documented, not closed.
+- The write-push guard (PR6) is unchanged and still required: it is what makes
+  the v1 lookback safe, and it keeps a stage from capturing another
+  transaction's intent as a "prior".
+
+**Rejected alternatives.** (a) *Cap the GC floor at the oldest unresolved
+intent on the engine* (a hold, like held snapshots): needs an engine API, a
+per-replica hold set maintained on stage/resolve, recomputed on every open and
+every snapshot install, ordered against compaction; and it still does not fix
+mechanism 2, which would separately need the image to ship each intent key's
+prior version (and an install path that writes two versions of one key, which
+`merge_batch` deduplicates). Several interacting invariants versus one local
+one. (c) *Raise the grace*: narrows the race, does not close it (an abandoned
+prepare is aborted after `RECOVERY_GRACE`, seconds later), and does nothing
+for mechanism 2.
+
+**Format.** `txn-envelope` is a new ADR 0073 inventory row (it was untagged
+in the inventory; tag `1` is its v1). v1 stays readable forever via
+`txn::legacy::v1`; fixtures `crates/animus-cp-data/tests/fixtures/formats/
+txn-envelope/v1.bin` + `v2.bin`. Intent size grows by the prior value; the Raft
+log command is unchanged (the prior is computed at apply).
+
+**Upgrade harness (ADR 0073 P1-D).** A stored intent is an engine row value, so the
+harness needed a transcode that reaches *inside* engine files, not only whole-file
+formats: `animus-test`'s `upgrade::transcode::ROW_TABLE` carries `txn-envelope`'s
+real v2 -> v1 down-conversion (the v1 encoder is behind the `legacy-encoders`
+feature like every other legacy encoder), applied by
+`animus_storage::rewrite_row_values` to every WAL segment and SSTable of a stopped
+node (`TranscodeOpts::row_back`, per-file mixed-version fraction included).
+`upgrade_restart_txn_envelope.rs` (tier 1b) stages a transaction, leaves it
+unresolved across the stop, down-converts the stored intents, restarts and resolves
+over v1 intents, asserting the rewrite really happened (non-zero rewritten count,
+raw envelope tag `2` -> `1`). It also pins the residual gap above as a control: the
+same abort under a compaction burst keeps the value for a v2 intent and loses it for
+a v1 intent.
+
+**Not changed here, filed separately:** the 1 ms default GC grace also breaks
+every *other* historical read below the floor — `read_at`/`scan_at`
+(`TransactGetItems`' snapshot reads) and the on-demand backup capture's
+pinned-`cut_version` `local_scan_kind_snapshot`, which spans many ticks. Those
+need a retention hold or a time-denominated grace, a separate design.
+
+**Tests.** `crates/animus-cp-data/tests/it/txn_abort_restore_history.rs`
+(abort after LSM compaction: put, delete and absent-key intents, plus the
+pending-window eventual read; abort on a snapshot-caught-up follower on
+`MemoryEngine`) — three of four failed before the fix (the absent-key control
+passed both ways). `animus-test`'s `txn_serializable.rs` gained an
+`LsmEngine<SimEnv>` tier under compaction pressure (`lsm_compaction_*` cells):
+`lsm_compaction_abandon_prepare` failed before the fix with exactly the chaos
+finding ("lost acknowledged append ... absent from final state"). Envelope
+decode/round-trip and fixture tests in `txn.rs` and `format_fixture_tests.rs`.
+
+## Amendment 2026-10-06 — the stale-restage guard is durable state (issue #1243)
+
+`TxnStage`'s rejection of a stage for an already-resolved `(key, txn_id)`
+(the issue #298 shape A seatbelt) was decided from `TxnTracker::
+recently_resolved`, process memory that a restart, an `InstallSnapshot` or its
+4096-entry cap emptied — so one committed entry applied differently per
+replica, and the apply-time read-modify-write arms then diverged permanently.
+It is replaced by a **durable resolved marker**: `TxnResolve`'s apply writes
+`txn::resolved_marker_key(key)` (`token || [0x00, 0x04] || key`, value
+`[0xA1] || txn_id`, format `txn-resolved-marker` v1, ADR 0073 inventory) for
+every key it resolves, in the same merge batch, and `TxnStage`'s apply reads
+it. One row per key, overwritten by the next resolve there; a duplicate stage
+of T arriving after a *later* transaction resolved the same key is not caught,
+but that residual is now identical on every replica. No command or wire format
+changed; the marker is class G (ADR 0073): `engine_image` omits it while
+`Gate::GlobalTables` is closed. Regression: `animus-cp-data` `tests/it/resolved_restage_replica_
+determinism.rs` (restart and snapshot-install variants over several seeds).
+
+## Amendment 2026-10-06 — `TxnStage` is a no-op when replayed over an engine already ahead of it (issue #1242)
+
+The #1243 amendment's closing claim — the marker's one-row-per-key residual "is
+now identical on every replica" — held for live apply and for a replica that
+installs a snapshot, but not for **WAL replay after a restart**. A restarted
+replica re-applies its log tail from `snapshot_index` over its own durable
+engine, which already holds the effects of entries past that point, so each
+`TxnStage` decision read *future* state: a stage the live apply rejected (a
+stale/duplicate stage caught by the resolved marker of one key, a stage blocked
+by a foreign intent that was resolved afterwards) was accepted on replay, and
+its intent merge landed on every key with no later write. The resurrected
+intent exists on that replica only and blocks every later stage touching the
+key there (whole-or-nothing), so the acknowledged transaction's *other* key
+never applied on that replica — a permanent `ConsistentRead: false` divergence
+that shows only transaction halves missing (the chaos smoke's
+`[eventual-prefix]`).
+
+Fix, apply-side only (no command, wire or durable format change, so no ADR 0073
+gate: the new branch is unreachable on the live path, where no row can carry a
+version above the entry being applied — with one exception: `SeedBatch`, the
+restore driver, merges rows at carried source-cluster versions, so a stage
+hitting a seeded key with a higher version is Fenced live too, deterministically
+on every replica; a liveness edge on a not-yet-served table only): `TxnStage` first checks whether any of
+its own keys, their resolved markers, or (anchor) its record key hold a
+version strictly above the entry's `ts`, **tombstones included** (a plain `get`
+hides a key deleted after the stage, so a stage rejected live by an own-key
+condition such as "A absent" would pass on replay once A is deleted); if so a later entry already ran, and the stage replays as a
+no-op (`StageOutcome::Fenced`, nobody waits on a replayed entry). Strictly
+above, not at-or-above: an equal version is this entry's own, possibly
+crash-interrupted, merge and re-applies normally. Regression:
+`animus-cp-data` `tests/it/txn_stage_replay_stability.rs` (two constructed
+shapes plus a seeded schedule corpus, `ANIMUS_TXN_REPLAY_SEEDS`). `KindEval`/`KindEvalBatch`, which re-decide from engine state
+on replay too, are fixed separately (issue #1247, ADR 0054's 2026-10-06
+amendment). `KindBatch`/`Batch` make no engine-state decision. At cluster version
+1 (marker withheld from `InstallSnapshot` images) a snapshot-installed replica
+still had the #1243 residual; the next amendment (issue #1251) closes it.
+
+## Amendment 2026-10-06 — the resolved marker crosses in every snapshot image (issue #1251)
+
+The #1243 marker is what makes `TxnStage`'s stale-restage rejection a function
+of durable state, which only holds if every replica holds the same marker set.
+`engine_image` omitted marker rows while `Gate::GlobalTables` was closed (a
+previous-release replica would surface `token || 0x00 0x04 || key` to clients),
+so a replica caught up by `InstallSnapshot` at cluster version 1 had no
+markers, accepted a stale re-stage its peers rejected, and kept a resurrected
+intent that blocked later transactions on that key there only. Every cluster
+nobody has finalized is at version 1 (the era starts there), so all of them were
+exposed. The `txn_stage_replay_stability` corpus diverged at version 1 on seed
+2882520953; the directed `resolved_restage_replica_determinism` snapshot variant
+at version 1 failed on a raw-row comparison (before: replica 1's rows differ
+from replica 0's; after: identical).
+
+Options weighed against "the apply outcome is identical on every replica, live,
+replayed or snapshot-installed, at every version, and an N-1 replica is not
+broken":
+- **Fail closed on a key with no marker** — rejected: the replica that lacks the
+  markers would reject what the others accept, the same divergence in the other
+  direction.
+- **Derive the decision from state every v1 image already carries** — nothing
+  shipped identifies the resolving transaction (the resolve rewrites the base
+  row as a plain committed value or restore; the anchor record lives on another
+  tablet), so there is nothing to derive it from without a new row anyway.
+- **Start a fresh cluster's era at the maximum version** — only a complement: it
+  would not help a cluster already running at version 1 nor one mid-upgrade.
+- **Ship the markers in the image through a channel an N-1 replica ignores** —
+  chosen. The v1 image body is unchanged; each marker entry is tagged with the
+  wire-only row kind `KIND_WIRE_RESOLVED_MARKER` (`0x80`), which is in no
+  `ALL_KINDS` scope. The previous release's `install_engine_image`
+  (`git show ac57d56a`) drops any kind it has no scope for with a warning, so it
+  never files the marker as a client row; a current receiver maps the kind back
+  to the base-scope marker row. A gate-open image still ships the marker as the
+  plain base row. Apply never branches on the gate, so the decision is identical
+  on every current replica. Classification and the residual are in ADR 0073's
+  `txn-resolved-marker` inventory row.
+
+The one thing this cannot fix: a snapshot **sent by** an N-1 leader carries no
+markers (that binary never had them), so a current replica installing it holds
+none; N-1 replicas keep their own in-memory guard (the pre-#1243 behaviour). That
+is bounded by the rolling upgrade and ends at finalize. Regression:
+`resolved_restage_replica_determinism` (snapshot-install at version 1 and 2,
+raw-row identity incl. tombstones and markers), `txn_stage_replay_stability`
+(`txn_replay_corpus_at_cluster_version_1`, known-failing seed 2882520953),
+`txn_resolved_marker_gate` (the marker reaches a current follower at both
+versions), and the in-crate image test that pins the wire kind and what an
+N-1 receiver would file.

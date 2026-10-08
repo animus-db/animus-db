@@ -64,6 +64,8 @@ fn named_role_addrs(name: &str, i: usize, addrs: &[SocketAddr]) -> RoleAddrs {
         advertise_host: None,
         tls: None,
         encryption_key_path: None,
+        labels: Default::default(),
+        overload: None,
     }
 }
 

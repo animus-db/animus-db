@@ -37,7 +37,7 @@
 //! - `GET  /admin/restores`            — the replicated restore catalog: id, backup id, source/target table, status, destination tablet + its live state (ADR 0059 §7, Train 2; pure observer — the DynamoDB wire surface, `RestoreTableFromBackup`, is `animusd::dynamo::restore_table_from_backup`)
 //! - `GET  /admin/metrics`             — the metrics snapshot as JSON, plus per-tablet `stream_change_rates` (ADR 0042 §14, growth PR3 Fork F) and `request_rates` (W-09, ADR 0034 amendment)
 //! - `GET  /admin/metrics/history`     — periodic snapshots, ~2h ring buffer (ADR 0021 sparklines)
-//! - `GET  /admin/health`              — readiness: 503 until the control plane has had a RECENT leader (`leader_within` hysteresis, issue #595) — the Kubernetes readiness probe (ADR 0060)
+//! - `GET  /admin/health`              — readiness: 503 until the control plane has had a RECENT leader, and 503 for good once a consensus-loop task has panicked (`consensus_task_panics`, issue #1220) (`leader_within` hysteresis, issue #595) — the Kubernetes readiness probe (ADR 0060)
 //! - `GET  /admin/live`                — liveness: 200 whenever this admin server can answer at all, independent of control-leader knowledge, hosting, or role — the Kubernetes liveness probe (ADR 0060's 2026-09-07 amendment, issue #710; `/admin/health` must never back a liveness probe, since a healthy joining process can go a full `advance_control_growth` reconcile cycle with no known leader)
 //! - `POST /admin/tablet/split`        — `{tablet, split_key}`
 //! - `POST /admin/stream/grow`         — `{table}` — split every tablet of a streamed table at its byte-weighted median (ADR 0042 §14, growth PR3)
@@ -51,6 +51,9 @@
 //! - `GET  /admin/control/members`     — live control-plane voters + address book (ADR 0037 PR3)
 //! - `POST /admin/control/member/add`    — `{node?, addr}` — grow the control group (ADR 0037 PR3; `node` optional since the ADR 0037 hardening trio's PR3, allocator-minted)
 //! - `POST /admin/control/member/remove` — `{node}` — shrink the control group (ADR 0037 PR3)
+//! - `GET  /admin/cluster-version`       — ADR 0073 Phase 2: active cluster version, per-node recorded range + build, safe target, Finalize blockers (any node; the control leader adds its live observation table)
+//! - `GET  /admin/roll-health`           — ADR 0073 Phase 3 (D2): the server-side "safe to touch the next node" verdict (`ok` + named `reasons`, control quorum, member statuses, tablet ladder counts, this node's own group catch-up); read-only, never a probe; `GET /admin/cluster-version` also carries a derived `roll` object (phase, on_new, remaining, down, blockers, health)
+//! - `POST /admin/cluster-version/finalize` — `{to?, expected?}` — raise the cluster version one step (local-control-leader-only, not relayed; 409 names every blocker, and the leader on a non-leader)
 //! - `POST /admin/data/dynamo`         — run a DynamoDB op `{op, payload}` (ADR 0021), item API or Streams read API alike (ADR 0042)
 //! - `POST /admin/data/drop-table`     — drop a table's schema `{table}` (ADR 0021)
 //! - `POST /admin/data/seed`           — bulk-write synthetic DynamoDB items `{count, …}` (ADR 0021)
@@ -174,6 +177,12 @@ pub(crate) struct CpRaftView {
     /// replica is re-admitted through the learner path. A pure observer;
     /// `Metric::CpGroupsRefusedAsVoter` counts these per node.
     pub(crate) refused_as_voter: bool,
+    /// Whether this replica's WAL is suspect after an ENOSPC
+    /// (`RaftKvNode::is_storage_full`, R-01 (d)): the group refuses writes with
+    /// a named `StorageFull` error and acks nothing until it has rewritten its
+    /// WAL onto free space, which it does by itself, without a restart. A pure
+    /// observer.
+    pub(crate) storage_full: bool,
     /// Every distinct voter configuration this replica has adopted, in
     /// adoption order (issue #596) — each entry the sorted `String` node ids
     /// of one voter set, oldest first, dropping the timestamp `RaftKvNode::
@@ -280,12 +289,33 @@ pub(crate) async fn serve(
     ctx: ClientCtx,
     tls: Option<tokio_rustls::TlsAcceptor>,
 ) {
+    // R-01 (d), ADR 0074 §2: bounded like the DynamoDB listener (a `503`, then
+    // close; TLS closes outright), against `max_admin_connections`.
+    let gate = crate::overload::CountGate::new(ctx.overload.limits.max_admin_connections);
+    let shed_response = tls.is_none().then(|| {
+        crate::overload::shed_response(
+            "text/plain; charset=utf-8",
+            "the admin listener is at its connection limit (max_admin_connections); retry",
+        )
+    });
     loop {
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
+                let Some(conn_permit) = gate.try_acquire() else {
+                    ctx.overload
+                        .metrics
+                        .incr(animus_env::Metric::OverloadShedAdminConnCap);
+                    crate::overload::shed_connection(
+                        stream,
+                        shed_response.clone(),
+                        &ctx.overload.shed_tasks,
+                    );
+                    continue;
+                };
                 let ctx = ctx.clone();
                 let tls = tls.clone();
                 tokio::spawn(async move {
+                    let _conn_permit = conn_permit;
                     let stream = match tls {
                         None => MaybeTlsStream::Plain(stream),
                         Some(acceptor) => match acceptor.accept(stream).await {
@@ -573,6 +603,21 @@ impl AdminHost for ClientCtx {
     async fn action_transfer_control_leadership(&self, body: &[u8]) -> (u16, Value) {
         action_transfer_control_leadership(self, body).await
     }
+    async fn cluster_version_view(&self) -> Value {
+        self.admin_cluster_version_view()
+    }
+    async fn roll_health_view(&self) -> Value {
+        roll_health_view(self)
+    }
+    async fn action_finalize_cluster_version(&self, body: &[u8]) -> (u16, Value) {
+        action_finalize_cluster_version(self, body).await
+    }
+    async fn global_tables_view(&self) -> Value {
+        crate::global_tables::admin_global_tables_view(self)
+    }
+    async fn action_set_preferred_leader(&self, body: &[u8]) -> (u16, Value) {
+        action_set_preferred_leader(self, body).await
+    }
     async fn action_data_dynamo(&self, body: &[u8]) -> (u16, Value) {
         action_data_dynamo_concrete(self, body).await
     }
@@ -739,6 +784,21 @@ impl<E: Env, R: RelayClient> AdminHost for GenericAdminHost<E, R> {
     }
     async fn action_transfer_control_leadership(&self, body: &[u8]) -> (u16, Value) {
         action_transfer_control_leadership(&self.0, body).await
+    }
+    async fn cluster_version_view(&self) -> Value {
+        self.0.admin_cluster_version_view()
+    }
+    async fn roll_health_view(&self) -> Value {
+        roll_health_view(&self.0)
+    }
+    async fn action_finalize_cluster_version(&self, body: &[u8]) -> (u16, Value) {
+        action_finalize_cluster_version(&self.0, body).await
+    }
+    async fn global_tables_view(&self) -> Value {
+        crate::global_tables::admin_global_tables_view(&self.0)
+    }
+    async fn action_set_preferred_leader(&self, body: &[u8]) -> (u16, Value) {
+        action_set_preferred_leader(&self.0, body).await
     }
     async fn action_data_dynamo(&self, body: &[u8]) -> (u16, Value) {
         action_data_dynamo(&self.0, body).await
@@ -2190,7 +2250,7 @@ fn metrics_history_view<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> Value 
 /// leaderless — small enough that a truly leaderless node (a real outage,
 /// a stuck election) still flips to `503` within roughly one second at the
 /// default 150ms election base, not tens of seconds.
-const HEALTH_LEADER_GRACE_ELECTION_TIMEOUTS: u32 = 3;
+pub(crate) const HEALTH_LEADER_GRACE_ELECTION_TIMEOUTS: u32 = 3;
 
 fn health<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> (u16, Value) {
     let r = &ctx.control;
@@ -2210,18 +2270,46 @@ fn health<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> (u16, Value) {
     // the full account.
     let health_grace = r.election_timeout() * HEALTH_LEADER_GRACE_ELECTION_TIMEOUTS;
     let leader_recent = r.leader_within(health_grace).is_some();
-    let hosts_cp = !ctx.edge.hosted_groups().is_empty();
+    let hosted = ctx.edge.hosted_groups();
+    let hosts_cp = !hosted.is_empty();
+    // R-01 (d), ADR 0074 §2: a degraded `storage_full` signal while this node's
+    // control WAL, or any hosted tablet group's WAL, is suspect after an ENOSPC.
+    // The status code deliberately does NOT flip: the node still serves reads
+    // (and the readiness probe pulling it out of rotation would take those
+    // away too) — what it refuses is writes, with a named 503 `StorageFull`.
+    let storage_full_groups: Vec<u64> = hosted
+        .iter()
+        .filter(|(_, g)| g.is_storage_full())
+        .map(|(t, _)| t.0)
+        .collect();
+    let control_storage_full = r.is_storage_full();
+    let storage_full = control_storage_full || !storage_full_groups.is_empty();
+    // Issue #1220: a panicked consensus-loop task (control Raft driver /
+    // Metadata apply loop, a CP-data group's driver / apply loop) is never
+    // restarted, so the node is permanently dead for that group while every
+    // other signal looks fine. Unlike `storage_full` this DOES fail
+    // readiness: only a restart repairs it, so pull the node from rotation.
+    // Read from this node's own env sink (what `ProdEnv` records into).
+    let consensus_task_panics = ctx
+        .env
+        .metrics()
+        .get(animus_env::metrics::Metric::ConsensusTaskPanics);
+    let healthy = leader_recent && consensus_task_panics == 0;
     let body = json!({
-        "ok": leader_recent,
+        "ok": healthy,
+        "consensus_task_panics": consensus_task_panics,
         "control_leader_known": leader_known,
         "control_leader_recent": leader_recent,
         "is_control_leader": r.is_leader(),
         "hosts_cp": hosts_cp,
+        "storage_full": storage_full,
+        "storage_full_control": control_storage_full,
+        "storage_full_tablets": storage_full_groups,
     });
     // 503 until the control plane has had a RECENT leader (the readiness
     // signal, hysteresis-gated per issue #595); 200 once it does (whether
     // this node leads or follows).
-    (if leader_recent { 200 } else { 503 }, body)
+    (if healthy { 200 } else { 503 }, body)
 }
 
 /// `GET /admin/live` (ADR 0060's 2026-09-07 amendment, issue #710): the
@@ -2280,6 +2368,10 @@ struct ReconfigureReq {
 #[derive(Deserialize)]
 struct DrainReq {
     node: NodeId,
+    /// Drain even when `node` is the last Active member of a Region a global
+    /// table pins (the decommission guard, ADR 0075 plan D10).
+    #[serde(default)]
+    force: bool,
 }
 
 /// `POST /admin/member/remove` request body (ADR 0032 PR3 decommission):
@@ -2585,7 +2677,7 @@ fn action_drain<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>, body: &[u8]) -> (
         Ok(r) => r,
         Err(e) => return e,
     };
-    match ctx.admin_drain(req.node.clone()) {
+    match ctx.admin_drain(req.node.clone(), req.force) {
         Ok(()) => (
             200,
             json!({"ok": true, "node": req.node, "status": "Leaving"}),
@@ -2777,6 +2869,65 @@ async fn action_transfer_control_leadership<E: Env, R: RelayClient>(
         Ok(()) => (200, json!({"ok": true, "to": req.to})),
         Err(e) => (409, json!({"error": e})),
     }
+}
+
+/// `POST /admin/table/preferred-leader {table, region}` (ADR 0075 plan D3).
+#[derive(Deserialize)]
+struct PreferredLeaderReq {
+    table: String,
+    region: String,
+}
+
+async fn action_set_preferred_leader<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    body: &[u8],
+) -> (u16, Value) {
+    let req: PreferredLeaderReq = match parse_body(body) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    crate::global_tables::admin_set_preferred_leader(ctx, &req.table, &req.region).await
+}
+
+/// `GET /admin/roll-health` (ADR 0073 Phase 3, D2): the server-side verdict
+/// from this node's own view, see [`crate::roll_health`]. Always 200: `ok`
+/// in the body is the verdict, so a caller polling it never mistakes "not
+/// healthy yet" for a transport failure.
+fn roll_health_view<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> Value {
+    ctx.roll_health_verdict(&ctx.effective_metadata()).to_json()
+}
+
+/// `POST /admin/cluster-version/finalize {to?, expected?}` (ADR 0073 Phase 2,
+/// P2-C). **Local-control-leader-only, not relayed** — see
+/// [`crate::ClientCtx::admin_finalize_cluster_version`].
+#[derive(Deserialize)]
+struct FinalizeClusterVersionReq {
+    /// The version to raise to; must be `active + 1` when given.
+    #[serde(default)]
+    to: Option<u32>,
+    /// Optional CAS on the currently active version.
+    #[serde(default)]
+    expected: Option<u32>,
+}
+
+async fn action_finalize_cluster_version<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    body: &[u8],
+) -> (u16, Value) {
+    // An empty body is a plain "finalize the next version".
+    let req: FinalizeClusterVersionReq = if body.iter().all(u8::is_ascii_whitespace) {
+        FinalizeClusterVersionReq {
+            to: None,
+            expected: None,
+        }
+    } else {
+        match parse_body(body) {
+            Ok(r) => r,
+            Err(e) => return e,
+        }
+    };
+    ctx.admin_finalize_cluster_version(req.to, req.expected)
+        .await
 }
 
 // ---- data write proxies (ADR 0021 dashboard) ----------------------------
@@ -3933,6 +4084,8 @@ mod system_table_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                labels: Default::default(),
+                overload: None,
             }],
             dynamo_auth: None,
             cluster_settings: None,

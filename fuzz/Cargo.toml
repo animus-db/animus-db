@@ -1,0 +1,112 @@
+# AnimusDB fuzzing (roadmap R-01 (c)). A cargo-fuzz project that is **not** a
+# member of the root workspace (its own `[workspace]` below, and the root
+# `[workspace] exclude = ["fuzz"]`): `cargo build --workspace`, clippy and
+# `cargo deny` never see it, and libFuzzer's build requirements stay out of the
+# normal gates. See fuzz/README.md.
+
+[package]
+name = "animus-fuzz"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.96"
+license = "AGPL-3.0-only"
+publish = false
+description = "cargo-fuzz targets + deterministic stable smoke for every untrusted parser (R-01 (c))."
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+animus-env = { path = "../crates/animus-env", features = ["fuzzing"] }
+animus-sim = { path = "../crates/animus-sim" }
+animus-storage = { path = "../crates/animus-storage", features = ["fuzzing"] }
+animus-control = { path = "../crates/animus-control" }
+animus-cp-data = { path = "../crates/animus-cp-data", features = ["fuzzing"] }
+animus-item = { path = "../crates/animus-item" }
+animus-dynamo = { path = "../crates/animus-dynamo" }
+animus-node = { path = "../crates/animus-node" }
+animus-tablet = { path = "../crates/animus-tablet" }
+crc32fast = "1"
+futures = "0.3"
+serde_json = "1"
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "dynamo_request"
+path = "fuzz_targets/dynamo_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dynamo_expressions"
+path = "fuzz_targets/dynamo_expressions.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "partiql"
+path = "fuzz_targets/partiql.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_sigv4"
+path = "fuzz_targets/http_sigv4.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "item_codecs"
+path = "fuzz_targets/item_codecs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "net_frames"
+path = "fuzz_targets/net_frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lsm_formats"
+path = "fuzz_targets/lsm_formats.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "control_formats"
+path = "fuzz_targets/control_formats.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cp_data_formats"
+path = "fuzz_targets/cp_data_formats.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "encryption_envelope"
+path = "fuzz_targets/encryption_envelope.rs"
+test = false
+doc = false
+bench = false
+
+# Not a fuzz target: an `[[example]]` so `cargo fuzz list` does not list it.
+[[example]]
+name = "seed_corpus"
+path = "examples/seed_corpus.rs"

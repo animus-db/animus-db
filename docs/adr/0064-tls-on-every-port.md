@@ -938,3 +938,14 @@ run (with round 2's certificate/secret/event diagnostics and this round's
 first-lines log capture) is what will settle it. No code change was made
 in this round — round 1's wildcard-SAN and CA-hierarchy fix remains in
 place unmodified, since neither (A) nor (B) found a gap in it.
+
+## Amendment (2026-10-08, issue #1253): `peer_ca_path` splits peer-region trust from the own CA
+
+`TlsSection`/`TlsConfig` gain an optional `peer_ca_path`. `ca_path` is the own
+cluster CA; `peer_ca_path` holds peer-region CAs (ADR 0075 section 4.3). The
+mutual acceptor admits both, but a client certificate that does not chain to the
+own CA is classified `PeerRegionOnly` (`TlsMaterial::classify_peer`): on the
+`intra` port it may send only `MrecApply`, and on the internal Raft wire it is
+dropped. Absent `peer_ca_path` is the old behaviour (all admitted certs are
+own-CA). Plaintext `allow_insecure_peers` is unchanged and unauthenticated. See
+ADR 0075's "Peer trust class" amendment.

@@ -47,10 +47,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
+name = "animus-bench"
+version = "0.1.0-alpha.0"
+dependencies = [
+ "animus-dynamo",
+ "animus-env",
+ "animusd",
+ "hdrhistogram",
+ "rand 0.8.8",
+ "rand_chacha 0.3.1",
+ "rcgen",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+]
+
+[[package]]
 name = "animus-cli"
 version = "0.1.0-alpha.0"
 dependencies = [
+ "animus-control",
  "animus-env",
+ "animus-roll",
  "animusd",
  "futures",
  "rcgen",
@@ -86,6 +108,7 @@ name = "animus-cp-data"
 version = "0.1.0-alpha.0"
 dependencies = [
  "animus-control",
+ "animus-cp-data",
  "animus-env",
  "animus-item",
  "animus-placement",
@@ -156,6 +179,7 @@ dependencies = [
  "animus-cp-data",
  "animus-dynamo",
  "animus-env",
+ "animus-item",
  "animus-sim",
  "animus-storage",
  "animus-tablet",
@@ -169,6 +193,7 @@ dependencies = [
 name = "animus-operator"
 version = "0.1.0-alpha.0"
 dependencies = [
+ "animus-roll",
  "async-trait",
  "bytes",
  "futures",
@@ -200,7 +225,15 @@ dependencies = [
  "animus-env",
  "proptest",
  "serde",
+ "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "animus-roll"
+version = "0.1.0-alpha.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
@@ -280,6 +313,7 @@ dependencies = [
  "animus-sim",
  "animus-storage",
  "animus-tablet",
+ "async-trait",
  "flate2",
  "futures",
  "serde",
@@ -296,6 +330,8 @@ dependencies = [
  "animus-env",
  "animus-item",
  "animus-node",
+ "animus-placement",
+ "animus-roll",
  "animus-s3",
  "animus-sim",
  "animus-storage",
@@ -482,6 +518,12 @@ name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
+
+[[package]]
+name = "byteorder"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
 name = "bytes"
@@ -1022,6 +1064,16 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+
+[[package]]
+name = "hdrhistogram"
+version = "7.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f49d1053f4708f0af3cf9fc5bffc7e68a914a3c45becb231c80068c9c3f78bea"
+dependencies = [
+ "byteorder",
+ "num-traits",
+]
 
 [[package]]
 name = "hmac"

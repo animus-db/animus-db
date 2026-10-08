@@ -89,7 +89,12 @@ amendment — the shape predates and outlives it.)
   module's own 69-line `//!` doc has the full design (replica selection,
   the request/reply correlation, `repair`); wired into `animusd`
   (`animusd::build_segment_store`, `SegmentStoreHandle` — see that crate's
-  `CLAUDE.md`).
+  `CLAUDE.md`). **ADR 0073 section 8: class G, every `SegmentWire` variant is
+  `Gate::Base`** (`SegmentWire::required_gate`, exhaustive, no `_` arm; `encode`
+  debug-asserts it and `gate_tests` pins each variant's JSON). A new variant or
+  field is a wedge for an older replica: it must name a non-`Base` gate, which
+  then needs a gated send path (this store has no `ClusterFeatures` yet) before
+  the assertion is relaxed.
 - **`codec.rs`** — the crate's compact binary wire/image codec (ADR 0017
   A.2): length-prefixed, magic/version-checked framing for `KvWire`
   messages and engine images (`serde_json`'s decimal-array `Vec<u8>`
@@ -630,8 +635,10 @@ Three things about them that a doc comment cannot enforce:
   claim (no wake, checked against a real quiesced 3-node group's own
   timeline/metrics rather than just structurally) is `tests/
   quiesced_eventual_read.rs`'s regression.
-- **An unresolved intent reads back one MVCC version**
-  (`stale_value` → `prior_committed`), never as absent. `local_get`'s raw
+- **An unresolved intent reads back the key's last committed value**
+  (`stale_value` → `prior_committed`, which takes it from the v2 intent's own
+  carried `prior` — never from MVCC history, see the envelope bullet in Key
+  invariants), never as absent. `local_get`'s raw
   peek reports it as absent — correct for its admin/debug callers, a
   fabricated deletion for a client-visible read. `stale_scan_rows` applies
   the same rule row-by-row, where `resolve_scan_rows` drops the row.
@@ -1108,8 +1115,10 @@ State once here; cross-referenced from the sections below.
   including a mid-commit leader kill).
 - **The value envelope + transactions (`txn.rs`).** Every value the apply
   path merges into the engine is 1-byte-tagged: `0` = committed (raw value
-  follows), `1` = an intent naming the staging `TxnId`, its record's
-  logical key, and the staged value (`None` = a staged delete). Every read
+  follows), `2` = an intent (`txn-envelope` v2) naming the staging `TxnId`,
+  its record's logical key, the staged value (`None` = a staged delete) and
+  the **prior** committed value it shadows (`None` = absent); `1` is the
+  retired v1 intent with no prior (`txn::legacy::v1`, still decoded). Every read
   path unwraps it before a value reaches a caller: point reads resolve via
   `RaftKvNode::read_resolved` (bounded retry while `Pending`); scans resolve
   via `resolve_scan_rows`, **non-blocking** — a still-`Pending` row is
@@ -1121,9 +1130,20 @@ State once here; cross-referenced from the sections below.
   regardless of caller:
 
   - `Aborted` (or a later `Committed`) resolution serves the value the key
-    held immediately before the intent, restored by rewinding to
-    `get_at(key, intent_version - 1)` — **never** a tombstone, which would
-    incorrectly shadow that older, still-live committed value.
+    held immediately before the intent — **never** a tombstone over a
+    committed value. **That value comes from the intent itself**
+    (`IntentPrior::Known`, captured by `TxnStage`'s apply from the key's
+    latest record via `stage_intent_prior`), **never from MVCC history**:
+    the old `get_at(key, intent_version - 1)` lookback lost acked writes
+    (ADR 0018's 2026-10-04 amendment) because `LsmEngine` compaction GC drops
+    versions below a floor about 1 ms of HLC behind the newest write, and an
+    `InstallSnapshot` image ships latest records only. Only a legacy v1
+    intent (`IntentPrior::Unknown`) still uses the lookback. **General rule:
+    no apply or read path may depend on `get_at` below the newest version
+    unless something holds that history** (a held `LsmSnapshot`); the
+    `MemoryEngine`-only corpora cannot catch a violation — see
+    `tests/it/txn_abort_restore_history.rs` and `animus-test`'s
+    `lsm_compaction_*` txn-corpus cells.
   - **`erase_scope` deliberately does NOT go through `local_scan`** (which
     filters record keys and resolves values) — it uses `raw_scoped_keys`,
     since drop-table GC must physically erase everything this scope ever
@@ -1159,12 +1179,11 @@ State once here; cross-referenced from the sections below.
     a fresh HLC — caught live (`delivered=146/144`, one member of a
     transactional pair duplicated under a single sealed shard) during the
     same `SplitMode::InPlace`-unpinned soak that caught shape B. **Fixed**
-    via a new bounded, best-effort per-group memo, `TxnTracker::
-    recently_resolved` (`physical_key -> txn_id`, populated at every
-    `TxnResolve` apply, checked by `(key, txn_id)` identity): `TxnStage`'s
-    apply arm now rejects (folds into the same `Fenced` bucket as
-    `already_decided`) a stage whose target key was already resolved by
-    THIS EXACT transaction on this group. **Tracing the captured trace's
+    via a per-group memo, `TxnTracker::recently_resolved`, **replaced
+    2026-10-06 (issue #1243)** by a durable per-key *resolved marker* (see
+    below): `TxnStage`'s apply arm rejects (folds into the same `Fenced`
+    bucket as `already_decided`) a stage whose target key was already
+    resolved by THIS EXACT transaction on this group. **Tracing the captured trace's
     own `txn_id`s past this fix showed the LIVE trigger is narrower and
     deeper than this guard alone closes** — see `docs/engineering-
     lessons.md`'s shape A amendment for the full account: the resurrecting
@@ -1209,6 +1228,75 @@ State once here; cross-referenced from the sections below.
   Regression (whole txn suite): `tests/txn_single.rs`,
   `tests/snapshot_catchup.rs`, `tests/prod_concurrent_ts_monotonic.rs`, the
   in-crate `pr5_orphan_and_resurrection_tests` module.
+
+- **Resolved marker (issue #1243): apply decisions read durable state, never
+  process memory.** `TxnResolve`'s apply writes, for every key it actually
+  resolves, a row `txn::resolved_marker_key(key)` = `token || [0x00, 0x04] ||
+  key` in the base scope (value `[0xA1] || txn_id`, format
+  `txn-resolved-marker` v1, fixture `tests/fixtures/formats/txn-resolved-marker/v1.bin`)
+  in the same merge batch as the resolve; `TxnStage`'s apply reads it and
+  rejects a stage whose `(key, txn_id)` matches. It replaced the in-memory
+  `TxnTracker::recently_resolved` map, which made one committed log entry
+  apply differently on a restarted / snapshot-installed / cap-evicted replica
+  (stage rejected on some, intent resurrected on others; the apply-time
+  read-modify-write arms then diverged permanently). One row per key
+  (overwritten by the next resolve there), token-led so it moves with its key
+  through splits and snapshot images; every client-facing scan skips it via
+  `txn::is_internal_key` (record keys alone stay `is_record_key`, the predicate
+  for code that *decodes records*). **Class G**: `engine_image` omits marker
+  rows while `Gate::GlobalTables` is closed (an N-1 replica's filters would
+  surface them to clients; it keeps its own in-memory guard — residual), apply
+  always writes them; cell `tests/it/txn_resolved_marker_gate.rs`. Residual by design: it remembers only the
+  LAST resolver of a key, so a duplicate stage of T arriving after a *later*
+  transaction also resolved the same key is not caught — but that residual is
+  identical on every replica for live apply and snapshot install (but see the
+  replay bullet below), where the old one was per-process. A new internal row kind must be added to `is_internal_key` and
+  the `animus-test` `EMBEDDED` table. Regression:
+  `tests/it/resolved_restage_replica_determinism.rs` (restart + snapshot-install
+  variants, `ANIMUS_RESTAGE_SEEDS`).
+- **WAL replay re-applies over an engine that is already ahead (issue #1242).**
+  A restart replays the log tail from `snapshot_index` over the replica's own
+  durable engine, which already holds everything applied before the kill. An
+  arm whose decision reads engine state sees future state on replay; the
+  per-key `merge` version guard protects arms whose only effect is a plain
+  per-key merge, but not whole-or-nothing multi-key ones. `TxnStage`
+  therefore no-ops (`Fenced`) when any of its keys, their resolved markers, or
+  (anchor) its record key carries a version strictly above the entry's `ts`
+  (equal = its own partial merge, re-applies). The read is **tombstone-aware**
+  (`latest_version_incl_tombstone`, over `scan_with_tombstones`): `get` hides a
+  key deleted after the stage, which makes a stage rejected live by an
+  own-key condition (`A` must be absent) look acceptable on replay once `A` is
+  deleted. The branch is unreachable live except via `SeedBatch` (the restore
+  driver merges rows at carried source-cluster versions, so a stage hitting a
+  seeded key with a higher version is Fenced live too — deterministic on every
+  replica, a liveness edge on a not-yet-served table only). Without it a stage
+  the live apply rejected (stale restage caught by one key's marker; stage
+  blocked by a since-resolved intent) resurrected an intent on the restarted
+  replica only, silently dropping later acked txn appends there. The #1243
+  "residual is identical on every replica" statement above held for live apply,
+  not replay. Any new multi-key conditional arm needs the same "what if every
+  key were from the future" review. `KindBatch`/`Batch`/`Cas`/`Delete`/`SeedBatch` make no
+  engine-state decision that fans out to other keys (nothing to guard).
+  **`KindEval`/`KindEvalBatch` (issue #1247, ADR 0054's 2026-10-06 amendment)**
+  re-decide from engine state, and the derived rows `materialize_derived`
+  writes (change-log on a unique `prefix||ts||ordinal` key, LSI/footprint rows
+  keyed by item attributes) are not protected by per-key LWW. They no-op on
+  replay when the decided base key (tombstone-aware, `key_reached_by_entry`)
+  is **at or above** the entry's `ts` — at-or-above, not strictly above as for
+  `TxnStage`, because a `KindEval*` entry's whole write set is ONE atomic
+  `merge_batch` (a single WAL record), so an equal base row proves the entry
+  fully landed and re-evaluating it would read its own post-state (`ADD`
+  applied twice, a `not_exists` item failing on its own write and shifting
+  every later item's change-record ordinal). `KindEvalBatch` is
+  entry-granular (any item's key reached skips the whole entry; one pre-pass
+  `get` per key is reused by the evaluation loop). `TxnResolve` decides only
+  from an intent of its own `txn_id` (monotone: stage then resolve; a replayed
+  resolve finds none) and `TxnStage`'s pending-write evaluation sits behind
+  the `engine_ahead` gate above. Regressions:
+  `tests/it/kind_eval_replay_stability.rs` (`ANIMUS_KINDEVAL_REPLAY_SEEDS`),
+  `tests/it/txn_stage_replay_stability.rs`
+  (`ANIMUS_TXN_REPLAY_SEEDS`); lesson
+  `docs/lessons/code-patterns/2026-10-06-wal-replay-over-an-ahead-engine-must-not-re-decide-an-apply.md`.
 - **`engine_applied` vs `last_applied`.** The two-task split (below) means the
   core's `last_applied` (a buffer cursor the consensus loop advances) *leads*
   the engine. Linearizable reads therefore gate on the separate
@@ -1238,6 +1326,16 @@ State once here; cross-referenced from the sections below.
   regardless), but a real regression to that optimization on nearly every
   split instead of rarely, caught by `tests/inplace_split_dead_space.rs`.
   `drive()` reads this marker back at startup instead of `core.last_applied()`.
+  **Snapshots carry markers at every version (issue #1251).** A replica must
+  hold the sender's marker set or its stale-restage decision diverges (and
+  "fail closed where markers are missing" diverges the other way). While
+  `Gate::GlobalTables` is closed `engine_image` ships each marker under the
+  wire-only image row kind `KIND_WIRE_RESOLVED_MARKER` (`0x80`, in no
+  `ALL_KINDS` scope; the previous release drops an unknown kind) and
+  `install_engine_image` files it back as the base-scope marker row; open, it
+  is the plain base row. Never add a real row kind at `0x80`. A v1-cluster
+  replica-identity check must compare intents in their v1 form (the sender also
+  down-converts v2 intents, #1237).
 
   `RaftCore::state_machine_behind` (shared with `animus-control`, permanently
   inert there — see ADR 0009's addendum) is `true` whenever `engine_applied <
@@ -2243,7 +2341,22 @@ disambiguation is needed.
     on-demand snapshot-image build `RaftCore::take_snapshot_needed` sets,
     purely off the leader's own heartbeat/replicate cycle with no commit
     advance) still converges off the safety poll alone — see
-    `tests/apply_signal.rs`.
+    `tests/apply_signal.rs`. **The safety poll is not armed while the group
+    is quiesced (issue #1180):** `apply_loop` checks `is_quiesced()` under
+    the core lock after each idle pass and, if quiesced, parks on
+    `ApplyPending` alone, so a quiesced group has an empty `SimEnv` timeline
+    (`tests/it/quiesced_apply_no_poll.rs`). The consensus loop keeps a
+    loop-local `quiesced_seen` and raises `apply_signal` on every
+    quiesced/awake transition it observes (comparing the previous
+    iteration's state, this iteration's top sample, and its post-step
+    sample, so an un-quiesce done outside the loop — local propose, `wake()`,
+    `read_barrier` — is still caught, since each also wakes the loop). That
+    notify is what re-arms the poll for signal-less work
+    (`take_snapshot_needed` can only be set by a leader's replicate cycle,
+    and `quiesce_entry_ok` requires `!snapshot_needed` / no snapshot
+    machinery, so a quiesced group cannot reach it without first
+    un-quiescing). A new apply-task wake source that can fire while
+    quiesced must raise `apply_signal` itself.
   - **`Freeze` and `SplitTablet`'s own whole-range seal-marker writes are
     halted-gated too (issue #939)** — the same class of bare `.expect(..)`
     hard panic `flush_pending`/the WAL-compaction `replace` path above were
@@ -2876,6 +2989,28 @@ wire/image codec is `pub(crate)`; new formats add a section in whichever fits.
     build must not touch (pre-baseline or newer-version data). Keep the
     refusal a plain `return None` before that `match` arm.
 
+- **`txn-envelope` v2** (`txn.rs`, ADR 0018's 2026-10-04 amendment): the
+  per-value tag byte is the version (`0` committed, `1` v1 intent, `2` v2
+  intent = v1 body + trailing `prior`). **Class G too (ADR 0073's 2026-10-05
+  amendment, #1237): apply always writes v2 into the node's own engine, but
+  `engine_image` (the `InstallSnapshot` image, the one place engine values leave
+  a node) ships every v2 intent down-converted to v1 — plus its prior as the
+  committed row one MVCC version below the intent, where the v1 lookback reads
+  it — until `Gate::GlobalTables` (cluster version 2) is open; an N-1 replica
+  panics on tag 2. Never branch apply on the gate; never ship an engine value
+  without asking what an N-1 reader does with it.** `decode_envelope` dispatches on it;
+  `txn::legacy::v1` holds the frozen v1 decoder and the v1 encoder (production
+  code now, the snapshot sender uses it; not `legacy-encoders`-gated), plus `downgrade_intent_to_v1`
+  (re-exported as `downgrade_txn_envelope_to_v1`): the strict whole-value v2 -> v1
+  down-conversion the upgrade harness's engine-row transcode
+  (`animus-test`'s `ROW_TABLE`) applies to every stored row. It parses the *entire*
+  v2 shape (tag, every field, the trailing `prior`, nothing after) before touching a
+  value, because an engine holds many unrelated value kinds and a row carries no
+  type marker beyond the tag. Fixtures
+  `txn-envelope/v1.bin` + `v2.bin` (`u32`-BE-length-prefixed envelope
+  values), tests in `src/format_fixture_tests.rs`. The shared v1 body codec
+  (`put_intent_v1_body`/`decode_intent_v1_body`) is frozen: a future version
+  that changes those fields copies them into `legacy::v1` first.
 - **Decoder dispatch + `legacy` seam (ADR 0073 Phase 1, P1-A).** Every
   format here (`backup-manifest`, `backup-data`, `segment`, `raftkv-wire`,
   `raftkv-image`, `cp-engine-layout`) keeps its `0`/`> CURRENT` named error
@@ -3053,7 +3188,7 @@ different host/session/media (the bench prints the resolved `/proc/mounts`
 filesystem type + device for whatever directory it writes into, so a
 reader never has to take the media on faith).
 
-**Upgrade-harness class (ADR 0073 P1-D):** none of this crate's formats is a whole-file `TABLE` entry; `raftkv-wal` and `cp-engine-layout` are `EMBEDDED` in a whole-file carrier (`control-wal`/`lsm-sstable`), and `raftkv-wire`, `raftkv-image`, `segment`, `backup-manifest`, `backup-data` are `EMBEDDED` off-disk (`animus-test`'s `upgrade::transcode::EMBEDDED`).
+**Upgrade-harness class (ADR 0073 P1-D):** none of this crate's formats is a whole-file `TABLE` entry; `raftkv-wal`, `cp-engine-layout` and `txn-envelope` (v2) are `EMBEDDED` in a whole-file carrier (`control-wal`/`lsm-sstable`), and `raftkv-wire`, `raftkv-image`, `segment`, `backup-manifest`, `backup-data` are `EMBEDDED` off-disk (`animus-test`'s `upgrade::transcode::EMBEDDED`).
 
 ## `wal_lock` is a FIFO-fair `FairMutex` (apply-task starvation fix)
 
@@ -3082,9 +3217,52 @@ own internal mutex (in `animus-control`) is only taken inside `append_tagged`/
   `ANIMUS_DENSITY_BATCH=N` hosts N groups at a time waiting for leaders, avoiding
   the all-at-once election herd). Each (rf, G)
   cell runs in a child process so allocator retention cannot leak between cells.
-  Assertions are liveness only; the numbers are the product. Known finding: a
-  quiesced group still wakes every `APPLY_SAFETY_POLL` (250 ms) via its apply
-  task, so steady CPU is small but nonzero and scales with G.
+  Assertions are liveness only; the numbers are the product. The first run found a
+  quiesced group still woke every `APPLY_SAFETY_POLL` (250 ms) via its apply
+  task (issue #1180, fixed by #1207); the quiesced CPU numbers in ADR 0044's
+  2026-10-04 outcome amendment predate that fix.
+
+## Per-group WAN timing in the host reconciler (ADR 0075 section 3.4)
+
+`MetadataView::regions` (member id -> region label, empty by default: no
+behaviour change) and `Reconciler::set_max_region_rtt` feed
+`Reconciler::timing_profile_for(replicas)`; the profile is applied on `host`,
+on `materialize_split_child` and re-applied every `tick` to each hosted tablet
+(a label or replica-set change converges; the no-change path draws no
+entropy). `RaftKvNode::set_timing_profile` wakes the driver on a real change;
+`RaftKvNode::election_timeout()` reads the installed base. **The ADR 0044
+heartbeat batcher is unchanged**: its 50 ms tick (`DEFAULT_HEARTBEAT_BATCH_
+INTERVAL`) is `<=` every profile's heartbeat. Every `MetadataView { .. }`
+literal now needs `..Default::default()` (or a `regions` field). Corpus:
+`tests/it/wan_timing_corpus.rs`, `ANIMUS_WAN_TIMING_SEEDS` (see the lesson
+`docs/lessons/testing/2026-10-04-measure-where-the-old-setting-fails-before-
+building-its-negative-control.md`: the LAN-forced control only bites on the
+re-election cells).
+
+## Preferred leader and witness replicas (ADR 0075 section 3.3/3.6, G-c M2)
+
+`MetadataView::preferred_leader` (tablet -> `LeaderPreference { region, witness }`,
+empty = no behaviour change; `animusd::leader_preferences` derives it from
+`TableSchema.global` x `Tablet.table`) feeds `Reconciler::preferred_leader_step`
+(end of `tick`). It acts only when this node **leads a tablet from a Region it must
+not** (not the preferred one, or the witness one): the violation must hold for
+`PREFERRED_LEADER_STABILITY_TIMEOUTS` (2) election timeouts and transfers are at
+least `PREFERRED_LEADER_MIN_INTERVAL_TIMEOUTS` (10) apart per group; target = non-`Down`
+voter in the preferred Region with the best `peer_match >= commit_index` (the exact
+arm gate of `RaftCore::transfer_leadership`; its `bool` is checked and a refusal is
+retried without resetting the window; metrics `CpPreferredLeaderTransfers`/`...Rejected`).
+A witness-region leader falls back to any other caught-up non-witness voter. Idle
+correct groups are never touched, so quiescence is not fought (arming a transfer is
+the only wake). The same pass calls `RaftKvNode::set_witness`, which makes
+`stale_read_ready()` false so a witness never serves a replica-local eventual read
+(`animusd` `cp_stale_forward_target` also skips witness replicas). Corpus:
+`tests/it/preferred_leader_corpus.rs`, `ANIMUS_MRSC_SEEDS`. Known: quiescence does not
+settle on links with RTT above the heartbeat interval (issue #1226), so the quiescence
+cell runs on 1 ms links.
+
+## Fuzzing (roadmap R-01 (c))
+
+The RaftKV codec (wire/image/WAL), segment codec, backup chunk/manifest codecs, layout marker, cursors and engine marker values are the `cp_data_formats` fuzz target; the `pub(crate)` ones are reached through the off-by-default `fuzzing` feature (`src/fuzzing.rs`). See `fuzz/README.md` (stable smoke: `cd fuzz && cargo test --release --test smoke`).
 
 ## Gate enforcement (ADR 0073 Phase 2, P2-B)
 
@@ -3111,3 +3289,113 @@ own internal mutex (in `animus-control`) is only taken inside `append_tagged`/
   re-points its `HeartbeatBatcher` via `set_features`) is the production seam P2-C
   calls with `RaftNode::features()`. A hosted group keeps the handle it started with.
 
+
+## StorageFull with every replica full (issue #1228)
+
+A suspect-WAL node ships frozen acks (`is_frozen_ack`: success acks at or below
+the frozen durable index, heartbeats) next to the `ships_before_durable`
+allowlist, so followers stay in contact and the leader keeps its seat. Reads on
+a full leader: `read_serve_ts` serves linearizable reads at the engine's highest
+version once the ceiling lapses (no unproposable ceilings), and `read_barrier`
+targets the leader's first-term entry instead of `commit_index` (the engine may
+be paused short of it). `stale_read_ready` for a full replica needs only
+`had_leader_contact` and no half-installed snapshot. Leader death with every
+replica full is not repaired until space returns (ADR 0074 amendment). G-01
+preferred-leader transfer goes through `transfer_leadership`, so it inherits the
+refuse-full-target and healthy-quorum guards, and the storage-full step-down
+wins over preference. `peer_health` is a diagnostic on the node's own clock
+(the sim has per-node clock skew; never compare it with another node's `now`).
+Tests: `animus-control` `storage_full_step_down`, `animus-test`
+`raftkv_disk_full_all_replicas_*`, `quiescence` (ix), `animusd`
+`sim_cluster_dynamo_disk_full`, `chaos_disk_full` phase 2. The `first`-based
+ReadIndex is guarded by `raftkv_disk_full_paused_apply_leader_still_serves_
+linearizable_reads` (animus-test): a slow fsync on the leader alone makes a
+write commit on the two healthy followers while the leader's durable index and
+apply lag, then 100% ENOSPC is armed on all three at that instant; replacing
+the `first` target with `commit_index` makes the read return None.
+
+## StorageFull: per-tablet WAL recovery (R-01 (d), issue #1185)
+
+`persist_wal` no longer `assert!`s on an ENOSPC append/sync (per-group file or
+`SharedWal::append_tagged`): it calls `PersistProgress::mark_suspect` and runs
+`recover_kv_wal`, which wraps `animus_control::persist_round::recover_suspect_wal`
+with a `write_image` of `Disk::replace` (removing the `.tmp` sibling on failure)
+on the per-group path or `SharedWal::compact_group` on the shared path. A
+suspect group refuses writes before proposing (`RaftKvNode::is_storage_full`,
+`record_storage_full_refusal` feeds `overload_storage_full`), keeps serving
+reads of applied state, and `apply_and_compact` skips compaction while suspect
+(an ENOSPC compaction rewrite also marks suspect; the staged-rewrite path
+tolerates ENOSPC). The `persist` field on `RaftKvNode` exposes the progress
+handle. A non-ENOSPC failure stays `assert!(halted)`. Engine-side ENOSPC (issue #1218):
+`apply_loop` wraps its engine in `apply_stall::StallingEngine`, which retries
+any `StorageError::StorageFull` call (after `Env::sleep`) instead of panicking
+at the apply task's many `.expect`s; `RaftKvNode::is_storage_full()` is
+`persist.is_suspect() || apply_stalled`. Soundness rests on the engine contract
+that a `StorageFull` call changed nothing, and on the task being blocked inside
+that call (order preserved). On `halted` a paused call sets `apply_stopped` and
+parks (never panics a caller's `.expect`). Only the apply task's handle is
+wrapped; other engine users still propagate. See `docs/resource-bounds.md`
+section 3.
+
+**Leader step-down (issue #1219).** The consensus loop computes
+`storage_full = persist.is_suspect() || apply_stalled` every pass, in the same
+lock acquisition as `set_state_machine_behind`: it calls
+`RaftCore::set_storage_full` (no campaigning, `TimeoutNow` declined), vetoes
+quiescence while full, and on a **leader** arms `RaftCore::storage_full_step_down`
+(rotating `stepdown_last`, cooldown `2 * election_timeout`, then
+`propose_signal.notify()` so `TimeoutNow` ships immediately). A refused write
+(`record_storage_full_refusal`) and the apply task's ENOSPC stall start
+(`StallingEngine`'s `wake`) raise `wake_signal`, so a parked/quiesced leader
+re-evaluates; arming un-quiesces. A full follower never acks (the failed round
+gates every ack; `persist_round` unit test + corpus pin). Do not make the step-down
+conditional on follower health knowledge: there is no wire signal for it, an
+aborted transfer to a full target is the (cheap) negative answer.
+
+handle. A non-ENOSPC failure stays `assert!(halted)`. Gap: engine-side ENOSPC
+(LSM flush/compaction, apply-time `merge_batch`) is NOT handled; the corpus
+runs `MemoryEngine` only. See `docs/resource-bounds.md` section 3.
+
+## A split child's log does not reproduce its engine (issue #1229)
+
+A fork child's engine is cloned from the parent's, so its pre-fork rows are in no
+log entry. `RaftKvNode`'s driver reads the durable split-trim marker at start and
+calls `RaftCore::set_log_omits_base(true)`; while the leader's `snapshot_index` is 0
+it then sends a *learner* no log (it raises `snapshot_needed` instead, so the engine
+image is built and shipped). Never route a new replica of a fork child through log
+replay. Regression: `animusd` `sim_cluster_split_relocation`. ADR 0058's
+2026-10-05 amendment; lesson `docs/lessons/code-patterns/2026-10-05-state-seeded-outside-the-log-needs-a-snapshot-for-every-new-replica.md`.
+
+- **TxnId uniqueness (R-01 F-2).** `TxnId.node` is the node qualified by the group stream (`n0#100`; primary stream = bare node id), because `ts` is per-group `Hlc` state and one node leads many groups. `txn_stage_local` (animusd) also refuses, before proposing, a stage group with any key outside the leader range (stale grouping across a split). See `docs/lessons/testing/2026-10-05-a-txn-id-must-be-unique-per-group-not-per-node.md`.
+
+- **Seal check on every mutating apply arm (R-01 F-2).** `TxnCommit`/`TxnAbort` (and the orphan tombstone) are deterministic no-ops on a sealed record key, like every other mutation: a fork clones the parent's CURRENT engine per replica, asynchronously, so a post-fork decision landing in the parent diverges the children. Regression: `tests/it/split_tablet.rs::a_txn_decision_ordered_after_the_fork_is_a_sealed_no_op`; see `docs/lessons/testing/2026-10-05-every-mutating-apply-arm-needs-the-seal-check.md`.
+
+- **MREC shapes (G-01 stage G-d M1).** `KindEvalOp::Replicate { item, ver }` and
+  `WriteSchema.mrec` ride as JSON blobs inside `KindEval`/`KindEvalBatch`/`TxnStage`
+  (no binary codec bump, wire stays v1, WAL v2). `KvCommand::required_gate` is
+  **content-dependent** for those three carriers (`gates.rs::eval_gate`: MREC content
+  joins to `Gate::MrecReplication`), enforced at the one `gated_propose` choke point;
+  `evaluate_kind_eval` gives a `Replicate` its LWW semantics (M2, below). Shaped fixtures `raftkv-wire/v1-mrec.bin`, `raftkv-wal/v2-mrec.bin`
+  (built by `codec::tests::mrec_sample_wires`; `fixture_files` skips `vN-<shape>` names).
+
+- **MREC apply (G-01 stage G-d M2, ADR 0075 amendment).** `evaluate_kind_eval` takes
+  the stored stamp (`decode_stored_item_versioned`; the `KindEvalBatch` overlay carries
+  it too). `KindEvalOp::Replicate` applies iff `ver > stored` via the normal
+  `derive_kind_writes` path, else `KindEvalDecision::Superseded` (no writes, not even a
+  change record; leader-local `KindEvalResult::superseded` /
+  `KindEvalItemResult::Superseded`, the replicated outcome stays `Applied`); a key with
+  an intent gives `ConditionFailed` (the shipper's Retry); `mrec: None` rejects. A local
+  op with `WriteSchema.mrec` stamps via `MrecVersion::next_local`. A `Replicate` in a
+  `TxnStage` is rejected before evaluation. Tests: `src/mrec_props.rs` (pure convergence
+  proptest + two negative controls, `ANIMUS_MREC_PROP_CASES`), `tests/it/mrec_apply.rs`
+  (a group opened with `HostedOptions { features }` at cluster version 3: the propose
+  gate panics in tests otherwise). **Adding a base-row writer for an MREC table means
+  stamping it** (see the ADR's writer audit).
+
+**MREC apply is the only consumer-facing piece here (ADR 0075 "G-d as built").** The
+shipper, saga and receiver live in `animusd`; this crate owns the last-writer-wins rule
+(`apply_mrec`: stored `MrecVersion` vs the incoming one, `Superseded` on a loss, stamped
+tombstones, a foreign intent is `Retry`) and the content-dependent `KvCommand::required_gate`.
+The cursor rows `mrec:<region>`/`mrecscan:<region>` are ordinary `KIND_CURSOR` rows written
+through the existing kind ops (no new command); `trim_split_child` drops them, which is why
+a split child rescans. Test-only switch `mrec_test_switch::set_lww_by_arrival` (thread-local)
+backs the M5 negative control; never reachable in a release build path.

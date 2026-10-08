@@ -824,3 +824,41 @@ read — the propose→apply staleness window this ADR set out to close is
 closed for every caller, and the leader-side machinery that used to exist
 only to make the old design safe (or to double-check the new one against
 it) is gone.
+
+## Amendment 2026-10-06 — `KindEval`/`KindEvalBatch` replay as a no-op over an engine that already holds them (issue #1247)
+
+Evaluating at apply means the decision (condition result, foreign-intent
+`ConditionFailed`, an `Update`'s fold) is a function of engine state. WAL
+recovery re-applies a restarted replica's log tail from `snapshot_index` over
+its own durable engine, which already holds this entry's — and later entries' —
+effects, so the replayed decision can differ from the live one (ADR 0018's
+2026-10-06 `TxnStage` amendment, issue #1242, is the same shape). The base row
+is protected by per-key last-writer-wins, but the derived rows
+`materialize_derived` writes are not: the change-log record sits on a unique
+`prefix || ts || ordinal` key and LSI/footprint rows are keyed by item
+attributes, so a flipped decision lands an orphan stream record or index row on
+the restarted replica alone. Three concrete flips were reproduced: a
+`attribute_not_exists` put rejected live because the item existed, replayed
+after the item was deleted; a put rejected live by a foreign intent, replayed
+after the intent resolved; and, inside a `KindEvalBatch`, an applied
+`not_exists` item that fails on replay against its own write, which shifts every
+later item's change-record ordinal onto a different key.
+
+Fix, apply-side only (no command, wire or durable-format change): each arm reads
+its decided base key(s) **tombstone-aware** and, if a base key's newest version
+is **at or above** the entry's `ts`, replays as a no-op before any derived row
+is written (`KindEval` records `ConditionFailed`; `KindEvalBatch` fills every
+item `ConditionFailed`; nobody waits on a replayed entry). At-or-above, unlike
+`TxnStage`'s strictly-above rule, because the entry's whole write set is one
+atomic `merge_batch` (one WAL record): a base row at the entry's own version
+proves every row landed, and re-evaluating would read its own post-state (an
+`ADD` applied twice). `KindEvalBatch` skips the whole entry when any item's key
+is reached (a per-item skip would leave later items re-evaluating against
+shifted ordinals). The branch is unreachable live: `assert_ts_monotonic` makes
+every existing row's version strictly smaller than the entry's `ts`; the one
+exception is a `SeedBatch`-seeded key carrying a higher source-cluster version
+(restore), where the write is dropped deterministically on every replica
+(`ConditionFailed`, as the base merge could not land there anyway) — a liveness
+edge on a not-yet-served table only. Regression: `animus-cp-data`
+`tests/it/kind_eval_replay_stability.rs` (directed shapes plus a seeded
+corpus, `ANIMUS_KINDEVAL_REPLAY_SEEDS`).

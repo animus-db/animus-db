@@ -163,6 +163,8 @@ async fn join_control_nonvoter(
             advertise_host: None,
             tls: None,
             encryption_key_path: None,
+            labels: Default::default(),
+            overload: None,
         };
         let bound = match animusd::Node::bind_control(
             nid(new_control_id),

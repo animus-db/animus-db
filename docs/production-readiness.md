@@ -28,7 +28,7 @@ Last verified against the tree: 2026-10-04.
 
 | Needs | Blocks |
 |---|---|
-| B-01 (benchmark harness / workload generator, `docs/roadmap.md`) | (a) soak workload; (e) capacity-planning numbers; (f) per-op-class p99 SLO targets |
+| B-01 (benchmark harness / workload generator: `crates/animus-bench`, ADR 0076; published numbers still pending) | (a) soak workload; (e) capacity-planning numbers; (f) per-op-class p99 SLO targets |
 | C-17 (scale/density, `docs/roadmap.md`) | (d) default connection/in-flight bounds sizing; (e) disk and node sizing |
 | ADR 0073 Phase 2 (replicated cluster version / feature gate) and Phase 3 (rolling upgrades) | (e) the rolling-upgrade chapter; criterion G-7 mixed-version support statement |
 
@@ -46,37 +46,37 @@ Last verified against the tree: 2026-10-04.
 | X-8 | Backup, restore and PITR implemented and fault-injection tested | Met | `docs/adr/0059-backup-restore.md` | X |
 | X-9 | The Kubernetes operator is smoke-tested on a real `kind` cluster in CI (create, bootstrap, scale, delete; plain and TLS) | Met | `scripts/e2e-kind.sh`, `.github/workflows/e2e-kind.yml`, `docs/adr/0060-kubernetes-operator.md` | X |
 | X-10 | Dependency licences and advisories are gated per push | Met | `deny.toml`, the `cargo-deny check` step in `.github/workflows/ci.yml` | X |
-| X-11 | Rolling (mixed-version) upgrades are supported and tested | Pending-dependency | ADR 0073 Phase 2 (design in review) then Phase 3 (planned); today only whole-cluster restart is supported | X |
+| X-11 | Rolling (mixed-version) upgrades are supported and tested | Pending-dependency | ADR 0073 Phase 2 (P2-A and P2-C landed: era live, admin/CLI present; P2-B and P2-D not yet) then Phase 3 (planned); rolling upgrade is not yet supported, only whole-cluster restart | X |
 
 ## (a) Soak
 
-Needs B-01's workload generator.
+Harness: [`docs/soak.md`](soak.md). (It uses the chaos history recorder, not B-01's `animus-bench` generator, which yields latency rather than an oracle-checkable history.)
 
 | ID | Criterion | Status | Evidence | Owner |
 |---|---|---|---|---|
-| A-1 | A multi-day soak harness runs real `animusd` processes (bare multi-process and/or the operator on `kind`) under a continuous recorded workload | Pending-dependency | None yet (no soak tooling in the tree); needs B-01 | a |
-| A-2 | A 7-consecutive-day soak completes with zero violations from the `animus-test` oracles (`check_cycles`, `check_durability`, `check_convergence`) over the recorded history | Pending-dependency | Oracles exist: `crates/animus-test/src/check.rs`; no soak run yet | a |
-| A-3 | Resource trends stay bounded over the soak: RSS, open fds, disk, WAL and compaction backlog show no monotone growth | Pending-dependency | None yet; metrics seam `crates/animus-env/src/metrics.rs` | a |
-| A-4 | Soak is re-runnable from CI or one documented command | Pending-dependency | None yet (`.github/workflows/soak.yml` planned) | a |
+| A-1 | A multi-day soak harness runs real `animusd` processes (bare multi-process and/or the operator on `kind`) under a continuous recorded workload | Not met | Bare multi-process harness `crates/animusd/tests/soak.rs` (opt-in `soak` feature), [`docs/soak.md`](soak.md); operator-on-`kind` leg not built; uses the chaos recorder rather than `animus-bench` | a |
+| A-2 | A 7-consecutive-day soak completes with zero violations from the `animus-test` oracles (`check_cycles`, `check_durability`, `check_convergence`) over the recorded history | Not met | Oracles run per epoch inside the harness (`docs/soak.md`); only short legs run so far, no 7-day run | a |
+| A-3 | Resource trends stay bounded over the soak: RSS, open fds, disk, WAL and compaction backlog show no monotone growth | Not met | Trend detector `crates/animus-test/src/soak.rs` (unit-tested) and per-node sampling in `tests/soak.rs`; no 7-day run | a |
+| A-4 | Soak is re-runnable from CI or one documented command | Met | `.github/workflows/soak.yml` (short leg, weekly + dispatch) and the one command in `docs/soak.md` | a |
 
 ## (b) Real-cluster chaos
 
 | ID | Criterion | Status | Evidence | Owner |
 |---|---|---|---|---|
-| B-1 | Chaos scenarios run against real processes: process kill, network partition, clock skew, slow disk, disk full | Not met | None yet. Only simulated faults exist (`crates/animus-sim`) and the operator smoke `scripts/e2e-kind.sh` has no fault leg | b |
-| B-2 | Each scenario records a client history and passes the `animus-test` oracles | Not met | Oracles exist (`crates/animus-test/src/check.rs`); no real-cluster history capture | b |
-| B-3 | A failure reproducible from a seed is converted into a seeded sim corpus cell | Not met | Process not yet exercised (no chaos failures yet); policy in ADR 0074 section 1 | b |
-| B-4 | A chaos leg runs in CI or nightly beside the `kind` e2e | Not met | `.github/workflows/e2e-kind.yml` exists; no chaos leg | b |
+| B-1 | Chaos scenarios run against real processes: process kill, network partition, clock skew, slow disk, disk full | Not met | Real-process harness `crates/animusd/tests/chaos.rs` covers process kill (incl. control leader, full power cut), network partition (incl. one-way), delay and SIGSTOP stall, see `docs/chaos.md`. Disk full now runs against real processes on real size-limited tmpfs mounts (`chaos_disk_full`, #1221; needs `CAP_SYS_ADMIN`, CI job `chaos-disk-full`, skips cleanly where mounting is not permitted); it found two real defects (F-1 and F-2 in `docs/chaos.md`, both since fixed). Still missing from the criterion: clock skew and slow disk (Kubernetes-only designs in `deploy/chaos/`, unvalidated) | b |
+| B-2 | Each scenario records a client history and passes the `animus-test` oracles | Not met | History capture and oracle feed exist (`crates/animusd/tests/chaos_support/workload.rs`, oracles `crates/animus-test/src/check.rs`) but the first runs found a violation (`docs/chaos.md`, Findings), so the scenarios do not pass | b |
+| B-3 | A failure reproducible from a seed is converted into a seeded sim corpus cell | Not met | Policy in ADR 0074 section 1. The first finding is timing-dependent (not seed-reproducible, ~1 in 12 smoke runs) and has not been reduced to a sim cell yet; the engine-level mechanism is reproducible deterministically (`docs/chaos.md`, Findings) | b |
+| B-4 | A chaos leg runs in CI or nightly beside the `kind` e2e | Met | `.github/workflows/chaos.yml` (PR smoke + nightly, non-required) beside `.github/workflows/e2e-kind.yml` | b |
 
 ## (c) Fuzzing
 
 | ID | Criterion | Status | Evidence | Owner |
 |---|---|---|---|---|
-| C-1 | A `cargo-fuzz` target exists for every untrusted parser: DynamoDB JSON request decode, UpdateExpression/ConditionExpression/projection parsers, PartiQL lexer/parser, SigV4 header/credential parsing, the HTTP request parser | Not met | No `fuzz/` directory. Parsers live in `crates/animus-dynamo/src/wire.rs`, `crates/animus-node/src/http.rs` | c |
-| C-2 | A fuzz target exists for each durable-format decoder with a `legacy` seam (LSM WAL/SSTable/manifest, Raft WAL/snapshot, RaftKV codec, segment and backup chunk codecs, encryption envelope), seeded from the golden fixtures | Not met | Seeds exist: `crates/*/tests/fixtures/formats/`; no targets | c |
-| C-3 | Property held: never panic, never allocate unboundedly, decode-or-named-error | Not met | No targets to hold it yet | c |
-| C-4 | A short fuzz smoke (about 60 s per target) runs per push and long runs nightly | Not met | Nightly infra exists: `.github/workflows/corpus-deep.yml`; no fuzz job | c |
-| C-5 | Every crash found becomes a regression test (format-decoder crashes are filed as bugs under the green invariant) | Not met | Process, nothing found yet | c |
+| C-1 | A `cargo-fuzz` target exists for every untrusted parser: DynamoDB JSON request decode, UpdateExpression/ConditionExpression/projection parsers, PartiQL lexer/parser, SigV4 header/credential parsing, the HTTP request parser | Met | `fuzz/fuzz_targets/{dynamo_request,dynamo_expressions,partiql,http_sigv4,net_frames}.rs`; stable smoke `fuzz/tests/smoke.rs`; see `fuzz/README.md` | c |
+| C-2 | A fuzz target exists for each durable-format decoder with a `legacy` seam (LSM WAL/SSTable/manifest, Raft WAL/snapshot, RaftKV codec, segment and backup chunk codecs, encryption envelope), seeded from the golden fixtures | Met | `fuzz/fuzz_targets/{lsm_formats,control_formats,cp_data_formats,encryption_envelope,item_codecs}.rs`, seeded in place from `crates/*/tests/fixtures/formats/` via `fuzz/seeds.tsv` | c |
+| C-3 | Property held: never panic, never allocate unboundedly, decode-or-named-error | Not met | Held on every target except one known violation: an LZ4 SSTable block's untrusted size prefix allocates ~4 GiB (`animus-storage` `decode_block_v1`), fenced by a guard in `fuzz_shims::block_v1` and listed in `fuzz/known-issues.tsv`; flips when its fix PR lands | c |
+| C-4 | A short fuzz smoke (about 60 s per target) runs per push and long runs nightly | Not met | `.github/workflows/fuzz.yml` (60 s per target per push, long nightly matrix) is in the tree; flips on its first green run | c |
+| C-5 | Every crash found becomes a regression test (format-decoder crashes are filed as bugs under the green invariant) | Not met | One finding so far (the LZ4 size-prefix allocation above); its regression test lands with the fix | c |
 
 ## (d) Resource bounds and overload
 
@@ -93,13 +93,13 @@ uses C-17.
 | D-4 | Every client-facing listener has a finite connection cap; an excess connection is refused with 503 `ServiceUnavailable`, never queued | Not met | The accept loop in `crates/animusd/src/dynamo.rs` spawns a task per connection with no cap; no cap in `crates/animus-node/src/http.rs` | d |
 | D-5 | A node-wide in-flight request bound and a per-connection pipelining bound shed with `ServiceUnavailable`, before queuing | Not met | None; error plumbing exists (`error_status`, `WireError::service_unavailable`) | d |
 | D-6 | Memory-bound audit done: per-connection buffers, scan/batch result sizes, snapshot streaming buffers and channels on untrusted paths are bounded and documented, each with a test | Not met | No audit recorded | d |
-| D-7 | Disk-full: a write that cannot be fsynced is refused with a named `StorageFull` error and never acked, reads continue, and the node recovers without restart when space returns; proven in sim and on a real size-limited filesystem | Not met | Sim primitive exists (`ErrorKind::StorageFull` in `crates/animus-sim/src/lib.rs`, `crates/animus-sim/tests/it/disk_faults.rs`); no handling or `ProdEnv` test on a real node | d |
+| D-7 | Disk-full: a write that cannot be fsynced is refused with a named `StorageFull` error and never acked, reads continue, and the node recovers without restart when space returns; proven in sim and on a real size-limited filesystem | Partially met | Handled (R-01 (d), #1185): ENOSPC marks the WAL suspect, refuses writes with a named 503 `StorageFull` (`overload_storage_full`), reports `storage_full` on `/admin/health`, and rewrites the WAL onto free space without a restart; sim corpus `ANIMUS_DISK_FULL_SEEDS` (`raftkv_linearizable.rs`). LSM-engine ENOSPC (#1218) is handled too: the apply task pauses and retries, flush/compaction fail cleanly, the group reports `storage_full` while paused, and the corpus runs over `LsmEngine<SimEnv>`. A StorageFull tablet leader hands leadership to a replica with free disk (#1219), so a leader-only disk-full window keeps the group writable (probe writes acked in-window in the corpus). The real-filesystem leg now exists (#1221): `chaos_disk_full` (`crates/animusd/tests/chaos.rs`) puts each node's data dir on its own 64 MiB tmpfs, fills one node then all three with a ballast file under a recorded workload, asserts the named 503 `StorageFull` refusal, `storage_full` on `/admin/health`, writes continuing through the other replicas in the one-node window, recovery with no restart (same pids) after the ballast is deleted, and runs the oracles. A panicked consensus task now fails `/admin/health` and is exported as `consensus_task_panics` (#1220). With every replica full (#1228) the leader keeps its seat, writes get a prompt 503 `StorageFull`, and linearizable and eventual reads are still served (sim cells, a SimCluster wire test and chaos phase 2 assert it; F-1 and F-3 resolved, `docs/resource-bounds.md` "Every replica full"). A leader that dies while every replica is full is not replaced until space returns (documented decision, ADR 0074 amendment). The F-2 unresolved-intent defect was fixed separately; the scenario still runs with 2PC off by default | d |
 | D-8 | Each overload refusal is counted by reason in the metrics seam | Not met | None; metrics seam `crates/animus-env/src/metrics.rs` | d |
 
 ## (e) Operations runbook
 
 Capacity planning needs B-01 and C-17; the upgrade chapter's rolling part
-needs ADR 0073 Phase 3.
+landed with ADR 0073 Phase 3 (E-7, partially met).
 
 | ID | Criterion | Status | Evidence | Owner |
 |---|---|---|---|---|
@@ -109,7 +109,7 @@ needs ADR 0073 Phase 3.
 | E-4 | Certificate rotation procedure (restart-time `TlsConfig::load()`) | Not met | Mechanism: `docs/adr/0064-tls-on-every-port.md` | e |
 | E-5 | Encryption key rotation procedure | Not met | Mechanism: `docs/adr/0069-encryption-at-rest.md` | e |
 | E-6 | Upgrade chapter: whole-cluster procedure per ADR 0073 | Not met | Supported and tested (X-3); no runbook page | e |
-| E-7 | Upgrade chapter: rolling-upgrade procedure | Pending-dependency | ADR 0073 Phase 3 | e |
+| E-7 | Upgrade chapter: rolling-upgrade procedure | Partially met | `docs/runbook/upgrade.md` (manual and operator paths); exercised on real processes by the `upgrade-previous-release` CI job (`crates/animusd/tests/upgrade_previous_release.rs`); the operator path's nightly `kind` leg (`E2E_UPGRADE=1`) has not yet had a verified run; **not met yet:** rolling from a release older than `efcaa6cb` with transactions carries that release's own bug (#1238; #1237 is fixed) and the `kind` leg is unverified | e |
 | E-8 | Capacity planning and disk sizing with published numbers | Pending-dependency | B-01 and C-17 | e |
 | E-9 | A game-day drill checklist is executed once on `kind` | Not met | `scripts/e2e-kind.sh` is the substrate; no checklist | e |
 
@@ -153,7 +153,7 @@ date. Waivers are re-reviewed at every release.
 
 ## Summary (2026-10-04)
 
-Met: X-1 to X-10, D-1, D-2, F-1, G-8. Pending-dependency: X-11, A-1 to
-A-4, E-7, E-8, F-2, F-5. Not met: every remaining row (all of B and C, D-3
+Met: X-1 to X-10, A-4, B-4, D-1, D-2, F-1, G-8. Pending-dependency: X-11,
+E-8, F-2, F-5. Partially met: D-7, E-7 (ADR 0073 Phase 3 landed 2026-10-05). Not met: every remaining row (A-1 to A-3, B-1 to B-3, all of C, D-3
 to D-8, E-1 to E-6 and E-9, F-3, F-4, G-1 to G-7, G-9). The project is therefore
 **pre-alpha**.

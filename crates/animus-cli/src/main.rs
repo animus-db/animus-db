@@ -28,6 +28,8 @@
     reason = "animus-cli is a real-socket client CLI outside the Env seam, not system logic (ADR 0003); see ADR 0061 Decision 4"
 )]
 
+mod roll;
+
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -70,7 +72,7 @@ async fn main() -> ExitCode {
         Err(msg) => {
             eprintln!("animus: {msg}");
             eprintln!(
-                "\nusage:\n  animus [--tls-ca PATH] status <node-addr>\n  animus [--tls-ca PATH] put <node-addr> <table> <key> <value>\n  animus [--tls-ca PATH] get <node-addr> <table> <key>\n  animus [--tls-ca PATH] get-eventual <node-addr> <table> <key>\n{SEED_USAGE}\n{ADMIN_USAGE}"
+                "\nusage:\n  animus [--tls-ca PATH] status <node-addr>\n  animus [--tls-ca PATH] put <node-addr> <table> <key> <value>\n  animus [--tls-ca PATH] get <node-addr> <table> <key>\n  animus [--tls-ca PATH] get-eventual <node-addr> <table> <key>\n{SEED_USAGE}\n{CLUSTER_USAGE}\n{TABLE_USAGE}\n{ADMIN_USAGE}"
             );
             ExitCode::FAILURE
         }
@@ -213,9 +215,17 @@ async fn maybe_tls_connect(
 const SEED_USAGE: &str = "  seed <admin-addr> <table> <count> [--start N] [--key-prefix P] \
     [--value-bytes B] [--concurrency C] [--batch N]";
 
+const TABLE_USAGE: &str = "  table preferred-leader <admin-addr> <table> <region>";
+
+const CLUSTER_USAGE: &str = "  cluster version <admin-addr> [--json]\n  \
+    cluster finalize <leader-admin-addr> [--to N] [--yes]\n  \
+    cluster roll plan <admin-addr> [--json]\n  \
+    cluster roll status <admin-addr> [--json]\n  \
+    cluster roll wait <node-admin-addr> [--node ID] [--timeout 10m] [--interval 2s] [--finalize --yes]";
+
 const ADMIN_USAGE: &str = "  admin <subcommand> <admin-addr> [args]:\n    \
     config|status|raft|raftkv|metrics|health <admin-addr>\n    \
-    peers|txns|backups|restores|backup-store|ttl-reaper|gc|segment-store|control-members|storage-control <admin-addr>\n    \
+    peers|txns|backups|restores|backup-store|ttl-reaper|gc|segment-store|control-members|global-tables|storage-control <admin-addr>\n    \
     lsm|wal <admin-addr> [tablet]\n    \
     wal-segment <admin-addr> <seg> [tablet]\n    \
     key <admin-addr> <key> [tablet]\n    \
@@ -230,7 +240,7 @@ const ADMIN_USAGE: &str = "  admin <subcommand> <admin-addr> [args]:\n    \
     stream-grow <admin-addr> <table>\n    \
     flush|compact <admin-addr> <tablet>\n    \
     reconfigure <admin-addr> <tablet> <voter,voter,...>\n    \
-    drain <admin-addr> <node-id>\n    \
+    drain <admin-addr> <node-id> [--force]\n    \
     drain-status <admin-addr> <node-id>\n    \
     remove <admin-addr> <node-id>\n    \
     decommission <admin-addr> <node-id> [--force-control-remove]\n    \
@@ -269,6 +279,18 @@ async fn run(args: &[String], tls: Option<&tokio_rustls::TlsConnector>) -> Resul
     // `admin` subcommand, not a client address like `put`/`get`.
     if cmd == "seed" {
         return run_seed(&args[1..], tls).await;
+    }
+    // `cluster version|finalize` (ADR 0073 Phase 2, P2-C): the cluster's
+    // active version, per-node supported ranges, and the manual,
+    // irreversible Finalize step. Admin-port commands like `seed`, so the
+    // address is an **admin** address.
+    if cmd == "cluster" {
+        return run_cluster(&args[1..], tls).await;
+    }
+    // `table preferred-leader` (ADR 0075 plan D3): re-point a global table's
+    // preferred-leader Region over the admin port.
+    if cmd == "table" {
+        return run_table(&args[1..], tls).await;
     }
     let addr = args.get(1).ok_or("missing <node-addr>")?;
 
@@ -871,6 +893,12 @@ fn admin_request(
         // object count/bytes.
         "segment-store" => ("GET", "/admin/segment-store".into(), None),
         "control-members" => ("GET", "/admin/control/members".into(), None),
+        // `GET /admin/global-tables` (ADR 0075 section 8, G-01 G-c): every
+        // MRSC global table's Regions, preferred leader, placement and
+        // warnings, plus (G-d M6) every MREC table's replicas and this node's
+        // per-(tablet, peer) shipper health (backlog, lag, last ack, resync,
+        // last error). The CLI prints the JSON as served.
+        "global-tables" => ("GET", "/admin/global-tables".into(), None),
         // `POST /admin/control/transfer {to}` (ADR 0020/0037, roadmap U-05):
         // a single request/response, unlike `control-add`/`control-remove`/
         // `control-grow` above — the server itself does the bounded arm-
@@ -983,7 +1011,21 @@ fn admin_request(
         }
         "drain" => {
             let node = arg(2).ok_or("drain needs <node-id>")?;
-            let body = serde_json::json!({"node": node}).to_string();
+            // `--force` overrides the decommission guard (ADR 0075 plan D10:
+            // the last Active member of a Region a global table pins).
+            let force = match arg(3) {
+                None => false,
+                Some("--force") => true,
+                Some(other) => return Err(format!("drain: unknown argument {other:?}")),
+            };
+            // `force` is sent only when set, so the body an older server
+            // already accepts is byte-identical.
+            let body = if force {
+                serde_json::json!({"node": node, "force": true})
+            } else {
+                serde_json::json!({"node": node})
+            }
+            .to_string();
             ("POST", "/admin/drain".into(), Some(body))
         }
         "drain-status" => {
@@ -1680,6 +1722,282 @@ async fn run_control_remove(
     Ok(())
 }
 
+// ---- `cluster version` / `cluster finalize` (ADR 0073 Phase 2, P2-C) -----
+
+/// Parsed `cluster finalize` arguments.
+#[derive(Debug, PartialEq, Eq)]
+struct FinalizeArgs {
+    addr: String,
+    to: Option<u32>,
+    yes: bool,
+}
+
+/// Pure argument parsing for `cluster finalize <leader-admin-addr> [--to N]
+/// [--yes]` (unit-testable, no socket I/O). `args` excludes the leading
+/// `finalize`.
+fn parse_finalize_args(args: &[String]) -> Result<FinalizeArgs, String> {
+    let addr = args
+        .first()
+        .filter(|a| !a.starts_with("--"))
+        .ok_or("cluster finalize needs <leader-admin-addr>")?
+        .clone();
+    let mut to = None;
+    let mut yes = false;
+    let mut it = args[1..].iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--yes" => yes = true,
+            "--to" => {
+                let v = it.next().ok_or("--to needs a version number")?;
+                to = Some(
+                    v.parse::<u32>()
+                        .map_err(|_| format!("--to: {v:?} is not a version number"))?,
+                );
+            }
+            other => return Err(format!("cluster finalize: unknown argument {other:?}")),
+        }
+    }
+    Ok(FinalizeArgs { addr, to, yes })
+}
+
+fn range_str(v: &serde_json::Value) -> String {
+    if v.is_null() {
+        "-".to_string()
+    } else {
+        format!("[{},{}]", v["min"], v["max"])
+    }
+}
+
+/// Human rendering of `GET /admin/cluster-version` (pure).
+fn format_cluster_version(v: &serde_json::Value) -> String {
+    let mut out = String::new();
+    let era = v["era_active"].as_bool().unwrap_or(false);
+    if !era {
+        out.push_str("version era: not started (every member must run a versioned binary and report in first)\n");
+    }
+    out.push_str(&format!("active cluster version: {}\n", v["active"]));
+    out.push_str(&format!(
+        "this node's binary: range {} build {}\n",
+        range_str(&v["own_range"]),
+        v["own_build"].as_str().unwrap_or("-")
+    ));
+    match v["safe_target"].as_u64() {
+        Some(t) => out.push_str(&format!("safe target: {t}\n")),
+        None => out.push_str("safe target: none (a member has not reported)\n"),
+    }
+    out.push_str("nodes:\n");
+    for n in v["nodes"].as_array().map_or(&[][..], Vec::as_slice) {
+        out.push_str(&format!(
+            "  {:<12} {:<8} {:<8} range {:<8} build {}\n",
+            n["node"].as_str().unwrap_or("?"),
+            n["role"].as_str().unwrap_or("?"),
+            n["status"].as_str().unwrap_or("-"),
+            range_str(&n["range"]),
+            n["build"].as_str().unwrap_or("-"),
+        ));
+    }
+    let blockers = v["blockers"].as_array().map_or(&[][..], Vec::as_slice);
+    if blockers.is_empty() {
+        if v["can_finalize"].as_bool().unwrap_or(false) {
+            out.push_str(&format!("can finalize to {}: yes\n", v["target"]));
+        } else {
+            out.push_str(&format!(
+                "can finalize to {}: no (no member blocks it; this binary or the era does not allow it)\n",
+                v["target"]
+            ));
+        }
+    } else {
+        out.push_str(&format!("cannot finalize to {}; blockers:\n", v["target"]));
+        for b in blockers {
+            out.push_str(&format!(
+                "  {}: {}\n",
+                b["node"].as_str().unwrap_or("?"),
+                b["reason"].as_str().unwrap_or("?")
+            ));
+        }
+    }
+    out
+}
+
+/// The Finalize pre-flight over a fetched view (pure): the `(active,
+/// target)` pair if finalizing is allowed, else the refusal text naming
+/// every blocker. `to`, when given, must be exactly `active + 1`.
+fn finalize_preflight(v: &serde_json::Value, to: Option<u32>) -> Result<(u32, u32), String> {
+    if !v["era_active"].as_bool().unwrap_or(false) {
+        return Err(
+            "the version era has not started: not every member has reported its version yet".into(),
+        );
+    }
+    let active = u32::try_from(
+        v["active"]
+            .as_u64()
+            .ok_or("malformed view: no active version")?,
+    )
+    .map_err(|_| "malformed view: active version out of range")?;
+    let target = active + 1;
+    if let Some(to) = to
+        && to != target
+    {
+        return Err(format!(
+            "the cluster version is raised one step at a time: the next version is {target} (--to {to})"
+        ));
+    }
+    let blockers = v["blockers"].as_array().map_or(&[][..], Vec::as_slice);
+    if !blockers.is_empty() {
+        let named: Vec<String> = blockers
+            .iter()
+            .map(|b| {
+                format!(
+                    "{}: {}",
+                    b["node"].as_str().unwrap_or("?"),
+                    b["reason"].as_str().unwrap_or("?")
+                )
+            })
+            .collect();
+        return Err(format!(
+            "cannot finalize cluster version {target}: {}",
+            named.join("; ")
+        ));
+    }
+    if !v["can_finalize"].as_bool().unwrap_or(false) {
+        return Err(format!(
+            "cannot finalize cluster version {target}: this node's binary does not support it"
+        ));
+    }
+    Ok((active, target))
+}
+
+const FINALIZE_WARNING: &str = "Finalizing a cluster version CANNOT be undone: once raised, no \
+node may run a binary that does not support it, and there is no rollback. Re-run with --yes to proceed.";
+
+/// Pure argument parsing for `table preferred-leader <admin-addr> <table>
+/// <region>`: `(admin address, JSON body)` for
+/// `POST /admin/table/preferred-leader`.
+fn preferred_leader_request(args: &[String]) -> Result<(String, String), String> {
+    if args.first().map(String::as_str) != Some("preferred-leader") {
+        return Err("table needs a subcommand: preferred-leader".into());
+    }
+    let addr = args
+        .get(1)
+        .ok_or("table preferred-leader needs <admin-addr>")?;
+    let table = args.get(2).ok_or("table preferred-leader needs <table>")?;
+    let region = args.get(3).ok_or("table preferred-leader needs <region>")?;
+    if let Some(extra) = args.get(4) {
+        return Err(format!(
+            "table preferred-leader: unknown argument {extra:?}"
+        ));
+    }
+    let body = serde_json::json!({"table": table, "region": region}).to_string();
+    Ok((addr.clone(), body))
+}
+
+async fn run_table(
+    args: &[String],
+    tls: Option<&tokio_rustls::TlsConnector>,
+) -> Result<(), String> {
+    let (addr, body) = preferred_leader_request(args)?;
+    let (status, resp) = http_call(
+        &addr,
+        "POST",
+        "/admin/table/preferred-leader",
+        Some(body),
+        tls,
+    )
+    .await?;
+    println!("{resp}");
+    if (200..300).contains(&status) {
+        Ok(())
+    } else {
+        Err(format!("table/preferred-leader failed (HTTP {status})"))
+    }
+}
+
+/// The finalize flow shared by `cluster finalize` and `cluster roll wait
+/// --finalize`: show the view, pre-flight it, require `yes`, POST, and poll
+/// for the new version.
+pub(crate) async fn run_finalize(
+    addr: &str,
+    to: Option<u32>,
+    yes: bool,
+    tls: Option<&tokio_rustls::TlsConnector>,
+) -> Result<(), String> {
+    let (status, resp) = http_call(addr, "GET", "/admin/cluster-version", None, tls).await?;
+    if !(200..300).contains(&status) {
+        println!("{resp}");
+        return Err(format!("admin request failed (HTTP {status})"));
+    }
+    let view: serde_json::Value =
+        serde_json::from_str(&resp).map_err(|e| format!("malformed reply: {e}"))?;
+    print!("{}", format_cluster_version(&view));
+    let (active, target) = finalize_preflight(&view, to)?;
+    if !yes {
+        return Err(FINALIZE_WARNING.into());
+    }
+    println!("finalizing cluster version {active} -> {target} ...");
+    let body = serde_json::json!({"to": target, "expected": active}).to_string();
+    let (status, resp) = http_call(
+        addr,
+        "POST",
+        "/admin/cluster-version/finalize",
+        Some(body),
+        tls,
+    )
+    .await?;
+    println!("{resp}");
+    if !(200..300).contains(&status) {
+        // A non-leader's 409 names the leader to retry on.
+        return Err(format!("cluster-version/finalize failed (HTTP {status})"));
+    }
+    // Poll until the version is observed at the target (bounded).
+    for _ in 0..60 {
+        let (st, r) = http_call(addr, "GET", "/admin/cluster-version", None, tls).await?;
+        if (200..300).contains(&st)
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&r)
+            && v["active"].as_u64() == Some(u64::from(target))
+        {
+            println!("cluster version is now {target}");
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    Err(format!(
+        "finalize was accepted but cluster version {target} was not observed within 30s; \
+         check `cluster version`"
+    ))
+}
+
+async fn run_cluster(
+    args: &[String],
+    tls: Option<&tokio_rustls::TlsConnector>,
+) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("version") => {
+            let addr = args.get(1).ok_or("cluster version needs <admin-addr>")?;
+            let raw_json = args.get(2).map(String::as_str) == Some("--json");
+            let (status, resp) =
+                http_call(addr, "GET", "/admin/cluster-version", None, tls).await?;
+            if !(200..300).contains(&status) {
+                println!("{resp}");
+                return Err(format!("admin request failed (HTTP {status})"));
+            }
+            if raw_json {
+                println!("{resp}");
+            } else {
+                let v: serde_json::Value =
+                    serde_json::from_str(&resp).map_err(|e| format!("malformed reply: {e}"))?;
+                print!("{}", format_cluster_version(&v));
+            }
+            Ok(())
+        }
+        Some("finalize") => {
+            let fa = parse_finalize_args(&args[1..])?;
+            run_finalize(&fa.addr, fa.to, fa.yes, tls).await
+        }
+        Some("roll") => roll::run_roll(&args[1..], tls).await,
+        _ => Err("cluster needs a subcommand: version | finalize | roll".into()),
+    }
+}
+
 /// `animus admin control-grow <leader-admin-addr> <node-id> <new-node-admin-addr>
 /// [<node-id> <new-node-admin-addr>...]` (ADR 0037 PR3): the "3→5" composite —
 /// `RaftCore::change_membership` is single-server-at-a-time (ADR 0017 C), so
@@ -1821,6 +2139,10 @@ fn print_response(response: &ClientResponse) {
                 println!("  [{i}] {result:?}");
             }
         }
+        // Internal intra-only MREC replication reply (ADR 0075, G-01 stage
+        // G-d M3): consumed by a peer cluster's shipper, never requested by a
+        // CLI subcommand — printed raw if one ever surfaces here.
+        ClientResponse::MrecApply(resp) => println!("mrec apply: {resp:?}"),
         // Internal TxnResolve RPC reply (ADR 0018 §3/§6, torn-pair-fix
         // stack PR2): consumed programmatically by `txn_resolve_participant_retrying`,
         // not requested by any CLI subcommand of its own — printed raw if
@@ -1835,6 +2157,7 @@ fn print_response(response: &ClientResponse) {
             client_route,
             intra_route,
             admin_addrs,
+            ..
         } => {
             println!("control ids: {control_ids:?}");
             println!("peers: {peers:?}");
@@ -1911,6 +2234,123 @@ mod tests {
             .chain(rest.iter().copied())
             .map(String::from)
             .collect()
+    }
+
+    fn sargs(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn preferred_leader_request_parses_and_rejects() {
+        let (addr, body) = preferred_leader_request(&sargs(&[
+            "preferred-leader",
+            "10.0.0.1:8080",
+            "orders",
+            "eu-west-1",
+        ]))
+        .unwrap();
+        assert_eq!(addr, "10.0.0.1:8080");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["table"], "orders");
+        assert_eq!(v["region"], "eu-west-1");
+        assert!(preferred_leader_request(&sargs(&[])).is_err());
+        assert!(preferred_leader_request(&sargs(&["wat", "a", "t", "r"])).is_err());
+        assert!(preferred_leader_request(&sargs(&["preferred-leader", "a", "t"])).is_err());
+        assert!(
+            preferred_leader_request(&sargs(&["preferred-leader", "a", "t", "r", "x"])).is_err()
+        );
+    }
+
+    #[test]
+    fn global_tables_and_drain_force_admin_requests() {
+        let (m, p, b) = admin_request("global-tables", &sargs(&["global-tables", "a:1"])).unwrap();
+        assert_eq!((m, p.as_str(), b), ("GET", "/admin/global-tables", None));
+        let (m, p, b) = admin_request("drain", &sargs(&["drain", "a:1", "n3", "--force"])).unwrap();
+        assert_eq!((m, p.as_str()), ("POST", "/admin/drain"));
+        let v: serde_json::Value = serde_json::from_str(&b.unwrap()).unwrap();
+        assert_eq!(v["force"], true);
+        let (_, _, b) = admin_request("drain", &sargs(&["drain", "a:1", "n3"])).unwrap();
+        assert_eq!(b.as_deref(), Some(r#"{"node":"n3"}"#));
+        assert!(admin_request("drain", &sargs(&["drain", "a:1", "n3", "--wat"])).is_err());
+    }
+
+    #[test]
+    fn finalize_args_parse() {
+        assert_eq!(
+            parse_finalize_args(&sargs(&["10.0.0.1:8080"])).unwrap(),
+            FinalizeArgs {
+                addr: "10.0.0.1:8080".into(),
+                to: None,
+                yes: false
+            }
+        );
+        assert_eq!(
+            parse_finalize_args(&sargs(&["h:1", "--to", "3", "--yes"])).unwrap(),
+            FinalizeArgs {
+                addr: "h:1".into(),
+                to: Some(3),
+                yes: true
+            }
+        );
+        assert!(parse_finalize_args(&sargs(&[])).is_err());
+        assert!(parse_finalize_args(&sargs(&["--yes"])).is_err());
+        assert!(parse_finalize_args(&sargs(&["h:1", "--to"])).is_err());
+        assert!(parse_finalize_args(&sargs(&["h:1", "--to", "x"])).is_err());
+        assert!(parse_finalize_args(&sargs(&["h:1", "--wat"])).is_err());
+    }
+
+    fn sample_view(blockers: serde_json::Value, can: bool) -> serde_json::Value {
+        serde_json::json!({
+            "era_active": true, "active": 1, "target": 2, "safe_target": 2,
+            "own_range": {"min": 1, "max": 2}, "own_build": "t",
+            "can_finalize": can, "blockers": blockers,
+            "nodes": [
+                {"node": "n0", "role": "combined", "status": "Active",
+                 "range": {"min": 1, "max": 2}, "build": "t", "reported": true},
+                {"node": "n1", "role": "data", "status": "Down",
+                 "range": null, "build": null, "reported": false}
+            ]
+        })
+    }
+
+    #[test]
+    fn cluster_version_output_names_nodes_and_blockers() {
+        let blockers = serde_json::json!([{"node": "n1", "reason": "member is Down"}]);
+        let text = format_cluster_version(&sample_view(blockers, false));
+        assert!(text.contains("active cluster version: 1"), "{text}");
+        assert!(text.contains("safe target: 2"), "{text}");
+        assert!(text.contains("n1"), "{text}");
+        assert!(text.contains("n1: member is Down"), "{text}");
+        assert!(text.contains("cannot finalize to 2"), "{text}");
+        let ok = format_cluster_version(&sample_view(serde_json::json!([]), true));
+        assert!(ok.contains("can finalize to 2: yes"), "{ok}");
+    }
+
+    #[test]
+    fn finalize_preflight_enforces_the_one_step_rule_and_names_blockers() {
+        let ok = sample_view(serde_json::json!([]), true);
+        assert_eq!(finalize_preflight(&ok, None).unwrap(), (1, 2));
+        assert_eq!(finalize_preflight(&ok, Some(2)).unwrap(), (1, 2));
+        assert!(
+            finalize_preflight(&ok, Some(3))
+                .unwrap_err()
+                .contains("one step")
+        );
+        let blocked = sample_view(
+            serde_json::json!([{"node": "n1", "reason": "member is Down"}]),
+            false,
+        );
+        let e = finalize_preflight(&blocked, None).unwrap_err();
+        assert!(e.contains("n1: member is Down"), "{e}");
+        let mut no_era = ok.clone();
+        no_era["era_active"] = serde_json::json!(false);
+        assert!(
+            finalize_preflight(&no_era, None)
+                .unwrap_err()
+                .contains("era")
+        );
+        let cannot = sample_view(serde_json::json!([]), false);
+        assert!(finalize_preflight(&cannot, None).is_err());
     }
 
     #[test]

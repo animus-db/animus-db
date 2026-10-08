@@ -5,6 +5,9 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# The cargo-fuzz project (roadmap R-01 (c)) is its own workspace: libFuzzer and
+# its build needs stay out of every normal gate. See fuzz/README.md.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0-alpha.0"
@@ -24,6 +27,7 @@ animus-tablet = { path = "crates/animus-tablet" }
 animus-placement = { path = "crates/animus-placement" }
 animus-cp-data = { path = "crates/animus-cp-data" }
 animus-item = { path = "crates/animus-item" }
+animus-roll = { path = "crates/animus-roll" }
 animus-dynamo = { path = "crates/animus-dynamo" }
 animus-s3 = { path = "crates/animus-s3" }
 animus-test = { path = "crates/animus-test" }

@@ -420,22 +420,66 @@ just because it sits outside the `Env` seam.
 
 ### Upgrades
 
-**No operator-driven upgrade yet; rolling upgrades wait on ADR 0073
-Phase 3.** The repository's compatibility rule is now staged (root
-`CLAUDE.md`, [ADR 0073](0073-upgrade-compatibility.md)): as of Phase 1
-(done 2026-10-03) a **whole-cluster stop → upgrade → restart** across
-post-baseline versions is supported and tested by the upgrade-restart
-harness, but there is **no wire compatibility and no rolling-upgrade
-story** until Phases 2 and 3. For this operator that means the supported
-way to move to a new `animusd` build is a whole-cluster restart, never a
-pod-by-pod mix of versions. The operator does not enforce this: it does
-not reject a `spec.image` edit (a `validate_spec` test allows one), and
-the `StatefulSet` controller rolls it like any pod-template change, which
-is precisely the mixed-version window that is unsupported before Phase 3.
-Treat `spec.image` changes as unsupported until the operator orchestrates
-upgrades (Phase 3), or recreate the `AnimusCluster`. (Earlier text claimed
-an image change was "either rejected by the operator's own validation or
-requires recreating the cluster"; the validation half was never true.)
+**The operator orchestrates rolling upgrades** (ADR 0073 Phase 3, done
+2026-10-05; the design and as-built record are in
+[ADR 0073](0073-upgrade-compatibility.md)'s two 2026-10-05 Phase 3
+amendments). The repository's compatibility rule is staged (root
+`CLAUDE.md`): Phase 1 supports a whole-cluster stop -> upgrade -> restart,
+Phase 2 adds a replicated cluster version and feature gates so a
+node-by-node rolling upgrade (R-1 -> R, never skipping a release) is
+supported, and Phase 3 makes that roll something a CLI and this operator
+drive with a health gate between nodes and an explicit, irreversible
+finalize step.
+
+- **Every pod-template change is a gated roll** — a `spec.image` edit *and* a
+  restart-relevant config change such as a `spec.controlNodes` growth. There
+  is no ungated window: the operator owns the `StatefulSet`'s
+  `updateStrategy.rollingUpdate.partition` (a `RollingUpdate`, not
+  `OnDelete`, so no pod-`delete` RBAC), applies a changed template together
+  with `partition = replicas` in the same server-side apply, then lowers it one
+  ordinal at a time, only while every member is `Active`,
+  `GET /admin/roll-health` is `ok` everywhere (the one server-side verdict the
+  CLI, dashboard and operator share) and the previous pod is `Ready`, healthy
+  and has reported the new range. The decision is `animus-roll`'s pure
+  `decide_with_target` (the operator fixes the order: a `StatefulSet` replaces
+  highest ordinal first); the control leader is handed leadership away
+  (`POST /admin/control/transfer`) before its pod restarts. Fail closed: an
+  unobservable gate holds the partition.
+- **Finalize** is irreversible and manual by default (`spec.upgrade.finalize:
+  Manual`; the operator reports `UpgradeFinalizePending`, a human runs
+  `animus cluster finalize`). `Auto` is opt-in and finalizes only when the roll
+  is complete, `can_finalize` holds and the cluster has been healthy for
+  `spec.upgrade.soakSeconds` (default 0); a blocker is retried, never forced.
+- **Fix forward, no rollback.** A pod that never becomes healthy stops the roll
+  at that pod (`UpgradeBlocked`); the fix is a fixed `spec.image`. Reverting
+  `spec.image` to the pre-roll image after any pod ran the new binary is
+  refused by the webhook and pinned by the reconciler
+  (`UpgradeChangesHeld`); `spec.nodes`/`spec.controlNodes` edits are held until
+  `RollComplete`. A shape whose PodDisruptionBudget `maxUnavailable` is 0 (one
+  control node, fewer than three nodes) is not rolled: the template is staged,
+  `UpgradeBlocked` says why, and the whole-cluster stop-upgrade-restart
+  applies. A skipped release is caught by the first upgraded pod's startup
+  range check (no image-label pre-check, ADR 0073 maintainer decision 5).
+- **Observability**: additive `status.upgrade` (`phase`, versions, `onNew`/
+  `total`, images and the stall/soak clocks) and the conditions
+  `UpgradeInProgress`, `UpgradeBlocked`, `UpgradeFinalizePending`,
+  `RollComplete`, `UpgradeChangesHeld`; additive optional `spec.upgrade`; the
+  CRD schema version stays 1 (new fixture `v1-upgrade.json`).
+- **Evidence and limits**: fakes-level tests prove the operator's decisions;
+  the shared machine is proven by the `sim_cluster_roll_orchestrator` corpus
+  and a real-process previous-release roll by the `upgrade-previous-release`
+  CI job; Kubernetes' own partition semantics are exercised only by the
+  nightly `kind` leg (`E2E_UPGRADE=1`, `.github/workflows/upgrade-kind-
+  nightly.yml`), which has not yet had a verified run. **Open:** rolling
+  *from* a release older than `efcaa6cb` while multi-item transactions are in use
+  (#1238, that release's own abort-lookback bug; #1237 is fixed). Mechanism:
+  `crates/animus-operator/CLAUDE.md`; user-facing steps:
+  `docs/runbook/upgrade.md` and `deploy/operator/README.md`.
+
+(Earlier text said the operator did not orchestrate upgrades and that an image
+change was "either rejected by the operator's own validation or requires
+recreating the cluster"; the validation half was never true, and the rest was
+superseded by Phase 3.)
 
 ### End-to-end testing
 
@@ -1881,6 +1925,59 @@ before applying any child resource. Every shipped `AnimusCluster` manifest
 carries `schemaVersion: 1`, and a golden fixture
 (`tests/fixtures/formats/animuscluster-spec/v1.json`) pins the format.
 
+## Amendment 2026-10-04: node topology resolution and spread hints (G-01 stage G-a)
+
+**Spread hints.** The `StatefulSet` pod template carries a
+`topologySpreadConstraints` entry over `topology.kubernetes.io/zone`
+(`maxSkew: 1`, `whenUnsatisfiable: ScheduleAnyway`, so a single-zone kind or
+dev cluster still schedules) and a *preferred* pod anti-affinity over
+`kubernetes.io/hostname`, both selecting the cluster's own pods. On by
+default; `spec.topology.spread: false` (additive optional CRD field) turns
+both off.
+
+**Resolving a node's region/zone.** The downward API cannot expose a *node's*
+labels, so `animusd` cannot read them itself. Decision: the **operator**
+resolves them. After applying children, every reconcile lists the cluster's
+pods; for each scheduled pod it reads the `Node` named by `spec.nodeName`
+and merge-patches `animus.io/topology-region`, `animus.io/topology-zone` (only
+those the node has) and `animus.io/topology-resolved: "true"` onto the pod
+(`desired::topology::pod_annotation_patch`, a pure function; a node with no
+topology labels still gets the marker, an unreadable node patches nothing and
+is retried). The reconcile requeues after 3 s while any pod is unscheduled.
+The pod template mounts a downward-API volume projecting
+`metadata.annotations` to `/etc/animus/topology/annotations`, and the
+entrypoint passes `--labels-file ... --labels-file-annotations
+--labels-wait-secs 180` on both role branches. `animusd` keeps only the
+`animus.io/topology-*` keys, translates them back to the canonical
+`topology.kubernetes.io/{region,zone}` label keys
+(`animusd::node_labels`), and waits (bounded, polling the file) for the
+`resolved` marker before registering; on timeout it logs a warning and
+registers with whatever is there (labels are then fixed until a restart that
+finds them, ADR 0005's 2026-10-04 amendment). RBAC added in
+`deploy/operator/rbac.yaml`: `nodes` get/list/watch (cluster-scoped) and
+`pods` patch.
+
+**Why not an init container.** An init container would have to read the Node
+itself, i.e. every cluster pod's ServiceAccount would need cluster-wide `nodes`
+read access, a far wider grant than the one operator doing it once; it also
+needs a new image or a `kubectl`-capable one and still has to hand the result
+to `animusd` through a shared volume. The operator already watches the pods
+and has the permissions' natural home. The cost: the kubelet refreshes a
+downward-API volume on its own sync period (up to about a minute after the
+annotation lands), hence the generous default wait; and the startup path
+depends on the operator being up (bounded by the wait, never a hard failure).
+
+**Compatibility and rollout.** The operator and the `animusd` image ship
+together: an old image rejects the new flags. The pod template (volume, spread
+hints, entrypoint) changes, so every existing cluster rolls once on the
+operator upgrade that ships this. The `rbac.yaml` update is needed for
+resolution; without it pods still start (after the wait) unlabelled and the
+operator logs a warning per reconcile. `scripts/e2e-kind.sh` labels the kind
+node with a region/zone and asserts the annotations and the registered member
+labels (it runs the operator out-of-cluster, so the RBAC itself is not
+exercised there). Cross-zone placement is proven by the `SimCluster` corpus,
+not by kind. The multi-region ADR is 0075.
+
 ## Amendment (2026-10-04) — multi-cluster federation is scoped (ADR 0075)
 
 [ADR 0075](0075-global-tables.md) §5.4 scopes operator federation for global
@@ -1892,3 +1989,29 @@ not implemented. Topology spread (stage G-a) is separate.
 ## Amendment 2026-10-04: `spec.s3.webIdentity` (S-08)
 
 `spec.s3` gains an additive `webIdentity { roleArn, serviceAccountName?, audience? }` alternative to `credentialsSecretName` (now optional; exactly one of the two is required). The operator projects a rotating service-account token into combined-role pods and writes a static `source: web_identity` credentials file, so no `Secret` is read or embedded; egress also opens 443 for STS. Existing CRs round-trip unchanged (append-only fixture `v1-s3-web-identity.json`); see ADR 0059's S-08 amendment. Separately, the kind e2e S3 leg described above now runs RustFS, not MinIO (#863).
+
+## Amendment (2026-10-05) — `spec.maxRegionRttMs` and the stretch shape (ADR 0075, G-c)
+
+`spec.maxRegionRttMs` (additive, optional; `schemaVersion` unchanged, the
+committed `crd.yaml` regenerated) is rendered into the generated
+`cluster.json`'s `cluster_settings.max_region_rtt_ms`, which sizes the WAN Raft
+timing profile of every group spanning more than one
+`topology.kubernetes.io/region` (ADR 0075 section 3.4). It is inert on a
+single-region or unlabelled cluster. The supported multi-region shape in G-c is
+one `AnimusCluster` on a Kubernetes cluster whose nodes span the Regions
+(ADR 0075 section 3.8); federation across Kubernetes clusters is G-e. The
+`kind` e2e cannot exercise a stretch topology; stretch behaviour is proven in
+`SimEnv` (`sim_cluster_mrsc`).
+
+## Amendment (2026-10-06) — `spec.region`, `spec.peers` (ADR 0075, G-e)
+
+The CRD gains additive `spec.region`, `spec.peers[]` (`region`, `endpoints`,
+`caSecretRef`), `spec.allowInsecurePeers` (dev) and `spec.mrecMaxClockSkewMs`,
+rendered into `cluster.json`'s `cluster_settings` for MREC peer replication; a
+peer CA `Secret` per peer is mounted read-only and merged into the intra trust
+bundle by `entrypoint.sh`; the `NetworkPolicy` gains peer-port egress and
+intra-port-only ingress when peers are set; a `PeerReachable` condition reports
+shipper health. Details, the `PeersSpecInvalid` refusal and the TLS and
+NetworkPolicy reasoning: ADR 0075's "G-e as built". `schemaVersion` stays 1;
+the golden fixture `v1-peers.json` was added.
+

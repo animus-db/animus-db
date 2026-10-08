@@ -62,6 +62,21 @@ fn recovery_grace_now_ms<E: Env>(env: &E, route: &CpRoute<E>) -> u64 {
     }
 }
 
+/// The allowlisted "nothing of this transaction was applied" stage refusal
+/// (`TxnAbortReason::is_safe_to_retry_fresh` matches its middle phrase): a
+/// stale route, an out-of-fence range, a group whose keys no longer share one
+/// tablet after a split, or a concurrent in-doubt-recovery decision. One
+/// source for both the apply-time `StageOutcome::Fenced` arm and the
+/// pre-propose range check in `txn_stage_local`, so the two can never drift
+/// out of the allowlist.
+fn stage_rejected_stale_route(table: &str) -> String {
+    format!(
+        "txn prepare: stage on table `{table}` was rejected (a stale route, an \
+         already-sealed/out-of-fence range, or a concurrent in-doubt-recovery \
+         decision); retry"
+    )
+}
+
 impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// **The one place a stage actually executes on the leader's own node**
     /// (ADR 0046 U3, `TxnStage` kind-writes stack PR2) — shared by
@@ -97,9 +112,15 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         pending_kind_writes: Vec<PendingKindWrite>,
     ) -> Result<(TxnId, Vec<u8>, String, HlcTimestamp, StageOutcome), TxnAbortReason> {
         decide::frozen_refusal(leader.is_frozen()).map_err(TxnAbortReason::Other)?;
+        leader
+            .refuse_if_storage_full()
+            .map_err(TxnAbortReason::Other)?;
         if !pending_kind_writes.is_empty() {
             let meta = self.effective_metadata();
-            let schema = dynamo::write_schema_for(&meta, table);
+            let mut schema = dynamo::write_schema_for(&meta, table);
+            // ADR 0075 V14: a transaction on an MREC table is region-local; its
+            // rows carry the same last-writer-wins stamp as any other write.
+            schema.mrec = dynamo::mrec_write_stamp(&meta, table, self.env.wall_now().0);
             // Both halves of the throttle pre-charge below are loop-invariant:
             // they depend only on `meta` (just snapshotted) and `table` (fixed
             // for this call), never on the per-item key. Hoisted so a 100-action
@@ -136,7 +157,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                             crate::KindWriteOp::Put(item) => {
                                 capacity::write_units(capacity::item_size(item))
                             }
-                            crate::KindWriteOp::Delete | crate::KindWriteOp::Update { .. } => 1.0,
+                            crate::KindWriteOp::Delete
+                            | crate::KindWriteOp::Update { .. }
+                            | crate::KindWriteOp::Replicate { .. } => 1.0,
                         };
                     if !self
                         .throttle
@@ -166,6 +189,24 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     },
                 ));
             }
+        }
+        // R-01 F-2: the coordinator groups a transaction's keys by tablet from
+        // ONE metadata snapshot, but this stage is routed (`cp_route`) by the
+        // group's FIRST key against the live tablet map. A split cutting the
+        // table between the two (the in-place fork of a provisioned table's
+        // min-tablet split, or an auto-split) leaves a group whose keys now
+        // span both children; staging it whole on the first key's child
+        // landed the other key's intent and, at resolve, its committed value
+        // in a tablet that does not own that key (apply checks seals, not
+        // ranges), so the txn "committed" with one half unreadable. A group
+        // is only valid on a tablet whose range holds EVERY key: refuse before
+        // proposing, with the allowlisted nothing-was-proposed refusal that
+        // `run_transact` retries with a fresh grouping. A range is immutable
+        // per group (ADR 0050), so this check is exact and replicates no new
+        // apply behavior.
+        let range = leader.scope_range();
+        if writes.iter().any(|w| !range.contains(&w.key)) {
+            return Err(TxnAbortReason::Other(stage_rejected_stale_route(table)));
         }
         match anchor {
             None => {
@@ -538,11 +579,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     )));
                 }
                 StageOutcome::Fenced => {
-                    return Err(TxnAbortReason::Other(format!(
-                        "txn prepare: stage on table `{table}` was rejected (a stale route, an \
-                         already-sealed/out-of-fence range, or a concurrent in-doubt-recovery \
-                         decision); retry"
-                    )));
+                    return Err(TxnAbortReason::Other(stage_rejected_stale_route(table)));
                 }
             }
             if attempt + 1 < TXN_STAGE_PUSH_ATTEMPTS {
@@ -653,6 +690,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         match self.cp_route(table, &record_key, deadline).await {
             CpRoute::Local(leader) => {
                 decide::frozen_refusal(leader.is_frozen())?;
+                leader.refuse_if_storage_full()?;
                 if let Some(created_ts) = orphan_created_ts {
                     leader
                         .txn_abort_orphan(txn_id.clone(), record_key.clone(), created_ts)
@@ -674,6 +712,16 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         Ok(TxnOutcome::Committed { commit_ts })
                     }
                     Some(TxnDecisionStatus::Aborted) => Ok(TxnOutcome::Aborted),
+                    // A fork sealed this group between the pre-propose frozen
+                    // check and the apply (the propose-vs-apply sliver): the
+                    // decision entry applied as a sealed no-op (`animus-cp-data`'s
+                    // seal check on `TxnCommit`/`TxnAbort`), so the record is
+                    // legitimately still `Pending` HERE and now lives on a child.
+                    // Refuse retryably so `txn_decide_anchor_retrying` re-routes
+                    // the SAME decision to the record's new owner.
+                    Some(TxnDecisionStatus::Pending) if leader.is_frozen() => {
+                        Err(decide::FROZEN_REFUSAL.to_string())
+                    }
                     Some(TxnDecisionStatus::Pending) => Err(
                         "txn decide: record still Pending immediately after its own decide \
                          applied — protocol bug"
@@ -817,6 +865,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 // resolve re-routes to the child, which holds the copied
                 // intent + record and materializes at its own position.
                 decide::frozen_refusal(leader.is_frozen())?;
+                leader.refuse_if_storage_full()?;
                 match leader.txn_resolve(txn_id, record_key, keys, outcome).await {
                     Some((_, outcome)) => Ok(outcome),
                     None => Err("CP group leader moved during resolve; retry".into()),
@@ -1547,6 +1596,24 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                  (ADR 0022) for a multi-participant transaction",
                 w.key, w.table
             )));
+        }
+
+        // ADR 0075 G-d M2: a plain (edge-valued, non-`pending`) write carries
+        // its base value as opaque bytes and so cannot be MREC-stamped at
+        // apply; refuse it on an MREC table. Every Dynamo transaction write is
+        // `pending` (evaluated and stamped at `TxnStage` apply), so only the
+        // raw client protocol's `Txn` can land here.
+        {
+            let meta = self.effective_metadata();
+            if let Some(w) = writes.iter().find(|w| {
+                w.pending.is_none() && meta.table_global(&w.table).is_some_and(|g| g.is_mrec())
+            }) {
+                return Err(TxnAbortReason::Other(format!(
+                    "table `{}` is an MREC global table: raw (unstamped) transactional writes \
+                     are not supported",
+                    w.table
+                )));
+            }
         }
 
         // Auto-provision every distinct table's first tablet on demand, like

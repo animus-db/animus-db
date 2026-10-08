@@ -1,0 +1,1 @@
+DELETE FROM t WHERE pk = ? AND sk = ? RETURNING ALL OLD *

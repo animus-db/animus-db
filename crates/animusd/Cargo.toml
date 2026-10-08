@@ -55,6 +55,38 @@ path = "src/main.rs"
 name = "cluster_bench"
 harness = false
 
+# R-01 sub-track (b): real-process chaos harness (docs/chaos.md). Opt-in so
+# the per-push gates never schedule a multi-minute multi-process run; it is
+# still compiled by `clippy --all-features`.
+# Run: `cargo test -p animusd --features chaos --test chaos -- --test-threads=1`.
+[features]
+chaos = []
+# R-01 sub-track (a): multi-hour/day soak harness (docs/soak.md). Opt-in for
+# the same reason as `chaos`.
+# Run: `ANIMUS_SOAK_DURATION=15m cargo test -p animusd --features soak --test soak -- --nocapture`.
+soak = []
+# ADR 0073 Phase 3 (P3-E, D10): the previous-release rolling-upgrade test
+# (`tests/upgrade_previous_release.rs`). Opt-in because it needs the reference
+# R-1 binary (`scripts/build-upgrade-from.sh`); with the feature on, a missing
+# binary FAILS the test, it never skips. Still compiled by `clippy --all-features`.
+# Run: `ANIMUS_UPGRADE_FROM_BIN=$(scripts/build-upgrade-from.sh) cargo test -p animusd --features upgrade-from --test upgrade_previous_release -- --nocapture --test-threads=1`.
+upgrade-from = []
+
+[[test]]
+name = "chaos"
+path = "tests/chaos.rs"
+required-features = ["chaos"]
+
+[[test]]
+name = "upgrade_previous_release"
+path = "tests/upgrade_previous_release.rs"
+required-features = ["upgrade-from"]
+
+[[test]]
+name = "soak"
+path = "tests/soak.rs"
+required-features = ["soak"]
+
 [dependencies]
 async-trait.workspace = true
 # `animusd` is the real node process — it's the one place that actually
@@ -70,6 +102,7 @@ animus-s3 = { workspace = true, features = ["prod"] }
 # re-exports its wire types/`topology`/`decide` from at the crate root.
 animus-node.workspace = true
 animus-control.workspace = true
+animus-placement.workspace = true
 animus-cp-data.workspace = true
 animus-storage.workspace = true
 animus-tablet.workspace = true
@@ -163,6 +196,10 @@ animus-sim.workspace = true
 # as a dev-dependency; no cycle — `animus-test`'s own `Cargo.toml` does not
 # depend on `animusd`).
 animus-test.workspace = true
+# ADR 0073 Phase 3 (P3-C): the pure rolling-upgrade state machine the
+# `sim_cluster_roll_orchestrator` corpus drives over SimCluster (the CLI and the
+# operator are its production consumers).
+animus-roll.workspace = true
 # S-04 PR 2's own in-crate `s3_store_tests` (`lib.rs`): exercises the
 # `SegmentStoreConfig::S3`/`BackupStoreHandle::S3` wiring against
 # `animus_s3::fake::FakeS3` — no real sockets. The normal (non-dev)

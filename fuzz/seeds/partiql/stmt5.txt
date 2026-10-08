@@ -1,0 +1,1 @@
+SELECT * FROM t WHERE begins_with(pk, 'x') OR attribute_exists(a) AND size(b) > 3

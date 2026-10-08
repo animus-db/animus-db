@@ -1879,6 +1879,21 @@ a literal `:0`.
   `table_detail_with_no_pitr_or_backups_is_null_and_empty`/
   `table_detail_shows_pitr_status_and_backups`.
 
+## Overload and resource bounds (R-01 (d), ADR 0074 §2)
+
+`overload.rs` holds `CountGate` (non-blocking atomic permit counter),
+`OverloadState` (on `ClientCtx::overload`) and `shed_connection` (bounded
+refusal tasks). Limits come from `RoleAddrs::overload` (`config::
+OverloadSection`, per node, absent = defaults; `--max-connections`/
+`--max-inflight` on `--config/--node`, `data`, `join`; zero rejected). The
+DynamoDB listener sheds over `max_connections` with a 503 and closes; `handle_conn`
+sheds over `max_inflight_requests` with `ServiceUnavailable` around `dispatch`
+(`/metrics` exempt). Admin/console and the client/intra listeners have their own
+caps. Counters `overload_shed_{conn_cap,admission,admin_conn_cap,peer_conn_cap}`.
+Full table, memory audit, disk-full trace and design: `docs/resource-bounds.md`.
+Adding a field to `RoleAddrs` hits the usual ~80-literal `E0063` fan-out.
+Real-TCP regression: `tests/overload.rs`.
+
 ## CLI reference
 
 `main.rs --help` (or the `gen-config`/`join`/`control`/`data` subcommand
@@ -7319,6 +7334,90 @@ attempted here.
 `=25` depths on the first complete run; the `ConsistentRead: false`
 prefix check and both direct probes never found a violation.
 
+## Cluster version wiring (ADR 0073 Phase 2, P2-C)
+
+`version_wiring.rs` (module carries `#[deny(clippy::disallowed_methods)]`) is
+everything `animusd` does with `animus-control`'s cluster-version machinery.
+**The era is live in production**: `apply_profile_to_raft` sets each control
+`RaftNode`'s own range/build at both start sites (`BoundNode::start_with_growth`,
+`BoundControlNode::start_control_with`), and `Node::bind*` gives the `ProdEnv`
+its handshake `ext` (`own_ext()`, a pure function of constants; always
+non-empty, presence is the Phase 2 signal). Known benign race: the accept loop
+is spawned before `set_own_ext`, so a connection in those microseconds answers
+with an empty `ext`; an era-on peer refuses and redials (closing it needs an
+`animus-env` `bind*` parameter).
+
+- **Per-node state**: `ClusterEdgeState::version()` -> `VersionState {
+  features (ClusterFeatures), halt (VersionHalt), profile (range + build) }`.
+  `Node::features()` / `version_halt_reason()` / `wait_version_halt()` expose
+  it. P2-B's emitters consult `ctx.edge.version().features`.
+- **`version_wiring_loop`** (spawned from `spawn_common_tail` and every
+  `SimCluster` node; one generic task, every role): feeds `ClusterFeatures`
+  from `effective_metadata()` once metadata is ready, flips
+  `require_peer_ext` for nodes with no local apply task (data-only), latches
+  the out-of-range halt, and **self-reports `ReportNodeVersion` only once the
+  node's own applied view shows the era** (never pre-era: a Phase 1 voter
+  cannot decode it). `ReportNodeVersion` is on the relay allowlist; Finalize
+  is not (leader-local).
+- **CHS1**: dials advertise `own_ext()` and never require the peer's; the
+  accept side advertises the node's profile `ext` and, era on, requires the
+  peer's **on `ListenerKind::Intra` only** (CLI/external clients dial the client
+  port with an empty `ext`).
+- **Admin**: `GET /admin/cluster-version` (any node) and
+  `POST /admin/cluster-version/finalize` (`ClientCtx::admin_finalize_cluster_version`:
+  leadership first, era, one-step, `expected` CAS, blockers, propose, confirm on
+  the version value). Blockers include Down/Leaving/never-activated Joining
+  members strictly; `Metadata::apply` enforces that half too since issue #1168
+  (the pre-check is operator-level, apply is authoritative).
+  `animus cluster version|finalize` (`animus-cli`) wraps them.
+- **Admission/joins**: `admin_add_control_member` refuses (era on) a voter with
+  no known range or an excluding one (so the voter must be up, connected or
+  self-reported, **before** the admin add once the era is on);
+  `discover_join_info` refuses an
+  out-of-range cluster from `JoinInfo.cluster_version` before claiming anything.
+- **Halt**: `main.rs` `wait_for_shutdown` races the signal against every node's
+  `wait_version_halt`; a halt prints `animusd: FATAL: <reason>` and exits 78
+  (`EX_CONFIG`), no usage text.
+- **Gated emit/receive sites (P2-B handoffs, closed out)**: every client frame
+  is written through `write_frame_gated` (`ClientGated` + the node's
+  `ClusterFeatures`; the ungated `write_frame` stays for tests and raw clients);
+  `AnimusdRelayClient`/`relay_request_with_timeout` carry the handle and map an
+  `InvalidInput` (closed gate) to `relay refused: ...`, never a wire write. The
+  relay **receiver** (`forwarding.rs` `ProposeSchema`) calls
+  `version_wiring::relay_gate_verdict` after the relayable check: it re-reads
+  `effective_metadata` once before refusing, counts
+  `Metric::ClusterGateRelayRefused`, and answers a named `ClientResponse::Error`
+  (without it a closed-gate relayed command reaches `RaftNode::propose`, which
+  debug-asserts). Both reconciler sites call `set_cluster_features` so every
+  hosted `RaftKvNode` runs on the node's control-fed handle (data-only nodes
+  included, fed from the mirror). `ClusterFeatures::violations` is exported as
+  `Metric::ClusterGateViolations*` by the feeder loop and on every
+  `/admin/metrics` scrape. **Gotcha: `SimEnv::env.metrics()` is a per-(sim,
+  node) sink, NOT the exported sink** (in `ProdEnv` they coincide); anything a
+  metric test must observe goes through `ClientCtx::exported_metrics()`.
+  `SimCluster::control_features(n)` is the `RaftNode`'s own handle (what
+  `propose` consults), distinct from `features(n)` (the node-level handle the
+  wire/relay emitters use).
+- **Mixed-version corpus cluster tier** (`sim_cluster_mixed_version_corpus.rs`):
+  besides the rolling cells, the workload-free cells `ladder_finalize_each_gate`,
+  `negative_control_ungated_{variant,field}` / `_stale_view`,
+  `joiner_phase1_after_era`, `joiner_phase1_dials_data_only_node` (the data-only
+  node's require-peer-ext flag comes from the feeder via
+  `ControlHandle::Remote`) and `joiner_range_checks`.
+  `SimCluster::try_join_via_seed_as(seed, role, range)` plays a joiner binary
+  (its `ext` on the throwaway dial identity, the production `check_join_range`
+  at discovery) and returns the refusal instead of panicking; a joiner range
+  disjoint from the cluster's is refused earlier, by the handshake, so the
+  discovery check is only reachable by a range that overlaps it.
+- **Tests**: `sim_cluster_cluster_version.rs` (`SimCluster::set_node_version` /
+  `set_all_node_versions` are the per-node "binary" hook; synthetic `[1, 2]`
+  ranges stand in for a second release; `set_raft_own_range` switches the
+  leader's own upkeep off so the relay-arm test is red without the arm) and
+  `tests/cluster_version_prod.rs` (real sockets: era, view, by-name Finalize
+  refusal, CHS1 client-vs-intra, data-only node learning the era). The default
+  `SimCluster` node stays a Phase 1 `RaftNode`, so existing sim tests never start
+  an era.
+
 ## Versioned formats (ADR 0073 Phase 0, Workstream E)
 
 `ClusterConfig` is the config JSON file's top-level type and carries a
@@ -11887,6 +11986,38 @@ violations); a truncated LSM file on every node must fail the strict open
 bump) need no change here: they land as one `transcode::TABLE` entry and the
 cells grow with `transcode::supported_back()`.
 
+
+## G-01 stage G-a: node labels and the zone-spread default (2026-10-04)
+
+- `RoleAddrs::labels` (additive, skip-if-empty) is each node's topology labels;
+  `Bound{,Control,Data}Node` keep them and pass them to `register_node` /
+  `admin_add_member`. Inputs and merge order: `node_labels::LabelFlags`
+  (`--label`, `--labels-file`, `--labels-file-annotations`,
+  `--labels-wait-secs`; flag > file > config). `--cluster N` rejects them.
+  `node_labels.rs` is process-boundary startup code (real `std::fs` and a real
+  bounded wait) and deliberately not a `#[deny(disallowed_methods)]` module.
+- `schema.rs::default_table_policy` / `zone_aware_initial_replicas`: the
+  zone-spread policy decision at table creation (see
+  `animus_placement::zone_spread_policy`). Computed once at creation.
+- `sim_cluster_zone_placement.rs` (`ANIMUS_ZONE_PLACEMENT_SEEDS`,
+  `SimCluster::new_with_node_labels`): 6 nodes / 3 zones, RF 3, wire
+  `CreateTable`, zone kill. Negative-controlled: disabling the zone-aware
+  initial pick fails it at placement.
+
+## Observability kit and the metrics-exist check (R-01 (f))
+
+`deploy/observability/` (alert + recording rules, Grafana dashboard, SLO
+README) references real exposition names only. Prometheus scrapes
+`GET /metrics` on the DynamoDB port (`dynamo.rs::handle_conn`), not
+`/admin/metrics` (JSON). `sim_cluster_admin::metric_references_exist_in_exposition`
+(runs in the `--lib` nextest tier) renders `SimCluster::metrics_text(node)`
+(the real `ClientCtx::metrics_text`), cross-checks it against `/admin/metrics`
+and `Metric::ALL`, then greps `docs/`, `website/` and `deploy/observability/`.
+A false positive (a backticked identifier that only looks like a metric)
+goes in its `NOT_A_METRIC` allowlist with a reason. `dynamo_requests_total` /
+`dynamo_responses_5xx` are bumped per dispatched request in `handle_conn`
+(test: `dynamo::..::request_outcome_counters_count_requests_and_only_5xx_faults`).
+
 ## Appendix — `sim_cluster_mixed_version_corpus`: rolling Phase 1 -> B2 over `SimCluster` (ADR 0073 Phase 2, P2-D, 2026-10-04)
 
 The cluster tier of the mixed-version corpus (the pure tier is
@@ -11971,3 +12102,299 @@ at `--test-threads=2` in a debug build; the N=50000 run is ~150 s in `--release`
   `docs/lessons/testing/2026-10-04-a-sim-restart-must-preserve-the-wal-and-engine-pair.md`.
 - Lessons: `docs/lessons/testing/2026-10-04-quiescent-means-silent-on-the-wire-…`,
   `docs/lessons/code-patterns/2026-10-04-a-scale-fixture-built-past-an-o-n-apply-…`.
+## WAN timing config and the region-aware control-voter check (ADR 0075 section 3.4)
+
+`cluster_settings.max_region_rtt_ms` (additive, `skip_serializing_if` unset so
+the frozen cluster-config v1 fixture is unchanged; default 150) and
+`--max-region-rtt-ms MS` (needs `--config`) set the inter-region round-trip
+bound that sizes the WAN Raft profile; `ClusterConfig::max_region_rtt()` reads
+it and `Bound*Node::with_max_region_rtt` plumbs it to the control group
+(`RaftNode::enable_region_timing`) and the tablet-host reconciler
+(`set_max_region_rtt`). Inert unless some group's replicas span more than one
+`topology.kubernetes.io/region` label. `tablet_host_reconciler_loop` and
+`SimCluster` build `MetadataView::regions` from `Metadata.members` labels
+(`SimCluster` does not run the control loop, to keep fixed-seed timelines).
+`admin_add_control_member`/`admin_remove_control_member` call
+`animus_control::timing::control_voter_change_check` (remove accepts `--force`).
+**Gaps:** control-only voters' labels are not in `Metadata` (no `Member` row);
+`gen-config` cannot warn about a region-concentrated control set until G-a
+supplies labels.
+
+## MRSC global tables: `global_tables.rs` and `sim_cluster_mrsc` (ADR 0075, G-01 G-c)
+
+`global_tables.rs` is the `E: Env`-generic client/admin edge of MRSC (deny-
+`disallowed_methods` on its `mod` line): `update_table_global` (the wire
+conversion, shared by `run_operation` and `SimCluster`'s `dispatch_table_op`),
+`global_description` (DescribeTable fields, replica status derived), the MRSC
+restriction guards, and, since M4, `admin_global_tables_view`
+(`GET /admin/global-tables`), `admin_set_preferred_leader`
+(`POST /admin/table/preferred-leader`, relayed like a schema proposal and
+confirmed by observing `schema.global`) and the **decommission guard**
+`drain_strands_region` (`ClientCtx::admin_drain(node, force)` refuses the last
+`Active` member of a pinned Region; `force` overrides). Both admin routes have
+an `AdminHost` method (animus-node) and an arm in each of the two `impl`s in
+`admin.rs`. The dashboard needs no new fetch: `schemas.tables[t].global` is in
+`/admin/status`.
+
+`sim_cluster_mrsc.rs` (`ANIMUS_MRSC_SEEDS`, shared with `animus-cp-data`'s
+`preferred_leader_corpus`; `ANIMUS_MRSC_CELL`, `ANIMUS_SEED`): one `#[test]`
+per cell (`sim_cluster_mrsc_corpus_<cell>`, parallel under nextest) plus three
+negative controls. Harness gotchas it cost to learn:
+- **Give every node a recorded profile.** `SimCluster::restart` re-applies the
+  node's *recorded* binary profile (default `Phase1`); `set_all_node_versions`
+  alone does not record one, so a restarted node came back as a Phase 1 binary
+  that cannot decode version-2 batches and never rejoined. Call
+  `set_binary_profile(n, BinaryProfile::Release(2))` for every node.
+- **Use the LSM backend (`new_with_node_labels_lsm`) for any cell that
+  restarts a node.** With `Memory` a restarted tablet group replays an empty
+  Raft state; the issue #667 boot-time cluster check then (correctly) refuses
+  to let it vote or campaign, so a leadership transfer to it silently never
+  completes. That is right for a wiped disk, wrong for a process restart.
+- **`SimCluster` has no background split driver:** drive
+  `drive_inplace_split_cutover(node)` on every node each poll tick.
+- `await_replicas_caught_up` skips crashed nodes (a dead node's stale replica
+  is not progress); `group_states(node)` prints role@term/known leader per
+  hosted group for a convergence-timeout dump.
+- `split_under_mrsc` checks writes acked before and after the split; it found
+  issue #1229 (a split child whose replicas all move lost pre-split rows),
+  fixed by #1231.
+
+## Real-process soak (R-01 (a), `docs/soak.md`)
+
+`tests/soak.rs` (opt-in `soak` cargo feature, like `chaos`) runs the chaos
+harness's cluster/workload/oracle machinery (`tests/chaos_support/`) with no
+faults for hours or days, in **epochs**: each epoch has a fresh key range
+(`Shared::with_base`'s `key_base`), is verified (final reads through two nodes,
+the three oracles plus eventual-prefix and txn-atomicity) and its history is
+dropped; the previous epoch and epoch 0 are re-read as cold data; keys two
+epochs old are deleted so live data stays bounded. Per-node RSS/threads/fds
+(`/proc/<pid>`), data-dir/WAL bytes, `sst-*` file count and the
+`demux_*`/`spawned_task_handles_tracked` gauges feed
+`animus_test::soak::evaluate`. **Gotchas**: `chaos_support` is `mod`-included by
+both targets, so a helper only one uses needs `#[allow(dead_code)]` (clippy
+`-D warnings` over `--all-features` builds both); `ChaosCluster::pid`/
+`data_dir` exist for the soak; the soak never arms the proxy faults, so a
+`[node-exit]` or `[node-panic]` there is always a finding; node logs are not
+rotated, so a multi-day run needs disk for them.
+
+## Previous-release rolling upgrade (ADR 0073 Phase 3 P3-E, D10)
+
+`tests/upgrade_previous_release.rs` (opt-in `upgrade-from` cargo feature; CI job
+`upgrade-previous-release`) starts a real multi-process cluster of the pinned
+**R-1** `animusd` (`scripts/upgrade-from.txt`, built from source and cached by
+SHA by `scripts/build-upgrade-from.sh`; `ANIMUS_UPGRADE_FROM_BIN`), runs the
+chaos harness's recorded workload and oracles (`chaos_support`, reused as in the
+soak), then rolls it onto this tree with the real `animus cluster roll
+plan/wait` and `finalize` CLI (`animus` is found next to `animusd`, or
+`ANIMUS_CLI_BIN`), restarts the whole cluster on the current build, and checks
+durability/cycles/convergence, a bounded write stall, the era, `can_finalize`,
+finalize, and that the state only grew across the whole-cluster restart. Four
+variants (SIGTERM+transfer on 3 nodes; the same on 4 nodes with a restart gap
+past the 5 s repair dwell, which is the **D4 repair-churn measurement**; SIGKILL
+of the control leader; SIGKILL + a torn control/shared WAL tail). **Gotchas**:
+with the feature on a missing R-1 binary **panics** (never skips: a skipped
+cross-version job is a silent pass); `roll plan` is taken over the Phase 1
+cluster and re-asked after every step (it is re-entrant: before the era no node
+has a recorded range, so the CLI probes each node's own `cluster-version`; the
+test asserts the re-plan lists exactly the remaining nodes, and is empty after
+finalize); a node restarted
+for less than the repair dwell causes no churn even with a spare node, so the
+measurement needs `ANIMUS_UPGRADE_FROM_RESTART_GAP_SECS`; a write the client
+timed out on can commit after the workload stopped, so "unchanged after a
+restart" is wrong, "grew, in order, only by writes this workload issued" is
+right; **Known findings** against the pinned `ac57d56a` (module doc): its own
+abort-tombstone defect (`efcaa6cb`), legacy v1 intents aborted by the new
+binary, and the ungated `txn-envelope` v2 intent (an R-1 replica panics on an
+upgraded node's repair snapshot), so the workload runs without multi-key
+transactions unless `ANIMUS_UPGRADE_FROM_TXN=1` (CI runs one such variant as an
+informational, non-blocking step);
+`ANIMUS_UPGRADE_FROM_CONTROL=same-binary|current-only` runs the same
+roll with no binary change, to tell a mixed-version defect from a restart/repair
+defect; a failure writes history, op trace, violations and node logs under
+`$ANIMUS_UPGRADE_FROM_REPORT_DIR/<variant>-failure/`.
+
+## StorageFull on the client path and in `/admin/health` (R-01 (d), issue #1185)
+
+`CpGroup::is_storage_full` + `refuse_if_storage_full` (`lib.rs`) refuse a write
+before it is proposed when the hosted group's WAL is suspect; `write_path.rs`
+and `txn_coordinator.rs` call it and stop their retry loops on
+`is_storage_full_refusal`. `dynamo::map_throttleable_error` maps the refusal to
+a 503 `ServiceUnavailable` whose message starts `StorageFull:` and ends
+`; retry` (test: `map_throttleable_error_tests`), counted as
+`overload_storage_full`. `/admin/health` adds `storage_full`,
+`storage_full_control`, `storage_full_tablets` without flipping the status code
+(readiness would also pull reads); `/admin/raftkv` gets a per-group
+`storage_full` field. `sim_cluster_admin`'s NOT_A_METRIC list no longer holds
+`overload_storage_full`; `storage_full` stays (it is a JSON field, not a metric)
+and `spawned_task_panics` no longer does (exported since #1220, below).
+
+## Panicked consensus task fails `/admin/health` (issue #1220)
+
+`/admin/health` (`admin::health`) reads `Metric::ConsensusTaskPanics` from
+`ctx.env.metrics()` and returns 503 with `consensus_task_panics: N` once it is
+nonzero (unlike `storage_full`, this DOES flip the status: a dead Raft driver or
+apply loop is never restarted, only a restart repairs it; `/admin/live` is
+unchanged so the kubelet can still restart the pod). The counter is bumped by
+`ProdEnv::spawn_counted` for tasks spawned with `spawn_critical_task` (control
+`drive` + `meta_apply_loop`, CP-data `drive` + `apply_loop`); `Metric::
+SpawnedTaskPanics` counts every task. `SimEnv`'s `spawn_critical` is a plain
+spawn, so sim tests cannot see a panic; the real-task proof is
+`tests/consensus_task_panic_health.rs` (its own `ProdEnv` target; injects an
+ordinary then a critical panic and polls `/admin/health` + `/admin/metrics`).
+Both metrics are in the exposition (`sim_cluster_admin`'s metrics-exist check),
+alerts `AnimusConsensusTaskPanicked`/`AnimusBackgroundTaskPanicked` are in
+`deploy/observability/animus-alerts.yml`. **Gotcha:** a new `Spawner` wrapper
+must forward `spawn_critical` or the flag is silently lost (the default
+delegates to `spawn`).
+
+## Real-filesystem disk-full chaos scenario (issue #1221)
+
+`chaos_disk_full` (`tests/chaos.rs`, helpers `chaos_support/diskfull.rs`, `ChaosCluster::set_data_dir`)
+mounts one 64 MiB tmpfs per node (`sudo -n mount` unless root), fills them with a
+ballast file and asserts refusal, step-down write continuity and no-restart
+recovery; see `docs/chaos.md` ("Disk full on real filesystems") for the phases,
+knobs, and the two open findings (F-1 reads while every node is full, F-2 an
+unresolved 2PC intent, which is why 2PC ops are off by default here). It skips
+with a message when it cannot mount (`ANIMUS_CHAOS_REQUIRE_MOUNT=1` fails
+instead; the CI job `chaos-disk-full` sets it). **Gotcha:** a leaked mount on a
+crashed run is `mount | grep animus-chaos` + `sudo umount -l`; `Tmpfs`'s `Drop`
+unmounts after the nodes are killed, so drop the cluster before the mounts.
+
+and `spawned_task_panics` stays (still not exported).
+
+## `sim_cluster_split_relocation` (issue #1229)
+
+`sim_cluster_split_relocation.rs`: 6-node RF 3 `SimCluster`, auto-split, child moved
+wholesale off the parent's replicas by directed Placing; every pre-split key must
+read back (`ConsistentRead`). Two cells (`MemoryEngine`; `LsmEngine` + rotating
+crash/restart). `ANIMUS_SPLIT_RELOCATION_SEEDS=K`, `ANIMUS_SEED=<s>`. Nightly at 20.
+See `crates/animus-cp-data/CLAUDE.md` for the root cause.
+
+- **TxnId uniqueness (R-01 F-2).** `TxnId.node` is the node qualified by the group stream (`n0#100`; primary stream = bare node id), because `ts` is per-group `Hlc` state and one node leads many groups. `txn_stage_local` (animusd) also refuses, before proposing, a stage group with any key outside the leader range (stale grouping across a split). See `docs/lessons/testing/2026-10-05-a-txn-id-must-be-unique-per-group-not-per-node.md`.
+
+- **Decide on a frozen group re-routes (R-01 F-2).** `txn_decide_anchor` returns the retryable `FROZEN_REFUSAL` when the record is still `Pending` on a group that is now frozen (the decision applied as a sealed no-op); `txn_decide_anchor_retrying` then re-routes the SAME decision to the record's new owner.
+
+## Startup self-registration is retried (issue #1230)
+
+`spawn_common_tail`'s `RegisterNode` and the growth/data-only `admin_add_member`
+claims run `ClientCtx::register_node_until_settled` /
+`admin_add_member_until_settled` (`schema.rs`): bounded-backoff retry via
+`env.sleep`, a log line per failure, stops on `Registered`/`Collision` or on
+first sight of the node's own entry in its local view (so a retry can never
+resurrect a node `RemoveMember` just removed; a replicated tombstone would be
+needed to close the residual mirror-lag window). Never reintroduce
+`let _ = ctx.register_node(..)`. Regression: `sim_cluster_register_retry.rs`
+(partition a follower from the control quorum for 25 s > `SCHEMA_COMMIT_TIMEOUT`;
+`ANIMUS_SEED=<seed>` replays). Lesson: `docs/lessons/code-patterns/2026-10-05-a-fire-and-forget-let-underscore-turns-a-bounded-timeout-into-a-permanent-silent-failure.md`.
+
+## Roll health and the `roll` object (ADR 0073 Phase 3, P3-A)
+
+`roll_health.rs` is the one server-side definition of "safe to touch the next node":
+`GET /admin/roll-health` (`AdminHost::roll_health_view`, route in `animus-node`),
+the `roll.health` summary inside `GET /admin/cluster-version`, and the dashboard Version
+card all read it. It is **pure** (`Metadata` + `ControlView` + `LocalView` in, verdict
+out); `ClientCtx::roll_health_verdict` snapshots the inputs (`CpGroup::roll_group` is the
+cheap, no-byte-estimate group read; control reachability is observable only on the control
+leader, elsewhere a recent leader is the evidence). `version_wiring::roll_view` derives the
+`roll` object (phase/total/on_new/remaining/down/blockers/health) from `Metadata` alone:
+**never stored**, so a leader change loses nothing. `tablet_status` is a line-for-line
+port of `dashboard_core.js::tabletStatus`; `roll_health::tests::
+ladder_equals_the_dashboard_tablet_status` runs the real JS under `node` over an enumerated
+state table and fails if they diverge (it skips loudly without a `node` binary): change the
+ladder in both places or the test fails. Adding an `ok` clause means a new `Reason` kind, a
+one-clause unit test, and a line in `docs/runbook/upgrade.md`. Not a readiness probe, by
+design (issues #595/#710).
+
+## `sim_cluster_roll_orchestrator`: the roll driver over `SimCluster` (ADR 0073 Phase 3, P3-C)
+
+`sim_cluster_roll_orchestrator.rs` drives `animus_roll::decide` (the pure roll state
+machine the CLI and operator share, see `crates/animus-roll/CLAUDE.md`) over a 4-node
+`SimCluster` (`[Both, Both, Both, Data]`, RF 3) under the linearizable DynamoDB workload.
+The harness is "the platform": it executes `Restart` (crash, a seeded 0.3-2 s of
+downtime, then the new binary), the real `POST /admin/control/transfer` and `POST
+/admin/cluster-version/finalize`, and observes through the same bodies the endpoints serve
+(`SimCluster::{cluster_version_view, roll_health_view}`, synchronous, no simulated time).
+The oracle re-derives the truth at each decision (independent `roll-health` on every other
+node, members `Active`, one node below the gate, not the leader, data before control,
+`roll.remaining[0]` parity in clean cells) and then runs the mixed corpus's end checks.
+Cells, knobs and replay: `ANIMUS_UPGRADE_SEEDS`, `ANIMUS_UPGRADE_CELL`, `ANIMUS_SEED`; a
+failing cell prints its last 40 decisions. Four things that cost time:
+
+- **Faults land between ticks, before the observation**, never between a decision and its
+  execution: a fault injected after `decide` makes the oracle blame a decision for state it
+  never saw.
+- **LSM backend, not Memory.** A roll restarts every node; the `Memory` backend's restart is
+  a wiped disk (the control system-keyspace mirror comes back empty, so a restarted control
+  node with a compacted log serves a partial `Metadata` at the leader's applied index).
+  `lsm_setup` uses `SimCluster::new_with_lsm_engines`.
+- **Client ops are capped on the client's own env** (`bounded_dynamo`): a request issued to a
+  node the harness has stopped never completes in the simulator (its timers die with the old
+  process), so the shared `client_loop` hangs. The copy here records a capped op as
+  indeterminate. Do not "fix" it by sharing the loop with the other corpora (it perturbs
+  their schedules).
+- The soak clock and the stall clock are the *caller's*: a "restarted driver" restarts them
+  (`driver_restarts` drops them every 13 ticks, so its soak is 2 s < 2.6 s).
+
+Mixed-version `Watch`, `setup`, `wedged_control` and friends are `pub(super)` for this reuse.
+Lessons: `docs/lessons/testing/2026-10-05-a-restart-heavy-simcluster-corpus-needs-the-lsm-backend-and-client-side-op-caps.md`.
+
+## `SimWorld` (multi-cluster sim, G-01 stage G-d M0)
+
+`src/sim_world.rs` (+ `sim_world_tests.rs`, `cargo test -p animusd --lib
+sim_world`, `ANIMUS_SIMWORLD_SEEDS=K`): N independent `SimCluster`s, each its own
+`Simulator`, advanced in lockstep by `SimWorld::run_for`, plus `PeerBridge`
+(per-link latency/jitter/loss/duplicate, partition/heal incl. one-way) behind the
+`PeerClient` trait seam. Drive it only through `SimWorld` methods (`dynamo`,
+`peer_call`, `drive`, `run_for`), never a member cluster's own `run_for`/`dynamo`.
+See `docs/lessons/testing/2026-10-05-multi-cluster-sim-is-two-simulators-in-lockstep.md`.
+
+## MREC writer guards (G-01 stage G-d M2)
+
+An MREC table's base row is stamped at apply, so no edge-valued writer may touch it:
+`dynamo::table_change_records_carry_images` is `true` for an MREC table (the
+`fast_marker_write`/`marker_batch_write` arms are never taken), `marker_batch_write_raw`
+refuses one, and `cp_txn` refuses its non-`pending` writes (the raw client `Put`/
+`PutBatch`/`Delete`/`Txn`). **Every `write_schema_for` call site (3 in `dynamo.rs`, 1 in
+`txn_coordinator.rs`) must set `mrec` once M4 emits it**, and the TTL reaper's must carry
+the expiry instant as `wall_ms`. `KindEvalApplied::Superseded` is the replicate's lost-LWW
+result (unused until the M3 receiver handler). Pinned by `mrec_writer_guard_tests.rs`.
+
+
+### MREC peer transport and receiver (ADR 0075 M3, G-01 stage G-d)
+
+`mrec_peer.rs`: `MrecConfig` (the node-local view of `cluster_settings.{region, peers,
+allow_insecure_peers, mrec_max_clock_skew_ms}`, installed by `with_mrec` on every `run_node*`
+path **and** the bound-node start half), the `PeerClient` seam (bytes in/out, `to` = index
+into the peer list) and `ProdPeerClient` (intra dial with mutual TLS, per-peer `tls_ca`).
+`mrec_receiver.rs`: `handle_mrec_apply`, `E: Env`-generic, reached from the intra
+`ClientRequest::MrecApply` arm; order of checks is proto, transport (TLS or
+`allow_insecure_peers`), `MrecReplication` gate, region, peer, in-flight cap, table. Gotchas:
+a replicate is `ProbeIdentity::RequiresOwnEntry` (never `ValueProves`); `ConditionFailed` on a
+replicate means a foreign intent and is `Retry`; a whole-batch `Refused` reply is gate
+**Base** (a class-G reply could not be emitted by a node whose gate is closed, and a debug build
+panics on that); a lost confirm is `Retry`, not an error. `tests/mrec_peer_transport.rs`
+drives two real one-node clusters through `mrec_peer::probe_peer_for_test`; it cannot apply
+data until M4's replica-create saga. Never drive a `SimWorld` member cluster directly.
+
+**MREC global tables, as built (ADR 0075 "G-d as built", G-01 G-d M4-M6).** Modules:
+`mrec_peer` (config, `PeerClient`, `ProdPeerClient`, node-local `PeerHealth` memo),
+`mrec_receiver` (`handle_mrec_apply`, routed from `ClientRequest::MrecApply`),
+`mrec_shipper` (module doc = design: per `(led tablet, peer)` tick, dirty keys above
+`mrec:<region>`, scan under `mrecscan:<region>`; cursor advances only after the peer's
+ack; loop prevention is state-based, a foreign-region-stamped row is never shipped;
+split child = unfiltered rescan), `mrec_saga` (`UpdateTable ReplicaUpdates`, driver =
+leader of the table's lowest active tablet, peer-side `handle_control`, `SetTtl`). Both
+loops (`mrec_ship_loop` calls saga then ship tick) are spawned beside
+`change_consumer_loop` at the two `lib.rs` assembly sites and are inert until a table
+is MREC. Every base-row writer of an MREC table must stamp `schema.mrec`
+(`mrec_write_stamp`); `kind_writes_for_item` deliberately does not (restore/import
+create regional tables). `/admin/global-tables` shows MREC tables via
+`admin_mrec_table_view` (shipper health is node-local, in memory). Tests:
+`sim_world_mrec_{shipper,saga,edge,e2e}_tests.rs` (>=20 seeds each), the corpus
+`sim_world_mrec_corpus.rs` (`ANIMUS_MREC_SEEDS`; `cargo test -p animusd --lib
+sim_world_mrec`), and real sockets in `tests/mrec_peer_transport.rs`
+(`two_real_clusters_replicate_a_table_both_ways_over_mutual_tls`: finalize to version 3
+over the TLS admin port, TLS DynamoDB wire, converged-or-timeout polls). Gotcha: the
+saga tests' `S` harness needs a `pad` peer so peer index == bridge cluster index.
+
+- **Peer trust class (issue #1253, ADR 0075 amendment).** `TlsSection.peer_ca_path` (optional) holds peer-region CAs; `ca_path` is the own CA. The intra acceptor admits both, `serve_requests` calls `TlsMaterial::classify_peer` after the accept and passes `PeerTrust` to `handle_connection`, which refuses anything but `MrecApply` for `PeerRegionOnly` (`animus_node::peer_region_may_send`, exhaustive, no `_` arm; `ClientResponse::Error` + `peer_region_request_refused` metric). The internal Raft wire (`animus-env` `spawn_accept`) drops such connections. No `peer_ca_path` = everything `Own` (old behaviour). Plaintext `allow_insecure_peers` stays unauthenticated. Test hook `mrec_peer::probe_peer_request_for_test` sends any `ClientRequest` with a chosen certificate; with the own-CA-only `ca_path` a dialer needs the peer's CA as `extra_ca` (`tls_ca` per peer) to trust the server certificate.

@@ -1577,6 +1577,7 @@ pub(crate) mod tests {
                                     key: animus_item::TableSchema::simple("pk"),
                                     lsis: Vec::new(),
                                     change_records_carry_images: false,
+                                    mrec: None,
                                 },
                                 pk: animus_item::AttributeValue::S("bob".to_owned()),
                                 sk: None,
@@ -1704,6 +1705,7 @@ pub(crate) mod tests {
                             projection: animus_item::Projection::KeysOnly,
                         }],
                         change_records_carry_images: true,
+                        mrec: None,
                     },
                     pk: animus_item::AttributeValue::S("alice".to_owned()),
                     sk: Some(animus_item::AttributeValue::N("42".to_owned())),
@@ -1742,6 +1744,7 @@ pub(crate) mod tests {
                                 key: animus_item::TableSchema::simple("pk"),
                                 lsis: Vec::new(),
                                 change_records_carry_images: false,
+                                mrec: None,
                             },
                             pk: animus_item::AttributeValue::S("bob".to_owned()),
                             sk: None,
@@ -1765,6 +1768,7 @@ pub(crate) mod tests {
                                     projection: animus_item::Projection::All,
                                 }],
                                 change_records_carry_images: true,
+                                mrec: None,
                             },
                             pk: animus_item::AttributeValue::S("carol".to_owned()),
                             sk: Some(animus_item::AttributeValue::N("7".to_owned())),
@@ -1904,6 +1908,120 @@ pub(crate) mod tests {
             ],
             Vec::new(),
         ]
+    }
+
+    /// ADR 0075 (G-01 stage G-d): the additive MREC content of the evaluated
+    /// writes, in one `AppendEntries` frame — `WriteSchema.mrec` on a
+    /// `KindEval`, `KindEvalOp::Replicate` (item and tombstone) in a
+    /// `KindEvalBatch`, and an MREC `TxnStage` pending write. Rides the
+    /// existing wire v1 (JSON blobs inside the envelope), so it is a *shaped*
+    /// fixture (`raftkv-wire/v1-mrec.bin`), append-only like [`sample_entries`].
+    pub(crate) fn mrec_sample_wires() -> Vec<KvWire> {
+        let ver = animus_item::MrecVersion {
+            wall_ms: 1_790_000_000_123,
+            logical: 7,
+            region_id: 0xe40c_292c,
+        };
+        let schema = |mrec: bool| animus_item::WriteSchema {
+            key: animus_item::TableSchema::composite("pk", "sk"),
+            lsis: Vec::new(),
+            change_records_carry_images: true,
+            mrec: mrec.then_some(animus_item::MrecWriteStamp {
+                region_id: 0xe40c_292c,
+                wall_ms: 1_790_000_000_456,
+            }),
+        };
+        let item: animus_item::Item = [(
+            "pk".to_owned(),
+            animus_item::AttributeValue::S("alice".to_owned()),
+        )]
+        .into_iter()
+        .collect();
+        let pk = || animus_item::AttributeValue::S("alice".to_owned());
+        let sk = || Some(animus_item::AttributeValue::N("42".to_owned()));
+        let entry = |index: u64, command: KvCommand| LogEntry {
+            term: 9,
+            index,
+            command,
+            config: None,
+            learners: None,
+        };
+        let entries = vec![
+            entry(
+                40,
+                KvCommand::KindEval {
+                    schema: schema(true),
+                    pk: pk(),
+                    sk: sk(),
+                    op: crate::KindEvalOp::Put(item.clone()),
+                    condition: None,
+                    ttl_expired: false,
+                    ts: ts(13, 0),
+                },
+            ),
+            entry(
+                41,
+                KvCommand::KindEvalBatch {
+                    entries: vec![
+                        crate::KindEvalEntry {
+                            schema: schema(false),
+                            pk: pk(),
+                            sk: sk(),
+                            op: crate::KindEvalOp::Replicate {
+                                item: Some(item.clone()),
+                                ver,
+                            },
+                            condition: None,
+                            ttl_expired: false,
+                        },
+                        crate::KindEvalEntry {
+                            schema: schema(false),
+                            pk: pk(),
+                            sk: sk(),
+                            op: crate::KindEvalOp::Replicate { item: None, ver },
+                            condition: None,
+                            ttl_expired: false,
+                        },
+                    ],
+                    ts: ts(14, 0),
+                },
+            ),
+            entry(
+                42,
+                KvCommand::TxnStage {
+                    txn_id: TxnId {
+                        ts: ts(15, 0),
+                        node: nid(3),
+                    },
+                    record_key: b"record".to_vec(),
+                    record_table: "orders".to_string(),
+                    is_anchor: true,
+                    writes: vec![TxnWrite::pending_eval(
+                        b"k2".to_vec(),
+                        None,
+                        crate::PendingTxnWrite {
+                            schema: schema(true),
+                            pk: pk(),
+                            sk: sk(),
+                            op: crate::KindEvalOp::Delete,
+                            condition: None,
+                            ttl_expired: false,
+                        },
+                    )],
+                    spans: Vec::new(),
+                    conditions: Vec::new(),
+                    ts: ts(15, 1),
+                },
+            ),
+        ];
+        vec![KvWire::Raft(RaftMsg::AppendEntries {
+            term: 9,
+            leader: nid(2),
+            prev_log_index: 39,
+            prev_log_term: 9,
+            entries,
+            leader_commit: 39,
+        })]
     }
 
     /// Every `KvWire` variant: each `RaftMsg` variant, both probes, and the

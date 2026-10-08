@@ -838,6 +838,14 @@ comment for its full type/method inventory.
   predicate the Streams read path filters markers and the backfill's
   `seeded` records with; change-log consumers themselves treat every
   record as a dirty-key signal and ignore both flags.
+- **Never byte-index a `str` at a position found by scanning bytes.**
+  `find_top_level` (the `OR`/`AND`/`BETWEEN` splitter behind every
+  Condition/Filter/KeyCondition expression) once looped over each byte `i` and
+  evaluated `lower[i..].starts_with(..)`, which panics when `i` falls inside a
+  multi-byte char (fuzzer-found remote panic: a U+FFFD in a `FilterExpression`).
+  Match on bytes (`bytes[i..i+n].eq_ignore_ascii_case(needle)`) over the
+  ORIGINAL string; ASCII-needle hits are always char boundaries. See
+  `docs/lessons/code-patterns/2026-10-04-str-slice-at-scanned-byte-index-panics-on-utf8.md`.
 
 ## Tests
 
@@ -916,3 +924,7 @@ that crate's `CLAUDE.md`'s Tests section). **Every GSI query assertion in
 those files is a converged-or-timeout poll** (ADR 0041's own
 eventually-consistent contract); an LSI query stays a plain immediate
 assertion.
+
+## Fuzzing (roadmap R-01 (c))
+
+`wire::decode_request` (every operation, and through it the private Update/Condition/Projection/KeyCondition expression parsers), `streams_wire`, `partiql::parse_statement`/`lower_*` and `sigv4::parse_credential`/`verify` are fuzz targets (`dynamo_request`, `dynamo_expressions`, `partiql`, `http_sigv4`). A new operation or expression form needs a seed in `fuzz/seeds/`; a decoder that panics on any input is a bug, not a precondition. See `fuzz/README.md` (stable smoke: `cd fuzz && cargo test --release --test smoke`).

@@ -317,6 +317,9 @@ struct Inner {
     /// path at all (verified by `spawn_aborted_task_never_counts_as_a_
     /// panic`).
     task_panics: AtomicU64,
+    /// Subset of `task_panics` that were **consensus-loop** tasks (spawned
+    /// via [`Spawner::spawn_critical`], issue #1220).
+    critical_task_panics: AtomicU64,
     /// The first spawned-task panic's message, if any (issue #939) — kept
     /// so a teardown check can name what happened rather than just "N
     /// panics". Only the first is kept: a cascade of panics after the
@@ -449,6 +452,7 @@ impl ProdEnv {
                 tasks: StdMutex::new(vec![accept_abort, pump_abort]),
                 finished_unswept: AtomicUsize::new(0),
                 task_panics: AtomicU64::new(0),
+                critical_task_panics: AtomicU64::new(0),
                 first_task_panic: StdMutex::new(None),
                 metrics,
             }),
@@ -585,6 +589,15 @@ impl ProdEnv {
     #[must_use]
     pub fn spawned_task_panics(&self) -> u64 {
         self.inner.task_panics.load(Ordering::SeqCst)
+    }
+
+    /// Count of **consensus-loop** tasks (spawned via
+    /// [`Spawner::spawn_critical`]) that panicked on this env (issue #1220);
+    /// a subset of [`spawned_task_panics`](Self::spawned_task_panics). Also
+    /// exported as `Metric::ConsensusTaskPanics`.
+    #[must_use]
+    pub fn consensus_task_panics(&self) -> u64 {
+        self.inner.critical_task_panics.load(Ordering::SeqCst)
     }
 
     /// The first spawned-task panic's message this env counted, if any
@@ -1825,7 +1838,20 @@ fn spawn_accept(
                         let stream = match tls {
                             None => MaybeTlsStream::Plain(stream),
                             Some(tls) => match tls.acceptor.accept(stream).await {
-                                Ok(tls_stream) => MaybeTlsStream::Tls(Box::new(tls_stream.into())),
+                                Ok(tls_stream) => {
+                                    // Issue #1253: a certificate admitted only through
+                                    // the peer-region CA bundle never speaks Raft.
+                                    if tls.classify_peer(tls_stream.get_ref().1.peer_certificates())
+                                        == crate::tls::PeerTrust::PeerRegionOnly
+                                    {
+                                        tracing::warn!(
+                                            %peer_addr,
+                                            "peer-region certificate on the internal Raft wire (dropping connection)"
+                                        );
+                                        return;
+                                    }
+                                    MaybeTlsStream::Tls(Box::new(tls_stream.into()))
+                                }
                                 Err(err) => {
                                     tracing::warn!(
                                         ?err,
@@ -2660,6 +2686,20 @@ impl Spawner for ProdEnv {
     /// task-abort as a panic, and doesn't (see
     /// `spawn_aborted_task_never_counts_as_a_panic`).
     fn spawn(&self, fut: crate::BoxFuture<'static, ()>) {
+        self.spawn_counted(fut, false);
+    }
+
+    /// Issue #1220: as [`spawn`](Self::spawn), and a panic in `fut` also
+    /// bumps `consensus_task_panics` / `Metric::ConsensusTaskPanics`.
+    fn spawn_critical(&self, fut: crate::BoxFuture<'static, ()>) {
+        self.spawn_counted(fut, true);
+    }
+}
+
+impl ProdEnv {
+    /// The body of [`Spawner::spawn`]/[`Spawner::spawn_critical`]; `critical`
+    /// marks a consensus-loop task (issue #1220).
+    fn spawn_counted(&self, fut: crate::BoxFuture<'static, ()>, critical: bool) {
         let inner = Arc::clone(&self.inner);
         // Created *outside* the async block and moved in, so it is owned by
         // the future's initial state: a task aborted before its first poll
@@ -2690,8 +2730,13 @@ impl Spawner for ProdEnv {
                         *first = Some(msg.clone());
                     }
                 }
+                if critical {
+                    inner.critical_task_panics.fetch_add(1, Ordering::SeqCst);
+                    inner.metrics.incr(Metric::ConsensusTaskPanics);
+                }
                 inner.task_panics.fetch_add(1, Ordering::SeqCst);
-                tracing::error!(panic = %msg, "spawned task panicked (issue #939)");
+                inner.metrics.incr(Metric::SpawnedTaskPanics);
+                tracing::error!(panic = %msg, critical, "spawned task panicked (issue #939)");
                 std::panic::resume_unwind(payload);
             }
         };
@@ -4426,6 +4471,7 @@ mod tests {
                     cert_path,
                     key_path,
                     ca_path: Some(ca_path.clone()),
+                    peer_ca_path: None,
                 }
             })
             .collect();
@@ -5048,6 +5094,43 @@ mod tests {
             env.first_spawned_task_panic().as_deref(),
             Some("issue-939 injected panic")
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #1220: only a `spawn_critical` (consensus-loop) task's panic
+    /// bumps `consensus_task_panics` / `Metric::ConsensusTaskPanics`; both
+    /// kinds bump `spawned_task_panics` / `Metric::SpawnedTaskPanics`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn critical_task_panic_is_counted_separately_and_exported() {
+        use crate::EnvExt;
+
+        let dir = unique_tmp_dir();
+        let (env, _addr) = ProdEnv::bind(nid(0), "127.0.0.1:0".parse().unwrap(), &dir)
+            .await
+            .expect("bind");
+        let wait_for = |want: u64| {
+            let env = env.clone();
+            async move {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while env.spawned_task_panics() < want {
+                    assert!(std::time::Instant::now() < deadline, "panic not counted");
+                    tokio::task::yield_now().await;
+                }
+            }
+        };
+
+        env.spawn_task(async { panic!("issue-1220 ordinary") });
+        wait_for(1).await;
+        assert_eq!(env.consensus_task_panics(), 0);
+        assert_eq!(env.metrics().get(Metric::SpawnedTaskPanics), 1);
+        assert_eq!(env.metrics().get(Metric::ConsensusTaskPanics), 0);
+
+        env.spawn_critical_task(async { panic!("issue-1220 critical") });
+        wait_for(2).await;
+        assert_eq!(env.consensus_task_panics(), 1);
+        assert_eq!(env.metrics().get(Metric::SpawnedTaskPanics), 2);
+        assert_eq!(env.metrics().get(Metric::ConsensusTaskPanics), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

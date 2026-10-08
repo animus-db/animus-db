@@ -164,6 +164,8 @@ async fn bring_up_combined(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig) {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                labels: Default::default(),
+                overload: None,
             })
             .collect();
         let config = ClusterConfig {
@@ -227,6 +229,8 @@ async fn join_control_nonvoter(
             advertise_host: None,
             tls: None,
             encryption_key_path: None,
+            labels: Default::default(),
+            overload: None,
         };
         let bound = match animusd::Node::bind_control(
             nid(new_control_id),

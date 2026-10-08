@@ -94,6 +94,10 @@ animusd --config cluster.json --node 0      # on each node, with a distinct --no
 animus status 10.0.0.1:<node-0 client port>
 ```
 
+## Operating
+
+See the [operations runbook](docs/runbook/README.md) for day-two procedures.
+
 ## Building
 
 ```sh

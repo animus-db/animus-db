@@ -584,3 +584,14 @@ handshake proving a `member/add`-shaped hostname:port dial succeeds
 end to end through the production `TlsMaterial`/`server_name_for` path
 when the peer's certificate SAN covers it — the actual payoff this fix
 exists for, not just a wire-deserialization detail.
+
+## As-built (2026-10-04, ADR 0073 Phase 2 / P2-C) — the same local-leader pattern, and an admission check
+
+`POST /admin/cluster-version/finalize` reuses this ADR's membership-action
+pattern (local control leader only, not relayed, leadership checked first so
+a follower's lagging replica cannot give a false refusal). It changes no
+membership. Separately, once the version era is on,
+`admin_add_control_member` now refuses a voter whose version range is unknown
+(a Phase 1 binary never advertises one) or excludes the cluster version, by
+name, before registering or proposing anything; pre-era behavior is
+unchanged. See ADR 0073's P2-C implementation notes.

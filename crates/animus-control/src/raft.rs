@@ -1040,6 +1040,12 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // health`). Consensus continues to consult `leader_id`/`election_
     // deadline` exclusively, unchanged.
     last_leader_contact: Option<(NodeId, Nanos)>,
+    // Issue #1228: sticky companion of `last_leader_contact` -- `true` once this
+    // process has ever had a genuine leader contact (an `AppendEntries`/
+    // `InstallSnapshot` from a leader, or its own election win). Unlike
+    // `last_leader_contact` it is never cleared by a higher-term step-down. Read by
+    // the eventual-read gate for a storage-full replica; volatile by design.
+    had_leader_contact: bool,
 
     // Pre-candidate state: nodes that have granted the current pre-vote round.
     // Rebuilt each `start_pre_vote`; only read while `role == PreCandidate`.
@@ -1337,14 +1343,13 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     incoming_snapshot: Option<IncomingSnapshot>,
 
     // Timing (virtual). Election timeout is randomized in `[base, 2*base)`.
-    // Fixed at 150ms for every constructor — issue #313 removed the
-    // `set_election_timeout` setter this comment used to point to: it had
-    // zero call sites (no assembly layer was ever built to widen this for a
-    // node doing real disk I/O, the use case its own doc described), so it
-    // was dead, aspirational API rather than a documented-but-unwired
-    // knob worth keeping. See `election_timeout()` for the read-only
-    // accessor, still used by `transfer_leadership`'s deadline and by
-    // driver-side observability.
+    // Every constructor starts at the LAN pair (150ms / 50ms). Issue #313
+    // removed the dead `set_election_timeout` setter (zero call sites);
+    // ADR 0075 section 3.4 (roadmap G-01 stage G-c) adds back ONE narrow,
+    // used replacement, `set_timing`, whose callers pick the pair from
+    // `crate::timing::TimingProfile` (a group spanning regions gets the WAN
+    // pair). See `election_timeout()` for the read-only accessor, used by
+    // `transfer_leadership`'s deadline and by driver-side observability.
     election_base: Duration,
     heartbeat_interval: Duration,
     election_deadline: Nanos,
@@ -1423,6 +1428,15 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // doc for why a latch produced a real livelock). Default `false`; only
     // ever set via that method.
     state_machine_behind: bool,
+    // This node is **out of disk** (R-01 (d), ADR 0074 §2 / issue #1219): its
+    // driver's WAL is suspect after an ENOSPC, or its apply task is paused on
+    // an engine ENOSPC. Such a node cannot make anything durable, so it must
+    // not campaign (a won election would only churn leadership onto a node
+    // that refuses every write) and ignores `TimeoutNow`. Fed LIVE by the
+    // driver every loop iteration via
+    // [`set_storage_full`](Self::set_storage_full); default `false`, and
+    // always `false` on the in-core control plane.
+    storage_full: bool,
     // The `last_index` of the most recently fully-received `InstallSnapshot`
     // THIS node installed, this process lifetime (never persisted — `None`
     // on every fresh/recovered core, exactly like `incoming_snapshot`
@@ -1603,6 +1617,16 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     /// their group. Purely diagnostic: never read by any protocol decision.
     /// `None` for the control group itself.
     group_label: Option<String>,
+    /// Issue #1229: the state machine's base state (index 0) was seeded
+    /// **outside the log** (an in-place split child's engine is cloned from
+    /// its parent's, ADR 0058), so while `snapshot_index == 0` the log does
+    /// NOT reproduce the state machine and replaying it from entry 1 would
+    /// give a brand-new replica only the post-fork writes. While set, a
+    /// learner is never sent `AppendEntries` until a snapshot base exists —
+    /// it gets the engine image instead. Purely local, never persisted
+    /// (re-derived from the engine at driver start); `false` for every
+    /// ordinary group.
+    log_omits_base: bool,
 }
 
 impl<C, S> RaftCore<C, S>
@@ -1638,6 +1662,7 @@ where
             durable_index: 0,
             leader_id: None,
             last_leader_contact: None,
+            had_leader_contact: false,
             pre_votes: BTreeSet::new(),
             votes: BTreeSet::new(),
             next_index: BTreeMap::new(),
@@ -1676,6 +1701,7 @@ where
             pending_install: None,
             snapshot_needed: false,
             state_machine_behind: false,
+            storage_full: false,
             last_installed_index: None,
             pending: Vec::new(),
             persisted_hard: (0, None),
@@ -1691,9 +1717,17 @@ where
             cluster_check_saw_established_with_me: false,
             cluster_check_refused: false,
             group_label: None,
+            log_omits_base: false,
         };
         core.reset_election_timer(now, entropy);
         core
+    }
+
+    /// Issue #1229: declare that this group's base state was seeded outside
+    /// its log (see the `log_omits_base` field). Set by the data-plane
+    /// driver for a split child; idempotent.
+    pub fn set_log_omits_base(&mut self, omits: bool) {
+        self.log_omits_base = omits;
     }
 
     /// Recover a node from its durable state, then resume as a follower.
@@ -2872,6 +2906,21 @@ where
         {
             return false;
         }
+        // Issue #1228: never hand leadership to a voter that reported it cannot
+        // vote (storage-full, or an unresolved boot-time cluster check) -- it
+        // would decline `TimeoutNow` at best and, if its report is stale, win a
+        // term it cannot persist at worst. Applies to every caller (the
+        // preferred-leader step, rebalance, the storage-full step-down), so no
+        // placement preference can steer leadership onto a full node.
+        if self.peer_check_pending.get(&target) == Some(&true) {
+            return false;
+        }
+        // A full leader with no healthy quorum of successors must not depose
+        // itself for a preference either: nobody could lead (see
+        // `storage_full_step_down`).
+        if self.storage_full && self.healthy_followers(now).len() < self.majority() {
+            return false;
+        }
         if self.transfer_target != Some(target.clone()) {
             self.transfer_target = Some(target);
             self.transfer_deadline =
@@ -2887,6 +2936,67 @@ where
         self.quiesced = false;
         self.last_activity = now;
         true
+    }
+
+    /// Install a new `(election_base, heartbeat_interval)` pair (ADR 0075
+    /// section 3.4: the per-group timing profile, see
+    /// [`crate::timing::TimingProfile::durations`]). Returns whether anything
+    /// changed.
+    ///
+    /// **Idempotent**: re-installing the current pair is a no-op that touches
+    /// no deadline, so a reconciler may call it on every tick without ever
+    /// postponing an election. A zero duration is refused (returns `false`).
+    ///
+    /// On a real change the deadlines are re-armed from `now` so the new pair
+    /// takes effect immediately rather than after the old, possibly much
+    /// longer or shorter, wait: a non-leader draws a fresh randomized election
+    /// deadline from the new base (`entropy` is the caller's `env.next_u64()`);
+    /// a leader pulls its next heartbeat in to at most `now + heartbeat` (never
+    /// pushes it out, so a WAN widening cannot starve followers still timing
+    /// out on the old base) and leaves an armed `transfer_deadline` alone.
+    /// A quiesced group's deadlines are not consulted at all. Everything that
+    /// derives from the pair (`transfer_leadership`'s deadline,
+    /// `next_cluster_check_resend`, the departing-peer backoff gap,
+    /// [`election_timeout`](Self::election_timeout) and its
+    /// `health` grace consumers) reads the fields, so it follows automatically.
+    ///
+    /// The driver sleeps until [`next_deadline`](Self::next_deadline) and
+    /// recomputes it every iteration, so a caller that SHORTENS the timing
+    /// should also wake the driver (the data plane's `RaftKvNode::wake`);
+    /// lengthening needs nothing (an early wake just finds nothing due).
+    pub fn set_timing(
+        &mut self,
+        election_base: Duration,
+        heartbeat_interval: Duration,
+        now: Nanos,
+        entropy: u64,
+    ) -> bool {
+        if election_base.is_zero() || heartbeat_interval.is_zero() {
+            return false;
+        }
+        if self.election_base == election_base && self.heartbeat_interval == heartbeat_interval {
+            return false;
+        }
+        self.election_base = election_base;
+        self.heartbeat_interval = heartbeat_interval;
+        if self.role == Role::Leader {
+            let next = Nanos(now.0.saturating_add(self.heartbeat_nanos()));
+            if next.0 < self.heartbeat_deadline.0 {
+                self.heartbeat_deadline = next;
+            }
+        } else {
+            self.reset_election_timer(now, entropy);
+        }
+        true
+    }
+
+    /// The current `(election_base, heartbeat_interval)` pair — what
+    /// [`set_timing`](Self::set_timing) last installed (the LAN defaults
+    /// otherwise). Lets a caller skip an entropy draw when nothing would
+    /// change.
+    #[must_use]
+    pub fn timing(&self) -> (Duration, Duration) {
+        (self.election_base, self.heartbeat_interval)
     }
 
     /// The current election-timeout base (the low end of the randomized
@@ -3016,6 +3126,10 @@ where
     /// surviving one.
     fn log_truncate(&mut self, keep: usize) {
         self.log.truncate(keep);
+        // Issue #1228: entries past the cut are gone, and what replaces them is
+        // not durable yet -- a frozen storage-full ack (`handle_append_entries`)
+        // reads `durable_index` as "my log is on disk through here".
+        self.durable_index = self.durable_index.min(self.last_log_index());
         self.pending.push(WalRecord::Truncate { keep });
         self.recompute_config();
     }
@@ -3105,6 +3219,7 @@ where
                     // continuously and healthily the entire time. See
                     // `last_leader_contact`'s own doc.
                     self.last_leader_contact = Some((self.id.clone(), now));
+                    self.had_leader_contact = true;
                     // Heartbeat cadence is one of the bounded retries a
                     // genuinely stuck snapshot chunk gets — but "bounded by
                     // heartbeat cadence" alone is not a bound on TOTAL
@@ -3392,6 +3507,9 @@ where
         if term != self.current_term || self.role == Role::Leader || !self.is_voter() {
             return Vec::new();
         }
+        // `start_election`'s own `storage_full` gate declines (and re-arms the
+        // election timer), so a storage-full transfer target simply lets the
+        // leader's transfer deadline abort — no special case needed here.
         self.start_election(now, entropy)
     }
 
@@ -3766,9 +3884,20 @@ where
     /// pending, or it resolved to REFUSED (a wiped voter). This is what a
     /// node reports to its leader as `AppendEntriesResp::check_pending`, so a
     /// leader never promotes a learner that could not vote once promoted.
+    ///
+    /// **Issue #1228:** also `true` while this node is
+    /// [`storage_full`](Self::storage_full): it cannot persist a term bump or a
+    /// vote, so it refuses every vote it would have to make durable and never
+    /// campaigns -- the same "cannot act as a voter" state. Folding it into
+    /// this one flag is how a full follower's *frozen ack* (see
+    /// [`handle_append_entries`](Self::handle_append_entries)) tells its leader
+    /// it is out of disk without a new wire field: the leader never hands
+    /// leadership to it ([`storage_full_step_down`](Self::storage_full_step_down),
+    /// [`transfer_leadership`](Self::transfer_leadership)), never counts it
+    /// toward a healthy quorum, and never promotes it as a learner.
     #[must_use]
     fn cannot_vote_yet(&self) -> bool {
-        self.cluster_check_pending.is_some() || self.cluster_check_refused
+        self.cluster_check_pending.is_some() || self.cluster_check_refused || self.storage_full
     }
 
     /// Label this core's group for diagnostics (see the `group_label`
@@ -4143,6 +4272,7 @@ where
         // Issue #595: a genuine leader contact — see `last_leader_contact`'s
         // own doc for why this is recorded separately from `leader_id`.
         self.last_leader_contact = Some((leader.clone(), now));
+        self.had_leader_contact = true;
         self.reset_election_timer(now, entropy);
 
         // The leader's prev is behind our snapshot: those entries are already in
@@ -4205,6 +4335,22 @@ where
             self.apply();
         }
 
+        // Issue #1228 (R-01 (d), ADR 0074 section 2, "all replicas full"): a
+        // storage-full follower still answers, but its ack is **frozen at its
+        // own durable index** -- it vouches only for entries it has already
+        // fsynced, never for the ones it just took into memory and cannot
+        // persist. So the leader keeps hearing from it (leadership, ReadIndex
+        // and liveness all survive an every-replica-full outage) while the
+        // commit index can never advance on an entry this node did not
+        // persist: `maybe_advance_commit` counts `match_index`, and this
+        // match never exceeds `durable_index`. `check_pending` below reports
+        // the full state so the leader does not hand it leadership.
+        let match_index = if self.storage_full {
+            match_index.min(self.durable_index)
+        } else {
+            match_index
+        };
+
         vec![(
             leader,
             RaftMsg::AppendEntriesResp {
@@ -4243,8 +4389,12 @@ where
         // Issue #1061: the same reachability proof resets a departing peer's
         // give-up clock and its send-gate schedule (`removal_sched`).
         self.note_departing_reply(&from, now);
+        // Issue #1228: whether this ack advanced what the leader knows `from`
+        // has -- a storage-full follower's frozen ack never does.
+        let mut progressed = false;
         if success {
             let m = self.match_index.entry(from.clone()).or_insert(0);
+            progressed = match_index > *m;
             *m = (*m).max(match_index);
             if self
                 .departing
@@ -4327,7 +4477,14 @@ where
             *ni = (*ni).max(match_index + 1);
             self.maybe_advance_commit();
             self.apply();
-            if self.next_index.get(&from).copied().unwrap_or(1) <= self.last_log_index() {
+            // A frozen ack (the follower is out of disk and re-acks only what it
+            // already had durable) must not trigger an immediate resend: the
+            // resend would be acked just as flatly, and the pair would spin at
+            // zero latency for the whole outage. The next heartbeat re-offers
+            // the entries instead.
+            if self.next_index.get(&from).copied().unwrap_or(1) <= self.last_log_index()
+                && (progressed || !check_pending)
+            {
                 return self
                     .replicate_to(from, SnapshotResend::Always)
                     .into_iter()
@@ -4386,6 +4543,7 @@ where
         // Issue #595: a genuine leader contact — see `last_leader_contact`'s
         // own doc for why this is recorded separately from `leader_id`.
         self.last_leader_contact = Some((leader.clone(), now));
+        self.had_leader_contact = true;
         self.reset_election_timer(now, entropy);
 
         // Already at least this far along: drop any partial transfer and just
@@ -5013,7 +5171,7 @@ where
         // discarded, which (unlike a learner) it CAN do here since its log
         // is otherwise fully caught up. Mirrors that gate exactly; see
         // `state_machine_behind`'s own doc.
-        if !self.is_voter() || self.state_machine_behind {
+        if !self.is_voter() || self.state_machine_behind || self.storage_full {
             // Issue #1019: a non-voter (learner, or a node not yet added at
             // all) can never itself campaign — but its belief that a
             // particular node is the live leader, and its own lease on a
@@ -5133,7 +5291,7 @@ where
             self.reset_election_timer(now, entropy);
             return Vec::new();
         }
-        if !self.is_voter() || self.state_machine_behind {
+        if !self.is_voter() || self.state_machine_behind || self.storage_full {
             self.reset_election_timer(now, entropy);
             return Vec::new();
         }
@@ -5180,6 +5338,7 @@ where
         // Issue #595: this node itself just won an election — record itself
         // as the genuine contact (see `last_leader_contact`'s own doc).
         self.last_leader_contact = Some((self.id.clone(), now));
+        self.had_leader_contact = true;
         // A fresh leadership stint always starts un-quiesced (ADR 0044 phase-1
         // PR3) with its idle clock starting now — even if this same node was
         // quiesced as a follower a moment ago (its own `quiesced` from
@@ -5967,6 +6126,19 @@ where
             return None;
         }
         let next = self.next_index.get(&peer).copied().unwrap_or(1).max(1);
+        // Issue #1229: a learner of a group whose base state lives outside
+        // its log must be shipped the engine image, never the log from
+        // entry 1 — the log alone lacks the pre-fork rows. Nothing flows to
+        // it until a snapshot base exists (`snapshot_upto` at the image
+        // build below moves `snapshot_index` off 0, after which the
+        // ordinary `next <= snapshot_index` branch ships it). Raising
+        // `snapshot_needed` needs something applied to snapshot at.
+        if self.log_omits_base && self.snapshot_index == 0 && self.learners.contains(&peer) {
+            if self.last_applied > 0 {
+                self.snapshot_needed = true;
+            }
+            return None;
+        }
         // The entry before `next` is in our snapshot (or earlier) — we can't form
         // a valid `prev_log_term`, so ship the snapshot instead, as the next
         // offset-addressed chunk for this peer.
@@ -6210,6 +6382,113 @@ where
     /// control plane never raises it.
     pub fn take_snapshot_needed(&mut self) -> bool {
         std::mem::replace(&mut self.snapshot_needed, false)
+    }
+
+    /// Whether this process has ever had a genuine leader contact -- an
+    /// `AppendEntries`/`InstallSnapshot` from a leader, or its own election win
+    /// (issue #1228). Volatile: a freshly started process answers `false` until
+    /// it hears a leader. The eventual-read gate uses it to tell "was in this
+    /// group's history, leader currently unknown" from "never initialised".
+    #[must_use]
+    pub fn has_had_leader_contact(&self) -> bool {
+        self.had_leader_contact
+    }
+
+    /// Whether this node's driver reported itself out of disk (issue #1219) —
+    /// see [`set_storage_full`](Self::set_storage_full).
+    #[must_use]
+    pub fn storage_full(&self) -> bool {
+        self.storage_full
+    }
+
+    /// Feed the **storage-full** state (R-01 (d), ADR 0074 §2, issue #1219).
+    /// Only a `DRIVER_APPLIED` plane's driver calls this (`animus-cp-data`'s
+    /// consensus loop, **live, every iteration**, in the same lock acquisition
+    /// as `set_state_machine_behind`); the control plane keeps it `false`.
+    ///
+    /// While set, the node never starts a pre-vote or an election and declines
+    /// a `TimeoutNow` (both fall into the same gate as `state_machine_behind`):
+    /// it cannot persist the term bump and self-vote an election needs, and a
+    /// leader that cannot make anything durable would refuse every write
+    /// anyway. This is what keeps leadership from ping-ponging back to a node
+    /// that just handed it off. It is **not** a liveness hole: a node that is
+    /// *already* leader keeps leading until a healthy target really wins
+    /// ([`storage_full_step_down`](Self::storage_full_step_down) only arms a
+    /// transfer, and an aborted transfer leaves it leader), and a cluster that
+    /// is full everywhere recovers as soon as any node's space returns and its
+    /// flag clears.
+    pub fn set_storage_full(&mut self, full: bool) {
+        self.storage_full = full;
+    }
+
+    /// Leader-side (issue #1228): the other voters this leader currently has
+    /// positive, recent evidence are **able to vote and persist** -- their
+    /// latest `AppendEntriesResp` reported `check_pending == false` (which
+    /// includes "not storage-full", see `cannot_vote_yet`) and arrived within
+    /// one election timeout of `now`. A voter that has never reported, reported
+    /// full / unable, or has gone quiet is absent. Empty on a non-leader.
+    #[must_use]
+    pub fn healthy_followers(&self, now: Nanos) -> Vec<NodeId> {
+        if self.role != Role::Leader {
+            return Vec::new();
+        }
+        let window = self.election_base.as_nanos() as u64;
+        self.config
+            .iter()
+            .filter(|n| **n != self.id)
+            .filter(|n| self.peer_check_pending.get(*n) == Some(&false))
+            .filter(|n| {
+                self.last_contact
+                    .get(*n)
+                    .is_some_and(|at| now.0.saturating_sub(at.0) <= window)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Leader-side: hand leadership to the most up-to-date healthy-looking
+    /// voter because this node is storage-full (issue #1219). Arms
+    /// [`transfer_leadership`](Self::transfer_leadership) toward the voter with
+    /// the highest `peer_match` (at least `commit_index`, the arm gate), the
+    /// voter in `avoid` (the previous, un-answered target) ordered last so a
+    /// target that is itself full — it declines `TimeoutNow` — is rotated away
+    /// from on the next attempt. Returns the armed target; `None` if this node
+    /// is not the leader, a transfer is already armed, or no voter qualifies.
+    /// Idempotence is the caller's: it re-invokes only after the previous
+    /// transfer aborted.
+    ///
+    /// **Issue #1228 -- only when a healthy successor can actually lead.** The
+    /// handoff happens only if a *quorum* of the other voters is known healthy
+    /// ([`healthy_followers`](Self::healthy_followers): they reported, on a
+    /// recent ack, that they can vote and persist). With fewer, no replica can
+    /// win an election or commit a write under any leader, so stepping down
+    /// would only depose the one node that can still serve reads and refuse
+    /// writes with a named `StorageFull` -- the group would sit leaderless
+    /// until space returned (chaos finding F-1). In that case this returns
+    /// `None` and the leader stays leader, write-refusing. A `None` here is
+    /// retried by the caller on its cooldown, so the handoff still happens as
+    /// soon as enough followers report healthy again.
+    pub fn storage_full_step_down(&mut self, now: Nanos, avoid: Option<&NodeId>) -> Option<NodeId> {
+        if self.role != Role::Leader || self.transfer_target.is_some() {
+            return None;
+        }
+        let healthy = self.healthy_followers(now);
+        if healthy.len() < self.majority() {
+            return None;
+        }
+        let mut cands: Vec<NodeId> = healthy
+            .into_iter()
+            .filter(|n| self.peer_match(n) >= self.commit_index)
+            .collect();
+        cands.sort_by(|a, b| {
+            (Some(a) == avoid)
+                .cmp(&(Some(b) == avoid))
+                .then(self.peer_match(b).cmp(&self.peer_match(a)))
+                .then(a.cmp(b))
+        });
+        cands
+            .into_iter()
+            .find(|t| self.transfer_leadership(t.clone(), now))
     }
 
     /// Whether this node's own state machine is behind its own log's

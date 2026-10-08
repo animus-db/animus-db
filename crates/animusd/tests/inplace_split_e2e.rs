@@ -78,6 +78,8 @@ async fn bring_up_inplace(
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                labels: Default::default(),
+                overload: None,
             })
             .collect();
         let config = ClusterConfig {

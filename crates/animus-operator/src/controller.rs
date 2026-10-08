@@ -14,6 +14,7 @@
 //! no DNS record, nothing an orphaned finalizer could leak) and it keeps a
 //! stuck-finalizer failure mode out of a v1 operator entirely.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,18 +36,28 @@ use crate::crd::{
     CONDITION_CONTROL_NODES_SHRINK_REJECTED, CONDITION_DRAIN_FAILED,
     CONDITION_ENCRYPTION_KEY_SECRET_INVALID, CONDITION_EPHEMERAL_VOTER_STORAGE_HAZARD,
     CONDITION_EPHEMERAL_VOTER_STORAGE_REJECTED, CONDITION_NODES_SPEC_INVALID,
-    CONDITION_S3_SPEC_INVALID, CONDITION_SCALE_BELOW_CONTROL_NODES_REFUSED,
-    CONDITION_SCHEMA_VERSION_INVALID, CONDITION_STORE_SPEC_INVALID, CONDITION_TLS_SPEC_INVALID,
+    CONDITION_PEER_REACHABLE, CONDITION_PEERS_SPEC_INVALID, CONDITION_S3_SPEC_INVALID,
+    CONDITION_SCALE_BELOW_CONTROL_NODES_REFUSED, CONDITION_SCHEMA_VERSION_INVALID,
+    CONDITION_STORE_SPEC_INVALID, CONDITION_TLS_SPEC_INVALID, CONDITION_UPGRADE_CHANGES_HELD,
     ClusterCondition, ClusterPhase, ConditionStatus,
 };
 use crate::desired;
+use crate::roll;
 use crate::validate;
 
 /// The field manager name every server-side-apply call uses
 /// ([`crate::cluster_api::RealClusterApi`]'s own `PatchParams::apply`).
 pub const FIELD_MANAGER: &str = "animus-operator";
 /// Requeue interval after a clean reconcile.
+/// Requeue while some pod's node topology is not resolved yet (unscheduled
+/// pod) — short, since `animusd` is waiting on it (G-01 stage G-a).
+const REQUEUE_TOPOLOGY_PENDING: Duration = Duration::from_secs(3);
+
 const REQUEUE_OK: Duration = Duration::from_secs(30);
+/// Requeue interval while a rolling upgrade is active (ADR 0073 Phase 3): the
+/// gate is re-evaluated this often, and the `StatefulSet`/pod watches wake the
+/// reconciler sooner on every revision or readiness change.
+const REQUEUE_ROLL: Duration = Duration::from_secs(5);
 /// Requeue interval after a reconcile error (kube's `Controller` also
 /// backs this off internally, but a fixed floor keeps a persistently
 /// failing cluster from hot-looping the operator process).
@@ -73,6 +84,9 @@ pub enum ReconcileError {
 pub struct Context<C: ClusterApi, A: AdminOps> {
     pub cluster_api: C,
     pub admin: A,
+    /// The operator's own wall clock for the rolling upgrade's stall/soak
+    /// clocks (`crate::roll::WallClock`; ADR 0073 Phase 3).
+    pub clock: crate::roll::WallClock,
 }
 
 /// Apply every desired child for `cluster`, in a fixed order (`ConfigMap`
@@ -91,6 +105,7 @@ async fn apply_children<C: ClusterApi>(
     cluster: &AnimusCluster,
     ns: &str,
     pdb_control_nodes: i32,
+    sts: &StatefulSet,
 ) -> Result<StatefulSet, ReconcileError> {
     let spec = &cluster.spec;
 
@@ -143,8 +158,10 @@ async fn apply_children<C: ClusterApi>(
     let pdb = desired::poddisruptionbudget::build(cluster, &pdb_spec);
     cluster_api.apply_poddisruptionbudget(ns, &pdb).await?;
 
-    let sts = desired::statefulset::build(cluster, spec);
-    let applied = cluster_api.apply_statefulset(ns, &sts).await?;
+    // `sts` is built by the caller (`finish_reconcile`), already carrying the
+    // roll driver's `partition` (ADR 0073 Phase 3, D7/D8): a changed pod
+    // template is only ever applied together with `partition = replicas`.
+    let applied = cluster_api.apply_statefulset(ns, sts).await?;
 
     Ok(applied)
 }
@@ -739,6 +756,58 @@ async fn resolve_tls_ca<C: ClusterApi>(
     }
 }
 
+/// Set (G-e) the positive-polarity `PeerReachable` condition from every pod's
+/// `/admin/global-tables` (`crate::peers::evaluate`), or remove it when the
+/// spec has no peers. Best effort: an admin failure only makes a pod's view
+/// `None`, never fails the reconcile.
+async fn update_peer_reachable<C: ClusterApi, A: AdminOps>(
+    ctx: &Context<C, A>,
+    cluster: &AnimusCluster,
+    ns: &str,
+    status: &mut AnimusClusterStatus,
+) {
+    status
+        .conditions
+        .retain(|c| c.type_ != CONDITION_PEER_REACHABLE);
+    if cluster.spec.peers.is_empty() {
+        return;
+    }
+    let name = cluster.name_any();
+    let tls = cluster.spec.tls.is_some();
+    let tls_ca = resolve_tls_ca(&ctx.cluster_api, cluster, ns, &name)
+        .await
+        .ok()
+        .flatten();
+    let admin_port = cluster.spec.base_port_or_default() + desired::cluster_config::PORT_ADMIN;
+    let mut views = Vec::new();
+    for i in 0..cluster.spec.nodes {
+        let url = format!(
+            "{}/admin/global-tables",
+            admin_base_url(&name, ns, i, admin_port, tls)
+        );
+        views.push(ctx.admin.get_json(&url, tls_ca.as_deref()).await.ok());
+    }
+    let regions: Vec<String> = cluster
+        .spec
+        .peers
+        .iter()
+        .map(|p| p.region.clone())
+        .collect();
+    let r = crate::peers::evaluate(&regions, &views, crate::peers::PEER_ACK_BOUND_MS);
+    let reason = match r.status {
+        ConditionStatus::True => "PeersReachable",
+        ConditionStatus::False => "PeerUnreachable",
+        ConditionStatus::Unknown => "PeerHealthUnknown",
+    };
+    status.conditions.push(ClusterCondition {
+        type_: CONDITION_PEER_REACHABLE.to_string(),
+        status: r.status,
+        reason: Some(reason.to_string()),
+        message: Some(r.message),
+        last_transition_time: None,
+    });
+}
+
 /// Live-checks `spec.encryptionKeySecretName` (ADR 0069, S-03 PR 3) against
 /// the API server: the named `Secret` must exist in `ns` and carry
 /// [`desired::cluster_config::ENCRYPTION_KEY_SECRET_DATA_KEY`] as one of its
@@ -907,6 +976,40 @@ async fn reconcile<C: ClusterApi, A: AdminOps>(
     let mut status = cluster.status.clone().unwrap_or_default();
     status.observed_generation = cluster.metadata.generation;
 
+    // ADR 0073 Phase 3 (D8 case 2, D9): while a roll is in flight a
+    // `spec.nodes`/`spec.controlNodes` edit waits for `RollComplete`, and an
+    // image revert after a pod reported the new range is refused. Pin those
+    // fields to what is running and reconcile the rest; the webhook refuses
+    // the same revert at write time (`validate::validate_image_revert`).
+    let cluster = {
+        let live = ctx.cluster_api.get_statefulset(&ns, &name).await?;
+        let probe = desired::statefulset::build(&cluster, &cluster.spec);
+        let live_view = live.as_ref().map(|l| roll::StsView::of(l, &probe));
+        let prior = if live_view
+            .as_ref()
+            .is_some_and(roll::StsView::roll_in_flight)
+        {
+            previous_applied_control_nodes(&ctx.cluster_api, &ns, &cluster).await?
+        } else {
+            None
+        };
+        let (pinned, notes) = roll::hold_edits(&cluster, live_view.as_ref(), prior);
+        if notes.is_empty() {
+            status
+                .conditions
+                .retain(|c| c.type_ != CONDITION_UPGRADE_CHANGES_HELD);
+            cluster
+        } else {
+            warn!(cluster = %name, held = ?notes, "holding spec edits while a roll is in flight");
+            set_condition(
+                &mut status,
+                CONDITION_UPGRADE_CHANGES_HELD,
+                notes.join("; "),
+            );
+            Arc::new(pinned)
+        }
+    };
+
     // Validate `spec.schemaVersion` (ADR 0073 Phase 0 E): a spec whose content
     // schema this operator cannot interpret is refused before any child is
     // applied. Returns `await_change` (not `Err`, which would requeue with
@@ -1048,6 +1151,24 @@ async fn reconcile<C: ClusterApi, A: AdminOps>(
     status
         .conditions
         .retain(|c| c.type_ != CONDITION_TLS_SPEC_INVALID);
+
+    // Validate `spec.region`/`spec.peers` (ADR 0075 section 5.4, G-e): the
+    // webhook rejects this at write time when installed; this is the
+    // fallback. **Refuse, not strip** (see `CONDITION_PEERS_SPEC_INVALID`):
+    // nothing is applied until the spec is fixed, so the last applied
+    // federation keeps running rather than silently losing its peers or its
+    // TLS requirement.
+    if let Err(e) = cluster.spec.validate_peers_spec() {
+        warn!(cluster = %name, error = %e, "refusing invalid spec.region/spec.peers");
+        set_condition(&mut status, CONDITION_PEERS_SPEC_INVALID, e);
+        ctx.cluster_api
+            .patch_cluster_status(&ns, &name, &status)
+            .await?;
+        return Ok(Action::requeue(REQUEUE_OK));
+    }
+    status
+        .conditions
+        .retain(|c| c.type_ != CONDITION_PEERS_SPEC_INVALID);
 
     // Validate `spec.encryptionKeySecretName` (ADR 0069, S-03 PR 3): unlike
     // every check above, this one is LIVE (a Secret reference's only
@@ -1339,7 +1460,36 @@ async fn finish_reconcile<C: ClusterApi, A: AdminOps>(
     pdb_control_nodes: i32,
 ) -> Result<Action, ReconcileError> {
     let name = cluster.name_any();
-    let applied_sts = apply_children(&ctx.cluster_api, cluster, ns, pdb_control_nodes).await?;
+
+    // ADR 0073 Phase 3 (D7/D8/D9): decide the `StatefulSet`'s partition from
+    // live truth *before* applying it, so a changed pod template is applied
+    // with `partition = replicas` in the same server-side apply (no ungated
+    // window), and a roll in flight is driven one gated step at a time.
+    let mut sts = desired::statefulset::build(cluster, &cluster.spec);
+    let live_sts = ctx.cluster_api.get_statefulset(ns, &name).await?;
+    let live_view = live_sts.as_ref().map(|l| roll::StsView::of(l, &sts));
+    let tls_ca = if matches!(
+        roll::stage(live_view.as_ref(), status.upgrade.as_ref()),
+        roll::Stage::Drive { .. }
+    ) {
+        resolve_tls_ca(&ctx.cluster_api, cluster, ns, &name).await?
+    } else {
+        None
+    };
+    let roll_out = roll::step(
+        ctx,
+        cluster,
+        ns,
+        &sts,
+        live_sts.as_ref(),
+        tls_ca.as_deref(),
+        &mut status,
+    )
+    .await?;
+    desired::statefulset::set_partition(&mut sts, roll_out.partition);
+
+    let applied_sts =
+        apply_children(&ctx.cluster_api, cluster, ns, pdb_control_nodes, &sts).await?;
 
     let desired_replicas = cluster.spec.nodes;
     let ready = applied_sts
@@ -1364,11 +1514,67 @@ async fn finish_reconcile<C: ClusterApi, A: AdminOps>(
         ClusterPhase::Pending
     });
 
+    update_peer_reachable(ctx, cluster, ns, &mut status).await;
+
     ctx.cluster_api
         .patch_cluster_status(ns, &name, &status)
         .await?;
 
-    Ok(Action::requeue(REQUEUE_OK))
+    // G-01 stage G-a: resolve each scheduled pod's node topology onto the
+    // pod's annotations. Best effort — a failure (e.g. an operator upgraded
+    // without the new `nodes`/`pods patch` RBAC) must never block the rest of
+    // the reconcile; `animusd` times out its own wait and starts unlabelled.
+    let ok_requeue = if roll_out.active {
+        REQUEUE_ROLL
+    } else {
+        REQUEUE_OK
+    };
+    match resolve_pod_topology(&ctx.cluster_api, &name, ns).await {
+        Ok(0) => Ok(Action::requeue(ok_requeue)),
+        Ok(_pending) => Ok(Action::requeue(REQUEUE_TOPOLOGY_PENDING)),
+        Err(e) => {
+            tracing::warn!(cluster = %name, error = %e, "resolving pod node topology failed");
+            Ok(Action::requeue(REQUEUE_ERR))
+        }
+    }
+}
+
+/// For every pod of cluster `name`: if scheduled, read its node's labels and
+/// patch the topology annotations ([`desired::topology::pod_annotation_patch`])
+/// that `animusd` reads back through the downward API. Returns how many pods
+/// are still *unresolved* (unscheduled, or their node unreadable) so the
+/// caller can requeue quickly.
+async fn resolve_pod_topology<C: ClusterApi>(
+    cluster_api: &C,
+    name: &str,
+    ns: &str,
+) -> Result<usize, ReconcileError> {
+    let pods = cluster_api
+        .list_pods(ns, &desired::selector_labels(name))
+        .await?;
+    let mut node_cache: BTreeMap<String, Option<BTreeMap<String, String>>> = BTreeMap::new();
+    let mut pending = 0usize;
+    for pod in &pods {
+        let Some(node) = desired::topology::node_name(pod) else {
+            pending += 1;
+            continue;
+        };
+        if !node_cache.contains_key(node) {
+            let labels = cluster_api.get_node_labels(node).await?;
+            node_cache.insert(node.to_string(), labels);
+        }
+        let labels = node_cache[node].as_ref();
+        if labels.is_none() {
+            pending += 1;
+            continue;
+        }
+        if let Some(patch) = desired::topology::pod_annotation_patch(pod, labels) {
+            cluster_api
+                .patch_pod_annotations(ns, &pod.name_any(), &patch)
+                .await?;
+        }
+    }
+    Ok(pending)
 }
 
 fn error_policy<C: ClusterApi, A: AdminOps>(
@@ -1401,6 +1607,7 @@ pub async fn run(client: Client, admin_access: AdminAccessMode) {
     let ctx = Arc::new(Context {
         cluster_api: RealClusterApi::new(client.clone()),
         admin: RealAdminClient::new(admin_access, client.clone()),
+        clock: crate::roll::WallClock::real(),
     });
 
     Controller::new(clusters, watcher::Config::default())
@@ -1443,6 +1650,9 @@ pub async fn run(client: Client, admin_access: AdminAccessMode) {
 }
 
 /// ADR 0061 rung E1: `reconcile`/`previous_applied_control_nodes`/
+#[cfg(test)]
+mod roll_tests;
+
 /// `drain_and_remove_node` exercised via `crate::fakes::{FakeClusterApi,
 /// FakeAdminClient}` — no live API server, no real socket. See that
 /// module's doc and `crates/animus-operator/CLAUDE.md`'s testing section
@@ -1463,7 +1673,11 @@ mod tests {
         cluster_api: FakeClusterApi,
         admin: FakeAdminClient,
     ) -> Arc<Context<FakeClusterApi, FakeAdminClient>> {
-        Arc::new(Context { cluster_api, admin })
+        Arc::new(Context {
+            cluster_api,
+            admin,
+            clock: crate::roll::WallClock::fixed(1_000),
+        })
     }
 
     /// The exact URL `admin_base_url` + a path suffix builds — used to
@@ -1488,6 +1702,59 @@ mod tests {
             desired::cluster_config::to_json(&config),
         )]));
         cm
+    }
+
+    // --- G-01 stage G-a: pod node-topology resolution ---------------------
+
+    fn topo_pod(name: &str, node: Option<&str>) -> k8s_openapi::api::core::v1::Pod {
+        let mut pod = k8s_openapi::api::core::v1::Pod::default();
+        pod.metadata.name = Some(name.to_string());
+        pod.spec = Some(k8s_openapi::api::core::v1::PodSpec {
+            node_name: node.map(str::to_string),
+            ..Default::default()
+        });
+        pod
+    }
+
+    #[tokio::test]
+    async fn reconcile_annotates_scheduled_pods_with_their_nodes_topology() {
+        let cluster = Arc::new(test_cluster("demo", "ns1", 3, None));
+        let fake = FakeClusterApi::new();
+        fake.seed_pod(topo_pod("demo-0", Some("node-a")));
+        fake.seed_pod(topo_pod("demo-1", Some("node-b")));
+        fake.seed_pod(topo_pod("demo-2", None));
+        fake.seed_node_labels(
+            "node-a",
+            &[
+                ("topology.kubernetes.io/region", "r1"),
+                ("topology.kubernetes.io/zone", "r1-a"),
+            ],
+        );
+        fake.seed_node_labels("node-b", &[]);
+        let ctx = make_ctx(fake, FakeAdminClient::new());
+
+        let action = reconcile(Arc::clone(&cluster), Arc::clone(&ctx))
+            .await
+            .expect("reconcile succeeds");
+        assert_eq!(
+            action,
+            Action::requeue(REQUEUE_TOPOLOGY_PENDING),
+            "an unscheduled pod requeues quickly"
+        );
+        let patches = ctx.cluster_api.pod_patches();
+        assert_eq!(patches.len(), 2, "{patches:?}");
+        let a = &patches.iter().find(|(n, _)| n == "demo-0").unwrap().1;
+        assert_eq!(a["animus.io/topology-zone"], "r1-a");
+        assert_eq!(a["animus.io/topology-region"], "r1");
+        assert_eq!(a["animus.io/topology-resolved"], "true");
+        let b = &patches.iter().find(|(n, _)| n == "demo-1").unwrap().1;
+        assert_eq!(b.len(), 1, "unlabelled node: marker only");
+
+        // Second reconcile: scheduled pods are left alone (idempotent).
+        let _ = reconcile(Arc::clone(&cluster), Arc::clone(&ctx))
+            .await
+            .unwrap();
+        assert_eq!(ctx.cluster_api.pod_patches().len(), 2);
     }
 
     // --- (1) a fresh cluster reconcile creates the expected children -----
@@ -3908,5 +4175,119 @@ mod tests {
             "a 2-node/2-controlNode cluster must block every voluntary eviction, \
              not inherit the prior 5-node shape's budget"
         );
+    }
+}
+
+#[cfg(test)]
+mod peers_tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::crd::{PeerSpec, TlsSpec};
+    use crate::desired::test_support::test_cluster;
+    use crate::fakes::{FakeAdminClient, FakeClusterApi};
+
+    fn ctx() -> Arc<Context<FakeClusterApi, FakeAdminClient>> {
+        Arc::new(Context {
+            cluster_api: FakeClusterApi::new(),
+            admin: FakeAdminClient::new(),
+            clock: crate::roll::WallClock::fixed(1_000),
+        })
+    }
+
+    fn federated() -> AnimusCluster {
+        let mut c = test_cluster("demo", "ns1", 3, None);
+        c.spec.region = Some("us".into());
+        c.spec.peers = vec![PeerSpec {
+            region: "eu".into(),
+            endpoints: vec!["eu.example.com:14004".into()],
+            ca_secret_ref: None,
+        }];
+        c.spec.tls = Some(TlsSpec {
+            secret_name: Some("t".into()),
+            cert_manager: None,
+        });
+        c
+    }
+
+    fn condition(
+        ctx: &Context<FakeClusterApi, FakeAdminClient>,
+        t: &str,
+    ) -> Option<ClusterCondition> {
+        ctx.cluster_api
+            .status_patches()
+            .last()
+            .and_then(|s| s.conditions.iter().find(|c| c.type_ == t).cloned())
+    }
+
+    #[tokio::test]
+    async fn peers_without_tls_are_refused_with_a_condition_and_nothing_is_applied() {
+        let mut c = federated();
+        c.spec.tls = None;
+        let ctx = ctx();
+        reconcile(Arc::new(c), Arc::clone(&ctx)).await.unwrap();
+        assert!(
+            ctx.cluster_api.applies().is_empty(),
+            "{:?}",
+            ctx.cluster_api.applies()
+        );
+        let cond = condition(&ctx, CONDITION_PEERS_SPEC_INVALID).expect("condition");
+        assert!(cond.message.unwrap().contains("spec.tls"));
+    }
+
+    #[tokio::test]
+    async fn the_insecure_opt_in_reconciles_normally() {
+        let mut c = federated();
+        c.spec.tls = None;
+        c.spec.allow_insecure_peers = Some(true);
+        let ctx = ctx();
+        reconcile(Arc::new(c), Arc::clone(&ctx)).await.unwrap();
+        assert!(!ctx.cluster_api.applies().is_empty());
+        assert!(condition(&ctx, CONDITION_PEERS_SPEC_INVALID).is_none());
+    }
+
+    #[tokio::test]
+    async fn peer_reachable_is_unknown_until_a_table_replicates_then_tracks_the_shipper() {
+        let ctx = ctx();
+        reconcile(Arc::new(federated()), Arc::clone(&ctx))
+            .await
+            .unwrap();
+        let cond = condition(&ctx, CONDITION_PEER_REACHABLE).expect("PeerReachable");
+        assert_eq!(cond.status, ConditionStatus::Unknown);
+
+        let healthy = serde_json::json!({"tables": [{"shippers": [
+            {"peer": "eu", "caught_up": true, "last_error": null}]}]});
+        ctx.admin
+            .script_get(None, "/admin/global-tables", Ok(healthy));
+        reconcile(Arc::new(federated()), Arc::clone(&ctx))
+            .await
+            .unwrap();
+        assert_eq!(
+            condition(&ctx, CONDITION_PEER_REACHABLE).unwrap().status,
+            ConditionStatus::True
+        );
+
+        let broken = serde_json::json!({"tables": [{"shippers": [
+            {"peer": "eu", "caught_up": false, "last_error": "connection refused"}]}]});
+        ctx.admin
+            .script_get(None, "/admin/global-tables", Ok(broken));
+        reconcile(Arc::new(federated()), Arc::clone(&ctx))
+            .await
+            .unwrap();
+        let cond = condition(&ctx, CONDITION_PEER_REACHABLE).unwrap();
+        assert_eq!(cond.status, ConditionStatus::False);
+        assert!(cond.message.unwrap().contains("connection refused"));
+    }
+
+    #[tokio::test]
+    async fn a_cluster_without_peers_never_carries_peer_reachable() {
+        let ctx = ctx();
+        reconcile(
+            Arc::new(test_cluster("demo", "ns1", 3, None)),
+            Arc::clone(&ctx),
+        )
+        .await
+        .unwrap();
+        assert!(condition(&ctx, CONDITION_PEER_REACHABLE).is_none());
     }
 }

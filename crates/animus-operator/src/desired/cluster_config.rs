@@ -62,6 +62,10 @@ pub struct TlsSection {
     pub key_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca_path: Option<String>,
+    /// Mirrors `animusd::config::TlsSection::peer_ca_path` (issue #1253):
+    /// the peer-region CA bundle, trusted for MREC replication frames only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_ca_path: Option<String>,
 }
 
 /// Mirrors `animusd::lib::RoleAddrs`'s JSON shape field-for-field
@@ -100,8 +104,8 @@ pub struct RoleAddrs {
 /// orphan-sweep, stream-seal) `animusd` now reads from a config file's own
 /// `cluster_settings` section on every deployment shape, not just
 /// `--cluster N`'s dev-only in-process CLI flags. This crate only ever
-/// populates the two fields the CRD exposes today
-/// (`auto_split_bytes`/`quiesce_after_secs`, see
+/// populates the three fields the CRD exposes today
+/// (`auto_split_bytes`/`quiesce_after_secs`/`max_region_rtt_ms`, see
 /// [`build_cluster_config`]) — the rest stay `None`, `#[serde(skip_
 /// serializing_if = "Option::is_none")]` so an unset field is simply
 /// absent from the emitted JSON rather than a null, exactly like every
@@ -148,6 +152,33 @@ pub struct ClusterSettings {
     pub tablet_max_read_units: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tablet_max_write_units: Option<u64>,
+    /// ADR 0075 section 3.4: the cluster-wide upper bound on the inter-region
+    /// round trip, populated from `spec.maxRegionRttMs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_region_rtt_ms: Option<u64>,
+    /// ADR 0075 section 5.4 (G-e): this cluster's MREC region name
+    /// (`spec.region`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    /// The MREC peer clusters (`spec.peers`), animusd's `PeerCluster` shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peers: Vec<PeerCluster>,
+    /// `spec.allowInsecurePeers` (dev only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_insecure_peers: Option<bool>,
+    /// `spec.mrecMaxClockSkewMs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mrec_max_clock_skew_ms: Option<u64>,
+}
+
+/// Mirrors `animusd::config::PeerCluster` (`deny_unknown_fields` there, so
+/// the field names must match exactly).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerCluster {
+    pub region: String,
+    pub endpoints: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_ca: Option<String>,
 }
 
 impl ClusterSettings {
@@ -211,7 +242,7 @@ pub fn build_cluster_config(name: &str, ns: &str, spec: &AnimusClusterSpec) -> C
     // by `crate::controller` before this function is ever called with an
     // invalid `spec.tls`; this function itself only cares whether `tls` is
     // present at all.
-    let tls = spec.tls.as_ref().map(|_| tls_section());
+    let tls = spec.tls.as_ref().map(|_| tls_section_for(spec));
     // ADR 0069 S-03 PR 3: every node gets the identical
     // `encryption_key_path` (pointing at the one `Secret` mounted
     // identically on every pod) when `spec.encryptionKeySecretName` is set
@@ -267,6 +298,20 @@ pub fn cluster_settings_or_none(spec: &AnimusClusterSpec) -> Option<ClusterSetti
     let settings = ClusterSettings {
         auto_split_bytes: spec.auto_split_bytes,
         quiesce_after_secs: spec.quiesce_after_secs,
+        max_region_rtt_ms: spec.max_region_rtt_ms,
+        region: spec.region.clone(),
+        peers: spec
+            .peers
+            .iter()
+            .enumerate()
+            .map(|(i, p)| PeerCluster {
+                region: p.region.clone(),
+                endpoints: p.endpoints.clone(),
+                tls_ca: p.ca_secret_ref.as_ref().map(|_| peer_ca_path(i)),
+            })
+            .collect(),
+        allow_insecure_peers: spec.allow_insecure_peers.filter(|b| *b),
+        mrec_max_clock_skew_ms: spec.mrec_max_clock_skew_ms,
         ..ClusterSettings::default()
     };
     if settings.is_empty() {
@@ -348,7 +393,39 @@ pub fn tls_section() -> TlsSection {
         cert_path: format!("{TLS_MOUNT_DIR}/tls.crt"),
         key_path: format!("{TLS_MOUNT_DIR}/tls.key"),
         ca_path: Some(format!("{TLS_MOUNT_DIR}/ca.crt")),
+        peer_ca_path: None,
     }
+}
+
+/// Where the peer cluster `i`'s CA `Secret` (`spec.peers[i].caSecretRef`) is
+/// mounted, read-only (G-01 stage G-e): `{dir}/{i}/ca.crt` (the `Secret`'s
+/// chosen key is projected to that fixed file name). Indexed by position, not
+/// region name, so any valid region name yields a valid path and volume name.
+pub const PEER_CA_MOUNT_DIR: &str = "/etc/animus/peer-ca";
+/// The peer-only trust bundle `entrypoint.sh` writes at container start
+/// (every peer CA, and **not** the own CA) when a peer names a CA `Secret`.
+/// A scratch path like [`S3_CREDENTIALS_RUNTIME_PATH`], never persisted. It
+/// is `animusd`'s `tls.peer_ca_path` (issue #1253): the intra listener admits
+/// a client certificate chaining to it, but trusts such a certificate for
+/// MREC replication frames only. `ca_path` stays the own CA alone.
+pub const PEER_CA_BUNDLE_PATH: &str = "/tmp/animus-tls-ca-bundle.pem";
+
+/// The mounted CA file path of peer `i`.
+#[must_use]
+pub fn peer_ca_path(i: usize) -> String {
+    format!("{PEER_CA_MOUNT_DIR}/{i}/ca.crt")
+}
+
+/// [`tls_section`] for `spec`: identical, except that when a peer names a CA
+/// `Secret` the `peer_ca_path` is the peers-only [`PEER_CA_BUNDLE_PATH`]
+/// (`ca_path` is always the own CA).
+#[must_use]
+pub fn tls_section_for(spec: &AnimusClusterSpec) -> TlsSection {
+    let mut t = tls_section();
+    if spec.has_peer_ca() {
+        t.peer_ca_path = Some(PEER_CA_BUNDLE_PATH.to_string());
+    }
+    t
 }
 
 /// The absolute in-container path `spec.encryptionKeySecretName`'s resolved
@@ -454,6 +531,18 @@ pub fn entrypoint_script(spec: &AnimusClusterSpec) -> String {
     let mut data_flags = String::new();
     let mut both_preamble = String::new();
 
+    // G-01 stage G-a: this node's topology labels, resolved by the operator
+    // onto the pod's annotations and projected to a file (see
+    // `super::topology`). Both branches accept the flags.
+    let labels_flags = format!(
+        " --labels-file {}/{} --labels-file-annotations --labels-wait-secs {}",
+        super::topology::TOPOLOGY_MOUNT_DIR,
+        super::topology::TOPOLOGY_FILE_NAME,
+        super::topology::LABELS_WAIT_SECS,
+    );
+    both_flags.push_str(&labels_flags);
+    data_flags.push_str(&labels_flags);
+
     if ephemeral {
         both_flags.push_str(" --ephemeral");
         data_flags.push_str(" --ephemeral");
@@ -527,11 +616,30 @@ pub fn entrypoint_script(spec: &AnimusClusterSpec) -> String {
         ));
     }
 
+    // G-e / issue #1253: concatenate every peer CA (NOT the own CA) into the
+    // file `tls.peer_ca_path` points at; `tls.ca_path` stays the own CA.
+    // Both branches.
+    let mut common_preamble = String::new();
+    if spec.tls.is_some() && spec.has_peer_ca() {
+        let files: Vec<String> = spec
+            .peers
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.ca_secret_ref.is_some())
+            .map(|(i, _)| peer_ca_path(i))
+            .collect();
+        common_preamble.push_str(&format!(
+            "for f in {}; do cat \"$f\"; echo; done > {PEER_CA_BUNDLE_PATH}\n",
+            files.join(" ")
+        ));
+    }
+
     format!(
         "#!/bin/sh\n\
          set -eu\n\
          # Generated by animus-operator — do not edit; changes are\n\
          # overwritten on the next reconcile.\n\
+         {common_preamble}\
          ord=\"${{HOSTNAME##*-}}\"\n\
          cfg=\"{CONFIG_MOUNT_DIR}/{CONFIG_FILE_NAME}\"\n\
          if [ \"$ord\" -lt {control_nodes} ]; then\n\
@@ -745,6 +853,22 @@ mod tests {
     }
 
     #[test]
+    fn max_region_rtt_ms_reaches_cluster_settings_and_is_absent_when_unset() {
+        let mut s = spec(3);
+        s.max_region_rtt_ms = Some(220);
+        let cfg = build_cluster_config("c", "ns", &s);
+        let value: serde_json::Value = serde_json::from_str(&to_json(&cfg)).unwrap();
+        assert_eq!(
+            value["cluster_settings"],
+            serde_json::json!({"max_region_rtt_ms": 220}),
+            "got {value}"
+        );
+        // Unset: the section stays absent, the pre-existing bytes.
+        let cfg = build_cluster_config("c", "ns", &spec(3));
+        assert!(cfg.cluster_settings.is_none());
+    }
+
+    #[test]
     fn mixed_role_split_at_control_nodes() {
         let mut s = spec(5);
         s.control_nodes = Some(2);
@@ -931,6 +1055,9 @@ mod tests {
         "--quiesce-after",
         "--dynamo-auth",
         "--advertise-host",
+        "--labels-file",
+        "--labels-file-annotations",
+        "--labels-wait-secs",
         "--seed",
         "--id",
         "--base-port",
@@ -977,6 +1104,18 @@ mod tests {
             "entrypoint script emitted flag(s) `animusd` does not accept: {unknown:?}\n\
              script:\n{script}"
         );
+    }
+
+    #[test]
+    fn entrypoint_passes_the_topology_labels_flags_on_both_branches() {
+        let script = entrypoint_script(&spec(3));
+        let (both_branch, data_branch) = script.split_once("else").unwrap();
+        for branch in [both_branch, data_branch] {
+            assert!(branch.contains(
+                "--labels-file /etc/animus/topology/annotations --labels-file-annotations \
+                 --labels-wait-secs 180"
+            ));
+        }
     }
 
     #[test]
@@ -1361,5 +1500,144 @@ mod tests {
         assert!(script.starts_with("#!/bin/sh\n"));
         assert!(script.contains("set -eu"));
         assert!(script.contains("HOSTNAME##*-"));
+    }
+}
+
+#[cfg(test)]
+mod peers_tests {
+    use super::*;
+    use crate::crd::{PeerCaSecretRef, PeerSpec, TlsSpec};
+
+    fn federated(with_ca: bool) -> AnimusClusterSpec {
+        AnimusClusterSpec {
+            nodes: 3,
+            region: Some("us".into()),
+            peers: vec![
+                PeerSpec {
+                    region: "eu".into(),
+                    endpoints: vec![
+                        "eu-a.example.com:14004".into(),
+                        "eu-b.example.com:443".into(),
+                    ],
+                    ca_secret_ref: with_ca.then(|| PeerCaSecretRef {
+                        name: "eu-ca".into(),
+                        key: None,
+                    }),
+                },
+                PeerSpec {
+                    region: "ap".into(),
+                    endpoints: vec!["ap.example.com:14004".into()],
+                    ca_secret_ref: with_ca.then(|| PeerCaSecretRef {
+                        name: "ap-ca".into(),
+                        key: Some("tls.crt".into()),
+                    }),
+                },
+            ],
+            tls: Some(TlsSpec {
+                secret_name: Some("t".into()),
+                cert_manager: None,
+            }),
+            mrec_max_clock_skew_ms: Some(250),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn no_peers_means_no_federation_keys_anywhere() {
+        let cfg = build_cluster_config(
+            "c",
+            "ns",
+            &AnimusClusterSpec {
+                nodes: 3,
+                ..Default::default()
+            },
+        );
+        assert!(cfg.cluster_settings.is_none());
+        assert!(!entrypoint_script(&AnimusClusterSpec::default()).contains("animus-tls-ca-bundle"));
+    }
+
+    #[test]
+    fn cluster_settings_carries_exactly_the_animusd_peer_shape() {
+        let cfg = build_cluster_config("c", "ns", &federated(true));
+        let v: serde_json::Value = serde_json::from_str(&to_json(&cfg)).unwrap();
+        assert_eq!(
+            v["cluster_settings"],
+            serde_json::json!({
+                "region": "us",
+                "peers": [
+                    {"region": "eu", "endpoints": ["eu-a.example.com:14004", "eu-b.example.com:443"],
+                     "tls_ca": "/etc/animus/peer-ca/0/ca.crt"},
+                    {"region": "ap", "endpoints": ["ap.example.com:14004"],
+                     "tls_ca": "/etc/animus/peer-ca/1/ca.crt"}
+                ],
+                "mrec_max_clock_skew_ms": 250
+            })
+        );
+    }
+
+    #[test]
+    fn allow_insecure_peers_is_emitted_only_when_true() {
+        let mut s = federated(false);
+        s.tls = None;
+        s.allow_insecure_peers = Some(true);
+        let v: serde_json::Value =
+            serde_json::from_str(&to_json(&build_cluster_config("c", "ns", &s))).unwrap();
+        assert_eq!(v["cluster_settings"]["allow_insecure_peers"], true);
+        s.allow_insecure_peers = Some(false);
+        let v: serde_json::Value =
+            serde_json::from_str(&to_json(&build_cluster_config("c", "ns", &s))).unwrap();
+        assert!(v["cluster_settings"].get("allow_insecure_peers").is_none());
+    }
+
+    #[test]
+    fn the_emitted_json_matches_animusds_field_names() {
+        // animusd's `PeerCluster` is `deny_unknown_fields`; this crate cannot
+        // depend on animusd, so pin the names literally (they are checked
+        // against animusd's own parser by `animusd`'s config round-trip test
+        // `mrec_settings_are_additive_and_pinned_json`).
+        let cfg = build_cluster_config("c", "ns", &federated(true));
+        let v: serde_json::Value = serde_json::from_str(&to_json(&cfg)).unwrap();
+        let p = v["cluster_settings"]["peers"][0].as_object().unwrap();
+        let mut keys: Vec<_> = p.keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["endpoints", "region", "tls_ca"]);
+    }
+
+    #[test]
+    fn ca_path_is_always_the_own_ca_and_peer_ca_path_is_the_peer_bundle() {
+        let with = build_cluster_config("c", "ns", &federated(true));
+        for n in &with.nodes {
+            let tls = n.tls.as_ref().unwrap();
+            // Issue #1253: the own CA alone is `ca_path`; the peer bundle is
+            // a separate, lesser trust root.
+            assert_eq!(tls.ca_path.as_deref(), Some("/etc/animus/tls/ca.crt"));
+            assert_eq!(
+                tls.peer_ca_path.as_deref(),
+                Some("/tmp/animus-tls-ca-bundle.pem")
+            );
+        }
+        let without = build_cluster_config("c", "ns", &federated(false));
+        let tls = without.nodes[0].tls.as_ref().unwrap();
+        assert_eq!(tls.ca_path.as_deref(), Some("/etc/animus/tls/ca.crt"));
+        assert_eq!(tls.peer_ca_path, None);
+        assert!(!to_json(&without).contains("peer_ca_path"));
+    }
+
+    #[test]
+    fn entrypoint_concatenates_only_the_peer_cas_before_exec() {
+        let script = entrypoint_script(&federated(true));
+        // Issue #1253: the own CA must NOT be in the peer bundle.
+        let merge = "for f in /etc/animus/peer-ca/0/ca.crt \
+                     /etc/animus/peer-ca/1/ca.crt; do cat \"$f\"; echo; done > \
+                     /tmp/animus-tls-ca-bundle.pem";
+        let at = script
+            .find(merge)
+            .unwrap_or_else(|| panic!("no merge line in {script}"));
+        assert!(at < script.find("exec animusd").unwrap());
+        assert!(
+            at < script.find("if [ \"$ord\"").unwrap(),
+            "merge must run on both branches"
+        );
+        assert!(!entrypoint_script(&federated(false)).contains("animus-tls-ca-bundle"));
     }
 }

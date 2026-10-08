@@ -1,0 +1,355 @@
+# AnimusDB Prometheus alert + recording rules (R-01 sub-track (f), criteria F-3/F-5).
+#
+# Every animusd metric name below is a real name from
+# `crates/animus-env/src/metrics.rs` as served by `GET /metrics` on the node's
+# DynamoDB listener (unprefixed, e.g. `cp_commits`; there is no `animus_`
+# namespace). `deploy/observability/README.md` has the scrape config, the SLO
+# definitions and the list of signals that have no metric yet. A CI test
+# (`animusd` `sim_cluster_admin::metric_references_exist_in_exposition`)
+# fails if a name used here is not in the live exposition.
+#
+# Non-animusd inputs (clearly third-party, not checked by that test):
+#   up                                          - Prometheus itself
+#   kubelet_volume_stats_*                      - kubelet (PVC usage)
+#   certmanager_certificate_expiration_timestamp_seconds - cert-manager
+#
+# Assumptions: the scrape job is named `animusd`, one target per node, and
+# `instance` identifies the node. Counters are per-node and reset on restart,
+# so every counter is used through rate()/increase().
+groups:
+  - name: animus.recording
+    interval: 30s
+    rules:
+      # Availability SLI: fraction of dispatched DynamoDB-wire requests that
+      # answered 5xx. Throttles and client errors are 4xx and count as
+      # available (a throttle is the provisioned-capacity contract working).
+      - record: animus:dynamo_request_errors:ratio_rate5m
+        expr: |
+          sum(rate(dynamo_responses_5xx[5m]))
+            /
+          clamp_min(sum(rate(dynamo_requests_total[5m])), 1e-9)
+      - record: animus:dynamo_request_errors:ratio_rate1h
+        expr: |
+          sum(rate(dynamo_responses_5xx[1h]))
+            /
+          clamp_min(sum(rate(dynamo_requests_total[1h])), 1e-9)
+      - record: animus:dynamo_request_errors:ratio_rate6h
+        expr: |
+          sum(rate(dynamo_responses_5xx[6h]))
+            /
+          clamp_min(sum(rate(dynamo_requests_total[6h])), 1e-9)
+      - record: animus:dynamo_request_errors:ratio_rate30d
+        expr: |
+          sum(rate(dynamo_responses_5xx[30d]))
+            /
+          clamp_min(sum(rate(dynamo_requests_total[30d])), 1e-9)
+      # Linearizable-read SLI: fraction of ReadIndex barriers that did not
+      # confirm before their deadline.
+      - record: animus:linearizable_read_barrier_failures:ratio_rate5m
+        expr: |
+          sum(rate(cp_read_barriers_timed_out[5m]))
+            /
+          clamp_min(sum(rate(cp_read_barriers_served[5m])) + sum(rate(cp_read_barriers_timed_out[5m])), 1e-9)
+      # Write-routing SLI: fraction of proposals refused because the contacted
+      # replica was not the leader (a leader move or a leaderless group).
+      - record: animus:write_proposals_not_leader:ratio_rate5m
+        expr: |
+          sum(rate(cp_proposals_rejected_not_leader[5m]))
+            /
+          clamp_min(sum(rate(cp_proposals_accepted[5m])) + sum(rate(cp_proposals_rejected_not_leader[5m])), 1e-9)
+      # Throttle rate as a share of dispatched requests.
+      - record: animus:dynamo_throttled:ratio_rate5m
+        expr: |
+          (sum(rate(throttled_reads[5m])) + sum(rate(throttled_writes[5m])))
+            /
+          clamp_min(sum(rate(dynamo_requests_total[5m])), 1e-9)
+
+  - name: animus.cluster
+    rules:
+      - alert: AnimusNodeDown
+        expr: up{job="animusd"} == 0
+        for: 2m
+        labels: {severity: critical, component: node}
+        annotations:
+          summary: "animusd {{ $labels.instance }} is not scrapable"
+          description: "Prometheus has failed to scrape {{ $labels.instance }} for 2m. The process, pod or network path is down. Tablet groups hosted there run a replica short."
+          runbook_url: "https://github.com/animus-db/animus-db/blob/main/docs/runbook/node-down.md"
+      - alert: AnimusScrapeAbsent
+        expr: absent(up{job="animusd"})
+        for: 5m
+        labels: {severity: critical, component: monitoring}
+        annotations:
+          summary: "No animusd scrape target exists"
+          description: "No `up{job=\"animusd\"}` series at all: the scrape config or service discovery is broken, so every other animus alert is blind."
+          runbook_url: "https://github.com/animus-db/animus-db/blob/main/docs/runbook/node-down.md"
+      - alert: AnimusQuorumToleranceExhausted
+        # n scraped nodes tolerate floor((n-1)/2) failures if every node is a
+        # control voter; with data-only nodes in the job this is conservative.
+        expr: |
+          count(up{job="animusd"} == 0)
+            >= floor((count(up{job="animusd"}) - 1) / 2)
+        for: 2m
+        labels: {severity: critical, component: control-plane}
+        annotations:
+          summary: "Cluster has no node-failure tolerance left"
+          description: "{{ $value }} node(s) are down; one more failure can cost the control-plane quorum and some tablet-group quorums (writes and linearizable reads then stop)."
+          runbook_url: "https://github.com/animus-db/animus-db/blob/main/docs/runbook/quorum-risk.md"
+      - alert: AnimusControlPlaneLeaderless
+        expr: sum(control_is_leader) == 0
+        for: 1m
+        labels: {severity: critical, component: control-plane}
+        annotations:
+          summary: "No control-plane leader"
+          description: "No scraped node reports `control_is_leader 1`. Metadata changes (CreateTable, placement, splits) are blocked; existing tablet groups keep serving."
+          runbook_url: "https://github.com/animus-db/animus-db/blob/main/docs/runbook/control-plane-leader.md"
+      - alert: AnimusControlPlaneMultipleLeaders
+        expr: sum(control_is_leader) > 1
+        for: 5m
+        labels: {severity: warning, component: control-plane}
+        annotations:
+          summary: "More than one node reports control-plane leadership"
+          description: "Brief overlap during a transfer is normal; 5m is a stale gauge or a partition. Compare with /admin/raft."
+          runbook_url: "https://github.com/animus-db/animus-db/blob/main/docs/runbook/control-plane-leader.md"
+      - alert: AnimusControlPlaneElectionChurn
+        expr: sum(increase(control_elections_started[10m])) > 3
+        for: 5m
+        labels: {severity: warning, component: control-plane}
+        annotations:
+          summary: "Control-plane elections are flapping"
+          description: "{{ $value }} elections started in 10m. Look for an overloaded or slow node, packet loss or timer starvation."
+          runbook_url: "https://github.com/animus-db/animus-db/blob/main/docs/runbook/control-plane-leader.md"
+      - alert: AnimusMemberDeclaredDown
+        expr: sum(increase(control_failure_detector_down[10m])) > 0
+        labels: {severity: warning, component: control-plane}
+        annotations:
+          summary: "The failure detector marked a member Down"
+          description: "The control plane itself declared a member Down in the last 10m (ADR 0012); placement will repair its replicas."
+          runbook_url: "https://github.com/animus-db/animus-db/blob/main/docs/runbook/node-down.md"
+
+      - alert: AnimusConsensusTaskPanicked
+        expr: max by (instance) (consensus_task_panics) > 0
+        labels: {severity: critical, component: process}
+        annotations:
+          summary: "{{ $labels.instance }} has a dead consensus-loop task (it panicked)"
+          description: "A control-plane Raft driver/apply loop or a tablet group's driver/apply loop panicked and is never restarted, so this node is silently dead for that group. /admin/health returns 503 (`consensus_task_panics`). Restart the node; keep the log for the bug report."
+          runbook_url: "https://github.com/animus-db/animus-db/blob/main/docs/runbook/node-down.md#a-task-panicked-on-a-live-node"
+      - alert: AnimusBackgroundTaskPanicked
+        expr: sum by (instance) (increase(spawned_task_panics[15m])) > 0
+        labels: {severity: warning, component: process}
+        annotations:
+          summary: "{{ $labels.instance }} had a background task panic"
+          description: "A spawned task (any kind) panicked. Consensus-loop panics also fire AnimusConsensusTaskPanicked; this one covers every other task (a request handler, a reaper, a sweeper) whose loss is partial. Any panic is a bug."
+          runbook_url: "https://github.com/animus-db/animus-db/blob/main/docs/runbook/node-down.md#a-task-panicked-on-a-live-node"
+
+  - name: animus.tablets
+    rules:
+      - alert: AnimusTabletGroupLeaderless
+        expr: sum(rate(cp_route_fanout_exhausted[5m])) > 0
+        for: 3m
+        labels: {severity: critical, component: data-plane}
+        annotations:
+          summary: "Requests find no leader for some tablet group"
+          description: "The request router gave up after asking multiple replicas for a leader hint. Some tablet group is leaderless (quorum lost or election stuck); its keys are unavailable."
+          runbook_url: "https://github.com/animus-db/animus-db/blob/main/docs/runbook/tablet-leaderless.md"
+      - alert: AnimusWritesBouncingOffNonLeaders
+        expr: animus:write_proposals_not_leader:ratio_rate5m > 0.2
+        for: 10m
+        labels: {severity: warning, component: data-plane}
+        annotations:
+          summary: "More than 20% of proposals are refused as not-leader"
+          description: "Sustained leader churn or a leaderless group (ratio {{ $value | humanizePercentage }})."
+          runbook_url: "https://github.com/animus-db/animus-db/blob/main/docs/runbook/tablet-leaderless.md"
+      - alert: AnimusLinearizableReadsTimingOut
+        expr: animus:linearizable_read_barrier_failures:ratio_rate5m > 0.05
+        for: 5m
+        labels: {severity: critical, component: data-plane}
+        annotations:
+          summary: "ConsistentRead barriers are failing"
+          description: "{{ $value | humanizePercentage }} of ReadIndex barriers did not confirm leadership in time: a group has lost quorum or its leader is isolated."
+          runbook_url: "https://github.com/animus-db/animus-db/blob/main/docs/runbook/tablet-leaderless.md"
+      - alert: AnimusReplicaRefusedAsVoter
+        expr: sum by (instance) (cp_groups_refused_as_voter) > 0
+        for: 10m
+        labels: {severity: warning, component: data-plane}
+        annotations:
+          summary: "{{ $labels.instance }} hosts replicas permanently refused as voters"
+          description: "{{ $value }} replica(s) replicate but never vote, so their group silently runs a voter short (under-replicated for quorum purposes). /admin/raftkv names the tablet."
+          runbook_url: "https://github.com/animus-db/animus-db/blob/main/docs/runbook/replica-health.md"
+      - alert: AnimusEngineOpenFailed
+        expr: sum by (instance) (increase(cp_engine_open_failed[15m])) > 0
+        labels: {severity: warning, component: storage}
+        annotations:
+          summary: "{{ $labels.instance }} lost a tablet engine and is rebuilding it"
+          description: "A local tablet engine failed to open (corruption or loss); recovery destroys and re-snapshots it from the leader. Repeats point at a failing disk."
+          runbook_url: "https://github.com/animus-db/animus-db/blob/main/docs/runbook/engine-recovery.md"
+      - alert: AnimusEngineRebuildFailed
+        expr: sum by (instance) (increase(cp_engine_rebuild_failed[15m])) > 0
+        labels: {severity: critical, component: storage}
+        annotations:
+          summary: "{{ $labels.instance }} could not rebuild a tablet engine (data at risk)"
+          description: "Destroy-and-reopen also failed: this node's disk is unhealthy, and the replica stays unhosted so the group runs a replica short."
+          runbook_url: "https://github.com/animus-db/animus-db/blob/main/docs/runbook/engine-recovery.md"
+      - alert: AnimusReplicaNeedsSnapshotRepeated
+        expr: sum by (instance) (increase(cp_engine_needs_snapshot[1h])) > 3
+        labels: {severity: warning, component: data-plane}
+        annotations:
+          summary: "{{ $labels.instance }} keeps entering needs-snapshot"
+          description: "Replicas refuse reads and campaigns until an InstallSnapshot arrives; repeated entries point at repeated engine loss."
+          runbook_url: "https://github.com/animus-db/animus-db/blob/main/docs/runbook/engine-recovery.md"
+      - alert: AnimusTxnRecoveryStuck
+        expr: sum(increase(cp_txn_recovery_stuck_inconclusive[15m])) + sum(increase(cp_txn_unresolved_decided_stuck[15m])) > 0
+        labels: {severity: warning, component: transactions}
+        annotations:
+          summary: "Cross-tablet transaction recovery is not completing"
+          description: "In-doubt transactions cannot be verified or resolved in the background (intents stay safely pending; readers resolve on demand)."
+          runbook_url: "https://github.com/animus-db/animus-db/blob/main/docs/runbook/txn-recovery.md"
+      - alert: AnimusReconcilerStopTimeout
+        expr: sum by (instance) (increase(cp_reconciler_stop_timeout[15m])) > 0
+        labels: {severity: warning, component: data-plane}
+        annotations:
+          summary: "{{ $labels.instance }} has a tablet whose driver will not halt"
+          description: "A stuck or very slow engine/apply loop; the reconciler keeps going but that tablet is wedged."
+          runbook_url: "https://github.com/animus-db/animus-db/blob/main/docs/runbook/replica-health.md"
+
+  - name: animus.client
+    rules:
+      - alert: AnimusHighServerErrorRate
+        expr: animus:dynamo_request_errors:ratio_rate5m > 0.01
+        for: 5m
+        labels: {severity: critical, component: client-wire}
+        annotations:
+          summary: "More than 1% of DynamoDB requests answer 5xx"
+          description: "5xx ratio {{ $value | humanizePercentage }} (InternalServerError/ServiceUnavailable)."
+          runbook_url: "https://github.com/animus-db/animus-db/blob/main/docs/runbook/errors-5xx.md"
+      - alert: AnimusErrorBudgetFastBurn
+        # SLO 99.9% availability: budget 0.1%. 14.4x burn over 1h and 5m.
+        expr: |
+          animus:dynamo_request_errors:ratio_rate1h > (14.4 * 0.001)
+            and
+          animus:dynamo_request_errors:ratio_rate5m > (14.4 * 0.001)
+        labels: {severity: critical, component: slo}
+        annotations:
+          summary: "Availability SLO error budget burning 14.4x"
+          description: "At this rate the 30d budget is gone in about 2 days. SLO definition: deploy/observability/README.md."
+          runbook_url: "https://github.com/animus-db/animus-db/blob/main/docs/runbook/errors-5xx.md"
+      - alert: AnimusErrorBudgetSlowBurn
+        expr: |
+          animus:dynamo_request_errors:ratio_rate6h > (6 * 0.001)
+            and
+          animus:dynamo_request_errors:ratio_rate30d > 0
+        for: 30m
+        labels: {severity: warning, component: slo}
+        annotations:
+          summary: "Availability SLO error budget burning 6x"
+          description: "6h 5xx ratio {{ $value | humanizePercentage }}; a ticket-level burn."
+          runbook_url: "https://github.com/animus-db/animus-db/blob/main/docs/runbook/errors-5xx.md"
+      - alert: AnimusThrottlingHigh
+        expr: animus:dynamo_throttled:ratio_rate5m > 0.05
+        for: 15m
+        labels: {severity: warning, component: client-wire}
+        annotations:
+          summary: "More than 5% of requests are throttled"
+          description: "Clients exceed a table's provisioned throughput ({{ $value | humanizePercentage }}). Raise capacity or fix the hot key; throttling is a 4xx and does not burn the availability budget."
+          runbook_url: "https://github.com/animus-db/animus-db/blob/main/docs/runbook/throttling.md"
+      - alert: AnimusClientRequestsAbandoned
+        expr: sum by (instance) (rate(client_requests_abandoned[5m])) > 1
+        for: 10m
+        labels: {severity: warning, component: client-wire}
+        annotations:
+          summary: "{{ $labels.instance }} is dropping in-flight requests when clients disconnect"
+          description: "Sustained abandoned work, often a client timeout shorter than server latency or a forward/hint-chase loop."
+          runbook_url: "https://github.com/animus-db/animus-db/blob/main/docs/runbook/errors-5xx.md"
+      - alert: AnimusAuthDeniedSpike
+        expr: sum(rate(auth_denied[5m])) + sum(rate(auth_unknown_key[5m])) > 1
+        for: 10m
+        labels: {severity: warning, component: security}
+        annotations:
+          summary: "Sustained authentication/authorization denials"
+          description: "Misconfigured clients, an expired rotated credential or a probing client."
+          runbook_url: "https://github.com/animus-db/animus-db/blob/main/docs/runbook/auth.md"
+      - alert: AnimusHandshakeRefused
+        expr: sum(rate(net_handshake_refused[5m])) + sum(rate(client_handshake_refused[5m])) > 0
+        for: 10m
+        labels: {severity: warning, component: network}
+        annotations:
+          summary: "Wire handshakes are being refused"
+          description: "A peer or client speaks an incompatible protocol or cluster identity (mixed versions, wrong cluster, TLS misconfiguration)."
+          runbook_url: "https://github.com/animus-db/animus-db/blob/main/docs/runbook/network.md"
+      - alert: AnimusInboxOverflow
+        expr: sum by (instance) (rate(demux_frames_dropped_overflow[5m])) > 0
+        for: 10m
+        labels: {severity: warning, component: network}
+        annotations:
+          summary: "{{ $labels.instance }} drops inbound frames at the inbox cap"
+          description: "A consumer is not draining its stream (never-hosted tablet or a stalled loop)."
+          runbook_url: "https://github.com/animus-db/animus-db/blob/main/docs/runbook/network.md"
+
+  - name: animus.backlog
+    rules:
+      - alert: AnimusStreamSealBacklog
+        expr: max(stream_seal_backlog_ms) > 900000
+        for: 15m
+        labels: {severity: warning, component: streams}
+        annotations:
+          summary: "DynamoDB Streams sealing is more than 15 minutes behind"
+          description: "Hot change-log bytes are accumulating ({{ $value }} ms oldest unsealed). Check the segment store and seal failures."
+          runbook_url: "https://github.com/animus-db/animus-db/blob/main/docs/runbook/stream-backlog.md"
+      - alert: AnimusStreamSealFailures
+        expr: sum(increase(stream_seal_failures_total[15m])) > 3
+        labels: {severity: warning, component: streams}
+        annotations:
+          summary: "Stream seal attempts are failing"
+          description: "The segment store put or the SealStreamShard proposal is failing."
+          runbook_url: "https://github.com/animus-db/animus-db/blob/main/docs/runbook/stream-backlog.md"
+      - alert: AnimusChangeLogTrimBlocked
+        expr: max(change_log_trim_blocked) == 1
+        for: 30m
+        labels: {severity: warning, component: streams}
+        annotations:
+          summary: "Change-log trim is blocked"
+          description: "The hot change-log scope grows unboundedly until the missing watermark (an unhealed store or never-sealed stream) is resolved."
+          runbook_url: "https://github.com/animus-db/animus-db/blob/main/docs/runbook/stream-backlog.md"
+      - alert: AnimusStreamRepairBacklog
+        expr: max(stream_repair_backlog) > 0
+        for: 30m
+        labels: {severity: warning, component: streams}
+        annotations:
+          summary: "Stream segments stay under-replicated"
+          description: "{{ $value }} live segment rows reference a replica that is not an Active member; the repair sweep is stuck."
+          runbook_url: "https://github.com/animus-db/animus-db/blob/main/docs/runbook/stream-backlog.md"
+
+  - name: animus.infrastructure
+    rules:
+      # Third-party metrics: kubelet (PVC usage) and cert-manager. Adjust the
+      # label matchers to your deployment; the operator names the data volume
+      # `data` (PVC `data-<cluster>-<ordinal>`) and the TLS Certificate
+      # `<cluster>-tls`.
+      - alert: AnimusDataVolumeFillingUp
+        expr: |
+          kubelet_volume_stats_available_bytes{persistentvolumeclaim=~"data-.*"}
+            / kubelet_volume_stats_capacity_bytes{persistentvolumeclaim=~"data-.*"} < 0.15
+        for: 15m
+        labels: {severity: warning, component: storage}
+        annotations:
+          summary: "Data volume {{ $labels.persistentvolumeclaim }} is over 85% full"
+          description: "{{ $value | humanizePercentage }} free. A full disk stops WAL appends on that node."
+          runbook_url: "https://github.com/animus-db/animus-db/blob/main/docs/runbook/disk-space.md"
+      - alert: AnimusDataVolumeAlmostFull
+        expr: |
+          kubelet_volume_stats_available_bytes{persistentvolumeclaim=~"data-.*"}
+            / kubelet_volume_stats_capacity_bytes{persistentvolumeclaim=~"data-.*"} < 0.05
+        for: 5m
+        labels: {severity: critical, component: storage}
+        annotations:
+          summary: "Data volume {{ $labels.persistentvolumeclaim }} is over 95% full"
+          description: "{{ $value | humanizePercentage }} free; writes on this node are about to fail."
+          runbook_url: "https://github.com/animus-db/animus-db/blob/main/docs/runbook/disk-space.md"
+      - alert: AnimusTlsCertificateExpiringSoon
+        expr: |
+          certmanager_certificate_expiration_timestamp_seconds{name=~".*-tls"} - time() < 14 * 86400
+        for: 1h
+        labels: {severity: warning, component: security}
+        annotations:
+          summary: "TLS certificate {{ $labels.name }} expires in under 14 days"
+          description: "animusd reads certificates at start-up (ADR 0064): renewing the Secret is not enough, the pods must be restarted after rotation."
+          runbook_url: "https://github.com/animus-db/animus-db/blob/main/docs/runbook/cert-expiry.md"

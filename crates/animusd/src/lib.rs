@@ -34,6 +34,7 @@ pub mod config;
 #[deny(clippy::disallowed_methods)]
 mod index_drain;
 mod min_tablets;
+pub mod node_labels;
 pub mod otel;
 pub use config::{ClusterConfig, DynamoAuthConfig};
 // Re-exported so callers (CLI, tests, operators) can inspect a node's cached
@@ -52,7 +53,7 @@ pub use animus_control::{
 pub use animus_node::{
     ClientRequest, ClientResponse, KindWriteBatchItem, KindWriteItemReply, KindWriteOp,
     PendingKindWrite, Surface, TxnPrecondition, TxnTableWrite, TxnWriteCondition, decide,
-    is_relayable_command, surface_of, topology,
+    is_relayable_command, peer_region_may_send, surface_of, topology,
 };
 // ADR 0061 rung C5 step 3a: `ClientCtx`'s own `control` field needs the
 // *generic* `ControlHandle<E, R>` (not this crate's `E = ProdEnv`/`R =
@@ -101,14 +102,29 @@ mod dynamo;
 mod dynamo_streams;
 #[deny(clippy::disallowed_methods)]
 mod forwarding;
+#[deny(clippy::disallowed_methods)]
+mod global_tables;
 mod http;
 mod import;
 #[deny(clippy::disallowed_methods)]
 mod index_backfill;
+#[allow(
+    dead_code,
+    reason = "G-d M3: first production caller is the M4 shipper"
+)]
+pub mod mrec_peer;
+#[deny(clippy::disallowed_methods)]
+mod mrec_receiver;
+#[deny(clippy::disallowed_methods)]
+mod mrec_saga;
+mod mrec_shipper;
+mod overload;
 #[deny(clippy::disallowed_methods)]
 mod pitr_janitor;
 #[deny(clippy::disallowed_methods)]
 mod read_path;
+#[deny(clippy::disallowed_methods)]
+mod roll_health;
 #[deny(clippy::disallowed_methods)]
 mod schema;
 mod segment_janitor;
@@ -117,6 +133,8 @@ mod split_placing_completion;
 mod ttl_reaper;
 #[deny(clippy::disallowed_methods)]
 mod txn_coordinator;
+#[deny(clippy::disallowed_methods)]
+mod version_wiring;
 #[deny(clippy::disallowed_methods)]
 mod write_path;
 
@@ -132,8 +150,8 @@ use animus_cp_data::{
 };
 use animus_env::{
     CLIENT_PROTOCOL, Clock, Disk, Env, FsSegmentStore, MaybeTlsStream, Metric, MetricsHandle,
-    Nanos, NodeId, PreambleError, ProdEnv, TlsMaterial, exchange_preamble, read_preamble,
-    write_own_preamble,
+    Nanos, NodeId, PreambleError, ProdEnv, TlsMaterial, exchange_preamble_with, read_preamble,
+    write_own_preamble_with,
 };
 use animus_storage::{
     Key, LsmEngine, MemoryEngine, SsTableView, StorageEngine, StorageError, VersionedValue,
@@ -564,6 +582,26 @@ enum CpGroup<E: Env = ProdEnv> {
 }
 
 impl<E: Env> CpGroup<E> {
+    /// Test-only: `role@term` for a corpus's convergence-timeout dump.
+    #[cfg(test)]
+    fn role_term(&self) -> String {
+        match self {
+            CpGroup::Lsm(n) => format!("{:?}@{}", n.role(), n.term()),
+            CpGroup::Mem(n) => format!("{:?}@{}", n.role(), n.term()),
+        }
+    }
+
+    /// The group's feature-gate handle (ADR 0073 Phase 2): the node's own
+    /// control-fed handle when the reconciler injected it, else a private
+    /// floor handle. Test-only: nothing in production reads it back.
+    #[cfg(test)]
+    fn features(&self) -> animus_control::version::ClusterFeatures {
+        match self {
+            CpGroup::Lsm(n) => n.features(),
+            CpGroup::Mem(n) => n.features(),
+        }
+    }
+
     /// Propose a write to the group (honored on the leader), stamping `fence`
     /// Propose a write to this group. See [`RaftKvNode::put`].
     fn put(&self, key: Vec<u8>, value: Vec<u8>) -> ProposeResult {
@@ -673,6 +711,27 @@ impl<E: Env> CpGroup<E> {
         match self {
             CpGroup::Lsm(n) => n.local_scan(start, None, Some(limit)).await,
             CpGroup::Mem(n) => n.local_scan(start, None, Some(limit)).await,
+        }
+    }
+
+    /// The MREC shipper's committed point read (see
+    /// [`RaftKvNode::local_get_for_ship`]).
+    pub(crate) async fn local_get_for_ship(&self, key: &[u8]) -> animus_cp_data::ShipGet {
+        match self {
+            CpGroup::Lsm(n) => n.local_get_for_ship(key).await,
+            CpGroup::Mem(n) => n.local_get_for_ship(key).await,
+        }
+    }
+
+    /// The MREC shipper's scan window (see [`RaftKvNode::local_scan_for_ship`]).
+    pub(crate) async fn local_scan_for_ship(
+        &self,
+        start: &[u8],
+        limit: usize,
+    ) -> (Vec<(Vec<u8>, Vec<u8>)>, Option<Vec<u8>>) {
+        match self {
+            CpGroup::Lsm(n) => n.local_scan_for_ship(start, limit).await,
+            CpGroup::Mem(n) => n.local_scan_for_ship(start, limit).await,
         }
     }
 
@@ -1000,6 +1059,34 @@ impl<E: Env> CpGroup<E> {
             CpGroup::Lsm(n) => n.is_frozen(),
             CpGroup::Mem(n) => n.is_frozen(),
         }
+    }
+
+    /// Whether this group's WAL is suspect after an ENOSPC (R-01 (d), ADR 0074
+    /// §2) — the `StorageFull` state. A pure flag read; see
+    /// [`RaftKvNode::is_storage_full`].
+    pub(crate) fn is_storage_full(&self) -> bool {
+        match self {
+            CpGroup::Lsm(n) => n.is_storage_full(),
+            CpGroup::Mem(n) => n.is_storage_full(),
+        }
+    }
+
+    /// The pre-propose disk-full refusal every mutating local write/txn helper
+    /// consults beside [`decide::frozen_refusal`]: while this group is
+    /// `StorageFull` it can make nothing durable, so a write is refused
+    /// **before proposing** with the named, `"; retry"`-suffixed
+    /// [`decide::STORAGE_FULL_REFUSAL`] (surfaced as a 503
+    /// `ServiceUnavailable` naming `StorageFull`) and `overload_storage_full`
+    /// is counted. Reads are never gated.
+    pub(crate) fn refuse_if_storage_full(&self) -> Result<(), String> {
+        let full = self.is_storage_full();
+        if full {
+            match self {
+                CpGroup::Lsm(n) => n.record_storage_full_refusal(),
+                CpGroup::Mem(n) => n.record_storage_full_refusal(),
+            }
+        }
+        decide::storage_full_refusal(full)
     }
 
     /// Propose the split-cutover freeze directly (`RaftKvNode::
@@ -1348,6 +1435,7 @@ impl<E: Env> CpGroup<E> {
                     byte_size,
                     quiesced: $n.is_quiesced(),
                     refused_as_voter: $n.refused_as_voter(),
+                    storage_full: $n.is_storage_full(),
                     voter_history: self
                         .voter_history()
                         .into_iter()
@@ -1369,6 +1457,28 @@ impl<E: Env> CpGroup<E> {
         match self {
             CpGroup::Lsm(n) => view!(n),
             CpGroup::Mem(n) => view!(n),
+        }
+    }
+
+    /// The cheap subset of [`raft_view`](Self::raft_view) the roll-health
+    /// verdict needs (ADR 0073 Phase 3, D2): leader belief, learners, commit
+    /// vs. engine-applied. Lock-and-read only (no byte-size estimate), since
+    /// `GET /admin/cluster-version` is polled while a roll is in flight.
+    fn roll_group(&self, tablet: TabletId) -> roll_health::LocalGroup {
+        macro_rules! g {
+            ($n:expr) => {
+                roll_health::LocalGroup {
+                    tablet: tablet.0,
+                    leader_known: $n.leader().is_some(),
+                    learners: $n.learners().len(),
+                    commit_index: $n.commit_index(),
+                    engine_applied_index: $n.engine_applied_index(),
+                }
+            };
+        }
+        match self {
+            CpGroup::Lsm(n) => g!(n),
+            CpGroup::Mem(n) => g!(n),
         }
     }
 
@@ -2358,10 +2468,19 @@ async fn perform_client_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     role: &'static str,
     peer_desc: &str,
     metrics: &MetricsHandle,
+    own_ext: &[u8],
+    require_peer_ext: bool,
 ) -> std::io::Result<()> {
-    exchange_preamble(conn, &CLIENT_PROTOCOL, CLIENT_HANDSHAKE_TIMEOUT)
-        .await
-        .map_err(|err| classify_client_handshake_error(err, role, peer_desc, metrics))
+    exchange_preamble_with(
+        conn,
+        &CLIENT_PROTOCOL,
+        CLIENT_HANDSHAKE_TIMEOUT,
+        own_ext,
+        require_peer_ext,
+    )
+    .await
+    .map(|_peer| ())
+    .map_err(|err| classify_client_handshake_error(err, role, peer_desc, metrics))
 }
 
 /// The pipelined dial-side counterpart to [`perform_client_handshake`],
@@ -2399,13 +2518,22 @@ async fn client_request_pipelined<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     peer_desc: &str,
     request: &ClientRequest,
+    features: &animus_control::version::ClusterFeatures,
 ) -> std::io::Result<ClientResponse> {
-    write_own_preamble(stream, &CLIENT_PROTOCOL)
+    // ADR 0073 Phase 2 (P2-C): advertise this binary's version `ext`
+    // (a Phase 1 peer ignores it). Never *require* the peer's on a dial: the
+    // refusal of an empty-ext peer is the accept side's job, on the intra
+    // port only.
+    let own_ext = version_wiring::own_ext();
+    write_own_preamble_with(stream, &CLIENT_PROTOCOL, &own_ext)
         .await
         .map_err(|err| {
             classify_client_handshake_error(err, "dial", peer_desc, &MetricsHandle::noop())
         })?;
-    write_frame(stream, request).await?;
+    // Gated (ADR 0073 Phase 2, P2-C): a request whose gate is closed on this
+    // node is refused before it reaches the wire (the preamble above is
+    // harmless: every binary reads it).
+    write_frame_gated(stream, request, features).await?;
     match tokio::time::timeout(
         CLIENT_HANDSHAKE_TIMEOUT,
         read_preamble(stream, &CLIENT_PROTOCOL),
@@ -2413,7 +2541,9 @@ async fn client_request_pipelined<S: AsyncRead + AsyncWrite + Unpin>(
     .await
     {
         Ok(Ok(peer)) => {
-            if let Err(err) = animus_env::handshake::check_peer(&CLIENT_PROTOCOL, &peer) {
+            if let Err(err) =
+                animus_env::handshake::check_peer_ext(&CLIENT_PROTOCOL, &own_ext, &peer, false)
+            {
                 return Err(classify_client_handshake_error(
                     PreambleError::Refused(err),
                     "dial",
@@ -2479,6 +2609,8 @@ pub async fn connect_client(addr: impl tokio::net::ToSocketAddrs) -> std::io::Re
         "dial",
         "client/intra dial",
         &MetricsHandle::noop(),
+        &version_wiring::own_ext(),
+        false,
     )
     .await?;
     Ok(stream)
@@ -2878,6 +3010,23 @@ pub struct RoleAddrs {
     /// loaded and handed to `ProdEnv::bind_with_tls_and_key`.
     #[serde(default)]
     pub encryption_key_path: Option<String>,
+    /// This node's topology labels (G-01 stage G-a) — e.g.
+    /// `topology.kubernetes.io/zone`. Passed to the node's own
+    /// `register_node`/`admin_add_member` self-registration, so they land in
+    /// replicated `Metadata::members[*].labels` where the placement engine's
+    /// residency/spread policies read them. **Fixed at first registration**:
+    /// `Metadata`'s `RegisterNode`/`admin_add_member` never overwrite an
+    /// existing member row's labels (see ADR 0005's 2026-10-04 amendment).
+    /// Empty (every pre-G-a config, `#[serde(default)]`, skipped on
+    /// serialize so existing config bytes are unchanged) registers none.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
+    /// This node's resource bounds / overload limits (R-01 (d), ADR 0074
+    /// §2) — `None` (every pre-existing config) means every default, see
+    /// [`config::OverloadSection`]. Not serialized when absent, so existing
+    /// configs and the `cluster-config` v1 fixture round-trip unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overload: Option<config::OverloadSection>,
 }
 
 /// Fallback endpoint for configs written before a field existed: an ephemeral
@@ -2948,7 +3097,18 @@ pub struct BoundNode {
     /// This node's advertised hostname (ADR 0060), from the [`RoleAddrs`]
     /// [`Node::bind`] was given — see [`advertised_addr`] and
     /// [`RoleAddrs::advertise_host`]'s own doc.
+    /// ADR 0075 section 3.4: the configured max inter-region round trip, sizing
+    /// the WAN Raft timing profile of every group this node hosts that spans
+    /// more than one region. Defaults to 150 ms; set from
+    /// `cluster_settings.max_region_rtt_ms` via `with_max_region_rtt`.
+    max_region_rtt: Duration,
+    /// MREC peer settings (`cluster_settings.{region,peers,..}`, G-d M3) via `with_mrec`.
+    mrec: Arc<crate::mrec_peer::MrecConfig>,
     advertise_host: Option<String>,
+    /// This node's own topology labels, from [`RoleAddrs::labels`] — handed
+    /// to its self-registration (`spawn_common_tail`'s `register_node`, a
+    /// growth node's `admin_add_member`).
+    labels: BTreeMap<String, String>,
     /// This node's TLS material (ADR 0064, S-01 commit 2), loaded once at
     /// bind time from `RoleAddrs::tls` — `None` is plain TCP on every port.
     tls: Option<TlsMaterial>,
@@ -2961,6 +3121,8 @@ pub struct BoundNode {
     /// own tail (`start_with_growth`) reaches them — see that constructor's
     /// own doc for the cluster-wide key-scope contract this relies on.
     encryption_key: Option<animus_env::EncryptionKey>,
+    /// This node's overload limits (R-01 (d)), from `RoleAddrs::overload`.
+    overload: Option<config::OverloadSection>,
 }
 
 /// A node's identity + bound addresses, captured for the admin `/admin/config`
@@ -5272,7 +5434,7 @@ fn spawn_common_tail(
     admin_info: Arc<AdminInfo>,
     client_route: BTreeMap<NodeId, String>,
     intra_route: BTreeMap<NodeId, String>,
-    self_addrs: (NodeId, NodeAddrs),
+    self_addrs: (NodeId, NodeAddrs, BTreeMap<String, String>),
     // `Arc`-wrapped (issue #1060) — see [`BoundNode::client_listener`]'s own
     // doc for why; `serve_requests` below takes the same type.
     client_listener: Arc<TcpListener>,
@@ -5284,6 +5446,8 @@ fn spawn_common_tail(
     dynamo_auth: Option<Arc<BTreeMap<String, String>>>,
     tls: Option<TlsMaterial>,
     export_s3: Option<ExportS3Config>,
+    overload_limits: config::ResolvedLimits,
+    mrec: Arc<crate::mrec_peer::MrecConfig>,
 ) -> (ClientCtx, Vec<tokio::task::JoinHandle<()>>) {
     // The seed `route_sync_loop` (below) re-overlays `Metadata.node_addrs[*].client`
     // onto every tick (ADR 0032 PR1) — the same static-base pattern
@@ -5306,11 +5470,16 @@ fn spawn_common_tail(
     // (`ClientCtx::any_table_throughput`'s doc) — a borrow, not a move, so
     // `control` below still moves into the struct unchanged.
     let initial_any_table_throughput = control.metadata_cached().any_table_throughput();
+    // The relay client's gated encoder reads this node's own feature handle
+    // (ADR 0073 Phase 2, P2-C); cloned before `edge` moves into the ctx.
+    let relay_features = edge.version().features.clone();
+    let overload_metrics = env.metrics();
     let export_store_factory = Arc::new(Mutex::new(default_export_store_factory(
         export_s3,
         env.clone(),
     )));
     let ctx = ClientCtx {
+        mrec,
         control,
         edge,
         env,
@@ -5335,7 +5504,7 @@ fn spawn_common_tail(
         control_storage,
         dynamo_auth,
         tls: tls.clone(),
-        relay: AnimusdRelayClient { tls: tls.clone() },
+        relay: AnimusdRelayClient::new(tls.clone(), relay_features),
         throttle: ThrottleTracker::new(),
         throttle_defaults: Arc::new(ThrottleDefaults::new(
             throttle_read_units,
@@ -5344,6 +5513,7 @@ fn spawn_common_tail(
         any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(
             initial_any_table_throughput,
         )),
+        overload: overload::OverloadState::new(overload_limits, overload_metrics),
     };
     // ADR 0066 §1 (S-02 step 3): seed the lock-free "any catalog
     // credentials" fast path from whatever this node's control handle
@@ -5378,9 +5548,16 @@ fn spawn_common_tail(
     // a control-only node's snapshot is just the control sink (`metrics_text`/
     // `metrics_json` skip the raftkv sink when `ctx.data` is `None`).
     tasks.push(tokio::spawn(metrics_sample_loop(ctx.clone())));
+    // ADR 0073 Phase 2 (P2-C): the per-node version feeder — feeds this
+    // node's `ClusterFeatures`, flips `require_peer_ext` once the era is on
+    // (nodes with no local apply task), latches the out-of-range halt and
+    // self-reports `ReportNodeVersion` once the era is active. Every role.
+    tasks.push(tokio::spawn(version_wiring::version_wiring_loop(
+        ctx.clone(),
+    )));
     // This node's own identity self-registration (ADR 0032 PR1; ADR 0040
     // Decision C since PR4 — the registration CAS is now the mechanism, not
-    // just an address-book update): one-shot, so peer-sync (internal
+    // just an address-book update): retried until registered (issue #1230), so peer-sync (internal
     // addresses) and any node's route/peers views (client/admin addresses)
     // can resolve it regardless of when this node joined relative to the
     // reader. Every node shape reaches this — a fresh bootstrap node whose
@@ -5390,16 +5567,27 @@ fn spawn_common_tail(
     // already owns) and a growth node with no other claim path at all (e.g.
     // a control-only permanently-non-voter — `BoundControlNode::
     // start_control_with` has no `admin_add_member` call of its own; this is
-    // its *only* claim). No labels here (this is a bare identity/address
-    // claim, not an operator-labeled add) — `admin_add_member`/
-    // `admin_add_control_member` are where real labels are set, and
-    // `RegisterNode`'s apply never overwrites an already-`members`-present
-    // entry's labels, so this can never clobber them.
+    // its *only* claim). Carries this node's own topology labels (G-01 stage
+    // G-a, `RoleAddrs::labels`; empty unless configured). `RegisterNode`'s apply
+    // never overwrites a non-empty label set, and only *fills in* an unlabelled
+    // already-present row — which closes the race where `bootstrap`'s
+    // `UpsertMember{labels: {}}` lands before this registration.
     {
         let ctx = ctx.clone();
-        let (node, addrs) = self_addrs;
+        let (node, addrs, labels) = self_addrs;
         tasks.push(tokio::spawn(async move {
-            let _ = ctx.register_node(node, addrs, BTreeMap::new()).await;
+            // Retried until a terminal outcome (issue #1230): a single
+            // attempt with its error discarded left a pod that started
+            // before the control group had a leader unregistered forever.
+            if let RegisterOutcome::Collision = ctx
+                .register_node_until_settled(node.clone(), addrs, labels)
+                .await
+            {
+                eprintln!(
+                    "animusd: self-registration of {node} found a different registration \
+                     already claiming this identity; not retrying"
+                );
+            }
         }));
     }
     // The two client-protocol listeners (ADR 0047): one parameterized
@@ -5418,12 +5606,14 @@ fn spawn_common_tail(
         ctx.clone(),
         ListenerKind::Client,
         tls.as_ref().map(|m| m.server_acceptor.clone()),
+        None,
     )));
     tasks.push(tokio::spawn(serve_requests(
         intra_listener,
         ctx.clone(),
         ListenerKind::Intra,
         tls.as_ref().map(|m| m.acceptor.clone()),
+        tls.clone(),
     )));
     // The admin / debug HTTP-JSON endpoint on its own port (ADR 0020) —
     // server-only TLS (ADR 0064 Decision 2).
@@ -5454,6 +5644,7 @@ fn spawn_common_tail(
             table_source,
             backend,
             tls.as_ref().map(|m| m.server_acceptor.clone()),
+            ctx.overload.clone(),
         )));
     }
 
@@ -5571,6 +5762,23 @@ impl Drop for StartupTasks {
 }
 
 impl BoundNode {
+    /// Set the max inter-region round trip (ADR 0075 section 3.4) — see
+    /// `ClusterSettings::max_region_rtt_ms`. Inert unless some group spans more
+    /// than one `topology.kubernetes.io/region` label value.
+    #[must_use]
+    pub fn with_max_region_rtt(mut self, rtt: Duration) -> Self {
+        self.max_region_rtt = rtt;
+        self
+    }
+
+    /// Install the node's MREC peer settings (`cluster_settings.region`/
+    /// `peers`/`allow_insecure_peers`/`mrec_max_clock_skew_ms`, ADR 0075
+    /// section 4.3, G-d M3): read by the MREC receiver. Default: no MREC.
+    pub(crate) fn with_mrec(mut self, mrec: crate::mrec_peer::MrecConfig) -> Self {
+        self.mrec = Arc::new(mrec);
+        self
+    }
+
     /// This node's own identity, as bound — the same [`NodeId`] [`Node::bind`]
     /// was given. Lets a caller holding a bag of already-bound nodes (e.g. a
     /// test fixture binding every node before starting any of them, issue
@@ -6049,7 +6257,16 @@ impl BoundNode {
         // one-process-per-node mode (`tests/schema_ddl_relay.rs`); a
         // `--cluster N` in-process node now exercises it too instead of always
         // finding the leader's handle locally.
+        // ADR 0073 Phase 2 (P2-C): THE flip — this binary's own range and
+        // build go onto the control `RaftNode`, which from here on evaluates
+        // the era-start precondition P and (era on) reports/refuses by
+        // version. Everything before this line in the wiring is inert.
+        version_wiring::apply_profile_to_raft(&raft, &edge.version().profile());
         edge.register_control(raft.clone());
+        // ADR 0075 section 3.4: the control group derives its Raft timing
+        // profile from its own voters' region labels (a no-op on an unlabelled
+        // cluster). Opt-in, spawned after everything `RaftNode::start` spawns.
+        raft.enable_region_timing(self.max_region_rtt);
 
         // **Leaderful CP per-tablet Raft group** (ADR 0017 #3a) — the v1 data plane
         // (ADR 0019). Stage 3a hosts a single, statically-placed CP group spanning
@@ -6130,6 +6347,7 @@ impl BoundNode {
                     intra: advertised_addr(self.advertise_host.as_deref(), my_intra_addr),
                     role: "combined".to_string(),
                 },
+                self.labels.clone(),
             ),
             self.client_listener,
             self.admin_listener,
@@ -6140,6 +6358,8 @@ impl BoundNode {
             dynamo_auth,
             self.tls,
             export_s3,
+            config::OverloadSection::resolve(self.overload.as_ref()),
+            self.mrec.clone(),
         );
         // Adopted into the `StartupTasks` guard so the fallible
         // `check_wal_layout`/`SharedWal::open` steps below are covered too
@@ -6203,10 +6423,20 @@ impl BoundNode {
                 )),
             }
         };
+        // ADR 0073 Phase 2 (P2-C): inject this node's control-fed
+        // `ClusterFeatures` handle (the one `version_wiring_loop` feeds from
+        // the applied view or, on a data-only node, the mirror) before the
+        // first tick, so every hosted group, its heartbeat batcher and its
+        // snapshot images gate on the cluster's real version. Without this
+        // each group would run on a private floor handle forever.
+        reconciler.set_cluster_features(edge.version().features.clone());
         // ADR 0044 phase-1 PR4 production wiring (PR7 layers the
         // `--quiesce-after` CLI flag on top of this same knob):
         // `Duration::ZERO` (every existing call site) disables it entirely —
         // zero behavior change. Data-plane groups only (fork G).
+        // ADR 0075 section 3.4: per-group WAN timing input (inert unless a hosted
+        // tablet's replicas span more than one region label).
+        reconciler.set_max_region_rtt(self.max_region_rtt);
         if !quiesce_after.is_zero() {
             // See `MIN_QUIESCE_AFTER`'s own doc for the full argument. The
             // CLI's own parser is the primary enforcement (a release build
@@ -6379,8 +6609,9 @@ impl BoundNode {
             {
                 let ctx = ctx.clone();
                 let node = my_id;
+                let labels = self.labels.clone();
                 tasks.push(tokio::spawn(async move {
-                    let _ = ctx.admin_add_member(node, BTreeMap::new()).await;
+                    ctx.admin_add_member_until_settled(node, labels).await;
                 }));
             }
         }
@@ -6429,6 +6660,7 @@ impl BoundNode {
         // per-tablet leadership-checked, exactly like `txn_resolver_loop` above
         // — a node that leads no tablet does nothing each tick.
         tasks.push(tokio::spawn(index_drain::change_consumer_loop(ctx.clone())));
+        tasks.push(tokio::spawn(mrec_shipper::mrec_ship_loop(ctx.clone())));
 
         // The TTL reaper (ADR 0051 §4/§6): deletes items whose declared TTL
         // has passed, on every led tablet of a TTL-enabled table. Same
@@ -6729,6 +6961,14 @@ impl Node {
             encryption_key.clone(),
         )
         .await?;
+        // ADR 0073 Phase 2 (P2-C): advertise this binary's version `ext` on
+        // every connection this env dials or accepts from here on. Benign
+        // known race: `bind_with_tls_and_key` already spawned its accept
+        // loop, so a connection accepted in the microseconds before this
+        // line answers with an empty `ext`; an era-on peer refuses it and
+        // simply redials (an `ext` parameter on `ProdEnv::bind*` would close
+        // it, but that is `animus-env`).
+        env.set_own_ext(version_wiring::own_ext());
         // `Arc`-wrapped (issue #1060) — see [`BoundNode::client_listener`]'s
         // own doc for why.
         let client_listener = Arc::new(TcpListener::bind(addrs.client).await?);
@@ -6756,9 +6996,13 @@ impl Node {
             intra_addr,
             console_listener,
             console_addr,
+            max_region_rtt: animus_control::timing::DEFAULT_MAX_REGION_RTT,
+            mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             advertise_host: addrs.advertise_host,
+            labels: addrs.labels,
             tls,
             encryption_key,
+            overload: addrs.overload,
         })
     }
 
@@ -6791,6 +7035,14 @@ impl Node {
             encryption_key.clone(),
         )
         .await?;
+        // ADR 0073 Phase 2 (P2-C): advertise this binary's version `ext` on
+        // every connection this env dials or accepts from here on. Benign
+        // known race: `bind_with_tls_and_key` already spawned its accept
+        // loop, so a connection accepted in the microseconds before this
+        // line answers with an empty `ext`; an era-on peer refuses it and
+        // simply redials (an `ext` parameter on `ProdEnv::bind*` would close
+        // it, but that is `animus-env`).
+        env.set_own_ext(version_wiring::own_ext());
         // `Arc`-wrapped (issue #1060) — see [`BoundNode::client_listener`]'s
         // own doc for why.
         let client_listener = Arc::new(TcpListener::bind(addrs.client).await?);
@@ -6810,9 +7062,13 @@ impl Node {
             admin_addr,
             intra_listener,
             intra_addr,
+            max_region_rtt: animus_control::timing::DEFAULT_MAX_REGION_RTT,
+            mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             advertise_host: addrs.advertise_host,
+            labels: addrs.labels,
             tls,
             encryption_key,
+            overload: addrs.overload,
         })
     }
 
@@ -6846,6 +7102,14 @@ impl Node {
             encryption_key.clone(),
         )
         .await?;
+        // ADR 0073 Phase 2 (P2-C): advertise this binary's version `ext` on
+        // every connection this env dials or accepts from here on. Benign
+        // known race: `bind_with_tls_and_key` already spawned its accept
+        // loop, so a connection accepted in the microseconds before this
+        // line answers with an empty `ext`; an era-on peer refuses it and
+        // simply redials (an `ext` parameter on `ProdEnv::bind*` would close
+        // it, but that is `animus-env`).
+        env.set_own_ext(version_wiring::own_ext());
         // `Arc`-wrapped (issue #1060) — see [`BoundNode::client_listener`]'s
         // own doc for why.
         let client_listener = Arc::new(TcpListener::bind(addrs.client).await?);
@@ -6873,9 +7137,13 @@ impl Node {
             intra_addr,
             console_listener,
             console_addr,
+            max_region_rtt: animus_control::timing::DEFAULT_MAX_REGION_RTT,
+            mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             advertise_host: addrs.advertise_host,
+            labels: addrs.labels,
             tls,
             encryption_key,
+            overload: addrs.overload,
         })
     }
 
@@ -6893,6 +7161,26 @@ impl Node {
     pub fn dynamo_addr(&self) -> SocketAddr {
         self.dynamo_addr
             .expect("dynamo_addr: this node has no data role (ADR 0035 PR3 control-only)")
+    }
+
+    /// This node's own cluster-feature handle (ADR 0073 Phase 2): the single
+    /// per-node handle every gated emitter consults, fed by the version
+    /// feeder. Floor (era off) until the first `Metadata` read.
+    pub fn features(&self) -> animus_control::version::ClusterFeatures {
+        self.edge.version().features.clone()
+    }
+
+    /// The named reason this node must exit (its binary's version range does
+    /// not contain the cluster version), if its feeder latched one.
+    pub fn version_halt_reason(&self) -> Option<String> {
+        self.edge.version().halt.get()
+    }
+
+    /// Resolves with the halt reason once this node's feeder latches one;
+    /// never resolves otherwise. `main` races it against the shutdown
+    /// signal and exits with a named code.
+    pub async fn wait_version_halt(&self) -> String {
+        self.edge.version().halt.wait().await
     }
 
     /// The address the admin / debug HTTP endpoint listens on (ADR 0020).
@@ -7398,15 +7686,43 @@ pub struct BoundControlNode {
     intra_listener: Arc<TcpListener>,
     intra_addr: SocketAddr,
     /// See [`BoundNode::advertise_host`]'s doc.
+    /// ADR 0075 section 3.4: the configured max inter-region round trip, sizing
+    /// the WAN Raft timing profile of every group this node hosts that spans
+    /// more than one region. Defaults to 150 ms; set from
+    /// `cluster_settings.max_region_rtt_ms` via `with_max_region_rtt`.
+    max_region_rtt: Duration,
+    /// MREC peer settings (`cluster_settings.{region,peers,..}`, G-d M3) via `with_mrec`.
+    mrec: Arc<crate::mrec_peer::MrecConfig>,
     advertise_host: Option<String>,
+    /// See [`BoundNode::labels`]'s doc.
+    labels: BTreeMap<String, String>,
     /// This node's TLS material (ADR 0064, S-01 commit 2), loaded once at
     /// bind time from `RoleAddrs::tls` — `None` is plain TCP on every port.
     tls: Option<TlsMaterial>,
     /// See [`BoundNode::encryption_key`]'s doc.
     encryption_key: Option<animus_env::EncryptionKey>,
+    /// This node's overload limits (R-01 (d)), from `RoleAddrs::overload`.
+    overload: Option<config::OverloadSection>,
 }
 
 impl BoundControlNode {
+    /// Set the max inter-region round trip (ADR 0075 section 3.4) — see
+    /// `ClusterSettings::max_region_rtt_ms`. Inert unless some group spans more
+    /// than one `topology.kubernetes.io/region` label value.
+    #[must_use]
+    pub fn with_max_region_rtt(mut self, rtt: Duration) -> Self {
+        self.max_region_rtt = rtt;
+        self
+    }
+
+    /// Install the node's MREC peer settings (`cluster_settings.region`/
+    /// `peers`/`allow_insecure_peers`/`mrec_max_clock_skew_ms`, ADR 0075
+    /// section 4.3, G-d M3): read by the MREC receiver. Default: no MREC.
+    pub(crate) fn with_mrec(mut self, mrec: crate::mrec_peer::MrecConfig) -> Self {
+        self.mrec = Arc::new(mrec);
+        self
+    }
+
     /// The address clients connect to.
     pub fn client_addr(&self) -> SocketAddr {
         self.client_addr
@@ -7625,7 +7941,12 @@ impl BoundControlNode {
         // still lets `propose_schema` (and the client dispatch paths above)
         // propose locally when this node is the control leader.
         let edge = ClusterEdgeState::new();
+        // ADR 0073 Phase 2 (P2-C): the flip, control-only assembly — see
+        // `BoundNode::start_with_growth`'s identical call.
+        version_wiring::apply_profile_to_raft(&raft, &edge.version().profile());
         edge.register_control(raft.clone());
+        // ADR 0075 section 3.4 — see `BoundNode::start_with_growth`'s identical call.
+        raft.enable_region_timing(self.max_region_rtt);
 
         // This node's stream-shard segment store (ADR 0043 §A7b) — see
         // `BoundNode::start_with_streams`'s identical construction; `control`
@@ -7677,6 +7998,7 @@ impl BoundControlNode {
                     intra: advertised_addr(self.advertise_host.as_deref(), self.intra_addr),
                     role: "control".to_string(),
                 },
+                self.labels.clone(),
             ),
             self.client_listener,
             self.admin_listener,
@@ -7692,6 +8014,8 @@ impl BoundControlNode {
             // never serves `ExportTableToPointInTime` either — nothing
             // here would ever call `ClientCtx::export_store_factory`.
             None,
+            config::OverloadSection::resolve(self.overload.as_ref()),
+            self.mrec.clone(),
         );
         startup.extend(common_tail_tasks);
         // No fallible step remains in this assembly past this point (issue
@@ -7835,15 +8159,43 @@ pub struct BoundDataNode {
     console_listener: TcpListener,
     console_addr: SocketAddr,
     /// See [`BoundNode::advertise_host`]'s doc.
+    /// ADR 0075 section 3.4: the configured max inter-region round trip, sizing
+    /// the WAN Raft timing profile of every group this node hosts that spans
+    /// more than one region. Defaults to 150 ms; set from
+    /// `cluster_settings.max_region_rtt_ms` via `with_max_region_rtt`.
+    max_region_rtt: Duration,
+    /// MREC peer settings (`cluster_settings.{region,peers,..}`, G-d M3) via `with_mrec`.
+    mrec: Arc<crate::mrec_peer::MrecConfig>,
     advertise_host: Option<String>,
+    /// See [`BoundNode::labels`]'s doc.
+    labels: BTreeMap<String, String>,
     /// This node's TLS material (ADR 0064, S-01 commit 2), loaded once at
     /// bind time from `RoleAddrs::tls` — `None` is plain TCP on every port.
     tls: Option<TlsMaterial>,
     /// See [`BoundNode::encryption_key`]'s doc.
     encryption_key: Option<animus_env::EncryptionKey>,
+    /// This node's overload limits (R-01 (d)), from `RoleAddrs::overload`.
+    overload: Option<config::OverloadSection>,
 }
 
 impl BoundDataNode {
+    /// Set the max inter-region round trip (ADR 0075 section 3.4) — see
+    /// `ClusterSettings::max_region_rtt_ms`. Inert unless some group spans more
+    /// than one `topology.kubernetes.io/region` label value.
+    #[must_use]
+    pub fn with_max_region_rtt(mut self, rtt: Duration) -> Self {
+        self.max_region_rtt = rtt;
+        self
+    }
+
+    /// Install the node's MREC peer settings (`cluster_settings.region`/
+    /// `peers`/`allow_insecure_peers`/`mrec_max_clock_skew_ms`, ADR 0075
+    /// section 4.3, G-d M3): read by the MREC receiver. Default: no MREC.
+    pub(crate) fn with_mrec(mut self, mrec: crate::mrec_peer::MrecConfig) -> Self {
+        self.mrec = Arc::new(mrec);
+        self
+    }
+
     /// The address clients connect to.
     pub fn client_addr(&self) -> SocketAddr {
         self.client_addr
@@ -8082,9 +8434,7 @@ impl BoundDataNode {
 
         let control = ControlHandle::Remote(RemoteControlClient::new(
             control_seeds.clone(),
-            AnimusdRelayClient {
-                tls: self.tls.clone(),
-            },
+            AnimusdRelayClient::new(self.tls.clone(), edge.version().features.clone()),
             CLIENT_TIMEOUT,
         ));
 
@@ -8202,6 +8552,7 @@ impl BoundDataNode {
                     intra: advertised_addr(self.advertise_host.as_deref(), my_intra_addr),
                     role: "data".to_string(),
                 },
+                self.labels.clone(),
             ),
             self.client_listener,
             self.admin_listener,
@@ -8219,6 +8570,8 @@ impl BoundDataNode {
             // this entry point) — a data-only node's own export factory
             // stays the "not configured" default until this is wired.
             None,
+            config::OverloadSection::resolve(self.overload.as_ref()),
+            self.mrec.clone(),
         );
         // Adopted into the `StartupTasks` guard so the fallible
         // `check_wal_layout`/`SharedWal::open` steps below are covered too
@@ -8268,11 +8621,21 @@ impl BoundDataNode {
                 )),
             }
         };
+        // ADR 0073 Phase 2 (P2-C): inject this node's control-fed
+        // `ClusterFeatures` handle (the one `version_wiring_loop` feeds from
+        // the applied view or, on a data-only node, the mirror) before the
+        // first tick, so every hosted group, its heartbeat batcher and its
+        // snapshot images gate on the cluster's real version. Without this
+        // each group would run on a private floor handle forever.
+        reconciler.set_cluster_features(edge.version().features.clone());
         // ADR 0044 phase-1 / ADR 0048 (S-06 closes the documented gap this
         // path used to have): identical contract to `BoundNode::
         // start_with_growth`'s own quiescence gate above — `Duration::ZERO`
         // (every pre-S-06 call site) disables it entirely, zero behavior
         // change.
+        // ADR 0075 section 3.4: per-group WAN timing input (inert unless a hosted
+        // tablet's replicas span more than one region label).
+        reconciler.set_max_region_rtt(self.max_region_rtt);
         if !quiesce_after.is_zero() {
             // Two asserts, not one — identical contract/rationale to
             // `BoundNode::start_with_growth`'s own gate above: the
@@ -8364,8 +8727,9 @@ impl BoundDataNode {
         {
             let ctx = ctx.clone();
             let node = my_id;
+            let labels = self.labels.clone();
             tasks.push(tokio::spawn(async move {
-                let _ = ctx.admin_add_member(node, BTreeMap::new()).await;
+                ctx.admin_add_member_until_settled(node, labels).await;
             }));
         }
 
@@ -8390,6 +8754,7 @@ impl BoundDataNode {
         // per-tablet leadership-checked, exactly like `txn_resolver_loop` above
         // — a node that leads no tablet does nothing each tick.
         tasks.push(tokio::spawn(index_drain::change_consumer_loop(ctx.clone())));
+        tasks.push(tokio::spawn(mrec_shipper::mrec_ship_loop(ctx.clone())));
 
         // The TTL reaper (ADR 0051 §4/§6) — same shape as the GSI drain
         // just above. No test-tunable interval knob on this data-only path
@@ -8569,6 +8934,13 @@ pub struct ClusterEdgeState<E: Env = ProdEnv> {
     /// security hole, since the gate still runs whenever `ctx.dynamo_auth`
     /// is configured regardless of this flag.
     has_catalog_credentials: Arc<std::sync::atomic::AtomicBool>,
+    /// This node's own ADR 0073 Phase 2 version state: its `ClusterFeatures`
+    /// handle (the one per-node handle every gated emitter consults), its own
+    /// version profile (range + build) and the halt cell the process exit
+    /// waits on. Lives here, not on `ClientCtx`, so every construction site
+    /// that already builds one `ClusterEdgeState` per node gets it with zero
+    /// struct-literal fan-out. Fed by `version_wiring::version_wiring_loop`.
+    version: version_wiring::VersionState,
 }
 
 impl<E: Env> Default for ClusterEdgeState<E> {
@@ -8585,7 +8957,14 @@ impl<E: Env> ClusterEdgeState<E> {
             dynamo_registry: Arc::new(Mutex::new(animus_dynamo::SchemaRegistry::new())),
             raftkv: Arc::new(Mutex::new(BTreeMap::new())),
             has_catalog_credentials: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            version: version_wiring::VersionState::default(),
         }
+    }
+
+    /// This node's version state (ADR 0073 Phase 2): `version().features` is
+    /// the per-node `ClusterFeatures` handle.
+    pub(crate) fn version(&self) -> &version_wiring::VersionState {
+        &self.version
     }
 
     /// The current best-effort answer to "does the replicated credential
@@ -11188,6 +11567,10 @@ struct DataRole {
 /// than inventing a new one.
 #[derive(Clone)]
 pub(crate) struct ClientCtx<E: Env = ProdEnv, R: RelayClient = AnimusdRelayClient> {
+    /// This node's MREC peer settings and receiver concurrency gauge (ADR 0075
+    /// section 4.3, G-d M3). Default (no region, no peers) outside a
+    /// configured production node.
+    pub(crate) mrec: Arc<crate::mrec_peer::MrecConfig>,
     control: GenericControlHandle<E, R>,
     pub(crate) edge: ClusterEdgeState<E>,
     /// This node's one internal `ProdEnv` (ADR 0040 PR1) — every role's
@@ -11448,6 +11831,10 @@ pub(crate) struct ClientCtx<E: Env = ProdEnv, R: RelayClient = AnimusdRelayClien
     /// applied/fetched — never guessed from the request that triggered it.
     /// `Arc`-shared for the same reason `throttle_defaults` is.
     any_table_throughput: Arc<std::sync::atomic::AtomicBool>,
+    /// R-01 (d), ADR 0074 §2: this node's connection caps and in-flight
+    /// request bound (see [`overload`]). `Arc`-backed atomics inside, so
+    /// every per-connection clone shares one set of counters.
+    pub(crate) overload: overload::OverloadState,
 }
 
 impl<E: Env, R: RelayClient> ClientCtx<E, R> {
@@ -11581,6 +11968,22 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     // `ok_or_err` moved to [`decide::ok_or_err`] (ADR 0061 A6) — a plain
     // `ClientResponse -> Result` map with nothing to gather from `self`.
 
+    /// The sink this node's metrics are **exported** from (what
+    /// [`metrics_text`](Self::metrics_text)/[`metrics_json`](Self::metrics_json)
+    /// read): the data role's sink when there is one, else the control
+    /// handle's (a data-only node's control handle is a permanent no-op, a
+    /// control-only node has no data role). A combined node's two are the
+    /// same sink. Metrics that no `Env`-level recorder owns (the ADR 0073
+    /// gate levels and the relay-refusal counter) record here, so they are
+    /// exported identically under `ProdEnv` and `SimEnv`, whose
+    /// `env.metrics()` are not the exported sinks.
+    pub(crate) fn exported_metrics(&self) -> MetricsHandle {
+        match &self.data {
+            Some(data) => data.raftkv_metrics.clone(),
+            None => self.control.metrics().clone(),
+        }
+    }
+
     /// Render this node's **live** metrics as the ADR 0015 text export
     /// (`name value` lines), aggregated across the node's role sink(s).
     ///
@@ -11596,6 +11999,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// activity rather than a cached value.
     pub(crate) fn metrics_text(&self) -> String {
         self.env.refresh_inbox_metrics();
+        version_wiring::export_gate_metrics(
+            &self.edge.version().features,
+            &self.exported_metrics(),
+        );
         let mut snaps = vec![self.control.metrics().snapshot()];
         if let Some(data) = &self.data
             && !data.raftkv_metrics.is_same_sink(self.control.metrics())
@@ -11631,6 +12038,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// sink(s), exactly as the text export.
     pub(crate) fn metrics_json(&self) -> (BTreeMap<String, u64>, i64) {
         self.env.refresh_inbox_metrics();
+        version_wiring::export_gate_metrics(
+            &self.edge.version().features,
+            &self.exported_metrics(),
+        );
         let mut snaps = vec![self.control.metrics().snapshot()];
         if let Some(data) = &self.data
             && !data.raftkv_metrics.is_same_sink(self.control.metrics())
@@ -11779,7 +12190,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// this requires the receiving node to be the control leader; a follower
     /// returns an error and the operator retries on the leader). Preserves the
     /// member's existing labels. Returns the accepted state or an error.
-    pub(crate) fn admin_drain(&self, node: NodeId) -> Result<(), String> {
+    /// Refuses (unless `force`) to drain the last Active member of a Region a
+    /// global table pins — see [`global_tables::drain_strands_region`].
+    pub(crate) fn admin_drain(&self, node: NodeId, force: bool) -> Result<(), String> {
         // Check leadership BEFORE reading `self.control.metadata_cached()`
         // for the member lookup below (ADR 0035 PR5 staleness-audit fix,
         // mirroring `admin_remove_member`'s already-fixed ordering — same
@@ -11795,6 +12208,14 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         let Some(member) = meta.members.get(&node) else {
             return Err(format!("node {node} is not a cluster member"));
         };
+        // Decommission guard (ADR 0075 plan D10): the last Active member of a
+        // Region a global table pins cannot be drained (the strict region pin
+        // would never re-place its replica) unless forced.
+        if !force && let Some((region, table)) = global_tables::drain_strands_region(&meta, &node) {
+            return Err(global_tables::drain_strands_region_error(
+                &node, &region, &table,
+            ));
+        }
         let labels = member.labels.clone();
         match leader.propose(MetaCommand::UpsertMember {
             node,
@@ -12049,6 +12470,32 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             }
             return Ok(node);
         }
+
+        // ADR 0075 section 3.4: refuse a voter set that would put a strict
+        // majority of control voters in one region (a no-op on an unlabelled or
+        // single-region cluster). Checked before any registration side effect so
+        // a refusal leaves nothing half-done.
+        {
+            let mut after = current.clone();
+            after.insert(node.clone());
+            animus_control::timing::control_voter_change_check(
+                &self.control.metadata_cached(),
+                &current,
+                &after,
+                Some((&node, &labels)),
+            )
+            .map_err(|e| format!("refusing to add control voter {node}: {e}"))?;
+        }
+        // ADR 0073 Phase 2 (P2-C): once the version era is on, refuse a voter
+        // whose version range is unknown (a Phase 1 binary) or excludes the
+        // cluster version, by name, before anything is registered or
+        // proposed. Pre-era: no check.
+        version_wiring::check_member_admission(
+            &leader.metadata(),
+            &leader.version_observations(),
+            self.env.now(),
+            &node,
+        )?;
 
         // **Issue #406/#450 (Bug B), read-your-writes barrier.** This
         // leader's own `metadata_cached()` is gated on its own async apply
@@ -12307,6 +12754,18 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         }
         let remaining: BTreeSet<NodeId> =
             current.iter().filter(|&id| *id != node).cloned().collect();
+        // ADR 0075 section 3.4: same region-majority guard as the add path;
+        // `--force` bypasses it (it can leave a region-concentrated quorum, so
+        // it must be explicit).
+        if !force {
+            animus_control::timing::control_voter_change_check(
+                &self.control.metadata_cached(),
+                &current,
+                &remaining,
+                None,
+            )
+            .map_err(|e| format!("refusing to remove control voter {node}: {e}; retry with --force to remove anyway"))?;
+        }
         // Liveness-aware quorum-loss guard (ADR 0037 hardening PR2). The
         // original ADR 0037 guard counted only the *resulting* voter count
         // (refuse `< 1`, warn `== 1`) — which looks complete but misses the
@@ -12456,6 +12915,228 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// `admin_remove_control_member`'s own self-removal arm polls against —
     /// a transfer that never completes in time surfaces as its own,
     /// distinct timeout error rather than a bare "not the leader" refusal.
+    /// `GET /admin/cluster-version` body (ADR 0073 Phase 2, P2-C): served by
+    /// any node from its own view of `Metadata`; the control leader also
+    /// reports its live observation table (`observed_range`), every other
+    /// node reports `null` there.
+    pub(crate) fn admin_cluster_version_view(&self) -> serde_json::Value {
+        let meta = self.effective_metadata();
+        let observed = self.edge.leader_handle().map(|l| l.version_observations());
+        let health = self.roll_health_verdict(&meta);
+        version_wiring::cluster_version_view(
+            &meta,
+            &self.edge.version().profile(),
+            observed.as_ref(),
+            self.control.leader().as_ref(),
+            Some(&health),
+        )
+    }
+
+    /// The ADR 0073 Phase 3 D2 verdict from this node's own view (see
+    /// [`roll_health`]): replicated `Metadata`, the control group's liveness,
+    /// and this node's hosted groups. Shared by `GET /admin/roll-health` and
+    /// the `roll.health` field of `GET /admin/cluster-version`.
+    pub(crate) fn roll_health_verdict(&self, meta: &Metadata) -> roll_health::RollHealth {
+        let r = &self.control;
+        let grace = r.election_timeout() * admin::HEALTH_LEADER_GRACE_ELECTION_TIMEOUTS;
+        let voters = r.config();
+        // Reachability is observable only on the control leader (a follower's
+        // contact table is empty); elsewhere a recent leader is the evidence.
+        let reachable = match (r, &voters) {
+            (animus_node::control_handle::ControlHandle::Local(raft), Some(v))
+                if raft.is_leader() =>
+            {
+                Some(
+                    v.iter()
+                        .filter(|id| raft.control_peer_believed_alive((*id).clone()))
+                        .count(),
+                )
+            }
+            _ => None,
+        };
+        let control = roll_health::ControlView {
+            voters: voters.as_ref().map(|v| v.len()),
+            reachable,
+            leader_recent: r.leader_within(grace).is_some(),
+        };
+        let local = roll_health::LocalView {
+            node: self.env.node_id(),
+            groups: self
+                .edge
+                .hosted_groups()
+                .iter()
+                .map(|(t, g)| g.roll_group(*t))
+                .collect(),
+        };
+        roll_health::roll_health(meta, &control, &local)
+    }
+
+    /// `POST /admin/cluster-version/finalize` (ADR 0073 Phase 2, P2-C):
+    /// raise the cluster version by exactly one. **Local-control-leader-only,
+    /// not relayed** (the ADR 0037 `admin_remove_member` pattern; Finalize is
+    /// irreversible, so it is deliberately not reachable through the generic
+    /// relay): leadership is checked FIRST (a follower's replica lags, so any
+    /// metadata-dependent refusal there would be a false answer), then the
+    /// era, the one-step rule, the `expected` CAS and the blockers, computed
+    /// from the leader's own `Metadata`. `Accepted` only means appended, so
+    /// success is confirmed by observing the cluster version reach `target`
+    /// (the CAS target, unambiguous).
+    pub(crate) async fn admin_finalize_cluster_version(
+        &self,
+        to: Option<u32>,
+        expected: Option<u32>,
+    ) -> (u16, serde_json::Value) {
+        let Some(leader) = self.edge.leader_handle() else {
+            return (409, serde_json::json!({"error": self.not_leader_error()}));
+        };
+        // Issue #406 pattern: the leader's `metadata()` is the apply-task
+        // cache, which can lag a just-elected leader's own committed log.
+        // Bounded converged-or-timeout wait for it to catch up before any
+        // metadata-dependent refusal (or the blockers) is computed from it.
+        {
+            let deadline = self.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
+            loop {
+                if leader.engine_applied_index() >= leader.commit_index() {
+                    break;
+                }
+                if self.env.now() >= deadline {
+                    return (
+                        503,
+                        serde_json::json!({"error": "control leader's metadata has not caught up \
+                            with its committed log (apply lag); retry the finalize"}),
+                    );
+                }
+                self.env.sleep(SCHEMA_POLL_INTERVAL).await;
+            }
+        }
+        let meta = leader.metadata();
+        if !meta.versioning_active() {
+            return (
+                409,
+                serde_json::json!({"error": "version era not active: not every member has reported its version yet"}),
+            );
+        }
+        let active = meta.cluster_version();
+        let target = active + 1;
+        if let Some(to) = to
+            && to != target
+        {
+            return (
+                400,
+                serde_json::json!({"error": format!(
+                    "the cluster version is raised one step at a time: the next version is \
+                     {target} (requested {to})"
+                )}),
+            );
+        }
+        if let Some(expected) = expected
+            && expected != active
+        {
+            return (
+                409,
+                serde_json::json!({"error": format!(
+                    "expected cluster version {expected} but the active version is {active}"
+                )}),
+            );
+        }
+        let own = self
+            .edge
+            .version()
+            .profile()
+            .range
+            .unwrap_or_else(animus_control::version::own_range);
+        if target > own.max {
+            return (
+                409,
+                serde_json::json!({"error": format!(
+                    "this binary supports cluster versions up to {} and cannot finalize {target}",
+                    own.max
+                )}),
+            );
+        }
+        // ADR 0073 decision 6: Down / Leaving / never-activated Joining
+        // members block regardless of any recorded range. `Metadata::apply`
+        // does NOT enforce the status half, so this admin pre-check (racy,
+        // operator-level) is its only enforcement today; apply-level
+        // enforcement is tracked in issue #1168.
+        let blockers = version_wiring::finalize_blockers(&meta, target);
+        if !blockers.is_empty() {
+            let named: Vec<String> = blockers
+                .iter()
+                .map(|b| format!("{}: {}", b.node, b.reason))
+                .collect();
+            return (
+                409,
+                serde_json::json!({
+                    "error": format!(
+                        "cannot finalize cluster version {target}: {}",
+                        named.join("; ")
+                    ),
+                    "blockers": blockers
+                        .iter()
+                        .map(|b| serde_json::json!({"node": b.node.to_string(), "reason": b.reason}))
+                        .collect::<Vec<_>>(),
+                }),
+            );
+        }
+        // A different finalize may have landed between the reads above and
+        // now: name that instead of proposing (and later mistaking its
+        // result for ours).
+        let now_active = leader.metadata().cluster_version();
+        if now_active != active {
+            return (
+                409,
+                serde_json::json!({"error": format!(
+                    "the cluster version is already {now_active} (another finalize landed \
+                     first); nothing was proposed"
+                )}),
+            );
+        }
+        let ProposeResult::Accepted { index, .. } =
+            leader.propose(MetaCommand::FinalizeClusterVersion {
+                expected: active,
+                target,
+            })
+        else {
+            return (409, serde_json::json!({"error": self.not_leader_error()}));
+        };
+        let deadline = self.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
+        loop {
+            if leader.metadata().cluster_version() >= target {
+                return (200, serde_json::json!({"ok": true, "active": target}));
+            }
+            // The apply task has merged past our entry's index yet the
+            // version did not move: the entry was applied-and-rejected by
+            // `Metadata::apply` (its own preconditions: era, expected CAS,
+            // ranges) or displaced by a leadership change. `apply`'s
+            // rejection reason is not surfaced to proposers.
+            if leader.engine_applied_index() >= index
+                && leader.metadata().cluster_version() < target
+            {
+                return (
+                    409,
+                    serde_json::json!({"error": format!(
+                        "finalize of cluster version {target} was rejected at apply (the \
+                         entry was applied but the cluster version did not move; its \
+                         preconditions no longer held, or leadership changed). Re-read \
+                         GET /admin/cluster-version before retrying"
+                    )}),
+                );
+            }
+            if self.env.now() >= deadline {
+                return (
+                    504,
+                    serde_json::json!({"error": format!(
+                        "finalize of cluster version {target} was not confirmed within {}s \
+                         (re-read GET /admin/cluster-version before retrying)",
+                        SCHEMA_COMMIT_TIMEOUT.as_secs()
+                    )}),
+                );
+            }
+            self.env.sleep(SCHEMA_POLL_INTERVAL).await;
+        }
+    }
+
     pub(crate) async fn admin_transfer_control_leadership(
         &self,
         target: NodeId,
@@ -13122,9 +13803,7 @@ async fn remote_metadata_sync_loop(ctx: ClientCtx, seeds: Vec<String>) {
     let remote = RemoteControlClient::with_mirror(
         seeds.clone(),
         ctx.remote_metadata.clone(),
-        AnimusdRelayClient {
-            tls: ctx.tls.clone(),
-        },
+        AnimusdRelayClient::new(ctx.tls.clone(), ctx.edge.version().features.clone()),
         CLIENT_TIMEOUT,
     );
     remote_metadata_watch_loop(remote, seeds).await
@@ -13557,6 +14236,14 @@ impl CpReconciler {
         }
     }
 
+    /// ADR 0075 section 3.4 — see [`Reconciler::set_max_region_rtt`]'s doc.
+    fn set_max_region_rtt(&mut self, rtt: Duration) {
+        match self {
+            CpReconciler::Lsm(r) => r.set_max_region_rtt(rtt),
+            CpReconciler::Mem(r) => r.set_max_region_rtt(rtt),
+        }
+    }
+
     /// ADR 0044 phase 2 (C-02 PR 2) production wiring — see
     /// [`Reconciler::enable_heartbeat_batching`]'s doc.
     fn enable_heartbeat_batching(&mut self) {
@@ -13572,6 +14259,17 @@ impl CpReconciler {
         match self {
             CpReconciler::Lsm(r) => r.enable_shared_wal(shared),
             CpReconciler::Mem(r) => r.enable_shared_wal(shared),
+        }
+    }
+
+    /// ADR 0073 Phase 2 (P2-C) — see [`Reconciler::set_cluster_features`]'s
+    /// doc: every hosted group (and the heartbeat batcher) gates its wire
+    /// frames, snapshot images and proposals on this node's control-fed
+    /// handle.
+    fn set_cluster_features(&mut self, features: animus_control::version::ClusterFeatures) {
+        match self {
+            CpReconciler::Lsm(r) => r.set_cluster_features(features),
+            CpReconciler::Mem(r) => r.set_cluster_features(features),
         }
     }
 
@@ -13752,12 +14450,45 @@ async fn tablet_host_reconciler_loop(ctx: ClientCtx, mut reconciler: CpReconcile
             .map(|(id, _)| id.clone())
             .collect();
         inplace_split_active = meta.tablets.values().any(|t| t.inplace_split.is_some());
+        let regions =
+            animus_control::timing::region_map(meta.members.iter().map(|(id, m)| (id, &m.labels)));
+        let preferred_leader = leader_preferences(&meta);
         let view = MetadataView {
             tablets: meta.tablets,
             down,
+            regions,
+            preferred_leader,
         };
         reconciler.tick(&view).await;
     }
+}
+
+/// Every tablet of a **global (MRSC) table** -> its leader preference (ADR 0075
+/// section 3.3, 3.6), derived from `TableSchema.global` x `Tablet.table`, for
+/// the tablet-host reconciler's preferred-leader step. A table's preference
+/// follows its splits for free (a child carries the same `Tablet.table`). Empty
+/// for a cluster with no global table.
+pub(crate) fn leader_preferences(
+    meta: &animus_control::Metadata,
+) -> std::collections::BTreeMap<animus_tablet::TabletId, animus_cp_data::host::LeaderPreference> {
+    meta.tablets
+        .iter()
+        .filter_map(|(id, t)| {
+            let g = meta
+                .schemas
+                .get(t.table.as_deref()?)?
+                .global
+                .as_ref()
+                .filter(|g| g.is_mrsc())?;
+            Some((
+                *id,
+                animus_cp_data::host::LeaderPreference {
+                    region: g.preferred_leader_region.clone(),
+                    witness: g.witness.clone(),
+                },
+            ))
+        })
+        .collect()
 }
 
 /// How often [`txn_resolver_loop`] sweeps this node's locally-led tablet
@@ -14627,20 +15358,42 @@ async fn serve_requests(
     ctx: ClientCtx,
     listener: ListenerKind,
     tls: Option<tokio_rustls::TlsAcceptor>,
+    // The TLS material whose `classify_peer` splits own-CA from peer-region
+    // client certificates (issue #1253); `Some` only for the mutual `intra`
+    // listener.
+    classify: Option<animus_env::TlsMaterial>,
 ) {
     let mut handlers: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    // R-01 (d), ADR 0074 §2: this listener serves peers and the CLI, speaks a
+    // framed protocol rather than HTTP, and a peer reconnects on its own — so
+    // an over-cap connection is simply closed (no response to write).
+    let gate = overload::CountGate::new(ctx.overload.limits.max_peer_connections);
     loop {
         tokio::select! {
             accepted = listener_socket.accept() => {
                 match accepted {
                     Ok((stream, peer_addr)) => {
+                        let Some(conn_permit) = gate.try_acquire() else {
+                            ctx.overload.metrics.incr(Metric::OverloadShedPeerConnCap);
+                            tracing::warn!(%peer_addr, ?listener, "peer connection refused: at max_peer_connections");
+                            drop(stream);
+                            continue;
+                        };
                         let ctx = ctx.clone();
                         let tls = tls.clone();
+                        let classify = classify.clone();
                         handlers.spawn(async move {
+                            let _conn_permit = conn_permit;
+                            let mut trust = animus_env::PeerTrust::Own;
                             let stream = match tls {
                                 None => MaybeTlsStream::Plain(stream),
                                 Some(acceptor) => match acceptor.accept(stream).await {
-                                    Ok(s) => MaybeTlsStream::Tls(Box::new(s.into())),
+                                    Ok(s) => {
+                                        if let Some(material) = &classify {
+                                            trust = material.classify_peer(s.get_ref().1.peer_certificates());
+                                        }
+                                        MaybeTlsStream::Tls(Box::new(s.into()))
+                                    }
                                     Err(err) => {
                                         tracing::warn!(
                                             ?err,
@@ -14652,18 +15405,31 @@ async fn serve_requests(
                                 },
                             };
                             let mut stream = stream;
+                            // ADR 0073 Phase 2 (P2-C): advertise this node's
+                            // own version `ext`; once the era is on, refuse an
+                            // empty-`ext` (Phase 1) peer on the INTRA port
+                            // only. Never the client port: `animus-cli` and
+                            // external clients are not members and dial with
+                            // an empty `ext`.
+                            let version = ctx.edge.version();
+                            let profile = version.profile();
+                            let own_ext = version_wiring::ext_for(profile.range, &profile.build);
+                            let require_peer_ext = listener == ListenerKind::Intra
+                                && version.features.era_active();
                             if perform_client_handshake(
                                 &mut stream,
                                 "accept",
                                 &peer_addr.to_string(),
                                 &ctx.env.metrics(),
+                                &own_ext,
+                                require_peer_ext,
                             )
                             .await
                             .is_err()
                             {
                                 return; // already logged/counted by perform_client_handshake
                             }
-                            if let Err(err) = handle_connection(stream, ctx, listener).await {
+                            if let Err(err) = handle_connection(stream, ctx, listener, trust).await {
                                 tracing::debug!(?err, "connection closed");
                             }
                         });
@@ -14776,6 +15542,7 @@ async fn handle_connection(
     stream: MaybeTlsStream,
     ctx: ClientCtx,
     listener: ListenerKind,
+    trust: animus_env::PeerTrust,
 ) -> std::io::Result<()> {
     // Split so the read half can be raced against the in-flight handler
     // (issue #596) while the write half stays free for the eventual reply —
@@ -14792,6 +15559,22 @@ async fn handle_connection(
         let Some(request) = read_frame::<ClientRequest, _>(&mut read_half).await? else {
             return Ok(());
         };
+        // Issue #1253: a connection admitted only through the peer-region CA
+        // bundle may send the MREC replication frame and nothing else.
+        if trust == animus_env::PeerTrust::PeerRegionOnly && !peer_region_may_send(&request) {
+            ctx.env.metrics().incr(Metric::PeerRegionRequestRefused);
+            tracing::warn!(
+                request = request_kind(&request),
+                ?listener,
+                "peer-region certificate sent a non-MREC request (refused)"
+            );
+            let response = ClientResponse::Error(format!(
+                "{} is not permitted for a peer-region certificate (only mrec_apply)",
+                request_kind(&request)
+            ));
+            write_frame_gated(&mut write_half, &response, &ctx.edge.version().features).await?;
+            continue;
+        }
         // Every accepted request is a root span (ADR 0027): this is what gives
         // `otel::current_traceparent()` something to inject if the request's
         // handling ends up forwarding to another node (`cp_forward`), and what
@@ -14828,7 +15611,11 @@ async fn handle_connection(
                 return Ok(());
             }
         };
-        write_frame(&mut write_half, &response).await?;
+        // ADR 0073 Phase 2 (P2-C): every reply goes out through the node's own
+        // gated encoder (a `ClientResponse` is `Base` today, so this changes
+        // no byte; a future gated variant cannot reach a peer that cannot
+        // decode it).
+        write_frame_gated(&mut write_half, &response, &ctx.edge.version().features).await?;
     }
 }
 
@@ -14842,6 +15629,7 @@ fn request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::KindWrite { .. } => "kind_write",
         ClientRequest::KindWriteItem { .. } => "kind_write_item",
         ClientRequest::KindWriteBatch { .. } => "kind_write_batch",
+        ClientRequest::MrecApply(_) => "mrec_apply",
         ClientRequest::CpLeaderHintProbe { .. } => "cp_leader_hint_probe",
         ClientRequest::KindScan { .. } => "kind_scan",
         ClientRequest::ForceSeal { .. } => "force_seal",
@@ -15003,6 +15791,10 @@ async fn handle_request(
             client_route: ctx.route_snapshot(),
             intra_route: ctx.intra_route_snapshot(),
             admin_addrs: ctx.admin.admin_addrs.clone(),
+            // ADR 0073 Phase 2 (P2-C): the raw cluster version (0 = era off,
+            // so pre-era bytes equal Phase 1's); lets a joiner refuse an
+            // out-of-range cluster before claiming anything.
+            cluster_version: ctx.effective_metadata().cluster_version,
         },
         // Long-poll metadata watch (ADR 0035 PR5) — see `ClientCtx::
         // watch_metadata`'s doc.
@@ -15060,6 +15852,14 @@ async fn handle_request(
              in `Forwarded`"
                 .into(),
         ),
+        // ADR 0075 G-d M3: a peer cluster's MREC replication batch. Intra-only
+        // (`surface_of`, refused on the client listener by the guard above),
+        // received **bare** — it is the one request here that is not wrapped in
+        // `Forwarded`, because a peer cluster has no cluster-internal route to
+        // the tablet leader; the receiver routes it itself.
+        ClientRequest::MrecApply(req) => {
+            ClientResponse::MrecApply(mrec_receiver::handle_mrec_apply(ctx, &ctx.mrec, req).await)
+        }
         // Issue #996 layer 2: the batched evaluate-at-leader write RPC,
         // refused bare for the identical reason `KindWriteItem` just above
         // is — see `ClientRequest::KindWriteBatch`'s own doc. Real handling
@@ -15284,6 +16084,8 @@ pub async fn bind_cluster_with_advertise_host_and_key(
             advertise_host: advertise_host.clone(),
             tls: None,
             encryption_key_path: encryption_key_path.clone(),
+            labels: Default::default(),
+            overload: None,
         };
         let node = Node::bind(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?;
         nodes.push(node);
@@ -15888,6 +16690,8 @@ pub async fn start_split_cluster_with_growth(
             advertise_host: None,
             tls: None,
             encryption_key_path: None,
+            labels: Default::default(),
+            overload: None,
         };
         control_bound.push(
             Node::bind_control(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?,
@@ -15907,6 +16711,8 @@ pub async fn start_split_cluster_with_growth(
             advertise_host: None,
             tls: None,
             encryption_key_path: None,
+            labels: Default::default(),
+            overload: None,
         };
         data_bound
             .push(Node::bind_data(config::node_id(i), addrs, dir.join(format!("node-{i}"))).await?);
@@ -16457,7 +17263,13 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
     // — this node can never see itself as a member of its own genesis
     // config, so it never campaigns and the group never elects a leader. See
     // `docs/engineering-lessons.md` for the incident this fixes.
-    let bound = Node::bind(addrs.id.clone(), addrs, dir).await?;
+    let bound = Node::bind(addrs.id.clone(), addrs, dir)
+        .await?
+        .with_max_region_rtt(config.max_region_rtt())
+        .with_mrec(
+            crate::mrec_peer::MrecConfig::from_cluster(config)
+                .with_node_tls(config.nodes.get(index).and_then(|n| n.tls.clone())),
+        );
     start_bound_node_with_streams_quiesce_and_ttl_sweep_interval(
         bound,
         config,
@@ -16601,6 +17413,13 @@ pub async fn start_bound_node_with_streams_quiesce_and_ttl_sweep_interval(
         .dynamo_auth
         .as_ref()
         .map(|cfg| Arc::new(cfg.credentials.clone()));
+    // The MREC peer settings (G-d M3): `Node::bind` has no config, so the
+    // start half installs them like every other `run_node*` entry point does
+    // (`tests/mrec_peer_transport.rs` caught the bound path missing them).
+    let bound = bound.with_mrec(
+        crate::mrec_peer::MrecConfig::from_cluster(config)
+            .with_node_tls(config.nodes.get(index).and_then(|n| n.tls.clone())),
+    );
     bound
         .start_with_growth(
             config.peer_book(),
@@ -16839,7 +17658,13 @@ pub async fn run_node_control_with_stores(
     // See `run_node_with_streams_quiesce_and_ttl_sweep_interval`'s matching
     // comment: the node's own identity must be `addrs.id`, not the unrelated
     // `config::node_id(index)` minting convention.
-    let bound = Node::bind_control(addrs.id.clone(), addrs, dir).await?;
+    let bound = Node::bind_control(addrs.id.clone(), addrs, dir)
+        .await?
+        .with_max_region_rtt(config.max_region_rtt())
+        .with_mrec(
+            crate::mrec_peer::MrecConfig::from_cluster(config)
+                .with_node_tls(config.nodes.get(index).and_then(|n| n.tls.clone())),
+        );
 
     // Cross-node routing (ADR 0017 #3b / ADR 0013): map every node's id to
     // its client API address, so a data op or a schema-DDL relay landing on
@@ -17062,7 +17887,13 @@ pub async fn run_node_data_with_cluster_settings(
     // See `run_node_with_streams_quiesce_and_ttl_sweep_interval`'s matching
     // comment: the node's own identity must be `addrs.id`, not the unrelated
     // `config::node_id(index)` minting convention.
-    let bound = Node::bind_data(addrs.id.clone(), addrs, dir).await?;
+    let bound = Node::bind_data(addrs.id.clone(), addrs, dir)
+        .await?
+        .with_max_region_rtt(config.max_region_rtt())
+        .with_mrec(
+            crate::mrec_peer::MrecConfig::from_cluster(config)
+                .with_node_tls(config.nodes.get(index).and_then(|n| n.tls.clone())),
+        );
 
     // The control deployment's **intra**-cluster addresses (ADR 0047) — the
     // mirror/leader-hint discovery root (ADR 0035 §1/§4; `WatchMetadata` is
@@ -17191,7 +18022,13 @@ pub async fn run_node_growth(
     // See `run_node_with_streams_quiesce_and_ttl_sweep_interval`'s matching
     // comment: the node's own identity must be `addrs.id`, not the unrelated
     // `config::node_id(index)` minting convention.
-    let bound = Node::bind(addrs.id.clone(), addrs, dir).await?;
+    let bound = Node::bind(addrs.id.clone(), addrs, dir)
+        .await?
+        .with_max_region_rtt(config.max_region_rtt())
+        .with_mrec(
+            crate::mrec_peer::MrecConfig::from_cluster(config)
+                .with_node_tls(config.nodes.get(index).and_then(|n| n.tls.clone())),
+        );
     let mut client_route: BTreeMap<NodeId, String> = BTreeMap::new();
     for (i, addrs) in config.nodes.iter().enumerate() {
         client_route.insert(
@@ -17256,10 +18093,14 @@ const JOIN_DISCOVERY_BUDGET: Duration = SCHEMA_COMMIT_TIMEOUT;
 /// helper's own doc names, so pipelining the handshake with the request
 /// frame here saves one round trip per attempt.
 async fn join_request(seeds: &[String], request: &ClientRequest) -> Option<ClientResponse> {
+    // A joiner has no `Metadata` yet, so it sends at the **floor** (every era
+    // and version gate closed): its requests are `Status`/`JoinInfo` and the
+    // `RegisterNode` registration, all `Base`.
+    let floor = animus_control::version::ClusterFeatures::new();
     for addr in seeds {
         let reply = tokio::time::timeout(JOIN_ATTEMPT_TIMEOUT, async {
             let mut stream = TcpStream::connect(addr.as_str()).await.ok()?;
-            client_request_pipelined(&mut stream, addr.as_str(), request)
+            client_request_pipelined(&mut stream, addr.as_str(), request, &floor)
                 .await
                 .ok()
         })
@@ -17599,7 +18440,20 @@ async fn discover_join_info(
             client_route,
             intra_route,
             admin_addrs,
-        } => Ok((control_ids, peers, client_route, intra_route, admin_addrs)),
+            cluster_version,
+        } => {
+            // ADR 0073 Phase 2 (P2-C): refuse a cluster whose version this
+            // binary's range excludes BEFORE claiming an identity or binding
+            // anything (covers the pre-era "binary R+1 vs cluster at R-1"
+            // case, which `EraWatch` cannot: it is era-only). A Phase 1 seed
+            // omits the field (reads 0 = version 1).
+            version_wiring::check_join_range(
+                cluster_version,
+                &animus_control::version::own_range(),
+            )
+            .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidData, msg))?;
+            Ok((control_ids, peers, client_route, intra_route, admin_addrs))
+        }
         other => Err(std::io::Error::other(format!(
             "seed returned an unexpected reply to JoinInfo: {other:?}"
         ))),
@@ -18024,6 +18878,7 @@ async fn relay_request_with_timeout(
     request: &ClientRequest,
     timeout: Duration,
     tls: Option<&TlsMaterial>,
+    features: &animus_control::version::ClusterFeatures,
 ) -> ClientResponse {
     match tokio::time::timeout(timeout, async {
         let stream = TcpStream::connect(addr.as_str()).await.ok()?;
@@ -18035,14 +18890,18 @@ async fn relay_request_with_timeout(
                 MaybeTlsStream::Tls(Box::new(tls_stream.into()))
             }
         };
-        client_request_pipelined(&mut stream, &addr, request)
-            .await
-            .ok()
+        Some(client_request_pipelined(&mut stream, &addr, request, features).await)
     })
     .await
     {
-        Ok(Some(resp)) => resp,
-        Ok(None) => ClientResponse::Error(RELAY_TRANSPORT_FAILURE.into()),
+        Ok(Some(Ok(resp))) => resp,
+        // A request this node's own feature gate refuses to send (ADR 0073
+        // Phase 2): named, not folded into the transport sentinel, so it is
+        // neither retried as a transient failure nor mistaken for one.
+        Ok(Some(Err(err))) if err.kind() == std::io::ErrorKind::InvalidInput => {
+            ClientResponse::Error(format!("relay refused: {err}"))
+        }
+        Ok(Some(Err(_)) | None) => ClientResponse::Error(RELAY_TRANSPORT_FAILURE.into()),
         Err(_) => ClientResponse::Error(RELAY_HOP_TIMEOUT.into()),
     }
 }
@@ -18119,6 +18978,110 @@ mod client_request_pipelining_tests {
 
     use crate::{ClientRequest, ClientResponse};
 
+    // ---- ADR 0073 Phase 2 (P2-C close-out): the gated relay sender ----
+
+    fn era_request() -> ClientRequest {
+        use animus_control::MetaCommand;
+        use animus_control::version::VersionRange;
+        ClientRequest::ProposeSchema(MetaCommand::ReportNodeVersion {
+            node: animus_env::NodeId::propose("a").unwrap(),
+            range: VersionRange::new(1, 1),
+            build: "t".into(),
+        })
+    }
+
+    /// A handle fed from an era-on `Metadata`, so `Gate::Era` is open.
+    fn era_on_features() -> animus_control::version::ClusterFeatures {
+        use animus_control::meta::{Member, NodeStatus};
+        use animus_control::version::{NodeVersion, VersionRange};
+        let a = animus_env::NodeId::propose("a").unwrap();
+        let mut meta = animus_control::Metadata::default();
+        meta.members.insert(
+            a.clone(),
+            Member {
+                labels: Default::default(),
+                status: NodeStatus::Active,
+                has_activated: true,
+            },
+        );
+        meta.node_versions.insert(
+            a,
+            NodeVersion {
+                range: VersionRange::new(1, 1),
+                build: "t".into(),
+            },
+        );
+        meta.cluster_version = 1;
+        let f = animus_control::version::ClusterFeatures::new();
+        f.update(&meta);
+        assert!(f.era_active());
+        f
+    }
+
+    /// Dial `addr` through the production relay sender with `features` and
+    /// return `(what the relay returned, every byte the peer received)`.
+    async fn relay_and_capture(
+        features: animus_control::version::ClusterFeatures,
+    ) -> (Option<ClientResponse>, Vec<u8>) {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let peer = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut got = Vec::new();
+            // Until the sender hangs up (it never gets a reply).
+            let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut got)).await;
+            got
+        });
+        let relay = crate::control_handle::AnimusdRelayClient::new(None, features);
+        let sender = tokio::spawn(async move {
+            animus_node::host::RelayClient::relay(
+                &relay,
+                addr,
+                &era_request(),
+                Duration::from_millis(600),
+            )
+            .await
+        });
+        // A debug build's closed-gate `debug_assert!` panics the sender task.
+        let resp = sender.await.ok();
+        (resp, peer.await.unwrap())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_relay_sender_never_puts_a_closed_gate_request_on_the_wire() {
+        let marker = b"ReportNodeVersion";
+        let contains = |hay: &[u8]| hay.windows(marker.len()).any(|w| w == marker);
+
+        // Pre-era (floor handle): the request is refused at the sender.
+        let floor = animus_control::version::ClusterFeatures::new();
+        let (resp, got) = relay_and_capture(floor.clone()).await;
+        assert!(
+            !contains(&got),
+            "the era-only request reached the peer: {}",
+            String::from_utf8_lossy(&got)
+        );
+        assert_eq!(
+            floor.violations(animus_control::version::GateSurface::ClientRequest),
+            1
+        );
+        match resp {
+            Some(ClientResponse::Error(m)) => {
+                assert!(m.contains("relay refused"), "{m}");
+            }
+            Some(other) => panic!("not refused: {other:?}"),
+            None => {
+                if !cfg!(debug_assertions) {
+                    panic!("only a debug build asserts");
+                }
+            }
+        }
+
+        // Era on: the identical request goes out (positive control).
+        let (_, got) = relay_and_capture(era_on_features()).await;
+        assert!(contains(&got), "an open-gate request must be sent");
+    }
+
     /// A correct accept-side stub: writes its own genuine `CLIENT_PROTOCOL`
     /// preamble eagerly (exactly like the real `serve_requests`/
     /// `perform_client_handshake` accept path — it never waits on the
@@ -18169,6 +19132,7 @@ mod client_request_pipelining_tests {
             &ClientRequest::Status,
             Duration::from_secs(5),
             None,
+            &animus_control::version::ClusterFeatures::new(),
         )
         .await;
         assert!(
@@ -18220,6 +19184,7 @@ mod client_request_pipelining_tests {
             &ClientRequest::Status,
             Duration::from_secs(5),
             None,
+            &animus_control::version::ClusterFeatures::new(),
         )
         .await;
         assert!(
@@ -18299,6 +19264,7 @@ mod client_request_pipelining_tests {
             &ClientRequest::Status,
             Duration::from_secs(8),
             None,
+            &animus_control::version::ClusterFeatures::new(),
         )
         .await;
         let elapsed = started.elapsed();
@@ -18352,6 +19318,39 @@ pub async fn write_frame<T: Serialize, S: AsyncWrite + Unpin>(
     msg: &T,
 ) -> std::io::Result<()> {
     let framed = animus_node::codec::encode_client_frame(msg)?;
+    stream.write_all(&framed).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// [`write_frame`] behind the ADR 0073 Phase 2 feature gate (P2-C): the frame
+/// is built by [`animus_node::codec::encode_client_frame_gated`] with the
+/// sending node's own `ClusterFeatures`, so a message whose
+/// [`required_gate`](animus_node::ClientGated::required_gate) is closed on
+/// this node is **refused** (an `InvalidInput` error, counted on the
+/// features handle's per-surface violation counter and mirrored to
+/// `Metric::ClusterGateViolations*`) instead of being sent to a peer that may
+/// not be able to decode it. For an open gate the bytes are identical to
+/// [`write_frame`]'s.
+///
+/// **Every production send goes through this**: the accept side's reply in
+/// [`handle_connection`] (`ClientResponse`) and the dial side's request in
+/// [`client_request_pipelined`] (`ClientRequest`, including the relayed
+/// `ProposeSchema`). The ungated [`write_frame`] stays for callers that have
+/// no node (test clients, raw probes) and for non-wire values.
+///
+/// # Errors
+/// A closed gate, or anything [`write_frame`] returns.
+pub async fn write_frame_gated<T, S>(
+    stream: &mut S,
+    msg: &T,
+    features: &animus_control::version::ClusterFeatures,
+) -> std::io::Result<()>
+where
+    T: animus_node::ClientGated + Serialize,
+    S: AsyncWrite + Unpin,
+{
+    let framed = animus_node::codec::encode_client_frame_gated(msg, features)?;
     stream.write_all(&framed).await?;
     stream.flush().await?;
     Ok(())
@@ -18461,6 +19460,8 @@ mod confirm_futility_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                labels: Default::default(),
+                overload: None,
             }],
             dynamo_auth: None,
             cluster_settings: None,
@@ -18567,6 +19568,7 @@ mod confirm_futility_tests {
             key: TableSchema::simple("pk"),
             lsis: Vec::new(),
             change_records_carry_images: false,
+            mrec: None,
         };
         let pk = AttributeValue::S("cf-target".to_owned());
         let base_key = crate::dynamo::item_key(&pk, None);
@@ -18701,6 +19703,8 @@ mod forward_transport_failure_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                labels: Default::default(),
+                overload: None,
             })
             .collect();
         ClusterConfig {
@@ -19084,6 +20088,8 @@ mod forward_hop_timeout_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                labels: Default::default(),
+                overload: None,
             })
             .collect();
         ClusterConfig {
@@ -19913,6 +20919,8 @@ mod client_cancellation_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                labels: Default::default(),
+                overload: None,
             })
             .collect();
         ClusterConfig {
@@ -20277,6 +21285,8 @@ mod halted_shutdown_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                labels: Default::default(),
+                overload: None,
             }],
             dynamo_auth: None,
             cluster_settings: None,
@@ -20642,6 +21652,7 @@ mod simenv_client_ctx_tests {
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),
+            mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             ttl_reaper_progress: Arc::new(Mutex::new(
                 animus_node::ttl_reaper::TtlReaperProgress::default(),
             )),
@@ -20660,6 +21671,7 @@ mod simenv_client_ctx_tests {
             throttle: ThrottleTracker::new(),
             throttle_defaults: Arc::new(ThrottleDefaults::default()),
             any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            overload: Default::default(),
         };
 
         (sim, ctx, control, kv)
@@ -21288,6 +22300,7 @@ mod two_node_relay_tests {
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),
+            mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             ttl_reaper_progress: Arc::new(Mutex::new(
                 animus_node::ttl_reaper::TtlReaperProgress::default(),
             )),
@@ -21307,6 +22320,7 @@ mod two_node_relay_tests {
             throttle: ThrottleTracker::new(),
             throttle_defaults: Arc::new(ThrottleDefaults::default()),
             any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            overload: Default::default(),
         };
 
         // Node A answers relayed requests through the generic dispatcher
@@ -21361,6 +22375,7 @@ mod two_node_relay_tests {
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),
+            mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             ttl_reaper_progress: Arc::new(Mutex::new(
                 animus_node::ttl_reaper::TtlReaperProgress::default(),
             )),
@@ -21379,6 +22394,7 @@ mod two_node_relay_tests {
             throttle: ThrottleTracker::new(),
             throttle_defaults: Arc::new(ThrottleDefaults::default()),
             any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            overload: Default::default(),
         };
 
         (sim, ctx_a, ctx_b, control)
@@ -21565,6 +22581,12 @@ mod sim_cluster_lsm;
 /// depth knob `ANIMUS_UPGRADE_SEEDS`. See that module's doc.
 #[cfg(test)]
 mod sim_cluster_mixed_version_corpus;
+/// ADR 0073 Phase 3, P3-C: the roll driver (`animus-roll`'s pure state
+/// machine) over `SimCluster` with fault injection. Run via `cargo test -p
+/// animusd --lib sim_cluster_roll_orchestrator`; depth knob
+/// `ANIMUS_UPGRADE_SEEDS`. See that module's doc.
+#[cfg(test)]
+mod sim_cluster_roll_orchestrator;
 /// C-17 Tier 1 (`docs/roadmap.md`): `SimEnv`/pure scale and density
 /// measurement — a metadata scale curve (snapshot image, mirror delta,
 /// `host::plan`, rebalance convergence, control `InstallSnapshot` catch-up)
@@ -21574,6 +22596,10 @@ mod sim_cluster_mixed_version_corpus;
 /// table. See that module's own doc.
 #[cfg(test)]
 mod sim_cluster_scale;
+/// Issue #1229: a split child relocated wholesale by directed Placing keeps
+/// its pre-split rows (`SimCluster`).
+#[cfg(test)]
+mod sim_cluster_split_relocation;
 /// ADR 0065's own `SimEnv`-driven, virtual-time-only throttle-enforcement
 /// coverage, over the real `SimCluster` fixture — a sibling of
 /// `sim_cluster_corpus`, for the identical reason (needs `SimCluster`'s own
@@ -21586,6 +22612,15 @@ mod sim_cluster_throttle;
 /// `ANIMUS_UPGRADE_RESTART_SEEDS` (shared with tier 1). See that module's doc.
 #[cfg(test)]
 mod sim_cluster_upgrade_corpus;
+/// G-01 stage G-a: zone-labelled placement + whole-zone loss over `SimCluster`
+/// (`ANIMUS_ZONE_PLACEMENT_SEEDS`) — see that module's own doc.
+#[cfg(test)]
+mod sim_cluster_zone_placement;
+
+/// G-01 stage G-c, M4: the MRSC stretch-table cluster corpus
+/// (`ANIMUS_MRSC_SEEDS`) — see that module's own doc.
+#[cfg(test)]
+mod sim_cluster_mrsc;
 
 /// A first deterministic smoke over `SimClusterHandle::dynamo`/`SimCluster::
 /// dynamo` (ADR 0061 rung D2 PR 1) — the DynamoDB wire edge, decoded by
@@ -21618,6 +22653,9 @@ mod sim_cluster_dynamo;
 #[cfg(test)]
 mod sim_cluster_dynamo_corpus;
 
+/// G-01 stage G-d M2: the structural MREC writer guards (test-only).
+#[cfg(test)]
+mod mrec_writer_guard_tests;
 /// ADR 0061 rung D3 PR 1 (C-04 D3): the first batch of "B class"
 /// `ProdEnv` DynamoDB logic tests converted to `SimCluster` — base-table
 /// tests that `dynamo::dispatch_item_op` can already drive, needing no
@@ -21637,11 +22675,16 @@ mod sim_cluster_dynamo_batch_get;
 #[cfg(test)]
 mod sim_cluster_dynamo_boolean_composition;
 #[cfg(test)]
+mod sim_cluster_dynamo_disk_full;
+#[cfg(test)]
 mod sim_cluster_dynamo_eventual_read;
 #[cfg(test)]
 mod sim_cluster_dynamo_expression_surface;
 #[cfg(test)]
 mod sim_cluster_dynamo_extended;
+/// G-01 stage G-c M3: the MRSC global-table wire surface over `SimCluster`.
+#[cfg(test)]
+mod sim_cluster_dynamo_global_table;
 #[cfg(test)]
 mod sim_cluster_dynamo_item_size_cap;
 #[cfg(test)]
@@ -21679,6 +22722,25 @@ mod sim_cluster_kind_batch_outcome;
 /// raw 2PC coordinator primitives, never the DynamoDB wire.
 #[cfg(test)]
 mod sim_cluster_txn_conflict;
+/// G-01 stage G-d M0: multi-cluster `SimWorld` + `PeerBridge` WAN model (test-only).
+#[cfg(test)]
+mod sim_world;
+/// G-01 stage G-d M5: the multi-cluster MREC fault-injection corpus (test-only).
+#[cfg(test)]
+mod sim_world_mrec_corpus;
+#[cfg(test)]
+mod sim_world_mrec_e2e_tests;
+#[cfg(test)]
+mod sim_world_mrec_edge_tests;
+#[cfg(test)]
+mod sim_world_mrec_saga_tests;
+#[cfg(test)]
+mod sim_world_mrec_shipper_tests;
+/// G-01 stage G-d M3: the MREC receiver over `SimWorld` (test-only).
+#[cfg(test)]
+mod sim_world_mrec_tests;
+#[cfg(test)]
+mod sim_world_tests;
 
 /// ADR 0061 rung D3 PR 2a (C-04 D3): base-table DDL over the real DynamoDB
 /// wire, driven through the new `dynamo::dispatch_table_op` generic core —
@@ -22207,6 +23269,13 @@ mod sim_cluster_control_only;
 #[cfg(test)]
 mod sim_cluster_data_only;
 
+/// Issue #1230: a node's self-registration must survive a control plane that
+/// is unreachable for longer than `SCHEMA_COMMIT_TIMEOUT` at start, and a
+/// still-running retry loop must never resurrect a removed node. See the
+/// module's own doc.
+#[cfg(test)]
+mod sim_cluster_register_retry;
+
 /// ADR 0061 rung L (C-12 PR 4a): the first conversion PR built on top of the
 /// PR 2/3 mechanism — `tests/control_only.rs` (3 tests), `tests/
 /// data_only.rs` (5 tests), and `tests/cluster_split.rs` (3 tests), pure
@@ -22278,6 +23347,8 @@ mod sim_cluster_control_membership_admin;
 #[cfg(test)]
 mod sim_cluster_seed_join;
 
+#[cfg(test)]
+mod sim_cluster_cluster_version;
 /// ADR 0073 Phase 2 (P2-A) residual risk #1 at the node-assembly level: every
 /// node role `SimCluster` can build (control-only, combined, data-only, a
 /// runtime-grown control voter, `join_via_seed` joiners of both kinds) is in
@@ -22411,6 +23482,8 @@ mod issue_298_conflict_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                labels: Default::default(),
+                overload: None,
                 console: addrs[5],
             }],
             dynamo_auth: None,

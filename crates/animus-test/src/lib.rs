@@ -17,6 +17,7 @@ pub mod corpus;
 pub mod export;
 pub mod history;
 pub mod shrink;
+pub mod soak;
 pub mod upgrade;
 
 pub use check::{CheckReport, check_convergence, check_cycles, check_durability};

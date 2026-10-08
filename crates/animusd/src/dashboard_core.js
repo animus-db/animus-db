@@ -14,7 +14,7 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
 // State assembled each refresh.
-let STATE = { status: null, backups: null, restores: null, backupStore: null, gc: null, nodes: [], peersErr: null };
+let STATE = { status: null, clusterVersion: null, backups: null, restores: null, backupStore: null, gc: null, nodes: [], peersErr: null };
 
 // ---- this node's own role (ADR 0035 PR7) ----
 // `SELF` is this node's own `/admin/config`+`/admin/raft`+`/admin/raftkv`+
@@ -522,6 +522,13 @@ async function loadAll() {
   try { backups = await getJSON(SEED, "/admin/backups"); } catch (e) { /* shown per-panel */ }
   let restores = null;
   try { restores = await getJSON(SEED, "/admin/restores"); } catch (e) { /* shown per-panel */ }
+  // `/admin/cluster-version` (ADR 0073 Phase 3, P3-A): the active cluster
+  // version plus the derived `roll` object (phase, nodes on the new build,
+  // remaining order, blockers, the server-side roll-health verdict) — one
+  // fetch against SEED like `status`; any node serves it, so no fan-out. An
+  // older node without the route degrades to "no Version card".
+  let clusterVersion = null;
+  try { clusterVersion = await getJSON(SEED, "/admin/cluster-version"); } catch (e) { /* card hidden */ }
   // `/admin/backup-store` (docs/roadmap.md U-07): this node's own backup
   // store config/object counts/janitor progress — a single fetch against
   // SEED like `backups`/`restores` just above, never a per-node fan-out
@@ -594,7 +601,7 @@ async function loadAll() {
     return node;
   }));
 
-  STATE = { status, backups, restores, backupStore, gc, nodes, peersErr: STATE.peersErr };
+  STATE = { status, clusterVersion, backups, restores, backupStore, gc, nodes, peersErr: STATE.peersErr };
   render();
   $("updated").textContent = "updated " + new Date().toLocaleTimeString();
 }

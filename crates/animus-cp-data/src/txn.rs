@@ -8,11 +8,14 @@
 //! and a `TxnResolve`'s final rewrite) is now a 1-byte-tagged [`Envelope`]:
 //! tag `0` = [`Envelope::Committed`] (the rest of the bytes are the value,
 //! byte-for-byte what the caller supplied — unwrapped again at every read
-//! path before it ever reaches a client); tag `1` = [`Envelope::Intent`], a
+//! path before it ever reaches a client); tag `2` = [`Envelope::Intent`], a
 //! provisional write staged by `KvCommand::TxnStage` naming the transaction
 //! that staged it, where to find its decision (the txn record's own logical
-//! key — see below), and the value the key will take if the transaction
-//! commits (`None` = the key will become a tombstone, a staged delete).
+//! key — see below), the value the key will take if the transaction
+//! commits (`None` = the key will become a tombstone, a staged delete), and
+//! the committed value it shadows ([`IntentPrior`], ADR 0018 §2's
+//! 2026-10-04 amendment). Tag `1` is the retired v1 intent, which carried no
+//! prior (`legacy::v1`; still decoded — ADR 0073's `txn-envelope` format).
 //! Tombstones themselves carry no value at all (the engine's own per-key
 //! tombstone bit, `merge_tombstone`) and are never enveloped — the tag only
 //! ever applies to an actual value.
@@ -81,16 +84,16 @@
 //! there, and no analogous "reserved partition key" mechanism exists for
 //! user data — hence the different, `escape`-structural argument above.)
 //!
-//! **A residual, documented, not closed by PR3**: a tablet split's
-//! `split_key` is an arbitrary existing row's own key
-//! (`animusd::auto_split_loop`'s byte-weighted median), not necessarily
-//! token-aligned, so in principle a single token's rows (and, per this
-//! design, its txn record) could end up split across two sibling tablets by
-//! a split racing an in-flight transaction. PR3 is deliberately
-//! single-participant/single-tablet in scope; split-vs.-in-flight-txn
-//! interaction is a PR4+ concern (mirroring how the range seal itself
-//! needed a dedicated amendment once genuine concurrent splits were
-//! exercised) and is not solved here.
+//! **A residual, documented**: a tablet split must not land *inside* a token,
+//! or a token's rows (and, per this design, its txn record, which sorts below
+//! every item of the token) end up on two sibling tablets: the anchor stage
+//! applies on the item's tablet while `TxnCommit`/recovery are routed by record
+//! key to the other, where no record exists (R-01 F-2: an orphan-abort
+//! tombstone and a never-resolved intent). `animusd`'s one split choke point,
+//! `decide::align_split_key`, therefore rounds **every** table's split key to a
+//! token boundary (down, else up). What stays open is a range holding a
+//! *single* token, which can still be split by sort key (the raw key is kept):
+//! a transaction anchored on that token can straddle the cut.
 //!
 //! ## Resolution semantics
 //!
@@ -100,10 +103,13 @@
 //! timestamp serves the staged value. An `Aborted` record — or a
 //! `Committed` one **after** the read's timestamp, which is equally
 //! invisible to that snapshot — serves whatever this key held **immediately
-//! before** the intent, restored by rewinding to the version just below the
-//! intent's own applied version (`get_at(key, intent_version - 1)`), never
-//! by writing a tombstone (which would incorrectly shadow that older,
-//! still-live committed value). A `Pending` record is a bounded retry at a
+//! before** the intent — the intent's own carried prior
+//! ([`IntentPrior::Known`]) — never a tombstone over a committed value.
+//! (It used to be read back with `get_at(key, intent_version - 1)`; MVCC
+//! history below an intent is not something the engine keeps — `LsmEngine`
+//! compaction GC and latest-only snapshot images both discard it — and
+//! aborted transactions lost acknowledged writes. Only a v1 intent still
+//! falls back to that lookback.) A `Pending` record is a bounded retry at a
 //! point read (`RaftKvNode::read_resolved`) or a silent omission at a scan
 //! (full push/wait scheduling for both is PR4).
 //!
@@ -133,11 +139,29 @@ use crate::hlc::HlcTimestamp;
 /// as good as any other.
 const RECORD_TAG: u8 = 0x02;
 
+/// The second byte of a **resolved-marker** key's lead pair (see
+/// [`resolved_marker_key`]): like [`RECORD_TAG`], any value outside
+/// `{0x00, 0x01}` is structurally disjoint from every real key's
+/// post-token suffix (the module doc's `escape` argument), and `0x03` is
+/// reserved by `cursor.rs`'s (differently scoped) cursor rows.
+const RESOLVED_TAG: u8 = 0x04;
+
+/// Leading byte (format version) of a resolved-marker row's value
+/// (`txn-resolved-marker` v1): `[RESOLVED_MARKER_V1] || txn_id`. Chosen so
+/// an older binary's [`decode_record`] — which reads a `txn_id` first and
+/// then a status byte — has no reason to mistake it for a record.
+const RESOLVED_MARKER_V1: u8 = 0xA1;
+
 /// A transaction's identity: its own commit-attempt timestamp plus the node
 /// that minted it (ADR 0018 §2/PR3) — the node tiebreak is load-bearing:
 /// different tablet groups run independent `Hlc` instances that never
-/// witness each other directly, so two different groups' leaders can in
-/// principle mint the identical `(wall_ms, logical)` pair. `Ord` derives in
+/// witness each other directly, so two different groups can mint the
+/// identical `(wall_ms, logical)` pair — **including two groups led by the
+/// same node** (routine), which is why a group's minted `node` is qualified
+/// with its stream (`RaftKvNode::txn_id_node`, `n0#100`; the primary stream
+/// keeps the bare node id) rather than being the plain node id. Without that,
+/// two transactions anchored on two same-led tablets shared a `TxnId` and one's
+/// resolve acted on the other's intent (R-01 F-2). `Ord` derives in
 /// field order (`ts`, then `node`), giving a total, deterministic order with
 /// no separate tiebreak logic. Serializable for the Raft WAL (it rides
 /// inside `KvCommand`, which the shared control-plane `serde_json`
@@ -542,7 +566,42 @@ pub(crate) enum Envelope {
         /// doc. Discarded, never materialized, on abort.
         kind_writes: Vec<crate::KindWrite>,
         change_log: Option<(Vec<u8>, Vec<u8>)>,
+        /// The committed value this key held immediately before the intent
+        /// — see [`IntentPrior`].
+        prior: IntentPrior,
     },
+}
+
+/// Envelope tag of a committed value (`txn-envelope`, every version).
+pub(crate) const TAG_COMMITTED: u8 = 0;
+/// Envelope tag of a **current-version** intent (`txn-envelope` v2, ADR 0018
+/// §2's 2026-10-04 amendment): the v1 intent body plus a trailing `prior`
+/// field. Tag `1` is the retired v1 intent ([`legacy::v1`]).
+pub(crate) const TAG_INTENT: u8 = 2;
+
+/// What an intent knows about the committed value it shadows (ADR 0018 §2's
+/// 2026-10-04 amendment).
+///
+/// An aborted intent, and a reader whose snapshot predates the intent's
+/// commit, must see the key's last committed value from *before* the intent.
+/// That used to be read back out of MVCC history with `get_at(key,
+/// intent_version - 1)`, which is not something any engine promises to keep:
+/// `LsmEngine` compaction collapses versions below its GC floor (about a
+/// millisecond of HLC time behind the newest write by default), and an
+/// `InstallSnapshot` image ships each key's latest record only. Either one
+/// made the lookback return nothing, so an abort wrote a **tombstone** over an
+/// acknowledged committed value. A v2 intent therefore carries its prior value
+/// itself, captured by `TxnStage`'s apply from the key's latest record at the
+/// moment the intent is written.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum IntentPrior {
+    /// Carried by the intent (`txn-envelope` v2): the committed value the key
+    /// held immediately before this intent — `None` = absent or tombstoned.
+    Known(Option<Vec<u8>>),
+    /// A v1 intent, written before the prior value was carried: the only
+    /// recourse is the old one-MVCC-version lookback (correct only while the
+    /// engine still holds that history).
+    Unknown,
 }
 
 // ---- the anchor-token-derived record key -----------------------------------
@@ -577,6 +636,76 @@ pub(crate) fn record_key(anchor_token: &[u8], txn_id: &TxnId) -> Vec<u8> {
 #[must_use]
 pub(crate) fn is_record_key(k: &[u8]) -> bool {
     k.len() >= TOKEN_BYTES + 2 && k[TOKEN_BYTES] == 0x00 && k[TOKEN_BYTES + 1] == RECORD_TAG
+}
+
+/// The logical key of the **resolved marker** for the base key `base_key`:
+/// `token(base_key) || [0x00, RESOLVED_TAG] || base_key`. A durable, per-key
+/// row recording *which transaction last resolved an intent at `base_key`*
+/// on this group — written by `TxnResolve`'s apply in the same merge batch
+/// as the resolve itself, read by `TxnStage`'s apply to reject a stale or
+/// duplicate stage for an already-resolved `(key, txn_id)`. Because it is
+/// engine state (not process memory) every replica — one that restarted,
+/// or installed a snapshot image — reads the identical value, which is what
+/// makes that rejection a deterministic function of (log, durable state).
+/// Token-led like [`record_key`], so it travels with its key across splits,
+/// snapshot images and range scans; it is one row per key (overwritten by
+/// the next resolve there), never one per transaction.
+///
+/// # Panics
+/// If `base_key` is shorter than [`TOKEN_BYTES`] (every real data-plane key
+/// leads with a full token, ADR 0022).
+#[must_use]
+pub(crate) fn resolved_marker_key(base_key: &[u8]) -> Vec<u8> {
+    assert!(
+        base_key.len() >= TOKEN_BYTES,
+        "txn::resolved_marker_key: key must lead with a {TOKEN_BYTES}-byte token (ADR 0022)"
+    );
+    let mut out = Vec::with_capacity(base_key.len() + 2);
+    out.extend_from_slice(&base_key[..TOKEN_BYTES]);
+    out.push(0x00);
+    out.push(RESOLVED_TAG);
+    out.extend_from_slice(base_key);
+    out
+}
+
+/// Whether logical key `k` is a [`resolved_marker_key`].
+#[must_use]
+pub(crate) fn is_resolved_marker_key(k: &[u8]) -> bool {
+    k.len() >= TOKEN_BYTES + 2 && k[TOKEN_BYTES] == 0x00 && k[TOKEN_BYTES + 1] == RESOLVED_TAG
+}
+
+/// Whether `k` is any of this module's internal bookkeeping keys (a txn
+/// record or a resolved marker) — what every client-facing scan and
+/// presence check must skip. [`is_record_key`] alone stays the predicate
+/// for code that decodes *records*.
+#[must_use]
+pub(crate) fn is_internal_key(k: &[u8]) -> bool {
+    is_record_key(k) || is_resolved_marker_key(k)
+}
+
+/// The value of a resolved-marker row naming `txn_id` (`txn-resolved-marker`
+/// v1).
+#[must_use]
+pub(crate) fn encode_resolved_marker(txn_id: &TxnId) -> Vec<u8> {
+    let mut out = vec![RESOLVED_MARKER_V1];
+    put_txn_id(&mut out, txn_id);
+    out
+}
+
+/// The dual of [`encode_resolved_marker`]; `None` on any other shape (an
+/// unknown version byte is treated as "no marker", never a panic).
+#[must_use]
+pub(crate) fn decode_resolved_marker(bytes: &[u8]) -> Option<TxnId> {
+    let (&version, body) = bytes.split_first()?;
+    if version != RESOLVED_MARKER_V1 {
+        return None;
+    }
+    let mut c = Cursor {
+        bytes: body,
+        pos: 0,
+    };
+    let id = c.txn_id()?;
+    (c.pos == body.len()).then_some(id)
 }
 
 // ---- binary encode/decode (this crate's compact style, mirroring seal.rs) -
@@ -755,16 +884,20 @@ fn put_change_log(out: &mut Vec<u8>, change_log: Option<&(Vec<u8>, Vec<u8>)>) {
 #[must_use]
 pub(crate) fn encode_committed(value: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(value.len() + 1);
-    out.push(0);
+    out.push(TAG_COMMITTED);
     out.extend_from_slice(value);
     out
 }
 
-/// Encode an intent envelope (tag `1`) — see [`Envelope::Intent`].
+/// Encode an intent envelope at the **current** version (tag
+/// [`TAG_INTENT`], `txn-envelope` v2) — see [`Envelope::Intent`].
 ///
 /// `kind_writes`/`change_log` are ADR 0046 A1's staged derived payload (empty/
-/// `None` for a plain write, byte-identical to the pre-ADR-0046 encoding
-/// except for the two trailing fields).
+/// `None` for a plain write). `prior` is the committed value this key held
+/// immediately before the intent (`None` = absent or tombstoned) — the value
+/// an abort restores and a too-early reader serves, carried in the intent
+/// itself so neither ever depends on the engine still holding MVCC history
+/// below the intent (ADR 0018 §2's 2026-10-04 amendment; see [`IntentPrior`]).
 #[must_use]
 pub(crate) fn encode_intent(
     txn_id: &TxnId,
@@ -773,56 +906,113 @@ pub(crate) fn encode_intent(
     staged_value: Option<&[u8]>,
     kind_writes: &[crate::KindWrite],
     change_log: Option<&(Vec<u8>, Vec<u8>)>,
+    prior: Option<&[u8]>,
 ) -> Vec<u8> {
-    let mut out = vec![1];
-    put_txn_id(&mut out, txn_id);
-    put_bytes(&mut out, record_key);
-    put_bytes(&mut out, record_table.as_bytes());
-    put_opt_bytes(&mut out, staged_value);
-    put_kind_writes(&mut out, kind_writes);
-    put_change_log(&mut out, change_log);
+    let mut out = vec![TAG_INTENT];
+    put_intent_v1_body(
+        &mut out,
+        txn_id,
+        record_key,
+        record_table,
+        staged_value,
+        kind_writes,
+        change_log,
+    );
+    put_opt_bytes(&mut out, prior);
     out
 }
 
-/// Decode a value envelope. Every value this crate's apply path ever merges
-/// into the engine is one of these two shapes — a decode failure means the
-/// engine holds bytes this crate never wrote, a hard bug, not a recoverable
-/// condition (mirrors `seal.rs`/`ceiling.rs`'s doctrine for their own
-/// markers).
+/// The body every intent version shares (everything after the tag, up to the
+/// v2 `prior` field): the whole of a v1 intent's body. Kept as one function so
+/// the v2 writer and the test-only v1 legacy encoder cannot drift apart.
+fn put_intent_v1_body(
+    out: &mut Vec<u8>,
+    txn_id: &TxnId,
+    record_key: &[u8],
+    record_table: &str,
+    staged_value: Option<&[u8]>,
+    kind_writes: &[crate::KindWrite],
+    change_log: Option<&(Vec<u8>, Vec<u8>)>,
+) {
+    put_txn_id(out, txn_id);
+    put_bytes(out, record_key);
+    put_bytes(out, record_table.as_bytes());
+    put_opt_bytes(out, staged_value);
+    put_kind_writes(out, kind_writes);
+    put_change_log(out, change_log);
+}
+
+/// The v1 intent fields, decoded from `c` — the frozen v1 body layout (see
+/// [`legacy::v1`]), which v2 extends with one trailing field.
+fn decode_intent_v1_body(c: &mut Cursor<'_>) -> Envelope {
+    let txn_id = c.txn_id().expect("txn: malformed intent envelope (txn_id)");
+    let record_key = c
+        .bytes()
+        .expect("txn: malformed intent envelope (record_key)");
+    let record_table = String::from_utf8(
+        c.bytes()
+            .expect("txn: malformed intent envelope (record_table)"),
+    )
+    .expect("txn: malformed intent envelope (record_table not utf8)");
+    let staged_value = c
+        .opt_bytes()
+        .expect("txn: malformed intent envelope (staged_value)");
+    let kind_writes = c
+        .kind_writes()
+        .expect("txn: malformed intent envelope (kind_writes)");
+    let change_log = c
+        .change_log()
+        .expect("txn: malformed intent envelope (change_log)");
+    Envelope::Intent {
+        txn_id,
+        record_key,
+        record_table,
+        staged_value,
+        kind_writes,
+        change_log,
+        prior: IntentPrior::Unknown,
+    }
+}
+
+/// Decode a value envelope, dispatching on its tag (which doubles as the
+/// `txn-envelope` format version for an intent — ADR 0073's decoder pattern:
+/// every older version is translated into the one current in-memory
+/// [`Envelope`]). Every value this crate's apply path ever merges into the
+/// engine is one of these shapes — a decode failure means the engine holds
+/// bytes this crate never wrote, a hard bug, not a recoverable condition
+/// (mirrors `seal.rs`/`ceiling.rs`'s doctrine for their own markers).
 ///
 /// # Panics
-/// If `bytes` is empty or the tag/fields don't match either shape.
+/// If `bytes` is empty or the tag/fields don't match any known shape.
 #[must_use]
 pub(crate) fn decode_envelope(bytes: &[u8]) -> Envelope {
     assert!(
         !bytes.is_empty(),
         "txn: empty value envelope (corrupt engine value)"
     );
+    let mut c = Cursor {
+        bytes: &bytes[1..],
+        pos: 0,
+    };
     match bytes[0] {
-        0 => Envelope::Committed(bytes[1..].to_vec()),
-        1 => {
-            let mut c = Cursor {
-                bytes: &bytes[1..],
-                pos: 0,
+        TAG_COMMITTED => Envelope::Committed(bytes[1..].to_vec()),
+        legacy::v1::TAG_INTENT_V1 => legacy::v1::decode_intent(&mut c),
+        TAG_INTENT => {
+            let Envelope::Intent {
+                txn_id,
+                record_key,
+                record_table,
+                staged_value,
+                kind_writes,
+                change_log,
+                ..
+            } = decode_intent_v1_body(&mut c)
+            else {
+                unreachable!("decode_intent_v1_body always yields an intent")
             };
-            let txn_id = c.txn_id().expect("txn: malformed intent envelope (txn_id)");
-            let record_key = c
-                .bytes()
-                .expect("txn: malformed intent envelope (record_key)");
-            let record_table = String::from_utf8(
-                c.bytes()
-                    .expect("txn: malformed intent envelope (record_table)"),
-            )
-            .expect("txn: malformed intent envelope (record_table not utf8)");
-            let staged_value = c
+            let prior = c
                 .opt_bytes()
-                .expect("txn: malformed intent envelope (staged_value)");
-            let kind_writes = c
-                .kind_writes()
-                .expect("txn: malformed intent envelope (kind_writes)");
-            let change_log = c
-                .change_log()
-                .expect("txn: malformed intent envelope (change_log)");
+                .expect("txn: malformed intent envelope (prior)");
             Envelope::Intent {
                 txn_id,
                 record_key,
@@ -830,9 +1020,119 @@ pub(crate) fn decode_envelope(bytes: &[u8]) -> Envelope {
                 staged_value,
                 kind_writes,
                 change_log,
+                prior: IntentPrior::Known(prior),
             }
         }
         other => panic!("txn: unknown envelope tag {other} (corrupt engine value)"),
+    }
+}
+
+/// Retired `txn-envelope` versions (ADR 0073 "The decoder pattern"): frozen
+/// decoders, kept forever, plus their test-only encoders.
+pub(crate) mod legacy {
+    /// `txn-envelope` v1: the pre-2026-10-04 intent, tag `1`, which carried
+    /// no prior value. Decodes to an [`Envelope::Intent`](super::Envelope)
+    /// with [`IntentPrior::Unknown`](super::IntentPrior), which tells every
+    /// reader to fall back to the old one-MVCC-version lookback (the only
+    /// information a v1 intent's writer left behind).
+    pub(crate) mod v1 {
+        use super::super::{Cursor, Envelope, decode_intent_v1_body};
+
+        /// The v1 intent tag. Never written by the current code.
+        pub(crate) const TAG_INTENT_V1: u8 = 1;
+
+        /// Decode a v1 intent body (everything after the tag). Frozen.
+        pub(in crate::txn) fn decode_intent(c: &mut Cursor<'_>) -> Envelope {
+            decode_intent_v1_body(c)
+        }
+
+        /// Legacy v1 encoder (ADR 0073 checklist step 7), anchored to
+        /// `tests/fixtures/formats/txn-envelope/v1.bin` by a byte-equality
+        /// test. **Not** behind `legacy-encoders` any more: the production
+        /// snapshot sender ([`downgrade_intent_to_v1`], class G, ADR 0073's
+        /// 2026-10-05 `txn-envelope` amendment) re-encodes every v2 intent
+        /// through it while `Gate::GlobalTables` is closed, and the
+        /// upgrade-restart harness's row-value transcode uses the same
+        /// function.
+        #[must_use]
+        pub(crate) fn encode_intent(
+            txn_id: &super::super::TxnId,
+            record_key: &[u8],
+            record_table: &str,
+            staged_value: Option<&[u8]>,
+            kind_writes: &[crate::KindWrite],
+            change_log: Option<&(Vec<u8>, Vec<u8>)>,
+        ) -> Vec<u8> {
+            let mut out = vec![TAG_INTENT_V1];
+            super::super::put_intent_v1_body(
+                &mut out,
+                txn_id,
+                record_key,
+                record_table,
+                staged_value,
+                kind_writes,
+                change_log,
+            );
+            out
+        }
+
+        /// The harness's `txn-envelope` v2 -> v1 row-value transcode: `Some(v1
+        /// bytes)` iff `value` is, byte for byte, exactly one well-formed v2
+        /// intent envelope (tag `2`, every field, the trailing `prior`, and
+        /// nothing after it); `None` for anything else — a committed value, a
+        /// v1 intent, a transaction record or any non-envelope row value —
+        /// which the transcode must leave untouched. Strict by construction:
+        /// an engine's rows carry no type marker beyond the envelope tag, so
+        /// the *whole* shape has to parse before a row is rewritten. Drops
+        /// the `prior`, the one field v1 cannot express.
+        ///
+        /// Production caller: `engine_image` (the snapshot a leader ships to a
+        /// follower) while the cluster has not finalized to the version that
+        /// introduces v2 — an N-1 reader panics on tag 2.
+        #[must_use]
+        pub(crate) fn downgrade_intent_to_v1(value: &[u8]) -> Option<Vec<u8>> {
+            downgrade_intent_to_v1_with_prior(value).map(|(v1, _prior)| v1)
+        }
+
+        /// [`downgrade_intent_to_v1`], also returning the dropped `prior`
+        /// (`Some(Some(v))` = the committed value the intent shadowed,
+        /// `Some(None)` = it shadowed nothing) so the snapshot sender can ship
+        /// it where a v1 reader's lookback finds it (the MVCC version just below
+        /// the intent) instead of losing it.
+        #[must_use]
+        pub(crate) fn downgrade_intent_to_v1_with_prior(
+            value: &[u8],
+        ) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+            use super::super::{Cursor, TAG_INTENT};
+            if value.first() != Some(&TAG_INTENT) {
+                return None;
+            }
+            let mut c = Cursor {
+                bytes: &value[1..],
+                pos: 0,
+            };
+            let txn_id = c.txn_id()?;
+            let record_key = c.bytes()?;
+            let record_table = String::from_utf8(c.bytes()?).ok()?;
+            let staged_value = c.opt_bytes()?;
+            let kind_writes = c.kind_writes()?;
+            let change_log = c.change_log()?;
+            let prior = c.opt_bytes()?;
+            if c.pos != c.bytes.len() {
+                return None;
+            }
+            Some((
+                encode_intent(
+                    &txn_id,
+                    &record_key,
+                    &record_table,
+                    staged_value.as_deref(),
+                    &kind_writes,
+                    change_log.as_ref(),
+                ),
+                prior,
+            ))
+        }
     }
 }
 
@@ -948,6 +1248,39 @@ mod tests {
     }
 
     #[test]
+    fn resolved_marker_round_trips_and_is_disjoint_from_records_and_real_keys() {
+        let id = TxnId {
+            ts: ts(7, 1),
+            node: nid(4),
+        };
+        let mut base = vec![0x11; TOKEN_BYTES];
+        base.extend_from_slice(&escape(b"pk"));
+        base.extend_from_slice(b"rk");
+        let mk = resolved_marker_key(&base);
+        assert!(is_resolved_marker_key(&mk));
+        assert!(is_internal_key(&mk));
+        assert!(!is_record_key(&mk), "a marker is never decoded as a record");
+        assert!(!is_resolved_marker_key(&base));
+        assert!(!is_resolved_marker_key(&record_key(
+            &[0x11; TOKEN_BYTES],
+            &id
+        )));
+        // Led by the base key's own token, so it routes/splits with it.
+        assert_eq!(&mk[..TOKEN_BYTES], &base[..TOKEN_BYTES]);
+        let v = encode_resolved_marker(&id);
+        assert_eq!(decode_resolved_marker(&v), Some(id));
+        // Anything else is "no marker", never a panic.
+        assert_eq!(decode_resolved_marker(&[]), None);
+        assert_eq!(decode_resolved_marker(&[0x00]), None);
+        assert_eq!(decode_resolved_marker(&v[..v.len() - 1]), None);
+        let mut longer = v.clone();
+        longer.push(0);
+        assert_eq!(decode_resolved_marker(&longer), None);
+        // A txn record's own bytes are not a marker.
+        assert_eq!(decode_resolved_marker(&[0x00; 16]), None);
+    }
+
+    #[test]
     fn is_record_key_identifies_only_markers() {
         let token = [9u8; TOKEN_BYTES];
         let marker = record_key(&token, &txn(1));
@@ -984,24 +1317,37 @@ mod tests {
         let id = txn(7);
         let record = record_key(&[0; TOKEN_BYTES], &id);
         for staged in [Some(b"v".to_vec()), None] {
-            let bytes = encode_intent(&id, &record, "orders", staged.as_deref(), &[], None);
-            match decode_envelope(&bytes) {
-                Envelope::Intent {
-                    txn_id,
-                    record_key: rk,
-                    record_table,
-                    staged_value,
-                    kind_writes,
-                    change_log,
-                } => {
-                    assert_eq!(txn_id, id);
-                    assert_eq!(rk, record);
-                    assert_eq!(record_table, "orders");
-                    assert_eq!(staged_value, staged);
-                    assert!(kind_writes.is_empty());
-                    assert!(change_log.is_none());
+            for prior_value in [Some(b"was".to_vec()), Some(Vec::new()), None] {
+                let bytes = encode_intent(
+                    &id,
+                    &record,
+                    "orders",
+                    staged.as_deref(),
+                    &[],
+                    None,
+                    prior_value.as_deref(),
+                );
+                assert_eq!(bytes[0], TAG_INTENT, "the current writer emits a v2 intent");
+                match decode_envelope(&bytes) {
+                    Envelope::Intent {
+                        txn_id,
+                        record_key: rk,
+                        record_table,
+                        staged_value,
+                        kind_writes,
+                        change_log,
+                        prior,
+                    } => {
+                        assert_eq!(txn_id, id);
+                        assert_eq!(rk, record);
+                        assert_eq!(record_table, "orders");
+                        assert_eq!(staged_value, staged);
+                        assert!(kind_writes.is_empty());
+                        assert!(change_log.is_none());
+                        assert_eq!(prior, IntentPrior::Known(prior_value.clone()));
+                    }
+                    Envelope::Committed(_) => panic!("expected Intent"),
                 }
-                Envelope::Committed(_) => panic!("expected Intent"),
             }
         }
     }
@@ -1024,6 +1370,7 @@ mod tests {
             Some(b"v"),
             &kind_writes,
             Some(&change_log),
+            Some(b"prior"),
         );
         match decode_envelope(&bytes) {
             Envelope::Intent {
@@ -1036,6 +1383,60 @@ mod tests {
             }
             Envelope::Committed(_) => panic!("expected Intent"),
         }
+    }
+
+    /// ADR 0073 checklist step 6: a retained v1 intent (tag `1`, no `prior`)
+    /// decodes to the current in-memory shape with `IntentPrior::Unknown`, the
+    /// one translation that is honest about what a v1 writer left behind.
+    #[test]
+    fn a_v1_intent_decodes_with_an_unknown_prior() {
+        let id = txn(13);
+        let record = record_key(&[0; TOKEN_BYTES], &id);
+        let kind_writes = vec![(1u8, b"lsi".to_vec(), None)];
+        let change_log = (b"p".to_vec(), b"r".to_vec());
+        let v1 = legacy::v1::encode_intent(
+            &id,
+            &record,
+            "orders",
+            Some(b"v"),
+            &kind_writes,
+            Some(&change_log),
+        );
+        assert_eq!(v1[0], legacy::v1::TAG_INTENT_V1);
+        assert_eq!(
+            decode_envelope(&v1),
+            Envelope::Intent {
+                txn_id: id.clone(),
+                record_key: record.clone(),
+                record_table: "orders".to_string(),
+                staged_value: Some(b"v".to_vec()),
+                kind_writes: kind_writes.clone(),
+                change_log: Some(change_log.clone()),
+                prior: IntentPrior::Unknown,
+            }
+        );
+        // v2 is the v1 body plus a trailing `prior`, under its own tag.
+        let v2 = encode_intent(
+            &id,
+            &record,
+            "orders",
+            Some(b"v"),
+            &kind_writes,
+            Some(&change_log),
+            None,
+        );
+        assert_eq!(&v2[1..v1.len()], &v1[1..]);
+        assert_eq!(&v2[v1.len()..], &[0u8]);
+    }
+
+    #[test]
+    #[should_panic(expected = "malformed intent envelope (prior)")]
+    fn a_v2_intent_missing_its_prior_field_is_malformed() {
+        let id = txn(14);
+        let record = record_key(&[0; TOKEN_BYTES], &id);
+        let mut bytes = legacy::v1::encode_intent(&id, &record, "orders", None, &[], None);
+        bytes[0] = TAG_INTENT;
+        let _ = decode_envelope(&bytes);
     }
 
     #[test]

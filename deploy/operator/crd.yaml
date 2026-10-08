@@ -20,6 +20,14 @@ spec:
           spec:
             description: '`AnimusCluster.spec` — the desired state of one AnimusDB cluster.'
             properties:
+              allowInsecurePeers:
+                description: |-
+                  **Dev only.** Permit cross-cluster MREC traffic with no `spec.tls`
+                  (maps to `cluster_settings.allow_insecure_peers`): the peer link is
+                  then unauthenticated and unencrypted. Without it a spec with `peers`
+                  and no `tls` is refused (`PeersSpecInvalid`).
+                nullable: true
+                type: boolean
               autoSplitBytes:
                 description: |-
                   The scoped-bytes threshold that auto-splits a led tablet (ADR 0034).
@@ -146,10 +154,88 @@ spec:
                   [`DEFAULT_IMAGE`](Self::DEFAULT_IMAGE) when omitted.
                 nullable: true
                 type: string
+              maxRegionRttMs:
+                description: |-
+                  An upper bound, in milliseconds, on the round trip between any two
+                  **regions** of a stretch cluster (ADR 0075 section 3.4, G-01 G-c; ADR
+                  0060 stretch shape). Emitted into the generated `cluster.json`'s
+                  `cluster_settings.max_region_rtt_ms`, where it sizes the WAN Raft
+                  timing profile of every group whose replicas span more than one
+                  `topology.kubernetes.io/region`. `None` (default) leaves the node's own
+                  default (150 ms); **inert on a single-region or unlabelled cluster**.
+                  Additive and skipped when unset, so an existing spec's `cluster.json`
+                  is byte-identical.
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
+              mrecMaxClockSkewMs:
+                description: |-
+                  Bound, in milliseconds, on how far ahead of a receiver's own wall
+                  clock a replicated MREC stamp may be (maps to
+                  `cluster_settings.mrec_max_clock_skew_ms`). Unset keeps animusd's
+                  default (500); `0` is refused.
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
               nodes:
                 description: Total pod count (`StatefulSet.spec.replicas`). Must be at least 1.
                 format: int32
                 type: integer
+              peers:
+                description: |-
+                  The **peer clusters** this cluster replicates MREC global tables with
+                  (ADR 0075 section 5.4). One `AnimusCluster` per Kubernetes cluster;
+                  peers are symmetric (each side lists the others); there is no
+                  federation CRD. Rendered into `cluster.json`'s
+                  `cluster_settings.peers`. Requires `spec.tls` (mutual TLS on the
+                  intra port authenticates the peer) unless
+                  [`allow_insecure_peers`](Self::allow_insecure_peers). See [`PeerSpec`]
+                  and [`AnimusClusterSpec::validate_peers_spec`].
+                items:
+                  description: |-
+                    One entry of `spec.peers` (ADR 0075 section 5.4, G-01 stage G-e): a peer
+                    cluster's MREC region name, the `host:port` endpoints of its nodes'
+                    **intra** ports (explicit, user-supplied LoadBalancer or multi-cluster
+                    DNS names; there is no automatic discovery), and optionally the Secret
+                    holding that peer's CA.
+                  properties:
+                    caSecretRef:
+                      description: |-
+                        A `Secret` in this namespace holding the peer cluster's CA
+                        certificate(s), only **referenced** (never created or written by this
+                        operator; a cert-manager user points it at the CA `Certificate`'s
+                        Secret). Mounted read-only, added to this cluster's inbound trust
+                        bundle and used to verify this peer's server certificate. Omit when
+                        the peer's certificates chain to the same CA as `spec.tls`.
+                      nullable: true
+                      properties:
+                        key:
+                          description: The data key holding the PEM CA bundle. Defaults to `ca.crt`.
+                          nullable: true
+                          type: string
+                        name:
+                          description: The `Secret`'s name (same namespace).
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    endpoints:
+                      description: |-
+                        `host:port` of the peer's intra port (any peer data node accepts a
+                        frame). At least one.
+                      items:
+                        type: string
+                      type: array
+                    region:
+                      description: The peer's own `spec.region`.
+                      type: string
+                  required:
+                  - endpoints
+                  - region
+                  type: object
+                type: array
               quiesceAfterSecs:
                 description: |-
                   The idle-before-quiescing grace period for a data-plane CP group
@@ -164,6 +250,16 @@ spec:
                 minimum: 0.0
                 nullable: true
                 type: integer
+              region:
+                description: |-
+                  This cluster's **MREC region name** (ADR 0075 section 5.4, G-01 stage
+                  G-e): the namespace of [`peers`](Self::peers) and of an MREC global
+                  table's replica set. Emitted into `cluster.json`'s
+                  `cluster_settings.region`. Distinct from the `topology.kubernetes.io/
+                  region` node label MRSC uses. Required when `peers` is non-empty.
+                  Additive: absent on every pre-G-e spec.
+                nullable: true
+                type: string
               resources:
                 description: Passthrough container resource requests/limits.
                 nullable: true
@@ -432,6 +528,54 @@ spec:
                     nullable: true
                     type: string
                 type: object
+              topology:
+                description: |-
+                  Topology-aware scheduling (G-01 stage G-a, ADR 0060's 2026-10-04
+                  amendment). `None` (default) is [`TopologySpec::default`]: the
+                  `StatefulSet` carries a zone `topologySpreadConstraints` entry and a
+                  preferred hostname pod anti-affinity. Node region/zone label
+                  resolution (the operator patching each scheduled pod's node labels
+                  onto the pod as annotations, projected to `--labels-file`) is **not**
+                  controlled by this field: it is always on.
+                nullable: true
+                properties:
+                  spread:
+                    description: |-
+                      Emit the pod `topologySpreadConstraints` (zone, `maxSkew: 1`,
+                      `whenUnsatisfiable: ScheduleAnyway`) and the preferred hostname pod
+                      anti-affinity. Default `true`; `false` leaves scheduling entirely to
+                      the cluster's defaults.
+                    nullable: true
+                    type: boolean
+                type: object
+              upgrade:
+                description: |-
+                  Rolling-upgrade behaviour (ADR 0073 Phase 3, P3-D, additive). `None`
+                  is [`UpgradeSpec::default`]: finalize stays manual, no soak.
+                nullable: true
+                properties:
+                  finalize:
+                    description: |-
+                      `Manual` (default): the operator never raises the cluster version; it
+                      reports `UpgradeFinalizePending` and a human runs `animus cluster
+                      finalize` (irreversible). `Auto` (opt-in): the operator finalizes once
+                      the roll it drove is complete, `can_finalize` is true and every
+                      verdict has been `ok` for [`soak_seconds`](Self::soak_seconds).
+                    enum:
+                    - Manual
+                    - Auto
+                    - null
+                    nullable: true
+                    type: string
+                  soakSeconds:
+                    description: |-
+                      With `finalize: Auto`: how long the finished roll must stay healthy
+                      before the operator finalizes. Default `0`.
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                type: object
             required:
             - nodes
             - schemaVersion
@@ -494,6 +638,79 @@ spec:
                 format: int32
                 nullable: true
                 type: integer
+              upgrade:
+                description: |-
+                  The rolling upgrade the operator is driving, or last drove (ADR 0073
+                  Phase 3, D7). Additive; once present it is never removed (a merge
+                  patch cannot drop it), it ends in [`UpgradePhase::Complete`].
+                nullable: true
+                properties:
+                  activeClusterVersion:
+                    description: The cluster version currently active (`GET /admin/cluster-version`).
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                  fromImage:
+                    description: The container image before the roll started.
+                    nullable: true
+                    type: string
+                  fromVersion:
+                    description: The cluster version in force when the roll was first observed.
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                  inFlightNode:
+                    description: |-
+                      The node currently in flight (restarting or not yet healthy) and since
+                      when (epoch seconds): the stall clock.
+                    nullable: true
+                    type: string
+                  inFlightSince:
+                    format: int64
+                    nullable: true
+                    type: integer
+                  onNew:
+                    description: Pods on the new revision that are `Ready`.
+                    format: int32
+                    nullable: true
+                    type: integer
+                  phase:
+                    description: '`status.upgrade.phase`.'
+                    enum:
+                    - InProgress
+                    - Blocked
+                    - FinalizePending
+                    - Complete
+                    type: string
+                  settledSince:
+                    description: |-
+                      Since when (epoch seconds) every node has been done and healthy: the
+                      `spec.upgrade.soakSeconds` clock.
+                    format: int64
+                    nullable: true
+                    type: integer
+                  toImage:
+                    description: The container image the roll is rolling to.
+                    nullable: true
+                    type: string
+                  toVersion:
+                    description: |-
+                      The cluster version the roll finalizes to (the new binaries' own range
+                      max), once a pod on the new binary has reported it.
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                  total:
+                    description: Pods the roll covers (`StatefulSet` replicas).
+                    format: int32
+                    nullable: true
+                    type: integer
+                required:
+                - phase
+                type: object
             type: object
         required:
         - spec

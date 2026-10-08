@@ -1,0 +1,2 @@
+GetItem
+{"TableName": "t", "Key": {"pk": {"S": "k"}}, "ConsistentRead": true, "ProjectionExpression": "pk, a.b[1], #n", "ExpressionAttributeNames": {"#n": "name"}}

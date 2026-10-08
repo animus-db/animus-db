@@ -321,11 +321,11 @@ fn build_reconciler(
     edge: ClusterEdgeState<SimEnv>,
 ) -> SimReconciler {
     let host_edge = edge.clone();
-    let teardown_edge = edge;
+    let teardown_edge = edge.clone();
     let base_id = node_id.clone();
-    if backend == SimEngineBackend::Lsm {
+    let mut reconciler = if backend == SimEngineBackend::Lsm {
         let factory = SimLsmTabletFactory::new(env.clone());
-        return SimReconciler::Lsm(Reconciler::new(
+        SimReconciler::Lsm(Reconciler::new(
             env,
             factory,
             node_id,
@@ -335,19 +335,43 @@ fn build_reconciler(
             move |tablet| {
                 teardown_edge.unregister_raftkv(tablet, base_id.clone());
             },
-        ));
-    }
-    SimReconciler::Mem(Reconciler::new(
-        env,
-        engines,
-        node_id,
-        move |tablet, node: &RaftKvNode<SimEnv, MemoryEngine>| {
-            host_edge.register_raftkv(tablet, CpGroup::Mem(node.clone()));
-        },
-        move |tablet| {
-            teardown_edge.unregister_raftkv(tablet, base_id.clone());
-        },
-    ))
+        ))
+    } else {
+        SimReconciler::Mem(Reconciler::new(
+            env,
+            engines,
+            node_id,
+            move |tablet, node: &RaftKvNode<SimEnv, MemoryEngine>| {
+                host_edge.register_raftkv(tablet, CpGroup::Mem(node.clone()));
+            },
+            move |tablet| {
+                teardown_edge.unregister_raftkv(tablet, base_id.clone());
+            },
+        ))
+    };
+    // ADR 0073 Phase 2 (P2-C): the same injection production's node assembly
+    // makes, so the sim exercises the control-fed handle on every hosted
+    // group.
+    reconciler.set_cluster_features(edge.version().features.clone());
+    reconciler
+}
+
+thread_local! {
+    /// Test-only negative-control switch (`sim_cluster_mrsc`): while set, every
+    /// node's reconciler loop feeds an EMPTY preferred-leader map, so the
+    /// preferred-leader step has nothing to act on. `SimEnv` runs on the
+    /// calling thread, so a thread-local scopes it to one test.
+    static PREFERRED_LEADER_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Switch the preferred-leader step off (`true`) or back on for this test's
+/// cluster (see [`PREFERRED_LEADER_DISABLED`]).
+pub(crate) fn set_preferred_leader_disabled(disabled: bool) {
+    PREFERRED_LEADER_DISABLED.with(|c| c.set(disabled));
+}
+
+fn preferred_leader_disabled() -> bool {
+    PREFERRED_LEADER_DISABLED.with(std::cell::Cell::get)
 }
 
 /// Drive `reconciler`'s per-tick lifecycle on `ctx`'s own node — this
@@ -396,9 +420,19 @@ fn spawn_reconciler_loop(ctx: SimNodeCtx, mut reconciler: SimReconciler) {
                 .filter(|(_, m)| m.status == NodeStatus::Down)
                 .map(|(id, _)| id.clone())
                 .collect();
+            let regions = animus_control::timing::region_map(
+                meta.members.iter().map(|(id, m)| (id, &m.labels)),
+            );
+            let preferred_leader = if preferred_leader_disabled() {
+                BTreeMap::new()
+            } else {
+                crate::leader_preferences(&meta)
+            };
             let view = MetadataView {
                 tablets: meta.tablets,
                 down,
+                regions,
+                preferred_leader,
             };
             reconciler.tick(&view).await;
         }
@@ -650,6 +684,7 @@ async fn discover_join_info_via_relay<E: Env, R: RelayClient>(
     env: &E,
     relay: &R,
     seeds: &[String],
+    own_range: Option<&animus_control::version::VersionRange>,
 ) -> Result<
     (
         Vec<NodeId>,
@@ -675,7 +710,16 @@ async fn discover_join_info_via_relay<E: Env, R: RelayClient>(
             client_route,
             intra_route,
             admin_addrs,
-        } => Ok((control_ids, peers, client_route, intra_route, admin_addrs)),
+            cluster_version,
+        } => {
+            // ADR 0073 P2-C / P2-D: production's `discover_join_info` refuses
+            // a cluster this binary's range excludes before claiming an
+            // identity. `None` (every pre-P2-D caller) skips the check.
+            if let Some(own) = own_range {
+                crate::version_wiring::check_join_range(cluster_version, own)?;
+            }
+            Ok((control_ids, peers, client_route, intra_route, admin_addrs))
+        }
         other => Err(format!(
             "seed returned an unexpected reply to JoinInfo: {other:?}"
         )),
@@ -817,6 +861,7 @@ fn spawn_self_mint_dial(
     mint_relay: SimRelayClient<SimEnv>,
     forced_first_candidate: Option<NodeId>,
     outcome: Arc<Mutex<Option<JoinDialOutcome>>>,
+    own_range: Option<animus_control::version::VersionRange>,
 ) {
     let dial_env = mint_env.clone();
     let dial_relay = mint_relay.clone();
@@ -824,7 +869,13 @@ fn spawn_self_mint_dial(
     mint_env.spawn_task(async move {
         let result = async {
             let (control_ids, _peers, client_route, intra_route, _admin_addrs) =
-                discover_join_info_via_relay(&dial_env, &dial_relay, &dial_seeds).await?;
+                discover_join_info_via_relay(
+                    &dial_env,
+                    &dial_relay,
+                    &dial_seeds,
+                    own_range.as_ref(),
+                )
+                .await?;
             let (id, addrs) = claim_join_identity_via_relay(
                 &dial_env,
                 &dial_relay,
@@ -885,6 +936,16 @@ type GetResult = Result<Option<Vec<u8>>, String>;
 /// reason as [`ScanRows`] — [`SimClusterHandle`]'s own `ctxs` field is a
 /// `Vec` of these behind an `Arc<Mutex<..>>`.
 type SimNodeCtx = ClientCtx<SimEnv, SimRelayClient<SimEnv>>;
+
+/// ADR 0073 Phase 2 (P2-C): spawn one node's version feeder
+/// (`version_wiring::version_wiring_loop`) — the same generic task production's
+/// `spawn_common_tail` spawns on every role. Spawned on every `SimCluster`
+/// node (construction, restart, every growth/join path); `Simulator::stop`
+/// drops it with the rest of the node's tasks, so `restart` respawns it.
+fn spawn_version_loop(ctx: &SimNodeCtx) {
+    let env = ctx.env.clone();
+    env.spawn_task(version_wiring::version_wiring_loop(ctx.clone()));
+}
 
 /// An `E`-free, plain-data projection of [`CpRoute`] — issue #950's own
 /// [`SimClusterHandle::cp_route`]/[`SimCluster::cp_route_timed`] use this
@@ -985,6 +1046,20 @@ impl SimClusterHandle {
     /// `Arc`, or a small handle) — see [`SimClusterHandle`]'s own doc.
     fn ctx(&self, node: u64) -> SimNodeCtx {
         self.ctxs.lock().expect("ctxs poisoned")[node as usize].clone()
+    }
+
+    /// A clone of `node`'s own `ClientCtx` for code that runs the node's real
+    /// handlers by hand (G-d M3: the MREC receiver driven through `SimWorld`).
+    pub(crate) fn node_ctx(&self, node: u64) -> SimNodeCtx {
+        self.ctx(node)
+    }
+
+    /// Give every node's `ClientCtx` the MREC peer configuration `cfg` (G-d M4b:
+    /// the wire-edge `UpdateTable` and the saga read `ctx.mrec`).
+    pub(crate) fn set_mrec_config(&self, cfg: std::sync::Arc<crate::mrec_peer::MrecConfig>) {
+        for ctx in self.ctxs.lock().expect("ctxs poisoned").iter_mut() {
+            ctx.mrec = cfg.clone();
+        }
     }
 
     fn set_ctx(&self, node: u64, ctx: SimNodeCtx) {
@@ -1172,6 +1247,27 @@ impl SimClusterHandle {
         self.ctx(node).effective_metadata()
     }
 
+    /// The ADR 0073 Phase 3 roll-health verdict body `node` computes over the
+    /// **given** metadata snapshot, with no simulated time passing — so a test
+    /// can compare it to a ladder computed over the very same snapshot.
+    pub(crate) fn roll_health_over(&self, node: u64, meta: &Metadata) -> serde_json::Value {
+        self.ctx(node).roll_health_verdict(meta).to_json()
+    }
+
+    /// The body `GET /admin/cluster-version` serves on `node`, computed
+    /// synchronously (no simulated time passes). ADR 0073 Phase 3 (P3-C): the
+    /// roll orchestrator corpus observes the cluster once per tick.
+    pub(crate) fn cluster_version_view(&self, node: u64) -> serde_json::Value {
+        self.ctx(node).admin_cluster_version_view()
+    }
+
+    /// The body `GET /admin/roll-health` serves on `node`, computed
+    /// synchronously (no simulated time passes).
+    pub(crate) fn roll_health_view(&self, node: u64) -> serde_json::Value {
+        let ctx = self.ctx(node);
+        ctx.roll_health_verdict(&ctx.effective_metadata()).to_json()
+    }
+
     /// Every tablet id `node`'s own `ClusterEdgeState` currently holds a
     /// live CP group handle for (ADR 0061 rung D4 PR 1) — regardless of a
     /// tablet's origin (hand-hosted via [`SimCluster::
@@ -1199,6 +1295,17 @@ impl SimClusterHandle {
         let groups = self.ctx(node).edge.hosted_groups();
         let quiesced = groups.iter().filter(|(_, g)| g.is_quiesced()).count();
         (groups.len(), quiesced)
+    }
+
+    /// Each CP group `node` hosts as `tablet:role@term->known leader`, for a
+    /// corpus's convergence-timeout dump.
+    pub(crate) fn group_states(&self, node: u64) -> Vec<String> {
+        self.ctx(node)
+            .edge
+            .hosted_groups()
+            .into_iter()
+            .map(|(t, g)| format!("{}:{}->{:?}", t.0, g.role_term(), g.leader()))
+            .collect()
     }
 
     /// Per-replica progress of every CP group `node` hosts, read straight off
@@ -1378,6 +1485,47 @@ impl SimClusterHandle {
             body,
         )
         .await
+    }
+
+    /// Send `request` from node `from` to node `to` through `from`'s own
+    /// `ClientCtx::relay` (the sim's `SimRelayClient`, whose receiving end is
+    /// `forwarding::handle_relayed_request`: the very function production's
+    /// relay receiver runs). The way a test plays "a follower-connected node
+    /// relays this to its peer" without a socket. ADR 0073 Phase 2 (P2-C).
+    pub(crate) async fn relay_request(
+        &self,
+        from: u64,
+        to: u64,
+        request: ClientRequest,
+    ) -> ClientResponse {
+        let target = self.ctx(to).env.node_id().to_string();
+        self.ctx(from).relay(target, request).await
+    }
+
+    /// Issue #1230: `node`'s own `ClientCtx::register_node` — the single
+    /// bounded attempt (10 s) the pre-fix self-registration task made.
+    pub(crate) async fn register_node_once(
+        &self,
+        node: u64,
+        id: NodeId,
+        addrs: NodeAddrs,
+        labels: BTreeMap<String, String>,
+    ) -> Result<RegisterOutcome, String> {
+        self.ctx(node).register_node(id, addrs, labels).await
+    }
+
+    /// Issue #1230: `node`'s own `ClientCtx::register_node_until_settled` —
+    /// what production's self-registration task runs.
+    pub(crate) async fn register_node_retrying(
+        &self,
+        node: u64,
+        id: NodeId,
+        addrs: NodeAddrs,
+        labels: BTreeMap<String, String>,
+    ) -> RegisterOutcome {
+        self.ctx(node)
+            .register_node_until_settled(id, addrs, labels)
+            .await
     }
 
     /// Call `node`'s own `ClientCtx::propose_schema` directly, bypassing a
@@ -1572,6 +1720,32 @@ impl SimClusterHandle {
         .await
     }
 
+    /// A single anchor stage attempt for a **multi-key group** — the shape the
+    /// coordinator stages for every key it grouped onto one tablet from a
+    /// metadata snapshot, issued from `node`'s own `ClientCtx` with no retry.
+    /// A test uses it to stage a group that a later split has made span two
+    /// tablets (R-01 F-2).
+    pub(crate) async fn txn_prepare_group_once(
+        &self,
+        node: u64,
+        table: &str,
+        group: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    ) -> Result<(TxnId, Vec<u8>, String, HlcTimestamp, StageOutcome), TxnAbortReason> {
+        let ctx = self.ctx(node);
+        ctx.txn_prepare(
+            table,
+            None,
+            group
+                .into_iter()
+                .map(|(k, v)| TxnWrite::plain(k, v))
+                .collect(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+    }
+
     /// Decide `txn_id`'s anchor record `commit`/abort — `ClientCtx::
     /// txn_decide_anchor`, issued from `node`'s own `ClientCtx`. Never
     /// resolves the transaction's own intents (matching production: decide
@@ -1654,6 +1828,9 @@ pub(crate) struct SimCluster {
     /// a different factor for one table uses
     /// [`SimCluster::create_table_with_replication`] instead.
     replication: usize,
+    /// Per-node topology labels registered by `seed_members` (G-01 stage G-a);
+    /// empty for every constructor but `new_with_node_labels`.
+    node_labels: BTreeMap<u64, BTreeMap<String, String>>,
     /// One control `RaftNode<SimEnv>` per node id, index == node id — the
     /// real multi-voter quorum (see the module doc's DDL-bypass bullet for
     /// why this fixture proposes on these handles directly rather than
@@ -2012,6 +2189,62 @@ impl SimCluster {
             segment_janitor_retention,
             cp_quiesce_after,
             SimEngineBackend::Memory,
+            BTreeMap::new(),
+        )
+    }
+
+    /// An all-`Both`, in-memory cluster whose members carry topology labels
+    /// (G-01 stage G-a): `node_labels[i]` is node `i`'s label set, registered
+    /// through both `RegisterNode` and the founding `UpsertMember`, exactly
+    /// as production self-registration does. Tables created over the wire
+    /// (`CreateTable`, i.e. `ClientCtx::provision_tablet`) then get the
+    /// zone-spread policy when the labels span >= RF zones.
+    pub(crate) fn new_with_node_labels(
+        seed: u64,
+        replication: usize,
+        node_labels: Vec<BTreeMap<String, String>>,
+    ) -> Self {
+        let roles = vec![NodeRole::Both; node_labels.len()];
+        Self::new_with_engine_backend(
+            seed,
+            &roles,
+            replication,
+            DEFAULT_SIM_SEGMENT_JANITOR_RETENTION,
+            None,
+            SimEngineBackend::Memory,
+            node_labels
+                .into_iter()
+                .enumerate()
+                .map(|(i, l)| (i as u64, l))
+                .collect(),
+        )
+    }
+
+    /// [`SimCluster::new_with_node_labels`] over real `LsmEngine<SimEnv>`s
+    /// (see [`SimEngineBackend::Lsm`]): a restarted node reopens its retained
+    /// disk, so its tablet groups' Raft state survives the restart exactly as
+    /// in production. With the `Memory` backend a restarted data group replays
+    /// an EMPTY Raft state, which the issue #667 boot-time cluster check
+    /// (correctly) treats as a wiped voter that never campaigns again — right
+    /// for a wiped disk, wrong for a model of a plain process restart.
+    pub(crate) fn new_with_node_labels_lsm(
+        seed: u64,
+        replication: usize,
+        node_labels: Vec<BTreeMap<String, String>>,
+    ) -> Self {
+        let roles = vec![NodeRole::Both; node_labels.len()];
+        Self::new_with_engine_backend(
+            seed,
+            &roles,
+            replication,
+            DEFAULT_SIM_SEGMENT_JANITOR_RETENTION,
+            None,
+            SimEngineBackend::Lsm,
+            node_labels
+                .into_iter()
+                .enumerate()
+                .map(|(i, l)| (i as u64, l))
+                .collect(),
         )
     }
 
@@ -2032,6 +2265,7 @@ impl SimCluster {
             DEFAULT_SIM_SEGMENT_JANITOR_RETENTION,
             cp_quiesce_after,
             SimEngineBackend::Lsm,
+            BTreeMap::new(),
         )
     }
 
@@ -2044,6 +2278,7 @@ impl SimCluster {
         segment_janitor_retention: Duration,
         cp_quiesce_after: Option<Duration>,
         backend: SimEngineBackend,
+        node_labels: BTreeMap<u64, BTreeMap<String, String>>,
     ) -> Self {
         let nodes = roles.len();
         assert!(nodes >= 1, "a cluster needs at least one node");
@@ -2384,6 +2619,7 @@ impl SimCluster {
                 backup_janitor_progress: Arc::new(Mutex::new(
                     animus_node::backup_janitor::JanitorProgress::default(),
                 )),
+                mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
                 ttl_reaper_progress: Arc::new(Mutex::new(
                     animus_node::ttl_reaper::TtlReaperProgress::default(),
                 )),
@@ -2402,6 +2638,7 @@ impl SimCluster {
                 throttle: ThrottleTracker::new(),
                 throttle_defaults: Arc::new(ThrottleDefaults::default()),
                 any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                overload: Default::default(),
             };
             ctxs.push(ctx);
         }
@@ -2482,6 +2719,11 @@ impl SimCluster {
                 reconciler.enable_quiescence(after);
             }
             spawn_reconciler_loop(ctxs[i].clone(), reconciler);
+        }
+
+        // ADR 0073 Phase 2 (P2-C): the per-node version feeder, every role.
+        for ctx in ctxs.iter() {
+            spawn_version_loop(ctx);
         }
 
         // ADR 0061 rung D4 PR 5: one `animus_node::backup_janitor::
@@ -2627,6 +2869,7 @@ impl SimCluster {
             backend,
             control_index,
             control_node_ids,
+            node_labels,
         };
         // Let the control group elect before any caller touches it —
         // generous for up to a handful of voters under `SimEnv`'s
@@ -2724,7 +2967,7 @@ impl SimCluster {
                     self.controls[leader].propose(MetaCommand::RegisterNode {
                         node: id.clone(),
                         addrs,
-                        labels: BTreeMap::new(),
+                        labels: self.node_labels.get(&n).cloned().unwrap_or_default(),
                     }),
                     ProposeResult::Accepted { .. }
                 ),
@@ -2737,7 +2980,7 @@ impl SimCluster {
                 matches!(
                     self.controls[leader].propose(MetaCommand::UpsertMember {
                         node: id.clone(),
-                        labels: BTreeMap::new(),
+                        labels: self.node_labels.get(&n).cloned().unwrap_or_default(),
                         status: NodeStatus::Active,
                     }),
                     ProposeResult::Accepted { .. }
@@ -3195,6 +3438,104 @@ impl SimCluster {
         self.controls[idx].version_observations()
     }
 
+    /// ADR 0073 Phase 2 (P2-C): make `node` run "a binary" supporting
+    /// `range` (`None` = a Phase 1 binary: empty handshake `ext`, never
+    /// evaluates the era, never self-reports). Does all three things a binary
+    /// is: the node's own version profile (what its `version_wiring_loop` and
+    /// admin view use), its control `RaftNode`'s own range + build (when
+    /// control-bearing; a data-only node has no `RaftNode`), and the
+    /// simulated network `ext` its peers observe (`Simulator::
+    /// set_network_ext_for`). Takes effect immediately, no restart needed.
+    pub(crate) fn set_node_version(
+        &mut self,
+        node: u64,
+        range: Option<animus_control::version::VersionRange>,
+    ) {
+        let ctx = self.shared.ctx(node);
+        let build = version_wiring::BUILD.to_string();
+        ctx.edge
+            .version()
+            .set_profile(version_wiring::VersionProfile {
+                range,
+                build: build.clone(),
+            });
+        if let Some(idx) = self.control_index_of(node) {
+            self.controls[idx].set_own_build(build.clone());
+            self.controls[idx].set_own_version_range(range);
+        }
+        self.sim
+            .set_network_ext_for(ctx.env.node_id(), version_wiring::ext_for(range, &build));
+    }
+
+    /// Set ONLY a control-bearing node's `RaftNode` own range, leaving its
+    /// profile and network `ext` alone — a test hook to switch the leader's
+    /// era upkeep (`era_on_proposals`) off while the (sticky) era stays on, so
+    /// a test can prove a node's own self-report lands through the relay path
+    /// and not merely through the leader noticing a changed `ext`.
+    pub(crate) fn set_raft_own_range(
+        &mut self,
+        node: u64,
+        range: Option<animus_control::version::VersionRange>,
+    ) {
+        let idx = self
+            .control_index_of(node)
+            .unwrap_or_else(|| panic!("node {node} is not control-bearing"));
+        self.controls[idx].set_own_version_range(range);
+    }
+
+    /// [`set_node_version`](Self::set_node_version) for every node.
+    pub(crate) fn set_all_node_versions(
+        &mut self,
+        range: Option<animus_control::version::VersionRange>,
+    ) {
+        for node in 0..self.nodes as u64 {
+            self.set_node_version(node, range);
+        }
+    }
+
+    /// The node's own `ClusterFeatures` handle (ADR 0073 Phase 2, P2-C): the
+    /// one handle every gated emitter consults.
+    pub(crate) fn features(&self, node: u64) -> animus_control::version::ClusterFeatures {
+        self.shared.ctx(node).edge.version().features.clone()
+    }
+
+    /// The control `RaftNode`'s own feature handle (the one its `propose`
+    /// consults), distinct from the node-level handle of
+    /// [`features`](Self::features) that the wire/relay emitters use.
+    pub(crate) fn control_features(&self, node: u64) -> animus_control::version::ClusterFeatures {
+        let idx = self
+            .control_index_of(node)
+            .unwrap_or_else(|| panic!("node {node} is not control-bearing"));
+        self.controls[idx].features()
+    }
+
+    /// The feature-gate handle of every CP group `node` currently hosts, in
+    /// tablet order (ADR 0073 Phase 2, P2-C): what the node's reconciler
+    /// injected into each `RaftKvNode`.
+    pub(crate) fn hosted_group_features(
+        &self,
+        node: u64,
+    ) -> Vec<animus_control::version::ClusterFeatures> {
+        self.shared
+            .ctx(node)
+            .edge
+            .hosted_groups()
+            .iter()
+            .map(|(_, g)| g.features())
+            .collect()
+    }
+
+    /// One metric's current value on `node` (the node's aggregated control +
+    /// data sinks, as `/admin/metrics` reports it).
+    pub(crate) fn metric(&self, node: u64, metric: animus_env::Metric) -> u64 {
+        self.shared.ctx(node).metrics_json().0[metric.name()]
+    }
+
+    /// The node's version halt reason, if its feeder latched one.
+    pub(crate) fn version_halt(&self, node: u64) -> Option<String> {
+        self.shared.ctx(node).edge.version().halt.get()
+    }
+
     /// **C-13 / ADR 0061 rung M PR 6**: `(commit_index, engine_applied_index)`
     /// read directly off `node`'s own local control `RaftNode<SimEnv>` —
     /// bypasses the `/admin/raft` HTTP-JSON round trip entirely (unlike
@@ -3264,6 +3605,21 @@ impl SimCluster {
         self.shared.metadata(node)
     }
 
+    /// See `SimClusterHandle::cluster_version_view` (no simulated time passes).
+    pub(crate) fn cluster_version_view(&self, node: u64) -> serde_json::Value {
+        self.shared.cluster_version_view(node)
+    }
+
+    /// See `SimClusterHandle::roll_health_view` (no simulated time passes).
+    pub(crate) fn roll_health_view(&self, node: u64) -> serde_json::Value {
+        self.shared.roll_health_view(node)
+    }
+
+    /// See `SimClusterHandle::roll_health_over` (verdict over a snapshot).
+    pub(crate) fn roll_health_over(&self, node: u64, meta: &Metadata) -> serde_json::Value {
+        self.shared.roll_health_over(node, meta)
+    }
+
     /// Whether **every replica of every tablet** hosted across the cluster's
     /// nodes has its own engine caught up to the highest commit index any
     /// replica of that tablet reports, with every voter actually reporting
@@ -3277,6 +3633,11 @@ impl SimCluster {
         // tablet -> (max commit, per-node applied, max voter count)
         let mut tablets: BTreeMap<TabletId, TabletProgress> = BTreeMap::new();
         for node in 0..self.node_count() as u64 {
+            // A crashed (muted) node cannot catch up; its stale replica of a
+            // group that was repaired away from it is not a progress signal.
+            if self.crashed.contains(&node) {
+                continue;
+            }
             for (t, commit, applied, voters) in self.shared.replica_progress(node) {
                 let e = tablets.entry(t).or_insert((0, Vec::new(), 0));
                 e.0 = e.0.max(commit);
@@ -3337,6 +3698,11 @@ impl SimCluster {
     /// (C-17 Tier 1).
     pub(crate) fn quiesced_counts(&self, node: u64) -> (usize, usize) {
         self.shared.quiesced_counts(node)
+    }
+
+    /// [`SimClusterHandle::group_states`]'s driver-callable twin.
+    pub(crate) fn group_states(&self, node: u64) -> Vec<String> {
+        self.shared.group_states(node)
     }
 
     /// [`SimClusterHandle::hosted_tablets`]'s own driver-callable twin.
@@ -3906,7 +4272,7 @@ impl SimCluster {
     /// cost by well over half relative to the pre-fix (`SimCluster::new`)
     /// baseline — see `SCENARIO_TIMER_FIRES_BUDGET`'s own doc for the exact
     /// before/after numbers this fix was measured against.
-    fn spawn_and_capture_fast<T, F>(&mut self, node: u64, fut: F) -> Option<T>
+    pub(crate) fn spawn_and_capture_fast<T, F>(&mut self, node: u64, fut: F) -> Option<T>
     where
         T: Send + 'static,
         F: std::future::Future<Output = T> + Send + 'static,
@@ -4149,6 +4515,20 @@ impl SimCluster {
         })
     }
 
+    /// [`SimClusterHandle::relay_request`]'s `&mut self` driver sibling.
+    /// `None` when the relay never resolved within the op budget.
+    pub(crate) fn relay_request(
+        &mut self,
+        from: u64,
+        to: u64,
+        request: ClientRequest,
+    ) -> Option<ClientResponse> {
+        let handle = self.shared.clone();
+        self.spawn_and_capture(from, async move {
+            handle.relay_request(from, to, request).await
+        })
+    }
+
     /// [`SimClusterHandle::propose_schema_direct`]'s own `&mut self` driver
     /// sibling — same early-returning shape as [`SimCluster::dynamo_fast`]
     /// (stops the instant the result lands, [`SPAWN_CAPTURE_FAST_STEP`]
@@ -4185,6 +4565,14 @@ impl SimCluster {
                 ),
             )
         })
+    }
+
+    /// `node`'s real `GET /metrics` text exposition — the exact string
+    /// production's DynamoDB listener serves (`ClientCtx::metrics_text`), read
+    /// synchronously (no simulated I/O). Used by the R-01 (f) metrics-reference
+    /// check (`sim_cluster_admin::metric_references_exist_in_exposition`).
+    pub(crate) fn metrics_text(&self, node: u64) -> String {
+        self.shared.ctx(node).metrics_text()
     }
 
     /// Run an admin HTTP-JSON request against `node`'s own `ClientCtx` (ADR
@@ -4490,6 +4878,26 @@ impl SimCluster {
         .unwrap_or_else(|| {
             Err(TxnAbortReason::Other(format!(
                 "txn_prepare_once on node {node} did not complete within {OP_BUDGET:?}"
+            )))
+        })
+    }
+
+    /// [`SimClusterHandle::txn_prepare_group_once`], driven from a test's own
+    /// `&mut self` call exactly like [`SimCluster::put`] above.
+    pub(crate) fn txn_prepare_group_once(
+        &mut self,
+        node: u64,
+        table: &str,
+        group: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    ) -> Result<(TxnId, Vec<u8>, String, HlcTimestamp, StageOutcome), TxnAbortReason> {
+        let handle = self.shared.clone();
+        let table = table.to_owned();
+        self.spawn_and_capture(node, async move {
+            handle.txn_prepare_group_once(node, &table, group).await
+        })
+        .unwrap_or_else(|| {
+            Err(TxnAbortReason::Other(format!(
+                "txn_prepare_group_once on node {node} did not complete within {OP_BUDGET:?}"
             )))
         })
     }
@@ -5418,6 +5826,7 @@ impl SimCluster {
             });
 
             self.controls[idx] = fresh_control;
+            spawn_version_loop(&ctx);
             self.shared.set_ctx(node, ctx);
         } else {
             // ---- data-only node (NodeRole::Data), constructed or grown (ADR 0061 rung L, C-12 PR 3) ----
@@ -5499,6 +5908,7 @@ impl SimCluster {
             });
 
             self.shared.set_ctx(node, ctx.clone());
+            spawn_version_loop(&ctx);
 
             // The one genuinely new mechanism a `NodeRole::Data` node's
             // restart needs — a fresh `SimEnv`-native mirror-sync loop over
@@ -5574,6 +5984,13 @@ impl SimCluster {
     /// window, or drain a background effect between two assertions.
     pub(crate) fn run_for(&mut self, dur: Duration) {
         self.sim.run_for(dur);
+    }
+
+    /// Replace every node's simulated disk behavior (ENOSPC injection, issue
+    /// #1228's every-replica-full window). Applies to retained engines and WALs
+    /// alike; pass `DiskConfig::default()` to return space.
+    pub(crate) fn set_disk_config(&mut self, cfg: animus_sim::DiskConfig) {
+        self.sim.set_disk_config(cfg);
     }
 
     /// The seed this cluster was built from — for an assertion message
@@ -5781,6 +6198,7 @@ impl SimCluster {
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),
+            mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             ttl_reaper_progress: Arc::new(Mutex::new(
                 animus_node::ttl_reaper::TtlReaperProgress::default(),
             )),
@@ -5799,6 +6217,7 @@ impl SimCluster {
             throttle: ThrottleTracker::new(),
             throttle_defaults: Arc::new(ThrottleDefaults::default()),
             any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            overload: Default::default(),
         };
 
         // Install the relay server, exactly like `SimCluster::new`/
@@ -5810,6 +6229,7 @@ impl SimCluster {
         });
 
         self.shared.push_ctx(ctx.clone());
+        spawn_version_loop(&ctx);
         self.engines.push(MemoryTabletEngines::new());
         // ADR 0061 rung L, C-12 PR 2: keeps `self.roles` index-aligned with
         // `self.engines`/`self.shared`'s own ctxs — `grow` supports
@@ -6121,6 +6541,7 @@ impl SimCluster {
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),
+            mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             ttl_reaper_progress: Arc::new(Mutex::new(
                 animus_node::ttl_reaper::TtlReaperProgress::default(),
             )),
@@ -6139,6 +6560,7 @@ impl SimCluster {
             throttle: ThrottleTracker::new(),
             throttle_defaults: Arc::new(ThrottleDefaults::default()),
             any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            overload: Default::default(),
         };
 
         let ctx_for_server = ctx.clone();
@@ -6148,6 +6570,7 @@ impl SimCluster {
         });
 
         self.shared.push_ctx(ctx.clone());
+        spawn_version_loop(&ctx);
         self.engines.push(MemoryTabletEngines::new());
         self.roles.push(NodeRole::Control);
         self.nodes += 1;
@@ -6430,6 +6853,7 @@ impl SimCluster {
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),
+            mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             ttl_reaper_progress: Arc::new(Mutex::new(
                 animus_node::ttl_reaper::TtlReaperProgress::default(),
             )),
@@ -6448,6 +6872,7 @@ impl SimCluster {
             throttle: ThrottleTracker::new(),
             throttle_defaults: Arc::new(ThrottleDefaults::default()),
             any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            overload: Default::default(),
         };
 
         let ctx_for_server = ctx.clone();
@@ -6457,6 +6882,7 @@ impl SimCluster {
         });
 
         self.shared.push_ctx(ctx.clone());
+        spawn_version_loop(&ctx);
         self.engines.push(MemoryTabletEngines::new());
         self.roles.push(NodeRole::Both);
         self.nodes += 1;
@@ -6635,6 +7061,62 @@ impl SimCluster {
         new_n
     }
 
+    /// ADR 0073 Phase 2 (P2-D): one join dial played by a binary of `joiner`'s
+    /// range (`None` = a Phase 1 binary: empty handshake `ext`, no range
+    /// check), **returning** the outcome instead of panicking, so a refusal can
+    /// be asserted. The dial's `ext` is installed on its throwaway pre-bind
+    /// identity (what the seed's handshake sees), the joiner applies the
+    /// production `check_join_range` at discovery, and on success the claimed
+    /// node is given the same `ext` and version profile before `finish_join`
+    /// (its heartbeats must pass an era-on cluster's handshake).
+    pub(crate) fn try_join_via_seed_as(
+        &mut self,
+        seed_node: usize,
+        role: NodeRole,
+        joiner: Option<animus_control::version::VersionRange>,
+    ) -> Result<u64, String> {
+        let wire_role = match role {
+            NodeRole::Both => "combined",
+            NodeRole::Data => "data",
+            NodeRole::Control => panic!("try_join_via_seed_as: NodeRole::Control is not joinable"),
+        };
+        let build = version_wiring::BUILD.to_string();
+        let mint_id = nid(self.nodes as u64);
+        self.sim
+            .set_network_ext_for(mint_id.clone(), version_wiring::ext_for(joiner, &build));
+        let mint_env = self.sim.env(mint_id);
+        let mint_relay: SimRelayClient<SimEnv> = SimRelayClient::new(mint_env.clone());
+        let outcome: Arc<Mutex<Option<JoinDialOutcome>>> = Arc::new(Mutex::new(None));
+        spawn_self_mint_dial(
+            &[nid(seed_node as u64).to_string()],
+            wire_role,
+            mint_env,
+            mint_relay,
+            None,
+            outcome.clone(),
+            joiner,
+        );
+        self.sim.run_for(JOIN_DIAL_DRIVE_BUDGET);
+        let (id, _addrs, discovered) = outcome
+            .lock()
+            .expect("join dial result slot poisoned")
+            .take()
+            .ok_or_else(|| {
+                format!("the dial did not resolve within {JOIN_DIAL_DRIVE_BUDGET:?}")
+            })??;
+        self.sim
+            .set_network_ext_for(id.clone(), version_wiring::ext_for(joiner, &build));
+        let idx = self.finish_join(
+            id,
+            wire_role,
+            discovered.control_ids,
+            discovered.client_route,
+            discovered.intra_route,
+        );
+        self.set_node_version(idx, joiner);
+        Ok(idx)
+    }
+
     /// **C-13 / ADR 0061 rung M PR 2: the real seed/join dial.** Combined-
     /// mode-only entry point, kept unchanged for every existing caller —
     /// delegates to [`join_via_seed_with_role`](Self::join_via_seed_with_role)
@@ -6792,6 +7274,7 @@ impl SimCluster {
                 mint_relay,
                 None,
                 outcome.clone(),
+                None,
             );
         }
 
@@ -6904,6 +7387,7 @@ impl SimCluster {
             mint_relay,
             Some(colliding_with.clone()),
             outcome.clone(),
+            None,
         );
         self.sim.run_for(JOIN_DIAL_DRIVE_BUDGET);
         let (id, _addrs, discovered) = outcome
@@ -7014,7 +7498,7 @@ impl SimCluster {
         mint_env.spawn_task(async move {
             let result = async {
                 let (control_ids, _peers, client_route, intra_route, _admin_addrs) =
-                    discover_join_info_via_relay(&dial_env, &dial_relay, &dial_seeds).await?;
+                    discover_join_info_via_relay(&dial_env, &dial_relay, &dial_seeds, None).await?;
                 let register_outcome = register_node_over_wire_via_relay(
                     &dial_env,
                     &dial_relay,
@@ -7187,6 +7671,7 @@ impl SimCluster {
             backup_janitor_progress: Arc::new(Mutex::new(
                 animus_node::backup_janitor::JanitorProgress::default(),
             )),
+            mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             ttl_reaper_progress: Arc::new(Mutex::new(
                 animus_node::ttl_reaper::TtlReaperProgress::default(),
             )),
@@ -7205,6 +7690,7 @@ impl SimCluster {
             throttle: ThrottleTracker::new(),
             throttle_defaults: Arc::new(ThrottleDefaults::default()),
             any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            overload: Default::default(),
         };
 
         let ctx_for_server = ctx.clone();
@@ -7214,6 +7700,7 @@ impl SimCluster {
         });
 
         self.shared.push_ctx(ctx.clone());
+        spawn_version_loop(&ctx);
         self.engines.push(MemoryTabletEngines::new());
         // See this method's own doc on why `NodeRole::Data`, not `Both`.
         self.roles.push(NodeRole::Data);
@@ -7362,7 +7849,7 @@ impl SimCluster {
     pub(crate) fn drain(&mut self, node: u64) {
         let leader = self.control_leader_index();
         let ctx = self.shared.ctx(leader as u64);
-        ctx.admin_drain(nid(node)).unwrap_or_else(|e| {
+        ctx.admin_drain(nid(node), false).unwrap_or_else(|e| {
             panic!("admin_drain(node={node}) must be accepted by the control leader: {e}")
         });
         self.poll_until(Duration::from_secs(20), |c| {

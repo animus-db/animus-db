@@ -66,6 +66,13 @@ pub async fn dispatch<H: AdminHost + ?Sized>(
         ("POST", "/admin/control/member/add") => host.action_add_control_member(body).await,
         ("POST", "/admin/control/member/remove") => host.action_remove_control_member(body).await,
         ("POST", "/admin/control/transfer") => host.action_transfer_control_leadership(body).await,
+        ("GET", "/admin/cluster-version") => (200, host.cluster_version_view().await),
+        ("GET", "/admin/roll-health") => (200, host.roll_health_view().await),
+        ("POST", "/admin/cluster-version/finalize") => {
+            host.action_finalize_cluster_version(body).await
+        }
+        ("GET", "/admin/global-tables") => (200, host.global_tables_view().await),
+        ("POST", "/admin/table/preferred-leader") => host.action_set_preferred_leader(body).await,
         ("POST", "/admin/data/dynamo") => host.action_data_dynamo(body).await,
         ("POST", "/admin/data/drop-table") => host.action_drop_table(body).await,
         ("POST", "/admin/data/seed") => host.action_data_seed(body).await,
@@ -245,7 +252,24 @@ mod tests {
         async fn action_remove_control_member(&self, _body: &[u8]) -> (u16, Value) {
             unreachable!()
         }
+        async fn cluster_version_view(&self) -> Value {
+            self.record()
+        }
+        async fn roll_health_view(&self) -> Value {
+            self.record()
+        }
+        async fn action_finalize_cluster_version(&self, body: &[u8]) -> (u16, Value) {
+            assert_eq!(body, b"the-body");
+            (200, self.record())
+        }
         async fn action_transfer_control_leadership(&self, body: &[u8]) -> (u16, Value) {
+            assert_eq!(body, b"the-body");
+            (200, self.record())
+        }
+        async fn global_tables_view(&self) -> Value {
+            self.record()
+        }
+        async fn action_set_preferred_leader(&self, body: &[u8]) -> (u16, Value) {
             assert_eq!(body, b"the-body");
             (200, self.record())
         }
@@ -352,6 +376,38 @@ mod tests {
         ));
         assert_eq!(status, 200);
         assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cluster_version_routes_dispatch_to_the_host() {
+        let host = FakeHost::new();
+        let (status, _) = block_on(dispatch(&host, "GET", "/admin/cluster-version", "", b""));
+        assert_eq!(status, 200);
+        let (status, _) = block_on(dispatch(
+            &host,
+            "POST",
+            "/admin/cluster-version/finalize",
+            "",
+            b"the-body",
+        ));
+        assert_eq!(status, 200);
+        assert_eq!(host.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn global_table_routes_dispatch_to_the_host() {
+        let host = FakeHost::new();
+        let (status, _) = block_on(dispatch(&host, "GET", "/admin/global-tables", "", b""));
+        assert_eq!(status, 200);
+        let (status, _) = block_on(dispatch(
+            &host,
+            "POST",
+            "/admin/table/preferred-leader",
+            "",
+            b"the-body",
+        ));
+        assert_eq!(status, 200);
+        assert_eq!(host.calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]

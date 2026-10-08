@@ -188,7 +188,12 @@
         Which nodes hold which replicas is a <strong>placement</strong> decision made by the
         control plane. The placement engine honours the replication factor, spreads replicas
         across failure domains, and respects residency labels — so you can require that a
-        group's data never leaves a given region or jurisdiction.
+        group's data never leaves a given region or jurisdiction. A node's labels are set at
+        its first registration with <code>--label key=value</code>, <code>--labels-file</code>,
+        or a node entry's <code>labels</code> in the cluster config; on Kubernetes the operator
+        supplies the node's <code>topology.kubernetes.io/region</code> and <code>/zone</code>
+        automatically, and a table created while the members span at least as many zones as
+        its replication factor spreads its replicas across zones (best effort).
       </p>
       <p>
         When a node fails, the control plane notices through heartbeats, re-plans the affected
@@ -390,8 +395,8 @@
             <tr><td><code>UpdateContinuousBackups</code> · <code>DescribeContinuousBackups</code> · <code>RestoreTableToPointInTime</code></td><td><span class="pill yes">Yes</span></td><td>Continuous backups (PITR). Restore to any second within the continuous-coverage window, into a brand-new table; works even if the source table has since been dropped</td></tr>
             <tr><td><code>ExportTableToPointInTime</code> · <code>DescribeExport</code> · <code>ListExports</code></td><td><span class="pill yes">Yes</span></td><td>Export to a customer-named S3 bucket in DynamoDB's own JSON layout. <code>DYNAMODB_JSON</code> format and a full (not incremental) export only</td></tr>
             <tr><td><code>ImportTable</code> · <code>DescribeImport</code> · <code>ListImports</code></td><td><span class="pill yes">Yes</span></td><td>Import from a customer-named S3 bucket in DynamoDB's own JSON layout into a brand-new table. <code>DYNAMODB_JSON</code> format only, <code>GZIP</code> or uncompressed; a malformed item is skipped and counted rather than failing the whole import, up to a bounded cap</td></tr>
-            <tr><td>Provisioned throughput / throttling</td><td><span class="pill yes">Yes</span></td><td>A table's declared <code>ProvisionedThroughput</code>, or a cluster-wide default, is enforced as a real per-tablet admission budget — an exhausted budget returns <code>ProvisionedThroughputExceededException</code> (or a <code>ThrottlingError</code> cancellation reason for <code>TransactWriteItems</code>). Declaring throughput also sizes tablet count up front, DynamoDB's own <code>ceil(RCU/3000 + WCU/1000)</code> formula. A transient unavailability that outlasts the server's own retry budget (a tablet split cutover, not a capacity refusal) returns <code>ServiceUnavailable</code> (HTTP 503) instead, retried by every AWS SDK's default policy</td></tr>
-            <tr><td>Global tables</td><td><span class="pill no">No</span></td><td>Not implemented yet — planned (multi-region replication; design proposed in ADR 0075)</td></tr>
+            <tr><td>Provisioned throughput / throttling</td><td><span class="pill yes">Yes</span></td><td>A table's declared <code>ProvisionedThroughput</code>, or a cluster-wide default, is enforced as a real per-tablet admission budget — an exhausted budget returns <code>ProvisionedThroughputExceededException</code> (or a <code>ThrottlingError</code> cancellation reason for <code>TransactWriteItems</code>). Declaring throughput also sizes tablet count up front, DynamoDB's own <code>ceil(RCU/3000 + WCU/1000)</code> formula. A transient unavailability that outlasts the server's own retry budget (a tablet split cutover, not a capacity refusal) returns <code>ServiceUnavailable</code> (HTTP 503) instead, retried by every AWS SDK's default policy. A node at its connection cap (<code>--max-connections</code>, default 4096) or in-flight request bound (<code>--max-inflight</code>, default 2048) sheds with the same <code>ServiceUnavailable</code> rather than queueing</td></tr>
+            <tr><td>Global tables</td><td><span class="pill part">Partial</span></td><td>Both modes, verified in simulation (ADR 0075). Multi-Region strongly consistent (MRSC): <code>UpdateTable</code> <code>ReplicaUpdates</code> + <code>MultiRegionConsistency: STRONG</code> on an empty table (three Regions, or two plus a witness), cluster version 2. Multi-Region eventually consistent (MREC): independent clusters configured as peers (<code>--region</code>, <code>--peer REGION=host:intra-port</code>, mutual TLS on the intra port; on Kubernetes the operator renders <code>spec.region</code>/<code>spec.peers</code> into the same config, unit-tested only, not yet run on a real cluster), <code>ReplicaUpdates</code> <code>Create</code>/<code>Delete</code> with no consistency or <code>EVENTUAL</code> on a populated table, last-writer-wins, cluster version 3; a replica's stream shows the latest state of a key, not every intermediate write. The legacy 2017.11.29 operations are not supported</td></tr>
             <tr><td>On-demand billing metering</td><td><span class="pill no">No</span></td><td>Out of scope for now — throttling is admission control, not an invoice</td></tr>
           </tbody>
         </table>
@@ -454,9 +459,23 @@
 <span class="p">$</span> <span class="k">animus admin flush|compact &lt;admin-addr&gt; &lt;tablet&gt;</span>
 <span class="p">$</span> <span class="k">animus admin reconfigure &lt;admin-addr&gt; &lt;tablet&gt; &lt;voter,voter,...&gt;</span>
 <span class="p">$</span> <span class="k">animus admin drain|drain-status|remove|decommission &lt;admin-addr&gt; &lt;node-id&gt;</span>
+<span class="p">$</span> <span class="k">animus admin drain &lt;admin-addr&gt; &lt;node-id&gt; --force</span>   <span class="c"># override the guard on the last Active node of a Region a global table pins</span>
 
-<span class="c"># control-plane membership</span>
+<span class="c"># control-plane membership (once the version era is on, start the new control voter first: it must be up to be admitted)</span>
 <span class="p">$</span> <span class="k">animus admin control-add|control-remove|control-grow|control-transfer &lt;leader-admin-addr&gt; …</span>
+
+<span class="c"># cluster version (ADR 0073 Phase 2)</span>
+<span class="p">$</span> <span class="k">animus cluster version &lt;admin-addr&gt; [--json]</span>
+<span class="p">$</span> <span class="k">animus cluster finalize &lt;leader-admin-addr&gt; [--to N] [--yes]</span>
+
+<span class="c"># rolling upgrade supervisor (ADR 0073 Phase 3): you restart each node; the CLI orders, gates and waits</span>
+<span class="p">$</span> <span class="k">animus cluster roll plan &lt;admin-addr&gt; [--json]</span>     <span class="c"># the roll order; exits 1 if a precondition fails</span>
+<span class="p">$</span> <span class="k">animus cluster roll wait &lt;node-admin-addr&gt; [--timeout 10m]</span>   <span class="c"># until that node is healthy and reports the new range</span>
+<span class="p">$</span> <span class="k">animus cluster roll status &lt;admin-addr&gt; [--json]</span>
+
+<span class="c"># global tables: MRSC regions/placement, and MREC replicas + this node's per-peer shipper health (backlog, lag, last error)</span>
+<span class="p">$</span> <span class="k">animus admin global-tables &lt;admin-addr&gt;</span>
+<span class="p">$</span> <span class="k">animus table preferred-leader &lt;admin-addr&gt; &lt;table&gt; &lt;region&gt;</span>
 
 <span class="c"># backup, restore, PITR, TTL, streams</span>
 <span class="p">$</span> <span class="k">animus admin backup-create &lt;admin-addr&gt; &lt;table&gt; &lt;backup-name&gt;</span>
@@ -532,11 +551,19 @@
         (<code>kubectl patch</code> its <code>nodes</code> field); deleting the custom resource
         tears down everything it owns through ordinary Kubernetes garbage collection. A
         CI-gated smoke test exercises a real <code>kind</code> cluster end-to-end — create,
-        bootstrap, scale, delete — on every change to this surface. Kubernetes' own rolling
-        update would replace pods one at a time on an image change, but AnimusDB does not yet
-        support running two versions in one cluster (no wire compatibility, no rolling
-        upgrades), so the operator does not orchestrate upgrades: the supported path is a
-        whole-cluster stop, upgrade and restart.
+        bootstrap, scale, delete — on every change to this surface. An image (or other
+        pod-template) edit is a gated rolling upgrade: the operator owns the StatefulSet's
+        update <code>partition</code> and lowers it one pod at a time, only while every member is
+        <code>Active</code>, the cluster-wide roll-health check passes and the previous pod has
+        reported the new version range; the control leader is handed leadership away before its
+        pod restarts. A pod that does not come back healthy stops the roll
+        (<code>UpgradeBlocked</code> names why; fix forward by editing the image again), and
+        the new cluster version is raised by <code>animus cluster finalize</code>, or by the
+        operator itself with <code>spec.upgrade.finalize: Auto</code>. Progress is on
+        <code>status.upgrade</code> and the <code>UpgradeInProgress</code> /
+        <code>UpgradeFinalizePending</code> / <code>RollComplete</code> conditions. Shapes that
+        cannot lose a node (fewer than three nodes, or one control node) are not rolled:
+        use a whole-cluster stop, upgrade and restart.
       </p>
     </section>
 
@@ -567,6 +594,16 @@
         groups and deletes their storage. The process is convergent — it finishes correctly even
         if nodes restart partway through.
       </p>
+      <h3>Runbook</h3>
+      <p>
+        Procedures for replacing or decommissioning a node, losing the control quorum, backup
+        and restore drills, certificate rotation, upgrades, disk sizing and overload live in the
+        <a href="https://github.com/animus-db/animus-db/blob/main/docs/runbook/README.md">operations
+        runbook</a>. It states plainly where a procedure has no tool yet (there is no recovery
+        tool for a permanently lost control quorum, no in-place encryption-key rotation, and
+        disk-full handling is proven in simulation and in a real-process chaos run on size-limited filesystems, not yet on a delayed-allocation one such as ext4 or xfs) and which procedures have not yet been
+        exercised on a real cluster.
+      </p>
     </section>
 
     <section id="observability">
@@ -574,7 +611,9 @@
       <ul>
         <li><strong>Metrics</strong> — a line-oriented <code>name value</code> text export at
           <code>GET /metrics</code> on the DynamoDB port. Counters and a leadership gauge, in
-          stable order.</li>
+          stable order. Reference Prometheus alert rules, availability SLO
+          recording rules and a Grafana dashboard ship in
+          <code>deploy/observability/</code>.</li>
         <li><strong>Tracing</strong> — optional OpenTelemetry export with W3C trace context
           propagated across forwarded hops, so a request that lands on the wrong node still shows
           as one trace.</li>
@@ -634,10 +673,28 @@
           config-gated per cluster. A cluster with no TLS configured is unauthenticated plain TCP,
           exactly as before; caller identity on the DynamoDB port is opt-in SigV4 either way, not
           affected by TLS.</li>
-        <li><strong>No rolling upgrades or mixed-version clusters.</strong> A full-cluster stop,
-          upgrade and restart across versions is supported and tested (on-disk formats stay
-          readable across versions), but nodes on different versions cannot talk to each
-          other yet, so upgrade every node at once.</li>
+        <li><strong>Rolling upgrades are one node at a time, by hand with CLI support or driven by the Kubernetes operator.</strong>
+          By hand, <code>animus cluster roll plan</code> prints the order (data-only nodes, then control voters,
+          the control leader last) and refuses if the cluster is not healthy; you restart one node on the
+          new binary; <code>animus cluster roll wait</code> blocks until that node is <code>Active</code>,
+          has reported the new range and the server-side roll-health check passes (no tablet
+          under-replicated, its own groups caught up); then run <code>animus cluster finalize</code>
+          once every member (down ones too) reports the new version range
+          (<code>roll wait --finalize --yes</code> on the last node does it for you, opt-in).
+          <code>animus cluster roll status</code> shows progress. On Kubernetes the operator runs the same
+          gate from a <code>spec.image</code> edit (see the operator section above); finalize stays
+          manual unless <code>spec.upgrade.finalize: Auto</code> is set. Each node advertises the cluster versions its binary
+          supports; <code>animus cluster version</code> shows the active version, every node's
+          range and what blocks raising it; finalize raises it one step, on the leader only,
+          irreversibly, and is refused while any member is down, leaving, never activated or
+          does not support the target. A mixed-version simulation corpus and a real-process
+          previous-release roll test cover it. A roll restarts each node in turn, so on a cluster
+          with spare nodes a slow restart can trigger replica rebuilds (correct, only wasteful).
+          Supported: from today's binaries to this release, and from one release to the next.
+          Not supported: skipping a release, rolling a node back after it ran the new binary,
+          reverting <code>spec.image</code> mid-roll, an old binary joining once versioning has started
+          (refused by name), and, for now, a roll from an older release with multi-item transactions in use (that
+          release's own abort-handling bug, open). The CLI restarts nothing itself.</li>
         <li><strong>Restore always creates a brand-new table, never in-place</strong> — matching
           real DynamoDB, for both on-demand backups (<code>RestoreTableFromBackup</code>) and
           continuous backups (<code>RestoreTableToPointInTime</code>); a source table's backup

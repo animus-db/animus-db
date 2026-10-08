@@ -37,6 +37,15 @@ per-tablet CP data plane (`animus-cp-data`).
   relayable in `animus-node` since P2-B (era-only; refused pre-era by the gate
   checks below).
 
+- **Finalize at apply** (issue #1168): `Metadata::apply` for
+  `FinalizeClusterVersion` rejects (`"blocked: a member is Down, Leaving, or a
+  never-activated Joining"`) on any `members` row for which
+  `Member::finalize_block_reason()` is `Some`, after the target check and
+  before the required-set range loop; `animusd`'s admin pre-check calls the same
+  method, so the two cannot drift. `tests/it/version_finalize_status.rs` pins
+  each status and the pre-check/apply race (a member flipped `Down` between
+  them); the apply corpus's independent oracle carries the status half.
+
 - **`version_observe.rs` + `RaftNode`'s `version_loop`** (ADR 0073 Phase 2,
   P2-A section 2). Leader-local, passive, **no wire change**: the driver loop
   records `Envelope.from -> (Option<VersionRange>, build, observed_at)` for
@@ -96,11 +105,21 @@ per-tablet CP data plane (`animus-cp-data`).
   applies own range + build + a **capped decode** atomically: the control recv
   arm (`node.rs`, one match guard before `Ok(msg)`) takes the SAME branch as an
   undecodable message (warn, drop, nothing reaches the core) when
-  `provisional_required_gate(msg)` is a gate the profile does not know, and
-  records a `CapRejection`. `provisional_required_gate` is a single-call-site
-  stub (an `AppendEntries` carrying `ReportNodeVersion`/`FinalizeClusterVersion`
-  => `Gate::Era`) that **P2-B's exhaustive `required_gate` tables replace**. The
-  cap state lives in `OwnVersion::sim_cap` (cfg-gated field, `None` by default).
+  `RaftMsg::required_gate(msg).join(content_gate(msg))` is a gate the profile
+  does not know, and records a `CapRejection`. `required_gate` is the emitter's
+  classification (P2-B); `content_gate` is what an older binary's strict decode
+  would need whatever the classifier says (it reads the synthetic gate/field
+  labels), which is what lets the "ungated field" negative control (N3) fail the
+  oracle: the cap, not the classifier, models the old binary. The cap state
+  lives in `OwnVersion::sim_cap` (cfg-gated field, `None` by default).
+  **Synthetic gate ladder**: `Gate::Synthetic(n)` (same cfg; version `n`,
+  rank `n`; never in `Gate::ALL`) is attached to a command only through the
+  `synthetic.gate=n` label of an `UpsertMember` (`SYNTHETIC_GATE_LABEL`, read by
+  `MetaCommand::required_gate`); the `synthetic.field=n` label
+  (`SYNTHETIC_FIELD_LABEL`) is the deliberately *unclassified* twin. `Release(N)`
+  profiles accept `Synthetic(k <= N)`. A new match on `Gate` anywhere in the
+  workspace must cope with the cfg'd variant (features unify: `animus-test`
+  enables `sim-versions` for every dev-dependent crate).
   Pure-tier corpus: the `version_world` harness has a *faithful* mode
   (`World::new_faithful`, `profiles`, `cap_logs`, `downgrade_to_phase1`) that P2-A's
   cells never use; cells and the oracle (era safety, delivery = empty cap log,
@@ -3063,6 +3082,46 @@ rounds while the apply task is behind.
 
 **Upgrade-harness class (ADR 0073 P1-D):** `control-wal`/`shared-wal` are whole-file `TABLE` entries in `animus-test`'s transcode table (a bump edits that entry; legacy encoders must be `pub` + `legacy-encoders`-gated); `control-snapshot`, `metadata`, `mirror-version` and `mirror-entities` are `EMBEDDED` (a bump edits their carrier's transcode).
 
+## Per-group Raft timing profile (`timing.rs`, ADR 0075 section 3.4)
+
+`timing::TimingProfile {Lan, Wan{max_region_rtt}}` is a pure function to
+`(election_base, heartbeat_interval)`: LAN is the historical 150 ms / 50 ms; WAN
+is `election = max(150 ms, 5 x max_region_rtt)`, `heartbeat = max(50 ms,
+election / 10)` (750 / 75 ms at the 150 ms default). A group is WAN iff its
+voters **and learners** carry more than one distinct
+`topology.kubernetes.io/region` label (`REGION_LABEL`, local copy: keep it equal
+to G-a's). `RaftCore::set_timing(election_base, heartbeat_interval, now,
+entropy)` installs the pair: zero refused, unchanged is a no-op, a follower
+re-arms its election deadline from the new base, a leader only ever pulls its
+heartbeat deadline in. **Callers compare first** (`RaftNode::set_timing_profile`
+reads `RaftCore::timing()` before drawing `now`/entropy) because an extra RNG
+draw desyncs fixed seeds. Everything derived from the pair follows it:
+`transfer_leadership`'s deadline, `election_timeout()` (and animusd's health
+grace), the cluster-check resend, the departing-peer gap, snapshot backoff.
+`RaftNode::enable_region_timing(rtt)` is the opt-in control-group loop (a
+spawned task, nothing in `start*` changed). **Control-only nodes have no
+`Member` row, so their labels are invisible here** until G-a's config-borne
+labels exist; `ControlHandle::Remote::election_timeout` still says 150 ms.
+`timing::control_voter_change_check` is the admin add/remove region-majority
+guard (see ADR 0075's 2026-10-04 amendment); tests `tests/it/set_timing.rs`.
+
+## G-01 stage G-a: `RegisterNode` label fill-in (2026-10-04)
+
+`RegisterNode`'s apply still never overwrites a *non-empty* member label set,
+but now fills in an already-present member row whose labels are *empty*
+(`fill_empty_labels`; status/`has_activated` untouched), on both the
+unclaimed-address and the idempotent same-addresses arms. Reason: bootstrap's
+`UpsertMember { labels: {} }` can beat the node's own registration, and no
+relayable command can repair the row afterwards. Changing non-empty labels is
+unsupported (would need a new non-relayable command). See ADR 0005's
+2026-10-04 amendment.
+
+- `Metadata::apply(UpsertMember)` keeps an existing non-empty label set when the incoming one is empty (status-only proposers like the detector build from stale reads that can predate a `RegisterNode` label fill-in); see `docs/lessons/testing/2026-10-04-status-only-upsert-built-from-a-stale-read-wipes-fields.md`.
+
+## Fuzzing (roadmap R-01 (c))
+
+The control WAL / shared WAL / snapshot image / `Metadata::from_json` / syskv key decoders are the `control_formats` fuzz target. The line-framed formats carry a CRC, so the target re-stamps CRCs (`fix_line_crcs`) to reach the payload decoders. `mirror::apply_key_write` still `.expect`s on a corrupt mirrored value (node-local data, by design) and is deliberately not fuzzed. See `fuzz/README.md` (stable smoke: `cd fuzz && cargo test --release --test smoke`).
+
 ## Gate enforcement (ADR 0073 Phase 2, P2-B)
 
 - **`version.rs`**: `Gate::Base` (declared first, version 1, always open) and
@@ -3103,3 +3162,72 @@ rounds while the apply task is behind.
   (`cfg(any(test, feature = "sim-versions"))`). `sim_versions::BinaryProfile::accepts`
   treats `Gate::Base` as always accepted; the capped decode classifies with
   `RaftMsg::required_gate`.
+
+## G-01 stage G-c M1: `GlobalTableSpec`, `ConvertTableToGlobal`, `Gate::GlobalTables` (2026-10-05)
+
+- `MAX_SUPPORTED` is **2**; `Gate::GlobalTables` (version 2) gates
+  `MetaCommand::ConvertTableToGlobal` (exhaustive `required_gate` row). The
+  command sets `TableSchema.global` and pins every tablet's policy
+  (`PlacementPolicy::mrsc`, IN-set + strict REGION spread) in one apply; an
+  identical spec is a `NoOp`. State guards reject TTL/LSI on a global table.
+- `reconcile_placement` uses `replan_pinned` for a pinned policy: no
+  best-effort growth, never repairs across regions (a region with no node gives
+  no command).
+- **`BinaryProfile::B2` is the literal `[1,1]`**, not `own_range()`; test
+  harnesses that flip a node to B2 must do the same (see the lessons log).
+- New fields are skipped at default; shaped fixtures `v1-global.json` /
+  `v1-pinned.json` cover them (the version tag does not change).
+
+## StorageFull: suspect WAL and in-place recovery (R-01 (d), issue #1185)
+
+`persist_round::PersistProgress` carries a `suspect` flag (`mark_suspect`/
+`is_suspect`/`complete_all_drained`; `fully_durable` is false while suspect, so
+no buffered ack ships on a file whose state is unknown). On ENOSPC in
+`node.rs`'s `persist_wal` (and in a compaction rewrite) the group marks the WAL
+suspect: it is **never appended to or `fsync`ed again** (fsyncgate, a torn
+partial append may sit in it). `persist_round::recover_suspect_wal` (shared with
+`animus-cp-data`) then probes on `env.sleep` (50 ms backoff to a 2 s cap; each
+probe takes `wal_lock`, defers while `RewriteTail::is_active()` since a staged
+rewrite shares the `.tmp` sibling, drains, captures `RaftCore::wal_image()` and
+hands it to a `write_image` closure that must write a **fresh file**). Only on
+success does it `mark_durable_through`, `complete_all_drained` and clear the
+flag; ENOSPC on the rewrite keeps probing, any other error stays a hard failure.
+No persisted-format change. `RaftNode::is_storage_full()` feeds `/admin/health`.
+Issue #1228 (full follower / all-full group): a full follower keeps acking, but
+`handle_append_entries` clamps the success `match_index` to `durable_index` when
+`storage_full` (and `log_truncate` lowers `durable_index`), so commit can never
+advance on an ack for entries it did not persist; `cannot_vote_yet()` includes
+`storage_full`, so every ack carries `check_pending = true`. The leader's
+step-down and `transfer_leadership` need a *healthy quorum*
+(`healthy_followers(now)`: acked `check_pending == false` within one election
+timeout) and never target a `check_pending` peer, so a full leader does not hand
+off to a full node or ping-pong. `handle_append_resp` skips the immediate resend
+for an ack that made no progress while `check_pending` (a zero-latency
+ack/resend spin otherwise; guarded by the trace-event bound in the corpus).
+`had_leader_contact` is sticky (never cleared) and feeds the eventual-read gate.
+`SharedWal` has a `needs_rewrite` flag armed ONLY by an ENOSPC append/sync
+failure; while armed `Append` is refused (StorageFull error) until a `Compact`
+succeeds, so a healthy sibling tablet cannot stack bytes after a suspect tail.
+Leader step-down (issue #1219): `RaftCore::set_storage_full` (fed live by a DRIVER_APPLIED driver, `animus-cp-data`'s consensus loop; the control plane never sets it) makes `start_pre_vote`/`start_election` (and so `TimeoutNow`) no-ops, the same gate as `state_machine_behind`; `RaftCore::storage_full_step_down(now, avoid)` arms `transfer_leadership` toward the highest-`peer_match` voter (rotating away from `avoid`, the previous unanswered target). The control group's own storage-full handling is unchanged (no step-down). Tests: `tests/it/storage_full_step_down.rs`. (The apply
+task's engine ENOSPC, formerly a gap, is handled by `animus-cp-data`'s
+`apply_stall`, issue #1218.) Tests: `persist_round` unit tests; end-to-end by the
+`animus-test` disk-full corpus (`ANIMUS_DISK_FULL_SEEDS`).
+
+## MREC formats and `Gate::MrecReplication` (G-01 stage G-d M1, ADR 0075/0073 amendments)
+
+`MAX_SUPPORTED = 3`; **`MIN_SUPPORTED` is held at the literal `1`**, not `MAX - 1`:
+the era starts at cluster version 1 and `ReportNodeVersion` is rejected when its range
+excludes the current version, so a floor of 2 would stop a fresh cluster ever starting
+an era (raising it needs the era-start rule redesigned first). `Gate::MrecReplication`
+(version 3) guards `MetaCommand::{ConvertTableToMrec, AddMrecReplica,
+RemoveMrecReplica, SetMrecReplicaStatus}` (all relayable, mirrored as schema rows),
+`MultiRegionConsistency::Eventual` and `GlobalTableSpec.replicas` (additive, skipped
+when empty). A `ConvertTableToGlobal` carrying an `Eventual` spec is classified
+`MrecReplication` **by content** (and rejected by apply). The MRSC-only restrictions
+(no TTL/LSI) test `GlobalTableSpec::is_mrsc()`; anything that means "MRSC" must too.
+`mrec_region_id` (FNV-1a, vectors pinned) is frozen. Sim: `BinaryProfile::Release(2)`
+is `[1, 2]` as shipped (unit-tested); the sim cap's `content_gate` names the MREC
+variants by content, independent of `required_gate`. Cells:
+`version_mixed_corpus::release2_to_release3_mrec_gate` + N6; apply matrix:
+`tests/it/mrec_table_apply.rs`; fixtures `metadata/v1-mrec.json`,
+`mirror-entities/schema/v1-mrec.json` (shaped `vN-<shape>` names, read by dedicated tests).

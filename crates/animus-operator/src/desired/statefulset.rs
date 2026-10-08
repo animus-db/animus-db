@@ -45,12 +45,15 @@
 
 use std::collections::BTreeMap;
 
-use k8s_openapi::api::apps::v1::{StatefulSet, StatefulSetSpec};
+use k8s_openapi::api::apps::v1::{
+    RollingUpdateStatefulSetStrategy, StatefulSet, StatefulSetSpec, StatefulSetUpdateStrategy,
+};
 use k8s_openapi::api::core::v1::{
-    ConfigMapVolumeSource, Container, EmptyDirVolumeSource, EnvVar, HTTPGetAction,
-    PersistentVolumeClaim, PersistentVolumeClaimSpec, PodSpec, PodTemplateSpec, Probe,
+    Affinity, ConfigMapVolumeSource, Container, DownwardAPIVolumeFile, DownwardAPIVolumeSource,
+    EmptyDirVolumeSource, EnvVar, HTTPGetAction, ObjectFieldSelector, PersistentVolumeClaim,
+    PersistentVolumeClaimSpec, PodAffinityTerm, PodAntiAffinity, PodSpec, PodTemplateSpec, Probe,
     ProjectedVolumeSource, ResourceRequirements, SecretVolumeSource, ServiceAccountTokenProjection,
-    Volume, VolumeMount, VolumeProjection,
+    TopologySpreadConstraint, Volume, VolumeMount, VolumeProjection, WeightedPodAffinityTerm,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
@@ -59,7 +62,7 @@ use serde::Serialize;
 
 use super::cluster_config::{
     self, CONFIG_MOUNT_DIR, DATA_DIR, DYNAMO_AUTH_MOUNT_DIR, ENCRYPTION_KEY_MOUNT_DIR,
-    ENTRYPOINT_FILE_NAME, S3_MOUNT_DIR, S3_WEB_IDENTITY_MOUNT_DIR,
+    ENTRYPOINT_FILE_NAME, PEER_CA_MOUNT_DIR, S3_MOUNT_DIR, S3_WEB_IDENTITY_MOUNT_DIR,
     S3_WEB_IDENTITY_TOKEN_EXPIRY_SECS, S3_WEB_IDENTITY_TOKEN_FILE, TLS_MOUNT_DIR,
 };
 use super::{
@@ -202,7 +205,10 @@ fn restart_relevant_projection(spec: &AnimusClusterSpec) -> RestartRelevantConfi
         control_nodes: spec.control_nodes_or_default(),
         entrypoint_sh: cluster_config::entrypoint_script(spec),
         cluster_settings: cluster_config::cluster_settings_or_none(spec),
-        tls: spec.tls.as_ref().map(|_| cluster_config::tls_section()),
+        tls: spec
+            .tls
+            .as_ref()
+            .map(|_| cluster_config::tls_section_for(spec)),
         encryption_key_path: spec
             .encryption_key_secret_name
             .as_ref()
@@ -252,6 +258,7 @@ const S3_VOLUME: &str = "s3";
 /// `spec.s3.webIdentity`'s projected service-account-token volume.
 const S3_WEB_IDENTITY_VOLUME: &str = "s3-web-identity";
 const ENCRYPTION_KEY_VOLUME: &str = "encryption-key";
+const TOPOLOGY_VOLUME: &str = "topology";
 /// `defaultMode` for the encryption-key `Secret` volume (ADR 0069, S-03 PR
 /// 3): world-readable, no write bit for anyone — tighter than the
 /// Kubernetes default (`0644`, which grants the file owner write access
@@ -301,9 +308,84 @@ fn admin_probe(
     probe
 }
 
-/// Build the `StatefulSet` for `cluster`.
+/// The `StatefulSet`'s own **metadata** annotation (not the pod template's, so
+/// adding or changing it never rolls a pod) holding the fingerprint of the
+/// pod template this operator last applied ([`template_fingerprint`]). The
+/// roll driver (`crate::roll`) compares it against the freshly built template
+/// *before* applying, which is what lets the first apply of a changed template
+/// carry `partition = replicas` atomically (ADR 0073 Phase 3, D8).
+pub const TEMPLATE_HASH_ANNOTATION: &str = "animusdb.io/template-hash";
+
+/// FNV-1a 64 over the canonical JSON of the whole pod template: **any**
+/// change to what the `StatefulSet` controller would roll pods for (image,
+/// config-hash annotation, resources, probes, volumes, ...) changes it.
+#[must_use]
+pub fn template_fingerprint(template: &PodTemplateSpec) -> String {
+    let json = serde_json::to_string(template).expect("a PodTemplateSpec always serializes");
+    format!("{:016x}", fnv1a_64(json.as_bytes()))
+}
+
+/// The container image of the pod template's first (only) container.
+#[must_use]
+pub fn template_image(sts: &StatefulSet) -> Option<String> {
+    sts.spec
+        .as_ref()?
+        .template
+        .spec
+        .as_ref()?
+        .containers
+        .first()?
+        .image
+        .clone()
+}
+
+/// The [`CONFIG_HASH_ANNOTATION`] value on the pod template of `sts`.
+#[must_use]
+pub fn template_config_hash(sts: &StatefulSet) -> Option<String> {
+    sts.spec
+        .as_ref()?
+        .template
+        .metadata
+        .as_ref()?
+        .annotations
+        .as_ref()?
+        .get(CONFIG_HASH_ANNOTATION)
+        .cloned()
+}
+
+/// Build the `StatefulSet` for `cluster` with `partition 0` (every pod the
+/// controller sees is eligible for update): a fresh cluster, and the steady
+/// state. A roll goes through [`build_with_partition`].
 #[must_use]
 pub fn build(cluster: &AnimusCluster, spec: &AnimusClusterSpec) -> StatefulSet {
+    build_with_partition(cluster, spec, 0)
+}
+
+/// Set `updateStrategy.rollingUpdate.partition` on an already-built
+/// `StatefulSet` (the roll driver decides the number after the build).
+pub fn set_partition(sts: &mut StatefulSet, partition: i32) {
+    if let Some(spec) = sts.spec.as_mut() {
+        spec.update_strategy = Some(StatefulSetUpdateStrategy {
+            type_: Some("RollingUpdate".to_string()),
+            rolling_update: Some(RollingUpdateStatefulSetStrategy {
+                partition: Some(partition),
+                max_unavailable: None,
+            }),
+        });
+    }
+}
+
+/// Build the `StatefulSet` for `cluster` with an explicit
+/// `updateStrategy.rollingUpdate.partition` (ADR 0073 Phase 3, D7/D8). The
+/// strategy is **present in every apply** (`RollingUpdate`, never `OnDelete`:
+/// the operator needs no pod-delete privilege): Kubernetes updates only
+/// ordinals `>= partition`, and the operator owns the number.
+#[must_use]
+pub fn build_with_partition(
+    cluster: &AnimusCluster,
+    spec: &AnimusClusterSpec,
+    partition: i32,
+) -> StatefulSet {
     let name = cluster
         .metadata
         .name
@@ -412,6 +494,34 @@ pub fn build(cluster: &AnimusCluster, spec: &AnimusClusterSpec) -> StatefulSet {
         });
     }
 
+    // G-01 stage G-e: every peer's referenced CA `Secret`, read-only, the
+    // chosen key projected to `ca.crt`. Referenced only, never written.
+    for (i, peer) in spec.peers.iter().enumerate() {
+        let Some(r) = &peer.ca_secret_ref else {
+            continue;
+        };
+        let vol = format!("peer-ca-{i}");
+        volumes.push(Volume {
+            name: vol.clone(),
+            secret: Some(SecretVolumeSource {
+                secret_name: Some(r.name.clone()),
+                items: Some(vec![k8s_openapi::api::core::v1::KeyToPath {
+                    key: r.key_or_default().to_string(),
+                    path: "ca.crt".to_string(),
+                    mode: None,
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        volume_mounts.push(VolumeMount {
+            name: vol,
+            mount_path: format!("{PEER_CA_MOUNT_DIR}/{i}"),
+            read_only: Some(true),
+            ..Default::default()
+        });
+    }
+
     // S-04 PR 3: `spec.s3`'s credential `Secret` (never created or written
     // by this operator, only referenced — same idiom as `spec.tls` above),
     // mounted read-only on **every** pod even though only a combined-role
@@ -495,6 +605,71 @@ pub fn build(cluster: &AnimusCluster, spec: &AnimusClusterSpec) -> StatefulSet {
         });
     }
 
+    // G-01 stage G-a: the pod's own annotations, projected to a file. The
+    // operator patches the scheduled node's region/zone onto the pod as
+    // annotations (`desired::topology`); `animusd --labels-file` reads them
+    // back as this node's member labels. Always present (the label
+    // resolution is independent of `spec.topology.spread`).
+    volumes.push(Volume {
+        name: TOPOLOGY_VOLUME.to_string(),
+        downward_api: Some(DownwardAPIVolumeSource {
+            items: Some(vec![DownwardAPIVolumeFile {
+                path: super::topology::TOPOLOGY_FILE_NAME.to_string(),
+                field_ref: Some(ObjectFieldSelector {
+                    field_path: "metadata.annotations".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    volume_mounts.push(VolumeMount {
+        name: TOPOLOGY_VOLUME.to_string(),
+        mount_path: super::topology::TOPOLOGY_MOUNT_DIR.to_string(),
+        read_only: Some(true),
+        ..Default::default()
+    });
+
+    let (topology_spread_constraints, affinity) = if spec.topology_spread_enabled() {
+        (
+            Some(vec![TopologySpreadConstraint {
+                max_skew: 1,
+                topology_key: super::topology::NODE_ZONE_LABEL.to_string(),
+                // `ScheduleAnyway`: a single-zone (kind/minikube) cluster must
+                // still schedule every pod.
+                when_unsatisfiable: "ScheduleAnyway".to_string(),
+                label_selector: Some(LabelSelector {
+                    match_labels: Some(selector.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            Some(Affinity {
+                pod_anti_affinity: Some(PodAntiAffinity {
+                    preferred_during_scheduling_ignored_during_execution: Some(vec![
+                        WeightedPodAffinityTerm {
+                            weight: 100,
+                            pod_affinity_term: PodAffinityTerm {
+                                topology_key: super::topology::HOSTNAME_LABEL.to_string(),
+                                label_selector: Some(LabelSelector {
+                                    match_labels: Some(selector.clone()),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            },
+                        },
+                    ]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        )
+    } else {
+        (None, None)
+    };
+
     let container = Container {
         name: "animusd".to_string(),
         image: Some(spec.image_or_default().to_string()),
@@ -527,11 +702,40 @@ pub fn build(cluster: &AnimusCluster, spec: &AnimusClusterSpec) -> StatefulSet {
         ..Default::default()
     };
 
+    let labels_for_sts = labels.clone();
+    let template = PodTemplateSpec {
+        metadata: Some(ObjectMeta {
+            labels: Some(labels),
+            annotations: Some(BTreeMap::from([(
+                CONFIG_HASH_ANNOTATION.to_string(),
+                restart_relevant_config_hash(spec),
+            )])),
+            ..Default::default()
+        }),
+        spec: Some(PodSpec {
+            containers: vec![container],
+            service_account_name: spec
+                .s3
+                .as_ref()
+                .and_then(|s3| s3.web_identity.as_ref())
+                .and_then(|wi| wi.service_account_name.clone()),
+            volumes: Some(volumes),
+            topology_spread_constraints,
+            affinity,
+            termination_grace_period_seconds: Some(TERMINATION_GRACE_PERIOD_SECS),
+            ..Default::default()
+        }),
+    };
+
     StatefulSet {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
             namespace: Some(ns.to_string()),
-            labels: Some(labels.clone()),
+            labels: Some(labels_for_sts),
+            annotations: Some(BTreeMap::from([(
+                TEMPLATE_HASH_ANNOTATION.to_string(),
+                template_fingerprint(&template),
+            )])),
             owner_references: Some(vec![owner_reference(cluster)]),
             ..Default::default()
         },
@@ -539,31 +743,18 @@ pub fn build(cluster: &AnimusCluster, spec: &AnimusClusterSpec) -> StatefulSet {
             service_name: Some(internal_service_name(name)),
             replicas: Some(spec.nodes),
             pod_management_policy: Some("Parallel".to_string()),
+            update_strategy: Some(StatefulSetUpdateStrategy {
+                type_: Some("RollingUpdate".to_string()),
+                rolling_update: Some(RollingUpdateStatefulSetStrategy {
+                    partition: Some(partition),
+                    max_unavailable: None,
+                }),
+            }),
             selector: LabelSelector {
                 match_labels: Some(selector.clone()),
                 ..Default::default()
             },
-            template: PodTemplateSpec {
-                metadata: Some(ObjectMeta {
-                    labels: Some(labels),
-                    annotations: Some(BTreeMap::from([(
-                        CONFIG_HASH_ANNOTATION.to_string(),
-                        restart_relevant_config_hash(spec),
-                    )])),
-                    ..Default::default()
-                }),
-                spec: Some(PodSpec {
-                    containers: vec![container],
-                    service_account_name: spec
-                        .s3
-                        .as_ref()
-                        .and_then(|s3| s3.web_identity.as_ref())
-                        .and_then(|wi| wi.service_account_name.clone()),
-                    volumes: Some(volumes),
-                    termination_grace_period_seconds: Some(TERMINATION_GRACE_PERIOD_SECS),
-                    ..Default::default()
-                }),
-            },
+            template,
             volume_claim_templates: if volume_claim_templates.is_empty() {
                 None
             } else {
@@ -604,6 +795,144 @@ mod tests {
             .annotations
             .unwrap()[CONFIG_HASH_ANNOTATION]
             .clone()
+    }
+
+    fn pod_spec(sts: &StatefulSet) -> PodSpec {
+        sts.spec.as_ref().unwrap().template.spec.clone().unwrap()
+    }
+
+    // --- ADR 0073 Phase 3 (P3-D): updateStrategy / partition / fingerprint --
+
+    fn partition_of(sts: &StatefulSet) -> Option<i32> {
+        sts.spec
+            .as_ref()?
+            .update_strategy
+            .as_ref()?
+            .rolling_update
+            .as_ref()?
+            .partition
+    }
+
+    #[test]
+    fn every_build_carries_a_rolling_update_strategy_never_on_delete() {
+        let cluster = test_cluster("c", "ns", 3, None);
+        for sts in [
+            build(&cluster, &cluster.spec),
+            build_with_partition(&cluster, &cluster.spec, 3),
+        ] {
+            let strategy = sts.spec.as_ref().unwrap().update_strategy.as_ref().unwrap();
+            assert_eq!(strategy.type_.as_deref(), Some("RollingUpdate"));
+        }
+        assert_eq!(partition_of(&build(&cluster, &cluster.spec)), Some(0));
+        assert_eq!(
+            partition_of(&build_with_partition(&cluster, &cluster.spec, 3)),
+            Some(3)
+        );
+        let mut sts = build(&cluster, &cluster.spec);
+        set_partition(&mut sts, 2);
+        assert_eq!(partition_of(&sts), Some(2));
+    }
+
+    fn fingerprint(c: &AnimusCluster) -> String {
+        build(c, &c.spec).metadata.annotations.unwrap()[TEMPLATE_HASH_ANNOTATION].clone()
+    }
+
+    #[test]
+    fn an_image_change_and_a_config_hash_change_both_change_the_template_fingerprint() {
+        let base = test_cluster("c", "ns", 4, Some(3));
+        let mut image = base.clone();
+        image.spec.image = Some("img:2".to_string());
+        assert_ne!(fingerprint(&base), fingerprint(&image), "image");
+        // controlNodes growth: only the config-hash annotation moves
+        let grown = test_cluster("c", "ns", 4, Some(4));
+        assert_ne!(fingerprint(&base), fingerprint(&grown), "config hash");
+        assert_ne!(config_hash(&base), config_hash(&grown));
+    }
+
+    #[test]
+    fn a_plain_scale_does_not_change_the_template_fingerprint_and_the_hash_is_not_in_the_template()
+    {
+        let base = test_cluster("c", "ns", 4, Some(3));
+        let scaled = test_cluster("c", "ns", 6, Some(3));
+        assert_eq!(fingerprint(&base), fingerprint(&scaled));
+        // The fingerprint lives on the StatefulSet's metadata: adding it can
+        // never itself roll a pod.
+        let sts = build(&base, &base.spec);
+        let template_annotations = sts
+            .spec
+            .unwrap()
+            .template
+            .metadata
+            .unwrap()
+            .annotations
+            .unwrap();
+        assert!(!template_annotations.contains_key(TEMPLATE_HASH_ANNOTATION));
+    }
+
+    #[test]
+    fn topology_spread_and_anti_affinity_default_on() {
+        let cluster = test_cluster("c", "ns", 3, None);
+        let ps = pod_spec(&build(&cluster, &cluster.spec));
+        let tsc = ps.topology_spread_constraints.expect("spread constraints");
+        assert_eq!(tsc.len(), 1);
+        assert_eq!(tsc[0].topology_key, "topology.kubernetes.io/zone");
+        assert_eq!(tsc[0].max_skew, 1);
+        assert_eq!(tsc[0].when_unsatisfiable, "ScheduleAnyway");
+        assert_eq!(
+            tsc[0].label_selector.as_ref().unwrap().match_labels,
+            Some(selector_labels("c"))
+        );
+        let terms = ps
+            .affinity
+            .unwrap()
+            .pod_anti_affinity
+            .unwrap()
+            .preferred_during_scheduling_ignored_during_execution
+            .unwrap();
+        assert_eq!(terms.len(), 1);
+        assert_eq!(
+            terms[0].pod_affinity_term.topology_key,
+            "kubernetes.io/hostname"
+        );
+    }
+
+    #[test]
+    fn topology_spread_can_be_disabled_but_label_projection_stays() {
+        let mut cluster = test_cluster("c", "ns", 3, None);
+        cluster.spec.topology = Some(crate::crd::TopologySpec {
+            spread: Some(false),
+        });
+        let ps = pod_spec(&build(&cluster, &cluster.spec));
+        assert!(ps.topology_spread_constraints.is_none());
+        assert!(ps.affinity.is_none());
+        assert!(ps.volumes.unwrap().iter().any(|v| v.name == "topology"));
+    }
+
+    #[test]
+    fn topology_downward_api_volume_projects_annotations() {
+        let cluster = test_cluster("c", "ns", 3, None);
+        let sts = build(&cluster, &cluster.spec);
+        let ps = pod_spec(&sts);
+        let vol = ps
+            .volumes
+            .unwrap()
+            .into_iter()
+            .find(|v| v.name == "topology")
+            .unwrap();
+        let item = &vol.downward_api.unwrap().items.unwrap()[0];
+        assert_eq!(item.path, "annotations");
+        assert_eq!(
+            item.field_ref.as_ref().unwrap().field_path,
+            "metadata.annotations"
+        );
+        let mount = container(&sts)
+            .volume_mounts
+            .unwrap()
+            .into_iter()
+            .find(|m| m.name == "topology")
+            .unwrap();
+        assert_eq!(mount.mount_path, "/etc/animus/topology");
+        assert_eq!(mount.read_only, Some(true));
     }
 
     #[test]
@@ -1338,8 +1667,14 @@ mod tests {
         // byte-identically to before the field existed, so no already-
         // deployed cluster restarts on upgrade purely because this PR
         // shipped.
+        //
+        // **Deliberately changed by G-01 stage G-a** (2026-10-04): the
+        // entrypoint now passes `--labels-file ... --labels-wait-secs`, and
+        // the pod template gains the topology downward-API volume and spread
+        // hints, so every existing cluster rolls once on the operator
+        // upgrade that ships this — unavoidable, the template itself changed.
         let cluster = test_cluster("c", "ns", 3, None);
-        assert_eq!(config_hash(&cluster), "f5c65fc10dcc4e1c");
+        assert_eq!(config_hash(&cluster), "7ae469656d485b98");
     }
 
     #[test]
@@ -1357,6 +1692,106 @@ mod tests {
         assert_eq!(
             c.resources.unwrap().limits.unwrap()["cpu"],
             Q("2".to_string())
+        );
+    }
+}
+
+#[cfg(test)]
+mod peers_tests {
+    use super::*;
+    use crate::crd::{PeerCaSecretRef, PeerSpec, TlsSpec};
+    use crate::desired::test_support::test_cluster;
+
+    fn federated(ca: bool) -> AnimusCluster {
+        let mut c = test_cluster("c", "ns", 3, None);
+        c.spec.region = Some("us".into());
+        c.spec.tls = Some(TlsSpec {
+            secret_name: Some("t".into()),
+            cert_manager: None,
+        });
+        c.spec.peers = vec![
+            PeerSpec {
+                region: "eu".into(),
+                endpoints: vec!["eu:14004".into()],
+                ca_secret_ref: None,
+            },
+            PeerSpec {
+                region: "ap".into(),
+                endpoints: vec!["ap:14004".into()],
+                ca_secret_ref: ca.then(|| PeerCaSecretRef {
+                    name: "ap-ca".into(),
+                    key: Some("tls.crt".into()),
+                }),
+            },
+        ];
+        c
+    }
+
+    fn pod_spec(c: &AnimusCluster) -> k8s_openapi::api::core::v1::PodSpec {
+        build(c, &c.spec).spec.unwrap().template.spec.unwrap()
+    }
+
+    #[test]
+    fn a_peer_ca_secret_is_mounted_read_only_by_peer_index_with_its_key_projected() {
+        let p = pod_spec(&federated(true));
+        let vol = p
+            .volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|v| v.name == "peer-ca-1")
+            .expect("peer-ca-1 volume");
+        let sec = vol.secret.as_ref().unwrap();
+        assert_eq!(sec.secret_name.as_deref(), Some("ap-ca"));
+        let items = sec.items.as_ref().unwrap();
+        assert_eq!(
+            (items[0].key.as_str(), items[0].path.as_str()),
+            ("tls.crt", "ca.crt")
+        );
+        let mount = p.containers[0]
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.name == "peer-ca-1")
+            .expect("mount");
+        assert_eq!(mount.mount_path, "/etc/animus/peer-ca/1");
+        assert_eq!(mount.read_only, Some(true));
+        // Peer 0 names no CA: no volume for it.
+        assert!(!p.volumes.unwrap().iter().any(|v| v.name == "peer-ca-0"));
+    }
+
+    #[test]
+    fn no_peer_ca_means_no_peer_volumes() {
+        let p = pod_spec(&federated(false));
+        assert!(
+            !p.volumes
+                .unwrap()
+                .iter()
+                .any(|v| v.name.starts_with("peer-ca"))
+        );
+    }
+
+    #[test]
+    fn adding_or_changing_peers_rolls_the_pods_via_the_config_hash() {
+        let base = test_cluster("c", "ns", 3, None);
+        let h = |c: &AnimusCluster| restart_relevant_config_hash(&c.spec);
+        assert_ne!(h(&base), h(&federated(false)));
+        assert_ne!(h(&federated(false)), h(&federated(true)));
+        let mut moved = federated(true);
+        moved.spec.peers[0].endpoints = vec!["eu2:14004".into()];
+        assert_ne!(h(&federated(true)), h(&moved));
+    }
+
+    #[test]
+    fn a_spec_without_peers_keeps_its_config_hash() {
+        // The G-e fields add nothing to the projection when unset, so an
+        // existing cluster is not rolled by an operator upgrade.
+        let c = test_cluster("c", "ns", 3, None);
+        let json = serde_json::to_string(&restart_relevant_projection(&c.spec)).unwrap();
+        assert!(
+            !json.contains("peers") && !json.contains("region"),
+            "{json}"
         );
     }
 }

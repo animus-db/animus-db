@@ -1037,6 +1037,11 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     Ok(dynamo::KindWriteOutcome::ConditionFailed) => {
                         ClientResponse::ConditionFailed
                     }
+                    Ok(dynamo::KindWriteOutcome::Superseded) => ClientResponse::Error(
+                        "a singular kind write came back superseded (MREC replicate rides \
+                         KindWriteBatch only)"
+                            .into(),
+                    ),
                     // Preserve the error's own code across the hop (a typed
                     // evaluation error — e.g. size() on an N attribute, a
                     // real ValidationException — must not degrade to a 500
@@ -1683,7 +1688,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             | ClientRequest::SplitTablet { .. }
             | ClientRequest::JoinInfo
             | ClientRequest::WatchMetadata { .. }
-            | ClientRequest::Txn { .. } => {
+            | ClientRequest::Txn { .. }
+            // ADR 0075 G-d M3: a peer cluster's replication batch is received
+            // bare on the intra port, never relayed inside `Forwarded`.
+            | ClientRequest::MrecApply(_) => {
                 ClientResponse::Error("unexpected forwarded request".into())
             }
         }
@@ -1764,6 +1772,13 @@ pub(crate) async fn handle_relayed_request<E: Env, R: RelayClient>(
         ClientRequest::ProposeSchema(command) => {
             if !crate::is_relayable_command(&command) {
                 ClientResponse::Error("command not allowed over the relay path".into())
+            } else if let Err(refusal) = crate::version_wiring::relay_gate_verdict(ctx, &command) {
+                // ADR 0073 Phase 2 (P2-C): the sender gates its own emit, but
+                // the receiver's view is the one that proposes — a command
+                // whose feature gate is closed here (an era-only command on a
+                // pre-era node) is refused by name and never reaches the
+                // control log, where a peer that cannot decode it would wedge.
+                ClientResponse::Error(refusal)
             } else {
                 // `propose_schema_local_or_hinted`, never the full
                 // `propose_schema` — issue #610's own fd-exhaustion
@@ -1805,6 +1820,7 @@ pub(crate) async fn handle_relayed_request<E: Env, R: RelayClient>(
             client_route: ctx.route_snapshot(),
             intra_route: ctx.intra_route_snapshot(),
             admin_addrs: ctx.admin.admin_addrs.clone(),
+            cluster_version: ctx.effective_metadata().cluster_version,
         },
         _ => ClientResponse::Error("not relayable under sim".into()),
     }

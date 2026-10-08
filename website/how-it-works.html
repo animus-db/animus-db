@@ -217,9 +217,9 @@
         <li>Continuous backups (point-in-time recovery to any second, <code>UpdateContinuousBackups</code>/<code>RestoreTableToPointInTime</code>)</li>
         <li>Export a table's data to a customer-named S3 bucket in DynamoDB's own JSON layout (<code>ExportTableToPointInTime</code>), and import it back into a brand-new table (<code>ImportTable</code>) — either this adapter's own export, or real AWS's identical layout</li>
         <li>Metrics, OpenTelemetry tracing, admin JSON endpoints and a built-in dashboard</li>
+        <li>Rolling upgrades — a node-by-node roll with <code>animus cluster roll plan|wait|status</code> and <code>animus cluster finalize</code>, or on Kubernetes from a <code>spec.image</code> edit, with the operator rolling pods one at a time behind a health gate (not yet safe from an older release while multi-item transactions are in use)</li>
       </ul></div>
       <div class="lcard"><h3>Day two, missing</h3><ul>
-        <li>Rolling upgrades — a full-cluster stop, upgrade and restart is supported and tested, but nodes on different versions cannot yet run together</li>
         <li>Authentication beyond SigV4 — TLS (below) adds encryption and, on the internal ports, cluster-membership authentication, but caller identity on the client port is still just opt-in SigV4</li>
       </ul></div>
     </div>
@@ -256,7 +256,7 @@
     <div class="cardgrid c4" style="margin-top:16px">
       <div class="lcard"><span class="tag">Reference</span><h3><a href="architecture.html">Architecture</a></h3><p>The two planes and why the split matters, tablets and placement, the consistency model, four deployment shapes with their commands, the six ports, determinism internals, day-two operations, and the known limits in one list.</p></div>
       <div class="lcard"><span class="tag">Reference</span><h3><a href="compatibility.html">Compatibility</a></h3><p>Every DynamoDB operation with its status and per-operation notes, the data model, and the four differences that will actually show up in your code rather than in a table.</p></div>
-      <div class="lcard"><span class="tag">Reference</span><h3><a href="performance.html">Performance</a></h3><p>The cost model operation by operation, what scales with the cluster and what doesn't, six questions worth more than someone else's benchmark, and the methodology we're committing to before we have results.</p></div>
+      <div class="lcard"><span class="tag">Reference</span><h3><a href="performance.html">Performance</a></h3><p>The cost model operation by operation, what scales with the cluster and what doesn't, six questions worth more than someone else's benchmark, and the benchmark methodology and load generator — with no published numbers yet.</p></div>
       <div class="lcard"><span class="tag">Reference</span><h3><a href="licence.html">Licensing</a></h3><p>AGPL-3.0 scenario by scenario, the section 13 question your counsel will ask, why this licence and not a permissive one, and exactly where a commercial licence stands today.</p></div>
     </div>
     <span class="kicker" style="margin:30px 0 8px">Longer arguments</span>

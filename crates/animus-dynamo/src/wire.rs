@@ -759,6 +759,21 @@ pub enum Operation {
         /// this call doesn't touch throughput at all.
         throughput_update: Option<Option<ProvisionedThroughput>>,
     },
+    /// `UpdateTable` carrying `ReplicaUpdates` / `GlobalTableWitnessUpdates` /
+    /// `MultiRegionConsistency` (ADR 0075 section 5.1, G-01 stage G-c): the
+    /// global-table conversion. A **separate variant** from
+    /// [`UpdateTable`](Self::UpdateTable) so no existing struct literal gains
+    /// a field. The payload is the *undigested* request
+    /// ([`crate::global::GlobalTableUpdate`]): `animusd` checks
+    /// `Gate::GlobalTables` first (a closed gate keeps the pre-G-c
+    /// `ReplicaUpdates is not supported` text byte for byte) and only then
+    /// validates it.
+    UpdateTableGlobal {
+        /// Target table name.
+        table: String,
+        /// What the request said.
+        update: crate::global::GlobalTableUpdate,
+    },
     /// `DescribeTable` (ADR 0042 §2): a pure read of the replicated catalog
     /// (key schema, secondary-index definitions, stream configuration).
     DescribeTable {
@@ -1402,6 +1417,7 @@ impl Operation {
         match self {
             Operation::CreateTable { table, .. }
             | Operation::UpdateTable { table, .. }
+            | Operation::UpdateTableGlobal { table, .. }
             | Operation::DescribeTable { table, .. }
             | Operation::DeleteTable { table, .. }
             | Operation::PutItem { table, .. }
@@ -2028,6 +2044,12 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
         }),
         "DescribeLimits" => Ok(Operation::DescribeLimits),
         "DescribeEndpoints" => Ok(Operation::DescribeEndpoints),
+        // ADR 0075 section 5.3: the legacy (2017.11.29) global tables control
+        // plane is rejected by name, ungated (rejecting is not a new
+        // surface).
+        legacy if crate::global::LEGACY_GLOBAL_TABLE_OPERATIONS.contains(&legacy) => {
+            Err(crate::global::legacy_global_table_operation_error(legacy))
+        }
         _ => Err(WireError::unknown_operation(target)),
     }
 }
@@ -4269,7 +4291,9 @@ pub(crate) fn stream_view_type_str(vt: StreamViewType) -> &'static str {
 }
 
 /// `UpdateTable` top-level keys this adapter never implements a change for —
-/// no encryption-at-rest toggle, and no global-tables replica set (see
+/// no encryption-at-rest toggle (`ReplicaUpdates` used to be listed here too;
+/// since G-01 stage G-c it routes to [`Operation::UpdateTableGlobal`] and the
+/// `animusd` edge decides, gate first; see
 /// `website/compatibility.html`'s "no billing meter" framing — provisioned
 /// throughput itself **is** now supported, ADR 0065 §5(b); `BillingMode`/
 /// `ProvisionedThroughput` are handled separately, by
@@ -4277,7 +4301,7 @@ pub(crate) fn stream_view_type_str(vt: StreamViewType) -> &'static str {
 /// unconditionally, so a body carrying either of these is a clear
 /// `ValidationException` naming the key rather than the generic "requires
 /// either..." fallback or, worse, a silent no-op.
-const UNSUPPORTED_UPDATE_TABLE_KEYS: &[&str] = &["SSESpecification", "ReplicaUpdates"];
+const UNSUPPORTED_UPDATE_TABLE_KEYS: &[&str] = &["SSESpecification"];
 
 /// Reject any `UpdateTable` top-level key this adapter doesn't model at all,
 /// each with its own named `ValidationException` (mirroring
@@ -4355,6 +4379,15 @@ fn decode_update_table_throughput(
 /// new key attribute.
 fn decode_update_table(obj: &Map<String, Value>) -> Result<Operation, WireError> {
     let table = table_name(obj)?;
+    // ADR 0075 (G-01 stage G-c): a global-table conversion is its own typed
+    // operation; the gate decision and the validation are `animusd`'s (see
+    // `crate::global`'s module doc for why the decoder never rejects here).
+    if crate::global::is_global_table_update(obj) {
+        return Ok(Operation::UpdateTableGlobal {
+            table,
+            update: crate::global::decode_update_table_global(obj),
+        });
+    }
     reject_unsupported_update_table_keys(obj)?;
     let has_index_updates = obj.contains_key("GlobalSecondaryIndexUpdates");
     let has_stream_spec = obj.contains_key("StreamSpecification");
@@ -4864,9 +4897,17 @@ fn decode_predicate(
 /// combinator: it belongs to the term. That one is handled by refusing to split
 /// on an ` AND ` that a `BETWEEN` at the same depth is still waiting for.
 fn find_top_level(haystack: &str, needle: &str) -> Option<usize> {
-    let lower = haystack.to_ascii_lowercase();
-    let needle = needle.to_ascii_lowercase();
-    let bytes = lower.as_bytes();
+    // Byte-based, ASCII-case-insensitive matching on the ORIGINAL bytes: never
+    // slice the `str` at a byte index that may fall inside a multi-byte char
+    // (that panics), and the returned offsets index `haystack` itself. Every
+    // needle starts with an ASCII space, so a hit is always a char boundary.
+    let bytes = haystack.as_bytes();
+    let at = |i: usize, pat: &[u8]| {
+        bytes
+            .get(i..i + pat.len())
+            .is_some_and(|w| w.eq_ignore_ascii_case(pat))
+    };
+    let needle = needle.as_bytes();
     let mut depth = 0i32;
     // Positions of the token, recorded left to right, then chosen from the right.
     let mut hits: Vec<usize> = Vec::new();
@@ -4880,11 +4921,11 @@ fn find_top_level(haystack: &str, needle: &str) -> Option<usize> {
             _ => {}
         }
         if depth == 0 {
-            if lower[i..].starts_with(" between ") {
+            if at(i, b" between ") {
                 pending_between += 1;
             }
-            if lower[i..].starts_with(&needle) {
-                if needle == " and " && pending_between > 0 {
+            if at(i, needle) {
+                if needle.eq_ignore_ascii_case(b" and ") && pending_between > 0 {
                     // This AND closes a BETWEEN rather than joining two terms.
                     pending_between -= 1;
                 } else {
@@ -6385,6 +6426,41 @@ pub fn describe_table_response(
     status: &str,
     throughput: Option<&ProvisionedThroughput>,
 ) -> String {
+    table_description_response(
+        table,
+        schema,
+        key_types,
+        indexes,
+        index_statuses,
+        stream,
+        status,
+        throughput,
+        None,
+        "Table",
+    )
+}
+
+/// [`describe_table_response`] generalized for a global table (ADR 0075
+/// section 5.1): `global` adds `GlobalTableVersion`/`MultiRegionConsistency`/
+/// `Replicas`/`GlobalTableWitnesses` (and is `None` for every non-global
+/// table, whose output is byte-identical to [`describe_table_response`]'s),
+/// and `wrapper` is the key the description sits under — `"Table"` for
+/// `DescribeTable`, `"TableDescription"` for `UpdateTable`/`CreateTable`/
+/// `DeleteTable` (AWS's shape for each).
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn table_description_response(
+    table: &str,
+    schema: &TableSchema,
+    key_types: &[(String, String)],
+    indexes: &[SecondaryIndex],
+    index_statuses: &[(String, IndexStatus)],
+    stream: Option<&StreamDescription>,
+    status: &str,
+    throughput: Option<&ProvisionedThroughput>,
+    global: Option<&crate::global::GlobalTableDescription>,
+    wrapper: &str,
+) -> String {
     let mut desc = table_description_object(
         table,
         schema,
@@ -6398,8 +6474,11 @@ pub fn describe_table_response(
         "AttributeDefinitions".into(),
         Value::Array(attribute_definitions(schema, key_types, indexes)),
     );
+    if let Some(global) = global {
+        global.apply_to(&mut desc);
+    }
     let mut obj = Map::new();
-    obj.insert("Table".into(), Value::Object(desc));
+    obj.insert(wrapper.into(), Value::Object(desc));
     serde_json::to_string(&Value::Object(obj)).expect("describe-table response serializes")
 }
 
@@ -9137,13 +9216,73 @@ mod tests {
         );
     }
 
+    /// G-01 stage G-c: a non-global table's `DescribeTable` is unchanged (no
+    /// `GlobalTableVersion`/`Replicas`/`MultiRegionConsistency`), and a global
+    /// one gains exactly those fields, under either wrapper key.
     #[test]
-    fn update_table_rejects_replica_updates() {
+    fn table_description_response_global_fields_are_additive() {
+        let schema = TableSchema::simple("id");
+        let args = |global: Option<&crate::global::GlobalTableDescription>, wrapper: &str| {
+            table_description_response(
+                "tbl",
+                &schema,
+                &[("id".into(), "S".into())],
+                &[],
+                &[],
+                None,
+                "ACTIVE",
+                None,
+                global,
+                wrapper,
+            )
+        };
+        let plain = describe_table_response(
+            "tbl",
+            &schema,
+            &[("id".into(), "S".into())],
+            &[],
+            &[],
+            None,
+            "ACTIVE",
+            None,
+        );
+        assert_eq!(plain, args(None, "Table"));
+        for key in [
+            "GlobalTableVersion",
+            "Replicas",
+            "MultiRegionConsistency",
+            "GlobalTableWitnesses",
+        ] {
+            assert!(!plain.contains(key), "{key} leaked into a non-global table");
+        }
+        let g = crate::global::GlobalTableDescription {
+            replicas: vec![("a".into(), crate::global::RegionStatus::Active)],
+            witness: None,
+            eventual: false,
+        };
+        let v: Value = serde_json::from_str(&args(Some(&g), "TableDescription")).unwrap();
+        assert_eq!(v["TableDescription"]["GlobalTableVersion"], "2019.11.21");
+        assert_eq!(v["TableDescription"]["MultiRegionConsistency"], "STRONG");
+        assert_eq!(v["TableDescription"]["Replicas"][0]["RegionName"], "a");
+        assert!(v.get("Table").is_none());
+    }
+
+    /// G-01 stage G-c: `ReplicaUpdates` decodes to the typed
+    /// `UpdateTableGlobal` op (the gate and the validation are `animusd`'s);
+    /// the gate-closed text is the pre-G-c text byte for byte.
+    #[test]
+    fn update_table_routes_replica_updates_to_the_global_op() {
         let body =
             br#"{"TableName":"tbl","ReplicaUpdates":[{"Create":{"RegionName":"us-west-2"}}]}"#;
-        let err = decode_request("DynamoDB_20120810.UpdateTable", body).unwrap_err();
-        assert_eq!(err.code, "ValidationException");
-        assert_eq!(err.message, "UpdateTable: ReplicaUpdates is not supported");
+        match decode_request("DynamoDB_20120810.UpdateTable", body).unwrap() {
+            Operation::UpdateTableGlobal { table, update } => {
+                assert_eq!(table, "tbl");
+                let err = update.closed_gate_error();
+                assert_eq!(err.code, "ValidationException");
+                assert_eq!(err.message, "UpdateTable: ReplicaUpdates is not supported");
+            }
+            other => panic!("expected UpdateTableGlobal, got {other:?}"),
+        }
     }
 
     /// ADR 0065 §5(b): a bare `ProvisionedThroughput`, no `BillingMode`
@@ -13231,5 +13370,70 @@ mod byte_cap_tests {
         let err = decode_request("DynamoDB_20120810.TransactWriteItems", over_cap.as_bytes())
             .expect_err("one over the cap is rejected");
         assert_eq!(err.code, "ValidationException");
+    }
+}
+
+// Regression tests for the fuzzer-found `find_top_level` panic: a non-ASCII
+// char at paren depth 0 made `lower[i..]` slice inside a multi-byte char.
+// Own module, same conflict-avoidance convention as `byte_cap_tests`.
+#[cfg(test)]
+mod find_top_level_utf8_tests {
+    use super::*;
+
+    fn scan_with_filter(filter: &str) -> Result<Operation, WireError> {
+        let body = serde_json::json!({
+            "TableName": "tbl",
+            "FilterExpression": filter,
+            "ExpressionAttributeValues": {":v": {"S": "x"}, ":x": {"N": "1"}, ":y": {"N": "2"}},
+        });
+        decode_request("DynamoDB_20120810.Scan", body.to_string().as_bytes())
+    }
+
+    #[test]
+    fn non_ascii_at_depth_zero_never_panics() {
+        for filter in [
+            "a = :v OR b\u{FFFD}c = :v",
+            "\u{FFFD} OR \u{FFFD} AND \u{FFFD}",
+            "a = :v AND \u{130}x = :v OR b = :v",
+            "\u{130}\u{130}\u{130} BETWEEN :x AND :y",
+            "a = :v \u{1F600} OR \u{1F600} b = :v AND \u{1F600}",
+            "\u{1F600}",
+            "a \u{130} between :x and :y",
+        ] {
+            // Ok or a named validation error are both fine; a panic is not.
+            if let Err(e) = scan_with_filter(filter) {
+                assert!(!e.code.is_empty(), "{filter:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn find_top_level_offsets_index_the_original_string() {
+        let s = "\u{130}\u{130} = :v OR b = :v";
+        let at = find_top_level(s, " OR ").expect("top-level OR");
+        assert!(s.is_char_boundary(at));
+        assert_eq!(&s[at..at + 4], " OR ");
+    }
+
+    /// The exact libFuzzer `dynamo_request` crash input (body after the
+    /// `Scan\n` routing line), including a U+FFFD at depth 0.
+    #[test]
+    fn fuzzer_crash_input_does_not_panic() {
+        let body = "{\"TableName\": \"tExporthhhhhhhhhhhhhhhhhhhheqhhhhhhhhKeyhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhxhhhhhhhhhhhhhhhhhhhhhhhhhhTa\", \"FilterExpression\": \"not aimmmmmmmmmmmmmmshardId-aBatchGBatch\u{FFFD}etI------mNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNmmmmmmmmmmmmmmmmmmmmmmns(anul, >s2 OR NOT (b IN s:v, ,v))\", \"EApressionAttributeValues\": {\":s\": {\"S\": \"x\"}, \":v\": {\"2\": \"2\"}}, \"Segment\": 0, \"TotalSegments\": 4}";
+        let _ = decode_request("DynamoDB_20120810.Scan", body.as_bytes());
+    }
+
+    #[test]
+    fn legit_or_between_filter_still_parses_identically() {
+        let a = scan_with_filter("a = :v OR b BETWEEN :x AND :y").expect("parses");
+        let b = scan_with_filter("a = :v or b between :x and :y").expect("parses");
+        let dbg = format!("{a:?}");
+        assert_eq!(dbg, format!("{b:?}"), "keyword case must not matter");
+        assert!(dbg.contains("Or("), "{dbg}");
+        assert!(dbg.contains("Between"), "{dbg}");
+        assert!(
+            !dbg.contains("And("),
+            "BETWEEN's AND is not a combinator: {dbg}"
+        );
     }
 }

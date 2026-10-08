@@ -57,7 +57,7 @@ pub use prod::{
 #[cfg(feature = "prod")]
 pub mod tls;
 #[cfg(feature = "prod")]
-pub use tls::{MaybeTlsStream, TlsConfig, TlsMaterial};
+pub use tls::{MaybeTlsStream, PeerTrust, TlsConfig, TlsMaterial};
 
 /// Encryption at rest (ADR 0069): the `EncryptedDisk`/`EncryptedEnv` AEAD
 /// wrapper over the `Disk` seam, the per-node `EncryptionKey`, and the
@@ -307,6 +307,22 @@ impl std::fmt::Debug for NodeId {
 #[must_use]
 pub fn nid(n: u64) -> NodeId {
     NodeId::new_unchecked(format!("n{n}"))
+}
+
+/// Whether a disk-seam error means the volume is out of space (ENOSPC, or a
+/// quota exhaustion, EDQUOT) — the one I/O failure class the Raft persist
+/// path treats as **recoverable** (R-01 (d) / ADR 0074 §2): the group's WAL is
+/// marked suspect, rewritten from the in-memory log once space returns, and
+/// writes resume without a restart. Every other disk error stays a loud
+/// crash-stop. `ProdEnv` surfaces ENOSPC as `ErrorKind::StorageFull` (std maps
+/// raw 28 to it) and `SimEnv`'s injector produces the same kind; the raw-errno
+/// arm covers a wrapper that rebuilt the error from an OS code alone.
+#[must_use]
+pub fn is_storage_full(e: &std::io::Error) -> bool {
+    /// Linux `ENOSPC` / `EDQUOT`.
+    const ENOSPC: i32 = 28;
+    const EDQUOT: i32 = 122;
+    e.kind() == std::io::ErrorKind::StorageFull || matches!(e.raw_os_error(), Some(ENOSPC | EDQUOT))
 }
 
 /// A monotonic instant, measured in nanoseconds since the environment started.
@@ -947,6 +963,17 @@ pub trait SegmentStore: Send + Sync {
 pub trait Spawner: Send + Sync {
     /// Spawn a future to run concurrently. The future must be `Send + 'static`.
     fn spawn(&self, fut: BoxFuture<'static, ()>);
+
+    /// Spawn a **consensus-loop** task (issue #1220): one whose death leaves
+    /// a Raft group on this node silently dead (the control-plane driver and
+    /// `Metadata` apply loop, a CP-data group's driver and apply loop).
+    /// Identical to [`spawn`](Self::spawn) except that `ProdEnv` additionally
+    /// counts a panic in it as a `Metric::ConsensusTaskPanics`, which flips
+    /// `/admin/health` to 503. The default delegates to `spawn`, so an env
+    /// with no panic observation (`SimEnv`, test wrappers) is unchanged.
+    fn spawn_critical(&self, fut: BoxFuture<'static, ()>) {
+        self.spawn(fut);
+    }
 }
 
 /// The environment supertrait: a cheap-to-clone handle, scoped to one node,
@@ -1013,6 +1040,14 @@ pub trait EnvExt: Env {
         F: Future<Output = ()> + Send + 'static,
     {
         self.spawn(Box::pin(fut));
+    }
+
+    /// [`Spawner::spawn_critical`] for an `async` block (issue #1220).
+    fn spawn_critical_task<F>(&self, fut: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.spawn_critical(Box::pin(fut));
     }
 }
 

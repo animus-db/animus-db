@@ -579,6 +579,14 @@ the production implementation; the deterministic implementation lives in
   `std::panic::resume_unwind`ing the payload, so the default panic hook's
   own stderr print/backtrace and any real `JoinHandle` a caller does keep
   are completely unaffected — this only adds an observation point.
+  **Exported (issue #1220):** a panic also bumps `Metric::SpawnedTaskPanics`
+  (any task). A **consensus-loop** task is spawned with `Spawner::spawn_critical`
+  / `EnvExt::spawn_critical_task` (default: plain `spawn`; `ProdEnv` and
+  `EncryptedEnv` override it, and any new `Spawner` wrapper must forward it) and
+  additionally bumps `Metric::ConsensusTaskPanics` and `ProdEnv::consensus_task_panics()`.
+  Today's critical tasks: the control `drive` and `meta_apply_loop`, the CP-data
+  per-group `drive` and `apply_loop`; add a new never-restarted consensus loop here
+  too. `/admin/health` 503s on a nonzero `consensus_task_panics`.
   **`ProdEnv::spawned_task_panics()`/`first_spawned_task_panic()`** read
   that counter/message; `animusd::Node` sums/picks across its role envs.
   **An `abort()`ed (cancelled) task never counts**: cancellation drops the
@@ -1229,3 +1237,27 @@ hold the lock only for the swap. Trait defaults are correct for any `Disk`
 and `SimEnv` override them natively. `EncryptedDisk` deliberately uses the
 defaults (its per-file frame index makes a native rename-based swap
 non-trivial), so under `--encryption-key` the swap re-reads and `replace`s.
+
+## Fuzzing (roadmap R-01 (c))
+
+The `ADE1` encryption envelope and the handshake preamble/extension parsers are the `encryption_envelope` and `net_frames` fuzz targets; the private envelope scan/open is exposed through the off-by-default `fuzzing` feature (`encrypted::fuzzing`). See `fuzz/README.md` (stable smoke: `cd fuzz && cargo test --release --test smoke`).
+
+**Adding a `Metric` (R-01 (f)):** append the variant, its `ALL` row and its
+`name()` arm, then update every doc/alert that should reference it; the
+`animusd` test `sim_cluster_admin::metric_references_exist_in_exposition`
+fails if any name in `docs/`, `website/` or `deploy/observability/` is not in
+the live exposition. Exported names are unprefixed (no `animus_`).
+
+- **Overload counters (R-01 (d))**: `Metric::OverloadShed{ConnCap,Admission,AdminConnCap,PeerConnCap}` (`overload_shed_*`), appended after `CpGroupsRefusedAsVoter`, recorded by `animusd::overload` users. Known issue: `prod.rs::read_frames` allocates `vec![0; len]` from a peer-supplied `u32` with no cap (see `docs/resource-bounds.md` section 4).
+
+## `is_storage_full` and `Metric::OverloadStorageFull` (R-01 (d), issue #1185)
+
+`animus_env::is_storage_full(&io::Error)` is the one classifier for ENOSPC
+(`ErrorKind::StorageFull`); `ProdEnv` surfaces the real errno as that kind and
+`SimEnv`'s `DiskConfig::set_enospc_prob` injects it, so both exercise the same
+match. Every WAL writer branches on it (persist rounds, compaction rewrites,
+`SharedWal`) instead of treating it as a generic durability fault. A new
+`Metric::OverloadStorageFull` (`overload_storage_full`) is appended at the END
+of the enum (the ordering is a stable export contract), bumped by the wire
+edge when it refuses a write for a StorageFull group. Design:
+`docs/resource-bounds.md` section 3.

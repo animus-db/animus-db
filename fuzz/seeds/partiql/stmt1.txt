@@ -1,0 +1,1 @@
+SELECT a, b.c FROM "t"."idx" WHERE pk = ? AND x IN [1, 2, 3] AND NOT y

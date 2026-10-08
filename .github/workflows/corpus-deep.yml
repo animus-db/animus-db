@@ -489,6 +489,27 @@ jobs:
           ANIMUS_DYNAMO_WIRE_SEEDS: ${{ github.event.inputs.dynamo_wire_seeds || '25' }}
         run: cargo test -p animusd --lib sim_cluster_dynamo_corpus -- --nocapture
 
+      # G-01 stage G-a: six zone-labelled nodes (two per zone), RF 3 —
+      # every tablet must span 3 zones, a whole zone is then killed, and
+      # every acked write must survive with the repair pass re-converging.
+      - name: deep zone-placement corpus (G-01 stage G-a)
+        id: zone_placement
+        continue-on-error: true
+        timeout-minutes: 30
+        env:
+          ANIMUS_ZONE_PLACEMENT_SEEDS: '25'
+        run: cargo test -p animusd --lib sim_cluster_zone_placement -- --nocapture
+
+      # Issue #1229: a split child relocated wholesale by directed Placing
+      # keeps its pre-split rows (learner shipped the engine image, not the log).
+      - name: split-child relocation corpus (issue #1229)
+        id: split_relocation
+        continue-on-error: true
+        timeout-minutes: 30
+        env:
+          ANIMUS_SPLIT_RELOCATION_SEEDS: '20'
+        run: cargo test -p animusd --lib sim_cluster_split_relocation -- --nocapture
+
       # ADR 0068's S3 export/import job driver + import driver: multi-tablet
       # export content fidelity, concurrent writes racing the pin, bucket
       # faults, a crash mid-export/mid-import (the ADR's own named
@@ -541,6 +562,71 @@ jobs:
           ANIMUS_HEARTBEAT_SEEDS: ${{ github.event.inputs.heartbeat_seeds || '40' }}
         run: |
           cargo test -p animus-cp-data --test it heartbeat_batch_corpus:: -- --nocapture
+
+      # ADR 0075 section 3.4 (G-01 stage G-c groundwork): the per-group WAN
+      # Raft timing profile. Three regions at 60-90ms one-way with a noisy
+      # tail; the WAN cells (steady, leader-node kill, leader-region
+      # partition + heal) must keep bounded term churn and commit durably,
+      # and the LAN-forced negative control must show election churn on the
+      # fault cells. Each cell is a pure function of its seed.
+      - name: deep WAN-timing corpus (ADR 0075 section 3.4)
+        id: wan_timing
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          ANIMUS_WAN_TIMING_SEEDS: '40'
+        run: |
+          cargo test -p animus-cp-data --test it wan_timing_corpus:: -- --nocapture
+
+      # ADR 0075 sections 3.3/3.6 (G-01 stage G-c, M2): the preferred-leader
+      # reconciler step over three regions on WAN links. Steady convergence of
+      # the leader into the preferred region, leader-region kill + return,
+      # preferred-region partition + heal, the witness region never leading,
+      # an unready transfer target, and hysteresis under a flapping link, with
+      # a statistical negative control (empty preferred map) and a no-
+      # hysteresis control. Fixed depth, no workflow_dispatch input (the cap
+      # of 25 is full). Each cell is a pure function of its seed.
+      - name: deep MRSC preferred-leader corpus (ADR 0075 section 3.3)
+        id: mrsc_leader
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          ANIMUS_MRSC_SEEDS: '40'
+        run: |
+          cargo test -p animus-cp-data --test it preferred_leader_corpus:: -- --nocapture
+
+      # ADR 0075 (G-01 stage G-c, M4): the MRSC stretch-cluster corpus over
+      # SimCluster: six nodes, three regions, WAN links, a table converted over
+      # the real DynamoDB wire, then region loss / partition / split / node
+      # replacement / witness-form / decommission-guard cells and three
+      # negative controls. Fixed depth, no workflow_dispatch input. Each cell
+      # is a pure function of its seed.
+      - name: deep MRSC stretch-cluster corpus (ADR 0075)
+        id: mrsc_cluster
+        continue-on-error: true
+        timeout-minutes: 30
+        env:
+          ANIMUS_MRSC_SEEDS: '10'
+        run: cargo test -p animusd --lib sim_cluster_mrsc -- --nocapture
+
+      # G-01 stage G-d M5 (ADR 0075 section 4.9): the multi-cluster MREC
+      # fault-injection corpus. `SimWorld` = 2-3 real 3-node clusters on the
+      # LSM backend joined into one eventually-consistent global table, random
+      # wire workloads under WAN partition/loss/duplication, node crash and
+      # restart on both sides, tablet split while shipping, clock skew within
+      # and beyond the bound, and a peer down past max_backlog (resync); the
+      # oracle is convergence + LWW + no loss/resurrection + no re-replication
+      # + stream parity; four negative controls (LWW by arrival, cursor
+      # before ack, loop prevention off, a wrong expectation) must fail.
+      # Fixed depth (measured ~57 s per seed on 4 cores, all 17 cells + the
+      # controls in parallel), no workflow_dispatch input.
+      - name: deep MREC multi-cluster corpus (ADR 0075)
+        id: mrec_world
+        continue-on-error: true
+        timeout-minutes: 30
+        env:
+          ANIMUS_MREC_SEEDS: '15'
+        run: cargo test -p animusd --lib sim_world_mrec_corpus -- --nocapture
 
       # ADR 0028's C-05 PR 2 SharedWal persist-path wiring: cross-tablet
       # coalescing under a burst of concurrent hosted-group writes, a crash
@@ -642,6 +728,24 @@ jobs:
           ANIMUS_UPGRADE_SEEDS: '40'
         run: cargo test -p animusd --lib sim_cluster_mixed_version -- --nocapture
 
+      # ADR 0073 Phase 3 (P3-C): the roll driver (`animus-roll`'s pure state
+      # machine, shared by the CLI and the operator) over SimCluster's LSM
+      # backend: Release(1) -> Release(2) and Phase 1 -> B2 rolls with a
+      # control-leader transfer first, leader kills, partitions, a crash after
+      # restart, a member that stays down (the driver must hold), a node that
+      # cannot catch up (NodeStalled), driver restarts, manual vs opt-in
+      # auto-finalize, and two negative controls. Shares ANIMUS_UPGRADE_SEEDS
+      # with the mixed-version corpus; K=20 is ~2.5 minutes wall in debug, so
+      # the nightly K=40 is ~5 minutes. Replay with ANIMUS_SEED (+
+      # ANIMUS_UPGRADE_CELL); a failing cell prints its decision trace.
+      - name: deep roll-orchestrator corpus, SimCluster tier (ADR 0073 Phase 3, P3-C)
+        id: upgrade_roll
+        continue-on-error: true
+        timeout-minutes: 30
+        env:
+          ANIMUS_UPGRADE_SEEDS: '40'
+        run: cargo test -p animusd --lib sim_cluster_roll_orchestrator -- --nocapture
+
       # Issue #1064/#1092: a late-joining learner needing a real multi-chunk
       # InstallSnapshot under a writer that never stops, one corpus seed per
       # scenario. Each seed is a pure function of its seed, so a failure names
@@ -712,21 +816,28 @@ jobs:
             [control]="${{ steps.control.outcome }}"
             [simcluster]="${{ steps.simcluster.outcome }}"
             [dynamo_wire]="${{ steps.dynamo_wire.outcome }}"
+            [zone_placement]="${{ steps.zone_placement.outcome }}"
+            [split_relocation]="${{ steps.split_relocation.outcome }}"
             [export_import]="${{ steps.export_import.outcome }}"
             [s3_fault]="${{ steps.s3_fault.outcome }}"
             [heartbeat]="${{ steps.heartbeat.outcome }}"
+            [wan_timing]="${{ steps.wan_timing.outcome }}"
+            [mrsc_leader]="${{ steps.mrsc_leader.outcome }}"
+            [mrsc_cluster]="${{ steps.mrsc_cluster.outcome }}"
+            [mrec_world]="${{ steps.mrec_world.outcome }}"
             [sharedwal]="${{ steps.sharedwal.outcome }}"
             [wal_rewrite_crash]="${{ steps.wal_rewrite_crash.outcome }}"
             [upgrade_restart]="${{ steps.upgrade_restart.outcome }}"
             [upgrade_restart_cluster]="${{ steps.upgrade_restart_cluster.outcome }}"
             [upgrade_mixed]="${{ steps.upgrade_mixed.outcome }}"
             [upgrade_mixed_cluster]="${{ steps.upgrade_mixed_cluster.outcome }}"
+            [upgrade_roll]="${{ steps.upgrade_roll.outcome }}"
             [learner_snapshot_livelock]="${{ steps.learner_snapshot_livelock.outcome }}"
             [scale]="${{ steps.scale.outcome }}"
           )
           failed=0
           failed_names=()
-          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner reconfigure_drop inplace_split backup pitr lsm_crash lsm_disk_fault lsm_encrypted segment_store_encrypted control simcluster dynamo_wire export_import s3_fault heartbeat sharedwal wal_rewrite_crash upgrade_restart upgrade_restart_cluster upgrade_mixed upgrade_mixed_cluster learner_snapshot_livelock scale; do
+          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner reconfigure_drop inplace_split backup pitr lsm_crash lsm_disk_fault lsm_encrypted segment_store_encrypted control simcluster dynamo_wire zone_placement split_relocation export_import s3_fault heartbeat wan_timing mrsc_leader mrsc_cluster mrec_world sharedwal wal_rewrite_crash upgrade_restart upgrade_restart_cluster upgrade_mixed upgrade_mixed_cluster upgrade_roll learner_snapshot_livelock scale; do
             outcome="${outcomes[$name]}"
             echo "${name}: ${outcome}"
             if [ "${outcome}" != "success" ]; then

@@ -1,0 +1,66 @@
+[package]
+name = "animus-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "AnimusDB open-loop (coordinated-omission-corrected) DynamoDB-wire load generator."
+
+[lints]
+workspace = true
+
+[lib]
+name = "animus_bench"
+path = "src/lib.rs"
+
+[[bin]]
+name = "animus-bench"
+path = "src/main.rs"
+
+# Real-thread `ProdEnv` cluster tests are opt-in behind `prod-heavy` and run in
+# CI's `prod-liveness-scattered` job (`--test-threads=1`), never in the
+# per-push `gates` tier — the same convention as animus-control /
+# animus-cp-data / animus-storage (see `.github/workflows/ci.yml`).
+[features]
+prod-heavy = []
+
+[[test]]
+name = "smoke"
+path = "tests/smoke.rs"
+required-features = ["prod-heavy"]
+
+[dependencies]
+# SigV4 client-side signing (`animus_dynamo::sigv4::sign`, already `pub`,
+# ADR 0057) — reused rather than pulling in the AWS SDK.
+animus-dynamo.workspace = true
+# In-process cluster launcher (`Node::bind` + `run_bound_node`) — the same
+# bring-up the integration tests use; a bench-launched cluster is always
+# labeled non-publishable.
+animusd.workspace = true
+tokio = { workspace = true, features = ["process"] }
+serde.workspace = true
+serde_json.workspace = true
+# Seeded op/key stream (the generator is a process-boundary binary, but a
+# seeded stream makes a run's operation sequence reproducible).
+rand.workspace = true
+rand_chacha.workspace = true
+# HdrHistogram (`record_correct`-free: the intended-time correction is done
+# by the recorder itself, see `recorder.rs`). No `serialization` feature.
+hdrhistogram = { version = "7", default-features = false }
+# Server-only TLS on the DynamoDB and admin dials (ADR 0064, ADR 0076
+# as-built note): `--tls-ca PATH`, modelled on `animus-cli`. `animus-env`'s
+# `MaybeTlsStream` / `server_name_for` are reused verbatim; the rustls trio
+# is the workspace's pinned `ring` feature set (one crypto backend, ADR
+# 0064 Decision 5) — nothing new enters `Cargo.lock`.
+animus-env = { workspace = true, features = ["prod"] }
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pki-types.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+# Throwaway CA + leaf for the TLS tests (workspace dev-dep, as animusd's
+# own `tests/support::tls_pki` uses it).
+rcgen.workspace = true

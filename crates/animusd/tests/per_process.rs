@@ -73,6 +73,8 @@ async fn per_process_nodes_form_a_cluster_from_shared_config() {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                labels: Default::default(),
+                overload: None,
             })
             .collect();
         let config = ClusterConfig {

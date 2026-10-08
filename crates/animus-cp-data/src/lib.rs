@@ -50,7 +50,7 @@ use animus_control::persist_round::{
     self, GatedOuts, PersistArm, PersistFut, PersistProgress, PersistWake,
 };
 use animus_control::raft::{Out, RaftCore, RaftMsg, StateMachine};
-use animus_control::version::ClusterFeatures;
+use animus_control::version::{ClusterFeatures, Gate};
 use animus_control::{PersistedState, ProposeResult};
 use animus_env::{Env, EnvExt, Metric, MetricsHandle, Nanos, NodeId, PRIMARY_STREAM};
 // ADR 0054 step 2: the pure item model/evaluation crate below the wire
@@ -63,6 +63,7 @@ use futures::task::AtomicWaker;
 use serde::{Deserialize, Serialize};
 
 mod applied;
+mod apply_stall;
 pub mod backup;
 mod ceiling;
 pub mod cluster_segment_store;
@@ -70,12 +71,17 @@ mod codec;
 pub mod cursor;
 #[cfg(test)]
 mod format_fixture_tests;
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing;
 mod gates;
 pub mod heartbeat_batch;
 pub mod hlc;
 pub mod host;
 mod hwm;
 pub mod layout;
+#[cfg(test)]
+mod mrec_props;
 mod seal;
 pub mod segment;
 mod split;
@@ -86,6 +92,15 @@ mod txn;
 use heartbeat_batch::{HeartbeatBatcher, HeartbeatPending};
 use hlc::{Hlc, HlcTimestamp, bump_strictly_above};
 use ts_cache::TsCache;
+/// The upgrade-restart harness's `txn-envelope` row-value transcode (ADR 0073
+/// P1-D, `animus-test`'s `upgrade::transcode`): the v1 down-conversion of one
+/// stored engine row value — `Some(v1 bytes)` iff `value` is exactly one
+/// well-formed v2 intent envelope, `None` (leave the row alone) otherwise.
+#[cfg(any(test, feature = "legacy-encoders"))]
+#[must_use]
+pub fn downgrade_txn_envelope_to_v1(value: &[u8]) -> Option<Vec<u8>> {
+    txn::legacy::v1::downgrade_intent_to_v1(value)
+}
 pub use txn::{
     PendingTxnWrite, ResolveOutcome, StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome, TxnWrite,
 };
@@ -522,6 +537,16 @@ pub const KIND_FOOTPRINT: u8 = 0x03;
 /// lineage)`, holding a packed-HLC watermark.
 pub const KIND_CURSOR: u8 = 0x04;
 
+/// Snapshot-image-only row kind (issue #1251, ADR 0073 `txn-resolved-marker`
+/// amendment): the **resolved-marker** base-scope row, shipped under a kind no
+/// [`ALL_KINDS`] scope owns while `Gate::GlobalTables` is closed. A
+/// previous-release receiver drops an unknown kind in `install_engine_image`
+/// (so it never sees the marker as a client item), a current receiver files
+/// it as the base-scope marker row. Never a storage scope and never in
+/// [`ALL_KINDS`]; reserved in the high half so a future real kind cannot
+/// collide with it.
+pub(crate) const KIND_WIRE_RESOLVED_MARKER: u8 = 0x80;
+
 /// Every row-kind scope a tablet group owns, in selector order (ADR 0041 §3,
 /// extended ADR 0042/0043).
 ///
@@ -575,6 +600,29 @@ pub enum KindEvalOp {
     Update {
         key_item: Item,
         actions: Vec<UpdateAction>,
+    },
+    /// **Apply a replicated MREC write** (ADR 0075 section 4, G-01 stage
+    /// G-d): another Region's already-resolved result for this item, shipped
+    /// as the resulting image (never the expression). `item: None` is a
+    /// tombstone. `ver` is the originating Region's stamp; apply (M2) writes
+    /// the row only when `ver` beats the stored stamp, otherwise it reports
+    /// the leader-local `Superseded` result. Unconditional: the entry's
+    /// `condition` is ignored by construction (the shipper never sets one).
+    ///
+    /// **Class G, gated by `Gate::MrecReplication`** (cluster version 3):
+    /// [`KvCommand::required_gate`](crate::gates) is content-dependent, so a
+    /// `KindEval`/`KindEvalBatch`/`TxnStage` carrying this op is refused at
+    /// the propose site until the gate opens. **Apply (M2)**: applied only if
+    /// `ver` is strictly greater than the stored stamp (an unversioned row
+    /// compares as zero), through the ordinary `derive_kind_writes` path (LSI
+    /// rows, change record with images) with `ver` written verbatim;
+    /// otherwise the leader-local `Superseded` result and no writes. A key
+    /// holding a foreign transaction intent yields the entry's
+    /// `ConditionFailed` outcome (the shipper's `Retry`). Rejected
+    /// deterministically when the entry's `WriteSchema::mrec` is `None`.
+    Replicate {
+        item: Option<Item>,
+        ver: animus_item::MrecVersion,
     },
 }
 
@@ -700,7 +748,7 @@ impl StorageScope {
         rows.map(|rows| {
             rows.iter().any(|(k, _)| {
                 self.strip_in_range(k)
-                    .is_some_and(|logical| !txn::is_record_key(logical))
+                    .is_some_and(|logical| !txn::is_internal_key(logical))
             })
         })
         .unwrap_or(false)
@@ -1829,6 +1877,10 @@ pub struct KindEvalResult {
     /// The item immediately after this entry applied — `None` for a
     /// delete.
     pub new: Option<Item>,
+    /// ADR 0075 G-d M2: the entry was a [`KindEvalOp::Replicate`] that lost
+    /// last-writer-wins (`ver <= stored`) and wrote nothing; `old == new` is
+    /// then the item as stored. Always `false` for every other op.
+    pub superseded: bool,
 }
 
 /// The leader-local slot map [`KvCommand::KindEval`]'s apply arm fills
@@ -1928,6 +1980,10 @@ pub enum KindEvalItemResult {
     /// [`KindBatchOutcome::Rejected`]'s doc for the two cases this covers.
     /// Like `ConditionFailed`, scoped to this one item.
     Rejected { code: String, message: String },
+    /// ADR 0075 G-d M2: a [`KindEvalOp::Replicate`] that lost last-writer-wins
+    /// (`ver <= stored`): nothing was written for this item; `current` is the
+    /// item as stored. Scoped to this one item like `ConditionFailed`.
+    Superseded { current: Option<Item> },
 }
 
 /// The leader-local result payload of one `KvCommand::KindEvalBatch` entry
@@ -2082,65 +2138,50 @@ struct TxnTracker {
     /// read-path push, ADR 0018 §2/PR5 §3) — only background promptness is
     /// (very slightly) weaker in that residual case.
     unresolved_decided: BTreeMap<TxnId, (Vec<u8>, txn::TxnOutcome)>,
-    /// `physical_key -> txn_id`: the transaction whose intent at this key
-    /// was most recently resolved (`TxnResolve`, commit or abort alike) on
-    /// THIS group — populated for every participant that applies a
-    /// resolve, anchor or not, unlike `pending`/`unresolved_decided` above
-    /// (which are anchor-only by construction). A **defensive seatbelt**
-    /// against issue #298 shape A: `KvCommand::TxnStage`'s own `blocked_by`
-    /// check only ever rejects overwriting a *different* transaction's
-    /// still-live `Intent` — it has no way to reject a stage that arrives
-    /// for a key AFTER this exact transaction's own resolve already ran,
-    /// since by then the key is a plain `Committed`/restored value, not an
-    /// `Intent` at all. `KvCommand::TxnStage`'s apply arm checks this map
-    /// by **(key, txn_id) identity**, never presence alone — the same
-    /// discipline `KindBatchOutcome`'s own false-ack fix established for
-    /// "never trust an outcome without confirming it names the SAME
-    /// thing." Bounded (`record_resolution`'s own `RETAIN`), like
-    /// `KindBatchOutcomes`/`StageOutcomes`: purely a best-effort catch, not
-    /// a source of truth — an evicted (or, after a restart, simply never
-    /// rebuilt) entry only means this ONE seatbelt doesn't catch a given
-    /// resurrection attempt, never that a wrong decision gets made from a
-    /// stale one. **Deliberately not rebuilt at group start**
-    /// (`rebuild_txn_tracker`, below) — unlike `pending`/`unresolved_
-    /// decided`, which restore real transaction-lifecycle facts a restart
-    /// must not lose, this map's whole job is catching a stale stage that
-    /// arrives shortly after its own resolve within the SAME uptime window;
-    /// starting it empty after a restart is exactly as safe as any other
-    /// eviction.
-    recently_resolved: BTreeMap<Vec<u8>, TxnId>,
-    /// Insertion order for `recently_resolved`'s bounded FIFO eviction —
-    /// see `record_resolution`.
-    recently_resolved_order: std::collections::VecDeque<(Vec<u8>, TxnId)>,
 }
 
-impl TxnTracker {
-    /// Entries retained behind the newest, mirroring `KindBatchOutcomes::
-    /// RETAIN`'s own "generous next to the realistic poll/retry window,
-    /// while keeping the map small enough to be free" reasoning — a stale
-    /// re-stage this seatbelt exists to catch arrives within a bounded
-    /// retry/timeout window (seconds), never after thousands of intervening
-    /// resolves on the same busy tablet.
-    const RECENTLY_RESOLVED_RETAIN: usize = 4096;
-
-    /// Record that `txn_id`'s intent at `physical_key` was just resolved on
-    /// this group — see `recently_resolved`'s own doc.
-    fn record_resolution(&mut self, physical_key: Vec<u8>, txn_id: TxnId) {
-        self.recently_resolved
-            .insert(physical_key.clone(), txn_id.clone());
-        self.recently_resolved_order
-            .push_back((physical_key, txn_id));
-        while self.recently_resolved_order.len() > Self::RECENTLY_RESOLVED_RETAIN {
-            let Some((old_key, old_txn_id)) = self.recently_resolved_order.pop_front() else {
-                break;
-            };
-            // Only remove if it's still THIS eviction's own entry — a
-            // later resolution of the same key (a different, newer
-            // txn_id) must never be evicted by an older entry's turn.
-            if self.recently_resolved.get(&old_key) == Some(&old_txn_id) {
-                self.recently_resolved.remove(&old_key);
-            }
-        }
+/// The committed value `physical_key` holds right now, as the `prior` a
+/// freshly staged intent of `txn_id` must carry (ADR 0018 §2's 2026-10-04
+/// amendment; see [`txn::IntentPrior`]). Called by `TxnStage`'s apply right
+/// before it writes the intent, after flushing the pending run, so "right
+/// now" is exactly the state immediately below the intent's own version on
+/// every replica (every replica applies the same log prefix to the same
+/// latest-record state; neither compaction GC nor snapshot install ever
+/// changes a key's latest record).
+///
+/// - a committed value → that value; absent/tombstoned → `None`;
+/// - **this same transaction's own intent** (a WAL-replay re-application, or
+///   a second write to one key within a stage) → that intent's own prior, so
+///   re-staging never captures the transaction's own provisional value; a
+///   legacy v1 own intent (no carried prior) falls back to the old
+///   one-MVCC-version lookback below it;
+/// - another transaction's intent is unreachable here (`blocked_by` rejects
+///   the whole stage first); it is treated like a v1 own intent rather than
+///   asserted, never capturing raw envelope bytes as a value.
+async fn stage_intent_prior<S: StorageEngine>(
+    storage: &S,
+    physical_key: &[u8],
+    txn_id: &TxnId,
+) -> Option<Vec<u8>> {
+    let vv = storage
+        .get(physical_key)
+        .await
+        .expect("raftkv txn stage prior read")?;
+    match txn::decode_envelope(&vv.value) {
+        txn::Envelope::Committed(v) => Some(v),
+        txn::Envelope::Intent {
+            txn_id: owner,
+            prior: txn::IntentPrior::Known(prior),
+            ..
+        } if &owner == txn_id => prior,
+        txn::Envelope::Intent { .. } => storage
+            .get_at(physical_key, vv.version.saturating_sub(1))
+            .await
+            .expect("raftkv txn stage prior lookback read")
+            .and_then(|pvv| match txn::decode_envelope(&pvv.value) {
+                txn::Envelope::Committed(v) => Some(v),
+                txn::Envelope::Intent { .. } => None,
+            }),
     }
 }
 
@@ -2219,6 +2260,15 @@ async fn rebuild_txn_tracker<S: StorageEngine>(storage: &S, scope: &StorageScope
 /// [`linearizable_get_served_fast`](RaftKvNode::linearizable_get_served_fast)'s
 /// doc and `animusd::ClientCtx::cp_get_local_resolving`/
 /// `cp_get_local_snapshot`, the two callers that act on this.
+/// The outcome of [`RaftKvNode::local_get_for_ship`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShipGet {
+    /// A committed value, or `None` for no such row.
+    Value(Option<Vec<u8>>),
+    /// A pending intent covers the key; the shipper must retry later.
+    Pending,
+}
+
 enum ResolveStep {
     Value(Option<Vec<u8>>),
     Pending(IntentInfo),
@@ -2375,6 +2425,10 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// ([`is_stopped`](Self::is_stopped)) — the teardown path (drop-table GC) waits
     /// on that before deleting the engine/WAL.
     apply_stopped: Arc<AtomicBool>,
+    /// True while the apply task is **paused on ENOSPC** (R-01 (d) residual,
+    /// issue #1218; see `apply_stall`). Reported by
+    /// [`is_storage_full`](Self::is_storage_full) alongside the suspect WAL.
+    apply_stalled: Arc<AtomicBool>,
     /// **Wake-on-propose** signal: a proposer raises it to make the consensus loop
     /// replicate a freshly appended entry immediately, cutting single-write latency
     /// (ADR 0017) — no waiting on the next heartbeat tick.
@@ -2469,6 +2523,10 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// write/txn helpers consult). Never cleared: a frozen parent's only
     /// future is retirement at cutover.
     frozen: Arc<AtomicBool>,
+    /// Persist-round accounting shared with the consensus loop and the apply
+    /// task's compaction rewrite — here only so [`is_storage_full`](Self::is_storage_full)
+    /// can read the group's WAL-suspect (ENOSPC) state.
+    persist: Arc<PersistProgress>,
     /// The highest `ReadCeiling` **candidate** this leader has ever
     /// proposed (whether committed yet or not), packed via [`hlc::pack`] —
     /// disambiguates two `ensure_ceiling_above` calls that independently
@@ -2528,6 +2586,13 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// Defaults `false` — zero behavior change for every caller that never
     /// touches it.
     external_quiesce_veto: Arc<AtomicBool>,
+    /// Node-local: this replica sits in its table's **witness** Region (ADR
+    /// 0075 section 3.6) and so must never serve a replica-local eventual
+    /// read. Set by the tablet-host reconciler from the replicated global-table
+    /// spec ([`set_witness`](Self::set_witness)); [`stale_read_ready`]
+    /// (Self::stale_read_ready) then declines, so every eventual read falls
+    /// back to (or forwards to) a full replica. Defaults `false`.
+    witness: Arc<AtomicBool>,
     /// Freshness stamp for `external_quiesce_veto` (issue #302 fix): the
     /// value of [`engine_applied_index`](Self::engine_applied_index) the
     /// external caller's own observation is valid through — see
@@ -3109,6 +3174,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let halted = Arc::new(AtomicBool::new(false));
         let stopped = Arc::new(AtomicBool::new(false));
         let apply_stopped = Arc::new(AtomicBool::new(false));
+        let apply_stalled = Arc::new(AtomicBool::new(false));
         let engine_applied = Arc::new(AtomicU64::new(0));
         let applied_watch = AppliedWatch::default();
         let wal_lock = Arc::new(FairMutex::new());
@@ -3156,6 +3222,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // ordering.
         let txn_tracker = Arc::new(Mutex::new(TxnTracker::default()));
         let external_quiesce_veto = Arc::new(AtomicBool::new(false));
+        let witness = Arc::new(AtomicBool::new(false));
         // See the field's own doc: `u64::MAX` is the "never engaged" sentinel,
         // not `0` — a caller that never calls `set_quiesce_veto` for this
         // group must impose no freshness requirement at all.
@@ -3188,6 +3255,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             halted: Arc::clone(&halted),
             stopped: Arc::clone(&stopped),
             apply_stopped: Arc::clone(&apply_stopped),
+            apply_stalled: Arc::clone(&apply_stalled),
             propose_signal: Arc::clone(&propose_signal),
             apply_signal: Arc::clone(&apply_signal),
             wake_signal: Arc::clone(&wake_signal),
@@ -3200,11 +3268,13 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             ts_cache: Arc::clone(&ts_cache),
             committed_ceiling: Arc::clone(&committed_ceiling),
             frozen: Arc::clone(&frozen),
+            persist: Arc::clone(&persist),
             last_ceiling_candidate,
             last_proposed_ts,
             last_absorbed_term,
             txn_tracker: Arc::clone(&txn_tracker),
             external_quiesce_veto: Arc::clone(&external_quiesce_veto),
+            witness: Arc::clone(&witness),
             external_quiesce_veto_fresh_through: Arc::clone(&external_quiesce_veto_fresh_through),
             voter_history: Arc::clone(&voter_history),
             hot_change_max: Arc::clone(&hot_change_max),
@@ -3214,7 +3284,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // The consensus loop recovers from the WAL, then spawns the apply task
         // (so the apply task sees the recovered core + the correct
         // `engine_applied` base before it merges anything), then runs.
-        env.spawn_task(drive(DriveState {
+        env.spawn_critical_task(drive(DriveState {
             env: env.clone(),
             core,
             all_nodes,
@@ -3232,6 +3302,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             halted,
             stopped,
             apply_stopped,
+            apply_stalled,
             propose_signal,
             apply_signal,
             wake_signal,
@@ -3322,6 +3393,44 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         ForkPending {
             signal: &self.fork_signal,
         }
+    }
+
+    /// Install `profile`'s `(election_base, heartbeat_interval)` on this group
+    /// (ADR 0075 section 3.4, G-01 stage G-c groundwork) — see
+    /// [`RaftCore::set_timing`]. Idempotent (no RNG draw, no deadline touched
+    /// when the group already runs `profile`); on a real change the driver is
+    /// woken so it re-evaluates `next_deadline` at once. Returns whether the
+    /// timing changed. Called by the tablet-host reconciler
+    /// ([`host::Reconciler`]) with a profile derived from the tablet's replica
+    /// regions; a node-local, non-replicated decision.
+    pub fn set_timing_profile(&self, profile: animus_control::timing::TimingProfile) -> bool {
+        let want = profile.durations();
+        if self.lock().timing() == want {
+            return false;
+        }
+        let now = self.env.now();
+        let entropy = self.env.next_u64();
+        let changed = self.lock().set_timing(want.0, want.1, now, entropy);
+        if changed {
+            self.wake();
+        }
+        changed
+    }
+
+    /// Mark (or unmark) this replica as sitting in its table's witness Region
+    /// (ADR 0075 section 3.6). Node-local and idempotent; called by the
+    /// tablet-host reconciler every tick from replicated `Metadata`. A witness
+    /// still votes and replicates normally — only the replica-local eventual
+    /// read ([`stale_read_ready`](Self::stale_read_ready)) is refused.
+    pub fn set_witness(&self, witness: bool) {
+        self.witness.store(witness, Ordering::Relaxed);
+    }
+
+    /// Whether this replica is currently marked as a witness (see
+    /// [`set_witness`](Self::set_witness)).
+    #[must_use]
+    pub fn is_witness(&self) -> bool {
+        self.witness.load(Ordering::Relaxed)
     }
 
     /// Opt this group into quiescence (ADR 0044 phase-1 PR3): once its leader
@@ -3631,6 +3740,24 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             {
                 return candidate;
             }
+        }
+    }
+
+    /// The `node` half of a [`TxnId`] this group mints. `ts` comes from the
+    /// **group's own** `Hlc`, so two groups led by one node (routine: a node
+    /// leads many tablets) can mint the identical `(ts, node)` for two
+    /// different transactions at the same instant, and a resolve for one then
+    /// acts on the other's intent (R-01 F-2). A non-primary group therefore
+    /// qualifies the node with its stream (`n0#100`), making the id unique per
+    /// group; the primary stream keeps the bare node id, so every previously
+    /// written id and fixture is unchanged. `TxnId.node` is an opaque
+    /// tiebreak (decoded unchecked), never matched against a real node id.
+    fn txn_id_node(&self) -> NodeId {
+        let node = self.env.node_id();
+        if self.stream == PRIMARY_STREAM {
+            node
+        } else {
+            NodeId::new_unchecked(format!("{node}#{}", self.stream))
         }
     }
 
@@ -3996,6 +4123,32 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         self.frozen.load(Ordering::SeqCst)
     }
 
+    /// Whether this group is out of disk (R-01 (d), ADR 0074 §2): its WAL is
+    /// suspect after an ENOSPC, **or** its apply task is paused on an engine
+    /// ENOSPC (a `merge_batch`/marker/flush/compaction write that hit a full
+    /// volume, retried until space returns — issue #1218, `apply_stall`) — the
+    /// **`StorageFull`** state. A pure flag read, never a wake or a
+    /// propose. While true the group cannot make anything durable: it acks no
+    /// write, and `animusd`'s write/txn helpers refuse mutating requests
+    /// **before proposing** with a named `StorageFull` error (503
+    /// `ServiceUnavailable`), counting `Metric::OverloadStorageFull`. Reads
+    /// keep being served. It clears itself — no restart — once the consensus
+    /// loop has rewritten the WAL from the in-memory log onto a fresh file, and
+    /// once the paused apply call finally succeeds.
+    pub fn is_storage_full(&self) -> bool {
+        self.persist.is_suspect() || self.apply_stalled.load(Ordering::SeqCst)
+    }
+
+    /// Record one `StorageFull` refusal on this group's metrics handle
+    /// (`overload_storage_full`); the caller returns the refusal itself.
+    pub fn record_storage_full_refusal(&self) {
+        self.metrics.incr(Metric::OverloadStorageFull);
+        // Issue #1219: the refused write never reaches the log, so nothing else
+        // would wake a parked (quiesced) storage-full leader to hand off
+        // leadership -- this wake makes its consensus loop re-evaluate.
+        self.wake_signal.notify();
+    }
+
     /// Propose the **split-cutover freeze** (ADR 0050 rung 5, stage 3 — see
     /// [`KvCommand::Freeze`]'s doc): terminally close this whole group to
     /// further mutation, ordered at this entry's own log position. Called
@@ -4178,7 +4331,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             let ts = self.mint_pushed(term, &keys);
             let txn_id = TxnId {
                 ts,
-                node: self.env.node_id(),
+                node: self.txn_id_node(),
             };
             let record_key = txn::record_key(&token, &txn_id);
             let mut spans: Vec<(String, KeyRange)> = keys
@@ -5125,6 +5278,24 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         self.lock().peer_match(node)
     }
 
+    /// The leader's view of a peer's health (issue #1228): the last
+    /// `check_pending` it reported on an `AppendEntriesResp` (`Some(true)` for
+    /// a storage-full follower's frozen ack), and how long ago, **on this
+    /// node's own clock**, that ack arrived (a caller's clock may be skewed
+    /// from this node's in the sim). Both `None` until the peer has acked this
+    /// leadership stint. Diagnostic: the corpus uses it to prove a full
+    /// follower keeps acking.
+    #[must_use]
+    pub fn peer_health(&self, node: &NodeId) -> (Option<bool>, Option<std::time::Duration>) {
+        let c = self.lock();
+        let now = self.env.now();
+        (
+            c.peer_check_pending(node),
+            c.peer_last_contact(node.clone())
+                .map(|at| std::time::Duration::from_nanos(now.0.saturating_sub(at.0))),
+        )
+    }
+
     /// Arm a leadership transfer to `target` (see
     /// [`RaftCore::transfer_leadership`]) and, if armed, wake the driver loop so
     /// the resulting `TimeoutNow` ships at once instead of waiting for the next
@@ -5468,14 +5639,16 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// `Committed` at or before `read_ts` (`None` = "latest") serves
     /// `staged_value`; `Committed` strictly after `read_ts`, or `Aborted`,
     /// serves whatever `physical_key` held immediately before this intent
-    /// (rewinding to `vv_version - 1` — never a tombstone, which would
-    /// incorrectly shadow an older, still-live committed value — see
-    /// `txn.rs`'s module doc).
+    /// (the intent's carried `prior`, see
+    /// [`prior_committed`](Self::prior_committed) — never a tombstone, which
+    /// would incorrectly shadow an older, still-live committed value — see
+    /// `txn.rs`'s module doc). The staged value served on commit is
+    /// `pending.staged_value`.
     async fn resolve_decided(
         &self,
         physical_key: &[u8],
         vv_version: u64,
-        staged_value: Option<Vec<u8>>,
+        prior: &txn::IntentPrior,
         read_ts: Option<HlcTimestamp>,
         status: &txn::TxnDecisionStatus,
         pending: IntentInfo,
@@ -5484,43 +5657,54 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             txn::TxnDecisionStatus::Committed { commit_ts }
                 if read_ts.is_none_or(|rt| *commit_ts <= rt) =>
             {
-                ResolveStep::Value(staged_value)
+                ResolveStep::Value(pending.staged_value)
             }
             txn::TxnDecisionStatus::Committed { .. } | txn::TxnDecisionStatus::Aborted => {
-                ResolveStep::Value(self.prior_committed(physical_key, vv_version).await)
+                ResolveStep::Value(self.prior_committed(physical_key, vv_version, prior).await)
             }
             txn::TxnDecisionStatus::Pending => ResolveStep::Pending(pending),
         }
     }
 
-    /// The key's **last committed value**, read one MVCC version below
-    /// `version` — the "one hop back from this intent" lookup shared by
-    /// [`resolve_decided`](Self::resolve_decided)'s aborted/too-late branch
-    /// and the ADR 0055 eventually-consistent read path.
+    /// The key's **last committed value** before an intent at engine
+    /// `version` — the value shared by [`resolve_decided`](Self::resolve_decided)'s
+    /// aborted/too-late branch and the ADR 0055 eventually-consistent read
+    /// path.
     ///
-    /// A *prior intent* one hop back **should be unreachable since ADR 0018
-    /// §2/PR6 (task #16)** — `KvCommand::TxnStage`'s apply-time
-    /// writer-push-intents guard rejects a stage over any key still holding
-    /// another transaction's unresolved intent, so one hop back from an
-    /// intent's own version can only ever be a genuinely committed value or
-    /// true absence (see `KvCommand::TxnStage`'s doc for the durability
-    /// argument this closes — a corpus depth run found a corrupted MVCC
-    /// version chain that made an already-committed value permanently
-    /// unreadable). Kept as a defensive fallback rather than an assert: this
-    /// function has no way to distinguish "the invariant broke" from "an
-    /// older, pre-fix WAL entry replayed on recovery" — conservatively
-    /// treating it as absent (never leaking raw envelope bytes to a caller)
-    /// is still correct either way.
-    async fn prior_committed(&self, physical_key: &[u8], version: u64) -> Option<Vec<u8>> {
-        self.storage
-            .get_at(physical_key, version.saturating_sub(1))
-            .await
-            .ok()
-            .flatten()
-            .and_then(|pvv| match txn::decode_envelope(&pvv.value) {
-                txn::Envelope::Committed(v) => Some(v),
-                txn::Envelope::Intent { .. } => None,
-            })
+    /// A current (`txn-envelope` v2) intent carries it
+    /// ([`txn::IntentPrior::Known`]), captured when the intent was staged, so
+    /// this never depends on the engine still holding MVCC history below the
+    /// intent — `LsmEngine` compaction GC and a latest-only `InstallSnapshot`
+    /// image both discard it (ADR 0018 §2's 2026-10-04 amendment: reading it
+    /// back made an aborted transaction tombstone, and an eventual read
+    /// report as absent, a key with an acknowledged committed value).
+    ///
+    /// Only a legacy v1 intent ([`txn::IntentPrior::Unknown`]) still reads
+    /// one MVCC version below `version`. A *prior intent* one hop back is
+    /// unreachable since ADR 0018 §2/PR6 (task #16) — `KvCommand::TxnStage`'s
+    /// apply-time writer-push-intents guard rejects a stage over any key still
+    /// holding another transaction's unresolved intent — but is still treated
+    /// as absent rather than asserted (never leaking raw envelope bytes to a
+    /// caller).
+    async fn prior_committed(
+        &self,
+        physical_key: &[u8],
+        version: u64,
+        prior: &txn::IntentPrior,
+    ) -> Option<Vec<u8>> {
+        match prior {
+            txn::IntentPrior::Known(prior) => prior.clone(),
+            txn::IntentPrior::Unknown => self
+                .storage
+                .get_at(physical_key, version.saturating_sub(1))
+                .await
+                .ok()
+                .flatten()
+                .and_then(|pvv| match txn::decode_envelope(&pvv.value) {
+                    txn::Envelope::Committed(v) => Some(v),
+                    txn::Envelope::Intent { .. } => None,
+                }),
+        }
     }
 
     /// The outcome of resolving one raw, envelope-tagged stored value
@@ -5539,6 +5723,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 record_key,
                 record_table,
                 staged_value,
+                prior,
                 ..
             } => {
                 // The record lives in the **anchor's** tablet, which is
@@ -5572,13 +5757,13 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                             txn_id: txn_id.clone(),
                             record_key: record_key.clone(),
                             record_table: record_table.clone(),
-                            staged_value: staged_value.clone(),
+                            staged_value,
                             version: hlc::unpack(vv.version),
                         };
                         self.resolve_decided(
                             physical_key,
                             vv.version,
-                            staged_value,
+                            &prior,
                             read_ts,
                             &r.status.to_public(),
                             pending,
@@ -5661,7 +5846,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     ) -> Vec<(Vec<u8>, Vec<u8>)> {
         let mut out = Vec::with_capacity(rows.len());
         for (key, vv) in rows {
-            if txn::is_record_key(&key) {
+            if txn::is_internal_key(&key) {
                 continue;
             }
             let physical = self.scope.physical(&key);
@@ -5689,6 +5874,52 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             ResolveStep::Value(v) => v,
             ResolveStep::Pending(_) | ResolveStep::Foreign(_) => None,
         }
+    }
+
+    /// One base key's **committed** value for the MREC shipper (ADR 0075 G-d M4):
+    /// [`ShipGet::Value`] a committed value (or none), and [`ShipGet::Pending`] the key is covered by a still-`Pending` (or foreign) intent,
+    /// which [`local_get`](Self::local_get) would have silently read as absent
+    /// — the shipper must hold its cursor rather than skip the key.
+    pub async fn local_get_for_ship(&self, key: &[u8]) -> ShipGet {
+        let physical = self.scope.physical(key);
+        let Some(vv) = self.storage.get(&physical).await.ok().flatten() else {
+            return ShipGet::Value(None);
+        };
+        match self.resolve_once_step(&physical, vv, None).await {
+            ResolveStep::Value(v) => ShipGet::Value(v),
+            ResolveStep::Pending(_) | ResolveStep::Foreign(_) => ShipGet::Pending,
+        }
+    }
+
+    /// A key-ordered window of at most `limit` committed base rows from
+    /// `start` (inclusive), for the MREC shipper's scan mode: unlike
+    /// [`local_scan`](Self::local_scan) it **stops at the first row covered by
+    /// a pending intent** instead of silently omitting it, returning that
+    /// row's key as the second element so the shipper can hold its cursor in
+    /// front of it (an aborted transaction leaves no later change record, so
+    /// an omitted row would otherwise never be shipped).
+    pub async fn local_scan_for_ship(
+        &self,
+        start: &[u8],
+        limit: usize,
+    ) -> (Vec<(Vec<u8>, Vec<u8>)>, Option<Vec<u8>>) {
+        let raw = self.raw_base_rows(start, None).await;
+        let mut out = Vec::new();
+        for (key, vv) in raw {
+            if out.len() >= limit {
+                break;
+            }
+            if txn::is_internal_key(&key) {
+                continue;
+            }
+            let physical = self.scope.physical(&key);
+            match self.resolve_once_step(&physical, vv, None).await {
+                ResolveStep::Value(Some(v)) => out.push((key, v)),
+                ResolveStep::Value(None) => {}
+                ResolveStep::Pending(_) | ResolveStep::Foreign(_) => return (out, Some(key)),
+            }
+        }
+        (out, None)
     }
 
     // ---- eventually-consistent reads (ADR 0055) --------------------------
@@ -5739,14 +5970,36 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// hence fully applied, hence current.
     #[must_use]
     pub fn stale_read_ready(&self) -> bool {
+        // ADR 0075 section 3.6: a witness replica never serves an eventual read.
+        if self.witness.load(Ordering::Relaxed) {
+            return false;
+        }
         // One lock acquisition for both core facts. `engine_applied` is read
         // *after* releasing it and only ever grows, so a concurrent apply can
         // make this false-negative (a read that falls back to the strong
         // path, which is always correct) but never false-positive.
-        let (has_leader, commit) = {
+        let (has_leader, had_contact, commit, snapshot_index) = {
             let core = self.lock();
-            (core.leader().is_some(), core.commit_index())
+            (
+                core.leader().is_some(),
+                core.has_had_leader_contact(),
+                core.commit_index(),
+                core.snapshot_index(),
+            )
         };
+        // Issue #1228: a storage-full replica never campaigns and its apply task
+        // may be paused on ENOSPC, so neither "knows a current leader" nor
+        // "applied everything committed" can be restored until space returns --
+        // yet its engine still holds a genuine, in-order prefix of the log
+        // (a paused apply stops between entries), which is exactly what an
+        // eventual read promises. So a full replica that has had a leader in
+        // this process's life serves unless it is mid-`InstallSnapshot`
+        // (`engine_applied < snapshot_index`: a half-written image, the one
+        // state that is not a prefix of the log). A process that has never
+        // heard a leader still serves nothing.
+        if self.is_storage_full() {
+            return had_contact && self.engine_applied_index() >= snapshot_index;
+        }
         Self::stale_read_ready_decision(has_leader, self.engine_applied_index(), commit)
     }
 
@@ -5862,7 +6115,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     ) -> Vec<(Vec<u8>, Vec<u8>)> {
         let mut out = Vec::with_capacity(rows.len());
         for (key, vv) in rows {
-            if txn::is_record_key(&key) {
+            if txn::is_internal_key(&key) {
                 continue;
             }
             let physical = self.scope.physical(&key);
@@ -5886,7 +6139,9 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     ) -> Option<Vec<u8>> {
         match txn::decode_envelope(&vv.value) {
             txn::Envelope::Committed(v) => Some(v),
-            txn::Envelope::Intent { .. } => self.prior_committed(physical_key, vv.version).await,
+            txn::Envelope::Intent { prior, .. } => {
+                self.prior_committed(physical_key, vv.version, &prior).await
+            }
         }
     }
 
@@ -6011,6 +6266,12 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             .into_iter()
             .filter_map(|(k, vv)| {
                 let logical = scope.strip_in_range(&k)?.to_vec();
+                // Internal rows (txn records, resolved markers) are never
+                // user data, and a marker's value is not an envelope: this
+                // scan feeds backup/export capture of `KIND_BASE`.
+                if kind == KIND_BASE && txn::is_internal_key(&logical) {
+                    return None;
+                }
                 match txn::decode_envelope(&vv.value) {
                     txn::Envelope::Committed(v) => Some((logical, v)),
                     txn::Envelope::Intent { .. } => None,
@@ -6126,7 +6387,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             // every ordinary scan. Checked here, before the `limit` gate,
             // so a marker interleaved in the range never silently consumes
             // one of the caller's requested chunk slots.
-            if txn::is_record_key(logical) {
+            if txn::is_internal_key(logical) {
                 continue;
             }
             if out.len() >= limit {
@@ -6269,10 +6530,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         if !self.read_barrier().await {
             return None;
         }
-        let ts = self.hlc.mint(self.env.now());
-        if !self.ensure_ceiling_above(ts).await {
-            return None;
-        }
+        let ts = self.read_serve_ts().await?;
         let rows = self.local_scan_kind_rev(kind, start, end, limit).await;
         self.ts_cache.lock().expect("ts cache poisoned").bump(
             start.to_vec(),
@@ -6292,10 +6550,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         if !self.read_barrier().await {
             return None;
         }
-        let ts = self.hlc.mint(self.env.now());
-        if !self.ensure_ceiling_above(ts).await {
-            return None;
-        }
+        let ts = self.read_serve_ts().await?;
         let rows = self.local_scan_kind(kind, start, end, limit).await;
         // Bump the *whole requested span*, mirroring `linearizable_scan`'s
         // identical reasoning — a future write anywhere in `[start, end)` is
@@ -6438,10 +6693,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // one if not — see `ensure_ceiling_above`'s doc), then bump the
         // read-timestamp cache with the *actual* ts served, so a concurrent
         // or later write to this key is pushed above it.
-        let ts = self.hlc.mint(self.env.now());
-        if !self.ensure_ceiling_above(ts).await {
-            return None;
-        }
+        let ts = self.read_serve_ts().await?;
         // ADR 0018 §2/PR3: unlike `local_get`'s raw peek, a linearizable
         // read retries (bounded) a still-`Pending` intent rather than
         // reporting a false absence — see `read_resolved`'s doc.
@@ -6471,10 +6723,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         if !self.read_barrier().await {
             return None;
         }
-        let ts = self.hlc.mint(self.env.now());
-        if !self.ensure_ceiling_above(ts).await {
-            return None;
-        }
+        let ts = self.read_serve_ts().await?;
         let physical = self.scope.physical(key);
         let Some(vv) = self.storage.get(&physical).await.ok().flatten() else {
             let (start, end) = ts_cache::point_span(key);
@@ -6536,6 +6785,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 record_key,
                 record_table,
                 staged_value,
+                prior,
                 ..
             } if &found == txn_id => {
                 // Built for parity with `resolve_once_step`'s own call —
@@ -6547,18 +6797,11 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                     txn_id: found.clone(),
                     record_key,
                     record_table,
-                    staged_value: staged_value.clone(),
+                    staged_value,
                     version: hlc::unpack(vv.version),
                 };
                 match self
-                    .resolve_decided(
-                        &physical,
-                        vv.version,
-                        staged_value,
-                        read_ts,
-                        &status,
-                        pending,
-                    )
+                    .resolve_decided(&physical, vv.version, &prior, read_ts, &status, pending)
                     .await
                 {
                     ResolveStep::Value(v) => Some(v),
@@ -6592,10 +6835,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         if !self.read_barrier().await {
             return None;
         }
-        let ts = self.hlc.mint(self.env.now());
-        if !self.ensure_ceiling_above(ts).await {
-            return None;
-        }
+        let ts = self.read_serve_ts().await?;
         let rows = self.local_scan(start, end, limit).await;
         // Bump the *whole requested span* (not just the rows a `limit`
         // happened to return): over-conservative, never wrong — a future
@@ -6629,10 +6869,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         if !self.read_barrier().await {
             return None;
         }
-        let ts = self.hlc.mint(self.env.now());
-        if !self.ensure_ceiling_above(ts).await {
-            return None;
-        }
+        let ts = self.read_serve_ts().await?;
         let rows = self.local_scan_rev(start, end, limit).await;
         self.ts_cache.lock().expect("ts cache poisoned").bump(
             start.to_vec(),
@@ -7099,7 +7336,25 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 let first = c
                     .first_term_index()
                     .expect("a leader has a first-term index");
-                (c.commit_index() >= first).then(|| (c.term(), c.commit_index()))
+                // Issue #1228: a storage-full leader cannot apply what it
+                // cannot persist (the WAL is suspect, or the engine's own
+                // writes are stalled on ENOSPC), so `commit_index` can sit past
+                // what its engine will ever reach until space returns, and
+                // waiting for the engine to reach it would never finish. What
+                // the read must cover is every write ever *acknowledged*:
+                // those of this leader's own term were acked only after
+                // being applied here, and the read is served from the
+                // engine's state at serving time, which holds them; those of
+                // earlier terms are all at or below this leader's first
+                // current-term entry (its election no-op), which it
+                // confirmed committed above. So the ReadIndex that must be
+                // applied is `first`, not the (unreachable) commit index.
+                let target = if self.is_storage_full() {
+                    first
+                } else {
+                    c.commit_index()
+                };
+                (c.commit_index() >= first).then(|| (c.term(), target))
             };
             if let Some(state) = captured {
                 break state;
@@ -7183,6 +7438,47 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             self.metrics.incr(Metric::CpReadBarriersTimedOut);
         }
         ok
+    }
+
+    /// The timestamp a **linearizable read** is served at, with the committed
+    /// read ceiling covering it (`None`: nothing may be served -- the caller
+    /// treats it exactly like a failed [`read_barrier`](Self::read_barrier)).
+    ///
+    /// Normally: mint a fresh `ts` and [`ensure_ceiling_above`](Self::ensure_ceiling_above)
+    /// it, proposing and waiting for a `ReadCeiling` when the committed one has
+    /// lapsed (it covers `HLC_MAX_OFFSET` of wall time per proposal).
+    ///
+    /// **Issue #1228 -- a storage-full leader cannot extend the ceiling.** A
+    /// `ReadCeiling` must commit *and apply*, and a leader that cannot persist
+    /// applies nothing new (its visible state is gated at its own durable
+    /// index); proposing one anyway would only grow a log nobody can commit and
+    /// stall the read for a whole `READ_TIMEOUT`. So once the ceiling has
+    /// lapsed such a leader serves at the **committed floor** instead: the
+    /// highest version its engine holds (`latest_version`, which includes the
+    /// ceiling marker and every applied write's commit ts), not a fresh mint.
+    ///
+    /// That is linearizable, not merely available: the read barrier already
+    /// confirmed leadership by quorum and that the engine holds everything
+    /// committed, so a read at the floor sees every write ever acknowledged
+    /// (each acked write's version is at or below the floor); and any
+    /// *future* write, on this leader or on whichever replica leads after a
+    /// change, is minted strictly above every timestamp it has applied or
+    /// witnessed -- the floor included -- so it can never land below a read
+    /// served here. The ceiling exists to cover a *fresh* mint that no
+    /// replicated entry yet bounds; the floor is bounded by committed entries
+    /// by construction.
+    async fn read_serve_ts(&self) -> Option<HlcTimestamp> {
+        let ts = self.hlc.mint(self.env.now());
+        if self.committed_ceiling() > ts {
+            return Some(ts);
+        }
+        if self.is_storage_full() {
+            if !self.is_leader() {
+                return None;
+            }
+            return Some(hlc::unpack(self.storage.latest_version()).max(self.committed_ceiling()));
+        }
+        self.ensure_ceiling_above(ts).await.then_some(ts)
     }
 
     /// Ensure this group's **committed read ceiling** (ADR 0018 §2/PR2b,
@@ -7321,6 +7617,12 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// The group's current Raft term.
     pub fn term(&self) -> u64 {
         self.lock().term()
+    }
+
+    /// The group's installed election-timeout base (ADR 0075 section 3.4:
+    /// 150 ms on the LAN profile, wider on the WAN one). Read-only.
+    pub fn election_timeout(&self) -> Duration {
+        self.lock().election_timeout()
     }
 
     /// This node's own observability sink (ADR 0015) — the same
@@ -7551,7 +7853,19 @@ async fn persist_wal<E: Env>(
     tablet: TabletId,
     metrics: &MetricsHandle,
 ) {
-    let _wal = wal_lock.lock().await;
+    let wal_guard = wal_lock.lock().await;
+    // Disk-full (R-01 (d), ADR 0074 §2): a suspect WAL is never appended to
+    // again — a compaction rewrite (or an earlier round) hit ENOSPC, so go
+    // straight to the rewrite recovery, even with nothing new to drain.
+    if progress.is_suspect() {
+        drop(wal_guard);
+        recover_kv_wal(
+            env, wal, core, wal_lock, progress, halted, shared, tablet, metrics,
+        )
+        .await;
+        apply_signal.notify();
+        return;
+    }
     // The round number is claimed in the *same* core-lock acquisition as the
     // drain (issue #279): that is what lets the consensus loop ask "which round
     // covers the mutation I just made?" and get an answer no concurrent
@@ -7569,6 +7883,25 @@ async fn persist_wal<E: Env>(
     };
     if let Some(shared) = shared {
         if let Err(e) = shared.append_tagged(env, wal, tablet, &records).await {
+            if animus_env::is_storage_full(&e) && !halted.load(Ordering::SeqCst) {
+                tracing::error!(error = %e, "raftkv shared wal append hit ENOSPC; group is StorageFull until the WAL is rewritten");
+                progress.mark_suspect();
+                drop(wal_guard);
+                recover_kv_wal(
+                    env,
+                    wal,
+                    core,
+                    wal_lock,
+                    progress,
+                    halted,
+                    Some(shared),
+                    tablet,
+                    metrics,
+                )
+                .await;
+                apply_signal.notify();
+                return;
+            }
             assert!(
                 halted.load(Ordering::SeqCst),
                 "raftkv shared wal append failed while running: {e}"
@@ -7599,17 +7932,32 @@ async fn persist_wal<E: Env>(
             record_bytes.extend(PersistedState::encode_record(record));
         }
         buf.extend_from_slice(&record_bytes);
-        if let Err(e) = env.append(wal, &buf).await {
-            assert!(
-                halted.load(Ordering::SeqCst),
-                "raftkv wal append failed while running: {e}"
-            );
-            return;
+        let io = async {
+            env.append(wal, &buf).await?;
+            env.sync(wal).await
         }
-        if let Err(e) = env.sync(wal).await {
+        .await;
+        if let Err(e) = io {
+            if animus_env::is_storage_full(&e) && !halted.load(Ordering::SeqCst) {
+                // ENOSPC: the file's tail is now unknown (a torn partial
+                // append, or bytes a failed fsync may have dropped), so it is
+                // marked suspect and rewritten from the in-memory log onto a
+                // fresh file once space returns. Never retry the fsync on this
+                // file and assume success (fsyncgate). The round is NOT marked
+                // durable and nothing is acked until that rewrite lands.
+                tracing::error!(error = %e, "raftkv wal write hit ENOSPC; group is StorageFull until the WAL is rewritten");
+                progress.mark_suspect();
+                drop(wal_guard);
+                recover_kv_wal(
+                    env, wal, core, wal_lock, progress, halted, shared, tablet, metrics,
+                )
+                .await;
+                apply_signal.notify();
+                return;
+            }
             assert!(
                 halted.load(Ordering::SeqCst),
-                "raftkv wal sync failed while running: {e}"
+                "raftkv wal append failed while running (append or sync): {e}"
             );
             return;
         }
@@ -7628,6 +7976,64 @@ async fn persist_wal<E: Env>(
         progress.complete_drain(round);
     }
     apply_signal.notify();
+}
+
+/// Rewrite a suspect per-tablet WAL from the group's in-memory log onto a
+/// fresh file and clear the `StorageFull` state — see
+/// [`persist_round::recover_suspect_wal`]. The write is `Disk::replace` on the
+/// per-group-file path (a temp file + rename: new descriptor, a torn tail
+/// simply disappears) and the coordinator's whole-file `compact_group` on the
+/// shared-WAL path (which replaces this tablet's cached tail with the image and
+/// rewrites the one shared file from every tablet's tail). A non-ENOSPC
+/// failure of the rewrite is a real durability fault and stays a hard panic
+/// (tolerated only while `halted`).
+#[allow(clippy::too_many_arguments)] // mirrors `persist_wal`'s own parameter list
+async fn recover_kv_wal<E: Env>(
+    env: &E,
+    wal: &str,
+    core: &Arc<Mutex<KvCore>>,
+    wal_lock: &FairMutex,
+    progress: &PersistProgress,
+    halted: &AtomicBool,
+    shared: Option<&SharedWal<KvCommand, KvState>>,
+    tablet: TabletId,
+    metrics: &MetricsHandle,
+) {
+    let result = persist_round::recover_suspect_wal(
+        env,
+        core,
+        wal_lock,
+        progress,
+        halted,
+        |image: Vec<animus_control::persist::WalRecord<KvCommand, KvState>>| async move {
+            if let Some(shared) = shared {
+                let r = shared.compact_group(env, wal, tablet, image).await;
+                if r.is_ok() {
+                    metrics.incr(Metric::CpSharedWalGcRewrites);
+                }
+                r
+            } else {
+                let mut buf = Vec::new();
+                for record in &image {
+                    buf.extend(PersistedState::encode_record(record));
+                }
+                let r = env.replace(wal, &buf).await;
+                if r.is_err() {
+                    // Free the half-written temp sibling so the space it holds
+                    // can return to the volume.
+                    let _ = env.remove(&format!("{wal}.tmp")).await;
+                }
+                r
+            }
+        },
+    )
+    .await;
+    if let Err(e) = result {
+        assert!(
+            halted.load(Ordering::SeqCst),
+            "raftkv wal rewrite failed while running: {e}"
+        );
+    }
 }
 
 /// Whether `key` falls inside any range this group has already sealed
@@ -7924,7 +8330,21 @@ enum KindEvalDecision {
         change_log: (Vec<u8>, Vec<u8>),
         old: Option<Item>,
         new: Option<Item>,
+        /// The MREC stamp the base row was written with: `Some` exactly when
+        /// the entry's `WriteSchema::mrec` is `Some` (a local write stamped
+        /// by [`animus_item::MrecVersion::next_local`], or a replicated
+        /// record's own stamp written verbatim); `None` for every ordinary
+        /// table, whose base row stays byte-identical to the pre-MREC
+        /// encoding.
+        new_ver: Option<animus_item::MrecVersion>,
     },
+    /// ADR 0075 G-d M2: a [`KindEvalOp::Replicate`] whose stamp does not beat
+    /// the stored one (last-writer-wins: `ver <= stored`, including the
+    /// idempotent equal re-delivery). **No writes of any kind** — not even a
+    /// change record: the receiver's streams/PITR/GSI drain see nothing for a
+    /// record that changed nothing. `current` is the item as stored (the
+    /// leader-local result's `old == new`).
+    Superseded { current: Option<Item> },
     /// `condition` evaluated to `Ok(false)` — an ordinary
     /// `ConditionalCheckFailedException`-shaped no-op.
     ConditionFailed,
@@ -7934,6 +8354,31 @@ enum KindEvalDecision {
     /// [`KindBatchOutcome::Rejected`]'s own doc for the full account of
     /// the two cases this covers.
     Rejected { code: String, message: String },
+}
+
+/// Test-only negative-control switch for the G-d MREC corpus (ADR 0075 section
+/// 4.9, `animusd`'s `sim_world_mrec_corpus`): `true` makes a replicated record
+/// apply by arrival order (last delivered wins) instead of last-writer-wins on
+/// the stamp, proving the corpus oracle detects a broken LWW rule. A
+/// thread-local, so it scopes to one simulated test (`SimEnv` runs on the
+/// calling thread); it is always `false` in production (never set outside the
+/// corpus's own negative control).
+#[doc(hidden)]
+pub mod mrec_test_switch {
+    use std::cell::Cell;
+
+    thread_local! {
+        static LWW_BY_ARRIVAL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Arm (`true`) or disarm the arrival-order apply for this thread.
+    pub fn set_lww_by_arrival(on: bool) {
+        LWW_BY_ARRIVAL.with(|c| c.set(on));
+    }
+
+    pub(crate) fn lww_by_arrival() -> bool {
+        LWW_BY_ARRIVAL.with(Cell::get)
+    }
 }
 
 /// The pure evaluation core of [`KvCommand::KindEval`]'s apply arm (ADR
@@ -7950,10 +8395,40 @@ fn evaluate_kind_eval(
     sk: Option<&AttributeValue>,
     token_prefix: &[u8],
     old: Option<Item>,
+    stored_ver: Option<animus_item::MrecVersion>,
     op: &KindEvalOp,
     condition: Option<&ConditionExpression>,
     ttl_expired: bool,
 ) -> KindEvalDecision {
+    // ADR 0075 G-d M2: a replicated MREC record is **unconditional** (the
+    // shipper never sets a condition; one that rides anyway is ignored by
+    // construction) and is decided by last-writer-wins on the stored stamp
+    // alone, before anything else is evaluated.
+    if let KindEvalOp::Replicate { item, ver } = op {
+        // A replicate only makes sense on an MREC table. The proposer builds
+        // the receiver's own `WriteSchema` (so `mrec` is `Some` on every
+        // legitimate one); a deterministic rejection, never a panic or a
+        // versioned row on a table that is not MREC.
+        if schema.mrec.is_none() {
+            return KindEvalDecision::Rejected {
+                code: "ValidationException".to_owned(),
+                message: "MREC replicate on a table that is not an MREC global table".to_owned(),
+            };
+        }
+        if !ver.supersedes(stored_ver) && !mrec_test_switch::lww_by_arrival() {
+            return KindEvalDecision::Superseded { current: old };
+        }
+        return kind_eval_applied(
+            schema,
+            pk,
+            sk,
+            token_prefix,
+            old,
+            item.clone(),
+            Some(*ver),
+            ttl_expired,
+        );
+    }
     if let Some(cond) = condition {
         match cond.evaluate(old.as_ref()) {
             Ok(true) => {}
@@ -7969,6 +8444,7 @@ fn evaluate_kind_eval(
     let new = match op {
         KindEvalOp::Put(item) => Some(item.clone()),
         KindEvalOp::Delete => None,
+        KindEvalOp::Replicate { .. } => unreachable!("handled above"),
         KindEvalOp::Update { key_item, actions } => {
             let base = old.clone().unwrap_or_else(|| key_item.clone());
             match animus_item::apply_update(base, actions) {
@@ -7982,9 +8458,36 @@ fn evaluate_kind_eval(
             }
         }
     };
-    let base_value = match &new {
-        Some(item) => animus_item::encode_stored_item(item),
-        None => animus_item::encode_tombstone(),
+    // ADR 0075 G-d M2: a local write on an MREC table stamps its row from the
+    // frozen `WriteSchema::mrec` and the stored stamp — a pure function of
+    // `(entry, engine state)`, so every replica writes identical bytes.
+    let new_ver = schema
+        .mrec
+        .map(|m| animus_item::MrecVersion::next_local(stored_ver, m.wall_ms, m.region_id));
+    kind_eval_applied(schema, pk, sk, token_prefix, old, new, new_ver, ttl_expired)
+}
+
+/// The shared tail of [`evaluate_kind_eval`]: encode the base row (versioned
+/// iff `new_ver` is `Some`) and derive every companion write and the change
+/// record through `animus_item::derive_kind_writes` — the one derivation
+/// every writer shares, so LSI rows, change-log images, Streams and PITR see
+/// a replicated write exactly as they see a local one.
+#[allow(clippy::too_many_arguments)] // one item write's full identity + before/after
+fn kind_eval_applied(
+    schema: &WriteSchema,
+    pk: &AttributeValue,
+    sk: Option<&AttributeValue>,
+    token_prefix: &[u8],
+    old: Option<Item>,
+    new: Option<Item>,
+    new_ver: Option<animus_item::MrecVersion>,
+    ttl_expired: bool,
+) -> KindEvalDecision {
+    let base_value = match (&new, new_ver) {
+        (Some(item), None) => animus_item::encode_stored_item(item),
+        (None, None) => animus_item::encode_tombstone(),
+        (Some(item), Some(ver)) => animus_item::encode_stored_item_versioned(item, ver),
+        (None, Some(ver)) => animus_item::encode_tombstone_versioned_keyed(ver, pk, sk),
     };
     let derived = animus_item::derive_kind_writes(
         schema,
@@ -8003,6 +8506,7 @@ fn evaluate_kind_eval(
         change_log: derived.change_log,
         old,
         new,
+        new_ver,
     }
 }
 
@@ -8160,6 +8664,53 @@ fn surface_suspicious_merge_noop(
     // until the fresh-vs-replay distinguisher is redesigned to also
     // recognize an idempotent identical-value re-application, not just a
     // post-restart one.
+}
+
+/// The version of `physical`'s newest record, **tombstones included**
+/// (`get` hides a deleted key, so it cannot prove a later delete ran). Built on
+/// the bounded `scan_with_tombstones` over `[key, key || 0x00)`.
+async fn latest_version_incl_tombstone<S: StorageEngine>(
+    storage: &S,
+    physical: &[u8],
+) -> Option<u64> {
+    let mut end = physical.to_vec();
+    end.push(0);
+    storage
+        .scan_with_tombstones(physical, &end)
+        .await
+        .expect("raftkv replay-ahead tombstone-aware read")
+        .into_iter()
+        .find(|(k, _, _)| k.as_slice() == physical)
+        .map(|(_, _, v)| v)
+}
+
+/// Replay check for a `KindEval`/`KindEvalBatch` entry's decided key (issues
+/// #1242/#1247): `true` iff the key's newest record — tombstones included —
+/// carries a version **at or above** `entry_version` (the packed `ts` of the
+/// entry being applied), which proves this entry or a later one already wrote
+/// it. Unlike `TxnStage`'s strictly-greater check, equal counts: a `KindEval*`
+/// entry's whole write set (base row, LSI/footprint rows, change record) goes
+/// down in ONE atomic `merge_batch` (a single WAL record), so a base row at
+/// this entry's own version proves every row of the entry landed, and
+/// re-evaluating it would read its own post-state (an `Update`'s `ADD` would
+/// apply twice, a `not_exists` condition would flip). `current` is the live row
+/// the caller already read with `get` (a hit answers without a second read;
+/// only a miss pays the tombstone-aware scan, since `get` hides a deleted key).
+/// Never true on the live path (`assert_ts_monotonic`: every row is stamped at
+/// an earlier entry's strictly smaller `ts`) except for a `SeedBatch`-seeded
+/// key carrying a source-cluster version.
+async fn key_reached_by_entry<S: StorageEngine>(
+    storage: &S,
+    physical: &[u8],
+    current: Option<&animus_storage::VersionedValue>,
+    entry_version: u64,
+) -> bool {
+    match current {
+        Some(vv) => vv.version >= entry_version,
+        None => latest_version_incl_tombstone(storage, physical)
+            .await
+            .is_some_and(|v| v >= entry_version),
+    }
 }
 
 /// Install any received snapshot, apply committed-and-durable commands to the
@@ -8708,30 +9259,72 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         key: base_key.clone(),
                     }
                 } else {
+                    let physical_base = scope.physical(&base_key);
                     let raw = storage
-                        .get(&scope.physical(&base_key))
+                        .get(&physical_base)
                         .await
                         .expect("raftkv kind eval read");
+                    // Replay stability (issue #1247, the `TxnStage` #1242
+                    // shape). WAL recovery re-applies this entry over an
+                    // engine that already holds later entries' effects, so
+                    // the decision below (condition result, foreign-intent
+                    // `ConditionFailed`) would read the *future* of this
+                    // entry and could flip — and the derived rows
+                    // `materialize_derived` then writes (change-log record
+                    // on a unique `prefix||ts||ordinal` key, LSI/footprint
+                    // rows keyed by item attributes) are NOT protected by
+                    // per-key LWW the way the base row is: an orphan stream
+                    // record / index row on this replica only. A base-key
+                    // version (tombstones included) strictly above this
+                    // entry's `ts` proves a later entry already ran, and one
+                    // EQUAL to it proves this entry's own (atomic, single
+                    // `merge_batch`) write already landed, whose post-state
+                    // a re-evaluation would misread: replay as a no-op
+                    // BEFORE any derived row is written (see
+                    // `key_reached_by_entry`). Nobody waits on a replayed
+                    // entry, so `ConditionFailed` is the safe recorded
+                    // outcome. Unreachable live except a
+                    // `SeedBatch`-seeded key at a carried higher version,
+                    // where the write could not land on the base row anyway.
+                    let ahead =
+                        key_reached_by_entry(storage, &physical_base, raw.as_ref(), hlc::pack(ts))
+                            .await;
+                    if ahead {
+                        tracing::debug!(
+                            ?base_key,
+                            "raftkv: KindEval replayed over an engine already ahead of it — no-op"
+                        );
+                    }
                     match raw.map(|vv| txn::decode_envelope(&vv.value)) {
+                        _ if ahead => KindBatchOutcome::ConditionFailed {
+                            key: base_key.clone(),
+                        },
                         // An unresolved intent from a concurrent transaction
                         // makes "the current committed value" ambiguous —
                         // never guess, mirroring `KindBatch.conditions`'
                         // and `Cas`'s identical discipline for a foreign
                         // intent. The proposer's cue is the same as any
-                        // other no-op: retry.
+                        // other no-op: retry. (A `KindEvalOp::Replicate`
+                        // gets the same outcome: it carries no condition,
+                        // so for it `ConditionFailed` can only mean
+                        // "intent on the key", which the MREC shipper
+                        // treats as `Retry`, ADR 0075 G-d M2.)
                         Some(txn::Envelope::Intent { .. }) => KindBatchOutcome::ConditionFailed {
                             key: base_key.clone(),
                         },
                         committed => {
-                            let old: Option<Item> = match committed {
+                            let (old, stored_ver): (
+                                Option<Item>,
+                                Option<animus_item::MrecVersion>,
+                            ) = match committed {
                                 Some(txn::Envelope::Committed(bytes)) => {
-                                    animus_item::decode_stored_item(&bytes)
+                                    animus_item::decode_stored_item_versioned(&bytes)
                                         .expect("raftkv kind eval decode")
                                 }
                                 Some(txn::Envelope::Intent { .. }) => {
                                     unreachable!("handled by the arm above")
                                 }
-                                None => None,
+                                None => (None, None),
                             };
                             match evaluate_kind_eval(
                                 &schema,
@@ -8739,6 +9332,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                 sk.as_ref(),
                                 &token,
                                 old,
+                                stored_ver,
                                 &op,
                                 condition.as_ref(),
                                 ttl_expired,
@@ -8755,11 +9349,34 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                         message,
                                     }
                                 }
+                                KindEvalDecision::Superseded { current } => {
+                                    // ADR 0075 G-d M2: LWW lost — no writes,
+                                    // not even a change record. The entry
+                                    // itself applied (it is committed and
+                                    // deterministic on every replica), so
+                                    // the replicated outcome is `Applied`;
+                                    // `Superseded` is only the leader-local
+                                    // result payload.
+                                    kind_eval_results
+                                        .lock()
+                                        .expect("kind eval results poisoned")
+                                        .fill(
+                                            index,
+                                            term,
+                                            KindEvalResult {
+                                                old: current.clone(),
+                                                new: current,
+                                                superseded: true,
+                                            },
+                                        );
+                                    KindBatchOutcome::Applied
+                                }
                                 KindEvalDecision::Applied {
                                     writes,
                                     change_log,
                                     old,
                                     new,
+                                    ..
                                 } => {
                                     // ADR 0046 binding decision, reused
                                     // verbatim: the ONE shared
@@ -8791,7 +9408,15 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                     kind_eval_results
                                         .lock()
                                         .expect("kind eval results poisoned")
-                                        .fill(index, term, KindEvalResult { old, new });
+                                        .fill(
+                                            index,
+                                            term,
+                                            KindEvalResult {
+                                                old,
+                                                new,
+                                                superseded: false,
+                                            },
+                                        );
                                     KindBatchOutcome::Applied
                                 }
                             }
@@ -8856,138 +9481,233 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     // behavior for a duplicate `BatchWriteItem` key — with
                     // zero extra `merge_batch`/sync calls in the common
                     // (all-distinct-keys) case.
-                    let mut overlay: BTreeMap<Vec<u8>, Option<Item>> = BTreeMap::new();
-                    let mut next_ordinal: u32 = 0;
-                    let mut items: Vec<KindEvalItemResult> = Vec::with_capacity(entries.len());
-                    for entry in &entries {
-                        let base_key = kind_eval_base_key(&entry.pk, entry.sk.as_ref());
-                        let token = animus_tablet::partition_token(&animus_item::storage_key(
-                            &entry.pk, None,
-                        ));
-                        let old: Option<Item> = if let Some(cached) = overlay.get(&base_key) {
-                            cached.clone()
-                        } else {
+                    // Replay stability (issue #1247; the `TxnStage` #1242
+                    // shape). WAL recovery re-applies this entry over an
+                    // engine that already holds its own — and later entries'
+                    // — effects, so re-evaluating would read post-state and
+                    // can decide differently than the live apply did (a
+                    // `not_exists` item that passed live fails on its own
+                    // write, shifting every later item's change-record
+                    // `ordinal` onto a different key; a later delete makes a
+                    // live-rejected condition pass). Base rows are protected
+                    // by per-key LWW but the derived rows are not (a
+                    // change-log key is unique `prefix||ts||ordinal`, LSI
+                    // keys follow item attributes). The entry's write set is
+                    // one atomic `merge_batch`, so ANY item's base key at or
+                    // above this entry's `ts` (tombstones included; see
+                    // `key_reached_by_entry`) proves the whole entry already
+                    // landed: the entire entry replays as a no-op before a
+                    // single derived row is written. Entry-granular on
+                    // purpose: a per-item skip would leave later items
+                    // re-evaluating against shifted ordinals. Reads are
+                    // collected here and reused by the loop below (one `get`
+                    // per distinct key, as before). Unreachable live except
+                    // a `SeedBatch`-seeded key at a carried higher version.
+                    'eval: {
+                        let entry_version = hlc::pack(ts);
+                        let mut engine_rows: BTreeMap<
+                            Vec<u8>,
+                            Option<animus_storage::VersionedValue>,
+                        > = BTreeMap::new();
+                        let mut replayed_noop = false;
+                        for entry in &entries {
+                            let bk = kind_eval_base_key(&entry.pk, entry.sk.as_ref());
+                            if engine_rows.contains_key(&bk) {
+                                continue;
+                            }
+                            let physical_base = scope.physical(&bk);
                             let raw = storage
-                                .get(&scope.physical(&base_key))
+                                .get(&physical_base)
                                 .await
                                 .expect("raftkv kind eval batch read");
-                            match raw.map(|vv| txn::decode_envelope(&vv.value)) {
-                                // An unresolved intent from a concurrent
-                                // transaction makes "the current committed
-                                // value" ambiguous for THIS item only —
-                                // never guess; siblings still evaluate on
-                                // their own merits (see this variant's own
-                                // doc: one item's no-op never aborts
-                                // another's).
-                                Some(txn::Envelope::Intent { .. }) => {
-                                    items.push(KindEvalItemResult::ConditionFailed);
-                                    continue;
-                                }
-                                Some(txn::Envelope::Committed(bytes)) => {
-                                    animus_item::decode_stored_item(&bytes)
-                                        .expect("raftkv kind eval batch decode")
-                                }
-                                None => None,
-                            }
-                        };
-                        match evaluate_kind_eval(
-                            &entry.schema,
-                            &entry.pk,
-                            entry.sk.as_ref(),
-                            &token,
-                            old,
-                            &entry.op,
-                            entry.condition.as_ref(),
-                            entry.ttl_expired,
-                        ) {
-                            KindEvalDecision::ConditionFailed => {
-                                items.push(KindEvalItemResult::ConditionFailed);
-                            }
-                            KindEvalDecision::Rejected { code, message } => {
-                                items.push(KindEvalItemResult::Rejected { code, message });
-                            }
-                            KindEvalDecision::Applied {
-                                writes,
-                                change_log,
-                                old,
-                                new,
-                            } => {
-                                // Record this item's own `new` image in the
-                                // overlay BEFORE moving on — a later item
-                                // sharing this same key must see it.
-                                overlay.insert(base_key, new.clone());
-                                // ADR 0046 binding decision, reused
-                                // verbatim: the ONE shared materialization
-                                // helper `KindBatch`'s/`KindEval`'s own arms
-                                // and `TxnResolve`'s commit branch also
-                                // call. `next_ordinal` threads across this
-                                // loop exactly like `TxnResolve`'s own
-                                // multi-key commit loop (issue #852) so
-                                // every item's change record lands at a
-                                // distinct `(ts, ordinal)` pair.
-                                let starting = next_ordinal;
-                                next_ordinal = materialize_derived(
-                                    kind_scopes,
-                                    &writes,
-                                    std::slice::from_ref(&change_log),
-                                    ts,
-                                    &mut pending,
-                                    next_ordinal,
-                                );
-                                if next_ordinal > starting {
-                                    note_hot_change_write(hot_change_max, ts, next_ordinal - 1);
-                                }
-                                items.push(KindEvalItemResult::Applied { old, new });
+                            let reached = key_reached_by_entry(
+                                storage,
+                                &physical_base,
+                                raw.as_ref(),
+                                entry_version,
+                            )
+                            .await;
+                            engine_rows.insert(bk, raw);
+                            if reached {
+                                replayed_noop = true;
+                                break;
                             }
                         }
+                        if replayed_noop {
+                            tracing::debug!(
+                                "raftkv: KindEvalBatch replayed over an engine that already holds it \
+                             — no-op"
+                            );
+                            kind_outcomes
+                                .lock()
+                                .expect("kind batch outcomes poisoned")
+                                .record(index, term, KindBatchOutcome::Applied);
+                            kind_eval_batch_results
+                                .lock()
+                                .expect("kind eval batch results poisoned")
+                                .fill(
+                                    index,
+                                    term,
+                                    KindEvalBatchResult {
+                                        items: entries
+                                            .iter()
+                                            .map(|_| KindEvalItemResult::ConditionFailed)
+                                            .collect(),
+                                    },
+                                );
+                            break 'eval;
+                        }
+                        // ADR 0075 G-d M2: the overlay also carries the stamp the earlier
+                        // item wrote, so a second local write to the same MREC key in one
+                        // entry bumps from it (and a replicate sees it).
+                        let mut overlay: BTreeMap<
+                            Vec<u8>,
+                            (Option<Item>, Option<animus_item::MrecVersion>),
+                        > = BTreeMap::new();
+                        let mut next_ordinal: u32 = 0;
+                        let mut items: Vec<KindEvalItemResult> = Vec::with_capacity(entries.len());
+                        for entry in &entries {
+                            let base_key = kind_eval_base_key(&entry.pk, entry.sk.as_ref());
+                            let token = animus_tablet::partition_token(&animus_item::storage_key(
+                                &entry.pk, None,
+                            ));
+                            let (old, stored_ver): (
+                                Option<Item>,
+                                Option<animus_item::MrecVersion>,
+                            ) = if let Some(cached) = overlay.get(&base_key) {
+                                cached.clone()
+                            } else {
+                                // Read once up front (`engine_rows`, above).
+                                let raw = engine_rows.get(&base_key).cloned().expect(
+                                    "every item's base key was read by the replay pre-pass",
+                                );
+                                match raw.map(|vv| txn::decode_envelope(&vv.value)) {
+                                    // An unresolved intent from a concurrent
+                                    // transaction makes "the current committed
+                                    // value" ambiguous for THIS item only —
+                                    // never guess; siblings still evaluate on
+                                    // their own merits (see this variant's own
+                                    // doc: one item's no-op never aborts
+                                    // another's).
+                                    Some(txn::Envelope::Intent { .. }) => {
+                                        items.push(KindEvalItemResult::ConditionFailed);
+                                        continue;
+                                    }
+                                    Some(txn::Envelope::Committed(bytes)) => {
+                                        animus_item::decode_stored_item_versioned(&bytes)
+                                            .expect("raftkv kind eval batch decode")
+                                    }
+                                    None => (None, None),
+                                }
+                            };
+                            match evaluate_kind_eval(
+                                &entry.schema,
+                                &entry.pk,
+                                entry.sk.as_ref(),
+                                &token,
+                                old,
+                                stored_ver,
+                                &entry.op,
+                                entry.condition.as_ref(),
+                                entry.ttl_expired,
+                            ) {
+                                KindEvalDecision::ConditionFailed => {
+                                    items.push(KindEvalItemResult::ConditionFailed);
+                                }
+                                KindEvalDecision::Rejected { code, message } => {
+                                    items.push(KindEvalItemResult::Rejected { code, message });
+                                }
+                                KindEvalDecision::Superseded { current } => {
+                                    // ADR 0075 G-d M2: LWW lost, nothing written
+                                    // (the overlay is unchanged: the stored row
+                                    // is still what a later same-key item sees).
+                                    items.push(KindEvalItemResult::Superseded { current });
+                                }
+                                KindEvalDecision::Applied {
+                                    writes,
+                                    change_log,
+                                    old,
+                                    new,
+                                    new_ver,
+                                } => {
+                                    // Record this item's own `new` image (and
+                                    // stamp) in the overlay BEFORE moving on — a
+                                    // later item sharing this same key must see
+                                    // it.
+                                    overlay.insert(base_key, (new.clone(), new_ver));
+                                    // ADR 0046 binding decision, reused
+                                    // verbatim: the ONE shared materialization
+                                    // helper `KindBatch`'s/`KindEval`'s own arms
+                                    // and `TxnResolve`'s commit branch also
+                                    // call. `next_ordinal` threads across this
+                                    // loop exactly like `TxnResolve`'s own
+                                    // multi-key commit loop (issue #852) so
+                                    // every item's change record lands at a
+                                    // distinct `(ts, ordinal)` pair.
+                                    let starting = next_ordinal;
+                                    next_ordinal = materialize_derived(
+                                        kind_scopes,
+                                        &writes,
+                                        std::slice::from_ref(&change_log),
+                                        ts,
+                                        &mut pending,
+                                        next_ordinal,
+                                    );
+                                    if next_ordinal > starting {
+                                        note_hot_change_write(hot_change_max, ts, next_ordinal - 1);
+                                    }
+                                    items.push(KindEvalItemResult::Applied { old, new });
+                                }
+                            }
+                        }
+                        // Collapse this entry's own pending writes to at most ONE
+                        // op per PHYSICAL key, keeping the LAST one pushed.
+                        // `pending` holds exactly (and only) this entry's own
+                        // writes here — `flush_pending` emptied it above, and
+                        // nothing else can touch it mid-arm — so this cannot
+                        // affect any other entry.
+                        //
+                        // Needed because [`StorageEngine::merge`]'s per-key LWW
+                        // takes effect only when its `version` is STRICTLY
+                        // greater than the key's current latest: two writes to
+                        // the SAME physical key sharing this entry's one `ts`
+                        // (the same-key-duplicate case `overlay` above makes
+                        // read-consistent) would otherwise silently keep the
+                        // FIRST push and drop the second — the opposite of the
+                        // last-write-wins behavior this variant preserves for a
+                        // duplicate `BatchWriteItem` key (see this variant's own
+                        // doc). Every change-log op's own key is unique per item
+                        // (it carries that item's `ordinal`), so this can only
+                        // ever collapse a genuine BASE/LSI collision, never a
+                        // change record.
+                        let mut last_index_for_key: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
+                        for (i, op) in pending.iter().enumerate() {
+                            last_index_for_key.insert(op.key.clone(), i);
+                        }
+                        let mut keep = vec![false; pending.len()];
+                        for &i in last_index_for_key.values() {
+                            keep[i] = true;
+                        }
+                        let mut next = 0;
+                        pending.retain(|_| {
+                            let k = keep[next];
+                            next += 1;
+                            k
+                        });
+                        // ONE `KindBatchOutcome::Applied` for the whole entry —
+                        // never a per-item breakdown in the replicated map (see
+                        // this variant's own doc) — plus the ordered per-item
+                        // breakdown in the leader-local, never-replicated
+                        // `KindEvalBatchResults` slot map.
+                        kind_outcomes
+                            .lock()
+                            .expect("kind batch outcomes poisoned")
+                            .record(index, term, KindBatchOutcome::Applied);
+                        kind_eval_batch_results
+                            .lock()
+                            .expect("kind eval batch results poisoned")
+                            .fill(index, term, KindEvalBatchResult { items });
                     }
-                    // Collapse this entry's own pending writes to at most ONE
-                    // op per PHYSICAL key, keeping the LAST one pushed.
-                    // `pending` holds exactly (and only) this entry's own
-                    // writes here — `flush_pending` emptied it above, and
-                    // nothing else can touch it mid-arm — so this cannot
-                    // affect any other entry.
-                    //
-                    // Needed because [`StorageEngine::merge`]'s per-key LWW
-                    // takes effect only when its `version` is STRICTLY
-                    // greater than the key's current latest: two writes to
-                    // the SAME physical key sharing this entry's one `ts`
-                    // (the same-key-duplicate case `overlay` above makes
-                    // read-consistent) would otherwise silently keep the
-                    // FIRST push and drop the second — the opposite of the
-                    // last-write-wins behavior this variant preserves for a
-                    // duplicate `BatchWriteItem` key (see this variant's own
-                    // doc). Every change-log op's own key is unique per item
-                    // (it carries that item's `ordinal`), so this can only
-                    // ever collapse a genuine BASE/LSI collision, never a
-                    // change record.
-                    let mut last_index_for_key: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
-                    for (i, op) in pending.iter().enumerate() {
-                        last_index_for_key.insert(op.key.clone(), i);
-                    }
-                    let mut keep = vec![false; pending.len()];
-                    for &i in last_index_for_key.values() {
-                        keep[i] = true;
-                    }
-                    let mut next = 0;
-                    pending.retain(|_| {
-                        let k = keep[next];
-                        next += 1;
-                        k
-                    });
-                    // ONE `KindBatchOutcome::Applied` for the whole entry —
-                    // never a per-item breakdown in the replicated map (see
-                    // this variant's own doc) — plus the ordered per-item
-                    // breakdown in the leader-local, never-replicated
-                    // `KindEvalBatchResults` slot map.
-                    kind_outcomes
-                        .lock()
-                        .expect("kind batch outcomes poisoned")
-                        .record(index, term, KindBatchOutcome::Applied);
-                    kind_eval_batch_results
-                        .lock()
-                        .expect("kind eval batch results poisoned")
-                        .fill(index, term, KindEvalBatchResult { items });
                 }
             }
             KvCommand::Delete { key, ts } => {
@@ -9294,6 +10014,65 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // foreign-transaction block (`blocked_by`) — see
                 // `docs/lessons/` for the regression this closed.
                 flush_pending(storage, &mut pending, metrics, halted).await;
+                // Replay stability (issue #1242). WAL recovery re-applies this
+                // group's log tail from `snapshot_index` over an engine that
+                // already holds the effects of entries past it (a
+                // `kill -9` restart: the engine is durable per call, the
+                // replay start is the last compaction). Every decision below
+                // reads engine state, so on that replay it sees state from
+                // the *future* of this entry and can decide differently than
+                // the live apply did: a stage the live apply rejected (a
+                // stale/duplicate stage caught by a resolved marker, a stage
+                // blocked by a since-resolved foreign intent) is accepted,
+                // and its merge lands on every key that has no later write —
+                // an intent resurrected on this replica only, which then
+                // blocks every later stage touching that key here (the
+                // acknowledged transaction's other key silently never
+                // applies on this replica). Entries apply in strictly
+                // increasing `ts` order, so a row or resolved marker at one
+                // of this stage's own keys with a version strictly above this
+                // entry's proves a later entry already ran: this entry has
+                // been applied (or rejected) in full already and replays as a
+                // no-op, exactly as the live apply left it. Equal is NOT
+                // ahead: it is this very entry's own (possibly partial,
+                // crash-interrupted) intent merge, which re-applies normally.
+                // Never true on the live path (no row can carry a version
+                // above the entry being applied) — one exception: a
+                // `SeedBatch` (the restore driver) merges rows at carried
+                // source-cluster versions, so a stage hitting a seeded key
+                // with a higher version is Fenced live too (deterministic on
+                // every replica; a liveness edge on a not-yet-served table
+                // only). Replicas that did not restart otherwise behave
+                // exactly as before. The record key joins the check on the
+                // anchor: its version moves with every later decision.
+                let stage_version = hlc::pack(ts);
+                let mut engine_ahead = false;
+                'ahead: for physical in writes
+                    .iter()
+                    .flat_map(|w| [w.key.clone(), txn::resolved_marker_key(&w.key)])
+                    .chain(is_anchor.then(|| record_key.clone()))
+                    .map(|k| scope.physical(&k))
+                {
+                    // Tombstone-aware: a key deleted after this stage (a
+                    // resolve-as-delete, a DeleteItem, a TTL reap) has no
+                    // live row, but its tombstone's version still proves a
+                    // later entry ran.
+                    if latest_version_incl_tombstone(storage, &physical)
+                        .await
+                        .is_some_and(|v| v > stage_version)
+                    {
+                        engine_ahead = true;
+                        break 'ahead;
+                    }
+                }
+                if engine_ahead {
+                    tracing::debug!(
+                        ?txn_id,
+                        ?record_key,
+                        "raftkv: TxnStage replayed over an engine already ahead of it (a later \
+                         entry wrote one of its keys) — no-op, as the live apply left it"
+                    );
+                }
                 // ADR 0018 §2/PR5 resurrection guard: PR4's prepare phase
                 // is concurrent, so the anchor's own `TxnStage` (this
                 // entry, when `is_anchor`) can arrive **after** a recovery
@@ -9368,18 +10147,31 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // resolved on this group — `blocked_by` above only ever
                 // catches a *different* transaction's still-live `Intent`,
                 // never a same-txn resurrection of an already-`Committed`/
-                // restored value (see `TxnTracker::recently_resolved`'s
-                // doc for the full argument and why checking (key, txn_id)
-                // IDENTITY, not mere presence, is load-bearing here — a
-                // *different*, genuinely later transaction reusing the same
-                // physical key is the ordinary, unrelated write path and
-                // must stage normally).
-                let resurrection_attempt = {
-                    let t = txn_tracker.lock().expect("txn tracker poisoned");
-                    writes
-                        .iter()
-                        .any(|w| t.recently_resolved.get(&scope.physical(&w.key)) == Some(&txn_id))
-                };
+                // restored value. The decision reads the durable
+                // **resolved marker** (`txn::resolved_marker_key`) that
+                // `TxnResolve`'s apply wrote beside the resolve — engine
+                // state, so it is identical on every replica whether it
+                // restarted, installed a snapshot image, or never lost
+                // anything (issue #1243: an in-memory map here made the
+                // same log entry apply differently per replica). Checking
+                // (key, txn_id) IDENTITY, not mere presence, is
+                // load-bearing: a *different*, genuinely later transaction
+                // reusing the same physical key is the ordinary, unrelated
+                // write path and must stage normally.
+                let mut resurrection_attempt = false;
+                for w in &writes {
+                    let marker = storage
+                        .get(&scope.physical(&txn::resolved_marker_key(&w.key)))
+                        .await
+                        .expect("raftkv txn stage resolved-marker read");
+                    if marker
+                        .and_then(|vv| txn::decode_resolved_marker(&vv.value))
+                        .is_some_and(|resolved| resolved == txn_id)
+                    {
+                        resurrection_attempt = true;
+                        break;
+                    }
+                }
                 if resurrection_attempt {
                     tracing::warn!(
                         ?txn_id,
@@ -9432,6 +10224,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         && w.pending.as_ref().is_none_or(|p| pending_base_key_matches(&w.key, p))
                 });
                 let all_in_fence = !already_decided
+                    && !engine_ahead
                     && !resurrection_attempt
                     && blocked_by.is_none()
                     && kind_tokens_ok
@@ -9521,43 +10314,59 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                             .get(&scope.physical(&w.key))
                             .await
                             .expect("raftkv txn stage pending-eval read");
-                        let old: Option<Item> = match raw.map(|vv| txn::decode_envelope(&vv.value))
-                        {
-                            None => None,
-                            Some(txn::Envelope::Committed(bytes)) => {
-                                animus_item::decode_stored_item(&bytes)
-                                    .expect("raftkv txn stage pending-eval decode")
-                            }
-                            // Same-txn re-staging (a WAL-replay
-                            // re-application): this exact stage already
-                            // landed this exact intent at this exact key —
-                            // reuse its already-computed payload verbatim
-                            // instead of re-evaluating `op`/`condition`
-                            // against it as though it were the pre-stage
-                            // value (which would, e.g., double-apply a
-                            // non-idempotent `ADD` against its own prior
-                            // result). A *foreign* intent here is
-                            // unreachable: `blocked_by` above already
-                            // rejected the whole stage (`all_in_fence ==
-                            // false`) before this loop ever runs.
-                            Some(txn::Envelope::Intent {
-                                txn_id: owner,
-                                staged_value,
-                                kind_writes,
-                                change_log,
-                                ..
-                            }) if owner == txn_id => {
-                                evaluated_payload[i] =
-                                    Some((staged_value, kind_writes, change_log));
-                                continue;
-                            }
-                            Some(txn::Envelope::Intent { .. }) => {
-                                unreachable!(
-                                    "a foreign intent here was already caught by `blocked_by` \
+                        let (old, stored_ver): (Option<Item>, Option<animus_item::MrecVersion>) =
+                            match raw.map(|vv| txn::decode_envelope(&vv.value)) {
+                                None => (None, None),
+                                Some(txn::Envelope::Committed(bytes)) => {
+                                    animus_item::decode_stored_item_versioned(&bytes)
+                                        .expect("raftkv txn stage pending-eval decode")
+                                }
+                                // Same-txn re-staging (a WAL-replay
+                                // re-application): this exact stage already
+                                // landed this exact intent at this exact key —
+                                // reuse its already-computed payload verbatim
+                                // instead of re-evaluating `op`/`condition`
+                                // against it as though it were the pre-stage
+                                // value (which would, e.g., double-apply a
+                                // non-idempotent `ADD` against its own prior
+                                // result). A *foreign* intent here is
+                                // unreachable: `blocked_by` above already
+                                // rejected the whole stage (`all_in_fence ==
+                                // false`) before this loop ever runs.
+                                Some(txn::Envelope::Intent {
+                                    txn_id: owner,
+                                    staged_value,
+                                    kind_writes,
+                                    change_log,
+                                    ..
+                                }) if owner == txn_id => {
+                                    evaluated_payload[i] =
+                                        Some((staged_value, kind_writes, change_log));
+                                    continue;
+                                }
+                                Some(txn::Envelope::Intent { .. }) => {
+                                    unreachable!(
+                                        "a foreign intent here was already caught by `blocked_by` \
                                      above (all_in_fence would be false)"
-                                )
-                            }
-                        };
+                                    )
+                                }
+                            };
+                        // ADR 0075 G-d M2: a replicated MREC record is never
+                        // part of a transaction (transactions are
+                        // region-local, each committed item takes a local
+                        // stamp); a stage carrying one is a deterministic
+                        // validation rejection, same structural bucket as a
+                        // failed evaluation — whether or not its stamp would
+                        // have won.
+                        if matches!(p.op, KindEvalOp::Replicate { .. }) {
+                            pending_failure = Some(txn::StageOutcome::Rejected {
+                                key: w.key.clone(),
+                                code: "ValidationException".to_owned(),
+                                message: "an MREC replicate cannot be staged in a transaction"
+                                    .to_owned(),
+                            });
+                            break 'pending_eval;
+                        }
                         let token =
                             animus_tablet::partition_token(&animus_item::storage_key(&p.pk, None));
                         match evaluate_kind_eval(
@@ -9566,6 +10375,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                             p.sk.as_ref(),
                             &token,
                             old,
+                            stored_ver,
                             &p.op,
                             p.condition.as_ref(),
                             p.ttl_expired,
@@ -9580,6 +10390,19 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                     key: w.key.clone(),
                                     code,
                                     message,
+                                });
+                                break 'pending_eval;
+                            }
+                            // Only a `Replicate` can be superseded, and one was
+                            // rejected above; kept total (never a panic in a
+                            // replicated apply) with the same rejection.
+                            KindEvalDecision::Superseded { .. } => {
+                                pending_failure = Some(txn::StageOutcome::Rejected {
+                                    key: w.key.clone(),
+                                    code: "ValidationException".to_owned(),
+                                    message: "an MREC replicate cannot be staged in a \
+                                              transaction"
+                                        .to_owned(),
                                 });
                                 break 'pending_eval;
                             }
@@ -9620,6 +10443,16 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                 w.change_log.as_ref(),
                             ),
                         };
+                        let physical_key = scope.physical(&w.key);
+                        // ADR 0018 §2's 2026-10-04 amendment: the intent
+                        // carries the committed value it shadows, so an
+                        // abort (or a reader predating the commit) never
+                        // has to find it in MVCC history below the intent,
+                        // which compaction GC and a latest-only snapshot
+                        // image both discard. `pending` was flushed above,
+                        // so this read sees every earlier entry of this
+                        // apply pass.
+                        let prior = stage_intent_prior(storage, &physical_key, &txn_id).await;
                         let intent_env = txn::encode_intent(
                             &txn_id,
                             &record_key,
@@ -9627,8 +10460,8 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                             value,
                             kind_writes,
                             change_log,
+                            prior.as_deref(),
                         );
-                        let physical_key = scope.physical(&w.key);
                         let took_effect = storage
                             .merge(&physical_key, &intent_env, version)
                             .await
@@ -9724,7 +10557,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // (`IntentBlocked`) both pre-empt ever evaluating this
                 // stage's own conditions, so they take priority over
                 // `ConditionFailed` here too.
-                let outcome = if already_decided {
+                let outcome = if already_decided || engine_ahead {
                     txn::StageOutcome::Fenced
                 } else if let Some((
                     blocked_key,
@@ -9753,6 +10586,37 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     .expect("stage outcomes poisoned")
                     .outcomes
                     .insert(index, (term, outcome));
+            }
+            // R-01 F-2 (fourth mechanism): a txn DECISION whose record key falls
+            // in a range this group has already sealed (the whole-range seal a
+            // `Freeze` or the in-place `SplitTablet` fork applies) is a
+            // deterministic no-op, exactly like every other mutating arm. This
+            // was the one arm missing the check, and it is not harmless: the
+            // children of a fork are cloned from the parent's CURRENT engine by
+            // the host reconciler, asynchronously and per replica, so a decision
+            // ordered after the fork entry landed in the clone of the replicas
+            // that cloned late and not in the others -- replica-divergent
+            // children, plus an acked commit the record's real owner never saw
+            // (its participants' intents then never resolved and the keys
+            // reverted to their prior values). The proposer's own post-decide
+            // status read sees the record still `Pending` on the frozen group and
+            // re-routes the SAME decision to the child that now owns the record
+            // (`txn_decide_anchor_retrying`). Apply stays a pure function of the
+            // entry and the state machine (ADR 0073 "apply never branches on a
+            // gate"); no new variant is needed, since the sealed window is the
+            // one place the old behaviour was replica-dependent.
+            KvCommand::TxnCommit { record_key, ts, .. }
+            | KvCommand::TxnAbort { record_key, ts, .. }
+                if is_sealed(sealed, &record_key) =>
+            {
+                assert_ts_monotonic(
+                    max_applied_ts,
+                    last_applied_ts_entry,
+                    ts,
+                    index,
+                    term,
+                    variant,
+                );
             }
             KvCommand::TxnCommit {
                 txn_id,
@@ -10068,6 +10932,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         intent_version: Version,
                         kind_writes: Vec<KindWrite>,
                         change_log: Option<(Vec<u8>, Vec<u8>)>,
+                        prior: txn::IntentPrior,
                     }
                     let mut resolved: Vec<Option<ResolvedIntent>> = Vec::with_capacity(keys.len());
                     for key in &keys {
@@ -10081,12 +10946,14 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                     staged_value,
                                     kind_writes,
                                     change_log,
+                                    prior,
                                     ..
                                 } if found == txn_id => Some(ResolvedIntent {
                                     staged_value,
                                     intent_version: vv.version,
                                     kind_writes,
                                     change_log,
+                                    prior,
                                 }),
                                 // Already resolved, or a different/newer
                                 // txn's intent has since overwritten this
@@ -10231,6 +11098,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                             intent_version,
                             kind_writes,
                             change_log,
+                            prior,
                         }) = resolved_intent
                         else {
                             continue; // nothing left here to resolve (idempotent no-op)
@@ -10327,47 +11195,49 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                             None => {
                                 // Aborted: restore whatever this key held
                                 // immediately before the intent — never a
-                                // tombstone, which would incorrectly shadow
-                                // that older, still-live committed value
-                                // (see `txn.rs`'s module doc). Every
-                                // version this group has ever applied is
-                                // strictly increasing
-                                // (`assert_ts_monotonic`), so
-                                // `intent_version - 1` is guaranteed to sit
-                                // strictly below the intent's own version
-                                // and at/above this key's true prior
-                                // version. **This one-hop-back lookback is
-                                // sound only because ADR 0018 §2/PR6 (task
-                                // #16)'s apply-time writer-push-intents
-                                // guard (`KvCommand::TxnStage`'s doc)
-                                // structurally rules out another
-                                // transaction's own unresolved intent ever
-                                // having been written at that prior
-                                // version** — before that fix, an
-                                // overwriting transaction's own later abort
-                                // could land here on a still-live intent
-                                // from the transaction it overwrote,
-                                // blindly re-merging its raw envelope bytes
-                                // (a corpus depth run's original finding:
-                                // the corrupted-MVCC-chain durability
-                                // hole). `pvv.value` below is therefore
-                                // always either a `Committed` envelope or
-                                // (via the `None` arm) genuinely absent —
-                                // never another live `Intent`.
-                                let prior = storage
-                                    .get_at(&physical_key, intent_version.saturating_sub(1))
-                                    .await
-                                    .expect("raftkv txn resolve prior read");
+                                // tombstone over a committed value, which
+                                // would lose an acknowledged write (see
+                                // `txn.rs`'s module doc). A current
+                                // (`txn-envelope` v2) intent carries that
+                                // value itself (`IntentPrior::Known`,
+                                // captured by `TxnStage`'s apply from the
+                                // key's latest record when the intent was
+                                // written), so the restore never depends on
+                                // the engine still holding MVCC history
+                                // below the intent — which `LsmEngine`
+                                // compaction GC and a latest-only
+                                // `InstallSnapshot` image both discard (ADR
+                                // 0018 §2's 2026-10-04 amendment: an
+                                // aborted transaction tombstoned acked
+                                // writes). Only a legacy v1 intent
+                                // (`IntentPrior::Unknown`) still falls back
+                                // to the one-MVCC-version lookback; that is
+                                // sound only while the history is retained,
+                                // and only because ADR 0018 §2/PR6's
+                                // writer-push-intents guard
+                                // (`KvCommand::TxnStage`'s doc) rules out
+                                // another transaction's live intent sitting
+                                // one version below.
+                                let restored: Option<Vec<u8>> = match prior {
+                                    txn::IntentPrior::Known(prior) => {
+                                        prior.map(|v| txn::encode_committed(&v))
+                                    }
+                                    txn::IntentPrior::Unknown => storage
+                                        .get_at(&physical_key, intent_version.saturating_sub(1))
+                                        .await
+                                        .expect("raftkv txn resolve prior read")
+                                        .map(|pvv| pvv.value),
+                                };
                                 // Issue #834: queued onto `pending` like the
                                 // commit branch above — see this match's own
                                 // doc for why `took_effect`/
                                 // `surface_suspicious_merge_noop` are no
                                 // longer checked here.
-                                match prior {
-                                    Some(pvv) => {
+                                match restored {
+                                    Some(committed_envelope) => {
                                         pending.push(MergeOp::put(
                                             physical_key.clone(),
-                                            pvv.value,
+                                            committed_envelope,
                                             version,
                                         ));
                                     }
@@ -10381,19 +11251,21 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                             }
                         }
                         // ADR 0018 §2/PR6 seatbelt (issue #298 shape A):
-                        // record that THIS exact transaction's intent at
-                        // this key has now been resolved here (commit or
-                        // abort — both leave nothing of `txn_id`'s own at
-                        // this key), so a stale/duplicate `TxnStage`
-                        // re-arriving for the identical `(key, txn_id)`
-                        // afterward is rejected instead of silently
-                        // resurrecting it — see `TxnTracker::recently_
-                        // resolved`'s doc and `KvCommand::TxnStage`'s own
-                        // resurrection-guard read of this map.
-                        txn_tracker
-                            .lock()
-                            .expect("txn tracker poisoned")
-                            .record_resolution(physical_key, txn_id.clone());
+                        // durably record that THIS exact transaction's
+                        // intent at this key has now been resolved here
+                        // (commit or abort — both leave nothing of
+                        // `txn_id`'s own at this key), in the SAME merge
+                        // batch as the resolve itself so the two are
+                        // atomic, so a stale/duplicate `TxnStage`
+                        // re-arriving for the identical `(key, txn_id)` is
+                        // rejected on every replica instead of
+                        // resurrecting it — see `TxnStage`'s own
+                        // resurrection guard and `txn::resolved_marker_key`.
+                        pending.push(MergeOp::put(
+                            scope.physical(&txn::resolved_marker_key(key)),
+                            txn::encode_resolved_marker(&txn_id),
+                            version,
+                        ));
                     }
                     // ADR 0018 §2/PR5, refined by the write-loss amendment
                     // §3/§6 fix: this group's own recovery-retry bookkeeping
@@ -10743,6 +11615,11 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         // Serialize the WAL rewrite against the consensus loop's appends. The
         // lock is FIFO-fair so back-to-back persist rounds cannot starve this.
         let mut wal_guard = Some(wal_lock.lock().await);
+        // Disk-full (R-01 (d)): never compact over a suspect WAL; the consensus
+        // loop is about to rewrite the whole file from the in-memory log.
+        if persist.is_suspect() {
+            return did_work;
+        }
         let (bytes, lli) = {
             let mut c = core.lock().expect("raftkv core poisoned");
             // Advance the base to exactly the engine state (`snapshot_upto` drops
@@ -10973,13 +11850,24 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 env.clone().spawn_task(async move {
                     let _release = guard;
                     if let Err(e) = rewrite_wal_staged(&env, &wal, &wal_lock, &records).await {
-                        // Same rule as the persist path: tolerated only while
-                        // halted (the pre-compaction WAL is intact, so recovery
-                        // is unaffected); a live failure is a real fault.
-                        assert!(
-                            halted.load(Ordering::SeqCst),
-                            "raftkv wal compaction failed while running: {e}"
-                        );
+                        if animus_env::is_storage_full(&e) && !halted.load(Ordering::SeqCst) {
+                            // ENOSPC on the staged rewrite: the live WAL is
+                            // untouched and already holds every acked record
+                            // (the round that drained `records` was made
+                            // durable by the `early` append above), so this is
+                            // only a deferred shrink — no durability claim
+                            // hangs on it. The next compaction retries.
+                            tracing::warn!(error = %e, "raftkv wal compaction rewrite hit ENOSPC; deferred");
+                        } else {
+                            // Same rule as the persist path: tolerated only
+                            // while halted (the pre-compaction WAL is intact,
+                            // so recovery is unaffected); a live failure is a
+                            // real fault.
+                            assert!(
+                                halted.load(Ordering::SeqCst),
+                                "raftkv wal compaction failed while running: {e}"
+                            );
+                        }
                     }
                 });
                 Ok(())
@@ -11004,10 +11892,22 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // the pre-compaction WAL is still intact, so recovery is unaffected.
                 // A failure while *not* halted is a real durability fault → surface.
                 Err(e) => {
-                    assert!(
-                        halted.load(Ordering::SeqCst),
-                        "raftkv wal compaction failed while running: {e}"
-                    );
+                    if animus_env::is_storage_full(&e) && !halted.load(Ordering::SeqCst) {
+                        // ENOSPC on the compaction's early append (or the
+                        // shared WAL's whole-file rewrite): the drain above
+                        // took the loop's pending records and numbered a round
+                        // that will now never complete here. Hand it to the
+                        // consensus loop's recovery, which rewrites the whole
+                        // file from the in-memory log (snapshot base included)
+                        // and completes every drained round.
+                        tracing::error!(error = %e, "raftkv wal compaction hit ENOSPC; group is StorageFull until its WAL is rewritten");
+                        persist.mark_suspect();
+                    } else {
+                        assert!(
+                            halted.load(Ordering::SeqCst),
+                            "raftkv wal compaction failed while running: {e}"
+                        );
+                    }
                 }
             }
         }
@@ -11280,6 +12180,17 @@ async fn engine_image<S: StorageEngine>(
         .entries_with_tombstones()
         .await
         .expect("raftkv engine scan");
+    // ADR 0073 (class G, `txn-envelope` v2, 2026-10-05 amendment): engine
+    // values cross nodes inside this image, and a previous-release replica
+    // panics on an intent whose tag it does not know (`txn: unknown envelope
+    // tag 2`). While the version that introduces v2 (`Gate::GlobalTables`) is
+    // closed — which includes "this node has not read the cluster version
+    // yet" (floor) — every v2 intent in a base row ships down-converted to
+    // v1 (v1 cannot express the carried `prior`, so it ships as the committed
+    // row one MVCC version below the intent, where the old lookback reads it).
+    // The local engine is untouched and apply never branches on the gate, so
+    // replicas stay deterministic; a finalized cluster ships v2 as is.
+    let ship_v1_intents = !features.is_open(Gate::GlobalTables);
     let mut entries: Vec<ImageEntry> = Vec::new();
     for (k, v, version) in rows {
         let claimed = ALL_KINDS
@@ -11287,6 +12198,48 @@ async fn engine_image<S: StorageEngine>(
             .zip(kind_scopes)
             .find_map(|(kind, scope)| scope.strip_in_range(&k).map(|l| (*kind, l.to_vec())));
         if let Some((kind, logical)) = claimed {
+            // ADR 0073 (`txn-resolved-marker` v1, issues #1243/#1251): a
+            // previous-release replica's scan/`has_data` filters know only
+            // record keys and would surface a marker row (`token || 0x00 0x04
+            // || key`) as a client item, so while the introducing gate is
+            // closed it cannot ship as a `KIND_BASE` row. It must still
+            // ship: `TxnStage`'s stale-restage rejection reads it, so a
+            // replica that installs this image without the sender's markers
+            // would accept a stage its peers reject (a replica-divergent
+            // intent). It rides in the SAME image under the wire-only kind
+            // [`KIND_WIRE_RESOLVED_MARKER`], which no `ALL_KINDS` scope
+            // claims: a previous-release receiver drops an unknown kind
+            // (`install_engine_image`, verified at the R-1 reference), a
+            // current one files it back as the base-scope marker row. A
+            // gate-open image ships it as the plain base row, as before.
+            if ship_v1_intents && kind == KIND_BASE && txn::is_resolved_marker_key(&logical) {
+                entries.push((KIND_WIRE_RESOLVED_MARKER, logical, v, version));
+                continue;
+            }
+            let v = match v {
+                Some(bytes) if ship_v1_intents && kind == KIND_BASE => {
+                    match txn::legacy::v1::downgrade_intent_to_v1_with_prior(&bytes) {
+                        Some((v1, prior)) => {
+                            // v1 cannot carry the prior, but a v1 reader
+                            // looks one MVCC version below the intent for
+                            // it: ship it there, so a replica that rebuilds
+                            // from this image can still restore the value on
+                            // an abort (as far as that lookback reaches).
+                            if let (Some(p), Some(below)) = (prior, version.checked_sub(1)) {
+                                entries.push((
+                                    kind,
+                                    logical.clone(),
+                                    Some(txn::encode_committed(&p)),
+                                    below,
+                                ));
+                            }
+                            Some(v1)
+                        }
+                        None => Some(bytes),
+                    }
+                }
+                other => other,
+            };
             entries.push((kind, logical, v, version));
         }
     }
@@ -11348,6 +12301,14 @@ async fn install_engine_image<S: StorageEngine>(
         // build does not (ALL_KINDS grew). Dropping it is the safe read: this
         // replica has no scope to put it in, and silently mis-filing it under
         // another kind would corrupt that kind's keyspace.
+        // The wire-only marker kind (issue #1251) is the base-scope
+        // resolved-marker row, shipped under a kind a previous-release
+        // receiver ignores; anything else unknown is dropped.
+        let kind = if kind == KIND_WIRE_RESOLVED_MARKER && txn::is_resolved_marker_key(&key) {
+            KIND_BASE
+        } else {
+            kind
+        };
         let Some(scope) = kind_scopes.get(kind as usize) else {
             tracing::warn!(kind, "snapshot image entry of unknown row kind dropped");
             continue;
@@ -11408,6 +12369,7 @@ struct DriveState<E: Env, S: StorageEngine> {
     halted: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
     apply_stopped: Arc<AtomicBool>,
+    apply_stalled: Arc<AtomicBool>,
     propose_signal: Arc<ProposeSignal>,
     apply_signal: Arc<ApplySignal>,
     wake_signal: Arc<WakeSignal>,
@@ -11562,6 +12524,11 @@ fn witness_append_entries(hlc: &Hlc, msg: &RaftMsg<KvCommand>, now: Nanos) {
 /// degrades to today's (pre-fix) latency at worst, never a stall. Under load
 /// `apply_and_compact` keeps returning `true`, so the task never sleeps and apply
 /// stays close behind commit — this only bounds latency (and CPU) while idle.
+///
+/// **Not armed while the group is quiesced** (issue #1180, ADR 0048): a quiesced
+/// group's apply task parks on [`ApplySignal`] alone, and the consensus loop
+/// raises the signal on every quiesced/awake transition, so the poll is re-armed
+/// the moment the group wakes.
 const APPLY_SAFETY_POLL: Duration = Duration::from_millis(250);
 
 /// The per-node **consensus loop**: recover from the WAL, spawn the apply task, then
@@ -11591,6 +12558,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         halted,
         stopped,
         apply_stopped,
+        apply_stalled,
         propose_signal,
         apply_signal,
         wake_signal,
@@ -11776,6 +12744,21 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         .unwrap_or(0);
     engine_applied.store(engine_watermark, Ordering::SeqCst);
     applied_watch.bump(engine_watermark);
+    // Issue #1229: an in-place split child's engine was cloned from its
+    // parent (ADR 0058), so its pre-fork rows are in no log entry. The
+    // durable trim marker identifies such a group (it survives restarts,
+    // unlike how the group was started); tell the core, so a learner is
+    // shipped the engine image instead of a log that lacks those rows.
+    if storage
+        .get(&trim_marker::trim_marker_key(stream))
+        .await
+        .expect("system-keyspace engine read (cp split trim marker)")
+        .is_some()
+    {
+        core.lock()
+            .expect("raftkv core poisoned")
+            .set_log_omits_base(true);
+    }
     // Needs-snapshot state (issue #554): the engine's own watermark is below
     // the log's own compacted start — the prefix through `snapshot_index` is
     // gone from both the log (compacted) and the engine (never merged, or
@@ -11869,7 +12852,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
     // Spawn the apply task now — after recovery seeded the core + `engine_applied`
     // + `sealed` + `committed_ceiling` + `txn_tracker` + `hot_change_max`, so it
     // never merges against pre-recovery state.
-    env.spawn_task(apply_loop(
+    env.spawn_critical_task(apply_loop(
         env.clone(),
         wal.clone(),
         Arc::clone(&core),
@@ -11885,6 +12868,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         Arc::clone(&wal_lock),
         Arc::clone(&halted),
         apply_stopped,
+        Arc::clone(&apply_stalled),
         metrics.clone(),
         scope,
         kind_scopes,
@@ -11901,6 +12885,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         Arc::clone(&hot_change_max),
         Arc::clone(&compact_tuning),
         features.clone(),
+        Arc::clone(&wake_signal),
     ));
 
     // Issue #279: the loop's own in-flight persist round, and the outbound
@@ -11979,6 +12964,21 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         }
     }
 
+    // The quiesced flag as this loop last observed it (issue #1180) -- see the
+    // `apply_signal.notify()` on transitions below.
+    let mut quiesced_seen = false;
+    // Issue #1219 storage-full step-down bookkeeping (consensus-loop-local): the
+    // target of the last transfer this leader armed because it is out of disk
+    // (rotated away from on the next attempt, so a target that is itself full --
+    // it declines `TimeoutNow` -- cannot pin the handoff), and the earliest
+    // time a further attempt may be armed.
+    let mut stepdown_last: Option<NodeId> = None;
+    let mut stepdown_next = animus_env::Nanos(0);
+    // Issue #1228: when this node entered the storage-full state. The step-down
+    // waits a settle window from then (below) so the followers -- which learn
+    // they are full from the same failed write, not before -- have reported it
+    // on their frozen acks before the leader picks a "healthy" successor.
+    let mut full_since: Option<animus_env::Nanos> = None;
     loop {
         // A requested shutdown exits *between* persist rounds so the WAL is never
         // left mid-write; `stopped` (paired with the apply task's `apply_stopped`)
@@ -12011,10 +13011,11 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         // than blocking the loop before it, so heartbeats keep flowing and the
         // election deadline keeps being re-armed while the disk is slow.
         if persist_fut.is_none()
-            && core
+            && (core
                 .lock()
                 .expect("raftkv core poisoned")
                 .has_unflushed_wal()
+                || persist.is_suspect())
         {
             persist_fut = Some(Box::pin(persist_wal(
                 &env,
@@ -12073,6 +13074,46 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             // it in the very same tick, before any response can go out.
             let engine_behind = engine_applied.load(Ordering::SeqCst) < c.snapshot_index();
             c.set_state_machine_behind(engine_behind);
+            // Issue #1219 (R-01 (d), ADR 0074 §2): feed the storage-full state
+            // live, like `state_machine_behind` just above. A storage-full node
+            // never campaigns (`RaftCore::set_storage_full`), and a storage-full
+            // **leader** hands leadership to its most up-to-date follower so a
+            // replica with free disk serves writes. This runs on every loop
+            // pass -- including the one a refused write's `wake()` (or the
+            // apply task's stall transition) forces on a parked, quiesced
+            // leader; arming the transfer un-quiesces it. A transfer to a target
+            // that is also full simply aborts at its deadline (the leader keeps
+            // leading, never leaderless) and the retry rotates to the next
+            // voter after a cooldown.
+            let storage_full = persist.is_suspect() || apply_stalled.load(Ordering::SeqCst);
+            c.set_storage_full(storage_full);
+            if storage_full {
+                let at = env.now();
+                let since = *full_since.get_or_insert(at);
+                let settled =
+                    at.0.saturating_sub(since.0) >= c.election_timeout().as_nanos() as u64;
+                if c.is_leader()
+                    && settled
+                    && at.0 >= stepdown_next.0
+                    && let Some(target) = c.storage_full_step_down(at, stepdown_last.as_ref())
+                {
+                    tracing::warn!(
+                        tablet = tablet.0,
+                        target = %target,
+                        "raftkv leader is StorageFull; transferring leadership to a replica with free disk"
+                    );
+                    stepdown_last = Some(target);
+                    // Past the transfer's own election-timeout deadline.
+                    stepdown_next = animus_env::Nanos(
+                        at.0.saturating_add(2 * c.election_timeout().as_nanos() as u64),
+                    );
+                    // Ship the `TimeoutNow` now rather than at the next heartbeat.
+                    propose_signal.notify();
+                }
+            } else {
+                stepdown_last = None;
+                full_since = None;
+            }
             // ADR 0044 phase-1 PR5, fork D: feed the quiesce veto — a
             // non-empty `TxnTracker` (this group has a pending 2PC intent or
             // a decided-but-unresolved record still owed a resolve) always
@@ -12097,7 +13138,10 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             // bound that matters: "as of what index did the last real
             // observation of this tablet's own obligation state land."
             c.set_quiesce_veto(
-                txn_veto || persist_veto || external_quiesce_veto.load(Ordering::SeqCst),
+                txn_veto
+                    || persist_veto
+                    || storage_full
+                    || external_quiesce_veto.load(Ordering::SeqCst),
                 external_quiesce_veto_fresh_through.load(Ordering::SeqCst),
             );
             // Issue #596: same "recompute live, once per consensus-loop
@@ -12403,6 +13447,19 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             (true, false) => metrics.incr(Metric::CpUnquiesces),
             _ => {}
         }
+        // Issue #1180: the apply task parks WITHOUT its safety-poll timer
+        // while quiesced, so every quiesced <-> awake transition must raise
+        // `apply_signal` (awake: re-arm the poll for signal-less work such as
+        // `take_snapshot_needed`; quiesced: let a still-armed poll drop).
+        // `quiesced_seen` is this loop's own last-observed state, compared
+        // against both samples of this iteration, so an un-quiesce performed
+        // OUTSIDE this loop (a local propose, `wake()`, `read_barrier`) is
+        // still caught at the top of the next iteration -- every such trigger
+        // also wakes this loop, so one always follows.
+        if quiesced_seen != was_quiesced || was_quiesced != is_quiesced_now {
+            apply_signal.notify();
+        }
+        quiesced_seen = is_quiesced_now;
         // Wake-on-commit (ADR 0044 phase-1 PR1): a commit-index advance covers both
         // a follower's in-line apply on `AppendEntries` (gated on `commit_index`
         // alone, so it can create apply work with no separate `mark_durable_through`
@@ -12424,11 +13481,26 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         // wait for their round; replication, heartbeats and pre-vote traffic go
         // out immediately, which is what keeps a group alive across a slow
         // `fsync`. Engine apply happens independently on the apply task.
+        //
+        // Issue #1228: while the WAL is suspect (ENOSPC) the round a held ack
+        // waits on may never land, and a full follower that holds every ack
+        // starves its leader of the contact leadership and read barriers need.
+        // So an `AppendEntriesResp { success: true }` whose `match_index` is
+        // already at or below this node's *durable* index ships at once: it
+        // vouches only for entries that are on disk (the core freezes a full
+        // follower's ack there, `RaftCore::handle_append_entries`), so it can
+        // never help commit an entry this node did not persist. Anything that
+        // claims more stays held, exactly as before.
+        let frozen_durable = if gate.is_some() && persist.is_suspect() {
+            Some(core.lock().expect("raftkv core poisoned").durable_index())
+        } else {
+            None
+        };
         let (immediate, held): (Vec<_>, Vec<_>) = match gate {
             None => (outs, Vec::new()),
-            Some(_) => outs
-                .into_iter()
-                .partition(|(_, wire)| ships_before_durable(wire)),
+            Some(_) => outs.into_iter().partition(|(_, wire)| {
+                ships_before_durable(wire) || frozen_durable.is_some_and(|d| is_frozen_ack(wire, d))
+            }),
         };
         if let Some(round) = gate {
             gated.push(round, held);
@@ -12497,6 +13569,7 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     wal_lock: Arc<FairMutex>,
     halted: Arc<AtomicBool>,
     apply_stopped: Arc<AtomicBool>,
+    apply_stalled: Arc<AtomicBool>,
     metrics: MetricsHandle,
     scope: StorageScope,
     kind_scopes: [StorageScope; ALL_KINDS.len()],
@@ -12518,7 +13591,20 @@ async fn apply_loop<E: Env, S: StorageEngine>(
     compact_tuning: Arc<CompactTuning>,
     // ADR 0073 P2-B: selects the snapshot image's frame version.
     features: ClusterFeatures,
+    // Issue #1219: raised when an ENOSPC stall begins/ends so the consensus
+    // loop (possibly parked, quiesced) re-evaluates the storage-full state.
+    wake_signal: Arc<WakeSignal>,
 ) {
+    // R-01 (d) residual (#1218): every engine call this task makes pauses and
+    // retries on ENOSPC instead of panicking — see `apply_stall`.
+    let storage = apply_stall::StallingEngine::new(
+        storage,
+        env.clone(),
+        Arc::clone(&halted),
+        Arc::clone(&apply_stopped),
+        apply_stalled,
+        wake_signal,
+    );
     // This apply task's own sequential, single-writer bookkeeping (see
     // `apply_and_compact`'s doc): `sealed` is seeded from the engine-durable
     // recovery scan `drive` already did; `max_applied_ts` starts `None` each
@@ -12602,13 +13688,41 @@ async fn apply_loop<E: Env, S: StorageEngine>(
         )
         .await;
         if !did_work {
-            select(
+            // Issue #1180 / ADR 0048: a quiesced group parks on `ApplySignal`
+            // ALONE -- no safety-poll timer -- so it posts zero timeline events
+            // while idle. Sound because (a) a quiesced group cannot reach any
+            // signal-less transition without first un-quiescing (the entry
+            // predicate requires `!snapshot_needed`, no pending/incoming
+            // snapshot, every peer fully matched, engine caught up; and
+            // `take_snapshot_needed` is only ever set by a leader's
+            // replicate cycle, which a quiesced leader does not run), and
+            // (b) the consensus loop raises `apply_signal` on every
+            // quiesced <-> awake transition it observes (see its
+            // `quiesced_seen` bookkeeping), so un-quiescing re-arms the poll.
+            //
+            // Lost-wakeup safety: the flag is read under the core lock AFTER
+            // `apply_and_compact` returned. If the group is awake here we use
+            // the poll as before. If it is quiesced here and un-quiesces
+            // afterwards, the consensus loop (which always runs after any
+            // un-quiesce trigger) sets `ApplySignal.pending` *after* the
+            // flag flipped; `ApplyPending::poll` registers its waker and
+            // then swaps the flag, so the notify is observed whether it
+            // lands before or after we park.
+            let quiesced = core.lock().expect("raftkv core poisoned").is_quiesced();
+            if quiesced {
                 ApplyPending {
                     signal: &apply_signal,
-                },
-                env.sleep(APPLY_SAFETY_POLL),
-            )
-            .await;
+                }
+                .await;
+            } else {
+                select(
+                    ApplyPending {
+                        signal: &apply_signal,
+                    },
+                    env.sleep(APPLY_SAFETY_POLL),
+                )
+                .await;
+            }
         }
     }
 }
@@ -12665,6 +13779,24 @@ mod kind_scope_tests {
                 );
             }
         }
+    }
+
+    /// `latest_version_incl_tombstone` (issue #1242 replay-ahead check) sees a
+    /// tombstone's version where `get` sees nothing, ignores neighbouring keys
+    /// that merely share a prefix, and reports `None` for a never-written key.
+    #[test]
+    fn latest_version_incl_tombstone_sees_deletes_and_exact_key_only() {
+        use animus_storage::{MemoryEngine, StorageEngine};
+        futures::executor::block_on(async {
+            let e = MemoryEngine::new();
+            e.merge(b"k", b"v", 5).await.unwrap();
+            e.merge(b"k\x00x", b"other", 99).await.unwrap();
+            assert_eq!(latest_version_incl_tombstone(&e, b"k").await, Some(5));
+            e.merge_tombstone(b"k", 9).await.unwrap();
+            assert!(e.get(b"k").await.unwrap().is_none(), "get hides it");
+            assert_eq!(latest_version_incl_tombstone(&e, b"k").await, Some(9));
+            assert_eq!(latest_version_incl_tombstone(&e, b"nope").await, None);
+        });
     }
 
     /// The rung-B4 seed path's foundation (ADR 0050): an `engine_image` of
@@ -12749,6 +13881,102 @@ mod kind_scope_tests {
                 dst.get(&hwm_key).await.unwrap().map(|v| v.value),
                 Some(hwm::encode_hwm_value(max_ts)),
                 "the installed hwm marker must reflect the image header's own max_ts"
+            );
+        });
+    }
+
+    /// Issue #1251: a resolved marker crosses in EVERY image. While
+    /// `Gate::GlobalTables` is closed it rides under the wire-only kind
+    /// `KIND_WIRE_RESOLVED_MARKER` and never as a base row, so a
+    /// previous-release receiver (which files only `ALL_KINDS` entries and
+    /// drops an unknown kind) never holds a marker-shaped client row; once
+    /// the gate is open it ships as the plain base row. A current receiver
+    /// ends up with the sender's marker either way.
+    #[test]
+    fn engine_image_ships_resolved_markers_through_the_ignorable_kind_while_the_gate_is_closed() {
+        use animus_storage::{MemoryEngine, StorageEngine};
+        futures::executor::block_on(async {
+            let src = MemoryEngine::new();
+            let src_scopes = kind_scopes(&StorageScope::whole());
+            let base = [7u8; 12];
+            let mk = txn::resolved_marker_key(&base);
+            let marker_val = txn::encode_resolved_marker(&txn::TxnId {
+                ts: HlcTimestamp {
+                    wall_ms: 3,
+                    logical: 1,
+                },
+                node: animus_env::nid(5),
+            });
+            src.merge(
+                &src_scopes[KIND_BASE as usize].physical(&mk),
+                &marker_val,
+                40,
+            )
+            .await
+            .unwrap();
+            src.merge(
+                &src_scopes[KIND_BASE as usize].physical(&base),
+                &txn::encode_committed(b"v"),
+                41,
+            )
+            .await
+            .unwrap();
+
+            let closed = ClusterFeatures::new();
+            let image = engine_image(&src, &src_scopes, None, &closed).await;
+            let (_, entries) = codec::decode_image(&image).unwrap();
+            // What a previous-release receiver files: only `ALL_KINDS` rows.
+            assert!(
+                entries
+                    .iter()
+                    .filter(|(k, ..)| ALL_KINDS.contains(k))
+                    .all(|(_, key, ..)| !txn::is_resolved_marker_key(key)),
+                "a gate-closed image must carry no marker-shaped base row"
+            );
+            assert!(
+                entries
+                    .iter()
+                    .any(|(k, key, v, ver)| *k == KIND_WIRE_RESOLVED_MARKER
+                        && key == &mk
+                        && v.as_deref() == Some(&marker_val[..])
+                        && *ver == 40),
+                "the marker must ship under the wire kind: {entries:?}"
+            );
+            assert!(
+                !ALL_KINDS.contains(&KIND_WIRE_RESOLVED_MARKER),
+                "the wire kind must never be a storage scope"
+            );
+
+            // A current receiver files the marker back as the base-scope row.
+            let dst = MemoryEngine::new();
+            let dst_scopes = kind_scopes(&StorageScope::whole());
+            install_engine_image(&dst, &dst_scopes, &image, 1, 42).await;
+            let got = dst
+                .get(&dst_scopes[KIND_BASE as usize].physical(&mk))
+                .await
+                .unwrap()
+                .expect("receiver holds the marker");
+            assert_eq!((got.value, got.version), (marker_val.clone(), 40));
+
+            // Gate open: the plain base row, as before; same receiver result.
+            let open = ClusterFeatures::new();
+            open.update(&animus_control::Metadata {
+                cluster_version: 2,
+                ..animus_control::Metadata::default()
+            });
+            let image = engine_image(&src, &src_scopes, None, &open).await;
+            let (_, entries) = codec::decode_image(&image).unwrap();
+            assert!(
+                entries
+                    .iter()
+                    .any(|(k, key, ..)| *k == KIND_BASE && key == &mk),
+                "a gate-open image ships the marker as a base row"
+            );
+            assert!(
+                entries
+                    .iter()
+                    .all(|(k, ..)| *k != KIND_WIRE_RESOLVED_MARKER),
+                "a gate-open image never uses the wire kind"
             );
         });
     }
@@ -13241,6 +14469,17 @@ mod pr5_orphan_and_resurrection_tests {
 /// crate's own **non-consensus** variants are decided here:
 /// `ReadProbe`/`ReadProbeAck` are a ReadIndex barrier the `RaftCore` never even
 /// sees, carry no state claim, and so are never held back.
+/// Issue #1228: whether `wire` is a successful append ack that claims nothing
+/// past `durable` -- the only ack a storage-full follower may send before its
+/// WAL is rewritten (see the partition in the consensus loop).
+fn is_frozen_ack(wire: &KvWire, durable: u64) -> bool {
+    matches!(
+        wire,
+        KvWire::Raft(RaftMsg::AppendEntriesResp { success: true, match_index, .. })
+            if *match_index <= durable
+    )
+}
+
 fn ships_before_durable(wire: &KvWire) -> bool {
     match wire {
         KvWire::ReadProbe { .. } | KvWire::ReadProbeAck { .. } => true,
@@ -13327,6 +14566,64 @@ mod campaign_now_tests {
             node0.is_leader(),
             "the campaigning voter must win leadership well within one election timeout"
         );
+    }
+}
+
+/// Issue #1228: the eventual-read gate for a **storage-full** replica that has
+/// had a leader but currently knows none. A full node never campaigns, so once
+/// its leader belief is cleared (a higher-term message deposed the leader, as in
+/// a step-down onto a voter that cannot win) nothing would ever restore "knows a
+/// leader"; the replica still holds a genuine prefix of the log and keeps serving.
+#[cfg(test)]
+mod storage_full_stale_read_tests {
+    use super::*;
+    use animus_sim::{SimEnv, Simulator};
+    use animus_storage::MemoryEngine;
+
+    #[test]
+    fn a_full_replica_that_had_a_leader_serves_an_eventual_read_leaderless() {
+        let mut sim = Simulator::new(0x5A1E_F011);
+        let ids = [0u64, 1, 2];
+        let nodes: Vec<RaftKvNode<SimEnv, MemoryEngine>> = ids
+            .iter()
+            .map(|&i| {
+                RaftKvNode::start(
+                    sim.env(animus_env::nid(i)),
+                    ids.iter().copied().map(animus_env::nid).collect(),
+                    MemoryEngine::new(),
+                )
+            })
+            .collect();
+        sim.run_for(Duration::from_secs(2));
+        let leader = nodes.iter().position(|n| n.is_leader()).expect("a leader");
+        let f = (0..3).find(|&i| i != leader).unwrap();
+        assert!(nodes[f].stale_read_ready(), "a settled follower serves");
+        // A higher-term vote request clears the follower's leader belief.
+        {
+            let mut c = nodes[f].lock();
+            let term = c.term() + 5;
+            let _ = c.handle(
+                animus_env::nid(ids[leader]),
+                RaftMsg::RequestVote {
+                    term,
+                    candidate: animus_env::nid(ids[leader]),
+                    last_log_index: 0,
+                    last_log_term: 0,
+                },
+                sim.now(),
+                7,
+            );
+            assert!(c.leader().is_none(), "the leader belief should be cleared");
+            assert!(c.has_had_leader_contact());
+        }
+        assert!(
+            !nodes[f].stale_read_ready(),
+            "healthy and leaderless: not ready (never serve from a replica that cannot tell it was ever led)"
+        );
+        // Out of disk: the same replica keeps serving what it holds.
+        nodes[f].persist.mark_suspect();
+        assert!(nodes[f].is_storage_full());
+        assert!(nodes[f].stale_read_ready());
     }
 }
 

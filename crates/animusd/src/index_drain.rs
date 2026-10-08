@@ -287,7 +287,7 @@ const ORDINAL_BYTES: usize = 4;
 /// `packed_hlc || ordinal`. Every place that used to strip a bare
 /// [`HLC_BYTES`] to recover an item's own key prefix must strip this
 /// instead (issue #852 widened the suffix).
-const CHANGE_KEY_SUFFIX_BYTES: usize = HLC_BYTES + ORDINAL_BYTES;
+pub(crate) const CHANGE_KEY_SUFFIX_BYTES: usize = HLC_BYTES + ORDINAL_BYTES;
 
 /// How many change records one trim `KindBatch` entry deletes at most —
 /// bounds a large backlog's catch-up to several ticks instead of one
@@ -594,11 +594,15 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
             //   derives **zero expected terms** and its existing
             //   trim-everything rule (F10/F12-b) deletes every marker in
             //   declared range — the same rule, not a second deleter.
+            let mrec_ships = meta.table_global(&table).is_some_and(|g| {
+                g.is_mrec() && g.replicas.iter().any(crate::mrec_shipper::is_shippable)
+            });
             if gsis.is_empty()
                 && !stream_enabled
                 && !ever_streamed
                 && !pitr_enabled
                 && !ever_pitr_sealed
+                && !mrec_ships
             {
                 if splitting {
                     // Trim held for the build (the split driver above holds
@@ -1274,7 +1278,7 @@ fn record_hlc(key: &[u8]) -> Option<HlcTimestamp> {
 /// (issue #852) — the pagination-granularity read every `GetRecords`/
 /// `GetShardIterator` cursor path needs, unlike [`record_hlc`]'s
 /// HLC-only view. `None` on a malformed/too-short suffix.
-fn record_hlc_ordinal(key: &[u8]) -> Option<(HlcTimestamp, u32)> {
+pub(crate) fn record_hlc_ordinal(key: &[u8]) -> Option<(HlcTimestamp, u32)> {
     let suffix_start = key.len().checked_sub(CHANGE_KEY_SUFFIX_BYTES)?;
     let ts = cursor::decode_watermark(&key[suffix_start..suffix_start + HLC_BYTES])?;
     let ordinal_start = suffix_start + HLC_BYTES;
@@ -2590,6 +2594,13 @@ async fn trim_janitor(
             None => blocked = true,
         }
     }
+    // ADR 0075 section 4.2: the MREC shipper's per-peer `mrec:<region>` cursors.
+    if !blocked
+        && let Some(w) =
+            crate::mrec_shipper::trim_term(&ctx.env, &ctx.mrec, meta, table, group).await
+    {
+        trim_point = Some(trim_point.map_or(w, |t| t.min(w)));
+    }
     ctx.data()
         .raftkv_metrics
         .set(Metric::ChangeLogTrimBlocked, u64::from(blocked));
@@ -2730,6 +2741,8 @@ mod gsi_drain_cursor_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                labels: Default::default(),
+                overload: None,
             }],
             dynamo_auth: None,
             cluster_settings: None,
@@ -3320,12 +3333,36 @@ mod gsi_drain_cursor_tests {
                 split_key.len()
             );
 
-            let parent = only_tablet(&node, table);
-            split(client_addr, parent, split_key.clone()).await;
-            await_true(20, "split produced two tablets", || {
-                tablets_of(&node, table).len() == 2
-            })
-            .await;
+            // R-01 F-2: every split key is now rounded to its token boundary
+            // (`decide::align_split_key`), so a non-token-aligned boundary only
+            // survives where the range holds a SINGLE token (the raw key is
+            // kept there so one hot partition can still split by sort key).
+            // Build exactly that range: cut at the row's token `T`, then at
+            // `T+1`, leaving a child `[T, T+1)`, and finally split THAT child
+            // at the row's own (longer, non-aligned) physical key.
+            let token: [u8; TOKEN_BYTES] = split_key[..TOKEN_BYTES].try_into().expect("token");
+            let next_token = (u64::from_be_bytes(token) + 1).to_be_bytes();
+            let cut = |node: &Node, key: &[u8]| -> TabletId {
+                let m = node.metadata();
+                *m.tablets
+                    .iter()
+                    .filter(|(_, t)| t.table.as_deref() == Some(table))
+                    .find(|(_, t)| t.range.contains(key))
+                    .expect("a tablet owns the key")
+                    .0
+            };
+            for (n, at) in [token.to_vec(), next_token.to_vec(), split_key.clone()]
+                .into_iter()
+                .enumerate()
+            {
+                let expected_tablets = n + 2;
+                let parent = cut(&node, &at);
+                split(client_addr, parent, at).await;
+                await_true(20, "split produced a further tablet", || {
+                    tablets_of(&node, table).len() == expected_tablets
+                })
+                .await;
+            }
 
             let (left, right) = {
                 let m = node.metadata();
@@ -3338,8 +3375,8 @@ mod gsi_drain_cursor_tests {
                 let left = ts
                     .iter()
                     .copied()
-                    .find(|t| *t != right)
-                    .expect("the sibling tablet");
+                    .find(|t| m.tablets[t].range.end.as_deref() == Some(split_key.as_slice()))
+                    .expect("the sibling tablet ending at the split key");
                 (left, right)
             };
 
@@ -3535,6 +3572,8 @@ mod stream_sealer_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                labels: Default::default(),
+                overload: None,
             }],
             dynamo_auth: None,
             cluster_settings: None,

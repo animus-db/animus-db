@@ -320,3 +320,9 @@ both change response *shape*, not just accept/reject).
 `animus_dynamo::limits` when global tables land (MRSC requires exactly three
 regions, at most one witness, global-tables version `2019.11.21`; MREC has no
 separate AWS numeric cap found). Proposed; no code yet.
+
+## Amendment (2026-10-05) — global-tables entries landed (ADR 0075, G-c)
+
+`animus_dynamo::limits` gained `MRSC_REQUIRED_REGIONS` (3), `MRSC_MAX_WITNESSES`
+(1), `MRSC_MIN_FULL_REPLICAS` (2) and `GLOBAL_TABLE_VERSION` ("2019.11.21"),
+listed in the catalogue test. Still no "unleashed" mode.

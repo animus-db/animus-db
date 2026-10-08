@@ -58,6 +58,33 @@ pub fn frozen_refusal(is_frozen: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// R-01 (d), ADR 0074 §2 (`docs/resource-bounds.md` §3): the named refusal a
+/// mutating propose helper returns while the tablet group's own write-ahead
+/// log is suspect after an ENOSPC (`RaftKvNode::is_storage_full`). Begins with
+/// `StorageFull:` so a client/operator reading the 503 body sees the cause,
+/// and ends in the house `"; retry"` suffix so every relay allowlist and
+/// `WireError::service_unavailable` mapping treats it as a transient
+/// `ServiceUnavailable` — the condition clears, without a restart, once space
+/// returns and the group has rewritten its WAL. Never returned for a read.
+pub const STORAGE_FULL_REFUSAL: &str = "StorageFull: this tablet's disk is full and its write-ahead log is awaiting a rewrite onto free space; writes are refused until space returns; retry";
+
+/// The shared pre-propose disk-full refusal (see [`STORAGE_FULL_REFUSAL`]).
+/// `is_storage_full` is `CpGroup::is_storage_full()`'s own value.
+pub fn storage_full_refusal(is_storage_full: bool) -> Result<(), String> {
+    if is_storage_full {
+        return Err(STORAGE_FULL_REFUSAL.into());
+    }
+    Ok(())
+}
+
+/// Whether `e` is the [`STORAGE_FULL_REFUSAL`] (or a relayed copy of it). A
+/// retry loop must **not** spin on it inline for its whole client budget — the
+/// condition lasts until an operator frees space — so the retry decision
+/// excludes it and the client backs off on the 503 instead.
+pub fn is_storage_full_refusal(e: &str) -> bool {
+    e.contains("StorageFull:")
+}
+
 /// Whether a CP read error is a **transient routing/leadership/scope race**
 /// the reader should retry with re-resolved routing (the `"; retry"` shape
 /// every such error in this file carries), as opposed to a genuine failure
@@ -76,20 +103,36 @@ pub fn ok_or_err(resp: ClientResponse, what: &str) -> Result<(), String> {
     }
 }
 
-/// F11 (ADR 0042 §14, growth PR2): align a candidate split key to the token
-/// boundary (`TOKEN_BYTES`) if `tablet`'s table is streamed, so one shard's
-/// worth of a stream (which is keyed at token granularity) never ends up
-/// straddling two post-split tablets. Also reports whether the (possibly
-/// rounded) key is still a legal **interior** split point for `tablet`'s
+/// Align a candidate split key to a token boundary (`TOKEN_BYTES`), so one
+/// partition key's rows never straddle two post-split tablets, and report
+/// whether the result is a legal **interior** split point for `tablet`'s
 /// current range (`KeyRange::split_at`'s own "strictly inside" rule).
-/// Rounding a hot single-token partition's own key can collapse it onto
-/// `range.start` — Fork E's accepted single-token hot-partition limit: one
-/// very hot partition key ends up owning the tablet's entire range, and it
-/// can never legally split without separating that same token's records
-/// across siblings — the exact affinity F11 exists to protect. `viable ==
-/// false` for an unknown tablet too (the caller's own subsequent lookup
-/// reports that more precisely; this just never claims a key is fine for a
-/// tablet this function can't even see).
+///
+/// **Every** table is aligned, not only streamed ones (R-01 F-2). F11 (ADR
+/// 0042 §14) introduced this for a streamed table, whose stream shard is keyed
+/// at token granularity. The same affinity is load-bearing for 2PC: a
+/// transaction's record key is derived from its **anchor's token** and sorts
+/// *below* every item of that token (`txn.rs`), so a split at an item's own
+/// key (what the byte-weighted-median trigger returns, and with one item per
+/// partition key that item is the first row of its token) put the anchor's
+/// item on the right child and its record on the left one. The anchor stage
+/// landed on one tablet and every `TxnCommit`/recovery was routed to the other,
+/// where no record existed: an orphan-abort tombstone, a never-resolved
+/// intent, a lost acknowledged write.
+///
+/// Rounding goes **down** first (the token's rows all move right). If that
+/// collapses onto `range.start` (a hot token that opens the tablet) a
+/// non-streamed table goes **up** to the next token boundary instead (the
+/// token's rows all stay left).
+/// Only when neither is interior -- the range holds a single token -- does a
+/// non-streamed table fall back to the raw key, preserving the pre-existing
+/// ability to split one hot partition by sort key (a **documented residual**:
+/// a transaction anchored on that token can still straddle the cut, see
+/// `animus-cp-data`'s `txn.rs`); a streamed table reports `viable == false`
+/// (Fork E's accepted single-token limit, which keeps the stream's change
+/// records in one tablet). `viable == false` for an unknown tablet too (the
+/// caller's own subsequent lookup reports that more precisely; this just
+/// never claims a key is fine for a tablet this function can't even see).
 pub fn align_split_key(meta: &Metadata, tablet: TabletId, split_key: Vec<u8>) -> (Vec<u8>, bool) {
     let Some(t) = meta.tablets.get(&tablet) else {
         return (split_key, false);
@@ -98,13 +141,33 @@ pub fn align_split_key(meta: &Metadata, tablet: TabletId, split_key: Vec<u8>) ->
         .table
         .as_deref()
         .is_some_and(|table| meta.table_stream(table).is_some());
-    let key = if streamed {
-        split_key[..TOKEN_BYTES.min(split_key.len())].to_vec()
-    } else {
-        split_key
-    };
-    let viable = t.range.split_at(&key).is_some();
-    (key, viable)
+    let down = split_key[..TOKEN_BYTES.min(split_key.len())].to_vec();
+    if t.range.split_at(&down).is_some() {
+        return (down, true);
+    }
+    // Down collapsed onto `range.start` (or the key is a short, non-interior
+    // one): try the next token boundary up. A streamed table keeps Fork E's
+    // established "collapse = skip" behavior instead.
+    if !streamed && down.len() == TOKEN_BYTES {
+        let mut up = down.clone();
+        let mut carried = true;
+        for b in up.iter_mut().rev() {
+            let (v, over) = b.overflowing_add(1);
+            *b = v;
+            if !over {
+                carried = false;
+                break;
+            }
+        }
+        if !carried && t.range.split_at(&up).is_some() {
+            return (up, true);
+        }
+    }
+    if streamed {
+        return (down, false);
+    }
+    let viable = t.range.split_at(&split_key).is_some();
+    (split_key, viable)
 }
 
 /// ADR 0034: the key that roughly bisects `pairs`' total **bytes** (key +
@@ -391,6 +454,26 @@ mod tests {
         assert!(!read_should_retry("please retry later"));
     }
 
+    // --- storage_full_refusal (R-01 (d), ADR 0074 §2) -------------------------
+
+    #[test]
+    fn storage_full_refusal_ok_when_the_wal_is_healthy() {
+        assert_eq!(storage_full_refusal(false), Ok(()));
+    }
+
+    #[test]
+    fn storage_full_refusal_is_named_and_retryable_when_suspect() {
+        let e = storage_full_refusal(true).unwrap_err();
+        assert!(e.starts_with("StorageFull:"), "{e}");
+        assert!(read_should_retry(&e), "must map to a 503, not a 500: {e}");
+        assert!(is_storage_full_refusal(&e));
+    }
+
+    #[test]
+    fn is_storage_full_refusal_ignores_other_retryable_errors() {
+        assert!(!is_storage_full_refusal("CP group leader moved; retry"));
+    }
+
     // --- ok_or_err ---------------------------------------------------------
 
     #[test]
@@ -469,21 +552,57 @@ mod tests {
         );
     }
 
-    #[test]
-    fn leaves_an_unstreamed_tables_key_untouched() {
+    fn plain_metadata_with_tablet(tablet: TabletId, range: KeyRange) -> Metadata {
         let mut m = Metadata::default();
         assert!(matches!(
             m.apply(&MetaCommand::CreateTablet {
-                tablet: TabletId(1),
+                tablet,
                 table: Some("plain".to_owned()),
-                range: KeyRange::whole(),
+                range,
                 replicas: Vec::new(),
             }),
             animus_control::ApplyOutcome::Applied
         ));
+        m
+    }
+
+    /// R-01 F-2: an unstreamed table's split key is token-aligned too (a
+    /// split inside a token separates a txn record from its anchor's item).
+    #[test]
+    fn rounds_an_unstreamed_tables_key_down_to_the_token_boundary() {
+        let m = plain_metadata_with_tablet(TabletId(1), KeyRange::whole());
         let raw = b"any-length-key-at-all".to_vec();
         let (key, viable) = align_split_key(&m, TabletId(1), raw.clone());
-        assert_eq!(key, raw);
+        assert_eq!(key, raw[..TOKEN_BYTES].to_vec());
+        assert!(viable);
+    }
+
+    /// A hot token that opens the tablet: rounding down collapses onto
+    /// `range.start`, so an unstreamed table rounds UP to the next token
+    /// boundary (the whole token stays on the left child).
+    #[test]
+    fn an_unstreamed_collapse_rounds_up_to_the_next_token() {
+        let range = KeyRange {
+            start: b"orders-m".to_vec(),
+            end: None,
+        };
+        let m = plain_metadata_with_tablet(TabletId(2), range);
+        let (key, viable) = align_split_key(&m, TabletId(2), b"orders-mZZ".to_vec());
+        assert_eq!(key, b"orders-n".to_vec());
+        assert!(viable);
+    }
+
+    /// A range holding a single token has no token boundary inside it: an
+    /// unstreamed table keeps the raw key (the documented sub-token residual).
+    #[test]
+    fn a_single_token_unstreamed_range_falls_back_to_the_raw_key() {
+        let range = KeyRange {
+            start: b"orders-m".to_vec(),
+            end: Some(b"orders-n".to_vec()),
+        };
+        let m = plain_metadata_with_tablet(TabletId(2), range);
+        let (key, viable) = align_split_key(&m, TabletId(2), b"orders-mZZ".to_vec());
+        assert_eq!(key, b"orders-mZZ".to_vec());
         assert!(viable);
     }
 

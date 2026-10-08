@@ -46,6 +46,12 @@ Each node assembles three internal roles over `ProdEnv` (the only place real
 time/IO/RNG live): a control-plane Raft node, a data-plane replica, and a
 client-facing coordinator that serves the DynamoDB-JSON wire adapter.
 
+## Operating a cluster
+
+Procedures for day-two operations (node replacement and decommission, quorum
+loss, backup and restore, certificate rotation, upgrades, disk, overload) are in
+the [operations runbook](runbook/README.md).
+
 ## Where metrics surface
 
 Observability is a **deterministic-safe seam** in `animus-env` (ADR 0015):
@@ -86,6 +92,7 @@ on every attempt or every driver-loop tick), grouped by area:
 | `cp_eventual_reads_local` / `cp_eventual_reads_forwarded` / `cp_eventual_reads_fell_back` | an eventually-consistent read (ADR 0055, `ConsistentRead: false`) was served from this replica / forwarded one hop / fell back to the linearizable path |
 | `cp_snapshot_triggers` / `cp_snapshot_image_builds` / `cp_snapshot_ships` / `cp_snapshot_installs` | compaction advanced the snapshot base / an image was actually built / an `InstallSnapshot` chunk was sent / a peer finished installing one |
 | `cp_reconfigure_accepted` / `cp_reconfigure_rejected` | a per-tablet single-server `change_membership` step was accepted / rejected |
+| `dynamo_requests_total` / `dynamo_responses_5xx` | a DynamoDB-wire request was dispatched / answered with an HTTP 5xx (server fault; throttles and validation errors are 4xx) |
 | `cp_txn_recovered_committed` / `cp_txn_recovered_aborted` / `cp_txn_resolver_runs` | in-doubt-transaction recovery (ADR 0018 §2) drove a stale record to `Committed` / `Aborted` / one resolver-loop tick ran |
 
 This is the commonly-watched subset, not the full `Metric` enum — the CP data
@@ -124,11 +131,10 @@ curl -s <dynamo addr>/metrics
 # control_is_leader 1
 ```
 
-The body is **aggregated across the node's three role sinks** (control, data,
-coord), read at request time so it reflects live activity. A node runs three
-internal `ProdEnv` roles on distinct ids, each recording into its own sink:
-`RaftNode::start` records into the control env's sink, the data replica and the
-coordinator into theirs. The handler sums the three snapshots counter-by-counter
+The body is **aggregated across the node's two metric sinks** (control and
+data), read at request time so it reflects live activity (`ClientCtx::metrics_text`).
+The control plane records into the control env's sink and the data replica into
+its own; the handler sums the snapshots counter-by-counter
 (and takes the max of the leadership gauge, which only the control plane sets),
 so both control- and data-plane counters surface from one endpoint. Both move
 today: the control-plane counters as soon as the control Raft group is active,
@@ -155,4 +161,15 @@ assertion messages; replay with:
 
 ```sh
 ANIMUS_SEED=<seed> cargo test <name>
+```
+
+## Measuring performance
+
+The load generator and its methodology live in
+[`docs/benchmarks.md`](benchmarks.md) (design record: ADR 0076). There are no
+published results yet; numbers from a single-host run are marked
+non-publishable by the tool itself.
+
+```sh
+cargo run --release -p animus-bench -- --help
 ```

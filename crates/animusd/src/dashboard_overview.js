@@ -50,6 +50,8 @@ function renderOverview() {
     ? `${controlRows.length} control + ${nodeCount} data node(s) · ${tabletIds.length} tablet(s)`
     : `${nodeCount} node(s) · ${tabletIds.length} tablet(s)`;
 
+  renderOverviewVersion();
+
   // ---- health banner ----
   // Health here means "is the data at risk", not "is anything in transition"
   // (full philosophy on `computeHealth`, dashboard_core.js). Critical is
@@ -252,4 +254,54 @@ function renderOverview() {
     const h2 = max ? Math.max(4, (c / max) * 56) : 4;
     return `<div class="bar${downSet.has(id) ? " down" : ""}" style="height:${h2}px" title="node ${esc(id)}: ${c} tablet(s)"></div>`;
   }).join("") || `<div class="empty">no nodes yet</div>`;
+}
+
+// ---- Version card (ADR 0073 Phase 3, P3-A) ----
+// Straight off `GET /admin/cluster-version` (`STATE.clusterVersion`): the
+// active cluster version, how many nodes already report the new build, the
+// derived roll phase, what is left (in roll order), the blockers and the
+// server-side roll-health verdict (`roll.health`, one definition shared with
+// `GET /admin/roll-health` — nothing is recomputed here). The Finalize
+// button appears only at `ready_to_finalize` and talks to the control
+// leader's own admin port (Finalize is local-leader-only, never relayed);
+// like every Overview control it is reachable only on a control/combined
+// node's dashboard, and it is `window.confirm`-gated because it is
+// irreversible.
+function renderOverviewVersion() {
+  const el = $("ov-version");
+  const v = STATE.clusterVersion;
+  if (!v || !v.roll) { el.style.display = "none"; return; }
+  el.style.display = "";
+  const r = v.roll;
+  const phaseCls = { not_started: "dim-dot", rolling: "warn-dot", blocked: "bad-dot", ready_to_finalize: "ok-dot" }[r.phase] || "dim-dot";
+  const phaseText = { not_started: "no roll in progress", rolling: "rolling", blocked: "blocked", ready_to_finalize: "ready to finalize" }[r.phase] || r.phase;
+  const h = r.health;
+  const healthHtml = h
+    ? (h.ok ? `<span class="muted">roll-health: ok</span>`
+        : `<span class="muted">roll-health: not ok (${esc((h.reasons || []).slice(0, 4).map((x) => x.kind + (x.node ? " " + x.node : "") + (x.tablet != null ? " #" + x.tablet : "")).join(", "))}${(h.reasons || []).length > 4 ? ", …" : ""})</span>`)
+    : "";
+  const blockers = (r.blockers || []).map((b) => `<div class="list-row"><span class="mono">${esc(b.node)}</span><span class="muted">${esc(b.reason)}</span></div>`).join("");
+  const finalizeHtml = r.phase === "ready_to_finalize"
+    ? `<button class="link-text" id="ov-finalize">Finalize to version ${esc(v.target)} →</button>`
+    : "";
+  el.innerHTML = `<div class="section-head"><span class="title">Version</span>${finalizeHtml}</div>
+    <div class="stat-tiles">
+      <div class="stat-tile"><div class="label">Cluster version</div><div class="value">${esc(v.active)}</div></div>
+      <div class="stat-tile"><div class="label">On the new build</div><div class="value">${esc(r.on_new)} of ${esc(r.total)}</div></div>
+      <div class="stat-tile"><div class="label">Roll</div><div class="value">${dot(phaseCls)} ${esc(phaseText)}</div></div>
+    </div>
+    <div class="muted" style="margin-top:8px">${r.remaining && r.remaining.length ? "next: " + esc(r.remaining.join(" → ")) + " · " : ""}${healthHtml}</div>
+    ${blockers && r.phase !== "not_started" ? `<div style="margin-top:8px">${blockers}</div>` : ""}`;
+  const btn = $("ov-finalize");
+  if (btn) btn.addEventListener("click", overviewFinalize);
+}
+
+async function overviewFinalize() {
+  const v = STATE.clusterVersion;
+  const leader = STATE.nodes.find((x) => x.ok && x.raft && x.raft.is_leader);
+  if (!v || !leader) { window.alert("no control leader currently known"); return; }
+  if (!window.confirm(`Finalize cluster version ${v.active} -> ${v.target}? This is irreversible: no node can return to the old binary afterwards.`)) return;
+  const { status, body } = await postJSON(leader.base, "/admin/cluster-version/finalize", { to: v.target, expected: v.active });
+  if (status >= 300) { window.alert((body && body.error) || `HTTP ${status}`); return; }
+  await loadAll();
 }

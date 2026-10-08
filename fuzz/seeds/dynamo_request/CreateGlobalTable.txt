@@ -1,0 +1,2 @@
+CreateGlobalTable
+{"GlobalTableName": "tbl", "ReplicationGroup": [{"RegionName": "a"}]}

@@ -38,8 +38,11 @@ fn node(i: u16, role: NodeRole, tls: bool) -> RoleAddrs {
             cert_path: PathBuf::from("/etc/animus/tls/tls.crt"),
             key_path: PathBuf::from("/etc/animus/tls/tls.key"),
             ca_path: Some(PathBuf::from("/etc/animus/tls/ca.crt")),
+            peer_ca_path: None,
         }),
         encryption_key_path: (i == 0).then(|| "/etc/animus/enc/key".to_string()),
+        labels: Default::default(),
+        overload: None,
     }
 }
 

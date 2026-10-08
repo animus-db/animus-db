@@ -315,6 +315,8 @@ async fn restarted_control_node_resets_its_ring_and_pre_restart_watchers_fall_ba
             advertise_host: None,
             tls: None,
             encryption_key_path: None,
+            labels: Default::default(),
+            overload: None,
         }
     };
     let config = animusd::ClusterConfig {
@@ -430,6 +432,24 @@ async fn restarted_control_node_resets_its_ring_and_pre_restart_watchers_fall_ba
     .await
     .expect("restarted control node did not re-elect itself leader in 20s");
 
+    // ADR 0073 Phase 2 (P2-C): a control node whose cluster has not started
+    // the version era yet starts it shortly after it takes leadership (the
+    // initial `ReportNodeVersion` is a real commit, so a real metadata
+    // change). Let that settle before sampling the "nothing changed" window
+    // below — the assertion is about the watch machinery on a quiescent
+    // `Metadata`, not about the era start.
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let meta = node.metadata();
+            if meta.versioning_active() && !meta.node_versions.is_empty() {
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the version era did not start on the restarted control node in 20s");
+
     // `Metadata` survived (the engine is durable) — confirm the restarted
     // node's own watermark is at least what it was pre-restart (it may have
     // advanced further, e.g. a fresh election no-op). issue #1024: a
@@ -469,7 +489,10 @@ async fn restarted_control_node_resets_its_ring_and_pre_restart_watchers_fall_ba
     .await;
     match reply {
         ClientResponse::MetadataDelta { writes, .. } => {
-            assert!(writes.is_empty(), "nothing changed since `current`");
+            assert!(
+                writes.is_empty(),
+                "nothing changed since `current`: {writes:?}"
+            );
         }
         other => panic!("expected a trivial MetadataDelta, got {other:?}"),
     }

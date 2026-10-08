@@ -445,6 +445,8 @@ fn sim_cluster_scale_metadata_curve() {
             let view = MetadataView {
                 tablets: meta.tablets.clone(),
                 down: BTreeSet::new(),
+                regions: BTreeMap::new(),
+                preferred_leader: BTreeMap::new(),
             };
             let local: BTreeSet<TabletId> = meta
                 .tablets

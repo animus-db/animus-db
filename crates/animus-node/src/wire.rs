@@ -62,6 +62,31 @@ pub enum KindWriteOp {
         key_item: animus_dynamo::Item,
         actions: Vec<animus_dynamo::wire::UpdateAction>,
     },
+    /// **Apply a replicated MREC write** (ADR 0075 section 4, G-01 stage G-d
+    /// M3): another cluster's already-resolved result for this item (`item:
+    /// None` is a tombstone), with the originating write's stamp `ver`. The
+    /// leader proposes `KindEvalOp::Replicate` (last-writer-wins apply, M2).
+    /// Proposed only by the MREC receiver (`animusd::mrec_receiver`), never by
+    /// a DynamoDB write; refused in a transaction.
+    ///
+    /// **Class G, `Gate::MrecReplication`**: [`ClientRequest::required_gate`]
+    /// is content-dependent, so a request carrying this op is never sent to a
+    /// node that cannot decode it.
+    Replicate {
+        item: Option<animus_dynamo::Item>,
+        ver: animus_item::MrecVersion,
+    },
+}
+
+impl KindWriteOp {
+    /// The gate this op needs ([`Gate::MrecReplication`] for a replicate).
+    #[must_use]
+    pub fn required_gate(&self) -> Gate {
+        match self {
+            KindWriteOp::Put(_) | KindWriteOp::Delete | KindWriteOp::Update { .. } => Gate::Base,
+            KindWriteOp::Replicate { .. } => Gate::MrecReplication,
+        }
+    }
 }
 
 /// A `cp_txn`/`ClientRequest::Txn` write spanning tables (ADR 0018 §2/PR4;
@@ -177,6 +202,107 @@ pub enum KindWriteItemReply {
     /// domain violation (e.g. `size()` on the wrong attribute type) or a
     /// malformed/oversized update, scoped to this one item.
     Rejected { code: String, message: String },
+    /// This item was a [`KindWriteOp::Replicate`] whose stamp did not beat the
+    /// stored one (it lost last-writer-wins, or was an idempotent
+    /// re-delivery): nothing was written. **Class G, `Gate::MrecReplication`**
+    /// ([`ClientResponse::required_gate`] is content-dependent).
+    Superseded,
+}
+
+/// The MREC replication protocol version carried in an
+/// [`MrecApplyRequest`]/[`MrecApplyResponse`]: the two clusters roll
+/// independently, so the cross-cluster frame is versioned on its own (ADR
+/// 0073 Phase 2 note; a receiver refuses an unknown `proto` by name).
+pub const MREC_PROTO: u32 = 1;
+
+/// One replicated item of an [`MrecApplyRequest`]: the originating region's
+/// resulting image (`item: None` is a tombstone) and its stamp.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MrecRecord {
+    pub pk: animus_dynamo::AttributeValue,
+    pub sk: Option<animus_dynamo::AttributeValue>,
+    pub item: Option<animus_dynamo::Item>,
+    pub ver: animus_item::MrecVersion,
+}
+
+/// **Cross-cluster MREC replication batch** (ADR 0075 section 4, G-d M3): the
+/// shipper of region `from_region` offers `records` of `table` to a peer data
+/// node, which groups them by its own tablet layout and proposes one
+/// `KindEvalBatch` per destination tablet. Intra-only ([`surface_of`]); the
+/// cross-cluster authentication is ADR 0064 mutual TLS on the intra port.
+/// Answered with [`ClientResponse::MrecApply`]. **Class G,
+/// `Gate::MrecReplication`.**
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MrecApplyRequest {
+    /// [`MREC_PROTO`] of the sender.
+    pub proto: u32,
+    /// The sender's own region name (must be a configured peer of the
+    /// receiver and a replica of `table`).
+    pub from_region: String,
+    pub table: String,
+    pub records: Vec<MrecRecord>,
+    /// A replica-lifecycle message instead of a record batch (G-d M4; `records`
+    /// is then empty and ignored). Additive: absent on every pre-M4 frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<MrecControl>,
+}
+
+/// The replica-lifecycle messages one cluster sends a peer (the create/delete
+/// saga, ADR 0075 4.3/5.1), carried by [`MrecApplyRequest::control`]. Answered
+/// with [`MrecApplyResponse::Done`] or [`MrecApplyResponse::Refused`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MrecControl {
+    /// Create the receiving cluster's replica of `table` (idempotent): a
+    /// `CreateTable` body (DynamoDB JSON) for the table, an optional TTL
+    /// attribute, and the other regions of the replica set (the sender
+    /// excluded) the receiver must also replicate with.
+    CreateReplica {
+        create_table: String,
+        ttl_attribute: Option<String>,
+        peers: Vec<String>,
+    },
+    /// The sender removed the receiving cluster from its replica set (and
+    /// asks the receiver to drop the sender from its own). The receiver's
+    /// table survives as a standalone one.
+    Leave,
+    /// The sender added `region` to the replica set; the receiver adds it too
+    /// (full mesh, ADR 0075 D8).
+    AddPeer { region: String },
+    /// The sender's table now has (`Some`) or no longer has (`None`) a TTL
+    /// attribute; the receiver mirrors it (idempotent; ADR 0075 V15, TTL
+    /// settings synchronize across replicas). Added after the first three
+    /// variants, class G with the rest of the `MrecApply` frame.
+    SetTtl { attribute: Option<String> },
+}
+
+/// The receiver's per-record verdict (same order as the request's `records`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MrecAnswer {
+    /// The record won last-writer-wins and is committed on the receiver's
+    /// tablet. The shipper may advance past it.
+    Applied,
+    /// The receiver already holds an equal or newer stamp (loss, or an
+    /// idempotent re-delivery). Terminal: the shipper may advance past it.
+    Superseded,
+    /// Not applied *yet* (skew-ahead stamp, a live transaction intent on the
+    /// key, overload, leadership churn): resend later; never advance past it.
+    Retry,
+    /// Refused for good (malformed record); never retried.
+    Rejected { message: String },
+}
+
+/// Reply to [`MrecApplyRequest`] (carried by [`ClientResponse::MrecApply`]).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MrecApplyResponse {
+    /// One answer per request record, in order.
+    Answers(Vec<MrecAnswer>),
+    /// A [`MrecControl`] message was carried out (idempotent).
+    Done,
+    /// The whole batch was refused before any record was looked at (gate
+    /// closed, unknown peer, table not an MREC table or not replicated with
+    /// the sender, an insecure link, unknown `proto`). `retryable` says
+    /// whether the same batch may succeed later.
+    Refused { message: String, retryable: bool },
 }
 
 /// A request from a client to a node (length-prefixed JSON over TCP).
@@ -795,6 +921,18 @@ pub enum ClientRequest {
         span: KeyRange,
         txn_id: TxnId,
     },
+    /// **Cross-cluster MREC replication batch** (ADR 0075 section 4, G-01
+    /// stage G-d M3) — see [`MrecApplyRequest`]. The one request a *peer
+    /// cluster* sends to a data node's intra port (ADR 0064 mutual TLS is the
+    /// cross-cluster authentication, no new listener). **Intra-only, never
+    /// forwarded**: it is received bare, handled by any data node
+    /// (`animusd::mrec_receiver`), which itself proposes through the ordinary
+    /// per-tablet leader path. Answered with [`ClientResponse::MrecApply`].
+    /// Not a `MetaCommand`, so `is_relayable_command` does not apply.
+    /// **Class G, `Gate::MrecReplication`**: an older binary tears the
+    /// connection down on the unknown variant (ADR 0073 section 3), which the
+    /// shipper reads as an ordinary transport error and backs off on.
+    MrecApply(MrecApplyRequest),
 }
 
 /// Where a [`ClientRequest`] variant may be received **bare** — a
@@ -872,7 +1010,52 @@ pub fn surface_of(request: &ClientRequest) -> Surface {
         | ClientRequest::TxnResolve { .. }
         | ClientRequest::TxnStatus { .. }
         | ClientRequest::TxnRecordView { .. }
-        | ClientRequest::TxnVerify { .. } => Surface::Intra,
+        | ClientRequest::TxnVerify { .. }
+        | ClientRequest::MrecApply(_) => Surface::Intra,
+    }
+}
+
+/// Whether a connection whose client certificate chains **only** to a
+/// peer-region CA (`PeerTrust::PeerRegionOnly`, issue #1253) may send
+/// `request` on the intra port: the cross-region MREC replication frame and
+/// nothing else. **No wildcard arm** (like [`surface_of`]) so a new
+/// `ClientRequest` variant is a compile error here until it is classified;
+/// the default for a new variant is `false`. Node-local enforcement (ADR 0073
+/// class L): no wire change, a refusal reuses `ClientResponse::Error`.
+#[must_use]
+pub fn peer_region_may_send(request: &ClientRequest) -> bool {
+    match request {
+        ClientRequest::MrecApply(_) => true,
+        ClientRequest::Status
+        | ClientRequest::Put { .. }
+        | ClientRequest::PutBatch { .. }
+        | ClientRequest::Get { .. }
+        | ClientRequest::Scan { .. }
+        | ClientRequest::Delete { .. }
+        | ClientRequest::Txn { .. }
+        | ClientRequest::SplitTablet { .. }
+        | ClientRequest::Forwarded { .. }
+        | ClientRequest::ProposeSchema(_)
+        | ClientRequest::JoinInfo
+        | ClientRequest::WatchMetadata { .. }
+        | ClientRequest::KindWrite { .. }
+        | ClientRequest::KindScan { .. }
+        | ClientRequest::GetSnapshot { .. }
+        | ClientRequest::ForceSeal { .. }
+        | ClientRequest::ForcePitrSeal { .. }
+        | ClientRequest::TriggerAutoSplit { .. }
+        | ClientRequest::StreamHotRead { .. }
+        | ClientRequest::StreamHotChangeMax { .. }
+        | ClientRequest::ClearBackfillCursor { .. }
+        | ClientRequest::KindWriteItem { .. }
+        | ClientRequest::KindWriteBatch { .. }
+        | ClientRequest::CpLeaderHintProbe { .. }
+        | ClientRequest::TxnPrepare { .. }
+        | ClientRequest::TxnDecide { .. }
+        | ClientRequest::TxnResolve { .. }
+        | ClientRequest::TxnStatus { .. }
+        | ClientRequest::TxnRecordView { .. }
+        | ClientRequest::TxnVerify { .. } => false,
     }
 }
 
@@ -974,6 +1157,27 @@ pub fn is_relayable_command(command: &MetaCommand) -> bool {
         // `CreateTable`/`UpdateTable` carrying `BillingMode`/
         // `ProvisionedThroughput` must reach the control leader.
         | MetaCommand::SetTableThroughput { .. }
+        // Global-table conversion (ADR 0075, G-01 stage G-c): schema-catalog
+        // class, same relay reason as `SetTableTtl` — a follower-connected
+        // `UpdateTable` (multi-Region `ReplicaUpdates`) must reach the
+        // control leader. The receiver re-checks `Gate::GlobalTables`
+        // (`version_wiring::relay_gate_verdict`), so relaying while the gate
+        // is closed is refused by name, never appended.
+        | MetaCommand::ConvertTableToGlobal { .. }
+        // Preferred-leader re-point (ADR 0075 section 3.3): same class and
+        // relay reason as `ConvertTableToGlobal` (the admin action may land
+        // on a follower); the receiver re-checks `Gate::GlobalTables`.
+        | MetaCommand::SetGlobalPreferredLeader { .. }
+        // MREC global tables (ADR 0075 section 4, G-01 stage G-d): the replica
+        // set is catalog state mutated from a wire `UpdateTable` on any node
+        // (and by the create/delete saga on the control leader), so all four
+        // relay like `ConvertTableToGlobal`; the receiver re-checks
+        // `Gate::MrecReplication` (`version_wiring::relay_gate_verdict`).
+        | MetaCommand::ConvertTableToMrec { .. }
+        | MetaCommand::AddMrecReplica { .. }
+        | MetaCommand::RemoveMrecReplica { .. }
+        | MetaCommand::SetMrecReplicaStatus { .. }
+        | MetaCommand::MarkMrecCopied { .. }
         // Resource tagging (roadmap W-06): schema-catalog class, same relay
         // reason as `SetTableTtl` — a follower-connected `TagResource`/
         // `UntagResource` must reach the control leader.
@@ -1159,23 +1363,44 @@ pub fn is_relayable_command(command: &MetaCommand) -> bool {
         MetaCommand::ExpireStreamShards { .. } => false,
         MetaCommand::ExpirePitrSegments { .. } => false,
         MetaCommand::RemoveMember { .. } => false,
-        // ADR 0073 Phase 2 (P2-B): both version commands are relayable.
-        // `ReportNodeVersion`: a data-only node's era-on boot self-report has
-        // no other route to the control leader. `FinalizeClusterVersion`: the
-        // admin Finalize rides the existing `ProposeSchema` relay (ADR 0073
-        // section 2, "no new variant"). Both are **era-only**
+        // ADR 0073 Phase 2 (P2-A/B/C): both version commands are era-only
         // (`MetaCommand::required_gate` is `Gate::Era`): the sender side
         // refuses them before the era (`animus_node::encode_client_frame_gated`
         // and `RaftNode::propose`'s gate check), and the relay *receiver* in
-        // `animusd` (`forwarding.rs`) must re-check `required_gate` against its
-        // own `ClusterFeatures` before proposing (P2-C), because a Phase 1
-        // receiver cannot decode them at all.
+        // `animusd` (`forwarding.rs`) re-checks `required_gate` against its own
+        // `ClusterFeatures` before proposing, because a Phase 1 receiver cannot
+        // decode them at all.
+        //
+        // `ReportNodeVersion` relays: the boot-time self-report of a
+        // follower-connected combined/control node and of every data-only node
+        // (no local `RaftNode`) must reach the control leader. Safe: apply
+        // validates the node is registered and the range is well-formed and
+        // contains the cluster version; the leader's own `era_on_proposals`
+        // upkeep proposes the identical command.
+        //
+        // `FinalizeClusterVersion` deliberately stays NON-relayable (P2-C wins
+        // over P2-B's draft decision): it is a leader-local admin action (ADR
+        // 0037 pattern, `admin_remove_member`'s shape). The admin endpoint
+        // checks the blocker table on the control leader and answers 409
+        // naming the leader on any other node, so no sanctioned path relays
+        // it; leaving it off the allowlist means a peer cannot raise the
+        // cluster version by relaying a Finalize that skips that check.
         MetaCommand::ReportNodeVersion { .. } => true,
-        MetaCommand::FinalizeClusterVersion { .. } => true,
+        MetaCommand::FinalizeClusterVersion { .. } => false,
         MetaCommand::CompleteBackup { .. } => false,
         MetaCommand::FailBackup { .. } => false,
         MetaCommand::DeleteBackup { .. } => false,
     }
+}
+
+/// `skip_serializing_if` predicate for additive `u32` wire fields whose
+/// default must not appear on the wire (ADR 0073 Phase 2).
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip predicate signature"
+)]
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 /// ADR 0073 Phase 2 (P2-B): the gate each [`ClientRequest`] needs before it may be
@@ -1192,6 +1417,15 @@ impl ClientRequest {
         match self {
             ClientRequest::ProposeSchema(command) => command.required_gate(),
             ClientRequest::Forwarded { request, .. } => request.required_gate(),
+            // ADR 0075 G-d M3: the cross-cluster replication batch, and the
+            // replicate op riding the data-plane write RPCs (content-dependent).
+            ClientRequest::MrecApply(_) => Gate::MrecReplication,
+            ClientRequest::KindWriteItem { op, .. } => op.required_gate(),
+            ClientRequest::KindWriteBatch { items, .. } => items
+                .iter()
+                .map(|i| i.op.required_gate())
+                .max()
+                .unwrap_or(Gate::Base),
             ClientRequest::Status
             | ClientRequest::Put { .. }
             | ClientRequest::PutBatch { .. }
@@ -1203,8 +1437,6 @@ impl ClientRequest {
             | ClientRequest::StreamHotRead { .. }
             | ClientRequest::StreamHotChangeMax { .. }
             | ClientRequest::ClearBackfillCursor { .. }
-            | ClientRequest::KindWriteItem { .. }
-            | ClientRequest::KindWriteBatch { .. }
             | ClientRequest::CpLeaderHintProbe { .. }
             | ClientRequest::Get { .. }
             | ClientRequest::GetSnapshot { .. }
@@ -1234,12 +1466,31 @@ impl ClientResponse {
     #[must_use]
     pub fn required_gate(&self) -> Gate {
         match self {
+            // ADR 0075 G-d M3: the replication reply, and a batch reply that
+            // carries a `Superseded` slot (content-dependent).
+            // A whole-batch `Refused` is the one MrecApply reply a node whose
+            // own gate is still closed must be able to emit (it is how it
+            // says "not yet"); it answers a request only a new binary can
+            // send, so it is `Base`. Per-record answers need the gate open.
+            ClientResponse::MrecApply(MrecApplyResponse::Refused { .. }) => Gate::Base,
+            ClientResponse::MrecApply(MrecApplyResponse::Answers(_) | MrecApplyResponse::Done) => {
+                Gate::MrecReplication
+            }
+            ClientResponse::KindWriteBatchOk { results } => {
+                if results
+                    .iter()
+                    .any(|r| matches!(r, KindWriteItemReply::Superseded))
+                {
+                    Gate::MrecReplication
+                } else {
+                    Gate::Base
+                }
+            }
             ClientResponse::Status { .. }
             | ClientResponse::PutOk
             | ClientResponse::Value(_)
             | ClientResponse::KindWriteOk { .. }
             | ClientResponse::ConditionFailed
-            | ClientResponse::KindWriteBatchOk { .. }
             | ClientResponse::Unresolved
             | ClientResponse::CpLeaderHint { .. }
             | ClientResponse::Pairs(_)
@@ -1400,6 +1651,15 @@ pub enum ClientResponse {
         /// had a chance to tick.
         intra_route: BTreeMap<NodeId, String>,
         admin_addrs: Vec<SocketAddr>,
+        /// ADR 0073 Phase 2 (P2-C): the answering node's **raw**
+        /// `Metadata::cluster_version` (`0` = the version era has not
+        /// started), so a joiner can refuse a cluster whose version its own
+        /// binary range excludes *before* claiming an identity or binding
+        /// anything. Additive: `#[serde(default, skip_serializing_if)]`, so
+        /// pre-era bytes are identical to Phase 1's and a Phase 1 reader
+        /// ignores the field.
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        cluster_version: u32,
     },
     /// **Incremental long-poll reply to
     /// [`WatchMetadata`](ClientRequest::WatchMetadata)** (ADR 0038 PR5): the
@@ -1497,6 +1757,9 @@ pub enum ClientResponse {
     /// replied `ClientResponse::PutOk`, indistinguishable from a genuine
     /// resolve — the exact gap the amendment names.
     TxnResolved { outcome: ResolveOutcome },
+    /// Reply to [`MrecApply`](ClientRequest::MrecApply) (ADR 0075 section 4,
+    /// G-d M3). **Class G, `Gate::MrecReplication`.**
+    MrecApply(MrecApplyResponse),
 }
 
 #[cfg(test)]
@@ -1509,6 +1772,34 @@ mod tests {
     use animus_tablet::{Epoch, KeyRange, TabletId};
 
     use super::*;
+
+    /// Issue #1253: a peer-region-only certificate may send `MrecApply` and
+    /// nothing else (everything else, `Forwarded` and a bare `Get` included,
+    /// is refused).
+    #[test]
+    fn peer_region_may_send_only_mrec_apply() {
+        let mrec = ClientRequest::MrecApply(MrecApplyRequest {
+            proto: 1,
+            from_region: "west".into(),
+            table: "t".into(),
+            records: Vec::new(),
+            control: None,
+        });
+        assert!(peer_region_may_send(&mrec));
+        let get = ClientRequest::Get {
+            key: b"k".to_vec(),
+            table: "t".into(),
+            stale: false,
+        };
+        assert!(!peer_region_may_send(&get));
+        let fwd = ClientRequest::Forwarded {
+            request: Box::new(get),
+            traceparent: None,
+        };
+        assert!(!peer_region_may_send(&fwd));
+        assert!(!peer_region_may_send(&ClientRequest::Status));
+        assert!(!peer_region_may_send(&ClientRequest::JoinInfo));
+    }
 
     /// Pins `is_relayable_command`'s classification of every `MetaCommand`
     /// variant (ADR 0061 rung C1's `matches!` -> exhaustive `match`
@@ -1539,6 +1830,12 @@ mod tests {
         };
 
         let true_cases: Vec<MetaCommand> = vec![
+            // ADR 0073 Phase 2 (P2-C): relays (boot-time self-report).
+            MetaCommand::ReportNodeVersion {
+                node: nid(1),
+                range: animus_control::version::VersionRange::new(1, 1),
+                build: "t".to_string(),
+            },
             MetaCommand::CreateTableSchema {
                 table: table.clone(),
                 schema: schema.clone(),
@@ -1587,6 +1884,39 @@ mod tests {
                     read_units: 5,
                     write_units: 5,
                 }),
+            },
+            MetaCommand::ConvertTableToGlobal {
+                table: table.clone(),
+                spec: animus_control::GlobalTableSpec {
+                    consistency: animus_control::MultiRegionConsistency::Strong,
+                    regions: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+                    witness: None,
+                    preferred_leader_region: "a".to_string(),
+                    replicas: Vec::new(),
+                },
+            },
+            MetaCommand::SetGlobalPreferredLeader {
+                table: table.clone(),
+                region: "b".to_string(),
+            },
+            MetaCommand::ConvertTableToMrec {
+                table: table.clone(),
+                local_region: "us".to_string(),
+                region_id: animus_control::mrec_region_id("us"),
+            },
+            MetaCommand::AddMrecReplica {
+                table: table.clone(),
+                region: "eu".to_string(),
+                region_id: animus_control::mrec_region_id("eu"),
+            },
+            MetaCommand::RemoveMrecReplica {
+                table: table.clone(),
+                region: "eu".to_string(),
+            },
+            MetaCommand::SetMrecReplicaStatus {
+                table: table.clone(),
+                region: "eu".to_string(),
+                status: animus_control::MrecReplicaStatus::Active,
             },
             MetaCommand::TagResource {
                 table: table.clone(),
@@ -1778,16 +2108,6 @@ mod tests {
             MetaCommand::RevokeCredential {
                 id: "AKID1".to_string(),
             },
-            // ADR 0073 Phase 2 (P2-B): era-only, relayable (see the match arm).
-            MetaCommand::ReportNodeVersion {
-                node: nid(1),
-                range: animus_control::version::VersionRange::new(1, 1),
-                build: "t".to_string(),
-            },
-            MetaCommand::FinalizeClusterVersion {
-                expected: 1,
-                target: 2,
-            },
         ];
         for cmd in &true_cases {
             assert!(is_relayable_command(cmd), "expected relayable: {cmd:?}");
@@ -1819,6 +2139,11 @@ mod tests {
                 remove: false,
             },
             MetaCommand::RemoveMember { node: nid(1) },
+            // P2-C: leader-local admin action, never relayed (see the match arm).
+            MetaCommand::FinalizeClusterVersion {
+                expected: 1,
+                target: 2,
+            },
             MetaCommand::CompleteBackup {
                 backup_id: "b1".to_string(),
             },

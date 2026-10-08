@@ -1775,6 +1775,7 @@ fn metadata_view(meta: &Metadata) -> MetadataView {
     MetadataView {
         tablets: meta.tablets.clone(),
         down: BTreeSet::new(),
+        ..Default::default()
     }
 }
 
@@ -2664,6 +2665,7 @@ fn kind_eval_batch_schema() -> animus_item::WriteSchema {
         key: animus_item::TableSchema::simple("pk"),
         lsis: Vec::new(),
         change_records_carry_images: true,
+        mrec: None,
     }
 }
 

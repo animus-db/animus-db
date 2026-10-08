@@ -156,6 +156,12 @@ jobs:
       - name: format fixtures are append-only (ADR 0073)
         run: scripts/check-format-fixtures.sh
 
+      # GitHub rejects a workflow with more than 25 `workflow_dispatch`
+      # inputs, silently killing every run of it (corpus-deep.yml crossed
+      # the cap twice through merges).
+      - name: workflow_dispatch inputs within GitHub's cap of 25
+        run: scripts/check-workflow-dispatch-inputs.sh
+
       # `--all-features` here (unlike the plain `cargo test` the test jobs run)
       # turns on every crate's opt-in `prod-heavy` feature too, so the
       # real-thread test binaries gated behind it (see `prod-liveness`) still
@@ -617,6 +623,11 @@ jobs:
           cargo test -p animus-storage --features prod-heavy --locked \
             --test lsm_concurrent --test idle_engine_cost \
             -- --test-threads=1
+          # B-01's smoke: a real 3-node in-process ProdEnv cluster driven
+          # over the SigV4 DynamoDB wire (~45 s). Real threads + a whole
+          # cluster => same contention rules as the binaries above.
+          cargo test -p animus-bench --features prod-heavy --locked \
+            --test smoke -- --test-threads=1
 
       - name: sccache stats
         if: always()
@@ -743,3 +754,132 @@ jobs:
       - name: RustFS logs
         if: failure()
         run: docker logs rustfs || true
+
+  # ADR 0073 Phase 3 (P3-E, D10), the `ProdEnv` tier: a REAL rolling upgrade
+  # from the previous release's real bytes. `scripts/upgrade-from.txt` pins
+  # R-1 (the Phase 1 build `ac57d56a` until the first `v*` tag exists, then the
+  # previous release tag); `scripts/build-upgrade-from.sh` builds that ref's
+  # `animusd` from source, cached here by its resolved commit SHA. The test
+  # (`crates/animusd/tests/upgrade_previous_release.rs`, `upgrade-from`
+  # feature) starts a real multi-process cluster on R-1, runs a recorded
+  # DynamoDB-wire workload, rolls it node by node onto this tree's `animusd`
+  # with the real `animus cluster roll plan/wait` CLI, finalizes, and checks
+  # durability/linearizability, availability, the era and `can_finalize`; it
+  # also MEASURES D4 repair churn (reported, never asserted).
+  #
+  # Never silently green: the test target is feature-gated (a missing target
+  # is a cargo error), the guard step below fails if fewer than the expected
+  # tests are listed, and with the feature on a missing
+  # `ANIMUS_UPGRADE_FROM_BIN` panics instead of skipping.
+  #
+  # Runs on `pull_request`, `push` to main and `merge_group` like every job in
+  # this file. It is deliberately NOT folded into the `prod-liveness` aggregate
+  # (same shape as `s3-real-endpoint`): adding it to the required checks is a
+  # repo-ruleset decision, made once it has a green track record on `main`.
+  # Cutting a release means moving `scripts/upgrade-from.txt` to the previous
+  # tag and getting this job green BEFORE tagging (docs/release.md).
+  upgrade-previous-release:
+    name: upgrade-previous-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+    steps:
+      - name: Checkout, full history (the pinned R-1 may be an old commit)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          df -h /
+          echo "ANIMUS_UPGRADE_FROM_REPORT_DIR=${RUNNER_TEMP}/upgrade-report" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain (1.96)
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "false"
+
+      - name: Resolve the pinned reference R-1
+        id: ref
+        run: |
+          echo "sha=$(scripts/build-upgrade-from.sh --sha)" >> "$GITHUB_OUTPUT"
+          echo "pinned: $(grep -v '^[[:space:]]*#' scripts/upgrade-from.txt | head -n1)"
+
+      # The R-1 binary, cached by its commit SHA. The path is the script's own
+      # cache layout (`<cache>/<sha>/animusd`).
+      - name: Cache the R-1 binary
+        id: r1cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/animus-upgrade-from/${{ steps.ref.outputs.sha }}
+          key: upgrade-from-${{ steps.ref.outputs.sha }}
+
+      - name: Build the R-1 binary (cache miss only)
+        id: r1
+        run: echo "bin=$(scripts/build-upgrade-from.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Build this tree's animusd and animus CLI
+        run: cargo build -p animusd -p animus-cli --bins --locked
+
+      - name: Guard, the test target must list all four variants
+        env:
+          ANIMUS_UPGRADE_FROM_BIN: ${{ steps.r1.outputs.bin }}
+        run: |
+          list="$(cargo test -p animusd --features upgrade-from --test upgrade_previous_release --locked -- --list 2>/dev/null)"
+          echo "${list}"
+          for t in clean_3_nodes spare_node_repair_churn_4_nodes \
+                   kill_the_control_leader_3_nodes torn_wal_tail_3_nodes; do
+            echo "${list}" | grep -q "^${t}: test" || { echo "::error::missing test ${t}"; exit 1; }
+          done
+
+      - name: Roll R-1 to this tree (real processes)
+        env:
+          ANIMUS_UPGRADE_FROM_BIN: ${{ steps.r1.outputs.bin }}
+          ANIMUS_UPGRADE_FROM_REF: ${{ steps.ref.outputs.sha }}
+        run: |
+          cargo test -p animusd --features upgrade-from --test upgrade_previous_release --locked \
+            -- --nocapture --test-threads=1
+
+      # The measured D4 repair churn and per-step timings, for the job summary.
+      - name: Summarize the roll and the D4 measurement
+        if: always()
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import glob, json, os
+          d = os.environ["ANIMUS_UPGRADE_FROM_REPORT_DIR"]
+          print("### Previous-release roll (R-1 to this tree) and D4 repair churn\n")
+          print("| variant | steps | ok writes | longest write stall (ms) | replica sets changed | snapshot installs | snapshot ships | reconfigurations |")
+          print("|---|---|---|---|---|---|---|---|")
+          for f in sorted(glob.glob(d + "/*.json")):
+              r = json.load(open(f))
+              t = r["total_over_roll"]
+              print(f"| {r['variant']} | {len(r['steps'])} | {r['ok_writes']} | {r['longest_write_stall_ms']} | "
+                    f"{t['tablets_replica_set_changed']} | {t['cp_snapshot_installs']} | {t['cp_snapshot_ships']} | {t['cp_reconfigure_accepted']} |")
+          PY
+
+      # On failure the harness leaves history.json, op-trace.txt, the
+      # violations and every node's log under `<variant>-failure/`.
+      - name: Upload the roll reports and failure artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upgrade-previous-release
+          path: ${{ runner.temp }}/upgrade-report
+          if-no-files-found: ignore
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats

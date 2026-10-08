@@ -205,7 +205,7 @@ a silent hang.** Concretely:
      deprecated by a changelog notice in release N and removed no earlier
      than the next MINOR (pre-1.0) or MAJOR (post-1.0).
    - *Internal node-to-node wire*: governed by ADR 0073 Phase 2/3 (a
-     replicated cluster version and feature gate); until Phase 2 lands,
+     replicated cluster version and feature gate); until Phase 2 completes (P2-A and P2-C have landed; P2-B and P2-D have not),
      mixed-version clusters are unsupported and release notes say so.
    - *CLI flags, config keys, metric names*: deprecated for at least one
      MINOR with a warning before removal (pre-1.0).
@@ -237,3 +237,154 @@ a silent hang.** Concretely:
   C-17's per-node density numbers when available).
 - Whether disk-full should additionally flip `/admin/health` readiness;
   decided in (d) with the runbook author.
+
+## Amendment 2026-10-05: disk-full implemented (issue #1185)
+
+Disk-full (D-7) is implemented for the WAL path. As built: ENOSPC marks the
+group's WAL suspect (never appended to or fsynced again), the group refuses
+writes with a named 503 `StorageFull ...; retry` (`overload_storage_full`), and a
+backoff probe rewrites the WAL from the in-memory log onto a fresh file and
+resumes without a restart; no persisted-format change. This differs from the
+design sketched in `docs/resource-bounds.md` before the change in two ways:
+there is no `requeue_unpersisted` (the in-memory log is a superset of every
+drained round, so a whole-image rewrite suffices) and there was initially no
+leader step-down (added by the issue #1219 amendment below). The open
+question above is decided: `/admin/health` reports a degraded `storage_full`
+field but its status code does not flip, because readiness would also pull the
+node's reads. Still open: exporting
+`spawned_task_panics`, and a `ProdEnv` size-limited-filesystem test. Proven by
+`ANIMUS_DISK_FULL_SEEDS`; see `docs/resource-bounds.md` section 3.
+
+## Amendment 2026-10-05: LSM-engine ENOSPC (issue #1218)
+
+The residual "ENOSPC inside the LSM engine still panics" is closed. As built:
+`StorageError::StorageFull` is the recoverable class (a failed call changed
+nothing durable or visible); the apply task pauses and retries the identical
+engine call instead of panicking, which preserves apply order by construction
+and surfaces as the existing `StorageFull` state (writes refused with the 503,
+`/admin/health` `storage_full`) until the call succeeds; flush and compaction
+fail cleanly and remove their orphan outputs; inline post-write maintenance
+ENOSPC is deferred rather than failing the already-durable write; and an
+ENOSPC-failed WAL batch cuts the segment back to its last durable length before
+the next batch. The disk-full semantics for clients are unchanged. No
+persisted-format change. The disk-full corpus now also runs over
+`LsmEngine<SimEnv>`.
+
+## Amendment 2026-10-05: leader step-down on StorageFull (issue #1219)
+
+The residual "a StorageFull leader keeps leadership" is closed, which makes the
+earlier clause in section 2 item 3 ("a leader steps down") true as written. As
+built: the per-tablet consensus loop feeds the group's storage-full state
+(suspect WAL or ENOSPC-stalled apply task) into `RaftCore::set_storage_full`; a
+storage-full leader arms the existing `transfer_leadership` toward its most
+up-to-date voter (`RaftCore::storage_full_step_down`), and a storage-full node
+never campaigns and declines `TimeoutNow`, so leadership cannot ping-pong back.
+A transfer only arms: the leader keeps leading until a healthy target wins, an
+unanswered transfer (a full target) aborts at its deadline and the retry rotates
+to the next voter, so there is no permanent leaderlessness and a whole-cluster
+disk-full still converges when space returns. A follower with a suspect WAL
+already acked nothing it could not persist (the failed round gates every later
+ack); that is now pinned by tests. No wire or persisted-format change; the
+control-plane group is unchanged. Proven by the disk-full corpus (writes acked
+inside a leader-only window, plus linearizability); see
+`docs/resource-bounds.md` section 3. Still open: exporting `spawned_task_panics`
+and a `ProdEnv` size-limited-filesystem test.
+
+## Amendment 2026-10-06: every replica full (issue #1228, chaos findings F-1 / F-3)
+
+The 2026-10-05 amendment left one case open: with **every** replica of a group
+full the group could lose its leader and become unreadable until space returned
+(`docs/chaos.md` F-1), and the phase-2 "writes are refused with a named 503"
+assertion of `chaos_disk_full` had to be downgraded to "reported" (F-3). Root
+causes, found from a real run's per-group dumps rather than assumed:
+
+1. **The step-down deposed the one node that could still serve.** A full leader
+   handed leadership to its most caught-up voter, but a voter's fullness was
+   unknown to the leader (a full follower acked nothing, so it could not even
+   say so), and a handoff to a voter that has not yet noticed it is full wins a
+   term it can persist while the other (full) voters cannot grant a vote: the
+   old leader stepped down on the higher term, no election could complete, and
+   full nodes never campaign, so the group was leaderless until space returned.
+2. **A full leader could not serve a linearizable read.** The read path mints a
+   timestamp and needs a *committed* `ReadCeiling` above it (ADR 0018 section
+   2); the ceiling covers 500 ms, and extending it needs a quorum that can
+   persist.
+3. **A full leader's ReadIndex could never be applied**: with one healthy
+   follower the commit index runs past what the leader's own WAL holds, and the
+   leader applies only what it has made durable.
+
+What changed (no wire or persisted-format change; ADR 0073 needs no gate):
+
+- **A full follower keeps acking, frozen.** `RaftCore::handle_append_entries`
+  clamps the ack's `match_index` to the follower's own `durable_index` while it
+  is storage-full, the consensus loop ships an `AppendEntriesResp{success}`
+  whose `match_index <= durable_index` ahead of the (never-landing) round, and
+  the ack's existing `check_pending` flag carries "I cannot vote" (now also true
+  when storage-full, `cannot_vote_yet`). Safety: the ack vouches only for
+  entries already on disk, so `maybe_advance_commit` can never count a full
+  follower toward an entry it did not persist (a unit test and
+  `raftkv_disk_full_follower_acks_nothing_it_could_not_persist` pin it;
+  `log_truncate` now also lowers `durable_index`, so a truncated-and-replaced
+  tail is never read as durable). The term it echoes is the leader's own
+  (a success ack requires `term >= current_term`), and a node never makes a
+  *vote* without first persisting it, so a frozen ack cannot enable a second
+  vote in a term. A reject, a vote grant and any ack claiming more stay held
+  exactly as before. A leader stops treating the frozen ack as a reason to
+  resend immediately (the first version spun at zero latency: 1.4 M simulator
+  events in 10 s, now bounded by the corpus).
+- **Step down only to a successor that can lead.** `storage_full_step_down`
+  (and every `transfer_leadership` caller: the G-01 preferred-leader step,
+  rebalance) refuses a target that reported `check_pending`, and the full-leader
+  handoff happens only when a *majority* of the other voters reported healthy on
+  a recent ack (`RaftCore::healthy_followers`). With fewer, no replica could win
+  an election or commit under any leader, so the leader stays: leadership is
+  stable, reads are served and writes are refused. The driver waits one election
+  timeout after entering the full state before picking, so followers that learn
+  of their own fullness from the same failed write have reported it first. The
+  storage-full step-down therefore also wins over a placement preference: a
+  preference can only arm a transfer a healthy successor could complete.
+- **A full leader serves linearizable reads at its committed floor.**
+  `read_serve_ts`: once the ceiling lapses a storage-full leader serves at the
+  highest version its engine holds (applied write versions and the ceiling
+  marker) instead of proposing a ceiling it cannot commit. Linearizable: the
+  read barrier still confirms leadership by quorum and engine-applied progress,
+  every acknowledged write is at or below the floor, and any future write on any
+  leader is minted above everything that leader applied or witnessed, so it can
+  never land below a read served here. The barrier's ReadIndex for a full leader
+  is its first-term entry (its election no-op), not the commit index: its
+  engine can never reach a commit index its apply is paused short of, but every
+  earlier-term acknowledged write is at or below that entry (which the barrier
+  confirms committed) and every own-term acknowledged write was applied before
+  its ack, so the engine at serving time holds them all.
+- **The eventual-read gate no longer needs a current leader, nor a fully
+  caught-up engine, for a full replica that has had one**
+  (`had_leader_contact`, sticky for the process's life): a paused apply stops
+  between entries, so its engine is an in-order prefix of the log, which is what
+  an eventual read promises. The one excluded state is mid-`InstallSnapshot`
+  (`engine_applied < snapshot_index`), and the "never initialised" protection is
+  unchanged for a process that has never heard a leader.
+
+**Decision: a leader that dies while every replica is full is not replaced.**
+Allowing a full node to win an election (and merely refuse writes) was
+considered and rejected: an election needs the candidate's term bump and
+self-vote, and every voter's grant, to be durable before it is sent (a vote
+that was not persisted can be cast again after a restart: two leaders in one
+term). A full node cannot make anything durable, so it neither campaigns nor
+grants. A reserved hard-state file would not be portable (copy-on-write
+filesystems can fail an overwrite). The group is therefore leaderless from the
+leader's death until space returns on a quorum, but it is not unavailable for
+what it can safely serve: every surviving replica keeps serving eventual reads
+(above), nothing acknowledged is lost, and when space returns the group elects
+and writes resume (`raftkv_disk_full_all_replicas_leader_crash_*`). The residual
+is a restart *during* the window: a freshly started process has had no leader
+contact, so it serves no eventual read until one exists.
+
+Proven by: the animus-control unit tests (`storage_full_step_down.rs`), the
+disk-full corpus cells (`raftkv_disk_full_all_replicas_*`, the healthy-quorum
+boundary RF3/RF5, the leader-crash cell, mem and LSM), the quiescence cell
+(`quiescence.rs` (ix)), the `SimCluster` wire test
+`sim_cluster_dynamo_disk_full` (prompt 503 `StorageFull` on every node, strong
+and eventual reads served, leader unmoved), and `chaos_disk_full`, whose phase 2
+again **asserts** reads served and at least one 503 `StorageFull` refusal. The
+control-plane group is unchanged (it never sets `storage_full`; its full
+follower still holds its acks).

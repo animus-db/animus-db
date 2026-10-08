@@ -24,7 +24,13 @@ How to maintain this file:
   `U` operator surfaces, `D` docs, `B` benchmarks, `R` release/readiness,
   `G` global/geo.
 
-The next free ADR number at the time of writing is **0074** (0073 is
+The next free ADR number at the time of writing is **0077** (0076 is
+[Published benchmarks](adr/0076-published-benchmarks.md), B-01's design of
+record — the load generator and methodology landed 2026-10-04 and its
+roadmap section is removed the same way; 0075 is
+[Global tables](adr/0075-global-tables.md), G-01's stage G-b; 0074 is
+[Production-readiness exit criteria](adr/0074-production-readiness-exit-criteria.md),
+R-01's; 0073 is
 [Upgrade compatibility](adr/0073-upgrade-compatibility.md); 0065 is
 [Per-table throttling](adr/0065-per-table-throttling.md), W-08's design of
 record; 0066 is [SigV4 hardening](adr/0066-sigv4-hardening.md), S-02's;
@@ -1499,7 +1505,9 @@ outstanding on the wire surface at present.
   amendment's own "what remains unowned" accounting and `crates/animusd/
   CLAUDE.md`'s consolidated closed-C-15 appendix.
 
-### C-16 Upgrade compatibility (ADR 0073) — Phases 0 and 1 done; Phase 2 in progress (P2-A merged)
+### C-16 Upgrade compatibility (ADR 0073) — Phases 0-3 done (Phase 3, rolling-upgrade orchestration, 2026-10-05); open: rolling with transactions, the D4(b) decision
+
+- **Phase 3 design (PROPOSED, 2026-10-05):** rolling-upgrade orchestration (`animus cluster roll`, a server-side `roll-health` signal, operator `spec.image` roll via StatefulSet `partition`, opt-in auto-finalize, previous-release cross-version CI) is designed in [ADR 0073's "Phase 3 design" amendment](adr/0073-upgrade-compatibility.md); workstreams P3-A..P3-G, open questions for the maintainer listed there.
 
 - **Gap (closed):** `website/index.html` listed "On-disk format stability,
   then rolling upgrades" as Planned with no ADR, roadmap entry, or issue
@@ -1565,7 +1573,7 @@ outstanding on the wire surface at present.
   (CWL/SWL v2 WAL sync markers, #1140/#1141, plus `raftkv-wal` v2), and the
   harness transcodes them to v1 for real; every other format is still v1. **Next: Phase 2** (replicated cluster version /
   feature gate; design accepted in ADR 0073's "Phase 2 design"
-  amendment, **P2-A merged**: workstreams P2-A..P2-D, knob `ANIMUS_UPGRADE_SEEDS`, no rollback
+  amendment, **P2-A and P2-C landed**: workstreams P2-A..P2-D, knob `ANIMUS_UPGRADE_SEEDS`, no rollback
   once a node has run the new binary; rolling-installable from today's
   Phase 1 binaries, never a stop-the-world step), then Phase 3. Phase 4 (lifting/rewriting root `CLAUDE.md`'s
   no-back-compat rule) is **already done** by this same maintainer
@@ -1584,10 +1592,9 @@ outstanding on the wire surface at present.
   per Phase 0 workstream); a new `SimCluster`-based upgrade/restart/
   finalize corpus with a per-node selectable version knob (proposed depth
   knob `ANIMUS_UPGRADE_SEEDS`, Phase 2/3 work); a `kind` e2e for the
-  operator's rolling-restart path, once Phase 3 exists.
+  operator's rolling-restart path (done as the nightly `E2E_UPGRADE=1` leg, unverified).
 - **ADR:** [0073](adr/0073-upgrade-compatibility.md) (Accepted, 2026-09-27
-  — Phases 0 and 1 done, baseline `9a9f972f`; Phase 2 next; Phase 3
-  planned).
+  — Phases 0-3 done, baseline `9a9f972f`; Phase 3 as built 2026-10-05).
 - **Size:** XL overall across all four phases; Phase 0 alone is roughly M
   (mechanical, one format at a time, no design risk), now split five ways
   across independent sessions.
@@ -1597,118 +1604,45 @@ outstanding on the wire surface at present.
   its orchestration primitives, and on ADR 0060 for the operator's own
   `spec.image` handling.
 - **Status:** Phase 0 done (workstreams A-E merged, baseline `9a9f972f`);
-  Phase 1 done (2026-10-03); **Phase 2 in progress: P2-A has merged on
-  `main`** (`c4948113` version module + `Metadata` `node_versions`/
+  Phase 1 done (2026-10-03); **Phase 2 (history; now done): P2-A had merged on
+  `main` and P2-C (node wiring, era live, `/admin/cluster-version` and
+  `animus cluster version|finalize`) has landed** (`c4948113` version module + `Metadata` `node_versions`/
   `cluster_version` + `ReportNodeVersion`/`FinalizeClusterVersion`,
   `54c6c81a` handshake extension TLV and era-on refusal hook,
   `04c2bef4` leader-local version observation / precondition P / era
   start, `acf54d7f` era-on refusal of Phase 1 peers and the startup
   cluster-version range check; `crates/animus-control/src/version.rs`,
-  `version_observe.rs`). **P2-B, P2-C and P2-D are not started** — no
+  `version_observe.rs`). **P2-B and P2-D have not landed** (P2-C's Finalize apply-level status check is tracked in #1168) — no
   `required_gate` exists in the code yet (ADR 0073 designs it as an
   exhaustive match on the wire enums). Open issue #1168: the
   `FinalizeClusterVersion` apply does not block on Down/Leaving/
-  never-activated Joining members (Decision 6). Phase 3 not started, no
-  owner or target wave yet.
-
-### B-01 Published benchmarks with disclosed methodology
-
-- **Gap:** `website/index.html` lists "Published benchmarks with disclosed
-  methodology" as Planned and `website/performance.html` commits to a
-  methodology (disclosed hardware, tail percentiles, both read modes
-  apart, a failure case in every run, reproducible, no DynamoDB
-  comparison charts) but there are no numbers and no roadmap entry. What
-  exists is a developer tool, not a publishable suite:
-  `crates/animusd/benches/cluster_bench.rs` (in-process 3-node `ProdEnv`
-  cluster on one host; raw HTTP/1.1 over `TcpStream`, **unauthenticated**
-  — no SigV4; sequential connect-per-request latency classes `PutItem`/
-  `GetItem` (both `ConsistentRead` modes)/`Query`/`Scan`; a **closed-loop**
-  concurrent-`PutItem` sweep; a leader-kill degraded phase; percentiles
-  over sorted samples, so **no coordinated-omission correction**; no
-  workload mix; no warm-up/steady-state split; manual, not in CI),
-  `crates/animus-storage/benches/engine_bench.rs` (single-threaded
-  storage-engine macro-bench, explicitly "not statistical rigor"), and
-  `crates/animus-cp-data/benches/wal_fsync_bench.rs` (a C-05 gating
-  bench: per-group files vs `SharedWal`, `ANIMUS_BENCH_GROUPS`).
-- **Plan:** a separate load-generator binary (new workspace member,
-  proposed `animus-bench`; a real-socket process boundary like
-  `animus-cli`, so it carries individually justified
-  `disallowed_methods` allows) that drives a
-  cluster **as a client** over the real DynamoDB wire with AWS-SDK-shaped,
-  SigV4-signed requests (reuse `animus_dynamo::sigv4::sign` or the AWS SDK as a
-  dependency — decide in the ADR).
-  1. **Workloads:** YCSB A–F mapped onto DynamoDB ops (A 50/50 read/update,
-     B 95/5, C read-only, D read-latest with inserts, E short scans via
-     `Query` on a sort key, F read-modify-write via conditional `UpdateItem`
-     or `TransactWriteItems`), zipfian and uniform key distributions,
-     item size and key count fixed and disclosed. Each read workload runs
-     twice, `ConsistentRead: true` and `false`, reported apart (ADR 0055).
-  2. **Open-loop generation with coordinated-omission correction:** a
-     fixed arrival-rate scheduler (intended send time, not actual), latency
-     measured from the intended time, recorded into an HdrHistogram
-     (`hdrhistogram` crate) — p50/p99/p99.9/p99.99/max; a throughput-vs-
-     latency sweep that finds the knee rather than a single closed-loop
-     number.
-  3. **Phases per run:** load, warm-up (discarded, length disclosed),
-     steady state, **degraded** (kill a node mid-run; a second variant
-     kills the tablet leader), recovery. Extends the existing degraded
-     phase from two op classes to the whole mix.
-  4. **Topology, fixed and disclosed:** separate client and server hosts
-     (not in-process on one box), a named instance type / disk model /
-     network, three nodes RF 3 as the baseline plus one scale-out point,
-     replica placement printed from `/admin` into the results file, TLS and
-     encryption at rest state recorded, `--shared-wal`/quiesce defaults
-     recorded. Results JSON carries git SHA, flags, kernel and hardware.
-  5. **Publication:** a methodology doc (`docs/benchmarks.md`) and a
-     results page generated into `website/` (extend `performance.html`;
-     keep its commitments table true — its "No comparison charts against
-     DynamoDB" row stays unless the maintainer reverses it in the ADR),
-     with raw output committed or attached to a release.
-  6. **Regression tracking:** a scheduled workflow on a **fixed, dedicated
-     runner** (self-hosted or a pinned bare-metal instance), never a shared
-     GitHub-hosted runner — `cluster_bench`'s own doc and the lessons log
-     ("a historical bench figure from a different host is not a baseline")
-     say shared-runner noise makes absolute numbers meaningless. Honest
-     handling: compare only against a baseline run **re-executed on the
-     same host in the same job** (A/B the base commit and the PR), report
-     the run-to-run spread, flag only changes beyond a disclosed
-     threshold, and treat a single outlier as a rerun, not a verdict.
-     Until the dedicated runner exists, the job is manual
-     (`workflow_dispatch`) and uploads artifacts only.
-  7. **Comparison rules (if the maintainer ever wants any):** like for
-     like only — same instance types and counts, same item/key shape,
-     same durability (fsync-acked writes vs the other system's setting),
-     `ConsistentRead` mode matched to the other system's read
-     consistency, replication factor matched, the other system's
-     configuration published in full and ideally reviewed by its own
-     community, versions pinned, and **no managed-service-vs-self-hosted
-     charts** (per `performance.html`). Not planned by default.
-- **Reuse:** `cluster_bench.rs`'s cluster bring-up, leader-kill helper and
-  JSON output shape; the `animusd` `ProdEnv` multi-process launch used by
-  its integration tests; `animus-dynamo`'s SigV4 code; `animus-test`'s
-  history recording for correctness-under-load cross-checks (B-01 can
-  optionally feed R-01's soak).
-- **Files:** new `crates/animus-bench/` (+ its `CLAUDE.md` row in root
-  `CLAUDE.md`), `crates/animusd/benches/cluster_bench.rs` (kept as the
-  in-process smoke), `docs/benchmarks.md`, `website/performance.html`,
-  `website/index.html` (Planned pill), `.github/workflows/bench.yml`.
-- **Tests:** unit tests for the open-loop scheduler and CO correction (a
-  stalled server must show a tail, a property a closed-loop loop hides);
-  the generator's own wire shapes against `animusd` in a `--cluster 3`
-  smoke at tiny sizes; no latency assertions anywhere (that is the
-  flakiness the green invariant forbids) — the regression job reports, a
-  human decides.
-- **ADR:** new ADR (next free number at time of writing: **0074**; renumber
-  if another session claims it first) pinning the workloads, the
-  topology, the CO method and the comparison rules.
-- **PRs:** one workstream PR with milestones: (1) generator crate +
-  workloads A–F + HDR histogram + CO tests, (2) phases incl. node kill +
-  results JSON, (3) methodology doc, ADR, website page, (4) bench workflow
-  (manual dispatch first). The first published numbers need a dedicated
-  host and are a follow-on run, not part of the code PR.
-- **Size:** L for the code and docs; the dedicated runner and the first
-  curated results are an operations task on top.
-- **Depends:** none to start. Feeds C-17 and R-01 (capacity planning).
+  never-activated Joining members (Decision 6) — closed by the P2
+  close-out. **Phase 2 is done (2026-10-04) and Phase 3 is done
+  (2026-10-05)**; see ADR 0073's two 2026-10-05 Phase 3 amendments (design,
+  then as built).
+- **Phase 3 as built (P3-A..P3-F):** `GET /admin/roll-health` (one
+  server-side verdict), the `roll` object in `/admin/cluster-version` and a
+  dashboard Version card (P3-A); `animus cluster roll plan|wait|status`
+  (+ `wait --finalize --yes`; `plan` is re-entrant mid-roll) (P3-B); the new
+  pure `animus-roll` crate and the `sim_cluster_roll_orchestrator` corpus
+  (P3-C); the operator's gated `spec.image` roll behind an operator-owned
+  `StatefulSet` partition, `spec.upgrade`/`status.upgrade` (P3-D); the
+  `upgrade-previous-release` `ProdEnv` CI job (R-1 pinned in
+  `scripts/upgrade-from.txt`, `ac57d56a` until a `v*` tag exists) and the
+  nightly `kind` leg `E2E_UPGRADE=1` (P3-E); docs close-out (P3-F). Supported:
+  a manual or operator-driven rolling upgrade R-1 -> R of a cluster of at
+  least three nodes, ending in an explicit (or opted-in automatic) finalize;
+  no rollback once a node ran the new binary. **Open items:** #1237
+  (ungated `txn-envelope` v2 intent panics an N-1 replica) is fixed (#1240);
+  #1238 is the previous release's own abort-lookback bug (open; rolling from a
+  release older than `efcaa6cb` with transactions carries it), and the
+  transactional roll variant stays off in the previous-release job pending a
+  decision to repin R-1 past `efcaa6cb`; #1235 (a `SimCluster` Memory
+  backend restart oddity); the nightly `kind` leg has not had a verified run;
+  **D4(b)** (a replicated, expiring per-node maintenance mark that suppresses
+  repair churn during a roll, a `Gate::Era` command) is a **pending
+  maintainer decision** now that the D4 measurement exists (ADR 0073 as-built
+  amendment); `roll run --exec` is deferred (maintainer decision 8).
 
 ### C-17 Scale and density testing (per-node tablet density, metadata growth)
 
@@ -1742,8 +1676,8 @@ outstanding on the wire surface at present.
   *operation counts and message volume per tick*, not wall-clock CPU or
   RSS — report counts (messages, proposals, bytes), never "it took X ms".
   **Tier 2 — `ProdEnv` multi-process (RSS, CPU, fds, tasks, latency;
-  manual/scheduled, never a per-push gate).** Reuse B-01's generator and
-  topology: one data node hosting G groups for G in 100/500/1k/5k/10k,
+  manual/scheduled, never a per-push gate).** Reuse `crates/animus-bench`'s generator
+  (ADR 0076) and topology: one data node hosting G groups for G in 100/500/1k/5k/10k,
   each quiesced and each active at a fixed per-group write rate; record
   RSS, CPU, open fds, tokio task count (add a metric if none exists),
   heartbeat frames/s (`heartbeat_batch`), WAL fsync/s (`SharedWal`), idle
@@ -1775,7 +1709,7 @@ outstanding on the wire surface at present.
 - **Reuse:** `SimCluster` (`crates/animusd/src/sim_cluster.rs`,
   `grow`/`drain`/`remove`, the auto-split harness), `idle_engine_cost`'s
   per-engine method, `wal_fsync_bench`, `heartbeat_batch_corpus` (groups
-  per node), the metrics seam, B-01's generator and topology.
+  per node), the metrics seam, `crates/animus-bench`'s generator and topology (ADR 0076).
 - **Files:** new `crates/animusd/src/sim_cluster_scale.rs` (Tier 1),
   `crates/animus-bench/` scale scenarios (Tier 2), possibly one new gauge
   for hosted-group/task counts in `crates/animus-env/src/metrics.rs`,
@@ -1785,10 +1719,10 @@ outstanding on the wire surface at present.
   fault-injecting simulation (node kill and leader transfer during a split
   storm); Tier 2 asserts nothing about timing, it records.
 - **ADR:** an amendment to ADR 0044 (C-03 outcome) and ADR 0039 (evidence),
-  or a new ADR (next free number, **0074** at time of writing) if the
+  or a new ADR (next free number, **0077** at time of writing) if the
   threshold set itself needs a home.
 - **PRs:** one workstream PR: (1) Tier 1 corpus + thresholds ADR text,
-  (2) Tier 2 scenarios on B-01's generator, (3) the first recorded run and
+  (2) Tier 2 scenarios on `animus-bench`'s generator, (3) the first recorded run and
   the C-03/ADR 0039 outcome amendments (needs a real host, so it may land
   as a follow-up commit after a manual run).
 - **Size:** L (Tier 1 is M; Tier 2 is mostly harness reuse plus the
@@ -1802,12 +1736,12 @@ outstanding on the wire surface at present.
   - **Thresholds** were ratified in the ADR 0044 and ADR 0039 amendments
     before the runs; the outcomes are in their 2026-10-04 outcome
     amendments.
-  - **Cliffs filed:** #1180, #1190, #1191, #1192, #1194, #1199.
-  - **Remaining, blocked on B-01's generator:** active groups at a fixed
+  - **Cliffs filed:** #1180 (fixed by #1207), #1190, #1191, #1192, #1194, #1199.
+  - **Remaining, needs `animus-bench` (B-01, now landed):** active groups at a fixed
     write rate, hot-tablet p99, WAL fsync/s under load, cluster node-count
     scaling 3/6/12/24, and a `ProdEnv` wall-clock control InstallSnapshot
     catch-up at 50k tablets (ADR 0039 criterion 1).
-- **Depends:** B-01 (Tier 2 harness and topology; Tier 1 can start now).
+- **Depends:** `animus-bench` (ADR 0076; landed: the Tier 2 harness and topology; Tier 1 can start now).
 
 ### R-01 Production-readiness pass: exit criteria for leaving pre-alpha
 
@@ -1828,13 +1762,14 @@ outstanding on the wire surface at present.
   DynamoDB edge beyond the 1 MiB `MAX_BODY` request cap
   (`crates/animus-node/src/http.rs`) and per-table throttling (ADR 0065).
   Disk-full is injected in simulation (`animus-sim` `DiskConfig`,
-  `StorageFull`) but its behaviour on real nodes is untested.
+  `StorageFull`); handling landed with (d) (issue #1185), but its behaviour on
+  real nodes is still untested.
 - **Plan:** define **beta exit criteria** as a checklist in a new
   `docs/production-readiness.md` (ratified by the ADR), each item
   checkable and owned by a sub-track below. Beta means: every criterion
   is green or has an explicit, signed-off waiver listed in the doc.
   Sub-tracks, with independence marked:
-  - **(a) Soak (independent after B-01's generator exists; M-L).** A
+  - **(a) Soak (independent; builds on `animus-bench`'s generator, ADR 0076; M-L).** A
     multi-day run on real processes (`animusd` per node, the operator on
     `kind` or bare multi-process) with a continuous recorded workload;
     record the client history and run the existing `animus-test` oracles
@@ -1842,6 +1777,16 @@ outstanding on the wire surface at present.
     `crates/animus-test/src/check.rs`) over it; add resource-trend
     assertions (RSS, fds, disk, WAL/compaction backlog stay bounded).
     Exit: 7 consecutive days, zero oracle violations, no monotone growth.
+    **Harness landed 2026-10-05** ([`docs/soak.md`](soak.md)): bare
+    multi-process leg (`crates/animusd/tests/soak.rs`, opt-in `soak`
+    feature, reusing `chaos_support/`), epoch-bounded history with the three
+    oracles plus cold-data re-verification per epoch, per-node RSS/fd/
+    thread/disk/WAL/SSTable-count/queue-gauge sampling with the pure
+    `animus_test::soak` trend detector (unit-tested), and
+    `.github/workflows/soak.yml` (short leg; non-required). **Not done:**
+    the 7-day run itself (dedicated hardware), the operator-on-`kind` leg,
+    reuse of `animus-bench`'s generator (it records latency, not an
+    oracle-checkable history; the chaos recorder is used instead).
   - **(b) Real-cluster chaos (independent; L).** Process kill,
     network partition, clock skew, disk full, slow disk. On k8s via the
     operator (Chaos Mesh `PodChaos`/`NetworkChaos`/`IOChaos`/`TimeChaos`
@@ -1851,6 +1796,21 @@ outstanding on the wire surface at present.
     oracles; the sim corpora remain the correctness proof, this checks
     the `ProdEnv` seams the sim cannot (ADR 0003: sim proves logic and
     ordering, not real-thread liveness).
+    **First PR landed 2026-10-04** ([`docs/chaos.md`](chaos.md)): the bare
+    multi-process leg only (no root needed: a userspace loopback fault
+    proxy instead of `tc netem`), `crates/animusd/tests/chaos.rs` +
+    `chaos_support/` behind the opt-in `chaos` feature, scenarios `smoke`/
+    `kill`/`partition`/`pause`/`delay`/`mixed` (process `kill -9` incl. the
+    control leader and a full power cut, per-link partitions incl. one-way,
+    SIGSTOP, delay), the recorded DynamoDB-wire history fed unchanged to
+    `check_cycles`/`check_durability`/`check_convergence` plus eventual-read
+    prefix and transaction-atomicity checks, `.github/workflows/chaos.yml`
+    (non-required). **Not done:** clock skew, slow disk and packet loss
+    (Kubernetes-only designs in `deploy/chaos/`, pinned and unvalidated),
+    real-process disk full (the node-side handling landed with (d), #1185;
+    the real size-limited-filesystem leg is still open). **Its first runs found a real
+    violation** (acknowledged writes lost on keys touched by an aborted
+    cross-tablet transaction; see `docs/chaos.md`, "Findings").
   - **(c) Fuzzing (independent; M).** `cargo-fuzz` targets for every
     untrusted parser: DynamoDB JSON request decode and expression
     parsers (`animus-dynamo`: UpdateExpression, ConditionExpression,
@@ -1870,7 +1830,13 @@ outstanding on the wire surface at present.
     limits and admission control with a defined overload response (a DynamoDB-shaped throttling/unavailable error code as W-08 already
     does per table, never unbounded queuing), and define disk-full behaviour (the node goes
     read-only or refuses writes with a named error and recovers when
-    space returns; never corrupts or acks a write it cannot fsync). Each
+    space returns; never corrupts or acks a write it cannot fsync).
+    **Disk-full landed (issue #1185, 2026-10-05):** ENOSPC marks the WAL suspect,
+    writes are refused with a named 503 `StorageFull`, and the WAL is rewritten
+    from the in-memory log onto free space without a restart (sim corpus
+    `ANIMUS_DISK_FULL_SEEDS`; `docs/resource-bounds.md` section 3). LSM-engine ENOSPC (#1218) and leader step-down (#1219)
+    have since landed. **Still open:** exporting `spawned_task_panics` and a
+    `ProdEnv` tmpfs test. Each
     bound gets a sim test with fault injection where possible and a
     `ProdEnv` test where not.
   - **(e) Operations runbook (independent; M).** `docs/runbook/`: node
@@ -1879,11 +1845,11 @@ outstanding on the wire surface at present.
     needed; none exists today), backup/restore and PITR drill (ADR 0059),
     cert rotation (ADR 0064 section on restart-time `TlsConfig::load()`),
     encryption key rotation (ADR 0069), upgrade procedure per ADR 0073
-    (whole-cluster today; rolling after C-16 Phase 3), capacity planning
-    (numbers from B-01 and C-17), disk sizing, and a game-day drill
+    (whole-cluster and rolling, C-16 Phase 3 done), capacity planning
+    (numbers from `animus-bench` (ADR 0076) and C-17), disk sizing, and a game-day drill
     checklist actually executed once on `kind`.
   - **(f) Observability completeness (independent; M).** SLO definitions
-    (availability, p99 latency per op class from B-01) and alert rules as
+    (availability, p99 latency per op class from `animus-bench`) and alert rules as
     shipped YAML (Prometheus rules) plus a dashboard JSON; a test that
     every metric name referenced in `docs/` and `website/` exists in
     `crates/animus-env/src/metrics.rs` and appears in `/admin/metrics`
@@ -1929,8 +1895,8 @@ outstanding on the wire surface at present.
   independent change, which `CLAUDE.md` Session operating mode item 3
   allows; it is not a stack.
 - **Size:** XL in total (c, e, f, g are M each; a, b, d are L).
-- **Depends:** (e) upgrade chapter needs C-16 Phase 3 (rolling upgrades);
-  (e) capacity planning and (a) need B-01; (e)/(d) sizing use C-17;
+- **Depends:** (e) upgrade chapter needs C-16 Phase 3 (rolling upgrades, done);
+  (e) capacity planning and (a) need `animus-bench` (ADR 0076; its first curated run is pending); (e)/(d) sizing use C-17;
   (b) real-cluster chaos benefits from the operator e2e leg staying
   green. (c), (f), (g) depend on nothing.
 
@@ -2013,7 +1979,11 @@ outstanding on the wire surface at present.
      model is part of the work.
 - **Plan (staged, each stage independently valuable and mergeable):**
   - **G-a Topology-aware single-cluster operator (S-M, independent, do
-    now).** Add a labels input to `ClusterConfig`/`animusd` flags
+    now). LANDED 2026-10-04 (branch `g01-a-topology-placement`; see the ADR 0005/0060
+    2026-10-04 amendments): labels input (`--label`/`--labels-file`/config
+    `labels`), operator node-topology annotations + spread hints, zone-spread
+    default policy, `sim_cluster_zone_placement` corpus. Known limits: policy
+    fixed at table creation; labels fixed at first registration.** Add a labels input to `ClusterConfig`/`animusd` flags
     (additive `#[serde(default)]`, ADR 0035 discipline, ADR 0073 format
     rules) so a node self-registers with labels; have the operator inject
     the pod's node `topology.kubernetes.io/region` and `/zone` labels
@@ -2032,8 +2002,24 @@ outstanding on the wire surface at present.
     `DescribeTable` replica fields, `MultiRegionConsistency`), the ADR 0072
     limits catalogue entries (compiled-in, AWS-faithful), and gate every
     new `Metadata`/wire surface behind the ADR 0073 Phase 2 cluster-version
-    gate. Next free ADR number: **0074** at time of writing.
-  - **G-c MRSC as a geo-distributed per-tablet Raft group (L, likely the
+    gate. Next free ADR number: **0075** at time of writing.
+  - **G-c MRSC as a geo-distributed per-tablet Raft group — LANDED
+    2026-10-05 (ADR 0075 "G-c as built"; one PR, #1225).** `UpdateTable`
+    `ReplicaUpdates` + `MultiRegionConsistency: STRONG` (3 regions, or 2 +
+    a witness) on an empty table converts it; behind `Gate::GlobalTables`
+    (cluster version 2, `animus cluster finalize`). Region-pinned one-per-
+    region placement with in-region repair, the preferred-leader mechanism,
+    witness hiding, MRSC restrictions (no TTL/LSI/transactions), the
+    `DescribeTable` fields, `/admin/global-tables`, `animus table
+    preferred-leader`, the decommission guard, `spec.maxRegionRttMs`, and the
+    `sim_cluster_mrsc` + `preferred_leader_corpus` corpora (nightly in
+    `corpus-deep.yml`). **Residuals:** no quiescence benefit on
+    WAN groups (#1226); witness may transiently lead (no campaign
+    suppression); control-voter region placement is not enforced (only
+    warned about); AWS field names/error texts unverified against the live
+    API; no WAN cost numbers (`animus-bench` cross-region variant); no lease
+    reads. The original design notes follow.
+  - **(Design notes) G-c MRSC as a geo-distributed per-tablet Raft group (L, likely the
     cheapest wire-visible mode).** Reuses the CP machinery: a table whose
     replicas are placed across regions by residency/failure-domain labels
     (region key), WAN-tuned election and heartbeat timeouts per group,
@@ -2042,14 +2028,42 @@ outstanding on the wire surface at present.
     `reconfigure_step` path. Needs one logical cluster spanning regions
     (control plane included: quorum placement across at least 3 regions);
     this is "stretch cluster", not federation. Measured cost goes into
-    B-01's results (cross-region topology variant).
+    `animus-bench`'s results (ADR 0076; cross-region topology variant).
+    **Groundwork landed (branch `g01-c-wan-groundwork`, ADR 0075's
+    2026-10-04 amendment):** the per-group WAN Raft timing profile
+    (`animus_control::timing`, `RaftCore::set_timing`, wired into the cp-data
+    reconciler and the control group, `max_region_rtt_ms` /
+    `--max-region-rtt-ms`), the region-aware control-voter admin check, and the
+    `ANIMUS_WAN_TIMING_SEEDS` corpus with a LAN-forced negative control. It is
+    node-local and derived from existing `Member.labels`: no replicated field,
+    command or format change. **Still gated on P2-B/P2-C:** preferred-leader
+    placement, `ReplicaUpdates` mapping, the MRSC table mode and wire surface;
+    **still open independent of the gate:** control-only voters' labels (need
+    G-a's config-borne labels) and the `gen-config` warning.
   - **G-d MREC async replication with LWW (XL).** The agent in item 5
     above, plus replicated-TTL, stream parity and a multi-cluster
     `SimCluster` WAN corpus (seeded partitions, duplicate/reordered
     delivery, region failure and heal, concurrent conflicting writes from
     both regions: convergence and LWW determinism asserted by
     `check_convergence`-style oracles).
-  - **G-e Operator multi-cluster federation (L).** One `AnimusCluster` per
+    **Landed 2026-10-06 (ADR 0075 "G-d as built (M0-M6)"), simulation-proven**
+    behind `Gate::MrecReplication` (cluster version 3): `UpdateTable
+    ReplicaUpdates` create/delete saga, stamped LWW apply, per-(tablet, peer)
+    shipper, TTL sync, split lineage by unfiltered scan, the `SimWorld`
+    multi-cluster corpus (`ANIMUS_MREC_SEEDS`, nightly), the `/admin/global-tables`
+    MREC rows and one real-process two-cluster test over mutual TLS. **Residuals:**
+    no WAN cost or latency number (the `animus-bench` cross-region variant is
+    still owed); cluster-wide lag
+    aggregation and alerting; AWS wire
+    names unverified (ADR 0075 section 0); the other gaps are listed at the end
+    of the ADR's amendment.
+  - **G-e Operator multi-cluster federation (L) - MREC half built
+    2026-10-06** (`spec.region`/`spec.peers`, peer CA trust (MREC-only via `peer_ca_path`, issue #1253), NetworkPolicy,
+    `PeerReachable`; ADR 0075 "G-e as built"). **Residuals:** the two-cluster
+    `kind` e2e is unwritten and nothing is verified against a real API server;
+    stretch-segment federation (MRSC over several Kubernetes clusters), peer
+    endpoint auto-discovery and a source-address peer NetworkPolicy stay
+    deferred. Original scope: One `AnimusCluster` per
     Kubernetes cluster/region plus a federating resource or peer spec
     (cross-cluster endpoint discovery, peer TLS trust per ADR 0064,
     NetworkPolicy/egress for the peer ports, ordered replica-add on
@@ -2080,8 +2094,8 @@ outstanding on the wire surface at present.
 - **Size:** XL in total (G-a S-M, G-b S, G-c L, G-d XL, G-e L).
 - **Depends:** G-a and G-b: none, start now. G-c, G-d, G-e: ADR 0073
   Phase 2 (C-16: a replicated cluster version / feature gate, so the new
-  `Metadata` and wire surfaces are not unguarded; P2-A has merged, P2-B..D
-  have not), G-b, and ADR 0072 limits. G-c benefits from B-01 to quantify
+  `Metadata` and wire surfaces are not unguarded; P2-A and P2-C have landed, P2-B and
+  P2-D have not), G-b, and ADR 0072 limits. G-c benefits from `animus-bench` (ADR 0076) to quantify
   WAN cost. Reverses the global-tables clause of section 6.
 
 ## 4. Operator surfaces: admin API, dashboard, console, CLI
@@ -2171,10 +2185,10 @@ wave are independent and can run in parallel.
 | 14 | C-13 (closed 2026-09-13 — all seven PRs landed — seed/join discovery under `SimCluster`, ADR 0061 rung M) | Gated on C-12 (closed) — the next unowned residual group per C-08's through C-12's own close-outs |
 | 15 | C-14 (closed 2026-09-14 — all five PRs landed: #876, #884, #886, #887, plus PR 5 — combined control-plane voter growth under `SimCluster`, ADR 0061 rung N) | Gated on C-13 (closed) — the one residual C-13 PR 6 named precisely: a fresh `RaftNode<SimEnv>` joining the live control quorum after construction |
 | 16 | C-15 (closed 2026-09-20 — node assembly/raw `ClientRequest` assess-and-close, ADR 0061 rung O, #997) | Gated on C-14 (closed) — the last class-D group C-14's own close-out confirmed still unowned |
-| 17 | B-01 (benchmarks); S-08 (S3 credentials/multipart; landed 2026-10-04); G-01 stage G-a + G-b (topology-aware operator, global-tables ADR); R-01 sub-tracks c (fuzzing), f (observability), g (release engineering) | All independent of each other and of the open C-16 phases; no ordering constraint |
-| 18 | C-17 (scale/density), R-01 sub-tracks a (soak), b (chaos), d (resource bounds), e (runbook) | C-17 Tier 2 and R-01 (a)/(e) capacity planning need B-01's generator; C-17 Tier 1 and R-01 (b)/(d) can start earlier |
-| 19 | G-01 stages G-c (MRSC stretch), G-d (MREC), G-e (federation) | After C-16 Phase 2 (P2-B..D: cluster-version/feature gate) and the G-b ADR; G-c wants B-01 to quantify WAN cost |
-| 20 | R-01 runbook upgrade chapter | After C-16 Phase 3 (rolling upgrades) |
+| 17 | S-08 (S3 credentials/multipart; landed 2026-10-04); G-01 stage G-a + G-b (topology-aware operator, global-tables ADR); R-01 sub-tracks c (fuzzing), f (observability), g (release engineering) | All independent of each other and of the open C-16 phases; no ordering constraint |
+| 18 | C-17 (scale/density), R-01 sub-tracks a (soak), b (chaos), d (resource bounds), e (runbook) | C-17 Tier 2 and R-01 (a)/(e) capacity planning need `animus-bench`'s generator (landed, ADR 0076); C-17 Tier 1 and R-01 (b)/(d) can start earlier |
+| 19 | G-01 stage G-e (federation); G-c (MRSC stretch) landed 2026-10-05, G-d (MREC) 2026-10-06 | G-c: done (ADR 0075 "G-c as built"; residuals under G-01 above). G-d: done 2026-10-06, simulation-proven (ADR 0075 "G-d as built"; gate `MrecReplication`, version 3; residuals under G-01 above). G-e: still open (C-16 Phase 2 is done; it adds its own gate if it needs one). `animus-bench` (ADR 0076) cross-region variant still owed to quantify WAN cost |
+| 20 | R-01 runbook upgrade chapter | C-16 Phase 3 (rolling upgrades) is done: `docs/runbook/upgrade.md` carries the rolling and operator procedures |
 
 Open issues mapped: none left (#375 closed by W-01, #319 by W-05). Filed
 from wave 2's own findings: #590 (the operator still emits the deleted

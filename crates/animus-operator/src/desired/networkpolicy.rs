@@ -187,6 +187,16 @@ fn s3_endpoint_ports(s3: &crate::crd::S3StoreSpec) -> BTreeSet<i32> {
     ports
 }
 
+/// The distinct ports of every `spec.peers[].endpoints` entry (G-e), sorted.
+fn peer_endpoint_ports(spec: &AnimusClusterSpec) -> BTreeSet<i32> {
+    spec.peers
+        .iter()
+        .flat_map(|p| p.endpoints.iter())
+        .filter_map(|e| crate::crd::peer_endpoint_port(e))
+        .map(i32::from)
+        .collect()
+}
+
 /// Build the `NetworkPolicy` for `cluster`.
 #[must_use]
 pub fn build(cluster: &AnimusCluster, spec: &AnimusClusterSpec) -> NetworkPolicy {
@@ -273,6 +283,29 @@ pub fn build(cluster: &AnimusCluster, spec: &AnimusClusterSpec) -> NetworkPolicy
                 ports: Some(ports.into_iter().map(tcp_port).collect()),
             });
         }
+    }
+
+    // G-01 stage G-e (ADR 0075 section 5.4): MREC peer federation. A
+    // `NetworkPolicy` cannot match a DNS name, and peer endpoints are
+    // user-supplied names (LoadBalancer or multi-cluster DNS), so the rules
+    // are port-scoped, not address-scoped: egress to each peer endpoint's
+    // port on any destination, and ingress on the **intra** port only from
+    // any source. Peer authentication is mutual TLS on that port (ADR 0064;
+    // an unauthenticated peer is only possible with the dev-only
+    // `allowInsecurePeers`), not network location. The client (dynamo), admin
+    // and console ports are never opened to peers (ADR 0047). Absent entirely
+    // when `spec.peers` is empty: a cluster with no peers is byte-identical.
+    let mut ingress = ingress;
+    let peer_ports = peer_endpoint_ports(spec);
+    if !peer_ports.is_empty() {
+        ingress.push(NetworkPolicyIngressRule {
+            from: None,
+            ports: Some(vec![tcp_port(intra_port)]),
+        });
+        egress.push(NetworkPolicyEgressRule {
+            to: Some(vec![ip_block_peer("0.0.0.0/0"), ip_block_peer("::/0")]),
+            ports: Some(peer_ports.into_iter().map(tcp_port).collect()),
+        });
     }
 
     NetworkPolicy {
@@ -633,5 +666,100 @@ mod tests {
             ports,
             vec![Some(IntOrString::Int(20000)), Some(IntOrString::Int(20004))]
         );
+    }
+}
+
+#[cfg(test)]
+mod peers_tests {
+    use super::*;
+    use crate::crd::PeerSpec;
+    use crate::desired::test_support::test_cluster;
+
+    fn ports(r: &[NetworkPolicyPort]) -> Vec<i32> {
+        r.iter()
+            .map(|p| match p.port {
+                Some(IntOrString::Int(i)) => i,
+                _ => panic!("named port"),
+            })
+            .collect()
+    }
+
+    fn federated() -> AnimusCluster {
+        let mut c = test_cluster("c", "ns", 3, None);
+        c.spec.region = Some("us".into());
+        c.spec.peers = vec![
+            PeerSpec {
+                region: "eu".into(),
+                endpoints: vec!["eu.example.com:14004".into(), "eu2.example.com:443".into()],
+                ca_secret_ref: None,
+            },
+            PeerSpec {
+                region: "ap".into(),
+                endpoints: vec!["ap.example.com:14004".into()],
+                ca_secret_ref: None,
+            },
+        ];
+        c
+    }
+
+    #[test]
+    fn no_peers_leaves_the_policy_unchanged() {
+        let c = test_cluster("c", "ns", 3, None);
+        let spec = build(&c, &c.spec).spec.unwrap();
+        assert_eq!(spec.ingress.unwrap().len(), 3);
+        assert_eq!(spec.egress.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn peers_add_an_egress_rule_for_exactly_the_endpoint_ports() {
+        let c = federated();
+        let egress = build(&c, &c.spec).spec.unwrap().egress.unwrap();
+        assert_eq!(egress.len(), 3);
+        let rule = &egress[2];
+        assert_eq!(ports(rule.ports.as_ref().unwrap()), vec![443, 14004]);
+        let cidrs: Vec<_> = rule
+            .to
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|p| p.ip_block.as_ref().unwrap().cidr.clone())
+            .collect();
+        assert_eq!(cidrs, vec!["0.0.0.0/0", "::/0"]);
+    }
+
+    #[test]
+    fn peers_add_ingress_on_the_intra_port_only_and_never_the_client_port() {
+        let c = federated();
+        let ingress = build(&c, &c.spec).spec.unwrap().ingress.unwrap();
+        assert_eq!(ingress.len(), 4);
+        let peer_rule = &ingress[3];
+        assert!(
+            peer_rule.from.is_none(),
+            "any source: DNS names cannot be matched"
+        );
+        assert_eq!(ports(peer_rule.ports.as_ref().unwrap()), vec![14004]);
+        // The only any-source ingress rules are the pre-existing dynamo rule
+        // and the new intra rule; admin (14003), internal (14000), client
+        // (14001) and console (14005) are never open to every source.
+        let open: Vec<i32> = ingress
+            .iter()
+            .filter(|r| r.from.is_none())
+            .flat_map(|r| ports(r.ports.as_ref().unwrap()))
+            .collect();
+        assert_eq!(open, vec![14002, 14004]);
+        for closed in [14000, 14001, 14003, 14005] {
+            assert!(
+                !open.contains(&closed),
+                "{closed} must not be open to peers"
+            );
+        }
+    }
+
+    #[test]
+    fn peer_ports_follow_a_custom_base_port_for_ingress() {
+        let mut c = federated();
+        c.spec.base_port = Some(20000);
+        let ingress = build(&c, &c.spec).spec.unwrap().ingress.unwrap();
+        assert_eq!(ports(ingress[3].ports.as_ref().unwrap()), vec![20004]);
     }
 }

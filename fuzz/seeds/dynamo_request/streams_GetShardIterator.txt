@@ -1,0 +1,2 @@
+streams:GetShardIterator
+{"StreamArn": "arn:aws:dynamodb:us-east-1:000000000000:table/t/stream/x", "ShardId": "shardId-1-2", "ShardIteratorType": "AFTER_SEQUENCE_NUMBER", "SequenceNumber": "100000000000000000001"}

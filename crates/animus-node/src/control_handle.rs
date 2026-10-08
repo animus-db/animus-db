@@ -614,6 +614,17 @@ impl<E: Env, R: RelayClient> ControlHandle<E, R> {
         }
     }
 
+    /// Whether this node's own control WAL is suspect after an ENOSPC and
+    /// awaiting its rewrite onto free space (R-01 (d), ADR 0074 §2) — see
+    /// `RaftNode::is_storage_full`. `Remote` has no local control WAL, so it
+    /// is always `false`.
+    pub fn is_storage_full(&self) -> bool {
+        match self {
+            Self::Local(raft) => raft.is_storage_full(),
+            Self::Remote(_) => false,
+        }
+    }
+
     /// This handle's election-timeout base, for sizing a `leader_within`
     /// grace window (e.g. `animusd::admin::health`'s `HEALTH_LEADER_GRACE`).
     /// `Remote` has no local `RaftCore` at all, so it answers the same

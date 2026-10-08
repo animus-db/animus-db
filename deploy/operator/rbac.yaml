@@ -59,6 +59,22 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
+  # G-01 stage G-a (ADR 0060's 2026-10-04 amendment): the operator patches
+  # each scheduled pod's node topology (region/zone) onto the pod as
+  # annotations (`animus.io/topology-*`), which animusd reads back through a
+  # downward-API volume. The ONLY pod write this operator performs —
+  # annotations only; pods remain owned by the StatefulSet controller.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["patch"]
+  # Read-only, cluster-scoped: the downward API cannot expose a *node's*
+  # labels, so the operator reads `topology.kubernetes.io/{region,zone}` off
+  # the Node a pod was scheduled to. Without this (an older rbac.yaml) pods
+  # still start — animusd waits out its bounded --labels-wait-secs and
+  # registers without topology labels.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
   # The pod-proxy subresource: how every admin-port call (the scale-down
   # drain sequence, `crate::admin_client::ProxyAdminClient`) reaches a
   # pod's admin port by default (`--admin-access proxy`) — a `GET` through

@@ -15,7 +15,9 @@ architecture map calls out: seed/intra node-to-node traffic stays
 cluster-internal, only the DynamoDB wire edge is exposed.
 
 **This crate does not depend on `animusd`, `animus-env`, or any other
-workspace crate.** It only has to *emit* JSON `animusd` can parse and a
+workspace crate — with one exception: `animus-roll` (ADR 0073 Phase 3), the
+pure, I/O-free rolling-upgrade state machine `animus cluster roll` shares with
+the operator's partition driver (`src/roll.rs`).** It only has to *emit* JSON `animusd` can parse and a
 shell script that execs the right `animusd` invocation — a hand-written
 mirror of `animusd::config::ClusterConfig`/`RoleAddrs`'s serde shape avoids
 pulling the whole node-server dependency tree into a Kubernetes-controller
@@ -25,6 +27,7 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
 
 ## Entry points
 
+- `src/roll.rs` — the rolling-upgrade driver (see "Rolling upgrades" below).
 - `src/crd.rs` — the `AnimusCluster` type (`kube::CustomResource` derive):
   `AnimusClusterSpec`/`AnimusClusterStatus`/`StorageSpec`/
   `ClientServiceSpec`/`ClusterCondition`/`ClusterPhase`/`TlsSpec`/
@@ -1321,6 +1324,62 @@ name, per-version expected value, `panic!` on an unrecognised version. Every `An
 `schemaVersion: 1`; regenerate `deploy/operator/crd.yaml` after touching the
 spec type.
 
+## Rolling upgrades (ADR 0073 Phase 3, P3-D)
+
+Every pod-template change (a `spec.image` edit **and** a config-hash change such as a
+`spec.controlNodes` growth) is rolled one pod at a time under the `animus-roll` gate; there is
+no ungated window. Mechanism: `src/roll.rs` (pure `stage`/`drive`/`hold_edits`/`pdb_start_gate`
+plus the `observe`/`execute`/`step` shell), wired in `controller::finish_reconcile` (partition
+decided *before* the `StatefulSet` apply) and `controller::reconcile` (edit holds at the top).
+
+- **`RollingUpdate` with an operator-owned `partition`, never `OnDelete`** (no pod-delete RBAC;
+  `deploy/operator/rbac.yaml` is unchanged). Every apply carries `updateStrategy`
+  (`desired::statefulset::build_with_partition`).
+- **The first apply of a changed template carries `partition = replicas`** (`Stage::Start`).
+  "Changed" is a fingerprint of the whole pod template stamped on the StatefulSet's *metadata*
+  (`TEMPLATE_HASH_ANNOTATION`, deliberately not on the template so it never rolls a pod). A
+  StatefulSet from an older operator has none: it is compared by image + config hash, and a
+  template with neither is adopted as unchanged (never guess a roll into existence).
+- **Never read stale controller status as "done".** `StsView::status_current` compares
+  `observedGeneration` to `metadata.generation`; until it holds the partition is left exactly as
+  stored (`Stage::Hold`). Resetting it to 0 off stale revisions would roll everything ungated.
+- **One step per `ok`**: `animus_roll::decide_with_target` is asked about the pod the partition
+  is about to admit (the highest old ordinal below it; the StatefulSet's order, not the
+  machine's own), then `Restart` lowers the partition to that ordinal, `Wait`/`Blocked`/`Soak`/
+  `AwaitEra` hold, `Complete`/`ReadyToFinalize`/`Finalize` mean partition 0. A control leader that
+  is next gets `POST /admin/control/transfer` first; the partition holds that reconcile.
+- **Fail closed**: an unobservable gate (no `Ready` pod answers, admin unreachable) holds the
+  partition and sets `UpgradeBlocked`. A pod that is not `Ready` is `Unreachable` without a call;
+  a `404` on `roll-health`/`cluster-version` is `Unavailable` (a previous-release node). A first
+  roll over Phase 1 binaries has no `cluster-version` at all: the members come from `GET
+  /admin/status`, the era is reported inactive, the roll ends in "waiting for the era".
+- **`goal` is derived from live truth**: the highest `own_range.max` a *new-binary* pod reports,
+  floored at `active`. A config-only roll therefore has `goal == active` and waits for no era and
+  no finalize. Soak (`spec.upgrade.soakSeconds`) and stall (15 min) are the operator's own wall
+  clocks, recorded as epoch seconds in `status.upgrade` (`WallClock`; fixed in tests).
+- **Holds, not rejections**: while a roll is in flight (`partition > 0` or revisions differ) a
+  `spec.nodes` / `spec.controlNodes` edit is pinned to what is running, and a `spec.image` revert
+  after a pod reported the new range is pinned to the roll's target (`UpgradeChangesHeld`; the
+  webhook refuses the same revert outright via `validate_image_revert`, which needs the old
+  object's `status.upgrade`). A revert before any pod reported is free. A *different* image
+  mid-roll is the fix-forward path: `Start` again, partition back to `replicas`.
+- **PDB `maxUnavailable` 0 refuses to start** (`pdb_start_gate`): the template is staged with
+  `partition = replicas` (nothing rolls), `UpgradeBlocked` says why. Consequence: a `controlNodes`
+  growth that lands on a PDB-0 shape (e.g. 1 -> 2) is also staged and never rolls; use the
+  whole-cluster stop-upgrade-restart. `spec.upgrade.finalize: Auto` finalizes only when the
+  machine says `Finalize` (`can_finalize`, no blocker, soak elapsed): on the leader's
+  `POST /admin/cluster-version/finalize {to, expected}`; a failure is retried, never forced.
+- `status.upgrade` is additive and never removed (a merge patch cannot drop a key): its fields
+  serialize as explicit `null`s so clearing a clock really clears it. Conditions:
+  `UpgradeInProgress`, `UpgradeBlocked`, `UpgradeFinalizePending`, `RollComplete`,
+  `UpgradeChangesHeld`. Fixture: `tests/fixtures/formats/animuscluster-spec/v1-upgrade.json`.
+- **Operator upgrade side effect**: the first reconcile by this version over an existing cluster
+  stamps the fingerprint (metadata only, no roll). A later template-builder change rolls the
+  cluster through the gate like any other template change (it used to roll ungated).
+- Tests: `src/controller/roll_tests.rs` (reconcile level over the fakes), `src/roll.rs` tests
+  (pure), `desired::statefulset` tests. They prove the operator's decisions, **not** Kubernetes'
+  partition semantics (the kind e2e is the only thing that does).
+
 ## Tests
 
 `cargo test -p animus-operator` — every `desired::*` builder module has its
@@ -1778,3 +1837,95 @@ reasons. If `scripts/e2e-kind.sh` fails at the `kind create cluster` phase
 with this exact `runc`/`EOF` signature in the diagnostics dump, this is
 almost certainly it — check `docker run --cap-add SYS_RESOURCE ... echo ok`
 first before debugging anything else.
+
+## G-01 stage G-a: topology (2026-10-04)
+
+- `desired::topology`: constants + the pure `pod_annotation_patch`. The
+  controller's `resolve_pod_topology` (end of `finish_reconcile`, best effort)
+  lists the cluster's pods, reads each scheduled pod's Node labels and patches
+  `animus.io/topology-{region,zone,resolved}` onto the pod; new `ClusterApi`
+  methods `list_pods`/`get_node_labels`/`patch_pod_annotations` (+ fakes).
+  RBAC: `nodes` get/list/watch, `pods` patch (`deploy/operator/rbac.yaml`).
+- StatefulSet: zone `topologySpreadConstraints` (ScheduleAnyway) + preferred
+  hostname anti-affinity (`spec.topology.spread`, default true), and a
+  downward-API volume of `metadata.annotations` at `/etc/animus/topology`;
+  the entrypoint passes `--labels-file ... --labels-file-annotations
+  --labels-wait-secs 180`. The config-hash literal changed on purpose.
+- Operator and `animusd` image ship together (an old image rejects the flags).
+  kind e2e labels the node and asserts annotations + registered member labels
+  (could not be run in the authoring sandbox).
+
+**e2e topology assertion is polled, not one-shot (2026-10-04).** The G-01 G-a
+check that `/admin/status` shows >=3 members labelled with the kind node's zone
+runs under `wait_for`: pod Ready does not imply each node's background
+`RegisterNode` has committed and reached the serving replica (run 37201459207
+saw e2e-0 with empty labels right after readiness). See
+`docs/lessons/testing/2026-10-04-e2e-pod-ready-does-not-mean-registered.md`.
+
+## `spec.maxRegionRttMs` (ADR 0075 section 3.4, G-01 G-c)
+
+Additive optional `AnimusClusterSpec.max_region_rtt_ms` (`maxRegionRttMs`),
+rendered into `cluster.json`'s `cluster_settings.max_region_rtt_ms` through the
+`ClusterSettings` mirror (`desired::cluster_config`), exactly like
+`quiesceAfterSecs`. Unset keeps `cluster_settings` absent (byte-identical to
+before); `schemaVersion` stays 1 (an additive optional field needs no new
+version, and the golden fixture is untouched). `deploy/operator/crd.yaml` is
+regenerated (`cargo run -p animus-operator -- crd > deploy/operator/crd.yaml`;
+`crd_manifest_pinned` fails otherwise). Inert on a single-region or unlabelled
+cluster. The supported stretch shape is one `AnimusCluster` on a Kubernetes
+cluster spanning the Regions; the `kind` e2e cannot run a stretch topology (and
+cannot run at all in the sandbox), so stretch behaviour is proven only in
+`SimEnv` (`animusd` `sim_cluster_mrsc`).
+
+
+## `E2E_UPGRADE=1`: the nightly operator-driven roll on `kind` (ADR 0073 Phase 3, D10)
+
+`scripts/e2e-kind.sh`'s `E2E_UPGRADE=1` leg (workflow
+`.github/workflows/upgrade-kind-nightly.yml`, nightly 04:07 UTC +
+`workflow_dispatch`; NOT per push, it builds two release images and rolls a
+4-node cluster) bootstraps the cluster on the **previous-release** image
+(`ANIMUSD_IMAGE_PREV`, built from the ref in `scripts/upgrade-from.txt` with
+that ref's own `Dockerfile`), applies `spec.upgrade.finalize: Auto`, runs the
+usual plain-TCP phases (so the table exists, the cluster is scaled to 4 and
+`controlNodes` grown), then starts an **in-cluster** `curlimages/curl` write
+loop against `svc/{name}-dynamo` (each write retried up to 60 s, then a STALL;
+in-cluster because a host port-forward pins one pod and dies when it restarts),
+patches `spec.image` to `ANIMUSD_IMAGE`, and polls every 2 s until
+`status.upgrade.phase=Complete`. It asserts: the partition was held at
+`replicas` and reached 0, `InProgress` was seen, the minimum `readyReplicas`
+across the roll was `>= replicas-1`, every pod is on the new image,
+`RollComplete=True`, `GET /admin/cluster-version` shows `era_active` and
+`active == own_range.max` (the operator finalized), and after the client stops
+every acked write reads back with `ConsistentRead` and none stalled.
+**UNVERIFIED in the sandbox** (`kind` cannot run here): `bash -n` and a YAML
+parse only (no `shellcheck`/`actionlint` installed); a first nightly failure is
+this leg's first real run. It is plain-TCP only (fails fast with
+`E2E_TLS`/`E2E_S3_TLS`). Known risk: the previous-release (Phase 1) binary must
+accept the config this operator renders; a rejected flag would show as a pod
+that never goes Ready *before* the roll starts.
+
+## MREC peer federation (ADR 0075 section 5.4, G-01 stage G-e)
+
+- **CRD:** `spec.region`, `spec.peers[]` (`PeerSpec`: `region`, `endpoints`
+  host:port of the peer intra port, `caSecretRef{name,key}`), `spec.allowInsecurePeers`
+  (dev), `spec.mrecMaxClockSkewMs`; all additive and skipped when unset (so the
+  config hash of an existing cluster is unchanged). Golden fixture
+  `tests/fixtures/formats/animuscluster-spec/v1-peers.json`; `deploy/operator/crd.yaml`
+  regenerated (`cargo run -p animus-operator -- crd`; pinned by `crd_manifest_pinned`).
+- **Config:** `cluster_config::ClusterSettings` mirrors animusd's `region`/`peers`/
+  `allow_insecure_peers`/`mrec_max_clock_skew_ms`; `PeerCluster` has `deny_unknown_fields`
+  on the animusd side, so keep the field names exact (the operator does not link animusd,
+  so nothing compiles that for you).
+- **Trust:** the intra listener verifies client certs against the single `tls.ca_path`;
+  with any `caSecretRef`, `entrypoint.sh` merges own `ca.crt` + peer CAs into
+  `/tmp/animus-tls-ca-bundle.pem` (`tls_section_for`) and per-peer `tls_ca` points at
+  `/etc/animus/peer-ca/<index>/ca.crt`. Volumes are `peer-ca-<index>` (index, not region).
+- **NetworkPolicy:** port-scoped only (DNS names cannot be matched): egress to peer ports
+  any destination, ingress on the intra port from any source, only when peers are set; a
+  test pins that dynamo/intra are the only any-source ingress ports. mTLS is the auth.
+- **Validation:** `AnimusClusterSpec::validate_peers_spec` (webhook + reconciler);
+  reconciler refuses (applies nothing) with `PeersSpecInvalid`.
+- **`PeerReachable`:** `peers::evaluate` (pure) over every pod's `/admin/global-tables`;
+  Unknown until a shipper exists. Unverified against a real cluster; no kind e2e.
+
+- **Peer CA bundle is peer-only (issue #1253).** `tls.ca_path` is always the own CA (`{TLS_MOUNT_DIR}/ca.crt`); when a peer names a CA `Secret`, `tls.peer_ca_path` is `PEER_CA_BUNDLE_PATH`, which `entrypoint.sh` fills with the peer CAs only (not the own CA). animusd trusts a certificate chaining only to `peer_ca_path` for MREC replication frames alone. The `TlsSection` mirror carries `peer_ca_path` (skipped when `None`).

@@ -71,6 +71,8 @@ async fn bring_up_one(dir: &std::path::Path) -> Node {
         advertise_host: None,
         tls: None,
         encryption_key_path: None,
+        labels: Default::default(),
+        overload: None,
     };
     let config = animusd::ClusterConfig {
         version: animusd::config::CLUSTER_CONFIG_VERSION,

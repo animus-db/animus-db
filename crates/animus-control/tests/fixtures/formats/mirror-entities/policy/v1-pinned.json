@@ -1,0 +1,1 @@
+{"name":"mrsc:orders","replication_factor":3,"required_labels":{},"allowed_values":{"topology.kubernetes.io/region":["a","b","c"]},"spread":{"domain":"topology.kubernetes.io/region","strict":true}}

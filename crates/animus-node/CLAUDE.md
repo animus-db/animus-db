@@ -75,7 +75,9 @@ makes the constraint **compiler-enforced**:
   inputs and executes the decision.
 - **`decide`** — the pure predicates ADR 0061 rung A6 lifted out of
   `animusd`'s `impl ClientCtx`: `frozen_refusal`, `read_should_retry`,
-  `ok_or_err`, `align_split_key`,
+  `ok_or_err`, `align_split_key` (rounds **every** table's split key to a
+  token boundary, R-01 F-2: a split inside a token cuts a txn record off its
+  anchor's item — see `docs/lessons/testing/2026-10-05-a-split-inside-a-token-*`),
   `byte_weighted_median`, `other_tablet_replica_addr`/
   `decide_forward_retry`/`ForwardRetryStep`. Every function takes plain
   values (no `&self`, no `&CpGroup`, no `ProdEnv`) and returns a plain
@@ -763,6 +765,10 @@ nodes_relay_and_edge_state` for the full regression (both the mid-
 scenario restart case and the final-drop case, each `Weak`-verified,
 each confirmed red-before/green-after by temporarily reverting the fix).
 
+## Fuzzing (roadmap R-01 (c))
+
+`http::parse_request_head` (+ `query_param`/`percent_decode`), `sigv4_gate`'s inputs and `decode_client_frame` are fuzz targets (`http_sigv4`, `net_frames`); keep them panic-free on arbitrary bytes. See `fuzz/README.md` (stable smoke: `cd fuzz && cargo test --release --test smoke`).
+
 ## Gate enforcement (ADR 0073 Phase 2, P2-B)
 
 - `ClientRequest::required_gate` / `ClientResponse::required_gate` (`wire.rs`):
@@ -775,11 +781,11 @@ each confirmed red-before/green-after by temporarily reverting the fix).
   closed-gate message (error + counter + debug_assert) and otherwise returns the
   **same bytes** as `encode_client_frame`, which is unchanged (animusd's generic
   `write_frame` still uses it until P2-C switches).
-- `is_relayable_command`: `ReportNodeVersion` and `FinalizeClusterVersion` are now
-  relayable (data-only boot self-report; admin Finalize over `ProposeSchema`). They
-  are era-only: the relay *receiver* in `animusd` must check `required_gate` against
-  its own `ClusterFeatures` before proposing (P2-C), since a Phase 1 receiver cannot
-  decode them at all.
+- `is_relayable_command`: `ReportNodeVersion` is relayable (data-only boot
+  self-report); `FinalizeClusterVersion` is NOT (P2-C: leader-local admin action;
+  P2-B had drafted it as relayable). Both are era-only: the relay *receiver* in
+  `animusd` must check `required_gate` against its own `ClusterFeatures` before
+  proposing, since a Phase 1 receiver cannot decode them at all.
 - `SimRelayClient` (`sim_relay.rs`) does **not** gate its `RelayWire` encode: it is a
   sim-only `RelayClient` stand-in with no feature handle in reach, and the production
   relay sender is `animusd`'s, which uses the gated encoder from P2-C.
@@ -787,3 +793,56 @@ each confirmed red-before/green-after by temporarily reverting the fix).
   variant) is **Phase 1 bytes generated from commit `941a5ea`**; `tests/it/format_fixtures.rs`
   holds the byte-identity, exhaustiveness and gate-pin tests.
 
+## ADR 0073 Phase 2 (P2-C) additions
+
+`is_relayable_command`: `ReportNodeVersion => true` (boot-time self-report from a
+follower-connected or data-only node must reach the leader; `FinalizeClusterVersion`
+stays `false`, a leader-local admin action). `ClientResponse::JoinInfo` gained an
+additive `cluster_version: u32` (`#[serde(default, skip_serializing_if = "is_zero_u32")]`:
+the raw `Metadata::cluster_version`, 0 pre-era so pre-era bytes equal Phase 1's). `AdminHost`
+gained `cluster_version_view` and `action_finalize_cluster_version` (routes
+`GET /admin/cluster-version`, `POST /admin/cluster-version/finalize`); both `animusd`
+impls (`ClientCtx`, `GenericAdminHost`) implement them.
+
+## `ConvertTableToGlobal` is relayable (G-01 G-c M1, 2026-10-05)
+
+`is_relayable_command` includes `MetaCommand::ConvertTableToGlobal` (a follower-
+connected node must be able to forward it); the receiver refuses it by name
+until `Gate::GlobalTables` is open. It is in the `true_cases` round-trip table.
+
+## StorageFull refusal (R-01 (d), issue #1185)
+
+`decide::STORAGE_FULL_REFUSAL` ("StorageFull: ...; retry"), `storage_full_refusal(bool)`
+(pre-propose gate: `Ok(())` when healthy) and `is_storage_full_refusal(&str)`
+are the pure pieces; `read_should_retry` treats the refusal as transient so the
+wire maps it to a 503, and retry loops stop on `is_storage_full_refusal`
+instead of spinning to a timeout. `ControlHandle::is_storage_full()` reports the
+local control WAL (always `false` for `Remote`, which has no local WAL). Unit
+tests in `decide::tests`.
+
+## `AdminHost` global-table methods (G-01 G-c M4, 2026-10-05)
+
+`AdminHost` gained `global_tables_view` (`GET /admin/global-tables`) and
+`action_set_preferred_leader` (`POST /admin/table/preferred-leader`); both
+`animusd` impls (`ClientCtx`, `GenericAdminHost`) implement them and the
+`FakeHost` in `admin.rs`'s tests stubs them (`global_table_routes_dispatch_to_the_host`).
+No new relayed command or wire shape: the action proposes the existing
+`SetGlobalPreferredLeader` (M1/M2, `Gate::GlobalTables`).
+
+
+**`MrecApply` (ADR 0075 M3).** `ClientRequest::MrecApply`/`ClientResponse::MrecApply` are
+intra-only and class G (`Gate::MrecReplication`), with their own `MREC_PROTO`. The response
+gate is content-dependent: a whole-batch `Refused` is `Base` so a closed-gate node can still
+say "not yet"; `Answers` need the gate. Fixture `client-frame/v1-mrec.bin` (never edit).
+
+**MREC `MrecControl` and the admin route (ADR 0075 G-d M4-M6).** `MrecApplyRequest::control`
+carries the replica-saga peer calls (`CreateReplica`, `Leave`, `AddPeer`, and `SetTtl`, which
+was added after the first three: class G, fixtures `client-frame/v1-mrec-control.bin` and
+`v1-mrec-control-ttl.bin`, never edit). `MetaCommand::MarkMrecCopied` lives in `animus-control`
+but its relay arm is in `wire.rs`. `AdminHost::global_tables_view` serves both MRSC and MREC
+tables (`consistency` distinguishes them); `admin.rs` has the FakeHost routing test.
+
+## `AdminHost::roll_health_view` (ADR 0073 Phase 3, P3-A)
+
+New required method behind `GET /admin/roll-health` (always 200; `ok` in the body is the
+verdict). Both `animusd` impls delegate to `roll_health::roll_health` (see `animusd`'s guide).

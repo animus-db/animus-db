@@ -476,12 +476,35 @@ pub(crate) async fn serve(
     ctx: ClientCtx,
     tls: Option<tokio_rustls::TlsAcceptor>,
 ) {
+    // R-01 (d), ADR 0074 §2: a connection beyond `max_connections` is answered
+    // `503 ServiceUnavailable` and closed (plain HTTP only — a TLS listener
+    // cannot speak HTTP before its handshake, so it closes outright), never
+    // parked and never given a task of its own.
+    let shed_response = (tls.is_none()).then(|| {
+        crate::overload::shed_response(
+            "application/x-amz-json-1.0",
+            &WireError::service_unavailable(
+                "the node is at its connection limit (max_connections); retry",
+            )
+            .to_json(),
+        )
+    });
     loop {
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
+                let Some(conn_permit) = ctx.overload.dynamo_conns.try_acquire() else {
+                    ctx.overload.metrics.incr(Metric::OverloadShedConnCap);
+                    crate::overload::shed_connection(
+                        stream,
+                        shed_response.clone(),
+                        &ctx.overload.shed_tasks,
+                    );
+                    continue;
+                };
                 let ctx = ctx.clone();
                 let tls = tls.clone();
                 tokio::spawn(async move {
+                    let _conn_permit = conn_permit;
                     let stream = match tls {
                         None => MaybeTlsStream::Plain(stream),
                         Some(acceptor) => match acceptor.accept(stream).await {
@@ -590,7 +613,38 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
         } else {
             Principal::unrestricted()
         };
+        // R-01 (d), ADR 0074 §2: node-wide admission control. A request over
+        // `max_inflight_requests` is refused immediately with the retryable
+        // `ServiceUnavailable` — never queued. The permit is held for exactly
+        // the work (`dispatch`), not the response write. (Pipelining is
+        // bounded per connection by construction: this loop reads, runs and
+        // answers one request before reading the next.)
+        let Some(inflight) = ctx.overload.inflight.try_acquire() else {
+            ctx.overload.metrics.incr(Metric::OverloadShedAdmission);
+            let err = WireError::service_unavailable(
+                "the node is at its in-flight request limit (max_inflight_requests); retry",
+            );
+            http::write_amz_json_response(
+                &mut stream,
+                error_status(&err),
+                &err.to_json(),
+                keep_alive,
+            )
+            .await?;
+            if !keep_alive {
+                return Ok(());
+            }
+            continue;
+        };
         let (status, body) = dispatch(&ctx, &request, &principal).await;
+        drop(inflight);
+        // R-01 (f): request-outcome counters for the 5xx-ratio alert.
+        if let Some(data) = ctx.data.as_ref() {
+            data.raftkv_metrics.incr(Metric::DynamoRequestsTotal);
+            if status >= 500 {
+                data.raftkv_metrics.incr(Metric::DynamoResponses5xx);
+            }
+        }
         http::write_amz_json_response(&mut stream, status, &body, keep_alive).await?;
         if !keep_alive {
             // The client asked us to close (HTTP/1.0 default, or an explicit
@@ -734,6 +788,7 @@ fn is_ddl_mutation(op: &Operation) -> bool {
         op,
         Operation::CreateTable { .. }
             | Operation::UpdateTable { .. }
+            | Operation::UpdateTableGlobal { .. }
             | Operation::DeleteTable { .. }
             | Operation::UpdateTimeToLive { .. }
             | Operation::UpdateContinuousBackups { .. }
@@ -849,6 +904,11 @@ async fn run_operation(
                 throughput_update,
             )
             .await
+        }
+        // ADR 0075 (G-01 stage G-c): `ReplicaUpdates` / witness /
+        // `MultiRegionConsistency` — the global-table conversion, gate first.
+        Operation::UpdateTableGlobal { table, update } => {
+            crate::global_tables::update_table_global(ctx, &table, update).await
         }
         Operation::DescribeTable { table } => describe_table(ctx, meta, &table),
         Operation::DeleteTable { table } => delete_table(ctx, &table).await,
@@ -1250,6 +1310,9 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
                 KindWriteOutcome::ConditionFailed => Err(WireError::conditional_check_failed(
                     "the conditional request failed",
                 )),
+                KindWriteOutcome::Superseded => Err(internal(
+                    "a client write came back superseded (MREC replicate result on a client path)",
+                )),
                 KindWriteOutcome::Ok {
                     old,
                     collection_bytes,
@@ -1312,6 +1375,9 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
             {
                 KindWriteOutcome::ConditionFailed => Err(WireError::conditional_check_failed(
                     "the conditional request failed",
+                )),
+                KindWriteOutcome::Superseded => Err(internal(
+                    "a client write came back superseded (MREC replicate result on a client path)",
                 )),
                 KindWriteOutcome::Ok {
                     old,
@@ -1594,6 +1660,9 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
             {
                 KindWriteOutcome::ConditionFailed => Err(WireError::conditional_check_failed(
                     "the conditional request failed",
+                )),
+                KindWriteOutcome::Superseded => Err(internal(
+                    "a client write came back superseded (MREC replicate result on a client path)",
                 )),
                 KindWriteOutcome::Ok {
                     old,
@@ -1973,6 +2042,11 @@ async fn dispatch_table_op<E: Env, R: RelayClient>(
             exclusive_start_table_name,
             limit,
         } => list_tables(meta, exclusive_start_table_name.as_deref(), limit),
+        // ADR 0075 (G-01 stage G-c): the global-table conversion — the same
+        // generic handler `run_operation` reaches.
+        Operation::UpdateTableGlobal { table, update } => {
+            crate::global_tables::update_table_global(ctx, &table, update).await
+        }
         // ADR 0061 rung D3 PR 2b + rung G (C-07 PR 2) + rung J (C-10 PR 2):
         // the throughput-only, stream-only, and (since rung J) index-change
         // shapes of `UpdateTable` are all covered now — see `update_table`'s
@@ -2095,6 +2169,7 @@ pub(crate) async fn execute_item_op_as<E: Env, R: RelayClient>(
                     | Operation::ListTables { .. }
                     | Operation::DescribeTable { .. }
                     | Operation::UpdateTable { .. }
+                    | Operation::UpdateTableGlobal { .. }
             ) {
                 dispatch_table_op(ctx, meta, op).await
             } else {
@@ -2200,6 +2275,9 @@ async fn update_time_to_live<E: Env, R: RelayClient>(
              `{table}`'s currently-enabled TTL attribute `{}`",
             current.attribute_name
         )));
+    }
+    if enabled {
+        crate::global_tables::reject_ttl_on_global(&meta, table)?;
     }
     let spec = enabled.then(|| TtlSpec {
         attribute_name: attribute_name.to_owned(),
@@ -4480,7 +4558,7 @@ async fn create_table<E: Env, R: RelayClient>(
 /// see `dispatch_table_op`'s own doc), but must still type-check for any
 /// `E`/`R`, and `update_table`'s own (unmodified, `ProdEnv`-only) call site
 /// keeps compiling unchanged, monomorphized as before.
-async fn enable_stream<E: Env, R: RelayClient>(
+pub(crate) async fn enable_stream<E: Env, R: RelayClient>(
     ctx: &ClientCtx<E, R>,
     table: &str,
     view_type: animus_control::StreamViewType,
@@ -4542,6 +4620,17 @@ async fn disable_stream<E: Env, R: RelayClient>(
     ctx: &ClientCtx<E, R>,
     table: &str,
 ) -> Result<(), WireError> {
+    // ADR 0075 V13: an MREC table's stream feeds its replication.
+    if metadata_fresh(ctx)
+        .await
+        .table_global(table)
+        .is_some_and(|g| g.is_mrec())
+    {
+        return Err(WireError::validation(format!(
+            "UpdateTable: the stream of table `{table}` cannot be disabled: it is part of a \
+             multi-Region eventually consistent table"
+        )));
+    }
     let tablets: Vec<TabletId> = metadata_fresh(ctx)
         .await
         .tablets_for_table(table)
@@ -4994,7 +5083,7 @@ async fn drop_table_index<E: Env, R: RelayClient>(
 /// every table before this derivation existed and nothing here should
 /// change that default. Derived fresh from the live tablet map every call,
 /// never stored redundantly on the schema/catalog row.
-fn table_status(meta: &Metadata, table: &str) -> &'static str {
+pub(crate) fn table_status(meta: &Metadata, table: &str) -> &'static str {
     if meta
         .tablets_for_table(table)
         .any(|(_, t)| t.state != TabletState::Active)
@@ -5018,6 +5107,20 @@ fn describe_table<E: Env, R: RelayClient>(
     meta: &Metadata,
     table: &str,
 ) -> Result<String, WireError> {
+    describe_table_wrapped(meta, table, "Table")
+}
+
+/// [`describe_table`]'s body, parameterized on the key the description is
+/// wrapped under (`"Table"` for `DescribeTable`, `"TableDescription"` for the
+/// global-table `UpdateTable`, AWS's shape for each) and extended with a
+/// global table's `GlobalTableVersion`/`Replicas`/`MultiRegionConsistency`/
+/// `GlobalTableWitnesses` (ADR 0075 section 5.1) — emitted **only** for a
+/// global table, so every other table's output is byte-identical to before.
+pub(crate) fn describe_table_wrapped(
+    meta: &Metadata,
+    table: &str,
+    wrapper: &str,
+) -> Result<String, WireError> {
     let Some(control_schema) = meta.table_schema(table) else {
         return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
             table.to_owned(),
@@ -5040,7 +5143,8 @@ fn describe_table<E: Env, R: RelayClient>(
         .map(|d| (d.name.clone(), d.status))
         .collect();
     let stream_desc = meta.table_stream(table).map(stream_description);
-    Ok(wire::describe_table_response(
+    let global = crate::global_tables::global_description(meta, table);
+    Ok(wire::table_description_response(
         table,
         &dynamo_schema,
         &key_types,
@@ -5049,6 +5153,8 @@ fn describe_table<E: Env, R: RelayClient>(
         stream_desc.as_ref(),
         table_status(meta, table),
         meta.table_throughput(table),
+        global.as_ref(),
+        wrapper,
     ))
 }
 
@@ -5420,6 +5526,13 @@ async fn run_transact<E: Env, R: RelayClient>(
         animus_control::OpClass::Write,
         actions.iter().map(TransactAction::table),
     )?;
+    for action in actions {
+        crate::global_tables::reject_transaction_on_global(
+            meta,
+            action.table(),
+            "TransactWriteItems",
+        )?;
+    }
     // Cheap, pure validation up front (ADR 0018's 2026-08-24 amendment): every
     // action's table must not be the reserved internal table, and no two
     // actions may target the same item — both checked **before** the
@@ -5851,7 +5964,7 @@ async fn transact_write_idempotency_preflight<E: Env, R: RelayClient>(
     loop {
         match idempotency_claim_put(ctx, &meta, token, &fingerprint).await? {
             KindWriteOutcome::Ok { .. } => return Ok(None),
-            KindWriteOutcome::ConditionFailed => {}
+            KindWriteOutcome::ConditionFailed | KindWriteOutcome::Superseded => {}
         }
         let Some(record) = read_idempotency_record(ctx, &meta, token).await? else {
             // A concurrent commit/cancel already flipped the outcome and the
@@ -6223,6 +6336,9 @@ async fn run_transact_get<E: Env, R: RelayClient>(
         animus_control::OpClass::Read,
         gets.iter().map(|g| g.table.as_str()),
     )?;
+    for get in gets {
+        crate::global_tables::reject_transaction_on_global(meta, &get.table, "TransactGetItems")?;
+    }
 
     let mut keys: Vec<(String, Vec<u8>)> = Vec::with_capacity(gets.len());
     let mut seen: BTreeSet<(String, Vec<u8>)> = BTreeSet::new();
@@ -6518,6 +6634,10 @@ fn lsi_key_names(base: &TableSchema, idx: &IndexDef) -> BTreeSet<String> {
 pub(crate) fn kind_write_is_idempotent(op: &KindWriteOp) -> bool {
     match op {
         KindWriteOp::Put(_) | KindWriteOp::Delete => true,
+        // A replicate is idempotent as *state* (LWW), but its confirm must be
+        // its own entry: value equality does not prove *this* entry won
+        // (ADR 0075 G-d M2 note), so it is classed `RequiresOwnEntry`.
+        KindWriteOp::Replicate { .. } => false,
         KindWriteOp::Update { actions, .. } => !actions
             .iter()
             .any(|a| matches!(a, UpdateAction::Add(_, AttributeValue::N(_)))),
@@ -9243,7 +9363,7 @@ fn key_item_of<E: Env, R: RelayClient>(
 }
 
 /// Map a registry error to a DynamoDB wire error code.
-fn registry_error(err: animus_dynamo::RegistryError) -> WireError {
+pub(crate) fn registry_error(err: animus_dynamo::RegistryError) -> WireError {
     use animus_dynamo::RegistryError as R;
     match err {
         R::NoSuchTable(t) => WireError {
@@ -9318,6 +9438,11 @@ pub(crate) enum KindWriteOutcome {
     /// The caller's own `condition` did not match the leader's own read of
     /// the current item — no diff was ever computed, nothing was proposed.
     ConditionFailed,
+    /// A [`KindWriteOp::Replicate`] whose stamp did not beat the stored one:
+    /// it lost last-writer-wins (or was an idempotent re-delivery) and wrote
+    /// nothing. Only the MREC receiver's batch path produces it (ADR 0075 G-d
+    /// M3); every client write path treats it as an internal error.
+    Superseded,
 }
 
 /// **The evaluate-AT-APPLY write path (ADR 0054, Accepted)** for `PutItem`/
@@ -9454,7 +9579,23 @@ pub(crate) async fn kind_write_item_at_leader<E: Env, R: RelayClient>(
     } else {
         ProbeIdentity::RequiresOwnEntry
     };
-    let schema = write_schema_for(meta, table);
+    let mut schema = write_schema_for(meta, table);
+    // G-d M4: stamp an MREC table's write (inert for a regional table).
+    schema.mrec = mrec_write_stamp(meta, table, ctx.env.wall_now().0);
+    // ADR 0075 4.6 / V15: the TTL reaper's delete is stamped at the item's
+    // expiry instant (the reaper's condition pins the TTL attribute to its
+    // epoch-second value), so every region's concurrent reap is the same
+    // tombstone modulo region id. Apply takes max(stamp, stored), so an item
+    // rewritten after expiry is never lost to it.
+    if ttl_expired
+        && let Some(stamp) = schema.mrec.as_mut()
+        && let Some(ConditionExpression::Compare(_, _, AttributeValue::N(n))) = condition
+        && let Ok(secs) = n.parse::<f64>()
+        && secs.is_finite()
+        && secs >= 0.0
+    {
+        stamp.wall_ms = ((secs * 1000.0) as u64).min(stamp.wall_ms);
+    }
     let eval_op = kind_write_op_to_eval_op(op);
     // Turbofish required (ADR 0061 rung C5 step 3a): `cp_kind_eval_local`
     // takes no `self`/`R`-typed argument, so nothing here pins down `R` for
@@ -9515,6 +9656,12 @@ pub(crate) async fn kind_write_item_at_leader<E: Env, R: RelayClient>(
         }
         KindEvalApplied::ConditionFailed => Ok(KindWriteOutcome::ConditionFailed),
         KindEvalApplied::Rejected { code, message } => Err(rejected_wire_error(&code, message)),
+        // ADR 0075 G-d M2: only a `KindEvalOp::Replicate` is ever superseded,
+        // and no client write path proposes one (M3's receiver handler has its
+        // own caller).
+        KindEvalApplied::Superseded { .. } => Err(internal(
+            "a client write came back superseded (MREC replicate result on a client path)",
+        )),
     }
 }
 
@@ -9568,6 +9715,7 @@ pub(crate) fn kind_write_outcome_to_reply(
             collection_bytes,
         },
         Ok(KindWriteOutcome::ConditionFailed) => KindWriteItemReply::ConditionFailed,
+        Ok(KindWriteOutcome::Superseded) => KindWriteItemReply::Superseded,
         Err(e) => KindWriteItemReply::Rejected {
             code: e.code.to_string(),
             message: e.message,
@@ -9592,6 +9740,7 @@ pub(crate) fn kind_write_item_reply_to_outcome(
             collection_bytes,
         }),
         KindWriteItemReply::ConditionFailed => Ok(KindWriteOutcome::ConditionFailed),
+        KindWriteItemReply::Superseded => Ok(KindWriteOutcome::Superseded),
         KindWriteItemReply::Rejected { code, message } => {
             Err(wire_error_from_batch_rejected(code, message))
         }
@@ -9644,7 +9793,14 @@ pub(crate) async fn kind_write_batch_at_leader<E: Env, R: RelayClient>(
     if items.is_empty() {
         return Vec::new();
     }
-    let schema = write_schema_for(meta, table);
+    let mut schema = write_schema_for(meta, table);
+    // ADR 0075 G-d M3: a batch of replicated records is stamped with this
+    // cluster's region context at the proposing leader (apply rejects a
+    // `Replicate` whose entry carries none). Ordinary client batches on an
+    // MREC table are stamped below.
+    // G-d M4: an ordinary client batch on an MREC table is stamped the same way
+    // (`None` for a regional table, so this is inert there).
+    schema.mrec = mrec_write_stamp(meta, table, ctx.env.wall_now().0);
     let write_limit = ctx.throttle_limits_for(meta, table).write_units;
     let tablet_count = meta.tablets_for_table(table).count().max(1);
 
@@ -9754,6 +9910,9 @@ pub(crate) async fn kind_write_batch_at_leader<E: Env, R: RelayClient>(
                         KindEvalApplied::Rejected { code, message } => {
                             Err(rejected_wire_error(&code, message))
                         }
+                        // A replicate that lost LWW (the MREC receiver's batch,
+                        // ADR 0075 G-d M3); a client write never produces one.
+                        KindEvalApplied::Superseded { .. } => Ok(KindWriteOutcome::Superseded),
                     };
                     results[a.original_index] = Some(outcome);
                 }
@@ -9868,6 +10027,7 @@ pub(crate) fn kind_write_op_to_eval_op(op: KindWriteOp) -> animus_cp_data::KindE
         KindWriteOp::Update { key_item, actions } => {
             animus_cp_data::KindEvalOp::Update { key_item, actions }
         }
+        KindWriteOp::Replicate { item, ver } => animus_cp_data::KindEvalOp::Replicate { item, ver },
     }
 }
 
@@ -9880,7 +10040,10 @@ pub(crate) fn kind_write_op_to_eval_op(op: KindWriteOp) -> animus_cp_data::KindE
 fn kind_write_precharge_units(op: &KindWriteOp) -> f64 {
     match op {
         KindWriteOp::Put(item) => capacity::write_units(capacity::item_size(item)),
-        KindWriteOp::Delete | KindWriteOp::Update { .. } => 1.0,
+        KindWriteOp::Replicate {
+            item: Some(item), ..
+        } => capacity::write_units(capacity::item_size(item)),
+        KindWriteOp::Delete | KindWriteOp::Update { .. } | KindWriteOp::Replicate { .. } => 1.0,
     }
 }
 
@@ -10210,6 +10373,16 @@ pub(crate) async fn marker_batch_write_raw<E: Env, R: RelayClient>(
     // back with nothing observable in between, discarding the first clone
     // whenever the tablet already existed.
     let mut route_meta = ctx.effective_metadata();
+    // ADR 0075 G-d M2: an edge-valued (raw) base-row write cannot carry an
+    // MREC stamp, so it is refused outright on an MREC table. Defence in
+    // depth: the Dynamo fast arms never reach here for one
+    // (`table_change_records_carry_images` is true for MREC), and the raw
+    // client protocol's values are not items anyway.
+    if route_meta.table_global(table).is_some_and(|g| g.is_mrec()) {
+        return Err(format!(
+            "table `{table}` is an MREC global table: raw (unstamped) writes are not supported"
+        ));
+    }
     if provision_if_absent && !route_meta.has_table_tablet(table) {
         ctx.provision_tablet(table).await?;
         route_meta = ctx.effective_metadata();
@@ -10353,6 +10526,13 @@ pub(crate) fn table_change_records_carry_images(meta: &Metadata, table: &str) ->
         // marker-write arm — real DynamoDB's own PITR carries an
         // analogous (if internally different) continuous-capture cost.
         || meta.table_pitr(table).is_some()
+        // ADR 0075 G-d M2: an MREC table's rows carry a last-writer-wins stamp
+        // that only the evaluate-at-apply path (`KindEval`) can compute from
+        // the stored row, so such a table must never take an edge-valued fast
+        // arm (`fast_marker_write`/`marker_batch_write`), which would write an
+        // unstamped base row. (MREC also forces a stream with images on at
+        // conversion, M4; this is the structural guarantee, not a courtesy.)
+        || meta.table_global(table).is_some_and(|g| g.is_mrec())
 }
 
 /// Whether `cp_txn` must **await** its post-commit resolve under the ADR
@@ -10557,7 +10737,25 @@ pub(crate) fn write_schema_for(meta: &Metadata, table: &str) -> animus_item::Wri
         key,
         lsis,
         change_records_carry_images: table_change_records_carry_images(meta, table),
+        mrec: None,
     }
+}
+
+/// The MREC write stamp context for `table` at `wall_ms` (the leader's
+/// `Env::wall_now` milliseconds): `Some` iff the table is an MREC global table,
+/// carrying this cluster's own region id (the `local` replica's). The one
+/// place a producer derives `WriteSchema::mrec` (ADR 0075 section 4.4, G-d).
+pub(crate) fn mrec_write_stamp(
+    meta: &Metadata,
+    table: &str,
+    wall_ms: u64,
+) -> Option<animus_item::write_schema::MrecWriteStamp> {
+    let spec = meta.table_global(table).filter(|g| g.is_mrec())?;
+    let local = spec.replicas.iter().find(|r| r.local)?;
+    Some(animus_item::write_schema::MrecWriteStamp {
+        region_id: local.region_id,
+        wall_ms,
+    })
 }
 
 /// `animus_control::schema::IndexProjection` -> `animus_item::write_schema::
@@ -11013,6 +11211,16 @@ mod map_throttleable_error_tests {
         assert_eq!(err.message, forward_exhausted);
     }
 
+    /// R-01 (d), ADR 0074 §2: the disk-full refusal is a named 503
+    /// `ServiceUnavailable` carrying the `StorageFull:` cause, never a 500.
+    #[test]
+    fn the_storage_full_refusal_maps_to_a_named_service_unavailable() {
+        let err = map_throttleable_error(animus_node::decide::STORAGE_FULL_REFUSAL.to_owned());
+        assert_eq!(err.code, "ServiceUnavailable");
+        assert!(err.message.starts_with("StorageFull:"), "{}", err.message);
+        assert!(err.message.ends_with("; retry"), "{}", err.message);
+    }
+
     /// A throttle refusal is unchanged — it must never be conflated with a
     /// transient/retryable condition (ADR 0065 §6: the client, not this
     /// server, backs off).
@@ -11084,6 +11292,8 @@ mod stream_write_path_tests {
                 advertise_host: None,
                 tls: None,
                 encryption_key_path: None,
+                labels: Default::default(),
+                overload: None,
             }],
             dynamo_auth: None,
             cluster_settings: None,
@@ -11198,6 +11408,40 @@ mod stream_write_path_tests {
         })
         .await
         .expect("table's tablet never hosted locally")
+    }
+
+    /// R-01 (f): every request that reaches `dispatch` bumps
+    /// `dynamo_requests_total`; only a 5xx bumps `dynamo_responses_5xx`
+    /// (a 4xx validation error is a request but not a server fault).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn request_outcome_counters_count_requests_and_only_5xx_faults() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let node = single_node(dir.path()).await;
+        let before = metrics_value(node.dynamo_addr(), "dynamo_requests_total").await;
+        let (status, body) = dynamo(
+            node.dynamo_addr(),
+            "DynamoDB_20120810.CreateTable",
+            r#"{"TableName":"rqt",
+                "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
+                "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "CreateTable failed: {body}");
+        // A request for a table that does not exist: a 4xx, not a fault.
+        let (status, _) = dynamo(
+            node.dynamo_addr(),
+            "DynamoDB_20120810.GetItem",
+            r#"{"TableName":"nope","Key":{"id":{"S":"a"}}}"#,
+        )
+        .await;
+        assert!((400..500).contains(&status), "expected a 4xx, got {status}");
+        let after = metrics_value(node.dynamo_addr(), "dynamo_requests_total").await;
+        assert_eq!(after - before, 2, "both requests must be counted");
+        assert_eq!(
+            metrics_value(node.dynamo_addr(), "dynamo_responses_5xx").await,
+            0,
+            "a 2xx and a 4xx are not server faults"
+        );
     }
 
     /// A streamed-but-unindexed table's `PutItem`/`UpdateItem`/`DeleteItem`

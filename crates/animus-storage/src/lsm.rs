@@ -622,6 +622,15 @@ pub struct LsmEngine<E: Env> {
     /// view, so an error has nowhere else to surface; the next write that
     /// crosses the threshold retriggers maintenance regardless).
     background_error: Arc<Mutex<Option<String>>>,
+    /// Whether the latest background maintenance run failed for want of disk
+    /// space (ENOSPC/EDQUOT) — cleared by the next successful run. Lets
+    /// `await_backpressure` surface [`StorageError::StorageFull`] instead of a
+    /// generic backend error.
+    background_full: Arc<AtomicBool>,
+    /// How many times an inline post-write flush/compaction failed with
+    /// ENOSPC and was deferred (the write itself had already succeeded).
+    /// Introspection for tests.
+    maintenance_deferrals: Arc<AtomicU64>,
 }
 
 impl<E: Env> LsmEngine<E> {
@@ -909,6 +918,8 @@ impl<E: Env> LsmEngine<E> {
             metrics,
             maintenance_scheduled: Arc::new(AtomicBool::new(false)),
             background_error: Arc::new(Mutex::new(None)),
+            background_full: Arc::new(AtomicBool::new(false)),
+            maintenance_deferrals: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -1233,7 +1244,20 @@ impl<E: Env> LsmEngine<E> {
             self.trigger_background_maintenance();
             self.await_backpressure().await
         } else {
-            self.maybe_flush_and_compact().await
+            match self.maybe_flush_and_compact().await {
+                // The write that got us here is already durable and applied;
+                // failing it for want of disk for *maintenance* would make a
+                // caller retry (or report) a write that took effect. Defer the
+                // flush/compaction instead: it failed cleanly (see `flush` and
+                // `run_compaction`), the memtable and WAL are intact, and the
+                // next write (or `flush_now`/`compact_now`) re-attempts it onto
+                // whatever space has been freed by then.
+                Err(e) if e.is_storage_full() => {
+                    self.maintenance_deferrals.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                }
+                other => other,
+            }
         }
     }
 
@@ -1263,8 +1287,14 @@ impl<E: Env> LsmEngine<E> {
         }
         let engine = self.clone();
         self.env.spawn_task(async move {
-            if let Err(e) = engine.maybe_flush_and_compact().await {
-                *engine.background_error.lock().expect("poisoned") = Some(e.to_string());
+            match engine.maybe_flush_and_compact().await {
+                Ok(()) => engine.background_full.store(false, Ordering::Release),
+                Err(e) => {
+                    engine
+                        .background_full
+                        .store(e.is_storage_full(), Ordering::Release);
+                    *engine.background_error.lock().expect("poisoned") = Some(e.to_string());
+                }
             }
             engine.maintenance_scheduled.store(false, Ordering::Release);
         });
@@ -1301,11 +1331,20 @@ impl<E: Env> LsmEngine<E> {
             self.env.sleep(BACKPRESSURE_POLL).await;
         }
         let last_error = self.background_error.lock().expect("poisoned").clone();
-        Err(StorageError::Backend(format!(
+        let msg = format!(
             "write backpressure: memtable stayed over the hard cap ({cap} bytes) \
              after {BACKPRESSURE_MAX_POLLS} polls — background maintenance is not \
              keeping up (last error: {last_error:?})"
-        )))
+        );
+        // Maintenance stuck on a full disk is the recoverable class: the write
+        // that waited here is already durable and applied (LWW-idempotent on a
+        // retry), and the caller should surface/pause as storage-full, not as an
+        // engine fault.
+        Err(if self.background_full.load(Ordering::Acquire) {
+            StorageError::StorageFull(msg)
+        } else {
+            StorageError::Backend(msg)
+        })
     }
 
     /// Open a reader for `file`/`meta` with the engine's shared block-read
@@ -1369,10 +1408,28 @@ impl<E: Env> LsmEngine<E> {
 
         // Build + sync the new SSTable file (outside the lock). A flush always
         // lands at L0 (the overlapping flush tier).
+        //
+        // A failure here (ENOSPC mid-write above all) must leave the engine
+        // exactly as it was: the memtable and WAL are untouched, `next_seq` was
+        // only bumped on the *local* manifest clone, and the partial output is
+        // removed (best effort — it is an unreferenced orphan either way, but
+        // on a full disk it is also space the retry needs). The next flush
+        // attempt re-allocates the same seq and starts the file clean.
         let file = self.sst_file(seq);
-        let meta = SsTableWriter::write(&self.env, &file, seq, 0, &records).await?;
-        self.env.sync(&file).await.map_err(io)?;
-        let reader = self.open_reader(file, meta.clone()).await?;
+        let built = async {
+            let meta = SsTableWriter::write(&self.env, &file, seq, 0, &records).await?;
+            self.env.sync(&file).await.map_err(io)?;
+            let reader = self.open_reader(file.clone(), meta.clone()).await?;
+            Ok::<_, StorageError>((meta, reader))
+        }
+        .await;
+        let (meta, reader) = match built {
+            Ok(built) => built,
+            Err(e) => {
+                let _ = self.env.remove(&file).await;
+                return Err(e);
+            }
+        };
 
         // Compute the WAL segments fully covered by this flush (all their records
         // ≤ watermark, so now in the SSTable). Record the *surviving* segment set
@@ -1393,7 +1450,16 @@ impl<E: Env> LsmEngine<E> {
         // manifest + the intact WAL segments.
         new_manifest.tables.push(meta);
         new_manifest.wal_segments = surviving;
-        self.write_manifest(&new_manifest).await?;
+        if let Err(e) = self.write_manifest(&new_manifest).await {
+            // ENOSPC fails the atomic `replace` before it swaps anything, so the
+            // old manifest is still authoritative and the new table is an
+            // orphan to drop. (Any other error leaves the swap's outcome
+            // unknown — never delete a file the manifest might now name.)
+            if e.is_storage_full() {
+                let _ = self.env.remove(&file).await;
+            }
+            return Err(e);
+        }
 
         // The new manifest is durable and no longer names the covered segments, so
         // their files can be removed (bounding WAL size — no whole-file rewrite).
@@ -1579,15 +1645,38 @@ impl<E: Env> LsmEngine<E> {
         let mut new_readers: Vec<SsTableReader> = Vec::with_capacity(partitions.len());
         let mut new_files: Vec<String> = Vec::with_capacity(partitions.len());
         let mut seq = base_seq;
+        //
+        // A failure while writing the outputs (ENOSPC above all) leaves the
+        // input tables authoritative — the manifest has not changed — and every
+        // partial/complete output written so far is removed (best effort): they
+        // are unreferenced orphans, and on a full disk also exactly the space a
+        // retry needs. `next_seq` is untouched, so the retry re-allocates the
+        // same seqs and each output starts clean.
         for records in &partitions {
             seq += 1;
             let file = self.sst_file(seq);
-            let meta = SsTableWriter::write(&self.env, &file, seq, target_level, records).await?;
-            self.env.sync(&file).await.map_err(io)?;
-            let reader = self.open_reader(file.clone(), meta.clone()).await?;
-            new_metas.push(meta);
-            new_readers.push(reader);
-            new_files.push(file);
+            let built = async {
+                let meta =
+                    SsTableWriter::write(&self.env, &file, seq, target_level, records).await?;
+                self.env.sync(&file).await.map_err(io)?;
+                let reader = self.open_reader(file.clone(), meta.clone()).await?;
+                Ok::<_, StorageError>((meta, reader))
+            }
+            .await;
+            match built {
+                Ok((meta, reader)) => {
+                    new_metas.push(meta);
+                    new_readers.push(reader);
+                    new_files.push(file);
+                }
+                Err(e) => {
+                    let _ = self.env.remove(&file).await;
+                    for done in &new_files {
+                        let _ = self.env.remove(done).await;
+                    }
+                    return Err(e);
+                }
+            }
         }
 
         // Build the new manifest: survivors (not consumed) + the new runs. A crash
@@ -1619,7 +1708,15 @@ impl<E: Env> LsmEngine<E> {
             };
             (new_manifest, old_files)
         };
-        self.write_manifest(&new_manifest).await?;
+        if let Err(e) = self.write_manifest(&new_manifest).await {
+            // See `flush`: only an ENOSPC failure is known to have swapped nothing.
+            if e.is_storage_full() {
+                for f in &new_files {
+                    let _ = self.env.remove(f).await;
+                }
+            }
+            return Err(e);
+        }
 
         // Commit in-memory: rebuild the parallel readers vector to match the new
         // manifest's table order, then remove the consumed input files.
@@ -1723,6 +1820,15 @@ impl<E: Env> LsmEngine<E> {
     #[must_use]
     pub fn background_maintenance_error(&self) -> Option<String> {
         self.background_error.lock().expect("poisoned").clone()
+    }
+
+    /// How many inline post-write flushes/compactions were deferred because the
+    /// disk was full (the triggering write had already succeeded; the work is
+    /// re-attempted by the next write). Test/introspection.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn maintenance_deferral_count(&self) -> u64 {
+        self.maintenance_deferrals.load(Ordering::Relaxed)
     }
 
     /// Whether a background maintenance task is currently in flight.
@@ -3243,6 +3349,59 @@ fn wal_resync_point(bytes: &[u8], start: usize) -> Option<usize> {
     (start..bytes.len()).find(|&p| try_parse_wal_frame(bytes, p).is_some())
 }
 
+/// Thin, `#[doc(hidden)]` decoder entry points for the `fuzz/` cargo-fuzz
+/// project (roadmap R-01 (c)); compiled only under the `fuzzing` feature.
+/// Each returns a count or a rendered error: the property under test is
+/// "never panics, never allocates unboundedly, decode-or-named-error".
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing {
+    use super::*;
+
+    /// Whole WAL file (`LWL1` header + framed records): version dispatch.
+    pub fn wal(bytes: &[u8]) -> std::result::Result<(usize, usize), String> {
+        decode_wal(bytes)
+            .map(|(r, n)| (r.len(), n))
+            .map_err(|e| e.to_string())
+    }
+
+    /// One WAL record payload, skipping the length/CRC framing a fuzzer
+    /// could not otherwise get past.
+    pub fn wal_record(bytes: &[u8]) -> std::result::Result<(), String> {
+        decode_wal_record(bytes)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Manifest file: magic/version dispatch plus the body decoder.
+    pub fn manifest(bytes: &[u8]) -> std::result::Result<usize, String> {
+        decode_manifest(bytes)
+            .map(|m| m.tables.len())
+            .map_err(|e| e.to_string())
+    }
+
+    /// CRC-stripped SSTable data block (`tag || payload`).
+    pub fn sstable_block(framed: &[u8]) -> std::result::Result<usize, String> {
+        sstable::fuzz_shims::block_v1(framed).map_err(|e| e.to_string())
+    }
+
+    /// SSTable block-index region.
+    pub fn sstable_index(bytes: &[u8]) -> std::result::Result<usize, String> {
+        sstable::fuzz_shims::block_index(bytes).map_err(|e| e.to_string())
+    }
+
+    /// Open a whole SSTable image already written to `file` on `env`, then
+    /// scan and point-read it.
+    pub async fn sstable_image<E: Env>(
+        env: &E,
+        file: &str,
+        bytes: &[u8],
+    ) -> std::result::Result<usize, String> {
+        sstable::fuzz_shims::open_image(env, file, bytes)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
 /// Decode a WAL segment's raw bytes: first the file-level header (magic +
 /// version, ADR 0073 Phase 0 — see `wal`'s module docs for why this is
 /// file-level rather than per-record), then its records. Returns the decoded
@@ -3387,6 +3546,181 @@ pub fn reframe_wal_to_v1(bytes: &[u8]) -> Result<Vec<u8>> {
     }
     let (records, _) = decode_wal(bytes)?;
     Ok(legacy::v1::encode_file(&records))
+}
+
+/// A row-value mapper for [`rewrite_row_values`]: `(key, value)` -> the new
+/// value, or `None` to leave the row alone.
+#[cfg(any(test, feature = "legacy-encoders"))]
+pub type RowMapper<'a> = dyn Fn(&[u8], &[u8]) -> Option<Vec<u8>> + 'a;
+
+/// What [`rewrite_row_values`] did to one node disk.
+#[cfg(any(test, feature = "legacy-encoders"))]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RowRewriteReport {
+    /// Row values the mapper was offered (every version of every key in every
+    /// file it visited; tombstones excluded).
+    pub values_seen: usize,
+    /// Row values the mapper replaced.
+    pub values_rewritten: usize,
+    /// Files rewritten, in visit order: WAL segments and SSTables, by name.
+    pub files_rewritten: Vec<String>,
+    /// Files left alone because the keep filter said so (mixed-version).
+    pub files_skipped: Vec<String>,
+}
+
+/// Rewrite the **row values** of every LSM engine on a *stopped* node's disk,
+/// leaving file formats and versions as they are: the upgrade-restart
+/// harness's transcode for formats that live *inside* engine rows (ADR 0073
+/// P1-D), such as `animus-cp-data`'s `txn-envelope`, which no whole-file
+/// transcode can reach because a row value is opaque to the file formats
+/// that carry it.
+///
+/// Walks every `<prefix>wal-NNNNNN` segment and every SSTable a
+/// `<prefix>MANIFEST` names, offering each non-tombstone `(key, value)` to
+/// `map` (`Some(new)` replaces the value). A WAL segment is re-encoded at the
+/// version it already has; an SSTable is rewritten whole and its manifest
+/// entry (index offset/length, size, Bloom filter) is updated in the same
+/// manifest swap. `rewrite_file(name)` decides per file whether it takes part
+/// at all (`false` = left byte-for-byte untouched, a mixed-version engine).
+///
+/// Not crash-atomic across files, like the rest of the harness: the node must
+/// be stopped, and any prefix of the pass is itself a valid mixed-version
+/// state (every value decodes at either shape).
+///
+/// # Errors
+/// A malformed WAL/manifest/SSTable, or a disk error.
+#[cfg(any(test, feature = "legacy-encoders"))]
+pub async fn rewrite_row_values<E: Env>(
+    env: &E,
+    map: &RowMapper<'_>,
+    rewrite_file: &dyn Fn(&str) -> bool,
+) -> Result<RowRewriteReport> {
+    fn numbered(file: &str, stem: &str) -> bool {
+        file.rfind(stem).is_some_and(|i| {
+            let d = &file[i + stem.len()..];
+            d.len() == 6 && d.bytes().all(|b| b.is_ascii_digit())
+        })
+    }
+    let mut report = RowRewriteReport::default();
+    let mut files = env.list().await.map_err(io)?;
+    files.sort();
+    files.dedup();
+
+    let apply = |key: &[u8], value: &mut Vec<u8>, seen: &mut usize, changed: &mut usize| {
+        *seen += 1;
+        if let Some(new) = map(key, value) {
+            *value = new;
+            *changed += 1;
+        }
+    };
+
+    // WAL segments.
+    for file in files.iter().filter(|f| numbered(f, "wal-")) {
+        let bytes = env.read(file).await.map_err(io)?;
+        if bytes.len() < WAL_HEADER_LEN {
+            continue;
+        }
+        if !rewrite_file(file) {
+            report.files_skipped.push(file.clone());
+            continue;
+        }
+        let version = bytes[4];
+        let (mut records, _) = decode_wal(&bytes)?;
+        let (mut seen, mut changed) = (0usize, 0usize);
+        for r in &mut records {
+            match r {
+                WalRecord::Put { key, value, .. } => apply(key, value, &mut seen, &mut changed),
+                WalRecord::Batch { ops, .. } => {
+                    for op in ops {
+                        if let BatchOp::Put { key, value } = op {
+                            apply(key, value, &mut seen, &mut changed);
+                        }
+                    }
+                }
+                WalRecord::MergeBatch { ops } => {
+                    for op in ops {
+                        if let Some(value) = &mut op.value {
+                            apply(&op.key, value, &mut seen, &mut changed);
+                        }
+                    }
+                }
+                WalRecord::Delete { .. } | WalRecord::DeleteRange { .. } => {}
+            }
+        }
+        report.values_seen += seen;
+        report.values_rewritten += changed;
+        if changed == 0 {
+            continue;
+        }
+        let out = match version {
+            WAL_VERSION_V1 => legacy::v1::encode_file(&records),
+            _ => {
+                // Current version: header, frames, and one closing sync marker
+                // (everything before it was fsynced when it was written).
+                let mut out = wal::encode_wal_header_version(version).to_vec();
+                for r in &records {
+                    out.extend_from_slice(&encode_wal(r));
+                }
+                let at = out.len() as u64;
+                out.extend_from_slice(&wal::encode_wal_marker(at));
+                out
+            }
+        };
+        env.replace(file, &out).await.map_err(io)?;
+        report.files_rewritten.push(file.clone());
+    }
+
+    // SSTables, through each engine's manifest.
+    for mfile in files.iter().filter(|f| f.ends_with("MANIFEST")) {
+        let prefix = &mfile[..mfile.len() - "MANIFEST".len()];
+        let bytes = env.read(mfile).await.map_err(io)?;
+        if bytes.is_empty() {
+            continue;
+        }
+        let mut manifest = decode_manifest(&bytes)?;
+        let mut manifest_dirty = false;
+        for i in 0..manifest.tables.len() {
+            let meta = manifest.tables[i].clone();
+            let file = format!("{prefix}sst-{:06}", meta.seq);
+            if !rewrite_file(&file) {
+                report.files_skipped.push(file);
+                continue;
+            }
+            let reader = SsTableReader::open(env, file.clone(), meta.clone()).await?;
+            let mut records: Vec<Record> = reader
+                .full_scan(env)
+                .await?
+                .into_iter()
+                .map(|(key, version, value)| Record {
+                    key,
+                    version,
+                    value,
+                })
+                .collect();
+            let (mut seen, mut changed) = (0usize, 0usize);
+            for r in &mut records {
+                if let Some(value) = &mut r.value {
+                    apply(&r.key, value, &mut seen, &mut changed);
+                }
+            }
+            report.values_seen += seen;
+            report.values_rewritten += changed;
+            if changed == 0 {
+                continue;
+            }
+            let new_meta = SsTableWriter::write(env, &file, meta.seq, meta.level, &records).await?;
+            env.sync(&file).await.map_err(io)?;
+            manifest.tables[i] = new_meta;
+            manifest_dirty = true;
+            report.files_rewritten.push(file);
+        }
+        if manifest_dirty {
+            env.replace(mfile, &encode_manifest(&manifest))
+                .await
+                .map_err(io)?;
+        }
+    }
+    Ok(report)
 }
 
 /// Parse a sync-marker frame at `bytes[pos..]`: `Some((claimed_offset, next))`
@@ -4347,7 +4681,7 @@ fn decode_manifest_v1(mut c: Cursor<'_>) -> Result<Manifest> {
 }
 
 fn io(e: std::io::Error) -> StorageError {
-    StorageError::Backend(e.to_string())
+    StorageError::from_io(&e)
 }
 
 #[cfg(test)]

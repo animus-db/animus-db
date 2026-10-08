@@ -653,6 +653,10 @@ pub enum Metric {
     /// rate under a hint-chasing forward means abandoned server-side work is
     /// piling up, not necessarily a client bug (see the issue #596 lesson).
     ClientRequestsAbandoned,
+    /// A connection authenticated only by a peer-region CA certificate (issue
+    /// #1253) sent a request other than the MREC replication frame on the
+    /// intra port and was refused.
+    PeerRegionRequestRefused,
 
     // --- Per-table throttling (ADR 0065, W-08 step 2/3) --- Appended after
     // the client-cancellation variant above; every earlier variant's slot
@@ -959,12 +963,125 @@ pub enum Metric {
     /// sustained non-zero value needs an operator (`/admin/raftkv`'s
     /// per-group `refused_as_voter` names which tablet).
     CpGroupsRefusedAsVoter,
+
+    // --- Overload shedding (R-01 (d), ADR 0074 §2; appended, same slot-stability
+    // discipline) --- One counter per refusal reason; recorded by `animusd`'s
+    // listeners (`overload` module). A shed is always a prompt refusal, never a
+    // queue, so these are the only trace an operator has of load being turned away.
+    /// A new connection on the DynamoDB listener was refused (answered
+    /// `503 ServiceUnavailable` and closed, or closed outright) because the
+    /// listener was at its `max_connections` cap. Reason `conn_cap`.
+    OverloadShedConnCap,
+    /// A DynamoDB request was answered `503 ServiceUnavailable` immediately
+    /// because the node was already executing `max_inflight_requests`
+    /// requests. Reason `admission`.
+    OverloadShedAdmission,
+    /// A new connection on the admin or console listener was refused because
+    /// that listener was at its `max_admin_connections` cap.
+    OverloadShedAdminConnCap,
+    /// A new connection on the client-protocol or intra listener was closed
+    /// because that listener was at its `max_peer_connections` cap.
+    OverloadShedPeerConnCap,
+    // --- DynamoDB wire request outcomes (R-01 (f), appended; same slot-stability discipline) ---
+    // Recorded by `animusd::dynamo`'s per-connection loop, once per request that
+    // reached `dispatch` (i.e. past the `/metrics` route and the SigV4 gate).
+    // They exist so a Prometheus alert can express a server-fault ratio
+    // (`dynamo_responses_5xx / dynamo_requests_total`); a throttled or invalid
+    // request is a 4xx and is deliberately not counted as a fault.
+    /// A DynamoDB-wire request was dispatched (every response status).
+    DynamoRequestsTotal,
+    /// A dispatched DynamoDB-wire request answered with an HTTP 5xx status
+    /// (`InternalServerError`/`ServiceUnavailable`: the server, not the client
+    /// or a throttle, failed it).
+    DynamoResponses5xx,
+
+    // --- Cluster-version feature-gate observability (ADR 0073 Phase 2, P2-C;
+    // appended, same slot-stability discipline). Each is a **level** mirrored
+    // from `animus_control::version::ClusterFeatures::violations(surface)` via
+    // `MetricsHandle::set` (the handle, not this crate, owns the count: this
+    // crate cannot depend on `animus-control`). A violation is an emitter
+    // that tried to put a value on the wire (or into a proposal) whose
+    // feature gate was closed on this node; the emit is refused and a debug
+    // build asserts, so any non-zero value is a bug to chase. Expected `0`.
+    /// Gate violations on control `RaftMsg` sends.
+    ClusterGateViolationsRaftMsg,
+    /// Gate violations on `MetaCommand` proposals and relays.
+    ClusterGateViolationsMetaCommand,
+    /// Gate violations on tablet `KvWire` sends.
+    ClusterGateViolationsKvWire,
+    /// Gate violations on tablet `KvCommand` proposals.
+    ClusterGateViolationsKvCommand,
+    /// Gate violations on `ClientRequest` frames this node sent.
+    ClusterGateViolationsClientRequest,
+    /// Gate violations on `ClientResponse` frames this node sent.
+    ClusterGateViolationsClientResponse,
+    /// A relayed `ProposeSchema` this node *received* and refused because the
+    /// command's gate is closed in this node's own view (`animusd`'s relay
+    /// receiver). A counter, not a level: the sender is another node.
+    ClusterGateRelayRefused,
+
+    // --- Disk-full semantics (R-01 (d), ADR 0074 §2 / `docs/resource-bounds.md`
+    // §3; appended, same slot-stability discipline) ---
+    /// A mutating request was refused with a named `StorageFull` error
+    /// (HTTP 503 `ServiceUnavailable`, message begins `StorageFull:`) because
+    /// the hosted tablet group's own write-ahead log is suspect after an
+    /// ENOSPC and has not yet been rewritten onto free space. Reason
+    /// `storage_full`. Reads are never refused for this reason.
+    OverloadStorageFull,
+    // --- Preferred-leader mechanism (ADR 0075 section 3.3, G-01 stage G-c) ---
+    /// A leader this node held was handed to a voter in the table's preferred
+    /// region (or away from a witness region) by the tablet-host reconciler's
+    /// preferred-leader step: the transfer was **armed**. A counter, bumped
+    /// once per armed transfer; steady state is zero.
+    CpPreferredLeaderTransfers,
+    /// The preferred-leader step chose a target but `transfer_leadership`
+    /// refused to arm (target not caught up, config change in flight, ...).
+    /// Retried on the next tick without resetting the stability window.
+    CpPreferredLeaderTransferRejected,
+    // --- MREC global tables (ADR 0075 section 4, G-01 stage G-d M3) ---
+    /// The MREC receiver answered `Retry` for a replicated record because its
+    /// stamp's wall part was further ahead of this node's `wall_now` than
+    /// `cluster_settings.mrec_max_clock_skew_ms` (a fast-clocked peer region,
+    /// or a bug). A counter: the shipper re-sends until local time catches up,
+    /// so a sustained non-zero rate is the skew alarm. Expected `0`.
+    MrecSkewRejectedTotal,
+    // --- MREC shipper (G-d M4) ---
+    /// Rows the shipper delivered to a peer (applied or superseded). A counter.
+    MrecShippedRowsTotal,
+    /// Shipping attempts that failed (transport error, refusal, `Retry`
+    /// answers). A counter; a sustained rate is a peer outage or an operator
+    /// error (see `/admin/global-tables`).
+    MrecShipErrorsTotal,
+    /// A peer fell past the retention cap (or a tablet had no cursor) and the
+    /// shipper started a full resync scan. A counter; expected `0` outside an
+    /// outage longer than `mrec_max_backlog`.
+    MrecResyncTotal,
+    /// Dirty keys the shipper still owed its peers at the end of its last tick
+    /// (a gauge, node-wide sum of the last value per tablet/peer).
+    MrecPendingRecords,
+    /// Age in ms of the oldest unshipped change at the shipper's last tick (a
+    /// gauge; the AWS `ReplicationLatency` analogue, the max over peers).
+    MrecReplicationLagMs,
+
+    // --- Issue #1220 (R-01 / production-readiness D-7; resource-bounds §3
+    // item 6; appended, same slot-stability discipline) ---
+    /// Count of spawned background tasks (any, through `Spawner::spawn`) that
+    /// panicked (`ProdEnv::spawned_task_panics`). Always 0 under `SimEnv`.
+    /// Any nonzero value is a bug; alert on it.
+    SpawnedTaskPanics,
+    /// Count of **consensus-loop** tasks that panicked: the control-plane Raft
+    /// driver and `Metadata` apply loop, and each CP-data group's Raft driver
+    /// and apply loop (spawned via `Spawner::spawn_critical`). Such a task
+    /// never restarts, so the node is silently dead for that group; nonzero
+    /// flips `/admin/health` to 503 (`consensus_task_panics` field) for the
+    /// life of the process.
+    ConsensusTaskPanics,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 110] = [
+    pub const ALL: [Metric; 135] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -1049,6 +1166,7 @@ impl Metric {
         Metric::CpEngineRebuilt,
         Metric::CpEngineRebuildFailed,
         Metric::ClientRequestsAbandoned,
+        Metric::PeerRegionRequestRefused,
         Metric::ThrottledWrites,
         Metric::ThrottledReads,
         Metric::AuthRotatedSecretUsed,
@@ -1075,6 +1193,30 @@ impl Metric {
         Metric::CpRemovalNoticesIgnored,
         Metric::CpDepartingPeersDropped,
         Metric::CpGroupsRefusedAsVoter,
+        Metric::OverloadShedConnCap,
+        Metric::OverloadShedAdmission,
+        Metric::OverloadShedAdminConnCap,
+        Metric::OverloadShedPeerConnCap,
+        Metric::DynamoRequestsTotal,
+        Metric::DynamoResponses5xx,
+        Metric::ClusterGateViolationsRaftMsg,
+        Metric::ClusterGateViolationsMetaCommand,
+        Metric::ClusterGateViolationsKvWire,
+        Metric::ClusterGateViolationsKvCommand,
+        Metric::ClusterGateViolationsClientRequest,
+        Metric::ClusterGateViolationsClientResponse,
+        Metric::ClusterGateRelayRefused,
+        Metric::OverloadStorageFull,
+        Metric::CpPreferredLeaderTransfers,
+        Metric::CpPreferredLeaderTransferRejected,
+        Metric::MrecSkewRejectedTotal,
+        Metric::MrecShippedRowsTotal,
+        Metric::MrecShipErrorsTotal,
+        Metric::MrecResyncTotal,
+        Metric::MrecPendingRecords,
+        Metric::MrecReplicationLagMs,
+        Metric::SpawnedTaskPanics,
+        Metric::ConsensusTaskPanics,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -1166,6 +1308,7 @@ impl Metric {
             Metric::CpEngineRebuilt => "cp_engine_rebuilt",
             Metric::CpEngineRebuildFailed => "cp_engine_rebuild_failed",
             Metric::ClientRequestsAbandoned => "client_requests_abandoned",
+            Metric::PeerRegionRequestRefused => "peer_region_request_refused",
             Metric::ThrottledWrites => "throttled_writes",
             Metric::ThrottledReads => "throttled_reads",
             Metric::AuthRotatedSecretUsed => "auth_rotated_secret_used",
@@ -1192,6 +1335,32 @@ impl Metric {
             Metric::CpRemovalNoticesIgnored => "cp_removal_notices_ignored",
             Metric::CpDepartingPeersDropped => "cp_departing_peers_dropped",
             Metric::CpGroupsRefusedAsVoter => "cp_groups_refused_as_voter",
+            Metric::OverloadShedConnCap => "overload_shed_conn_cap",
+            Metric::OverloadShedAdmission => "overload_shed_admission",
+            Metric::OverloadShedAdminConnCap => "overload_shed_admin_conn_cap",
+            Metric::OverloadShedPeerConnCap => "overload_shed_peer_conn_cap",
+            Metric::DynamoRequestsTotal => "dynamo_requests_total",
+            Metric::DynamoResponses5xx => "dynamo_responses_5xx",
+            Metric::ClusterGateViolationsRaftMsg => "cluster_gate_violations_raft_msg",
+            Metric::ClusterGateViolationsMetaCommand => "cluster_gate_violations_meta_command",
+            Metric::ClusterGateViolationsKvWire => "cluster_gate_violations_kv_wire",
+            Metric::ClusterGateViolationsKvCommand => "cluster_gate_violations_kv_command",
+            Metric::ClusterGateViolationsClientRequest => "cluster_gate_violations_client_request",
+            Metric::ClusterGateViolationsClientResponse => {
+                "cluster_gate_violations_client_response"
+            }
+            Metric::ClusterGateRelayRefused => "cluster_gate_relay_refused",
+            Metric::OverloadStorageFull => "overload_storage_full",
+            Metric::CpPreferredLeaderTransfers => "cp_preferred_leader_transfers",
+            Metric::CpPreferredLeaderTransferRejected => "cp_preferred_leader_transfer_rejected",
+            Metric::MrecSkewRejectedTotal => "mrec_skew_rejected_total",
+            Metric::MrecShippedRowsTotal => "mrec_shipped_rows_total",
+            Metric::MrecShipErrorsTotal => "mrec_ship_errors_total",
+            Metric::MrecResyncTotal => "mrec_resync_total",
+            Metric::MrecPendingRecords => "mrec_pending_records",
+            Metric::MrecReplicationLagMs => "mrec_replication_lag_ms",
+            Metric::SpawnedTaskPanics => "spawned_task_panics",
+            Metric::ConsensusTaskPanics => "consensus_task_panics",
         }
     }
 

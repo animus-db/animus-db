@@ -159,9 +159,27 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         let replicas = &meta.tablets.get(&tablet)?.replicas;
         let me = self.data.as_ref().map(|d| &d.base_id);
         let route = self.intra_route_snapshot();
+        // ADR 0075 section 3.6: never forward an eventual read to a witness
+        // replica (it declines every one, see `RaftKvNode::set_witness`).
+        let witness_region = meta
+            .tablets
+            .get(&tablet)
+            .and_then(|t| t.table.as_deref())
+            .and_then(|t| meta.schemas.get(t))
+            .and_then(|s| s.global.as_ref())
+            .filter(|g| g.is_mrsc())
+            .and_then(|g| g.witness.as_deref());
         replicas
             .iter()
             .filter(|id| Some(*id) != me)
+            .filter(|id| {
+                witness_region.is_none_or(|w| {
+                    meta.members
+                        .get(*id)
+                        .and_then(|m| m.labels.get(animus_control::timing::REGION_LABEL))
+                        .is_none_or(|r| r != w)
+                })
+            })
             .find_map(|id| route.get(id).cloned())
     }
 

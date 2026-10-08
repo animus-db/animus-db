@@ -11,7 +11,7 @@ website/
   how-it-works.html     the whole system on one page
   architecture.html     reference: the two planes, consistency, deployment, ports, limits
   compatibility.html    reference: DynamoDB operation-by-operation status
-  performance.html      reference: the cost model (no benchmarks yet, and why)
+  performance.html      reference: the cost model, the benchmark methodology (no published numbers yet)
   licence.html          reference: AGPL-3.0 scenario by scenario
   docs.html             documentation — concepts, architecture, API, operations
   install.html          build, run a cluster, connect, deploy

@@ -14,7 +14,8 @@ use animus_env::NodeId;
 #[cfg(test)]
 use animus_env::nid;
 use animus_placement::{
-    Candidate, PlacementPolicy, rebalance_step, replan, replan_repair, select_replicas,
+    Candidate, PlacementPolicy, rebalance_step, replan, replan_pinned, replan_repair,
+    select_replicas,
 };
 use animus_tablet::{
     Epoch, InPlaceSplitIntent, KeyRange, SplitChild, TOKEN_BYTES, Tablet, TabletId, TabletState,
@@ -22,7 +23,7 @@ use animus_tablet::{
 use serde::{Deserialize, Serialize};
 
 use crate::schema::{
-    IndexDef, IndexStatus, PitrSpec, ProvisionedThroughput, SchemaCatalog, StreamSpec,
+    IndexDef, IndexKind, IndexStatus, PitrSpec, ProvisionedThroughput, SchemaCatalog, StreamSpec,
     StreamViewType, TableName, TableSchema, TtlSpec,
 };
 use crate::version::{ClusterVersion, NodeVersion, VersionRange};
@@ -107,6 +108,26 @@ pub struct Member {
     /// attempted or required.
     #[serde(default)]
     pub has_activated: bool,
+}
+
+impl Member {
+    /// Why this member alone blocks [`MetaCommand::FinalizeClusterVersion`]
+    /// (ADR 0073 decision 6), if it does: a `Down` or `Leaving` member, or a
+    /// `Joining` one that never activated. Such a node still holds replicas
+    /// and maybe a vote, and returning on an old binary after a finalize it
+    /// would be refused for good. The one source of truth for the apply arm
+    /// and `animusd`'s admin pre-check (issue #1168).
+    #[must_use]
+    pub fn finalize_block_reason(&self) -> Option<&'static str> {
+        match self.status {
+            NodeStatus::Down => Some("member is Down"),
+            NodeStatus::Leaving => Some("member is Leaving"),
+            NodeStatus::Joining if !self.has_activated => {
+                Some("member is Joining (never activated)")
+            }
+            NodeStatus::Joining | NodeStatus::Active => None,
+        }
+    }
 }
 
 /// A member's full address book (ADR 0032 PR1): every listen address a node
@@ -568,6 +589,35 @@ pub struct Metadata {
     /// the default so era-0 bytes match Phase 1's.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub cluster_version: u32,
+}
+
+/// G-01 stage G-a: `RegisterNode`'s one narrow label write onto an
+/// **already-present** member row — fill the labels in iff the row's own are
+/// empty and the registration carries some. Returns whether it changed
+/// anything. Never overwrites a non-empty label set and never touches
+/// `status`/`has_activated`.
+///
+/// Why it exists: a founding member's row can be inserted by `bootstrap`'s
+/// `UpsertMember { labels: {} }` (or an operator's bare `admin_add_member`)
+/// *before* the node's own self-registration — carrying the topology labels
+/// resolved from its pod's node — reaches the log, and no relayable command
+/// can fix the row afterwards (`UpsertMember` is relayable only as `Down`).
+/// Without this the placement spread policy would silently see an unlabelled
+/// node depending on a startup race. Also lets a restart of a previously
+/// unlabelled node (same addresses, the idempotent arm) label it. Changing a
+/// non-empty label set is deliberately still unsupported.
+fn fill_empty_labels(
+    members: &mut BTreeMap<NodeId, Member>,
+    node: &NodeId,
+    labels: &BTreeMap<String, String>,
+) -> bool {
+    match members.get_mut(node) {
+        Some(m) if m.labels.is_empty() && !labels.is_empty() => {
+            m.labels = labels.clone();
+            true
+        }
+        _ => false,
+    }
 }
 
 fn is_zero_u32(v: &u32) -> bool {
@@ -2190,6 +2240,100 @@ pub enum MetaCommand {
         table: TableName,
         spec: Option<TtlSpec>,
     },
+    /// **Convert an empty table to a global table** (ADR 0075 section 3, G-01
+    /// stage G-c): record its [`GlobalTableSpec`](crate::schema::GlobalTableSpec)
+    /// in `schema.global` **and**, in the same apply, replace the
+    /// placement policy of every tablet of the table with the pinned
+    /// [`PlacementPolicy::mrsc`] over `spec.regions` (one command, one apply:
+    /// there is never a window where the table is global with a simple policy,
+    /// or pinned with no spec). Replica movement then converges through the
+    /// ordinary reconcile path (`reconcile_placement`'s pinned branch).
+    ///
+    /// Rejected (deterministically, state-based, never gate-based) when the
+    /// table has no schema, is already global with a *different* spec, the
+    /// spec is invalid, TTL is enabled, the table has an LSI, or it has no
+    /// tablets. Re-applying an identical spec is a no-op.
+    ///
+    /// **Gate: `Gate::GlobalTables`** (cluster version 2). An older voter
+    /// cannot decode this variant, so it is emitted only once the cluster
+    /// version reaches 2.
+    ConvertTableToGlobal {
+        table: TableName,
+        spec: crate::schema::GlobalTableSpec,
+    },
+    /// **Re-point a global table's preferred-leader Region** (ADR 0075 section
+    /// 3.3, G-01 stage G-c): sets `schema.global.preferred_leader_region`, which
+    /// each node's tablet-host reconciler reads (via `MetadataView`) to steer
+    /// the table's leaders. Placement is untouched — the replica set is already
+    /// one per Region.
+    ///
+    /// Rejected (state-based) when the table has no schema or is not global,
+    /// the Region is not one of the table's Regions, or it is the table's
+    /// witness. Setting the Region it already has is a no-op.
+    ///
+    /// **Gate: `Gate::GlobalTables`** — the same single gate as
+    /// [`ConvertTableToGlobal`](Self::ConvertTableToGlobal) (everything in
+    /// G-c ships at cluster version 2; a table can only be global once that
+    /// gate is open, so this command is meaningless before it).
+    SetGlobalPreferredLeader { table: TableName, region: String },
+    /// **Convert a table to an MREC (multi-Region eventual-consistency) global
+    /// table** (ADR 0075 section 4, G-01 stage G-d): records
+    /// `schema.global = GlobalTableSpec { consistency: Eventual, replicas:
+    /// [the local replica, Active] }`. `region_id` must equal
+    /// [`mrec_region_id`](crate::schema::mrec_region_id)`(local_region)` (a
+    /// deterministic state-based rejection otherwise). Placement is untouched
+    /// (an MREC table's data stays inside this cluster; the replicas are
+    /// *other clusters*). The table need not be empty. Re-applying the
+    /// identical conversion is a no-op.
+    ///
+    /// **M1 ships the shape and a real, inert apply; nothing emits it yet**
+    /// (the wire surface and replica-create saga are M4).
+    ///
+    /// **Gate: `Gate::MrecReplication`** (cluster version 3).
+    ConvertTableToMrec {
+        table: TableName,
+        local_region: String,
+        region_id: u32,
+    },
+    /// **Add a peer replica to an MREC table** (status `Creating`). `region_id`
+    /// must be `mrec_region_id(region)`. Rejected (state-based) when the table
+    /// is not MREC, the id is wrong or collides, or the replica cap is hit;
+    /// adding an identical replica is a no-op.
+    ///
+    /// **Gate: `Gate::MrecReplication`.**
+    AddMrecReplica {
+        table: TableName,
+        region: String,
+        region_id: u32,
+    },
+    /// **Remove a peer replica from an MREC table.** Removing an absent replica
+    /// is a no-op; removing the local replica is rejected.
+    ///
+    /// **Gate: `Gate::MrecReplication`.**
+    RemoveMrecReplica { table: TableName, region: String },
+    /// **Set an MREC replica's lifecycle status** (stored, not derived: it
+    /// depends on a remote cluster). Rejected for an unknown replica; setting
+    /// the status it already has is a no-op.
+    ///
+    /// **Gate: `Gate::MrecReplication`.**
+    SetMrecReplicaStatus {
+        table: TableName,
+        region: String,
+        status: crate::schema::MrecReplicaStatus,
+    },
+    /// **Record that one tablet's initial copy to a peer replica finished**
+    /// (G-d M4): the tablet's leader-side shipper has shipped every row this
+    /// region originated in that tablet to `region` and switched to the change
+    /// log. The replica-create saga flips the replica `Active` once every
+    /// routable tablet is recorded. Rejected for an unknown replica; a repeat
+    /// is a no-op.
+    ///
+    /// **Gate: `Gate::MrecReplication`.**
+    MarkMrecCopied {
+        table: TableName,
+        region: String,
+        tablet: u64,
+    },
     /// Enable, reconfigure, or disable a table's **provisioned throughput**
     /// (ADR 0065 §5(b)) — the `CreateTable`/`UpdateTable` `BillingMode`/
     /// `ProvisionedThroughput` wire fields' own catalog mutation. Rejected
@@ -2539,7 +2683,9 @@ pub enum MetaCommand {
     /// step. Rejected unless the era is active, `expected` is the current
     /// [`Metadata::cluster_version`] (a CAS), `target == expected + 1`, and
     /// every node in the required set has a `node_versions` entry whose
-    /// range contains `target`. Apply never reads a feature gate.
+    /// range contains `target`, and no member is `Down`, `Leaving` or a
+    /// never-activated `Joining` ([`Member::finalize_block_reason`], issue
+    /// #1168). Apply never reads a feature gate.
     FinalizeClusterVersion {
         expected: ClusterVersion,
         target: ClusterVersion,
@@ -3180,12 +3326,28 @@ fn reconcile_placement(
             // genuinely can, rather than refusing to make any progress —
             // see that function's own doc for the growth-only contract
             // (it never shrinks an already-at-capacity set).
+            //
+            // A **pinned** policy (ADR 0075 MRSC, `PlacementPolicy::
+            // is_pinned`) is repaired with `replan_pinned` instead: plain
+            // `replan_repair` seeds survivors without re-validating the strict
+            // spread, so it can never fix a skewed set (two replicas in one
+            // region), and its best-effort growth would trade away the pin.
+            // A pinned region with no eligible node is an `Err` here (no
+            // command): the replica waits for its region rather than moving
+            // to another.
+            let repair = |pool: &[Candidate]| {
+                if policy.is_pinned() {
+                    replan_pinned(&t.replicas, pool, policy)
+                } else {
+                    replan_repair(&t.replicas, pool, policy)
+                }
+            };
             let desired = if dwelling.is_empty() {
-                replan_repair(&t.replicas, &candidates, policy).ok()?
+                repair(&candidates).ok()?
             } else {
                 let mut augmented = candidates.clone();
                 augmented.extend(dwelling);
-                replan_repair(&t.replicas, &augmented, policy).ok()?
+                repair(&augmented).ok()?
             };
             // `replan_repair` returns a sorted set; `t.replicas` is
             // normalized (sorted + deduped) by `Tablet::new` /
@@ -3559,10 +3721,22 @@ impl Metadata {
                 // caller happens to drive a promotion.
                 let has_activated = self.members.get(node).is_some_and(|m| m.has_activated)
                     || *status == NodeStatus::Active;
+                // An *empty* incoming label set never wipes a non-empty one
+                // already on file. Every status-only caller (the ADR 0012
+                // detector's promotion, `admin_drain`) builds its command
+                // from a read that may predate a `RegisterNode` label
+                // fill-in (`fill_empty_labels`); applied after it, a
+                // wholesale replace silently un-labelled the node (G-01
+                // stage G-a e2e-kind flake). Replacing a non-empty set with
+                // another non-empty one (`admin_add_member`) is unchanged.
+                let labels = match self.members.get(node) {
+                    Some(m) if labels.is_empty() && !m.labels.is_empty() => m.labels.clone(),
+                    _ => labels.clone(),
+                };
                 self.members.insert(
                     node.clone(),
                     Member {
-                        labels: labels.clone(),
+                        labels,
                         status: *status,
                         has_activated,
                     },
@@ -4014,6 +4188,11 @@ impl Metadata {
                 // Tentatively apply, then validate the resulting schema so a
                 // malformed index (e.g. an LSI with no sort attribute) is rejected
                 // deterministically and leaves the schema unchanged.
+                if schema.global.as_ref().is_some_and(|g| g.is_mrsc())
+                    && index.kind == IndexKind::Local
+                {
+                    return ApplyOutcome::Rejected("global table cannot have a local index");
+                }
                 let mut candidate = schema.clone();
                 candidate.upsert_index(index.clone());
                 if candidate.validate().is_err() {
@@ -4763,6 +4942,9 @@ impl Metadata {
                 let Some(schema) = self.schemas.get_mut(table) else {
                     return ApplyOutcome::Rejected("no such table schema");
                 };
+                if spec.is_some() && schema.global.as_ref().is_some_and(|g| g.is_mrsc()) {
+                    return ApplyOutcome::Rejected("global table cannot have TTL enabled");
+                }
                 if schema.ttl == *spec {
                     // Covers both idempotent shapes at once: re-enabling
                     // with the same attribute name, and disabling when
@@ -4772,6 +4954,200 @@ impl Metadata {
                 }
                 schema.ttl = spec.clone();
                 ApplyOutcome::Applied
+            }
+            MetaCommand::ConvertTableToGlobal { table, spec } => {
+                let Some(schema) = self.schemas.get(table) else {
+                    return ApplyOutcome::Rejected("no such table schema");
+                };
+                if let Some(existing) = &schema.global {
+                    return if existing == spec {
+                        ApplyOutcome::NoOp
+                    } else {
+                        ApplyOutcome::Rejected("table is already a global table")
+                    };
+                }
+                if !spec.is_mrsc() {
+                    return ApplyOutcome::Rejected(
+                        "ConvertTableToGlobal takes a strong spec (use ConvertTableToMrec)",
+                    );
+                }
+                if let Err(e) = spec.validate() {
+                    return ApplyOutcome::Rejected(e.message());
+                }
+                if schema.ttl.is_some() {
+                    return ApplyOutcome::Rejected("global table cannot have TTL enabled");
+                }
+                if schema.indexes.iter().any(|i| i.kind == IndexKind::Local) {
+                    return ApplyOutcome::Rejected("global table cannot have a local index");
+                }
+                let tablet_ids: Vec<TabletId> =
+                    self.tablets_for_table(table).map(|(&id, _)| id).collect();
+                if tablet_ids.is_empty() {
+                    return ApplyOutcome::Rejected("table has no tablets to convert");
+                }
+                let policy =
+                    PlacementPolicy::mrsc(format!("mrsc:{table}"), spec.regions.iter().cloned());
+                for id in tablet_ids {
+                    self.policies.insert(id, policy.clone());
+                }
+                if let Some(schema) = self.schemas.get_mut(table) {
+                    schema.global = Some(spec.clone());
+                }
+                ApplyOutcome::Applied
+            }
+            MetaCommand::SetGlobalPreferredLeader { table, region } => {
+                let Some(schema) = self.schemas.get_mut(table) else {
+                    return ApplyOutcome::Rejected("no such table schema");
+                };
+                let Some(global) = schema.global.as_mut() else {
+                    return ApplyOutcome::Rejected("table is not a global table");
+                };
+                if !global.regions.contains(region) {
+                    return ApplyOutcome::Rejected(
+                        "preferred-leader region is not one of the table's regions",
+                    );
+                }
+                if global.witness.as_ref() == Some(region) {
+                    return ApplyOutcome::Rejected("preferred-leader region is the witness");
+                }
+                if global.preferred_leader_region == *region {
+                    return ApplyOutcome::NoOp;
+                }
+                global.preferred_leader_region.clone_from(region);
+                ApplyOutcome::Applied
+            }
+            MetaCommand::ConvertTableToMrec {
+                table,
+                local_region,
+                region_id,
+            } => {
+                let Some(schema) = self.schemas.get_mut(table) else {
+                    return ApplyOutcome::Rejected("no such table schema");
+                };
+                let spec = crate::schema::GlobalTableSpec {
+                    consistency: crate::schema::MultiRegionConsistency::Eventual,
+                    regions: Vec::new(),
+                    witness: None,
+                    preferred_leader_region: String::new(),
+                    replicas: vec![crate::schema::MrecReplica {
+                        region: local_region.clone(),
+                        region_id: *region_id,
+                        status: crate::schema::MrecReplicaStatus::Active,
+                        local: true,
+                        copied: Default::default(),
+                    }],
+                };
+                if let Some(existing) = &schema.global {
+                    return if existing.is_mrec()
+                        && existing.replicas.iter().any(|r| {
+                            r.local && r.region == *local_region && r.region_id == *region_id
+                        }) {
+                        ApplyOutcome::NoOp
+                    } else {
+                        ApplyOutcome::Rejected("table is already a global table")
+                    };
+                }
+                if let Err(e) = spec.validate() {
+                    return ApplyOutcome::Rejected(e.message());
+                }
+                schema.global = Some(spec);
+                ApplyOutcome::Applied
+            }
+            MetaCommand::AddMrecReplica {
+                table,
+                region,
+                region_id,
+            } => {
+                let Some(spec) = self
+                    .schemas
+                    .get_mut(table)
+                    .and_then(|s| s.global.as_mut())
+                    .filter(|g| g.is_mrec())
+                else {
+                    return ApplyOutcome::Rejected("table is not an MREC global table");
+                };
+                if let Some(existing) = spec.replicas.iter().find(|r| r.region == *region) {
+                    return if existing.region_id == *region_id {
+                        ApplyOutcome::NoOp
+                    } else {
+                        ApplyOutcome::Rejected("replica already exists with a different region id")
+                    };
+                }
+                let mut candidate = spec.clone();
+                candidate.replicas.push(crate::schema::MrecReplica {
+                    region: region.clone(),
+                    region_id: *region_id,
+                    status: crate::schema::MrecReplicaStatus::Creating,
+                    local: false,
+                    copied: Default::default(),
+                });
+                if let Err(e) = candidate.validate() {
+                    return ApplyOutcome::Rejected(e.message());
+                }
+                *spec = candidate;
+                ApplyOutcome::Applied
+            }
+            MetaCommand::RemoveMrecReplica { table, region } => {
+                let Some(spec) = self
+                    .schemas
+                    .get_mut(table)
+                    .and_then(|s| s.global.as_mut())
+                    .filter(|g| g.is_mrec())
+                else {
+                    return ApplyOutcome::Rejected("table is not an MREC global table");
+                };
+                let Some(pos) = spec.replicas.iter().position(|r| r.region == *region) else {
+                    return ApplyOutcome::NoOp;
+                };
+                if spec.replicas[pos].local {
+                    return ApplyOutcome::Rejected("cannot remove the local replica");
+                }
+                spec.replicas.remove(pos);
+                ApplyOutcome::Applied
+            }
+            MetaCommand::SetMrecReplicaStatus {
+                table,
+                region,
+                status,
+            } => {
+                let Some(spec) = self
+                    .schemas
+                    .get_mut(table)
+                    .and_then(|s| s.global.as_mut())
+                    .filter(|g| g.is_mrec())
+                else {
+                    return ApplyOutcome::Rejected("table is not an MREC global table");
+                };
+                let Some(replica) = spec.replicas.iter_mut().find(|r| r.region == *region) else {
+                    return ApplyOutcome::Rejected("no such MREC replica");
+                };
+                if replica.status == *status {
+                    return ApplyOutcome::NoOp;
+                }
+                replica.status = *status;
+                ApplyOutcome::Applied
+            }
+            MetaCommand::MarkMrecCopied {
+                table,
+                region,
+                tablet,
+            } => {
+                let Some(spec) = self
+                    .schemas
+                    .get_mut(table)
+                    .and_then(|s| s.global.as_mut())
+                    .filter(|g| g.is_mrec())
+                else {
+                    return ApplyOutcome::Rejected("table is not an MREC global table");
+                };
+                let Some(replica) = spec.replicas.iter_mut().find(|r| r.region == *region) else {
+                    return ApplyOutcome::Rejected("no such MREC replica");
+                };
+                if replica.copied.insert(*tablet) {
+                    ApplyOutcome::Applied
+                } else {
+                    ApplyOutcome::NoOp
+                }
             }
             MetaCommand::SetTableThroughput { table, spec } => {
                 let Some(schema) = self.schemas.get_mut(table) else {
@@ -5167,6 +5543,20 @@ impl Metadata {
                 if expected.checked_add(1) != Some(*target) {
                     return ApplyOutcome::Rejected("target must be exactly expected + 1");
                 }
+                // Decision 6 (issue #1168): the status half is enforced here,
+                // not only in the admin pre-check, which reads an applied
+                // cache and so can race a concurrent status flip. Apply is a
+                // pure function of the replicated state, so every replica
+                // agrees; this is a state check, never a feature gate.
+                if self
+                    .members
+                    .values()
+                    .any(|m| m.finalize_block_reason().is_some())
+                {
+                    return ApplyOutcome::Rejected(
+                        "blocked: a member is Down, Leaving, or a never-activated Joining",
+                    );
+                }
                 for node in self.required_version_set() {
                     match self.node_versions.get(&node) {
                         None => {
@@ -5246,6 +5636,9 @@ impl Metadata {
                             );
                             return ApplyOutcome::Applied;
                         }
+                        if claims_membership && fill_empty_labels(&mut self.members, node, labels) {
+                            return ApplyOutcome::Applied;
+                        }
                         ApplyOutcome::NoOp
                     }
                     Some(_) => {
@@ -5270,6 +5663,8 @@ impl Metadata {
                                     has_activated: false,
                                 },
                             );
+                        } else if claims_membership {
+                            fill_empty_labels(&mut self.members, node, labels);
                         }
                         ApplyOutcome::Applied
                     }
@@ -5320,6 +5715,47 @@ impl Metadata {
     #[must_use]
     pub fn table_ttl(&self, table: &str) -> Option<&TtlSpec> {
         self.schemas.get(table).and_then(|s| s.ttl.as_ref())
+    }
+
+    /// This table's global-table configuration (ADR 0075), if it is one.
+    /// `None` for an unknown table or a regional one. A read accessor for the
+    /// wire adapter (`DescribeTable`, the MRSC restrictions) and the
+    /// preferred-leader view, mirroring [`table_ttl`](Self::table_ttl).
+    #[must_use]
+    pub fn table_global(&self, table: &str) -> Option<&crate::schema::GlobalTableSpec> {
+        self.schemas.get(table).and_then(|s| s.global.as_ref())
+    }
+
+    /// The Regions in which **every** routable tablet of `table` has a replica
+    /// in its current (desired) replica set — what `DescribeTable` reports as
+    /// `ACTIVE` for a global table (ADR 0075 section 3.5, plan decision D4:
+    /// replica status is *derived*, never stored). A Region is a
+    /// `topology.kubernetes.io/region` label value of the replica's member; a
+    /// replica whose member carries no such label (or no member row) counts for
+    /// no Region. Empty for a table with no routable tablet.
+    ///
+    /// Reflects the **desired** replica set (`Tablet::replicas`), not Raft
+    /// voter promotion: honest but slightly optimistic while a learner is still
+    /// catching up.
+    #[must_use]
+    pub fn table_ready_regions(&self, table: &str) -> BTreeSet<String> {
+        let mut ready: Option<BTreeSet<String>> = None;
+        for (_, tablet) in self
+            .tablets_for_table(table)
+            .filter(|(_, t)| t.is_routable())
+        {
+            let here: BTreeSet<String> = tablet
+                .replicas
+                .iter()
+                .filter_map(|n| self.members.get(n))
+                .filter_map(|m| m.labels.get(crate::timing::REGION_LABEL).cloned())
+                .collect();
+            ready = Some(match ready {
+                None => here,
+                Some(acc) => acc.intersection(&here).cloned().collect(),
+            });
+        }
+        ready.unwrap_or_default()
     }
 
     /// This table's provisioned throughput configuration (ADR 0065 §5(b)),
@@ -6217,6 +6653,17 @@ impl crate::version::GatedCommand for MetaCommand {
     fn required_gate(&self) -> crate::version::Gate {
         use crate::version::Gate;
         match self {
+            // Test/sim builds: the `synthetic.gate` label makes an
+            // `UpsertMember` require a synthetic gate (the gate ladder).
+            #[cfg(any(test, feature = "sim-versions"))]
+            MetaCommand::UpsertMember { labels, .. }
+                if labels.contains_key(crate::version::SYNTHETIC_GATE_LABEL) =>
+            {
+                labels
+                    .get(crate::version::SYNTHETIC_GATE_LABEL)
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .map_or(Gate::Base, Gate::Synthetic)
+            }
             MetaCommand::NoOp
             | MetaCommand::UpsertMember { .. }
             | MetaCommand::CreateTablet { .. }
@@ -6265,6 +6712,25 @@ impl crate::version::GatedCommand for MetaCommand {
             | MetaCommand::PutCredential { .. }
             | MetaCommand::RotateCredential { .. }
             | MetaCommand::RevokeCredential { .. } => Gate::Base,
+            // ADR 0075 (G-01 stage G-c): the first real gate. An older voter
+            // cannot decode the variant nor the `TableSchema.global` /
+            // `PlacementPolicy.allowed_values` fields it writes.
+            // A `ConvertTableToGlobal` whose spec is `Eventual` would smuggle an
+            // MREC shape through the version-2 gate (apply rejects it, but a
+            // Release(2) voter would fail to *decode* it): classify by content.
+            MetaCommand::ConvertTableToGlobal { spec, .. } if spec.is_mrec() => {
+                Gate::MrecReplication
+            }
+            MetaCommand::ConvertTableToGlobal { .. }
+            | MetaCommand::SetGlobalPreferredLeader { .. } => Gate::GlobalTables,
+            // ADR 0075 (G-01 stage G-d): the MREC commands, one gate; an older
+            // voter cannot decode the variants nor `Eventual` /
+            // `GlobalTableSpec.replicas`.
+            MetaCommand::ConvertTableToMrec { .. }
+            | MetaCommand::AddMrecReplica { .. }
+            | MetaCommand::RemoveMrecReplica { .. }
+            | MetaCommand::SetMrecReplicaStatus { .. }
+            | MetaCommand::MarkMrecCopied { .. } => Gate::MrecReplication,
             MetaCommand::ReportNodeVersion { .. } | MetaCommand::FinalizeClusterVersion { .. } => {
                 Gate::Era
             }
@@ -11329,7 +11795,9 @@ mod tests {
             m.apply(&MetaCommand::RegisterNode {
                 node: nid(901),
                 addrs: cas_addrs(1),
-                labels: BTreeMap::new(),
+                // Non-empty: G-a's fill-in only ever labels an *unlabelled*
+                // row, so a differing later label set must stay a NoOp.
+                labels: [("region".to_owned(), "us-east".to_owned())].into(),
             }),
             ApplyOutcome::Applied
         );
@@ -11478,6 +11946,117 @@ mod tests {
             "RegisterNode must never overwrite labels a different command already set"
         );
         assert_eq!(member.status, NodeStatus::Down);
+    }
+
+    /// G-01 stage G-a: a member row inserted *unlabelled* (bootstrap's
+    /// `UpsertMember { labels: {} }` winning the race against the node's own
+    /// self-registration) gets its labels filled in by the later
+    /// `RegisterNode` — status and `has_activated` untouched — on both the
+    /// unclaimed-address arm and the idempotent same-addresses re-registration
+    /// arm (a restart of a previously unlabelled node); a non-empty label set
+    /// is never overwritten.
+    #[test]
+    fn register_node_fills_in_labels_on_an_unlabelled_member_but_never_overwrites() {
+        let zone = |z: &str| -> BTreeMap<String, String> {
+            [("topology.kubernetes.io/zone".to_owned(), z.to_owned())].into()
+        };
+        let mut m = Metadata::default();
+        m.apply(&MetaCommand::UpsertMember {
+            node: nid(906),
+            labels: BTreeMap::new(),
+            status: NodeStatus::Active,
+        });
+        assert_eq!(
+            m.apply(&MetaCommand::RegisterNode {
+                node: nid(906),
+                addrs: cas_addrs(6),
+                labels: zone("a"),
+            }),
+            ApplyOutcome::Applied
+        );
+        let member = &m.members[&nid(906)];
+        assert_eq!(member.labels, zone("a"));
+        assert_eq!(member.status, NodeStatus::Active);
+        assert!(member.has_activated);
+        // A different label set never overwrites a non-empty one.
+        assert_eq!(
+            m.apply(&MetaCommand::RegisterNode {
+                node: nid(906),
+                addrs: cas_addrs(6),
+                labels: zone("b"),
+            }),
+            ApplyOutcome::NoOp
+        );
+        assert_eq!(m.members[&nid(906)].labels, zone("a"));
+
+        // Idempotent arm: addresses already on file, member row unlabelled.
+        let mut m = Metadata::default();
+        m.apply(&MetaCommand::RegisterNode {
+            node: nid(907),
+            addrs: cas_addrs(7),
+            labels: BTreeMap::new(),
+        });
+        assert_eq!(
+            m.apply(&MetaCommand::RegisterNode {
+                node: nid(907),
+                addrs: cas_addrs(7),
+                labels: zone("c"),
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(m.members[&nid(907)].labels, zone("c"));
+        assert_eq!(m.members[&nid(907)].status, NodeStatus::Down);
+    }
+
+    /// G-01 stage G-a e2e-kind flake (one random member left unlabelled, run
+    /// 37202693323): a status-only `UpsertMember` built from a *stale* read
+    /// (the ADR 0012 detector's `Down`->`Active` promotion, `admin_drain`)
+    /// carries the then-empty label set and, applying after the node's own
+    /// `RegisterNode` filled the labels in, must NOT wipe them. A non-empty
+    /// incoming set still replaces (the admin add-member path).
+    #[test]
+    fn upsert_member_with_empty_labels_never_wipes_a_filled_in_label_set() {
+        let zone = |z: &str| -> BTreeMap<String, String> {
+            [("topology.kubernetes.io/zone".to_owned(), z.to_owned())].into()
+        };
+        let mut m = Metadata::default();
+        // bootstrap / admin_add_member inserts the row unlabelled, Down.
+        m.apply(&MetaCommand::UpsertMember {
+            node: nid(910),
+            labels: BTreeMap::new(),
+            status: NodeStatus::Down,
+        });
+        // The detector reads this row (labels empty) and builds the promotion...
+        // ...but the node's own registration commits first and fills the labels.
+        m.apply(&MetaCommand::RegisterNode {
+            node: nid(910),
+            addrs: cas_addrs(10),
+            labels: zone("a"),
+        });
+        // The stale promotion now applies.
+        assert_eq!(
+            m.apply(&MetaCommand::UpsertMember {
+                node: nid(910),
+                labels: BTreeMap::new(),
+                status: NodeStatus::Active,
+            }),
+            ApplyOutcome::Applied
+        );
+        let member = &m.members[&nid(910)];
+        assert_eq!(member.status, NodeStatus::Active);
+        assert!(member.has_activated);
+        assert_eq!(
+            member.labels,
+            zone("a"),
+            "stale empty-label upsert wiped labels"
+        );
+        // A non-empty set still replaces.
+        m.apply(&MetaCommand::UpsertMember {
+            node: nid(910),
+            labels: zone("b"),
+            status: NodeStatus::Active,
+        });
+        assert_eq!(m.members[&nid(910)].labels, zone("b"));
     }
 
     /// **The bug an integration test caught** (`animusd`'s `control_only_

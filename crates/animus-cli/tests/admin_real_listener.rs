@@ -43,6 +43,8 @@ fn role_addrs(tls: Option<TlsSection>) -> RoleAddrs {
         advertise_host: None,
         tls,
         encryption_key_path: None,
+        labels: Default::default(),
+        overload: None,
     }
 }
 
@@ -70,6 +72,8 @@ async fn start_node(dir: &Path, tls: Option<TlsSection>) -> Node {
             advertise_host: None,
             tls,
             encryption_key_path: None,
+            labels: Default::default(),
+            overload: None,
         }],
         dynamo_auth: None,
         cluster_settings: None,
@@ -106,6 +110,7 @@ fn test_pki(dir: &Path) -> (TlsSection, std::path::PathBuf) {
             cert_path,
             key_path,
             ca_path: Some(ca_path.clone()),
+            peer_ca_path: None,
         },
         ca_path,
     )
@@ -160,6 +165,80 @@ async fn run_admin_until(sub: &str, addr: SocketAddr, ca: Option<&Path>, ok: fn(
     }
 }
 
+/// Run `animus [--tls-ca CA] <args...>` until its stdout satisfies `ok`
+/// (regardless of exit status: a refused `roll plan` exits 1 by design) or
+/// `OVERALL` elapses.
+async fn run_cli_stdout_until(
+    args: Vec<String>,
+    ca: Option<&Path>,
+    ok: fn(&str) -> bool,
+) -> String {
+    let ca = ca.map(Path::to_path_buf);
+    tokio::task::spawn_blocking(move || {
+        let deadline = Instant::now() + OVERALL;
+        loop {
+            let mut cmd = Command::new(animus_bin());
+            if let Some(ca) = &ca {
+                cmd.arg("--tls-ca").arg(ca);
+            }
+            let o = cmd.args(&args).output().expect("spawn animus");
+            let stdout = String::from_utf8_lossy(&o.stdout).into_owned();
+            if ok(&stdout) {
+                return stdout;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "`animus {args:?}` never produced the expected output: status {:?}\nstdout: {stdout}\nstderr: {}",
+                o.status,
+                String::from_utf8_lossy(&o.stderr)
+            );
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    })
+    .await
+    .expect("join")
+}
+
+/// `cluster roll status|plan` (ADR 0073 Phase 3, P3-B) over the real admin
+/// listener: the endpoints it reads (`cluster-version`, `roll-health`, `raft`)
+/// are the real ones, and the CLI's parse of them must work end to end.
+async fn roll_commands_work(addr: SocketAddr, ca: Option<&Path>) {
+    let a = addr.to_string();
+    let status = run_cli_stdout_until(
+        ["cluster", "roll", "status", &a].map(String::from).to_vec(),
+        ca,
+        |s| s.contains("active cluster version:") && s.contains("roll health:"),
+    )
+    .await;
+    assert!(status.contains("next:"), "{status}");
+    // A one-node cluster cannot hand its control leadership to anyone, so the
+    // plan is refused (exit 1) by name; the cluster state is still printed.
+    // (Once the node is seen on the new binary, via its recorded range or its
+    // own `cluster-version` probe, there is nothing to restart at all.)
+    let plan = run_cli_stdout_until(
+        ["cluster", "roll", "plan", &a].map(String::from).to_vec(),
+        ca,
+        |s| {
+            s.contains("nodes:")
+                && (s.contains("refused:")
+                    || s.contains("roll order:")
+                    || s.contains("nothing to restart"))
+        },
+    )
+    .await;
+    assert!(plan.contains("cluster version: active"), "{plan}");
+    let json = run_cli_stdout_until(
+        ["cluster", "roll", "status", &a, "--json"]
+            .map(String::from)
+            .to_vec(),
+        ca,
+        |s| s.trim_start().starts_with('{'),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(json.trim()).expect("status --json is JSON");
+    assert!(v["roll"]["total"].as_u64().is_some(), "{v}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_admin_subcommands_work_against_real_plain_admin_listener() {
     let dir = tempfile::tempdir().unwrap();
@@ -168,6 +247,7 @@ async fn cli_admin_subcommands_work_against_real_plain_admin_listener() {
     // `health` and `config` are flat one-shot admin routes (`http_call`).
     run_admin_until("health", addr, None, |s| !s.trim().is_empty()).await;
     run_admin_until("config", addr, None, |s| s.trim_start().starts_with('{')).await;
+    roll_commands_work(addr, None).await;
     node.shutdown_graceful().await;
 }
 
@@ -182,5 +262,6 @@ async fn cli_admin_subcommands_work_against_real_tls_admin_listener() {
         s.trim_start().starts_with('{')
     })
     .await;
+    roll_commands_work(addr, Some(&ca)).await;
     node.shutdown_graceful().await;
 }

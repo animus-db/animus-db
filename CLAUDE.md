@@ -101,26 +101,58 @@ baseline is set: `9a9f972f` (2026-09-29, see ADR 0073)**. From it on:
 older post-baseline binary wrote, an existing golden fixture is never edited
 or deleted (`scripts/check-format-fixtures.sh` enforces this in CI), and a
 format change is a new version tag plus a new fixture, never a rewrite of an
-old one. **Wire formats** join the same rule once Phase 2 (a replicated
-cluster version / feature gate) lands; **rolling upgrades** once Phase 3
-lands; **Support window: every post-baseline version stays readable forever**
+old one. **Wire formats** follow the same rule as of Phase 2 (done: a
+replicated cluster version and feature gates, below); **rolling upgrades**
+are supported as of Phase 3 (done, below); **Support window: every post-baseline version stays readable forever**
 (2026-09-30) — old decoders and fixtures are never deleted. **Phase 1 is done (2026-10-03):** every durable format has a
 version-dispatching decoder with a `legacy` seam and a per-version fixture
 test, and the upgrade-restart harness (`animus-test` tiers 0/1,
 `animusd` `sim_cluster_upgrade_corpus` tier 2; per-push at K=1, nightly in
 `corpus-deep.yml`) restarts on state transcoded to older versions. So a
 **whole-cluster stop → upgrade → restart is supported and tested**;
-**mixed-version wire and rolling upgrades are not** (Phases 2 and 3 —
-Phase 2, a replicated cluster version / feature gate, is next). The
+**Cluster version is 2 since 2026-10-05** (`MAX_SUPPORTED = 2`, first real gate `Gate::GlobalTables` for `ConvertTableToGlobal`; B2 is pinned to `[1,1]`, ADR 0073's 2026-10-05 amendment). **Phase 2 is done (2026-10-04):** a replicated cluster version and feature
+gates (`Gate`, `ClusterFeatures`, `GatedCommand::required_gate`, ADR 0073
+sections 1-4 and 8), a mixed-version corpus (both tiers, negative controls,
+`ANIMUS_UPGRADE_SEEDS`), and a **manual node-by-node rolling upgrade with no
+stop, from today's Phase 1 binaries to B2 and from release R-1 to R**
+(`animus cluster version` / `animus cluster finalize`; skipping a release,
+rolling a node back and a Phase 1 binary joining after the era started are
+not supported). **Phase 3 is done (2026-10-05): rolling-upgrade orchestration**
+(ADR 0073's Phase 3 design and as-built amendments). Supported: a **manual roll
+with the CLI** (`animus cluster roll plan|wait|status`, `GET /admin/roll-health`,
+`animus cluster finalize`; one node at a time, control leader last after a
+leadership transfer, no drain) and an **operator-orchestrated roll** (a
+`spec.image` or other pod-template edit rolls an `AnimusCluster` of at least
+three nodes one pod at a time behind an operator-owned `StatefulSet` partition and
+the shared `animus-roll` gate; finalize manual by default, `spec.upgrade.finalize:
+Auto` opt-in; `docs/runbook/upgrade.md`). Still no rollback once a node has run the
+new binary, no skipped release, no mid-roll image revert. **Transactions:** #1237 (ungated
+`txn-envelope` v2 intent could panic an N-1 replica) is fixed (#1240); #1238 is the
+previous release's own abort-lookback bug (a v1 intent written before `efcaa6cb`
+carries no prior, so aborting it after LSM GC can lose an acked value), open to
+track a mitigation — rolling *from* a release containing `efcaa6cb` with
+transactions is supported, rolling from an older one (e.g. the R-1 pin `ac57d56a`)
+carries that bug for its still-unresolved intents. **Open:** #1235 (a `SimCluster` Memory-backend restart oddity,
+test-only); the nightly `kind` operator-roll leg (`E2E_UPGRADE=1`) has not had a
+verified run; D4(b), a replicated maintenance mark that suppresses repair churn during
+a roll, is a pending maintainer decision (measured: ADR 0073 as-built). The
 first real bumps have landed (2026-10-03, #1140/#1141/#1142): `control-wal`,
 `shared-wal` and the LSM WAL (`lsm-wal`, `LWL1`) are v2 (WAL sync markers) and
 the harness transcodes them to v1 for real; `raftkv-wal` is v2 too (embedded
-in the control-wal carrier); every other format is still v1, transcoded as
-the identity. **A format change follows ADR 0073's "Phase 1 design"
+in the control-wal carrier); `txn-envelope` (the value-envelope intent tag) is v2
+since 2026-10-04 (an intent carries its prior value, ADR 0018; an engine-row value, so the harness
+down-converts it to v1 with a row transcode, `animus-test` `ROW_TABLE`; class G as well since
+2026-10-05: the snapshot sender ships v1 until `Gate::GlobalTables` opens, #1237); every other format is still v1,
+transcoded as the identity. **A format change follows ADR 0073's "Phase 1 design"
 checklist** ([`docs/adr/0073-upgrade-compatibility.md`](docs/adr/0073-upgrade-compatibility.md):
 bump, keep the vN decoder under `legacy`, new no-overwrite fixture,
 per-version expected value, round-trip and old-input tests, test-only legacy
-encoder, inventory row). Wire changes stay free until Phase 2. See ADR 0073 for the phase
+encoder, inventory row) **plus, for any cross-node surface (a wire or
+replicated shape), the Phase 2 step: classify it G (gated on the cluster
+version or the era), L (node-local) or F (outlives the cluster), and for G
+name its `Gate` (an exhaustive `required_gate` row, no `_` arm; emit sites
+check it, a per-gate test and a mixed-version corpus cell cover it); a new
+cross-node variant or field without a gate wedges older replicas**. See ADR 0073 for the phase
 plan, the conventions (tag shape, fixture layout), and the open questions
 (support window length, the hash-ring/key-encoding layer). A break that
 can't be made compatible needs an explicit ADR amendment naming it and its
@@ -140,6 +172,7 @@ the relevant one before working in a crate:
 | `animus-control` | [crates/animus-control/CLAUDE.md](crates/animus-control/CLAUDE.md) |
 | `animus-cp-data` | [crates/animus-cp-data/CLAUDE.md](crates/animus-cp-data/CLAUDE.md) |
 | `animus-item` | [crates/animus-item/CLAUDE.md](crates/animus-item/CLAUDE.md) |
+| `animus-roll` | [crates/animus-roll/CLAUDE.md](crates/animus-roll/CLAUDE.md) |
 | `animus-test` | [crates/animus-test/CLAUDE.md](crates/animus-test/CLAUDE.md) |
 | `animus-dynamo` | [crates/animus-dynamo/CLAUDE.md](crates/animus-dynamo/CLAUDE.md) |
 | `animus-s3` | [crates/animus-s3/CLAUDE.md](crates/animus-s3/CLAUDE.md) |
@@ -147,6 +180,7 @@ the relevant one before working in a crate:
 | `animus-node` | [crates/animus-node/CLAUDE.md](crates/animus-node/CLAUDE.md) |
 | `animusd` | [crates/animusd/CLAUDE.md](crates/animusd/CLAUDE.md) |
 | `animus-cli` | [crates/animus-cli/CLAUDE.md](crates/animus-cli/CLAUDE.md) |
+| `animus-bench` | [crates/animus-bench/CLAUDE.md](crates/animus-bench/CLAUDE.md) |
 | `animus-operator` | [crates/animus-operator/CLAUDE.md](crates/animus-operator/CLAUDE.md) |
 
 ## Commands
@@ -164,8 +198,10 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all --check
 cargo deny check                                   # licenses + advisories (cargo install cargo-deny)
 scripts/check-format-fixtures.sh                   # ADR 0073 Phase 0: fails if a checked-in format fixture was edited/deleted
+(cd fuzz && cargo test --release --test smoke)    # R-01 (c): deterministic stable smoke of every fuzz target (real libFuzzer: fuzz/README.md)
 cargo bench -p animus-storage                      # ProdEnv smoke of the write/IO path
 cargo bench -p animusd                             # cluster wire benchmark: latency percentiles + degraded phase
+cargo run --release -p animus-bench -- --help      # open-loop YCSB A-F load generator over the DynamoDB wire (docs/benchmarks.md, ADR 0076)
 cargo bench -p animus-cp-data --bench wal_fsync_bench  # ProdEnv WAL fsync bench gating SharedWal wiring (ADR 0028, C-05)
 ```
 
@@ -204,7 +240,12 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 | `ANIMUS_RAFTKV_LSM=1` | off | run the whole raftkv corpus over `LsmEngine<SimEnv>` |
 | `ANIMUS_RAFTKV_WAL_FAULTS=1` | off | run a second pass of the raftkv corpus's crash-based cells (`LeaderKill`/`FollowerKill`) with `torn_tail_on_crash`+`corrupt_on_crash` armed for the whole run |
 | `ANIMUS_UPGRADE_RESTART_SEEDS=K` | 1 | upgrade-restart corpus depth, tiers 1 and 2 (ADR 0073 P1-D): tier 1 `animus-test` `tests/it/upgrade_restart_corpus.rs` — K seeds per cell (21 cells); tier 2 `animusd` `sim_cluster_upgrade_corpus` (whole-cluster restart over `SimCluster`'s `LsmEngine` backend + the DynamoDB wire, 3 cells; `cargo test -p animusd --lib sim_cluster_upgrade_corpus`); `ANIMUS_UPGRADE_RESTART_CELL=<substring>` narrows to matching cells (combine with `ANIMUS_SEED=<seed>` to replay one). |
-| `ANIMUS_UPGRADE_SEEDS=K` | 1 | mixed-version corpus depth (ADR 0073 Phase 2, P2-D; distinct from `ANIMUS_UPGRADE_RESTART_SEEDS`): pure tier `animus-control` `tests/it/version_mixed_corpus.rs` (`cargo test -p animus-control --test it version_mixed_corpus::`, 8 cells) and `animusd` `sim_cluster_mixed_version_corpus` (rolling Phase 1 -> B2 over `SimCluster`, `cargo test -p animusd --lib sim_cluster_mixed_version`); `ANIMUS_UPGRADE_CELL=<substring>` narrows cells, `ANIMUS_SEED=<seed>` replays one. Needs `animus-control`'s `sim-versions` feature (enabled via `animus-test`) |
+| `ANIMUS_UPGRADE_SEEDS=K` | 1 | mixed-version corpus depth (ADR 0073 Phase 2, P2-D; distinct from `ANIMUS_UPGRADE_RESTART_SEEDS`): pure tier `animus-control` `tests/it/version_mixed_corpus.rs` (`cargo test -p animus-control --test it version_mixed_corpus::`, 8 cells) and `animusd` `sim_cluster_mixed_version_corpus` (rolling Phase 1 -> B2 over `SimCluster`, `cargo test -p animusd --lib sim_cluster_mixed_version`) and, since ADR 0073 Phase 3 P3-C, `animusd` `sim_cluster_roll_orchestrator` (the `animus-roll` roll driver over `SimCluster`'s LSM backend, 12 cells, `cargo test -p animusd --lib sim_cluster_roll_orchestrator`); `ANIMUS_UPGRADE_CELL=<substring>` narrows cells, `ANIMUS_SEED=<seed>` replays one. Needs `animus-control`'s `sim-versions` feature (enabled via `animus-test`) |
+| `E2E_UPGRADE`, `ANIMUSD_IMAGE_PREV`, `E2E_UPGRADE_ROLL_TIMEOUT`, `UPGRADE_CLIENT_IMAGE` | 0 / `animusd:e2e-prev` / 1500 / `curlimages/curl:8.10.1` | `kind` operator-driven rolling-upgrade leg of `scripts/e2e-kind.sh` (ADR 0073 Phase 3, D10; nightly `.github/workflows/upgrade-kind-nightly.yml`, not per-push): `E2E_UPGRADE=1` bootstraps on `ANIMUSD_IMAGE_PREV` (the previous release, built from `scripts/upgrade-from.txt`) with `spec.upgrade.finalize: Auto`, starts an in-cluster retrying write client, edits `spec.image` to `ANIMUSD_IMAGE`, and asserts a gated roll (one pod unavailable at most), finalize, and no lost/stalled acked write; plain-TCP only; **unverified** (kind cannot run in the sandbox) |
+| `ANIMUS_UPGRADE_FROM_BIN` / `_REF` / `_REPORT_DIR` / `_RESTART_GAP_SECS` / `_TXN` / `_CONTROL`, `ANIMUS_CLI_BIN` | required / — / — / 0 (12 on the 4-node variant) / unset | previous-release rolling-upgrade `ProdEnv` test (ADR 0073 Phase 3 P3-E, D10; `animusd` `tests/upgrade_previous_release.rs`, `upgrade-from` feature, CI job `upgrade-previous-release`): `_BIN` = the pinned R-1 `animusd` (`scripts/build-upgrade-from.sh`, pin in `scripts/upgrade-from.txt`; **a missing binary fails the test, it never skips**); `_REF` labels it in the report; `_REPORT_DIR` receives the per-variant JSON (rolling steps, D4 repair churn) and, on a failure, history/op-trace/node logs; `_RESTART_GAP_SECS` keeps each node down that long before it restarts (past the 5 s repair dwell the D4 rebuild traffic shows); `_TXN=1` turns multi-key transactions on (off by default: against the pinned `ac57d56a` they expose three known defects, see the test's "Known findings"); `_CONTROL=same-binary\|current-only` runs the same roll with no binary change (triage: mixed-version vs restart/repair defect); `ANIMUS_CLI_BIN` overrides the `animus` binary (default: next to `animusd`). Run: `ANIMUS_UPGRADE_FROM_BIN=$(scripts/build-upgrade-from.sh) cargo test -p animusd --features upgrade-from --test upgrade_previous_release -- --nocapture --test-threads=1` |
+| `ANIMUS_MRSC_SEEDS=K` | 1 | **two corpora share this knob** (ADR 0075, G-01 G-c; each corpus step in `corpus-deep.yml` sets it separately): (1) pure tier, `animus-cp-data` `preferred_leader_corpus` (M2) — 3 regions x 1 node over WAN links, real `host::Reconciler` with `MetadataView.preferred_leader`; cells + negative control (empty preferred map leaves the leader outside the preferred region) — `cargo test -p animus-cp-data --test it preferred_leader_corpus::`; (2) cluster tier, `animusd` `sim_cluster_mrsc` (M4) — 6 nodes, 3 regions x 2, WAN links, LSM engine, table converted over the DynamoDB wire; one `sim_cluster_mrsc_corpus_<cell>` test per cell (steady, region loss leader/follower, partition heal, split, in-region replacement, witness form, decommission guard) + 3 negative controls — `cargo test -p animusd --lib sim_cluster_mrsc`; one seed is ~8 CPU-minutes in a debug build. `ANIMUS_MRSC_CELL=<substring>` narrows (both), `ANIMUS_SEED=<seed>` replays one |
+| `ANIMUS_MREC_SEEDS=K` | 1 | multi-cluster MREC (eventually-consistent global table) fault-injection corpus depth (`animusd`, ADR 0075 section 4.9, G-01 G-d M5) — `SimWorld`: 2-3 real 3-node clusters on the LSM backend over a WAN bridge, random DynamoDB-wire workloads (put/update/delete/conditional/txn/TTL) under partition (incl. one-way), loss/duplication/reorder, crash/restart of the shipping and receiving leaders, split while shipping, clock skew within/beyond the bound, a peer down past `max_backlog` (resync); one `sim_world_mrec_corpus_<cell>` test per cell (17) + `sim_world_mrec_corpus_determinism` + 4 negative controls `mrec_negative_*` (LWW by arrival, cursor before ack, loop prevention off, oracle bite) — `cargo test -p animusd --lib sim_world_mrec_corpus`; ~1 CPU-minute per seed for all cells (debug). `ANIMUS_MREC_CELL=<substring>` narrows, `ANIMUS_SEED=<seed>` replays one, `ANIMUS_MREC_DEBUG=1` prints per-run dumps and failed ops |
+| `ANIMUS_MREC_WORLD_SEEDS=K` | 4 | depth of the hand-written `SimWorld` MREC suites (`animusd` `sim_world_mrec_tests`/`_shipper_tests`; the saga/edge/e2e files floor at 20 seeds) — `cargo test -p animusd --lib sim_world_mrec`; `ANIMUS_SEED=<seed>` replays one |
 | `ANIMUS_RECONCILER_SEEDS=K` | 1 | reconciler-corpus depth (`animus-cp-data`) |
 | `ANIMUS_TXN_SEEDS=K` | 1 | multi-tablet cross-transaction corpus depth (`animus-test`, ADR 0018) |
 | `ANIMUS_STREAM_SEEDS=K` | 1 | DynamoDB Streams lineage-walk corpus depth (`animus-test`, ADR 0042/0043) |
@@ -226,14 +267,25 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 | `ANIMUS_DYNAMO_WIRE_SEEDS=K` | 1 | end-to-end DynamoDB-wire cycles/durability corpus depth over `SimCluster` (`animusd`, ADR 0061 rung D2 PR 2) — run via `cargo test -p animusd --lib sim_cluster_dynamo_corpus` |
 | `ANIMUS_SHAREDWAL_SEEDS=K` | 1 | `SharedWal` cross-tablet ordering/crash-safety/GC fault-injection corpus depth (`animus-cp-data`, ADR 0028, C-05 — on by default since PR 3's cutover) — `cargo test -p animus-cp-data --test it sharedwal_fault_corpus::` |
 | `ANIMUS_WAL_REWRITE_CRASH_SEEDS=K` | 1 | staged WAL-compaction-rewrite crash corpus depth (`animus-cp-data`, issue #1116) — whole-cluster power-cut at 12 offsets into a stalled rewrite, plain and torn/corrupt tails; every acked write must survive — `cargo test -p animus-cp-data --test it wal_rewrite_crash::` |
+| `ANIMUS_ZONE_PLACEMENT_SEEDS=K` | 1 | zone-labelled placement + whole-zone-loss corpus depth over `SimCluster` (`animusd`, G-01 stage G-a) — 6 nodes, 2 per zone, RF 3: every tablet spans 3 zones, kill a zone, no acked write lost, repair re-converges — `cargo test -p animusd --lib sim_cluster_zone_placement` |
+| `ANIMUS_SPLIT_RELOCATION_SEEDS=K` | 1 | split-child wholesale-relocation corpus depth over `SimCluster` (`animusd`, issue #1229) — a child moved entirely off the parent's replicas by directed Placing must keep its pre-split rows; two cells (`MemoryEngine`; `LsmEngine` + rotating node restarts) — `cargo test -p animusd --lib sim_cluster_split_relocation` |
 | `ANIMUS_EXPORT_IMPORT_SEEDS=K` | 1 | S3 export/import fault-injection corpus depth (`animus-test`, ADR 0068, S-05 PR 3) |
 | `ANIMUS_S3_FAULT_SEEDS=K` | 1 | S3 store retry/backoff fault-injection corpus depth (`animus-test`, `tests/it/s3_fault_corpus.rs`, S-08 M3) — `S3SegmentStore<FaultyTransport<FakeS3>, SimEnv>`: 5xx/429/timeout/lost-ack bursts, multipart part/Complete failures, expiring and failing credential providers; `ANIMUS_SEED=<seed>` replays one seed per cell — `cargo test -p animus-test --test it s3_fault_corpus::` |
 | `ANIMUS_HEARTBEAT_SEEDS=K` | 1 | per-node heartbeat-batcher fault-injection corpus depth (`animus-cp-data`, ADR 0044 phase 2, C-02 PR 2) — run via `cargo test -p animus-cp-data --test it heartbeat_batch_corpus::` |
+| `ANIMUS_WAN_TIMING_SEEDS=K` | 1 | per-group WAN Raft timing profile corpus depth (`animus-cp-data`, ADR 0075 section 3.4, G-01 stage G-c groundwork) — 3 regions at 60-90ms one-way with tail latency: steady, leader-node kill and leader-region partition+heal must keep bounded term churn and commit durably under the WAN profile, and a LAN-forced negative control must show election churn — `cargo test -p animus-cp-data --test it wan_timing_corpus::` |
 | `ANIMUS_DIRECTED_PLACING_LOAD_SEEDS=K` | 1 | directed-Placing (2-of-3 replica diff) learner-promotion-under-a-continuous-writer corpus depth (`animus-cp-data`, issue #1064) — `cargo test -p animus-cp-data --test it directed_placing_under_sustained_load::` |
 | `ANIMUS_LEARNER_SNAPSHOT_LIVELOCK_SEEDS=K` | 1 | late-joining-learner-needing-a-real-InstallSnapshot-under-a-continuous-writer corpus depth (`animus-cp-data`, issue #1064 part 2) — `cargo test -p animus-cp-data --test it learner_snapshot_livelock_under_continuous_writer::` |
+| `ANIMUS_TXN_REPLAY_SEEDS=K` | 2 (+1 known-failing seed) | WAL-replay-over-an-ahead-engine corpus depth (`animus-cp-data`, issue #1242) — seeded schedules of txns, stale re-stages, duplicate resolves, crashes, fresh-process restarts and compaction; every replica's raw rows must end identical — `cargo test -p animus-cp-data --test it txn_stage_replay_stability::`; `ANIMUS_SEED=<seed>` replays one |
+| `ANIMUS_KINDEVAL_REPLAY_SEEDS=K` | 4 | `KindEval`/`KindEvalBatch` WAL-replay-over-an-ahead-engine corpus depth (`animus-cp-data`, issue #1247) — seeded conditional puts/updates/deletes, batches, foreign intents, crashes, fresh-process restarts and compaction; every replica's raw rows (change-log and LSI included) must end identical — `cargo test -p animus-cp-data --test it kind_eval_replay_stability::`; `ANIMUS_SEED=<seed>` replays |
 | `ANIMUS_RELEASE_RACE_SEEDS=K` | 1 | release-vs-promote race corpus depth (`animus-cp-data`, `tests/release_race_corpus.rs`, ADR 0031's 2026-09-30 amendment) — a mid-catch-up learner must never be released/erased by the host reconciler nor refused as a voter on re-host |
 | `ANIMUS_SCALE_SEEDS=K` | 1 | C-17 Tier 1 scale/density corpus depth (`animusd`, `sim_cluster_scale.rs`) — seeds per real-`SimCluster` cell (quiesced-group density, split storm); replay one with `ANIMUS_SEED=<seed>`; run via `cargo test -p animusd --lib sim_cluster_scale -- --nocapture` (prints `C17 metric=…` count lines, asserts only structural properties) |
 | `ANIMUS_SCALE_MAX_TABLETS=N` | 1000 | C-17 Tier 1 size cap: the pure metadata curve runs tablets ∈ {100, 1k, 10k, 50k} up to N (rebalance sweep capped at 10k), and N also caps the density group counts (3 nodes: N/20, 9 nodes: N/100, from {10, 50, 100}) and enables the larger split-storm cell at N ≥ 10000; nightly `corpus-deep.yml` sets 50000 |
+| `ANIMUS_RESTAGE_SEEDS=K` | 2 | stale-restage-after-resolve replica-determinism corpus depth (`animus-cp-data`, `tests/it/resolved_restage_replica_determinism.rs`, issue #1243) — a duplicate `TxnStage` for an already-resolved txn must apply identically on a restarted replica and on a snapshot-installed one; `ANIMUS_SEED=<seed>` replays one — `cargo test -p animus-cp-data --test it resolved_restage` |
+| `ANIMUS_CHAOS_SEED=S` | per-scenario name hash | seed of the real-cluster chaos harness's **fault schedule** (`animusd`, `tests/chaos.rs`, R-01 b, `docs/chaos.md`); the processes are real, so a replay is the same faults against a similar, not identical, execution. Opt-in: `cargo test -p animusd --features chaos --test chaos -- --test-threads=1` |
+| `ANIMUS_CHAOS_SECS=N` | 90 (smoke) / 150 | length of the chaos fault window in seconds (the long run: `ANIMUS_CHAOS_SECS=900 … chaos_mixed`); also `ANIMUS_CHAOS_NODES` (3), `ANIMUS_CHAOS_TABLETS` (4), `ANIMUS_CHAOS_RECOVERY_SECS` (60), `ANIMUS_CHAOS_TXN=0`, `ANIMUS_CHAOS_DIR`, `ANIMUS_CHAOS_OUT` |
+| `ANIMUS_SOAK_DURATION=D` | `10m` | total length of the real-process soak (`animusd`, `tests/soak.rs`, R-01 (a), opt-in `soak` feature, `docs/soak.md`); also `ANIMUS_SOAK_{SEED,NODES,TABLETS,EPOCH_SECS,SAMPLE_SECS,WARMUP,PACE_MS,RESTART_EVERY,DIR,OUT}` |
+| `ANIMUS_DISK_FULL_SEEDS=K` | 1 | disk-full (ENOSPC) corpus depth (`animus-test`, `tests/it/raftkv_linearizable.rs`, R-01 (d), issue #1185) — 8 cells of ENOSPC windows (every replica, leader only, flaky) over `MemoryEngine`, plus (issue #1218) three representative cells always on over `LsmEngine<SimEnv>` and the whole corpus over it under `ANIMUS_RAFTKV_LSM=1` (the engine's own WAL/flush/compaction ENOSPC and the apply task's pause-and-retry); asserts no acked write lost/duplicated and resume without restart — `cargo test -p animus-test --test it raftkv_linearizable::raftkv_disk_full`; `ANIMUS_SEED=<seed>` replays one |
+| `ANIMUS_CHAOS_DISK_MB=N` / `ANIMUS_CHAOS_DISK_TXN=0` / `ANIMUS_CHAOS_REQUIRE_MOUNT=1` | 64 / on / off | the real-filesystem disk-full chaos scenario (`animusd`, `chaos_disk_full`, issue #1221, `docs/chaos.md`): per-node tmpfs size in MiB; the 2PC ops are on by default (F-2 fixed), `0` drops them; fail instead of skip when the process cannot mount (needs `CAP_SYS_ADMIN`: root or `sudo -n`) |
 | `ANIMUS_SHRINK=1` | off | when a corpus scenario fails, delta-debug it to a minimal reproducing case and print a replayable handle (`animus-test::shrink`, ADR 0061 rung B4) |
 | `ANIMUS_SHRINK_MAX_CHECKS=N` | 500 | iteration budget for `ANIMUS_SHRINK`'s search (a plain check count, not wall-clock time — see `animus-test/CLAUDE.md`) |
 | `ANIMUS_SHRINK_REPLAY=<json>` | unset | replay a minimized scenario a shrink run printed (per-corpus entry point, e.g. `raftkv_shrink_replay` in `raftkv_linearizable.rs`) |
@@ -417,6 +469,40 @@ truth; this map is just for navigation.
   placement event-driven (ADR 0031). Clusters grow online: new nodes
   self-register and mirror `Metadata` (ADR 0030), join via seed addresses, and
   are decommissioned via drain → remove (ADR 0032).
+- **Global tables (MRSC stretch tables)** — ADR 0075 (G-01 stage G-c; MREC is
+  below, federation is G-e, not built). One cluster whose nodes carry
+  `topology.kubernetes.io/region` labels; `UpdateTable` `ReplicaUpdates` +
+  `MultiRegionConsistency: STRONG` on an empty table (three Regions, or two plus
+  a witness) becomes one `ConvertTableToGlobal` (`animus-control`, behind
+  `Gate::GlobalTables`, cluster version 2): every tablet gets a region-pinned,
+  one-replica-per-Region policy (`animus-placement` `allowed_values`,
+  `replan_pinned`; a lost Region's replica waits, repair happens only inside a
+  Region), the host reconciler's **preferred-leader step** keeps leaders in the
+  preferred Region and off the witness (`animus-cp-data` `host`), witness
+  replicas never serve eventual reads, and `animusd::global_tables` is the wire
+  edge + `/admin/global-tables` + the decommission guard. Corpora:
+  `preferred_leader_corpus` (pure) and `sim_cluster_mrsc` (cluster), knob
+  `ANIMUS_MRSC_SEEDS`. Known gap: #1226 (WAN groups never quiesce).
+- **Global tables (MREC, eventual, between clusters)** — ADR 0075 section 4 and
+  its "G-d as built" amendment (G-01 stage G-d; behind `Gate::MrecReplication`,
+  cluster version 3). Independent clusters, each with `cluster_settings.region` +
+  `peers`, replicate a table by last-writer-wins on a **calendar `MrecVersion`**
+  stamped in the row value (not the cluster HLC). Per led tablet and peer a
+  shipper (`animusd::mrec_shipper`) ships each dirty key's **current row** above a
+  `mrec:<region>` cursor (a scan for the first copy, resync and split children;
+  receiver streams coalesce), the saga (`mrec_saga`) drives `UpdateTable
+  ReplicaUpdates` create/delete, the receiver (`mrec_receiver`) applies via
+  `animus-cp-data` `apply_mrec`, over the mutual-TLS intra port
+  (`MrecApply` frame). Proofs: the multi-cluster `SimWorld`
+  (`sim_world_mrec_*`, corpus knob `ANIMUS_MREC_SEEDS`) and the real-process
+  `tests/mrec_peer_transport.rs`. Admin: `/admin/global-tables` (replicas + node-local
+  shipper health). **Operator federation (G-e, built, `kind` e2e unrun):**
+  `AnimusCluster` `spec.region`/`spec.peers[]`/`spec.allowInsecurePeers` render
+  into `cluster_settings` (peers need `spec.tls` or the dev opt-in, else
+  `PeersSpecInvalid`), peer CAs are mounted and merged into the intra trust
+  bundle, a port-scoped peer `NetworkPolicy` opens only the intra port, and a
+  `PeerReachable` condition reads shipper health; stretch-segment federation is
+  deferred (ADR 0075 "G-e as built").
 - **Transaction consensus** — 2PC/HLC over the per-tablet Raft groups (ADR
   0018), the only transaction story. The Accord slice that used to sit here
   (`animus-consensus`, ADR 0011) is **deleted** — rejected for CP by ADR 0018 in
@@ -510,7 +596,10 @@ truth; this map is just for navigation.
   cluster. Only the client-facing wire edge (DynamoDB) is exposed outside
   the cluster; this is what motivated the ADR 0047 client/intra port split
   — review any design touching listeners, ports, or address resolution
-  against this shape. `spec.tls` (ADR 0064) turns TLS on for the whole
+  against this shape. A pod-template edit (`spec.image`, a `controlNodes`
+  growth) is a gated rolling upgrade the operator drives through its own
+  `StatefulSet` partition (ADR 0073 Phase 3, `crates/animus-operator/src/roll.rs`).
+  `spec.tls` (ADR 0064) turns TLS on for the whole
   cluster from either a pre-existing `Secret` or a cert-manager
   `Certificate`/`Issuer` this operator only references, mounted read-only
   on every pod and wired into the generated `cluster.json`; the scale-down
