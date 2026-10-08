@@ -555,6 +555,7 @@ pub fn tls_pki(names: &[&str]) -> (TempDir, Vec<TlsSection>) {
                 cert_path,
                 key_path,
                 ca_path: Some(ca_path.clone()),
+                peer_ca_path: None,
             }
         })
         .collect();

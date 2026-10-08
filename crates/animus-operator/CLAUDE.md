@@ -1927,3 +1927,5 @@ that never goes Ready *before* the roll starts.
   reconciler refuses (applies nothing) with `PeersSpecInvalid`.
 - **`PeerReachable`:** `peers::evaluate` (pure) over every pod's `/admin/global-tables`;
   Unknown until a shipper exists. Unverified against a real cluster; no kind e2e.
+
+- **Peer CA bundle is peer-only (issue #1253).** `tls.ca_path` is always the own CA (`{TLS_MOUNT_DIR}/ca.crt`); when a peer names a CA `Secret`, `tls.peer_ca_path` is `PEER_CA_BUNDLE_PATH`, which `entrypoint.sh` fills with the peer CAs only (not the own CA). animusd trusts a certificate chaining only to `peer_ca_path` for MREC replication frames alone. The `TlsSection` mirror carries `peer_ca_path` (skipped when `None`).

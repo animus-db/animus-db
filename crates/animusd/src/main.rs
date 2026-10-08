@@ -1714,6 +1714,7 @@ fn resolve_tls_flags(
             cert_path: cert_path.into(),
             key_path: key_path.into(),
             ca_path: Some(ca_path.into()),
+            peer_ca_path: None,
         })),
         _ => Err(
             "--tls-cert, --tls-key, and --tls-ca must be given together (all three) or omitted \
@@ -4134,6 +4135,7 @@ mod tests {
             cert_path: format!("{tag}.cert.pem").into(),
             key_path: format!("{tag}.key.pem").into(),
             ca_path: Some("ca.pem".into()),
+            peer_ca_path: None,
         }
     }
 

@@ -110,6 +110,7 @@ fn test_pki(dir: &Path) -> (TlsSection, std::path::PathBuf) {
             cert_path,
             key_path,
             ca_path: Some(ca_path.clone()),
+            peer_ca_path: None,
         },
         ca_path,
     )

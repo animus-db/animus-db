@@ -49,5 +49,6 @@ pub use sim_relay::{RELAY_STREAM, SimRelayClient};
 pub use wire::{
     ClientRequest, ClientResponse, KindWriteBatchItem, KindWriteItemReply, KindWriteOp, MREC_PROTO,
     MrecAnswer, MrecApplyRequest, MrecApplyResponse, MrecControl, MrecRecord, PendingKindWrite,
-    Surface, TxnPrecondition, TxnTableWrite, TxnWriteCondition, is_relayable_command, surface_of,
+    Surface, TxnPrecondition, TxnTableWrite, TxnWriteCondition, is_relayable_command,
+    peer_region_may_send, surface_of,
 };

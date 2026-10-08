@@ -1838,7 +1838,20 @@ fn spawn_accept(
                         let stream = match tls {
                             None => MaybeTlsStream::Plain(stream),
                             Some(tls) => match tls.acceptor.accept(stream).await {
-                                Ok(tls_stream) => MaybeTlsStream::Tls(Box::new(tls_stream.into())),
+                                Ok(tls_stream) => {
+                                    // Issue #1253: a certificate admitted only through
+                                    // the peer-region CA bundle never speaks Raft.
+                                    if tls.classify_peer(tls_stream.get_ref().1.peer_certificates())
+                                        == crate::tls::PeerTrust::PeerRegionOnly
+                                    {
+                                        tracing::warn!(
+                                            %peer_addr,
+                                            "peer-region certificate on the internal Raft wire (dropping connection)"
+                                        );
+                                        return;
+                                    }
+                                    MaybeTlsStream::Tls(Box::new(tls_stream.into()))
+                                }
                                 Err(err) => {
                                     tracing::warn!(
                                         ?err,
@@ -4458,6 +4471,7 @@ mod tests {
                     cert_path,
                     key_path,
                     ca_path: Some(ca_path.clone()),
+                    peer_ca_path: None,
                 }
             })
             .collect();
