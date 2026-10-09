@@ -117,6 +117,11 @@ async fn run_scenario(scn: Scenario) -> Outcome {
             .await
             .expect("bring-up: every node serves");
     }
+    // Open every version gate (a fresh cluster starts at version 1), so the run
+    // exercises the shipped apply behaviours, e.g. seal-checked txn decisions.
+    cluster
+        .finalize_cluster_version(Duration::from_secs(90))
+        .await;
 
     // ---- workload + faults ------------------------------------------
     let shared = Arc::new(Shared::new(seed));
@@ -567,6 +572,9 @@ async fn run_disk_full() -> Option<Outcome> {
             .await
             .expect("bring-up: every node serves");
     }
+    cluster
+        .finalize_cluster_version(Duration::from_secs(90))
+        .await;
     // A key written while healthy, to read back while the disks are full.
     put_until_ok(nodes[0], "df-seed", Duration::from_secs(30))
         .await

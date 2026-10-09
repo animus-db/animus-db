@@ -4256,3 +4256,78 @@ raw-row identity incl. tombstones and markers), `txn_stage_replay_stability`
 `txn_resolved_marker_gate` (the marker reaches a current follower at both
 versions), and the in-crate image test that pins the wire kind and what an
 N-1 receiver would file.
+
+## Amendment 2026-10-09 — a single-token range is never split; sealed txn decisions are version-gated (R-01 residuals of #1233)
+
+Two residuals #1233 left open, closed together.
+
+**1. A tablet whose range holds a single hash-ring token is never split.**
+`decide::align_split_key` rounds every table's split key to a token boundary,
+down first and then up (#1233). When neither boundary is interior, the range
+lies within one token; it used to keep the raw, sort-key-granular key for a
+non-streamed table (the "documented residual" in `txn.rs`), so a hot single
+partition key could still be cut mid-token and a transaction anchored on it could
+straddle the cut: the record sorts below the token's items, so the anchor stage
+and the decision landed on different tablets. It now returns `viable == false`
+for **every** table, which `ClientCtx::trigger_split` — the one choke point of
+every split proposer (byte/ops/change-rate auto-split, ADR 0067's
+throughput-derived minimum, `POST /admin/tablet/split`,
+`ClientRequest::SplitTablet`, stream grow) — turns into the metered
+`SPLIT_KEY_NOT_TOKEN_VIABLE` skip (the same outcome as a streamed table's Fork E
+limit and as a collapse), before anything is proposed. The price is the accepted
+Fork E limit generalised: one partition key's rows can no longer be spread
+across tablets, so a single hot key is bounded by one tablet's capacity (as in
+DynamoDB itself). **Proposer-side only**: `Metadata::apply` of
+`BeginSplitInPlace` deliberately gets no alignment check, because an entry an
+older binary committed (and tablets it already split mid-token) must replay
+unchanged; a binary-compatible apply rejection would need a gate and the
+proposer-side refusal already closes the reachable paths. Regression:
+`decide` unit tests (streamed and non-streamed), and
+`sim_cluster_auto_split::j_a_single_token_tablet_is_never_split` (one hot
+partition key over many sort keys, carved down to a `[T, T+1)` tablet that
+stays over the byte threshold across several cooldowns: every tablet boundary
+stays a whole token, all rows stay readable and writable).
+
+**2. The seal check on txn decisions is a version-gated variant, not a changed
+apply arm.** #1233 made a `TxnCommit`/`TxnAbort` (including the orphan
+tombstone) whose record key lies in an already-sealed range (a `Freeze` or the
+in-place fork) a deterministic no-op. That changed what an already-committed
+entry *does*, so an old replica and a new replica applying the same entry
+would diverge in a mixed-version cluster. ADR 0073 decision 4 forbids the
+obvious fix (apply branching on the cluster version: it cannot read it, and a
+replica restarting mid-log would re-apply a historical entry under a different
+answer). The repo's precedent for a behaviour change is that the behaviour
+travels in the entry, gated at the proposer (`Gate`, `GatedCommand`,
+`gated_propose`). So:
+
+- New `KvCommand::TxnCommitSealChecked` / `TxnAbortSealChecked` (binary codec
+  tags 18/19, same payloads as 9/10; WAL `serde_json` externally tagged)
+  carry the seal-checked apply. The legacy `TxnCommit`/`TxnAbort` arms are
+  restored to their original seal-blind behaviour **forever**, so every entry an
+  older binary committed replays identically.
+- New `Gate::TxnSealChecked`, cluster version 4 (`MAX_SUPPORTED = 4`), the third
+  real gate. `KvCommand::required_gate` names it for the two new variants; the
+  single propose choke point refuses them while it is closed.
+- The proposers (`txn_commit_at_least`, `txn_abort`, `txn_abort_orphan`,
+  `txn_decide`) emit the new variants only once `ClusterFeatures` shows the gate
+  open, i.e. once the finalize to 4 proved every registered node can decode and
+  apply them; below that they emit the legacy variants, so a mixed cluster's old
+  and new replicas apply every entry identically. The coordinator's
+  frozen-refusal reroute (`txn_decide_anchor`) needs no separate gate: a record
+  can only read back `Pending` on a frozen group after a *sealed* no-op, which
+  only the new variants produce.
+- Wire/WAL: no format version bump (additive variants inside `raftkv-wire` v1 and
+  `raftkv-wal` v2, like the MREC shapes); new shaped fixtures
+  `raftkv-wire/v1-txnseal.bin` and `raftkv-wal/v2-txnseal.bin`, existing fixtures
+  untouched.
+
+Consequence to state plainly: a cluster protects against the sealed-decision
+divergence only once it has **finalized to version 4** (a fresh cluster starts
+at 1 and the finalize is manual, ADR 0073 decision 5). The real-process chaos
+harness now finalizes to the binary's maximum at bring-up so its txn-atomicity
+oracle keeps exercising the fix. Tests: `split_tablet::
+a_txn_decision_ordered_after_the_fork_is_a_sealed_no_op` (gate open) and
+`below_the_gate_a_txn_decision_after_the_fork_applies_as_it_always_did` (gate
+closed), the gate-table unit test in `gates.rs`, the codec fixtures, and the
+mixed-version cell `sim_cluster_mixed_version_corpus::
+release3_to_release4_txn_seal_gate`.

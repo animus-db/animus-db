@@ -1,0 +1,5 @@
+0021d104:CWL102{"Hard":{"term":11,"voted_for":"n2"}}
+4f988e9e:CWL102{"Append":{"term":11,"index":60,"command":{"TxnCommitSealChecked":{"txn_id":{"ts":{"wall_ms":21,"logical":0},"node":"n2"},"record_key":[114,101,99,111,114,100],"ts":{"wall_ms":22,"logical":0}}},"config":null,"learners":null}}
+5a9a5d6a:CWL102{"Append":{"term":11,"index":61,"command":{"TxnAbortSealChecked":{"txn_id":{"ts":{"wall_ms":21,"logical":0},"node":"n2"},"record_key":[114,101,99,111,114,100],"ts":{"wall_ms":22,"logical":1},"orphan_created_ts":null}},"config":null,"learners":null}}
+f4bde9a3:CWL102{"Append":{"term":11,"index":62,"command":{"TxnAbortSealChecked":{"txn_id":{"ts":{"wall_ms":21,"logical":0},"node":"n2"},"record_key":[114,101,99,111,114,100],"ts":{"wall_ms":22,"logical":2},"orphan_created_ts":{"wall_ms":20,"logical":5}}},"config":null,"learners":null}}
+41f304c3:CWL102!sync:846

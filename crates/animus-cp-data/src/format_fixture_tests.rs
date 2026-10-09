@@ -263,6 +263,53 @@ fn generate_fixture_raftkv_wire_mrec() {
     std::fs::write(&path, mrec_wire_bytes()).expect("write fixture");
 }
 
+fn txn_sealed_wire_bytes() -> Vec<u8> {
+    let frames: Vec<Vec<u8>> = codec::tests::txn_sealed_sample_wires()
+        .iter()
+        .map(|w| codec::encode_wire(w, &ClusterFeatures::new()))
+        .collect();
+    pack_frames(&frames)
+}
+
+/// ADR 0018 (2026-10-09, R-01): `raftkv-wire/v1-txnseal.bin` -- the additive
+/// seal-checked decision variants (codec tags 18/19) inside wire v1. Decodes to
+/// the hand-built value, the current encoder reproduces its bytes, every frame is
+/// still v1, and the content-dependent gate classifies it `TxnSealChecked`.
+#[test]
+fn raftkv_wire_txn_sealed_shape_fixture_decodes_and_round_trips() {
+    let bytes = std::fs::read(formats_dir("raftkv-wire").join("v1-txnseal.bin"))
+        .expect("raftkv-wire/v1-txnseal.bin is checked in");
+    let expected = codec::tests::txn_sealed_sample_wires();
+    let frames = unpack_frames(&bytes);
+    assert_eq!(frames.len(), expected.len());
+    for (i, (frame, want)) in frames.iter().zip(&expected).enumerate() {
+        assert_eq!((frame[0], frame[1]), (0xCB, 1), "frame {i}: still wire v1");
+        let got = codec::decode_wire(frame).unwrap_or_else(|e| panic!("frame {i}: {e}"));
+        assert_eq!(format!("{got:?}"), format!("{want:?}"), "frame {i}");
+        assert_eq!(got.required_gate(), Gate::TxnSealChecked, "frame {i}");
+    }
+    assert_eq!(
+        txn_sealed_wire_bytes(),
+        bytes,
+        "the current encoder emits the fixture"
+    );
+}
+
+/// `cargo test -p animus-cp-data --lib generate_fixture_raftkv_wire_txn_sealed -- --ignored`.
+/// Refuses to overwrite an existing fixture.
+#[test]
+#[ignore]
+fn generate_fixture_raftkv_wire_txn_sealed() {
+    let path = formats_dir("raftkv-wire").join("v1-txnseal.bin");
+    if std::fs::metadata(&path).is_ok() {
+        panic!(
+            "{} already exists — never regenerated in place",
+            path.display()
+        );
+    }
+    std::fs::write(&path, txn_sealed_wire_bytes()).expect("write fixture");
+}
+
 /// `cargo test -p animus-cp-data --lib generate_fixture_raftkv_wire -- --ignored`.
 /// Refuses to overwrite an existing fixture (ADR 0073 Phase 0).
 #[test]
@@ -577,6 +624,62 @@ fn generate_fixture_raftkv_wal_mrec() {
         );
     }
     std::fs::write(&path, mrec_wal_bytes()).expect("write fixture");
+}
+
+/// The seal-checked decision records of `raftkv-wal/v2-txnseal.bin` (ADR 0018,
+/// 2026-10-09): the entries of [`codec::tests::txn_sealed_sample_wires`] as
+/// `Append` records in one persist round plus its sync marker (the v2 layout).
+fn txn_sealed_wal_records() -> Vec<Rec> {
+    let mut recs = vec![Rec::Hard {
+        term: 11,
+        voted_for: Some(nid(2)),
+    }];
+    for w in codec::tests::txn_sealed_sample_wires() {
+        let KvWire::Raft(animus_control::raft::RaftMsg::AppendEntries { entries, .. }) = w else {
+            panic!("txn_sealed_sample_wires is an AppendEntries frame");
+        };
+        recs.extend(entries.into_iter().map(Rec::Append));
+    }
+    recs
+}
+
+fn txn_sealed_wal_bytes() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for r in &txn_sealed_wal_records() {
+        bytes.extend(PersistedState::<KvCommand, KvState>::encode_record(r));
+    }
+    bytes.extend(animus_control::format::encode_sync_marker(
+        &animus_control::persist::CONTROL_WAL,
+        bytes.len() as u64,
+    ));
+    bytes
+}
+
+#[test]
+fn raftkv_wal_txn_sealed_shape_fixture_decodes_and_round_trips() {
+    let bytes = std::fs::read(formats_dir("raftkv-wal").join("v2-txnseal.bin"))
+        .expect("raftkv-wal/v2-txnseal.bin is checked in");
+    let got = PersistedState::<KvCommand, KvState>::decode(&bytes).expect("decodes");
+    assert_eq!(got, txn_sealed_wal_records());
+    assert_eq!(
+        txn_sealed_wal_bytes(),
+        bytes,
+        "the current encoder emits the fixture"
+    );
+}
+
+/// `cargo test -p animus-cp-data --lib generate_fixture_raftkv_wal_txn_sealed -- --ignored`.
+#[test]
+#[ignore]
+fn generate_fixture_raftkv_wal_txn_sealed() {
+    let path = formats_dir("raftkv-wal").join("v2-txnseal.bin");
+    if std::fs::metadata(&path).is_ok() {
+        panic!(
+            "{} already exists — never regenerated in place",
+            path.display()
+        );
+    }
+    std::fs::write(&path, txn_sealed_wal_bytes()).expect("write fixture");
 }
 
 /// The required fields of `TxnWrite` (ADR 0073 Phase 0 dropped their

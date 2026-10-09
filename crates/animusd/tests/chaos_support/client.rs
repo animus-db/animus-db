@@ -76,6 +76,18 @@ async fn request(
     }
 }
 
+/// One admin-port `POST` with a JSON body.
+pub async fn http_post(
+    addr: SocketAddr,
+    path: &str,
+    body: &str,
+    tmo: Duration,
+) -> Result<(u16, String), CallErr> {
+    let head =
+        format!("POST {path} HTTP/1.1\r\nHost: animus\r\nContent-Type: application/json\r\n");
+    request(addr, head, body, tmo).await
+}
+
 /// One DynamoDB request.
 pub async fn dynamo_call(
     addr: SocketAddr,

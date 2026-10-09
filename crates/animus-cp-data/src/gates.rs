@@ -53,6 +53,12 @@ impl GatedCommand for KvCommand {
             | KvCommand::TxnAbort { .. }
             | KvCommand::TxnResolve { .. }
             | KvCommand::NoOp => Gate::Base,
+            // ADR 0018 (2026-10-09, R-01): a new variant an older voter cannot
+            // decode, whose apply (a no-op on a sealed range) also differs
+            // from the legacy decision's.
+            KvCommand::TxnCommitSealChecked { .. } | KvCommand::TxnAbortSealChecked { .. } => {
+                Gate::TxnSealChecked
+            }
         }
     }
 }
@@ -222,6 +228,66 @@ mod tests {
             target: 2,
         };
         assert_eq!(append(vec![era]).required_gate(), Gate::Era);
+    }
+
+    /// ADR 0018 (2026-10-09, R-01): the seal-checked decision variants are
+    /// `TxnSealChecked`; the legacy ones stay `Base`; the propose-site predicate
+    /// agrees with the gate being open (cluster version 4) or closed.
+    #[test]
+    fn seal_checked_decisions_need_their_own_gate() {
+        let ts = crate::hlc::HlcTimestamp {
+            wall_ms: 1,
+            logical: 0,
+        };
+        let txn_id = crate::txn::TxnId {
+            ts,
+            node: animus_env::nid(1),
+        };
+        let legacy = [
+            KvCommand::TxnCommit {
+                txn_id: txn_id.clone(),
+                record_key: Vec::new(),
+                ts,
+            },
+            KvCommand::TxnAbort {
+                txn_id: txn_id.clone(),
+                record_key: Vec::new(),
+                ts,
+                orphan_created_ts: None,
+            },
+        ];
+        let checked = [
+            KvCommand::TxnCommitSealChecked {
+                txn_id: txn_id.clone(),
+                record_key: Vec::new(),
+                ts,
+            },
+            KvCommand::TxnAbortSealChecked {
+                txn_id,
+                record_key: Vec::new(),
+                ts,
+                orphan_created_ts: Some(ts),
+            },
+        ];
+        let at = |v: u32| {
+            let f = ClusterFeatures::new();
+            f.update(&animus_control::Metadata {
+                cluster_version: v,
+                ..animus_control::Metadata::default()
+            });
+            f
+        };
+        for c in &legacy {
+            assert_eq!(c.required_gate(), Gate::Base);
+            assert!(check_propose(&at(1), c));
+        }
+        for c in &checked {
+            assert_eq!(c.required_gate(), Gate::TxnSealChecked);
+            assert!(check_propose(&at(4), c));
+        }
+        let closed = at(3);
+        assert!(!closed.is_open(Gate::TxnSealChecked));
+        assert!(closed.is_open(Gate::MrecReplication));
     }
 
     fn mrec_schema(mrec: bool) -> animus_item::WriteSchema {

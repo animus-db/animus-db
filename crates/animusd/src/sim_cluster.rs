@@ -1766,6 +1766,50 @@ impl SimClusterHandle {
             .await
     }
 
+    /// **R-01 (`Gate::TxnSealChecked`)**: propose a txn decision directly on
+    /// `node`'s own replica of `tablet` (bypassing the coordinator's
+    /// pre-propose frozen refusal, so the decision lands on an already-sealed
+    /// group exactly like the propose-vs-apply sliver does), wait for it to
+    /// apply, and return the record's status read back from that replica.
+    /// `None` when `node` hosts no replica, is not its leader, or the call
+    /// does not complete.
+    pub(crate) async fn txn_decide_on_group(
+        &self,
+        node: u64,
+        tablet: TabletId,
+        txn_id: TxnId,
+        record_key: Vec<u8>,
+        commit: bool,
+    ) -> Option<animus_cp_data::TxnDecisionStatus> {
+        let group = self.ctx(node).edge.local_cp(tablet)?;
+        let proposed = if commit {
+            group
+                .txn_commit_at_least(txn_id, record_key.clone(), HlcTimestamp::zero())
+                .await
+        } else {
+            group.txn_abort(txn_id, record_key.clone()).await
+        };
+        proposed?;
+        group.txn_status_local(&record_key).await
+    }
+
+    /// The raw bytes of the txn record at `record_key` on `node`'s own replica
+    /// of `tablet` (a plain local engine read: any replica, no read barrier),
+    /// so a test can compare replicas byte for byte. `None` when `node` hosts
+    /// no replica or holds no record.
+    pub(crate) async fn txn_record_bytes_on(
+        &self,
+        node: u64,
+        tablet: TabletId,
+        record_key: Vec<u8>,
+    ) -> Option<Vec<u8>> {
+        self.ctx(node)
+            .edge
+            .local_cp(tablet)?
+            .local_get(&record_key)
+            .await
+    }
+
     /// `ClientCtx::push_resolution_if_decided` (issue #298 residual fix,
     /// this fixture's regression for the mechanism issue #734's `Node::
     /// abort_background_tasks_for_test` had to isolate on the real-thread
@@ -4925,6 +4969,40 @@ impl SimCluster {
                 "txn_decide_anchor on node {node} did not complete within {OP_BUDGET:?}"
             ))
         })
+    }
+
+    /// [`SimClusterHandle::txn_decide_on_group`], driven from a test's own
+    /// `&mut self` call exactly like [`SimCluster::put`] above.
+    pub(crate) fn txn_decide_on_group(
+        &mut self,
+        node: u64,
+        tablet: TabletId,
+        txn_id: TxnId,
+        record_key: Vec<u8>,
+        commit: bool,
+    ) -> Option<animus_cp_data::TxnDecisionStatus> {
+        let handle = self.shared.clone();
+        self.spawn_and_capture(node, async move {
+            handle
+                .txn_decide_on_group(node, tablet, txn_id, record_key, commit)
+                .await
+        })
+        .flatten()
+    }
+
+    /// [`SimClusterHandle::txn_record_bytes_on`], driven from a test's own
+    /// `&mut self` call.
+    pub(crate) fn txn_record_bytes_on(
+        &mut self,
+        node: u64,
+        tablet: TabletId,
+        record_key: Vec<u8>,
+    ) -> Option<Vec<u8>> {
+        let handle = self.shared.clone();
+        self.spawn_and_capture(node, async move {
+            handle.txn_record_bytes_on(node, tablet, record_key).await
+        })
+        .flatten()
     }
 
     /// [`SimClusterHandle::push_resolution_if_decided`], driven from a

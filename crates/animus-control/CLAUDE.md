@@ -3231,3 +3231,17 @@ variants by content, independent of `required_gate`. Cells:
 `version_mixed_corpus::release2_to_release3_mrec_gate` + N6; apply matrix:
 `tests/it/mrec_table_apply.rs`; fixtures `metadata/v1-mrec.json`,
 `mirror-entities/schema/v1-mrec.json` (shaped `vN-<shape>` names, read by dedicated tests).
+
+## `Gate::TxnSealChecked`, `MAX_SUPPORTED = 4` (R-01, ADR 0018/0073 2026-10-09 amendments)
+
+The third real gate (version 4) guards `KvCommand::{TxnCommitSealChecked,
+TxnAbortSealChecked}` in `animus-cp-data` (`gates.rs` row, `gated_propose`): the
+only gate so far whose reason is a *changed apply behaviour* (a txn decision on an
+already-sealed range is a no-op) rather than a new surface; the behaviour travels in
+the entry because apply never branches on a gate (ADR 0073 decision 4). Adding a
+gate still means a `Gate` variant + `version`/`rank`/`ALL` rows, the `sim_versions`
+acceptance matrix (`profiles_accept_gates_exactly_up_to_their_known_version` gains a
+`Release(n)` column per release), the `gate_table_is_exhaustive` test and the
+`MAX_SUPPORTED` pin. `BinaryProfile::Release(n)` is `[n-1, n]` in the sim; `Release(2)`
+stays the literal `[1, 2]`. Cell: animusd `sim_cluster_mixed_version_corpus`
+`release3_to_release4_txn_seal_gate`.
