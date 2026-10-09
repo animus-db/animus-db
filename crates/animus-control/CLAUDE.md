@@ -3201,7 +3201,7 @@ advance on an ack for entries it did not persist; `cannot_vote_yet()` includes
 step-down and `transfer_leadership` need a *healthy quorum*
 (`healthy_followers(now)`: acked `check_pending == false` within one election
 timeout) and never target a `check_pending` peer, so a full leader does not hand
-off to a full node or ping-pong. `handle_append_resp` skips the immediate resend
+off to a full node or ping-pong. A voter this leader saw flip from `check_pending` true to false (`peer_recovered_at`) is also excluded until it has stayed healthy for 20 election timeouts (chaos F-4: a full disk regains a sliver from its own WAL rewrite and loses it on the next write; trusting that first healthy ack handed leadership back onto a group that could not commit its first-term entry). `handle_append_resp` skips the immediate resend
 for an ack that made no progress while `check_pending` (a zero-latency
 ack/resend spin otherwise; guarded by the trace-event bound in the corpus).
 `had_leader_contact` is sticky (never cleared) and feeds the eventual-read gate.

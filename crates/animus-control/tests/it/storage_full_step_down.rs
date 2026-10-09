@@ -16,6 +16,8 @@ fn group() -> [NodeId; 3] {
 }
 const NOW: Nanos = Nanos(1_000_000_000);
 const LATER: Nanos = Nanos(60_000_000_000);
+/// The sustained-health window: 20 default election timeouts (150 ms each).
+const WINDOW: u64 = 150_000_000 * 20;
 
 fn elect_leader() -> RaftCore {
     let mut core: RaftCore = RaftCore::new(group()[0].clone(), &group(), Nanos(0), 7);
@@ -154,9 +156,14 @@ fn storage_full_step_down_needs_a_healthy_quorum_of_followers() {
         "one healthy follower of two is not a quorum that can elect or commit"
     );
     assert_eq!(core.transfer_target(), None);
-    // Node 2's space returns and it reports healthy: the handoff proceeds.
+    // Node 2's space returns and it reports healthy: trusted once it has stayed
+    // healthy for a window (see `a_voter_that_just_recovered_...`), then the
+    // handoff proceeds.
     ack(&mut core, 2);
-    assert_eq!(core.storage_full_step_down(NOW, None), Some(nid(1)));
+    let later = Nanos(NOW.0 + WINDOW);
+    ack_with(&mut core, 1, last, false, later);
+    ack_with(&mut core, 2, last, false, later);
+    assert_eq!(core.storage_full_step_down(later, None), Some(nid(1)));
 }
 
 #[test]
@@ -169,6 +176,66 @@ fn storage_full_step_down_ignores_a_stale_health_report() {
     assert_eq!(core.storage_full_step_down(LATER, None), None);
     assert!(core.healthy_followers(LATER).is_empty());
     assert_eq!(core.healthy_followers(NOW).len(), 2);
+}
+
+/// Chaos `disk_full` F-4: a voter this leader saw report unable (full) and then
+/// healthy is a flap, not a successor. Its disk regained a sliver of space (its
+/// own WAL rewrite freed the old file) that the next write consumes again.
+/// Trusting that first healthy ack handed leadership back to the node that had
+/// just handed it off, onto a group whose other replicas were full too: the new
+/// leader's first-term entry never committed and no linearizable read could be
+/// served. Without the sustained-health rule the handoff below is armed.
+#[test]
+fn a_voter_that_just_recovered_is_not_a_successor_until_it_stays_healthy() {
+    let window = WINDOW;
+    let mut core = elect_leader();
+    let last = core.last_log_index();
+    // Node 1 reports full, node 2 healthy.
+    ack_with(&mut core, 1, last, true, NOW);
+    ack_with(&mut core, 2, last, false, NOW);
+    assert_eq!(core.storage_full_step_down(NOW, None), None);
+    // Node 1 reports healthy (a sliver of space regained): present, but not yet
+    // trusted, so the full leader still has no healthy quorum of successors.
+    let t1 = Nanos(NOW.0 + window / 4);
+    ack_with(&mut core, 1, last, false, t1);
+    ack_with(&mut core, 2, last, false, t1);
+    assert_eq!(core.peer_check_pending(&nid(1)), Some(false));
+    assert_eq!(core.healthy_followers(t1), vec![nid(2)]);
+    assert_eq!(
+        core.storage_full_step_down(t1, None),
+        None,
+        "a flapping voter must not complete the quorum a handoff needs"
+    );
+    assert_eq!(core.transfer_target(), None);
+    // It stays healthy for the whole sustained-health window: now it counts.
+    let t2 = Nanos(t1.0 + window);
+    ack_with(&mut core, 1, last, false, t2);
+    ack_with(&mut core, 2, last, false, t2);
+    assert_eq!(core.healthy_followers(t2).len(), 2);
+    assert_eq!(core.storage_full_step_down(t2, None), Some(nid(1)));
+}
+
+/// A relapse resets the clock: healthy, full again, healthy again is a new flap.
+#[test]
+fn a_relapse_restarts_the_sustained_health_clock() {
+    let window = WINDOW;
+    let mut core = elect_leader();
+    let last = core.last_log_index();
+    ack_with(&mut core, 2, last, false, NOW);
+    ack_with(&mut core, 1, last, true, NOW);
+    let t1 = Nanos(NOW.0 + window);
+    ack_with(&mut core, 1, last, false, t1); // recovered at t1
+    ack_with(&mut core, 2, last, false, t1);
+    let t2 = Nanos(t1.0 + window / 2);
+    ack_with(&mut core, 1, last, true, t2); // relapse
+    let t3 = Nanos(t2.0 + window / 2);
+    ack_with(&mut core, 1, last, false, t3); // recovered again at t3
+    ack_with(&mut core, 2, last, false, t3);
+    // More than a window since the FIRST recovery, but only t3 counts.
+    let t4 = Nanos(t3.0 + window / 2);
+    ack_with(&mut core, 1, last, false, t4);
+    ack_with(&mut core, 2, last, false, t4);
+    assert_eq!(core.healthy_followers(t4), vec![nid(2)]);
 }
 
 #[test]
@@ -195,7 +262,10 @@ fn a_full_leader_without_a_healthy_quorum_refuses_any_transfer() {
     // other two voters (this leader included) cannot persist.
     assert!(!core.transfer_leadership(nid(1), NOW));
     ack(&mut core, 2);
-    assert!(core.transfer_leadership(nid(1), NOW));
+    let later = Nanos(NOW.0 + WINDOW);
+    ack_with(&mut core, 1, last, false, later);
+    ack_with(&mut core, 2, last, false, later);
+    assert!(core.transfer_leadership(nid(1), later));
 }
 
 /// The ack a storage-full follower sends is frozen at its durable index, and a

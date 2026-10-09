@@ -238,6 +238,21 @@ for the kernel's ENOSPC, not for every filesystem's timing of it.
   are asserted in phase 2 again (see `docs/resource-bounds.md`, "Every replica
   full"). Verified 6 of 6 `chaos_disk_full` and 3 of 3 `chaos_smoke` runs.
 
+- **F-4 (resolved for the flapping-node form, see ADR 0074's 2026-10-09 amendment): a
+  full leader handed leadership back to a node that had just regained a sliver
+  of space, and consistent reads stalled.** Phase 2 reported `consistent
+  [0, 0, 0]` (eventual 4 of 4) in about 1 run in 30 locally; the finalize was
+  not the cause (the leadership hand-back that precedes it also appears without
+  it). Per-group dump of a failing run: one tablet at term
+  3, its leader's first-term entry uncommitted because both followers were full.
+  Cause and the sustained-health fix are in the ADR amendment; the regression is
+  `storage_full_step_down::a_voter_that_just_recovered_is_not_a_successor_until_it_stays_healthy`.
+  The harness also tops the ballast up before each node's reads now (a node can
+  regain a few KiB mid-window from its own WAL rewrite), and prints how many
+  bytes that regained, so "every disk full" holds while it asserts. The lazy
+  discovery of fullness (a full node that has received no write does not know it)
+  is the remaining open edge.
+
 ### Faults not implemented, and why
 
 | Fault | Status |
