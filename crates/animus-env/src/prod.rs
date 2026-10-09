@@ -4569,6 +4569,86 @@ mod tests {
         let _ = std::fs::remove_dir_all(&pki_dir_b);
     }
 
+    /// Issue #1253 / PR #1255: the internal Raft wire admits only own-CA
+    /// peers. `b` trusts its own CA and, via `peer_ca_path`, a second
+    /// (peer-region) CA. A client whose certificate chains to the own CA
+    /// exchanges frames; a client whose certificate chains only to the
+    /// peer-region CA completes the TLS handshake but is dropped by
+    /// `spawn_accept` before any frame is read, so nothing is delivered.
+    #[tokio::test]
+    async fn tls_peer_region_only_certificate_is_dropped_on_the_internal_wire() {
+        use crate::Network;
+
+        let dir = |_: usize| unique_tmp_dir();
+        let (dir_a, dir_c, dir_b) = (dir(0), dir(1), dir(2));
+        let own_pki = unique_tmp_dir();
+        let peer_pki = unique_tmp_dir();
+
+        // Own CA signs `b` (the listener) and `a` (the good client); the
+        // peer-region CA signs `c`, whose own `ca_path` is the own CA so it
+        // still trusts `b`'s server certificate and the handshake completes.
+        let (own_ca, mut own_cfgs) = write_test_pki(&own_pki, &["127.0.0.1", "127.0.0.1"]);
+        let (peer_ca, mut peer_cfgs) = write_test_pki(&peer_pki, &["127.0.0.1"]);
+        let mut cfg_b = own_cfgs.remove(0);
+        let cfg_a = own_cfgs.remove(0);
+        cfg_b.peer_ca_path = Some(peer_ca);
+        let mut cfg_c = peer_cfgs.remove(0);
+        cfg_c.ca_path = Some(own_ca);
+
+        let loop0 = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
+        let (b, b_addr) = ProdEnv::bind_with_tls(nid(1), loop0, &dir_b, Some(cfg_b))
+            .await
+            .expect("bind b with tls");
+        let (a, _) = ProdEnv::bind_with_tls(nid(0), loop0, &dir_a, Some(cfg_a))
+            .await
+            .expect("bind a with tls");
+        let (c, _) = ProdEnv::bind_with_tls(nid(2), loop0, &dir_c, Some(cfg_c))
+            .await
+            .expect("bind c with tls");
+        a.set_peers([(nid(1), b_addr.to_string())].into_iter().collect());
+        c.set_peers([(nid(1), b_addr.to_string())].into_iter().collect());
+
+        // Positive control: the own-CA client is delivered.
+        a.send(nid(1), b"own-ca-frame".to_vec()).await;
+        let env = tokio::time::timeout(Duration::from_secs(10), b.recv())
+            .await
+            .expect("own-CA frame timed out");
+        assert_eq!(env.from, nid(0));
+        assert_eq!(env.payload, b"own-ca-frame");
+
+        // The peer-region-only client sends; then the own-CA client sends a
+        // canary. Everything `b` receives until the canary (and for a short
+        // window after it) must be the canary alone.
+        c.send(nid(1), b"peer-region-frame".to_vec()).await;
+        a.send(nid(1), b"canary".to_vec()).await;
+        let mut got = Vec::new();
+        loop {
+            let env = tokio::time::timeout(Duration::from_secs(10), b.recv())
+                .await
+                .expect("canary never arrived");
+            let canary = env.payload == b"canary";
+            got.push((env.from, env.payload));
+            if canary {
+                break;
+            }
+        }
+        while let Ok(env) = tokio::time::timeout(Duration::from_millis(500), b.recv()).await {
+            got.push((env.from, env.payload));
+        }
+        assert!(
+            got.iter().all(|(from, _)| *from != nid(2)),
+            "a peer-region-only certificate must never reach the internal Raft wire: {got:?}"
+        );
+        assert!(got.iter().any(|(_, p)| p == b"canary"));
+
+        a.shutdown();
+        b.shutdown();
+        c.shutdown();
+        for d in [&dir_a, &dir_b, &dir_c, &own_pki, &peer_pki] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
     /// A plain-TCP dial into a TLS listener fails cleanly (no valid TLS
     /// handshake ever completes) and — the important part — the listener
     /// keeps right on serving genuine TLS peers afterward, exactly as
