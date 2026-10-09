@@ -296,6 +296,20 @@ pub struct LsmOptions {
 }
 
 impl LsmOptions {
+    /// The options a production node (`animusd`) opens its engines with: the
+    /// defaults, plus [`background_maintenance`](Self::background_maintenance)
+    /// so a flush / L0->L1 compaction (which rewrites every overlapping L1
+    /// table, i.e. the whole base table for random keys) never runs inline on
+    /// the single apply task and freezes every in-flight op on the tablet
+    /// (issue #1196). Only usable under a driver that polls spawned tasks.
+    #[must_use]
+    pub fn production() -> Self {
+        Self {
+            background_maintenance: true,
+            ..Self::default()
+        }
+    }
+
     /// Reject option combinations that would make [`LsmEngine`]'s leveled
     /// compaction unable to reach a stable state.
     ///

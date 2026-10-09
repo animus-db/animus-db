@@ -837,3 +837,10 @@ hard-links rather than copies.
 ## Fuzzing (roadmap R-01 (c))
 
 The LSM WAL/manifest/SSTable decoders are the `lsm_formats` fuzz target, reached through the off-by-default `fuzzing` feature's `#[doc(hidden)] lsm::fuzzing` module (thin entry points only — no behaviour lives there). Adding a format version = keep the `legacy::vN` decoder reachable from that module. See `fuzz/README.md` (stable smoke: `cd fuzz && cargo test --release --test smoke`).
+
+- **Production engines run maintenance in the background (#1196).** `animusd`
+  opens every `LsmEngine` with `LsmOptions::production()`
+  (`background_maintenance: true`); the `Default` stays inline only so
+  `block_on`-only tests keep working. Inline flush/compaction on the single
+  apply task is a periodic 200-700 ms whole-tablet stall that grows with table
+  size. A new open site in production code must use `production()`.
