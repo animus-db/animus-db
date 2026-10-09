@@ -2554,6 +2554,17 @@ disambiguation is needed.
     two bullets below). The control plane's own `meta_apply_and_compact`
     does not use this — see the ADR amendment for why (a single small
     per-cluster group, never the flood's own mechanism).
+- **The read-side waits are event-driven (issue #1197).** `read_barrier` and
+  `ensure_ceiling_above` park in `wait_read_progress(seen)` on `applied_watch`
+  (engine-applied advance) and `ReadState::ack_events` (one bump per recorded
+  `ReadProbeAck`), with `READ_POLL` (20 ms) only as a safety net for the
+  transitions that raise no wake (step-down, term change, deadline). They used
+  to be bare `sleep(READ_POLL)` loops, a ~21 ms floor on every
+  `ConsistentRead: true` read. Take `read_wake_marks()` **before** evaluating
+  the condition. A new wait on read-side state must add its wake source here
+  rather than a sleep. Regression: `tests/it/read_index_latency.rs`
+  (`ANIMUS_READ_LATENCY_SEEDS`); lesson
+  `docs/lessons/code-patterns/2026-10-09-a-poll-sleep-in-a-wait-loop-is-a-latency-floor.md`.
 - **Wake-on-propose cuts single-write latency.** `put`/`delete`/`cas`/
   `change_membership` route through `propose_and_wake`: after the core appends,
   the proposer raises a `ProposeSignal` (`AtomicBool` +

@@ -48,6 +48,7 @@ mod quiesced_eventual_read;
 mod quiescence;
 mod read_index;
 mod read_index_fresh_leader;
+mod read_index_latency;
 mod reconciler_corpus;
 mod reconfigure_down_extra_priority;
 mod reconfigure_healthy_drop;

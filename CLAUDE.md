@@ -249,6 +249,7 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 | `ANIMUS_RECONCILER_SEEDS=K` | 1 | reconciler-corpus depth (`animus-cp-data`) |
 | `ANIMUS_TXN_SEEDS=K` | 1 | multi-tablet cross-transaction corpus depth (`animus-test`, ADR 0018) |
 | `ANIMUS_STREAM_SEEDS=K` | 1 | DynamoDB Streams lineage-walk corpus depth (`animus-test`, ADR 0042/0043) |
+| `ANIMUS_READ_LATENCY_SEEDS=K` | 4 (floor) | linearizable-read-latency corpus depth (`animus-cp-data`, issue #1197) — a ReadIndex read must finish in about one probe round trip of virtual time, not a poll tick; `cargo test -p animus-cp-data --test it read_index_latency::` |
 | `ANIMUS_BACKFILL_SEEDS=K` | 1 | secondary-index backfill fault-injection corpus depth (`animus-test`, ADR 0045) |
 | `ANIMUS_QUIESCE_SEEDS=K` | 1 | idle-tablet-group quiescence corpus depth (`animus-cp-data`, ADR 0044 phase 1) |
 | `ANIMUS_SPLIT_SEEDS=K` | 1 | `KvCommand::SeedBatch` corpus depth (`animus-cp-data`) — the version-carrying row-merge command originally built for the now-deleted copy-based split driver (ADR 0050 Train B), its sole surviving consumer is the restore driver (ADR 0059 §7) |
