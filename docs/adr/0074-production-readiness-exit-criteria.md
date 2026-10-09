@@ -388,3 +388,42 @@ and eventual reads served, leader unmoved), and `chaos_disk_full`, whose phase 2
 again **asserts** reads served and at least one 503 `StorageFull` refusal. The
 control-plane group is unchanged (it never sets `storage_full`; its full
 follower still holds its acks).
+
+## Amendment 2026-10-09: a recovered voter is not a successor until it stays healthy (chaos finding F-4)
+
+`chaos_disk_full` failed on PR #1260 with `consistent [0, 0, 0]` of every read
+of a written key while every disk was full (eventual reads 4 of 4). It
+reproduced locally (1 run in 30 on the PR; the precursor, a leadership
+hand-back at all-full time, also shows without the PR's cluster-version
+finalize, so the finalize is not the cause). The per-group dump of a failing run showed the
+mechanism: tablet 3 at term 3, leader n0, commit 514, n0's durable 516, n1/n2
+full. Every node's disk filled within about a second, but a node only learns it
+is full from a failed write, and a full leader's refused writes never reach its
+followers. So the leader `n0` handed off to `n1` (both followers looked healthy,
+one of them stale), and a second later `n1`, itself now full, handed leadership
+**back** to `n0`. `n0` had regained 96 KiB from its own WAL rewrite (the old
+WAL file freed) and so reported `check_pending == false` for a moment; `n2`'s
+last ack still said healthy because it had not yet failed a write. Two of two
+other voters "healthy" satisfied the quorum rule, `n0` won term 3, appended its
+election no-op, and no follower could persist it: the first-term entry never
+committed, and Raft section 6.4 forbids a ReadIndex read before it does. Eventual
+reads still worked (the sticky `had_leader_contact` gate).
+
+What changed (no wire or persisted-format change): the leader remembers when a
+voter flipped from `check_pending == true` to `false` within its stint
+(`peer_recovered_at`), and `healthy_followers` omits that voter until it has
+stayed healthy for 20 election timeouts. A voter that was never seen unhealthy
+is trusted as before, so an ordinary one-full-node handoff is not delayed. A
+relapse restarts the clock; the window is 20 election timeouts, because a
+150 ms one still let a hand-back through (the WAL rewrite that frees the space is
+retried on a 100 ms to 2 s backoff). Looped locally with the fix: 0 of 45 runs
+reached term 3 in the all-full dump (2 of 22 before) and 45 of 45 passed. Tests:
+`storage_full_step_down::a_voter_that_just_recovered_is_not_a_successor_until_it_stays_healthy`
+and `a_relapse_restarts_the_sustained_health_clock` (red before).
+
+**Still open:** the lazy discovery itself. A node whose disk is full and which
+has received no write does not know it (health is learned from a failed write,
+not probed), so a handoff to a voter that is in fact full and merely has not
+noticed can still happen and leaves the new leader unable to commit until space
+returns. Closing it needs an active free-space probe on followers; the
+hysteresis above removes the flapping-node form of it that the chaos run hit.

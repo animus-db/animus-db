@@ -129,6 +129,15 @@ pub const SNAPSHOT_CHUNK_BYTES: usize = 64 * 1024;
 /// this cap and unaffected.
 const MAX_APPEND_ENTRIES_BATCH: usize = 512;
 
+/// How many election timeouts a voter this leader saw report unable (full) and
+/// then healthy must stay healthy before it counts in
+/// [`RaftCore::healthy_followers`] (chaos `disk_full` F-4). A full disk regains
+/// a sliver of space when the node's WAL rewrite frees its old file, and the
+/// rewrite is retried on a backoff of 100 ms up to 2 s, so the flap period is
+/// on the order of a second: one election timeout (150 ms by default) is far
+/// too short to tell a flap from a recovery.
+const SUSTAINED_HEALTH_ELECTION_TIMEOUTS: u64 = 20;
+
 /// How a call site's `InstallSnapshot` chunk resend for an already-outstanding
 /// (unchanged) offset is bounded (issues #532/#537, ADR 0009's third
 /// 2026-09-01 amendment — the residual beyond `MAX_APPEND_ENTRIES_BATCH` and
@@ -1086,6 +1095,17 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // promotion. Cleared on `become_leader` and on any membership change that
     // (re)introduces or drops the peer, exactly like `match_index`.
     peer_check_pending: BTreeMap<NodeId, bool>,
+    // Leader-only, volatile (issue #1228, chaos `disk_full` F-4): the `now` at
+    // which each peer last flipped from reporting `check_pending == true`
+    // (full / unable to vote) to `false` within this leader's stint. A peer
+    // that reported unable and then healthy is not trusted as a handoff
+    // target or quorum member until it has stayed healthy for
+    // `SUSTAINED_HEALTH_ELECTION_TIMEOUTS` election timeouts
+    // (`healthy_followers`): a full disk regains a sliver of space from its
+    // own WAL rewrite / compaction and then loses it again on the next write.
+    // ABSENT means "never observed unhealthy" and is trusted. Cleared with
+    // `peer_check_pending`.
+    peer_recovered_at: BTreeMap<NodeId, Nanos>,
     // Leader-only, volatile liveness bookkeeping (ADR 0037 hardening PR2): the
     // `now` at which this leader last heard an `AppendEntriesResp` (success OR
     // reject — either proves the peer is up and reachable) from each peer.
@@ -1669,6 +1689,7 @@ where
             match_index: BTreeMap::new(),
             snapshot_served_through: BTreeMap::new(),
             peer_check_pending: BTreeMap::new(),
+            peer_recovered_at: BTreeMap::new(),
             last_contact: BTreeMap::new(),
             leader_since: None,
             heard_from: BTreeSet::new(),
@@ -4380,7 +4401,12 @@ where
         // Issue #1131: latest report wins (a reordered older ack can only
         // make a resolved check look pending again, which only delays a
         // promotion).
-        self.peer_check_pending.insert(from.clone(), check_pending);
+        let was_pending = self.peer_check_pending.insert(from.clone(), check_pending);
+        if check_pending {
+            self.peer_recovered_at.remove(&from);
+        } else if was_pending == Some(true) {
+            self.peer_recovered_at.insert(from.clone(), now);
+        }
         // Either outcome — success or reject — proves `from` is up and
         // reachable right now, which is exactly the liveness signal
         // `peer_last_contact`/`control_peer_believed_alive` need. Stamped once
@@ -5347,6 +5373,7 @@ where
         self.last_activity = now;
         let last = self.last_log_index();
         self.peer_check_pending.clear();
+        self.peer_recovered_at.clear();
         // ADR 0058 Train 1: seed a learner's `next_index`/`match_index`/
         // `last_contact` the identical way a voter's is seeded — a learner is
         // replicated to and tracked exactly like a follower, just never
@@ -5710,6 +5737,7 @@ where
             self.match_index.insert(n.clone(), 0);
             self.snapshot_served_through.remove(n);
             self.peer_check_pending.remove(n);
+            self.peer_recovered_at.remove(n);
             self.forget_snapshot_transfer(n);
         }
         for n in old_members.difference(&now_members) {
@@ -5721,6 +5749,7 @@ where
             self.last_contact.remove(n);
             self.snapshot_served_through.remove(n);
             self.peer_check_pending.remove(n);
+            self.peer_recovered_at.remove(n);
             self.forget_snapshot_transfer(n);
         }
     }
@@ -5744,6 +5773,7 @@ where
         self.last_contact.remove(peer);
         self.snapshot_served_through.remove(peer);
         self.peer_check_pending.remove(peer);
+        self.peer_recovered_at.remove(peer);
         self.forget_snapshot_transfer(peer);
     }
 
@@ -6427,6 +6457,16 @@ where
     /// includes "not storage-full", see `cannot_vote_yet`) and arrived within
     /// one election timeout of `now`. A voter that has never reported, reported
     /// full / unable, or has gone quiet is absent. Empty on a non-leader.
+    ///
+    /// **Sustained health (chaos `disk_full` F-4).** A voter this leader saw
+    /// report unable and then healthy is also absent until it has stayed
+    /// healthy for [`SUSTAINED_HEALTH_ELECTION_TIMEOUTS`] election timeouts. A
+    /// full disk regains a sliver of space (the node's own WAL rewrite frees its
+    /// old file) that the next write consumes again; trusting that first
+    /// healthy ack handed leadership back to the node that had just handed it
+    /// off, onto a group whose other replicas were full too, so the new
+    /// leader's first-term entry never committed and no linearizable read could
+    /// be served.
     #[must_use]
     pub fn healthy_followers(&self, now: Nanos) -> Vec<NodeId> {
         if self.role != Role::Leader {
@@ -6441,6 +6481,13 @@ where
                 self.last_contact
                     .get(*n)
                     .is_some_and(|at| now.0.saturating_sub(at.0) <= window)
+            })
+            .filter(|n| {
+                // Sustained health: a peer that was unable a moment ago and
+                // just reported healthy is a flap, not a successor.
+                self.peer_recovered_at.get(*n).is_none_or(|at| {
+                    now.0.saturating_sub(at.0) >= window * SUSTAINED_HEALTH_ELECTION_TIMEOUTS
+                })
             })
             .cloned()
             .collect()
