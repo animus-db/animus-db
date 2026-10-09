@@ -3220,7 +3220,10 @@ own internal mutex (in `animus-control`) is only taken inside `append_tagged`/
   Assertions are liveness only; the numbers are the product. The first run found a
   quiesced group still woke every `APPLY_SAFETY_POLL` (250 ms) via its apply
   task (issue #1180, fixed by #1207); the quiesced CPU numbers in ADR 0044's
-  2026-10-04 outcome amendment predate that fix.
+  2026-10-04 outcome amendment predate that fix, and its 2026-10-09 amendment
+  re-measures: quiesced net CPU 0 ms/s at RF1 (1k and 10k groups), 1 ms/s at
+  RF3. CPU is read in `CLK_TCK` ticks (100 Hz) over the window, so 1 ms/s over
+  10 s is one tick: treat <= 1 ms/s as the floor, not a finding.
 
 ## Per-group WAN timing in the host reconciler (ADR 0075 section 3.4)
 
