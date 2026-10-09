@@ -1218,3 +1218,124 @@ fn i_a_group_spanning_a_split_is_refused_before_staging_over_seeds() {
         run_i_a_group_spanning_a_split_is_refused_before_staging(0xA5F1_9000 + i);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Scenario (j): a tablet whose range covers a single hash-ring token is never
+// split (R-01 residual of F-2).
+// ---------------------------------------------------------------------------
+
+/// Every row shares ONE partition key (one token), spread over many sort
+/// keys. The byte trigger first carves the token out at its boundaries
+/// (`[.., T)`, `[T, T+1)`, `[T+1, ..)` -- both cuts token-aligned), after
+/// which the hot tablet's range is exactly one token and still over the
+/// threshold. `decide::align_split_key` used to fall back to the raw,
+/// sort-key-granular key there, cutting *inside* the token (separating a 2PC
+/// record, which sorts below the token's items, from its anchor's item). It
+/// must refuse instead: no tablet boundary may ever be anything but a whole
+/// token, and the tablet stays whole, readable and writable.
+fn run_j_a_single_token_tablet_is_never_split(seed: u64) {
+    use animus_tablet::TOKEN_BYTES;
+
+    let mut cluster = SimCluster::new(seed, 3, 3);
+    let body = r#"{"TableName":"hot",
+        "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},
+                     {"AttributeName":"sk","KeyType":"RANGE"}],
+        "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"},
+                                {"AttributeName":"sk","AttributeType":"S"}]}"#;
+    let (status, resp) = cluster.dynamo(0, "DynamoDB_20120810.CreateTable", body.as_bytes());
+    assert_eq!(status, 200, "seed={seed}: CreateTable failed: {resp}");
+
+    let put = |cluster: &mut SimCluster, sk: &str| {
+        let pad = "x".repeat(PAD_LEN);
+        let body = format!(
+            r#"{{"TableName":"hot","Item":{{"pk":{{"S":"hot"}},"sk":{{"S":"{sk}"}},"pad":{{"S":"{pad}"}}}}}}"#
+        );
+        cluster.dynamo(0, "DynamoDB_20120810.PutItem", body.as_bytes())
+    };
+    let sks: Vec<String> = (0..NUM_KEYS + 4).map(|i| format!("r{i:02}")).collect();
+    for sk in &sks {
+        let (status, resp) = put(&mut cluster, sk);
+        assert_eq!(status, 200, "seed={seed}: PutItem({sk}) failed: {resp}");
+    }
+
+    cluster.set_auto_split_thresholds(thresholds());
+    let nodes: Vec<u64> = (0..cluster.node_count() as u64).collect();
+    // Long enough for two full cooldown periods after the two token-aligned
+    // carve splits: the single-token tablet is retried (and refused) at least
+    // twice. The cutover driver is only run while a fork is in flight (it is
+    // costly per call), never as a blind 100 ms ticker.
+    let mut elapsed = Duration::ZERO;
+    while elapsed < Duration::from_secs(40) {
+        let in_flight = {
+            let meta = cluster.metadata(0);
+            let states: Vec<_> = meta
+                .tablets_for_table("hot")
+                .map(|(_, t)| t.state)
+                .collect();
+            states.iter().any(|s| *s != TabletState::Active) || states.len() < 3
+        };
+        if in_flight || elapsed < Duration::from_secs(5) {
+            for &n in &nodes {
+                cluster.drive_inplace_split_cutover(n);
+            }
+        }
+        cluster.run_for(Duration::from_millis(500));
+        elapsed += Duration::from_millis(500);
+    }
+
+    for &n in &nodes {
+        let meta = cluster.metadata(n);
+        let mut active = 0;
+        for (id, t) in meta.tablets_for_table("hot") {
+            assert_ne!(
+                t.state,
+                TabletState::Splitting,
+                "seed={seed}: node {n}: tablet {id:?} stuck Splitting"
+            );
+            if t.state != TabletState::Active {
+                continue;
+            }
+            active += 1;
+            for b in [Some(&t.range.start), t.range.end.as_ref()]
+                .into_iter()
+                .flatten()
+                .filter(|b| !b.is_empty())
+            {
+                assert_eq!(
+                    b.len(),
+                    TOKEN_BYTES,
+                    "seed={seed}: node {n}: tablet {id:?} range {:?} has a boundary \
+                     that cuts inside a token",
+                    t.range
+                );
+            }
+        }
+        assert!(
+            active >= 2,
+            "seed={seed}: node {n}: the token-aligned carve split never happened \
+             (vacuous test)"
+        );
+    }
+
+    // The hot tablet stays whole, readable and writable.
+    let (status, resp) = put(&mut cluster, "r99");
+    assert_eq!(
+        status, 200,
+        "seed={seed}: PutItem after settle failed: {resp}"
+    );
+    let (status, count) = scan_count(&mut cluster, 1, "hot");
+    assert_eq!(status, 200, "seed={seed}: Scan failed");
+    assert_eq!(count, sks.len() + 1, "seed={seed}: rows lost");
+}
+
+#[test]
+fn j_a_single_token_tablet_is_never_split() {
+    run_j_a_single_token_tablet_is_never_split(env_seed(0xA5F1_000A));
+}
+
+#[test]
+fn j_a_single_token_tablet_is_never_split_over_seeds() {
+    for i in 0..3 {
+        run_j_a_single_token_tablet_is_never_split(0xA5F1_A000 + i);
+    }
+}

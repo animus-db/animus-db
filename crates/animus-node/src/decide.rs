@@ -124,13 +124,13 @@ pub fn ok_or_err(resp: ClientResponse, what: &str) -> Result<(), String> {
 /// collapses onto `range.start` (a hot token that opens the tablet) a
 /// non-streamed table goes **up** to the next token boundary instead (the
 /// token's rows all stay left).
-/// Only when neither is interior -- the range holds a single token -- does a
-/// non-streamed table fall back to the raw key, preserving the pre-existing
-/// ability to split one hot partition by sort key (a **documented residual**:
-/// a transaction anchored on that token can still straddle the cut, see
-/// `animus-cp-data`'s `txn.rs`); a streamed table reports `viable == false`
-/// (Fork E's accepted single-token limit, which keeps the stream's change
-/// records in one tablet). `viable == false` for an unknown tablet too (the
+/// Only when neither is interior -- the range holds a single token -- is the
+/// key reported `viable == false` for **every** table (Fork E's accepted
+/// single-token hot-partition limit: a streamed table keeps its change
+/// records in one tablet, and, for 2PC, a transaction anchored on that token
+/// can never straddle a cut). Earlier a non-streamed table fell back to the
+/// raw key there (a residual closed by R-01). The caller skips the split.
+/// `viable == false` for an unknown tablet too (the
 /// caller's own subsequent lookup reports that more precisely; this just
 /// never claims a key is fine for a tablet this function can't even see).
 pub fn align_split_key(meta: &Metadata, tablet: TabletId, split_key: Vec<u8>) -> (Vec<u8>, bool) {
@@ -163,11 +163,11 @@ pub fn align_split_key(meta: &Metadata, tablet: TabletId, split_key: Vec<u8>) ->
             return (up, true);
         }
     }
-    if streamed {
-        return (down, false);
-    }
-    let viable = t.range.split_at(&split_key).is_some();
-    (split_key, viable)
+    // Neither the down nor the up boundary is interior: the range lies
+    // within a single token. Refuse (the "can't split further" outcome, same
+    // as a collapse) for streamed and non-streamed tables alike -- cutting
+    // inside a token would separate a txn record from its anchor's item.
+    (down, false)
 }
 
 /// ADR 0034: the key that roughly bisects `pairs`' total **bytes** (key +
@@ -592,18 +592,30 @@ mod tests {
         assert!(viable);
     }
 
-    /// A range holding a single token has no token boundary inside it: an
-    /// unstreamed table keeps the raw key (the documented sub-token residual).
+    /// A range holding a single token has no token boundary inside it: the
+    /// split is refused (never cut mid-token), streamed or not.
     #[test]
-    fn a_single_token_unstreamed_range_falls_back_to_the_raw_key() {
+    fn a_single_token_unstreamed_range_is_not_viable() {
         let range = KeyRange {
             start: b"orders-m".to_vec(),
             end: Some(b"orders-n".to_vec()),
         };
         let m = plain_metadata_with_tablet(TabletId(2), range);
-        let (key, viable) = align_split_key(&m, TabletId(2), b"orders-mZZ".to_vec());
-        assert_eq!(key, b"orders-mZZ".to_vec());
-        assert!(viable);
+        let (_key, viable) = align_split_key(&m, TabletId(2), b"orders-mZZ".to_vec());
+        assert!(!viable, "a single-token range must never be split");
+        let (_k, viable) = align_split_key(&m, TabletId(2), b"orders-mA".to_vec());
+        assert!(!viable);
+    }
+
+    #[test]
+    fn a_single_token_streamed_range_is_not_viable() {
+        let range = KeyRange {
+            start: b"orders-m".to_vec(),
+            end: Some(b"orders-n".to_vec()),
+        };
+        let m = streamed_metadata_with_tablet(TabletId(2), range);
+        let (_key, viable) = align_split_key(&m, TabletId(2), b"orders-mZZ".to_vec());
+        assert!(!viable);
     }
 
     #[test]
