@@ -12398,3 +12398,8 @@ over the TLS admin port, TLS DynamoDB wire, converged-or-timeout polls). Gotcha:
 saga tests' `S` harness needs a `pad` peer so peer index == bridge cluster index.
 
 - **Peer trust class (issue #1253, ADR 0075 amendment).** `TlsSection.peer_ca_path` (optional) holds peer-region CAs; `ca_path` is the own CA. The intra acceptor admits both, `serve_requests` calls `TlsMaterial::classify_peer` after the accept and passes `PeerTrust` to `handle_connection`, which refuses anything but `MrecApply` for `PeerRegionOnly` (`animus_node::peer_region_may_send`, exhaustive, no `_` arm; `ClientResponse::Error` + `peer_region_request_refused` metric). The internal Raft wire (`animus-env` `spawn_accept`) drops such connections. No `peer_ca_path` = everything `Own` (old behaviour). Plaintext `allow_insecure_peers` stays unauthenticated. Test hook `mrec_peer::probe_peer_request_for_test` sends any `ClientRequest` with a chosen certificate; with the own-CA-only `ca_path` a dialer needs the peer's CA as `extra_ca` (`tls_ca` per peer) to trust the server certificate.
+
+- **Engines are opened with `LsmOptions::production()` (#1196).** Flush and
+  L0->L1 compaction run in a background task, not inline on the apply task;
+  inline maintenance froze every op on a tablet for 200-700 ms. Any new
+  `LsmEngine::open*` call in this crate must pass `LsmOptions::production()`.

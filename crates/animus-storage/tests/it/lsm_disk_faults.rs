@@ -301,6 +301,53 @@ fn scenario_injected_errors_during_flush_and_compaction_lose_no_acked_write(seed
     });
 }
 
+/// Background-maintenance twin of the injected-error scenario (issue #1196:
+/// production engines run flush and compaction off the ack path). Injected I/O
+/// errors hit the spawned maintenance task, which records the failure, instead
+/// of failing a writer inline. A put may fail loudly; every acked write must
+/// survive clearing the fault and a crash.
+fn scenario_bg_injected_errors_during_flush_and_compaction_lose_no_acked_write(seed: u64) {
+    let mut sim = Simulator::new(seed);
+    let n = 120u64;
+    let mut acked = Vec::new();
+    {
+        let mut o = churn_opts();
+        o.background_maintenance = true;
+        let e = open(&sim, o);
+        let mut cfg = DiskConfig::default();
+        cfg.set_error_prob(0.05);
+        sim.set_disk_config(cfg);
+        for i in 0..n {
+            if block_on(e.put(key(i).as_bytes(), value(i).as_bytes(), i + 1)).is_ok() {
+                acked.push(i);
+            }
+            sim.run_for(std::time::Duration::from_millis(5));
+        }
+        sim.set_disk_config(DiskConfig::default());
+        sim.run_for(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        !acked.is_empty(),
+        "seed={seed}: some puts should have succeeded"
+    );
+
+    sim.crash(nid(0));
+    let mut o = churn_opts();
+    o.background_maintenance = true;
+    let e = open(&sim, o);
+    block_on(async {
+        for &i in &acked {
+            let got = e.get(key(i).as_bytes()).await.unwrap();
+            assert_eq!(
+                got.as_ref().map(|vv| vv.value.clone()),
+                Some(value(i).into_bytes()),
+                "seed={seed}: acked write {} lost across faulty background run",
+                key(i),
+            );
+        }
+    });
+}
+
 /// At-rest corruption of a **synced SSTable data block** surfaces as a clean
 /// `StorageError` on read — the per-block CRC catches it — never a panic or
 /// silently wrong data.
@@ -718,6 +765,10 @@ fn scenario_cells() -> Vec<Scenario> {
         scenario!(
             "synced_wal_frame_before_a_marker_corrupted_is_refused",
             scenario_synced_wal_frame_before_a_marker_corrupted_is_refused
+        ),
+        scenario!(
+            "bg_injected_errors_during_flush_and_compaction_lose_no_acked_write",
+            scenario_bg_injected_errors_during_flush_and_compaction_lose_no_acked_write
         ),
     ]
 }
