@@ -247,6 +247,12 @@ impl World {
             .sum()
     }
 
+    fn unquiesces(&self) -> u64 {
+        (0..3)
+            .map(|i| self.sim.env(node(i)).metrics().get(Metric::CpUnquiesces))
+            .sum()
+    }
+
     fn write_one(&mut self) {
         let Some(l) = self.leader() else { return };
         let key = format!("k{:05}", self.next_key).into_bytes();
@@ -666,12 +672,9 @@ fn no_step_leaves_leader_outside_preferred() {
     }
 }
 
-/// ADR 0048: the step must not fight quiescence. Runs on quiet 1 ms links
-/// because, as built, a quiesced leader is woken by *any* inbound message and
-/// on links whose round trip exceeds the heartbeat interval the acks still in
-/// flight at the quiesce instant defeat quiescence on every settle (a
-/// pre-existing interaction of ADR 0048 with the WAN profile, independent of
-/// this step; issue #1226). An idle group whose leader is
+/// ADR 0048: the step must not fight quiescence, on the WAN links the
+/// stretch groups actually run (issue #1226 fixed late acks waking a quiesced
+/// leader). An idle group whose leader is
 /// already in the preferred region stays asleep (the step never pokes it); an
 /// idle group whose leader is misplaced is moved by exactly one transfer (the
 /// only thing that wakes it), then falls asleep again.
@@ -681,7 +684,7 @@ fn the_step_does_not_wake_a_correctly_placed_idle_group_and_moves_a_misplaced_on
         vec![cell("quiesced_idle_group", Mode::Step, Script::Steady)],
         seeds_per_cell(),
     ) {
-        let mut w = World::new_with(c.seed, Mode::Step, true, true);
+        let mut w = World::new_with(c.seed, Mode::Step, true, false);
         w.run(Duration::from_secs(25), false);
         w.run(Duration::from_secs(6), true);
         let first = w.leader().expect("a leader");
@@ -732,6 +735,45 @@ fn the_step_does_not_wake_a_correctly_placed_idle_group_and_moves_a_misplaced_on
             "seed={:#x}: the group never went back to sleep",
             c.seed
         );
+    }
+}
+
+/// Issue #1226: on WAN links (RTT above the heartbeat interval) an idle,
+/// quiescence-enabled group must settle and STAY quiesced. Acks sent before the
+/// leader quiesced arrive after it and used to wake it, forever. Converged-or-
+/// timeout to quiesced, then a stability window in which `CpUnquiesces` must not
+/// move and every replica stays asleep.
+#[test]
+fn an_idle_group_quiesces_and_stays_quiesced_on_wan_links() {
+    for c in select(
+        vec![cell("wan_quiescence", Mode::Step, Script::Steady)],
+        seeds_per_cell(),
+    ) {
+        let mut w = World::new_with(c.seed, Mode::Step, true, false);
+        w.run(Duration::from_secs(25), false);
+        w.run(Duration::from_secs(6), true);
+        let all_asleep = |w: &World| (0..3).all(|i| w.handle(i).is_some_and(|h| h.is_quiesced()));
+        let mut elapsed = Duration::ZERO;
+        while elapsed < Duration::from_secs(60) && !all_asleep(&w) {
+            w.step(false);
+            elapsed += TICK;
+        }
+        assert!(
+            all_asleep(&w),
+            "seed={:#x}: the idle WAN group never quiesced",
+            c.seed
+        );
+        // Let the last in-flight acks land, then the counter must be frozen.
+        w.run(Duration::from_secs(5), false);
+        let settled = w.unquiesces();
+        w.run(Duration::from_secs(60), false);
+        assert_eq!(
+            w.unquiesces(),
+            settled,
+            "seed={:#x}: late acks woke the quiesced group (#1226)",
+            c.seed
+        );
+        assert!(all_asleep(&w), "seed={:#x}: woke up", c.seed);
     }
 }
 
