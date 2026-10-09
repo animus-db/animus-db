@@ -1289,3 +1289,21 @@ frozen, while core `last_applied` still equalled commit. `persist_wal` takes the
 lock before branching on `SharedWal`, so both WAL paths were affected. It is now
 `animus_control::fair_lock::FairMutex`; see ADR 0038's 2026-09-30 amendment for
 the mechanism. Regression: `crates/animus-cp-data/tests/apply_not_starved_by_wal_lock.rs`.
+
+## Amendment (2026-10-09) — the ReadIndex barrier is event-driven, not poll-driven
+
+Issue #1197: `ConsistentRead: true` reads had a ~21 ms floor (eventual ~1 ms).
+`read_barrier`'s gate, confirmation and applied waits (and
+`ensure_ceiling_above`'s ceiling wait) were `env.sleep(READ_POLL)` loops
+(`READ_POLL` = 20 ms), so a barrier whose `ReadProbeAck`s arrived in ~1 ms still
+returned at the next poll boundary. They now park in `wait_read_progress` on
+`applied_watch` (engine-applied advance; also releases the fresh-leader no-op
+gate and the ceiling wait) and `ReadState::ack_events` (bumped by each recorded
+`ReadProbeAck`), racing `READ_POLL` only as a safety net for step-down / term
+change / deadline, which raise no wake. Marks are sampled before the condition
+is evaluated so no wake is lost. A linearizable read now costs about one probe
+round trip. Measured (3-node `animus-bench` workload C, 50 rps, colocated):
+ConsistentRead p50 23.7 ms -> 3.4 ms, min 22.3 ms -> 2.2 ms. Regression:
+`tests/it/read_index_latency.rs` (`ANIMUS_READ_LATENCY_SEEDS`). Residual: a
+read that has to extend the `ReadCeiling` (about once per `HLC_MAX_OFFSET`) still
+pays a real commit + fsync, a tail rather than a floor.
