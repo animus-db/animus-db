@@ -173,20 +173,20 @@ jobs:
         run: cargo build --workspace --all-targets --locked
 
       # cargo-deny can't run in the local dev sandbox (not installed); CI is
-      # where this gate actually executes. The pinned action installs cargo-deny
-      # and runs `cargo deny check` (advisories + bans + licenses + sources).
-      #
-      # `RUSTC_WRAPPER` is blanked for this step only: the action runs cargo
-      # inside its own Docker container, which inherits the job-level
-      # `RUSTC_WRAPPER: sccache` but has no `sccache` binary, so `cargo
-      # metadata` died with "could not execute process `sccache .../rustc -vV`
-      # (never executed)". deny only resolves metadata; it compiles nothing.
-      - name: cargo-deny check
-        uses: EmbarkStudios/cargo-deny-action@v2
-        env:
-          RUSTC_WRAPPER: ""
+      # where this gate actually executes: `cargo deny check` (advisories +
+      # bans + licenses + sources), with the same arguments
+      # `EmbarkStudios/cargo-deny-action@v2` passed. The binary comes from
+      # `taiki-e/install-action` (a GitHub release download) rather than that
+      # action, whose Docker image builds `FROM` a Docker Hub base on every
+      # run, so a Docker Hub pull failure turned this gate red on unrelated
+      # changes (2026-10-09). deny only resolves metadata; it compiles nothing.
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
         with:
-          command: check
+          tool: cargo-deny@0.20.2
+
+      - name: cargo-deny check
+        run: cargo deny --log-level warn --all-features check
 
       - name: sccache stats
         if: always()
@@ -682,8 +682,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      RUSTFS_IMAGE: rustfs/rustfs:1.0.0-rc.6
-      AWSCLI_IMAGE: amazon/aws-cli:2.36.44
+      # Pulled from ghcr.io and ECR Public, not Docker Hub (same digests as
+      # the Docker Hub tags): a Docker Hub pull failure on the runners turned
+      # this job red on unrelated changes (2026-10-09).
+      RUSTFS_IMAGE: ghcr.io/rustfs/rustfs:1.0.0-rc.6
+      AWSCLI_IMAGE: public.ecr.aws/aws-cli/aws-cli:2.36.44
       S3_ACCESS_KEY: ciaccesskey
       S3_SECRET_KEY: cisecretkey123
       S3_BUCKET: ci-real-endpoint
