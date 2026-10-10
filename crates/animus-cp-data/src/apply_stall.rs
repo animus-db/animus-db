@@ -124,6 +124,10 @@ impl<E: Env, S: StorageEngine> StallingEngine<E, S> {
 impl<E: Env, S: StorageEngine> StorageEngine for StallingEngine<E, S> {
     type Snapshot = S::Snapshot;
 
+    fn hold_version(&self, version: Version) -> animus_storage::VersionHold {
+        self.inner.hold_version(version)
+    }
+
     async fn put(&self, key: &[u8], value: &[u8], version: Version) -> Result<()> {
         self.retry("put", || self.inner.put(key, value, version))
             .await

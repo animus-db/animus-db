@@ -1873,3 +1873,18 @@ unchanged; (2) golden fixtures `backup-manifest/v1.bin` and
 `backup-data/v1.bin` (`animus-cp-data/tests/fixtures/formats/`) pin both
 layouts from the baseline on, so a layout change is a new version plus a new
 fixture, never an edit of `v1`.
+
+## Amendment 2026-10-10: the capture holds its `cut_version` (#1206)
+
+The `cut_version` a tablet's capture pins is replayed by `local_scan_kind_snapshot`
+(`StorageEngine::scan_at`) on every tick, and the "identical re-put" invariant
+(a retried chunk re-derives byte-identical content) needs the engine to still
+hold the versions visible at that cut. `LsmEngine` compaction used to drop
+history ~1 ms behind the newest write, so a compaction between two ticks broke
+it. The capture loop now keeps a `StorageEngine::hold_version(cut_version)` guard
+per `(backup, tablet)` it leads, for the whole capture (released on completion,
+failure, cancel, loss of leadership or task drop), and the engine's time grace is
+5 s of HLC wall time (ADR 0008's 2026-10-10 amendment). After a leader change the
+new leader takes its own hold on its first tick; the gap is covered only by the
+time grace. Test: `animus-test` `lsm_read_holds::held_cut_version_rescan_is_identical_across_compaction`
+(with an unheld control).

@@ -871,6 +871,17 @@ impl<E: Env> CpGroup<E> {
         }
     }
 
+    /// Pin `version` on this replica's engine against compaction GC until the
+    /// guard drops — the backup capture driver holds its `cut_version` across
+    /// every tick of a tablet's capture (issue #1206). See
+    /// [`RaftKvNode::hold_version`].
+    pub(crate) fn hold_version(&self, version: u64) -> animus_storage::VersionHold {
+        match self {
+            CpGroup::Lsm(n) => n.hold_version(version),
+            CpGroup::Mem(n) => n.hold_version(version),
+        }
+    }
+
     /// A snapshot-pinned, intent-resolved, resumable-cursor sweep of a kind
     /// scope — the backup capture driver's own read primitive (ADR 0059
     /// §4/§5). See [`RaftKvNode::local_scan_kind_snapshot`].
@@ -7909,8 +7920,12 @@ impl BoundControlNode {
         // sole writer.
         let (raft, control_storage) = match backend {
             StorageBackend::Lsm => {
-                match LsmEngine::open_with(engine_env, SYSKV_LSM_PREFIX, LsmOptions::production())
-                    .await
+                match LsmEngine::open_with(
+                    engine_env,
+                    SYSKV_LSM_PREFIX,
+                    LsmOptions::production_raw_versions(),
+                )
+                .await
                 {
                     Ok(lsm) => (
                         RaftNode::start_with_orphan_sweep_after(

@@ -844,3 +844,14 @@ The LSM WAL/manifest/SSTable decoders are the `lsm_formats` fuzz target, reached
   `block_on`-only tests keep working. Inline flush/compaction on the single
   apply task is a periodic 200-700 ms whole-tablet stall that grows with table
   size. A new open site in production code must use `production()`.
+
+- **Version holds and the GC grace (#1206, ADR 0008's 2026-10-10 amendment).**
+  `StorageEngine::hold_version(v) -> VersionHold` is an RAII pin through
+  `Inner::held_snapshots` at an arbitrary older version; the default is a no-op
+  (correct for `MemoryEngine`), `LsmEngine` overrides it, and a wrapper engine
+  MUST forward it or its holds silently do nothing. The default
+  `tombstone_grace_versions` is 5 s of HLC wall time (`5000 << 20`); an engine
+  versioned by sequence number (control syskv, `raft_index + 1`) must open with
+  `LsmOptions::raw_versions()`/`production_raw_versions()` (`1 << 20`). Neither
+  is an on-disk format (no ADR 0073 bump). A hold taken after the grace passed
+  cannot resurrect GC'd versions. Test: `lsm_gc.rs::held_version_survives_compaction_gc`.

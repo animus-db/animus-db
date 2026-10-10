@@ -103,6 +103,7 @@
 //! once — a control-plane completion report); it never touches, blocks, or
 //! delays an ordinary client write to the tablet it is capturing.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use animus_control::{BackupStatus, ProposeResult};
@@ -258,12 +259,19 @@ pub(crate) fn decode_capture_cursor(bytes: &[u8]) -> Option<CaptureCursor> {
 /// tick — see the module doc's "Discovery" section for the per-`(backup,
 /// tablet)` targeting decision.
 pub(crate) async fn backup_capture_loop(ctx: ClientCtx) {
+    // The per-`(backup, tablet)` hold on this replica's engine at the capture's
+    // `cut_version` (issue #1206): the scan replays that version on every tick
+    // for as long as the capture runs, and the LSM's time-based grace is far
+    // shorter than a capture, so without a pin a compaction between two ticks
+    // would drop the versions the cut needs and break the identical re-put
+    // invariant. Entries live exactly as long as this node keeps driving the
+    // pair: each pass rebuilds the live set below, so a finished, failed,
+    // cancelled (backup no longer `Creating`) or de-led pair is released, and
+    // dropping the loop task releases the rest (RAII).
+    let mut holds: BTreeMap<(String, TabletId), animus_storage::VersionHold> = BTreeMap::new();
     loop {
         tokio::time::sleep(BACKUP_CAPTURE_INTERVAL).await;
         let meta = ctx.effective_metadata();
-        if meta.backups.is_empty() {
-            continue;
-        }
         let creating: Vec<&String> = meta
             .backups
             .iter()
@@ -271,8 +279,10 @@ pub(crate) async fn backup_capture_loop(ctx: ClientCtx) {
             .map(|(id, _)| id)
             .collect();
         if creating.is_empty() {
+            holds.clear();
             continue;
         }
+        let mut live: BTreeSet<(String, TabletId)> = BTreeSet::new();
         for (tablet, group) in ctx.edge.hosted_groups() {
             if !group.is_leader() {
                 continue;
@@ -287,9 +297,12 @@ pub(crate) async fn backup_capture_loop(ctx: ClientCtx) {
                 if !meta.backup_capture_target(backup_id, tablet) {
                     continue; // not (or no longer) this tablet's backup
                 }
-                backup_capture_tick(&ctx, &group, tablet, backup_id).await;
+                let key = ((*backup_id).clone(), tablet);
+                live.insert(key.clone());
+                backup_capture_tick(&ctx, &group, tablet, backup_id, &mut holds, key).await;
             }
         }
+        holds.retain(|k, _| live.contains(k));
     }
 }
 
@@ -302,7 +315,14 @@ pub(crate) async fn backup_capture_loop(ctx: ClientCtx) {
 /// tick until the tablet's own share reports complete — no internal
 /// loop-to-completion, mirroring every other per-tick driver in this
 /// crate (`backfill_seed_tick`, `seal_tick`).
-async fn backup_capture_tick(ctx: &ClientCtx, group: &CpGroup, tablet: TabletId, backup_id: &str) {
+async fn backup_capture_tick(
+    ctx: &ClientCtx,
+    group: &CpGroup,
+    tablet: TabletId,
+    backup_id: &str,
+    holds: &mut BTreeMap<(String, TabletId), animus_storage::VersionHold>,
+    hold_key: (String, TabletId),
+) {
     let tag = backup_cursor_tag(backup_id);
     let cursor_key = cursor::cursor_key(&group.scope_range().start, &tag);
     let mut cur = group
@@ -315,6 +335,14 @@ async fn backup_capture_tick(ctx: &ClientCtx, group: &CpGroup, tablet: TabletId,
         report_capture_complete(ctx, backup_id, tablet, &cur).await;
         return;
     }
+
+    // Pin the cut on this replica for the rest of the capture (issue #1206).
+    // Taken before the first scan; after a leader change the new leader takes
+    // its own hold here on its first tick, relying on the engine's time grace
+    // for the (short) gap in between.
+    holds
+        .entry(hold_key)
+        .or_insert_with(|| group.hold_version(cur.cut_version));
 
     let kind = CAPTURE_KINDS[cur.phase];
     let (rows, next) = group
