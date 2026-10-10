@@ -202,6 +202,7 @@ async fn join_control_nonvoter(
                 animusd::SegmentStoreConfig::default(),
                 animusd::BackupStoreConfig::default(),
                 animusd::DEFAULT_STREAM_RETENTION,
+                std::time::Duration::from_secs(35 * 24 * 60 * 60),
             )
             .await
             .expect("open the growth control-only node's system-keyspace engine");

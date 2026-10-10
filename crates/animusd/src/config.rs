@@ -421,6 +421,21 @@ pub struct ClusterSettings {
     /// janitor's own retention grace period.
     #[serde(default)]
     pub stream_retention_secs: Option<u64>,
+    /// PITR retention in days (issue #1275, ADR 0059 amendment 2026-10-10):
+    /// how far back `RestoreTableToPointInTime`/`ExportTableToPointInTime`
+    /// can reach, and what the control-leader PITR janitor trims to. `1..=35`
+    /// like DynamoDB's `RecoveryPeriodInDays`; unset means 35. Node-local
+    /// config (ADR 0073 class L), config-file only (no CLI flag).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pitr_retention_days: Option<u64>,
+    /// PITR sealer age trigger in seconds (issue #1275): seal a led tablet's
+    /// unsealed PITR change-log once its oldest record is this old, so
+    /// `LatestRestorableDateTime` lags now by about this much. `>= 1`; unset
+    /// means 300 (5 minutes, DynamoDB's typical lag). Independent of
+    /// `stream_seal_age_secs`; the bytes trigger is still `stream_seal_bytes`.
+    /// Node-local (class L), config-file only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pitr_seal_age_secs: Option<u64>,
     /// `--throttle-read-units N` (ADR 0065 §5(a), W-08 step 4): the
     /// cluster-wide default read-capacity-units budget applied to any table
     /// that has not set its own `ProvisionedThroughput` — seeds `ClientCtx`'s
@@ -539,6 +554,42 @@ pub struct PeerCluster {
 }
 
 impl ClusterSettings {
+    /// Startup validation of the PITR knobs (issue #1275): retention
+    /// `1..=35` days, seal age at least one second.
+    ///
+    /// # Errors
+    /// A message naming the first offending setting.
+    pub fn validate_pitr(&self) -> Result<(), String> {
+        if let Some(d) = self.pitr_retention_days
+            && !(1..=35).contains(&d)
+        {
+            return Err(format!(
+                "cluster_settings.pitr_retention_days must be between 1 and 35, got {d}"
+            ));
+        }
+        if self.pitr_seal_age_secs == Some(0) {
+            return Err("cluster_settings.pitr_seal_age_secs must be at least 1".into());
+        }
+        Ok(())
+    }
+
+    /// The PITR retention window (default 35 days); call
+    /// [`validate_pitr`](Self::validate_pitr) first.
+    #[must_use]
+    pub fn pitr_retention(&self) -> std::time::Duration {
+        self.pitr_retention_days
+            .map_or(crate::pitr_janitor::DEFAULT_PITR_RETENTION, |d| {
+                std::time::Duration::from_secs(d * 24 * 60 * 60)
+            })
+    }
+
+    /// The PITR sealer age trigger (default 5 minutes).
+    #[must_use]
+    pub fn pitr_seal_age(&self) -> std::time::Duration {
+        self.pitr_seal_age_secs
+            .map_or(crate::DEFAULT_PITR_SEAL_AGE, std::time::Duration::from_secs)
+    }
+
     /// Startup validation of the MREC peer settings (G-d M3): a region name
     /// is required whenever peers are set; no peer may be this cluster's own
     /// region or repeat another peer's; every peer needs at least one
@@ -927,6 +978,7 @@ impl ClusterConfig {
         cfg.validate_tls().map_err(ConfigError::Invalid)?;
         if let Some(s) = &cfg.cluster_settings {
             s.validate_mrec().map_err(ConfigError::Invalid)?;
+            s.validate_pitr().map_err(ConfigError::Invalid)?;
         }
         for n in &cfg.nodes {
             if let Some(o) = &n.overload {
@@ -1186,6 +1238,47 @@ mod tests {
     }
 
     #[test]
+    fn pitr_settings_default_parse_and_validate() {
+        let d = ClusterSettings::default();
+        d.validate_pitr().expect("unset is valid");
+        assert_eq!(d.pitr_retention().as_secs(), 35 * 24 * 60 * 60);
+        assert_eq!(d.pitr_seal_age().as_secs(), 300);
+
+        let parsed: ClusterSettings =
+            serde_json::from_str(r#"{"pitr_retention_days": 7, "pitr_seal_age_secs": 60}"#)
+                .expect("parses");
+        parsed.validate_pitr().expect("valid");
+        assert_eq!(parsed.pitr_retention().as_secs(), 7 * 24 * 60 * 60);
+        assert_eq!(parsed.pitr_seal_age().as_secs(), 60);
+
+        for days in [0, 36] {
+            let bad = ClusterSettings {
+                pitr_retention_days: Some(days),
+                ..Default::default()
+            };
+            let e = bad.validate_pitr().expect_err("out of range");
+            assert!(e.contains("pitr_retention_days"), "{e}");
+        }
+        for days in [1, 35] {
+            ClusterSettings {
+                pitr_retention_days: Some(days),
+                ..Default::default()
+            }
+            .validate_pitr()
+            .expect("bounds are inclusive");
+        }
+        let zero = ClusterSettings {
+            pitr_seal_age_secs: Some(0),
+            ..Default::default()
+        };
+        assert!(
+            zero.validate_pitr()
+                .expect_err("zero age")
+                .contains("pitr_seal_age_secs")
+        );
+    }
+
+    #[test]
     fn cluster_settings_round_trips_every_field() {
         let mut cfg = ClusterConfig::generate(1, "127.0.0.1".parse().unwrap(), 7000);
         cfg.cluster_settings = Some(ClusterSettings {
@@ -1199,6 +1292,8 @@ mod tests {
             stream_seal_bytes: Some(4_194_304),
             stream_seal_age_secs: Some(3600),
             stream_retention_secs: Some(86_400),
+            pitr_retention_days: Some(7),
+            pitr_seal_age_secs: Some(60),
             throttle_read_units: Some(50),
             throttle_write_units: Some(25),
             tablet_max_read_units: Some(100),

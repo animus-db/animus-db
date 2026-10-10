@@ -512,7 +512,7 @@ long as it needs it"). It:
   trim segments — a PITR base snapshot is retained at least as long as any
   segment sealed after it might still need it as a replay base.
 
-**Retention window: 35 days by default, configurable, janitor-enforced.**
+**Retention window: 35 days by default, configurable (`cluster_settings.pitr_retention_days`, 1..=35, 2026-10-10 amendment), janitor-enforced.**
 `EarliestRestorableDateTime` is the retention floor; the same two-phase
 janitor (§3) marks and reclaims a PITR base snapshot or sealed segment
 once retention has passed it, subject to the identical "never remove a
@@ -1873,3 +1873,33 @@ unchanged; (2) golden fixtures `backup-manifest/v1.bin` and
 `backup-data/v1.bin` (`animus-cp-data/tests/fixtures/formats/`) pin both
 layouts from the baseline on, so a layout change is a new version plus a new
 fixture, never an edit of `v1`.
+
+## Amendment 2026-10-10: PITR retention and seal age are `cluster_settings` (issue #1275)
+
+This resolves the contradiction between the Retention section ("configurable")
+and Train 3's as-built note ("no CLI-configurable retention knob", "PITR shares
+the stream sealer's `seal_bytes`/`seal_age`"): the as-built note described the
+code at Train 3 and is superseded; the Retention section is now true.
+
+- `cluster_settings.pitr_retention_days` (default 35, validated `1..=35` like
+  DynamoDB's `RecoveryPeriodInDays`) replaces the hardcoded
+  `DEFAULT_PITR_RETENTION` at every use: the control-leader `pitr_janitor_loop`
+  (combined and control-only nodes) and the DynamoDB edge's restore-window
+  clamp (`DescribeContinuousBackups`, `RestoreTableToPointInTime`,
+  `ExportTableToPointInTime`). Shortening it takes effect at the next janitor
+  sweep; the window only ever shrinks, so no data outside it is promised.
+- `cluster_settings.pitr_seal_age_secs` (default 300, at least 1) is the PITR
+  sealer's own age trigger, independent of `stream_seal_age_secs` (4 h), so
+  `LatestRestorableDateTime` trails now by about five minutes plus one sweep on
+  a quiet table, like DynamoDB, instead of up to four hours. The size trigger
+  still reuses `stream_seal_bytes`. Cost: one small sealed segment per led
+  tablet per five minutes while a PITR table is written to (a tablet with an
+  empty hot tail never seals).
+- Both are config-file only (no CLI flag) and node-local: ADR 0073 class L.
+  They are not replicated and gate nothing across nodes; the `cluster-config`
+  version tag is unchanged because both are additive optional fields with a
+  serde default. `DEFAULT_PITR_SNAPSHOT_CADENCE` (6 h) stays fixed.
+- Proof: `index_drain` test `pitr_seal_age_knob_is_independent_of_the_streams_seal_age`
+  (a short PITR age alone seals and advances the restore window; a short
+  Streams age alone does not), plus `config.rs` unit tests for parse, defaults
+  and validation. The `AnimusCluster` CRD does not expose the knobs yet.
