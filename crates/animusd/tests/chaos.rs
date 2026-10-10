@@ -706,8 +706,13 @@ async fn run_disk_full() -> Option<Outcome> {
     let mut read_ok = [0u32; 3];
     let mut read_tries = [0u32; 3];
     let mut strong_ok = [0u32; 3];
+    let mut regained = [0u64; 3];
     for _ in 0..4 {
         for (i, node) in nodes.iter().enumerate() {
+            let before = std::fs::metadata(mounts[i].path().join("ballast")).map_or(0, |m| m.len());
+            let _ = diskfull::fill(mounts[i].path());
+            let after = std::fs::metadata(mounts[i].path().join("ballast")).map_or(0, |m| m.len());
+            regained[i] += after - before;
             read_tries[i] += 1;
             let r = read_item(*node, "df-seed", false, Duration::from_secs(3)).await;
             if matches!(&r, Ok((200, body)) if body.contains("\"v\"")) {
@@ -722,7 +727,7 @@ async fn run_disk_full() -> Option<Outcome> {
     note(
         &mut events,
         format!(
-            "phase 2: reads served while every disk is full: eventual {read_ok:?}, consistent {strong_ok:?} of {read_tries:?}"
+            "phase 2: reads served while every disk is full: eventual {read_ok:?}, consistent {strong_ok:?} of {read_tries:?}; space regained and re-ballasted {regained:?}"
         ),
     );
     for i in 0..n {
