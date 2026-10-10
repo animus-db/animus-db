@@ -1332,6 +1332,19 @@ name, per-version expected value, `panic!` on an unrecognised version. Every `An
 `schemaVersion: 1`; regenerate `deploy/operator/crd.yaml` after touching the
 spec type.
 
+### Pausing voter auto-add (issue #1277, 2026-10-10)
+
+`advance_control_growth` re-adds every missing ordinal in `0..controlNodes`, so
+a manual `control-remove` is undone within a reconcile. The annotation
+`animusdb.io/pause-control-voter-reconcile: "true"`
+(`crd::ANNOTATION_PAUSE_CONTROL_VOTER_RECONCILE`; deliberately an annotation,
+not a spec field, so no CRD/fixture churn) makes `reconcile` skip
+`advance_control_growth` entirely (no discovery, no `member/add`) and set the
+`ControlVoterReconcilePaused` condition; everything else (children, PDB with the
+last applied count, roll) still runs. Removing the annotation (or any value other
+than `"true"`) clears the condition and growth resumes from live truth. Test:
+`reconcile_growth_paused_by_annotation_skips_voter_add_and_sets_condition`.
+
 ## Rolling upgrades (ADR 0073 Phase 3, P3-D)
 
 Every pod-template change (a `spec.image` edit **and** a config-hash change such as a

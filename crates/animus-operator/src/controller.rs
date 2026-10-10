@@ -32,8 +32,9 @@ use tracing::{error, info, warn};
 use crate::admin_client::{AdminAccessMode, AdminOps, RealAdminClient};
 use crate::cluster_api::{ClusterApi, RealClusterApi};
 use crate::crd::{
-    AnimusCluster, AnimusClusterStatus, CONDITION_CONTROL_NODES_GROWING,
-    CONDITION_CONTROL_NODES_SHRINK_REJECTED, CONDITION_DRAIN_FAILED,
+    ANNOTATION_PAUSE_CONTROL_VOTER_RECONCILE, AnimusCluster, AnimusClusterStatus,
+    CONDITION_CONTROL_NODES_GROWING, CONDITION_CONTROL_NODES_SHRINK_REJECTED,
+    CONDITION_CONTROL_VOTER_RECONCILE_PAUSED, CONDITION_DRAIN_FAILED,
     CONDITION_ENCRYPTION_KEY_SECRET_INVALID, CONDITION_EPHEMERAL_VOTER_STORAGE_HAZARD,
     CONDITION_EPHEMERAL_VOTER_STORAGE_REJECTED, CONDITION_NODES_SPEC_INVALID,
     CONDITION_PEER_REACHABLE, CONDITION_PEERS_SPEC_INVALID, CONDITION_S3_SPEC_INVALID,
@@ -1023,6 +1024,17 @@ async fn drain_and_remove_node<A: AdminOps>(
     Ok(())
 }
 
+/// True when the cluster carries
+/// [`ANNOTATION_PAUSE_CONTROL_VOTER_RECONCILE`]`="true"` (issue #1277).
+fn control_voter_reconcile_paused(cluster: &AnimusCluster) -> bool {
+    cluster
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(ANNOTATION_PAUSE_CONTROL_VOTER_RECONCILE))
+        .is_some_and(|v| v == "true")
+}
+
 /// Set (replacing any existing entry of the same `type`) one condition on
 /// `status`.
 fn set_condition(status: &mut AnimusClusterStatus, type_: &str, message: String) {
@@ -1397,23 +1409,43 @@ async fn reconcile<C: ClusterApi, A: AdminOps>(
             // "live-truth-driven, not a stored plan" design already
             // intends; the status condition remains a user-visible
             // progress message, never a gate on whether to check again.
-            let admin_port =
-                cluster.spec.base_port_or_default() + desired::cluster_config::PORT_ADMIN;
-            let internal_port =
-                cluster.spec.base_port_or_default() + desired::cluster_config::PORT_INTERNAL;
-            let tls_ca = resolve_tls_ca(&ctx.cluster_api, &cluster, &ns, &name).await?;
-            advance_control_growth(
-                &ctx,
-                &name,
-                &ns,
-                target_control_nodes,
-                prior,
-                admin_port,
-                internal_port,
-                tls_ca.as_deref(),
-                &mut status,
-            )
-            .await
+            // Issue #1277: an operator-set annotation pauses voter auto-add so
+            // a manual `control-remove` is not undone. Children still apply.
+            if control_voter_reconcile_paused(&cluster) {
+                set_condition(
+                    &mut status,
+                    CONDITION_CONTROL_VOTER_RECONCILE_PAUSED,
+                    format!(
+                        "annotation {ANNOTATION_PAUSE_CONTROL_VOTER_RECONCILE}=true: control \
+                         voter auto-add is paused; remove the annotation to resume"
+                    ),
+                );
+                status
+                    .conditions
+                    .retain(|c| c.type_ != CONDITION_CONTROL_NODES_GROWING);
+                prior
+            } else {
+                status
+                    .conditions
+                    .retain(|c| c.type_ != CONDITION_CONTROL_VOTER_RECONCILE_PAUSED);
+                let admin_port =
+                    cluster.spec.base_port_or_default() + desired::cluster_config::PORT_ADMIN;
+                let internal_port =
+                    cluster.spec.base_port_or_default() + desired::cluster_config::PORT_INTERNAL;
+                let tls_ca = resolve_tls_ca(&ctx.cluster_api, &cluster, &ns, &name).await?;
+                advance_control_growth(
+                    &ctx,
+                    &name,
+                    &ns,
+                    target_control_nodes,
+                    prior,
+                    admin_port,
+                    internal_port,
+                    tls_ca.as_deref(),
+                    &mut status,
+                )
+                .await
+            }
         }
         None => {
             status
@@ -2594,6 +2626,60 @@ mod tests {
                 .contains("4/5"),
             "{:?}",
             growing.message
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_growth_paused_by_annotation_skips_voter_add_and_sets_condition() {
+        let fake_cluster = FakeClusterApi::new();
+        let fake_admin = FakeAdminClient::new();
+        seed_pre_growth_state(&fake_cluster, &fake_admin);
+        fake_admin.mark_ordinal_ready_both(3);
+        let ctx = make_ctx(fake_cluster, fake_admin);
+
+        let mut c = test_cluster("demo", "ns1", 5, Some(5));
+        c.metadata.annotations = Some(
+            [(
+                ANNOTATION_PAUSE_CONTROL_VOTER_RECONCILE.to_string(),
+                "true".to_string(),
+            )]
+            .into(),
+        );
+        let result = reconcile(Arc::new(c.clone()), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert!(
+            !ctx.admin
+                .calls()
+                .iter()
+                .any(|(m, u)| m == "POST" && u.contains("/admin/control/member/add")),
+            "paused: no member/add call"
+        );
+        assert!(!ctx.admin.control_voters().contains("demo-3"));
+        let status = ctx.cluster_api.last_status().unwrap();
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_CONTROL_VOTER_RECONCILE_PAUSED)
+        );
+        // Children were still applied.
+        assert!(
+            ctx.cluster_api
+                .configmap(&desired::config_map_name("demo"))
+                .is_some()
+        );
+
+        // Removing the annotation resumes growth and clears the condition.
+        c.metadata.annotations = None;
+        let result = reconcile(Arc::new(c), Arc::clone(&ctx)).await;
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert!(ctx.admin.control_voters().contains("demo-3"));
+        let status = ctx.cluster_api.last_status().unwrap();
+        assert!(
+            !status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == CONDITION_CONTROL_VOTER_RECONCILE_PAUSED)
         );
     }
 
