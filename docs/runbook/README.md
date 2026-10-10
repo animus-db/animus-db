@@ -118,7 +118,9 @@ maintenance mode.
 These are product gaps, found while writing the pages; they are listed so
 nobody discovers them during an incident.
 
-1. No unsafe-recovery tool for a lost control-plane quorum
+1. Control-plane quorum loss has an offline, data-losing recovery tool
+   (`animusd recover-control`, ADR 0077) that is proven in simulation but not
+   drilled on a real cluster; there is none yet for a tablet group
    ([control-plane-quorum-loss.md](control-plane-quorum-loss.md)).
 2. Disk-full on a WAL write is handled (named 503 `StorageFull`, self-recovery) but
    proven in simulation only; an LSM-engine ENOSPC is still unhandled and may leave a

@@ -13,6 +13,7 @@ mod declined_snapshot_offer;
 mod driver_applied_sm;
 mod failure_detection;
 mod follower_visibility;
+mod force_new_configuration;
 mod format_fixtures;
 mod gate_enforcement;
 mod generic_state_machine;

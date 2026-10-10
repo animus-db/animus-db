@@ -1852,8 +1852,8 @@ outstanding on the wire surface at present.
     `ProdEnv` test where not.
   - **(e) Operations runbook (independent; M).** `docs/runbook/`: node
     replace and decommission (ADR 0032 drain), control-plane quorum
-    loss and the unsafe-recovery procedure (decide whether a tool is
-    needed; none exists today), backup/restore and PITR drill (ADR 0059),
+    loss and the unsafe-recovery procedure (tool built for the control plane:
+    `animusd recover-control`, ADR 0077; tablet groups are phase 2), backup/restore and PITR drill (ADR 0059),
     cert rotation (ADR 0064 section on restart-time `TlsConfig::load()`),
     encryption key rotation (ADR 0069), upgrade procedure per ADR 0073
     (whole-cluster and rolling, C-16 Phase 3 done), capacity planning

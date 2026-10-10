@@ -104,7 +104,7 @@ landed with ADR 0073 Phase 3 (E-7, partially met).
 | ID | Criterion | Status | Evidence | Owner |
 |---|---|---|---|---|
 | E-1 | `docs/runbook/` exists with node replace and decommission (ADR 0032 drain) | Not met | Directory absent; mechanism in `docs/adr/0032-seed-join-membership.md` | e |
-| E-2 | Control-plane quorum-loss procedure written, including whether an unsafe-recovery tool is needed | Not met | Only lesson files mention it; no tool exists | e |
+| E-2 | Control-plane quorum-loss procedure written, including whether an unsafe-recovery tool is needed | Met (control plane) | ADR 0077: `animusd recover-control` (offline force-new-configuration, ack flag, simulation corpus `force_new_configuration`); runbook `control-plane-quorum-loss.md`. Not drilled on a real cluster; tablet-group form is phase 2 | e |
 | E-3 | Backup, restore and PITR drill documented and executed once | Not met | Mechanism: `docs/adr/0059-backup-restore.md`; no drill | e |
 | E-4 | Certificate rotation procedure (restart-time `TlsConfig::load()`) | Not met | Mechanism: `docs/adr/0064-tls-on-every-port.md` | e |
 | E-5 | Encryption key rotation procedure | Not met | Mechanism: `docs/adr/0069-encryption-at-rest.md` | e |

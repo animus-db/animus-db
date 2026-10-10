@@ -34,7 +34,7 @@ use crate::version_observe::{
 };
 
 /// File name of the per-node Raft write-ahead log on the `Env` disk.
-const WAL: &str = "raft.wal";
+const WAL: &str = crate::recover::CONTROL_WAL_FILE;
 
 /// Snapshot (truncating the covered log prefix) and rewrite the WAL once this
 /// many applied entries have accumulated beyond the current snapshot base. This
@@ -1193,6 +1193,16 @@ impl<E: Env> RaftNode<E> {
     #[must_use]
     pub fn refused_as_voter(&self) -> bool {
         self.lock().refused_as_voter()
+    }
+
+    /// Whether an explicit `RaftMsg::Removed` notice (issue #1061) has told this
+    /// node that a committed configuration removed it and nothing has re-added
+    /// it. Volatile (lost on restart; the next campaign is answered again). A
+    /// stale old voter that returns after a force-new-configuration recovery
+    /// (ADR 0077) is fenced exactly this way. See `RaftCore::removed_by_leader`.
+    #[must_use]
+    pub fn removed_by_leader(&self) -> bool {
+        self.lock().removed_by_leader()
     }
 
     /// A clone of the apply task's published `Metadata` cache (ADR 0038 PR3)

@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub mod config;
+pub mod control_recover;
 #[deny(clippy::disallowed_methods)]
 mod index_drain;
 mod min_tablets;
