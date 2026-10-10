@@ -2015,3 +2015,16 @@ shipper health. Details, the `PeersSpecInvalid` refusal and the TLS and
 NetworkPolicy reasoning: ADR 0075's "G-e as built". `schemaVersion` stays 1;
 the golden fixture `v1-peers.json` was added.
 
+
+## Amendment (2026-10-10): pausing control-voter auto-add (issue #1277)
+
+The S-07d growth step re-adds any control ordinal in `0..controlNodes` that is
+missing from the live voter set on every reconcile, which silently undoes a
+manual `control-remove` (quorum-loss recovery, `animusd recover-control`
+regrowth). An `AnimusCluster` annotation
+`animusdb.io/pause-control-voter-reconcile: "true"` now makes reconcile skip the
+growth step and report a `ControlVoterReconcilePaused` condition; all other
+reconciliation continues, and removing the annotation resumes growth from live
+truth. An annotation was chosen over a spec field: it is an emergency,
+operator-of-the-operator escape hatch, and needs no CRD schema or fixture
+change (ADR 0073).
