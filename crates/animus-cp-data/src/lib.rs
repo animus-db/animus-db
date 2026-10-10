@@ -1779,6 +1779,15 @@ struct ReadState {
     next_epoch: u64,
     /// `epoch -> (term, acking nodes)`.
     pending: BTreeMap<u64, (u64, BTreeSet<NodeId>)>,
+    /// Bumped (to a fresh, strictly increasing value) every time a
+    /// `ReadProbeAck` is recorded, so a [`RaftKvNode::read_barrier`] parked on
+    /// "has my quorum confirmed yet?" wakes the instant the ack lands instead
+    /// of at its next poll tick (issue #1197). A multi-waiter [`AppliedWatch`]
+    /// used as a generation counter, since any number of reads can be in
+    /// flight on one leader.
+    ack_events: AppliedWatch,
+    /// Source of the strictly increasing values `ack_events` is bumped to.
+    ack_generation: u64,
 }
 
 /// Per-CAS outcomes recorded at apply time, keyed by the entry's **Raft log
@@ -7367,6 +7376,53 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         }
     }
 
+    /// The wake sources a read-side wait parks on, sampled **before** the
+    /// state they guard is inspected: `(engine-applied index, probe-ack
+    /// generation)`. See [`wait_read_progress`](Self::wait_read_progress).
+    fn read_wake_marks(&self) -> (u64, u64) {
+        let acks = self
+            .reads
+            .lock()
+            .expect("read state poisoned")
+            .ack_events
+            .latest();
+        (self.applied_watch.latest(), acks)
+    }
+
+    /// Park a read-side wait (the ReadIndex barrier's gate / confirmation /
+    /// applied wait, and the read-ceiling wait) until something it is waiting
+    /// on may have changed: the engine-applied index advanced past
+    /// `seen.0`, a `ReadProbeAck` landed after `seen.1`, or [`READ_POLL`]
+    /// elapsed.
+    ///
+    /// **Issue #1197:** these waits used to be a bare `env.sleep(READ_POLL)`
+    /// (20 ms), so a `ConsistentRead: true` read whose probe acks arrived in
+    /// ~1 ms still returned only at the next poll boundary -- a ~21 ms floor
+    /// on every linearizable read, independent of the network. The wakes make
+    /// the common case cost the round trip; `READ_POLL` stays as a safety net
+    /// for the transitions that raise no wake (a step-down or term change
+    /// observed only by re-reading the core, the deadline).
+    ///
+    /// `seen` must be taken with [`read_wake_marks`](Self::read_wake_marks)
+    /// *before* the caller evaluates its condition: both watches resolve at
+    /// once if they already moved past the mark, so a wake between the check
+    /// and this park cannot be lost.
+    async fn wait_read_progress(&self, seen: (u64, u64)) {
+        let ack_events = self
+            .reads
+            .lock()
+            .expect("read state poisoned")
+            .ack_events
+            .clone();
+        let applied = self.applied_watch.changed(seen.0);
+        let acked = ack_events.changed(seen.1);
+        let poll = self.env.sleep(READ_POLL);
+        let applied = std::pin::pin!(applied);
+        let acked = std::pin::pin!(acked);
+        let poll = std::pin::pin!(poll);
+        let _ = select(select(applied, acked), poll).await;
+    }
+
     /// The **ReadIndex read barrier** (ADR 0017 B.2): wait until this leader has
     /// committed an entry of its **own term** (Raft §6.4 — see below), record
     /// `read_index = commit_index` for the current term, confirm via a quorum of
@@ -7393,6 +7449,10 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     async fn read_barrier(&self) -> bool {
         let deadline = self.env.now().0 + READ_TIMEOUT.as_nanos() as u64;
         let (term, read_index) = loop {
+            // Sampled BEFORE the state it guards is read, so a wake landing
+            // between the read and the park is never lost (see
+            // `wait_read_progress`).
+            let seen = self.read_wake_marks();
             let captured = {
                 let c = self.lock();
                 if !c.is_leader() {
@@ -7431,7 +7491,9 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 self.metrics.incr(Metric::CpReadBarriersTimedOut);
                 return false;
             }
-            self.env.sleep(READ_POLL).await;
+            // The no-op's commit is followed by its apply, which bumps the
+            // applied watch, so that is the wake (`READ_POLL` is the net).
+            self.wait_read_progress(seen).await;
         };
         // Register the read barrier (self trivially confirms its own term).
         let epoch = {
@@ -7462,6 +7524,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // READ_TIMEOUT.
         let majority = self.majority();
         let ok = loop {
+            let seen = self.read_wake_marks();
             // Still the leader for this term? A step-down/term change invalidates
             // the barrier — fail rather than risk a stale read.
             let still_leader = {
@@ -7485,7 +7548,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             if confirmed && applied {
                 break true;
             }
-            self.env.sleep(READ_POLL).await;
+            self.wait_read_progress(seen).await;
         };
         self.reads
             .lock()
@@ -7613,13 +7676,16 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         }
         let deadline = self.env.now().0 + READ_TIMEOUT.as_nanos() as u64;
         loop {
+            let seen = self.read_wake_marks();
             if self.committed_ceiling() > ts {
                 return true;
             }
             if !self.is_leader() || self.env.now().0 >= deadline {
                 return false;
             }
-            self.env.sleep(READ_POLL).await;
+            // The ceiling is applied by the apply task, which bumps the
+            // applied watch right after.
+            self.wait_read_progress(seen).await;
         }
     }
 
@@ -13417,6 +13483,10 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
                                     && *t == term
                                 {
                                     acks.insert(envelope.from);
+                                    // Issue #1197: wake the parked barrier now
+                                    // (it re-checks quorum + term itself).
+                                    r.ack_generation += 1;
+                                    r.ack_events.bump(r.ack_generation);
                                 }
                                 (Vec::new(), None)
                             }

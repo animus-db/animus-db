@@ -154,8 +154,8 @@ use animus_env::{
     write_own_preamble_with,
 };
 use animus_storage::{
-    Key, LsmEngine, MemoryEngine, SsTableView, StorageEngine, StorageError, VersionedValue,
-    WalRecordView,
+    Key, LsmEngine, LsmOptions, MemoryEngine, SsTableView, StorageEngine, StorageError,
+    VersionedValue, WalRecordView,
 };
 use animus_tablet::{KeyRange, TabletId, TabletState};
 use serde::Serialize;
@@ -6197,14 +6197,18 @@ impl BoundNode {
         // so it no longer needs a head start to win that race — see
         // `tablet_host_reconciler_loop`'s doc). No harm in keeping the order.
         let storage = match backend {
-            StorageBackend::Lsm => match LsmEngine::open(self.env.clone(), LSM_PREFIX).await {
-                Ok(lsm) => SharedEngine::Lsm(lsm),
-                Err(e) => {
-                    return Err(std::io::Error::other(format!(
-                        "opening the node's shared CP storage engine: {e}"
-                    )));
+            StorageBackend::Lsm => {
+                match LsmEngine::open_with(self.env.clone(), LSM_PREFIX, LsmOptions::production())
+                    .await
+                {
+                    Ok(lsm) => SharedEngine::Lsm(lsm),
+                    Err(e) => {
+                        return Err(std::io::Error::other(format!(
+                            "opening the node's shared CP storage engine: {e}"
+                        )));
+                    }
                 }
-            },
+            }
             StorageBackend::Memory => SharedEngine::Mem(MemoryEngine::new()),
         };
 
@@ -7902,24 +7906,28 @@ impl BoundControlNode {
         // handle (moved into `RaftNode::start_with_metrics` below) stays the
         // sole writer.
         let (raft, control_storage) = match backend {
-            StorageBackend::Lsm => match LsmEngine::open(engine_env, SYSKV_LSM_PREFIX).await {
-                Ok(lsm) => (
-                    RaftNode::start_with_orphan_sweep_after(
-                        self.env,
-                        control_ids.clone(),
-                        control_metrics,
-                        lsm.clone(),
-                        animus_control::DeltaRing::default(),
-                        orphan_sweep_after,
+            StorageBackend::Lsm => {
+                match LsmEngine::open_with(engine_env, SYSKV_LSM_PREFIX, LsmOptions::production())
+                    .await
+                {
+                    Ok(lsm) => (
+                        RaftNode::start_with_orphan_sweep_after(
+                            self.env,
+                            control_ids.clone(),
+                            control_metrics,
+                            lsm.clone(),
+                            animus_control::DeltaRing::default(),
+                            orphan_sweep_after,
+                        ),
+                        SharedEngine::Lsm(lsm),
                     ),
-                    SharedEngine::Lsm(lsm),
-                ),
-                Err(e) => {
-                    return Err(std::io::Error::other(format!(
-                        "opening the control-only node's system-keyspace engine: {e}"
-                    )));
+                    Err(e) => {
+                        return Err(std::io::Error::other(format!(
+                            "opening the control-only node's system-keyspace engine: {e}"
+                        )));
+                    }
                 }
-            },
+            }
             StorageBackend::Memory => {
                 let mem = MemoryEngine::new();
                 (
@@ -8486,14 +8494,18 @@ impl BoundDataNode {
         // Same shared-engine assembly as `BoundNode::start_with` — see that
         // method's doc.
         let storage = match backend {
-            StorageBackend::Lsm => match LsmEngine::open(self.env.clone(), LSM_PREFIX).await {
-                Ok(lsm) => SharedEngine::Lsm(lsm),
-                Err(e) => {
-                    return Err(std::io::Error::other(format!(
-                        "opening the node's shared CP storage engine: {e}"
-                    )));
+            StorageBackend::Lsm => {
+                match LsmEngine::open_with(self.env.clone(), LSM_PREFIX, LsmOptions::production())
+                    .await
+                {
+                    Ok(lsm) => SharedEngine::Lsm(lsm),
+                    Err(e) => {
+                        return Err(std::io::Error::other(format!(
+                            "opening the node's shared CP storage engine: {e}"
+                        )));
+                    }
                 }
-            },
+            }
             StorageBackend::Memory => SharedEngine::Mem(MemoryEngine::new()),
         };
 
@@ -14072,9 +14084,13 @@ struct LsmTabletFactory {
 #[async_trait::async_trait]
 impl animus_cp_data::host::EngineFactory<LsmEngine<ProdEnv>> for LsmTabletFactory {
     async fn open(&self, tablet: TabletId) -> Result<LsmEngine<ProdEnv>, String> {
-        LsmEngine::open(self.env.clone(), &tablet_lsm_prefix(tablet.0))
-            .await
-            .map_err(|e| e.to_string())
+        LsmEngine::open_with(
+            self.env.clone(),
+            &tablet_lsm_prefix(tablet.0),
+            LsmOptions::production(),
+        )
+        .await
+        .map_err(|e| e.to_string())
     }
 
     async fn probe(&self, tablet: TabletId) -> bool {

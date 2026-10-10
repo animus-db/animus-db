@@ -3375,6 +3375,103 @@ where
         // candidate once its old leader is truly gone. Only
         // [`on_local_wake`](Self::on_local_wake) re-arms the election timer,
         // and only for the follower that itself asked to be woken.
+        //
+        // Issue #1226 carve-out: a **stale ack** does not wake a quiesced
+        // leader. On links whose round trip exceeds the heartbeat interval the
+        // heartbeat acks sent before the group quiesced land after it; they
+        // carry no new information (same term, success, no snapshot/check
+        // flag, and a `match_index` this leader already knew), so waking on
+        // them re-ran a settle window forever. Anything else -- a vote, an
+        // append, a higher term, a rejection, a fresher `match_index` --
+        // still wakes. The ack is still processed (it refreshes
+        // `last_contact`); should that ever produce output, that is new
+        // information after all and the group wakes.
+        if self.quiesced
+            && self.role == Role::Leader
+            && let RaftMsg::AppendEntriesResp {
+                term,
+                success: true,
+                match_index,
+                needs_snapshot: false,
+                check_pending: false,
+                ..
+            } = &msg
+            && *term == self.current_term
+            && *match_index <= self.match_index.get(&from).copied().unwrap_or(0)
+        {
+            let (term, match_index) = (*term, *match_index);
+            let out = self.handle_append_resp(from, term, true, match_index, false, false, now);
+            if !out.is_empty() {
+                self.quiesced = false;
+                self.last_activity = now;
+            }
+            return out;
+        }
+        // The follower-side twin: a pure heartbeat from the recorded leader
+        // that proves nothing new (no entries, `prev_log_index` at this
+        // node's own tip, `leader_commit` not past its commit index) is
+        // either reordered past the `Quiesce` that followed it (WAN
+        // jitter) or the leader's own wake with nothing to replicate. Waking
+        // on it re-armed the election timer under a leader that then went
+        // silent, deposing it. The heartbeat is still answered (a ReadIndex
+        // round needs the ack); an append with entries, a higher
+        // `leader_commit`, a rejection, or any other message still wakes. A
+        // leader that dies in this window is recovered the way a dead leader
+        // of any quiesced group is (the reconciler's `Down` wake).
+        if self.quiesced
+            && self.role == Role::Follower
+            && let RaftMsg::AppendEntries {
+                term,
+                leader,
+                prev_log_index,
+                entries,
+                leader_commit,
+                ..
+            } = &msg
+            && *term == self.current_term
+            && self.leader_id.as_ref() == Some(leader)
+            && entries.is_empty()
+            && *prev_log_index == self.last_log_index()
+            && *leader_commit <= self.commit_index
+            && self.last_log_index() == self.commit_index
+        {
+            let RaftMsg::AppendEntries {
+                term,
+                leader,
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit,
+            } = msg
+            else {
+                unreachable!()
+            };
+            let out = self.handle_append_entries(
+                term,
+                leader,
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit,
+                now,
+                entropy,
+            );
+            let clean_ack = out.iter().all(|(_, m)| {
+                matches!(
+                    m,
+                    RaftMsg::AppendEntriesResp {
+                        success: true,
+                        needs_snapshot: false,
+                        ..
+                    }
+                )
+            });
+            if !clean_ack || self.last_log_index() != self.commit_index {
+                self.quiesced = false;
+                self.last_activity = now;
+            }
+            return out;
+        }
         if self.quiesced {
             self.quiesced = false;
             self.last_activity = now;

@@ -760,3 +760,64 @@ decision inputs:
 2,000 awake RF3 groups need more CPU than the box delivers. Leadership is
 then lost in an election storm with no recovery. Quiescence avoids this
 only while groups are idle.
+
+## Amendment (2026-10-09): C-17 re-measurement after #1207
+
+The 2026-10-04 outcome amendment recommended fixing #1180, re-running
+`group_density_cost` against the same thresholds, and returning C-03 to
+deferred if quiesced CPU then measured zero. #1180 is fixed (#1207: a
+quiesced group's apply task no longer wakes every `APPLY_SAFETY_POLL`). This
+is the re-run, on `main` at `d999dc8d`. The thresholds are unchanged.
+
+**Method.** Same harness and same rows as the original issue table, two runs
+per row, one cell per child process, one heavy command at a time:
+
+```sh
+ANIMUS_DENSITY_GROUPS=<G> ANIMUS_DENSITY_RF=<rf> cargo test -p animus-cp-data \
+  --release --test group_density_cost --features prod-heavy -- --ignored --nocapture
+```
+
+**Host caveat.** A 4-core Intel Xeon @ 2.10 GHz colocated dev container
+(Linux 6.18 microVM), not dedicated hardware. CPU is read from `/proc` in
+clock ticks (`CLK_TCK` = 100) over a 10 s window, so the resolution is
+**1 ms/s**: a "1.0" is one tick in the window. The zero-group baseline
+itself reads 2-3 ms/s. Load-dependent Tier 2 runs still need dedicated
+hardware.
+
+**Results (net CPU is process CPU minus the zero-group baseline).**
+
+| Row | Quiesced net CPU, before (2026-10-04) | Quiesced net CPU, after (2 runs) | Awake-idle net CPU, before | Awake-idle net CPU, after (2 runs) | Quiesced RSS/replica, after |
+|---|---|---|---|---|---|
+| G=1000, RF1 | 20 ms/s | 0.0, 0.0 | 145 ms/s | 159, 164 ms/s | 23.9, 24.1 KB |
+| G=10000, RF1 | 167 ms/s | 0.0, 0.0 | 1182 ms/s | 1553, 1612 ms/s | 22.2, 22.2 KB |
+| G=1000, RF3 | 70 ms/s | 1.0, 1.0 | 1325 ms/s | 1451, 1377 ms/s | 34.2, 27.4 KB |
+
+Raw lines for the quiesced phase (`rss_per_replica_bytes`, `cpu_net_ms_per_s`,
+`tasks`, `wake_latency_us`): RF1/1000: 23933 / 0.0 / 2000 / 23220 and 24064 /
+0.0 / 2000 / 24504; RF1/10000: 22156 / 0.0 / 20000 / 23911 and 22178 / 0.0 /
+20000 / 23028; RF3/1000: 34248 / 1.0 / 6006 / 44947 and 27359 / 1.0 / 6006 /
+45059. The awake-idle rows are not decision inputs and moved with run load
+(the earlier figures were also a single colocated run).
+
+**Reading against the ratified thresholds, at 1,000 groups/node.**
+
+- *Quiesced RSS <= 64 KB per replica:* met (24 KB RF1, 27-34 KB RF3).
+- *Quiesced steady CPU, any nonzero amount attributable to the groups:* met.
+  RF1 is exactly zero net at 1,000 and at 10,000 groups, and the 10,000-group
+  row would show 167 ms/s if the per-group wake still existed. RF3 reads
+  1 ms/s, one clock tick in a 10 s window, i.e. 0.001 ms/s per group and at
+  the measurement resolution, in the same range as the baseline's own
+  2-3 ms/s. It does not scale with G the way the removed poll did (RF1 shows
+  no residual at 10x the groups). What remains at RF3 is per-node fixed work
+  (the 50 ms heartbeat-batch tick and a handful of per-node tasks; the 6006
+  tasks are 2 per replica x 3 replicas x 1,000 groups plus 6 fixed), not a per-group periodic wake. No residual
+  per-group wake was found, so no new issue is filed.
+
+**C-03 conclusion: stays deferred.** Both quiesced thresholds are met, which
+is the condition the 2026-10-04 amendment set for returning C-03 to deferred;
+the cost that tripped it was the single apply poll, now removed. The active
+half (1 MB/group active RSS, 2x hot-tablet p99) is still unmeasured: it needs
+`animus-bench` (landed) driving a hot tablet on dedicated hardware, and until
+then it is an open input, not a reopen. The 2026-10-04 amendment's other
+findings (#1199 election-storm cliff and the rest) are unaffected. The
+thresholds are not changed.

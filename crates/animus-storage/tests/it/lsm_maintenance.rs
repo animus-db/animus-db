@@ -181,3 +181,37 @@ fn default_behavior_is_still_fully_synchronous() {
          simulator driving needed"
     );
 }
+
+/// Issue #1196: `LsmOptions::production()` (what animusd opens every engine
+/// with) must keep flush AND compaction off the write ack path. With inline
+/// maintenance, a write that trips an L0->L1 compaction waited for the whole
+/// rewrite, a 200-700 ms stall on a populated table. Seeded: for each seed,
+/// a bare `block_on` write loop (nothing polls spawned tasks) must never see
+/// a flush or compaction run, and driving the simulator must then converge.
+#[test]
+fn production_options_never_run_maintenance_inline_on_the_ack_path() {
+    assert!(
+        LsmOptions::production().background_maintenance,
+        "production engines must use background maintenance (#1196)"
+    );
+    for seed in 0..8u64 {
+        let mut sim = Simulator::new(seed);
+        let mut o = opts();
+        o.background_maintenance = LsmOptions::production().background_maintenance;
+        let e = block_on(LsmEngine::open_with(sim.env(nid(0)), PREFIX, o)).expect("open");
+        // Stay under the backpressure ceiling (4x flush threshold) so the
+        // un-driven loop cannot legitimately wait on maintenance.
+        for i in 0..20u64 {
+            block_on(e.put(key(i).as_bytes(), value(i).as_bytes(), i + 1)).unwrap();
+        }
+        assert_eq!(e.flush_count(), 0, "seed {seed}: flush ran on the ack path");
+        assert_eq!(
+            e.compaction_count(),
+            0,
+            "seed {seed}: compaction ran on the ack path"
+        );
+        assert!(sim.run_until_quiescent(1_000_000), "seed {seed}: quiesce");
+        assert!(e.flush_count() >= 1, "seed {seed}: background flush ran");
+        assert_eq!(e.background_maintenance_error(), None, "seed {seed}");
+    }
+}

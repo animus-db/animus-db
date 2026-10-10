@@ -819,3 +819,49 @@ time by a full `OP_BUDGET` per call) specifically because this scenario's
 own timing precision — placing a write within roughly 150ms of an
 `AUTO_SPLIT_INTERVAL` tick boundary — is far finer than `OP_BUDGET` (12s)
 would ever allow.
+
+## Amendment (2026-10-09, issue #1226 -- late acks and reordered heartbeats no longer wake a quiesced group)
+
+### The gap
+
+ADR 0044 phase-1 PR3's trigger (a) woke a quiesced node on *any* inbound Raft
+message. On links whose round trip exceeds the heartbeat interval (the WAN
+profile of ADR 0075's stretch groups) the heartbeat acks sent before the
+leader quiesced arrive after it, wake it, and restart a 2 s settle window that
+again ends with acks in flight: `Metric::CpUnquiesces` grew every ~2 s and the
+group never stayed quiesced. With heavy-tail jitter the follower side had the
+same flaw: a pure heartbeat sent before the `Quiesce` can be reordered behind
+it, wake the follower, and re-arm its election timer under a leader that then
+goes silent, which deposed the leader (a spurious election, one extra
+preferred-leader transfer).
+
+### The fix (node-local; no wire or replicated shape changes)
+
+`RaftCore::handle` carves two cases out of "any message wakes":
+
+- a quiesced **leader** receiving an `AppendEntriesResp` of its current term,
+  `success`, with neither `needs_snapshot` nor `check_pending`, and a
+  `match_index` no higher than the leader already knew, processes it (it still
+  refreshes `last_contact`) but stays quiesced;
+- a quiesced **follower** receiving an `AppendEntries` from its recorded leader
+  at its current term with no entries, `prev_log_index` at its own tip and
+  `leader_commit` not past its own commit index answers it but stays quiesced.
+
+Anything carrying information still wakes: a vote or pre-vote, an append with
+entries or a higher `leader_commit`, any rejection or snapshot flag, a higher
+term, a fresher `match_index`, a client write, `WakeRequest`, a transfer. If
+handling a carved-out message produces unexpected output, the node wakes.
+
+Trade-off, stated plainly: a follower now sleeps through a leader's pure
+heartbeats, so a leader that wakes with nothing to replicate and then dies
+before sending entries is noticed through the same path as the death of any
+quiesced group's leader (the reconciler's `Down` wake), not by the election
+timeout. The window is the leader's short awake settle period.
+
+### Regression coverage
+
+`preferred_leader_corpus::an_idle_group_quiesces_and_stays_quiesced_on_wan_links`
+(60-90 ms links, heavy-tail jitter, 30 s idle: converged-or-timeout to all
+three replicas quiesced, then a 60 s window in which `CpUnquiesces` must not
+move), failing on `main` before the fix. The quiesced-idle preferred-leader
+cell now runs on the WAN links too (it used 1 ms links to dodge this issue).

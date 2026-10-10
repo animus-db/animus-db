@@ -269,6 +269,12 @@ outstanding on the wire surface at present.
     item to deferred if quiesced CPU then measures zero.
   - The active half (1 MB/group, 2x hot p99) waits on B-01's load
     generator.
+- **Re-measured 2026-10-09 after #1207: stays deferred.** Quiesced steady CPU
+  is now zero net at RF1 (1,000 and 10,000 groups; was 20 and 167 ms/s) and
+  1 ms/s (one clock tick, the measurement resolution) at RF3 (was 70), and
+  quiesced RSS is 22-34 KB per replica. Both quiesced thresholds are met; no
+  residual per-group wake was found. Only the active half remains open
+  (ADR 0044's 2026-10-09 amendment).
 
 ### C-04 Testability phases D and E (ADR 0061)
 
@@ -1737,10 +1743,15 @@ outstanding on the wire surface at present.
     before the runs; the outcomes are in their 2026-10-04 outcome
     amendments.
   - **Cliffs filed:** #1180 (fixed by #1207), #1190, #1191, #1192, #1194, #1199.
-  - **Remaining, needs `animus-bench` (B-01, now landed):** active groups at a fixed
-    write rate, hot-tablet p99, WAL fsync/s under load, cluster node-count
-    scaling 3/6/12/24, and a `ProdEnv` wall-clock control InstallSnapshot
-    catch-up at 50k tablets (ADR 0039 criterion 1).
+  - **Re-run 2026-10-09 after #1207 (ADR 0044's amendment of that date):**
+    quiesced steady CPU is zero net at RF1 and at the 1 ms/s measurement
+    floor at RF3, so C-03 stays deferred.
+  - **Remaining (`animus-bench`, B-01, has landed; these runs need dedicated
+    hardware, the load-dependent numbers are not meaningful on the colocated
+    4-core dev container):** active groups at a fixed write rate, hot-tablet
+    p99, WAL fsync/s under load, cluster node-count scaling 3/6/12/24, and a
+    `ProdEnv` wall-clock control InstallSnapshot catch-up at 50k tablets
+    (ADR 0039 criterion 1).
 - **Depends:** `animus-bench` (ADR 0076; landed: the Tier 2 harness and topology; Tier 1 can start now).
 
 ### R-01 Production-readiness pass: exit criteria for leaving pre-alpha
@@ -2013,8 +2024,7 @@ outstanding on the wire surface at present.
     `DescribeTable` fields, `/admin/global-tables`, `animus table
     preferred-leader`, the decommission guard, `spec.maxRegionRttMs`, and the
     `sim_cluster_mrsc` + `preferred_leader_corpus` corpora (nightly in
-    `corpus-deep.yml`). **Residuals:** no quiescence benefit on
-    WAN groups (#1226); witness may transiently lead (no campaign
+    `corpus-deep.yml`). **Residuals:** witness may transiently lead (no campaign
     suppression); control-voter region placement is not enforced (only
     warned about); AWS field names/error texts unverified against the live
     API; no WAN cost numbers (`animus-bench` cross-region variant); no lease

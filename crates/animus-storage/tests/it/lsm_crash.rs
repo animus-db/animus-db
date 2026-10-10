@@ -468,6 +468,68 @@ fn scenario_coalesced_unsynced_batch_tear_reopens(seed: u64) {
     }
 }
 
+/// 9. **A crash while background maintenance (the production configuration,
+///    issue #1196) is mid-flush or mid-compaction.** With
+///    `background_maintenance: true` the flush and compaction run on a spawned
+///    task, so a crash can land at any await point inside them while writers
+///    are still being acked. Sweeps the number of acked writes and the virtual
+///    time given to the maintenance task before the power cut (torn tail and
+///    corruption armed), then a strict reopen must return every acked key at
+///    its acked value and accept a new write.
+fn scenario_background_maintenance_crash_recovers_all_acked_writes(seed: u64) {
+    let bg = || LsmOptions {
+        background_maintenance: true,
+        ..opts()
+    };
+    for acked in [6u64, 14, 30, 60] {
+        for draw in 0..8u64 {
+            let mut sim = Simulator::new(seed.wrapping_add(acked * 1_000 + draw));
+            {
+                let e = block_on(LsmEngine::open_with(sim.env(nid(0)), PREFIX, bg())).unwrap();
+                for i in 0..acked {
+                    block_on(e.put(
+                        format!("k{i:03}").as_bytes(),
+                        format!("v{i}").as_bytes(),
+                        i + 1,
+                    ))
+                    .unwrap();
+                    // Let the maintenance task make partial progress between
+                    // writes (also keeps the writer under the backpressure cap).
+                    if i % 3 == 2 {
+                        sim.run_for(std::time::Duration::from_micros(40 + draw * 53));
+                    }
+                }
+                sim.run_for(std::time::Duration::from_micros(draw * 97));
+            }
+            let mut cfg = DiskConfig::default();
+            cfg.torn_tail_on_crash = true;
+            cfg.corrupt_on_crash = true;
+            sim.set_disk_config(cfg);
+            sim.crash(nid(0));
+            let e = block_on(LsmEngine::open_with(sim.env(nid(0)), PREFIX, bg())).unwrap_or_else(
+                |err| panic!("seed={seed} acked={acked} draw={draw}: strict reopen failed: {err}"),
+            );
+            block_on(async {
+                for i in 0..acked {
+                    let got = e
+                        .get(format!("k{i:03}").as_bytes())
+                        .await
+                        .unwrap()
+                        .unwrap_or_else(|| {
+                            panic!("seed={seed} acked={acked} draw={draw}: acked k{i:03} lost")
+                        });
+                    assert_eq!(
+                        got.value,
+                        format!("v{i}").as_bytes(),
+                        "seed={seed} acked={acked} draw={draw}: k{i:03} wrong value"
+                    );
+                }
+                e.put(b"after", b"v", acked + 2).await.unwrap();
+            });
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Scenario {
     name: String,
@@ -537,6 +599,10 @@ fn scenario_cells() -> Vec<Scenario> {
         scenario!(
             "coalesced_unsynced_batch_tear_reopens",
             scenario_coalesced_unsynced_batch_tear_reopens
+        ),
+        scenario!(
+            "background_maintenance_crash_recovers_all_acked_writes",
+            scenario_background_maintenance_crash_recovers_all_acked_writes
         ),
     ]
 }

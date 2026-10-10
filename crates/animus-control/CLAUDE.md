@@ -3232,6 +3232,10 @@ variants by content, independent of `required_gate`. Cells:
 `tests/it/mrec_table_apply.rs`; fixtures `metadata/v1-mrec.json`,
 `mirror-entities/schema/v1-mrec.json` (shaped `vN-<shape>` names, read by dedicated tests).
 
+- **Quiescence wake carve-outs (issue #1226, ADR 0048 2026-10-09 amendment):** `RaftCore::handle` does NOT wake a
+  quiesced node on a stale ack (leader) or a no-new-information heartbeat from its leader (follower); every other
+  inbound message still wakes. Keep any new inbound variant on the waking path unless it provably carries nothing new.
+
 ## `Gate::TxnSealChecked`, `MAX_SUPPORTED = 4` (R-01, ADR 0018/0073 2026-10-09 amendments)
 
 The third real gate (version 4) guards `KvCommand::{TxnCommitSealChecked,

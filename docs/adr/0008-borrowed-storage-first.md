@@ -291,3 +291,18 @@ here:
   indices (offer a skip-check fast path); `remove_orphan_wal_segments` probes
   `0..lowest_live` segment numbers on every open (O(lifetime rotations); bound
   with a watermark or `Disk::list`).
+
+## Amendment 2026-10-09: production engines run maintenance in the background (#1196)
+
+`LsmOptions::background_maintenance` existed since the backpressure follow-up
+but `animusd` still opened every engine with the default (`false`), so a
+flush or an L0->L1 compaction (which rewrites every overlapping L1 table, the
+whole base table for random keys) ran inline on the single apply task and
+froze every in-flight op on the tablet for 200-700 ms. `LsmOptions::production()`
+(defaults + `background_maintenance: true`) is now what every `animusd`
+`LsmEngine::open_with` site uses. The default stays `false` because most
+crate tests drive a bare `block_on` that never polls spawned tasks; production
+runs under a driver that does. Measured (YCSB A, 300 ops/s, ConsistentRead
+true): p99 557 ms -> 110 ms, max 637 -> 115 ms. Tests:
+`lsm_maintenance::production_options_never_run_maintenance_inline_on_the_ack_path`
+plus background-maintenance cells in `lsm_crash` and `lsm_disk_faults`.
