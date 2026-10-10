@@ -289,9 +289,10 @@ per-tablet CP data plane (`animus-cp-data`).
 - **`delta_ring.rs`** (ADR 0038) — the apply task's bounded, per-node,
   best-effort in-memory ring of [`mirror::KeyWrite`] deltas keyed by Raft log
   index. Pure (no `Env`, no I/O); `push`/`clear`/`writes_since(last_seen,
-  upto)` are its whole surface. Bounded by **both** `max_entries` and
-  `max_bytes` (`DeltaRing::default` uses 1024 entries / 4 MiB), oldest
-  evicted first — except a push never evicts the entry it just inserted,
+  upto)` are its whole surface. Bounded by **bytes alone** (`max_bytes`;
+  `DeltaRing::default` is 4 MiB, ~7000 single-tablet deltas; no entry-count
+  cap since issue #1191 -- it made a 10k-tablet drain overflow the ring),
+  oldest evicted first — except a push never evicts the entry it just inserted,
   even if that single entry alone exceeds `max_bytes` (discarding your own
   freshest entry would defeat the ring's purpose). **`writes_since`'s
   contiguity check is subtle at the boundary: `last_seen + 1 ==

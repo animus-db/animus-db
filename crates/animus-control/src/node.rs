@@ -670,8 +670,7 @@ impl<E: Env> RaftNode<E> {
     /// `start`); the sim observability test threads in a recording handle here so
     /// it can read counters back without editing `animus-sim`, and integration
     /// can pass `env.metrics()` (or any chosen sink) explicitly. Uses the
-    /// default delta-ring bounds ([`crate::delta_ring::DEFAULT_MAX_ENTRIES`]/
-    /// [`crate::delta_ring::DEFAULT_MAX_BYTES`]) — see
+    /// default delta-ring byte budget ([`crate::delta_ring::DEFAULT_MAX_BYTES`]) — see
     /// [`start_with_ring_bounds`](Self::start_with_ring_bounds) for a caller
     /// that wants different ones.
     pub fn start_with_metrics<S: StorageEngine + 'static>(
@@ -687,7 +686,7 @@ impl<E: Env> RaftNode<E> {
     /// explicit [`DeltaRing`] (ADR 0038 PR5) instead of the default bounds —
     /// the "configurable" half of the ring's design; a test proving
     /// eviction/fallback behavior without pushing thousands of entries
-    /// constructs a small-bounded [`DeltaRing::with_bounds`] and passes it
+    /// constructs a small-budget [`DeltaRing::with_max_bytes`] and passes it
     /// here. Uses [`DEFAULT_ORPHAN_SWEEP_AFTER`] for the orphan-member sweep
     /// (ADR 0040 PR6) — see
     /// [`start_with_orphan_sweep_after`](Self::start_with_orphan_sweep_after)

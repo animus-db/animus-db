@@ -224,9 +224,10 @@ committed in full):
    `engine_applied`: one entry per drained command, keyed by its Raft log
    index, holding that command's derived `KeyWrite`s (possibly empty — a
    `NoOp`/rejected command still gets an entry, which is what keeps the ring's
-   index space contiguous with no unexplained gaps). Bounded by **both** max
-   entries and max total bytes (defaults 1024 / 4 MiB, `DeltaRing::
-   with_bounds`/`RaftNode::start_with_ring_bounds` for a different bound) —
+   index space contiguous with no unexplained gaps). Bounded by max total
+   bytes (default 4 MiB, `DeltaRing::with_max_bytes`/`RaftNode::
+   start_with_ring_bounds` for a different budget; originally also 1024
+   entries, dropped 2026-10-10, see the amendment below) —
    oldest evicted first. Strictly per-node, best-effort, no cross-node
    coordination — nothing here is replicated or agreed on. **Reset to empty**
    whenever `cache` is rebuilt from a jump the ring itself didn't witness (a
@@ -545,6 +546,22 @@ task's `merge_batch` for a pass always lands before it queues for compaction, an
 queue wait is bounded by the rounds ahead of it. Regression:
 `tests/apply_not_starved_by_wal_lock.rs`. Follow-up not addressed: the failure
 detector re-proposing `Down` for members a stale cache shows Active.
+
+## Amendment (2026-10-10, issue #1191 -- the delta ring is capped by bytes only)
+
+The ring's 1024-entry cap is removed; only the byte budget (`DEFAULT_MAX_BYTES`,
+4 MiB, unchanged) bounds it. Why: every delta is O(1) bytes per touched tablet
+(~566 B for a single-change delta), so memory is already bounded by bytes, while
+the entry cap made a node drain of ~10k tablets (one replica-move command per
+tablet) overflow the ring and force every lagging mirror onto the full-`Status`
+fallback (4.27 MB at 10k tablets). At ~566 B/delta the 4 MiB budget holds about
+7000 deltas, so a 10k-tablet drain at 9+ nodes (~3.3k commands) now fits; a
+3-node 10k drain (~10k commands) and 50k-tablet drains still overflow and fall
+back, which is the intended best-effort behavior. The budget stays at 4 MiB
+(memory per control node). API: `DeltaRing::with_bounds(entries, bytes)` became
+`DeltaRing::with_max_bytes(bytes)`; `DEFAULT_MAX_ENTRIES` is gone. Tests:
+`delta_ring` unit tests (byte-only eviction, 10k small entries retained) and
+`watch_deltas::over_a_thousand_small_deltas_are_still_served_as_a_delta`.
 
 ## See also
 
