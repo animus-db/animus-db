@@ -28,9 +28,10 @@ does not match its directory.**
 
 ## Documentation contradiction you need to know about
 
-ADR 0069's decision section says rotation means "standing up a fresh,
+ADR 0069's decision section said rotation means "standing up a fresh,
 differently-keyed replica and letting Raft catch it up, then decommissioning the old one".
-That was written for the per-node disk key. The later "As-built: cluster store" amendment
+That text is now struck through and superseded by ADR 0069's 2026-10-10 amendment (which
+also records the keyring plan for real rotation). It was written for the per-node disk key. The later "As-built: cluster store" amendment
 (2026-09-07) put the default replicated segment and backup stores under **the same
 cluster-wide key** (nodes exchange ciphertext; a node with a different key cannot serve or
 accept those objects). So a differently-keyed replacement node is not a supported
