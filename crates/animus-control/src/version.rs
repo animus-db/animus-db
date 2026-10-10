@@ -37,7 +37,7 @@ use crate::meta::Metadata;
 pub type ClusterVersion = u32;
 
 /// The highest cluster version this binary can run at.
-pub const MAX_SUPPORTED: ClusterVersion = 3;
+pub const MAX_SUPPORTED: ClusterVersion = 4;
 
 /// The lowest cluster version this binary can run at.
 ///
@@ -202,6 +202,16 @@ pub enum Gate {
     /// because a Release(2) voter (G-c) already knows `GlobalTables` yet
     /// cannot decode any of these.
     MrecReplication,
+    /// **Seal-checked transaction decisions** (ADR 0018's 2026-10-09
+    /// amendment, R-01): the third real version gate, opening at cluster
+    /// version 4. Guards `KvCommand::{TxnCommitSealChecked,
+    /// TxnAbortSealChecked}`, the decision entries whose apply is a no-op on a
+    /// range the group has already sealed (a `Freeze` or the in-place split
+    /// fork). Its own gate because the *apply behaviour* differs from the
+    /// legacy `TxnCommit`/`TxnAbort` (which still apply on a sealed range) and
+    /// an older voter cannot decode the new variants; apply never branches on
+    /// a gate (ADR 0073 decision 4), so the behaviour travels in the entry.
+    TxnSealChecked,
     /// A **synthetic** version gate `n` (test/sim builds only): opens at
     /// cluster version `n`, ranks `n`. It exists so the gate *ladder*
     /// (several version gates, each opening at its own finalize) can be
@@ -225,6 +235,7 @@ impl Gate {
         Gate::Era,
         Gate::GlobalTables,
         Gate::MrecReplication,
+        Gate::TxnSealChecked,
     ];
 
     /// The cluster version at which this gate opens, or `None` for a gate
@@ -240,6 +251,8 @@ impl Gate {
             Gate::GlobalTables => Some(2),
             // ADR 0075 (G-01 stage G-d): the second real version gate.
             Gate::MrecReplication => Some(3),
+            // ADR 0018 (2026-10-09, R-01): the third real version gate.
+            Gate::TxnSealChecked => Some(4),
             #[cfg(any(test, feature = "sim-versions"))]
             Gate::Synthetic(n) => Some(n),
         }
@@ -256,6 +269,7 @@ impl Gate {
             Gate::Era => 1,
             Gate::GlobalTables => 2,
             Gate::MrecReplication => 3,
+            Gate::TxnSealChecked => 4,
             #[cfg(any(test, feature = "sim-versions"))]
             Gate::Synthetic(n) => {
                 if n > 1 {
@@ -531,6 +545,8 @@ mod tests {
                 Gate::GlobalTables => Some(2),
                 // ADR 0075 (G-01 G-d): the second.
                 Gate::MrecReplication => Some(3),
+                // ADR 0018 (2026-10-09, R-01): the third.
+                Gate::TxnSealChecked => Some(4),
                 // Never in `ALL` (parametric, test/sim only): see the ladder test.
                 Gate::Synthetic(_) => unreachable!("synthetic gates are not in Gate::ALL"),
             };
@@ -552,9 +568,14 @@ mod tests {
             Gate::GlobalTables.join(Gate::MrecReplication),
             Gate::MrecReplication
         );
+        assert!(seen.contains(&Gate::TxnSealChecked));
         assert_eq!(
-            MAX_SUPPORTED, 3,
-            "G-01 G-d is the release that takes MAX to 3"
+            Gate::MrecReplication.join(Gate::TxnSealChecked),
+            Gate::TxnSealChecked
+        );
+        assert_eq!(
+            MAX_SUPPORTED, 4,
+            "the seal-checked txn decision gate (R-01) is the release that takes MAX to 4"
         );
         assert_eq!(MIN_SUPPORTED, 1);
         // Declaration order is opening order: ranks are non-decreasing.

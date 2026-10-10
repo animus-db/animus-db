@@ -86,6 +86,17 @@
 //!   report the capped rejection at exactly that voter, wedged and never
 //!   appended, and the MREC spec applied before its gate on the others.
 //!
+//! - `release3_to_release4_txn_seal_gate`: the third real gate (`Gate::
+//!   TxnSealChecked`, cluster version 4, R-01, ADR 0018's 2026-10-09
+//!   amendment): the gate guards the *apply behaviour* of a txn decision that
+//!   lands on an already-sealed range (the seal-checked `KvCommand` variants,
+//!   which an older voter cannot decode). With the cluster finalized at 3
+//!   (and even half-rolled to `Release(4)`, the finalize refused while a
+//!   `[1,3]` node is recorded) a decision on a frozen group applies as it
+//!   always did (the record flips, identically on every replica); after the
+//!   finalize to 4 the same decision on a frozen group is a sealed no-op
+//!   (the record stays `Pending`, identically on every replica);
+//!
 //! # Not covered
 //!
 //! - Roll orders / leader kills over `Release(1) -> Release(2)`: the pure
@@ -155,6 +166,10 @@ enum Kind {
     MrecGate,
     /// N6: `ConvertTableToMrec` emitted ungated with a Release(2) voter.
     MrecGateNegative,
+    /// Release(3) -> Release(4) over `Gate::TxnSealChecked` (R-01): a txn
+    /// decision landing on a sealed range applies as before until the gate
+    /// opens, as a sealed no-op after.
+    TxnSealGate,
 }
 
 /// The three ladder negative controls (ADR 0073 section 7).
@@ -243,6 +258,7 @@ fn cells() -> Vec<Cell> {
             "negative_control_mrec_gate_emitted_early",
             Kind::MrecGateNegative,
         ),
+        cell("release3_to_release4_txn_seal_gate", Kind::TxnSealGate),
     ]
 }
 
@@ -351,6 +367,7 @@ fn run(c: &Cell) -> Verdict {
         Kind::GlobalGateNegative => run_global_negative(c),
         Kind::MrecGate => run_mrec_gate(c),
         Kind::MrecGateNegative => run_mrec_negative(c),
+        Kind::TxnSealGate => run_txn_seal_gate(c),
         _ => run_roll(c),
     }
 }
@@ -635,7 +652,8 @@ fn run_roll(c: &Cell) -> Verdict {
         | Kind::GlobalGate
         | Kind::GlobalGateNegative
         | Kind::MrecGate
-        | Kind::MrecGateNegative => unreachable!(),
+        | Kind::MrecGateNegative
+        | Kind::TxnSealGate => unreachable!(),
     }
 
     // Liveness: the era starts once the last node is B2, every node recorded.
@@ -1634,6 +1652,198 @@ fn run_mrec_negative(c: &Cell) -> Verdict {
     verdict_of(c, v, cap_fired)
 }
 
+// ---------------------------------------------------------------------------
+// The third real gate: `Gate::TxnSealChecked` (cluster version 4, R-01)
+// ---------------------------------------------------------------------------
+
+/// A table's sole tablet, a txn staged on it (not decided), and the record
+/// coordinates: `(tablet, txn_id, record_key)`.
+fn stage_open_txn(
+    cluster: &mut SimCluster,
+    w: &mut Watch,
+    table: &str,
+) -> Option<(animus_tablet::TabletId, animus_cp_data::TxnId, Vec<u8>)> {
+    let tablet = *cluster
+        .metadata(0)
+        .tablets_for_table(table)
+        .next()
+        .map(|(id, _)| id)?;
+    let key = crate::dynamo::item_key(
+        &animus_dynamo::AttributeValue::S("pk".to_string()),
+        Some(&animus_dynamo::AttributeValue::S("sk".to_string())),
+    );
+    match cluster.txn_prepare_once(0, table, key, Some(b"v".to_vec())) {
+        Ok((txn_id, record_key, _table, _ts, animus_cp_data::StageOutcome::Staged)) => {
+            Some((tablet, txn_id, record_key))
+        }
+        other => {
+            w.violations
+                .push(format!("staging a txn on {table} failed: {other:?}"));
+            None
+        }
+    }
+}
+
+/// Freeze `tablet` at its leader, propose a commit decision straight onto the
+/// frozen group (the propose-vs-apply sliver), and return the status the
+/// leader reports for the record. Every hosting replica's own record bytes
+/// must be identical (a divergence is a violation, pushed here).
+fn decide_on_frozen_group(
+    cluster: &mut SimCluster,
+    w: &mut Watch,
+    tablet: animus_tablet::TabletId,
+    txn_id: animus_cp_data::TxnId,
+    record_key: Vec<u8>,
+) -> Option<animus_cp_data::TxnDecisionStatus> {
+    let Some(leader) = (0..64).find_map(|_| {
+        w.run(cluster, Duration::from_millis(200));
+        cluster.leader_index_of(tablet)
+    }) else {
+        w.violations
+            .push(format!("{tablet:?} never elected a leader"));
+        return None;
+    };
+    cluster.freeze_tablet(leader, tablet);
+    let status = cluster.txn_decide_on_group(leader, tablet, txn_id, record_key.clone(), true);
+    // Replicas converge on the entry; compare every hosting replica's record.
+    w.run(cluster, Duration::from_secs(2));
+    let records: Vec<(u64, Option<Vec<u8>>)> = (0..NODES)
+        .map(|n| {
+            (
+                n,
+                cluster.txn_record_bytes_on(n, tablet, record_key.clone()),
+            )
+        })
+        .filter(|(_, b)| b.is_some())
+        .collect();
+    if records.len() < 2 || records.iter().any(|(_, b)| b != &records[0].1) {
+        w.violations.push(format!(
+            "the replicas of {tablet:?} disagree on the record (or fewer than two hold it): \
+             {records:?}"
+        ));
+    }
+    status
+}
+
+fn roll_to_release4(cluster: &mut SimCluster, w: &mut Watch, nodes: &[u64]) {
+    for &n in nodes {
+        cluster.set_binary_profile(n, BinaryProfile::Release(4));
+        cluster.set_node_version(n, Some(VersionRange::new(1, 4)));
+        w.run(cluster, Duration::from_millis(500));
+    }
+}
+
+/// Roll `Release(3)` -> `Release(4)`. A txn decision proposed onto an
+/// already-sealed (frozen) group applies exactly as it always did (the
+/// record flips, the same on every replica) while the cluster is at version 3
+/// -- including with most nodes already `Release(4)` and the finalize refused
+/// by name -- and is a sealed no-op (the record stays `Pending`, the same on
+/// every replica) once the finalize to 4 opened `Gate::TxnSealChecked`.
+fn run_txn_seal_gate(c: &Cell) -> Verdict {
+    use animus_control::version::Gate;
+    use animus_cp_data::TxnDecisionStatus;
+    let mut cluster = light_cluster(c.seed);
+    let mut w = Watch::new(true);
+    mrec_setup(&mut cluster, &mut w);
+    roll_to_release3(&mut cluster, &mut w, &[0, 1, 2, DATA]);
+    if !converge(&mut cluster, |c| {
+        w.sample(c);
+        (0..NODES).all(|n| {
+            c.metadata(n)
+                .node_versions
+                .values()
+                .all(|v| v.range == VersionRange::new(1, 3))
+                && c.metadata(n).node_versions.len() == NODES as usize
+        })
+    }) {
+        w.violations
+            .push("the [1,3] records never landed on every node".into());
+    }
+    let l = control_leader(&mut cluster);
+    let (status, body) = finalize(&mut cluster, l, r#"{"to":3,"expected":2}"#);
+    if status != 200 {
+        w.violations
+            .push(format!("finalize 2 -> 3: {status} {body}"));
+    }
+    if !converge(&mut cluster, |c| {
+        w.sample(c);
+        (0..NODES).all(|n| c.features(n).cluster_version() == 3)
+    }) {
+        w.violations
+            .push("cluster version 3 never reached on every node".into());
+    }
+    // Two open transactions, one per table, staged at version 3.
+    let _ = cluster.create_table("s1");
+    let _ = cluster.create_table("s2");
+    let (Some(a), Some(b)) = (
+        stage_open_txn(&mut cluster, &mut w, "s1"),
+        stage_open_txn(&mut cluster, &mut w, "s2"),
+    ) else {
+        return verdict_of(c, w.violations, false);
+    };
+
+    // Half-rolled: nodes 0, 1 and the data node are Release(4), node 2 is not.
+    roll_to_release4(&mut cluster, &mut w, &[0, 1, DATA]);
+    let leader = control_leader(&mut cluster);
+    let (status, body) = finalize(&mut cluster, leader, r#"{"to":4,"expected":3}"#);
+    if status == 200 {
+        w.violations.push(format!(
+            "a finalize to 4 was accepted with a [1,3] node: {body}"
+        ));
+    }
+    if (0..NODES).any(|n| cluster.features(n).is_open(Gate::TxnSealChecked)) {
+        w.violations
+            .push("TxnSealChecked open before the finalize".into());
+    }
+    // Gate closed: the old apply outcome, identical on every replica.
+    let before = decide_on_frozen_group(&mut cluster, &mut w, a.0, a.1, a.2);
+    if !matches!(before, Some(TxnDecisionStatus::Committed { .. })) {
+        w.violations.push(format!(
+            "below the gate a decision on a sealed group must apply as it always did \
+             (Committed): {before:?}"
+        ));
+    }
+
+    // Everyone rolls, the finalize to 4 opens the gate on every node.
+    roll_to_release4(&mut cluster, &mut w, &[OLD]);
+    if !converge(&mut cluster, |c| {
+        w.sample(c);
+        (0..NODES).all(|n| {
+            c.metadata(n)
+                .node_versions
+                .values()
+                .all(|v| v.range == VersionRange::new(1, 4))
+                && c.metadata(n).node_versions.len() == NODES as usize
+        })
+    }) {
+        w.violations
+            .push("the [1,4] records never landed on every node".into());
+    }
+    let l = control_leader(&mut cluster);
+    let (status, body) = finalize(&mut cluster, l, r#"{"to":4,"expected":3}"#);
+    if status != 200 {
+        w.violations
+            .push(format!("finalize 3 -> 4: {status} {body}"));
+    }
+    if !converge(&mut cluster, |c| {
+        w.sample(c);
+        (0..NODES).all(|n| c.features(n).is_open(Gate::TxnSealChecked))
+    }) {
+        w.violations
+            .push("TxnSealChecked never opened on every node".into());
+    }
+    // Gate open: the sealed no-op, identical on every replica.
+    let after = decide_on_frozen_group(&mut cluster, &mut w, b.0, b.1, b.2);
+    if !matches!(after, Some(TxnDecisionStatus::Pending)) {
+        w.violations.push(format!(
+            "at the gate a decision on a sealed group must be a no-op (Pending, identically on every \
+             replica): {after:?}"
+        ));
+    }
+    w.sample(&cluster);
+    verdict_of(c, w.violations, false)
+}
+
 /// A Phase 1 binary joining after the era is refused at the seed's handshake
 /// (counted, never a member); the cluster is unaffected; a versioned joiner
 /// through the same seed is admitted and recorded. `via_data` dials the
@@ -1921,6 +2131,11 @@ fn sim_cluster_mixed_version_corpus_negative_control_mrec_gate() {
 }
 
 #[test]
+fn sim_cluster_mixed_version_corpus_txn_seal_gate() {
+    run_family("release3_to_release4_txn_seal_gate");
+}
+
+#[test]
 fn sim_cluster_mixed_version_cell_names_and_seeds_are_unique() {
     let cs = corpus::seed_expand(cells(), 3);
     let names: BTreeSet<_> = cs.iter().map(|c| c.name.clone()).collect();
@@ -1945,6 +2160,7 @@ fn sim_cluster_mixed_version_cell_names_and_seeds_are_unique() {
         "negative_control_global_gate_emitted_early",
         "release2_to_release3_mrec_gate",
         "negative_control_mrec_gate_emitted_early",
+        "release3_to_release4_txn_seal_gate",
     ] {
         assert!(
             cells().iter().any(|c| c.name.starts_with(prefix)),

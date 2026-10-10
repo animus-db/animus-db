@@ -76,7 +76,10 @@ operator never deletes a pod (no new RBAC).
    operator sets `UpgradeFinalizePending`: run `animus cluster finalize <control-leader-admin-addr>`
    (irreversible). With `Auto` the operator finalizes once the roll is complete, `can_finalize`
    holds and the cluster has stayed healthy for `soakSeconds`; a failure (a `Down` member) is
-   retried, never forced.
+   retried, never forced. Do not leave a cluster unfinalized indefinitely: some fixes ship
+   as version-gated behaviour that is only on after the finalize (cluster version 4:
+   seal-checked transaction decisions, ADR 0018's 2026-10-09 amendment, which close a
+   commit-vs-split race), so a cluster stays on the previous behaviour until then.
 5. **If a pod never becomes healthy** the roll stops at that pod and the rest stay on the old
    binary (the cluster serves normally at the old cluster version). **Fix forward**: set
    `spec.image` to a fixed image and the gate re-targets it; or wipe that pod's PVC and let it

@@ -240,7 +240,7 @@ mod tests {
     fn b2_is_pinned_to_one_one_and_release_two_is_pinned_to_one_two() {
         assert_eq!(BinaryProfile::B2.own_range(), Some(VersionRange::new(1, 1)));
         // Release(2) is the G-c binary as it shipped: a literal, never the
-        // real range (which is `[1, 3]` since G-d).
+        // real range (which is `[1, 4]` since R-01).
         assert_eq!(
             BinaryProfile::Release(2).own_range(),
             Some(VersionRange::new(1, 2))
@@ -277,17 +277,19 @@ mod tests {
                 BinaryProfile::B2,
                 BinaryProfile::Release(2),
                 BinaryProfile::Release(3),
+                BinaryProfile::Release(4),
             ]
             .iter()
             .map(|p| p.accepts(g))
             .collect();
             let want = match g {
-                Gate::Base => [true, true, true, true],
-                Gate::Era => [false, true, true, true],
-                Gate::GlobalTables => [false, false, true, true],
-                Gate::MrecReplication => [false, false, false, true],
-                Gate::Synthetic(2) => [false, false, true, true],
-                Gate::Synthetic(3) => [false, false, false, true],
+                Gate::Base => [true, true, true, true, true],
+                Gate::Era => [false, true, true, true, true],
+                Gate::GlobalTables => [false, false, true, true, true],
+                Gate::MrecReplication => [false, false, false, true, true],
+                Gate::TxnSealChecked => [false, false, false, false, true],
+                Gate::Synthetic(2) => [false, false, true, true, true],
+                Gate::Synthetic(3) => [false, false, false, true, true],
                 Gate::Synthetic(_) => unreachable!(),
             };
             assert_eq!(row, want, "{g:?}");

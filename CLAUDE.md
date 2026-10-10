@@ -110,7 +110,7 @@ test, and the upgrade-restart harness (`animus-test` tiers 0/1,
 `animusd` `sim_cluster_upgrade_corpus` tier 2; per-push at K=1, nightly in
 `corpus-deep.yml`) restarts on state transcoded to older versions. So a
 **whole-cluster stop → upgrade → restart is supported and tested**;
-**Cluster version is 2 since 2026-10-05** (`MAX_SUPPORTED = 2`, first real gate `Gate::GlobalTables` for `ConvertTableToGlobal`; B2 is pinned to `[1,1]`, ADR 0073's 2026-10-05 amendment). **Phase 2 is done (2026-10-04):** a replicated cluster version and feature
+**Cluster version is 4 since 2026-10-09** (`MAX_SUPPORTED = 4`: `Gate::GlobalTables` (2), `Gate::MrecReplication` (3), `Gate::TxnSealChecked` (4, the seal-checked txn decision variants, ADR 0018/0073's 2026-10-09 amendments); B2 is pinned to `[1,1]`, ADR 0073's 2026-10-05 amendment). **Phase 2 is done (2026-10-04):** a replicated cluster version and feature
 gates (`Gate`, `ClusterFeatures`, `GatedCommand::required_gate`, ADR 0073
 sections 1-4 and 8), a mixed-version corpus (both tiers, negative controls,
 `ANIMUS_UPGRADE_SEEDS`), and a **manual node-by-node rolling upgrade with no

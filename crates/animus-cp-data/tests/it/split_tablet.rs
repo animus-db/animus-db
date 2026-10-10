@@ -16,8 +16,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use animus_control::ProposeResult;
-use animus_cp_data::{KIND_BASE, RaftKvNode, TxnDecisionStatus};
-use animus_env::{EnvExt, nid};
+use animus_control::version::ClusterFeatures;
+use animus_cp_data::{HostedOptions, KIND_BASE, RaftKvNode, StorageScope, TxnDecisionStatus};
+use animus_env::{EnvExt, PRIMARY_STREAM, nid};
 use animus_sim::{SimEnv, Simulator};
 use animus_storage::MemoryEngine;
 use animus_tablet::{SplitChild, TabletId};
@@ -36,6 +37,34 @@ fn group(seed: u64) -> (Simulator, Vec<KvNode>) {
                 sim.env(nid(id)),
                 NODES.iter().copied().map(nid).collect(),
                 MemoryEngine::new(),
+            )
+        })
+        .collect();
+    (sim, nodes)
+}
+
+/// As [`group`], but every replica's feature handle reads `cluster_version`
+/// (4 = `Gate::TxnSealChecked` open, 3 = closed).
+fn group_at(seed: u64, cluster_version: u32) -> (Simulator, Vec<KvNode>) {
+    let sim = Simulator::new(seed);
+    let nodes = NODES
+        .iter()
+        .map(|&id| {
+            let features = ClusterFeatures::new();
+            features.update(&animus_control::Metadata {
+                cluster_version,
+                ..animus_control::Metadata::default()
+            });
+            RaftKvNode::start_hosted_with_options(
+                sim.env(nid(id)),
+                NODES.iter().copied().map(nid).collect(),
+                MemoryEngine::new(),
+                StorageScope::whole(),
+                PRIMARY_STREAM,
+                HostedOptions {
+                    features,
+                    ..HostedOptions::default()
+                },
             )
         })
         .collect();
@@ -358,11 +387,17 @@ fn drive<T: Send + 'static>(
 /// intents were never resolved, so the key later reverted to its prior
 /// value). The seal must make a post-fork decision a deterministic no-op,
 /// like every other post-fork mutation.
-#[test]
-fn a_txn_decision_ordered_after_the_fork_is_a_sealed_no_op() {
+///
+/// **Gated (ADR 0018's 2026-10-09 amendment, `Gate::TxnSealChecked`)**: the
+/// seal-checked decision variants apply as a sealed no-op, and are what
+/// proposers emit once the gate is open (cluster version 4). Below the gate the
+/// legacy seal-blind `TxnCommit`/`TxnAbort` are proposed and apply exactly as
+/// the pre-R-01 binary did (the record flips on the frozen parent), so a mixed
+/// cluster's old and new replicas apply every entry identically.
+fn run_decision_after_fork(cluster_version: u32, gate_open: bool) {
     for (name, commit) in [("commit", true), ("abort", false)] {
-        let seed = if commit { 0x5713_0010 } else { 0x5713_0011 };
-        let (mut sim, nodes) = group(seed);
+        let seed = if commit { 0x5713_0010 } else { 0x5713_0011 } + u64::from(cluster_version);
+        let (mut sim, nodes) = group_at(seed, cluster_version);
         sim.run_for(Duration::from_secs(2));
         let l = leader(&nodes, seed);
 
@@ -414,12 +449,40 @@ fn a_txn_decision_ordered_after_the_fork_is_a_sealed_no_op() {
             async move { n.txn_status_local(&r).await },
         )
         .flatten();
-        assert_eq!(
-            status,
-            Some(TxnDecisionStatus::Pending),
-            "{name}: a decision ordered after the fork must not change the frozen parent's \
-             record (the children clone it; a replica-dependent decision diverges them) \
-             (seed={seed})"
-        );
+        if gate_open {
+            assert_eq!(
+                status,
+                Some(TxnDecisionStatus::Pending),
+                "{name}: a decision ordered after the fork must not change the frozen parent's \
+                 record (the children clone it; a replica-dependent decision diverges them) \
+                 (seed={seed})"
+            );
+        } else {
+            // The gate is closed: the legacy variants were proposed, and they
+            // apply seal-blind exactly as the pre-R-01 binary did.
+            let want = if commit {
+                matches!(status, Some(TxnDecisionStatus::Committed { .. }))
+            } else {
+                matches!(status, Some(TxnDecisionStatus::Aborted))
+            };
+            assert!(
+                want,
+                "{name}: below the gate the legacy decision applies on the sealed parent, \
+                 got {status:?} (seed={seed})"
+            );
+        }
     }
+}
+
+#[test]
+fn a_txn_decision_ordered_after_the_fork_is_a_sealed_no_op() {
+    run_decision_after_fork(4, true);
+}
+
+/// Below `Gate::TxnSealChecked` the legacy apply is reproduced exactly (the
+/// mixed-version guarantee: an old replica applying the same entry gets the same
+/// outcome).
+#[test]
+fn below_the_gate_a_txn_decision_after_the_fork_applies_as_it_always_did() {
+    run_decision_after_fork(3, false);
 }

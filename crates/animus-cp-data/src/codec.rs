@@ -685,6 +685,32 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
             put_ts(out, *ts);
             put_opt_ts(out, orphan_created_ts);
         }
+        // ADR 0018 (2026-10-09, R-01), `Gate::TxnSealChecked`: same payloads as
+        // tags 9/10 under new tags (the apply behaviour differs, so the tag is
+        // what carries it). Additive: no frame-version bump, an older decoder
+        // rejects the tag by name and the gate keeps it from being sent.
+        KvCommand::TxnCommitSealChecked {
+            txn_id,
+            record_key,
+            ts,
+        } => {
+            put_u8(out, 18);
+            put_txn_id(out, txn_id);
+            put_bytes(out, record_key);
+            put_ts(out, *ts);
+        }
+        KvCommand::TxnAbortSealChecked {
+            txn_id,
+            record_key,
+            ts,
+            orphan_created_ts,
+        } => {
+            put_u8(out, 19);
+            put_txn_id(out, txn_id);
+            put_bytes(out, record_key);
+            put_ts(out, *ts);
+            put_opt_ts(out, orphan_created_ts);
+        }
         KvCommand::TxnResolve {
             txn_id,
             record_key,
@@ -827,6 +853,17 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
             ts: read_ts(c)?,
         },
         10 => KvCommand::TxnAbort {
+            txn_id: read_txn_id(c)?,
+            record_key: c.bytes()?,
+            ts: read_ts(c)?,
+            orphan_created_ts: read_opt_ts(c)?,
+        },
+        18 => KvCommand::TxnCommitSealChecked {
+            txn_id: read_txn_id(c)?,
+            record_key: c.bytes()?,
+            ts: read_ts(c)?,
+        },
+        19 => KvCommand::TxnAbortSealChecked {
             txn_id: read_txn_id(c)?,
             record_key: c.bytes()?,
             ts: read_ts(c)?,
@@ -2021,6 +2058,61 @@ pub(crate) mod tests {
             prev_log_term: 9,
             entries,
             leader_commit: 39,
+        })]
+    }
+
+    /// ADR 0018 (2026-10-09, R-01): one `AppendEntries` frame carrying the two
+    /// seal-checked decision variants (`Gate::TxnSealChecked`, codec tags 18 and
+    /// 19), the abort once with an orphan-tombstone `created_ts`. A *shaped*
+    /// fixture (`raftkv-wire/v1-txnseal.bin`), append-only like
+    /// [`sample_entries`]: the variants are additive inside wire v1.
+    pub(crate) fn txn_sealed_sample_wires() -> Vec<KvWire> {
+        let entry = |index: u64, command: KvCommand| LogEntry {
+            term: 11,
+            index,
+            command,
+            config: None,
+            learners: None,
+        };
+        let txn_id = TxnId {
+            ts: ts(21, 0),
+            node: nid(2),
+        };
+        let entries = vec![
+            entry(
+                60,
+                KvCommand::TxnCommitSealChecked {
+                    txn_id: txn_id.clone(),
+                    record_key: b"record".to_vec(),
+                    ts: ts(22, 0),
+                },
+            ),
+            entry(
+                61,
+                KvCommand::TxnAbortSealChecked {
+                    txn_id: txn_id.clone(),
+                    record_key: b"record".to_vec(),
+                    ts: ts(22, 1),
+                    orphan_created_ts: None,
+                },
+            ),
+            entry(
+                62,
+                KvCommand::TxnAbortSealChecked {
+                    txn_id,
+                    record_key: b"record".to_vec(),
+                    ts: ts(22, 2),
+                    orphan_created_ts: Some(ts(20, 5)),
+                },
+            ),
+        ];
+        vec![KvWire::Raft(RaftMsg::AppendEntries {
+            term: 11,
+            leader: nid(2),
+            prev_log_index: 59,
+            prev_log_term: 11,
+            entries,
+            leader_commit: 59,
         })]
     }
 

@@ -14898,8 +14898,9 @@ struct AutoSplitThresholds {
 }
 
 /// F11 (ADR 0042 §14): the exact error [`ClientCtx::trigger_split`] returns
-/// when [`decide::align_split_key`] finds a streamed table's split key rounds down
-/// onto the target tablet's own `range.start` — matched by `auto_split_loop`
+/// when [`decide::align_split_key`] finds no interior token boundary for the split
+/// key (the tablet's range holds a single token; any table, streamed or not) —
+/// matched by `auto_split_loop`
 /// to downgrade its logging (Fork E: skip + meter via
 /// [`Metric::StreamSplitSingleTokenSkipped`], never its ordinary "split did
 /// not commit" warning, which would otherwise fire every cooldown, forever,

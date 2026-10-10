@@ -91,9 +91,11 @@
 //! key to the other, where no record exists (R-01 F-2: an orphan-abort
 //! tombstone and a never-resolved intent). `animusd`'s one split choke point,
 //! `decide::align_split_key`, therefore rounds **every** table's split key to a
-//! token boundary (down, else up). What stays open is a range holding a
-//! *single* token, which can still be split by sort key (the raw key is kept):
-//! a transaction anchored on that token can straddle the cut.
+//! token boundary (down, else up), and refuses (skips) a range holding a
+//! *single* token rather than cutting inside it (the residual of the first
+//! fix, closed in R-01: ADR 0018's 2026-10-09 amendment). `Metadata::apply`
+//! deliberately does not re-check alignment, so tablets an older binary split
+//! mid-token replay unchanged.
 //!
 //! ## Resolution semantics
 //!

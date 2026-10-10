@@ -3236,3 +3236,16 @@ variants by content, independent of `required_gate`. Cells:
   quiesced node on a stale ack (leader) or a no-new-information heartbeat from its leader (follower); every other
   inbound message still wakes. Keep any new inbound variant on the waking path unless it provably carries nothing new.
 
+## `Gate::TxnSealChecked`, `MAX_SUPPORTED = 4` (R-01, ADR 0018/0073 2026-10-09 amendments)
+
+The third real gate (version 4) guards `KvCommand::{TxnCommitSealChecked,
+TxnAbortSealChecked}` in `animus-cp-data` (`gates.rs` row, `gated_propose`): the
+only gate so far whose reason is a *changed apply behaviour* (a txn decision on an
+already-sealed range is a no-op) rather than a new surface; the behaviour travels in
+the entry because apply never branches on a gate (ADR 0073 decision 4). Adding a
+gate still means a `Gate` variant + `version`/`rank`/`ALL` rows, the `sim_versions`
+acceptance matrix (`profiles_accept_gates_exactly_up_to_their_known_version` gains a
+`Release(n)` column per release), the `gate_table_is_exhaustive` test and the
+`MAX_SUPPORTED` pin. `BinaryProfile::Release(n)` is `[n-1, n]` in the sim; `Release(2)`
+stays the literal `[1, 2]`. Cell: animusd `sim_cluster_mixed_version_corpus`
+`release3_to_release4_txn_seal_gate`.

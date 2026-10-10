@@ -1350,6 +1350,12 @@ pub enum KvCommand {
     /// this only ever touches the record key itself, never user data. A
     /// missing record (the stage never landed — fenced/sealed out) is a
     /// silent no-op, matching this crate's fence-miss doctrine.
+    ///
+    /// **Seal-blind, by design and forever**: this legacy variant applies on an
+    /// already-sealed range exactly as every pre-R-01 binary did. The
+    /// seal-checked behaviour lives in [`TxnCommitSealChecked`](Self::
+    /// TxnCommitSealChecked), which proposers emit once `Gate::TxnSealChecked`
+    /// is open (ADR 0018's 2026-10-09 amendment).
     TxnCommit {
         txn_id: TxnId,
         record_key: Vec<u8>,
@@ -1378,6 +1384,42 @@ pub enum KvCommand {
     /// instead of overwriting it back to `Pending` (`KvCommand::TxnStage`'s
     /// own resurrection guard).
     TxnAbort {
+        txn_id: TxnId,
+        record_key: Vec<u8>,
+        ts: HlcTimestamp,
+        orphan_created_ts: Option<HlcTimestamp>,
+    },
+    /// **Seal-checked transaction commit** (ADR 0018's 2026-10-09 amendment,
+    /// R-01; `Gate::TxnSealChecked`, cluster version 4). Identical to
+    /// [`TxnCommit`](Self::TxnCommit) **except** that apply treats a record
+    /// key inside a range this group has already sealed (the whole-range seal
+    /// a `Freeze` or the in-place `SplitTablet` fork applies) as a
+    /// deterministic no-op, like every other mutating arm: the children of a
+    /// fork are cloned from the parent's CURRENT engine, asynchronously and
+    /// per replica, so a decision ordered after the fork entry used to land
+    /// in the clone of the replicas that cloned late and not in the others
+    /// (replica-divergent children, and an acked commit the record's real
+    /// owner never saw). The proposer re-routes the same decision to the
+    /// child that now owns the record (`txn_decide_anchor_retrying`).
+    ///
+    /// **Why a separate variant, not a change to `TxnCommit`**: apply never
+    /// branches on a gate (ADR 0073 decision 4) and an old voter applying the
+    /// identical entry must reproduce the old outcome, so the behaviour
+    /// travels in the entry. The legacy variants keep their original
+    /// seal-blind apply forever (an entry an older binary committed must
+    /// replay identically); proposers emit these only once the gate is open
+    /// ([`gates`]), i.e. once every voter can decode and apply them.
+    TxnCommitSealChecked {
+        txn_id: TxnId,
+        record_key: Vec<u8>,
+        ts: HlcTimestamp,
+    },
+    /// **Seal-checked transaction abort**: the `Aborted` dual of
+    /// [`TxnCommitSealChecked`](Self::TxnCommitSealChecked) (including the
+    /// `orphan_created_ts` tombstone case, which is also a no-op on a sealed
+    /// range: the synthesized record would otherwise land in a parent that no
+    /// longer owns it).
+    TxnAbortSealChecked {
         txn_id: TxnId,
         record_key: Vec<u8>,
         ts: HlcTimestamp,
@@ -3770,6 +3812,52 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         }
     }
 
+    /// The txn commit decision this group proposes: the seal-checked variant
+    /// once `Gate::TxnSealChecked` is open (every voter can decode and apply
+    /// it), else the legacy seal-blind `TxnCommit` (ADR 0018's 2026-10-09
+    /// amendment; apply never branches on a gate, so the behaviour is chosen
+    /// here, at the proposer).
+    fn txn_commit_cmd(&self, txn_id: TxnId, record_key: Vec<u8>, ts: HlcTimestamp) -> KvCommand {
+        if self.features.is_open(Gate::TxnSealChecked) {
+            KvCommand::TxnCommitSealChecked {
+                txn_id,
+                record_key,
+                ts,
+            }
+        } else {
+            KvCommand::TxnCommit {
+                txn_id,
+                record_key,
+                ts,
+            }
+        }
+    }
+
+    /// The abort dual of [`txn_commit_cmd`](Self::txn_commit_cmd).
+    fn txn_abort_cmd(
+        &self,
+        txn_id: TxnId,
+        record_key: Vec<u8>,
+        ts: HlcTimestamp,
+        orphan_created_ts: Option<HlcTimestamp>,
+    ) -> KvCommand {
+        if self.features.is_open(Gate::TxnSealChecked) {
+            KvCommand::TxnAbortSealChecked {
+                txn_id,
+                record_key,
+                ts,
+                orphan_created_ts,
+            }
+        } else {
+            KvCommand::TxnAbort {
+                txn_id,
+                record_key,
+                ts,
+                orphan_created_ts,
+            }
+        }
+    }
+
     /// Mint a write's `ts`, **pushed** above any read this group's
     /// [`ts_cache`](Self::ts_cache) or committed read ceiling has already
     /// served for `keys` (ADR 0018 §2/PR2b, amended by the `mint_pushed`
@@ -4495,11 +4583,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     ) -> Option<HlcTimestamp> {
         let (result, ts) = self.propose_ordered_aux(|_term| {
             let ts = self.mint_at_least(min_ts);
-            let cmd = KvCommand::TxnCommit {
-                txn_id: txn_id.clone(),
-                record_key: record_key.clone(),
-                ts,
-            };
+            let cmd = self.txn_commit_cmd(txn_id.clone(), record_key.clone(), ts);
             (cmd, ts)
         });
         let index = match result {
@@ -4528,12 +4612,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     pub async fn txn_abort(&self, txn_id: TxnId, record_key: Vec<u8>) -> Option<HlcTimestamp> {
         let (result, ts) = self.propose_ordered_aux(|term| {
             let ts = self.mint_pushed(term, std::slice::from_ref(&record_key));
-            let cmd = KvCommand::TxnAbort {
-                txn_id: txn_id.clone(),
-                record_key: record_key.clone(),
-                ts,
-                orphan_created_ts: None,
-            };
+            let cmd = self.txn_abort_cmd(txn_id.clone(), record_key.clone(), ts, None);
             (cmd, ts)
         });
         let index = match result {
@@ -4574,12 +4653,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     ) -> Option<HlcTimestamp> {
         let (result, ts) = self.propose_ordered_aux(|term| {
             let ts = self.mint_pushed(term, std::slice::from_ref(&record_key));
-            let cmd = KvCommand::TxnAbort {
-                txn_id: txn_id.clone(),
-                record_key: record_key.clone(),
-                ts,
-                orphan_created_ts: Some(created_ts),
-            };
+            let cmd = self.txn_abort_cmd(txn_id.clone(), record_key.clone(), ts, Some(created_ts));
             (cmd, ts)
         });
         let index = match result {
@@ -4680,18 +4754,9 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let (decide_result, decision_ts) = self.propose_ordered_aux(|term| {
             let ts = self.mint_pushed(term, std::slice::from_ref(&record_key));
             let cmd = if commit {
-                KvCommand::TxnCommit {
-                    txn_id: txn_id.clone(),
-                    record_key: record_key.clone(),
-                    ts,
-                }
+                self.txn_commit_cmd(txn_id.clone(), record_key.clone(), ts)
             } else {
-                KvCommand::TxnAbort {
-                    txn_id: txn_id.clone(),
-                    record_key: record_key.clone(),
-                    ts,
-                    orphan_created_ts: None,
-                }
+                self.txn_abort_cmd(txn_id.clone(), record_key.clone(), ts, None)
             };
             (cmd, ts)
         });
@@ -8145,6 +8210,8 @@ fn kv_command_variant_name(c: &KvCommand) -> &'static str {
         KvCommand::TxnStage { .. } => "TxnStage",
         KvCommand::TxnCommit { .. } => "TxnCommit",
         KvCommand::TxnAbort { .. } => "TxnAbort",
+        KvCommand::TxnCommitSealChecked { .. } => "TxnCommitSealChecked",
+        KvCommand::TxnAbortSealChecked { .. } => "TxnAbortSealChecked",
         KvCommand::TxnResolve { .. } => "TxnResolve",
         KvCommand::NoOp => "NoOp",
     }
@@ -10653,26 +10720,27 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     .outcomes
                     .insert(index, (term, outcome));
             }
-            // R-01 F-2 (fourth mechanism): a txn DECISION whose record key falls
-            // in a range this group has already sealed (the whole-range seal a
-            // `Freeze` or the in-place `SplitTablet` fork applies) is a
-            // deterministic no-op, exactly like every other mutating arm. This
-            // was the one arm missing the check, and it is not harmless: the
-            // children of a fork are cloned from the parent's CURRENT engine by
-            // the host reconciler, asynchronously and per replica, so a decision
-            // ordered after the fork entry landed in the clone of the replicas
-            // that cloned late and not in the others -- replica-divergent
-            // children, plus an acked commit the record's real owner never saw
-            // (its participants' intents then never resolved and the keys
-            // reverted to their prior values). The proposer's own post-decide
-            // status read sees the record still `Pending` on the frozen group and
-            // re-routes the SAME decision to the child that now owns the record
-            // (`txn_decide_anchor_retrying`). Apply stays a pure function of the
-            // entry and the state machine (ADR 0073 "apply never branches on a
-            // gate"); no new variant is needed, since the sealed window is the
-            // one place the old behaviour was replica-dependent.
-            KvCommand::TxnCommit { record_key, ts, .. }
-            | KvCommand::TxnAbort { record_key, ts, .. }
+            // R-01 F-2 (fourth mechanism): a SEAL-CHECKED txn DECISION whose
+            // record key falls in a range this group has already sealed (the
+            // whole-range seal a `Freeze` or the in-place `SplitTablet` fork
+            // applies) is a deterministic no-op, exactly like every other
+            // mutating arm. The legacy `TxnCommit`/`TxnAbort` arms below stay
+            // seal-blind on purpose (ADR 0073: apply never branches on a gate;
+            // an entry an older binary committed replays identically).
+            //
+            // The check is not harmless to omit: the children of a fork are
+            // cloned from the parent's CURRENT engine by the host reconciler,
+            // asynchronously and per replica, so a decision ordered after the
+            // fork entry landed in the clone of the replicas that cloned late
+            // and not in the others -- replica-divergent children, plus an
+            // acked commit the record's real owner never saw (its participants'
+            // intents then never resolved and the keys reverted to their prior
+            // values). The proposer's own post-decide status read sees the
+            // record still `Pending` on the frozen group and re-routes the SAME
+            // decision to the child that now owns the record
+            // (`txn_decide_anchor_retrying`).
+            KvCommand::TxnCommitSealChecked { record_key, ts, .. }
+            | KvCommand::TxnAbortSealChecked { record_key, ts, .. }
                 if is_sealed(sealed, &record_key) =>
             {
                 assert_ts_monotonic(
@@ -10685,6 +10753,11 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 );
             }
             KvCommand::TxnCommit {
+                txn_id,
+                record_key,
+                ts,
+            }
+            | KvCommand::TxnCommitSealChecked {
                 txn_id,
                 record_key,
                 ts,
@@ -10820,6 +10893,12 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 }
             }
             KvCommand::TxnAbort {
+                txn_id,
+                record_key,
+                ts,
+                orphan_created_ts,
+            }
+            | KvCommand::TxnAbortSealChecked {
                 txn_id,
                 record_key,
                 ts,
@@ -12554,6 +12633,8 @@ fn command_ts(command: &KvCommand) -> Option<HlcTimestamp> {
         | KvCommand::TxnStage { ts, .. }
         | KvCommand::TxnCommit { ts, .. }
         | KvCommand::TxnAbort { ts, .. }
+        | KvCommand::TxnCommitSealChecked { ts, .. }
+        | KvCommand::TxnAbortSealChecked { ts, .. }
         | KvCommand::TxnResolve { ts, .. } => Some(*ts),
         KvCommand::NoOp => None,
     }

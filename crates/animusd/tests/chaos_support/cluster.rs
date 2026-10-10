@@ -15,7 +15,7 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::task::JoinHandle;
 
-use super::client::http_get;
+use super::client::{http_get, http_post};
 use super::proxy::{Faults, PortKind, spawn_proxy};
 
 /// Ports per node, in `ClusterConfig::generate`'s order.
@@ -161,6 +161,44 @@ impl ChaosCluster {
 
     pub fn dynamo_addr(&self, i: usize) -> SocketAddr {
         self.port(i, PORT_DYNAMO)
+    }
+
+    /// Raise the cluster version to this binary's `MAX_SUPPORTED`, one
+    /// finalize step at a time against whichever node is the control leader
+    /// (ADR 0073 Phase 2: a fresh cluster stays at version 1 until an operator
+    /// finalizes). Every version-gated apply behaviour (e.g. the seal-checked
+    /// txn decisions, `Gate::TxnSealChecked`) is closed below its gate, so a
+    /// chaos run that wants to exercise the shipped fixes must open them
+    /// first. Panics if the target is not reached in `budget`.
+    pub async fn finalize_cluster_version(&self, budget: Duration) {
+        let target = u64::from(animus_control::version::MAX_SUPPORTED);
+        let t0 = tokio::time::Instant::now();
+        let mut active = 1u64;
+        while active < target {
+            assert!(
+                t0.elapsed() < budget,
+                "chaos bring-up: cluster version stuck at {active}, wanted {target}"
+            );
+            for i in 0..self.n {
+                let r = http_post(
+                    self.admin_addr(i),
+                    "/admin/cluster-version/finalize",
+                    "{}",
+                    Duration::from_secs(5),
+                )
+                .await;
+                if let Ok((200, body)) = r {
+                    if let Some(a) = serde_json::from_str::<Value>(&body)
+                        .ok()
+                        .and_then(|v| v["active"].as_u64())
+                    {
+                        active = a;
+                    }
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
     }
 
     pub fn admin_addr(&self, i: usize) -> SocketAddr {

@@ -3333,13 +3333,17 @@ mod gsi_drain_cursor_tests {
                 split_key.len()
             );
 
-            // R-01 F-2: every split key is now rounded to its token boundary
-            // (`decide::align_split_key`), so a non-token-aligned boundary only
-            // survives where the range holds a SINGLE token (the raw key is
-            // kept there so one hot partition can still split by sort key).
-            // Build exactly that range: cut at the row's token `T`, then at
-            // `T+1`, leaving a child `[T, T+1)`, and finally split THAT child
-            // at the row's own (longer, non-aligned) physical key.
+            // R-01: every split key is rounded to its token boundary
+            // (`decide::align_split_key`) and a range holding a single token is
+            // never split, so the client/admin split paths can no longer
+            // produce a non-token-aligned boundary at all. Tablets split by an
+            // older binary can still hold one (their `range.start` is longer
+            // than `TOKEN_BYTES`), and that is exactly the shape this issue's
+            // cursor bookkeeping must handle: cut at the row's token `T` and at
+            // `T+1` through the real split path, then propose the final
+            // `BeginSplitInPlace` at the row's own (longer, non-aligned)
+            // physical key straight to the control group, bypassing the
+            // proposer-side alignment, as an older binary's split would have.
             let token: [u8; TOKEN_BYTES] = split_key[..TOKEN_BYTES].try_into().expect("token");
             let next_token = (u64::from_be_bytes(token) + 1).to_be_bytes();
             let cut = |node: &Node, key: &[u8]| -> TabletId {
@@ -3351,7 +3355,7 @@ mod gsi_drain_cursor_tests {
                     .expect("a tablet owns the key")
                     .0
             };
-            for (n, at) in [token.to_vec(), next_token.to_vec(), split_key.clone()]
+            for (n, at) in [token.to_vec(), next_token.to_vec()]
                 .into_iter()
                 .enumerate()
             {
@@ -3360,6 +3364,29 @@ mod gsi_drain_cursor_tests {
                 split(client_addr, parent, at).await;
                 await_true(20, "split produced a further tablet", || {
                     tablets_of(&node, table).len() == expected_tablets
+                })
+                .await;
+            }
+            {
+                let parent = cut(&node, &split_key);
+                let m = node.metadata();
+                let t = &m.tablets[&parent];
+                let left_id = m.next_free_tablet_id();
+                let right_id = TabletId(left_id.0 + 1);
+                assert!(
+                    node.propose_meta(MetaCommand::BeginSplitInPlace {
+                        parent,
+                        expected_epoch: t.epoch,
+                        split_key: split_key.clone(),
+                        children: [
+                            (left_id, t.replicas.clone()),
+                            (right_id, t.replicas.clone()),
+                        ],
+                    }),
+                    "the single node leads the control group"
+                );
+                await_true(20, "raw split produced a further tablet", || {
+                    tablets_of(&node, table).len() == 4
                 })
                 .await;
             }

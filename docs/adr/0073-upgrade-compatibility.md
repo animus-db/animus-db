@@ -2268,7 +2268,7 @@ arm.
 |---|---|---|
 | `MetaCommand` (50) | `impl GatedCommand`, `animus-control/src/meta.rs` | `Base` for 48; `Era` for `ReportNodeVersion`, `FinalizeClusterVersion` |
 | `RaftMsg<C>` (16) | `envelope_gate` (unbounded impl) + `required_gate` (separate `C: GatedCommand` impl), `raft.rs` | `AppendEntries` = join over `entries[].command` (a no-op or config entry still carries a command, gated like any other); `InstallSnapshot` data is opaque, its content is gated by its image encoder |
-| `KvCommand` (16), `KvWire` (4) | `animus-cp-data/src/gates.rs` | all `Base`; `KvWire` recurses into `Raft` and `HeartbeatBatch` |
+| `KvCommand` (16, now 18), `KvWire` (4) | `animus-cp-data/src/gates.rs` | `Base` except MREC content (`MrecReplication`) and the seal-checked txn decisions (`TxnSealChecked`, 2026-10-09); `KvWire` recurses into `Raft` and `HeartbeatBatch` |
 | `ClientRequest` (30), `ClientResponse` (19) | `animus-node/src/wire.rs` | `ProposeSchema(cmd)` takes `cmd`'s gate, `Forwarded` recurses; responses all `Base` (`Status`/`JoinInfo`/`MetadataDelta` carry `Metadata`/mirror writes, whose content is gated by additive skipped-at-default fields and era-only entity kinds) |
 
 The bounded impl is separate on purpose: `RaftCore<C, S>` and the toy commands in
@@ -3422,3 +3422,38 @@ while closed and tag 2 once open, and an abort restores the committed value on
 every replica in both). Mutation: `ship_v1_intents = false` fails the closed
 cells (follower holds tag 2); dropping the prior row fails the closed abort.
 The real-process proof is the P3-E job with `ANIMUS_UPGRADE_FROM_TXN=1`.
+
+## Amendment 2026-10-09 — the third real gate: `Gate::TxnSealChecked`, `MAX_SUPPORTED = 4` (R-01)
+
+`MAX_SUPPORTED` is now **4** and `Gate::TxnSealChecked` (version 4) gates the
+seal-checked txn decision variants `KvCommand::{TxnCommitSealChecked,
+TxnAbortSealChecked}` (ADR 0018's 2026-10-09 amendment). It is the first gate
+whose reason is a **changed apply behaviour** rather than a new surface: #1233
+had made a decision on an already-sealed range a no-op in the existing
+`TxnCommit`/`TxnAbort` arms, which would make old and new replicas disagree on
+the same committed entry. Decision 4 (apply never branches on a gate) therefore
+rules out gating the arm; the behaviour moved into new variants and the legacy
+arms were restored to their original semantics for good.
+
+| New shape | Class | Gate | Emit-site / propose-site check |
+|---|---|---|---|
+| `KvCommand::TxnCommitSealChecked`, `TxnAbortSealChecked` | G (new variant, changed apply) | `TxnSealChecked` | exhaustive `KvCommand::required_gate` rows; `gated_propose`; the group's proposer helpers (`txn_commit_cmd`/`txn_abort_cmd`) pick the legacy variant while the gate is closed |
+
+- `MIN_SUPPORTED` stays 1 (see the 2026-10-05 amendment). `BinaryProfile::
+  Release(4)` is `[3, 4]` in the simulated model; the per-gate acceptance matrix
+  gained a `Release(4)` column.
+- **Fixtures (new, none edited):** `raftkv-wire/v1-txnseal.bin`,
+  `raftkv-wal/v2-txnseal.bin` (shaped, like the MREC ones). No version tag moved
+  (additive variants inside wire v1 / WAL v2), so the checklist's bump / legacy
+  decoder / legacy encoder steps do not apply; the legacy variants' decoding is
+  unchanged and still covered by the existing v1/v2 fixtures.
+- **Cell.** `sim_cluster_mixed_version_corpus::release3_to_release4_txn_seal_gate`
+  (cluster tier): at cluster version 3, and with most nodes already `Release(4)`
+  and the finalize refused by name, a decision on a frozen group applies as it
+  always did and the replicas agree byte for byte; after the finalize to 4 the same
+  decision is a sealed no-op and the replicas agree. Mutation checked: ignoring
+  the gate at the proposer fails the cell. The unit tier is `split_tablet::`
+  `a_txn_decision_ordered_after_the_fork_is_a_sealed_no_op` /
+  `below_the_gate_a_txn_decision_after_the_fork_applies_as_it_always_did`.
+- The chaos harness (`animusd/tests/chaos_support`) finalizes the cluster to
+  `MAX_SUPPORTED` at bring-up, because a fresh cluster starts at version 1.

@@ -445,11 +445,12 @@ pub enum Metric {
     // ClientCtx::trigger_split` — the single choke point every split
     // proposer (auto-split, `POST /admin/tablet/split`,
     // `ClientRequest::SplitTablet`) funnels through.
-    /// A streamed table's split key rounded down (F11) onto the target
-    /// tablet's own `range.start` — a single very-hot partition token that
-    /// owns the tablet's entire range, which can never legally split
-    /// without breaking the per-token affinity F11 exists to protect (ADR
-    /// 0042 §14 Fork E, the accepted single-token hot-partition limit).
+    /// A split key that cannot be made a legal interior token boundary —
+    /// the target tablet's range holds a single very-hot partition token,
+    /// which can never legally split without breaking the per-token affinity
+    /// F11 exists to protect (ADR 0042 §14 Fork E, the accepted
+    /// single-token hot-partition limit; applies to **every** table since
+    /// R-01, ADR 0018's 2026-10-09 amendment — the name is historical).
     /// Counts the skip, not an error: `trigger_split` returns immediately
     /// (no propose attempt) and `auto_split_loop` matches this specific
     /// outcome to skip its own "split did not commit" warning, which would
