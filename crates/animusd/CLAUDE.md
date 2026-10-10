@@ -12429,3 +12429,17 @@ node, a bad index, a missing/empty WAL, and a node that is not a voter in its ow
 WAL. WAL path is `<dir>/internal/raft.wal` (`--encryption-key` as for the node).
 Tests: `cargo test -p animusd --lib control_recover`. Runbook:
 `docs/runbook/control-plane-quorum-loss.md`.
+
+## PITR retention and seal age (issue #1275, ADR 0059 amendment 2026-10-10)
+
+`cluster_settings.pitr_retention_days` (default 35, `1..=35`) and
+`cluster_settings.pitr_seal_age_secs` (default 300) are config-file-only,
+node-local (ADR 0073 class L) knobs. `ClusterSettings::validate_pitr` runs at
+config load and in `resolve_cluster_settings`. Seal age rides in
+`StreamSealKnobs::pitr_seal_age` (read by `index_drain::pitr_tick`, not the
+Streams `seal_age`); retention rides in `StreamSealKnobs::pitr_retention` into
+`AdminInfo::pitr_retention`, which `dynamo.rs` reads (`ctx.admin`) and the two
+`pitr_janitor_loop` spawn sites use; `start_control_with` /
+`run_node_control_with_stores` take it as a parameter (control-only has no
+seal knobs). A new `StreamSealKnobs { .. }` literal needs `..Default::default()`
+(or all four fields in a `const`).

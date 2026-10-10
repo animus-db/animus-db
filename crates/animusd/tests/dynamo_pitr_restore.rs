@@ -35,6 +35,8 @@ mod support;
 const TEST_SEAL_KNOBS: StreamSealKnobs = StreamSealKnobs {
     seal_bytes: 200,
     seal_age: Duration::from_secs(3600),
+    pitr_seal_age: Duration::from_secs(3600),
+    pitr_retention: Duration::from_secs(35 * 24 * 60 * 60),
 };
 
 /// Bring up a single node with [`TEST_SEAL_KNOBS`] and a tiny PITR periodic
