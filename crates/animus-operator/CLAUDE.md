@@ -356,7 +356,15 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
   internal.{ns}.svc.cluster.local:{admin_port}`), the same address
   `RoleAddrs::advertise_host` carries — reusing it here rather than reading
   a pod IP keeps the drain sequence correct across a pod restart mid-drain
-  (the DNS name is stable; a pod IP is not).
+  (the DNS name is stable; a pod IP is not). **Drain, drain-status and
+  remove are sent to the control-plane leader, not the departing pod**
+  (issue #1177): `/admin/drain` and `/admin/member/remove` are local-leader-
+  only and not relayed, so a follower answers 409 "not the control-plane
+  leader" (with no usable address hint from a `Local` control handle).
+  `leader_request` therefore tries the departing pod first, then every other
+  running pod, rotating only on that refusal and pinning whichever accepts
+  for the rest of the sequence. `FakeAdminClient` refuses leader-only POSTs
+  at any ordinal but its `set_control_leader` (default 0) the same way.
 - **No finalizer in v1** (`controller.rs`'s own module doc): deletion relies
   entirely on Kubernetes GC following the `controller: true` owner
   references every child carries. There is nothing external an

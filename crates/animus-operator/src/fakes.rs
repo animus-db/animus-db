@@ -371,6 +371,16 @@ pub struct FakeAdminClient {
     drain_status_responses: Mutex<VecDeque<Value>>,
     fail_drain: Mutex<bool>,
     fail_remove: Mutex<bool>,
+    /// Issue #1177: the ordinal currently acting as control-plane leader
+    /// (default `0`). Like the real `animusd`, `POST .../admin/drain` and
+    /// `POST .../admin/member/remove` are local-leader-only and not relayed:
+    /// dialed at any other ordinal they answer the real 409 "not the
+    /// control-plane leader" refusal.
+    control_leader: Mutex<i32>,
+    /// URLs of leader-only POSTs refused because the dialed ordinal was not
+    /// the leader. Deliberately kept out of `calls`/`post_bodies`, which
+    /// record only requests the (fake) leader accepted.
+    refused_leader_posts: Mutex<Vec<String>>,
     /// Issue #853: which ordinals' `POST .../admin/drain` calls fail —
     /// `fail_drain`'s per-ordinal equivalent, letting a test express
     /// "ordinals above N drain fine, N itself never finishes" so the
@@ -466,6 +476,17 @@ impl FakeAdminClient {
     /// succeed) before failing on this one.
     pub fn fail_drain_for_ordinal(&self, ordinal: i32) {
         self.fail_drain_ordinals.lock().unwrap().insert(ordinal);
+    }
+
+    /// URLs of leader-only POSTs refused as "not the control-plane leader".
+    pub fn refused_leader_posts(&self) -> Vec<String> {
+        self.refused_leader_posts.lock().unwrap().clone()
+    }
+
+    /// Make `ordinal` the control-plane leader (default `0`); see the
+    /// `control_leader` field.
+    pub fn set_control_leader(&self, ordinal: i32) {
+        *self.control_leader.lock().unwrap() = ordinal;
     }
 
     /// Make every future `POST .../admin/member/remove` call fail.
@@ -591,6 +612,21 @@ impl AdminOps for FakeAdminClient {
         body: &Value,
         _ca_pem: Option<&[u8]>,
     ) -> Result<Value, String> {
+        let leader_only = url.contains("/admin/member/remove") || url.contains("/admin/drain");
+        if leader_only
+            && let Some(o) = ordinal_from_url(url)
+            && o != *self.control_leader.lock().unwrap()
+        {
+            self.refused_leader_posts
+                .lock()
+                .unwrap()
+                .push(url.to_string());
+            return Err(
+                "admin endpoint returned status 409: {\"error\":\"this node is not \
+                 the control-plane leader; retry on the leader\"} (fake)"
+                    .to_string(),
+            );
+        }
         self.calls
             .lock()
             .unwrap()
@@ -645,7 +681,11 @@ impl AdminOps for FakeAdminClient {
                 return Err("remove failed (fake)".to_string());
             }
         } else if *self.fail_drain.lock().unwrap()
-            || ordinal_from_url(url)
+            // Keyed on the drained *node* (request body), not the dialed pod:
+            // since issue #1177 the drain is sent to the control leader.
+            || body["node"]
+                .as_str()
+                .and_then(|n| n.rsplit_once('-')?.1.parse::<i32>().ok())
                 .is_some_and(|o| self.fail_drain_ordinals.lock().unwrap().contains(&o))
         {
             return Err("drain failed (fake)".to_string());
