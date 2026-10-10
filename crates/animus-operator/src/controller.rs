@@ -1555,37 +1555,62 @@ fn classify_ready_route(answer: &Result<serde_json::Value, String>) -> ReadyRout
 }
 
 /// The pure decision of the observed switch. `live` is the readiness path
-/// currently in the live `StatefulSet` (`None`: no `StatefulSet` yet, which
-/// starts on the conservative path), which is also the persisted state: it
-/// survives operator restarts with no status field.
+/// currently in the live `StatefulSet`, which is also the persisted state: it
+/// survives operator restarts with no status field. `None` (no `StatefulSet`
+/// yet, a fresh cluster) starts on `/admin/ready`, so a new cluster never pays
+/// a second roll to flip; a fresh cluster on an old image is corrected by the
+/// `404` rule below ([`revert_is_ungated`] makes that revert land).
 ///
 /// - any pod answers `404` -> `/admin/health` (also reverts after an image
 ///   revert);
 /// - every pod answers (`Present`) -> `/admin/ready`, but only when no roll
 ///   is in flight (a flip mid-roll would re-target it), otherwise `live`;
-/// - anything else (a pod unreachable, not yet created) -> keep `live`.
+/// - anything else (a pod unreachable, not yet created) -> keep `live`
+///   (`/admin/ready` when there is none).
 pub(crate) fn pick_readiness_path(
     live: Option<&str>,
+    fresh: bool,
     routes: &[ReadyRoute],
     roll_in_flight: bool,
 ) -> &'static str {
     use desired::statefulset::{READINESS_PATH_HEALTH, READINESS_PATH_READY};
+    if routes.contains(&ReadyRoute::Absent) {
+        return READINESS_PATH_HEALTH;
+    }
+    if fresh {
+        return READINESS_PATH_READY;
+    }
     let keep = if live == Some(READINESS_PATH_READY) {
         READINESS_PATH_READY
     } else {
         READINESS_PATH_HEALTH
     };
-    if routes.contains(&ReadyRoute::Absent) {
-        return READINESS_PATH_HEALTH;
-    }
-    if live.is_some()
-        && !roll_in_flight
-        && !routes.is_empty()
-        && routes.iter().all(|r| *r == ReadyRoute::Present)
-    {
+    if !roll_in_flight && !routes.is_empty() && routes.iter().all(|r| *r == ReadyRoute::Present) {
         return READINESS_PATH_READY;
     }
     keep
+}
+
+/// Whether a switch from the live `/admin/ready` back to `/admin/health` may
+/// bypass the roll gate: only when it is the *only* template difference, no
+/// roll is in flight, and no pod of the live `StatefulSet` is Ready, so there
+/// is no availability to protect. This is what makes a fresh cluster on an old
+/// image (pods unready on a 404 probe) recover: the gate itself cannot help
+/// there (`roll::Stage::Start` can be refused by the PDB start gate on a
+/// small cluster, and `Drive` needs Ready pods to observe), so going through
+/// it would wedge the cluster on a probe no pod can pass.
+fn revert_is_ungated(live: &StatefulSet, only_probe_differs: bool, chosen: &str) -> bool {
+    use desired::statefulset::{READINESS_PATH_HEALTH, READINESS_PATH_READY};
+    only_probe_differs
+        && chosen == READINESS_PATH_HEALTH
+        && desired::statefulset::readiness_path_of(live).as_deref() == Some(READINESS_PATH_READY)
+        && live
+            .status
+            .as_ref()
+            .and_then(|s| s.ready_replicas)
+            .unwrap_or(0)
+            == 0
+        && !roll::StsView::of(live, live).roll_in_flight()
 }
 
 /// Observe every pod's `GET /admin/ready` and pick the `readinessProbe` path
@@ -1622,7 +1647,7 @@ async fn decide_readiness_path<C: ClusterApi, A: AdminOps>(
         async move { classify_ready_route(&ctx.admin.get_json(&url, tls_ca).await) }
     }))
     .await;
-    pick_readiness_path(live_path.as_deref(), &routes, in_flight)
+    pick_readiness_path(live_path.as_deref(), live.is_none(), &routes, in_flight)
 }
 
 async fn finish_reconcile<C: ClusterApi, A: AdminOps>(
@@ -1655,16 +1680,35 @@ async fn finish_reconcile<C: ClusterApi, A: AdminOps>(
     } else {
         None
     };
-    let roll_out = roll::step(
-        ctx,
-        cluster,
-        ns,
-        &sts,
-        live_sts.as_ref(),
-        tls_ca.as_deref(),
-        &mut status,
-    )
-    .await?;
+    // A probe-only revert to `/admin/health` on a cluster with no Ready pod
+    // bypasses the roll gate (see `revert_is_ungated`).
+    let ungated_revert = live_sts.as_ref().is_some_and(|l| {
+        let at_live_path = desired::statefulset::build_with_readiness(
+            cluster,
+            &cluster.spec,
+            0,
+            desired::statefulset::readiness_path_of_or_default(Some(l)),
+        );
+        revert_is_ungated(l, !roll::template_changed(l, &at_live_path), readiness_path)
+    });
+    let roll_out = if ungated_revert {
+        warn!(cluster = %name, "no pod serves /admin/ready and none is Ready: reverting readinessProbe to /admin/health without a roll gate");
+        roll::StepOut {
+            partition: 0,
+            active: true,
+        }
+    } else {
+        roll::step(
+            ctx,
+            cluster,
+            ns,
+            &sts,
+            live_sts.as_ref(),
+            tls_ca.as_deref(),
+            &mut status,
+        )
+        .await?
+    };
     desired::statefulset::set_partition(&mut sts, roll_out.partition);
 
     let applied_sts =
@@ -4572,10 +4616,39 @@ mod readiness_switch_tests {
     }
 
     #[tokio::test]
-    async fn a_fresh_cluster_starts_on_health() {
+    async fn a_fresh_cluster_starts_on_ready_and_reverts_on_a_404() {
         let ctx = ctx();
-        script_all(&ctx, [Ok(()), Ok(()), Ok(())]);
+        // Pods do not exist yet: no information, start on /admin/ready.
+        script_all(&ctx, [Err("connection refused"); 3]);
+        assert_eq!(decide(&ctx, None).await, READINESS_PATH_READY);
+        // A fresh cluster on an old image: the pods answer 404.
+        script_all(&ctx, [Err(NOT_FOUND), Err(NOT_FOUND), Err(NOT_FOUND)]);
         assert_eq!(decide(&ctx, None).await, READINESS_PATH_HEALTH);
+    }
+
+    fn live_with(ready: Option<i32>, path: &str) -> StatefulSet {
+        let cluster = test_cluster("c", "ns", 3, None);
+        let mut sts = build_with_readiness(&cluster, &cluster.spec, 0, path);
+        sts.status = Some(k8s_openapi::api::apps::v1::StatefulSetStatus {
+            ready_replicas: ready,
+            ..Default::default()
+        });
+        sts
+    }
+
+    #[test]
+    fn the_revert_bypasses_the_gate_only_with_no_ready_pod_and_a_probe_only_change() {
+        let unready = live_with(Some(0), READINESS_PATH_READY);
+        assert!(revert_is_ungated(&unready, true, READINESS_PATH_HEALTH));
+        // A Ready pod means there is availability to protect: gated.
+        let one_ready = live_with(Some(1), READINESS_PATH_READY);
+        assert!(!revert_is_ungated(&one_ready, true, READINESS_PATH_HEALTH));
+        // Anything else differing (an image edit) keeps the gate.
+        assert!(!revert_is_ungated(&unready, false, READINESS_PATH_HEALTH));
+        // Only the ready -> health direction is ever ungated.
+        let on_health = live_with(Some(0), READINESS_PATH_HEALTH);
+        assert!(!revert_is_ungated(&on_health, true, READINESS_PATH_READY));
+        assert!(!revert_is_ungated(&on_health, true, READINESS_PATH_HEALTH));
     }
 
     #[tokio::test]
@@ -4606,11 +4679,11 @@ mod readiness_switch_tests {
     fn a_roll_in_flight_defers_the_flip_but_not_the_revert() {
         use ReadyRoute::{Absent, Present};
         assert_eq!(
-            pick_readiness_path(Some(READINESS_PATH_HEALTH), &[Present; 3], true),
+            pick_readiness_path(Some(READINESS_PATH_HEALTH), false, &[Present; 3], true),
             READINESS_PATH_HEALTH
         );
         assert_eq!(
-            pick_readiness_path(Some(READINESS_PATH_READY), &[Present, Absent], true),
+            pick_readiness_path(Some(READINESS_PATH_READY), false, &[Present, Absent], true),
             READINESS_PATH_HEALTH
         );
     }

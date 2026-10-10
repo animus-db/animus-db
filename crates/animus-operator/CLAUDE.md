@@ -426,11 +426,14 @@ client `-dynamo` Service. A previous-release `animusd` 404s on it, so
 `controller::decide_readiness_path` probes `/admin/ready` on every pod each
 reconcile (`200`/`503` = route exists, `404` = old binary; `pick_readiness_path`
 is the pure decision): any 404 -> `/admin/health`; all pods answer ->
-`/admin/ready`; unreachable/missing pods keep the live path. The live
+`/admin/ready`; unreachable/missing pods keep the live path; a fresh cluster (no
+StatefulSet) starts on `/admin/ready` (no extra roll after bootstrap; a 404
+reverts it, and `revert_is_ungated` lets that one revert skip the roll gate
+when it is the only template change and no pod is Ready, since the gate cannot
+progress on a cluster whose pods are NotReady on the probe). The live
 StatefulSet's probe path is the persisted state (no status field). A flip is a
 pod-template change and goes through the roll gate; the flip to ready waits for
-no roll in flight, the revert on a 404 does not. A fresh cluster starts on
-`/admin/health`. `FakeAdminClient` answers 404 for `/admin/ready` unless
+no roll in flight, the revert on a 404 does not. `FakeAdminClient` answers 404 for `/admin/ready` unless
 scripted. Liveness stays `/admin/live`. The text below describes the original
 `/admin/health` readiness and still explains why liveness must differ.
 

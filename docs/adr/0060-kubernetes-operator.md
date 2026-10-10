@@ -2031,13 +2031,27 @@ the cluster (`controller::decide_readiness_path`; `200` and `503` both mean the
 route exists, `404` an old binary) and picks the path: any `404` ->
 `/admin/health`; every pod answers -> `/admin/ready`; anything else (a pod
 unreachable or not yet created) keeps the path in the live StatefulSet. A new
-cluster starts on `/admin/health`. The live StatefulSet's own probe path is the
+cluster (no StatefulSet yet) starts directly on `/admin/ready`, so it never
+pays a second roll just to flip (an earlier draft started on `/admin/health`
+and flipped after bootstrap; the extra full roll killed the e2e port-forward and
+is a real product cost). If the image turns out to be old, its pods answer 404
+and the rule above reverts the path. That revert **bypasses the roll gate**
+when it is the only template difference, no roll is in flight and no pod is
+Ready (`controller::revert_is_ungated`): through the gate it could wedge, since
+`Stage::Start` can be refused by the PDB start gate on a small cluster and
+`Drive` needs Ready pods to observe, while the pods are NotReady precisely
+because they 404 on the probe. With `podManagementPolicy: Parallel` all pods
+exist at once and the StatefulSet controller replaces old-revision pods one at a
+time (deleting an unhealthy old-revision pod is allowed), each recovering on
+`/admin/health`. With any Ready pod the revert stays gated like any other
+template change. The live StatefulSet's own probe path is the
 persisted state (no status field, no CRD change), so it survives operator
 restarts. The path is part of the pod template, so flipping it is an ordinary
 template change that goes through the `animus-roll` gate. The flip to
 `/admin/ready` is deferred while a roll is in flight (it would re-target it);
 the revert to `/admin/health` on a `404` (e.g. an image revert) is not. Cost:
-once all pods serve the route, one extra gated roll flips the probe path. No
+an *existing* cluster upgraded to a release that serves the route pays one
+extra gated roll to flip the probe path; a new cluster does not. No
 "bump `spec.image` with the operator upgrade" step is needed.
 The e2e script's `/admin/health` waits are unchanged (they check a pod's own
 control-plane view, not Service membership).
