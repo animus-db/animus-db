@@ -38,6 +38,7 @@
 //! - `GET  /admin/metrics`             — the metrics snapshot as JSON, plus per-tablet `stream_change_rates` (ADR 0042 §14, growth PR3 Fork F) and `request_rates` (W-09, ADR 0034 amendment)
 //! - `GET  /admin/metrics/history`     — periodic snapshots, ~2h ring buffer (ADR 0021 sparklines)
 //! - `GET  /admin/health`              — readiness: 503 until the control plane has had a RECENT leader, and 503 for good once a consensus-loop task has panicked (`consensus_task_panics`, issue #1220) (`leader_within` hysteresis, issue #595) — the Kubernetes readiness probe (ADR 0060)
+//! - `GET  /admin/ready`               — data-plane readiness (issue #1274): 200 when this node can serve the DynamoDB wire, i.e. it has synced `Metadata` at least once and no consensus-loop task has panicked; deliberately NOT gated on a recent control-plane leader (`control_leader_recent` is a diagnostic only). The operator's `readinessProbe`; `/admin/health` keeps the stricter control-leader semantics
 //! - `GET  /admin/live`                — liveness: 200 whenever this admin server can answer at all, independent of control-leader knowledge, hosting, or role — the Kubernetes liveness probe (ADR 0060's 2026-09-07 amendment, issue #710; `/admin/health` must never back a liveness probe, since a healthy joining process can go a full `advance_control_growth` reconcile cycle with no known leader)
 //! - `POST /admin/tablet/split`        — `{tablet, split_key}`
 //! - `POST /admin/stream/grow`         — `{table}` — split every tablet of a streamed table at its byte-weighted median (ADR 0042 §14, growth PR3)
@@ -567,6 +568,9 @@ impl AdminHost for ClientCtx {
     async fn live(&self) -> (u16, Value) {
         live(self)
     }
+    async fn ready(&self) -> (u16, Value) {
+        ready(self)
+    }
     async fn action_split(&self, body: &[u8]) -> (u16, Value) {
         action_split(self, body).await
     }
@@ -748,6 +752,9 @@ impl<E: Env, R: RelayClient> AdminHost for GenericAdminHost<E, R> {
     }
     async fn live(&self) -> (u16, Value) {
         live(&self.0)
+    }
+    async fn ready(&self) -> (u16, Value) {
+        ready(&self.0)
     }
     async fn action_split(&self, body: &[u8]) -> (u16, Value) {
         action_split(&self.0, body).await
@@ -2344,6 +2351,43 @@ fn live<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> (u16, Value) {
         "control_leader_recent": leader_recent,
     });
     (200, body)
+}
+
+/// `GET /admin/ready` (issue #1274): **data-plane readiness** -- `200` when
+/// this node can serve the DynamoDB wire, `503` otherwise. Unlike [`health`]
+/// it is NOT gated on a recent control-plane leader: the per-tablet Raft
+/// groups keep serving linearizable reads/writes through a control-plane
+/// quorum loss, and the client `Service` only routes to Ready pods, so
+/// gating readiness on the control leader removed every client endpoint for
+/// an outage that did not affect the data plane. What it does require: this
+/// node has a trustworthy view of `Metadata` (the tablet map and schemas the
+/// wire edge routes with: the same three-way signal the host reconciler's
+/// pre-recovery guard uses), and no consensus-loop task has panicked (issue
+/// #1220: only a restart repairs that). `control_leader_recent` is a pure
+/// diagnostic. `/admin/health` keeps its stricter semantics unchanged.
+fn ready<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> (u16, Value) {
+    let r = &ctx.control;
+    let health_grace = r.election_timeout() * HEALTH_LEADER_GRACE_ELECTION_TIMEOUTS;
+    let leader_recent = r.leader_within(health_grace).is_some();
+    let metadata_synced = r.last_applied() > 0
+        || r.has_synced_metadata()
+        || ctx
+            .remote_metadata
+            .lock()
+            .expect("remote metadata poisoned")
+            .is_some();
+    let consensus_task_panics = ctx
+        .env
+        .metrics()
+        .get(animus_env::metrics::Metric::ConsensusTaskPanics);
+    let ok = metadata_synced && consensus_task_panics == 0;
+    let body = json!({
+        "ok": ok,
+        "metadata_synced": metadata_synced,
+        "consensus_task_panics": consensus_task_panics,
+        "control_leader_recent": leader_recent,
+    });
+    (if ok { 200 } else { 503 }, body)
 }
 
 // ---- operator actions ---------------------------------------------------

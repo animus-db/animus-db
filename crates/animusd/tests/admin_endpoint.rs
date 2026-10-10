@@ -1620,3 +1620,64 @@ async fn admin_live_is_200_while_a_genuinely_leaderless_admin_health_is_503() {
     .await
     .expect("test timed out");
 }
+
+/// Issue #1274: `/admin/ready` (the Kubernetes readiness probe) must stay
+/// `200` on a node that has synced `Metadata` but lost its control-plane
+/// quorum, while `/admin/health` correctly goes `503`. Before this route the
+/// readiness probe was `/admin/health`, so a control-plane quorum loss
+/// removed every client endpoint although the tablet groups kept serving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_ready_is_200_while_leaderless_with_metadata() {
+    timeout(Duration::from_secs(60), async {
+        let dir = support::panic_safe_tempdir();
+        let (mut nodes, _config) = bring_up(3, dir.path()).await;
+        let survivor_addr = nodes[0].admin_addr();
+
+        // Converged: a leader exists and node 0 has applied metadata.
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let (h, _) = admin_get(survivor_addr, "/admin/health").await;
+                let (r, _) = admin_get(survivor_addr, "/admin/ready").await;
+                if h == 200 && r == 200 {
+                    return;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("a healthy 3-node cluster must report /admin/health and /admin/ready 200");
+
+        // Lose the control quorum: stop the other two voters.
+        let two = nodes.split_off(1);
+        for n in &two {
+            n.shutdown_graceful().await;
+        }
+
+        let health = timeout(Duration::from_secs(20), async {
+            loop {
+                let (s, body) = admin_get(survivor_addr, "/admin/health").await;
+                if s == 503 {
+                    return body;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("/admin/health must go 503 once the control quorum is lost");
+        assert_eq!(health["control_leader_recent"], false, "{health}");
+
+        let (s, ready) = admin_get(survivor_addr, "/admin/ready").await;
+        assert_eq!(
+            s, 200,
+            "readiness must not gate on a control leader: {ready}"
+        );
+        assert_eq!(ready["ok"], true, "{ready}");
+        assert_eq!(ready["metadata_synced"], true, "{ready}");
+        assert_eq!(ready["control_leader_recent"], false, "{ready}");
+        assert_eq!(ready["consensus_task_panics"], 0, "{ready}");
+
+        nodes[0].shutdown_graceful().await;
+    })
+    .await
+    .expect("test timed out");
+}

@@ -1,6 +1,7 @@
 //! The `StatefulSet` builder: one pod per node ordinal, running
 //! `entrypoint.sh` off the cluster `ConfigMap`, probed on the admin port —
-//! **`readinessProbe` on `GET /admin/health`, `livenessProbe` on
+//! **`readinessProbe` on `GET /admin/ready` (data-plane readiness, since
+//! 2026-10-10, issue #1274; was `/admin/health`), `livenessProbe` on
 //! `GET /admin/live`, deliberately different routes since 2026-09-07
 //! (issue #710; see [`admin_probe`]'s own doc for why)**. The probes'
 //! scheme follows `spec.tls`: HTTP when unset, HTTPS (unverified, as the
@@ -70,13 +71,18 @@ use super::{
 };
 use crate::crd::{AnimusCluster, AnimusClusterSpec};
 
-/// `readinessProbe`, on `GET /admin/health`: `periodSeconds: 5`,
-/// `failureThreshold: 3` — fast to pull a pod out of `Endpoints` (and
-/// therefore the client `Service`'s LB rotation) once its own
-/// `/admin/health` starts reporting no known control leader. Readiness is
-/// exactly the surface that route is *for* — a caller should not be routed
-/// to a node with no recent control leader — so gating it on that signal
-/// is correct and unchanged.
+/// `readinessProbe`, on `GET /admin/ready` (issue #1274, 2026-10-10):
+/// `periodSeconds: 5`, `failureThreshold: 3` — fast to pull a pod out of
+/// `Endpoints` (and therefore the client `Service`'s LB rotation) once the
+/// node can no longer serve the DynamoDB wire (no synced `Metadata`, or a
+/// panicked consensus task). It is deliberately NOT gated on a recent
+/// control-plane leader (that was `/admin/health`, the previous readiness
+/// route): the per-tablet Raft groups keep serving through a control-plane
+/// quorum loss, and gating on the leader removed every client endpoint.
+/// The path lands in the pod template together with `spec.image`, so a
+/// previous-release image (no `/admin/ready`) is only ever probed on
+/// `/admin/health` until the template is re-rendered; see ADR 0060's
+/// 2026-10-10 amendment for the operator-upgrade ordering caveat.
 const READINESS_PERIOD_SECS: i32 = 5;
 const READINESS_FAILURE_THRESHOLD: i32 = 3;
 /// `livenessProbe`, on `GET /admin/live` (issue #710, 2026-09-07 — see
@@ -272,7 +278,7 @@ const ENCRYPTION_KEY_SECRET_DEFAULT_MODE: i32 = 0o444;
 
 /// Builds one `HTTPGetAction`-based probe against the admin port at
 /// `path` — `readiness_probe` and `liveness_probe` below each call this
-/// with their own path (`/admin/health` and `/admin/live` respectively,
+/// with their own path (`/admin/ready` and `/admin/live` respectively,
 /// since issue #710's readiness/liveness split, 2026-09-07). Readiness
 /// legitimately depends on control-plane state (a node with no recent
 /// leader should not receive traffic); liveness must not — a distributed-
@@ -687,7 +693,7 @@ pub fn build_with_partition(
             .resources
             .clone()
             .or(Some(ResourceRequirements::default())),
-        readiness_probe: Some(admin_probe(admin_port, "/admin/health", tls_enabled, |p| {
+        readiness_probe: Some(admin_probe(admin_port, "/admin/ready", tls_enabled, |p| {
             p.period_seconds = Some(READINESS_PERIOD_SECS);
             p.failure_threshold = Some(READINESS_FAILURE_THRESHOLD);
         })),
@@ -975,7 +981,7 @@ mod tests {
         // SIGTERM it out from under an ordinary join.
         let readiness_path = readiness.http_get.as_ref().unwrap().path.as_deref();
         let liveness_path = liveness.http_get.as_ref().unwrap().path.as_deref();
-        assert_eq!(readiness_path, Some("/admin/health"));
+        assert_eq!(readiness_path, Some("/admin/ready"));
         assert_eq!(liveness_path, Some("/admin/live"));
         assert_ne!(
             readiness_path, liveness_path,
@@ -1403,7 +1409,7 @@ mod tests {
         // route split holds over TLS exactly as it does over plain HTTP.
         assert_eq!(
             readiness.http_get.as_ref().unwrap().path.as_deref(),
-            Some("/admin/health")
+            Some("/admin/ready")
         );
         assert_eq!(
             liveness.http_get.as_ref().unwrap().path.as_deref(),
@@ -1437,7 +1443,7 @@ mod tests {
         }
         assert_eq!(
             readiness.http_get.as_ref().unwrap().path.as_deref(),
-            Some("/admin/health")
+            Some("/admin/ready")
         );
         assert_eq!(
             liveness.http_get.as_ref().unwrap().path.as_deref(),

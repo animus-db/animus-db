@@ -418,6 +418,19 @@ non-default `kube-dns` namespace.
 
 ## Probes: readiness vs. liveness (issue #710, 2026-09-07)
 
+**Update 2026-10-10 (issue #1274): `readinessProbe` is now `GET /admin/ready`,
+not `/admin/health`.** `/admin/ready` is data-plane readiness (synced
+`Metadata`, no panicked consensus task) and is not gated on a control leader,
+so a control-plane quorum loss no longer empties the client `-dynamo` Service
+(it only routes to Ready pods). Liveness stays `/admin/live`. The probe path
+lives in the pod template next to `spec.image`, so it changes only when the
+template is re-rendered; **an operator upgrade re-renders it against whatever
+image `spec.image` still names, and a previous-release `animusd` has no
+`/admin/ready` (404, pod never Ready): bump `spec.image` to a release that has
+the route in the same edit as (or before) the operator upgrade.** The text
+below describes the original `/admin/health` readiness and still explains why
+liveness must differ.
+
 `desired::statefulset::admin_probe` builds both probes off one shared
 `HTTPGetAction` shape (port, TLS scheme) but takes an explicit `path`
 argument — **`readinessProbe` on `GET /admin/health`, `livenessProbe` on

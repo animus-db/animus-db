@@ -2015,3 +2015,19 @@ shipper health. Details, the `PeersSpecInvalid` refusal and the TLS and
 NetworkPolicy reasoning: ADR 0075's "G-e as built". `schemaVersion` stays 1;
 the golden fixture `v1-peers.json` was added.
 
+
+## Amendment (2026-10-10): readinessProbe moves to `/admin/ready` (issue #1274)
+
+The StatefulSet `readinessProbe` is now `GET /admin/ready` (ADR 0020's
+2026-10-10 amendment), no longer `/admin/health`; liveness stays `/admin/live`.
+A control-plane quorum loss therefore no longer marks every pod NotReady and
+empties the `{name}-dynamo` Service, since the data plane serves through it.
+Rolling-upgrade interaction: the probe path and `spec.image` are both in the
+pod template, so the new path reaches a pod only with a template re-render. A
+previous-release image lacks `/admin/ready`; upgrading the operator while
+`spec.image` still names such an image re-renders the template, and the rolled
+pod would 404 its readiness probe and never become Ready (the `animus-roll`
+gate then holds the roll at that pod, fail-safe but stuck). Bump `spec.image`
+to a release containing the route in the same edit as the operator upgrade.
+The e2e script's `/admin/health` waits are unchanged (they check a pod's own
+control-plane view, not Service membership).
