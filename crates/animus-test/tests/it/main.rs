@@ -5,6 +5,7 @@ mod backfill_fault_corpus;
 mod backup_fault_corpus;
 mod cycle_checker;
 mod export_import_fault_corpus;
+mod lsm_read_holds;
 mod negative_control;
 mod pitr_fault_corpus;
 mod raftkv_linearizable;

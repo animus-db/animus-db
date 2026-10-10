@@ -306,3 +306,38 @@ runs under a driver that does. Measured (YCSB A, 300 ops/s, ConsistentRead
 true): p99 557 ms -> 110 ms, max 637 -> 115 ms. Tests:
 `lsm_maintenance::production_options_never_run_maintenance_inline_on_the_ack_path`
 plus background-maintenance cells in `lsm_crash` and `lsm_disk_faults`.
+
+## Amendment 2026-10-10: reader holds and an HLC-wall grace (#1206)
+
+`tombstone_grace_versions` defaulted to `1 << 20` raw versions. Data-plane
+versions are HLC-packed (`wall_ms << 20 | logical`), so that was about **1 ms**
+of wall time: any reader of history older than that could find the version it
+needed GC'd by a compaction — a `read_at`/`scan_at` snapshot read
+(`TransactGetItems`, `read_resolved`'s version ceiling) or the backup capture
+driver, which replays one pinned `cut_version` across many 200 ms ticks (ADR
+0059). The sim corpora ran on `MemoryEngine`, which keeps every version.
+
+Two changes, both retention policy only (what compaction *keeps*; no on-disk
+format, so no ADR 0073 version bump or fixture):
+
+1. **Explicit holds.** `StorageEngine::hold_version(version) -> VersionHold` is
+   an RAII pin through the existing `held_snapshots` / held-floor mechanism, at
+   an arbitrary (older) version rather than only the latest. `MemoryEngine`
+   keeps the default no-op (it never GCs); `LsmEngine` overrides it; a wrapper
+   engine must forward it (`StallingEngine` does). `RaftKvNode::read_at` /
+   `scan_at` / `local_scan_kind_snapshot` take one for the duration of the read,
+   and the backup capture loop (`animusd::backup_capture`) keeps one per
+   `(backup, tablet)` at the `cut_version` across every tick, released when the
+   pair completes, fails, is cancelled, loses leadership, or the task is dropped.
+2. **Time-based grace.** `DEFAULT_TOMBSTONE_GRACE_VERSIONS` is now
+   `5_000 << 20` — 5 s of HLC wall time. An engine whose versions are small
+   sequence numbers (the control system keyspace, versioned at `raft_index + 1`)
+   would never reclaim under that, so it opens with
+   `LsmOptions::production_raw_versions()` / `raw_versions()` and keeps the old
+   `1 << 20` entries.
+
+A hold taken after the grace has already passed cannot recover versions that are
+gone; the grace is the floor under a hold taken a moment late (and under a new
+leader's first capture tick after a leader change). Tests:
+`animus-storage` `lsm_gc.rs::held_version_survives_compaction_gc` (with a
+no-hold control) and `animus-test` `lsm_read_holds.rs` (`ANIMUS_LSM_HOLD_SEEDS`).
