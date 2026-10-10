@@ -3340,11 +3340,7 @@ decided, with D4(a): accept, document ("What a roll costs" in
   acked writes in 6/10 runs; current -> current passes 24/24. So rolling *from* a
   release containing `efcaa6cb` with transactions in use is supported; rolling from an
   older release (e.g. the pin `ac57d56a`) carries that release's own bug for intents it
-  wrote that are still unresolved. #1238 stays open to track a possible mitigation
-  (backfilling the prior at engine open). The job's workload runs without multi-key
-  transactions (`ANIMUS_UPGRADE_FROM_TXN=1` turns them on) and **the transactional
-  roll variant stays off pending the maintainer's decision whether to repin R-1 past
-  `efcaa6cb`**. Two further known findings against the pin, both
+  wrote that are still unresolved. **Superseded 2026-10-10:** #1238 is closed, the pin moved past `efcaa6cb` and the job runs transactions (see the last amendment). Two further known findings against the pin, both
   properties of `ac57d56a` itself rather than of the roll: its own abort-tombstone
   defect and legacy v1 intents being aborted by the new binary.
 - **#1235**: `SimCluster`'s `Memory` backend restarts as a wiped disk (the control
@@ -3457,3 +3453,49 @@ arms were restored to their original semantics for good.
   `below_the_gate_a_txn_decision_after_the_fork_applies_as_it_always_did`.
 - The chaos harness (`animusd/tests/chaos_support`) finalizes the cluster to
   `MAX_SUPPORTED` at bring-up, because a fresh cluster starts at version 1.
+
+### Amendment 2026-10-10: R-1 moves past `efcaa6cb`; #1238 closed
+
+Maintainer decision "pin + document" on #1238.
+
+- **The pin.** `scripts/upgrade-from.txt` moved from `ac57d56a` to `f6709564`
+  (the tip of PR #1205, `claude/fix-txn-abort-restore-gc`). No `v*` tag exists
+  yet, so "the previous release" is still a commit; the rule for choosing it is:
+  the oldest CI-green tree on `main`'s history that (a) contains `efcaa6cb`, so
+  its intents carry their prior (ADR 0018 section 2), and (b) still predates the
+  P2-C node wiring (#1201), so it behaves as a Phase 1 build in production (ADR
+  0073's 2026-10-03 P2-A note 1: until P2-C, no era is started and there is no
+  `cluster-version` endpoint), which is what the test's roll logic assumes.
+  `efcaa6cb` itself is older but is a mid-branch commit that was never a CI
+  run's head; `f6709564` is the same code plus the upgrade harness's
+  `txn-envelope` transcode and a merge of `main`, and its PR's checks were green.
+  It is reachable from `main`, so `scripts/build-upgrade-from.sh` resolves it in
+  any full clone (CI checks out with `fetch-depth: 0`).
+- **#1238 is closed.** It was never a roll bug: a v1 intent (any binary before
+  `efcaa6cb`) carries no prior, and aborting one after LSM GC collapsed history
+  can tombstone an acknowledged value. The pin was the only thing that made the
+  test hit it.
+- **Transactions are on by default** in the previous-release test
+  (`ANIMUS_UPGRADE_FROM_TXN=0` turns them off). Of the three findings that kept
+  them off, the new pin removes all three by construction: R-1's intents carry
+  their prior (the legacy-intent abort and R-1's own abort-tombstone defect), and
+  R-1 decodes `txn-envelope` v2 (#1237, also fixed on the sender side by #1240).
+  **This was not run locally** (the R-1 build did not fit in the author's
+  environment); the first `upgrade-previous-release` run on the PR is the
+  evidence, and a red run there is a finding to triage, not to switch the default
+  back.
+- **Support statement.** A rolling upgrade *from* a release containing
+  `efcaa6cb`, with multi-item transactions in use, is supported. Rolling *from*
+  an older release with transactions in use is **unsupported**: that release can
+  lose an acknowledged value on aborting an intent whether or not it is
+  upgraded. What can be said to be safe is limited to: stop issuing multi-item
+  transactions and wait until every in-flight one has resolved before the first
+  node restarts on the new binary, so no prior-less intent is outstanding. A
+  whole-cluster stop-upgrade-restart is no safer on its own, because an
+  unresolved intent is durable and survives the restart. This mitigation is
+  untested. Hence there is no backfill of priors at engine open; it was only ever
+  a possible mitigation for a release that is not a supported source.
+- Docs updated in the same change: root and `animusd` `CLAUDE.md`,
+  `docs/runbook/upgrade.md`, `docs/release.md`, `docs/roadmap.md`, ADR 0060's
+  maturity note. The website states no supported-source-release list, so it is
+  unchanged.
