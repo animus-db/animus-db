@@ -287,13 +287,84 @@ pub fn replica_excluded(
     removed_by_leader || (!voters.contains(me) && !learners.contains(me))
 }
 
-/// An owned, minimal projection of replicated `Metadata` — *not* the whole
+/// A shared, immutable handle on the cluster's tablet map (issue #1190).
+///
+/// Built from the control plane's published `Arc<Metadata>` with
+/// [`TabletMap::from_metadata`], it costs one `Arc` clone however many
+/// tablets there are, so a reconciler wake no longer copies the map. It
+/// derefs to the `BTreeMap` (deterministic iteration), so readers use it
+/// exactly as they used the owned map. Tests build one from a plain map via
+/// `From<BTreeMap<..>>`.
+#[derive(Debug, Clone, Default)]
+pub struct TabletMap(Arc<animus_control::Metadata>);
+
+impl TabletMap {
+    /// Share `meta`'s tablet map without copying it.
+    #[must_use]
+    pub fn from_metadata(meta: Arc<animus_control::Metadata>) -> Self {
+        Self(meta)
+    }
+
+    /// Whether `self` and `other` share the very same underlying `Metadata`
+    /// allocation (no copy happened between them).
+    #[must_use]
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl From<BTreeMap<TabletId, Tablet>> for TabletMap {
+    fn from(tablets: BTreeMap<TabletId, Tablet>) -> Self {
+        Self(Arc::new(animus_control::Metadata {
+            tablets,
+            ..animus_control::Metadata::default()
+        }))
+    }
+}
+
+impl std::ops::Deref for TabletMap {
+    type Target = BTreeMap<TabletId, Tablet>;
+    fn deref(&self) -> &Self::Target {
+        &self.0.tablets
+    }
+}
+
+/// Copy-on-write mutable access (tests and fixtures): clones the shared
+/// `Metadata` first if another handle still holds it.
+impl std::ops::DerefMut for TabletMap {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut Arc::make_mut(&mut self.0).tablets
+    }
+}
+
+impl FromIterator<(TabletId, Tablet)> for TabletMap {
+    fn from_iter<I: IntoIterator<Item = (TabletId, Tablet)>>(iter: I) -> Self {
+        iter.into_iter().collect::<BTreeMap<_, _>>().into()
+    }
+}
+
+impl<'a> IntoIterator for &'a TabletMap {
+    type Item = (&'a TabletId, &'a Tablet);
+    type IntoIter = std::collections::btree_map::Iter<'a, TabletId, Tablet>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.tablets.iter()
+    }
+}
+
+impl PartialEq for TabletMap {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || self.0.tablets == other.0.tablets
+    }
+}
+impl Eq for TabletMap {}
+
+/// A minimal projection of replicated `Metadata` — *not* the whole
 /// `animus_control::Metadata` (this crate stays decoupled from the control
 /// plane's full state shape; only what a host-reconcile decision needs).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MetadataView {
     /// Every tablet in the cluster's tablet map, keyed by id.
-    pub tablets: BTreeMap<TabletId, Tablet>,
+    pub tablets: TabletMap,
     /// Base node ids the control plane's failure detector currently considers
     /// `Down` — the priority input [`HostAction::Reconfigure`] carries so the
     /// executing `reconfigure_step` can tell a failure repair from a healthy
@@ -2932,6 +3003,24 @@ mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    /// Issue #1190: a view built from a shared `Metadata` copies nothing,
+    /// and clones of the view keep sharing it; mutation is copy-on-write.
+    #[test]
+    fn tablet_map_shares_the_metadata_arc() {
+        let mut meta = animus_control::Metadata::default();
+        meta.tablets
+            .insert(TabletId(1), tablet(1, b"", None, vec![base()]));
+        let meta = Arc::new(meta);
+        let a = TabletMap::from_metadata(Arc::clone(&meta));
+        let mut b = a.clone();
+        assert!(a.ptr_eq(&b), "a clone shares the allocation");
+        assert_eq!(Arc::strong_count(&meta), 3);
+        assert_eq!(a.len(), 1);
+        b.clear();
+        assert!(!a.ptr_eq(&b), "mutation un-shares (copy-on-write)");
+        assert_eq!(a.len(), 1, "the original is untouched");
     }
 
     // === Parity ports of animusd::topology's tests =========================

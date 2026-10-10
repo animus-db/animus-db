@@ -1648,7 +1648,7 @@ impl Cluster {
 /// separate fake view needed.
 fn metadata_view(meta: &Metadata) -> MetadataView {
     MetadataView {
-        tablets: meta.tablets.clone(),
+        tablets: meta.tablets.clone().into(),
         down: BTreeSet::new(),
         ..Default::default()
     }

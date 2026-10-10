@@ -662,7 +662,7 @@ impl Cluster {
 
 fn metadata_view(meta: &Metadata) -> MetadataView {
     MetadataView {
-        tablets: meta.tablets.clone(),
+        tablets: meta.tablets.clone().into(),
         down: BTreeSet::new(),
         ..Default::default()
     }

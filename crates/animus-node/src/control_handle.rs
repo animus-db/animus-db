@@ -160,7 +160,7 @@ pub struct RemoteControlClient<R: RelayClient> {
     /// [`has_synced`](Self::has_synced) exposes for the tablet-host
     /// reconciler's pre-recovery guard, which otherwise has no local
     /// `last_applied()` to gate on (this handle's is pinned at 0 forever).
-    mirror: Arc<Mutex<Option<Metadata>>>,
+    mirror: Arc<Mutex<Option<Arc<Metadata>>>>,
     /// The last-known control-plane leader `(id, client address)` — see the
     /// type doc's "leader-hint lifecycle" section.
     leader_hint: Arc<Mutex<Option<(NodeId, String)>>>,
@@ -233,7 +233,7 @@ impl<R: RelayClient> RemoteControlClient<R> {
     /// copy of the mirror to keep in sync.
     pub fn with_mirror(
         seeds: Vec<String>,
-        mirror: Arc<Mutex<Option<Metadata>>>,
+        mirror: Arc<Mutex<Option<Arc<Metadata>>>>,
         relay: R,
         timeout: Duration,
     ) -> Self {
@@ -254,6 +254,14 @@ impl<R: RelayClient> RemoteControlClient<R> {
     /// has never synced (see [`has_synced`](Self::has_synced) for telling the
     /// two apart).
     pub fn metadata_cached(&self) -> Metadata {
+        Metadata::clone(&self.metadata_cached_arc())
+    }
+
+    /// Like [`metadata_cached`](Self::metadata_cached) but a shared handle:
+    /// an `Arc` clone, O(1) in tablet count (issue #1190). Writers replace
+    /// the `Arc` (or `Arc::make_mut` it when no reader holds one), so a held
+    /// handle is an immutable snapshot.
+    pub fn metadata_cached_arc(&self) -> Arc<Metadata> {
         self.mirror
             .lock()
             .expect("remote control mirror poisoned")
@@ -370,7 +378,7 @@ impl<R: RelayClient> RemoteControlClient<R> {
         }
         let mut cached = self.mirror.lock().expect("remote control mirror poisoned");
         if watermark >= self.watch.latest() {
-            *cached = Some(metadata);
+            *cached = Some(Arc::new(metadata));
             *self
                 .control_voters
                 .lock()
@@ -428,9 +436,11 @@ impl<R: RelayClient> RemoteControlClient<R> {
             // Stale relative to a concurrent update — see the doc above.
             return false;
         }
-        let mut meta = cached.clone().unwrap_or_default();
+        // `take()` so the mirror's own reference is gone: `make_mut` then
+        // clones the map only when a reader still holds a snapshot.
+        let mut meta = cached.take().unwrap_or_default();
         for write in writes {
-            mirror::apply_key_write(&mut meta, write);
+            mirror::apply_key_write(Arc::make_mut(&mut meta), write);
         }
         *cached = Some(meta);
         *self
@@ -504,6 +514,15 @@ impl<E: Env, R: RelayClient> ControlHandle<E, R> {
         match self {
             Self::Local(raft) => raft.metadata(),
             Self::Remote(remote) => remote.metadata_cached(),
+        }
+    }
+
+    /// [`metadata_cached`](Self::metadata_cached) as a shared `Arc` handle —
+    /// no copy of the tablet map (issue #1190).
+    pub fn metadata_cached_arc(&self) -> Arc<Metadata> {
+        match self {
+            Self::Local(raft) => raft.metadata_arc(),
+            Self::Remote(remote) => remote.metadata_cached_arc(),
         }
     }
 
