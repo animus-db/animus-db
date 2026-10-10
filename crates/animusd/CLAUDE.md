@@ -12416,3 +12416,5 @@ saga tests' `S` harness needs a `pad` peer so peer index == bridge cluster index
   L0->L1 compaction run in a background task, not inline on the apply task;
   inline maintenance froze every op on a tablet for 200-700 ms. Any new
   `LsmEngine::open*` call in this crate must pass `LsmOptions::production()`.
+
+- A single-item write blocked by another transaction's write intent answers `TransactionConflictException` (`KindBatchOutcome::IntentBlocked` -> `KindEvalApplied::IntentBlocked` -> `WireError::transaction_conflict_exception`), never `ConditionalCheckFailedException`; the code is in `RELAYABLE_WIRE_ERROR_CODES`. See `docs/lessons/code-patterns/2026-10-10-a-no-op-label-shared-by-two-causes-hides-the-wire-error.md`.

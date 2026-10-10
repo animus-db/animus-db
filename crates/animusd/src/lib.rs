@@ -2043,7 +2043,8 @@ fn classify_kind_batch_outcome(
             _,
             KindBatchOutcome::ConditionFailed { .. }
             | KindBatchOutcome::Sealed { .. }
-            | KindBatchOutcome::Rejected { .. },
+            | KindBatchOutcome::Rejected { .. }
+            | KindBatchOutcome::IntentBlocked { .. },
         )) => KindBatchSignal::NoOp,
         _ => KindBatchSignal::Inconclusive,
     }
@@ -23031,6 +23032,12 @@ mod sim_cluster_growth;
 /// account, including what stayed on `ProdEnv` and why.
 #[cfg(test)]
 mod sim_cluster_dynamo_transact;
+
+/// Issue #1203: an unconditional single-item write blocked by another
+/// transaction's write intent answers `TransactionConflictException`, while a
+/// genuinely false condition stays `ConditionalCheckFailedException`.
+#[cfg(test)]
+mod sim_cluster_dynamo_intent_blocked;
 
 /// ADR 0061 rung F (C-06 PR 5): deterministic `SimCluster` reachability
 /// smoke for `ExecuteStatement`/`BatchExecuteStatement`/`ExecuteTransaction`
