@@ -667,29 +667,35 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// until a wake that may never come.
     async fn wait_applied_past(leader: &CpGroup<E>, index: u64) {
         let watch = leader.applied_watch();
-        loop {
-            // Ordering invariant: read the watch's cursor BEFORE checking
-            // `engine_applied_index`, never after. `changed(seen)` only
-            // wakes on a bump that lands *after* `seen` was captured — read
-            // `seen` after the check and a bump landing in the gap between
-            // the two reads is already folded into `seen`, so `changed`
-            // then waits for a further bump that may never come and this
-            // wait overshoots all the way to the `CP_CONFIRM_POLL_MAX`
-            // fallback on every such race, exactly the overshoot this
-            // helper exists to remove. Reading first is race-free: `changed`
-            // re-registers and re-checks fresh on every poll (see its own
-            // doc), so a bump between this `latest()` and the index check
-            // below is still caught the instant this future is polled.
-            let seen = watch.latest();
-            if leader.engine_applied_index() >= index {
-                return;
-            }
-            let _ = futures::future::select(
-                watch.changed(seen),
-                leader.env().sleep(CP_CONFIRM_POLL_MAX),
-            )
-            .await;
+        // Ordering invariant: read the watch's cursor BEFORE checking
+        // `engine_applied_index`, never after. `changed(seen)` only
+        // wakes on a bump that lands *after* `seen` was captured — read
+        // `seen` after the check and a bump landing in the gap between
+        // the two reads is already folded into `seen`, so `changed`
+        // then waits for a further bump that may never come and this
+        // wait overshoots all the way to the `CP_CONFIRM_POLL_MAX`
+        // fallback on every such race, exactly the overshoot this
+        // helper exists to remove. Reading first is race-free: `changed`
+        // re-registers and re-checks fresh on every poll (see its own
+        // doc), so a bump between this `latest()` and the index check
+        // below is still caught the instant this future is polled.
+        let seen = watch.latest();
+        if leader.engine_applied_index() >= index {
+            return;
         }
+        // **One pass, never a loop (issue #1249).** This returns after the
+        // first wake OR the `CP_CONFIRM_POLL_MAX` timeout, whether or not
+        // `index` has applied; every caller re-checks its own state
+        // (outcome, superseded proof, deadline) and calls again. An inner
+        // `loop` here re-parked until `index` applied, so a group whose
+        // apply never reaches `index` (a partitioned leader that never
+        // commits it, a stopped or restarted node's old incarnation, a halted
+        // apply task) trapped the caller below its own `deadline` forever:
+        // the "always returns at least that often" contract above held only
+        // on paper.
+        let _ =
+            futures::future::select(watch.changed(seen), leader.env().sleep(CP_CONFIRM_POLL_MAX))
+                .await;
     }
 
     /// The **known-leader** local half of [`cp_kind_write_raw`](Self::
@@ -2370,6 +2376,112 @@ mod wait_applied_past_futility_tests {
             "the superseded entry's write must never have applied under \
              any term (seed={seed})"
         );
+    }
+}
+
+/// Regression for issue #1249: `wait_applied_past` used to loop internally
+/// until `index` applied, so a confirm wait on a group that never applies the
+/// accepted index never returned to its caller's `deadline` check and the
+/// client request hung forever (found as a nightly `upgrade_mixed_cluster`
+/// "workload did not finish": a write in flight when its node restarted).
+/// A three-voter group with the leader isolated before it proposes: the entry
+/// is accepted but can never commit, the isolated leader still believes it
+/// leads and never learns otherwise, so the confirm must end at its own
+/// deadline with `TimedOut`, not hang.
+#[cfg(test)]
+mod wait_applied_past_deadline_tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use animus_cp_data::{KIND_BASE, RaftKvNode};
+    use animus_env::{Clock, EnvExt, nid};
+    use animus_sim::{SimEnv, Simulator};
+    use animus_storage::MemoryEngine;
+
+    use super::*;
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct NeverRelay;
+
+    #[async_trait::async_trait]
+    impl RelayClient for NeverRelay {
+        async fn relay(
+            &self,
+            addr: String,
+            _request: &ClientRequest,
+            _timeout: Duration,
+        ) -> ClientResponse {
+            ClientResponse::Error(format!("NeverRelay (addr={addr})"))
+        }
+    }
+
+    fn run(seed: u64) {
+        let mut sim = Simulator::new(seed);
+        let ids = [nid(0), nid(1), nid(2)];
+        let nodes: Vec<RaftKvNode<SimEnv, MemoryEngine>> = ids
+            .iter()
+            .map(|id| RaftKvNode::start(sim.env(id.clone()), ids.to_vec(), MemoryEngine::new()))
+            .collect();
+        sim.run_for(Duration::from_secs(2));
+        let leaders: Vec<usize> = (0..3).filter(|&i| nodes[i].is_leader()).collect();
+        assert_eq!(leaders.len(), 1, "one leader expected (seed={seed})");
+        let l = leaders[0];
+        for i in (0..3).filter(|&i| i != l) {
+            sim.partition_pair(nid(l as u64), nid(i as u64));
+        }
+        let leader = nodes[l].clone();
+        let key = b"item".to_vec();
+        let value = b"never-lands".to_vec();
+        let (index, term) = match leader.put_kind_batch(
+            vec![(KIND_BASE, key.clone(), Some(value.clone()))],
+            Vec::new(),
+        ) {
+            ProposeResult::Accepted { index, term } => (index, term),
+            other => panic!("propose not accepted (seed={seed}): {other:?}"),
+        };
+        let deadline = leader.env().now().saturating_add(Duration::from_secs(1));
+        let env = leader.env().clone();
+        let group = CpGroup::Mem(leader.clone());
+        let slot: Arc<Mutex<Option<ProbeWait>>> = Arc::new(Mutex::new(None));
+        let out = slot.clone();
+        env.spawn_task(async move {
+            let r = ClientCtx::<SimEnv, NeverRelay>::poll_probe(
+                &group,
+                index,
+                term,
+                &key,
+                &value,
+                ProbeIdentity::ValueProves,
+                deadline,
+            )
+            .await;
+            *out.lock().expect("slot poisoned") = Some(r);
+        });
+        // Converged-or-timeout: 1s deadline, 5s of virtual time to notice it.
+        let mut result = None;
+        for _ in 0..50 {
+            sim.run_for(Duration::from_millis(100));
+            result = slot.lock().expect("slot poisoned").take();
+            if result.is_some() {
+                break;
+            }
+        }
+        assert_eq!(
+            result,
+            Some(ProbeWait::TimedOut),
+            "a confirm wait on an index that never applies must end at its \
+             own deadline, not hang (seed={seed})"
+        );
+    }
+
+    #[test]
+    fn a_confirm_wait_on_a_never_applied_index_ends_at_its_deadline() {
+        run(0x1249_0001);
+    }
+
+    #[test]
+    fn a_confirm_wait_on_a_never_applied_index_ends_at_its_deadline_seed2() {
+        run(0x1249_0002);
     }
 }
 
