@@ -1886,6 +1886,15 @@ cannot run at all in the sandbox), so stretch behaviour is proven only in
 `SimEnv` (`animusd` `sim_cluster_mrsc`).
 
 
+## `E2E_KEEP_CLUSTER=1`: keep the `kind` cluster after the smoke (#1278)
+
+Opt-in keep-alive for the game-day drill (`docs/runbook/game-day.md`). `cleanup()` still stops
+the port-forwards and the out-of-cluster operator (nothing leaks, ports free), but skips
+`kind delete cluster`, and the final "delete AnimusCluster and verify GC" phase is skipped so
+the 3-node cluster stays up; it applies to a failed run too. The operator is deliberately not
+kept (a detached process outliving the script has no owner): restart it with the printed
+kubeconfig. Unverified: `kind` cannot run in the sandbox, only `bash -n`.
+
 ## `E2E_UPGRADE=1`: the nightly operator-driven roll on `kind` (ADR 0073 Phase 3, D10)
 
 `scripts/e2e-kind.sh`'s `E2E_UPGRADE=1` leg (workflow
