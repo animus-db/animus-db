@@ -880,6 +880,62 @@ pub(crate) fn admin_base_url(
     )
 }
 
+/// The refusal text `animusd` returns (409) from a local-leader-only admin
+/// action on a node that is not the control-plane leader
+/// (`ClientCtx::not_leader_error`).
+const NOT_LEADER_MARKER: &str = "not the control-plane leader";
+
+/// One admin request routed to the control-plane leader (issue #1177).
+enum LeaderReq<'a> {
+    Post(&'a str, serde_json::Value),
+    Get(String),
+}
+
+/// Send `req` to the control-plane leader among `bases` (admin base URLs of
+/// every candidate pod), starting at `*pinned` (the pod that last answered as
+/// leader). `/admin/drain` and `/admin/member/remove` are local-leader-only
+/// and **not relayed**: a follower answers 409 "not the control-plane
+/// leader". A `Local` control handle's leader hint is always `None`, so —
+/// like [`add_control_voter`] — we try every candidate in turn; at most one
+/// accepts. Only the not-leader refusal rotates to the next candidate; any
+/// other error is returned as-is. `*pinned` is updated to the accepting pod
+/// so later steps (and a leadership move mid-drain) are followed.
+async fn leader_request<A: AdminOps>(
+    admin: &A,
+    bases: &[String],
+    pinned: &mut usize,
+    req: &LeaderReq<'_>,
+    tls_ca: Option<&[u8]>,
+) -> Result<serde_json::Value, String> {
+    let mut last_err = "no candidate pod to ask".to_string();
+    for step in 0..bases.len() {
+        let idx = (*pinned + step) % bases.len();
+        let res = match req {
+            LeaderReq::Post(path, body) => {
+                admin
+                    .post_json(&format!("{}{path}", bases[idx]), body, tls_ca)
+                    .await
+            }
+            LeaderReq::Get(path) => {
+                admin
+                    .get_json(&format!("{}{path}", bases[idx]), tls_ca)
+                    .await
+            }
+        };
+        match res {
+            Ok(v) => {
+                *pinned = idx;
+                return Ok(v);
+            }
+            Err(e) if e.contains(NOT_LEADER_MARKER) => last_err = e,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(format!(
+        "no control-plane leader accepted the request: {last_err}"
+    ))
+}
+
 /// Drain and remove one pod ordinal before it is scaled away, via the
 /// sequence `crate::CLAUDE.md`/the delivery brief document: `POST
 /// /admin/drain {node}`, poll `GET /admin/member/drain-status?node=` to
@@ -887,36 +943,52 @@ pub(crate) fn admin_base_url(
 /// commit 3): `Some(pem)` dials the admin port over TLS trusting `pem` as
 /// the cluster CA; `None` plain TCP — see `reconcile`'s own call site for
 /// where this is read out of `spec.tls`'s resolved `Secret`.
+///
+/// **Leader routing (issue #1177):** drain and remove are control-plane-
+/// leader-only and not relayed, so they are sent to the leader, not to the
+/// departing pod (which is usually a follower). `pod_count` is the number of
+/// pods currently running (`0..pod_count` are the candidates; the departing
+/// ordinal is tried first so a departing leader costs no extra round trip).
+/// See [`leader_request`].
 async fn drain_and_remove_node<A: AdminOps>(
     admin: &A,
     name: &str,
     ns: &str,
     ordinal: i32,
+    pod_count: i32,
     admin_port: i32,
     tls_ca: Option<&[u8]>,
 ) -> Result<(), String> {
     let node_id = desired::cluster_config::node_id(name, ordinal);
-    let base = admin_base_url(name, ns, ordinal, admin_port, tls_ca.is_some());
+    let tls = tls_ca.is_some();
+    let bases: Vec<String> = std::iter::once(ordinal)
+        .chain((0..pod_count.max(ordinal + 1)).filter(|o| *o != ordinal))
+        .map(|o| admin_base_url(name, ns, o, admin_port, tls))
+        .collect();
+    let mut pinned = 0usize;
 
-    admin
-        .post_json(
-            &format!("{base}/admin/drain"),
-            &json!({ "node": node_id }),
-            tls_ca,
-        )
-        .await
-        .map_err(|e| format!("draining {node_id}: {e}"))?;
+    leader_request(
+        admin,
+        &bases,
+        &mut pinned,
+        &LeaderReq::Post("/admin/drain", json!({ "node": node_id })),
+        tls_ca,
+    )
+    .await
+    .map_err(|e| format!("draining {node_id}: {e}"))?;
 
     const MAX_POLLS: u32 = 120;
     const POLL_INTERVAL: Duration = Duration::from_secs(5);
     for attempt in 0..MAX_POLLS {
-        let status: serde_json::Value = admin
-            .get_json(
-                &format!("{base}/admin/member/drain-status?node={node_id}"),
-                tls_ca,
-            )
-            .await
-            .map_err(|e| format!("polling drain-status for {node_id}: {e}"))?;
+        let status: serde_json::Value = leader_request(
+            admin,
+            &bases,
+            &mut pinned,
+            &LeaderReq::Get(format!("/admin/member/drain-status?node={node_id}")),
+            tls_ca,
+        )
+        .await
+        .map_err(|e| format!("polling drain-status for {node_id}: {e}"))?;
         let tablets_remaining = status["tablets_remaining"].as_u64().unwrap_or(u64::MAX);
         let member_status = status["status"].as_str().unwrap_or("");
         if tablets_remaining == 0 && member_status != "Active" {
@@ -939,14 +1011,15 @@ async fn drain_and_remove_node<A: AdminOps>(
         tokio::time::sleep(POLL_INTERVAL).await;
     }
 
-    admin
-        .post_json(
-            &format!("{base}/admin/member/remove"),
-            &json!({ "node": node_id }),
-            tls_ca,
-        )
-        .await
-        .map_err(|e| format!("removing {node_id}: {e}"))?;
+    leader_request(
+        admin,
+        &bases,
+        &mut pinned,
+        &LeaderReq::Post("/admin/member/remove", json!({ "node": node_id })),
+        tls_ca,
+    )
+    .await
+    .map_err(|e| format!("removing {node_id}: {e}"))?;
     Ok(())
 }
 
@@ -1407,6 +1480,7 @@ async fn reconcile<C: ClusterApi, A: AdminOps>(
                     &name,
                     &ns,
                     ordinal,
+                    current_replicas,
                     admin_port,
                     tls_ca.as_deref(),
                 )
@@ -2032,6 +2106,18 @@ mod tests {
         }
     }
 
+    /// Node ids POSTed to `path` (e.g. `/admin/drain`) that the fake leader
+    /// accepted, in order — scale-down now dials the control leader, not the
+    /// departing pod, so the node is read from the body, not the URL.
+    fn accepted_nodes(admin: &FakeAdminClient, path: &str) -> Vec<String> {
+        admin
+            .post_bodies()
+            .into_iter()
+            .filter(|(p, _)| p == path)
+            .filter_map(|(_, b)| b["node"].as_str().map(String::from))
+            .collect()
+    }
+
     // --- (4) drain_and_remove_node's sequence, including the bounded ------
     // --- never-completes failure path -------------------------------------
 
@@ -2039,8 +2125,11 @@ mod tests {
     async fn drain_and_remove_node_succeeds_when_drain_completes_immediately() {
         // No response queued: FakeAdminClient's default GET response is
         // "already fully drained", so the sequence completes in one poll.
+        // The departing pod (2) is the control leader here, so no request
+        // is redirected.
         let admin = FakeAdminClient::new();
-        let result = drain_and_remove_node(&admin, "demo", "ns1", 2, 14003, None).await;
+        admin.set_control_leader(2);
+        let result = drain_and_remove_node(&admin, "demo", "ns1", 2, 3, 14003, None).await;
         assert!(result.is_ok(), "{result:?}");
 
         assert_eq!(
@@ -2074,6 +2163,42 @@ mod tests {
         desired::cluster_config::node_id("demo", 2)
     }
 
+    /// Issue #1177: the departing pod (2) is a follower; drain, drain-status
+    /// and remove must all reach the control leader (0), the departing pod is
+    /// refused once on drain, and a later leadership move is followed.
+    #[tokio::test]
+    async fn drain_and_remove_node_routes_to_the_leader_when_the_departing_pod_is_a_follower() {
+        let admin = FakeAdminClient::new();
+        admin.set_control_leader(0);
+        let result = drain_and_remove_node(&admin, "demo", "ns1", 2, 3, 14003, None).await;
+        assert!(result.is_ok(), "{result:?}");
+
+        let calls = admin.calls();
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        for (_, url) in &calls {
+            assert!(url.contains("demo-0."), "must dial the leader: {url}");
+        }
+        assert_eq!(accepted_nodes(&admin, "/admin/drain"), ["demo-2"]);
+        assert_eq!(accepted_nodes(&admin, "/admin/member/remove"), ["demo-2"]);
+        // Only the first dial (the departing follower) was refused; the
+        // leader is then pinned for the rest of the sequence.
+        assert_eq!(
+            admin.refused_leader_posts(),
+            vec![admin_url("demo", "ns1", 2, 14003, "/admin/drain")]
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_and_remove_node_fails_when_no_pod_is_the_leader() {
+        let admin = FakeAdminClient::new();
+        admin.set_control_leader(9); // no such pod: an election in progress
+        let err = drain_and_remove_node(&admin, "demo", "ns1", 2, 3, 14003, None)
+            .await
+            .expect_err("no leader must surface as an error, not a silent skip");
+        assert!(err.contains("no control-plane leader accepted"), "{err}");
+        assert!(admin.calls().is_empty());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn drain_and_remove_node_is_bounded_when_drain_never_completes() {
         let admin = FakeAdminClient::new();
@@ -2082,7 +2207,7 @@ mod tests {
         // `drain_and_remove_node`'s completion check.
         admin.queue_drain_status(3, "Draining");
 
-        let result = drain_and_remove_node(&admin, "demo", "ns1", 4, 14003, None).await;
+        let result = drain_and_remove_node(&admin, "demo", "ns1", 4, 5, 14003, None).await;
         let err = result.expect_err("a drain that never completes must eventually give up");
         assert!(
             err.contains("did not finish draining after 120 polls"),
@@ -2112,33 +2237,20 @@ mod tests {
         let result = reconcile(Arc::clone(&cluster), Arc::clone(&ctx)).await;
         assert!(result.is_ok(), "{:?}", result.err());
 
-        let drain_posts: Vec<String> = ctx
-            .admin
-            .calls()
-            .into_iter()
-            .filter(|(m, u)| m == "POST" && u.ends_with("/admin/drain"))
-            .map(|(_, u)| u)
-            .collect();
+        // Issue #1177: both departing pods are followers (the fake leader
+        // is ordinal 0), so every accepted call was dialed at the leader.
         assert_eq!(
-            drain_posts,
-            vec![
-                admin_url("demo", "ns1", 4, 14003, "/admin/drain"),
-                admin_url("demo", "ns1", 3, 14003, "/admin/drain"),
-            ]
+            accepted_nodes(&ctx.admin, "/admin/drain"),
+            ["demo-4", "demo-3"]
         );
-        let remove_posts: Vec<String> = ctx
-            .admin
-            .calls()
-            .into_iter()
-            .filter(|(m, u)| m == "POST" && u.ends_with("/admin/member/remove"))
-            .map(|(_, u)| u)
-            .collect();
         assert_eq!(
-            remove_posts,
-            vec![
-                admin_url("demo", "ns1", 4, 14003, "/admin/member/remove"),
-                admin_url("demo", "ns1", 3, 14003, "/admin/member/remove"),
-            ]
+            accepted_nodes(&ctx.admin, "/admin/member/remove"),
+            ["demo-4", "demo-3"]
+        );
+        assert!(
+            ctx.admin.calls().iter().all(|(_, u)| u.contains("demo-0.")),
+            "{:?}",
+            ctx.admin.calls()
         );
 
         // No blocking condition: the drain sequence succeeded.
@@ -2175,15 +2287,7 @@ mod tests {
         // must stop there, never touching ordinal 3, and never reaching
         // "remove" for anything.
         let calls = ctx.admin.calls();
-        let drain_posts: Vec<&String> = calls
-            .iter()
-            .filter(|(m, u)| m == "POST" && u.ends_with("/admin/drain"))
-            .map(|(_, u)| u)
-            .collect();
-        assert_eq!(
-            drain_posts,
-            vec![&admin_url("demo", "ns1", 4, 14003, "/admin/drain")]
-        );
+        assert_eq!(accepted_nodes(&ctx.admin, "/admin/drain"), ["demo-4"]);
         assert!(!calls.iter().any(|(_, u)| u.contains("/member/remove")));
 
         // Issue #853: ordinal 4 never finished draining, so the applied
@@ -2232,18 +2336,9 @@ mod tests {
                 .any(|c| c.type_ == CONDITION_DRAIN_FAILED)
         );
 
-        let calls = ctx.admin.calls();
-        let drain_posts: Vec<&String> = calls
-            .iter()
-            .filter(|(m, u)| m == "POST" && u.ends_with("/admin/drain"))
-            .map(|(_, u)| u)
-            .collect();
         assert_eq!(
-            drain_posts,
-            vec![
-                &admin_url("demo", "ns1", 4, 14003, "/admin/drain"),
-                &admin_url("demo", "ns1", 3, 14003, "/admin/drain"),
-            ]
+            accepted_nodes(&ctx.admin, "/admin/drain"),
+            ["demo-4", "demo-3"]
         );
 
         let applied = ctx
@@ -3389,7 +3484,7 @@ mod tests {
     async fn drain_and_remove_node_over_tls_dials_https_and_forwards_the_ca() {
         let admin = FakeAdminClient::new();
         let ca = b"fake-ca-pem";
-        let result = drain_and_remove_node(&admin, "demo", "ns1", 2, 14003, Some(ca)).await;
+        let result = drain_and_remove_node(&admin, "demo", "ns1", 2, 3, 14003, Some(ca)).await;
         assert!(result.is_ok(), "{result:?}");
         let calls = admin.calls();
         assert!(
@@ -3435,9 +3530,9 @@ mod tests {
         assert_eq!(
             drain_posts,
             vec![
-                admin_url("demo", "ns1", 4, 14003, "/admin/drain")
+                admin_url("demo", "ns1", 0, 14003, "/admin/drain")
                     .replacen("http://", "https://", 1),
-                admin_url("demo", "ns1", 3, 14003, "/admin/drain")
+                admin_url("demo", "ns1", 0, 14003, "/admin/drain")
                     .replacen("http://", "https://", 1),
             ]
         );
