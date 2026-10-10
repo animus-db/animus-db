@@ -97,8 +97,8 @@ the GitHub release notes.
 2a. **Previous-release rolling-upgrade check** (ADR 0073 Phase 3, D10; Phase 2
    rule 3, "N-1 to N for every later release is mandatory", enforced with real
    bytes). `scripts/upgrade-from.txt` pins R-1, the build the release being cut
-   must be able to take over by a rolling upgrade: the last Phase 1 tree
-   (`ac57d56a`) until the first `v*` tag exists, afterwards the **previous
+   must be able to take over by a rolling upgrade: the oldest CI-green tree that has
+   the transaction abort fix `efcaa6cb` (`f6709564`) until the first `v*` tag exists, afterwards the **previous
    release's tag**. In the release PR move that pointer to the previous tag
    (for release R, R-1's tag; never skip a release, the job pins exactly one
    step) and get the `upgrade-previous-release` CI job green on that PR

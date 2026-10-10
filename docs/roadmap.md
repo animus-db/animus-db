@@ -1634,7 +1634,7 @@ outstanding on the wire surface at present.
   (P3-C); the operator's gated `spec.image` roll behind an operator-owned
   `StatefulSet` partition, `spec.upgrade`/`status.upgrade` (P3-D); the
   `upgrade-previous-release` `ProdEnv` CI job (R-1 pinned in
-  `scripts/upgrade-from.txt`, `ac57d56a` until a `v*` tag exists) and the
+  `scripts/upgrade-from.txt`, `f6709564` until a `v*` tag exists) and the
   nightly `kind` leg `E2E_UPGRADE=1` (P3-E); docs close-out (P3-F). Supported:
   a manual or operator-driven rolling upgrade R-1 -> R of a cluster of at
   least three nodes, ending in an explicit (or opted-in automatic) finalize;
