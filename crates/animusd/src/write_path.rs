@@ -70,6 +70,10 @@ pub(crate) enum KindEvalApplied {
     /// cannot cheaply be, told apart from a genuine condition failure at
     /// this layer.)
     ConditionFailed,
+    /// Another transaction's unresolved write intent sits on the key, so
+    /// the write no-op'd (issue #1203). The wire edge answers
+    /// `TransactionConflictException`, not `ConditionalCheckFailedException`.
+    IntentBlocked,
     /// The evaluator itself rejected the write — a domain violation in the
     /// client's own condition, or a malformed/oversized update — copied
     /// verbatim from `animus_cp_data::KindBatchOutcome::Rejected`.
@@ -1022,11 +1026,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// - `ConditionFailed` → `Ok(KindEvalApplied::ConditionFailed)`, a
     ///   DEFINITIVE result (never retried here) — the client's own
     ///   condition genuinely evaluated false against apply's fresh read.
-    ///   (This is also where an unresolved foreign transaction intent on
-    ///   this key lands, per apply's own documented foreign-intent
-    ///   discipline — an accepted, rare imprecision; see this function's
-    ///   own caller, `dynamo::kind_write_item_at_leader`, for the full
-    ///   account of why that is not disambiguated here.)
+    /// - `IntentBlocked` → `Ok(KindEvalApplied::IntentBlocked)`, also
+    ///   definitive (issue #1203): an unresolved foreign transaction
+    ///   intent on this key, kept distinct from a false condition so the
+    ///   edge can answer `TransactionConflictException`.
     /// - `Rejected { code, message }` → `Ok(KindEvalApplied::Rejected)`,
     ///   also definitive — a domain violation in the condition or a
     ///   malformed/oversized update, copied verbatim.
@@ -1036,10 +1039,11 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     ///   `cp_kind_write_item`'s own retry loop) rather than treat it as a
     ///   terminal answer.
     /// - `Applied`/`None` never reach here — `classify_kind_batch_outcome`
-    ///   only ever returns `NoOp` for one of the three variants above.
+    ///   only ever returns `NoOp` for one of the variants above.
     fn kind_eval_noop(outcome: Option<(u64, KindBatchOutcome)>) -> Result<KindEvalApplied, String> {
         match outcome.map(|(_, o)| o) {
             Some(KindBatchOutcome::ConditionFailed { .. }) => Ok(KindEvalApplied::ConditionFailed),
+            Some(KindBatchOutcome::IntentBlocked { .. }) => Ok(KindEvalApplied::IntentBlocked),
             Some(KindBatchOutcome::Rejected { code, message, .. }) => {
                 Ok(KindEvalApplied::Rejected { code, message })
             }
@@ -1050,7 +1054,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             ),
             other => unreachable!(
                 "classify_kind_batch_outcome only returns NoOp for ConditionFailed/Sealed/\
-                 Rejected, got {other:?}"
+                 Rejected/IntentBlocked, got {other:?}"
             ),
         }
     }

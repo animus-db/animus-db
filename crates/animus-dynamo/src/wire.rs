@@ -1745,6 +1745,23 @@ impl WireError {
         }
     }
 
+    /// A single-item write (`PutItem`/`UpdateItem`/`DeleteItem`) found
+    /// another transaction's unresolved write intent on its key (issue
+    /// #1203) — AWS's `TransactionConflictException` (HTTP 400, retryable),
+    /// *not* `ConditionalCheckFailedException`, which a write with no
+    /// condition must never see. The `...Exception` sibling of the bare
+    /// `TransactionConflict` code
+    /// [`CancellationReason::transaction_conflict`] carries inside a
+    /// `TransactWriteItems` cancellation.
+    #[must_use]
+    pub fn transaction_conflict_exception() -> Self {
+        Self {
+            code: "TransactionConflictException",
+            message: "Transaction is ongoing for the item".into(),
+            reasons: None,
+        }
+    }
+
     /// A `TransactWriteItems` `ClientRequestToken` names a record this node
     /// observed as still `PENDING` (ADR 0018's 2026-08-24 amendment) — the
     /// original request with this token may still be committing, or may
@@ -1854,7 +1871,7 @@ impl WireError {
             "ResourceNotFoundException" => "ResourceNotFound",
             "AccessDeniedException" => "AccessDenied",
             "ProvisionedThroughputExceededException" => "ProvisionedThroughputExceeded",
-            "TransactionConflict" => "TransactionConflict",
+            "TransactionConflict" | "TransactionConflictException" => "TransactionConflict",
             "ThrottlingError" => "ThrottlingError",
             _ => "InternalServerError",
         }
@@ -10503,6 +10520,12 @@ mod tests {
         };
         assert_eq!(
             transaction_conflict.batch_statement_error_code(),
+            "TransactionConflict"
+        );
+        // Issue #1203: the single-item `...Exception` form maps to the same
+        // bare per-statement code.
+        assert_eq!(
+            WireError::transaction_conflict_exception().batch_statement_error_code(),
             "TransactionConflict"
         );
         let throttling_error = WireError {

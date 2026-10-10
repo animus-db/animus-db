@@ -1879,6 +1879,19 @@ pub enum KindBatchOutcome {
         code: String,
         message: String,
     },
+    /// **`KvCommand::KindEval`-only** (issue #1203): a client `Put`/`Delete`/
+    /// `Update` found another transaction's unresolved **write intent** on
+    /// its key and no-op'd. Distinct from `ConditionFailed` so the wire edge
+    /// can answer `TransactionConflictException` (AWS's answer for a write
+    /// racing an in-flight `TransactWriteItems`) instead of a misleading
+    /// `ConditionalCheckFailedException` for a write that carried no
+    /// condition. A leader-local result label only: the apply-time decision
+    /// (write nothing) is byte-identical to the `ConditionFailed` it
+    /// replaces, so replicas of different versions never diverge. A
+    /// `KindEvalOp::Replicate` still records `ConditionFailed` (the MREC
+    /// shipper's retry cue). Same term-independent soundness as the other
+    /// no-op variants.
+    IntentBlocked { key: Vec<u8> },
 }
 
 /// Per-`KindBatch` outcomes recorded at apply time, keyed by the entry's Raft
@@ -9442,6 +9455,13 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         // so for it `ConditionFailed` can only mean
                         // "intent on the key", which the MREC shipper
                         // treats as `Retry`, ADR 0075 G-d M2.)
+                        Some(txn::Envelope::Intent { .. })
+                            if !matches!(op, KindEvalOp::Replicate { .. }) =>
+                        {
+                            KindBatchOutcome::IntentBlocked {
+                                key: base_key.clone(),
+                            }
+                        }
                         Some(txn::Envelope::Intent { .. }) => KindBatchOutcome::ConditionFailed {
                             key: base_key.clone(),
                         },

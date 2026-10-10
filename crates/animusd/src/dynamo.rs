@@ -9655,6 +9655,9 @@ pub(crate) async fn kind_write_item_at_leader<E: Env, R: RelayClient>(
             })
         }
         KindEvalApplied::ConditionFailed => Ok(KindWriteOutcome::ConditionFailed),
+        // Issue #1203: an in-flight transaction's intent on the key — AWS's
+        // `TransactionConflictException`, never a false condition.
+        KindEvalApplied::IntentBlocked => Err(WireError::transaction_conflict_exception()),
         KindEvalApplied::Rejected { code, message } => Err(rejected_wire_error(&code, message)),
         // ADR 0075 G-d M2: only a `KindEvalOp::Replicate` is ever superseded,
         // and no client write path proposes one (M3's receiver handler has its
@@ -9907,6 +9910,9 @@ pub(crate) async fn kind_write_batch_at_leader<E: Env, R: RelayClient>(
                             })
                         }
                         KindEvalApplied::ConditionFailed => Ok(KindWriteOutcome::ConditionFailed),
+                        KindEvalApplied::IntentBlocked => {
+                            Err(WireError::transaction_conflict_exception())
+                        }
                         KindEvalApplied::Rejected { code, message } => {
                             Err(rejected_wire_error(&code, message))
                         }
@@ -10979,6 +10985,7 @@ const RELAYABLE_WIRE_ERROR_CODES: &[&str] = &[
     "ProvisionedThroughputExceededException",
     "ServiceUnavailable",
     "ConditionalCheckFailedException",
+    "TransactionConflictException",
     "ResourceNotFoundException",
     "ResourceInUseException",
     "TransactionCanceledException",

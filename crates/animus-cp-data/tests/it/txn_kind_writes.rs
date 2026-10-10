@@ -1089,9 +1089,9 @@ fn a_kind_eval_racing_a_still_unresolved_pending_stage_gets_condition_failed_the
         animus_control::ProposeResult::Accepted { index, .. } => {
             sim.run_for(SETTLE);
             match node.kind_batch_outcome(index) {
-                Some((_, KindBatchOutcome::ConditionFailed { key: k })) => assert_eq!(k, key),
+                Some((_, KindBatchOutcome::IntentBlocked { key: k })) => assert_eq!(k, key),
                 other => panic!(
-                    "expected ConditionFailed against the unresolved intent, got {other:?} \
+                    "expected IntentBlocked against the unresolved intent, got {other:?} \
                      (seed={seed})"
                 ),
             }

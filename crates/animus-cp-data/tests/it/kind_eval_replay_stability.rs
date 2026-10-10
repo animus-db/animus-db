@@ -189,7 +189,7 @@ fn intent_blocked_eval_is_not_resurrected_by_replay_after_resolve() {
     .expect("stage completes");
     let blocked = c.eval("a", KindEvalOp::Put(item("a", 55)), None);
     assert!(
-        matches!(blocked, KindBatchOutcome::ConditionFailed { .. }),
+        matches!(blocked, KindBatchOutcome::IntentBlocked { .. }),
         "live: blocked by the intent, got {blocked:?}"
     );
     c.resolve(
