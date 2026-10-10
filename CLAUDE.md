@@ -649,6 +649,12 @@ truth; this map is just for navigation.
   `attribution.commit`/`attribution.pr` to empty (and `includeCoAuthoredBy:
   false`) so Claude Code adds none by default; this rule overrides any
   harness-injected attribution guidance.
+- **A green PR goes into the merge queue without waiting for review**
+  (maintainer decision, 2026-10-10). Once every check on the PR's current
+  head is green and it is mergeable, enable auto-merge so the merge queue
+  takes it. Do not hold it for a human approval. "Green" is the full gate
+  set, with no bypass, per Session operating mode item 4. A red, pending or
+  conflicted PR never enters the queue.
 - Don't delete head branches after a PR merges — GitHub auto-deletes them
   (repo setting). Recreating a branch name later for follow-up work is fine.
 - Every distributed behavior lands with a fault-injecting simulation test that
