@@ -250,12 +250,15 @@ problem, not an artifact of one specific format.
   its own caller; this is encryption **at rest**, not confidentiality
   against a live memory dump or a malicious operator with process access.
   Key **rotation** is out of scope for v1 — there is no mechanism to
-  re-encrypt an existing data directory under a new key; rotating means
+  re-encrypt an existing data directory under a new key. ~~Rotating means
   standing up a fresh, differently-keyed replica and letting Raft catch it
   up (the same mechanism that already handles any other full-replica
   rebuild), then decommissioning the old one. This mirrors ADR 0064's TLS
   cert rotation story (no built-in rotation, replace-the-replica) rather
-  than inventing a new one. **No key derivation, no KMS integration, no
+  than inventing a new one.~~ **[Superseded 2026-10-10: the
+  replace-the-replica path no longer works since the 2026-09-07 cluster-
+  store amendment made the segment/backup stores share one cluster-wide
+  key; see "Amendment 2026-10-10: key rotation is unsupported".]** **No key derivation, no KMS integration, no
   per-tenant keys** — one key per node, matching the "per-node local key
   file" pattern this ADR intentionally keeps as simple as `--tls-cert`.
 - **Zeroization**: `EncryptionKey` wraps its 32 bytes in `zeroize::
@@ -426,7 +429,8 @@ its fix.
   cost (frame offset/length pairs, not the frame bytes themselves) for
   avoiding whole-file decryption on every `read_at` — the right trade for
   `LsmEngine`'s point-read-heavy access pattern.
-- Key rotation and per-tenant keys are explicitly deferred; a future ADR
+- *(See the 2026-10-10 amendment: rotation is unsupported and planned.)*
+  Key rotation and per-tenant keys are explicitly deferred; a future ADR
   would need to design a re-encryption or key-versioning story if either
   becomes a real requirement — nothing in this design blocks that, but
   nothing in it builds toward it either.
@@ -1187,3 +1191,64 @@ tests/segment_store_encrypted_fault_corpus.rs`) stays green unmodified —
 this change alters no fault-injection surface.
 
 No wire, config, or CLI change; no new dependency.
+
+## Amendment 2026-10-10: key rotation is unsupported (issue #1276)
+
+**Verified against the code.** `animusd` loads one `EncryptionKey` per node
+(`load_encryption_key` in `crates/animusd/src/lib.rs`) and hands that same key
+to the node's `EncryptedEnv` (WAL and per-tablet engine files) and to every
+`EncryptedSegmentStore` it builds (`local_cluster_store`, the `--backup-store`
+and stream-segment wrappers). The `animus-env` envelope header is
+`MAGIC "ADE1" || VERSION(1) || SALT(16)` and carries **no key id**; the
+per-directory marker authenticates one key. So there is exactly one key in
+play per node and per cluster, and nothing identifies which key sealed a given
+file or object.
+
+**Key rotation is not supported.** The decision section's "stand up a
+differently-keyed replica, let Raft catch it up, decommission the old one" was
+written when only the node-local disk was sealed. The 2026-09-07 amendments
+("As-built: cluster store", "Key scope") made the default replicated segment
+and backup stores, and the stream-segment objects, share the **identical
+cluster-wide key**, because a node routinely reads what another node wrote
+(ciphertext is exchanged between nodes). A replica with a different key
+therefore cannot decrypt the cluster store or any backup/PITR/stream segment
+sealed under the old key, and its own objects are unreadable by its peers. The
+path is no longer valid, and the decision-section text is marked superseded.
+
+**What an operator must not do.**
+- Do not edit or replace the key file (or a Kubernetes `Secret`'s content, or
+  `spec.encryptionKeySecretName`) on a running or existing cluster. Nodes
+  refuse to start against a marker the new key does not authenticate; the
+  operator does not roll pods on same-name `Secret` content changes.
+- Do not run nodes with different keys in one cluster, and do not add a
+  differently-keyed node expecting Raft catch-up to migrate data.
+- Do not discard the old key while any backup, PITR chain, or stream segment
+  sealed under it exists; losing the key loses that data permanently.
+- If the key leaked, the only complete remedy today is a new cluster with a new
+  key, with data moved by S3 export/import or at the application level (see
+  `docs/runbook/encryption-key-rotation.md`; untried).
+
+**Plan for real rotation (not built).**
+1. *Key id in the envelope.* A new envelope version (`ADE1` VERSION 2) adds a
+   key id (a short fingerprint) to the header; the segment-store object format
+   and the directory marker gain the same field. Version 1 files have an
+   implicit key id of "the single key".
+2. *Keyring.* The key file becomes a keyring: one active key (encrypt) plus any
+   number of retired keys (decrypt only), selected by key id. Startup validates
+   every marker against the keyring.
+3. *Cluster distribution.* The active key id is cluster state behind a
+   cluster-version gate, so every node can decrypt before any node starts
+   encrypting under the new key (roll order: keyring everywhere, then flip).
+4. *Background re-seal.* Engine files are re-sealed by compaction (new files
+   use the active key); the WAL by its normal truncation; segment-store
+   objects by a rewrite sweep. A retired key is removable once an inventory
+   reports no remaining file or object under its id.
+5. *ADR 0073 compatibility.* This is a durable-format change: a new envelope
+   version with a new no-overwrite golden fixture, the v1 decoder kept under
+   `legacy` forever, a per-version expected value, round-trip and old-input
+   tests, and an inventory row. The segment-store object, the marker and the
+   keyring/active-key replicated state are cross-node surfaces, so each is
+   classified (G, L or F) with an exhaustive `required_gate` row.
+
+Tracked in `docs/roadmap.md` (S-03 follow-up); the runbook and the website no
+longer describe replica replacement as a rotation path.
