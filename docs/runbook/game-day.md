@@ -18,16 +18,16 @@ base port 14000, so admin `14003`, DynamoDB `14002`):
 
 ```sh
 docker build -t animusd:e2e .
-E2E_TLS=1 E2E_ENCRYPTION=1 scripts/e2e-kind.sh      # optional legs: E2E_TLS, E2E_S3, E2E_ENCRYPTION, E2E_WEBHOOK; needs docker, kind, kubectl, curl, jq
+E2E_KEEP_CLUSTER=1 E2E_TLS=1 E2E_ENCRYPTION=1 scripts/e2e-kind.sh      # optional legs: E2E_TLS, E2E_S3, E2E_ENCRYPTION, E2E_WEBHOOK; needs docker, kind, kubectl, curl, jq
 ```
 
-**The script tears its cluster down on exit** (`cleanup` trap) and has no keep-alive option,
-so a drill cannot reuse the cluster it creates. Either (a) copy its bring-up phases by hand
-(`kind create cluster`, `kind load docker-image`, `kubectl apply -f deploy/operator/crd.yaml`,
-build and run `animus-operator run` out of cluster with `RUST_LOG=info` or apply
-`deploy/operator/{rbac,deployment}.yaml`, then `kubectl apply` an `AnimusCluster` like the
-manifest in the script's "apply AnimusCluster" phase), or (b) add a keep-alive flag to the
-script (a code change this page does not make; report it as a follow-up). Reach pods with
+**The script tears its cluster down on exit by default.** Set `E2E_KEEP_CLUSTER=1` to keep it:
+the kind cluster and the `AnimusCluster` stay up (the final delete-and-GC phase is skipped, on
+a failed run too), the port-forwards and the out-of-cluster operator are stopped, and the exit
+log prints the `KUBECONFIG` to export and the `kind delete cluster --name animus-e2e` command.
+Restart the operator before a drill step that needs reconciliation (`KUBECONFIG=<workdir>/kubeconfig
+cargo run -p animus-operator -- run`, or apply `deploy/operator/{rbac,deployment}.yaml`).
+Not run in the sandbox (no `kind`); `bash -n` only. Reach pods with
 `kubectl port-forward pod/e2e-<n> 18101:14003 18100:14002` (the script does this itself).
 
 Use a larger shape for the drills that need it: `nodes: 5`, `controlNodes: 3`, so that data-only
