@@ -1194,6 +1194,17 @@ pub const CONDITION_CONTROL_NODES_SHRINK_REJECTED: &str = "ControlNodesShrinkRej
 /// voter check once nothing is pending), never the source of truth, which
 /// is always the live control group itself.
 pub const CONDITION_CONTROL_NODES_GROWING: &str = "ControlNodesGrowing";
+/// Annotation on an `AnimusCluster` (value `"true"`) that pauses the
+/// operator's control-voter auto-add (issue #1277): while set, reconcile
+/// never calls `member/add` for a control ordinal in `0..controlNodes` that
+/// is missing from the live voter set, so a manual `animus admin
+/// control-remove` (quorum-loss recovery) is not silently undone. Children
+/// are still applied. Any other value, or removal, resumes auto-add.
+pub const ANNOTATION_PAUSE_CONTROL_VOTER_RECONCILE: &str =
+    "animusdb.io/pause-control-voter-reconcile";
+/// Condition type set while [`ANNOTATION_PAUSE_CONTROL_VOTER_RECONCILE`] is
+/// `"true"`; cleared when the annotation is removed.
+pub const CONDITION_CONTROL_VOTER_RECONCILE_PAUSED: &str = "ControlVoterReconcilePaused";
 /// Condition type name warning that `spec.storage.ephemeral: true` is a
 /// standing Raft safety hazard for this cluster's control voter(s) (issue
 /// #864, root-causing the S-07d growth stall): the voter's own Raft WAL
