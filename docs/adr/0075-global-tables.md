@@ -845,8 +845,6 @@ register checker.
   child whose replicas all move to other nodes lost its pre-split rows. Fixed
   separately by #1231 (ADR 0058's 2026-10-05 amendment); `split_under_mrsc`
   covers writes acked both before and after the split.
-- Issue #1226 (pre-existing): quiescence never settles on links whose RTT
-  exceeds the heartbeat interval, so stretch groups get no quiescence benefit.
 - The control quorum across Regions is only checked at admin time; a cluster
   whose control majority sits in one Region loses DDL when that Region fails.
   `/admin/global-tables` warns; placement of control voters is the operator's.
