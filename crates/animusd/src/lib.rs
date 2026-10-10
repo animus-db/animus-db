@@ -22919,6 +22919,11 @@ mod sim_cluster_schema_broadcast;
 #[cfg(test)]
 mod sim_cluster_dynamo_drop_table;
 
+/// Issue #1245: a table re-created under the same name with a different key
+/// schema is usable on every node (the registry's key schema is refreshed).
+#[cfg(test)]
+mod sim_cluster_dynamo_recreate_schema;
+
 /// Issue #920: a `ConsistentRead: true` read routed through a node hosting
 /// no replica must not hang for tens of seconds after every replica of an
 /// idle (quiesced, ADR 0048) tablet group is crashed and restarted in

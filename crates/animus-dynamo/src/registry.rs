@@ -264,8 +264,9 @@ impl SchemaRegistry {
     /// *definitions* (surviving a restart) rather than from process-local
     /// `create_table_with_indexes` state.
     ///
-    /// The table is registered with `schema` if absent, then its index set is
-    /// replaced wholesale to match `indexes` — there is no per-index entry data
+    /// The table is registered with `schema` if absent; if present, its key
+    /// schema is refreshed to `schema` (a re-created table may have a different
+    /// one) and its index set is replaced wholesale to match `indexes` — there is no per-index entry data
     /// to preserve or discard across a shape change any more (ADR 0041), so
     /// this is a plain resync, not a merge.
     ///
@@ -282,12 +283,15 @@ impl SchemaRegistry {
             // Register fresh with the desired indexes in one shot.
             return self.create_table_with_indexes(table, schema, indexes.to_vec());
         }
-        let partition_key = self
-            .tables
-            .get(table)
-            .map(|t| t.schema.partition_key.clone())
-            .unwrap_or_default();
         let state = self.tables.get_mut(table).expect("table present");
+        // The catalog is authoritative: a table that was dropped and re-created
+        // under the same name may carry a different key schema, so refresh it
+        // (and treat the sort key as required again, as for any declared table).
+        if state.schema != schema {
+            state.schema = schema;
+            state.sort_key_optional = false;
+        }
+        let partition_key = state.schema.partition_key.clone();
         state.indexes = indexes
             .iter()
             .map(|index| index_state(index, &partition_key))
@@ -491,6 +495,24 @@ mod tests {
         assert_eq!(
             reg.index_projected_attributes("users", "by-email"),
             Ok(None)
+        );
+    }
+
+    #[test]
+    fn sync_indexes_refreshes_key_schema_of_recreated_table() {
+        let mut reg = SchemaRegistry::new();
+        reg.sync_indexes("t", TableSchema::composite("pk", "sk"), &[])
+            .unwrap();
+        // Table dropped and re-created with a different key schema.
+        reg.sync_indexes("t", TableSchema::simple("id"), &[])
+            .unwrap();
+        assert_eq!(reg.schema("t"), Some(&TableSchema::simple("id")));
+        let (pk, sk) = reg.extract_key("t", &item(&[("id", s("k"))])).unwrap();
+        assert_eq!(pk, s("k"));
+        assert_eq!(sk, None);
+        assert_eq!(
+            reg.extract_key("t", &item(&[("pk", s("p")), ("sk", s("a"))])),
+            Err(RegistryError::MissingKey("id".into()))
         );
     }
 

@@ -928,3 +928,5 @@ assertion.
 ## Fuzzing (roadmap R-01 (c))
 
 `wire::decode_request` (every operation, and through it the private Update/Condition/Projection/KeyCondition expression parsers), `streams_wire`, `partiql::parse_statement`/`lower_*` and `sigv4::parse_credential`/`verify` are fuzz targets (`dynamo_request`, `dynamo_expressions`, `partiql`, `http_sigv4`). A new operation or expression form needs a seed in `fuzz/seeds/`; a decoder that panics on any input is a bug, not a precondition. See `fuzz/README.md` (stable smoke: `cd fuzz && cargo test --release --test smoke`).
+
+- `SchemaRegistry::sync_indexes` also refreshes the key schema of an already-registered table (a drop + re-create may change it); see `docs/lessons/code-patterns/2026-10-10-a-reconcile-from-the-catalog-must-reconcile-every-field.md`.
