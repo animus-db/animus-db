@@ -6,7 +6,9 @@
 //! `last_seen` watermark instead of a full `Metadata` clone (`RaftNode::
 //! watch_delta_since`).
 //!
-//! Bounded by **both** entry count and total byte size — oldest evicted
+//! Bounded by **total byte size alone** (issue #1191: an entry-count cap
+//! made a ~10k-tablet node drain, one small delta per tablet, overflow the
+//! ring long before the byte budget did) — oldest evicted
 //! first — and deliberately **per-node and best-effort**: nothing here is
 //! replicated or agreed on, and no correctness property depends on its
 //! contents surviving. A caller whose `last_seen` has aged out of the
@@ -20,8 +22,6 @@ use std::collections::VecDeque;
 
 use crate::mirror::KeyWrite;
 
-/// Default entry-count bound (see [`DeltaRing::default`]).
-pub const DEFAULT_MAX_ENTRIES: usize = 1024;
 /// Default total-byte bound (see [`DeltaRing::default`]).
 pub const DEFAULT_MAX_BYTES: usize = 4 * 1024 * 1024;
 
@@ -54,27 +54,27 @@ fn entry_size(entry: &DeltaEntry) -> usize {
 pub struct DeltaRing {
     entries: VecDeque<DeltaEntry>,
     bytes: usize,
-    max_entries: usize,
     max_bytes: usize,
 }
 
 impl Default for DeltaRing {
     fn default() -> Self {
-        Self::with_bounds(DEFAULT_MAX_ENTRIES, DEFAULT_MAX_BYTES)
+        Self::with_max_bytes(DEFAULT_MAX_BYTES)
     }
 }
 
 impl DeltaRing {
-    /// A ring with explicit bounds — the "configurable" half of the design
-    /// (defaults via [`DeltaRing::default`]/[`crate::RaftNode::start`]; a
-    /// caller that wants tighter bounds, e.g. a test proving eviction
+    /// A ring with an explicit byte budget — the "configurable" half of the
+    /// design (default via [`DeltaRing::default`]/[`crate::RaftNode::start`];
+    /// a caller that wants a tighter budget, e.g. a test proving eviction
     /// behavior without pushing thousands of entries, uses this directly).
+    /// There is deliberately no entry-count bound: every entry is O(1) bytes
+    /// per touched tablet, so the byte budget alone bounds memory.
     #[must_use]
-    pub fn with_bounds(max_entries: usize, max_bytes: usize) -> Self {
+    pub fn with_max_bytes(max_bytes: usize) -> Self {
         Self {
             entries: VecDeque::new(),
             bytes: 0,
-            max_entries,
             max_bytes,
         }
     }
@@ -91,7 +91,7 @@ impl DeltaRing {
     }
 
     /// Push one drained command's derived writes at `index`, evicting the
-    /// oldest entries first if this exceeds either bound. Every push must be
+    /// oldest entries first if this exceeds the byte bound. Every push must be
     /// at a strictly higher index than the previous one (the apply task's
     /// own commit-order discipline) — debug-asserted, not a runtime-enforced
     /// invariant, since this type is a read-side cache no safety property
@@ -108,9 +108,7 @@ impl DeltaRing {
         // `max_bytes` (there is nothing smaller left to evict down to, and a
         // ring that discarded its own freshest entry would be self-defeating
         // — every push must leave at least one entry retained).
-        while self.entries.len() > 1
-            && (self.entries.len() > self.max_entries || self.bytes > self.max_bytes)
-        {
+        while self.entries.len() > 1 && self.bytes > self.max_bytes {
             let Some(evicted) = self.entries.pop_front() else {
                 break;
             };
@@ -219,17 +217,20 @@ mod tests {
     }
 
     #[test]
-    fn entry_count_eviction_produces_a_gap_fallback() {
-        let mut ring = DeltaRing::with_bounds(3, usize::MAX);
+    fn byte_eviction_produces_a_gap_fallback() {
+        // Each entry is 8 (index) + 1 (key) + 8 (value) = 17 bytes; a
+        // 51-byte budget retains exactly the newest 3.
+        let mut ring = DeltaRing::with_max_bytes(51);
         for i in 1..=5u64 {
             ring.push(i, vec![put(b"k", &i.to_be_bytes())]);
         }
-        assert_eq!(ring.len(), 3, "only the newest 3 entries are retained");
-        // Indices 1 and 2 were evicted — a caller stuck at last_seen=1 has
+        assert_eq!(ring.len(), 3, "only the newest 3 entries fit the budget");
+        assert!(ring.bytes() <= 51);
+        // Indices 1 and 2 were evicted: a caller stuck at last_seen=1 has
         // fallen outside the window.
         assert_eq!(ring.writes_since(1, 5), None);
-        // But a caller at last_seen=2 (the last evicted index) is exactly at
-        // the boundary the retained window still covers.
+        // A caller at last_seen=2 (the last evicted index) is exactly at the
+        // boundary the retained window still covers.
         assert_eq!(
             ring.writes_since(2, 5),
             Some(vec![
@@ -241,11 +242,24 @@ mod tests {
     }
 
     #[test]
+    fn many_small_entries_are_retained_with_no_entry_count_cap() {
+        // Issue #1191: > 1024 small deltas (a ~10k-tablet node drain) must
+        // all stay inside the default byte budget.
+        let mut ring = DeltaRing::default();
+        for i in 1..=10_000u64 {
+            ring.push(i, vec![put(b"tablet-key", &[0u8; 100])]);
+        }
+        assert_eq!(ring.len(), 10_000);
+        assert!(ring.bytes() <= DEFAULT_MAX_BYTES);
+        assert_eq!(ring.writes_since(0, 10_000).map(|w| w.len()), Some(10_000));
+    }
+
+    #[test]
     fn byte_bound_eviction_from_one_huge_entry() {
         // A single entry whose own footprint exceeds the byte bound still
         // gets retained (there is nothing smaller to evict down to), but it
         // evicts every entry that came before it.
-        let mut ring = DeltaRing::with_bounds(1024, 100);
+        let mut ring = DeltaRing::with_max_bytes(100);
         ring.push(1, vec![put(b"a", b"small")]);
         ring.push(2, vec![put(b"b", b"also-small")]);
         assert_eq!(ring.len(), 2);
