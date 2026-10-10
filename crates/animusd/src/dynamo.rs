@@ -3203,7 +3203,7 @@ const EXPORT_MANIFEST_ROOT: &str = "AWSDynamoDB";
 /// mirroring the on-demand backup capture driver's own `CHUNK_ROWS`
 /// simplification against a byte budget (`backup_capture.rs`'s own doc;
 /// ADR 0068 §1).
-const EXPORT_CHUNK_ROWS: usize = 1000;
+pub(crate) const EXPORT_CHUNK_ROWS: usize = 1000;
 
 /// The bare export id (the random hex suffix [`create_export`] minted) from
 /// its own ARN — the last `/`-separated segment ([`wire::export_arn`]

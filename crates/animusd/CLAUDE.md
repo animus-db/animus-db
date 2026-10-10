@@ -5834,6 +5834,11 @@ ADR itself for the full design/rationale.
   destination tablet + `BeginImport` row and returns immediately —
   asynchronous, like restore.
 
+  `gunzip_bytes` (issue #1189) decompresses through `Read::take(limit + 1)` with
+  `MAX_DECOMPRESSED_OBJECT_BYTES` (no ADR-documented per-object import limit exists, so it is
+  `EXPORT_CHUNK_ROWS` x `MAX_ITEM_SIZE_BYTES` x 2); an overrun is a terminal
+  `DecompressedObjectTooLarge` import failure, not a retry.
+
   `import.rs`'s `import_tick` (once per `IMPORT_TICK_INTERVAL` per led
   tablet, no durable cursor — safe to re-sweep on retry because every
   seeded row carries the fixed `IMPORT_SEED_VERSION`, and
