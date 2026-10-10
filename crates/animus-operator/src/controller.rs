@@ -1549,7 +1549,9 @@ fn classify_ready_route(answer: &Result<serde_json::Value, String>) -> ReadyRout
     match answer {
         Ok(_) => ReadyRoute::Present,
         Err(e) if e.contains("status 503") => ReadyRoute::Present,
-        Err(e) if e.contains("status 404") => ReadyRoute::Absent,
+        // The API server's own "pod does not exist (yet)" 404 (pod proxy) is
+        // not an old binary: it says nothing about the route.
+        Err(e) if e.contains("status 404") && !e.contains("pods \"") => ReadyRoute::Absent,
         Err(_) => ReadyRoute::Unknown,
     }
 }
@@ -1613,9 +1615,19 @@ fn revert_is_ungated(live: &StatefulSet, only_probe_differs: bool, chosen: &str)
         && !roll::StsView::of(live, live).roll_in_flight()
 }
 
+/// Upper bound on the whole readiness-route observation: it is an
+/// optimisation of the probe path and must never stall the rest of a
+/// reconcile (topology annotations, status). Pods not answered in time count
+/// as `Unknown`.
+const READY_PROBE_BUDGET: Duration = Duration::from_secs(3);
+
 /// Observe every pod's `GET /admin/ready` and pick the `readinessProbe` path
 /// (see [`pick_readiness_path`]). Flipping the path changes the pod template,
 /// so it goes through the roll gate like any template change.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "animus-operator has no Env seam (see its own CLAUDE.md); bounding real pod-admin-port requests is outside ADR 0003's scope, like admin_client::with_admin_timeout"
+)]
 async fn decide_readiness_path<C: ClusterApi, A: AdminOps>(
     ctx: &Context<C, A>,
     cluster: &AnimusCluster,
@@ -1639,14 +1651,43 @@ async fn decide_readiness_path<C: ClusterApi, A: AdminOps>(
     });
     let admin_port = cluster.spec.base_port_or_default() + desired::cluster_config::PORT_ADMIN;
     let tls = tls_ca.is_some();
-    let routes = futures::future::join_all((0..cluster.spec.nodes).map(|i| {
+    // Only pods that are Running with an IP can answer; probing a pending or
+    // unscheduled pod would just burn the admin timeout. A failed pod
+    // listing is "no information", never an error.
+    let running: std::collections::BTreeSet<String> = ctx
+        .cluster_api
+        .list_pods(ns, &desired::selector_labels(&name))
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|p| {
+            p.status
+                .as_ref()
+                .is_some_and(|s| s.phase.as_deref() == Some("Running") && s.pod_ip.is_some())
+        })
+        .map(ResourceExt::name_any)
+        .collect();
+    let probes = futures::future::join_all((0..cluster.spec.nodes).map(|i| {
         let url = format!(
             "{}/admin/ready",
             admin_base_url(&name, ns, i, admin_port, tls)
         );
-        async move { classify_ready_route(&ctx.admin.get_json(&url, tls_ca).await) }
-    }))
-    .await;
+        let probe_it = running.contains(&format!("{name}-{i}"));
+        async move {
+            if probe_it {
+                classify_ready_route(&ctx.admin.get_json(&url, tls_ca).await)
+            } else {
+                ReadyRoute::Unknown
+            }
+        }
+    }));
+    let routes = match tokio::time::timeout(READY_PROBE_BUDGET, probes).await {
+        Ok(routes) => routes,
+        Err(_) => {
+            warn!(cluster = %name, "observing /admin/ready timed out; keeping the live readiness path");
+            vec![ReadyRoute::Unknown; usize::try_from(cluster.spec.nodes).unwrap_or(0)]
+        }
+    };
     pick_readiness_path(live_path.as_deref(), live.is_none(), &routes, in_flight)
 }
 
@@ -1667,6 +1708,14 @@ async fn finish_reconcile<C: ClusterApi, A: AdminOps>(
     let tls_ca = resolve_tls_ca(&ctx.cluster_api, cluster, ns, &name).await?;
     // Issue #1274, the "observed switch": the readiness route is part of the
     // pod template, so it is decided from live observation before the build.
+    //
+    // Topology annotations come FIRST and independently of the probing: the
+    // pods' `animusd` waits (bounded) for them at boot, so nothing here may
+    // delay or skip them (the trailing call below still reports pending pods
+    // for the requeue). Best effort, exactly like that trailing call.
+    if let Err(e) = resolve_pod_topology(&ctx.cluster_api, &name, ns).await {
+        warn!(cluster = %name, error = %e, "resolving pod node topology failed");
+    }
     let readiness_path =
         decide_readiness_path(ctx, cluster, ns, live_sts.as_ref(), tls_ca.as_deref()).await;
     let mut sts =
@@ -4565,11 +4614,110 @@ mod readiness_switch_tests {
         })
     }
 
+    fn running_pod(name: &str) -> k8s_openapi::api::core::v1::Pod {
+        let mut pod = k8s_openapi::api::core::v1::Pod::default();
+        pod.metadata.name = Some(name.to_string());
+        pod.status = Some(k8s_openapi::api::core::v1::PodStatus {
+            phase: Some("Running".to_string()),
+            pod_ip: Some("10.0.0.1".to_string()),
+            ..Default::default()
+        });
+        pod
+    }
+
+    #[test]
+    fn an_api_server_pod_not_found_404_is_not_an_old_binary() {
+        let missing: Result<serde_json::Value, String> =
+            Err("admin endpoint returned status 404: pods \"c-3\" not found".to_string());
+        assert_eq!(classify_ready_route(&missing), ReadyRoute::Unknown);
+        let old: Result<serde_json::Value, String> =
+            Err("admin endpoint returned status 404: unknown admin route /admin/ready".to_string());
+        assert_eq!(classify_ready_route(&old), ReadyRoute::Absent);
+    }
+
+    /// Scale-up 3 -> 4: the existing pods answer, the new ordinal does not
+    /// exist yet. The path must stay `/admin/ready` and the template must not
+    /// change (a change would roll every pod).
+    #[tokio::test]
+    async fn scale_up_with_an_unreachable_new_ordinal_changes_nothing() {
+        let ctx = ctx();
+        script_all(&ctx, [Ok(()), Ok(()), Ok(())]);
+        ctx.admin.script_get(
+            Some(3),
+            "/admin/ready",
+            Err("admin endpoint returned status 404: pods \"c-3\" not found".to_string()),
+        );
+        for i in 0..3 {
+            ctx.cluster_api.seed_pod(running_pod(&format!("c-{i}")));
+        }
+        let three = test_cluster("c", "ns", 3, None);
+        let live = build_with_readiness(&three, &three.spec, 0, READINESS_PATH_READY);
+        let four = test_cluster("c", "ns", 4, None);
+        let path = decide_readiness_path(&ctx, &four, "ns", Some(&live), None).await;
+        assert_eq!(path, READINESS_PATH_READY);
+        let desired = build_with_readiness(&four, &four.spec, 0, path);
+        let at_live_path = build_with_readiness(&four, &four.spec, 0, READINESS_PATH_READY);
+        assert!(!crate::roll::template_changed(&live, &at_live_path));
+        assert!(!crate::roll::template_changed(&live, &desired));
+    }
+
+    #[tokio::test]
+    async fn pods_that_are_not_running_are_never_probed() {
+        let ctx = ctx();
+        let cluster = test_cluster("c", "ns", 3, None);
+        let route = decide_readiness_path(&ctx, &cluster, "ns", None, None).await;
+        assert_eq!(route, READINESS_PATH_READY);
+        assert!(ctx.admin.calls().is_empty(), "{:?}", ctx.admin.calls());
+    }
+
+    /// Issue #1274 / e2e-kind-encryption: failing `/admin/ready` probes must
+    /// never skip or delay the pods' topology annotations.
+    #[tokio::test]
+    async fn topology_is_annotated_even_when_ready_probes_fail() {
+        let cluster = Arc::new(test_cluster("c", "ns", 3, None));
+        let fake = FakeClusterApi::new();
+        for i in 0..3 {
+            let mut pod = running_pod(&format!("c-{i}"));
+            pod.spec = Some(k8s_openapi::api::core::v1::PodSpec {
+                node_name: Some("node-a".to_string()),
+                ..Default::default()
+            });
+            fake.seed_pod(pod);
+        }
+        fake.seed_node_labels("node-a", &[("topology.kubernetes.io/zone", "z-a")]);
+        let admin = FakeAdminClient::new();
+        for i in 0..3 {
+            admin.script_get(
+                Some(i),
+                "/admin/ready",
+                Err("connection refused".to_string()),
+            );
+        }
+        let ctx = Arc::new(Context {
+            cluster_api: fake,
+            admin,
+            clock: crate::roll::WallClock::fixed(1_000),
+        });
+        reconcile(Arc::clone(&cluster), Arc::clone(&ctx))
+            .await
+            .expect("probe failures never fail the reconcile");
+        let patches = ctx.cluster_api.pod_patches();
+        assert_eq!(patches.len(), 3, "{patches:?}");
+        assert!(
+            patches
+                .iter()
+                .all(|(_, a)| a["animus.io/topology-zone"] == "z-a")
+        );
+    }
+
     async fn decide(
         ctx: &Context<FakeClusterApi, FakeAdminClient>,
         live_path: Option<&str>,
     ) -> &'static str {
         let cluster = test_cluster("c", "ns", 3, None);
+        for i in 0..3 {
+            ctx.cluster_api.seed_pod(running_pod(&format!("c-{i}")));
+        }
         let live = live_path.map(|p| build_with_readiness(&cluster, &cluster.spec, 0, p));
         decide_readiness_path(ctx, &cluster, "ns", live.as_ref(), None).await
     }

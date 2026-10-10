@@ -433,8 +433,14 @@ when it is the only template change and no pod is Ready, since the gate cannot
 progress on a cluster whose pods are NotReady on the probe). The live
 StatefulSet's probe path is the persisted state (no status field). A flip is a
 pod-template change and goes through the roll gate; the flip to ready waits for
-no roll in flight, the revert on a 404 does not. `FakeAdminClient` answers 404 for `/admin/ready` unless
-scripted. Liveness stays `/admin/live`. The text below describes the original
+no roll in flight, the revert on a 404 does not. Only Running pods with an IP are probed, under a 3s total budget
+(`READY_PROBE_BUDGET`), and the API server's own `pods "x" not found` 404
+(pod proxy, a pod not created yet, e.g. a scale-up ordinal) is *Unknown*, not
+"old binary": misreading it as a 404 from animusd reverted the path and rolled
+every pod (e2e-kind-s3-tls scale-up, curl 52). Pod topology annotations are
+resolved at the START of `finish_reconcile` too, so probing can never delay
+them (animusd waits for them at boot; e2e-kind-encryption). `FakeAdminClient`
+answers 404 for `/admin/ready` unless scripted. Liveness stays `/admin/live`. The text below describes the original
 `/admin/health` readiness and still explains why liveness must differ.
 
 `desired::statefulset::admin_probe` builds both probes off one shared
