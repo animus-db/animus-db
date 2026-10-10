@@ -133,6 +133,14 @@ pub struct ClusterSettings {
     pub stream_seal_age_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_retention_secs: Option<u64>,
+    /// Issue #1275: PITR retention (days, 1..=35) and PITR sealer age
+    /// (seconds). Shape parity only — no `AnimusClusterSpec` field exposes
+    /// either yet (a CRD addition is a follow-up), so this crate never
+    /// populates them and they stay absent from the emitted JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pitr_retention_days: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pitr_seal_age_secs: Option<u64>,
     /// ADR 0065 §5(a), W-08 step 4: the cluster-wide default throttle
     /// budget. Same precedent as `auto_split_ops_rate` — no
     /// `AnimusClusterSpec` field exposes either of these yet, so this crate

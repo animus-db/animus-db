@@ -682,6 +682,8 @@ async fn inplace_split_stream_shard_walks_parent_to_children_without_loss_or_dup
             StreamSealKnobs {
                 seal_bytes: 1_000_000,
                 seal_age: Duration::from_secs(3600),
+                pitr_seal_age: Duration::from_secs(3600),
+                ..Default::default()
             },
         )
         .await;

@@ -43,6 +43,8 @@ fn tiny_seal_knobs() -> StreamSealKnobs {
     StreamSealKnobs {
         seal_bytes: 1,
         seal_age: Duration::from_secs(3600),
+        pitr_seal_age: Duration::from_secs(3600),
+        ..Default::default()
     }
 }
 
