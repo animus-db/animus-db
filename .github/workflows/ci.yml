@@ -728,6 +728,24 @@ jobs:
 
       - name: Create bucket
         run: |
+          # Pull explicitly, with bounded retries: an unauthenticated ECR
+          # Public pull from the shared runner IPs intermittently fails, and
+          # a bare `docker run` then exits 125 before the bucket is even
+          # requested (#1266/#1267/#1268, 2026-10-10). A pull failure is a
+          # registry hiccup, not an S3 result, so retrying it hides nothing.
+          pulled=0
+          for attempt in 1 2 3 4 5; do
+            if docker pull --quiet "$AWSCLI_IMAGE"; then
+              pulled=1
+              break
+            fi
+            echo "::warning::pull of $AWSCLI_IMAGE failed (attempt $attempt)"
+            sleep $((attempt * 5))
+          done
+          if [ "$pulled" != "1" ]; then
+            echo "::error::could not pull $AWSCLI_IMAGE after 5 attempts"
+            exit 1
+          fi
           docker run --rm --network host \
             -e AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY" \
             -e AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY" \
