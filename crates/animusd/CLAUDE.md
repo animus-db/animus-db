@@ -2352,7 +2352,13 @@ and, before that fix's own successor, an exponential back-off
 loop here shared; that scheme was correct but still rounded every write up
 to its own next doubling checkpoint (0.2/0.6/1.4/3.0/6.2ms), an average
 half-a-step overshoot on top of real apply latency — wake-on-apply removes
-the rounding entirely. `wait_applied_past` itself is bounded only by a
+the rounding entirely. `wait_applied_past` itself makes exactly ONE pass
+(returns after the first wake or the `CP_CONFIRM_POLL_MAX` timeout, applied
+or not; it must never loop internally: issue #1249, a confirm wait on an
+index that never applies hung its request past `CLIENT_TIMEOUT` forever,
+regression `wait_applied_past_deadline_tests`; see
+`docs/lessons/testing/2026-10-10-a-nightly-only-corpus-failure-is-two-bugs-until-proven-one.md`)
+and is thereby bounded by a
 forced `CP_CONFIRM_POLL_MAX`-interval re-check, so a caller's own
 `confirm_wait_is_futile`/deadline logic — which the helper never evaluates
 itself — keeps firing on schedule even when the awaited index never

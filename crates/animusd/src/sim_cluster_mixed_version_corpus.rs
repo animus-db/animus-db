@@ -455,6 +455,25 @@ pub(super) fn wedged_control(cluster: &SimCluster) -> Vec<u64> {
         .collect()
 }
 
+/// The wedged control replicas once the **expected** victim is the only one
+/// (issue #1249). A negative control's oracle is "exactly `victim` is wedged",
+/// but `wedged_control` is `applied < the leader's commit`, and the leader
+/// keeps committing (its own periodic entries) while the followers' commit
+/// advance rides the next heartbeat: a single sample taken at an arbitrary
+/// virtual instant can catch a healthy B2 follower one entry behind and
+/// report `[victim, follower]` (seen as `expected only node 1 wedged, got
+/// [1, 2]`). An eventual property is polled, never sampled once (root
+/// `CLAUDE.md`): converge to `[victim]`, and return what was last seen, so a
+/// replica that is genuinely wedged (or a victim that is not) still fails.
+fn wedged_settled(cluster: &mut SimCluster, victim: u64) -> Vec<u64> {
+    let mut last = wedged_control(cluster);
+    let _ = converge(cluster, |c| {
+        last = wedged_control(c);
+        last == [victim]
+    });
+    last
+}
+
 pub(super) fn era_fully_recorded(cluster: &SimCluster) -> bool {
     (0..NODES).all(|n| {
         let m = cluster.metadata(n);
@@ -820,7 +839,7 @@ fn run_negative_control(c: &Cell) -> Verdict {
     if !accepted {
         v.push("the premature emit was never accepted".into());
     }
-    let wedged = wedged_control(&cluster);
+    let wedged = wedged_settled(&mut cluster, victim);
     if wedged != vec![victim] {
         v.push(format!(
             "expected only node {victim} wedged, got {wedged:?}"
@@ -1123,7 +1142,7 @@ fn run_ladder_negative(c: &Cell, neg: Neg) -> Verdict {
         v.push(format!("the bad emit was not accepted: {accepted:?}"));
     }
     w.run(&mut cluster, Duration::from_secs(6));
-    let wedged = wedged_control(&cluster);
+    let wedged = wedged_settled(&mut cluster, OLD);
     if wedged != vec![OLD] {
         v.push(format!("expected only node {OLD} wedged, got {wedged:?}"));
     }
@@ -1356,7 +1375,7 @@ fn run_global_negative(c: &Cell) -> Verdict {
         v.push(format!("the bad emit was not accepted: {accepted:?}"));
     }
     w.run(&mut cluster, Duration::from_secs(6));
-    let wedged = wedged_control(&cluster);
+    let wedged = wedged_settled(&mut cluster, OLD);
     if wedged != vec![OLD] {
         v.push(format!("expected only node {OLD} wedged, got {wedged:?}"));
     }
@@ -1625,7 +1644,7 @@ fn run_mrec_negative(c: &Cell) -> Verdict {
         v.push(format!("the bad emit was not accepted: {accepted:?}"));
     }
     w.run(&mut cluster, Duration::from_secs(6));
-    let wedged = wedged_control(&cluster);
+    let wedged = wedged_settled(&mut cluster, OLD);
     if wedged != vec![OLD] {
         v.push(format!("expected only node {OLD} wedged, got {wedged:?}"));
     }
@@ -2073,6 +2092,48 @@ fn sim_cluster_mixed_version_corpus_member_down() {
 #[test]
 fn sim_cluster_mixed_version_corpus_negative_control_is_caught() {
     run_family("negative_control_premature");
+}
+
+/// Issue #1249: the nightly `upgrade_mixed_cluster` seeds that failed, frozen.
+/// Three hung a client write in flight when its node restarted
+/// (`write_path::wait_applied_past` never returned to its caller's deadline;
+/// "the workload did not finish within its budget"); two caught a healthy B2
+/// follower one entry behind the leader's commit at the single N1 sample
+/// ("expected only node 1 wedged, got [1, 2]"). Pinned so a regression of
+/// either fails per push, not only at the nightly's depth.
+#[test]
+fn sim_cluster_mixed_version_corpus_issue_1249_pinned_seeds() {
+    let pinned: [(&str, Kind, u64); 5] = [
+        (
+            "kill_b2_leader",
+            Kind::KillB2Leader,
+            2_564_138_293_302_078_740,
+        ),
+        (
+            "member_down_blocks_era",
+            Kind::MemberDown,
+            12_442_384_602_217_604_344,
+        ),
+        ("roll_descending", Kind::Roll(1), 3_666_506_192_210_358_048),
+        (
+            "negative_control_premature_era_variant",
+            Kind::NegativeControl,
+            7_065_717_046_081_461_260,
+        ),
+        (
+            "negative_control_premature_era_variant",
+            Kind::NegativeControl,
+            7_065_712_648_034_948_416,
+        ),
+    ];
+    for (name, kind, seed) in pinned {
+        let c = Cell {
+            name: name.to_string(),
+            seed,
+            kind,
+        };
+        assert_ok(&run_cell(&c));
+    }
 }
 
 #[test]
