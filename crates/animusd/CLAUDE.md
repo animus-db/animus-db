@@ -12418,3 +12418,14 @@ saga tests' `S` harness needs a `pad` peer so peer index == bridge cluster index
   `LsmEngine::open*` call in this crate must pass `LsmOptions::production()`.
 
 - A single-item write blocked by another transaction's write intent answers `TransactionConflictException` (`KindBatchOutcome::IntentBlocked` -> `KindEvalApplied::IntentBlocked` -> `WireError::transaction_conflict_exception`), never `ConditionalCheckFailedException`; the code is in `RELAYABLE_WIRE_ERROR_CODES`. See `docs/lessons/code-patterns/2026-10-10-a-no-op-label-shared-by-two-causes-hides-the-wire-error.md`.
+
+## `animusd recover-control` (`control_recover.rs`, ADR 0077, issue #1178)
+
+Offline force-new-configuration of the control plane: process boundary around
+`animus_control::recover`. Prints the plan; only `--acknowledge-data-loss` writes.
+`animusd` has no data-dir lock, so "is a node running here?" is answered by binding
+the node's own internal listen address (held for the whole run). Refuses a data-only
+node, a bad index, a missing/empty WAL, and a node that is not a voter in its own
+WAL. WAL path is `<dir>/internal/raft.wal` (`--encryption-key` as for the node).
+Tests: `cargo test -p animusd --lib control_recover`. Runbook:
+`docs/runbook/control-plane-quorum-loss.md`.

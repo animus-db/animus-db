@@ -292,6 +292,7 @@ async fn main() -> ExitCode {
         Some("gen-config") => gen_config(&args[1..]),
         Some("join") => run_join(&args[1..]).await,
         Some("control") => run_control(&args[1..]).await,
+        Some("recover-control") => run_recover_control(&args[1..]).await,
         Some("data") => run_data(&args[1..]).await,
         _ => run(&args).await,
     };
@@ -353,6 +354,7 @@ const USAGE: &str = "usage:\n  \
     animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--dynamo-auth PATH]\n  \
     animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral] [--advertise-host NAME] [--label K=V]... [--labels-file PATH [--labels-file-annotations]] [--labels-wait-secs N] [--encryption-key PATH] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3]\n  \
     animusd control --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--encryption-key PATH]\n  \
+    animusd recover-control --config FILE --node I [--dir DIR] [--encryption-key PATH] [--acknowledge-data-loss]\n  \
     animusd data --config FILE --node I [--dir DIR] [--ephemeral] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH]\n  \
     animusd data --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH] [--encryption-key PATH] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3]";
 
@@ -2153,6 +2155,54 @@ async fn run_single(
 /// 0035 PR3) — no CP data storage engine, no `raftkv` env, no DynamoDB
 /// listener. `--ephemeral` (ADR 0038 PR2) selects a volatile in-memory
 /// system-keyspace mirror engine instead of the durable on-disk default.
+/// `recover-control` (issue #1178, ADR 0077): offline force-new-configuration
+/// of a control node whose quorum is permanently lost. Without
+/// `--acknowledge-data-loss` it only prints what it would do and exits non-zero.
+async fn run_recover_control(args: &[String]) -> Result<(), String> {
+    let mut config_path: Option<String> = None;
+    let mut node: Option<usize> = None;
+    let mut dir: Option<std::path::PathBuf> = None;
+    let mut encryption_key_path: Option<String> = None;
+    let mut ack = false;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--config" => config_path = Some(parse_next(&mut it, "--config")?),
+            "--node" => node = Some(parse_next(&mut it, "--node")?),
+            "--dir" => dir = Some(parse_next::<String>(&mut it, "--dir")?.into()),
+            "--encryption-key" => {
+                encryption_key_path = Some(parse_next(&mut it, "--encryption-key")?);
+            }
+            "--acknowledge-data-loss" => ack = true,
+            other => return Err(format!("unknown recover-control argument `{other}`")),
+        }
+    }
+    let path = config_path.ok_or("recover-control requires --config FILE")?;
+    let index = node.ok_or("recover-control requires --node I")?;
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("reading {path}: {e}"))?;
+    let mut config = ClusterConfig::from_json(&text).map_err(|e| format!("parsing {path}: {e}"))?;
+    apply_encryption_key_flag(&mut config, index, encryption_key_path)?;
+    let dir = dir.unwrap_or_else(|| std::env::temp_dir().join(format!("animusd-control-{index}")));
+    let report = animusd::control_recover::run(&animusd::control_recover::Request {
+        config,
+        index,
+        dir,
+        acknowledge_data_loss: ack,
+    })
+    .await;
+    match report {
+        Ok(text) => {
+            println!("{text}");
+            Ok(())
+        }
+        Err(animusd::control_recover::Error::NotAcknowledged(text)) => {
+            println!("{text}");
+            Err("refusing to proceed without --acknowledge-data-loss".to_owned())
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 async fn run_control(args: &[String]) -> Result<(), String> {
     let mut config_path: Option<String> = None;
     let mut node: Option<usize> = None;

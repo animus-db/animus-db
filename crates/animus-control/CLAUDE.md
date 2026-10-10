@@ -3249,3 +3249,19 @@ acceptance matrix (`profiles_accept_gates_exactly_up_to_their_known_version` gai
 `MAX_SUPPORTED` pin. `BinaryProfile::Release(n)` is `[n-1, n]` in the sim; `Release(2)`
 stays the literal `[1, 2]`. Cell: animusd `sim_cluster_mixed_version_corpus`
 `release3_to_release4_txn_seal_gate`.
+
+## Force-new-configuration recovery (`recover.rs`, ADR 0077, issue #1178)
+
+`recover::{plan, apply}` rewrite a survivor's own WAL offline: back it up
+(`<file>.pre-force-new-config.<term>`), then append an existing-shape
+`WalRecord::Hard` (term + `RECOVERY_TERM_JUMP`) and a config-bearing no-op
+`Append` naming the survivor as sole voter. No new format (ADR 0073), so no tag or
+fixture. `apply` needs a `DataLossAcknowledged` token and re-plans first
+(`PlanChanged` if the WAL moved). Generic over `RaftCore<C, S>` (tablet groups are
+phase 2) but only `CONTROL_WAL_FILE` is wired; the CLI is `animusd recover-control`
+(`crates/animusd/src/control_recover.rs`). A non-empty recovered WAL takes the
+`recovered` boot path, so the ADR 0009 genesis-vs-wiped cluster check never runs on
+the survivor. Stale un-wiped voters are fenced by the term jump plus `Removed`
+(`RaftNode::removed_by_leader`) but must still be wiped to be re-admitted. Tests:
+`tests/it/force_new_configuration.rs` (`ANIMUS_FORCE_RECOVER_SEEDS`, `ANIMUS_SEED`
+replay). Its restarts use `sim.stop` + fresh `RaftNode::start` on the retained engine.

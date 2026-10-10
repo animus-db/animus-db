@@ -54,42 +54,64 @@ this before anything else; it is the only fully supported recovery.
 Replace the lost voters one at a time ([node-replace.md](node-replace.md) B).
 Never remove a second voter while a third is suspected dead.
 
-## Not recoverable with any shipped tool: a majority of voters is permanently gone
+## A majority of voters is permanently gone: force a new configuration
 
-There is **no unsafe-recovery tool**. Checked by searching the source, ADRs and
-CLI for any forced membership reset, "force new cluster", unsafe or disaster
-recovery path: none exists.
+When a majority of control voters cannot come back (disks destroyed), no in-band
+change can commit: `control-remove --force` and the tablet-level `reconfigure` both
+need a majority of the old configuration. The supported way out is the **offline,
+data-losing** `animusd recover-control` (ADR 0077): it rewrites one surviving
+voter's own WAL so that it is the sole control voter. Use it only after the
+"recoverable" sections above are ruled out.
 
-- `control-remove --force` (`POST /admin/control/member/remove {"force":true}`) only
-  bypasses the reachability guard. It still proposes a configuration change through
-  the Raft log, which needs a leader and a majority of the *old* configuration, so
-  it cannot help without quorum. It never removes the last voter either.
-- The tablet-level `reconfigure` (`POST /admin/raftkv/reconfigure`) is leader-only
-  per tablet and likewise needs a majority of that tablet's group; it changes data
-  plane replica sets, not the control plane.
-- Nothing rebuilds `Metadata` from the data nodes. Hand-editing WALs or snapshots
-  is not a procedure this project supports; do not attempt it on the only copy.
+What it keeps and loses. It keeps everything in the survivor's WAL and system
+keyspace, **including entries it holds but never saw committed** (they become
+committed). It loses any write the old group acknowledged that the survivor never
+received. The tool cannot tell which those are.
 
-Consequences, stated plainly: the cluster can no longer change metadata, ever. The
-data plane may keep serving existing tablets for as long as their groups keep a
-majority, but with no failure detection or repair, any further node loss
-degrades tablets permanently. The data is still on the data nodes' disks and
-in your backups. The honest recovery is **rebuild**:
+1. **Stop client traffic and every control process.** Keep all disks. Copy every
+   surviving control voter's data directory aside.
+2. **Pick the survivor with the most complete log.** For each candidate, run the
+   tool without the ack flag (it prints the plan and writes nothing) and compare
+   "last index"; prefer the highest.
+   ```sh
+   animusd recover-control --config cluster.json --node <I> [--dir <DIR>] [--encryption-key <PATH>]
+   ```
+3. **Wipe the data directory of every other old control voter** (not just stop
+   them). A voter that restarts on its old disk keeps state the recovered group
+   does not have. The term jump and a removal notice stop it disrupting the
+   survivor, but only a wiped node may be re-admitted.
+4. **Run it for real on the chosen survivor** (process stopped; it refuses if a
+   node is bound to the node's internal address, if the node is not a voter in its
+   own WAL, or if the WAL is missing or empty):
+   ```sh
+   animusd recover-control --config cluster.json --node <I> --acknowledge-data-loss
+   ```
+   It backs the WAL up as `internal/raft.wal.pre-force-new-config.<term>` first.
+   Re-running is a no-op.
+5. **Start the survivor.** It elects itself (a one-voter group) and serves
+   `Metadata` as of its log. Check `/admin/control/members` shows one voter and
+   `/admin/health` is 200.
+6. **Regrow the group** one voter at a time with `control-add`
+   ([node-replace.md](node-replace.md) B) using the wiped nodes or new ones. Never
+   start a wiped old voter before the survivor is serving.
+7. **Reconcile `Metadata`.** It still lists the dead nodes; the failure detector
+   marks them down and repair re-replicates tablets from surviving data nodes.
+   Decommission nodes that are never coming back ([node-decommission.md](node-decommission.md)).
+   Backups in the catalog survive in the survivor's `Metadata`; those taken in
+   the lost tail are not catalogued.
 
-1. Stop client traffic. Keep all disks. If any control voter's directory survives,
-   copy it aside first.
-2. Create a new cluster (new `gen-config`/new `AnimusCluster`).
-3. Restore data. `RestoreTableFromBackup` needs the backup *catalog*, which lives in
-   the lost `Metadata`; the objects in an `fs:`/`s3://` backup store are not
-   re-importable into a new cluster by any shipped tool. **Verify this on a
-   throwaway cluster before relying on it** ([backup-restore-pitr.md](backup-restore-pitr.md)).
-   Data exported with ExportTableToPointInTime (ADR 0068, plain DynamoDB-JSON in a
-   customer bucket) can be loaded with `ImportTable`
-   (`animus admin import-create`, or `POST /admin/data/dynamo`); that is the one path that
-   does not depend on the lost catalog.
+Deployed under the Kubernetes operator, scale the `StatefulSet` to zero (or
+otherwise stop the pods), run the tool in a debug pod mounting the survivor's
+volume, and delete the other control voters' PVCs before scaling back up.
 
-So: **schedule recurring exports to an object store as a disaster-recovery copy**
-in addition to backups, until a recovery tool exists.
+The data-plane equivalent for a tablet group that lost its majority is not built
+(ADR 0077 phase 2); restore from backup/PITR.
+
+If **no** control voter's directory survives, there is nothing to recover from:
+rebuild a new cluster and load data from your exports with `ImportTable`
+(`animus admin import-create`, or `POST /admin/data/dynamo`). The backup catalog
+lives in the lost `Metadata`, so keep recurring exports to an object store as a
+disaster-recovery copy.
 
 ## Prevention
 
@@ -101,20 +123,9 @@ in addition to backups, until a recovery tool exists.
   ([node-decommission.md](node-decommission.md), [quorum-risk.md](quorum-risk.md)).
 - The operator's PodDisruptionBudget blocks voluntary evictions that would cost quorum.
 
-## Recommendation (for the maintainers)
-
-File a follow-up to design an explicit, loud, offline "force new configuration"
-recovery tool (the etcd `--force-new-cluster` / TiKV `unsafe-recover` shape): started
-on a surviving voter's data directory with an explicit acknowledgement flag, it
-rewrites the persisted Raft configuration to that voter alone (term bumped, never
-auto-run), after which `control-add` regrows the group and a re-registration
-pass reconciles tablet replicas. It needs its own ADR (it can discard committed
-metadata) and a simulation test. Without it, beta has no answer to permanent loss of
-two of three voters other than rebuild-from-export.
-
 ## Maturity
 
 Diagnosis endpoints and the refusals were checked in code, and the "single
 voter cannot be removed" refusal was run on a dev cluster. The behaviour during
 an actual loss, including the Kubernetes readiness effect, was not drilled. The
-rebuild path is untested.
+rebuild path is untested. `recover-control` is proven in simulation (the ADR 0077 corpus) and by unit tests of its refusals; it has not been drilled on a real cluster.

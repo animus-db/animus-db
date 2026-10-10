@@ -45,6 +45,8 @@ pub mod persist;
 /// Persist-round accounting shared by both planes' Raft drivers (issue #279).
 pub mod persist_round;
 pub mod raft;
+/// Offline force-new-configuration recovery of a Raft WAL (ADR 0077, issue #1178).
+pub mod recover;
 pub mod schema;
 pub mod shared_wal;
 #[cfg(any(test, feature = "sim-versions"))]
