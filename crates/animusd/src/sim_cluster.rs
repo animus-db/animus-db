@@ -413,7 +413,7 @@ fn spawn_reconciler_loop(ctx: SimNodeCtx, mut reconciler: SimReconciler) {
             // loop`'s own identical comment.
             last_seen = watch.latest();
 
-            let meta = ctx.effective_metadata();
+            let meta = ctx.effective_metadata_arc();
             let down: BTreeSet<NodeId> = meta
                 .members
                 .iter()
@@ -429,7 +429,7 @@ fn spawn_reconciler_loop(ctx: SimNodeCtx, mut reconciler: SimReconciler) {
                 crate::leader_preferences(&meta)
             };
             let view = MetadataView {
-                tablets: meta.tablets,
+                tablets: animus_cp_data::host::TabletMap::from_metadata(Arc::clone(&meta)),
                 down,
                 regions,
                 preferred_leader,

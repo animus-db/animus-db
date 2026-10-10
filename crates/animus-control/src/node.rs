@@ -569,7 +569,7 @@ pub struct RaftNode<E: Env> {
     /// `detect_loop`) reads *this*, never the core's own (unused, since
     /// `Metadata: DRIVER_APPLIED`) in-memory field. The apply task
     /// (`meta_apply_loop`) is its sole writer.
-    cache: Arc<Mutex<Metadata>>,
+    cache: Arc<Mutex<Arc<Metadata>>>,
     /// The highest Raft log index the system-keyspace engine has durably
     /// merged (ADR 0038 PR3) — mirrors `animus-cp-data`'s `engine_applied`.
     /// `cache` is only ever published *after* the matching engine write, so
@@ -743,7 +743,7 @@ impl<E: Env> RaftNode<E> {
         )));
         let detector = Arc::new(Mutex::new(FailureDetector::new(DETECT_TIMEOUT)));
         let watch = MetadataWatch::default();
-        let cache = Arc::new(Mutex::new(Metadata::default()));
+        let cache = Arc::new(Mutex::new(Arc::new(Metadata::default())));
         let engine_applied = Arc::new(AtomicU64::new(0));
         let engine_applied_for_version = Arc::clone(&engine_applied);
         let delta_ring = Arc::new(Mutex::new(delta_ring));
@@ -1214,7 +1214,16 @@ impl<E: Env> RaftNode<E> {
     /// [`engine_applied_index`](Self::engine_applied_index) instead of
     /// assuming this call alone is synchronized with a just-issued `propose`.
     pub fn metadata(&self) -> Metadata {
-        self.cache.lock().expect("cache poisoned").clone()
+        Metadata::clone(&self.cache.lock().expect("cache poisoned"))
+    }
+
+    /// The apply task's published `Metadata` as a shared handle: an `Arc`
+    /// clone, O(1) regardless of tablet count (issue #1190). The apply task
+    /// replaces the `Arc` on every publish, so a held handle is an immutable
+    /// snapshot; two reads with no apply in between are `Arc::ptr_eq`. Same
+    /// freshness contract as [`metadata`](Self::metadata).
+    pub fn metadata_arc(&self) -> Arc<Metadata> {
+        Arc::clone(&self.cache.lock().expect("cache poisoned"))
     }
 
     /// A clone of just the **membership map** — the failure detector's
@@ -1458,7 +1467,7 @@ fn send_gate_ok(features: &ClusterFeatures, msg: &RaftMsg) -> bool {
 /// otherwise race the handle and be refused for nothing.
 fn propose_gated(
     core: &Mutex<RaftCore>,
-    cache: &Mutex<Metadata>,
+    cache: &Mutex<Arc<Metadata>>,
     features: &ClusterFeatures,
     command: MetaCommand,
 ) -> ProposeResult {
@@ -1538,7 +1547,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
     metrics: MetricsHandle,
     watch: MetadataWatch,
     engine: S,
-    cache: Arc<Mutex<Metadata>>,
+    cache: Arc<Mutex<Arc<Metadata>>>,
     engine_applied: Arc<AtomicU64>,
     delta_ring: Arc<Mutex<DeltaRing>>,
     wal_lock: Arc<FairMutex>,
@@ -2064,7 +2073,7 @@ struct ApplySeed {
 /// branch) needs to clear an already-populated ring.
 async fn meta_apply_seed<S: StorageEngine>(
     engine: &S,
-    cache: &Arc<Mutex<Metadata>>,
+    cache: &Arc<Mutex<Arc<Metadata>>>,
     engine_applied: &Arc<AtomicU64>,
     watch: &MetadataWatch,
 ) -> Result<ApplySeed, FormatError> {
@@ -2089,7 +2098,7 @@ async fn meta_apply_seed<S: StorageEngine>(
         .expect("system-keyspace engine read (watermark)")
         .map(|v| decode_watermark(&v.value))
         .unwrap_or(0);
-    *cache.lock().expect("cache poisoned") = shadow.clone();
+    *cache.lock().expect("cache poisoned") = Arc::new(shadow.clone());
     engine_applied.store(watermark, Ordering::SeqCst);
     // A restart can recover already-applied state; a watcher parked before
     // this task's first loop iteration should see it too.
@@ -2120,7 +2129,7 @@ async fn meta_apply_loop<E: Env, S: StorageEngine>(
     env: E,
     core: Arc<Mutex<RaftCore>>,
     engine: S,
-    cache: Arc<Mutex<Metadata>>,
+    cache: Arc<Mutex<Arc<Metadata>>>,
     engine_applied: Arc<AtomicU64>,
     delta_ring: Arc<Mutex<DeltaRing>>,
     watch: MetadataWatch,
@@ -2201,7 +2210,7 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
     env: &E,
     core: &Arc<Mutex<RaftCore>>,
     engine: &S,
-    cache: &Arc<Mutex<Metadata>>,
+    cache: &Arc<Mutex<Arc<Metadata>>>,
     engine_applied: &Arc<AtomicU64>,
     delta_ring: &Arc<Mutex<DeltaRing>>,
     watch: &MetadataWatch,
@@ -2257,7 +2266,7 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
             }
         };
         *watermark = last_index;
-        *cache.lock().expect("cache poisoned") = shadow.clone();
+        *cache.lock().expect("cache poisoned") = Arc::new(shadow.clone());
         engine_applied.fetch_max(last_index, Ordering::SeqCst);
         // The ring's coverage window is meaningless across a jump it didn't
         // witness (ADR 0038 PR5) — reset it so a `WatchMetadata` caller
@@ -2331,7 +2340,7 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
             return did_work;
         }
         *watermark = max_index;
-        *cache.lock().expect("cache poisoned") = shadow.clone();
+        *cache.lock().expect("cache poisoned") = Arc::new(shadow.clone());
         engine_applied.fetch_max(max_index, Ordering::SeqCst);
         // Feed the ring before bumping `watch` (ADR 0038 PR5): a watcher
         // woken by that bump calls straight into `watch_delta_since`, which
@@ -2829,7 +2838,7 @@ fn record_transfer_clear(
 async fn reconcile_loop<E: Env>(
     env: E,
     core: Arc<Mutex<RaftCore>>,
-    cache: Arc<Mutex<Metadata>>,
+    cache: Arc<Mutex<Arc<Metadata>>>,
     features: ClusterFeatures,
 ) {
     let mut tick: u64 = 0;
@@ -3149,7 +3158,7 @@ fn recently_down_this_tick<E: Env>(
 async fn detect_loop<E: Env>(
     env: E,
     core: Arc<Mutex<RaftCore>>,
-    cache: Arc<Mutex<Metadata>>,
+    cache: Arc<Mutex<Arc<Metadata>>>,
     detector: Arc<Mutex<FailureDetector>>,
     metrics: MetricsHandle,
     features: ClusterFeatures,
@@ -3260,7 +3269,7 @@ async fn detect_loop<E: Env>(
 async fn version_loop<E: Env>(
     env: E,
     core: Arc<Mutex<RaftCore>>,
-    cache: Arc<Mutex<Metadata>>,
+    cache: Arc<Mutex<Arc<Metadata>>>,
     engine_applied: Arc<AtomicU64>,
     observations: Arc<Mutex<VersionObservations>>,
     own_version: Arc<Mutex<OwnVersion>>,
@@ -3510,7 +3519,7 @@ async fn region_timing_loop<E: Env>(node: RaftNode<E>, max_region_rtt: Duration)
 async fn orphan_sweep_loop<E: Env>(
     env: E,
     core: Arc<Mutex<RaftCore>>,
-    cache: Arc<Mutex<Metadata>>,
+    cache: Arc<Mutex<Arc<Metadata>>>,
     orphan_sweep_after: Duration,
     metrics: MetricsHandle,
     features: ClusterFeatures,
@@ -4096,7 +4105,7 @@ mod tests {
 
         let core = Arc::new(Mutex::new(core));
         let engine = animus_storage::MemoryEngine::new();
-        let cache = Arc::new(Mutex::new(Metadata::default()));
+        let cache = Arc::new(Mutex::new(Arc::new(Metadata::default())));
         let engine_applied = Arc::new(AtomicU64::new(0));
         let delta_ring = Arc::new(Mutex::new(DeltaRing::default()));
         let watch = MetadataWatch::default();
@@ -4131,7 +4140,7 @@ mod tests {
         assert_eq!(shadow, Metadata::default(), "shadow must not have advanced");
         assert_eq!(
             *cache.lock().expect("cache poisoned"),
-            Metadata::default(),
+            Arc::new(Metadata::default()),
             "cache must not have been (re)published"
         );
         assert_eq!(
@@ -4173,7 +4182,7 @@ mod tests {
 
         let core = Arc::new(Mutex::new(core));
         let engine = animus_storage::MemoryEngine::new();
-        let cache = Arc::new(Mutex::new(Metadata::default()));
+        let cache = Arc::new(Mutex::new(Arc::new(Metadata::default())));
         let engine_applied = Arc::new(AtomicU64::new(0));
         let delta_ring = Arc::new(Mutex::new(DeltaRing::default()));
         let watch = MetadataWatch::default();
@@ -4310,7 +4319,7 @@ mod tests {
 
         let core = Arc::new(Mutex::new(core));
         let engine = animus_storage::MemoryEngine::new();
-        let cache = Arc::new(Mutex::new(Metadata::default()));
+        let cache = Arc::new(Mutex::new(Arc::new(Metadata::default())));
         // Well past `SNAPSHOT_THRESHOLD` (64) — "the engine's own durable
         // watermark, re-seeded at this task's own startup, is far ahead of
         // what this recovered core's own WAL shows."

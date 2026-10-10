@@ -11725,7 +11725,7 @@ pub(crate) struct ClientCtx<E: Env = ProdEnv, R: RelayClient = AnimusdRelayClien
     /// this is only ever populated on a node started via [`run_node_growth`]).
     /// Read through [`effective_metadata`](Self::effective_metadata), never
     /// directly — see that method's doc for which call sites must use it.
-    remote_metadata: Arc<Mutex<Option<Metadata>>>,
+    remote_metadata: Arc<Mutex<Option<Arc<Metadata>>>>,
     /// This node's own control-plane **system-keyspace** engine handle (ADR
     /// 0038 PR4), if it has a `ControlHandle::Local` control role — a clone
     /// of exactly the engine handle passed to `RaftNode::start_with_metrics`
@@ -11890,6 +11890,14 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// everything except its own commit-wait polls (see
     /// [`metadata_fresh`](Self::metadata_fresh) for those).
     fn effective_metadata(&self) -> Metadata {
+        Metadata::clone(&self.effective_metadata_arc())
+    }
+
+    /// [`effective_metadata`](Self::effective_metadata) as a shared handle:
+    /// an `Arc` clone, no copy of the tablet map (issue #1190). The per-wake
+    /// reconcilers read through this; two reads with no change in between
+    /// are `Arc::ptr_eq`.
+    fn effective_metadata_arc(&self) -> Arc<Metadata> {
         if let Some(meta) = self
             .remote_metadata
             .lock()
@@ -11898,7 +11906,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         {
             return meta;
         }
-        self.control.metadata_cached()
+        self.control.metadata_cached_arc()
     }
 
     /// The lock-free "does the replicated credential catalog hold any row
@@ -14460,7 +14468,7 @@ async fn tablet_host_reconciler_loop(ctx: ClientCtx, mut reconciler: CpReconcile
             continue;
         }
 
-        let meta = ctx.effective_metadata();
+        let meta = ctx.effective_metadata_arc();
         let down: BTreeSet<NodeId> = meta
             .members
             .iter()
@@ -14472,7 +14480,7 @@ async fn tablet_host_reconciler_loop(ctx: ClientCtx, mut reconciler: CpReconcile
             animus_control::timing::region_map(meta.members.iter().map(|(id, m)| (id, &m.labels)));
         let preferred_leader = leader_preferences(&meta);
         let view = MetadataView {
-            tablets: meta.tablets,
+            tablets: animus_cp_data::host::TabletMap::from_metadata(Arc::clone(&meta)),
             down,
             regions,
             preferred_leader,
