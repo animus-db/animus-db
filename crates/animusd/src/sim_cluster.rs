@@ -8414,6 +8414,10 @@ mod tests {
         // different node.
         let (status, body) = cluster.admin(1, "GET", "/admin/live", "", &[]);
         assert_eq!(status, 200, "body: {body}");
+
+        // `/admin/ready` (issue #1274) is the data-plane readiness probe.
+        let (status, body) = cluster.admin(1, "GET", "/admin/ready", "", &[]);
+        assert_eq!(status, 200, "body: {body}");
     }
 
     /// ADR 0061 rung H (C-08 PR 2) groundwork smoke: `SimCluster::console`

@@ -340,6 +340,11 @@ pub trait AdminHost: Send + Sync {
     /// dependency on control-leader knowledge, hosting, or role — never
     /// gate this on the same signal [`health`](Self::health) uses.
     async fn live(&self) -> (u16, Value);
+    /// `GET /admin/ready` -- data-plane readiness (issue #1274): `200` when
+    /// this node can serve the DynamoDB wire (synced `Metadata`, no panicked
+    /// consensus task); NOT gated on a recent control leader, unlike
+    /// [`health`](Self::health).
+    async fn ready(&self) -> (u16, Value);
     /// `POST /admin/tablet/split`.
     async fn action_split(&self, body: &[u8]) -> (u16, Value);
     /// `POST /admin/stream/grow`.

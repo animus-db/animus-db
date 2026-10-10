@@ -890,3 +890,15 @@ Region a global table pins is refused with a `409` naming the Region and
 table). `animus table preferred-leader`, `animus admin global-tables` and
 `animus admin drain --force` consume them; the dashboard Placement tab reads
 `schemas.tables[t].global` from `/admin/status`.
+
+## Amendment (2026-10-10): `GET /admin/ready`, data-plane readiness (issue #1274)
+
+`/admin/health` 503s without a recent control-plane leader, so using it as the
+Kubernetes readiness probe made a control-plane quorum loss remove every
+client endpoint although per-tablet Raft groups could still serve. New route
+`GET /admin/ready`: `200` when the node has synced `Metadata` at least once
+(`last_applied() > 0`, a synced remote mirror, or the growth-node mirror) and
+no consensus-loop task has panicked (issue #1220); otherwise `503`. Body:
+`ok`, `metadata_synced`, `consensus_task_panics`, `control_leader_recent`
+(diagnostic only). `/admin/health` semantics are unchanged; `/admin/live` is
+unchanged.
