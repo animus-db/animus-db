@@ -12365,7 +12365,8 @@ result (unused until the M3 receiver handler). Pinned by `mrec_writer_guard_test
 
 `mrec_peer.rs`: `MrecConfig` (the node-local view of `cluster_settings.{region, peers,
 allow_insecure_peers, mrec_max_clock_skew_ms}`, installed by `with_mrec` on every `run_node*`
-path **and** the bound-node start half), the `PeerClient` seam (bytes in/out, `to` = index
+path **and** the bound-node start half, via `apply_cluster_settings_to_bound`, which also
+applies `with_max_region_rtt` — issue #1241), the `PeerClient` seam (bytes in/out, `to` = index
 into the peer list) and `ProdPeerClient` (intra dial with mutual TLS, per-peer `tls_ca`).
 `mrec_receiver.rs`: `handle_mrec_apply`, `E: Env`-generic, reached from the intra
 `ClientRequest::MrecApply` arm; order of checks is proto, transport (TLS or

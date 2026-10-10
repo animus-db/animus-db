@@ -17314,6 +17314,25 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
     .await
 }
 
+/// Install the cluster-config-derived settings `Node::bind` cannot know on a
+/// [`BoundNode`] — the MREC peer settings (G-d M3) and the configured
+/// `max_region_rtt` (ADR 0075 section 3.4, issue #1241). Every `run_node*`
+/// entry point does the same; the bound-node start half is the one place all
+/// of its callers (`run_bound_node*` included) pass through, so it is applied
+/// here rather than at each caller.
+fn apply_cluster_settings_to_bound(
+    bound: BoundNode,
+    config: &ClusterConfig,
+    index: usize,
+) -> BoundNode {
+    bound
+        .with_max_region_rtt(config.max_region_rtt())
+        .with_mrec(
+            crate::mrec_peer::MrecConfig::from_cluster(config)
+                .with_node_tls(config.nodes.get(index).and_then(|n| n.tls.clone())),
+        )
+}
+
 /// The **start half** of
 /// [`run_node_with_streams_quiesce_and_ttl_sweep_interval`], taking an
 /// already-[`Node::bind`]-bound node instead of binding one itself (issue
@@ -17433,10 +17452,7 @@ pub async fn start_bound_node_with_streams_quiesce_and_ttl_sweep_interval(
     // The MREC peer settings (G-d M3): `Node::bind` has no config, so the
     // start half installs them like every other `run_node*` entry point does
     // (`tests/mrec_peer_transport.rs` caught the bound path missing them).
-    let bound = bound.with_mrec(
-        crate::mrec_peer::MrecConfig::from_cluster(config)
-            .with_node_tls(config.nodes.get(index).and_then(|n| n.tls.clone())),
-    );
+    let bound = apply_cluster_settings_to_bound(bound, config, index);
     bound
         .start_with_growth(
             config.peer_book(),
@@ -23810,5 +23826,54 @@ mod refused_voter_observability_tests {
             CpGroup::Mem(nodes[healthy].clone()).raft_view(TabletId(TABLET), false),
         );
         assert!(!view.refused_as_voter, "seed={seed}: healthy replica");
+    }
+}
+
+#[cfg(test)]
+mod bound_node_settings_tests {
+    use super::*;
+    use crate::config::{ClusterSettings, NodeRole};
+
+    /// Issue #1241: the bound-node start half must carry
+    /// `cluster_settings.max_region_rtt_ms` onto the `BoundNode` (it used to
+    /// keep `DEFAULT_MAX_REGION_RTT`, silently ignoring the setting).
+    #[tokio::test]
+    async fn bound_node_start_half_applies_configured_max_region_rtt() {
+        let any: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let addrs = RoleAddrs {
+            id: config::node_id(0),
+            role: NodeRole::Both,
+            internal: any,
+            client: any,
+            dynamo: any,
+            admin: any,
+            intra: any,
+            console: any,
+            advertise_host: None,
+            tls: None,
+            encryption_key_path: None,
+            labels: Default::default(),
+            overload: None,
+        };
+        let config = ClusterConfig {
+            version: crate::config::CLUSTER_CONFIG_VERSION,
+            nodes: vec![addrs.clone()],
+            dynamo_auth: None,
+            cluster_settings: Some(ClusterSettings {
+                max_region_rtt_ms: Some(437),
+                ..Default::default()
+            }),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let bound = Node::bind(addrs.id.clone(), addrs, dir.path())
+            .await
+            .unwrap();
+        assert_eq!(
+            bound.max_region_rtt,
+            animus_control::timing::DEFAULT_MAX_REGION_RTT,
+            "precondition: a fresh BoundNode starts at the default"
+        );
+        let bound = apply_cluster_settings_to_bound(bound, &config, 0);
+        assert_eq!(bound.max_region_rtt, Duration::from_millis(437));
     }
 }
