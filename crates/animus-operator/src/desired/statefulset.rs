@@ -1,7 +1,9 @@
 //! The `StatefulSet` builder: one pod per node ordinal, running
 //! `entrypoint.sh` off the cluster `ConfigMap`, probed on the admin port —
-//! **`readinessProbe` on `GET /admin/ready` (data-plane readiness, since
-//! 2026-10-10, issue #1274; was `/admin/health`), `livenessProbe` on
+//! **`readinessProbe` on `GET /admin/health`, or `GET /admin/ready`
+//! (data-plane readiness, issue #1274) once every pod has been observed to
+//! serve it (the "observed switch", `controller::decide_readiness_path`);
+//! `livenessProbe` on
 //! `GET /admin/live`, deliberately different routes since 2026-09-07
 //! (issue #710; see [`admin_probe`]'s own doc for why)**. The probes'
 //! scheme follows `spec.tls`: HTTP when unset, HTTPS (unverified, as the
@@ -71,18 +73,14 @@ use super::{
 };
 use crate::crd::{AnimusCluster, AnimusClusterSpec};
 
-/// `readinessProbe`, on `GET /admin/ready` (issue #1274, 2026-10-10):
-/// `periodSeconds: 5`, `failureThreshold: 3` — fast to pull a pod out of
-/// `Endpoints` (and therefore the client `Service`'s LB rotation) once the
-/// node can no longer serve the DynamoDB wire (no synced `Metadata`, or a
-/// panicked consensus task). It is deliberately NOT gated on a recent
-/// control-plane leader (that was `/admin/health`, the previous readiness
-/// route): the per-tablet Raft groups keep serving through a control-plane
-/// quorum loss, and gating on the leader removed every client endpoint.
-/// The path lands in the pod template together with `spec.image`, so a
-/// previous-release image (no `/admin/ready`) is only ever probed on
-/// `/admin/health` until the template is re-rendered; see ADR 0060's
-/// 2026-10-10 amendment for the operator-upgrade ordering caveat.
+/// `readinessProbe` (`/admin/health`, or `/admin/ready` after the observed
+/// switch, issue #1274): `periodSeconds: 5`, `failureThreshold: 3` — fast to
+/// pull a pod out of `Endpoints` (and therefore the client `Service`'s LB
+/// rotation). `/admin/ready` is not gated on a control-plane leader, so a
+/// control-plane quorum loss does not empty the client Service. The path
+/// is chosen by the controller from live observation, never assumed: a
+/// previous-release `animusd` has no `/admin/ready` (404), and a probe on
+/// it would keep that pod NotReady forever (ADR 0060's 2026-10-10 amendment).
 const READINESS_PERIOD_SECS: i32 = 5;
 const READINESS_FAILURE_THRESHOLD: i32 = 3;
 /// `livenessProbe`, on `GET /admin/live` (issue #710, 2026-09-07 — see
@@ -278,7 +276,7 @@ const ENCRYPTION_KEY_SECRET_DEFAULT_MODE: i32 = 0o444;
 
 /// Builds one `HTTPGetAction`-based probe against the admin port at
 /// `path` — `readiness_probe` and `liveness_probe` below each call this
-/// with their own path (`/admin/ready` and `/admin/live` respectively,
+/// with their own path (`/admin/health` or `/admin/ready`, and `/admin/live` respectively,
 /// since issue #710's readiness/liveness split, 2026-09-07). Readiness
 /// legitimately depends on control-plane state (a node with no recent
 /// leader should not receive traffic); liveness must not — a distributed-
@@ -391,6 +389,57 @@ pub fn build_with_partition(
     cluster: &AnimusCluster,
     spec: &AnimusClusterSpec,
     partition: i32,
+) -> StatefulSet {
+    build_with_readiness(cluster, spec, partition, READINESS_PATH_HEALTH)
+}
+
+/// The conservative readiness route every `animusd` release serves.
+pub const READINESS_PATH_HEALTH: &str = "/admin/health";
+/// Data-plane readiness (issue #1274); only releases that serve it. The
+/// controller selects it only once every pod has been observed to answer it
+/// (`controller::decide_readiness_path`).
+pub const READINESS_PATH_READY: &str = "/admin/ready";
+
+/// The path of the first container's `readinessProbe` in `sts`'s pod
+/// template, if any: the persisted state of the "observed switch".
+#[must_use]
+pub fn readiness_path_of(sts: &StatefulSet) -> Option<String> {
+    sts.spec
+        .as_ref()?
+        .template
+        .spec
+        .as_ref()?
+        .containers
+        .first()?
+        .readiness_probe
+        .as_ref()?
+        .http_get
+        .as_ref()?
+        .path
+        .clone()
+}
+
+/// [`readiness_path_of`] of `live`, or [`READINESS_PATH_HEALTH`] when there
+/// is no live `StatefulSet` or it carries no readiness probe.
+#[must_use]
+pub fn readiness_path_of_or_default(live: Option<&StatefulSet>) -> &str {
+    // Leaks nothing: the two known paths are statics; an unknown live path
+    // (never written by this operator) maps to the conservative default.
+    match live.and_then(readiness_path_of).as_deref() {
+        Some(READINESS_PATH_READY) => READINESS_PATH_READY,
+        _ => READINESS_PATH_HEALTH,
+    }
+}
+
+/// [`build_with_partition`] with an explicit `readinessProbe` path
+/// ([`READINESS_PATH_HEALTH`] or [`READINESS_PATH_READY`]). The path is part
+/// of the pod template, so changing it is an ordinary gated template change.
+#[must_use]
+pub fn build_with_readiness(
+    cluster: &AnimusCluster,
+    spec: &AnimusClusterSpec,
+    partition: i32,
+    readiness_path: &str,
 ) -> StatefulSet {
     let name = cluster
         .metadata
@@ -693,7 +742,7 @@ pub fn build_with_partition(
             .resources
             .clone()
             .or(Some(ResourceRequirements::default())),
-        readiness_probe: Some(admin_probe(admin_port, "/admin/ready", tls_enabled, |p| {
+        readiness_probe: Some(admin_probe(admin_port, readiness_path, tls_enabled, |p| {
             p.period_seconds = Some(READINESS_PERIOD_SECS);
             p.failure_threshold = Some(READINESS_FAILURE_THRESHOLD);
         })),
@@ -981,7 +1030,7 @@ mod tests {
         // SIGTERM it out from under an ordinary join.
         let readiness_path = readiness.http_get.as_ref().unwrap().path.as_deref();
         let liveness_path = liveness.http_get.as_ref().unwrap().path.as_deref();
-        assert_eq!(readiness_path, Some("/admin/ready"));
+        assert_eq!(readiness_path, Some("/admin/health"));
         assert_eq!(liveness_path, Some("/admin/live"));
         assert_ne!(
             readiness_path, liveness_path,
@@ -1409,7 +1458,7 @@ mod tests {
         // route split holds over TLS exactly as it does over plain HTTP.
         assert_eq!(
             readiness.http_get.as_ref().unwrap().path.as_deref(),
-            Some("/admin/ready")
+            Some("/admin/health")
         );
         assert_eq!(
             liveness.http_get.as_ref().unwrap().path.as_deref(),
@@ -1443,7 +1492,7 @@ mod tests {
         }
         assert_eq!(
             readiness.http_get.as_ref().unwrap().path.as_deref(),
-            Some("/admin/ready")
+            Some("/admin/health")
         );
         assert_eq!(
             liveness.http_get.as_ref().unwrap().path.as_deref(),

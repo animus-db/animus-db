@@ -131,7 +131,7 @@ pointing at those three files — the *same* cert/key on every pod, not a
 distinct one per ordinal (see `crd::TlsSpec`'s own doc for why).
 
 **(2026-09-05)** The pod's own readiness/liveness probes (`GET
-/admin/ready` / `GET /admin/live`) switch to `scheme: HTTPS` once `spec.tls` is set — admin is
+/admin/health` or, once every pod serves it, `/admin/ready`; liveness `/admin/live`) switch to `scheme: HTTPS` once `spec.tls` is set — admin is
 server-only TLS, so a plaintext kubelet probe against a TLS-only listener
 fails the handshake on the server side, and without this every pod stays
 NotReady and gets restart-looped by the kubelet. The kubelet's HTTPS probe

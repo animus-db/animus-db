@@ -2018,16 +2018,26 @@ the golden fixture `v1-peers.json` was added.
 
 ## Amendment (2026-10-10): readinessProbe moves to `/admin/ready` (issue #1274)
 
-The StatefulSet `readinessProbe` is now `GET /admin/ready` (ADR 0020's
-2026-10-10 amendment), no longer `/admin/health`; liveness stays `/admin/live`.
-A control-plane quorum loss therefore no longer marks every pod NotReady and
-empties the `{name}-dynamo` Service, since the data plane serves through it.
-Rolling-upgrade interaction: the probe path and `spec.image` are both in the
-pod template, so the new path reaches a pod only with a template re-render. A
-previous-release image lacks `/admin/ready`; upgrading the operator while
-`spec.image` still names such an image re-renders the template, and the rolled
-pod would 404 its readiness probe and never become Ready (the `animus-roll`
-gate then holds the roll at that pod, fail-safe but stuck). Bump `spec.image`
-to a release containing the route in the same edit as the operator upgrade.
+The StatefulSet `readinessProbe` can now be `GET /admin/ready` (ADR 0020's
+2026-10-10 amendment, data-plane readiness) instead of `/admin/health`;
+liveness stays `/admin/live`. A control-plane quorum loss then no longer marks
+every pod NotReady and empties the `{name}-dynamo` Service, since the data
+plane serves through it.
+
+**Observed switch.** A previous-release `animusd` has no `/admin/ready` (404),
+and a probe on it would keep that pod NotReady forever, so the operator never
+assumes the route. Each reconcile it probes `GET /admin/ready` on every pod of
+the cluster (`controller::decide_readiness_path`; `200` and `503` both mean the
+route exists, `404` an old binary) and picks the path: any `404` ->
+`/admin/health`; every pod answers -> `/admin/ready`; anything else (a pod
+unreachable or not yet created) keeps the path in the live StatefulSet. A new
+cluster starts on `/admin/health`. The live StatefulSet's own probe path is the
+persisted state (no status field, no CRD change), so it survives operator
+restarts. The path is part of the pod template, so flipping it is an ordinary
+template change that goes through the `animus-roll` gate. The flip to
+`/admin/ready` is deferred while a roll is in flight (it would re-target it);
+the revert to `/admin/health` on a `404` (e.g. an image revert) is not. Cost:
+once all pods serve the route, one extra gated roll flips the probe path. No
+"bump `spec.image` with the operator upgrade" step is needed.
 The e2e script's `/admin/health` waits are unchanged (they check a pod's own
 control-plane view, not Service membership).

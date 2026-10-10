@@ -1056,7 +1056,14 @@ async fn reconcile<C: ClusterApi, A: AdminOps>(
     // the same revert at write time (`validate::validate_image_revert`).
     let cluster = {
         let live = ctx.cluster_api.get_statefulset(&ns, &name).await?;
-        let probe = desired::statefulset::build(&cluster, &cluster.spec);
+        // Built with the live readiness path so this throwaway probe never
+        // reads as a template change (`decide_readiness_path` owns that).
+        let probe = desired::statefulset::build_with_readiness(
+            &cluster,
+            &cluster.spec,
+            0,
+            desired::statefulset::readiness_path_of_or_default(live.as_ref()),
+        );
         let live_view = live.as_ref().map(|l| roll::StsView::of(l, &probe));
         let prior = if live_view
             .as_ref()
@@ -1526,6 +1533,98 @@ async fn reconcile<C: ClusterApi, A: AdminOps>(
     finish_reconcile(&cluster, &ctx, &ns, status, pdb_control_nodes).await
 }
 
+/// What one pod said to `GET /admin/ready`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadyRoute {
+    /// `200` or `503`: the route exists (a `503` is "not ready", still a
+    /// release that serves it).
+    Present,
+    /// `404`: a binary that predates `/admin/ready`.
+    Absent,
+    /// Unreachable or any other answer: no information.
+    Unknown,
+}
+
+fn classify_ready_route(answer: &Result<serde_json::Value, String>) -> ReadyRoute {
+    match answer {
+        Ok(_) => ReadyRoute::Present,
+        Err(e) if e.contains("status 503") => ReadyRoute::Present,
+        Err(e) if e.contains("status 404") => ReadyRoute::Absent,
+        Err(_) => ReadyRoute::Unknown,
+    }
+}
+
+/// The pure decision of the observed switch. `live` is the readiness path
+/// currently in the live `StatefulSet` (`None`: no `StatefulSet` yet, which
+/// starts on the conservative path), which is also the persisted state: it
+/// survives operator restarts with no status field.
+///
+/// - any pod answers `404` -> `/admin/health` (also reverts after an image
+///   revert);
+/// - every pod answers (`Present`) -> `/admin/ready`, but only when no roll
+///   is in flight (a flip mid-roll would re-target it), otherwise `live`;
+/// - anything else (a pod unreachable, not yet created) -> keep `live`.
+pub(crate) fn pick_readiness_path(
+    live: Option<&str>,
+    routes: &[ReadyRoute],
+    roll_in_flight: bool,
+) -> &'static str {
+    use desired::statefulset::{READINESS_PATH_HEALTH, READINESS_PATH_READY};
+    let keep = if live == Some(READINESS_PATH_READY) {
+        READINESS_PATH_READY
+    } else {
+        READINESS_PATH_HEALTH
+    };
+    if routes.contains(&ReadyRoute::Absent) {
+        return READINESS_PATH_HEALTH;
+    }
+    if live.is_some()
+        && !roll_in_flight
+        && !routes.is_empty()
+        && routes.iter().all(|r| *r == ReadyRoute::Present)
+    {
+        return READINESS_PATH_READY;
+    }
+    keep
+}
+
+/// Observe every pod's `GET /admin/ready` and pick the `readinessProbe` path
+/// (see [`pick_readiness_path`]). Flipping the path changes the pod template,
+/// so it goes through the roll gate like any template change.
+async fn decide_readiness_path<C: ClusterApi, A: AdminOps>(
+    ctx: &Context<C, A>,
+    cluster: &AnimusCluster,
+    ns: &str,
+    live: Option<&StatefulSet>,
+    tls_ca: Option<&[u8]>,
+) -> &'static str {
+    let name = cluster.name_any();
+    let live_path = live.and_then(desired::statefulset::readiness_path_of);
+    let in_flight = live.is_some_and(|l| {
+        roll::StsView::of(
+            l,
+            &desired::statefulset::build_with_readiness(
+                cluster,
+                &cluster.spec,
+                0,
+                desired::statefulset::readiness_path_of_or_default(Some(l)),
+            ),
+        )
+        .roll_in_flight()
+    });
+    let admin_port = cluster.spec.base_port_or_default() + desired::cluster_config::PORT_ADMIN;
+    let tls = tls_ca.is_some();
+    let routes = futures::future::join_all((0..cluster.spec.nodes).map(|i| {
+        let url = format!(
+            "{}/admin/ready",
+            admin_base_url(&name, ns, i, admin_port, tls)
+        );
+        async move { classify_ready_route(&ctx.admin.get_json(&url, tls_ca).await) }
+    }))
+    .await;
+    pick_readiness_path(live_path.as_deref(), &routes, in_flight)
+}
+
 async fn finish_reconcile<C: ClusterApi, A: AdminOps>(
     cluster: &AnimusCluster,
     ctx: &Context<C, A>,
@@ -1539,14 +1638,20 @@ async fn finish_reconcile<C: ClusterApi, A: AdminOps>(
     // live truth *before* applying it, so a changed pod template is applied
     // with `partition = replicas` in the same server-side apply (no ungated
     // window), and a roll in flight is driven one gated step at a time.
-    let mut sts = desired::statefulset::build(cluster, &cluster.spec);
     let live_sts = ctx.cluster_api.get_statefulset(ns, &name).await?;
+    let tls_ca = resolve_tls_ca(&ctx.cluster_api, cluster, ns, &name).await?;
+    // Issue #1274, the "observed switch": the readiness route is part of the
+    // pod template, so it is decided from live observation before the build.
+    let readiness_path =
+        decide_readiness_path(ctx, cluster, ns, live_sts.as_ref(), tls_ca.as_deref()).await;
+    let mut sts =
+        desired::statefulset::build_with_readiness(cluster, &cluster.spec, 0, readiness_path);
     let live_view = live_sts.as_ref().map(|l| roll::StsView::of(l, &sts));
     let tls_ca = if matches!(
         roll::stage(live_view.as_ref(), status.upgrade.as_ref()),
         roll::Stage::Drive { .. }
     ) {
-        resolve_tls_ca(&ctx.cluster_api, cluster, ns, &name).await?
+        tls_ca
     } else {
         None
     };
@@ -2248,7 +2353,12 @@ mod tests {
             ["demo-4", "demo-3"]
         );
         assert!(
-            ctx.admin.calls().iter().all(|(_, u)| u.contains("demo-0.")),
+            // (the readiness-route observation, issue #1274, probes every pod)
+            ctx.admin
+                .calls()
+                .iter()
+                .filter(|(_, u)| !u.ends_with("/admin/ready"))
+                .all(|(_, u)| u.contains("demo-0.")),
             "{:?}",
             ctx.admin.calls()
         );
@@ -4384,5 +4494,124 @@ mod peers_tests {
         .await
         .unwrap();
         assert!(condition(&ctx, CONDITION_PEER_REACHABLE).is_none());
+    }
+}
+
+#[cfg(test)]
+mod readiness_switch_tests {
+    use std::sync::Arc;
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::desired::statefulset::{
+        READINESS_PATH_HEALTH, READINESS_PATH_READY, build_with_readiness,
+    };
+    use crate::desired::test_support::test_cluster;
+    use crate::fakes::{FakeAdminClient, FakeClusterApi};
+
+    const NOT_FOUND: &str = "admin endpoint returned status 404: not found";
+    const NOT_READY: &str = "admin endpoint returned status 503: {\"ok\":false}";
+
+    fn ctx() -> Arc<Context<FakeClusterApi, FakeAdminClient>> {
+        Arc::new(Context {
+            cluster_api: FakeClusterApi::new(),
+            admin: FakeAdminClient::new(),
+            clock: crate::roll::WallClock::fixed(1_000),
+        })
+    }
+
+    async fn decide(
+        ctx: &Context<FakeClusterApi, FakeAdminClient>,
+        live_path: Option<&str>,
+    ) -> &'static str {
+        let cluster = test_cluster("c", "ns", 3, None);
+        let live = live_path.map(|p| build_with_readiness(&cluster, &cluster.spec, 0, p));
+        decide_readiness_path(ctx, &cluster, "ns", live.as_ref(), None).await
+    }
+
+    fn script_all(ctx: &Context<FakeClusterApi, FakeAdminClient>, answers: [Result<(), &str>; 3]) {
+        for (i, a) in answers.into_iter().enumerate() {
+            let ordinal = i32::try_from(i).unwrap();
+            ctx.admin.script_get(
+                Some(ordinal),
+                "/admin/ready",
+                a.map(|()| json!({"ok": true})).map_err(str::to_string),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn all_pods_without_the_route_keep_health() {
+        let ctx = ctx();
+        script_all(&ctx, [Err(NOT_FOUND), Err(NOT_FOUND), Err(NOT_FOUND)]);
+        assert_eq!(
+            decide(&ctx, Some(READINESS_PATH_HEALTH)).await,
+            READINESS_PATH_HEALTH
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mixed_cluster_keeps_health() {
+        let ctx = ctx();
+        script_all(&ctx, [Ok(()), Ok(()), Err(NOT_FOUND)]);
+        assert_eq!(
+            decide(&ctx, Some(READINESS_PATH_HEALTH)).await,
+            READINESS_PATH_HEALTH
+        );
+    }
+
+    #[tokio::test]
+    async fn every_pod_with_the_route_switches_to_ready_and_503_counts() {
+        let ctx = ctx();
+        script_all(&ctx, [Ok(()), Err(NOT_READY), Ok(())]);
+        assert_eq!(
+            decide(&ctx, Some(READINESS_PATH_HEALTH)).await,
+            READINESS_PATH_READY
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fresh_cluster_starts_on_health() {
+        let ctx = ctx();
+        script_all(&ctx, [Ok(()), Ok(()), Ok(())]);
+        assert_eq!(decide(&ctx, None).await, READINESS_PATH_HEALTH);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_pod_keeps_the_live_path_either_way() {
+        let ctx = ctx();
+        script_all(&ctx, [Ok(()), Ok(()), Err("connection refused")]);
+        assert_eq!(
+            decide(&ctx, Some(READINESS_PATH_READY)).await,
+            READINESS_PATH_READY
+        );
+        assert_eq!(
+            decide(&ctx, Some(READINESS_PATH_HEALTH)).await,
+            READINESS_PATH_HEALTH
+        );
+    }
+
+    #[tokio::test]
+    async fn a_404_after_the_switch_reverts_to_health() {
+        let ctx = ctx();
+        script_all(&ctx, [Ok(()), Err(NOT_FOUND), Ok(())]);
+        assert_eq!(
+            decide(&ctx, Some(READINESS_PATH_READY)).await,
+            READINESS_PATH_HEALTH
+        );
+    }
+
+    #[test]
+    fn a_roll_in_flight_defers_the_flip_but_not_the_revert() {
+        use ReadyRoute::{Absent, Present};
+        assert_eq!(
+            pick_readiness_path(Some(READINESS_PATH_HEALTH), &[Present; 3], true),
+            READINESS_PATH_HEALTH
+        );
+        assert_eq!(
+            pick_readiness_path(Some(READINESS_PATH_READY), &[Present, Absent], true),
+            READINESS_PATH_HEALTH
+        );
     }
 }

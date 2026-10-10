@@ -39,9 +39,10 @@ Verified from code and ADR 0037 (not by an outage drill):
   task), so a control quorum loss no longer removes the client endpoints: pods stay
   Ready and the `<name>-dynamo` Service keeps routing to tablet groups that can still
   serve. `/admin/health` (503 with no recent leader, three election timeouts) is
-  unchanged and is the signal that shows the control plane is down. Pods running a
-  release older than this change still probe `/admin/health` and drop out of the
-  Service as before; port-forward to a pod meanwhile.
+  unchanged and is the signal that shows the control plane is down. The operator
+  switches a cluster to `/admin/ready` only once every pod serves it; until then
+  (or on a cluster with an older pod) pods still probe `/admin/health` and drop
+  out of the Service as before; port-forward to a pod meanwhile.
 
 ## Recoverable: voters come back with their data
 
