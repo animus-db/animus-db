@@ -322,13 +322,30 @@ async fn import_tick(
         };
         processed_size_bytes += bytes.len() as u64;
         let text = match row.input_compression {
-            animus_control::InputCompressionType::Gzip => match gunzip_bytes(&bytes) {
-                Ok(t) => t,
-                Err(err) => {
-                    tracing::warn!(import_id, data_key, %err, "import: data file is not valid gzip");
-                    return ImportTickOutcome::NoProgress;
+            animus_control::InputCompressionType::Gzip => {
+                match gunzip_bytes(&bytes, MAX_DECOMPRESSED_OBJECT_BYTES) {
+                    Ok(t) => t,
+                    Err(err @ GunzipError::DecompressedTooLarge { .. }) => {
+                        tracing::warn!(import_id, data_key, %err, "import: failing the import");
+                        fail_import_and_cleanup(
+                            ctx,
+                            import_id,
+                            row,
+                            &format!("data file `{data_key}`: {err}"),
+                            processed_item_count,
+                            imported_item_count,
+                            error_count,
+                            processed_size_bytes,
+                        )
+                        .await;
+                        return ImportTickOutcome::Failed;
+                    }
+                    Err(err) => {
+                        tracing::warn!(import_id, data_key, %err, "import: data file is not valid gzip");
+                        return ImportTickOutcome::NoProgress;
+                    }
                 }
-            },
+            }
             animus_control::InputCompressionType::None => match String::from_utf8(bytes) {
                 Ok(t) => t,
                 Err(_) => {
@@ -489,14 +506,58 @@ fn rebase_recorded_key(recorded: &str, direct: bool) -> String {
     rest.to_owned()
 }
 
-/// gunzip `bytes` into a UTF-8 string, or an error naming what failed —
-/// never leaked verbatim to a client (the caller only ever counts/logs this),
-/// mirroring [`crate::dynamo::gzip_bytes`]'s own inverse.
-fn gunzip_bytes(bytes: &[u8]) -> Result<String, std::io::Error> {
-    let mut decoder = flate2::read::GzDecoder::new(bytes);
-    let mut out = String::new();
-    decoder.read_to_string(&mut out)?;
-    Ok(out)
+/// Upper bound on one gzip import object's *decompressed* size — a gzip
+/// bomb guard (issue #1189). ADR 0072/`animus_dynamo::limits` document no
+/// per-object import limit, so the cap is derived from the per-item limit
+/// and this adapter's own export layout: one data file holds at most
+/// [`crate::dynamo::EXPORT_CHUNK_ROWS`] items of at most
+/// [`animus_dynamo::limits::MAX_ITEM_SIZE_BYTES`] each, doubled for DynamoDB-JSON
+/// encoding overhead (base64 binary, type tags, the `Item` envelope).
+const MAX_DECOMPRESSED_OBJECT_BYTES: u64 = (animus_dynamo::limits::MAX_ITEM_SIZE_BYTES as u64)
+    * (crate::dynamo::EXPORT_CHUNK_ROWS as u64)
+    * 2;
+
+/// Why [`gunzip_bytes`] failed.
+#[derive(Debug)]
+enum GunzipError {
+    /// Not valid gzip, or not valid UTF-8 once decompressed (retryable I/O
+    /// class, like every other bad-object fault in this module).
+    Invalid(std::io::Error),
+    /// The decompressed stream exceeded the cap — a gzip bomb (or an
+    /// oversized export). Content-level and terminal: retrying cannot help.
+    DecompressedTooLarge { limit: u64 },
+}
+
+impl std::fmt::Display for GunzipError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(e) => write!(f, "{e}"),
+            Self::DecompressedTooLarge { limit } => write!(
+                f,
+                "import data file exceeds the {limit}-byte decompressed size limit \
+                 (DecompressedObjectTooLarge)"
+            ),
+        }
+    }
+}
+
+/// gunzip `bytes` into a UTF-8 string, reading at most `limit` decompressed
+/// bytes (`Read::take(limit + 1)` detects an overrun without ever
+/// materialising more than `limit + 1` bytes), or an error naming what
+/// failed — never leaked verbatim to a client (the caller only ever
+/// counts/logs this), mirroring [`crate::dynamo::gzip_bytes`]'s own inverse.
+fn gunzip_bytes(bytes: &[u8], limit: u64) -> Result<String, GunzipError> {
+    let decoder = flate2::read::GzDecoder::new(bytes);
+    let mut out = Vec::new();
+    decoder
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut out)
+        .map_err(GunzipError::Invalid)?;
+    if out.len() as u64 > limit {
+        return Err(GunzipError::DecompressedTooLarge { limit });
+    }
+    String::from_utf8(out)
+        .map_err(|e| GunzipError::Invalid(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
 }
 
 /// One derived kind write: `(kind, physical key, value — `None` is a
@@ -717,5 +778,46 @@ async fn fail_import_and_cleanup(
             "import: failed to drop the half-created target table after a failed import — a \
              later DeleteTable will still clean it up"
         );
+    }
+}
+
+#[cfg(test)]
+mod gunzip_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn gz(data: &[u8]) -> Vec<u8> {
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    }
+
+    #[test]
+    fn normal_object_round_trips_under_the_cap() {
+        let text = "{\"Item\":{}}\n".repeat(10);
+        assert_eq!(gunzip_bytes(&gz(text.as_bytes()), 1024).unwrap(), text);
+        // Exactly at the cap is accepted.
+        let at = vec![b'a'; 64];
+        assert_eq!(gunzip_bytes(&gz(&at), 64).unwrap().len(), 64);
+    }
+
+    #[test]
+    fn high_ratio_gzip_bomb_fails_with_the_named_error() {
+        let bomb = gz(&vec![b'a'; 1 << 20]);
+        assert!(bomb.len() < 4096, "fixture must be a high-ratio object");
+        let err = gunzip_bytes(&bomb, 64 * 1024).unwrap_err();
+        assert!(matches!(
+            err,
+            GunzipError::DecompressedTooLarge { limit: 65536 }
+        ));
+        assert!(err.to_string().contains("DecompressedObjectTooLarge"));
+    }
+
+    #[test]
+    fn non_gzip_is_an_invalid_not_a_too_large_error() {
+        assert!(matches!(
+            gunzip_bytes(b"not gzip", 1024),
+            Err(GunzipError::Invalid(_))
+        ));
     }
 }
