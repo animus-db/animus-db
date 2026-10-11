@@ -1357,6 +1357,19 @@ name, per-version expected value, `panic!` on an unrecognised version. Every `An
 `schemaVersion: 1`; regenerate `deploy/operator/crd.yaml` after touching the
 spec type.
 
+### Pausing voter auto-add (issue #1277, 2026-10-10)
+
+`advance_control_growth` re-adds every missing ordinal in `0..controlNodes`, so
+a manual `control-remove` is undone within a reconcile. The annotation
+`animusdb.io/pause-control-voter-reconcile: "true"`
+(`crd::ANNOTATION_PAUSE_CONTROL_VOTER_RECONCILE`; deliberately an annotation,
+not a spec field, so no CRD/fixture churn) makes `reconcile` skip
+`advance_control_growth` entirely (no discovery, no `member/add`) and set the
+`ControlVoterReconcilePaused` condition; everything else (children, PDB with the
+last applied count, roll) still runs. Removing the annotation (or any value other
+than `"true"`) clears the condition and growth resumes from live truth. Test:
+`reconcile_growth_paused_by_annotation_skips_voter_add_and_sets_condition`.
+
 ## Rolling upgrades (ADR 0073 Phase 3, P3-D)
 
 Every pod-template change (a `spec.image` edit **and** a config-hash change such as a
@@ -1910,6 +1923,15 @@ cluster spanning the Regions; the `kind` e2e cannot run a stretch topology (and
 cannot run at all in the sandbox), so stretch behaviour is proven only in
 `SimEnv` (`animusd` `sim_cluster_mrsc`).
 
+
+## `E2E_KEEP_CLUSTER=1`: keep the `kind` cluster after the smoke (#1278)
+
+Opt-in keep-alive for the game-day drill (`docs/runbook/game-day.md`). `cleanup()` still stops
+the port-forwards and the out-of-cluster operator (nothing leaks, ports free), but skips
+`kind delete cluster`, and the final "delete AnimusCluster and verify GC" phase is skipped so
+the 3-node cluster stays up; it applies to a failed run too. The operator is deliberately not
+kept (a detached process outliving the script has no owner): restart it with the printed
+kubeconfig. Unverified: `kind` cannot run in the sandbox, only `bash -n`.
 
 ## `E2E_UPGRADE=1`: the nightly operator-driven roll on `kind` (ADR 0073 Phase 3, D10)
 

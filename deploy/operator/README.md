@@ -419,6 +419,11 @@ loosen or disable it.
 
 ## Control-voter growth (S-07d)
 
+To pause voter auto-add during manual control-plane surgery (e.g. `control-remove`
+in `docs/runbook/control-plane-quorum-loss.md`), annotate the cluster
+`animusdb.io/pause-control-voter-reconcile=true`; the status then carries a
+`ControlVoterReconcilePaused` condition. Remove the annotation to resume.
+
 `spec.controlNodes` is **grow-only**: an increase is honored — the
 operator drives ADR 0037's `control/member/add` against the
 newly-promoted ordinals, one voter at a time, until the control group

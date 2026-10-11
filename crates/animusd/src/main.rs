@@ -796,6 +796,8 @@ async fn run(args: &[String]) -> Result<(), String> {
         stream_seal_bytes,
         stream_seal_age_secs,
         stream_retention_secs,
+        pitr_retention_days: None,
+        pitr_seal_age_secs: None,
         throttle_read_units,
         throttle_write_units,
         tablet_max_read_units,
@@ -811,6 +813,7 @@ async fn run(args: &[String]) -> Result<(), String> {
     let stream_seal_knobs = stream_seal_knobs(
         cli_cluster_settings.stream_seal_bytes,
         cli_cluster_settings.stream_seal_age_secs,
+        &cli_cluster_settings,
     );
     let stream_retention = cli_cluster_settings
         .stream_retention_secs
@@ -1122,11 +1125,17 @@ const DEFAULT_SHARED_WAL: bool = animusd::DEFAULT_SHARED_WAL;
 /// [`animusd::StreamSealKnobs`] from the optional `--stream-seal-bytes`/
 /// `--stream-seal-age` CLI values — each independently defaults to
 /// [`animusd::StreamSealKnobs::default`]'s own field when omitted.
-fn stream_seal_knobs(bytes: Option<u64>, age_secs: Option<u64>) -> animusd::StreamSealKnobs {
+fn stream_seal_knobs(
+    bytes: Option<u64>,
+    age_secs: Option<u64>,
+    settings: &animusd::config::ClusterSettings,
+) -> animusd::StreamSealKnobs {
     let default = animusd::StreamSealKnobs::default();
     animusd::StreamSealKnobs {
         seal_bytes: bytes.unwrap_or(default.seal_bytes),
         seal_age: age_secs.map_or(default.seal_age, Duration::from_secs),
+        pitr_seal_age: settings.pitr_seal_age(),
+        pitr_retention: settings.pitr_retention(),
     }
 }
 
@@ -1978,6 +1987,7 @@ fn resolve_cluster_settings(
     // surfaces as `validate_mrec`'s duplicate-region error.
     effective.peers.extend(cli.peers.iter().cloned());
     effective.validate_mrec()?;
+    effective.validate_pitr()?;
     Ok(effective)
 }
 
@@ -2083,8 +2093,11 @@ async fn run_single(
         cs.mrec_max_clock_skew_ms = settings.mrec_max_clock_skew_ms;
     }
     let orphan_sweep_after = orphan_sweep_after_duration(settings.orphan_sweep_after_secs);
-    let stream_seal_knobs_val =
-        stream_seal_knobs(settings.stream_seal_bytes, settings.stream_seal_age_secs);
+    let stream_seal_knobs_val = stream_seal_knobs(
+        settings.stream_seal_bytes,
+        settings.stream_seal_age_secs,
+        &settings,
+    );
     let stream_retention = settings
         .stream_retention_secs
         .map_or(animusd::DEFAULT_STREAM_RETENTION, Duration::from_secs);
@@ -2299,6 +2312,7 @@ async fn run_control(args: &[String]) -> Result<(), String> {
         segment_store_config,
         backup_store_config,
         animusd::DEFAULT_STREAM_RETENTION,
+        settings.pitr_retention(),
     )
     .await
     .map_err(|e| format!("failed to start control node {index}: {e}"))?;
@@ -2616,8 +2630,11 @@ async fn run_data_config(
     let settings = config.cluster_settings.clone().unwrap_or_default();
     let quiesce_after = quiesce_after_duration(settings.quiesce_after_secs);
     validate_quiesce_after(quiesce_after)?;
-    let stream_seal_knobs_val =
-        stream_seal_knobs(settings.stream_seal_bytes, settings.stream_seal_age_secs);
+    let stream_seal_knobs_val = stream_seal_knobs(
+        settings.stream_seal_bytes,
+        settings.stream_seal_age_secs,
+        &settings,
+    );
 
     let node = animusd::run_node_data_with_cluster_settings(
         &config,
