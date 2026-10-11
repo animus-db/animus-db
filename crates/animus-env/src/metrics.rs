@@ -1077,12 +1077,19 @@ pub enum Metric {
     /// flips `/admin/health` to 503 (`consensus_task_panics` field) for the
     /// life of the process.
     ConsensusTaskPanics,
+    /// Control-leader load-rebalance evaluations (ADR 0029, issue #1192): one
+    /// per rebalance-cadence tick that reached the rebalance step.
+    ControlRebalanceEvals,
+    /// Of those, evaluations that had to rebuild the O(tablets) plan; the
+    /// rest were served from the cached plan. `rebuilds / evals` is the
+    /// amortization the plan cache buys (ADR 0029's 2026-10-11 amendment).
+    ControlRebalancePlanRebuilds,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 135] = [
+    pub const ALL: [Metric; 137] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -1218,6 +1225,8 @@ impl Metric {
         Metric::MrecReplicationLagMs,
         Metric::SpawnedTaskPanics,
         Metric::ConsensusTaskPanics,
+        Metric::ControlRebalanceEvals,
+        Metric::ControlRebalancePlanRebuilds,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -1362,6 +1371,8 @@ impl Metric {
             Metric::MrecReplicationLagMs => "mrec_replication_lag_ms",
             Metric::SpawnedTaskPanics => "spawned_task_panics",
             Metric::ConsensusTaskPanics => "consensus_task_panics",
+            Metric::ControlRebalanceEvals => "control_rebalance_evals",
+            Metric::ControlRebalancePlanRebuilds => "control_rebalance_plan_rebuilds",
         }
     }
 

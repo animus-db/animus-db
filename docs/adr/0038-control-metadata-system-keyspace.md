@@ -559,3 +559,25 @@ detector re-proposing `Down` for members a stale cache shows Active.
   must not reintroduce, the watermark-seeding lesson PR3 added, the
   concurrent-mirror-update race PR5 added, and (PR6) the
   whole-namespace-scan-vs-`entries()` warning.
+
+## Amendment (2026-10-10, issue #1192): derived table -> tablet index on `Metadata`
+
+`Metadata::apply(CreateTablet)` ran `tablets_for_table` and
+`next_free_tablet_id` as linear scans, so building N tablets was O(N^2).
+`Metadata` now carries a private, `#[serde(skip)]`, equality-neutral
+`TabletIndex` (table -> ordered tablet ids): derived in-memory state, **never
+serialized and no format change**, so the apply-task mirror, snapshots and the
+frozen fixtures are untouched. Every in-crate insert/remove of `tablets` goes
+through `insert_tablet`/`remove_tablet`; the index records the tablet count it
+was built for and readers (`tablets_for_table`, `has_table_tablet`) trust it
+only when that equals `tablets.len()`, otherwise they scan. A fresh decode,
+snapshot install or direct edit of the public `tablets` map is therefore always
+correct and merely unindexed until `rebuild_tablet_index` (called lazily by
+`CreateTablet`). Residual: an edit of the public map that keeps the count
+equal (swapping a row's table in place) is not detected; no code does that, and
+`tablet_index_is_exact` plus a random-command property test guard the
+maintained paths. `next_free_tablet_id` needs no cache: the highest id is the
+last key of the ordered map (`keys().next_back()`), so its semantics (counter,
+highest existing id, floor of 1, ids never reused) are unchanged and it is
+O(log n). Measured (debug, `CreateTablet` x N): 1k tablets 59 ms -> 8 ms,
+10k tablets 6442 ms -> 67 ms.

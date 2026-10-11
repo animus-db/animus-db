@@ -45,6 +45,7 @@ pub mod persist;
 /// Persist-round accounting shared by both planes' Raft drivers (issue #279).
 pub mod persist_round;
 pub mod raft;
+pub mod rebalance_cache;
 /// Offline force-new-configuration recovery of a Raft WAL (ADR 0077, issue #1178).
 pub mod recover;
 pub mod schema;
