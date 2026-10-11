@@ -60,6 +60,8 @@ fn tiny_seal_knobs() -> StreamSealKnobs {
     StreamSealKnobs {
         seal_bytes: 1,
         seal_age: Duration::from_secs(3600),
+        pitr_seal_age: Duration::from_secs(3600),
+        ..Default::default()
     }
 }
 
@@ -75,6 +77,8 @@ fn production_seal_knobs() -> StreamSealKnobs {
     StreamSealKnobs {
         seal_bytes: 1_000_000,
         seal_age: Duration::from_secs(2),
+        pitr_seal_age: Duration::from_secs(2),
+        ..Default::default()
     }
 }
 
@@ -2306,6 +2310,8 @@ async fn auto_split_change_rate_splits_a_high_churn_streamed_table_never_a_plain
         StreamSealKnobs {
             seal_bytes: 10_000_000,
             seal_age: Duration::from_secs(3600),
+            pitr_seal_age: Duration::from_secs(3600),
+            ..Default::default()
         },
         10_000,
     )

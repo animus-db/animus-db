@@ -224,9 +224,10 @@ committed in full):
    `engine_applied`: one entry per drained command, keyed by its Raft log
    index, holding that command's derived `KeyWrite`s (possibly empty — a
    `NoOp`/rejected command still gets an entry, which is what keeps the ring's
-   index space contiguous with no unexplained gaps). Bounded by **both** max
-   entries and max total bytes (defaults 1024 / 4 MiB, `DeltaRing::
-   with_bounds`/`RaftNode::start_with_ring_bounds` for a different bound) —
+   index space contiguous with no unexplained gaps). Bounded by max total
+   bytes (default 4 MiB, `DeltaRing::with_max_bytes`/`RaftNode::
+   start_with_ring_bounds` for a different budget; originally also 1024
+   entries, dropped 2026-10-10, see the amendment below) —
    oldest evicted first. Strictly per-node, best-effort, no cross-node
    coordination — nothing here is replicated or agreed on. **Reset to empty**
    whenever `cache` is rebuilt from a jump the ring itself didn't witness (a
@@ -546,6 +547,42 @@ queue wait is bounded by the rounds ahead of it. Regression:
 `tests/apply_not_starved_by_wal_lock.rs`. Follow-up not addressed: the failure
 detector re-proposing `Down` for members a stale cache shows Active.
 
+## Amendment (2026-10-10, issue #1191 -- the delta ring is capped by bytes only)
+
+The ring's 1024-entry cap is removed; only the byte budget (`DEFAULT_MAX_BYTES`,
+4 MiB, unchanged) bounds it. Why: every delta is O(1) bytes per touched tablet
+(~566 B for a single-change delta), so memory is already bounded by bytes, while
+the entry cap made a node drain of ~10k tablets (one replica-move command per
+tablet) overflow the ring and force every lagging mirror onto the full-`Status`
+fallback (4.27 MB at 10k tablets). At ~566 B/delta the 4 MiB budget holds about
+7000 deltas, so a 10k-tablet drain at 9+ nodes (~3.3k commands) now fits; a
+3-node 10k drain (~10k commands) and 50k-tablet drains still overflow and fall
+back, which is the intended best-effort behavior. The budget stays at 4 MiB
+(memory per control node). API: `DeltaRing::with_bounds(entries, bytes)` became
+`DeltaRing::with_max_bytes(bytes)`; `DEFAULT_MAX_ENTRIES` is gone. Tests:
+`delta_ring` unit tests (byte-only eviction, 10k small entries retained) and
+`watch_deltas::over_a_thousand_small_deltas_are_still_served_as_a_delta`.
+
+## Amendment (2026-10-10, issues #1194/#1235 — a control node refuses to start on a syskv mirror behind its compacted WAL)
+
+A `DRIVER_APPLIED` snapshot keeps no local image: after a restart the apply
+task replays only the log above the recovered snapshot base and trusts the
+engine for everything below it. If the system-keyspace engine is lost or wiped
+while the control WAL survives (compacted below the base), the node rebuilt a
+partial `Metadata`, read `commit == applied` equal to the leader's, and the
+leader never sent `InstallSnapshot`. **Decision (maintainer): refuse to
+start.** In `drive`, right after `meta_apply_seed`, if the engine's durable
+`_applied_index` watermark is below the core's recovered `snapshot_index()`
+the node logs an error naming both indices and the remedy, latches `halted`
+and returns, exactly like the syskv-decode-failure halt. A fresh bootstrap (no
+snapshot, base 0), an empty WAL and a normal restart (watermark >= base)
+are unaffected. Remedy (runbook `control-plane-quorum-loss.md`): wipe the
+node's control state entirely and re-add it. `SimCluster`'s Memory backend
+(#1235) now retains the control mirror engine across `restart` like a real
+disk. Tests: `animus-control` `restart_retained_syskv_engine` (fresh engine
+halts, retained engine converges) and `animusd`
+`sim_cluster_control_restart_compacted`.
+
 ## See also
 
 - `crates/animus-control/CLAUDE.md` — `node.rs`/`raft.rs`/`mirror.rs`/`syskv.rs`/
@@ -559,3 +596,25 @@ detector re-proposing `Down` for members a stale cache shows Active.
   must not reintroduce, the watermark-seeding lesson PR3 added, the
   concurrent-mirror-update race PR5 added, and (PR6) the
   whole-namespace-scan-vs-`entries()` warning.
+
+## Amendment (2026-10-10, issue #1192): derived table -> tablet index on `Metadata`
+
+`Metadata::apply(CreateTablet)` ran `tablets_for_table` and
+`next_free_tablet_id` as linear scans, so building N tablets was O(N^2).
+`Metadata` now carries a private, `#[serde(skip)]`, equality-neutral
+`TabletIndex` (table -> ordered tablet ids): derived in-memory state, **never
+serialized and no format change**, so the apply-task mirror, snapshots and the
+frozen fixtures are untouched. Every in-crate insert/remove of `tablets` goes
+through `insert_tablet`/`remove_tablet`; the index records the tablet count it
+was built for and readers (`tablets_for_table`, `has_table_tablet`) trust it
+only when that equals `tablets.len()`, otherwise they scan. A fresh decode,
+snapshot install or direct edit of the public `tablets` map is therefore always
+correct and merely unindexed until `rebuild_tablet_index` (called lazily by
+`CreateTablet`). Residual: an edit of the public map that keeps the count
+equal (swapping a row's table in place) is not detected; no code does that, and
+`tablet_index_is_exact` plus a random-command property test guard the
+maintained paths. `next_free_tablet_id` needs no cache: the highest id is the
+last key of the ordered map (`keys().next_back()`), so its semantics (counter,
+highest existing id, floor of 1, ids never reused) are unchanged and it is
+O(log n). Measured (debug, `CreateTablet` x N): 1k tablets 59 ms -> 8 ms,
+10k tablets 6442 ms -> 67 ms.

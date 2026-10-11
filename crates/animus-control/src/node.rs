@@ -26,6 +26,7 @@ use crate::mirror::{self, KeyWrite, RebuildError};
 use crate::persist::{CONTROL_SNAPSHOT, CONTROL_WAL, PersistedState};
 use crate::persist_round::{self, GatedOuts, PersistArm, PersistFut, PersistProgress, PersistWake};
 use crate::raft::{Out, ProposeResult, RaftCore, RaftMsg, Role};
+use crate::rebalance_cache::{RebalanceCache, RebalanceCacheStats};
 use crate::syskv;
 use crate::version::{ClusterFeatures, GateSurface, GatedCommand, VersionRange};
 use crate::version_observe::{
@@ -569,7 +570,7 @@ pub struct RaftNode<E: Env> {
     /// `detect_loop`) reads *this*, never the core's own (unused, since
     /// `Metadata: DRIVER_APPLIED`) in-memory field. The apply task
     /// (`meta_apply_loop`) is its sole writer.
-    cache: Arc<Mutex<Metadata>>,
+    cache: Arc<Mutex<Arc<Metadata>>>,
     /// The highest Raft log index the system-keyspace engine has durably
     /// merged (ADR 0038 PR3) — mirrors `animus-cp-data`'s `engine_applied`.
     /// `cache` is only ever published *after* the matching engine write, so
@@ -670,8 +671,7 @@ impl<E: Env> RaftNode<E> {
     /// `start`); the sim observability test threads in a recording handle here so
     /// it can read counters back without editing `animus-sim`, and integration
     /// can pass `env.metrics()` (or any chosen sink) explicitly. Uses the
-    /// default delta-ring bounds ([`crate::delta_ring::DEFAULT_MAX_ENTRIES`]/
-    /// [`crate::delta_ring::DEFAULT_MAX_BYTES`]) — see
+    /// default delta-ring byte budget ([`crate::delta_ring::DEFAULT_MAX_BYTES`]) — see
     /// [`start_with_ring_bounds`](Self::start_with_ring_bounds) for a caller
     /// that wants different ones.
     pub fn start_with_metrics<S: StorageEngine + 'static>(
@@ -687,7 +687,7 @@ impl<E: Env> RaftNode<E> {
     /// explicit [`DeltaRing`] (ADR 0038 PR5) instead of the default bounds —
     /// the "configurable" half of the ring's design; a test proving
     /// eviction/fallback behavior without pushing thousands of entries
-    /// constructs a small-bounded [`DeltaRing::with_bounds`] and passes it
+    /// constructs a small-budget [`DeltaRing::with_max_bytes`] and passes it
     /// here. Uses [`DEFAULT_ORPHAN_SWEEP_AFTER`] for the orphan-member sweep
     /// (ADR 0040 PR6) — see
     /// [`start_with_orphan_sweep_after`](Self::start_with_orphan_sweep_after)
@@ -743,7 +743,7 @@ impl<E: Env> RaftNode<E> {
         )));
         let detector = Arc::new(Mutex::new(FailureDetector::new(DETECT_TIMEOUT)));
         let watch = MetadataWatch::default();
-        let cache = Arc::new(Mutex::new(Metadata::default()));
+        let cache = Arc::new(Mutex::new(Arc::new(Metadata::default())));
         let engine_applied = Arc::new(AtomicU64::new(0));
         let engine_applied_for_version = Arc::clone(&engine_applied);
         let delta_ring = Arc::new(Mutex::new(delta_ring));
@@ -799,6 +799,7 @@ impl<E: Env> RaftNode<E> {
             Arc::clone(&core),
             Arc::clone(&cache),
             features.clone(),
+            metrics.clone(),
         ));
         // The failure detector evaluates member liveness on a timer and, when
         // leader, proposes `UpsertMember` transitions (ADR 0012). Like the
@@ -1214,7 +1215,16 @@ impl<E: Env> RaftNode<E> {
     /// [`engine_applied_index`](Self::engine_applied_index) instead of
     /// assuming this call alone is synchronized with a just-issued `propose`.
     pub fn metadata(&self) -> Metadata {
-        self.cache.lock().expect("cache poisoned").clone()
+        Metadata::clone(&self.cache.lock().expect("cache poisoned"))
+    }
+
+    /// The apply task's published `Metadata` as a shared handle: an `Arc`
+    /// clone, O(1) regardless of tablet count (issue #1190). The apply task
+    /// replaces the `Arc` on every publish, so a held handle is an immutable
+    /// snapshot; two reads with no apply in between are `Arc::ptr_eq`. Same
+    /// freshness contract as [`metadata`](Self::metadata).
+    pub fn metadata_arc(&self) -> Arc<Metadata> {
+        Arc::clone(&self.cache.lock().expect("cache poisoned"))
     }
 
     /// A clone of just the **membership map** — the failure detector's
@@ -1458,7 +1468,7 @@ fn send_gate_ok(features: &ClusterFeatures, msg: &RaftMsg) -> bool {
 /// otherwise race the handle and be refused for nothing.
 fn propose_gated(
     core: &Mutex<RaftCore>,
-    cache: &Mutex<Metadata>,
+    cache: &Mutex<Arc<Metadata>>,
     features: &ClusterFeatures,
     command: MetaCommand,
 ) -> ProposeResult {
@@ -1538,7 +1548,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
     metrics: MetricsHandle,
     watch: MetadataWatch,
     engine: S,
-    cache: Arc<Mutex<Metadata>>,
+    cache: Arc<Mutex<Arc<Metadata>>>,
     engine_applied: Arc<AtomicU64>,
     delta_ring: Arc<Mutex<DeltaRing>>,
     wal_lock: Arc<FairMutex>,
@@ -1699,6 +1709,29 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
                 return;
             }
         };
+
+    // Issues #1194/#1235 (ADR 0038's 2026-10-10 amendment): the engine's
+    // durable watermark must reach the recovered core's snapshot base. A
+    // DRIVER_APPLIED snapshot keeps no local image, so the apply task replays
+    // only the log tail above the base; an engine behind it (lost or wiped
+    // while the WAL survived) would otherwise serve a partial `Metadata` at a
+    // matching applied index, and the leader would never send InstallSnapshot.
+    // Refuse to start instead, exactly like the decode-failure halts above.
+    let snapshot_base = core.lock().expect("raft core poisoned").snapshot_index();
+    if watermark < snapshot_base {
+        tracing::error!(
+            engine_watermark = watermark,
+            snapshot_base,
+            "control-plane system-keyspace mirror is behind this node's compacted Raft \
+             WAL (engine watermark {watermark} < snapshot base {snapshot_base}); the \
+             mirror was lost or wiped while the WAL survived, so serving would expose a \
+             partial Metadata. halting this node: wipe its control state entirely (WAL \
+             and system keyspace) and re-add it with `control-add` \
+             (docs/runbook/control-plane-quorum-loss.md)"
+        );
+        halted.store(true, Ordering::SeqCst);
+        return;
+    }
 
     // ADR 0073 Phase 2 (P2-A): era-on handshake refusal + startup range check
     // against the freshly read `Metadata`, before the first tick.
@@ -2064,7 +2097,7 @@ struct ApplySeed {
 /// branch) needs to clear an already-populated ring.
 async fn meta_apply_seed<S: StorageEngine>(
     engine: &S,
-    cache: &Arc<Mutex<Metadata>>,
+    cache: &Arc<Mutex<Arc<Metadata>>>,
     engine_applied: &Arc<AtomicU64>,
     watch: &MetadataWatch,
 ) -> Result<ApplySeed, FormatError> {
@@ -2089,7 +2122,7 @@ async fn meta_apply_seed<S: StorageEngine>(
         .expect("system-keyspace engine read (watermark)")
         .map(|v| decode_watermark(&v.value))
         .unwrap_or(0);
-    *cache.lock().expect("cache poisoned") = shadow.clone();
+    *cache.lock().expect("cache poisoned") = Arc::new(shadow.clone());
     engine_applied.store(watermark, Ordering::SeqCst);
     // A restart can recover already-applied state; a watcher parked before
     // this task's first loop iteration should see it too.
@@ -2120,7 +2153,7 @@ async fn meta_apply_loop<E: Env, S: StorageEngine>(
     env: E,
     core: Arc<Mutex<RaftCore>>,
     engine: S,
-    cache: Arc<Mutex<Metadata>>,
+    cache: Arc<Mutex<Arc<Metadata>>>,
     engine_applied: Arc<AtomicU64>,
     delta_ring: Arc<Mutex<DeltaRing>>,
     watch: MetadataWatch,
@@ -2201,7 +2234,7 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
     env: &E,
     core: &Arc<Mutex<RaftCore>>,
     engine: &S,
-    cache: &Arc<Mutex<Metadata>>,
+    cache: &Arc<Mutex<Arc<Metadata>>>,
     engine_applied: &Arc<AtomicU64>,
     delta_ring: &Arc<Mutex<DeltaRing>>,
     watch: &MetadataWatch,
@@ -2257,7 +2290,7 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
             }
         };
         *watermark = last_index;
-        *cache.lock().expect("cache poisoned") = shadow.clone();
+        *cache.lock().expect("cache poisoned") = Arc::new(shadow.clone());
         engine_applied.fetch_max(last_index, Ordering::SeqCst);
         // The ring's coverage window is meaningless across a jump it didn't
         // witness (ADR 0038 PR5) — reset it so a `WatchMetadata` caller
@@ -2331,7 +2364,7 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
             return did_work;
         }
         *watermark = max_index;
-        *cache.lock().expect("cache poisoned") = shadow.clone();
+        *cache.lock().expect("cache poisoned") = Arc::new(shadow.clone());
         engine_applied.fetch_max(max_index, Ordering::SeqCst);
         // Feed the ring before bumping `watch` (ADR 0038 PR5): a watcher
         // woken by that bump calls straight into `watch_delta_since`, which
@@ -2829,10 +2862,18 @@ fn record_transfer_clear(
 async fn reconcile_loop<E: Env>(
     env: E,
     core: Arc<Mutex<RaftCore>>,
-    cache: Arc<Mutex<Metadata>>,
+    cache: Arc<Mutex<Arc<Metadata>>>,
     features: ClusterFeatures,
+    metrics: MetricsHandle,
 ) {
     let mut tick: u64 = 0;
+    // The leader's rebalance plan, kept across ticks (issue #1192, ADR 0029's
+    // 2026-10-11 amendment): still at most one move per evaluation, but the
+    // O(tablets) planning pass runs only when the cluster diverged from what
+    // the plan predicted. Dropped on losing leadership and on a refused
+    // proposal; a term change is also caught inside the cache.
+    let mut rebalance_cache = RebalanceCache::new();
+    let mut reported = RebalanceCacheStats::default();
     // Driver-local dwell tracking for the directed-Placing phase's
     // retarget gate (ADR 0062 §2, issue #528 fix) — see
     // `retarget_ready_this_tick`'s own doc. Volatile, per-node,
@@ -2868,7 +2909,11 @@ async fn reconcile_loop<E: Env>(
         // pure decision *off* the lock, so a big catalog never turns this
         // background tick into a full-blob clone every 500ms (clone-churn
         // fix).
-        if !core.lock().expect("raft core poisoned").is_leader() {
+        let term = {
+            let core = core.lock().expect("raft core poisoned");
+            core.is_leader().then(|| core.term())
+        };
+        let Some(term) = term else {
             // A non-leader's dwell tracking is meaningless (only the leader
             // ever proposes a retarget) — clear it so a future leadership
             // stint starts its dwell clocks fresh rather than resuming a
@@ -2878,8 +2923,9 @@ async fn reconcile_loop<E: Env>(
             retarget_since.clear();
             done_since.clear();
             down_since.clear();
+            rebalance_cache.invalidate();
             continue;
-        }
+        };
         let view = cache.lock().expect("cache poisoned").placement_view();
         // Issue #928/#921 fix: computed before repair/rebalance so both can
         // exclude a tablet still inside its post-`done` grace window — see
@@ -2903,11 +2949,22 @@ async fn reconcile_loop<E: Env>(
         // move (a healthy replica from a most-loaded node onto a least-loaded
         // one). The cadence is pure churn control (see `REBALANCE_EVERY_N_TICKS`):
         // safety is the epoch-CAS + data-plane catch-up gate, not this timing.
-        if !repaired
-            && tick.is_multiple_of(REBALANCE_EVERY_N_TICKS)
-            && let Some(command) = view.rebalance(&recently_done, &recently_down)
-        {
-            propose_gated(&core, &cache, &features, command);
+        if !repaired && tick.is_multiple_of(REBALANCE_EVERY_N_TICKS) {
+            if let Some(command) = rebalance_cache.next(&view, term, &recently_done)
+                && !matches!(
+                    propose_gated(&core, &cache, &features, command),
+                    ProposeResult::Accepted { .. }
+                )
+            {
+                rebalance_cache.invalidate();
+            }
+            let now = rebalance_cache.stats();
+            metrics.incr_by(Metric::ControlRebalanceEvals, now.evals - reported.evals);
+            metrics.incr_by(
+                Metric::ControlRebalancePlanRebuilds,
+                now.rebuilds - reported.rebuilds,
+            );
+            reported = now;
         }
         // ADR 0062 §2's directed-Placing phase: unconditional every tick,
         // independent of the repair/rebalance gating above. Off-leader
@@ -3149,7 +3206,7 @@ fn recently_down_this_tick<E: Env>(
 async fn detect_loop<E: Env>(
     env: E,
     core: Arc<Mutex<RaftCore>>,
-    cache: Arc<Mutex<Metadata>>,
+    cache: Arc<Mutex<Arc<Metadata>>>,
     detector: Arc<Mutex<FailureDetector>>,
     metrics: MetricsHandle,
     features: ClusterFeatures,
@@ -3260,7 +3317,7 @@ async fn detect_loop<E: Env>(
 async fn version_loop<E: Env>(
     env: E,
     core: Arc<Mutex<RaftCore>>,
-    cache: Arc<Mutex<Metadata>>,
+    cache: Arc<Mutex<Arc<Metadata>>>,
     engine_applied: Arc<AtomicU64>,
     observations: Arc<Mutex<VersionObservations>>,
     own_version: Arc<Mutex<OwnVersion>>,
@@ -3510,7 +3567,7 @@ async fn region_timing_loop<E: Env>(node: RaftNode<E>, max_region_rtt: Duration)
 async fn orphan_sweep_loop<E: Env>(
     env: E,
     core: Arc<Mutex<RaftCore>>,
-    cache: Arc<Mutex<Metadata>>,
+    cache: Arc<Mutex<Arc<Metadata>>>,
     orphan_sweep_after: Duration,
     metrics: MetricsHandle,
     features: ClusterFeatures,
@@ -3946,6 +4003,7 @@ mod tests {
             tablets: BTreeMap::new(),
             policies: BTreeMap::new(),
             split_placing: BTreeMap::new(),
+            rev: 0,
         }
     }
 
@@ -4096,7 +4154,7 @@ mod tests {
 
         let core = Arc::new(Mutex::new(core));
         let engine = animus_storage::MemoryEngine::new();
-        let cache = Arc::new(Mutex::new(Metadata::default()));
+        let cache = Arc::new(Mutex::new(Arc::new(Metadata::default())));
         let engine_applied = Arc::new(AtomicU64::new(0));
         let delta_ring = Arc::new(Mutex::new(DeltaRing::default()));
         let watch = MetadataWatch::default();
@@ -4131,7 +4189,7 @@ mod tests {
         assert_eq!(shadow, Metadata::default(), "shadow must not have advanced");
         assert_eq!(
             *cache.lock().expect("cache poisoned"),
-            Metadata::default(),
+            Arc::new(Metadata::default()),
             "cache must not have been (re)published"
         );
         assert_eq!(
@@ -4173,7 +4231,7 @@ mod tests {
 
         let core = Arc::new(Mutex::new(core));
         let engine = animus_storage::MemoryEngine::new();
-        let cache = Arc::new(Mutex::new(Metadata::default()));
+        let cache = Arc::new(Mutex::new(Arc::new(Metadata::default())));
         let engine_applied = Arc::new(AtomicU64::new(0));
         let delta_ring = Arc::new(Mutex::new(DeltaRing::default()));
         let watch = MetadataWatch::default();
@@ -4310,7 +4368,7 @@ mod tests {
 
         let core = Arc::new(Mutex::new(core));
         let engine = animus_storage::MemoryEngine::new();
-        let cache = Arc::new(Mutex::new(Metadata::default()));
+        let cache = Arc::new(Mutex::new(Arc::new(Metadata::default())));
         // Well past `SNAPSHOT_THRESHOLD` (64) — "the engine's own durable
         // watermark, re-seeded at this task's own startup, is far ahead of
         // what this recovered core's own WAL shows."

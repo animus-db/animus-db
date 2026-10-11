@@ -131,7 +131,7 @@ pointing at those three files — the *same* cert/key on every pod, not a
 distinct one per ordinal (see `crd::TlsSpec`'s own doc for why).
 
 **(2026-09-05)** The pod's own readiness/liveness probes (`GET
-/admin/health`) switch to `scheme: HTTPS` once `spec.tls` is set — admin is
+/admin/health` or, once every pod serves it, `/admin/ready`; liveness `/admin/live`) switch to `scheme: HTTPS` once `spec.tls` is set — admin is
 server-only TLS, so a plaintext kubelet probe against a TLS-only listener
 fails the handshake on the server side, and without this every pod stays
 NotReady and gets restart-looped by the kubelet. The kubelet's HTTPS probe
@@ -418,6 +418,11 @@ module doc for the full reasoning, including why there is no CRD field to
 loosen or disable it.
 
 ## Control-voter growth (S-07d)
+
+To pause voter auto-add during manual control-plane surgery (e.g. `control-remove`
+in `docs/runbook/control-plane-quorum-loss.md`), annotate the cluster
+`animusdb.io/pause-control-voter-reconcile=true`; the status then carries a
+`ControlVoterReconcilePaused` condition. Remove the annotation to resume.
 
 `spec.controlNodes` is **grow-only**: an increase is honored — the
 operator drives ADR 0037's `control/member/add` against the

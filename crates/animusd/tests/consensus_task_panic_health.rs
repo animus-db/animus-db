@@ -80,6 +80,10 @@ async fn a_panicked_consensus_task_fails_health_and_counts() {
     let (_, body) = wait_for(admin, "/admin/health", "a healthy node", |s, _| s == 200).await;
     assert_eq!(body["consensus_task_panics"], 0, "{body}");
     assert_eq!(body["ok"], true, "{body}");
+    // Issue #1274: `/admin/ready` (the readiness probe) is 200 too.
+    let (rs, rbody) = get(admin, "/admin/ready").await.expect("ready answers");
+    assert_eq!(rs, 200, "{rbody}");
+    assert_eq!(rbody["metadata_synced"], true, "{rbody}");
 
     // A panic in an ordinary spawned task is counted but is NOT a consensus
     // loop: health stays 200.
@@ -105,6 +109,11 @@ async fn a_panicked_consensus_task_fails_health_and_counts() {
     assert_eq!(status, 503, "{body}");
     assert_eq!(body["ok"], false, "{body}");
     assert_eq!(body["consensus_task_panics"], 1, "{body}");
+    // ... and so does `/admin/ready`: only a restart repairs a dead loop.
+    let (rs, rbody) = get(admin, "/admin/ready").await.expect("ready answers");
+    assert_eq!(rs, 503, "{rbody}");
+    assert_eq!(rbody["ok"], false, "{rbody}");
+    assert_eq!(rbody["consensus_task_panics"], 1, "{rbody}");
     let (_, m) = get(admin, "/admin/metrics").await.expect("metrics answer");
     assert_eq!(m["counters"]["consensus_task_panics"], 1, "{m}");
     assert_eq!(m["counters"]["spawned_task_panics"], 2, "{m}");

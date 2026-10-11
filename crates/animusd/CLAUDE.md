@@ -1188,7 +1188,20 @@ a literal `:0`.
   `is_relayable_command` allowlist regression, mirroring
   `schema_ddl_relay.rs`'s precedent for `SetTableTtl`/`TagResource`/etc.).
 
-  **`GET /admin/health` — the Kubernetes readiness probe (ADR 0060) — reads
+  **`GET /admin/ready` (issue #1274, 2026-10-10) is the Kubernetes readiness
+  probe now; `/admin/health` is unchanged control-plane health.** `ready()`
+  is `200` iff this node has synced `Metadata` (`last_applied() > 0` OR
+  `has_synced_metadata()` OR `ctx.remote_metadata` set: the same three-way
+  signal as the host reconciler's pre-recovery guard) AND
+  `consensus_task_panics == 0`; it never gates on a control leader
+  (`control_leader_recent` is a diagnostic), because per-tablet Raft groups
+  serve through a control-plane quorum loss and the client Service only
+  routes to Ready pods. Tests: `a_panicked_consensus_task_fails_health_and_counts`
+  (`tests/consensus_task_panic_health.rs`, ready 503 on panic),
+  `admin_endpoint.rs`'s `admin_ready_is_200_while_leaderless_with_metadata`,
+  and the `sim_cluster` smoke. ADR 0020/0060 2026-10-10 amendments.
+
+  **`GET /admin/health` — formerly the Kubernetes readiness probe (ADR 0060) — reads
   a HYSTERESIS-gated leader belief, not the raw one (issue #595, ADR 0020's
   2026-09-04 amendment).** `ctx.control.leader().is_some()` (the raw
   consensus belief, `RaftCore::leader_id`) is cleared the instant a
@@ -3302,6 +3315,19 @@ built on, not just the first one found. Regression:
 `animus-cp-data/tests/txn_record_view_served.rs` (the fixed primitive's own
 "served" contract) and the mirrored fix in `animus-test/tests/
 txn_serializable.rs`'s own `push`/`resolver_tick`.
+
+**`RECOVERY_GRACE` after a restart (issue #1204)**: `txn_recover`'s grace
+gate compares `created_ts.wall_ms` (an HLC, re-seeded from the engine's
+high-water mark at start) with `env.now()` (`ProdEnv`: process uptime, near
+zero after a restart), so a restarted cluster refused to recover an in-doubt
+intent, and a consistent read of its key hung, until uptime caught up with the
+old incarnation's. The gate now also opens once *this node* has watched the
+txn in doubt for a grace on its own clock (`ClusterEdgeState::
+in_doubt_grace_elapsed`; either test suffices). Regression:
+`sim_cluster_dynamo_transact::coordinator_crash_recovers_when_the_survivors_
+clock_restarted_behind_the_record` (a negative `set_clock_skew_for` models the
+uptime reset; asserts recovery latency in virtual time). The chaos
+`chaos_kill` seed-777 repro is the real-process check.
 
 **`ClientRequestToken` idempotency for `TransactWriteItems` (ADR 0018's
 2026-08-24 amendment; the 2026-08-27 amendment closing issue #298's "deep
@@ -12213,12 +12239,13 @@ for less than the repair dwell causes no churn even with a spare node, so the
 measurement needs `ANIMUS_UPGRADE_FROM_RESTART_GAP_SECS`; a write the client
 timed out on can commit after the workload stopped, so "unchanged after a
 restart" is wrong, "grew, in order, only by writes this workload issued" is
-right; **Known findings** against the pinned `ac57d56a` (module doc): its own
-abort-tombstone defect (`efcaa6cb`), legacy v1 intents aborted by the new
-binary, and the ungated `txn-envelope` v2 intent (an R-1 replica panics on an
-upgraded node's repair snapshot), so the workload runs without multi-key
-transactions unless `ANIMUS_UPGRADE_FROM_TXN=1` (CI runs one such variant as an
-informational, non-blocking step);
+right; **Transactions** (module doc, #1238 closed 2026-10-10): the pin
+(`scripts/upgrade-from.txt`) is `f6709564`, which contains `efcaa6cb`, so the
+old `ac57d56a` defects (its own abort-tombstone bug, legacy v1 intents aborted by
+the new binary, the ungated v2 intent that panicked an R-1 replica) do not apply
+and the workload runs multi-key transactions by default (`ANIMUS_UPGRADE_FROM_TXN=0`
+turns them off). Never pin a ref older than `efcaa6cb` while transactions are on; that
+ref loses acked writes with no upgrade at all (`_CONTROL=same-binary`);
 `ANIMUS_UPGRADE_FROM_CONTROL=same-binary|current-only` runs the same
 roll with no binary change, to tell a mixed-version defect from a restart/repair
 defect; a failure writes history, op trace, violations and node logs under
@@ -12429,3 +12456,28 @@ node, a bad index, a missing/empty WAL, and a node that is not a voter in its ow
 WAL. WAL path is `<dir>/internal/raft.wal` (`--encryption-key` as for the node).
 Tests: `cargo test -p animusd --lib control_recover`. Runbook:
 `docs/runbook/control-plane-quorum-loss.md`.
+
+`SimCluster` keeps each control node's syskv `MemoryEngine` across `restart` (a real
+restart reopens the same disk); a fresh engine over a compacted control WAL now makes
+the control node halt (ADR 0038 2026-10-10, issues #1194/#1235). Test:
+`cargo test -p animusd --lib sim_cluster_control_restart_compacted`.
+
+- **`backup_capture.rs` holds its cut (#1206).** `backup_capture_loop` keeps a
+  `VersionHold` per `(backup, tablet)` at `cut_version` for the whole capture,
+  rebuilt each pass from the pairs it still drives (so completion, failure,
+  cancel, loss of leadership and task drop all release it). ADR 0059's 2026-10-10
+  amendment.
+
+## PITR retention and seal age (issue #1275, ADR 0059 amendment 2026-10-10)
+
+`cluster_settings.pitr_retention_days` (default 35, `1..=35`) and
+`cluster_settings.pitr_seal_age_secs` (default 300) are config-file-only,
+node-local (ADR 0073 class L) knobs. `ClusterSettings::validate_pitr` runs at
+config load and in `resolve_cluster_settings`. Seal age rides in
+`StreamSealKnobs::pitr_seal_age` (read by `index_drain::pitr_tick`, not the
+Streams `seal_age`); retention rides in `StreamSealKnobs::pitr_retention` into
+`AdminInfo::pitr_retention`, which `dynamo.rs` reads (`ctx.admin`) and the two
+`pitr_janitor_loop` spawn sites use; `start_control_with` /
+`run_node_control_with_stores` take it as a parameter (control-only has no
+seal knobs). A new `StreamSealKnobs { .. }` literal needs `..Default::default()`
+(or all four fields in a `const`).

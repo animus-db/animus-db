@@ -705,6 +705,11 @@ impl AdminOps for FakeAdminClient {
                 return answer.clone();
             }
         }
+        if url.contains("/admin/ready") {
+            // A previous-release `animusd` (issue #1274): no such route,
+            // unless a test scripted one.
+            return Err("admin endpoint returned status 404: not found (fake)".to_string());
+        }
         if url.contains("/admin/control/members") {
             if *self.fail_control_members.lock().unwrap() {
                 return Err("control/members unreachable (fake)".to_string());

@@ -34,13 +34,15 @@ Verified from code and ADR 0037 (not by an outage drill):
   Anything needing a metadata commit fails ("did not commit to the control plane
   in time (no leader reachable?)", HTTP 500). Nodes serve their last mirrored
   `Metadata` for routing.
-- **Kubernetes caveat (by code reading, not drilled).** The pod readiness probe is
-  `/admin/health`, which is 503 when no control leader was heard from for three
-  election timeouts. The client-facing `<name>-dynamo` Service does not publish
-  not-ready addresses (only the headless internal Service does). So a control quorum
-  loss makes every pod `NotReady` and removes all endpoints from the client Service
-  even though tablet groups could still serve. Port-forward or address a pod
-  directly to reach the data plane meanwhile.
+- **Kubernetes (issue #1274).** The pod readiness probe is `/admin/ready`, which is
+  NOT gated on a control leader (it needs synced `Metadata` and no panicked consensus
+  task), so a control quorum loss no longer removes the client endpoints: pods stay
+  Ready and the `<name>-dynamo` Service keeps routing to tablet groups that can still
+  serve. `/admin/health` (503 with no recent leader, three election timeouts) is
+  unchanged and is the signal that shows the control plane is down. The operator
+  switches a cluster to `/admin/ready` only once every pod serves it; until then
+  (or on a cluster with an older pod) pods still probe `/admin/health` and drop
+  out of the Service as before; port-forward to a pod meanwhile.
 
 ## Recoverable: voters come back with their data
 
@@ -49,12 +51,36 @@ is needed: the control Raft recovers from its WAL and a leader is elected.
 Restart them ([node-down.md](node-down.md)), same `--dir`, same identity. Do
 this before anything else; it is the only fully supported recovery.
 
+## A control node halts: "mirror is behind this node's compacted Raft WAL"
+
+A control node that logs `control-plane system-keyspace mirror is behind this
+node's compacted Raft WAL (engine watermark W < snapshot base B)` refused to
+start (issues #1194/#1235, ADR 0038's 2026-10-10 amendment). Its control Raft
+WAL survived but its system-keyspace engine (the durable `Metadata` mirror)
+was lost or wiped, so serving would have exposed a partial `Metadata` while
+reporting caught up. The node stays halted (`RaftNode::is_halted()`; it never
+votes, leads or serves) until repaired. Do not restore only one of the two
+directories. Repair: remove the node's control state entirely (WAL and
+system keyspace), then re-add it as a fresh voter with
+`animus cluster control-add` ([node-replace.md](node-replace.md)); it catches
+up by `InstallSnapshot`. Restoring the matching system-keyspace directory also
+works. Other quorum members are unaffected as long as a majority is healthy.
+
 ## Recoverable by design: a minority is lost, a majority is alive
 
 Replace the lost voters one at a time ([node-replace.md](node-replace.md) B).
 Never remove a second voter while a third is suspected dead.
 
 ## A majority of voters is permanently gone: force a new configuration
+
+**Operator-managed clusters (issue #1277).** The operator re-adds any control
+ordinal in `0..controlNodes` missing from the live voter set on every reconcile,
+which would undo the removals and wipes above. Before step 1, pause it:
+`kubectl annotate animuscluster NAME animusdb.io/pause-control-voter-reconcile=true`
+(status shows a `ControlVoterReconcilePaused` condition; children are still
+applied). When the group is regrown as you want (or you want the operator to do
+the regrowth), remove it: `kubectl annotate animuscluster NAME
+animusdb.io/pause-control-voter-reconcile-`.
 
 When a majority of control voters cannot come back (disks destroyed), no in-band
 change can commit: `control-remove --force` and the tablet-level `reconfigure` both

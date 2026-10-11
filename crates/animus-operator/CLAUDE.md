@@ -418,6 +418,31 @@ non-default `kube-dns` namespace.
 
 ## Probes: readiness vs. liveness (issue #710, 2026-09-07)
 
+**Update 2026-10-10 (issue #1274): the readiness route is an observed
+switch between `GET /admin/health` and `GET /admin/ready`.** `/admin/ready` is
+data-plane readiness (synced `Metadata`, no panicked consensus task), not gated
+on a control leader, so a control-plane quorum loss no longer empties the
+client `-dynamo` Service. A previous-release `animusd` 404s on it, so
+`controller::decide_readiness_path` probes `/admin/ready` on every pod each
+reconcile (`200`/`503` = route exists, `404` = old binary; `pick_readiness_path`
+is the pure decision): any 404 -> `/admin/health`; all pods answer ->
+`/admin/ready`; unreachable/missing pods keep the live path; a fresh cluster (no
+StatefulSet) starts on `/admin/ready` (no extra roll after bootstrap; a 404
+reverts it, and `revert_is_ungated` lets that one revert skip the roll gate
+when it is the only template change and no pod is Ready, since the gate cannot
+progress on a cluster whose pods are NotReady on the probe). The live
+StatefulSet's probe path is the persisted state (no status field). A flip is a
+pod-template change and goes through the roll gate; the flip to ready waits for
+no roll in flight, the revert on a 404 does not. Only Running pods with an IP are probed, under a 3s total budget
+(`READY_PROBE_BUDGET`), and the API server's own `pods "x" not found` 404
+(pod proxy, a pod not created yet, e.g. a scale-up ordinal) is *Unknown*, not
+"old binary": misreading it as a 404 from animusd reverted the path and rolled
+every pod (e2e-kind-s3-tls scale-up, curl 52). Pod topology annotations are
+resolved at the START of `finish_reconcile` too, so probing can never delay
+them (animusd waits for them at boot; e2e-kind-encryption). `FakeAdminClient`
+answers 404 for `/admin/ready` unless scripted. Liveness stays `/admin/live`. The text below describes the original
+`/admin/health` readiness and still explains why liveness must differ.
+
 `desired::statefulset::admin_probe` builds both probes off one shared
 `HTTPGetAction` shape (port, TLS scheme) but takes an explicit `path`
 argument — **`readinessProbe` on `GET /admin/health`, `livenessProbe` on
@@ -1332,6 +1357,19 @@ name, per-version expected value, `panic!` on an unrecognised version. Every `An
 `schemaVersion: 1`; regenerate `deploy/operator/crd.yaml` after touching the
 spec type.
 
+### Pausing voter auto-add (issue #1277, 2026-10-10)
+
+`advance_control_growth` re-adds every missing ordinal in `0..controlNodes`, so
+a manual `control-remove` is undone within a reconcile. The annotation
+`animusdb.io/pause-control-voter-reconcile: "true"`
+(`crd::ANNOTATION_PAUSE_CONTROL_VOTER_RECONCILE`; deliberately an annotation,
+not a spec field, so no CRD/fixture churn) makes `reconcile` skip
+`advance_control_growth` entirely (no discovery, no `member/add`) and set the
+`ControlVoterReconcilePaused` condition; everything else (children, PDB with the
+last applied count, roll) still runs. Removing the annotation (or any value other
+than `"true"`) clears the condition and growth resumes from live truth. Test:
+`reconcile_growth_paused_by_annotation_skips_voter_add_and_sets_condition`.
+
 ## Rolling upgrades (ADR 0073 Phase 3, P3-D)
 
 Every pod-template change (a `spec.image` edit **and** a config-hash change such as a
@@ -1885,6 +1923,15 @@ cluster spanning the Regions; the `kind` e2e cannot run a stretch topology (and
 cannot run at all in the sandbox), so stretch behaviour is proven only in
 `SimEnv` (`animusd` `sim_cluster_mrsc`).
 
+
+## `E2E_KEEP_CLUSTER=1`: keep the `kind` cluster after the smoke (#1278)
+
+Opt-in keep-alive for the game-day drill (`docs/runbook/game-day.md`). `cleanup()` still stops
+the port-forwards and the out-of-cluster operator (nothing leaks, ports free), but skips
+`kind delete cluster`, and the final "delete AnimusCluster and verify GC" phase is skipped so
+the 3-node cluster stays up; it applies to a failed run too. The operator is deliberately not
+kept (a detached process outliving the script has no owner): restart it with the printed
+kubeconfig. Unverified: `kind` cannot run in the sandbox, only `bash -n`.
 
 ## `E2E_UPGRADE=1`: the nightly operator-driven roll on `kind` (ADR 0073 Phase 3, D10)
 

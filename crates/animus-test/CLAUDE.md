@@ -1402,3 +1402,10 @@ replica (removing the step-down fails them). Only the all-replica `DiskFull`
 cells assert acked writes after the heal (a leader-only run can drain its whole
 workload inside the window). `raftkv_disk_full_follower_acks_nothing_it_could_
 not_persist` pins that a full follower's `match_index` on the leader freezes.
+
+- **`lsm_read_holds.rs` (#1206, `ANIMUS_LSM_HOLD_SEEDS`, floor 3):** `LsmEngine<SimEnv>`
+  under compaction pressure; `read_at` at a ~2 s-old timestamp (5 s time grace) and
+  a backup-style `local_scan_kind_snapshot` cut re-scanned after 7 s (explicit
+  `hold_version`), each with a negative control (old ~1 ms grace; no hold). The
+  txn corpus' reader no longer uses `read_at` (it does latest-read rounds), so it
+  cannot exercise this; do not look for read-hold coverage there.

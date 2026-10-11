@@ -6397,6 +6397,15 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         self.storage.latest_version()
     }
 
+    /// Pin `version` on this replica's own engine against compaction GC until
+    /// the returned guard drops ([`StorageEngine::hold_version`]; issue #1206).
+    /// Every reader of history older than the engine's time-based grace
+    /// (`read_at`/`scan_at` below, and the backup capture driver, which keeps
+    /// one across all of a tablet's ticks) takes this at its read/cut version.
+    pub fn hold_version(&self, version: u64) -> animus_storage::VersionHold {
+        self.storage.hold_version(version)
+    }
+
     /// A **snapshot-pinned**, intent-resolved sweep of a kind scope, chunked
     /// via a caller-supplied resumable cursor (ADR 0059 §4/§5) — the
     /// on-demand backup capture driver's core read primitive (`animusd`, a
@@ -6454,6 +6463,9 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let Some(physical_end) = scope.physical_bounds().1 else {
             return (Vec::new(), None);
         };
+        // Per-call pin; the capture driver additionally holds `version_ceiling`
+        // across ticks (issue #1206), this covers any other caller.
+        let _hold = self.storage.hold_version(version_ceiling);
         let raw: Vec<(Vec<u8>, animus_storage::VersionedValue)> = self
             .storage
             .scan_at(&scope.physical(start), &physical_end, version_ceiling)
@@ -7191,6 +7203,9 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             return None;
         }
         let physical = self.scope.physical(key);
+        // Pin the read version for the whole read (issue #1206): a compaction
+        // between the intent lookup and the value read must not GC it.
+        let _hold = self.storage.hold_version(hlc::pack(ts));
         let value = self
             .read_resolved(&physical, Some(ts), Some(hlc::pack(ts)))
             .await?;
@@ -7240,6 +7255,9 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             return None;
         }
         let version = hlc::pack(ts);
+        // Pin the snapshot version for the whole scan, including the intent
+        // resolution of its rows (issue #1206).
+        let _hold = self.storage.hold_version(version);
         let raw: Vec<(Vec<u8>, animus_storage::VersionedValue)> = match end {
             Some(e) => self
                 .storage

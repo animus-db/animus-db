@@ -45,6 +45,7 @@ mod pre_vote;
 mod protocol_version_refusal;
 mod quiescence;
 mod raft_msg_fixture;
+mod rebalance_cache;
 mod register_node_cas;
 mod removal_notice;
 mod restart;

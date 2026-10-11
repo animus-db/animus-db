@@ -289,9 +289,10 @@ per-tablet CP data plane (`animus-cp-data`).
 - **`delta_ring.rs`** (ADR 0038) — the apply task's bounded, per-node,
   best-effort in-memory ring of [`mirror::KeyWrite`] deltas keyed by Raft log
   index. Pure (no `Env`, no I/O); `push`/`clear`/`writes_since(last_seen,
-  upto)` are its whole surface. Bounded by **both** `max_entries` and
-  `max_bytes` (`DeltaRing::default` uses 1024 entries / 4 MiB), oldest
-  evicted first — except a push never evicts the entry it just inserted,
+  upto)` are its whole surface. Bounded by **bytes alone** (`max_bytes`;
+  `DeltaRing::default` is 4 MiB, ~7000 single-tablet deltas; no entry-count
+  cap since issue #1191 -- it made a 10k-tablet drain overflow the ring),
+  oldest evicted first — except a push never evicts the entry it just inserted,
   even if that single entry alone exceeds `max_bytes` (discarding your own
   freshest entry would defeat the ring's purpose). **`writes_since`'s
   contiguity check is subtle at the boundary: `last_seen + 1 ==
@@ -486,6 +487,16 @@ per-tablet CP data plane (`animus-cp-data`).
   flag shape, and layout-mismatch handling. See `crates/animus-cp-data/
   CLAUDE.md`'s own C-05 PR 2 entry for the persist-path wiring itself.
 
+- **`Metadata` tablet index** (issue #1192, `meta.rs`) — private
+  `#[serde(skip)]` `TabletIndex` (table -> ordered tablet ids), equality-neutral,
+  never serialized. All in-crate `tablets` inserts/removes go through
+  `insert_tablet`/`remove_tablet`; readers trust the index only when its
+  recorded count equals `tablets.len()` (else scan), `CreateTablet` rebuilds
+  lazily. After editing the public `tablets` map directly call
+  `rebuild_tablet_index()`. `next_free_tablet_id` uses `keys().next_back()`.
+  `Metadata::rebalance_batch` = N x `rebalance` + apply in one pass
+  (`animus_placement::rebalance_plan`); the leader tick still uses the
+  one-move `rebalance`.
 - **`syskv.rs`** (ADR 0038) — the control plane's reserved **system keyspace**
   key encoding: pure functions, no I/O. `RESERVED_NAMESPACE =
   "__animus_system"` is the top-level namespace no user table/keyspace may
@@ -3118,6 +3129,15 @@ unsupported (would need a new non-relayable command). See ADR 0005's
 
 - `Metadata::apply(UpsertMember)` keeps an existing non-empty label set when the incoming one is empty (status-only proposers like the detector build from stale reads that can predate a `RegisterNode` label fill-in); see `docs/lessons/testing/2026-10-04-status-only-upsert-built-from-a-stale-read-wipes-fields.md`.
 
+## Syskv watermark guard (issues #1194/#1235, ADR 0038 2026-10-10)
+
+`drive` halts (`halted`, error log naming both indices) when `meta_apply_seed`'s
+engine watermark is below the recovered core's `snapshot_index()`: a lost
+system-keyspace engine over a compacted control WAL is refused, never served
+as partial `Metadata`. Fresh/empty-WAL and retained-engine restarts are
+unaffected. A test that wants a "disk loss" restart must expect the halt.
+Tests: `tests/it/restart_retained_syskv_engine.rs`.
+
 ## Fuzzing (roadmap R-01 (c))
 
 The control WAL / shared WAL / snapshot image / `Metadata::from_json` / syskv key decoders are the `control_formats` fuzz target. The line-framed formats carry a CRC, so the target re-stamps CRCs (`fix_line_crcs`) to reach the payload decoders. `mirror::apply_key_write` still `.expect`s on a corrupt mirrored value (node-local data, by design) and is deliberately not fuzzed. See `fuzz/README.md` (stable smoke: `cd fuzz && cargo test --release --test smoke`).
@@ -3265,3 +3285,21 @@ the survivor. Stale un-wiped voters are fenced by the term jump plus `Removed`
 (`RaftNode::removed_by_leader`) but must still be wiped to be re-admitted. Tests:
 `tests/it/force_new_configuration.rs` (`ANIMUS_FORCE_RECOVER_SEEDS`, `ANIMUS_SEED`
 replay). Its restarts use `sim.stop` + fresh `RaftNode::start` on the retained engine.
+
+## Leader rebalance-plan cache (issue #1192, ADR 0029's 2026-10-11 amendment)
+
+`reconcile_loop` serves its one-move-per-evaluation rebalance from
+`rebalance_cache::RebalanceCache` (a `rebalance_batch` plan kept across ticks)
+instead of re-planning O(tablets) per move. Contract: the offered move always
+equals `PlacementView::rebalance` on the same view; the cache proves it with
+`Metadata::placement_rev` (an in-memory, serde-skipped counter bumped by `apply`
+on every `Applied` command, excluded from equality), the `recently_done` set, the
+term and the map sizes, and pops its head only when the head's CAS is OBSERVED
+(row at `expected_epoch.next()` with the planned replicas, rev exactly `+1`).
+Rules: any new code path that mutates `members`/`tablets`/`policies`/
+`split_placing` must go through `apply` (a direct edit of the pub maps is not seen
+by `placement_rev`; only the map-size check catches some of them); a new input to
+`rebalance_placement` must be added to the cache fingerprint. Test:
+`cargo test -p animus-control --test it rebalance_cache::` (property test vs fresh
+`rebalance`; `ANIMUS_REBALANCE_CACHE_SEEDS=K`, `ANIMUS_SEED` replay). Metrics
+`control_rebalance_evals` / `control_rebalance_plan_rebuilds`.

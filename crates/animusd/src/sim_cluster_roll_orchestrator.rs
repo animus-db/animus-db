@@ -429,11 +429,10 @@ fn spawn_clients(cluster: &SimCluster, shared: &Arc<Shared>, phase: u64, rounds:
 }
 
 /// The `setup` of the mixed-version corpus over `LsmEngine<SimEnv>`s. A roll
-/// restarts every node, and the `Memory` backend's restart is a *wiped disk*
-/// (the control system-keyspace mirror and the data groups' Raft state come
-/// back empty), which is not what restarting a process does: a restarted
-/// control node whose log was already compacted rebuilt a partial `Metadata`
-/// from `MemoryEngine::new()`.
+/// restarts every node, and the `Memory` backend's data groups' Raft state
+/// comes back empty on restart (the control mirror is retained since #1235),
+/// which is not what restarting a process does; `LsmEngine` is the faithful
+/// durable shape for a whole-cluster roll.
 fn lsm_setup(seed: u64) -> (SimCluster, Arc<Shared>) {
     let mut cluster = SimCluster::new_with_lsm_engines(
         seed,

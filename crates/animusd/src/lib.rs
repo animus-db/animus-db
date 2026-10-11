@@ -871,6 +871,17 @@ impl<E: Env> CpGroup<E> {
         }
     }
 
+    /// Pin `version` on this replica's engine against compaction GC until the
+    /// guard drops — the backup capture driver holds its `cut_version` across
+    /// every tick of a tablet's capture (issue #1206). See
+    /// [`RaftKvNode::hold_version`].
+    pub(crate) fn hold_version(&self, version: u64) -> animus_storage::VersionHold {
+        match self {
+            CpGroup::Lsm(n) => n.hold_version(version),
+            CpGroup::Mem(n) => n.hold_version(version),
+        }
+    }
+
     /// A snapshot-pinned, intent-resolved, resumable-cursor sweep of a kind
     /// scope — the backup capture driver's own read primitive (ADR 0059
     /// §4/§5). See [`RaftKvNode::local_scan_kind_snapshot`].
@@ -3195,6 +3206,10 @@ pub(crate) struct AdminInfo {
     /// The write-capacity-units sibling of
     /// [`throttle_read_units`](Self::throttle_read_units).
     pub(crate) throttle_write_units: Option<u64>,
+    /// `cluster_settings.pitr_retention_days` as resolved at start (issue
+    /// #1275): the PITR retention window the janitor trims to and the
+    /// DynamoDB edge reports/validates against. Default 35 days.
+    pub(crate) pitr_retention: Duration,
     /// This node's own **backup** store (ADR 0059 §1), redacted to kind +
     /// root path — see [`StoreView`]. `None` on a control-only node: it
     /// never provisions one ([`BoundControlNode::start_control_with`] takes
@@ -6149,6 +6164,7 @@ impl BoundNode {
             auto_split_ops_rate_threshold: auto_split_ops_rate,
             throttle_read_units,
             throttle_write_units,
+            pitr_retention: stream_seal_knobs.pitr_retention,
             backup_store: Some((&backup_store_config).into()),
             segment_store: Some((&segment_store_config).into()),
             quiesce_after_ms: (!quiesce_after.is_zero())
@@ -6766,7 +6782,7 @@ impl BoundNode {
         )));
         tasks.push(tokio::spawn(pitr_janitor::pitr_janitor_loop(
             ctx.clone(),
-            pitr_janitor::DEFAULT_PITR_RETENTION,
+            stream_seal_knobs.pitr_retention,
         )));
 
         // Auto-split loop (Phase 2.4 / ADR 0034): a node splits a tablet it
@@ -7831,6 +7847,7 @@ impl BoundControlNode {
         segment_store_config: SegmentStoreConfig,
         backup_store_config: BackupStoreConfig,
         stream_retention: Duration,
+        pitr_retention: Duration,
     ) -> std::io::Result<Node> {
         // ProdEnv's peer book is now keyed by address string (advertise/dial
         // split groundwork) — this boundary still deals in `SocketAddr`
@@ -7874,6 +7891,7 @@ impl BoundControlNode {
             // own doc on `AdminInfo`.
             throttle_read_units: None,
             throttle_write_units: None,
+            pitr_retention,
             // A control-only node never runs `auto_split_loop` either (see
             // `auto_split_ops_rate_threshold` above) — these two report the
             // production defaults purely for shape parity, never actually
@@ -7909,8 +7927,12 @@ impl BoundControlNode {
         // sole writer.
         let (raft, control_storage) = match backend {
             StorageBackend::Lsm => {
-                match LsmEngine::open_with(engine_env, SYSKV_LSM_PREFIX, LsmOptions::production())
-                    .await
+                match LsmEngine::open_with(
+                    engine_env,
+                    SYSKV_LSM_PREFIX,
+                    LsmOptions::production_raw_versions(),
+                )
+                .await
                 {
                     Ok(lsm) => (
                         RaftNode::start_with_orphan_sweep_after(
@@ -8116,7 +8138,7 @@ impl BoundControlNode {
         )));
         tasks.push(tokio::spawn(pitr_janitor::pitr_janitor_loop(
             ctx.clone(),
-            pitr_janitor::DEFAULT_PITR_RETENTION,
+            pitr_retention,
         )));
 
         let (tasks, envs) = tasks.into_parts();
@@ -8466,6 +8488,7 @@ impl BoundDataNode {
             auto_split_ops_rate_threshold: auto_split_ops_rate,
             throttle_read_units,
             throttle_write_units,
+            pitr_retention: stream_seal_knobs.pitr_retention,
             backup_store: Some((&backup_store_config).into()),
             segment_store: Some((&segment_store_config).into()),
             // S-06 wired `quiesce_after` through this data-only path (via
@@ -8955,6 +8978,12 @@ pub struct ClusterEdgeState<E: Env = ProdEnv> {
     /// that already builds one `ClusterEdgeState` per node gets it with zero
     /// struct-literal fan-out. Fed by `version_wiring::version_wiring_loop`.
     version: version_wiring::VersionState,
+    /// When this node's own clock first saw each in-doubt transaction
+    /// (issue #1204): the node-local half of `txn_recover`'s
+    /// `RECOVERY_GRACE` gate, see
+    /// [`in_doubt_grace_elapsed`](Self::in_doubt_grace_elapsed). Lives here
+    /// for the same zero-fan-out reason as `version`.
+    in_doubt_first_seen: Arc<Mutex<BTreeMap<TxnId, Nanos>>>,
 }
 
 impl<E: Env> Default for ClusterEdgeState<E> {
@@ -8972,7 +9001,36 @@ impl<E: Env> ClusterEdgeState<E> {
             raftkv: Arc::new(Mutex::new(BTreeMap::new())),
             has_catalog_credentials: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             version: version_wiring::VersionState::default(),
+            in_doubt_first_seen: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    /// Has this node itself watched `txn_id` sit in doubt for a full
+    /// [`RECOVERY_GRACE`](animus_cp_data::RECOVERY_GRACE)? Records `now` as
+    /// the first sighting on the first call, and answers off that on every
+    /// later one.
+    ///
+    /// **Why it exists (issue #1204).** `txn_recover` gates a decision on
+    /// `now_ms >= created_ts.wall_ms + RECOVERY_GRACE`, but `created_ts` is an
+    /// HLC (`max(uptime, every timestamp witnessed or recovered from the
+    /// engine)`) while `now_ms` is this process's uptime. They share a unit,
+    /// not a time base: after a restart, uptime starts near zero and the HLC
+    /// does not, so the gate stayed shut (and a consistent read of the
+    /// blocked key hung) for as long as the previous incarnation had been up.
+    /// This elapsed-on-my-own-clock test is immune to that, and is never
+    /// earlier than the intended "grace since creation" (the first sighting
+    /// cannot precede the creation). `txn_recover` lets either test open the
+    /// gate. Entries older than ten graces are pruned, so the memo stays
+    /// bounded by the arrival rate; a pruned entry only costs one more grace.
+    pub(crate) fn in_doubt_grace_elapsed(&self, txn_id: &TxnId, now: Nanos) -> bool {
+        let grace = u64::try_from(animus_cp_data::RECOVERY_GRACE.as_nanos()).unwrap_or(u64::MAX);
+        let mut seen = self
+            .in_doubt_first_seen
+            .lock()
+            .expect("in_doubt_first_seen mutex poisoned");
+        seen.retain(|_, first| now.0.saturating_sub(first.0) < grace.saturating_mul(10));
+        let first = *seen.entry(txn_id.clone()).or_insert(now);
+        now.0.saturating_sub(first.0) >= grace
     }
 
     /// This node's version state (ADR 0073 Phase 2): `version().features` is
@@ -9247,13 +9305,30 @@ pub struct StreamSealKnobs {
     /// record's age — measured against the loop's own `env` clock, never
     /// `std::time` directly (ADR 0003) — exceeds this.
     pub seal_age: Duration,
+    /// `cluster_settings.pitr_seal_age_secs` (issue #1275): the PITR sealer's
+    /// own age trigger, independent of the Streams `seal_age` above, so
+    /// `LatestRestorableDateTime` trails now by about this much (plus one
+    /// sweep). Default [`DEFAULT_PITR_SEAL_AGE`] (5 minutes).
+    pub pitr_seal_age: Duration,
+    /// `cluster_settings.pitr_retention_days` (issue #1275): how far back
+    /// the PITR window reaches; read by the control-leader janitor and the
+    /// DynamoDB edge. Carried here (not a separate parameter) so every
+    /// start path that already threads the seal knobs threads it too.
+    /// Default [`pitr_janitor::DEFAULT_PITR_RETENTION`] (35 days).
+    pub pitr_retention: Duration,
 }
+
+/// Default PITR seal age (issue #1275): 5 minutes, DynamoDB's typical
+/// `LatestRestorableDateTime` lag.
+pub const DEFAULT_PITR_SEAL_AGE: Duration = Duration::from_secs(5 * 60);
 
 impl Default for StreamSealKnobs {
     fn default() -> Self {
         StreamSealKnobs {
             seal_bytes: 4 * 1024 * 1024,
             seal_age: Duration::from_secs(4 * 60 * 60),
+            pitr_seal_age: DEFAULT_PITR_SEAL_AGE,
+            pitr_retention: pitr_janitor::DEFAULT_PITR_RETENTION,
         }
     }
 }
@@ -11725,7 +11800,7 @@ pub(crate) struct ClientCtx<E: Env = ProdEnv, R: RelayClient = AnimusdRelayClien
     /// this is only ever populated on a node started via [`run_node_growth`]).
     /// Read through [`effective_metadata`](Self::effective_metadata), never
     /// directly — see that method's doc for which call sites must use it.
-    remote_metadata: Arc<Mutex<Option<Metadata>>>,
+    remote_metadata: Arc<Mutex<Option<Arc<Metadata>>>>,
     /// This node's own control-plane **system-keyspace** engine handle (ADR
     /// 0038 PR4), if it has a `ControlHandle::Local` control role — a clone
     /// of exactly the engine handle passed to `RaftNode::start_with_metrics`
@@ -11890,6 +11965,14 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// everything except its own commit-wait polls (see
     /// [`metadata_fresh`](Self::metadata_fresh) for those).
     fn effective_metadata(&self) -> Metadata {
+        Metadata::clone(&self.effective_metadata_arc())
+    }
+
+    /// [`effective_metadata`](Self::effective_metadata) as a shared handle:
+    /// an `Arc` clone, no copy of the tablet map (issue #1190). The per-wake
+    /// reconcilers read through this; two reads with no change in between
+    /// are `Arc::ptr_eq`.
+    fn effective_metadata_arc(&self) -> Arc<Metadata> {
         if let Some(meta) = self
             .remote_metadata
             .lock()
@@ -11898,7 +11981,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         {
             return meta;
         }
-        self.control.metadata_cached()
+        self.control.metadata_cached_arc()
     }
 
     /// The lock-free "does the replicated credential catalog hold any row
@@ -14460,7 +14543,7 @@ async fn tablet_host_reconciler_loop(ctx: ClientCtx, mut reconciler: CpReconcile
             continue;
         }
 
-        let meta = ctx.effective_metadata();
+        let meta = ctx.effective_metadata_arc();
         let down: BTreeSet<NodeId> = meta
             .members
             .iter()
@@ -14472,7 +14555,7 @@ async fn tablet_host_reconciler_loop(ctx: ClientCtx, mut reconciler: CpReconcile
             animus_control::timing::region_map(meta.members.iter().map(|(id, m)| (id, &m.labels)));
         let preferred_leader = leader_preferences(&meta);
         let view = MetadataView {
-            tablets: meta.tablets,
+            tablets: animus_cp_data::host::TabletMap::from_metadata(Arc::clone(&meta)),
             down,
             regions,
             preferred_leader,
@@ -16821,6 +16904,7 @@ pub async fn start_split_cluster_with_growth(
                 SegmentStoreConfig::default(),
                 BackupStoreConfig::default(),
                 DEFAULT_STREAM_RETENTION,
+                pitr_janitor::DEFAULT_PITR_RETENTION,
             )
             .await?,
         );
@@ -17654,6 +17738,7 @@ pub async fn run_node_control_with_orphan_sweep_after(
         SegmentStoreConfig::default(),
         BackupStoreConfig::default(),
         DEFAULT_STREAM_RETENTION,
+        pitr_janitor::DEFAULT_PITR_RETENTION,
     )
     .await
 }
@@ -17680,6 +17765,7 @@ pub async fn run_node_control_with_stores(
     segment_store_config: SegmentStoreConfig,
     backup_store_config: BackupStoreConfig,
     stream_retention: Duration,
+    pitr_retention: Duration,
 ) -> std::io::Result<Node> {
     let addrs = config.nodes.get(index).cloned().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "node index out of range")
@@ -17738,6 +17824,7 @@ pub async fn run_node_control_with_stores(
             segment_store_config,
             backup_store_config,
             stream_retention,
+            pitr_retention,
         )
         .await
 }
@@ -21653,6 +21740,7 @@ mod simenv_client_ctx_tests {
             auto_split_ops_rate_threshold: None,
             throttle_read_units: None,
             throttle_write_units: None,
+            pitr_retention: pitr_janitor::DEFAULT_PITR_RETENTION,
             // This harness never builds a real `DataRole`/dynamo listener
             // (`data: None` below) — see `AdminInfo`'s own field docs.
             backup_store: None,
@@ -22304,6 +22392,7 @@ mod two_node_relay_tests {
             auto_split_ops_rate_threshold: None,
             throttle_read_units: None,
             throttle_write_units: None,
+            pitr_retention: pitr_janitor::DEFAULT_PITR_RETENTION,
             node_id: Some(nid(1)),
             internal_addr: Some(placeholder_addr()),
             client_addr: placeholder_addr(),
@@ -22377,6 +22466,7 @@ mod two_node_relay_tests {
             auto_split_ops_rate_threshold: None,
             throttle_read_units: None,
             throttle_write_units: None,
+            pitr_retention: pitr_janitor::DEFAULT_PITR_RETENTION,
             node_id: Some(nid(2)),
             internal_addr: Some(placeholder_addr()),
             client_addr: placeholder_addr(),
@@ -23300,6 +23390,11 @@ mod sim_cluster_stream_backfill_seed_filter;
 /// `crates/animusd/CLAUDE.md`'s matching SimCluster-roles entry.
 #[cfg(test)]
 mod sim_cluster_control_only;
+
+/// Issue #1235: a Memory-backend control restart past log compaction keeps
+/// its syskv mirror and converges to full `Metadata`.
+#[cfg(test)]
+mod sim_cluster_control_restart_compacted;
 
 /// ADR 0061 rung L (C-12 PR 3): data-only nodes under `SimCluster` —
 /// `NodeRole::Data` first-class at construction (`SimCluster::new_with_
