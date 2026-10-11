@@ -147,6 +147,35 @@ function of one seed. This is the substrate every distributed test runs on.
 
 ## What's non-obvious
 
+- **CPU starvation** (`set_cpu_cost(node, per_event)`, ADR 0078 step zero):
+  a finite virtual CPU for one node. Each timer fire and each message delivery
+  costs `per_event`; the node's events are serialized (an event runs at
+  `max(scheduled, busy_until)`, then `busy_until` advances by the cost), so a
+  node offered more than `1 / per_event` events per second falls behind
+  without bound. `pause` is all-or-nothing; this is the proportional
+  version. `cpu_backlog(node) -> (timers, deliveries)` is the observability
+  accessor; `set_cpu_order(node, CpuOrder::{Fifo, Random})` picks how a busy
+  node chooses among waiting events. Default-off (no map is touched for an
+  unset node, no event is scheduled, no RNG drawn), traced
+  (`TraceEvent::CpuCost`), `ANIMUS_SEED`-replayable. Tests:
+  `tests/it/cpu_cost.rs`. Two things you will otherwise rediscover:
+  - **Waiting events are queued per node, not re-timelined.** An event popped
+    while the node is busy goes into a per-node queue (`CpuQueue`) and one
+    `Event::CpuDrain` at `busy_until` runs the next; re-inserting every
+    deferred event at `busy_until` (the `pause` shape) is O(backlog) per fire
+    and took 4 minutes for a 60 s overload at 300 groups.
+  - **Expired timers run before waiting messages, and `Fifo` never
+    false-triggers.** A FIFO backlog is just a uniformly slow clock: every
+    timer and heartbeat is late by the same amount, in the same order, so
+    followers see heartbeats spaced ~`load x 50 ms` apart and stay quiet
+    (measured: 300 groups at 1.15x for 110 s, no term moves). The collapse of
+    issue #1199 needs variance in how late an individual event is, which a
+    runtime serving thousands of ready tasks in non-arrival order has and a
+    FIFO model does not: use `CpuOrder::Random` (a uniformly random waiting
+    event drawn from the sim RNG, still seed-reproducible) for an overload
+    corpus. See `docs/lessons/testing/2026-10-11-a-fifo-cpu-backlog-is-a-slow-clock-not-a-starved-node.md`.
+
+
 - **`SimSegmentStore` (`segment_store.rs`, ADR 0043 §A7) is `animus-env`'s
   `SegmentStore` seam's deterministic corpus impl** — a seeded,
   fault-injectable in-memory `BTreeMap<String, Vec<u8>>` store, built from a

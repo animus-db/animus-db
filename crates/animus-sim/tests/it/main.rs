@@ -2,6 +2,7 @@
 //! Real-thread / `ProdEnv` binaries stay separate `tests/*.rs` targets — see the crate's CLAUDE.md.
 
 mod clock_skew;
+mod cpu_cost;
 mod determinism;
 mod disk_faults;
 mod encrypted_disk;

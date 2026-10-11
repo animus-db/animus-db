@@ -15,6 +15,7 @@ mod cluster_segment_store;
 mod cursor_scope;
 mod demux_stream_teardown;
 mod directed_placing_under_sustained_load;
+mod election_backpressure_corpus;
 mod engine_layout;
 mod engine_wipe_needs_snapshot;
 mod follower_aware_compaction;

@@ -3084,6 +3084,29 @@ reconciler end to end, the ADR 0044 phase-2 heartbeat-batcher baseline
 (`tests/heartbeat_batch_corpus.rs`, C-02 PR 2, below), and the real-thread
 `ProdEnv` regression noted above.
 
+### Election-backpressure corpus (`tests/it/election_backpressure_corpus.rs`)
+
+ADR 0078 step 1 (the Tier 1 baseline). 300 `RaftKvNode` groups share three
+physical nodes (one `HeartbeatBatcher` per node, one stream per group), and
+`Simulator::set_cpu_cost` gives every node a per-event CPU price chosen so
+steady demand is a stated multiple of capacity (`EVENTS_PER_GROUP_PER_S = 24.6`
+was measured on this rig and `calibration_matches_measurement` keeps it honest).
+Cells are data (`Cell { kind, load, mechanisms }`); `Mechanisms` is the struct
+later steps fill in (governor, lag stretch, staggering). The oracle (`Limits`)
+is safety (no two leaders per term, no acked write lost) plus liveness (all led
+within a bound, led at end), a term-churn ceiling and a monotone led count.
+Cells: 1 (cold start), control (a) (1.25x sustained overload, no mechanisms:
+the oracle MUST flag the led-count drop and the churn, safety must hold) and 12
+(a pinned digest of a small mechanisms-off run, idle and at 0.9x: later steps
+must leave it unchanged while their knobs are off).
+
+Rules learned: the rig uses `CpuOrder::Random` because a FIFO backlog is a
+uniformly slow clock and never false-triggers a follower (the #1199 collapse
+needs timers served out of order with the heartbeats that would cancel them;
+`docs/lessons/testing/2026-10-11-a-fifo-cpu-backlog-is-a-slow-clock-not-a-starved-node.md`).
+Collapse onset is tens of virtual seconds into the overload, so the control
+runs 60 s and costs about 80 s of wall time in a debug build.
+
 ### Heartbeat-batcher corpus (`tests/heartbeat_batch_corpus.rs`)
 
 ADR 0044 phase 2 — the `heartbeat_batch` module's own fault-injection
