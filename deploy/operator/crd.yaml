@@ -65,6 +65,19 @@ spec:
                 format: int32
                 nullable: true
                 type: integer
+              campaignMaxInflight:
+                description: |-
+                  Per-node cap on simultaneously active Raft campaigns across the
+                  data-plane groups a node hosts (ADR 0078 step 3, the
+                  `CampaignGovernor`). Emitted into `cluster.json`'s
+                  `cluster_settings.campaign_max_inflight`. `None` (default) leaves the
+                  node's own default (32); `0` disables the governor. Additive and
+                  skipped when unset, so an existing spec's `cluster.json` is
+                  byte-identical.
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
               clientService:
                 default: {}
                 description: The client-facing dynamo port's own `Service`.
@@ -148,12 +161,46 @@ spec:
                   nothing else about the pod template would otherwise change.
                 nullable: true
                 type: string
+              hostSettleTimeoutMs:
+                description: |-
+                  How long, in milliseconds, a freshly hosted group holds a staggered
+                  hosting slot before it is released even without a leader (ADR 0078
+                  section 3). Emitted into `cluster_settings.host_settle_timeout_ms`.
+                  `None` (default) leaves the node's own default (600); `0` is refused
+                  ([`AnimusClusterSpec::validate_election_backpressure_spec`]). Additive
+                  and skipped when unset.
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
+              hostUnsettledMax:
+                description: |-
+                  Most freshly hosted tablet groups a node lets be unsettled at once
+                  (ADR 0078 section 3, staggered hosting, `H`). Emitted into
+                  `cluster_settings.host_unsettled_max`. `None` (default) leaves the
+                  node's own default (100); `0` disables staggering. Additive and
+                  skipped when unset.
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
               image:
                 description: |-
                   The `animusd` container image. Defaults to
                   [`DEFAULT_IMAGE`](Self::DEFAULT_IMAGE) when omitted.
                 nullable: true
                 type: string
+              lagStretchMaxX:
+                description: |-
+                  Cap on the lag-stretched election timeout as a multiple of the
+                  election base (ADR 0078 step 4, `S_max`). Emitted into
+                  `cluster_settings.lag_stretch_max_x`. `None` (default) leaves the
+                  node's own default (4); `0` disables the load monitor and the stretch.
+                  Additive and skipped when unset.
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
               maxRegionRttMs:
                 description: |-
                   An upper bound, in milliseconds, on the round trip between any two

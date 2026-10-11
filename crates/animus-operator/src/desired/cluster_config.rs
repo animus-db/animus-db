@@ -104,8 +104,9 @@ pub struct RoleAddrs {
 /// orphan-sweep, stream-seal) `animusd` now reads from a config file's own
 /// `cluster_settings` section on every deployment shape, not just
 /// `--cluster N`'s dev-only in-process CLI flags. This crate only ever
-/// populates the three fields the CRD exposes today
-/// (`auto_split_bytes`/`quiesce_after_secs`/`max_region_rtt_ms`, see
+/// populates the fields the CRD exposes today
+/// (`auto_split_bytes`/`quiesce_after_secs`/`max_region_rtt_ms`, the MREC
+/// fields and the ADR 0078 election-backpressure knobs, see
 /// [`build_cluster_config`]) — the rest stay `None`, `#[serde(skip_
 /// serializing_if = "Option::is_none")]` so an unset field is simply
 /// absent from the emitted JSON rather than a null, exactly like every
@@ -164,6 +165,17 @@ pub struct ClusterSettings {
     /// round trip, populated from `spec.maxRegionRttMs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_region_rtt_ms: Option<u64>,
+    /// ADR 0078 election backpressure (node-local knobs), populated from
+    /// `spec.campaignMaxInflight`, `spec.lagStretchMaxX`,
+    /// `spec.hostUnsettledMax` and `spec.hostSettleTimeoutMs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub campaign_max_inflight: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lag_stretch_max_x: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_unsettled_max: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_settle_timeout_ms: Option<u64>,
     /// ADR 0075 section 5.4 (G-e): this cluster's MREC region name
     /// (`spec.region`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -307,6 +319,13 @@ pub fn cluster_settings_or_none(spec: &AnimusClusterSpec) -> Option<ClusterSetti
         auto_split_bytes: spec.auto_split_bytes,
         quiesce_after_secs: spec.quiesce_after_secs,
         max_region_rtt_ms: spec.max_region_rtt_ms,
+        campaign_max_inflight: spec.campaign_max_inflight,
+        lag_stretch_max_x: spec.lag_stretch_max_x,
+        host_unsettled_max: spec.host_unsettled_max,
+        // `0` is an animusd startup error; the webhook refuses it, and
+        // without the webhook it falls back to the node default rather
+        // than crash-looping every pod.
+        host_settle_timeout_ms: spec.host_settle_timeout_ms.filter(|ms| *ms > 0),
         region: spec.region.clone(),
         peers: spec
             .peers
@@ -874,6 +893,42 @@ mod tests {
         // Unset: the section stays absent, the pre-existing bytes.
         let cfg = build_cluster_config("c", "ns", &spec(3));
         assert!(cfg.cluster_settings.is_none());
+    }
+
+    #[test]
+    fn election_backpressure_knobs_reach_cluster_settings_and_are_absent_when_unset() {
+        let mut s = spec(3);
+        s.campaign_max_inflight = Some(16);
+        s.lag_stretch_max_x = Some(0);
+        s.host_unsettled_max = Some(40);
+        s.host_settle_timeout_ms = Some(900);
+        let cfg = build_cluster_config("c", "ns", &s);
+        let value: serde_json::Value = serde_json::from_str(&to_json(&cfg)).unwrap();
+        assert_eq!(
+            value["cluster_settings"],
+            serde_json::json!({
+                "campaign_max_inflight": 16,
+                "lag_stretch_max_x": 0,
+                "host_unsettled_max": 40,
+                "host_settle_timeout_ms": 900
+            }),
+            "got {value}"
+        );
+        // A zero settle timeout (refused by the webhook) is dropped, not
+        // rendered into a value animusd would refuse at startup.
+        let mut s = spec(3);
+        s.host_settle_timeout_ms = Some(0);
+        assert!(
+            build_cluster_config("c", "ns", &s)
+                .cluster_settings
+                .is_none()
+        );
+        // Unset: the section stays absent, the pre-existing bytes.
+        assert!(
+            build_cluster_config("c", "ns", &spec(3))
+                .cluster_settings
+                .is_none()
+        );
     }
 
     #[test]

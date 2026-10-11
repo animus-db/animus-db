@@ -1923,6 +1923,18 @@ cluster spanning the Regions; the `kind` e2e cannot run a stretch topology (and
 cannot run at all in the sandbox), so stretch behaviour is proven only in
 `SimEnv` (`animusd` `sim_cluster_mrsc`).
 
+## Election backpressure knobs (ADR 0078)
+
+Additive optional `spec.campaignMaxInflight`, `spec.lagStretchMaxX`,
+`spec.hostUnsettledMax`, `spec.hostSettleTimeoutMs`, rendered into
+`cluster.json`'s `cluster_settings` (`campaign_max_inflight`,
+`lag_stretch_max_x`, `host_unsettled_max`, `host_settle_timeout_ms`) exactly
+like `maxRegionRttMs`; unset keeps the section absent and `schemaVersion` 1.
+Node defaults apply when unset (32 / 4x / 100 / 600 ms); `0` disables the
+first three. `hostSettleTimeoutMs: 0` is an animusd startup error, so the
+webhook refuses it (`validate_election_backpressure_spec`) and the renderer
+drops it (node default) when no webhook is installed. `crd.yaml` regenerated.
+
 
 ## `E2E_KEEP_CLUSTER=1`: keep the `kind` cluster after the smoke (#1278)
 
