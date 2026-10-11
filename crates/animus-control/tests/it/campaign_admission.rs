@@ -276,6 +276,11 @@ fn a_precandidate_whose_round_lapsed_is_also_gated() {
         core.campaign_active(),
         "the driver releases the permit itself"
     );
+    // A deferred retry is active by role but not campaigning: the driver must
+    // not hand it an exempt permit (it would leave the queue and leak a slot).
+    assert!(core.campaign_deferred());
+    let _ = core.tick_gated(Nanos(core.next_deadline().unwrap().0), 6, true);
+    assert!(!core.campaign_deferred(), "starting the round clears it");
 }
 
 // ---- the permit check sits after the early returns -------------------------

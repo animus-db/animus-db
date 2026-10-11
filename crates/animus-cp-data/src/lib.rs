@@ -13755,7 +13755,12 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             if let Some(g) = &governor {
                 if !c.campaign_active() {
                     permit = None;
-                } else if permit.is_none() {
+                } else if permit.is_none() && !c.campaign_deferred() {
+                    // (A deferred retry of a PreCandidate/Candidate is
+                    // `campaign_active` by role but is waiting in the queue,
+                    // not campaigning: giving it an exempt permit here took
+                    // it out of the queue and leaked an over-cap slot on
+                    // every retry, starving the queue.)
                     permit = Some(g.acquire_exempt(stream, env.now(), campaign_ttl(&c)));
                     campaign_waiting = false;
                 }

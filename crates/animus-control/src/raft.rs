@@ -3282,6 +3282,16 @@ where
         matches!(self.role, Role::PreCandidate | Role::Candidate)
     }
 
+    /// Whether a due campaign is currently deferred by [`tick_gated`](Self::tick_gated)
+    /// (`admit = false`). Cleared when a campaign starts (the election timer
+    /// is re-armed) or the node wins. A deferred `PreCandidate` or `Candidate`
+    /// is still `campaign_active` by role but is NOT campaigning, so a driver
+    /// must not give it an exempt permit (ADR 0078).
+    #[must_use]
+    pub fn campaign_deferred(&self) -> bool {
+        self.campaign_hold.is_some()
+    }
+
     /// Handle a timer tick at `now`. May start an election or send heartbeats.
     ///
     /// Exactly [`tick_gated`](Self::tick_gated) with `admit = true`, so every
