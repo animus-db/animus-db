@@ -516,6 +516,14 @@ pub struct LocalState {
     /// `hosted` but absent from `view.tablets` until cutover — exactly
     /// [`tablets_to_reclaim`]'s trigger condition for every OTHER tablet).
     pub split_forming: BTreeSet<TabletId>,
+    /// **A `plan` output, not an input** (ADR 0078 section 3): how many
+    /// fresh-hosting [`HostAction::Host`] actions the last [`plan`] call held
+    /// back because its `host_budget` ran out. The held-back tablets are
+    /// simply not in [`hosted`](Self::hosted), so the next call re-derives
+    /// and re-emits them; this count only drives the reconciler's short
+    /// re-tick wake and its `hosting_ramp` readings. Overwritten on every
+    /// call (so it reads `0` whenever nothing was deferred).
+    pub deferred_hosts: usize,
 }
 
 impl LocalState {
@@ -548,6 +556,76 @@ impl LocalState {
     /// cleared until its teardown actually completes.
     pub fn release_unconfirmed_host(&mut self, tablet: TabletId) {
         self.hosted.remove(&tablet);
+    }
+}
+
+/// `host_budget` value meaning "no staggering": [`plan`] emits every
+/// pending [`HostAction::Host`] (the pre-ADR-0078 behaviour, and what
+/// `host_unsettled_max = 0` selects).
+pub const UNLIMITED_HOST_BUDGET: usize = usize::MAX;
+
+/// Default `host_unsettled_max` (ADR 0078 section 3, `H`): how many freshly
+/// hosted groups may be unsettled at once before further fresh hosting waits.
+pub const DEFAULT_HOST_UNSETTLED_MAX: usize = 100;
+
+/// Default `host_settle_timeout` (ADR 0078 section 3): `4 * election_base`
+/// (600 ms on the LAN profile) — the liveness backstop after which a hosted
+/// group stops holding a ramp slot even if it never heard a leader.
+pub const DEFAULT_HOST_SETTLE_TIMEOUT: Duration =
+    Duration::from_millis(4 * timing::LAN_ELECTION_BASE.as_millis() as u64);
+
+/// Upper bound on the reconciler's own re-tick cadence while a hosting ramp
+/// has deferred work (same cadence as `animusd`'s
+/// `INPLACE_SPLIT_RECONCILE_INTERVAL`).
+pub const HOST_RAMP_WAKE_MAX: Duration = Duration::from_millis(50);
+
+/// A reading of the staggered-hosting ramp (ADR 0078 section 3): advisory
+/// operational facts for `/admin/health`, never a health verdict.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HostingRamp {
+    /// Groups this node currently hosts.
+    pub hosted: usize,
+    /// Groups the planner is holding back from hosting for now.
+    pub deferred: usize,
+    /// Freshly hosted groups still waiting on a leader (or the settle
+    /// timeout).
+    pub unsettled: usize,
+}
+
+impl HostingRamp {
+    /// `true` while the node is still ramping up: some group is waiting to be
+    /// hosted. Advisory only.
+    #[must_use]
+    pub fn active(&self) -> bool {
+        self.deferred > 0
+    }
+}
+
+/// Shared, cheap-to-clone handle over the latest [`HostingRamp`] reading, so
+/// an observer (`animusd`'s `/admin/health`) can read what the reconciler
+/// task owns. Plain relaxed atomics: a pure observation, no ordering role.
+#[derive(Debug, Clone, Default)]
+pub struct HostingRampGauge(Arc<[std::sync::atomic::AtomicUsize; 3]>);
+
+impl HostingRampGauge {
+    /// Publish a reading (the reconciler does this at the end of every tick;
+    /// public so an assembly or test can seed one).
+    pub fn store(&self, r: HostingRamp) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.0[0].store(r.hosted, Relaxed);
+        self.0[1].store(r.deferred, Relaxed);
+        self.0[2].store(r.unsettled, Relaxed);
+    }
+
+    /// The latest reading.
+    #[must_use]
+    pub fn get(&self) -> HostingRamp {
+        use std::sync::atomic::Ordering::Relaxed;
+        HostingRamp {
+            hosted: self.0[0].load(Relaxed),
+            deferred: self.0[1].load(Relaxed),
+            unsettled: self.0[2].load(Relaxed),
+        }
     }
 }
 
@@ -830,6 +908,15 @@ pub enum HostAction {
 /// never be "a tablet that merely hasn't appeared in `Metadata` yet," since
 /// nothing on this node ever creates an engine before first observing the
 /// tablet itself (directly, or via its parent's own intent).
+///
+/// **`host_budget` (ADR 0078 section 3, staggered hosting).** The most fresh
+/// [`HostAction::Host`] actions this call may emit — the caller's
+/// `host_unsettled_max` minus its count of still-unsettled groups
+/// ([`UNLIMITED_HOST_BUDGET`] when staggering is off). They go out in
+/// ascending `TabletId` order; the rest are deferred (counted in
+/// [`LocalState::deferred_hosts`]) and, never being claimed into
+/// [`LocalState::hosted`], stay "to host" for the next call. Split-child
+/// materialization, `Reconfigure`, `Release` and `Reclaim` are exempt.
 #[must_use]
 pub fn plan(
     view: &MetadataView,
@@ -837,6 +924,7 @@ pub fn plan(
     local_tablets: &BTreeSet<TabletId>,
     state: &LocalState,
     base_id: NodeId,
+    host_budget: usize,
 ) -> (Vec<HostAction>, LocalState) {
     let mut next = state.clone();
     let mut actions = Vec::new();
@@ -957,6 +1045,17 @@ pub fn plan(
             to_host.push((tablet, t, join_plan.initial_formation));
         }
     }
+    // ADR 0078 section 3 (staggered hosting): emit at most `host_budget`
+    // fresh `Host` actions, lowest `TabletId` first (`view.tablets` iterates
+    // ascending, so `to_host` already is). Every node derives the same order
+    // from replicated metadata, which is what puts the early tablets' replicas
+    // in the first waves on all their nodes together. A deferred tablet is
+    // simply not claimed into `next.hosted`, so it stays "to host" and the next
+    // call re-derives it. Only this fresh-hosting path is capped: split-child
+    // materialization (phase 0.5), `Reconfigure`, `Release` and `Reclaim` are
+    // exempt.
+    next.deferred_hosts = to_host.len().saturating_sub(host_budget);
+    to_host.truncate(host_budget);
     for (tablet, t, initial_formation) in to_host {
         let has_data = facts.get(&tablet).is_some_and(|f| f.has_data);
         actions.push(HostAction::Host {
@@ -1285,6 +1384,21 @@ pub struct Reconciler<E: Env, S: StorageEngine> {
     /// Per-tablet state of the preferred-leader step (ADR 0075 section 3.3).
     /// Pruned to the hosted set every tick.
     preference: BTreeMap<TabletId, PreferenceState>,
+    /// ADR 0078 section 3 (staggered hosting): `H`, the most freshly hosted
+    /// groups allowed to be unsettled at once. `0` disables staggering.
+    /// See [`set_host_stagger`](Self::set_host_stagger).
+    host_unsettled_max: usize,
+    /// ADR 0078 section 3: how long after hosting a group stops counting as
+    /// unsettled even if it never heard a leader (the liveness backstop).
+    host_settle_timeout: Duration,
+    /// Groups this reconciler hosted that have not yet settled: tablet ->
+    /// `env.now()` at the moment it was hosted. A group leaves this map when
+    /// it has a leader it has heard from, when `host_settle_timeout` has
+    /// elapsed, or when it is no longer hosted. Rebuilt from nothing on a
+    /// restart (every group starts unsettled when freshly hosted).
+    unsettled: BTreeMap<TabletId, Nanos>,
+    /// The latest [`HostingRamp`] reading, published for `/admin/health`.
+    ramp: HostingRampGauge,
 }
 
 /// One tablet parked mid-teardown — see [`Reconciler::stopping`]'s doc.
@@ -1360,7 +1474,76 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
             max_region_rtt: DEFAULT_MAX_REGION_RTT,
             regions: BTreeMap::new(),
             preference: BTreeMap::new(),
+            host_unsettled_max: DEFAULT_HOST_UNSETTLED_MAX,
+            host_settle_timeout: DEFAULT_HOST_SETTLE_TIMEOUT,
+            unsettled: BTreeMap::new(),
+            ramp: HostingRampGauge::default(),
         }
+    }
+
+    /// Configure staggered hosting (ADR 0078 section 3; `animusd`'s
+    /// `host_unsettled_max` / `host_settle_timeout_ms` settings). At most
+    /// `unsettled_max` freshly hosted groups may be waiting on a leader at
+    /// once; further fresh hosting waits for the next tick. `0` disables
+    /// staggering entirely (every pending tablet is hosted in one tick, the
+    /// pre-ADR-0078 behaviour). `settle_timeout` is how long a group may
+    /// hold a slot without ever hearing a leader.
+    pub fn set_host_stagger(&mut self, unsettled_max: usize, settle_timeout: Duration) {
+        self.host_unsettled_max = unsettled_max;
+        self.host_settle_timeout = settle_timeout;
+    }
+
+    /// A handle onto this reconciler's latest [`HostingRamp`] reading, for an
+    /// observer on another task (`/admin/health`). Updated at the end of every
+    /// [`tick`](Self::tick).
+    #[must_use]
+    pub fn ramp_gauge(&self) -> HostingRampGauge {
+        self.ramp.clone()
+    }
+
+    /// Replace the gauge this reconciler publishes to with `gauge` (so the
+    /// assembly can hand it a gauge it already shared with its observer).
+    pub fn set_ramp_gauge(&mut self, gauge: HostingRampGauge) {
+        self.ramp = gauge;
+    }
+
+    /// The latest [`HostingRamp`] reading.
+    #[must_use]
+    pub fn hosting_ramp(&self) -> HostingRamp {
+        self.ramp.get()
+    }
+
+    /// How soon the caller should re-[`tick`](Self::tick) on its own, ahead of
+    /// its ordinary fallback cadence: `Some(min(settle poll, 50 ms))` while the
+    /// last tick deferred fresh hosting (the ramp needs re-evaluating as groups
+    /// settle, and nothing else will wake the loop for that), `None` otherwise.
+    /// The settle poll is a quarter of the settle timeout. A caller races
+    /// `sleep(next_wake)` against its other tick triggers.
+    #[must_use]
+    pub fn next_wake(&self) -> Option<Duration> {
+        (self.ramp.get().deferred > 0).then(|| {
+            (self.host_settle_timeout / 4)
+                .min(HOST_RAMP_WAKE_MAX)
+                .max(Duration::from_millis(1))
+        })
+    }
+
+    /// Drop every group from the unsettled set that has settled: it has a
+    /// leader it has heard from (it is the leader, or its `leader_id` is set —
+    /// `RaftCore` clears that belief the instant its election timer lapses, so
+    /// a set value is a fresh one), or `host_settle_timeout` has elapsed since
+    /// it was hosted. A group no longer hosted is dropped too.
+    fn refresh_settled(&mut self) {
+        let now = self.env.now();
+        let timeout = self.host_settle_timeout;
+        let hosted = &self.hosted;
+        self.unsettled.retain(|tablet, hosted_at| {
+            let Some(node) = hosted.get(tablet) else {
+                return false;
+            };
+            let has_leader = node.is_leader() || node.leader().is_some();
+            !has_leader && now.duration_since(*hosted_at) < timeout
+        });
     }
 
     /// Set the cluster's `max_region_rtt` (ADR 0075 section 3.4;
@@ -1708,14 +1891,28 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
             self.local_engines_checked = true;
             self.factory.local_tablets().await
         };
+        // ADR 0078 section 3: the remaining fresh-hosting budget this tick.
+        self.refresh_settled();
+        let host_budget = if self.host_unsettled_max == 0 {
+            UNLIMITED_HOST_BUDGET
+        } else {
+            self.host_unsettled_max.saturating_sub(self.unsettled.len())
+        };
         let (actions, next) = plan(
             view,
             &facts,
             &local_tablets,
             &self.state,
             self.base_id.clone(),
+            host_budget,
         );
+        let deferred = next.deferred_hosts;
         self.state = next;
+        if deferred > 0 {
+            self.env
+                .metrics()
+                .incr_by(Metric::CpHostWaveDeferred, deferred as u64);
+        }
 
         for action in actions {
             match action {
@@ -1725,6 +1922,11 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                     initial_formation,
                 } => {
                     self.host(view, tablet, range, initial_formation).await;
+                    if self.hosted.contains_key(&tablet) {
+                        // A freshly hosted group holds a ramp slot until it
+                        // hears a leader or the settle timeout passes.
+                        self.unsettled.insert(tablet, self.env.now());
+                    }
                 }
                 HostAction::Reconfigure {
                     tablet,
@@ -1790,6 +1992,12 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         }
 
         self.preferred_leader_step(view);
+
+        self.ramp.store(HostingRamp {
+            hosted: self.hosted.len(),
+            deferred,
+            unsettled: self.unsettled.len(),
+        });
     }
 
     /// ADR 0075 section 3.3 / 3.6, the **preferred-leader step**: for every
@@ -3188,7 +3396,14 @@ mod tests {
         // Drive to RELEASE_CONFIRM_TICKS to force the release action too.
         let mut last = (Vec::new(), state);
         for _ in 0..RELEASE_CONFIRM_TICKS {
-            last = plan(&v, &facts, &BTreeSet::new(), &last.1, base());
+            last = plan(
+                &v,
+                &facts,
+                &BTreeSet::new(),
+                &last.1,
+                base(),
+                UNLIMITED_HOST_BUDGET,
+            );
         }
         let (actions, _next) = last;
 
@@ -3235,7 +3450,14 @@ mod tests {
         .into_iter()
         .collect();
 
-        let (actions, next) = plan(&v, &facts, &BTreeSet::new(), &state, base());
+        let (actions, next) = plan(
+            &v,
+            &facts,
+            &BTreeSet::new(),
+            &state,
+            base(),
+            UNLIMITED_HOST_BUDGET,
+        );
         assert_eq!(actions, Vec::new());
         assert_eq!(next, state);
     }
@@ -3260,7 +3482,14 @@ mod tests {
         .into_iter()
         .collect();
 
-        let (actions, _next) = plan(&v, &facts, &BTreeSet::new(), &state, base());
+        let (actions, _next) = plan(
+            &v,
+            &facts,
+            &BTreeSet::new(),
+            &state,
+            base(),
+            UNLIMITED_HOST_BUDGET,
+        );
         assert_eq!(actions, Vec::new());
     }
 
@@ -3271,7 +3500,14 @@ mod tests {
         let v = view([(1, tablet_for_table(1, "t", b"", None, vec![base()]))]);
         let state = LocalState::default();
 
-        let (actions, next) = plan(&v, &BTreeMap::new(), &BTreeSet::new(), &state, base());
+        let (actions, next) = plan(
+            &v,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &state,
+            base(),
+            UNLIMITED_HOST_BUDGET,
+        );
         assert_eq!(
             actions,
             vec![HostAction::Host {
@@ -3284,7 +3520,14 @@ mod tests {
 
         // A second call with the tablet now in `hosted` (and no facts,
         // meaning not-yet-actually-registered) must not re-plan a Host.
-        let (actions2, _next2) = plan(&v, &BTreeMap::new(), &BTreeSet::new(), &next, base());
+        let (actions2, _next2) = plan(
+            &v,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &next,
+            base(),
+            UNLIMITED_HOST_BUDGET,
+        );
         assert_eq!(actions2, Vec::new());
     }
 
@@ -3294,7 +3537,14 @@ mod tests {
         t.epoch = Epoch::INITIAL.next();
         let v = view([(1, t)]);
         let state = LocalState::default();
-        let (actions, _next) = plan(&v, &BTreeMap::new(), &BTreeSet::new(), &state, base());
+        let (actions, _next) = plan(
+            &v,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &state,
+            base(),
+            UNLIMITED_HOST_BUDGET,
+        );
         assert_eq!(
             actions,
             vec![HostAction::Host {
@@ -3323,7 +3573,14 @@ mod tests {
         .into_iter()
         .collect();
 
-        let (actions, _next) = plan(&v, &facts, &BTreeSet::new(), &state, base());
+        let (actions, _next) = plan(
+            &v,
+            &facts,
+            &BTreeSet::new(),
+            &state,
+            base(),
+            UNLIMITED_HOST_BUDGET,
+        );
         assert_eq!(
             actions,
             vec![HostAction::Host {
@@ -3338,7 +3595,14 @@ mod tests {
     fn plan_does_not_host_a_non_replica_tablet() {
         let v = view([(1, tablet(1, b"", None, vec![nid(301), nid(302)]))]);
         let state = LocalState::default();
-        let (actions, next) = plan(&v, &BTreeMap::new(), &BTreeSet::new(), &state, base());
+        let (actions, next) = plan(
+            &v,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &state,
+            base(),
+            UNLIMITED_HOST_BUDGET,
+        );
         assert_eq!(actions, Vec::new());
         assert!(next.hosted.is_empty());
     }
@@ -3377,7 +3641,14 @@ mod tests {
         .into_iter()
         .collect();
 
-        let (actions, _next) = plan(&v, &facts, &BTreeSet::new(), &state, base());
+        let (actions, _next) = plan(
+            &v,
+            &facts,
+            &BTreeSet::new(),
+            &state,
+            base(),
+            UNLIMITED_HOST_BUDGET,
+        );
         assert_eq!(
             actions,
             vec![HostAction::Reconfigure {
@@ -3404,7 +3675,14 @@ mod tests {
         )]
         .into_iter()
         .collect();
-        let (actions, _next) = plan(&v, &facts, &BTreeSet::new(), &state, base());
+        let (actions, _next) = plan(
+            &v,
+            &facts,
+            &BTreeSet::new(),
+            &state,
+            base(),
+            UNLIMITED_HOST_BUDGET,
+        );
         assert!(
             !actions
                 .iter()
@@ -3437,7 +3715,14 @@ mod tests {
 
         let mut cur = state;
         for tick in 1..RELEASE_CONFIRM_TICKS {
-            let (actions, next) = plan(&v, &facts, &BTreeSet::new(), &cur, base());
+            let (actions, next) = plan(
+                &v,
+                &facts,
+                &BTreeSet::new(),
+                &cur,
+                base(),
+                UNLIMITED_HOST_BUDGET,
+            );
             assert_eq!(
                 actions,
                 Vec::new(),
@@ -3452,7 +3737,14 @@ mod tests {
             cur = next;
         }
 
-        let (actions, next) = plan(&v, &facts, &BTreeSet::new(), &cur, base());
+        let (actions, next) = plan(
+            &v,
+            &facts,
+            &BTreeSet::new(),
+            &cur,
+            base(),
+            UNLIMITED_HOST_BUDGET,
+        );
         assert_eq!(
             actions,
             vec![HostAction::Release {
@@ -3470,7 +3762,14 @@ mod tests {
     fn an_epoch_bump_mid_count_resets_the_release_dampener() {
         let (v, state, facts) = released_tablet_setup();
 
-        let (_actions, next1) = plan(&v, &facts, &BTreeSet::new(), &state, base());
+        let (_actions, next1) = plan(
+            &v,
+            &facts,
+            &BTreeSet::new(),
+            &state,
+            base(),
+            UNLIMITED_HOST_BUDGET,
+        );
         assert_eq!(
             next1.pending_release.get(&TabletId(1)).map(|(_, t)| *t),
             Some(1)
@@ -3482,7 +3781,14 @@ mod tests {
         let t = bumped.tablets.get_mut(&TabletId(1)).expect("tablet");
         t.epoch = t.epoch.next();
 
-        let (_actions, next2) = plan(&bumped, &facts, &BTreeSet::new(), &next1, base());
+        let (_actions, next2) = plan(
+            &bumped,
+            &facts,
+            &BTreeSet::new(),
+            &next1,
+            base(),
+            UNLIMITED_HOST_BUDGET,
+        );
         assert_eq!(
             next2.pending_release.get(&TabletId(1)).map(|(_, t)| *t),
             Some(1),
@@ -3494,7 +3800,14 @@ mod tests {
     fn a_re_add_cancels_a_pending_release() {
         let (v, state, facts) = released_tablet_setup();
 
-        let (_actions, next1) = plan(&v, &facts, &BTreeSet::new(), &state, base());
+        let (_actions, next1) = plan(
+            &v,
+            &facts,
+            &BTreeSet::new(),
+            &state,
+            base(),
+            UNLIMITED_HOST_BUDGET,
+        );
         assert!(next1.pending_release.contains_key(&TabletId(1)));
 
         // The tablet's replica set gains base() back (a re-add).
@@ -3505,7 +3818,14 @@ mod tests {
             .expect("tablet")
             .replicas = vec![base(), nid(301), nid(302)];
 
-        let (actions, next2) = plan(&readded, &facts, &BTreeSet::new(), &next1, base());
+        let (actions, next2) = plan(
+            &readded,
+            &facts,
+            &BTreeSet::new(),
+            &next1,
+            base(),
+            UNLIMITED_HOST_BUDGET,
+        );
         assert!(
             !next2.pending_release.contains_key(&TabletId(1)),
             "a re-add must cancel the pending release"
@@ -3528,7 +3848,14 @@ mod tests {
         state.hosted.insert(TabletId(1));
 
         // No facts entry at all: `hosted` fact is false -> "not excluded".
-        let (actions, next) = plan(&v, &BTreeMap::new(), &BTreeSet::new(), &state, base());
+        let (actions, next) = plan(
+            &v,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &state,
+            base(),
+            UNLIMITED_HOST_BUDGET,
+        );
         assert_eq!(actions, Vec::new());
         assert!(!next.pending_release.contains_key(&TabletId(1)));
 
@@ -3543,7 +3870,14 @@ mod tests {
         )]
         .into_iter()
         .collect();
-        let (actions, next) = plan(&v, &facts, &BTreeSet::new(), &state, base());
+        let (actions, next) = plan(
+            &v,
+            &facts,
+            &BTreeSet::new(),
+            &state,
+            base(),
+            UNLIMITED_HOST_BUDGET,
+        );
         assert_eq!(actions, Vec::new());
         assert!(!next.pending_release.contains_key(&TabletId(1)));
     }
@@ -3611,7 +3945,14 @@ mod tests {
             ..Default::default()
         };
         for tick in 0..(RELEASE_CONFIRM_TICKS as usize * 3) {
-            let (actions, next) = plan(&v, &facts, &BTreeSet::new(), &state, me.clone());
+            let (actions, next) = plan(
+                &v,
+                &facts,
+                &BTreeSet::new(),
+                &state,
+                me.clone(),
+                UNLIMITED_HOST_BUDGET,
+            );
             assert!(
                 !actions
                     .iter()
@@ -3655,6 +3996,7 @@ mod tests {
             &BTreeSet::new(),
             &LocalState::default(),
             base(),
+            UNLIMITED_HOST_BUDGET,
         );
         assert!(matches!(actions[0], HostAction::Host { tablet, .. } if tablet == TabletId(1)));
         assert!(next.hosted.contains(&TabletId(1)));
@@ -3668,7 +4010,14 @@ mod tests {
         // The next `plan` call must genuinely re-emit `Host` — the whole
         // point of releasing the claim — not silently swallow it forever
         // (the bug this method exists to close).
-        let (actions2, _next2) = plan(&v, &BTreeMap::new(), &BTreeSet::new(), &released, base());
+        let (actions2, _next2) = plan(
+            &v,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &released,
+            base(),
+            UNLIMITED_HOST_BUDGET,
+        );
         assert_eq!(
             actions2,
             vec![HostAction::Host {
@@ -3821,7 +4170,14 @@ mod tests {
         let mut state = LocalState::default();
         state.hosted.insert(TabletId(1));
 
-        let (actions1, next1) = plan(&v, &BTreeMap::new(), &BTreeSet::new(), &state, base());
+        let (actions1, next1) = plan(
+            &v,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &state,
+            base(),
+            UNLIMITED_HOST_BUDGET,
+        );
         assert_eq!(
             actions1,
             vec![HostAction::Reclaim {
@@ -3832,7 +4188,14 @@ mod tests {
         assert!(next1.hosted.contains(&TabletId(1)));
 
         // Retried identically on a second call before confirmation.
-        let (actions2, next2) = plan(&v, &BTreeMap::new(), &BTreeSet::new(), &next1, base());
+        let (actions2, next2) = plan(
+            &v,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &next1,
+            base(),
+            UNLIMITED_HOST_BUDGET,
+        );
         assert_eq!(
             actions2,
             vec![HostAction::Reclaim {
@@ -3843,7 +4206,14 @@ mod tests {
         // Once the caller confirms the teardown, it stops being replanned.
         let mut confirmed = next2;
         confirmed.confirm_torn_down(TabletId(1));
-        let (actions3, _next3) = plan(&v, &BTreeMap::new(), &BTreeSet::new(), &confirmed, base());
+        let (actions3, _next3) = plan(
+            &v,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &confirmed,
+            base(),
+            UNLIMITED_HOST_BUDGET,
+        );
         assert_eq!(actions3, Vec::new());
     }
 
@@ -3859,7 +4229,14 @@ mod tests {
         let mut state = LocalState::default();
         state.hosted.insert(TabletId(2));
 
-        let (actions, _next) = plan(&v, &BTreeMap::new(), &BTreeSet::new(), &state, base());
+        let (actions, _next) = plan(
+            &v,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &state,
+            base(),
+            UNLIMITED_HOST_BUDGET,
+        );
         assert_eq!(
             actions,
             vec![HostAction::Reclaim {
@@ -3881,7 +4258,14 @@ mod tests {
         let state = LocalState::default();
         let local_tablets: BTreeSet<TabletId> = [TabletId(2)].into_iter().collect();
 
-        let (actions, next) = plan(&v, &BTreeMap::new(), &local_tablets, &state, base());
+        let (actions, next) = plan(
+            &v,
+            &BTreeMap::new(),
+            &local_tablets,
+            &state,
+            base(),
+            UNLIMITED_HOST_BUDGET,
+        );
         assert_eq!(
             actions,
             vec![HostAction::Reclaim {
@@ -3904,7 +4288,14 @@ mod tests {
         let state = LocalState::default();
         let local_tablets: BTreeSet<TabletId> = [TabletId(2)].into_iter().collect();
 
-        let (actions, _next) = plan(&v, &BTreeMap::new(), &local_tablets, &state, base());
+        let (actions, _next) = plan(
+            &v,
+            &BTreeMap::new(),
+            &local_tablets,
+            &state,
+            base(),
+            UNLIMITED_HOST_BUDGET,
+        );
         assert!(
             !actions
                 .iter()
@@ -3944,7 +4335,14 @@ mod tests {
         // own intent.
         let local_tablets: BTreeSet<TabletId> = [TabletId(10), TabletId(11)].into_iter().collect();
 
-        let (actions, next) = plan(&v, &BTreeMap::new(), &local_tablets, &state, base());
+        let (actions, next) = plan(
+            &v,
+            &BTreeMap::new(),
+            &local_tablets,
+            &state,
+            base(),
+            UNLIMITED_HOST_BUDGET,
+        );
         assert!(
             !actions.iter().any(|a| matches!(
                 a,
@@ -3955,5 +4353,213 @@ mod tests {
         );
         assert!(!next.hosted.contains(&TabletId(10)));
         assert!(!next.hosted.contains(&TabletId(11)));
+    }
+
+    // === plan(): staggered hosting (ADR 0078 section 3) ======================
+
+    /// A view of fresh single-replica tablets `ids` (this node is the only
+    /// replica, so each is a fresh `Host` candidate).
+    fn fresh_view(ids: &BTreeSet<u64>) -> MetadataView {
+        view(
+            ids.iter()
+                .map(|&id| (id, tablet_for_table(id, "t", b"", None, vec![base()]))),
+        )
+    }
+
+    fn host_ids(actions: &[HostAction]) -> Vec<TabletId> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                HostAction::Host { tablet, .. } => Some(*tablet),
+                _ => None,
+            })
+            .collect()
+    }
+
+    proptest::proptest! {
+        /// Whatever the tablet map, the already-hosted set and the budget: Host
+        /// actions come out ascending, never exceed the budget, are exactly the
+        /// lowest-id pending tablets, and the rest stay unclaimed ("to host").
+        #[test]
+        fn staggered_plan_emits_the_lowest_ids_within_budget_and_defers_the_rest(
+            ids in proptest::collection::btree_set(1u64..400, 0..80),
+            hosted_mask in proptest::collection::vec(proptest::bool::ANY, 80),
+            budget in 0usize..40,
+        ) {
+            let v = fresh_view(&ids);
+            let mut state = LocalState::default();
+            for (t, &h) in ids.iter().zip(hosted_mask.iter()) {
+                if h {
+                    state.hosted.insert(TabletId(*t));
+                }
+            }
+            let pending: Vec<TabletId> = ids
+                .iter()
+                .map(|&t| TabletId(t))
+                .filter(|t| !state.hosted.contains(t))
+                .collect();
+            let (actions, next) =
+                plan(&v, &BTreeMap::new(), &BTreeSet::new(), &state, base(), budget);
+            let emitted = host_ids(&actions);
+            proptest::prop_assert!(emitted.windows(2).all(|w| w[0] < w[1]), "ascending");
+            proptest::prop_assert!(emitted.len() <= budget);
+            let take = pending.len().min(budget);
+            proptest::prop_assert_eq!(&emitted[..], &pending[..take]);
+            proptest::prop_assert_eq!(next.deferred_hosts, pending.len() - take);
+            for t in &pending[take..] {
+                proptest::prop_assert!(!next.hosted.contains(t), "deferred stays to-host");
+            }
+            for t in &emitted {
+                proptest::prop_assert!(next.hosted.contains(t));
+            }
+        }
+
+        /// Repeated plans at any positive budget emit every tablet exactly
+        /// once, in ascending order overall, within ceil(n / budget) calls.
+        #[test]
+        fn every_deferred_tablet_is_eventually_emitted_exactly_once(
+            ids in proptest::collection::btree_set(1u64..400, 0..80),
+            budget in 1usize..30,
+        ) {
+            let v = fresh_view(&ids);
+            let mut state = LocalState::default();
+            let mut all = Vec::new();
+            let mut calls = 0usize;
+            loop {
+                let (actions, next) =
+                    plan(&v, &BTreeMap::new(), &BTreeSet::new(), &state, base(), budget);
+                let emitted = host_ids(&actions);
+                state = next;
+                calls += 1;
+                if emitted.is_empty() {
+                    proptest::prop_assert_eq!(state.deferred_hosts, 0);
+                    break;
+                }
+                all.extend(emitted);
+                proptest::prop_assert!(calls <= ids.len() / budget + 2, "no progress");
+            }
+            let want: Vec<TabletId> = ids.iter().map(|&t| TabletId(t)).collect();
+            proptest::prop_assert_eq!(all, want);
+        }
+
+        /// An unlimited budget is the pre-ADR-0078 planner: it matches any
+        /// budget at least as large as the pending set, in actions and state.
+        #[test]
+        fn an_unlimited_budget_is_the_unstaggered_plan(
+            ids in proptest::collection::btree_set(1u64..400, 0..80),
+        ) {
+            let v = fresh_view(&ids);
+            let state = LocalState::default();
+            let (a, na) = plan(
+                &v, &BTreeMap::new(), &BTreeSet::new(), &state, base(), UNLIMITED_HOST_BUDGET,
+            );
+            let (b, nb) = plan(
+                &v, &BTreeMap::new(), &BTreeSet::new(), &state, base(), ids.len(),
+            );
+            proptest::prop_assert_eq!(&a, &b);
+            proptest::prop_assert_eq!(&na, &nb);
+            proptest::prop_assert_eq!(na.deferred_hosts, 0);
+            proptest::prop_assert_eq!(host_ids(&a).len(), ids.len());
+        }
+    }
+
+    #[test]
+    fn a_zero_budget_hosts_nothing_but_defers_every_pending_tablet() {
+        let ids: BTreeSet<u64> = (1..=5).collect();
+        let v = fresh_view(&ids);
+        let (actions, next) = plan(
+            &v,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &LocalState::default(),
+            base(),
+            0,
+        );
+        assert!(actions.is_empty());
+        assert!(next.hosted.is_empty());
+        assert_eq!(next.deferred_hosts, 5);
+    }
+
+    #[test]
+    fn split_child_materialization_and_the_other_actions_are_never_deferred() {
+        // Tablet 1: hosted, led here, with a local fork recorded -> two
+        // MaterializeSplitChild actions. Tablet 2: hosted, led here ->
+        // Reconfigure. Tablet 3 is absent from the map but hosted ->
+        // Reclaim. Tablets 4..=6 are fresh -> would be Host. With a zero
+        // budget only the Host actions are held back.
+        let parent = tablet_for_table(1, "t", b"", None, vec![base()]);
+        let (left, right) = (TabletId(10), TabletId(11));
+        let mk_child = |id| SplitChild {
+            id,
+            replicas: vec![base()],
+        };
+        let pending = crate::PendingSplit {
+            split_key: b"m".to_vec(),
+            children: [mk_child(left), mk_child(right)],
+            bootstrap_voters: [base()].into_iter().collect(),
+            ts: crate::hlc::HlcTimestamp::zero(),
+        };
+        let mut v = view([
+            (1, parent),
+            (2, tablet_for_table(2, "u", b"", None, vec![base()])),
+            (4, tablet_for_table(4, "w", b"", None, vec![base()])),
+            (5, tablet_for_table(5, "x", b"", None, vec![base()])),
+            (6, tablet_for_table(6, "y", b"", None, vec![base()])),
+        ]);
+        // Give the parent's view entry a live intent-free shape; the fork is
+        // the local fact below.
+        v.tablets.get_mut(&TabletId(1)).unwrap().epoch = Epoch(1);
+        let mut state = LocalState::default();
+        state.hosted.insert(TabletId(1));
+        state.hosted.insert(TabletId(2));
+        state.hosted.insert(TabletId(3));
+        let facts: BTreeMap<TabletId, TabletFacts> = [
+            (
+                TabletId(1),
+                TabletFacts {
+                    hosted: true,
+                    is_leader: true,
+                    pending_split: Some(pending),
+                    ..Default::default()
+                },
+            ),
+            (
+                TabletId(2),
+                TabletFacts {
+                    hosted: true,
+                    is_leader: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                TabletId(3),
+                TabletFacts {
+                    hosted: true,
+                    ..Default::default()
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let (actions, next) = plan(&v, &facts, &BTreeSet::new(), &state, base(), 0);
+        let count = |f: fn(&HostAction) -> bool| actions.iter().filter(|a| f(a)).count();
+        assert_eq!(
+            count(|a| matches!(a, HostAction::MaterializeSplitChild { .. })),
+            2,
+            "{actions:?}"
+        );
+        assert_eq!(
+            count(|a| matches!(a, HostAction::Reconfigure { .. })),
+            2,
+            "tablets 1 and 2 are led here: {actions:?}"
+        );
+        assert_eq!(
+            count(|a| matches!(a, HostAction::Reclaim { tablet } if *tablet == TabletId(3))),
+            1,
+            "{actions:?}"
+        );
+        assert_eq!(count(|a| matches!(a, HostAction::Host { .. })), 0);
+        assert_eq!(next.deferred_hosts, 3);
+        assert!(next.hosted.contains(&left) && next.hosted.contains(&right));
     }
 }

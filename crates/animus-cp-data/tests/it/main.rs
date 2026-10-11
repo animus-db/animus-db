@@ -73,6 +73,7 @@ mod snapshot_resend_bound;
 mod snapshot_transfer_survives_compaction;
 mod split_tablet;
 mod split_trim_failure;
+mod staggered_hosting;
 mod stale_read;
 mod stream_addressing;
 mod timerless_park;

@@ -1084,12 +1084,21 @@ pub enum Metric {
     /// rest were served from the cached plan. `rebuilds / evals` is the
     /// amortization the plan cache buys (ADR 0029's 2026-10-11 amendment).
     ControlRebalancePlanRebuilds,
+
+    // --- Election backpressure (ADR 0078), appended; slot-stability discipline ---
+    /// Host actions the planner deferred to a later reconcile tick because the
+    /// node already had `host_unsettled_max` freshly hosted groups still
+    /// settling (ADR 0078 section 3, staggered hosting). Bumped by the number
+    /// of tablets deferred each tick, so a rate shows the ramp in progress and
+    /// it stays flat in steady state (and always under `host_unsettled_max =
+    /// 0`).
+    CpHostWaveDeferred,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 137] = [
+    pub const ALL: [Metric; 138] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -1227,6 +1236,7 @@ impl Metric {
         Metric::ConsensusTaskPanics,
         Metric::ControlRebalanceEvals,
         Metric::ControlRebalancePlanRebuilds,
+        Metric::CpHostWaveDeferred,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -1373,6 +1383,7 @@ impl Metric {
             Metric::ConsensusTaskPanics => "consensus_task_panics",
             Metric::ControlRebalanceEvals => "control_rebalance_evals",
             Metric::ControlRebalancePlanRebuilds => "control_rebalance_plan_rebuilds",
+            Metric::CpHostWaveDeferred => "cp_host_wave_deferred",
         }
     }
 

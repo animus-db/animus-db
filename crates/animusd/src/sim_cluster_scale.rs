@@ -457,8 +457,14 @@ fn sim_cluster_scale_metadata_curve() {
                 .collect();
             let mut facts: BTreeMap<TabletId, TabletFacts> = BTreeMap::new();
             // Boot tick: nothing hosted yet -> one Host per local tablet.
-            let (boot, state) =
-                host::plan(&view, &facts, &local, &LocalState::default(), me.clone());
+            let (boot, state) = host::plan(
+                &view,
+                &facts,
+                &local,
+                &LocalState::default(),
+                me.clone(),
+                host::UNLIMITED_HOST_BUDGET,
+            );
             let hosts = boot
                 .iter()
                 .filter(|a| matches!(a, HostAction::Host { .. }))
@@ -480,7 +486,14 @@ fn sim_cluster_scale_metadata_curve() {
                     },
                 );
             }
-            let (steady, state) = host::plan(&view, &facts, &local, &state, me.clone());
+            let (steady, state) = host::plan(
+                &view,
+                &facts,
+                &local,
+                &state,
+                me.clone(),
+                host::UNLIMITED_HOST_BUDGET,
+            );
             let reconfigures = steady
                 .iter()
                 .filter(|a| matches!(a, HostAction::Reconfigure { .. }))
@@ -517,7 +530,14 @@ fn sim_cluster_scale_metadata_curve() {
             let t3 = view2.tablets.get_mut(&TabletId(3)).unwrap();
             t3.replicas.pop();
             t3.epoch = t3.epoch.next();
-            let (changed, _) = host::plan(&view2, &facts, &local, &state, me.clone());
+            let (changed, _) = host::plan(
+                &view2,
+                &facts,
+                &local,
+                &state,
+                me.clone(),
+                host::UNLIMITED_HOST_BUDGET,
+            );
             let changed_non_reconf = changed
                 .iter()
                 .filter(|a| !matches!(a, HostAction::Reconfigure { .. }))
