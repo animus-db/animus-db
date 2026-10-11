@@ -114,7 +114,8 @@ Pods are `<name>-<ordinal>` with a stable identity and one PVC each. A node
 - **Control ordinal** (< `spec.controlNodes`): `control-remove` the id (section B.2),
   delete the PVC and pod. **The operator re-adds any ordinal in `0..controlNodes`
   that is missing from the live voter set on every reconcile (about every 30 s,
-  `advance_control_growth`),** so once the new pod is up and reports the combined
+  `advance_control_growth`),** (to stop that during manual surgery, annotate the cluster
+  `animusdb.io/pause-control-voter-reconcile=true`; see control-plane-quorum-loss.md) so once the new pod is up and reports the combined
   role, the operator performs the `control/member/add` itself. Do not also
   run B.3 by hand unless the operator is stopped. This is derived from the code
   and has not been run end to end.

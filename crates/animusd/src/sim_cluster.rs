@@ -413,7 +413,7 @@ fn spawn_reconciler_loop(ctx: SimNodeCtx, mut reconciler: SimReconciler) {
             // loop`'s own identical comment.
             last_seen = watch.latest();
 
-            let meta = ctx.effective_metadata();
+            let meta = ctx.effective_metadata_arc();
             let down: BTreeSet<NodeId> = meta
                 .members
                 .iter()
@@ -429,7 +429,7 @@ fn spawn_reconciler_loop(ctx: SimNodeCtx, mut reconciler: SimReconciler) {
                 crate::leader_preferences(&meta)
             };
             let view = MetadataView {
-                tablets: meta.tablets,
+                tablets: animus_cp_data::host::TabletMap::from_metadata(Arc::clone(&meta)),
                 down,
                 regions,
                 preferred_leader,
@@ -2548,6 +2548,7 @@ impl SimCluster {
                 auto_split_ops_rate_threshold: None,
                 throttle_read_units: None,
                 throttle_write_units: None,
+                pitr_retention: crate::pitr_janitor::DEFAULT_PITR_RETENTION,
                 node_id: Some(id.clone()),
                 internal_addr: Some(placeholder_addr()),
                 client_addr: placeholder_addr(),
@@ -6223,6 +6224,7 @@ impl SimCluster {
             auto_split_ops_rate_threshold: None,
             throttle_read_units: None,
             throttle_write_units: None,
+            pitr_retention: crate::pitr_janitor::DEFAULT_PITR_RETENTION,
             node_id: Some(id.clone()),
             internal_addr: Some(placeholder_addr()),
             client_addr: placeholder_addr(),
@@ -6584,6 +6586,7 @@ impl SimCluster {
             auto_split_ops_rate_threshold: None,
             throttle_read_units: None,
             throttle_write_units: None,
+            pitr_retention: crate::pitr_janitor::DEFAULT_PITR_RETENTION,
             node_id: Some(id.clone()),
             internal_addr: Some(placeholder_addr()),
             client_addr: placeholder_addr(),
@@ -6891,6 +6894,7 @@ impl SimCluster {
             auto_split_ops_rate_threshold: None,
             throttle_read_units: None,
             throttle_write_units: None,
+            pitr_retention: crate::pitr_janitor::DEFAULT_PITR_RETENTION,
             node_id: Some(id.clone()),
             internal_addr: Some(placeholder_addr()),
             client_addr: placeholder_addr(),
@@ -7711,6 +7715,7 @@ impl SimCluster {
             auto_split_ops_rate_threshold: None,
             throttle_read_units: None,
             throttle_write_units: None,
+            pitr_retention: crate::pitr_janitor::DEFAULT_PITR_RETENTION,
             node_id: Some(id.clone()),
             internal_addr: Some(placeholder_addr()),
             client_addr: placeholder_addr(),

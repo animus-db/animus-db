@@ -272,7 +272,7 @@ fn ring_resets_across_a_restart_and_pre_restart_watchers_fall_back() {
     });
 }
 
-/// A small, bounded ring evicts old entries: a caller whose `last_seen` has
+/// A small, byte-bounded ring evicts old entries: a caller whose `last_seen` has
 /// aged out of the window falls back to a full fetch, while a recent caller
 /// still gets a delta — proven at the `RaftNode` level (not just
 /// `DeltaRing`'s own unit tests), so the bound actually threads through
@@ -292,7 +292,8 @@ fn a_small_ring_evicts_and_a_stale_watcher_falls_back() {
             vec![nid(0)],
             MetricsHandle::noop(),
             engine,
-            DeltaRing::with_bounds(3, usize::MAX),
+            // A 1-byte budget: every push evicts all but the newest entry.
+            DeltaRing::with_max_bytes(1),
         );
         sim.run_for(Duration::from_secs(1));
 
@@ -302,19 +303,58 @@ fn a_small_ring_evicts_and_a_stale_watcher_falls_back() {
         }
         sim.run_for(Duration::from_secs(1));
 
-        // The ring only holds the newest 3 entries — a caller stuck at
+        // The ring only holds the newest entry — a caller stuck at
         // `first_seen` (well before any of the 10 upserts) has fallen out
         // of the window.
         assert_eq!(
             node.watch_delta_since(first_seen),
             None,
-            "a watcher this far behind a 3-entry ring must fall back"
+            "a watcher this far behind a 1-entry ring must fall back"
         );
         // But a caller near the current watermark is still covered.
         let current = node.engine_applied_index();
         assert!(
             node.watch_delta_since(current - 1).is_some(),
-            "a watcher one commit behind should still be within a 3-entry ring"
+            "a watcher one commit behind should still be within a 1-entry ring"
+        );
+    });
+}
+
+/// Issue #1191: the default ring is byte-bounded only, so more than the old
+/// 1024-entry cap of small deltas is still served as a delta (not a full
+/// `Status` fallback) to a watcher that has been behind the whole time.
+#[test]
+fn over_a_thousand_small_deltas_are_still_served_as_a_delta() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    rt.block_on(async move {
+        let seed = 0x1191_5EEDu64;
+        let mut sim = Simulator::new(seed);
+        let node = RaftNode::start_with_metrics(
+            sim.env(nid(0)),
+            vec![nid(0)],
+            MetricsHandle::noop(),
+            MemoryEngine::new(),
+        );
+        sim.run_for(Duration::from_secs(1));
+
+        let first_seen = node.engine_applied_index();
+        for i in 0..1_500u64 {
+            node.propose(upsert(i));
+        }
+        sim.run_for(Duration::from_secs(5));
+
+        let current = node.engine_applied_index();
+        assert!(
+            current - first_seen > 1024,
+            "test must outrun the old entry cap (seed={seed})"
+        );
+        assert!(
+            node.watch_delta_since(first_seen).is_some(),
+            "{} small deltas fit the byte budget and must not force a full fetch (seed={seed})",
+            current - first_seen
         );
     });
 }

@@ -1976,7 +1976,7 @@ async fn pitr_tick(
     let backlog_ms = now_ms.saturating_sub(last_seal_ms);
 
     let size_hot = approx_bytes > ctx.data().stream_seal_knobs.seal_bytes;
-    let age_hot = Duration::from_millis(backlog_ms) > ctx.data().stream_seal_knobs.seal_age;
+    let age_hot = Duration::from_millis(backlog_ms) > ctx.data().stream_seal_knobs.pitr_seal_age;
     if !size_hot && !age_hot {
         return Ok(());
     }
@@ -3876,6 +3876,8 @@ mod stream_sealer_tests {
                 StreamSealKnobs {
                     seal_bytes: 200,
                     seal_age: Duration::from_secs(3600),
+                    pitr_seal_age: Duration::from_secs(3600),
+                    ..Default::default()
                 },
             )
             .await;
@@ -3930,6 +3932,76 @@ mod stream_sealer_tests {
         .expect("did not converge in time");
     }
 
+    /// **Issue #1275: the PITR sealer's age trigger is its own knob.** With
+    /// the Streams `seal_age` and the size trigger both out of reach, a short
+    /// `pitr_seal_age` alone seals a quiet PITR table's tail and advances
+    /// `LatestRestorableDateTime` (the restore window's `latest_ms`) within
+    /// that age; and the converse: a short Streams `seal_age` with a long
+    /// `pitr_seal_age` does NOT PITR-seal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pitr_seal_age_knob_is_independent_of_the_streams_seal_age() {
+        timeout(Duration::from_secs(60), async {
+            // Short PITR age, long Streams age: PITR seals, window advances.
+            let dir = tempfile::tempdir().expect("tempdir");
+            let node = single_node_with_streams(
+                dir.path(),
+                StreamSealKnobs {
+                    seal_bytes: 64 * 1024 * 1024,
+                    seal_age: Duration::from_secs(3600),
+                    pitr_seal_age: Duration::from_millis(300),
+                    ..Default::default()
+                },
+            )
+            .await;
+            let table = "quiet_pitr";
+            create_base_table(node.dynamo_addr(), table).await;
+            set_pitr(node.dynamo_addr(), table, true).await;
+            let enabled_latest = node
+                .metadata()
+                .pitr_restore_window(table)
+                .map_or(0, |w| w.latest_ms);
+            put_item_padded(node.dynamo_addr(), table, "k0", 4).await;
+            let tablet = only_tablet(&node, table);
+            await_true(20, "pitr_seal_age alone seals the quiet tail", || {
+                node.metadata().pitr_segments.contains_key(&(tablet, 0))
+            })
+            .await;
+            let advanced = node
+                .metadata()
+                .pitr_restore_window(table)
+                .expect("window exists once a segment sealed")
+                .latest_ms;
+            assert!(
+                advanced > enabled_latest,
+                "LatestRestorableDateTime must advance past the enable time ({advanced} vs \
+                 {enabled_latest})"
+            );
+
+            // Short Streams age, long PITR age: no PITR seal.
+            let dir2 = tempfile::tempdir().expect("tempdir");
+            let node2 = single_node_with_streams(
+                dir2.path(),
+                StreamSealKnobs {
+                    seal_bytes: 64 * 1024 * 1024,
+                    seal_age: Duration::from_millis(300),
+                    pitr_seal_age: Duration::from_secs(3600),
+                    ..Default::default()
+                },
+            )
+            .await;
+            create_base_table(node2.dynamo_addr(), table).await;
+            set_pitr(node2.dynamo_addr(), table, true).await;
+            put_item_padded(node2.dynamo_addr(), table, "k0", 4).await;
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            assert!(
+                node2.metadata().pitr_segments.is_empty(),
+                "the Streams seal age must not drive PITR sealing"
+            );
+        })
+        .await
+        .expect("did not converge in time");
+    }
+
     /// **PITR seal happy path** (ADR 0059 §9, Train 3): the fifth consumer
     /// arm fires against an otherwise-plain, unstreamed base table — proving
     /// PITR needs no stream at all — lands a `PitrSegmentRow` (a distinct
@@ -3948,6 +4020,8 @@ mod stream_sealer_tests {
                 StreamSealKnobs {
                     seal_bytes: 200,
                     seal_age: Duration::from_secs(3600),
+                    pitr_seal_age: Duration::from_secs(3600),
+                    ..Default::default()
                 },
             )
             .await;
@@ -4122,6 +4196,8 @@ mod stream_sealer_tests {
                 StreamSealKnobs {
                     seal_bytes: 64 * 1024 * 1024, // never trips by size here
                     seal_age: Duration::from_millis(300),
+                    pitr_seal_age: Duration::from_millis(300),
+                    ..Default::default()
                 },
             )
             .await;
@@ -4177,6 +4253,8 @@ mod stream_sealer_tests {
                 StreamSealKnobs {
                     seal_bytes: 1, // would trip immediately if anything were pending
                     seal_age: Duration::from_millis(50),
+                    pitr_seal_age: Duration::from_millis(50),
+                    ..Default::default()
                 },
             )
             .await;
@@ -4236,6 +4314,8 @@ mod stream_sealer_tests {
                 StreamSealKnobs {
                     seal_bytes: 64 * 1024 * 1024,        // this backlog never approaches it
                     seal_age: Duration::from_secs(3600), // nor does elapsed time
+                    pitr_seal_age: Duration::from_secs(3600),
+                    ..Default::default()
                 },
             )
             .await;
@@ -4287,6 +4367,8 @@ mod stream_sealer_tests {
                 StreamSealKnobs {
                     seal_bytes: 64 * 1024 * 1024, // never trips by size
                     seal_age: Duration::from_millis(300),
+                    pitr_seal_age: Duration::from_millis(300),
+                    ..Default::default()
                 },
             )
             .await;
@@ -4334,6 +4416,8 @@ mod stream_sealer_tests {
                 StreamSealKnobs {
                     seal_bytes: 20, // one padded write alone exceeds this
                     seal_age: Duration::from_secs(3600),
+                    pitr_seal_age: Duration::from_secs(3600),
+                    ..Default::default()
                 },
             )
             .await;
@@ -4390,6 +4474,8 @@ mod stream_sealer_tests {
                 StreamSealKnobs {
                     seal_bytes: 32, // trips on the very first padded write
                     seal_age: Duration::from_secs(3600),
+                    pitr_seal_age: Duration::from_secs(3600),
+                    ..Default::default()
                 },
             )
             .await;
@@ -4458,6 +4544,8 @@ mod stream_sealer_tests {
                 StreamSealKnobs {
                     seal_bytes: 64 * 1024 * 1024, // never trips on its own
                     seal_age: Duration::from_secs(3600),
+                    pitr_seal_age: Duration::from_secs(3600),
+                    ..Default::default()
                 },
             )
             .await;
@@ -4516,6 +4604,8 @@ mod stream_sealer_tests {
                 StreamSealKnobs {
                     seal_bytes: 64 * 1024 * 1024,
                     seal_age: Duration::from_secs(3600),
+                    pitr_seal_age: Duration::from_secs(3600),
+                    ..Default::default()
                 },
             )
             .await;
@@ -4710,6 +4800,8 @@ mod stream_sealer_tests {
                     StreamSealKnobs {
                         seal_bytes: 64 * 1024 * 1024, // never seal mid-test
                         seal_age: Duration::from_secs(3600),
+                        pitr_seal_age: Duration::from_secs(3600),
+                        ..Default::default()
                     },
                     SegmentStoreConfig::default(),
                     crate::DEFAULT_STREAM_RETENTION,
@@ -4770,6 +4862,8 @@ mod stream_sealer_tests {
                 StreamSealKnobs {
                     seal_bytes: 200,
                     seal_age: Duration::from_secs(3600),
+                    pitr_seal_age: Duration::from_secs(3600),
+                    ..Default::default()
                 },
                 None,
                 Duration::from_millis(300),
@@ -4879,6 +4973,8 @@ mod stream_sealer_tests {
                 StreamSealKnobs {
                     seal_bytes: u64::MAX,
                     seal_age: Duration::from_secs(3600),
+                    pitr_seal_age: Duration::from_secs(3600),
+                    ..Default::default()
                 },
                 None,
                 Duration::from_millis(300),
@@ -4934,6 +5030,8 @@ mod stream_sealer_tests {
                 StreamSealKnobs {
                     seal_bytes: u64::MAX, // never seal — records must persist
                     seal_age: Duration::from_secs(3600),
+                    pitr_seal_age: Duration::from_secs(3600),
+                    ..Default::default()
                 },
                 None,
                 Duration::from_millis(300),
@@ -5010,6 +5108,8 @@ mod stream_sealer_tests {
                 StreamSealKnobs {
                     seal_bytes: u64::MAX, // never seal — the marker must persist
                     seal_age: Duration::from_secs(3600),
+                    pitr_seal_age: Duration::from_secs(3600),
+                    ..Default::default()
                 },
                 None,
                 Duration::from_secs(600),
@@ -5128,6 +5228,8 @@ mod stream_sealer_tests {
                 StreamSealKnobs {
                     seal_bytes: 2_000,
                     seal_age: Duration::from_secs(3600),
+                    pitr_seal_age: Duration::from_secs(3600),
+                    ..Default::default()
                 },
                 Some(2_000), // tiny byte auto-split threshold
                 Duration::from_secs(3),

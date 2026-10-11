@@ -32,6 +32,8 @@ mod support;
 const TEST_SEAL_KNOBS: StreamSealKnobs = StreamSealKnobs {
     seal_bytes: 200,
     seal_age: Duration::from_secs(3600),
+    pitr_seal_age: Duration::from_secs(3600),
+    pitr_retention: Duration::from_secs(35 * 24 * 60 * 60),
 };
 
 /// Bring up a single node with [`TEST_SEAL_KNOBS`], retrying the port-TOCTOU
@@ -391,6 +393,8 @@ async fn disable_survives_concurrent_periodic_seal_on_local_route() {
         let racy_knobs = StreamSealKnobs {
             seal_bytes: 48,
             seal_age: Duration::from_secs(3600),
+            pitr_seal_age: Duration::from_secs(3600),
+            ..Default::default()
         };
         let (node, _config) = start_single_node_with_knobs(dir.path(), racy_knobs).await;
         let table = "orders";
