@@ -199,6 +199,8 @@ Extend the density cells with the `C17 metric=` lines `sim_cluster_scale.rs` alr
 
 Structural assertions only (the file's convention): `campaign_inflight_hwm <= K + exempt`; every group led by the end; `max_term` below a stated bound at the density row (the issue's G=3000 row). `ANIMUS_SCALE_SEEDS` / `ANIMUS_SCALE_MAX_TABLETS` select size; nightly `corpus-deep.yml` runs the 50k setting. The metric the maintainer should watch is **`election_term_churn_per_group`**: in the issue it is about 7 to 32 at 1000 groups and 48 at 3000; with the mechanisms it should be near 1.
 
+*As built (2026-10-11):* the six lines print at the end of every density cell (`emit_election`), plus `campaign_admitted_total` (a wiring sanity check) and `preferred_leader_transfers_total` (the exempt-permit allowance in the hwm assertion, `hwm <= K + transfers`); `max_term` is asserted at most 8. `SimCluster`'s `build_reconciler` did not install the governor and monitor until this step (production's node assembly did), so every `SimCluster` test now runs them at their defaults (the full `animusd --lib` tier stays green); the counters are read from the `SimEnv::metrics()` sink (`SimCluster::env_metric`). The density cells create their tables one at a time and each create waits for its group's first leader, so the per-push rows show `campaign_inflight_hwm` 1 and no deferral: they pin the wiring and the churn, not the governor's bound (the Tier 1 corpus and Tier 3 do that).
+
 ### Tier 3: `ProdEnv` liveness, `animus-cp-data` `tests/election_backpressure_liveness.rs`
 
 Its own `tests/*.rs` target (`ProdEnv`, real threads, `prod-heavy`), a timeout-guarded `#[tokio::test(multi_thread)]`, per `docs/lessons/testing/`:
