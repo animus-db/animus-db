@@ -407,7 +407,7 @@ fn sim_cluster_scale_metadata_curve() {
             split_delta_by_cell.insert((tablets, nodes), split_wire);
 
             // DeltaRing: how many such single-tablet commands fit before the
-            // ring evicts (entry cap 1024 vs the 4 MiB byte cap), and the
+            // ring evicts (byte-capped only, 4 MiB), and the
             // bulk-change cliff: a node drain rewrites every tablet naming
             // that node, one command each — more than the ring holds means a
             // mirror that fell behind one drain falls back to a full Status.
