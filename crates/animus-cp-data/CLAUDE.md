@@ -3167,6 +3167,15 @@ controls (a)/(b) cost 45 to 80 s each in a debug build; the whole file takes
 about 4.5 minutes on this host (its tests run in parallel; the cells test is
 sequential). `ANIMUS_ELECTION_BP_CELL=<substring>` runs one cell.
 
+**Tier 3 (`ProdEnv`, `tests/election_backpressure_liveness.rs`, `prod-heavy`).**
+Three `ProdEnv` nodes, a 2-worker runtime, G=300 RF3 hosted at once through real
+reconcilers at production settings; all led, `max_term` ceiling, governor hwm <= K,
+then a node loss after quiescence (marked `Down` after 500 ms) re-led within the
+ADR's worst-case lost-leader bound. ~8 s debug; run it under contention (several
+copies at once) after touching the governor: that is how the late-pre-vote-grant
+over-cap was found. `density_repro_g3000_holds_led_count` (ignored) is the #1199
+acceptance (`ANIMUS_BP_LIVE_GROUPS=N` overrides G).
+
 
 
 ADR 0044 phase 2 — the `heartbeat_batch` module's own fault-injection

@@ -126,3 +126,12 @@ required-features = ["prod-heavy"]
 name = "group_density_cost"
 path = "tests/group_density_cost.rs"
 required-features = ["prod-heavy"]
+
+# ADR 0078 Tier 3: `ProdEnv` liveness of election backpressure (governor, lag
+# stretch, staggered hosting) on real threads — 3 nodes, RF3, G=300, a node
+# loss. Per-push in `prod-liveness-scattered`; its G=3000 density acceptance is
+# `#[ignore]`d. Same `required-features` gating as above.
+[[test]]
+name = "election_backpressure_liveness"
+path = "tests/election_backpressure_liveness.rs"
+required-features = ["prod-heavy"]

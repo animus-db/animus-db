@@ -210,6 +210,8 @@ Its own `tests/*.rs` target (`ProdEnv`, real threads, `prod-heavy`), a timeout-g
 
 SimEnv does not replace the `ProdEnv` test: it proves the ordering and the bound, not that a real runtime's timers behave the way the `LoadMonitor` assumes.
 
+*As built (2026-10-11):* `tests/election_backpressure_liveness.rs` (`prod-heavy`, run per push in `prod-liveness-scattered`). The groups are hosted through each node's real `host::Reconciler` in the production configuration (batching, quiescence, governor, monitor, stagger), the node loss happens once every replica has quiesced, and the killed node is marked `Down` after 500 ms so the reconciler wakes the quiesced followers (ADR 0048 fork H); the lost-leader bound is the formula above at its worst case (`K_eff = K/4`, `base_eff = 5 * base`) plus that detection path. About 8 s in a debug build. Under CPU contention (three copies at once) it found that a deferred `PreCandidate` finished its lapsed pre-vote round on a late grant and campaigned on an exempt permit over the cap; `handle_pre_vote_resp` now ignores grants while `campaign_hold` is set (`docs/lessons/code-patterns/2026-10-11-a-deferral-must-gate-the-message-path-not-only-the-timer.md`). The G=3000 acceptance is the `#[ignore]`d `density_repro_g3000_holds_led_count` in the same file (same rig at G=3000; the issue's `group_density_cost` rig starts bare `RaftKvNode`s, so it never had the mechanisms).
+
 ## Alternatives considered
 
 - **A larger static election timeout.** Slows every failover for every group, all the time, to protect against a condition that only happens under load; it does nothing for the start-up burst (all groups are leaderless regardless of the timeout). Rejected; lag-stretch is the adaptive version, capped.
