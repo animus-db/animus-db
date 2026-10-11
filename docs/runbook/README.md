@@ -93,7 +93,8 @@ no `animus_` prefix (for example `control_is_leader`, `throttled_writes`).
 | Endpoint | Meaning |
 |---|---|
 | `GET /admin/live` | 200 whenever the admin server answers. Never gates on cluster state (Kubernetes liveness probe). |
-| `GET /admin/health` | 200 only if this node has heard from a control-plane leader recently (3 election timeouts); 503 otherwise (Kubernetes readiness probe). It says nothing about tablets. |
+| `GET /admin/health` | 200 only if this node has heard from a control-plane leader recently (3 election timeouts); 503 otherwise (control-plane health; no longer the readiness probe). It says nothing about tablets. |
+| `GET /admin/ready` | 200 when this node can serve the DynamoDB wire (synced `Metadata`, no panicked consensus task); NOT gated on a control leader. The Kubernetes readiness probe (issue #1274). |
 
 **Logs.** `animusd` logs through `tracing` to stderr; set `RUST_LOG`
 (default `info`). A background task that panics dies silently apart from one

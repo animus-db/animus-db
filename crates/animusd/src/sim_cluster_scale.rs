@@ -48,6 +48,7 @@ use std::time::Duration;
 use animus_control::mirror::{self, KeyWrite};
 use animus_control::node::encode_syskv_image_bytes;
 use animus_control::raft::SNAPSHOT_CHUNK_BYTES;
+use animus_control::rebalance_cache::RebalanceCache;
 use animus_control::{
     ApplyOutcome, ColumnType, DeltaRing, MetaCommand, Metadata, NodeStatus, PlacementPolicy,
     RaftCore, RaftMsg, TableSchema, syskv,
@@ -619,24 +620,85 @@ fn sim_cluster_scale_rebalance_converges() {
             add_members(&mut meta, from, to);
             let before = load_per_node(&meta);
             let mut moves = 0u64;
+            // Issue #1192: one `rebalance_batch` plans the whole convergence
+            // in a single pass (counts built once, updated incrementally); the
+            // old one-move-per-call loop is O(moves x tablets) and is kept
+            // only as the equivalence reference on small cells.
             let mut invocations = 0u64;
             // Termination bound: each move strictly improves balance; a
             // generous O(replicas) cap catches a livelock.
-            let bound = (tablets * RF * 2) as u64 + 16;
-            loop {
-                invocations += 1;
-                assert!(
-                    invocations <= bound,
-                    "tablets={tablets} {from}->{to}: rebalance did not terminate in {bound} calls"
-                );
-                match meta.rebalance(&none_done, &none_down) {
-                    None => break,
-                    Some(cmd) => {
-                        assert_eq!(meta.apply(&cmd), ApplyOutcome::Applied);
-                        moves += 1;
-                    }
+            let bound = tablets * RF * 2 + 16;
+            let reference = (tablets <= 200).then(|| {
+                let mut m = meta.clone();
+                let mut seq = Vec::new();
+                while let Some(cmd) = m.rebalance(&none_done, &none_down) {
+                    assert_eq!(m.apply(&cmd), ApplyOutcome::Applied);
+                    seq.push(cmd);
+                    assert!(seq.len() <= bound, "reference loop did not terminate");
                 }
+                seq
+            });
+            let plan = meta.rebalance_batch(&none_done, bound);
+            invocations += 1;
+            assert!(
+                plan.len() < bound,
+                "tablets={tablets} {from}->{to}: rebalance plan hit the {bound}-move bound"
+            );
+            if let Some(reference) = reference {
+                assert_eq!(
+                    plan, reference,
+                    "tablets={tablets} {from}->{to}: batch plan != repeated single steps"
+                );
             }
+            // The leader's plan cache (ADR 0029's 2026-10-11 amendment): one
+            // move per evaluation, as `reconcile_loop` does, must walk the
+            // same sequence while rebuilding the O(tablets) plan only
+            // O(log moves) times. (The harness clones the view per tick, so
+            // it is capped to keep the cell O(moves x tablets) bounded.)
+            if tablets <= 1000 {
+                let mut m = meta.clone();
+                let mut cache = RebalanceCache::new();
+                let mut seq = Vec::new();
+                while let Some(cmd) = cache.next(&m.placement_view(), 1, &none_done) {
+                    assert_eq!(m.apply(&cmd), ApplyOutcome::Applied);
+                    seq.push(cmd);
+                    assert!(seq.len() <= bound, "cached loop did not terminate");
+                }
+                assert_eq!(
+                    seq, plan,
+                    "tablets={tablets} {from}->{to}: cached one-per-tick sequence != batch plan"
+                );
+                let st = cache.stats();
+                let log2 = u64::from(usize::BITS - plan.len().leading_zeros());
+                assert!(
+                    st.rebuilds <= 2 + log2,
+                    "tablets={tablets} {from}->{to}: {} plan rebuilds for {} moves",
+                    st.rebuilds,
+                    plan.len()
+                );
+                emit(
+                    &format!("rebalance_cached_evals_{from}_to_{to}"),
+                    tablets,
+                    to,
+                    st.evals,
+                );
+                emit(
+                    &format!("rebalance_cached_plan_rebuilds_{from}_to_{to}"),
+                    tablets,
+                    to,
+                    st.rebuilds,
+                );
+            }
+            for cmd in &plan {
+                assert_eq!(meta.apply(cmd), ApplyOutcome::Applied);
+                moves += 1;
+            }
+            // Fixed point: the single-step path agrees nothing is left.
+            invocations += 1;
+            assert!(
+                meta.rebalance(&none_done, &none_down).is_none(),
+                "tablets={tablets} {from}->{to}: plan left a legal move"
+            );
             let after = load_per_node(&meta);
             // The fewest moves that could possibly fill the newly added
             // members to their final load.

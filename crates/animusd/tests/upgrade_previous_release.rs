@@ -44,26 +44,30 @@
 //!   binary (a power cut mid-append), so the new binary's recovery reads
 //!   the old binary's torn files.
 //!
-//! **Known findings** (against the pinned R-1 `ac57d56a`, 2026-10-05; all are
-//! reproduced, intermittently, by `ANIMUS_UPGRADE_FROM_TXN=1`, which is why the
-//! workload runs without multi-key transactions by default):
+//! **Transactions** (issue #1238, closed 2026-10-10): multi-key transactions
+//! are ON by default (`ANIMUS_UPGRADE_FROM_TXN=0` turns them off). They used
+//! to be off because the pinned R-1 `ac57d56a` predates `efcaa6cb` (ADR 0018
+//! section 2, an intent carries the committed value it shadows) and showed
+//! three defects, none of them the roll's mechanics:
 //!
-//! 0. A legacy (v1, tag 1) intent written by an R-1 node and still unresolved
-//!    when the new binary resolves it carries no `prior`, so an abort falls
-//!    back to the old lookback and can tombstone an acknowledged committed
-//!    value: acked writes lost after a roll (seen as `[durability]` in the
+//! 0. A legacy (v1, tag 1) intent, written by an R-1 that predates
+//!    `efcaa6cb`, carries no `prior`, so aborting it after LSM GC can
+//!    tombstone an acknowledged committed value (seen as `[durability]` in the
 //!    SIGKILL variant and `[restart-all]` data loss in the clean one).
-//! 1. `ac57d56a` itself loses acknowledged writes under transactions plus
-//!    replica repair (an aborted intent tombstones the committed value it
-//!    shadows once a snapshot shipped only the latest record), fixed on `main`
-//!    by `efcaa6cb` (ADR 0018 section 2, 2026-10-04). It reproduces with
-//!    `ANIMUS_UPGRADE_FROM_CONTROL=same-binary` (no binary change at all).
-//! 2. That fix introduced `txn-envelope` v2 (intent tag 2), which the current
-//!    build writes **ungated**: an R-1 replica that receives an engine image
-//!    from an upgraded node (a repair snapshot) panics in its apply task with
-//!    `txn: unknown envelope tag 2 (corrupt engine value)`
-//!    (`animus-cp-data/src/txn.rs`, R-1's line 835), after which reads of its
-//!    groups stall or diverge. A rolling upgrade across that format needs a gate.
+//! 1. `ac57d56a` itself lost acknowledged writes under transactions plus
+//!    replica repair with no upgrade at all (`ANIMUS_UPGRADE_FROM_CONTROL=
+//!    same-binary` reproduced it): the same bug.
+//! 2. `efcaa6cb` introduced `txn-envelope` v2 (intent tag 2), which the
+//!    current build used to write ungated, so an R-1 replica without tag 2
+//!    panicked on an upgraded node's repair snapshot (#1237, fixed by #1240:
+//!    the snapshot sender ships v1 until `Gate::GlobalTables` opens).
+//!
+//! The R-1 pin moved to `f6709564`, which contains `efcaa6cb`: its intents are
+//! v2 and carry their prior (0 and 1 do not apply), and it decodes tag 2 (2
+//! does not apply). **This has not been run locally** (the change was made
+//! where an R-1 build did not fit); the `upgrade-previous-release` CI job is
+//! the first run. Rolling with transactions *from a release older than
+//! `efcaa6cb`* is unsupported (ADR 0073's 2026-10-10 amendment).
 //!
 //! **A missing reference binary FAILS this test** (it is feature-gated, so a
 //! job that selects it cannot silently match nothing, and the gate itself
@@ -624,19 +628,15 @@ async fn roll_scenario(
     }
 
     // ---- workload ---------------------------------------------------------------
-    // Multi-key transactions (2PC intents) are OFF by default: against the
-    // pinned `ac57d56a` an in-flight intent across the roll hits the known
-    // findings in the module doc (an acked write lost, or an R-1 replica
-    // panic), which would make this job red for reasons that are not the roll's
-    // mechanics. `ANIMUS_UPGRADE_FROM_TXN=1` turns them on (CI runs one such
-    // variant as an informational step); flip this default once the findings are
-    // fixed or R-1 moves to a release that has the fix.
-    let txns = std::env::var("ANIMUS_UPGRADE_FROM_TXN").is_ok_and(|v| v.trim() == "1");
+    // Multi-key transactions (2PC intents) are ON by default since the R-1 pin
+    // moved past `efcaa6cb` (module doc, "Transactions"; #1238).
+    // `ANIMUS_UPGRADE_FROM_TXN=0` turns them off, to triage a failure as
+    // transaction-related or not.
+    let txns = std::env::var("ANIMUS_UPGRADE_FROM_TXN")
+        .ok()
+        .is_none_or(|v| v.trim() != "0");
     if !txns {
-        eprintln!(
-            "upgrade[{name}]: multi-key transactions are OFF (see the module doc, \"Known \
-             findings\"); ANIMUS_UPGRADE_FROM_TXN=1 turns them on"
-        );
+        eprintln!("upgrade[{name}]: multi-key transactions are OFF (ANIMUS_UPGRADE_FROM_TXN=0)");
     }
     let mut workload_state = Shared::with_base(seed, 0, (10, 30));
     workload_state.txn_ops = txns;

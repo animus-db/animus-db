@@ -307,13 +307,17 @@ with no condition at all (seen hundreds of times per run in `op-trace.txt`). Dyn
 correctness violation (the write definitely did not apply, the harness records it `info`), but a
 wire-semantics deviation clients will mishandle.
 
-**Finding 3: a consistent read hung 60 s after a full-cluster power cut.** `chaos_kill`, seed
-777: after `kill -9` of all nodes and restart, `GetItem(ConsistentRead: true)` of key 0 via node 0
-never answered within 60 s while node 1 answered immediately (the other 23 keys were fine; the
-durability/atomicity lines on key 0 in that run are artifacts of the missing final read). Node
-logs show `txn_resolver_loop: unresolved_decided record has been unreachable past RECOVERY_GRACE`.
-Likely an unresolved transaction intent on key 0 whose resolution is not driven by the read.
-Artifacts were captured under `$ANIMUS_CHAOS_OUT/kill-777`; not investigated further.
+**Finding 3 (resolved, #1204): a consistent read hung 60 s after a full-cluster power cut.** `chaos_kill`, seed
+777: after `kill -9` of all nodes and restart, `GetItem(ConsistentRead: true)` of one key via node 0
+never answered within 60 s. Reproduced on 2026-10-11 (the key differed, the symptom was the same).
+**Root cause:** `txn_recover` only decides an in-doubt transaction once `now >= record.created_ts.wall_ms +
+RECOVERY_GRACE`, but `created_ts` is an HLC (restored from the engine's persisted high-water mark on
+restart) and `now` is `ProdEnv`'s process uptime, which restarts near zero. A transaction left in doubt
+by a process that had been up 108 s was therefore not recoverable until the new process had been up
+~113 s; the blocked key's reads, and every `TxnStage` that needed to push it, failed meanwhile. The gate
+now also opens once the recovering node has itself watched the transaction in doubt for a grace
+(`ClusterEdgeState::in_doubt_grace_elapsed`). Regression:
+`sim_cluster_dynamo_transact::coordinator_crash_recovers_when_the_survivors_clock_restarted_behind_the_record`.
 
 The CI smoke is kept as is (non-required workflow): it will go red intermittently until Finding 1
 is fixed, which is the intended signal.

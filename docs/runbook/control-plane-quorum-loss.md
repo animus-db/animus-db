@@ -34,13 +34,15 @@ Verified from code and ADR 0037 (not by an outage drill):
   Anything needing a metadata commit fails ("did not commit to the control plane
   in time (no leader reachable?)", HTTP 500). Nodes serve their last mirrored
   `Metadata` for routing.
-- **Kubernetes caveat (by code reading, not drilled).** The pod readiness probe is
-  `/admin/health`, which is 503 when no control leader was heard from for three
-  election timeouts. The client-facing `<name>-dynamo` Service does not publish
-  not-ready addresses (only the headless internal Service does). So a control quorum
-  loss makes every pod `NotReady` and removes all endpoints from the client Service
-  even though tablet groups could still serve. Port-forward or address a pod
-  directly to reach the data plane meanwhile.
+- **Kubernetes (issue #1274).** The pod readiness probe is `/admin/ready`, which is
+  NOT gated on a control leader (it needs synced `Metadata` and no panicked consensus
+  task), so a control quorum loss no longer removes the client endpoints: pods stay
+  Ready and the `<name>-dynamo` Service keeps routing to tablet groups that can still
+  serve. `/admin/health` (503 with no recent leader, three election timeouts) is
+  unchanged and is the signal that shows the control plane is down. The operator
+  switches a cluster to `/admin/ready` only once every pod serves it; until then
+  (or on a cluster with an older pod) pods still probe `/admin/health` and drop
+  out of the Service as before; port-forward to a pod meanwhile.
 
 ## Recoverable: voters come back with their data
 

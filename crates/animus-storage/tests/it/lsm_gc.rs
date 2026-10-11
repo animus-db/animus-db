@@ -245,3 +245,74 @@ fn held_snapshot_survives_compaction_gc() {
         );
     });
 }
+
+/// Churn far past the grace window so compaction would GC `victim`'s history
+/// (put at 1, delete at 2) were nothing pinning it. Returns the compaction count.
+async fn churn(e: &LsmEngine<SimEnv>) -> u64 {
+    for i in 0u64..300 {
+        let k = format!("k{i:04}");
+        e.put(k.as_bytes(), format!("v{i}").as_bytes(), 100 + i)
+            .await
+            .unwrap();
+    }
+    e.compaction_count()
+}
+
+/// An explicit [`StorageEngine::hold_version`] pins an arbitrary older version
+/// (issue #1206): a `get_at` at the held version keeps returning the pre-delete
+/// value through compaction pressure far past the grace; the same history
+/// without a hold is reclaimed (negative control: the hold is what protects
+/// it); the hold is refcounted and releases on drop.
+#[test]
+fn held_version_survives_compaction_gc() {
+    let seed = 0x1206_u64;
+    let sim = Simulator::new(seed);
+    let e = open(&sim, 1);
+    let sim2 = Simulator::new(seed);
+    let c = open(&sim2, 1);
+    block_on(async {
+        // Held engine.
+        e.put(b"victim", b"hello", 1).await.unwrap();
+        e.delete(b"victim", 2).await.unwrap();
+        let hold = e.hold_version(1);
+        let second = e.hold_version(1);
+        assert_eq!(e.held_snapshot_count(), 2, "seed={seed}: two holds");
+        assert!(churn(&e).await >= 1, "seed={seed}: expected compactions");
+        assert_eq!(
+            e.get_at(b"victim", 1).await.unwrap().map(|v| v.value),
+            Some(b"hello".to_vec()),
+            "seed={seed}: a held version's data was reclaimed by GC"
+        );
+        drop(hold);
+        assert_eq!(e.held_snapshot_count(), 1, "seed={seed}: refcounted");
+        drop(second);
+        assert_eq!(e.held_snapshot_count(), 0, "seed={seed}: released on drop");
+
+        // Negative control: the identical history with no hold loses the value,
+        // so the assertion above is what the hold buys.
+        c.put(b"victim", b"hello", 1).await.unwrap();
+        c.delete(b"victim", 2).await.unwrap();
+        assert!(churn(&c).await >= 1, "seed={seed}: expected compactions");
+        assert_eq!(
+            c.get_at(b"victim", 1).await.unwrap(),
+            None,
+            "seed={seed}: negative control: without a hold the history is GC'd, \
+             so this test must be able to see the hold's effect"
+        );
+    });
+}
+
+/// The default grace is 5 s of HLC wall time (`5000 << 20` packed versions), and
+/// a raw-version engine (control syskv) keeps the old `1 << 20` entries.
+#[test]
+fn default_grace_is_five_seconds_of_hlc_wall_time() {
+    assert_eq!(
+        LsmOptions::default().tombstone_grace_versions,
+        5_000u64 << 20
+    );
+    assert_eq!(
+        LsmOptions::raw_versions().tombstone_grace_versions,
+        1u64 << 20
+    );
+    assert!(LsmOptions::production_raw_versions().background_maintenance);
+}

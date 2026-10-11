@@ -468,6 +468,62 @@ pub trait StorageEngine: Clone + Send + Sync {
 
     /// The engine's current latest (highest) version, or 0 if empty.
     fn latest_version(&self) -> Version;
+
+    /// Pin `version` against compaction GC until the returned [`VersionHold`]
+    /// drops: every `get_at`/`scan_at`/`entries_at` at a version `>= version`
+    /// keeps returning what it returned when the hold was taken, even when
+    /// `version` is older than the engine's time-based grace window
+    /// ([`LsmOptions::tombstone_grace_versions`]). Take it **before** the
+    /// reads it protects and keep it for their whole span (a multi-tick
+    /// backup capture holds it across ticks). Refcounted; holds at different
+    /// versions are independent. Unlike [`snapshot`](Self::snapshot) it pins
+    /// an arbitrary (older) version and does not capture a read view.
+    ///
+    /// The default is a no-op guard, correct for engines that keep every
+    /// version ([`MemoryEngine`]); [`LsmEngine`] overrides it, and a wrapper
+    /// engine must forward it to the engine it wraps.
+    fn hold_version(&self, _version: Version) -> VersionHold {
+        VersionHold::none()
+    }
+}
+
+/// RAII guard returned by [`StorageEngine::hold_version`]: while it lives the
+/// engine's compaction GC keeps every version a read at the held version needs.
+/// Dropping it (including on a panic or a cancelled/aborted task) releases the
+/// hold.
+#[must_use = "a dropped VersionHold releases its pin immediately"]
+pub struct VersionHold {
+    release: Option<Box<dyn FnOnce() + Send + Sync>>,
+}
+
+impl VersionHold {
+    /// A guard that pins nothing (engines that retain all versions).
+    pub fn none() -> Self {
+        Self { release: None }
+    }
+
+    /// A guard that runs `release` exactly once, on drop.
+    pub fn new(release: impl FnOnce() + Send + Sync + 'static) -> Self {
+        Self {
+            release: Some(Box::new(release)),
+        }
+    }
+}
+
+impl Drop for VersionHold {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            release();
+        }
+    }
+}
+
+impl std::fmt::Debug for VersionHold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VersionHold")
+            .field("pinned", &self.release.is_some())
+            .finish()
+    }
 }
 
 /// A consistent, immutable read view of a [`StorageEngine`] pinned at a version.

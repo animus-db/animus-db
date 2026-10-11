@@ -418,6 +418,31 @@ non-default `kube-dns` namespace.
 
 ## Probes: readiness vs. liveness (issue #710, 2026-09-07)
 
+**Update 2026-10-10 (issue #1274): the readiness route is an observed
+switch between `GET /admin/health` and `GET /admin/ready`.** `/admin/ready` is
+data-plane readiness (synced `Metadata`, no panicked consensus task), not gated
+on a control leader, so a control-plane quorum loss no longer empties the
+client `-dynamo` Service. A previous-release `animusd` 404s on it, so
+`controller::decide_readiness_path` probes `/admin/ready` on every pod each
+reconcile (`200`/`503` = route exists, `404` = old binary; `pick_readiness_path`
+is the pure decision): any 404 -> `/admin/health`; all pods answer ->
+`/admin/ready`; unreachable/missing pods keep the live path; a fresh cluster (no
+StatefulSet) starts on `/admin/ready` (no extra roll after bootstrap; a 404
+reverts it, and `revert_is_ungated` lets that one revert skip the roll gate
+when it is the only template change and no pod is Ready, since the gate cannot
+progress on a cluster whose pods are NotReady on the probe). The live
+StatefulSet's probe path is the persisted state (no status field). A flip is a
+pod-template change and goes through the roll gate; the flip to ready waits for
+no roll in flight, the revert on a 404 does not. Only Running pods with an IP are probed, under a 3s total budget
+(`READY_PROBE_BUDGET`), and the API server's own `pods "x" not found` 404
+(pod proxy, a pod not created yet, e.g. a scale-up ordinal) is *Unknown*, not
+"old binary": misreading it as a 404 from animusd reverted the path and rolled
+every pod (e2e-kind-s3-tls scale-up, curl 52). Pod topology annotations are
+resolved at the START of `finish_reconcile` too, so probing can never delay
+them (animusd waits for them at boot; e2e-kind-encryption). `FakeAdminClient`
+answers 404 for `/admin/ready` unless scripted. Liveness stays `/admin/live`. The text below describes the original
+`/admin/health` readiness and still explains why liveness must differ.
+
 `desired::statefulset::admin_probe` builds both probes off one shared
 `HTTPGetAction` shape (port, TLS scheme) but takes an explicit `path`
 argument — **`readinessProbe` on `GET /admin/health`, `livenessProbe` on

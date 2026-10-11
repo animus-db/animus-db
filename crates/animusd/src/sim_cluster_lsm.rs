@@ -174,8 +174,12 @@ pub(crate) fn start_control(
             None => RaftNode::start(env, ids, memory_syskv),
         },
         SimEngineBackend::Lsm => {
-            let engine = block_on(LsmEngine::open(env.clone(), SYSKV_LSM_PREFIX))
-                .expect("strict open of the control system-keyspace LSM engine");
+            let engine = block_on(LsmEngine::open_with(
+                env.clone(),
+                SYSKV_LSM_PREFIX,
+                LsmOptions::raw_versions(),
+            ))
+            .expect("strict open of the control system-keyspace LSM engine");
             match metrics {
                 Some(m) => RaftNode::start_with_metrics(env, ids, m, engine),
                 None => RaftNode::start(env, ids, engine),

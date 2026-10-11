@@ -110,11 +110,15 @@ semantics are exercised only by the nightly `kind` job (`upgrade-kind-nightly`, 
 in `scripts/e2e-kind.sh`), which has not yet had a verified run. **Transactions:** an N-1 replica
 caught up by snapshot used to be able to crash on a transaction-envelope version it could not read
 (#1237, fixed: it now receives the old format until the cluster version gate opens). Separately,
-a release older than commit `efcaa6cb` has its own bug (#1238, open): a multi-item transaction
-intent it wrote that is still unresolved can lose an acknowledged value if aborted after storage
-compaction. Rolling from a release containing `efcaa6cb` with transactions in use is supported;
-rolling from an older release carries that bug, so drain or resolve in-flight transactions first
-or use the whole-cluster procedure.
+a release older than commit `efcaa6cb` has its own bug (#1238, closed by moving the
+previous-release test's pin past that commit): a multi-item transaction intent it wrote that is
+still unresolved can lose an acknowledged value if aborted after storage compaction, with or without
+an upgrade. Rolling from a release containing `efcaa6cb` with transactions in use is supported and
+is what the `upgrade-previous-release` job runs. **Rolling from an older release with transactions
+in use is unsupported.** Before starting such a roll, stop issuing multi-item transactions and wait
+until every in-flight one has resolved (an unresolved intent is durable, so the whole-cluster
+stop-upgrade-restart procedure does not remove the exposure; only resolving the intents before the
+new binary takes over does). That mitigation is untested.
 
 The dashboard Overview shows the same state in a Version card (cluster version, `N of M`
 nodes on the new build, roll phase, what is next, blockers and the roll-health verdict,
@@ -164,7 +168,7 @@ the upgrade are lost unless exported. Test this rehearsal before you need it.
   has run the new binary**.
 - Criterion E-7 (rolling-upgrade procedure) is partially met by this page; the operator path's
   Kubernetes-semantics evidence is the nightly `kind` job, not yet run (see "Maturity" above).
-- **Open (Phase 3 findings):** issue #1238 (an older release's own abort-lookback bug when rolling from it with transactions; #1237 is fixed), #1235
+- **Open (Phase 3 findings):** #1237 and #1238 are fixed/closed (an older release's own abort-lookback bug stays a documented unsupported source, above), #1235
   (a `SimCluster` Memory-backend restart oddity, test-only). D4(b), a replicated maintenance mark
   that suppresses repair churn during a roll, is a pending maintainer decision now that
   the churn has been measured (ADR 0073's Phase 3 as-built amendment).
