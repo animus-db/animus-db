@@ -1,6 +1,6 @@
 # ADR 0078 — Election backpressure: per-node campaign admission, lag-stretched election timeouts, staggered hosting
 
-- **Status:** Proposed (2026-10-11) — design only; nothing is implemented
+- **Status:** Accepted (2026-10-11) — design only; nothing is implemented yet. The maintainer settled the six open questions on 2026-10-11 (see "Maintainer decisions" below).
 - **Date:** 2026-10-11
 - **Origin:** issue #1199 (found by C-17 Tier 2, `crates/animus-cp-data/tests/group_density_cost.rs`); maintainer decision "ADR first, code after".
 - **Amends:** none. **Depends on:** ADR 0003 (determinism, the `Env` seam), ADR 0009 (control-plane Raft, pre-vote), ADR 0016/0017 (CP data plane, per-tablet Raft), ADR 0031 (host reconciler), ADR 0044/0048 (quiescence, heartbeat batching), ADR 0058 (learners), ADR 0073 (upgrade compatibility), ADR 0075 section 3.4 (per-group timing profile).
@@ -233,7 +233,18 @@ Per the repo's session operating mode (one bigger PR per workstream), this is on
 6. **Calibration and Tier 2**: sweep `K ∈ {8, 16, 32, 64, unbounded}`, `c`, `S_max`, `H` over the corpus and C-17; set the final defaults; the `sim_cluster_scale` `C17 metric=` lines and assertions; cell 9 with `wan_timing_corpus`. Re-baseline any existing corpus whose trace moved with a note in the PR (expected only where more than `K` campaigns were simultaneous).
 7. **`ProdEnv` liveness test** and the density acceptance run recorded in ADR 0044's C-17 amendment; **docs**: this ADR to Accepted/implemented with an "as built" note, `crates/animus-control/CLAUDE.md` and `crates/animus-cp-data/CLAUDE.md` (the seam, the governor, the exemptions), `docs/roadmap.md` (C-17 and #1199), `website/` if it states election or restart behavior, and a `docs/lessons/` entry for anything learned. Close #1199 on this PR.
 
-## Open questions for the maintainer
+## Maintainer decisions (2026-10-11)
+
+The maintainer accepted the recommendation on each of the six questions this ADR raised:
+
+1. **On by default.** All three mechanisms ship enabled, since the failure is a silent cliff. Corpora with more than `K` simultaneous campaigns are re-baselined in the same change that turns them on.
+2. **Defaults.** `K=32`, `H=100`, `c=4`, `S_max=4x` are the starting values, to be confirmed by measurement in implementation step 6. `K` stays a fixed knob; it does not scale with a core count.
+3. **Exemptions confirmed.** The control group and leadership transfers are exempt from the campaign governor.
+4. **Advisory only.** `hosting_ramp` and the lag gauge stay advisory in `/admin/health`. Sustained high lag does not fail the health check or the roll gate (ADR 0073 Phase 3).
+5. **Density admission is a separate ADR.** A per-node cap on awake groups is out of scope here. It gets its own ADR once Tier 2 shows where the stable ceiling is.
+6. **Restart tail accepted.** `H` stays fixed. A ramp-time-dependent `H` can follow later if measurement justifies it.
+
+## Open questions for the maintainer (as originally posed)
 
 1. **Default on or opt-in?** This ADR proposes all three on by default, since the failure is a silent cliff; the cost is that corpora with more than `K` simultaneous campaigns will re-baseline. Opt-in for one release is the conservative alternative.
 2. **Defaults.** `K=32`, `H=100`, `c=4`, `S_max=4x` are reasoned but not measured; step 6 sets them. Is a fixed `K` acceptable, or should it scale with a configured core count (an explicit flag, never auto-detected)?
