@@ -2332,6 +2332,77 @@ fn calibration_matches_measurement() {
     );
 }
 
+/// ADR 0078 step 6: the calibration sweep. One parameter varies at a time
+/// around the defaults (`K=32`, `c=4`, `S_max=4x`, `H=100`) over the five cells
+/// that stress it; the table is printed as `BP-SWEEP` lines. Not an assertion
+/// test (the defaults are pinned by the corpus cells): it exists so the numbers
+/// in the ADR can be regenerated.
+///
+/// ```text
+/// cargo test --release -p animus-cp-data --test it \
+///   election_backpressure_corpus::calibration_sweep -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "manual calibration sweep (ADR 0078 step 6); minutes in release"]
+fn calibration_sweep() {
+    let wanted = [
+        "cell_5_sustained_overload",
+        "cell_4b_leader_node_loss_under_lag",
+        "cell_2_cold_start_staggered_all_mechanisms",
+        "cell_2b_whole_cluster_restart_ascending",
+        "cell_10_lost_leader_bound",
+    ];
+    let base: Vec<Cell> = cells()
+        .into_iter()
+        .filter(|c| wanted.contains(&c.name.as_str()))
+        .collect();
+    assert_eq!(base.len(), wanted.len(), "a sweep cell was renamed");
+    // `(label, edit)`; `u64`/`usize` values are what the cell's `Mechanisms`
+    // takes. "unbounded" K is a cap no cell can reach.
+    type Edit = (&'static str, fn(&mut Mechanisms));
+    let variants: Vec<Edit> = vec![
+        ("default", |_| {}),
+        ("K=8", |m| m.governor_k = 8),
+        ("K=16", |m| m.governor_k = 16),
+        ("K=64", |m| m.governor_k = 64),
+        ("K=unbounded", |m| m.governor_k = 100_000),
+        ("c=2", |m| m.gain = 2),
+        ("c=8", |m| m.gain = 8),
+        ("S_max=2x", |m| m.stretch_x = 2),
+        ("S_max=8x", |m| m.stretch_x = 8),
+        ("H=50", |m| m.host_h = 50),
+        ("H=200", |m| m.host_h = 200),
+    ];
+    for (label, edit) in variants {
+        for b in &base {
+            let mut c = b.clone();
+            edit(&mut c.mech);
+            // H only means something where the Reconciler hosts: test the
+            // unedited cell, the edit itself sets `host_h`.
+            if label.starts_with("H=") && b.mech.host_h == 0 {
+                continue;
+            }
+            let r = run_cell(&c, groups());
+            let v = Limits::for_cell(&c).violations(&r);
+            eprintln!(
+                "BP-SWEEP {label:>11} {:<46} all_led={:?} churn={:.3} max_term={} \
+                 recovery={:?} since_restart={:?} leaderless_gs={:.1} inflight_hwm={} \
+                 deferred={} max_stretch_ms={} violations={v:?}",
+                c.name,
+                r.time_to_all_led_s,
+                r.churn_per_group,
+                r.max_term,
+                r.recovery_s,
+                r.since_restart_s,
+                r.leaderless_gs,
+                r.gov.inflight_hwm,
+                r.gov.deferred,
+                r.max_stretch_ms,
+            );
+        }
+    }
+}
+
 #[test]
 fn names_and_seeds_are_unique_and_frozen() {
     let all: Vec<Cell> = cells()
