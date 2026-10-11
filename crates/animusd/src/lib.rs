@@ -3122,6 +3122,11 @@ pub struct BoundNode {
     /// monitor, no stretch); set from `cluster_settings.lag_stretch_max_x` via
     /// `with_lag_stretch_max_x`.
     lag_stretch_max_x: u64,
+    /// ADR 0078 section 3 (staggered hosting): `(host_unsettled_max,
+    /// host_settle_timeout)` for this node's host reconciler. Defaults to the
+    /// ADR defaults (100, 600 ms); set from `cluster_settings` via
+    /// `with_host_stagger`. `0` disables staggering.
+    host_stagger: (usize, Duration),
     /// MREC peer settings (`cluster_settings.{region,peers,..}`, G-d M3) via `with_mrec`.
     mrec: Arc<crate::mrec_peer::MrecConfig>,
     advertise_host: Option<String>,
@@ -5811,6 +5816,15 @@ impl BoundNode {
         self
     }
 
+    /// Configure staggered hosting (ADR 0078 section 3) — see
+    /// `ClusterSettings::host_unsettled_max` / `host_settle_timeout_ms`.
+    /// `unsettled_max == 0` disables staggering.
+    #[must_use]
+    pub fn with_host_stagger(mut self, unsettled_max: usize, settle_timeout: Duration) -> Self {
+        self.host_stagger = (unsettled_max, settle_timeout);
+        self
+    }
+
     /// Install the node's MREC peer settings (`cluster_settings.region`/
     /// `peers`/`allow_insecure_peers`/`mrec_max_clock_skew_ms`, ADR 0075
     /// section 4.3, G-d M3): read by the MREC receiver. Default: no MREC.
@@ -6491,6 +6505,10 @@ impl BoundNode {
                 self.lag_stretch_max_x,
             ));
         }
+        // ADR 0078 section 3: staggered hosting, and the gauge `/admin/health`
+        // reads its `hosting_ramp` from.
+        reconciler.set_host_stagger(self.host_stagger.0, self.host_stagger.1);
+        reconciler.set_ramp_gauge(edge.hosting_ramp());
         if !quiesce_after.is_zero() {
             // See `MIN_QUIESCE_AFTER`'s own doc for the full argument. The
             // CLI's own parser is the primary enforcement (a release build
@@ -7053,6 +7071,10 @@ impl Node {
             max_region_rtt: animus_control::timing::DEFAULT_MAX_REGION_RTT,
             campaign_max_inflight: animus_cp_data::campaign_governor::DEFAULT_CAMPAIGN_MAX_INFLIGHT,
             lag_stretch_max_x: animus_cp_data::load_monitor::DEFAULT_LAG_STRETCH_MAX_X,
+            host_stagger: (
+                animus_cp_data::host::DEFAULT_HOST_UNSETTLED_MAX,
+                animus_cp_data::host::DEFAULT_HOST_SETTLE_TIMEOUT,
+            ),
             mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             advertise_host: addrs.advertise_host,
             labels: addrs.labels,
@@ -7196,6 +7218,10 @@ impl Node {
             max_region_rtt: animus_control::timing::DEFAULT_MAX_REGION_RTT,
             campaign_max_inflight: animus_cp_data::campaign_governor::DEFAULT_CAMPAIGN_MAX_INFLIGHT,
             lag_stretch_max_x: animus_cp_data::load_monitor::DEFAULT_LAG_STRETCH_MAX_X,
+            host_stagger: (
+                animus_cp_data::host::DEFAULT_HOST_UNSETTLED_MAX,
+                animus_cp_data::host::DEFAULT_HOST_SETTLE_TIMEOUT,
+            ),
             mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             advertise_host: addrs.advertise_host,
             labels: addrs.labels,
@@ -8239,6 +8265,11 @@ pub struct BoundDataNode {
     /// monitor, no stretch); set from `cluster_settings.lag_stretch_max_x` via
     /// `with_lag_stretch_max_x`.
     lag_stretch_max_x: u64,
+    /// ADR 0078 section 3 (staggered hosting): `(host_unsettled_max,
+    /// host_settle_timeout)` for this node's host reconciler. Defaults to the
+    /// ADR defaults (100, 600 ms); set from `cluster_settings` via
+    /// `with_host_stagger`. `0` disables staggering.
+    host_stagger: (usize, Duration),
     /// MREC peer settings (`cluster_settings.{region,peers,..}`, G-d M3) via `with_mrec`.
     mrec: Arc<crate::mrec_peer::MrecConfig>,
     advertise_host: Option<String>,
@@ -8276,6 +8307,15 @@ impl BoundDataNode {
     #[must_use]
     pub fn with_lag_stretch_max_x(mut self, x: u64) -> Self {
         self.lag_stretch_max_x = x;
+        self
+    }
+
+    /// Configure staggered hosting (ADR 0078 section 3) — see
+    /// `ClusterSettings::host_unsettled_max` / `host_settle_timeout_ms`.
+    /// `unsettled_max == 0` disables staggering.
+    #[must_use]
+    pub fn with_host_stagger(mut self, unsettled_max: usize, settle_timeout: Duration) -> Self {
+        self.host_stagger = (unsettled_max, settle_timeout);
         self
     }
 
@@ -8741,6 +8781,10 @@ impl BoundDataNode {
                 self.lag_stretch_max_x,
             ));
         }
+        // ADR 0078 section 3: staggered hosting, and the gauge `/admin/health`
+        // reads its `hosting_ramp` from.
+        reconciler.set_host_stagger(self.host_stagger.0, self.host_stagger.1);
+        reconciler.set_ramp_gauge(edge.hosting_ramp());
         if !quiesce_after.is_zero() {
             // Two asserts, not one — identical contract/rationale to
             // `BoundNode::start_with_growth`'s own gate above: the
@@ -9052,6 +9096,11 @@ pub struct ClusterEdgeState<E: Env = ProdEnv> {
     /// [`in_doubt_grace_elapsed`](Self::in_doubt_grace_elapsed). Lives here
     /// for the same zero-fan-out reason as `version`.
     in_doubt_first_seen: Arc<Mutex<BTreeMap<TxnId, Nanos>>>,
+    /// The latest staggered-hosting reading (ADR 0078 section 3), published by
+    /// this node's host reconciler and read by `/admin/health` (advisory
+    /// `hosting_ramp`). Lives here for the same zero-fan-out reason as
+    /// `version`.
+    hosting_ramp: animus_cp_data::host::HostingRampGauge,
 }
 
 impl<E: Env> Default for ClusterEdgeState<E> {
@@ -9070,7 +9119,14 @@ impl<E: Env> ClusterEdgeState<E> {
             has_catalog_credentials: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             version: version_wiring::VersionState::default(),
             in_doubt_first_seen: Arc::new(Mutex::new(BTreeMap::new())),
+            hosting_ramp: animus_cp_data::host::HostingRampGauge::default(),
         }
+    }
+
+    /// The gauge this node's host reconciler publishes its staggered-hosting
+    /// reading to (ADR 0078 section 3).
+    pub(crate) fn hosting_ramp(&self) -> animus_cp_data::host::HostingRampGauge {
+        self.hosting_ramp.clone()
     }
 
     /// Has this node itself watched `txn_id` sit in doubt for a full
@@ -14424,6 +14480,30 @@ impl CpReconciler {
         }
     }
 
+    /// ADR 0078 section 3 — see [`Reconciler::set_host_stagger`]'s doc.
+    fn set_host_stagger(&mut self, unsettled_max: usize, settle_timeout: Duration) {
+        match self {
+            CpReconciler::Lsm(r) => r.set_host_stagger(unsettled_max, settle_timeout),
+            CpReconciler::Mem(r) => r.set_host_stagger(unsettled_max, settle_timeout),
+        }
+    }
+
+    /// ADR 0078 section 3 — see [`Reconciler::set_ramp_gauge`]'s doc.
+    fn set_ramp_gauge(&mut self, gauge: animus_cp_data::host::HostingRampGauge) {
+        match self {
+            CpReconciler::Lsm(r) => r.set_ramp_gauge(gauge),
+            CpReconciler::Mem(r) => r.set_ramp_gauge(gauge),
+        }
+    }
+
+    /// ADR 0078 section 3 — see [`Reconciler::next_wake`]'s doc.
+    fn next_wake(&self) -> Option<Duration> {
+        match self {
+            CpReconciler::Lsm(r) => r.next_wake(),
+            CpReconciler::Mem(r) => r.next_wake(),
+        }
+    }
+
     /// ADR 0044 phase 2 (C-02 PR 2) production wiring — see
     /// [`Reconciler::enable_heartbeat_batching`]'s doc.
     fn enable_heartbeat_batching(&mut self) {
@@ -14583,11 +14663,17 @@ async fn tablet_host_reconciler_loop(ctx: ClientCtx, mut reconciler: CpReconcile
     // the intent remains present.
     let mut inplace_split_active = false;
     loop {
-        let fallback = if inplace_split_active {
+        let mut fallback = if inplace_split_active {
             INPLACE_SPLIT_RECONCILE_INTERVAL
         } else {
             RECONCILE_FALLBACK_INTERVAL
         };
+        // ADR 0078 section 3: while the last tick deferred fresh hosting, the
+        // reconciler asks for its own short re-tick (groups settling wake
+        // nothing else) instead of waiting out the fallback.
+        if let Some(wake) = reconciler.next_wake() {
+            fallback = fallback.min(wake);
+        }
         tokio::select! {
             _ = watch.changed(last_seen) => {}
             _ = tokio::time::sleep(fallback) => {}
@@ -17450,6 +17536,7 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
         .with_max_region_rtt(config.max_region_rtt())
         .with_campaign_max_inflight(config.campaign_max_inflight())
         .with_lag_stretch_max_x(config.lag_stretch_max_x())
+        .with_host_stagger(config.host_unsettled_max(), config.host_settle_timeout())
         .with_mrec(
             crate::mrec_peer::MrecConfig::from_cluster(config)
                 .with_node_tls(config.nodes.get(index).and_then(|n| n.tls.clone())),
@@ -17519,6 +17606,7 @@ fn apply_cluster_settings_to_bound(
         .with_max_region_rtt(config.max_region_rtt())
         .with_campaign_max_inflight(config.campaign_max_inflight())
         .with_lag_stretch_max_x(config.lag_stretch_max_x())
+        .with_host_stagger(config.host_unsettled_max(), config.host_settle_timeout())
         .with_mrec(
             crate::mrec_peer::MrecConfig::from_cluster(config)
                 .with_node_tls(config.nodes.get(index).and_then(|n| n.tls.clone())),
@@ -18120,6 +18208,7 @@ pub async fn run_node_data_with_cluster_settings(
         .with_max_region_rtt(config.max_region_rtt())
         .with_campaign_max_inflight(config.campaign_max_inflight())
         .with_lag_stretch_max_x(config.lag_stretch_max_x())
+        .with_host_stagger(config.host_unsettled_max(), config.host_settle_timeout())
         .with_mrec(
             crate::mrec_peer::MrecConfig::from_cluster(config)
                 .with_node_tls(config.nodes.get(index).and_then(|n| n.tls.clone())),
@@ -18257,6 +18346,7 @@ pub async fn run_node_growth(
         .with_max_region_rtt(config.max_region_rtt())
         .with_campaign_max_inflight(config.campaign_max_inflight())
         .with_lag_stretch_max_x(config.lag_stretch_max_x())
+        .with_host_stagger(config.host_unsettled_max(), config.host_settle_timeout())
         .with_mrec(
             crate::mrec_peer::MrecConfig::from_cluster(config)
                 .with_node_tls(config.nodes.get(index).and_then(|n| n.tls.clone())),
@@ -22809,6 +22899,11 @@ mod sim_cluster_cp_route_fanout;
 /// own `pub(crate)` surface, no further visibility widened).
 #[cfg(test)]
 mod sim_cluster_dynamo_throttle;
+/// ADR 0078 section 3: the advisory `hosting_ramp` in `/admin/health` — a
+/// sibling of `sim_cluster_throttle` (needs `SimCluster`'s `pub(crate)`
+/// surface).
+#[cfg(test)]
+mod sim_cluster_hosting_ramp;
 #[cfg(test)]
 mod sim_cluster_lsm;
 /// ADR 0073 Phase 2, P2-D: the mixed-version (rolling Phase 1 -> B2) corpus over

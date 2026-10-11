@@ -37,7 +37,7 @@
 //! - `GET  /admin/restores`            — the replicated restore catalog: id, backup id, source/target table, status, destination tablet + its live state (ADR 0059 §7, Train 2; pure observer — the DynamoDB wire surface, `RestoreTableFromBackup`, is `animusd::dynamo::restore_table_from_backup`)
 //! - `GET  /admin/metrics`             — the metrics snapshot as JSON, plus per-tablet `stream_change_rates` (ADR 0042 §14, growth PR3 Fork F) and `request_rates` (W-09, ADR 0034 amendment)
 //! - `GET  /admin/metrics/history`     — periodic snapshots, ~2h ring buffer (ADR 0021 sparklines)
-//! - `GET  /admin/health`              — readiness: 503 until the control plane has had a RECENT leader, and 503 for good once a consensus-loop task has panicked (`consensus_task_panics`, issue #1220) (`leader_within` hysteresis, issue #595) — the Kubernetes readiness probe (ADR 0060)
+//! - `GET  /admin/health`              — readiness: 503 until the control plane has had a RECENT leader, and 503 for good once a consensus-loop task has panicked (`consensus_task_panics`, issue #1220) (`leader_within` hysteresis, issue #595) — the Kubernetes readiness probe (ADR 0060); also carries the advisory `hosting_ramp` boolean plus `hosting_ramp_{hosted,deferred,unsettled}` counts (ADR 0078 section 3, staggered hosting), which never affect the verdict
 //! - `GET  /admin/ready`               — data-plane readiness (issue #1274): 200 when this node can serve the DynamoDB wire, i.e. it has synced `Metadata` at least once and no consensus-loop task has panicked; deliberately NOT gated on a recent control-plane leader (`control_leader_recent` is a diagnostic only). The operator's `readinessProbe`; `/admin/health` keeps the stricter control-leader semantics
 //! - `GET  /admin/live`                — liveness: 200 whenever this admin server can answer at all, independent of control-leader knowledge, hosting, or role — the Kubernetes liveness probe (ADR 0060's 2026-09-07 amendment, issue #710; `/admin/health` must never back a liveness probe, since a healthy joining process can go a full `advance_control_growth` reconcile cycle with no known leader)
 //! - `POST /admin/tablet/split`        — `{tablet, split_key}`
@@ -2302,8 +2302,16 @@ fn health<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> (u16, Value) {
         .metrics()
         .get(animus_env::metrics::Metric::ConsensusTaskPanics);
     let healthy = leader_recent && consensus_task_panics == 0;
+    // ADR 0078 section 3: staggered hosting is an operational fact ("up but
+    // still hosting"), not an error — advisory only. It is deliberately NOT
+    // part of `healthy`, so it can neither fail this check nor the roll gate.
+    let ramp = ctx.edge.hosting_ramp().get();
     let body = json!({
         "ok": healthy,
+        "hosting_ramp": ramp.active(),
+        "hosting_ramp_hosted": ramp.hosted,
+        "hosting_ramp_deferred": ramp.deferred,
+        "hosting_ramp_unsettled": ramp.unsettled,
         "consensus_task_panics": consensus_task_panics,
         "control_leader_known": leader_known,
         "control_leader_recent": leader_recent,

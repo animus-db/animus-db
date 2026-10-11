@@ -1109,12 +1109,20 @@ pub enum Metric {
     /// A level: the election-timeout stretch in nanoseconds the monitor
     /// currently derives for the node's default election base.
     CpElectionStretchNanos,
+    // --- Election backpressure (ADR 0078), appended; slot-stability discipline ---
+    /// Host actions the planner deferred to a later reconcile tick because the
+    /// node already had `host_unsettled_max` freshly hosted groups still
+    /// settling (ADR 0078 section 3, staggered hosting). Bumped by the number
+    /// of tablets deferred each tick, so a rate shows the ramp in progress and
+    /// it stays flat in steady state (and always under `host_unsettled_max =
+    /// 0`).
+    CpHostWaveDeferred,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 144] = [
+    pub const ALL: [Metric; 145] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -1259,6 +1267,7 @@ impl Metric {
         Metric::CpCampaignQueueDepth,
         Metric::CpElectionLagNanos,
         Metric::CpElectionStretchNanos,
+        Metric::CpHostWaveDeferred,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -1412,6 +1421,7 @@ impl Metric {
             Metric::CpCampaignQueueDepth => "cp_campaign_queue_depth",
             Metric::CpElectionLagNanos => "cp_election_lag_nanos",
             Metric::CpElectionStretchNanos => "cp_election_stretch_nanos",
+            Metric::CpHostWaveDeferred => "cp_host_wave_deferred",
         }
     }
 

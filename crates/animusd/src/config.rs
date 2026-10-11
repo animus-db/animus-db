@@ -539,7 +539,32 @@ pub struct ClusterSettings {
     /// [`DEFAULT_MREC_MAX_CLOCK_SKEW_MS`] (500); `0` is rejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mrec_max_clock_skew_ms: Option<u64>,
+    /// `--host-unsettled-max N` (ADR 0078 section 3, staggered hosting): `H`,
+    /// the most freshly hosted tablet groups the host reconciler lets be
+    /// unsettled (leaderless and inside their settle timeout) at once; further
+    /// fresh hosting waits for later reconcile ticks, lowest `TabletId` first.
+    /// `None` resolves to [`DEFAULT_HOST_UNSETTLED_MAX`] (100); an explicit
+    /// `0` disables staggering (every pending tablet is hosted in one tick,
+    /// the pre-ADR-0078 behaviour). Additive and skipped when unset (ADR 0035 /
+    /// ADR 0073 class L: an old config and the frozen fixture are
+    /// byte-identical); a node-local choice, never replicated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_unsettled_max: Option<u64>,
+    /// `--host-settle-timeout-ms MS` (ADR 0078 section 3): how long after
+    /// hosting a group stops holding a ramp slot even if it never heard a
+    /// leader (the liveness backstop, so a group that cannot elect does not
+    /// stall the ramp). `None` resolves to [`DEFAULT_HOST_SETTLE_TIMEOUT_MS`]
+    /// (600, i.e. `4 *` the 150 ms LAN election base); `0` is rejected.
+    /// Additive and skipped when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_settle_timeout_ms: Option<u64>,
 }
+
+/// The default [`ClusterSettings::host_unsettled_max`] (ADR 0078 section 3).
+pub const DEFAULT_HOST_UNSETTLED_MAX: u64 = 100;
+
+/// The default [`ClusterSettings::host_settle_timeout_ms`] (ADR 0078 section 3).
+pub const DEFAULT_HOST_SETTLE_TIMEOUT_MS: u64 = 600;
 
 /// The default [`ClusterSettings::max_region_rtt_ms`] (ADR 0075 section 3.4).
 pub const DEFAULT_MAX_REGION_RTT_MS: u64 = 150;
@@ -610,6 +635,19 @@ impl ClusterSettings {
     pub fn pitr_seal_age(&self) -> std::time::Duration {
         self.pitr_seal_age_secs
             .map_or(crate::DEFAULT_PITR_SEAL_AGE, std::time::Duration::from_secs)
+    }
+
+    /// Startup validation of the staggered-hosting settings (ADR 0078 section
+    /// 3): the settle timeout must be positive (`host_unsettled_max = 0` is
+    /// the documented way to turn staggering off).
+    ///
+    /// # Errors
+    /// A message naming the offending setting.
+    pub fn validate_hosting(&self) -> Result<(), String> {
+        if self.host_settle_timeout_ms == Some(0) {
+            return Err("cluster_settings.host_settle_timeout_ms must be at least 1".into());
+        }
+        Ok(())
     }
 
     /// Startup validation of the MREC peer settings (G-d M3): a region name
@@ -793,6 +831,30 @@ impl ClusterConfig {
             .as_ref()
             .and_then(|s| s.lag_stretch_max_x)
             .unwrap_or(DEFAULT_LAG_STRETCH_MAX_X)
+    }
+
+    /// The effective `host_unsettled_max` ([`ClusterSettings::host_unsettled_max`],
+    /// default [`DEFAULT_HOST_UNSETTLED_MAX`]); `0` disables staggered hosting.
+    #[must_use]
+    pub fn host_unsettled_max(&self) -> usize {
+        let v = self
+            .cluster_settings
+            .as_ref()
+            .and_then(|s| s.host_unsettled_max)
+            .unwrap_or(DEFAULT_HOST_UNSETTLED_MAX);
+        usize::try_from(v).unwrap_or(usize::MAX)
+    }
+
+    /// The effective host settle timeout ([`ClusterSettings::host_settle_timeout_ms`],
+    /// default [`DEFAULT_HOST_SETTLE_TIMEOUT_MS`]).
+    #[must_use]
+    pub fn host_settle_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.cluster_settings
+                .as_ref()
+                .and_then(|s| s.host_settle_timeout_ms)
+                .unwrap_or(DEFAULT_HOST_SETTLE_TIMEOUT_MS),
+        )
     }
 
     /// Generate a **combined-mode** config for `n` nodes on `host`, assigning
@@ -1021,6 +1083,7 @@ impl ClusterConfig {
         if let Some(s) = &cfg.cluster_settings {
             s.validate_mrec().map_err(ConfigError::Invalid)?;
             s.validate_pitr().map_err(ConfigError::Invalid)?;
+            s.validate_hosting().map_err(ConfigError::Invalid)?;
         }
         for n in &cfg.nodes {
             if let Some(o) = &n.overload {
@@ -1351,6 +1414,8 @@ mod tests {
             }],
             allow_insecure_peers: Some(false),
             mrec_max_clock_skew_ms: Some(300),
+            host_unsettled_max: Some(40),
+            host_settle_timeout_ms: Some(900),
         });
         let parsed = ClusterConfig::from_json(&cfg.to_json()).unwrap();
         assert_eq!(parsed.cluster_settings, cfg.cluster_settings);
@@ -1453,6 +1518,61 @@ mod tests {
             serde_json::from_str::<PeerCluster>(r#"{"region":"a","endpoints":[],"tls":"x"}"#)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn host_stagger_settings_are_additive_and_old_configs_still_parse() {
+        // Default settings (and so any config that never mentions them) emit
+        // neither key: the frozen v1 `ClusterConfig` bytes stay untouched.
+        let plain = serde_json::to_string(&ClusterSettings::default()).unwrap();
+        for key in ["host_unsettled_max", "host_settle_timeout_ms"] {
+            assert!(
+                !plain.contains(key),
+                "default settings must not emit `{key}`: {plain}"
+            );
+        }
+        let cfg = ClusterConfig::generate(1, "127.0.0.1".parse().unwrap(), 7000);
+        assert!(
+            !cfg.to_json().contains("host_unsettled_max"),
+            "a default config must not serialize the new keys"
+        );
+
+        // An old config (a `cluster_settings` section from before the keys
+        // existed) parses, and resolves to the ADR 0078 defaults.
+        let old = serde_json::json!({
+            "v": 1,
+            "nodes": cfg.nodes,
+            "cluster_settings": { "quiesce_after_secs": 5 }
+        })
+        .to_string();
+        let parsed = ClusterConfig::from_json(&old).expect("old config parses");
+        let s = parsed.cluster_settings.as_ref().unwrap();
+        assert_eq!(
+            (s.host_unsettled_max, s.host_settle_timeout_ms),
+            (None, None)
+        );
+        assert_eq!(parsed.host_unsettled_max(), 100);
+        assert_eq!(
+            parsed.host_settle_timeout(),
+            std::time::Duration::from_millis(600)
+        );
+
+        // Set values round-trip, and `0` is the documented off switch.
+        let set = ClusterSettings {
+            host_unsettled_max: Some(0),
+            host_settle_timeout_ms: Some(250),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&set).unwrap();
+        assert!(
+            json.ends_with(r#""host_unsettled_max":0,"host_settle_timeout_ms":250}"#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<ClusterSettings>(&json).unwrap(), set);
+        set.validate_hosting().expect("0 unsettled is valid");
+        let mut bad = set.clone();
+        bad.host_settle_timeout_ms = Some(0);
+        assert!(bad.validate_hosting().unwrap_err().contains("at least 1"));
     }
 
     #[test]

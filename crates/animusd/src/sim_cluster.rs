@@ -353,6 +353,9 @@ fn build_reconciler(
     // makes, so the sim exercises the control-fed handle on every hosted
     // group.
     reconciler.set_cluster_features(edge.version().features.clone());
+    // ADR 0078 section 3: staggered hosting is on by default (the ADR's
+    // defaults, as in production); the gauge feeds `/admin/health`.
+    reconciler.set_ramp_gauge(edge.hosting_ramp());
     reconciler
 }
 
@@ -405,9 +408,12 @@ fn spawn_reconciler_loop(ctx: SimNodeCtx, mut reconciler: SimReconciler) {
         let mut last_seen = watch.latest();
         loop {
             let env = ctx.env.clone();
-            let _ =
-                futures::future::select(watch.changed(last_seen), env.sleep(RECONCILER_FALLBACK))
-                    .await;
+            // ADR 0078 section 3: a deferred hosting ramp asks for a sooner
+            // re-tick than the fallback, as production's loop does.
+            let fallback = reconciler
+                .next_wake()
+                .map_or(RECONCILER_FALLBACK, |w| w.min(RECONCILER_FALLBACK));
+            let _ = futures::future::select(watch.changed(last_seen), env.sleep(fallback)).await;
             // Coalesce: take the freshest observed index regardless of
             // which arm woke the loop, mirroring `tablet_host_reconciler_
             // loop`'s own identical comment.
