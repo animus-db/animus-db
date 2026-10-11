@@ -3107,6 +3107,36 @@ needs timers served out of order with the heartbeats that would cancel them;
 Collapse onset is tens of virtual seconds into the overload, so the control
 runs 60 s and costs about 80 s of wall time in a debug build.
 
+**Step 3 (campaign governor).** `campaign_governor.rs`: one `CampaignGovernor`
+per node (next to the `HeartbeatBatcher`; `animusd` builds it with
+`env.metrics()` and installs it via `Reconciler::set_election_backpressure`, the
+only edit to `host.rs`). Sync, `Env`-clean, `BTreeMap` only, time passed in.
+`try_admit(stream, now, ttl, &wake)` returns an RAII `CampaignPermit` or
+`Deferred`; deferred groups sit in a FIFO keyed `(first_deferred_at, stream)`,
+are woken through their group's `WakeSignal` when a permit returns (the first
+`free` waiters), re-queue at the back after a failed attempt, and expire lazily
+after `2*election_base_max` (permits and silent waiters; a backstop re-check at
+`election_base` is the `campaign_hold` deadline). Gating is **candidate-side
+only**: a deferred follower keeps its lapsed `election_deadline`, so it still
+grants pre-votes (control (c) re-arms it and the group never recovers). The
+driver (`drive` in `lib.rs`) calls `campaign_due` before `tick`, uses
+`tick_gated`, and releases the permit when `campaign_active()` turns false, on
+shutdown or on release. **Exempt** (never queued, counted in the
+`CpCampaignInflight` gauge, so the gauge may exceed K): `TimeoutNow`,
+`campaign_now`; **never reach the governor**: single-voter groups, learners and
+non-voters (`campaign_due` is false), quiesced groups (no deadline), and the
+control-plane `RaftNode`. `HostedOptions.backpressure` defaults to off, so
+every existing caller is byte-identical (cell 12 digests). Test hook:
+`GovernorFault::{RearmOnDefer, LeakPermits}` for the negative controls.
+Corpus cells added: 1 with governor (`cell_1_cold_start_*`), 4 (leader-node loss
+while quiesced), 7 (partition and heal), 8 (transfer under saturation), 10
+(lost-leader bound, asserted as `2*base + ceil(Q/K)*2*base + 50 ms` own-election
+slack), 11 (no permits for learners, single voters, quiesced groups); controls
+(c) `control_c_*` and (d) `control_d_*`. The default run takes ~2 min in a debug
+build (control (a) alone ~80 s); `ANIMUS_ELECTION_BP_CELL=<substring>` runs one
+cell (each cell is 1 to 12 s except cell 1/control (a)),
+`ANIMUS_ELECTION_BP_GROUPS=N` shrinks the rig.
+
 ### Heartbeat-batcher corpus (`tests/heartbeat_batch_corpus.rs`)
 
 ADR 0044 phase 2 — the `heartbeat_batch` module's own fault-injection

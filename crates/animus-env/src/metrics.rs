@@ -1084,12 +1084,31 @@ pub enum Metric {
     /// rest were served from the cached plan. `rebuilds / evals` is the
     /// amortization the plan cache buys (ADR 0029's 2026-10-11 amendment).
     ControlRebalancePlanRebuilds,
+
+    // --- ADR 0078 (election backpressure; appended, same slot-stability
+    // discipline) --- Node-level readings of the per-node campaign governor
+    // (`animus-cp-data` `campaign_governor`). A node with the governor disabled
+    // (`--campaign-max-inflight 0`) never records them.
+    /// Campaign attempts the governor admitted (a counter): a timer-driven
+    /// pre-vote round that got a permit, immediately or after a queue wait.
+    CpCampaignAdmitted,
+    /// Campaign attempts the governor deferred (a counter): one per attempt,
+    /// at the first refusal (a re-check of an already-queued group is not
+    /// counted again).
+    CpCampaignDeferred,
+    /// A level: campaign permits outstanding right now, exempt campaigns
+    /// (`TimeoutNow`, `campaign_now`) included, so it can exceed the cap.
+    CpCampaignInflight,
+    /// A level: the highest `CpCampaignInflight` since the process started.
+    CpCampaignInflightHwm,
+    /// A level: groups queued waiting for a campaign permit.
+    CpCampaignQueueDepth,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 137] = [
+    pub const ALL: [Metric; 142] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -1227,6 +1246,11 @@ impl Metric {
         Metric::ConsensusTaskPanics,
         Metric::ControlRebalanceEvals,
         Metric::ControlRebalancePlanRebuilds,
+        Metric::CpCampaignAdmitted,
+        Metric::CpCampaignDeferred,
+        Metric::CpCampaignInflight,
+        Metric::CpCampaignInflightHwm,
+        Metric::CpCampaignQueueDepth,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -1373,6 +1397,11 @@ impl Metric {
             Metric::ConsensusTaskPanics => "consensus_task_panics",
             Metric::ControlRebalanceEvals => "control_rebalance_evals",
             Metric::ControlRebalancePlanRebuilds => "control_rebalance_plan_rebuilds",
+            Metric::CpCampaignAdmitted => "cp_campaign_admitted",
+            Metric::CpCampaignDeferred => "cp_campaign_deferred",
+            Metric::CpCampaignInflight => "cp_campaign_inflight",
+            Metric::CpCampaignInflightHwm => "cp_campaign_inflight_hwm",
+            Metric::CpCampaignQueueDepth => "cp_campaign_queue_depth",
         }
     }
 

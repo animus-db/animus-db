@@ -43,6 +43,7 @@ use animus_control::SharedWal;
 use animus_control::timing::{self, DEFAULT_MAX_REGION_RTT, TimingProfile};
 use animus_control::version::ClusterFeatures;
 
+use crate::campaign_governor::ElectionBackpressure;
 use crate::heartbeat_batch::{DEFAULT_HEARTBEAT_BATCH_INTERVAL, HeartbeatBatcher};
 use crate::layout;
 use crate::trim_marker::trim_marker_key;
@@ -1249,6 +1250,9 @@ pub struct Reconciler<E: Env, S: StorageEngine> {
     /// batcher). A floor handle (`ClusterFeatures::new()`) by default; see
     /// [`set_cluster_features`](Self::set_cluster_features).
     features: ClusterFeatures,
+    /// ADR 0078: the node's election-backpressure handles (campaign governor,
+    /// lag monitor), given to every group hosted from now on. Default: off.
+    backpressure: ElectionBackpressure,
     /// Issue #722: has this reconciler already consulted
     /// [`EngineFactory::local_tablets`] once? `false` from [`new`](Self::new)
     /// until the first [`tick`](Self::tick) call, then permanently `true` —
@@ -1355,6 +1359,7 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
             heartbeat_batcher: None,
             shared_wal: None,
             features: ClusterFeatures::new(),
+            backpressure: ElectionBackpressure::default(),
             local_engines_checked: false,
             stopping: BTreeMap::new(),
             max_region_rtt: DEFAULT_MAX_REGION_RTT,
@@ -1584,6 +1589,14 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         self.shared_wal = Some(shared);
     }
 
+    /// Install the node's election-backpressure handles (ADR 0078): every
+    /// group hosted from now on asks `backpressure`'s governor before a
+    /// timer-driven campaign. Like [`enable_quiescence`](Self::enable_quiescence),
+    /// call once at node start, before the first tick.
+    pub fn set_election_backpressure(&mut self, backpressure: ElectionBackpressure) {
+        self.backpressure = backpressure;
+    }
+
     /// The start options every hosted group gets: this reconciler's batcher,
     /// shared WAL and feature-gate handle, plus the two per-call flags.
     fn hosted_options(
@@ -1597,6 +1610,7 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
             heartbeat_batcher: self.heartbeat_batcher.clone(),
             shared_wal: self.shared_wal.clone(),
             features: self.features.clone(),
+            backpressure: self.backpressure.clone(),
         }
     }
 

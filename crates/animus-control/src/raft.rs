@@ -3105,6 +3105,18 @@ where
         self.lag_stretch
     }
 
+    /// **Negative-control hook, never called in production** (ADR 0078 control
+    /// (c)): re-arm the election timer exactly as a heard heartbeat would. A
+    /// driver that did this when it *deferred* a campaign would turn every
+    /// deferred voter into a refuser of pre-votes (`handle_pre_vote` grants
+    /// only once `now >= election_deadline`), which is the deadlock
+    /// [`tick_gated`](Self::tick_gated) documents; the Tier 1 corpus uses it
+    /// to prove that bug is observable.
+    #[doc(hidden)]
+    pub fn rearm_election_timer_for_test(&mut self, now: Nanos, entropy: u64) {
+        self.reset_election_timer(now, entropy);
+    }
+
     // ---- durable-state helpers ------------------------------------------
 
     /// Append a log entry and record it for persistence. A config-bearing entry is

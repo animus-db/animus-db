@@ -12157,6 +12157,20 @@ it and `Bound*Node::with_max_region_rtt` plumbs it to the control group
 `gen-config` cannot warn about a region-concentrated control set until G-a
 supplies labels.
 
+## Campaign governor flag (ADR 0078 step 3)
+
+`cluster_settings.campaign_max_inflight` (additive, `skip_serializing_if` unset;
+default 32, `0` disables) and `--campaign-max-inflight N` (needs `--config`,
+same reach and both-sides-conflict rule as `--max-region-rtt-ms`) cap the
+simultaneously active Raft campaigns across all data-plane groups a node hosts.
+`ClusterConfig::campaign_max_inflight()` reads it; `Bound{,Data}Node::
+with_campaign_max_inflight` carries it to the tablet-host reconciler start
+(`Reconciler::set_election_backpressure`), which builds one
+`animus_cp_data::campaign_governor::CampaignGovernor` per node beside the
+heartbeat batcher. The control-plane group never uses it. Metrics
+`cp_campaign_{admitted,deferred,inflight,inflight_hwm,queue_depth}`. Serde test:
+`config::tests::campaign_max_inflight_is_additive_and_old_configs_parse`.
+
 ## MRSC global tables: `global_tables.rs` and `sim_cluster_mrsc` (ADR 0075, G-01 G-c)
 
 `global_tables.rs` is the `E: Env`-generic client/admin edge of MRSC (deny-

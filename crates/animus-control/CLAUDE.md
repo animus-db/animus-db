@@ -3323,3 +3323,7 @@ into `election_base`, which the transfer budget, `election_timeout()`, the
 health grace, the heartbeat interval and the vote lease keep reading. It is a
 no-op when unchanged and draws no entropy. Tests:
 `cargo test -p animus-control --test it campaign_admission::`.
+`RaftNode::rearm_election_timer_for_test` (`#[doc(hidden)]`) exists only for ADR
+0078 negative control (c) (animus-cp-data): it re-arms a deferred follower's
+election timer, the responder-side gating the ADR rejects. Never call it from
+production code.

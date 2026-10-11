@@ -580,6 +580,9 @@ async fn run(args: &[String]) -> Result<(), String> {
     // config file is the route for every other shape, same partial CLI reach
     // as `--export-s3-endpoint`.
     let mut max_region_rtt_ms: Option<u64> = None;
+    // ADR 0078 step 3: `--campaign-max-inflight N` (0 disables the per-node
+    // campaign governor); same reach and conflict rule as `--max-region-rtt-ms`.
+    let mut campaign_max_inflight: Option<usize> = None;
     // MREC global-table peer settings (ADR 0075 section 4, G-01 stage G-d M3):
     // `--region NAME`, repeatable `--peer REGION=host:port[,host:port...]`,
     // `--allow-insecure-peers` (dev only) and `--mrec-max-clock-skew-ms MS`.
@@ -732,6 +735,9 @@ async fn run(args: &[String]) -> Result<(), String> {
                 }
                 max_region_rtt_ms = Some(ms);
             }
+            "--campaign-max-inflight" => {
+                campaign_max_inflight = Some(parse_next(&mut it, "--campaign-max-inflight")?);
+            }
             "--region" => mrec_region = Some(parse_next::<String>(&mut it, "--region")?),
             "--peer" => {
                 let v = parse_next::<String>(&mut it, "--peer")?;
@@ -803,6 +809,7 @@ async fn run(args: &[String]) -> Result<(), String> {
         tablet_max_read_units,
         tablet_max_write_units,
         max_region_rtt_ms,
+        campaign_max_inflight,
         region: mrec_region.clone(),
         peers: mrec_peers.clone(),
         allow_insecure_peers,
@@ -841,6 +848,13 @@ async fn run(args: &[String]) -> Result<(), String> {
         return Err(
             "--max-region-rtt-ms is only supported with --config/--node (set \
              cluster_settings.max_region_rtt_ms in the config file for the other shapes)"
+                .into(),
+        );
+    }
+    if campaign_max_inflight.is_some() && config_path.is_none() {
+        return Err(
+            "--campaign-max-inflight is only supported with --config/--node (set \
+             cluster_settings.campaign_max_inflight in the config file for the other shapes)"
                 .into(),
         );
     }
@@ -1971,6 +1985,7 @@ fn resolve_cluster_settings(
     merge_field!(tablet_max_read_units, "--tablet-max-read-units");
     merge_field!(tablet_max_write_units, "--tablet-max-write-units");
     merge_field!(max_region_rtt_ms, "--max-region-rtt-ms");
+    merge_field!(campaign_max_inflight, "--campaign-max-inflight");
     merge_field!(allow_insecure_peers, "--allow-insecure-peers");
     merge_field!(mrec_max_clock_skew_ms, "--mrec-max-clock-skew-ms");
     if let Some(r) = &cli.region {
@@ -2078,6 +2093,13 @@ async fn run_single(
             .cluster_settings
             .get_or_insert_with(Default::default)
             .max_region_rtt_ms = Some(ms);
+    }
+    // ADR 0078 step 3: same for the campaign cap.
+    if let Some(n) = settings.campaign_max_inflight {
+        config
+            .cluster_settings
+            .get_or_insert_with(Default::default)
+            .campaign_max_inflight = Some(n);
     }
     // G-d M3: the MREC peer settings likewise travel on the config (the
     // merge above validated them, region/peers/duplicates included).

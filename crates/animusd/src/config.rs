@@ -488,6 +488,14 @@ pub struct ClusterSettings {
     /// Raft group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_region_rtt_ms: Option<u64>,
+    /// `--campaign-max-inflight N` (ADR 0078 step 3): the per-node cap on
+    /// simultaneously active Raft campaigns across all hosted data-plane groups
+    /// (the `CampaignGovernor`). `None` resolves to
+    /// [`DEFAULT_CAMPAIGN_MAX_INFLIGHT`] (32); `0` disables the governor (the
+    /// pre-0078 behaviour). Node-local, never replicated, additive and skipped
+    /// when unset. The control-plane group never uses it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub campaign_max_inflight: Option<usize>,
     /// `--region NAME` (ADR 0075 section 4, G-01 stage G-d M3): **this
     /// cluster's own MREC region name** — the namespace of
     /// [`peers`](Self::peers) and of an MREC table's replica set (a *peer
@@ -528,6 +536,10 @@ pub struct ClusterSettings {
 
 /// The default [`ClusterSettings::max_region_rtt_ms`] (ADR 0075 section 3.4).
 pub const DEFAULT_MAX_REGION_RTT_MS: u64 = 150;
+
+/// The default [`ClusterSettings::campaign_max_inflight`] (ADR 0078).
+pub const DEFAULT_CAMPAIGN_MAX_INFLIGHT: usize =
+    animus_cp_data::campaign_governor::DEFAULT_CAMPAIGN_MAX_INFLIGHT;
 
 /// The default [`ClusterSettings::mrec_max_clock_skew_ms`] (ADR 0075 section
 /// 4.4).
@@ -751,6 +763,16 @@ impl ClusterConfig {
                 .and_then(|s| s.max_region_rtt_ms)
                 .unwrap_or(DEFAULT_MAX_REGION_RTT_MS),
         )
+    }
+
+    /// The effective campaign cap ([`ClusterSettings::campaign_max_inflight`],
+    /// default [`DEFAULT_CAMPAIGN_MAX_INFLIGHT`]); `0` disables the governor.
+    #[must_use]
+    pub fn campaign_max_inflight(&self) -> usize {
+        self.cluster_settings
+            .as_ref()
+            .and_then(|s| s.campaign_max_inflight)
+            .unwrap_or(DEFAULT_CAMPAIGN_MAX_INFLIGHT)
     }
 
     /// Generate a **combined-mode** config for `n` nodes on `host`, assigning
@@ -1299,6 +1321,7 @@ mod tests {
             tablet_max_read_units: Some(100),
             tablet_max_write_units: Some(100),
             max_region_rtt_ms: Some(220),
+            campaign_max_inflight: Some(16),
             region: Some("us".into()),
             peers: vec![PeerCluster {
                 region: "eu".into(),
@@ -1310,6 +1333,41 @@ mod tests {
         });
         let parsed = ClusterConfig::from_json(&cfg.to_json()).unwrap();
         assert_eq!(parsed.cluster_settings, cfg.cluster_settings);
+    }
+
+    // --- campaign governor cap (ADR 0078 step 3) ---------------------------
+
+    #[test]
+    fn campaign_max_inflight_is_additive_and_old_configs_parse() {
+        // Unset: no key on the wire, the default applies.
+        let plain = serde_json::to_string(&ClusterSettings::default()).unwrap();
+        assert!(!plain.contains("campaign_max_inflight"), "{plain}");
+        let cfg = ClusterConfig::generate(1, std::net::Ipv4Addr::LOCALHOST.into(), 9000);
+        assert_eq!(cfg.campaign_max_inflight(), DEFAULT_CAMPAIGN_MAX_INFLIGHT);
+        assert_eq!(DEFAULT_CAMPAIGN_MAX_INFLIGHT, 32);
+        // An old config (a `cluster_settings` without the key, and one without
+        // `cluster_settings` at all) parses and resolves the default.
+        let old = r#"{"quiesce_after_secs":10,"max_region_rtt_ms":200}"#;
+        let s: ClusterSettings = serde_json::from_str(old).unwrap();
+        assert_eq!(s.campaign_max_inflight, None);
+        assert_eq!(s.max_region_rtt_ms, Some(200));
+        // Set (including 0 = off) round-trips.
+        for k in [0usize, 7, 64] {
+            let s = ClusterSettings {
+                campaign_max_inflight: Some(k),
+                ..ClusterSettings::default()
+            };
+            let json = serde_json::to_string(&s).unwrap();
+            assert!(
+                json.contains(&format!(r#""campaign_max_inflight":{k}"#)),
+                "{json}"
+            );
+            let back: ClusterSettings = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, s);
+            let mut c = ClusterConfig::generate(1, std::net::Ipv4Addr::LOCALHOST.into(), 9000);
+            c.cluster_settings = Some(s);
+            assert_eq!(c.campaign_max_inflight(), k);
+        }
     }
 
     // --- MREC peer settings (G-d M3) -------------------------------------
