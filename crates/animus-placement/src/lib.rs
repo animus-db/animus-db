@@ -459,6 +459,164 @@ pub fn rebalance_step<K: Ord + Copy>(
     tablets: &[(K, &[NodeId], &PlacementPolicy)],
     candidates: &[Candidate],
 ) -> Option<(K, Vec<NodeId>)> {
+    RebalanceState::new(tablets, candidates).next_move()
+}
+
+/// The moves repeated calls of [`rebalance_step`] would make, computed in one
+/// pass (issue #1192): `rebalance_step`, then apply its move to the input,
+/// then `rebalance_step` again, up to `max_moves` times or until it returns
+/// `None`. The result is **move for move identical** to that loop (an
+/// equivalence test pins it), but the per-node load counts and the
+/// per-node tablet lists are built once and updated incrementally instead of
+/// being recomputed over every tablet per move, so converging a grown cluster
+/// costs O(tablets + moves × search) instead of O(moves × tablets).
+///
+/// A tablet may appear more than once (moved again after an earlier move);
+/// each entry carries that tablet's replica set **after** the move. The
+/// caller applies the moves in order (and so must expect the tablet's epoch
+/// to have advanced once per earlier move on the same tablet).
+#[must_use]
+pub fn rebalance_plan<K: Ord + Copy>(
+    tablets: &[(K, &[NodeId], &PlacementPolicy)],
+    candidates: &[Candidate],
+    max_moves: usize,
+) -> Vec<(K, Vec<NodeId>)> {
+    let mut state = RebalanceState::new(tablets, candidates);
+    let mut plan = Vec::new();
+    while plan.len() < max_moves {
+        let Some(mv) = state.next_move() else { break };
+        plan.push(mv);
+    }
+    plan
+}
+
+/// The incremental working set behind [`rebalance_step`] / [`rebalance_plan`]:
+/// per-node replica counts and, per node, the (K-ordered) positions of the
+/// policy-satisfying tablets that have a replica there. The method
+/// `next_move` picks exactly the move [`rebalance_step`]
+/// documents and then applies it to this state.
+struct RebalanceState<'a, K> {
+    candidates: &'a [Candidate],
+    /// Eligible tablets (current set satisfies the policy), sorted by `K`.
+    eligible: Vec<(K, Vec<NodeId>, &'a PlacementPolicy)>,
+    counts: BTreeMap<NodeId, usize>,
+    /// node -> indices into `eligible` of the tablets with a replica on it.
+    on_node: BTreeMap<NodeId, BTreeSet<usize>>,
+}
+
+impl<'a, K: Ord + Copy> RebalanceState<'a, K> {
+    fn new(tablets: &[(K, &[NodeId], &'a PlacementPolicy)], candidates: &'a [Candidate]) -> Self {
+        // Per-node replica counts, seeded 0 for every candidate so an empty new
+        // node is a genuine minimum (a destination), not simply absent.
+        let mut counts: BTreeMap<NodeId, usize> =
+            candidates.iter().map(|c| (c.node.clone(), 0)).collect();
+
+        // Only tablets whose *current* set already satisfies their policy count
+        // toward load or are eligible to move; a violating set is the repair
+        // reconciler's job.
+        let mut eligible: Vec<(K, Vec<NodeId>, &PlacementPolicy)> = tablets
+            .iter()
+            .filter(|(_, replicas, policy)| set_satisfies(replicas, candidates, policy))
+            .map(|(k, replicas, policy)| (*k, replicas.to_vec(), *policy))
+            .collect();
+        eligible.sort_by_key(|(k, _, _)| *k);
+
+        let mut on_node: BTreeMap<NodeId, BTreeSet<usize>> = BTreeMap::new();
+        for (i, (_, replicas, _)) in eligible.iter().enumerate() {
+            for r in replicas {
+                if let Some(c) = counts.get_mut(r) {
+                    *c += 1;
+                }
+                on_node.entry(r.clone()).or_default().insert(i);
+            }
+        }
+        RebalanceState {
+            candidates,
+            eligible,
+            counts,
+            on_node,
+        }
+    }
+
+    /// Find the next move (see [`rebalance_step`]'s algorithm) and apply it to
+    /// this state.
+    fn next_move(&mut self) -> Option<(K, Vec<NodeId>)> {
+        let candidates = self.candidates;
+        // Sources most-loaded first; destinations least-loaded first (id-asc ties).
+        let mut sources: Vec<(NodeId, usize)> =
+            self.counts.iter().map(|(n, &c)| (n.clone(), c)).collect();
+        let mut dests = sources.clone();
+        sources.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        dests.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+
+        for (src, src_count) in &sources {
+            let Some(on_src) = self.on_node.get(src) else {
+                continue;
+            };
+            for (dst, dst_count) in &dests {
+                // Only a pair whose imbalance a single move strictly reduces.
+                if src == dst || *src_count < dst_count + 2 {
+                    continue;
+                }
+                let Some(dst_cand) = candidate_for(candidates, dst) else {
+                    continue;
+                };
+                // Tablets with a replica on `src`, in `K` order.
+                for &i in on_src {
+                    let (k, replicas, policy) = &self.eligible[i];
+                    if replicas.contains(dst) || !policy.admits(dst_cand) {
+                        continue;
+                    }
+                    let mut post: Vec<NodeId> =
+                        replicas.iter().filter(|&n| n != src).cloned().collect();
+                    post.push(dst.clone());
+                    post.sort_unstable();
+                    if !set_satisfies(&post, candidates, policy) {
+                        continue;
+                    }
+                    // Best-effort spread: never make the worst domain worse.
+                    if let Some(sp) = &policy.spread
+                        && !sp.strict
+                        && max_per_domain(&post, candidates, sp)
+                            > max_per_domain(replicas, candidates, sp)
+                    {
+                        continue;
+                    }
+                    let k = *k;
+                    let (src, dst) = (src.clone(), dst.clone());
+                    self.apply(i, &src, &dst, post.clone());
+                    return Some((k, post));
+                }
+            }
+        }
+        None
+    }
+
+    /// Account for moving tablet `i`'s replica `src` -> `dst` (new set `post`).
+    fn apply(&mut self, i: usize, src: &NodeId, dst: &NodeId, post: Vec<NodeId>) {
+        self.eligible[i].1 = post;
+        if let Some(c) = self.counts.get_mut(src) {
+            *c -= 1;
+        }
+        if let Some(c) = self.counts.get_mut(dst) {
+            *c += 1;
+        }
+        if let Some(set) = self.on_node.get_mut(src) {
+            set.remove(&i);
+        }
+        self.on_node.entry(dst.clone()).or_default().insert(i);
+    }
+}
+
+/// The pre-#1192 `rebalance_step` body, kept verbatim as the reference the
+/// equivalence tests compare [`rebalance_step`] / [`rebalance_plan`] against.
+/// Not part of the API.
+#[doc(hidden)]
+#[must_use]
+pub fn rebalance_step_reference<K: Ord + Copy>(
+    tablets: &[(K, &[NodeId], &PlacementPolicy)],
+    candidates: &[Candidate],
+) -> Option<(K, Vec<NodeId>)> {
     // Per-node replica counts, seeded 0 for every candidate so an empty new node
     // is a genuine minimum (a destination), not simply absent.
     let mut counts: BTreeMap<NodeId, usize> =

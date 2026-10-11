@@ -22,8 +22,8 @@ use std::collections::BTreeSet;
 
 use animus_env::{NodeId, nid};
 use animus_placement::{
-    Candidate, PlacementPolicy, SpreadPolicy, rebalance_step, replan, select_replicas,
-    select_replicas_balanced,
+    Candidate, PlacementPolicy, SpreadPolicy, rebalance_plan, rebalance_step,
+    rebalance_step_reference, replan, select_replicas, select_replicas_balanced,
 };
 use proptest::prelude::*;
 
@@ -432,5 +432,43 @@ proptest! {
                 }
             }
         }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// Issue #1192: `rebalance_step` and `rebalance_plan` produce, move for
+    /// move, the sequence of the pre-#1192 implementation (kept as
+    /// `rebalance_step_reference`) applied repeatedly -- including spread
+    /// policies, where the sequence may stop early on a blocked move.
+    #[test]
+    fn rebalance_plan_equals_repeated_reference_steps(
+        (full_pool, policy, tablets) in topology_strategy(0..40)
+    ) {
+        prop_assume!(!tablets.is_empty());
+        let cap = full_pool.len() * tablets.len() * 3 + 30;
+
+        // Reference: step, apply, step ...
+        let mut cur = tablets.clone();
+        let mut reference: Vec<(u32, Vec<NodeId>)> = Vec::new();
+        for _ in 0..cap {
+            let refs: Vec<(u32, &[NodeId], &PlacementPolicy)> =
+                cur.iter().map(|(k, r)| (*k, r.as_slice(), &policy)).collect();
+            let single = rebalance_step(&refs, &full_pool);
+            prop_assert_eq!(&single, &rebalance_step_reference(&refs, &full_pool));
+            let Some((k, set)) = single else { break };
+            cur.iter_mut().find(|(kk, _)| *kk == k).unwrap().1 = set.clone();
+            reference.push((k, set));
+        }
+
+        let refs: Vec<(u32, &[NodeId], &PlacementPolicy)> =
+            tablets.iter().map(|(k, r)| (*k, r.as_slice(), &policy)).collect();
+        let plan = rebalance_plan(&refs, &full_pool, cap);
+        prop_assert_eq!(&plan, &reference);
+
+        // A capped plan is a prefix.
+        let half = reference.len() / 2;
+        prop_assert_eq!(&rebalance_plan(&refs, &full_pool, half)[..], &reference[..half]);
     }
 }

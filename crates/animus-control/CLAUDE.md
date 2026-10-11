@@ -486,6 +486,16 @@ per-tablet CP data plane (`animus-cp-data`).
   flag shape, and layout-mismatch handling. See `crates/animus-cp-data/
   CLAUDE.md`'s own C-05 PR 2 entry for the persist-path wiring itself.
 
+- **`Metadata` tablet index** (issue #1192, `meta.rs`) — private
+  `#[serde(skip)]` `TabletIndex` (table -> ordered tablet ids), equality-neutral,
+  never serialized. All in-crate `tablets` inserts/removes go through
+  `insert_tablet`/`remove_tablet`; readers trust the index only when its
+  recorded count equals `tablets.len()` (else scan), `CreateTablet` rebuilds
+  lazily. After editing the public `tablets` map directly call
+  `rebuild_tablet_index()`. `next_free_tablet_id` uses `keys().next_back()`.
+  `Metadata::rebalance_batch` = N x `rebalance` + apply in one pass
+  (`animus_placement::rebalance_plan`); the leader tick still uses the
+  one-move `rebalance`.
 - **`syskv.rs`** (ADR 0038) — the control plane's reserved **system keyspace**
   key encoding: pure functions, no I/O. `RESERVED_NAMESPACE =
   "__animus_system"` is the top-level namespace no user table/keyspace may

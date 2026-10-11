@@ -208,3 +208,27 @@ removing entry's `(index, term)`, and is no longer "cleared once that peer's
 and, as a volume bound on a peer that is genuinely gone, by five minutes of
 total silence.
 
+
+## Amendment (2026-10-10, issue #1192): incremental load counts and `rebalance_plan`
+
+C-17 Tier 1 measured the one-move-per-call convergence at O(moves x tablets)
+(200M work units for 3 -> 9 nodes at 10k tablets): every `rebalance_step`
+recomputed per-node counts, the policy filter and the sort over every tablet to
+return one move. The algorithm and its move order are **unchanged**; the
+mechanism is now a `RebalanceState` holding per-node counts and, per node, the
+K-ordered positions of the policy-satisfying tablets with a replica there, so
+the first-fit scan visits only a source node's tablets and a move updates the
+state in O(log) instead of rebuilding it. `rebalance_step` is a fresh state plus
+one `next_move`; the new `rebalance_plan(tablets, candidates, max_moves)` runs
+`next_move` repeatedly and returns the exact sequence that
+step -> apply -> step would, with the state built once. `Metadata::rebalance_batch`
+wraps it as `CasTabletReplicas` commands (a tablet moved twice gets its
+`expected_epoch` advanced once per earlier move). The control leader keeps the
+**one CAS per evaluation** churn bound (`Metadata::rebalance`), so production
+call sites are untouched and each tick still pays one O(tablets) build; the batch
+path serves bulk convergence (the C-17 harness, which asserts it equals the
+repeated single step on small cells). The pre-change implementation is kept as
+`#[doc(hidden)] rebalance_step_reference` and a property test compares all three
+move for move, spread policies included. Limit: no state survives across
+leader ticks, because the inputs (epochs, `split_placing`, liveness) can change
+between them.

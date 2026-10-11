@@ -14,8 +14,8 @@ use animus_env::NodeId;
 #[cfg(test)]
 use animus_env::nid;
 use animus_placement::{
-    Candidate, PlacementPolicy, rebalance_step, replan, replan_pinned, replan_repair,
-    select_replicas,
+    Candidate, PlacementPolicy, rebalance_plan, rebalance_step, replan, replan_pinned,
+    replan_repair, select_replicas,
 };
 use animus_tablet::{
     Epoch, InPlaceSplitIntent, KeyRange, SplitChild, TOKEN_BYTES, Tablet, TabletId, TabletState,
@@ -297,6 +297,14 @@ pub struct Metadata {
     /// snapshot still allocates above its tablets.
     #[serde(default)]
     pub next_tablet_id: u64,
+    /// Derived, in-memory-only table → tablet-ids index (issue #1192); never
+    /// serialized, never compared. See [`TabletIndex`].
+    ///
+    /// `pub` only so struct-update syntax (`..Metadata::default()`) keeps
+    /// working in other crates; the type has no public API.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub tablet_index: TabletIndex,
     /// Replicated **node address book** (ADR 0032 PR1): every member's full
     /// address set (raftkv/client/admin), keyed by its raftkv id. Mutated by
     /// [`MetaCommand::RegisterNode`] (the sole claim path, ADR 0040 Decision
@@ -624,6 +632,68 @@ fn is_zero_u32(v: &u32) -> bool {
     *v == 0
 }
 
+/// Derived, **in-memory-only** index from table name to the ids of its
+/// tablets (issue #1192), so `CreateTablet`'s "table already has a tablet"
+/// check and `tablets_for_table` are not O(all tablets). Never serialized
+/// (`#[serde(skip)]`, no format change) and never part of `Metadata`'s
+/// equality. `total` records the tablet count the index was built for; readers
+/// trust the index only when it equals `tablets.len()` and otherwise fall back
+/// to a scan, so direct edits of the public `tablets` map (tests, fixture
+/// builders) and a fresh decode are always correct, merely unindexed until
+/// [`Metadata::rebuild_tablet_index`] (done lazily by `CreateTablet`).
+#[derive(Clone, Debug, Default)]
+pub struct TabletIndex {
+    by_table: BTreeMap<String, BTreeSet<TabletId>>,
+    total: usize,
+}
+
+impl PartialEq for TabletIndex {
+    /// Always equal: the index is derived state, so it must not affect
+    /// `Metadata`'s `PartialEq`. (Exactness is checked by
+    /// [`Metadata::tablet_index_is_exact`].)
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for TabletIndex {}
+
+impl TabletIndex {
+    fn build(tablets: &BTreeMap<TabletId, Tablet>) -> Self {
+        let mut ix = TabletIndex {
+            by_table: BTreeMap::new(),
+            total: tablets.len(),
+        };
+        for (id, t) in tablets {
+            ix.add(t.table.as_deref(), *id);
+        }
+        ix
+    }
+    fn is_valid(&self, tablets_len: usize) -> bool {
+        self.total == tablets_len
+    }
+    fn add(&mut self, table: Option<&str>, id: TabletId) {
+        if let Some(table) = table {
+            self.by_table
+                .entry(table.to_owned())
+                .or_default()
+                .insert(id);
+        }
+    }
+    fn remove(&mut self, table: Option<&str>, id: TabletId) {
+        if let Some(table) = table
+            && let Some(set) = self.by_table.get_mut(table)
+        {
+            set.remove(&id);
+            if set.is_empty() {
+                self.by_table.remove(table);
+            }
+        }
+    }
+    fn ids<'a>(&'a self, table: &str) -> impl Iterator<Item = &'a TabletId> {
+        self.by_table.get(table).into_iter().flatten()
+    }
+}
+
 impl Default for Metadata {
     /// A fresh, empty [`Metadata`] at [`METADATA_VERSION`]. Deliberately a
     /// manual impl, not `#[derive(Default)]` (which the ADR 0073 Phase 0
@@ -640,6 +710,7 @@ impl Default for Metadata {
             policies: Default::default(),
             schemas: Default::default(),
             next_tablet_id: Default::default(),
+            tablet_index: TabletIndex::default(),
             node_addrs: Default::default(),
             split_lineage: Default::default(),
             split_placing: Default::default(),
@@ -3211,6 +3282,29 @@ impl PlacementView {
         )
     }
 
+    /// Up to `max_moves` consecutive [`Metadata::rebalance`] decisions in
+    /// one pass (issue #1192): the commands the one-move-per-call loop
+    /// would produce if each were applied before the next evaluation, move
+    /// for move, without recomputing the per-node load over every tablet per
+    /// move. Meant for callers that converge in bulk (the C-17 scale harness);
+    /// the control leader keeps its one-CAS-per-tick churn bound with
+    /// [`Metadata::rebalance`]. Apply the commands in order.
+    #[must_use]
+    pub fn rebalance_batch(
+        &self,
+        recently_done: &BTreeSet<TabletId>,
+        max_moves: usize,
+    ) -> Vec<MetaCommand> {
+        rebalance_placement_batch(
+            &self.members,
+            &self.tablets,
+            &self.policies,
+            &self.split_placing,
+            recently_done,
+            max_moves,
+        )
+    }
+
     /// The pure directed-Placing convergence decision (ADR 0062 §2) —
     /// identical to [`Metadata::split_placing_reconcile`]. `retarget_ready`
     /// is the driver's own dwell-gate decision (`node.rs`'s
@@ -3407,7 +3501,55 @@ fn rebalance_placement(
     _recently_down: &BTreeSet<NodeId>,
 ) -> Option<MetaCommand> {
     let candidates = active_candidates(members);
-    let entries: Vec<(TabletId, &[NodeId], &PlacementPolicy)> = policies
+    let entries = rebalance_entries(tablets, policies, split_placing, recently_done);
+    let (tablet, replicas) = rebalance_step(&entries, &candidates)?;
+    let epoch = tablets.get(&tablet)?.epoch;
+    Some(MetaCommand::CasTabletReplicas {
+        tablet,
+        expected_epoch: epoch,
+        replicas,
+    })
+}
+
+/// The commands `max_moves` consecutive [`rebalance_placement`] evaluations
+/// would produce if each were applied before the next (issue #1192), planned
+/// in one pass over [`animus_placement::rebalance_plan`]. A tablet moved
+/// more than once gets an `expected_epoch` advanced once per earlier move,
+/// matching `CasTabletReplicas`'s apply-time epoch bump.
+fn rebalance_placement_batch(
+    members: &BTreeMap<NodeId, Member>,
+    tablets: &BTreeMap<TabletId, Tablet>,
+    policies: &BTreeMap<TabletId, PlacementPolicy>,
+    split_placing: &BTreeMap<TabletId, SplitPlacing>,
+    recently_done: &BTreeSet<TabletId>,
+    max_moves: usize,
+) -> Vec<MetaCommand> {
+    let candidates = active_candidates(members);
+    let entries = rebalance_entries(tablets, policies, split_placing, recently_done);
+    let mut epochs: BTreeMap<TabletId, Epoch> = BTreeMap::new();
+    let mut out = Vec::new();
+    for (tablet, replicas) in rebalance_plan(&entries, &candidates, max_moves) {
+        let Some(base) = tablets.get(&tablet).map(|t| t.epoch) else {
+            break;
+        };
+        let epoch = *epochs.get(&tablet).unwrap_or(&base);
+        epochs.insert(tablet, epoch.next());
+        out.push(MetaCommand::CasTabletReplicas {
+            tablet,
+            expected_epoch: epoch,
+            replicas,
+        });
+    }
+    out
+}
+
+fn rebalance_entries<'a>(
+    tablets: &'a BTreeMap<TabletId, Tablet>,
+    policies: &'a BTreeMap<TabletId, PlacementPolicy>,
+    split_placing: &BTreeMap<TabletId, SplitPlacing>,
+    recently_done: &BTreeSet<TabletId>,
+) -> Vec<(TabletId, &'a [NodeId], &'a PlacementPolicy)> {
+    policies
         .iter()
         .filter_map(|(tablet, policy)| {
             let t = tablets.get(tablet)?;
@@ -3426,14 +3568,7 @@ fn rebalance_placement(
             }
             Some((*tablet, t.replicas.as_slice(), policy))
         })
-        .collect();
-    let (tablet, replicas) = rebalance_step(&entries, &candidates)?;
-    let epoch = tablets.get(&tablet)?.epoch;
-    Some(MetaCommand::CasTabletReplicas {
-        tablet,
-        expected_epoch: epoch,
-        replicas,
-    })
+        .collect()
 }
 
 /// The shared body of [`Metadata::split_placing_reconcile`] /
@@ -3671,6 +3806,29 @@ impl Metadata {
         )
     }
 
+    /// Up to `max_moves` consecutive [`Metadata::rebalance`] decisions in
+    /// one pass (issue #1192): the commands the one-move-per-call loop
+    /// would produce if each were applied before the next evaluation, move
+    /// for move, without recomputing the per-node load over every tablet per
+    /// move. Meant for callers that converge in bulk (the C-17 scale harness);
+    /// the control leader keeps its one-CAS-per-tick churn bound with
+    /// [`Metadata::rebalance`]. Apply the commands in order.
+    #[must_use]
+    pub fn rebalance_batch(
+        &self,
+        recently_done: &BTreeSet<TabletId>,
+        max_moves: usize,
+    ) -> Vec<MetaCommand> {
+        rebalance_placement_batch(
+            &self.members,
+            &self.tablets,
+            &self.policies,
+            &self.split_placing,
+            recently_done,
+            max_moves,
+        )
+    }
+
     /// The directed-Placing convergence phase (ADR 0062 §2, fixed for issue
     /// #528): for every un-`done` [`split_placing`](Self::split_placing)
     /// entry, drive toward its STORED target while every member of it is
@@ -3749,12 +3907,10 @@ impl Metadata {
                 range,
                 replicas,
             } => {
+                self.ensure_tablet_index();
                 if self.tablets.contains_key(tablet) {
                     ApplyOutcome::Rejected("tablet already exists")
-                } else if table
-                    .as_deref()
-                    .is_some_and(|t| self.tablets_for_table(t).next().is_some())
-                {
+                } else if table.as_deref().is_some_and(|t| self.has_table_tablet(t)) {
                     // One `CreateTablet` per table (ADR 0023): the *first* tablet is
                     // provisioned at `CreateTable`; further tablets of a table come
                     // only from `SplitTablet`. This makes provision-at-create
@@ -3783,7 +3939,7 @@ impl Metadata {
                     // floor can.
                     ApplyOutcome::Rejected("tablet id below the monotonic allocator")
                 } else {
-                    self.tablets.insert(
+                    self.insert_tablet(
                         *tablet,
                         Tablet::with_table(*tablet, table.clone(), range.clone(), replicas.clone()),
                     );
@@ -3988,7 +4144,7 @@ impl Metadata {
                     t.state = TabletState::Active;
                     t.epoch = t.epoch.next();
                     let child_replicas = t.replicas.clone();
-                    self.tablets.insert(child.id, t);
+                    self.insert_tablet(child.id, t);
                     if let Some(policy) = policy.clone() {
                         self.policies.insert(child.id, policy);
                     }
@@ -4037,7 +4193,7 @@ impl Metadata {
                         }
                     }
                 }
-                self.tablets.remove(parent);
+                self.remove_tablet(parent);
                 self.policies.remove(parent);
                 ApplyOutcome::Applied
             }
@@ -4163,7 +4319,7 @@ impl Metadata {
                     return ApplyOutcome::NoOp;
                 }
                 for id in &dropped {
-                    self.tablets.remove(id);
+                    self.remove_tablet(id);
                     // A dropped tablet can no longer be reconciled.
                     self.policies.remove(id);
                 }
@@ -4623,7 +4779,7 @@ impl Metadata {
                     replicas.clone(),
                 );
                 t.state = TabletState::Building;
-                self.tablets.insert(*tablet, t);
+                self.insert_tablet(*tablet, t);
                 self.next_tablet_id = self.next_tablet_id.max(tablet.0 + 1);
                 self.restores.insert(
                     restore_id.clone(),
@@ -4714,7 +4870,7 @@ impl Metadata {
                     replicas.clone(),
                 );
                 t.state = TabletState::Building;
-                self.tablets.insert(*tablet, t);
+                self.insert_tablet(*tablet, t);
                 self.next_tablet_id = self.next_tablet_id.max(tablet.0 + 1);
                 self.imports.insert(
                     import_id.clone(),
@@ -6197,17 +6353,85 @@ impl Metadata {
     pub fn tablets_for_table<'a>(
         &'a self,
         table: &'a str,
-    ) -> impl Iterator<Item = (&'a TabletId, &'a Tablet)> {
-        self.tablets
-            .iter()
-            .filter(move |(_, t)| t.table.as_deref() == Some(table))
+    ) -> Box<dyn Iterator<Item = (&'a TabletId, &'a Tablet)> + Send + 'a> {
+        if self.tablet_index.is_valid(self.tablets.len()) {
+            // Indexed: O(k log n) for the k tablets of `table`, ascending id.
+            Box::new(
+                self.tablet_index
+                    .ids(table)
+                    .filter_map(move |id| self.tablets.get_key_value(id)),
+            )
+        } else {
+            // Stale or not-yet-built index (direct `tablets` mutation or a
+            // fresh decode): the exact linear scan.
+            Box::new(
+                self.tablets
+                    .iter()
+                    .filter(move |(_, t)| t.table.as_deref() == Some(table)),
+            )
+        }
     }
 
     /// Whether at least one tablet is scoped to `table` (ADR 0023). When false, a
     /// key of `table` routes to the legacy whole-keyspace tablet if present.
     #[must_use]
     pub fn has_table_tablet(&self, table: &str) -> bool {
-        self.tablets_for_table(table).next().is_some()
+        if self.tablet_index.is_valid(self.tablets.len()) {
+            self.tablet_index.ids(table).next().is_some()
+        } else {
+            self.tablets_for_table(table).next().is_some()
+        }
+    }
+
+    /// Insert (or replace) a tablet row, keeping [`TabletIndex`] exact. Every
+    /// in-crate mutation of `tablets` goes through this or
+    /// [`Metadata::remove_tablet`].
+    fn insert_tablet(&mut self, id: TabletId, tablet: Tablet) {
+        let valid = self.tablet_index.is_valid(self.tablets.len());
+        let new_table = tablet.table.clone();
+        let old = self.tablets.insert(id, tablet);
+        if valid {
+            if let Some(old) = old {
+                self.tablet_index.remove(old.table.as_deref(), id);
+            }
+            self.tablet_index.add(new_table.as_deref(), id);
+            self.tablet_index.total = self.tablets.len();
+        }
+    }
+
+    /// Remove a tablet row, keeping [`TabletIndex`] exact.
+    fn remove_tablet(&mut self, id: &TabletId) -> Option<Tablet> {
+        let valid = self.tablet_index.is_valid(self.tablets.len());
+        let old = self.tablets.remove(id);
+        if valid {
+            if let Some(old) = &old {
+                self.tablet_index.remove(old.table.as_deref(), *id);
+            }
+            self.tablet_index.total = self.tablets.len();
+        }
+        old
+    }
+
+    /// Recompute [`TabletIndex`] from `tablets` (O(n)). Call after mutating
+    /// the public `tablets` map directly (tests, fixture builders); `apply`
+    /// does it lazily on the first `CreateTablet` after a decode.
+    pub fn rebuild_tablet_index(&mut self) {
+        self.tablet_index = TabletIndex::build(&self.tablets);
+    }
+
+    fn ensure_tablet_index(&mut self) {
+        if !self.tablet_index.is_valid(self.tablets.len()) {
+            self.rebuild_tablet_index();
+        }
+    }
+
+    /// Test/debug helper: whether the derived index equals a from-scratch
+    /// rebuild (always true when it is stale-by-count, as the readers then
+    /// scan).
+    #[must_use]
+    pub fn tablet_index_is_exact(&self) -> bool {
+        !self.tablet_index.is_valid(self.tablets.len())
+            || self.tablet_index == TabletIndex::build(&self.tablets)
     }
 
     /// Count of tablets whose **current** replica set still names `node` (ADR
@@ -6291,7 +6515,9 @@ impl Metadata {
     /// duplicate and it re-reads this for a fresh id.
     #[must_use]
     pub fn next_free_tablet_id(&self) -> TabletId {
-        let highest = self.tablets.keys().map(|t| t.0).max().unwrap_or(0);
+        // `BTreeMap` keys are ordered: the highest id is the last key, O(log n)
+        // (formerly a full `keys().max()` scan, issue #1192).
+        let highest = self.tablets.keys().next_back().map_or(0, |t| t.0);
         TabletId(self.next_tablet_id.max(highest + 1).max(1))
     }
 
@@ -6741,6 +6967,161 @@ impl crate::version::GatedCommand for MetaCommand {
 mod tests {
     use super::*;
     use crate::schema::{ColumnDef, ColumnType};
+
+    /// Issue #1192: `rebalance_batch` is exactly the one-move-per-call
+    /// `rebalance` loop with each command applied before the next
+    /// evaluation (including the per-move epoch advance for a tablet moved
+    /// more than once).
+    #[test]
+    fn rebalance_batch_equals_repeated_rebalance() {
+        let mut m = Metadata::default();
+        for n in 0..3u64 {
+            assert_eq!(
+                m.apply(&MetaCommand::UpsertMember {
+                    node: nid(n),
+                    labels: BTreeMap::new(),
+                    status: NodeStatus::Active,
+                }),
+                ApplyOutcome::Applied
+            );
+        }
+        let policy = PlacementPolicy::simple("p", 2);
+        for i in 1..=24u64 {
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: TabletId(i),
+                table: Some(format!("t{i}")),
+                range: KeyRange::whole(),
+                replicas: vec![nid(i % 3), nid((i + 1) % 3)],
+            });
+            m.apply(&MetaCommand::SetTabletPolicy {
+                tablet: TabletId(i),
+                policy: Some(policy.clone()),
+            });
+        }
+        for n in 3..7u64 {
+            m.apply(&MetaCommand::UpsertMember {
+                node: nid(n),
+                labels: BTreeMap::new(),
+                status: NodeStatus::Active,
+            });
+        }
+        let none = BTreeSet::new();
+        let none_down: BTreeSet<NodeId> = BTreeSet::new();
+        let mut looped = m.clone();
+        let mut seq = Vec::new();
+        while let Some(cmd) = looped.rebalance(&none, &none_down) {
+            assert_eq!(looped.apply(&cmd), ApplyOutcome::Applied);
+            seq.push(cmd);
+        }
+        assert!(!seq.is_empty());
+        let plan = m.rebalance_batch(&none, 1000);
+        assert_eq!(plan, seq);
+        for cmd in &plan {
+            assert_eq!(m.apply(cmd), ApplyOutcome::Applied);
+        }
+        assert_eq!(m, looped);
+    }
+
+    /// Issue #1192: the derived table -> tablet-ids index stays exactly equal
+    /// to a from-scratch scan across random sequences of the commands that add
+    /// or remove tablets (create, drop, in-place split begin/cutover), and
+    /// `next_free_tablet_id` keeps its monotonic semantics through deletes.
+    #[test]
+    fn tablet_index_matches_full_scan_over_random_commands() {
+        let mut checked_splits = 0u32;
+        for seed in 0..40u64 {
+            let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut next = move |n: u64| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x % n
+            };
+            let mut m = Metadata::default();
+            let mut highest_ever = 0u64;
+            for step in 0..300 {
+                let table = format!("t{}", next(6));
+                let cmd = match next(10) {
+                    0..=4 => MetaCommand::CreateTablet {
+                        tablet: TabletId(next(60)),
+                        table: if next(8) == 0 { None } else { Some(table) },
+                        range: KeyRange::whole(),
+                        replicas: vec![nid(1)],
+                    },
+                    5 => MetaCommand::DropTableTablets { table },
+                    _ => {
+                        let ids: Vec<TabletId> = m.tablets.keys().copied().collect();
+                        if ids.is_empty() {
+                            continue;
+                        }
+                        let parent = ids[next(ids.len() as u64) as usize];
+                        let epoch = m.tablets[&parent].epoch;
+                        if next(2) == 0 {
+                            let a = m.next_free_tablet_id();
+                            MetaCommand::BeginSplitInPlace {
+                                parent,
+                                expected_epoch: epoch,
+                                split_key: vec![0x80],
+                                children: [(a, vec![nid(1)]), (TabletId(a.0 + 1), vec![nid(1)])],
+                            }
+                        } else {
+                            MetaCommand::CutoverSplit {
+                                parent,
+                                expected_epoch: epoch,
+                                cutover_wall_ms: 0,
+                            }
+                        }
+                    }
+                };
+                let was_cutover = matches!(cmd, MetaCommand::CutoverSplit { .. });
+                let before = m.tablets.len();
+                let out = m.apply(&cmd);
+                if was_cutover && out == ApplyOutcome::Applied {
+                    checked_splits += 1;
+                    assert!(
+                        m.tablets.len() >= before,
+                        "cutover removes parent, adds two"
+                    );
+                }
+                assert!(
+                    m.tablet_index_is_exact(),
+                    "seed={seed} step={step}: index diverged after {cmd:?}"
+                );
+                // Once a CreateTablet has run, the index must be live, and
+                // every table's indexed view must equal the scan.
+                if m.tablet_index.total == m.tablets.len() {
+                    for tb in (0..6).map(|i| format!("t{i}")) {
+                        let scan: Vec<TabletId> = m
+                            .tablets
+                            .iter()
+                            .filter(|(_, t)| t.table.as_deref() == Some(tb.as_str()))
+                            .map(|(id, _)| *id)
+                            .collect();
+                        let ix: Vec<TabletId> =
+                            m.tablets_for_table(&tb).map(|(id, _)| *id).collect();
+                        assert_eq!(ix, scan, "seed={seed} step={step} table={tb}");
+                        assert_eq!(m.has_table_tablet(&tb), !scan.is_empty());
+                    }
+                }
+                highest_ever = highest_ever.max(m.tablets.keys().last().map_or(0, |t| t.0));
+                assert!(
+                    m.next_free_tablet_id().0 > highest_ever,
+                    "seed={seed}: allocator must stay above every id ever seen"
+                );
+                if step % 100 == 99 {
+                    // Decode: the index is not serialized, rebuilt on demand.
+                    let json = serde_json::to_vec(&m).unwrap();
+                    let mut d = Metadata::from_json(&json).unwrap();
+                    assert_eq!(d, m);
+                    assert_eq!(d.next_free_tablet_id(), m.next_free_tablet_id());
+                    d.rebuild_tablet_index();
+                    assert!(d.tablet_index_is_exact());
+                    assert_eq!(d.tablet_index.total, d.tablets.len());
+                }
+            }
+        }
+        assert!(checked_splits > 0, "the cutover path was never exercised");
+    }
 
     /// `ReplaceTableSchema` (the atomic `ALTER TABLE` primitive): replaces an
     /// existing table's schema in **one apply** — rejected when there is no schema

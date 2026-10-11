@@ -619,24 +619,46 @@ fn sim_cluster_scale_rebalance_converges() {
             add_members(&mut meta, from, to);
             let before = load_per_node(&meta);
             let mut moves = 0u64;
+            // Issue #1192: one `rebalance_batch` plans the whole convergence
+            // in a single pass (counts built once, updated incrementally); the
+            // old one-move-per-call loop is O(moves x tablets) and is kept
+            // only as the equivalence reference on small cells.
             let mut invocations = 0u64;
             // Termination bound: each move strictly improves balance; a
             // generous O(replicas) cap catches a livelock.
-            let bound = (tablets * RF * 2) as u64 + 16;
-            loop {
-                invocations += 1;
-                assert!(
-                    invocations <= bound,
-                    "tablets={tablets} {from}->{to}: rebalance did not terminate in {bound} calls"
-                );
-                match meta.rebalance(&none_done, &none_down) {
-                    None => break,
-                    Some(cmd) => {
-                        assert_eq!(meta.apply(&cmd), ApplyOutcome::Applied);
-                        moves += 1;
-                    }
+            let bound = tablets * RF * 2 + 16;
+            let reference = (tablets <= 200).then(|| {
+                let mut m = meta.clone();
+                let mut seq = Vec::new();
+                while let Some(cmd) = m.rebalance(&none_done, &none_down) {
+                    assert_eq!(m.apply(&cmd), ApplyOutcome::Applied);
+                    seq.push(cmd);
+                    assert!(seq.len() <= bound, "reference loop did not terminate");
                 }
+                seq
+            });
+            let plan = meta.rebalance_batch(&none_done, bound);
+            invocations += 1;
+            assert!(
+                plan.len() < bound,
+                "tablets={tablets} {from}->{to}: rebalance plan hit the {bound}-move bound"
+            );
+            if let Some(reference) = reference {
+                assert_eq!(
+                    plan, reference,
+                    "tablets={tablets} {from}->{to}: batch plan != repeated single steps"
+                );
             }
+            for cmd in &plan {
+                assert_eq!(meta.apply(cmd), ApplyOutcome::Applied);
+                moves += 1;
+            }
+            // Fixed point: the single-step path agrees nothing is left.
+            invocations += 1;
+            assert!(
+                meta.rebalance(&none_done, &none_down).is_none(),
+                "tablets={tablets} {from}->{to}: plan left a legal move"
+            );
             let after = load_per_node(&meta);
             // The fewest moves that could possibly fill the newly added
             // members to their final load.

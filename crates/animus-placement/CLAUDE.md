@@ -33,6 +33,13 @@ membership and a placement policy, decide which nodes replicate a tablet.
     This is `Metadata::reconcile`'s (`animus-control`) one production
     caller; `replan` itself is still what the directed-Placing convergence
     phase (ADR 0062 §2) and every other caller use unchanged.
+  - `rebalance_plan(tablets, candidates, max_moves)` (issue #1192) — the exact
+    sequence repeated `rebalance_step` + apply would produce, from one
+    `RebalanceState` (per-node counts + per-node K-ordered tablet positions,
+    updated incrementally); `rebalance_step` is a fresh state plus one move.
+    `rebalance_step_reference` (`#[doc(hidden)]`) is the pre-change body the
+    `rebalance_plan_equals_repeated_reference_steps` property test pins all
+    of them to. Keep all three in lockstep when changing the algorithm.
   - `rebalance_step(tablets, candidates)` — one **load-rebalancing** move (ADR
     0029): the balance-driven counterpart of `replan`. Where `replan` only moves
     a replica *off* a failed/ineligible node, this moves a *healthy* replica from
