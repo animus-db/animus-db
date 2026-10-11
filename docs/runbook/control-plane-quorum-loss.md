@@ -49,6 +49,21 @@ is needed: the control Raft recovers from its WAL and a leader is elected.
 Restart them ([node-down.md](node-down.md)), same `--dir`, same identity. Do
 this before anything else; it is the only fully supported recovery.
 
+## A control node halts: "mirror is behind this node's compacted Raft WAL"
+
+A control node that logs `control-plane system-keyspace mirror is behind this
+node's compacted Raft WAL (engine watermark W < snapshot base B)` refused to
+start (issues #1194/#1235, ADR 0038's 2026-10-10 amendment). Its control Raft
+WAL survived but its system-keyspace engine (the durable `Metadata` mirror)
+was lost or wiped, so serving would have exposed a partial `Metadata` while
+reporting caught up. The node stays halted (`RaftNode::is_halted()`; it never
+votes, leads or serves) until repaired. Do not restore only one of the two
+directories. Repair: remove the node's control state entirely (WAL and
+system keyspace), then re-add it as a fresh voter with
+`animus cluster control-add` ([node-replace.md](node-replace.md)); it catches
+up by `InstallSnapshot`. Restoring the matching system-keyspace directory also
+works. Other quorum members are unaffected as long as a majority is healthy.
+
 ## Recoverable by design: a minority is lost, a majority is alive
 
 Replace the lost voters one at a time ([node-replace.md](node-replace.md) B).
