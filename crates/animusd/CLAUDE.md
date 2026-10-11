@@ -12457,6 +12457,12 @@ WAL. WAL path is `<dir>/internal/raft.wal` (`--encryption-key` as for the node).
 Tests: `cargo test -p animusd --lib control_recover`. Runbook:
 `docs/runbook/control-plane-quorum-loss.md`.
 
+- **`backup_capture.rs` holds its cut (#1206).** `backup_capture_loop` keeps a
+  `VersionHold` per `(backup, tablet)` at `cut_version` for the whole capture,
+  rebuilt each pass from the pairs it still drives (so completion, failure,
+  cancel, loss of leadership and task drop all release it). ADR 0059's 2026-10-10
+  amendment.
+
 ## PITR retention and seal age (issue #1275, ADR 0059 amendment 2026-10-10)
 
 `cluster_settings.pitr_retention_days` (default 35, `1..=35`) and

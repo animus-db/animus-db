@@ -3413,3 +3413,10 @@ The cursor rows `mrec:<region>`/`mrecscan:<region>` are ordinary `KIND_CURSOR` r
 through the existing kind ops (no new command); `trim_split_child` drops them, which is why
 a split child rescans. Test-only switch `mrec_test_switch::set_lww_by_arrival` (thread-local)
 backs the M5 negative control; never reachable in a release build path.
+
+- **Readers of old history hold their version (#1206).** `read_at`, `scan_at`
+  and `local_scan_kind_snapshot` take `storage.hold_version(..)` for the read's
+  duration; `RaftKvNode::hold_version` is the public primitive the backup
+  capture driver keeps across ticks. A new reader of a version-ceiling
+  (`get_at`/`scan_at`/`entries_at`) read must do the same, and a wrapper
+  `StorageEngine` (e.g. `StallingEngine`) must forward `hold_version`.

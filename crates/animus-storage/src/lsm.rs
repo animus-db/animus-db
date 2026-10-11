@@ -205,12 +205,25 @@ const L1_TABLE_BUDGET: usize = 4;
 /// the default flush threshold so a flush usually covers and removes one or more
 /// whole segments.
 const DEFAULT_WAL_SEGMENT_BYTES: u64 = 64 * 1024;
-/// Default tombstone GC grace, in **versions**: a tombstone (and the versions it
-/// shadows) is only reclaimed during compaction once it sits below
-/// `max_version - this`, so any historical read within the most-recent
-/// `this`-versions window is unaffected. Sized generously by default so GC is a
-/// no-op under ordinary use; the data plane / tests lower it to reclaim sooner.
-const DEFAULT_TOMBSTONE_GRACE_VERSIONS: Version = 1 << 20;
+/// Low bits of an HLC-packed version (`wall_ms << 20 | logical`); mirrors
+/// `animus-cp-data`'s `hlc::LOGICAL_BITS`. The storage crate stays HLC-agnostic
+/// (versions are opaque `u64`s to the engine); this only sizes the default grace.
+const HLC_LOGICAL_BITS: u32 = 20;
+/// Default tombstone GC grace, in **versions**, for an engine whose versions are
+/// HLC-packed (the data plane): `5_000 << 20`, i.e. **5 seconds of HLC wall
+/// time**. A tombstone (and the versions it shadows) is only reclaimed during
+/// compaction once it sits below `max_version - this`, so any historical read
+/// within the most-recent 5 s of wall time (a `TransactGetItems` snapshot read
+/// at its transaction timestamp, a backup chunk retry) is unaffected. Readers of
+/// older history take an explicit hold ([`StorageEngine::hold_version`]); this
+/// is only the floor under holds taken a moment too late. Not an on-disk format
+/// (it only decides what compaction keeps), so it needs no ADR 0073 bump.
+const DEFAULT_TOMBSTONE_GRACE_VERSIONS: Version = 5_000 << HLC_LOGICAL_BITS;
+/// Tombstone GC grace for an engine whose versions are **small sequence numbers**
+/// rather than HLC-packed ones — the control system keyspace, versioned at
+/// `raft_index + 1`. This is the pre-2026-10-10 default (`1 << 20` entries);
+/// the HLC-wall default above would be ~5e9 entries there, i.e. never reclaim.
+pub const RAW_VERSION_GRACE_VERSIONS: Version = 1 << 20;
 /// Max times a read re-snapshots + retries when a **concurrent compaction**
 /// removed an SSTable file mid-read. Reads snapshot the reader set under a brief
 /// lock then fetch blocks lock-free; a compaction swaps the readers and then
@@ -254,7 +267,9 @@ pub struct LsmOptions {
     /// group-commit batch rolls to a fresh segment file, so a flush can drop whole
     /// covered segments rather than rewriting one growing WAL.
     pub wal_segment_bytes: u64,
-    /// Tombstone GC grace, in **versions**. During compaction a tombstone (and the
+    /// Tombstone GC grace, in **versions** (default: 5 s of HLC wall time,
+    /// `5000 << 20`; a sequence-numbered engine uses [`LsmOptions::raw_versions`];
+    /// explicit reader pins are [`StorageEngine::hold_version`]). During compaction a tombstone (and the
     /// versions it shadows) is reclaimed only once its version is at or below the
     /// **GC floor** = `max_version.saturating_sub(this)` — and only when no deeper,
     /// uncompacted level could still hold an older value for that key (which would
@@ -306,6 +321,27 @@ impl LsmOptions {
     pub fn production() -> Self {
         Self {
             background_maintenance: true,
+            ..Self::default()
+        }
+    }
+
+    /// [`production`](Self::production) for an engine whose versions are small
+    /// sequence numbers (Raft log indexes), not HLC-packed: the control system
+    /// keyspace. Keeps the raw-version grace ([`RAW_VERSION_GRACE_VERSIONS`]).
+    #[must_use]
+    pub fn production_raw_versions() -> Self {
+        Self {
+            background_maintenance: true,
+            ..Self::raw_versions()
+        }
+    }
+
+    /// The defaults, with the raw-version grace ([`RAW_VERSION_GRACE_VERSIONS`])
+    /// for an engine versioned by sequence number rather than HLC.
+    #[must_use]
+    pub fn raw_versions() -> Self {
+        Self {
+            tombstone_grace_versions: RAW_VERSION_GRACE_VERSIONS,
             ..Self::default()
         }
     }
@@ -2867,6 +2903,15 @@ impl<E: Env> StorageEngine for LsmEngine<E> {
 
     fn latest_version(&self) -> Version {
         self.lock().manifest.max_version
+    }
+
+    fn hold_version(&self, version: Version) -> crate::VersionHold {
+        // The same refcounted pin an `LsmSnapshot` takes (compaction's GC floor
+        // stays strictly below the lowest held version), at an arbitrary
+        // caller-chosen version instead of the current `max_version`.
+        self.hold_snapshot(version);
+        let engine = self.clone();
+        crate::VersionHold::new(move || engine.release_snapshot(version))
     }
 }
 
