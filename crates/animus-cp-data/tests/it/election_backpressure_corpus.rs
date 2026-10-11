@@ -72,15 +72,20 @@ use animus_cp_data::campaign_governor::{
     Admission, CampaignGovernor, CampaignWake, ElectionBackpressure, GovernorFault,
 };
 use animus_cp_data::heartbeat_batch::{DEFAULT_HEARTBEAT_BATCH_INTERVAL, HeartbeatBatcher};
-use animus_cp_data::load_monitor::LoadMonitor;
+use animus_cp_data::host::{
+    DEFAULT_HOST_SETTLE_TIMEOUT, LeaderPreference, MemoryTabletEngines, MetadataView, Reconciler,
+};
+use animus_cp_data::load_monitor::{LoadMonitor, STRETCH_C};
 use animus_cp_data::{HostedOptions, KIND_BASE, RaftKvNode, StorageScope};
-use animus_env::{Clock, EnvExt, Metric, MetricsHandle, nid};
+use animus_env::{Clock, Env, EnvExt, Metric, MetricsHandle, NodeId, nid};
 use animus_sim::{CpuOrder, SimEnv, Simulator};
 use animus_storage::{MemoryEngine, StorageEngine};
+use animus_tablet::{KeyRange, Tablet, TabletId};
 use animus_test::corpus::{self, SeedVariant};
 use futures::executor::block_on;
 
 type KvNode = RaftKvNode<SimEnv, MemoryEngine>;
+type Recon = Reconciler<SimEnv, MemoryEngine>;
 
 const NODES: [u64; 3] = [0, 1, 2];
 /// Per-push group count (ADR 0078 Tier 1: G=300).
@@ -104,11 +109,13 @@ const EVENTS_PER_GROUP_PER_S: f64 = 24.6;
 
 /// `K`, the campaign cap the cells run with (ADR 0078 default).
 const K: usize = 32;
+/// `H`, the hosting stagger the reconciled cells run with (ADR 0078 default).
+const HOST_H: usize = 100;
 /// The election base of the LAN profile, as the groups run it.
 const BASE: Duration = Duration::from_millis(150);
 
-/// Which ADR 0078 mechanisms are on. Step 3 adds the campaign governor; step 4
-/// adds the lag stretch and step 5 staggered hosting as fields here.
+/// Which ADR 0078 mechanisms are on, and with which parameters (the calibration
+/// sweep varies `governor_k`, `gain`, `stretch_x` and `host_h`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Mechanisms {
     /// Campaign governor `K` (`0` = off).
@@ -118,6 +125,12 @@ struct Mechanisms {
     /// `lag_stretch_max_x` of the load monitor (`0` = off, the monitor is not
     /// even started).
     stretch_x: u64,
+    /// The stretch gain `c` (production: [`STRETCH_C`]).
+    gain: u64,
+    /// `host_unsettled_max` `H` of the host reconciler (`0` = off: every
+    /// pending tablet is hosted in one tick). Only cells that host through the
+    /// real `Reconciler` ([`Rig::host_reconciled`]) look at it.
+    host_h: usize,
 }
 
 impl Mechanisms {
@@ -126,33 +139,39 @@ impl Mechanisms {
         governor_k: 0,
         fault: GovernorFault::None,
         stretch_x: 0,
+        gain: STRETCH_C,
+        host_h: 0,
     };
     /// The campaign governor at the default `K`.
     const GOVERNOR: Mechanisms = Mechanisms {
         governor_k: K,
-        fault: GovernorFault::None,
-        stretch_x: 0,
+        ..Mechanisms::NONE
     };
-    /// Governor plus lag stretch at the default `lag_stretch_max_x` (4): what
-    /// `animusd` runs by default (ADR 0078 steps 3 and 4).
+    /// Governor plus lag stretch at the default `lag_stretch_max_x` (4), the
+    /// hosting stagger off: what `animusd` ran after ADR 0078 steps 3 and 4.
     const ALL: Mechanisms = Mechanisms {
         governor_k: K,
-        fault: GovernorFault::None,
         stretch_x: 4,
+        ..Mechanisms::NONE
+    };
+    /// All three mechanisms at their defaults (`K=32`, `c=4`, `S_max=4x`,
+    /// `H=100`): the production configuration. Cells that host through the
+    /// `Reconciler` use it.
+    const ALL_STAGGERED: Mechanisms = Mechanisms {
+        host_h: HOST_H,
+        ..Mechanisms::ALL
     };
     /// Governor plus an effectively unbounded stretch (`S_max = inf`,
     /// negative control (e)).
     const UNBOUNDED_STRETCH: Mechanisms = Mechanisms {
-        governor_k: K,
-        fault: GovernorFault::None,
         stretch_x: 1_000_000,
+        ..Mechanisms::GOVERNOR
     };
     /// The governor with a deliberate bug.
     const fn faulty(fault: GovernorFault) -> Mechanisms {
         Mechanisms {
-            governor_k: K,
             fault,
-            stretch_x: 0,
+            ..Mechanisms::GOVERNOR
         }
     }
 }
@@ -195,6 +214,25 @@ enum Kind {
     /// Cell 11: learners (non-voters), single-voter groups and quiesced groups
     /// never take a permit.
     NoPermits,
+    /// Cell 2: every group is hosted from a cold start through the real
+    /// per-node `Reconciler` (all three mechanisms at their defaults), the node
+    /// CPU already at `load` x steady demand. The ramp is observed: never more
+    /// than `H` unsettled groups, all hosted within `ceil(G/H) * T_settle`.
+    ColdStartStaggered,
+    /// Cell 3: converge, then stop node 1 (it leads a third of the groups),
+    /// keep it down for [`RESTART_GAP`], restart it: its groups re-host with the
+    /// stagger while the survivors have already re-elected.
+    NodeRestart,
+    /// Cell 2b and control (f): converge, then stop all three nodes and restart
+    /// them together. With `shuffled_restart` each node re-hosts in its own
+    /// shuffled order instead of ascending `TabletId`.
+    WholeClusterRestart,
+    /// Cell 9: three regions on WAN links, every tablet prefers region a; the
+    /// governors are saturated by ghosts and the CPU is loaded. The reconciler's
+    /// preferred-leader step (transfers, exempt from the governor) must still
+    /// move every leader to region a, with the WAN-profile term bound of
+    /// `wan_timing_corpus`.
+    PreferredLeaderStep,
 }
 
 #[derive(Clone)]
@@ -206,6 +244,8 @@ struct Cell {
     /// what the node can do).
     load: f64,
     mech: Mechanisms,
+    /// Control (f): the restarted nodes re-host in per-node shuffled order.
+    shuffled_restart: bool,
 }
 
 impl SeedVariant for Cell {
@@ -228,6 +268,7 @@ fn cell(name: &str, kind: Kind, load: f64, mech: Mechanisms) -> Cell {
         kind,
         load,
         mech,
+        shuffled_restart: false,
     }
 }
 
@@ -302,6 +343,31 @@ fn cells() -> Vec<Cell> {
             0.0,
             Mechanisms::GOVERNOR,
         ),
+        cell(
+            "cell_2_cold_start_staggered_all_mechanisms",
+            Kind::ColdStartStaggered,
+            0.9,
+            Mechanisms::ALL_STAGGERED,
+        ),
+        cell(
+            "cell_3_node_restart_rehosts_with_stagger",
+            Kind::NodeRestart,
+            0.9,
+            Mechanisms::ALL_STAGGERED,
+        ),
+        // The ascending-order whole-cluster restart control (f) is read against.
+        cell(
+            "cell_2b_whole_cluster_restart_ascending",
+            Kind::WholeClusterRestart,
+            0.9,
+            Mechanisms::ALL_STAGGERED,
+        ),
+        cell(
+            "cell_9_preferred_leader_step_under_saturation_wan",
+            Kind::PreferredLeaderStep,
+            0.9,
+            Mechanisms::ALL_STAGGERED,
+        ),
     ]
 }
 
@@ -344,6 +410,21 @@ fn controls_e() -> Vec<Cell> {
     );
     // Same seed as cell 4b, so the two runs differ only in the stretch cap.
     c.seed = corpus::name_seed("cell_4b_leader_node_loss_under_lag");
+    vec![c]
+}
+
+/// Negative control (f): per-node random hosting order on a whole-cluster
+/// restart. It shares cell 2b's seed, so the two runs are identical until the
+/// restart and differ only in the hosting order.
+fn controls_f() -> Vec<Cell> {
+    let mut c = cell(
+        "control_f_per_node_random_hosting_order_whole_cluster_restart",
+        Kind::WholeClusterRestart,
+        0.9,
+        Mechanisms::ALL_STAGGERED,
+    );
+    c.seed = corpus::name_seed("cell_2b_whole_cluster_restart_ascending");
+    c.shuffled_restart = true;
     vec![c]
 }
 
@@ -429,7 +510,42 @@ struct Rig {
     /// Replicas whose driver was halted (`shutdown`): their frozen handle
     /// must not count as a leader.
     halted: Vec<(usize, usize)>,
+    /// The mechanisms the rig was set up with (restarted nodes rebuild theirs).
+    mech: Mechanisms,
+    /// Hosting goes through the real per-node `host::Reconciler` (cells 2, 3, 9
+    /// and control (f)) instead of starting every replica by hand: `nodes` is
+    /// then empty and a replica is looked up in its node's reconciler
+    /// ([`Rig::replica`]); `placement[gi] == [0, 1, 2]`, so replica index ==
+    /// node index.
+    reconciled: bool,
+    /// Per-node durable engine registries, kept across a node restart.
+    engines: Vec<MemoryTabletEngines>,
+    recons: Vec<Option<Recon>>,
+    /// The metadata every reconciler is ticked with.
+    view: MetadataView,
+    /// Control (f): every node hosts fresh tablets in its own shuffled order
+    /// instead of ascending `TabletId`.
+    shuffled_hosting: bool,
+    /// Cell 9: the nodes sit in three regions on WAN links.
+    wan: bool,
+    /// Cell 9: every tablet advertises region `a` as its preferred leader
+    /// region, so the reconcilers' preferred-leader step acts.
+    prefer: bool,
+    /// Governors of node incarnations that were stopped (kept for the totals).
+    retired_governors: Vec<CampaignGovernor>,
+    /// Highest `hosting_ramp().unsettled` / `.deferred` any live reconciler
+    /// reported after a tick.
+    max_unsettled: usize,
+    max_deferred: usize,
+    /// How soon the reconciler loop wants its next tick (the production loop's
+    /// 500 ms fallback, or the ramp's own short wake).
+    next_recon_in: Duration,
 }
+
+/// The production reconciler loop's fallback cadence.
+const RECON_FALLBACK: Duration = Duration::from_millis(500);
+/// Seed of control (f)'s per-node hosting shuffles.
+const SHUFFLE_SEED: u64 = 0x5EED_0F0F;
 
 impl Rig {
     fn new(seed: u64, g: usize) -> Rig {
@@ -446,60 +562,81 @@ impl Rig {
             real_probe: false,
             live: [true; 3],
             halted: Vec::new(),
+            mech: Mechanisms::NONE,
+            reconciled: false,
+            engines: Vec::new(),
+            recons: Vec::new(),
+            view: MetadataView::default(),
+            shuffled_hosting: false,
+            wan: false,
+            prefer: false,
+            retired_governors: Vec::new(),
+            max_unsettled: 0,
+            max_deferred: 0,
+            next_recon_in: Duration::ZERO,
         }
     }
 
-    /// The per-node batchers and governors (ADR 0044 phase 2, ADR 0078).
-    fn setup(&mut self, mech: Mechanisms) {
-        self.batchers = NODES
-            .iter()
-            .enumerate()
-            .map(|(i, &id)| {
-                HeartbeatBatcher::new(
-                    self.sim.env(nid(id)),
-                    DEFAULT_HEARTBEAT_BATCH_INTERVAL,
+    /// One node's campaign governor (`None` = off).
+    fn make_governor(&self, i: usize) -> Option<CampaignGovernor> {
+        (self.mech.governor_k > 0).then(|| {
+            CampaignGovernor::with_fault(
+                self.mech.governor_k,
+                self.handles[i].clone(),
+                self.mech.fault,
+            )
+        })
+    }
+
+    /// One node's load monitor over its governor (`None` = lag stretch off).
+    /// The corpus feeds the monitor from the simulator's CPU queue
+    /// ([`Rig::probe`]) rather than from a probe task: the CPU model serves
+    /// expired timers ahead of waiting deliveries, so the timer-lateness probe
+    /// of `LoadMonitor::new` reads ~0 here (it is exercised on a paused node by
+    /// `load_monitor_task_measures_a_paused_node`).
+    fn make_monitor(&self, i: usize) -> Option<LoadMonitor> {
+        (self.mech.stretch_x > 0).then(|| {
+            if self.real_probe {
+                return LoadMonitor::new(
+                    &self.sim.env(nid(NODES[i])),
+                    self.mech.stretch_x,
+                    BASE,
                     self.handles[i].clone(),
-                )
-            })
-            .collect();
-        self.governors = (0..NODES.len())
-            .map(|i| {
-                (mech.governor_k > 0).then(|| {
-                    CampaignGovernor::with_fault(
-                        mech.governor_k,
+                    self.governors[i].clone(),
+                );
+            }
+            LoadMonitor::detached_with_gain(
+                self.mech.gain,
+                self.mech.stretch_x,
+                BASE,
+                self.handles[i].clone(),
+                self.governors[i].clone(),
+            )
+        })
+    }
+
+    /// The per-node batchers, governors and monitors (ADR 0044 phase 2, ADR
+    /// 0078). A reconciled rig leaves the batchers to the reconcilers.
+    fn setup(&mut self, mech: Mechanisms) {
+        self.mech = mech;
+        self.batchers = if self.reconciled {
+            Vec::new()
+        } else {
+            NODES
+                .iter()
+                .enumerate()
+                .map(|(i, &id)| {
+                    HeartbeatBatcher::new(
+                        self.sim.env(nid(id)),
+                        DEFAULT_HEARTBEAT_BATCH_INTERVAL,
                         self.handles[i].clone(),
-                        mech.fault,
                     )
                 })
-            })
-            .collect();
-        self.monitors = (0..NODES.len())
-            .map(|i| {
-                // The corpus feeds the monitor from the simulator's CPU queue
-                // ([`Rig::probe`]) rather than from a probe task: the CPU model
-                // serves expired timers ahead of waiting deliveries, so the
-                // timer-lateness probe of `LoadMonitor::new` reads ~0 here
-                // (it is exercised on a paused node by
-                // `load_monitor_task_measures_a_paused_node`).
-                (mech.stretch_x > 0).then(|| {
-                    if self.real_probe {
-                        return LoadMonitor::new(
-                            &self.sim.env(nid(NODES[i])),
-                            mech.stretch_x,
-                            BASE,
-                            self.handles[i].clone(),
-                            self.governors[i].clone(),
-                        );
-                    }
-                    LoadMonitor::detached(
-                        mech.stretch_x,
-                        BASE,
-                        self.handles[i].clone(),
-                        self.governors[i].clone(),
-                    )
-                })
-            })
-            .collect();
+                .collect()
+        };
+        self.governors = (0..NODES.len()).map(|i| self.make_governor(i)).collect();
+        let monitors: Vec<_> = (0..NODES.len()).map(|i| self.make_monitor(i)).collect();
+        self.monitors = monitors;
     }
 
     fn options(&self, node: usize) -> HostedOptions<SimEnv> {
@@ -540,6 +677,158 @@ impl Rig {
         }
     }
 
+    /// Region label of node `i` (cell 9).
+    fn region(i: usize) -> String {
+        ["region-a", "region-b", "region-c"][i].to_string()
+    }
+
+    /// The metadata every reconciler is ticked with: every group's tablet
+    /// replicated on all three nodes; in cell 9 also the node regions and the
+    /// preferred leader (region a) of every tablet.
+    fn build_view(&self) -> MetadataView {
+        let replicas: Vec<NodeId> = NODES.iter().map(|&n| nid(n)).collect();
+        let tablets = (0..self.g)
+            .map(|gi| {
+                let id = Self::tablet(gi);
+                (
+                    id,
+                    Tablet::new_for_table(id, "t", KeyRange::whole(), replicas.clone()),
+                )
+            })
+            .collect();
+        let (regions, preferred_leader) = if self.wan {
+            (
+                (0..3).map(|i| (nid(NODES[i]), Self::region(i))).collect(),
+                (0..self.g)
+                    .filter(|_| self.prefer)
+                    .map(|gi| {
+                        (
+                            Self::tablet(gi),
+                            LeaderPreference {
+                                region: Self::region(0),
+                                witness: None,
+                            },
+                        )
+                    })
+                    .collect(),
+            )
+        } else {
+            (BTreeMap::new(), BTreeMap::new())
+        };
+        MetadataView {
+            tablets,
+            regions,
+            preferred_leader,
+            ..Default::default()
+        }
+    }
+
+    /// Start advertising region `a` as every tablet's preferred leader region.
+    fn set_preferred(&mut self) {
+        self.prefer = true;
+        self.view = self.build_view();
+    }
+
+    fn tablet(gi: usize) -> TabletId {
+        TabletId(STREAM0 + gi as u64)
+    }
+
+    /// A fresh per-node `Reconciler` in the production configuration (heartbeat
+    /// batching, the node's governor and monitor, the hosting stagger).
+    fn make_recon(&self, i: usize) -> Recon {
+        let id = nid(NODES[i]);
+        let mut r: Recon = Reconciler::new(
+            self.sim.env(id.clone()),
+            self.engines[i].clone(),
+            id,
+            |_t, _n| {},
+            |_t| {},
+        );
+        r.enable_heartbeat_batching();
+        r.set_election_backpressure(ElectionBackpressure {
+            governor: self.governors[i].clone(),
+            monitor: self.monitors[i].clone(),
+        });
+        r.set_host_stagger(self.mech.host_h, DEFAULT_HOST_SETTLE_TIMEOUT);
+        if self.shuffled_hosting {
+            r.set_host_order_fault(Some(SHUFFLE_SEED + i as u64));
+        }
+        if self.wan {
+            r.set_max_region_rtt(crate::wan_timing_corpus::MAX_REGION_RTT);
+        }
+        r
+    }
+
+    /// Host all `g` RF3 groups through the real per-node `Reconciler`s (cells
+    /// 2, 3, 9 and control (f)): no group exists until a reconciler tick hosts
+    /// it, `mech.host_h` waves of them. [`Rig::reconcile`] ticks them.
+    ///
+    /// **Why a reconciler in the rig and not `host::plan` with a budget:** the
+    /// stagger is a property of the loop (the settle tracker, the ramp's own
+    /// short wake and the per-tick budget all live in `Reconciler::tick`), so
+    /// driving `plan` alone would test the arithmetic and not the loop. A
+    /// reconciler tick that only hosts never awaits a timer, so `block_on` is
+    /// safe (the `wan_timing_corpus` convention).
+    fn host_reconciled(&mut self, mech: Mechanisms) {
+        self.reconciled = true;
+        self.engines = (0..NODES.len())
+            .map(|_| MemoryTabletEngines::new())
+            .collect();
+        self.setup(mech);
+        self.placement = vec![vec![0, 1, 2]; self.g];
+        self.view = self.build_view();
+        self.recons = (0..NODES.len()).map(|i| Some(self.make_recon(i))).collect();
+        self.next_recon_in = Duration::ZERO;
+    }
+
+    /// One reconciler tick on every live node, then record the ramp numbers
+    /// and decide when the loop wants its next tick (the ramp's short wake, else
+    /// the 500 ms fallback).
+    fn reconcile(&mut self) {
+        let mut next = RECON_FALLBACK;
+        let Rig { recons, view, .. } = self;
+        for r in recons.iter_mut().flatten() {
+            block_on(r.tick(view));
+            let ramp = r.hosting_ramp();
+            self.max_unsettled = self.max_unsettled.max(ramp.unsettled);
+            self.max_deferred = self.max_deferred.max(ramp.deferred);
+            if let Some(w) = r.next_wake() {
+                next = next.min(w);
+            }
+        }
+        self.next_recon_in = next;
+    }
+
+    /// Whether every live node's reconciler has hosted every tablet.
+    fn all_hosted(&self) -> bool {
+        self.recons
+            .iter()
+            .flatten()
+            .all(|r| r.local_state().hosted.len() == self.g)
+    }
+
+    /// Stop node `i` as a process exit would: its tasks and reconciler are
+    /// gone, its durable disk and engine registry stay.
+    fn stop_node(&mut self, i: usize) {
+        self.sim.stop(nid(NODES[i]));
+        self.recons[i] = None;
+        self.live[i] = false;
+    }
+
+    /// Start a fresh process on node `i` after [`Rig::stop_node`]: new governor,
+    /// monitor and reconciler (no memory of the old incarnation), the same
+    /// engine registry and Raft WAL, `LocalState::default()`.
+    fn start_node(&mut self, i: usize) {
+        if let Some(g) = self.governors[i].take() {
+            self.retired_governors.push(g);
+        }
+        self.governors[i] = self.make_governor(i);
+        self.monitors[i] = self.make_monitor(i);
+        self.recons[i] = Some(self.make_recon(i));
+        self.live[i] = true;
+        self.next_recon_in = Duration::ZERO;
+    }
+
     /// Give every node the CPU cost that makes steady demand `load` x
     /// capacity. `load == 0` removes the cost.
     fn set_load(&self, load: f64) {
@@ -577,26 +866,65 @@ impl Rig {
         self.live[self.placement[gi][ri]] && !self.halted.contains(&(gi, ri))
     }
 
+    /// Replica `ri` of group `gi`, if it is hosted (always, unless the rig
+    /// hosts through reconcilers and this one has not been hosted yet or its
+    /// node is stopped).
+    fn replica(&self, gi: usize, ri: usize) -> Option<&KvNode> {
+        if self.reconciled {
+            self.recons[self.placement[gi][ri]]
+                .as_ref()?
+                .hosted_node(Self::tablet(gi))
+        } else {
+            self.nodes.get(gi)?.get(ri)
+        }
+    }
+
+    /// The hosted replicas of group `gi` with their replica index.
+    fn replicas(&self, gi: usize) -> Vec<(usize, &KvNode)> {
+        (0..self.placement[gi].len())
+            .filter_map(|ri| self.replica(gi, ri).map(|n| (ri, n)))
+            .collect()
+    }
+
+    /// Every hosted replica of every group.
+    fn all_replicas(&self) -> Vec<&KvNode> {
+        (0..self.g)
+            .flat_map(|gi| self.replicas(gi).into_iter().map(|(_, n)| n))
+            .collect()
+    }
+
     /// The index of the replica of `gi` leading on a live node, if any.
     fn live_leader(&self, gi: usize) -> Option<usize> {
-        self.nodes[gi]
-            .iter()
-            .enumerate()
-            .position(|(ri, n)| self.replica_live(gi, ri) && n.is_leader())
+        self.replicas(gi)
+            .into_iter()
+            .find(|(ri, n)| self.replica_live(gi, *ri) && n.is_leader())
+            .map(|(ri, _)| ri)
     }
 
     /// Groups led by a replica on a live node.
     fn led(&self) -> usize {
-        (0..self.nodes.len())
+        (0..self.g)
             .filter(|&gi| self.live_leader(gi).is_some())
+            .count()
+    }
+
+    /// Groups whose replica on node `ni` is the leader.
+    fn led_by(&self, ni: usize) -> usize {
+        (0..self.g)
+            .filter(|&gi| self.replica(gi, ni).is_some_and(KvNode::is_leader))
             .count()
     }
 
     /// Groups with exactly one leader among all replicas (live or not).
     fn exactly_one_leader(&self) -> usize {
-        self.nodes
-            .iter()
-            .filter(|rs| rs.iter().filter(|n| n.is_leader()).count() == 1)
+        (0..self.g)
+            .filter(|&gi| {
+                self.replicas(gi)
+                    .iter()
+                    .filter(|(_, n)| n.is_leader())
+                    .count()
+                    == 1
+            })
             .count()
     }
 
@@ -605,8 +933,13 @@ impl Rig {
     fn churn(&self) -> (u64, u64) {
         let mut sum = 0;
         let mut max = 0;
-        for rs in &self.nodes {
-            let t = rs.iter().map(KvNode::term).max().unwrap_or(0);
+        for gi in 0..self.g {
+            let t = self
+                .replicas(gi)
+                .iter()
+                .map(|(_, n)| n.term())
+                .max()
+                .unwrap_or(0);
             sum += t.saturating_sub(1);
             max = max.max(t);
         }
@@ -672,7 +1005,12 @@ impl Rig {
     /// Governor numbers summed over the nodes (max for the high-water marks).
     fn gov_totals(&self) -> GovTotals {
         let mut t = GovTotals::default();
-        for g in self.governors.iter().flatten() {
+        for g in self
+            .governors
+            .iter()
+            .flatten()
+            .chain(&self.retired_governors)
+        {
             let s = g.stats();
             t.inflight_hwm = t.inflight_hwm.max(s.inflight_hwm);
             t.nonexempt_hwm = t.nonexempt_hwm.max(s.nonexempt_hwm);
@@ -740,8 +1078,8 @@ impl Sampler {
     fn sample(&mut self, rig: &Rig, at_s: f64) {
         let led = rig.led();
         let (churn_sum, max_term) = rig.churn();
-        for (gi, rs) in rig.nodes.iter().enumerate() {
-            for (ri, r) in rs.iter().enumerate() {
+        for gi in 0..rig.g {
+            for (ri, r) in rig.replicas(gi) {
                 if r.is_leader() {
                     self.leaders.entry((gi, r.term())).or_default().insert(ri);
                 }
@@ -797,6 +1135,23 @@ struct Report {
     /// node again.
     recovery_s: Option<f64>,
     gov: GovTotals,
+    /// Reconciled cells: the largest `hosting_ramp().unsettled` / `.deferred` a
+    /// live reconciler reported (since the last restart, in restart cells).
+    max_unsettled: usize,
+    max_deferred: usize,
+    /// Reconciled cells: seconds until every live reconciler had hosted every
+    /// tablet (from the start, or from the restart in restart cells).
+    hosted_all_s: Option<f64>,
+    /// Restart cells: seconds from the (last) node start until every group was
+    /// led by a live node.
+    since_restart_s: Option<f64>,
+    /// Restart cells: group-seconds without a leader since the restart (the
+    /// area under the leaderless count; finer than the first-all-led sample).
+    leaderless_gs: f64,
+    /// Cell 9: the largest per-group term growth after the governors were
+    /// saturated, and how many groups ended led from region a.
+    term_growth: u64,
+    led_in_a: usize,
     /// Highest dead-banded monitor lag seen at a sample, in ms (0 = stretch off
     /// or never above the dead band), and the highest stretch it implied.
     max_lag_ms: u64,
@@ -824,6 +1179,13 @@ struct Limits {
     /// Cells that overload the node: the monitor must have read a lag, or the
     /// stretch clauses are vacuous.
     expect_lag: bool,
+    /// `H` the reconcilers ran with (`0` = no ramp clauses).
+    host_h: usize,
+    /// Check that every tablet was hosted everywhere within the ramp bound.
+    ramp_bound: bool,
+    /// Whether the led count must stay monotone after convergence (not in a
+    /// cell whose steady state moves leaders on purpose).
+    monotone: bool,
 }
 
 impl Limits {
@@ -834,12 +1196,16 @@ impl Limits {
         governor_k: 0,
         stretch_x: 0,
         expect_lag: false,
+        host_h: 0,
+        ramp_bound: false,
+        monotone: true,
     };
 
     fn for_cell(c: &Cell) -> Limits {
         let base = Limits {
             governor_k: c.mech.governor_k,
             stretch_x: c.mech.stretch_x,
+            host_h: c.mech.host_h,
             expect_lag: matches!(
                 c.kind,
                 Kind::SustainedOverload | Kind::OverloadThenRelief | Kind::LeaderLossUnderLag
@@ -876,6 +1242,32 @@ impl Limits {
                 recovery_s: Some(10.0),
                 ..base
             },
+            Kind::ColdStartStaggered => Limits {
+                ramp_bound: true,
+                ..base
+            },
+            // One third of the groups lose their leader with the node.
+            Kind::NodeRestart => Limits {
+                churn_per_group: 0.75,
+                recovery_s: Some(5.0),
+                ramp_bound: true,
+                ..base
+            },
+            // Every group re-elects after the restart: about a term each.
+            Kind::WholeClusterRestart => Limits {
+                churn_per_group: 1.5,
+                recovery_s: Some(15.0),
+                ramp_bound: true,
+                ..base
+            },
+            // Leaders move on purpose, so the led count is not monotone; the
+            // WAN groups' initial election is slow.
+            Kind::PreferredLeaderStep => Limits {
+                all_led_s: 20.0,
+                churn_per_group: 2.0,
+                monotone: false,
+                ..base
+            },
         }
     }
 
@@ -903,8 +1295,27 @@ impl Limits {
         if r.acked == 0 {
             v.push("harness: no write was ever acked, the durability check is vacuous");
         }
-        if r.led_drop > 0 {
+        if self.monotone && r.led_drop > 0 {
             v.push("monotone: led count fell after first convergence");
+        }
+        if self.host_h > 0 {
+            if r.max_unsettled > self.host_h {
+                v.push("ramp: more than H freshly hosted groups were unsettled at once");
+            }
+            if r.max_deferred == 0 && r.groups > self.host_h {
+                v.push(
+                    "harness: the stagger never deferred a tablet, the ramp clauses are vacuous",
+                );
+            }
+        }
+        if self.ramp_bound {
+            match r.hosted_all_s {
+                None => v.push("liveness: a node never hosted every tablet"),
+                Some(t) if t > ramp_bound_s(r.groups, self.host_h) => {
+                    v.push("ramp: hosting took longer than ceil(G/H) * T_settle");
+                }
+                Some(_) => {}
+            }
         }
         if let Some(bound) = self.recovery_s {
             match r.recovery_s {
@@ -932,6 +1343,15 @@ impl Limits {
     }
 }
 
+/// ADR 0078 "Staggered hosting", liveness: the ramp takes at most
+/// `ceil(G/H) * T_settle` (`T_settle` the settle timeout, the worst case of a
+/// group that never hears a leader), plus one reconciler wake (50 ms) per wave
+/// and 100 ms of slack. `H = 0` (no stagger) is one tick.
+fn ramp_bound_s(groups: usize, h: usize) -> f64 {
+    let waves = if h == 0 { 1 } else { groups.div_ceil(h) } as f64;
+    waves * DEFAULT_HOST_SETTLE_TIMEOUT.as_secs_f64() + waves * 0.05 + 0.1
+}
+
 fn is_safety(clause: &str) -> bool {
     clause.starts_with("safety")
 }
@@ -952,11 +1372,13 @@ struct Writes {
 impl Writes {
     /// Propose one write on every `every`-th group's current (live) leader.
     fn propose(&mut self, rig: &Rig, every: usize) {
-        for gi in (0..rig.nodes.len()).step_by(every) {
+        for gi in (0..rig.g).step_by(every) {
             let Some(ri) = rig.live_leader(gi) else {
                 continue;
             };
-            let n = &rig.nodes[gi][ri];
+            let Some(n) = rig.replica(gi, ri) else {
+                continue;
+            };
             let key = format!("w{:06}", self.next).into_bytes();
             self.next += 1;
             if let ProposeResult::Accepted { index, term } = n.put(key.clone(), b"v".to_vec()) {
@@ -967,7 +1389,10 @@ impl Writes {
 
     fn settle(&mut self, rig: &Rig) {
         for (gi, ri, key, index, term) in std::mem::take(&mut self.pending) {
-            let n = &rig.nodes[gi][ri];
+            // A replica that is gone (its node restarted) never acks.
+            let Some(n) = rig.replica(gi, ri) else {
+                continue;
+            };
             if n.term() == term && n.engine_applied_index() >= index {
                 self.acked.push((gi, key));
             } else if n.term() == term && rig.replica_live(gi, ri) {
@@ -981,7 +1406,7 @@ impl Writes {
         self.acked
             .iter()
             .filter(|(gi, key)| {
-                rig.nodes[*gi].iter().enumerate().any(|(ri, n)| {
+                rig.replicas(*gi).into_iter().any(|(ri, n)| {
                     if !rig.replica_live(*gi, ri)
                         || !n.config().contains(&nid(NODES[rig.placement[*gi][ri]]))
                     {
@@ -1031,6 +1456,12 @@ struct Run {
     max_lag: Duration,
     max_stretch: Duration,
     since_probe: Duration,
+    /// Reconciled cells: when hosting (or the last restart) began, and how long
+    /// until every live reconciler had hosted every tablet.
+    hosting_from: Duration,
+    hosted_all_s: Option<f64>,
+    /// When the last node (re)start happened, in seconds.
+    restart_at_s: Option<f64>,
 }
 
 impl Run {
@@ -1044,25 +1475,55 @@ impl Run {
             max_lag: Duration::ZERO,
             max_stretch: Duration::ZERO,
             since_probe: Duration::ZERO,
+            hosting_from: Duration::ZERO,
+            hosted_all_s: None,
+            restart_at_s: None,
         }
     }
 
+    /// A node (re)start begins now: the ramp readings start over.
+    fn begin_restart(&mut self) {
+        self.hosting_from = self.at;
+        self.hosted_all_s = None;
+        self.restart_at_s = Some(self.at.as_secs_f64());
+        self.rig.max_unsettled = 0;
+        self.rig.max_deferred = 0;
+    }
+
     /// Run the simulator for `step`, taking a lag probe every
-    /// [`animus_cp_data::load_monitor::PROBE`] of virtual time.
+    /// [`animus_cp_data::load_monitor::PROBE`] of virtual time and, on a
+    /// reconciled rig, ticking the reconcilers on their own cadence (the
+    /// ramp's 50 ms wake, else the 500 ms fallback).
     fn run_probed(&mut self, step: Duration) {
-        if self.rig.monitors.iter().all(Option::is_none) {
+        let probed = self.rig.monitors.iter().any(Option::is_some);
+        let reconciled = self.rig.reconciled;
+        if !probed && !reconciled {
             self.rig.sim.run_for(step);
             return;
         }
         let mut left = step;
         while !left.is_zero() {
-            let chunk = left.min(animus_cp_data::load_monitor::PROBE - self.since_probe);
+            if reconciled && self.rig.next_recon_in.is_zero() {
+                self.rig.reconcile();
+            }
+            let mut chunk = left;
+            if probed {
+                chunk = chunk.min(animus_cp_data::load_monitor::PROBE - self.since_probe);
+            }
+            if reconciled {
+                chunk = chunk.min(self.rig.next_recon_in);
+            }
             self.rig.sim.run_for(chunk);
             left -= chunk;
-            self.since_probe += chunk;
-            if self.since_probe >= animus_cp_data::load_monitor::PROBE {
-                self.since_probe = Duration::ZERO;
-                self.rig.probe();
+            if reconciled {
+                self.rig.next_recon_in -= chunk;
+            }
+            if probed {
+                self.since_probe += chunk;
+                if self.since_probe >= animus_cp_data::load_monitor::PROBE {
+                    self.since_probe = Duration::ZERO;
+                    self.rig.probe();
+                }
             }
         }
     }
@@ -1074,6 +1535,9 @@ impl Run {
             self.run_probed(step);
             self.at += step;
             self.s.sample(&self.rig, self.at.as_secs_f64());
+            if self.rig.reconciled && self.hosted_all_s.is_none() && self.rig.all_hosted() {
+                self.hosted_all_s = Some((self.at - self.hosting_from).as_secs_f64());
+            }
             for m in self.rig.monitors.iter().flatten() {
                 self.max_lag = self.max_lag.max(m.lag());
                 self.max_stretch = self.max_stretch.max(m.stretch(BASE));
@@ -1117,6 +1581,8 @@ impl Run {
             cell,
             max_lag,
             max_stretch,
+            hosted_all_s,
+            restart_at_s,
             ..
         } = self;
         let g = rig.g;
@@ -1135,6 +1601,19 @@ impl Run {
             lost_acked: w.lost(&rig),
             recovery_s: s.recovered_at_s.zip(s.fault_at_s).map(|(r, f)| r - f),
             gov: rig.gov_totals(),
+            max_unsettled: rig.max_unsettled,
+            max_deferred: rig.max_deferred,
+            hosted_all_s,
+            since_restart_s: s.recovered_at_s.zip(restart_at_s).map(|(r, f)| r - f),
+            leaderless_gs: restart_at_s.map_or(0.0, |r0| {
+                s.series
+                    .windows(2)
+                    .filter(|w| w[1].at_s > r0)
+                    .map(|w| (g - w[1].led) as f64 * (w[1].at_s - w[0].at_s))
+                    .sum()
+            }),
+            term_growth: 0,
+            led_in_a: 0,
             max_lag_ms: max_lag.as_millis() as u64,
             max_stretch_ms: max_stretch.as_millis() as u64,
             extra,
@@ -1149,6 +1628,7 @@ impl Run {
             }
         }
         drop(rig.nodes);
+        drop(rig.recons);
         rig.sim.shutdown();
         report
     }
@@ -1190,7 +1670,7 @@ fn run_cell(c: &Cell, g: usize) -> Report {
             r.converge_and_write();
             r.rig.set_load(c.load);
             r.advance(LAG_BUILDUP, SAMPLE, true);
-            let led_by_dead = r.rig.nodes.iter().filter(|rs| rs[0].is_leader()).count();
+            let led_by_dead = r.rig.led_by(0);
             r.rig.set_load(0.0);
             r.s.begin_fault(r.at.as_secs_f64());
             r.rig.kill(0);
@@ -1203,7 +1683,164 @@ fn run_cell(c: &Cell, g: usize) -> Report {
         Kind::TransferUnderSaturation => run_transfer(r, c),
         Kind::LostLeaderBound => run_lost_leader(r, c),
         Kind::NoPermits => run_no_permits(r, c),
+        Kind::ColdStartStaggered => run_cold_start_staggered(r, c),
+        Kind::NodeRestart => run_node_restart(r, c),
+        Kind::WholeClusterRestart => run_whole_cluster_restart(r, c),
+        Kind::PreferredLeaderStep => run_preferred_leader_step(r, c),
     }
+}
+
+/// How long node 1 stays down in cell 3.
+const RESTART_GAP: Duration = Duration::from_secs(3);
+
+/// Cell 2: cold start through the reconcilers, all mechanisms on.
+fn run_cold_start_staggered(mut r: Run, c: &Cell) -> Report {
+    r.rig.set_load(c.load);
+    r.rig.host_reconciled(c.mech);
+    r.advance(COLD_WINDOW, SAMPLE, false);
+    r.w.propose(&r.rig, 10);
+    r.advance(Duration::from_secs(5), SAMPLE, true);
+    r.finish(Vec::new(), String::new())
+}
+
+/// Cell 3: node 1 (a third of the leaders) is stopped and restarted; its
+/// groups re-host in waves.
+fn run_node_restart(mut r: Run, c: &Cell) -> Report {
+    r.rig.host_reconciled(c.mech);
+    r.converge_and_write();
+    r.rig.set_load(c.load);
+    let led_by_stopped = r.rig.led_by(1);
+    r.s.begin_fault(r.at.as_secs_f64());
+    r.rig.stop_node(1);
+    r.advance(RESTART_GAP, FINE, true);
+    // The survivors have re-elected by now; the restarted node then re-hosts
+    // its 300 groups under the stagger.
+    let survivors_led = r.rig.led();
+    r.begin_restart();
+    r.rig.start_node(1);
+    r.advance(FAULT_WINDOW, FINE, true);
+    r.w.propose(&r.rig, 10);
+    r.advance(Duration::from_secs(5), SAMPLE, true);
+    let mut extra = Vec::new();
+    if survivors_led != r.rig.g {
+        extra.push("liveness: the survivors had not re-elected every group before the restart");
+    }
+    let detail = format!("led_by_stopped_node={led_by_stopped} survivors_led={survivors_led}");
+    r.finish(extra, detail)
+}
+
+/// Cell 2b and control (f): all three nodes stop and restart together.
+fn run_whole_cluster_restart(mut r: Run, c: &Cell) -> Report {
+    r.rig.host_reconciled(c.mech);
+    r.converge_and_write();
+    r.rig.set_load(c.load);
+    r.s.begin_fault(r.at.as_secs_f64());
+    for i in 0..NODES.len() {
+        r.rig.stop_node(i);
+    }
+    r.advance(Duration::from_secs(1), FINE, false);
+    // The hosting order is the one variable of control (f).
+    r.rig.shuffled_hosting = c.shuffled_restart;
+    r.begin_restart();
+    for i in 0..NODES.len() {
+        r.rig.start_node(i);
+    }
+    r.advance(Duration::from_secs(30), FINE, false);
+    r.w.propose(&r.rig, 10);
+    r.advance(Duration::from_secs(5), SAMPLE, true);
+    r.finish(Vec::new(), String::new())
+}
+
+/// Cell 9: the preferred-leader step on three WAN regions with saturated
+/// governors.
+fn run_preferred_leader_step(mut r: Run, c: &Cell) -> Report {
+    use crate::wan_timing_corpus::{MAX_TERM_GROWTH, WAN_ONE_WAY_MS, wan_link};
+    for ((i, j), ms) in WAN_ONE_WAY_MS {
+        let cfg = wan_link(ms);
+        r.rig
+            .sim
+            .set_link_net_config(nid(NODES[i]), nid(NODES[j]), cfg.clone());
+        r.rig
+            .sim
+            .set_link_net_config(nid(NODES[j]), nid(NODES[i]), cfg);
+    }
+    r.rig.wan = true;
+    r.rig.host_reconciled(c.mech);
+    // The WAN groups' first election takes up to two of their (>= 1 s) bases.
+    r.advance(Duration::from_secs(8), SAMPLE, false);
+    r.w.propose(&r.rig, 10);
+    r.advance(Duration::from_secs(2), SAMPLE, true);
+    let base_terms: Vec<u64> = (0..r.rig.g)
+        .map(|gi| {
+            r.rig
+                .replicas(gi)
+                .iter()
+                .map(|(_, n)| n.term())
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    // From here the governors are saturated and the CPU is loaded: the step's
+    // transfers must still go through.
+    r.rig.spawn_ghosts(3 * K);
+    r.rig.set_load(c.load);
+    r.advance(Duration::from_secs(3), SAMPLE, true);
+    // Now the operator's `SetGlobalPreferredLeader`: a transfer is needed for
+    // the two thirds of the groups whose leader sits in region b or c.
+    r.rig.set_preferred();
+    let all_in_a = |rig: &Rig| rig.led_by(0) == rig.g;
+    let converged = r.advance_until(Duration::from_secs(120), SAMPLE, all_in_a);
+    r.advance(Duration::from_secs(20), SAMPLE, true);
+    let mut extra = Vec::new();
+    if converged.is_none() {
+        extra.push("preferred: not every leader reached the preferred region");
+    }
+    let led_in_a = r.rig.led_by(0);
+    if led_in_a != r.rig.g {
+        extra.push("preferred: a leader left the preferred region again");
+    }
+    let growth = (0..r.rig.g)
+        .map(|gi| {
+            let t = r
+                .rig
+                .replicas(gi)
+                .iter()
+                .map(|(_, n)| n.term())
+                .max()
+                .unwrap_or(0);
+            t.saturating_sub(base_terms[gi])
+        })
+        .max()
+        .unwrap_or(0);
+    // `wan_timing_corpus`'s bound, unchanged: a group's term moves by at most
+    // `MAX_TERM_GROWTH` after its first election (here: one transfer plus the
+    // odd retry).
+    if growth > MAX_TERM_GROWTH {
+        extra.push("wan: a group's term grew by more than wan_timing_corpus' MAX_TERM_GROWTH");
+    }
+    let hwm = r.rig.gov_totals();
+    if hwm.inflight_hwm <= K {
+        extra.push("harness: the governors were not saturated");
+    }
+    let transfers: u64 = (0..NODES.len())
+        .map(|i| {
+            r.rig
+                .sim
+                .env(nid(NODES[i]))
+                .metrics()
+                .get(Metric::CpPreferredLeaderTransfers)
+        })
+        .sum();
+    if transfers == 0 {
+        extra.push("harness: the preferred-leader step never transferred anything");
+    }
+    let detail = format!(
+        "to_region_a_s={converged:?} term_growth={growth} transfers={transfers} governor={hwm:?}"
+    );
+    let mut report = r.finish(extra, detail);
+    report.term_growth = growth;
+    report.led_in_a = led_in_a;
+    report
 }
 
 /// Cell 4 (and control (c)): quiesce everything, kill the node leading a third
@@ -1211,28 +1848,24 @@ fn run_cell(c: &Cell, g: usize) -> Report {
 fn run_leader_node_loss(mut r: Run, c: &Cell) -> Report {
     r.rig.host(c.mech);
     r.converge_and_write();
-    for rs in &r.rig.nodes {
-        for n in rs {
-            n.enable_quiescence(Duration::from_secs(2));
-        }
+    for n in r.rig.all_replicas() {
+        n.enable_quiescence(Duration::from_secs(2));
     }
     let quiesced = r.advance_until(Duration::from_secs(40), Duration::from_secs(1), |rig| {
-        rig.nodes
-            .iter()
-            .all(|rs| rs.iter().all(KvNode::is_quiesced))
+        rig.all_replicas().into_iter().all(KvNode::is_quiesced)
     });
     let mut extra = Vec::new();
     if quiesced.is_none() {
         extra.push("harness: the groups did not all quiesce before the fault");
     }
-    let led_by_dead = r.rig.nodes.iter().filter(|rs| rs[0].is_leader()).count();
+    let led_by_dead = r.rig.led_by(0);
     r.rig.set_load(c.load);
     r.s.begin_fault(r.at.as_secs_f64());
     r.rig.kill(0);
     // The reconciler's `down`-driven wake: every group whose replica set
     // contains the down node is woken on the survivors, all in one pass.
-    for rs in &r.rig.nodes {
-        for n in &rs[1..] {
+    for gi in 0..r.rig.g {
+        for (_, n) in r.rig.replicas(gi).into_iter().filter(|(ri, _)| *ri > 0) {
             n.wake();
         }
     }
@@ -1276,14 +1909,16 @@ fn run_transfer(mut r: Run, c: &Cell) -> Report {
     r.advance(Duration::from_secs(3), SAMPLE, true);
     let mut extra = Vec::new();
     let gi = 0;
-    let from = r.rig.nodes[gi]
+    let from = r
+        .rig
+        .replicas(gi)
         .iter()
-        .position(KvNode::is_leader)
+        .position(|(_, n)| n.is_leader())
         .expect("group 0 is led");
     let to = (from + 1) % NODES.len();
     let armed = r.rig.nodes[gi][from].transfer_leadership(nid(NODES[to]));
     let took = r.advance_until(Duration::from_secs(2), Duration::from_millis(10), |rig| {
-        rig.nodes[gi][to].is_leader()
+        rig.replica(gi, to).is_some_and(KvNode::is_leader)
     });
     if !armed {
         extra.push("harness: the transfer was not armed");
@@ -1319,19 +1954,20 @@ fn run_lost_leader(mut r: Run, c: &Cell) -> Report {
         .max()
         .unwrap_or(0);
     let gi = 0;
-    let ri = r.rig.nodes[gi]
+    let ri = r
+        .rig
+        .replicas(gi)
         .iter()
-        .position(KvNode::is_leader)
+        .position(|(_, n)| n.is_leader())
         .expect("group 0 is led");
     r.s.begin_fault(r.at.as_secs_f64());
-    r.rig.nodes[gi][ri].shutdown();
+    r.rig.replica(gi, ri).expect("hosted").shutdown();
     // The halted replica's frozen handle still reports `is_leader`.
     r.rig.halted.push((gi, ri));
     let delay = r.advance_until(Duration::from_secs(8), Duration::from_millis(10), |rig| {
-        rig.nodes[gi]
+        rig.replicas(gi)
             .iter()
-            .enumerate()
-            .any(|(j, n)| j != ri && n.is_leader())
+            .any(|(j, n)| *j != ri && n.is_leader())
     });
     // `delay <= 2*base_eff + ceil(Q/K_eff) * T_hold_max`, `T_hold_max =
     // 2*base_eff` (ADR 0078, "Lost-leader liveness bound"); `base_eff = base`
@@ -1394,10 +2030,8 @@ fn run_no_permits(mut r: Run, c: &Cell) -> Report {
         extra.push("permits: a learner or single-voter group touched node 2's governor");
     }
     // Quiesce everything and watch the permit count stay put.
-    for rs in &r.rig.nodes {
-        for n in rs {
-            n.enable_quiescence(Duration::from_secs(2));
-        }
+    for n in r.rig.all_replicas() {
+        n.enable_quiescence(Duration::from_secs(2));
     }
     let quiesced = r.advance_until(Duration::from_secs(40), Duration::from_secs(1), |rig| {
         rig.nodes[..VOTER_GROUPS]
@@ -1602,6 +2236,55 @@ fn control_c_gating_the_responder_slows_recovery() {
     }
 }
 
+/// NEGATIVE CONTROL (f): a per-node random hosting order instead of ascending
+/// `TabletId`. On a whole-cluster restart every node derives the same ascending
+/// order from replicated metadata, so a tablet's three replicas are in the
+/// same wave and can elect together; per-node orders spread them over different
+/// waves, and the time until every group has a leader (a quorum) is longer.
+/// The two runs share a seed and are identical until the restart.
+#[test]
+fn control_f_per_node_hosting_order_delays_quorum() {
+    let ascending = cells()
+        .into_iter()
+        .find(|c| c.name == "cell_2b_whole_cluster_restart_ascending")
+        .expect("cell 2b");
+    for f in select(controls_f()) {
+        let mut a = ascending.clone();
+        a.seed = f.seed;
+        let ra = run_cell(&a, groups());
+        let rf = run_cell(&f, groups());
+        let va = Limits::for_cell(&a).violations(&ra);
+        let vf = Limits::for_cell(&f).violations(&rf);
+        eprintln!("BP-CONTROL {} seed={:#x} {vf:?} {rf:?}", f.name, f.seed);
+        eprintln!("BP-CONTROL-BASELINE ascending {va:?} {ra:?}");
+        assert!(va.is_empty(), "the ascending run must pass: {va:?} {ra:?}");
+        assert!(
+            vf.iter().all(|x| !is_safety(x)),
+            "{} seed={:#x}: safety must hold: {vf:?} {rf:?}",
+            f.name,
+            f.seed
+        );
+        let asc = ra.since_restart_s.expect("ascending run recovers");
+        // A shuffled run that never recovers is the deferred-retry permit leak
+        // (a deferred PreCandidate re-took an exempt slot and left the queue),
+        // not a slower order: it is a failure, not a pass.
+        match rf.since_restart_s {
+            None => panic!("{} seed={:#x}: never recovered: {rf:?}", f.name, f.seed),
+            Some(t) => {
+                assert!(
+                    t >= asc && rf.leaderless_gs > ra.leaderless_gs,
+                    "{} seed={:#x}: shuffled order took {t}s / {} leaderless group-s, \
+                     not worse than ascending {asc}s / {}",
+                    f.name,
+                    f.seed,
+                    rf.leaderless_gs,
+                    ra.leaderless_gs
+                );
+            }
+        }
+    }
+}
+
 /// NEGATIVE CONTROL (d): permits that are never returned (no RAII release).
 /// The lost-leader bound of cell 10 must be violated.
 #[test]
@@ -1658,12 +2341,13 @@ fn names_and_seeds_are_unique_and_frozen() {
         .chain(controls_c())
         .chain(controls_d())
         .chain(controls_e())
+        .chain(controls_f())
         .collect();
     let names: BTreeSet<&str> = all.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names.len(), all.len());
     for c in &all {
-        // Control (e) deliberately shares cell 4b's seed.
-        if !c.name.starts_with("control_e") {
+        // Controls (e) and (f) deliberately share a cell's seed.
+        if !c.name.starts_with("control_e") && !c.name.starts_with("control_f") {
             assert_eq!(c.seed, corpus::name_seed(&c.name));
         }
     }

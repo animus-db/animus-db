@@ -72,10 +72,17 @@ pub fn reading(lag: u64) -> u64 {
 /// `max_x == 0` disables it.
 #[must_use]
 pub fn stretch_nanos(lag: u64, base: Duration, max_x: u64) -> u64 {
+    stretch_nanos_with_gain(lag, base, max_x, STRETCH_C)
+}
+
+/// [`stretch_nanos`] with an explicit gain `c` (the calibration sweep's knob;
+/// production always uses [`STRETCH_C`]).
+#[must_use]
+pub fn stretch_nanos_with_gain(lag: u64, base: Duration, max_x: u64, c: u64) -> u64 {
     let cap = u64::try_from(base.as_nanos())
         .unwrap_or(u64::MAX)
         .saturating_mul(max_x);
-    reading(lag).saturating_mul(STRETCH_C).min(cap)
+    reading(lag).saturating_mul(c).min(cap)
 }
 
 /// The effective campaign cap for an estimate: `K`, `K/2` at >= 30 ms, `K/4`
@@ -97,6 +104,8 @@ struct Inner {
     /// The raw smoothed estimate, nanoseconds (before the dead band).
     lag: AtomicU64,
     max_x: u64,
+    /// The stretch gain `c` ([`STRETCH_C`] unless a calibration run overrides it).
+    gain: u64,
     /// The node's default election base, for the published stretch metric.
     base: Duration,
     metrics: MetricsHandle,
@@ -145,9 +154,23 @@ impl LoadMonitor {
         metrics: MetricsHandle,
         governor: Option<CampaignGovernor>,
     ) -> Self {
+        Self::detached_with_gain(STRETCH_C, max_x, base, metrics, governor)
+    }
+
+    /// [`detached`](Self::detached) with an explicit stretch gain `c`, for the
+    /// ADR 0078 step 6 calibration sweep only (production uses [`STRETCH_C`]).
+    #[must_use]
+    pub fn detached_with_gain(
+        gain: u64,
+        max_x: u64,
+        base: Duration,
+        metrics: MetricsHandle,
+        governor: Option<CampaignGovernor>,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 lag: AtomicU64::new(0),
+                gain,
                 max_x,
                 base,
                 metrics,
@@ -165,7 +188,7 @@ impl LoadMonitor {
             .set(Metric::CpElectionLagNanos, reading(lag));
         self.inner.metrics.set(
             Metric::CpElectionStretchNanos,
-            stretch_nanos(lag, self.inner.base, self.inner.max_x),
+            stretch_nanos_with_gain(lag, self.inner.base, self.inner.max_x, self.inner.gain),
         );
         if let Some(g) = &self.inner.governor {
             g.set_lag(lag);
@@ -181,10 +204,11 @@ impl LoadMonitor {
     /// The stretch to install on a group whose election base is `base`.
     #[must_use]
     pub fn stretch(&self, base: Duration) -> Duration {
-        Duration::from_nanos(stretch_nanos(
+        Duration::from_nanos(stretch_nanos_with_gain(
             self.inner.lag.load(Ordering::Relaxed),
             base,
             self.inner.max_x,
+            self.inner.gain,
         ))
     }
 

@@ -525,6 +525,14 @@ pub struct LocalState {
     /// re-tick wake and its `hosting_ramp` readings. Overwritten on every
     /// call (so it reads `0` whenever nothing was deferred).
     pub deferred_hosts: usize,
+    /// **Negative-control hook, never set in production** (ADR 0078 control
+    /// (f)): when `Some(seed)`, [`plan`] orders fresh hosting by a per-seed hash
+    /// of the `TabletId` instead of ascending `TabletId`, which is what a
+    /// node-local (non-metadata-derived) hosting order would look like. Used by
+    /// the election-backpressure corpus to prove the ascending order is
+    /// load-bearing on a whole-cluster restart. `None` (the default) is the
+    /// ADR's ascending order.
+    pub host_order_seed: Option<u64>,
 }
 
 impl LocalState {
@@ -1055,6 +1063,20 @@ pub fn plan(
     // call re-derives it. Only this fresh-hosting path is capped: split-child
     // materialization (phase 0.5), `Reconfigure`, `Release` and `Reclaim` are
     // exempt.
+    if let Some(seed) = state.host_order_seed {
+        // Control (f) only: a deterministic per-seed shuffle (splitmix64 of
+        // the id), so each node that is given its own seed hosts in its own
+        // order.
+        to_host.sort_by_key(|(tablet, _, _)| {
+            let mut z = tablet
+                .0
+                .wrapping_add(seed)
+                .wrapping_add(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        });
+    }
     next.deferred_hosts = to_host.len().saturating_sub(host_budget);
     to_host.truncate(host_budget);
     for (tablet, t, initial_formation) in to_host {
@@ -1496,6 +1518,13 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
     pub fn set_host_stagger(&mut self, unsettled_max: usize, settle_timeout: Duration) {
         self.host_unsettled_max = unsettled_max;
         self.host_settle_timeout = settle_timeout;
+    }
+
+    /// **Negative-control hook** (ADR 0078 control (f); never called in
+    /// production): host fresh tablets in a per-`seed` shuffled order instead
+    /// of ascending `TabletId`. See [`LocalState::host_order_seed`].
+    pub fn set_host_order_fault(&mut self, seed: Option<u64>) {
+        self.state.host_order_seed = seed;
     }
 
     /// A handle onto this reconciler's latest [`HostingRamp`] reading, for an
