@@ -208,3 +208,80 @@ removing entry's `(index, term)`, and is no longer "cleared once that peer's
 and, as a volume bound on a peer that is genuinely gone, by five minutes of
 total silence.
 
+
+## Amendment (2026-10-10, issue #1192): incremental load counts and `rebalance_plan`
+
+C-17 Tier 1 measured the one-move-per-call convergence at O(moves x tablets)
+(200M work units for 3 -> 9 nodes at 10k tablets): every `rebalance_step`
+recomputed per-node counts, the policy filter and the sort over every tablet to
+return one move. The algorithm and its move order are **unchanged**; the
+mechanism is now a `RebalanceState` holding per-node counts and, per node, the
+K-ordered positions of the policy-satisfying tablets with a replica there, so
+the first-fit scan visits only a source node's tablets and a move updates the
+state in O(log) instead of rebuilding it. `rebalance_step` is a fresh state plus
+one `next_move`; the new `rebalance_plan(tablets, candidates, max_moves)` runs
+`next_move` repeatedly and returns the exact sequence that
+step -> apply -> step would, with the state built once. `Metadata::rebalance_batch`
+wraps it as `CasTabletReplicas` commands (a tablet moved twice gets its
+`expected_epoch` advanced once per earlier move). The control leader keeps the
+**one CAS per evaluation** churn bound (`Metadata::rebalance`), so production
+call sites are untouched and each tick still pays one O(tablets) build; the batch
+path serves bulk convergence (the C-17 harness, which asserts it equals the
+repeated single step on small cells). The pre-change implementation is kept as
+`#[doc(hidden)] rebalance_step_reference` and a property test compares all three
+move for move, spread policies included. Limit: no state survives across
+leader ticks, because the inputs (epochs, `split_placing`, liveness) can change
+between them.
+
+## Amendment (2026-10-11, issue #1192): the leader keeps the plan across ticks
+
+The previous amendment left one cost in production: `reconcile_loop` still
+called `Metadata::rebalance` (one fresh `RebalanceState`, O(tablets)) for each
+move, so converging a grown cluster stayed O(tablets x moves). Maintainer
+choice: **cache the plan**, keep the churn bound, recompute on divergence.
+
+`animus_control::rebalance_cache::RebalanceCache` holds the remaining moves of a
+`rebalance_batch` plan (first plan 64 moves, doubling to 8192 each time a plan is
+consumed with the cluster on course; reset on divergence). The leader still
+proposes **at most one move per rebalance evaluation** (same cadence, same one
+CAS, same data-movement rate); only the planning cost is amortized.
+
+**Soundness contract: the proposed move always equals `Metadata::rebalance` on
+the current state.** The cache serves from the plan only when it can prove the
+view is the state the plan expects, with an O(1) fingerprint:
+
+- `rev`: `Metadata::placement_rev`, a `#[serde(skip)]` in-memory counter bumped
+  by `apply` on every `Applied` command (deliberately coarse: a schema or backup
+  command bumps it too, costing one rebuild, never a stale plan). It covers
+  members (membership, liveness, labels), tablets, policies and
+  `split_placing` -- ADR 0062's `done` flip included -- because every change
+  goes through `apply`. No format change; it is excluded from equality and
+  restarts at 0 on decode or snapshot rebuild, so it is only compared within one
+  `Metadata` value.
+- The only prediction allowed is our own CAS: the view may be at `rev + 1`
+  only if the head move was already offered and the head tablet's row now shows
+  exactly `expected_epoch.next()` and the planned replicas. The head is popped
+  only when its application is **observed**, never when proposed, so an
+  in-flight or lost proposal makes the cache offer the same head again, which is
+  what the uncached decision does.
+- The other inputs of the pure decision: the `recently_done` set (compared by
+  value) and the Raft term (a leadership change, including leave-and-regain
+  between two ticks, drops the plan); the four map sizes are a belt-and-braces
+  check against a direct edit of the public maps that bypassed `apply`.
+- A refused proposal (`propose_gated` not `Accepted`) and any non-leader tick
+  invalidate.
+
+Any mismatch drops the plan and rebuilds, so correctness never depends on the
+plan being right, only on the fingerprint not missing a change. Proofs: a
+seeded property test (`tests/it/rebalance_cache.rs`) interleaves ticks with
+random node add/remove, liveness flips, new tablets, splits and their Placing
+completion, foreign CAS, an opening/closing grace window, term changes and
+lost/late/refused proposals, and asserts every tick's move equals a fresh
+`Metadata::rebalance` (both fingerprint terms were mutation-checked: dropping
+either makes it fail); `sim_cluster_scale` (C-17) asserts the cached
+one-per-tick walk equals the batch plan and rebuilds O(log moves) times.
+Observability: `control_rebalance_evals` / `control_rebalance_plan_rebuilds`.
+
+Limit: the loop still clones the placement view and runs `reconcile` (repair)
+every tick; this amendment removes only the rebalance planning cost. A balanced,
+unchanged cluster now skips the rebalance pass entirely.
