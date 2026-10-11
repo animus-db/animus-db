@@ -8955,6 +8955,12 @@ pub struct ClusterEdgeState<E: Env = ProdEnv> {
     /// that already builds one `ClusterEdgeState` per node gets it with zero
     /// struct-literal fan-out. Fed by `version_wiring::version_wiring_loop`.
     version: version_wiring::VersionState,
+    /// When this node's own clock first saw each in-doubt transaction
+    /// (issue #1204): the node-local half of `txn_recover`'s
+    /// `RECOVERY_GRACE` gate, see
+    /// [`in_doubt_grace_elapsed`](Self::in_doubt_grace_elapsed). Lives here
+    /// for the same zero-fan-out reason as `version`.
+    in_doubt_first_seen: Arc<Mutex<BTreeMap<TxnId, Nanos>>>,
 }
 
 impl<E: Env> Default for ClusterEdgeState<E> {
@@ -8972,7 +8978,36 @@ impl<E: Env> ClusterEdgeState<E> {
             raftkv: Arc::new(Mutex::new(BTreeMap::new())),
             has_catalog_credentials: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             version: version_wiring::VersionState::default(),
+            in_doubt_first_seen: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    /// Has this node itself watched `txn_id` sit in doubt for a full
+    /// [`RECOVERY_GRACE`](animus_cp_data::RECOVERY_GRACE)? Records `now` as
+    /// the first sighting on the first call, and answers off that on every
+    /// later one.
+    ///
+    /// **Why it exists (issue #1204).** `txn_recover` gates a decision on
+    /// `now_ms >= created_ts.wall_ms + RECOVERY_GRACE`, but `created_ts` is an
+    /// HLC (`max(uptime, every timestamp witnessed or recovered from the
+    /// engine)`) while `now_ms` is this process's uptime. They share a unit,
+    /// not a time base: after a restart, uptime starts near zero and the HLC
+    /// does not, so the gate stayed shut (and a consistent read of the
+    /// blocked key hung) for as long as the previous incarnation had been up.
+    /// This elapsed-on-my-own-clock test is immune to that, and is never
+    /// earlier than the intended "grace since creation" (the first sighting
+    /// cannot precede the creation). `txn_recover` lets either test open the
+    /// gate. Entries older than ten graces are pruned, so the memo stays
+    /// bounded by the arrival rate; a pruned entry only costs one more grace.
+    pub(crate) fn in_doubt_grace_elapsed(&self, txn_id: &TxnId, now: Nanos) -> bool {
+        let grace = u64::try_from(animus_cp_data::RECOVERY_GRACE.as_nanos()).unwrap_or(u64::MAX);
+        let mut seen = self
+            .in_doubt_first_seen
+            .lock()
+            .expect("in_doubt_first_seen mutex poisoned");
+        seen.retain(|_, first| now.0.saturating_sub(first.0) < grace.saturating_mul(10));
+        let first = *seen.entry(txn_id.clone()).or_insert(now);
+        now.0.saturating_sub(first.0) >= grace
     }
 
     /// This node's version state (ADR 0073 Phase 2): `version().features` is
