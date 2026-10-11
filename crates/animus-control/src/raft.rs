@@ -4377,6 +4377,14 @@ where
         if self.role != Role::PreCandidate {
             return Vec::new();
         }
+        // ADR 0078: a deferred retry (`campaign_hold`) is waiting for a
+        // campaign permit, not campaigning. A late grant from its lapsed round
+        // must not start an election: it would campaign with no permit (the
+        // driver then counts it as an exempt campaign over the cap). The retry
+        // runs a fresh pre-vote once admitted. Never set without a governor.
+        if granted && self.campaign_hold.is_some() {
+            return Vec::new();
+        }
         if granted {
             // ADR 0058 Train 1: only ever count a grant from a current voter
             // toward the pre-vote majority — `majority()` is computed over

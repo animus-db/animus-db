@@ -283,6 +283,46 @@ fn a_precandidate_whose_round_lapsed_is_also_gated() {
     assert!(!core.campaign_deferred(), "starting the round clears it");
 }
 
+#[test]
+fn a_deferred_precandidate_does_not_finish_its_lapsed_round_on_a_late_grant() {
+    // Found by the ProdEnv Tier 3 test under CPU contention: a PreCandidate whose
+    // round lapsed is deferred (its driver returned the permit), then a grant
+    // from the lapsed round arrives late. Counting it would start a real
+    // election with no permit, and the driver would hand the campaign an
+    // exempt permit over the cap. A deferred node is not campaigning: the
+    // late grant is ignored, the retry runs a fresh round once admitted.
+    let mut core = follower();
+    let t1 = Nanos(core.next_deadline().unwrap().0);
+    let _ = core.tick_gated(t1, 5, true);
+    assert_eq!(core.role(), Role::PreCandidate);
+    let term = core.term();
+    let lapsed = Nanos(core.next_deadline().unwrap().0 + 1);
+    let _ = core.tick_gated(lapsed, 5, false);
+    assert!(core.campaign_deferred());
+    let out = core.handle(
+        nid(1),
+        RaftMsg::PreVoteResp {
+            term: term + 1,
+            granted: true,
+        },
+        Nanos(lapsed.0 + MS),
+        7,
+    );
+    assert!(out.is_empty(), "no RequestVote while deferred: {out:?}");
+    assert_eq!(
+        core.role(),
+        Role::PreCandidate,
+        "still waiting for a permit"
+    );
+    assert_eq!(core.term(), term, "no term bump while deferred");
+    assert!(core.campaign_deferred(), "still queued");
+    // Admitted: a fresh pre-vote round (the stale grant does not carry over).
+    let _ = core.tick_gated(Nanos(core.next_deadline().unwrap().0), 8, true);
+    assert_eq!(core.role(), Role::PreCandidate);
+    assert_eq!(core.term(), term);
+    assert!(!core.campaign_deferred());
+}
+
 // ---- the permit check sits after the early returns -------------------------
 
 #[test]
