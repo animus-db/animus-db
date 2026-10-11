@@ -457,8 +457,14 @@ fn sim_cluster_scale_metadata_curve() {
                 .collect();
             let mut facts: BTreeMap<TabletId, TabletFacts> = BTreeMap::new();
             // Boot tick: nothing hosted yet -> one Host per local tablet.
-            let (boot, state) =
-                host::plan(&view, &facts, &local, &LocalState::default(), me.clone());
+            let (boot, state) = host::plan(
+                &view,
+                &facts,
+                &local,
+                &LocalState::default(),
+                me.clone(),
+                host::UNLIMITED_HOST_BUDGET,
+            );
             let hosts = boot
                 .iter()
                 .filter(|a| matches!(a, HostAction::Host { .. }))
@@ -480,7 +486,14 @@ fn sim_cluster_scale_metadata_curve() {
                     },
                 );
             }
-            let (steady, state) = host::plan(&view, &facts, &local, &state, me.clone());
+            let (steady, state) = host::plan(
+                &view,
+                &facts,
+                &local,
+                &state,
+                me.clone(),
+                host::UNLIMITED_HOST_BUDGET,
+            );
             let reconfigures = steady
                 .iter()
                 .filter(|a| matches!(a, HostAction::Reconfigure { .. }))
@@ -517,7 +530,14 @@ fn sim_cluster_scale_metadata_curve() {
             let t3 = view2.tablets.get_mut(&TabletId(3)).unwrap();
             t3.replicas.pop();
             t3.epoch = t3.epoch.next();
-            let (changed, _) = host::plan(&view2, &facts, &local, &state, me.clone());
+            let (changed, _) = host::plan(
+                &view2,
+                &facts,
+                &local,
+                &state,
+                me.clone(),
+                host::UNLIMITED_HOST_BUDGET,
+            );
             let changed_non_reconf = changed
                 .iter()
                 .filter(|a| !matches!(a, HostAction::Reconfigure { .. }))
@@ -890,6 +910,15 @@ const QUIESCE_AFTER: Duration = Duration::from_secs(5);
 /// Settle poll step / budget for "every group quiesces".
 const SETTLE_STEP: Duration = Duration::from_secs(5);
 const SETTLE_BUDGET: Duration = Duration::from_secs(120);
+/// C-17 Tier 2 (ADR 0078): the step at which the election probe samples
+/// leadership while the cell settles.
+const PROBE_STEP: Duration = Duration::from_millis(250);
+/// ADR 0078 Tier 2's stated `election_max_term` bound for a density cell: a
+/// group's term after creation, any rebalance move (a leadership transfer
+/// bumps it once) and a wake. The issue's runaway shape is tens of terms per
+/// group (#1199: churn 7 to 48 per group); a cell above this bound is that
+/// shape again, not noise.
+const ELECTION_MAX_TERM_BOUND: u64 = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum CellKind {
@@ -1101,7 +1130,12 @@ fn cluster_quiesced(cluster: &SimCluster) -> (usize, usize) {
 /// nodes of a wider cluster triggers ~G rebalance moves, each waking the
 /// moved group). Returns virtual seconds waited; panics naming the seed on
 /// timeout.
-fn settle_all_quiesced(cluster: &mut SimCluster, expect_replicas: usize, what: &str) -> u64 {
+fn settle_all_quiesced(
+    cluster: &mut SimCluster,
+    expect_replicas: usize,
+    what: &str,
+    probe: &mut ElectionProbe,
+) -> u64 {
     let budget = SETTLE_BUDGET + Duration::from_secs(15 * expect_replicas as u64);
     let mut waited = Duration::ZERO;
     loop {
@@ -1115,9 +1149,71 @@ fn settle_all_quiesced(cluster: &mut SimCluster, expect_replicas: usize, what: &
              (hosted={hosted} expected={expect_replicas} quiesced={quiesced}, seed={})",
             cluster.seed()
         );
-        cluster.run_for(SETTLE_STEP);
+        let mut stepped = Duration::ZERO;
+        while stepped < SETTLE_STEP {
+            cluster.run_for(PROBE_STEP);
+            probe.sample(cluster);
+            stepped += PROBE_STEP;
+        }
         waited += SETTLE_STEP;
     }
+}
+
+/// C-17 Tier 2 (ADR 0078): the density cell's election progress, sampled off
+/// every replica's local Raft state (no virtual time passes).
+struct ElectionProbe {
+    /// Groups the cell expects to be led (grows as tables are created).
+    expect: usize,
+    /// Virtual time of the previous sample.
+    last: Nanos,
+    /// Sampled integral of leaderless groups over virtual time, in ms (each
+    /// sample charges the interval since the previous one).
+    leaderless_group_ms: u64,
+}
+
+impl ElectionProbe {
+    fn new(cluster: &SimCluster) -> Self {
+        Self {
+            expect: 0,
+            last: cluster.sim_now(),
+            leaderless_group_ms: 0,
+        }
+    }
+
+    /// Charge the interval since the previous sample with the groups
+    /// leaderless now; returns how many groups are led.
+    fn sample(&mut self, cluster: &SimCluster) -> usize {
+        let (led, _) = election_view(cluster);
+        let now = cluster.sim_now();
+        let dt_ms = now.0.saturating_sub(self.last.0) / 1_000_000;
+        self.leaderless_group_ms += self.expect.saturating_sub(led) as u64 * dt_ms;
+        self.last = now;
+        led
+    }
+}
+
+/// `(groups some replica believes it leads, each group's highest term over
+/// its replicas)` across the cluster.
+fn election_view(cluster: &SimCluster) -> (usize, BTreeMap<TabletId, u64>) {
+    let mut led = BTreeSet::new();
+    let mut terms: BTreeMap<TabletId, u64> = BTreeMap::new();
+    for n in 0..cluster.node_count() as u64 {
+        for (t, leads, term) in cluster.group_leads_terms(n) {
+            if leads {
+                led.insert(t);
+            }
+            let e = terms.entry(t).or_insert(0);
+            *e = (*e).max(term);
+        }
+    }
+    (led.len(), terms)
+}
+
+/// Sum of one metric over every node's `SimEnv` sink.
+fn metric_sum(cluster: &SimCluster, m: animus_env::Metric) -> u64 {
+    (0..cluster.node_count() as u64)
+        .map(|n| cluster.env_metric(n, m))
+        .sum()
 }
 
 #[derive(Default, Clone, Debug)]
@@ -1133,15 +1229,36 @@ fn run_density(s: &Scenario) -> DensityResult {
     let (g, n) = (s.groups, s.nodes);
 
     let create0 = cluster.sim_stats();
+    let t_create = cluster.sim_now();
+    let mut probe = ElectionProbe::new(&cluster);
     let tables: Vec<String> = (0..g).map(|i| format!("t{i}")).collect();
     for t in &tables {
         cluster.create_table_with_replication(t, rf);
+        probe.expect += 1;
+        probe.sample(&cluster);
     }
     let (cp, ct) = stats_delta(create0, cluster.sim_stats());
     emit("create_task_polls", g, n, cp);
     emit("create_timer_fires", g, n, ct);
 
-    let waited = settle_all_quiesced(&mut cluster, g * rf, &s.name);
+    // C-17 Tier 2 (ADR 0078): converged-or-timeout, every group led. Each
+    // create already waited for its own group's first leader, so this
+    // catches a later create's elections unseating an earlier group.
+    let mut waited_led = Duration::ZERO;
+    while probe.sample(&cluster) < g {
+        assert!(
+            waited_led < SETTLE_BUDGET,
+            "{}: groups never all led within {SETTLE_BUDGET:?} (seed={})",
+            s.name,
+            s.seed
+        );
+        cluster.run_for(PROBE_STEP);
+        waited_led += PROBE_STEP;
+    }
+    let all_led_ms = (cluster.sim_now().0 - t_create.0) / 1_000_000;
+    emit("election_time_to_all_led_ms", g, n, all_led_ms);
+
+    let waited = settle_all_quiesced(&mut cluster, g * rf, &s.name, &mut probe);
     emit("quiesce_settle_virtual_s", g, n, waited);
     let (hosted, quiesced) = cluster_quiesced(&cluster);
     emit("group_replicas_hosted", g, n, hosted);
@@ -1153,6 +1270,7 @@ fn run_density(s: &Scenario) -> DensityResult {
     let (c0, t0) = (cluster.sim_stats(), sim.trace().len());
     let (ctl0, _) = cluster.control_raft_indices(0);
     cluster.run_for(IDLE_WINDOW);
+    probe.sample(&cluster);
     let (ctl1, _) = cluster.control_raft_indices(0);
     let (c1, trace) = (cluster.sim_stats(), sim.trace());
     let secs = IDLE_WINDOW.as_secs();
@@ -1222,6 +1340,7 @@ fn run_density(s: &Scenario) -> DensityResult {
         let wake_window = Duration::from_secs(2);
         let (w0, tw0) = (cluster.sim_stats(), sim.trace().len());
         cluster.run_for(wake_window);
+        probe.sample(&cluster);
         let (w1, trace) = (cluster.sim_stats(), sim.trace());
         let (wp, wf) = stats_delta(w0, w1);
         let wt = traffic(&trace[tw0..]);
@@ -1240,7 +1359,7 @@ fn run_density(s: &Scenario) -> DensityResult {
             k * rf
         );
 
-        let resettle = settle_all_quiesced(&mut cluster, g * rf, &s.name);
+        let resettle = settle_all_quiesced(&mut cluster, g * rf, &s.name, &mut probe);
         emit("wake_requiesce_virtual_s", g, n, resettle);
         let acked = acked.lock().expect("acked").clone();
         assert_eq!(
@@ -1262,10 +1381,65 @@ fn run_density(s: &Scenario) -> DensityResult {
         }
     }
 
+    emit_election(&cluster, s, &mut probe);
+
     DensityResult {
         idle_polls_per_s: polls / secs,
         idle_timer_fires_per_s: fires / secs,
     }
+}
+
+/// C-17 Tier 2 (ADR 0078): the election metrics of a density cell at its end,
+/// with structural assertions only: every group is led, the busiest node
+/// never had more than `K` timer-driven campaigns in flight (plus at most one
+/// exempt `TimeoutNow` campaign per preferred-leader transfer the cluster
+/// made: the hwm gauge counts exempt permits too), and no group's term passed
+/// [`ELECTION_MAX_TERM_BOUND`].
+fn emit_election(cluster: &SimCluster, s: &Scenario, probe: &mut ElectionProbe) {
+    use animus_env::Metric;
+    let (g, n) = (s.groups, s.nodes);
+    let led = probe.sample(cluster);
+    let (_, terms) = election_view(cluster);
+    let max_term = terms.values().copied().max().unwrap_or(0);
+    let churn: u64 = terms.values().map(|t| t.saturating_sub(1)).sum();
+    let churn_x1000 = if g == 0 { 0 } else { churn * 1000 / g as u64 };
+    let hwm = (0..n as u64)
+        .map(|i| cluster.env_metric(i, Metric::CpCampaignInflightHwm))
+        .max()
+        .unwrap_or(0);
+    let deferred = metric_sum(cluster, Metric::CpCampaignDeferred);
+    let transfers = metric_sum(cluster, Metric::CpPreferredLeaderTransfers);
+    emit("election_max_term", g, n, max_term);
+    emit("election_term_churn_per_group_x1000", g, n, churn_x1000);
+    emit("campaign_inflight_hwm", g, n, hwm);
+    emit("campaign_deferred_total", g, n, deferred);
+    emit(
+        "campaign_admitted_total",
+        g,
+        n,
+        metric_sum(cluster, Metric::CpCampaignAdmitted),
+    );
+    emit("preferred_leader_transfers_total", g, n, transfers);
+    emit("leaderless_group_ms", g, n, probe.leaderless_group_ms);
+    assert_eq!(
+        led, g,
+        "{}: every group led at the end (seed={})",
+        s.name, s.seed
+    );
+    let k = animus_cp_data::campaign_governor::DEFAULT_CAMPAIGN_MAX_INFLIGHT as u64;
+    assert!(
+        hwm <= k + transfers,
+        "{}: campaign_inflight_hwm {hwm} above K={k} + {transfers} exempt transfers (seed={})",
+        s.name,
+        s.seed
+    );
+    assert!(
+        max_term <= ELECTION_MAX_TERM_BOUND,
+        "{}: election_max_term {max_term} above the stated bound {ELECTION_MAX_TERM_BOUND} \
+         (seed={})",
+        s.name,
+        s.seed
+    );
 }
 
 /// Every table's live tablets tile its whole ring: sorted by range start,

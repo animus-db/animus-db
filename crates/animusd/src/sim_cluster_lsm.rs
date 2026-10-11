@@ -143,6 +143,37 @@ impl SimReconciler {
         }
     }
 
+    /// ADR 0078 section 3: publish this node's staggered-hosting reading to the
+    /// node's edge state, exactly as production's node assembly does.
+    pub(crate) fn set_ramp_gauge(&mut self, gauge: animus_cp_data::host::HostingRampGauge) {
+        match self {
+            SimReconciler::Mem(r) => r.set_ramp_gauge(gauge),
+            SimReconciler::Lsm(r) => r.set_ramp_gauge(gauge),
+        }
+    }
+
+    /// ADR 0078 sections 1 and 2: the node's campaign governor and load
+    /// monitor, shared by every data-plane group hosted here, exactly as
+    /// production's node assembly installs them.
+    pub(crate) fn set_election_backpressure(
+        &mut self,
+        bp: animus_cp_data::campaign_governor::ElectionBackpressure,
+    ) {
+        match self {
+            SimReconciler::Mem(r) => r.set_election_backpressure(bp),
+            SimReconciler::Lsm(r) => r.set_election_backpressure(bp),
+        }
+    }
+
+    /// ADR 0078 section 3: the reconciler's own short re-tick request while a
+    /// hosting ramp has deferred work.
+    pub(crate) fn next_wake(&self) -> Option<Duration> {
+        match self {
+            SimReconciler::Mem(r) => r.next_wake(),
+            SimReconciler::Lsm(r) => r.next_wake(),
+        }
+    }
+
     pub(crate) async fn tick(&mut self, view: &MetadataView) {
         match self {
             SimReconciler::Mem(r) => r.tick(view).await,

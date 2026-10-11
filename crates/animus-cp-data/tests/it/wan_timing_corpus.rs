@@ -52,7 +52,7 @@ const TABLET: TabletId = TabletId(1);
 /// The configured max inter-region round trip handed to the reconciler.
 /// One-way latency is at most ~90 ms plus jitter, so a round trip is at most
 /// ~200 ms; the operator-facing knob is sized to that.
-const MAX_REGION_RTT: Duration = Duration::from_millis(200);
+pub(crate) const MAX_REGION_RTT: Duration = Duration::from_millis(200);
 const WRITE_PERIOD: Duration = Duration::from_millis(500);
 /// Link noise on top of the 60-90 ms one-way base: a congested WAN link.
 /// **Measured, not assumed** (see the module doc): with only a few ms of
@@ -67,13 +67,28 @@ const TAIL_JITTER: Duration = Duration::from_millis(400);
 const TAIL_PROB: f64 = 0.30;
 /// Shared by the WAN cells (must stay within) and the LAN-forced control
 /// (must exceed on most fault cells). Calibrated over 50 seeds per cell.
-const MAX_TERM_GROWTH: u64 = 3;
+pub(crate) const MAX_TERM_GROWTH: u64 = 3;
 const MIN_ACKED_DURING_FAULT: usize = 18;
 /// The negative control is statistical (it must fail on *most* LAN-forced
 /// fault cells, and a single seed can get lucky: at one seed per cell it hit
 /// 1 of 2), so it always runs at least this many seeds per cell regardless of
 /// `ANIMUS_WAN_TIMING_SEEDS`.
 const NEGATIVE_CONTROL_MIN_SEEDS: usize = 10;
+
+/// The three region pairs' one-way base latency in ms (60 / 75 / 90), shared
+/// with the election-backpressure corpus' cell 9.
+pub(crate) const WAN_ONE_WAY_MS: [((usize, usize), u64); 3] =
+    [((0, 1), 60), ((0, 2), 75), ((1, 2), 90)];
+
+/// One WAN link: `ms` one-way, `JITTER` and the heavy tail (see those consts).
+pub(crate) fn wan_link(ms: u64) -> NetConfig {
+    let mut cfg = NetConfig::default();
+    cfg.base_delay = Duration::from_millis(ms);
+    cfg.max_jitter = JITTER;
+    cfg.heavy_tail_max_jitter = TAIL_JITTER;
+    cfg.set_heavy_tail_prob(TAIL_PROB);
+    cfg
+}
 
 fn node(i: usize) -> NodeId {
     nid(700 + i as u64)
@@ -132,13 +147,8 @@ impl World {
         // 60 / 75 / 90 ms one-way between the three region pairs, symmetric,
         // `JITTER` and a heavy tail (see those consts), ~1 ms inside a region
         // (unused: one node per region).
-        let one_way = [((0, 1), 60u64), ((0, 2), 75), ((1, 2), 90)];
-        for ((i, j), ms) in one_way {
-            let mut cfg = NetConfig::default();
-            cfg.base_delay = Duration::from_millis(ms);
-            cfg.max_jitter = JITTER;
-            cfg.heavy_tail_max_jitter = TAIL_JITTER;
-            cfg.set_heavy_tail_prob(TAIL_PROB);
+        for ((i, j), ms) in WAN_ONE_WAY_MS {
+            let cfg = wan_link(ms);
             sim.set_link_net_config(node(i), node(j), cfg.clone());
             sim.set_link_net_config(node(j), node(i), cfg);
         }

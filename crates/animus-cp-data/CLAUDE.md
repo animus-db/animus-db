@@ -3084,7 +3084,99 @@ reconciler end to end, the ADR 0044 phase-2 heartbeat-batcher baseline
 (`tests/heartbeat_batch_corpus.rs`, C-02 PR 2, below), and the real-thread
 `ProdEnv` regression noted above.
 
-### Heartbeat-batcher corpus (`tests/heartbeat_batch_corpus.rs`)
+### Election-backpressure corpus (`tests/it/election_backpressure_corpus.rs`)
+
+ADR 0078 step 1 (the Tier 1 baseline). 300 `RaftKvNode` groups share three
+physical nodes (one `HeartbeatBatcher` per node, one stream per group), and
+`Simulator::set_cpu_cost` gives every node a per-event CPU price chosen so
+steady demand is a stated multiple of capacity (`EVENTS_PER_GROUP_PER_S = 24.6`
+was measured on this rig and `calibration_matches_measurement` keeps it honest).
+Cells are data (`Cell { kind, load, mechanisms }`); `Mechanisms` is the struct
+later steps fill in (governor, lag stretch, staggering). The oracle (`Limits`)
+is safety (no two leaders per term, no acked write lost) plus liveness (all led
+within a bound, led at end), a term-churn ceiling and a monotone led count.
+Cells: 1 (cold start), control (a) (1.25x sustained overload, no mechanisms:
+the oracle MUST flag the led-count drop and the churn, safety must hold) and 12
+(a pinned digest of a small mechanisms-off run, idle and at 0.9x: later steps
+must leave it unchanged while their knobs are off).
+
+Rules learned: the rig uses `CpuOrder::Random` because a FIFO backlog is a
+uniformly slow clock and never false-triggers a follower (the #1199 collapse
+needs timers served out of order with the heartbeats that would cancel them;
+`docs/lessons/testing/2026-10-11-a-fifo-cpu-backlog-is-a-slow-clock-not-a-starved-node.md`).
+Collapse onset is tens of virtual seconds into the overload, so the control
+runs 60 s and costs about 80 s of wall time in a debug build.
+
+**Step 3 (campaign governor).** `campaign_governor.rs`: one `CampaignGovernor`
+per node (next to the `HeartbeatBatcher`; `animusd` builds it with
+`env.metrics()` and installs it via `Reconciler::set_election_backpressure`, the
+only edit to `host.rs`). Sync, `Env`-clean, `BTreeMap` only, time passed in.
+`try_admit(stream, now, ttl, &wake)` returns an RAII `CampaignPermit` or
+`Deferred`; deferred groups sit in a FIFO keyed `(first_deferred_at, stream)`,
+are woken through their group's `WakeSignal` when a permit returns (the first
+`free` waiters), re-queue at the back after a failed attempt, and expire lazily
+after `2*election_base_max` (permits and silent waiters; a backstop re-check at
+`election_base` is the `campaign_hold` deadline). Gating is **candidate-side
+only**: a deferred follower keeps its lapsed `election_deadline`, so it still
+grants pre-votes (control (c) re-arms it and the group never recovers). The
+driver (`drive` in `lib.rs`) calls `campaign_due` before `tick`, uses
+`tick_gated`, and releases the permit when `campaign_active()` turns false, on
+shutdown or on release. **Exempt** (never queued, counted in the
+`CpCampaignInflight` gauge, so the gauge may exceed K): `TimeoutNow`,
+`campaign_now`; **never reach the governor**: single-voter groups, learners and
+non-voters (`campaign_due` is false), quiesced groups (no deadline), and the
+control-plane `RaftNode`. `HostedOptions.backpressure` defaults to off, so
+every existing caller is byte-identical (cell 12 digests). Test hook:
+`GovernorFault::{RearmOnDefer, LeakPermits}` for the negative controls.
+Corpus cells added: 1 with governor (`cell_1_cold_start_*`), 4 (leader-node loss
+while quiesced), 7 (partition and heal), 8 (transfer under saturation), 10
+(lost-leader bound, asserted as `2*base + ceil(Q/K)*2*base + 50 ms` own-election
+slack), 11 (no permits for learners, single voters, quiesced groups); controls
+(c) `control_c_*` and (d) `control_d_*`. The default run takes ~2 min in a debug
+build (control (a) alone ~80 s); `ANIMUS_ELECTION_BP_CELL=<substring>` runs one
+cell (each cell is 1 to 12 s except cell 1/control (a)),
+`ANIMUS_ELECTION_BP_GROUPS=N` shrinks the rig.
+
+**Step 4 (load monitor and lag stretch).** `load_monitor.rs`: one `LoadMonitor`
+per node, one probe task via `env.spawn_task` (`PROBE` 20 ms): `sample = (now -
+slept_from) - PROBE`, `lag = max(sample, lag - lag/32)` (instant attack, integer
+decay), dead band 10 ms reads zero, stretch `S = min(4*lag, lag_stretch_max_x *
+election_base)`, and `K_eff` (the governor's cap) is `K/2` at lag >= 30 ms and
+`K/4` (min 1) at >= 100 ms. Everything numeric is a pure integer function
+(`next_estimate`, `reading`, `stretch_nanos`, `k_eff`) with unit tests
+(monotone, bounded, dead band, stretch, `K_eff`). The driver installs
+`monitor.stretch(c.election_timeout())` with `set_lag_stretch` once per loop
+iteration (no-op if unchanged, no entropy; it applies at the next timer reset,
+so a quiesced follower woken by `on_local_wake` is not stretched). The monitor
+feeds `CampaignGovernor::set_lag` (wakes the head of the queue when `K_eff`
+grows) and metrics `cp_election_lag_nanos` / `cp_election_stretch_nanos`.
+`ElectionBackpressure { governor, monitor }` (default off) carries both.
+**SimEnv caveat:** the CPU-starvation model serves expired timers ahead of
+waiting deliveries, so the probe task reads ~0 under it (it is exercised on a
+`pause`d node by `load_monitor_task_measures_a_paused_node`); the corpus feeds
+`LoadMonitor::detached` from `Simulator::cpu_backlog` (`waiting deliveries x
+per-event cost`, once per `PROBE` of virtual time, `Rig::probe`).
+`cell_12_idle_probe_task_changes_no_group_outcome` runs the real task idle.
+Corpus cells added: 4 with all mechanisms, 4b (leader-node loss with decaying
+lag: the node loss lands as the load ends, so the cap on the stretch is the only
+thing that bounds the failover), 5 (1.25x sustained overload for 60 s), 6
+(1.25x for 30 s then relief); controls (b) (stretch off on cell 5) and (e)
+(`S_max = inf` on cell 4b, same seed as 4b so the runs differ only in the cap),
+plus `control_a6_*` (cell 6 without mechanisms). Cells 5 and 6 and the
+controls (a)/(b) cost 45 to 80 s each in a debug build; the whole file takes
+about 4.5 minutes on this host (its tests run in parallel; the cells test is
+sequential). `ANIMUS_ELECTION_BP_CELL=<substring>` runs one cell.
+
+**Tier 3 (`ProdEnv`, `tests/election_backpressure_liveness.rs`, `prod-heavy`).**
+Three `ProdEnv` nodes, a 2-worker runtime, G=300 RF3 hosted at once through real
+reconcilers at production settings; all led, `max_term` ceiling, governor hwm <= K,
+then a node loss after quiescence (marked `Down` after 500 ms) re-led within the
+ADR's worst-case lost-leader bound. ~8 s debug; run it under contention (several
+copies at once) after touching the governor: that is how the late-pre-vote-grant
+over-cap was found. `density_repro_g3000_holds_led_count` (ignored) is the #1199
+acceptance (`ANIMUS_BP_LIVE_GROUPS=N` overrides G).
+
+
 
 ADR 0044 phase 2 — the `heartbeat_batch` module's own fault-injection
 corpus, depth knob `ANIMUS_HEARTBEAT_SEEDS` (default 1). This corpus

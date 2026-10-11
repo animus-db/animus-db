@@ -251,6 +251,8 @@ pub fn validate_image_revert(
 /// - `spec.region`/`spec.peers` are consistent and, with peers, `spec.tls` or
 ///   the dev-only `spec.allowInsecurePeers` is set
 ///   ([`AnimusClusterSpec::validate_peers_spec`], G-01 stage G-e).
+/// - `spec.hostSettleTimeoutMs`, when set, is at least 1
+///   ([`AnimusClusterSpec::validate_election_backpressure_spec`], ADR 0078).
 /// - `spec.backupStore`/`spec.segmentStore` are each a syntactically valid,
 ///   non-conflicting value ([`AnimusClusterSpec::validate_store_spec`]).
 ///
@@ -296,6 +298,13 @@ pub fn validate_spec(
     if let Err(e) = new.validate_peers_spec() {
         violations.push(Violation {
             field: "spec.region/spec.peers",
+            message: e,
+        });
+    }
+
+    if let Err(e) = new.validate_election_backpressure_spec() {
+        violations.push(Violation {
+            field: "spec.hostSettleTimeoutMs",
             message: e,
         });
     }

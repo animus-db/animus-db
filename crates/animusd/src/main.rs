@@ -349,7 +349,7 @@ fn otel_instance_label(args: &[String]) -> String {
 const USAGE: &str = "usage:\n  \
     animusd gen-config --nodes N [--host H] [--base-port P] [--region NAME] [--peer REGION=host:port[,..]]... [--allow-insecure-peers] [--mrec-max-clock-skew-ms MS]\n  \
     animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P]\n  \
-    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--max-region-rtt-ms MS] [--region NAME] [--peer REGION=host:port[,host:port...]]... [--allow-insecure-peers] [--mrec-max-clock-skew-ms MS] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH] [--encryption-key PATH]\n  \
+    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--max-region-rtt-ms MS] [--campaign-max-inflight N] [--lag-stretch-max N] [--host-unsettled-max N] [--host-settle-timeout-ms MS] [--region NAME] [--peer REGION=host:port[,host:port...]]... [--allow-insecure-peers] [--mrec-max-clock-skew-ms MS] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH] [--encryption-key PATH]\n  \
     animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] [--encryption-key PATH]\n  \
     animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--dynamo-auth PATH]\n  \
     animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral] [--advertise-host NAME] [--label K=V]... [--labels-file PATH [--labels-file-annotations]] [--labels-wait-secs N] [--encryption-key PATH] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3]\n  \
@@ -580,6 +580,18 @@ async fn run(args: &[String]) -> Result<(), String> {
     // config file is the route for every other shape, same partial CLI reach
     // as `--export-s3-endpoint`.
     let mut max_region_rtt_ms: Option<u64> = None;
+    // ADR 0078 step 3: `--campaign-max-inflight N` (0 disables the per-node
+    // campaign governor); same reach and conflict rule as `--max-region-rtt-ms`.
+    let mut campaign_max_inflight: Option<usize> = None;
+    // ADR 0078 step 4: `--lag-stretch-max N` (multiple of the election base; 0
+    // disables the load monitor and the stretch); same reach and conflict rule.
+    let mut lag_stretch_max_x: Option<u64> = None;
+    // `--host-unsettled-max N` / `--host-settle-timeout-ms MS` (ADR 0078
+    // section 3, staggered hosting): same reach as `--max-region-rtt-ms`
+    // (`--config`/`--node`, merged with the `cluster_settings` keys of the
+    // same name; conflict = hard error).
+    let mut host_unsettled_max: Option<u64> = None;
+    let mut host_settle_timeout_ms: Option<u64> = None;
     // MREC global-table peer settings (ADR 0075 section 4, G-01 stage G-d M3):
     // `--region NAME`, repeatable `--peer REGION=host:port[,host:port...]`,
     // `--allow-insecure-peers` (dev only) and `--mrec-max-clock-skew-ms MS`.
@@ -732,6 +744,22 @@ async fn run(args: &[String]) -> Result<(), String> {
                 }
                 max_region_rtt_ms = Some(ms);
             }
+            "--campaign-max-inflight" => {
+                campaign_max_inflight = Some(parse_next(&mut it, "--campaign-max-inflight")?);
+            }
+            "--lag-stretch-max" => {
+                lag_stretch_max_x = Some(parse_next(&mut it, "--lag-stretch-max")?);
+            }
+            "--host-unsettled-max" => {
+                host_unsettled_max = Some(parse_next(&mut it, "--host-unsettled-max")?);
+            }
+            "--host-settle-timeout-ms" => {
+                let ms: u64 = parse_next(&mut it, "--host-settle-timeout-ms")?;
+                if ms == 0 {
+                    return Err("--host-settle-timeout-ms must be at least 1".into());
+                }
+                host_settle_timeout_ms = Some(ms);
+            }
             "--region" => mrec_region = Some(parse_next::<String>(&mut it, "--region")?),
             "--peer" => {
                 let v = parse_next::<String>(&mut it, "--peer")?;
@@ -803,10 +831,14 @@ async fn run(args: &[String]) -> Result<(), String> {
         tablet_max_read_units,
         tablet_max_write_units,
         max_region_rtt_ms,
+        campaign_max_inflight,
+        lag_stretch_max_x,
         region: mrec_region.clone(),
         peers: mrec_peers.clone(),
         allow_insecure_peers,
         mrec_max_clock_skew_ms,
+        host_unsettled_max,
+        host_settle_timeout_ms,
     };
     let orphan_sweep_after =
         orphan_sweep_after_duration(cli_cluster_settings.orphan_sweep_after_secs);
@@ -841,6 +873,28 @@ async fn run(args: &[String]) -> Result<(), String> {
         return Err(
             "--max-region-rtt-ms is only supported with --config/--node (set \
              cluster_settings.max_region_rtt_ms in the config file for the other shapes)"
+                .into(),
+        );
+    }
+    if lag_stretch_max_x.is_some() && config_path.is_none() {
+        return Err(
+            "--lag-stretch-max is only supported with --config/--node (set \
+             cluster_settings.lag_stretch_max_x in the config file for the other shapes)"
+                .into(),
+        );
+    }
+    if campaign_max_inflight.is_some() && config_path.is_none() {
+        return Err(
+            "--campaign-max-inflight is only supported with --config/--node (set \
+             cluster_settings.campaign_max_inflight in the config file for the other shapes)"
+                .into(),
+        );
+    }
+    if (host_unsettled_max.is_some() || host_settle_timeout_ms.is_some()) && config_path.is_none() {
+        return Err(
+            "--host-unsettled-max/--host-settle-timeout-ms are only supported with \
+             --config/--node (set cluster_settings.host_unsettled_max / \
+             host_settle_timeout_ms in the config file for the other shapes)"
                 .into(),
         );
     }
@@ -1971,6 +2025,10 @@ fn resolve_cluster_settings(
     merge_field!(tablet_max_read_units, "--tablet-max-read-units");
     merge_field!(tablet_max_write_units, "--tablet-max-write-units");
     merge_field!(max_region_rtt_ms, "--max-region-rtt-ms");
+    merge_field!(campaign_max_inflight, "--campaign-max-inflight");
+    merge_field!(lag_stretch_max_x, "--lag-stretch-max");
+    merge_field!(host_unsettled_max, "--host-unsettled-max");
+    merge_field!(host_settle_timeout_ms, "--host-settle-timeout-ms");
     merge_field!(allow_insecure_peers, "--allow-insecure-peers");
     merge_field!(mrec_max_clock_skew_ms, "--mrec-max-clock-skew-ms");
     if let Some(r) = &cli.region {
@@ -1988,6 +2046,7 @@ fn resolve_cluster_settings(
     effective.peers.extend(cli.peers.iter().cloned());
     effective.validate_mrec()?;
     effective.validate_pitr()?;
+    effective.validate_hosting()?;
     Ok(effective)
 }
 
@@ -2078,6 +2137,26 @@ async fn run_single(
             .cluster_settings
             .get_or_insert_with(Default::default)
             .max_region_rtt_ms = Some(ms);
+    }
+    // ADR 0078 step 4: and the stretch cap.
+    if let Some(x) = settings.lag_stretch_max_x {
+        config
+            .cluster_settings
+            .get_or_insert_with(Default::default)
+            .lag_stretch_max_x = Some(x);
+    }
+    // ADR 0078 step 3: same for the campaign cap.
+    if let Some(n) = settings.campaign_max_inflight {
+        config
+            .cluster_settings
+            .get_or_insert_with(Default::default)
+            .campaign_max_inflight = Some(n);
+    }
+    // ADR 0078 section 3: staggered hosting travels the same way.
+    if settings.host_unsettled_max.is_some() || settings.host_settle_timeout_ms.is_some() {
+        let cs = config.cluster_settings.get_or_insert_with(Default::default);
+        cs.host_unsettled_max = settings.host_unsettled_max;
+        cs.host_settle_timeout_ms = settings.host_settle_timeout_ms;
     }
     // G-d M3: the MREC peer settings likewise travel on the config (the
     // merge above validated them, region/peers/duplicates included).

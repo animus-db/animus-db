@@ -65,6 +65,7 @@ use serde::{Deserialize, Serialize};
 mod applied;
 mod apply_stall;
 pub mod backup;
+pub mod campaign_governor;
 mod ceiling;
 pub mod cluster_segment_store;
 mod codec;
@@ -80,6 +81,7 @@ pub mod hlc;
 pub mod host;
 mod hwm;
 pub mod layout;
+pub mod load_monitor;
 #[cfg(test)]
 mod mrec_props;
 mod seal;
@@ -89,6 +91,9 @@ mod trim_marker;
 mod ts_cache;
 mod txn;
 
+use campaign_governor::{
+    Admission, CampaignGovernor, CampaignPermit, CampaignWake, ElectionBackpressure,
+};
 use heartbeat_batch::{HeartbeatBatcher, HeartbeatPending};
 use hlc::{Hlc, HlcTimestamp, bump_strictly_above};
 use ts_cache::TsCache;
@@ -2814,6 +2819,9 @@ pub struct HostedOptions<E: Env> {
     pub shared_wal: Option<Arc<SharedWal<KvCommand, KvState>>>,
     /// The node's feature-gate handle.
     pub features: ClusterFeatures,
+    /// The node's election-backpressure handles (ADR 0078): the campaign
+    /// governor (and, once installed, the lag monitor). `Default` is all off.
+    pub backpressure: ElectionBackpressure,
 }
 
 impl<E: Env> Default for HostedOptions<E> {
@@ -2824,6 +2832,7 @@ impl<E: Env> Default for HostedOptions<E> {
             heartbeat_batcher: None,
             shared_wal: None,
             features: ClusterFeatures::new(),
+            backpressure: ElectionBackpressure::default(),
         }
     }
 }
@@ -2852,6 +2861,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             None,
             None,
             ClusterFeatures::new(),
+            ElectionBackpressure::default(),
         )
     }
 
@@ -2873,6 +2883,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             None,
             None,
             ClusterFeatures::new(),
+            ElectionBackpressure::default(),
         )
     }
 
@@ -2905,6 +2916,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             None,
             None,
             ClusterFeatures::new(),
+            ElectionBackpressure::default(),
         )
     }
 
@@ -2961,6 +2973,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             batcher,
             shared_wal,
             ClusterFeatures::new(),
+            ElectionBackpressure::default(),
         )
     }
 
@@ -3001,6 +3014,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             batcher,
             shared_wal,
             ClusterFeatures::new(),
+            ElectionBackpressure::default(),
         )
     }
 
@@ -3087,6 +3101,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             None,
             None,
             ClusterFeatures::new(),
+            ElectionBackpressure::default(),
         )
     }
 
@@ -3139,6 +3154,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             batcher,
             shared_wal,
             ClusterFeatures::new(),
+            ElectionBackpressure::default(),
         )
     }
 
@@ -3169,6 +3185,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             options.heartbeat_batcher,
             options.shared_wal,
             options.features,
+            options.backpressure,
         )
     }
 
@@ -3194,6 +3211,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             None,
             None,
             ClusterFeatures::new(),
+            ElectionBackpressure::default(),
         )
     }
 
@@ -3210,6 +3228,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         heartbeat_batcher: Option<HeartbeatBatcher<E>>,
         shared_wal: Option<Arc<SharedWal<KvCommand, KvState>>>,
         features: ClusterFeatures,
+        backpressure: ElectionBackpressure,
     ) -> Self {
         // ADR 0041 §3: callers hand in the tablet's **parent** scope
         // (`escape(table)` + this tablet's range); the group owns one sibling
@@ -3390,6 +3409,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             hot_change_max,
             compact_tuning,
             features,
+            backpressure,
         }));
         node
     }
@@ -12621,6 +12641,9 @@ struct DriveState<E: Env, S: StorageEngine> {
     /// See [`RaftKvNode::features`] — the gate handle every send site in
     /// `drive` (and the apply task's snapshot-image build) consults.
     features: ClusterFeatures,
+    /// ADR 0078: the node's election-backpressure handles. The default (all
+    /// `None`) is byte-for-byte the pre-ADR driver.
+    backpressure: ElectionBackpressure,
 }
 
 /// One split-build seed row (ADR 0050 Train B rung 4): `(kind index into
@@ -12716,6 +12739,58 @@ fn witness_append_entries(hlc: &Hlc, msg: &RaftMsg<KvCommand>, now: Nanos) {
 /// the moment the group wakes.
 const APPLY_SAFETY_POLL: Duration = Duration::from_millis(250);
 
+/// The leak backstop of a campaign permit (ADR 0078): `2 * election_base_max`
+/// of the holder's profile, where `election_base_max` is the top of the drawn
+/// window, `2 * (election_base + lag_stretch)`.
+fn campaign_ttl(c: &KvCore) -> Duration {
+    (c.election_timeout() + c.lag_stretch()) * 4
+}
+
+/// One timer-path tick with campaign admission (ADR 0078 mechanism 1). With no
+/// governor this is exactly `RaftCore::tick`. With one: when a campaign is due
+/// the group first returns any slot it holds (its previous attempt failed, so
+/// it re-enters at the back of the queue with a fresh ticket) and asks the
+/// governor; the core then either starts the round (`admit`) or records the
+/// deferral and leaves its lapsed election timer alone (so it keeps granting
+/// pre-votes to admitted campaigners, see `RaftCore::tick_gated`).
+#[allow(clippy::too_many_arguments)]
+fn gated_tick(
+    c: &mut KvCore,
+    now: Nanos,
+    entropy: u64,
+    governor: Option<&CampaignGovernor>,
+    permit: &mut Option<CampaignPermit>,
+    waiting: &mut bool,
+    stream: u64,
+    wake: &CampaignWake,
+) -> Vec<Out<KvCommand>> {
+    let Some(governor) = governor else {
+        return c.tick(now, entropy);
+    };
+    let admit = if c.campaign_due(now) {
+        *permit = None;
+        match governor.try_admit(stream, now, campaign_ttl(c), wake) {
+            Admission::Admitted(p) => {
+                *permit = Some(p);
+                *waiting = false;
+                true
+            }
+            Admission::Deferred => {
+                *waiting = true;
+                false
+            }
+        }
+    } else {
+        true
+    };
+    let outs = c.tick_gated(now, entropy, admit);
+    if !admit && governor.fault() == campaign_governor::GovernorFault::RearmOnDefer {
+        // Negative control (c) only: a deferral that re-arms the timer.
+        c.rearm_election_timer_for_test(now, entropy);
+    }
+    outs
+}
+
 /// The per-node **consensus loop**: recover from the WAL, spawn the apply task, then
 /// repeatedly persist the WAL, wait for the next message or timer, step the core,
 /// persist again, and ship outbound. Engine apply + compaction run on the *separate*
@@ -12767,6 +12842,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         hot_change_max,
         compact_tuning,
         features,
+        backpressure,
     } = st;
 
     // ADR 0044 phase 2 (C-02 PR 2): register this group's own stream with
@@ -12778,6 +12854,20 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
     let heartbeat_inbox = heartbeat_batcher
         .as_ref()
         .map(|b| b.register_hosted(stream));
+
+    // ADR 0078 (election backpressure), mechanism 1. `governor` is `None` when
+    // the node runs without one (the pre-ADR driver, byte for byte). `permit`
+    // is the campaign slot this group holds while it is in a campaign attempt
+    // (`RaftCore::campaign_active`); `campaign_waiting` says it is queued for
+    // one. Both are released on every exit of this future (RAII).
+    let governor: Option<CampaignGovernor> = backpressure.governor.clone();
+    let campaign_wake: CampaignWake = {
+        let ws = Arc::clone(&wake_signal);
+        Arc::new(move || ws.notify())
+    };
+    let mut permit: Option<CampaignPermit> = None;
+    let mut campaign_waiting = false;
+    let load_monitor = backpressure.monitor.clone();
 
     // C-05 PR 2 (ADR 0028): a `Some` shared WAL routes both the recovery
     // READ and every future write through the per-node coordinator (tagged
@@ -13149,6 +13239,16 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         }
     }
 
+    // ADR 0078: `campaign_now` is an exempt campaign (one designated replica per
+    // split child): it takes a slot if one is free and proceeds over the cap
+    // if not, so a fresh child never waits behind a storm.
+    if let Some(g) = &governor {
+        let c = core.lock().expect("raftkv core poisoned");
+        if c.campaign_active() {
+            permit = Some(g.acquire_exempt(stream, env.now(), campaign_ttl(&c)));
+        }
+    }
+
     // The quiesced flag as this loop last observed it (issue #1180) -- see the
     // `apply_signal.notify()` on transitions below.
     let mut quiesced_seen = false;
@@ -13184,6 +13284,13 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             if let Some(batcher) = &heartbeat_batcher {
                 batcher.unregister_hosted(stream);
             }
+            // ADR 0078: a halted group neither holds a campaign slot nor
+            // waits for one.
+            permit = None;
+            if let Some(g) = &governor {
+                g.cancel(stream);
+            }
+            drop(permit);
             stopped.store(true, Ordering::SeqCst);
             return;
         }
@@ -13334,6 +13441,13 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             // `state_machine_behind`/the quiesce veto above — `record` is a
             // cheap no-op on the overwhelming majority of iterations, where
             // the config hasn't changed since last checked.
+            // ADR 0078 mechanism 2: install the node's observed scheduling lag
+            // as follower patience (a no-op when unchanged, draws no entropy,
+            // applies at the next timer reset). Absent monitor = never called.
+            if let Some(m) = &load_monitor {
+                let stretch = m.stretch(c.election_timeout());
+                c.set_lag_stretch(stretch);
+            }
             (c.next_deadline(), c.is_quiesced(), c.config())
         };
         voter_history
@@ -13466,7 +13580,22 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
                         let entropy = env.next_u64();
                         let (raft_outs, gate) = {
                             let mut c = core.lock().expect("raftkv core poisoned");
-                            let outs = c.on_local_wake(env.now(), entropy);
+                            let mut outs = c.on_local_wake(env.now(), entropy);
+                            // ADR 0078: a wake from the governor (a slot freed
+                            // for this queued group) retries admission now
+                            // rather than at the next timer.
+                            if campaign_waiting && c.campaign_due(env.now()) {
+                                outs.extend(gated_tick(
+                                    &mut c,
+                                    env.now(),
+                                    entropy,
+                                    governor.as_ref(),
+                                    &mut permit,
+                                    &mut campaign_waiting,
+                                    stream,
+                                    &campaign_wake,
+                                ));
+                            }
                             (outs, persist.gate(c.has_unflushed_wal()))
                         };
                         (
@@ -13553,7 +13682,16 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
                         let entropy = env.next_u64();
                         let (raft_outs, gate) = {
                             let mut c = core.lock().expect("raftkv core poisoned");
-                            let outs = c.tick(env.now(), entropy);
+                            let outs = gated_tick(
+                                &mut c,
+                                env.now(),
+                                entropy,
+                                governor.as_ref(),
+                                &mut permit,
+                                &mut campaign_waiting,
+                                stream,
+                                &campaign_wake,
+                            );
                             (outs, persist.gate(c.has_unflushed_wal()))
                         };
                         // ADR 0044 phase 2 (C-02 PR 2): a bare (no-entries)
@@ -13608,6 +13746,29 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
 
         let (after_commit, install_pending, is_quiesced_now, removal_stats) = {
             let c = core.lock().expect("raftkv core poisoned");
+            // ADR 0078: keep the campaign slot consistent with the core's role
+            // after every step. Holding one only while in a campaign attempt
+            // covers the win, the step-down (a heard leader or a higher term)
+            // and a leadership-transfer `TimeoutNow`, which starts a campaign
+            // outside the timer path: it takes a slot if free and proceeds over
+            // the cap if not (an exempt campaign).
+            if let Some(g) = &governor {
+                if !c.campaign_active() {
+                    permit = None;
+                } else if permit.is_none() && !c.campaign_deferred() {
+                    // (A deferred retry of a PreCandidate/Candidate is
+                    // `campaign_active` by role but is waiting in the queue,
+                    // not campaigning: giving it an exempt permit here took
+                    // it out of the queue and leaked an over-cap slot on
+                    // every retry, starving the queue.)
+                    permit = Some(g.acquire_exempt(stream, env.now(), campaign_ttl(&c)));
+                    campaign_waiting = false;
+                }
+                if campaign_waiting && !c.campaign_due(env.now()) {
+                    g.cancel(stream);
+                    campaign_waiting = false;
+                }
+            }
             (
                 c.commit_index(),
                 c.has_pending_install(),

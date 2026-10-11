@@ -74,6 +74,37 @@ enum Event {
     Timer(TimerId),
     /// A message is delivered to a node's inbox (on `env.stream`, ADR 0026).
     Deliver { to: NodeId, env: Envelope },
+    /// A costed node's virtual CPU frees up ([`Simulator::set_cpu_cost`]):
+    /// run the next queued event for it. At most one is pending per node.
+    CpuDrain(NodeId),
+}
+
+/// Which waiting event a costed node's CPU takes next within a class
+/// ([`Simulator::set_cpu_order`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CpuOrder {
+    /// First come, first served (by scheduled time). Deterministic and
+    /// benign: a backlog behaves as a uniformly slow clock.
+    #[default]
+    Fifo,
+    /// A uniformly random waiting event, drawn from the simulation RNG (so
+    /// still a pure function of the seed). Models a runtime with thousands
+    /// of ready tasks, which does not serve them in arrival order: any
+    /// standing queue gives an individual event a long, high-variance wait.
+    Random,
+}
+
+/// Events waiting for a costed node's virtual CPU ([`Simulator::set_cpu_cost`]).
+/// Two FIFO classes with **timers strictly first**: a real runtime fires an
+/// expired timer at its next poll even while received messages sit unread, and
+/// that ordering (a follower's election timer beating the heartbeat already
+/// queued behind it) is exactly the false trigger of ADR 0078.
+#[derive(Default)]
+struct CpuQueue {
+    timers: VecDeque<TimerId>,
+    delivers: VecDeque<(NodeId, Envelope)>,
+    /// A `CpuDrain` for this node is on the timeline.
+    drain_pending: bool,
 }
 
 /// Network delay/drop/duplicate/corruption model. Every sample (drop,
@@ -367,6 +398,14 @@ pub enum TraceEvent {
     /// leaves before then; messages addressed to it queue (deferred, not
     /// dropped) until then too.
     Pause { t: u64, node: NodeId, until: u64 },
+    /// A node was given a per-event CPU cost ([`Simulator::set_cpu_cost`]):
+    /// from `t` on, each timer fire and message delivery for it occupies
+    /// `per_event_nanos` of virtual node-CPU, and its events are serialized.
+    CpuCost {
+        t: u64,
+        node: NodeId,
+        per_event_nanos: u64,
+    },
     /// A disk op failed with an injected error ([`DiskConfig::error_threshold`]
     /// / [`DiskConfig::enospc_threshold`]). `kind` is `"enospc"` (the op
     /// failed with `ErrorKind::StorageFull`) or `"error"` (generic
@@ -463,6 +502,13 @@ impl std::fmt::Display for TraceEvent {
             }
             TraceEvent::Pause { t, node, until } => {
                 write!(f, "t={t} PAUSE node={node} until={until}")
+            }
+            TraceEvent::CpuCost {
+                t,
+                node,
+                per_event_nanos,
+            } => {
+                write!(f, "t={t} CPUCOST node={node} per_event={per_event_nanos}")
             }
             TraceEvent::DiskFault {
                 t,
@@ -566,6 +612,21 @@ struct SimState {
     // before that instant either (see `send_stream`'s deliver_at clamp). See
     // `Simulator::pause`.
     paused_until: BTreeMap<NodeId, u64>,
+    // Per-node virtual-CPU cost of one event (a timer fire or a message
+    // delivery), in nanoseconds. Absent = no starvation model for the node
+    // (every event is free and instant, as before). See
+    // `Simulator::set_cpu_cost`.
+    cpu_cost: BTreeMap<NodeId, u64>,
+    // Per-node instant (absolute virtual time) the node's virtual CPU is next
+    // free. Only populated for a node with a `cpu_cost`. An event due before
+    // it is deferred to it, exactly like a paused node's events are deferred
+    // to `paused_until`.
+    cpu_busy_until: BTreeMap<NodeId, u64>,
+    // Per-node queue of events that arrived while the node's virtual CPU was
+    // busy (see `CpuQueue`). Only costed nodes ever have an entry.
+    cpu_queue: BTreeMap<NodeId, CpuQueue>,
+    // Per-node service order (absent = `CpuOrder::Fifo`).
+    cpu_order: BTreeMap<NodeId, CpuOrder>,
     // Per-node recording metrics sink handed out by `SimEnv::metrics()`,
     // created lazily on first access. Scoped to THIS simulator's state, so
     // two simulators (or two nodes) never share a sink — mirrors `ProdEnv`'s
@@ -659,6 +720,234 @@ struct SimState {
 }
 
 impl SimState {
+    /// The CPU-starvation gate (`Simulator::set_cpu_cost`). Whether `node`'s
+    /// virtual CPU cannot take an event at `t`: it is costed and either still
+    /// busy or has earlier events queued (so a newcomer never jumps them).
+    fn cpu_busy(&self, node: &NodeId, t: u64) -> bool {
+        self.cpu_cost.contains_key(node)
+            && (t < self.cpu_busy_until.get(node).copied().unwrap_or(0)
+                || self
+                    .cpu_queue
+                    .get(node)
+                    .is_some_and(|q| !q.timers.is_empty() || !q.delivers.is_empty()))
+    }
+
+    /// Charge one event to `node`'s virtual CPU, starting at `t`. A node with
+    /// no cost is a pure no-op (no map is touched), which is what keeps every
+    /// pre-existing trace byte-identical.
+    fn cpu_charge(&mut self, node: &NodeId, t: u64) {
+        if let Some(&cost) = self.cpu_cost.get(node) {
+            self.cpu_busy_until
+                .insert(node.clone(), t.saturating_add(cost));
+        }
+    }
+
+    /// Make sure a `CpuDrain` is pending for `node` (at its `busy_until`, never
+    /// in the past).
+    fn cpu_schedule_drain(&mut self, node: &NodeId, t: u64) {
+        let at = self.cpu_busy_until.get(node).copied().unwrap_or(0).max(t);
+        let q = self.cpu_queue.entry(node.clone()).or_default();
+        if q.drain_pending {
+            return;
+        }
+        q.drain_pending = true;
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.timeline
+            .insert((at, seq), Event::CpuDrain(node.clone()));
+    }
+
+    /// Everything that happens when a message reaches `to`: the drop checks
+    /// (crash, closed stream, partition, protocol refusal), the pause defer,
+    /// the CPU gate, and finally the inbox push. `from_queue` is true when the
+    /// delivery is being replayed from the node's CPU queue (it has already
+    /// waited its turn). Returns `Some(waker)` iff the message was actually
+    /// delivered (the CPU slot was consumed), `None` if it was dropped,
+    /// deferred, or queued.
+    fn deliver(
+        &mut self,
+        to: NodeId,
+        env: Envelope,
+        t: u64,
+        from_queue: bool,
+    ) -> Option<Option<Waker>> {
+        let from = env.from.clone();
+        let stream = env.stream;
+        if self.crashed.contains(&to) {
+            self.trace.push(TraceEvent::Drop {
+                t,
+                from,
+                to,
+                stream,
+                reason: "crashed",
+            });
+            None
+        } else if self.closed_streams.contains(&(to.clone(), stream)) {
+            // ADR 0026, 2026-09-28 amendment: a frame addressed
+            // to a stream this node has explicitly closed (and
+            // not yet reopened via `recv_stream`) is discarded
+            // rather than queued — the `SimEnv` mirror of
+            // `ProdEnv`'s `Demux`-closed drop in `spawn_pump`.
+            self.trace.push(TraceEvent::Drop {
+                t,
+                from,
+                to,
+                stream,
+                reason: "stream-closed",
+            });
+            None
+        } else if self.partitions.contains(&(from.clone(), to.clone())) {
+            self.trace.push(TraceEvent::Drop {
+                t,
+                from,
+                to,
+                stream,
+                reason: "partition",
+            });
+            None
+        } else if let Some(reason) = self.network_protocol_refused(&from, &to, Some(&env.peer_ext))
+        {
+            // Handshake-modelled refusal (ADR 0073 Phase 0,
+            // workstream D) — see `network_protocol_refused`'s
+            // doc for why this is a pure comparison (no RNG, no
+            // timeline event) and hence never perturbs a run
+            // that never configures a non-default protocol.
+            // Checked before the pause branch below: a refused
+            // message is never delivered at all, paused or not
+            // — unlike a paused destination's ordinary
+            // deliveries, there is nothing to "catch up" on
+            // later.
+            *self.protocol_refusals.entry(to.clone()).or_insert(0) += 1;
+            self.trace.push(TraceEvent::Drop {
+                t,
+                from,
+                to,
+                stream,
+                reason,
+            });
+            None
+        } else if let Some(until) = self
+            .paused_until
+            .get(&to)
+            .copied()
+            .filter(|&until| t < until)
+        {
+            // The destination is paused: queue, don't drop — defer
+            // this same delivery to fire at the resume instant.
+            let seq = self.next_seq;
+            self.next_seq += 1;
+            self.timeline
+                .insert((until, seq), Event::Deliver { to, env });
+            None
+        } else if !from_queue && self.cpu_busy(&to, t) {
+            // `Simulator::set_cpu_cost`: the destination's virtual CPU is
+            // busy (or has earlier events waiting). Queue behind them; the
+            // message is already "received" by the kernel, it just has not
+            // been read yet.
+            self.cpu_queue
+                .entry(to.clone())
+                .or_default()
+                .delivers
+                .push_back((to.clone(), env));
+            self.cpu_schedule_drain(&to, t);
+            None
+        } else {
+            self.cpu_charge(&to, t);
+            let len = env.payload.len();
+            self.trace.push(TraceEvent::Deliver {
+                t,
+                from,
+                to: to.clone(),
+                stream,
+                len,
+            });
+            let key = (to.clone(), stream);
+            *self.inbox_bytes.entry(key.clone()).or_insert(0) += len;
+            self.inboxes.entry(key).or_default().push_back(env);
+            self.enforce_inbox_cap(&to, stream, t);
+            Some(self.recv_wakers.remove(&(to, stream)))
+        }
+    }
+
+    /// A costed node's CPU is free at `t`: run its next queued event (timers
+    /// first), skipping cancelled timers and dropped deliveries for free.
+    /// Returns the waker to wake, if any.
+    fn cpu_drain(&mut self, node: &NodeId, t: u64) -> Option<Waker> {
+        if let Some(q) = self.cpu_queue.get_mut(node) {
+            q.drain_pending = false;
+        }
+        // Paused while waiting: nothing runs until the resume instant.
+        if let Some(until) = self.paused_until.get(node).copied().filter(|&u| t < u) {
+            if let Some(q) = self.cpu_queue.get_mut(node) {
+                q.drain_pending = true;
+            }
+            let seq = self.next_seq;
+            self.next_seq += 1;
+            self.timeline
+                .insert((until, seq), Event::CpuDrain(node.clone()));
+            return None;
+        }
+        let mut woken = None;
+        loop {
+            let random = self.cpu_order.get(node) == Some(&CpuOrder::Random);
+            let pick = |rng: &mut ChaCha8Rng, len: usize| -> usize {
+                if random && len > 1 {
+                    (rng.next_u64() % len as u64) as usize
+                } else {
+                    0
+                }
+            };
+            let next_timer = match self.cpu_queue.get_mut(node) {
+                Some(q) if !q.timers.is_empty() => {
+                    let i = pick(&mut self.rng, q.timers.len());
+                    if i == 0 {
+                        q.timers.pop_front()
+                    } else {
+                        q.timers.swap_remove_back(i)
+                    }
+                }
+                _ => None,
+            };
+            if let Some(id) = next_timer {
+                // A timer whose `Sleep` was dropped while it waited is gone.
+                if !self.timer_wakers.contains_key(&id) {
+                    continue;
+                }
+                self.cpu_charge(node, t);
+                self.trace.push(TraceEvent::Timer { t, id });
+                self.timer_key.remove(&id);
+                woken = self.timer_wakers.remove(&id);
+                break;
+            }
+            let next_delivery = match self.cpu_queue.get_mut(node) {
+                Some(q) if !q.delivers.is_empty() => {
+                    let i = pick(&mut self.rng, q.delivers.len());
+                    if i == 0 {
+                        q.delivers.pop_front()
+                    } else {
+                        q.delivers.swap_remove_back(i)
+                    }
+                }
+                _ => None,
+            };
+            let Some((to, env)) = next_delivery else {
+                break;
+            };
+            if let Some(w) = self.deliver(to, env, t, true) {
+                woken = w;
+                break;
+            }
+        }
+        let more = self
+            .cpu_queue
+            .get(node)
+            .is_some_and(|q| !q.timers.is_empty() || !q.delivers.is_empty());
+        if more {
+            self.cpu_schedule_drain(node, t);
+        }
+        woken
+    }
+
     /// The effective disk fault model for `node`: its override, else the global.
     fn disk_cfg_for(&self, node: &NodeId) -> &DiskConfig {
         self.node_disk_cfg.get(node).unwrap_or(&self.disk_cfg)
@@ -1080,6 +1369,10 @@ impl Simulator {
             clock_skew: BTreeMap::new(),
             clock_drift: BTreeMap::new(),
             paused_until: BTreeMap::new(),
+            cpu_cost: BTreeMap::new(),
+            cpu_busy_until: BTreeMap::new(),
+            cpu_queue: BTreeMap::new(),
+            cpu_order: BTreeMap::new(),
             metrics: BTreeMap::new(),
             timer_owner: BTreeMap::new(),
             timer_key: BTreeMap::new(),
@@ -1606,6 +1899,22 @@ impl Simulator {
                 });
             }
         }
+        // Messages already received but still waiting for a costed node's
+        // virtual CPU (`set_cpu_cost`) die with the process too.
+        let queued: Vec<(NodeId, Envelope)> = st
+            .cpu_queue
+            .get_mut(&node)
+            .map(|q| q.delivers.drain(..).collect())
+            .unwrap_or_default();
+        for (to, env) in queued {
+            st.trace.push(TraceEvent::Drop {
+                t,
+                from: env.from,
+                to,
+                stream: env.stream,
+                reason: "stopped",
+            });
+        }
         // Explicit, not relying only on declaration-order drop semantics:
         // release the lock before `removed_futures` (declared above `st`)
         // drops the collected futures — see that field's own comment.
@@ -1651,6 +1960,88 @@ impl Simulator {
         let until = t.saturating_add(dur_nanos(dur));
         st.paused_until.insert(node.clone(), until);
         st.trace.push(TraceEvent::Pause { t, node, until });
+    }
+
+    /// Choose how a costed node picks among its waiting events
+    /// ([`CpuOrder`]; default FIFO). Timers still run before messages.
+    /// Only meaningful with [`set_cpu_cost`](Self::set_cpu_cost).
+    pub fn set_cpu_order(&self, node: NodeId, order: CpuOrder) {
+        let mut st = self.shared.lock();
+        match order {
+            CpuOrder::Fifo => st.cpu_order.remove(&node),
+            CpuOrder::Random => st.cpu_order.insert(node, order),
+        };
+    }
+
+    /// How many events are waiting for `node`'s virtual CPU right now
+    /// ([`set_cpu_cost`](Self::set_cpu_cost)): `(timers, deliveries)`.
+    /// `(0, 0)` for a node with no cost. Observability only; nothing in the
+    /// simulator reads it.
+    #[must_use]
+    pub fn cpu_backlog(&self, node: &NodeId) -> (usize, usize) {
+        self.shared
+            .lock()
+            .cpu_queue
+            .get(node)
+            .map_or((0, 0), |q| (q.timers.len(), q.delivers.len()))
+    }
+
+    /// Give `node` a finite virtual CPU (ADR 0078 "step zero"): every timer
+    /// fire and message delivery for it now costs `per_event` of node-CPU.
+    /// The node's events are **serialized**: an event runs at
+    /// `max(scheduled, busy_until)` and then `busy_until += per_event`
+    /// (measured from the instant it actually ran). A node whose offered
+    /// load exceeds `1 / per_event` events per second therefore falls behind
+    /// without bound: its timers fire late and its inbox backs up, which is
+    /// exactly the starvation a real overloaded process shows and `pause`
+    /// (all-or-nothing) cannot express.
+    ///
+    /// **Which waiting event runs next** (the one refinement of "FIFO by
+    /// scheduled time", found by measurement): an expired **timer** runs
+    /// before any waiting **message**, timers FIFO among themselves and
+    /// messages FIFO among themselves. A strict FIFO node is just a slow
+    /// clock (every timer and every heartbeat is late by the same backlog,
+    /// in the same order) and, measured, never false-triggers a follower. A
+    /// real runtime fires an expired timer at its next poll while received
+    /// messages sit unread, so a follower's election timer beats the
+    /// heartbeat already queued behind it; that is the false trigger issue
+    /// #1199 and ADR 0078 are about, and the only way a starved node can lose
+    /// leadership it did nothing to lose.
+    ///
+    /// Implemented on the defer-at-fire hook `pause` has, with one extra
+    /// timeline event kind: an event popped while the node is busy goes into
+    /// the node's queue and a single `CpuDrain` at `busy_until` runs the next
+    /// one (O(1) per event, however deep the backlog). It composes with
+    /// `pause` (a paused node defers to the resume instant first). A timer
+    /// whose `Sleep` is dropped while queued is cancelled for free.
+    ///
+    /// **Default-off**: a node with no cost is untouched (no map entry is
+    /// created, no RNG is drawn, no extra timeline event is scheduled), so
+    /// every existing seed's trace is byte-identical. `Duration::ZERO`
+    /// removes the cost again. Calling it again replaces the cost; the
+    /// node's current `busy_until` and queue are kept, so lowering the cost
+    /// mid-run (an overload that is then relieved) drains the backlog at the
+    /// new, faster rate. Deterministic (a pure function of the schedule,
+    /// never drawn from the RNG) and traced ([`TraceEvent::CpuCost`]) at the
+    /// call site, so an `ANIMUS_SEED` replay reproduces it exactly.
+    ///
+    /// Only an event that would actually fire costs CPU: a delivery dropped
+    /// for a crashed node, a partition, a closed stream or a protocol
+    /// refusal is free (also when the drop is decided after it queued).
+    pub fn set_cpu_cost(&self, node: NodeId, per_event: Duration) {
+        let mut st = self.shared.lock();
+        let t = st.clock;
+        let nanos = dur_nanos(per_event);
+        if nanos == 0 {
+            st.cpu_cost.remove(&node);
+        } else {
+            st.cpu_cost.insert(node.clone(), nanos);
+        }
+        st.trace.push(TraceEvent::CpuCost {
+            t,
+            node,
+            per_event_nanos: nanos,
+        });
     }
 
     /// Tear down this simulation's still-pending tasks, breaking the
@@ -1920,7 +2311,25 @@ impl Simulator {
                         // the right timeline entry (issue #837).
                         st.timer_key.insert(id, (until, seq));
                         None
+                    } else if let Some(node) = owner.filter(|o| st.cpu_busy(o, t)) {
+                        // `Simulator::set_cpu_cost`: the owner's virtual CPU
+                        // is busy. The timer has expired but cannot run yet;
+                        // it waits in the node's queue (ahead of any message
+                        // queued behind it). `timer_key` keeps its stale
+                        // key: `Sleep::drop` removing a missing timeline
+                        // entry is harmless, and it removes the waker, which
+                        // is how `cpu_drain` knows the timer was cancelled.
+                        st.cpu_queue
+                            .entry(node.clone())
+                            .or_default()
+                            .timers
+                            .push_back(id);
+                        st.cpu_schedule_drain(&node, t);
+                        None
                     } else {
+                        if let Some(o) = st.timer_owner.get(&id).cloned() {
+                            st.cpu_charge(&o, t);
+                        }
                         st.trace.push(TraceEvent::Timer { t, id });
                         // Genuinely fired: nothing left on the timeline for
                         // this id, so there's nothing left for a later
@@ -1929,88 +2338,8 @@ impl Simulator {
                         st.timer_wakers.remove(&id)
                     }
                 }
-                Event::Deliver { to, env } => {
-                    let from = env.from.clone();
-                    let stream = env.stream;
-                    if st.crashed.contains(&to) {
-                        st.trace.push(TraceEvent::Drop {
-                            t,
-                            from,
-                            to,
-                            stream,
-                            reason: "crashed",
-                        });
-                        None
-                    } else if st.closed_streams.contains(&(to.clone(), stream)) {
-                        // ADR 0026, 2026-09-28 amendment: a frame addressed
-                        // to a stream this node has explicitly closed (and
-                        // not yet reopened via `recv_stream`) is discarded
-                        // rather than queued — the `SimEnv` mirror of
-                        // `ProdEnv`'s `Demux`-closed drop in `spawn_pump`.
-                        st.trace.push(TraceEvent::Drop {
-                            t,
-                            from,
-                            to,
-                            stream,
-                            reason: "stream-closed",
-                        });
-                        None
-                    } else if st.partitions.contains(&(from.clone(), to.clone())) {
-                        st.trace.push(TraceEvent::Drop {
-                            t,
-                            from,
-                            to,
-                            stream,
-                            reason: "partition",
-                        });
-                        None
-                    } else if let Some(reason) =
-                        st.network_protocol_refused(&from, &to, Some(&env.peer_ext))
-                    {
-                        // Handshake-modelled refusal (ADR 0073 Phase 0,
-                        // workstream D) — see `network_protocol_refused`'s
-                        // doc for why this is a pure comparison (no RNG, no
-                        // timeline event) and hence never perturbs a run
-                        // that never configures a non-default protocol.
-                        // Checked before the pause branch below: a refused
-                        // message is never delivered at all, paused or not
-                        // — unlike a paused destination's ordinary
-                        // deliveries, there is nothing to "catch up" on
-                        // later.
-                        *st.protocol_refusals.entry(to.clone()).or_insert(0) += 1;
-                        st.trace.push(TraceEvent::Drop {
-                            t,
-                            from,
-                            to,
-                            stream,
-                            reason,
-                        });
-                        None
-                    } else if let Some(until) =
-                        st.paused_until.get(&to).copied().filter(|&until| t < until)
-                    {
-                        // The destination is paused: queue, don't drop — defer
-                        // this same delivery to fire at the resume instant.
-                        let seq = st.next_seq;
-                        st.next_seq += 1;
-                        st.timeline.insert((until, seq), Event::Deliver { to, env });
-                        None
-                    } else {
-                        let len = env.payload.len();
-                        st.trace.push(TraceEvent::Deliver {
-                            t,
-                            from,
-                            to: to.clone(),
-                            stream,
-                            len,
-                        });
-                        let key = (to.clone(), stream);
-                        *st.inbox_bytes.entry(key.clone()).or_insert(0) += len;
-                        st.inboxes.entry(key).or_default().push_back(env);
-                        st.enforce_inbox_cap(&to, stream, t);
-                        st.recv_wakers.remove(&(to, stream))
-                    }
-                }
+                Event::Deliver { to, env } => st.deliver(to, env, t, false).flatten(),
+                Event::CpuDrain(node) => st.cpu_drain(&node, t),
             }
         };
         if let Some(w) = waker {

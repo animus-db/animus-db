@@ -12157,6 +12157,39 @@ it and `Bound*Node::with_max_region_rtt` plumbs it to the control group
 `gen-config` cannot warn about a region-concentrated control set until G-a
 supplies labels.
 
+## Election backpressure flags (ADR 0078 steps 3-5)
+
+`cluster_settings.campaign_max_inflight` (additive, `skip_serializing_if` unset;
+default 32, `0` disables) and `--campaign-max-inflight N` (needs `--config`,
+same reach and both-sides-conflict rule as `--max-region-rtt-ms`) cap the
+simultaneously active Raft campaigns across all data-plane groups a node hosts.
+`ClusterConfig::campaign_max_inflight()` reads it; `Bound{,Data}Node::
+with_campaign_max_inflight` carries it to the tablet-host reconciler start
+(`Reconciler::set_election_backpressure`), which builds one
+`animus_cp_data::campaign_governor::CampaignGovernor` per node beside the
+heartbeat batcher. The control-plane group never uses it. Metrics
+`cp_campaign_{admitted,deferred,inflight,inflight_hwm,queue_depth}`. Serde test:
+`config::tests::campaign_max_inflight_is_additive_and_old_configs_parse`.
+
+`cluster_settings.lag_stretch_max_x` (additive; default 4; `0` disables the
+per-node `LoadMonitor` and the stretch) and `--lag-stretch-max N` (needs
+`--config`, same conflict rule) set `S_max` as a multiple of the election base
+(ADR 0078 step 4). `node_election_backpressure` builds both handles (governor
+if `K > 0`, monitor if `x > 0`) once per node and the reconciler hands them to
+every hosted data-plane group; the control group never sees them.
+`/admin/health` shows `election_lag_ms`, `election_stretch_ms`,
+`campaigns_inflight`, `campaigns_queued` (advisory, never part of `ok`).
+
+`cluster_settings.host_unsettled_max` (additive; default 100; `0` disables the
+stagger) and `--host-unsettled-max N`, plus `cluster_settings.
+host_settle_timeout_ms` (default 600; `0` refused) and
+`--host-settle-timeout-ms MS` (both need `--config`, same conflict rule), size
+the staggered hosting ramp (ADR 0078 section 3). All four flags are in the
+`--config FILE --node I` line of `--help`; the operator mirrors them as
+`spec.campaignMaxInflight`/`lagStretchMaxX`/`hostUnsettledMax`/
+`hostSettleTimeoutMs`. Since ADR 0078's Tier 2, `SimCluster` runs the governor
+and monitor at their defaults.
+
 ## MRSC global tables: `global_tables.rs` and `sim_cluster_mrsc` (ADR 0075, G-01 G-c)
 
 `global_tables.rs` is the `E: Env`-generic client/admin edge of MRSC (deny-

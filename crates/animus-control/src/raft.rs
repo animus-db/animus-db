@@ -1374,6 +1374,26 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     heartbeat_interval: Duration,
     election_deadline: Nanos,
     heartbeat_deadline: Nanos,
+    // ADR 0078 (election backpressure), node-local and volatile, in-memory
+    // only (never persisted, never on the wire):
+    //
+    // `lag_stretch` widens ONLY the follower's patience: it is added to
+    // `election_base` where `reset_election_timer` draws a deadline and where
+    // `next_cluster_check_resend` draws a resend. It is deliberately NOT
+    // folded into `election_base` itself, so everything that reads the
+    // configured base (`transfer_leadership`'s budget, `election_timeout()`
+    // and the health grace built on it, the leader's heartbeat interval, the
+    // vote lease) is untouched. `Duration::ZERO` (the default) is exactly the
+    // pre-ADR behavior. Installed by the driver via `set_lag_stretch`.
+    lag_stretch: Duration,
+    // `Some(retry_at)` while a campaign that was due was deferred by
+    // `tick_gated(.., admit = false)`: the election timer is deliberately left
+    // lapsed (so this node still GRANTS pre-votes and votes to admitted
+    // campaigners, see `tick_gated`), and `next_deadline` returns `retry_at`
+    // instead so the driver wakes to ask again. Cleared by
+    // `reset_election_timer` (a heard leader, a fresh round) and on becoming
+    // leader.
+    campaign_hold: Option<Nanos>,
 
     // Applied state machine and the order commands were applied (for tests /
     // divergence checks). `applied` holds only the window since the last
@@ -1714,6 +1734,8 @@ where
             heartbeat_interval: Duration::from_millis(50),
             election_deadline: Nanos(0),
             heartbeat_deadline: Nanos(0),
+            lag_stretch: Duration::ZERO,
+            campaign_hold: None,
             metadata: S::default(),
             applied: Vec::new(),
             pending_apply: Vec::new(),
@@ -2360,13 +2382,21 @@ where
             // regression this amendment fixes: the resend logic in `tick()`
             // was correct in isolation, but `tick()` was never being called
             // at the right time to run it.
+            // ADR 0078: while a due campaign is deferred (`campaign_hold`),
+            // `election_deadline` is deliberately left lapsed, so the driver
+            // must wake at the hold's retry instant instead, or it would spin
+            // on an already-past deadline.
+            let election = match self.campaign_hold {
+                Some(retry_at) => Nanos(self.election_deadline.0.max(retry_at.0)),
+                None => self.election_deadline,
+            };
             match self.cluster_check_pending {
                 Some(_) => {
-                    Some(Nanos(self.election_deadline.0.min(
+                    Some(Nanos(election.0.min(
                         self.cluster_check_resend_deadline.map_or(u64::MAX, |d| d.0),
                     )))
                 }
-                None => Some(self.election_deadline),
+                None => Some(election),
             }
         }
     }
@@ -3031,9 +3061,60 @@ where
     }
 
     fn reset_election_timer(&mut self, now: Nanos, entropy: u64) {
-        let base = self.election_base.as_nanos() as u64;
+        // ADR 0078: the draw is `[b, 2b)` with `b = election_base +
+        // lag_stretch` (one `entropy` value, exactly as before; the stretch
+        // is zero unless the driver installed one).
+        let base = self.stretched_base();
         let extra = if base == 0 { 0 } else { entropy % base };
-        self.election_deadline = Nanos(now.0.saturating_add(base + extra));
+        self.election_deadline = Nanos(now.0.saturating_add(base.saturating_add(extra)));
+        self.campaign_hold = None;
+    }
+
+    /// `election_base + lag_stretch` in nanoseconds: the base the follower's
+    /// patience is drawn from (ADR 0078). The configured
+    /// [`election_timeout`](Self::election_timeout) is NOT this.
+    fn stretched_base(&self) -> u64 {
+        (self.election_base.as_nanos() as u64).saturating_add(self.lag_stretch.as_nanos() as u64)
+    }
+
+    /// Install the node's observed scheduling lag as an election-patience
+    /// stretch (ADR 0078 mechanism 2). Returns whether anything changed.
+    ///
+    /// **A no-op when unchanged and draws no entropy** (like
+    /// [`set_timing`](Self::set_timing)), so a driver may call it on every
+    /// iteration. It does not re-arm any deadline: the new stretch applies at
+    /// the next [`reset_election_timer`](Self::reset_election_timer) (every
+    /// heartbeat from the leader), which is exactly when a follower decides
+    /// how long to wait for the *next* one. It widens only
+    /// `reset_election_timer` and `next_cluster_check_resend`; the transfer
+    /// budget, the health grace, the heartbeat interval and the vote lease
+    /// keep reading the configured `election_base` on purpose (a leader's
+    /// heartbeat must not slow down, only followers' patience grows).
+    pub fn set_lag_stretch(&mut self, stretch: Duration) -> bool {
+        if self.lag_stretch == stretch {
+            return false;
+        }
+        self.lag_stretch = stretch;
+        true
+    }
+
+    /// The stretch [`set_lag_stretch`](Self::set_lag_stretch) last installed
+    /// (zero by default).
+    #[must_use]
+    pub fn lag_stretch(&self) -> Duration {
+        self.lag_stretch
+    }
+
+    /// **Negative-control hook, never called in production** (ADR 0078 control
+    /// (c)): re-arm the election timer exactly as a heard heartbeat would. A
+    /// driver that did this when it *deferred* a campaign would turn every
+    /// deferred voter into a refuser of pre-votes (`handle_pre_vote` grants
+    /// only once `now >= election_deadline`), which is the deadlock
+    /// [`tick_gated`](Self::tick_gated) documents; the Tier 1 corpus uses it
+    /// to prove that bug is observable.
+    #[doc(hidden)]
+    pub fn rearm_election_timer_for_test(&mut self, now: Nanos, entropy: u64) {
+        self.reset_election_timer(now, entropy);
     }
 
     // ---- durable-state helpers ------------------------------------------
@@ -3170,8 +3251,76 @@ where
 
     // ---- driving entry points -------------------------------------------
 
+    /// Whether a [`tick`](Self::tick) at `now` would begin a campaign round
+    /// that **broadcasts** (ADR 0078): the role is `Follower`, `PreCandidate`
+    /// or `Candidate`, the election timer has lapsed, and none of
+    /// `start_pre_vote`'s early returns applies (boot-time cluster check
+    /// pending or refused, not a voter, state machine behind, storage full).
+    /// A single-voter group, which wins without a message, is not "due" either.
+    /// Pure: touches nothing. The driver calls it before `tick` to know
+    /// whether to ask a node-level governor for a permit.
+    #[must_use]
+    pub fn campaign_due(&self, now: Nanos) -> bool {
+        matches!(
+            self.role,
+            Role::Follower | Role::PreCandidate | Role::Candidate
+        ) && now.0 >= self.election_deadline.0
+            && !self.cluster_check_refused
+            && self.cluster_check_pending.is_none()
+            && self.is_voter()
+            && !self.state_machine_behind
+            && !self.storage_full
+            && self.majority() > 1
+    }
+
+    /// Whether this core is in a campaign attempt (`PreCandidate` or
+    /// `Candidate`), so a driver can release a campaign permit on the
+    /// transition back to `Follower` or on to `Leader` without the core
+    /// knowing about any governor (ADR 0078).
+    #[must_use]
+    pub fn campaign_active(&self) -> bool {
+        matches!(self.role, Role::PreCandidate | Role::Candidate)
+    }
+
+    /// Whether a due campaign is currently deferred by [`tick_gated`](Self::tick_gated)
+    /// (`admit = false`). Cleared when a campaign starts (the election timer
+    /// is re-armed) or the node wins. A deferred `PreCandidate` or `Candidate`
+    /// is still `campaign_active` by role but is NOT campaigning, so a driver
+    /// must not give it an exempt permit (ADR 0078).
+    #[must_use]
+    pub fn campaign_deferred(&self) -> bool {
+        self.campaign_hold.is_some()
+    }
+
     /// Handle a timer tick at `now`. May start an election or send heartbeats.
+    ///
+    /// Exactly [`tick_gated`](Self::tick_gated) with `admit = true`, so every
+    /// caller without a campaign governor is byte-identical to before ADR 0078.
     pub fn tick(&mut self, now: Nanos, entropy: u64) -> Vec<Out<C>> {
+        self.tick_gated(now, entropy, true)
+    }
+
+    /// [`tick`](Self::tick) with campaign admission (ADR 0078 mechanism 1).
+    /// `admit` says whether this group holds a campaign permit.
+    ///
+    /// When `admit` is `false` and a campaign is due
+    /// ([`campaign_due`](Self::campaign_due)) the core does **not** reset the
+    /// election timer and does **not** change role or term: it records
+    /// `campaign_hold = Some(now + election_base)` (so
+    /// [`next_deadline`](Self::next_deadline) wakes the driver to ask again)
+    /// and starts nothing. Everything else a tick does (the cluster-check
+    /// resend, a leader's heartbeats and transfer abort) is unaffected by
+    /// `admit`; the permit check sits after every early return of the
+    /// campaign path, so a learner, a non-voter or a node with a pending
+    /// cluster check never needs, and is never refused by, a permit.
+    ///
+    /// **Why the lapsed `election_deadline` is left alone (the deadlock this
+    /// avoids):** [`handle_pre_vote`](Self::handle_pre_vote) grants unless
+    /// `now < election_deadline` and a leader is believed. A deferred node
+    /// keeps granting pre-votes and votes to the campaigners that *were*
+    /// admitted; re-arming the timer would make every deferred voter refuse
+    /// everyone and the admitted campaigns could never reach a majority.
+    pub fn tick_gated(&mut self, now: Nanos, entropy: u64, admit: bool) -> Vec<Out<C>> {
         self.now_hint = now;
         // Issue #667 amendment: the boot-time cluster-check resend, on its
         // OWN deadline (`cluster_check_resend_deadline`'s own doc explains
@@ -3254,6 +3403,14 @@ where
             }
             Role::Follower | Role::PreCandidate | Role::Candidate => {
                 if now.0 >= self.election_deadline.0 {
+                    // ADR 0078: the permit check, after every early return of
+                    // the campaign path (`campaign_due` mirrors them).
+                    if !admit && self.campaign_due(now) {
+                        self.campaign_hold = Some(Nanos(
+                            now.0.saturating_add(self.election_base.as_nanos() as u64),
+                        ));
+                        return Vec::new();
+                    }
                     // Run a **pre-vote** round first (ADR 0009): a node whose driver
                     // briefly stalled past the timeout probes whether it *could* win
                     // before incrementing the term, so it can't disrupt a healthy
@@ -3683,9 +3840,11 @@ where
     /// differ, and reusing the shape (not the same call, since that would
     /// touch `election_deadline` too) keeps the resend rate familiar.
     fn next_cluster_check_resend(&self, now: Nanos, entropy: u64) -> Nanos {
-        let base = self.election_base.as_nanos() as u64;
+        // Stretched like the election timer (ADR 0078): a resend is the same
+        // kind of patience.
+        let base = self.stretched_base();
         let extra = if base == 0 { 0 } else { entropy % base };
-        Nanos(now.0.saturating_add(base + extra))
+        Nanos(now.0.saturating_add(base.saturating_add(extra)))
     }
 
     fn broadcast_cluster_probe(&self) -> Vec<Out<C>> {
@@ -4216,6 +4375,14 @@ where
         entropy: u64,
     ) -> Vec<Out<C>> {
         if self.role != Role::PreCandidate {
+            return Vec::new();
+        }
+        // ADR 0078: a deferred retry (`campaign_hold`) is waiting for a
+        // campaign permit, not campaigning. A late grant from its lapsed round
+        // must not start an election: it would campaign with no permit (the
+        // driver then counts it as an exempt campaign over the cap). The retry
+        // runs a fresh pre-vote once admitted. Never set without a governor.
+        if granted && self.campaign_hold.is_some() {
             return Vec::new();
         }
         if granted {
@@ -5454,6 +5621,8 @@ where
 
     fn become_leader(&mut self, now: Nanos) -> Vec<Out<C>> {
         self.role = Role::Leader;
+        // ADR 0078: a leader has no campaign to defer.
+        self.campaign_hold = None;
         self.leader_id = Some(self.id.clone());
         // Issue #923: mark when THIS stint began, before any per-peer
         // `last_contact` seeding below — `leader_since`'s own field doc.

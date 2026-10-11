@@ -323,6 +323,14 @@ fn build_reconciler(
     let host_edge = edge.clone();
     let teardown_edge = edge.clone();
     let base_id = node_id.clone();
+    // ADR 0078 sections 1 and 2 at their defaults, as production's node
+    // assembly installs them (`--campaign-max-inflight 32`,
+    // `--lag-stretch-max 4`).
+    let backpressure = super::node_election_backpressure(
+        &env,
+        animus_cp_data::campaign_governor::DEFAULT_CAMPAIGN_MAX_INFLIGHT,
+        animus_cp_data::load_monitor::DEFAULT_LAG_STRETCH_MAX_X,
+    );
     let mut reconciler = if backend == SimEngineBackend::Lsm {
         let factory = SimLsmTabletFactory::new(env.clone());
         SimReconciler::Lsm(Reconciler::new(
@@ -353,6 +361,10 @@ fn build_reconciler(
     // makes, so the sim exercises the control-fed handle on every hosted
     // group.
     reconciler.set_cluster_features(edge.version().features.clone());
+    // ADR 0078 section 3: staggered hosting is on by default (the ADR's
+    // defaults, as in production); the gauge feeds `/admin/health`.
+    reconciler.set_ramp_gauge(edge.hosting_ramp());
+    reconciler.set_election_backpressure(backpressure);
     reconciler
 }
 
@@ -405,9 +417,12 @@ fn spawn_reconciler_loop(ctx: SimNodeCtx, mut reconciler: SimReconciler) {
         let mut last_seen = watch.latest();
         loop {
             let env = ctx.env.clone();
-            let _ =
-                futures::future::select(watch.changed(last_seen), env.sleep(RECONCILER_FALLBACK))
-                    .await;
+            // ADR 0078 section 3: a deferred hosting ramp asks for a sooner
+            // re-tick than the fallback, as production's loop does.
+            let fallback = reconciler
+                .next_wake()
+                .map_or(RECONCILER_FALLBACK, |w| w.min(RECONCILER_FALLBACK));
+            let _ = futures::future::select(watch.changed(last_seen), env.sleep(fallback)).await;
             // Coalesce: take the freshest observed index regardless of
             // which arm woke the loop, mirroring `tablet_host_reconciler_
             // loop`'s own identical comment.
@@ -1295,6 +1310,18 @@ impl SimClusterHandle {
         let groups = self.ctx(node).edge.hosted_groups();
         let quiesced = groups.iter().filter(|(_, g)| g.is_quiesced()).count();
         (groups.len(), quiesced)
+    }
+
+    /// Each CP group `node` hosts as `(tablet, believes it leads, term)`: a
+    /// pure local read (no virtual time), for C-17 Tier 2's election
+    /// metrics (ADR 0078).
+    pub(crate) fn group_leads_terms(&self, node: u64) -> Vec<(TabletId, bool, u64)> {
+        self.ctx(node)
+            .edge
+            .hosted_groups()
+            .into_iter()
+            .map(|(t, g)| (t, g.is_leader(), g.term()))
+            .collect()
     }
 
     /// Each CP group `node` hosts as `tablet:role@term->known leader`, for a
@@ -3576,6 +3603,14 @@ impl SimCluster {
         self.shared.ctx(node).metrics_json().0[metric.name()]
     }
 
+    /// One metric's current value in `node`'s `SimEnv::metrics()` sink: where
+    /// every hosted `RaftKvNode` and the ADR 0078 campaign governor and load
+    /// monitor record (a different sink from [`SimCluster::metric`]'s, see
+    /// this fixture's `node_metrics` note).
+    pub(crate) fn env_metric(&self, node: u64, metric: animus_env::Metric) -> u64 {
+        self.sim.env(nid(node)).metrics().get(metric)
+    }
+
     /// The node's version halt reason, if its feeder latched one.
     pub(crate) fn version_halt(&self, node: u64) -> Option<String> {
         self.shared.ctx(node).edge.version().halt.get()
@@ -3743,6 +3778,11 @@ impl SimCluster {
     /// (C-17 Tier 1).
     pub(crate) fn quiesced_counts(&self, node: u64) -> (usize, usize) {
         self.shared.quiesced_counts(node)
+    }
+
+    /// [`SimClusterHandle::group_leads_terms`]'s driver-callable twin.
+    pub(crate) fn group_leads_terms(&self, node: u64) -> Vec<(TabletId, bool, u64)> {
+        self.shared.group_leads_terms(node)
     }
 
     /// [`SimClusterHandle::group_states`]'s driver-callable twin.

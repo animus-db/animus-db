@@ -821,3 +821,20 @@ half (1 MB/group active RSS, 2x hot-tablet p99) is still unmeasured: it needs
 then it is an open input, not a reopen. The 2026-10-04 amendment's other
 findings (#1199 election-storm cliff and the rest) are unaffected. The
 thresholds are not changed.
+
+## Amendment (2026-10-11): the #1199 election-storm cliff, after ADR 0078
+
+The cliff recorded in the 2026-10-04 outcome amendment (#1199) is addressed
+by ADR 0078 (election backpressure: a per-node campaign governor, lag-stretched
+election timeouts and staggered hosting, all on by default). The density
+acceptance run, `density_repro_g3000_holds_led_count` in
+`crates/animus-cp-data/tests/election_backpressure_liveness.rs`, started
+3000 RF3 groups at once on three `ProdEnv` nodes with the mechanisms at their
+defaults, in release. It passed: all 3000 groups were led within 11 s and the
+led count held for the 120 s window, with `max_term` 3 and a governor
+high-water mark of 32. The run hosts groups through each node's real host
+reconciler in the production configuration, not `group_density_cost`'s
+bare-node rig. The C-17 `sim_cluster_scale` density cells now also print the
+`election_*` and `campaign_*` metric lines. The C-03 thresholds and conclusion
+above are unchanged; a per-node cap on awake groups (density admission) is
+still a separate, future ADR. See ADR 0078's "As built (2026-10-11)" section.

@@ -526,6 +526,37 @@ pub struct AnimusClusterSpec {
     /// is byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_region_rtt_ms: Option<u64>,
+    /// Per-node cap on simultaneously active Raft campaigns across the
+    /// data-plane groups a node hosts (ADR 0078 step 3, the
+    /// `CampaignGovernor`). Emitted into `cluster.json`'s
+    /// `cluster_settings.campaign_max_inflight`. `None` (default) leaves the
+    /// node's own default (32); `0` disables the governor. Additive and
+    /// skipped when unset, so an existing spec's `cluster.json` is
+    /// byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub campaign_max_inflight: Option<u64>,
+    /// Cap on the lag-stretched election timeout as a multiple of the
+    /// election base (ADR 0078 step 4, `S_max`). Emitted into
+    /// `cluster_settings.lag_stretch_max_x`. `None` (default) leaves the
+    /// node's own default (4); `0` disables the load monitor and the stretch.
+    /// Additive and skipped when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lag_stretch_max_x: Option<u64>,
+    /// Most freshly hosted tablet groups a node lets be unsettled at once
+    /// (ADR 0078 section 3, staggered hosting, `H`). Emitted into
+    /// `cluster_settings.host_unsettled_max`. `None` (default) leaves the
+    /// node's own default (100); `0` disables staggering. Additive and
+    /// skipped when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_unsettled_max: Option<u64>,
+    /// How long, in milliseconds, a freshly hosted group holds a staggered
+    /// hosting slot before it is released even without a leader (ADR 0078
+    /// section 3). Emitted into `cluster_settings.host_settle_timeout_ms`.
+    /// `None` (default) leaves the node's own default (600); `0` is refused
+    /// ([`AnimusClusterSpec::validate_election_backpressure_spec`]). Additive
+    /// and skipped when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_settle_timeout_ms: Option<u64>,
     /// Name of a `Secret` (in the same namespace) holding the DynamoDB
     /// SigV4 credential store (`{"credentials": {"AKID...": "secret...",
     /// ...}}`, ADR 0057). Mounted read-only at `/etc/animus/dynamo-auth/`
@@ -703,6 +734,20 @@ impl AnimusClusterSpec {
     #[must_use]
     pub fn has_peer_ca(&self) -> bool {
         self.peers.iter().any(|p| p.ca_secret_ref.is_some())
+    }
+
+    /// Pure validation of the ADR 0078 election-backpressure knobs, mirroring
+    /// animusd's own `cluster_settings.host_settle_timeout_ms` check (`0` is
+    /// a startup error there, so refuse it at admission instead of
+    /// crash-looping every pod).
+    ///
+    /// # Errors
+    /// A message naming the violated rule.
+    pub fn validate_election_backpressure_spec(&self) -> Result<(), String> {
+        if self.host_settle_timeout_ms == Some(0) {
+            return Err("spec.hostSettleTimeoutMs must be at least 1".to_string());
+        }
+        Ok(())
     }
 
     /// Pure validation of `spec.region`/`peers`/`allowInsecurePeers`/
@@ -895,6 +940,10 @@ impl Default for AnimusClusterSpec {
             quiesce_after_secs: None,
             auto_split_bytes: None,
             max_region_rtt_ms: None,
+            campaign_max_inflight: None,
+            lag_stretch_max_x: None,
+            host_unsettled_max: None,
+            host_settle_timeout_ms: None,
             dynamo_auth_secret_name: None,
             tls: None,
             s3: None,
@@ -1921,6 +1970,21 @@ mod peers_tests {
         let mut s = federated();
         s.mrec_max_clock_skew_ms = Some(0);
         assert!(s.validate_peers_spec().is_err());
+    }
+
+    #[test]
+    fn host_settle_timeout_zero_is_refused() {
+        let mut s = AnimusClusterSpec {
+            nodes: 3,
+            ..Default::default()
+        };
+        assert_eq!(s.validate_election_backpressure_spec(), Ok(()));
+        s.host_settle_timeout_ms = Some(600);
+        assert_eq!(s.validate_election_backpressure_spec(), Ok(()));
+        s.host_settle_timeout_ms = Some(0);
+        assert!(s.validate_election_backpressure_spec().is_err());
+        let v = crate::validate::validate_spec(None, &s).unwrap_err();
+        assert!(v.iter().any(|v| v.field == "spec.hostSettleTimeoutMs"));
     }
 
     #[test]

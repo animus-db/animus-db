@@ -488,6 +488,21 @@ pub struct ClusterSettings {
     /// Raft group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_region_rtt_ms: Option<u64>,
+    /// `--campaign-max-inflight N` (ADR 0078 step 3): the per-node cap on
+    /// simultaneously active Raft campaigns across all hosted data-plane groups
+    /// (the `CampaignGovernor`). `None` resolves to
+    /// [`DEFAULT_CAMPAIGN_MAX_INFLIGHT`] (32); `0` disables the governor (the
+    /// pre-0078 behaviour). Node-local, never replicated, additive and skipped
+    /// when unset. The control-plane group never uses it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub campaign_max_inflight: Option<usize>,
+    /// `--lag-stretch-max N` (ADR 0078 step 4): `S_max` of the lag-stretched
+    /// election timeout as a multiple of the election base (the per-node
+    /// `LoadMonitor` stretches followers' patience by `min(4 * lag, S_max)`).
+    /// `None` resolves to [`DEFAULT_LAG_STRETCH_MAX_X`] (4); `0` disables the
+    /// monitor and the stretch. Node-local, additive, skipped when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lag_stretch_max_x: Option<u64>,
     /// `--region NAME` (ADR 0075 section 4, G-01 stage G-d M3): **this
     /// cluster's own MREC region name** — the namespace of
     /// [`peers`](Self::peers) and of an MREC table's replica set (a *peer
@@ -524,10 +539,42 @@ pub struct ClusterSettings {
     /// [`DEFAULT_MREC_MAX_CLOCK_SKEW_MS`] (500); `0` is rejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mrec_max_clock_skew_ms: Option<u64>,
+    /// `--host-unsettled-max N` (ADR 0078 section 3, staggered hosting): `H`,
+    /// the most freshly hosted tablet groups the host reconciler lets be
+    /// unsettled (leaderless and inside their settle timeout) at once; further
+    /// fresh hosting waits for later reconcile ticks, lowest `TabletId` first.
+    /// `None` resolves to [`DEFAULT_HOST_UNSETTLED_MAX`] (100); an explicit
+    /// `0` disables staggering (every pending tablet is hosted in one tick,
+    /// the pre-ADR-0078 behaviour). Additive and skipped when unset (ADR 0035 /
+    /// ADR 0073 class L: an old config and the frozen fixture are
+    /// byte-identical); a node-local choice, never replicated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_unsettled_max: Option<u64>,
+    /// `--host-settle-timeout-ms MS` (ADR 0078 section 3): how long after
+    /// hosting a group stops holding a ramp slot even if it never heard a
+    /// leader (the liveness backstop, so a group that cannot elect does not
+    /// stall the ramp). `None` resolves to [`DEFAULT_HOST_SETTLE_TIMEOUT_MS`]
+    /// (600, i.e. `4 *` the 150 ms LAN election base); `0` is rejected.
+    /// Additive and skipped when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_settle_timeout_ms: Option<u64>,
 }
+
+/// The default [`ClusterSettings::host_unsettled_max`] (ADR 0078 section 3).
+pub const DEFAULT_HOST_UNSETTLED_MAX: u64 = 100;
+
+/// The default [`ClusterSettings::host_settle_timeout_ms`] (ADR 0078 section 3).
+pub const DEFAULT_HOST_SETTLE_TIMEOUT_MS: u64 = 600;
 
 /// The default [`ClusterSettings::max_region_rtt_ms`] (ADR 0075 section 3.4).
 pub const DEFAULT_MAX_REGION_RTT_MS: u64 = 150;
+
+/// The default [`ClusterSettings::lag_stretch_max_x`] (ADR 0078).
+pub const DEFAULT_LAG_STRETCH_MAX_X: u64 = animus_cp_data::load_monitor::DEFAULT_LAG_STRETCH_MAX_X;
+
+/// The default [`ClusterSettings::campaign_max_inflight`] (ADR 0078).
+pub const DEFAULT_CAMPAIGN_MAX_INFLIGHT: usize =
+    animus_cp_data::campaign_governor::DEFAULT_CAMPAIGN_MAX_INFLIGHT;
 
 /// The default [`ClusterSettings::mrec_max_clock_skew_ms`] (ADR 0075 section
 /// 4.4).
@@ -588,6 +635,19 @@ impl ClusterSettings {
     pub fn pitr_seal_age(&self) -> std::time::Duration {
         self.pitr_seal_age_secs
             .map_or(crate::DEFAULT_PITR_SEAL_AGE, std::time::Duration::from_secs)
+    }
+
+    /// Startup validation of the staggered-hosting settings (ADR 0078 section
+    /// 3): the settle timeout must be positive (`host_unsettled_max = 0` is
+    /// the documented way to turn staggering off).
+    ///
+    /// # Errors
+    /// A message naming the offending setting.
+    pub fn validate_hosting(&self) -> Result<(), String> {
+        if self.host_settle_timeout_ms == Some(0) {
+            return Err("cluster_settings.host_settle_timeout_ms must be at least 1".into());
+        }
+        Ok(())
     }
 
     /// Startup validation of the MREC peer settings (G-d M3): a region name
@@ -750,6 +810,50 @@ impl ClusterConfig {
                 .as_ref()
                 .and_then(|s| s.max_region_rtt_ms)
                 .unwrap_or(DEFAULT_MAX_REGION_RTT_MS),
+        )
+    }
+
+    /// The effective campaign cap ([`ClusterSettings::campaign_max_inflight`],
+    /// default [`DEFAULT_CAMPAIGN_MAX_INFLIGHT`]); `0` disables the governor.
+    #[must_use]
+    pub fn campaign_max_inflight(&self) -> usize {
+        self.cluster_settings
+            .as_ref()
+            .and_then(|s| s.campaign_max_inflight)
+            .unwrap_or(DEFAULT_CAMPAIGN_MAX_INFLIGHT)
+    }
+
+    /// The effective `lag_stretch_max_x` ([`ClusterSettings::lag_stretch_max_x`],
+    /// default [`DEFAULT_LAG_STRETCH_MAX_X`]); `0` disables the stretch.
+    #[must_use]
+    pub fn lag_stretch_max_x(&self) -> u64 {
+        self.cluster_settings
+            .as_ref()
+            .and_then(|s| s.lag_stretch_max_x)
+            .unwrap_or(DEFAULT_LAG_STRETCH_MAX_X)
+    }
+
+    /// The effective `host_unsettled_max` ([`ClusterSettings::host_unsettled_max`],
+    /// default [`DEFAULT_HOST_UNSETTLED_MAX`]); `0` disables staggered hosting.
+    #[must_use]
+    pub fn host_unsettled_max(&self) -> usize {
+        let v = self
+            .cluster_settings
+            .as_ref()
+            .and_then(|s| s.host_unsettled_max)
+            .unwrap_or(DEFAULT_HOST_UNSETTLED_MAX);
+        usize::try_from(v).unwrap_or(usize::MAX)
+    }
+
+    /// The effective host settle timeout ([`ClusterSettings::host_settle_timeout_ms`],
+    /// default [`DEFAULT_HOST_SETTLE_TIMEOUT_MS`]).
+    #[must_use]
+    pub fn host_settle_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.cluster_settings
+                .as_ref()
+                .and_then(|s| s.host_settle_timeout_ms)
+                .unwrap_or(DEFAULT_HOST_SETTLE_TIMEOUT_MS),
         )
     }
 
@@ -979,6 +1083,7 @@ impl ClusterConfig {
         if let Some(s) = &cfg.cluster_settings {
             s.validate_mrec().map_err(ConfigError::Invalid)?;
             s.validate_pitr().map_err(ConfigError::Invalid)?;
+            s.validate_hosting().map_err(ConfigError::Invalid)?;
         }
         for n in &cfg.nodes {
             if let Some(o) = &n.overload {
@@ -1299,6 +1404,8 @@ mod tests {
             tablet_max_read_units: Some(100),
             tablet_max_write_units: Some(100),
             max_region_rtt_ms: Some(220),
+            campaign_max_inflight: Some(16),
+            lag_stretch_max_x: Some(2),
             region: Some("us".into()),
             peers: vec![PeerCluster {
                 region: "eu".into(),
@@ -1307,9 +1414,60 @@ mod tests {
             }],
             allow_insecure_peers: Some(false),
             mrec_max_clock_skew_ms: Some(300),
+            host_unsettled_max: Some(40),
+            host_settle_timeout_ms: Some(900),
         });
         let parsed = ClusterConfig::from_json(&cfg.to_json()).unwrap();
         assert_eq!(parsed.cluster_settings, cfg.cluster_settings);
+    }
+
+    // --- campaign governor cap (ADR 0078 step 3) ---------------------------
+
+    #[test]
+    fn campaign_max_inflight_is_additive_and_old_configs_parse() {
+        // Unset: no key on the wire, the default applies.
+        let plain = serde_json::to_string(&ClusterSettings::default()).unwrap();
+        assert!(!plain.contains("campaign_max_inflight"), "{plain}");
+        assert!(!plain.contains("lag_stretch_max_x"), "{plain}");
+        let cfg = ClusterConfig::generate(1, std::net::Ipv4Addr::LOCALHOST.into(), 9000);
+        assert_eq!(cfg.campaign_max_inflight(), DEFAULT_CAMPAIGN_MAX_INFLIGHT);
+        assert_eq!(DEFAULT_CAMPAIGN_MAX_INFLIGHT, 32);
+        // An old config (a `cluster_settings` without the key, and one without
+        // `cluster_settings` at all) parses and resolves the default.
+        let old = r#"{"quiesce_after_secs":10,"max_region_rtt_ms":200}"#;
+        let s: ClusterSettings = serde_json::from_str(old).unwrap();
+        assert_eq!(s.campaign_max_inflight, None);
+        assert_eq!(s.lag_stretch_max_x, None);
+        assert_eq!(cfg.lag_stretch_max_x(), 4);
+        assert_eq!(s.max_region_rtt_ms, Some(200));
+        // Set (including 0 = off) round-trips.
+        for k in [0usize, 7, 64] {
+            let s = ClusterSettings {
+                campaign_max_inflight: Some(k),
+                ..ClusterSettings::default()
+            };
+            let json = serde_json::to_string(&s).unwrap();
+            assert!(
+                json.contains(&format!(r#""campaign_max_inflight":{k}"#)),
+                "{json}"
+            );
+            let back: ClusterSettings = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, s);
+            let mut c = ClusterConfig::generate(1, std::net::Ipv4Addr::LOCALHOST.into(), 9000);
+            c.cluster_settings = Some(s);
+            assert_eq!(c.campaign_max_inflight(), k);
+            let s = ClusterSettings {
+                lag_stretch_max_x: Some(k as u64),
+                ..ClusterSettings::default()
+            };
+            let json = serde_json::to_string(&s).unwrap();
+            assert!(
+                json.contains(&format!(r#""lag_stretch_max_x":{k}"#)),
+                "{json}"
+            );
+            c.cluster_settings = Some(s);
+            assert_eq!(c.lag_stretch_max_x(), k as u64);
+        }
     }
 
     // --- MREC peer settings (G-d M3) -------------------------------------
@@ -1360,6 +1518,61 @@ mod tests {
             serde_json::from_str::<PeerCluster>(r#"{"region":"a","endpoints":[],"tls":"x"}"#)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn host_stagger_settings_are_additive_and_old_configs_still_parse() {
+        // Default settings (and so any config that never mentions them) emit
+        // neither key: the frozen v1 `ClusterConfig` bytes stay untouched.
+        let plain = serde_json::to_string(&ClusterSettings::default()).unwrap();
+        for key in ["host_unsettled_max", "host_settle_timeout_ms"] {
+            assert!(
+                !plain.contains(key),
+                "default settings must not emit `{key}`: {plain}"
+            );
+        }
+        let cfg = ClusterConfig::generate(1, "127.0.0.1".parse().unwrap(), 7000);
+        assert!(
+            !cfg.to_json().contains("host_unsettled_max"),
+            "a default config must not serialize the new keys"
+        );
+
+        // An old config (a `cluster_settings` section from before the keys
+        // existed) parses, and resolves to the ADR 0078 defaults.
+        let old = serde_json::json!({
+            "v": 1,
+            "nodes": cfg.nodes,
+            "cluster_settings": { "quiesce_after_secs": 5 }
+        })
+        .to_string();
+        let parsed = ClusterConfig::from_json(&old).expect("old config parses");
+        let s = parsed.cluster_settings.as_ref().unwrap();
+        assert_eq!(
+            (s.host_unsettled_max, s.host_settle_timeout_ms),
+            (None, None)
+        );
+        assert_eq!(parsed.host_unsettled_max(), 100);
+        assert_eq!(
+            parsed.host_settle_timeout(),
+            std::time::Duration::from_millis(600)
+        );
+
+        // Set values round-trip, and `0` is the documented off switch.
+        let set = ClusterSettings {
+            host_unsettled_max: Some(0),
+            host_settle_timeout_ms: Some(250),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&set).unwrap();
+        assert!(
+            json.ends_with(r#""host_unsettled_max":0,"host_settle_timeout_ms":250}"#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<ClusterSettings>(&json).unwrap(), set);
+        set.validate_hosting().expect("0 unsettled is valid");
+        let mut bad = set.clone();
+        bad.host_settle_timeout_ms = Some(0);
+        assert!(bad.validate_hosting().unwrap_err().contains("at least 1"));
     }
 
     #[test]
