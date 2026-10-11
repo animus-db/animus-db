@@ -12171,6 +12171,15 @@ heartbeat batcher. The control-plane group never uses it. Metrics
 `cp_campaign_{admitted,deferred,inflight,inflight_hwm,queue_depth}`. Serde test:
 `config::tests::campaign_max_inflight_is_additive_and_old_configs_parse`.
 
+`cluster_settings.lag_stretch_max_x` (additive; default 4; `0` disables the
+per-node `LoadMonitor` and the stretch) and `--lag-stretch-max N` (needs
+`--config`, same conflict rule) set `S_max` as a multiple of the election base
+(ADR 0078 step 4). `node_election_backpressure` builds both handles (governor
+if `K > 0`, monitor if `x > 0`) once per node and the reconciler hands them to
+every hosted data-plane group; the control group never sees them.
+`/admin/health` shows `election_lag_ms`, `election_stretch_ms`,
+`campaigns_inflight`, `campaigns_queued` (advisory, never part of `ok`).
+
 ## MRSC global tables: `global_tables.rs` and `sim_cluster_mrsc` (ADR 0075, G-01 G-c)
 
 `global_tables.rs` is the `E: Env`-generic client/admin edge of MRSC (deny-

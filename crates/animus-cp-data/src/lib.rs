@@ -81,6 +81,7 @@ pub mod hlc;
 pub mod host;
 mod hwm;
 pub mod layout;
+pub mod load_monitor;
 #[cfg(test)]
 mod mrec_props;
 mod seal;
@@ -12866,6 +12867,7 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
     };
     let mut permit: Option<CampaignPermit> = None;
     let mut campaign_waiting = false;
+    let load_monitor = backpressure.monitor.clone();
 
     // C-05 PR 2 (ADR 0028): a `Some` shared WAL routes both the recovery
     // READ and every future write through the per-node coordinator (tagged
@@ -13439,6 +13441,13 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             // `state_machine_behind`/the quiesce veto above — `record` is a
             // cheap no-op on the overwhelming majority of iterations, where
             // the config hasn't changed since last checked.
+            // ADR 0078 mechanism 2: install the node's observed scheduling lag
+            // as follower patience (a no-op when unchanged, draws no entropy,
+            // applies at the next timer reset). Absent monitor = never called.
+            if let Some(m) = &load_monitor {
+                let stretch = m.stretch(c.election_timeout());
+                c.set_lag_stretch(stretch);
+            }
             (c.next_deadline(), c.is_quiesced(), c.config())
         };
         voter_history

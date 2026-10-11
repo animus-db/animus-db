@@ -1103,12 +1103,18 @@ pub enum Metric {
     CpCampaignInflightHwm,
     /// A level: groups queued waiting for a campaign permit.
     CpCampaignQueueDepth,
+    /// A level (ADR 0078 step 4): the node's smoothed scheduling lag in
+    /// nanoseconds as read by the `LoadMonitor` (zero inside the dead band).
+    CpElectionLagNanos,
+    /// A level: the election-timeout stretch in nanoseconds the monitor
+    /// currently derives for the node's default election base.
+    CpElectionStretchNanos,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 142] = [
+    pub const ALL: [Metric; 144] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -1251,6 +1257,8 @@ impl Metric {
         Metric::CpCampaignInflight,
         Metric::CpCampaignInflightHwm,
         Metric::CpCampaignQueueDepth,
+        Metric::CpElectionLagNanos,
+        Metric::CpElectionStretchNanos,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -1402,6 +1410,8 @@ impl Metric {
             Metric::CpCampaignInflight => "cp_campaign_inflight",
             Metric::CpCampaignInflightHwm => "cp_campaign_inflight_hwm",
             Metric::CpCampaignQueueDepth => "cp_campaign_queue_depth",
+            Metric::CpElectionLagNanos => "cp_election_lag_nanos",
+            Metric::CpElectionStretchNanos => "cp_election_stretch_nanos",
         }
     }
 

@@ -2312,6 +2312,15 @@ fn health<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> (u16, Value) {
         "storage_full": storage_full,
         "storage_full_control": control_storage_full,
         "storage_full_tablets": storage_full_groups,
+        // ADR 0078, advisory only (never part of `ok`): the load monitor's
+        // smoothed scheduling lag and the election-timeout stretch it implies
+        // for the LAN base (ms; both 0 inside the dead band or when the
+        // monitor is off), and the campaign governor's in-flight / queued
+        // campaigns.
+        "election_lag_ms": ctx.env.metrics().get(animus_env::metrics::Metric::CpElectionLagNanos) / 1_000_000,
+        "election_stretch_ms": ctx.env.metrics().get(animus_env::metrics::Metric::CpElectionStretchNanos) / 1_000_000,
+        "campaigns_inflight": ctx.env.metrics().get(animus_env::metrics::Metric::CpCampaignInflight),
+        "campaigns_queued": ctx.env.metrics().get(animus_env::metrics::Metric::CpCampaignQueueDepth),
     });
     // 503 until the control plane has had a RECENT leader (the readiness
     // signal, hysteresis-gated per issue #595); 200 once it does (whether

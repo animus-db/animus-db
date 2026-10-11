@@ -52,6 +52,17 @@
 //! full `2 * election_base`, drops it and asks again (so it re-queues at the
 //! back). Ghosts are how cells 8 and 10 saturate the governor deterministically.
 
+//!
+//! **ADR step 4 (load monitor, lag stretch)** adds `Mechanisms::stretch_x` and
+//! cells 4 with all mechanisms, 4b (a node loss as the load ends, so the cap on
+//! the stretch alone bounds the failover), 5 (sustained overload) and 6
+//! (overload then relief), plus negative controls (b) (stretch off on cell 5),
+//! (e) (`S_max = inf` on 4b, sharing 4b's seed) and `a6` (cell 6 without
+//! mechanisms). The CPU-starvation model serves timers ahead of deliveries, so
+//! the monitor's own timer-lateness probe reads ~0 here; the cells feed a
+//! detached monitor from the simulator's queue ([`Rig::probe`]) and
+//! `load_monitor_task_measures_a_paused_node` covers the real task.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -61,6 +72,7 @@ use animus_cp_data::campaign_governor::{
     Admission, CampaignGovernor, CampaignWake, ElectionBackpressure, GovernorFault,
 };
 use animus_cp_data::heartbeat_batch::{DEFAULT_HEARTBEAT_BATCH_INTERVAL, HeartbeatBatcher};
+use animus_cp_data::load_monitor::LoadMonitor;
 use animus_cp_data::{HostedOptions, KIND_BASE, RaftKvNode, StorageScope};
 use animus_env::{Clock, EnvExt, Metric, MetricsHandle, nid};
 use animus_sim::{CpuOrder, SimEnv, Simulator};
@@ -103,6 +115,9 @@ struct Mechanisms {
     governor_k: usize,
     /// A deliberate governor bug (negative controls (c) and (d)).
     fault: GovernorFault,
+    /// `lag_stretch_max_x` of the load monitor (`0` = off, the monitor is not
+    /// even started).
+    stretch_x: u64,
 }
 
 impl Mechanisms {
@@ -110,17 +125,34 @@ impl Mechanisms {
     const NONE: Mechanisms = Mechanisms {
         governor_k: 0,
         fault: GovernorFault::None,
+        stretch_x: 0,
     };
     /// The campaign governor at the default `K`.
     const GOVERNOR: Mechanisms = Mechanisms {
         governor_k: K,
         fault: GovernorFault::None,
+        stretch_x: 0,
+    };
+    /// Governor plus lag stretch at the default `lag_stretch_max_x` (4): what
+    /// `animusd` runs by default (ADR 0078 steps 3 and 4).
+    const ALL: Mechanisms = Mechanisms {
+        governor_k: K,
+        fault: GovernorFault::None,
+        stretch_x: 4,
+    };
+    /// Governor plus an effectively unbounded stretch (`S_max = inf`,
+    /// negative control (e)).
+    const UNBOUNDED_STRETCH: Mechanisms = Mechanisms {
+        governor_k: K,
+        fault: GovernorFault::None,
+        stretch_x: 1_000_000,
     };
     /// The governor with a deliberate bug.
     const fn faulty(fault: GovernorFault) -> Mechanisms {
         Mechanisms {
             governor_k: K,
             fault,
+            stretch_x: 0,
         }
     }
 }
@@ -148,6 +180,18 @@ enum Kind {
     /// Cell 10: the governor has `Q` queued groups, then one group's leader
     /// is lost; the new leader must arrive within `2*base + ceil(Q/K)*2*base`.
     LostLeaderBound,
+    /// Cell 4b (and control (e)): groups left active, the nodes pushed to
+    /// `load` x steady demand until the load monitor reads seconds of lag, then
+    /// the load ends and, in the same instant, the node leading a third of the
+    /// groups is killed. The monitor's lag decays over seconds, so the
+    /// followers of the dead node's groups still wait out a stretched election
+    /// timeout, while the surviving nodes are no longer overloaded: the stretch
+    /// cap is what bounds the failover, and nothing else is in play.
+    LeaderLossUnderLag,
+    /// Cell 6: converge, overload for [`OVERLOAD_SHORT`], then lower the cost;
+    /// every group must be led again within the recovery bound without a
+    /// restart.
+    OverloadThenRelief,
     /// Cell 11: learners (non-voters), single-voter groups and quiesced groups
     /// never take a permit.
     NoPermits,
@@ -211,6 +255,30 @@ fn cells() -> Vec<Cell> {
             Mechanisms::GOVERNOR,
         ),
         cell(
+            "cell_4_leader_node_loss_quiesced_all_mechanisms",
+            Kind::LeaderNodeLoss,
+            0.9,
+            Mechanisms::ALL,
+        ),
+        cell(
+            "cell_4b_leader_node_loss_under_lag",
+            Kind::LeaderLossUnderLag,
+            1.25,
+            Mechanisms::ALL,
+        ),
+        cell(
+            "cell_5_sustained_overload",
+            Kind::SustainedOverload,
+            1.25,
+            Mechanisms::ALL,
+        ),
+        cell(
+            "cell_6_overload_then_relief",
+            Kind::OverloadThenRelief,
+            1.25,
+            Mechanisms::ALL,
+        ),
+        cell(
             "cell_7_partition_and_heal",
             Kind::PartitionHeal,
             0.9,
@@ -239,12 +307,44 @@ fn cells() -> Vec<Cell> {
 
 /// Negative control (a): cells whose oracle must FAIL (it bites).
 fn controls() -> Vec<Cell> {
+    vec![
+        cell(
+            "control_a_no_mechanisms_sustained_overload",
+            Kind::SustainedOverload,
+            1.25,
+            Mechanisms::NONE,
+        ),
+        // Cell 6's shape without mechanisms (reported alongside cell 6).
+        cell(
+            "control_a6_no_mechanisms_overload_then_relief",
+            Kind::OverloadThenRelief,
+            1.25,
+            Mechanisms::NONE,
+        ),
+    ]
+}
+
+/// Negative control (b): the governor on, the lag stretch off, on cell 5.
+fn controls_b() -> Vec<Cell> {
     vec![cell(
-        "control_a_no_mechanisms_sustained_overload",
+        "control_b_stretch_off_sustained_overload",
         Kind::SustainedOverload,
         1.25,
-        Mechanisms::NONE,
+        Mechanisms::GOVERNOR,
     )]
+}
+
+/// Negative control (e): an unbounded stretch on the leader-node-loss cell.
+fn controls_e() -> Vec<Cell> {
+    let mut c = cell(
+        "control_e_unbounded_stretch_leader_node_loss_under_lag",
+        Kind::LeaderLossUnderLag,
+        1.25,
+        Mechanisms::UNBOUNDED_STRETCH,
+    );
+    // Same seed as cell 4b, so the two runs differ only in the stretch cap.
+    c.seed = corpus::name_seed("cell_4b_leader_node_loss_under_lag");
+    vec![c]
 }
 
 /// Negative control (c): admission also gating the responder side.
@@ -315,6 +415,15 @@ struct Rig {
     batchers: Vec<HeartbeatBatcher<SimEnv>>,
     /// One governor per node (`None` = off).
     governors: Vec<Option<CampaignGovernor>>,
+    /// One load monitor per node (`None` = lag stretch off).
+    monitors: Vec<Option<LoadMonitor>>,
+    /// The per-event CPU cost (ns) last set by [`Rig::set_load`], for the
+    /// model-derived lag probe ([`Rig::probe`]).
+    cost_ns: std::cell::Cell<u64>,
+    /// Start the production probe task (`LoadMonitor::new`) instead of feeding
+    /// the monitor from the simulator's CPU queue (only the idle-identity test
+    /// wants it, see [`Rig::setup`]).
+    real_probe: bool,
     /// Nodes that are neither killed nor cut off.
     live: [bool; 3],
     /// Replicas whose driver was halted (`shutdown`): their frozen handle
@@ -332,6 +441,9 @@ impl Rig {
             handles: NODES.iter().map(|_| MetricsHandle::recording()).collect(),
             batchers: Vec::new(),
             governors: Vec::new(),
+            monitors: Vec::new(),
+            cost_ns: std::cell::Cell::new(0),
+            real_probe: false,
             live: [true; 3],
             halted: Vec::new(),
         }
@@ -361,6 +473,33 @@ impl Rig {
                 })
             })
             .collect();
+        self.monitors = (0..NODES.len())
+            .map(|i| {
+                // The corpus feeds the monitor from the simulator's CPU queue
+                // ([`Rig::probe`]) rather than from a probe task: the CPU model
+                // serves expired timers ahead of waiting deliveries, so the
+                // timer-lateness probe of `LoadMonitor::new` reads ~0 here
+                // (it is exercised on a paused node by
+                // `load_monitor_task_measures_a_paused_node`).
+                (mech.stretch_x > 0).then(|| {
+                    if self.real_probe {
+                        return LoadMonitor::new(
+                            &self.sim.env(nid(NODES[i])),
+                            mech.stretch_x,
+                            BASE,
+                            self.handles[i].clone(),
+                            self.governors[i].clone(),
+                        );
+                    }
+                    LoadMonitor::detached(
+                        mech.stretch_x,
+                        BASE,
+                        self.handles[i].clone(),
+                        self.governors[i].clone(),
+                    )
+                })
+            })
+            .collect();
     }
 
     fn options(&self, node: usize) -> HostedOptions<SimEnv> {
@@ -368,6 +507,7 @@ impl Rig {
             heartbeat_batcher: Some(self.batchers[node].clone()),
             backpressure: ElectionBackpressure {
                 governor: self.governors[node].clone(),
+                monitor: self.monitors[node].clone(),
             },
             ..HostedOptions::default()
         }
@@ -414,6 +554,21 @@ impl Rig {
                 Duration::from_secs_f64(load / demand)
             };
             self.sim.set_cpu_cost(nid(id), cost);
+            self.cost_ns
+                .set(u64::try_from(cost.as_nanos()).unwrap_or(u64::MAX));
+        }
+    }
+
+    /// One lag probe: the sample is how long a delivery arriving now would
+    /// wait for the node's virtual CPU, `waiting deliveries x per-event cost`
+    /// (the queue-wait that makes heartbeats late; see [`Rig::setup`]).
+    fn probe(&self) {
+        let cost = self.cost_ns.get();
+        for (i, m) in self.monitors.iter().enumerate() {
+            if let Some(m) = m {
+                let (_, waiting) = self.sim.cpu_backlog(&nid(NODES[i]));
+                m.observe((waiting as u64).saturating_mul(cost));
+            }
         }
     }
 
@@ -642,6 +797,10 @@ struct Report {
     /// node again.
     recovery_s: Option<f64>,
     gov: GovTotals,
+    /// Highest dead-banded monitor lag seen at a sample, in ms (0 = stretch off
+    /// or never above the dead band), and the highest stretch it implied.
+    max_lag_ms: u64,
+    max_stretch_ms: u64,
     /// Cell-specific clauses the runner found broken, plus the numbers behind
     /// them (`detail`).
     extra: Vec<&'static str>,
@@ -660,6 +819,11 @@ struct Limits {
     recovery_s: Option<f64>,
     /// `K` the governor ran with (`0` = no governor to check).
     governor_k: usize,
+    /// `lag_stretch_max_x` the monitor ran with (`0` = no stretch to check).
+    stretch_x: u64,
+    /// Cells that overload the node: the monitor must have read a lag, or the
+    /// stretch clauses are vacuous.
+    expect_lag: bool,
 }
 
 impl Limits {
@@ -668,11 +832,18 @@ impl Limits {
         churn_per_group: 0.25,
         recovery_s: None,
         governor_k: 0,
+        stretch_x: 0,
+        expect_lag: false,
     };
 
     fn for_cell(c: &Cell) -> Limits {
         let base = Limits {
             governor_k: c.mech.governor_k,
+            stretch_x: c.mech.stretch_x,
+            expect_lag: matches!(
+                c.kind,
+                Kind::SustainedOverload | Kind::OverloadThenRelief | Kind::LeaderLossUnderLag
+            ),
             ..Limits::DEFAULT
         };
         match c.kind {
@@ -687,7 +858,24 @@ impl Limits {
                 churn_per_group: 0.5,
                 ..base
             },
-            Kind::ColdStart | Kind::SustainedOverload => base,
+            Kind::ColdStart => base,
+            // With the stretch on, a sustained overload moves no term (0.0
+            // measured); the default ceiling is for the unprotected code.
+            Kind::SustainedOverload if c.mech.stretch_x > 0 => Limits {
+                churn_per_group: 0.05,
+                ..base
+            },
+            Kind::SustainedOverload => base,
+            Kind::LeaderLossUnderLag => Limits {
+                churn_per_group: 0.75,
+                recovery_s: Some(5.0),
+                ..base
+            },
+            Kind::OverloadThenRelief => Limits {
+                churn_per_group: 0.05,
+                recovery_s: Some(10.0),
+                ..base
+            },
         }
     }
 
@@ -727,6 +915,17 @@ impl Limits {
         }
         if self.governor_k > 0 && r.gov.nonexempt_hwm > self.governor_k {
             v.push("governor: more than K non-exempt campaigns in flight");
+        }
+        if self.stretch_x > 0 {
+            // The stretch is `min(4 * lag, S_max)`: never above `S_max`, on
+            // any node, at any sample (the unbounded control breaks this).
+            let cap_ms = self.stretch_x * BASE.as_millis() as u64;
+            if r.max_stretch_ms > cap_ms {
+                v.push("stretch: above S_max = lag_stretch_max_x * election_base");
+            }
+            if self.expect_lag && r.max_lag_ms == 0 {
+                v.push("harness: the load monitor never read a lag, the stretch is vacuous");
+            }
         }
         v.extend(r.extra.iter().copied());
         v
@@ -806,6 +1005,10 @@ impl Writes {
 const CONVERGE: Duration = Duration::from_secs(5);
 /// Virtual time of the overload (ADR 0078 cell 5: 60 s).
 const OVERLOAD: Duration = Duration::from_secs(60);
+/// Load phase before the node loss of cell 4b / control (e).
+const LAG_BUILDUP: Duration = Duration::from_secs(10);
+/// Virtual time of the overload of cell 6.
+const OVERLOAD_SHORT: Duration = Duration::from_secs(30);
 /// Virtual time after the load is removed, for the "no group permanently
 /// leaderless once the fault clears" clause.
 const RELIEF: Duration = Duration::from_secs(15);
@@ -825,6 +1028,9 @@ struct Run {
     w: Writes,
     at: Duration,
     cell: String,
+    max_lag: Duration,
+    max_stretch: Duration,
+    since_probe: Duration,
 }
 
 impl Run {
@@ -835,6 +1041,29 @@ impl Run {
             w: Writes::default(),
             at: Duration::ZERO,
             cell: c.name.clone(),
+            max_lag: Duration::ZERO,
+            max_stretch: Duration::ZERO,
+            since_probe: Duration::ZERO,
+        }
+    }
+
+    /// Run the simulator for `step`, taking a lag probe every
+    /// [`animus_cp_data::load_monitor::PROBE`] of virtual time.
+    fn run_probed(&mut self, step: Duration) {
+        if self.rig.monitors.iter().all(Option::is_none) {
+            self.rig.sim.run_for(step);
+            return;
+        }
+        let mut left = step;
+        while !left.is_zero() {
+            let chunk = left.min(animus_cp_data::load_monitor::PROBE - self.since_probe);
+            self.rig.sim.run_for(chunk);
+            left -= chunk;
+            self.since_probe += chunk;
+            if self.since_probe >= animus_cp_data::load_monitor::PROBE {
+                self.since_probe = Duration::ZERO;
+                self.rig.probe();
+            }
         }
     }
 
@@ -842,9 +1071,13 @@ impl Run {
     fn advance(&mut self, d: Duration, step: Duration, write: bool) {
         let end = self.at + d;
         while self.at < end {
-            self.rig.sim.run_for(step);
+            self.run_probed(step);
             self.at += step;
             self.s.sample(&self.rig, self.at.as_secs_f64());
+            for m in self.rig.monitors.iter().flatten() {
+                self.max_lag = self.max_lag.max(m.lag());
+                self.max_stretch = self.max_stretch.max(m.stretch(BASE));
+            }
             if write {
                 self.w.settle(&self.rig);
             }
@@ -878,7 +1111,13 @@ impl Run {
 
     fn finish(self, extra: Vec<&'static str>, detail: String) -> Report {
         let Run {
-            rig, s, w, cell, ..
+            rig,
+            s,
+            w,
+            cell,
+            max_lag,
+            max_stretch,
+            ..
         } = self;
         let g = rig.g;
         let (churn_sum, max_term) = rig.churn();
@@ -896,6 +1135,8 @@ impl Run {
             lost_acked: w.lost(&rig),
             recovery_s: s.recovered_at_s.zip(s.fault_at_s).map(|(r, f)| r - f),
             gov: rig.gov_totals(),
+            max_lag_ms: max_lag.as_millis() as u64,
+            max_stretch_ms: max_stretch.as_millis() as u64,
             extra,
             detail,
         };
@@ -932,6 +1173,30 @@ fn run_cell(c: &Cell, g: usize) -> Report {
             r.rig.set_load(0.0);
             r.advance(RELIEF, SAMPLE, true);
             r.finish(Vec::new(), String::new())
+        }
+        Kind::OverloadThenRelief => {
+            r.rig.host(c.mech);
+            r.converge_and_write();
+            r.rig.set_load(c.load);
+            r.advance(OVERLOAD_SHORT, SAMPLE, true);
+            r.rig.set_load(0.0);
+            // From here the oracle measures recovery, not the overload.
+            r.s.begin_fault(r.at.as_secs_f64());
+            r.advance(RELIEF, FINE, true);
+            r.finish(Vec::new(), String::new())
+        }
+        Kind::LeaderLossUnderLag => {
+            r.rig.host(c.mech);
+            r.converge_and_write();
+            r.rig.set_load(c.load);
+            r.advance(LAG_BUILDUP, SAMPLE, true);
+            let led_by_dead = r.rig.nodes.iter().filter(|rs| rs[0].is_leader()).count();
+            r.rig.set_load(0.0);
+            r.s.begin_fault(r.at.as_secs_f64());
+            r.rig.kill(0);
+            r.advance(Duration::from_secs(30), FINE, true);
+            let detail = format!("led_by_dead_node={led_by_dead}");
+            r.finish(Vec::new(), detail)
         }
         Kind::LeaderNodeLoss => run_leader_node_loss(r, c),
         Kind::PartitionHeal => run_partition_heal(r, c),
@@ -1196,7 +1461,8 @@ fn control_a_no_mechanisms_reproduces_the_collapse() {
             c.seed
         );
         assert!(
-            v.contains(&"monotone: led count fell after first convergence"),
+            c.kind != Kind::SustainedOverload
+                || v.contains(&"monotone: led count fell after first convergence"),
             "{} seed={:#x}: the led count must fall under overload: {v:?} {r:?}",
             c.name,
             c.seed
@@ -1210,6 +1476,98 @@ fn control_a_no_mechanisms_reproduces_the_collapse() {
         assert!(
             v.contains(&"churn: terms per group above ceiling"),
             "{} seed={:#x}: term churn must exceed the ceiling: {v:?} {r:?}",
+            c.name,
+            c.seed
+        );
+    }
+}
+
+/// The monitor's own probe task (`LoadMonitor::new`, the production path)
+/// measures timer lateness: a node paused for 400 ms wakes its probe 400 ms
+/// late, the reading and stretch follow, the governor's `K_eff` drops, and all
+/// of it decays back once the node is healthy.
+#[test]
+fn load_monitor_task_measures_a_paused_node() {
+    let mut sim = Simulator::new(corpus::name_seed("election_bp_monitor_probe"));
+    let h = MetricsHandle::recording();
+    let gov = CampaignGovernor::new(K, h.clone());
+    let m = LoadMonitor::new(&sim.env(nid(0)), 4, BASE, h.clone(), Some(gov.clone()));
+    sim.run_for(Duration::from_secs(1));
+    assert_eq!(m.lag(), Duration::ZERO, "an idle node reads zero");
+    assert_eq!(m.stretch(BASE), Duration::ZERO);
+    assert_eq!(gov.k_eff(), K);
+    assert_eq!(h.get(Metric::CpElectionLagNanos), 0);
+
+    sim.pause(nid(0), Duration::from_millis(400));
+    sim.run_for(Duration::from_millis(450));
+    let lag = m.lag();
+    assert!(
+        lag >= Duration::from_millis(300) && lag <= Duration::from_millis(400),
+        "the probe fires ~380 ms late: {lag:?}"
+    );
+    assert_eq!(m.stretch(BASE), BASE * 4, "400 ms of lag hits the 4x cap");
+    assert_eq!(gov.k_eff(), K / 4);
+    assert!(h.get(Metric::CpElectionLagNanos) >= 300_000_000);
+    assert_eq!(
+        h.get(Metric::CpElectionStretchNanos),
+        BASE.as_nanos() as u64 * 4
+    );
+
+    // Slow integer decay: it takes a few seconds, not a probe, to forget.
+    sim.run_for(Duration::from_millis(100));
+    assert!(m.lag() > Duration::from_millis(200), "decays slowly");
+    sim.run_for(Duration::from_secs(8));
+    assert_eq!(m.lag(), Duration::ZERO, "back inside the dead band");
+    assert_eq!(gov.k_eff(), K);
+    sim.shutdown();
+}
+
+/// NEGATIVE CONTROL (b): the governor on, the lag stretch off. Cell 5's load
+/// must still break the oracle, so the stretch is load-bearing on its own
+/// (safety still holds).
+#[test]
+fn control_b_stretch_off_still_breaks_under_overload() {
+    for c in select(controls_b()) {
+        let r = run_cell(&c, groups());
+        let v = Limits::for_cell(&c).violations(&r);
+        eprintln!("BP-CONTROL {} seed={:#x} {v:?} {r:?}", c.name, c.seed);
+        eprintln!("BP-DETAIL {} {}", c.name, r.detail);
+        assert!(
+            v.iter().all(|x| !is_safety(x)),
+            "{} seed={:#x}: safety must hold: {v:?} {r:?}",
+            c.name,
+            c.seed
+        );
+        assert!(
+            v.contains(&"churn: terms per group above ceiling")
+                || v.contains(&"monotone: led count fell after first convergence"),
+            "{} seed={:#x}: without the stretch the oracle must fail: {v:?} {r:?}",
+            c.name,
+            c.seed
+        );
+    }
+}
+
+/// NEGATIVE CONTROL (e): `S_max = inf`. A stretch with no cap turns the
+/// node's lag into unavailability: the failover after a node loss must miss
+/// the bound that the capped stretch (cell 4) meets.
+#[test]
+fn control_e_unbounded_stretch_slows_failover() {
+    for c in select(controls_e()) {
+        let r = run_cell(&c, groups());
+        let v = Limits::for_cell(&c).violations(&r);
+        eprintln!("BP-CONTROL {} seed={:#x} {v:?} {r:?}", c.name, c.seed);
+        eprintln!("BP-DETAIL {} {}", c.name, r.detail);
+        assert!(
+            v.iter().all(|x| !is_safety(x)),
+            "{} seed={:#x}: safety must hold: {v:?} {r:?}",
+            c.name,
+            c.seed
+        );
+        assert!(
+            v.contains(&"liveness: recovery after the fault above bound")
+                || v.contains(&"liveness: groups never recovered after the fault"),
+            "{} seed={:#x}: failover must exceed the bound: {v:?} {r:?}",
             c.name,
             c.seed
         );
@@ -1296,13 +1654,18 @@ fn names_and_seeds_are_unique_and_frozen() {
     let all: Vec<Cell> = cells()
         .into_iter()
         .chain(controls())
+        .chain(controls_b())
         .chain(controls_c())
         .chain(controls_d())
+        .chain(controls_e())
         .collect();
     let names: BTreeSet<&str> = all.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names.len(), all.len());
     for c in &all {
-        assert_eq!(c.seed, corpus::name_seed(&c.name));
+        // Control (e) deliberately shares cell 4b's seed.
+        if !c.name.starts_with("control_e") {
+            assert_eq!(c.seed, corpus::name_seed(&c.name));
+        }
     }
 }
 
@@ -1378,6 +1741,42 @@ fn cell_12_governor_on_without_contention_is_identical() {
             "load {load}: an idle governor changed the run ({d:?})"
         );
     }
+}
+
+/// With the production probe task running and no load, the monitor reads zero
+/// the whole time, so every group's leader and term are those of the run with
+/// no mechanism at all (the probe's own timers add events, so only the
+/// per-group outcome is compared).
+#[test]
+fn cell_12_idle_probe_task_changes_no_group_outcome() {
+    fn run(mech: Mechanisms) -> (Vec<(usize, u64)>, u64) {
+        let mut rig = Rig::new(corpus::name_seed("election_bp_cell_12"), 30);
+        rig.real_probe = true;
+        rig.host(mech);
+        rig.sim.run_for(Duration::from_secs(8));
+        let per_group = rig
+            .nodes
+            .iter()
+            .map(|rs| {
+                let lead = rs.iter().position(KvNode::is_leader).unwrap_or(usize::MAX);
+                (lead, rs.iter().map(KvNode::term).max().unwrap_or(0))
+            })
+            .collect();
+        let lag = rig
+            .monitors
+            .iter()
+            .flatten()
+            .map(|m| m.lag().as_nanos() as u64)
+            .max()
+            .unwrap_or(0);
+        drop(rig.nodes);
+        rig.sim.shutdown();
+        (per_group, lag)
+    }
+    let (off, _) = run(Mechanisms::NONE);
+    let (all, lag) = run(Mechanisms::ALL);
+    assert_eq!(lag, 0, "an unloaded node reads zero lag");
+    assert_eq!(all, off, "the idle monitor changed a group's outcome");
 }
 
 const PINNED_IDLE: u64 = 0x889e0d5bdd9161f8;

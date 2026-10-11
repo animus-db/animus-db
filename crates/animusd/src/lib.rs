@@ -3118,6 +3118,10 @@ pub struct BoundNode {
     /// ADR 0078 step 3: the per-node campaign cap (0 = governor off); set from
     /// `cluster_settings.campaign_max_inflight` via `with_campaign_max_inflight`.
     campaign_max_inflight: usize,
+    /// ADR 0078 step 4: `S_max` as a multiple of the election base (0 = no load
+    /// monitor, no stretch); set from `cluster_settings.lag_stretch_max_x` via
+    /// `with_lag_stretch_max_x`.
+    lag_stretch_max_x: u64,
     /// MREC peer settings (`cluster_settings.{region,peers,..}`, G-d M3) via `with_mrec`.
     mrec: Arc<crate::mrec_peer::MrecConfig>,
     advertise_host: Option<String>,
@@ -5799,6 +5803,14 @@ impl BoundNode {
         self
     }
 
+    /// Set the lag-stretch cap (ADR 0078 step 4) — see
+    /// `ClusterSettings::lag_stretch_max_x`; `0` disables the load monitor.
+    #[must_use]
+    pub fn with_lag_stretch_max_x(mut self, x: u64) -> Self {
+        self.lag_stretch_max_x = x;
+        self
+    }
+
     /// Install the node's MREC peer settings (`cluster_settings.region`/
     /// `peers`/`allow_insecure_peers`/`mrec_max_clock_skew_ms`, ADR 0075
     /// section 4.3, G-d M3): read by the MREC receiver. Default: no MREC.
@@ -6470,17 +6482,14 @@ impl BoundNode {
         // ADR 0075 section 3.4: per-group WAN timing input (inert unless a hosted
         // tablet's replicas span more than one region label).
         reconciler.set_max_region_rtt(self.max_region_rtt);
-        if self.campaign_max_inflight > 0 {
-            // ADR 0078 step 3: one governor per node, next to the heartbeat
-            // batcher; shared by every data-plane group this reconciler hosts.
-            reconciler.set_election_backpressure(
-                animus_cp_data::campaign_governor::ElectionBackpressure {
-                    governor: Some(animus_cp_data::campaign_governor::CampaignGovernor::new(
-                        self.campaign_max_inflight,
-                        self.env.metrics(),
-                    )),
-                },
-            );
+        // ADR 0078: one governor and one load monitor per node, next to the
+        // heartbeat batcher; shared by every data-plane group hosted here.
+        if self.campaign_max_inflight > 0 || self.lag_stretch_max_x > 0 {
+            reconciler.set_election_backpressure(node_election_backpressure(
+                &self.env,
+                self.campaign_max_inflight,
+                self.lag_stretch_max_x,
+            ));
         }
         if !quiesce_after.is_zero() {
             // See `MIN_QUIESCE_AFTER`'s own doc for the full argument. The
@@ -7043,6 +7052,7 @@ impl Node {
             console_addr,
             max_region_rtt: animus_control::timing::DEFAULT_MAX_REGION_RTT,
             campaign_max_inflight: animus_cp_data::campaign_governor::DEFAULT_CAMPAIGN_MAX_INFLIGHT,
+            lag_stretch_max_x: animus_cp_data::load_monitor::DEFAULT_LAG_STRETCH_MAX_X,
             mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             advertise_host: addrs.advertise_host,
             labels: addrs.labels,
@@ -7185,6 +7195,7 @@ impl Node {
             console_addr,
             max_region_rtt: animus_control::timing::DEFAULT_MAX_REGION_RTT,
             campaign_max_inflight: animus_cp_data::campaign_governor::DEFAULT_CAMPAIGN_MAX_INFLIGHT,
+            lag_stretch_max_x: animus_cp_data::load_monitor::DEFAULT_LAG_STRETCH_MAX_X,
             mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             advertise_host: addrs.advertise_host,
             labels: addrs.labels,
@@ -8224,6 +8235,10 @@ pub struct BoundDataNode {
     /// ADR 0078 step 3: the per-node campaign cap (0 = governor off); set from
     /// `cluster_settings.campaign_max_inflight` via `with_campaign_max_inflight`.
     campaign_max_inflight: usize,
+    /// ADR 0078 step 4: `S_max` as a multiple of the election base (0 = no load
+    /// monitor, no stretch); set from `cluster_settings.lag_stretch_max_x` via
+    /// `with_lag_stretch_max_x`.
+    lag_stretch_max_x: u64,
     /// MREC peer settings (`cluster_settings.{region,peers,..}`, G-d M3) via `with_mrec`.
     mrec: Arc<crate::mrec_peer::MrecConfig>,
     advertise_host: Option<String>,
@@ -8253,6 +8268,14 @@ impl BoundDataNode {
     #[must_use]
     pub fn with_campaign_max_inflight(mut self, k: usize) -> Self {
         self.campaign_max_inflight = k;
+        self
+    }
+
+    /// Set the lag-stretch cap (ADR 0078 step 4) — see
+    /// `ClusterSettings::lag_stretch_max_x`; `0` disables the load monitor.
+    #[must_use]
+    pub fn with_lag_stretch_max_x(mut self, x: u64) -> Self {
+        self.lag_stretch_max_x = x;
         self
     }
 
@@ -8709,17 +8732,14 @@ impl BoundDataNode {
         // ADR 0075 section 3.4: per-group WAN timing input (inert unless a hosted
         // tablet's replicas span more than one region label).
         reconciler.set_max_region_rtt(self.max_region_rtt);
-        if self.campaign_max_inflight > 0 {
-            // ADR 0078 step 3: one governor per node, next to the heartbeat
-            // batcher; shared by every data-plane group this reconciler hosts.
-            reconciler.set_election_backpressure(
-                animus_cp_data::campaign_governor::ElectionBackpressure {
-                    governor: Some(animus_cp_data::campaign_governor::CampaignGovernor::new(
-                        self.campaign_max_inflight,
-                        self.env.metrics(),
-                    )),
-                },
-            );
+        // ADR 0078: one governor and one load monitor per node, next to the
+        // heartbeat batcher; shared by every data-plane group hosted here.
+        if self.campaign_max_inflight > 0 || self.lag_stretch_max_x > 0 {
+            reconciler.set_election_backpressure(node_election_backpressure(
+                &self.env,
+                self.campaign_max_inflight,
+                self.lag_stretch_max_x,
+            ));
         }
         if !quiesce_after.is_zero() {
             // Two asserts, not one — identical contract/rationale to
@@ -17429,6 +17449,7 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
         .await?
         .with_max_region_rtt(config.max_region_rtt())
         .with_campaign_max_inflight(config.campaign_max_inflight())
+        .with_lag_stretch_max_x(config.lag_stretch_max_x())
         .with_mrec(
             crate::mrec_peer::MrecConfig::from_cluster(config)
                 .with_node_tls(config.nodes.get(index).and_then(|n| n.tls.clone())),
@@ -17460,6 +17481,29 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
     .await
 }
 
+/// ADR 0078: build this node's election-backpressure handles. `k` is the
+/// campaign cap (`0` = no governor), `stretch_x` the lag-stretch cap as a
+/// multiple of the LAN election base (`0` = no load monitor, which also
+/// leaves `K_eff` at `K`). The monitor spawns its one probe task on `env`.
+fn node_election_backpressure<E: Env>(
+    env: &E,
+    k: usize,
+    stretch_x: u64,
+) -> animus_cp_data::campaign_governor::ElectionBackpressure {
+    let governor =
+        (k > 0).then(|| animus_cp_data::campaign_governor::CampaignGovernor::new(k, env.metrics()));
+    let monitor = (stretch_x > 0).then(|| {
+        animus_cp_data::load_monitor::LoadMonitor::new(
+            env,
+            stretch_x,
+            animus_control::timing::LAN_ELECTION_BASE,
+            env.metrics(),
+            governor.clone(),
+        )
+    });
+    animus_cp_data::campaign_governor::ElectionBackpressure { governor, monitor }
+}
+
 /// Install the cluster-config-derived settings `Node::bind` cannot know on a
 /// [`BoundNode`] — the MREC peer settings (G-d M3) and the configured
 /// `max_region_rtt` (ADR 0075 section 3.4, issue #1241). Every `run_node*`
@@ -17474,6 +17518,7 @@ fn apply_cluster_settings_to_bound(
     bound
         .with_max_region_rtt(config.max_region_rtt())
         .with_campaign_max_inflight(config.campaign_max_inflight())
+        .with_lag_stretch_max_x(config.lag_stretch_max_x())
         .with_mrec(
             crate::mrec_peer::MrecConfig::from_cluster(config)
                 .with_node_tls(config.nodes.get(index).and_then(|n| n.tls.clone())),
@@ -18074,6 +18119,7 @@ pub async fn run_node_data_with_cluster_settings(
         .await?
         .with_max_region_rtt(config.max_region_rtt())
         .with_campaign_max_inflight(config.campaign_max_inflight())
+        .with_lag_stretch_max_x(config.lag_stretch_max_x())
         .with_mrec(
             crate::mrec_peer::MrecConfig::from_cluster(config)
                 .with_node_tls(config.nodes.get(index).and_then(|n| n.tls.clone())),
@@ -18210,6 +18256,7 @@ pub async fn run_node_growth(
         .await?
         .with_max_region_rtt(config.max_region_rtt())
         .with_campaign_max_inflight(config.campaign_max_inflight())
+        .with_lag_stretch_max_x(config.lag_stretch_max_x())
         .with_mrec(
             crate::mrec_peer::MrecConfig::from_cluster(config)
                 .with_node_tls(config.nodes.get(index).and_then(|n| n.tls.clone())),

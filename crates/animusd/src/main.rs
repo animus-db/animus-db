@@ -583,6 +583,9 @@ async fn run(args: &[String]) -> Result<(), String> {
     // ADR 0078 step 3: `--campaign-max-inflight N` (0 disables the per-node
     // campaign governor); same reach and conflict rule as `--max-region-rtt-ms`.
     let mut campaign_max_inflight: Option<usize> = None;
+    // ADR 0078 step 4: `--lag-stretch-max N` (multiple of the election base; 0
+    // disables the load monitor and the stretch); same reach and conflict rule.
+    let mut lag_stretch_max_x: Option<u64> = None;
     // MREC global-table peer settings (ADR 0075 section 4, G-01 stage G-d M3):
     // `--region NAME`, repeatable `--peer REGION=host:port[,host:port...]`,
     // `--allow-insecure-peers` (dev only) and `--mrec-max-clock-skew-ms MS`.
@@ -738,6 +741,9 @@ async fn run(args: &[String]) -> Result<(), String> {
             "--campaign-max-inflight" => {
                 campaign_max_inflight = Some(parse_next(&mut it, "--campaign-max-inflight")?);
             }
+            "--lag-stretch-max" => {
+                lag_stretch_max_x = Some(parse_next(&mut it, "--lag-stretch-max")?);
+            }
             "--region" => mrec_region = Some(parse_next::<String>(&mut it, "--region")?),
             "--peer" => {
                 let v = parse_next::<String>(&mut it, "--peer")?;
@@ -810,6 +816,7 @@ async fn run(args: &[String]) -> Result<(), String> {
         tablet_max_write_units,
         max_region_rtt_ms,
         campaign_max_inflight,
+        lag_stretch_max_x,
         region: mrec_region.clone(),
         peers: mrec_peers.clone(),
         allow_insecure_peers,
@@ -848,6 +855,13 @@ async fn run(args: &[String]) -> Result<(), String> {
         return Err(
             "--max-region-rtt-ms is only supported with --config/--node (set \
              cluster_settings.max_region_rtt_ms in the config file for the other shapes)"
+                .into(),
+        );
+    }
+    if lag_stretch_max_x.is_some() && config_path.is_none() {
+        return Err(
+            "--lag-stretch-max is only supported with --config/--node (set \
+             cluster_settings.lag_stretch_max_x in the config file for the other shapes)"
                 .into(),
         );
     }
@@ -1986,6 +2000,7 @@ fn resolve_cluster_settings(
     merge_field!(tablet_max_write_units, "--tablet-max-write-units");
     merge_field!(max_region_rtt_ms, "--max-region-rtt-ms");
     merge_field!(campaign_max_inflight, "--campaign-max-inflight");
+    merge_field!(lag_stretch_max_x, "--lag-stretch-max");
     merge_field!(allow_insecure_peers, "--allow-insecure-peers");
     merge_field!(mrec_max_clock_skew_ms, "--mrec-max-clock-skew-ms");
     if let Some(r) = &cli.region {
@@ -2093,6 +2108,13 @@ async fn run_single(
             .cluster_settings
             .get_or_insert_with(Default::default)
             .max_region_rtt_ms = Some(ms);
+    }
+    // ADR 0078 step 4: and the stretch cap.
+    if let Some(x) = settings.lag_stretch_max_x {
+        config
+            .cluster_settings
+            .get_or_insert_with(Default::default)
+            .lag_stretch_max_x = Some(x);
     }
     // ADR 0078 step 3: same for the campaign cap.
     if let Some(n) = settings.campaign_max_inflight {

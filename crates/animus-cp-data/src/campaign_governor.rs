@@ -55,6 +55,8 @@ use std::time::Duration;
 
 use animus_env::{Metric, MetricsHandle, Nanos};
 
+use crate::load_monitor::LoadMonitor;
+
 /// Default `K`, the in-flight cap (ADR 0078 "Maintainer decisions": 32).
 pub const DEFAULT_CAMPAIGN_MAX_INFLIGHT: usize = 32;
 
@@ -110,6 +112,8 @@ struct Waiter {
 struct State {
     /// `K`; the effective cap is [`State::k_eff`].
     k: usize,
+    /// The load monitor's smoothed lag (nanoseconds); drives `K_eff`.
+    lag: u64,
     fault: GovernorFault,
     next_id: u64,
     permits: BTreeMap<u64, PermitRec>,
@@ -126,7 +130,7 @@ struct State {
 
 impl State {
     fn k_eff(&self) -> usize {
-        self.k
+        crate::load_monitor::k_eff(self.k, self.lag)
     }
 
     fn free(&self) -> usize {
@@ -287,6 +291,7 @@ impl CampaignGovernor {
                 metrics,
                 state: Mutex::new(State {
                     k: max_inflight.max(1),
+                    lag: 0,
                     fault,
                     next_id: 1,
                     permits: BTreeMap::new(),
@@ -300,6 +305,36 @@ impl CampaignGovernor {
                 }),
             }),
         }
+    }
+
+    /// Feed the load monitor's smoothed lag (nanoseconds, ADR 0078 step 4):
+    /// `K_eff` is `K` below 30 ms, `K/2` from 30 ms and `K/4` from 100 ms. When
+    /// the lag falls and slots open, the head of the queue is woken. Permits
+    /// already held are never revoked.
+    pub fn set_lag(&self, lag_nanos: u64) {
+        let wakes = {
+            let mut st = self.inner.state.lock().expect("campaign governor poisoned");
+            let before = st.k_eff();
+            st.lag = lag_nanos;
+            if st.k_eff() > before {
+                st.wakeups()
+            } else {
+                Vec::new()
+            }
+        };
+        for w in wakes {
+            w();
+        }
+    }
+
+    /// The effective cap now (`K` reduced by the observed lag).
+    #[must_use]
+    pub fn k_eff(&self) -> usize {
+        self.inner
+            .state
+            .lock()
+            .expect("campaign governor poisoned")
+            .k_eff()
     }
 
     /// Ask for a campaign permit for group `stream` at `now`.
@@ -505,6 +540,9 @@ impl Drop for CampaignPermit {
 pub struct ElectionBackpressure {
     /// Campaign admission (mechanism 1); `None` = disabled.
     pub governor: Option<CampaignGovernor>,
+    /// Scheduling-lag monitor (mechanism 2): stretches follower election
+    /// timeouts and reduces the governor's `K_eff`; `None` = disabled.
+    pub monitor: Option<LoadMonitor>,
 }
 
 #[cfg(test)]

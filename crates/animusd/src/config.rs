@@ -496,6 +496,13 @@ pub struct ClusterSettings {
     /// when unset. The control-plane group never uses it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub campaign_max_inflight: Option<usize>,
+    /// `--lag-stretch-max N` (ADR 0078 step 4): `S_max` of the lag-stretched
+    /// election timeout as a multiple of the election base (the per-node
+    /// `LoadMonitor` stretches followers' patience by `min(4 * lag, S_max)`).
+    /// `None` resolves to [`DEFAULT_LAG_STRETCH_MAX_X`] (4); `0` disables the
+    /// monitor and the stretch. Node-local, additive, skipped when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lag_stretch_max_x: Option<u64>,
     /// `--region NAME` (ADR 0075 section 4, G-01 stage G-d M3): **this
     /// cluster's own MREC region name** — the namespace of
     /// [`peers`](Self::peers) and of an MREC table's replica set (a *peer
@@ -536,6 +543,9 @@ pub struct ClusterSettings {
 
 /// The default [`ClusterSettings::max_region_rtt_ms`] (ADR 0075 section 3.4).
 pub const DEFAULT_MAX_REGION_RTT_MS: u64 = 150;
+
+/// The default [`ClusterSettings::lag_stretch_max_x`] (ADR 0078).
+pub const DEFAULT_LAG_STRETCH_MAX_X: u64 = animus_cp_data::load_monitor::DEFAULT_LAG_STRETCH_MAX_X;
 
 /// The default [`ClusterSettings::campaign_max_inflight`] (ADR 0078).
 pub const DEFAULT_CAMPAIGN_MAX_INFLIGHT: usize =
@@ -773,6 +783,16 @@ impl ClusterConfig {
             .as_ref()
             .and_then(|s| s.campaign_max_inflight)
             .unwrap_or(DEFAULT_CAMPAIGN_MAX_INFLIGHT)
+    }
+
+    /// The effective `lag_stretch_max_x` ([`ClusterSettings::lag_stretch_max_x`],
+    /// default [`DEFAULT_LAG_STRETCH_MAX_X`]); `0` disables the stretch.
+    #[must_use]
+    pub fn lag_stretch_max_x(&self) -> u64 {
+        self.cluster_settings
+            .as_ref()
+            .and_then(|s| s.lag_stretch_max_x)
+            .unwrap_or(DEFAULT_LAG_STRETCH_MAX_X)
     }
 
     /// Generate a **combined-mode** config for `n` nodes on `host`, assigning
@@ -1322,6 +1342,7 @@ mod tests {
             tablet_max_write_units: Some(100),
             max_region_rtt_ms: Some(220),
             campaign_max_inflight: Some(16),
+            lag_stretch_max_x: Some(2),
             region: Some("us".into()),
             peers: vec![PeerCluster {
                 region: "eu".into(),
@@ -1342,6 +1363,7 @@ mod tests {
         // Unset: no key on the wire, the default applies.
         let plain = serde_json::to_string(&ClusterSettings::default()).unwrap();
         assert!(!plain.contains("campaign_max_inflight"), "{plain}");
+        assert!(!plain.contains("lag_stretch_max_x"), "{plain}");
         let cfg = ClusterConfig::generate(1, std::net::Ipv4Addr::LOCALHOST.into(), 9000);
         assert_eq!(cfg.campaign_max_inflight(), DEFAULT_CAMPAIGN_MAX_INFLIGHT);
         assert_eq!(DEFAULT_CAMPAIGN_MAX_INFLIGHT, 32);
@@ -1350,6 +1372,8 @@ mod tests {
         let old = r#"{"quiesce_after_secs":10,"max_region_rtt_ms":200}"#;
         let s: ClusterSettings = serde_json::from_str(old).unwrap();
         assert_eq!(s.campaign_max_inflight, None);
+        assert_eq!(s.lag_stretch_max_x, None);
+        assert_eq!(cfg.lag_stretch_max_x(), 4);
         assert_eq!(s.max_region_rtt_ms, Some(200));
         // Set (including 0 = off) round-trips.
         for k in [0usize, 7, 64] {
@@ -1367,6 +1391,17 @@ mod tests {
             let mut c = ClusterConfig::generate(1, std::net::Ipv4Addr::LOCALHOST.into(), 9000);
             c.cluster_settings = Some(s);
             assert_eq!(c.campaign_max_inflight(), k);
+            let s = ClusterSettings {
+                lag_stretch_max_x: Some(k as u64),
+                ..ClusterSettings::default()
+            };
+            let json = serde_json::to_string(&s).unwrap();
+            assert!(
+                json.contains(&format!(r#""lag_stretch_max_x":{k}"#)),
+                "{json}"
+            );
+            c.cluster_settings = Some(s);
+            assert_eq!(c.lag_stretch_max_x(), k as u64);
         }
     }
 

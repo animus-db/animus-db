@@ -3137,7 +3137,37 @@ build (control (a) alone ~80 s); `ANIMUS_ELECTION_BP_CELL=<substring>` runs one
 cell (each cell is 1 to 12 s except cell 1/control (a)),
 `ANIMUS_ELECTION_BP_GROUPS=N` shrinks the rig.
 
-### Heartbeat-batcher corpus (`tests/heartbeat_batch_corpus.rs`)
+**Step 4 (load monitor and lag stretch).** `load_monitor.rs`: one `LoadMonitor`
+per node, one probe task via `env.spawn_task` (`PROBE` 20 ms): `sample = (now -
+slept_from) - PROBE`, `lag = max(sample, lag - lag/32)` (instant attack, integer
+decay), dead band 10 ms reads zero, stretch `S = min(4*lag, lag_stretch_max_x *
+election_base)`, and `K_eff` (the governor's cap) is `K/2` at lag >= 30 ms and
+`K/4` (min 1) at >= 100 ms. Everything numeric is a pure integer function
+(`next_estimate`, `reading`, `stretch_nanos`, `k_eff`) with unit tests
+(monotone, bounded, dead band, stretch, `K_eff`). The driver installs
+`monitor.stretch(c.election_timeout())` with `set_lag_stretch` once per loop
+iteration (no-op if unchanged, no entropy; it applies at the next timer reset,
+so a quiesced follower woken by `on_local_wake` is not stretched). The monitor
+feeds `CampaignGovernor::set_lag` (wakes the head of the queue when `K_eff`
+grows) and metrics `cp_election_lag_nanos` / `cp_election_stretch_nanos`.
+`ElectionBackpressure { governor, monitor }` (default off) carries both.
+**SimEnv caveat:** the CPU-starvation model serves expired timers ahead of
+waiting deliveries, so the probe task reads ~0 under it (it is exercised on a
+`pause`d node by `load_monitor_task_measures_a_paused_node`); the corpus feeds
+`LoadMonitor::detached` from `Simulator::cpu_backlog` (`waiting deliveries x
+per-event cost`, once per `PROBE` of virtual time, `Rig::probe`).
+`cell_12_idle_probe_task_changes_no_group_outcome` runs the real task idle.
+Corpus cells added: 4 with all mechanisms, 4b (leader-node loss with decaying
+lag: the node loss lands as the load ends, so the cap on the stretch is the only
+thing that bounds the failover), 5 (1.25x sustained overload for 60 s), 6
+(1.25x for 30 s then relief); controls (b) (stretch off on cell 5) and (e)
+(`S_max = inf` on cell 4b, same seed as 4b so the runs differ only in the cap),
+plus `control_a6_*` (cell 6 without mechanisms). Cells 5 and 6 and the
+controls (a)/(b) cost 45 to 80 s each in a debug build; the whole file takes
+about 4.5 minutes on this host (its tests run in parallel; the cells test is
+sequential). `ANIMUS_ELECTION_BP_CELL=<substring>` runs one cell.
+
+
 
 ADR 0044 phase 2 — the `heartbeat_batch` module's own fault-injection
 corpus, depth knob `ANIMUS_HEARTBEAT_SEEDS` (default 1). This corpus
