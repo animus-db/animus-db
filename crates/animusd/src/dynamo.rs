@@ -2561,29 +2561,34 @@ async fn update_continuous_backups(
             })?;
         }
     }
+    // `propose_and_await`, not a propose-every-poll loop (issue #1292): a
+    // resubmit per 50ms tick appended a duplicate entry to the very commit
+    // pipeline this call waits on, and a fixed 5s deadline turned a slow but
+    // live single-node commit under write load into a 500.
     let wall_ms = ctx.env.wall_now().0;
-    let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
-    loop {
-        ctx.propose_schema(&MetaCommand::UpdateContinuousBackups {
-            table: table.to_owned(),
-            enabled,
-            wall_ms,
-        })
-        .await;
-        let fresh = metadata_fresh(ctx).await;
-        if fresh.table_pitr(table).is_some() == enabled {
-            return Ok(wire::update_continuous_backups_response(&pitr_description(
-                ctx, &fresh, table,
-            )));
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(internal(
+    let fresh = ctx
+        .propose_and_await(
+            MetaCommand::UpdateContinuousBackups {
+                table: table.to_owned(),
+                enabled,
+                wall_ms,
+            },
+            SCHEMA_COMMIT_TIMEOUT,
+            || async {
+                let fresh = metadata_fresh(ctx).await;
+                (fresh.table_pitr(table).is_some() == enabled).then_some(fresh)
+            },
+        )
+        .await
+        .map_err(|()| {
+            internal(
                 "UpdateContinuousBackups did not commit to the control plane in time \
                  (no leader reachable?)",
-            ));
-        }
-        tokio::time::sleep(SCHEMA_POLL_INTERVAL).await;
-    }
+            )
+        })?;
+    Ok(wire::update_continuous_backups_response(&pitr_description(
+        ctx, &fresh, table,
+    )))
 }
 
 /// `DescribeContinuousBackups` (ADR 0059 §9): a pure read of the replicated

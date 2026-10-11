@@ -1054,6 +1054,26 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// caller's commit-wait predicate must be able to `.await` it; every
     /// existing call site's predicate — sync in substance for a `Local`
     /// handle — just gained an `async` wrapper with no behavior change).
+    ///
+    /// **`timeout` bounds a stall, not a slow commit (issue #1292).** When
+    /// this node is itself the control leader, a commit is a pipeline this
+    /// node can watch: the proposal lands in its log at a known index, the
+    /// driver's persist round makes it durable, and the apply task merges it
+    /// and publishes `Metadata` (only then can `committed` see it). Under
+    /// disk contention each stage waits for the `fsync`s queued ahead of it,
+    /// so the whole pipeline can take seconds while every stage is still
+    /// moving — the single-node `dynamo_pitr` stress test hit exactly that,
+    /// 500ing "no leader reachable?" with its own leader alive and applying.
+    /// So while the local apply watermark
+    /// ([`engine_applied_index`](animus_control::RaftNode::engine_applied_index))
+    /// is still below the proposal's own index and advancing, the deadline
+    /// moves out with it, and the proposal is not resubmitted (it is in the
+    /// log; a resubmit only appends a duplicate the same pipeline must
+    /// persist and apply). The wait stays bounded: the watermark is
+    /// monotonic and the extension ends once it reaches the proposal's
+    /// index, after which a still-invisible change (a truncated entry, a
+    /// rejected command) falls back to the plain `timeout`. A follower or a
+    /// data-only node sees no local pipeline and keeps the plain `timeout`.
     pub(crate) async fn propose_and_await<T, Fut>(
         &self,
         command: MetaCommand,
@@ -1063,18 +1083,48 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     where
         Fut: std::future::Future<Output = Option<T>>,
     {
-        let deadline = self.env.now().saturating_add(timeout);
+        let mut deadline = self.env.now().saturating_add(timeout);
         let mut next_propose_at = self.env.now();
+        // The local log index of our latest proposal, and the apply
+        // watermark last seen while it was pending (`None` unless this node
+        // proposed it as the control leader).
+        let mut local_pending: Option<(u64, u64)> = None;
         loop {
             if let Some(value) = committed().await {
                 return Ok(value);
             }
             let now = self.env.now();
+            if let Some((index, seen)) = local_pending {
+                let applied = self
+                    .edge
+                    .leader_handle()
+                    .map(|leader| leader.engine_applied_index());
+                match applied {
+                    Some(applied) if applied < index => {
+                        if applied > seen {
+                            deadline = deadline.max(now.saturating_add(timeout));
+                            local_pending = Some((index, applied));
+                        }
+                        next_propose_at =
+                            next_propose_at.max(now.saturating_add(SCHEMA_POLL_INTERVAL));
+                    }
+                    _ => local_pending = None,
+                }
+            }
             if now >= deadline {
                 return Err(());
             }
             if now >= next_propose_at {
-                let sent = self.propose_schema(&command).await;
+                let sent = match self.edge.leader_handle() {
+                    Some(leader) => match leader.propose(command.clone()) {
+                        ProposeResult::Accepted { index, .. } => {
+                            local_pending = Some((index, leader.engine_applied_index()));
+                            true
+                        }
+                        ProposeResult::NotLeader { .. } => false,
+                    },
+                    None => self.propose_schema(&command).await,
+                };
                 next_propose_at = now.saturating_add(if sent {
                     SCHEMA_PROPOSE_PATIENCE
                 } else {
