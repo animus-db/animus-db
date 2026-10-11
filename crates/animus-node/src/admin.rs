@@ -54,6 +54,7 @@ pub async fn dispatch<H: AdminHost + ?Sized>(
         ("GET", "/admin/member/drain-status") => host.member_drain_status(query).await,
         ("GET", "/admin/health") => host.health().await,
         ("GET", "/admin/live") => host.live().await,
+        ("GET", "/admin/ready") => host.ready().await,
         ("POST", "/admin/tablet/split") => host.action_split(body).await,
         ("POST", "/admin/stream/grow") => host.action_stream_grow(body).await,
         ("POST", "/admin/storage/flush") => host.action_flush(body).await,
@@ -216,6 +217,9 @@ mod tests {
             unreachable!()
         }
         async fn live(&self) -> (u16, Value) {
+            (200, self.record())
+        }
+        async fn ready(&self) -> (u16, Value) {
             (200, self.record())
         }
         async fn action_split(&self, body: &[u8]) -> (u16, Value) {
@@ -441,6 +445,15 @@ mod tests {
     fn get_admin_live_routes_to_live() {
         let host = FakeHost::new();
         let (status, body) = block_on(dispatch(&host, "GET", "/admin/live", "", b""));
+        assert_eq!(status, 200);
+        assert!(body.contains("\"marker\""));
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn get_admin_ready_routes_to_ready() {
+        let host = FakeHost::new();
+        let (status, body) = block_on(dispatch(&host, "GET", "/admin/ready", "", b""));
         assert_eq!(status, 200);
         assert!(body.contains("\"marker\""));
         assert_eq!(host.calls.load(Ordering::SeqCst), 1);

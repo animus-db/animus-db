@@ -14,10 +14,10 @@ a quorum loss: [control-plane-quorum-loss.md](control-plane-quorum-loss.md). If 
 majority is up, look for a network partition between them, a certificate or
 handshake problem ([network.md](network.md), [cert-rotation.md](cert-rotation.md)),
 or a wiped voter that refuses to vote (see [node-replace.md](node-replace.md)).
-While leaderless, the data plane keeps serving existing tablets, but on
-Kubernetes every pod's readiness (`/admin/health`) goes 503 after three election
-timeouts, which removes them from the client Service (see
-[control-plane-quorum-loss.md](control-plane-quorum-loss.md)).
+While leaderless, the data plane keeps serving existing tablets. `/admin/health`
+goes 503 after three election timeouts, but the Kubernetes readiness probe
+(`/admin/ready`, issue #1274) does not, so the client Service keeps its endpoints
+(see [control-plane-quorum-loss.md](control-plane-quorum-loss.md)).
 
 **Multiple leaders.** Each node reports its own belief. A short overlap right
 after a leadership change is possible (an old leader has not yet seen the higher

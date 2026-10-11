@@ -1188,7 +1188,20 @@ a literal `:0`.
   `is_relayable_command` allowlist regression, mirroring
   `schema_ddl_relay.rs`'s precedent for `SetTableTtl`/`TagResource`/etc.).
 
-  **`GET /admin/health` — the Kubernetes readiness probe (ADR 0060) — reads
+  **`GET /admin/ready` (issue #1274, 2026-10-10) is the Kubernetes readiness
+  probe now; `/admin/health` is unchanged control-plane health.** `ready()`
+  is `200` iff this node has synced `Metadata` (`last_applied() > 0` OR
+  `has_synced_metadata()` OR `ctx.remote_metadata` set: the same three-way
+  signal as the host reconciler's pre-recovery guard) AND
+  `consensus_task_panics == 0`; it never gates on a control leader
+  (`control_leader_recent` is a diagnostic), because per-tablet Raft groups
+  serve through a control-plane quorum loss and the client Service only
+  routes to Ready pods. Tests: `a_panicked_consensus_task_fails_health_and_counts`
+  (`tests/consensus_task_panic_health.rs`, ready 503 on panic),
+  `admin_endpoint.rs`'s `admin_ready_is_200_while_leaderless_with_metadata`,
+  and the `sim_cluster` smoke. ADR 0020/0060 2026-10-10 amendments.
+
+  **`GET /admin/health` — formerly the Kubernetes readiness probe (ADR 0060) — reads
   a HYSTERESIS-gated leader belief, not the raw one (issue #595, ADR 0020's
   2026-09-04 amendment).** `ctx.control.leader().is_some()` (the raw
   consensus belief, `RaftCore::leader_id`) is cleared the instant a
