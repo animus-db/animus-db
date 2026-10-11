@@ -3275,3 +3275,21 @@ the survivor. Stale un-wiped voters are fenced by the term jump plus `Removed`
 (`RaftNode::removed_by_leader`) but must still be wiped to be re-admitted. Tests:
 `tests/it/force_new_configuration.rs` (`ANIMUS_FORCE_RECOVER_SEEDS`, `ANIMUS_SEED`
 replay). Its restarts use `sim.stop` + fresh `RaftNode::start` on the retained engine.
+
+## Leader rebalance-plan cache (issue #1192, ADR 0029's 2026-10-11 amendment)
+
+`reconcile_loop` serves its one-move-per-evaluation rebalance from
+`rebalance_cache::RebalanceCache` (a `rebalance_batch` plan kept across ticks)
+instead of re-planning O(tablets) per move. Contract: the offered move always
+equals `PlacementView::rebalance` on the same view; the cache proves it with
+`Metadata::placement_rev` (an in-memory, serde-skipped counter bumped by `apply`
+on every `Applied` command, excluded from equality), the `recently_done` set, the
+term and the map sizes, and pops its head only when the head's CAS is OBSERVED
+(row at `expected_epoch.next()` with the planned replicas, rev exactly `+1`).
+Rules: any new code path that mutates `members`/`tablets`/`policies`/
+`split_placing` must go through `apply` (a direct edit of the pub maps is not seen
+by `placement_rev`; only the map-size check catches some of them); a new input to
+`rebalance_placement` must be added to the cache fingerprint. Test:
+`cargo test -p animus-control --test it rebalance_cache::` (property test vs fresh
+`rebalance`; `ANIMUS_REBALANCE_CACHE_SEEDS=K`, `ANIMUS_SEED` replay). Metrics
+`control_rebalance_evals` / `control_rebalance_plan_rebuilds`.

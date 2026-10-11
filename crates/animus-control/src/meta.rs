@@ -305,6 +305,15 @@ pub struct Metadata {
     #[doc(hidden)]
     #[serde(skip)]
     pub tablet_index: TabletIndex,
+    /// Derived, in-memory-only **mutation counter** (issue #1192, ADR 0029's
+    /// 2026-10-11 amendment): bumped by [`Metadata::apply`] on every command
+    /// that returns [`ApplyOutcome::Applied`]. Never serialized, never part of
+    /// equality. The leader's rebalance-plan cache compares it to detect that
+    /// ANY placement input (members, tablets, policies, `split_placing`)
+    /// moved without scanning them. See [`PlacementRev`].
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub placement_rev: PlacementRev,
     /// Replicated **node address book** (ADR 0032 PR1): every member's full
     /// address set (raftkv/client/admin), keyed by its raftkv id. Mutated by
     /// [`MetaCommand::RegisterNode`] (the sole claim path, ADR 0040 Decision
@@ -632,6 +641,22 @@ fn is_zero_u32(v: &u32) -> bool {
     *v == 0
 }
 
+/// The in-memory mutation counter behind [`Metadata::placement_rev`]. Local to
+/// one process's `Metadata` value (two replicas that applied the same log
+/// generally hold different values, and a value rebuilt from a snapshot or a
+/// decode restarts at 0), so it is only meaningful as "did THIS value change
+/// between two observations of it" and is never compared across values:
+/// `PartialEq` is always true so it cannot affect `Metadata`'s equality.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PlacementRev(u64);
+
+impl PartialEq for PlacementRev {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for PlacementRev {}
+
 /// Derived, **in-memory-only** index from table name to the ids of its
 /// tablets (issue #1192), so `CreateTablet`'s "table already has a tablet"
 /// check and `tablets_for_table` are not O(all tablets). Never serialized
@@ -711,6 +736,7 @@ impl Default for Metadata {
             schemas: Default::default(),
             next_tablet_id: Default::default(),
             tablet_index: TabletIndex::default(),
+            placement_rev: PlacementRev::default(),
             node_addrs: Default::default(),
             split_lineage: Default::default(),
             split_placing: Default::default(),
@@ -3233,6 +3259,10 @@ pub struct PlacementView {
     /// third phase needs it alongside `tablets`/`policies` to know which
     /// un-`done` children still need converging.
     pub split_placing: BTreeMap<TabletId, SplitPlacing>,
+    /// The source `Metadata`'s [`placement_rev`](Metadata::placement_rev) when
+    /// this view was cloned (see [`PlacementRev`] for what it can be compared
+    /// with).
+    pub rev: u64,
 }
 
 impl PlacementView {
@@ -3687,7 +3717,15 @@ impl Metadata {
             tablets: self.tablets.clone(),
             policies: self.policies.clone(),
             split_placing: self.split_placing.clone(),
+            rev: self.placement_rev.0,
         }
+    }
+
+    /// The mutation counter [`PlacementView::rev`] snapshots; see
+    /// [`PlacementRev`].
+    #[must_use]
+    pub fn placement_rev(&self) -> u64 {
+        self.placement_rev.0
     }
 
     /// Recompute placement for every tablet that has a policy and return the
@@ -3861,7 +3899,21 @@ impl Metadata {
     }
 
     /// Apply a command, returning the (deterministic) outcome.
+    ///
+    /// Every [`ApplyOutcome::Applied`] bumps [`placement_rev`](Self::placement_rev).
+    /// That is deliberately conservative (a schema or backup command also
+    /// bumps it): a spurious bump only costs the rebalance-plan cache one
+    /// rebuild, while a missed one would let a stale plan through.
     pub fn apply(&mut self, command: &MetaCommand) -> ApplyOutcome {
+        let outcome = self.apply_inner(command);
+        if outcome == ApplyOutcome::Applied {
+            self.placement_rev.0 = self.placement_rev.0.wrapping_add(1);
+        }
+        outcome
+    }
+
+    /// The command body behind [`apply`](Self::apply).
+    fn apply_inner(&mut self, command: &MetaCommand) -> ApplyOutcome {
         match command {
             MetaCommand::NoOp => ApplyOutcome::NoOp,
             MetaCommand::UpsertMember {

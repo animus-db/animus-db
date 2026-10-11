@@ -148,3 +148,11 @@ A cluster-default policy and operator-facing policy management are future work.
   strict domain (lowest node id kept), then fills; **no best-effort growth** and
   `InsufficientDomains` when a pinned region has no node (never repair across
   regions). Property tests start from violating sets (`tests/it/pinned.rs`).
+
+## Plan reuse (issue #1192)
+
+`rebalance_plan` is what the control leader's plan cache
+(`animus-control` `rebalance_cache`) consumes: the plan is valid only while the
+inputs are exactly the state the earlier moves produce, so a caller that keeps
+it across ticks must fingerprint ALL of `tablets`, `candidates` and the policies
+and drop the plan on any unpredicted change. The crate stays stateless.

@@ -26,6 +26,7 @@ use crate::mirror::{self, KeyWrite, RebuildError};
 use crate::persist::{CONTROL_SNAPSHOT, CONTROL_WAL, PersistedState};
 use crate::persist_round::{self, GatedOuts, PersistArm, PersistFut, PersistProgress, PersistWake};
 use crate::raft::{Out, ProposeResult, RaftCore, RaftMsg, Role};
+use crate::rebalance_cache::{RebalanceCache, RebalanceCacheStats};
 use crate::syskv;
 use crate::version::{ClusterFeatures, GateSurface, GatedCommand, VersionRange};
 use crate::version_observe::{
@@ -799,6 +800,7 @@ impl<E: Env> RaftNode<E> {
             Arc::clone(&core),
             Arc::clone(&cache),
             features.clone(),
+            metrics.clone(),
         ));
         // The failure detector evaluates member liveness on a timer and, when
         // leader, proposes `UpsertMember` transitions (ADR 0012). Like the
@@ -2831,8 +2833,16 @@ async fn reconcile_loop<E: Env>(
     core: Arc<Mutex<RaftCore>>,
     cache: Arc<Mutex<Metadata>>,
     features: ClusterFeatures,
+    metrics: MetricsHandle,
 ) {
     let mut tick: u64 = 0;
+    // The leader's rebalance plan, kept across ticks (issue #1192, ADR 0029's
+    // 2026-10-11 amendment): still at most one move per evaluation, but the
+    // O(tablets) planning pass runs only when the cluster diverged from what
+    // the plan predicted. Dropped on losing leadership and on a refused
+    // proposal; a term change is also caught inside the cache.
+    let mut rebalance_cache = RebalanceCache::new();
+    let mut reported = RebalanceCacheStats::default();
     // Driver-local dwell tracking for the directed-Placing phase's
     // retarget gate (ADR 0062 §2, issue #528 fix) — see
     // `retarget_ready_this_tick`'s own doc. Volatile, per-node,
@@ -2868,7 +2878,11 @@ async fn reconcile_loop<E: Env>(
         // pure decision *off* the lock, so a big catalog never turns this
         // background tick into a full-blob clone every 500ms (clone-churn
         // fix).
-        if !core.lock().expect("raft core poisoned").is_leader() {
+        let term = {
+            let core = core.lock().expect("raft core poisoned");
+            core.is_leader().then(|| core.term())
+        };
+        let Some(term) = term else {
             // A non-leader's dwell tracking is meaningless (only the leader
             // ever proposes a retarget) — clear it so a future leadership
             // stint starts its dwell clocks fresh rather than resuming a
@@ -2878,8 +2892,9 @@ async fn reconcile_loop<E: Env>(
             retarget_since.clear();
             done_since.clear();
             down_since.clear();
+            rebalance_cache.invalidate();
             continue;
-        }
+        };
         let view = cache.lock().expect("cache poisoned").placement_view();
         // Issue #928/#921 fix: computed before repair/rebalance so both can
         // exclude a tablet still inside its post-`done` grace window — see
@@ -2903,11 +2918,22 @@ async fn reconcile_loop<E: Env>(
         // move (a healthy replica from a most-loaded node onto a least-loaded
         // one). The cadence is pure churn control (see `REBALANCE_EVERY_N_TICKS`):
         // safety is the epoch-CAS + data-plane catch-up gate, not this timing.
-        if !repaired
-            && tick.is_multiple_of(REBALANCE_EVERY_N_TICKS)
-            && let Some(command) = view.rebalance(&recently_done, &recently_down)
-        {
-            propose_gated(&core, &cache, &features, command);
+        if !repaired && tick.is_multiple_of(REBALANCE_EVERY_N_TICKS) {
+            if let Some(command) = rebalance_cache.next(&view, term, &recently_done)
+                && !matches!(
+                    propose_gated(&core, &cache, &features, command),
+                    ProposeResult::Accepted { .. }
+                )
+            {
+                rebalance_cache.invalidate();
+            }
+            let now = rebalance_cache.stats();
+            metrics.incr_by(Metric::ControlRebalanceEvals, now.evals - reported.evals);
+            metrics.incr_by(
+                Metric::ControlRebalancePlanRebuilds,
+                now.rebuilds - reported.rebuilds,
+            );
+            reported = now;
         }
         // ADR 0062 §2's directed-Placing phase: unconditional every tick,
         // independent of the repair/rebalance gating above. Off-leader
@@ -3946,6 +3972,7 @@ mod tests {
             tablets: BTreeMap::new(),
             policies: BTreeMap::new(),
             split_placing: BTreeMap::new(),
+            rev: 0,
         }
     }
 
