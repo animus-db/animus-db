@@ -56,6 +56,15 @@ Never remove a second voter while a third is suspected dead.
 
 ## A majority of voters is permanently gone: force a new configuration
 
+**Operator-managed clusters (issue #1277).** The operator re-adds any control
+ordinal in `0..controlNodes` missing from the live voter set on every reconcile,
+which would undo the removals and wipes above. Before step 1, pause it:
+`kubectl annotate animuscluster NAME animusdb.io/pause-control-voter-reconcile=true`
+(status shows a `ControlVoterReconcilePaused` condition; children are still
+applied). When the group is regrown as you want (or you want the operator to do
+the regrowth), remove it: `kubectl annotate animuscluster NAME
+animusdb.io/pause-control-voter-reconcile-`.
+
 When a majority of control voters cannot come back (disks destroyed), no in-band
 change can commit: `control-remove --force` and the tablet-level `reconfigure` both
 need a majority of the old configuration. The supported way out is the **offline,

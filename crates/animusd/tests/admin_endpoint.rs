@@ -141,6 +141,8 @@ async fn bring_up_with_streams(
                 animusd::StreamSealKnobs {
                     seal_bytes: 1,
                     seal_age: Duration::from_secs(3600),
+                    pitr_seal_age: Duration::from_secs(3600),
+                    ..Default::default()
                 },
                 animusd::SegmentStoreConfig::default(),
                 Duration::from_secs(600),
@@ -214,6 +216,8 @@ async fn bring_up_with_fs_segment_store(
                 animusd::StreamSealKnobs {
                     seal_bytes: 1,
                     seal_age: Duration::from_secs(3600),
+                    pitr_seal_age: Duration::from_secs(3600),
+                    ..Default::default()
                 },
                 animusd::SegmentStoreConfig::Fs(
                     segment_store_dir.join(format!("attempt-{attempt}")),

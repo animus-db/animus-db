@@ -278,6 +278,8 @@ async fn disable_survives_concurrent_periodic_seal_on_local_route() {
     let racy_knobs = StreamSealKnobs {
         seal_bytes: 48,
         seal_age: Duration::from_secs(3600),
+        pitr_seal_age: Duration::from_secs(3600),
+        ..Default::default()
     };
     let disable = async {
         let dir = support::panic_safe_tempdir();
