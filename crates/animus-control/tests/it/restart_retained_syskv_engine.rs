@@ -2,7 +2,9 @@
 //! system-keyspace engine over a WAL compacted past a snapshot converges to
 //! the leader's full `Metadata`. (A fresh engine over a retained compacted
 //! WAL is an unsupported state that silently loses pre-snapshot entries; it
-//! was `SimCluster::restart`'s fixture bug, now fixed.)
+//! was `SimCluster::restart`'s fixture bug, now fixed.) Issues #1194/#1235:
+//! that unsupported state is now REFUSED at boot (the node halts) instead of
+//! serving a partial `Metadata`.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -24,7 +26,7 @@ fn upsert(node: u64) -> MetaCommand {
 
 /// `durable_engine`: restart on the retained engine (production shape) vs a
 /// fresh one (SimCluster Memory-backend shape). Returns (restarted, leader).
-fn run(seed: u64, entries: u64, durable_engine: bool) -> (usize, usize, u64, u64) {
+fn run(seed: u64, entries: u64, durable_engine: bool) -> (usize, usize, u64, u64, bool) {
     let mut sim = Simulator::new(seed);
     let engines: Vec<MemoryEngine> = NODES.iter().map(|_| MemoryEngine::new()).collect();
     let mut nodes: Vec<RaftNode<SimEnv>> = NODES
@@ -71,15 +73,32 @@ fn run(seed: u64, entries: u64, durable_engine: bool) -> (usize, usize, u64, u64
         nodes[lead_now].metadata().members.len(),
         nodes[victim].engine_applied_index(),
         nodes[lead_now].engine_applied_index(),
+        nodes[victim].is_halted(),
     )
 }
 
 #[test]
 fn restart_with_retained_syskv_engine_converges_past_compaction() {
     let seed = 0xC17;
-    let (v, l, va, la) = run(seed, 300, true);
+    let (v, l, va, la, halted) = run(seed, 300, true);
+    assert!(
+        !halted,
+        "retained-engine restart must not halt (seed={seed})"
+    );
     assert_eq!(
         v, l,
         "durable-engine restart diverged (seed={seed}, applied {va} vs {la})"
     );
+}
+
+/// #1194: a fresh engine over the retained, compacted WAL must halt the node
+/// and never expose a partial `Metadata` (it stays at the empty default).
+#[test]
+fn restart_with_fresh_syskv_engine_over_compacted_wal_halts() {
+    for seed in [0xC17, 0x1194, 8140559029270420170] {
+        let (v, l, _va, _la, halted) = run(seed, 300, false);
+        assert!(halted, "fresh-engine restart must halt (seed={seed})");
+        assert!(l >= 300, "leader lost entries (seed={seed})");
+        assert_eq!(v, 0, "halted node served partial Metadata (seed={seed})");
+    }
 }

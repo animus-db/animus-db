@@ -12429,3 +12429,8 @@ node, a bad index, a missing/empty WAL, and a node that is not a voter in its ow
 WAL. WAL path is `<dir>/internal/raft.wal` (`--encryption-key` as for the node).
 Tests: `cargo test -p animusd --lib control_recover`. Runbook:
 `docs/runbook/control-plane-quorum-loss.md`.
+
+`SimCluster` keeps each control node's syskv `MemoryEngine` across `restart` (a real
+restart reopens the same disk); a fresh engine over a compacted control WAL now makes
+the control node halt (ADR 0038 2026-10-10, issues #1194/#1235). Test:
+`cargo test -p animusd --lib sim_cluster_control_restart_compacted`.

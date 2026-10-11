@@ -1700,6 +1700,29 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
             }
         };
 
+    // Issues #1194/#1235 (ADR 0038's 2026-10-10 amendment): the engine's
+    // durable watermark must reach the recovered core's snapshot base. A
+    // DRIVER_APPLIED snapshot keeps no local image, so the apply task replays
+    // only the log tail above the base; an engine behind it (lost or wiped
+    // while the WAL survived) would otherwise serve a partial `Metadata` at a
+    // matching applied index, and the leader would never send InstallSnapshot.
+    // Refuse to start instead, exactly like the decode-failure halts above.
+    let snapshot_base = core.lock().expect("raft core poisoned").snapshot_index();
+    if watermark < snapshot_base {
+        tracing::error!(
+            engine_watermark = watermark,
+            snapshot_base,
+            "control-plane system-keyspace mirror is behind this node's compacted Raft \
+             WAL (engine watermark {watermark} < snapshot base {snapshot_base}); the \
+             mirror was lost or wiped while the WAL survived, so serving would expose a \
+             partial Metadata. halting this node: wipe its control state entirely (WAL \
+             and system keyspace) and re-add it with `control-add` \
+             (docs/runbook/control-plane-quorum-loss.md)"
+        );
+        halted.store(true, Ordering::SeqCst);
+        return;
+    }
+
     // ADR 0073 Phase 2 (P2-A): era-on handshake refusal + startup range check
     // against the freshly read `Metadata`, before the first tick.
     let mut era_watch = EraWatch::default();

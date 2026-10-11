@@ -23301,6 +23301,11 @@ mod sim_cluster_stream_backfill_seed_filter;
 #[cfg(test)]
 mod sim_cluster_control_only;
 
+/// Issue #1235: a Memory-backend control restart past log compaction keeps
+/// its syskv mirror and converges to full `Metadata`.
+#[cfg(test)]
+mod sim_cluster_control_restart_compacted;
+
 /// ADR 0061 rung L (C-12 PR 3): data-only nodes under `SimCluster` —
 /// `NodeRole::Data` first-class at construction (`SimCluster::new_with_
 /// roles`, previously `SimCluster::grow("data")`-only), role-aware `crash`/

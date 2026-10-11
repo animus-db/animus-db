@@ -546,6 +546,26 @@ queue wait is bounded by the rounds ahead of it. Regression:
 `tests/apply_not_starved_by_wal_lock.rs`. Follow-up not addressed: the failure
 detector re-proposing `Down` for members a stale cache shows Active.
 
+## Amendment (2026-10-10, issues #1194/#1235 — a control node refuses to start on a syskv mirror behind its compacted WAL)
+
+A `DRIVER_APPLIED` snapshot keeps no local image: after a restart the apply
+task replays only the log above the recovered snapshot base and trusts the
+engine for everything below it. If the system-keyspace engine is lost or wiped
+while the control WAL survives (compacted below the base), the node rebuilt a
+partial `Metadata`, read `commit == applied` equal to the leader's, and the
+leader never sent `InstallSnapshot`. **Decision (maintainer): refuse to
+start.** In `drive`, right after `meta_apply_seed`, if the engine's durable
+`_applied_index` watermark is below the core's recovered `snapshot_index()`
+the node logs an error naming both indices and the remedy, latches `halted`
+and returns, exactly like the syskv-decode-failure halt. A fresh bootstrap (no
+snapshot, base 0), an empty WAL and a normal restart (watermark >= base)
+are unaffected. Remedy (runbook `control-plane-quorum-loss.md`): wipe the
+node's control state entirely and re-add it. `SimCluster`'s Memory backend
+(#1235) now retains the control mirror engine across `restart` like a real
+disk. Tests: `animus-control` `restart_retained_syskv_engine` (fresh engine
+halts, retained engine converges) and `animusd`
+`sim_cluster_control_restart_compacted`.
+
 ## See also
 
 - `crates/animus-control/CLAUDE.md` — `node.rs`/`raft.rs`/`mirror.rs`/`syskv.rs`/
