@@ -1,6 +1,6 @@
 # ADR 0078 — Election backpressure: per-node campaign admission, lag-stretched election timeouts, staggered hosting
 
-- **Status:** Accepted (2026-10-11) — design only; nothing is implemented yet. The maintainer settled the six open questions on 2026-10-11 (see "Maintainer decisions" below).
+- **Status:** Accepted (2026-10-11), implemented (2026-10-11). The maintainer settled the six open questions on 2026-10-11 (see "Maintainer decisions" below); see "As built (2026-10-11)" for where the implementation differs from the design.
 - **Date:** 2026-10-11
 - **Origin:** issue #1199 (found by C-17 Tier 2, `crates/animus-cp-data/tests/group_density_cost.rs`); maintainer decision "ADR first, code after".
 - **Amends:** none. **Depends on:** ADR 0003 (determinism, the `Env` seam), ADR 0009 (control-plane Raft, pre-vote), ADR 0016/0017 (CP data plane, per-tablet Raft), ADR 0031 (host reconciler), ADR 0044/0048 (quiescence, heartbeat batching), ADR 0058 (learners), ADR 0073 (upgrade compatibility), ADR 0075 section 3.4 (per-group timing profile).
@@ -247,6 +247,34 @@ The maintainer accepted the recommendation on each of the six questions this ADR
 4. **Advisory only.** `hosting_ramp` and the lag gauge stay advisory in `/admin/health`. Sustained high lag does not fail the health check or the roll gate (ADR 0073 Phase 3).
 5. **Density admission is a separate ADR.** A per-node cap on awake groups is out of scope here. It gets its own ADR once Tier 2 shows where the stable ceiling is.
 6. **Restart tail accepted.** `H` stays fixed. A ramp-time-dependent `H` can follow later if measurement justifies it.
+
+## As built (2026-10-11)
+
+Implemented on one branch as the seven planned steps. The defaults are unchanged (`K=32`, `H=100`, `c=4`, `S_max=4x`, settle timeout 600 ms) and all three mechanisms are on by default. Deviations from the text above, and results:
+
+- **CPU model ordering.** `Simulator::set_cpu_cost` keeps a per-node queue that serves due **timers ahead of waiting deliveries, in seeded random order** (`CpuOrder::Random`, which the corpus uses). Plain FIFO turned out to model a uniformly slow clock: every event is late by the same amount, heartbeats keep their relative order, and nothing collapses, so the #1199 shape never appeared.
+- **Overload level.** The overload cells and control (a) run at **1.25x** capacity, not the 1.15x the test plan states.
+- **Load monitor in the corpus.** Because the CPU model serves timers ahead of deliveries, the monitor's own timer-lateness probe reads about 0 under the sim. The corpus therefore feeds a **detached `LoadMonitor`** from the simulator's queue (`Simulator::cpu_backlog`). The real probe task is covered separately (`load_monitor_task_measures_a_paused_node`) and in Tier 3.
+- **Cell 10** adds a 50 ms `OWN_ELECTION_SLACK` to the literal lost-leader bound. The formula stops at admission, but the admitted group still needs its own pre-vote, vote and commit round trips, and the probe resolution is 10 ms. A permit leak (control (d)) misses the bound by seconds.
+- **Control (e)** (`S_max = inf`) runs on **cell 4b**, a node loss as the load ends, sharing 4b's seed. On cell 4 the reconciler's `down` wake goes through `on_local_wake`, which draws an unstretched jitter, so the stretch cap is not what bounds failover there.
+- **Control (c)** (the governor also gating the responder) only bites on the cell-4 shape (mass un-quiesce after a leader-node loss). On a cold start (cell 1) the deadlock does not form, so (c) is asserted on cell 4.
+- **Two governor bugs found by the corpus and Tier 3, fixed with tests.** (1) A `PreCandidate`/`Candidate` whose retry was deferred is `campaign_active` by role, so the driver's post-step check gave it an exempt permit, removing it from the queue and leaking an over-cap slot on every retry. A whole-cluster restart with per-node hosting orders then stayed leaderless. `RaftCore::campaign_deferred()` now exposes the hold, and the driver skips the exempt acquire while it is set. (2) A deferred `PreCandidate` finished its lapsed pre-vote round on a late grant and campaigned over the cap. `handle_pre_vote_resp` now ignores grants while `campaign_hold` is set (`docs/lessons/code-patterns/2026-10-11-a-deferral-must-gate-the-message-path-not-only-the-timer.md`).
+- **Calibration sweep** (`#[ignore]`d, release, about 6.5 min; `K` in {8, 16, 32, 64, unbounded}, `c` in {2, 4, 8}, `S_max` in {2x, 4x, 8x}, `H` in {50, 100, 200} over cells 2, 2b, 4b, 5, 10). The only violations are `K=8` and `K=16` on cell 10's lost-leader bound, so **`K=32` is the smallest swept value that passes**. Nothing contradicts the other defaults.
+
+  | Variant | Cell 10 recovery | Cell 10 hwm | Cell 4b recovery | Cell 2 all led | Violations |
+  |---|---|---|---|---|---|
+  | default (`K=32`) | 0.92 s | 32 | 2.80 s | 1.0 s | none |
+  | `K=8` | 3.62 s | 8 | 1.80 s | 1.0 s | cell 10 bound |
+  | `K=16` | 1.82 s | 16 | 2.60 s | 1.0 s | cell 10 bound |
+  | `K=64` | 0.46 s | 64 | 2.50 s | 1.0 s | none |
+  | unbounded | 0.33 s | 97 | 2.60 s | 1.0 s | none |
+  | `c=2` / `c=8` | 0.92 s | 32 | 1.50 / 3.00 s | 1.0 / 1.5 s | none |
+  | `H=50` / `H=200` | n/a | n/a | n/a | 1.5 / 1.0 s | none |
+
+  `K` trades lost-leader latency against burst width roughly linearly. `c` and `S_max` barely move any cell.
+- **Tier 2 and Tier 3** are as described in their own as-built notes above. `SimCluster` now runs the governor and the load monitor at their defaults, so every `animusd` `SimCluster` test exercises them.
+- **Density acceptance (#1199).** `density_repro_g3000_holds_led_count` (G=3000 RF3 on three `ProdEnv` nodes, mechanisms at defaults, release) passed: all 3000 groups led in 11 s and the led count held for the 120 s window, with `max_term` 3 and governor high-water mark 32. It uses the Tier 3 rig, where groups are hosted through each node's real `host::Reconciler` in the production configuration. It does not use `group_density_cost`'s bare-`RaftKvNode` rig, which never had the mechanisms. `ANIMUS_BP_LIVE_GROUPS=N` changes its group count.
+- **Operator.** `AnimusClusterSpec` gains `campaignMaxInflight`, `lagStretchMaxX`, `hostUnsettledMax` and `hostSettleTimeoutMs`, rendered into `cluster.json`'s `cluster_settings` like `maxRegionRttMs`. `hostSettleTimeoutMs: 0` is refused by the webhook and dropped by the renderer, because animusd refuses it at startup.
 
 ## Open questions for the maintainer (as originally posed)
 
