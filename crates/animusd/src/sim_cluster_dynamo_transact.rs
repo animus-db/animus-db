@@ -127,6 +127,10 @@ use animus_tablet::TOKEN_BYTES;
 
 use super::sim_cluster::SimCluster;
 
+/// Virtual time the issue #1204 scenario runs before it prepares: the age the
+/// "previous incarnation" had when it was power-cut.
+const RESTART_WARMUP: Duration = Duration::from_secs(300);
+
 fn env_seed(default: u64) -> u64 {
     std::env::var("ANIMUS_SEED")
         .ok()
@@ -741,7 +745,10 @@ fn idempotency_table_bootstrap_race_between_two_first_callers_over_seeds() {
 /// absolute timestamp and so never let recovery proceed. Both are fixed;
 /// this scenario is the regression for the second (the first has its own
 /// dedicated coverage in `animus-node`).
-fn run_coordinator_crash_after_prepare_recovers_atomically_to_commit(seed: u64) {
+fn run_coordinator_crash_after_prepare_recovers_atomically_to_commit(
+    seed: u64,
+    restart_survivor_clocks: bool,
+) {
     let mut cluster = SimCluster::new(seed, 3, 3);
     let (status, body) = create_table(&mut cluster, 0, "rcg_a");
     assert_eq!(
@@ -753,6 +760,12 @@ fn run_coordinator_crash_after_prepare_recovers_atomically_to_commit(seed: u64) 
         status, 200,
         "seed={seed}: CreateTable(rcg_b) failed: {body}"
     );
+
+    if restart_survivor_clocks {
+        // Long enough that "the survivors' clocks restarted" leaves the
+        // record more than the whole poll budget ahead of them.
+        cluster.run_for(RESTART_WARMUP);
+    }
 
     let coordinator = 0u64;
     let anchor_key = txn_key("anchor", "-rcg");
@@ -791,11 +804,31 @@ fn run_coordinator_crash_after_prepare_recovers_atomically_to_commit(seed: u64) 
     cluster.run_for(Duration::from_millis(500));
     cluster.crash(coordinator);
 
+    // Issue #1204: a restarted `ProdEnv` node's `Clock::now()` is process
+    // uptime, so it restarts near zero while the record's `created_ts` (an
+    // HLC the engine's persisted high-water mark carries forward) does not.
+    // Model that as a negative clock skew on the nodes that carry on: their
+    // `now()` reads far behind the record's `created_ts.wall_ms`.
+    // The skew puts each survivor's clock one second past zero (never
+    // saturating at zero, which would freeze every deadline on it), i.e. far
+    // behind the record, whose `created_ts` is `RESTART_WARMUP` old.
+    if restart_survivor_clocks {
+        let sim = cluster.simulator();
+        let skew_ns = i64::try_from(sim.now().0).expect("virtual time fits in an i64")
+            - Duration::from_secs(1).as_nanos() as i64;
+        for node in [1u64, 2u64] {
+            sim.set_clock_skew_for(animus_env::nid(node), -skew_ns);
+        }
+    }
+
     let reader = 1u64;
+    let crashed_at = cluster.simulator().now();
     let mut converged = false;
+    let mut last_read = String::new();
     for _ in 0..40 {
         cluster.run_for(Duration::from_secs(1));
         let r = cluster.raw_get(reader, "rcg_b", participant_key.clone(), true);
+        last_read = format!("{r:?}");
         if let Ok(Some(v)) = r {
             assert_eq!(
                 v,
@@ -808,8 +841,21 @@ fn run_coordinator_crash_after_prepare_recovers_atomically_to_commit(seed: u64) 
     }
     assert!(
         converged,
-        "seed={seed}: the participant key never recovered to a committed value within budget"
+        "seed={seed}: the participant key never recovered to a committed value within \
+         budget (last read: {last_read})"
     );
+
+    if restart_survivor_clocks {
+        // The point of the #1204 variant: recovery is driven by the grace the
+        // survivors themselves watched, not by their clocks catching up with
+        // the record's `created_ts` (`RESTART_WARMUP` away).
+        let took = Duration::from_nanos(cluster.simulator().now().0 - crashed_at.0);
+        assert!(
+            took < RESTART_WARMUP / 2,
+            "seed={seed}: recovery took {took:?} of virtual time after the crash; it must \
+             not wait for the survivors' restarted clocks to reach the record's created_ts"
+        );
+    }
 
     // Atomicity: the anchor's own key must ALSO be visible now, never left
     // behind by a partial commit.
@@ -920,12 +966,26 @@ fn run_coordinator_crash_after_prepare_recovers_atomically_to_commit(seed: u64) 
 /// `0xC06F_0007` = `3228499975`.
 #[test]
 fn coordinator_crash_after_prepare_recovers_atomically_to_commit() {
-    run_coordinator_crash_after_prepare_recovers_atomically_to_commit(env_seed(0xC06F_0007));
+    run_coordinator_crash_after_prepare_recovers_atomically_to_commit(env_seed(0xC06F_0007), false);
+}
+
+/// **Issue #1204 regression.** The same scenario as above, but the nodes
+/// that carry on read a clock far *behind* the record's `created_ts` — what
+/// a whole-cluster power cut does to `ProdEnv` (`now()` is process uptime and
+/// restarts near zero) while the HLC is restored from the engine's persisted
+/// high-water mark. Before the fix `txn_recover` compared `created_ts.wall_ms
+/// + RECOVERY_GRACE` against that uptime-based `now`, so the in-doubt intent
+/// stayed undecided (and a consistent read of its key hung) until the new
+/// process's uptime caught up with the old one's: the real-process chaos
+/// `chaos_kill` seed 777 final read timing out for 60 s.
+#[test]
+fn coordinator_crash_recovers_when_the_survivors_clock_restarted_behind_the_record() {
+    run_coordinator_crash_after_prepare_recovers_atomically_to_commit(env_seed(0xC06F_04B4), true);
 }
 
 #[test]
 fn coordinator_crash_after_prepare_recovers_atomically_to_commit_over_seeds() {
     for i in 0..5 {
-        run_coordinator_crash_after_prepare_recovers_atomically_to_commit(0xC06F_7000 + i);
+        run_coordinator_crash_after_prepare_recovers_atomically_to_commit(0xC06F_7000 + i, false);
     }
 }
