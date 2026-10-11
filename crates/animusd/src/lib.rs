@@ -23168,6 +23168,11 @@ mod sim_cluster_dynamo_streams;
 #[cfg(test)]
 mod sim_cluster_dynamo_pitr_seal;
 
+/// Issue #1292: `ClientCtx::propose_and_await`'s commit-wait times out a
+/// stalled control-plane pipeline, never a slow but live one.
+#[cfg(test)]
+mod sim_cluster_schema_commit_wait;
+
 /// ADR 0061 rung G (post-C-06): Streams `SimCluster` dispatch (C-07), PR 5
 /// — deterministic `SimCluster` coverage for the stream segment janitor's
 /// own async loop (`segment_janitor::segment_janitor_loop`), mirroring

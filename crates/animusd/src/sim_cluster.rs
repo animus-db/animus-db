@@ -4260,6 +4260,24 @@ impl SimCluster {
         slot.lock().expect("result slot poisoned").take()
     }
 
+    /// Run `f` against `node`'s own `ClientCtx` as a task on that node's env
+    /// and capture its output ([`spawn_and_capture`](Self::spawn_and_capture)'s
+    /// contract: `None` if it did not resolve within [`OP_BUDGET`]). For a test
+    /// that drives a `ClientCtx` method no wire operation reaches under
+    /// `SimEnv` (issue #1292: `propose_and_await`'s commit-wait).
+    pub(crate) fn run_with_ctx<T, Fut>(
+        &mut self,
+        node: u64,
+        f: impl FnOnce(SimNodeCtx) -> Fut,
+    ) -> Option<T>
+    where
+        T: Send + 'static,
+        Fut: std::future::Future<Output = T> + Send + 'static,
+    {
+        let ctx = self.shared.ctx(node);
+        self.spawn_and_capture(node, f(ctx))
+    }
+
     /// [`SimCluster::spawn_and_capture`]'s early-returning sibling — same
     /// spawn/capture shape, same `Some(T)`-once-resolved/`None`-on-timeout
     /// contract, but polls in [`SPAWN_CAPTURE_FAST_STEP`] increments and
