@@ -3303,6 +3303,19 @@ built on, not just the first one found. Regression:
 "served" contract) and the mirrored fix in `animus-test/tests/
 txn_serializable.rs`'s own `push`/`resolver_tick`.
 
+**`RECOVERY_GRACE` after a restart (issue #1204)**: `txn_recover`'s grace
+gate compares `created_ts.wall_ms` (an HLC, re-seeded from the engine's
+high-water mark at start) with `env.now()` (`ProdEnv`: process uptime, near
+zero after a restart), so a restarted cluster refused to recover an in-doubt
+intent, and a consistent read of its key hung, until uptime caught up with the
+old incarnation's. The gate now also opens once *this node* has watched the
+txn in doubt for a grace on its own clock (`ClusterEdgeState::
+in_doubt_grace_elapsed`; either test suffices). Regression:
+`sim_cluster_dynamo_transact::coordinator_crash_recovers_when_the_survivors_
+clock_restarted_behind_the_record` (a negative `set_clock_skew_for` models the
+uptime reset; asserts recovery latency in virtual time). The chaos
+`chaos_kill` seed-777 repro is the real-process check.
+
 **`ClientRequestToken` idempotency for `TransactWriteItems` (ADR 0018's
 2026-08-24 amendment; the 2026-08-27 amendment closing issue #298's "deep
 shape A" residual)**: `dynamo.rs::run_transact` preflights a token against a

@@ -40,6 +40,11 @@ use crate::{
 /// on every call and declined on-demand recovery of a foreign in-doubt
 /// intent permanently; see `docs/engineering-lessons.md`'s matching entry).
 ///
+/// **Not a proof that `created_ts` is in the past** (issue #1204): an HLC
+/// wall component is `max(uptime, anything witnessed or restored from disk)`,
+/// so after a restart it can sit far ahead of this uptime clock. Callers
+/// therefore also consult `ClusterEdgeState::in_doubt_grace_elapsed`.
+///
 /// A free function, not a `ClientCtx` method — it reads nothing but `env`/
 /// `route`, so it needs no `&self` at all, and staying free-standing lets
 /// `recovery_grace_tests` below unit-test the comparison directly off a bare
@@ -1273,7 +1278,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     )
                     .await;
                 let now_ms = recovery_grace_now_ms(&self.env, &route);
-                if now_ms < hint_ts.wall_ms + animus_cp_data::RECOVERY_GRACE.as_millis() as u64 {
+                let seen_in_doubt = self.edge.in_doubt_grace_elapsed(txn_id, self.env.now());
+                if now_ms < hint_ts.wall_ms + animus_cp_data::RECOVERY_GRACE.as_millis() as u64
+                    && !seen_in_doubt
+                {
                     return Ok(TxnDecisionStatus::Pending);
                 }
                 // Always an abort — see this method's own doc for why an
@@ -1338,7 +1346,15 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             )
             .await;
         let now_ms = recovery_grace_now_ms(&self.env, &route);
-        if now_ms < view.created_ts.wall_ms + animus_cp_data::RECOVERY_GRACE.as_millis() as u64 {
+        // Issue #1204: the record's `created_ts` is an HLC, which a restart
+        // leaves ahead of this process's uptime-based clock, so this
+        // comparison alone can stay shut for as long as the previous
+        // incarnation was up. Either "created long enough ago" or "I have
+        // watched it in doubt for a grace myself" opens the gate.
+        let seen_in_doubt = self.edge.in_doubt_grace_elapsed(txn_id, self.env.now());
+        if now_ms < view.created_ts.wall_ms + animus_cp_data::RECOVERY_GRACE.as_millis() as u64
+            && !seen_in_doubt
+        {
             return Ok(TxnDecisionStatus::Pending);
         }
 
