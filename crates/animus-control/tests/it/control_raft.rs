@@ -75,6 +75,25 @@ fn elects_a_single_stable_leader() {
     }
 }
 
+/// Issue #1190: two reads of the published metadata with no apply between
+/// them share one allocation (`metadata_arc` is an `Arc` clone, not a map
+/// copy), and `metadata()` still returns an equal owned value.
+#[test]
+fn metadata_arc_is_shared_until_the_next_apply() {
+    let seed = 0x1190;
+    let (mut sim, nodes) = cluster(seed);
+    sim.run_for(Duration::from_secs(2));
+    let leader = unique_leader(&nodes, &[0, 1, 2], seed);
+    let n = &nodes[leader];
+    let a = n.metadata_arc();
+    let b = n.metadata_arc();
+    assert!(
+        std::sync::Arc::ptr_eq(&a, &b),
+        "idle reads must share (seed={seed})"
+    );
+    assert_eq!(*a, n.metadata(), "seed={seed}");
+}
+
 #[test]
 fn replicates_metadata_in_total_order() {
     let seed = 0xABCD_1234;

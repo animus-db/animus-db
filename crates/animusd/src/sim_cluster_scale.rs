@@ -443,7 +443,7 @@ fn sim_cluster_scale_metadata_curve() {
             // --- A3: host::plan cost on the (post-change) map, node 0's view.
             let me = nid(0);
             let view = MetadataView {
-                tablets: meta.tablets.clone(),
+                tablets: meta.tablets.clone().into(),
                 down: BTreeSet::new(),
                 regions: BTreeMap::new(),
                 preferred_leader: BTreeMap::new(),
