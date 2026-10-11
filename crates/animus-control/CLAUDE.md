@@ -3303,3 +3303,23 @@ by `placement_rev`; only the map-size check catches some of them); a new input t
 `cargo test -p animus-control --test it rebalance_cache::` (property test vs fresh
 `rebalance`; `ANIMUS_REBALANCE_CACHE_SEEDS=K`, `ANIMUS_SEED` replay). Metrics
 `control_rebalance_evals` / `control_rebalance_plan_rebuilds`.
+
+**Campaign admission and lag stretch seam (ADR 0078 step 2).** `RaftCore` has a
+driver-facing seam for node-level election backpressure; the core knows no
+governor. `campaign_due(now)` is pure and mirrors `start_pre_vote`'s early
+returns (cluster check pending or refused, non-voter, state machine behind,
+storage full, single voter), so only a campaign that would broadcast asks for a
+permit. `tick_gated(now, entropy, admit)` is `tick` with a permit; `tick` is
+exactly `tick_gated(.., true)`. A refused due campaign changes no role or term,
+does NOT reset the election timer (so the node still grants pre-votes and votes
+to admitted campaigners; re-arming it would make every deferred voter refuse
+everyone and no admitted campaign could reach a majority) and sets
+`campaign_hold = now + election_base`, which `next_deadline` returns instead of
+the lapsed deadline so the driver does not spin. `campaign_active()` lets a
+driver release a permit on the way back to Follower or on to Leader.
+`set_lag_stretch(d)` widens only the follower's draw in `reset_election_timer`
+and `next_cluster_check_resend` (`election_base + stretch`); it is not folded
+into `election_base`, which the transfer budget, `election_timeout()`, the
+health grace, the heartbeat interval and the vote lease keep reading. It is a
+no-op when unchanged and draws no entropy. Tests:
+`cargo test -p animus-control --test it campaign_admission::`.

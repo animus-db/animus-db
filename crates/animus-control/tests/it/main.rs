@@ -5,6 +5,7 @@ mod append_resp_next_index_monotonic;
 mod apply_engine;
 mod apply_not_starved_by_wal_lock;
 mod backup_catalog;
+mod campaign_admission;
 mod control_corpus;
 mod control_membership;
 mod control_raft;
