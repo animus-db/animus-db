@@ -1750,7 +1750,7 @@ outstanding on the wire surface at present.
   - **Thresholds** were ratified in the ADR 0044 and ADR 0039 amendments
     before the runs; the outcomes are in their 2026-10-04 outcome
     amendments.
-  - **Cliffs filed:** #1180 (fixed by #1207), #1190, #1191, #1192, #1194, #1199.
+  - **Cliffs filed:** #1180 (fixed by #1207), #1190, #1191, #1192, #1194, #1199 (election-storm cliff: design in ADR 0078, implementation pending).
   - **Re-run 2026-10-09 after #1207 (ADR 0044's amendment of that date):**
     quiesced steady CPU is zero net at RF1 and at the 1 ms/s measurement
     floor at RF3, so C-03 stays deferred.
