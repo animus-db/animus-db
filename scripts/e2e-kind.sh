@@ -279,9 +279,28 @@
 #                       on the `e2e-kind-webhook` job as this leg finding
 #                       its first real bug.
 #
+#   E2E_KEEP_CLUSTER - "1" keeps the kind cluster (and the AnimusCluster in it)
+#                       alive on exit, for the game-day drill
+#                       (docs/runbook/game-day.md) to reuse. On exit it still
+#                       stops the background processes it started (port
+#                       forwards and the out-of-cluster operator, so nothing
+#                       leaks and a rerun is not blocked on ports), but does
+#                       NOT delete the kind cluster, and the final "delete
+#                       AnimusCluster and verify GC" phase is SKIPPED, so the
+#                       3-node cluster is left running. It applies on pass
+#                       and on failure (a failed cluster is kept for
+#                       debugging). The operator is not kept: restart it with
+#                       `KUBECONFIG=<workdir>/kubeconfig cargo run -p
+#                       animus-operator -- run` (or apply
+#                       deploy/operator/{rbac,deployment}.yaml) before a drill
+#                       step that needs reconciliation. The exit message
+#                       prints the kubeconfig path, context and the delete
+#                       command. A rerun deletes a stale same-named cluster
+#                       first, as always.
+#
 # Exit non-zero on any failure; a trap dumps cluster/operator diagnostics and
-# always tears down the kind cluster and background processes it started,
-# whether the run passed or failed.
+# tears down the kind cluster (unless E2E_KEEP_CLUSTER=1) and the background
+# processes it started, whether the run passed or failed.
 
 set -euo pipefail
 
@@ -345,6 +364,7 @@ TRUSTED_IMAGE_TAG="animusd-e2e:s3-tls-trusted"
 S3_TLS_NEGATIVE_POD_NAME="s3-tls-untrusted-check"
 E2E_ENCRYPTION="${E2E_ENCRYPTION:-0}"
 E2E_UPGRADE="${E2E_UPGRADE:-0}"
+E2E_KEEP_CLUSTER="${E2E_KEEP_CLUSTER:-0}"
 ANIMUSD_IMAGE_PREV="${ANIMUSD_IMAGE_PREV:-animusd:e2e-prev}"
 E2E_UPGRADE_ROLL_TIMEOUT="${E2E_UPGRADE_ROLL_TIMEOUT:-1500}"
 UPGRADE_CLIENT_IMAGE="${UPGRADE_CLIENT_IMAGE:-curlimages/curl:8.10.1}"
@@ -749,7 +769,11 @@ cleanup() {
         # `animus-operator run`.
         pkill -9 -f "target/[^ ]*/animus-operator run" >/dev/null 2>&1 || true
     fi
-    if [ "$KIND_CLUSTER_UP" = "true" ]; then
+    if [ "$KIND_CLUSTER_UP" = "true" ] && [ "$E2E_KEEP_CLUSTER" = "1" ]; then
+        log "E2E_KEEP_CLUSTER=1: keeping kind cluster ${CLUSTER_NAME} (the operator and port-forwards were stopped)"
+        log "  use it:    export KUBECONFIG=${KIND_KUBECONFIG}   (context: kind-${CLUSTER_NAME}, namespace: ${NAMESPACE})"
+        log "  delete it: kind delete cluster --name ${CLUSTER_NAME}"
+    elif [ "$KIND_CLUSTER_UP" = "true" ]; then
         log "deleting kind cluster ${CLUSTER_NAME}"
         KUBECONFIG="$KIND_KUBECONFIG" kind delete cluster --name "$CLUSTER_NAME" >/dev/null 2>&1 || true
     fi
@@ -2479,9 +2503,14 @@ CLIENT
     kubectl delete pod "$UPGRADE_CLIENT_POD" -n "$NAMESPACE" --ignore-not-found >/dev/null
 fi
 
-phase "delete AnimusCluster and verify GC"
-kubectl delete animuscluster "$AC_NAME" -n "$NAMESPACE"
-wait_for "statefulset garbage-collected" 120 3 -- sts_gone
+if [ "$E2E_KEEP_CLUSTER" = "1" ]; then
+    phase "delete AnimusCluster and verify GC (skipped: E2E_KEEP_CLUSTER=1)"
+    log "leaving AnimusCluster ${AC_NAME} running in namespace ${NAMESPACE}"
+else
+    phase "delete AnimusCluster and verify GC"
+    kubectl delete animuscluster "$AC_NAME" -n "$NAMESPACE"
+    wait_for "statefulset garbage-collected" 120 3 -- sts_gone
+fi
 
 phase "done"
 log "all phases passed"

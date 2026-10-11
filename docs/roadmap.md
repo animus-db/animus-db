@@ -168,6 +168,14 @@ outstanding on the wire surface at present.
   **landed 2026-09-07**. **Size:** XL (interacts with the `Disk` seam's
   fsync/durability contract). **S-03 is complete.**
 
+- **Open: encryption key rotation (issue #1276, not built).** Unsupported;
+  the replace-the-replica path in ADR 0069's decision section no longer applies
+  since the cluster store shares one cluster-wide key. Plan in ADR 0069's
+  2026-10-10 amendment: key id in a v2 envelope header, keyring (active +
+  retired keys), gated cluster-wide key flip, background re-seal, ADR 0073
+  fixture and `legacy` decoder. Interim: key change = new cluster
+  (`docs/runbook/encryption-key-rotation.md`).
+
 ### S-07 Operator hardening (ADR 0060 deferred list) — landed 2026-09-07, complete
 
 - **e. Admission webhook** validating the CRD — landed 2026-09-07: a pure,

@@ -2506,7 +2506,7 @@ pub(crate) fn pitr_description<E: Env, R: RelayClient>(
         };
     };
     let now_ms = ctx.env.wall_now().0;
-    let retention_ms = crate::pitr_janitor::DEFAULT_PITR_RETENTION.as_millis() as u64;
+    let retention_ms = ctx.admin.pitr_retention.as_millis() as u64;
     let floor_ms = now_ms.saturating_sub(retention_ms);
     let earliest_ms = floor_ms.max(spec.enabled_wall_ms);
 
@@ -3086,7 +3086,7 @@ fn validate_export_time(
         });
     };
     let now_ms = ctx.env.wall_now().0;
-    let retention_ms = crate::pitr_janitor::DEFAULT_PITR_RETENTION.as_millis() as u64;
+    let retention_ms = ctx.admin.pitr_retention.as_millis() as u64;
     let floor_ms = now_ms.saturating_sub(retention_ms);
     let earliest_ms = window.earliest_ms.max(floor_ms);
     let latest_ms = window.latest_ms.max(earliest_ms);
@@ -4282,7 +4282,7 @@ async fn restore_table_to_point_in_time(
     };
 
     let now_ms = ctx.env.wall_now().0;
-    let retention_ms = crate::pitr_janitor::DEFAULT_PITR_RETENTION.as_millis() as u64;
+    let retention_ms = ctx.admin.pitr_retention.as_millis() as u64;
     let floor_ms = now_ms.saturating_sub(retention_ms);
     let earliest_ms = window.earliest_ms.max(floor_ms);
     let latest_ms = window.latest_ms.max(earliest_ms);
