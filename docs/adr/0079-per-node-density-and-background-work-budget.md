@@ -5,7 +5,7 @@
 - **Origin:** issue #1295 (follow-up to #1199, closed by ADR 0078); the ADR 0078 maintainer decision 5 (2026-10-11) that a per-node cap on awake groups gets its own ADR once the stable ceiling is measured. Measurements: `docs/density-measurements.md` (branch `claude/per-node-density`, commit `795465c`).
 - **Amends:** none. **Depends on:** ADR 0003 (determinism, the `Env` seam), ADR 0005 (placement), ADR 0029 (rebalancing), ADR 0031 (host reconciler), ADR 0044/0048 (quiescence), ADR 0058 (learners, snapshots), ADR 0073 (upgrade compatibility), ADR 0075 (region-pinned placement, MREC receiver), ADR 0078 (campaign governor, `LoadMonitor`, staggered hosting).
 - **Not in scope:** client-path and transport admission (issue #1296: per-group propose bounds, the node-wide request gate, unbounded transport queues). This ADR only says where its permit pools and `LoadMonitor` input could be shared with that work.
-- **Open dependency:** issue #1297 (an awake-overload stall: at G=3000 awake, 2651 of 3000 groups led after 600 s with `max_term` flat at 3). Its cause is under investigation. This ADR does not assume the outcome; see "Open dependency".
+- **Motivating evidence:** issue #1297 (at G=3000 awake, 2651 of 3000 groups led after 600 s with `max_term` flat at 3), diagnosed as accepted overload; see "Resolved dependency".
 
 ## Context
 
@@ -138,15 +138,14 @@ The defaults are deliberately low and are expected to change after the ProdEnv s
 
 **Knobs:** `--bg-snapshot-streams`, `--bg-catchup-learners`, `--bg-splits`, `--bg-compactions`, `--repair-proposals-per-tick`, `--repair-inflight-max` and their `cluster_settings` mirrors; `0` disables the matching pool (unbounded, today's behaviour). The operator derives `bg-compactions` from the pod CPU request and passes the others unchanged.
 
-### Open dependency: the awake-overload stall (#1297)
+### Resolved dependency: the awake-overload stall (#1297)
 
-At G=3000 awake (about 2x the measured ceiling) the rig left 349 groups leaderless for 10 minutes with `max_term` flat at 3, which ADR 0078 did not predict ("leadership is retained and latency rises"). Whether that is accepted overload behaviour or a liveness defect in the governor or the pre-vote path (starvation in the FIFO queue, pre-votes that never reach a majority under the stretched timeout, a permit leak) is **not known**.
+At G=3000 awake (about 2x the measured ceiling) the rig left 349 groups leaderless for 10 minutes with `max_term` flat at 3, which looked like a liveness defect. The investigation (ADR 0078's 2026-10-12 amendment) found **accepted overload, not a defect**:
+- The governor never starved or leaked: inflight held at `K_eff` and admissions kept rising.
+- Responders granted the pre-votes (30,043 grants, 9 refusals).
+- 29,099 of those grants arrived after the round's election window had lapsed and were dropped by design (`handle_pre_vote_resp` while `campaign_hold` is set). A dropped grant was 1.7 to 3.4 s old on average, against a round window of 0.77 to 0.88 s: `S_max` caps the stretch at 600 ms on purpose, to bound failover.
 
-This ADR does not assume either answer:
-
-- If #1297 is accepted overload, layer 2 is the fix: `A` keeps the node out of that region.
-- If #1297 is a defect, it is fixed in its own PR with its own regression test (per the repo's convention) and layer 2 still stands as the guard against reaching it, but its `A` default must be re-measured on the fixed code, because the ceiling of 1250-1500 groups was measured on the same code.
-- Either way, this ADR cannot go from Proposed to Accepted with the `A` default unmeasured, and the calibration (plan step 1) must run on the code after #1297 is resolved.
+Once a saturated node's round trip exceeds the capped window, a cold start cannot elect, and only staying below capacity prevents it. Layer 2 is that guard: `A` keeps the node out of this region. The 1250-1500 ceiling measured on this code stands, and calibration needs no re-measurement for #1297.
 
 ### Knobs (summary)
 
@@ -253,7 +252,7 @@ New `C17 metric=` lines: `awake_hwm`, `wake_deferred_total`, `bg_snapshot_hwm`, 
 
 One implementation PR on one branch (per the repo's operating mode), ordered commits, each green on all gates. This ADR is its own docs-only PR first.
 
-1. **Calibration harness first** (no product change except test knobs): worker-thread sweep, `LsmEngine` variant, loaded variant, data-bearing node-loss cell, split-storm run, all after #1297 is resolved. Record results in `docs/density-measurements.md` and set the defaults. Negative-control (a) repros on cells 3 and 9.
+1. **Calibration harness first** (no product change except test knobs): worker-thread sweep, `LsmEngine` variant, loaded variant, data-bearing node-loss cell, split-storm run. Record results in `docs/density-measurements.md` and set the defaults. Negative-control (a) repros on cells 3 and 9.
 2. **Pure functions**: `animus-placement` `Capacity` and weighted `select_replicas_balanced`/`replan`/`replan_repair`/`rebalance_*`; the equal-weights-equals-today guard; property tests.
 3. **Gated metadata shape**: `Gate::NodeCapacity`, `RegisterNode` field, `SetNodeCapacity`, `required_gate` row, golden fixture, mixed-version cell, admin/CLI display, operator derivation. Resolve the snapshot-refusal wire question here.
 4. **Awake-group admission**: wake queue, `A_eff`, wiring beside the reconciler's `wake()` and `on_local_wake`; cells 1-5, controls (b), (c).
@@ -271,6 +270,6 @@ One implementation PR on one branch (per the repo's operating mode), ordered com
 5. **Should hosting also respect `A`** (the first wave after a restart can exceed it)? Recommended: no; ADR 0078's stagger already bounds the ramp, and refusing to host breaks replica-set invariants.
 6. **Is an L0 write stall and a compaction IO rate limit in scope for a later ADR?** Recommended: yes, as a storage-engine ADR; this one only adds the permit pool and the L0 bypass.
 7. **Does the test plan need a disk-cost model in `animus-sim`** (analogous to `set_cpu_cost`) to test compaction pacing under SimEnv? Recommended: no for this ADR (cell 8 asserts the pool bound and no data loss, not latency); revisit if the ProdEnv compaction run shows IO is the first saturated resource.
-8. **How should #1297 gate this ADR?** Recommended: resolve #1297 (fix or documented as accepted overload) before calibration step 1, since `A` is measured on the code it touches; this ADR can still be Accepted as a design with the numbers marked provisional.
+8. **#1297 (resolved):** diagnosed as accepted overload (see "Resolved dependency"). No gate on this ADR remains; it is kept here only so the numbering of the other questions does not change.
 9. **Should the permit pools and `LoadMonitor` input be shared with #1296's client-path admission** (one lag-reduction rule for the request gate as well)? Recommended: yes, a single `lag -> factor` helper used by both, with the client-gate wiring left to #1296's ADR.
 10. **Cluster version.** Recommended: a new `Gate::NodeCapacity` at cluster version 5, finalised with the rest of the release, rather than folding capacity into an existing gate.
