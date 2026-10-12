@@ -50,7 +50,7 @@ schemars = "1.2.2"
 hyper = { version = "1.11.0", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1.20", features = ["client", "client-legacy", "http1", "tokio"] }
 http-body-util = "0.1.5"
-serde_yaml = "0.9.34"
+serde_norway = "0.9.42"
 bytes = "1.12.1"
 http = "1.5.0"
 # The admin client's server-only TLS connector (ADR 0064 commit 3): trusts
