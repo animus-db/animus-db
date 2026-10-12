@@ -142,7 +142,7 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
 - `src/main.rs` — two subcommands: `run` (the controller, `kube::Client::
   try_default()` — in-cluster service-account config when running as a pod,
   or the local kubeconfig otherwise) and `crd` (prints the
-  `CustomResourceDefinition` as real YAML via `serde_yaml` to stdout — see
+  `CustomResourceDefinition` as real YAML via `serde_norway` (the maintained `serde_yaml` fork; `serde_yaml`'s `unsafe-libyaml` is RUSTSEC-2024-0449) to stdout — see
   `deploy/operator/README.md` for regenerating the committed
   `deploy/operator/crd.yaml`).
 
