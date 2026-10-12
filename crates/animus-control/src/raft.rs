@@ -374,6 +374,44 @@ pub const DEPARTING_QUIET_GIVE_UP: Duration = Duration::from_secs(30);
 /// operator can see notices being sent, acknowledged, ignored as stale, and
 /// departing peers being dropped — the questions the first live check of
 /// the notice could not answer.
+/// Lifetime counters of pre-vote traffic, for diagnosing election liveness
+/// under load (issue #1297). Plain facts the core keeps; nothing reads them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CampaignStats {
+    /// Pre-vote rounds this core started (broadcast to peers).
+    pub rounds_started: u64,
+    /// A round started while the previous round was still `PreCandidate`
+    /// (it timed out without a majority).
+    pub rounds_restarted: u64,
+    /// Grants tallied toward a majority.
+    pub grants_rx: u64,
+    /// Grants dropped because a deferred retry is waiting (`campaign_hold`).
+    pub grants_rx_dropped_hold: u64,
+    /// Grants dropped for a wrong round or a non-voter.
+    pub grants_rx_dropped_round: u64,
+    /// Refusals received.
+    pub refusals_rx: u64,
+    /// Pre-votes this core granted as a responder.
+    pub pv_granted: u64,
+    /// Refused: a live leader (or this node is leader).
+    pub pv_refused_leader: u64,
+    /// Refused: a lease on a real vote it granted.
+    pub pv_refused_lease: u64,
+    /// Refused: the candidate's term is behind, or its log is.
+    pub pv_refused_term_or_log: u64,
+    /// Real elections started (term bumps).
+    pub elections_started: u64,
+    /// Sum, over dropped-by-hold grants, of nanoseconds since that round began.
+    pub dropped_age_ns_sum: u64,
+    /// Largest such age.
+    pub dropped_age_ns_max: u64,
+    /// Sum of the same age over counted grants.
+    pub counted_age_ns_sum: u64,
+    /// Sum of the round windows (deadline - start) of dropped-by-hold grants'
+    /// rounds, to compare with the age.
+    pub dropped_window_ns_sum: u64,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RemovalStats {
     /// `RaftMsg::Removed` notices this node emitted as a leader (to a
@@ -1394,6 +1432,9 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // `reset_election_timer` (a heard leader, a fresh round) and on becoming
     // leader.
     campaign_hold: Option<Nanos>,
+    campaign_stats: CampaignStats,
+    round_started_at: Nanos,
+    round_window_ns: u64,
 
     // Applied state machine and the order commands were applied (for tests /
     // divergence checks). `applied` holds only the window since the last
@@ -1736,6 +1777,9 @@ where
             heartbeat_deadline: Nanos(0),
             lag_stretch: Duration::ZERO,
             campaign_hold: None,
+            campaign_stats: CampaignStats::default(),
+            round_started_at: Nanos(0),
+            round_window_ns: 0,
             metadata: S::default(),
             applied: Vec::new(),
             pending_apply: Vec::new(),
@@ -2492,6 +2536,12 @@ where
     #[must_use]
     pub fn removal_stats(&self) -> RemovalStats {
         self.removal_stats
+    }
+
+    /// Pre-vote traffic counters (issue #1297 diagnosis).
+    #[must_use]
+    pub fn campaign_stats(&self) -> CampaignStats {
+        self.campaign_stats
     }
 
     /// Every distinct `(config, learners)` pair this core has adopted, in
@@ -4348,6 +4398,17 @@ where
         // learner can therefore still be granted here without any safety
         // consequence — it simply won't count toward anyone's majority.
         let granted = !has_live_leader && term >= self.current_term && log_ok;
+        if granted {
+            self.campaign_stats.pv_granted += 1;
+        } else if self.role == Role::Leader
+            || (self.leader_id.is_some() && now.0 < self.election_deadline.0)
+        {
+            self.campaign_stats.pv_refused_leader += 1;
+        } else if voted_lease {
+            self.campaign_stats.pv_refused_lease += 1;
+        } else {
+            self.campaign_stats.pv_refused_term_or_log += 1;
+        }
         vec![(
             candidate,
             RaftMsg::PreVoteResp {
@@ -4383,7 +4444,21 @@ where
         // driver then counts it as an exempt campaign over the cap). The retry
         // runs a fresh pre-vote once admitted. Never set without a governor.
         if granted && self.campaign_hold.is_some() {
+            self.campaign_stats.grants_rx_dropped_hold += 1;
+            let age = now.0.saturating_sub(self.round_started_at.0);
+            self.campaign_stats.dropped_age_ns_sum += age;
+            self.campaign_stats.dropped_age_ns_max =
+                self.campaign_stats.dropped_age_ns_max.max(age);
+            self.campaign_stats.dropped_window_ns_sum += self.round_window_ns;
             return Vec::new();
+        }
+        if !granted {
+            self.campaign_stats.refusals_rx += 1;
+        } else if term == self.current_term + 1 && self.config.contains(&from) {
+            self.campaign_stats.grants_rx += 1;
+            self.campaign_stats.counted_age_ns_sum += now.0.saturating_sub(self.round_started_at.0);
+        } else {
+            self.campaign_stats.grants_rx_dropped_round += 1;
         }
         if granted {
             // ADR 0058 Train 1: only ever count a grant from a current voter
@@ -5534,6 +5609,11 @@ where
             self.reset_election_timer(now, entropy);
             return Vec::new();
         }
+        if self.role == Role::PreCandidate {
+            self.campaign_stats.rounds_restarted += 1;
+        }
+        self.campaign_stats.rounds_started += 1;
+        self.round_started_at = now;
         self.role = Role::PreCandidate;
         // The election timer expired ⇒ we no longer believe in a live leader; drop
         // the hint so we will grant *others'* pre-votes this round too. Term and
@@ -5542,6 +5622,7 @@ where
         self.pre_votes.clear();
         self.pre_votes.insert(self.id.clone());
         self.reset_election_timer(now, entropy);
+        self.round_window_ns = self.election_deadline.0.saturating_sub(now.0);
 
         // Single-node (or otherwise already a majority): skip straight to the real
         // election, which becomes leader immediately.
@@ -5585,6 +5666,7 @@ where
             self.reset_election_timer(now, entropy);
             return Vec::new();
         }
+        self.campaign_stats.elections_started += 1;
         self.role = Role::Candidate;
         self.current_term += 1;
         self.voted_for = Some(self.id.clone());

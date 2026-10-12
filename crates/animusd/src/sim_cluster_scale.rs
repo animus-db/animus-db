@@ -1809,3 +1809,89 @@ fn sim_cluster_scale_covers_every_cell_shape() {
     let names: BTreeSet<&str> = cells.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names.len(), cells.len(), "duplicate cell names");
 }
+
+/// #1295 measurement (manual, `--ignored --nocapture`): the re-replication
+/// burst after one node of a 6-node, RF-3 cluster dies. Hosts `G`
+/// single-tablet tables (`ANIMUS_SCALE_REPAIR_TABLES`, default 60), settles,
+/// crashes node 5 and runs until every tablet is back to three live
+/// replicas, emitting the repair proposals (`CpReconfigureAccepted`), the
+/// snapshot ships/installs, the convergence time and the peak per-second
+/// proposal rate. Structural asserts only; virtual time, so it says nothing
+/// about CPU or real disk/network cost (see `docs/density-measurements.md`).
+#[test]
+#[ignore = "manual #1295 measurement; run with --ignored --nocapture"]
+fn sim_cluster_scale_node_loss_repair_burst() {
+    use animus_env::Metric;
+    let g: usize = std::env::var("ANIMUS_SCALE_REPAIR_TABLES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
+    let (nodes, rf, dead) = (6usize, 3usize, 5u64);
+    let seed = corpus::name_seed("scale_node_loss_repair_burst");
+    eprintln!("seed={seed} tables={g}");
+    let mut cluster = SimCluster::new_with_cp_quiescence(seed, nodes, rf, Some(QUIESCE_AFTER));
+    let tables: Vec<String> = (0..g).map(|i| format!("t{i}")).collect();
+    for t in &tables {
+        cluster.create_table_with_replication(t, rf);
+    }
+    cluster.run_for(Duration::from_secs(60));
+    let sum = |c: &SimCluster, m: Metric| -> u64 {
+        (0..nodes as u64)
+            .filter(|n| *n != dead)
+            .map(|n| c.env_metric(n, m))
+            .sum()
+    };
+    let ms = [
+        ("reconfigure_accepted", Metric::CpReconfigureAccepted),
+        ("reconfigure_rejected", Metric::CpReconfigureRejected),
+        ("snapshot_ships", Metric::CpSnapshotShips),
+        ("snapshot_installs", Metric::CpSnapshotInstalls),
+        ("snapshot_triggers", Metric::CpSnapshotTriggers),
+    ];
+    let before: Vec<u64> = ms.iter().map(|(_, m)| sum(&cluster, *m)).collect();
+    let dead_id = nid(dead);
+    let on_dead = cluster
+        .metadata(0)
+        .tablets
+        .values()
+        .filter(|t| t.replicas.contains(&dead_id))
+        .count();
+    let tablets = cluster.metadata(0).tablets.len();
+    cluster.crash(dead);
+    let (mut secs, mut peak, mut last) = (0u64, 0u64, before[0]);
+    loop {
+        cluster.run_for(Duration::from_secs(1));
+        secs += 1;
+        let now = sum(&cluster, ms[0].1);
+        peak = peak.max(now.saturating_sub(last));
+        last = now;
+        let meta = cluster.metadata(0);
+        let done = meta
+            .tablets
+            .values()
+            .all(|t| t.replicas.len() == rf && !t.replicas.contains(&dead_id));
+        if done {
+            break;
+        }
+        assert!(
+            secs < 1800,
+            "seed={seed}: no re-convergence in 1800 virtual s"
+        );
+    }
+    emit("repair_tablets_total", tablets, nodes, tablets);
+    emit("repair_tablets_on_dead_node", tablets, nodes, on_dead);
+    emit("repair_converge_virtual_s", tablets, nodes, secs);
+    emit("repair_peak_proposals_per_s", tablets, nodes, peak);
+    for (i, (name, m)) in ms.iter().enumerate() {
+        emit(
+            &format!("repair_{name}"),
+            tablets,
+            nodes,
+            sum(&cluster, *m).saturating_sub(before[i]),
+        );
+    }
+    assert!(
+        on_dead > 0,
+        "seed={seed}: vacuous, dead node held no replica"
+    );
+}
