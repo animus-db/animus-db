@@ -32,7 +32,8 @@
 //!   --test election_backpressure_liveness -- --ignored --nocapture
 //! ```
 //!
-//! `ANIMUS_BP_LIVE_GROUPS=N` overrides the ignored test's group count. Output
+//! `ANIMUS_BP_LIVE_GROUPS=N` overrides the ignored test's group count;
+//! `ANIMUS_BP_LIVE_QUIESCE=0` disables quiescence (all groups stay awake). Output
 //! lines are `BP-LIVE ...` (machine-readable).
 
 // ADR 0003 / ADR 0061 Decision 4: a real-thread ProdEnv liveness test; the
@@ -178,7 +179,11 @@ impl Cluster {
                     },
                 );
                 recon.enable_heartbeat_batching();
-                recon.enable_quiescence(QUIESCE_AFTER);
+                // `ANIMUS_BP_LIVE_QUIESCE=0` keeps every group awake (density
+                // measurement, #1295); the default is production's.
+                if std::env::var("ANIMUS_BP_LIVE_QUIESCE").as_deref() != Ok("0") {
+                    recon.enable_quiescence(QUIESCE_AFTER);
+                }
                 recon.set_election_backpressure(ElectionBackpressure {
                     governor: Some(governor.clone()),
                     monitor: Some(monitor),
