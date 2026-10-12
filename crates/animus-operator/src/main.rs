@@ -182,7 +182,7 @@ fn print_crd() {
     let crd = animus_operator::AnimusCluster::crd();
     print!(
         "{}",
-        serde_yaml::to_string(&crd).expect("CustomResourceDefinition serializes to YAML")
+        serde_norway::to_string(&crd).expect("CustomResourceDefinition serializes to YAML")
     );
 }
 
@@ -262,7 +262,7 @@ fn print_webhook_cert(args: &[String]) -> Result<(), String> {
     );
     print!(
         "{}",
-        serde_yaml::to_string(&obj).expect("DynamicObject serializes to YAML")
+        serde_norway::to_string(&obj).expect("DynamicObject serializes to YAML")
     );
     Ok(())
 }

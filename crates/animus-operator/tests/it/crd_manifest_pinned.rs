@@ -18,7 +18,7 @@ const COMMITTED: &str = include_str!("../../../../deploy/operator/crd.yaml");
 
 #[test]
 fn committed_crd_manifest_matches_the_generated_one() {
-    let generated = serde_yaml::to_string(&animus_operator::AnimusCluster::crd())
+    let generated = serde_norway::to_string(&animus_operator::AnimusCluster::crd())
         .expect("CustomResourceDefinition serializes to YAML");
     assert!(
         COMMITTED == generated,
