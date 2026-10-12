@@ -1,6 +1,6 @@
 # ADR 0079 — Per-node density and the background-work budget: placement capacity, awake-group admission, background permit pools
 
-- **Status:** Proposed (2026-10-12). Docs-only; no code changes with this ADR ("ADR first, code after").
+- **Status:** Accepted (2026-10-12). The maintainer settled the ten open questions on 2026-10-12, taking the recommendation on each (see "Maintainer decisions"). Not yet implemented; the defaults stay provisional until calibration (implementation plan step 1).
 - **Date:** 2026-10-12
 - **Origin:** issue #1295 (follow-up to #1199, closed by ADR 0078); the ADR 0078 maintainer decision 5 (2026-10-11) that a per-node cap on awake groups gets its own ADR once the stable ceiling is measured. Measurements: `docs/density-measurements.md` (branch `claude/per-node-density`, commit `795465c`).
 - **Amends:** none. **Depends on:** ADR 0003 (determinism, the `Env` seam), ADR 0005 (placement), ADR 0029 (rebalancing), ADR 0031 (host reconciler), ADR 0044/0048 (quiescence), ADR 0058 (learners, snapshots), ADR 0073 (upgrade compatibility), ADR 0075 (region-pinned placement, MREC receiver), ADR 0078 (campaign governor, `LoadMonitor`, staggered hosting).
@@ -261,7 +261,22 @@ One implementation PR on one branch (per the repo's operating mode), ordered com
 7. **Capacity cells** 10-12, controls (g), (h); Tier 2 metrics and assertions.
 8. **Docs**: this ADR to Accepted/implemented with an as-built note; ADR 0044 amendment (the awake-cap line); `crates/animus-placement/CLAUDE.md`, `animus-control`, `animus-cp-data`, `animus-operator` guides; `docs/roadmap.md` (C-17, #1295); `website/` if it states placement or density claims; `docs/lessons/` entries.
 
-## Open questions for the maintainer
+## Maintainer decisions (2026-10-12)
+
+The maintainer accepted the recommendation on every open question below:
+
+1. **Capacity shape.** Each node declares a `weight` (default 100) plus an optional `max_replicas` (default unset). Weight only shapes placement and never refuses. `max_replicas` is the explicit hard ceiling.
+2. **No derived `max_replicas` yet.** The operator derives `weight` from the CPU request only. `max_replicas` is set by hand through `spec.nodeCapacity` until an `LsmEngine` run measures the per-tablet memory and file-descriptor cost.
+3. **The cap is strict under repair.** Repair never over-places past `max_replicas`. Table creation is refused, repair is best-effort within the caps, and `placement_capacity_blocked_tablets` alerts the operator, who raises the cap. There is no `capacity_overflow` setting.
+4. **Fixed repair pacing.** `R = 8` new repairs per tick and `R_inflight = 16`, both operator-tunable. Pacing does not depend on lag, because a node loss produces its burst before the lag rises.
+5. **Hosting does not respect `A`.** ADR 0078's stagger bounds the post-restart ramp. Hosting is never refused.
+6. **The L0 write stall and the compaction IO rate limit go to a separate storage-engine ADR** (#1300). This ADR keeps only the compaction permit pool and its L0 bypass.
+7. **No `SimEnv` disk-cost model for now.** Revisit only if the `ProdEnv` `LsmEngine` run shows IO saturates first.
+8. **#1297** was resolved as accepted overload. It does not gate this ADR.
+9. **One shared `lag -> factor` helper** for `K_eff`, `A_eff` and the permit pools. #1296's client-path admission reuses it; that wiring belongs to #1296's own ADR.
+10. **A dedicated `Gate::NodeCapacity` at cluster version 5**, finalised with the release.
+
+## Open questions for the maintainer (as originally posed)
 
 1. **Is a declared per-node `weight` plus an optional `max_replicas` the right capacity shape?** Recommended: yes, both. Weight only shapes placement and never refuses; `max_replicas` is the explicit ceiling, default unset so nothing changes for a homogeneous cluster.
 2. **Should the operator set `max_replicas` by default from the memory request?** Recommended: no, not until an `LsmEngine` run measures per-tablet memory and fds. Expose `spec.nodeCapacity` overrides now and leave the derived default for weight only (from the CPU request).
