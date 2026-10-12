@@ -269,6 +269,23 @@ impl Cluster {
         (led.len(), max_term, quiesced, hosted)
     }
 
+    /// Hosted tablets no live replica currently believes it leads. Read per
+    /// node, not atomically: a leadership transfer racing the scan can read
+    /// as a one-poll blip either way, which the callers' persistence bound
+    /// absorbs (they only act on a tablet that stays leaderless).
+    fn leaderless(&self) -> BTreeSet<TabletId> {
+        let (mut all, mut led) = (BTreeSet::new(), BTreeSet::new());
+        for n in self.live() {
+            for (t, g) in n.hosted.lock().expect("hosted").iter() {
+                all.insert(*t);
+                if g.is_leader() {
+                    led.insert(*t);
+                }
+            }
+        }
+        all.difference(&led).copied().collect()
+    }
+
     /// The groups node `i` leads.
     fn led_by(&self, i: usize) -> BTreeSet<TabletId> {
         self.nodes[i]
@@ -523,19 +540,58 @@ async fn election_backpressure_liveness_g300() {
 
         // Let every replica quiesce (the issue's idle-cluster shape), then
         // kill the node leading the most groups.
+        //
+        // Leadership is an eventual property: under CPU starvation a leader
+        // may legitimately step down or be replaced while the cluster idles
+        // (availability, not safety; ADR 0078's #1297 amendment documents
+        // late pre-vote grants under overload). So a momentary `led < g` is
+        // not a failure; a tablet that stays leaderless longer than the
+        // ADR's own lost-leader bound is. The bound is taken at `q = g`, the
+        // conservative queue length: every group could in principle be
+        // queued behind the governor on one node, and the formula is the
+        // ADR's, not a new constant. The loop still exits only when all g
+        // groups are led AND all quiesced.
+        let idle_bound = lost_leader_bound(g);
+        let mut leaderless_since: BTreeMap<TabletId, Instant> = BTreeMap::new();
+        let (mut idle_leader_losses, mut worst_leaderless) = (0usize, Duration::ZERO);
         let t0 = Instant::now();
         loop {
             let (led, _, quiesced, hosted) = c.census();
-            assert_eq!(led, g, "a group lost its leader while idle");
-            if quiesced == hosted && hosted == g * NODES {
+            let now = Instant::now();
+            let unled = c.leaderless();
+            for t in &unled {
+                leaderless_since.entry(*t).or_insert_with(|| {
+                    idle_leader_losses += 1;
+                    now
+                });
+            }
+            for since in leaderless_since.values() {
+                worst_leaderless = worst_leaderless.max(now - *since);
+            }
+            leaderless_since.retain(|t, _| unled.contains(t));
+            if let Some((t, since)) = leaderless_since.iter().max_by_key(|(_, s)| now - **s) {
+                assert!(
+                    now - *since < idle_bound,
+                    "tablet {t:?} stayed leaderless {:?} while idle, above the lost-leader \
+                     bound {idle_bound:?} ({} leaderless now)",
+                    now - *since,
+                    leaderless_since.len()
+                );
+            }
+            if led == g && quiesced == hosted && hosted == g * NODES {
                 break;
             }
             assert!(
                 t0.elapsed() < QUIESCE_AFTER + Duration::from_secs(30),
-                "groups never all quiesced ({quiesced}/{hosted})"
+                "groups never all quiesced and led (led={led}/{g}, quiesced={quiesced}/{hosted})"
             );
             c.step().await;
         }
+        println!(
+            "BP-LIVE g={g} phase=idle idle_leader_losses={idle_leader_losses} \
+             worst_leaderless_ms={}",
+            worst_leaderless.as_millis()
+        );
         let victim = (0..NODES)
             .max_by_key(|&i| c.led_by(i).len())
             .expect("a node");
