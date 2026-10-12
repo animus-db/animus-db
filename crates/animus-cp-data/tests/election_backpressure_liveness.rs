@@ -64,6 +64,26 @@ use animus_tablet::{KeyRange, Tablet, TabletId};
 use tokio::time::{sleep, timeout};
 
 type KvNode = RaftKvNode<ProdEnv, MemoryEngine>;
+
+/// Max tokio oversleep (microseconds) of a 10 ms sleeper since the last
+/// `diag` (issue #1297: how late does a task wake on this runtime?).
+static SCHED_LAG_MAX_US: AtomicU64 = AtomicU64::new(0);
+static SCHED_LAG_SUM_US: AtomicU64 = AtomicU64::new(0);
+static SCHED_LAG_N: AtomicU64 = AtomicU64::new(0);
+
+fn spawn_sched_probe() {
+    tokio::spawn(async {
+        loop {
+            let t = Instant::now();
+            sleep(Duration::from_millis(10)).await;
+            let over = t.elapsed().saturating_sub(Duration::from_millis(10));
+            let us = over.as_micros() as u64;
+            SCHED_LAG_MAX_US.fetch_max(us, Ordering::Relaxed);
+            SCHED_LAG_SUM_US.fetch_add(us, Ordering::Relaxed);
+            SCHED_LAG_N.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+}
 type Recon = Reconciler<ProdEnv, MemoryEngine>;
 
 const NODES: usize = 3;
@@ -309,6 +329,7 @@ impl Cluster {
                     t0.elapsed().as_millis()
                 );
                 last_log = Instant::now();
+                self.diag(what);
             }
             assert!(
                 t0.elapsed() < bound,
@@ -317,6 +338,122 @@ impl Cluster {
             );
             self.step().await;
         }
+    }
+
+    /// One BP-LIVE line explaining what the leaderless groups wait on (#1297):
+    /// per node the governor level, and over the leaderless groups the roles,
+    /// deferred holds, and how many replicas of each are hosted.
+    fn diag(&self, tag: &str) {
+        use animus_control::Role;
+        let mut by_group: BTreeMap<TabletId, Vec<(usize, Role, bool, u64)>> = BTreeMap::new();
+        let mut led = BTreeSet::new();
+        for (i, n) in self.nodes.iter().enumerate() {
+            if n.recon.is_none() {
+                continue;
+            }
+            for (t, g) in n.hosted.lock().expect("hosted").iter() {
+                if g.is_leader() {
+                    led.insert(*t);
+                }
+                by_group.entry(*t).or_default().push((
+                    i,
+                    g.role(),
+                    g.campaign_deferred(),
+                    g.term(),
+                ));
+            }
+        }
+        let (mut fol, mut pre, mut cand, mut held) = (0, 0, 0, 0);
+        let mut replicas_hist = [0usize; 4];
+        let mut terms: BTreeMap<u64, usize> = BTreeMap::new();
+        let mut leaderless = 0;
+        for (t, reps) in &by_group {
+            if led.contains(t) {
+                continue;
+            }
+            leaderless += 1;
+            replicas_hist[reps.len().min(3)] += 1;
+            for (_, role, deferred, term) in reps {
+                match role {
+                    Role::Follower => fol += 1,
+                    Role::PreCandidate => pre += 1,
+                    Role::Candidate => cand += 1,
+                    Role::Leader => {}
+                }
+                held += usize::from(*deferred);
+                *terms.entry(*term).or_default() += 1;
+            }
+        }
+        let mut st = animus_control::CampaignStats::default();
+        let mut stl = animus_control::CampaignStats::default();
+        for n in &self.nodes {
+            for (t, g) in n.hosted.lock().expect("hosted").iter() {
+                let x = g.campaign_stats();
+                let tgt = if led.contains(t) { &mut stl } else { &mut st };
+                tgt.rounds_started += x.rounds_started;
+                tgt.rounds_restarted += x.rounds_restarted;
+                tgt.grants_rx += x.grants_rx;
+                tgt.grants_rx_dropped_hold += x.grants_rx_dropped_hold;
+                tgt.grants_rx_dropped_round += x.grants_rx_dropped_round;
+                tgt.refusals_rx += x.refusals_rx;
+                tgt.pv_granted += x.pv_granted;
+                tgt.pv_refused_leader += x.pv_refused_leader;
+                tgt.pv_refused_lease += x.pv_refused_lease;
+                tgt.pv_refused_term_or_log += x.pv_refused_term_or_log;
+                tgt.elections_started += x.elections_started;
+                tgt.dropped_age_ns_sum += x.dropped_age_ns_sum;
+                tgt.dropped_age_ns_max = tgt.dropped_age_ns_max.max(x.dropped_age_ns_max);
+                tgt.counted_age_ns_sum += x.counted_age_ns_sum;
+                tgt.dropped_window_ns_sum += x.dropped_window_ns_sum;
+            }
+        }
+        let mut stretch_max = Duration::ZERO;
+        for n in &self.nodes {
+            for (_, g) in n.hosted.lock().expect("hosted").iter() {
+                stretch_max = stretch_max.max(g.lag_stretch());
+            }
+        }
+        let (mx, sm, cnt) = (
+            SCHED_LAG_MAX_US.swap(0, Ordering::Relaxed),
+            SCHED_LAG_SUM_US.swap(0, Ordering::Relaxed),
+            SCHED_LAG_N.swap(0, Ordering::Relaxed),
+        );
+        println!(
+            "BP-LAG {tag} sched_oversleep_max_ms={} mean_ms={} samples={cnt} stretch_max_ms={}",
+            mx / 1000,
+            sm / 1000 / cnt.max(1),
+            stretch_max.as_millis()
+        );
+        println!(
+            "BP-AGE {tag} leaderless: mean_age_of_dropped_grant_ms={} max_ms={} mean_round_window_ms={} mean_age_of_counted_ms={}",
+            st.dropped_age_ns_sum / st.grants_rx_dropped_hold.max(1) / 1_000_000,
+            st.dropped_age_ns_max / 1_000_000,
+            st.dropped_window_ns_sum / st.grants_rx_dropped_hold.max(1) / 1_000_000,
+            st.counted_age_ns_sum / st.grants_rx.max(1) / 1_000_000
+        );
+        println!("BP-STATS {tag} leaderless={st:?}");
+        println!("BP-STATS {tag} led={stl:?}");
+        let gov: Vec<String> = self
+            .nodes
+            .iter()
+            .map(|n| {
+                let s = n.governor.stats();
+                format!(
+                    "q={} inflight={} adm={} def={} exp={} keff={}",
+                    s.queue_depth,
+                    s.inflight,
+                    s.admitted,
+                    s.deferred,
+                    s.expired_permits,
+                    n.governor.k_eff()
+                )
+            })
+            .collect();
+        println!(
+            "BP-DIAG {tag} leaderless={leaderless} hosted_replicas_hist(0..3)={replicas_hist:?} \
+             roles(fol={fol},pre={pre},cand={cand}) deferred_holds={held} terms={terms:?} gov=[{}]",
+            gov.join(" | ")
+        );
     }
 
     fn governor_stats(&self) -> (usize, usize, u64) {
@@ -468,6 +605,7 @@ async fn density_repro_g3000_holds_led_count() {
         .unwrap_or(3000);
     let hold = Duration::from_secs(120);
     timeout(Duration::from_secs(1500), async {
+        spawn_sched_probe();
         let mut c = Cluster::start(g).await;
         let took = c.await_all_led("host", Duration::from_secs(600)).await;
         let (_, max_term, _, _) = c.census();

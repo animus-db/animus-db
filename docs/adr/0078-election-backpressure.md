@@ -284,3 +284,64 @@ Implemented on one branch as the seven planned steps. The defaults are unchanged
 4. **Should an overloaded node say so?** `hosting_ramp` and the lag gauge are in `/admin/health` as advisory. Should sustained high lag also make a node *fail* its health check (and so the roll gate, ADR 0073 Phase 3), or stay advisory?
 5. **A per-node cap on awake groups** (density admission) is the logical next step and is out of scope here. Worth a separate ADR once Tier 2 shows where the stable ceiling is?
 6. **Whole-cluster restart tail.** With waves, the last tablets of a very large cluster come up after `ceil(G/H) * T_settle`. Acceptable, or should `H` grow with elapsed ramp time?
+
+## Amendment (2026-10-12): a cold start past the cliff does not elect (#1297)
+
+**Finding.** With quiescence off, G=3000 awake RF3 groups on three `ProdEnv`
+nodes (2 worker threads, about 1.9 cores in use) leave about 12% of groups
+leaderless for the whole 10 minutes, with `max_term` flat at 3. Reproduced
+(`ANIMUS_BP_LIVE_QUIESCE=0 ANIMUS_BP_LIVE_GROUPS=3000`, release): 2623/3000 led
+at 600 s, 377 leaderless, `max_term` 3 from 40 s on. This is overload, not a
+liveness defect in the governor or pre-vote path. ADR 0078 keeps leadership and
+bounds failover while the node is past its cliff; it does not make an election
+*complete* once a round trip outlasts the stretch cap, and a cold start is such
+a case.
+
+**Evidence** (the rig now prints `BP-DIAG`, `BP-STATS`, `BP-AGE`, `BP-LAG`
+lines from `RaftCore::campaign_stats`, `RaftKvNode::campaign_deferred` and a
+10 ms scheduler probe):
+
+- *No starvation, no permit leak.* Governor `inflight` sits at `K_eff` (8 to 16,
+  halved by lag) on every node for the whole run, `admitted` keeps rising
+  (about 12 per second per node at the end), `expired_permits` is 5 to 7 over
+  600 s, and the queue depth tracks the number of leaderless replicas.
+- *Pre-vote is granted, but too late.* The leaderless groups started 15,495
+  pre-vote rounds and the responders granted 30,043 pre-votes (refusals: 9, all
+  a vote lease). Only 27 grants were counted toward a majority; 29,099 arrived
+  after the round's election timer had lapsed, with `campaign_hold` set, and
+  were dropped by the `handle_pre_vote_resp` rule. So 97% of grants exist but
+  arrive late. Every pre-vote grant reaches the candidate; none reaches it in
+  time.
+- *How late.* A dropped grant is on average 1.7 s old at 20 s into the run and
+  3.4 s old by 170 s (largest 8.2 s), against a round window of 0.77 to 0.88 s
+  (`[b, 2b)` with the lag stretch at its `S_max` cap of 600 ms, `b` = 750 ms).
+  The rounds that succeed (counted grants) average 0.3 to 0.5 s.
+- *Where the delay is.* A 10 ms tokio sleeper on the same runtime oversleeps by
+  10 to 20 ms on average and 130 to 390 ms at most, so the lag monitor reads
+  roughly 100 to 400 ms and the stretch saturates at its cap. The message
+  pipeline (one connection per destination, one unbatched response per group
+  per heartbeat) is far behind the task scheduler: a request-response pair
+  takes seconds. Process RSS grows (425 MB at 160 s, 618 MB at 600 s at G=3000;
+  flat at G=1250 and 1500), i.e. an unbounded backlog.
+- *The demand really exceeds the box.* CPU is saturated at about 1.9 cores from
+  G=1250 on (962 ticks per 5 s at G=1250, 1500, 2000 and 3000 alike). ADR 0044's
+  own measurement is 1.2 to 1.8 ms/s per awake RF3 group, so 3000 groups need
+  3.6 to 5.4 cores. The convergence time degrades monotonically with G (5 s at
+  1250, 7 s at 1500, 29 to 57 s at 2000, not done by 250 s at 2500, not at 3000 in 600 s).
+  At 2500 the late phase shows term churn (max_term 14, 23 leaderless groups
+  with replicas at terms 9 to 11): real elections that start and lose because
+  the vote grant round trip also outlasts its window.
+
+**Consequence.** Nothing in the governor or the load monitor can fix this:
+the bound `S_max` is deliberate (it caps failover), and a longer window would
+only slow the recovery of every group that does fail over. The remedy is not to
+host more awake groups than the node can heartbeat (density admission, #1295),
+or to quiesce them. The "What this ADR is not" statement stands for groups that
+already have a leader; it should be read as not covering an election that has
+to *start* past the cliff.
+
+**Not changed.** The `campaign_hold` rule that drops a late grant is correct
+(accepting it would start an election without a permit); changing it would not
+help while the round trip exceeds the window of the *next* round as well.
+`RaftCore::campaign_stats` (pre-vote rounds, grants counted and dropped, the
+responder's refusal reasons, ages) stays as a diagnostic.

@@ -86,8 +86,8 @@ pub use animus_placement::PlacementPolicy;
 pub use animus_placement::{Candidate, select_replicas_balanced};
 pub use persist::{PersistedState, WalRecord};
 pub use raft::{
-    DEPARTING_NOTICE_GIVE_UP, DEPARTING_QUIET_GIVE_UP, LogEntry, MemberRole, ProposeResult,
-    RaftCore, RaftMsg, RemovalStats, Role, StateMachine,
+    CampaignStats, DEPARTING_NOTICE_GIVE_UP, DEPARTING_QUIET_GIVE_UP, LogEntry, MemberRole,
+    ProposeResult, RaftCore, RaftMsg, RemovalStats, Role, StateMachine,
 };
 pub use shared_wal::SharedWal;
 pub use version::{

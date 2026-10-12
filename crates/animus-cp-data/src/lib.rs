@@ -7801,6 +7801,22 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         self.lock().term()
     }
 
+    /// The election lag stretch currently installed (ADR 0078), read-only.
+    pub fn lag_stretch(&self) -> Duration {
+        self.lock().lag_stretch()
+    }
+
+    /// Pre-vote traffic counters (issue #1297 diagnosis).
+    pub fn campaign_stats(&self) -> animus_control::CampaignStats {
+        self.lock().campaign_stats()
+    }
+
+    /// Whether a due campaign is currently deferred for lack of a campaign
+    /// permit (ADR 0078). Read-only diagnostic.
+    pub fn campaign_deferred(&self) -> bool {
+        self.lock().campaign_deferred()
+    }
+
     /// The group's installed election-timeout base (ADR 0075 section 3.4:
     /// 150 ms on the LAN profile, wider on the WAN one). Read-only.
     pub fn election_timeout(&self) -> Duration {
