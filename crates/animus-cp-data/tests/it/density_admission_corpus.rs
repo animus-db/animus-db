@@ -165,6 +165,14 @@ fn control_c() -> Vec<Cell> {
     )]
 }
 
+fn control_d() -> Vec<Cell> {
+    vec![cell(
+        "control_d_no_lost_leader_bypass",
+        Kind::MassWake,
+        AwakeFault::NoLostLeaderBypass,
+    )]
+}
+
 fn groups() -> usize {
     std::env::var("ANIMUS_DENSITY_GROUPS")
         .ok()
@@ -484,18 +492,24 @@ impl Rig {
         self.tracked_led = Some(self.led());
     }
 
-    /// The edge wake a client request makes for a group with no leader: every
-    /// live replica, never deferred.
-    fn client_wake_leaderless(&self) {
-        for gi in 0..self.g {
-            if self.live_leader(gi).is_none() {
-                for ni in (0..NODES.len()).filter(|&n| self.live[n]) {
-                    if let Some(n) = self.replica(gi, ni) {
-                        n.wake();
-                    }
-                }
-            }
-        }
+    /// The groups currently led by node `ni` (the lost-leader set once `ni`
+    /// is killed).
+    fn led_by(&self, ni: usize) -> Vec<usize> {
+        (0..self.g)
+            .filter(|&gi| self.live_leader(gi) == Some(ni))
+            .collect()
+    }
+
+    /// ADR 0079 step 4 follow-up oracle: every group in `lost` (its leader
+    /// was on the killed node) gets a live leader with NO client touch inside
+    /// `within`. A group with only a Down follower is not in `lost` and may
+    /// stay queued.
+    fn lost_leaders_recover(&mut self, lost: &[usize], within: Duration) -> bool {
+        let lost = lost.to_vec();
+        self.advance_until(within, move |rig| {
+            lost.iter().all(|&gi| rig.live_leader(gi).is_some())
+        })
+        .is_some()
     }
 
     /// Propose one write on group `gi`'s live leader; returns its key when it
@@ -660,9 +674,10 @@ struct MassWake {
 /// **Clients**: a request to a group that has no leader makes the edge wake
 /// its local replicas (`RaftKvNode::wake`, never deferred: the cap is soft),
 /// after which the group elects and takes the write.
-fn mass_wake_run(seed: u64, g: usize, a: usize) -> MassWake {
-    let mut r = Rig::new(seed, g, a, AwakeFault::None);
+fn mass_wake_run(seed: u64, g: usize, a: usize, fault: AwakeFault) -> MassWake {
+    let mut r = Rig::new(seed, g, a, fault);
     let mut bad = r.bring_up();
+    let lost = r.led_by(0);
     r.kill(0);
     r.mark_down(0);
     r.advance(Duration::from_secs(40));
@@ -682,15 +697,12 @@ fn mass_wake_run(seed: u64, g: usize, a: usize) -> MassWake {
             })
         })
         .collect();
-    let leaderless = r.g - r.led();
-    if let Some(s) = r.stats(1)
-        && leaderless > 0
-        && s.queue_depth == 0
-    {
-        bad.push("cap: leaderless groups but nothing queued");
+    // No client ever touches a group: every lost-leader group must have
+    // been admitted over the cap and elected on its own.
+    if !r.lost_leaders_recover(&lost, Duration::from_secs(20)) {
+        bad.push("lost-leader: a group whose leader died stayed leaderless without a client");
     }
-    // The clients arrive.
-    r.client_wake_leaderless();
+    let leaderless = r.g - r.led();
     let served = r.advance_until(Duration::from_secs(60), |rig| rig.led() == rig.g);
     if served.is_none() {
         bad.push("served: a group never got a live leader");
@@ -712,8 +724,8 @@ fn mass_wake_run(seed: u64, g: usize, a: usize) -> MassWake {
 
 fn run_mass_wake(c: &Cell, g: usize) -> Report {
     let a = cap_for(g);
-    let base = mass_wake_run(c.seed, g, 0);
-    let capped = mass_wake_run(c.seed, g, a);
+    let base = mass_wake_run(c.seed, g, 0, AwakeFault::None);
+    let capped = mass_wake_run(c.seed, g, a, c.fault);
     let mut rep = capped.report;
     for (i, s) in capped.bulk.iter().enumerate() {
         // The accounting identity, at the end of the bulk phase: every awake
@@ -730,17 +742,18 @@ fn run_mass_wake(c: &Cell, g: usize) -> Report {
         if s.deferred == 0 {
             rep.violations.push("cap: the wake queue was never used");
         }
-        if s.awake_hwm * 2 > base.bulk[i].awake_hwm {
+        // The lost-leader groups (about a third of them) are admitted over the
+        // cap, so the high-water is no longer "half the uncapped run"; it must
+        // still sit clearly below it (the Down-follower groups stay queued).
+        if s.awake_hwm * 5 > base.bulk[i].awake_hwm * 4 {
             rep.violations
-                .push("cap: high-water not well below the uncapped run");
+                .push("cap: high-water not below the uncapped run");
         }
     }
-    if capped.leaderless == 0 {
-        rep.violations
-            .push("cap: nothing was left deferred (the cap did not bite)");
-    }
-    if rep.stats.iter().flatten().any(|s| s.queue_depth != 0) {
-        rep.violations.push("cap: the wake queue did not drain");
+    // Groups with only a Down follower stay queued (node 0 never returns in
+    // this cell, so no repair frees their slots); the queue is bounded by G.
+    if rep.stats.iter().flatten().any(|s| s.queue_depth > g) {
+        rep.violations.push("cap: the wake queue grew past G");
     }
     rep.violations.extend(base.report.violations);
     rep.detail = format!(
@@ -836,18 +849,20 @@ fn run_write_to_deferred(c: &Cell, g: usize) -> Report {
 /// cap. `a == 0` is the uncapped baseline (the CPU model is sized from the
 /// cap in both arms, so both see the same node capacity).
 fn overload_run(seed: u64, g: usize, a: usize) -> Report {
-    let cap = cap_for(g);
     let mut r = Rig::new(seed, g, a, AwakeFault::None);
-    r.a = cap;
     let mut bad = r.bring_up();
+    let lost = r.led_by(0);
+    r.a = cap_for(g);
     r.set_load(1.0);
     r.kill(0);
     r.mark_down(0);
     r.track_led();
     r.advance(Duration::from_secs(60));
     r.set_load(0.0);
-    // The clients arrive once the overload is over.
-    r.client_wake_leaderless();
+    // No client touch: lost-leader groups elect on their own.
+    if !r.lost_leaders_recover(&lost, Duration::from_secs(30)) {
+        bad.push("lost-leader: a group whose leader died stayed leaderless without a client");
+    }
     let served = r.advance_until(Duration::from_secs(60), |rig| rig.led() == rig.g);
     if served.is_none() {
         bad.push("served: a group never got a live leader");
@@ -867,10 +882,14 @@ fn run_overload(c: &Cell, g: usize) -> Report {
         rep.violations
             .push("monotone: the led count fell after the fault");
     }
-    if rep.max_lag_ms * 5 > base.max_lag_ms {
-        rep.violations
-            .push("lag: the capped run was not several times calmer than the uncapped one");
-    }
+    // ADR 0079 step 4 follow-up: the lag comparison step 4 asserted here
+    // ("several times calmer than uncapped") no longer holds and is reported
+    // only. The groups whose leader died are admitted over the cap (they must
+    // elect), and the CPU model sizes a node at `2A` groups while a node
+    // leads about `G/3` of them, so the bypass alone puts a survivor over
+    // capacity; the cap's remaining job is to keep the *other* groups'
+    // Down-follower wakes (about 2/3 of the mass wake) off the node. What
+    // stays asserted: every group is led and the led count never falls.
     rep.violations
         .extend(base.violations.iter().filter(|v| v.starts_with("safety")));
     rep.detail = format!(
@@ -1126,12 +1145,38 @@ fn control_c_no_lag_reduction_keeps_waking() {
     }
 }
 
+/// NEGATIVE CONTROL (d): the lost-leader bypass is off
+/// ([`AwakeFault::NoLostLeaderBypass`]). Cell 1's groups whose leader died are
+/// deferred like any bulk wake and stay leaderless without a client, and the
+/// oracle must say so.
+#[test]
+fn control_d_no_lost_leader_bypass_strands_groups() {
+    for c in select(control_d()) {
+        let r = run_cell(&c, groups());
+        eprintln!("DENSITY-CONTROL {} seed={:#x} {r:?}", c.name, c.seed);
+        assert!(
+            r.violations.iter().all(|v| !v.starts_with("safety")),
+            "{}: safety must hold: {:?}",
+            c.name,
+            r.violations
+        );
+        assert!(
+            r.violations.iter().any(|v| v.starts_with("lost-leader:")),
+            "{} seed={:#x}: without the bypass a lost-leader group must stay leaderless: {:?} {r:?}",
+            c.name,
+            c.seed,
+            r.violations
+        );
+    }
+}
+
 #[test]
 fn names_and_seeds_are_unique_and_frozen() {
     let all: Vec<Cell> = cells()
         .into_iter()
         .chain(control_b())
         .chain(control_c())
+        .chain(control_d())
         .collect();
     let names: BTreeSet<&str> = all.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names.len(), all.len());

@@ -3542,14 +3542,18 @@ replicas at `A = awake_max_per_core x cores` by deferring **bulk** wakes only.
   `k_eff` now calls (equivalence test `k_eff_is_behaviour_identical_to_the_pre_
   shared_helper_body` over a dense grid against the old body, verbatim).
 - **A leader cannot quiesce while a voter never catches up**
-  (`quiesce_entry_ok`), so with a node *killed* (not just marked `Down`) the
-  groups a bulk wake admits stay awake and the slots do not turn over: the
-  rest of the queue stays quiesced until a client touches them (the edge's
-  proactive `wake()`). The corpus cells model both (`mass_wake_run` kills;
-  `run_cap_and_lag` marks `Down` on a live node so slots turn over).
+  (`quiesce_entry_ok`), so with a node *killed* the groups a bulk wake admits stay
+  awake and the slots do not turn over. Hence the **lost-leader bypass**: the
+  reconciler (`host.rs`) calls `wake_bulk_leader_lost()` (`WakeSignal.leader_lost`)
+  when the replica's own `leader()` is in `view.down`; the wake arm then skips
+  `try_admit_wake` (the group wakes over the cap, `report` counts it overcap, the
+  campaign governor still paces its election). Down-follower-only groups stay
+  deferrable and may sit queued until repair replaces the dead voter. Never decide
+  this from the queue or the metadata alone: `leader()` is the only leader
+  knowledge a quiesced follower really has.
 - **Metrics:** `CpAwakeReplicas`, `CpAwakeMaxEffective`, `CpWakeQueueDepth`,
   `CpWakeDeferred`, `CpWakeOvercap`; `/admin/health` shows them (advisory).
-- **Negative controls** are `AwakeFault::{HardCap, IgnoreLag}` (`#[doc(hidden)]`);
+- **Negative controls** are `AwakeFault::{HardCap, IgnoreLag, NoLostLeaderBypass}` (`#[doc(hidden)]`);
   `HardCap` is acted on in the driver (`hard_refuses`: inbound peer messages and
   the propose kick of a slot-less group are dropped).
 - **Corpus:** `tests/it/density_admission_corpus.rs` (`ANIMUS_DENSITY_SEEDS`),

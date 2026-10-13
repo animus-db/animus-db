@@ -88,6 +88,9 @@ pub enum AwakeFault {
     HardCap,
     /// `A_eff` ignores the observed lag (no reduction).
     IgnoreLag,
+    /// The lost-leader bypass is off: a group whose leader is on a `Down` node
+    /// is deferred like any other bulk wake (negative control (d)).
+    NoLostLeaderBypass,
 }
 
 struct State {
@@ -416,6 +419,13 @@ impl AwakeAdmission {
     pub fn hard_refuses(&self, stream: u64) -> bool {
         let st = self.lock();
         st.fault == AwakeFault::HardCap && !st.awake.contains(&stream) && st.free() == 0
+    }
+
+    /// Whether a bulk wake of a group with a `Down` leader bypasses the cap
+    /// (true except under the `NoLostLeaderBypass` negative control).
+    #[must_use]
+    pub fn lost_leader_bypass(&self) -> bool {
+        self.lock().fault != AwakeFault::NoLostLeaderBypass
     }
 
     /// Whether this admission is running the `HardCap` negative control.

@@ -380,16 +380,30 @@ section named). Class **L** as classified: no wire or replicated change, no gate
   awake high-water was 10 against 60 uncapped (`admit_awake_hwm` is exactly
   `A_eff`; the rest is counted overcap). In the CPU-model cell the capped run's
   worst scheduling lag was 115-630 ms against 4.8-5.7 s uncapped.
-- **A woken group does not always give its slot back.** A leader cannot quiesce
-  while any voter is behind (`quiesce_entry_ok`), so with a node *killed*, the
-  groups a bulk wake admits stay awake until the dead replica is replaced and the
-  slots do not turn over: the rest of the queue stays quiesced (leaderless if the
-  dead node led it) until a client touches the group, which wakes it over the cap.
-  That is the soft cap working as designed, but it means the cap paces
-  *unsolicited* recovery after a node loss to about `A` groups plus their peer
-  cascade, and recovery of the rest is client-driven. If that is not wanted, the
-  follow-up is to let the queue admit past `A_eff` for a group whose recorded
-  leader is `Down` (not built; Open question for the maintainer).
+- **A woken group does not always give its slot back, so a lost leader bypasses
+  the cap (follow-up, built).** A leader cannot quiesce while any voter is behind
+  (`quiesce_entry_ok`), so with a node *killed* the groups a bulk wake admits stay
+  awake until the dead replica is replaced and the slots do not turn over. The
+  first version therefore left every queued group quiesced, and for a group whose
+  *leader* was on the dead node that meant no election and no repair until a client
+  touched it (a breach of ADR 0078's lost-leader bound). Now the reconciler calls
+  `RaftKvNode::wake_bulk_leader_lost()` instead of `wake_bulk()` when the replica's
+  own `leader()` belief (the raw `leader_id` a quiesced follower keeps; a Raft member
+  id, which is the node id in `view.down`; no new wire) is in `view.down`. The
+  driver then skips the admission ask: the group wakes **over the cap**, is counted
+  in `CpWakeOvercap` when it lands past `A_eff`, and its election stays paced by the
+  campaign governor `K`. A group whose Down replica is only a follower keeps its
+  leader, stays deferrable, and its re-replication waits for the queue. The cost is
+  that the over-cap population after a node loss is the number of groups the dead
+  node led (about `G/N`), not `A`: where that exceeds node capacity the bypass alone
+  overloads a survivor (cell 3 therefore no longer asserts "several times calmer
+  than uncapped", only that every group is led and the led count never falls; cell 1
+  asserts the awake high-water stays below the uncapped run's). Corpus: cells 1 and 3
+  lost their post-bulk client wake and assert that every group led by the killed node
+  gets a live leader with no client touch; negative control (d)
+  (`AwakeFault::NoLostLeaderBypass`) fails that oracle. Open: once repair replaces
+  the dead voter the awake groups can quiesce and the queue drain; cell 1 keeps node
+  0 dead, so that drain is only covered by cell 4 (a live node marked `Down`).
 - **Cell 5's bound is per campaign attempt.** ADR 0078's lost-leader bound is
   missed on reseeded variants by one `2 * base` window when a pre-vote round
   fails; the same happens with no awake cap (#1306). Cell 5 asserts the literal

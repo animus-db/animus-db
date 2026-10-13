@@ -251,6 +251,10 @@ struct WakeSignal {
     /// proactive wake, which ADR 0079's awake-group admission may defer.
     /// Consumed by the consensus loop's wake arm.
     bulk: AtomicBool,
+    /// Set (with `bulk`) by [`RaftKvNode::wake_bulk_leader_lost`]: the group's
+    /// locally known leader is on a `Down` node, so the wake is exempt from
+    /// the awake cap (ADR 0079 step 4 follow-up).
+    leader_lost: AtomicBool,
     /// Set (with `pending`) by [`RaftKvNode::wake`]: a client-driven wake that
     /// wins over a coalesced `bulk` one (the cap is soft, ADR 0079).
     direct: AtomicBool,
@@ -3488,6 +3492,19 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     pub fn wake_bulk(&self) {
         self.wake_signal.bulk.store(true, Ordering::Release);
         self.wake_signal.notify();
+    }
+
+    /// A [`wake_bulk`](Self::wake_bulk) for a group whose **leader** (this
+    /// replica's own `leader()` belief) is on a `Down` node. Such a group has
+    /// no one serving it and only an election (ADR 0078's lost-leader bound)
+    /// and repair can fix that, so it is admitted **over** the awake cap
+    /// (counted in `CpWakeOvercap` when it lands past `A_eff`); its election
+    /// stays paced by the campaign governor `K`. Without this a leaderless
+    /// quiesced group would wait for a client touch indefinitely, since the
+    /// groups that did get slots cannot quiesce while a voter is dead.
+    pub fn wake_bulk_leader_lost(&self) {
+        self.wake_signal.leader_lost.store(true, Ordering::Release);
+        self.wake_bulk();
     }
 
     /// A future that resolves once this replica's own apply task has
@@ -13656,11 +13673,13 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
                         // soft.
                         let direct = wake_signal.direct.swap(false, Ordering::AcqRel);
                         let bulk = wake_signal.bulk.swap(false, Ordering::AcqRel) && !direct;
+                        let lost_leader = wake_signal.leader_lost.swap(false, Ordering::AcqRel);
                         let mut defer = false;
                         if bulk
                             && c.is_quiesced()
                             && !c.is_leader()
                             && let Some(a) = &awake
+                            && !(lost_leader && a.lost_leader_bypass())
                         {
                             match a.try_admit_wake(stream, env.now(), &awake_wake) {
                                 WakeAdmission::Deferred => defer = true,

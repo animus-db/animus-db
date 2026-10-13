@@ -1921,7 +1921,14 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
             if let Some(t) = view.tablets.get(&tablet)
                 && t.replicas.iter().any(|r| view.down.contains(r))
             {
-                node.wake_bulk();
+                // ADR 0079 step 4 follow-up: a group whose known leader is
+                // the Down node is leaderless and bypasses the awake cap; a
+                // group with only a Down follower stays deferrable.
+                if node.leader().is_some_and(|l| view.down.contains(&l)) {
+                    node.wake_bulk_leader_lost();
+                } else {
+                    node.wake_bulk();
+                }
             }
         }
 
