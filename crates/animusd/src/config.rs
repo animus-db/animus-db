@@ -558,7 +558,30 @@ pub struct ClusterSettings {
     /// Additive and skipped when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_settle_timeout_ms: Option<u64>,
+    /// `--node-weight N` (ADR 0079 section 1): this node's relative capacity
+    /// for replica placement, advertised to the control plane through
+    /// `MetaCommand::SetNodeCapacity` once `Gate::NodeCapacity` is open. Only
+    /// ratios between nodes matter; `None` is
+    /// [`DEFAULT_NODE_WEIGHT`] (100, what every node that declares nothing
+    /// has); `0` is rejected. Additive and skipped when unset (ADR 0073 class
+    /// L for the file itself: an old config and the frozen fixture are
+    /// byte-identical); the replicated effect is the gated class G command.
+    /// In a shared `cluster_settings` it is the default for every node that
+    /// loads the file; `--node-weight` on one node's command line overrides
+    /// the file only by being the sole source (a both-sides set is a conflict).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_weight: Option<u32>,
+    /// `--node-max-replicas N` (ADR 0079 section 1): an absolute ceiling on the
+    /// replicas (voters and learners) placement puts on this node; `None` is
+    /// no ceiling. Same advertising path, gate and serialization rule as
+    /// [`node_weight`](Self::node_weight).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_max_replicas: Option<u32>,
 }
+
+/// The default [`ClusterSettings::node_weight`] (ADR 0079 section 1): the
+/// weight of a node that declares nothing.
+pub const DEFAULT_NODE_WEIGHT: u32 = 100;
 
 /// The default [`ClusterSettings::host_unsettled_max`] (ADR 0078 section 3).
 pub const DEFAULT_HOST_UNSETTLED_MAX: u64 = 100;
@@ -635,6 +658,18 @@ impl ClusterSettings {
     pub fn pitr_seal_age(&self) -> std::time::Duration {
         self.pitr_seal_age_secs
             .map_or(crate::DEFAULT_PITR_SEAL_AGE, std::time::Duration::from_secs)
+    }
+
+    /// Startup validation of the node-capacity settings (ADR 0079 section 1):
+    /// the weight must be at least 1 (a zero weight would be an infinite fill).
+    ///
+    /// # Errors
+    /// A message naming the offending setting.
+    pub fn validate_capacity(&self) -> Result<(), String> {
+        if self.node_weight == Some(0) {
+            return Err("cluster_settings.node_weight must be at least 1".into());
+        }
+        Ok(())
     }
 
     /// Startup validation of the staggered-hosting settings (ADR 0078 section
@@ -843,6 +878,18 @@ impl ClusterConfig {
             .and_then(|s| s.host_unsettled_max)
             .unwrap_or(DEFAULT_HOST_UNSETTLED_MAX);
         usize::try_from(v).unwrap_or(usize::MAX)
+    }
+
+    /// This node's declared placement capacity (ADR 0079 section 1): the
+    /// `node_weight` / `node_max_replicas` settings, defaulting to
+    /// [`animus_control::Capacity::DEFAULT`] (weight 100, no ceiling).
+    #[must_use]
+    pub fn node_capacity(&self) -> animus_control::Capacity {
+        let s = self.cluster_settings.as_ref();
+        animus_control::Capacity {
+            weight: s.and_then(|s| s.node_weight).unwrap_or(DEFAULT_NODE_WEIGHT),
+            max_replicas: s.and_then(|s| s.node_max_replicas),
+        }
     }
 
     /// The effective host settle timeout ([`ClusterSettings::host_settle_timeout_ms`],
@@ -1084,6 +1131,7 @@ impl ClusterConfig {
             s.validate_mrec().map_err(ConfigError::Invalid)?;
             s.validate_pitr().map_err(ConfigError::Invalid)?;
             s.validate_hosting().map_err(ConfigError::Invalid)?;
+            s.validate_capacity().map_err(ConfigError::Invalid)?;
         }
         for n in &cfg.nodes {
             if let Some(o) = &n.overload {
@@ -1416,6 +1464,8 @@ mod tests {
             mrec_max_clock_skew_ms: Some(300),
             host_unsettled_max: Some(40),
             host_settle_timeout_ms: Some(900),
+            node_weight: Some(250),
+            node_max_replicas: Some(640),
         });
         let parsed = ClusterConfig::from_json(&cfg.to_json()).unwrap();
         assert_eq!(parsed.cluster_settings, cfg.cluster_settings);
@@ -1518,6 +1568,47 @@ mod tests {
             serde_json::from_str::<PeerCluster>(r#"{"region":"a","endpoints":[],"tls":"x"}"#)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn node_capacity_settings_are_additive_default_and_validated() {
+        // ADR 0079 section 1: absent from default bytes (the frozen v1
+        // `ClusterConfig` fixture is untouched) and resolving to weight 100,
+        // no ceiling.
+        let plain = serde_json::to_string(&ClusterSettings::default()).unwrap();
+        for key in ["node_weight", "node_max_replicas"] {
+            assert!(
+                !plain.contains(key),
+                "default settings emit `{key}`: {plain}"
+            );
+        }
+        let mut cfg = ClusterConfig::generate(1, "127.0.0.1".parse().unwrap(), 7000);
+        assert_eq!(cfg.node_capacity(), animus_control::Capacity::DEFAULT);
+        assert!(!cfg.to_json().contains("node_weight"));
+        cfg.cluster_settings = Some(ClusterSettings {
+            node_weight: Some(300),
+            node_max_replicas: Some(800),
+            ..Default::default()
+        });
+        assert_eq!(
+            cfg.node_capacity(),
+            animus_control::Capacity {
+                weight: 300,
+                max_replicas: Some(800)
+            }
+        );
+        let compact = serde_json::to_string(cfg.cluster_settings.as_ref().unwrap()).unwrap();
+        assert!(
+            compact.ends_with(r#""node_weight":300,"node_max_replicas":800}"#),
+            "{compact}"
+        );
+        let bad = ClusterSettings {
+            node_weight: Some(0),
+            ..Default::default()
+        };
+        assert!(bad.validate_capacity().unwrap_err().contains("at least 1"));
+        cfg.cluster_settings = Some(bad);
+        assert!(ClusterConfig::from_json(&cfg.to_json()).is_err());
     }
 
     #[test]

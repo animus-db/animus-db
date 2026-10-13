@@ -27,6 +27,10 @@ use crate::{
 /// ([`ClientCtx::register_node_until_settled`], issue #1230). Each attempt
 /// already waits up to `SCHEMA_COMMIT_TIMEOUT`, so this only paces a
 /// fast-failing leaderless cluster.
+/// How often [`ClientCtx::sync_node_capacity`] re-checks a closed
+/// `Gate::NodeCapacity` or a not-yet-visible member row (ADR 0079).
+const CAPACITY_SYNC_INTERVAL: Duration = Duration::from_secs(2);
+
 const REGISTER_RETRY_BACKOFF_INITIAL: Duration = Duration::from_millis(500);
 const REGISTER_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
@@ -733,6 +737,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             node: node.clone(),
             addrs: addrs.clone(),
             labels,
+            capacity: None,
         };
         match self
             .propose_and_await(cmd, SCHEMA_COMMIT_TIMEOUT, || async {
@@ -860,6 +865,52 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 self.env.sleep(SCHEMA_POLL_INTERVAL).await;
             }
             backoff = (backoff * 2).min(REGISTER_RETRY_BACKOFF_MAX);
+        }
+    }
+
+    /// Reconcile this node's declared placement capacity into `Metadata` (ADR
+    /// 0079 section 1): once `Gate::NodeCapacity` is open and `node` is a
+    /// data-plane member, propose `SetNodeCapacity` until the replicated value
+    /// equals `configured`, then return. The process configuration is the
+    /// source of truth (a restart with a changed flag overwrites; a node that
+    /// declares nothing clears a leftover entry). A node whose configured
+    /// capacity already equals what `Metadata` holds -- always the case for a
+    /// cluster that declares nothing -- returns on the first read, proposes
+    /// nothing, and never waits for the gate: the emit-site check of ADR 0073
+    /// (an unopened gate is polled, never proposed through).
+    pub(crate) async fn sync_node_capacity(
+        &self,
+        node: &NodeId,
+        configured: animus_control::Capacity,
+    ) {
+        loop {
+            let meta = self.effective_metadata();
+            if meta.capacity_of(node) == configured {
+                return;
+            }
+            if meta.members.contains_key(node) {
+                let features = &self.edge.version().features;
+                if !features.is_open(animus_control::version::Gate::NodeCapacity) {
+                    // The feeder runs on a tick; re-read this node's applied view.
+                    features.update(&meta);
+                }
+                if features.is_open(animus_control::version::Gate::NodeCapacity) {
+                    let cmd = MetaCommand::SetNodeCapacity {
+                        node: node.clone(),
+                        capacity: configured,
+                    };
+                    let done = self
+                        .propose_and_await(cmd, SCHEMA_COMMIT_TIMEOUT, || async {
+                            (self.effective_metadata().capacity_of(node) == configured)
+                                .then_some(())
+                        })
+                        .await;
+                    if done.is_ok() {
+                        return;
+                    }
+                }
+            }
+            self.env.sleep(CAPACITY_SYNC_INTERVAL).await;
         }
     }
 

@@ -349,7 +349,7 @@ fn otel_instance_label(args: &[String]) -> String {
 const USAGE: &str = "usage:\n  \
     animusd gen-config --nodes N [--host H] [--base-port P] [--region NAME] [--peer REGION=host:port[,..]]... [--allow-insecure-peers] [--mrec-max-clock-skew-ms MS]\n  \
     animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P]\n  \
-    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--max-region-rtt-ms MS] [--campaign-max-inflight N] [--lag-stretch-max N] [--host-unsettled-max N] [--host-settle-timeout-ms MS] [--region NAME] [--peer REGION=host:port[,host:port...]]... [--allow-insecure-peers] [--mrec-max-clock-skew-ms MS] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH] [--encryption-key PATH]\n  \
+    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--max-region-rtt-ms MS] [--campaign-max-inflight N] [--lag-stretch-max N] [--host-unsettled-max N] [--host-settle-timeout-ms MS] [--node-weight N] [--node-max-replicas N] [--region NAME] [--peer REGION=host:port[,host:port...]]... [--allow-insecure-peers] [--mrec-max-clock-skew-ms MS] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH] [--encryption-key PATH]\n  \
     animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] [--encryption-key PATH]\n  \
     animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--dynamo-auth PATH]\n  \
     animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral] [--advertise-host NAME] [--label K=V]... [--labels-file PATH [--labels-file-annotations]] [--labels-wait-secs N] [--encryption-key PATH] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3]\n  \
@@ -592,6 +592,12 @@ async fn run(args: &[String]) -> Result<(), String> {
     // same name; conflict = hard error).
     let mut host_unsettled_max: Option<u64> = None;
     let mut host_settle_timeout_ms: Option<u64> = None;
+    // ADR 0079 step 3: `--node-weight N` / `--node-max-replicas N`, this node's
+    // declared placement capacity; same reach and conflict rule as
+    // `--max-region-rtt-ms` (`--config`/`--node`, merged with the
+    // `cluster_settings` keys of the same name).
+    let mut node_weight: Option<u32> = None;
+    let mut node_max_replicas: Option<u32> = None;
     // MREC global-table peer settings (ADR 0075 section 4, G-01 stage G-d M3):
     // `--region NAME`, repeatable `--peer REGION=host:port[,host:port...]`,
     // `--allow-insecure-peers` (dev only) and `--mrec-max-clock-skew-ms MS`.
@@ -750,6 +756,16 @@ async fn run(args: &[String]) -> Result<(), String> {
             "--lag-stretch-max" => {
                 lag_stretch_max_x = Some(parse_next(&mut it, "--lag-stretch-max")?);
             }
+            "--node-weight" => {
+                let w: u32 = parse_next(&mut it, "--node-weight")?;
+                if w == 0 {
+                    return Err("--node-weight must be at least 1".into());
+                }
+                node_weight = Some(w);
+            }
+            "--node-max-replicas" => {
+                node_max_replicas = Some(parse_next(&mut it, "--node-max-replicas")?);
+            }
             "--host-unsettled-max" => {
                 host_unsettled_max = Some(parse_next(&mut it, "--host-unsettled-max")?);
             }
@@ -839,6 +855,8 @@ async fn run(args: &[String]) -> Result<(), String> {
         mrec_max_clock_skew_ms,
         host_unsettled_max,
         host_settle_timeout_ms,
+        node_weight,
+        node_max_replicas,
     };
     let orphan_sweep_after =
         orphan_sweep_after_duration(cli_cluster_settings.orphan_sweep_after_secs);
@@ -887,6 +905,14 @@ async fn run(args: &[String]) -> Result<(), String> {
         return Err(
             "--campaign-max-inflight is only supported with --config/--node (set \
              cluster_settings.campaign_max_inflight in the config file for the other shapes)"
+                .into(),
+        );
+    }
+    if (node_weight.is_some() || node_max_replicas.is_some()) && config_path.is_none() {
+        return Err(
+            "--node-weight/--node-max-replicas are only supported with --config/--node (set \
+             cluster_settings.node_weight / node_max_replicas in the config file for the \
+             other shapes)"
                 .into(),
         );
     }
@@ -2029,6 +2055,8 @@ fn resolve_cluster_settings(
     merge_field!(lag_stretch_max_x, "--lag-stretch-max");
     merge_field!(host_unsettled_max, "--host-unsettled-max");
     merge_field!(host_settle_timeout_ms, "--host-settle-timeout-ms");
+    merge_field!(node_weight, "--node-weight");
+    merge_field!(node_max_replicas, "--node-max-replicas");
     merge_field!(allow_insecure_peers, "--allow-insecure-peers");
     merge_field!(mrec_max_clock_skew_ms, "--mrec-max-clock-skew-ms");
     if let Some(r) = &cli.region {
@@ -2047,6 +2075,7 @@ fn resolve_cluster_settings(
     effective.validate_mrec()?;
     effective.validate_pitr()?;
     effective.validate_hosting()?;
+    effective.validate_capacity()?;
     Ok(effective)
 }
 
@@ -2151,6 +2180,12 @@ async fn run_single(
             .cluster_settings
             .get_or_insert_with(Default::default)
             .campaign_max_inflight = Some(n);
+    }
+    // ADR 0079 section 1: the declared node capacity travels the same way.
+    if settings.node_weight.is_some() || settings.node_max_replicas.is_some() {
+        let cs = config.cluster_settings.get_or_insert_with(Default::default);
+        cs.node_weight = settings.node_weight;
+        cs.node_max_replicas = settings.node_max_replicas;
     }
     // ADR 0078 section 3: staggered hosting travels the same way.
     if settings.host_unsettled_max.is_some() || settings.host_settle_timeout_ms.is_some() {

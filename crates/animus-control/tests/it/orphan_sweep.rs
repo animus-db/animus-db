@@ -98,6 +98,7 @@ fn register(node: NodeId, role: &str, suffix: u16) -> MetaCommand {
         node,
         addrs: addrs(role, suffix),
         labels: BTreeMap::new(),
+        capacity: None,
     }
 }
 

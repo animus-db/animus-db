@@ -218,6 +218,7 @@ const SEED_USAGE: &str = "  seed <admin-addr> <table> <count> [--start N] [--key
 const TABLE_USAGE: &str = "  table preferred-leader <admin-addr> <table> <region>";
 
 const CLUSTER_USAGE: &str = "  cluster version <admin-addr> [--json]\n  \
+  cluster capacity <admin-addr> [--json]\n  \
     cluster finalize <leader-admin-addr> [--to N] [--yes]\n  \
     cluster roll plan <admin-addr> [--json]\n  \
     cluster roll status <admin-addr> [--json]\n  \
@@ -1768,6 +1769,45 @@ fn range_str(v: &serde_json::Value) -> String {
     }
 }
 
+/// Human rendering of `GET /admin/capacity` (ADR 0079 section 1; pure).
+fn format_cluster_capacity(v: &serde_json::Value) -> String {
+    let mut out = String::new();
+    let open = v["gate_open"].as_bool().unwrap_or(false);
+    out.push_str(&format!(
+        "cluster version {}: placement reads declared capacity: {}\n",
+        v["cluster_version"],
+        if open {
+            "yes"
+        } else {
+            "no (capacity is applied once cluster version 5 is finalized; every node is weight 100 until then)"
+        }
+    ));
+    out.push_str(&format!(
+        "  {:<12} {:<8} {:>7} {:>13} {:>9}\n",
+        "node", "status", "weight", "max-replicas", "replicas"
+    ));
+    for n in v["nodes"].as_array().map_or(&[][..], Vec::as_slice) {
+        let d = &n["declared"];
+        let max = d["max_replicas"]
+            .as_u64()
+            .map_or_else(|| "-".to_string(), |m| m.to_string());
+        let note = if n["effective"] == n["declared"] {
+            ""
+        } else {
+            "  (declared, not yet in effect)"
+        };
+        out.push_str(&format!(
+            "  {:<12} {:<8} {:>7} {:>13} {:>9}{note}\n",
+            n["node"].as_str().unwrap_or("?"),
+            n["status"].as_str().unwrap_or("-"),
+            d["weight"],
+            max,
+            n["replicas"],
+        ));
+    }
+    out
+}
+
 /// Human rendering of `GET /admin/cluster-version` (pure).
 fn format_cluster_version(v: &serde_json::Value) -> String {
     let mut out = String::new();
@@ -1989,12 +2029,29 @@ async fn run_cluster(
             }
             Ok(())
         }
+        Some("capacity") => {
+            let addr = args.get(1).ok_or("cluster capacity needs <admin-addr>")?;
+            let raw_json = args.get(2).map(String::as_str) == Some("--json");
+            let (status, resp) = http_call(addr, "GET", "/admin/capacity", None, tls).await?;
+            if !(200..300).contains(&status) {
+                println!("{resp}");
+                return Err(format!("admin request failed (HTTP {status})"));
+            }
+            if raw_json {
+                println!("{resp}");
+            } else {
+                let v: serde_json::Value =
+                    serde_json::from_str(&resp).map_err(|e| format!("malformed reply: {e}"))?;
+                print!("{}", format_cluster_capacity(&v));
+            }
+            Ok(())
+        }
         Some("finalize") => {
             let fa = parse_finalize_args(&args[1..])?;
             run_finalize(&fa.addr, fa.to, fa.yes, tls).await
         }
         Some("roll") => roll::run_roll(&args[1..], tls).await,
-        _ => Err("cluster needs a subcommand: version | finalize | roll".into()),
+        _ => Err("cluster needs a subcommand: version | capacity | finalize | roll".into()),
     }
 }
 
@@ -2324,6 +2381,42 @@ mod tests {
         assert!(text.contains("cannot finalize to 2"), "{text}");
         let ok = format_cluster_version(&sample_view(serde_json::json!([]), true));
         assert!(ok.contains("can finalize to 2: yes"), "{ok}");
+    }
+
+    #[test]
+    fn cluster_capacity_output_shows_declared_effective_and_load() {
+        let node = |id: &str, w: u64, max: serde_json::Value, eff_w: u64, replicas: u64| {
+            serde_json::json!({
+                "node": id, "status": "Active", "replicas": replicas,
+                "declared": {"weight": w, "max_replicas": max},
+                "effective": {"weight": eff_w, "max_replicas": max},
+            })
+        };
+        let closed = serde_json::json!({
+            "gate_open": false, "cluster_version": 4,
+            "nodes": [node("n1", 300, serde_json::json!(800), 100, 7)],
+        });
+        let text = format_cluster_capacity(&closed);
+        assert!(
+            text.contains("placement reads declared capacity: no"),
+            "{text}"
+        );
+        assert!(text.contains("declared, not yet in effect"), "{text}");
+        let open = serde_json::json!({
+            "gate_open": true, "cluster_version": 5,
+            "nodes": [node("n1", 300, serde_json::json!(800), 300, 7),
+                      node("n2", 100, serde_json::Value::Null, 100, 2)],
+        });
+        let text = format_cluster_capacity(&open);
+        assert!(
+            text.contains("placement reads declared capacity: yes"),
+            "{text}"
+        );
+        assert!(!text.contains("not yet in effect"), "{text}");
+        assert!(
+            text.contains("n1") && text.contains("800") && text.contains("n2"),
+            "{text}"
+        );
     }
 
     #[test]

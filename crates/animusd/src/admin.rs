@@ -54,6 +54,7 @@
 //! - `POST /admin/control/member/remove` — `{node}` — shrink the control group (ADR 0037 PR3)
 //! - `GET  /admin/cluster-version`       — ADR 0073 Phase 2: active cluster version, per-node recorded range + build, safe target, Finalize blockers (any node; the control leader adds its live observation table)
 //! - `GET  /admin/roll-health`           — ADR 0073 Phase 3 (D2): the server-side "safe to touch the next node" verdict (`ok` + named `reasons`, control quorum, member statuses, tablet ladder counts, this node's own group catch-up); read-only, never a probe; `GET /admin/cluster-version` also carries a derived `roll` object (phase, on_new, remaining, down, blockers, health)
+//! - `GET  /admin/capacity`             — ADR 0079 section 1: every data member's declared placement capacity (`weight`, `max_replicas`), the replicas it holds, and whether placement reads capacity yet (`Gate::NodeCapacity` open); `animus cluster capacity`
 //! - `POST /admin/cluster-version/finalize` — `{to?, expected?}` — raise the cluster version one step (local-control-leader-only, not relayed; 409 names every blocker, and the leader on a non-leader)
 //! - `POST /admin/data/dynamo`         — run a DynamoDB op `{op, payload}` (ADR 0021), item API or Streams read API alike (ADR 0042)
 //! - `POST /admin/data/drop-table`     — drop a table's schema `{table}` (ADR 0021)
@@ -613,6 +614,9 @@ impl AdminHost for ClientCtx {
     async fn roll_health_view(&self) -> Value {
         roll_health_view(self)
     }
+    async fn capacity_view(&self) -> Value {
+        capacity_view(self)
+    }
     async fn action_finalize_cluster_version(&self, body: &[u8]) -> (u16, Value) {
         action_finalize_cluster_version(self, body).await
     }
@@ -797,6 +801,9 @@ impl<E: Env, R: RelayClient> AdminHost for GenericAdminHost<E, R> {
     }
     async fn roll_health_view(&self) -> Value {
         roll_health_view(&self.0)
+    }
+    async fn capacity_view(&self) -> Value {
+        capacity_view(&self.0)
     }
     async fn action_finalize_cluster_version(&self, body: &[u8]) -> (u16, Value) {
         action_finalize_cluster_version(&self.0, body).await
@@ -1630,7 +1637,9 @@ fn system_table_value_display(kind: syskv::EntityKind, value: &[u8]) -> Value {
         | syskv::EntityKind::SplitPlacing
         // A `NodeVersion` (ADR 0073 Phase 2, P2-A) — same JSON passthrough
         // convention.
-        | syskv::EntityKind::NodeVersion => {
+        | syskv::EntityKind::NodeVersion
+        // A `Capacity` (ADR 0079) — same JSON passthrough convention.
+        | syskv::EntityKind::NodeCapacity => {
             serde_json::from_slice::<Value>(value).unwrap_or(Value::Null)
         }
         syskv::EntityKind::Counter => match <[u8; 8]>::try_from(value) {
@@ -2948,6 +2957,43 @@ async fn action_set_preferred_leader<E: Env, R: RelayClient>(
         Err(e) => return e,
     };
     crate::global_tables::admin_set_preferred_leader(ctx, &req.table, &req.region).await
+}
+
+/// `GET /admin/capacity` (ADR 0079 section 1): the declared placement capacity
+/// of every data-plane member, from this node's applied view. `declared` is
+/// what `Metadata::node_capacity` holds (the default for a node that declares
+/// nothing); `effective` is what placement actually uses, which is the default
+/// for every node until `Gate::NodeCapacity` opens. `replicas` counts the
+/// replicas (voters and learners) the tablet map puts on the node.
+fn capacity_view<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> Value {
+    let meta = ctx.effective_metadata();
+    let mut replicas: std::collections::BTreeMap<&animus_env::NodeId, usize> =
+        std::collections::BTreeMap::new();
+    for t in meta.tablets.values() {
+        for r in &t.replicas {
+            *replicas.entry(r).or_insert(0) += 1;
+        }
+    }
+    let cap_json =
+        |c: animus_control::Capacity| json!({"weight": c.weight, "max_replicas": c.max_replicas});
+    let nodes: Vec<Value> = meta
+        .members
+        .iter()
+        .map(|(id, m)| {
+            json!({
+                "node": id,
+                "status": format!("{:?}", m.status),
+                "declared": cap_json(meta.capacity_of(id)),
+                "effective": cap_json(meta.placement_capacity(id)),
+                "replicas": replicas.get(id).copied().unwrap_or(0),
+            })
+        })
+        .collect();
+    json!({
+        "gate_open": meta.capacity_gate_open(),
+        "cluster_version": meta.cluster_version(),
+        "nodes": nodes,
+    })
 }
 
 /// `GET /admin/roll-health` (ADR 0073 Phase 3, D2): the server-side verdict

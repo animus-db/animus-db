@@ -409,6 +409,7 @@ fn run_d_leader_crash_mid_registration_converges(seed: u64) {
         node: new_id.clone(),
         addrs,
         labels: BTreeMap::new(),
+        capacity: None,
     });
     assert!(
         accepted(&outcome),

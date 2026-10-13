@@ -4004,6 +4004,7 @@ mod tests {
             policies: BTreeMap::new(),
             split_placing: BTreeMap::new(),
             rev: 0,
+            capacity: BTreeMap::new(),
         }
     }
 

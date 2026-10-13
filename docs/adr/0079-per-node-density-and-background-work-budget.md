@@ -273,3 +273,65 @@ One implementation PR on one branch (per the repo's operating mode), ordered com
 8. **#1297 (resolved):** diagnosed as accepted overload (see "Resolved dependency"). No gate on this ADR remains; it is kept here only so the numbering of the other questions does not change.
 9. **Should the permit pools and `LoadMonitor` input be shared with #1296's client-path admission** (one lag-reduction rule for the request gate as well)? Recommended: yes, a single `lag -> factor` helper used by both, with the client-gate wiring left to #1296's ADR.
 10. **Cluster version.** Recommended: a new `Gate::NodeCapacity` at cluster version 5, finalised with the rest of the release, rather than folding capacity into an existing gate.
+
+## Implementation step 3 as built (2026-10-13)
+
+Step 3 shipped `Gate::NodeCapacity` (cluster version 5), `Capacity` in
+`Metadata` (`node_capacity`, mirror kind `node_capacity`), the `RegisterNode`
+`capacity` field and `SetNodeCapacity`; the control leader's repair, rebalance
+and directed-Placing passes feed declared capacity and per-node replica counts
+into the step 2 `*_with_load` functions only once the gate is open (gate closed
+or nothing declared: the original functions, byte for byte); `--node-weight` /
+`--node-max-replicas` (`cluster_settings.node_weight` / `node_max_replicas`);
+`GET /admin/capacity` and `animus cluster capacity`; and the operator
+derivation. The compatibility record is ADR 0073's 2026-10-13 amendment.
+
+- **A node advertises through a sync loop, not at registration.**
+  `RegisterNode.capacity` exists, is gated by content and is applied
+  fill-if-empty, but `animusd` registers with `None` (the old shape, so a join
+  into a cluster below version 5 stays valid) and `ClientCtx::sync_node_capacity`
+  proposes `SetNodeCapacity` once the node is a member and the gate is open.
+  The process configuration is the source of truth: a restart with a changed
+  flag overwrites, and a node that declares nothing clears a leftover entry.
+- **`CutoverSplit` target.** The apply-time directed-Placing target uses
+  `select_replicas_balanced` over the pre-fork replica counts when capacity is
+  in effect (still a pure function of replicated state), so a child's target
+  respects weights and ceilings; the fork itself remains placement-blind.
+- **Table creation refusal (section 1, "Total capacity below demand") is not
+  in this step.** `CreateTable` placement still goes through
+  `select_replicas`; refusing a new tablet when every eligible node is at
+  `max_replicas` and the `placement_capacity_blocked_tablets` gauge are step 7
+  (cells 11-12), together with the retryable wire error mapping.
+- **Operator derivation (maintainer instruction of 2026-10-13, superseding open
+  question 2's "weight only"):** `weight = max(1, cpu_millicores / 100)` and
+  `max_replicas = min(0.5 * memory_request / 64 KiB, 1000)` from
+  `spec.resources.requests` (`docs/density-measurements.md`, 2026-10-13), each
+  overridden field by field by `spec.nodeCapacity.{weight,maxReplicas}`; absent
+  requests render neither key. The `nofile / 2` term is not applied (the
+  operator cannot see a container's `nofile`, a runtime default far above the
+  cap), and the constant 1000 is the temporary hosting-time cap pending #1303.
+
+### The snapshot-refusal wire question (resolved)
+
+The classification table left open whether a full receive pool can refuse an
+`InstallSnapshot` through an existing reply. Read against the code:
+`InstallSnapshotResp { term, last_index, next_offset }` has **no busy form**.
+The one refusal-shaped reply, `(last_index 0, next_offset 0)` to an offset-0
+chunk, means "I already hold state through your offer's base": the leader
+forgets the transfer, marks that base as *served* and probes with
+`AppendEntries` (`handle_install_snapshot_resp`), which is exactly wrong for
+"not now" (a refused base would never be re-offered until the base moved).
+**Decision (the ADR's recommended direction: reuse the existing path, add no
+wire shape): the receiver refuses by not acknowledging the first chunk of an
+offer** (no reply at all, and it buffers nothing). The sender already treats
+a silent peer as slow: the offset-0 chunk is resent by the heartbeat `Backoff`
+schedule and the ack-driven capped resend, "a stuck transfer is never
+permanently silenced". This is class **L** (receiver-local, no new variant, no
+gate, an older sender is unaffected because it already tolerates silence). The
+cost is that there is no retry-after hint: the retry cadence is the existing
+backoff, and step 5 must release the *sender's* permit when its transfer sits
+unacknowledged past a bound, rather than rely on a refusal to do it. If step 5's
+measurements show the backoff too slow, a `Busy` reply variant would then be
+class **G** under its own gate, with an older sender treating an unknown
+variant as a failure it retries; that is a deliberate later amendment, not
+part of this step.

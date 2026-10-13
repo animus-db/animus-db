@@ -174,3 +174,12 @@ A cluster-default policy and operator-facing policy management are future work.
 inputs are exactly the state the earlier moves produce, so a caller that keeps
 it across ticks must fingerprint ALL of `tablets`, `candidates` and the policies
 and drop the plan on any unpredicted change. The crate stays stateless.
+
+## Who feeds capacity (ADR 0079 step 3)
+
+`animus-control` builds `Candidate`s with `.with_capacity(..)` only from
+`Metadata::effective_capacities()` (empty until `Gate::NodeCapacity` is open) and
+calls the `*_with_load` forms only when that map is non-empty, with
+`replica_load(tablets)` (every tablet's replicas, voters and learners) as `load`.
+This crate stays gate-blind; it must keep returning today's output for equal
+default capacities.

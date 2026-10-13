@@ -1229,6 +1229,14 @@ pub fn is_relayable_command(command: &MetaCommand) -> bool {
         // "no seed answered" — see `tests/seed_join_allocated.rs`'s
         // follower-connected-seed case (`animusd`).
         | MetaCommand::RegisterNode { .. }
+        // Per-node capacity (ADR 0079, `Gate::NodeCapacity`): a data node
+        // reconciles its own configured capacity into `Metadata` from
+        // wherever it runs (usually a follower of the control group), the
+        // identical relay reasoning as `RegisterNode` just above. Missing
+        // this arm would be the bimodal per-process flake the root
+        // `CLAUDE.md` warns about: a node connected to a follower would
+        // never get its declared capacity applied.
+        | MetaCommand::SetNodeCapacity { .. }
         // `CreateBackup` wire operation (ADR 0059 §3/§4, Train 1 PR④):
         // an operator's `CreateBackup` call may land on any node, exactly
         // like `CreateTable`/`UpdateTimeToLive` — relaying `BeginBackup`
@@ -1975,6 +1983,11 @@ mod tests {
                 node: nid(1),
                 addrs: addrs.clone(),
                 labels: Default::default(),
+                capacity: None,
+            },
+            MetaCommand::SetNodeCapacity {
+                node: nid(1),
+                capacity: animus_control::Capacity::DEFAULT,
             },
             MetaCommand::BeginBackup {
                 backup_id: "b1".to_string(),

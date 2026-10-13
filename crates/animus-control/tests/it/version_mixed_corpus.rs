@@ -592,6 +592,7 @@ fn run_phase1_after_era(seed: u64, variant: u64) {
                     role: "data".into(),
                 },
                 labels: Default::default(),
+                capacity: None,
             },
             &|m| m.node_addrs.contains_key(&nid(12)),
             "registration of the Phase 1 arrival",

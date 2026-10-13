@@ -12514,3 +12514,23 @@ Streams `seal_age`); retention rides in `StreamSealKnobs::pitr_retention` into
 `run_node_control_with_stores` take it as a parameter (control-only has no
 seal knobs). A new `StreamSealKnobs { .. }` literal needs `..Default::default()`
 (or all four fields in a `const`).
+
+## Per-node capacity (ADR 0079 step 3, `Gate::NodeCapacity`, cluster version 5)
+
+- Settings: `--node-weight N` / `--node-max-replicas N` (`--config`/`--node` only,
+  merged with `cluster_settings.node_weight` / `node_max_replicas`, a both-sides
+  set is a conflict; `0` weight is refused) -> `ClusterConfig::node_capacity()` ->
+  `Bound{,Data}Node::with_node_capacity` -> `spawn_common_tail`.
+- **Advertising is a loop, not a registration field.** After the self-registration
+  task settles it runs `ClientCtx::sync_node_capacity` (`schema.rs`): returns at
+  once if `Metadata` already holds the configured value (always, for a cluster
+  that declares nothing); otherwise polls (`CAPACITY_SYNC_INTERVAL`) until the
+  node is a member and `Gate::NodeCapacity` is open on this node's features, then
+  `propose_and_await(SetNodeCapacity)`. Never propose through a closed gate
+  (`RaftNode::propose` debug-asserts). `register_node` still sends `capacity: None`.
+- `GET /admin/capacity` (`admin.rs::capacity_view`, `AdminHost::capacity_view`)
+  shows declared vs effective capacity and replica counts; `animus cluster capacity`.
+- Cells: `sim_cluster_mixed_version_corpus` `release4_to_release5_node_capacity_gate`
+  (the sync task is running before the gate opens mid-run) and
+  `negative_control_node_capacity_gate_emitted_early`; `SimClusterHandle::sync_node_capacity`
+  runs the production loop on a simulated node.

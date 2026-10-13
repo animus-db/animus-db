@@ -383,6 +383,11 @@ pub trait AdminHost: Send + Sync {
     /// statuses, the tablet ladder and this node's own group catch-up. Pure
     /// observer; never a readiness probe.
     async fn roll_health_view(&self) -> Value;
+    /// `GET /admin/capacity` (ADR 0079 section 1) -- every data member's
+    /// declared placement capacity (weight, `max_replicas`), the replicas it
+    /// holds now, and whether placement is allowed to read capacity yet
+    /// (`Gate::NodeCapacity`). Pure observer.
+    async fn capacity_view(&self) -> Value;
     /// `POST /admin/cluster-version/finalize` (ADR 0073 Phase 2, P2-C) —
     /// raise the cluster version by one. Local-control-leader-only, not
     /// relayed (the ADR 0037 `admin_remove_member` pattern).

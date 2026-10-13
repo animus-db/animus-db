@@ -3327,3 +3327,28 @@ no-op when unchanged and draws no entropy. Tests:
 0078 negative control (c) (animus-cp-data): it re-arms a deferred follower's
 election timer, the responder-side gating the ADR rejects. Never call it from
 production code.
+
+## `Gate::NodeCapacity`, `MAX_SUPPORTED = 5` (ADR 0079 step 3, ADR 0073's 2026-10-13 amendment)
+
+- **State.** `Metadata::node_capacity: BTreeMap<NodeId, Capacity>` holds only
+  non-default capacities (skipped when empty; default entries are removed, so
+  "declares the default" and "declares nothing" are one state). A separate map,
+  not a `Member` field, for the reason `node_versions` is one: `UpsertMember`
+  replaces the whole `Member`. Mirror kind `EntityKind::NodeCapacity`
+  (`node_capacity`), pruned by `RemoveMember`.
+- **Commands.** `RegisterNode.capacity` (`Option`, fill-if-empty like labels,
+  a control-role registration records nothing) and `SetNodeCapacity` (rejected
+  for a non-member and a zero weight, `NoOp` when equal, default removes).
+  `required_gate`: `SetNodeCapacity` and `RegisterNode { capacity: Some }` are
+  `NodeCapacity`, a plain registration stays `Base`. `is_relayable_command`
+  (`animus-node` `wire.rs`) lists `SetNodeCapacity`.
+- **Placement reads the gate from the metadata.** `PlacementView.capacity` /
+  `Metadata::effective_capacities()` is `node_capacity` iff `capacity_gate_open()`
+  (the replicated cluster version, never a `ClusterFeatures` handle), else empty;
+  an empty map keeps the original placement functions, a non-empty one switches
+  `reconcile_placement`, `rebalance_*`, `split_placing_reconcile` and the
+  `CutoverSplit` target to the step 2 `*_with_load` / `select_replicas_balanced`
+  with `replica_load(tablets)`. Tests: `tests/it/node_capacity.rs`.
+- **Fixtures** `metadata/v1-capacity.json`, `mirror-entities/node_capacity/v1.json`;
+  `capacity_wire_shapes_are_pinned` freezes the command JSON. `sim_versions`
+  `content_gate` names the new shapes by content.

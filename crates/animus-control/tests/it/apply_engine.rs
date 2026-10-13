@@ -130,6 +130,7 @@ fn run_scenario(seed: u64) {
                 role: "combined".to_string(),
             },
             labels: BTreeMap::new(),
+            capacity: None,
         });
         sim.run_for(Duration::from_secs(2));
         assert_cache_matches_engine(&nodes, &engines, seed, "after initial commands").await;

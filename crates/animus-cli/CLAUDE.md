@@ -541,3 +541,10 @@ MRSC tables (regions, preferred leader, placement) and, since G-d M6, MREC table
 per-(tablet, peer) shipper health). Shipper health is node-local, so a fleet view means
 running it against each node. The CLI has no MREC-specific rendering to keep in sync; only
 the request-shape unit test (`global_tables_and_drain_force_admin_requests`).
+
+## `animus cluster capacity` (ADR 0079 step 3)
+
+`cluster capacity <admin-addr> [--json]` renders `GET /admin/capacity`
+(`format_cluster_capacity`, pure): per member the declared weight / `max_replicas`,
+the replica count, and a note when the declaration is not yet in effect (the cluster
+has not finalized version 5).

@@ -761,6 +761,7 @@ async fn register_node_over_wire_via_relay<E: Env, R: RelayClient>(
         node: node.clone(),
         addrs: addrs.clone(),
         labels: labels.clone(),
+        capacity: None,
     };
     loop {
         // Best-effort (re-)propose — mirrors `register_node_over_wire`'s own
@@ -1553,6 +1554,18 @@ impl SimClusterHandle {
         self.ctx(node)
             .register_node_until_settled(id, addrs, labels)
             .await
+    }
+
+    /// ADR 0079: `node`'s own `ClientCtx::sync_node_capacity` -- what
+    /// production's self-registration task runs once registered. Returns once
+    /// `Metadata` holds `capacity` for `id` (it waits for `Gate::NodeCapacity`).
+    pub(crate) async fn sync_node_capacity(
+        &self,
+        node: u64,
+        id: NodeId,
+        capacity: animus_control::Capacity,
+    ) {
+        self.ctx(node).sync_node_capacity(&id, capacity).await;
     }
 
     /// Call `node`'s own `ClientCtx::propose_schema` directly, bypassing a
@@ -3040,6 +3053,7 @@ impl SimCluster {
                         node: id.clone(),
                         addrs,
                         labels: self.node_labels.get(&n).cloned().unwrap_or_default(),
+                        capacity: None,
                     }),
                     ProposeResult::Accepted { .. }
                 ),
@@ -6437,6 +6451,7 @@ impl SimCluster {
                     node: id.clone(),
                     addrs,
                     labels: BTreeMap::new(),
+                    capacity: None,
                 }),
                 ProposeResult::Accepted { .. }
             ),
@@ -7096,6 +7111,7 @@ impl SimCluster {
                     node: id.clone(),
                     addrs,
                     labels: BTreeMap::new(),
+                    capacity: None,
                 }),
                 ProposeResult::Accepted { .. }
             ),

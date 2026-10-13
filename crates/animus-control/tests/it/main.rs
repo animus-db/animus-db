@@ -34,6 +34,7 @@ mod metadata_watch;
 mod metrics;
 mod mrec_table_apply;
 mod next_deadline;
+mod node_capacity;
 mod non_voter_vote_lease;
 mod one_identity_multiplexing;
 mod orphan_sweep;

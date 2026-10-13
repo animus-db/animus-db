@@ -302,6 +302,7 @@ impl World {
                     node: nid(id),
                     addrs: addrs(id, "control"),
                     labels: BTreeMap::new(),
+                    capacity: None,
                 },
                 &|m| m.node_addrs.contains_key(&nid(id)),
                 "control registration",

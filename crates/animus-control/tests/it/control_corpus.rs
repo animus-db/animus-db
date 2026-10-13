@@ -1647,6 +1647,7 @@ async fn register_cas_client(
         node: target.clone(),
         addrs: addrs.clone(),
         labels: BTreeMap::new(),
+        capacity: None,
     };
     let deadline = env.now().0 + OP_BUDGET.as_nanos() as u64;
     let mut confirmed = false;
@@ -1673,6 +1674,7 @@ async fn register_cas_client(
         node: target.clone(),
         addrs: colliding_addrs,
         labels: BTreeMap::new(),
+        capacity: None,
     };
     for _ in 0..5 {
         if let Some((_, node)) = leader_slot(&nodes) {

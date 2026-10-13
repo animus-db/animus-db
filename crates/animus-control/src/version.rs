@@ -37,7 +37,7 @@ use crate::meta::Metadata;
 pub type ClusterVersion = u32;
 
 /// The highest cluster version this binary can run at.
-pub const MAX_SUPPORTED: ClusterVersion = 4;
+pub const MAX_SUPPORTED: ClusterVersion = 5;
 
 /// The lowest cluster version this binary can run at.
 ///
@@ -212,6 +212,14 @@ pub enum Gate {
     /// an older voter cannot decode the new variants; apply never branches on
     /// a gate (ADR 0073 decision 4), so the behaviour travels in the entry.
     TxnSealChecked,
+    /// **Per-node capacity** (ADR 0079 section 1): the fourth real version
+    /// gate, opening at cluster version 5. Guards `MetaCommand::SetNodeCapacity`,
+    /// a `RegisterNode` that carries a `capacity`, and the `Metadata::
+    /// node_capacity` map they write (a new snapshot field). The control
+    /// leader's placement passes also read declared capacity only once this
+    /// gate is open (before it every node is weight 100 with no ceiling, i.e.
+    /// today's count balance), so every leader computes the same plan.
+    NodeCapacity,
     /// A **synthetic** version gate `n` (test/sim builds only): opens at
     /// cluster version `n`, ranks `n`. It exists so the gate *ladder*
     /// (several version gates, each opening at its own finalize) can be
@@ -236,6 +244,7 @@ impl Gate {
         Gate::GlobalTables,
         Gate::MrecReplication,
         Gate::TxnSealChecked,
+        Gate::NodeCapacity,
     ];
 
     /// The cluster version at which this gate opens, or `None` for a gate
@@ -253,6 +262,8 @@ impl Gate {
             Gate::MrecReplication => Some(3),
             // ADR 0018 (2026-10-09, R-01): the third real version gate.
             Gate::TxnSealChecked => Some(4),
+            // ADR 0079 (per-node capacity): the fourth real version gate.
+            Gate::NodeCapacity => Some(5),
             #[cfg(any(test, feature = "sim-versions"))]
             Gate::Synthetic(n) => Some(n),
         }
@@ -270,6 +281,7 @@ impl Gate {
             Gate::GlobalTables => 2,
             Gate::MrecReplication => 3,
             Gate::TxnSealChecked => 4,
+            Gate::NodeCapacity => 5,
             #[cfg(any(test, feature = "sim-versions"))]
             Gate::Synthetic(n) => {
                 if n > 1 {
@@ -547,6 +559,8 @@ mod tests {
                 Gate::MrecReplication => Some(3),
                 // ADR 0018 (2026-10-09, R-01): the third.
                 Gate::TxnSealChecked => Some(4),
+                // ADR 0079: the fourth.
+                Gate::NodeCapacity => Some(5),
                 // Never in `ALL` (parametric, test/sim only): see the ladder test.
                 Gate::Synthetic(_) => unreachable!("synthetic gates are not in Gate::ALL"),
             };
@@ -573,9 +587,14 @@ mod tests {
             Gate::MrecReplication.join(Gate::TxnSealChecked),
             Gate::TxnSealChecked
         );
+        assert!(seen.contains(&Gate::NodeCapacity));
         assert_eq!(
-            MAX_SUPPORTED, 4,
-            "the seal-checked txn decision gate (R-01) is the release that takes MAX to 4"
+            Gate::TxnSealChecked.join(Gate::NodeCapacity),
+            Gate::NodeCapacity
+        );
+        assert_eq!(
+            MAX_SUPPORTED, 5,
+            "the per-node capacity gate (ADR 0079) is the release that takes MAX to 5"
         );
         assert_eq!(MIN_SUPPORTED, 1);
         // Declaration order is opening order: ranks are non-decreasing.
@@ -599,6 +618,7 @@ mod tests {
             node,
             addrs,
             labels: Default::default(),
+            capacity: None,
         });
     }
 

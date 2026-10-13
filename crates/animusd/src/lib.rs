@@ -3127,6 +3127,11 @@ pub struct BoundNode {
     /// ADR defaults (100, 600 ms); set from `cluster_settings` via
     /// `with_host_stagger`. `0` disables staggering.
     host_stagger: (usize, Duration),
+    /// ADR 0079 section 1: this node's declared placement capacity, set from
+    /// `cluster_settings.{node_weight,node_max_replicas}` via
+    /// `with_node_capacity` and reconciled into `Metadata` (once
+    /// `Gate::NodeCapacity` is open) by `ClientCtx::sync_node_capacity`.
+    node_capacity: animus_control::Capacity,
     /// MREC peer settings (`cluster_settings.{region,peers,..}`, G-d M3) via `with_mrec`.
     mrec: Arc<crate::mrec_peer::MrecConfig>,
     advertise_host: Option<String>,
@@ -5464,6 +5469,8 @@ fn spawn_common_tail(
     client_route: BTreeMap<NodeId, String>,
     intra_route: BTreeMap<NodeId, String>,
     self_addrs: (NodeId, NodeAddrs, BTreeMap<String, String>),
+    // ADR 0079 section 1: this node's declared placement capacity.
+    node_capacity: animus_control::Capacity,
     // `Arc`-wrapped (issue #1060) — see [`BoundNode::client_listener`]'s own
     // doc for why; `serve_requests` below takes the same type.
     client_listener: Arc<TcpListener>,
@@ -5616,6 +5623,10 @@ fn spawn_common_tail(
                     "animusd: self-registration of {node} found a different registration \
                      already claiming this identity; not retrying"
                 );
+            } else {
+                // ADR 0079 section 1: advertise this node's declared capacity
+                // once the gate is open (a no-op while it matches `Metadata`).
+                ctx.sync_node_capacity(&node, node_capacity).await;
             }
         }));
     }
@@ -5822,6 +5833,14 @@ impl BoundNode {
     #[must_use]
     pub fn with_host_stagger(mut self, unsettled_max: usize, settle_timeout: Duration) -> Self {
         self.host_stagger = (unsettled_max, settle_timeout);
+        self
+    }
+
+    /// Declare this node's placement capacity (ADR 0079 section 1) -- see
+    /// `ClusterSettings::node_weight` / `node_max_replicas`.
+    #[must_use]
+    pub fn with_node_capacity(mut self, capacity: animus_control::Capacity) -> Self {
+        self.node_capacity = capacity;
         self
     }
 
@@ -6408,6 +6427,7 @@ impl BoundNode {
                 },
                 self.labels.clone(),
             ),
+            self.node_capacity,
             self.client_listener,
             self.admin_listener,
             self.intra_listener,
@@ -7075,6 +7095,7 @@ impl Node {
                 animus_cp_data::host::DEFAULT_HOST_UNSETTLED_MAX,
                 animus_cp_data::host::DEFAULT_HOST_SETTLE_TIMEOUT,
             ),
+            node_capacity: animus_control::Capacity::DEFAULT,
             mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             advertise_host: addrs.advertise_host,
             labels: addrs.labels,
@@ -7222,6 +7243,7 @@ impl Node {
                 animus_cp_data::host::DEFAULT_HOST_UNSETTLED_MAX,
                 animus_cp_data::host::DEFAULT_HOST_SETTLE_TIMEOUT,
             ),
+            node_capacity: animus_control::Capacity::DEFAULT,
             mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             advertise_host: addrs.advertise_host,
             labels: addrs.labels,
@@ -8094,6 +8116,7 @@ impl BoundControlNode {
                 },
                 self.labels.clone(),
             ),
+            animus_control::Capacity::DEFAULT, // a control-only node hosts no replicas (ADR 0079)
             self.client_listener,
             self.admin_listener,
             self.intra_listener,
@@ -8270,6 +8293,11 @@ pub struct BoundDataNode {
     /// ADR defaults (100, 600 ms); set from `cluster_settings` via
     /// `with_host_stagger`. `0` disables staggering.
     host_stagger: (usize, Duration),
+    /// ADR 0079 section 1: this node's declared placement capacity, set from
+    /// `cluster_settings.{node_weight,node_max_replicas}` via
+    /// `with_node_capacity` and reconciled into `Metadata` (once
+    /// `Gate::NodeCapacity` is open) by `ClientCtx::sync_node_capacity`.
+    node_capacity: animus_control::Capacity,
     /// MREC peer settings (`cluster_settings.{region,peers,..}`, G-d M3) via `with_mrec`.
     mrec: Arc<crate::mrec_peer::MrecConfig>,
     advertise_host: Option<String>,
@@ -8316,6 +8344,14 @@ impl BoundDataNode {
     #[must_use]
     pub fn with_host_stagger(mut self, unsettled_max: usize, settle_timeout: Duration) -> Self {
         self.host_stagger = (unsettled_max, settle_timeout);
+        self
+    }
+
+    /// Declare this node's placement capacity (ADR 0079 section 1) -- see
+    /// `ClusterSettings::node_weight` / `node_max_replicas`.
+    #[must_use]
+    pub fn with_node_capacity(mut self, capacity: animus_control::Capacity) -> Self {
+        self.node_capacity = capacity;
         self
     }
 
@@ -8690,6 +8726,7 @@ impl BoundDataNode {
                 },
                 self.labels.clone(),
             ),
+            self.node_capacity,
             self.client_listener,
             self.admin_listener,
             self.intra_listener,
@@ -13703,6 +13740,7 @@ mod bootstrap_active_upserts_tests {
             node: nid(1),
             addrs: data_addrs(1),
             labels: labels.clone(),
+            capacity: None,
         });
         // Sanity: the real self-registration apply arm produced the shape the
         // race leaves behind, so the assertion below is about that shape.
@@ -13777,6 +13815,7 @@ mod bootstrap_active_upserts_tests {
             node: nid(9),
             addrs: data_addrs(9),
             labels: BTreeMap::new(),
+            capacity: None,
         });
         assert!(bootstrap_active_upserts(&meta, &[]).is_empty());
         // ...and alongside a declared absent id, only the declared one is
@@ -13813,6 +13852,7 @@ mod bootstrap_active_upserts_tests {
             node: nid(2),
             addrs: data_addrs(2),
             labels: BTreeMap::new(),
+            capacity: None,
         });
         // nid(3): already Active -> skip.
         meta.apply(&MetaCommand::UpsertMember {
@@ -17537,6 +17577,7 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
         .with_campaign_max_inflight(config.campaign_max_inflight())
         .with_lag_stretch_max_x(config.lag_stretch_max_x())
         .with_host_stagger(config.host_unsettled_max(), config.host_settle_timeout())
+        .with_node_capacity(config.node_capacity())
         .with_mrec(
             crate::mrec_peer::MrecConfig::from_cluster(config)
                 .with_node_tls(config.nodes.get(index).and_then(|n| n.tls.clone())),
@@ -17607,6 +17648,7 @@ fn apply_cluster_settings_to_bound(
         .with_campaign_max_inflight(config.campaign_max_inflight())
         .with_lag_stretch_max_x(config.lag_stretch_max_x())
         .with_host_stagger(config.host_unsettled_max(), config.host_settle_timeout())
+        .with_node_capacity(config.node_capacity())
         .with_mrec(
             crate::mrec_peer::MrecConfig::from_cluster(config)
                 .with_node_tls(config.nodes.get(index).and_then(|n| n.tls.clone())),
@@ -18209,6 +18251,7 @@ pub async fn run_node_data_with_cluster_settings(
         .with_campaign_max_inflight(config.campaign_max_inflight())
         .with_lag_stretch_max_x(config.lag_stretch_max_x())
         .with_host_stagger(config.host_unsettled_max(), config.host_settle_timeout())
+        .with_node_capacity(config.node_capacity())
         .with_mrec(
             crate::mrec_peer::MrecConfig::from_cluster(config)
                 .with_node_tls(config.nodes.get(index).and_then(|n| n.tls.clone())),
@@ -18347,6 +18390,7 @@ pub async fn run_node_growth(
         .with_campaign_max_inflight(config.campaign_max_inflight())
         .with_lag_stretch_max_x(config.lag_stretch_max_x())
         .with_host_stagger(config.host_unsettled_max(), config.host_settle_timeout())
+        .with_node_capacity(config.node_capacity())
         .with_mrec(
             crate::mrec_peer::MrecConfig::from_cluster(config)
                 .with_node_tls(config.nodes.get(index).and_then(|n| n.tls.clone())),
@@ -18808,6 +18852,7 @@ async fn register_node_over_wire(
         node: node.clone(),
         addrs: addrs.clone(),
         labels: labels.clone(),
+        capacity: None,
     };
     loop {
         // Best-effort (re-)propose — a relay/leader race just gets retried

@@ -143,6 +143,7 @@ pub(crate) fn era_on_metadata() -> animus_control::Metadata {
             role: "control".into(),
         },
         labels: Default::default(),
+        capacity: None,
     });
     assert_eq!(registered, ApplyOutcome::Applied);
     let reported = m.apply(&MetaCommand::ReportNodeVersion {

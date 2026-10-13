@@ -3499,3 +3499,44 @@ Maintainer decision "pin + document" on #1238.
   `docs/runbook/upgrade.md`, `docs/release.md`, `docs/roadmap.md`, ADR 0060's
   maturity note. The website states no supported-source-release list, so it is
   unchanged.
+
+## Amendment 2026-10-13 — the fourth real gate: `Gate::NodeCapacity`, `MAX_SUPPORTED = 5` (ADR 0079 step 3)
+
+`MAX_SUPPORTED` is now **5** and `Gate::NodeCapacity` (version 5) guards the
+per-node declared capacity of ADR 0079 section 1.
+
+| New shape | Class | Gate | Emit-site / propose-site check |
+|---|---|---|---|
+| `MetaCommand::SetNodeCapacity { node, capacity }` | G (new variant) | `NodeCapacity` | exhaustive `required_gate` row; `RaftNode::propose` refuses it while closed; the node's own `ClientCtx::sync_node_capacity` polls the gate and never proposes through a closed one |
+| `RegisterNode.capacity` (`Option`, `skip_serializing_if`) | G (new field, by content) | `NodeCapacity` when `Some`, `Base` when `None` | the `required_gate` arm classifies by content; a plain registration's bytes are unchanged |
+| `Metadata.node_capacity` (snapshot field), mirror kind `node_capacity` | G (state) / L (mirror row) | follows the command | skipped when empty, so a cluster that declares nothing serializes byte-identically; a reader that does not know the mirror kind ignores the row |
+| `cluster_settings.node_weight` / `node_max_replicas`, `--node-weight` / `--node-max-replicas` | F-adjacent, additive | none | optional, skipped when unset; the frozen `ClusterConfig` v1 fixture is untouched |
+| `GET /admin/capacity`, `animus cluster capacity` | not a format | none | additive |
+
+- **Placement reads capacity from the replicated cluster version, not from a
+  node-local `ClusterFeatures` handle.** `Metadata::effective_capacities()`
+  returns the declared map only when the metadata's own cluster version is at
+  least 5 (empty otherwise, and empty also when nothing is declared, which
+  selects the original, non-`_with_load` placement functions). The control
+  leader's repair, rebalance, directed-Placing and the apply-time `CutoverSplit`
+  target are all pure functions of `Metadata`, so every replica computes the
+  same answer; a node-local handle that opened a tick early would not.
+- **Fixtures (new, none edited):** `metadata/v1-capacity.json` (a registration
+  carrying a capacity, a `SetNodeCapacity`, finalized to 5) and
+  `mirror-entities/node_capacity/v1.json`. `capacity_wire_shapes_are_pinned`
+  freezes the JSON of the plain and capacity-carrying `RegisterNode` and of
+  `SetNodeCapacity` byte for byte (no new `control-wal` fixture: the existing
+  v1/v2 ones still decode and no tag moved). No version tag moved.
+- `BinaryProfile::Release(5)` is `[4, 5]` in the simulated model; the per-gate
+  acceptance matrix gained a `Release(5)` column and `content_gate` names
+  `SetNodeCapacity` and a capacity-carrying `RegisterNode` independently of
+  `required_gate`.
+- **Cells.** `sim_cluster_mixed_version_corpus::release4_to_release5_node_capacity_gate`:
+  the data-only node's capacity-sync task is already running when the cluster
+  is still at 4 (half-rolled, the finalize to 5 refused by name); nothing is
+  proposed or applied until the finalize opens the gate mid-run, then the same
+  task completes and the capacity lands on every replica, the data-only mirror
+  included. `negative_control_node_capacity_gate_emitted_early` (N7): the
+  ungated emit must wedge exactly the `Release(4)` voter. The pure tier is
+  `animus-control` `node_capacity::` (apply matrix, gate rows, placement reads
+  capacity only once open, `max_replicas` binding and the over-cap drain).

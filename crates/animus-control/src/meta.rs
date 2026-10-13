@@ -14,8 +14,9 @@ use animus_env::NodeId;
 #[cfg(test)]
 use animus_env::nid;
 use animus_placement::{
-    Candidate, PlacementPolicy, rebalance_plan, rebalance_step, replan, replan_pinned,
-    replan_repair, select_replicas,
+    Candidate, Capacity, PlacementPolicy, rebalance_plan, rebalance_step, replan, replan_pinned,
+    replan_pinned_with_load, replan_repair, replan_repair_with_load, replan_with_load,
+    select_replicas, select_replicas_balanced,
 };
 use animus_tablet::{
     Epoch, InPlaceSplitIntent, KeyRange, SplitChild, TOKEN_BYTES, Tablet, TabletId, TabletState,
@@ -597,6 +598,18 @@ pub struct Metadata {
     /// [`MetaCommand::RemoveMember`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub node_versions: BTreeMap<NodeId, NodeVersion>,
+    /// **Declared per-node capacity** (ADR 0079 section 1, `Gate::NodeCapacity`),
+    /// keyed by data-plane member. Holds only **non-default** capacities: a
+    /// node that declares nothing (or declares exactly [`Capacity::DEFAULT`])
+    /// has no entry, so a cluster that never sets a capacity serializes
+    /// byte-identically to one from before the field existed. A separate map
+    /// rather than a `Member` field for the reason `node_versions` is one:
+    /// `UpsertMember`'s apply replaces the whole `Member` row (a failure-
+    /// detector flip would erase it). Pruned by [`MetaCommand::RemoveMember`].
+    /// Placement reads it through [`Metadata::capacity_of`] only when the
+    /// gate is open (see [`Metadata::placement_capacity`]).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub node_capacity: BTreeMap<NodeId, Capacity>,
     /// The raw replicated cluster version (ADR 0073 Phase 2): `0`/absent
     /// means the era is off and reads as `1` — use
     /// [`cluster_version`](Self::cluster_version). Also the sticky **era
@@ -752,6 +765,7 @@ impl Default for Metadata {
             exports: Default::default(),
             imports: Default::default(),
             node_versions: Default::default(),
+            node_capacity: Default::default(),
             cluster_version: 0,
         }
     }
@@ -2760,7 +2774,22 @@ pub enum MetaCommand {
         node: NodeId,
         addrs: NodeAddrs,
         labels: BTreeMap<String, String>,
+        /// The node's declared capacity (ADR 0079 section 1), **fill-if-empty**
+        /// like `labels`: written only while the node has no capacity on file
+        /// (later changes go through [`MetaCommand::SetNodeCapacity`]). `None`
+        /// (the default, and what every node emits while `Gate::NodeCapacity`
+        /// is closed) keeps the command's JSON byte-identical to before; a
+        /// `Some` requires the gate (an older voter would reject the unknown
+        /// field or drop it silently).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        capacity: Option<Capacity>,
     },
+    /// **Gated (`Gate::NodeCapacity`, ADR 0079 section 1)**: set `node`'s
+    /// declared capacity. Idempotent (`NoOp` when it already holds), rejected
+    /// for a node that is not a data-plane member (like `RegisterNodeAddrs`
+    /// for an unknown node) and for a zero weight. Setting
+    /// [`Capacity::DEFAULT`] removes the entry (the canonical form).
+    SetNodeCapacity { node: NodeId, capacity: Capacity },
     /// **Era-only (ADR 0073 Phase 2, P2-A)**: record `node`'s supported
     /// cluster-version range and build. Rejected if `node` is not in
     /// [`Metadata::required_version_set`], if `range` is invalid
@@ -3259,6 +3288,11 @@ pub struct PlacementView {
     /// third phase needs it alongside `tablets`/`policies` to know which
     /// un-`done` children still need converging.
     pub split_placing: BTreeMap<TabletId, SplitPlacing>,
+    /// The **effective** declared capacities (ADR 0079): `Metadata::
+    /// node_capacity` when `Gate::NodeCapacity` is open at the source's
+    /// cluster version, else empty (every node weight 100, no ceiling: today's
+    /// count balance). Empty also when nobody declared anything.
+    pub capacity: BTreeMap<NodeId, Capacity>,
     /// The source `Metadata`'s [`placement_rev`](Metadata::placement_rev) when
     /// this view was cloned (see [`PlacementRev`] for what it can be compared
     /// with).
@@ -3285,6 +3319,7 @@ impl PlacementView {
     ) -> Vec<MetaCommand> {
         reconcile_placement(
             &self.members,
+            &self.capacity,
             &self.tablets,
             &self.policies,
             &self.split_placing,
@@ -3304,6 +3339,7 @@ impl PlacementView {
     ) -> Option<MetaCommand> {
         rebalance_placement(
             &self.members,
+            &self.capacity,
             &self.tablets,
             &self.policies,
             &self.split_placing,
@@ -3327,6 +3363,7 @@ impl PlacementView {
     ) -> Vec<MetaCommand> {
         rebalance_placement_batch(
             &self.members,
+            &self.capacity,
             &self.tablets,
             &self.policies,
             &self.split_placing,
@@ -3344,6 +3381,7 @@ impl PlacementView {
     pub fn split_placing_reconcile(&self, retarget_ready: &BTreeSet<TabletId>) -> Vec<MetaCommand> {
         split_placing_reconcile(
             &self.members,
+            &self.capacity,
             &self.tablets,
             &self.policies,
             &self.split_placing,
@@ -3356,12 +3394,33 @@ impl PlacementView {
 /// Liveness is the control plane's job (ADR 0005): only `Active` members are
 /// offered to the placement engine, which then enforces *policy* (residency
 /// + spread). Iteration is over a `BTreeMap`, so the order is deterministic.
-fn active_candidates(members: &BTreeMap<NodeId, Member>) -> Vec<Candidate> {
+fn active_candidates(
+    members: &BTreeMap<NodeId, Member>,
+    capacity: &BTreeMap<NodeId, Capacity>,
+) -> Vec<Candidate> {
     members
         .iter()
         .filter(|(_, m)| m.status == NodeStatus::Active)
-        .map(|(id, m)| Candidate::new(id.clone(), m.labels.clone()))
+        .map(|(id, m)| candidate_of(id, m, capacity))
         .collect()
+}
+
+/// One placement candidate with its (effective) declared capacity.
+fn candidate_of(id: &NodeId, m: &Member, capacity: &BTreeMap<NodeId, Capacity>) -> Candidate {
+    Candidate::new(id.clone(), m.labels.clone())
+        .with_capacity(capacity.get(id).copied().unwrap_or(Capacity::DEFAULT))
+}
+
+/// Replicas hosted per node across every tablet (voters and learners are one
+/// set here), the `load` input of the `*_with_load` placement functions.
+fn replica_load(tablets: &BTreeMap<TabletId, Tablet>) -> BTreeMap<NodeId, usize> {
+    let mut load: BTreeMap<NodeId, usize> = BTreeMap::new();
+    for t in tablets.values() {
+        for r in &t.replicas {
+            *load.entry(r.clone()).or_insert(0) += 1;
+        }
+    }
+    load
 }
 
 /// The shared body of [`Metadata::reconcile`] / [`PlacementView::reconcile`]: a
@@ -3398,13 +3457,15 @@ fn active_candidates(members: &BTreeMap<NodeId, Member>) -> Vec<Candidate> {
 /// evicts it.
 fn reconcile_placement(
     members: &BTreeMap<NodeId, Member>,
+    capacity: &BTreeMap<NodeId, Capacity>,
     tablets: &BTreeMap<TabletId, Tablet>,
     policies: &BTreeMap<TabletId, PlacementPolicy>,
     split_placing: &BTreeMap<TabletId, SplitPlacing>,
     recently_done: &BTreeSet<TabletId>,
     recently_down: &BTreeSet<NodeId>,
 ) -> Vec<MetaCommand> {
-    let candidates = active_candidates(members);
+    let candidates = active_candidates(members, capacity);
+    let load = (!capacity.is_empty()).then(|| replica_load(tablets));
     policies
         .iter()
         .filter_map(|(tablet, policy)| {
@@ -3438,11 +3499,7 @@ fn reconcile_placement(
                 .replicas
                 .iter()
                 .filter(|r| recently_down.contains(r))
-                .filter_map(|r| {
-                    members
-                        .get(r)
-                        .map(|m| Candidate::new(r.clone(), m.labels.clone()))
-                })
+                .filter_map(|r| members.get(r).map(|m| candidate_of(r, m, capacity)))
                 .collect();
             // `replan_repair`, not plain `replan` (issue #957): this is the
             // repair pass, so a policy RF the current candidate pool can't
@@ -3459,12 +3516,16 @@ fn reconcile_placement(
             // A pinned region with no eligible node is an `Err` here (no
             // command): the replica waits for its region rather than moving
             // to another.
-            let repair = |pool: &[Candidate]| {
-                if policy.is_pinned() {
-                    replan_pinned(&t.replicas, pool, policy)
-                } else {
-                    replan_repair(&t.replicas, pool, policy)
-                }
+            //
+            // ADR 0079: once capacity is declared (and the gate open) the
+            // `*_with_load` forms honour `max_replicas` (a full node is never
+            // recruited, a held replica is never dropped). Without declared
+            // capacity the original functions run, byte-identical to before.
+            let repair = |pool: &[Candidate]| match (&load, policy.is_pinned()) {
+                (None, true) => replan_pinned(&t.replicas, pool, policy),
+                (None, false) => replan_repair(&t.replicas, pool, policy),
+                (Some(l), true) => replan_pinned_with_load(&t.replicas, pool, policy, l),
+                (Some(l), false) => replan_repair_with_load(&t.replicas, pool, policy, l),
             };
             let desired = if dwelling.is_empty() {
                 repair(&candidates).ok()?
@@ -3524,13 +3585,14 @@ fn reconcile_placement(
 /// leaving alone.
 fn rebalance_placement(
     members: &BTreeMap<NodeId, Member>,
+    capacity: &BTreeMap<NodeId, Capacity>,
     tablets: &BTreeMap<TabletId, Tablet>,
     policies: &BTreeMap<TabletId, PlacementPolicy>,
     split_placing: &BTreeMap<TabletId, SplitPlacing>,
     recently_done: &BTreeSet<TabletId>,
     _recently_down: &BTreeSet<NodeId>,
 ) -> Option<MetaCommand> {
-    let candidates = active_candidates(members);
+    let candidates = active_candidates(members, capacity);
     let entries = rebalance_entries(tablets, policies, split_placing, recently_done);
     let (tablet, replicas) = rebalance_step(&entries, &candidates)?;
     let epoch = tablets.get(&tablet)?.epoch;
@@ -3548,13 +3610,14 @@ fn rebalance_placement(
 /// matching `CasTabletReplicas`'s apply-time epoch bump.
 fn rebalance_placement_batch(
     members: &BTreeMap<NodeId, Member>,
+    capacity: &BTreeMap<NodeId, Capacity>,
     tablets: &BTreeMap<TabletId, Tablet>,
     policies: &BTreeMap<TabletId, PlacementPolicy>,
     split_placing: &BTreeMap<TabletId, SplitPlacing>,
     recently_done: &BTreeSet<TabletId>,
     max_moves: usize,
 ) -> Vec<MetaCommand> {
-    let candidates = active_candidates(members);
+    let candidates = active_candidates(members, capacity);
     let entries = rebalance_entries(tablets, policies, split_placing, recently_done);
     let mut epochs: BTreeMap<TabletId, Epoch> = BTreeMap::new();
     let mut out = Vec::new();
@@ -3656,12 +3719,14 @@ fn rebalance_entries<'a>(
 /// behind an unrelated split's own convergence.
 fn split_placing_reconcile(
     members: &BTreeMap<NodeId, Member>,
+    capacity: &BTreeMap<NodeId, Capacity>,
     tablets: &BTreeMap<TabletId, Tablet>,
     policies: &BTreeMap<TabletId, PlacementPolicy>,
     split_placing: &BTreeMap<TabletId, SplitPlacing>,
     retarget_ready: &BTreeSet<TabletId>,
 ) -> Vec<MetaCommand> {
-    let candidates = active_candidates(members);
+    let candidates = active_candidates(members, capacity);
+    let load = (!capacity.is_empty()).then(|| replica_load(tablets));
     let active: BTreeSet<NodeId> = candidates.iter().map(|c| c.node.clone()).collect();
     split_placing
         .iter()
@@ -3682,7 +3747,11 @@ fn split_placing_reconcile(
                     }
                 }
                 Some(target) if retarget_ready.contains(&child) => {
-                    let fresh = replan(target, &candidates, policy).ok()?;
+                    let fresh = match &load {
+                        None => replan(target, &candidates, policy),
+                        Some(l) => replan_with_load(target, &candidates, policy, l),
+                    }
+                    .ok()?;
                     if Some(&fresh) == entry.target.as_ref() {
                         None
                     } else {
@@ -3695,7 +3764,11 @@ fn split_placing_reconcile(
                 }
                 Some(_) => None, // paused: dwelling on a down target member
                 None => {
-                    let fresh = select_replicas(&candidates, policy).ok()?;
+                    let fresh = match &load {
+                        None => select_replicas(&candidates, policy),
+                        Some(l) => select_replicas_balanced(&candidates, policy, l),
+                    }
+                    .ok()?;
                     Some(MetaCommand::RetargetSplitPlacing {
                         tablet: child,
                         expected_epoch: t.epoch,
@@ -3717,6 +3790,7 @@ impl Metadata {
             tablets: self.tablets.clone(),
             policies: self.policies.clone(),
             split_placing: self.split_placing.clone(),
+            capacity: self.effective_capacities(),
             rev: self.placement_rev.0,
         }
     }
@@ -3799,6 +3873,7 @@ impl Metadata {
     ) -> Vec<MetaCommand> {
         reconcile_placement(
             &self.members,
+            &self.effective_capacities(),
             &self.tablets,
             &self.policies,
             &self.split_placing,
@@ -3836,6 +3911,7 @@ impl Metadata {
     ) -> Option<MetaCommand> {
         rebalance_placement(
             &self.members,
+            &self.effective_capacities(),
             &self.tablets,
             &self.policies,
             &self.split_placing,
@@ -3859,6 +3935,7 @@ impl Metadata {
     ) -> Vec<MetaCommand> {
         rebalance_placement_batch(
             &self.members,
+            &self.effective_capacities(),
             &self.tablets,
             &self.policies,
             &self.split_placing,
@@ -3891,6 +3968,7 @@ impl Metadata {
     pub fn split_placing_reconcile(&self, retarget_ready: &BTreeSet<TabletId>) -> Vec<MetaCommand> {
         split_placing_reconcile(
             &self.members,
+            &self.effective_capacities(),
             &self.tablets,
             &self.policies,
             &self.split_placing,
@@ -4186,7 +4264,11 @@ impl Metadata {
                 // same candidate pool every child below is measured
                 // against, computed once rather than per child (the
                 // active-member set doesn't change mid-apply).
-                let candidates = active_candidates(&self.members);
+                let capacity = self.effective_capacities();
+                let candidates = active_candidates(&self.members, &capacity);
+                // Counted before the children are inserted: both inherit the
+                // parent's replicas, so the load is the pre-fork one.
+                let load = (!capacity.is_empty()).then(|| replica_load(&self.tablets));
                 for (child, range) in [
                     (&intent.children[0], left_range),
                     (&intent.children[1], right_range),
@@ -4213,7 +4295,11 @@ impl Metadata {
                     // own "no policy, no automatic placement" rule — no
                     // `split_placing` entry either.
                     if let Some(policy) = &policy {
-                        match select_replicas(&candidates, policy) {
+                        let wanted = match &load {
+                            None => select_replicas(&candidates, policy),
+                            Some(l) => select_replicas_balanced(&candidates, policy, l),
+                        };
+                        match wanted {
                             // Already satisfying the freshest placement
                             // decision at fork time: no entry at all —
                             // there is nothing for a directed-Placing
@@ -5693,7 +5779,8 @@ impl Metadata {
                     // node never blocks `FinalizeClusterVersion`.
                     let had_addrs = self.node_addrs.remove(node).is_some();
                     let had_version = self.node_versions.remove(node).is_some();
-                    if had_addrs || had_version {
+                    let had_capacity = self.node_capacity.remove(node).is_some();
+                    if had_addrs || had_version || had_capacity {
                         return ApplyOutcome::Applied;
                     }
                     return ApplyOutcome::NoOp;
@@ -5707,6 +5794,7 @@ impl Metadata {
                 self.members.remove(node);
                 self.node_addrs.remove(node);
                 self.node_versions.remove(node);
+                self.node_capacity.remove(node);
                 ApplyOutcome::Applied
             }
             MetaCommand::ReportNodeVersion { node, range, build } => {
@@ -5783,10 +5871,35 @@ impl Metadata {
                 self.cluster_version = *target;
                 ApplyOutcome::Applied
             }
+            MetaCommand::SetNodeCapacity { node, capacity } => {
+                if !self.members.contains_key(node) {
+                    return ApplyOutcome::Rejected(
+                        "node id not a data-plane member — register it via \
+                         MetaCommand::RegisterNode first",
+                    );
+                }
+                if capacity.weight == 0 {
+                    return ApplyOutcome::Rejected("capacity weight must be at least 1");
+                }
+                if *capacity == Capacity::DEFAULT {
+                    return if self.node_capacity.remove(node).is_some() {
+                        ApplyOutcome::Applied
+                    } else {
+                        ApplyOutcome::NoOp
+                    };
+                }
+                if self.node_capacity.get(node) == Some(capacity) {
+                    ApplyOutcome::NoOp
+                } else {
+                    self.node_capacity.insert(node.clone(), *capacity);
+                    ApplyOutcome::Applied
+                }
+            }
             MetaCommand::RegisterNode {
                 node,
                 addrs,
                 labels,
+                capacity,
             } => {
                 // The CAS is keyed on `node_addrs` alone, not `members` —
                 // membership can legitimately already exist via a wholly
@@ -5842,9 +5955,18 @@ impl Metadata {
                                     has_activated: false,
                                 },
                             );
+                            if claims_membership {
+                                self.fill_node_capacity(node, capacity.as_ref());
+                            }
                             return ApplyOutcome::Applied;
                         }
-                        if claims_membership && fill_empty_labels(&mut self.members, node, labels) {
+                        // Both fills run (no short-circuit) so one registration
+                        // can land labels and capacity together.
+                        let labelled =
+                            claims_membership && fill_empty_labels(&mut self.members, node, labels);
+                        let sized =
+                            claims_membership && self.fill_node_capacity(node, capacity.as_ref());
+                        if labelled || sized {
                             return ApplyOutcome::Applied;
                         }
                         ApplyOutcome::NoOp
@@ -5874,11 +5996,79 @@ impl Metadata {
                         } else if claims_membership {
                             fill_empty_labels(&mut self.members, node, labels);
                         }
+                        if claims_membership {
+                            self.fill_node_capacity(node, capacity.as_ref());
+                        }
                         ApplyOutcome::Applied
                     }
                 }
             }
         }
+    }
+
+    /// `RegisterNode`'s fill-if-empty capacity write: record `capacity` for
+    /// `node` iff it is `Some`, valid (weight at least 1), non-default, and the
+    /// node has none on file. Returns whether anything changed.
+    fn fill_node_capacity(&mut self, node: &NodeId, capacity: Option<&Capacity>) -> bool {
+        match capacity {
+            Some(c)
+                if c.weight >= 1
+                    && *c != Capacity::DEFAULT
+                    && !self.node_capacity.contains_key(node) =>
+            {
+                self.node_capacity.insert(node.clone(), *c);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// `node`'s declared capacity (ADR 0079 section 1): its `node_capacity`
+    /// entry, else [`Capacity::DEFAULT`]. Ignores the gate; the placement
+    /// passes use [`placement_capacity`](Self::placement_capacity).
+    #[must_use]
+    pub fn capacity_of(&self, node: &NodeId) -> Capacity {
+        self.node_capacity
+            .get(node)
+            .copied()
+            .unwrap_or(Capacity::DEFAULT)
+    }
+
+    /// The capacity placement is allowed to see for `node`: its declared
+    /// capacity iff `Gate::NodeCapacity` is open at this metadata's own cluster
+    /// version, else [`Capacity::DEFAULT`] (today's count balance, exactly).
+    /// Derived from the replicated version, never a node-local handle, so every
+    /// replica of a pure placement function computes the same answer (ADR 0079
+    /// compatibility table).
+    #[must_use]
+    pub fn placement_capacity(&self, node: &NodeId) -> Capacity {
+        if self.capacity_gate_open() {
+            self.capacity_of(node)
+        } else {
+            Capacity::DEFAULT
+        }
+    }
+
+    /// The capacities the placement passes are allowed to see (ADR 0079):
+    /// `node_capacity` once the gate is open, else empty. Empty means "every
+    /// node is [`Capacity::DEFAULT`]", which the passes treat as today's
+    /// behaviour exactly.
+    #[must_use]
+    pub fn effective_capacities(&self) -> BTreeMap<NodeId, Capacity> {
+        if self.capacity_gate_open() {
+            self.node_capacity.clone()
+        } else {
+            BTreeMap::new()
+        }
+    }
+
+    /// Whether `Gate::NodeCapacity` is open at this metadata's cluster version.
+    #[must_use]
+    pub fn capacity_gate_open(&self) -> bool {
+        self.versioning_active()
+            && crate::version::Gate::NodeCapacity
+                .version()
+                .is_some_and(|v| self.cluster_version() >= v)
     }
 
     /// The schema registered for `table`, if any (ADR 0013). A read accessor for
@@ -6971,7 +7161,6 @@ impl crate::version::GatedCommand for MetaCommand {
             | MetaCommand::ExpirePitrSegments { .. }
             | MetaCommand::RegisterNodeAddrs { .. }
             | MetaCommand::RemoveMember { .. }
-            | MetaCommand::RegisterNode { .. }
             | MetaCommand::BeginBackup { .. }
             | MetaCommand::RecordBackupTabletComplete { .. }
             | MetaCommand::CompleteBackup { .. }
@@ -6990,6 +7179,14 @@ impl crate::version::GatedCommand for MetaCommand {
             | MetaCommand::PutCredential { .. }
             | MetaCommand::RotateCredential { .. }
             | MetaCommand::RevokeCredential { .. } => Gate::Base,
+            // ADR 0079: the capacity field of a registration is classified by
+            // content (a plain registration stays Base, byte-identical), the
+            // dedicated command always needs the gate.
+            MetaCommand::RegisterNode {
+                capacity: Some(_), ..
+            }
+            | MetaCommand::SetNodeCapacity { .. } => Gate::NodeCapacity,
+            MetaCommand::RegisterNode { capacity: None, .. } => Gate::Base,
             // ADR 0075 (G-01 stage G-c): the first real gate. An older voter
             // cannot decode the variant nor the `TableSchema.global` /
             // `PlacementPolicy.allowed_values` fields it writes.
@@ -11779,6 +11976,7 @@ mod tests {
                 role: "control".to_string(),
             },
             labels: BTreeMap::new(),
+            capacity: None,
         });
         assert!(m.node_addrs.contains_key(&nid(301)));
         assert!(
@@ -11909,6 +12107,7 @@ mod tests {
                 role: "combined".to_string(),
             },
             labels: BTreeMap::new(),
+            capacity: None,
         });
         // Shape 2: a control-role claim-without-member — a candidate too.
         m.apply(&MetaCommand::RegisterNode {
@@ -11921,6 +12120,7 @@ mod tests {
                 role: "control".to_string(),
             },
             labels: BTreeMap::new(),
+            capacity: None,
         });
         // A member that activated, then went Down — NOT a candidate
         // (`has_activated` guard).
@@ -11956,6 +12156,7 @@ mod tests {
                 role: "combined".to_string(),
             },
             labels: BTreeMap::new(),
+            capacity: None,
         });
         m.apply(&MetaCommand::CreateTablet {
             tablet: TabletId(1),
@@ -12202,6 +12403,7 @@ mod tests {
                 node: nid(900),
                 addrs: cas_addrs(0),
                 labels: labels.clone(),
+                capacity: None,
             }),
             ApplyOutcome::Applied
         );
@@ -12231,6 +12433,7 @@ mod tests {
                 // Non-empty: G-a's fill-in only ever labels an *unlabelled*
                 // row, so a differing later label set must stay a NoOp.
                 labels: [("region".to_owned(), "us-east".to_owned())].into(),
+                capacity: None,
             }),
             ApplyOutcome::Applied
         );
@@ -12242,6 +12445,7 @@ mod tests {
                 node: nid(901),
                 addrs: cas_addrs(2),
                 labels: BTreeMap::new(),
+                capacity: None,
             }),
             ApplyOutcome::Rejected("node id already claimed by a different registration")
         );
@@ -12259,6 +12463,7 @@ mod tests {
                 node: nid(901),
                 addrs: cas_addrs(1),
                 labels: other_labels,
+                capacity: None,
             }),
             ApplyOutcome::NoOp
         );
@@ -12273,6 +12478,7 @@ mod tests {
                 node: nid(902),
                 addrs: cas_addrs(2),
                 labels: BTreeMap::new(),
+                capacity: None,
             }),
             ApplyOutcome::Applied
         );
@@ -12293,6 +12499,7 @@ mod tests {
             node: nid(903),
             addrs: cas_addrs(3),
             labels: labels.clone(),
+            capacity: None,
         };
         assert_eq!(m.apply(&cmd), ApplyOutcome::Applied);
         let after_first = m.clone();
@@ -12328,6 +12535,7 @@ mod tests {
                 node: nid(904),
                 addrs: cas_addrs(4),
                 labels,
+                capacity: None,
             }),
             ApplyOutcome::NoOp
         );
@@ -12368,6 +12576,7 @@ mod tests {
                 // Deliberately different/empty labels — proving they never
                 // clobber the labels `UpsertMember` already set.
                 labels: BTreeMap::new(),
+                capacity: None,
             }),
             ApplyOutcome::Applied
         );
@@ -12404,6 +12613,7 @@ mod tests {
                 node: nid(906),
                 addrs: cas_addrs(6),
                 labels: zone("a"),
+                capacity: None,
             }),
             ApplyOutcome::Applied
         );
@@ -12417,6 +12627,7 @@ mod tests {
                 node: nid(906),
                 addrs: cas_addrs(6),
                 labels: zone("b"),
+                capacity: None,
             }),
             ApplyOutcome::NoOp
         );
@@ -12428,12 +12639,14 @@ mod tests {
             node: nid(907),
             addrs: cas_addrs(7),
             labels: BTreeMap::new(),
+            capacity: None,
         });
         assert_eq!(
             m.apply(&MetaCommand::RegisterNode {
                 node: nid(907),
                 addrs: cas_addrs(7),
                 labels: zone("c"),
+                capacity: None,
             }),
             ApplyOutcome::Applied
         );
@@ -12465,6 +12678,7 @@ mod tests {
             node: nid(910),
             addrs: cas_addrs(10),
             labels: zone("a"),
+            capacity: None,
         });
         // The stale promotion now applies.
         assert_eq!(
@@ -12516,6 +12730,7 @@ mod tests {
                 node: nid(906),
                 addrs: control_addrs.clone(),
                 labels: BTreeMap::new(),
+                capacity: None,
             }),
             ApplyOutcome::Applied
         );
@@ -12531,6 +12746,7 @@ mod tests {
                 node: nid(906),
                 addrs: control_addrs,
                 labels: BTreeMap::new(),
+                capacity: None,
             }),
             ApplyOutcome::NoOp
         );
@@ -12568,6 +12784,7 @@ mod tests {
                 node: nid(907),
                 addrs: original.clone(),
                 labels: BTreeMap::new(),
+                capacity: None,
             }),
             ApplyOutcome::Applied
         );
