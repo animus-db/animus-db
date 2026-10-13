@@ -425,3 +425,61 @@ section named). Class **L** as classified: no wire or replicated change, no gate
   (with the rest of the operator derivation), the Tier 1 cell 3 "control (a)"
   collapse arm (belongs with steps 5-7), and a `SimCluster` hook for the C-17
   `awake_hwm` line.
+
+## Implementation step 5 as built (2026-10-13): background budget
+
+Classification: **L** throughout (no wire shape, no replicated state, no durable
+format; a refused snapshot chunk is simply not acknowledged, as step 3 decided).
+No `Gate`.
+
+- **Mechanism.** `animus_cp_data::background_budget` (`BackgroundBudget`,
+  `BgPermit`, `BgFlow`, `SplitPermits`, `BudgetSizes`, `BudgetFault`): one
+  synchronous, `Env`-seam-clean budget per physical node, shared by `Arc` with
+  the hosted groups (a per-group `BgFlow` filters inbound `InstallSnapshot`
+  chunks / learner traffic and outbound snapshot chunks in the raftkv driver),
+  with the split path (`ClientCtx::trigger_split`, auto-split sweeps skip a
+  tablet whose pool is full and ask again next sweep; a manual split gets the
+  retryable `SPLIT_BUSY`) and with the tablet engines (`animus-storage`
+  `CompactionGate`, installed by `LsmTabletFactory`). Permits are RAII (error,
+  cancel, drop all return them) and may carry an idle TTL that a full pool reaps
+  lazily at the next acquire (no timer). Effective sizes follow node scheduling
+  lag through the shared `scale_by_lag` and are never below 1.
+- **Defaults.** Snapshot send 2 and receive 2 (`--bg-snapshot-streams`), learner
+  catch-up 4 (`--bg-catchup-learners`) and splits 1 (`--bg-splits`) are **on by
+  default**; compactions (`--bg-compactions`) default to `max(1, cores/2)` when
+  `--cores` is set and to **off** (today's behaviour) when it is not. `0` turns
+  any pool off. Each flag has a `cluster_settings.bg_*` mirror, node-local, like
+  step 4's `cores`.
+- **L0 bypass.** An engine whose L0 holds `>= 2 x compaction_trigger` tables is
+  granted a compaction slot over the cap (counted in `BgCompactionOvercap`); a
+  deferred engine re-asks every `COMPACTION_DEFER_RETRY` (100 ms, one pending
+  retry per engine). Issue #1300 (a storage-level L0 write stall / compaction IO
+  limit) is untouched.
+- **The unacknowledged-transfer bound.** A receiver with a full pool refuses by
+  not acknowledging the first chunk (step 3). The sender releases its send permit
+  when a transfer sits unacknowledged for `snapshot_unacked_bound(heartbeat) =
+  heartbeat * 2 * SNAPSHOT_HEARTBEAT_BACKOFF_MAX_TICKS` (64 ticks): by then the
+  existing backoff (gaps 1, 2, 4 .. 32, then every 32nd tick) has offered the
+  first chunk about seven times, so silence means a dead, partitioned or refusing
+  receiver. The released peer sits out one further bound before it may ask again,
+  so a never-ready receiver cannot starve the other sends. The receiver's own slot
+  (and a learner's catch-up slot) is reaped after twice that bound of leader
+  silence. Both bounds derive from the existing timing constants; none is new
+  wall-clock state.
+- **Observability.** Metrics `BgPermitInflight{Pool}` (gauge + hwm),
+  `BgPermitDeferred{Pool}`, `BgCompactionOvercap`; `/admin/health` gains a
+  `bg_permits` object (per pool `inflight`/`hwm`/`deferred`, plus
+  `compaction_overcap`) beside step 4's awake fields. `SimCluster` runs with every
+  pool off.
+- **Corpus** (`density_admission_corpus.rs`, `ANIMUS_DENSITY_SEEDS`): cell 6
+  (snapshot storm: send/receive high-water within the pools, every group
+  converges), **6b** (an unacknowledged transfer releases its permit within the
+  bound and the next group's learner is served), cell 7 (split storm: at most one
+  split in progress, all complete), cell 8 (compaction under write load: pool
+  cap held, L0 bounded, bypass counted). Negative controls are named
+  `control_bg_*` so they do not clash with the step 4 control (d) (lost-leader
+  bypass): **bg_d** (`LeakPermits`, ADR control (d): the catch-up pool fills with
+  never-returned permits and learners starve), **bg_d2** (`NoIdleBound`: a dead
+  receiver keeps the only send slot, the next group starves), **bg_e**
+  (`PoolMinZero`, ADR control (e): a pool allowed to reach 0 under lag stalls
+  compaction). Each asserts the oracle FAILS with its mechanism off.

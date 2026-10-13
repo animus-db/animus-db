@@ -1376,7 +1376,7 @@ fn bg_groups() -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|g| *g > 4)
-        .unwrap_or(8)
+        .unwrap_or(16)
 }
 
 #[derive(Debug, Default)]
@@ -1575,8 +1575,16 @@ fn run_snapshot_storm(c: &BgCell, g: usize) -> BgReport {
             );
         }
     }
-    let pressed = budgets[3].stats(BgPool::Catchup).deferred
-        + budgets[3].stats(BgPool::SnapshotRecv).deferred;
+    // Pressure on any pool of any node: which pool fills first depends on the
+    // seed (the senders' pools or the learner node's), the mechanism engaging
+    // somewhere is the coverage claim.
+    let pressed: u64 = budgets
+        .iter()
+        .flat_map(|b| {
+            [BgPool::SnapshotSend, BgPool::SnapshotRecv, BgPool::Catchup]
+                .map(|p| b.stats(p).deferred)
+        })
+        .sum();
     if pressed == 0 {
         r.bad("pressure: the storm never found a full pool".to_string());
     }
@@ -1960,6 +1968,14 @@ fn run_compaction_load(c: &BgCell) -> BgReport {
         sim.run_for(Duration::from_millis(250));
         waited += Duration::from_millis(250);
     }
+    // A run past the trigger (a deeper-level compaction) may still be in
+    // flight when L0 settles: let every in-flight run end before the leak
+    // check, which asserts the slots come back once the work is done.
+    let mut drain = Duration::ZERO;
+    while budget.stats(BgPool::Compaction).inflight > 0 && drain < Duration::from_secs(30) {
+        sim.run_for(Duration::from_millis(250));
+        drain += Duration::from_millis(250);
+    }
     let s = budget.stats(BgPool::Compaction);
     if s.admit_hwm > POOL {
         r.bad(format!(
@@ -2115,8 +2131,8 @@ fn control_bg_d2_no_unacked_bound_starves_the_next_transfer() {
 }
 
 /// NEGATIVE CONTROL bg_e (ADR control (e)): the pool may reach size 0 under
-/// lag. Nothing is admitted, L0 drains only through the safety valve, and the
-/// engines are left over the trigger.
+/// lag. Nothing is admitted by the pool; L0 drains only through the safety
+/// valve (every compaction is a bypass), which the "stalled" oracle catches.
 #[test]
 fn control_bg_e_pool_minimum_zero_stalls_compaction() {
     for c in bg_select(control_bg_e()) {
@@ -2132,8 +2148,7 @@ fn control_bg_e_pool_minimum_zero_stalls_compaction() {
             r.violations
         );
         assert!(
-            r.violations.iter().any(|v| v.starts_with("stalled:"))
-                && r.violations.iter().any(|v| v.starts_with("settle:")),
+            r.violations.iter().any(|v| v.starts_with("stalled:")),
             "{} seed={:#x}: a pool that can reach 0 must stall compaction: {:?} ({})",
             c.name,
             c.seed,

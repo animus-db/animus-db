@@ -3562,3 +3562,19 @@ replicas at `A = awake_max_per_core x cores` by deferring **bulk** wakes only.
   counted over-cap wakes). The lost-leader bound in cell 5 is **per campaign
   attempt** (a split vote or a failed pre-vote round costs another attempt; the
   cap-less rig misses ADR 0078's literal bound on some seeds too, #1306).
+
+## Background budget (ADR 0079 layer 3, step 5)
+
+`src/background_budget.rs`: node-local permit pools (snapshot send 2 / receive 2,
+learner catch-up 4, splits 1 on by default; compactions `max(1, cores/2)` only
+with `--cores`, else off; `0` = off). Class L, no gate. Permits are RAII; a pool
+that is full reaps idle-TTL'd permits lazily at the next acquire. The raftkv
+driver holds a per-group `BgFlow` (inbound refusal = drop the chunk unacked, the
+step 3 decision; outbound send permit). **A sender releases a send permit after
+`snapshot_unacked_bound` (2 x the snapshot heartbeat backoff cap, 64 ticks) with
+no ack and bars that peer for one more bound** — do not shorten it below the
+backoff, or a live receiver is starved of its retries. `animus-storage`'s
+`CompactionGate` is the engine-side hook (L0 bypass at `2 x compaction_trigger`).
+Corpus: `density_admission_corpus.rs` cells 6, 6b, 7, 8 and controls
+`control_bg_d`, `control_bg_d2`, `control_bg_e` (`ANIMUS_DENSITY_SEEDS`,
+`ANIMUS_DENSITY_CELL=<substring>`).
