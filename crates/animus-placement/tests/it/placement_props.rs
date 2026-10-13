@@ -33,7 +33,10 @@ const ZONES: &[&str] = &["a", "b", "c", "d"];
 /// A pool of `min..=max` candidates with distinct ids and random `region`/
 /// `zone` labels drawn from a small vocabulary (small enough that residency
 /// and spread constraints are exercised, not vacuous).
-fn candidate_pool_strategy(min: usize, max: usize) -> impl Strategy<Value = Vec<Candidate>> {
+pub(crate) fn candidate_pool_strategy(
+    min: usize,
+    max: usize,
+) -> impl Strategy<Value = Vec<Candidate>> {
     proptest::collection::btree_set(1u64..1000, min..=max).prop_flat_map(|ids| {
         let ids: Vec<u64> = ids.into_iter().collect();
         let n = ids.len();
@@ -122,7 +125,7 @@ fn sum_of_squares(counts: &BTreeMap<NodeId, usize>) -> u64 {
 
 /// A generated topology: the full candidate pool, the policy under test, and
 /// the tablets initially placed over (a subset of) it.
-type Topology = (Vec<Candidate>, PlacementPolicy, Vec<(u32, Vec<NodeId>)>);
+pub(crate) type Topology = (Vec<Candidate>, PlacementPolicy, Vec<(u32, Vec<NodeId>)>);
 
 /// A random `(full_pool, initial_pool, policy, tablets)` topology: `policy`'s
 /// RF and spread are chosen to be feasible over `full_pool` (verified via
@@ -131,7 +134,9 @@ type Topology = (Vec<Candidate>, PlacementPolicy, Vec<(u32, Vec<NodeId>)>);
 /// `full_pool`'s extra nodes are, by construction, initially idle, giving
 /// `rebalance_step` genuine imbalance to fix (the "cluster grew" scenario
 /// the function's own doc motivates it with).
-fn topology_strategy(num_tablets_range: std::ops::Range<usize>) -> impl Strategy<Value = Topology> {
+pub(crate) fn topology_strategy(
+    num_tablets_range: std::ops::Range<usize>,
+) -> impl Strategy<Value = Topology> {
     // Stage 1: pick the pool + residency/spread shape, then a feasible RF
     // for that shape over the pool (checked via actual admits/domain
     // counting, not guessed) — `(full_pool, base_pool, policy)`.
