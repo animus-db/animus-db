@@ -226,6 +226,37 @@ spec:
                 minimum: 0.0
                 nullable: true
                 type: integer
+              nodeCapacity:
+                description: |-
+                  Explicit per-node placement capacity overrides (ADR 0079 section 1).
+                  Left unset, the operator **derives** both values from
+                  `spec.resources.requests` ([`derive_node_capacity`](crate::desired::
+                  cluster_config::derive_node_capacity)); a field set here wins over the
+                  derived one. Rendered into `cluster_settings.node_weight` /
+                  `node_max_replicas`, which each node advertises through
+                  `SetNodeCapacity` once the cluster has finalized version 5. Additive
+                  and skipped when unset.
+                nullable: true
+                properties:
+                  maxReplicas:
+                    description: |-
+                      Absolute ceiling on the replicas (voters and learners) placement puts on
+                      a node. Derived default: `min(memoryRequest / 2 / 64 KiB, 1000)` when a
+                      memory request is set, else unset (no ceiling).
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                  weight:
+                    description: |-
+                      Relative placement weight (only ratios between nodes matter; a node that
+                      declares nothing is 100). Derived default: `max(1, cpuMillicores / 100)`.
+                      `0` is refused.
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                type: object
               nodes:
                 description: Total pod count (`StatefulSet.spec.replicas`). Must be at least 1.
                 format: int32
