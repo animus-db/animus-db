@@ -377,3 +377,115 @@ async fn bench_inplace_split_serve_latency_and_cutover_blip() {
     .await
     .expect("bench timed out");
 }
+
+/// `(utime + stime)` clock ticks of this process (Linux), for the storm's CPU
+/// cost; `0` elsewhere.
+fn self_cpu_ticks() -> u64 {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    let rest = stat.rsplit_once(')').map_or("", |(_, r)| r);
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    let num = |i: usize| f.get(i).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    num(11) + num(12)
+}
+
+/// ADR 0079 step 1 calibration (#1295): a scoped `ProdEnv` split **storm**.
+/// `ANIMUS_SPLIT_STORM_TABLES` (default 4) single-tablet tables, each with
+/// `ANIMUS_SPLIT_STORM_ROWS` (2000) rows of `ANIMUS_SPLIT_STORM_VALUE_BYTES`
+/// (256), on a 3-node LSM cluster in one process (4 worker threads); every
+/// split is kicked off back to back, then a separate `probe` table is
+/// read/written continuously until every parent is gone. Reports per-split
+/// wall clock, total process CPU, and the probe table's get/put latency and
+/// retries during the storm. Run: `cargo test -p animusd --release --test
+/// inplace_split_bench bench_inplace_split_storm_cost -- --ignored --nocapture`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "bench — run explicitly with --ignored --nocapture"]
+async fn bench_inplace_split_storm_cost() {
+    let knob = |k: &str, d: usize| -> usize {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let tables = knob("ANIMUS_SPLIT_STORM_TABLES", 4);
+    let rows = knob("ANIMUS_SPLIT_STORM_ROWS", 2_000);
+    let vb = knob("ANIMUS_SPLIT_STORM_VALUE_BYTES", 256);
+    timeout(Duration::from_secs(1500), async {
+        let dir = support::panic_safe_tempdir();
+        let (nodes, _config) = bring_up_inplace(3, dir.path()).await;
+        support::await_bootstrap(&nodes).await;
+        let mut s = animusd::connect_client(nodes[0].client_addr())
+            .await
+            .expect("connect");
+        let filler = vec![b'x'; vb];
+        let names: Vec<String> = (0..tables).map(|i| format!("storm{i}")).collect();
+        for name in &names {
+            for i in 0..rows {
+                let key = vec![b'k', (i / 256) as u8, (i % 256) as u8];
+                put_in(&mut s, name, key, filler.clone()).await;
+            }
+        }
+        for i in 0..200usize {
+            put_in(&mut s, "probe", vec![b'k', 0, i as u8], vec![b'p']).await;
+        }
+        let parents: Vec<u64> = names.iter().map(|n| sole_tablet_of(&nodes[0], n)).collect();
+
+        let (cpu0, t0) = (self_cpu_ticks(), std::time::Instant::now());
+        for p in &parents {
+            kickoff_tablet(&nodes[0], *p, "k\\u0004").await;
+        }
+        let mut done_at: Vec<Option<Duration>> = vec![None; parents.len()];
+        let (mut gets, mut puts) = (Vec::new(), Vec::new());
+        let (mut retries, mut n) = (0u64, 0usize);
+        while done_at.iter().any(Option::is_none) {
+            let t = std::time::Instant::now();
+            let _ = get_in(&mut s, "probe", vec![b'k', 0, (n % 200) as u8]).await;
+            gets.push(t.elapsed());
+            let t = std::time::Instant::now();
+            let a = put_in_counting(&mut s, "probe", vec![b'w', (n % 256) as u8], vec![b'v']).await;
+            puts.push(t.elapsed());
+            retries += u64::from(a.saturating_sub(1));
+            n += 1;
+            let (_, st) = admin(nodes[0].admin_addr(), "GET", "/admin/status", None).await;
+            let live = st["tablets"].as_object().cloned().unwrap_or_default();
+            for (i, p) in parents.iter().enumerate() {
+                if done_at[i].is_none() && !live.contains_key(&p.to_string()) {
+                    done_at[i] = Some(t0.elapsed());
+                }
+            }
+            assert!(
+                t0.elapsed() < Duration::from_secs(1200),
+                "split storm never completed: {done_at:?}"
+            );
+        }
+        let (total, cpu) = (t0.elapsed(), self_cpu_ticks() - cpu0);
+        for (name, p) in names.iter().zip(&parents) {
+            await_cutover_of(&nodes[0], name, *p, Duration::from_secs(60)).await;
+        }
+        let pct = |mut v: Vec<Duration>, q: usize| {
+            v.sort();
+            v[(v.len() * q / 100).min(v.len() - 1)]
+        };
+        let mut ds: Vec<Duration> = done_at.iter().flatten().copied().collect();
+        ds.sort();
+        eprintln!(
+            "SPLIT-STORM tables={tables} rows={rows} value_bytes={vb} total_s={:.1} cpu_cores={:.2} \
+             first_done_s={:.1} median_done_s={:.1} last_done_s={:.1} probe_ops={n} probe_retries={retries} \
+             get_p50={:?} get_p99={:?} put_p50={:?} put_p99={:?} put_max={:?}",
+            total.as_secs_f64(),
+            cpu as f64 / 100.0 / total.as_secs_f64(),
+            ds[0].as_secs_f64(),
+            ds[ds.len() / 2].as_secs_f64(),
+            ds[ds.len() - 1].as_secs_f64(),
+            pct(gets.clone(), 50),
+            pct(gets, 99),
+            pct(puts.clone(), 50),
+            pct(puts.clone(), 99),
+            pct(puts, 100),
+        );
+        for node in &nodes {
+            node.shutdown_graceful().await;
+        }
+    })
+    .await
+    .expect("split storm bench timed out");
+}

@@ -3347,7 +3347,19 @@ impl SimCluster {
             (1..=self.nodes).contains(&replication),
             "replication must be between 1 and the node count"
         );
-        let replicas: Vec<u64> = (0..replication as u64).collect();
+        self.create_table_on(table, (0..replication as u64).collect())
+    }
+
+    /// [`create_table_with_replication`](Self::create_table_with_replication)
+    /// with an explicit replica set (node indices), so a cell can spread
+    /// tablets over every node instead of always the first `replication`
+    /// (ADR 0079 step 1: the data-bearing node-loss cell).
+    pub(crate) fn create_table_on(&mut self, table: &str, replicas: Vec<u64>) -> TabletId {
+        let replication = replicas.len();
+        assert!(
+            replicas.iter().all(|&n| (n as usize) < self.nodes),
+            "replica index out of range"
+        );
         let replica_ids: Vec<NodeId> = replicas.iter().copied().map(nid).collect();
 
         let leader = self.control_leader_index();
@@ -4429,6 +4441,35 @@ impl SimCluster {
         .unwrap_or_else(|| {
             Err(format!(
                 "put on node {node} did not complete within {OP_BUDGET:?}"
+            ))
+        })
+    }
+
+    /// `rows` written one after another (separate Raft entries) by ONE task,
+    /// returning at the first failure or when all are acked. Unlike calling
+    /// [`SimCluster::put`] in a loop, this does not burn a full
+    /// [`OP_BUDGET`] of virtual time per write (about 5 MB of retained sim
+    /// trace per put at 6 nodes; ADR 0079 step 1's data-bearing node-loss
+    /// cell preloads thousands of entries), and the whole batch shares one
+    /// [`OP_BUDGET`] window.
+    pub(crate) fn put_many_fast(
+        &mut self,
+        node: u64,
+        table: &str,
+        pk: &str,
+        rows: Vec<(String, Vec<u8>)>,
+    ) -> Result<(), String> {
+        let handle = self.shared.clone();
+        let (table, pk) = (table.to_owned(), pk.to_owned());
+        self.spawn_and_capture_fast(node, async move {
+            for (sk, value) in rows {
+                handle.put(node, &table, &pk, &sk, &value).await?;
+            }
+            Ok(())
+        })
+        .unwrap_or_else(|| {
+            Err(format!(
+                "put_many_fast on node {node} did not complete within {OP_BUDGET:?}"
             ))
         })
     }

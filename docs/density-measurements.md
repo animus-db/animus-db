@@ -176,3 +176,242 @@ Suggested starting values, each marked.
 Follow-ups this implies: an LsmEngine variant of the rig (fds, memory,
 compaction), a loaded variant with client writes, a larger `worker_threads` to
 find the true per-core figure, and a data-bearing node-loss cell.
+
+---
+
+# 2026-10-13: ADR 0079 step 1 calibration
+
+Same box (4-core, 15 GB, release build), main `50e1edc` plus the test knobs of
+this change. Every ProdEnv row is a **single run** (not seed-reproducible):
+order of magnitude, and a row at a boundary (a one-group led dip, `max_term`
+in the 4-10 range) can flip on a repeat. G=1500 at 2 workers passed here with
+a 60 s hold and failed in the 2026-10-12 run with a 120 s hold. The sim rows
+(section F) are seeded and deterministic but have no CPU model. "Measured" =
+printed by the run; "inferred" = arithmetic on measured rows, labelled so.
+
+The ignored test samples itself (`/proc/self`, so the lesson of
+`docs/lessons/testing/2026-10-12-sample-the-test-binary-not-cargo-test.md` cannot
+recur). Knobs, all default to the old behaviour (`election_backpressure_liveness.rs`):
+`ANIMUS_BP_LIVE_WORKERS` (runtime worker threads, 2), `_ENGINE=lsm`
+(`LsmEngine<ProdEnv>`, real files), `_WRITE_RPS`, `_WRITE_GROUPS`, `_VALUE_BYTES`
+(client puts at a fixed rate, round-robin over the first N groups), `_HOLD_SECS`
+(120), `_CONVERGE_SECS` (600), `_ASSERT=0` (print a `verdict` line instead of
+failing). "cores" = CPU ticks over the hold phase / hold seconds; "hold" below is
+60 s unless stated. Logs: session scratchpad only.
+
+```sh
+cargo test -p animus-cp-data --release --features prod-heavy --test election_backpressure_liveness --no-run
+ANIMUS_BP_LIVE_ASSERT=0 ANIMUS_BP_LIVE_QUIESCE=0 ANIMUS_BP_LIVE_WORKERS=1 ANIMUS_BP_LIVE_GROUPS=1100 \
+  ANIMUS_BP_LIVE_HOLD_SECS=60 target/release/deps/election_backpressure_liveness-<hash> \
+  density_repro_g3000_holds_led_count --ignored --nocapture
+```
+
+## E1. Awake ceiling vs worker threads (MemoryEngine, no client load, `QUIESCE=0`)
+
+| workers | G | cores (hold) | max_term | deferrals | verdict |
+|---|---|---|---|---|---|
+| 1 | 500 | 0.51 | 2 | 12 | held |
+| 1 | 700 | 0.71 | 2 | 0 | held |
+| 1 | 900 | 0.86 | 3 | 541 | held |
+| 1 | 1100 | 0.98 | 3 | 1820 | held |
+| 1 | 1300 | 1.02 | 4 | 1347 | held (saturated) |
+| 1 | 1500 | 1.02 | 9 | 4228 | held, churning |
+| 1 | 1800 | 1.03 | 22 | 8865 | held, churning |
+| 1 | 2200 | 1.04 | 70 | 44207 | **fail** (not all led in 120 s; dip of 4) |
+| 2 | 1250 | 1.50 | 2 | 139 | held |
+| 2 | 1500 | 1.75 | 3 | 279 | held (fail in the 2026-10-12 120 s run) |
+| 3 | 1500 | 2.08 | 2 | 0 | held |
+| 3 | 1900 | 2.53 | 3 | 32 | held |
+| 3 | 2300 | 2.76 | 4 | 2747 | held |
+| 3 | 2700 | 2.77 | 9 | 6496 | held, churning |
+| 3 | 3000 | 2.75 | 47 | 55223 | held, heavy churn |
+| 3 | 3400 | 2.75 | 8 | 170910 | **fail** (min led 3252) |
+
+Findings (measured unless marked):
+
+- **The per-core cost is lowest with one worker.** Below saturation: 0.9-1.0
+  process-core per 1000 groups at 1 worker, 1.2 at 2, 1.2-1.4 at 3 (cross-thread
+  contention). The 2026-10-12 inference of 0.5 core per 1000 own replicas
+  (1900-2000 per node-core) was a 2-worker number; at 1 worker it is about
+  0.30-0.33.
+- **Clean ceiling** (all led, led count held, `max_term` single digit, no
+  deferral storm): about 1100-1300 groups at 1 worker (1.0 core), 1500 at 2 (1.75
+  cores), 2300-2700 at 3 (2.76 cores). Past it the process pins at its worker
+  count, `max_term` and deferrals climb steeply, and the verdict degrades from
+  "held, churning" to a led-count dip, to non-convergence.
+- **Inferred per node-core** (three nodes share the process, each hosts all G
+  replicas, so one core carries 3 x G replicas): about **3300-3900 awake
+  replicas per core** at the 1-worker clean ceiling, about 2600-2700 at 2-3
+  workers. No client load. The ADR's provisional `A` = 1500 is 40-60 % of that.
+
+## E2. `LsmEngine<ProdEnv>` per tablet (real files, 2 workers)
+
+| mode | G | replicas | all-led | host CPU | cores (hold) | RSS | fds | files / sstables | notes |
+|---|---|---|---|---|---|---|---|---|---|
+| quiesced | 300 | 900 | 5.4 s | 5.6 core-s | 0.04 | 35 MB | 25 | 3600 / 900 | |
+| quiesced | 1000 | 3000 | **54 s** | 58 core-s | 0.06 | 95 MB | 25 | 12000 / 3000 | |
+| quiesced | 2000 | 6000 | **not in 180 s** (1400 led at 180 s) | 184 core-s | 1.19 (still hosting) | 148 MB | 25 | 16800 / 4200 | stopped |
+| awake | 300 | 900 | 7.2 s | 8 core-s | 0.42 | 36 MB | 25 | 3600 / 900 | |
+| awake | 700 | 2100 | 24.8 s | 35 core-s | 0.91 | 73 MB | 25 | 8400 / 2100 | |
+| awake | 1100 | 3300 | 66 s | 108 core-s | 1.41 | 112 MB | 25 | 13200 / 3300 | |
+
+- **Steady state is close to MemoryEngine**: awake 1100 groups costs 1.41 cores
+  (MemoryEngine at 2 workers: about 1.3 interpolated), quiesced 0.04-0.06 core,
+  about 28 KB RSS per hosted replica (95 MB / 3000; MemoryEngine 23 KB). Each
+  replica holds 4 files, one of them an sstable (the layout-marker flush), so
+  **about 4 inodes per hosted replica** (12000 files at 3000 replicas). **fds are flat at 25 idle**: engine files are
+  opened per operation, not held.
+- **Hosting cost is superlinear, and that looks like a product defect, not
+  overload.** Host CPU per replica is 6 ms at G=300, 19 ms at 1000, at least 30 ms
+  at 2000 (184 core-s over at most 6000 replicas), so total hosting CPU is roughly quadratic in the tablets already on
+  the node. Cause (read, not profiled): the reconciler calls
+  `EngineFactory::probe` for every tablet it hosts (`host.rs`, around line 2228),
+  and `LsmTabletFactory::probe` (and `local_tablets`, `destroy`) does a full
+  `env.list()` of the node's flat data directory, which `ProdEnv::list`
+  implements as `read_dir` plus one `file_type().await` (a blocking-pool hop)
+  per entry. At 12000 entries that is 12000 hops per probe. The test factory
+  mirrors the product's. Per-push quiesced density through `LsmEngine` is
+  therefore bounded by hosting time (G=2000 did not converge in 180 s with
+  idle machinery), not by steady-state cost. **Not fixed here**; to be filed and
+  handled separately (a per-tablet probe by a prefix-targeted stat, or one
+  listing per reconciler tick). Until then the hosting-time-bound
+  `max_replicas` below is the safe figure.
+- Awake-vs-quiesced per replica matches E1 (no new steady-state cost class).
+
+## E3. Loaded variant: client writes at a fixed rate (MemoryEngine, 2 workers, 128 B values)
+
+Writes are raw tablet puts through the leader (`RaftKvNode::put`), no DynamoDB
+wire, `Accepted` means appended on the leader. Rate is requested; the sender is
+a single task in the polling loop.
+
+| mode | G | requested puts/s | writes sent / accepted | cores | RSS | fds | min led | verdict |
+|---|---|---|---|---|---|---|---|---|
+| awake | 1000 | 0 | 0 | 1.25 | 81 MB | 25 | 1000 | held |
+| awake | 1000 | 1000 | 59899 / 59899 | 2.05 | 555 MB | 1154 | 1000 | held |
+| awake | 1000 | 3000 | 179684 / 179684 | 2.15 | 1.22 GB | 1602 | 1000 | held (saturated) |
+| awake | 1000 | 6000 | 359643 / 359298 | 2.12 | 1.55 GB | 1746 | 999 | **dip of 1** |
+| awake | 1500 | 1000 | 59978 / 59963 | 2.02 | 802 MB | 1575 | 1499 | **dip of 1** (1.75 cores unloaded, held) |
+| awake | 1500 | 3000 | 179853 / 179630 | 2.16 | 1.18 GB | 2199 | 1498 | **dip of 2** |
+| quiesced, 100 hot groups | 2000 | 1000 | 59946 / 59946 | 1.21 | 292 MB | 25 | 2000 | held |
+| quiesced, writes over all groups | 1000 | 500 | 29972 / 29972 | 1.74 | 195 MB | 25 | 1000 | held |
+| LSM 4 KiB, awake, 50 hot groups | 700 | 600 | 35987 / 35961 | 2.11 (0.91 unloaded) | 2.67 GB | 298 | 693 | **dip of 7**, 10951 deferrals |
+
+- **CPU per write** (inferred from the 1000/s rows, a whole RF-3 write: leader
+  append, two follower appends, three applies, the network): about **0.8-1.0 ms**
+  of process CPU with MemoryEngine and 128 B values, about **2 ms** with
+  `LsmEngine` and 4 KiB. At 2 workers (about 2 cores) that is a pinned ceiling
+  of roughly 2000-2500 RF-3 writes/s in this rig before the awake groups starve.
+- **Load moves the clean awake ceiling.** Unloaded 1500 groups held at 1.75 cores;
+  with 1000 puts/s it pinned at 2.0 and lost a led group. So at 2 workers the
+  loaded clean ceiling is below 1500 groups at 1000 puts/s (inferred: about
+  1000-1250). Load costs about the same core fraction as 800-1000 awake
+  replicas per 1000 puts/s.
+- **Writes keep a quiesced group awake**: 500 puts/s spread over 1000 groups
+  (one write per group every 2 s, under the 5 s quiesce timer) costs 1.74 cores,
+  about the same as 1000 awake groups without writes. A hot set of 100 groups at
+  1000 puts/s on 2000 groups costs 1.21 cores, of which about 0.1 is the idle
+  floor. The quiesce saving needs the *write working set*, not just the reads,
+  to be small.
+- **fds and memory under write load are per written replica, not per hosted
+  one**: a per-replica raft WAL file stays open once written (about 0.35-0.5 fd
+  per hosted replica at 1000 and 1500 groups, 25 idle). A 1024 soft `nofile`
+  limit would be exceeded at about 2000 written replicas (inferred);
+  `LimitNOFILE` must follow `max_replicas`.
+- **LSM write amplification** (single run): 35961 x 4 KiB x 3 replicas = 430 MB
+  logical became 1.5 GB on disk in 60 s (about 3.5x; WAL segments and sstables,
+  sstable count 2447-2571 then falling to 2364 from a 2100 baseline, so compaction ran and kept up, inferred) and RSS grew from 71 MB to 2.7 GB (1 GB in the first 10 s, then
+  about 0.2 GB per 10 s, still rising at 60 s). Flush threshold is 64 KiB so each
+  hot tablet flushed every 16 writes. Memory growth under write load is the
+  largest unmodelled per-node cost: it is data-, not replica-, proportional and
+  was not bounded in 60 s. **Not understood** (memtable, raft log tail, or
+  unflushed applied buffers); needs its own run before `max_replicas` can be
+  tied to a memory limit under load.
+
+## F. Data-bearing node-loss burst (sim, `sim_cluster_scale_node_loss_repair_burst`)
+
+6 nodes, RF 3, tables placed round-robin (every node holds half the tablets;
+the old fixture put every tablet on nodes 0-2), each preloaded with `puts`
+writes (more than the 64-entry compaction threshold), settle 60 s, node 5
+crashed. "metadata converged" = three live replicas on every tablet;
+"data settled" = also every replica hosted and the reconfigure/snapshot counters
+still for 10 s. Seed `name_seed` = `893798268308609673`, deterministic.
+
+| tables x puts x bytes | tablets on dead node | metadata converged | data settled | peak reconfigure/s | reconfigures accepted / rejected | snapshot triggers / ships (chunk msgs) / installs | tablet traffic |
+|---|---|---|---|---|---|---|---|
+| 12 x 80 x 1 KiB | 6 | 6 s | 17 s | 8 | 30 / 0 | 18 / 54 / 9 | 5.2 MB |
+| 60 x 80 x 1 KiB | 30 | 6 s | 54 s | 30 | 129 / 30 | 86 / 273 / 43 | 28 MB |
+| 60 x 600 x 1 KiB | 30 | 6 s | 57 s | 30 | 129 / 0 | 86 / 711 / 43 | 72 MB |
+| 120 x 200 x 4 KiB | 60 | 6 s | 102 s | 61 | 255 / 0 | 167 / 1850 / 85 | 161 MB |
+| 300 x 80 x 1 KiB | 150 | 6 s | 243 s | 151 | 633 / 1 | 423 / 1322 / 211 | 216 MB |
+
+- **Without a pacing mechanism the metadata flips for every affected tablet in
+  one second** (peak reconfigure/s = the affected-tablet count: 151 for 150
+  tablets), then the data catches up serially: **about 1.6 virtual s per affected
+  tablet** (243 s / 150), independent of the tablet's size over 80-600 puts and
+  1-4 KiB values. 4.2 accepted reconfigurations and 1.4 snapshot installs per
+  affected tablet (the earlier empty-tablet figure was 2.3 and 0 installs).
+- The burst is 1:1 with tablets on the dead node, which on a balanced cluster is
+  `replicas_per_node / 1` tablets: at 3000 hosted replicas per node, 3000
+  proposals in the first second. That is the case `R` (per-tick repair
+  proposals) is for. Virtual time and no CPU model: it bounds the work, not the
+  CPU cost; the snapshot bytes are tablet-message bytes (0.9-2.7 MB of tablet messages per affected tablet, 1-4x its data, including
+  ordinary heartbeats).
+- The small form of this cell (12 x 80 x 1 KiB, about 1 s in release) is now
+  per-push as `sim_cluster_scale_node_loss_with_data_installs_snapshots`
+  (structural: dead node held replicas, snapshot installed, every affected
+  tablet saw an accepted reconfigure). The scalable cell stays `#[ignore]`d.
+  Harness note: `SimCluster::put` retains about 5 MB of sim trace per call, so
+  the preload uses the new `put_many_fast` (see
+  `docs/lessons/testing/2026-10-13-let-the-test-sample-itself-and-sweep-worker-threads-for-a-per-core-figure.md`).
+
+## G. ProdEnv split storm (`inplace_split_bench.rs`, `bench_inplace_split_storm_cost`)
+
+Three real nodes in one process (LSM, 4 workers), T single-tablet tables, every
+split kicked off back to back via `/admin/tablet/split`, a separate `probe`
+table read and written throughout.
+
+| T x rows x bytes | total | per-split done (first / median / last) | cores | probe get p50 / p99 | probe put p50 / p99 / max | probe retries |
+|---|---|---|---|---|---|---|
+| 1 x 2000 x 256 | 0.7 s | 0.7 s | 2.26 | 0.5 / 3.0 ms | 3.3 / 7.3 / 7.6 ms | 0 |
+| 4 x 2000 x 256 | 1.8 s | 0.7 / 1.5 / 1.8 s | 2.21 | 1.0 / 5.2 ms | 3.2 / 7.1 / 8.3 ms | 0 |
+| 8 x 4000 x 1 KiB | 15.4 s | 1.9 / 9.6 / 15.4 s | 2.62 | 1.8 / 8.4 ms | 2.5 / 7.9 / 16.7 ms | 0 |
+
+- **Splits finish one after another** (1.9 s, 9.6 s, 15.4 s for 8 started
+  together): about 1.7 s per 4 MB split regardless of concurrency, and the
+  process runs at 2.2-2.6 of 4 cores while it does. Neighbouring-table reads and
+  writes were unaffected (no retries, put p99 under 10 ms), so these sizes show
+  no starvation from concurrency; the per-split cost is the unit.
+- Not measured: splits of tablets near the real split size (hundreds of MB; the
+  runs fork 0.5-4 MB), splits under an awake-saturated node, and the follow-up
+  directed Placing. The doubling from 4 to 8 tables with 2x larger tablets and
+  4x larger rows (15 s vs 1.8 s) says cost tracks bytes, not split count.
+
+## Proposed final defaults (recommendations for review; ADR 0079's knob table is not edited)
+
+| Knob | ADR provisional | Recommendation | Basis |
+|---|---|---|---|
+| `A` awake replicas per core | 1500 | **keep 1500** | Measured clean no-load ceiling is 2600-3900 per core (E1); 1000 puts/s costs the equivalent of about 800-1000 awake replicas (E3, inferred); 1500 leaves 0.4-0.55 core for writes (about 1500 RF-3 writes/s per node-core at 0.8-1 ms per write, inferred) and still sits below the loaded dip seen at 2 workers (E3). Raising it would eat the write budget. |
+| `cores` | operator, from requests | **keep**; document that `A` is per *configured* core, not per worker thread | E1: per-core efficiency differs by 1.3x across worker counts |
+| snapshot send / recv pools | 2 / 2 | **keep 2 / 2** | F: 1.4 installs per affected tablet, serial at about 1.6 virtual s each; no CPU data to justify more. Revisit with a CPU-modelled run. |
+| catch-up learners pool | 4 | **keep 4** | inferred; F shows catch-up is not the binding stage, the snapshot is |
+| `bg-splits` | 1 | **keep 1**; reconsider 2 only with a near-real-size split run | G: concurrency 1 vs 8 gives the same per-split time (they serialise already); a pool of 1 costs nothing measured |
+| `bg-compactions` | `max(1, cores/2)` | **keep** | E3 LSM: sstable count stayed flat under 600 puts/s; no starvation seen. Single run, 60 s. |
+| `R` (repair proposals/tick) | 8 | **keep 8**, `R_inflight` 16 | F: unpaced, all affected tablets flip in 1 s while the data stage runs at about 0.6 tablets/s, so the proposal stage is not the bottleneck; `R` caps the metadata/Raft storm, not the bytes. 3000 proposals at once is the case to pace. |
+| `max_replicas` (operator) | derived | **min(** 0.5 x memory request / 64 KiB, `nofile` / 2, 1000 **)**. Measured: about 28 KB RSS per idle replica (E2), so 64 KiB is a 2x margin; fds 0 idle, 0.35-0.5 per *written* replica (E3); with `LsmEngine` hosting G=1000 per node took 54 s and G=2000 did not finish in 180 s (E2, the `probe` defect). | the constant 1000 is the hosting-time cap while the `probe` defect stands (about 1 min to host 1000 per node at 2/3 core each); drop that term after the fix. Memory under write load (E3 LSM) is unbounded in 60 s and not covered by any per-replica term: do not tie `max_replicas` to a memory limit under load until that is understood. |
+| `LimitNOFILE` | n/a | at least `max_replicas` | E3: fds scale with written replicas |
+
+## Not measured, and why
+
+- **CPU-modelled snapshot/repair cost** (F is virtual time only); would need
+  `Simulator::set_cpu_cost` plumbed into `SimCluster`, or a ProdEnv node-kill run
+  with data, a larger harness than this step.
+- **Per-node (not per-process) CPU**: the rig puts three nodes in one process;
+  the 1/3 split is inferred. The sandbox has 4 cores, so w=4 (a free core
+  for the sampler) was not run.
+- **Real-size splits and compaction under sustained load** (G only reaches 4 MB
+  tablets; E3 LSM ran 60 s once).
+- **DynamoDB wire write cost** (E3 uses raw tablet puts; the wire adds parsing,
+  item encoding and index maintenance on top of the 0.8-2 ms).
+- **LSM RSS growth under load** (unexplained, E3).
+- **A repeat of any ProdEnv cell**: all single runs; the 2026-10-12 and 2026-10-13
+  G=1500 / 2-worker results disagree (fail vs pass), which is the noise floor.
