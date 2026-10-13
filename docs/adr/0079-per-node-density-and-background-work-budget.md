@@ -335,3 +335,71 @@ measurements show the backoff too slow, a `Busy` reply variant would then be
 class **G** under its own gate, with an older sender treating an unknown
 variant as a failure it retries; that is a deliberate later amendment, not
 part of this step.
+
+## Implementation step 4 as built (2026-10-13): awake-group admission
+
+Layer 2 shipped as `animus-cp-data` `awake_admission.rs` (`AwakeAdmission`,
+`ElectionBackpressure.awake`, attached to the `LoadMonitor`), the
+`RaftKvNode::wake_bulk()` split of the wake signal, `--cores` /
+`--awake-max-per-core` (`cluster_settings.cores` / `awake_max_per_core`,
+`--config`/`--node` only, same merge rule as `--node-weight`), five `Metric`
+variants (`CpAwakeReplicas`, `CpAwakeMaxEffective`, `CpWakeQueueDepth`,
+`CpWakeDeferred`, `CpWakeOvercap`), the `/admin/health` fields (`awake`,
+`awake_max_effective`, `wake_queue_depth`, `wake_deferred`, `overcap_wakes`;
+advisory), and the Tier 1 corpus `density_admission_corpus.rs` (knob
+`ANIMUS_DENSITY_SEEDS`, not the `ANIMUS_DENSITY_ADMISSION_SEEDS` the Tier 1
+section named). Class **L** as classified: no wire or replicated change, no gate.
+
+- **Cap off unless `--cores` is set** (never autodetected); `--awake-max-per-core 0`
+  also disables it. A node without it runs the pre-step driver (`awake` is `None`).
+  `animusd`'s `SimCluster` assembly passes `None`, so every cluster-tier test is
+  unchanged.
+- **Shared lag rule (decision Q9).** `load_monitor::lag_divisor` / `scale_by_lag`
+  is the one lag-to-factor function; `k_eff` and `a_eff` both call it. The ADR's
+  "minimum `A/8`" parenthetical is superseded by the shared rule (`A/2` at 30 ms,
+  `A/4` at 100 ms, never below 1): the governor's `K_eff` has no `K/8` tier and
+  one function was the point. Equivalence of the refactor is a test
+  (`k_eff_is_behaviour_identical_to_the_pre_shared_helper_body`): the old body,
+  verbatim, against `k_eff` over 4000 lags x 75 `k` values.
+- **What is deferred.** Only the host reconciler's proactive `Down` wake, now
+  `wake_bulk()`, and only for a quiesced **follower** (`on_local_wake` is a no-op
+  for a leader). A deferred group stays quiesced, queued FIFO, and is woken by
+  the queue callback; the reconciler re-wakes each tick, which is the backstop
+  for a lost callback. The client-facing `wake()` carries its own `direct` flag
+  that wins over a coalesced bulk wake (found by cell 1: without it a client
+  wake of a queued group was deferred, see
+  `docs/lessons/testing/2026-10-13-a-deferral-keyed-on-a-coalesced-flag-loses-the-direct-wake.md`).
+- **Soft cap.** A client write, a peer message (pre-vote, `AppendEntries`,
+  `WakeRequest`) and a campaign un-quiesce inside the core and are never refused:
+  the driver reports each quiescence change, and one that was not an admitted bulk
+  wake and leaves the node past `A_eff` is counted (`CpWakeOvercap`). Hosting
+  registers awake and exempt (decision Q5), with an RAII membership that returns
+  the slot on any exit of the driver.
+- **Measured behaviour worth knowing (Tier 1, `G` = 60, `A` = 6).** Peer-message
+  wakes make the cap leaky by design, but mildly: after a node loss the bulk-wake
+  awake high-water was 10 against 60 uncapped (`admit_awake_hwm` is exactly
+  `A_eff`; the rest is counted overcap). In the CPU-model cell the capped run's
+  worst scheduling lag was 115-630 ms against 4.8-5.7 s uncapped.
+- **A woken group does not always give its slot back.** A leader cannot quiesce
+  while any voter is behind (`quiesce_entry_ok`), so with a node *killed*, the
+  groups a bulk wake admits stay awake until the dead replica is replaced and the
+  slots do not turn over: the rest of the queue stays quiesced (leaderless if the
+  dead node led it) until a client touches the group, which wakes it over the cap.
+  That is the soft cap working as designed, but it means the cap paces
+  *unsolicited* recovery after a node loss to about `A` groups plus their peer
+  cascade, and recovery of the rest is client-driven. If that is not wanted, the
+  follow-up is to let the queue admit past `A_eff` for a group whose recorded
+  leader is `Down` (not built; Open question for the maintainer).
+- **Cell 5's bound is per campaign attempt.** ADR 0078's lost-leader bound is
+  missed on reseeded variants by one `2 * base` window when a pre-vote round
+  fails; the same happens with no awake cap (#1306). Cell 5 asserts the literal
+  bound times the number of campaign attempts the survivors were admitted for.
+- **Tier 3.** `ANIMUS_BP_LIVE_AWAKE_MAX=A` turns the cap on in the ProdEnv
+  liveness rig. Because hosting is exempt (decision Q5) and
+  `ANIMUS_BP_LIVE_QUIESCE=0` never quiesces, the cap has nothing to defer in
+  `density_repro_g3000_holds_led_count`: the #1297 shape at G=3000 awake is
+  guarded only by ADR 0078's stagger, which is what Open question 5 recommended.
+- **Not in this step:** operator rendering of `cores` from the pod CPU limit
+  (with the rest of the operator derivation), the Tier 1 cell 3 "control (a)"
+  collapse arm (belongs with steps 5-7), and a `SimCluster` hook for the C-17
+  `awake_hwm` line.

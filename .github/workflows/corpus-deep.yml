@@ -578,6 +578,21 @@ jobs:
         run: |
           cargo test -p animus-cp-data --test it wan_timing_corpus:: -- --nocapture
 
+      # ADR 0079 layer 2 (awake-group admission): three nodes with a soft cap
+      # on awake groups. Mass wake after a node loss, a client write to a
+      # deferred group, awake overload with and without the cap, the cap
+      # under injected lag, and the lost-leader bound with a full wake queue;
+      # the hard-cap and no-lag-reduction negative controls must fail their
+      # cells. Each cell is a pure function of its seed.
+      - name: deep density admission corpus (ADR 0079 layer 2)
+        id: density_admission
+        continue-on-error: true
+        timeout-minutes: 20
+        env:
+          ANIMUS_DENSITY_SEEDS: '20'
+        run: |
+          cargo test -p animus-cp-data --test it density_admission_corpus:: -- --nocapture
+
       # ADR 0075 sections 3.3/3.6 (G-01 stage G-c, M2): the preferred-leader
       # reconciler step over three regions on WAN links. Steady convergence of
       # the leader into the preferred region, leader-region kill + return,
@@ -822,6 +837,7 @@ jobs:
             [s3_fault]="${{ steps.s3_fault.outcome }}"
             [heartbeat]="${{ steps.heartbeat.outcome }}"
             [wan_timing]="${{ steps.wan_timing.outcome }}"
+            [density_admission]="${{ steps.density_admission.outcome }}"
             [mrsc_leader]="${{ steps.mrsc_leader.outcome }}"
             [mrsc_cluster]="${{ steps.mrsc_cluster.outcome }}"
             [mrec_world]="${{ steps.mrec_world.outcome }}"
@@ -837,7 +853,7 @@ jobs:
           )
           failed=0
           failed_names=()
-          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner reconfigure_drop inplace_split backup pitr lsm_crash lsm_disk_fault lsm_encrypted segment_store_encrypted control simcluster dynamo_wire zone_placement split_relocation export_import s3_fault heartbeat wan_timing mrsc_leader mrsc_cluster mrec_world sharedwal wal_rewrite_crash upgrade_restart upgrade_restart_cluster upgrade_mixed upgrade_mixed_cluster upgrade_roll learner_snapshot_livelock scale; do
+          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner reconfigure_drop inplace_split backup pitr lsm_crash lsm_disk_fault lsm_encrypted segment_store_encrypted control simcluster dynamo_wire zone_placement split_relocation export_import s3_fault heartbeat wan_timing density_admission mrsc_leader mrsc_cluster mrec_world sharedwal wal_rewrite_crash upgrade_restart upgrade_restart_cluster upgrade_mixed upgrade_mixed_cluster upgrade_roll learner_snapshot_livelock scale; do
             outcome="${outcomes[$name]}"
             echo "${name}: ${outcome}"
             if [ "${outcome}" != "success" ]; then

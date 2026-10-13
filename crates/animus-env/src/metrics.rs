@@ -1117,12 +1117,28 @@ pub enum Metric {
     /// it stays flat in steady state (and always under `host_unsettled_max =
     /// 0`).
     CpHostWaveDeferred,
+    // --- Awake-group admission (ADR 0079 layer 2; appended, same
+    // slot-stability discipline). A node with the cap off (no `--cores`, or
+    // `--awake-max-per-core 0`) never records them. ---
+    /// A level: this node's awake (non-quiesced) data-plane replicas now.
+    CpAwakeReplicas,
+    /// A level: the effective awake cap `A_eff` (`A` reduced by scheduling
+    /// lag, the shared lag-to-factor rule).
+    CpAwakeMaxEffective,
+    /// A level: quiesced groups queued for a wake slot.
+    CpWakeQueueDepth,
+    /// A counter: bulk wakes deferred (counted once per group, at the first
+    /// refusal).
+    CpWakeDeferred,
+    /// A counter: groups that left quiescence over the cap (a client write, a
+    /// peer message, a proactive edge wake); the cap is soft.
+    CpWakeOvercap,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 145] = [
+    pub const ALL: [Metric; 150] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -1268,6 +1284,11 @@ impl Metric {
         Metric::CpElectionLagNanos,
         Metric::CpElectionStretchNanos,
         Metric::CpHostWaveDeferred,
+        Metric::CpAwakeReplicas,
+        Metric::CpAwakeMaxEffective,
+        Metric::CpWakeQueueDepth,
+        Metric::CpWakeDeferred,
+        Metric::CpWakeOvercap,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -1422,6 +1443,11 @@ impl Metric {
             Metric::CpElectionLagNanos => "cp_election_lag_nanos",
             Metric::CpElectionStretchNanos => "cp_election_stretch_nanos",
             Metric::CpHostWaveDeferred => "cp_host_wave_deferred",
+            Metric::CpAwakeReplicas => "cp_awake_replicas",
+            Metric::CpAwakeMaxEffective => "cp_awake_max_effective",
+            Metric::CpWakeQueueDepth => "cp_wake_queue_depth",
+            Metric::CpWakeDeferred => "cp_wake_deferred",
+            Metric::CpWakeOvercap => "cp_wake_overcap",
         }
     }
 

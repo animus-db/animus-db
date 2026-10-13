@@ -25,12 +25,13 @@
 //!
 //! [`HeartbeatBatcher`]: crate::heartbeat_batch::HeartbeatBatcher
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use animus_env::{Env, EnvExt, Metric, MetricsHandle};
 
+use crate::awake_admission::AwakeAdmission;
 use crate::campaign_governor::CampaignGovernor;
 
 /// The probe period: how long the monitor task sleeps between samples.
@@ -85,19 +86,42 @@ pub fn stretch_nanos_with_gain(lag: u64, base: Duration, max_x: u64, c: u64) -> 
     reading(lag).saturating_mul(c).min(cap)
 }
 
+/// The shared **lag-to-factor** rule (ADR 0079 decision Q9): the divisor a
+/// node-local capacity is reduced by at a given lag estimate. `1` below
+/// [`K_HALVE_AT`], `2` from it, `4` from [`K_QUARTER_AT`] (dead-banded through
+/// [`reading`]). One function, so every capacity that follows the node's
+/// scheduling lag (the campaign governor's `K_eff`, the awake cap's `A_eff`,
+/// later the background pools) reduces by the same thresholds.
+#[must_use]
+pub fn lag_divisor(lag: u64) -> usize {
+    let r = u128::from(reading(lag));
+    if r >= K_QUARTER_AT.as_nanos() {
+        4
+    } else if r >= K_HALVE_AT.as_nanos() {
+        2
+    } else {
+        1
+    }
+}
+
+/// `base` reduced by [`lag_divisor`]; never below 1.
+#[must_use]
+pub fn scale_by_lag(base: usize, lag: u64) -> usize {
+    (base.max(1) / lag_divisor(lag)).max(1)
+}
+
 /// The effective campaign cap for an estimate: `K`, `K/2` at >= 30 ms, `K/4`
 /// (minimum 1) at >= 100 ms; never below 1, never above `k`.
 #[must_use]
 pub fn k_eff(k: usize, lag: u64) -> usize {
-    let r = u128::from(reading(lag));
-    let k = k.max(1);
-    if r >= K_QUARTER_AT.as_nanos() {
-        (k / 4).max(1)
-    } else if r >= K_HALVE_AT.as_nanos() {
-        (k / 2).max(1)
-    } else {
-        k
-    }
+    scale_by_lag(k, lag)
+}
+
+/// The effective awake cap for an estimate (ADR 0079 layer 2): `A` reduced by
+/// the same rule as [`k_eff`]. `a` is the already-resolved cap (at least 1).
+#[must_use]
+pub fn a_eff(a: usize, lag: u64) -> usize {
+    scale_by_lag(a, lag)
 }
 
 struct Inner {
@@ -110,6 +134,9 @@ struct Inner {
     base: Duration,
     metrics: MetricsHandle,
     governor: Option<CampaignGovernor>,
+    /// The node's awake-group admission (ADR 0079), whose `A_eff` follows the
+    /// same lag through the shared rule; attached once after construction.
+    awake: OnceLock<AwakeAdmission>,
 }
 
 /// The per-node monitor handle. Cloning is an `Arc` bump; drivers hold a clone
@@ -175,8 +202,16 @@ impl LoadMonitor {
                 base,
                 metrics,
                 governor,
+                awake: OnceLock::new(),
             }),
         }
+    }
+
+    /// Attach the node's awake-group admission (ADR 0079): from now on its
+    /// `A_eff` follows this monitor's lag. At most once; a second attach is
+    /// ignored.
+    pub fn attach_awake(&self, awake: AwakeAdmission) {
+        let _ = self.inner.awake.set(awake);
     }
 
     /// Fold one probe sample (nanoseconds late) into the estimate and publish.
@@ -192,6 +227,9 @@ impl LoadMonitor {
         );
         if let Some(g) = &self.inner.governor {
             g.set_lag(lag);
+        }
+        if let Some(a) = self.inner.awake.get() {
+            a.set_lag(lag);
         }
     }
 
@@ -343,6 +381,46 @@ mod tests {
             let k = k_eff(32, l);
             assert!(k <= prev && k >= 1);
             prev = k;
+        }
+    }
+
+    /// ADR 0079 decision Q9: `k_eff` was refactored onto the shared helper.
+    /// The pre-refactor body, verbatim, is the oracle over a dense grid.
+    #[test]
+    fn k_eff_is_behaviour_identical_to_the_pre_shared_helper_body() {
+        fn old_k_eff(k: usize, lag: u64) -> usize {
+            let r = u128::from(reading(lag));
+            let k = k.max(1);
+            if r >= K_QUARTER_AT.as_nanos() {
+                (k / 4).max(1)
+            } else if r >= K_HALVE_AT.as_nanos() {
+                (k / 2).max(1)
+            } else {
+                k
+            }
+        }
+        let lags = (0..4000u64).map(|i| i * MS / 8).chain([
+            u64::MAX,
+            29_999_999,
+            30_000_000,
+            99_999_999,
+            100_000_000,
+        ]);
+        for lag in lags {
+            for k in (0..=70usize).chain([1000, 1500, 6000, usize::MAX]) {
+                assert_eq!(k_eff(k, lag), old_k_eff(k, lag), "k={k} lag={lag}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_eff_follows_the_shared_rule() {
+        assert_eq!(a_eff(1500, 0), 1500);
+        assert_eq!(a_eff(1500, 30 * MS), 750);
+        assert_eq!(a_eff(1500, 100 * MS), 375);
+        assert_eq!(a_eff(1, 100 * MS), 1);
+        for lag in [0, 9 * MS, 30 * MS, 99 * MS, 100 * MS, 5000 * MS] {
+            assert_eq!(a_eff(32, lag), k_eff(32, lag));
         }
     }
 

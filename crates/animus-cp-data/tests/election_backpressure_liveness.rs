@@ -181,6 +181,7 @@ impl<S: StorageEngine + 'static> Cluster<S> {
                 let on_down = Arc::clone(&hosted);
                 // The production node assembly (`animusd`'s
                 // `node_election_backpressure` + the reconciler setters).
+                let node_metrics = env.metrics();
                 let governor = CampaignGovernor::new(DEFAULT_CAMPAIGN_MAX_INFLIGHT, env.metrics());
                 let monitor = LoadMonitor::new(
                     &env,
@@ -208,9 +209,25 @@ impl<S: StorageEngine + 'static> Cluster<S> {
                 if std::env::var("ANIMUS_BP_LIVE_QUIESCE").as_deref() != Ok("0") {
                     recon.enable_quiescence(QUIESCE_AFTER);
                 }
+                // `ANIMUS_BP_LIVE_AWAKE_MAX=A` turns ADR 0079's awake-group
+                // admission on at cap `A` per node (default off, as a node
+                // without `--cores`).
+                let awake = std::env::var("ANIMUS_BP_LIVE_AWAKE_MAX")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .filter(|a| *a > 0)
+                    .map(|a| {
+                        let adm = animus_cp_data::awake_admission::AwakeAdmission::new(
+                            a,
+                            node_metrics.clone(),
+                        );
+                        monitor.attach_awake(adm.clone());
+                        adm
+                    });
                 recon.set_election_backpressure(ElectionBackpressure {
                     governor: Some(governor.clone()),
                     monitor: Some(monitor),
+                    awake,
                 });
                 recon.set_host_stagger(DEFAULT_HOST_UNSETTLED_MAX, DEFAULT_HOST_SETTLE_TIMEOUT);
                 Node {

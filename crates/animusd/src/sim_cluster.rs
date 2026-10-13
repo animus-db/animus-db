@@ -330,6 +330,9 @@ fn build_reconciler(
         &env,
         animus_cp_data::campaign_governor::DEFAULT_CAMPAIGN_MAX_INFLIGHT,
         animus_cp_data::load_monitor::DEFAULT_LAG_STRETCH_MAX_X,
+        // ADR 0079 layer 2: the awake cap is off (no `--cores`), as on any
+        // node that does not configure a core count.
+        None,
     );
     let mut reconciler = if backend == SimEngineBackend::Lsm {
         let factory = SimLsmTabletFactory::new(env.clone());

@@ -14,6 +14,7 @@ mod cas_outcome_identity;
 mod cluster_segment_store;
 mod cursor_scope;
 mod demux_stream_teardown;
+mod density_admission_corpus;
 mod directed_placing_under_sustained_load;
 mod election_backpressure_corpus;
 mod engine_layout;

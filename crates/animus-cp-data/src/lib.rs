@@ -64,6 +64,7 @@ use serde::{Deserialize, Serialize};
 
 mod applied;
 mod apply_stall;
+pub mod awake_admission;
 pub mod backup;
 pub mod campaign_governor;
 mod ceiling;
@@ -91,6 +92,7 @@ mod trim_marker;
 mod ts_cache;
 mod txn;
 
+use awake_admission::{AwakeAdmission, WakeAdmission};
 use campaign_governor::{
     Admission, CampaignGovernor, CampaignPermit, CampaignWake, ElectionBackpressure,
 };
@@ -245,6 +247,13 @@ impl Future for ApplyPending<'_> {
 struct WakeSignal {
     /// Set by `shutdown`/`wake`, consumed by the consensus loop.
     pending: AtomicBool,
+    /// Set (with `pending`) by [`RaftKvNode::wake_bulk`] only: the reconciler's
+    /// proactive wake, which ADR 0079's awake-group admission may defer.
+    /// Consumed by the consensus loop's wake arm.
+    bulk: AtomicBool,
+    /// Set (with `pending`) by [`RaftKvNode::wake`]: a client-driven wake that
+    /// wins over a coalesced `bulk` one (the cap is soft, ADR 0079).
+    direct: AtomicBool,
     /// The consensus loop's waker, registered each time it parks.
     waker: AtomicWaker,
 }
@@ -3464,6 +3473,20 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// only causes one extra, inert loop iteration (re-checking `halted` and
     /// re-evaluating `next_deadline`), never an unwanted state change.
     pub fn wake(&self) {
+        self.wake_signal.direct.store(true, Ordering::Release);
+        self.wake_signal.notify();
+    }
+
+    /// A **bulk** wake: [`wake`](Self::wake) that ADR 0079's awake-group
+    /// admission may defer. The host reconciler's proactive wake of every
+    /// group whose replica set touches a newly `Down` node (ADR 0048 fork H)
+    /// is the mass un-quiesce the awake cap exists to pace; it goes through
+    /// here. A deferred group stays quiesced (it keeps its leader belief and
+    /// lease state) and is woken from the FIFO queue when a slot frees. With
+    /// no awake admission on the node this is exactly `wake`. Client-driven
+    /// wakes (`wake`, a propose, a peer message) are never deferred.
+    pub fn wake_bulk(&self) {
+        self.wake_signal.bulk.store(true, Ordering::Release);
         self.wake_signal.notify();
     }
 
@@ -12884,6 +12907,25 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
     let mut permit: Option<CampaignPermit> = None;
     let mut campaign_waiting = false;
     let load_monitor = backpressure.monitor.clone();
+    // ADR 0079 layer 2 (awake-group admission). `awake` is `None` without
+    // `--cores` (the pre-ADR driver, byte for byte). A hosted group registers
+    // as awake (hosting is exempt from the cap) and the guard returns its slot
+    // on every exit of this future. `awake_quiesced` is the quiescence this
+    // loop last reported.
+    let awake: Option<AwakeAdmission> = backpressure.awake.clone();
+    let _awake_membership = awake.as_ref().map(|a| a.membership(stream));
+    let hard_cap = awake.as_ref().is_some_and(AwakeAdmission::is_hard_cap);
+    let mut awake_quiesced = false;
+    // The queue's callback is a *bulk* wake of this group: the re-ask it
+    // triggers goes through the admission again, whereas a client `wake()` of
+    // a queued group (soft cap) does not.
+    let awake_wake: CampaignWake = {
+        let ws = Arc::clone(&wake_signal);
+        Arc::new(move || {
+            ws.bulk.store(true, Ordering::Release);
+            ws.notify();
+        })
+    };
 
     // C-05 PR 2 (ADR 0028): a `Some` shared WAL routes both the recovery
     // READ and every future write through the per-node coordinator (tagged
@@ -13526,34 +13568,63 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         // ahead of taking on more work.
         let persist_arm = PersistArm::new(&persist, persist_fut.as_mut(), gated.min_round());
         let mut own_round_done = false;
-        let (outs, gate): (Vec<(NodeId, KvWire)>, Option<u64>) =
-            match select(persist_arm, stepped).await {
-                // A round landed. Nothing to step: the release below ships
-                // whatever was waiting on it.
-                Either::Left((wake, _)) => {
-                    own_round_done = wake == PersistWake::OwnRoundDone;
-                    (Vec::new(), None)
-                }
-                // ADR 0044 phase 2 (C-02 PR 2): a demuxed batched heartbeat
-                // arrived for this group. Handled through **exactly** the
-                // same path an ordinary wire-arrived `KvWire::Raft` message
-                // takes below (witness, `core.handle`, gate) — see
-                // `heartbeat_batch`'s module doc for why `from` is taken
-                // from the message's own embedded `leader` field rather
-                // than any wire envelope.
-                Either::Right((Either::Left((msg, _)), _)) => {
-                    let entropy = env.next_u64();
-                    let from = match &msg {
-                        RaftMsg::AppendEntries { leader, .. } => leader.clone(),
-                        other => unreachable!(
-                            "HeartbeatBatcher only ever demuxes bare AppendEntries \
+        let (outs, gate): (Vec<(NodeId, KvWire)>, Option<u64>) = match select(persist_arm, stepped)
+            .await
+        {
+            // A round landed. Nothing to step: the release below ships
+            // whatever was waiting on it.
+            Either::Left((wake, _)) => {
+                own_round_done = wake == PersistWake::OwnRoundDone;
+                (Vec::new(), None)
+            }
+            // ADR 0044 phase 2 (C-02 PR 2): a demuxed batched heartbeat
+            // arrived for this group. Handled through **exactly** the
+            // same path an ordinary wire-arrived `KvWire::Raft` message
+            // takes below (witness, `core.handle`, gate) — see
+            // `heartbeat_batch`'s module doc for why `from` is taken
+            // from the message's own embedded `leader` field rather
+            // than any wire envelope.
+            Either::Right((Either::Left((msg, _)), _)) => {
+                let entropy = env.next_u64();
+                let from = match &msg {
+                    RaftMsg::AppendEntries { leader, .. } => leader.clone(),
+                    other => unreachable!(
+                        "HeartbeatBatcher only ever demuxes bare AppendEntries \
                              heartbeats, got {other:?}"
-                        ),
-                    };
-                    witness_append_entries(&hlc, &msg, env.now());
-                    let (raft_outs, gate): (Vec<Out<KvCommand>>, Option<u64>) = {
+                    ),
+                };
+                witness_append_entries(&hlc, &msg, env.now());
+                let (raft_outs, gate): (Vec<Out<KvCommand>>, Option<u64>) = {
+                    let mut c = core.lock().expect("raftkv core poisoned");
+                    let outs = c.handle(from, msg, env.now(), entropy);
+                    (outs, persist.gate(c.has_unflushed_wal()))
+                };
+                (
+                    raft_outs
+                        .into_iter()
+                        .map(|(to, m)| (to, KvWire::Raft(m)))
+                        .collect(),
+                    gate,
+                )
+            }
+            Either::Right((Either::Right((stepped, _)), _)) => match stepped {
+                // Wake-on-propose: ship the new entry now (leader-only; empty otherwise).
+                Either::Left(((), _)) => {
+                    let (raft_outs, gate) = {
                         let mut c = core.lock().expect("raftkv core poisoned");
-                        let outs = c.handle(from, msg, env.now(), entropy);
+                        // ADR 0079 negative control (b) only: a hard cap
+                        // refuses the replication kick of a group that
+                        // holds no awake slot.
+                        let outs =
+                            if hard_cap && awake.as_ref().is_some_and(|a| a.hard_refuses(stream)) {
+                                Vec::new()
+                            } else {
+                                c.replicate_now(env.now())
+                            };
+                        // The gate is read in the **same lock acquisition** as
+                        // the step that made the mutation — the one detail
+                        // both reverted attempts got wrong (see
+                        // `persist_round`'s module doc).
                         (outs, persist.gate(c.has_unflushed_wal()))
                     };
                     (
@@ -13564,141 +13635,48 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
                         gate,
                     )
                 }
-                Either::Right((Either::Right((stepped, _)), _)) => match stepped {
-                    // Wake-on-propose: ship the new entry now (leader-only; empty otherwise).
-                    Either::Left(((), _)) => {
-                        let (raft_outs, gate) = {
-                            let mut c = core.lock().expect("raftkv core poisoned");
-                            let outs = c.replicate_now(env.now());
-                            // The gate is read in the **same lock acquisition** as
-                            // the step that made the mutation — the one detail
-                            // both reverted attempts got wrong (see
-                            // `persist_round`'s module doc).
-                            (outs, persist.gate(c.has_unflushed_wal()))
-                        };
-                        (
-                            raft_outs
-                                .into_iter()
-                                .map(|(to, m)| (to, KvWire::Raft(m)))
-                                .collect(),
-                            gate,
-                        )
-                    }
-                    // Driver-level wake: looping back already re-checks `halted` and
-                    // re-evaluates `next_deadline` (finding 4's hazard 1). It also
-                    // covers a locally-woken **quiesced follower**'s "are you still
-                    // there?" check (ADR 0044 phase-1 PR3, fork B) —
-                    // `on_local_wake` is a no-op for every other state (not quiesced,
-                    // or this node is the leader), so this arm stays inert exactly as
-                    // it was in PR2 for a quiesced-leader wake or any wake on a
-                    // ticking group.
-                    Either::Right((Either::Left(((), _)), _)) => {
-                        let entropy = env.next_u64();
-                        let (raft_outs, gate) = {
-                            let mut c = core.lock().expect("raftkv core poisoned");
-                            let mut outs = c.on_local_wake(env.now(), entropy);
-                            // ADR 0078: a wake from the governor (a slot freed
-                            // for this queued group) retries admission now
-                            // rather than at the next timer.
-                            if campaign_waiting && c.campaign_due(env.now()) {
-                                outs.extend(gated_tick(
-                                    &mut c,
-                                    env.now(),
-                                    entropy,
-                                    governor.as_ref(),
-                                    &mut permit,
-                                    &mut campaign_waiting,
-                                    stream,
-                                    &campaign_wake,
-                                ));
-                            }
-                            (outs, persist.gate(c.has_unflushed_wal()))
-                        };
-                        (
-                            raft_outs
-                                .into_iter()
-                                .map(|(to, m)| (to, KvWire::Raft(m)))
-                                .collect(),
-                            gate,
-                        )
-                    }
-                    Either::Right((Either::Right((Either::Left((envelope, _)), _)), _)) => {
-                        let entropy = env.next_u64();
-                        match codec::decode_wire(&envelope.payload) {
-                            Ok(KvWire::Raft(msg)) => {
-                                // Witnessing point (ADR 0018 §2 amendment): every
-                                // command entry this replica receives — leader or
-                                // follower alike — before the core decides whether to
-                                // accept it (see `witness_append_entries`'s doc).
-                                witness_append_entries(&hlc, &msg, env.now());
-                                let (raft_outs, gate): (Vec<Out<KvCommand>>, Option<u64>) = {
-                                    let mut c = core.lock().expect("raftkv core poisoned");
-                                    let outs = c.handle(envelope.from, msg, env.now(), entropy);
-                                    (outs, persist.gate(c.has_unflushed_wal()))
-                                };
-                                (
-                                    raft_outs
-                                        .into_iter()
-                                        .map(|(to, m)| (to, KvWire::Raft(m)))
-                                        .collect(),
-                                    gate,
-                                )
-                            }
-                            // A ReadProbe is answered iff we are still in the prober's term
-                            // (we have not moved on to help elect a newer leader). Not
-                            // consensus traffic — the core never sees it, and it makes no
-                            // durable claim, so it never waits on a round.
-                            Ok(KvWire::ReadProbe { term, epoch }) => {
-                                let same_term =
-                                    core.lock().expect("raftkv core poisoned").term() == term;
-                                if same_term {
-                                    (
-                                        vec![(envelope.from, KvWire::ReadProbeAck { term, epoch })],
-                                        None,
-                                    )
-                                } else {
-                                    (Vec::new(), None)
-                                }
-                            }
-                            Ok(KvWire::ReadProbeAck { term, epoch }) => {
-                                let mut r = reads.lock().expect("read state poisoned");
-                                if let Some((t, acks)) = r.pending.get_mut(&epoch)
-                                    && *t == term
-                                {
-                                    acks.insert(envelope.from);
-                                    // Issue #1197: wake the parked barrier now
-                                    // (it re-checks quorum + term itself).
-                                    r.ack_generation += 1;
-                                    r.ack_events.bump(r.ack_generation);
-                                }
-                                (Vec::new(), None)
-                            }
-                            // ADR 0044 phase 2: `HeartbeatBatch` only ever
-                            // rides the reserved `HEARTBEAT_BATCH_STREAM`,
-                            // decoded solely by `heartbeat_batch::
-                            // demux_loop` — never a group's own `stream`.
-                            // Unreachable in production (nothing ever sends
-                            // one here), but the match must stay exhaustive;
-                            // logged and dropped like any other
-                            // unexpected-on-this-stream payload.
-                            Ok(KvWire::HeartbeatBatch(_)) => {
-                                tracing::warn!(
-                                    "unexpected KvWire::HeartbeatBatch on a per-group stream, \
-                                     dropped"
-                                );
-                                (Vec::new(), None)
-                            }
-                            Err(err) => {
-                                tracing::warn!(?err, "undecodable raftkv message dropped");
-                                (Vec::new(), None)
+                // Driver-level wake: looping back already re-checks `halted` and
+                // re-evaluates `next_deadline` (finding 4's hazard 1). It also
+                // covers a locally-woken **quiesced follower**'s "are you still
+                // there?" check (ADR 0044 phase-1 PR3, fork B) —
+                // `on_local_wake` is a no-op for every other state (not quiesced,
+                // or this node is the leader), so this arm stays inert exactly as
+                // it was in PR2 for a quiesced-leader wake or any wake on a
+                // ticking group.
+                Either::Right((Either::Left(((), _)), _)) => {
+                    let entropy = env.next_u64();
+                    let (raft_outs, gate) = {
+                        let mut c = core.lock().expect("raftkv core poisoned");
+                        // ADR 0079: a *bulk* wake of a quiesced follower
+                        // (the reconciler's `Down` wake) asks the awake
+                        // admission first; a deferred group stays
+                        // quiesced and is woken from the FIFO queue when
+                        // a slot frees. Every other wake (a client
+                        // `wake()`, shutdown) skips the ask: the cap is
+                        // soft.
+                        let direct = wake_signal.direct.swap(false, Ordering::AcqRel);
+                        let bulk = wake_signal.bulk.swap(false, Ordering::AcqRel) && !direct;
+                        let mut defer = false;
+                        if bulk
+                            && c.is_quiesced()
+                            && !c.is_leader()
+                            && let Some(a) = &awake
+                        {
+                            match a.try_admit_wake(stream, env.now(), &awake_wake) {
+                                WakeAdmission::Deferred => defer = true,
+                                WakeAdmission::Admitted => awake_quiesced = false,
                             }
                         }
-                    }
-                    Either::Right((Either::Right((Either::Right(((), _)), _)), _)) => {
-                        let entropy = env.next_u64();
-                        let (raft_outs, gate) = {
-                            let mut c = core.lock().expect("raftkv core poisoned");
-                            let outs = gated_tick(
+                        let mut outs = if defer {
+                            Vec::new()
+                        } else {
+                            c.on_local_wake(env.now(), entropy)
+                        };
+                        // ADR 0078: a wake from the governor (a slot freed
+                        // for this queued group) retries admission now
+                        // rather than at the next timer.
+                        if campaign_waiting && c.campaign_due(env.now()) {
+                            outs.extend(gated_tick(
                                 &mut c,
                                 env.now(),
                                 entropy,
@@ -13707,54 +13685,160 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
                                 &mut campaign_waiting,
                                 stream,
                                 &campaign_wake,
-                            );
-                            (outs, persist.gate(c.has_unflushed_wal()))
-                        };
-                        // ADR 0044 phase 2 (C-02 PR 2): a bare (no-entries)
-                        // `AppendEntries` from THIS branch — `tick()`'s own
-                        // heartbeat send — is handed to the per-node batcher
-                        // instead of the ordinary immediate pipeline, when
-                        // one is attached. Nothing else `tick()` can emit
-                        // (a non-empty `AppendEntries` still replicating a
-                        // lagging peer, `TimeoutNow`, or the quiesce
-                        // message) is ever batched — only this one shape,
-                        // and only from this one call site (`replicate_now`'s
-                        // wake-on-propose output is never filtered, so ADR
-                        // 0017's single-write latency is untouched). See
-                        // `heartbeat_batch`'s module doc for the full
-                        // rationale, including why this keeps
-                        // `Metric::CpAppendEntriesSent` counting the
-                        // logical per-group heartbeat unchanged (recorded
-                        // inside `HeartbeatBatcher::register` itself, since
-                        // a batched message never reaches
-                        // `record_kv_outbound`'s own `outs` scan below).
-                        let raft_outs = match &heartbeat_batcher {
-                            Some(batcher) => {
-                                let mut rest = Vec::with_capacity(raft_outs.len());
-                                for (to, msg) in raft_outs {
-                                    match &msg {
-                                        RaftMsg::AppendEntries { entries, .. }
-                                            if entries.is_empty() =>
-                                        {
-                                            batcher.register(to, stream, msg);
-                                        }
-                                        _ => rest.push((to, msg)),
-                                    }
-                                }
-                                rest
+                            ));
+                        }
+                        (outs, persist.gate(c.has_unflushed_wal()))
+                    };
+                    (
+                        raft_outs
+                            .into_iter()
+                            .map(|(to, m)| (to, KvWire::Raft(m)))
+                            .collect(),
+                        gate,
+                    )
+                }
+                Either::Right((Either::Right((Either::Left((envelope, _)), _)), _)) => {
+                    let entropy = env.next_u64();
+                    match codec::decode_wire(&envelope.payload) {
+                        // ADR 0079 negative control (b) only: a hard cap
+                        // refuses inbound peer messages to a group that
+                        // holds no awake slot.
+                        Ok(KvWire::Raft(_))
+                            if hard_cap
+                                && awake.as_ref().is_some_and(|a| a.hard_refuses(stream)) =>
+                        {
+                            (Vec::new(), None)
+                        }
+                        Ok(KvWire::Raft(msg)) => {
+                            // Witnessing point (ADR 0018 §2 amendment): every
+                            // command entry this replica receives — leader or
+                            // follower alike — before the core decides whether to
+                            // accept it (see `witness_append_entries`'s doc).
+                            witness_append_entries(&hlc, &msg, env.now());
+                            let (raft_outs, gate): (Vec<Out<KvCommand>>, Option<u64>) = {
+                                let mut c = core.lock().expect("raftkv core poisoned");
+                                let outs = c.handle(envelope.from, msg, env.now(), entropy);
+                                (outs, persist.gate(c.has_unflushed_wal()))
+                            };
+                            (
+                                raft_outs
+                                    .into_iter()
+                                    .map(|(to, m)| (to, KvWire::Raft(m)))
+                                    .collect(),
+                                gate,
+                            )
+                        }
+                        // A ReadProbe is answered iff we are still in the prober's term
+                        // (we have not moved on to help elect a newer leader). Not
+                        // consensus traffic — the core never sees it, and it makes no
+                        // durable claim, so it never waits on a round.
+                        Ok(KvWire::ReadProbe { term, epoch }) => {
+                            let same_term =
+                                core.lock().expect("raftkv core poisoned").term() == term;
+                            if same_term {
+                                (
+                                    vec![(envelope.from, KvWire::ReadProbeAck { term, epoch })],
+                                    None,
+                                )
+                            } else {
+                                (Vec::new(), None)
                             }
-                            None => raft_outs,
-                        };
-                        (
-                            raft_outs
-                                .into_iter()
-                                .map(|(to, m)| (to, KvWire::Raft(m)))
-                                .collect(),
-                            gate,
-                        )
+                        }
+                        Ok(KvWire::ReadProbeAck { term, epoch }) => {
+                            let mut r = reads.lock().expect("read state poisoned");
+                            if let Some((t, acks)) = r.pending.get_mut(&epoch)
+                                && *t == term
+                            {
+                                acks.insert(envelope.from);
+                                // Issue #1197: wake the parked barrier now
+                                // (it re-checks quorum + term itself).
+                                r.ack_generation += 1;
+                                r.ack_events.bump(r.ack_generation);
+                            }
+                            (Vec::new(), None)
+                        }
+                        // ADR 0044 phase 2: `HeartbeatBatch` only ever
+                        // rides the reserved `HEARTBEAT_BATCH_STREAM`,
+                        // decoded solely by `heartbeat_batch::
+                        // demux_loop` — never a group's own `stream`.
+                        // Unreachable in production (nothing ever sends
+                        // one here), but the match must stay exhaustive;
+                        // logged and dropped like any other
+                        // unexpected-on-this-stream payload.
+                        Ok(KvWire::HeartbeatBatch(_)) => {
+                            tracing::warn!(
+                                "unexpected KvWire::HeartbeatBatch on a per-group stream, \
+                                     dropped"
+                            );
+                            (Vec::new(), None)
+                        }
+                        Err(err) => {
+                            tracing::warn!(?err, "undecodable raftkv message dropped");
+                            (Vec::new(), None)
+                        }
                     }
-                },
-            };
+                }
+                Either::Right((Either::Right((Either::Right(((), _)), _)), _)) => {
+                    let entropy = env.next_u64();
+                    let (raft_outs, gate) = {
+                        let mut c = core.lock().expect("raftkv core poisoned");
+                        let outs = gated_tick(
+                            &mut c,
+                            env.now(),
+                            entropy,
+                            governor.as_ref(),
+                            &mut permit,
+                            &mut campaign_waiting,
+                            stream,
+                            &campaign_wake,
+                        );
+                        (outs, persist.gate(c.has_unflushed_wal()))
+                    };
+                    // ADR 0044 phase 2 (C-02 PR 2): a bare (no-entries)
+                    // `AppendEntries` from THIS branch — `tick()`'s own
+                    // heartbeat send — is handed to the per-node batcher
+                    // instead of the ordinary immediate pipeline, when
+                    // one is attached. Nothing else `tick()` can emit
+                    // (a non-empty `AppendEntries` still replicating a
+                    // lagging peer, `TimeoutNow`, or the quiesce
+                    // message) is ever batched — only this one shape,
+                    // and only from this one call site (`replicate_now`'s
+                    // wake-on-propose output is never filtered, so ADR
+                    // 0017's single-write latency is untouched). See
+                    // `heartbeat_batch`'s module doc for the full
+                    // rationale, including why this keeps
+                    // `Metric::CpAppendEntriesSent` counting the
+                    // logical per-group heartbeat unchanged (recorded
+                    // inside `HeartbeatBatcher::register` itself, since
+                    // a batched message never reaches
+                    // `record_kv_outbound`'s own `outs` scan below).
+                    let raft_outs = match &heartbeat_batcher {
+                        Some(batcher) => {
+                            let mut rest = Vec::with_capacity(raft_outs.len());
+                            for (to, msg) in raft_outs {
+                                match &msg {
+                                    RaftMsg::AppendEntries { entries, .. }
+                                        if entries.is_empty() =>
+                                    {
+                                        batcher.register(to, stream, msg);
+                                    }
+                                    _ => rest.push((to, msg)),
+                                }
+                            }
+                            rest
+                        }
+                        None => raft_outs,
+                    };
+                    (
+                        raft_outs
+                            .into_iter()
+                            .map(|(to, m)| (to, KvWire::Raft(m)))
+                            .collect(),
+                        gate,
+                    )
+                }
+            },
+        };
         // Safe only here: the `select` above (which borrows it) has been dropped.
         if own_round_done {
             persist_fut = None;
@@ -13826,6 +13910,15 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             apply_signal.notify();
         }
         quiesced_seen = is_quiesced_now;
+        // ADR 0079: report a quiescence change to the node's awake admission
+        // (a quiesce frees a slot for the wake queue; an un-quiesce that was
+        // not an admitted bulk wake is a soft-cap wake, counted as overcap).
+        if let Some(a) = &awake
+            && awake_quiesced != is_quiesced_now
+        {
+            awake_quiesced = is_quiesced_now;
+            a.report(stream, is_quiesced_now);
+        }
         // Wake-on-commit (ADR 0044 phase-1 PR1): a commit-index advance covers both
         // a follower's in-line apply on `AppendEntries` (gated on `commit_index`
         // alone, so it can create apply work with no separate `mark_durable_through`

@@ -503,6 +503,20 @@ pub struct ClusterSettings {
     /// monitor and the stretch. Node-local, additive, skipped when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lag_stretch_max_x: Option<u64>,
+    /// `--cores N` (ADR 0079 layer 2): this node's **configured** core count,
+    /// the multiplier of the awake-group cap `A = awake_max_per_core x cores`.
+    /// `None` (the default) leaves the cap **off**: the core count is never
+    /// autodetected (ADR 0078 decision 2), so a node without it behaves exactly
+    /// as before. The operator renders it from the pod's CPU limit. Node-local,
+    /// additive, skipped when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cores: Option<usize>,
+    /// `--awake-max-per-core N` (ADR 0079 layer 2): `A` per configured core.
+    /// `None` resolves to [`DEFAULT_AWAKE_MAX_PER_CORE`] (1500); `0` disables
+    /// the cap. Only meaningful with [`cores`](Self::cores). Node-local,
+    /// additive, skipped when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub awake_max_per_core: Option<usize>,
     /// `--region NAME` (ADR 0075 section 4, G-01 stage G-d M3): **this
     /// cluster's own MREC region name** — the namespace of
     /// [`peers`](Self::peers) and of an MREC table's replica set (a *peer
@@ -594,6 +608,10 @@ pub const DEFAULT_MAX_REGION_RTT_MS: u64 = 150;
 
 /// The default [`ClusterSettings::lag_stretch_max_x`] (ADR 0078).
 pub const DEFAULT_LAG_STRETCH_MAX_X: u64 = animus_cp_data::load_monitor::DEFAULT_LAG_STRETCH_MAX_X;
+
+/// The default [`ClusterSettings::awake_max_per_core`] (ADR 0079 layer 2).
+pub const DEFAULT_AWAKE_MAX_PER_CORE: usize =
+    animus_cp_data::awake_admission::DEFAULT_AWAKE_MAX_PER_CORE;
 
 /// The default [`ClusterSettings::campaign_max_inflight`] (ADR 0078).
 pub const DEFAULT_CAMPAIGN_MAX_INFLIGHT: usize =
@@ -866,6 +884,23 @@ impl ClusterConfig {
             .as_ref()
             .and_then(|s| s.lag_stretch_max_x)
             .unwrap_or(DEFAULT_LAG_STRETCH_MAX_X)
+    }
+
+    /// The configured core count ([`ClusterSettings::cores`]); `None` = the
+    /// awake-group cap is off.
+    #[must_use]
+    pub fn cores(&self) -> Option<usize> {
+        self.cluster_settings.as_ref().and_then(|s| s.cores)
+    }
+
+    /// The effective awake-cap per core ([`ClusterSettings::awake_max_per_core`],
+    /// default [`DEFAULT_AWAKE_MAX_PER_CORE`]); `0` disables the cap.
+    #[must_use]
+    pub fn awake_max_per_core(&self) -> usize {
+        self.cluster_settings
+            .as_ref()
+            .and_then(|s| s.awake_max_per_core)
+            .unwrap_or(DEFAULT_AWAKE_MAX_PER_CORE)
     }
 
     /// The effective `host_unsettled_max` ([`ClusterSettings::host_unsettled_max`],
@@ -1454,6 +1489,8 @@ mod tests {
             max_region_rtt_ms: Some(220),
             campaign_max_inflight: Some(16),
             lag_stretch_max_x: Some(2),
+            cores: Some(4),
+            awake_max_per_core: Some(1200),
             region: Some("us".into()),
             peers: vec![PeerCluster {
                 region: "eu".into(),
@@ -1489,6 +1526,11 @@ mod tests {
         assert_eq!(s.campaign_max_inflight, None);
         assert_eq!(s.lag_stretch_max_x, None);
         assert_eq!(cfg.lag_stretch_max_x(), 4);
+        // ADR 0079 layer 2: no `cores` = the awake cap is off, whatever the
+        // per-core figure; the per-core default is 1500.
+        assert_eq!(s.cores, None);
+        assert_eq!(cfg.cores(), None);
+        assert_eq!(cfg.awake_max_per_core(), 1500);
         assert_eq!(s.max_region_rtt_ms, Some(200));
         // Set (including 0 = off) round-trips.
         for k in [0usize, 7, 64] {

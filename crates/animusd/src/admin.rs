@@ -2338,6 +2338,14 @@ fn health<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> (u16, Value) {
         "election_stretch_ms": ctx.env.metrics().get(animus_env::metrics::Metric::CpElectionStretchNanos) / 1_000_000,
         "campaigns_inflight": ctx.env.metrics().get(animus_env::metrics::Metric::CpCampaignInflight),
         "campaigns_queued": ctx.env.metrics().get(animus_env::metrics::Metric::CpCampaignQueueDepth),
+        // ADR 0079 layer 2, advisory only (never part of `ok`): awake data-plane
+        // replicas, the effective awake cap (0 = the cap is off), bulk wakes
+        // queued and ever deferred, and wakes that left quiescence over the cap.
+        "awake": ctx.env.metrics().get(animus_env::metrics::Metric::CpAwakeReplicas),
+        "awake_max_effective": ctx.env.metrics().get(animus_env::metrics::Metric::CpAwakeMaxEffective),
+        "wake_queue_depth": ctx.env.metrics().get(animus_env::metrics::Metric::CpWakeQueueDepth),
+        "wake_deferred": ctx.env.metrics().get(animus_env::metrics::Metric::CpWakeDeferred),
+        "overcap_wakes": ctx.env.metrics().get(animus_env::metrics::Metric::CpWakeOvercap),
     });
     // 503 until the control plane has had a RECENT leader (the readiness
     // signal, hysteresis-gated per issue #595); 200 once it does (whether

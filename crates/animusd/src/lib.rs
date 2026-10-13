@@ -3122,6 +3122,11 @@ pub struct BoundNode {
     /// monitor, no stretch); set from `cluster_settings.lag_stretch_max_x` via
     /// `with_lag_stretch_max_x`.
     lag_stretch_max_x: u64,
+    /// ADR 0079 layer 2: the awake-group cap's configured core count (`None` =
+    /// the cap is off, never autodetected) and `A` per core; set from
+    /// `cluster_settings.{cores,awake_max_per_core}` via `with_awake_admission`.
+    cores: Option<usize>,
+    awake_max_per_core: usize,
     /// ADR 0078 section 3 (staggered hosting): `(host_unsettled_max,
     /// host_settle_timeout)` for this node's host reconciler. Defaults to the
     /// ADR defaults (100, 600 ms); set from `cluster_settings` via
@@ -5827,6 +5832,16 @@ impl BoundNode {
         self
     }
 
+    /// Configure awake-group admission (ADR 0079 layer 2) — see
+    /// `ClusterSettings::{cores, awake_max_per_core}`. `cores == None` (or
+    /// `awake_max_per_core == 0`) leaves the cap off.
+    #[must_use]
+    pub fn with_awake_admission(mut self, cores: Option<usize>, awake_max_per_core: usize) -> Self {
+        self.cores = cores;
+        self.awake_max_per_core = awake_max_per_core;
+        self
+    }
+
     /// Configure staggered hosting (ADR 0078 section 3) — see
     /// `ClusterSettings::host_unsettled_max` / `host_settle_timeout_ms`.
     /// `unsettled_max == 0` disables staggering.
@@ -6518,11 +6533,16 @@ impl BoundNode {
         reconciler.set_max_region_rtt(self.max_region_rtt);
         // ADR 0078: one governor and one load monitor per node, next to the
         // heartbeat batcher; shared by every data-plane group hosted here.
-        if self.campaign_max_inflight > 0 || self.lag_stretch_max_x > 0 {
+        // ADR 0079 layer 2 rides the same handles: the awake cap and its wake
+        // queue, whose `A_eff` follows the monitor's lag.
+        let awake_max =
+            animus_cp_data::awake_admission::resolve_awake_max(self.cores, self.awake_max_per_core);
+        if self.campaign_max_inflight > 0 || self.lag_stretch_max_x > 0 || awake_max.is_some() {
             reconciler.set_election_backpressure(node_election_backpressure(
                 &self.env,
                 self.campaign_max_inflight,
                 self.lag_stretch_max_x,
+                awake_max,
             ));
         }
         // ADR 0078 section 3: staggered hosting, and the gauge `/admin/health`
@@ -7091,6 +7111,8 @@ impl Node {
             max_region_rtt: animus_control::timing::DEFAULT_MAX_REGION_RTT,
             campaign_max_inflight: animus_cp_data::campaign_governor::DEFAULT_CAMPAIGN_MAX_INFLIGHT,
             lag_stretch_max_x: animus_cp_data::load_monitor::DEFAULT_LAG_STRETCH_MAX_X,
+            cores: None,
+            awake_max_per_core: animus_cp_data::awake_admission::DEFAULT_AWAKE_MAX_PER_CORE,
             host_stagger: (
                 animus_cp_data::host::DEFAULT_HOST_UNSETTLED_MAX,
                 animus_cp_data::host::DEFAULT_HOST_SETTLE_TIMEOUT,
@@ -7239,6 +7261,8 @@ impl Node {
             max_region_rtt: animus_control::timing::DEFAULT_MAX_REGION_RTT,
             campaign_max_inflight: animus_cp_data::campaign_governor::DEFAULT_CAMPAIGN_MAX_INFLIGHT,
             lag_stretch_max_x: animus_cp_data::load_monitor::DEFAULT_LAG_STRETCH_MAX_X,
+            cores: None,
+            awake_max_per_core: animus_cp_data::awake_admission::DEFAULT_AWAKE_MAX_PER_CORE,
             host_stagger: (
                 animus_cp_data::host::DEFAULT_HOST_UNSETTLED_MAX,
                 animus_cp_data::host::DEFAULT_HOST_SETTLE_TIMEOUT,
@@ -8288,6 +8312,11 @@ pub struct BoundDataNode {
     /// monitor, no stretch); set from `cluster_settings.lag_stretch_max_x` via
     /// `with_lag_stretch_max_x`.
     lag_stretch_max_x: u64,
+    /// ADR 0079 layer 2: the awake-group cap's configured core count (`None` =
+    /// the cap is off, never autodetected) and `A` per core; set from
+    /// `cluster_settings.{cores,awake_max_per_core}` via `with_awake_admission`.
+    cores: Option<usize>,
+    awake_max_per_core: usize,
     /// ADR 0078 section 3 (staggered hosting): `(host_unsettled_max,
     /// host_settle_timeout)` for this node's host reconciler. Defaults to the
     /// ADR defaults (100, 600 ms); set from `cluster_settings` via
@@ -8335,6 +8364,16 @@ impl BoundDataNode {
     #[must_use]
     pub fn with_lag_stretch_max_x(mut self, x: u64) -> Self {
         self.lag_stretch_max_x = x;
+        self
+    }
+
+    /// Configure awake-group admission (ADR 0079 layer 2) — see
+    /// `ClusterSettings::{cores, awake_max_per_core}`. `cores == None` (or
+    /// `awake_max_per_core == 0`) leaves the cap off.
+    #[must_use]
+    pub fn with_awake_admission(mut self, cores: Option<usize>, awake_max_per_core: usize) -> Self {
+        self.cores = cores;
+        self.awake_max_per_core = awake_max_per_core;
         self
     }
 
@@ -8811,11 +8850,16 @@ impl BoundDataNode {
         reconciler.set_max_region_rtt(self.max_region_rtt);
         // ADR 0078: one governor and one load monitor per node, next to the
         // heartbeat batcher; shared by every data-plane group hosted here.
-        if self.campaign_max_inflight > 0 || self.lag_stretch_max_x > 0 {
+        // ADR 0079 layer 2 rides the same handles: the awake cap and its wake
+        // queue, whose `A_eff` follows the monitor's lag.
+        let awake_max =
+            animus_cp_data::awake_admission::resolve_awake_max(self.cores, self.awake_max_per_core);
+        if self.campaign_max_inflight > 0 || self.lag_stretch_max_x > 0 || awake_max.is_some() {
             reconciler.set_election_backpressure(node_election_backpressure(
                 &self.env,
                 self.campaign_max_inflight,
                 self.lag_stretch_max_x,
+                awake_max,
             ));
         }
         // ADR 0078 section 3: staggered hosting, and the gauge `/admin/health`
@@ -17576,6 +17620,7 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
         .with_max_region_rtt(config.max_region_rtt())
         .with_campaign_max_inflight(config.campaign_max_inflight())
         .with_lag_stretch_max_x(config.lag_stretch_max_x())
+        .with_awake_admission(config.cores(), config.awake_max_per_core())
         .with_host_stagger(config.host_unsettled_max(), config.host_settle_timeout())
         .with_node_capacity(config.node_capacity())
         .with_mrec(
@@ -17613,10 +17658,13 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
 /// campaign cap (`0` = no governor), `stretch_x` the lag-stretch cap as a
 /// multiple of the LAN election base (`0` = no load monitor, which also
 /// leaves `K_eff` at `K`). The monitor spawns its one probe task on `env`.
+/// `awake_max` (ADR 0079 layer 2) is the resolved awake cap `A` (`None` = the
+/// cap is off); its `A_eff` follows the monitor's lag when there is one.
 fn node_election_backpressure<E: Env>(
     env: &E,
     k: usize,
     stretch_x: u64,
+    awake_max: Option<usize>,
 ) -> animus_cp_data::campaign_governor::ElectionBackpressure {
     let governor =
         (k > 0).then(|| animus_cp_data::campaign_governor::CampaignGovernor::new(k, env.metrics()));
@@ -17629,7 +17677,16 @@ fn node_election_backpressure<E: Env>(
             governor.clone(),
         )
     });
-    animus_cp_data::campaign_governor::ElectionBackpressure { governor, monitor }
+    let awake =
+        awake_max.map(|a| animus_cp_data::awake_admission::AwakeAdmission::new(a, env.metrics()));
+    if let (Some(m), Some(a)) = (&monitor, &awake) {
+        m.attach_awake(a.clone());
+    }
+    animus_cp_data::campaign_governor::ElectionBackpressure {
+        governor,
+        monitor,
+        awake,
+    }
 }
 
 /// Install the cluster-config-derived settings `Node::bind` cannot know on a
@@ -17647,6 +17704,7 @@ fn apply_cluster_settings_to_bound(
         .with_max_region_rtt(config.max_region_rtt())
         .with_campaign_max_inflight(config.campaign_max_inflight())
         .with_lag_stretch_max_x(config.lag_stretch_max_x())
+        .with_awake_admission(config.cores(), config.awake_max_per_core())
         .with_host_stagger(config.host_unsettled_max(), config.host_settle_timeout())
         .with_node_capacity(config.node_capacity())
         .with_mrec(
@@ -18250,6 +18308,7 @@ pub async fn run_node_data_with_cluster_settings(
         .with_max_region_rtt(config.max_region_rtt())
         .with_campaign_max_inflight(config.campaign_max_inflight())
         .with_lag_stretch_max_x(config.lag_stretch_max_x())
+        .with_awake_admission(config.cores(), config.awake_max_per_core())
         .with_host_stagger(config.host_unsettled_max(), config.host_settle_timeout())
         .with_node_capacity(config.node_capacity())
         .with_mrec(
@@ -18389,6 +18448,7 @@ pub async fn run_node_growth(
         .with_max_region_rtt(config.max_region_rtt())
         .with_campaign_max_inflight(config.campaign_max_inflight())
         .with_lag_stretch_max_x(config.lag_stretch_max_x())
+        .with_awake_admission(config.cores(), config.awake_max_per_core())
         .with_host_stagger(config.host_unsettled_max(), config.host_settle_timeout())
         .with_node_capacity(config.node_capacity())
         .with_mrec(

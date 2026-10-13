@@ -12180,6 +12180,17 @@ every hosted data-plane group; the control group never sees them.
 `/admin/health` shows `election_lag_ms`, `election_stretch_ms`,
 `campaigns_inflight`, `campaigns_queued` (advisory, never part of `ok`).
 
+`--cores N` / `--awake-max-per-core N` (ADR 0079 layer 2; `--config`/`--node`
+only, merged with `cluster_settings.cores` / `awake_max_per_core`) turn on the
+awake-group cap `A = awake_max_per_core (1500) x cores`. `--cores` is a
+**configured** number, never `available_parallelism`; unset = the cap is off and
+the node is byte-for-byte the pre-0079 driver; `--awake-max-per-core 0` also
+disables it. `node_election_backpressure(env, k, stretch_x, awake_max)` builds
+the `AwakeAdmission` beside the governor and attaches it to the monitor (no
+monitor = no lag feedback). `/admin/health` adds `awake`, `awake_max_effective`
+(0 = off), `wake_queue_depth`, `wake_deferred`, `overcap_wakes` (advisory).
+Mechanism and corpus: `crates/animus-cp-data/CLAUDE.md`, "Awake-group admission".
+
 `cluster_settings.host_unsettled_max` (additive; default 100; `0` disables the
 stagger) and `--host-unsettled-max N`, plus `cluster_settings.
 host_settle_timeout_ms` (default 600; `0` refused) and
