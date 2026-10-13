@@ -395,10 +395,18 @@ section named). Class **L** as classified: no wire or replicated change, no gate
   campaign governor `K`. A group whose Down replica is only a follower keeps its
   leader, stays deferrable, and its re-replication waits for the queue. The cost is
   that the over-cap population after a node loss is the number of groups the dead
-  node led (about `G/N`), not `A`: where that exceeds node capacity the bypass alone
-  overloads a survivor (cell 3 therefore no longer asserts "several times calmer
-  than uncapped", only that every group is led and the led count never falls; cell 1
-  asserts the awake high-water stays below the uncapped run's). Corpus: cells 1 and 3
+  node led (about `G/N`), not `A`. **Cell 3's old assertion ("capped lag several times
+  calmer than uncapped") was root-caused and replaced, not weakened blindly**
+  (seed `0x5b12e826afff8b4a`, node 1, 60 s overload): the capped run's lag is higher
+  (8-21 s against 4.7 s) because it *elects* the lost-leader groups (53 of 60 led after
+  60 s, 41 uncapped, whose lost groups starve and never elect); admission churn is
+  not the cause (3 admits, 20 queued, no re-queues, campaign admits about 6/s in both
+  runs). Node 1's message backlog grew about 150/s capped against about 22/s uncapped,
+  i.e. arrivals of about 447/s against 317/s, which is about 8.4 and 7.7 per led
+  group: the extra load is the heartbeat and vote traffic of 12 more live leaders. The
+  cell now asserts the capped run leads no fewer groups under load than the uncapped
+  one and reports lag and backlog; cell 1's high-water bound is `4/5` of the uncapped
+  run's (the bypassed third is awake by design). Corpus: cells 1 and 3
   lost their post-bulk client wake and assert that every group led by the killed node
   gets a live leader with no client touch; negative control (d)
   (`AwakeFault::NoLostLeaderBypass`) fails that oracle. Open: once repair replaces

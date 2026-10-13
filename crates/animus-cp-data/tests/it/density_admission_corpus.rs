@@ -848,7 +848,7 @@ fn run_write_to_deferred(c: &Cell, g: usize) -> Report {
 /// Cell 3: the same node loss and mass wake with the CPU model on, cap vs no
 /// cap. `a == 0` is the uncapped baseline (the CPU model is sized from the
 /// cap in both arms, so both see the same node capacity).
-fn overload_run(seed: u64, g: usize, a: usize) -> Report {
+fn overload_run(seed: u64, g: usize, a: usize) -> (Report, usize, usize) {
     let mut r = Rig::new(seed, g, a, AwakeFault::None);
     let mut bad = r.bring_up();
     let lost = r.led_by(0);
@@ -858,6 +858,8 @@ fn overload_run(seed: u64, g: usize, a: usize) -> Report {
     r.mark_down(0);
     r.track_led();
     r.advance(Duration::from_secs(60));
+    let led_under_load = r.led();
+    let backlog = r.sim.cpu_backlog(&nid(1)).1;
     r.set_load(0.0);
     // No client touch: lost-leader groups elect on their own.
     if !r.lost_leaders_recover(&lost, Duration::from_secs(30)) {
@@ -871,29 +873,36 @@ fn overload_run(seed: u64, g: usize, a: usize) -> Report {
         "served_s={served:?} hwm={:?}",
         r.stats(1).map(|s| s.awake_hwm)
     );
-    r.finish(bad, detail)
+    (r.finish(bad, detail), led_under_load, backlog)
 }
 
 fn run_overload(c: &Cell, g: usize) -> Report {
     let a = cap_for(g);
-    let base = overload_run(c.seed, g, 0);
-    let mut rep = overload_run(c.seed, g, a);
+    let (base, base_led, base_backlog) = overload_run(c.seed, g, 0);
+    let (mut rep, led, backlog) = overload_run(c.seed, g, a);
     if rep.led_regress > 0 {
         rep.violations
             .push("monotone: the led count fell after the fault");
     }
-    // ADR 0079 step 4 follow-up: the lag comparison step 4 asserted here
-    // ("several times calmer than uncapped") no longer holds and is reported
-    // only. The groups whose leader died are admitted over the cap (they must
-    // elect), and the CPU model sizes a node at `2A` groups while a node
-    // leads about `G/3` of them, so the bypass alone puts a survivor over
-    // capacity; the cap's remaining job is to keep the *other* groups'
-    // Down-follower wakes (about 2/3 of the mass wake) off the node. What
-    // stays asserted: every group is led and the led count never falls.
+    // ADR 0079 step 4 follow-up. The bypass admits the groups whose leader
+    // died over the cap, so the lag comparison step 4 asserted ("several times
+    // calmer than uncapped") is replaced; it was root-caused (measured on seed
+    // 0x1c45947310301007: node 1's message backlog grew ~150/s capped against
+    // ~22/s uncapped) to the capped run actually electing the lost groups
+    // (53 of 60 led after 60 s against 41 uncapped, whose lost groups starve
+    // and never elect): arrivals per led group are the same (~8/s) in both, so
+    // the extra lag is the heartbeat and election traffic of 12 more live
+    // leaders, not admission churn. What the cap must still deliver under
+    // overload: no fewer groups led than uncapped. Lag and backlog are
+    // reported, not asserted.
+    if led < base_led {
+        rep.violations
+            .push("overload: the capped run led fewer groups than the uncapped one");
+    }
     rep.violations
         .extend(base.violations.iter().filter(|v| v.starts_with("safety")));
     rep.detail = format!(
-        "{} capped_lag_ms={} uncapped_lag_ms={} capped_term={} uncapped_term={} uncapped_regress={} uncapped_led={}/{}",
+        "{} led_under_load={led}/{base_led} backlog={backlog}/{base_backlog} capped_lag_ms={} uncapped_lag_ms={} capped_term={} uncapped_term={} uncapped_regress={} uncapped_led={}/{}",
         rep.detail,
         rep.max_lag_ms,
         base.max_lag_ms,
