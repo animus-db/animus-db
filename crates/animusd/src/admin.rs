@@ -2346,6 +2346,11 @@ fn health<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> (u16, Value) {
         "wake_queue_depth": ctx.env.metrics().get(animus_env::metrics::Metric::CpWakeQueueDepth),
         "wake_deferred": ctx.env.metrics().get(animus_env::metrics::Metric::CpWakeDeferred),
         "overcap_wakes": ctx.env.metrics().get(animus_env::metrics::Metric::CpWakeOvercap),
+        // ADR 0079 layer 3, advisory only: per background pool (snapshot send /
+        // receive, learner catch-up, split, compaction) the permits held now,
+        // the high-water mark and the requests deferred; plus compactions that
+        // bypassed the pool at the L0 safety valve. A pool that is off reads 0.
+        "bg_permits": bg_permits_json(&ctx.env.metrics()),
     });
     // 503 until the control plane has had a RECENT leader (the readiness
     // signal, hysteresis-gated per issue #595); 200 once it does (whether
@@ -4263,4 +4268,25 @@ mod system_table_tests {
         assert_eq!(status, 200, "body: {body}");
         assert_eq!(body["available"], true);
     }
+}
+
+/// `/admin/health`'s `bg_permits` object (ADR 0079 layer 3): one entry per
+/// pool, read from the node's metrics.
+fn bg_permits_json(m: &animus_env::MetricsHandle) -> serde_json::Value {
+    use animus_env::metrics::Metric as M;
+    let pool = |inflight, hwm, deferred| {
+        serde_json::json!({
+            "inflight": m.get(inflight),
+            "hwm": m.get(hwm),
+            "deferred": m.get(deferred),
+        })
+    };
+    serde_json::json!({
+        "snapshot_send": pool(M::BgPermitInflightSnapshotSend, M::BgPermitInflightHwmSnapshotSend, M::BgPermitDeferredSnapshotSend),
+        "snapshot_recv": pool(M::BgPermitInflightSnapshotRecv, M::BgPermitInflightHwmSnapshotRecv, M::BgPermitDeferredSnapshotRecv),
+        "catchup": pool(M::BgPermitInflightCatchup, M::BgPermitInflightHwmCatchup, M::BgPermitDeferredCatchup),
+        "split": pool(M::BgPermitInflightSplit, M::BgPermitInflightHwmSplit, M::BgPermitDeferredSplit),
+        "compaction": pool(M::BgPermitInflightCompaction, M::BgPermitInflightHwmCompaction, M::BgPermitDeferredCompaction),
+        "compaction_overcap": m.get(M::BgCompactionOvercap),
+    })
 }

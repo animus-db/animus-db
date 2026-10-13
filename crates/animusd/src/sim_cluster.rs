@@ -333,6 +333,8 @@ fn build_reconciler(
         // ADR 0079 layer 2: the awake cap is off (no `--cores`), as on any
         // node that does not configure a core count.
         None,
+        // ADR 0079 layer 3: every background pool off in the simulated cluster.
+        None,
     );
     let mut reconciler = if backend == SimEngineBackend::Lsm {
         let factory = SimLsmTabletFactory::new(env.clone());
@@ -2678,6 +2680,7 @@ impl SimCluster {
                         stream_seal_knobs: StreamSealKnobs::default(),
                         change_rates: ChangeRateTracker::default(),
                         request_rates: RequestRateTracker::default(),
+                        bg: None,
                     })
                 } else {
                     None
@@ -6375,6 +6378,7 @@ impl SimCluster {
                 stream_seal_knobs: StreamSealKnobs::default(),
                 change_rates: ChangeRateTracker::default(),
                 request_rates: RequestRateTracker::default(),
+                bg: None,
             }),
             // ADR 0061 rung L, C-12 PR 3: the SAME shared `SimSegmentStore`
             // every other node's own `ClientCtx::segment_store` wraps
@@ -7042,6 +7046,7 @@ impl SimCluster {
                 stream_seal_knobs: StreamSealKnobs::default(),
                 change_rates: ChangeRateTracker::default(),
                 request_rates: RequestRateTracker::default(),
+                bg: None,
             }),
             segment_store: SegmentStoreHandle::S3(Arc::new(self.segment_store.clone())),
             backup_store: BackupStoreHandle::S3(Arc::new(self.backup_store.clone())),
@@ -7862,6 +7867,7 @@ impl SimCluster {
                 stream_seal_knobs: StreamSealKnobs::default(),
                 change_rates: ChangeRateTracker::default(),
                 request_rates: RequestRateTracker::default(),
+                bg: None,
             }),
             segment_store: SegmentStoreHandle::S3(Arc::new(self.segment_store.clone())),
             backup_store: BackupStoreHandle::S3(Arc::new(self.backup_store.clone())),

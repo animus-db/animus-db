@@ -65,6 +65,7 @@ use serde::{Deserialize, Serialize};
 mod applied;
 mod apply_stall;
 pub mod awake_admission;
+pub mod background_budget;
 pub mod backup;
 pub mod campaign_governor;
 mod ceiling;
@@ -12933,6 +12934,14 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
     let _awake_membership = awake.as_ref().map(|a| a.membership(stream));
     let hard_cap = awake.as_ref().is_some_and(AwakeAdmission::is_hard_cap);
     let mut awake_quiesced = false;
+    // ADR 0079 layer 3 (background budget): this group's snapshot send/receive
+    // and learner catch-up permits. `None` when every pool is off (the
+    // pre-ADR driver, byte for byte); the permits are RAII and return on every
+    // exit of this future.
+    let mut bg_flow: Option<background_budget::BgFlow> = backpressure
+        .budget
+        .clone()
+        .map(background_budget::BgFlow::new);
     // The queue's callback is a *bulk* wake of this group: the re-ask it
     // triggers goes through the admission again, whereas a client `wake()` of
     // a queued group (soft cap) does not.
@@ -13728,6 +13737,22 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
                         {
                             (Vec::new(), None)
                         }
+                        // ADR 0079 layer 3: an `InstallSnapshot` chunk (or a
+                        // learner's catch-up traffic) that finds this node's
+                        // receive / catch-up pool full is dropped
+                        // unacknowledged; the sender's heartbeat backoff
+                        // resends it (a refused chunk looks like a slow peer).
+                        Ok(KvWire::Raft(msg))
+                            if bg_flow.as_mut().is_some_and(|f| {
+                                let (hb, learner) = {
+                                    let c = core.lock().expect("raftkv core poisoned");
+                                    (c.timing().1, c.is_learner())
+                                };
+                                !f.admit_inbound(&envelope.from, &msg, env.now(), hb, learner)
+                            }) =>
+                        {
+                            (Vec::new(), None)
+                        }
                         Ok(KvWire::Raft(msg)) => {
                             // Witnessing point (ADR 0018 §2 amendment): every
                             // command entry this replica receives — leader or
@@ -13950,6 +13975,20 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         if after_commit > before_commit || install_pending {
             apply_signal.notify();
         }
+        // ADR 0079 layer 3: a snapshot chunk goes out only under a send
+        // permit; our own install ack returns the receive slot; a promoted
+        // learner returns its catch-up slot.
+        let outs = match bg_flow.as_mut() {
+            Some(f) => {
+                let (hb, leader, learner) = {
+                    let c = core.lock().expect("raftkv core poisoned");
+                    (c.timing().1, c.is_leader(), c.is_learner())
+                };
+                f.after_step(learner);
+                f.filter_outbound(outs, env.now(), hb, leader)
+            }
+            None => outs,
+        };
         record_kv_outbound(&metrics, &outs);
 
         // Durability before action, message by message (issue #279). A step that

@@ -296,7 +296,7 @@ const SNAPSHOT_ACK_RESEND_CAP: u32 = 8;
 /// second, structurally new liveness channel for exactly one peer state,
 /// doubling this mechanism's own surface for a cosmetic (not correctness)
 /// win pre-vote already provides for free.
-const SNAPSHOT_HEARTBEAT_BACKOFF_MAX_TICKS: u32 = 32;
+pub const SNAPSHOT_HEARTBEAT_BACKOFF_MAX_TICKS: u32 = 32;
 
 /// Issue #898: how many CONSECUTIVE mid-transfer acks reporting an offset
 /// below the currently tracked `snapshot_offset` this leader tolerates as

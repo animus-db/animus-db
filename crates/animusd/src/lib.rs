@@ -3127,6 +3127,9 @@ pub struct BoundNode {
     /// `cluster_settings.{cores,awake_max_per_core}` via `with_awake_admission`.
     cores: Option<usize>,
     awake_max_per_core: usize,
+    /// ADR 0079 layer 3: the background-work pool sizes; set from
+    /// `cluster_settings.bg_*` via `with_background_budget`.
+    bg_sizes: animus_cp_data::background_budget::BudgetSizes,
     /// ADR 0078 section 3 (staggered hosting): `(host_unsettled_max,
     /// host_settle_timeout)` for this node's host reconciler. Defaults to the
     /// ADR defaults (100, 600 ms); set from `cluster_settings` via
@@ -5842,6 +5845,18 @@ impl BoundNode {
         self
     }
 
+    /// Configure the background-work budget (ADR 0079 layer 3) — see
+    /// `ClusterSettings::bg_*` and [`ClusterConfig::bg_sizes`]. The default is
+    /// the ADR's (snapshot 2/2, catch-up 4, splits 1, compactions off).
+    #[must_use]
+    pub fn with_background_budget(
+        mut self,
+        sizes: animus_cp_data::background_budget::BudgetSizes,
+    ) -> Self {
+        self.bg_sizes = sizes;
+        self
+    }
+
     /// Configure staggered hosting (ADR 0078 section 3) — see
     /// `ClusterSettings::host_unsettled_max` / `host_settle_timeout_ms`.
     /// `unsettled_max == 0` disables staggering.
@@ -6409,12 +6424,22 @@ impl BoundNode {
             self.encryption_key.as_ref(),
         )
         .await?;
+        // ADR 0079 layer 3: the node's background-work budget, shared by the
+        // hosted groups (snapshot / catch-up pools), the tablet engines
+        // (compaction pool) and the split path (`ClientCtx::trigger_split`).
+        let bg_budget = animus_cp_data::background_budget::BackgroundBudget::new(
+            self.bg_sizes,
+            self.env.metrics(),
+        );
         let data_role = DataRole {
             raftkv_metrics,
             base_id: my_id.clone(),
             stream_seal_knobs,
             change_rates: ChangeRateTracker::default(),
             request_rates: RequestRateTracker::default(),
+            bg: Some(animus_cp_data::background_budget::SplitPermits::new(
+                bg_budget.clone(),
+            )),
         };
         // Issue #1060: kept here, alongside (not instead of) the clones
         // `spawn_common_tail` moves below, so `Node::shutdown`/
@@ -6499,7 +6524,10 @@ impl BoundNode {
             match &storage {
                 SharedEngine::Lsm(_) => CpReconciler::Lsm(Reconciler::new(
                     hook_env.clone(),
-                    LsmTabletFactory { env: hook_env },
+                    LsmTabletFactory {
+                        env: hook_env,
+                        bg_budget: Some(bg_budget.clone()),
+                    },
                     my_id.clone(),
                     move |tablet, node: &RaftKvNode<ProdEnv, LsmEngine<ProdEnv>>| {
                         host_edge.register_raftkv(tablet, CpGroup::Lsm(node.clone()));
@@ -6537,12 +6565,17 @@ impl BoundNode {
         // queue, whose `A_eff` follows the monitor's lag.
         let awake_max =
             animus_cp_data::awake_admission::resolve_awake_max(self.cores, self.awake_max_per_core);
-        if self.campaign_max_inflight > 0 || self.lag_stretch_max_x > 0 || awake_max.is_some() {
+        if self.campaign_max_inflight > 0
+            || self.lag_stretch_max_x > 0
+            || awake_max.is_some()
+            || self.bg_sizes != animus_cp_data::background_budget::BudgetSizes::off()
+        {
             reconciler.set_election_backpressure(node_election_backpressure(
                 &self.env,
                 self.campaign_max_inflight,
                 self.lag_stretch_max_x,
                 awake_max,
+                Some(bg_budget.clone()),
             ));
         }
         // ADR 0078 section 3: staggered hosting, and the gauge `/admin/health`
@@ -7113,6 +7146,9 @@ impl Node {
             lag_stretch_max_x: animus_cp_data::load_monitor::DEFAULT_LAG_STRETCH_MAX_X,
             cores: None,
             awake_max_per_core: animus_cp_data::awake_admission::DEFAULT_AWAKE_MAX_PER_CORE,
+            bg_sizes: animus_cp_data::background_budget::BudgetSizes::resolve(
+                None, None, None, None, None,
+            ),
             host_stagger: (
                 animus_cp_data::host::DEFAULT_HOST_UNSETTLED_MAX,
                 animus_cp_data::host::DEFAULT_HOST_SETTLE_TIMEOUT,
@@ -7263,6 +7299,9 @@ impl Node {
             lag_stretch_max_x: animus_cp_data::load_monitor::DEFAULT_LAG_STRETCH_MAX_X,
             cores: None,
             awake_max_per_core: animus_cp_data::awake_admission::DEFAULT_AWAKE_MAX_PER_CORE,
+            bg_sizes: animus_cp_data::background_budget::BudgetSizes::resolve(
+                None, None, None, None, None,
+            ),
             host_stagger: (
                 animus_cp_data::host::DEFAULT_HOST_UNSETTLED_MAX,
                 animus_cp_data::host::DEFAULT_HOST_SETTLE_TIMEOUT,
@@ -8317,6 +8356,9 @@ pub struct BoundDataNode {
     /// `cluster_settings.{cores,awake_max_per_core}` via `with_awake_admission`.
     cores: Option<usize>,
     awake_max_per_core: usize,
+    /// ADR 0079 layer 3: the background-work pool sizes; set from
+    /// `cluster_settings.bg_*` via `with_background_budget`.
+    bg_sizes: animus_cp_data::background_budget::BudgetSizes,
     /// ADR 0078 section 3 (staggered hosting): `(host_unsettled_max,
     /// host_settle_timeout)` for this node's host reconciler. Defaults to the
     /// ADR defaults (100, 600 ms); set from `cluster_settings` via
@@ -8374,6 +8416,18 @@ impl BoundDataNode {
     pub fn with_awake_admission(mut self, cores: Option<usize>, awake_max_per_core: usize) -> Self {
         self.cores = cores;
         self.awake_max_per_core = awake_max_per_core;
+        self
+    }
+
+    /// Configure the background-work budget (ADR 0079 layer 3) — see
+    /// `ClusterSettings::bg_*` and [`ClusterConfig::bg_sizes`]. The default is
+    /// the ADR's (snapshot 2/2, catch-up 4, splits 1, compactions off).
+    #[must_use]
+    pub fn with_background_budget(
+        mut self,
+        sizes: animus_cp_data::background_budget::BudgetSizes,
+    ) -> Self {
+        self.bg_sizes = sizes;
         self
     }
 
@@ -8734,12 +8788,22 @@ impl BoundDataNode {
             self.encryption_key.as_ref(),
         )
         .await?;
+        // ADR 0079 layer 3: the node's background-work budget, shared by the
+        // hosted groups (snapshot / catch-up pools), the tablet engines
+        // (compaction pool) and the split path (`ClientCtx::trigger_split`).
+        let bg_budget = animus_cp_data::background_budget::BackgroundBudget::new(
+            self.bg_sizes,
+            self.env.metrics(),
+        );
         let data_role = DataRole {
             raftkv_metrics,
             base_id: my_id.clone(),
             stream_seal_knobs,
             change_rates: ChangeRateTracker::default(),
             request_rates: RequestRateTracker::default(),
+            bg: Some(animus_cp_data::background_budget::SplitPermits::new(
+                bg_budget.clone(),
+            )),
         };
         // Issue #1060: see the combined-node path's identical comment above
         // `BoundNode::start_with_growth`'s own `spawn_common_tail` call.
@@ -8815,7 +8879,10 @@ impl BoundDataNode {
             match &storage {
                 SharedEngine::Lsm(_) => CpReconciler::Lsm(Reconciler::new(
                     hook_env.clone(),
-                    LsmTabletFactory { env: hook_env },
+                    LsmTabletFactory {
+                        env: hook_env,
+                        bg_budget: Some(bg_budget.clone()),
+                    },
                     my_id.clone(),
                     move |tablet, node: &RaftKvNode<ProdEnv, LsmEngine<ProdEnv>>| {
                         host_edge.register_raftkv(tablet, CpGroup::Lsm(node.clone()));
@@ -8854,12 +8921,17 @@ impl BoundDataNode {
         // queue, whose `A_eff` follows the monitor's lag.
         let awake_max =
             animus_cp_data::awake_admission::resolve_awake_max(self.cores, self.awake_max_per_core);
-        if self.campaign_max_inflight > 0 || self.lag_stretch_max_x > 0 || awake_max.is_some() {
+        if self.campaign_max_inflight > 0
+            || self.lag_stretch_max_x > 0
+            || awake_max.is_some()
+            || self.bg_sizes != animus_cp_data::background_budget::BudgetSizes::off()
+        {
             reconciler.set_election_backpressure(node_election_backpressure(
                 &self.env,
                 self.campaign_max_inflight,
                 self.lag_stretch_max_x,
                 awake_max,
+                Some(bg_budget.clone()),
             ));
         }
         // ADR 0078 section 3: staggered hosting, and the gauge `/admin/health`
@@ -11831,6 +11903,10 @@ struct DataRole {
     /// [`RequestRateTracker`]'s own doc for the full design, including why
     /// it counts writes only.
     pub(crate) request_rates: RequestRateTracker,
+    /// ADR 0079 layer 3: this node's background-work budget and the in-place
+    /// splits holding a [`BgPool::Split`](animus_cp_data::background_budget::BgPool)
+    /// permit. `None` on a `SimCluster` node (every pool off).
+    pub(crate) bg: Option<animus_cp_data::background_budget::SplitPermits>,
 }
 
 /// Shared context for the client request server and the DynamoDB endpoint:
@@ -14372,18 +14448,28 @@ fn parse_tablet_id_from_lsm_filename(filename: &str) -> Option<TabletId> {
 /// destroyed by filename prefix over this node's one `ProdEnv` disk.
 struct LsmTabletFactory {
     env: ProdEnv,
+    /// ADR 0079 layer 3: every tablet engine this factory opens takes its
+    /// compactions from the node's pool (when that pool is on).
+    bg_budget: Option<animus_cp_data::background_budget::BackgroundBudget>,
 }
 
 #[async_trait::async_trait]
 impl animus_cp_data::host::EngineFactory<LsmEngine<ProdEnv>> for LsmTabletFactory {
     async fn open(&self, tablet: TabletId) -> Result<LsmEngine<ProdEnv>, String> {
-        LsmEngine::open_with(
+        let engine = LsmEngine::open_with(
             self.env.clone(),
             &tablet_lsm_prefix(tablet.0),
             LsmOptions::production(),
         )
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+        if let Some(gate) = self.bg_budget.as_ref().and_then(|b| {
+            let env = self.env.clone();
+            b.compaction_gate(Arc::new(move || env.now()))
+        }) {
+            engine.set_compaction_gate(gate);
+        }
+        Ok(engine)
     }
 
     async fn probe(&self, tablet: TabletId) -> bool {
@@ -15242,6 +15328,13 @@ struct AutoSplitThresholds {
 const SPLIT_KEY_NOT_TOKEN_VIABLE: &str =
     "split key rounds onto the tablet's own range start (single-token hot partition)";
 
+/// The retryable refusal of a split request when this node's split pool is full
+/// (ADR 0079 layer 3, `--bg-splits`): not an error in the request. The
+/// auto-split sweeps never reach it (they check
+/// `ClientCtx::split_pool_full` first and try again on their next sweep); a
+/// manual split gets it as a "not now".
+pub(crate) const SPLIT_BUSY: &str = "split pool full (--bg-splits), retry shortly";
+
 // F11 (ADR 0042 §14, Fork D): the split-key token-rounding predicate moved
 // to [`decide::align_split_key`] (ADR 0061 A6) — round-trip-pure over a
 // `Metadata` snapshot, no `self`/network/lock access. Called from the
@@ -15360,6 +15453,11 @@ async fn auto_split_loop<E: Env, R: RelayClient>(
             let Some(leader) = ctx.edge.cp_leader(tablet) else {
                 continue;
             };
+            // ADR 0079 layer 3: with the split pool full, skip this tablet
+            // (no materializing); the next sweep asks again.
+            if ctx.split_pool_full(tablet) {
+                continue;
+            }
             // ADR 0044 phase-1 PR6: a quiesced group's bytes/key-count are,
             // by construction, static — no activity for `quiesce_after`
             // means no new writes since it quiesced, and a write is the
@@ -15540,6 +15638,10 @@ async fn auto_split_loop<E: Env, R: RelayClient>(
             let Some((tablet, _, leader)) = best else {
                 continue;
             };
+            // ADR 0079 layer 3: pool full, try again next sweep.
+            if ctx.split_pool_full(tablet) {
+                continue;
+            }
             let pairs = leader.local_pairs().await;
             let split_key = if pairs.len() >= 2 {
                 // Real data exists: bisect it evenly, same as the other
@@ -17621,6 +17723,7 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
         .with_campaign_max_inflight(config.campaign_max_inflight())
         .with_lag_stretch_max_x(config.lag_stretch_max_x())
         .with_awake_admission(config.cores(), config.awake_max_per_core())
+        .with_background_budget(config.bg_sizes())
         .with_host_stagger(config.host_unsettled_max(), config.host_settle_timeout())
         .with_node_capacity(config.node_capacity())
         .with_mrec(
@@ -17660,11 +17763,14 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
 /// leaves `K_eff` at `K`). The monitor spawns its one probe task on `env`.
 /// `awake_max` (ADR 0079 layer 2) is the resolved awake cap `A` (`None` = the
 /// cap is off); its `A_eff` follows the monitor's lag when there is one.
+/// `budget` (ADR 0079 layer 3) is the node's background-work budget, whose pool
+/// sizes follow the same lag.
 fn node_election_backpressure<E: Env>(
     env: &E,
     k: usize,
     stretch_x: u64,
     awake_max: Option<usize>,
+    budget: Option<animus_cp_data::background_budget::BackgroundBudget>,
 ) -> animus_cp_data::campaign_governor::ElectionBackpressure {
     let governor =
         (k > 0).then(|| animus_cp_data::campaign_governor::CampaignGovernor::new(k, env.metrics()));
@@ -17682,10 +17788,14 @@ fn node_election_backpressure<E: Env>(
     if let (Some(m), Some(a)) = (&monitor, &awake) {
         m.attach_awake(a.clone());
     }
+    if let (Some(m), Some(b)) = (&monitor, &budget) {
+        m.attach_budget(b.clone());
+    }
     animus_cp_data::campaign_governor::ElectionBackpressure {
         governor,
         monitor,
         awake,
+        budget,
     }
 }
 
@@ -17705,6 +17815,7 @@ fn apply_cluster_settings_to_bound(
         .with_campaign_max_inflight(config.campaign_max_inflight())
         .with_lag_stretch_max_x(config.lag_stretch_max_x())
         .with_awake_admission(config.cores(), config.awake_max_per_core())
+        .with_background_budget(config.bg_sizes())
         .with_host_stagger(config.host_unsettled_max(), config.host_settle_timeout())
         .with_node_capacity(config.node_capacity())
         .with_mrec(
@@ -18309,6 +18420,7 @@ pub async fn run_node_data_with_cluster_settings(
         .with_campaign_max_inflight(config.campaign_max_inflight())
         .with_lag_stretch_max_x(config.lag_stretch_max_x())
         .with_awake_admission(config.cores(), config.awake_max_per_core())
+        .with_background_budget(config.bg_sizes())
         .with_host_stagger(config.host_unsettled_max(), config.host_settle_timeout())
         .with_node_capacity(config.node_capacity())
         .with_mrec(
@@ -18449,6 +18561,7 @@ pub async fn run_node_growth(
         .with_campaign_max_inflight(config.campaign_max_inflight())
         .with_lag_stretch_max_x(config.lag_stretch_max_x())
         .with_awake_admission(config.cores(), config.awake_max_per_core())
+        .with_background_budget(config.bg_sizes())
         .with_host_stagger(config.host_unsettled_max(), config.host_settle_timeout())
         .with_node_capacity(config.node_capacity())
         .with_mrec(
@@ -22381,6 +22494,7 @@ mod simenv_client_ctx_tests {
                 stream_seal_knobs: StreamSealKnobs::default(),
                 change_rates: ChangeRateTracker::default(),
                 request_rates: RequestRateTracker::default(),
+                bg: None,
             }),
             ..ctx
         };
@@ -22558,6 +22672,7 @@ mod simenv_client_ctx_tests {
                 stream_seal_knobs: StreamSealKnobs::default(),
                 change_rates: ChangeRateTracker::default(),
                 request_rates: RequestRateTracker::default(),
+                bg: None,
             }),
             ..ctx
         };

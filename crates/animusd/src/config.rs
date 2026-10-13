@@ -517,6 +517,28 @@ pub struct ClusterSettings {
     /// additive, skipped when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub awake_max_per_core: Option<usize>,
+    /// `--bg-snapshot-streams N` (ADR 0079 layer 3): concurrent `InstallSnapshot`
+    /// transfers this node sends, and (separately) receives. `None` resolves to
+    /// 2; `0` turns the pools off (unbounded, the pre-ADR behaviour).
+    /// Node-local (class L), additive, skipped when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg_snapshot_streams: Option<usize>,
+    /// `--bg-catchup-learners N` (ADR 0079 layer 3): learners this node catches
+    /// up at once. `None` resolves to 4; `0` turns the pool off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg_catchup_learners: Option<usize>,
+    /// `--bg-splits N` (ADR 0079 layer 3): in-place splits this node leads at
+    /// once, from `BeginSplitInPlace` to both children's Placing done. `None`
+    /// resolves to 1; `0` turns the pool off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg_splits: Option<usize>,
+    /// `--bg-compactions N` (ADR 0079 layer 3): LSM compactions this node runs
+    /// at once across all tablet engines. `None` resolves to
+    /// `max(1, cores / 2)` when [`cores`](Self::cores) is set and to **off**
+    /// otherwise (today's behaviour); `0` turns the pool off. The operator
+    /// derives it from the pod CPU request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg_compactions: Option<usize>,
     /// `--region NAME` (ADR 0075 section 4, G-01 stage G-d M3): **this
     /// cluster's own MREC region name** — the namespace of
     /// [`peers`](Self::peers) and of an MREC table's replica set (a *peer
@@ -901,6 +923,20 @@ impl ClusterConfig {
             .as_ref()
             .and_then(|s| s.awake_max_per_core)
             .unwrap_or(DEFAULT_AWAKE_MAX_PER_CORE)
+    }
+
+    /// The resolved background-work pool sizes (ADR 0079 layer 3) from
+    /// `bg_*` and [`cores`](Self::cores).
+    #[must_use]
+    pub fn bg_sizes(&self) -> animus_cp_data::background_budget::BudgetSizes {
+        let s = self.cluster_settings.as_ref();
+        animus_cp_data::background_budget::BudgetSizes::resolve(
+            s.and_then(|s| s.bg_snapshot_streams),
+            s.and_then(|s| s.bg_catchup_learners),
+            s.and_then(|s| s.bg_splits),
+            s.and_then(|s| s.bg_compactions),
+            self.cores(),
+        )
     }
 
     /// The effective `host_unsettled_max` ([`ClusterSettings::host_unsettled_max`],
@@ -1491,6 +1527,10 @@ mod tests {
             lag_stretch_max_x: Some(2),
             cores: Some(4),
             awake_max_per_core: Some(1200),
+            bg_snapshot_streams: Some(3),
+            bg_catchup_learners: Some(5),
+            bg_splits: Some(2),
+            bg_compactions: Some(6),
             region: Some("us".into()),
             peers: vec![PeerCluster {
                 region: "eu".into(),
@@ -1531,6 +1571,19 @@ mod tests {
         assert_eq!(s.cores, None);
         assert_eq!(cfg.cores(), None);
         assert_eq!(cfg.awake_max_per_core(), 1500);
+        // ADR 0079 layer 3: snapshot/catch-up/split pools default on, the
+        // compaction pool needs `cores` (or its own flag).
+        let sizes = cfg.bg_sizes();
+        assert_eq!(
+            (
+                sizes.snapshot_send,
+                sizes.catchup,
+                sizes.splits,
+                sizes.compactions
+            ),
+            (Some(2), Some(4), Some(1), None)
+        );
+        assert_eq!(s.bg_snapshot_streams, None);
         assert_eq!(s.max_region_rtt_ms, Some(200));
         // Set (including 0 = off) round-trips.
         for k in [0usize, 7, 64] {

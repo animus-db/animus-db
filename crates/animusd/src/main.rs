@@ -349,7 +349,7 @@ fn otel_instance_label(args: &[String]) -> String {
 const USAGE: &str = "usage:\n  \
     animusd gen-config --nodes N [--host H] [--base-port P] [--region NAME] [--peer REGION=host:port[,..]]... [--allow-insecure-peers] [--mrec-max-clock-skew-ms MS]\n  \
     animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P]\n  \
-    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--max-region-rtt-ms MS] [--campaign-max-inflight N] [--lag-stretch-max N] [--host-unsettled-max N] [--host-settle-timeout-ms MS] [--node-weight N] [--node-max-replicas N] [--cores N] [--awake-max-per-core N] [--region NAME] [--peer REGION=host:port[,host:port...]]... [--allow-insecure-peers] [--mrec-max-clock-skew-ms MS] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH] [--encryption-key PATH]\n  \
+    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--max-region-rtt-ms MS] [--campaign-max-inflight N] [--lag-stretch-max N] [--host-unsettled-max N] [--host-settle-timeout-ms MS] [--node-weight N] [--node-max-replicas N] [--cores N] [--awake-max-per-core N] [--bg-snapshot-streams N] [--bg-catchup-learners N] [--bg-splits N] [--bg-compactions N] [--region NAME] [--peer REGION=host:port[,host:port...]]... [--allow-insecure-peers] [--mrec-max-clock-skew-ms MS] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH] [--encryption-key PATH]\n  \
     animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] [--encryption-key PATH]\n  \
     animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--dynamo-auth PATH]\n  \
     animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral] [--advertise-host NAME] [--label K=V]... [--labels-file PATH [--labels-file-annotations]] [--labels-wait-secs N] [--encryption-key PATH] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3]\n  \
@@ -603,6 +603,12 @@ async fn run(args: &[String]) -> Result<(), String> {
     // (`A` per core, default 1500, `0` disables); same reach and conflict rule.
     let mut cores: Option<usize> = None;
     let mut awake_max_per_core: Option<usize> = None;
+    // ADR 0079 layer 3: the background-work permit pools; same reach and
+    // conflict rule (`--config`/`--node` only).
+    let mut bg_snapshot_streams: Option<usize> = None;
+    let mut bg_catchup_learners: Option<usize> = None;
+    let mut bg_splits: Option<usize> = None;
+    let mut bg_compactions: Option<usize> = None;
     // MREC global-table peer settings (ADR 0075 section 4, G-01 stage G-d M3):
     // `--region NAME`, repeatable `--peer REGION=host:port[,host:port...]`,
     // `--allow-insecure-peers` (dev only) and `--mrec-max-clock-skew-ms MS`.
@@ -783,6 +789,18 @@ async fn run(args: &[String]) -> Result<(), String> {
             "--awake-max-per-core" => {
                 awake_max_per_core = Some(parse_next(&mut it, "--awake-max-per-core")?);
             }
+            "--bg-snapshot-streams" => {
+                bg_snapshot_streams = Some(parse_next(&mut it, "--bg-snapshot-streams")?);
+            }
+            "--bg-catchup-learners" => {
+                bg_catchup_learners = Some(parse_next(&mut it, "--bg-catchup-learners")?);
+            }
+            "--bg-splits" => {
+                bg_splits = Some(parse_next(&mut it, "--bg-splits")?);
+            }
+            "--bg-compactions" => {
+                bg_compactions = Some(parse_next(&mut it, "--bg-compactions")?);
+            }
             "--host-unsettled-max" => {
                 host_unsettled_max = Some(parse_next(&mut it, "--host-unsettled-max")?);
             }
@@ -876,6 +894,10 @@ async fn run(args: &[String]) -> Result<(), String> {
         node_max_replicas,
         cores,
         awake_max_per_core,
+        bg_snapshot_streams,
+        bg_catchup_learners,
+        bg_splits,
+        bg_compactions,
     };
     let orphan_sweep_after =
         orphan_sweep_after_duration(cli_cluster_settings.orphan_sweep_after_secs);
@@ -940,6 +962,19 @@ async fn run(args: &[String]) -> Result<(), String> {
             "--cores/--awake-max-per-core are only supported with --config/--node (set \
              cluster_settings.cores / awake_max_per_core in the config file for the other \
              shapes)"
+                .into(),
+        );
+    }
+    if (bg_snapshot_streams.is_some()
+        || bg_catchup_learners.is_some()
+        || bg_splits.is_some()
+        || bg_compactions.is_some())
+        && config_path.is_none()
+    {
+        return Err(
+            "--bg-snapshot-streams/--bg-catchup-learners/--bg-splits/--bg-compactions are only \
+             supported with --config/--node (set the matching cluster_settings keys in the \
+             config file for the other shapes)"
                 .into(),
         );
     }
@@ -2086,6 +2121,10 @@ fn resolve_cluster_settings(
     merge_field!(node_max_replicas, "--node-max-replicas");
     merge_field!(cores, "--cores");
     merge_field!(awake_max_per_core, "--awake-max-per-core");
+    merge_field!(bg_snapshot_streams, "--bg-snapshot-streams");
+    merge_field!(bg_catchup_learners, "--bg-catchup-learners");
+    merge_field!(bg_splits, "--bg-splits");
+    merge_field!(bg_compactions, "--bg-compactions");
     merge_field!(allow_insecure_peers, "--allow-insecure-peers");
     merge_field!(mrec_max_clock_skew_ms, "--mrec-max-clock-skew-ms");
     if let Some(r) = &cli.region {
@@ -2221,6 +2260,18 @@ async fn run_single(
         let cs = config.cluster_settings.get_or_insert_with(Default::default);
         cs.cores = settings.cores;
         cs.awake_max_per_core = settings.awake_max_per_core;
+    }
+    // ADR 0079 layer 3: the background-work pools travel the same way.
+    if settings.bg_snapshot_streams.is_some()
+        || settings.bg_catchup_learners.is_some()
+        || settings.bg_splits.is_some()
+        || settings.bg_compactions.is_some()
+    {
+        let cs = config.cluster_settings.get_or_insert_with(Default::default);
+        cs.bg_snapshot_streams = settings.bg_snapshot_streams;
+        cs.bg_catchup_learners = settings.bg_catchup_learners;
+        cs.bg_splits = settings.bg_splits;
+        cs.bg_compactions = settings.bg_compactions;
     }
     // ADR 0078 section 3: staggered hosting travels the same way.
     if settings.host_unsettled_max.is_some() || settings.host_settle_timeout_ms.is_some() {

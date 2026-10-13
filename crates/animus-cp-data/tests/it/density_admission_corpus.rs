@@ -59,7 +59,7 @@ use animus_cp_data::host::{
 };
 use animus_cp_data::load_monitor::{LoadMonitor, PROBE};
 use animus_cp_data::{KIND_BASE, RaftKvNode};
-use animus_env::{Clock, EnvExt, Metric, MetricsHandle, nid};
+use animus_env::{Clock, EnvExt, Metric, MetricsHandle, Nanos, nid};
 use animus_sim::{CpuOrder, SimEnv, Simulator};
 use animus_storage::{MemoryEngine, StorageEngine};
 use animus_tablet::{KeyRange, Tablet, TabletId};
@@ -317,6 +317,7 @@ impl Rig {
             governor: Some(self.governors[i].clone()),
             monitor: Some(self.monitors[i].clone()),
             awake: self.awake[i].clone(),
+            budget: None,
         });
         r.set_host_stagger(HOST_H, DEFAULT_HOST_SETTLE_TIMEOUT);
         r
@@ -1220,4 +1221,948 @@ fn a_cap_that_never_binds_is_a_no_op() {
         (rep.led_at_end, rep.max_term, rep.acked)
     }
     assert_eq!(run(0), run(1_000_000));
+}
+
+// ===========================================================================
+// ADR 0079 step 5 (layer 3: the background budget): cells 6-8 and controls.
+//
+// 6.  **snapshot storm**: `G` learners, one per group, on one node all need a
+//     real `InstallSnapshot` at once. Per node the in-flight sends, receives
+//     and catch-up learners never pass their pool (2 / 2 / 4); the chunks the
+//     pools refuse are dropped unacknowledged and resent by the sender's own
+//     backoff; every learner still converges and is promoted; and every
+//     permit is back at the end.
+// 6b. **unacknowledged transfers release their send permit**: a leader's only
+//     send slot goes to a transfer whose receiver never answers; the slot is
+//     released by the unacknowledged bound (`snapshot_unacked_bound`), so the
+//     next group's learner gets it and converges instead of starving.
+// 7.  **split storm**: more eligible tablets than the split pool; driven
+//     through the real `SplitPermits` against a real `Metadata` (BeginSplit,
+//     CutoverSplit, MarkSplitPlacingDone applied by the pure state machine):
+//     in-progress splits never pass the pool and every tablet splits.
+// 8.  **compaction under write load** (`LsmEngine<SimEnv>` with a sync delay,
+//     so runs interleave): admitted compactions never pass the pool, the L0
+//     safety valve is the only way past it and is counted, no acked write is
+//     lost, and after the load every engine's L0 settles under the trigger
+//     while the node's lag keeps the pool at its minimum.
+//
+// Negative controls (each asserts the oracle FAILS). The ADR names them (d)
+// and (e); this file's pre-existing awake-cap control (d) (the lost-leader
+// bypass) already owns that name, so these are `bg_d`, `bg_d2` and `bg_e`.
+//
+// - **bg_d** pool permit leak (`BudgetFault::LeakPermits`) on cell 6: the
+//   learner node's pools fill with permits nobody returns, later learners never
+//   catch up.
+// - **bg_d2** no unacknowledged-transfer bound (`BudgetFault::NoIdleBound`) on
+//   cell 6b: the dead receiver holds the send slot forever, the next learner
+//   starves.
+// - **bg_e** pool minimum 0 under lag (`BudgetFault::PoolMinZero`) on cell 8:
+//   nothing is admitted, L0 only ever drains through the safety valve and the
+//   engines are left over the trigger.
+// ===========================================================================
+
+use animus_control::{ApplyOutcome, MetaCommand, Metadata, NodeStatus, PlacementPolicy};
+use animus_cp_data::background_budget::{
+    BackgroundBudget, BgPool, BudgetFault, BudgetSizes, SplitAdmission, SplitPermits,
+    snapshot_unacked_bound,
+};
+use animus_cp_data::{HostedOptions, StorageScope};
+use animus_storage::{LsmEngine, LsmOptions};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BgKind {
+    SnapshotStorm,
+    UnackedBound,
+    SplitStorm,
+    CompactionLoad,
+}
+
+#[derive(Clone)]
+struct BgCell {
+    name: String,
+    seed: u64,
+    kind: BgKind,
+    fault: BudgetFault,
+}
+
+impl SeedVariant for BgCell {
+    fn scenario_name(&self) -> &str {
+        &self.name
+    }
+    fn reseeded(&self, name: String, seed: u64) -> Self {
+        BgCell {
+            name,
+            seed,
+            ..self.clone()
+        }
+    }
+}
+
+fn bg_cell(name: &str, kind: BgKind, fault: BudgetFault) -> BgCell {
+    BgCell {
+        name: name.to_string(),
+        seed: corpus::name_seed(name),
+        kind,
+        fault,
+    }
+}
+
+fn bg_cells() -> Vec<BgCell> {
+    vec![
+        bg_cell(
+            "cell_6_snapshot_storm",
+            BgKind::SnapshotStorm,
+            BudgetFault::None,
+        ),
+        bg_cell(
+            "cell_6b_unacked_transfer_releases_its_permit",
+            BgKind::UnackedBound,
+            BudgetFault::None,
+        ),
+        bg_cell("cell_7_split_storm", BgKind::SplitStorm, BudgetFault::None),
+        bg_cell(
+            "cell_8_compaction_under_write_load",
+            BgKind::CompactionLoad,
+            BudgetFault::None,
+        ),
+    ]
+}
+
+fn control_bg_d() -> Vec<BgCell> {
+    vec![bg_cell(
+        "control_bg_d_permit_leak",
+        BgKind::SnapshotStorm,
+        BudgetFault::LeakPermits,
+    )]
+}
+
+fn control_bg_d2() -> Vec<BgCell> {
+    vec![bg_cell(
+        "control_bg_d2_no_unacked_bound",
+        BgKind::UnackedBound,
+        BudgetFault::NoIdleBound,
+    )]
+}
+
+fn control_bg_e() -> Vec<BgCell> {
+    vec![bg_cell(
+        "control_bg_e_pool_minimum_zero",
+        BgKind::CompactionLoad,
+        BudgetFault::PoolMinZero,
+    )]
+}
+
+fn bg_select(cells: Vec<BgCell>) -> Vec<BgCell> {
+    let filter = std::env::var("ANIMUS_DENSITY_CELL").ok();
+    let replay = std::env::var("ANIMUS_SEED")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok());
+    corpus::seed_expand(cells, corpus::seeds_from_env("ANIMUS_DENSITY_SEEDS"))
+        .into_iter()
+        .filter(|c| filter.as_ref().is_none_or(|f| c.name.contains(f.as_str())))
+        .map(|mut c| {
+            if let Some(s) = replay {
+                c.seed = s;
+            }
+            c
+        })
+        .collect()
+}
+
+/// Learners (= groups) in the snapshot storm; `ANIMUS_DENSITY_BG_GROUPS`
+/// resizes (must exceed the catch-up pool of 4 to press on it).
+fn bg_groups() -> usize {
+    std::env::var("ANIMUS_DENSITY_BG_GROUPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|g| *g > 4)
+        .unwrap_or(8)
+}
+
+#[derive(Debug, Default)]
+struct BgReport {
+    violations: Vec<String>,
+    /// Deterministic numbers (used for the replay check and the eprintln).
+    detail: String,
+}
+
+impl BgReport {
+    fn bad(&mut self, v: String) {
+        self.violations.push(v);
+    }
+}
+
+const BG_STREAM0: u64 = 500;
+const WARM_WRITES: u64 = 150;
+
+fn voters3() -> Vec<animus_env::NodeId> {
+    NODES.iter().copied().map(nid).collect()
+}
+
+fn bg_start(
+    sim: &Simulator,
+    node: u64,
+    stream: u64,
+    budget: &BackgroundBudget,
+) -> (KvNode, MemoryEngine) {
+    let engine = MemoryEngine::new();
+    let n = RaftKvNode::start_hosted_with_options(
+        sim.env(nid(node)),
+        voters3(),
+        engine.clone(),
+        StorageScope::whole(),
+        stream,
+        HostedOptions {
+            backpressure: ElectionBackpressure {
+                budget: Some(budget.clone()),
+                ..ElectionBackpressure::default()
+            },
+            ..HostedOptions::default()
+        },
+    );
+    (n, engine)
+}
+
+fn bg_leader(group: &[KvNode]) -> Option<usize> {
+    let ls: Vec<usize> = (0..group.len()).filter(|&i| group[i].is_leader()).collect();
+    (ls.len() == 1).then(|| ls[0])
+}
+
+fn bg_warm(group: &[KvNode], l: usize, tag: &str, r: &mut BgReport) {
+    for i in 0..WARM_WRITES {
+        let res = group[l].put(
+            format!("{tag}-{i:03}").into_bytes(),
+            format!("v{tag}-{i}").into_bytes(),
+        );
+        if !matches!(res, ProposeResult::Accepted { .. }) {
+            r.bad(format!("warm: {tag} write {i} refused by its leader"));
+            return;
+        }
+    }
+}
+
+/// Whether `node`'s local engine holds every warm key of `tag`.
+fn bg_has_all(node: &KvNode, tag: &str) -> bool {
+    [0, 1, 64, 100, WARM_WRITES - 1].iter().all(|&i| {
+        block_on(node.local_get(format!("{tag}-{i:03}").as_bytes()))
+            == Some(format!("v{tag}-{i}").into_bytes())
+    })
+}
+
+// --- cell 6 -----------------------------------------------------------------
+
+fn run_snapshot_storm(c: &BgCell, g: usize) -> BgReport {
+    let mut r = BgReport::default();
+    let mut sim = Simulator::new(c.seed);
+    let sizes = BudgetSizes::resolve(None, None, None, None, None);
+    // Nodes 0-2 vote; node 3 hosts every group's learner (and so every pool the
+    // storm presses on). The fault, when any, is the learner node's.
+    let budgets: Vec<BackgroundBudget> = (0..4)
+        .map(|n| {
+            let fault = if n == 3 { c.fault } else { BudgetFault::None };
+            BackgroundBudget::with_fault(sizes, MetricsHandle::recording(), fault)
+        })
+        .collect();
+    let groups: Vec<Vec<KvNode>> = (0..g)
+        .map(|gi| {
+            (0..3)
+                .map(|n| bg_start(&sim, n as u64, BG_STREAM0 + gi as u64, &budgets[n]).0)
+                .collect()
+        })
+        .collect();
+    sim.run_for(Duration::from_secs(3));
+    let mut leaders = Vec::new();
+    for (gi, grp) in groups.iter().enumerate() {
+        match bg_leader(grp) {
+            Some(l) => leaders.push(l),
+            None => {
+                r.bad(format!("bring-up: group {gi} has no single leader"));
+                return r;
+            }
+        }
+    }
+    for (gi, grp) in groups.iter().enumerate() {
+        bg_warm(grp, leaders[gi], &format!("g{gi}"), &mut r);
+    }
+    sim.run_for(Duration::from_secs(4));
+
+    // The storm: every learner joins at the same instant.
+    let learners: Vec<KvNode> = (0..g)
+        .map(|gi| bg_start(&sim, 3, BG_STREAM0 + gi as u64, &budgets[3]).0)
+        .collect();
+    for (gi, grp) in groups.iter().enumerate() {
+        if !matches!(
+            grp[leaders[gi]].add_learner(nid(3)),
+            ProposeResult::Accepted { .. }
+        ) {
+            r.bad(format!("storm: add_learner refused for group {gi}"));
+        }
+    }
+    let mut promoted = vec![false; g];
+    let mut seen: BTreeMap<(usize, u64), usize> = BTreeMap::new();
+    let mut done_at = None;
+    let start = Duration::ZERO;
+    let mut t = start;
+    while t < Duration::from_secs(150) {
+        sim.run_for(Duration::from_millis(250));
+        t += Duration::from_millis(250);
+        for (gi, grp) in groups.iter().enumerate() {
+            for (ni, n) in grp.iter().enumerate() {
+                if n.is_leader() {
+                    match seen.insert((gi, n.term()), ni) {
+                        Some(prev) if prev != ni => r.bad(format!(
+                            "safety: two leaders in group {gi} term {}",
+                            n.term()
+                        )),
+                        _ => {}
+                    }
+                }
+            }
+            if !promoted[gi]
+                && let Some(l) = bg_leader(grp)
+                && grp[l].learner_caught_up(&nid(3), 4)
+                && matches!(
+                    grp[l].promote_learner(nid(3)),
+                    ProposeResult::Accepted { .. }
+                )
+            {
+                promoted[gi] = true;
+            }
+        }
+        if promoted.iter().all(|p| *p)
+            && learners
+                .iter()
+                .enumerate()
+                .all(|(gi, n)| bg_has_all(n, &format!("g{gi}")))
+        {
+            done_at = Some(t);
+            break;
+        }
+    }
+    sim.run_for(Duration::from_secs(10));
+
+    let converged = (0..g)
+        .filter(|&gi| promoted[gi] && bg_has_all(&learners[gi], &format!("g{gi}")))
+        .count();
+    if converged < g {
+        r.bad(format!("converge: {converged} of {g} learners caught up"));
+    }
+    // Pools: never past their size.
+    let caps = [
+        (BgPool::SnapshotSend, 2usize),
+        (BgPool::SnapshotRecv, 2),
+        (BgPool::Catchup, 4),
+    ];
+    let mut detail = format!("done_at={done_at:?} converged={converged}/{g}");
+    for (n, b) in budgets.iter().enumerate() {
+        for (pool, cap) in caps {
+            let s = b.stats(pool);
+            if s.hwm > cap {
+                r.bad(format!("pool: node {n} {pool:?} hwm {} > {cap}", s.hwm));
+            }
+            if s.size_eff.is_some_and(|e| e == 0) {
+                r.bad(format!("pool: node {n} {pool:?} stuck at size 0"));
+            }
+            if s.inflight > 0 {
+                r.bad(format!(
+                    "leak: node {n} {pool:?} still holds {} permits after the storm",
+                    s.inflight
+                ));
+            }
+            detail += &format!(
+                " n{n}.{pool:?}(hwm={} adm={} def={} exp={})",
+                s.hwm, s.admitted, s.deferred, s.expired
+            );
+        }
+    }
+    let pressed = budgets[3].stats(BgPool::Catchup).deferred
+        + budgets[3].stats(BgPool::SnapshotRecv).deferred;
+    if pressed == 0 {
+        r.bad("pressure: the storm never found a full pool".to_string());
+    }
+    r.detail = detail;
+    r
+}
+
+// --- cell 6b ----------------------------------------------------------------
+
+fn run_unacked_bound(c: &BgCell) -> BgReport {
+    let mut r = BgReport::default();
+    let mut sim = Simulator::new(c.seed);
+    // One send slot, shared by both groups' leaders: the contention is the
+    // point, whichever voters lead.
+    let mut sizes = BudgetSizes::off();
+    sizes.snapshot_send = Some(1);
+    let budget = BackgroundBudget::with_fault(sizes, MetricsHandle::recording(), c.fault);
+    // Node 3 hosts group A's learner and has NO receive room: its pool (size 1)
+    // is held by a transfer that never finishes, so it refuses A's first chunk
+    // by not acknowledging it. Node 4 (group B's learner) has room.
+    let mut room = BudgetSizes::off();
+    room.snapshot_recv = Some(1);
+    let full = BackgroundBudget::new(room, MetricsHandle::recording());
+    let _hog = full
+        .try_acquire(BgPool::SnapshotRecv, Nanos(0), None)
+        .expect("the hog takes the only receive slot");
+    let mk = |stream: u64| -> Vec<KvNode> {
+        (0..3)
+            .map(|n| bg_start(&sim, n as u64, stream, &budget).0)
+            .collect()
+    };
+    let (a, b) = (mk(BG_STREAM0), mk(BG_STREAM0 + 1));
+    sim.run_for(Duration::from_secs(3));
+    let (Some(la), Some(lb)) = (bg_leader(&a), bg_leader(&b)) else {
+        r.bad("bring-up: no single leader".into());
+        return r;
+    };
+    bg_warm(&a, la, "ga", &mut r);
+    bg_warm(&b, lb, "gb", &mut r);
+    sim.run_for(Duration::from_secs(4));
+
+    // Group A's learner takes the only send slot first and is never answered.
+    let (_learner_a, _) = bg_start(&sim, 3, BG_STREAM0, &full);
+    let _ = a[la].add_learner(nid(3));
+    sim.run_for(Duration::from_secs(1));
+    let sent_to_a = budget.stats(BgPool::SnapshotSend);
+    if sent_to_a.inflight != 1 {
+        r.bad(format!(
+            "setup: group A's transfer should hold the send slot ({sent_to_a:?})"
+        ));
+    }
+    let (learner_b, _) = bg_start(&sim, 4, BG_STREAM0 + 1, &budget);
+    let _ = b[lb].add_learner(nid(4));
+    let hb = Duration::from_millis(50);
+    let bound = snapshot_unacked_bound(hb);
+    let limit = bound * 2 + Duration::from_secs(15);
+    let mut waited = Duration::ZERO;
+    let mut done = None;
+    while waited < limit {
+        sim.run_for(Duration::from_millis(250));
+        waited += Duration::from_millis(250);
+        if bg_has_all(&learner_b, "gb") {
+            done = Some(waited);
+            break;
+        }
+    }
+    let s = budget.stats(BgPool::SnapshotSend);
+    if done.is_none() {
+        r.bad(format!(
+            "starved: group B's learner never got the send slot held by a transfer \
+             nobody acknowledges (waited {waited:?}, bound {bound:?})"
+        ));
+    }
+    if c.fault == BudgetFault::None && s.expired == 0 {
+        r.bad("bound: the unacknowledged transfer's permit was never released".into());
+    }
+    if s.hwm > 1 {
+        r.bad(format!("pool: send hwm {} > 1", s.hwm));
+    }
+    r.detail = format!(
+        "done={done:?} bound={bound:?} send(hwm={} adm={} def={} exp={})",
+        s.hwm, s.admitted, s.deferred, s.expired
+    );
+    r
+}
+
+// --- cell 7 -----------------------------------------------------------------
+
+/// `splitmix64` step (a seeded, dependency-free generator for the model's
+/// durations).
+fn mix(x: &mut u64) -> u64 {
+    *x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+fn run_split_storm(c: &BgCell) -> BgReport {
+    const TABLETS: usize = 12;
+    const POOL: usize = 1;
+    let mut r = BgReport::default();
+    let mut rng = c.seed;
+    let mut m = Metadata::default();
+    for n in [1u64, 2, 3, 4] {
+        let _ = m.apply(&MetaCommand::UpsertMember {
+            node: nid(n),
+            labels: BTreeMap::new(),
+            status: NodeStatus::Active,
+        });
+    }
+    // One tablet per table (a table's tablets partition its own ring), RF3 on
+    // n2,n3,n4 so each child's directed Placing target (n1,n2,n3) differs and
+    // a `split_placing` obligation exists until it is marked done.
+    for i in 0..TABLETS {
+        let t = TabletId(i as u64 + 1);
+        let table = format!("t{i}");
+        assert_eq!(
+            m.apply(&MetaCommand::CreateTablet {
+                tablet: t,
+                table: Some(table.clone()),
+                range: KeyRange::whole(),
+                replicas: vec![nid(2), nid(3), nid(4)],
+            }),
+            ApplyOutcome::Applied
+        );
+        let _ = m.apply(&MetaCommand::SetTabletPolicy {
+            tablet: t,
+            policy: Some(PlacementPolicy::simple(&table, 3)),
+        });
+    }
+    let budget = BackgroundBudget::with_fault(
+        {
+            let mut s = BudgetSizes::off();
+            s.splits = Some(POOL);
+            s
+        },
+        MetricsHandle::recording(),
+        c.fault,
+    );
+    let permits = SplitPermits::new(budget.clone());
+    let split_key = 0x8000_0000_0000_0000u64.to_be_bytes().to_vec();
+
+    // The model: a started split finishes its fork after `fork`, then its two
+    // children's Placing after `place` more (seeded, a few seconds each).
+    struct Split {
+        parent: TabletId,
+        children: [TabletId; 2],
+        cut_at: Duration,
+        done_at: Duration,
+        cut: bool,
+        done: bool,
+    }
+    let mut running: Vec<Split> = Vec::new();
+    let mut started: BTreeSet<TabletId> = BTreeSet::new();
+    let mut next_child = TABLETS as u64 + 1;
+    let mut max_in_progress = 0usize;
+    let mut busy_refusals = 0u64;
+    let mut placing_rows = 0usize;
+    let mut now = Duration::ZERO;
+    let sweep = Duration::from_secs(2);
+    let mut next_sweep = Duration::ZERO;
+    let limit = Duration::from_secs(60 * 10);
+    while now < limit {
+        let ns = Nanos(now.as_nanos() as u64);
+        // Progress the model.
+        for s in running.iter_mut() {
+            if !s.cut && now >= s.cut_at {
+                let epoch = m.tablets[&s.parent].epoch;
+                assert_eq!(
+                    m.apply(&MetaCommand::CutoverSplit {
+                        parent: s.parent,
+                        expected_epoch: epoch,
+                        cutover_wall_ms: 1,
+                    }),
+                    ApplyOutcome::Applied
+                );
+                s.cut = true;
+                // No directed-Placing obligation (the children already sit on
+                // their targets): the split is finished at cutover.
+                s.done = s
+                    .children
+                    .iter()
+                    .all(|ch| m.split_placing.get(ch).is_none_or(|p| p.done));
+                placing_rows += s
+                    .children
+                    .iter()
+                    .filter(|ch| m.split_placing.contains_key(ch))
+                    .count();
+            }
+            if s.cut && !s.done && now >= s.done_at {
+                for ch in s.children {
+                    if m.split_placing.get(&ch).is_some_and(|p| !p.done) {
+                        let epoch = m.tablets[&ch].epoch;
+                        let _ = m.apply(&MetaCommand::MarkSplitPlacingDone {
+                            tablet: ch,
+                            expected_epoch: epoch,
+                        });
+                    }
+                }
+                s.done = true;
+            }
+        }
+        running.retain(|s| !s.done);
+        // The auto-split sweep: every eligible tablet asks, ascending id.
+        if now >= next_sweep {
+            next_sweep += sweep;
+            let eligible: Vec<TabletId> = (1..=TABLETS as u64)
+                .map(TabletId)
+                .filter(|t| !started.contains(t))
+                .collect();
+            for t in eligible {
+                if permits.pool_full(t, &m, ns) {
+                    busy_refusals += 1;
+                    continue;
+                }
+                match permits.admit(t, &m, ns) {
+                    SplitAdmission::Busy => busy_refusals += 1,
+                    SplitAdmission::Granted(p) => {
+                        let left = TabletId(next_child);
+                        let right = TabletId(next_child + 1);
+                        next_child += 2;
+                        let epoch = m.tablets[&t].epoch;
+                        assert_eq!(
+                            m.apply(&MetaCommand::BeginSplitInPlace {
+                                parent: t,
+                                expected_epoch: epoch,
+                                split_key: split_key.clone(),
+                                children: [
+                                    (left, vec![nid(2), nid(3), nid(4)]),
+                                    (right, vec![nid(2), nid(3), nid(4)]),
+                                ],
+                            }),
+                            ApplyOutcome::Applied
+                        );
+                        if let Some(p) = p {
+                            permits.hold(t, p);
+                        }
+                        started.insert(t);
+                        let fork = Duration::from_millis(500 + mix(&mut rng) % 2_500);
+                        let place = Duration::from_millis(1_000 + mix(&mut rng) % 5_000);
+                        running.push(Split {
+                            parent: t,
+                            children: [left, right],
+                            cut_at: now + fork,
+                            done_at: now + fork + place,
+                            cut: false,
+                            done: false,
+                        });
+                    }
+                }
+            }
+        }
+        max_in_progress = max_in_progress.max(running.len());
+        if running.len() > POOL {
+            r.bad(format!(
+                "pool: {} splits in progress at {now:?}, pool is {POOL}",
+                running.len()
+            ));
+            break;
+        }
+        if started.len() == TABLETS && running.is_empty() {
+            break;
+        }
+        now += Duration::from_millis(100);
+    }
+    // One last release pass, as the next sweep would do.
+    permits.release_finished(&m, Nanos(now.as_nanos() as u64));
+    let split = (1..=TABLETS as u64)
+        .filter(|t| !m.tablets.contains_key(&TabletId(*t)))
+        .count();
+    if split < TABLETS {
+        r.bad(format!("progress: only {split} of {TABLETS} tablets split"));
+    }
+    let s = budget.stats(BgPool::Split);
+    if s.admit_hwm > POOL {
+        r.bad(format!("pool: admit hwm {} > {POOL}", s.admit_hwm));
+    }
+    if s.inflight > 0 || permits.held() > 0 {
+        r.bad(format!(
+            "leak: {} permits / {} held splits after every split finished",
+            s.inflight,
+            permits.held()
+        ));
+    }
+    if busy_refusals == 0 || s.deferred == 0 {
+        r.bad("pressure: the storm never found the pool full".into());
+    }
+    r.detail = format!(
+        "split={split}/{TABLETS} end={now:?} max_in_progress={max_in_progress} \
+         placing_rows={placing_rows} refusals={busy_refusals} adm={} def={}",
+        s.admitted, s.deferred
+    );
+    r
+}
+
+// --- cell 8 -----------------------------------------------------------------
+
+fn run_compaction_load(c: &BgCell) -> BgReport {
+    const ENGINES: usize = 6;
+    const POOL: usize = 2;
+    const WRITES: u64 = 400;
+    const TRIGGER: usize = 4;
+    let mut r = BgReport::default();
+    let mut sim = Simulator::new(c.seed);
+    // A sync delay makes flush and compaction I/O yield, so runs on different
+    // engines genuinely overlap under SimEnv.
+    let mut disk = animus_sim::DiskConfig::default();
+    disk.set_sync_delay(Duration::from_millis(4));
+    sim.set_disk_config_for(nid(0), disk);
+    let env = sim.env(nid(0));
+    let budget = BackgroundBudget::with_fault(
+        {
+            let mut s = BudgetSizes::off();
+            s.compactions = Some(POOL);
+            s
+        },
+        MetricsHandle::recording(),
+        c.fault,
+    );
+    // The node is under sustained load: the pool sits at its lag-reduced size.
+    budget.set_lag(500_000_000);
+    let opts = LsmOptions {
+        flush_threshold_bytes: 256,
+        compaction_trigger: TRIGGER,
+        target_table_bytes: 1024,
+        level_fanout: 2,
+        wal_segment_bytes: 4096,
+        tombstone_grace_versions: 1 << 20,
+        trust_monotonic_versions: false,
+        background_maintenance: true,
+    };
+    let engines: Vec<LsmEngine<SimEnv>> = (0..ENGINES)
+        .map(|i| {
+            let e =
+                block_on(LsmEngine::open_with(env.clone(), format!("e{i}/"), opts)).expect("open");
+            let envc = env.clone();
+            let gate = budget
+                .compaction_gate(Arc::new(move || envc.now()))
+                .expect("compaction pool on");
+            e.set_compaction_gate(gate);
+            e
+        })
+        .collect();
+    let acked: Arc<std::sync::Mutex<Vec<(usize, u64)>>> = Arc::default();
+    for (i, e) in engines.iter().enumerate() {
+        let e = e.clone();
+        let acked = Arc::clone(&acked);
+        let wenv = env.clone();
+        env.spawn_task(async move {
+            for k in 0..WRITES {
+                let key = format!("k{k:05}");
+                let val = format!("v{i}-{k}");
+                if e.put(key.as_bytes(), val.as_bytes(), k + 1).await.is_ok() {
+                    acked.lock().unwrap().push((i, k));
+                }
+                wenv.sleep(Duration::from_millis(2)).await;
+            }
+        });
+    }
+    let mut max_l0 = 0usize;
+    let mut t = Duration::ZERO;
+    while t < Duration::from_secs(40)
+        && (acked.lock().unwrap().len() as u64) < ENGINES as u64 * WRITES
+    {
+        sim.run_for(Duration::from_millis(50));
+        t += Duration::from_millis(50);
+        for e in &engines {
+            max_l0 = max_l0.max(e.l0_table_count());
+        }
+    }
+    let load_ended = t;
+    // Load over: the pool alone must settle every engine under the trigger.
+    let mut settled = None;
+    let mut waited = Duration::ZERO;
+    while waited < Duration::from_secs(60) {
+        if engines.iter().all(|e| e.l0_table_count() < TRIGGER) {
+            settled = Some(waited);
+            break;
+        }
+        sim.run_for(Duration::from_millis(250));
+        waited += Duration::from_millis(250);
+    }
+    let s = budget.stats(BgPool::Compaction);
+    if s.admit_hwm > POOL {
+        r.bad(format!(
+            "pool: admitted compactions hwm {} > {POOL}",
+            s.admit_hwm
+        ));
+    }
+    // A bypass is the only way past the pool, and each engine runs one
+    // maintenance pass at a time.
+    if s.hwm > POOL + ENGINES {
+        r.bad(format!(
+            "bypass: hwm {} > pool {POOL} + one bypass per engine {ENGINES}",
+            s.hwm
+        ));
+    }
+    if s.bypassed > 0 && max_l0 < 2 * TRIGGER {
+        r.bad(format!(
+            "bypass: {} bypasses but L0 never reached 2 x trigger (max {max_l0})",
+            s.bypassed
+        ));
+    }
+    if s.admitted == 0 {
+        r.bad("stalled: the pool admitted no compaction at all".into());
+    }
+    if settled.is_none() {
+        let left: Vec<usize> = engines.iter().map(LsmEngine::l0_table_count).collect();
+        r.bad(format!(
+            "settle: L0 never fell under the trigger after the load (L0 per engine {left:?})"
+        ));
+    }
+    let acked = acked.lock().unwrap().clone();
+    if acked.len() as u64 != ENGINES as u64 * WRITES {
+        r.bad(format!(
+            "writes: {} of {} writes acked",
+            acked.len(),
+            ENGINES as u64 * WRITES
+        ));
+    }
+    let lost = acked
+        .iter()
+        .filter(|(i, k)| {
+            let got = block_on(engines[*i].get(format!("k{k:05}").as_bytes()))
+                .ok()
+                .flatten()
+                .map(|v| v.value);
+            got != Some(format!("v{i}-{k}").into_bytes())
+        })
+        .count();
+    if lost > 0 {
+        r.bad(format!("safety: {lost} acked writes lost or wrong"));
+    }
+    if s.inflight > 0 {
+        r.bad(format!(
+            "leak: {} compaction permits still held",
+            s.inflight
+        ));
+    }
+    r.detail = format!(
+        "load_ended={load_ended:?} max_l0={max_l0} settled={settled:?} adm={} def={} bypass={} hwm={} admit_hwm={} \
+         compactions={}",
+        s.admitted,
+        s.deferred,
+        s.bypassed,
+        s.hwm,
+        s.admit_hwm,
+        engines.iter().map(LsmEngine::compaction_count).sum::<u64>()
+    );
+    r
+}
+
+fn run_bg_cell(c: &BgCell) -> BgReport {
+    match c.kind {
+        BgKind::SnapshotStorm => run_snapshot_storm(c, bg_groups()),
+        BgKind::UnackedBound => run_unacked_bound(c),
+        BgKind::SplitStorm => run_split_storm(c),
+        BgKind::CompactionLoad => run_compaction_load(c),
+    }
+}
+
+#[test]
+fn background_budget_cells_pass_the_oracle() {
+    for c in bg_select(bg_cells()) {
+        let r = run_bg_cell(&c);
+        eprintln!(
+            "DENSITY-BG-CELL {} seed={:#x} {} {:?}",
+            c.name, c.seed, r.detail, r.violations
+        );
+        assert!(
+            r.violations.is_empty(),
+            "{} seed={:#x}: {:?} ({})",
+            c.name,
+            c.seed,
+            r.violations,
+            r.detail
+        );
+    }
+}
+
+/// NEGATIVE CONTROL bg_d (ADR control (d)): permits never returned. The learner
+/// node's catch-up pool fills with permits of promoted learners, the rest never
+/// catch up, and the oracle must say so.
+#[test]
+fn control_bg_d_a_permit_leak_strands_learners() {
+    for c in bg_select(control_bg_d()) {
+        let r = run_bg_cell(&c);
+        eprintln!(
+            "DENSITY-BG-CONTROL {} seed={:#x} {} {:?}",
+            c.name, c.seed, r.detail, r.violations
+        );
+        assert!(
+            r.violations.iter().all(|v| !v.starts_with("safety")),
+            "{}: safety must hold: {:?}",
+            c.name,
+            r.violations
+        );
+        assert!(
+            r.violations.iter().any(|v| v.starts_with("converge:")),
+            "{} seed={:#x}: a leaking pool must strand learners: {:?} ({})",
+            c.name,
+            c.seed,
+            r.violations,
+            r.detail
+        );
+        assert!(
+            r.violations.iter().any(|v| v.starts_with("leak:")),
+            "{} seed={:#x}: the leak must be visible as held permits: {:?}",
+            c.name,
+            c.seed,
+            r.violations
+        );
+    }
+}
+
+/// NEGATIVE CONTROL bg_d2: no unacknowledged-transfer bound. A dead receiver
+/// keeps the only send slot and the next group's learner starves.
+#[test]
+fn control_bg_d2_no_unacked_bound_starves_the_next_transfer() {
+    for c in bg_select(control_bg_d2()) {
+        let r = run_bg_cell(&c);
+        eprintln!(
+            "DENSITY-BG-CONTROL {} seed={:#x} {} {:?}",
+            c.name, c.seed, r.detail, r.violations
+        );
+        assert!(
+            r.violations.iter().any(|v| v.starts_with("starved:")),
+            "{} seed={:#x}: without the bound the next learner must starve: {:?} ({})",
+            c.name,
+            c.seed,
+            r.violations,
+            r.detail
+        );
+    }
+}
+
+/// NEGATIVE CONTROL bg_e (ADR control (e)): the pool may reach size 0 under
+/// lag. Nothing is admitted, L0 drains only through the safety valve, and the
+/// engines are left over the trigger.
+#[test]
+fn control_bg_e_pool_minimum_zero_stalls_compaction() {
+    for c in bg_select(control_bg_e()) {
+        let r = run_bg_cell(&c);
+        eprintln!(
+            "DENSITY-BG-CONTROL {} seed={:#x} {} {:?}",
+            c.name, c.seed, r.detail, r.violations
+        );
+        assert!(
+            r.violations.iter().all(|v| !v.starts_with("safety")),
+            "{}: no acked write may be lost even when compaction stalls: {:?}",
+            c.name,
+            r.violations
+        );
+        assert!(
+            r.violations.iter().any(|v| v.starts_with("stalled:"))
+                && r.violations.iter().any(|v| v.starts_with("settle:")),
+            "{} seed={:#x}: a pool that can reach 0 must stall compaction: {:?} ({})",
+            c.name,
+            c.seed,
+            r.violations,
+            r.detail
+        );
+    }
+}
+
+#[test]
+fn background_cell_names_and_seeds_are_unique_and_frozen() {
+    let all: Vec<BgCell> = bg_cells()
+        .into_iter()
+        .chain(control_bg_d())
+        .chain(control_bg_d2())
+        .chain(control_bg_e())
+        .collect();
+    let names: BTreeSet<&str> = all.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names.len(), all.len());
+    for c in &all {
+        assert_eq!(c.seed, corpus::name_seed(&c.name));
+    }
+}
+
+/// The same seed replays to the same numbers (no new nondeterminism).
+#[test]
+fn a_background_run_is_a_pure_function_of_its_seed() {
+    for kind in [BgKind::SplitStorm, BgKind::CompactionLoad] {
+        let c = bg_cell("bg_determinism", kind, BudgetFault::None);
+        assert_eq!(run_bg_cell(&c).detail, run_bg_cell(&c).detail, "{kind:?}");
+    }
 }

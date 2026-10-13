@@ -1133,12 +1133,51 @@ pub enum Metric {
     /// A counter: groups that left quiescence over the cap (a client write, a
     /// peer message, a proactive edge wake); the cap is soft.
     CpWakeOvercap,
+    // --- Background-work budget (ADR 0079 layer 3; appended, same
+    // slot-stability discipline). `BgPermitInflight*` is the pool's permits
+    // held now, `BgPermitInflightHwm*` its high-water mark, `BgPermitDeferred*`
+    // the requests refused for want of a free permit (counted once per
+    // requester until it is admitted). A pool that is off (size 0) records
+    // nothing. ---
+    /// A level: `SnapshotSend` permits held now.
+    BgPermitInflightSnapshotSend,
+    /// A level: `SnapshotRecv` permits held now.
+    BgPermitInflightSnapshotRecv,
+    /// A level: `Catchup` permits held now.
+    BgPermitInflightCatchup,
+    /// A level: `Split` permits held now.
+    BgPermitInflightSplit,
+    /// A level: `Compaction` permits held now.
+    BgPermitInflightCompaction,
+    /// A high-water mark: most `SnapshotSend` permits ever held at once.
+    BgPermitInflightHwmSnapshotSend,
+    /// A high-water mark: most `SnapshotRecv` permits ever held at once.
+    BgPermitInflightHwmSnapshotRecv,
+    /// A high-water mark: most `Catchup` permits ever held at once.
+    BgPermitInflightHwmCatchup,
+    /// A high-water mark: most `Split` permits ever held at once.
+    BgPermitInflightHwmSplit,
+    /// A high-water mark: most `Compaction` permits ever held at once.
+    BgPermitInflightHwmCompaction,
+    /// A counter: `SnapshotSend` requests deferred (no permit free).
+    BgPermitDeferredSnapshotSend,
+    /// A counter: `SnapshotRecv` requests deferred (no permit free).
+    BgPermitDeferredSnapshotRecv,
+    /// A counter: `Catchup` requests deferred (no permit free).
+    BgPermitDeferredCatchup,
+    /// A counter: `Split` requests deferred (no permit free).
+    BgPermitDeferredSplit,
+    /// A counter: `Compaction` requests deferred (no permit free).
+    BgPermitDeferredCompaction,
+    /// A counter: compactions that bypassed the pool because L0 reached
+    /// `2 x compaction_trigger` (the safety valve).
+    BgCompactionOvercap,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 150] = [
+    pub const ALL: [Metric; 166] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -1289,6 +1328,22 @@ impl Metric {
         Metric::CpWakeQueueDepth,
         Metric::CpWakeDeferred,
         Metric::CpWakeOvercap,
+        Metric::BgPermitInflightSnapshotSend,
+        Metric::BgPermitInflightSnapshotRecv,
+        Metric::BgPermitInflightCatchup,
+        Metric::BgPermitInflightSplit,
+        Metric::BgPermitInflightCompaction,
+        Metric::BgPermitInflightHwmSnapshotSend,
+        Metric::BgPermitInflightHwmSnapshotRecv,
+        Metric::BgPermitInflightHwmCatchup,
+        Metric::BgPermitInflightHwmSplit,
+        Metric::BgPermitInflightHwmCompaction,
+        Metric::BgPermitDeferredSnapshotSend,
+        Metric::BgPermitDeferredSnapshotRecv,
+        Metric::BgPermitDeferredCatchup,
+        Metric::BgPermitDeferredSplit,
+        Metric::BgPermitDeferredCompaction,
+        Metric::BgCompactionOvercap,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -1448,6 +1503,22 @@ impl Metric {
             Metric::CpWakeQueueDepth => "cp_wake_queue_depth",
             Metric::CpWakeDeferred => "cp_wake_deferred",
             Metric::CpWakeOvercap => "cp_wake_overcap",
+            Metric::BgPermitInflightSnapshotSend => "bg_permit_inflight_snapshot_send",
+            Metric::BgPermitInflightSnapshotRecv => "bg_permit_inflight_snapshot_recv",
+            Metric::BgPermitInflightCatchup => "bg_permit_inflight_catchup",
+            Metric::BgPermitInflightSplit => "bg_permit_inflight_split",
+            Metric::BgPermitInflightCompaction => "bg_permit_inflight_compaction",
+            Metric::BgPermitInflightHwmSnapshotSend => "bg_permit_inflight_hwm_snapshot_send",
+            Metric::BgPermitInflightHwmSnapshotRecv => "bg_permit_inflight_hwm_snapshot_recv",
+            Metric::BgPermitInflightHwmCatchup => "bg_permit_inflight_hwm_catchup",
+            Metric::BgPermitInflightHwmSplit => "bg_permit_inflight_hwm_split",
+            Metric::BgPermitInflightHwmCompaction => "bg_permit_inflight_hwm_compaction",
+            Metric::BgPermitDeferredSnapshotSend => "bg_permit_deferred_snapshot_send",
+            Metric::BgPermitDeferredSnapshotRecv => "bg_permit_deferred_snapshot_recv",
+            Metric::BgPermitDeferredCatchup => "bg_permit_deferred_catchup",
+            Metric::BgPermitDeferredSplit => "bg_permit_deferred_split",
+            Metric::BgPermitDeferredCompaction => "bg_permit_deferred_compaction",
+            Metric::BgCompactionOvercap => "bg_compaction_overcap",
         }
     }
 

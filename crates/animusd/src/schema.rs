@@ -18,7 +18,7 @@ use crate::{
     BROADCAST_EXHAUSTED_BACKOFF, CLIENT_TIMEOUT, ClientCtx, ClientRequest, ClientResponse, CpRoute,
     FORWARD_HOP_TIMEOUT, MAX_REPLICATION_FACTOR, MetaCommand, NodeAddrs, NodeStatus,
     PlacementPolicy, ProposeResult, RegisterOutcome, SCHEMA_COMMIT_TIMEOUT, SCHEMA_POLL_INTERVAL,
-    SCHEMA_PROPOSE_PATIENCE, SPLIT_KEY_NOT_TOKEN_VIABLE, STREAM_GROW_MID_SPLIT,
+    SCHEMA_PROPOSE_PATIENCE, SPLIT_BUSY, SPLIT_KEY_NOT_TOKEN_VIABLE, STREAM_GROW_MID_SPLIT,
     STREAM_GROW_NO_SPLIT_POINT, WATCH_METADATA_SERVER_TIMEOUT, decide, index_drain,
     median_split_key, topology,
 };
@@ -542,16 +542,58 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     ///
     /// Routed to the control leader (relayable, [`is_relayable_command`]), so
     /// this works from any node the client happens to be connected to.
-    #[tracing::instrument(
-        name = "split_tablet",
-        skip(self, split_key),
-        fields(tablet = tablet.0, new_id = tracing::field::Empty)
-    )]
+    ///
+    /// **Split pool (ADR 0079 layer 3).** A split this node starts takes a
+    /// split-pool permit (default 1) held until the split is finished in the
+    /// replicated `Metadata` (`SplitPermits`); with the pool full the call is
+    /// refused with the retryable [`SPLIT_BUSY`] error, and the auto-split
+    /// sweeps (which check [`split_pool_full`](Self::split_pool_full) first)
+    /// skip the tablet until their next sweep.
     pub(crate) async fn trigger_split(
         &self,
         tablet: TabletId,
         split_key: Vec<u8>,
     ) -> ClientResponse {
+        use animus_cp_data::background_budget::SplitAdmission;
+        let pool = self.split_pool();
+        let permit = match pool.map(|p| p.admit(tablet, &self.effective_metadata(), self.env.now()))
+        {
+            Some(SplitAdmission::Busy) => return ClientResponse::Error(SPLIT_BUSY.into()),
+            Some(SplitAdmission::Granted(p)) => p,
+            None => None,
+        };
+        let response = self.trigger_split_begin(tablet, split_key).await;
+        // Success (the split began, or was already running) keeps the permit
+        // until the split finishes; a failure drops it here.
+        if matches!(response, ClientResponse::PutOk)
+            && let (Some(p), Some(pool)) = (permit, pool)
+        {
+            pool.hold(tablet, p);
+        }
+        response
+    }
+
+    /// This node's split pool (ADR 0079 layer 3), when it is on.
+    fn split_pool(&self) -> Option<&animus_cp_data::background_budget::SplitPermits> {
+        self.data
+            .as_ref()
+            .and_then(|d| d.bg.as_ref())
+            .filter(|bg| bg.is_on())
+    }
+
+    /// Whether a new split of `tablet` would be refused now (the auto-split
+    /// sweeps skip the tablet instead of materializing it).
+    pub(crate) fn split_pool_full(&self, tablet: TabletId) -> bool {
+        self.split_pool()
+            .is_some_and(|p| p.pool_full(tablet, &self.effective_metadata(), self.env.now()))
+    }
+
+    #[tracing::instrument(
+        name = "split_tablet",
+        skip(self, split_key),
+        fields(tablet = tablet.0, new_id = tracing::field::Empty)
+    )]
+    async fn trigger_split_begin(&self, tablet: TabletId, split_key: Vec<u8>) -> ClientResponse {
         // `effective_metadata()`, not `self.control.metadata_cached()`
         // directly (ADR 0035 PR5 staleness-audit fix): unlike a plain stale
         // read racing a *concurrent* epoch bump — which the CAS below catches

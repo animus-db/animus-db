@@ -228,6 +228,7 @@ impl<S: StorageEngine + 'static> Cluster<S> {
                     governor: Some(governor.clone()),
                     monitor: Some(monitor),
                     awake,
+                    budget: None,
                 });
                 recon.set_host_stagger(DEFAULT_HOST_UNSETTLED_MAX, DEFAULT_HOST_SETTLE_TIMEOUT);
                 Node {
