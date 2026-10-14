@@ -81,7 +81,9 @@ async fn a_panicked_consensus_task_fails_health_and_counts() {
     assert_eq!(body["consensus_task_panics"], 0, "{body}");
     assert_eq!(body["ok"], true, "{body}");
     // Issue #1274: `/admin/ready` (the readiness probe) is 200 too.
-    let (rs, rbody) = get(admin, "/admin/ready").await.expect("ready answers");
+    // Readiness converges after health (the metadata mirror syncs a beat
+    // later), so poll for it rather than sampling once.
+    let (rs, rbody) = wait_for(admin, "/admin/ready", "a ready node", |s, _| s == 200).await;
     assert_eq!(rs, 200, "{rbody}");
     assert_eq!(rbody["metadata_synced"], true, "{rbody}");
 
