@@ -3352,3 +3352,25 @@ production code.
 - **Fixtures** `metadata/v1-capacity.json`, `mirror-entities/node_capacity/v1.json`;
   `capacity_wire_shapes_are_pinned` freezes the command JSON. `sim_versions`
   `content_gate` names the new shapes by content.
+
+## Repair pacing (`repair_pacing.rs`, ADR 0079 step 6)
+
+`reconcile_loop` no longer proposes every violating tablet's repair in one
+tick: `RepairPacer::select` lets through at most `R` (`RepairPacing::per_tick`,
+default 8) new `CasTabletReplicas` per tick, ascending `TabletId`, while fewer
+than `R_inflight` (default 16) repairs are in flight; the rest are deferred
+(`CpRepairDeferred`) and come back from `reconcile` next tick. Set with
+`RaftNode::set_repair_pacing` (animusd wires `cluster_settings.repair_*`); `0`
+disables a limit. Non-obvious:
+
+- **In flight is time-bounded, on purpose.** The control plane cannot see a
+  learner catch up (data-plane-local), so a repair holds its slot from the
+  accepted proposal for `REPAIR_INFLIGHT_TTL` (= `REPAIR_DWELL`) unless its
+  tablet disappears or leadership is lost. Do not add a "wait for completion"
+  signal without a replicated one: a repair that never completes would hold a
+  slot forever.
+- A proposal for a tablet whose tracked CAS has not applied yet (view epoch ==
+  tracked `expected_epoch`) is a free retry that keeps its original start time.
+- Deferred repairs still make `repaired` true, so rebalancing keeps yielding.
+- Tests: `tests/it/repair_pacing.rs` (cell 9, controls (a) and (f)) and the
+  module's unit tests.

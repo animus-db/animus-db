@@ -609,6 +609,9 @@ async fn run(args: &[String]) -> Result<(), String> {
     let mut bg_catchup_learners: Option<usize> = None;
     let mut bg_splits: Option<usize> = None;
     let mut bg_compactions: Option<usize> = None;
+    // ADR 0079 step 6: control-leader repair pacing; same reach and conflict rule.
+    let mut repair_proposals_per_tick: Option<usize> = None;
+    let mut repair_inflight_max: Option<usize> = None;
     // MREC global-table peer settings (ADR 0075 section 4, G-01 stage G-d M3):
     // `--region NAME`, repeatable `--peer REGION=host:port[,host:port...]`,
     // `--allow-insecure-peers` (dev only) and `--mrec-max-clock-skew-ms MS`.
@@ -801,6 +804,13 @@ async fn run(args: &[String]) -> Result<(), String> {
             "--bg-compactions" => {
                 bg_compactions = Some(parse_next(&mut it, "--bg-compactions")?);
             }
+            "--repair-proposals-per-tick" => {
+                repair_proposals_per_tick =
+                    Some(parse_next(&mut it, "--repair-proposals-per-tick")?);
+            }
+            "--repair-inflight-max" => {
+                repair_inflight_max = Some(parse_next(&mut it, "--repair-inflight-max")?);
+            }
             "--host-unsettled-max" => {
                 host_unsettled_max = Some(parse_next(&mut it, "--host-unsettled-max")?);
             }
@@ -898,6 +908,8 @@ async fn run(args: &[String]) -> Result<(), String> {
         bg_catchup_learners,
         bg_splits,
         bg_compactions,
+        repair_proposals_per_tick,
+        repair_inflight_max,
     };
     let orphan_sweep_after =
         orphan_sweep_after_duration(cli_cluster_settings.orphan_sweep_after_secs);
@@ -968,11 +980,14 @@ async fn run(args: &[String]) -> Result<(), String> {
     if (bg_snapshot_streams.is_some()
         || bg_catchup_learners.is_some()
         || bg_splits.is_some()
-        || bg_compactions.is_some())
+        || bg_compactions.is_some()
+        || repair_proposals_per_tick.is_some()
+        || repair_inflight_max.is_some())
         && config_path.is_none()
     {
         return Err(
-            "--bg-snapshot-streams/--bg-catchup-learners/--bg-splits/--bg-compactions are only \
+            "--bg-snapshot-streams/--bg-catchup-learners/--bg-splits/--bg-compactions/\
+             --repair-proposals-per-tick/--repair-inflight-max are only \
              supported with --config/--node (set the matching cluster_settings keys in the \
              config file for the other shapes)"
                 .into(),
@@ -2125,6 +2140,8 @@ fn resolve_cluster_settings(
     merge_field!(bg_catchup_learners, "--bg-catchup-learners");
     merge_field!(bg_splits, "--bg-splits");
     merge_field!(bg_compactions, "--bg-compactions");
+    merge_field!(repair_proposals_per_tick, "--repair-proposals-per-tick");
+    merge_field!(repair_inflight_max, "--repair-inflight-max");
     merge_field!(allow_insecure_peers, "--allow-insecure-peers");
     merge_field!(mrec_max_clock_skew_ms, "--mrec-max-clock-skew-ms");
     if let Some(r) = &cli.region {
@@ -2266,12 +2283,16 @@ async fn run_single(
         || settings.bg_catchup_learners.is_some()
         || settings.bg_splits.is_some()
         || settings.bg_compactions.is_some()
+        || settings.repair_proposals_per_tick.is_some()
+        || settings.repair_inflight_max.is_some()
     {
         let cs = config.cluster_settings.get_or_insert_with(Default::default);
         cs.bg_snapshot_streams = settings.bg_snapshot_streams;
         cs.bg_catchup_learners = settings.bg_catchup_learners;
         cs.bg_splits = settings.bg_splits;
         cs.bg_compactions = settings.bg_compactions;
+        cs.repair_proposals_per_tick = settings.repair_proposals_per_tick;
+        cs.repair_inflight_max = settings.repair_inflight_max;
     }
     // ADR 0078 section 3: staggered hosting travels the same way.
     if settings.host_unsettled_max.is_some() || settings.host_settle_timeout_ms.is_some() {

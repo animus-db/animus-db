@@ -539,6 +539,17 @@ pub struct ClusterSettings {
     /// derives it from the pod CPU request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bg_compactions: Option<usize>,
+    /// `--repair-proposals-per-tick R` (ADR 0079 step 6): new repair
+    /// (`CasTabletReplicas`) proposals the control leader makes per reconcile
+    /// tick. `None` resolves to 8; `0` turns the per-tick limit off. Leader-local
+    /// (class L), additive, skipped when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair_proposals_per_tick: Option<usize>,
+    /// `--repair-inflight-max N` (ADR 0079 step 6): repairs in flight on the
+    /// control leader before a new one is deferred. `None` resolves to 16; `0`
+    /// turns the in-flight limit off. Leader-local (class L).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair_inflight_max: Option<usize>,
     /// `--region NAME` (ADR 0075 section 4, G-01 stage G-d M3): **this
     /// cluster's own MREC region name** — the namespace of
     /// [`peers`](Self::peers) and of an MREC table's replica set (a *peer
@@ -937,6 +948,21 @@ impl ClusterConfig {
             s.and_then(|s| s.bg_compactions),
             self.cores(),
         )
+    }
+
+    /// The resolved control-leader repair pacing (ADR 0079 step 6).
+    #[must_use]
+    pub fn repair_pacing(&self) -> animus_control::repair_pacing::RepairPacing {
+        let s = self.cluster_settings.as_ref();
+        let d = animus_control::repair_pacing::RepairPacing::default();
+        animus_control::repair_pacing::RepairPacing {
+            per_tick: s
+                .and_then(|s| s.repair_proposals_per_tick)
+                .unwrap_or(d.per_tick),
+            inflight_max: s
+                .and_then(|s| s.repair_inflight_max)
+                .unwrap_or(d.inflight_max),
+        }
     }
 
     /// The effective `host_unsettled_max` ([`ClusterSettings::host_unsettled_max`],
@@ -1531,6 +1557,8 @@ mod tests {
             bg_catchup_learners: Some(5),
             bg_splits: Some(2),
             bg_compactions: Some(6),
+            repair_proposals_per_tick: Some(4),
+            repair_inflight_max: Some(9),
             region: Some("us".into()),
             peers: vec![PeerCluster {
                 region: "eu".into(),
@@ -1582,6 +1610,11 @@ mod tests {
                 sizes.compactions
             ),
             (Some(2), Some(4), Some(1), None)
+        );
+        // ADR 0079 step 6: repair pacing defaults on (8 per tick, 16 in flight).
+        assert_eq!(
+            cfg.repair_pacing(),
+            animus_control::repair_pacing::RepairPacing::default()
         );
         assert_eq!(s.bg_snapshot_streams, None);
         assert_eq!(s.max_region_rtt_ms, Some(200));

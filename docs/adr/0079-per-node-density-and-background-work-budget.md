@@ -483,3 +483,62 @@ No `Gate`.
   receiver keeps the only send slot, the next group starves), **bg_e**
   (`PoolMinZero`, ADR control (e): a pool allowed to reach 0 under lag stalls
   compaction). Each asserts the oracle FAILS with its mechanism off.
+
+## Implementation step 6 as built (2026-10-14): repair pacing
+
+Classification: **L** (a control-leader-local computation over replicated
+state; every proposal is an existing `CasTabletReplicas`). No `Gate`, no wire
+or durable shape.
+
+- **Mechanism.** `animus_control::repair_pacing` (`RepairPacer`, `RepairPacing`,
+  `RepairPacingHandle`) sits between the pure `PlacementView::reconcile` and the
+  propose loop in `reconcile_loop` (`node.rs`). `RaftNode::set_repair_pacing`
+  sets it after `start`; defaults are on (`R` = 8, `R_inflight` = 16), so every
+  sim and `SimCluster` is paced. `0` turns the matching limit off (both `0` =
+  the pre-ADR behaviour). `animusd`: `--repair-proposals-per-tick`,
+  `--repair-inflight-max` and `cluster_settings.repair_proposals_per_tick` /
+  `repair_inflight_max` (`--config`/`--node` only, like the other 0079 knobs),
+  applied to the combined and control-only assemblies (the data-only node has no
+  control leader).
+- **Ordering.** Ascending `TabletId` (as ADR 0078 orders hosting), re-sorted in
+  the pacer; the first `R` that fit under the in-flight cap are proposed, the
+  rest are deferred and simply come back from `reconcile` on the next tick
+  (their tablets still violate). Q4 (decision): a fixed cadence, not adaptive;
+  the leader-lag reduction of `R` the section above mentions is **not**
+  built (the section 4 `LoadMonitor` factor is data-plane local and the
+  decision is the fixed cadence). Q3 (decision): `max_replicas` stays strict
+  under repair (step 3's `replan_repair_with_load`; nothing here relaxes it).
+- **In flight, defined.** A repair is in flight from the moment its
+  `CasTabletReplicas` is *accepted* by the leader's core until the first of:
+  (1) `REPAIR_INFLIGHT_TTL` (= `REPAIR_DWELL`, 5 s, an existing constant)
+  elapsed; (2) its tablet leaves the tablet map; (3) the leader loses
+  leadership (the tracker is dropped). The control plane has no replicated
+  "learner caught up" signal (the learner phase is data-plane-local), so
+  completion is not observable on the leader and a time bound is the only one
+  a repair that never completes cannot wedge. A proposal whose CAS has not
+  applied yet (the view's epoch still equals the tracked `expected_epoch`) is a
+  *retry* of the same repair: it passes through free and keeps its original
+  start time, preserving the old re-propose-until-applied behaviour without
+  extending the TTL. Consequence: sustained throughput is at most
+  `min(R / tick, R_inflight / TTL)` = `min(16/s, 3.2/s)`, so a 1000-tablet loss
+  proposes in about 5 minutes rather than the 63 s the `R`-only bound gives; the
+  data plane's own pools (step 5) remain the real limiter on bytes moved.
+  Raise `--repair-inflight-max` for a faster burst.
+- **Metrics.** `CpRepairDeferred` (counter, per deferred tablet per tick),
+  `CpRepairInflight` (level), `CpRepairInflightHwm`; the C-17
+  `sim_cluster_scale_node_loss_*` cells print `repair_deferred_total` and
+  `repair_inflight_hwm`, and the per-push cell asserts the high-water is within
+  `1..=16`. Rebalancing still yields while repairs are deferred.
+- **Corpus** (`animus-control` `tests/it/repair_pacing.rs`, knob
+  `ANIMUS_REPAIR_PACING_SEEDS`; 60 RF3 tablets over 6 nodes, one node killed,
+  the real `reconcile_loop`): cell 9 (default pacing: at most `R` repairs
+  committed per tick window, in-flight high-water at most `R_inflight`, all
+  tablets RF3 within `REPAIR_DWELL + ceil(V/slots) * (TTL + tick) + 5 s`, the
+  in-flight gauge returns to 0 after the repairs age out) and 9b (`R_inflight` 4
+  binds, still converges). Negative controls: **(a)** pacing off, the paced
+  oracle fails (30 repairs in one window); **(f)** `R` on and the in-flight limit
+  off, the `R_inflight` = 4 oracle fails (high-water 30). The cell's "no acked
+  write lost, data above the snapshot threshold" half is the animusd
+  `sim_cluster_scale_node_loss_with_data_installs_snapshots` cell (no client
+  writes during the repair), since the pure control-plane rig has no data plane.
+

@@ -1829,6 +1829,11 @@ struct BurstResult {
     tablet_bytes: u64,
     tablet_msgs: u64,
     control_msgs: u64,
+    /// ADR 0079 step 6: repairs the control leader deferred (all nodes' sum;
+    /// only the leader records, into the control sink `SimCluster::metric`
+    /// reads) and the most it ever had in flight.
+    repair_deferred_total: u64,
+    repair_inflight_hwm: u64,
 }
 
 /// The re-replication burst after one node of a 6-node, RF-3 cluster dies,
@@ -1941,6 +1946,13 @@ fn run_node_loss_burst(g: usize, puts: usize, value_bytes: usize, seed: u64) -> 
         tablet_bytes: tr.tablet_bytes,
         tablet_msgs: tr.tablet_msgs,
         control_msgs: tr.control_msgs,
+        repair_deferred_total: (0..nodes as u64)
+            .map(|n| cluster.metric(n, Metric::CpRepairDeferred))
+            .sum(),
+        repair_inflight_hwm: (0..nodes as u64)
+            .map(|n| cluster.metric(n, Metric::CpRepairInflightHwm))
+            .max()
+            .unwrap_or(0),
     }
 }
 
@@ -1980,6 +1992,18 @@ fn emit_burst(r: &BurstResult, nodes: usize) {
     emit("repair_tablet_bytes", t, nodes, r.tablet_bytes);
     emit("repair_tablet_msgs", t, nodes, r.tablet_msgs);
     emit("repair_control_msgs", t, nodes, r.control_msgs);
+    emit(
+        "repair_deferred_total",
+        t,
+        nodes,
+        r.repair_deferred_total as usize,
+    );
+    emit(
+        "repair_inflight_hwm",
+        t,
+        nodes,
+        r.repair_inflight_hwm as usize,
+    );
 }
 
 /// #1295 / ADR 0079 measurement (manual, `--ignored --nocapture`): the
@@ -2031,6 +2055,13 @@ fn sim_cluster_scale_node_loss_with_data_installs_snapshots() {
     assert!(
         r.snapshot_installs > 0,
         "seed={seed}: no tablet took a snapshot, the cell does not exercise the snapshot path"
+    );
+    // ADR 0079 step 6: the default pacing (R_inflight = 16) bounds the repairs
+    // in flight, and the leader did track some.
+    assert!(
+        (1..=16).contains(&r.repair_inflight_hwm),
+        "seed={seed}: repair in-flight high-water {} outside 1..=16",
+        r.repair_inflight_hwm
     );
     assert!(
         r.reconfigure_accepted >= r.on_dead as u64,

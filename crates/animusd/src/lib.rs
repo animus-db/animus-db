@@ -3135,6 +3135,9 @@ pub struct BoundNode {
     /// ADR defaults (100, 600 ms); set from `cluster_settings` via
     /// `with_host_stagger`. `0` disables staggering.
     host_stagger: (usize, Duration),
+    /// ADR 0079 step 6: the control leader's repair pacing, set from
+    /// `cluster_settings.repair_*` via `with_repair_pacing`.
+    repair_pacing: animus_control::repair_pacing::RepairPacing,
     /// ADR 0079 section 1: this node's declared placement capacity, set from
     /// `cluster_settings.{node_weight,node_max_replicas}` via
     /// `with_node_capacity` and reconciled into `Metadata` (once
@@ -5866,6 +5869,17 @@ impl BoundNode {
         self
     }
 
+    /// Configure the control leader's repair pacing (ADR 0079 step 6) -- see
+    /// `ClusterSettings::repair_proposals_per_tick` / `repair_inflight_max`.
+    #[must_use]
+    pub fn with_repair_pacing(
+        mut self,
+        pacing: animus_control::repair_pacing::RepairPacing,
+    ) -> Self {
+        self.repair_pacing = pacing;
+        self
+    }
+
     /// Declare this node's placement capacity (ADR 0079 section 1) -- see
     /// `ClusterSettings::node_weight` / `node_max_replicas`.
     #[must_use]
@@ -6375,6 +6389,8 @@ impl BoundNode {
         // profile from its own voters' region labels (a no-op on an unlabelled
         // cluster). Opt-in, spawned after everything `RaftNode::start` spawns.
         raft.enable_region_timing(self.max_region_rtt);
+        // ADR 0079 step 6: the control leader's repair pacing (leader-local).
+        raft.set_repair_pacing(self.repair_pacing);
 
         // **Leaderful CP per-tablet Raft group** (ADR 0017 #3a) — the v1 data plane
         // (ADR 0019). Stage 3a hosts a single, statically-placed CP group spanning
@@ -7153,6 +7169,7 @@ impl Node {
                 animus_cp_data::host::DEFAULT_HOST_UNSETTLED_MAX,
                 animus_cp_data::host::DEFAULT_HOST_SETTLE_TIMEOUT,
             ),
+            repair_pacing: animus_control::repair_pacing::RepairPacing::default(),
             node_capacity: animus_control::Capacity::DEFAULT,
             mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             advertise_host: addrs.advertise_host,
@@ -7220,6 +7237,7 @@ impl Node {
             intra_listener,
             intra_addr,
             max_region_rtt: animus_control::timing::DEFAULT_MAX_REGION_RTT,
+            repair_pacing: animus_control::repair_pacing::RepairPacing::default(),
             mrec: Arc::new(crate::mrec_peer::MrecConfig::default()),
             advertise_host: addrs.advertise_host,
             labels: addrs.labels,
@@ -7860,6 +7878,9 @@ pub struct BoundControlNode {
     /// more than one region. Defaults to 150 ms; set from
     /// `cluster_settings.max_region_rtt_ms` via `with_max_region_rtt`.
     max_region_rtt: Duration,
+    /// ADR 0079 step 6: the control leader's repair pacing, set from
+    /// `cluster_settings.repair_*` via `with_repair_pacing`.
+    repair_pacing: animus_control::repair_pacing::RepairPacing,
     /// MREC peer settings (`cluster_settings.{region,peers,..}`, G-d M3) via `with_mrec`.
     mrec: Arc<crate::mrec_peer::MrecConfig>,
     advertise_host: Option<String>,
@@ -7881,6 +7902,17 @@ impl BoundControlNode {
     #[must_use]
     pub fn with_max_region_rtt(mut self, rtt: Duration) -> Self {
         self.max_region_rtt = rtt;
+        self
+    }
+
+    /// Configure the control leader's repair pacing (ADR 0079 step 6) -- see
+    /// `ClusterSettings::repair_proposals_per_tick` / `repair_inflight_max`.
+    #[must_use]
+    pub fn with_repair_pacing(
+        mut self,
+        pacing: animus_control::repair_pacing::RepairPacing,
+    ) -> Self {
+        self.repair_pacing = pacing;
         self
     }
 
@@ -8126,6 +8158,8 @@ impl BoundControlNode {
         edge.register_control(raft.clone());
         // ADR 0075 section 3.4 — see `BoundNode::start_with_growth`'s identical call.
         raft.enable_region_timing(self.max_region_rtt);
+        // ADR 0079 step 6: the control leader's repair pacing (leader-local).
+        raft.set_repair_pacing(self.repair_pacing);
 
         // This node's stream-shard segment store (ADR 0043 §A7b) — see
         // `BoundNode::start_with_streams`'s identical construction; `control`
@@ -17725,6 +17759,7 @@ pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
         .with_awake_admission(config.cores(), config.awake_max_per_core())
         .with_background_budget(config.bg_sizes())
         .with_host_stagger(config.host_unsettled_max(), config.host_settle_timeout())
+        .with_repair_pacing(config.repair_pacing())
         .with_node_capacity(config.node_capacity())
         .with_mrec(
             crate::mrec_peer::MrecConfig::from_cluster(config)
@@ -17817,6 +17852,7 @@ fn apply_cluster_settings_to_bound(
         .with_awake_admission(config.cores(), config.awake_max_per_core())
         .with_background_budget(config.bg_sizes())
         .with_host_stagger(config.host_unsettled_max(), config.host_settle_timeout())
+        .with_repair_pacing(config.repair_pacing())
         .with_node_capacity(config.node_capacity())
         .with_mrec(
             crate::mrec_peer::MrecConfig::from_cluster(config)
@@ -18187,6 +18223,7 @@ pub async fn run_node_control_with_stores(
     let bound = Node::bind_control(addrs.id.clone(), addrs, dir)
         .await?
         .with_max_region_rtt(config.max_region_rtt())
+        .with_repair_pacing(config.repair_pacing())
         .with_mrec(
             crate::mrec_peer::MrecConfig::from_cluster(config)
                 .with_node_tls(config.nodes.get(index).and_then(|n| n.tls.clone())),
@@ -18563,6 +18600,7 @@ pub async fn run_node_growth(
         .with_awake_admission(config.cores(), config.awake_max_per_core())
         .with_background_budget(config.bg_sizes())
         .with_host_stagger(config.host_unsettled_max(), config.host_settle_timeout())
+        .with_repair_pacing(config.repair_pacing())
         .with_node_capacity(config.node_capacity())
         .with_mrec(
             crate::mrec_peer::MrecConfig::from_cluster(config)
