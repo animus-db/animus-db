@@ -333,6 +333,16 @@ pub struct Tablet {
     /// pre-existing snapshot loading as `None`.
     #[serde(default)]
     pub inplace_split: Option<InPlaceSplitIntent>,
+    /// The highest placement epoch whose replica set the data plane has
+    /// reported **realised** (ADR 0079 step 6: every replica of that set is a
+    /// voter of the tablet's Raft group, no learner remains), set only by
+    /// `MetaCommand::RepairSettled` (gated, `Gate::NodeCapacity`). The control
+    /// leader's repair pacer frees a repair's in-flight slot when this equals
+    /// the tablet's current [`epoch`](Self::epoch). `None` (and absent from
+    /// the serialised form, so every pre-existing encoding is byte-identical)
+    /// until a report applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled_epoch: Option<Epoch>,
 }
 
 /// A tablet's lifecycle state.
@@ -405,6 +415,7 @@ impl Tablet {
             epoch: Epoch::INITIAL,
             state: TabletState::default(),
             inplace_split: None,
+            settled_epoch: None,
         }
     }
 

@@ -3363,16 +3363,22 @@ than `R_inflight` (default 16) repairs are in flight; the rest are deferred
 `RaftNode::set_repair_pacing` (animusd wires `cluster_settings.repair_*`); `0`
 disables a limit. Non-obvious:
 
-- **In flight is time-bounded, on purpose.** The control plane cannot see a
-  learner catch up (data-plane-local), so a repair holds its slot from the
-  accepted proposal for `REPAIR_INFLIGHT_TTL` (= `REPAIR_DWELL`) unless its
-  tablet disappears or leadership is lost. Do not add a "wait for completion"
-  signal without a replicated one: a repair that never completes would hold a
-  slot forever.
+- **In flight ends at the observable end, with a TTL safety net.** A repair
+  holds its slot from the accepted proposal until the tablet's
+  `settled_epoch == epoch` (epoch past the tracked one): the data-plane leader
+  reports `MetaCommand::RepairSettled` (`animusd::repair_settled`) once its
+  group is the new voter set with no learner. `Metadata` itself never shows the
+  learner phase (the CAS writes the desired set at once), which is why a
+  report exists. The report is gated (`Gate::NodeCapacity`, v5): below it no
+  report comes and the slot is held for `REPAIR_INFLIGHT_TTL` (= `REPAIR_DWELL`)
+  as before. The TTL stays the safety net for a repair that never settles, or
+  whose report is lost: never remove it, a repair that never completes would
+  hold a slot forever. Also freed when the tablet disappears or leadership is
+  lost.
 - A proposal for a tablet whose tracked CAS has not applied yet (view epoch ==
   tracked `expected_epoch`) is a free retry that keeps its original start time.
 - Deferred repairs still make `repaired` true, so rebalancing keeps yielding.
-- Tests: `tests/it/repair_pacing.rs` (cell 9, controls (a) and (f)) and the
+- Tests: `tests/it/repair_pacing.rs` (cell 9, controls (a), (f) and (g); the settled/unsettled cells) and the
   module's unit tests.
 
 ## Capacity: creation refusal, blocked gauge, cells 10-12 (ADR 0079 step 7)

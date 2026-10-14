@@ -11,14 +11,17 @@
 //! * a new repair is not started while `R_inflight`
 //!   ([`RepairPacing::inflight_max`]) repairs are in flight.
 //!
-//! **In flight** is leader-local and time-bounded. A repair becomes in flight
-//! the moment its `CasTabletReplicas` is accepted by the leader's core, and
-//! stops being in flight at the first of: (1) [`REPAIR_INFLIGHT_TTL`] elapsed
-//! (the control plane has no replicated "learner caught up" signal: the
-//! learner phase is data-plane-local, so completion is not observable here and
-//! a time bound is the only one that cannot be wedged by a repair that never
-//! completes); (2) the tablet leaves the tablet map; (3) the leader loses
-//! leadership (the whole tracker is dropped). A proposal whose CAS has not yet
+//! **In flight** is leader-local. A repair becomes in flight the moment its
+//! `CasTabletReplicas` is accepted by the leader's core, and stops being in
+//! flight at the first of: (1) **settled**: the tablet's data-plane leader has
+//! reported the repair's replica set realised (every replica a voter, no
+//! learner left; `MetaCommand::RepairSettled`, which sets
+//! `Tablet::settled_epoch`) and the CAS has applied, i.e. the tablet's
+//! `settled_epoch` equals its current epoch, which is past the tracked
+//! `expected_epoch`; (2) [`REPAIR_INFLIGHT_TTL`] elapsed, the safety net for a
+//! repair that never settles (and the only bound while `Gate::NodeCapacity`
+//! is closed, as no report is emitted then); (3) the tablet leaves the tablet
+//! map; (4) the leader loses leadership (the whole tracker is dropped). A proposal whose CAS has not yet
 //! applied (the view's epoch still equals the tracked `expected_epoch`) is a
 //! *retry* of the same repair, not a new one: it passes through free, which
 //! preserves the pre-pacing behaviour of re-proposing every tick until the
@@ -152,8 +155,14 @@ impl RepairPacer {
 
     /// Drop entries that timed out or whose tablet is gone.
     pub fn expire(&mut self, now: Nanos, tablets: &BTreeMap<TabletId, Tablet>) {
-        self.inflight.retain(|t, (_, since)| {
-            tablets.contains_key(t) && now.duration_since(*since) < REPAIR_INFLIGHT_TTL
+        self.inflight.retain(|t, (expected, since)| {
+            let Some(tab) = tablets.get(t) else {
+                return false;
+            };
+            // Settled: the CAS applied (epoch moved past the tracked one) and
+            // the data plane reported the current epoch's set realised.
+            let settled = tab.epoch > *expected && tab.settled_epoch == Some(tab.epoch);
+            !settled && now.duration_since(*since) < REPAIR_INFLIGHT_TTL
         });
     }
 
@@ -334,6 +343,36 @@ mod tests {
         assert_eq!(pacer.inflight(), 0);
         let p = pacer.select(pacing, &applied, props(5));
         assert_eq!(ids(&p), vec![5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn settled_report_frees_the_slot_before_the_ttl() {
+        let ts = tablets(&[1, 2]);
+        let mut pacer = RepairPacer::new();
+        pacer.accepted(Nanos(0), &cas(1, 1));
+        pacer.accepted(Nanos(0), &cas(2, 1));
+        let mut applied = ts.clone();
+        for t in [1, 2] {
+            applied.get_mut(&TabletId(t)).unwrap().epoch = Epoch(2);
+        }
+        let soon = Nanos(1);
+        pacer.expire(soon, &applied);
+        assert_eq!(pacer.inflight(), 2, "applied but not settled");
+        // A settled_epoch for the OLD epoch (stale) frees nothing.
+        applied.get_mut(&TabletId(1)).unwrap().settled_epoch = Some(Epoch(1));
+        pacer.expire(soon, &applied);
+        assert_eq!(pacer.inflight(), 2);
+        applied.get_mut(&TabletId(1)).unwrap().settled_epoch = Some(Epoch(2));
+        pacer.expire(soon, &applied);
+        assert_eq!(pacer.inflight(), 1, "settled tablet 1 freed, 2 held");
+        // A tablet previously settled at its (unchanged) epoch is not a
+        // completion of a not-yet-applied repair.
+        let mut stale = ts.clone();
+        stale.get_mut(&TabletId(2)).unwrap().settled_epoch = Some(Epoch(1));
+        let mut p2 = RepairPacer::new();
+        p2.accepted(Nanos(0), &cas(2, 1));
+        p2.expire(soon, &stale);
+        assert_eq!(p2.inflight(), 1);
     }
 
     #[test]

@@ -5637,6 +5637,14 @@ ADR itself for the full design/rationale.
   kickoff contract as `restore_table_from_backup`: returns as soon as
   `BeginRestore` commits, with `backup_restore.rs`'s driver doing the
   actual seed/replay/activate/GSI-declare sequence in the background.
+- **`repair_settled.rs`** (ADR 0079 step 6) — every node's loop reports a
+  converged repair: for each led tablet whose group voters equal the `Metadata`
+  replica set with no learner and whose epoch is past `INITIAL`, it proposes
+  `MetaCommand::RepairSettled` (relayed; `is_relayable_command` arm), which sets
+  `Tablet::settled_epoch` and frees the control leader's repair-pacer slot.
+  Gated: emits nothing while `Metadata::capacity_gate_open()` is false. Generic
+  over `E`/`R` so `SimCluster` drives `repair_settled_tick` directly
+  (`sim_cluster_repair_settled`); the SimCluster does not spawn the loop.
 - **`split_placing_completion.rs`** (ADR 0062 §3) — the in-place split
   **directed-Placing completion loop**: a per-tablet, leader-side loop, the
   same "run everywhere, self-gate per tablet on `group.is_leader()`,

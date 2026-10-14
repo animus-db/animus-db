@@ -50,7 +50,7 @@ use animus_control::raft::LogEntry;
 use animus_control::schema::{ColumnType, TableSchema};
 use animus_control::{ApplyOutcome, MetaCommand, Metadata, NodeStatus, PlacementPolicy};
 use animus_env::nid;
-use animus_tablet::{KeyRange, TabletId};
+use animus_tablet::{Epoch, KeyRange, TabletId};
 
 /// One of each [`WalRecord`] variant, built from fixed constants only (ADR
 /// 0073 Phase 0's determinism rule — no wall-clock time, no unseeded
@@ -641,6 +641,91 @@ fn v1_capacity_metadata() -> Metadata {
     m
 }
 
+/// The repair-settled shape (ADR 0079 step 6, gate `NodeCapacity`, the same
+/// version-5 era as capacity): the capacity scenario plus one tablet whose
+/// replica set was changed by `CasTabletReplicas` (epoch 2) and then reported
+/// realised by `RepairSettled`, so the tablet carries `settled_epoch: 2`; a
+/// second tablet is untouched (no `settled_epoch` key).
+fn v1_repair_settled_metadata() -> Metadata {
+    let mut m = v1_capacity_metadata();
+    for command in [
+        MetaCommand::CreateTablet {
+            tablet: TabletId(1),
+            table: None,
+            range: KeyRange::whole(),
+            replicas: vec![nid(1), nid(2)],
+        },
+        MetaCommand::CreateTablet {
+            tablet: TabletId(2),
+            table: None,
+            range: KeyRange::whole(),
+            replicas: vec![nid(1), nid(2)],
+        },
+        MetaCommand::CasTabletReplicas {
+            tablet: TabletId(1),
+            expected_epoch: Epoch::INITIAL,
+            replicas: vec![nid(2), nid(3)],
+        },
+        MetaCommand::RepairSettled {
+            tablet: TabletId(1),
+            epoch: Epoch(2),
+        },
+    ] {
+        assert_eq!(
+            m.apply(&command),
+            ApplyOutcome::Applied,
+            "fixture premise: {command:?} applies cleanly"
+        );
+    }
+    assert_eq!(m.tablets[&TabletId(1)].settled_epoch, Some(Epoch(2)));
+    m
+}
+
+/// Writes `v1-repair-settled.json`; refuses to overwrite.
+/// `cargo test -p animus-control --test it format_fixtures::generate_fixture_metadata_repair_settled -- --ignored`.
+#[test]
+#[ignore]
+fn generate_fixture_metadata_repair_settled() {
+    let path = metadata_fixtures_dir().join("v1-repair-settled.json");
+    if std::fs::metadata(&path).is_ok() {
+        panic!(
+            "{} already exists — never regenerated in place",
+            path.display()
+        );
+    }
+    let bytes =
+        serde_json::to_vec_pretty(&v1_repair_settled_metadata()).expect("metadata serializes");
+    std::fs::write(&path, &bytes).unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
+}
+
+/// ADR 0079 step 6's compatibility claims, pinned: the command's JSON shape,
+/// the `settled_epoch` key absent from every tablet that was never reported
+/// (so all pre-existing tablet encodings and fixtures are byte-identical),
+/// and an older reader's tablet (the key absent) decoding as unsettled.
+#[test]
+fn repair_settled_wire_shapes_are_pinned() {
+    let cmd = MetaCommand::RepairSettled {
+        tablet: TabletId(7),
+        epoch: Epoch(3),
+    };
+    assert_eq!(
+        serde_json::to_string(&cmd).unwrap(),
+        r#"{"RepairSettled":{"tablet":7,"epoch":3}}"#
+    );
+    let m = v1_repair_settled_metadata();
+    let v = serde_json::to_value(&m).unwrap();
+    let tablets = &v["tablets"];
+    let dump = tablets.to_string();
+    assert_eq!(dump.matches("settled_epoch").count(), 1, "{dump}");
+    assert!(
+        !serde_json::to_string(&v1_capacity_metadata())
+            .unwrap()
+            .contains("settled_epoch")
+    );
+    let bytes = serde_json::to_vec(&m).unwrap();
+    assert_eq!(Metadata::from_json(&bytes).unwrap(), m);
+}
+
 /// Writes `v1-capacity.json` from [`v1_capacity_metadata`]; refuses to overwrite.
 /// `cargo test -p animus-control --test it format_fixtures::generate_fixture_metadata_capacity -- --ignored`.
 #[test]
@@ -835,6 +920,7 @@ fn decodes_every_checked_in_metadata_fixture_to_its_per_version_value() {
             (1, Some("global")) => v1_global_metadata(),
             (1, Some("mrec")) => v1_mrec_metadata(),
             (1, Some("capacity")) => v1_capacity_metadata(),
+            (1, Some("repair-settled")) => v1_repair_settled_metadata(),
             (other, _) => panic!(
                 "{name}: no expected value for metadata v{other} shape {shape:?}; add a match arm (and a \
                  frozen legacy decoder) before adding the fixture file"

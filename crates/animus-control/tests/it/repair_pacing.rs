@@ -31,6 +31,7 @@ use std::time::Duration;
 use animus_control::node::{REPAIR_DWELL, heartbeat_loop};
 use animus_control::raft::ProposeResult;
 use animus_control::repair_pacing::{REPAIR_INFLIGHT_TTL, RepairPacing};
+use animus_control::version::VersionRange;
 use animus_control::{MetaCommand, NodeStatus, RaftNode};
 use animus_env::{EnvExt, Metric, MetricsHandle, NodeId, nid};
 use animus_placement::PlacementPolicy;
@@ -55,7 +56,24 @@ struct Report {
     final_inflight: u64,
 }
 
+/// Which repaired tablets the simulated data plane reports `RepairSettled` for,
+/// and how long after the repair's CAS applied it does so (the learner
+/// catch-up and promotion it stands in for).
+#[derive(Clone, Copy)]
+enum Settle {
+    /// No report is ever sent (the gate closed, or completion detection off).
+    Never,
+    /// Every repaired tablet reports after this long.
+    All(Duration),
+    /// Only even-numbered tablets report; odd ones never settle.
+    EvenOnly(Duration),
+}
+
 fn run_cell(seed: u64, pacing: RepairPacing) -> Report {
+    run_cell_settle(seed, pacing, Settle::Never)
+}
+
+fn run_cell_settle(seed: u64, pacing: RepairPacing, settle: Settle) -> Report {
     let mut sim = Simulator::new(seed);
     let handles: Vec<MetricsHandle> = CONTROL.iter().map(|_| MetricsHandle::recording()).collect();
     let nodes: Vec<RaftNode<SimEnv>> = CONTROL
@@ -72,6 +90,21 @@ fn run_cell(seed: u64, pacing: RepairPacing) -> Report {
             n
         })
         .collect();
+    // The settled report is gated (`Gate::NodeCapacity`, cluster version 5):
+    // the settle cells run an era-active cluster finalized to it.
+    let gated = !matches!(settle, Settle::Never);
+    if gated {
+        for id in CONTROL.iter().chain(&DATA) {
+            sim.set_network_ext_for(
+                nid(*id),
+                animus_env::handshake::encode_ext(Some((1, 5)), Some("t")),
+            );
+        }
+        for n in &nodes {
+            n.set_own_version_range(Some(VersionRange::new(1, 5)));
+            n.set_own_build("t");
+        }
+    }
     for id in DATA {
         let env = sim.env(nid(id));
         env.spawn_task(heartbeat_loop(
@@ -88,6 +121,34 @@ fn run_cell(seed: u64, pacing: RepairPacing) -> Report {
             status: NodeStatus::Active,
         });
         assert!(matches!(ok, ProposeResult::Accepted { .. }));
+    }
+    if gated {
+        for _ in 0..100 {
+            if nodes[leader].metadata().versioning_active() {
+                break;
+            }
+            sim.run_for(Duration::from_millis(200));
+        }
+        assert!(
+            nodes[leader].metadata().versioning_active(),
+            "era never started"
+        );
+        for id in DATA {
+            nodes[leader].propose(MetaCommand::ReportNodeVersion {
+                node: nid(id),
+                range: VersionRange::new(1, 5),
+                build: "t".into(),
+            });
+            sim.run_for(Duration::from_millis(200));
+        }
+        for target in 2..=5 {
+            nodes[leader].propose(MetaCommand::FinalizeClusterVersion {
+                expected: target - 1,
+                target,
+            });
+            sim.run_for(Duration::from_millis(200));
+        }
+        assert!(nodes[leader].metadata().capacity_gate_open(), "gate closed");
     }
     sim.run_for(Duration::from_secs(1));
     let policy = PlacementPolicy::simple("rf3", 3);
@@ -150,9 +211,38 @@ fn run_cell(seed: u64, pacing: RepairPacing) -> Report {
     let mut converged_after = None;
     let horizon = REPAIR_DWELL + Duration::from_secs(120);
     let mut elapsed = Duration::ZERO;
+    // tablet -> (epoch, first seen at that epoch) for the simulated data plane.
+    let mut seen: BTreeMap<TabletId, (animus_tablet::Epoch, Duration)> = BTreeMap::new();
     while elapsed < horizon {
         sim.run_for(SAMPLE);
         elapsed += SAMPLE;
+        let after = match settle {
+            Settle::Never => None,
+            Settle::All(d) | Settle::EvenOnly(d) => Some(d),
+        };
+        if let Some(d) = after {
+            let m = nodes[leader].metadata();
+            for t in m.tablets.values() {
+                let eligible = t.epoch > animus_tablet::Epoch::INITIAL
+                    && !t.replicas.contains(&dead)
+                    && t.settled_epoch != Some(t.epoch)
+                    && (!matches!(settle, Settle::EvenOnly(_)) || t.id.0 % 2 == 0);
+                if !eligible {
+                    continue;
+                }
+                let e = seen.entry(t.id).or_insert((t.epoch, elapsed));
+                if e.0 != t.epoch {
+                    *e = (t.epoch, elapsed);
+                }
+                if elapsed.saturating_sub(e.1) >= d && e.1 <= elapsed {
+                    let _ = nodes[leader].propose(MetaCommand::RepairSettled {
+                        tablet: t.id,
+                        epoch: t.epoch,
+                    });
+                    e.1 = elapsed + Duration::from_secs(3600);
+                }
+            }
+        }
         let done = repaired(&nodes[leader]) - base;
         samples.push((elapsed, done));
         let m = nodes[leader].metadata();
@@ -331,6 +421,75 @@ fn negative_control_f_no_inflight_limit_breaks_the_inflight_bound() {
         assert!(
             err.contains("in-flight"),
             "seed {seed}: wrong failure: {err}"
+        );
+    }
+}
+
+// ---- Observable completion (ADR 0079 step 6, `RepairSettled`) ----------------
+
+/// The data plane reports a repair's learner promoted this long after its CAS.
+const PROMOTE_AFTER: Duration = Duration::from_millis(300);
+
+/// Throughput oracle: with completion observable, the whole burst proposes at
+/// the `R` / tick rate (plus two ticks of slack), not at `R_inflight / TTL`.
+fn check_throughput(r: &Report, p: RepairPacing) -> Result<(), String> {
+    let rounds = r.violating.div_ceil(p.per_tick) as u32;
+    let bound = REPAIR_DWELL + TICK * (rounds + 2) + Duration::from_secs(1);
+    match r.converged_after {
+        Some(t) if t <= bound => Ok(()),
+        other => Err(format!("repairs took {other:?} > R-bound {bound:?}")),
+    }
+}
+
+#[test]
+fn cell9_settled_report_frees_slots_before_the_ttl() {
+    let p = RepairPacing::default();
+    for seed in seeds(0x9A11_0005) {
+        let s = run_cell_settle(seed, p, Settle::All(PROMOTE_AFTER));
+        let t = run_cell(seed, p);
+        assert!(
+            s.violating > p.inflight_max,
+            "seed {seed}: V must exceed R_inflight"
+        );
+        check(&s, p).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        check_throughput(&s, p).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        let (cs, ct) = (s.converged_after.unwrap(), t.converged_after.unwrap());
+        eprintln!(
+            "repair-settled seed={seed} V={} settled_converged={cs:?} ttl_only_converged={ct:?} \
+             inflight_hwm settled={} ttl_only={}",
+            s.violating, s.inflight_hwm, t.inflight_hwm
+        );
+        // The TTL-only run must wait out a full TTL for the second round.
+        assert!(
+            cs + Duration::from_secs(2) < ct,
+            "seed {seed}: {cs:?} vs {ct:?}"
+        );
+    }
+}
+
+#[test]
+fn cell9_unsettled_repairs_are_freed_by_the_ttl() {
+    let p = RepairPacing::default();
+    for seed in seeds(0x9A11_0006) {
+        let r = run_cell_settle(seed, p, Settle::EvenOnly(PROMOTE_AFTER));
+        // Odd tablets never report: their slots age out, everything converges,
+        // and the gauge returns to 0 (the `check` liveness + gauge clauses).
+        check(&r, p).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        assert!(r.converged_after.is_some(), "seed {seed}");
+    }
+}
+
+#[test]
+fn negative_control_g_completion_detection_off_fails_the_throughput_oracle() {
+    let p = RepairPacing::default();
+    for seed in seeds(0x9A11_0007) {
+        // Reports are sent, but the TTL-only run is the one with detection off:
+        // `Settle::Never` = no `RepairSettled` ever applies, so only the TTL frees.
+        let r = run_cell_settle(seed, p, Settle::Never);
+        assert!(
+            check_throughput(&r, p).is_err(),
+            "seed {seed}: TTL-only run met the observable-completion throughput bound ({:?})",
+            r.converged_after
         );
     }
 }
