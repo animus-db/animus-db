@@ -1098,11 +1098,14 @@ fn run_elections(c: &Cell, g: usize) -> Report {
         .unwrap_or(0);
     let gi = 0;
     let ni = r.live_leader(gi).expect("group 0 is led");
-    let admitted_before: Vec<u64> = r
-        .handles
-        .iter()
-        .map(|h| h.get(Metric::CpCampaignAdmitted))
-        .collect();
+    // Per-group attempt counter: pre-vote rounds each node's core has started
+    // for group `gi`. (The node-wide `CpCampaignAdmitted` counts every hosted
+    // group and the ghosts, so using it made the bound below vacuous.)
+    let rounds_of = |r: &Rig, n: usize| {
+        r.replica(gi, n)
+            .map_or(0, |k| k.campaign_stats().rounds_started)
+    };
+    let rounds_before: Vec<u64> = (0..NODES.len()).map(|n| rounds_of(&r, n)).collect();
     r.replica(gi, ni).expect("hosted").shutdown();
     let start = r.at;
     let others: Vec<usize> = (0..NODES.len()).filter(|&n| n != ni).collect();
@@ -1118,19 +1121,33 @@ fn run_elections(c: &Cell, g: usize) -> Report {
         }
     }
     const OWN_ELECTION_SLACK: f64 = 0.05;
-    let round = 2.0 * BASE.as_secs_f64() + (q.div_ceil(K) as f64) * 2.0 * BASE.as_secs_f64();
+    // The queue ahead is the ghosts above: not woken by a grant, they re-ask on
+    // a `BASE` sleep and the governor protects the queue head, so each of the
+    // `ceil(Q/K)` passes costs `2*BASE + BASE` (issue #1306; the same term as
+    // `election_backpressure_corpus` cell 10).
+    const GHOST_REASK: f64 = BASE.as_secs_f64();
+    let round = 2.0 * BASE.as_secs_f64()
+        + (q.div_ceil(K) as f64) * (2.0 * BASE.as_secs_f64() + GHOST_REASK);
     // ADR 0078's literal bound holds per campaign attempt: a split vote or a
     // pre-vote round that fails (no governor bound excludes either; they are
     // not specific to the awake cap, the cap-less rig misses the literal
     // bound on some seeds too) costs a further attempt. `rounds` counts the
-    // attempts the survivors were admitted for while the group had no leader.
+    // pre-vote rounds the survivors started for this group while it had no
+    // leader (floor 1; a deferred campaign starts none).
     let rounds = others
         .iter()
-        .map(|&o| r.handles[o].get(Metric::CpCampaignAdmitted) - admitted_before[o])
+        .map(|&o| rounds_of(&r, o) - rounds_before[o])
         .max()
         .unwrap_or(1)
         .max(1);
     let bound = round * rounds as f64 + OWN_ELECTION_SLACK;
+    // Livelock guard, independent of the `rounds`-scaled bound (which a
+    // livelock would only widen): same cap and derivation as
+    // `election_backpressure_corpus::attempt_cap` (28 = ceil(ln 1e-6 / ln 0.6));
+    // this rig measured 1..6 rounds over 16 seeds.
+    if rounds > 28 {
+        bad.push("livelock: more lost campaign attempts than the geometry allows");
+    }
     match delay {
         None => bad.push("bound: the lost group never got a leader (starved)"),
         Some(d) if d > bound => {
