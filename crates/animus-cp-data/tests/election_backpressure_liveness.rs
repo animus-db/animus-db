@@ -291,6 +291,23 @@ impl<S: StorageEngine + 'static> Cluster<S> {
         (led.len(), max_term, quiesced, hosted)
     }
 
+    /// `(sum of retained Raft log entries, sum of committed-but-not-engine-
+    /// applied entries, the largest of those per replica)` over every hosted
+    /// replica. The apply backlog is what an overloaded node queues in memory
+    /// (issue #1304): each entry sits in the log and the apply buffer.
+    fn backlog(&self) -> (usize, u64, u64) {
+        let (mut log, mut lag, mut lag_max) = (0usize, 0u64, 0u64);
+        for n in self.live() {
+            for g in n.hosted.lock().expect("hosted").values() {
+                log += g.log_len();
+                let a = g.commit_index().saturating_sub(g.engine_applied_index());
+                lag += a;
+                lag_max = lag_max.max(a);
+            }
+        }
+        (log, lag, lag_max)
+    }
+
     /// Hosted tablets no live replica currently believes it leads. Read per
     /// node, not atomically: a leadership transfer racing the scan can read
     /// as a one-poll blip either way, which the callers' persistence bound
@@ -796,19 +813,29 @@ impl EngineFactory<LsmEngine<ProdEnv>> for LsmFactory {
 impl<S: StorageEngine + 'static> Cluster<S> {
     /// Propose one put to `t`'s current leader; `true` iff a leader accepted
     /// it (appended locally, ProposeResult::Accepted).
-    fn put_leader(&self, t: TabletId, key: Vec<u8>, value: Vec<u8>) -> bool {
+    ///
+    /// `window > 0` closes the loop the way the DynamoDB wire does (a client
+    /// waits for its write to apply, and `max_inflight_requests` bounds the
+    /// node): the put is *shed* (`None`) while the leader's committed-but-
+    /// not-engine-applied backlog exceeds `window` entries. `window == 0` is the
+    /// open loop (the propose path itself has no admission control).
+    fn put_leader(&self, t: TabletId, key: Vec<u8>, value: Vec<u8>, window: u64) -> Option<bool> {
         for n in self.live() {
             let hosted = n.hosted.lock().expect("hosted");
             if let Some(g) = hosted.get(&t)
                 && g.is_leader()
             {
-                return matches!(
+                if window > 0 && g.commit_index().saturating_sub(g.engine_applied_index()) > window
+                {
+                    return None;
+                }
+                return Some(matches!(
                     g.put(key, value),
                     animus_control::raft::ProposeResult::Accepted { .. }
-                );
+                ));
             }
         }
-        false
+        Some(false)
     }
 }
 
@@ -821,6 +848,7 @@ impl<S: StorageEngine + 'static> Cluster<S> {
 /// `ANIMUS_BP_LIVE_ENGINE=lsm` (`LsmEngine<ProdEnv>` per tablet, real files),
 /// `ANIMUS_BP_LIVE_WRITE_RPS` (client puts per second spread round-robin
 /// over the groups during the hold; 0), `ANIMUS_BP_LIVE_VALUE_BYTES` (128), `ANIMUS_BP_LIVE_WRITE_GROUPS` (all; a hot subset),
+/// `ANIMUS_BP_LIVE_WRITE_WINDOW` (0 = open loop; N sheds a put while its leader has more than N committed-but-unapplied entries, as the wire's per-request wait does),
 /// `ANIMUS_BP_LIVE_HOLD_SECS` (120), `ANIMUS_BP_LIVE_CONVERGE_SECS` (600), `ANIMUS_BP_LIVE_ASSERT=0` (report the
 /// outcome in a `BP-LIVE verdict` line instead of failing, for sweeps). The
 /// hold lines carry `cpu_ticks`/`rss_kb`/`fds`/`threads`/`files`/`ssts` from
@@ -864,6 +892,7 @@ async fn density_body<S: StorageEngine + 'static>(c: &mut Cluster<S>, lsm: bool,
     let value_bytes: usize = knob("ANIMUS_BP_LIVE_VALUE_BYTES", 128);
     let converge = Duration::from_secs(knob("ANIMUS_BP_LIVE_CONVERGE_SECS", 600));
     let write_groups: usize = knob("ANIMUS_BP_LIVE_WRITE_GROUPS", g).clamp(1, g);
+    let window: u64 = knob("ANIMUS_BP_LIVE_WRITE_WINDOW", 0);
     let assert_on = std::env::var("ANIMUS_BP_LIVE_ASSERT").as_deref() != Ok("0");
     println!(
         "BP-LIVE g={g} phase=config workers={workers} engine={} write_rps={rps} write_groups={write_groups} value_bytes={value_bytes} hold_s={}",
@@ -893,7 +922,7 @@ async fn density_body<S: StorageEngine + 'static>(c: &mut Cluster<S>, lsm: bool,
         let hold_base = proc_sample();
         let mut last_log = Instant::now();
         let mut min_led = g;
-        let (mut sent, mut accepted, mut next_group) = (0u64, 0u64, 0usize);
+        let (mut sent, mut accepted, mut shed, mut next_group) = (0u64, 0u64, 0u64, 0usize);
         let mut budget = 0f64;
         let mut last_tick = Instant::now();
         let payload = vec![0xA5u8; value_bytes];
@@ -909,23 +938,29 @@ async fn density_body<S: StorageEngine + 'static>(c: &mut Cluster<S>, lsm: bool,
                     let key = format!("k{sent:012}").into_bytes();
                     sent += 1;
                     next_group += 1;
-                    if c.put_leader(t, key, payload.clone()) {
-                        accepted += 1;
+                    match c.put_leader(t, key, payload.clone(), window) {
+                        Some(true) => accepted += 1,
+                        Some(false) => {}
+                        None => shed += 1,
                     }
                 }
             }
             if last_log.elapsed() >= Duration::from_secs(10) {
                 let s = proc_sample();
+                let backlog = c.backlog();
                 let (files, bytes, ssts) = if lsm { dir_stats(&c.dirs) } else { (0, 0, 0) };
                 println!(
                     "BP-LIVE g={g} phase=hold t_s={} led={led} quiesced={quiesced} hosted={hosted} max_term={max_term} \
-                     cpu_ticks={} rss_kb={} fds={} threads={} writes_sent={sent} writes_accepted={accepted} \
-                     files={files} dir_bytes={bytes} ssts={ssts}",
+                     cpu_ticks={} rss_kb={} fds={} threads={} writes_sent={sent} writes_accepted={accepted} writes_shed={shed} \
+                     log_len_sum={} apply_lag_sum={} apply_lag_max={} files={files} dir_bytes={bytes} ssts={ssts}",
                     t0.elapsed().as_secs(),
                     s.0 - hold_base.0,
                     s.1,
                     s.2,
-                    s.3
+                    s.3,
+                    backlog.0,
+                    backlog.1,
+                    backlog.2
                 );
                 last_log = Instant::now();
             }
@@ -934,14 +969,19 @@ async fn density_body<S: StorageEngine + 'static>(c: &mut Cluster<S>, lsm: bool,
         let (led, max_term, _, _) = c.census();
         let (hwm, _, deferred) = c.governor_stats();
         let end = proc_sample();
+        let backlog = c.backlog();
         let hold_s = hold.as_secs_f64();
         let (files, bytes, ssts) = if lsm { dir_stats(&c.dirs) } else { (0, 0, 0) };
         println!(
             "BP-LIVE g={g} phase=held min_led={min_led} led={led} max_term={max_term} inflight_hwm={hwm} deferred={deferred} \
-             hold_cores={:.3} rss_kb={} fds={} writes_sent={sent} writes_accepted={accepted} files={files} dir_bytes={bytes} ssts={ssts}",
+             hold_cores={:.3} rss_kb={} fds={} writes_sent={sent} writes_accepted={accepted} writes_shed={shed} \
+             log_len_sum={} apply_lag_sum={} apply_lag_max={} files={files} dir_bytes={bytes} ssts={ssts}",
             (end.0 - hold_base.0) as f64 / 100.0 / hold_s,
             end.1,
-            end.2
+            end.2,
+            backlog.0,
+            backlog.1,
+            backlog.2
         );
         (took.is_some(), min_led, hwm)
     })
