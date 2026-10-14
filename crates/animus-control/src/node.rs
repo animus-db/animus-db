@@ -2947,6 +2947,7 @@ async fn reconcile_loop<E: Env>(
                 pacer.clear();
                 metrics.set(Metric::CpRepairInflight, 0);
             }
+            metrics.set(Metric::PlacementCapacityBlockedTablets, 0);
             rebalance_cache.invalidate();
             continue;
         };
@@ -2983,6 +2984,13 @@ async fn reconcile_loop<E: Env>(
                 pacer.accepted(now, &command);
             }
         }
+        // ADR 0079 section 1: the capacity alarm. Recomputed from the view each
+        // tick (a cheap pass over the tablet map, zero when nobody declares a
+        // ceiling).
+        metrics.set(
+            Metric::PlacementCapacityBlockedTablets,
+            view.capacity_blocked_tablets() as u64,
+        );
         let inflight = pacer.inflight() as u64;
         inflight_hwm = inflight_hwm.max(inflight);
         metrics.set(Metric::CpRepairInflight, inflight);

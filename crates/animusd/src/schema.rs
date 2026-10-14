@@ -423,7 +423,8 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     .filter(|(_, m)| m.status == NodeStatus::Active)
                     .map(|(id, _)| id.clone())
                     .collect();
-                replicas = zone_aware_initial_replicas(&meta, replicas);
+                replicas =
+                    zone_aware_initial_replicas(&meta, replicas).map_err(|e| e.to_string())?;
                 let now = self.env.now();
                 if !replicas.is_empty()
                     && (last_proposed_create != Some(true) || now >= next_propose_at)
@@ -1814,17 +1815,33 @@ pub(crate) fn default_table_policy(meta: &crate::Metadata) -> PlacementPolicy {
     )
 }
 
+/// Prefix of the error [`ClientCtx::provision_tablet`] and `CreateTable`
+/// return when every `Active` node is at its `max_replicas` (ADR 0079 section
+/// 1): the wire layer maps it to the retryable `ServiceUnavailable`
+/// (`dynamo::internal`), never an `InternalServerError` and never a
+/// provisioning timeout.
+pub(crate) const CAPACITY_EXHAUSTED_REFUSAL: &str = "no capacity for a new tablet";
+
 /// The first tablet's initial replica set from the `Active` members
 /// `active` (id order): zone-spread and load-aware when the table's policy
 /// is a spread one and enough `Active` members exist to satisfy it, else the
 /// historical first-`RF`-by-id truncation. The reconciler never *repairs* a
 /// best-effort spread that merely started skewed (it is not a hard
 /// violation), so the initial pick has to be right.
+///
+/// **Capacity (ADR 0079 section 1):** once `Gate::NodeCapacity` is open and a
+/// node has declared capacity, the pick is capacity-aware instead
+/// ([`Metadata::capacity_initial_replicas`]: weighted fill, never a node at
+/// `max_replicas`), and a cluster whose every `Active` node is full refuses
+/// with [`CapacityExhausted`]. A cluster that declares nothing is unchanged.
 pub(crate) fn zone_aware_initial_replicas(
     meta: &crate::Metadata,
     mut active: Vec<NodeId>,
-) -> Vec<NodeId> {
+) -> Result<Vec<NodeId>, animus_control::CapacityExhausted> {
     let policy = default_table_policy(meta);
+    if let Some(picked) = meta.capacity_initial_replicas(&policy) {
+        return picked;
+    }
     if policy.spread.is_some() {
         let cands: Vec<animus_placement::Candidate> = active
             .iter()
@@ -1841,11 +1858,11 @@ pub(crate) fn zone_aware_initial_replicas(
             }
         }
         if let Ok(set) = animus_placement::select_replicas_balanced(&cands, &policy, &load) {
-            return set;
+            return Ok(set);
         }
     }
     active.truncate(MAX_REPLICATION_FACTOR);
-    active
+    Ok(active)
 }
 
 #[cfg(test)]
@@ -1906,7 +1923,7 @@ mod default_table_policy_tests {
         ];
         let meta = meta_with(&zones, NodeStatus::Active);
         let active: Vec<NodeId> = (0..6).map(nid).collect();
-        let picked = zone_aware_initial_replicas(&meta, active.clone());
+        let picked = zone_aware_initial_replicas(&meta, active.clone()).unwrap();
         let picked_zones: BTreeSet<_> = picked
             .iter()
             .map(|n| meta.members[n].labels[ZONE_LABEL].clone())
@@ -1914,11 +1931,11 @@ mod default_table_policy_tests {
         assert_eq!(picked.len(), 3);
         assert_eq!(picked_zones.len(), 3, "{picked:?}");
         // Not enough Active members to satisfy RF: falls back to first-N by id.
-        let few = zone_aware_initial_replicas(&meta, active[..2].to_vec());
+        let few = zone_aware_initial_replicas(&meta, active[..2].to_vec()).unwrap();
         assert_eq!(few, vec![nid(0), nid(1)]);
         // Unlabelled cluster: historical truncation.
         let plain = meta_with(&[None, None, None, None], NodeStatus::Active);
-        let got = zone_aware_initial_replicas(&plain, (0..4).map(nid).collect());
+        let got = zone_aware_initial_replicas(&plain, (0..4).map(nid).collect()).unwrap();
         assert_eq!(got, vec![nid(0), nid(1), nid(2)]);
     }
 }

@@ -3300,6 +3300,13 @@ pub struct PlacementView {
 }
 
 impl PlacementView {
+    /// [`Metadata::capacity_blocked_tablets`] over this view (the control
+    /// leader's `PlacementCapacityBlockedTablets` gauge).
+    #[must_use]
+    pub fn capacity_blocked_tablets(&self) -> usize {
+        capacity_blocked_count(&self.members, &self.capacity, &self.tablets, &self.policies)
+    }
+
     /// The pure placement decision over this view — identical to
     /// [`Metadata::reconcile`] (both delegate to the same body).
     /// `recently_done` is the driver's own post-`done` grace-window decision
@@ -3421,6 +3428,70 @@ fn replica_load(tablets: &BTreeMap<TabletId, Tablet>) -> BTreeMap<NodeId, usize>
         }
     }
     load
+}
+
+/// Tablets the repair pass cannot bring up to their policy RF **because of
+/// `max_replicas`** (ADR 0079 section 1, "Total capacity below demand": the
+/// alarm behind `Metric::PlacementCapacityBlockedTablets`). A tablet counts
+/// when it is `Active`, has fewer live (`Active`-member) replicas than its
+/// policy RF, no policy-admissible node outside its set has room, and at
+/// least one such node is full: so raising a cap (or adding a node) is what
+/// would resolve it. `0` whenever no node declares a ceiling. Pure and
+/// deterministic like the placement passes.
+fn capacity_blocked_count(
+    members: &BTreeMap<NodeId, Member>,
+    capacity: &BTreeMap<NodeId, Capacity>,
+    tablets: &BTreeMap<TabletId, Tablet>,
+    policies: &BTreeMap<TabletId, PlacementPolicy>,
+) -> usize {
+    if capacity.values().all(|c| c.max_replicas.is_none()) {
+        return 0;
+    }
+    let load = replica_load(tablets);
+    let candidates = active_candidates(members, capacity);
+    let full = |c: &Candidate| c.capacity.is_full(load.get(&c.node).copied().unwrap_or(0));
+    tablets
+        .iter()
+        .filter(|(id, t)| {
+            t.state == TabletState::Active
+                && policies.get(id).is_some_and(|p| {
+                    let live = t
+                        .replicas
+                        .iter()
+                        .filter(|r| candidates.iter().any(|c| &c.node == *r))
+                        .count();
+                    let outside = || {
+                        candidates
+                            .iter()
+                            .filter(|c| !t.replicas.contains(&c.node) && p.admits(c))
+                    };
+                    live < p.replication_factor
+                        && !outside().any(|c| !full(c))
+                        && outside().any(full)
+                })
+        })
+        .count()
+}
+
+/// Why a brand-new tablet cannot be placed (ADR 0079 section 1): every
+/// `Active` node is at its `max_replicas`. The caller refuses the creation
+/// with a retryable error rather than over-placing past a cap the operator
+/// set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapacityExhausted {
+    /// `Active` members considered.
+    pub active: usize,
+}
+
+impl std::fmt::Display for CapacityExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no capacity for a new tablet: all {} active node(s) are at their max_replicas; \
+             raise a node's max_replicas or add a node; retry",
+            self.active
+        )
+    }
 }
 
 /// The shared body of [`Metadata::reconcile`] / [`PlacementView::reconcile`]: a
@@ -6060,6 +6131,99 @@ impl Metadata {
         } else {
             BTreeMap::new()
         }
+    }
+
+    /// Tablets that cannot reach their policy RF because every eligible node
+    /// is at `max_replicas` (the `Metric::PlacementCapacityBlockedTablets`
+    /// gauge, ADR 0079 section 1). `0` while the gate is closed or no node
+    /// declares a ceiling.
+    #[must_use]
+    pub fn capacity_blocked_tablets(&self) -> usize {
+        capacity_blocked_count(
+            &self.members,
+            &self.effective_capacities(),
+            &self.tablets,
+            &self.policies,
+        )
+    }
+
+    /// The first replica set for a **brand-new tablet** under declared
+    /// capacity (ADR 0079 section 1), or `None` when capacity is not in effect
+    /// (gate closed, or nothing declared) and the caller keeps today's pick.
+    ///
+    /// Candidates are the `Active` members; `select_replicas_balanced` orders
+    /// them by the fill each would have after one more replica and drops those
+    /// at `max_replicas`. When **every** `Active` node is full the tablet
+    /// cannot be placed and the answer is [`CapacityExhausted`] (the caller
+    /// refuses the creation; the only moment the cluster can say no cleanly).
+    /// When some but fewer than `policy.replication_factor` nodes have room,
+    /// the tablet is minted on those (best effort, like the bootstrap case of
+    /// fewer members than RF) and the blocked gauge reports it.
+    ///
+    /// # Errors
+    /// [`CapacityExhausted`] when every `Active` node is at its ceiling.
+    pub fn capacity_initial_replicas(
+        &self,
+        policy: &PlacementPolicy,
+    ) -> Option<Result<Vec<NodeId>, CapacityExhausted>> {
+        let capacity = self.effective_capacities();
+        if capacity.is_empty() {
+            return None;
+        }
+        let candidates = active_candidates(&self.members, &capacity);
+        if candidates.is_empty() {
+            return None;
+        }
+        let load = replica_load(&self.tablets);
+        let room = candidates
+            .iter()
+            .filter(|c| !c.capacity.is_full(load.get(&c.node).copied().unwrap_or(0)))
+            .count();
+        if room == 0 {
+            return Some(Err(CapacityExhausted {
+                active: candidates.len(),
+            }));
+        }
+        if let Ok(set) = select_replicas_balanced(&candidates, policy, &load) {
+            return Some(Ok(set));
+        }
+        // Fewer nodes with room than the RF (or a spread that cannot be met):
+        // the plain best-effort pick over the nodes that do have room.
+        let mut relaxed =
+            PlacementPolicy::simple(policy.name.clone(), room.min(policy.replication_factor));
+        relaxed.required_labels.clone_from(&policy.required_labels);
+        relaxed.allowed_values.clone_from(&policy.allowed_values);
+        Some(Ok(
+            select_replicas_balanced(&candidates, &relaxed, &load).unwrap_or_default()
+        ))
+    }
+
+    /// The Regions among `regions` in which **no** `Active` node has room
+    /// under `max_replicas` (ADR 0079 section 1, region pinning): a pinned
+    /// tablet needs one replica in each Region, so converting a table to a
+    /// global table is refused while any named Region is full. A Region with
+    /// no `Active` node at all is reported too. Empty while capacity is not in
+    /// effect.
+    #[must_use]
+    pub fn regions_without_capacity(&self, regions: &[String]) -> Vec<String> {
+        let capacity = self.effective_capacities();
+        if capacity.values().all(|c| c.max_replicas.is_none()) {
+            return Vec::new();
+        }
+        let load = replica_load(&self.tablets);
+        let candidates = active_candidates(&self.members, &capacity);
+        regions
+            .iter()
+            .filter(|r| {
+                !candidates.iter().any(|c| {
+                    c.labels
+                        .get(crate::timing::REGION_LABEL)
+                        .is_some_and(|v| v == *r)
+                        && !c.capacity.is_full(load.get(&c.node).copied().unwrap_or(0))
+                })
+            })
+            .cloned()
+            .collect()
     }
 
     /// Whether `Gate::NodeCapacity` is open at this metadata's cluster version.

@@ -6,6 +6,7 @@ mod apply_engine;
 mod apply_not_starved_by_wal_lock;
 mod backup_catalog;
 mod campaign_admission;
+mod capacity_corpus;
 mod control_corpus;
 mod control_membership;
 mod control_raft;

@@ -1182,12 +1182,17 @@ pub enum Metric {
     CpRepairInflight,
     /// A high-water mark: most repairs ever in flight at once.
     CpRepairInflightHwm,
+    /// A level (ADR 0079 section 1): tablets the control leader could not
+    /// bring up to their policy RF because every remaining eligible node is
+    /// at its `max_replicas` (recomputed each reconcile tick; non-zero is the
+    /// "raise a cap or add a node" alarm).
+    PlacementCapacityBlockedTablets,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 169] = [
+    pub const ALL: [Metric; 170] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -1357,6 +1362,7 @@ impl Metric {
         Metric::CpRepairDeferred,
         Metric::CpRepairInflight,
         Metric::CpRepairInflightHwm,
+        Metric::PlacementCapacityBlockedTablets,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -1535,6 +1541,7 @@ impl Metric {
             Metric::CpRepairDeferred => "cp_repair_deferred",
             Metric::CpRepairInflight => "cp_repair_inflight",
             Metric::CpRepairInflightHwm => "cp_repair_inflight_hwm",
+            Metric::PlacementCapacityBlockedTablets => "placement_capacity_blocked_tablets",
         }
     }
 
