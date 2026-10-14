@@ -18,9 +18,9 @@ use crate::{
     BROADCAST_EXHAUSTED_BACKOFF, CLIENT_TIMEOUT, ClientCtx, ClientRequest, ClientResponse, CpRoute,
     FORWARD_HOP_TIMEOUT, MAX_REPLICATION_FACTOR, MetaCommand, NodeAddrs, NodeStatus,
     PlacementPolicy, ProposeResult, RegisterOutcome, SCHEMA_COMMIT_TIMEOUT, SCHEMA_POLL_INTERVAL,
-    SCHEMA_PROPOSE_PATIENCE, SPLIT_BUSY, SPLIT_KEY_NOT_TOKEN_VIABLE, STREAM_GROW_MID_SPLIT,
-    STREAM_GROW_NO_SPLIT_POINT, WATCH_METADATA_SERVER_TIMEOUT, decide, index_drain,
-    median_split_key, topology,
+    SCHEMA_PROPOSE_PATIENCE, SPLIT_BUSY, SPLIT_KEY_NOT_TOKEN_VIABLE, SPLIT_WAIT_BOUND,
+    STREAM_GROW_MID_SPLIT, STREAM_GROW_NO_SPLIT_POINT, WATCH_METADATA_SERVER_TIMEOUT, decide,
+    index_drain, median_split_key, topology,
 };
 
 /// First/maximum pause between self-registration attempts
@@ -546,11 +546,52 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     ///
     /// **Split pool (ADR 0079 layer 3).** A split this node starts takes a
     /// split-pool permit (default 1) held until the split is finished in the
-    /// replicated `Metadata` (`SplitPermits`); with the pool full the call is
-    /// refused with the retryable [`SPLIT_BUSY`] error, and the auto-split
-    /// sweeps (which check [`split_pool_full`](Self::split_pool_full) first)
-    /// skip the tablet until their next sweep.
+    /// replicated `Metadata` (`SplitPermits`). This is the *explicit* path
+    /// (the admin endpoint, `SplitTablet`, stream grow): with the pool full it
+    /// **waits its turn** (FIFO) for up to [`SPLIT_WAIT_BOUND`] and only then
+    /// returns the retryable [`SPLIT_BUSY`]. The auto-split sweeps use
+    /// [`trigger_split_nowait`](Self::trigger_split_nowait) instead.
     pub(crate) async fn trigger_split(
+        &self,
+        tablet: TabletId,
+        split_key: Vec<u8>,
+    ) -> ClientResponse {
+        self.trigger_split_within(tablet, split_key, SPLIT_WAIT_BOUND)
+            .await
+    }
+
+    /// [`trigger_split`](Self::trigger_split) with an explicit wait bound (the
+    /// forwarded stream-grow arm must answer inside one relay hop).
+    pub(crate) async fn trigger_split_within(
+        &self,
+        tablet: TabletId,
+        split_key: Vec<u8>,
+        bound: Duration,
+    ) -> ClientResponse {
+        use animus_cp_data::background_budget::SplitAdmission;
+        let pool = self.split_pool();
+        let permit = match pool {
+            Some(p) => match p
+                .admit_wait(
+                    &self.env,
+                    tablet,
+                    || self.effective_metadata(),
+                    bound,
+                    SCHEMA_POLL_INTERVAL,
+                )
+                .await
+            {
+                SplitAdmission::Busy => return ClientResponse::Error(SPLIT_BUSY.into()),
+                SplitAdmission::Granted(p) => p,
+            },
+            None => None,
+        };
+        self.split_with_permit(tablet, split_key, permit).await
+    }
+
+    /// The auto-split sweeps' entry: never waits. With the pool full it
+    /// returns [`SPLIT_BUSY`] at once and the sweep retries on its next tick.
+    pub(crate) async fn trigger_split_nowait(
         &self,
         tablet: TabletId,
         split_key: Vec<u8>,
@@ -563,6 +604,16 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             Some(SplitAdmission::Granted(p)) => p,
             None => None,
         };
+        self.split_with_permit(tablet, split_key, permit).await
+    }
+
+    async fn split_with_permit(
+        &self,
+        tablet: TabletId,
+        split_key: Vec<u8>,
+        permit: Option<animus_cp_data::background_budget::BgPermit>,
+    ) -> ClientResponse {
+        let pool = self.split_pool();
         let response = self.trigger_split_begin(tablet, split_key).await;
         // Success (the split began, or was already running) keeps the permit
         // until the split finishes; a failure drops it here.
@@ -1382,20 +1433,19 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// error (including this action's own expected skips) is a terminal
     /// outcome, not a signal to keep retrying.
     pub(crate) async fn grow_stream_tablet(&self, tablet: TabletId) -> ClientResponse {
-        let deadline = self.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
+        let deadline = self
+            .env
+            .now()
+            .saturating_add(SCHEMA_COMMIT_TIMEOUT)
+            .saturating_add(SPLIT_WAIT_BOUND);
         loop {
             match self.resolve_cp_route(tablet) {
                 Some(CpRoute::Local(leader)) => {
-                    let resp = match median_split_key(&leader).await {
+                    return match median_split_key(&leader).await {
                         None => ClientResponse::Error(STREAM_GROW_NO_SPLIT_POINT.into()),
+                        // Waits for the split pool (ADR 0079), up to its bound.
                         Some(split_key) => self.trigger_split(tablet, split_key).await,
                     };
-                    // ADR 0079 layer 3: a full split pool is "not now", and
-                    // this action is the operator saying "split every tablet",
-                    // so wait for the earlier splits to finish (below).
-                    if !matches!(&resp, ClientResponse::Error(e) if e == SPLIT_BUSY) {
-                        return resp;
-                    }
                 }
                 Some(CpRoute::Forward(addr, hinted)) => {
                     let request = ClientRequest::TriggerAutoSplit { tablet: tablet.0 };
@@ -1405,7 +1455,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     {
                         ClientResponse::Error(e)
                             if topology::parse_not_leader_refusal(&e).is_some() => {} // chase exhausted mid-election, retry below
-                        ClientResponse::Error(e) if e == SPLIT_BUSY => {} // pool full, retry below
+                        // The remote's pool wait is capped under one relay hop
+                        // (`FORWARDED_SPLIT_WAIT`), so a full pool there comes
+                        // back as SPLIT_BUSY and this loop asks again.
+                        ClientResponse::Error(e) if e == SPLIT_BUSY => {}
                         other => return other,
                     }
                 }
@@ -1413,7 +1466,8 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             }
             if self.env.now() >= deadline {
                 return ClientResponse::Error(
-                    "stream grow: did not reach this tablet's leader in time".into(),
+                    "stream grow: did not reach this tablet's leader (or get a split-pool permit) in time"
+                        .into(),
                 );
             }
             self.env.sleep(SCHEMA_POLL_INTERVAL).await;

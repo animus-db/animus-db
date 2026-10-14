@@ -607,6 +607,29 @@ pub struct SplitPermits {
     held: Arc<Mutex<BTreeMap<animus_tablet::TabletId, BgPermit>>>,
     /// Parents whose deferral is already counted (once per requester).
     deferred: Arc<Mutex<BTreeSet<animus_tablet::TabletId>>>,
+    /// Manual splits waiting for a permit, oldest first ([`admit_wait`](Self::admit_wait)).
+    waiters: Arc<Mutex<SplitWaiters>>,
+}
+
+#[derive(Default)]
+struct SplitWaiters {
+    next: u64,
+    queue: std::collections::VecDeque<u64>,
+}
+
+/// A place in the split pool's FIFO of waiting manual splits. Dropping it
+/// (the wait finished, timed out, or its future was cancelled) leaves the
+/// queue, so an abandoned waiter can never block the ones behind it.
+struct SplitTicket {
+    id: u64,
+    waiters: Arc<Mutex<SplitWaiters>>,
+}
+
+impl Drop for SplitTicket {
+    fn drop(&mut self) {
+        let mut w = self.waiters.lock().expect("split waiters poisoned");
+        w.queue.retain(|&t| t != self.id);
+    }
 }
 
 impl SplitPermits {
@@ -617,6 +640,7 @@ impl SplitPermits {
             budget,
             held: Arc::default(),
             deferred: Arc::default(),
+            waiters: Arc::default(),
         }
     }
 
@@ -710,6 +734,50 @@ impl SplitPermits {
                 }
                 SplitAdmission::Busy
             }
+        }
+    }
+
+    /// [`admit`](Self::admit), but **wait** for a permit (ADR 0079 step 5): an
+    /// explicit, operator-requested split queues behind the pool instead of
+    /// being refused. Waiters are served strictly first come, first served;
+    /// the permit frees as `meta()` (re-read on every poll) shows an earlier
+    /// split finished, so the wait polls every `poll` of `env` time. Returns
+    /// [`SplitAdmission::Busy`] only once `bound` has passed. Cancellation-safe:
+    /// a dropped future leaves the queue (see `SplitTicket`).
+    pub async fn admit_wait<E: animus_env::Env>(
+        &self,
+        env: &E,
+        tablet: animus_tablet::TabletId,
+        meta: impl Fn() -> animus_control::Metadata,
+        bound: Duration,
+        poll: Duration,
+    ) -> SplitAdmission {
+        let deadline = env.now().saturating_add(bound);
+        let ticket = {
+            let mut w = self.waiters.lock().expect("split waiters poisoned");
+            let id = w.next;
+            w.next += 1;
+            w.queue.push_back(id);
+            SplitTicket {
+                id,
+                waiters: self.waiters.clone(),
+            }
+        };
+        loop {
+            let at_head = self
+                .waiters
+                .lock()
+                .expect("split waiters poisoned")
+                .queue
+                .front()
+                == Some(&ticket.id);
+            if at_head && let SplitAdmission::Granted(p) = self.admit(tablet, &meta(), env.now()) {
+                return SplitAdmission::Granted(p);
+            }
+            if env.now() >= deadline {
+                return SplitAdmission::Busy;
+            }
+            env.sleep(poll).await;
         }
     }
 

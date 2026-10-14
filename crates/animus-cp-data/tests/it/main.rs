@@ -73,6 +73,7 @@ mod snapshot_heartbeat_resend_unbounded;
 mod snapshot_reads;
 mod snapshot_resend_bound;
 mod snapshot_transfer_survives_compaction;
+mod split_permit_wait;
 mod split_tablet;
 mod split_trim_failure;
 mod staggered_hosting;

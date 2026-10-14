@@ -15362,11 +15362,20 @@ struct AutoSplitThresholds {
 const SPLIT_KEY_NOT_TOKEN_VIABLE: &str =
     "split key rounds onto the tablet's own range start (single-token hot partition)";
 
-/// The retryable refusal of a split request when this node's split pool is full
-/// (ADR 0079 layer 3, `--bg-splits`): not an error in the request. The
-/// auto-split sweeps never reach it (they check
-/// `ClientCtx::split_pool_full` first and try again on their next sweep); a
-/// manual split gets it as a "not now".
+/// How long an explicit split (`POST /admin/tablet/split`, `SplitTablet`,
+/// stream grow) waits for a split-pool permit before answering [`SPLIT_BUSY`]:
+/// 3 x [`CLIENT_TIMEOUT`] (30 s), several times a healthy split's fork plus
+/// directed Placing, so only a stuck pool ever times out (a stuck permit is
+/// itself reclaimed after `SPLIT_PERMIT_MAX_HOLD`).
+pub(crate) const SPLIT_WAIT_BOUND: Duration = Duration::from_secs(3 * CLIENT_TIMEOUT.as_secs());
+/// The wait a *forwarded* stream-grow split takes on the remote node: half of
+/// [`FORWARD_HOP_TIMEOUT`], so it answers before the relay hop gives up.
+pub(crate) const FORWARDED_SPLIT_WAIT: Duration =
+    Duration::from_secs(FORWARD_HOP_TIMEOUT.as_secs() / 2);
+/// The retryable refusal of a split when this node's split pool is full (ADR
+/// 0079 layer 3, `--bg-splits`): not an error in the request. The auto-split
+/// sweeps get it at once and retry on their next sweep; an explicit split gets
+/// it only after waiting [`SPLIT_WAIT_BOUND`].
 pub(crate) const SPLIT_BUSY: &str = "split pool full (--bg-splits), retry shortly";
 
 // F11 (ADR 0042 §14, Fork D): the split-key token-rounding predicate moved
@@ -15597,7 +15606,10 @@ async fn auto_split_loop<E: Env, R: RelayClient>(
             // that structurally cannot split).
             last_triggered.insert(tablet, ctx.env.now());
             let span = tracing::info_span!("auto_split", tablet = tablet.0);
-            let response = ctx.trigger_split(tablet, split_key).instrument(span).await;
+            let response = ctx
+                .trigger_split_nowait(tablet, split_key)
+                .instrument(span)
+                .await;
             match &response {
                 ClientResponse::PutOk => {}
                 ClientResponse::Error(msg) if msg == SPLIT_KEY_NOT_TOKEN_VIABLE => {}
@@ -15720,7 +15732,10 @@ async fn auto_split_loop<E: Env, R: RelayClient>(
                 tablet = tablet.0,
                 table = %table
             );
-            let response = ctx.trigger_split(tablet, split_key).instrument(span).await;
+            let response = ctx
+                .trigger_split_nowait(tablet, split_key)
+                .instrument(span)
+                .await;
             match &response {
                 ClientResponse::PutOk => {
                     ctx.env.metrics().incr(Metric::AutoSplitMinTablets);

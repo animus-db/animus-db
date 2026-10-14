@@ -12562,6 +12562,12 @@ seal knobs). A new `StreamSealKnobs { .. }` literal needs `..Default::default()`
   `wake_deferred_total`, `bg_{snapshot,split,compaction}_hwm`,
   `capacity_blocked_tablets`. The `DataRole` split pool is a separate
   `BackgroundBudget` from the reconciler's (fixture simplification).
+- **Split pool: explicit splits wait, the sweeps skip (ADR 0079 step 5).**
+  `ClientCtx::trigger_split` (admin endpoint, `SplitTablet`, stream grow) queues FIFO on
+  `SplitPermits::admit_wait` for up to `SPLIT_WAIT_BOUND` (3 x `CLIENT_TIMEOUT`) before
+  `SPLIT_BUSY`; `trigger_split_nowait` (the two auto-split sweeps) never waits. The forwarded
+  `TriggerAutoSplit` arm waits only `FORWARDED_SPLIT_WAIT` (inside one relay hop) and
+  `grow_stream_tablet` re-asks on `SPLIT_BUSY`. Tests: `animus-cp-data` `split_permit_wait::`.
 - `auto_split_loop`'s bytes sweep carries a `pool_deferred` set: a tablet skipped
   on a full split pool is evaluated later even if it has quiesced.
 - Wire test: `sim_cluster_cluster_version::create_table_is_refused_retryably_when_every_node_is_at_max_replicas`

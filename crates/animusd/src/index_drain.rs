@@ -2964,37 +2964,24 @@ mod gsi_drain_cursor_tests {
     /// murmur3 token prefix — `ClientRequest`'s own `Vec<u8>` field
     /// `serde_json`-encodes as an ordinary byte array instead).
     async fn split(client_addr: SocketAddr, tablet: TabletId, split_key: Vec<u8>) {
-        // The split pool (ADR 0079, default 1) answers a second split with a
-        // retryable "pool full" error until the previous split's children are
-        // placed, as a real client would see; retry it, bounded.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            let mut stream = connect_client(client_addr).await.expect("connect");
-            write_frame(
-                &mut stream,
-                &ClientRequest::SplitTablet {
-                    tablet: tablet.0,
-                    split_key: split_key.clone(),
-                },
-            )
+        let mut stream = connect_client(client_addr).await.expect("connect");
+        write_frame(
+            &mut stream,
+            &ClientRequest::SplitTablet {
+                tablet: tablet.0,
+                split_key,
+            },
+        )
+        .await
+        .expect("send split");
+        let resp: ClientResponse = read_frame(&mut stream)
             .await
-            .expect("send split");
-            let resp: ClientResponse = read_frame(&mut stream)
-                .await
-                .expect("read reply")
-                .expect("a reply");
-            if matches!(&resp, ClientResponse::Error(e) if e == crate::SPLIT_BUSY)
-                && tokio::time::Instant::now() < deadline
-            {
-                sleep(Duration::from_millis(100)).await;
-                continue;
-            }
-            assert!(
-                matches!(resp, ClientResponse::PutOk),
-                "split failed: {resp:?}"
-            );
-            return;
-        }
+            .expect("read reply")
+            .expect("a reply");
+        assert!(
+            matches!(resp, ClientResponse::PutOk),
+            "split failed: {resp:?}"
+        );
     }
 
     /// An `id` value whose real ADR 0022 token (`crate::dynamo::item_key`,

@@ -129,7 +129,7 @@ The defaults are deliberately low and are expected to change after the ProdEnv s
 **What happens past the cap.**
 
 - *Snapshot and catch-up streams:* a **retryable refusal**, in the style of `MREC_MAX_INFLIGHT_APPLIES`. The sender asks for a permit before starting; the receiver refuses an `InstallSnapshot`/learner start with a retry-after hint when its receive pool is full. The leader's existing retry logic treats a refusal as "not now" (the learner stays a learner; replication to it resumes later). No Raft safety rule changes: a refused snapshot is indistinguishable from a slow follower. The retry interval is the existing replication retry cadence plus jitter drawn from `Env`.
-- *Splits:* the auto-split sweep skips a tablet when the pool is full and tries again on its next sweep (`AUTO_SPLIT_INTERVAL`); a manual split request gets the retryable refusal. `AUTO_SPLIT_COOLDOWN` stays per-tablet.
+- *Splits:* the auto-split sweep skips a tablet when the pool is full and tries again on its next sweep (`AUTO_SPLIT_INTERVAL`); an explicit split (admin endpoint, `SplitTablet`, stream grow) **queues for the permit** (FIFO, cancellation-safe, polled on `Env` time) for up to `SPLIT_WAIT_BOUND` (3 x `CLIENT_TIMEOUT`, 30 s) and only then gets the retryable `SPLIT_BUSY`. Refusing an operator who asked for N splits in a row would make every back-to-back caller (stream grow, scripts, tests) write its own retry loop. `AUTO_SPLIT_COOLDOWN` stays per-tablet.
 - *Compactions:* the compaction scheduler takes a permit before starting a run and **defers** (re-checks at the maintenance tick) when none is free. Deferral is bounded by an L0 safety valve: when a tablet's L0 table count reaches `2 x compaction_trigger` its compaction **bypasses the pool** (counted `compaction_overcap`), because an unbounded L0 makes reads and eventually writes worse than an extra compaction. This does not add the L0 write stall that is missing today (see Open question 6); it only stops the pool from making L0 growth worse.
 
 **Repair-proposal pacing (control leader).** `reconcile()` currently returns every violating tablet's fix and `reconcile_loop` proposes all of them in one tick. New rule: at most `repair_proposals_per_tick = R` *new* `CasTabletReplicas` repairs are proposed per `RECONCILE_INTERVAL` tick, selected deterministically (ascending `TabletId`, as ADR 0078 orders hosting) from the violating set; the rest are returned to the next tick, where `recently_done` already excludes tablets in flight. Pacing also counts repairs already in flight (a learner being caught up whose promotion is pending): the leader does not start a new repair while `in_flight >= R_inflight`. Defaults (provisional): `R = 8`, `R_inflight = 16`. The leader's `LoadMonitor` lag reduces both by the same rule. Basis: the measured burst (25 proposals/s peak at 12 tablets) shows the shape but not a capacity, so these are **inferred** and set so a 1000-tablet loss takes minutes of ticks, not one burst. `REPAIR_DWELL` is unchanged. Rebalancing keeps its own cadence and still yields to repair.
@@ -475,8 +475,8 @@ No `Gate`.
   the hosted groups (a per-group `BgFlow` filters inbound `InstallSnapshot`
   chunks / learner traffic and outbound snapshot chunks in the raftkv driver),
   with the split path (`ClientCtx::trigger_split`, auto-split sweeps skip a
-  tablet whose pool is full and ask again next sweep; a manual split gets the
-  retryable `SPLIT_BUSY`) and with the tablet engines (`animus-storage`
+  tablet whose pool is full and ask again next sweep; an explicit split waits FIFO for
+  the permit, up to `SPLIT_WAIT_BOUND`, then gets the retryable `SPLIT_BUSY`) and with the tablet engines (`animus-storage`
   `CompactionGate`, installed by `LsmTabletFactory`). Permits are RAII (error,
   cancel, drop all return them) and may carry an idle TTL that a full pool reaps
   lazily at the next acquire (no timer). Effective sizes follow node scheduling
