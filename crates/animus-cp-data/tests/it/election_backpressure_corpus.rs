@@ -117,6 +117,26 @@ const BASE: Duration = Duration::from_millis(150);
 /// Probe resolution of `recovery_s` (`SAMPLE`/`FINE` steps), in seconds.
 const RECOVERY_NOISE_S: f64 = 0.1;
 
+/// Cell 10's livelock guard (issue #1306 review): the most lost campaign
+/// attempts a lost-leader re-election may take, independent of the
+/// `attempts`-scaled delay bound (which a livelock would only widen).
+/// Derivation: over 47 reseeded runs of cell 10 (`ANIMUS_ELECTION_BP_SEEDS=64`)
+/// the attempt count was 1:20 2:8 3:8 4:4 5:1 6:4 7:2, mean 2.5, so one attempt
+/// succeeds with probability `s ~= 1/2.5 = 0.4` and the count is roughly
+/// geometric (`P(n > m) = 0.6^m`). A per-run false-failure budget of `1e-6`
+/// (so a deep nightly of thousands of seeds stays green) gives
+/// `m = ceil(ln 1e-6 / ln 0.6) = 28`. Re-derive it if the geometry (K, Q, base)
+/// or the election timing changes.
+const ATTEMPT_SUCCESS_P: f64 = 0.4;
+const ATTEMPT_FALSE_FAIL: f64 = 1e-6;
+/// Control (g): the survivors are partitioned for longer than the cap allows
+/// (28 attempts at 1.5 s each when partitioned, measured).
+const LOSS_WINDOW: Duration = Duration::from_secs(60);
+
+fn attempt_cap() -> u64 {
+    (ATTEMPT_FALSE_FAIL.ln() / (1.0 - ATTEMPT_SUCCESS_P).ln()).ceil() as u64
+}
+
 /// Which ADR 0078 mechanisms are on, and with which parameters (the calibration
 /// sweep varies `governor_k`, `gain`, `stretch_x` and `host_h`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -249,6 +269,9 @@ struct Cell {
     mech: Mechanisms,
     /// Control (f): the restarted nodes re-host in per-node shuffled order.
     shuffled_restart: bool,
+    /// Control (g): the lost group's two survivors are cut off from each other
+    /// for `LOSS_WINDOW` after the kill, so every campaign attempt is lost.
+    lose_attempts: bool,
 }
 
 impl SeedVariant for Cell {
@@ -272,6 +295,7 @@ fn cell(name: &str, kind: Kind, load: f64, mech: Mechanisms) -> Cell {
         load,
         mech,
         shuffled_restart: false,
+        lose_attempts: false,
     }
 }
 
@@ -449,6 +473,17 @@ fn controls_d() -> Vec<Cell> {
         0.0,
         Mechanisms::faulty(GovernorFault::LeakPermits),
     )]
+}
+
+fn controls_g() -> Vec<Cell> {
+    let mut c = cell(
+        "control_g_lost_attempts_livelock_lost_leader_bound",
+        Kind::LostLeaderBound,
+        0.0,
+        Mechanisms::GOVERNOR,
+    );
+    c.lose_attempts = true;
+    vec![c]
 }
 
 fn seeds_per_cell() -> usize {
@@ -1965,35 +2000,85 @@ fn run_lost_leader(mut r: Run, c: &Cell) -> Report {
         .iter()
         .position(|(_, n)| n.is_leader())
         .expect("group 0 is led");
+    // Pre-vote rounds each survivor's core has started for group `gi`: the
+    // per-group attempt counter (the node-wide `CpCampaignAdmitted` counts
+    // every hosted group and the ghosts, so it would make the bound vacuous).
+    let rounds_of = |rig: &Rig, n: usize| {
+        rig.replica(gi, n)
+            .map_or(0, |k| k.campaign_stats().rounds_started)
+    };
+    let rounds_before: Vec<u64> = (0..NODES.len()).map(|n| rounds_of(&r.rig, n)).collect();
     r.s.begin_fault(r.at.as_secs_f64());
     r.rig.replica(gi, ri).expect("hosted").shutdown();
     // The halted replica's frozen handle still reports `is_leader`.
     r.rig.halted.push((gi, ri));
+    // Control (g): every attempt is lost while the survivors cannot talk.
+    let mut loss_s = 0.0;
+    if c.lose_attempts {
+        let (a, b) = match ri {
+            0 => (1, 2),
+            1 => (0, 2),
+            _ => (0, 1),
+        };
+        r.rig.sim.partition_pair(nid(NODES[a]), nid(NODES[b]));
+        r.advance(LOSS_WINDOW, SAMPLE, false);
+        r.rig.sim.heal(nid(NODES[a]), nid(NODES[b]));
+        loss_s = LOSS_WINDOW.as_secs_f64();
+    }
     let delay = r.advance_until(Duration::from_secs(8), Duration::from_millis(10), |rig| {
         rig.replicas(gi)
             .iter()
             .any(|(j, n)| *j != ri && n.is_leader())
     });
+    // ADR 0078, "Lost-leader liveness bound": per campaign attempt,
     // `delay <= 2*base_eff + ceil(Q/K_eff) * T_hold_max`, `T_hold_max =
-    // 2*base_eff` (ADR 0078, "Lost-leader liveness bound"); `base_eff = base`
-    // here (no lag stretch).
-    // The ADR's formula stops at admission; the admitted group still needs its
-    // own pre-vote / vote / commit round trips and the probe resolution is
-    // 10 ms, so the harness adds `OWN_ELECTION_SLACK` (50 ms) to the literal
-    // bound. A leak (control (d)) misses it by seconds, not milliseconds.
+    // 2*base_eff`; `base_eff = base` here (no lag stretch). Two harness terms
+    // the literal formula does not carry (issue #1306):
+    //
+    // * The queue ahead of the lost group is the ghosts (the awake groups are
+    //   served by the lost-leader bypass, ADR 0079). A ghost holds its permit
+    //   for `2*base` like a real campaign, but it is not woken on a grant: it
+    //   re-asks on a `base` sleep (`spawn_ghosts`), and the governor protects
+    //   the queue head, so a grant waits up to one `GHOST_REASK = base` for the
+    //   ghost at the head to come back. Each of the `ceil(Q/K)` passes
+    //   therefore costs `2*base + GHOST_REASK`, not `2*base`. (A real group is
+    //   woken by its callback at once, so production has no such term.) The
+    //   canonical seed lands inside the literal bound only by phase luck;
+    //   reseeded variants measured 1.21 s against 0.95 s.
+    // * The formula stops at admission; the admitted group still needs its own
+    //   pre-vote / vote / commit round trips and the probe resolution is 10 ms,
+    //   so `OWN_ELECTION_SLACK` (50 ms) is added.
+    //
+    // A campaign attempt can also be lost without a term bump (a pre-vote
+    // round that fails when both followers pre-campaign together, or a split
+    // vote), costing a further full window; `attempts` is the most pre-vote
+    // rounds either survivor started for this group since the kill (floor 1).
+    // A permit leak (control (d)) admits nothing, so it still gets the
+    // single-attempt bound and misses it by seconds.
     const OWN_ELECTION_SLACK: f64 = 0.05;
-    let bound = 2.0 * BASE.as_secs_f64()
-        + (q.div_ceil(K) as f64) * 2.0 * BASE.as_secs_f64()
-        + OWN_ELECTION_SLACK;
+    const GHOST_REASK: f64 = BASE.as_secs_f64();
+    let attempts = (0..NODES.len())
+        .filter(|&n| n != ri)
+        .map(|n| rounds_of(&r.rig, n) - rounds_before[n])
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let round = 2.0 * BASE.as_secs_f64()
+        + (q.div_ceil(K) as f64) * (2.0 * BASE.as_secs_f64() + GHOST_REASK);
+    let bound = round * attempts as f64 + OWN_ELECTION_SLACK;
+    let delay = delay.map(|d| d + loss_s);
     let mut extra = Vec::new();
+    if attempts > attempt_cap() {
+        extra.push("livelock: more lost campaign attempts than the geometry allows");
+    }
     match delay {
         None => extra.push("bound: the lost group never got a leader (starved)"),
         Some(d) if d > bound => {
-            extra.push("bound: lost-leader delay above 2*base + ceil(Q/K)*T_hold_max")
+            extra.push("bound: lost-leader delay above attempts * (2*base + ceil(Q/K)*T_hold_max)")
         }
         Some(_) => {}
     }
-    let detail = format!("q={q} k={K} delay_s={delay:?} bound_s={bound:.3}");
+    let detail = format!("q={q} k={K} attempts={attempts} delay_s={delay:?} bound_s={bound:.3}");
     // The group stays on the books of the run: keep going so the end-state
     // clause sees every other group still led.
     r.advance(Duration::from_secs(3), SAMPLE, false);
@@ -2325,6 +2410,32 @@ fn control_f_per_node_hosting_order_delays_quorum() {
     }
 }
 
+/// NEGATIVE CONTROL (g): the survivors of the lost group cannot talk for
+/// `LOSS_WINDOW`, so every campaign attempt is lost and the attempt count
+/// climbs. The delay bound scales with `attempts` and still holds; only the
+/// livelock guard (`attempt_cap`) may fail it.
+#[test]
+fn control_g_lost_attempts_livelock_is_caught_by_the_attempt_cap() {
+    for c in select(controls_g()) {
+        let r = run_cell(&c, groups());
+        let v = Limits::for_cell(&c).violations(&r);
+        eprintln!("BP-CONTROL {} seed={:#x} {v:?} {r:?}", c.name, c.seed);
+        eprintln!("BP-DETAIL {} {}", c.name, r.detail);
+        assert!(
+            v.iter().all(|x| !is_safety(x)),
+            "{} seed={:#x}: safety must hold: {v:?} {r:?}",
+            c.name,
+            c.seed
+        );
+        assert!(
+            v.iter().any(|x| x.starts_with("livelock:")),
+            "{} seed={:#x}: the attempt cap must fire: {v:?} {r:?}",
+            c.name,
+            c.seed
+        );
+    }
+}
+
 /// NEGATIVE CONTROL (d): permits that are never returned (no RAII release).
 /// The lost-leader bound of cell 10 must be violated.
 #[test]
@@ -2453,6 +2564,7 @@ fn names_and_seeds_are_unique_and_frozen() {
         .chain(controls_d())
         .chain(controls_e())
         .chain(controls_f())
+        .chain(controls_g())
         .collect();
     let names: BTreeSet<&str> = all.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names.len(), all.len());

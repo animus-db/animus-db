@@ -3130,8 +3130,8 @@ every existing caller is byte-identical (cell 12 digests). Test hook:
 `GovernorFault::{RearmOnDefer, LeakPermits}` for the negative controls.
 Corpus cells added: 1 with governor (`cell_1_cold_start_*`), 4 (leader-node loss
 while quiesced), 7 (partition and heal), 8 (transfer under saturation), 10
-(lost-leader bound, asserted as `2*base + ceil(Q/K)*2*base + 50 ms` own-election
-slack), 11 (no permits for learners, single voters, quiesced groups); controls
+(lost-leader bound, asserted as `attempts * (2*base + ceil(Q/K)*(2*base + base)) + 50 ms` own-election
+slack (the `+ base` is the ghosts' re-ask sleep); `attempts` is also capped (`attempt_cap()`, derivation in the source; control (g) must fail it), `attempts` = survivors' per-group `campaign_stats().rounds_started` delta, issue #1306), 11 (no permits for learners, single voters, quiesced groups); controls
 (c) `control_c_*` and (d) `control_d_*` (reseeded variants of (c) and (f) are held to an effect that survives reseeding, not the canonical seed's absolute assertion: issue #1313). The default run takes ~2 min in a debug
 build (control (a) alone ~80 s); `ANIMUS_ELECTION_BP_CELL=<substring>` runs one
 cell (each cell is 1 to 12 s except cell 1/control (a)),
