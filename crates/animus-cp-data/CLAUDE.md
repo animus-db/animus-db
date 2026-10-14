@@ -3578,3 +3578,12 @@ backoff, or a live receiver is starved of its retries. `animus-storage`'s
 Corpus: `density_admission_corpus.rs` cells 6, 6b, 7, 8 and controls
 `control_bg_d`, `control_bg_d2`, `control_bg_e` (`ANIMUS_DENSITY_SEEDS`,
 `ANIMUS_DENSITY_CELL=<substring>`).
+
+## Cell 3b: absorbable overload (ADR 0079 step 7)
+
+`density_admission_corpus` `cell_3b_absorbable_overload_capped` sizes the CPU model
+at `1.5 x (G/N + A)` awake groups per survivor (`Rig::capacity_groups`), unlike cell
+3's `2A` which the lost-leader bypass already exceeds. The capped run must have no
+worse worst lag and no fewer groups led than the uncapped run. If it fails, read
+the detail line (lag, backlog, terms, `admit_awake_hwm`, over-cap wakes) before
+touching the bound: step 4's cell 3 was root-caused from exactly those counters.

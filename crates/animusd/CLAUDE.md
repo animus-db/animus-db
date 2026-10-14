@@ -12545,3 +12545,24 @@ seal knobs). A new `StreamSealKnobs { .. }` literal needs `..Default::default()`
   (the sync task is running before the gate opens mid-run) and
   `negative_control_node_capacity_gate_emitted_early`; `SimClusterHandle::sync_node_capacity`
   runs the production loop on a simulated node.
+
+## Capacity refusal and the Tier 2 density lines (ADR 0079 step 7)
+
+- `schema::zone_aware_initial_replicas` returns `Result<_, CapacityExhausted>` and
+  tries `Metadata::capacity_initial_replicas` first. `CreateTable` checks it
+  **before** committing the schema (no schema-without-tablet on refusal);
+  `provision_tablet` returns the `schema::CAPACITY_EXHAUSTED_REFUSAL` error at
+  once. `dynamo::internal` maps that prefix to `ServiceUnavailable` (503), so every
+  `internal(&e)` provisioning site is covered. `ImportTable`/`RestoreTable`
+  destinations still use `active_replicas_for_new_tablet` (first-N).
+- `sim_cluster::SimDensity::install()` turns the awake cap and the background pools
+  on for the current thread's `SimCluster` (nine constructors, six reconciler
+  sites, so no constructor parameter); the guard removes it. `sim_cluster_scale`'s
+  density / split-storm / node-loss cells use it and print `awake_hwm`,
+  `wake_deferred_total`, `bg_{snapshot,split,compaction}_hwm`,
+  `capacity_blocked_tablets`. The `DataRole` split pool is a separate
+  `BackgroundBudget` from the reconciler's (fixture simplification).
+- `auto_split_loop`'s bytes sweep carries a `pool_deferred` set: a tablet skipped
+  on a full split pool is evaluated later even if it has quiesced.
+- Wire test: `sim_cluster_cluster_version::create_table_is_refused_retryably_when_every_node_is_at_max_replicas`
+  (era -> finalize to 5 -> ceilings of 0 -> 503 -> raise -> 200).

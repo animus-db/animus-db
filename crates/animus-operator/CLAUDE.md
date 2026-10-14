@@ -2009,3 +2009,14 @@ renders neither key, so existing `cluster.json` bytes are unchanged. The values
 are config only: nodes advertise them (`SetNodeCapacity`) once the cluster has
 finalized version 5; the operator never edits `Metadata`. `weight: 0` is refused at
 admission (`validate_node_capacity_spec`). `deploy/operator/crd.yaml` regenerated.
+
+## `cores` derivation (ADR 0079 layers 2 and 3, step 7)
+
+`derive_cores` (`desired/cluster_config.rs`, beside `derive_node_capacity`) renders
+`cluster_settings.cores` = `spec.nodeCapacity.cores` (nonzero) else
+`max(1, floor(cpu request / 1 core))`, else unset (the node's awake cap and pools
+stay off). Round **down** (a 2500m pod is 2): `cores` scales the awake cap
+(`x 1500`) and the compaction pool (`max(1, cores / 2)`, derived by the node, not
+rendered), and too small is the safe error. Request, not limit; never
+`available_parallelism`. `spec.nodeCapacity.cores: 0` is refused at admission.
+`deploy/operator/crd.yaml` is regenerated.

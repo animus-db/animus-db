@@ -3374,3 +3374,23 @@ disables a limit. Non-obvious:
 - Deferred repairs still make `repaired` true, so rebalancing keeps yielding.
 - Tests: `tests/it/repair_pacing.rs` (cell 9, controls (a) and (f)) and the
   module's unit tests.
+
+## Capacity: creation refusal, blocked gauge, cells 10-12 (ADR 0079 step 7)
+
+- `Metadata::capacity_initial_replicas(policy)`: the capacity-aware first
+  placement for a new tablet (`None` when capacity is not in effect, so callers
+  keep their old pick byte-for-byte). Every `Active` node at `max_replicas` is
+  `Err(CapacityExhausted)`; some-but-fewer-than-RF nodes with room mints on those
+  (best effort). `animusd` maps the refusal to the retryable `ServiceUnavailable`.
+  `Metadata::regions_without_capacity` is the region-pinned twin (the wire edge
+  refuses `UpdateTable ReplicaUpdates` on a full Region).
+- `Metric::PlacementCapacityBlockedTablets`: `reconcile_loop` sets it each tick
+  from `PlacementView::capacity_blocked_tablets()` (an `Active` tablet short of its
+  policy RF whose every admissible outside node is full). `0` on a non-leader.
+- Tests: `tests/it/capacity_corpus.rs` (cells 10-12, controls (g)/(h), knob
+  `ANIMUS_CAPACITY_SEEDS`). To open `Gate::NodeCapacity` in a real `RaftNode` rig,
+  give every node (control and data) a `[1, 5]` handshake `ext`
+  (`animus_env::handshake::encode_ext`) and `set_own_version_range`, wait for the
+  era, then `ReportNodeVersion` for the data members and finalize 2..=5; the `[1,1]`
+  `b2_ext()` of `version_world` blocks the finalize ("a registered node's range
+  excludes the target"). A default-weight `SetNodeCapacity` is a `NoOp`.

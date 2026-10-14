@@ -542,3 +542,97 @@ or durable shape.
   `sim_cluster_scale_node_loss_with_data_installs_snapshots` cell (no client
   writes during the repair), since the pure control-plane rig has no data plane.
 
+
+## Implementation step 7 as built (2026-10-14): capacity cells, creation refusal, Tier 2 lines, operator `cores`
+
+Classification: **L** throughout (control-leader-local gauge, wire-edge refusal
+and test code). No `Gate`, no wire or durable shape; `Metric::
+PlacementCapacityBlockedTablets` is an additive appended variant.
+
+- **Creation refusal (section 1, "Total capacity below demand").**
+  `Metadata::capacity_initial_replicas(policy)` (`animus-control`) is the one
+  capacity-aware first placement: `None` when capacity is not in effect (gate
+  closed or nothing declared, so today's pick is byte-for-byte unchanged),
+  otherwise `select_replicas_balanced` over the `Active` members (weighted
+  fill, full nodes dropped). **Every `Active` node at `max_replicas` is
+  `CapacityExhausted`; some but fewer than RF nodes with room mints on those**
+  (best effort, the bootstrap rule, and the blocked gauge reports it).
+  `animusd` `zone_aware_initial_replicas` calls it first. Wire mapping:
+  **`ServiceUnavailable` (HTTP 503)**, the documented retryable code every SDK
+  backs off and retries, with a message naming the shortage ("no capacity for a
+  new tablet: all N active node(s) are at their max_replicas; raise a node's
+  max_replicas or add a node; retry"). `dynamo::internal` maps the
+  `schema::CAPACITY_EXHAUSTED_REFUSAL` prefix, so `CreateTable` and the lazy
+  first-write provisioning share it. **`CreateTable` checks before it commits
+  the schema**, so a refusal leaves no schema-without-tablet behind (a retry would
+  otherwise answer `ResourceInUseException`); `provision_tablet` re-checks and
+  returns at once instead of waiting out `SCHEMA_COMMIT_TIMEOUT`. The
+  region-pinned conversion (`UpdateTable ReplicaUpdates`) is refused the same
+  way when `Metadata::regions_without_capacity` names a Region whose `Active`
+  nodes are all at their ceiling. Not covered: `ImportTable`/`RestoreTable`
+  destination tablets still use the first-N pick (they mint through
+  `active_replicas_for_new_tablet`); the split path stays soft by design.
+- **`PlacementCapacityBlockedTablets`** (level, control leader, recomputed each
+  reconcile tick; `0` on a non-leader and whenever no node declares a ceiling): an
+  `Active` tablet with fewer live replicas than its policy RF, no admissible node
+  outside its set with room, and at least one admissible node full. The in-place
+  split's soft over-cap case (section 1, third bullet) is **not** in this gauge
+  (that tablet is fully replicated; the node is over, not the tablet blocked);
+  a node above its ceiling is visible in `/admin/capacity`.
+- **Cells** (`animus-control` `tests/it/capacity_corpus.rs`, knob
+  `ANIMUS_CAPACITY_SEEDS`; placed beside the cell 9 repair-pacing rig because they
+  need the control plane and no data plane): **10** (weights 100/100/200 and
+  seeded variants, tablets minted through the creation path, a node added,
+  rebalance to a fixed point within `1/min_weight`, then a lowered ceiling drains
+  the heaviest node losing no replica), **11** (the real `reconcile_loop`: four
+  RF3 tablets over four nodes at `max_replicas` 3, creation refused, a node dies,
+  repair stays within every ceiling and the gauge equals the blocked count,
+  raising the ceilings restores RF3 and the gauge returns to 0), **12** (a full
+  Region is reported, the conversion proceeds once it has room, and a wholly lost
+  Region's replica waits rather than moving to another Region). Controls **(g)**
+  (count balance ignoring weights) and **(h)** (over-placing creation) each fail
+  the cell's oracle. The wire half of cell 11 is `animusd`
+  `sim_cluster_cluster_version::create_table_is_refused_retryably_when_every_node_is_at_max_replicas`
+  (503, no half-created table, success after the ceilings rise).
+- **Tier 2 lines.** `sim_cluster_scale`'s density, split-storm and node-loss cells
+  now print `awake_hwm`, `wake_deferred_total`, `bg_snapshot_hwm`, `bg_split_hwm`,
+  `bg_compaction_hwm` and `capacity_blocked_tablets` and assert structurally (each
+  pool's high-water within its size, nothing capacity-blocked with no ceiling, the
+  snapshot and split pools held a permit when the cell exercised them). **The
+  layers are on in those cells**: `SimCluster` has nine constructors and six
+  reconciler build sites (restarts included), so a cell installs a
+  `sim_cluster::SimDensity` for its thread (`SimDensity::install`, an RAII guard)
+  and `build_reconciler` and the four `DataRole` sites read it. Density and storm
+  run the production default (2 cores, `A` = 3000, pools 2/2/4/1/1); the node-loss
+  cell runs 1 core and `A` = 4 so the loss exercises the queue. `awake_hwm` is a
+  sampled high-water of the `CpAwakeReplicas` level. Gaps: `bg_compaction_hwm`
+  prints 0 (the cells run `MemoryEngine`, which has no compaction pool), and the
+  `DataRole` split pool is its own `BackgroundBudget` (only the split pool records
+  there, with no lag attachment), a fixture simplification.
+- **A defect the cluster tier found (fixed here).** Turning the split pool on in
+  the split storm left one over-threshold table unsplit forever. The bytes sweep
+  deferred it on a full pool, it quiesced before the pool freed, and the sweep's
+  "a quiesced group was already checked by its last awake tick" skip (ADR 0044
+  PR6) is false for a tablet that tick *deferred*. The sweep now remembers
+  pool-deferred tablets and evaluates them even if quiesced, forcing its estimate
+  gate. Lesson: `docs/lessons/code-patterns/2026-10-14-a-deferral-must-defeat-the-skip-that-assumes-the-last-tick-decided.md`.
+  The storm also had to wait for every table to split (`>= tablets_before + g`)
+  rather than for "nothing mid-split", which a deferred split satisfies early.
+- **Operator `cores` (layers 2 and 3).** `derive_cores`/`cores_from_millicores`
+  (`animus-operator` `desired/cluster_config.rs`, beside `derive_node_capacity`)
+  render `cluster_settings.cores` = `spec.nodeCapacity.cores` if set, else
+  **`max(1, floor(cpu request millicores / 1000))`** from
+  `spec.resources.requests.cpu` (500m is 1, 2500m is 2, 4 cores is 4), else unset
+  (the cap and pools stay off). Rounded down on purpose: the safe error for a cap
+  and a compaction pool is too small, not one that over-admits a pod promised less
+  than it assumed. `bg_compactions` is not rendered separately: the node derives
+  `max(1, cores / 2)` from `cores` (`BudgetSizes::resolve`). The CRD
+  (`deploy/operator/crd.yaml`) is regenerated; zero is refused at admission.
+- **Cell 3b** (`density_admission_corpus`, "absorbable overload", step 4's cell 3
+  discussion): the CPU model gives each survivor `1.5 x (G/N + A)` awake groups of
+  capacity, so the capped population (`A_eff` plus the bypassed lost-leader
+  elections) fits and the uncapped one (every group awake) does not. Asserted: the
+  capped run's worst scheduling lag is no worse than uncapped **and** it leads no
+  fewer groups under load. First result (seed `0x24ef92c11692b620`): capped lag
+  12 ms against 13557 ms uncapped, 60 against 59 led, terms 2 against 19; held
+  across `ANIMUS_DENSITY_SEEDS=10`.

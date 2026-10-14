@@ -238,6 +238,19 @@ spec:
                   and skipped when unset.
                 nullable: true
                 properties:
+                  cores:
+                    description: |-
+                      The **configured** core count of each pod (ADR 0079 layers 2 and 3):
+                      the multiplier of the awake-group cap (`cores x 1500`) and the default
+                      size of the compaction pool (`max(1, cores / 2)`). Rendered into
+                      `cluster_settings.cores`; never autodetected at runtime. Derived
+                      default: `max(1, floor(cpuRequest))` from `spec.resources.requests.cpu`
+                      (a 500m pod is 1, a 2500m pod is 2, a 4-core pod is 4); with neither
+                      set the cap and the pools stay off. `0` is refused.
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
                   maxReplicas:
                     description: |-
                       Absolute ceiling on the replicas (voters and learners) placement puts on
