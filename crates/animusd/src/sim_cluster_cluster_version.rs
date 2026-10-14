@@ -925,3 +925,91 @@ fn roll_health_matches_dashboard_ladder() {
         run_roll_health_matches_dashboard_ladder(seed);
     }
 }
+
+/// ADR 0079 section 1 (step 7): with `Gate::NodeCapacity` open and every
+/// `Active` node at its `max_replicas`, a wire `CreateTable` is refused with
+/// the retryable `ServiceUnavailable` (HTTP 503) naming the shortage, leaves
+/// **no half-created table** (the schema never commits, so the retry is not a
+/// `ResourceInUseException`), and the same request succeeds once a ceiling is
+/// raised.
+fn run_create_table_refused_at_capacity(seed: u64) {
+    use animus_control::Capacity;
+    let mut cluster = new_cluster(seed);
+    start_era(&mut cluster, seed, 5);
+    let leader = leader_node(&mut cluster);
+    for (expected, target) in [(1u32, 2u32), (2, 3), (3, 4), (4, 5)] {
+        let (status, v) = post_finalize(
+            &mut cluster,
+            leader,
+            &format!(r#"{{"to":{target},"expected":{expected}}}"#),
+        );
+        assert_eq!(status, 200, "seed={seed}: finalize {target}: {v}");
+    }
+    poll_until(
+        &mut cluster,
+        Duration::from_secs(30),
+        seed,
+        "every node to open Gate::NodeCapacity",
+        |c| (0..ROLES.len() as u64).all(|n| c.features(n).is_open(Gate::NodeCapacity)),
+    );
+    // Every Active node holds zero replicas and a ceiling of zero: full.
+    let ceiling = |max: u32| Capacity {
+        weight: 100,
+        max_replicas: Some(max),
+    };
+    for n in 0..ROLES.len() as u64 {
+        cluster.propose_meta(MetaCommand::SetNodeCapacity {
+            node: animus_env::nid(n),
+            capacity: ceiling(0),
+        });
+    }
+    poll_until(
+        &mut cluster,
+        Duration::from_secs(30),
+        seed,
+        "the ceilings to replicate",
+        |c| c.metadata(0).node_capacity.len() == ROLES.len(),
+    );
+    let body = r#"{"TableName":"capped",
+        "KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+        "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}]}"#;
+    let (status, resp) = cluster.dynamo(leader, "DynamoDB_20120810.CreateTable", body.as_bytes());
+    assert_eq!(status, 503, "seed={seed}: {resp}");
+    assert!(resp.contains("ServiceUnavailable"), "seed={seed}: {resp}");
+    assert!(
+        resp.contains("max_replicas"),
+        "seed={seed}: names the shortage: {resp}"
+    );
+    assert!(
+        !cluster.metadata(leader).has_table_schema("capped"),
+        "seed={seed}: a refused CreateTable must not leave a schema behind"
+    );
+    // Raise the ceilings: the identical request now succeeds.
+    for n in 0..ROLES.len() as u64 {
+        cluster.propose_meta(MetaCommand::SetNodeCapacity {
+            node: animus_env::nid(n),
+            capacity: ceiling(50),
+        });
+    }
+    poll_until(
+        &mut cluster,
+        Duration::from_secs(30),
+        seed,
+        "the raised ceilings to replicate",
+        |c| {
+            c.metadata(0)
+                .node_capacity
+                .values()
+                .all(|c| c.max_replicas == Some(50))
+        },
+    );
+    let (status, resp) = cluster.dynamo(leader, "DynamoDB_20120810.CreateTable", body.as_bytes());
+    assert_eq!(status, 200, "seed={seed}: {resp}");
+}
+
+#[test]
+fn create_table_is_refused_retryably_when_every_node_is_at_max_replicas() {
+    for seed in seeds() {
+        run_create_table_refused_at_capacity(seed);
+    }
+}
