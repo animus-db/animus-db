@@ -342,6 +342,7 @@ fn run_admin_add_control_member_races_a_control_only_self_registration_and_still
                     node: nid(this_id),
                     addrs: addrs.clone(),
                     labels: BTreeMap::new(),
+                    capacity: None,
                 }),
                 ProposeResult::Accepted { .. }
             ),

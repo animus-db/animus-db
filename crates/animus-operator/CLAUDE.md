@@ -1996,3 +1996,27 @@ that never goes Ready *before* the roll starts.
   Unknown until a shipper exists. Unverified against a real cluster; no kind e2e.
 
 - **Peer CA bundle is peer-only (issue #1253).** `tls.ca_path` is always the own CA (`{TLS_MOUNT_DIR}/ca.crt`); when a peer names a CA `Secret`, `tls.peer_ca_path` is `PEER_CA_BUNDLE_PATH`, which `entrypoint.sh` fills with the peer CAs only (not the own CA). animusd trusts a certificate chaining only to `peer_ca_path` for MREC replication frames alone. The `TlsSection` mirror carries `peer_ca_path` (skipped when `None`).
+
+## Node capacity derivation (ADR 0079 step 3)
+
+`desired::cluster_config::derive_node_capacity(spec)` renders
+`cluster_settings.node_weight` / `node_max_replicas` from `spec.resources.requests`
+(`weight = max(1, cpu_millicores / 100)`; `max_replicas = min(0.5 * memory /
+64 KiB, 1000)`, the 1000 a temporary cap pending #1303; the `nofile / 2` term is
+not applied, the operator cannot see it), each overridden by
+`spec.nodeCapacity.{weight,maxReplicas}`. A spec with no requests and no override
+renders neither key, so existing `cluster.json` bytes are unchanged. The values
+are config only: nodes advertise them (`SetNodeCapacity`) once the cluster has
+finalized version 5; the operator never edits `Metadata`. `weight: 0` is refused at
+admission (`validate_node_capacity_spec`). `deploy/operator/crd.yaml` regenerated.
+
+## `cores` derivation (ADR 0079 layers 2 and 3, step 7)
+
+`derive_cores` (`desired/cluster_config.rs`, beside `derive_node_capacity`) renders
+`cluster_settings.cores` = `spec.nodeCapacity.cores` (nonzero) else
+`max(1, floor(cpu request / 1 core))`, else unset (the node's awake cap and pools
+stay off). Round **down** (a 2500m pod is 2): `cores` scales the awake cap
+(`x 1500`) and the compaction pool (`max(1, cores / 2)`, derived by the node, not
+rendered), and too small is the safe error. Request, not limit; never
+`available_parallelism`. `spec.nodeCapacity.cores: 0` is refused at admission.
+`deploy/operator/crd.yaml` is regenerated.

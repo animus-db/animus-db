@@ -1751,7 +1751,7 @@ outstanding on the wire surface at present.
     before the runs; the outcomes are in their 2026-10-04 outcome
     amendments.
   - **Cliffs filed:** #1180 (fixed by #1207), #1190, #1191, #1192, #1194, #1199 (election-storm cliff: fixed by ADR 0078, implemented 2026-10-11; the G=3000 RF3 acceptance run led all groups in 11 s and held them for 120 s with `max_term` 3, recorded in ADR 0044's 2026-10-11 amendment; the `sim_cluster_scale` density cells now print the `election_*`/`campaign_*` C-17 metrics).
-  - **Per-node density and background work (#1295, proposed 2026-10-12):** ADR 0079 (Proposed) covers placement capacity, an awake-group cap and a background-work budget; measurements in `docs/density-measurements.md`. Open dependency: #1297 (awake-overload stall). Client-path and transport admission is #1296.
+  - **Per-node density and background work (#1295, implemented 2026-10-14):** ADR 0079 is done: declared placement capacity (`Gate::NodeCapacity`, cluster version 5), an awake-group cap with a wake queue, a background permit budget and repair pacing, with corpora and C-17 Tier 2 lines; measurements in `docs/density-measurements.md`. Remaining: #1300 (L0 stall), #1303, #1304, #1305, #1306, and the operator `nofile` term. #1297 was resolved as overload. Client-path and transport admission is #1296.
   - **Re-run 2026-10-09 after #1207 (ADR 0044's amendment of that date):**
     quiesced steady CPU is zero net at RF1 and at the 1 ms/s measurement
     floor at RF3, so C-03 stays deferred.

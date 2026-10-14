@@ -1,6 +1,6 @@
 # ADR 0079 — Per-node density and the background-work budget: placement capacity, awake-group admission, background permit pools
 
-- **Status:** Accepted (2026-10-12). The maintainer settled the ten open questions on 2026-10-12, taking the recommendation on each (see "Maintainer decisions"). Not yet implemented; the defaults stay provisional until calibration (implementation plan step 1).
+- **Status:** Accepted (2026-10-12), implemented (2026-10-14). The maintainer settled the ten open questions on 2026-10-12, taking the recommendation on each (see "Maintainer decisions"). The defaults were calibrated in step 1 (`docs/density-measurements.md`); see "As built (consolidated)".
 - **Date:** 2026-10-12
 - **Origin:** issue #1295 (follow-up to #1199, closed by ADR 0078); the ADR 0078 maintainer decision 5 (2026-10-11) that a per-node cap on awake groups gets its own ADR once the stable ceiling is measured. Measurements: `docs/density-measurements.md` (branch `claude/per-node-density`, commit `795465c`).
 - **Amends:** none. **Depends on:** ADR 0003 (determinism, the `Env` seam), ADR 0005 (placement), ADR 0029 (rebalancing), ADR 0031 (host reconciler), ADR 0044/0048 (quiescence), ADR 0058 (learners, snapshots), ADR 0073 (upgrade compatibility), ADR 0075 (region-pinned placement, MREC receiver), ADR 0078 (campaign governor, `LoadMonitor`, staggered hosting).
@@ -129,7 +129,7 @@ The defaults are deliberately low and are expected to change after the ProdEnv s
 **What happens past the cap.**
 
 - *Snapshot and catch-up streams:* a **retryable refusal**, in the style of `MREC_MAX_INFLIGHT_APPLIES`. The sender asks for a permit before starting; the receiver refuses an `InstallSnapshot`/learner start with a retry-after hint when its receive pool is full. The leader's existing retry logic treats a refusal as "not now" (the learner stays a learner; replication to it resumes later). No Raft safety rule changes: a refused snapshot is indistinguishable from a slow follower. The retry interval is the existing replication retry cadence plus jitter drawn from `Env`.
-- *Splits:* the auto-split sweep skips a tablet when the pool is full and tries again on its next sweep (`AUTO_SPLIT_INTERVAL`); a manual split request gets the retryable refusal. `AUTO_SPLIT_COOLDOWN` stays per-tablet.
+- *Splits:* the auto-split sweep skips a tablet when the pool is full and tries again on its next sweep (`AUTO_SPLIT_INTERVAL`); an explicit split (admin endpoint, `SplitTablet`, stream grow) **queues for the permit** (FIFO, cancellation-safe, polled on `Env` time) for up to `SPLIT_WAIT_BOUND` (3 x `CLIENT_TIMEOUT`, 30 s) and only then gets the retryable `SPLIT_BUSY`. Refusing an operator who asked for N splits in a row would make every back-to-back caller (stream grow, scripts, tests) write its own retry loop. `AUTO_SPLIT_COOLDOWN` stays per-tablet.
 - *Compactions:* the compaction scheduler takes a permit before starting a run and **defers** (re-checks at the maintenance tick) when none is free. Deferral is bounded by an L0 safety valve: when a tablet's L0 table count reaches `2 x compaction_trigger` its compaction **bypasses the pool** (counted `compaction_overcap`), because an unbounded L0 makes reads and eventually writes worse than an extra compaction. This does not add the L0 write stall that is missing today (see Open question 6); it only stops the pool from making L0 growth worse.
 
 **Repair-proposal pacing (control leader).** `reconcile()` currently returns every violating tablet's fix and `reconcile_loop` proposes all of them in one tick. New rule: at most `repair_proposals_per_tick = R` *new* `CasTabletReplicas` repairs are proposed per `RECONCILE_INTERVAL` tick, selected deterministically (ascending `TabletId`, as ADR 0078 orders hosting) from the violating set; the rest are returned to the next tick, where `recently_done` already excludes tablets in flight. Pacing also counts repairs already in flight (a learner being caught up whose promotion is pending): the leader does not start a new repair while `in_flight >= R_inflight`. Defaults (provisional): `R = 8`, `R_inflight = 16`. The leader's `LoadMonitor` lag reduces both by the same rule. Basis: the measured burst (25 proposals/s peak at 12 tablets) shows the shape but not a capacity, so these are **inferred** and set so a 1000-tablet loss takes minutes of ticks, not one burst. `REPAIR_DWELL` is unchanged. Rebalancing keeps its own cadence and still yields to repair.
@@ -288,3 +288,430 @@ The maintainer accepted the recommendation on every open question below:
 8. **#1297 (resolved):** diagnosed as accepted overload (see "Resolved dependency"). No gate on this ADR remains; it is kept here only so the numbering of the other questions does not change.
 9. **Should the permit pools and `LoadMonitor` input be shared with #1296's client-path admission** (one lag-reduction rule for the request gate as well)? Recommended: yes, a single `lag -> factor` helper used by both, with the client-gate wiring left to #1296's ADR.
 10. **Cluster version.** Recommended: a new `Gate::NodeCapacity` at cluster version 5, finalised with the rest of the release, rather than folding capacity into an existing gate.
+
+## As built (consolidated, 2026-10-14)
+
+All eight implementation steps landed on one branch. Layer 1, declared per-node
+placement capacity: `animus-placement` `Capacity` and weighted `replan`,
+`replan_repair` and `rebalance_step` (equal weights are byte-identical to the
+old behaviour); `Gate::NodeCapacity` (cluster version 5, `MAX_SUPPORTED = 5`)
+gates `Capacity` in `Metadata`, the `RegisterNode` field and `SetNodeCapacity`;
+`--node-weight` / `--node-max-replicas`, `GET /admin/capacity`, `animus cluster
+capacity`, a creation refusal and a blocked gauge when no node fits, and the
+operator derives capacity from pod resources. Layer 2, awake-group admission
+(node-local, L): a soft cap of `--awake-max-per-core` (default 1500) times
+`--cores` on awake data-plane groups, a wake queue and `LoadMonitor` lag
+reduction, which defers un-quiesce rather than refusing hosting; the operator
+derives `cores`. Layer 3, the background-work budget (L): `BackgroundBudget`
+permit pools for snapshot and catch-up streams, splits and compactions with a
+retryable refusal and an L0 bypass, plus repair-proposal pacing in the control
+leader's `reconcile_loop`. Proofs: `capacity_corpus` and `repair_pacing`
+(`animus-control`) and `density_admission_corpus` (`animus-cp-data`), each with
+its negative controls; Tier 2 `C17` density lines. Deferred: #1300 (L0 stall),
+#1303, #1304, #1305, #1306, and the operator `nofile` term. The per-step notes
+below are the detail.
+
+## Implementation step 3 as built (2026-10-13)
+
+Step 3 shipped `Gate::NodeCapacity` (cluster version 5), `Capacity` in
+`Metadata` (`node_capacity`, mirror kind `node_capacity`), the `RegisterNode`
+`capacity` field and `SetNodeCapacity`; the control leader's repair, rebalance
+and directed-Placing passes feed declared capacity and per-node replica counts
+into the step 2 `*_with_load` functions only once the gate is open (gate closed
+or nothing declared: the original functions, byte for byte); `--node-weight` /
+`--node-max-replicas` (`cluster_settings.node_weight` / `node_max_replicas`);
+`GET /admin/capacity` and `animus cluster capacity`; and the operator
+derivation. The compatibility record is ADR 0073's 2026-10-13 amendment.
+
+- **A node advertises through a sync loop, not at registration.**
+  `RegisterNode.capacity` exists, is gated by content and is applied
+  fill-if-empty, but `animusd` registers with `None` (the old shape, so a join
+  into a cluster below version 5 stays valid) and `ClientCtx::sync_node_capacity`
+  proposes `SetNodeCapacity` once the node is a member and the gate is open.
+  The process configuration is the source of truth: a restart with a changed
+  flag overwrites, and a node that declares nothing clears a leftover entry.
+- **`CutoverSplit` target.** The apply-time directed-Placing target uses
+  `select_replicas_balanced` over the pre-fork replica counts when capacity is
+  in effect (still a pure function of replicated state), so a child's target
+  respects weights and ceilings; the fork itself remains placement-blind.
+- **Table creation refusal (section 1, "Total capacity below demand") is not
+  in this step.** `CreateTable` placement still goes through
+  `select_replicas`; refusing a new tablet when every eligible node is at
+  `max_replicas` and the `placement_capacity_blocked_tablets` gauge are step 7
+  (cells 11-12), together with the retryable wire error mapping.
+- **Operator derivation (maintainer instruction of 2026-10-13, superseding open
+  question 2's "weight only"):** `weight = max(1, cpu_millicores / 100)` and
+  `max_replicas = min(0.5 * memory_request / 64 KiB, 1000)` from
+  `spec.resources.requests` (`docs/density-measurements.md`, 2026-10-13), each
+  overridden field by field by `spec.nodeCapacity.{weight,maxReplicas}`; absent
+  requests render neither key. The `nofile / 2` term is not applied (the
+  operator cannot see a container's `nofile`, a runtime default far above the
+  cap), and the constant 1000 is the temporary hosting-time cap pending #1303.
+
+### The snapshot-refusal wire question (resolved)
+
+The classification table left open whether a full receive pool can refuse an
+`InstallSnapshot` through an existing reply. Read against the code:
+`InstallSnapshotResp { term, last_index, next_offset }` has **no busy form**.
+The one refusal-shaped reply, `(last_index 0, next_offset 0)` to an offset-0
+chunk, means "I already hold state through your offer's base": the leader
+forgets the transfer, marks that base as *served* and probes with
+`AppendEntries` (`handle_install_snapshot_resp`), which is exactly wrong for
+"not now" (a refused base would never be re-offered until the base moved).
+**Decision (the ADR's recommended direction: reuse the existing path, add no
+wire shape): the receiver refuses by not acknowledging the first chunk of an
+offer** (no reply at all, and it buffers nothing). The sender already treats
+a silent peer as slow: the offset-0 chunk is resent by the heartbeat `Backoff`
+schedule and the ack-driven capped resend, "a stuck transfer is never
+permanently silenced". This is class **L** (receiver-local, no new variant, no
+gate, an older sender is unaffected because it already tolerates silence). The
+cost is that there is no retry-after hint: the retry cadence is the existing
+backoff, and step 5 must release the *sender's* permit when its transfer sits
+unacknowledged past a bound, rather than rely on a refusal to do it. If step 5's
+measurements show the backoff too slow, a `Busy` reply variant would then be
+class **G** under its own gate, with an older sender treating an unknown
+variant as a failure it retries; that is a deliberate later amendment, not
+part of this step.
+
+## Implementation step 4 as built (2026-10-13): awake-group admission
+
+Layer 2 shipped as `animus-cp-data` `awake_admission.rs` (`AwakeAdmission`,
+`ElectionBackpressure.awake`, attached to the `LoadMonitor`), the
+`RaftKvNode::wake_bulk()` split of the wake signal, `--cores` /
+`--awake-max-per-core` (`cluster_settings.cores` / `awake_max_per_core`,
+`--config`/`--node` only, same merge rule as `--node-weight`), five `Metric`
+variants (`CpAwakeReplicas`, `CpAwakeMaxEffective`, `CpWakeQueueDepth`,
+`CpWakeDeferred`, `CpWakeOvercap`), the `/admin/health` fields (`awake`,
+`awake_max_effective`, `wake_queue_depth`, `wake_deferred`, `overcap_wakes`;
+advisory), and the Tier 1 corpus `density_admission_corpus.rs` (knob
+`ANIMUS_DENSITY_SEEDS`, not the `ANIMUS_DENSITY_ADMISSION_SEEDS` the Tier 1
+section named). Class **L** as classified: no wire or replicated change, no gate.
+
+- **Cap off unless `--cores` is set** (never autodetected); `--awake-max-per-core 0`
+  also disables it. A node without it runs the pre-step driver (`awake` is `None`).
+  `animusd`'s `SimCluster` assembly passes `None`, so every cluster-tier test is
+  unchanged.
+- **Shared lag rule (decision Q9).** `load_monitor::lag_divisor` / `scale_by_lag`
+  is the one lag-to-factor function; `k_eff` and `a_eff` both call it. The ADR's
+  "minimum `A/8`" parenthetical is superseded by the shared rule (`A/2` at 30 ms,
+  `A/4` at 100 ms, never below 1): the governor's `K_eff` has no `K/8` tier and
+  one function was the point. Equivalence of the refactor is a test
+  (`k_eff_is_behaviour_identical_to_the_pre_shared_helper_body`): the old body,
+  verbatim, against `k_eff` over 4000 lags x 75 `k` values.
+- **What is deferred.** Only the host reconciler's proactive `Down` wake, now
+  `wake_bulk()`, and only for a quiesced **follower** (`on_local_wake` is a no-op
+  for a leader). A deferred group stays quiesced, queued FIFO, and is woken by
+  the queue callback; the reconciler re-wakes each tick, which is the backstop
+  for a lost callback. The client-facing `wake()` carries its own `direct` flag
+  that wins over a coalesced bulk wake (found by cell 1: without it a client
+  wake of a queued group was deferred, see
+  `docs/lessons/testing/2026-10-13-a-deferral-keyed-on-a-coalesced-flag-loses-the-direct-wake.md`).
+- **Soft cap.** A client write, a peer message (pre-vote, `AppendEntries`,
+  `WakeRequest`) and a campaign un-quiesce inside the core and are never refused:
+  the driver reports each quiescence change, and one that was not an admitted bulk
+  wake and leaves the node past `A_eff` is counted (`CpWakeOvercap`). Hosting
+  registers awake and exempt (decision Q5), with an RAII membership that returns
+  the slot on any exit of the driver.
+- **Measured behaviour worth knowing (Tier 1, `G` = 60, `A` = 6).** Peer-message
+  wakes make the cap leaky by design, but mildly: after a node loss the bulk-wake
+  awake high-water was 10 against 60 uncapped (`admit_awake_hwm` is exactly
+  `A_eff`; the rest is counted overcap). In the CPU-model cell the capped run's
+  worst scheduling lag was 115-630 ms against 4.8-5.7 s uncapped.
+- **A woken group does not always give its slot back, so a lost leader bypasses
+  the cap (follow-up, built).** A leader cannot quiesce while any voter is behind
+  (`quiesce_entry_ok`), so with a node *killed* the groups a bulk wake admits stay
+  awake until the dead replica is replaced and the slots do not turn over. The
+  first version therefore left every queued group quiesced, and for a group whose
+  *leader* was on the dead node that meant no election and no repair until a client
+  touched it (a breach of ADR 0078's lost-leader bound). Now the reconciler calls
+  `RaftKvNode::wake_bulk_leader_lost()` instead of `wake_bulk()` when the replica's
+  own `leader()` belief (the raw `leader_id` a quiesced follower keeps; a Raft member
+  id, which is the node id in `view.down`; no new wire) is in `view.down`. The
+  driver then skips the admission ask: the group wakes **over the cap**, is counted
+  in `CpWakeOvercap` when it lands past `A_eff`, and its election stays paced by the
+  campaign governor `K`. A group whose Down replica is only a follower keeps its
+  leader, stays deferrable, and its re-replication waits for the queue. The cost is
+  that the over-cap population after a node loss is the number of groups the dead
+  node led (about `G/N`), not `A`. **Cell 3's old assertion ("capped lag several times
+  calmer than uncapped") was root-caused and replaced, not weakened blindly**
+  (seed `0x5b12e826afff8b4a`, node 1, 60 s overload): the capped run's lag is higher
+  (8-21 s against 4.7 s) because it *elects* the lost-leader groups (53 of 60 led after
+  60 s, 41 uncapped, whose lost groups starve and never elect); admission churn is
+  not the cause (3 admits, 20 queued, no re-queues, campaign admits about 6/s in both
+  runs). Node 1's message backlog grew about 150/s capped against about 22/s uncapped,
+  i.e. arrivals of about 447/s against 317/s, which is about 8.4 and 7.7 per led
+  group: the extra load is the heartbeat and vote traffic of 12 more live leaders. The
+  cell now asserts the capped run leads no fewer groups under load than the uncapped
+  one and reports lag and backlog; cell 1's high-water bound is `4/5` of the uncapped
+  run's (the bypassed third is awake by design). Corpus: cells 1 and 3
+  lost their post-bulk client wake and assert that every group led by the killed node
+  gets a live leader with no client touch; negative control (d)
+  (`AwakeFault::NoLostLeaderBypass`) fails that oracle. Open: once repair replaces
+  the dead voter the awake groups can quiesce and the queue drain; cell 1 keeps node
+  0 dead, so that drain is only covered by cell 4 (a live node marked `Down`).
+- **Cell 5's bound is per campaign attempt.** ADR 0078's lost-leader bound is
+  missed on reseeded variants by one `2 * base` window when a pre-vote round
+  fails; the same happens with no awake cap (#1306). Cell 5 asserts the literal
+  bound times the number of campaign attempts the survivors were admitted for.
+- **Tier 3.** `ANIMUS_BP_LIVE_AWAKE_MAX=A` turns the cap on in the ProdEnv
+  liveness rig. Because hosting is exempt (decision Q5) and
+  `ANIMUS_BP_LIVE_QUIESCE=0` never quiesces, the cap has nothing to defer in
+  `density_repro_g3000_holds_led_count`: the #1297 shape at G=3000 awake is
+  guarded only by ADR 0078's stagger, which is what Open question 5 recommended.
+- **Not in this step:** operator rendering of `cores` from the pod CPU limit
+  (with the rest of the operator derivation), the Tier 1 cell 3 "control (a)"
+  collapse arm (belongs with steps 5-7), and a `SimCluster` hook for the C-17
+  `awake_hwm` line.
+
+## Implementation step 5 as built (2026-10-13): background budget
+
+Classification: **L** throughout (no wire shape, no replicated state, no durable
+format; a refused snapshot chunk is simply not acknowledged, as step 3 decided).
+No `Gate`.
+
+- **Mechanism.** `animus_cp_data::background_budget` (`BackgroundBudget`,
+  `BgPermit`, `BgFlow`, `SplitPermits`, `BudgetSizes`, `BudgetFault`): one
+  synchronous, `Env`-seam-clean budget per physical node, shared by `Arc` with
+  the hosted groups (a per-group `BgFlow` filters inbound `InstallSnapshot`
+  chunks / learner traffic and outbound snapshot chunks in the raftkv driver),
+  with the split path (`ClientCtx::trigger_split`, auto-split sweeps skip a
+  tablet whose pool is full and ask again next sweep; an explicit split waits FIFO for
+  the permit, up to `SPLIT_WAIT_BOUND`, then gets the retryable `SPLIT_BUSY`) and with the tablet engines (`animus-storage`
+  `CompactionGate`, installed by `LsmTabletFactory`). Permits are RAII (error,
+  cancel, drop all return them) and may carry an idle TTL that a full pool reaps
+  lazily at the next acquire (no timer). Effective sizes follow node scheduling
+  lag through the shared `scale_by_lag` and are never below 1.
+- **Defaults.** Snapshot send 2 and receive 2 (`--bg-snapshot-streams`), learner
+  catch-up 4 (`--bg-catchup-learners`) and splits 1 (`--bg-splits`) are **on by
+  default**; compactions (`--bg-compactions`) default to `max(1, cores/2)` when
+  `--cores` is set and to **off** (today's behaviour) when it is not. `0` turns
+  any pool off. Each flag has a `cluster_settings.bg_*` mirror, node-local, like
+  step 4's `cores`.
+- **L0 bypass.** An engine whose L0 holds `>= 2 x compaction_trigger` tables is
+  granted a compaction slot over the cap (counted in `BgCompactionOvercap`); a
+  deferred engine re-asks every `COMPACTION_DEFER_RETRY` (100 ms, one pending
+  retry per engine). Issue #1300 (a storage-level L0 write stall / compaction IO
+  limit) is untouched.
+- **The unacknowledged-transfer bound.** A receiver with a full pool refuses by
+  not acknowledging the first chunk (step 3). The sender releases its send permit
+  when a transfer sits unacknowledged for `snapshot_unacked_bound(heartbeat) =
+  heartbeat * 2 * SNAPSHOT_HEARTBEAT_BACKOFF_MAX_TICKS` (64 ticks): by then the
+  existing backoff (gaps 1, 2, 4 .. 32, then every 32nd tick) has offered the
+  first chunk about seven times, so silence means a dead, partitioned or refusing
+  receiver. The released peer sits out one further bound before it may ask again,
+  so a never-ready receiver cannot starve the other sends. The receiver's own slot
+  (and a learner's catch-up slot) is reaped after twice that bound of leader
+  silence. Both bounds derive from the existing timing constants; none is new
+  wall-clock state.
+- **Observability.** Metrics `BgPermitInflight{Pool}` (gauge + hwm),
+  `BgPermitDeferred{Pool}`, `BgCompactionOvercap`; `/admin/health` gains a
+  `bg_permits` object (per pool `inflight`/`hwm`/`deferred`, plus
+  `compaction_overcap`) beside step 4's awake fields. `SimCluster` runs with every
+  pool off.
+- **Corpus** (`density_admission_corpus.rs`, `ANIMUS_DENSITY_SEEDS`): cell 6
+  (snapshot storm: send/receive high-water within the pools, every group
+  converges), **6b** (an unacknowledged transfer releases its permit within the
+  bound and the next group's learner is served), cell 7 (split storm: at most one
+  split in progress, all complete), cell 8 (compaction under write load: pool
+  cap held, L0 bounded, bypass counted). Negative controls are named
+  `control_bg_*` so they do not clash with the step 4 control (d) (lost-leader
+  bypass): **bg_d** (`LeakPermits`, ADR control (d): the catch-up pool fills with
+  never-returned permits and learners starve), **bg_d2** (`NoIdleBound`: a dead
+  receiver keeps the only send slot, the next group starves), **bg_e**
+  (`PoolMinZero`, ADR control (e): a pool allowed to reach 0 under lag stalls
+  compaction). Each asserts the oracle FAILS with its mechanism off.
+
+## Implementation step 6 as built (2026-10-14): repair pacing
+
+Classification: **L** (a control-leader-local computation over replicated
+state; every proposal is an existing `CasTabletReplicas`). No `Gate`, no wire
+or durable shape.
+
+- **Mechanism.** `animus_control::repair_pacing` (`RepairPacer`, `RepairPacing`,
+  `RepairPacingHandle`) sits between the pure `PlacementView::reconcile` and the
+  propose loop in `reconcile_loop` (`node.rs`). `RaftNode::set_repair_pacing`
+  sets it after `start`; defaults are on (`R` = 8, `R_inflight` = 16), so every
+  sim and `SimCluster` is paced. `0` turns the matching limit off (both `0` =
+  the pre-ADR behaviour). `animusd`: `--repair-proposals-per-tick`,
+  `--repair-inflight-max` and `cluster_settings.repair_proposals_per_tick` /
+  `repair_inflight_max` (`--config`/`--node` only, like the other 0079 knobs),
+  applied to the combined and control-only assemblies (the data-only node has no
+  control leader).
+- **Ordering.** Ascending `TabletId` (as ADR 0078 orders hosting), re-sorted in
+  the pacer; the first `R` that fit under the in-flight cap are proposed, the
+  rest are deferred and simply come back from `reconcile` on the next tick
+  (their tablets still violate). Q4 (decision): a fixed cadence, not adaptive;
+  the leader-lag reduction of `R` the section above mentions is **not**
+  built (the section 4 `LoadMonitor` factor is data-plane local and the
+  decision is the fixed cadence). Q3 (decision): `max_replicas` stays strict
+  under repair (step 3's `replan_repair_with_load`; nothing here relaxes it).
+- **In flight, defined (decision 2026-10-14, "observable end": a repair is
+  done when its replica set is realised).** A repair is in flight from the
+  moment its `CasTabletReplicas` is *accepted* by the leader's core until the
+  first of: (1) **settled**: the tablet's `settled_epoch` equals its current
+  epoch and that epoch is past the tracked `expected_epoch` (the CAS applied and
+  the data plane reported the resulting replica set realised, below); (2)
+  `REPAIR_INFLIGHT_TTL` (= `REPAIR_DWELL`, 5 s, an existing constant) elapsed,
+  the safety net for a repair that never settles and the only bound while the
+  gate is closed; (3) its tablet leaves the tablet map; (4) the leader loses
+  leadership (the tracker is dropped; a new leader starts empty, as before). A
+  proposal whose CAS has not applied yet (the view's epoch still equals the
+  tracked `expected_epoch`) is a *retry* of the same repair: it passes through
+  free and keeps its original start time. A repair superseded by another CAS is
+  freed by the same rule: the tablet's current epoch is settled, or the TTL
+  runs out.
+- **The completion report (`MetaCommand::RepairSettled { tablet, epoch }`).**
+  The control plane cannot see a learner caught up: `Metadata` holds only the
+  *desired* replica set (the CAS writes it at once) and the learner/voter
+  phase lives in the tablet's own Raft group. So the tablet's data-plane leader
+  reports it: `animusd::repair_settled` ticks every 200 ms, and for each led
+  tablet whose epoch is past `INITIAL`, whose group's voter set equals the
+  `Metadata` replica set and which has no learner left (every target promoted,
+  caught up by the promotion criterion), proposes `RepairSettled` through the
+  relay path (at most 16 per tick; an unconfirmed report is retried after 2 s).
+  Apply: epoch-CAS (a stale epoch is `Rejected`, an unknown tablet too),
+  idempotent (`NoOp` when already recorded), sets the tablet's new
+  `settled_epoch: Option<Epoch>` (`skip_serializing_if` none, so every
+  existing encoding and fixture is byte-identical). Rebalance moves and split
+  placings also report (one extra small command per placement change); the
+  pacer ignores them.
+- **Classification (ADR 0073): G, behind `Gate::NodeCapacity`, no new cluster
+  version.** `required_gate` has an exhaustive row naming `NodeCapacity`; the
+  loop emits nothing while `Metadata::capacity_gate_open()` is false (so the
+  pacer keeps the TTL-only behaviour exactly), and `RaftNode::propose` refuses
+  it while closed. v5 is unreleased, so **the v5 era covers both the capacity
+  metadata and the repair-settled report**: a binary that can decode one can
+  decode the other, so a second gate would only add a version no deployment can
+  sit at. Fixture `metadata/v1-repair-settled.json` (new), shape pinned by
+  `repair_settled_wire_shapes_are_pinned`.
+- **Throughput.** Sustained repair throughput is bounded by `R` per tick and
+  by real completion (a slot is held for the learner's actual catch-up, not 5
+  s): `min(R / tick, R_inflight / completion time)`. Measured in the
+  `animus-control` cell (30 violating tablets, simulated promotion 300 ms after
+  the CAS): all repairs commit 7.6 s after the kill (5 s dwell + 2.6 s) against
+  11.3 s with the TTL alone, in-flight high-water 8 against 16. At `R` = 8 per
+  500 ms tick a 1000-tablet loss proposes in about 63 s (it was about 5 minutes
+  under the TTL-only definition, `R_inflight / TTL` = 3.2/s); slow real
+  catch-ups lengthen it, bounded by the TTL, and the data plane's own pools
+  (step 5) remain the real limiter on bytes moved. While the gate is closed
+  (clusters below version 5) the TTL-only bound still applies; raise
+  `--repair-inflight-max` for a faster burst there.
+- **Metrics.** `CpRepairDeferred` (counter, per deferred tablet per tick),
+  `CpRepairInflight` (level), `CpRepairInflightHwm`; the C-17
+  `sim_cluster_scale_node_loss_*` cells print `repair_deferred_total` and
+  `repair_inflight_hwm`, and the per-push cell asserts the high-water is within
+  `1..=16`. Rebalancing still yields while repairs are deferred.
+- **Corpus** (`animus-control` `tests/it/repair_pacing.rs`, knob
+  `ANIMUS_REPAIR_PACING_SEEDS`; cells `cell9_settled_report_frees_slots_before_the_ttl`, `cell9_unsettled_repairs_are_freed_by_the_ttl`, negative control (g) completion detection off, plus `animusd` `sim_cluster_repair_settled`; 60 RF3 tablets over 6 nodes, one node killed,
+  the real `reconcile_loop`): cell 9 (default pacing: at most `R` repairs
+  committed per tick window, in-flight high-water at most `R_inflight`, all
+  tablets RF3 within `REPAIR_DWELL + ceil(V/slots) * (TTL + tick) + 5 s`, the
+  in-flight gauge returns to 0 after the repairs age out) and 9b (`R_inflight` 4
+  binds, still converges). Negative controls: **(a)** pacing off, the paced
+  oracle fails (30 repairs in one window); **(f)** `R` on and the in-flight limit
+  off, the `R_inflight` = 4 oracle fails (high-water 30). The cell's "no acked
+  write lost, data above the snapshot threshold" half is the animusd
+  `sim_cluster_scale_node_loss_with_data_installs_snapshots` cell (no client
+  writes during the repair), since the pure control-plane rig has no data plane.
+
+
+## Implementation step 7 as built (2026-10-14): capacity cells, creation refusal, Tier 2 lines, operator `cores`
+
+Classification: **L** throughout (control-leader-local gauge, wire-edge refusal
+and test code). No `Gate`, no wire or durable shape; `Metric::
+PlacementCapacityBlockedTablets` is an additive appended variant.
+
+- **Creation refusal (section 1, "Total capacity below demand").**
+  `Metadata::capacity_initial_replicas(policy)` (`animus-control`) is the one
+  capacity-aware first placement: `None` when capacity is not in effect (gate
+  closed or nothing declared, so today's pick is byte-for-byte unchanged),
+  otherwise `select_replicas_balanced` over the `Active` members (weighted
+  fill, full nodes dropped). **Every `Active` node at `max_replicas` is
+  `CapacityExhausted`; some but fewer than RF nodes with room mints on those**
+  (best effort, the bootstrap rule, and the blocked gauge reports it).
+  `animusd` `zone_aware_initial_replicas` calls it first. Wire mapping:
+  **`ServiceUnavailable` (HTTP 503)**, the documented retryable code every SDK
+  backs off and retries, with a message naming the shortage ("no capacity for a
+  new tablet: all N active node(s) are at their max_replicas; raise a node's
+  max_replicas or add a node; retry"). `dynamo::internal` maps the
+  `schema::CAPACITY_EXHAUSTED_REFUSAL` prefix, so `CreateTable` and the lazy
+  first-write provisioning share it. **`CreateTable` checks before it commits
+  the schema**, so a refusal leaves no schema-without-tablet behind (a retry would
+  otherwise answer `ResourceInUseException`); `provision_tablet` re-checks and
+  returns at once instead of waiting out `SCHEMA_COMMIT_TIMEOUT`. The
+  region-pinned conversion (`UpdateTable ReplicaUpdates`) is refused the same
+  way when `Metadata::regions_without_capacity` names a Region whose `Active`
+  nodes are all at their ceiling. Not covered: `ImportTable`/`RestoreTable`
+  destination tablets still use the first-N pick (they mint through
+  `active_replicas_for_new_tablet`); the split path stays soft by design.
+- **`PlacementCapacityBlockedTablets`** (level, control leader, recomputed each
+  reconcile tick; `0` on a non-leader and whenever no node declares a ceiling): an
+  `Active` tablet with fewer live replicas than its policy RF, no admissible node
+  outside its set with room, and at least one admissible node full. The in-place
+  split's soft over-cap case (section 1, third bullet) is **not** in this gauge
+  (that tablet is fully replicated; the node is over, not the tablet blocked);
+  a node above its ceiling is visible in `/admin/capacity`.
+- **Cells** (`animus-control` `tests/it/capacity_corpus.rs`, knob
+  `ANIMUS_CAPACITY_SEEDS`; placed beside the cell 9 repair-pacing rig because they
+  need the control plane and no data plane): **10** (weights 100/100/200 and
+  seeded variants, tablets minted through the creation path, a node added,
+  rebalance to a fixed point within `1/min_weight`, then a lowered ceiling drains
+  the heaviest node losing no replica), **11** (the real `reconcile_loop`: four
+  RF3 tablets over four nodes at `max_replicas` 3, creation refused, a node dies,
+  repair stays within every ceiling and the gauge equals the blocked count,
+  raising the ceilings restores RF3 and the gauge returns to 0), **12** (a full
+  Region is reported, the conversion proceeds once it has room, and a wholly lost
+  Region's replica waits rather than moving to another Region). Controls **(g)**
+  (count balance ignoring weights) and **(h)** (over-placing creation) each fail
+  the cell's oracle. The wire half of cell 11 is `animusd`
+  `sim_cluster_cluster_version::create_table_is_refused_retryably_when_every_node_is_at_max_replicas`
+  (503, no half-created table, success after the ceilings rise).
+- **Tier 2 lines.** `sim_cluster_scale`'s density, split-storm and node-loss cells
+  now print `awake_hwm`, `wake_deferred_total`, `bg_snapshot_hwm`, `bg_split_hwm`,
+  `bg_compaction_hwm` and `capacity_blocked_tablets` and assert structurally (each
+  pool's high-water within its size, nothing capacity-blocked with no ceiling, the
+  snapshot and split pools held a permit when the cell exercised them). **The
+  layers are on in those cells**: `SimCluster` has nine constructors and six
+  reconciler build sites (restarts included), so a cell installs a
+  `sim_cluster::SimDensity` for its thread (`SimDensity::install`, an RAII guard)
+  and `build_reconciler` and the four `DataRole` sites read it. Density and storm
+  run the production default (2 cores, `A` = 3000, pools 2/2/4/1/1); the node-loss
+  cell runs 1 core and `A` = 4 so the loss exercises the queue. `awake_hwm` is a
+  sampled high-water of the `CpAwakeReplicas` level. Gaps: `bg_compaction_hwm`
+  prints 0 (the cells run `MemoryEngine`, which has no compaction pool), and the
+  `DataRole` split pool is its own `BackgroundBudget` (only the split pool records
+  there, with no lag attachment), a fixture simplification.
+- **A defect the cluster tier found (fixed here).** Turning the split pool on in
+  the split storm left one over-threshold table unsplit forever. The bytes sweep
+  deferred it on a full pool, it quiesced before the pool freed, and the sweep's
+  "a quiesced group was already checked by its last awake tick" skip (ADR 0044
+  PR6) is false for a tablet that tick *deferred*. The sweep now remembers
+  pool-deferred tablets and evaluates them even if quiesced, forcing its estimate
+  gate. Lesson: `docs/lessons/code-patterns/2026-10-14-a-deferral-must-defeat-the-skip-that-assumes-the-last-tick-decided.md`.
+  The storm also had to wait for every table to split (`>= tablets_before + g`)
+  rather than for "nothing mid-split", which a deferred split satisfies early.
+- **Operator `cores` (layers 2 and 3).** `derive_cores`/`cores_from_millicores`
+  (`animus-operator` `desired/cluster_config.rs`, beside `derive_node_capacity`)
+  render `cluster_settings.cores` = `spec.nodeCapacity.cores` if set, else
+  **`max(1, floor(cpu request millicores / 1000))`** from
+  `spec.resources.requests.cpu` (500m is 1, 2500m is 2, 4 cores is 4), else unset
+  (the cap and pools stay off). Rounded down on purpose: the safe error for a cap
+  and a compaction pool is too small, not one that over-admits a pod promised less
+  than it assumed. `bg_compactions` is not rendered separately: the node derives
+  `max(1, cores / 2)` from `cores` (`BudgetSizes::resolve`). The CRD
+  (`deploy/operator/crd.yaml`) is regenerated; zero is refused at admission.
+- **Cell 3b** (`density_admission_corpus`, "absorbable overload", step 4's cell 3
+  discussion): the CPU model gives each survivor `1.5 x (G/N + A)` awake groups of
+  capacity, so the capped population (`A_eff` plus the bypassed lost-leader
+  elections) fits and the uncapped one (every group awake) does not. Asserted: the
+  capped run's worst scheduling lag is no worse than uncapped **and** it leads no
+  fewer groups under load. First result (seed `0x24ef92c11692b620`): capped lag
+  12 ms against 13557 ms uncapped, 60 against 59 led, terms 2 against 19; held
+  across `ANIMUS_DENSITY_SEEDS=10`.
+- **Cell 9's window oracle was a flake (step 6 test, fixed here).** `repair_pacing`
+  asserted at most `R` commits in a `RECONCILE_INTERVAL` window anchored at the
+  first commit; seed 2584926886 (4th of `ANIMUS_REPAIR_PACING_SEEDS=5`) put two
+  ticks' batches (16) in one window because the commit latency of the first batch
+  exceeded the second's. The oracle is now cumulative, `R x (ticks since the first
+  commit + 2)`; both negative controls still fail it; green at K=30. Lesson:
+  `docs/lessons/testing/2026-10-14-bound-a-rate-by-cumulative-commits-not-by-a-window-anchored-at-an-observation.md`.

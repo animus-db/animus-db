@@ -309,6 +309,13 @@ pub fn validate_spec(
         });
     }
 
+    if let Err(e) = new.validate_node_capacity_spec() {
+        violations.push(Violation {
+            field: "spec.nodeCapacity.weight",
+            message: e,
+        });
+    }
+
     if let Err(e) = new.validate_store_spec() {
         violations.push(Violation {
             field: "spec.backupStore/spec.segmentStore",

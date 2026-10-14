@@ -503,6 +503,53 @@ pub struct ClusterSettings {
     /// monitor and the stretch. Node-local, additive, skipped when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lag_stretch_max_x: Option<u64>,
+    /// `--cores N` (ADR 0079 layer 2): this node's **configured** core count,
+    /// the multiplier of the awake-group cap `A = awake_max_per_core x cores`.
+    /// `None` (the default) leaves the cap **off**: the core count is never
+    /// autodetected (ADR 0078 decision 2), so a node without it behaves exactly
+    /// as before. The operator renders it from the pod's CPU limit. Node-local,
+    /// additive, skipped when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cores: Option<usize>,
+    /// `--awake-max-per-core N` (ADR 0079 layer 2): `A` per configured core.
+    /// `None` resolves to [`DEFAULT_AWAKE_MAX_PER_CORE`] (1500); `0` disables
+    /// the cap. Only meaningful with [`cores`](Self::cores). Node-local,
+    /// additive, skipped when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub awake_max_per_core: Option<usize>,
+    /// `--bg-snapshot-streams N` (ADR 0079 layer 3): concurrent `InstallSnapshot`
+    /// transfers this node sends, and (separately) receives. `None` resolves to
+    /// 2; `0` turns the pools off (unbounded, the pre-ADR behaviour).
+    /// Node-local (class L), additive, skipped when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg_snapshot_streams: Option<usize>,
+    /// `--bg-catchup-learners N` (ADR 0079 layer 3): learners this node catches
+    /// up at once. `None` resolves to 4; `0` turns the pool off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg_catchup_learners: Option<usize>,
+    /// `--bg-splits N` (ADR 0079 layer 3): in-place splits this node leads at
+    /// once, from `BeginSplitInPlace` to both children's Placing done. `None`
+    /// resolves to 1; `0` turns the pool off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg_splits: Option<usize>,
+    /// `--bg-compactions N` (ADR 0079 layer 3): LSM compactions this node runs
+    /// at once across all tablet engines. `None` resolves to
+    /// `max(1, cores / 2)` when [`cores`](Self::cores) is set and to **off**
+    /// otherwise (today's behaviour); `0` turns the pool off. The operator
+    /// derives it from the pod CPU request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg_compactions: Option<usize>,
+    /// `--repair-proposals-per-tick R` (ADR 0079 step 6): new repair
+    /// (`CasTabletReplicas`) proposals the control leader makes per reconcile
+    /// tick. `None` resolves to 8; `0` turns the per-tick limit off. Leader-local
+    /// (class L), additive, skipped when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair_proposals_per_tick: Option<usize>,
+    /// `--repair-inflight-max N` (ADR 0079 step 6): repairs in flight on the
+    /// control leader before a new one is deferred. `None` resolves to 16; `0`
+    /// turns the in-flight limit off. Leader-local (class L).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair_inflight_max: Option<usize>,
     /// `--region NAME` (ADR 0075 section 4, G-01 stage G-d M3): **this
     /// cluster's own MREC region name** — the namespace of
     /// [`peers`](Self::peers) and of an MREC table's replica set (a *peer
@@ -558,7 +605,30 @@ pub struct ClusterSettings {
     /// Additive and skipped when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_settle_timeout_ms: Option<u64>,
+    /// `--node-weight N` (ADR 0079 section 1): this node's relative capacity
+    /// for replica placement, advertised to the control plane through
+    /// `MetaCommand::SetNodeCapacity` once `Gate::NodeCapacity` is open. Only
+    /// ratios between nodes matter; `None` is
+    /// [`DEFAULT_NODE_WEIGHT`] (100, what every node that declares nothing
+    /// has); `0` is rejected. Additive and skipped when unset (ADR 0073 class
+    /// L for the file itself: an old config and the frozen fixture are
+    /// byte-identical); the replicated effect is the gated class G command.
+    /// In a shared `cluster_settings` it is the default for every node that
+    /// loads the file; `--node-weight` on one node's command line overrides
+    /// the file only by being the sole source (a both-sides set is a conflict).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_weight: Option<u32>,
+    /// `--node-max-replicas N` (ADR 0079 section 1): an absolute ceiling on the
+    /// replicas (voters and learners) placement puts on this node; `None` is
+    /// no ceiling. Same advertising path, gate and serialization rule as
+    /// [`node_weight`](Self::node_weight).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_max_replicas: Option<u32>,
 }
+
+/// The default [`ClusterSettings::node_weight`] (ADR 0079 section 1): the
+/// weight of a node that declares nothing.
+pub const DEFAULT_NODE_WEIGHT: u32 = 100;
 
 /// The default [`ClusterSettings::host_unsettled_max`] (ADR 0078 section 3).
 pub const DEFAULT_HOST_UNSETTLED_MAX: u64 = 100;
@@ -571,6 +641,10 @@ pub const DEFAULT_MAX_REGION_RTT_MS: u64 = 150;
 
 /// The default [`ClusterSettings::lag_stretch_max_x`] (ADR 0078).
 pub const DEFAULT_LAG_STRETCH_MAX_X: u64 = animus_cp_data::load_monitor::DEFAULT_LAG_STRETCH_MAX_X;
+
+/// The default [`ClusterSettings::awake_max_per_core`] (ADR 0079 layer 2).
+pub const DEFAULT_AWAKE_MAX_PER_CORE: usize =
+    animus_cp_data::awake_admission::DEFAULT_AWAKE_MAX_PER_CORE;
 
 /// The default [`ClusterSettings::campaign_max_inflight`] (ADR 0078).
 pub const DEFAULT_CAMPAIGN_MAX_INFLIGHT: usize =
@@ -635,6 +709,18 @@ impl ClusterSettings {
     pub fn pitr_seal_age(&self) -> std::time::Duration {
         self.pitr_seal_age_secs
             .map_or(crate::DEFAULT_PITR_SEAL_AGE, std::time::Duration::from_secs)
+    }
+
+    /// Startup validation of the node-capacity settings (ADR 0079 section 1):
+    /// the weight must be at least 1 (a zero weight would be an infinite fill).
+    ///
+    /// # Errors
+    /// A message naming the offending setting.
+    pub fn validate_capacity(&self) -> Result<(), String> {
+        if self.node_weight == Some(0) {
+            return Err("cluster_settings.node_weight must be at least 1".into());
+        }
+        Ok(())
     }
 
     /// Startup validation of the staggered-hosting settings (ADR 0078 section
@@ -833,6 +919,52 @@ impl ClusterConfig {
             .unwrap_or(DEFAULT_LAG_STRETCH_MAX_X)
     }
 
+    /// The configured core count ([`ClusterSettings::cores`]); `None` = the
+    /// awake-group cap is off.
+    #[must_use]
+    pub fn cores(&self) -> Option<usize> {
+        self.cluster_settings.as_ref().and_then(|s| s.cores)
+    }
+
+    /// The effective awake-cap per core ([`ClusterSettings::awake_max_per_core`],
+    /// default [`DEFAULT_AWAKE_MAX_PER_CORE`]); `0` disables the cap.
+    #[must_use]
+    pub fn awake_max_per_core(&self) -> usize {
+        self.cluster_settings
+            .as_ref()
+            .and_then(|s| s.awake_max_per_core)
+            .unwrap_or(DEFAULT_AWAKE_MAX_PER_CORE)
+    }
+
+    /// The resolved background-work pool sizes (ADR 0079 layer 3) from
+    /// `bg_*` and [`cores`](Self::cores).
+    #[must_use]
+    pub fn bg_sizes(&self) -> animus_cp_data::background_budget::BudgetSizes {
+        let s = self.cluster_settings.as_ref();
+        animus_cp_data::background_budget::BudgetSizes::resolve(
+            s.and_then(|s| s.bg_snapshot_streams),
+            s.and_then(|s| s.bg_catchup_learners),
+            s.and_then(|s| s.bg_splits),
+            s.and_then(|s| s.bg_compactions),
+            self.cores(),
+        )
+    }
+
+    /// The resolved control-leader repair pacing (ADR 0079 step 6).
+    #[must_use]
+    pub fn repair_pacing(&self) -> animus_control::repair_pacing::RepairPacing {
+        let s = self.cluster_settings.as_ref();
+        let d = animus_control::repair_pacing::RepairPacing::default();
+        animus_control::repair_pacing::RepairPacing {
+            per_tick: s
+                .and_then(|s| s.repair_proposals_per_tick)
+                .unwrap_or(d.per_tick),
+            inflight_max: s
+                .and_then(|s| s.repair_inflight_max)
+                .unwrap_or(d.inflight_max),
+        }
+    }
+
     /// The effective `host_unsettled_max` ([`ClusterSettings::host_unsettled_max`],
     /// default [`DEFAULT_HOST_UNSETTLED_MAX`]); `0` disables staggered hosting.
     #[must_use]
@@ -843,6 +975,18 @@ impl ClusterConfig {
             .and_then(|s| s.host_unsettled_max)
             .unwrap_or(DEFAULT_HOST_UNSETTLED_MAX);
         usize::try_from(v).unwrap_or(usize::MAX)
+    }
+
+    /// This node's declared placement capacity (ADR 0079 section 1): the
+    /// `node_weight` / `node_max_replicas` settings, defaulting to
+    /// [`animus_control::Capacity::DEFAULT`] (weight 100, no ceiling).
+    #[must_use]
+    pub fn node_capacity(&self) -> animus_control::Capacity {
+        let s = self.cluster_settings.as_ref();
+        animus_control::Capacity {
+            weight: s.and_then(|s| s.node_weight).unwrap_or(DEFAULT_NODE_WEIGHT),
+            max_replicas: s.and_then(|s| s.node_max_replicas),
+        }
     }
 
     /// The effective host settle timeout ([`ClusterSettings::host_settle_timeout_ms`],
@@ -1084,6 +1228,7 @@ impl ClusterConfig {
             s.validate_mrec().map_err(ConfigError::Invalid)?;
             s.validate_pitr().map_err(ConfigError::Invalid)?;
             s.validate_hosting().map_err(ConfigError::Invalid)?;
+            s.validate_capacity().map_err(ConfigError::Invalid)?;
         }
         for n in &cfg.nodes {
             if let Some(o) = &n.overload {
@@ -1406,6 +1551,14 @@ mod tests {
             max_region_rtt_ms: Some(220),
             campaign_max_inflight: Some(16),
             lag_stretch_max_x: Some(2),
+            cores: Some(4),
+            awake_max_per_core: Some(1200),
+            bg_snapshot_streams: Some(3),
+            bg_catchup_learners: Some(5),
+            bg_splits: Some(2),
+            bg_compactions: Some(6),
+            repair_proposals_per_tick: Some(4),
+            repair_inflight_max: Some(9),
             region: Some("us".into()),
             peers: vec![PeerCluster {
                 region: "eu".into(),
@@ -1416,6 +1569,8 @@ mod tests {
             mrec_max_clock_skew_ms: Some(300),
             host_unsettled_max: Some(40),
             host_settle_timeout_ms: Some(900),
+            node_weight: Some(250),
+            node_max_replicas: Some(640),
         });
         let parsed = ClusterConfig::from_json(&cfg.to_json()).unwrap();
         assert_eq!(parsed.cluster_settings, cfg.cluster_settings);
@@ -1439,6 +1594,29 @@ mod tests {
         assert_eq!(s.campaign_max_inflight, None);
         assert_eq!(s.lag_stretch_max_x, None);
         assert_eq!(cfg.lag_stretch_max_x(), 4);
+        // ADR 0079 layer 2: no `cores` = the awake cap is off, whatever the
+        // per-core figure; the per-core default is 1500.
+        assert_eq!(s.cores, None);
+        assert_eq!(cfg.cores(), None);
+        assert_eq!(cfg.awake_max_per_core(), 1500);
+        // ADR 0079 layer 3: snapshot/catch-up/split pools default on, the
+        // compaction pool needs `cores` (or its own flag).
+        let sizes = cfg.bg_sizes();
+        assert_eq!(
+            (
+                sizes.snapshot_send,
+                sizes.catchup,
+                sizes.splits,
+                sizes.compactions
+            ),
+            (Some(2), Some(4), Some(1), None)
+        );
+        // ADR 0079 step 6: repair pacing defaults on (8 per tick, 16 in flight).
+        assert_eq!(
+            cfg.repair_pacing(),
+            animus_control::repair_pacing::RepairPacing::default()
+        );
+        assert_eq!(s.bg_snapshot_streams, None);
         assert_eq!(s.max_region_rtt_ms, Some(200));
         // Set (including 0 = off) round-trips.
         for k in [0usize, 7, 64] {
@@ -1518,6 +1696,47 @@ mod tests {
             serde_json::from_str::<PeerCluster>(r#"{"region":"a","endpoints":[],"tls":"x"}"#)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn node_capacity_settings_are_additive_default_and_validated() {
+        // ADR 0079 section 1: absent from default bytes (the frozen v1
+        // `ClusterConfig` fixture is untouched) and resolving to weight 100,
+        // no ceiling.
+        let plain = serde_json::to_string(&ClusterSettings::default()).unwrap();
+        for key in ["node_weight", "node_max_replicas"] {
+            assert!(
+                !plain.contains(key),
+                "default settings emit `{key}`: {plain}"
+            );
+        }
+        let mut cfg = ClusterConfig::generate(1, "127.0.0.1".parse().unwrap(), 7000);
+        assert_eq!(cfg.node_capacity(), animus_control::Capacity::DEFAULT);
+        assert!(!cfg.to_json().contains("node_weight"));
+        cfg.cluster_settings = Some(ClusterSettings {
+            node_weight: Some(300),
+            node_max_replicas: Some(800),
+            ..Default::default()
+        });
+        assert_eq!(
+            cfg.node_capacity(),
+            animus_control::Capacity {
+                weight: 300,
+                max_replicas: Some(800)
+            }
+        );
+        let compact = serde_json::to_string(cfg.cluster_settings.as_ref().unwrap()).unwrap();
+        assert!(
+            compact.ends_with(r#""node_weight":300,"node_max_replicas":800}"#),
+            "{compact}"
+        );
+        let bad = ClusterSettings {
+            node_weight: Some(0),
+            ..Default::default()
+        };
+        assert!(bad.validate_capacity().unwrap_err().contains("at least 1"));
+        cfg.cluster_settings = Some(bad);
+        assert!(ClusterConfig::from_json(&cfg.to_json()).is_err());
     }
 
     #[test]

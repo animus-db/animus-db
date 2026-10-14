@@ -3327,3 +3327,76 @@ no-op when unchanged and draws no entropy. Tests:
 0078 negative control (c) (animus-cp-data): it re-arms a deferred follower's
 election timer, the responder-side gating the ADR rejects. Never call it from
 production code.
+
+## `Gate::NodeCapacity`, `MAX_SUPPORTED = 5` (ADR 0079 step 3, ADR 0073's 2026-10-13 amendment)
+
+- **State.** `Metadata::node_capacity: BTreeMap<NodeId, Capacity>` holds only
+  non-default capacities (skipped when empty; default entries are removed, so
+  "declares the default" and "declares nothing" are one state). A separate map,
+  not a `Member` field, for the reason `node_versions` is one: `UpsertMember`
+  replaces the whole `Member`. Mirror kind `EntityKind::NodeCapacity`
+  (`node_capacity`), pruned by `RemoveMember`.
+- **Commands.** `RegisterNode.capacity` (`Option`, fill-if-empty like labels,
+  a control-role registration records nothing) and `SetNodeCapacity` (rejected
+  for a non-member and a zero weight, `NoOp` when equal, default removes).
+  `required_gate`: `SetNodeCapacity` and `RegisterNode { capacity: Some }` are
+  `NodeCapacity`, a plain registration stays `Base`. `is_relayable_command`
+  (`animus-node` `wire.rs`) lists `SetNodeCapacity`.
+- **Placement reads the gate from the metadata.** `PlacementView.capacity` /
+  `Metadata::effective_capacities()` is `node_capacity` iff `capacity_gate_open()`
+  (the replicated cluster version, never a `ClusterFeatures` handle), else empty;
+  an empty map keeps the original placement functions, a non-empty one switches
+  `reconcile_placement`, `rebalance_*`, `split_placing_reconcile` and the
+  `CutoverSplit` target to the step 2 `*_with_load` / `select_replicas_balanced`
+  with `replica_load(tablets)`. Tests: `tests/it/node_capacity.rs`.
+- **Fixtures** `metadata/v1-capacity.json`, `mirror-entities/node_capacity/v1.json`;
+  `capacity_wire_shapes_are_pinned` freezes the command JSON. `sim_versions`
+  `content_gate` names the new shapes by content.
+
+## Repair pacing (`repair_pacing.rs`, ADR 0079 step 6)
+
+`reconcile_loop` no longer proposes every violating tablet's repair in one
+tick: `RepairPacer::select` lets through at most `R` (`RepairPacing::per_tick`,
+default 8) new `CasTabletReplicas` per tick, ascending `TabletId`, while fewer
+than `R_inflight` (default 16) repairs are in flight; the rest are deferred
+(`CpRepairDeferred`) and come back from `reconcile` next tick. Set with
+`RaftNode::set_repair_pacing` (animusd wires `cluster_settings.repair_*`); `0`
+disables a limit. Non-obvious:
+
+- **In flight ends at the observable end, with a TTL safety net.** A repair
+  holds its slot from the accepted proposal until the tablet's
+  `settled_epoch == epoch` (epoch past the tracked one): the data-plane leader
+  reports `MetaCommand::RepairSettled` (`animusd::repair_settled`) once its
+  group is the new voter set with no learner. `Metadata` itself never shows the
+  learner phase (the CAS writes the desired set at once), which is why a
+  report exists. The report is gated (`Gate::NodeCapacity`, v5): below it no
+  report comes and the slot is held for `REPAIR_INFLIGHT_TTL` (= `REPAIR_DWELL`)
+  as before. The TTL stays the safety net for a repair that never settles, or
+  whose report is lost: never remove it, a repair that never completes would
+  hold a slot forever. Also freed when the tablet disappears or leadership is
+  lost.
+- A proposal for a tablet whose tracked CAS has not applied yet (view epoch ==
+  tracked `expected_epoch`) is a free retry that keeps its original start time.
+- Deferred repairs still make `repaired` true, so rebalancing keeps yielding.
+- Tests: `tests/it/repair_pacing.rs` (cell 9, controls (a), (f) and (g); the settled/unsettled cells) and the
+  module's unit tests.
+
+## Capacity: creation refusal, blocked gauge, cells 10-12 (ADR 0079 step 7)
+
+- `Metadata::capacity_initial_replicas(policy)`: the capacity-aware first
+  placement for a new tablet (`None` when capacity is not in effect, so callers
+  keep their old pick byte-for-byte). Every `Active` node at `max_replicas` is
+  `Err(CapacityExhausted)`; some-but-fewer-than-RF nodes with room mints on those
+  (best effort). `animusd` maps the refusal to the retryable `ServiceUnavailable`.
+  `Metadata::regions_without_capacity` is the region-pinned twin (the wire edge
+  refuses `UpdateTable ReplicaUpdates` on a full Region).
+- `Metric::PlacementCapacityBlockedTablets`: `reconcile_loop` sets it each tick
+  from `PlacementView::capacity_blocked_tablets()` (an `Active` tablet short of its
+  policy RF whose every admissible outside node is full). `0` on a non-leader.
+- Tests: `tests/it/capacity_corpus.rs` (cells 10-12, controls (g)/(h), knob
+  `ANIMUS_CAPACITY_SEEDS`). To open `Gate::NodeCapacity` in a real `RaftNode` rig,
+  give every node (control and data) a `[1, 5]` handshake `ext`
+  (`animus_env::handshake::encode_ext`) and `set_own_version_range`, wait for the
+  era, then `ReportNodeVersion` for the data members and finalize 2..=5; the `[1,1]`
+  `b2_ext()` of `version_world` blocks the finalize ("a registered node's range
+  excludes the target"). A default-weight `SetNodeCapacity` is a `NoOp`.

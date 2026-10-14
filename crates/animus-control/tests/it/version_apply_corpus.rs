@@ -62,6 +62,7 @@ fn register(n: u64, role: &str) -> MetaCommand {
             role: role.to_string(),
         },
         labels: BTreeMap::new(),
+        capacity: None,
     }
 }
 

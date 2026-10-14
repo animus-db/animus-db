@@ -543,6 +543,15 @@ pub struct ElectionBackpressure {
     /// Scheduling-lag monitor (mechanism 2): stretches follower election
     /// timeouts and reduces the governor's `K_eff`; `None` = disabled.
     pub monitor: Option<LoadMonitor>,
+    /// Awake-group admission (ADR 0079 layer 2): the node's soft cap on awake
+    /// replicas and its wake queue; `None` = disabled (`--cores` unset).
+    /// Lives here because it rides the same per-node plumbing and the same
+    /// `LoadMonitor` lag.
+    pub awake: Option<crate::awake_admission::AwakeAdmission>,
+    /// Background-work budget (ADR 0079 layer 3): the node's permit pools for
+    /// snapshot streams, learner catch-up, splits and compactions; `None` =
+    /// every pool off. Its effective sizes follow the same `LoadMonitor` lag.
+    pub budget: Option<crate::background_budget::BackgroundBudget>,
 }
 
 #[cfg(test)]

@@ -71,6 +71,7 @@ fn register(node: animus_env::NodeId, suffix: u16) -> MetaCommand {
         labels: [("region".to_string(), "eu-west".to_string())]
             .into_iter()
             .collect(),
+        capacity: None,
     }
 }
 

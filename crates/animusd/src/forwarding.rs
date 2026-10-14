@@ -17,9 +17,10 @@ use animus_tablet::{KeyRange, TabletId};
 use crate::{
     CLIENT_TIMEOUT, CP_ROUTE_FANOUT_PROBE_TIMEOUT, CP_ROUTE_FANOUT_RETRY_INTERVAL,
     CP_ROUTE_LOCAL_SUB_BUDGET, ClientCtx, ClientRequest, ClientResponse, CpRoute,
-    FORWARD_ELECTION_BACKOFF, FORWARD_HOP_TIMEOUT, HINTED_FORWARD_HOP_TIMEOUT, RELAY_HOP_TIMEOUT,
-    RELAY_TRANSPORT_FAILURE, SCHEMA_POLL_INTERVAL, STALE_READ_REFUSAL, STREAM_GROW_NO_SPLIT_POINT,
-    SnapshotRead, TxnAbortReason, decide, dynamo, index_drain, median_split_key, topology,
+    FORWARD_ELECTION_BACKOFF, FORWARD_HOP_TIMEOUT, FORWARDED_SPLIT_WAIT,
+    HINTED_FORWARD_HOP_TIMEOUT, RELAY_HOP_TIMEOUT, RELAY_TRANSPORT_FAILURE, SCHEMA_POLL_INTERVAL,
+    STALE_READ_REFUSAL, STREAM_GROW_NO_SPLIT_POINT, SnapshotRead, TxnAbortReason, decide, dynamo,
+    index_drain, median_split_key, topology,
 };
 
 /// The plain-text prefix on the error [`ClientCtx::forward_to_tablet_leader`]
@@ -1375,7 +1376,12 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 };
                 match median_split_key(&leader).await {
                     None => ClientResponse::Error(STREAM_GROW_NO_SPLIT_POINT.into()),
-                    Some(split_key) => self.trigger_split(tablet, split_key).await,
+                    // Waits for the split pool, but inside one relay hop; the
+                    // caller (`grow_stream_tablet`) re-asks on SPLIT_BUSY.
+                    Some(split_key) => {
+                        self.trigger_split_within(tablet, split_key, FORWARDED_SPLIT_WAIT)
+                            .await
+                    }
                 }
             }
             // ADR 0042 §7/§8, PR6: the open-shard hot-read RPC — addressed

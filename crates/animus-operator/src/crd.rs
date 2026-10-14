@@ -557,6 +557,16 @@ pub struct AnimusClusterSpec {
     /// and skipped when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_settle_timeout_ms: Option<u64>,
+    /// Explicit per-node placement capacity overrides (ADR 0079 section 1).
+    /// Left unset, the operator **derives** both values from
+    /// `spec.resources.requests` ([`derive_node_capacity`](crate::desired::
+    /// cluster_config::derive_node_capacity)); a field set here wins over the
+    /// derived one. Rendered into `cluster_settings.node_weight` /
+    /// `node_max_replicas`, which each node advertises through
+    /// `SetNodeCapacity` once the cluster has finalized version 5. Additive
+    /// and skipped when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_capacity: Option<NodeCapacitySpec>,
     /// Name of a `Secret` (in the same namespace) holding the DynamoDB
     /// SigV4 credential store (`{"credentials": {"AKID...": "secret...",
     /// ...}}`, ADR 0057). Mounted read-only at `/etc/animus/dynamo-auth/`
@@ -728,7 +738,49 @@ impl PeerCaSecretRef {
     }
 }
 
+/// `spec.nodeCapacity` (ADR 0079 section 1): explicit overrides of the
+/// per-node placement capacity the operator otherwise derives from the pod
+/// resource requests.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeCapacitySpec {
+    /// Relative placement weight (only ratios between nodes matter; a node that
+    /// declares nothing is 100). Derived default: `max(1, cpuMillicores / 100)`.
+    /// `0` is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<u32>,
+    /// Absolute ceiling on the replicas (voters and learners) placement puts on
+    /// a node. Derived default: `min(memoryRequest / 2 / 64 KiB, 1000)` when a
+    /// memory request is set, else unset (no ceiling).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_replicas: Option<u32>,
+    /// The **configured** core count of each pod (ADR 0079 layers 2 and 3):
+    /// the multiplier of the awake-group cap (`cores x 1500`) and the default
+    /// size of the compaction pool (`max(1, cores / 2)`). Rendered into
+    /// `cluster_settings.cores`; never autodetected at runtime. Derived
+    /// default: `max(1, floor(cpuRequest))` from `spec.resources.requests.cpu`
+    /// (a 500m pod is 1, a 2500m pod is 2, a 4-core pod is 4); with neither
+    /// set the cap and the pools stay off. `0` is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cores: Option<u32>,
+}
+
 impl AnimusClusterSpec {
+    /// Pure validation of `spec.nodeCapacity` (animusd refuses a zero weight
+    /// at startup, so refuse it at admission instead of crash-looping).
+    ///
+    /// # Errors
+    /// A message naming the violated rule.
+    pub fn validate_node_capacity_spec(&self) -> Result<(), String> {
+        if self.node_capacity.as_ref().and_then(|c| c.weight) == Some(0) {
+            return Err("spec.nodeCapacity.weight must be at least 1".to_string());
+        }
+        if self.node_capacity.as_ref().and_then(|c| c.cores) == Some(0) {
+            return Err("spec.nodeCapacity.cores must be at least 1".to_string());
+        }
+        Ok(())
+    }
+
     /// Whether any peer names a CA `Secret` (so a merged trust bundle is
     /// needed).
     #[must_use]
@@ -944,6 +996,7 @@ impl Default for AnimusClusterSpec {
             lag_stretch_max_x: None,
             host_unsettled_max: None,
             host_settle_timeout_ms: None,
+            node_capacity: None,
             dynamo_auth_secret_name: None,
             tls: None,
             s3: None,

@@ -48,6 +48,7 @@ pub mod raft;
 pub mod rebalance_cache;
 /// Offline force-new-configuration recovery of a Raft WAL (ADR 0077, issue #1178).
 pub mod recover;
+pub mod repair_pacing;
 pub mod schema;
 pub mod shared_wal;
 #[cfg(any(test, feature = "sim-versions"))]
@@ -61,11 +62,11 @@ pub use delta_ring::DeltaRing;
 pub use detector::{FailureDetector, Liveness};
 pub use meta::{
     AccessKeyId, ApplyOutcome, BackupId, BackupManifest, BackupPinnedTablet, BackupRow,
-    BackupStatus, BackupTabletProgress, CredentialRow, ExportFormat, ExportId, ExportRow,
-    ExportStatus, ExportType, ImportId, ImportRow, ImportStatus, InputCompressionType, InputFormat,
-    Member, MetaCommand, Metadata, NodeAddrs, NodeStatus, OpClass, PitrReplaySegmentRef,
-    PitrRestorePlan, PitrRestoreWindow, PitrSegmentRow, Policy, PreviousSecret, RestoreId,
-    RestoreRow, RestoreStatus, SecretKey, StreamShardRow, TableMatch,
+    BackupStatus, BackupTabletProgress, CapacityExhausted, CredentialRow, ExportFormat, ExportId,
+    ExportRow, ExportStatus, ExportType, ImportId, ImportRow, ImportStatus, InputCompressionType,
+    InputFormat, Member, MetaCommand, Metadata, NodeAddrs, NodeStatus, OpClass,
+    PitrReplaySegmentRef, PitrRestorePlan, PitrRestoreWindow, PitrSegmentRow, Policy,
+    PreviousSecret, RestoreId, RestoreRow, RestoreStatus, SecretKey, StreamShardRow, TableMatch,
 };
 pub use node::{DeltaReply, MetadataChanged, MetadataWatch, RaftNode};
 pub use schema::{
@@ -83,11 +84,12 @@ pub use animus_placement::PlacementPolicy;
 // children's final homes via the placement engine — re-exported here (like
 // `PlacementPolicy` above) so the assembler still needs no direct
 // `animus-placement` dependency.
-pub use animus_placement::{Candidate, select_replicas_balanced};
+pub use animus_placement::{Candidate, Capacity, select_replicas_balanced};
 pub use persist::{PersistedState, WalRecord};
 pub use raft::{
     CampaignStats, DEPARTING_NOTICE_GIVE_UP, DEPARTING_QUIET_GIVE_UP, LogEntry, MemberRole,
-    ProposeResult, RaftCore, RaftMsg, RemovalStats, Role, StateMachine,
+    ProposeResult, RaftCore, RaftMsg, RemovalStats, Role, SNAPSHOT_HEARTBEAT_BACKOFF_MAX_TICKS,
+    StateMachine,
 };
 pub use shared_wal::SharedWal;
 pub use version::{

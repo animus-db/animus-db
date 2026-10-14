@@ -18,15 +18,19 @@ use crate::{
     BROADCAST_EXHAUSTED_BACKOFF, CLIENT_TIMEOUT, ClientCtx, ClientRequest, ClientResponse, CpRoute,
     FORWARD_HOP_TIMEOUT, MAX_REPLICATION_FACTOR, MetaCommand, NodeAddrs, NodeStatus,
     PlacementPolicy, ProposeResult, RegisterOutcome, SCHEMA_COMMIT_TIMEOUT, SCHEMA_POLL_INTERVAL,
-    SCHEMA_PROPOSE_PATIENCE, SPLIT_KEY_NOT_TOKEN_VIABLE, STREAM_GROW_MID_SPLIT,
-    STREAM_GROW_NO_SPLIT_POINT, WATCH_METADATA_SERVER_TIMEOUT, decide, index_drain,
-    median_split_key, topology,
+    SCHEMA_PROPOSE_PATIENCE, SPLIT_BUSY, SPLIT_KEY_NOT_TOKEN_VIABLE, SPLIT_WAIT_BOUND,
+    STREAM_GROW_MID_SPLIT, STREAM_GROW_NO_SPLIT_POINT, WATCH_METADATA_SERVER_TIMEOUT, decide,
+    index_drain, median_split_key, topology,
 };
 
 /// First/maximum pause between self-registration attempts
 /// ([`ClientCtx::register_node_until_settled`], issue #1230). Each attempt
 /// already waits up to `SCHEMA_COMMIT_TIMEOUT`, so this only paces a
 /// fast-failing leaderless cluster.
+/// How often [`ClientCtx::sync_node_capacity`] re-checks a closed
+/// `Gate::NodeCapacity` or a not-yet-visible member row (ADR 0079).
+const CAPACITY_SYNC_INTERVAL: Duration = Duration::from_secs(2);
+
 const REGISTER_RETRY_BACKOFF_INITIAL: Duration = Duration::from_millis(500);
 const REGISTER_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
@@ -419,7 +423,8 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     .filter(|(_, m)| m.status == NodeStatus::Active)
                     .map(|(id, _)| id.clone())
                     .collect();
-                replicas = zone_aware_initial_replicas(&meta, replicas);
+                replicas =
+                    zone_aware_initial_replicas(&meta, replicas).map_err(|e| e.to_string())?;
                 let now = self.env.now();
                 if !replicas.is_empty()
                     && (last_proposed_create != Some(true) || now >= next_propose_at)
@@ -538,16 +543,109 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     ///
     /// Routed to the control leader (relayable, [`is_relayable_command`]), so
     /// this works from any node the client happens to be connected to.
-    #[tracing::instrument(
-        name = "split_tablet",
-        skip(self, split_key),
-        fields(tablet = tablet.0, new_id = tracing::field::Empty)
-    )]
+    ///
+    /// **Split pool (ADR 0079 layer 3).** A split this node starts takes a
+    /// split-pool permit (default 1) held until the split is finished in the
+    /// replicated `Metadata` (`SplitPermits`). This is the *explicit* path
+    /// (the admin endpoint, `SplitTablet`, stream grow): with the pool full it
+    /// **waits its turn** (FIFO) for up to [`SPLIT_WAIT_BOUND`] and only then
+    /// returns the retryable [`SPLIT_BUSY`]. The auto-split sweeps use
+    /// [`trigger_split_nowait`](Self::trigger_split_nowait) instead.
     pub(crate) async fn trigger_split(
         &self,
         tablet: TabletId,
         split_key: Vec<u8>,
     ) -> ClientResponse {
+        self.trigger_split_within(tablet, split_key, SPLIT_WAIT_BOUND)
+            .await
+    }
+
+    /// [`trigger_split`](Self::trigger_split) with an explicit wait bound (the
+    /// forwarded stream-grow arm must answer inside one relay hop).
+    pub(crate) async fn trigger_split_within(
+        &self,
+        tablet: TabletId,
+        split_key: Vec<u8>,
+        bound: Duration,
+    ) -> ClientResponse {
+        use animus_cp_data::background_budget::SplitAdmission;
+        let pool = self.split_pool();
+        let permit = match pool {
+            Some(p) => match p
+                .admit_wait(
+                    &self.env,
+                    tablet,
+                    || self.effective_metadata(),
+                    bound,
+                    SCHEMA_POLL_INTERVAL,
+                )
+                .await
+            {
+                SplitAdmission::Busy => return ClientResponse::Error(SPLIT_BUSY.into()),
+                SplitAdmission::Granted(p) => p,
+            },
+            None => None,
+        };
+        self.split_with_permit(tablet, split_key, permit).await
+    }
+
+    /// The auto-split sweeps' entry: never waits. With the pool full it
+    /// returns [`SPLIT_BUSY`] at once and the sweep retries on its next tick.
+    pub(crate) async fn trigger_split_nowait(
+        &self,
+        tablet: TabletId,
+        split_key: Vec<u8>,
+    ) -> ClientResponse {
+        use animus_cp_data::background_budget::SplitAdmission;
+        let pool = self.split_pool();
+        let permit = match pool.map(|p| p.admit(tablet, &self.effective_metadata(), self.env.now()))
+        {
+            Some(SplitAdmission::Busy) => return ClientResponse::Error(SPLIT_BUSY.into()),
+            Some(SplitAdmission::Granted(p)) => p,
+            None => None,
+        };
+        self.split_with_permit(tablet, split_key, permit).await
+    }
+
+    async fn split_with_permit(
+        &self,
+        tablet: TabletId,
+        split_key: Vec<u8>,
+        permit: Option<animus_cp_data::background_budget::BgPermit>,
+    ) -> ClientResponse {
+        let pool = self.split_pool();
+        let response = self.trigger_split_begin(tablet, split_key).await;
+        // Success (the split began, or was already running) keeps the permit
+        // until the split finishes; a failure drops it here.
+        if matches!(response, ClientResponse::PutOk)
+            && let (Some(p), Some(pool)) = (permit, pool)
+        {
+            pool.hold(tablet, p);
+        }
+        response
+    }
+
+    /// This node's split pool (ADR 0079 layer 3), when it is on.
+    fn split_pool(&self) -> Option<&animus_cp_data::background_budget::SplitPermits> {
+        self.data
+            .as_ref()
+            .and_then(|d| d.bg.as_ref())
+            .filter(|bg| bg.is_on())
+    }
+
+    /// Whether a new split of `tablet` would be refused now (the auto-split
+    /// sweeps skip the tablet instead of materializing it).
+    pub(crate) fn split_pool_full(&self, tablet: TabletId) -> bool {
+        self.split_pool()
+            .is_some_and(|p| p.pool_full(tablet, &self.effective_metadata(), self.env.now()))
+    }
+
+    #[tracing::instrument(
+        name = "split_tablet",
+        skip(self, split_key),
+        fields(tablet = tablet.0, new_id = tracing::field::Empty)
+    )]
+    async fn trigger_split_begin(&self, tablet: TabletId, split_key: Vec<u8>) -> ClientResponse {
         // `effective_metadata()`, not `self.control.metadata_cached()`
         // directly (ADR 0035 PR5 staleness-audit fix): unlike a plain stale
         // read racing a *concurrent* epoch bump — which the CAS below catches
@@ -733,6 +831,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             node: node.clone(),
             addrs: addrs.clone(),
             labels,
+            capacity: None,
         };
         match self
             .propose_and_await(cmd, SCHEMA_COMMIT_TIMEOUT, || async {
@@ -860,6 +959,52 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 self.env.sleep(SCHEMA_POLL_INTERVAL).await;
             }
             backoff = (backoff * 2).min(REGISTER_RETRY_BACKOFF_MAX);
+        }
+    }
+
+    /// Reconcile this node's declared placement capacity into `Metadata` (ADR
+    /// 0079 section 1): once `Gate::NodeCapacity` is open and `node` is a
+    /// data-plane member, propose `SetNodeCapacity` until the replicated value
+    /// equals `configured`, then return. The process configuration is the
+    /// source of truth (a restart with a changed flag overwrites; a node that
+    /// declares nothing clears a leftover entry). A node whose configured
+    /// capacity already equals what `Metadata` holds -- always the case for a
+    /// cluster that declares nothing -- returns on the first read, proposes
+    /// nothing, and never waits for the gate: the emit-site check of ADR 0073
+    /// (an unopened gate is polled, never proposed through).
+    pub(crate) async fn sync_node_capacity(
+        &self,
+        node: &NodeId,
+        configured: animus_control::Capacity,
+    ) {
+        loop {
+            let meta = self.effective_metadata();
+            if meta.capacity_of(node) == configured {
+                return;
+            }
+            if meta.members.contains_key(node) {
+                let features = &self.edge.version().features;
+                if !features.is_open(animus_control::version::Gate::NodeCapacity) {
+                    // The feeder runs on a tick; re-read this node's applied view.
+                    features.update(&meta);
+                }
+                if features.is_open(animus_control::version::Gate::NodeCapacity) {
+                    let cmd = MetaCommand::SetNodeCapacity {
+                        node: node.clone(),
+                        capacity: configured,
+                    };
+                    let done = self
+                        .propose_and_await(cmd, SCHEMA_COMMIT_TIMEOUT, || async {
+                            (self.effective_metadata().capacity_of(node) == configured)
+                                .then_some(())
+                        })
+                        .await;
+                    if done.is_ok() {
+                        return;
+                    }
+                }
+            }
+            self.env.sleep(CAPACITY_SYNC_INTERVAL).await;
         }
     }
 
@@ -1288,12 +1433,17 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// error (including this action's own expected skips) is a terminal
     /// outcome, not a signal to keep retrying.
     pub(crate) async fn grow_stream_tablet(&self, tablet: TabletId) -> ClientResponse {
-        let deadline = self.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
+        let deadline = self
+            .env
+            .now()
+            .saturating_add(SCHEMA_COMMIT_TIMEOUT)
+            .saturating_add(SPLIT_WAIT_BOUND);
         loop {
             match self.resolve_cp_route(tablet) {
                 Some(CpRoute::Local(leader)) => {
                     return match median_split_key(&leader).await {
                         None => ClientResponse::Error(STREAM_GROW_NO_SPLIT_POINT.into()),
+                        // Waits for the split pool (ADR 0079), up to its bound.
                         Some(split_key) => self.trigger_split(tablet, split_key).await,
                     };
                 }
@@ -1305,6 +1455,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     {
                         ClientResponse::Error(e)
                             if topology::parse_not_leader_refusal(&e).is_some() => {} // chase exhausted mid-election, retry below
+                        // The remote's pool wait is capped under one relay hop
+                        // (`FORWARDED_SPLIT_WAIT`), so a full pool there comes
+                        // back as SPLIT_BUSY and this loop asks again.
+                        ClientResponse::Error(e) if e == SPLIT_BUSY => {}
                         other => return other,
                     }
                 }
@@ -1312,7 +1466,8 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             }
             if self.env.now() >= deadline {
                 return ClientResponse::Error(
-                    "stream grow: did not reach this tablet's leader in time".into(),
+                    "stream grow: did not reach this tablet's leader (or get a split-pool permit) in time"
+                        .into(),
                 );
             }
             self.env.sleep(SCHEMA_POLL_INTERVAL).await;
@@ -1721,17 +1876,33 @@ pub(crate) fn default_table_policy(meta: &crate::Metadata) -> PlacementPolicy {
     )
 }
 
+/// Prefix of the error [`ClientCtx::provision_tablet`] and `CreateTable`
+/// return when every `Active` node is at its `max_replicas` (ADR 0079 section
+/// 1): the wire layer maps it to the retryable `ServiceUnavailable`
+/// (`dynamo::internal`), never an `InternalServerError` and never a
+/// provisioning timeout.
+pub(crate) const CAPACITY_EXHAUSTED_REFUSAL: &str = "no capacity for a new tablet";
+
 /// The first tablet's initial replica set from the `Active` members
 /// `active` (id order): zone-spread and load-aware when the table's policy
 /// is a spread one and enough `Active` members exist to satisfy it, else the
 /// historical first-`RF`-by-id truncation. The reconciler never *repairs* a
 /// best-effort spread that merely started skewed (it is not a hard
 /// violation), so the initial pick has to be right.
+///
+/// **Capacity (ADR 0079 section 1):** once `Gate::NodeCapacity` is open and a
+/// node has declared capacity, the pick is capacity-aware instead
+/// ([`Metadata::capacity_initial_replicas`]: weighted fill, never a node at
+/// `max_replicas`), and a cluster whose every `Active` node is full refuses
+/// with [`CapacityExhausted`]. A cluster that declares nothing is unchanged.
 pub(crate) fn zone_aware_initial_replicas(
     meta: &crate::Metadata,
     mut active: Vec<NodeId>,
-) -> Vec<NodeId> {
+) -> Result<Vec<NodeId>, animus_control::CapacityExhausted> {
     let policy = default_table_policy(meta);
+    if let Some(picked) = meta.capacity_initial_replicas(&policy) {
+        return picked;
+    }
     if policy.spread.is_some() {
         let cands: Vec<animus_placement::Candidate> = active
             .iter()
@@ -1748,11 +1919,11 @@ pub(crate) fn zone_aware_initial_replicas(
             }
         }
         if let Ok(set) = animus_placement::select_replicas_balanced(&cands, &policy, &load) {
-            return set;
+            return Ok(set);
         }
     }
     active.truncate(MAX_REPLICATION_FACTOR);
-    active
+    Ok(active)
 }
 
 #[cfg(test)]
@@ -1813,7 +1984,7 @@ mod default_table_policy_tests {
         ];
         let meta = meta_with(&zones, NodeStatus::Active);
         let active: Vec<NodeId> = (0..6).map(nid).collect();
-        let picked = zone_aware_initial_replicas(&meta, active.clone());
+        let picked = zone_aware_initial_replicas(&meta, active.clone()).unwrap();
         let picked_zones: BTreeSet<_> = picked
             .iter()
             .map(|n| meta.members[n].labels[ZONE_LABEL].clone())
@@ -1821,11 +1992,11 @@ mod default_table_policy_tests {
         assert_eq!(picked.len(), 3);
         assert_eq!(picked_zones.len(), 3, "{picked:?}");
         // Not enough Active members to satisfy RF: falls back to first-N by id.
-        let few = zone_aware_initial_replicas(&meta, active[..2].to_vec());
+        let few = zone_aware_initial_replicas(&meta, active[..2].to_vec()).unwrap();
         assert_eq!(few, vec![nid(0), nid(1)]);
         // Unlabelled cluster: historical truncation.
         let plain = meta_with(&[None, None, None, None], NodeStatus::Active);
-        let got = zone_aware_initial_replicas(&plain, (0..4).map(nid).collect());
+        let got = zone_aware_initial_replicas(&plain, (0..4).map(nid).collect()).unwrap();
         assert_eq!(got, vec![nid(0), nid(1), nid(2)]);
     }
 }

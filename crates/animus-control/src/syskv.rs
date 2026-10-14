@@ -222,6 +222,13 @@ pub enum EntityKind {
     /// leaves every era-0 mirror byte-identical. The cluster version itself
     /// rides [`Counter`](Self::Counter) as `mirror::CLUSTER_VERSION_COUNTER`.
     NodeVersion,
+    /// A node's declared capacity (`Metadata::node_capacity`, ADR 0079 section
+    /// 1, `Gate::NodeCapacity`), keyed by its [`NodeId`] ([`node_capacity_key`]).
+    /// The value is the JSON-encoded `animus_placement::Capacity`. Only
+    /// non-default capacities are stored, so a cluster that never declares one
+    /// has no such row and a reader that does not know the kind ignores it
+    /// (`decode_key` returns `None`).
+    NodeCapacity,
 }
 
 impl EntityKind {
@@ -252,6 +259,7 @@ impl EntityKind {
             EntityKind::Export => "export",
             EntityKind::Import => "import",
             EntityKind::NodeVersion => "node_version",
+            EntityKind::NodeCapacity => "node_capacity",
         }
     }
 
@@ -283,6 +291,7 @@ impl EntityKind {
             b"export" => EntityKind::Export,
             b"import" => EntityKind::Import,
             b"node_version" => EntityKind::NodeVersion,
+            b"node_capacity" => EntityKind::NodeCapacity,
             _ => return None,
         })
     }
@@ -379,6 +388,12 @@ pub fn member_key(id: &NodeId) -> Vec<u8> {
 #[must_use]
 pub fn node_version_key(id: &NodeId) -> Vec<u8> {
     entity_key(EntityKind::NodeVersion, id.as_str().as_bytes())
+}
+
+/// A [`NodeId`]'s key under [`EntityKind::NodeCapacity`] (ADR 0079).
+#[must_use]
+pub fn node_capacity_key(id: &NodeId) -> Vec<u8> {
+    entity_key(EntityKind::NodeCapacity, id.as_str().as_bytes())
 }
 
 /// A table name's key under [`EntityKind::Schema`].
@@ -680,7 +695,7 @@ mod tests {
     // `Restore` — pre-existing drift from `EntityKind`'s real variant count,
     // out of this change's scope to backfill (see `docs/engineering-
     // lessons.md`). The two kinds this PR adds ARE included below.
-    const ALL_KINDS: [EntityKind; 11] = [
+    const ALL_KINDS: [EntityKind; 12] = [
         EntityKind::Tablet,
         EntityKind::Member,
         EntityKind::Schema,
@@ -692,6 +707,7 @@ mod tests {
         EntityKind::PitrSegment,
         EntityKind::PitrBaseBackup,
         EntityKind::NodeVersion,
+        EntityKind::NodeCapacity,
     ];
 
     // --- reserved-name guard -------------------------------------------------

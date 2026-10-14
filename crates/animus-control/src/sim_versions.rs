@@ -185,6 +185,14 @@ pub fn content_gate(msg: &RaftMsg) -> Gate {
         crate::MetaCommand::ConvertTableToGlobal { spec, .. } if spec.is_mrec() => {
             g.join(Gate::MrecReplication)
         }
+        // ADR 0079: what a Release(4) binary's strict decode cannot read (the
+        // variant, and the `capacity` field of a registration), by content.
+        // ADR 0079 step 6: `RepairSettled` shares the v5 gate.
+        crate::MetaCommand::SetNodeCapacity { .. }
+        | crate::MetaCommand::RepairSettled { .. }
+        | crate::MetaCommand::RegisterNode {
+            capacity: Some(_), ..
+        } => g.join(Gate::NodeCapacity),
         _ => g,
     })
 }
@@ -278,18 +286,20 @@ mod tests {
                 BinaryProfile::Release(2),
                 BinaryProfile::Release(3),
                 BinaryProfile::Release(4),
+                BinaryProfile::Release(5),
             ]
             .iter()
             .map(|p| p.accepts(g))
             .collect();
             let want = match g {
-                Gate::Base => [true, true, true, true, true],
-                Gate::Era => [false, true, true, true, true],
-                Gate::GlobalTables => [false, false, true, true, true],
-                Gate::MrecReplication => [false, false, false, true, true],
-                Gate::TxnSealChecked => [false, false, false, false, true],
-                Gate::Synthetic(2) => [false, false, true, true, true],
-                Gate::Synthetic(3) => [false, false, false, true, true],
+                Gate::Base => [true, true, true, true, true, true],
+                Gate::Era => [false, true, true, true, true, true],
+                Gate::GlobalTables => [false, false, true, true, true, true],
+                Gate::MrecReplication => [false, false, false, true, true, true],
+                Gate::TxnSealChecked => [false, false, false, false, true, true],
+                Gate::NodeCapacity => [false, false, false, false, false, true],
+                Gate::Synthetic(2) => [false, false, true, true, true, true],
+                Gate::Synthetic(3) => [false, false, false, true, true, true],
                 Gate::Synthetic(_) => unreachable!(),
             };
             assert_eq!(row, want, "{g:?}");
@@ -327,6 +337,35 @@ mod tests {
         assert_eq!(gated.required_gate(), Gate::Synthetic(3));
         assert_eq!(content_gate(&gated), Gate::Synthetic(3));
         assert_eq!(content_gate(&ae(upsert("other"))), Gate::Base);
+    }
+
+    /// ADR 0079 step 6: the settled report is v5-gated by classification and
+    /// by content, so a `Release(4)` voter's capped decode refuses it.
+    #[test]
+    fn repair_settled_needs_the_node_capacity_gate() {
+        use crate::raft::LogEntry;
+        let cmd = MetaCommand::RepairSettled {
+            tablet: animus_tablet::TabletId(1),
+            epoch: animus_tablet::Epoch(2),
+        };
+        let msg = RaftMsg::AppendEntries {
+            term: 1,
+            leader: animus_env::nid(0),
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![LogEntry {
+                term: 1,
+                index: 1,
+                command: cmd,
+                config: None,
+                learners: None,
+            }],
+            leader_commit: 0,
+        };
+        assert_eq!(msg.required_gate(), Gate::NodeCapacity);
+        assert_eq!(content_gate(&msg), Gate::NodeCapacity);
+        assert!(!BinaryProfile::Release(4).accepts(Gate::NodeCapacity));
+        assert!(BinaryProfile::Release(5).accepts(Gate::NodeCapacity));
     }
 
     #[test]

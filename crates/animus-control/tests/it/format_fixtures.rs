@@ -50,7 +50,7 @@ use animus_control::raft::LogEntry;
 use animus_control::schema::{ColumnType, TableSchema};
 use animus_control::{ApplyOutcome, MetaCommand, Metadata, NodeStatus, PlacementPolicy};
 use animus_env::nid;
-use animus_tablet::{KeyRange, TabletId};
+use animus_tablet::{Epoch, KeyRange, TabletId};
 
 /// One of each [`WalRecord`] variant, built from fixed constants only (ADR
 /// 0073 Phase 0's determinism rule — no wall-clock time, no unseeded
@@ -433,6 +433,7 @@ fn v1_era_metadata() -> Metadata {
                 role: "control".to_string(),
             },
             labels: BTreeMap::new(),
+            capacity: None,
         },
     ];
     for (n, build) in [(1, "2.0.0"), (2, "2.0.0"), (3, "2.0.1")] {
@@ -564,6 +565,282 @@ fn v1_mrec_metadata() -> Metadata {
     m
 }
 
+/// The per-node capacity shape (ADR 0079, gate `NodeCapacity`, cluster
+/// version 5): two data members, one registered through a `RegisterNode` that
+/// carries a `capacity` (weight 300, ceiling 800) and one given a capacity by
+/// `SetNodeCapacity` (weight 50, no ceiling), the cluster finalized to
+/// version 5. Built through real commands. A third member declares nothing and
+/// has no entry.
+fn v1_capacity_metadata() -> Metadata {
+    use animus_control::Capacity;
+    use animus_control::meta::NodeAddrs;
+    use animus_control::version::VersionRange;
+    let mut m = Metadata::default();
+    let addrs = |n: u16| NodeAddrs {
+        internal: format!("127.0.0.1:{}", 9400 + n),
+        client: format!("127.0.0.1:{}", 9000 + n),
+        intra: format!("127.0.0.1:{}", 9600 + n),
+        admin: format!("127.0.0.1:{}", 9500 + n),
+        role: "combined".to_string(),
+    };
+    let mut commands = vec![
+        MetaCommand::UpsertMember {
+            node: nid(1),
+            labels: BTreeMap::new(),
+            status: NodeStatus::Active,
+        },
+        MetaCommand::UpsertMember {
+            node: nid(3),
+            labels: BTreeMap::new(),
+            status: NodeStatus::Active,
+        },
+        MetaCommand::RegisterNode {
+            node: nid(2),
+            addrs: addrs(2),
+            labels: BTreeMap::new(),
+            capacity: Some(Capacity {
+                weight: 300,
+                max_replicas: Some(800),
+            }),
+        },
+    ];
+    // A fresh `RegisterNode` claim is `Down`; a finalize needs every member up.
+    commands.push(MetaCommand::UpsertMember {
+        node: nid(2),
+        labels: BTreeMap::new(),
+        status: NodeStatus::Active,
+    });
+    for n in [1, 2, 3] {
+        commands.push(MetaCommand::ReportNodeVersion {
+            node: nid(n),
+            range: VersionRange::new(1, 5),
+            build: "5.0.0".to_string(),
+        });
+    }
+    for target in 2..=5 {
+        commands.push(MetaCommand::FinalizeClusterVersion {
+            expected: target - 1,
+            target,
+        });
+    }
+    commands.push(MetaCommand::SetNodeCapacity {
+        node: nid(1),
+        capacity: Capacity {
+            weight: 50,
+            max_replicas: None,
+        },
+    });
+    for command in &commands {
+        assert_eq!(
+            m.apply(command),
+            ApplyOutcome::Applied,
+            "fixture premise: {command:?} applies cleanly"
+        );
+    }
+    assert!(m.capacity_gate_open() && m.node_capacity.len() == 2);
+    m
+}
+
+/// The repair-settled shape (ADR 0079 step 6, gate `NodeCapacity`, the same
+/// version-5 era as capacity): the capacity scenario plus one tablet whose
+/// replica set was changed by `CasTabletReplicas` (epoch 2) and then reported
+/// realised by `RepairSettled`, so the tablet carries `settled_epoch: 2`; a
+/// second tablet is untouched (no `settled_epoch` key).
+fn v1_repair_settled_metadata() -> Metadata {
+    let mut m = v1_capacity_metadata();
+    for command in [
+        MetaCommand::CreateTablet {
+            tablet: TabletId(1),
+            table: None,
+            range: KeyRange::whole(),
+            replicas: vec![nid(1), nid(2)],
+        },
+        MetaCommand::CreateTablet {
+            tablet: TabletId(2),
+            table: None,
+            range: KeyRange::whole(),
+            replicas: vec![nid(1), nid(2)],
+        },
+        MetaCommand::CasTabletReplicas {
+            tablet: TabletId(1),
+            expected_epoch: Epoch::INITIAL,
+            replicas: vec![nid(2), nid(3)],
+        },
+        MetaCommand::RepairSettled {
+            tablet: TabletId(1),
+            epoch: Epoch(2),
+        },
+    ] {
+        assert_eq!(
+            m.apply(&command),
+            ApplyOutcome::Applied,
+            "fixture premise: {command:?} applies cleanly"
+        );
+    }
+    assert_eq!(m.tablets[&TabletId(1)].settled_epoch, Some(Epoch(2)));
+    m
+}
+
+/// Writes `v1-repair-settled.json`; refuses to overwrite.
+/// `cargo test -p animus-control --test it format_fixtures::generate_fixture_metadata_repair_settled -- --ignored`.
+#[test]
+#[ignore]
+fn generate_fixture_metadata_repair_settled() {
+    let path = metadata_fixtures_dir().join("v1-repair-settled.json");
+    if std::fs::metadata(&path).is_ok() {
+        panic!(
+            "{} already exists — never regenerated in place",
+            path.display()
+        );
+    }
+    let bytes =
+        serde_json::to_vec_pretty(&v1_repair_settled_metadata()).expect("metadata serializes");
+    std::fs::write(&path, &bytes).unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
+}
+
+/// ADR 0079 step 6's compatibility claims, pinned: the command's JSON shape,
+/// the `settled_epoch` key absent from every tablet that was never reported
+/// (so all pre-existing tablet encodings and fixtures are byte-identical),
+/// and an older reader's tablet (the key absent) decoding as unsettled.
+#[test]
+fn repair_settled_wire_shapes_are_pinned() {
+    let cmd = MetaCommand::RepairSettled {
+        tablet: TabletId(7),
+        epoch: Epoch(3),
+    };
+    assert_eq!(
+        serde_json::to_string(&cmd).unwrap(),
+        r#"{"RepairSettled":{"tablet":7,"epoch":3}}"#
+    );
+    let m = v1_repair_settled_metadata();
+    let v = serde_json::to_value(&m).unwrap();
+    let tablets = &v["tablets"];
+    let dump = tablets.to_string();
+    assert_eq!(dump.matches("settled_epoch").count(), 1, "{dump}");
+    assert!(
+        !serde_json::to_string(&v1_capacity_metadata())
+            .unwrap()
+            .contains("settled_epoch")
+    );
+    let bytes = serde_json::to_vec(&m).unwrap();
+    assert_eq!(Metadata::from_json(&bytes).unwrap(), m);
+}
+
+/// Writes `v1-capacity.json` from [`v1_capacity_metadata`]; refuses to overwrite.
+/// `cargo test -p animus-control --test it format_fixtures::generate_fixture_metadata_capacity -- --ignored`.
+#[test]
+#[ignore]
+fn generate_fixture_metadata_capacity() {
+    let path = metadata_fixtures_dir().join("v1-capacity.json");
+    if std::fs::metadata(&path).is_ok() {
+        panic!(
+            "{} already exists — never regenerated in place",
+            path.display()
+        );
+    }
+    let bytes = serde_json::to_vec_pretty(&v1_capacity_metadata()).expect("metadata serializes");
+    std::fs::write(&path, &bytes).unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
+}
+
+/// Writes `mirror-entities/node_capacity/v1.json`; refuses to overwrite.
+/// `cargo test -p animus-control --test it format_fixtures::generate_fixture_mirror_node_capacity -- --ignored`.
+#[test]
+#[ignore]
+fn generate_fixture_mirror_node_capacity() {
+    let (full, live) = v1_mirror_scenario();
+    let (key, _) = v1_entity(EntityKind::NodeCapacity, &full);
+    let dir = mirror_entities_root().join(EntityKind::NodeCapacity.as_str());
+    std::fs::create_dir_all(&dir).expect("create fixtures dir");
+    let path = dir.join(format!("v{SYSKV_MIRROR_VERSION}.json"));
+    if std::fs::metadata(&path).is_ok() {
+        panic!(
+            "{} already exists — never regenerated in place",
+            path.display()
+        );
+    }
+    std::fs::write(&path, &live[&key])
+        .unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
+}
+
+/// ADR 0079's compatibility claims, pinned byte for byte: a registration
+/// without a capacity encodes exactly as it did before the field existed; the
+/// capacity shapes are the documented JSON; era-0 and pre-capacity metadata
+/// never mention `node_capacity`; an older reader's metadata (the field
+/// absent) decodes with no declared capacities.
+#[test]
+fn capacity_wire_shapes_are_pinned() {
+    use animus_control::Capacity;
+    let addrs = NodeAddrs {
+        internal: "i".into(),
+        client: "c".into(),
+        intra: "x".into(),
+        admin: "a".into(),
+        role: "combined".into(),
+    };
+    let plain = MetaCommand::RegisterNode {
+        node: nid(1),
+        addrs: addrs.clone(),
+        labels: BTreeMap::new(),
+        capacity: None,
+    };
+    let plain_json = serde_json::to_string(&plain).unwrap();
+    assert!(!plain_json.contains("capacity"), "{plain_json}");
+    let sized = MetaCommand::RegisterNode {
+        node: nid(1),
+        addrs,
+        labels: BTreeMap::new(),
+        capacity: Some(Capacity {
+            weight: 300,
+            max_replicas: Some(800),
+        }),
+    };
+    assert!(
+        serde_json::to_string(&sized)
+            .unwrap()
+            .ends_with(r#""capacity":{"weight":300,"max_replicas":800}}}"#),
+        "{}",
+        serde_json::to_string(&sized).unwrap()
+    );
+    // A pre-capacity writer's bytes (the field absent) still decode.
+    assert_eq!(
+        serde_json::from_str::<MetaCommand>(&plain_json).unwrap(),
+        plain
+    );
+    let set = MetaCommand::SetNodeCapacity {
+        node: nid(1),
+        capacity: Capacity {
+            weight: 50,
+            max_replicas: None,
+        },
+    };
+    assert_eq!(
+        serde_json::to_string(&set).unwrap(),
+        format!(
+            r#"{{"SetNodeCapacity":{{"node":{},"capacity":{{"weight":50,"max_replicas":null}}}}}}"#,
+            serde_json::to_string(&nid(1)).unwrap()
+        )
+    );
+    // The era and pre-era shapes never mention the new map.
+    assert!(
+        !serde_json::to_string(&v1_metadata())
+            .unwrap()
+            .contains("node_capacity")
+    );
+    assert!(
+        !serde_json::to_string(&v1_era_metadata())
+            .unwrap()
+            .contains("node_capacity")
+    );
+    let cap = v1_capacity_metadata();
+    let bytes = serde_json::to_vec(&cap).unwrap();
+    assert_eq!(Metadata::from_json(&bytes).unwrap(), cap);
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    value.as_object_mut().unwrap().remove("node_capacity");
+    let stripped: Metadata = serde_json::from_value(value).unwrap();
+    assert!(stripped.node_capacity.is_empty());
+    assert_eq!(stripped.cluster_version(), 5);
+}
+
 /// ADR 0073 Phase 2 (P2-A): era-0 serialization is byte-identical to Phase 1's.
 /// `v1_metadata` carries no version record, so its current encoding must equal
 /// the frozen `v1.json` (pretty-printed, as the generator wrote it) exactly,
@@ -642,6 +919,8 @@ fn decodes_every_checked_in_metadata_fixture_to_its_per_version_value() {
             (1, Some("era")) => v1_era_metadata(),
             (1, Some("global")) => v1_global_metadata(),
             (1, Some("mrec")) => v1_mrec_metadata(),
+            (1, Some("capacity")) => v1_capacity_metadata(),
+            (1, Some("repair-settled")) => v1_repair_settled_metadata(),
             (other, _) => panic!(
                 "{name}: no expected value for metadata v{other} shape {shape:?}; add a match arm (and a \
                  frozen legacy decoder) before adding the fixture file"
@@ -1051,7 +1330,7 @@ use animus_storage::{MemoryEngine, MergeOp, StorageEngine};
 /// new variant a compile error there, and the scenario/fixture-directory
 /// tests below fail until this list, [`v1_entity`], and a checked-in fixture
 /// directory all cover it.
-const ALL_KINDS: [EntityKind; 19] = [
+const ALL_KINDS: [EntityKind; 20] = [
     EntityKind::Tablet,
     EntityKind::Member,
     EntityKind::Schema,
@@ -1071,6 +1350,7 @@ const ALL_KINDS: [EntityKind; 19] = [
     EntityKind::Export,
     EntityKind::Import,
     EntityKind::NodeVersion,
+    EntityKind::NodeCapacity,
 ];
 
 /// Exhaustive over [`EntityKind`] (no wildcard).
@@ -1095,6 +1375,7 @@ fn kind_witness(kind: EntityKind) -> usize {
         EntityKind::Export => 16,
         EntityKind::Import => 17,
         EntityKind::NodeVersion => 18,
+        EntityKind::NodeCapacity => 19,
     }
 }
 
@@ -1402,6 +1683,18 @@ fn v1_mirror_scenario() -> (Metadata, Live) {
             build: "2.0.0".to_string(),
         },
     );
+    // ADR 0079: the gated `NodeCapacity` kind (a non-default declared capacity).
+    run_mirror(
+        m,
+        l,
+        MetaCommand::SetNodeCapacity {
+            node: nid(1),
+            capacity: animus_control::Capacity {
+                weight: 200,
+                max_replicas: Some(500),
+            },
+        },
+    );
     (meta, live)
 }
 
@@ -1516,6 +1809,10 @@ fn v1_entity(kind: EntityKind, full: &Metadata) -> (Vec<u8>, Metadata) {
             m.node_versions
                 .insert(nid(1), full.node_versions[&nid(1)].clone());
             syskv::node_version_key(&nid(1))
+        }
+        EntityKind::NodeCapacity => {
+            m.node_capacity.insert(nid(1), full.node_capacity[&nid(1)]);
+            syskv::node_capacity_key(&nid(1))
         }
     };
     (key, m)
@@ -1816,7 +2113,7 @@ fn mirror_scenario_produces_a_live_row_of_every_entity_kind() {
             other => panic!("{kind:?} key decodes to {other:?}"),
         }
     }
-    assert_eq!(seen.len(), 19, "ALL_KINDS must list every EntityKind");
+    assert_eq!(seen.len(), 20, "ALL_KINDS must list every EntityKind");
     // Any kind the scenario writes but ALL_KINDS forgot is caught here too.
     for key in live.keys() {
         if let Some(DecodedKey::Entity { kind, .. }) = syskv::decode_key(key) {

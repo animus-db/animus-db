@@ -39,13 +39,107 @@ pub struct Candidate {
     pub node: NodeId,
     /// The node's topology labels.
     pub labels: BTreeMap<String, String>,
+    /// The node's declared capacity (ADR 0079 section 1). Defaults to
+    /// [`Capacity::DEFAULT`] (weight 100, no ceiling), under which every
+    /// function in this crate behaves exactly as it did before capacity existed.
+    pub capacity: Capacity,
 }
 
 impl Candidate {
-    /// Build a candidate from a node id and its labels.
+    /// Build a candidate from a node id and its labels, with the default
+    /// capacity.
     pub fn new(node: NodeId, labels: BTreeMap<String, String>) -> Self {
-        Self { node, labels }
+        Self {
+            node,
+            labels,
+            capacity: Capacity::DEFAULT,
+        }
     }
+
+    /// The same candidate with a declared `capacity`.
+    #[must_use]
+    pub fn with_capacity(mut self, capacity: Capacity) -> Self {
+        self.capacity = capacity;
+        self
+    }
+}
+
+/// The weight a node that declares nothing has (ADR 0079 section 1).
+pub const DEFAULT_WEIGHT: u32 = 100;
+
+/// A node's declared capacity (ADR 0079 section 1).
+///
+/// `weight` is relative capacity (only ratios matter); a node's *fill* is
+/// `replicas / weight`, compared as an exact rational (cross-multiplied
+/// integers, never floating point, so every Raft replica computes the same
+/// answer). `max_replicas` is an absolute ceiling on hosted replicas: a node
+/// whose replica count is at or above it is never chosen as a destination.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Capacity {
+    /// Relative capacity. `0` is treated as `1` (a weightless node would
+    /// otherwise have an infinite fill).
+    pub weight: u32,
+    /// Absolute ceiling on replicas (voters and learners); `None` is unbounded.
+    pub max_replicas: Option<u32>,
+}
+
+impl Capacity {
+    /// Weight [`DEFAULT_WEIGHT`], no ceiling.
+    pub const DEFAULT: Capacity = Capacity {
+        weight: DEFAULT_WEIGHT,
+        max_replicas: None,
+    };
+
+    /// The weight actually used in comparisons (`weight`, at least 1).
+    pub fn effective_weight(&self) -> u64 {
+        u64::from(self.weight.max(1))
+    }
+
+    /// Whether a node holding `replicas` replicas is at (or above) its
+    /// ceiling, so no further replica may be placed on it.
+    pub fn is_full(&self, replicas: usize) -> bool {
+        self.max_replicas.is_some_and(|m| replicas >= m as usize)
+    }
+
+    /// Whether a node holding `replicas` replicas is strictly above its
+    /// ceiling (the cap was lowered): a rebalance source only.
+    pub fn is_over(&self, replicas: usize) -> bool {
+        self.max_replicas.is_some_and(|m| replicas > m as usize)
+    }
+}
+
+impl Default for Capacity {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// Compare `ca / wa` with `cb / wb` as exact rationals (cross-multiplication
+/// in `u128`; no overflow for any `usize` count and `u32` weight).
+fn fill_cmp(ca: usize, wa: u64, cb: usize, wb: u64) -> std::cmp::Ordering {
+    (ca as u128 * u128::from(wb)).cmp(&(cb as u128 * u128::from(wa)))
+}
+
+/// Drop from `eligible` every node at its `max_replicas` under `load` (a node
+/// absent from `load` counts `0`), **except** a node already in `current`:
+/// capacity never shrinks a set (ADR 0079 section 1, rule 3).
+fn drop_full(
+    eligible: Vec<(NodeId, Domain)>,
+    candidates: &[Candidate],
+    load: &BTreeMap<NodeId, usize>,
+    current: &[NodeId],
+) -> Vec<(NodeId, Domain)> {
+    if candidates.iter().all(|c| c.capacity.max_replicas.is_none()) {
+        return eligible;
+    }
+    eligible
+        .into_iter()
+        .filter(|(n, _)| {
+            current.contains(n)
+                || candidate_for(candidates, n)
+                    .is_none_or(|c| !c.capacity.is_full(load.get(n).copied().unwrap_or(0)))
+        })
+        .collect()
 }
 
 /// How replicas must spread across a topology dimension (a failure domain).
@@ -253,6 +347,12 @@ pub fn select_replicas(candidates: &[Candidate], policy: &PlacementPolicy) -> Re
 /// replica count (a node absent from `load` counts as `0`, so a fresh member
 /// is a genuine minimum, matching [`rebalance_step`]'s own seeding rule).
 ///
+/// **Capacity-aware (ADR 0079):** nodes are ordered by the exact fill they would
+/// have after one more replica, `(load + 1) / weight` (so a weight-200 node
+/// takes twice the replicas of a weight-100 one), and a node already at its
+/// `max_replicas` is not eligible (all-full yields `InsufficientCandidates`:
+/// the caller refuses the mint). Equal weights reproduce the old order exactly.
+///
 /// Deterministic: ties break by node id, and [`choose`]'s own
 /// least-loaded-domain-first greedy is unchanged — this only re-orders the
 /// candidate list it feeds from node-sorted to `(load, node)`-sorted.
@@ -264,14 +364,23 @@ pub fn select_replicas_balanced(
     policy: &PlacementPolicy,
     load: &BTreeMap<NodeId, usize>,
 ) -> Result<Vec<NodeId>> {
-    let mut eligible = eligible_domains(candidates, policy);
-    eligible.sort_by(|(n, _), (m, _)| {
-        let (ln, lm) = (
-            load.get(n).copied().unwrap_or(0),
-            load.get(m).copied().unwrap_or(0),
-        );
-        ln.cmp(&lm).then_with(|| n.cmp(m))
+    let eligible = drop_full(eligible_domains(candidates, policy), candidates, load, &[]);
+    let mut eligible: Vec<(NodeId, Domain, u64, usize)> = eligible
+        .into_iter()
+        .map(|(n, d)| {
+            let w = candidate_for(candidates, &n)
+                .map_or(u64::from(DEFAULT_WEIGHT), |c| c.capacity.effective_weight());
+            let l = load.get(&n).copied().unwrap_or(0);
+            (n, d, w, l)
+        })
+        .collect();
+    // Order by the fill each node would have after taking one more replica
+    // (`(load + 1) / weight`, exact), then node id. With equal weights this is
+    // the old `(load, node)` order.
+    eligible.sort_by(|(n, _, wn, ln), (m, _, wm, lm)| {
+        fill_cmp(ln + 1, *wn, lm + 1, *wm).then_with(|| n.cmp(m))
     });
+    let eligible: Vec<(NodeId, Domain)> = eligible.into_iter().map(|(n, d, _, _)| (n, d)).collect();
     choose(&eligible, &BTreeSet::new(), policy)
 }
 
@@ -292,7 +401,30 @@ pub fn replan(
     candidates: &[Candidate],
     policy: &PlacementPolicy,
 ) -> Result<Vec<NodeId>> {
-    let eligible = eligible_domains(candidates, policy);
+    replan_with_load(current, candidates, policy, &BTreeMap::new())
+}
+
+/// [`replan`] with the caller's per-node replica counts (`load`; absent = 0) so
+/// a candidate's `max_replicas` is honoured (ADR 0079 section 1, rule 3): a
+/// node at its ceiling is excluded from the pool, **except** that a node
+/// already holding a replica of this tablet keeps it (capacity never shrinks a
+/// set). Replacement choice is still by node id, exactly as [`replan`]: weights
+/// shape the mint and the rebalance, not violation-driven repair.
+///
+/// # Errors
+/// As [`replan`].
+pub fn replan_with_load(
+    current: &[NodeId],
+    candidates: &[Candidate],
+    policy: &PlacementPolicy,
+    load: &BTreeMap<NodeId, usize>,
+) -> Result<Vec<NodeId>> {
+    let eligible = drop_full(
+        eligible_domains(candidates, policy),
+        candidates,
+        load,
+        current,
+    );
     let eligible_ids: BTreeSet<NodeId> = eligible.iter().map(|(n, _)| n.clone()).collect();
     // Keep the survivors: current replicas that remain eligible.
     let keep: BTreeSet<NodeId> = current
@@ -358,7 +490,30 @@ pub fn replan_repair(
     candidates: &[Candidate],
     policy: &PlacementPolicy,
 ) -> Result<Vec<NodeId>> {
-    let eligible = eligible_domains(candidates, policy);
+    replan_repair_with_load(current, candidates, policy, &BTreeMap::new())
+}
+
+/// [`replan_repair`] with the caller's per-node replica counts, honouring
+/// `max_replicas` strictly (ADR 0079 section 1 and Maintainer decision Q3): a
+/// node at its ceiling is never chosen, even to restore the replication factor.
+/// Repair grows as far as the caps allow and the tablet stays under-replicated
+/// otherwise (the caller reports it). A node already holding a replica keeps it.
+///
+/// # Errors
+/// As [`replan_repair`].
+#[must_use = "the caller must propose the returned replica set for it to take effect"]
+pub fn replan_repair_with_load(
+    current: &[NodeId],
+    candidates: &[Candidate],
+    policy: &PlacementPolicy,
+    load: &BTreeMap<NodeId, usize>,
+) -> Result<Vec<NodeId>> {
+    let eligible = drop_full(
+        eligible_domains(candidates, policy),
+        candidates,
+        load,
+        current,
+    );
     let eligible_ids: BTreeSet<NodeId> = eligible.iter().map(|(n, _)| n.clone()).collect();
     let keep: BTreeSet<NodeId> = current
         .iter()
@@ -402,7 +557,28 @@ pub fn replan_pinned(
     candidates: &[Candidate],
     policy: &PlacementPolicy,
 ) -> Result<Vec<NodeId>> {
-    let eligible = eligible_domains(candidates, policy);
+    replan_pinned_with_load(current, candidates, policy, &BTreeMap::new())
+}
+
+/// [`replan_pinned`] with per-node replica counts: capacity is applied inside
+/// the pinned candidate set (ADR 0079), so a Region whose nodes are all at
+/// `max_replicas` yields [`PlacementError::InsufficientDomains`] and the
+/// replica waits.
+///
+/// # Errors
+/// As [`replan_pinned`].
+pub fn replan_pinned_with_load(
+    current: &[NodeId],
+    candidates: &[Candidate],
+    policy: &PlacementPolicy,
+    load: &BTreeMap<NodeId, usize>,
+) -> Result<Vec<NodeId>> {
+    let eligible = drop_full(
+        eligible_domains(candidates, policy),
+        candidates,
+        load,
+        current,
+    );
     let domain_of: BTreeMap<&NodeId, &Domain> = eligible.iter().map(|(n, d)| (n, d)).collect();
     let strict = policy.spread.as_ref().is_some_and(|s| s.strict);
     let mut keep: BTreeSet<NodeId> = BTreeSet::new();
@@ -452,6 +628,16 @@ pub fn replan_pinned(
 ///   spread. Return that move; at most **one** move per call (a deliberate
 ///   one-CAS-per-evaluation churn bound).
 ///
+/// **Capacity-aware (ADR 0079):** "load" is `fill = replicas / weight` (exact
+/// rational, [`Capacity`]); sources are ordered fill-descending and destinations
+/// fill-ascending (node id breaks ties), and a pair is considered only when the
+/// move strictly reduces the pair's larger fill, `(dst + 1) / w_dst < src /
+/// w_src` (equal weights: `src >= dst + 2`, i.e. exactly the rule above). A
+/// node at its `max_replicas` is never a destination; a node strictly above it
+/// (the ceiling was lowered) is a source for any destination with room. The
+/// terminal state (no spread, no binding ceiling, every pair movable) is within
+/// `1 / w_dst` of proportional for every pair.
+///
 /// Fully deterministic (only `BTreeMap`/`BTreeSet` + stable sorts, no clock/RNG),
 /// so it returns the identical move on every replica and under input permutation.
 #[must_use]
@@ -500,6 +686,7 @@ struct RebalanceState<'a, K> {
     /// Eligible tablets (current set satisfies the policy), sorted by `K`.
     eligible: Vec<(K, Vec<NodeId>, &'a PlacementPolicy)>,
     counts: BTreeMap<NodeId, usize>,
+    caps: BTreeMap<NodeId, Capacity>,
     /// node -> indices into `eligible` of the tablets with a replica on it.
     on_node: BTreeMap<NodeId, BTreeSet<usize>>,
 }
@@ -534,6 +721,7 @@ impl<'a, K: Ord + Copy> RebalanceState<'a, K> {
             candidates,
             eligible,
             counts,
+            caps: capacity_map(candidates),
             on_node,
         }
     }
@@ -546,8 +734,8 @@ impl<'a, K: Ord + Copy> RebalanceState<'a, K> {
         let mut sources: Vec<(NodeId, usize)> =
             self.counts.iter().map(|(n, &c)| (n.clone(), c)).collect();
         let mut dests = sources.clone();
-        sources.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        dests.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        sort_by_fill(&mut sources, &self.caps, true);
+        sort_by_fill(&mut dests, &self.caps, false);
 
         for (src, src_count) in &sources {
             let Some(on_src) = self.on_node.get(src) else {
@@ -555,7 +743,7 @@ impl<'a, K: Ord + Copy> RebalanceState<'a, K> {
             };
             for (dst, dst_count) in &dests {
                 // Only a pair whose imbalance a single move strictly reduces.
-                if src == dst || *src_count < dst_count + 2 {
+                if !pair_movable(src, *src_count, dst, *dst_count, &self.caps) {
                     continue;
                 }
                 let Some(dst_cand) = candidate_for(candidates, dst) else {
@@ -642,13 +830,14 @@ pub fn rebalance_step_reference<K: Ord + Copy>(
     // Sources most-loaded first; destinations least-loaded first (id-asc ties).
     let mut sources: Vec<(NodeId, usize)> = counts.iter().map(|(n, &c)| (n.clone(), c)).collect();
     let mut dests = sources.clone();
-    sources.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    dests.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    let caps = capacity_map(candidates);
+    sort_by_fill(&mut sources, &caps, true);
+    sort_by_fill(&mut dests, &caps, false);
 
     for (src, src_count) in &sources {
         for (dst, dst_count) in &dests {
             // Only a pair whose imbalance a single move strictly reduces.
-            if src == dst || *src_count < dst_count + 2 {
+            if !pair_movable(src, *src_count, dst, *dst_count, &caps) {
                 continue;
             }
             for (k, replicas, policy) in &eligible {
@@ -681,6 +870,60 @@ pub fn rebalance_step_reference<K: Ord + Copy>(
         }
     }
     None
+}
+
+/// Each candidate's capacity by node id (the first entry wins on a duplicate id,
+/// like [`candidate_for`]).
+fn capacity_map(candidates: &[Candidate]) -> BTreeMap<NodeId, Capacity> {
+    let mut m = BTreeMap::new();
+    for c in candidates {
+        m.entry(c.node.clone()).or_insert(c.capacity);
+    }
+    m
+}
+
+/// Sort `(node, count)` pairs by fill: highest first (`desc`) or lowest first,
+/// node id ascending on ties. Equal weights reduce to `(count, node)`.
+fn sort_by_fill(v: &mut [(NodeId, usize)], caps: &BTreeMap<NodeId, Capacity>, desc: bool) {
+    let w = |n: &NodeId| {
+        caps.get(n)
+            .map_or(u64::from(DEFAULT_WEIGHT), |c| c.effective_weight())
+    };
+    v.sort_by(|a, b| {
+        let o = fill_cmp(a.1, w(&a.0), b.1, w(&b.0));
+        (if desc { o.reverse() } else { o }).then_with(|| a.0.cmp(&b.0))
+    });
+}
+
+/// Whether moving one replica `src` -> `dst` is worth considering (ADR 0079
+/// rule 4/5): `dst` is not at its ceiling, and either the move strictly
+/// reduces the pair's larger fill (`(dst+1)/w_dst < src/w_src`; with equal
+/// weights exactly `src >= dst + 2`) or `src` is over its ceiling (a drain).
+/// Both kinds strictly decrease `(total overage, descending fill vector)`
+/// lexicographically, so repeated application terminates.
+fn pair_movable(
+    src: &NodeId,
+    src_count: usize,
+    dst: &NodeId,
+    dst_count: usize,
+    caps: &BTreeMap<NodeId, Capacity>,
+) -> bool {
+    if src == dst {
+        return false;
+    }
+    let cap = |n: &NodeId| caps.get(n).copied().unwrap_or(Capacity::DEFAULT);
+    let (sc, dc) = (cap(src), cap(dst));
+    if dc.is_full(dst_count) {
+        return false;
+    }
+    sc.is_over(src_count)
+        || fill_cmp(
+            dst_count + 1,
+            dc.effective_weight(),
+            src_count,
+            sc.effective_weight(),
+        )
+        .is_lt()
 }
 
 /// The candidate for `node`, if it is in the pool.

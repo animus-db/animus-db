@@ -836,5 +836,6 @@ high-water mark of 32. The run hosts groups through each node's real host
 reconciler in the production configuration, not `group_density_cost`'s
 bare-node rig. The C-17 `sim_cluster_scale` density cells now also print the
 `election_*` and `campaign_*` metric lines. The C-03 thresholds and conclusion
-above are unchanged; a per-node cap on awake groups (density admission) is
-still a separate, future ADR. See ADR 0078's "As built (2026-10-11)" section.
+above are unchanged; a per-node cap on awake groups (density admission) landed as
+ADR 0079 (2026-10-14): a soft node-local cap with a wake queue that defers
+un-quiesce, plus a background-work budget and declared placement capacity. See ADR 0078's "As built (2026-10-11)" section.

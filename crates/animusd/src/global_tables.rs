@@ -298,6 +298,18 @@ pub(crate) async fn update_table_global<E: Env, R: RelayClient>(
         )));
     }
 
+    // ADR 0079 section 1 (region-pinned capacity): a pinned tablet needs one
+    // replica in every named Region, so a Region whose nodes are all at
+    // `max_replicas` refuses the (all-or-nothing) conversion, retryably.
+    let full = meta.regions_without_capacity(&regions);
+    if !full.is_empty() {
+        return Err(WireError::service_unavailable(format!(
+            "UpdateTable: no capacity to pin a replica in Region(s) {}: every active node there \
+             is at its max_replicas; raise a node's max_replicas or add a node; retry",
+            full.join(", ")
+        )));
+    }
+
     // The conversion.
     let spec = GlobalTableSpec {
         consistency: MultiRegionConsistency::Strong,

@@ -129,6 +129,7 @@ fn run_scenario(seed: u64) {
                 role: "combined".to_string(),
             },
             labels: BTreeMap::new(),
+            capacity: None,
         });
         sim.run_for(Duration::from_secs(2));
         last_seen = assert_delta_matches_full_fetch(

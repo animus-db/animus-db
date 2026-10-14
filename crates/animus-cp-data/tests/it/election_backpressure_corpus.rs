@@ -645,6 +645,7 @@ impl Rig {
             backpressure: ElectionBackpressure {
                 governor: self.governors[node].clone(),
                 monitor: self.monitors[node].clone(),
+                ..ElectionBackpressure::default()
             },
             ..HostedOptions::default()
         }
@@ -748,6 +749,7 @@ impl Rig {
         r.set_election_backpressure(ElectionBackpressure {
             governor: self.governors[i].clone(),
             monitor: self.monitors[i].clone(),
+            ..ElectionBackpressure::default()
         });
         r.set_host_stagger(self.mech.host_h, DEFAULT_HOST_SETTLE_TIMEOUT);
         if self.shuffled_hosting {

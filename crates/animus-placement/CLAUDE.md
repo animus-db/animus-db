@@ -52,6 +52,24 @@ membership and a placement policy, decide which nodes replicate a tablet.
     violates their policy (that's `replan`/reconcile's job), preserves residency,
     and never worsens spread (strict: keeps distinct domains; best-effort: never
     raises max-per-domain).
+  - **Capacity (ADR 0079 section 1, step 2; pure only, no metadata wiring yet).**
+    `Candidate.capacity: Capacity { weight, max_replicas }` (default 100 / none,
+    `Candidate::with_capacity`). `select_replicas_balanced` orders by the exact
+    fill after one more replica, `(load+1)/weight` (cross-multiplied `u128`, no
+    floats), and drops nodes at `max_replicas` (all full = `InsufficientCandidates`,
+    the caller refuses the mint). `replan_with_load` / `replan_repair_with_load` /
+    `replan_pinned_with_load` take the per-node replica counts and exclude nodes
+    at their ceiling, strictly, repair included (repair waits, ADR 0079 Q3),
+    except a node already in `current` (capacity never shrinks a set); the
+    load-less `replan*` delegate with an empty load map. Replacement choice stays
+    node-id order (weights shape the mint and the rebalance). `rebalance_*`
+    compare fill, never move onto a node at its ceiling, and treat a node above
+    its ceiling as a drain-only source. Termination: `(total overage, descending
+    fill vector)` strictly decreases lexicographically. **Equal weights are
+    byte-identical to the old count-based behaviour**; `tests/it/capacity.rs`
+    pins that against an independent copy of the pre-capacity algorithm (the
+    in-crate `rebalance_step_reference` is weighted too, so it no longer is that
+    oracle on its own).
   - `PlacementError` (`InsufficientCandidates`, `InsufficientDomains`).
 
 ## What's non-obvious
@@ -156,3 +174,12 @@ A cluster-default policy and operator-facing policy management are future work.
 inputs are exactly the state the earlier moves produce, so a caller that keeps
 it across ticks must fingerprint ALL of `tablets`, `candidates` and the policies
 and drop the plan on any unpredicted change. The crate stays stateless.
+
+## Who feeds capacity (ADR 0079 step 3)
+
+`animus-control` builds `Candidate`s with `.with_capacity(..)` only from
+`Metadata::effective_capacities()` (empty until `Gate::NodeCapacity` is open) and
+calls the `*_with_load` forms only when that map is non-empty, with
+`replica_load(tablets)` (every tablet's replicas, voters and learners) as `load`.
+This crate stays gate-blind; it must keep returning today's output for equal
+default capacities.

@@ -97,7 +97,20 @@
 //!   finalize to 4 the same decision on a frozen group is a sealed no-op
 //!   (the record stays `Pending`, identically on every replica);
 //!
+//! - `release4_to_release5_node_capacity_gate`: the fourth real gate (`Gate::
+//!   NodeCapacity`, cluster version 5, ADR 0079): the data-only node's own
+//!   capacity-sync task (production's `ClientCtx::sync_node_capacity`) is
+//!   running with a non-default capacity from before the gate opens. Below it
+//!   (even half-rolled to `Release(5)`, the finalize refused) nothing is
+//!   proposed or applied; the finalize to 5 opens the gate mid-run and the same
+//!   task completes, the capacity landing on every replica;
+//! - `negative_control_node_capacity_gate_emitted_early` (N7): `SetNodeCapacity`
+//!   appended ungated at version 4 with a `Release(4)` voter; the oracle MUST
+//!   report the capped rejection at exactly that voter, wedged and never
+//!   appended, and the capacity applied before its gate on the others.
+//!
 //! # Not covered
+//!
 //!
 //! - Roll orders / leader kills over `Release(1) -> Release(2)`: the pure
 //!   tier covers the per-node matrix; the ladder covers the finalize flow.
@@ -105,6 +118,7 @@
 //! Each cell runs on its own OS thread under a wall-clock watchdog
 //! ([`CELL_WATCHDOG`], a bound on a hang, never a verdict).
 
+use animus_env::EnvExt as _;
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -170,6 +184,12 @@ enum Kind {
     /// decision landing on a sealed range applies as before until the gate
     /// opens, as a sealed no-op after.
     TxnSealGate,
+    /// Release(4) -> Release(5) over `Gate::NodeCapacity` (ADR 0079): a node's
+    /// declared capacity is held back until the gate opens mid-run, then lands
+    /// on every replica.
+    NodeCapacityGate,
+    /// N7: `SetNodeCapacity` emitted ungated with a Release(4) voter.
+    NodeCapacityGateNegative,
 }
 
 /// The three ladder negative controls (ADR 0073 section 7).
@@ -259,6 +279,14 @@ fn cells() -> Vec<Cell> {
             Kind::MrecGateNegative,
         ),
         cell("release3_to_release4_txn_seal_gate", Kind::TxnSealGate),
+        cell(
+            "release4_to_release5_node_capacity_gate",
+            Kind::NodeCapacityGate,
+        ),
+        cell(
+            "negative_control_node_capacity_gate_emitted_early",
+            Kind::NodeCapacityGateNegative,
+        ),
     ]
 }
 
@@ -368,6 +396,8 @@ fn run(c: &Cell) -> Verdict {
         Kind::MrecGate => run_mrec_gate(c),
         Kind::MrecGateNegative => run_mrec_negative(c),
         Kind::TxnSealGate => run_txn_seal_gate(c),
+        Kind::NodeCapacityGate => run_node_capacity_gate(c),
+        Kind::NodeCapacityGateNegative => run_node_capacity_negative(c),
         _ => run_roll(c),
     }
 }
@@ -414,6 +444,17 @@ pub(super) fn instant_violations(cluster: &SimCluster, delivery: bool) -> Vec<St
                     ));
                 }
             }
+        }
+    }
+    // ADR 0079: a declared node capacity is applied only once the cluster
+    // version reached 5 (`Gate::NodeCapacity`).
+    for n in CONTROL {
+        let m = cluster.metadata(n);
+        if m.cluster_version() < 5 && !m.node_capacity.is_empty() {
+            v.push(format!(
+                "gate applied early: node {n} holds a node capacity at cluster version {}",
+                m.cluster_version()
+            ));
         }
     }
     // ADR 0075 G-d: an MREC spec is applied only once the cluster version
@@ -672,7 +713,9 @@ fn run_roll(c: &Cell) -> Verdict {
         | Kind::GlobalGateNegative
         | Kind::MrecGate
         | Kind::MrecGateNegative
-        | Kind::TxnSealGate => unreachable!(),
+        | Kind::TxnSealGate
+        | Kind::NodeCapacityGate
+        | Kind::NodeCapacityGateNegative => unreachable!(),
     }
 
     // Liveness: the era starts once the last node is B2, every node recorded.
@@ -1863,6 +1906,221 @@ fn run_txn_seal_gate(c: &Cell) -> Verdict {
     verdict_of(c, w.violations, false)
 }
 
+// ---------------------------------------------------------------------------
+// The fourth real gate: `Gate::NodeCapacity` (cluster version 5, ADR 0079)
+// ---------------------------------------------------------------------------
+
+fn roll_to_release5(cluster: &mut SimCluster, w: &mut Watch, nodes: &[u64]) {
+    for &n in nodes {
+        cluster.set_binary_profile(n, BinaryProfile::Release(5));
+        cluster.set_node_version(n, Some(VersionRange::new(1, 5)));
+        w.run(cluster, Duration::from_millis(500));
+    }
+}
+
+/// Every node recorded at exactly `[1, hi]` on every replica.
+fn all_recorded_at(cluster: &mut SimCluster, w: &mut Watch, hi: u32) -> bool {
+    converge(cluster, |c| {
+        w.sample(c);
+        (0..NODES).all(|n| {
+            c.metadata(n)
+                .node_versions
+                .values()
+                .all(|v| v.range == VersionRange::new(1, hi))
+                && c.metadata(n).node_versions.len() == NODES as usize
+        })
+    })
+}
+
+/// The cluster finalized at 4 (every node `Release(4)`), the setup both
+/// capacity cells share: the ladder 2, 3, 4 walked with the earlier rolls.
+fn capacity_setup(cluster: &mut SimCluster, w: &mut Watch) {
+    mrec_setup(cluster, w);
+    roll_to_release3(cluster, w, &[0, 1, 2, DATA]);
+    if !all_recorded_at(cluster, w, 3) {
+        w.violations
+            .push("the [1,3] records never landed on every node".into());
+    }
+    let l = control_leader(cluster);
+    let (status, body) = finalize(cluster, l, r#"{"to":3,"expected":2}"#);
+    if status != 200 {
+        w.violations
+            .push(format!("finalize 2 -> 3: {status} {body}"));
+    }
+    roll_to_release4(cluster, w, &[0, 1, 2, DATA]);
+    if !all_recorded_at(cluster, w, 4) {
+        w.violations
+            .push("the [1,4] records never landed on every node".into());
+    }
+    let l = control_leader(cluster);
+    let (status, body) = finalize(cluster, l, r#"{"to":4,"expected":3}"#);
+    if status != 200 {
+        w.violations
+            .push(format!("finalize 3 -> 4: {status} {body}"));
+    }
+    if !converge(cluster, |c| {
+        w.sample(c);
+        (0..NODES).all(|n| c.metadata(n).cluster_version() == 4)
+    }) {
+        w.violations
+            .push("cluster version 4 never reached on every node".into());
+    }
+}
+
+const DECLARED: animus_control::Capacity = animus_control::Capacity {
+    weight: 300,
+    max_replicas: Some(500),
+};
+
+/// Roll `Release(4)` -> `Release(5)` while the data-only node's own
+/// capacity-sync task (production's `ClientCtx::sync_node_capacity`) is
+/// already running with a non-default configured capacity. Below the gate --
+/// even with most nodes `Release(5)` and the finalize refused by name -- the
+/// task proposes nothing: no replica holds a capacity and no gate is violated.
+/// The gate then opens mid-run (the finalize to 5) and the same task completes:
+/// the capacity lands on every replica (the data-only mirror included), the
+/// placement view reads it, and an undeclared node stays at the default.
+fn run_node_capacity_gate(c: &Cell) -> Verdict {
+    use animus_control::version::Gate;
+    let mut cluster = light_cluster(c.seed);
+    let mut w = Watch::new(true);
+    capacity_setup(&mut cluster, &mut w);
+    if (0..NODES).any(|n| cluster.features(n).is_open(Gate::NodeCapacity)) {
+        w.violations
+            .push("NodeCapacity open before the finalize".into());
+    }
+    // The sync task starts now, before the gate: it must wait, not propose.
+    let done = Arc::new(Mutex::new(false));
+    let flag = done.clone();
+    let handle = cluster.handle();
+    handle.env(DATA).spawn_task(async move {
+        handle.sync_node_capacity(DATA, nid(DATA), DECLARED).await;
+        *flag.lock().expect("flag") = true;
+    });
+    // Half-rolled: nodes 0, 1 and the data node are Release(5), node 2 is not.
+    roll_to_release5(&mut cluster, &mut w, &[0, 1, DATA]);
+    let leader = control_leader(&mut cluster);
+    let (status, body) = finalize(&mut cluster, leader, r#"{"to":5,"expected":4}"#);
+    if status == 200 {
+        w.violations.push(format!(
+            "a finalize to 5 was accepted with a [1,4] node: {body}"
+        ));
+    }
+    w.run(&mut cluster, Duration::from_secs(8));
+    if *done.lock().expect("flag") {
+        w.violations
+            .push("the sync task finished below the gate".into());
+    }
+    if (0..NODES).any(|n| !cluster.metadata(n).node_capacity.is_empty()) {
+        w.violations
+            .push("a capacity was applied below the gate".into());
+    }
+    // Everyone rolls; the finalize to 5 opens the gate on every node.
+    roll_to_release5(&mut cluster, &mut w, &[OLD]);
+    if !all_recorded_at(&mut cluster, &mut w, 5) {
+        w.violations
+            .push("the [1,5] records never landed on every node".into());
+    }
+    let l = control_leader(&mut cluster);
+    let (status, body) = finalize(&mut cluster, l, r#"{"to":5,"expected":4}"#);
+    if status != 200 {
+        w.violations
+            .push(format!("finalize 4 -> 5: {status} {body}"));
+    }
+    if !converge(&mut cluster, |c| {
+        w.sample(c);
+        (0..NODES).all(|n| c.features(n).is_open(Gate::NodeCapacity))
+    }) {
+        w.violations
+            .push("NodeCapacity never opened on every node".into());
+    }
+    // Mid-run opening: the task that was already waiting completes.
+    if !converge(&mut cluster, |c| {
+        w.sample(c);
+        (0..NODES).all(|n| c.metadata(n).node_capacity.get(&nid(DATA)) == Some(&DECLARED))
+    }) {
+        w.violations
+            .push("the declared capacity never landed on every replica".into());
+    }
+    w.run(&mut cluster, Duration::from_secs(2));
+    if !*done.lock().expect("flag") {
+        w.violations
+            .push("the sync task never completed after the gate opened".into());
+    }
+    for n in 0..NODES {
+        let m = cluster.metadata(n);
+        if m.placement_capacity(&nid(DATA)) != DECLARED
+            || m.placement_capacity(&nid(0)) != animus_control::Capacity::DEFAULT
+            || m.node_capacity.len() != 1
+        {
+            w.violations.push(format!(
+                "node {n}: placement capacity wrong: {:?}",
+                m.node_capacity
+            ));
+        }
+    }
+    w.sample(&cluster);
+    verdict_of(c, w.violations, false)
+}
+
+/// N7: `SetNodeCapacity` appended ungated at version 4 with a `Release(4)`
+/// voter. The oracle MUST report the capped rejection at exactly that voter
+/// (wedged, never appended) and the capacity applied before its gate on the
+/// others.
+fn run_node_capacity_negative(c: &Cell) -> Verdict {
+    let mut cluster = light_cluster(c.seed);
+    let mut w = Watch::new(true);
+    capacity_setup(&mut cluster, &mut w);
+    let others: Vec<u64> = (0..NODES).filter(|&n| n != OLD).collect();
+    roll_to_release5(&mut cluster, &mut w, &others);
+    let setup = std::mem::take(&mut w.violations);
+    if control_leader(&mut cluster) == OLD {
+        let _ = cluster.transfer_leadership(OLD, 0);
+        w.run(&mut cluster, Duration::from_secs(2));
+    }
+    let mut v: Vec<String> = setup;
+    if control_leader(&mut cluster) == OLD {
+        v.push("could not move leadership off the Release(4) node".into());
+    }
+    let pre = instant_violations(&cluster, true);
+    if !pre.is_empty() {
+        v.push(format!("violations before the bad emit: {pre:?}"));
+    }
+    let pre_log = cluster.control_last_log_index(OLD);
+    let accepted = cluster.propose_meta_ungated(MetaCommand::SetNodeCapacity {
+        node: nid(DATA),
+        capacity: DECLARED,
+    });
+    if !matches!(accepted, ProposeResult::Accepted { .. }) {
+        v.push(format!("the bad emit was not accepted: {accepted:?}"));
+    }
+    w.run(&mut cluster, Duration::from_secs(6));
+    let wedged = wedged_settled(&mut cluster, OLD);
+    if wedged != vec![OLD] {
+        v.push(format!("expected only node {OLD} wedged, got {wedged:?}"));
+    }
+    let cap_fired = w.violations.iter().any(|s| {
+        s.starts_with(&format!("delivery: node {OLD} (Release(4))")) && s.contains("NodeCapacity")
+    });
+    if !cap_fired {
+        v.push(format!(
+            "the cap never rejected the NodeCapacity value: {:?}",
+            w.violations
+        ));
+    }
+    if !w
+        .violations
+        .iter()
+        .any(|s| s.starts_with("gate applied early"))
+    {
+        v.push("the early capacity application went unnoticed".into());
+    }
+    if cluster.control_last_log_index(OLD) != pre_log {
+        v.push("the Release(4) replica appended the NodeCapacity value".into());
+    }
+    verdict_of(c, v, cap_fired)
+}
+
 /// A Phase 1 binary joining after the era is refused at the seed's handshake
 /// (counted, never a member); the cluster is unaffected; a versioned joiner
 /// through the same seed is admitted and recorded. `via_data` dials the
@@ -2197,6 +2455,16 @@ fn sim_cluster_mixed_version_corpus_txn_seal_gate() {
 }
 
 #[test]
+fn sim_cluster_mixed_version_corpus_node_capacity_gate() {
+    run_family("release4_to_release5_node_capacity_gate");
+}
+
+#[test]
+fn sim_cluster_mixed_version_corpus_negative_control_node_capacity_gate() {
+    run_family("negative_control_node_capacity_gate_emitted_early");
+}
+
+#[test]
 fn sim_cluster_mixed_version_cell_names_and_seeds_are_unique() {
     let cs = corpus::seed_expand(cells(), 3);
     let names: BTreeSet<_> = cs.iter().map(|c| c.name.clone()).collect();
@@ -2222,6 +2490,8 @@ fn sim_cluster_mixed_version_cell_names_and_seeds_are_unique() {
         "release2_to_release3_mrec_gate",
         "negative_control_mrec_gate_emitted_early",
         "release3_to_release4_txn_seal_gate",
+        "release4_to_release5_node_capacity_gate",
+        "negative_control_node_capacity_gate_emitted_early",
     ] {
         assert!(
             cells().iter().any(|c| c.name.starts_with(prefix)),

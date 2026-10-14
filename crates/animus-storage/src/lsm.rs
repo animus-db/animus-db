@@ -561,6 +561,36 @@ impl Drop for InFlightGuard {
     }
 }
 
+/// Admission for background compaction runs (ADR 0079 layer 3): a node-wide
+/// pool bounds how many compactions run at once across every engine on the
+/// node. The engine knows nothing about pools; it asks this gate before it
+/// starts a run and holds the returned permit until the run ends (RAII, so an
+/// error, a cancelled future or a dropped engine all return it).
+///
+/// Installed with [`LsmEngine::set_compaction_gate`]; an engine with no gate
+/// (every test, the control keyspace) compacts exactly as before.
+pub trait CompactionGate: Send + Sync + 'static {
+    /// Ask for a compaction slot. `bypass` is the L0 safety valve (the engine's
+    /// L0 table count reached `2 x compaction_trigger`): a bypassing request is
+    /// **always** granted (and counted as over the cap), because an unbounded
+    /// L0 makes reads, and eventually writes, worse than one extra compaction.
+    /// `None` means "not now": the engine defers and re-checks after
+    /// [`COMPACTION_DEFER_RETRY`].
+    fn acquire(&self, bypass: bool) -> Option<CompactionPermit>;
+}
+
+/// Holds a compaction slot; dropping it returns the slot.
+pub type CompactionPermit = Box<dyn Send + 'static>;
+
+/// How long a deferred compaction waits before the engine re-asks its gate
+/// (the "maintenance tick" of ADR 0079's section 3; one background task per
+/// engine at most).
+pub const COMPACTION_DEFER_RETRY: Duration = Duration::from_millis(100);
+
+/// The L0 safety valve of [`CompactionGate`]: an engine whose L0 holds at
+/// least this many tables times `compaction_trigger` bypasses the pool.
+pub const COMPACTION_L0_BYPASS_FACTOR: usize = 2;
+
 /// An `Env`-agnostic **async mutex** serializing *maintenance* — memtable
 /// flushes and compactions — against each other. Exactly one flush **or**
 /// compaction runs at a time; overlapping ones would each read
@@ -681,6 +711,10 @@ pub struct LsmEngine<E: Env> {
     /// ENOSPC and was deferred (the write itself had already succeeded).
     /// Introspection for tests.
     maintenance_deferrals: Arc<AtomicU64>,
+    /// The node's compaction pool, if any (ADR 0079); set once after open.
+    compaction_gate: Arc<std::sync::OnceLock<Arc<dyn CompactionGate>>>,
+    /// Set while a deferred-compaction retry task is pending (at most one).
+    compaction_retry_scheduled: Arc<AtomicBool>,
 }
 
 impl<E: Env> LsmEngine<E> {
@@ -970,6 +1004,8 @@ impl<E: Env> LsmEngine<E> {
             background_error: Arc::new(Mutex::new(None)),
             background_full: Arc::new(AtomicBool::new(false)),
             maintenance_deferrals: Arc::new(AtomicU64::new(0)),
+            compaction_gate: Arc::new(std::sync::OnceLock::new()),
+            compaction_retry_scheduled: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -1277,9 +1313,75 @@ impl<E: Env> LsmEngine<E> {
         // Run compactions until none is due (bounded: each pass reduces a level's
         // table count, and deeper levels have larger budgets).
         while let Some(plan) = self.next_compaction() {
+            // ADR 0079: take a pool slot first (or bypass it at the L0 safety
+            // valve); no slot means defer and re-check on the maintenance tick.
+            let _permit = match self.compaction_gate.get() {
+                None => None,
+                Some(gate) => match gate.acquire(self.l0_overcap()) {
+                    Some(p) => Some(p),
+                    None => {
+                        self.schedule_compaction_retry();
+                        return Ok(());
+                    }
+                },
+            };
             self.run_compaction(plan).await?;
         }
         Ok(())
+    }
+
+    /// Install the node's compaction pool ([`CompactionGate`]). At most once;
+    /// a second call is ignored.
+    pub fn set_compaction_gate(&self, gate: Arc<dyn CompactionGate>) {
+        let _ = self.compaction_gate.set(gate);
+    }
+
+    /// Whether L0 holds `2 x compaction_trigger` tables or more: the pool's
+    /// safety valve ([`COMPACTION_L0_BYPASS_FACTOR`]).
+    fn l0_overcap(&self) -> bool {
+        let inner = self.lock();
+        inner
+            .manifest
+            .tables
+            .iter()
+            .filter(|t| t.level == 0)
+            .count()
+            >= COMPACTION_L0_BYPASS_FACTOR.saturating_mul(self.opts.compaction_trigger)
+    }
+
+    /// Number of L0 tables now. Test/introspection.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn l0_table_count(&self) -> usize {
+        self.lock()
+            .manifest
+            .tables
+            .iter()
+            .filter(|t| t.level == 0)
+            .count()
+    }
+
+    /// After a deferral, re-run maintenance once [`COMPACTION_DEFER_RETRY`] has
+    /// passed (one pending retry per engine; `env.sleep`, so it is virtual
+    /// time under `SimEnv`).
+    fn schedule_compaction_retry(&self) {
+        if self
+            .compaction_retry_scheduled
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let engine = self.clone();
+        self.env.spawn_task(async move {
+            engine.env.sleep(COMPACTION_DEFER_RETRY).await;
+            engine
+                .compaction_retry_scheduled
+                .store(false, Ordering::Release);
+            if let Err(e) = engine.maybe_flush_and_compact().await {
+                *engine.background_error.lock().expect("poisoned") = Some(e.to_string());
+            }
+        });
     }
 
     /// After a write is durable + applied: run flush/compaction **inline**

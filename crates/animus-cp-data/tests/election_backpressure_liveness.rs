@@ -54,16 +54,16 @@ use animus_cp_data::campaign_governor::{
     CampaignGovernor, DEFAULT_CAMPAIGN_MAX_INFLIGHT, ElectionBackpressure,
 };
 use animus_cp_data::host::{
-    DEFAULT_HOST_SETTLE_TIMEOUT, DEFAULT_HOST_UNSETTLED_MAX, MemoryTabletEngines, MetadataView,
-    Reconciler,
+    DEFAULT_HOST_SETTLE_TIMEOUT, DEFAULT_HOST_UNSETTLED_MAX, EngineFactory, MemoryTabletEngines,
+    MetadataView, Reconciler,
 };
 use animus_cp_data::load_monitor::{DEFAULT_LAG_STRETCH_MAX_X, LoadMonitor};
-use animus_env::{Env, NodeId, ProdEnv, nid};
-use animus_storage::MemoryEngine;
+use animus_env::{Disk, Env, NodeId, ProdEnv, nid};
+use animus_storage::{LsmEngine, LsmOptions, StorageEngine};
 use animus_tablet::{KeyRange, Tablet, TabletId};
 use tokio::time::{sleep, timeout};
 
-type KvNode = RaftKvNode<ProdEnv, MemoryEngine>;
+type KvNode<S> = RaftKvNode<ProdEnv, S>;
 
 /// Max tokio oversleep (microseconds) of a 10 ms sleeper since the last
 /// `diag` (issue #1297: how late does a task wake on this runtime?).
@@ -84,7 +84,7 @@ fn spawn_sched_probe() {
         }
     });
 }
-type Recon = Reconciler<ProdEnv, MemoryEngine>;
+type Recon<S> = Reconciler<ProdEnv, S>;
 
 const NODES: usize = 3;
 /// First tablet id (any value clear of the reserved streams).
@@ -124,22 +124,25 @@ fn unique_tmp_dir(tag: &str) -> std::path::PathBuf {
 
 /// One `ProdEnv` node: its reconciler (None once killed), the groups it
 /// hosts (filled by the reconciler's `on_host` hook) and its governor.
-struct Node {
-    recon: Option<Recon>,
-    hosted: Arc<Mutex<BTreeMap<TabletId, KvNode>>>,
+struct Node<S: StorageEngine + 'static> {
+    recon: Option<Recon<S>>,
+    hosted: Arc<Mutex<BTreeMap<TabletId, KvNode<S>>>>,
     governor: CampaignGovernor,
     next_tick: Instant,
 }
 
-struct Cluster {
-    nodes: Vec<Node>,
+struct Cluster<S: StorageEngine + 'static> {
+    nodes: Vec<Node<S>>,
     view: MetadataView,
     g: usize,
     dirs: Vec<std::path::PathBuf>,
 }
 
-impl Cluster {
-    async fn start(g: usize) -> Self {
+impl<S: StorageEngine + 'static> Cluster<S> {
+    async fn start<F: EngineFactory<S> + 'static>(
+        g: usize,
+        make_factory: impl Fn(&ProdEnv) -> F,
+    ) -> Self {
         let dirs: Vec<_> = (0..NODES)
             .map(|i| unique_tmp_dir(&format!("{g}-n{i}")))
             .collect();
@@ -173,11 +176,12 @@ impl Cluster {
         let nodes = envs
             .into_iter()
             .map(|env| {
-                let hosted: Arc<Mutex<BTreeMap<TabletId, KvNode>>> = Arc::default();
+                let hosted: Arc<Mutex<BTreeMap<TabletId, KvNode<S>>>> = Arc::default();
                 let on_host = Arc::clone(&hosted);
                 let on_down = Arc::clone(&hosted);
                 // The production node assembly (`animusd`'s
                 // `node_election_backpressure` + the reconciler setters).
+                let node_metrics = env.metrics();
                 let governor = CampaignGovernor::new(DEFAULT_CAMPAIGN_MAX_INFLIGHT, env.metrics());
                 let monitor = LoadMonitor::new(
                     &env,
@@ -187,11 +191,12 @@ impl Cluster {
                     Some(governor.clone()),
                 );
                 let id = env.node_id();
-                let mut recon: Recon = Reconciler::new(
+                let factory = make_factory(&env);
+                let mut recon: Recon<S> = Reconciler::new(
                     env,
-                    MemoryTabletEngines::new(),
+                    factory,
                     id,
-                    move |t, n: &KvNode| {
+                    move |t, n: &KvNode<S>| {
                         on_host.lock().expect("hosted").insert(t, n.clone());
                     },
                     move |t| {
@@ -204,9 +209,26 @@ impl Cluster {
                 if std::env::var("ANIMUS_BP_LIVE_QUIESCE").as_deref() != Ok("0") {
                     recon.enable_quiescence(QUIESCE_AFTER);
                 }
+                // `ANIMUS_BP_LIVE_AWAKE_MAX=A` turns ADR 0079's awake-group
+                // admission on at cap `A` per node (default off, as a node
+                // without `--cores`).
+                let awake = std::env::var("ANIMUS_BP_LIVE_AWAKE_MAX")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .filter(|a| *a > 0)
+                    .map(|a| {
+                        let adm = animus_cp_data::awake_admission::AwakeAdmission::new(
+                            a,
+                            node_metrics.clone(),
+                        );
+                        monitor.attach_awake(adm.clone());
+                        adm
+                    });
                 recon.set_election_backpressure(ElectionBackpressure {
                     governor: Some(governor.clone()),
                     monitor: Some(monitor),
+                    awake,
+                    budget: None,
                 });
                 recon.set_host_stagger(DEFAULT_HOST_UNSETTLED_MAX, DEFAULT_HOST_SETTLE_TIMEOUT);
                 Node {
@@ -245,7 +267,7 @@ impl Cluster {
         sleep(POLL).await;
     }
 
-    fn live(&self) -> impl Iterator<Item = &Node> {
+    fn live(&self) -> impl Iterator<Item = &Node<S>> {
         self.nodes.iter().filter(|n| n.recon.is_some())
     }
 
@@ -305,14 +327,14 @@ impl Cluster {
                 .lock()
                 .expect("hosted")
                 .get(&t)
-                .is_some_and(KvNode::is_leader)
+                .is_some_and(KvNode::<S>::is_leader)
         })
     }
 
     /// Kill node `i`: stop its reconciler and halt every group it hosts.
     async fn kill(&mut self, i: usize) {
         self.nodes[i].recon = None;
-        let groups: Vec<KvNode> = self.nodes[i]
+        let groups: Vec<KvNode<S>> = self.nodes[i]
             .hosted
             .lock()
             .expect("hosted")
@@ -323,7 +345,7 @@ impl Cluster {
             g.shutdown();
         }
         let dl = Instant::now() + Duration::from_secs(30);
-        while !groups.iter().all(KvNode::is_stopped) {
+        while !groups.iter().all(KvNode::<S>::is_stopped) {
             assert!(Instant::now() < dl, "killed node's groups never stopped");
             sleep(Duration::from_millis(20)).await;
         }
@@ -353,6 +375,31 @@ impl Cluster {
                 "{what}: only {led}/{} groups led after {bound:?} (max_term={max_term})",
                 self.g
             );
+            self.step().await;
+        }
+    }
+
+    /// [`await_all_led`](Self::await_all_led) without the assertion: `None`
+    /// when `bound` elapses first (density sweeps record non-convergence).
+    async fn await_all_led_soft(&mut self, what: &str, bound: Duration) -> Option<Duration> {
+        let t0 = Instant::now();
+        let mut last_log = Instant::now();
+        loop {
+            let (led, max_term, quiesced, hosted) = self.census();
+            if led == self.g {
+                return Some(t0.elapsed());
+            }
+            if last_log.elapsed() >= Duration::from_secs(10) {
+                println!(
+                    "BP-LIVE g={} phase={what} t_ms={} led={led} hosted={hosted} quiesced={quiesced} max_term={max_term}",
+                    self.g,
+                    t0.elapsed().as_millis()
+                );
+                last_log = Instant::now();
+            }
+            if t0.elapsed() >= bound {
+                return None;
+            }
             self.step().await;
         }
     }
@@ -485,7 +532,7 @@ impl Cluster {
     }
 }
 
-impl Drop for Cluster {
+impl<S: StorageEngine + 'static> Drop for Cluster<S> {
     fn drop(&mut self) {
         for n in &self.nodes {
             for g in n.hosted.lock().expect("hosted").values() {
@@ -517,7 +564,7 @@ fn lost_leader_bound(q: usize) -> Duration {
 async fn election_backpressure_liveness_g300() {
     timeout(Duration::from_secs(240), async {
         let g = 300;
-        let mut c = Cluster::start(g).await;
+        let mut c = Cluster::start(g, |_| MemoryTabletEngines::new()).await;
 
         // Host all at once (every tablet is in the first view) and converge.
         let took = c.await_all_led("host", ALL_LED_BOUND).await;
@@ -649,39 +696,236 @@ async fn election_backpressure_liveness_g300() {
     .expect("election_backpressure_liveness_g300 timed out");
 }
 
+/// Env knob parsed as `T`, else `default`.
+fn knob<T: std::str::FromStr>(name: &str, default: T) -> T {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// `(utime + stime ticks of this process, RSS kB, open fds, threads)` from
+/// `/proc/self` (density calibration, ADR 0079 step 1). Zeros off Linux.
+fn proc_sample() -> (u64, u64, usize, u64) {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    // Fields after the parenthesised comm: state is field 3; utime/stime are
+    // fields 14/15; num_threads is field 20.
+    let rest = stat.rsplit_once(')').map_or("", |(_, r)| r);
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    let num = |i: usize| f.get(i).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let ticks = num(11) + num(12);
+    let threads = num(17);
+    let rss_kb = std::fs::read_to_string("/proc/self/status")
+        .unwrap_or_default()
+        .lines()
+        .find_map(|l| l.strip_prefix("VmRSS:"))
+        .and_then(|v| v.split_whitespace().next()?.parse().ok())
+        .unwrap_or(0);
+    let fds = std::fs::read_dir("/proc/self/fd").map_or(0, Iterator::count);
+    (ticks, rss_kb, fds, threads)
+}
+
+/// `(files, bytes, sstables)` under the nodes' data directories.
+fn dir_stats(dirs: &[std::path::PathBuf]) -> (usize, u64, usize) {
+    let (mut files, mut bytes, mut ssts) = (0, 0, 0);
+    for d in dirs {
+        for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
+            files += 1;
+            bytes += e.metadata().map_or(0, |m| m.len());
+            if e.file_name().to_string_lossy().contains("-sst-") {
+                ssts += 1;
+            }
+        }
+    }
+    (files, bytes, ssts)
+}
+
+/// `LsmEngine<ProdEnv>` per-tablet factory: the shape of `animusd`'s
+/// `LsmTabletFactory` (prefix `db-t<id>-`, `LsmOptions::production()`), for the
+/// `ANIMUS_BP_LIVE_ENGINE=lsm` density calibration. Test-local, so the
+/// product code is untouched.
+#[derive(Clone)]
+struct LsmFactory {
+    env: ProdEnv,
+}
+
+fn lsm_prefix(t: TabletId) -> String {
+    format!("db-t{}-", t.0)
+}
+
+#[async_trait::async_trait]
+impl EngineFactory<LsmEngine<ProdEnv>> for LsmFactory {
+    async fn open(&self, t: TabletId) -> Result<LsmEngine<ProdEnv>, String> {
+        LsmEngine::open_with(self.env.clone(), &lsm_prefix(t), LsmOptions::production())
+            .await
+            .map_err(|e| e.to_string())
+    }
+    async fn probe(&self, t: TabletId) -> bool {
+        let p = lsm_prefix(t);
+        self.env
+            .list()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .any(|f| f.starts_with(&p))
+    }
+    async fn destroy(&self, t: TabletId) {
+        let p = lsm_prefix(t);
+        for f in self.env.list().await.unwrap_or_default() {
+            if f.starts_with(&p) {
+                let _ = self.env.remove(&f).await;
+            }
+        }
+    }
+    async fn flush_engine(&self, engine: &LsmEngine<ProdEnv>) -> Result<(), String> {
+        engine.flush_now().await.map_err(|e| e.to_string())
+    }
+    async fn clone_engine(
+        &self,
+        source: &LsmEngine<ProdEnv>,
+        target: TabletId,
+        keep: &[(Vec<u8>, Option<Vec<u8>>)],
+    ) -> Result<LsmEngine<ProdEnv>, String> {
+        source
+            .clone_to_filtered(lsm_prefix(target), keep)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+impl<S: StorageEngine + 'static> Cluster<S> {
+    /// Propose one put to `t`'s current leader; `true` iff a leader accepted
+    /// it (appended locally, ProposeResult::Accepted).
+    fn put_leader(&self, t: TabletId, key: Vec<u8>, value: Vec<u8>) -> bool {
+        for n in self.live() {
+            let hosted = n.hosted.lock().expect("hosted");
+            if let Some(g) = hosted.get(&t)
+                && g.is_leader()
+            {
+                return matches!(
+                    g.put(key, value),
+                    animus_control::raft::ProposeResult::Accepted { .. }
+                );
+            }
+        }
+        false
+    }
+}
+
 /// The issue #1199 acceptance (ADR 0078 Tier 3, ignored): 3000 RF3 groups on
 /// three nodes hosted at once reach "all led" and hold the led count for
 /// 120 s. Release build recommended (see the module doc).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+///
+/// Density calibration knobs (ADR 0079 step 1; all default to the historic
+/// behaviour): `ANIMUS_BP_LIVE_WORKERS` (runtime worker threads, 2),
+/// `ANIMUS_BP_LIVE_ENGINE=lsm` (`LsmEngine<ProdEnv>` per tablet, real files),
+/// `ANIMUS_BP_LIVE_WRITE_RPS` (client puts per second spread round-robin
+/// over the groups during the hold; 0), `ANIMUS_BP_LIVE_VALUE_BYTES` (128), `ANIMUS_BP_LIVE_WRITE_GROUPS` (all; a hot subset),
+/// `ANIMUS_BP_LIVE_HOLD_SECS` (120), `ANIMUS_BP_LIVE_CONVERGE_SECS` (600), `ANIMUS_BP_LIVE_ASSERT=0` (report the
+/// outcome in a `BP-LIVE verdict` line instead of failing, for sweeps). The
+/// hold lines carry `cpu_ticks`/`rss_kb`/`fds`/`threads`/`files`/`ssts` from
+/// `/proc/self`, so the test binary samples itself.
+#[test]
 #[ignore = "manual acceptance: 3000 groups, several minutes; run with --ignored --nocapture in release"]
-async fn density_repro_g3000_holds_led_count() {
-    let g: usize = std::env::var("ANIMUS_BP_LIVE_GROUPS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(3000);
-    let hold = Duration::from_secs(120);
-    timeout(Duration::from_secs(1500), async {
+fn density_repro_g3000_holds_led_count() {
+    let workers: usize = knob("ANIMUS_BP_LIVE_WORKERS", 2);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    if std::env::var("ANIMUS_BP_LIVE_ENGINE").as_deref() == Ok("lsm") {
+        rt.block_on(density_run(true, workers));
+    } else {
+        rt.block_on(density_run(false, workers));
+    }
+}
+
+async fn density_run(lsm: bool, workers: usize) {
+    if lsm {
+        let mut c = Cluster::start(knob("ANIMUS_BP_LIVE_GROUPS", 3000), |env: &ProdEnv| {
+            LsmFactory { env: env.clone() }
+        })
+        .await;
+        density_body(&mut c, true, workers).await;
+    } else {
+        let mut c = Cluster::start(knob("ANIMUS_BP_LIVE_GROUPS", 3000), |_| {
+            MemoryTabletEngines::new()
+        })
+        .await;
+        density_body(&mut c, false, workers).await;
+    }
+}
+
+async fn density_body<S: StorageEngine + 'static>(c: &mut Cluster<S>, lsm: bool, workers: usize) {
+    let g = c.g;
+    let hold = Duration::from_secs(knob("ANIMUS_BP_LIVE_HOLD_SECS", 120));
+    let rps: u64 = knob("ANIMUS_BP_LIVE_WRITE_RPS", 0);
+    let value_bytes: usize = knob("ANIMUS_BP_LIVE_VALUE_BYTES", 128);
+    let converge = Duration::from_secs(knob("ANIMUS_BP_LIVE_CONVERGE_SECS", 600));
+    let write_groups: usize = knob("ANIMUS_BP_LIVE_WRITE_GROUPS", g).clamp(1, g);
+    let assert_on = std::env::var("ANIMUS_BP_LIVE_ASSERT").as_deref() != Ok("0");
+    println!(
+        "BP-LIVE g={g} phase=config workers={workers} engine={} write_rps={rps} write_groups={write_groups} value_bytes={value_bytes} hold_s={}",
+        if lsm { "lsm" } else { "memory" },
+        hold.as_secs()
+    );
+    let verdict = timeout(Duration::from_secs(1500), async {
         spawn_sched_probe();
-        let mut c = Cluster::start(g).await;
-        let took = c.await_all_led("host", Duration::from_secs(600)).await;
-        let (_, max_term, _, _) = c.census();
+        let base = proc_sample();
+        let took = c.await_all_led_soft("host", converge).await;
+        let (led0, max_term, _, _) = c.census();
         let (hwm, _, deferred) = c.governor_stats();
+        let hosted_s = proc_sample();
         println!(
-            "BP-LIVE g={g} phase=all_led all_led_ms={} max_term={max_term} inflight_hwm={hwm} deferred={deferred}",
-            took.as_millis()
+            "BP-LIVE g={g} phase=all_led all_led_ms={} led={led0} max_term={max_term} inflight_hwm={hwm} deferred={deferred} \
+             host_cpu_ticks={} rss_kb={} fds={} threads={}",
+            took.map_or(-1, |t| t.as_millis() as i64),
+            hosted_s.0 - base.0,
+            hosted_s.1,
+            hosted_s.2,
+            hosted_s.3
         );
         // Hold: the led count must not fall for the whole window (the shape
-        // that decays without the mechanisms).
+        // that decays without the mechanisms). Optional client writes ride
+        // along, `rps` per second round-robin across the groups.
         let t0 = Instant::now();
+        let hold_base = proc_sample();
         let mut last_log = Instant::now();
         let mut min_led = g;
+        let (mut sent, mut accepted, mut next_group) = (0u64, 0u64, 0usize);
+        let mut budget = 0f64;
+        let mut last_tick = Instant::now();
+        let payload = vec![0xA5u8; value_bytes];
         while t0.elapsed() < hold {
             let (led, max_term, quiesced, hosted) = c.census();
             min_led = min_led.min(led);
+            if rps > 0 {
+                budget += rps as f64 * last_tick.elapsed().as_secs_f64();
+                last_tick = Instant::now();
+                while budget >= 1.0 {
+                    budget -= 1.0;
+                    let t = TabletId(STREAM0 + (next_group % write_groups) as u64);
+                    let key = format!("k{sent:012}").into_bytes();
+                    sent += 1;
+                    next_group += 1;
+                    if c.put_leader(t, key, payload.clone()) {
+                        accepted += 1;
+                    }
+                }
+            }
             if last_log.elapsed() >= Duration::from_secs(10) {
+                let s = proc_sample();
+                let (files, bytes, ssts) = if lsm { dir_stats(&c.dirs) } else { (0, 0, 0) };
                 println!(
-                    "BP-LIVE g={g} phase=hold t_s={} led={led} quiesced={quiesced} hosted={hosted} max_term={max_term}",
-                    t0.elapsed().as_secs()
+                    "BP-LIVE g={g} phase=hold t_s={} led={led} quiesced={quiesced} hosted={hosted} max_term={max_term} \
+                     cpu_ticks={} rss_kb={} fds={} threads={} writes_sent={sent} writes_accepted={accepted} \
+                     files={files} dir_bytes={bytes} ssts={ssts}",
+                    t0.elapsed().as_secs(),
+                    s.0 - hold_base.0,
+                    s.1,
+                    s.2,
+                    s.3
                 );
                 last_log = Instant::now();
             }
@@ -689,12 +933,31 @@ async fn density_repro_g3000_holds_led_count() {
         }
         let (led, max_term, _, _) = c.census();
         let (hwm, _, deferred) = c.governor_stats();
+        let end = proc_sample();
+        let hold_s = hold.as_secs_f64();
+        let (files, bytes, ssts) = if lsm { dir_stats(&c.dirs) } else { (0, 0, 0) };
         println!(
-            "BP-LIVE g={g} phase=held min_led={min_led} led={led} max_term={max_term} inflight_hwm={hwm} deferred={deferred}"
+            "BP-LIVE g={g} phase=held min_led={min_led} led={led} max_term={max_term} inflight_hwm={hwm} deferred={deferred} \
+             hold_cores={:.3} rss_kb={} fds={} writes_sent={sent} writes_accepted={accepted} files={files} dir_bytes={bytes} ssts={ssts}",
+            (end.0 - hold_base.0) as f64 / 100.0 / hold_s,
+            end.1,
+            end.2
         );
-        assert_eq!(min_led, g, "the led count fell during the {hold:?} window");
-        assert!(hwm <= DEFAULT_CAMPAIGN_MAX_INFLIGHT, "inflight hwm {hwm} above K");
+        (took.is_some(), min_led, hwm)
     })
     .await
     .expect("density_repro_g3000_holds_led_count timed out");
+    let (converged, min_led, hwm) = verdict;
+    println!(
+        "BP-LIVE g={g} verdict converged={converged} min_led={min_led} held={}",
+        converged && min_led == g
+    );
+    if assert_on {
+        assert!(converged, "not every group led within the bound");
+        assert_eq!(min_led, g, "the led count fell during the {hold:?} window");
+        assert!(
+            hwm <= DEFAULT_CAMPAIGN_MAX_INFLIGHT,
+            "inflight hwm {hwm} above K"
+        );
+    }
 }

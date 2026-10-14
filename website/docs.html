@@ -319,7 +319,7 @@
       <p>
         Replica counts across nodes converge on their own: the control-plane leader moves one
         replica at a time until the difference between the busiest and quietest node is at most
-        one tablet. Adding a node is therefore all it takes to get data onto it — the same
+        one tablet (or, if nodes declare a placement weight, until each carries its share in proportion to it, never above a declared <code>max_replicas</code>). Adding a node is therefore all it takes to get data onto it — the same
         mechanism that relocates a freshly split tablet's children onto their final homes.
       </p>
     </section>
@@ -467,6 +467,7 @@
 <span class="c"># cluster version (ADR 0073 Phase 2)</span>
 <span class="p">$</span> <span class="k">animus cluster version &lt;admin-addr&gt; [--json]</span>
 <span class="p">$</span> <span class="k">animus cluster finalize &lt;leader-admin-addr&gt; [--to N] [--yes]</span>
+<span class="p">$</span> <span class="k">animus cluster capacity &lt;admin-addr&gt; [--json]</span>   <span class="c"># declared node weight / max replicas vs. actual replicas</span>
 
 <span class="c"># rolling upgrade supervisor (ADR 0073 Phase 3): you restart each node; the CLI orders, gates and waits</span>
 <span class="p">$</span> <span class="k">animus cluster roll plan &lt;admin-addr&gt; [--json]</span>     <span class="c"># the roll order; exits 1 if a precondition fails</span>

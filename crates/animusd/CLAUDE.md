@@ -5639,6 +5639,14 @@ ADR itself for the full design/rationale.
   kickoff contract as `restore_table_from_backup`: returns as soon as
   `BeginRestore` commits, with `backup_restore.rs`'s driver doing the
   actual seed/replay/activate/GSI-declare sequence in the background.
+- **`repair_settled.rs`** (ADR 0079 step 6) — every node's loop reports a
+  converged repair: for each led tablet whose group voters equal the `Metadata`
+  replica set with no learner and whose epoch is past `INITIAL`, it proposes
+  `MetaCommand::RepairSettled` (relayed; `is_relayable_command` arm), which sets
+  `Tablet::settled_epoch` and frees the control leader's repair-pacer slot.
+  Gated: emits nothing while `Metadata::capacity_gate_open()` is false. Generic
+  over `E`/`R` so `SimCluster` drives `repair_settled_tick` directly
+  (`sim_cluster_repair_settled`); the SimCluster does not spawn the loop.
 - **`split_placing_completion.rs`** (ADR 0062 §3) — the in-place split
   **directed-Placing completion loop**: a per-tablet, leader-side loop, the
   same "run everywhere, self-gate per tablet on `group.is_leader()`,
@@ -12182,6 +12190,17 @@ every hosted data-plane group; the control group never sees them.
 `/admin/health` shows `election_lag_ms`, `election_stretch_ms`,
 `campaigns_inflight`, `campaigns_queued` (advisory, never part of `ok`).
 
+`--cores N` / `--awake-max-per-core N` (ADR 0079 layer 2; `--config`/`--node`
+only, merged with `cluster_settings.cores` / `awake_max_per_core`) turn on the
+awake-group cap `A = awake_max_per_core (1500) x cores`. `--cores` is a
+**configured** number, never `available_parallelism`; unset = the cap is off and
+the node is byte-for-byte the pre-0079 driver; `--awake-max-per-core 0` also
+disables it. `node_election_backpressure(env, k, stretch_x, awake_max)` builds
+the `AwakeAdmission` beside the governor and attaches it to the monitor (no
+monitor = no lag feedback). `/admin/health` adds `awake`, `awake_max_effective`
+(0 = off), `wake_queue_depth`, `wake_deferred`, `overcap_wakes` (advisory).
+Mechanism and corpus: `crates/animus-cp-data/CLAUDE.md`, "Awake-group admission".
+
 `cluster_settings.host_unsettled_max` (additive; default 100; `0` disables the
 stagger) and `--host-unsettled-max N`, plus `cluster_settings.
 host_settle_timeout_ms` (default 600; `0` refused) and
@@ -12516,3 +12535,50 @@ Streams `seal_age`); retention rides in `StreamSealKnobs::pitr_retention` into
 `run_node_control_with_stores` take it as a parameter (control-only has no
 seal knobs). A new `StreamSealKnobs { .. }` literal needs `..Default::default()`
 (or all four fields in a `const`).
+
+## Per-node capacity (ADR 0079 step 3, `Gate::NodeCapacity`, cluster version 5)
+
+- Settings: `--node-weight N` / `--node-max-replicas N` (`--config`/`--node` only,
+  merged with `cluster_settings.node_weight` / `node_max_replicas`, a both-sides
+  set is a conflict; `0` weight is refused) -> `ClusterConfig::node_capacity()` ->
+  `Bound{,Data}Node::with_node_capacity` -> `spawn_common_tail`.
+- **Advertising is a loop, not a registration field.** After the self-registration
+  task settles it runs `ClientCtx::sync_node_capacity` (`schema.rs`): returns at
+  once if `Metadata` already holds the configured value (always, for a cluster
+  that declares nothing); otherwise polls (`CAPACITY_SYNC_INTERVAL`) until the
+  node is a member and `Gate::NodeCapacity` is open on this node's features, then
+  `propose_and_await(SetNodeCapacity)`. Never propose through a closed gate
+  (`RaftNode::propose` debug-asserts). `register_node` still sends `capacity: None`.
+- `GET /admin/capacity` (`admin.rs::capacity_view`, `AdminHost::capacity_view`)
+  shows declared vs effective capacity and replica counts; `animus cluster capacity`.
+- Cells: `sim_cluster_mixed_version_corpus` `release4_to_release5_node_capacity_gate`
+  (the sync task is running before the gate opens mid-run) and
+  `negative_control_node_capacity_gate_emitted_early`; `SimClusterHandle::sync_node_capacity`
+  runs the production loop on a simulated node.
+
+## Capacity refusal and the Tier 2 density lines (ADR 0079 step 7)
+
+- `schema::zone_aware_initial_replicas` returns `Result<_, CapacityExhausted>` and
+  tries `Metadata::capacity_initial_replicas` first. `CreateTable` checks it
+  **before** committing the schema (no schema-without-tablet on refusal);
+  `provision_tablet` returns the `schema::CAPACITY_EXHAUSTED_REFUSAL` error at
+  once. `dynamo::internal` maps that prefix to `ServiceUnavailable` (503), so every
+  `internal(&e)` provisioning site is covered. `ImportTable`/`RestoreTable`
+  destinations still use `active_replicas_for_new_tablet` (first-N).
+- `sim_cluster::SimDensity::install()` turns the awake cap and the background pools
+  on for the current thread's `SimCluster` (nine constructors, six reconciler
+  sites, so no constructor parameter); the guard removes it. `sim_cluster_scale`'s
+  density / split-storm / node-loss cells use it and print `awake_hwm`,
+  `wake_deferred_total`, `bg_{snapshot,split,compaction}_hwm`,
+  `capacity_blocked_tablets`. The `DataRole` split pool is a separate
+  `BackgroundBudget` from the reconciler's (fixture simplification).
+- **Split pool: explicit splits wait, the sweeps skip (ADR 0079 step 5).**
+  `ClientCtx::trigger_split` (admin endpoint, `SplitTablet`, stream grow) queues FIFO on
+  `SplitPermits::admit_wait` for up to `SPLIT_WAIT_BOUND` (3 x `CLIENT_TIMEOUT`) before
+  `SPLIT_BUSY`; `trigger_split_nowait` (the two auto-split sweeps) never waits. The forwarded
+  `TriggerAutoSplit` arm waits only `FORWARDED_SPLIT_WAIT` (inside one relay hop) and
+  `grow_stream_tablet` re-asks on `SPLIT_BUSY`. Tests: `animus-cp-data` `split_permit_wait::`.
+- `auto_split_loop`'s bytes sweep carries a `pool_deferred` set: a tablet skipped
+  on a full split pool is evaluated later even if it has quiesced.
+- Wire test: `sim_cluster_cluster_version::create_table_is_refused_retryably_when_every_node_is_at_max_replicas`
+  (era -> finalize to 5 -> ceilings of 0 -> 503 -> raise -> 200).

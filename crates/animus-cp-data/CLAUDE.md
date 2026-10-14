@@ -3512,3 +3512,78 @@ backs the M5 negative control; never reachable in a release build path.
   capture driver keeps across ticks. A new reader of a version-ceiling
   (`get_at`/`scan_at`/`entries_at`) read must do the same, and a wrapper
   `StorageEngine` (e.g. `StallingEngine`) must forward `hold_version`.
+
+## Awake-group admission (ADR 0079 layer 2, step 4)
+
+`awake_admission.rs`: one `AwakeAdmission` per node (default off; `animusd` builds
+it only with `--cores`, `ElectionBackpressure.awake`, attached to the `LoadMonitor`
+by `attach_awake`). It bounds the node's **awake** (non-quiesced) data-plane
+replicas at `A = awake_max_per_core x cores` by deferring **bulk** wakes only.
+
+- **What is a bulk wake.** `RaftKvNode::wake_bulk()` (a `WakeSignal.bulk` flag
+  beside `pending`), called by the host reconciler for every hosted group whose
+  replica set touches a `Down` node (`host.rs`, was `wake()`). In the consensus
+  loop's wake arm a bulk wake of a quiesced **follower** asks
+  `try_admit_wake(stream, now, &awake_wake)`: admitted (slot reserved at once,
+  then `on_local_wake`) or **deferred** (stays quiesced, queued FIFO under
+  `(first_deferred_at, stream)`, woken by the queue callback, which re-raises
+  `bulk`). A queued group keeps its ticket on every re-ask (the reconciler
+  re-wakes each tick: the lost-wake backstop).
+- **Everything else is admitted over the cap and counted.** `RaftKvNode::wake()`
+  sets `WakeSignal.direct`, which wins over a coalesced `bulk` (a client wake of
+  a queued group must never be deferred: the first version lost it to a
+  same-iteration reconciler wake). A peer message, a propose and a campaign
+  un-quiesce inside the core; the loop reports every quiescence change
+  (`report`, end of iteration) and one that was not an admitted bulk wake and
+  lands past `A_eff` counts as `overcap`. Hosting registers awake and exempt
+  (`membership()` RAII guard, `deregister` on any exit).
+- **`A_eff`** is `A` through the SHARED `load_monitor::scale_by_lag` /
+  `lag_divisor` (30 ms halves, 100 ms quarters, min 1) -- the same function
+  `k_eff` now calls (equivalence test `k_eff_is_behaviour_identical_to_the_pre_
+  shared_helper_body` over a dense grid against the old body, verbatim).
+- **A leader cannot quiesce while a voter never catches up**
+  (`quiesce_entry_ok`), so with a node *killed* the groups a bulk wake admits stay
+  awake and the slots do not turn over. Hence the **lost-leader bypass**: the
+  reconciler (`host.rs`) calls `wake_bulk_leader_lost()` (`WakeSignal.leader_lost`)
+  when the replica's own `leader()` is in `view.down`; the wake arm then skips
+  `try_admit_wake` (the group wakes over the cap, `report` counts it overcap, the
+  campaign governor still paces its election). Down-follower-only groups stay
+  deferrable and may sit queued until repair replaces the dead voter. Never decide
+  this from the queue or the metadata alone: `leader()` is the only leader
+  knowledge a quiesced follower really has.
+- **Metrics:** `CpAwakeReplicas`, `CpAwakeMaxEffective`, `CpWakeQueueDepth`,
+  `CpWakeDeferred`, `CpWakeOvercap`; `/admin/health` shows them (advisory).
+- **Negative controls** are `AwakeFault::{HardCap, IgnoreLag, NoLostLeaderBypass}` (`#[doc(hidden)]`);
+  `HardCap` is acted on in the driver (`hard_refuses`: inbound peer messages and
+  the propose kick of a slot-less group are dropped).
+- **Corpus:** `tests/it/density_admission_corpus.rs` (`ANIMUS_DENSITY_SEEDS`),
+  its own rig on the real `Reconciler`; `AwakeStats::admit_awake_hwm` is the
+  oracle that bulk wakes alone never pass `A_eff` (`awake_hwm` also includes the
+  counted over-cap wakes). The lost-leader bound in cell 5 is **per campaign
+  attempt** (a split vote or a failed pre-vote round costs another attempt; the
+  cap-less rig misses ADR 0078's literal bound on some seeds too, #1306).
+
+## Background budget (ADR 0079 layer 3, step 5)
+
+`src/background_budget.rs`: node-local permit pools (snapshot send 2 / receive 2,
+learner catch-up 4, splits 1 on by default; compactions `max(1, cores/2)` only
+with `--cores`, else off; `0` = off). Class L, no gate. Permits are RAII; a pool
+that is full reaps idle-TTL'd permits lazily at the next acquire. The raftkv
+driver holds a per-group `BgFlow` (inbound refusal = drop the chunk unacked, the
+step 3 decision; outbound send permit). **A sender releases a send permit after
+`snapshot_unacked_bound` (2 x the snapshot heartbeat backoff cap, 64 ticks) with
+no ack and bars that peer for one more bound** — do not shorten it below the
+backoff, or a live receiver is starved of its retries. `animus-storage`'s
+`CompactionGate` is the engine-side hook (L0 bypass at `2 x compaction_trigger`).
+Corpus: `density_admission_corpus.rs` cells 6, 6b, 7, 8 and controls
+`control_bg_d`, `control_bg_d2`, `control_bg_e` (`ANIMUS_DENSITY_SEEDS`,
+`ANIMUS_DENSITY_CELL=<substring>`).
+
+## Cell 3b: absorbable overload (ADR 0079 step 7)
+
+`density_admission_corpus` `cell_3b_absorbable_overload_capped` sizes the CPU model
+at `1.5 x (G/N + A)` awake groups per survivor (`Rig::capacity_groups`), unlike cell
+3's `2A` which the lost-leader bypass already exceeds. The capped run must have no
+worse worst lag and no fewer groups led than the uncapped run. If it fails, read
+the detail line (lag, backlog, terms, `admit_awake_hwm`, over-cap wakes) before
+touching the bound: step 4's cell 3 was root-caused from exactly those counters.

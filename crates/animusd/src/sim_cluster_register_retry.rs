@@ -179,6 +179,7 @@ fn run_removed_node_is_not_resurrected(seed: u64) {
         node: nid(NEW_NODE),
         addrs: addrs(),
         labels: labels(),
+        capacity: None,
     });
     cluster.heal_all();
     poll(

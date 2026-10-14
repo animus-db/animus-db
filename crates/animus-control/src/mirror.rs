@@ -248,6 +248,12 @@ pub fn apply_and_derive_mirror(
         MetaCommand::RemoveMember { node } if meta.node_versions.contains_key(node)
     );
 
+    // `RemoveMember` also prunes the node's `node_capacity` row (ADR 0079).
+    let had_node_capacity = matches!(
+        command,
+        MetaCommand::RemoveMember { node } if meta.node_capacity.contains_key(node)
+    );
+
     // The first `ReportNodeVersion` starts the era by setting the stored
     // `cluster_version` to 1, which the mirror must carry too.
     let era_was_active = meta.versioning_active();
@@ -270,7 +276,8 @@ pub fn apply_and_derive_mirror(
             writes.push(put_json(syskv::tablet_key(*tablet), &meta.tablets[tablet]));
             writes.push(put_counter(NEXT_TABLET_ID_COUNTER, meta.next_tablet_id));
         }
-        MetaCommand::CasTabletReplicas { tablet, .. } => {
+        MetaCommand::CasTabletReplicas { tablet, .. }
+        | MetaCommand::RepairSettled { tablet, .. } => {
             writes.push(put_json(syskv::tablet_key(*tablet), &meta.tablets[tablet]));
         }
         MetaCommand::BeginSplitInPlace { parent, .. } => {
@@ -441,6 +448,16 @@ pub fn apply_and_derive_mirror(
             if had_node_version {
                 writes.push(KeyWrite::Delete(syskv::node_version_key(node)));
             }
+            if had_node_capacity {
+                writes.push(KeyWrite::Delete(syskv::node_capacity_key(node)));
+            }
+        }
+        MetaCommand::SetNodeCapacity { node, .. } => {
+            // Setting the default capacity removes the entry (canonical form).
+            match meta.node_capacity.get(node) {
+                Some(c) => writes.push(put_json(syskv::node_capacity_key(node), c)),
+                None => writes.push(KeyWrite::Delete(syskv::node_capacity_key(node))),
+            }
         }
         MetaCommand::ReportNodeVersion { node, .. } => {
             writes.push(put_json(
@@ -478,6 +495,11 @@ pub fn apply_and_derive_mirror(
                 syskv::node_addrs_key(node),
                 &meta.node_addrs[node],
             ));
+            // A registration may also have filled the node's declared
+            // capacity (ADR 0079); `Applied` with none set writes nothing.
+            if let Some(c) = meta.node_capacity.get(node) {
+                writes.push(put_json(syskv::node_capacity_key(node), c));
+            }
         }
         MetaCommand::SealStreamShard { tablet, epoch, .. } => {
             writes.push(put_json(
@@ -930,6 +952,11 @@ fn apply_put(meta: &mut Metadata, key: &[u8], value: &[u8]) {
                 serde_json::from_slice(value).expect("mirrored node-version value decodes");
             meta.node_versions.insert(decode_node_id(id), row);
         }
+        EntityKind::NodeCapacity => {
+            let row: animus_placement::Capacity =
+                serde_json::from_slice(value).expect("mirrored node-capacity value decodes");
+            meta.node_capacity.insert(decode_node_id(id), row);
+        }
         EntityKind::Import => {
             let import_id = String::from_utf8(id).expect("import id is UTF-8");
             let row: crate::meta::ImportRow =
@@ -1044,6 +1071,10 @@ fn apply_delete(meta: &mut Metadata, key: &[u8]) {
         EntityKind::NodeVersion => {
             // Reachable in practice — `RemoveMember` prunes the node's row.
             meta.node_versions.remove(&decode_node_id(id));
+        }
+        EntityKind::NodeCapacity => {
+            // Reachable: `RemoveMember`, or `SetNodeCapacity` back to default.
+            meta.node_capacity.remove(&decode_node_id(id));
         }
         EntityKind::Import => {
             // Never deleted in practice (no `DeleteImport` command exists,
@@ -1621,6 +1652,7 @@ mod tests {
             node: nid(910),
             addrs: addrs.clone(),
             labels: BTreeMap::new(),
+            capacity: None,
         };
         let (outcome, writes) = apply_and_derive_mirror(&mut meta, &command);
         assert_eq!(outcome, ApplyOutcome::Applied);
@@ -2702,6 +2734,7 @@ mod tests {
                     role: "combined".to_string(),
                 },
                 labels: BTreeMap::new(),
+                capacity: None,
             },
             MetaCommand::SetTableStream {
                 table: "orders".to_string(),
@@ -2966,6 +2999,7 @@ mod tests {
                 role: role.to_string(),
             },
             labels: BTreeMap::new(),
+            capacity: None,
         };
         let report = |n: u64, max: u32| MetaCommand::ReportNodeVersion {
             node: nid(n),

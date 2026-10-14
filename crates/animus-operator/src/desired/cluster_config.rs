@@ -176,6 +176,19 @@ pub struct ClusterSettings {
     pub host_unsettled_max: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_settle_timeout_ms: Option<u64>,
+    /// ADR 0079 section 1: this node's declared placement capacity, derived
+    /// from `spec.resources.requests` and overridden by `spec.nodeCapacity`
+    /// ([`derive_node_capacity`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_weight: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_max_replicas: Option<u32>,
+    /// ADR 0079 layers 2 and 3: the pod's configured core count, derived from
+    /// the CPU request and overridden by `spec.nodeCapacity.cores`
+    /// ([`derive_cores`]). The node derives the awake cap (`cores x 1500`) and
+    /// the compaction pool (`max(1, cores / 2)`) from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cores: Option<u32>,
     /// ADR 0075 section 5.4 (G-e): this cluster's MREC region name
     /// (`spec.region`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -300,6 +313,132 @@ pub fn build_cluster_config(name: &str, ns: &str, spec: &AnimusClusterSpec) -> C
     }
 }
 
+/// The per-replica memory budget of the `max_replicas` derivation (ADR 0079,
+/// `docs/density-measurements.md`): measured about 28 KB RSS per idle replica,
+/// so 64 KiB is a 2x margin.
+pub const REPLICA_MEMORY_BUDGET_BYTES: u64 = 64 * 1024;
+
+/// The temporary hosting-time cap on a derived `max_replicas` (ADR 0079
+/// calibration of 2026-10-13: with `LsmEngine` a node took about a minute to
+/// host 1000 groups and did not finish 2000, issue #1303). Drop this term
+/// once that defect is fixed.
+pub const DERIVED_MAX_REPLICAS_CAP: u64 = 1000;
+
+/// The weight a pod's CPU request earns: `max(1, millicores / 100)` (ADR 0079
+/// section 1), so a 4-core pod is 40 and a 16-core pod 160.
+#[must_use]
+pub fn weight_from_millicores(millicores: u64) -> u32 {
+    u32::try_from((millicores / 100).max(1)).unwrap_or(u32::MAX)
+}
+
+/// The replica ceiling a pod's memory request earns:
+/// `min(0.5 * memory / 64 KiB, 1000)`, at least 1. The `nofile / 2` term of the
+/// calibration doc is not applied: the operator cannot see a container's
+/// `nofile` limit (it is a runtime default, far above the 1000 cap).
+#[must_use]
+pub fn max_replicas_from_memory(memory_bytes: u64) -> u32 {
+    let by_memory = memory_bytes / 2 / REPLICA_MEMORY_BUDGET_BYTES;
+    u32::try_from(by_memory.clamp(1, DERIVED_MAX_REPLICAS_CAP)).unwrap_or(u32::MAX)
+}
+
+/// Parse a Kubernetes CPU quantity (`"2"`, `"500m"`, `"1.5"`) to millicores.
+/// `None` for anything it does not understand (the derivation then leaves the
+/// field unset rather than guessing).
+#[must_use]
+pub fn cpu_millicores(q: &str) -> Option<u64> {
+    let q = q.trim();
+    if let Some(m) = q.strip_suffix('m') {
+        return m.parse::<u64>().ok();
+    }
+    let cores: f64 = q.parse().ok()?;
+    if !cores.is_finite() || cores < 0.0 {
+        return None;
+    }
+    Some((cores * 1000.0).round() as u64)
+}
+
+/// Parse a Kubernetes memory quantity (`"4Gi"`, `"512Mi"`, `"1G"`, `"1048576"`)
+/// to bytes. `None` for anything it does not understand.
+#[must_use]
+pub fn memory_bytes(q: &str) -> Option<u64> {
+    let q = q.trim();
+    let split = q
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(q.len());
+    let (num, unit) = q.split_at(split);
+    let mult: f64 = match unit {
+        "" => 1.0,
+        "Ki" => 1024.0,
+        "Mi" => 1024.0 * 1024.0,
+        "Gi" => 1024.0 * 1024.0 * 1024.0,
+        "Ti" => 1024.0_f64.powi(4),
+        "k" => 1e3,
+        "M" => 1e6,
+        "G" => 1e9,
+        "T" => 1e12,
+        _ => return None,
+    };
+    let n: f64 = num.parse().ok()?;
+    if !n.is_finite() || n < 0.0 {
+        return None;
+    }
+    Some((n * mult) as u64)
+}
+
+/// The `(node_weight, node_max_replicas)` the operator renders into
+/// `cluster_settings` (ADR 0079 section 1). Each value is `spec.nodeCapacity`'s
+/// explicit override if set, else derived from `spec.resources.requests`
+/// (`cpu` -> weight, `memory` -> `max_replicas`), else `None` (the node default:
+/// weight 100, no ceiling). A spec with no `resources` and no `nodeCapacity`
+/// renders neither key, so an existing cluster's `cluster.json` is
+/// byte-identical.
+#[must_use]
+pub fn derive_node_capacity(spec: &AnimusClusterSpec) -> (Option<u32>, Option<u32>) {
+    let explicit = spec.node_capacity.as_ref();
+    let requests = spec.resources.as_ref().and_then(|r| r.requests.as_ref());
+    let weight = explicit
+        .and_then(|c| c.weight)
+        .filter(|w| *w > 0)
+        .or_else(|| {
+            let cpu = requests?.get("cpu")?;
+            cpu_millicores(&cpu.0).map(weight_from_millicores)
+        });
+    let max_replicas = explicit.and_then(|c| c.max_replicas).or_else(|| {
+        let mem = requests?.get("memory")?;
+        memory_bytes(&mem.0).map(max_replicas_from_memory)
+    });
+    (weight, max_replicas)
+}
+
+/// The core count a pod's CPU request earns: `max(1, floor(millicores /
+/// 1000))` (ADR 0079 layers 2 and 3). Rounded **down** on purpose: `cores` scales
+/// the awake-group cap and the compaction pool, and the safe error is a cap that
+/// is too small (a node defers more bulk wakes, compacts a little less in
+/// parallel) rather than one that over-admits a pod that was promised less CPU
+/// than it assumed; a sub-core request (`500m`) still rounds up to the minimum
+/// of one. It is a configured number, rendered into `cluster.json`; the node
+/// never reads `available_parallelism`.
+#[must_use]
+pub fn cores_from_millicores(millicores: u64) -> u32 {
+    u32::try_from((millicores / 1000).max(1)).unwrap_or(u32::MAX)
+}
+
+/// The `cores` the operator renders into `cluster_settings` (ADR 0079):
+/// `spec.nodeCapacity.cores` if set (nonzero), else derived from the CPU request
+/// ([`cores_from_millicores`]), else `None` (the cap and the pools stay off,
+/// as for any node that does not configure a core count).
+#[must_use]
+pub fn derive_cores(spec: &AnimusClusterSpec) -> Option<u32> {
+    spec.node_capacity
+        .as_ref()
+        .and_then(|c| c.cores)
+        .filter(|c| *c > 0)
+        .or_else(|| {
+            let cpu = spec.resources.as_ref()?.requests.as_ref()?.get("cpu")?;
+            cpu_millicores(&cpu.0).map(cores_from_millicores)
+        })
+}
+
 /// The `cluster_settings` section [`build_cluster_config`] embeds in the
 /// generated config — factored out (S-07d) so [`super::statefulset`]'s
 /// restart-relevant config-hash projection can reuse the exact same "empty
@@ -315,7 +454,11 @@ pub fn build_cluster_config(name: &str, ns: &str, spec: &AnimusClusterSpec) -> C
 /// stays byte-identical to before this section existed.
 #[must_use]
 pub fn cluster_settings_or_none(spec: &AnimusClusterSpec) -> Option<ClusterSettings> {
+    let (node_weight, node_max_replicas) = derive_node_capacity(spec);
     let settings = ClusterSettings {
+        node_weight,
+        node_max_replicas,
+        cores: derive_cores(spec),
         auto_split_bytes: spec.auto_split_bytes,
         quiesce_after_secs: spec.quiesce_after_secs,
         max_region_rtt_ms: spec.max_region_rtt_ms,
@@ -893,6 +1036,145 @@ mod tests {
         // Unset: the section stays absent, the pre-existing bytes.
         let cfg = build_cluster_config("c", "ns", &spec(3));
         assert!(cfg.cluster_settings.is_none());
+    }
+
+    fn with_requests(s: &mut AnimusClusterSpec, cpu: Option<&str>, memory: Option<&str>) {
+        use k8s_openapi::api::core::v1::ResourceRequirements;
+        use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+        let mut requests = std::collections::BTreeMap::new();
+        if let Some(c) = cpu {
+            requests.insert("cpu".to_string(), Quantity(c.to_string()));
+        }
+        if let Some(m) = memory {
+            requests.insert("memory".to_string(), Quantity(m.to_string()));
+        }
+        s.resources = Some(ResourceRequirements {
+            requests: Some(requests),
+            ..Default::default()
+        });
+    }
+
+    /// ADR 0079 section 1: weight from the CPU request, `max_replicas` from the
+    /// memory request (`min(0.5 x memory / 64 KiB, 1000)`), an explicit
+    /// `spec.nodeCapacity` field wins, and a spec that requests nothing renders
+    /// neither key (the pre-existing `cluster.json` bytes).
+    #[test]
+    fn node_capacity_is_derived_from_requests_and_overridable() {
+        // Nothing requested: absent, byte-identical to before.
+        assert_eq!(derive_node_capacity(&spec(3)), (None, None));
+        assert!(
+            build_cluster_config("c", "ns", &spec(3))
+                .cluster_settings
+                .is_none()
+        );
+
+        // 4 cores -> 40; 2 GiB -> 0.5 x 2 GiB / 64 KiB = 16384, capped at 1000.
+        let mut s = spec(3);
+        with_requests(&mut s, Some("4"), Some("2Gi"));
+        assert_eq!(derive_node_capacity(&s), (Some(40), Some(1000)));
+        // 250m of a core -> floor 2; 16 MiB -> 128 replicas, under the cap.
+        with_requests(&mut s, Some("250m"), Some("16Mi"));
+        assert_eq!(derive_node_capacity(&s), (Some(2), Some(128)));
+        // A tiny CPU request still earns weight 1; a tiny memory request, 1.
+        with_requests(&mut s, Some("50m"), Some("1Ki"));
+        assert_eq!(derive_node_capacity(&s), (Some(1), Some(1)));
+        // Only a CPU request: no ceiling.
+        with_requests(&mut s, Some("16"), None);
+        assert_eq!(derive_node_capacity(&s), (Some(160), None));
+        // An unparsable quantity leaves the field unset rather than guessing.
+        with_requests(&mut s, Some("lots"), Some("much"));
+        assert_eq!(derive_node_capacity(&s), (None, None));
+
+        // Explicit overrides win, field by field.
+        with_requests(&mut s, Some("4"), Some("2Gi"));
+        s.node_capacity = Some(crate::crd::NodeCapacitySpec {
+            weight: Some(7),
+            max_replicas: None,
+            cores: None,
+        });
+        assert_eq!(derive_node_capacity(&s), (Some(7), Some(1000)));
+        s.node_capacity = Some(crate::crd::NodeCapacitySpec {
+            weight: None,
+            max_replicas: Some(250),
+            cores: None,
+        });
+        let cfg = build_cluster_config("c", "ns", &s);
+        let value: serde_json::Value = serde_json::from_str(&to_json(&cfg)).unwrap();
+        assert_eq!(
+            value["cluster_settings"],
+            serde_json::json!({"node_weight": 40, "node_max_replicas": 250, "cores": 4}),
+            "got {value}"
+        );
+        // Zero weight is refused at admission.
+        s.node_capacity = Some(crate::crd::NodeCapacitySpec {
+            weight: Some(0),
+            max_replicas: None,
+            cores: None,
+        });
+        assert!(s.validate_node_capacity_spec().is_err());
+    }
+
+    /// ADR 0079 layers 2 and 3: `cores` is `max(1, floor(cpu request))`, an
+    /// explicit `spec.nodeCapacity.cores` wins, nothing requested renders no
+    /// key (so the awake cap and the pools stay off), and zero is refused.
+    #[test]
+    fn cores_are_derived_from_the_cpu_request_rounded_down() {
+        assert_eq!(derive_cores(&spec(3)), None);
+        let mut s = spec(3);
+        for (cpu, want) in [
+            ("4", 4),
+            ("16", 16),
+            ("2500m", 2),
+            ("1999m", 1),
+            ("1", 1),
+            ("500m", 1),
+            ("50m", 1),
+            ("0", 1),
+        ] {
+            with_requests(&mut s, Some(cpu), None);
+            assert_eq!(derive_cores(&s), Some(want), "cpu {cpu}");
+        }
+        // An unparsable quantity or a memory-only request: unset.
+        with_requests(&mut s, Some("lots"), None);
+        assert_eq!(derive_cores(&s), None);
+        with_requests(&mut s, None, Some("2Gi"));
+        assert_eq!(derive_cores(&s), None);
+        // The override wins; zero falls back to the derived value (and is
+        // refused at admission).
+        with_requests(&mut s, Some("4"), None);
+        s.node_capacity = Some(crate::crd::NodeCapacitySpec {
+            cores: Some(8),
+            ..Default::default()
+        });
+        assert_eq!(derive_cores(&s), Some(8));
+        let value: serde_json::Value =
+            serde_json::from_str(&to_json(&build_cluster_config("c", "ns", &s))).unwrap();
+        assert_eq!(value["cluster_settings"]["cores"], 8, "got {value}");
+        s.node_capacity = Some(crate::crd::NodeCapacitySpec {
+            cores: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(derive_cores(&s), Some(4));
+        assert!(s.validate_node_capacity_spec().is_err());
+        // No request, no override: neither the key nor a cluster_settings.
+        assert!(
+            build_cluster_config("c", "ns", &spec(3))
+                .cluster_settings
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn quantity_parsers() {
+        assert_eq!(cpu_millicores("2"), Some(2000));
+        assert_eq!(cpu_millicores("1.5"), Some(1500));
+        assert_eq!(cpu_millicores("500m"), Some(500));
+        assert_eq!(cpu_millicores("x"), None);
+        assert_eq!(memory_bytes("4Gi"), Some(4 << 30));
+        assert_eq!(memory_bytes("512Mi"), Some(512 << 20));
+        assert_eq!(memory_bytes("1G"), Some(1_000_000_000));
+        assert_eq!(memory_bytes("1048576"), Some(1_048_576));
+        assert_eq!(memory_bytes("12Q"), None);
     }
 
     #[test]

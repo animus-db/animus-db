@@ -4429,10 +4429,28 @@ async fn create_table<E: Env, R: RelayClient>(
     // before we propose (the state machine also rejects, but this gives the right
     // wire code without waiting on a commit that will be a no-op). Fresh, not
     // `metadata(ctx)`: this whole function is a commit-wait poll (ADR 0035 PR1).
-    if metadata_fresh(ctx).await.has_table_schema(table) {
+    let fresh = metadata_fresh(ctx).await;
+    if fresh.has_table_schema(table) {
         return Err(registry_error(animus_dynamo::RegistryError::TableExists(
             table.to_owned(),
         )));
+    }
+    // ADR 0079 section 1: when every `Active` node is at its `max_replicas`
+    // the table's first tablet cannot be placed. Refuse **before** the schema
+    // commits (a schema with no tablet would answer a retry with
+    // `ResourceInUseException`) with the retryable `ServiceUnavailable`
+    // (`internal` maps the sentinel); `provision_tablet` re-checks, so a race
+    // that fills the cluster in between fails the same way.
+    {
+        let active: Vec<NodeId> = fresh
+            .members
+            .iter()
+            .filter(|(_, m)| m.status == animus_control::NodeStatus::Active)
+            .map(|(id, _)| id.clone())
+            .collect();
+        if let Err(e) = crate::schema::zone_aware_initial_replicas(&fresh, active) {
+            return Err(internal(&e.to_string()));
+        }
     }
     // v1: every wire-created table is served by the leaderful CP plane (ADR 0019),
     // the only data plane there is — the edge routes its reads/writes through
@@ -10918,6 +10936,14 @@ async fn quorum_read<E: Env, R: RelayClient>(
 }
 
 pub(crate) fn internal(message: &str) -> WireError {
+    // ADR 0079 section 1: a refused placement is "try again after capacity is
+    // added", the documented `ServiceUnavailable` (HTTP 503, every SDK retries
+    // it), not a server fault. Every `provision_tablet` error string reaches
+    // the wire through here, so the one mapping covers CreateTable and the
+    // lazy first-write provisioning alike.
+    if message.starts_with(crate::schema::CAPACITY_EXHAUSTED_REFUSAL) {
+        return WireError::service_unavailable(message);
+    }
     WireError {
         code: "InternalServerError",
         message: message.to_owned(),

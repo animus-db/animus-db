@@ -1913,13 +1913,22 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         // the TiKV-hibernate-regions lesson (a quiesced leader that dies
         // while dormant would otherwise stay cold until some client happens
         // to touch its tablet, a worse availability story than today).
-        // `RaftKvNode::wake()` is a cheap, idempotent notify, safe to call
-        // unconditionally on every hosted group, quiesced or not.
+        // `RaftKvNode::wake_bulk()` is a cheap, idempotent notify, safe to call
+        // unconditionally on every hosted group, quiesced or not. It is the
+        // one wake ADR 0079's awake-group admission may defer (a mass wake is
+        // what the awake cap paces; a client write or peer message is not).
         for (&tablet, node) in &self.hosted {
             if let Some(t) = view.tablets.get(&tablet)
                 && t.replicas.iter().any(|r| view.down.contains(r))
             {
-                node.wake();
+                // ADR 0079 step 4 follow-up: a group whose known leader is
+                // the Down node is leaderless and bypasses the awake cap; a
+                // group with only a Down follower stays deferrable.
+                if node.leader().is_some_and(|l| view.down.contains(&l)) {
+                    node.wake_bulk_leader_lost();
+                } else {
+                    node.wake_bulk();
+                }
             }
         }
 

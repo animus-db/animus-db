@@ -1229,6 +1229,14 @@ pub fn is_relayable_command(command: &MetaCommand) -> bool {
         // "no seed answered" — see `tests/seed_join_allocated.rs`'s
         // follower-connected-seed case (`animusd`).
         | MetaCommand::RegisterNode { .. }
+        // Per-node capacity (ADR 0079, `Gate::NodeCapacity`): a data node
+        // reconciles its own configured capacity into `Metadata` from
+        // wherever it runs (usually a follower of the control group), the
+        // identical relay reasoning as `RegisterNode` just above. Missing
+        // this arm would be the bimodal per-process flake the root
+        // `CLAUDE.md` warns about: a node connected to a follower would
+        // never get its declared capacity applied.
+        | MetaCommand::SetNodeCapacity { .. }
         // `CreateBackup` wire operation (ADR 0059 §3/§4, Train 1 PR④):
         // an operator's `CreateBackup` call may land on any node, exactly
         // like `CreateTable`/`UpdateTimeToLive` — relaying `BeginBackup`
@@ -1320,6 +1328,13 @@ pub fn is_relayable_command(command: &MetaCommand) -> bool {
         // proposes `CasTabletReplicas` directly off its own live
         // `RaftNode` handle, so it needs no relay path of its own.
         | MetaCommand::MarkSplitPlacingDone { .. }
+        // Repair-settled report (ADR 0079 step 6, `Gate::NodeCapacity`): a
+        // tablet leader's own "the repair's replica set is realised" report,
+        // from wherever that leader runs — the identical relay reasoning as
+        // `MarkSplitPlacingDone` just above. Missing this arm would be the
+        // bimodal per-process flake the root `CLAUDE.md` warns about: a
+        // report from a follower-connected node would never reach the leader.
+        | MetaCommand::RepairSettled { .. }
         // Replicated credential catalog (ADR 0066 §1/§2): `PutCredential`/
         // `RotateCredential`/`RevokeCredential` all originate from the
         // admin API (`animusd::admin`, ADR 0066 §6), which may land on any
@@ -1975,6 +1990,11 @@ mod tests {
                 node: nid(1),
                 addrs: addrs.clone(),
                 labels: Default::default(),
+                capacity: None,
+            },
+            MetaCommand::SetNodeCapacity {
+                node: nid(1),
+                capacity: animus_control::Capacity::DEFAULT,
             },
             MetaCommand::BeginBackup {
                 backup_id: "b1".to_string(),
@@ -2091,6 +2111,10 @@ mod tests {
             MetaCommand::MarkSplitPlacingDone {
                 tablet: TabletId(2),
                 expected_epoch: Epoch::INITIAL,
+            },
+            MetaCommand::RepairSettled {
+                tablet: TabletId(2),
+                epoch: Epoch::INITIAL,
             },
             MetaCommand::PutCredential {
                 id: "AKID1".to_string(),
