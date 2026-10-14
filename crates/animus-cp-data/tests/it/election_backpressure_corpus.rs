@@ -1962,6 +1962,14 @@ fn run_lost_leader(mut r: Run, c: &Cell) -> Report {
         .iter()
         .position(|(_, n)| n.is_leader())
         .expect("group 0 is led");
+    // Pre-vote rounds each survivor's core has started for group `gi`: the
+    // per-group attempt counter (the node-wide `CpCampaignAdmitted` counts
+    // every hosted group and the ghosts, so it would make the bound vacuous).
+    let rounds_of = |rig: &Rig, n: usize| {
+        rig.replica(gi, n)
+            .map_or(0, |k| k.campaign_stats().rounds_started)
+    };
+    let rounds_before: Vec<u64> = (0..NODES.len()).map(|n| rounds_of(&r.rig, n)).collect();
     r.s.begin_fault(r.at.as_secs_f64());
     r.rig.replica(gi, ri).expect("hosted").shutdown();
     // The halted replica's frozen handle still reports `is_leader`.
@@ -1971,26 +1979,51 @@ fn run_lost_leader(mut r: Run, c: &Cell) -> Report {
             .iter()
             .any(|(j, n)| *j != ri && n.is_leader())
     });
+    // ADR 0078, "Lost-leader liveness bound": per campaign attempt,
     // `delay <= 2*base_eff + ceil(Q/K_eff) * T_hold_max`, `T_hold_max =
-    // 2*base_eff` (ADR 0078, "Lost-leader liveness bound"); `base_eff = base`
-    // here (no lag stretch).
-    // The ADR's formula stops at admission; the admitted group still needs its
-    // own pre-vote / vote / commit round trips and the probe resolution is
-    // 10 ms, so the harness adds `OWN_ELECTION_SLACK` (50 ms) to the literal
-    // bound. A leak (control (d)) misses it by seconds, not milliseconds.
+    // 2*base_eff`; `base_eff = base` here (no lag stretch). Two harness terms
+    // the literal formula does not carry (issue #1306):
+    //
+    // * The queue ahead of the lost group is the ghosts (the awake groups are
+    //   served by the lost-leader bypass, ADR 0079). A ghost holds its permit
+    //   for `2*base` like a real campaign, but it is not woken on a grant: it
+    //   re-asks on a `base` sleep (`spawn_ghosts`), and the governor protects
+    //   the queue head, so a grant waits up to one `GHOST_REASK = base` for the
+    //   ghost at the head to come back. Each of the `ceil(Q/K)` passes
+    //   therefore costs `2*base + GHOST_REASK`, not `2*base`. (A real group is
+    //   woken by its callback at once, so production has no such term.) The
+    //   canonical seed lands inside the literal bound only by phase luck;
+    //   reseeded variants measured 1.21 s against 0.95 s.
+    // * The formula stops at admission; the admitted group still needs its own
+    //   pre-vote / vote / commit round trips and the probe resolution is 10 ms,
+    //   so `OWN_ELECTION_SLACK` (50 ms) is added.
+    //
+    // A campaign attempt can also be lost without a term bump (a pre-vote
+    // round that fails when both followers pre-campaign together, or a split
+    // vote), costing a further full window; `attempts` is the most pre-vote
+    // rounds either survivor started for this group since the kill (floor 1).
+    // A permit leak (control (d)) admits nothing, so it still gets the
+    // single-attempt bound and misses it by seconds.
     const OWN_ELECTION_SLACK: f64 = 0.05;
-    let bound = 2.0 * BASE.as_secs_f64()
-        + (q.div_ceil(K) as f64) * 2.0 * BASE.as_secs_f64()
-        + OWN_ELECTION_SLACK;
+    const GHOST_REASK: f64 = BASE.as_secs_f64();
+    let attempts = (0..NODES.len())
+        .filter(|&n| n != ri)
+        .map(|n| rounds_of(&r.rig, n) - rounds_before[n])
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let round = 2.0 * BASE.as_secs_f64()
+        + (q.div_ceil(K) as f64) * (2.0 * BASE.as_secs_f64() + GHOST_REASK);
+    let bound = round * attempts as f64 + OWN_ELECTION_SLACK;
     let mut extra = Vec::new();
     match delay {
         None => extra.push("bound: the lost group never got a leader (starved)"),
         Some(d) if d > bound => {
-            extra.push("bound: lost-leader delay above 2*base + ceil(Q/K)*T_hold_max")
+            extra.push("bound: lost-leader delay above attempts * (2*base + ceil(Q/K)*T_hold_max)")
         }
         Some(_) => {}
     }
-    let detail = format!("q={q} k={K} delay_s={delay:?} bound_s={bound:.3}");
+    let detail = format!("q={q} k={K} attempts={attempts} delay_s={delay:?} bound_s={bound:.3}");
     // The group stays on the books of the run: keep going so the end-state
     // clause sees every other group still led.
     r.advance(Duration::from_secs(3), SAMPLE, false);
