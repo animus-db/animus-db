@@ -636,3 +636,10 @@ PlacementCapacityBlockedTablets` is an additive appended variant.
   fewer groups under load. First result (seed `0x24ef92c11692b620`): capped lag
   12 ms against 13557 ms uncapped, 60 against 59 led, terms 2 against 19; held
   across `ANIMUS_DENSITY_SEEDS=10`.
+- **Cell 9's window oracle was a flake (step 6 test, fixed here).** `repair_pacing`
+  asserted at most `R` commits in a `RECONCILE_INTERVAL` window anchored at the
+  first commit; seed 2584926886 (4th of `ANIMUS_REPAIR_PACING_SEEDS=5`) put two
+  ticks' batches (16) in one window because the commit latency of the first batch
+  exceeded the second's. The oracle is now cumulative, `R x (ticks since the first
+  commit + 2)`; both negative controls still fail it; green at K=30. Lesson:
+  `docs/lessons/testing/2026-10-14-bound-a-rate-by-cumulative-commits-not-by-a-window-anchored-at-an-observation.md`.
