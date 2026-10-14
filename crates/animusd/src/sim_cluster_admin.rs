@@ -1221,6 +1221,18 @@ fn admin_metrics_reports_nonzero_throttled_counters_over_seeds() {
 /// either is a real stale/invented metric name (fix the doc) or belongs here.
 const NOT_A_METRIC: &[(&str, &str)] = &[
     (
+        "bg_snapshot_hwm",
+        "a C17 Tier 2 `metric=` test-output line label (ADR 0079), not a Prometheus metric",
+    ),
+    (
+        "bg_split_hwm",
+        "a C17 Tier 2 `metric=` test-output line label (ADR 0079), not a Prometheus metric",
+    ),
+    (
+        "bg_compaction_hwm",
+        "a C17 Tier 2 `metric=` test-output line label (ADR 0079), not a Prometheus metric",
+    ),
+    (
         "control_voters",
         "an /admin or CLI JSON field, not a Prometheus metric",
     ),

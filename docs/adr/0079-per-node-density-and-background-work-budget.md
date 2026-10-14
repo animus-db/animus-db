@@ -1,6 +1,6 @@
 # ADR 0079 — Per-node density and the background-work budget: placement capacity, awake-group admission, background permit pools
 
-- **Status:** Accepted (2026-10-12). The maintainer settled the ten open questions on 2026-10-12, taking the recommendation on each (see "Maintainer decisions"). Not yet implemented; the defaults stay provisional until calibration (implementation plan step 1).
+- **Status:** Accepted (2026-10-12), implemented (2026-10-14). The maintainer settled the ten open questions on 2026-10-12, taking the recommendation on each (see "Maintainer decisions"). The defaults were calibrated in step 1 (`docs/density-measurements.md`); see "As built (consolidated)".
 - **Date:** 2026-10-12
 - **Origin:** issue #1295 (follow-up to #1199, closed by ADR 0078); the ADR 0078 maintainer decision 5 (2026-10-11) that a per-node cap on awake groups gets its own ADR once the stable ceiling is measured. Measurements: `docs/density-measurements.md` (branch `claude/per-node-density`, commit `795465c`).
 - **Amends:** none. **Depends on:** ADR 0003 (determinism, the `Env` seam), ADR 0005 (placement), ADR 0029 (rebalancing), ADR 0031 (host reconciler), ADR 0044/0048 (quiescence), ADR 0058 (learners, snapshots), ADR 0073 (upgrade compatibility), ADR 0075 (region-pinned placement, MREC receiver), ADR 0078 (campaign governor, `LoadMonitor`, staggered hosting).
@@ -288,6 +288,28 @@ The maintainer accepted the recommendation on every open question below:
 8. **#1297 (resolved):** diagnosed as accepted overload (see "Resolved dependency"). No gate on this ADR remains; it is kept here only so the numbering of the other questions does not change.
 9. **Should the permit pools and `LoadMonitor` input be shared with #1296's client-path admission** (one lag-reduction rule for the request gate as well)? Recommended: yes, a single `lag -> factor` helper used by both, with the client-gate wiring left to #1296's ADR.
 10. **Cluster version.** Recommended: a new `Gate::NodeCapacity` at cluster version 5, finalised with the rest of the release, rather than folding capacity into an existing gate.
+
+## As built (consolidated, 2026-10-14)
+
+All eight implementation steps landed on one branch. Layer 1, declared per-node
+placement capacity: `animus-placement` `Capacity` and weighted `replan`,
+`replan_repair` and `rebalance_step` (equal weights are byte-identical to the
+old behaviour); `Gate::NodeCapacity` (cluster version 5, `MAX_SUPPORTED = 5`)
+gates `Capacity` in `Metadata`, the `RegisterNode` field and `SetNodeCapacity`;
+`--node-weight` / `--node-max-replicas`, `GET /admin/capacity`, `animus cluster
+capacity`, a creation refusal and a blocked gauge when no node fits, and the
+operator derives capacity from pod resources. Layer 2, awake-group admission
+(node-local, L): a soft cap of `--awake-max-per-core` (default 1500) times
+`--cores` on awake data-plane groups, a wake queue and `LoadMonitor` lag
+reduction, which defers un-quiesce rather than refusing hosting; the operator
+derives `cores`. Layer 3, the background-work budget (L): `BackgroundBudget`
+permit pools for snapshot and catch-up streams, splits and compactions with a
+retryable refusal and an L0 bypass, plus repair-proposal pacing in the control
+leader's `reconcile_loop`. Proofs: `capacity_corpus` and `repair_pacing`
+(`animus-control`) and `density_admission_corpus` (`animus-cp-data`), each with
+its negative controls; Tier 2 `C17` density lines. Deferred: #1300 (L0 stall),
+#1303, #1304, #1305, #1306, and the operator `nofile` term. The per-step notes
+below are the detail.
 
 ## Implementation step 3 as built (2026-10-13)
 
