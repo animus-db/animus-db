@@ -6,7 +6,9 @@
 //! violation, and the real leader `reconcile_loop` repairs them. The cell
 //! asserts, per seed:
 //!
-//! * proposals: no `RECONCILE_INTERVAL` window commits more than `R` repairs;
+//! * proposals: cumulative commits never exceed `R x (ticks since the first
+//!   commit + 2)` (a single tick window flaked: commit latency can put two
+//!   batches in one);
 //! * in flight: the leader's `CpRepairInflightHwm` never exceeds `R_inflight`;
 //! * liveness: every tablet reaches RF3 on live nodes within
 //!   `REPAIR_DWELL + ceil(V / slots) * (TTL + tick) + slack`;
@@ -45,6 +47,8 @@ const SAMPLE: Duration = Duration::from_millis(10);
 struct Report {
     violating: usize,
     max_window: usize,
+    /// `(time since the kill, repairs committed so far)`, every `SAMPLE`.
+    samples: Vec<(Duration, usize)>,
     inflight_hwm: u64,
     deferred: u64,
     converged_after: Option<Duration>,
@@ -198,6 +202,7 @@ fn run_cell(seed: u64, pacing: RepairPacing) -> Report {
     Report {
         violating,
         max_window,
+        samples,
         inflight_hwm: h.get(Metric::CpRepairInflightHwm),
         deferred: h.get(Metric::CpRepairDeferred),
         converged_after,
@@ -207,11 +212,32 @@ fn run_cell(seed: u64, pacing: RepairPacing) -> Report {
 
 /// The oracle. `Err` names the violated bound.
 fn check(r: &Report, p: RepairPacing) -> Result<(), String> {
-    if p.per_tick > 0 && r.max_window > p.per_tick {
-        return Err(format!(
-            "{} repairs in one tick window > R={}",
-            r.max_window, p.per_tick
-        ));
+    if p.per_tick > 0 {
+        // The leader proposes at most R repairs per RECONCILE_INTERVAL tick, but
+        // they are observed when they *commit*, and the commit latency of one
+        // tick's batch can exceed the next one's (the first window is anchored
+        // at the first commit), so a single tick-long window may legitimately
+        // hold two batches: the per-window bound `R` flaked on seed 2584926886
+        // (16 in one window, two ticks of 8). The sound bound is cumulative:
+        // by `e` after the first commit at most `R * (floor(e / TICK) + 2)`
+        // repairs can have committed (two batches of slack for that jitter). An
+        // unpaced burst (30 at once) still breaks it in the first window.
+        let first = r
+            .samples
+            .iter()
+            .find(|s| s.1 > 0)
+            .map_or(Duration::ZERO, |s| s.0);
+        for &(e, done) in r.samples.iter().filter(|s| s.1 > 0) {
+            let ticks = ((e - first).as_millis() / TICK.as_millis()) as usize;
+            let allowed = p.per_tick * (ticks + 2);
+            if done > allowed {
+                return Err(format!(
+                    "{done} repairs committed {e:?} after the kill > R={} x (ticks since the \
+                     first commit + 2) = {allowed}",
+                    p.per_tick
+                ));
+            }
+        }
     }
     if p.inflight_max > 0 && r.inflight_hwm as usize > p.inflight_max {
         return Err(format!(

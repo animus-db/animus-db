@@ -202,7 +202,7 @@ fn proportional(m: &Metadata, nodes: &[(u64, u32)]) -> Result<(), String> {
 fn run_cell10(seed: u64, honor_weights: bool) -> Result<(), String> {
     let mut rng = Rng(seed);
     // The ADR's shape first (100/100/200); later seeds draw other weights.
-    let mut nodes: Vec<(u64, u32)> = if seed & 1 == 0 || seed % 3 == 0 {
+    let mut nodes: Vec<(u64, u32)> = if seed & 1 == 0 || seed.is_multiple_of(3) {
         vec![(1, 100), (2, 100), (3, 200)]
     } else {
         (1..=3)

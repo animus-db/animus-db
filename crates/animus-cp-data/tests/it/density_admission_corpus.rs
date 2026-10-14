@@ -26,11 +26,11 @@
 //!    exactly a node's capacity; the same mass wake runs with and without the
 //!    cap. Capped, the scheduling lag stays below the uncapped run's, every
 //!    group is led at the end and the led count never falls once converged.
-//! 3b. **absorbable overload, cap vs no cap** (ADR 0079 step 7): the same
-//!    node loss, but the CPU model gives each survivor capacity above what the
-//!    lost-leader groups plus `A` need (`1.5 x (G/N + A)` awake groups), so the
-//!    capped run is not saturated by design. Capped, the worst scheduling lag
-//!    is not worse than uncapped and no fewer groups are led under load.
+//!    Cell 3b (ADR 0079 step 7), **absorbable overload**: the same node loss, but
+//!    the CPU model gives each survivor capacity above what the lost-leader
+//!    groups plus `A` need (`1.5 x (G/N + A)` awake groups), so the capped run is
+//!    not saturated by design. Capped, the worst scheduling lag is not worse than
+//!    uncapped and no fewer groups are led under load.
 //! 4. **cap and lag**: lag is injected into node 1's monitor; its `A_eff`
 //!    falls to `A/4` and bulk wakes stop at that bound while node 0 (no lag)
 //!    still admits `A`; when the lag clears `A_eff` recovers and the queue
