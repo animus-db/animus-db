@@ -26,6 +26,11 @@
 //!    exactly a node's capacity; the same mass wake runs with and without the
 //!    cap. Capped, the scheduling lag stays below the uncapped run's, every
 //!    group is led at the end and the led count never falls once converged.
+//! 3b. **absorbable overload, cap vs no cap** (ADR 0079 step 7): the same
+//!    node loss, but the CPU model gives each survivor capacity above what the
+//!    lost-leader groups plus `A` need (`1.5 x (G/N + A)` awake groups), so the
+//!    capped run is not saturated by design. Capped, the worst scheduling lag
+//!    is not worse than uncapped and no fewer groups are led under load.
 //! 4. **cap and lag**: lag is injected into node 1's monitor; its `A_eff`
 //!    falls to `A/4` and bulk wakes stop at that bound while node 0 (no lag)
 //!    still admits `A`; when the lag clears `A_eff` recovers and the queue
@@ -93,6 +98,7 @@ enum Kind {
     MassWake,
     WriteToDeferred,
     OverloadCapped,
+    AbsorbableOverload,
     CapAndLag,
     ElectionsUnderCap,
 }
@@ -138,6 +144,11 @@ fn cells() -> Vec<Cell> {
         cell(
             "cell_3_awake_overload_capped",
             Kind::OverloadCapped,
+            AwakeFault::None,
+        ),
+        cell(
+            "cell_3b_absorbable_overload_capped",
+            Kind::AbsorbableOverload,
             AwakeFault::None,
         ),
         cell("cell_4_cap_and_lag", Kind::CapAndLag, AwakeFault::None),
@@ -219,6 +230,9 @@ struct Rig {
     cost_ns: u64,
     /// Whether the lag probe is fed from the simulator's CPU queue.
     probing: bool,
+    /// When set, the awake-group capacity the CPU model is sized for (instead
+    /// of `2A`): cell 3b gives the survivors room for the lost-leader groups.
+    capacity_groups: Option<f64>,
     at: Duration,
     since_probe: Duration,
     since_recon: Duration,
@@ -282,6 +296,7 @@ impl Rig {
             live: [true; 3],
             cost_ns: 0,
             probing: false,
+            capacity_groups: None,
             at: Duration::ZERO,
             since_probe: Duration::ZERO,
             since_recon: RECON_EVERY,
@@ -377,7 +392,7 @@ impl Rig {
     /// takes 1500 against a measured 1900-2000), so a node holding `A` awake
     /// groups runs at half its capacity and one holding `10A` at five times.
     fn set_load(&mut self, load: f64) {
-        let capacity_groups = 2.0 * self.a.max(1) as f64;
+        let capacity_groups = self.capacity_groups.unwrap_or(2.0 * self.a.max(1) as f64);
         for &id in &NODES {
             self.sim.set_cpu_order(nid(id), CpuOrder::Random);
             let cost = if load <= 0.0 {
@@ -850,10 +865,19 @@ fn run_write_to_deferred(c: &Cell, g: usize) -> Report {
 /// cap. `a == 0` is the uncapped baseline (the CPU model is sized from the
 /// cap in both arms, so both see the same node capacity).
 fn overload_run(seed: u64, g: usize, a: usize) -> (Report, usize, usize) {
+    overload_run_sized(seed, g, a, false)
+}
+
+/// [`overload_run`] with the CPU model sized, when `absorbable`, for the
+/// survivors to absorb the lost-leader groups plus `A` (cell 3b).
+fn overload_run_sized(seed: u64, g: usize, a: usize, absorbable: bool) -> (Report, usize, usize) {
     let mut r = Rig::new(seed, g, a, AwakeFault::None);
     let mut bad = r.bring_up();
     let lost = r.led_by(0);
     r.a = cap_for(g);
+    if absorbable {
+        r.capacity_groups = Some(1.5 * (g / NODES.len() + cap_for(g)) as f64);
+    }
     r.set_load(1.0);
     r.kill(0);
     r.mark_down(0);
@@ -912,6 +936,41 @@ fn run_overload(c: &Cell, g: usize) -> Report {
         base.led_regress,
         base.led_at_end,
         base.groups,
+    );
+    rep
+}
+
+/// Cell 3b (ADR 0079 step 7). Cell 3 sizes the CPU model at `2A` awake groups,
+/// which the lost-leader bypass (about `G/N` groups over the cap) already
+/// exceeds, so its capped run is saturated by construction and can only be
+/// held to "no fewer groups led". Here each survivor has capacity for
+/// `1.5 x (G/N + A)` awake groups: the capped population (`A_eff` plus the
+/// bypassed lost-leader elections) fits, the uncapped one (every group awake)
+/// does not. The capped run must then be no worse than the uncapped one on
+/// both axes: worst scheduling lag, and groups led under load. The run's
+/// counters (awake high-water, over-cap wakes, queue use, campaign admits, lag
+/// and backlog) are in the detail line so a failure can be root-caused.
+fn run_absorbable_overload(c: &Cell, g: usize) -> Report {
+    let a = cap_for(g);
+    let (base, base_led, base_backlog) = overload_run_sized(c.seed, g, 0, true);
+    let (mut rep, led, backlog) = overload_run_sized(c.seed, g, a, true);
+    if rep.led_regress > 0 {
+        rep.violations
+            .push("monotone: the led count fell after the fault");
+    }
+    if led < base_led {
+        rep.violations
+            .push("overload: the capped run led fewer groups than the uncapped one");
+    }
+    if rep.max_lag_ms > base.max_lag_ms {
+        rep.violations
+            .push("overload: the capped run's worst scheduling lag exceeds the uncapped one's");
+    }
+    rep.violations
+        .extend(base.violations.iter().filter(|v| v.starts_with("safety")));
+    rep.detail = format!(
+        "{} led_under_load={led}/{base_led} backlog={backlog}/{base_backlog} capped_lag_ms={} uncapped_lag_ms={} capped_term={} uncapped_term={}",
+        rep.detail, rep.max_lag_ms, base.max_lag_ms, rep.max_term, base.max_term,
     );
     rep
 }
@@ -1089,6 +1148,7 @@ fn run_cell(c: &Cell, g: usize) -> Report {
         Kind::MassWake => run_mass_wake(c, g),
         Kind::WriteToDeferred => run_write_to_deferred(c, g),
         Kind::OverloadCapped => run_overload(c, g),
+        Kind::AbsorbableOverload => run_absorbable_overload(c, g),
         Kind::CapAndLag => run_cap_and_lag(c, g),
         Kind::ElectionsUnderCap => run_elections(c, g),
     }

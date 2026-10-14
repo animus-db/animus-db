@@ -306,6 +306,61 @@ const DEFAULT_SIM_SEGMENT_JANITOR_RETENTION: Duration = Duration::from_secs(3600
 /// constant's own doc for why.
 const SIM_TTL_SWEEP_INTERVAL: Duration = SIM_FALLBACK_TICK;
 
+/// ADR 0079 step 7: the density knobs a `SimCluster` node assembles with, for
+/// the C-17 scale cells that measure the awake cap and the background pools.
+/// `SimCluster` has no constructor parameter for them (it has nine
+/// constructors and six reconciler build sites, restarts included), so a cell
+/// installs them for the current thread with [`SimDensity::install`] before it
+/// builds its cluster; the returned guard removes them. Every other cluster
+/// runs with both layers off, as before.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SimDensity {
+    /// `--cores` (never autodetected).
+    pub(crate) cores: usize,
+    /// `--awake-max-per-core`.
+    pub(crate) awake_max_per_core: usize,
+    /// The background pool sizes (`BudgetSizes::resolve(None, None, None, None,
+    /// Some(cores))` is the production default for `cores`).
+    pub(crate) sizes: animus_cp_data::background_budget::BudgetSizes,
+}
+
+thread_local! {
+    static SIM_DENSITY: std::cell::Cell<Option<SimDensity>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Removes the thread's [`SimDensity`] when dropped.
+pub(crate) struct SimDensityGuard(());
+
+impl Drop for SimDensityGuard {
+    fn drop(&mut self) {
+        SIM_DENSITY.with(|d| d.set(None));
+    }
+}
+
+impl SimDensity {
+    /// Install `self` for every node this thread's `SimCluster` builds from now
+    /// on, until the guard drops.
+    pub(crate) fn install(self) -> SimDensityGuard {
+        SIM_DENSITY.with(|d| d.set(Some(self)));
+        SimDensityGuard(())
+    }
+
+    fn current() -> Option<SimDensity> {
+        SIM_DENSITY.with(std::cell::Cell::get)
+    }
+}
+
+/// The split-pool handle a node's `DataRole` carries (`ClientCtx::
+/// trigger_split` takes a permit from it), when a [`SimDensity`] is installed.
+/// Its own `BackgroundBudget` (not the reconciler's): the pools are separate
+/// per-pool state, so only the split pool of this one records.
+fn sim_split_permits(env: &SimEnv) -> Option<animus_cp_data::background_budget::SplitPermits> {
+    let d = SimDensity::current()?;
+    let budget = animus_cp_data::background_budget::BackgroundBudget::new(d.sizes, env.metrics());
+    Some(animus_cp_data::background_budget::SplitPermits::new(budget))
+}
+
 /// Build a fresh per-node `Reconciler<SimEnv, MemoryEngine>` (ADR 0061 rung
 /// D4 PR 1) — mirrors `animusd`'s own production node assembly exactly
 /// (`BoundNode::start_with`'s `on_host`/`on_teardown` closures): a fresh
@@ -323,6 +378,7 @@ fn build_reconciler(
     let host_edge = edge.clone();
     let teardown_edge = edge.clone();
     let base_id = node_id.clone();
+    let density = SimDensity::current();
     // ADR 0078 sections 1 and 2 at their defaults, as production's node
     // assembly installs them (`--campaign-max-inflight 32`,
     // `--lag-stretch-max 4`).
@@ -331,10 +387,17 @@ fn build_reconciler(
         animus_cp_data::campaign_governor::DEFAULT_CAMPAIGN_MAX_INFLIGHT,
         animus_cp_data::load_monitor::DEFAULT_LAG_STRETCH_MAX_X,
         // ADR 0079 layer 2: the awake cap is off (no `--cores`), as on any
-        // node that does not configure a core count.
-        None,
-        // ADR 0079 layer 3: every background pool off in the simulated cluster.
-        None,
+        // node that does not configure a core count, unless the C-17 scale
+        // cell installed a [`SimDensity`].
+        density.and_then(|d| {
+            animus_cp_data::awake_admission::resolve_awake_max(Some(d.cores), d.awake_max_per_core)
+        }),
+        // ADR 0079 layer 3: every background pool off in the simulated cluster,
+        // unless the cell installed a [`SimDensity`] (the reconciler-held
+        // snapshot send/receive and catch-up pools).
+        density.map(|d| {
+            animus_cp_data::background_budget::BackgroundBudget::new(d.sizes, env.metrics())
+        }),
     );
     let mut reconciler = if backend == SimEngineBackend::Lsm {
         let factory = SimLsmTabletFactory::new(env.clone());
@@ -2680,7 +2743,7 @@ impl SimCluster {
                         stream_seal_knobs: StreamSealKnobs::default(),
                         change_rates: ChangeRateTracker::default(),
                         request_rates: RequestRateTracker::default(),
-                        bg: None,
+                        bg: sim_split_permits(&sim.env(id.clone())),
                     })
                 } else {
                     None
@@ -6378,7 +6441,7 @@ impl SimCluster {
                 stream_seal_knobs: StreamSealKnobs::default(),
                 change_rates: ChangeRateTracker::default(),
                 request_rates: RequestRateTracker::default(),
-                bg: None,
+                bg: sim_split_permits(&env),
             }),
             // ADR 0061 rung L, C-12 PR 3: the SAME shared `SimSegmentStore`
             // every other node's own `ClientCtx::segment_store` wraps
@@ -7046,7 +7109,7 @@ impl SimCluster {
                 stream_seal_knobs: StreamSealKnobs::default(),
                 change_rates: ChangeRateTracker::default(),
                 request_rates: RequestRateTracker::default(),
-                bg: None,
+                bg: sim_split_permits(&env),
             }),
             segment_store: SegmentStoreHandle::S3(Arc::new(self.segment_store.clone())),
             backup_store: BackupStoreHandle::S3(Arc::new(self.backup_store.clone())),
@@ -7867,7 +7930,7 @@ impl SimCluster {
                 stream_seal_knobs: StreamSealKnobs::default(),
                 change_rates: ChangeRateTracker::default(),
                 request_rates: RequestRateTracker::default(),
-                bg: None,
+                bg: sim_split_permits(&env),
             }),
             segment_store: SegmentStoreHandle::S3(Arc::new(self.segment_store.clone())),
             backup_store: BackupStoreHandle::S3(Arc::new(self.backup_store.clone())),

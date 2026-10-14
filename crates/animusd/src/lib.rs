@@ -15430,6 +15430,11 @@ async fn auto_split_loop<E: Env, R: RelayClient>(
     // When each tablet last had a *full* (materializing) count — the expensive
     // confirm is rate-limited per tablet, not run every tick.
     let mut last_counted: BTreeMap<TabletId, Nanos> = BTreeMap::new();
+    // ADR 0079 step 7: tablets this sweep skipped because the split pool was
+    // full. A deferred tablet is owed an evaluation: if it quiesces before the
+    // pool frees up, the quiesced skip below ("its last tick already checked
+    // it") is false for it, because that tick deferred instead of checking.
+    let mut pool_deferred: BTreeSet<TabletId> = BTreeSet::new();
     // ADR 0067 (W-08b): the fourth arm's own ceilings are always "on" (a
     // production default, never `None`), so unlike the three fields below
     // this can't be used to decide whether the loop has anything to do at
@@ -15490,8 +15495,12 @@ async fn auto_split_loop<E: Env, R: RelayClient>(
             // ADR 0079 layer 3: with the split pool full, skip this tablet
             // (no materializing); the next sweep asks again.
             if ctx.split_pool_full(tablet) {
+                pool_deferred.insert(tablet);
                 continue;
             }
+            // A tablet deferred earlier is evaluated now even if it has
+            // quiesced since, and its estimate gate is forced (below).
+            let was_deferred = pool_deferred.remove(&tablet);
             // ADR 0044 phase-1 PR6: a quiesced group's bytes/key-count are,
             // by construction, static — no activity for `quiesce_after`
             // means no new writes since it quiesced, and a write is the
@@ -15502,7 +15511,7 @@ async fn auto_split_loop<E: Env, R: RelayClient>(
             // periodic `due_confirm` correction below, which exists only
             // to catch estimate drift from *new* data) is pure waste until
             // something un-quiesces it.
-            if leader.is_quiesced() {
+            if leader.is_quiesced() && !was_deferred {
                 continue;
             }
             // Cheap per-tick gate: materializing every led tablet's live pairs
@@ -15513,9 +15522,10 @@ async fn auto_split_loop<E: Env, R: RelayClient>(
             // (compression can push real bytes-per-entry below the assumed size;
             // the memory backend has no key-count estimate at all, though it does
             // have a byte estimate — `approx_bytes` works on any backend).
-            let due_confirm = last_counted
-                .get(&tablet)
-                .is_none_or(|&at| ctx.env.now().duration_since(at) >= AUTO_SPLIT_COOLDOWN);
+            let due_confirm = was_deferred
+                || last_counted
+                    .get(&tablet)
+                    .is_none_or(|&at| ctx.env.now().duration_since(at) >= AUTO_SPLIT_COOLDOWN);
             let byte_hot = match thresholds.bytes {
                 Some(t) => leader.approx_bytes().await > t,
                 None => false,

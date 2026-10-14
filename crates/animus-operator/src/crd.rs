@@ -754,6 +754,15 @@ pub struct NodeCapacitySpec {
     /// memory request is set, else unset (no ceiling).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_replicas: Option<u32>,
+    /// The **configured** core count of each pod (ADR 0079 layers 2 and 3):
+    /// the multiplier of the awake-group cap (`cores x 1500`) and the default
+    /// size of the compaction pool (`max(1, cores / 2)`). Rendered into
+    /// `cluster_settings.cores`; never autodetected at runtime. Derived
+    /// default: `max(1, floor(cpuRequest))` from `spec.resources.requests.cpu`
+    /// (a 500m pod is 1, a 2500m pod is 2, a 4-core pod is 4); with neither
+    /// set the cap and the pools stay off. `0` is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cores: Option<u32>,
 }
 
 impl AnimusClusterSpec {
@@ -765,6 +774,9 @@ impl AnimusClusterSpec {
     pub fn validate_node_capacity_spec(&self) -> Result<(), String> {
         if self.node_capacity.as_ref().and_then(|c| c.weight) == Some(0) {
             return Err("spec.nodeCapacity.weight must be at least 1".to_string());
+        }
+        if self.node_capacity.as_ref().and_then(|c| c.cores) == Some(0) {
+            return Err("spec.nodeCapacity.cores must be at least 1".to_string());
         }
         Ok(())
     }

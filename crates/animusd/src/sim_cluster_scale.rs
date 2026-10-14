@@ -58,6 +58,8 @@ use animus_env::{Clock, EnvExt, Nanos, NodeId, nid};
 use animus_sim::{SimStats, TraceEvent};
 use animus_tablet::{KeyRange, Tablet, TabletId, TabletState};
 use animus_test::corpus::{self, SeedVariant};
+
+use super::sim_cluster::SimDensity;
 use serde::{Deserialize, Serialize};
 
 use super::AutoSplitThresholds;
@@ -98,6 +100,123 @@ fn sizes() -> Vec<usize> {
 /// Print one machine-readable measurement line.
 fn emit(metric: &str, tablets: usize, nodes: usize, value: impl Display) {
     println!("C17 metric={metric} tablets={tablets} nodes={nodes} value={value}");
+}
+
+/// ADR 0079 step 7: the density knobs the Tier 2 cells that measure layers 2
+/// and 3 run with (see [`SimDensity`]): `cores` configured cores, the awake cap
+/// `A = cores * awake_max_per_core`, and the production-default background
+/// pools for `cores` (snapshot 2/2, catch-up 4, splits 1, compactions
+/// `max(1, cores / 2)`).
+fn scale_density(cores: usize, awake_max_per_core: usize) -> SimDensity {
+    SimDensity {
+        cores,
+        awake_max_per_core,
+        sizes: animus_cp_data::background_budget::BudgetSizes::resolve(
+            None,
+            None,
+            None,
+            None,
+            Some(cores),
+        ),
+    }
+}
+
+/// The high-water of `CpAwakeReplicas` (a level) over the nodes, built from
+/// samples the cell takes as virtual time advances.
+#[derive(Default, Clone, Copy)]
+struct AwakeHwm(u64);
+
+impl AwakeHwm {
+    fn sample(&mut self, cluster: &SimCluster) {
+        for n in 0..cluster.node_count() as u64 {
+            self.0 = self
+                .0
+                .max(cluster.env_metric(n, animus_env::Metric::CpAwakeReplicas));
+        }
+    }
+}
+
+/// The ADR 0079 Tier 2 lines of one cell (all nodes aggregated: sum for
+/// counters, max for high-waters).
+struct DensityLines {
+    awake_hwm: u64,
+    wake_deferred_total: u64,
+    bg_snapshot_hwm: u64,
+    bg_split_hwm: u64,
+    bg_compaction_hwm: u64,
+    capacity_blocked_tablets: u64,
+}
+
+fn density_lines(cluster: &SimCluster, awake: AwakeHwm) -> DensityLines {
+    use animus_env::Metric as M;
+    let nodes = 0..cluster.node_count() as u64;
+    let max_of = |ms: &[M]| -> u64 {
+        nodes
+            .clone()
+            .flat_map(|n| ms.iter().map(move |m| (n, *m)))
+            .map(|(n, m)| cluster.env_metric(n, m))
+            .max()
+            .unwrap_or(0)
+    };
+    DensityLines {
+        awake_hwm: awake.0,
+        wake_deferred_total: nodes
+            .clone()
+            .map(|n| cluster.env_metric(n, M::CpWakeDeferred))
+            .sum(),
+        bg_snapshot_hwm: max_of(&[
+            M::BgPermitInflightHwmSnapshotSend,
+            M::BgPermitInflightHwmSnapshotRecv,
+        ]),
+        bg_split_hwm: max_of(&[M::BgPermitInflightHwmSplit]),
+        bg_compaction_hwm: max_of(&[M::BgPermitInflightHwmCompaction]),
+        // Only the control leader records the gauge, into the control sink.
+        capacity_blocked_tablets: nodes
+            .clone()
+            .map(|n| cluster.metric(n, M::PlacementCapacityBlockedTablets))
+            .max()
+            .unwrap_or(0),
+    }
+}
+
+fn emit_density_lines(l: &DensityLines, tablets: usize, nodes: usize) {
+    emit("awake_hwm", tablets, nodes, l.awake_hwm);
+    emit("wake_deferred_total", tablets, nodes, l.wake_deferred_total);
+    emit("bg_snapshot_hwm", tablets, nodes, l.bg_snapshot_hwm);
+    emit("bg_split_hwm", tablets, nodes, l.bg_split_hwm);
+    emit("bg_compaction_hwm", tablets, nodes, l.bg_compaction_hwm);
+    emit(
+        "capacity_blocked_tablets",
+        tablets,
+        nodes,
+        l.capacity_blocked_tablets,
+    );
+}
+
+/// Structural assertions on [`DensityLines`] (no thresholds): every pool's
+/// high-water is at most its size, and nothing is capacity-blocked in a
+/// cluster that declares no `max_replicas`.
+fn assert_density_lines(l: &DensityLines, d: &SimDensity, what: &str, seed: u64) {
+    let z = |o: Option<usize>| o.unwrap_or(0) as u64;
+    assert!(
+        l.bg_snapshot_hwm <= z(d.sizes.snapshot_send).max(z(d.sizes.snapshot_recv)),
+        "{what}: snapshot pool high-water {} above its size (seed={seed})",
+        l.bg_snapshot_hwm
+    );
+    assert!(
+        l.bg_split_hwm <= z(d.sizes.splits),
+        "{what}: split pool high-water {} above its size (seed={seed})",
+        l.bg_split_hwm
+    );
+    assert!(
+        l.bg_compaction_hwm <= z(d.sizes.compactions),
+        "{what}: compaction pool high-water {} above its size (seed={seed})",
+        l.bg_compaction_hwm
+    );
+    assert_eq!(
+        l.capacity_blocked_tablets, 0,
+        "{what}: nothing is capacity-blocked with no max_replicas declared (seed={seed})"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1169,6 +1288,8 @@ struct ElectionProbe {
     /// Sampled integral of leaderless groups over virtual time, in ms (each
     /// sample charges the interval since the previous one).
     leaderless_group_ms: u64,
+    /// ADR 0079 step 7: awake-replica high-water, sampled with the probe.
+    awake: AwakeHwm,
 }
 
 impl ElectionProbe {
@@ -1177,6 +1298,7 @@ impl ElectionProbe {
             expect: 0,
             last: cluster.sim_now(),
             leaderless_group_ms: 0,
+            awake: AwakeHwm::default(),
         }
     }
 
@@ -1184,6 +1306,7 @@ impl ElectionProbe {
     /// leaderless now; returns how many groups are led.
     fn sample(&mut self, cluster: &SimCluster) -> usize {
         let (led, _) = election_view(cluster);
+        self.awake.sample(cluster);
         let now = cluster.sim_now();
         let dt_ms = now.0.saturating_sub(self.last.0) / 1_000_000;
         self.leaderless_group_ms += self.expect.saturating_sub(led) as u64 * dt_ms;
@@ -1223,6 +1346,10 @@ struct DensityResult {
 }
 
 fn run_density(s: &Scenario) -> DensityResult {
+    // ADR 0079 step 7: production-default awake cap and pools (A = 2 * 1500),
+    // so the density cells also print and bound the Tier 2 lines.
+    let dens = scale_density(2, 1500);
+    let _density = dens.install();
     let rf = 3.min(s.nodes);
     let mut cluster = SimCluster::new_with_cp_quiescence(s.seed, s.nodes, rf, Some(QUIESCE_AFTER));
     let sim = cluster.simulator();
@@ -1382,6 +1509,10 @@ fn run_density(s: &Scenario) -> DensityResult {
     }
 
     emit_election(&cluster, s, &mut probe);
+    probe.awake.sample(&cluster);
+    let lines = density_lines(&cluster, probe.awake);
+    emit_density_lines(&lines, g, n);
+    assert_density_lines(&lines, &dens, &s.name, s.seed);
 
     DensityResult {
         idle_polls_per_s: polls / secs,
@@ -1485,6 +1616,11 @@ fn assert_tablet_map_consistent(meta: &Metadata, tables: &[String], what: &str) 
 type AckedWrites = Arc<Mutex<Vec<(String, String, Vec<u8>)>>>;
 
 fn run_split_storm(s: &Scenario) {
+    // ADR 0079 step 7: production-default pools, so the storm's splits go
+    // through the split pool (size 1) and its high-water is printed.
+    let dens = scale_density(2, 1500);
+    let _density = dens.install();
+    let mut awake = AwakeHwm::default();
     let rf = 3.min(s.nodes);
     let mut cluster = SimCluster::new_with_cp_quiescence(s.seed, s.nodes, rf, Some(QUIESCE_AFTER));
     let sim = cluster.simulator();
@@ -1548,7 +1684,11 @@ fn run_split_storm(s: &Scenario) {
         meta.tablets
             .values()
             .all(|t| t.state == TabletState::Active && t.inplace_split.is_none())
-            && meta.tablets.len() > tablets_before
+            // Every over-threshold table has split: with the split pool on
+            // (size 1 per node) a deferred split has not started yet, so
+            // "nothing is mid-split" alone would end the storm early (ADR 0079
+            // cell 7: all eventually split).
+            && meta.tablets.len() >= tablets_before + g
     };
     loop {
         rounds += 1;
@@ -1559,6 +1699,7 @@ fn run_split_storm(s: &Scenario) {
             s.seed
         );
         cluster.run_for(Duration::from_millis(500));
+        awake.sample(&cluster);
         for &node in &node_ids {
             cluster.drive_inplace_split_cutover(node);
         }
@@ -1660,6 +1801,15 @@ fn run_split_storm(s: &Scenario) {
         splits >= g,
         "{}: only {splits} splits for {g} over-threshold tables",
         s.name
+    );
+    let lines = density_lines(&cluster, awake);
+    emit_density_lines(&lines, g, n);
+    assert_density_lines(&lines, &dens, &s.name, s.seed);
+    assert!(
+        lines.bg_split_hwm >= 1,
+        "{}: splits ran but the split pool never held a permit (seed={})",
+        s.name,
+        s.seed
     );
 
     // Every acked write survives: converged-or-timeout read-back.
@@ -1834,6 +1984,10 @@ struct BurstResult {
     /// reads) and the most it ever had in flight.
     repair_deferred_total: u64,
     repair_inflight_hwm: u64,
+    /// ADR 0079 step 7: the awake / pool / capacity lines and the knobs they
+    /// were run with.
+    lines: DensityLines,
+    dens: SimDensity,
 }
 
 /// The re-replication burst after one node of a 6-node, RF-3 cluster dies,
@@ -1849,6 +2003,13 @@ struct BurstResult {
 fn run_node_loss_burst(g: usize, puts: usize, value_bytes: usize, seed: u64) -> BurstResult {
     use animus_env::Metric;
     let (nodes, rf, dead) = (6usize, 3usize, 5u64);
+    // ADR 0079 step 7: one core and a deliberately small awake cap (A = 4 per
+    // node, about the replicas each node holds here) with the default pools,
+    // so the loss of a node exercises the wake queue, the lost-leader bypass
+    // and the snapshot pools.
+    let dens = scale_density(1, 4);
+    let _density = dens.install();
+    let mut awake = AwakeHwm::default();
     let mut cluster = SimCluster::new_with_cp_quiescence(seed, nodes, rf, Some(QUIESCE_AFTER));
     let sim = cluster.simulator();
     let tables: Vec<String> = (0..g).map(|i| format!("t{i}")).collect();
@@ -1901,6 +2062,7 @@ fn run_node_loss_burst(g: usize, puts: usize, value_bytes: usize, seed: u64) -> 
     let data_secs = loop {
         cluster.run_for(Duration::from_secs(1));
         secs += 1;
+        awake.sample(&cluster);
         let now = sum(&cluster, ms[0]);
         peak = peak.max(now.saturating_sub(last));
         last = now;
@@ -1953,6 +2115,8 @@ fn run_node_loss_burst(g: usize, puts: usize, value_bytes: usize, seed: u64) -> 
             .map(|n| cluster.metric(n, Metric::CpRepairInflightHwm))
             .max()
             .unwrap_or(0),
+        lines: density_lines(&cluster, awake),
+        dens,
     }
 }
 
@@ -2004,6 +2168,7 @@ fn emit_burst(r: &BurstResult, nodes: usize) {
         nodes,
         r.repair_inflight_hwm as usize,
     );
+    emit_density_lines(&r.lines, t, nodes);
 }
 
 /// #1295 / ADR 0079 measurement (manual, `--ignored --nocapture`): the
@@ -2062,6 +2227,18 @@ fn sim_cluster_scale_node_loss_with_data_installs_snapshots() {
         (1..=16).contains(&r.repair_inflight_hwm),
         "seed={seed}: repair in-flight high-water {} outside 1..=16",
         r.repair_inflight_hwm
+    );
+    // ADR 0079 step 7: the snapshot pools bound the transfers (the sender
+    // took a permit for every install, so the high-water is at least one), the
+    // awake level was observed, and no tablet is capacity-blocked.
+    assert_density_lines(&r.lines, &r.dens, "node-loss burst", seed);
+    assert!(
+        r.lines.bg_snapshot_hwm >= 1,
+        "seed={seed}: snapshots installed but the snapshot pool never held a permit"
+    );
+    assert!(
+        r.lines.awake_hwm >= 1,
+        "seed={seed}: the awake high-water was never sampled above zero"
     );
     assert!(
         r.reconfigure_accepted >= r.on_dead as u64,
