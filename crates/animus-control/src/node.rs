@@ -27,6 +27,7 @@ use crate::persist::{CONTROL_SNAPSHOT, CONTROL_WAL, PersistedState};
 use crate::persist_round::{self, GatedOuts, PersistArm, PersistFut, PersistProgress, PersistWake};
 use crate::raft::{Out, ProposeResult, RaftCore, RaftMsg, Role};
 use crate::rebalance_cache::{RebalanceCache, RebalanceCacheStats};
+use crate::repair_pacing::{RepairPacer, RepairPacing, RepairPacingHandle};
 use crate::syskv;
 use crate::version::{ClusterFeatures, GateSurface, GatedCommand, VersionRange};
 use crate::version_observe::{
@@ -635,6 +636,9 @@ pub struct RaftNode<E: Env> {
     /// This node's own advertised version profile (see
     /// [`set_own_version_range`](Self::set_own_version_range)).
     own_version: Arc<Mutex<OwnVersion>>,
+    /// ADR 0079 step 6: the control leader's repair-pacing knobs, shared with
+    /// the reconcile loop (see [`set_repair_pacing`](Self::set_repair_pacing)).
+    repair_pacing: RepairPacingHandle,
     /// Why this node latched `halted` for a version reason (ADR 0073 Phase 2
     /// startup/install range check); `None` otherwise. See
     /// [`halt_reason`](Self::halt_reason).
@@ -754,6 +758,7 @@ impl<E: Env> RaftNode<E> {
         let own_version = Arc::new(Mutex::new(OwnVersion::default()));
         let halt_reason = Arc::new(Mutex::new(None));
         let features = ClusterFeatures::new();
+        let repair_pacing = RepairPacingHandle::default();
         let node = Self {
             env: env.clone(),
             core: Arc::clone(&core),
@@ -768,6 +773,7 @@ impl<E: Env> RaftNode<E> {
             halted: Arc::clone(&halted),
             observations: Arc::clone(&observations),
             own_version: Arc::clone(&own_version),
+            repair_pacing: repair_pacing.clone(),
             halt_reason: Arc::clone(&halt_reason),
             features: features.clone(),
         };
@@ -800,6 +806,7 @@ impl<E: Env> RaftNode<E> {
             Arc::clone(&cache),
             features.clone(),
             metrics.clone(),
+            repair_pacing,
         ));
         // The failure detector evaluates member liveness on a timer and, when
         // leader, proposes `UpsertMember` transitions (ADR 0012). Like the
@@ -954,6 +961,14 @@ impl<E: Env> RaftNode<E> {
             .lock()
             .expect("own version poisoned")
             .clone()
+    }
+
+    /// Set the control leader's repair-proposal pacing (ADR 0079 section 3):
+    /// `R` per tick and the in-flight cap, `0` = that limit off. Defaults to
+    /// [`RepairPacing::default`] (8 / 16); takes effect on the next reconcile
+    /// tick. Leader-local (class L): no replicated state.
+    pub fn set_repair_pacing(&self, pacing: RepairPacing) {
+        self.repair_pacing.set(pacing);
     }
 
     /// This node's metrics handle (ADR 0015). A snapshot of it
@@ -2865,8 +2880,13 @@ async fn reconcile_loop<E: Env>(
     cache: Arc<Mutex<Arc<Metadata>>>,
     features: ClusterFeatures,
     metrics: MetricsHandle,
+    repair_pacing: RepairPacingHandle,
 ) {
     let mut tick: u64 = 0;
+    // ADR 0079 step 6: the leader's repair in-flight tracker (see
+    // `repair_pacing`'s module doc). Volatile, dropped on losing leadership.
+    let mut pacer = RepairPacer::new();
+    let mut inflight_hwm: u64 = 0;
     // The leader's rebalance plan, kept across ticks (issue #1192, ADR 0029's
     // 2026-10-11 amendment): still at most one move per evaluation, but the
     // O(tablets) planning pass runs only when the cluster diverged from what
@@ -2923,6 +2943,10 @@ async fn reconcile_loop<E: Env>(
             retarget_since.clear();
             done_since.clear();
             down_since.clear();
+            if pacer.inflight() > 0 {
+                pacer.clear();
+                metrics.set(Metric::CpRepairInflight, 0);
+            }
             rebalance_cache.invalidate();
             continue;
         };
@@ -2936,13 +2960,33 @@ async fn reconcile_loop<E: Env>(
         // `REPAIR_DWELL`'s.
         let recently_down = recently_down_this_tick(&env, &view, &mut down_since);
         let proposals = view.reconcile(&recently_done, &recently_down);
-        let repaired = !proposals.is_empty();
-        for command in proposals {
+        // ADR 0079 step 6: pace the repairs (R new per tick, bounded in
+        // flight). A deferred repair is not lost: its tablet still violates
+        // its policy, so the next tick's `reconcile` returns it again.
+        let now = env.now();
+        pacer.expire(now, &view.tablets);
+        let paced = pacer.select(repair_pacing.get(), &view.tablets, proposals);
+        // Deferred work still counts as "repair has something to do": rebalance
+        // must keep yielding to it.
+        let repaired = !paced.propose.is_empty() || paced.deferred > 0;
+        if paced.deferred > 0 {
+            metrics.incr_by(Metric::CpRepairDeferred, paced.deferred as u64);
+        }
+        for command in paced.propose {
             // Off-leader transitions between the check and here are harmless:
             // a stale `CasTabletReplicas` is rejected by the epoch guard, and a
             // non-leader `propose` is dropped.
-            propose_gated(&core, &cache, &features, command);
+            if matches!(
+                propose_gated(&core, &cache, &features, command.clone()),
+                ProposeResult::Accepted { .. }
+            ) {
+                pacer.accepted(now, &command);
+            }
         }
+        let inflight = pacer.inflight() as u64;
+        inflight_hwm = inflight_hwm.max(inflight);
+        metrics.set(Metric::CpRepairInflight, inflight);
+        metrics.set(Metric::CpRepairInflightHwm, inflight_hwm);
         // Load rebalancing (ADR 0029) runs only when repair proposed *nothing*
         // this tick — violation repair always takes priority over balance — and
         // only on the rebalance cadence. It proposes a single balance-improving

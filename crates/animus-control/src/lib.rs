@@ -48,6 +48,7 @@ pub mod raft;
 pub mod rebalance_cache;
 /// Offline force-new-configuration recovery of a Raft WAL (ADR 0077, issue #1178).
 pub mod recover;
+pub mod repair_pacing;
 pub mod schema;
 pub mod shared_wal;
 #[cfg(any(test, feature = "sim-versions"))]

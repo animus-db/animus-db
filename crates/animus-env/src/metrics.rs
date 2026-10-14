@@ -1172,12 +1172,22 @@ pub enum Metric {
     /// A counter: compactions that bypassed the pool because L0 reached
     /// `2 x compaction_trigger` (the safety valve).
     BgCompactionOvercap,
+    // --- Repair pacing (ADR 0079 layer 3, control leader; appended, same
+    // slot-stability discipline). Recorded only by the control leader. ---
+    /// A counter: repair proposals the control leader deferred to a later
+    /// tick (over the per-tick budget `R`, or at the in-flight cap
+    /// `R_inflight`); counted per deferred tablet per tick.
+    CpRepairDeferred,
+    /// A level: repairs in flight on the control leader now.
+    CpRepairInflight,
+    /// A high-water mark: most repairs ever in flight at once.
+    CpRepairInflightHwm,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 166] = [
+    pub const ALL: [Metric; 169] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -1344,6 +1354,9 @@ impl Metric {
         Metric::BgPermitDeferredSplit,
         Metric::BgPermitDeferredCompaction,
         Metric::BgCompactionOvercap,
+        Metric::CpRepairDeferred,
+        Metric::CpRepairInflight,
+        Metric::CpRepairInflightHwm,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -1519,6 +1532,9 @@ impl Metric {
             Metric::BgPermitDeferredSplit => "bg_permit_deferred_split",
             Metric::BgPermitDeferredCompaction => "bg_permit_deferred_compaction",
             Metric::BgCompactionOvercap => "bg_compaction_overcap",
+            Metric::CpRepairDeferred => "cp_repair_deferred",
+            Metric::CpRepairInflight => "cp_repair_inflight",
+            Metric::CpRepairInflightHwm => "cp_repair_inflight_hwm",
         }
     }
 

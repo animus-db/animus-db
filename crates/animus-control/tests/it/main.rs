@@ -50,6 +50,7 @@ mod raft_msg_fixture;
 mod rebalance_cache;
 mod register_node_cas;
 mod removal_notice;
+mod repair_pacing;
 mod restart;
 mod restart_retained_syskv_engine;
 mod restart_seed_before_election;
