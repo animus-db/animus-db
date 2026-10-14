@@ -4739,8 +4739,8 @@ where
         // index. Entries past `idx` have not been checked against the leader's
         // log: a stale suffix from an earlier term can sit there, and
         // committing it would apply a command the leader never committed.
-        // Sending the whole tail on every heartbeat used to hide this; the
-        // empty in-flight heartbeat (issue #1304) exposed it.
+        // Sending the whole tail on every heartbeat hid this; an empty
+        // heartbeat (issue #1304) exposes it.
         if leader_commit > self.commit_index {
             let new_commit = leader_commit.min(idx);
             if new_commit > self.commit_index {

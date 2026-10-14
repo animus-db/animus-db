@@ -1100,5 +1100,5 @@ control nodes applying a different command at the same index in
 
 Tests: `tests/it/pipelined_replication.rs` (the burst is bounded, the ack
 answers with one batch, shallow windows are unchanged, empty heartbeats until
-the retransmit window, a reject resends at once, the commit cap).
+the retransmit window, a reject resends at once; the follower commit cap is `tests/it/follower_commit_cap.rs`, split out as its own PR #1318).
 

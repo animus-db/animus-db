@@ -16,15 +16,13 @@
 //! the in-flight entries have gone unacknowledged for
 //! `INFLIGHT_RETRANSMIT_HEARTBEATS` (4) heartbeats. A reject forgets the mark.
 //!
-//! The same change made the follower's commit rule follow Raft section 5.3
-//! (commit up to the last entry *the message vouched for*, not the follower's
-//! own last index), which the empty heartbeat would otherwise have turned into
-//! committing a stale suffix.
+//! The same change relies on the follower's commit rule following Raft section
+//! 5.3 (tested in `follower_commit_cap.rs`).
 //!
 //! Hand-drives `RaftCore`s directly, no `Simulator`: every property is a pure
 //! function of the messages exchanged.
 
-use animus_control::{LogEntry, MetaCommand, NodeStatus, ProposeResult, RaftCore, RaftMsg};
+use animus_control::{MetaCommand, NodeStatus, ProposeResult, RaftCore, RaftMsg};
 use animus_env::{Nanos, nid};
 use std::collections::BTreeMap;
 
@@ -213,59 +211,4 @@ fn a_reject_behind_a_deep_window_resends_at_once() {
     let a = appends(&out);
     assert_eq!(a.len(), 1, "{out:?}");
     assert!(a[0].1 >= 12, "the whole unacknowledged tail again: {a:?}");
-}
-
-fn entry(term: u64, index: u64, node: u64) -> LogEntry {
-    LogEntry {
-        term,
-        index,
-        command: upsert(node),
-        config: None,
-        learners: None,
-    }
-}
-
-/// Raft section 5.3: an `AppendEntries` vouches for the log only up to
-/// `prev_log_index + entries.len()`. A follower holding a stale suffix of an
-/// earlier term past that point must not commit it because the leader's
-/// `leader_commit` is higher.
-#[test]
-fn a_follower_never_commits_past_the_last_entry_the_message_vouched_for() {
-    let now = Nanos(1_000_000_000);
-    let mut f: RaftCore = RaftCore::new(nid(1), &[nid(0), nid(1), nid(2)], Nanos(0), 3);
-    // Term 1, leader 0: entries 1..=5, none committed.
-    let _ = f.handle(
-        nid(0),
-        RaftMsg::AppendEntries {
-            term: 1,
-            leader: nid(0),
-            prev_log_index: 0,
-            prev_log_term: 0,
-            entries: (1..=5).map(|i| entry(1, i, 600 + i)).collect(),
-            leader_commit: 0,
-        },
-        now,
-        3,
-    );
-    assert_eq!(f.last_log_index(), 5);
-    // Term 2, leader 2, whose log agrees only through index 2. An empty
-    // heartbeat at prev=2 with a high leader_commit.
-    let _ = f.handle(
-        nid(2),
-        RaftMsg::AppendEntries {
-            term: 2,
-            leader: nid(2),
-            prev_log_index: 2,
-            prev_log_term: 1,
-            entries: Vec::new(),
-            leader_commit: 5,
-        },
-        now,
-        3,
-    );
-    assert_eq!(
-        f.commit_index(),
-        2,
-        "indexes 3..=5 were never checked against the term-2 leader's log"
-    );
 }
