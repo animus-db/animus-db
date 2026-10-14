@@ -1,0 +1,114 @@
+{
+  "v": 1,
+  "members": {
+    "n1": {
+      "labels": {},
+      "status": "Active",
+      "has_activated": true
+    },
+    "n2": {
+      "labels": {},
+      "status": "Active",
+      "has_activated": true
+    },
+    "n3": {
+      "labels": {},
+      "status": "Active",
+      "has_activated": true
+    }
+  },
+  "tablets": {
+    "1": {
+      "id": 1,
+      "table": null,
+      "range": {
+        "start": [],
+        "end": null
+      },
+      "replicas": [
+        "n2",
+        "n3"
+      ],
+      "epoch": 2,
+      "state": "Active",
+      "inplace_split": null,
+      "settled_epoch": 2
+    },
+    "2": {
+      "id": 2,
+      "table": null,
+      "range": {
+        "start": [],
+        "end": null
+      },
+      "replicas": [
+        "n1",
+        "n2"
+      ],
+      "epoch": 1,
+      "state": "Active",
+      "inplace_split": null
+    }
+  },
+  "policies": {},
+  "schemas": {
+    "tables": {}
+  },
+  "next_tablet_id": 3,
+  "node_addrs": {
+    "n2": {
+      "internal": "127.0.0.1:9402",
+      "client": "127.0.0.1:9002",
+      "intra": "127.0.0.1:9602",
+      "admin": "127.0.0.1:9502",
+      "role": "combined"
+    }
+  },
+  "split_lineage": {},
+  "split_placing": {},
+  "stream_shards": [],
+  "index_backfill": [],
+  "backups": {},
+  "backup_tablet_progress": [],
+  "restores": {},
+  "pitr_segments": [],
+  "pitr_generation": {},
+  "pitr_base_backups": [],
+  "credentials": {},
+  "exports": {},
+  "imports": {},
+  "node_versions": {
+    "n1": {
+      "range": {
+        "min": 1,
+        "max": 5
+      },
+      "build": "5.0.0"
+    },
+    "n2": {
+      "range": {
+        "min": 1,
+        "max": 5
+      },
+      "build": "5.0.0"
+    },
+    "n3": {
+      "range": {
+        "min": 1,
+        "max": 5
+      },
+      "build": "5.0.0"
+    }
+  },
+  "node_capacity": {
+    "n1": {
+      "weight": 50,
+      "max_replicas": null
+    },
+    "n2": {
+      "weight": 300,
+      "max_replicas": 800
+    }
+  },
+  "cluster_version": 5
+}

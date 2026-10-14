@@ -67,6 +67,54 @@ fn required_gate_rows() {
     );
 }
 
+/// ADR 0079 step 6: `RepairSettled` shares the v5 gate; its apply is an
+/// epoch-CAS (stale and unknown rejected), idempotent (`NoOp`), and the mark
+/// is the tablet's own `settled_epoch`.
+#[test]
+fn repair_settled_gate_and_apply() {
+    use animus_tablet::Epoch;
+    let rs = |t: u64, e: u64| MetaCommand::RepairSettled {
+        tablet: TabletId(t),
+        epoch: Epoch(e),
+    };
+    assert_eq!(rs(1, 1).required_gate(), Gate::NodeCapacity);
+    let mut m = Metadata::default();
+    assert!(matches!(
+        apply(&mut m, &rs(1, 1)),
+        ApplyOutcome::Rejected(_)
+    ));
+    apply(
+        &mut m,
+        &MetaCommand::CreateTablet {
+            tablet: TabletId(1),
+            table: None,
+            range: KeyRange::whole(),
+            replicas: vec![nid(1)],
+        },
+    );
+    assert_eq!(apply(&mut m, &rs(1, 1)), ApplyOutcome::Applied);
+    assert_eq!(apply(&mut m, &rs(1, 1)), ApplyOutcome::NoOp);
+    // A placement change makes the old report stale and the mark inapplicable.
+    apply(
+        &mut m,
+        &MetaCommand::CasTabletReplicas {
+            tablet: TabletId(1),
+            expected_epoch: Epoch(1),
+            replicas: vec![nid(1), nid(2)],
+        },
+    );
+    assert!(matches!(
+        apply(&mut m, &rs(1, 1)),
+        ApplyOutcome::Rejected(_)
+    ));
+    assert_ne!(
+        m.tablets[&TabletId(1)].settled_epoch,
+        Some(m.tablets[&TabletId(1)].epoch)
+    );
+    assert_eq!(apply(&mut m, &rs(1, 2)), ApplyOutcome::Applied);
+    assert_eq!(m.tablets[&TabletId(1)].settled_epoch, Some(Epoch(2)));
+}
+
 /// `Metadata::apply` never reads a gate (ADR 0073 decision 4): both commands
 /// apply on a pre-era metadata; only the *emitters* are gated.
 #[test]

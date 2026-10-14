@@ -545,29 +545,64 @@ or durable shape.
   built (the section 4 `LoadMonitor` factor is data-plane local and the
   decision is the fixed cadence). Q3 (decision): `max_replicas` stays strict
   under repair (step 3's `replan_repair_with_load`; nothing here relaxes it).
-- **In flight, defined.** A repair is in flight from the moment its
-  `CasTabletReplicas` is *accepted* by the leader's core until the first of:
-  (1) `REPAIR_INFLIGHT_TTL` (= `REPAIR_DWELL`, 5 s, an existing constant)
-  elapsed; (2) its tablet leaves the tablet map; (3) the leader loses
-  leadership (the tracker is dropped). The control plane has no replicated
-  "learner caught up" signal (the learner phase is data-plane-local), so
-  completion is not observable on the leader and a time bound is the only one
-  a repair that never completes cannot wedge. A proposal whose CAS has not
-  applied yet (the view's epoch still equals the tracked `expected_epoch`) is a
-  *retry* of the same repair: it passes through free and keeps its original
-  start time, preserving the old re-propose-until-applied behaviour without
-  extending the TTL. Consequence: sustained throughput is at most
-  `min(R / tick, R_inflight / TTL)` = `min(16/s, 3.2/s)`, so a 1000-tablet loss
-  proposes in about 5 minutes rather than the 63 s the `R`-only bound gives; the
-  data plane's own pools (step 5) remain the real limiter on bytes moved.
-  Raise `--repair-inflight-max` for a faster burst.
+- **In flight, defined (decision 2026-10-14, "observable end": a repair is
+  done when its replica set is realised).** A repair is in flight from the
+  moment its `CasTabletReplicas` is *accepted* by the leader's core until the
+  first of: (1) **settled**: the tablet's `settled_epoch` equals its current
+  epoch and that epoch is past the tracked `expected_epoch` (the CAS applied and
+  the data plane reported the resulting replica set realised, below); (2)
+  `REPAIR_INFLIGHT_TTL` (= `REPAIR_DWELL`, 5 s, an existing constant) elapsed,
+  the safety net for a repair that never settles and the only bound while the
+  gate is closed; (3) its tablet leaves the tablet map; (4) the leader loses
+  leadership (the tracker is dropped; a new leader starts empty, as before). A
+  proposal whose CAS has not applied yet (the view's epoch still equals the
+  tracked `expected_epoch`) is a *retry* of the same repair: it passes through
+  free and keeps its original start time. A repair superseded by another CAS is
+  freed by the same rule: the tablet's current epoch is settled, or the TTL
+  runs out.
+- **The completion report (`MetaCommand::RepairSettled { tablet, epoch }`).**
+  The control plane cannot see a learner caught up: `Metadata` holds only the
+  *desired* replica set (the CAS writes it at once) and the learner/voter
+  phase lives in the tablet's own Raft group. So the tablet's data-plane leader
+  reports it: `animusd::repair_settled` ticks every 200 ms, and for each led
+  tablet whose epoch is past `INITIAL`, whose group's voter set equals the
+  `Metadata` replica set and which has no learner left (every target promoted,
+  caught up by the promotion criterion), proposes `RepairSettled` through the
+  relay path (at most 16 per tick; an unconfirmed report is retried after 2 s).
+  Apply: epoch-CAS (a stale epoch is `Rejected`, an unknown tablet too),
+  idempotent (`NoOp` when already recorded), sets the tablet's new
+  `settled_epoch: Option<Epoch>` (`skip_serializing_if` none, so every
+  existing encoding and fixture is byte-identical). Rebalance moves and split
+  placings also report (one extra small command per placement change); the
+  pacer ignores them.
+- **Classification (ADR 0073): G, behind `Gate::NodeCapacity`, no new cluster
+  version.** `required_gate` has an exhaustive row naming `NodeCapacity`; the
+  loop emits nothing while `Metadata::capacity_gate_open()` is false (so the
+  pacer keeps the TTL-only behaviour exactly), and `RaftNode::propose` refuses
+  it while closed. v5 is unreleased, so **the v5 era covers both the capacity
+  metadata and the repair-settled report**: a binary that can decode one can
+  decode the other, so a second gate would only add a version no deployment can
+  sit at. Fixture `metadata/v1-repair-settled.json` (new), shape pinned by
+  `repair_settled_wire_shapes_are_pinned`.
+- **Throughput.** Sustained repair throughput is bounded by `R` per tick and
+  by real completion (a slot is held for the learner's actual catch-up, not 5
+  s): `min(R / tick, R_inflight / completion time)`. Measured in the
+  `animus-control` cell (30 violating tablets, simulated promotion 300 ms after
+  the CAS): all repairs commit 7.6 s after the kill (5 s dwell + 2.6 s) against
+  11.3 s with the TTL alone, in-flight high-water 8 against 16. At `R` = 8 per
+  500 ms tick a 1000-tablet loss proposes in about 63 s (it was about 5 minutes
+  under the TTL-only definition, `R_inflight / TTL` = 3.2/s); slow real
+  catch-ups lengthen it, bounded by the TTL, and the data plane's own pools
+  (step 5) remain the real limiter on bytes moved. While the gate is closed
+  (clusters below version 5) the TTL-only bound still applies; raise
+  `--repair-inflight-max` for a faster burst there.
 - **Metrics.** `CpRepairDeferred` (counter, per deferred tablet per tick),
   `CpRepairInflight` (level), `CpRepairInflightHwm`; the C-17
   `sim_cluster_scale_node_loss_*` cells print `repair_deferred_total` and
   `repair_inflight_hwm`, and the per-push cell asserts the high-water is within
   `1..=16`. Rebalancing still yields while repairs are deferred.
 - **Corpus** (`animus-control` `tests/it/repair_pacing.rs`, knob
-  `ANIMUS_REPAIR_PACING_SEEDS`; 60 RF3 tablets over 6 nodes, one node killed,
+  `ANIMUS_REPAIR_PACING_SEEDS`; cells `cell9_settled_report_frees_slots_before_the_ttl`, `cell9_unsettled_repairs_are_freed_by_the_ttl`, negative control (g) completion detection off, plus `animusd` `sim_cluster_repair_settled`; 60 RF3 tablets over 6 nodes, one node killed,
   the real `reconcile_loop`): cell 9 (default pacing: at most `R` repairs
   committed per tick window, in-flight high-water at most `R_inflight`, all
   tablets RF3 within `REPAIR_DWELL + ceil(V/slots) * (TTL + tick) + 5 s`, the

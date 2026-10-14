@@ -276,7 +276,8 @@ pub fn apply_and_derive_mirror(
             writes.push(put_json(syskv::tablet_key(*tablet), &meta.tablets[tablet]));
             writes.push(put_counter(NEXT_TABLET_ID_COUNTER, meta.next_tablet_id));
         }
-        MetaCommand::CasTabletReplicas { tablet, .. } => {
+        MetaCommand::CasTabletReplicas { tablet, .. }
+        | MetaCommand::RepairSettled { tablet, .. } => {
             writes.push(put_json(syskv::tablet_key(*tablet), &meta.tablets[tablet]));
         }
         MetaCommand::BeginSplitInPlace { parent, .. } => {

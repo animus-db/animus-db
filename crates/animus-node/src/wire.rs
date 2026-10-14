@@ -1328,6 +1328,13 @@ pub fn is_relayable_command(command: &MetaCommand) -> bool {
         // proposes `CasTabletReplicas` directly off its own live
         // `RaftNode` handle, so it needs no relay path of its own.
         | MetaCommand::MarkSplitPlacingDone { .. }
+        // Repair-settled report (ADR 0079 step 6, `Gate::NodeCapacity`): a
+        // tablet leader's own "the repair's replica set is realised" report,
+        // from wherever that leader runs — the identical relay reasoning as
+        // `MarkSplitPlacingDone` just above. Missing this arm would be the
+        // bimodal per-process flake the root `CLAUDE.md` warns about: a
+        // report from a follower-connected node would never reach the leader.
+        | MetaCommand::RepairSettled { .. }
         // Replicated credential catalog (ADR 0066 §1/§2): `PutCredential`/
         // `RotateCredential`/`RevokeCredential` all originate from the
         // admin API (`animusd::admin`, ADR 0066 §6), which may land on any
@@ -2104,6 +2111,10 @@ mod tests {
             MetaCommand::MarkSplitPlacingDone {
                 tablet: TabletId(2),
                 expected_epoch: Epoch::INITIAL,
+            },
+            MetaCommand::RepairSettled {
+                tablet: TabletId(2),
+                epoch: Epoch::INITIAL,
             },
             MetaCommand::PutCredential {
                 id: "AKID1".to_string(),

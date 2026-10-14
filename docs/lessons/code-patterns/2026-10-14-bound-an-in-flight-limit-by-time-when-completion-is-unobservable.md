@@ -17,3 +17,17 @@ case a repair queue exists for. State the throughput consequence (here
 **Also:** a re-proposal of a not-yet-applied command is a retry, not new work;
 count it as neither a new slot nor a fresh TTL, or a lost proposal either
 starves the queue or never ages out.
+
+**Amendment (same day): make completion observable, keep the time bound.**
+"Unobservable" was the wrong place to stop. The maintainer's call was to add the
+signal: the party that does the work (the tablet's data-plane leader) reports
+completion through a replicated command (`RepairSettled`, gated), and the
+limiter frees the slot on it. The time bound stays as the safety net, so a
+repair that never completes (or a lost report) still cannot wedge the queue. A
+TTL-only definition capped throughput at `R_inflight / TTL` (about 5 minutes
+for 1000 tablets) regardless of how fast repairs really finish; with the report
+the measured burst ends at the per-tick bound. Check first what replicated
+state already shows: here `Metadata` holds only the *desired* replica set, so
+the "promotion is visible in Metadata" guess was false and the report needed a
+new (gated) command. Order of preference: observable completion + time-bound
+fallback, over time bound alone.

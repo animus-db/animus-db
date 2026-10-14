@@ -2196,6 +2196,16 @@ pub enum MetaCommand {
         tablet: TabletId,
         expected_epoch: Epoch,
     },
+    /// **Gated (`Gate::NodeCapacity`, ADR 0079 step 6)**: the tablet's own
+    /// data-plane leader reports that the replica set of placement epoch
+    /// `epoch` is **realised** in its Raft group (every replica a voter, no
+    /// learner remaining). Records `Tablet::settled_epoch = Some(epoch)`; the
+    /// control leader's repair pacer frees that repair's in-flight slot on it.
+    /// Epoch-CAS'd against the tablet's current epoch (a stale report is
+    /// `Rejected`, the `MarkSplitPlacingDone` discipline) and idempotent
+    /// (`NoOp` when already recorded), so a retried or duplicated report is
+    /// harmless. Never emitted while the gate is closed.
+    RepairSettled { tablet: TabletId, epoch: Epoch },
     /// Replace an in-place split child's directed-Placing STORED target
     /// (ADR 0062 §2, issue #528 fix): `tablet` is the CHILD's own id.
     /// Proposed only by the control-plane leader's own `reconcile_loop`
@@ -4406,6 +4416,15 @@ impl Metadata {
                 self.policies.remove(parent);
                 ApplyOutcome::Applied
             }
+            MetaCommand::RepairSettled { tablet, epoch } => match self.tablets.get_mut(tablet) {
+                None => ApplyOutcome::Rejected("no such tablet"),
+                Some(t) if t.epoch != *epoch => ApplyOutcome::Rejected("epoch mismatch"),
+                Some(t) if t.settled_epoch == Some(*epoch) => ApplyOutcome::NoOp,
+                Some(t) => {
+                    t.settled_epoch = Some(*epoch);
+                    ApplyOutcome::Applied
+                }
+            },
             MetaCommand::MarkSplitPlacingDone {
                 tablet,
                 expected_epoch,
@@ -7349,7 +7368,10 @@ impl crate::version::GatedCommand for MetaCommand {
             MetaCommand::RegisterNode {
                 capacity: Some(_), ..
             }
-            | MetaCommand::SetNodeCapacity { .. } => Gate::NodeCapacity,
+            | MetaCommand::SetNodeCapacity { .. }
+            // ADR 0079 step 6: shares the unreleased v5 era with the capacity
+            // metadata (an older voter can decode neither).
+            | MetaCommand::RepairSettled { .. } => Gate::NodeCapacity,
             MetaCommand::RegisterNode { capacity: None, .. } => Gate::Base,
             // ADR 0075 (G-01 stage G-c): the first real gate. An older voter
             // cannot decode the variant nor the `TableSchema.global` /

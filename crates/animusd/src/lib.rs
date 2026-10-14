@@ -124,6 +124,7 @@ mod overload;
 mod pitr_janitor;
 #[deny(clippy::disallowed_methods)]
 mod read_path;
+mod repair_settled;
 #[deny(clippy::disallowed_methods)]
 mod roll_health;
 #[deny(clippy::disallowed_methods)]
@@ -6866,6 +6867,11 @@ impl BoundNode {
         tasks.push(tokio::spawn(
             split_placing_completion::split_placing_completion_loop(ctx.clone()),
         ));
+        // ADR 0079 step 6: report a converged repair so the control leader's
+        // repair pacer frees its in-flight slot (gated, `Gate::NodeCapacity`).
+        tasks.push(tokio::spawn(repair_settled::repair_settled_loop(
+            ctx.clone(),
+        )));
 
         // The segment janitor (ADR 0043 §A9, round-3 PR7): retention +
         // replica repair over the whole stream-shard catalog. Control-
@@ -9132,6 +9138,11 @@ impl BoundDataNode {
         tasks.push(tokio::spawn(
             split_placing_completion::split_placing_completion_loop(ctx.clone()),
         ));
+        // ADR 0079 step 6: report a converged repair so the control leader's
+        // repair pacer frees its in-flight slot (gated, `Gate::NodeCapacity`).
+        tasks.push(tokio::spawn(repair_settled::repair_settled_loop(
+            ctx.clone(),
+        )));
 
         // ADR 0067 (W-08b): unconditional spawn — see the combined-mode
         // spawn site's identical comment above.
@@ -23968,6 +23979,9 @@ mod sim_cluster_seed_join;
 
 #[cfg(test)]
 mod sim_cluster_cluster_version;
+
+#[cfg(test)]
+mod sim_cluster_repair_settled;
 /// ADR 0073 Phase 2 (P2-A) residual risk #1 at the node-assembly level: every
 /// node role `SimCluster` can build (control-only, combined, data-only, a
 /// runtime-grown control voter, `join_via_seed` joiners of both kinds) is in

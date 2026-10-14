@@ -3540,3 +3540,22 @@ per-node declared capacity of ADR 0079 section 1.
   ungated emit must wedge exactly the `Release(4)` voter. The pure tier is
   `animus-control` `node_capacity::` (apply matrix, gate rows, placement reads
   capacity only once open, `max_replicas` binding and the over-cap drain).
+
+## Amendment 2026-10-14 — `RepairSettled` shares `Gate::NodeCapacity` (ADR 0079 step 6)
+
+| New shape | Class | Gate | Emit-site / propose-site check |
+|---|---|---|---|
+| `MetaCommand::RepairSettled { tablet, epoch }` | G (new variant) | `NodeCapacity` | exhaustive `required_gate` row; `RaftNode::propose` refuses it while closed; `animusd::repair_settled` emits nothing while `Metadata::capacity_gate_open()` is false; `is_relayable_command` arm in `animus-node` `wire.rs` |
+| `Tablet.settled_epoch` (`Option<Epoch>`, `skip_serializing_if`) | G (state) / L (mirror row) | follows the command | absent from every tablet never reported, so all existing tablet encodings, mirror rows and fixtures are byte-identical; a reader that does not know the key ignores it |
+
+No new cluster version: v5 is unreleased, so the same era covers the capacity
+metadata and the repair-settled report (a binary that decodes one decodes the
+other). Were v5 released first, this would need its own gate and version 6.
+`apply` never reads the gate (decision 4); only the emitter is gated.
+Fixture (new, none edited): `metadata/v1-repair-settled.json`;
+`repair_settled_wire_shapes_are_pinned` freezes the command JSON. Gate tests:
+`node_capacity::repair_settled_gate_and_apply`, `sim_versions` unit
+`repair_settled_needs_the_node_capacity_gate` (a `Release(4)` capped decode
+refuses it by content), and `animusd` `sim_cluster_repair_settled` (nothing
+reported through a closed gate, the leader's report lands once open, a
+follower-connected report relays, stale rejected).
