@@ -4690,9 +4690,20 @@ where
         }
         let match_index = idx;
 
+        // Raft §5.3: the commit index may only follow the leader up to the
+        // index of the last entry THIS message vouched for (`idx`:
+        // `prev_log_index` plus the entries carried), never up to our own last
+        // index. Entries past `idx` have not been checked against the leader's
+        // log: a stale suffix from an earlier term can sit there, and
+        // committing it would apply a command the leader never committed.
+        // Sending the whole tail on every heartbeat hid this; an empty
+        // heartbeat (issue #1304) exposes it.
         if leader_commit > self.commit_index {
-            self.commit_index = leader_commit.min(self.last_log_index());
-            self.apply();
+            let new_commit = leader_commit.min(idx);
+            if new_commit > self.commit_index {
+                self.commit_index = new_commit;
+                self.apply();
+            }
         }
 
         // Issue #1228 (R-01 (d), ADR 0074 section 2, "all replicas full"): a
