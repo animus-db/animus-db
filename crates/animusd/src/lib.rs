@@ -2097,6 +2097,87 @@ fn kind_batch_confirm_superseded(
             .is_some_and(|(term, _)| *term != accepted_term)
 }
 
+/// One confirm-loop poll's decision from a **single** `engine_applied_index`
+/// sample `applied` (issue #1308): the confirm classification
+/// ([`classify_kind_batch_outcome`]) and the superseded proof
+/// ([`kind_batch_confirm_superseded`]) MUST read the same sample.
+///
+/// The apply task records an entry's outcome *before* it publishes the
+/// applied index that makes its effects readable. A loop that sampled the
+/// applied index for the classification (still behind: `Applied` recorded
+/// but not readable, so `Inconclusive`), read the outcome, and then
+/// sampled the applied index *again* for the superseded proof could see
+/// the index jump past `accepted_index` in between, and report its OWN,
+/// just-applied entry as superseded. The caller then retried a write that
+/// had already applied: a duplicate item version and a duplicate Streams
+/// change record in an adjacent epoch (`cascade_split_walks_the_grandparent_
+/// chain_with_closed_shard_shape`, `delivered=121 expected=120`). With one
+/// sample, "behind the index" can only wait and "at/past the index" always
+/// has its own recorded outcome (the classification then confirms).
+///
+/// `superseded` is only meaningful when the signal is
+/// [`KindBatchSignal::Inconclusive`].
+fn kind_poll(
+    applied: u64,
+    accepted_index: u64,
+    accepted_term: u64,
+    outcome: &Option<(u64, KindBatchOutcome)>,
+) -> (KindBatchSignal, bool) {
+    (
+        classify_kind_batch_outcome(outcome.clone(), accepted_term, applied >= accepted_index),
+        kind_batch_confirm_superseded(applied, accepted_index, accepted_term, outcome),
+    )
+}
+
+#[cfg(test)]
+mod kind_poll_tests {
+    use super::{KindBatchOutcome, KindBatchSignal, kind_poll};
+
+    const IDX: u64 = 10;
+    const TERM: u64 = 7;
+
+    /// Issue #1308's interleaving, as seen by one poll: our own entry's
+    /// `Applied` is recorded but the applied index has not reached it yet.
+    /// Must wait, never report superseded (the old two-sample loop did, once
+    /// the second sample had advanced).
+    #[test]
+    fn own_applied_outcome_not_yet_readable_waits_and_is_never_superseded() {
+        let outcome = Some((TERM, KindBatchOutcome::Applied));
+        assert_eq!(
+            kind_poll(IDX - 1, IDX, TERM, &outcome),
+            (KindBatchSignal::Inconclusive, false)
+        );
+    }
+
+    /// The same entry once the index has caught up: a confirm.
+    #[test]
+    fn own_applied_outcome_readable_confirms() {
+        let outcome = Some((TERM, KindBatchOutcome::Applied));
+        assert_eq!(
+            kind_poll(IDX, IDX, TERM, &outcome).0,
+            KindBatchSignal::Confirm
+        );
+    }
+
+    /// Genuine supersede proofs are unchanged.
+    #[test]
+    fn genuine_supersede_proofs_still_fire() {
+        assert_eq!(
+            kind_poll(IDX, IDX, TERM, &None),
+            (KindBatchSignal::Inconclusive, true)
+        );
+        assert_eq!(
+            kind_poll(
+                IDX - 1,
+                IDX,
+                TERM,
+                &Some((TERM + 1, KindBatchOutcome::Applied))
+            ),
+            (KindBatchSignal::Inconclusive, true)
+        );
+    }
+}
+
 #[cfg(test)]
 mod kind_batch_confirm_superseded_tests {
     use super::{KindBatchOutcome, kind_batch_confirm_superseded};

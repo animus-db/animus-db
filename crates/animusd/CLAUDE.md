@@ -296,7 +296,9 @@ a literal `:0`.
   one of its callers (issues #911, #967, #971); the leadership-independent
   replacement, `kind_batch_confirm_superseded`, stayed in `animusd::lib`
   rather than moving to `animus-node`, since every one of its own callers
-  is itself `animusd`-local. `confirm_futility_tests`
+  is itself `animusd`-local. **Confirm loops decide via `kind_poll` (issue #1308): one
+  `engine_applied_index` sample feeds both the confirm classification and the superseded
+  proof; a second fresher sample double-applies a just-applied write.** `confirm_futility_tests`
   (in-crate here, real-socket, `#[tokio::test(flavor = "multi_thread")]`)
   proves the wired end-to-end fast-fail behavior through a real `CpGroup`
   propose/apply/poll round trip with timing assertions, not a predicate in

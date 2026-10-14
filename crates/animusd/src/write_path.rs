@@ -20,7 +20,7 @@ use crate::{
     CLIENT_TIMEOUT, CP_CONFIRM_POLL_MAX, ClientCtx, ClientRequest, ClientResponse, CpGroup,
     CpRoute, KindBatchSignal, KindWriteBatchItem, KindWriteOp, KvPair, ProbeIdentity, ProbeWait,
     SCHEMA_POLL_INTERVAL, classify_kind_batch_outcome, decide, dynamo,
-    kind_batch_confirm_superseded,
+    kind_batch_confirm_superseded, kind_poll,
 };
 
 /// The message [`ClientCtx::cp_kind_eval_local`] returns for a confirmed-
@@ -817,9 +817,14 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         // function's own longer-standing doc note above for why this
         // replaced the old flat/exponential polls.
         while leader.env().now() < deadline {
-            let effects_readable = leader.engine_applied_index() >= accepted_index;
+            // ONE `engine_applied_index` sample feeds both the confirm
+            // classification and the superseded proof (issue #1308): see
+            // `kind_poll`'s doc for the double-apply a second, fresher
+            // sample caused.
+            let applied = leader.engine_applied_index();
             let outcome = leader.kind_batch_outcome(accepted_index);
-            match classify_kind_batch_outcome(outcome.clone(), accepted_term, effects_readable) {
+            let (signal, superseded) = kind_poll(applied, accepted_index, accepted_term, &outcome);
+            match signal {
                 KindBatchSignal::Confirm => return Ok(()),
                 KindBatchSignal::NoOp => return Err(SUPERSEDED.into()),
                 KindBatchSignal::Inconclusive => {}
@@ -830,12 +835,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             // Leadership-independent proof this index resolved against us —
             // see [`kind_batch_confirm_superseded`]'s own doc for why
             // `!is_leader()` alone is deliberately NOT consulted here.
-            if kind_batch_confirm_superseded(
-                leader.engine_applied_index(),
-                accepted_index,
-                accepted_term,
-                &outcome,
-            ) {
+            if superseded {
                 return Err(SUPERSEDED.into());
             }
             Self::wait_applied_past(leader, accepted_index).await;
@@ -935,9 +935,14 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         // write that commits+applies in a few ms now returns in well under a
         // millisecond instead of eating either fixed floor.
         while leader.env().now() < deadline {
-            let effects_readable = leader.engine_applied_index() >= accepted_index;
+            // ONE `engine_applied_index` sample feeds both the confirm
+            // classification and the superseded proof (issue #1308): see
+            // `kind_poll`'s doc for the double-apply a second, fresher
+            // sample caused.
+            let applied = leader.engine_applied_index();
             let outcome = leader.kind_batch_outcome(accepted_index);
-            match classify_kind_batch_outcome(outcome.clone(), accepted_term, effects_readable) {
+            let (signal, superseded) = kind_poll(applied, accepted_index, accepted_term, &outcome);
+            match signal {
                 KindBatchSignal::Confirm => {
                     return Self::kind_eval_confirmed(
                         leader,
@@ -957,12 +962,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             // loop used the same `confirm_wait_is_futile` call) — see
             // [`kind_batch_confirm_superseded`]'s own doc for why
             // `!is_leader()` alone is deliberately NOT consulted any more.
-            if kind_batch_confirm_superseded(
-                leader.engine_applied_index(),
-                accepted_index,
-                accepted_term,
-                &outcome,
-            ) {
+            if superseded {
                 return Err(SUPERSEDED.into());
             }
             Self::wait_applied_past(leader, accepted_index).await;
@@ -1134,9 +1134,14 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         // for why this is THE confirm loop shape for every write since ADR
         // 0054 step 3, unchanged here at the batch grain.
         while leader.env().now() < deadline {
-            let effects_readable = leader.engine_applied_index() >= accepted_index;
+            // ONE `engine_applied_index` sample feeds both the confirm
+            // classification and the superseded proof (issue #1308): see
+            // `kind_poll`'s doc for the double-apply a second, fresher
+            // sample caused.
+            let applied = leader.engine_applied_index();
             let outcome = leader.kind_batch_outcome(accepted_index);
-            match classify_kind_batch_outcome(outcome.clone(), accepted_term, effects_readable) {
+            let (signal, superseded) = kind_poll(applied, accepted_index, accepted_term, &outcome);
+            match signal {
                 KindBatchSignal::Confirm => {
                     return Self::kind_eval_batch_confirmed(
                         leader,
@@ -1150,12 +1155,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 KindBatchSignal::NoOp => return Err(Self::kind_eval_batch_noop(outcome)),
                 KindBatchSignal::Inconclusive => {}
             }
-            if kind_batch_confirm_superseded(
-                leader.engine_applied_index(),
-                accepted_index,
-                accepted_term,
-                &outcome,
-            ) {
+            if superseded {
                 return Err(SUPERSEDED.into());
             }
             Self::wait_applied_past(leader, accepted_index).await;
