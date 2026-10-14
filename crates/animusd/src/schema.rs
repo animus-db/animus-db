@@ -1386,10 +1386,16 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         loop {
             match self.resolve_cp_route(tablet) {
                 Some(CpRoute::Local(leader)) => {
-                    return match median_split_key(&leader).await {
+                    let resp = match median_split_key(&leader).await {
                         None => ClientResponse::Error(STREAM_GROW_NO_SPLIT_POINT.into()),
                         Some(split_key) => self.trigger_split(tablet, split_key).await,
                     };
+                    // ADR 0079 layer 3: a full split pool is "not now", and
+                    // this action is the operator saying "split every tablet",
+                    // so wait for the earlier splits to finish (below).
+                    if !matches!(&resp, ClientResponse::Error(e) if e == SPLIT_BUSY) {
+                        return resp;
+                    }
                 }
                 Some(CpRoute::Forward(addr, hinted)) => {
                     let request = ClientRequest::TriggerAutoSplit { tablet: tablet.0 };
@@ -1399,6 +1405,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     {
                         ClientResponse::Error(e)
                             if topology::parse_not_leader_refusal(&e).is_some() => {} // chase exhausted mid-election, retry below
+                        ClientResponse::Error(e) if e == SPLIT_BUSY => {} // pool full, retry below
                         other => return other,
                     }
                 }
