@@ -87,7 +87,7 @@
 mod chaos_support;
 mod support;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -706,7 +706,18 @@ async fn roll_scenario(
     };
     eprintln!("upgrade[{name}]: PLAN {}", Value::Array(order.clone()));
     let mut transfer_from: Option<String> = None;
-    for first in &order {
+    // The plan follows the *current* control leader (the leader rolls last), and
+    // under load the leader moves on its own mid-roll, so the order taken at the
+    // start goes stale. A real operator follows each fresh plan; so does this
+    // loop: after every step the queue is replaced by the re-plan (below).
+    let mut queue: VecDeque<Value> = order.iter().cloned().collect();
+    let mut yet_to_roll: BTreeSet<String> = order
+        .iter()
+        .filter(|st| st["action"] == "restart")
+        .map(|st| st["node"].as_str().expect("node").to_string())
+        .collect();
+    while let Some(first) = queue.pop_front() {
+        let first = &first;
         if first["action"] == "transfer_control_leadership" {
             let from = first["from"].as_str().expect("from").to_string();
             let to = first["to"].as_str().expect("transfer target").to_string();
@@ -807,16 +818,12 @@ async fn roll_scenario(
         row["restart_to_healthy_ms"] = json!(healthy_after.saturating_sub(down).as_millis() as u64);
         eprintln!("upgrade[{name}]: step {id}: {row}");
         steps.push(row);
+        yet_to_roll.remove(&id);
         if control.is_none() {
             // Re-entrancy: a fresh plan, asked of a node that is up, lists
-            // exactly the restarts still to do (the not-yet-rolled nodes).
-            let left: Vec<String> = order
-                .iter()
-                .skip_while(|st| st["node"].as_str() != Some(id.as_str()))
-                .skip(1)
-                .filter(|st| st["action"] == "restart")
-                .map(|st| st["node"].as_str().expect("node").to_string())
-                .collect();
+            // exactly the restarts still to do (the not-yet-rolled nodes), in
+            // the order the *current* leader implies, which may differ from the
+            // first plan's if the control leader moved.
             let asked = c.nodes[i].admin.to_string();
             let p: Value = poll_until("re-plan accepted", Duration::from_secs(120), || async {
                 let (_, out, err) =
@@ -829,18 +836,17 @@ async fn roll_scenario(
                 Ok(p)
             })
             .await;
-            let got: Vec<String> = p["steps"]
-                .as_array()
-                .map(|v| v.as_slice())
-                .unwrap_or_default()
+            let steps: Vec<Value> = p["steps"].as_array().cloned().unwrap_or_default();
+            let got: BTreeSet<String> = steps
                 .iter()
                 .filter(|st| st["action"] == "restart")
                 .map(|st| st["node"].as_str().expect("node").to_string())
                 .collect();
             assert_eq!(
-                got, left,
+                got, yet_to_roll,
                 "re-plan after rolling {id} must list exactly the remaining nodes: {p}"
             );
+            queue = steps.into();
         }
         // Let repair settle so its traffic is attributed to this step, and
         // give the workload a window on the new mix before the next one.
