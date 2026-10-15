@@ -1261,7 +1261,7 @@ impl<E: Env> LsmEngine<E> {
                 // other multi-table path here already applies (`may_contain_
                 // observed` for point reads, `ranges_overlap` for compaction,
                 // `sstable_overlaps` for `approx_bytes_in_range`). Without it,
-                // `SsTableReader::scan_at` starts from `block_for_key(start)`,
+                // `SsTableReader::scan_at` starts from `blocks_for_key(start).start`,
                 // which for a table sorting entirely below `start` resolves to
                 // the table's *last* block — fetched, decompressed, and then
                 // filtered out record by record (issue #835). This is a pure

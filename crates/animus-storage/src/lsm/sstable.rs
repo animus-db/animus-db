@@ -705,59 +705,62 @@ impl SsTableReader {
         }
     }
 
-    /// The index of the block that may contain `key`: the last block whose
-    /// `first_key <= key`. Blocks are ordered by first key.
-    fn block_for_key(&self, key: &[u8]) -> Option<usize> {
-        if self.index.is_empty() {
-            return None;
-        }
-        // partition_point: count of blocks with first_key <= key.
-        let p = self
+    /// The blocks that may hold records for `key`, as an index range.
+    ///
+    /// A block is cut when it reaches `TARGET_BLOCK_BYTES`, with no regard for
+    /// key boundaries, so one key's versions can span several consecutive
+    /// blocks: the last block whose first key is below `key` (it may run on
+    /// into `key`), plus every block whose first key equals `key`. Reading
+    /// only the last block with `first_key <= key` misses the older versions
+    /// (issue #1315).
+    fn blocks_for_key(&self, key: &[u8]) -> std::ops::Range<usize> {
+        let below = self.index.partition_point(|b| b.first_key.as_slice() < key);
+        let at_or_below = self
             .index
             .partition_point(|b| b.first_key.as_slice() <= key);
-        if p == 0 {
-            // key precedes the first block's first key; only block 0 could hold a
-            // key equal to its first key — but key < first_key here, so none.
-            None
-        } else {
-            Some(p - 1)
-        }
+        below.saturating_sub(1)..at_or_below
     }
 
-    /// Newest record for `key` (greatest version), or `None`. Reads the one block
-    /// that could hold `key`.
+    /// Every record for `key` across the candidate blocks.
+    async fn records_for_key<E: Env>(
+        &self,
+        env: &E,
+        key: &[u8],
+        version: Version,
+    ) -> Result<Option<(Version, Option<Value>)>> {
+        let mut best: Option<(Version, Option<Value>)> = None;
+        for bidx in self.blocks_for_key(key) {
+            let block = self.read_block(env, &self.index[bidx]).await?;
+            for r in block {
+                if r.key == key
+                    && r.version <= version
+                    && best.as_ref().is_none_or(|(v, _)| r.version > *v)
+                {
+                    best = Some((r.version, r.value));
+                }
+            }
+        }
+        Ok(best)
+    }
+
+    /// Newest record for `key` (greatest version), or `None`. Reads every block
+    /// that could hold `key` (its versions may straddle blocks).
     pub async fn latest<E: Env>(
         &self,
         env: &E,
         key: &[u8],
     ) -> Result<Option<(Version, Option<Value>)>> {
-        let Some(bidx) = self.block_for_key(key) else {
-            return Ok(None);
-        };
-        let block = self.read_block(env, &self.index[bidx]).await?;
-        Ok(block
-            .into_iter()
-            .filter(|r| r.key == key)
-            .map(|r| (r.version, r.value))
-            .max_by_key(|(v, _)| *v))
+        self.records_for_key(env, key, Version::MAX).await
     }
 
-    /// Record for `key` as of `version`: greatest version `≤ version`, or `None`.
+    /// Record for `key` as of `version`: greatest version `<= version`, or `None`.
     pub async fn get_at<E: Env>(
         &self,
         env: &E,
         key: &[u8],
         version: Version,
     ) -> Result<Option<(Version, Option<Value>)>> {
-        let Some(bidx) = self.block_for_key(key) else {
-            return Ok(None);
-        };
-        let block = self.read_block(env, &self.index[bidx]).await?;
-        Ok(block
-            .into_iter()
-            .filter(|r| r.key == key && r.version <= version)
-            .map(|r| (r.version, r.value))
-            .max_by_key(|(v, _)| *v))
+        self.records_for_key(env, key, version).await
     }
 
     /// Scan `[start, end)` as of `version`: for each key in range the greatest
@@ -775,7 +778,7 @@ impl SsTableReader {
         }
         // First block to read: the one that could hold `start` (or block 0 if
         // `start` precedes everything).
-        let first = self.block_for_key(start).unwrap_or(0);
+        let first = self.blocks_for_key(start).start;
         // Collapse to the newest `(key) -> (version, slot)` with version <=
         // version, over the scanned range.
         let mut per_key: std::collections::BTreeMap<Key, (Version, Option<Value>)> =
