@@ -58,7 +58,7 @@ use animus_cp_data::host::{
     MetadataView, Reconciler,
 };
 use animus_cp_data::load_monitor::{DEFAULT_LAG_STRETCH_MAX_X, LoadMonitor};
-use animus_env::{Disk, Env, NodeId, ProdEnv, nid};
+use animus_env::{Env, NodeId, ProdEnv, nid};
 use animus_storage::{LsmEngine, LsmOptions, StorageEngine};
 use animus_tablet::{KeyRange, Tablet, TabletId};
 use tokio::time::{sleep, timeout};
@@ -744,38 +744,47 @@ fn dir_stats(dirs: &[std::path::PathBuf]) -> (usize, u64, usize) {
 /// `LsmTabletFactory` (prefix `db-t<id>-`, `LsmOptions::production()`), for the
 /// `ANIMUS_BP_LIVE_ENGINE=lsm` density calibration. Test-local, so the
 /// product code is untouched.
-#[derive(Clone)]
 struct LsmFactory {
     env: ProdEnv,
+    files: animus_cp_data::tablet_files::TabletFileIndex<ProdEnv>,
 }
 
 fn lsm_prefix(t: TabletId) -> String {
     format!("db-t{}-", t.0)
 }
 
+fn lsm_parse(f: &str) -> Option<TabletId> {
+    let rest = f.strip_prefix("db-t")?;
+    let end = rest.find('-')?;
+    rest[..end].parse::<u64>().ok().map(TabletId)
+}
+
+impl LsmFactory {
+    fn new(env: ProdEnv) -> Self {
+        Self {
+            files: animus_cp_data::tablet_files::TabletFileIndex::new(
+                env.clone(),
+                lsm_prefix,
+                lsm_parse,
+            ),
+            env,
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl EngineFactory<LsmEngine<ProdEnv>> for LsmFactory {
     async fn open(&self, t: TabletId) -> Result<LsmEngine<ProdEnv>, String> {
+        self.files.note_open(t);
         LsmEngine::open_with(self.env.clone(), &lsm_prefix(t), LsmOptions::production())
             .await
             .map_err(|e| e.to_string())
     }
     async fn probe(&self, t: TabletId) -> bool {
-        let p = lsm_prefix(t);
-        self.env
-            .list()
-            .await
-            .unwrap_or_default()
-            .iter()
-            .any(|f| f.starts_with(&p))
+        self.files.probe(t).await
     }
     async fn destroy(&self, t: TabletId) {
-        let p = lsm_prefix(t);
-        for f in self.env.list().await.unwrap_or_default() {
-            if f.starts_with(&p) {
-                let _ = self.env.remove(&f).await;
-            }
-        }
+        let _ = self.files.destroy(t).await;
     }
     async fn flush_engine(&self, engine: &LsmEngine<ProdEnv>) -> Result<(), String> {
         engine.flush_now().await.map_err(|e| e.to_string())
@@ -786,6 +795,7 @@ impl EngineFactory<LsmEngine<ProdEnv>> for LsmFactory {
         target: TabletId,
         keep: &[(Vec<u8>, Option<Vec<u8>>)],
     ) -> Result<LsmEngine<ProdEnv>, String> {
+        self.files.note_open(target);
         source
             .clone_to_filtered(lsm_prefix(target), keep)
             .await
@@ -844,7 +854,7 @@ fn density_repro_g3000_holds_led_count() {
 async fn density_run(lsm: bool, workers: usize) {
     if lsm {
         let mut c = Cluster::start(knob("ANIMUS_BP_LIVE_GROUPS", 3000), |env: &ProdEnv| {
-            LsmFactory { env: env.clone() }
+            LsmFactory::new(env.clone())
         })
         .await;
         density_body(&mut c, true, workers).await;

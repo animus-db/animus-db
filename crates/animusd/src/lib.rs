@@ -151,8 +151,8 @@ use animus_cp_data::{
     SHARED_WAL, StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome, TxnRecordView,
 };
 use animus_env::{
-    CLIENT_PROTOCOL, Clock, Disk, Env, FsSegmentStore, MaybeTlsStream, Metric, MetricsHandle,
-    Nanos, NodeId, PreambleError, ProdEnv, TlsMaterial, exchange_preamble_with, read_preamble,
+    CLIENT_PROTOCOL, Clock, Env, FsSegmentStore, MaybeTlsStream, Metric, MetricsHandle, Nanos,
+    NodeId, PreambleError, ProdEnv, TlsMaterial, exchange_preamble_with, read_preamble,
     write_own_preamble_with,
 };
 use animus_storage::{
@@ -6622,10 +6622,7 @@ impl BoundNode {
             match &storage {
                 SharedEngine::Lsm(_) => CpReconciler::Lsm(Reconciler::new(
                     hook_env.clone(),
-                    LsmTabletFactory {
-                        env: hook_env,
-                        bg_budget: Some(bg_budget.clone()),
-                    },
+                    LsmTabletFactory::new(hook_env, Some(bg_budget.clone())),
                     my_id.clone(),
                     move |tablet, node: &RaftKvNode<ProdEnv, LsmEngine<ProdEnv>>| {
                         host_edge.register_raftkv(tablet, CpGroup::Lsm(node.clone()));
@@ -9000,10 +8997,7 @@ impl BoundDataNode {
             match &storage {
                 SharedEngine::Lsm(_) => CpReconciler::Lsm(Reconciler::new(
                     hook_env.clone(),
-                    LsmTabletFactory {
-                        env: hook_env,
-                        bg_budget: Some(bg_budget.clone()),
-                    },
+                    LsmTabletFactory::new(hook_env, Some(bg_budget.clone())),
                     my_id.clone(),
                     move |tablet, node: &RaftKvNode<ProdEnv, LsmEngine<ProdEnv>>| {
                         host_edge.register_raftkv(tablet, CpGroup::Lsm(node.clone()));
@@ -14577,11 +14571,32 @@ struct LsmTabletFactory {
     /// ADR 0079 layer 3: every tablet engine this factory opens takes its
     /// compactions from the node's pool (when that pool is on).
     bg_budget: Option<animus_cp_data::background_budget::BackgroundBudget>,
+    /// Issue #1303: which tablets have files on the flat data dir, from one
+    /// cached listing instead of one whole-directory listing per probe.
+    files: animus_cp_data::tablet_files::TabletFileIndex<ProdEnv>,
+}
+
+impl LsmTabletFactory {
+    fn new(
+        env: ProdEnv,
+        bg_budget: Option<animus_cp_data::background_budget::BackgroundBudget>,
+    ) -> Self {
+        Self {
+            files: animus_cp_data::tablet_files::TabletFileIndex::new(
+                env.clone(),
+                |t| tablet_lsm_prefix(t.0),
+                parse_tablet_id_from_lsm_filename,
+            ),
+            env,
+            bg_budget,
+        }
+    }
 }
 
 #[async_trait::async_trait]
 impl animus_cp_data::host::EngineFactory<LsmEngine<ProdEnv>> for LsmTabletFactory {
     async fn open(&self, tablet: TabletId) -> Result<LsmEngine<ProdEnv>, String> {
+        self.files.note_open(tablet);
         let engine = LsmEngine::open_with(
             self.env.clone(),
             &tablet_lsm_prefix(tablet.0),
@@ -14602,23 +14617,12 @@ impl animus_cp_data::host::EngineFactory<LsmEngine<ProdEnv>> for LsmTabletFactor
         // Durable engine state exists iff any file carries this tablet's own
         // prefix — an `LsmEngine` writes its first file (a WAL segment) on
         // the first write, so a never-written tablet correctly probes false.
-        let prefix = tablet_lsm_prefix(tablet.0);
-        self.env
-            .list()
-            .await
-            .unwrap_or_default()
-            .iter()
-            .any(|f| f.starts_with(&prefix))
+        self.files.probe(tablet).await
     }
 
     async fn destroy(&self, tablet: TabletId) {
-        let prefix = tablet_lsm_prefix(tablet.0);
-        for f in self.env.list().await.unwrap_or_default() {
-            if f.starts_with(&prefix)
-                && let Err(e) = self.env.remove(&f).await
-            {
-                tracing::warn!(?e, file = %f, "deleting a reclaimed tablet's engine file");
-            }
+        for (f, e) in self.files.destroy(tablet).await {
+            tracing::warn!(?e, file = %f, "deleting a reclaimed tablet's engine file");
         }
     }
 
@@ -14649,6 +14653,7 @@ impl animus_cp_data::host::EngineFactory<LsmEngine<ProdEnv>> for LsmTabletFactor
         // ordinary `open(target)` recovers it identically to any other
         // hosted tablet. `source` is the caller's own already-open handle
         // (see the trait's own doc for why this method never re-opens it).
+        self.files.note_open(target);
         source
             .clone_to_filtered(tablet_lsm_prefix(target.0), keep)
             .await
@@ -14666,13 +14671,7 @@ impl animus_cp_data::host::EngineFactory<LsmEngine<ProdEnv>> for LsmTabletFactor
     /// trait's own doc — rather than propagate an error this method has no
     /// channel for.
     async fn local_tablets(&self) -> BTreeSet<TabletId> {
-        self.env
-            .list()
-            .await
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|f| parse_tablet_id_from_lsm_filename(f))
-            .collect()
+        self.files.local_tablets().await
     }
 }
 

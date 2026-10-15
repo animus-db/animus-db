@@ -89,6 +89,7 @@ mod mrec_props;
 mod seal;
 pub mod segment;
 mod split;
+pub mod tablet_files;
 mod trim_marker;
 mod ts_cache;
 mod txn;
