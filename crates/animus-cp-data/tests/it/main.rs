@@ -40,6 +40,7 @@ mod learner_catchup_under_load;
 mod learner_membership;
 mod learner_reconfigure;
 mod learner_snapshot_livelock_under_continuous_writer;
+mod legacy_r1_mixed_stage;
 mod membership;
 mod metrics;
 mod mrec_apply;

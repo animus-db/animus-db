@@ -21,6 +21,10 @@ workspace = true
 # ADR 0073 (Phase 1, "Legacy encoders are test-only"): gates `legacy::vN::encode`.
 # Off by default; enabled only by test crates (animus-test's dev-dependencies).
 legacy-encoders = []
+# Issue #1315: a test-only model of the previous release's pre-#1243 `TxnStage`
+# guard (in-memory `recently_resolved`, no resolved marker, no engine-ahead
+# fence), armed per node via `legacy_r1_model::set`. Off by default.
+legacy-r1-model = []
 # `#[doc(hidden)]` decoder entry points for the `fuzz/` cargo-fuzz project (roadmap
 # R-01 (c)). Off by default; never enabled by a production build.
 fuzzing = []
@@ -53,7 +57,7 @@ async-trait.workspace = true
 # Issue #1251: the v1-cluster replica-identity assertion normalizes a v2 intent
 # to its v1 form (a snapshot sender below `Gate::GlobalTables` down-converts it,
 # #1237), via `downgrade_txn_envelope_to_v1`.
-animus-cp-data = { path = ".", features = ["legacy-encoders"] }
+animus-cp-data = { path = ".", features = ["legacy-encoders", "legacy-r1-model"] }
 # This crate's own library never constructs a `ProdEnv` — only its real-thread
 # regression tests (`tests/prod_concurrent_ts_monotonic.rs`,
 # `tests/prod_compaction_persist_round.rs`) and, since C-05 PR 1,
