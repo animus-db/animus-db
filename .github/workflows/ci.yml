@@ -675,7 +675,7 @@ jobs:
   # `ANIMUS_S3_REQUIRE_ENDPOINT=1`, which turns a missing endpoint into a
   # panic. The server is RustFS (the same pinned image and settings as
   # `scripts/e2e-kind.sh`; MinIO images stopped resolving, issue #863), and
-  # the bucket is created with the same pinned aws-cli image. Credentials
+  # the bucket is created by a SigV4-signed curl PUT (no image, #1312). Credentials
   # are throwaway, for this one ephemeral container only. Not part of the
   # `gates`/`prod-liveness` aggregates.
   s3-real-endpoint:
