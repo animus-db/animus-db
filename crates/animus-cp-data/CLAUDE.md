@@ -3587,3 +3587,12 @@ at `1.5 x (G/N + A)` awake groups per survivor (`Rig::capacity_groups`), unlike 
 worse worst lag and no fewer groups led than the uncapped run. If it fails, read
 the detail line (lag, backlog, terms, `admit_awake_hwm`, over-cap wakes) before
 touching the bound: step 4's cell 3 was root-caused from exactly those counters.
+
+## `legacy-r1-model` feature (issue #1315)
+
+Test-only (off by default, on for this crate's own tests via the self dev-dependency):
+`legacy_r1_model::set(node, true)` before a node starts makes it apply `TxnStage`/`TxnResolve`
+like the previous release `f6709564` (in-memory `recently_resolved`, no resolved marker, no
+engine-ahead fence). `tests/it/legacy_r1_mixed_stage.rs` replays one log through both semantics
+and pins the mixed-version hazard (a stale stage resurrects an intent on the replica whose guard
+state is missing). Remove it with the R-1 pin once R-1 contains #1243/#1251.

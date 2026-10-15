@@ -387,6 +387,56 @@ fn open_removes_orphan_wal_segments_below_the_live_set() {
     });
 }
 
+/// Issue #1303: `open` probes the segment numbers below the live set one by one
+/// while there are few of them, and lists the directory once beyond
+/// `ORPHAN_PROBE_MAX` (16). The small-prefix path is the test above; this is the
+/// listing path, with an orphan far below a live set that starts well past 16.
+#[test]
+fn open_removes_orphan_wal_segments_when_many_segments_were_rotated_away() {
+    let seed = 0x1303_0001_u64;
+    let sim = Simulator::new(seed);
+    let count = 1500u64;
+    let orphan_seg;
+    {
+        let e = open(&sim);
+        block_on(async {
+            for i in 0..count {
+                let k = format!("key-{i:05}");
+                e.put(k.as_bytes(), format!("val-{i}").as_bytes(), i + 1)
+                    .await
+                    .unwrap();
+            }
+        });
+        let live = e.wal_segments();
+        let lowest_live = *live.iter().min().unwrap();
+        assert!(
+            lowest_live > 16,
+            "seed={seed}: need more than ORPHAN_PROBE_MAX rotated-away segments (live={live:?})"
+        );
+        orphan_seg = lowest_live - 3;
+        block_on(e.test_write_orphan_wal_segment(orphan_seg, b"garbage-orphan-not-replayed\n"));
+    }
+    let e = open(&sim);
+    let env = sim.env(nid(0));
+    block_on(async {
+        assert_eq!(
+            env.size(&format!("{PREFIX}wal-{orphan_seg:06}"))
+                .await
+                .unwrap(),
+            0,
+            "seed={seed}: orphan WAL segment {orphan_seg} should have been removed on open"
+        );
+        for i in 0..count {
+            let k = format!("key-{i:05}");
+            assert_eq!(
+                e.get(k.as_bytes()).await.unwrap().unwrap().value,
+                format!("val-{i}").as_bytes(),
+                "seed={seed}: key {k} lost after orphan cleanup"
+            );
+        }
+    });
+}
+
 /// A flush followed by more writes that roll new segments, then a flush again:
 /// recovery still reconstructs everything, proving segment numbers keep climbing
 /// and GC + fresh-segment allocation interleave correctly across flushes.

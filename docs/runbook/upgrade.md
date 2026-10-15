@@ -132,11 +132,12 @@ Read-only, never a readiness probe. `ok` is true only when the control group has
 recent leader (and, when the answering node can see it, a quorum of reachable voters),
 the answering node has synced `Metadata`, every member is `Active`, no tablet is
 `quorum-lost` or `under-replicated`, no group on the answering node has a learner mid
-catch-up, and every group on the answering node knows a leader and has its engine within
-16 entries of its commit index. `reasons[].kind` is one of: `no_control_leader`,
+catch-up, the answering node hosts every tablet whose replica set names it (a node that
+has just restarted answers before it has re-hosted anything), and every group on the
+answering node knows a leader and has its engine within 16 entries of its commit index. `reasons[].kind` is one of: `no_control_leader`,
 `control_quorum_lost`, `metadata_not_synced`, `member_not_active` (`node`),
 `tablet_quorum_lost` / `tablet_under_replicated` (`tablet`), `learner_pending` and
-`local_group_not_caught_up` (`tablet`). `tablets.forming` is reported but does not fail
+`local_group_not_caught_up` and `local_group_not_hosted` (`tablet`). `tablets.forming` is reported but does not fail
 `ok`. The tablet verdicts use the same ladder as the dashboard
 ([tablet-unavailable.md](tablet-unavailable.md)).
 

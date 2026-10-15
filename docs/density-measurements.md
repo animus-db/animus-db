@@ -319,13 +319,9 @@ a single task in the polling loop.
   `LimitNOFILE` must follow `max_replicas`.
 - **LSM write amplification** (single run): 35961 x 4 KiB x 3 replicas = 430 MB
   logical became 1.5 GB on disk in 60 s (about 3.5x; WAL segments and sstables,
-  sstable count 2447-2571 then falling to 2364 from a 2100 baseline, so compaction ran and kept up, inferred) and RSS grew from 71 MB to 2.7 GB (1 GB in the first 10 s, then
-  about 0.2 GB per 10 s, still rising at 60 s). Flush threshold is 64 KiB so each
-  hot tablet flushed every 16 writes. Memory growth under write load is the
-  largest unmodelled per-node cost: it is data-, not replica-, proportional and
-  was not bounded in 60 s. **Not understood** (memtable, raft log tail, or
-  unflushed applied buffers); needs its own run before `max_replicas` can be
-  tied to a memory limit under load.
+  sstable count 2447-2571 then falling to 2364 from a 2100 baseline, so compaction
+  ran and kept up, inferred). **The RSS growth (71 MB to 2.7 GB in 60 s) was
+  explained on 2026-10-14 (issue #1304, section H): it was not the engine.**
 
 ## F. Data-bearing node-loss burst (sim, `sim_cluster_scale_node_loss_repair_burst`)
 
@@ -386,6 +382,57 @@ table read and written throughout.
   directed Placing. The doubling from 4 to 8 tables with 2x larger tablets and
   4x larger rows (15 s vs 1.8 s) says cost tracks bytes, not split count.
 
+## H. LSM RSS under write load (issue #1304, 2026-10-14)
+
+Same box, same rig and command as E3's LSM row (`ANIMUS_BP_LIVE_ENGINE=lsm`,
+`_GROUPS=700`, `_WORKERS=2`, `_QUIESCE=0`, `_WRITE_RPS=600`, `_WRITE_GROUPS=50`,
+`_VALUE_BYTES=4096`, `_HOLD_SECS=60`), `cargo test --release`. New rig output:
+`log_len_sum` / `apply_lag_sum` / `apply_lag_max` (retained Raft log entries and
+committed-but-not-engine-applied entries over every replica) and `writes_shed`;
+new knob `ANIMUS_BP_LIVE_WRITE_WINDOW=N` (0, the old open loop; N sheds a put while
+its leader's apply backlog exceeds N, the way the wire's per-request wait does).
+Every row is one run (RSS repeats within about +-25%; the attribution counters
+were temporary and are not in the tree).
+
+**Attribution** (before the fix, 600 puts/s open loop): not memtables (64 KiB
+x about 150 written replicas is 10 MB), not a leak. Measured with temporary
+counters and `valgrind --tool=massif`:
+
+| quantity | before | note |
+|---|---|---|
+| bytes handed to `send_stream` | 2.3 GB at 10 s, 11.5 GB at 30 s | the entries written are 0.22 GB: about 30 `AppendEntries` entry-sends per entry |
+| encoded frames queued in `send_stream` tasks | 450-700 MB, 11-17k tasks | each task holds its payload until the send finishes |
+| inbox frames/bytes | under 35 MB | the per-stream cap works |
+| committed-but-unapplied backlog | 80k entries at 60 s | each entry sits in the log, the apply buffer and clones |
+| massif peak (scaled run) | 70% `encode_for_send` -> `put_bytes` | then decoded received entries, apply buffers, LSM flush/compaction buffers |
+
+Root cause: `RaftCore::replicate_to` sent `next_index..` on every propose,
+every success ack and every heartbeat, and `next_index` only moves on an ack, so
+the traffic was quadratic in the ack lag and a saturated peer made it worse
+(ADR 0009's 2026-10-14 amendment). It is a bounded-but-too-large steady state
+only at a rate the node keeps up with; past capacity the rig's open loop (a
+proposer with no admission control on `ProposeResult::Accepted`) grows the apply
+backlog linearly, which is a rig property: the wire is bounded by
+`max_inflight_requests` (2048).
+
+| row | RSS at 60 s before | RSS at 60 s after | min led (of 700) before / after | note |
+|---|---|---|---|---|
+| 600 puts/s, open loop | 2.62 GB (80.7k backlog, dip of 10) | 0.81 GB (35.7k backlog, held) | 690 / 700 | the documented command |
+| 600 puts/s, `WRITE_WINDOW=64` | 2.03 GB (plateau) | 0.55 GB (plateau) | 692 / 694 | closed loop, 31% / 39% of puts shed |
+| 300 puts/s, open loop | 1.69 GB | 0.55 GB | 697 / 700 | below capacity |
+| sent bytes, 600 puts/s, 20-30 s | 8.7 GB | 0.13 GB (instrumented run of a first, unconditional version of the fix; the shipped depth-4 version was not instrumented) | | 30x to about 1.1x per entry |
+
+Not fixed, and why (needs a decision, not done here): (1) the 150 s open-loop run
+at 600 puts/s still grows (about 1.4 GB at 150 s): 600 puts/s of 4 KiB is above
+this node's LSM apply capacity (about 400-450 puts/s at 2 workers), so any
+open-loop proposer queues; a leader-side admission limit on the apply backlog
+(`ProposeResult::Busy`) is the missing bound and is a new knob and a new return
+variant for every proposer. (2) The closed-loop steady state of 0.4-0.55 GB is
+allocator retention plus LSM compaction and flush buffers (a compaction
+materialises its input tables; `decode_block`, `partition_records`,
+`flatten_memtable` in massif) and the Raft log plus apply clones; a node-wide
+memtable/compaction memory budget is a design decision.
+
 ## Proposed final defaults (recommendations for review; ADR 0079's knob table is not edited)
 
 | Knob | ADR provisional | Recommendation | Basis |
@@ -397,7 +444,7 @@ table read and written throughout.
 | `bg-splits` | 1 | **keep 1**; reconsider 2 only with a near-real-size split run | G: concurrency 1 vs 8 gives the same per-split time (they serialise already); a pool of 1 costs nothing measured |
 | `bg-compactions` | `max(1, cores/2)` | **keep** | E3 LSM: sstable count stayed flat under 600 puts/s; no starvation seen. Single run, 60 s. |
 | `R` (repair proposals/tick) | 8 | **keep 8**, `R_inflight` 16 | F: unpaced, all affected tablets flip in 1 s while the data stage runs at about 0.6 tablets/s, so the proposal stage is not the bottleneck; `R` caps the metadata/Raft storm, not the bytes. 3000 proposals at once is the case to pace. |
-| `max_replicas` (operator) | derived | **min(** 0.5 x memory request / 64 KiB, `nofile` / 2, 1000 **)**. Measured: about 28 KB RSS per idle replica (E2), so 64 KiB is a 2x margin; fds 0 idle, 0.35-0.5 per *written* replica (E3); with `LsmEngine` hosting G=1000 per node took 54 s and G=2000 did not finish in 180 s (E2, the `probe` defect). | the constant 1000 is the hosting-time cap while the `probe` defect stands (about 1 min to host 1000 per node at 2/3 core each); drop that term after the fix. Memory under write load (E3 LSM) is unbounded in 60 s and not covered by any per-replica term: do not tie `max_replicas` to a memory limit under load until that is understood. |
+| `max_replicas` (operator) | derived | **min(** 0.5 x memory request / 64 KiB, `nofile` / 2, 1000 **)**. Measured: about 28 KB RSS per idle replica (E2), so 64 KiB is a 2x margin; fds 0 idle, 0.35-0.5 per *written* replica (E3); with `LsmEngine` hosting G=1000 per node took 54 s and G=2000 did not finish in 180 s (E2, the `probe` defect). | the constant 1000 is the hosting-time cap while the `probe` defect stands (about 1 min to host 1000 per node at 2/3 core each); drop that term after the fix. Memory under write load is data- and rate-proportional, not replica-proportional (section H): about 0.4-0.55 GB at 150 written replicas of 4 KiB values at a rate the node keeps up with, so it is not covered by a per-replica term; do not tie `max_replicas` to a memory limit under load. |
 | `LimitNOFILE` | n/a | at least `max_replicas` | E3: fds scale with written replicas |
 
 ## Not measured, and why
@@ -412,6 +459,41 @@ table read and written throughout.
   tablets; E3 LSM ran 60 s once).
 - **DynamoDB wire write cost** (E3 uses raw tablet puts; the wire adds parsing,
   item encoding and index maintenance on top of the 0.8-2 ms).
-- **LSM RSS growth under load** (unexplained, E3).
+- **LSM RSS growth under load**: explained and mostly fixed, section H.
 - **A repeat of any ProdEnv cell**: all single runs; the 2026-10-12 and 2026-10-13
   G=1500 / 2-worker results disagree (fail vs pass), which is the noise floor.
+
+# 2026-10-14: issue #1303, LsmEngine hosting cost (the `probe` defect, fixed)
+
+Same rig as E2: `election_backpressure_liveness`, `ANIMUS_BP_LIVE_ENGINE=lsm`,
+3 `ProdEnv` nodes in one process, 2 workers, `HOLD_SECS=1`. **Dev profile**
+(unoptimized, `debug=0`), so absolute times are not comparable with the release
+runs in E2; before and after are the same binary profile on the same machine.
+Single runs each. "CPU/replica" is `host_cpu_ticks` x 10 ms / (3 x G).
+
+| G (per cluster) | Before: all-led | Before: CPU/replica | After: all-led | After: CPU/replica |
+|---|---|---|---|---|
+| 300 | 11.2 s | 13 ms | 17.2 s | 15 ms |
+| 1000 | 120.6 s | 40 ms | 42.7 s | 13.5 ms |
+| 2000 | not run (E2 release: did not finish in 180 s) | - | 78.9 s | 12.8 ms |
+
+Before, 3.3x the groups cost 9.8x the CPU (quadratic). After, CPU per replica is
+flat (13-15 ms) from G=300 to G=2000. The G=300 row is within run-to-run noise.
+
+Root cause: every `EngineFactory::probe` (once per hosted tablet), `destroy`
+and `local_tablets` did a whole-directory `Disk::list` of the node's flat data
+dir (about 4 files per hosted replica), and `LsmEngine::open` of an existing
+engine did one more listing in `remove_orphan_wal_segments`. The issue's guess
+that `ProdEnv::list` awaits a `file_type()` per entry is not the cost: tokio
+1.53 caches the type from the buffered `readdir`. The cost is the O(entries)
+allocate-and-sort per call.
+
+Fix (no layout change): `animus_cp_data::tablet_files::TabletFileIndex` answers
+`probe` from one cached listing, kept exact by recording every engine open or
+clone; `remove_orphan_wal_segments` probes the (at most 16) segment numbers below
+the live set directly and only lists past that. The deterministic proof is
+`tests/it/tablet_file_index.rs`: hosting 100 and 1000 fresh tablets costs exactly
+one listing each, against 100 and 1000 for the old shape (a negative control that
+scans about 100x the entries at 10x N). `destroy` still lists once per reclaimed
+tablet (O(N) each, so a drop of N tablets is O(N^2) in directory entries, not on
+the hosting path); the `max_replicas` 1000 hosting-time cap can be revisited (dev profile only here; confirm in release first).

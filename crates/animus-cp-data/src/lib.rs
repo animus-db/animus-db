@@ -89,6 +89,7 @@ mod mrec_props;
 mod seal;
 pub mod segment;
 mod split;
+pub mod tablet_files;
 mod trim_marker;
 mod ts_cache;
 mod txn;
@@ -2221,6 +2222,69 @@ struct TxnTracker {
     /// read-path push, ADR 0018 §2/PR5 §3) — only background promptness is
     /// (very slightly) weaker in that residual case.
     unresolved_decided: BTreeMap<TxnId, (Vec<u8>, txn::TxnOutcome)>,
+    /// Test-only model of the previous release (`f6709564`, "R-1"): decide a
+    /// stale `TxnStage` from the in-memory `recently_resolved` map below
+    /// instead of the durable resolved marker, write no marker and have no
+    /// engine-ahead fence (issue #1315). Off unless a test arms the node
+    /// through [`legacy_r1_model`].
+    #[cfg(feature = "legacy-r1-model")]
+    legacy_r1: bool,
+    #[cfg(feature = "legacy-r1-model")]
+    recently_resolved: BTreeMap<Vec<u8>, TxnId>,
+}
+
+#[cfg(feature = "legacy-r1-model")]
+impl TxnTracker {
+    /// The state a rebuilt tracker keeps from `old`: only the model switch
+    /// (the pre-#1243 map is process memory, a rebuild empties it).
+    fn carry_model(&mut self, old: &TxnTracker) {
+        self.legacy_r1 = old.legacy_r1;
+    }
+}
+
+/// Test-only model of the previous release's `TxnStage` guard (issue #1315,
+/// feature `legacy-r1-model`, never built into a release).
+///
+/// A node is armed by id, per test thread (a `SimEnv` runs on the thread that
+/// drives it), before `RaftKvNode::start*`; the flag is read once when the
+/// group starts. An armed node applies exactly what `f6709564` applied: the
+/// stale-restage guard is the in-memory `recently_resolved` map (filled by its
+/// own `TxnResolve` applies, emptied by a restart or an `InstallSnapshot`),
+/// no resolved marker is written or read, and a `TxnStage` replayed over an
+/// engine already ahead of it is not fenced.
+#[cfg(feature = "legacy-r1-model")]
+pub mod legacy_r1_model {
+    use animus_env::NodeId;
+    use std::cell::RefCell;
+    use std::collections::BTreeSet;
+
+    thread_local! {
+        static ARMED: RefCell<BTreeSet<NodeId>> = const { RefCell::new(BTreeSet::new()) };
+    }
+
+    /// Arm (or disarm) the previous-release model for `node`'s next start.
+    pub fn set(node: NodeId, on: bool) {
+        ARMED.with(|a| {
+            if on {
+                a.borrow_mut().insert(node);
+            } else {
+                a.borrow_mut().remove(&node);
+            }
+        });
+    }
+
+    pub(crate) fn armed(node: NodeId) -> bool {
+        ARMED.with(|a| a.borrow().contains(&node))
+    }
+}
+
+#[cfg(feature = "legacy-r1-model")]
+impl TxnTracker {
+    /// R-1's `record_resolution` (bounded FIFO dropped: the model's runs stay
+    /// far below its 4096 cap).
+    fn record_resolution(&mut self, physical_key: Vec<u8>, txn_id: TxnId) {
+        self.recently_resolved.insert(physical_key, txn_id);
+    }
 }
 
 /// The committed value `physical_key` holds right now, as the `prior` a
@@ -3317,7 +3381,13 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // starts empty and is populated before the apply task's first pass,
         // mirroring `sealed`/`committed_ceiling`'s own rebuild-then-spawn
         // ordering.
-        let txn_tracker = Arc::new(Mutex::new(TxnTracker::default()));
+        #[allow(unused_mut, reason = "mutated only under feature legacy-r1-model")]
+        let mut initial_tracker = TxnTracker::default();
+        #[cfg(feature = "legacy-r1-model")]
+        {
+            initial_tracker.legacy_r1 = legacy_r1_model::armed(env.node_id());
+        }
+        let txn_tracker = Arc::new(Mutex::new(initial_tracker));
         let external_quiesce_veto = Arc::new(AtomicBool::new(false));
         let witness = Arc::new(AtomicBool::new(false));
         // See the field's own doc: `u64::MAX` is the "never engaged" sentinel,
@@ -9137,8 +9207,11 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
         // 3924719889167511385): a leader-killed-then-healed replica caught
         // up via snapshot install partway through a transaction's own
         // lifecycle, precisely reproducing this gap.
-        *txn_tracker.lock().expect("txn tracker poisoned") =
-            rebuild_txn_tracker(storage, scope).await;
+        #[allow(unused_mut, reason = "mutated only under feature legacy-r1-model")]
+        let mut rebuilt = rebuild_txn_tracker(storage, scope).await;
+        #[cfg(feature = "legacy-r1-model")]
+        rebuilt.carry_model(&txn_tracker.lock().expect("txn tracker poisoned"));
+        *txn_tracker.lock().expect("txn tracker poisoned") = rebuilt;
         // Issue #859 follow-up: `hot_change_max` needs the identical
         // re-seed `txn_tracker` just got, for the identical reason — an
         // `InstallSnapshot` replaces this ALREADY-RUNNING replica's whole
@@ -10295,6 +10368,10 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // anchor: its version moves with every later decision.
                 let stage_version = hlc::pack(ts);
                 let mut engine_ahead = false;
+                #[cfg(feature = "legacy-r1-model")]
+                let legacy_r1 = txn_tracker.lock().expect("txn tracker poisoned").legacy_r1;
+                #[cfg(not(feature = "legacy-r1-model"))]
+                let legacy_r1 = false;
                 'ahead: for physical in writes
                     .iter()
                     .flat_map(|w| [w.key.clone(), txn::resolved_marker_key(&w.key)])
@@ -10305,9 +10382,10 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                     // resolve-as-delete, a DeleteItem, a TTL reap) has no
                     // live row, but its tombstone's version still proves a
                     // later entry ran.
-                    if latest_version_incl_tombstone(storage, &physical)
-                        .await
-                        .is_some_and(|v| v > stage_version)
+                    if !legacy_r1
+                        && latest_version_incl_tombstone(storage, &physical)
+                            .await
+                            .is_some_and(|v| v > stage_version)
                     {
                         engine_ahead = true;
                         break 'ahead;
@@ -10407,7 +10485,14 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 // reusing the same physical key is the ordinary, unrelated
                 // write path and must stage normally.
                 let mut resurrection_attempt = false;
-                for w in &writes {
+                #[cfg(feature = "legacy-r1-model")]
+                if legacy_r1 {
+                    let t = txn_tracker.lock().expect("txn tracker poisoned");
+                    resurrection_attempt = writes
+                        .iter()
+                        .any(|w| t.recently_resolved.get(&scope.physical(&w.key)) == Some(&txn_id));
+                }
+                for w in writes.iter().filter(|_| !legacy_r1) {
                     let marker = storage
                         .get(&scope.physical(&txn::resolved_marker_key(&w.key)))
                         .await
@@ -11521,11 +11606,23 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         // rejected on every replica instead of
                         // resurrecting it — see `TxnStage`'s own
                         // resurrection guard and `txn::resolved_marker_key`.
-                        pending.push(MergeOp::put(
-                            scope.physical(&txn::resolved_marker_key(key)),
-                            txn::encode_resolved_marker(&txn_id),
-                            version,
-                        ));
+                        #[cfg(feature = "legacy-r1-model")]
+                        let legacy_r1 = txn_tracker.lock().expect("txn tracker poisoned").legacy_r1;
+                        #[cfg(not(feature = "legacy-r1-model"))]
+                        let legacy_r1 = false;
+                        if legacy_r1 {
+                            #[cfg(feature = "legacy-r1-model")]
+                            txn_tracker
+                                .lock()
+                                .expect("txn tracker poisoned")
+                                .record_resolution(scope.physical(key), txn_id.clone());
+                        } else {
+                            pending.push(MergeOp::put(
+                                scope.physical(&txn::resolved_marker_key(key)),
+                                txn::encode_resolved_marker(&txn_id),
+                                version,
+                            ));
+                        }
                     }
                     // ADR 0018 §2/PR5, refined by the write-loss amendment
                     // §3/§6 fix: this group's own recovery-retry bookkeeping
@@ -13199,7 +13296,10 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
     // be compacted out of the log long before the record's own lifecycle is
     // done. One bounded scope scan for `txn::is_record_key` markers, the
     // accepted cost this crate already pays for `has_data`/`engine_image`.
-    let rebuilt_tracker = rebuild_txn_tracker(&storage, &scope).await;
+    #[allow(unused_mut, reason = "mutated only under feature legacy-r1-model")]
+    let mut rebuilt_tracker = rebuild_txn_tracker(&storage, &scope).await;
+    #[cfg(feature = "legacy-r1-model")]
+    rebuilt_tracker.carry_model(&txn_tracker.lock().expect("txn tracker poisoned"));
     *txn_tracker.lock().expect("txn tracker poisoned") = rebuilt_tracker;
     // Issue #859: seed `hot_change_max` from one bounded scan of this
     // tablet's own `KIND_CHANGE` scope — the same "engine scan paid once at

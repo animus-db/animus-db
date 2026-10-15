@@ -19,7 +19,13 @@
 //!    port of the dashboard's `tabletStatus` ladder in `dashboard_core.js`);
 //! 5. none of this node's hosted groups has a learner mid catch-up;
 //! 6. every group this node hosts is caught up: it knows a leader and its
-//!    engine is within [`CATCH_UP_BOUND`] entries of its commit index.
+//!    engine is within [`CATCH_UP_BOUND`] entries of its commit index;
+//! 7. this node hosts every tablet whose replica set names it. A freshly
+//!    restarted node answers admin requests (and reports `Active`, its death
+//!    not yet detected) *before* its reconciler has re-hosted anything; with
+//!    no hosted groups clause 6 is vacuously true, so without this clause the
+//!    verdict said "safe to touch the next node" while the node served no
+//!    tablet at all (issue #1315).
 //!
 //! `forming` tablets are reported but do not fail `ok` (a transition), exactly
 //! as the dashboard treats them.
@@ -261,6 +267,15 @@ pub(crate) fn roll_health(meta: &Metadata, control: &ControlView, local: &LocalV
         }
     }
 
+    // 7. Every tablet that places a replica on this node is hosted here.
+    let mut not_hosted = 0usize;
+    for (id, t) in &meta.tablets {
+        if t.replicas.contains(&local.node) && !local_by_tablet.contains_key(&id.0) {
+            not_hosted += 1;
+            reasons.push(Reason::tablet("local_group_not_hosted", id.0));
+        }
+    }
+
     let ok = reasons.is_empty();
     let local_status = meta
         .members
@@ -286,6 +301,7 @@ pub(crate) fn roll_health(meta: &Metadata, control: &ControlView, local: &LocalV
             "node": local.node.to_string(),
             "status": local_status,
             "hosted_groups": local.groups.len(),
+            "not_hosted_groups": not_hosted,
             "caught_up_groups": caught_up,
         },
     });
@@ -346,7 +362,19 @@ mod tests {
         }
     }
 
-    fn local(groups: Vec<LocalGroup>) -> LocalView {
+    /// Node `a` hosting the given groups plus a caught-up group for each of
+    /// `healthy_meta`'s tablets (1, 2) not given, so a test names only the
+    /// group it makes interesting. `local_raw` is the unfilled form.
+    fn local(mut groups: Vec<LocalGroup>) -> LocalView {
+        for t in [1u64, 2] {
+            if !groups.iter().any(|g| g.tablet == t) {
+                groups.push(group(t));
+            }
+        }
+        local_raw(groups)
+    }
+
+    fn local_raw(groups: Vec<LocalGroup>) -> LocalView {
         LocalView {
             node: nid("a"),
             groups,
@@ -468,6 +496,37 @@ mod tests {
         g.commit_index = 1000;
         g.engine_applied_index = 1000 - CATCH_UP_BOUND;
         assert!(roll_health(&healthy_meta(), &ctl(), &local(vec![g])).ok);
+    }
+
+    /// Issue #1315: a node restarted a few milliseconds ago answers the admin
+    /// API, is still `Active` in `Metadata` (its death is not yet detected)
+    /// and hosts no group at all, so clause 6 is vacuously satisfied. It must
+    /// not be called safe to roll past until it hosts what it replicates.
+    #[test]
+    fn clause_node_that_has_not_re_hosted_its_tablets_is_not_ok() {
+        let m = healthy_meta();
+        let h = roll_health(&m, &ctl(), &local_raw(vec![]));
+        assert!(!h.ok);
+        assert_eq!(
+            kinds(&h),
+            ["local_group_not_hosted", "local_group_not_hosted"]
+        );
+        assert_eq!(h.reasons[0].tablet, Some(1));
+        assert_eq!(h.reasons[1].tablet, Some(2));
+        assert_eq!(h.to_json()["local"]["not_hosted_groups"], 2);
+        // Partially re-hosted: exactly the missing one is named.
+        let h = roll_health(&m, &ctl(), &local_raw(vec![group(2)]));
+        assert_eq!(kinds(&h), ["local_group_not_hosted"]);
+        assert_eq!(h.reasons[0].tablet, Some(1));
+        // Fully re-hosted: ok.
+        assert!(roll_health(&m, &ctl(), &local_raw(vec![group(1), group(2)])).ok);
+        // A tablet that places no replica on this node is not its concern.
+        let mut m2 = healthy_meta();
+        m2.tablets.insert(
+            TabletId(3),
+            Tablet::new(TabletId(3), KeyRange::whole(), vec![nid("b"), nid("c")]),
+        );
+        assert!(roll_health(&m2, &ctl(), &local_raw(vec![group(1), group(2)])).ok);
     }
 
     // ---- the oracle: Rust ladder == dashboard_core.js ladder ----

@@ -78,6 +78,7 @@
 //! -p animusd --lib sim_cluster_upgrade_corpus -- --nocapture`. Each cell runs
 //! on its own OS thread under a wall-clock watchdog ([`CELL_WATCHDOG`]).
 
+use animus_env::Disk;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::{Arc, Mutex};

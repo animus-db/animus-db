@@ -48,17 +48,26 @@ pub(crate) enum SimEngineBackend {
 /// shape (ADR 0050 rung 1) over a `SimEnv` disk, strict on `open`.
 pub(crate) struct SimLsmTabletFactory {
     env: SimEnv,
+    files: animus_cp_data::tablet_files::TabletFileIndex<SimEnv>,
 }
 
 impl SimLsmTabletFactory {
     pub(crate) fn new(env: SimEnv) -> Self {
-        Self { env }
+        Self {
+            files: animus_cp_data::tablet_files::TabletFileIndex::new(
+                env.clone(),
+                |t| tablet_lsm_prefix(t.0),
+                parse_tablet_id_from_lsm_filename,
+            ),
+            env,
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl EngineFactory<LsmEngine<SimEnv>> for SimLsmTabletFactory {
     async fn open(&self, tablet: TabletId) -> Result<LsmEngine<SimEnv>, String> {
+        self.files.note_open(tablet);
         match LsmEngine::open(self.env.clone(), tablet_lsm_prefix(tablet.0)).await {
             Ok(engine) => Ok(engine),
             // Deliberately a panic, never `Err`: see the module doc.
@@ -70,22 +79,11 @@ impl EngineFactory<LsmEngine<SimEnv>> for SimLsmTabletFactory {
     }
 
     async fn probe(&self, tablet: TabletId) -> bool {
-        let prefix = tablet_lsm_prefix(tablet.0);
-        self.env
-            .list()
-            .await
-            .unwrap_or_default()
-            .iter()
-            .any(|f| f.starts_with(&prefix))
+        self.files.probe(tablet).await
     }
 
     async fn destroy(&self, tablet: TabletId) {
-        let prefix = tablet_lsm_prefix(tablet.0);
-        for f in self.env.list().await.unwrap_or_default() {
-            if f.starts_with(&prefix) {
-                let _ = self.env.remove(&f).await;
-            }
-        }
+        let _ = self.files.destroy(tablet).await;
     }
 
     async fn flush_engine(&self, engine: &LsmEngine<SimEnv>) -> Result<(), String> {
@@ -98,6 +96,7 @@ impl EngineFactory<LsmEngine<SimEnv>> for SimLsmTabletFactory {
         target: TabletId,
         keep: &[(Vec<u8>, Option<Vec<u8>>)],
     ) -> Result<LsmEngine<SimEnv>, String> {
+        self.files.note_open(target);
         source
             .clone_to_filtered(tablet_lsm_prefix(target.0), keep)
             .await
@@ -105,13 +104,7 @@ impl EngineFactory<LsmEngine<SimEnv>> for SimLsmTabletFactory {
     }
 
     async fn local_tablets(&self) -> BTreeSet<TabletId> {
-        self.env
-            .list()
-            .await
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|f| parse_tablet_id_from_lsm_filename(f))
-            .collect()
+        self.files.local_tablets().await
     }
 }
 

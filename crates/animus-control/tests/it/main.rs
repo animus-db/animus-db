@@ -41,6 +41,7 @@ mod non_voter_vote_lease;
 mod one_identity_multiplexing;
 mod orphan_sweep;
 mod persistence;
+mod pipelined_replication;
 mod placement_auto_reconcile;
 mod placement_rebalance;
 mod placement_reconcile;

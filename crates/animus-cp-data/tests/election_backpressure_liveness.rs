@@ -58,7 +58,7 @@ use animus_cp_data::host::{
     MetadataView, Reconciler,
 };
 use animus_cp_data::load_monitor::{DEFAULT_LAG_STRETCH_MAX_X, LoadMonitor};
-use animus_env::{Disk, Env, NodeId, ProdEnv, nid};
+use animus_env::{Env, NodeId, ProdEnv, nid};
 use animus_storage::{LsmEngine, LsmOptions, StorageEngine};
 use animus_tablet::{KeyRange, Tablet, TabletId};
 use tokio::time::{sleep, timeout};
@@ -289,6 +289,23 @@ impl<S: StorageEngine + 'static> Cluster<S> {
             }
         }
         (led.len(), max_term, quiesced, hosted)
+    }
+
+    /// `(sum of retained Raft log entries, sum of committed-but-not-engine-
+    /// applied entries, the largest of those per replica)` over every hosted
+    /// replica. The apply backlog is what an overloaded node queues in memory
+    /// (issue #1304): each entry sits in the log and the apply buffer.
+    fn backlog(&self) -> (usize, u64, u64) {
+        let (mut log, mut lag, mut lag_max) = (0usize, 0u64, 0u64);
+        for n in self.live() {
+            for g in n.hosted.lock().expect("hosted").values() {
+                log += g.log_len();
+                let a = g.commit_index().saturating_sub(g.engine_applied_index());
+                lag += a;
+                lag_max = lag_max.max(a);
+            }
+        }
+        (log, lag, lag_max)
     }
 
     /// Hosted tablets no live replica currently believes it leads. Read per
@@ -744,38 +761,47 @@ fn dir_stats(dirs: &[std::path::PathBuf]) -> (usize, u64, usize) {
 /// `LsmTabletFactory` (prefix `db-t<id>-`, `LsmOptions::production()`), for the
 /// `ANIMUS_BP_LIVE_ENGINE=lsm` density calibration. Test-local, so the
 /// product code is untouched.
-#[derive(Clone)]
 struct LsmFactory {
     env: ProdEnv,
+    files: animus_cp_data::tablet_files::TabletFileIndex<ProdEnv>,
 }
 
 fn lsm_prefix(t: TabletId) -> String {
     format!("db-t{}-", t.0)
 }
 
+fn lsm_parse(f: &str) -> Option<TabletId> {
+    let rest = f.strip_prefix("db-t")?;
+    let end = rest.find('-')?;
+    rest[..end].parse::<u64>().ok().map(TabletId)
+}
+
+impl LsmFactory {
+    fn new(env: ProdEnv) -> Self {
+        Self {
+            files: animus_cp_data::tablet_files::TabletFileIndex::new(
+                env.clone(),
+                lsm_prefix,
+                lsm_parse,
+            ),
+            env,
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl EngineFactory<LsmEngine<ProdEnv>> for LsmFactory {
     async fn open(&self, t: TabletId) -> Result<LsmEngine<ProdEnv>, String> {
+        self.files.note_open(t);
         LsmEngine::open_with(self.env.clone(), &lsm_prefix(t), LsmOptions::production())
             .await
             .map_err(|e| e.to_string())
     }
     async fn probe(&self, t: TabletId) -> bool {
-        let p = lsm_prefix(t);
-        self.env
-            .list()
-            .await
-            .unwrap_or_default()
-            .iter()
-            .any(|f| f.starts_with(&p))
+        self.files.probe(t).await
     }
     async fn destroy(&self, t: TabletId) {
-        let p = lsm_prefix(t);
-        for f in self.env.list().await.unwrap_or_default() {
-            if f.starts_with(&p) {
-                let _ = self.env.remove(&f).await;
-            }
-        }
+        let _ = self.files.destroy(t).await;
     }
     async fn flush_engine(&self, engine: &LsmEngine<ProdEnv>) -> Result<(), String> {
         engine.flush_now().await.map_err(|e| e.to_string())
@@ -786,6 +812,7 @@ impl EngineFactory<LsmEngine<ProdEnv>> for LsmFactory {
         target: TabletId,
         keep: &[(Vec<u8>, Option<Vec<u8>>)],
     ) -> Result<LsmEngine<ProdEnv>, String> {
+        self.files.note_open(target);
         source
             .clone_to_filtered(lsm_prefix(target), keep)
             .await
@@ -796,19 +823,29 @@ impl EngineFactory<LsmEngine<ProdEnv>> for LsmFactory {
 impl<S: StorageEngine + 'static> Cluster<S> {
     /// Propose one put to `t`'s current leader; `true` iff a leader accepted
     /// it (appended locally, ProposeResult::Accepted).
-    fn put_leader(&self, t: TabletId, key: Vec<u8>, value: Vec<u8>) -> bool {
+    ///
+    /// `window > 0` closes the loop the way the DynamoDB wire does (a client
+    /// waits for its write to apply, and `max_inflight_requests` bounds the
+    /// node): the put is *shed* (`None`) while the leader's committed-but-
+    /// not-engine-applied backlog exceeds `window` entries. `window == 0` is the
+    /// open loop (the propose path itself has no admission control).
+    fn put_leader(&self, t: TabletId, key: Vec<u8>, value: Vec<u8>, window: u64) -> Option<bool> {
         for n in self.live() {
             let hosted = n.hosted.lock().expect("hosted");
             if let Some(g) = hosted.get(&t)
                 && g.is_leader()
             {
-                return matches!(
+                if window > 0 && g.commit_index().saturating_sub(g.engine_applied_index()) > window
+                {
+                    return None;
+                }
+                return Some(matches!(
                     g.put(key, value),
                     animus_control::raft::ProposeResult::Accepted { .. }
-                );
+                ));
             }
         }
-        false
+        Some(false)
     }
 }
 
@@ -821,6 +858,7 @@ impl<S: StorageEngine + 'static> Cluster<S> {
 /// `ANIMUS_BP_LIVE_ENGINE=lsm` (`LsmEngine<ProdEnv>` per tablet, real files),
 /// `ANIMUS_BP_LIVE_WRITE_RPS` (client puts per second spread round-robin
 /// over the groups during the hold; 0), `ANIMUS_BP_LIVE_VALUE_BYTES` (128), `ANIMUS_BP_LIVE_WRITE_GROUPS` (all; a hot subset),
+/// `ANIMUS_BP_LIVE_WRITE_WINDOW` (0 = open loop; N sheds a put while its leader has more than N committed-but-unapplied entries, as the wire's per-request wait does),
 /// `ANIMUS_BP_LIVE_HOLD_SECS` (120), `ANIMUS_BP_LIVE_CONVERGE_SECS` (600), `ANIMUS_BP_LIVE_ASSERT=0` (report the
 /// outcome in a `BP-LIVE verdict` line instead of failing, for sweeps). The
 /// hold lines carry `cpu_ticks`/`rss_kb`/`fds`/`threads`/`files`/`ssts` from
@@ -844,7 +882,7 @@ fn density_repro_g3000_holds_led_count() {
 async fn density_run(lsm: bool, workers: usize) {
     if lsm {
         let mut c = Cluster::start(knob("ANIMUS_BP_LIVE_GROUPS", 3000), |env: &ProdEnv| {
-            LsmFactory { env: env.clone() }
+            LsmFactory::new(env.clone())
         })
         .await;
         density_body(&mut c, true, workers).await;
@@ -864,6 +902,7 @@ async fn density_body<S: StorageEngine + 'static>(c: &mut Cluster<S>, lsm: bool,
     let value_bytes: usize = knob("ANIMUS_BP_LIVE_VALUE_BYTES", 128);
     let converge = Duration::from_secs(knob("ANIMUS_BP_LIVE_CONVERGE_SECS", 600));
     let write_groups: usize = knob("ANIMUS_BP_LIVE_WRITE_GROUPS", g).clamp(1, g);
+    let window: u64 = knob("ANIMUS_BP_LIVE_WRITE_WINDOW", 0);
     let assert_on = std::env::var("ANIMUS_BP_LIVE_ASSERT").as_deref() != Ok("0");
     println!(
         "BP-LIVE g={g} phase=config workers={workers} engine={} write_rps={rps} write_groups={write_groups} value_bytes={value_bytes} hold_s={}",
@@ -893,7 +932,7 @@ async fn density_body<S: StorageEngine + 'static>(c: &mut Cluster<S>, lsm: bool,
         let hold_base = proc_sample();
         let mut last_log = Instant::now();
         let mut min_led = g;
-        let (mut sent, mut accepted, mut next_group) = (0u64, 0u64, 0usize);
+        let (mut sent, mut accepted, mut shed, mut next_group) = (0u64, 0u64, 0u64, 0usize);
         let mut budget = 0f64;
         let mut last_tick = Instant::now();
         let payload = vec![0xA5u8; value_bytes];
@@ -909,23 +948,29 @@ async fn density_body<S: StorageEngine + 'static>(c: &mut Cluster<S>, lsm: bool,
                     let key = format!("k{sent:012}").into_bytes();
                     sent += 1;
                     next_group += 1;
-                    if c.put_leader(t, key, payload.clone()) {
-                        accepted += 1;
+                    match c.put_leader(t, key, payload.clone(), window) {
+                        Some(true) => accepted += 1,
+                        Some(false) => {}
+                        None => shed += 1,
                     }
                 }
             }
             if last_log.elapsed() >= Duration::from_secs(10) {
                 let s = proc_sample();
+                let backlog = c.backlog();
                 let (files, bytes, ssts) = if lsm { dir_stats(&c.dirs) } else { (0, 0, 0) };
                 println!(
                     "BP-LIVE g={g} phase=hold t_s={} led={led} quiesced={quiesced} hosted={hosted} max_term={max_term} \
-                     cpu_ticks={} rss_kb={} fds={} threads={} writes_sent={sent} writes_accepted={accepted} \
-                     files={files} dir_bytes={bytes} ssts={ssts}",
+                     cpu_ticks={} rss_kb={} fds={} threads={} writes_sent={sent} writes_accepted={accepted} writes_shed={shed} \
+                     log_len_sum={} apply_lag_sum={} apply_lag_max={} files={files} dir_bytes={bytes} ssts={ssts}",
                     t0.elapsed().as_secs(),
                     s.0 - hold_base.0,
                     s.1,
                     s.2,
-                    s.3
+                    s.3,
+                    backlog.0,
+                    backlog.1,
+                    backlog.2
                 );
                 last_log = Instant::now();
             }
@@ -934,14 +979,19 @@ async fn density_body<S: StorageEngine + 'static>(c: &mut Cluster<S>, lsm: bool,
         let (led, max_term, _, _) = c.census();
         let (hwm, _, deferred) = c.governor_stats();
         let end = proc_sample();
+        let backlog = c.backlog();
         let hold_s = hold.as_secs_f64();
         let (files, bytes, ssts) = if lsm { dir_stats(&c.dirs) } else { (0, 0, 0) };
         println!(
             "BP-LIVE g={g} phase=held min_led={min_led} led={led} max_term={max_term} inflight_hwm={hwm} deferred={deferred} \
-             hold_cores={:.3} rss_kb={} fds={} writes_sent={sent} writes_accepted={accepted} files={files} dir_bytes={bytes} ssts={ssts}",
+             hold_cores={:.3} rss_kb={} fds={} writes_sent={sent} writes_accepted={accepted} writes_shed={shed} \
+             log_len_sum={} apply_lag_sum={} apply_lag_max={} files={files} dir_bytes={bytes} ssts={ssts}",
             (end.0 - hold_base.0) as f64 / 100.0 / hold_s,
             end.1,
-            end.2
+            end.2,
+            backlog.0,
+            backlog.1,
+            backlog.2
         );
         (took.is_some(), min_led, hwm)
     })
