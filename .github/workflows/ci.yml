@@ -687,7 +687,6 @@ jobs:
       # the Docker Hub tags): a Docker Hub pull failure on the runners turned
       # this job red on unrelated changes (2026-10-09).
       RUSTFS_IMAGE: ghcr.io/rustfs/rustfs:1.0.0-rc.6
-      AWSCLI_IMAGE: public.ecr.aws/aws-cli/aws-cli:2.36.44
       S3_ACCESS_KEY: ciaccesskey
       S3_SECRET_KEY: cisecretkey123
       S3_BUCKET: ci-real-endpoint
@@ -729,30 +728,23 @@ jobs:
 
       - name: Create bucket
         run: |
-          # Pull explicitly, with bounded retries: an unauthenticated ECR
-          # Public pull from the shared runner IPs intermittently fails, and
-          # a bare `docker run` then exits 125 before the bucket is even
-          # requested (#1266/#1267/#1268, 2026-10-10). A pull failure is a
-          # registry hiccup, not an S3 result, so retrying it hides nothing.
-          pulled=0
-          for attempt in 1 2 3 4 5; do
-            if docker pull --quiet "$AWSCLI_IMAGE"; then
-              pulled=1
-              break
+          # A signed S3 CreateBucket straight from the runner's curl
+          # (--aws-sigv4), so this step pulls no image at all: the aws-cli
+          # image pull from ECR Public kept failing on the shared runner IPs
+          # even with retries (#1266/#1267/#1268, #1312).
+          for attempt in 1 2 3; do
+            code=$(curl -sS -o /tmp/mb.out -w '%{http_code}' -X PUT \
+              --aws-sigv4 "aws:amz:us-east-1:s3" \
+              --user "$S3_ACCESS_KEY:$S3_SECRET_KEY" \
+              "http://127.0.0.1:9000/$S3_BUCKET") || code=000
+            if [ "$code" = "200" ]; then
+              exit 0
             fi
-            echo "::warning::pull of $AWSCLI_IMAGE failed (attempt $attempt)"
-            sleep $((attempt * 5))
+            echo "::warning::CreateBucket returned HTTP $code (attempt $attempt): $(cat /tmp/mb.out 2>/dev/null)"
+            sleep 2
           done
-          if [ "$pulled" != "1" ]; then
-            echo "::error::could not pull $AWSCLI_IMAGE after 5 attempts"
-            exit 1
-          fi
-          docker run --rm --network host \
-            -e AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY" \
-            -e AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY" \
-            -e AWS_DEFAULT_REGION=us-east-1 \
-            "$AWSCLI_IMAGE" \
-            --endpoint-url http://127.0.0.1:9000 s3 mb "s3://$S3_BUCKET"
+          echo "::error::could not create bucket $S3_BUCKET"
+          exit 1
 
       - name: Run real-endpoint tests
         env:
