@@ -68,6 +68,7 @@ mod staggered_genesis_boot;
 mod stale_snapshot_no_rewind;
 mod storage_full_step_down;
 mod tablet_split;
+mod transfer_completes_under_faults;
 mod transfer_third_voter_wins;
 mod version_apply_corpus;
 mod version_era_on;
