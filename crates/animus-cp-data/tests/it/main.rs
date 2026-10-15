@@ -79,6 +79,7 @@ mod split_trim_failure;
 mod staggered_hosting;
 mod stale_read;
 mod stream_addressing;
+mod tablet_file_index;
 mod timerless_park;
 mod ts_cache;
 mod txn_abort_restore_history;

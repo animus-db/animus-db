@@ -187,6 +187,9 @@ use bloom::BloomFilter;
 use sstable::{Record, SsTableMeta, SsTableReader, SsTableWriter};
 use wal::{GroupCommit, WAL_HEADER_LEN, WAL_MAGIC, WAL_MARKER_TAG, WAL_VERSION, WAL_VERSION_V1};
 
+/// Issue #1303: at most this many segment numbers below the live set are probed
+/// one `remove` at a time on open; above it one directory listing is cheaper.
+const ORPHAN_PROBE_MAX: u64 = 16;
 /// Default memtable flush threshold: total bytes of buffered key+value data.
 const DEFAULT_FLUSH_BYTES: usize = 64 * 1024;
 /// Default L0 compaction trigger: number of L0 (flush-tier) SSTables that forces
@@ -775,6 +778,22 @@ impl<E: Env> LsmEngine<E> {
             return Ok(());
         };
         let wal_prefix = format!("{prefix}wal-");
+        // Issue #1303: a listing is O(every file on the node's flat data
+        // dir), which per-tablet engines (ADR 0050) share, so an open of N
+        // tablets paid O(N^2). When few segment numbers lie below the live
+        // set, probe them directly (the same names a listing would find,
+        // since a segment is always `wal-{n:06}`); only an engine that has
+        // rotated many segments still prefers the single listing.
+        if lowest_live <= ORPHAN_PROBE_MAX {
+            for seg in 0..lowest_live {
+                // `remove` of a missing file is a no-op, so this deletes
+                // exactly what a listing would have found.
+                env.remove(&format!("{wal_prefix}{seg:06}"))
+                    .await
+                    .map_err(io)?;
+            }
+            return Ok(());
+        }
         for name in env.list().await.map_err(io)? {
             let Some(seg_str) = name.strip_prefix(&wal_prefix) else {
                 continue;

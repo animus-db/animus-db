@@ -415,3 +415,38 @@ table read and written throughout.
 - **LSM RSS growth under load** (unexplained, E3).
 - **A repeat of any ProdEnv cell**: all single runs; the 2026-10-12 and 2026-10-13
   G=1500 / 2-worker results disagree (fail vs pass), which is the noise floor.
+
+# 2026-10-14: issue #1303, LsmEngine hosting cost (the `probe` defect, fixed)
+
+Same rig as E2: `election_backpressure_liveness`, `ANIMUS_BP_LIVE_ENGINE=lsm`,
+3 `ProdEnv` nodes in one process, 2 workers, `HOLD_SECS=1`. **Dev profile**
+(unoptimized, `debug=0`), so absolute times are not comparable with the release
+runs in E2; before and after are the same binary profile on the same machine.
+Single runs each. "CPU/replica" is `host_cpu_ticks` x 10 ms / (3 x G).
+
+| G (per cluster) | Before: all-led | Before: CPU/replica | After: all-led | After: CPU/replica |
+|---|---|---|---|---|
+| 300 | 11.2 s | 13 ms | 17.2 s | 15 ms |
+| 1000 | 120.6 s | 40 ms | 42.7 s | 13.5 ms |
+| 2000 | not run (E2 release: did not finish in 180 s) | - | 78.9 s | 12.8 ms |
+
+Before, 3.3x the groups cost 9.8x the CPU (quadratic). After, CPU per replica is
+flat (13-15 ms) from G=300 to G=2000. The G=300 row is within run-to-run noise.
+
+Root cause: every `EngineFactory::probe` (once per hosted tablet), `destroy`
+and `local_tablets` did a whole-directory `Disk::list` of the node's flat data
+dir (about 4 files per hosted replica), and `LsmEngine::open` of an existing
+engine did one more listing in `remove_orphan_wal_segments`. The issue's guess
+that `ProdEnv::list` awaits a `file_type()` per entry is not the cost: tokio
+1.53 caches the type from the buffered `readdir`. The cost is the O(entries)
+allocate-and-sort per call.
+
+Fix (no layout change): `animus_cp_data::tablet_files::TabletFileIndex` answers
+`probe` from one cached listing, kept exact by recording every engine open or
+clone; `remove_orphan_wal_segments` probes the (at most 16) segment numbers below
+the live set directly and only lists past that. The deterministic proof is
+`tests/it/tablet_file_index.rs`: hosting 100 and 1000 fresh tablets costs exactly
+one listing each, against 100 and 1000 for the old shape (a negative control that
+scans about 100x the entries at 10x N). `destroy` still lists once per reclaimed
+tablet (O(N) each, so a drop of N tablets is O(N^2) in directory entries, not on
+the hosting path); the `max_replicas` 1000 hosting-time cap can be revisited (dev profile only here; confirm in release first).
