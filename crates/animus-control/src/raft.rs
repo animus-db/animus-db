@@ -129,6 +129,29 @@ pub const SNAPSHOT_CHUNK_BYTES: usize = 64 * 1024;
 /// this cap and unaffected.
 const MAX_APPEND_ENTRIES_BATCH: usize = 512;
 
+/// How many heartbeat intervals an `AppendEntries` carrying entries may go
+/// unacknowledged before the leader's heartbeat re-offers the tail from
+/// `next_index` (issue #1304, see `RaftCore::inflight_sent`). In between, the
+/// heartbeat is an empty `AppendEntries` at the acknowledged position, so a
+/// slow peer costs a bounded few bytes per heartbeat instead of a re-send of
+/// its whole backlog (a re-send does not make a CPU-starved peer ack sooner).
+/// Four intervals is long enough that a merely queued ack does not provoke a
+/// duplicate and short enough that a genuinely lost message costs well under
+/// the default election timeout.
+const INFLIGHT_RETRANSMIT_HEARTBEATS: u64 = 4;
+
+/// How many entries may be in flight (sent, not yet acknowledged) to one peer
+/// before the leader stops sending it more on each propose/ack and batches
+/// instead (issue #1304, see `RaftCore::inflight_sent`). Below it a send still
+/// carries the whole unacknowledged tail anchored at the acknowledged
+/// position, exactly as before, so a lightly loaded group keeps its
+/// one-round-trip write latency and never exposes a peer to a gap; the
+/// overlap this allows costs at most this many times an entry's bytes. At or
+/// above it the peer is behind (a slow fsync, a starved node): re-sending the
+/// tail then only grows the backlog the peer has to chew through, so nothing
+/// is sent until its ack lands and the new entries go out as one batch.
+const INFLIGHT_OVERLAP_MAX_ENTRIES: u64 = 4;
+
 /// How many election timeouts a voter this leader saw report unable (full) and
 /// then healthy must stay healthy before it counts in
 /// [`RaftCore::healthy_followers`] (chaos `disk_full` F-4). A full disk regains
@@ -1101,6 +1124,25 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     votes: BTreeSet<NodeId>,
     // Leader state.
     next_index: BTreeMap<NodeId, u64>,
+    // Leader-only (issue #1304): per peer, the highest log index this leader
+    // has put on the wire in an `AppendEntries` that has not been fully
+    // acknowledged yet, and when. `next_index` only moves on an ack, so
+    // without this every propose, every ack and every heartbeat re-sent the
+    // whole unacknowledged tail (`next_index..`): with `w` entries in flight
+    // each ack provoked another `w`-entry message, and the traffic (and the
+    // encoded copies queued in the transport) grew with the square of the ack
+    // lag. Below `INFLIGHT_OVERLAP_MAX_ENTRIES` entries in flight
+    // (`s + 1 - next_index`) nothing changes. At or above it the propose/ack
+    // paths send the peer nothing more: whatever is proposed meanwhile goes
+    // out as ONE batch when the ack lands. Every message is anchored at the
+    // acknowledged `next_index - 1` (never at the in-flight mark), so a peer
+    // never sees a gap and a reordered delivery never provokes a reject. The
+    // heartbeat is an empty `AppendEntries` at the acknowledged position until
+    // the entries have gone unacknowledged for `INFLIGHT_RETRANSMIT_HEARTBEATS`
+    // heartbeats, then it re-offers the tail from `next_index` (loss
+    // recovery). A reject, a snapshot request, a new leadership stint or a
+    // membership change forgets the mark. Volatile, like `next_index`.
+    inflight_sent: BTreeMap<NodeId, (u64, Nanos)>,
     match_index: BTreeMap<NodeId, u64>,
     // Leader-only (issue #554): the highest `snapshot_index` this leader has
     // FULLY shipped and had acknowledged (`handle_install_snapshot_resp`'s
@@ -1747,6 +1789,7 @@ where
             pre_votes: BTreeSet::new(),
             votes: BTreeSet::new(),
             next_index: BTreeMap::new(),
+            inflight_sent: BTreeMap::new(),
             match_index: BTreeMap::new(),
             snapshot_served_through: BTreeMap::new(),
             peer_check_pending: BTreeMap::new(),
@@ -4819,6 +4862,7 @@ where
                 // log agreement, unrelated to what the engine holds.
                 self.next_index.insert(from.clone(), 1);
             }
+            self.inflight_sent.remove(&from);
             self.maybe_advance_commit();
             self.apply();
             return self
@@ -4872,6 +4916,7 @@ where
             if *ni > 1 {
                 *ni -= 1;
             }
+            self.inflight_sent.remove(&from);
             self.replicate_to(from, SnapshotResend::Always)
                 .into_iter()
                 .collect()
@@ -5714,6 +5759,7 @@ where
 
     fn become_leader(&mut self, now: Nanos) -> Vec<Out<C>> {
         self.role = Role::Leader;
+        self.inflight_sent.clear();
         // ADR 0078: a leader has no campaign to defer.
         self.campaign_hold = None;
         self.leader_id = Some(self.id.clone());
@@ -6092,6 +6138,7 @@ where
             .cloned()
             .collect();
         for n in now_members.difference(old_members) {
+            self.inflight_sent.remove(n);
             self.next_index.insert(n.clone(), entry_index);
             self.match_index.insert(n.clone(), 0);
             self.snapshot_served_through.remove(n);
@@ -6103,6 +6150,7 @@ where
             if self.departing.contains_key(n) {
                 continue;
             }
+            self.inflight_sent.remove(n);
             self.next_index.remove(n);
             self.match_index.remove(n);
             self.last_contact.remove(n);
@@ -6127,6 +6175,7 @@ where
         self.departing_since.remove(peer);
         self.departing_quiet.remove(peer);
         self.removal_sched.remove(peer);
+        self.inflight_sent.remove(peer);
         self.next_index.remove(peer);
         self.match_index.remove(peer);
         self.last_contact.remove(peer);
@@ -6549,15 +6598,46 @@ where
             }
             return self.snapshot_chunk_for(peer, snapshot_resend);
         }
+        let mut empty = false;
+        if let Some(&(s, at)) = self.inflight_sent.get(&peer)
+            && s >= next
+            && s + 1 - next >= INFLIGHT_OVERLAP_MAX_ENTRIES
+        {
+            // A deep window is in flight (issue #1304): re-sending the tail
+            // only grows what the peer has to chew through.
+            if !matches!(snapshot_resend, SnapshotResend::Backoff) {
+                // Propose / ack path: send nothing now. What is proposed
+                // meanwhile goes out as one batch when the ack lands.
+                return None;
+            }
+            // Heartbeat tick: an empty `AppendEntries` at the acknowledged
+            // position (it always matches) unless the in-flight entries have
+            // gone unacknowledged for `INFLIGHT_RETRANSMIT_HEARTBEATS`, then
+            // re-offer the tail from `next_index`.
+            if self.now_hint.0.saturating_sub(at.0)
+                < self
+                    .heartbeat_nanos()
+                    .saturating_mul(INFLIGHT_RETRANSMIT_HEARTBEATS)
+            {
+                empty = true;
+            }
+        }
         let prev_log_index = next - 1;
         let prev_log_term = self.term_at(prev_log_index);
-        let entries: Vec<LogEntry<C>> = self
-            .log
-            .iter()
-            .filter(|e| e.index >= next)
-            .take(MAX_APPEND_ENTRIES_BATCH)
-            .cloned()
-            .collect();
+        let entries: Vec<LogEntry<C>> = if empty {
+            Vec::new()
+        } else {
+            self.log
+                .iter()
+                .filter(|e| e.index >= next)
+                .take(MAX_APPEND_ENTRIES_BATCH)
+                .cloned()
+                .collect()
+        };
+        if let Some(l) = entries.last() {
+            self.inflight_sent
+                .insert(peer.clone(), (l.index, self.now_hint));
+        }
         Some((
             peer,
             RaftMsg::AppendEntries {

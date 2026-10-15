@@ -2476,6 +2476,20 @@ freezes that type's absent-field semantics once merged.**
   fact, the policy lives entirely in the driver. See the ADR amendment for
   the full mechanism and honest residual.
 
+  **A deep in-flight window is not re-sent (issue #1304, ADR 0009's
+  2026-10-14 amendment).** `inflight_sent` (per peer: highest index sent and
+  when) makes `replicate_to` send nothing on a propose/ack once
+  `INFLIGHT_OVERLAP_MAX_ENTRIES` (4) entries are unacknowledged, and turns the
+  heartbeat into an empty `AppendEntries` at the acknowledged position until
+  `INFLIGHT_RETRANSMIT_HEARTBEATS` (4) beats pass; below the depth behaviour
+  is unchanged. Every message stays anchored at `next_index - 1` (the
+  acknowledged position): do NOT "optimise" this into a classic pipeline
+  (`prev = last sent`), a reordered or lost message then rejects and the
+  reject arm's `next_index -= 1` walks the peer down into `InstallSnapshot`.
+  The follower's commit index is capped at `prev_log_index + entries.len()`
+  (Raft section 5.3), not its own last index. Tests:
+  `tests/it/pipelined_replication.rs`.
+
   **A resend of an already-outstanding chunk is bounded per caller, not
   unconditional (issues #532/#537, ADR 0009's THIRD 2026-09-01
   amendment — the residual the batch-cap/compaction-defer fixes above left

@@ -1052,3 +1052,53 @@ and a refused promotion is retried by the next reconcile pass. It cannot weaken
 the #667 safety property, which constrains what a node does once it is a voter,
 and the gate makes the node resolve its check before it becomes one. Regression:
 `tests/learner_promotion_pending_check.rs`.
+
+## Amendment (2026-10-14): a deep in-flight window is not re-sent, and a follower commits only what the message vouched for (issue #1304)
+
+`next_index` only moves on an ack, and `replicate_to` always shipped
+`next_index..` (capped at `MAX_APPEND_ENTRIES_BATCH`). So every propose
+(wake-on-propose), every success ack (`handle_append_resp` re-invokes
+`replicate_to` while more remains) and every heartbeat re-sent the whole
+unacknowledged tail: with `w` entries in flight each ack provoked another
+`w`-entry `AppendEntries`, and the bytes on the wire grew with the square of the
+ack lag. Measured on the ADR 0079 density rig (`LsmEngine`, 700 groups, 600 puts
+of 4 KiB/s over 50 groups, three nodes in one process): 8.7 GB sent in 20 s for
+about 0.2 GB of entries (30x), 450-700 MB of encoded frames queued in
+`ProdEnv::send_stream` tasks at any moment, and the process RSS reached 2.7 GB
+in 60 s. A saturated peer's acks come late, so the load that made it slow made
+the leader send it more.
+
+Fix (leader only, no wire or format change): `RaftCore::inflight_sent` records,
+per peer, the highest index sent in an `AppendEntries` that is not yet fully
+acknowledged and when. Below `INFLIGHT_OVERLAP_MAX_ENTRIES` (4) entries in
+flight nothing changes, so a lightly loaded group keeps today's one-round-trip
+latency and today's messages. At or above it the propose and ack paths send
+that peer nothing; what is proposed meanwhile goes out as one batch, anchored
+at the acknowledged position like every other message, when the ack lands.
+The heartbeat is then an empty `AppendEntries` at the acknowledged position
+(it always matches) until the entries have gone unacknowledged for
+`INFLIGHT_RETRANSMIT_HEARTBEATS` (4) heartbeats, when it re-offers the tail
+from `next_index` (loss recovery). Anchoring every message at the acknowledged
+position, never at the in-flight mark, is deliberate: a classic pipeline
+(`prev = last sent`) turns a reordered or lost message into a reject, and
+`handle_append_resp`'s reject arm backs `next_index` off by one per reject,
+which the simulator's jitter turned into a walk down into
+`InstallSnapshot` (43 installs in `follower_aware_compaction`). A reject, a
+snapshot request, a new leadership stint and a membership change forget the
+mark.
+
+The empty heartbeat exposed a latent follower bug, fixed in the same change
+(`handle_append_entries`): the follower advanced its commit index to
+`min(leader_commit, own last_log_index)`, but Raft section 5.3 bounds it by the
+last entry *the message vouched for*, `prev_log_index + entries.len()`. A stale
+suffix from an earlier term past that point is unchecked against the leader's
+log; with the leader sending the whole tail on every heartbeat it was almost
+always overwritten first (it needed a lag beyond the 512-entry batch), with an
+empty heartbeat the follower committed and applied it (seen as two of four
+control nodes applying a different command at the same index in
+`version_mixed_corpus::release2_to_release3_mrec_gate`).
+
+Tests: `tests/it/pipelined_replication.rs` (the burst is bounded, the ack
+answers with one batch, shallow windows are unchanged, empty heartbeats until
+the retransmit window, a reject resends at once; the follower commit cap is `tests/it/follower_commit_cap.rs`, split out as its own PR #1318).
+
