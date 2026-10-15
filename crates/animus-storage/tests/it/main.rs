@@ -13,6 +13,7 @@ mod lsm_group_commit;
 mod lsm_maintenance;
 mod lsm_merge_fast_path;
 mod lsm_metrics;
+mod lsm_multi_block_versions;
 mod lsm_options_validation;
 mod lsm_scan_range_gate;
 mod lsm_semantics;

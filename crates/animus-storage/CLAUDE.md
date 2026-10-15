@@ -226,7 +226,7 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   same range gate as every other multi-table path — `sstable_overlaps` — before
   calling into a reader's `scan_at` at all** (issue #835). Without it, every
   reader was visited unconditionally: `SsTableReader::scan_at` starts from
-  `block_for_key(start)`, which for a table sorting entirely *below* `start`
+  `blocks_for_key(start)`, which for a table sorting entirely *below* `start`
   resolves to that table's *last* block (every block satisfies `first_key <=
   start`), so the whole engine paid one wasted block fetch + CRC + LZ4
   decompress per below-range table, scaling with table count rather than
@@ -855,3 +855,5 @@ The LSM WAL/manifest/SSTable decoders are the `lsm_formats` fuzz target, reached
   `LsmOptions::raw_versions()`/`production_raw_versions()` (`1 << 20`). Neither
   is an on-disk format (no ADR 0073 bump). A hold taken after the grace passed
   cannot resurrect GC'd versions. Test: `lsm_gc.rs::held_version_survives_compaction_gc`.
+
+- **A key's versions can straddle SSTable data blocks** (blocks are cut at 4 KiB regardless of key boundaries). `SsTableReader` point reads and `scan_at` use `blocks_for_key`, a range, never one block (issue #1315; `tests/it/lsm_multi_block_versions.rs`). Do not reintroduce a single-block lookup.
