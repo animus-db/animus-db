@@ -672,6 +672,10 @@ async fn roll_scenario(
 
     // ---- the roll, as the runbook says --------------------------------------------
     let mut steps: Vec<Value> = Vec::new();
+    // When (seconds since the workload started, the clock every history time
+    // uses) each rolled node was started on its new binary, for the failure
+    // digest to place an acked write against the roll.
+    let mut restart_marks: Vec<(String, f64)> = Vec::new();
     // The plan is taken over the Phase-1 cluster and followed in order; after
     // every step it is asked again (from a node that is up) and must name
     // exactly the steps that are left: `plan` is re-entrant mid-roll because
@@ -775,6 +779,7 @@ async fn roll_scenario(
         // lets D4's rebuild traffic show.
         tokio::time::sleep(gap).await;
         let down = t0.elapsed();
+        restart_marks.push((id.clone(), shared.start.elapsed().as_secs_f64()));
         c.start(i, &roll_bin);
         let node_admin = c.nodes[i].admin.to_string();
         if control.is_some() {
@@ -1092,6 +1097,14 @@ async fn roll_scenario(
     for v in violations.iter().take(20) {
         eprintln!("upgrade[{name}]: VIOLATION {v}");
     }
+    // `ANIMUS_UPGRADE_FROM_DIGEST=1` prints it on a passing run too (to try it).
+    if !violations.is_empty() || std::env::var_os("ANIMUS_UPGRADE_FROM_DIGEST").is_some() {
+        // The CI artifact cannot always be fetched: put what triage needs in
+        // the job log itself (bounded, see `failure_digest`).
+        for line in failure_digest(&c, &shared, &history, &fin_a, &restart_marks).await {
+            eprintln!("upgrade[{name}]: DIGEST {line}");
+        }
+    }
     if !violations.is_empty()
         && let Ok(dir) = std::env::var("ANIMUS_UPGRADE_FROM_REPORT_DIR")
     {
@@ -1126,6 +1139,256 @@ async fn roll_scenario(
         violations.len(),
         violations.first().map_or("", String::as_str)
     );
+}
+
+/// The node-log phrases that say a `TxnStage` was not applied as staged (the
+/// stale-restage seatbelt, a blocking foreign intent, a late anchor stage, a
+/// replay over an engine already ahead of it; issue #1315's hypothesis is
+/// that these fire on some replicas and not on others, the same log entry
+/// applying differently on the previous-release and the current build).
+const TXN_LOG_PHRASES: [&str; 5] = [
+    "TxnStage rejected",
+    "TxnStage blocked",
+    "TxnStage arrived after",
+    "replayed over an engine already ahead",
+    "panicked at",
+];
+
+/// `YYYY-MM-DDTHH:MM:SSZ` of a unix time (civil-from-days, no dependency).
+fn rfc3339_utc(secs: u64) -> String {
+    let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+/// A log line without its terminal colour escapes.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+            for d in chars.by_ref() {
+                if d.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn clip(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        format!("{}...", s.chars().take(n).collect::<String>())
+    }
+}
+
+/// Everything a reader of the job log needs to tell, from one failed run,
+/// whether the same log entry applied differently on different replicas
+/// (issue #1315): the acked appends missing from the converged state with
+/// their ack times and transaction partners, the roll's restart times on the
+/// same clock, every node's own consistent and eventual view of the affected
+/// keys, and the node-log lines where a `TxnStage` was rejected, blocked or
+/// fenced. Bounded: at most ~130 lines of at most ~300 characters.
+async fn failure_digest(
+    c: &RollCluster,
+    shared: &Shared,
+    history: &animus_test::History,
+    fin: &BTreeMap<u64, Vec<u64>>,
+    restart_marks: &[(String, f64)],
+) -> Vec<String> {
+    use animus_test::Outcome;
+    use animus_test::history::Mop;
+    let mut out: Vec<String> = Vec::new();
+    let n = c.n();
+
+    // The clock: history times are ns since `shared.start`.
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let start_unix = now_unix.saturating_sub(shared.start.elapsed().as_secs());
+    out.push(format!(
+        "clock: workload t=0 is about {} (node-log timestamps are wall clock); \
+         roll restarts at workload seconds: {}",
+        rfc3339_utc(start_unix),
+        restart_marks
+            .iter()
+            .map(|(id, t)| format!("{id}@{t:.1}s"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    ));
+
+    // Acked appends: value -> (key, ack time s, process).
+    let mut acked: BTreeMap<u64, (u64, f64, u64)> = BTreeMap::new();
+    for e in history.entries.iter().filter(|e| e.outcome == Outcome::Ok) {
+        for m in &e.mops {
+            if let Mop::Append { key, value } = m {
+                acked.insert(*value, (*key, e.time as f64 / 1e9, e.process));
+            }
+        }
+    }
+    let txns = shared.txns.lock().expect("txns").clone();
+    let partner = |v: u64| -> String {
+        txns.iter().find(|t| t.v0 == v || t.v1 == v).map_or_else(
+            || "single".to_string(),
+            |t| {
+                format!(
+                    "txn(k{}<-{}, k{}<-{}, acked={})",
+                    t.k0, t.v0, t.k1, t.v1, t.acked
+                )
+            },
+        )
+    };
+    let mut lost: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    for (v, (k, _, _)) in &acked {
+        if fin.get(k).is_some_and(|l| !l.contains(v)) {
+            lost.entry(*k).or_default().push(*v);
+        }
+    }
+    let total: usize = lost.values().map(Vec::len).sum();
+    out.push(format!(
+        "{total} acked append(s) absent from the converged state, on {} key(s) (of {} acked appends)",
+        lost.len(),
+        acked.len()
+    ));
+    for (k, vals) in lost.iter().take(8) {
+        let times: Vec<f64> = vals.iter().map(|v| acked[v].1).collect();
+        let (lo, hi) = times
+            .iter()
+            .fold((f64::MAX, 0f64), |(a, b), t| (a.min(*t), b.max(*t)));
+        out.push(format!(
+            "key {k}: {} lost, acked {lo:.2}s..{hi:.2}s after workload start; final list has {} \
+             value(s)",
+            vals.len(),
+            fin.get(k).map_or(0, Vec::len)
+        ));
+        for v in vals.iter().take(4) {
+            let (_, t, proc) = acked[v];
+            out.push(format!(
+                "  lost {v}: acked at {t:.2}s by client {proc}, {}",
+                partner(*v)
+            ));
+        }
+    }
+    // Transaction halves (both appends acked, one in the final state).
+    let mut halves = 0;
+    for t in &txns {
+        let p0 = fin.get(&t.k0).is_some_and(|l| l.contains(&t.v0));
+        let p1 = fin.get(&t.k1).is_some_and(|l| l.contains(&t.v1));
+        if p0 != p1 && halves < 8 {
+            halves += 1;
+            let at = acked.get(&t.v0).or_else(|| acked.get(&t.v1)).map(|a| a.1);
+            out.push(format!(
+                "half-applied txn: k{}<-{} present={p0}, k{}<-{} present={p1}, acked={}, ack at {}",
+                t.k0,
+                t.v0,
+                t.k1,
+                t.v1,
+                t.acked,
+                at.map_or("?".to_string(), |a| format!("{a:.2}s"))
+            ));
+        }
+    }
+
+    // Each node's own view of the affected keys (eventual reads are served by
+    // the node's own replica when it passes the freshness gate).
+    let mut keys: Vec<u64> = lost.keys().copied().collect();
+    for t in &txns {
+        let p0 = fin.get(&t.k0).is_some_and(|l| l.contains(&t.v0));
+        let p1 = fin.get(&t.k1).is_some_and(|l| l.contains(&t.v1));
+        if p0 != p1 {
+            keys.push(if p0 { t.k1 } else { t.k0 });
+        }
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    for k in keys.iter().take(6) {
+        let want = lost.get(k).cloned().unwrap_or_default();
+        for i in 0..n {
+            let addr = c.nodes[i].dynamo;
+            let cons = workload::final_read(addr, *k, Duration::from_secs(10)).await;
+            let ev = workload::eventual_read(addr, *k).await;
+            let show = |l: &[u64]| {
+                let tail: Vec<String> = l.iter().rev().take(6).rev().map(u64::to_string).collect();
+                let missing = want.iter().filter(|v| !l.contains(v)).count();
+                format!(
+                    "len {} tail [{}] lacks {missing}/{} lost",
+                    l.len(),
+                    tail.join(","),
+                    want.len()
+                )
+            };
+            out.push(format!(
+                "key {k} via n{i}: consistent {} | eventual {}",
+                cons.as_ref().map_or_else(|e| clip(e, 80), |l| show(l)),
+                ev.as_ref().map_or("none".to_string(), |l| show(l)),
+            ));
+        }
+    }
+
+    // Node logs and the 2PC trackers. Per phrase: the first two and the last
+    // matching line (the log spans the node's R-1 and current lifetimes).
+    for i in 0..n {
+        let text = std::fs::read_to_string(c.log_path(i)).unwrap_or_default();
+        let mut counts = [0usize; TXN_LOG_PHRASES.len()];
+        let mut shown: Vec<Vec<String>> = vec![Vec::new(); TXN_LOG_PHRASES.len()];
+        for line in text.lines() {
+            for (j, ph) in TXN_LOG_PHRASES.iter().enumerate() {
+                if line.contains(ph) {
+                    counts[j] += 1;
+                    let plain = strip_ansi(line);
+                    if counts[j] <= 3 {
+                        shown[j].push(plain);
+                    } else {
+                        shown[j][2] = plain;
+                    }
+                }
+            }
+        }
+        out.push(format!(
+            "n{i} log line counts: {}",
+            TXN_LOG_PHRASES
+                .iter()
+                .zip(counts)
+                .map(|(p, c)| format!("'{p}'={c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
+        for l in shown.iter().flatten() {
+            out.push(format!("n{i} log: {}", clip(l, 300)));
+        }
+        if let Some(t) = c.admin_json(i, "/admin/txns").await {
+            let groups = t["groups"].as_array().cloned().unwrap_or_default();
+            let len = |g: &Value, f: &str| g[f].as_array().map_or(0, Vec::len);
+            out.push(format!(
+                "n{i} /admin/txns: {} group(s), pending {}, unresolved_decided {}",
+                groups.len(),
+                groups.iter().map(|g| len(g, "pending")).sum::<usize>(),
+                groups
+                    .iter()
+                    .map(|g| len(g, "unresolved_decided"))
+                    .sum::<usize>(),
+            ));
+        }
+    }
+    out
 }
 
 /// The converged state read through two different nodes.
@@ -1196,4 +1459,11 @@ fn kill_the_control_leader_3_nodes() {
 #[test]
 fn torn_wal_tail_3_nodes() {
     go(Variant::TornTail, 3);
+}
+
+#[test]
+fn digest_formats_a_unix_time_as_utc() {
+    assert_eq!(rfc3339_utc(0), "1970-01-01T00:00:00Z");
+    assert_eq!(rfc3339_utc(1_784_000_000), "2026-07-14T03:33:20Z");
+    assert_eq!(rfc3339_utc(1_791_936_000 + 3661), "2026-10-14T01:01:01Z");
 }
