@@ -6,9 +6,18 @@
  * that makes this surface roomy and read-at-leisure — ruled, plain-bordered,
  * softly rounded (6px controls, 8px panels), with no drop shadows anywhere,
  * not even the ink plates (that exception is gone — see the ADR's newest
- * amendment), and no rounded pills except tight status chips. Faces load
- * from Google Fonts (allowed on the marketing site); no build step.
+ * amendment), and no rounded pills except tight status chips. Faces are
+ * self-hosted (assets/fonts/, latin subset, variable weight) so the site makes
+ * no third-party request; no build step.
  */
+@font-face {
+  font-family: "Work Sans"; font-style: normal; font-weight: 100 900; font-display: swap;
+  src: url("fonts/work-sans-latin-wght-normal.woff2") format("woff2-variations");
+}
+@font-face {
+  font-family: "JetBrains Mono"; font-style: normal; font-weight: 100 800; font-display: swap;
+  src: url("fonts/jetbrains-mono-latin-wght-normal.woff2") format("woff2-variations");
+}
 :root {
   /* site skin — roomy: read at leisure, often on a phone */
   --radius: 6px;
@@ -389,12 +398,15 @@ td.d { color: var(--ink-72); font-size: 12.5px; }
 .pill.opt { color: var(--warn); background: var(--warn-bg); }
 .pill.out { color: var(--danger); background: var(--danger-bg); }
 .pill.part { color: var(--warn); background: var(--warn-bg); }
+.pill.sim { color: var(--accent); background: var(--surface2); } /* proven in deterministic simulation only */
 
 /* ---------- status list (single flat list, one status pill per row) ---------- */
 .status-list { list-style: none; margin: 0; padding: 0; border: 1px solid var(--border); background: var(--surface); border-radius: var(--radius-panel); overflow: hidden; }
 .status-list li { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 11px 16px; border-bottom: 1px solid var(--border); font-size: 13.5px; color: var(--ink-85); }
 .status-list li:last-child { border-bottom: none; }
 .status-list .pill { flex: 0 0 auto; }
+.status-more { margin-top: 12px; font-size: 13px; color: var(--text2); }
+.status-more .pill { margin-right: 4px; }
 
 /* ---------- callouts, warnings, asides, pull quotes ---------- */
 .callout {
