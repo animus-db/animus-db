@@ -1364,6 +1364,26 @@ impl<E: Env> RaftNode<E> {
         self.lock().transfer_leadership(target, self.env.now())
     }
 
+    /// Re-arm a leadership transfer to `target` whose arm window lapsed
+    /// (issue #1325). Returns whether a transfer is armed afterwards.
+    ///
+    /// [`RaftCore::transfer_leadership`] arms for only one election-timeout
+    /// window and then aborts on a tick (resuming proposals), so a transfer
+    /// whose `TimeoutNow` was lost, or whose target acked late, simply lapses
+    /// with this node still the leader. A caller that polls for the handoff
+    /// for longer than that window (the admin routes poll for seconds) must
+    /// re-issue the arm while it waits, or the rest of its budget is dead
+    /// time. A no-op (returns `true`) while the transfer is still armed, so
+    /// it never extends the deadline of a live arm; `false` when this node is
+    /// not the leader, or the target is not (yet) a valid, caught-up target.
+    pub fn rearm_lapsed_transfer(&self, target: NodeId) -> bool {
+        let mut core = self.lock();
+        if core.transfer_target().as_ref() == Some(&target) {
+            return true;
+        }
+        core.transfer_leadership(target, self.env.now())
+    }
+
     /// The voter this leader is currently handing leadership off to, if any
     /// (see [`RaftCore::transfer_target`]) — `/admin/raft`'s own window onto
     /// an in-flight transfer (issue #313: previously invisible short of
