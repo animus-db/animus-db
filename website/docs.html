@@ -3,15 +3,19 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AnimusDB documentation</title>
+<title>AnimusDB documentation — DynamoDB-compatible database on Kubernetes</title>
 <meta name="description" content="How AnimusDB works: tablets and partitioning, the two planes, the consistency model, the DynamoDB-compatible API surface, operations, and deterministic simulation testing.">
 <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
 <link rel="canonical" href="https://animusdb.io/docs.html">
-<meta property="og:title" content="AnimusDB documentation">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://animusdb.io/docs.html">
+<meta property="og:title" content="AnimusDB documentation — DynamoDB-compatible database on Kubernetes">
 <meta property="og:description" content="Tablets, the two planes, the consistency model, the API surface, operations, and the simulator.">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Work+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<meta property="og:image" content="https://animusdb.io/assets/og-card.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="AnimusDB — the DynamoDB API on infrastructure you own">
+<meta name="twitter:card" content="summary_large_image">
 <link rel="stylesheet" href="assets/tokens.css">
 <link rel="stylesheet" href="assets/site.css">
 <script src="assets/site.js" defer></script>
@@ -90,6 +94,43 @@
 </div>
 
 <div class="wrap doc-layout">
+  <details class="doc-toc">
+    <summary><span class="doc-toc-label">On this page</span><span class="doc-toc-current"></span></summary>
+    <nav class="doc-toc-panel" aria-label="On this page">
+      <div class="doc-toc-group">
+        <span class="doc-toc-head">Concepts</span>
+        <a href="#model">Data model</a>
+        <a href="#tablets">Tablets and partitioning</a>
+        <a href="#replication">Replication</a>
+        <a href="#consistency">Consistency model</a>
+      </div>
+      <div class="doc-toc-group">
+        <span class="doc-toc-head">Architecture</span>
+        <a href="#planes">The two planes</a>
+        <a href="#storage">Storage engine</a>
+        <a href="#lifecycle">Splits and rebalancing</a>
+        <a href="#derived">Indexes, streams, TTL</a>
+      </div>
+      <div class="doc-toc-group">
+        <span class="doc-toc-head">Interfaces</span>
+        <a href="#api">API compatibility</a>
+        <a href="#transactions">Transactions</a>
+        <a href="#consoles">Consoles and admin</a>
+      </div>
+      <div class="doc-toc-group">
+        <span class="doc-toc-head">Operating</span>
+        <a href="#deployments">Deployment shapes</a>
+        <a href="#operations">Day-two operations</a>
+        <a href="#observability">Observability</a>
+      </div>
+      <div class="doc-toc-group">
+        <span class="doc-toc-head">Engineering</span>
+        <a href="#determinism">Deterministic testing</a>
+        <a href="#limits">Known limits</a>
+        <a href="#further">Going deeper</a>
+      </div>
+    </nav>
+  </details>
   <aside class="doc-nav">
     <div class="cols">
       <div>
@@ -226,7 +267,7 @@
       </p>
       <div class="table-scroll">
         <table>
-          <thead><tr><th style="width:220px">Surface</th><th>Guarantee</th></tr></thead>
+          <thead><tr><th class="w-220">Surface</th><th>Guarantee</th></tr></thead>
           <tbody>
             <tr><td>Item reads and writes</td><td>Linearizable</td></tr>
             <tr><td>Query and Scan within a tablet</td><td>Linearizable</td></tr>
@@ -372,7 +413,7 @@
       <h3>DynamoDB operations</h3>
       <div class="table-scroll">
         <table>
-          <thead><tr><th style="width:280px">Operation</th><th style="width:120px">Status</th><th>Notes</th></tr></thead>
+          <thead><tr><th class="w-280">Operation</th><th class="w-120">Status</th><th>Notes</th></tr></thead>
           <tbody>
             <tr><td><code>CreateTable</code></td><td><span class="pill yes">Yes</span></td><td>Partition and sort keys, GSIs and LSIs at creation, plus <code>BillingMode</code>/<code>ProvisionedThroughput</code></td></tr>
             <tr><td><code>DescribeTable</code></td><td><span class="pill yes">Yes</span></td><td>Includes index status, stream configuration, and billing mode/throughput</td></tr>
@@ -512,7 +553,7 @@
       <h2>Deployment shapes</h2>
       <div class="table-scroll">
         <table>
-          <thead><tr><th style="width:190px">Shape</th><th>What it is</th><th style="width:200px">Command</th></tr></thead>
+          <thead><tr><th class="w-190">Shape</th><th>What it is</th><th class="w-200">Command</th></tr></thead>
           <tbody>
             <tr><td><strong>Combined</strong></td><td>Every node runs both planes. The default, and the right choice for small and medium clusters.</td><td><code>animusd --config … --node I</code></td></tr>
             <tr><td><strong>Control-only</strong></td><td>A small metadata quorum with no storage engine and no client endpoints.</td><td><code>animusd control --config … --node I</code></td></tr>
@@ -722,7 +763,7 @@
         record — the context, the decision, and the consequences knowingly accepted. They are the
         real documentation for how the internals work, and they are kept current with the code.
       </p>
-      <div class="btn-row" style="margin-top:20px">
+      <div class="btn-row mt-20">
         <a class="btn primary" href="https://github.com/animus-db/animus-db/blob/main/docs/adr/README.md">Architecture decision records</a>
         <a class="btn" href="https://github.com/animus-db/animus-db">Source on GitHub</a>
         <a class="btn" href="https://github.com/animus-db/animus-db/blob/main/CONTRIBUTING.md">Contributing</a>

@@ -3,18 +3,33 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AnimusDB — the DynamoDB API on infrastructure you own</title>
+<title>AnimusDB — a self-hosted DynamoDB alternative on infrastructure you own</title>
 <meta name="description" content="A DynamoDB-compatible database you host yourself. Same SDKs, same access patterns, your cloud and your jurisdiction. Open source, AGPL-3.0, pre-alpha.">
+<link rel="alternate" type="application/atom+xml" title="AnimusDB releases" href="https://github.com/animus-db/animus-db/releases.atom">
 <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
 <link rel="canonical" href="https://animusdb.io/">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://animusdb.io/">
-<meta property="og:title" content="AnimusDB — the DynamoDB API on infrastructure you own">
+<meta property="og:title" content="AnimusDB — a self-hosted DynamoDB alternative on infrastructure you own">
 <meta property="og:description" content="A DynamoDB-compatible database you host yourself. Same SDKs, same access patterns, your cloud and your jurisdiction. Open source, AGPL-3.0, pre-alpha.">
-<meta name="twitter:card" content="summary">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Work+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<meta property="og:image" content="https://animusdb.io/assets/og-card.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="AnimusDB — the DynamoDB API on infrastructure you own">
+<meta name="twitter:card" content="summary_large_image">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareSourceCode",
+  "name": "AnimusDB",
+  "description": "A DynamoDB-compatible database you host yourself. Same SDKs, same access patterns, your cloud and your jurisdiction. Open source, AGPL-3.0, pre-alpha.",
+  "url": "https://animusdb.io/",
+  "codeRepository": "https://github.com/animus-db/animus-db",
+  "programmingLanguage": "Rust",
+  "license": "https://www.gnu.org/licenses/agpl-3.0.html",
+  "runtimePlatform": "Linux, Kubernetes"
+}
+</script>
 <link rel="stylesheet" href="assets/tokens.css">
 <link rel="stylesheet" href="assets/site.css">
 <script src="assets/site.js" defer></script>
@@ -113,7 +128,7 @@
 
   <div class="stat-row">
     <div class="stat"><div class="n">Same SDKs</div><div class="l">The integration is one endpoint line — nothing new to learn, nothing new to hire for</div></div>
-    <div class="stat"><div class="n">Masterless</div><div class="l">One Raft group per tablet, no special node to lose</div></div>
+    <div class="stat"><div class="n">No special node</div><div class="l">One Raft group per tablet, leaders spread across every node</div></div>
     <div class="stat"><div class="n">Yours</div><div class="l">Your cloud, your datacentre, your jurisdiction</div></div>
     <div class="stat"><div class="n">Seed-reproducible</div><div class="l">Every distributed failure replays exactly, from one number</div></div>
   </div>
@@ -123,7 +138,7 @@
   <div class="wrap">
     <span class="kicker">Why this exists</span>
     <h2>The API is the standard. The hosting doesn't have to be.</h2>
-    <div class="split" style="margin-top:8px;align-items:start">
+    <div class="split mt-8 ai-start">
       <div>
         <p class="body-text">DynamoDB's API won for good reasons: predictable latency at any size, a data model that survives scale, and an SDK in every language your teams already use.</p>
         <p class="body-text">But there is one place to run it. One vendor sets your price, your regions and your recovery time — and revisits all three on their schedule, not yours.</p>
@@ -132,7 +147,7 @@
         <a class="ctalink" href="articles/why-lock-in-compounds.html">Why lock-in compounds →</a>
       </div>
       <div>
-        <span class="kicker" style="margin-bottom:10px">What adoption costs you</span>
+        <span class="kicker mb-10">What adoption costs you</span>
         <div class="plate">
           <div class="head"><span class="t">client configuration</span><span class="ext">diff</span></div>
           <div class="body">
@@ -140,8 +155,8 @@
             <div class="cl dp">+ endpoint: animus.internal:7102</div>
           </div>
         </div>
-        <p class="body-text" style="margin-top:14px;font-size:13px">One line. Your SDKs, your queries, your conditional writes, your pagination — unchanged. Nothing new to learn, nothing new to hire for. What <em>does</em> change sits behind that endpoint: capacity planning, upgrades, backups, and a pager that now rings for the database. That bill is real. We'd rather write it out than let you discover it in month three.</p>
-        <a class="ctalink" style="font-size:12.5px" href="articles/what-self-hosting-costs.html">What self-hosting actually costs →</a>
+        <p class="body-text mt-14 fs-13">One line. Your SDKs, your queries, your conditional writes, your pagination — unchanged. Nothing new to learn, nothing new to hire for. What <em>does</em> change sits behind that endpoint: capacity planning, upgrades, backups, and a pager that now rings for the database. That bill is real. We'd rather write it out than let you discover it in month three.</p>
+        <a class="ctalink ctalink-sm" href="articles/what-self-hosting-costs.html">What self-hosting actually costs →</a>
       </div>
     </div>
   </div>
@@ -151,7 +166,7 @@
   <div class="wrap">
     <span class="kicker">Who it's for</span>
     <h2>Three situations where this matters.</h2>
-    <div class="cardgrid c3" style="margin-top:18px">
+    <div class="cardgrid c3 mt-18">
       <div class="lcard"><span class="tag">Migration</span><h3>Leaving AWS</h3><p>Compute and object storage port in weeks. A decade of accumulated DynamoDB access patterns doesn't — which is why the data layer is usually the thing that blocks the move. It stops being the thing that blocks the move.</p></div>
       <div class="lcard"><span class="tag">Regulation</span><h3>Residency requirements</h3><p>Pin a dataset to a jurisdiction because the regulator says so, not because a region happens to exist there. The cluster runs where you put it, under the law that applies where you put it, on hardware whose owner you can name.</p></div>
       <div class="lcard"><span class="tag">Environment</span><h3>On-prem and edge</h3><p>Factory floor, ship, forward site, private cloud. Runs where there is no managed anything — and keeps running when the link back to head office doesn't.</p></div>
@@ -195,16 +210,16 @@
     <p class="body-text">A small Raft group holds cluster metadata: membership, which node owns which tablet, what tables exist. It is consulted when the topology changes — not on the path of your reads and writes.</p>
     <p class="body-text">Your data lives in as many independent Raft groups as you have tablets, each replicated and led separately. A write is acknowledged once a quorum of that tablet's replicas holds it. Nothing funnels through a single log, and no node is special. Lose one and you lose an election on some tablets, not the cluster.</p>
 
-    <div class="diagram-plate" style="margin-top:18px">
+    <div class="diagram-plate mt-18">
       <svg viewBox="0 0 980 210" role="img" aria-label="Compact two-planes strip: the control plane holds the map; the data plane is one Raft group per tablet; a write lands on a single tablet's leader.">
         <defs><marker id="arrB" markerWidth="7" markerHeight="7" refX="5.5" refY="3.5" orient="auto"><path class="dg-arrow" d="M0 1.2 L5.5 3.5 L0 5.8 z"/></marker></defs>
-        <rect class="dg-bx" x="20" y="46" width="200" height="118" rx="3"/>
+        <rect class="dg-bx" x="20" y="46" width="184" height="118" rx="3"/>
         <text class="dg-t" x="36" y="72">Control plane</text>
         <text class="dg-m" x="36" y="90">one small Raft group</text>
-        <text class="dg-m" x="36" y="114" style="fill:var(--ink-72);font:400 11.5px var(--font-ui)">holds the map:</text>
-        <text class="dg-m" x="36" y="132" style="fill:var(--ink-72);font:400 11.5px var(--font-ui)">members · tablets · tables</text>
-        <path class="dg-ln" d="M220 105 H268" stroke-dasharray="4 4"/>
-        <text class="dg-m" x="244" y="96" text-anchor="middle">topology</text>
+        <text class="dg-m dg-ui" x="36" y="114">holds the map:</text>
+        <text class="dg-m dg-ui" x="36" y="132">members · tablets · tables</text>
+        <path class="dg-ln" d="M204 105 H268" stroke-dasharray="4 4"/>
+        <text class="dg-m" x="236" y="96" text-anchor="middle">topology</text>
         <rect class="dg-bx" x="268" y="24" width="692" height="162" rx="3"/>
         <text class="dg-t" x="284" y="48">Data plane — one Raft group per tablet</text>
         <path class="dg-req" d="M560 4 V56" marker-end="url(#arrB)"/>
@@ -225,7 +240,7 @@
         <text class="dg-t" x="859" y="86" text-anchor="middle">tablet 4</text>
         <circle class="dg-leader-plain" cx="841" cy="112" r="5"/><circle class="dg-follower" cx="859" cy="112" r="4.5"/><circle class="dg-follower" cx="877" cy="112" r="4.5"/>
         <text class="dg-m" x="859" y="146" text-anchor="middle">own leader</text>
-        <text class="dg-m" x="614" y="200" text-anchor="middle" style="font-size:10.5px">no log connects the tablets · ● leader · ○ followers</text>
+        <text class="dg-m" x="614" y="200" text-anchor="middle">no log connects the tablets · ● leader · ○ followers</text>
       </svg>
     </div>
     <div class="ctalink-row"><a class="ctalink" href="how-it-works.html">How it works, in full →</a></div>
@@ -236,28 +251,29 @@
   <div class="wrap">
     <span class="kicker">Where it stands</span>
     <h2>Pre-alpha. Here's the honest version.</h2>
-    <ul class="status-list" style="margin-top:18px">
+    <ul class="status-list mt-18">
       <li><span class="t">Per-tablet Raft replication, linearizable writes</span><span class="pill yes">Works today</span></li>
       <li><span class="t">Tablet splits, movement and online rebalancing</span><span class="pill yes">Works today</span></li>
       <li><span class="t">Multi-tablet transactions (2PC, MVCC snapshot reads)</span><span class="pill yes">Works today</span></li>
       <li><span class="t">Secondary indexes, added and dropped online with backfill</span><span class="pill yes">Works today</span></li>
       <li><span class="t">Streams and time to live</span><span class="pill yes">Works today</span></li>
-      <li><span class="t">On-demand backup and restore, plus continuous backups (point-in-time recovery) to any second</span><span class="pill yes">Works today</span></li>
+      <li><span class="t">On-demand backup and restore, plus point-in-time recovery to any second</span><span class="pill yes">Works today</span></li>
       <li><span class="t">Metrics endpoint, admin API and a built-in dashboard</span><span class="pill yes">Works today</span></li>
       <li><span class="t">Growing a cluster by seed address; <code>drain</code> and <code>decommission</code> to shrink one</span><span class="pill yes">Works today</span></li>
-      <li><span class="t">A Kubernetes operator (an <code>AnimusCluster</code> custom resource, one <code>StatefulSet</code> per cluster), with a CI-gated <code>kind</code> cluster smoke test — create, bootstrap, scale, delete</span><span class="pill yes">Works today</span></li>
-      <li><span class="t">TLS on every port — mutual on the internal Raft/intra wire, server-only on the client, admin and console ports — config-gated, default off</span><span class="pill yes">Works today</span></li>
-      <li><span class="t">Encryption at rest for the Raft WAL, per-tablet engine files, and backup/PITR/stream-segment objects — including the default replicated segment/backup store, not just the <code>fs:</code>/<code>s3://</code> opt-ins (AEAD, cluster-wide key file) — config-gated, default off, also wired through the Kubernetes operator (<code>spec.encryptionKeySecretName</code> mounts a pre-existing Secret)</span><span class="pill yes">Works today</span></li>
-      <li><span class="t">SigV4 on the client port, with a replicated credential catalog, rotation and a per-key table/operation allow list — not a full IAM policy language</span><span class="pill yes">Works today</span></li>
-      <li><span class="t">Upgrades — every persisted format is versioned and pinned by golden fixtures; a full-cluster stop, upgrade and restart is supported and tested by an upgrade-restart simulation corpus, and a node-by-node rolling upgrade (a replicated cluster version with feature gates, <code>animus cluster roll plan|wait|status</code>, <code>animus cluster finalize</code>) is supported and tested by a mixed-version simulation corpus. On Kubernetes the operator drives the same gated roll from a <code>spec.image</code> edit; rolling from a release older than a known abort-handling fix with multi-item transactions in use is not yet safe (an older release's own bug)</span><span class="pill yes">Works today</span></li>
-      <li><span class="t">Benchmarks with disclosed methodology — the open-loop, coordinated-omission-corrected load generator and the methodology are built; no numbers are published yet (the first run needs dedicated multi-host hardware)</span><span class="pill opt">In progress</span></li>
-      <li><span class="t">Zone-aware replica placement on Kubernetes — the operator resolves each pod's node region/zone, new tables spread their replicas across zones when the cluster spans at least as many zones as the replication factor, and pods get zone spread and host anti-affinity hints; applies to tables created after the zone labels are present</span><span class="pill yes">Works today</span></li>
-      <li><span class="t">Multi-Region strongly consistent global tables on one stretched cluster (<code>UpdateTable</code> <code>ReplicaUpdates</code> with <code>MultiRegionConsistency: STRONG</code>, three Regions or two plus a witness; needs <code>animus cluster finalize</code> to cluster version 2) — proven in deterministic simulation only, not yet on real multi-Region hardware</span><span class="pill yes">Works today</span></li>
-      <li><span class="t">Eventual-consistency global tables (asynchronous last-writer-wins replication between independent clusters; <code>ReplicaUpdates</code> <code>Create</code>/<code>Delete</code>; needs <code>animus cluster finalize</code> to cluster version 3 and <code>--region</code>/<code>--peer</code> config with mutual TLS) — proven in deterministic simulation and in one two-cluster loopback test over mutual TLS; no WAN measurements. The Kubernetes operator renders <code>spec.region</code>/<code>spec.peers</code> into that config, but only unit-tested: it has not been run against a real cluster</span><span class="pill yes">Works today</span></li>
+      <li><span class="t">A Kubernetes operator, smoke-tested in CI on a <code>kind</code> cluster</span><span class="pill yes">Works today</span></li>
+      <li><span class="t">TLS on every port, mutual between cluster members (off by default)</span><span class="pill yes">Works today</span></li>
+      <li><span class="t">Encryption at rest for the WAL, engine files and backups (off by default)</span><span class="pill yes">Works today</span></li>
+      <li><span class="t">SigV4 with credential rotation and per-key allow lists (not full IAM)</span><span class="pill yes">Works today</span></li>
+      <li><span class="t">Versioned on-disk formats, full-cluster and rolling upgrades</span><span class="pill yes">Works today</span></li>
+      <li><span class="t">Zone-aware replica placement on Kubernetes</span><span class="pill yes">Works today</span></li>
+      <li><span class="t">Benchmarks with disclosed methodology (harness built, no numbers yet)</span><span class="pill opt">In progress</span></li>
+      <li><span class="t">Multi-Region strongly consistent global tables</span><span class="pill sim">Simulation-tested</span></li>
+      <li><span class="t">Eventual-consistency global tables between clusters</span><span class="pill sim">Simulation-tested</span></li>
     </ul>
+    <p class="status-more"><span class="pill sim">Simulation-tested</span> means proven in deterministic simulation, not yet on real multi-Region hardware. <a href="architecture.html#limits">Details and known limits →</a></p>
     <div class="warnbox">
       <span class="label">Before you point anything at it</span>
-      <p><strong>TLS and encryption at rest are both available but off by default, and SigV4 is still the only caller-identity story on the DynamoDB port.</strong> A cluster with no TLS configured is plain TCP end to end, exactly as before; turning TLS on gets you mutual authentication between cluster members plus encryption everywhere. Encryption at rest, when a key is configured, covers the Raft WAL and per-tablet engine files, plus backup/PITR/stream-segment objects on every segment/backup store — the default replicated one included, not just the <code>fs:</code>/<code>s3://</code> opt-ins (every node sharing a store needs the identical key file). SigV4 has a replicated credential catalog and rotation now, but is still not a full IAM policy language. Don't put an unconfigured cluster on the public internet, and don't store data you can't recreate.</p>
+      <p><strong>TLS, encryption at rest and SigV4 exist but are off by default.</strong> Don't expose an unconfigured cluster, and don't store data you can't recreate.</p>
       <p>What would end pre-alpha is written down: every item in the <a href="https://github.com/animus-db/animus-db/blob/main/docs/production-readiness.md">beta exit-criteria checklist</a> must be met or explicitly waived. Today most of the soak, chaos, fuzzing, overload, runbook and release-signing items are not met.</p>
     </div>
     <div class="ctalink-row">
@@ -271,9 +287,9 @@
   <div class="wrap">
     <span class="kicker">Where to go from here</span>
     <h2>Three ways in, depending on how much you trust us.</h2>
-    <div class="cardgrid c3" style="margin-top:18px">
-      <div class="lcard"><span class="tag">Evaluating it</span><h3>Run it in a minute</h3><p>Three nodes in one process on your laptop, then point the <code>aws</code> CLI at it. Needs Rust 1.96 and a few gigabytes of disk.</p><a class="ctalink more" href="install.html">Install →</a></div>
-      <div class="lcard"><span class="tag">Watching it</span><h3>Check back later</h3><p>It's pre-alpha, and most people reading this shouldn't adopt it yet. Star the repo, watch releases, and revisit when authentication and backups land.</p><a class="ctalink more" href="https://github.com/animus-db/animus-db">GitHub →</a></div>
+    <div class="cardgrid c3 mt-18">
+      <div class="lcard"><span class="tag">Evaluating it</span><h3>Run it on your laptop</h3><p>Three nodes in one process, then point the <code>aws</code> CLI at it. Needs Rust 1.96, a few gigabytes of disk and a first build that takes a while.</p><a class="ctalink more" href="install.html">Install →</a></div>
+      <div class="lcard"><span class="tag">Watching it</span><h3>Check back later</h3><p>It's pre-alpha, and most people reading this shouldn't adopt it yet. Get told when it changes: subscribe to the releases feed in any RSS reader, or use GitHub's Watch → Custom → Releases. Revisit when benchmarks are published and the beta exit criteria are met.</p><a class="ctalink more" href="https://github.com/animus-db/animus-db/releases.atom">Releases feed (RSS) →</a><a class="ctalink more" href="https://github.com/animus-db/animus-db/subscription">Watch releases on GitHub →</a></div>
       <div class="lcard"><span class="tag">Building it</span><h3>Design records and issues</h3><p>Architecture decisions are written down and argued in the open. Contributions need a DCO sign-off and a CLA.</p><a class="ctalink more" href="https://github.com/animus-db/animus-db/blob/main/CONTRIBUTING.md">Contribute →</a></div>
     </div>
   </div>

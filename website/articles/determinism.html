@@ -7,11 +7,31 @@
 <meta name="description" content="Deterministic simulation testing framed as risk reduction, with its boundaries drawn honestly and six questions to interrogate anyone who claims it.">
 <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
 <link rel="canonical" href="https://animusdb.io/articles/determinism.html">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://animusdb.io/articles/determinism.html">
 <meta property="og:title" content="Determinism, and why you should care — AnimusDB">
 <meta property="og:description" content="Deterministic simulation testing framed as risk reduction, with its boundaries drawn honestly and six questions to interrogate anyone who claims it.">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Work+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<meta property="og:image" content="https://animusdb.io/assets/og-card.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="AnimusDB — the DynamoDB API on infrastructure you own">
+<meta name="twitter:card" content="summary_large_image">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "Article",
+  "headline": "Determinism, and why you should care",
+  "description": "Deterministic simulation testing framed as risk reduction, with its boundaries drawn honestly and six questions to interrogate anyone who claims it.",
+  "url": "https://animusdb.io/articles/determinism.html",
+  "mainEntityOfPage": "https://animusdb.io/articles/determinism.html",
+  "image": "https://animusdb.io/assets/og-card.png",
+  "publisher": {
+   "@type": "Organization",
+   "name": "AnimusDB",
+   "url": "https://animusdb.io/"
+  }
+}
+</script>
 <link rel="stylesheet" href="../assets/tokens.css">
 <link rel="stylesheet" href="../assets/site.css">
 <script src="../assets/site.js" defer></script>
@@ -146,8 +166,8 @@
   <p>Mature databases have a different kind of evidence: years of production use, across thousands of deployments, with the worst bugs found by other people. That is genuinely the strongest evidence there is, and AnimusDB does not have it. It is pre-alpha, and <a href="../index.html#status">nobody has run it in production</a>, including us.</p>
   <p>Deterministic simulation is not a replacement for that evidence. It is the only thing available that partially substitutes for it — a way for a young system to have already survived failures that a mature one accumulated the slow way. When you are weighing a database with no operational history, the right question is not whether it has been tested. It is whether the testing was designed to find the failures that history would have found.</p>
 
-  <span class="kicker" style="display:block;margin:34px 0 12px;border-top:1px solid var(--border);padding-top:24px">Keep reading</span>
-  <div class="cardgrid c2" style="margin-bottom:40px">
+  <span class="kicker kicker-rule">Keep reading</span>
+  <div class="cardgrid c2 mb-40">
     <div class="lcard"><span class="tag">Mechanism</span><h3><a href="../architecture.html#determinism">Determinism, from the inside</a></h3><p>How the environment abstraction works, and how it fits the two-plane design.</p></div>
     <div class="lcard"><span class="tag">Status</span><h3><a href="../index.html#status">Where it stands</a></h3><p>What works today, what is planned, and what is honestly not there yet.</p></div>
   </div>

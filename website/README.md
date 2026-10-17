@@ -1,9 +1,9 @@
 # animusdb.io — the AnimusDB marketing site
 
 Static HTML/CSS/JS on the "Ledger" design system (ADR 0056). **No build step,
-no bundler** — edit a file, commit, and it ships. Google Fonts (Space
-Grotesk + Martian Mono) is the one external request the site makes; every
-other asset is local.
+no bundler** — edit a file, commit, and it ships. The site makes no third-party requests:
+the two faces (Work Sans + JetBrains Mono, variable, latin subset, SIL OFL)
+are self-hosted in `assets/fonts/`.
 
 ```
 website/
@@ -25,8 +25,11 @@ website/
     site.js       theme switch (light/dark/system; light is the default), mobile nav,
                   copy buttons, docs scrollspy
     favicon.svg
+    fonts/        self-hosted WOFF2 faces + their OFL licences
+    og-card.png   1200×630 social card (og:image) for every page
   CNAME           custom domain: animusdb.io
   .nojekyll       Pages serves the files as-is
+  404.html        served by Pages for unknown paths
   robots.txt sitemap.xml
 ```
 
