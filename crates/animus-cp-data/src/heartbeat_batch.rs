@@ -157,19 +157,52 @@ pub(crate) type GroupHeartbeat = (u64, RaftMsg<KvCommand>);
 /// never be lost regardless of ordering, and multiple pending entries (a
 /// slow-to-poll group falling behind the flush cadence) queue rather than
 /// overwrite.
-#[derive(Default)]
 pub(crate) struct HeartbeatInbox {
     queue: Mutex<VecDeque<RaftMsg<KvCommand>>>,
     waker: AtomicWaker,
+    /// ADR 0080 section 3: the bound. A slow-to-poll group keeps at most this
+    /// many pending heartbeats; the oldest is dropped for a newer one (a
+    /// heartbeat is superseded by the next, so the freshest is the one that
+    /// matters).
+    cap: usize,
+}
+
+/// ADR 0080 section 3: pending demuxed heartbeats kept per hosted group.
+pub(crate) const HEARTBEAT_INBOX_CAP: usize = 8;
+
+/// ADR 0080 section 3: most `(stream, heartbeat)` entries in one batch frame.
+pub(crate) const HEARTBEAT_BATCH_MAX_ENTRIES: usize = 8192;
+
+impl Default for HeartbeatInbox {
+    fn default() -> Self {
+        Self::with_cap(HEARTBEAT_INBOX_CAP)
+    }
 }
 
 impl HeartbeatInbox {
-    fn push(&self, msg: RaftMsg<KvCommand>) {
-        self.queue
-            .lock()
-            .expect("heartbeat inbox poisoned")
-            .push_back(msg);
+    /// An inbox bounded at `cap` (test seam; production uses the default).
+    pub(crate) fn with_cap(cap: usize) -> Self {
+        Self {
+            queue: Mutex::new(VecDeque::new()),
+            waker: AtomicWaker::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    /// Queue `msg`; returns `true` when the oldest pending message was
+    /// dropped to make room.
+    fn push(&self, msg: RaftMsg<KvCommand>) -> bool {
+        let dropped = {
+            let mut q = self.queue.lock().expect("heartbeat inbox poisoned");
+            let dropped = q.len() >= self.cap;
+            if dropped {
+                q.pop_front();
+            }
+            q.push_back(msg);
+            dropped
+        };
         self.waker.wake();
+        dropped
     }
 }
 
@@ -386,21 +419,44 @@ async fn flush_loop<E: Env>(inner: Arc<BatcherInner<E>>) {
             if entries.is_empty() {
                 continue;
             }
-            inner.metrics.incr(Metric::CpHeartbeatFramesSent);
             let features = inner
                 .features
                 .lock()
                 .expect("heartbeat batcher features poisoned")
                 .clone();
-            let Some(payload) =
-                crate::gates::encode_for_send(&KvWire::HeartbeatBatch(entries), &features)
-            else {
-                continue;
-            };
-            inner
-                .env
-                .send_stream(to, HEARTBEAT_BATCH_STREAM, payload)
-                .await;
+            // ADR 0080 section 3: split at HEARTBEAT_BATCH_MAX_ENTRIES so one
+            // frame stays well under the frame cap at tens of thousands of
+            // co-hosted groups. Each frame is superseded by the next for the
+            // same destination, so a stalled peer holds one batch, not many.
+            let mut rest = entries;
+            while !rest.is_empty() {
+                let tail = if rest.len() > HEARTBEAT_BATCH_MAX_ENTRIES {
+                    rest.split_off(HEARTBEAT_BATCH_MAX_ENTRIES)
+                } else {
+                    Vec::new()
+                };
+                let chunk = std::mem::replace(&mut rest, tail);
+                inner.metrics.incr(Metric::CpHeartbeatFramesSent);
+                let Some(payload) =
+                    crate::gates::encode_for_send(&KvWire::HeartbeatBatch(chunk), &features)
+                else {
+                    continue;
+                };
+                inner
+                    .env
+                    .send_stream_classed(
+                        to.clone(),
+                        HEARTBEAT_BATCH_STREAM,
+                        animus_env::MsgClass::Heartbeat,
+                        // No supersede key: a batch carries different groups
+                        // each tick, so replacing an unsent one would lose a
+                        // group's heartbeat. The Heartbeat class's own
+                        // drop-oldest bound limits a stalled peer.
+                        None,
+                        payload,
+                    )
+                    .await;
+            }
         }
     }
 }
@@ -431,7 +487,11 @@ async fn demux_loop<E: Env>(inner: Arc<BatcherInner<E>>) {
                         .get(&stream)
                         .cloned();
                     match inbox {
-                        Some(inbox) => inbox.push(msg),
+                        Some(inbox) => {
+                            if inbox.push(msg) {
+                                inner.metrics.incr(Metric::HeartbeatInboxDropped);
+                            }
+                        }
                         None => inner.metrics.incr(Metric::CpHeartbeatDemuxDropped),
                     }
                 }
@@ -526,5 +586,45 @@ mod tests {
         );
         sim.run_for(DEFAULT_HEARTBEAT_BATCH_INTERVAL * 5);
         assert_eq!(metrics_a.get(Metric::CpHeartbeatFramesSent), 0);
+    }
+
+    /// ADR 0080 cell 10: a group that does not poll keeps at most the bound,
+    /// and what it keeps is the freshest (drop-oldest).
+    #[test]
+    fn inbox_is_bounded_and_keeps_the_newest() {
+        let inbox = HeartbeatInbox::default();
+        let mut dropped = 0;
+        for term in 1..=1000u64 {
+            if inbox.push(heartbeat(term, nid(0))) {
+                dropped += 1;
+            }
+        }
+        assert_eq!(dropped, 1000 - HEARTBEAT_INBOX_CAP);
+        let q = inbox.queue.lock().unwrap();
+        assert_eq!(q.len(), HEARTBEAT_INBOX_CAP);
+        let terms: Vec<u64> = q
+            .iter()
+            .map(|m| match m {
+                RaftMsg::AppendEntries { term, .. } => *term,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(terms, (993..=1000).collect::<Vec<_>>());
+    }
+
+    /// ADR 0080 section 3: a flush over the entry cap is split into frames.
+    #[test]
+    fn oversized_flush_is_split_into_bounded_frames() {
+        let mut sim = Simulator::new(0xB47C_0F80);
+        let env_a: SimEnv = sim.env(nid(0));
+        let metrics_a = MetricsHandle::recording();
+        let batcher_a =
+            HeartbeatBatcher::new(env_a, DEFAULT_HEARTBEAT_BATCH_INTERVAL, metrics_a.clone());
+        let n = HEARTBEAT_BATCH_MAX_ENTRIES as u64 * 2 + 5;
+        for g in 0..n {
+            batcher_a.register(nid(1), g, heartbeat(3, nid(0)));
+        }
+        sim.run_for(DEFAULT_HEARTBEAT_BATCH_INTERVAL * 2);
+        assert_eq!(metrics_a.get(Metric::CpHeartbeatFramesSent), 3);
     }
 }

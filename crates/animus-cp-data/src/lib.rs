@@ -7854,7 +7854,15 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             if p != self.env.node_id()
                 && let Some(probe) = &probe
             {
-                self.env.send_stream(p, self.stream, probe.clone()).await;
+                self.env
+                    .send_stream_classed(
+                        p,
+                        self.stream,
+                        animus_env::MsgClass::Heartbeat,
+                        None,
+                        probe.clone(),
+                    )
+                    .await;
             }
         }
 
@@ -13352,9 +13360,12 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             let probe_features = features.clone();
             env.spawn_task(async move {
                 for (to, msg) in initial_probe {
+                    let (class, key) = msg.transport_class();
                     if let Some(bytes) = gates::encode_for_send(&KvWire::Raft(msg), &probe_features)
                     {
-                        probe_env.send_stream(to, probe_stream, bytes).await;
+                        probe_env
+                            .send_stream_classed(to, probe_stream, class, key, bytes)
+                            .await;
                     }
                 }
             });
@@ -13585,7 +13596,8 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             None => {
                 for (to, wire) in campaign_outs {
                     if let Some(bytes) = gates::encode_for_send(&wire, &features) {
-                        env.send_stream(to, stream, bytes).await;
+                        let (class, key) = wire_class(&wire);
+                        env.send_stream_classed(to, stream, class, key, bytes).await;
                     }
                 }
             }
@@ -14306,14 +14318,16 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         }
         for (to, wire) in immediate {
             if let Some(bytes) = gates::encode_for_send(&wire, &features) {
-                env.send_stream(to, stream, bytes).await;
+                let (class, key) = wire_class(&wire);
+                env.send_stream_classed(to, stream, class, key, bytes).await;
             }
         }
         // Whatever round landed — this loop's own `fsync` or the apply task's
         // compaction rewrite — releases the acks that were waiting on it.
         for (to, wire) in gated.release(persist.durable()) {
             if let Some(bytes) = gates::encode_for_send(&wire, &features) {
-                env.send_stream(to, stream, bytes).await;
+                let (class, key) = wire_class(&wire);
+                env.send_stream_classed(to, stream, class, key, bytes).await;
             }
         }
         // Safety net, and the reason a stranded ack is structurally impossible
@@ -14332,7 +14346,8 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             if settled && persist_fut.is_none() {
                 for (to, wire) in gated.release(u64::MAX) {
                     if let Some(bytes) = gates::encode_for_send(&wire, &features) {
-                        env.send_stream(to, stream, bytes).await;
+                        let (class, key) = wire_class(&wire);
+                        env.send_stream_classed(to, stream, class, key, bytes).await;
                     }
                 }
             }
@@ -15277,6 +15292,18 @@ fn is_frozen_ack(wire: &KvWire, durable: u64) -> bool {
         KvWire::Raft(RaftMsg::AppendEntriesResp { success: true, match_index, .. })
             if *match_index <= durable
     )
+}
+
+/// ADR 0080 section 3: the transport class and supersede key a wire message is
+/// queued with in the per-peer outbox.
+fn wire_class(wire: &KvWire) -> (animus_env::MsgClass, Option<u64>) {
+    match wire {
+        KvWire::Raft(msg) => msg.transport_class(),
+        KvWire::ReadProbe { .. } | KvWire::ReadProbeAck { .. } => {
+            (animus_env::MsgClass::Heartbeat, None)
+        }
+        KvWire::HeartbeatBatch(_) => (animus_env::MsgClass::Heartbeat, None),
+    }
 }
 
 fn ships_before_durable(wire: &KvWire) -> bool {

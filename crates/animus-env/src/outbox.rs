@@ -591,4 +591,103 @@ mod tests {
             assert!(o.bulk_bytes <= 500 || o.bulk.len() == 1);
         }
     }
+
+    /// Seeded writer model (ADR 0080 cell 9): the writer is 20x slower than
+    /// the producers, so the peer looks stalled. Per round the producers push
+    /// `burst` replicate frames, one heartbeat per group, and a vote every
+    /// 50 rounds. Returns (rounds a vote waited in frames written, peak
+    /// queued frames, peak heartbeat queue).
+    fn stalled_writer_model(seed: u64, priority: bool, coalesce: bool) -> (usize, usize, usize) {
+        let mut x = seed | 1;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut o = PeerOutbox::new(OutboxLimits::default());
+        // Control E's FIFO: one queue, no class order.
+        let mut fifo: std::collections::VecDeque<MsgClass> = Default::default();
+        let (mut worst_wait, mut peak, mut peak_hb) = (0usize, 0usize, 0usize);
+        let mut vote_pending_since: Option<usize> = None;
+        let mut written = 0usize;
+        for round in 0..2000usize {
+            for _ in 0..(rnd() % 20) {
+                if priority {
+                    o.push(f(MsgClass::Replicate, Some(rnd() % 64), 128, 1));
+                } else {
+                    fifo.push_back(MsgClass::Replicate);
+                }
+            }
+            for g in 0..16u64 {
+                let key = if coalesce { Some(g) } else { None };
+                if priority {
+                    o.push(f(MsgClass::Heartbeat, key, 64, 2));
+                } else {
+                    fifo.push_back(MsgClass::Heartbeat);
+                }
+            }
+            if round % 50 == 0 && vote_pending_since.is_none() {
+                vote_pending_since = Some(written);
+                if priority {
+                    o.push(f(MsgClass::Vote, None, 16, 3));
+                } else {
+                    fifo.push_back(MsgClass::Vote);
+                }
+            }
+            // The writer drains only one frame per round.
+            let got = if priority {
+                o.pop_control().map(|x| x.class)
+            } else {
+                fifo.pop_front()
+            };
+            if let Some(c) = got {
+                written += 1;
+                if c == MsgClass::Vote
+                    && let Some(since) = vote_pending_since.take()
+                {
+                    worst_wait = worst_wait.max(written - since);
+                }
+            }
+            peak = peak.max(if priority {
+                o.control_len()
+            } else {
+                fifo.len()
+            });
+            peak_hb = peak_hb.max(o.len_of(MsgClass::Heartbeat));
+        }
+        (worst_wait, peak, peak_hb)
+    }
+
+    #[test]
+    fn cell9_a_stalled_peer_keeps_votes_prompt_and_the_queue_bounded() {
+        for seed in 1..=16u64 {
+            let (vote_wait, peak, peak_hb) = stalled_writer_model(seed, true, true);
+            assert!(
+                vote_wait <= 2,
+                "seed {seed}: vote waited {vote_wait} frames"
+            );
+            assert!(peak <= 4096 + 4096 + 1024, "seed {seed}: peak {peak}");
+            assert!(
+                peak_hb <= 16,
+                "seed {seed}: heartbeats coalesce per group, got {peak_hb}"
+            );
+        }
+    }
+
+    /// Control E: a single FIFO (no class priority) makes the vote wait behind
+    /// the whole backlog -- the oracle's vote bound must FAIL.
+    #[test]
+    fn control_e_fifo_without_class_priority_delays_the_vote() {
+        let (vote_wait, ..) = stalled_writer_model(3, false, true);
+        assert!(vote_wait > 100, "FIFO vote waited only {vote_wait} frames");
+    }
+
+    /// Control F: coalescing off lets the heartbeat queue grow far past one per
+    /// group -- the coalescing oracle must FAIL.
+    #[test]
+    fn control_f_without_coalescing_heartbeats_pile_up() {
+        let (_, _, peak_hb) = stalled_writer_model(3, true, false);
+        assert!(peak_hb > 16, "heartbeat queue peaked at only {peak_hb}");
+    }
 }

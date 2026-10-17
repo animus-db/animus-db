@@ -813,6 +813,40 @@ impl<C> RaftMsg<C> {
         }
     }
 
+    /// ADR 0080 section 3: the transport class and supersede key this message
+    /// is sent with (in memory only, never on the wire). Exhaustive, no `_`
+    /// arm: a new variant does not compile until it names its class.
+    ///
+    /// Votes (and `TimeoutNow`) are strict priority; bare heartbeats and the
+    /// small liveness acks sit above bulk replication, and a newer bare
+    /// heartbeat supersedes a still-queued older one; entries ride the
+    /// replicate class; snapshot chunks are `Bulk`.
+    #[must_use]
+    pub fn transport_class(&self) -> (animus_env::MsgClass, Option<u64>) {
+        use animus_env::MsgClass;
+        match self {
+            RaftMsg::PreVote { .. }
+            | RaftMsg::PreVoteResp { .. }
+            | RaftMsg::RequestVote { .. }
+            | RaftMsg::RequestVoteResp { .. }
+            | RaftMsg::TimeoutNow { .. } => (MsgClass::Vote, None),
+            RaftMsg::AppendEntries { entries, .. } if entries.is_empty() => {
+                (MsgClass::Heartbeat, Some(0))
+            }
+            RaftMsg::AppendEntries { .. } => (MsgClass::Replicate, None),
+            RaftMsg::AppendEntriesResp { .. }
+            | RaftMsg::Heartbeat { .. }
+            | RaftMsg::Quiesce { .. }
+            | RaftMsg::WakeRequest { .. }
+            | RaftMsg::Removed { .. }
+            | RaftMsg::RemovedAck { .. } => (MsgClass::Heartbeat, None),
+            RaftMsg::InstallSnapshot { .. } => (MsgClass::Bulk, None),
+            RaftMsg::InstallSnapshotResp { .. }
+            | RaftMsg::ClusterProbe
+            | RaftMsg::ClusterProbeResp { .. } => (MsgClass::Normal, None),
+        }
+    }
+
     /// The Raft term carried by this message. A [`Heartbeat`](RaftMsg::Heartbeat)
     /// or [`WakeRequest`](RaftMsg::WakeRequest) is not consensus traffic and
     /// carries no term *authority* (it reports 0, never forcing a step-down) —
