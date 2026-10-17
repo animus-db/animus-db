@@ -356,6 +356,16 @@ impl Future for ForkPending<'_> {
     }
 }
 
+/// A definite propose-bound refusal (ADR 0080): nothing was appended to the
+/// log; the numbers are the backlog the leader saw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProposeBusy {
+    /// Entries past the engine-applied index when refused.
+    pub backlog_entries: u64,
+    /// Tracked bytes in that backlog.
+    pub backlog_bytes: u64,
+}
+
 /// Executor-agnostic "engine-applied index advanced" notification — the
 /// per-tablet-group counterpart to `animus-control`'s `MetadataWatch` (ADR
 /// 0031), same shape and same reason: let a caller waiting on a specific
@@ -403,6 +413,11 @@ struct AppliedWatchInner {
     /// Monotonic source of the slot ids handed out by
     /// [`AppliedWatch::changed`]. Only ever incremented.
     next_slot: AtomicU64,
+    /// The leader's propose-backlog byte ring (ADR 0080 decision 1), trimmed
+    /// here at the one place every apply-watermark advance already funnels
+    /// through. A leaf lock: `gated_propose` takes it while holding `core`,
+    /// `bump` takes it alone.
+    backlog: Mutex<admission::ProposeBacklog>,
 }
 
 impl AppliedWatch {
@@ -436,6 +451,14 @@ impl AppliedWatch {
     pub fn bump(&self, index: u64) {
         let prev = self.0.applied.fetch_max(index, Ordering::AcqRel);
         if index > prev {
+            // ADR 0080: release the propose-backlog bytes the apply watermark
+            // just passed (and their `QueuedBytes` charge), on every advance
+            // including a quiesced group's last one.
+            self.0
+                .backlog
+                .lock()
+                .expect("AppliedWatch backlog poisoned")
+                .trim(index);
             // Drain the registry before waking: a woken waiter re-registers
             // its own fresh slot on its next poll (if still pending), so
             // there is no need to retain entries here, and waking happens
@@ -446,6 +469,21 @@ impl AppliedWatch {
                 waker.wake();
             }
         }
+    }
+
+    /// Run `f` on this group's propose-backlog ring (ADR 0080).
+    fn with_backlog<R>(&self, f: impl FnOnce(&mut admission::ProposeBacklog) -> R) -> R {
+        f(&mut self
+            .0
+            .backlog
+            .lock()
+            .expect("AppliedWatch backlog poisoned"))
+    }
+
+    /// The tracked propose-backlog bytes (test and diagnostics visibility).
+    #[must_use]
+    pub fn backlog_bytes(&self) -> u64 {
+        self.with_backlog(|b| b.bytes())
     }
 
     /// Number of waiters currently parked on this watch. Test-only: used to
@@ -2809,6 +2847,10 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// node's control-fed one (`start_hosted_with_options`); read by every
     /// wire-send, snapshot-image and propose site (see `gates.rs`).
     features: ClusterFeatures,
+    /// ADR 0080 decision 1: the node's propose admission (the per-group
+    /// backlog bound and the `QueuedBytes` budget); `None` = unbounded, the
+    /// pre-ADR behaviour. The group's byte ring lives on `applied_watch`.
+    admission: Option<admission::NodeAdmission>,
 }
 
 /// A bounded, in-process ring of every distinct value of `T` a
@@ -3448,6 +3490,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             hot_change_max: Arc::clone(&hot_change_max),
             compact_tuning: Arc::clone(&compact_tuning),
             features: features.clone(),
+            admission: backpressure.admission.clone(),
         };
         // The consensus loop recovers from the WAL, then spawns the apply task
         // (so the apply task sees the recovered core + the correct
@@ -3790,7 +3833,60 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         if !gates::check_propose(&self.features, &command) {
             return ProposeResult::NotLeader { leader: None };
         }
-        core.propose(command)
+        // ADR 0080 decision 1: the leader propose bound. Checked here, under the
+        // caller's `core` lock, so the check and the append are atomic (a
+        // pre-propose check would let N concurrent proposers each pass and
+        // overshoot by N). A non-leader falls through to `core.propose`'s own
+        // `NotLeader`: a node that is not leading has no backlog to protect.
+        let Some(adm) = self.admission.as_ref().filter(|_| core.is_leader()) else {
+            return core.propose(command);
+        };
+        let class = command.admission_class();
+        let new_bytes = command.approx_bytes();
+        let applied = self.engine_applied.load(Ordering::SeqCst);
+        let entries = core.last_log_index().saturating_sub(applied);
+        self.applied_watch.with_backlog(|ring| {
+            ring.trim(applied);
+            let bytes = ring.bytes();
+            let (e_hwm, b_hwm) = ring.note_hwm(entries, bytes);
+            self.metrics
+                .set_max(Metric::CpProposeBacklogEntriesHwm, e_hwm);
+            self.metrics
+                .set_max(Metric::CpProposeBacklogBytesHwm, b_hwm);
+            let refused = |reason: admission::BusyReason| {
+                self.metrics.incr(match reason {
+                    admission::BusyReason::Backlog => Metric::OverloadShedBusy,
+                    admission::BusyReason::Budget => Metric::OverloadShedBudget,
+                });
+                ProposeResult::Busy {
+                    backlog_entries: entries,
+                    backlog_bytes: bytes,
+                }
+            };
+            if let Err(reason) = adm.verdict(class, entries, bytes, new_bytes) {
+                return refused(reason);
+            }
+            let charge = match adm.reserve(class, new_bytes) {
+                Ok(c) => c,
+                Err(reason) => return refused(reason),
+            };
+            let result = core.propose(command);
+            if let ProposeResult::Accepted { index, .. } = result {
+                ring.record(index, new_bytes, charge);
+                adm.budget().publish(&self.metrics);
+            }
+            result
+        })
+    }
+
+    /// The leader's current propose backlog `(entries, bytes)`: entries past
+    /// the engine-applied index and the tracked bytes among them (ADR 0080).
+    /// Diagnostics and corpus sampling; takes the core lock briefly.
+    #[must_use]
+    pub fn propose_backlog(&self) -> (u64, u64) {
+        let applied = self.engine_applied.load(Ordering::SeqCst);
+        let entries = self.lock().last_log_index().saturating_sub(applied);
+        (entries, self.applied_watch.backlog_bytes())
     }
 
     fn propose_ordered<F: FnOnce(u64) -> KvCommand>(&self, build: F) -> ProposeResult {
@@ -4554,6 +4650,25 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         participant_spans: Vec<(String, KeyRange)>,
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     ) -> Option<(TxnId, Vec<u8>, StageOutcome)> {
+        self.txn_stage_anchor_checked(table, writes, participant_spans, conditions)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// [`txn_stage_anchor`](Self::txn_stage_anchor) that tells a **definite
+    /// propose-bound refusal** (ADR 0080: `Err(ProposeBusy)`, nothing was
+    /// appended) apart from "not leader / never applied" (`Ok(None)`).
+    ///
+    /// # Panics
+    /// As [`txn_stage_anchor`](Self::txn_stage_anchor).
+    pub async fn txn_stage_anchor_checked(
+        &self,
+        table: &str,
+        writes: Vec<txn::TxnWrite>,
+        participant_spans: Vec<(String, KeyRange)>,
+        conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    ) -> Result<Option<(TxnId, Vec<u8>, StageOutcome)>, ProposeBusy> {
         assert!(
             !writes.is_empty(),
             "raftkv txn_stage: writes must be non-empty"
@@ -4600,10 +4715,21 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         });
         let (index, term) = match result {
             ProposeResult::Accepted { index, term } => (index, term),
-            ProposeResult::NotLeader { .. } => return None,
+            ProposeResult::NotLeader { .. } => return Ok(None),
+            ProposeResult::Busy {
+                backlog_entries,
+                backlog_bytes,
+            } => {
+                return Err(ProposeBusy {
+                    backlog_entries,
+                    backlog_bytes,
+                });
+            }
         };
-        let outcome = self.wait_stage_outcome(index, term).await?;
-        Some((txn_id, record_key, outcome))
+        let Some(outcome) = self.wait_stage_outcome(index, term).await else {
+            return Ok(None);
+        };
+        Ok(Some((txn_id, record_key, outcome)))
     }
 
     /// **Participant stage** phase of a multi-participant 2PC (ADR 0018
@@ -4630,6 +4756,25 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         writes: Vec<txn::TxnWrite>,
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     ) -> Option<(HlcTimestamp, StageOutcome)> {
+        self.txn_stage_participant_checked(txn_id, record_key, record_table, writes, conditions)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// [`txn_stage_participant`](Self::txn_stage_participant) that reports a
+    /// definite propose-bound refusal (ADR 0080) as `Err(ProposeBusy)`.
+    ///
+    /// # Panics
+    /// If `writes` is empty.
+    pub async fn txn_stage_participant_checked(
+        &self,
+        txn_id: TxnId,
+        record_key: Vec<u8>,
+        record_table: String,
+        writes: Vec<txn::TxnWrite>,
+        conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    ) -> Result<Option<(HlcTimestamp, StageOutcome)>, ProposeBusy> {
         assert!(
             !writes.is_empty(),
             "raftkv txn_stage_participant: writes must be non-empty"
@@ -4651,10 +4796,21 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         });
         let (index, term) = match result {
             ProposeResult::Accepted { index, term } => (index, term),
-            ProposeResult::NotLeader { .. } => return None,
+            ProposeResult::NotLeader { .. } => return Ok(None),
+            ProposeResult::Busy {
+                backlog_entries,
+                backlog_bytes,
+            } => {
+                return Err(ProposeBusy {
+                    backlog_entries,
+                    backlog_bytes,
+                });
+            }
         };
-        let outcome = self.wait_stage_outcome(index, term).await?;
-        Some((ts, outcome))
+        let Some(outcome) = self.wait_stage_outcome(index, term).await else {
+            return Ok(None);
+        };
+        Ok(Some((ts, outcome)))
     }
 
     /// Mint a ts that strictly exceeds `min_ts` **and** this group's own
@@ -4733,7 +4889,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         });
         let index = match result {
             ProposeResult::Accepted { index, .. } => index,
-            ProposeResult::NotLeader { .. } => return None,
+            ProposeResult::NotLeader { .. } | ProposeResult::Busy { .. } => return None,
         };
         self.wait_applied(index).await.then_some(ts)
     }
@@ -4762,7 +4918,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         });
         let index = match result {
             ProposeResult::Accepted { index, .. } => index,
-            ProposeResult::NotLeader { .. } => return None,
+            ProposeResult::NotLeader { .. } | ProposeResult::Busy { .. } => return None,
         };
         self.wait_applied(index).await.then_some(ts)
     }
@@ -4803,7 +4959,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         });
         let index = match result {
             ProposeResult::Accepted { index, .. } => index,
-            ProposeResult::NotLeader { .. } => return None,
+            ProposeResult::NotLeader { .. } | ProposeResult::Busy { .. } => return None,
         };
         self.wait_applied(index).await.then_some(ts)
     }
@@ -4864,7 +5020,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         });
         let (index, term) = match result {
             ProposeResult::Accepted { index, term } => (index, term),
-            ProposeResult::NotLeader { .. } => return None,
+            ProposeResult::NotLeader { .. } | ProposeResult::Busy { .. } => return None,
         };
         let outcome = self.wait_resolve_outcome(index, term).await?;
         Some((ts, outcome))
@@ -4907,7 +5063,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         });
         let decide_index = match decide_result {
             ProposeResult::Accepted { index, .. } => index,
-            ProposeResult::NotLeader { .. } => return None,
+            ProposeResult::NotLeader { .. } | ProposeResult::Busy { .. } => return None,
         };
         if !self.wait_applied(decide_index).await {
             return None;
@@ -5295,7 +5451,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     ) -> Option<bool> {
         let (index, term) = match self.cas(key, expected, value) {
             ProposeResult::Accepted { index, term } => (index, term),
-            ProposeResult::NotLeader { .. } => return None,
+            ProposeResult::NotLeader { .. } | ProposeResult::Busy { .. } => return None,
         };
         let deadline = self.env.now().0 + CAS_TIMEOUT.as_nanos() as u64;
         loop {
@@ -5685,7 +5841,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             c.insert(id.clone());
             return match self.promote_learner(id.clone()) {
                 ProposeResult::Accepted { .. } => Some(c),
-                ProposeResult::NotLeader { .. } => None,
+                ProposeResult::NotLeader { .. } | ProposeResult::Busy { .. } => None,
             };
         }
 
@@ -5799,7 +5955,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     fn propose_config(&self, next: BTreeSet<NodeId>) -> Option<BTreeSet<NodeId>> {
         match self.change_membership(next.clone()) {
             ProposeResult::Accepted { .. } => Some(next),
-            ProposeResult::NotLeader { .. } => None,
+            ProposeResult::NotLeader { .. } | ProposeResult::Busy { .. } => None,
         }
     }
 
@@ -7835,7 +7991,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             ProposeResult::Accepted { .. } => {
                 self.metrics.incr(Metric::CpReadCeilingProposals);
             }
-            ProposeResult::NotLeader { .. } => return false,
+            ProposeResult::NotLeader { .. } | ProposeResult::Busy { .. } => return false,
         }
         let deadline = self.env.now().0 + READ_TIMEOUT.as_nanos() as u64;
         loop {
@@ -8038,6 +8194,9 @@ fn record_propose(metrics: &MetricsHandle, result: ProposeResult) -> ProposeResu
     match result {
         ProposeResult::Accepted { .. } => metrics.incr(Metric::CpProposalsAccepted),
         ProposeResult::NotLeader { .. } => metrics.incr(Metric::CpProposalsRejectedNotLeader),
+        // ADR 0080: a `Busy` refusal is counted where it is decided
+        // (`gated_propose`, `OverloadShedBusy`), not as a not-leader reject.
+        ProposeResult::Busy { .. } => {}
     }
     result
 }
@@ -8048,7 +8207,9 @@ fn record_propose(metrics: &MetricsHandle, result: ProposeResult) -> ProposeResu
 fn record_reconfigure(metrics: &MetricsHandle, result: ProposeResult) -> ProposeResult {
     match result {
         ProposeResult::Accepted { .. } => metrics.incr(Metric::CpReconfigureAccepted),
-        ProposeResult::NotLeader { .. } => metrics.incr(Metric::CpReconfigureRejected),
+        ProposeResult::NotLeader { .. } | ProposeResult::Busy { .. } => {
+            metrics.incr(Metric::CpReconfigureRejected);
+        }
     }
     result
 }

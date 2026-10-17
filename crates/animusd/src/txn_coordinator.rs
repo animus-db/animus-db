@@ -213,11 +213,19 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         if writes.iter().any(|w| !range.contains(&w.key)) {
             return Err(TxnAbortReason::Other(stage_rejected_stale_route(table)));
         }
+        // ADR 0080: a propose-bound refusal is a definite "nothing staged"; it
+        // surfaces as `ThrottlingError` at the first write's index.
+        let busy_key = writes.first().map(|w| w.key.clone()).unwrap_or_default();
+        let busy = |_: animus_cp_data::ProposeBusy| TxnAbortReason::Throttled {
+            table: table.to_owned(),
+            key: busy_key.clone(),
+        };
         match anchor {
             None => {
                 let (txn_id, record_key, outcome) = leader
                     .txn_stage(table, writes, participant_spans, conditions)
                     .await
+                    .map_err(busy)?
                     .ok_or_else(|| {
                         TxnAbortReason::Other(
                             "CP group leader moved during anchor stage; retry".into(),
@@ -236,6 +244,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         conditions,
                     )
                     .await
+                    .map_err(busy)?
                     .ok_or_else(|| {
                         TxnAbortReason::Other(
                             "CP group leader moved during participant stage; retry".into(),

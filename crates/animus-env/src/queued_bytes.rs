@@ -177,6 +177,13 @@ impl QueuedBytes {
         b != 0 && self.used() >= b
     }
 
+    /// Publish the level and high-water mark to `metrics`
+    /// (`queued_bytes`, `queued_bytes_hwm`).
+    pub fn publish(&self, metrics: &crate::MetricsHandle) {
+        metrics.set(crate::Metric::QueuedBytes, self.used());
+        metrics.set_max(crate::Metric::QueuedBytesHwm, self.hwm());
+    }
+
     /// The most one group may hold: `min(configured, budget / 8)`; just
     /// `configured` when the budget is unlimited. `configured == 0` (off)
     /// stays `0`.

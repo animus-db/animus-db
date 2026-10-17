@@ -755,7 +755,12 @@ pub(crate) async fn execute_as(
     match wire::decode_request(target, body) {
         Ok(op) => match run_operation(ctx, principal, op).await {
             Ok(body) => (200, body),
-            Err(err) => (error_status(&err), err.to_json()),
+            Err(err) => {
+                // ADR 0080 safety net: whatever path produced it, an overload
+                // refusal never leaves as a 500.
+                let err = map_overload(err);
+                (error_status(&err), err.to_json())
+            }
         },
         Err(err) => (error_status(&err), err.to_json()),
     }
@@ -2177,7 +2182,11 @@ pub(crate) async fn execute_item_op_as<E: Env, R: RelayClient>(
             };
             match result {
                 Ok(body) => (200, body),
-                Err(err) => (error_status(&err), err.to_json()),
+                Err(err) => {
+                    // ADR 0080 safety net (see `execute_as`).
+                    let err = map_overload(err);
+                    (error_status(&err), err.to_json())
+                }
             }
         }
         Err(err) => (error_status(&err), err.to_json()),
@@ -10987,11 +10996,46 @@ pub(crate) const THROTTLE_READ_REFUSAL: &str = "provisioned throughput exceeded 
 pub(crate) fn map_throttleable_error(message: String) -> WireError {
     if message == THROTTLE_WRITE_REFUSAL {
         WireError::provisioned_throughput_exceeded(message)
+    } else if decide::is_overload_refusal(&message) {
+        map_overload(internal(&message))
     } else if decide::read_should_retry(&message) {
         WireError::service_unavailable(message)
     } else {
         internal(&message)
     }
+}
+
+/// ADR 0080: the edge mapping for an overload refusal, a **pure step at the
+/// terminal return** (lesson 2026-09-20: the internal `"; retry"` loop
+/// decisions do not change). A `WireError` whose message carries one of the
+/// house refusals is rendered with the DynamoDB-faithful code:
+///
+/// | condition | code |
+/// |---|---|
+/// | propose `Busy`, per-group in-flight cap, budget | 400 `ThrottlingException` |
+/// | forwarded-request gate, `NoLeader:` fast-fail | 503 `ServiceUnavailable` |
+///
+/// Any other error, and any error that already has a specific code (not the
+/// generic `InternalServerError` / `ServiceUnavailable` the refusal strings
+/// arrive as through `decode_relayed_error` or `internal(..)`), is returned
+/// unchanged. Idempotent.
+pub(crate) fn map_overload(err: WireError) -> WireError {
+    if err.code != "InternalServerError" && err.code != "ServiceUnavailable" {
+        return err;
+    }
+    if decide::is_no_leader_refusal(&err.message) || is_forwarded_gate_refusal(&err.message) {
+        return WireError::service_unavailable(err.message);
+    }
+    if decide::is_busy_refusal(&err.message) {
+        return WireError::throttling(err.message);
+    }
+    err
+}
+
+/// Whether `message` is the forwarded-request gate's refusal (a node
+/// condition, 503, not the caller-rate `Busy`).
+fn is_forwarded_gate_refusal(message: &str) -> bool {
+    message.contains(decide::FORWARDED_GATE_REFUSAL)
 }
 
 /// Marker carrying a [`WireError`]'s own `code` across the forwarded

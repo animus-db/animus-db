@@ -923,6 +923,21 @@ pub enum ProposeResult {
     Accepted { index: u64, term: u64 },
     /// This node is not the leader; `leader` is the best-known leader hint.
     NotLeader { leader: Option<NodeId> },
+    /// **Definite refusal (ADR 0080 decision 1):** the leader declined the
+    /// command because the group's propose backlog (`backlog_entries`
+    /// appended-but-unapplied entries, `backlog_bytes` of payload) is over its
+    /// bound, or the node's `QueuedBytes` budget is exhausted. **Nothing was
+    /// appended**, so unlike a timeout it can never have taken effect: a caller
+    /// may retry or fail with no idempotency question. Produced only by
+    /// `animus-cp-data`'s `gated_propose` for a client- or internal-class
+    /// command (never by [`RaftCore::propose`], and never for the control
+    /// plane); it is in-memory only (no serde), so it is node-local (ADR 0073
+    /// class L). A caller that does not special-case it must treat it as a
+    /// not-accepted result that is **retryable**, never as a terminal error.
+    Busy {
+        backlog_entries: u64,
+        backlog_bytes: u64,
+    },
 }
 
 /// An outbound message: `(destination, message)`. Generic over the command type

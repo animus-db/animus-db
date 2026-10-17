@@ -1679,14 +1679,14 @@ impl<E: Env> CpGroup<E> {
         writes: Vec<TxnWrite>,
         participant_spans: Vec<(String, KeyRange)>,
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
-    ) -> Option<(TxnId, Vec<u8>, StageOutcome)> {
+    ) -> Result<Option<(TxnId, Vec<u8>, StageOutcome)>, animus_cp_data::ProposeBusy> {
         match self {
             CpGroup::Lsm(n) => {
-                n.txn_stage_anchor(table, writes, participant_spans, conditions)
+                n.txn_stage_anchor_checked(table, writes, participant_spans, conditions)
                     .await
             }
             CpGroup::Mem(n) => {
-                n.txn_stage_anchor(table, writes, participant_spans, conditions)
+                n.txn_stage_anchor_checked(table, writes, participant_spans, conditions)
                     .await
             }
         }
@@ -1700,15 +1700,27 @@ impl<E: Env> CpGroup<E> {
         record_table: String,
         writes: Vec<TxnWrite>,
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
-    ) -> Option<(HlcTimestamp, StageOutcome)> {
+    ) -> Result<Option<(HlcTimestamp, StageOutcome)>, animus_cp_data::ProposeBusy> {
         match self {
             CpGroup::Lsm(n) => {
-                n.txn_stage_participant(txn_id, record_key, record_table, writes, conditions)
-                    .await
+                n.txn_stage_participant_checked(
+                    txn_id,
+                    record_key,
+                    record_table,
+                    writes,
+                    conditions,
+                )
+                .await
             }
             CpGroup::Mem(n) => {
-                n.txn_stage_participant(txn_id, record_key, record_table, writes, conditions)
-                    .await
+                n.txn_stage_participant_checked(
+                    txn_id,
+                    record_key,
+                    record_table,
+                    writes,
+                    conditions,
+                )
+                .await
             }
         }
     }
@@ -6664,6 +6676,8 @@ impl BoundNode {
             || self.lag_stretch_max_x > 0
             || awake_max.is_some()
             || self.bg_sizes != animus_cp_data::background_budget::BudgetSizes::off()
+            || ctx.overload.admission.limits().is_on()
+            || ctx.overload.admission.budget().budget() != 0
         {
             reconciler.set_election_backpressure(node_election_backpressure(
                 &self.env,
@@ -6671,6 +6685,7 @@ impl BoundNode {
                 self.lag_stretch_max_x,
                 awake_max,
                 Some(bg_budget.clone()),
+                Some(ctx.overload.admission.clone()),
             ));
         }
         // ADR 0078 section 3: staggered hosting, and the gauge `/admin/health`
@@ -9040,6 +9055,8 @@ impl BoundDataNode {
             || self.lag_stretch_max_x > 0
             || awake_max.is_some()
             || self.bg_sizes != animus_cp_data::background_budget::BudgetSizes::off()
+            || ctx.overload.admission.limits().is_on()
+            || ctx.overload.admission.budget().budget() != 0
         {
             reconciler.set_election_backpressure(node_election_backpressure(
                 &self.env,
@@ -9047,6 +9064,7 @@ impl BoundDataNode {
                 self.lag_stretch_max_x,
                 awake_max,
                 Some(bg_budget.clone()),
+                Some(ctx.overload.admission.clone()),
             ));
         }
         // ADR 0078 section 3: staggered hosting, and the gauge `/admin/health`
@@ -12721,7 +12739,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             status: NodeStatus::Leaving,
         }) {
             ProposeResult::Accepted { .. } => Ok(()),
-            ProposeResult::NotLeader { .. } => {
+            // Control-plane proposals are never `Busy` (ADR 0080: the bound lives in
+            // `animus-cp-data`); folded in with the other not-accepted shape.
+            ProposeResult::NotLeader { .. } | ProposeResult::Busy { .. } => {
                 Err("control leadership moved; retry on the leader".into())
             }
         }
@@ -12861,7 +12881,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         }
         match leader.propose(MetaCommand::RemoveMember { node }) {
             ProposeResult::Accepted { .. } => Ok(()),
-            ProposeResult::NotLeader { .. } => {
+            // Control-plane proposals are never `Busy` (ADR 0080: the bound lives in
+            // `animus-cp-data`); folded in with the other not-accepted shape.
+            ProposeResult::NotLeader { .. } | ProposeResult::Busy { .. } => {
                 Err("control leadership moved; retry on the leader".into())
             }
         }
@@ -13172,7 +13194,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         voters.insert(node.clone());
         match leader.change_membership(voters) {
             ProposeResult::Accepted { .. } => Ok(node),
-            ProposeResult::NotLeader { .. } => Err(
+            ProposeResult::NotLeader { .. } | ProposeResult::Busy { .. } => Err(
                 "control leadership moved, or a membership change is already in \
                  flight; the address book was updated (retry-safe) but the voter \
                  was not added — retry on the leader"
@@ -13350,7 +13372,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 // keeps it current regardless of voter status).
                 Ok(ControlRemoveOutcome { warning })
             }
-            ProposeResult::NotLeader { .. } => Err(
+            ProposeResult::NotLeader { .. } | ProposeResult::Busy { .. } => Err(
                 "control leadership moved, or a membership change is already in \
                      flight; retry on the leader"
                     .into(),
@@ -17922,6 +17944,7 @@ fn node_election_backpressure<E: Env>(
     stretch_x: u64,
     awake_max: Option<usize>,
     budget: Option<animus_cp_data::background_budget::BackgroundBudget>,
+    admission: Option<animus_cp_data::admission::NodeAdmission>,
 ) -> animus_cp_data::campaign_governor::ElectionBackpressure {
     let governor =
         (k > 0).then(|| animus_cp_data::campaign_governor::CampaignGovernor::new(k, env.metrics()));
@@ -17942,11 +17965,16 @@ fn node_election_backpressure<E: Env>(
     if let (Some(m), Some(b)) = (&monitor, &budget) {
         m.attach_budget(b.clone());
     }
+    // ADR 0080: the propose bound's limits follow the same lag.
+    if let (Some(m), Some(a)) = (&monitor, &admission) {
+        m.attach_admission(a.clone());
+    }
     animus_cp_data::campaign_governor::ElectionBackpressure {
         governor,
         monitor,
         awake,
         budget,
+        admission,
     }
 }
 

@@ -351,6 +351,52 @@ impl SimDensity {
     }
 }
 
+/// ADR 0080: the overload knobs a `SimCluster` node assembles with (the propose
+/// bound's limits and the `QueuedBytes` budget), installed per thread exactly
+/// like [`SimDensity`]. Every other cluster runs with the propose bound off.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SimOverload {
+    /// The per-group propose-backlog limits (`BacklogLimits::off()` = unbounded).
+    pub(crate) backlog: animus_cp_data::admission::BacklogLimits,
+    /// The node `QueuedBytes` budget in bytes (`0` = unlimited).
+    pub(crate) budget: u64,
+}
+
+thread_local! {
+    static SIM_OVERLOAD: std::cell::Cell<Option<SimOverload>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Removes the thread's [`SimOverload`] when dropped.
+#[allow(
+    dead_code,
+    reason = "installed by the sim_cluster_overload corpus (ADR 0080 edge-admission commit)"
+)]
+pub(crate) struct SimOverloadGuard(());
+
+impl Drop for SimOverloadGuard {
+    fn drop(&mut self) {
+        SIM_OVERLOAD.with(|d| d.set(None));
+    }
+}
+
+impl SimOverload {
+    #[allow(
+        dead_code,
+        reason = "installed by the sim_cluster_overload corpus (ADR 0080 edge-admission commit)"
+    )]
+    /// Install `self` for every node this thread's `SimCluster` builds from now
+    /// on, until the guard drops.
+    pub(crate) fn install(self) -> SimOverloadGuard {
+        SIM_OVERLOAD.with(|d| d.set(Some(self)));
+        SimOverloadGuard(())
+    }
+
+    fn current() -> Option<SimOverload> {
+        SIM_OVERLOAD.with(std::cell::Cell::get)
+    }
+}
+
 /// The split-pool handle a node's `DataRole` carries (`ClientCtx::
 /// trigger_split` takes a permit from it), when a [`SimDensity`] is installed.
 /// Its own `BackgroundBudget` (not the reconciler's): the pools are separate
@@ -397,6 +443,15 @@ fn build_reconciler(
         // snapshot send/receive and catch-up pools).
         density.map(|d| {
             animus_cp_data::background_budget::BackgroundBudget::new(d.sizes, env.metrics())
+        }),
+        // ADR 0080: the propose bound is off in the simulated cluster unless a
+        // cell installs one (`SimOverload`).
+        SimOverload::current().map(|o| {
+            animus_cp_data::admission::NodeAdmission::new(
+                o.backlog,
+                animus_env::QueuedBytes::new(o.budget),
+                env.metrics(),
+            )
         }),
     );
     let mut reconciler = if backend == SimEngineBackend::Lsm {

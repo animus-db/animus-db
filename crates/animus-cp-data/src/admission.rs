@@ -357,7 +357,6 @@ impl NodeAdmission {
 
     /// Decide whether a command of `class` and `new_bytes` may be appended to
     /// a group whose backlog is `entries` / `bytes`. Pure.
-    #[must_use]
     pub fn verdict(
         &self,
         class: AdmissionClass,

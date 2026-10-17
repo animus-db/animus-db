@@ -2752,7 +2752,11 @@ fn record_outbound(metrics: &MetricsHandle, outs: &[Out]) {
 fn record_reconfigure(metrics: &MetricsHandle, result: ProposeResult) -> ProposeResult {
     match result {
         ProposeResult::Accepted { .. } => metrics.incr(Metric::ControlReconfigureAccepted),
-        ProposeResult::NotLeader { .. } => metrics.incr(Metric::ControlReconfigureRejected),
+        // `Busy` is never produced by the control plane (ADR 0080: the bound
+        // lives in `animus-cp-data`); counted as a rejection to stay total.
+        ProposeResult::NotLeader { .. } | ProposeResult::Busy { .. } => {
+            metrics.incr(Metric::ControlReconfigureRejected);
+        }
     }
     result
 }

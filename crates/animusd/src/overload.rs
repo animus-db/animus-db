@@ -119,12 +119,23 @@ pub(crate) struct OverloadState {
     /// Where the `overload_shed_*` counters are recorded (this node's own
     /// sink, the one `/metrics` exports).
     pub(crate) metrics: MetricsHandle,
+    /// ADR 0080: this node's propose admission (the per-group backlog bound
+    /// and the shared `QueuedBytes` budget). Handed to the tablet-host
+    /// reconciler (via `ElectionBackpressure`), fed its lag by the
+    /// `LoadMonitor`, and read by the edge for its lag-scaled gates.
+    pub(crate) admission: animus_cp_data::admission::NodeAdmission,
 }
 
 impl OverloadState {
     pub(crate) fn new(limits: ResolvedLimits, metrics: MetricsHandle) -> Self {
+        let budget = animus_env::QueuedBytes::new(limits.queued_bytes_budget);
         Self {
             limits,
+            admission: animus_cp_data::admission::NodeAdmission::new(
+                limits.backlog_limits(),
+                budget,
+                metrics.clone(),
+            ),
             metrics,
             dynamo_conns: CountGate::new(limits.max_connections),
             inflight: CountGate::new(limits.max_inflight_requests),

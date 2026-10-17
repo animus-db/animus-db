@@ -1266,7 +1266,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                             local_pending = Some((index, leader.engine_applied_index()));
                             true
                         }
-                        ProposeResult::NotLeader { .. } => false,
+                        // A control-plane propose (never `Busy`: the bound
+                        // lives in `animus-cp-data`, ADR 0080).
+                        ProposeResult::NotLeader { .. } | ProposeResult::Busy { .. } => false,
                     },
                     None => self.propose_schema(&command).await,
                 };
