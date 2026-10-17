@@ -284,6 +284,8 @@ pub(crate) struct OverloadState {
     pub(crate) group_inflight: GroupInflight,
     /// ADR 0080 2b: per-tablet "no leader since" state for the fast-fail.
     pub(crate) leaderless: LeaderlessTracker,
+    /// ADR 0080 section 5 (4.7): admin handlers executing now.
+    pub(crate) admin_inflight: CountGate,
 }
 
 impl OverloadState {
@@ -303,6 +305,7 @@ impl OverloadState {
             forwarded: CountGate::new(limits.max_forwarded_inflight),
             group_inflight: GroupInflight::new(limits.group_inflight_max),
             leaderless: LeaderlessTracker::new(limits.leaderless_wait),
+            admin_inflight: CountGate::new(limits.max_admin_inflight),
         }
     }
 }

@@ -409,6 +409,35 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
             }
             continue;
         }
+        // ADR 0080 section 5 (4.7): a separate in-flight gate on admin
+        // handlers, with the probe routes exempt.
+        let _admin_permit = if admin_gate_exempt(&request.path) {
+            None
+        } else {
+            match ctx.overload.admin_inflight.try_acquire() {
+                Some(p) => Some(p),
+                None => {
+                    ctx.overload
+                        .metrics
+                        .incr(animus_env::metrics::Metric::OverloadShedAdminInflight);
+                    http::write_response_with(
+                        &mut stream,
+                        503,
+                        "application/json",
+                        &json!({"error": "the admin interface is at its in-flight limit \
+                                         (max_admin_inflight); retry"})
+                        .to_string(),
+                        keep_alive,
+                        http::CORS_HEADERS,
+                    )
+                    .await?;
+                    if !keep_alive {
+                        return Ok(());
+                    }
+                    continue;
+                }
+            }
+        };
         let (status, body) = dispatch(&ctx, &request).await;
         http::write_response_with(
             &mut stream,
@@ -469,6 +498,12 @@ fn static_asset(path: &str) -> Option<(&'static str, &'static str)> {
 /// them. See `animus_node::host::AdminHost`'s own doc for why the trait is
 /// drawn at "one method per route" rather than the raw `ClientCtx` member
 /// list.
+/// Routes the admin in-flight gate never refuses: the Kubernetes probes and the
+/// metrics scrape (ADR 0080 section 5).
+fn admin_gate_exempt(path: &str) -> bool {
+    matches!(path, "/admin/health" | "/admin/live" | "/metrics")
+}
+
 async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String) {
     animus_node::admin::dispatch(
         ctx,
@@ -4299,4 +4334,30 @@ fn bg_permits_json(m: &animus_env::MetricsHandle) -> serde_json::Value {
         "compaction": pool(M::BgPermitInflightCompaction, M::BgPermitInflightHwmCompaction, M::BgPermitDeferredCompaction),
         "compaction_overcap": m.get(M::BgCompactionOvercap),
     })
+}
+
+#[cfg(test)]
+mod admin_gate_tests {
+    use super::admin_gate_exempt;
+
+    /// ADR 0080 section 5 (4.7): probes and the scrape are never refused by the
+    /// admin in-flight gate; everything else is.
+    #[test]
+    fn only_the_probe_routes_are_exempt() {
+        for p in ["/admin/health", "/admin/live", "/metrics"] {
+            assert!(admin_gate_exempt(p), "{p}");
+        }
+        for p in ["/admin/tablets", "/admin/roll-health", "/admin/config", "/"] {
+            assert!(!admin_gate_exempt(p), "{p}");
+        }
+    }
+
+    #[test]
+    fn a_zero_admin_inflight_is_refused_by_validation() {
+        let s = crate::config::OverloadSection {
+            max_admin_inflight: Some(0),
+            ..Default::default()
+        };
+        assert!(s.validate().is_err());
+    }
 }

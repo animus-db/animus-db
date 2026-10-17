@@ -16184,8 +16184,14 @@ async fn handle_connection(
     // half is further wrapped in [`Rewindable`] for [`peer_closed`]'s sake.
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut read_half = Rewindable::new(read_half);
+    let frame_cap = match listener {
+        ListenerKind::Client => CLIENT_LISTENER_FRAME_CAP,
+        ListenerKind::Intra => MAX_FRAME_LEN,
+    };
     loop {
-        let Some(request) = read_frame::<ClientRequest, _>(&mut read_half).await? else {
+        let Some(request) =
+            read_frame_capped::<ClientRequest, _>(&mut read_half, frame_cap).await?
+        else {
             return Ok(());
         };
         // Issue #1253: a connection admitted only through the peer-region CA
@@ -20111,11 +20117,36 @@ where
 pub async fn read_frame<T: DeserializeOwned, S: AsyncRead + Unpin>(
     stream: &mut S,
 ) -> std::io::Result<Option<T>> {
+    read_frame_capped(stream, MAX_FRAME_LEN).await
+}
+
+/// ADR 0080 section 5 (4.4): the inbound frame cap on the **client** listener,
+/// 16 MiB. The intra listener keeps [`MAX_FRAME_LEN`] (64 MiB), because forwarded
+/// batches and snapshot-adjacent frames legitimately exceed 16 MiB; a client
+/// request is bounded by the DynamoDB item and batch limits well below it.
+pub(crate) const CLIENT_LISTENER_FRAME_CAP: usize = 16 << 20;
+
+/// [`read_frame`] with an explicit declared-length cap (never above
+/// [`MAX_FRAME_LEN`]); a longer frame is an `InvalidData` error before any
+/// allocation.
+///
+/// # Errors
+/// As [`read_frame`].
+pub(crate) async fn read_frame_capped<T: DeserializeOwned, S: AsyncRead + Unpin>(
+    stream: &mut S,
+    cap: usize,
+) -> std::io::Result<Option<T>> {
     let raw_len = match stream.read_u32().await {
         Ok(len) => len,
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e),
     };
+    if raw_len as usize > cap.min(MAX_FRAME_LEN) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("declared frame length {raw_len} exceeds the listener cap ({cap})"),
+        ));
+    }
     let len = animus_node::codec::frame_payload_len(raw_len)?;
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
@@ -24606,5 +24637,33 @@ mod bound_node_settings_tests {
         );
         let bound = apply_cluster_settings_to_bound(bound, &config, 0);
         assert_eq!(bound.max_region_rtt, Duration::from_millis(437));
+    }
+}
+
+#[cfg(test)]
+mod client_frame_cap_tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    /// ADR 0080 section 5 (4.4): a declared length past the cap is refused
+    /// before any allocation; the same length is fine under the intra cap.
+    #[tokio::test]
+    async fn a_frame_over_the_client_cap_is_refused_before_allocation() {
+        let len = (CLIENT_LISTENER_FRAME_CAP + 1) as u32;
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        tx.write_all(&len.to_be_bytes()).await.unwrap();
+        let r = read_frame_capped::<ClientRequest, _>(&mut rx, CLIENT_LISTENER_FRAME_CAP).await;
+        assert!(matches!(r, Err(ref e) if e.kind() == std::io::ErrorKind::InvalidData));
+
+        // Under the intra cap the same prefix is accepted as a length (the read
+        // then waits for the body, so it times out instead of erroring).
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        tx.write_all(&len.to_be_bytes()).await.unwrap();
+        let r = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            read_frame_capped::<ClientRequest, _>(&mut rx, MAX_FRAME_LEN),
+        )
+        .await;
+        assert!(r.is_err(), "the intra cap admits it and waits for the body");
     }
 }

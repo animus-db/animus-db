@@ -61,6 +61,8 @@ pub const DEFAULT_GROUP_INFLIGHT_MAX: usize = 256;
 pub const DEFAULT_LEADERLESS_WAIT_MS: u64 = 2_000;
 /// Default [`OverloadSection::max_forwarded_inflight`] (ADR 0080 decision 2d).
 pub const DEFAULT_MAX_FORWARDED_INFLIGHT: usize = 4096;
+/// Default [`OverloadSection::max_admin_inflight`] (ADR 0080 section 5, 4.7).
+pub const DEFAULT_MAX_ADMIN_INFLIGHT: usize = 32;
 /// Default [`OverloadSection::queued_bytes_budget`] (ADR 0080 section 4):
 /// 256 MiB, on out of the box ("every queue is bounded", ADR 0074).
 pub const DEFAULT_QUEUED_BYTES_BUDGET: u64 = 256 << 20;
@@ -112,6 +114,11 @@ pub struct OverloadSection {
     /// node's intra listener.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_forwarded_inflight: Option<usize>,
+    /// ADR 0080 section 5 (4.7): admin handlers executing at once; one more is
+    /// answered `503` at once. `/admin/health`, `/admin/live` and `/metrics`
+    /// are exempt, so a probe never starves behind an expensive admin call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_admin_inflight: Option<usize>,
     /// ADR 0080 section 4: the node-wide `QueuedBytes` budget, in bytes. `0`
     /// disables the budget (the per-queue bounds still apply).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -130,6 +137,7 @@ impl OverloadSection {
             ("max_admin_connections", self.max_admin_connections),
             ("max_peer_connections", self.max_peer_connections),
             ("max_forwarded_inflight", self.max_forwarded_inflight),
+            ("max_admin_inflight", self.max_admin_inflight),
         ] {
             if v == Some(0) {
                 return Err(format!(
@@ -171,6 +179,7 @@ impl OverloadSection {
             max_forwarded_inflight: s
                 .max_forwarded_inflight
                 .unwrap_or(DEFAULT_MAX_FORWARDED_INFLIGHT),
+            max_admin_inflight: s.max_admin_inflight.unwrap_or(DEFAULT_MAX_ADMIN_INFLIGHT),
             queued_bytes_budget: s.queued_bytes_budget.unwrap_or(DEFAULT_QUEUED_BYTES_BUDGET),
         }
     }
@@ -197,6 +206,8 @@ pub struct ResolvedLimits {
     pub leaderless_wait: std::time::Duration,
     /// See [`OverloadSection::max_forwarded_inflight`].
     pub max_forwarded_inflight: usize,
+    /// See [`OverloadSection::max_admin_inflight`].
+    pub max_admin_inflight: usize,
     /// See [`OverloadSection::queued_bytes_budget`] (`0` = off).
     pub queued_bytes_budget: u64,
 }
