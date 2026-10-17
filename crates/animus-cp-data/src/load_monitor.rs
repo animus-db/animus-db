@@ -140,6 +140,9 @@ struct Inner {
     /// The node's background-work budget (ADR 0079 layer 3), whose pool sizes
     /// follow the same lag; attached once after construction.
     budget: OnceLock<crate::background_budget::BackgroundBudget>,
+    /// The node's propose admission (ADR 0080), whose per-group backlog bounds
+    /// follow the same lag; attached once after construction.
+    admission: OnceLock<crate::admission::NodeAdmission>,
 }
 
 /// The per-node monitor handle. Cloning is an `Arc` bump; drivers hold a clone
@@ -207,6 +210,7 @@ impl LoadMonitor {
                 governor,
                 awake: OnceLock::new(),
                 budget: OnceLock::new(),
+                admission: OnceLock::new(),
             }),
         }
     }
@@ -222,6 +226,12 @@ impl LoadMonitor {
     /// on its pool sizes follow this monitor's lag. At most once.
     pub fn attach_budget(&self, budget: crate::background_budget::BackgroundBudget) {
         let _ = self.inner.budget.set(budget);
+    }
+
+    /// Attach the node's propose admission (ADR 0080): from now on its
+    /// per-group bounds follow this monitor's lag. At most once.
+    pub fn attach_admission(&self, admission: crate::admission::NodeAdmission) {
+        let _ = self.inner.admission.set(admission);
     }
 
     /// Fold one probe sample (nanoseconds late) into the estimate and publish.
@@ -243,6 +253,9 @@ impl LoadMonitor {
         }
         if let Some(b) = self.inner.budget.get() {
             b.set_lag(lag);
+        }
+        if let Some(a) = self.inner.admission.get() {
+            a.set_lag(lag);
         }
     }
 
