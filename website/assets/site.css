@@ -66,6 +66,9 @@ code {
   border-radius: var(--radius);
   color: var(--text);
 }
+/* Long API names (RestoreTableToPointInTime, ExpressionAttributeValues) in
+   running text must wrap on a phone rather than widen the page. */
+p code, li code, td code, dd code { overflow-wrap: anywhere; }
 
 .wrap { max-width: var(--maxw); margin: 0 auto; padding: 0 var(--pad-x); }
 .narrow { max-width: 760px; }
@@ -154,6 +157,11 @@ nav.main a.here { color: var(--text); border-bottom: var(--live-underline) solid
   }
   nav.main::-webkit-scrollbar { display: none; }
   nav.main a { white-space: nowrap; flex: none; padding: 8px 2px; }
+}
+/* Phones: the external GitHub link is the one that fell off the end of the
+   strip with no hint it scrolls. The footer carries it, so drop it here. */
+@media (max-width: 560px) {
+  nav.main a[href^="https://github.com"] { display: none; }
 }
 /* Chalk-paper wants margin: below 560px the 20px inset above steps up once
    more so body copy never reads edge-to-edge on a phone. (The nav keeps the
