@@ -68,7 +68,11 @@ code {
 }
 /* Long API names (RestoreTableToPointInTime, ExpressionAttributeValues) in
    running text must wrap on a phone rather than widen the page. */
-p code, li code, td code, dd code { overflow-wrap: anywhere; }
+p code, li code, dd code { overflow-wrap: anywhere; }
+/* In tables, break-word (not anywhere) keeps a whole identifier's width as
+   the column minimum, so "ExecuteStatement" never splits mid-word; a wide
+   table scrolls inside its .table-scroll box instead. */
+td code { overflow-wrap: break-word; }
 
 .wrap { max-width: var(--maxw); margin: 0 auto; padding: 0 var(--pad-x); }
 .narrow { max-width: 760px; }
