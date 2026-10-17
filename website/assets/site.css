@@ -143,6 +143,7 @@ nav.main a.here { color: var(--text); border-bottom: var(--live-underline) solid
    keyline on the active link stays visible, just scrolled to if needed. */
 @media (max-width: 860px) {
   :root { --pad-x: 20px; }
+  html { scroll-padding-top: 130px; }
   header.site .bar {
     flex-wrap: wrap; height: auto; min-height: 60px; padding: 10px var(--pad-x); row-gap: 6px; gap: 12px;
   }
@@ -518,20 +519,54 @@ td.d { color: var(--ink-72); font-size: 12.5px; }
 .doc-body section + section { border-top: 1px solid var(--border); padding-top: 6px; }
 .doc-body h3 { margin-top: 28px; }
 .doc-body .code, .doc-body .plate, .doc-body .table-scroll { margin: 16px 0 20px; }
+/* "On this page" — below 940px the sidebar is replaced by a sticky
+   dropdown pinned under the site header (114px tall below 860px, 67px
+   above). CSS-only; site.js just closes it after a pick and names the
+   current section in the summary. */
+.doc-toc { display: none; }
 @media (max-width: 940px) {
-  .doc-layout { grid-template-columns: minmax(0, 1fr); gap: 0; padding-block-start: 26px; }
-  .doc-nav { position: static; max-height: none; border-bottom: 1px solid var(--border); padding-bottom: 18px; margin-bottom: 24px; }
-  .doc-nav .cols { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 24px; }
+  .doc-layout { grid-template-columns: minmax(0, 1fr); gap: 0; padding-block-start: 0; }
+  .doc-nav { display: none; }
+  .doc-toc {
+    display: block; position: sticky; top: 66px; z-index: 40;
+    margin: 0 calc(-1 * var(--pad-x)) 8px; background: var(--bg); border-bottom: 1px solid var(--border);
+  }
+  .doc-toc summary {
+    display: flex; align-items: center; gap: 10px; cursor: pointer; list-style: none;
+    padding: 12px var(--pad-x); min-height: 46px; font-size: 14px;
+  }
+  .doc-toc summary::-webkit-details-marker { display: none; }
+  .doc-toc summary::after {
+    content: ""; margin-left: auto; flex: none; width: 7px; height: 7px;
+    border-right: 1.5px solid var(--ink-72); border-bottom: 1.5px solid var(--ink-72);
+    transform: translateY(-2px) rotate(45deg); transition: transform .15s;
+  }
+  .doc-toc[open] summary::after { transform: translateY(2px) rotate(-135deg); }
+  .doc-toc-label { font: 600 12px/1 var(--font-mono); letter-spacing: .1em; text-transform: uppercase; color: var(--accent); flex: none; }
+  .doc-toc-current { color: var(--text2); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .doc-toc-current:not(:empty)::before { content: "· "; color: var(--text3); }
+  .doc-toc-panel {
+    position: absolute; left: 0; right: 0; top: 100%;
+    background: var(--bg); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
+    max-height: calc(100vh - 200px); overflow-y: auto; overscroll-behavior: contain;
+    padding: 4px var(--pad-x) 16px; font-size: 14px;
+    display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 24px;
+  }
+  .doc-toc-head {
+    display: block; font: 600 12px/1 var(--font-mono); letter-spacing: .1em; text-transform: uppercase;
+    color: var(--text3); margin: 16px 0 6px;
+  }
+  .doc-toc-panel a { display: block; padding: 7px 0 7px 12px; color: var(--text2); border-left: 2px solid var(--border); }
+  .doc-toc-panel a:hover { color: var(--text); text-decoration: none; }
+  .doc-toc-panel a.active { color: var(--accent); border-left-color: var(--accent); font-weight: 500; }
+  html:has(.doc-toc) { scroll-padding-top: 130px; }
+}
+@media (max-width: 860px) {
+  .doc-toc { top: 113px; }
+  html:has(.doc-toc) { scroll-padding-top: 176px; }
 }
 @media (max-width: 560px) {
-  .doc-nav .cols { display: flex; flex-wrap: wrap; gap: 8px; }
-  .doc-nav .cols > div { display: contents; }
-  .doc-nav h4 { display: none; }
-  .doc-nav a {
-    display: inline-block; border: 1px solid var(--border); border-left-width: 1px;
-    border-radius: 999px; padding: 6px 12px; font-size: 12.5px; background: var(--surface);
-  }
-  .doc-nav a.active { border-color: var(--accent); }
+  .doc-toc-panel { grid-template-columns: minmax(0, 1fr); }
 }
 /* A doc section's h2 is a section label sitting on a 2px rule; below 640px
    give it real air above instead of the border-top + 6px it gets on desktop. */
