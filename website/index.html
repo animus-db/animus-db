@@ -213,13 +213,13 @@
     <div class="diagram-plate mt-18">
       <svg viewBox="0 0 980 210" role="img" aria-label="Compact two-planes strip: the control plane holds the map; the data plane is one Raft group per tablet; a write lands on a single tablet's leader.">
         <defs><marker id="arrB" markerWidth="7" markerHeight="7" refX="5.5" refY="3.5" orient="auto"><path class="dg-arrow" d="M0 1.2 L5.5 3.5 L0 5.8 z"/></marker></defs>
-        <rect class="dg-bx" x="20" y="46" width="200" height="118" rx="3"/>
+        <rect class="dg-bx" x="20" y="46" width="184" height="118" rx="3"/>
         <text class="dg-t" x="36" y="72">Control plane</text>
         <text class="dg-m" x="36" y="90">one small Raft group</text>
         <text class="dg-m dg-ui" x="36" y="114">holds the map:</text>
         <text class="dg-m dg-ui" x="36" y="132">members · tablets · tables</text>
-        <path class="dg-ln" d="M220 105 H268" stroke-dasharray="4 4"/>
-        <text class="dg-m" x="244" y="96" text-anchor="middle">topology</text>
+        <path class="dg-ln" d="M204 105 H268" stroke-dasharray="4 4"/>
+        <text class="dg-m" x="236" y="96" text-anchor="middle">topology</text>
         <rect class="dg-bx" x="268" y="24" width="692" height="162" rx="3"/>
         <text class="dg-t" x="284" y="48">Data plane — one Raft group per tablet</text>
         <path class="dg-req" d="M560 4 V56" marker-end="url(#arrB)"/>
@@ -240,7 +240,7 @@
         <text class="dg-t" x="859" y="86" text-anchor="middle">tablet 4</text>
         <circle class="dg-leader-plain" cx="841" cy="112" r="5"/><circle class="dg-follower" cx="859" cy="112" r="4.5"/><circle class="dg-follower" cx="877" cy="112" r="4.5"/>
         <text class="dg-m" x="859" y="146" text-anchor="middle">own leader</text>
-        <text class="dg-m dg-sm" x="614" y="200" text-anchor="middle">no log connects the tablets · ● leader · ○ followers</text>
+        <text class="dg-m" x="614" y="200" text-anchor="middle">no log connects the tablets · ● leader · ○ followers</text>
       </svg>
     </div>
     <div class="ctalink-row"><a class="ctalink" href="how-it-works.html">How it works, in full →</a></div>
