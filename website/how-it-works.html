@@ -82,11 +82,11 @@
 
 <main id="main">
 
-<div class="wrap ref-head" style="--rh-pt:40px;--rh-pb:20px">
+<div class="wrap ref-head rh-40">
   <span class="kicker">How it works</span>
   <h1>The whole system, on one page.</h1>
-  <p style="font-size:16px;color:var(--ink-78,var(--ink-72));max-width:720px;margin-bottom:22px">What it's compatible with, how it's built, how it's tested, what it costs you in round trips, and how you run it. Each section stops where the reference page begins.</p>
-  <span class="kicker" style="margin-bottom:8px">On this page</span>
+  <p class="page-lede page-lede-lg mb-22">What it's compatible with, how it's built, how it's tested, what it costs you in round trips, and how you run it. Each section stops where the reference page begins.</p>
+  <span class="kicker mb-8">On this page</span>
   <ol class="toc">
     <li><a href="#api">It speaks DynamoDB</a></li>
     <li><a href="#raft">It's built out of ordinary Raft groups</a></li>
@@ -101,7 +101,7 @@
   <div class="wrap">
     <span class="kicker">Compatibility</span>
     <h2>It speaks DynamoDB, so your SDK doesn't know the difference.</h2>
-    <div class="plate" style="max-width:560px;margin:14px 0 18px">
+    <div class="plate mw-560 plate-inset">
       <div class="head"><span class="t">the entire integration</span><span class="ext">diff</span></div>
       <div class="body">
         <div class="cl dm">- endpoint: dynamodb.eu-west-1.amazonaws.com</div>
@@ -122,7 +122,7 @@
     <p class="body-text">Your data lives in as many independent Raft groups as you have tablets, each replicated and led separately. A tablet is a contiguous range of the token space, and it is the unit of replication, movement and consensus. When one grows past its threshold it splits, online, into two groups.</p>
     <p class="body-text">Nothing funnels through a single log and no node is special — so losing one costs you an election on the tablets it led, not the cluster.</p>
 
-    <div class="diagram-plate" style="margin:18px 0">
+    <div class="diagram-plate my-18">
       <svg viewBox="0 0 980 360" role="img" aria-label="An unmodified AWS SDK sends a write; it arrives at the Raft leader of one tablet, not at a coordinator; a bracket marks the quorum acknowledgement across that tablet's replicas; two further tablets have their own separate leaders and no log connects the tablets; the control plane is a separate small Raft group holding membership, the tablet map and table definitions, attached only by a dashed link for topology lookups that never sit on the read or write path.">
         <defs>
           <marker id="arrF" markerWidth="7" markerHeight="7" refX="5.5" refY="3.5" orient="auto"><path class="dg-arrow-muted" d="M0 1.2 L5.5 3.5 L0 5.8 z"/></marker>
@@ -152,21 +152,21 @@
         <text class="dg-t" x="876" y="163" text-anchor="middle">tablet 3</text>
         <circle class="dg-leader-plain" cx="846" cy="196" r="5"/><circle class="dg-follower" cx="876" cy="196" r="4.5"/><circle class="dg-follower" cx="906" cy="196" r="4.5"/>
         <text class="dg-m" x="876" y="228" text-anchor="middle">own leader</text>
-        <text class="dg-m" x="669" y="300" text-anchor="middle" style="font-size:10.5px">each group: its own leader, its own log, its own quorum</text>
-        <text class="dg-m" x="669" y="320" text-anchor="middle" style="font-size:10.5px">no log connects the tablets to each other</text>
+        <text class="dg-m dg-sm" x="669" y="300" text-anchor="middle">each group: its own leader, its own log, its own quorum</text>
+        <text class="dg-m dg-sm" x="669" y="320" text-anchor="middle">no log connects the tablets to each other</text>
         <text class="dg-m" x="669" y="342" text-anchor="middle">● leader · ○ followers</text>
         <rect class="dg-bx" x="60" y="138" width="240" height="130" rx="3"/>
         <text class="dg-t" x="76" y="163">Control plane</text>
         <text class="dg-m" x="76" y="180">a separate small Raft group</text>
-        <text x="76" y="206" style="fill:var(--ink-72);font:400 11.5px var(--font-ui)">Membership · tablet map</text>
-        <text x="76" y="225" style="fill:var(--ink-72);font:400 11.5px var(--font-ui)">Table definitions</text>
+        <text class="dg-ui" x="76" y="206">Membership · tablet map</text>
+        <text class="dg-ui" x="76" y="225">Table definitions</text>
         <path class="dg-ln" d="M300 203 H384" stroke-dasharray="4 4" marker-end="url(#arrF)"/>
         <text class="dg-m" x="62" y="292">topology lookups — never on the read/write path</text>
       </svg>
       <div class="diagram-cap">The write path, the quorum acknowledgement, and the control plane held off the request path. This is the full version; the Architecture page reuses it.</div>
     </div>
 
-    <div class="table-scroll" style="max-width:760px">
+    <div class="table-scroll mw-760">
       <table>
         <thead><tr><th>Operation</th><th>Guarantee</th></tr></thead>
         <tbody>
@@ -212,7 +212,7 @@
     <h2>One binary, four shapes, six ports.</h2>
     <p class="body-text">Every node is the same <code>animusd</code> binary; what differs is which planes it hosts, and that is a line in a config file. Run <strong>combined</strong> nodes by default, split into <strong>control-only</strong> and <strong>data-only</strong> as a cluster grows, or start an entire cluster in a <strong>single process</strong> for development. A config can mix shapes, so a cluster migrates between them incrementally rather than being rebuilt.</p>
     <p class="body-text">A node claims six consecutive ports from its base, 7100 by default: Raft traffic, the client protocol, the DynamoDB HTTP endpoint (which also serves <code>GET /metrics</code>), the admin API and dashboard, intra-cluster communication and a data console.</p>
-    <div class="cardgrid c2" style="margin-top:16px;max-width:860px">
+    <div class="cardgrid c2 mt-16 mw-860">
       <div class="lcard"><h3>Day two, available</h3><ul>
         <li>Growing: a joining node needs the intra-cluster address of any running node</li>
         <li>Shrinking: <code>drain</code>, <code>drain-status</code>, <code>decommission</code></li>
@@ -229,7 +229,7 @@
     </div>
     <p class="body-text">TLS is available on every port — mutual on the Raft/intra-cluster ports, server-only on the client, admin and console ports — config-gated per cluster and <strong>off by default</strong>.</p>
     <p class="body-text">Encryption at rest is available too, via a key file (<code>--encryption-key PATH</code>, or the same field in a cluster config) — or, on Kubernetes, <code>spec.encryptionKeySecretName</code> naming a pre-existing Secret the operator mounts read-only: every AEAD-sealed byte covers the Raft WAL and each hosted tablet's own engine files, with a wrong or missing key against an already-encrypted data directory refused loudly at startup rather than silently reset. It also covers backup, point-in-time-recovery and stream segment objects on every segment/backup store — the <strong>default</strong> replicated one included, not just the <code>fs:</code>/<code>s3://</code> opt-ins — as long as every node sharing a store is configured with the identical key file (a cluster-wide key, not a per-node one, since a different node routinely reads what another wrote). There's no key rotation yet and it is not supported: the key is cluster-wide, so a differently-keyed replica cannot read the shared stores, and changing a key means building a new cluster; a keyring-based design is planned. It's <strong>off by default</strong> either way.</p>
-    <div class="warnbox" style="max-width:860px">
+    <div class="warnbox mw-860">
       <span class="label">Off by default, still just SigV4 for caller identity</span>
       <p>A cluster with no TLS configured is exactly as before: plain TCP everywhere. Turn it on and the internal ports refuse a non-cluster-member outright; the client port still only verifies a signature — opt-in, off by default independently of TLS. Don't put an unconfigured cluster on the public internet, and don't store data you can't recreate.</p>
     </div>
@@ -257,15 +257,15 @@
     <span class="kicker">Going deeper</span>
     <h2>Four reference pages sit under this one.</h2>
     <p class="body-text">Each section above stops at the point where detail starts being useful only to someone who has decided to look. That detail is here.</p>
-    <div class="cardgrid c4" style="margin-top:16px">
+    <div class="cardgrid c4 mt-16">
       <div class="lcard"><span class="tag">Reference</span><h3><a href="architecture.html">Architecture</a></h3><p>The two planes and why the split matters, tablets and placement, the consistency model, four deployment shapes with their commands, the six ports, determinism internals, day-two operations, and the known limits in one list.</p></div>
       <div class="lcard"><span class="tag">Reference</span><h3><a href="compatibility.html">Compatibility</a></h3><p>Every DynamoDB operation with its status and per-operation notes, the data model, and the four differences that will actually show up in your code rather than in a table.</p></div>
       <div class="lcard"><span class="tag">Reference</span><h3><a href="performance.html">Performance</a></h3><p>The cost model operation by operation, what scales with the cluster and what doesn't, six questions worth more than someone else's benchmark, and the benchmark methodology and load generator — with no published numbers yet.</p></div>
       <div class="lcard"><span class="tag">Reference</span><h3><a href="licence.html">Licensing</a></h3><p>AGPL-3.0 scenario by scenario, the section 13 question your counsel will ask, why this licence and not a permissive one, and exactly where a commercial licence stands today.</p></div>
     </div>
-    <span class="kicker" style="margin:30px 0 8px">Longer arguments</span>
-    <h2 style="font-size:21px">And three pieces that don't fit on a product page.</h2>
-    <div class="cardgrid c3" style="margin-top:14px">
+    <span class="kicker kicker-sub">Longer arguments</span>
+    <h2 class="h2-sm">And three pieces that don't fit on a product page.</h2>
+    <div class="cardgrid c3 mt-14">
       <div class="lcard"><span class="tag">Essay</span><h3><a href="articles/why-lock-in-compounds.html">Why lock-in compounds</a></h3><p>Lock-in as an options problem rather than a price problem — and an explicit concession that this is not an argument against AWS.</p></div>
       <div class="lcard"><span class="tag">Essay</span><h3><a href="articles/what-self-hosting-costs.html">What self-hosting actually costs</a></h3><p>The day-two bill written out in full, including the lines that show up in month seven, and the cases where self-hosting is the wrong answer.</p></div>
       <div class="lcard"><span class="tag">Essay</span><h3><a href="articles/determinism.html">Determinism, and why you should care</a></h3><p>Simulation testing as risk reduction, with its boundaries drawn, and six questions to interrogate anyone who claims it — us included.</p></div>

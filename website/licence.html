@@ -91,11 +91,11 @@
 
 <main id="main">
 
-<div class="wrap ref-head" style="--rh-pt:38px;--rh-pb:20px">
+<div class="wrap ref-head">
   <span class="kicker">Licensing</span>
   <h1>AGPL-3.0, and what it means for you.</h1>
-  <p style="font-size:15.5px;color:var(--ink-78,var(--ink-72));max-width:740px;font-style:italic;margin-bottom:18px">For anyone evaluating a database, the licence is the first objection raised in the meeting — whether it reaches your application code, and whether a commercial option exists. Silence on that reads as a trap, so here is the whole answer on one page.</p>
-  <div class="warnbox" style="max-width:740px">
+  <p class="page-lede italic mb-18">For anyone evaluating a database, the licence is the first objection raised in the meeting — whether it reaches your application code, and whether a commercial option exists. Silence on that reads as a trap, so here is the whole answer on one page.</p>
+  <div class="warnbox mw-740">
     <span class="label">This page is an explanation, not legal advice</span>
     <p>The <a href="https://github.com/animus-db/animus-db/blob/main/LICENSE">licence text</a> is the authority, and your counsel is the person whose reading of it governs your company. What follows is how we understand it and how we intend it to be used.</p>
   </div>
@@ -105,7 +105,7 @@
   <div class="wrap">
     <span class="kicker">The short version</span>
     <h2>Three sentences, then the detail.</h2>
-    <div class="cardgrid c3" style="margin-top:16px">
+    <div class="cardgrid c3 mt-16">
       <div class="lcard"><span class="tag">Your code</span><h3>Not affected</h3><p>Your application talks to AnimusDB over the DynamoDB HTTP API using AWS's own SDKs. It links nothing of ours. Using a database over a network protocol does not put your application under that database's licence.</p></div>
       <div class="lcard"><span class="tag">Unmodified use</span><h3>Nothing to publish</h3><p>Run a stock build of AnimusDB for your own product, however commercial, and you owe no one any source. The obligations begin when you modify it or when you pass copies on.</p></div>
       <div class="lcard"><span class="tag">Modified use</span><h3>Source to its users</h3><p>Modify AnimusDB and let people interact with your modified version over a network, and you must offer those people the modified source. That is section 13, and it is the clause that makes this AGPL rather than GPL.</p></div>
@@ -117,9 +117,9 @@
   <div class="wrap">
     <span class="kicker">Scenario by scenario</span>
     <h2>What you owe, in the situations that actually come up.</h2>
-    <div class="table-scroll" style="margin-top:14px">
+    <div class="table-scroll mt-14">
       <table>
-        <thead><tr><th style="width:300px">What you're doing</th><th>What the licence asks of you</th></tr></thead>
+        <thead><tr><th class="w-300">What you're doing</th><th>What the licence asks of you</th></tr></thead>
         <tbody>
           <tr><td>Running an unmodified build as the database behind your SaaS product</td><td><strong>Nothing.</strong> Your application is a separate work that speaks to AnimusDB over a documented network protocol. You are not conveying AnimusDB and you have not modified it.</td></tr>
           <tr><td>Carrying local patches, used only by services and staff inside your company</td><td>Section 13 asks that users interacting with the modified version over a network be offered its source. Those users are your own people, so in practice this is an internal repository link — but it is a real obligation, not a formality.</td></tr>
@@ -136,10 +136,10 @@
   <div class="wrap narrow">
     <span class="kicker">The question your counsel will ask</span>
     <h2>"Does section 13 reach our application?"</h2>
-    <p class="body-text" style="font-size:15px;max-width:100%">Section 13 obliges you to offer source to <em>users interacting with the modified Program</em> over a network. The question is who counts as such a user when your application sits in between.</p>
-    <p class="body-text" style="font-size:15px;max-width:100%">The widely held reading, and the one this project intends, is that the user in question is whoever talks to <strong>AnimusDB</strong> — over its DynamoDB endpoint, its admin API or its consoles. Someone using your web application, which happens to query a database several layers below, is a user of your application. They are not interacting with AnimusDB.</p>
-    <p class="body-text" style="font-size:15px;max-width:100%">Two facts make that reading easier to defend here than it is for some AGPL projects. AnimusDB ships <strong>no client library</strong> that you link into your application — you use AWS's SDKs, which are Apache-2.0 and are not ours. And the interface between you and it is a published wire protocol that predates this project.</p>
-    <p class="body-text" style="font-size:15px;max-width:100%">None of which is a substitute for your own counsel reading the clause. It is, however, the specific paragraph to put in front of them, which usually saves a week.</p>
+    <p class="body-text bt-wide">Section 13 obliges you to offer source to <em>users interacting with the modified Program</em> over a network. The question is who counts as such a user when your application sits in between.</p>
+    <p class="body-text bt-wide">The widely held reading, and the one this project intends, is that the user in question is whoever talks to <strong>AnimusDB</strong> — over its DynamoDB endpoint, its admin API or its consoles. Someone using your web application, which happens to query a database several layers below, is a user of your application. They are not interacting with AnimusDB.</p>
+    <p class="body-text bt-wide">Two facts make that reading easier to defend here than it is for some AGPL projects. AnimusDB ships <strong>no client library</strong> that you link into your application — you use AWS's SDKs, which are Apache-2.0 and are not ours. And the interface between you and it is a published wire protocol that predates this project.</p>
+    <p class="body-text bt-wide">None of which is a substitute for your own counsel reading the clause. It is, however, the specific paragraph to put in front of them, which usually saves a week.</p>
   </div>
 </section>
 
@@ -147,8 +147,8 @@
   <div class="wrap narrow">
     <span class="kicker">Why this licence</span>
     <h2>The licence makes the same argument the project does.</h2>
-    <p class="body-text" style="font-size:15px;max-width:100%">AnimusDB exists because a database you cannot move is a dependency you cannot renegotiate. A permissive licence would leave open the one outcome that argument is against: a well-funded operator taking a hosted fork closed, and the version everybody uses ceasing to be the version anybody can run.</p>
-    <p class="body-text" style="font-size:15px;max-width:100%">The AGPL closes that door and leaves every other one open. You can run it, modify it, embed it, build a business on it and never publish a line — right up until you start handing a modified version to other people, at which point they get what you got.</p>
+    <p class="body-text bt-wide">AnimusDB exists because a database you cannot move is a dependency you cannot renegotiate. A permissive licence would leave open the one outcome that argument is against: a well-funded operator taking a hosted fork closed, and the version everybody uses ceasing to be the version anybody can run.</p>
+    <p class="body-text bt-wide">The AGPL closes that door and leaves every other one open. You can run it, modify it, embed it, build a business on it and never publish a line — right up until you start handing a modified version to other people, at which point they get what you got.</p>
   </div>
 </section>
 
@@ -156,10 +156,10 @@
   <div class="wrap narrow">
     <span class="kicker">If AGPL is a hard blocker</span>
     <h2>Where a commercial licence stands today.</h2>
-    <p class="body-text" style="font-size:15px;max-width:100%">Some organisations forbid AGPL software by policy, whatever the analysis above says. It is worth being direct about the current position rather than implying more than exists.</p>
-    <p class="body-text" style="font-size:15px;max-width:100%"><strong>There is no commercial licence on offer today.</strong> AnimusDB is AGPL-3.0-only, and that is the only way to obtain it.</p>
-    <p class="body-text" style="font-size:15px;max-width:100%">What does exist is the machinery that would make one possible. Contributions require a DCO sign-off and a contributor licence agreement — the reasoning is written up in <a href="https://github.com/animus-db/animus-db/blob/main/docs/adr/README.md">the design records</a>, ADR 0007. Keeping the rights consolidated means a differently-licensed edition remains a decision the project can make, rather than one it has already foreclosed.</p>
-    <p class="body-text" style="font-size:15px;max-width:100%">If an AGPL policy is what stops you evaluating, say so in an <a href="https://github.com/animus-db/animus-db/issues">issue</a>. Knowing how many people are actually blocked, and on what grounds, is how that decision eventually gets made.</p>
+    <p class="body-text bt-wide">Some organisations forbid AGPL software by policy, whatever the analysis above says. It is worth being direct about the current position rather than implying more than exists.</p>
+    <p class="body-text bt-wide"><strong>There is no commercial licence on offer today.</strong> AnimusDB is AGPL-3.0-only, and that is the only way to obtain it.</p>
+    <p class="body-text bt-wide">What does exist is the machinery that would make one possible. Contributions require a DCO sign-off and a contributor licence agreement — the reasoning is written up in <a href="https://github.com/animus-db/animus-db/blob/main/docs/adr/README.md">the design records</a>, ADR 0007. Keeping the rights consolidated means a differently-licensed edition remains a decision the project can make, rather than one it has already foreclosed.</p>
+    <p class="body-text bt-wide">If an AGPL policy is what stops you evaluating, say so in an <a href="https://github.com/animus-db/animus-db/issues">issue</a>. Knowing how many people are actually blocked, and on what grounds, is how that decision eventually gets made.</p>
     <div class="ctalink-row">
       <a class="ctalink" href="https://github.com/animus-db/animus-db/blob/main/LICENSE">Read the licence →</a>
       <a class="ctalink" href="https://github.com/animus-db/animus-db/blob/main/CONTRIBUTING.md">Contributing and the CLA →</a>

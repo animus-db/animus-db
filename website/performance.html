@@ -91,18 +91,18 @@
 
 <main id="main">
 
-<div class="wrap ref-head" style="--rh-pt:38px;--rh-pb:20px">
+<div class="wrap ref-head">
   <span class="kicker">Performance</span>
   <h1>There are no published numbers yet. Here's everything else.</h1>
-  <p style="font-size:15.5px;color:var(--ink-78,var(--ink-72));max-width:740px;font-style:italic">A page with no numbers on it invites the assumption that the numbers are bad. The truthful position is narrower than that: AnimusDB has not been benchmarked at scale, so any figure we published today would be measuring an unfinished storage path — and would be quoted back at us for years.</p>
-  <p style="font-size:15.5px;color:var(--ink-78,var(--ink-72));max-width:740px;font-style:italic;margin-bottom:20px">What we can give you now is the cost model, which is derived from the architecture rather than measured, so you can check it against the design instead of trusting us — and the measurement method and the load generator, which are built and in the repository, so you can check how any number will be produced before there is one.</p>
+  <p class="page-lede italic">A page with no numbers on it invites the assumption that the numbers are bad. The truthful position is narrower than that: AnimusDB has not been benchmarked at scale, so any figure we published today would be measuring an unfinished storage path — and would be quoted back at us for years.</p>
+  <p class="page-lede italic mb-20">What we can give you now is the cost model, which is derived from the architecture rather than measured, so you can check it against the design instead of trusting us — and the measurement method and the load generator, which are built and in the repository, so you can check how any number will be produced before there is one.</p>
 </div>
 
 <section class="alt">
   <div class="wrap">
     <span class="kicker">The cost model</span>
     <h2>What each operation actually costs, in round trips.</h2>
-    <div class="table-scroll" style="margin-top:14px">
+    <div class="table-scroll mt-14">
       <table>
         <thead><tr><th>Operation</th><th>Network</th><th>Disk</th><th>Hard floor</th></tr></thead>
         <tbody>
@@ -115,7 +115,7 @@
         </tbody>
       </table>
     </div>
-    <p class="body-text" style="margin-top:16px">The floors in that last column are physics, not implementation. A quorum write cannot be acknowledged before the network has carried it to a quorum. Put replicas in three availability zones and your write floor is a metro round trip; put them on three continents and it is a continental one. No consensus protocol repeals this, and a vendor claiming otherwise is measuring something else.</p>
+    <p class="body-text mt-16">The floors in that last column are physics, not implementation. A quorum write cannot be acknowledged before the network has carried it to a quorum. Put replicas in three availability zones and your write floor is a metro round trip; put them on three continents and it is a continental one. No consensus protocol repeals this, and a vendor claiming otherwise is measuring something else.</p>
     <p class="body-text">The corollary is the useful part: <strong>most of your latency budget is a placement decision, and placement is yours to make.</strong> That is the same lever a managed service takes away from you.</p>
   </div>
 </section>
@@ -124,7 +124,7 @@
   <div class="wrap">
     <span class="kicker">Scaling behaviour</span>
     <h2>What adding hardware buys, and what it doesn't.</h2>
-    <div class="cardgrid c2" style="margin-top:16px">
+    <div class="cardgrid c2 mt-16">
       <div class="lcard"><h3>Scales with the cluster</h3><ul>
         <li><strong>Aggregate throughput.</strong> Tablets are independent Raft groups with independent leaders. More tablets on more nodes means more leaders doing work in parallel.</li>
         <li><strong>Capacity.</strong> A joining node takes on tablets by rebalancing, online, without a maintenance window.</li>
@@ -145,7 +145,7 @@
     <span class="kicker">Sizing it yourself</span>
     <h2>Six questions worth more than someone else's benchmark.</h2>
     <p class="body-text">A published benchmark measures a workload that isn't yours on hardware you don't have. If you are evaluating seriously, these are the questions that actually determine what you'll see.</p>
-    <ol style="font-size:14.5px;color:var(--ink-85);max-width:740px;line-height:1.75">
+    <ol class="note-list">
       <li><strong>Where do the three replicas of a tablet sit?</strong> Same rack, same zone, or three zones? This sets your write floor before any code runs.</li>
       <li><strong>What fraction of your reads genuinely need linearizability?</strong> On most workloads it is far less than 100%, and every one you can relax skips the leader.</li>
       <li><strong>How many of your writes cross a tablet boundary?</strong> Each one is a two-phase commit. If the answer is "most of them", revisit the key design before revisiting the database.</li>
@@ -162,7 +162,7 @@
     <span class="kicker">How we measure</span>
     <h2>The method is built. The numbers are not.</h2>
     <p class="body-text">The load generator is <code>animus-bench</code>, a separate client that drives a cluster over the real DynamoDB wire — HTTP/1.1 JSON, every request SigV4-signed — not an in-process shortcut. The full procedure is in <a href="https://github.com/animus-db/animus-db/blob/main/docs/benchmarks.md">docs/benchmarks.md</a> and the design record is <a href="https://github.com/animus-db/animus-db/blob/main/docs/adr/0076-published-benchmarks.md">ADR 0076</a>.</p>
-    <div class="cardgrid c2" style="margin-top:16px">
+    <div class="cardgrid c2 mt-16">
       <div class="lcard"><h3>What it does</h3><ul>
         <li><strong>YCSB A–F</strong> mapped onto DynamoDB operations: <code>GetItem</code>, <code>UpdateItem</code>, <code>PutItem</code>, <code>Query</code>, and workload F's <code>GetItem</code> plus a conditional <code>UpdateItem</code>. Zipfian or uniform keys; record count and item size are fixed flags and are written into the results.</li>
         <li><strong>Open-loop arrivals.</strong> Operation <em>i</em> is scheduled at <code>start + i/rate</code> whatever the server is doing, and latency is measured from that <em>intended</em> time, so a stall is charged to every request that should have been sent during it (coordinated-omission correction). The latency a closed-loop client would have seen is recorded beside it, so you can see how much the correction matters.</li>
@@ -180,7 +180,7 @@
         <li><strong>The separate-hosts topology is supported but has never been run.</strong> Only same-host development runs have.</li>
       </ul></div>
     </div>
-    <p class="body-text" style="margin-top:16px"><strong>What counts as a publishable run.</strong> The generator and the cluster must be on different hosts, and the file must contain a degraded run whose fault was actually injected. A run where the tool launched the cluster itself, where every endpoint is a loopback address, or that has no such degraded run is marked <code>"publishable": false</code> in its own output, with every unmet condition listed. That flag is a necessary condition, not a certificate — it does not check the rest, which we require before publishing: three nodes at replication factor 3 as the baseline plus one scale-out point, a named instance type, disk model and network for both sides, the leader-kill and follower-kill runs present, and the raw JSON committed or attached to a release.</p>
+    <p class="body-text mt-16"><strong>What counts as a publishable run.</strong> The generator and the cluster must be on different hosts, and the file must contain a degraded run whose fault was actually injected. A run where the tool launched the cluster itself, where every endpoint is a loopback address, or that has no such degraded run is marked <code>"publishable": false</code> in its own output, with every unmet condition listed. That flag is a necessary condition, not a certificate — it does not check the rest, which we require before publishing: three nodes at replication factor 3 as the baseline plus one scale-out point, a named instance type, disk model and network for both sides, the leader-kill and follower-kill runs present, and the raw JSON committed or attached to a release.</p>
     <p class="body-text"><strong>Regression tracking</strong> is deliberately modest. A manually triggered workflow builds a base and a candidate and runs both on the same host, interleaved (base, head, base, head…), and a <code>compare</code> step reports each metric's run-to-run spread. A change is flagged only when it is larger than a stated threshold (10% by default) <em>and</em> the base and candidate ranges do not overlap; otherwise it is shown as <code>noisy</code>. It reports and never fails the job; a lone outlier is a rerun, not a verdict. A benchmark is never a pass/fail latency assertion in a test, and a trend line needs a dedicated, fixed runner that does not exist yet.</p>
   </div>
 </section>
@@ -190,9 +190,9 @@
     <span class="kicker">What we will publish</span>
     <h2>The rules we committed to before we had results.</h2>
     <p class="body-text">Publishing the methodology first is a way of making it expensive to cherry-pick later. Where each rule stands today is in the right-hand column.</p>
-    <div class="table-scroll" style="margin-top:14px">
+    <div class="table-scroll mt-14">
       <table>
-        <thead><tr><th style="width:220px">Commitment</th><th>What it means</th><th style="width:34%">Where it stands</th></tr></thead>
+        <thead><tr><th class="w-220">Commitment</th><th>What it means</th><th class="w-34p">Where it stands</th></tr></thead>
         <tbody>
           <tr><td>Disclosed hardware</td><td>Instance types or machine specs, disk model, network topology, and the placement of every replica.</td><td>Replica placement and the client host are captured into the results file. Server instance type, disk and network are stated by whoever publishes the run; the tool does not detect them.</td></tr>
           <tr><td>Tail latency, not averages</td><td>p50, p99 and p99.9 for each operation class. A mean latency figure for a distributed database is close to meaningless.</td><td>Built: p50 to p99.99 and max per operation class, measured from the intended send time.</td></tr>
@@ -204,7 +204,7 @@
       </table>
     </div>
     <div class="aside">Until a run on dedicated hardware is published, the honest summary is the one on the status section of the overview: <strong>not benchmarked at scale, and therefore no performance claims.</strong> If you need numbers to proceed, AnimusDB is not ready for you yet, and that is the correct conclusion to draw.</div>
-    <p class="body-text" style="margin-top:16px">You can run the generator yourself today against a cluster you start (<code>cargo run --release -p animus-bench -- --help</code>). If it launches the cluster on the same machine it will say <code>publishable: false</code>, and you should read that as meaning it: such figures measure your machine, not the database. Colocated development runs have also shown write-path stalls of a few hundred milliseconds and a roughly 21 ms floor on <code>ConsistentRead: true</code> reads; these are observations from a development machine, not results, and are being tracked as issues. <code>cargo bench -p animusd</code> is a separate, older in-process smoke — unauthenticated, closed-loop, no coordinated-omission correction — and its numbers are not comparable to the generator's.</p>
+    <p class="body-text mt-16">You can run the generator yourself today against a cluster you start (<code>cargo run --release -p animus-bench -- --help</code>). If it launches the cluster on the same machine it will say <code>publishable: false</code>, and you should read that as meaning it: such figures measure your machine, not the database. Colocated development runs have also shown write-path stalls of a few hundred milliseconds and a roughly 21 ms floor on <code>ConsistentRead: true</code> reads; these are observations from a development machine, not results, and are being tracked as issues. <code>cargo bench -p animusd</code> is a separate, older in-process smoke — unauthenticated, closed-loop, no coordinated-omission correction — and its numbers are not comparable to the generator's.</p>
     <div class="ctalink-row">
       <a class="ctalink" href="architecture.html">How the architecture produces these costs →</a>
       <a class="ctalink" href="how-it-works.html">Back to how it works →</a>

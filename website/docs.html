@@ -230,7 +230,7 @@
       </p>
       <div class="table-scroll">
         <table>
-          <thead><tr><th style="width:220px">Surface</th><th>Guarantee</th></tr></thead>
+          <thead><tr><th class="w-220">Surface</th><th>Guarantee</th></tr></thead>
           <tbody>
             <tr><td>Item reads and writes</td><td>Linearizable</td></tr>
             <tr><td>Query and Scan within a tablet</td><td>Linearizable</td></tr>
@@ -376,7 +376,7 @@
       <h3>DynamoDB operations</h3>
       <div class="table-scroll">
         <table>
-          <thead><tr><th style="width:280px">Operation</th><th style="width:120px">Status</th><th>Notes</th></tr></thead>
+          <thead><tr><th class="w-280">Operation</th><th class="w-120">Status</th><th>Notes</th></tr></thead>
           <tbody>
             <tr><td><code>CreateTable</code></td><td><span class="pill yes">Yes</span></td><td>Partition and sort keys, GSIs and LSIs at creation, plus <code>BillingMode</code>/<code>ProvisionedThroughput</code></td></tr>
             <tr><td><code>DescribeTable</code></td><td><span class="pill yes">Yes</span></td><td>Includes index status, stream configuration, and billing mode/throughput</td></tr>
@@ -516,7 +516,7 @@
       <h2>Deployment shapes</h2>
       <div class="table-scroll">
         <table>
-          <thead><tr><th style="width:190px">Shape</th><th>What it is</th><th style="width:200px">Command</th></tr></thead>
+          <thead><tr><th class="w-190">Shape</th><th>What it is</th><th class="w-200">Command</th></tr></thead>
           <tbody>
             <tr><td><strong>Combined</strong></td><td>Every node runs both planes. The default, and the right choice for small and medium clusters.</td><td><code>animusd --config … --node I</code></td></tr>
             <tr><td><strong>Control-only</strong></td><td>A small metadata quorum with no storage engine and no client endpoints.</td><td><code>animusd control --config … --node I</code></td></tr>
@@ -726,7 +726,7 @@
         record — the context, the decision, and the consequences knowingly accepted. They are the
         real documentation for how the internals work, and they are kept current with the code.
       </p>
-      <div class="btn-row" style="margin-top:20px">
+      <div class="btn-row mt-20">
         <a class="btn primary" href="https://github.com/animus-db/animus-db/blob/main/docs/adr/README.md">Architecture decision records</a>
         <a class="btn" href="https://github.com/animus-db/animus-db">Source on GitHub</a>
         <a class="btn" href="https://github.com/animus-db/animus-db/blob/main/CONTRIBUTING.md">Contributing</a>
