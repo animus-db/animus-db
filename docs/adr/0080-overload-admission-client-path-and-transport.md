@@ -1,6 +1,6 @@
 # ADR 0080 — Overload admission on the client path and the transport: group-aware admission, a propose bound, bounded queues, a node memory budget
 
-- **Status:** Proposed (2026-10-15). Docs only: no implementation code lands with this ADR. Defaults are **provisional** until the calibration step of the implementation plan.
+- **Status:** Accepted (2026-10-17): maintainer accepted all 12 recommendations in "Open questions" (each is resolved to its recommendation below). Proposed 2026-10-15. Defaults are **provisional** until the calibration step of the implementation plan, which records the numbers in an as-built amendment.
 - **Date:** 2026-10-15
 - **Origin:** issue #1296 (companion to #1295 / ADR 0079); the two follow-ups PR #1317 (issue #1304) left open; ADR 0074 section 2 ("every queue is bounded"); maintainer order "ADR first, code after".
 - **Amends:** none. **Depends on:** ADR 0003 (determinism), ADR 0009 (control-plane Raft, 2026-10-14 pipelining amendment), ADR 0016/0017 (CP data plane), ADR 0026 (stream addressing, inbox cap), ADR 0044/0048 (quiescence, heartbeat batching), ADR 0055 (replica-local reads), ADR 0065 (per-table throttling), ADR 0073 (upgrade compatibility), ADR 0074 (exit criteria), ADR 0078 (campaign governor, `LoadMonitor`), ADR 0079 (awake cap, permit pools, shared `lag -> factor` helper).
@@ -193,17 +193,29 @@ One implementation PR on one branch (repo operating mode), ordered commits, each
 
 The docs-drift fix (Open question 11) is a separate small PR and does not gate this one.
 
-## Open questions for the maintainer
+## Open questions (all resolved 2026-10-17: the maintainer accepted every recommendation)
 
 1. **Which code for a `Busy` / per-group refusal: 503 `ServiceUnavailable` for everything, or 400 `ThrottlingException` for group-level conditions?** Recommended: `ThrottlingException` for `Busy` and the per-group cap (a hot group is a caller-rate signal and lets adaptive SDK retry slow down), `ServiceUnavailable` for the node gate, leaderless and forwarded gates (the server's condition, visible to the 5xx-ratio alert), `ThrottlingError` as the transaction reason. The cost is that group-level overload is invisible to the 5xx alert, so the shed counters join it.
+   - **Resolved 2026-10-17: the recommendation is accepted.**
 2. **Are the provisional defaults acceptable as starting points** (backlog 512 entries / 4 MiB per group, `leaderless_wait` 2 s, `group_inflight_max` 256, `max_forwarded_inflight` 4096, `B` 256 MiB)? Recommended: yes, to be replaced by the calibration step; they are single-run-derived and flagged as such.
+   - **Resolved 2026-10-17: the recommendation is accepted.**
 3. **`ProposeResult::Busy` variant, or a pre-propose check?** Recommended: the variant. Atomic under the `core` lock; the compiler plus a grep audit find the 213 sites; the pre-check overshoots under concurrency.
+   - **Resolved 2026-10-17: the recommendation is accepted.**
 4. **Refuse a write that would wake a quiesced group when lag >= 100 ms and `awake >= A_eff`?** Recommended: yes, only in that regime; it is the refusal path ADR 0079 said it lacked, and below it the cap stays soft so a quiesced tablet is never made unwritable by ordinary load. The risk is a tablet unwritable for the duration of a severe lag episode, bounded by recovery.
+   - **Resolved 2026-10-17: the recommendation is accepted.**
 5. **Replace task-per-frame with a per-peer outbox now, or ship only a global cap on in-flight send tasks first?** Recommended: the outbox, in one PR with a commit order that lands the simple cap first. The cap alone fixes memory but not priority, and heartbeat starvation is the failure ADR 0078 cares about.
+   - **Resolved 2026-10-17: the recommendation is accepted.**
 6. **A second TCP connection per peer for the `Bulk` class?** Recommended: yes. Class L, one extra socket per peer, removes head-of-line blocking of votes behind a stuck snapshot write.
+   - **Resolved 2026-10-17: the recommendation is accepted.**
 7. **Memory budget on by default at a fixed 256 MiB, or off unless configured (as the awake cap needs `--cores`)?** Recommended: on by default; the operator derives 25 % of the memory limit. A bound that exists only when configured does not meet ADR 0074's "every queue is bounded".
+   - **Resolved 2026-10-17: the recommendation is accepted.**
 8. **Should `QueuedBytes` charge `LsmEngine` memtable and compaction buffers?** Recommended: no, here. Size the pod for `floor + B + working set` (floor 0.4-0.55 GB, measured) and leave engine memory policy to the storage ADR (#1300).
+   - **Resolved 2026-10-17: the recommendation is accepted.**
 9. **HTTP listener `header_read_timeout` 10 s and `keepalive_idle_timeout` 120 s?** Recommended: yes. Provisional; confirm against the AWS SDK pool idle defaults before fixing.
+   - **Resolved 2026-10-17: the recommendation is accepted.**
 10. **String refusal convention or a typed `Retry-After` on the forwarded hop?** Recommended: the string convention now (class L, no Gate). Revisit with a typed field and `Gate` at cluster version 6 only if a third refusal kind needs structure.
+   - **Resolved 2026-10-17: the recommendation is accepted.**
 11. **Fix the documentation drift in a separate docs PR** (`docs/production-readiness.md` D-4, D-5, D-6, D-8, `docs/runbook/overload-and-throttling.md`, roadmap R-01(d) items #1220/#1221)? Recommended: yes, before implementation step 7, so the as-built note edits a true baseline.
+   - **Resolved 2026-10-17: the recommendation is accepted.**
 12. **Client-listener frame cap 16 MiB (finding 4.4), and defer 4.3 (scan byte pushdown) to its own PR?** Recommended: yes to both; 4.3 adds a request field and needs its own classification.
+   - **Resolved 2026-10-17: the recommendation is accepted.**
