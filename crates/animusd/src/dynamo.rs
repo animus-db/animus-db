@@ -619,7 +619,13 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
         // the work (`dispatch`), not the response write. (Pipelining is
         // bounded per connection by construction: this loop reads, runs and
         // answers one request before reading the next.)
-        let Some(inflight) = ctx.overload.inflight.try_acquire() else {
+        // ADR 0080 2a: the gate's effective size follows the node's scheduling
+        // lag (half at 30 ms, a quarter at 100 ms, floor 256).
+        let gate_cap = ctx
+            .overload
+            .admission
+            .node_gate(ctx.overload.limits.max_inflight_requests);
+        let Some(inflight) = ctx.overload.inflight.try_acquire_capped(gate_cap) else {
             ctx.overload.metrics.incr(Metric::OverloadShedAdmission);
             let err = WireError::service_unavailable(
                 "the node is at its in-flight request limit (max_inflight_requests); retry",
@@ -1509,7 +1515,7 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
                             }
                         }
                         Ok(None) => {}
-                        Err(e) if e.code == "ProvisionedThroughputExceededException" => {
+                        Err(e) if is_unprocessed_throttle(&e) => {
                             unprocessed.push((req.table.clone(), key.clone()));
                         }
                         Err(e) => return Err(e),
@@ -1864,7 +1870,7 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
                     for (key, result) in keys.into_iter().zip(results) {
                         match result {
                             Ok(_) => {}
-                            Err(e) if e.code == "ProvisionedThroughputExceededException" => {
+                            Err(e) if is_unprocessed_throttle(&e) => {
                                 if let Some(req) = by_key.get(&key) {
                                     unprocessed.push((table.clone(), req.clone()));
                                 }
@@ -5920,9 +5926,16 @@ async fn run_transact<E: Env, R: RelayClient>(
                     let reasons = cancellation_reasons_for(actions, index, reason);
                     Err(WireError::transaction_canceled_with_reasons(reasons))
                 }
-                None => Err(WireError::transaction_canceled(format!(
-                    "transaction cancelled: {e}"
-                ))),
+                // ADR 0080 2b: a leaderless tablet is the server's condition,
+                // a retryable 503 (never a cancellation of the transaction).
+                None => match &e {
+                    crate::TxnAbortReason::Other(m) if decide::is_no_leader_refusal(m) => {
+                        Err(WireError::service_unavailable(m.clone()))
+                    }
+                    _ => Err(WireError::transaction_canceled(format!(
+                        "transaction cancelled: {e}"
+                    ))),
+                },
             }
         }
     }
@@ -10449,7 +10462,7 @@ pub(crate) async fn marker_batch_write_raw<E: Env, R: RelayClient>(
         let keys: Vec<Vec<u8>> = writes.iter().map(|(_, k, _)| k.clone()).collect();
         match ctx.cp_kind_write_raw(table, writes, markers).await {
             Ok(()) => {}
-            Err(e) if e == THROTTLE_WRITE_REFUSAL => {
+            Err(e) if e == THROTTLE_WRITE_REFUSAL || decide::is_busy_refusal(&e) => {
                 unprocessed.extend(keys);
             }
             Err(e) => return Err(e),
@@ -11030,6 +11043,13 @@ pub(crate) fn map_overload(err: WireError) -> WireError {
         return WireError::throttling(err.message);
     }
     err
+}
+
+/// Whether a per-item batch error is a throttle the client should resubmit
+/// (ADR 0065 provisioned throughput, or ADR 0080's `Busy`): the item goes to
+/// `UnprocessedItems` / `UnprocessedKeys` rather than failing the whole call.
+fn is_unprocessed_throttle(e: &WireError) -> bool {
+    e.code == "ProvisionedThroughputExceededException" || e.code == "ThrottlingException"
 }
 
 /// Whether `message` is the forwarded-request gate's refusal (a node

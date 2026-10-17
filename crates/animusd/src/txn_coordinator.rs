@@ -302,6 +302,13 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         // (its own bounded-retry wrapper is `txn_prepare_pushing`, which
         // re-invokes this method fresh on each attempt), so the deadline
         // is minted once, here, at the top.
+        // ADR 0080 2c: one slot on the first key's tablet for this stage attempt.
+        let _group = self
+            .group_permit(table, &first)
+            .map_err(|_| TxnAbortReason::Throttled {
+                table: table.to_owned(),
+                key: first.clone(),
+            })?;
         let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
         match self.cp_route(table, &first, deadline).await {
             CpRoute::Local(leader) => {
@@ -357,9 +364,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             // `ClientRequestToken`'s idempotency record is never recorded
             // `CANCELLED` off this alone (ADR 0018's issue #298 "deep shape
             // A" amendment).
-            CpRoute::None => Err(TxnAbortReason::Other(
-                "no CP group leader reachable for txn prepare; retry".into(),
-            )),
+            CpRoute::None => Err(TxnAbortReason::Other(self.no_leader_message(table, &first))),
         }
     }
 

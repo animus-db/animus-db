@@ -23353,6 +23353,10 @@ mod sim_cluster_zone_placement;
 /// (`ANIMUS_MRSC_SEEDS`) — see that module's own doc.
 #[cfg(test)]
 mod sim_cluster_mrsc;
+/// ADR 0080 Tier 2: overload admission over `SimCluster` and the DynamoDB wire
+/// (leaderless fast-fail, the `Busy` propose bound, the error vocabulary).
+#[cfg(test)]
+mod sim_cluster_overload;
 
 /// A first deterministic smoke over `SimClusterHandle::dynamo`/`SimCluster::
 /// dynamo` (ADR 0061 rung D2 PR 1) — the DynamoDB wire edge, decoded by

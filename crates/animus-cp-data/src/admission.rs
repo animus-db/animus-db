@@ -50,6 +50,8 @@ pub const MIN_BACKLOG_ENTRIES: u64 = 8;
 pub const MIN_BACKLOG_BYTES: u64 = 256 << 10;
 /// The `Internal` class is bounded at this multiple of the limit.
 pub const INTERNAL_MULTIPLIER: u64 = 2;
+/// The lag-scaled node gate's floor (ADR 0080 section 2a).
+pub const NODE_GATE_FLOOR: usize = 256;
 
 /// How a command is admitted at the propose bound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -355,6 +357,19 @@ impl NodeAdmission {
         }
     }
 
+    /// The node gate's effective size (ADR 0080 section 2a): `configured`
+    /// scaled by the same lag rule as `K_eff`/`A_eff` (half at 30 ms, a quarter
+    /// at 100 ms) and never below [`NODE_GATE_FLOOR`] (or `configured` itself
+    /// when that is smaller). `0` stays `0` (gate off is not a thing here: the
+    /// caller never passes it).
+    #[must_use]
+    pub fn node_gate(&self, configured: usize) -> usize {
+        if configured == 0 {
+            return 0;
+        }
+        scale_by_lag(configured, self.effective_lag()).max(NODE_GATE_FLOOR.min(configured))
+    }
+
     /// Decide whether a command of `class` and `new_bytes` may be appended to
     /// a group whose backlog is `entries` / `bytes`. Pure.
     pub fn verdict(
@@ -513,6 +528,27 @@ mod tests {
 
     fn charge(a: &NodeAdmission, n: u64) -> Reservation {
         a.reserve(AdmissionClass::Client, n).expect("budget")
+    }
+
+    #[test]
+    fn the_node_gate_follows_the_lag_steps_and_keeps_its_floor() {
+        let a = adm(BacklogLimits::default(), 0);
+        assert_eq!(a.node_gate(2048), 2048);
+        a.set_lag(30 * MS);
+        assert_eq!(a.node_gate(2048), 1024);
+        a.set_lag(100 * MS);
+        assert_eq!(a.node_gate(2048), 512);
+        a.set_lag(10_000 * MS);
+        assert!(a.node_gate(2048) >= NODE_GATE_FLOOR);
+        // A configured gate below the floor is not raised above itself.
+        assert_eq!(a.node_gate(100), 100);
+    }
+
+    #[test]
+    fn the_budget_soft_watermark_shrinks_the_node_gate_one_step() {
+        let a = adm(BacklogLimits::default(), 1000);
+        let _hold = a.budget().force_reserve(700);
+        assert_eq!(a.node_gate(2048), 1024, "as if lag were 30 ms");
     }
 
     #[test]

@@ -158,15 +158,17 @@ enum Cell {
     StalledFollower,
     PartitionHeal,
     TxnStageRefusedResolveAdmitted,
+    QuiescedHotWake,
 }
 
 impl Cell {
-    const ALL: [Cell; 5] = [
+    const ALL: [Cell; 6] = [
         Cell::SteadyOverload,
         Cell::LeaderKill,
         Cell::StalledFollower,
         Cell::PartitionHeal,
         Cell::TxnStageRefusedResolveAdmitted,
+        Cell::QuiescedHotWake,
     ];
 
     fn name(self) -> &'static str {
@@ -176,6 +178,7 @@ impl Cell {
             Cell::StalledFollower => "c3_overload_stalled_follower",
             Cell::PartitionHeal => "c4_overload_partition_heal",
             Cell::TxnStageRefusedResolveAdmitted => "c8_txn_stage_refused_resolve_admitted",
+            Cell::QuiescedHotWake => "c7_quiesced_hot_wake_under_lag",
         }
     }
 
@@ -204,6 +207,9 @@ enum Control {
     BusyOnLiveness,
     /// (c) a `Busy` is recorded as `Accepted` by the client.
     BusyAsAccepted,
+    /// (h) the cold-wake refusal is off: a write to a quiesced group in the
+    /// severe-lag regime wakes it (the old soft cap).
+    NoColdWakeRefusal,
     /// (g) a `Busy` surfaces as a terminal (500-class) error: the old `other =>`
     /// arm of the write loops.
     BusyTerminal,
@@ -546,6 +552,7 @@ fn run_cell(cell: Cell, seed: u64, ctl: Control) -> Vec<String> {
             }
         }),
         Cell::TxnStageRefusedResolveAdmitted => return run_txn_cell(&mut rig, seed, ctl, l0),
+        Cell::QuiescedHotWake => return run_cold_wake_cell(seed, ctl),
     }
     t.applied_at_end = applied_now(&rig, &t);
     check(cell, &mut rig, seed, &t, capacity_of(seed))
@@ -646,6 +653,145 @@ fn run_txn_cell(rig: &mut Rig, seed: u64, ctl: Control, l0: usize) -> Vec<String
     v
 }
 
+/// Cell 7: three groups per node share one `AwakeAdmission` (`A` = 2) and one
+/// `NodeAdmission`; two are written to (awake), one idles into quiescence. In
+/// the severe-lag regime (`lag >= 100 ms`) with the awake set at `A_eff`, a
+/// write that would wake the cold group is refused with `Busy` while the hot
+/// groups are still served; when the lag recovers the cold group wakes and
+/// accepts the write. Below the regime nothing is refused (the cap stays soft).
+fn run_cold_wake_cell(seed: u64, ctl: Control) -> Vec<String> {
+    use animus_cp_data::awake_admission::AwakeAdmission;
+    let mut v = Vec::new();
+    let sim = Simulator::new(seed);
+    let voters: Vec<_> = NODES.iter().copied().map(nid).collect();
+    let awake: Vec<AwakeAdmission> = NODES
+        .iter()
+        .map(|_| AwakeAdmission::new(2, MetricsHandle::recording()))
+        .collect();
+    let adms: Vec<NodeAdmission> = NODES
+        .iter()
+        .map(|_| {
+            NodeAdmission::new(
+                BacklogLimits {
+                    max_entries: BOUND_ENTRIES,
+                    max_bytes: BOUND_BYTES,
+                },
+                QueuedBytes::new(0),
+                MetricsHandle::recording(),
+            )
+        })
+        .collect();
+    // groups[g][n]: group g (stream 1..=3) on node n.
+    let groups: Vec<Vec<KvNode>> = (1..=3u64)
+        .map(|stream| {
+            NODES
+                .iter()
+                .enumerate()
+                .map(|(n, &id)| {
+                    RaftKvNode::start_hosted_with_options(
+                        sim.env(nid(id)),
+                        voters.clone(),
+                        ApplyEngine {
+                            inner: MemoryEngine::new(),
+                            env: sim.env(nid(id)),
+                            per_op: Duration::ZERO,
+                        },
+                        StorageScope::whole(),
+                        stream,
+                        HostedOptions {
+                            backpressure: ElectionBackpressure {
+                                admission: Some(adms[n].clone()),
+                                awake: (ctl != Control::NoColdWakeRefusal)
+                                    .then(|| awake[n].clone()),
+                                ..ElectionBackpressure::default()
+                            },
+                            ..HostedOptions::default()
+                        },
+                    )
+                })
+                .collect()
+        })
+        .collect();
+    let mut sim = sim;
+    sim.run_for(Duration::from_secs(5));
+    let leader_of = |g: &[KvNode]| g.iter().position(KvNode::is_leader);
+    let (Some(l0), Some(l1), Some(l2)) = (
+        leader_of(&groups[0]),
+        leader_of(&groups[1]),
+        leader_of(&groups[2]),
+    ) else {
+        return vec!["setup: a group has no leader".into()];
+    };
+    // Group 3 idles into quiescence; groups 1 and 2 stay warm.
+    for g in &groups {
+        for n in g {
+            n.enable_quiescence(Duration::from_secs(2));
+        }
+    }
+    for i in 0..60 {
+        for (gi, l) in [(0, l0), (1, l1)] {
+            let _ = groups[gi][l].put(format!("warm-{i}").into_bytes(), vec![1]);
+        }
+        sim.run_for(Duration::from_millis(100));
+    }
+    if !groups[2][l2].is_quiesced() {
+        return vec!["setup: the cold group did not quiesce".into()];
+    }
+    let set_lag = |ms: u64| {
+        for n in 0..NODES.len() {
+            awake[n].set_lag(ms * 1_000_000);
+            adms[n].set_lag(ms * 1_000_000);
+        }
+    };
+    // Soft below the regime: a 30 ms lag never refuses a cold write.
+    set_lag(30);
+    let soft = groups[2][l2].put(b"cold-soft".to_vec(), vec![1]);
+    if !matches!(soft, ProposeResult::Accepted { .. }) {
+        v.push(format!(
+            "soft: a cold write was refused at 30 ms lag: {soft:?}"
+        ));
+    }
+    // Re-quiesce (the warm groups keep taking writes), then enter the severe
+    // regime.
+    for i in 0..60 {
+        for (gi, l) in [(0, l0), (1, l1)] {
+            let _ = groups[gi][l].put(format!("warm2-{i}").into_bytes(), vec![1]);
+        }
+        sim.run_for(Duration::from_millis(100));
+    }
+    if !groups[2][l2].is_quiesced() {
+        return vec!["setup: the cold group did not re-quiesce".into()];
+    }
+    set_lag(100);
+    let cold = groups[2][l2].put(b"cold-1".to_vec(), vec![1]);
+    if !matches!(cold, ProposeResult::Busy { .. }) {
+        v.push(format!(
+            "cold-wake: a cold write was admitted at 100 ms lag: {cold:?}"
+        ));
+    }
+    let hot = groups[0][l0].put(b"hot-1".to_vec(), vec![1]);
+    if !matches!(hot, ProposeResult::Accepted { .. }) {
+        v.push(format!(
+            "cold-wake: a write to an awake group was refused: {hot:?}"
+        ));
+    }
+    if matches!(cold, ProposeResult::Busy { .. })
+        && block_on(groups[2][l2].local_get(b"cold-1")).is_some()
+    {
+        v.push("refused-absent: the refused cold write is present".into());
+    }
+    // Recovery.
+    set_lag(0);
+    sim.run_for(Duration::from_secs(1));
+    let after = groups[2][l2].put(b"cold-2".to_vec(), vec![1]);
+    if !matches!(after, ProposeResult::Accepted { .. }) {
+        v.push(format!(
+            "recovery: the cold write is still refused after the lag cleared: {after:?}"
+        ));
+    }
+    v
+}
+
 fn real(cell: Cell) {
     if !cell_selected(cell) {
         return;
@@ -698,9 +844,14 @@ fn overload_c8_txn_stage_refused_resolve_admitted() {
 }
 
 #[test]
+fn overload_c7_quiesced_hot_wake_under_lag() {
+    real(Cell::QuiescedHotWake);
+}
+
+#[test]
 fn overload_cells_are_all_listed() {
     // A new cell must be added to ALL and to a #[test] above.
-    assert_eq!(Cell::ALL.len(), 5);
+    assert_eq!(Cell::ALL.len(), 6);
 }
 
 #[test]
@@ -732,5 +883,14 @@ fn overload_control_g_busy_as_terminal_error_is_caught() {
         Cell::SteadyOverload,
         Control::BusyTerminal,
         "no-terminal-busy:",
+    );
+}
+
+#[test]
+fn overload_control_h_without_the_cold_wake_refusal_a_cold_group_wakes() {
+    control(
+        Cell::QuiescedHotWake,
+        Control::NoColdWakeRefusal,
+        "cold-wake:",
     );
 }

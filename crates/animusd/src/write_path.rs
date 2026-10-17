@@ -154,6 +154,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         // Whether this write may be safely re-applied; see the retry decision
         // at the bottom of the loop.
         let idempotent = dynamo::kind_write_is_idempotent(&op);
+        // ADR 0080 2c: one slot on this tablet for the request's whole park.
+        let _group = self
+            .group_permit(table, &base_key)
+            .map_err(|e| dynamo::map_overload(dynamo::internal(&e)))?;
         let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
         loop {
             let err = match self.cp_route(table, &base_key, deadline).await {
@@ -217,7 +221,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         }
                     }
                 }
-                CpRoute::None => dynamo::internal("no CP group leader reachable"),
+                CpRoute::None => dynamo::internal(&self.no_leader_message(table, &base_key)),
             };
             // **At-most-once for a non-idempotent write.** This loop re-enters
             // `kind_write_item_at_leader`, which re-reads the old image and
@@ -328,6 +332,14 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             return items.iter().map(|_| Err(err.clone())).collect();
         }
         let first_key = dynamo::item_key(&items[0].pk, items[0].sk.as_ref());
+        // ADR 0080 2c: one slot on this tablet for the request's whole park.
+        let _group = match self.group_permit(table, &first_key) {
+            Ok(g) => g,
+            Err(e) => {
+                let err = dynamo::map_overload(dynamo::internal(&e));
+                return items.iter().map(|_| Err(err.clone())).collect();
+            }
+        };
         let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
         loop {
             let err = match self.cp_route(table, &first_key, deadline).await {
@@ -369,7 +381,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         )),
                     }
                 }
-                CpRoute::None => dynamo::internal("no CP group leader reachable"),
+                CpRoute::None => dynamo::internal(&self.no_leader_message(table, &first_key)),
             };
             if !decide::read_should_retry(&err.message)
                 || decide::is_storage_full_refusal(&err.message)
@@ -633,7 +645,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         Err(e) => e,
                     }
                 }
-                CpRoute::None => "no CP group leader reachable".to_string(),
+                CpRoute::None => self.no_leader_message(table, &first),
             };
             if !decide::read_should_retry(&err)
                 || decide::is_storage_full_refusal(&err)

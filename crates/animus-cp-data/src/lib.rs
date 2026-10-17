@@ -2851,6 +2851,9 @@ pub struct RaftKvNode<E: Env, S: StorageEngine> {
     /// backlog bound and the `QueuedBytes` budget); `None` = unbounded, the
     /// pre-ADR behaviour. The group's byte ring lives on `applied_watch`.
     admission: Option<admission::NodeAdmission>,
+    /// ADR 0080 (quiesced groups): the node's awake admission and this
+    /// group's stream, read by `gated_propose` for the cold-wake refusal.
+    awake_cold: Option<(AwakeAdmission, u64)>,
 }
 
 /// A bounded, in-process ring of every distinct value of `T` a
@@ -3491,6 +3494,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             compact_tuning: Arc::clone(&compact_tuning),
             features: features.clone(),
             admission: backpressure.admission.clone(),
+            awake_cold: backpressure.awake.clone().map(|a| (a, stream)),
         };
         // The consensus loop recovers from the WAL, then spawns the apply task
         // (so the apply task sees the recovered core + the correct
@@ -3845,6 +3849,22 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         let new_bytes = command.approx_bytes();
         let applied = self.engine_applied.load(Ordering::SeqCst);
         let entries = core.last_log_index().saturating_sub(applied);
+        // Quiesced groups (ADR 0080 / 0079): in the severe-lag regime with the
+        // awake population at `A_eff`, a client write that would wake a
+        // quiesced group is refused so the working set keeps being served.
+        if class == admission::AdmissionClass::Client
+            && core.is_quiesced()
+            && self
+                .awake_cold
+                .as_ref()
+                .is_some_and(|(a, stream)| a.cold_wake_refuses(*stream))
+        {
+            self.metrics.incr(Metric::OverloadShedColdWake);
+            return ProposeResult::Busy {
+                backlog_entries: entries,
+                backlog_bytes: self.applied_watch.backlog_bytes(),
+            };
+        }
         self.applied_watch.with_backlog(|ring| {
             ring.trim(applied);
             let bytes = ring.bytes();
