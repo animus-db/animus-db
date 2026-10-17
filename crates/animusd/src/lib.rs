@@ -5615,6 +5615,10 @@ fn spawn_common_tail(
     // (ADR 0073 Phase 2, P2-C); cloned before `edge` moves into the ctx.
     let relay_features = edge.version().features.clone();
     let overload_metrics = env.metrics();
+    // ADR 0080 section 4: the transport's outboxes charge the same node
+    // `QueuedBytes` budget the propose bound and the edge do.
+    let overload_state = overload::OverloadState::new(overload_limits, overload_metrics);
+    env.set_queued_bytes(overload_state.admission.budget().clone());
     let export_store_factory = Arc::new(Mutex::new(default_export_store_factory(
         export_s3,
         env.clone(),
@@ -5654,7 +5658,7 @@ fn spawn_common_tail(
         any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(
             initial_any_table_throughput,
         )),
-        overload: overload::OverloadState::new(overload_limits, overload_metrics),
+        overload: overload_state,
     };
     // ADR 0066 §1 (S-02 step 3): seed the lock-free "any catalog
     // credentials" fast path from whatever this node's control handle

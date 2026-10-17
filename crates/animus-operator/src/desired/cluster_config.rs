@@ -97,6 +97,29 @@ pub struct RoleAddrs {
     /// unchanged, byte-for-byte pre-S-03-PR-3 behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption_key_path: Option<String>,
+    /// Mirrors `animusd::config::NodeEntry::overload`'s JSON shape (ADR 0080
+    /// section 4): only the node `QueuedBytes` budget is ever rendered, derived
+    /// from the pod memory limit ([`derive_queued_bytes_budget`]). `None` (no
+    /// memory limit) leaves the node default (256 MiB).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overload: Option<OverloadMirror>,
+}
+
+/// The slice of `animusd::config::OverloadSection` the operator renders.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverloadMirror {
+    pub queued_bytes_budget: u64,
+}
+
+/// The node `QueuedBytes` budget a pod's memory **limit** earns (ADR 0080
+/// section 4): 25 % of the limit, so the queues' worst case (budget plus the
+/// stated allowance) stays well inside the container's OOM line. `None` when
+/// the spec sets no parseable memory limit (the node keeps its 256 MiB
+/// default; the ADR 0079 request-derived `max_replicas` is a separate budget).
+#[must_use]
+pub fn derive_queued_bytes_budget(spec: &AnimusClusterSpec) -> Option<u64> {
+    let limit = spec.resources.as_ref()?.limits.as_ref()?.get("memory")?;
+    memory_bytes(&limit.0).map(|b| b / 4).filter(|b| *b > 0)
 }
 
 /// Mirrors `animusd::config::ClusterSettings`'s JSON shape field-for-field
@@ -286,6 +309,10 @@ pub fn build_cluster_config(name: &str, ns: &str, spec: &AnimusClusterSpec) -> C
         .as_ref()
         .map(|_| encryption_key_mount_path());
 
+    let overload = derive_queued_bytes_budget(spec).map(|queued_bytes_budget| OverloadMirror {
+        queued_bytes_budget,
+    });
+
     let nodes = (0..spec.nodes)
         .map(|i| RoleAddrs {
             id: node_id(name, i),
@@ -303,6 +330,7 @@ pub fn build_cluster_config(name: &str, ns: &str, spec: &AnimusClusterSpec) -> C
             advertise_host: Some(super::pod_fqdn(name, ns, i)),
             tls: tls.clone(),
             encryption_key_path: encryption_key_path.clone(),
+            overload: overload.clone(),
         })
         .collect();
 
@@ -1845,6 +1873,31 @@ mod tests {
         assert!(script.starts_with("#!/bin/sh\n"));
         assert!(script.contains("set -eu"));
         assert!(script.contains("HOSTNAME##*-"));
+    }
+
+    #[test]
+    fn queued_bytes_budget_is_a_quarter_of_the_memory_limit() {
+        use k8s_openapi::api::core::v1::ResourceRequirements;
+        use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+        let mut s = spec(3);
+        assert_eq!(derive_queued_bytes_budget(&s), None);
+        s.resources = Some(ResourceRequirements {
+            limits: Some([("memory".to_string(), Quantity("4Gi".to_string()))].into()),
+            ..Default::default()
+        });
+        assert_eq!(derive_queued_bytes_budget(&s), Some(1 << 30));
+        let cfg = build_cluster_config("c", "ns", &s);
+        assert!(cfg.nodes.iter().all(|n| {
+            n.overload
+                .as_ref()
+                .is_some_and(|o| o.queued_bytes_budget == 1 << 30)
+        }));
+        // Requests alone derive nothing: the budget protects the OOM line.
+        s.resources = Some(ResourceRequirements {
+            requests: Some([("memory".to_string(), Quantity("4Gi".to_string()))].into()),
+            ..Default::default()
+        });
+        assert_eq!(derive_queued_bytes_budget(&s), None);
     }
 }
 

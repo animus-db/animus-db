@@ -2351,6 +2351,16 @@ fn health<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> (u16, Value) {
         // the high-water mark and the requests deferred; plus compactions that
         // bypassed the pool at the L0 safety valve. A pool that is off reads 0.
         "bg_permits": bg_permits_json(&ctx.env.metrics()),
+        // ADR 0080 section 4, advisory only (never part of `ok`, so it can
+        // neither fail readiness nor the roll gate): the node `QueuedBytes`
+        // budget (0 = unlimited), what is charged now and its high-water mark,
+        // whether the soft watermark (70 %) is crossed, and the transport
+        // outbox's queued bytes. Refusals are the `overload_shed_*` counters.
+        "queued_bytes_budget": ctx.overload.admission.budget().budget(),
+        "queued_bytes": ctx.overload.admission.budget().used(),
+        "queued_bytes_hwm": ctx.overload.admission.budget().hwm(),
+        "queued_bytes_over_soft": ctx.overload.admission.budget().over_soft(),
+        "transport_outbox_bytes": ctx.env.metrics().get(animus_env::metrics::Metric::TransportOutboxBytes),
     });
     // 503 until the control plane has had a RECENT leader (the readiness
     // signal, hysteresis-gated per issue #595); 200 once it does (whether
