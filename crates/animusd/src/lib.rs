@@ -20152,7 +20152,11 @@ pub(crate) async fn read_frame_capped<T: DeserializeOwned, S: AsyncRead + Unpin>
     if raw_len as usize > cap.min(MAX_FRAME_LEN) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("declared frame length {raw_len} exceeds the listener cap ({cap})"),
+            format!(
+                "declared frame length {raw_len} exceeds the listener frame cap \
+                 ({} bytes; MAX_FRAME_LEN is {MAX_FRAME_LEN})",
+                cap.min(MAX_FRAME_LEN)
+            ),
         ));
     }
     let len = animus_node::codec::frame_payload_len(raw_len)?;
