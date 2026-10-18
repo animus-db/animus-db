@@ -19,5 +19,6 @@ mod lsm_scan_range_gate;
 mod lsm_semantics;
 mod lsm_wal_rotation;
 mod lsm_wal_sync_markers;
+mod lsm_write_stall;
 mod storage_basic;
 mod storage_props;

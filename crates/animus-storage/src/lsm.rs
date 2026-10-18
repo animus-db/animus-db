@@ -166,7 +166,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::ops::Bound;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -247,10 +247,13 @@ const BACKPRESSURE_OVERSHOOT_FACTOR: usize = 4;
 /// How long a backpressured writer waits between polls of the memtable size.
 /// `env.sleep` keeps this deterministic under `SimEnv`.
 const BACKPRESSURE_POLL: Duration = Duration::from_millis(1);
-/// Bound on backpressure poll iterations, in case maintenance is persistently
-/// failing (e.g. a disk that never recovers) — turns what would otherwise be
-/// an unbounded retry loop into a clean, loud error.
-const BACKPRESSURE_MAX_POLLS: u32 = 10_000;
+/// How many **consecutive** non-ENOSPC background-maintenance failures turn the
+/// backpressure gate into an error (ADR 0081 decision 3; #1338). Counted in
+/// failures, not seconds: a merely slow or busy maintenance task is waited out
+/// indefinitely (a stall below Raft may delay a committed entry but must never
+/// fail it), while a persistently failing disk still fails loudly. ENOSPC is
+/// not counted — it surfaces as [`StorageError::StorageFull`] instead.
+const BACKPRESSURE_MAX_CONSECUTIVE_FAILURES: u32 = 8;
 
 /// Tuning knobs for an [`LsmEngine`]. Defaults are sized for tests; production
 /// wiring can raise them.
@@ -710,6 +713,10 @@ pub struct LsmEngine<E: Env> {
     /// `await_backpressure` surface [`StorageError::StorageFull`] instead of a
     /// generic backend error.
     background_full: Arc<AtomicBool>,
+    /// Consecutive background-maintenance runs that failed with a non-ENOSPC
+    /// error; reset by any success or an ENOSPC failure. The backpressure gate
+    /// errors only once this reaches [`BACKPRESSURE_MAX_CONSECUTIVE_FAILURES`].
+    maintenance_consecutive_failures: Arc<AtomicU32>,
     /// How many times an inline post-write flush/compaction failed with
     /// ENOSPC and was deferred (the write itself had already succeeded).
     /// Introspection for tests.
@@ -1022,6 +1029,7 @@ impl<E: Env> LsmEngine<E> {
             maintenance_scheduled: Arc::new(AtomicBool::new(false)),
             background_error: Arc::new(Mutex::new(None)),
             background_full: Arc::new(AtomicBool::new(false)),
+            maintenance_consecutive_failures: Arc::new(AtomicU32::new(0)),
             maintenance_deferrals: Arc::new(AtomicU64::new(0)),
             compaction_gate: Arc::new(std::sync::OnceLock::new()),
             compaction_retry_scheduled: Arc::new(AtomicBool::new(false)),
@@ -1397,9 +1405,8 @@ impl<E: Env> LsmEngine<E> {
             engine
                 .compaction_retry_scheduled
                 .store(false, Ordering::Release);
-            if let Err(e) = engine.maybe_flush_and_compact().await {
-                *engine.background_error.lock().expect("poisoned") = Some(e.to_string());
-            }
+            let r = engine.maybe_flush_and_compact().await;
+            engine.record_maintenance_result(r);
         });
     }
 
@@ -1432,6 +1439,39 @@ impl<E: Env> LsmEngine<E> {
         }
     }
 
+    /// Record the outcome of a background maintenance run: the introspection
+    /// error, the ENOSPC flag, and the consecutive non-ENOSPC failure count the
+    /// backpressure gate keys on.
+    fn record_maintenance_result(&self, r: Result<()>) {
+        match r {
+            Ok(()) => {
+                self.background_full.store(false, Ordering::Release);
+                self.maintenance_consecutive_failures
+                    .store(0, Ordering::Release);
+            }
+            Err(e) => {
+                let full = e.is_storage_full();
+                self.background_full.store(full, Ordering::Release);
+                if full {
+                    self.maintenance_consecutive_failures
+                        .store(0, Ordering::Release);
+                } else {
+                    self.maintenance_consecutive_failures
+                        .fetch_add(1, Ordering::AcqRel);
+                }
+                *self.background_error.lock().expect("poisoned") = Some(e.to_string());
+            }
+        }
+    }
+
+    /// Consecutive non-ENOSPC background-maintenance failures (introspection,
+    /// tests).
+    #[must_use]
+    pub fn maintenance_consecutive_failures(&self) -> u32 {
+        self.maintenance_consecutive_failures
+            .load(Ordering::Acquire)
+    }
+
     /// If the memtable is over the flush threshold, or a compaction is due, and
     /// no maintenance task is already running, spawn one (`env.spawn_task`) to
     /// do that work off the write path. At most one maintenance task runs at a
@@ -1458,15 +1498,8 @@ impl<E: Env> LsmEngine<E> {
         }
         let engine = self.clone();
         self.env.spawn_task(async move {
-            match engine.maybe_flush_and_compact().await {
-                Ok(()) => engine.background_full.store(false, Ordering::Release),
-                Err(e) => {
-                    engine
-                        .background_full
-                        .store(e.is_storage_full(), Ordering::Release);
-                    *engine.background_error.lock().expect("poisoned") = Some(e.to_string());
-                }
-            }
+            let r = engine.maybe_flush_and_compact().await;
+            engine.record_maintenance_result(r);
             engine.maintenance_scheduled.store(false, Ordering::Release);
         });
     }
@@ -1481,19 +1514,44 @@ impl<E: Env> LsmEngine<E> {
     /// flush/compaction work itself.
     ///
     /// # Errors
-    /// Returns [`StorageError::Backend`] if the memtable is still over the cap
-    /// after [`BACKPRESSURE_MAX_POLLS`] polls — maintenance is not making
-    /// progress (e.g. a persistently failing disk; see `background_error`),
-    /// so this turns what would otherwise be an unbounded stall into a loud,
-    /// clean error.
+    /// Elapsed time alone is never an error: a slow or busy maintenance task is
+    /// waited out (#1338; a stall below Raft may delay a committed entry but
+    /// must not fail it). Returns [`StorageError::StorageFull`] when the latest
+    /// maintenance run failed for want of disk (the recoverable class; the
+    /// write is already durable and applied), and [`StorageError::Backend`]
+    /// only after [`BACKPRESSURE_MAX_CONSECUTIVE_FAILURES`] consecutive
+    /// non-ENOSPC maintenance failures.
     async fn await_backpressure(&self) -> Result<()> {
         let cap = self
             .opts
             .flush_threshold_bytes
             .saturating_mul(BACKPRESSURE_OVERSHOOT_FACTOR);
-        for _ in 0..BACKPRESSURE_MAX_POLLS {
+        loop {
             if self.lock().memtable_bytes <= cap {
                 return Ok(());
+            }
+            let failures = self
+                .maintenance_consecutive_failures
+                .load(Ordering::Acquire);
+            let last_error = || self.background_error.lock().expect("poisoned").clone();
+            // `background_full` is stale while a fresh run is in flight (space
+            // may have returned since it was set): only a *finished* run that
+            // failed for want of space is a StorageFull verdict.
+            if self.background_full.load(Ordering::Acquire)
+                && !self.maintenance_scheduled.load(Ordering::Acquire)
+            {
+                return Err(StorageError::StorageFull(format!(
+                    "write backpressure: memtable over the hard cap ({cap} bytes) and \
+                     background maintenance is out of disk space (last error: {:?})",
+                    last_error()
+                )));
+            }
+            if failures >= BACKPRESSURE_MAX_CONSECUTIVE_FAILURES {
+                return Err(StorageError::Backend(format!(
+                    "write backpressure: memtable over the hard cap ({cap} bytes) after \
+                     {failures} consecutive background maintenance failures (last error: {:?})",
+                    last_error()
+                )));
             }
             // Make sure maintenance is actually working the backlog — normally
             // the write that pushed the memtable over threshold already
@@ -1501,21 +1559,6 @@ impl<E: Env> LsmEngine<E> {
             self.trigger_background_maintenance();
             self.env.sleep(BACKPRESSURE_POLL).await;
         }
-        let last_error = self.background_error.lock().expect("poisoned").clone();
-        let msg = format!(
-            "write backpressure: memtable stayed over the hard cap ({cap} bytes) \
-             after {BACKPRESSURE_MAX_POLLS} polls — background maintenance is not \
-             keeping up (last error: {last_error:?})"
-        );
-        // Maintenance stuck on a full disk is the recoverable class: the write
-        // that waited here is already durable and applied (LWW-idempotent on a
-        // retry), and the caller should surface/pause as storage-full, not as an
-        // engine fault.
-        Err(if self.background_full.load(Ordering::Acquire) {
-            StorageError::StorageFull(msg)
-        } else {
-            StorageError::Backend(msg)
-        })
     }
 
     /// Open a reader for `file`/`meta` with the engine's shared block-read
