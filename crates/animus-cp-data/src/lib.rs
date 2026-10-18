@@ -3847,7 +3847,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         };
         let class = command.admission_class();
         let new_bytes = command.approx_bytes();
-        let applied = self.engine_applied.load(Ordering::SeqCst);
+        let applied = self.backlog_applied(core);
         let entries = core.last_log_index().saturating_sub(applied);
         // Quiesced groups (ADR 0080 / 0079): in the severe-lag regime with the
         // awake population at `A_eff`, a client write that would wake a
@@ -3917,9 +3917,35 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// Diagnostics and corpus sampling; takes the core lock briefly.
     #[must_use]
     pub fn propose_backlog(&self) -> (u64, u64) {
-        let applied = self.engine_applied.load(Ordering::SeqCst);
-        let entries = self.lock().last_log_index().saturating_sub(applied);
+        let core = self.lock();
+        let applied = self.backlog_applied(&core);
+        let entries = core.last_log_index().saturating_sub(applied);
         (entries, self.applied_watch.backlog_bytes())
+    }
+
+    /// The engine-applied index `peer` last reported to this node while it
+    /// led (`AppendEntriesResp::applied_index`, `Gate::FollowerAppliedIndex`),
+    /// or `None` if it never has this leadership stint. Diagnostics and
+    /// corpus oracles.
+    #[must_use]
+    pub fn peer_applied_index(&self, peer: &NodeId) -> Option<u64> {
+        self.lock().peer_applied(peer).map(|(a, _)| a)
+    }
+
+    /// The index the propose backlog is measured from (ADR 0080, issue #1330).
+    /// This leader's own engine-applied index, lowered to the **quorum-th
+    /// highest applied index among the voters** ([`RaftCore::quorum_applied`])
+    /// once `Gate::FollowerAppliedIndex` is open: a quorum of replicas whose
+    /// apply lags then bounds client admission exactly as the leader's own lag
+    /// does, while one slow or silent follower outside the quorum does not
+    /// move it. Gate closed (an older replica may exist, no peer reports):
+    /// exactly the leader's own applied index, as before.
+    fn backlog_applied(&self, core: &KvCore) -> u64 {
+        let own = self.engine_applied.load(Ordering::SeqCst);
+        if !self.features.is_open(Gate::FollowerAppliedIndex) || !core.is_leader() {
+            return own;
+        }
+        core.quorum_applied(own, self.env.now(), 2 * core.election_timeout())
     }
 
     fn propose_ordered<F: FnOnce(u64) -> KvCommand>(&self, build: F) -> ProposeResult {
@@ -13773,6 +13799,11 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             // it in the very same tick, before any response can go out.
             let engine_behind = engine_applied.load(Ordering::SeqCst) < c.snapshot_index();
             c.set_state_machine_behind(engine_behind);
+            // Issue #1330 (`Gate::FollowerAppliedIndex`): feed the engine-applied
+            // index live, in the same lock acquisition, so every
+            // `AppendEntriesResp` built below echoes it. Always fed; whether it
+            // reaches the wire is the frame version's (gate's) decision.
+            c.set_local_applied(engine_applied.load(Ordering::SeqCst));
             // Issue #1219 (R-01 (d), ADR 0074 §2): feed the storage-full state
             // live, like `state_machine_behind` just above. A storage-full node
             // never campaigns (`RaftCore::set_storage_full`), and a storage-full

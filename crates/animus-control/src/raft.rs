@@ -502,6 +502,10 @@ pub struct LogEntry<C = MetaCommand> {
     pub learners: Option<BTreeSet<NodeId>>,
 }
 
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
 /// Wire messages exchanged between Raft peers, generic over the command type `C`
 /// (defaults to [`MetaCommand`]). Only [`AppendEntries`](RaftMsg::AppendEntries)
 /// carries commands; `InstallSnapshot` ships the snapshot as opaque bytes.
@@ -577,6 +581,21 @@ pub enum RaftMsg<C = MetaCommand> {
         /// decodes to `false` (no pending check, the pre-existing behavior).
         #[serde(default)]
         check_pending: bool,
+        /// **Issue #1330 (`Gate::FollowerAppliedIndex`).** The responder's
+        /// own *engine-applied* index ([`RaftCore::set_local_applied`]): how
+        /// far its separate apply task has merged the log into its engine,
+        /// as opposed to `match_index` (how far its log has been appended).
+        /// The leader records it per peer and bounds client admission on
+        /// the quorum-th highest applied index
+        /// ([`RaftCore::quorum_applied`]). `0` means *unknown* (an older
+        /// peer, a gate not yet open, a control-plane core, which never
+        /// sets it), never "nothing applied": the leader treats unknown as
+        /// its own applied index. `#[serde(default)]` and skipped when `0`
+        /// so a control-plane JSON `RaftMsg` is byte-identical to before;
+        /// the data plane's binary codec carries it only in `raftkv-wire`
+        /// frame v2, selected when the gate is open.
+        #[serde(default, skip_serializing_if = "is_zero_u64")]
+        applied_index: u64,
     },
     /// One **offset-addressed chunk** of the leader's state-machine snapshot,
     /// shipped to a follower whose log has fallen behind the leader's compacted
@@ -1235,6 +1254,17 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // ABSENT means "never observed unhealthy" and is trusted. Cleared with
     // `peer_check_pending`.
     peer_recovered_at: BTreeMap<NodeId, Nanos>,
+    // Leader-only, volatile (issue #1330, `Gate::FollowerAppliedIndex`): the
+    // latest non-zero engine-applied index each peer reported on an
+    // `AppendEntriesResp`, with the `now` it arrived. ABSENT = unknown (an
+    // older peer, a gate not yet open, never reported this stint). Cleared on
+    // `become_leader` and with the peer's other bookkeeping.
+    peer_applied: BTreeMap<NodeId, (u64, Nanos)>,
+    // This node's own engine-applied index, fed live by the `DRIVER_APPLIED`
+    // driver every loop iteration (`set_local_applied`) and echoed on every
+    // `AppendEntriesResp` it builds. Stays `0` (= unknown) for the in-core
+    // control plane.
+    local_applied: u64,
     // Leader-only, volatile liveness bookkeeping (ADR 0037 hardening PR2): the
     // `now` at which this leader last heard an `AppendEntriesResp` (success OR
     // reject — either proves the peer is up and reachable) from each peer.
@@ -1842,6 +1872,8 @@ where
             match_index: BTreeMap::new(),
             snapshot_served_through: BTreeMap::new(),
             peer_check_pending: BTreeMap::new(),
+            peer_applied: BTreeMap::new(),
+            local_applied: 0,
             peer_recovered_at: BTreeMap::new(),
             last_contact: BTreeMap::new(),
             leader_since: None,
@@ -3693,13 +3725,22 @@ where
                 match_index,
                 needs_snapshot: false,
                 check_pending: false,
-                ..
+                applied_index,
             } = &msg
             && *term == self.current_term
             && *match_index <= self.match_index.get(&from).copied().unwrap_or(0)
         {
-            let (term, match_index) = (*term, *match_index);
-            let out = self.handle_append_resp(from, term, true, match_index, false, false, now);
+            let (term, match_index, applied_index) = (*term, *match_index, *applied_index);
+            let out = self.handle_append_resp(
+                from,
+                term,
+                true,
+                match_index,
+                false,
+                false,
+                applied_index,
+                now,
+            );
             if !out.is_empty() {
                 self.quiesced = false;
                 self.last_activity = now;
@@ -3837,6 +3878,7 @@ where
                 match_index,
                 needs_snapshot,
                 check_pending,
+                applied_index,
             } => self.handle_append_resp(
                 from,
                 term,
@@ -3844,6 +3886,7 @@ where
                 match_index,
                 needs_snapshot,
                 check_pending,
+                applied_index,
                 now,
             ),
             RaftMsg::InstallSnapshot {
@@ -4715,6 +4758,7 @@ where
                     match_index: 0,
                     needs_snapshot: self.state_machine_behind,
                     check_pending: self.cannot_vote_yet(),
+                    applied_index: self.local_applied,
                 },
             )];
         }
@@ -4744,6 +4788,7 @@ where
                     match_index: self.snapshot_index,
                     needs_snapshot: self.state_machine_behind,
                     check_pending: self.cannot_vote_yet(),
+                    applied_index: self.local_applied,
                 },
             )];
         }
@@ -4761,6 +4806,7 @@ where
                     match_index: 0,
                     needs_snapshot: self.state_machine_behind,
                     check_pending: self.cannot_vote_yet(),
+                    applied_index: self.local_applied,
                 },
             )];
         }
@@ -4822,6 +4868,7 @@ where
                 match_index,
                 needs_snapshot: self.state_machine_behind,
                 check_pending: self.cannot_vote_yet(),
+                applied_index: self.local_applied,
             },
         )]
     }
@@ -4835,10 +4882,17 @@ where
         match_index: u64,
         needs_snapshot: bool,
         check_pending: bool,
+        applied_index: u64,
         now: Nanos,
     ) -> Vec<Out<C>> {
         if self.role != Role::Leader || term != self.current_term {
             return Vec::new();
+        }
+        // Issue #1330: latest non-zero report wins (`0` = unknown, never
+        // "nothing applied"); a reject carries it too, so a lagging follower
+        // stays visible while it is also failing the consistency check.
+        if applied_index > 0 {
+            self.peer_applied.insert(from.clone(), (applied_index, now));
         }
         // Issue #1131: latest report wins (a reordered older ack can only
         // make a resolved check look pending again, which only delays a
@@ -5828,6 +5882,7 @@ where
         let last = self.last_log_index();
         self.peer_check_pending.clear();
         self.peer_recovered_at.clear();
+        self.peer_applied.clear();
         // ADR 0058 Train 1: seed a learner's `next_index`/`match_index`/
         // `last_contact` the identical way a voter's is seeded — a learner is
         // replicated to and tracked exactly like a follower, just never
@@ -6193,6 +6248,7 @@ where
             self.snapshot_served_through.remove(n);
             self.peer_check_pending.remove(n);
             self.peer_recovered_at.remove(n);
+            self.peer_applied.remove(n);
             self.forget_snapshot_transfer(n);
         }
         for n in old_members.difference(&now_members) {
@@ -6206,6 +6262,7 @@ where
             self.snapshot_served_through.remove(n);
             self.peer_check_pending.remove(n);
             self.peer_recovered_at.remove(n);
+            self.peer_applied.remove(n);
             self.forget_snapshot_transfer(n);
         }
     }
@@ -6231,6 +6288,7 @@ where
         self.snapshot_served_through.remove(peer);
         self.peer_check_pending.remove(peer);
         self.peer_recovered_at.remove(peer);
+        self.peer_applied.remove(peer);
         self.forget_snapshot_transfer(peer);
     }
 
@@ -7035,6 +7093,68 @@ where
     #[must_use]
     pub fn state_machine_behind(&self) -> bool {
         self.state_machine_behind
+    }
+
+    /// Feed this node's own engine-applied index (issue #1330,
+    /// `Gate::FollowerAppliedIndex`). Called by a `DRIVER_APPLIED` plane's
+    /// driver every loop iteration, in the same lock acquisition as
+    /// [`set_state_machine_behind`](Self::set_state_machine_behind); echoed
+    /// as `applied_index` on every `AppendEntriesResp` this node builds. The
+    /// in-core control plane never calls it (the field stays `0` = unknown).
+    pub fn set_local_applied(&mut self, applied: u64) {
+        self.local_applied = applied;
+    }
+
+    /// The latest engine-applied index `node` reported to this leader and
+    /// when, or `None` if it never has this stint (an older peer, a closed
+    /// gate). Raw fact; policy lives in [`quorum_applied`](Self::quorum_applied).
+    #[must_use]
+    pub fn peer_applied(&self, node: &NodeId) -> Option<(u64, Nanos)> {
+        self.peer_applied.get(node).copied()
+    }
+
+    /// The **quorum-th highest engine-applied index** among the voters
+    /// (issue #1330): the largest `a` such that a majority of voters have
+    /// applied at least `a`, capped at `own_applied`. It is the index the
+    /// leader's propose bound measures backlog from, so a single slow or dead
+    /// follower outside the quorum never moves it, while a quorum whose
+    /// members all lag does.
+    ///
+    /// A voter's value is its latest report if that report is non-zero and no
+    /// older than `fresh_within` at `now`; otherwise (never reported: an
+    /// older peer or a fresh leadership stint; silent past the window: down,
+    /// partitioned, or a quiesced group's idle follower) it counts as
+    /// `own_applied` ("unknown is as caught up as the leader", never `0`, so a
+    /// mixed-version roll, a restart or a quiesced group cannot refuse every
+    /// write). The price is a documented gap: with one voter down and the
+    /// other slow, the quorum is the slow one but the silent voter reads as
+    /// caught up, so the bound does not engage (ADR 0080's #1330 amendment).
+    /// A follower behind the leader's compacted prefix is *not* excluded: it
+    /// is repaired by `InstallSnapshot`, but until that lands its lag is real
+    /// and sustained inflow is exactly what keeps compaction chasing it.
+    /// Learners never count.
+    #[must_use]
+    pub fn quorum_applied(&self, own_applied: u64, now: Nanos, fresh_within: Duration) -> u64 {
+        let within = fresh_within.as_nanos() as u64;
+        let mut vals: Vec<u64> = self
+            .config
+            .iter()
+            .map(|n| {
+                if *n == self.id {
+                    return own_applied;
+                }
+                match self.peer_applied.get(n) {
+                    Some(&(a, at)) if now.0.saturating_sub(at.0) <= within => a,
+                    _ => own_applied,
+                }
+            })
+            .collect();
+        if vals.is_empty() {
+            return own_applied;
+        }
+        vals.sort_unstable_by(|a, b| b.cmp(a));
+        let quorum = vals.len() / 2 + 1;
+        vals[quorum - 1].min(own_applied)
     }
 
     /// Set (or clear) the needs-snapshot state (issue #554). Only ever

@@ -37,7 +37,7 @@ use crate::meta::Metadata;
 pub type ClusterVersion = u32;
 
 /// The highest cluster version this binary can run at.
-pub const MAX_SUPPORTED: ClusterVersion = 5;
+pub const MAX_SUPPORTED: ClusterVersion = 6;
 
 /// The lowest cluster version this binary can run at.
 ///
@@ -220,6 +220,15 @@ pub enum Gate {
     /// gate is open (before it every node is weight 100 with no ceiling, i.e.
     /// today's count balance), so every leader computes the same plan.
     NodeCapacity,
+    /// **Follower applied index** (ADR 0080's issue #1330 amendment): the
+    /// fifth real version gate, opening at cluster version 6. Guards
+    /// `raftkv-wire` frame v2, whose `AppendEntriesResp` carries the
+    /// follower's engine-applied index, and the leader's use of it: the
+    /// per-group propose bound also measures the backlog from the
+    /// quorum-th highest applied index. A cross-node wire shape (an older
+    /// replica rejects the longer frame), so the encoder emits v2 only once
+    /// the gate is open and the leader ignores the field while it is closed.
+    FollowerAppliedIndex,
     /// A **synthetic** version gate `n` (test/sim builds only): opens at
     /// cluster version `n`, ranks `n`. It exists so the gate *ladder*
     /// (several version gates, each opening at its own finalize) can be
@@ -245,6 +254,7 @@ impl Gate {
         Gate::MrecReplication,
         Gate::TxnSealChecked,
         Gate::NodeCapacity,
+        Gate::FollowerAppliedIndex,
     ];
 
     /// The cluster version at which this gate opens, or `None` for a gate
@@ -264,6 +274,8 @@ impl Gate {
             Gate::TxnSealChecked => Some(4),
             // ADR 0079 (per-node capacity): the fourth real version gate.
             Gate::NodeCapacity => Some(5),
+            // ADR 0080 (issue #1330): the fifth real version gate.
+            Gate::FollowerAppliedIndex => Some(6),
             #[cfg(any(test, feature = "sim-versions"))]
             Gate::Synthetic(n) => Some(n),
         }
@@ -282,6 +294,7 @@ impl Gate {
             Gate::MrecReplication => 3,
             Gate::TxnSealChecked => 4,
             Gate::NodeCapacity => 5,
+            Gate::FollowerAppliedIndex => 6,
             #[cfg(any(test, feature = "sim-versions"))]
             Gate::Synthetic(n) => {
                 if n > 1 {
@@ -561,6 +574,8 @@ mod tests {
                 Gate::TxnSealChecked => Some(4),
                 // ADR 0079: the fourth.
                 Gate::NodeCapacity => Some(5),
+                // ADR 0080 (issue #1330): the fifth.
+                Gate::FollowerAppliedIndex => Some(6),
                 // Never in `ALL` (parametric, test/sim only): see the ladder test.
                 Gate::Synthetic(_) => unreachable!("synthetic gates are not in Gate::ALL"),
             };
@@ -592,9 +607,14 @@ mod tests {
             Gate::TxnSealChecked.join(Gate::NodeCapacity),
             Gate::NodeCapacity
         );
+        assert!(seen.contains(&Gate::FollowerAppliedIndex));
         assert_eq!(
-            MAX_SUPPORTED, 5,
-            "the per-node capacity gate (ADR 0079) is the release that takes MAX to 5"
+            Gate::NodeCapacity.join(Gate::FollowerAppliedIndex),
+            Gate::FollowerAppliedIndex
+        );
+        assert_eq!(
+            MAX_SUPPORTED, 6,
+            "the follower applied-index gate (ADR 0080, #1330) is the release that takes MAX to 6"
         );
         assert_eq!(MIN_SUPPORTED, 1);
         // Declaration order is opening order: ranks are non-decreasing.

@@ -3610,3 +3610,16 @@ state is missing). Remove it with the R-1 pin once R-1 contains #1243/#1251.
   `wire_class(&KvWire)` classifies every send in `lib.rs`.
 - Corpus: `tests/it/overload_admission_corpus.rs` (`ANIMUS_OVERLOAD_SEEDS`, `ANIMUS_OVERLOAD_CELL`).
   The apply-cost model (`ApplyEngine`) is what makes a backlog form; a slow-fsync model livelocks elections.
+- Follower apply lag (issue #1330, `Gate::FollowerAppliedIndex`, cluster version 6): the propose
+  bound measures from `RaftKvNode::backlog_applied` = `RaftCore::quorum_applied` (the quorum-th
+  highest engine-applied index among the voters, capped at the leader's own) once the gate is open;
+  closed, it is the leader's own `engine_applied` as before. The follower's index rides its
+  `AppendEntriesResp.applied_index`, fed by the consensus loop's `set_local_applied` and carried only
+  by `raftkv-wire` frame v2 (`WIRE_VERSIONS`, `codec.rs`: `put_raft`/`read_raft` take the frame
+  version; v1 decodes to `0` = unknown). Unknown, never-reported and stale (> 2x election timeout)
+  voters read as caught up, so one slow/dead follower outside the quorum, a quiesced group and a
+  fresh leader never refuse writes (known gap: one voter down and the other slow does not engage the
+  bound, ADR 0080's 2026-10-18 amendment). Corpus: `tests/it/follower_apply_lag.rs`
+  (`ANIMUS_FOLLOWER_LAG_SEEDS`, `ANIMUS_FOLLOWER_LAG_CELL`); its `PacedEngine` has a per-node apply
+  pace and a stall switch, and the leader must be *fast* or its own backlog hides the effect.
+  Fixture: `tests/fixtures/formats/raftkv-wire/v2.bin`. Diagnostic: `peer_applied_index`.

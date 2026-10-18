@@ -955,6 +955,7 @@ fn sim_cluster_scale_install_snapshot_catchup() {
                     match_index: index,
                     needs_snapshot: false,
                     check_pending: false,
+                    applied_index: 0,
                 },
                 now,
                 7,

@@ -604,6 +604,16 @@ impl<E: Env> CpGroup<E> {
         }
     }
 
+    /// The applied index `peer` last reported to this group's leader
+    /// (issue #1330). Test-only.
+    #[cfg(test)]
+    fn peer_applied_index(&self, peer: &NodeId) -> Option<u64> {
+        match self {
+            CpGroup::Lsm(n) => n.peer_applied_index(peer),
+            CpGroup::Mem(n) => n.peer_applied_index(peer),
+        }
+    }
+
     /// Propose a write to the group (honored on the leader), stamping `fence`
     /// Propose a write to this group. See [`RaftKvNode::put`].
     fn put(&self, key: Vec<u8>, value: Vec<u8>) -> ProposeResult {

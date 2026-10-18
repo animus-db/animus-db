@@ -3426,3 +3426,15 @@ disables a limit. Non-obvious:
 returns the outbox class and supersede key: votes -> Vote, bare `AppendEntries` -> Heartbeat
 (superseded per group), `AppendEntries` with entries -> Replicate, `InstallSnapshot` -> Bulk.
 A new variant must pick a class. Test: `tests/it/transport_class.rs`.
+
+## `Gate::FollowerAppliedIndex`, `MAX_SUPPORTED = 6` (ADR 0080 / issue #1330, ADR 0073's 2026-10-18 amendment)
+
+- `RaftMsg::AppendEntriesResp` gained `applied_index: u64` (`0` = unknown; JSON `serde(default)` and
+  skipped at `0`, so control-plane messages and the `raft_msg_fixture` stay byte-identical). The core
+  stores `local_applied` (fed by a `DRIVER_APPLIED` driver via `set_local_applied`; the control plane
+  never calls it) and, on a leader, `peer_applied` (latest non-zero report + arrival time, cleared in
+  `become_leader` and with a peer's other bookkeeping). `quorum_applied(own, now, fresh_within)` is the
+  quorum-th highest of {self: `own`, each voter: fresh report or `own`}, capped at `own`; a lone slow,
+  silent or never-reporting voter does not move it. The data plane's `raftkv-wire` v2 is what carries
+  the field on the wire (`animus-cp-data` `codec.rs`). New `AppendEntriesResp` construction sites need
+  `applied_index: 0` (patterns want `..`). Pure tests: `tests/it/quorum_applied.rs`.

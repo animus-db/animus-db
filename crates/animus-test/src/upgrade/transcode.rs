@@ -570,7 +570,9 @@ pub static EMBEDDED: &[Embedded] = &[
     // `RaftMsg` JSON and the client frames; `OffDisk`, like `raftkv-wire`.
     emb("control-raft-msg", Carrier::OffDisk, "animus-control"),
     emb("client-frame", Carrier::OffDisk, "animus-node"),
-    emb("raftkv-wire", Carrier::OffDisk, "animus-cp-data"),
+    // v2 (issue #1330, `Gate::FollowerAppliedIndex`): `AppendEntriesResp` carries
+    // the follower's applied index. Off-disk, so no carrier transcode.
+    emb_v("raftkv-wire", Carrier::OffDisk, "animus-cp-data", 2),
     emb("raftkv-image", Carrier::OffDisk, "animus-cp-data"),
     emb(
         "cp-engine-layout",

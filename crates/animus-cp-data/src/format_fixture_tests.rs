@@ -149,6 +149,17 @@ fn raftkv_wire_decodes_every_checked_in_fixture_structurally() {
                 }
                 assert_eq!(variants.len(), 16, "all KvCommand variants: {variants:?}");
             }
+            2 => {
+                // Issue #1330, wire v2: `AppendEntriesResp` carries `applied_index`.
+                let expected = codec::tests::applied_index_sample_wires();
+                assert_eq!(frames.len(), expected.len(), "v2 frame count");
+                for (i, (frame, want)) in frames.iter().zip(&expected).enumerate() {
+                    assert_eq!((frame[0], frame[1]), (0xCB, 2), "v2 frame {i}: header");
+                    let got =
+                        codec::decode_wire(frame).unwrap_or_else(|e| panic!("v2 frame {i}: {e}"));
+                    assert_eq!(format!("{got:?}"), format!("{want:?}"), "v2 frame {i}");
+                }
+            }
             other => panic!(
                 "raftkv-wire fixture v{other} has no expected value — add one (ADR 0073 checklist step 4)"
             ),
@@ -158,6 +169,31 @@ fn raftkv_wire_decodes_every_checked_in_fixture_structurally() {
 
 #[test]
 fn raftkv_wire_round_trips_and_matches_the_fixture_bytes() {
+    // v2 (issue #1330): re-encoding under an open gate reproduces the bytes.
+    let v2 = fixture_files(&formats_dir("raftkv-wire"))
+        .into_iter()
+        .find(|(v, _)| *v == 2)
+        .expect("raftkv-wire/v2.bin is checked in")
+        .1;
+    assert_eq!(
+        v2_wire_bytes(),
+        v2,
+        "v2: the current encoder emits the fixture"
+    );
+    let re2: Vec<Vec<u8>> = unpack_frames(&v2)
+        .iter()
+        .map(|f| {
+            codec::encode_wire(
+                &codec::decode_wire(f).expect("decode"),
+                &codec::tests::features_at(6),
+            )
+        })
+        .collect();
+    assert_eq!(
+        pack_frames(&re2),
+        v2,
+        "v2: decode -> encode reproduces the fixture"
+    );
     for (version, bytes) in fixture_files(&formats_dir("raftkv-wire")) {
         if version != 1 {
             continue;
@@ -187,7 +223,7 @@ fn raftkv_wire_round_trips_and_matches_the_fixture_bytes() {
 #[test]
 fn raftkv_wire_fixture_refuses_other_versions_by_name() {
     let frame = unpack_frames(&fixture_files(&formats_dir("raftkv-wire"))[0].1).remove(0);
-    for bad in [0u8, 2, 32, 255] {
+    for bad in [0u8, 3, 32, 255] {
         let mut f = frame.clone();
         f[1] = bad;
         assert_eq!(
@@ -195,10 +231,44 @@ fn raftkv_wire_fixture_refuses_other_versions_by_name() {
             FormatError::UnsupportedFormatVersion {
                 format: "raftkv-wire",
                 found: bad,
-                max_supported: 1
+                max_supported: 2
             }
         );
     }
+}
+
+fn v2_wire_bytes() -> Vec<u8> {
+    let open = codec::tests::features_at(6);
+    let frames: Vec<Vec<u8>> = codec::tests::applied_index_sample_wires()
+        .iter()
+        .map(|w| codec::encode_wire(w, &open))
+        .collect();
+    pack_frames(&frames)
+}
+
+/// Old-input test (issue #1330): every v1 frame in the checked-in fixture
+/// decodes to `applied_index: 0` ("unknown"), so a leader receiving an old
+/// peer's ack never sees a false lag.
+#[test]
+fn v1_wire_fixture_resps_decode_as_unknown_applied_index() {
+    let v1 = &fixture_files(&formats_dir("raftkv-wire"))[0].1;
+    let mut seen = 0;
+    for frame in unpack_frames(v1) {
+        let dbg = format!("{:?}", codec::decode_wire(&frame).expect("decodes"));
+        if dbg.contains("AppendEntriesResp") {
+            seen += 1;
+            assert!(dbg.contains("applied_index: 0"), "{dbg}");
+        }
+    }
+    assert!(seen > 0, "the fixture holds an AppendEntriesResp");
+}
+
+/// `cargo test -p animus-cp-data --lib generate_fixture_raftkv_wire_v2 -- --ignored`.
+/// Refuses to overwrite an existing fixture.
+#[test]
+#[ignore]
+fn generate_fixture_raftkv_wire_v2() {
+    write_new_fixture(&formats_dir("raftkv-wire"), 2, &v2_wire_bytes());
 }
 
 fn mrec_wire_bytes() -> Vec<u8> {

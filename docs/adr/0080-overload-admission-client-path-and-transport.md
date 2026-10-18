@@ -241,3 +241,74 @@ Deviations from the text above, each the closest sound choice:
 13. **Idle/header timeouts are fixed constants** (`HEADER_READ_TIMEOUT` 10 s, `KEEPALIVE_IDLE_TIMEOUT` 120 s) rather than config knobs; the 120 s was not yet checked against every SDK's pool idle default, as question 9 required.
 
 Test map: Tier 0 in `animus-env` (`queued_bytes`, `outbox`), `animus-cp-data` (`admission`, `heartbeat_batch`, `awake_admission`), `animusd` (`overload`, `http`, `admin`); Tier 1 `animus-cp-data` `tests/it/overload_admission_corpus.rs` (`ANIMUS_OVERLOAD_SEEDS`, `ANIMUS_OVERLOAD_CELL`); Tier 2 `animusd` `sim_cluster_overload`; Tier 3 `animus-env/tests/outbox_prod.rs` and `animusd/tests/overload.rs`.
+
+## Amendment 2026-10-18 — the propose bound sees follower apply lag (issue #1330, `Gate::FollowerAppliedIndex`)
+
+**Finding (the #1296 RSS run, l1).** The per-group bound of decision 1 read only
+the leader's own `engine_applied`. With a leader that applies as fast as it
+accepts and followers whose apply task is slower (or stalled), the leader's
+backlog stays near zero, nothing is refused, and the followers' unapplied
+backlog grows without bound: unbounded log retention on disk, replay time on
+restart, and a stale follower for eventual reads. ADR 0074's "every queue is
+bounded" did not hold for this queue. No leader-local signal sees it: the leader
+only knows each follower's `match_index` (log append), and in this regime the
+cost is in apply, not append.
+
+**Decision (maintainer, "new gate").** The follower reports its engine-applied
+index on its `AppendEntriesResp` and the propose bound measures from the
+**quorum-th highest applied index**:
+
+- `AppendEntriesResp` gains `applied_index: u64` (`0` = unknown, never "nothing
+  applied"). The driver feeds `RaftCore::set_local_applied(engine_applied)` every
+  loop iteration, beside `set_state_machine_behind`; every ack a node builds
+  echoes it. On the data plane's binary wire the field exists only in
+  `raftkv-wire` frame v2, selected when `Gate::FollowerAppliedIndex` (cluster
+  version 6) is open; control-plane JSON skips it at `0`. ADR 0073's 2026-10-18
+  amendment has the class G table.
+- The leader keeps the latest non-zero report and its arrival time per voter.
+  `RaftCore::quorum_applied(own, now, fresh_within)` sorts the voters' applied
+  indexes (itself: `own`) and returns the quorum-th highest, capped at `own`;
+  `RaftKvNode::gated_propose` and `propose_backlog` use it in place of `own` for
+  `entries = last_log_index - applied`, for the byte ring's trim (so the node's
+  `QueuedBytes` charge is held until the quorum has applied) and so for the same
+  `Busy { backlog_entries, backlog_bytes }` the leader-only bound returned. The
+  check stays under the `core` lock, atomic with the append. It is skipped
+  while the gate is closed (a node that does not know the field cannot send it),
+  so below version 6 the bound is exactly the leader-only bound.
+- **Quorum-th, not the slowest.** A single slow or dead follower outside the
+  quorum must not stall writes: commit already proceeds without it. With three
+  voters the bound is the better follower's lag (or the leader's own, if that is
+  the slower), so one slow follower never moves it; the surplus is refused only
+  when a whole quorum lags. The slowest replica is therefore still not bounded by
+  admission; it is repaired by the existing retention cap and `InstallSnapshot`.
+- **Unknown reads as caught up.** A voter that never reported (an older binary, a
+  fresh leadership stint, a gate still closed on its side), or whose last report
+  is older than `2 x election_timeout`, counts as `own`. So a mixed-version roll,
+  a restart, a partition or a quiesced group (no heartbeats, hence no reports)
+  can never refuse every write. Learners never count. Reports are cleared on
+  `become_leader` and when a peer leaves the configuration.
+- Liveness class commands (2PC decisions, `ReadCeiling`, `Freeze`, `NoOp`...) are
+  still never refused: they are what drains the backlog.
+
+**Known gap (documented, not closed).** A silent voter reads as caught up, so
+with one voter down and the other slow the quorum is the slow one but the bound
+does not engage (the leader's own bound still applies). Counting a silent voter
+as `0` would close it, but would also refuse every write of a freshly woken
+quiesced group for one round trip and of a leader that just took over; a
+`awake_since` marker on the core would make that distinction and is the next
+step if the case matters in practice.
+
+**Tests.** `animus-cp-data` `tests/it/follower_apply_lag.rs` (seed-reproducible,
+`ANIMUS_FOLLOWER_LAG_SEEDS`, `ANIMUS_FOLLOWER_LAG_CELL`): a fast leader and
+followers whose apply costs 80x more, offered 4x what they can apply. Cells: both
+followers slow (quorum-th applied lag stays inside the bound plus slack, the
+surplus is `Busy`, accepted keys survive, refused keys are absent), one slow
+follower outside the quorum (no refusal), one stalled follower (no refusal), both
+stalled then resumed (bounded while stalled, drains, a fresh write is admitted
+and applied everywhere), and a leader kill under a slow quorum. Negative
+controls: `n1_gate_closed` (cluster version 5: the lag oracle fails and nothing
+is refused, the pre-fix behaviour) and `n2_one_slow_blocks` (a bound against the
+slowest follower stalls a healthy quorum). Pure: `animus-control`
+`quorum_applied::`. Wire: `codec::` v2 round trip, v1 byte identity,
+truncation, `raftkv-wire/v2.bin`. Mixed version:
+`release5_to_release6_follower_applied_gate` and its negative control.

@@ -109,6 +109,20 @@
 //!   report the capped rejection at exactly that voter, wedged and never
 //!   appended, and the capacity applied before its gate on the others.
 //!
+//! - `release5_to_release6_follower_applied_gate`: the fifth real gate (`Gate::
+//!   FollowerAppliedIndex`, cluster version 6, ADR 0080's #1330 amendment): the
+//!   follower's engine-applied index rides its `AppendEntriesResp` in
+//!   `raftkv-wire` frame v2. Under a continuous writer, below the gate (even
+//!   half-rolled to `Release(6)`, the finalize refused while a `[1,5]` node is
+//!   recorded) no tablet leader holds any follower's reported applied index
+//!   (no v2 frame was emitted: a real `Release(5)` replica would reject one);
+//!   after the finalize to 6 every follower's report reaches the leader, writes
+//!   keep being acked, and nothing is wedged;
+//! - `negative_control_follower_applied_gate_emitted_early` (N8): a follower's
+//!   hosted-group feature handle is forged open at version 5; its v2 frames
+//!   reach the leader below the gate and the "reported below the gate" oracle
+//!   MUST fire.
+//!
 //! # Not covered
 //!
 //!
@@ -190,6 +204,12 @@ enum Kind {
     NodeCapacityGate,
     /// N7: `SetNodeCapacity` emitted ungated with a Release(4) voter.
     NodeCapacityGateNegative,
+    /// Release(5) -> Release(6) over `Gate::FollowerAppliedIndex` (issue
+    /// #1330): `raftkv-wire` frame v2 carries the follower's applied index only
+    /// once the gate opens.
+    FollowerAppliedGate,
+    /// N8: a follower's feature handle forged open below the gate.
+    FollowerAppliedGateNegative,
 }
 
 /// The three ladder negative controls (ADR 0073 section 7).
@@ -286,6 +306,14 @@ fn cells() -> Vec<Cell> {
         cell(
             "negative_control_node_capacity_gate_emitted_early",
             Kind::NodeCapacityGateNegative,
+        ),
+        cell(
+            "release5_to_release6_follower_applied_gate",
+            Kind::FollowerAppliedGate,
+        ),
+        cell(
+            "negative_control_follower_applied_gate_emitted_early",
+            Kind::FollowerAppliedGateNegative,
         ),
     ]
 }
@@ -398,6 +426,8 @@ fn run(c: &Cell) -> Verdict {
         Kind::TxnSealGate => run_txn_seal_gate(c),
         Kind::NodeCapacityGate => run_node_capacity_gate(c),
         Kind::NodeCapacityGateNegative => run_node_capacity_negative(c),
+        Kind::FollowerAppliedGate => run_follower_applied_gate(c),
+        Kind::FollowerAppliedGateNegative => run_follower_applied_negative(c),
         _ => run_roll(c),
     }
 }
@@ -715,7 +745,9 @@ fn run_roll(c: &Cell) -> Verdict {
         | Kind::MrecGateNegative
         | Kind::TxnSealGate
         | Kind::NodeCapacityGate
-        | Kind::NodeCapacityGateNegative => unreachable!(),
+        | Kind::NodeCapacityGateNegative
+        | Kind::FollowerAppliedGate
+        | Kind::FollowerAppliedGateNegative => unreachable!(),
     }
 
     // Liveness: the era starts once the last node is B2, every node recorded.
@@ -2121,6 +2153,191 @@ fn run_node_capacity_negative(c: &Cell) -> Verdict {
     verdict_of(c, v, cap_fired)
 }
 
+// ---------------------------------------------------------------------------
+// The fifth real gate: `Gate::FollowerAppliedIndex` (cluster version 6, #1330)
+// ---------------------------------------------------------------------------
+
+fn roll_to_release6(cluster: &mut SimCluster, w: &mut Watch, nodes: &[u64]) {
+    for &n in nodes {
+        cluster.set_binary_profile(n, BinaryProfile::Release(6));
+        cluster.set_node_version(n, Some(VersionRange::new(1, 6)));
+        w.run(cluster, Duration::from_millis(500));
+    }
+}
+
+/// The cluster finalized at 5 (every node `Release(5)`) with one table whose
+/// tablet is hosted and led; returns the tablet.
+fn follower_applied_setup(cluster: &mut SimCluster, w: &mut Watch) -> animus_tablet::TabletId {
+    capacity_setup(cluster, w);
+    roll_to_release5(cluster, w, &[0, 1, 2, DATA]);
+    if !all_recorded_at(cluster, w, 5) {
+        w.violations
+            .push("the [1,5] records never landed on every node".into());
+    }
+    let l = control_leader(cluster);
+    let (status, body) = finalize(cluster, l, r#"{"to":5,"expected":4}"#);
+    if status != 200 {
+        w.violations
+            .push(format!("finalize 4 -> 5: {status} {body}"));
+    }
+    if !converge(cluster, |c| {
+        w.sample(c);
+        (0..NODES).all(|n| c.metadata(n).cluster_version() == 5)
+    }) {
+        w.violations
+            .push("cluster version 5 never reached on every node".into());
+    }
+    cluster.create_table("fa")
+}
+
+/// A burst of acked writes through the DynamoDB-shaped `put` path (the tablet's
+/// leader replicates each to its followers, whose acks carry the applied index
+/// once the gate allows it). Returns the number acked.
+fn follower_applied_writes(
+    cluster: &mut SimCluster,
+    w: &mut Watch,
+    round: usize,
+    n: usize,
+) -> usize {
+    let mut acked = 0;
+    for i in 0..n {
+        if cluster
+            .put(0, "fa", &format!("pk{round}-{i}"), "sk", b"v")
+            .is_ok()
+        {
+            acked += 1;
+        }
+        w.run(cluster, Duration::from_millis(20));
+    }
+    acked
+}
+
+/// Every follower of `tablet` currently reported to its leader (`None` = no
+/// leader yet).
+fn reported(cluster: &SimCluster, tablet: animus_tablet::TabletId) -> Option<Vec<Option<u64>>> {
+    cluster
+        .leader_peer_applied(tablet)
+        .map(|(_, peers)| peers.into_iter().map(|(_, a)| a).collect())
+}
+
+/// Roll `Release(5)` -> `Release(6)` under a continuous writer. Below the gate
+/// no leader holds a follower's applied index (no v2 frame was emitted, which a
+/// real `Release(5)` replica could not decode) -- including half-rolled, the
+/// finalize refused by name. After the finalize to 6 every follower's report
+/// reaches the leader, writes keep being acked, and no capped rejection or
+/// wedged control replica appears.
+fn run_follower_applied_gate(c: &Cell) -> Verdict {
+    use animus_control::version::Gate;
+    let mut cluster = light_cluster(c.seed);
+    let mut w = Watch::new(true);
+    let tablet = follower_applied_setup(&mut cluster, &mut w);
+    if (0..NODES).any(|n| cluster.features(n).is_open(Gate::FollowerAppliedIndex)) {
+        w.violations
+            .push("FollowerAppliedIndex open before the finalize".into());
+    }
+    let mut acked = follower_applied_writes(&mut cluster, &mut w, 0, 30);
+    w.run(&mut cluster, Duration::from_secs(2));
+    if reported(&cluster, tablet).is_none_or(|r| r.iter().any(Option::is_some)) {
+        w.violations.push(format!(
+            "a follower's applied index reached the leader below the gate: {:?}",
+            reported(&cluster, tablet)
+        ));
+    }
+    // Half-rolled: nodes 0, 1 and the data node are Release(6), node 2 is not.
+    roll_to_release6(&mut cluster, &mut w, &[0, 1, DATA]);
+    let leader = control_leader(&mut cluster);
+    let (status, body) = finalize(&mut cluster, leader, r#"{"to":6,"expected":5}"#);
+    if status == 200 {
+        w.violations.push(format!(
+            "a finalize to 6 was accepted with a [1,5] node: {body}"
+        ));
+    }
+    acked += follower_applied_writes(&mut cluster, &mut w, 1, 30);
+    w.run(&mut cluster, Duration::from_secs(2));
+    if reported(&cluster, tablet).is_none_or(|r| r.iter().any(Option::is_some)) {
+        w.violations.push(format!(
+            "a follower's applied index reached the leader on a half-rolled cluster: {:?}",
+            reported(&cluster, tablet)
+        ));
+    }
+    // Everyone rolls; the finalize to 6 opens the gate on every node.
+    roll_to_release6(&mut cluster, &mut w, &[OLD]);
+    if !all_recorded_at(&mut cluster, &mut w, 6) {
+        w.violations
+            .push("the [1,6] records never landed on every node".into());
+    }
+    let l = control_leader(&mut cluster);
+    let (status, body) = finalize(&mut cluster, l, r#"{"to":6,"expected":5}"#);
+    if status != 200 {
+        w.violations
+            .push(format!("finalize 5 -> 6: {status} {body}"));
+    }
+    if !converge(&mut cluster, |c| {
+        w.sample(c);
+        (0..NODES).all(|n| c.features(n).is_open(Gate::FollowerAppliedIndex))
+    }) {
+        w.violations
+            .push("FollowerAppliedIndex never opened on every node".into());
+    }
+    // Gate open: reports flow on the next acks of a live writer.
+    let mut round = 2;
+    let landed = converge(&mut cluster, |c| {
+        acked += follower_applied_writes(c, &mut w, round, 5);
+        round += 1;
+        reported(c, tablet)
+            .is_some_and(|r| !r.is_empty() && r.iter().all(|a| a.is_some_and(|a| a > 0)))
+    });
+    if !landed {
+        w.violations.push(format!(
+            "no follower report reached the leader after the gate opened: {:?}",
+            reported(&cluster, tablet)
+        ));
+    }
+    if acked < 60 {
+        w.violations
+            .push(format!("only {acked} writes were acked across the roll"));
+    }
+    w.sample(&cluster);
+    verdict_of(c, w.violations, false)
+}
+
+/// N8: a follower's hosted-group feature handle is forged open at cluster
+/// version 5 (the "stale view" negative of the ladder, here for the data plane).
+/// Its v2 frames reach the leader below the gate, so the oracle of
+/// [`run_follower_applied_gate`] ("no applied index below the gate") MUST fire;
+/// the cell reports a violation only if it does not.
+fn run_follower_applied_negative(c: &Cell) -> Verdict {
+    let mut cluster = light_cluster(c.seed);
+    let mut w = Watch::new(true);
+    let tablet = follower_applied_setup(&mut cluster, &mut w);
+    let setup = std::mem::take(&mut w.violations);
+    let mut v: Vec<String> = setup;
+    let Some((leader, peers)) = cluster.leader_peer_applied(tablet) else {
+        v.push("the tablet has no leader".into());
+        return verdict_of(c, v, false);
+    };
+    for (follower, _) in &peers {
+        for f in cluster.hosted_group_features(*follower) {
+            f.update(&animus_control::Metadata {
+                cluster_version: 6,
+                ..animus_control::Metadata::default()
+            });
+        }
+    }
+    let _ = follower_applied_writes(&mut cluster, &mut w, 0, 20);
+    w.run(&mut cluster, Duration::from_secs(2));
+    let fired = cluster
+        .leader_peer_applied(tablet)
+        .is_some_and(|(l, ps)| l == leader && ps.iter().any(|(_, a)| a.is_some_and(|a| a > 0)));
+    if !fired {
+        v.push(
+            "the forged-open follower's report never reached the leader: the oracle is blind"
+                .into(),
+        );
+    }
+    verdict_of(c, v, fired)
+}
+
 /// A Phase 1 binary joining after the era is refused at the seed's handshake
 /// (counted, never a member); the cluster is unaffected; a versioned joiner
 /// through the same seed is admitted and recorded. `via_data` dials the
@@ -2465,6 +2682,16 @@ fn sim_cluster_mixed_version_corpus_negative_control_node_capacity_gate() {
 }
 
 #[test]
+fn sim_cluster_mixed_version_corpus_follower_applied_gate() {
+    run_family("release5_to_release6_follower_applied_gate");
+}
+
+#[test]
+fn sim_cluster_mixed_version_corpus_negative_control_follower_applied_gate() {
+    run_family("negative_control_follower_applied_gate_emitted_early");
+}
+
+#[test]
 fn sim_cluster_mixed_version_cell_names_and_seeds_are_unique() {
     let cs = corpus::seed_expand(cells(), 3);
     let names: BTreeSet<_> = cs.iter().map(|c| c.name.clone()).collect();
@@ -2492,6 +2719,8 @@ fn sim_cluster_mixed_version_cell_names_and_seeds_are_unique() {
         "release3_to_release4_txn_seal_gate",
         "release4_to_release5_node_capacity_gate",
         "negative_control_node_capacity_gate_emitted_early",
+        "release5_to_release6_follower_applied_gate",
+        "negative_control_follower_applied_gate_emitted_early",
     ] {
         assert!(
             cells().iter().any(|c| c.name.starts_with(prefix)),

@@ -1255,7 +1255,7 @@ fn txn_envelope_row_transcode_registration_is_complete() {
             r.name
         );
     }
-    // Every embedded format past v1 needs a real transcode: either its
+    // Every embedded *on-disk* format past v1 needs a real transcode: either its
     // carrier's own transcode already reaches that version (a `TABLE` entry at
     // least that new), or it is a `ROW_TABLE` row. An engine-resident format
     // bumped without either would be untested by every tier.
@@ -1264,7 +1264,10 @@ fn txn_envelope_row_transcode_registration_is_complete() {
             transcode::Carrier::Table(t) => {
                 transcode::entry(t).is_some_and(|c| c.current_version >= e.current_version)
             }
-            transcode::Carrier::OffDisk => false,
+            // Never read back by a restart (a wire frame, issue #1330's
+            // `raftkv-wire` v2): the mixed-version corpus covers it, not a
+            // restart transcode.
+            transcode::Carrier::OffDisk => true,
         };
         assert!(
             carried || transcode::row_entry(e.name).is_some(),

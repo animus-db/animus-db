@@ -75,18 +75,30 @@ const MAGIC: u8 = 0xCB;
 /// by the baseline reset: every pre-baseline layout (the old history ran to
 /// `32`) was dropped. From the baseline on, an incompatible layout change is a
 /// new version with a new golden fixture, never a rewrite of `1`.
+#[cfg(test)]
 const VERSION: u8 = 1;
+/// The newest `raftkv-wire` frame version this build decodes. v2 (issue
+/// #1330, [`Gate::FollowerAppliedIndex`]) differs from v1 in exactly one
+/// place: an `AppendEntriesResp` (tag 5) carries a trailing
+/// `applied_index: u64` after its flags byte. Every other tag is byte-for-byte
+/// v1, so a v2 frame is "v1 plus that field", selected only once the gate is
+/// open (every node then decodes v2).
+const WIRE_MAX_VERSION: u8 = 2;
+/// The newest `raftkv-image` frame version this build decodes (still v1).
+const IMAGE_MAX_VERSION: u8 = 1;
 
 /// Gate-selected frame versions (ADR 0073 Phase 2, P2-B, section 3 "Binary
 /// codecs"): one table per frame kind of `(frame version, gate that must be
 /// open before an encoder may emit it)`, ascending. The encoder writes the
 /// highest version whose gate is open on the sender's [`ClusterFeatures`]
 /// ([`select_frame_version`]); decoders keep accepting every version up to
-/// [`VERSION`]. Only v1 exists, behind [`Gate::Base`] (always open), so
-/// today's encoders emit exactly the Phase 1 bytes whatever the handle says.
+/// [`WIRE_MAX_VERSION`] / [`IMAGE_MAX_VERSION`]. Wire v1 is behind
+/// [`Gate::Base`] (always open) and v2 behind [`Gate::FollowerAppliedIndex`],
+/// so an encoder under a closed gate emits exactly the v1 bytes. The image
+/// has only v1.
 /// A new frame version adds a row here (with its gate), a body encoder arm, a
 /// decoder arm (the old one moving to `legacy`) and a fixture.
-const WIRE_VERSIONS: &[(u8, Gate)] = &[(1, Gate::Base)];
+const WIRE_VERSIONS: &[(u8, Gate)] = &[(1, Gate::Base), (2, Gate::FollowerAppliedIndex)];
 /// See [`WIRE_VERSIONS`], for `raftkv-image` frames.
 const IMAGE_VERSIONS: &[(u8, Gate)] = &[(1, Gate::Base)];
 
@@ -129,6 +141,7 @@ const IMAGE_NAME: &str = "raftkv-image";
 fn check_header<'a>(
     bytes: &'a [u8],
     format: &'static str,
+    max: u8,
 ) -> Result<(u8, Cursor<'a>), FormatError> {
     if bytes.first() != Some(&MAGIC) {
         return Err(FormatError::PreBaselineFormat { format });
@@ -139,11 +152,11 @@ fn check_header<'a>(
             detail: "truncated frame: magic byte without a version byte".to_owned(),
         });
     };
-    if version == 0 || version > VERSION {
+    if version == 0 || version > max {
         return Err(FormatError::UnsupportedFormatVersion {
             format,
             found: version,
-            max_supported: VERSION,
+            max_supported: max,
         });
     }
     let mut c = Cursor::new(bytes);
@@ -161,11 +174,11 @@ fn check_header<'a>(
 mod legacy {}
 
 /// The error for a version the dispatch `match` has no arm for.
-fn unsupported(format: &'static str, found: u8) -> FormatError {
+fn unsupported(format: &'static str, found: u8, max: u8) -> FormatError {
     FormatError::UnsupportedFormatVersion {
         format,
         found,
-        max_supported: VERSION,
+        max_supported: max,
     }
 }
 
@@ -961,7 +974,7 @@ fn read_entry(c: &mut Cursor<'_>) -> Result<LogEntry<KvCommand>, DecodeError> {
 // ---- RaftMsg<KvCommand> ------------------------------------------------------
 
 #[allow(clippy::enum_glob_use)]
-fn put_raft(out: &mut Vec<u8>, m: &RaftMsg<KvCommand>) {
+fn put_raft(out: &mut Vec<u8>, m: &RaftMsg<KvCommand>, version: u8) {
     match m {
         RaftMsg::PreVote {
             term,
@@ -1022,6 +1035,7 @@ fn put_raft(out: &mut Vec<u8>, m: &RaftMsg<KvCommand>) {
             match_index,
             needs_snapshot,
             check_pending,
+            applied_index,
         } => {
             put_u8(out, 5);
             put_u64(out, *term);
@@ -1035,6 +1049,10 @@ fn put_raft(out: &mut Vec<u8>, m: &RaftMsg<KvCommand>) {
                 out,
                 u8::from(*needs_snapshot) | (u8::from(*check_pending) << 1),
             );
+            // Frame v2 (issue #1330): the responder's engine-applied index.
+            if version >= 2 {
+                put_u64(out, *applied_index);
+            }
         }
         RaftMsg::InstallSnapshot {
             term,
@@ -1135,7 +1153,7 @@ fn put_raft(out: &mut Vec<u8>, m: &RaftMsg<KvCommand>) {
     }
 }
 
-fn read_raft(c: &mut Cursor<'_>) -> Result<RaftMsg<KvCommand>, DecodeError> {
+fn read_raft(c: &mut Cursor<'_>, version: u8) -> Result<RaftMsg<KvCommand>, DecodeError> {
     Ok(match c.u8()? {
         0 => RaftMsg::PreVote {
             term: c.u64()?,
@@ -1195,6 +1213,8 @@ fn read_raft(c: &mut Cursor<'_>) -> Result<RaftMsg<KvCommand>, DecodeError> {
                 match_index,
                 needs_snapshot: flags & 1 != 0,
                 check_pending: flags & 2 != 0,
+                // v1 frames carry none: unknown (`0`), the pre-gate behaviour.
+                applied_index: if version >= 2 { c.u64()? } else { 0 },
             }
         }
         6 => RaftMsg::InstallSnapshot {
@@ -1252,12 +1272,12 @@ pub(crate) fn encode_wire(w: &KvWire, features: &ClusterFeatures) -> Vec<u8> {
     let mut out = Vec::new();
     put_u8(&mut out, MAGIC);
     put_u8(&mut out, version);
-    // v1 is the only body layout today; a v2 adds a `match version` arm here.
+    // v2 differs from v1 only in `AppendEntriesResp` (see `put_raft`).
     debug_assert!(WIRE_VERSIONS.iter().any(|(v, _)| *v == version));
     match w {
         KvWire::Raft(m) => {
             put_u8(&mut out, 0);
-            put_raft(&mut out, m);
+            put_raft(&mut out, m, version);
         }
         KvWire::ReadProbe { term, epoch } => {
             put_u8(&mut out, 1);
@@ -1274,7 +1294,7 @@ pub(crate) fn encode_wire(w: &KvWire, features: &ClusterFeatures) -> Vec<u8> {
             out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
             for (stream, msg) in entries {
                 put_u64(&mut out, *stream);
-                put_raft(&mut out, msg);
+                put_raft(&mut out, msg, version);
             }
         }
     }
@@ -1284,25 +1304,28 @@ pub(crate) fn encode_wire(w: &KvWire, features: &ClusterFeatures) -> Vec<u8> {
 /// Decode a binary frame into a [`KvWire`] message. Errors are descriptive and
 /// the caller logs them loudly before dropping the message.
 pub(crate) fn decode_wire(bytes: &[u8]) -> Result<KvWire, FormatError> {
-    let (version, c) = check_header(bytes, WIRE_NAME)?;
+    let (version, c) = check_header(bytes, WIRE_NAME, WIRE_MAX_VERSION)?;
     match version {
-        1 => decode_wire_v1(c),
-        found => Err(unsupported(WIRE_NAME, found)),
+        // v1 stays a literal branch (its `AppendEntriesResp` has no
+        // `applied_index`); v2 is v1 plus that one field, so both share the
+        // body decoder parametrized on the frame version rather than
+        // duplicating ~100 unchanged lines under `legacy`.
+        1 | 2 => decode_wire_versioned(c, version),
+        found => Err(unsupported(WIRE_NAME, found, WIRE_MAX_VERSION)),
     }
 }
 
-/// The version-1 (current) `raftkv-wire` body decoder. When v2 lands this
-/// moves, frozen, into [`legacy`].
-fn decode_wire_v1(c: Cursor<'_>) -> Result<KvWire, FormatError> {
-    decode_wire_body(c).map_err(|detail| FormatError::Malformed {
+/// The `raftkv-wire` body decoder for frame versions 1 and 2.
+fn decode_wire_versioned(c: Cursor<'_>, version: u8) -> Result<KvWire, FormatError> {
+    decode_wire_body(c, version).map_err(|detail| FormatError::Malformed {
         format: WIRE_NAME,
         detail,
     })
 }
 
-fn decode_wire_body(mut c: Cursor<'_>) -> Result<KvWire, DecodeError> {
+fn decode_wire_body(mut c: Cursor<'_>, version: u8) -> Result<KvWire, DecodeError> {
     let wire = match c.u8()? {
-        0 => KvWire::Raft(read_raft(&mut c)?),
+        0 => KvWire::Raft(read_raft(&mut c, version)?),
         1 => KvWire::ReadProbe {
             term: c.u64()?,
             epoch: c.u64()?,
@@ -1320,7 +1343,7 @@ fn decode_wire_body(mut c: Cursor<'_>) -> Result<KvWire, DecodeError> {
             let mut entries = Vec::with_capacity(n.min(1 << 20) as usize);
             for _ in 0..n {
                 let stream = c.u64()?;
-                let msg = read_raft(&mut c)?;
+                let msg = read_raft(&mut c, version)?;
                 entries.push((stream, msg));
             }
             KvWire::HeartbeatBatch(entries)
@@ -1369,10 +1392,10 @@ pub(crate) fn encode_image(
 pub(crate) fn decode_image(
     bytes: &[u8],
 ) -> Result<(Option<HlcTimestamp>, Vec<ImageEntry>), FormatError> {
-    let (version, c) = check_header(bytes, IMAGE_NAME)?;
+    let (version, c) = check_header(bytes, IMAGE_NAME, IMAGE_MAX_VERSION)?;
     match version {
         1 => decode_image_v1(c),
-        found => Err(unsupported(IMAGE_NAME, found)),
+        found => Err(unsupported(IMAGE_NAME, found, IMAGE_MAX_VERSION)),
     }
 }
 
@@ -1422,19 +1445,18 @@ pub(crate) mod tests {
     /// highest open row (checked on a synthetic ladder, since only v1 exists).
     #[test]
     fn frame_version_tables_are_well_formed_and_the_selector_picks_the_highest_open() {
-        for (name, table) in [("wire", WIRE_VERSIONS), ("image", IMAGE_VERSIONS)] {
+        for (name, table, max) in [
+            ("wire", WIRE_VERSIONS, WIRE_MAX_VERSION),
+            ("image", IMAGE_VERSIONS, IMAGE_MAX_VERSION),
+        ] {
             assert_eq!(table[0], (1, Gate::Base), "{name}: v1 is the Base floor");
             assert!(
                 table.windows(2).all(|w| w[0].0 < w[1].0),
                 "{name}: ascending"
             );
-            assert_eq!(
-                table.last().unwrap().0,
-                VERSION,
-                "{name}: top row == VERSION"
-            );
+            assert_eq!(table.last().unwrap().0, max, "{name}: top row == max");
             for (v, _) in table {
-                assert!(*v >= 1 && *v <= VERSION, "{name}: decoder accepts v{v}");
+                assert!(*v >= 1 && *v <= max, "{name}: decoder accepts v{v}");
             }
         }
         let floor = ClusterFeatures::new();
@@ -1447,7 +1469,120 @@ pub(crate) mod tests {
         open.update(&era);
         assert!(open.is_open(Gate::Era));
         assert_eq!(select_frame_version(&ladder, &open), 2, "era open");
-        assert_eq!(wire_frame_version(&open), 1, "no v2 row yet");
+        assert_eq!(
+            wire_frame_version(&open),
+            1,
+            "an open era alone does not select wire v2"
+        );
+        let v6 = features_at(6);
+        assert_eq!(wire_frame_version(&v6), 2, "FollowerAppliedIndex open");
+        assert_eq!(image_frame_version(&v6), 1, "the image has no v2");
+        assert_eq!(wire_frame_version(&features_at(5)), 1, "gate closed at 5");
+    }
+
+    /// A feature handle reading `cluster_version` (6 opens
+    /// `Gate::FollowerAppliedIndex`).
+    pub(crate) fn features_at(cluster_version: u32) -> ClusterFeatures {
+        let f = ClusterFeatures::new();
+        f.update(&animus_control::Metadata {
+            cluster_version,
+            ..animus_control::Metadata::default()
+        });
+        f
+    }
+
+    /// The frames of `raftkv-wire/v2.bin` (issue #1330, wire v2): every
+    /// `AppendEntriesResp` shape that now carries `applied_index` (alone, in a
+    /// heartbeat batch, with each flag), beside an `AppendEntries` and a probe
+    /// to show the rest of the frame is v1's. Append-only.
+    pub(crate) fn applied_index_sample_wires() -> Vec<KvWire> {
+        let resp = |success, match_index, needs_snapshot, check_pending, applied_index| {
+            RaftMsg::AppendEntriesResp {
+                term: 12,
+                success,
+                match_index,
+                needs_snapshot,
+                check_pending,
+                applied_index,
+            }
+        };
+        vec![
+            KvWire::Raft(resp(true, 90, false, false, 87)),
+            KvWire::Raft(resp(false, 0, true, true, 1)),
+            KvWire::Raft(resp(true, 91, false, false, 0)),
+            KvWire::HeartbeatBatch(vec![
+                (3, resp(true, 5, false, false, 5)),
+                (4, resp(true, 6, true, false, u64::MAX)),
+            ]),
+            KvWire::ReadProbe { term: 12, epoch: 4 },
+            KvWire::Raft(RaftMsg::AppendEntries {
+                term: 12,
+                leader: nid(2),
+                prev_log_index: 90,
+                prev_log_term: 12,
+                entries: Vec::new(),
+                leader_commit: 90,
+            }),
+        ]
+    }
+
+    /// Wire v2 (issue #1330): `applied_index` round-trips under an open
+    /// gate; a closed gate encodes the identical v1 bytes (the field is
+    /// dropped, never half-written); a v1 frame decodes to `applied_index: 0`;
+    /// and a v2 frame is exactly the v1 frame plus the 8 trailing bytes.
+    #[test]
+    fn wire_v2_carries_applied_index_and_v1_stays_byte_identical() {
+        let open = features_at(6);
+        let closed = features_at(5);
+        for w in applied_index_sample_wires() {
+            let v2 = super::encode_wire(&w, &open);
+            assert_eq!(&v2[..2], &[MAGIC, 2]);
+            let back = decode_wire(&v2).expect("v2 decodes");
+            assert_eq!(format!("{w:?}"), format!("{back:?}"));
+            let v1 = super::encode_wire(&w, &closed);
+            assert_eq!(&v1[..2], &[MAGIC, 1], "closed gate selects v1");
+            let back1 = decode_wire(&v1).expect("v1 decodes");
+            // The same message minus the field the v1 frame cannot carry.
+            let n_resps = match &w {
+                KvWire::Raft(RaftMsg::AppendEntriesResp { .. }) => 1,
+                KvWire::HeartbeatBatch(es) => es.len(),
+                _ => 0,
+            };
+            assert_eq!(v2.len(), v1.len() + 8 * n_resps, "{w:?}");
+            let stripped = format!("{back1:?}");
+            assert!(!stripped.contains("applied_index: 87"), "{stripped}");
+        }
+        // v1 bytes with no resp are untouched by the version choice.
+        let probe = KvWire::ReadProbe { term: 1, epoch: 2 };
+        assert_eq!(
+            super::encode_wire(&probe, &open)[2..],
+            super::encode_wire(&probe, &closed)[2..]
+        );
+    }
+
+    /// A truncated v2 `AppendEntriesResp` (the new field cut short) is a
+    /// clean `Malformed`, and a v1 frame with an `applied_index`-sized tail is
+    /// "trailing bytes", never silently misread as v2.
+    #[test]
+    fn wire_v2_resp_truncation_and_v1_trailing_are_loud() {
+        let w = KvWire::Raft(RaftMsg::AppendEntriesResp {
+            term: 1,
+            success: true,
+            match_index: 2,
+            needs_snapshot: false,
+            check_pending: false,
+            applied_index: 9,
+        });
+        let v2 = super::encode_wire(&w, &features_at(6));
+        for cut in 2..v2.len() {
+            assert!(
+                matches!(decode_wire(&v2[..cut]), Err(FormatError::Malformed { .. })),
+                "cut {cut}"
+            );
+        }
+        let mut v1 = super::encode_wire(&w, &features_at(5));
+        v1.extend_from_slice(&9u64.to_be_bytes());
+        assert!(malformed_detail(decode_wire(&v1).unwrap_err()).contains("trailing"));
     }
 
     fn roundtrip(w: &KvWire) {
@@ -1877,6 +2012,7 @@ pub(crate) mod tests {
                 match_index: 23,
                 needs_snapshot: true,
                 check_pending: false,
+                applied_index: 0,
             },
             RaftMsg::InstallSnapshot {
                 term: 7,
@@ -2196,7 +2332,11 @@ pub(crate) mod tests {
         let unsupported = |format, found| FormatError::UnsupportedFormatVersion {
             format,
             found,
-            max_supported: VERSION,
+            max_supported: if format == "raftkv-wire" {
+                WIRE_MAX_VERSION
+            } else {
+                IMAGE_MAX_VERSION
+            },
         };
 
         // Empty input and a foreign payload (JSON, the pre-binary encoding)
@@ -2216,17 +2356,19 @@ pub(crate) mod tests {
 
         // Version 0, one past this build, and 255 are unsupported, on both
         // entry points (32 is the pre-baseline codec's last version).
-        for bad in [0u8, VERSION + 1, 32, 255] {
+        for bad in [0u8, WIRE_MAX_VERSION + 1, 32, 255] {
             assert_eq!(
                 decode_wire(&[MAGIC, bad, 1]).unwrap_err(),
                 unsupported("raftkv-wire", bad)
             );
+        }
+        for bad in [0u8, IMAGE_MAX_VERSION + 1, 32, 255] {
             assert_eq!(
                 decode_image(&[MAGIC, bad, 0, 0, 0, 0, 0]).unwrap_err(),
                 unsupported("raftkv-image", bad)
             );
         }
-        let msg = decode_wire(&[MAGIC, VERSION + 1, 1])
+        let msg = decode_wire(&[MAGIC, WIRE_MAX_VERSION + 1, 1])
             .unwrap_err()
             .to_string();
         assert!(msg.contains("unsupported format version"), "got: {msg}");
