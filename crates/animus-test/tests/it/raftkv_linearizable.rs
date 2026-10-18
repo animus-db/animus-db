@@ -2750,8 +2750,15 @@ struct DiskFullObservation {
     /// Some replica still reported `is_storage_full()` after the post-heal
     /// drain (the recovery never completed).
     storage_full_after_drain: bool,
-    /// Acked appends whose completion timestamp is after `heal_all`.
+    /// Acked Elle appends whose completion timestamp is after `heal_all`.
+    /// Diagnostic only: the finite workload can drain before the heal (issue
+    /// #1333), so this cannot witness resumption on its own.
     acked_writes_after_heal: usize,
+    /// Probe writes (see [`spawn_window_probe`]) acked after `heal_all`. The
+    /// probe loops until the post-heal drain ends, so unlike the finite Elle
+    /// workload it always has a write in flight: zero means the group never
+    /// resumed writes without a restart (issue #1333).
+    probe_acks_after_heal: usize,
     /// Probe writes (see [`spawn_window_probe`]) acked inside the disk-full
     /// window, at least [`STEP_DOWN_GRACE`] after the fault was applied (issue
     /// #1219): with the leader's disk alone full these only exist if
@@ -2874,6 +2881,12 @@ fn run_disk_full_scenario_on<S: StorageEngine + 'static>(
         .filter(|m| matches!(m, Mop::Append { .. }))
         .count();
     let window_from = fault_applied_at + STEP_DOWN_GRACE.as_nanos() as u64;
+    let probe_acks_after_heal = probe
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|t| **t > healed_at)
+        .count();
     let acked_writes_in_window = probe
         .lock()
         .unwrap()
@@ -2887,6 +2900,7 @@ fn run_disk_full_scenario_on<S: StorageEngine + 'static>(
             storage_full_during_window,
             storage_full_after_drain,
             acked_writes_after_heal,
+            probe_acks_after_heal,
             acked_writes_in_window,
         },
     )
@@ -2917,6 +2931,23 @@ fn run_disk_full_identified_on<S: StorageEngine + 'static>(
 #[test]
 fn raftkv_disk_full_corpus_is_linearizable() {
     check_disk_full_corpus("mem+disk-full", &disk_full_corpus(), mem_engine);
+}
+
+/// Issue #1333: `disk_full_mid_5` seed index 7 (`disk_full_mid_5_s07`) drains
+/// its whole Elle workload before the heal (the last in-flight op is a read), so
+/// the old "an Elle append acked after the heal" oracle failed although the
+/// group resumed writes ~1.6 s after space returned. Pinned in the default run
+/// (the knob only reaches this seed at `ANIMUS_DISK_FULL_SEEDS >= 8`); the
+/// resumption oracle is the probe writer, which cannot drain.
+#[test]
+fn raftkv_disk_full_pinned_seed_workload_drains_before_heal() {
+    let pinned: Vec<Scenario> = corpus::seed_expand(disk_full_cells(), 8)
+        .into_iter()
+        .filter(|s| s.name == "disk_full_mid_5_s07")
+        .collect();
+    assert_eq!(pinned.len(), 1, "pinned cell missing from the expansion");
+    assert_eq!(pinned[0].seed, 10807346798413470226);
+    check_disk_full_corpus("mem+disk-full-pinned", &pinned, mem_engine);
 }
 
 /// Run `scenarios` over `factory` and assert the disk-full properties.
@@ -2963,15 +2994,20 @@ fn check_disk_full_corpus<S: StorageEngine + 'static>(
             );
         }
         if matches!(s.faults[0].1, Nemesis::DiskFull) {
-            // Only a fully-unavailable disk strands the workload past the
-            // window; a flaky one lets the (short) workload finish inside it,
-            // which is progress in its own right (asserted just below).
+            // Resumption is witnessed by the probe writer, which runs until
+            // the post-heal drain ends. The Elle workload is finite and can
+            // drain entirely before the heal (its last rounds are reads, or
+            // it finished before the fault; issue #1333, `disk_full_mid_5`
+            // seed index 7), so "an Elle append acked after the heal" is not
+            // a sound proxy for "the group resumed". A flaky disk lets the
+            // workload finish inside the window instead (asserted below).
             assert!(
-                obs.acked_writes_after_heal > 0,
-                "scenario {} (seed={}): no write was acked after the disk-full window; \
-                 writes did not resume without a restart",
+                obs.probe_acks_after_heal > 0,
+                "scenario {} (seed={}): no probe write was acked after the disk-full window \
+                 ({} Elle appends acked after it); writes did not resume without a restart",
                 s.name,
-                s.seed
+                s.seed,
+                obs.acked_writes_after_heal
             );
         } else {
             assert!(
