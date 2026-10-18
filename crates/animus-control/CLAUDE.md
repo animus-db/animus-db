@@ -3221,7 +3221,11 @@ no buffered ack ships on a file whose state is unknown). On ENOSPC in
 suspect: it is **never appended to or `fsync`ed again** (fsyncgate, a torn
 partial append may sit in it). `persist_round::recover_suspect_wal` (shared with
 `animus-cp-data`) then probes on `env.sleep` (50 ms backoff to a 2 s cap; each
-probe takes `wal_lock`, defers while `RewriteTail::is_active()` since a staged
+probe first writes a fixed-size free-space canary
+(`persist_round::probe_free_space`, `{wal}.probe`) and builds nothing while it
+fails with ENOSPC (issue #1331: the image is a whole-log clone plus a 3-6x JSON
+encoding, and doing that per probe per group is an RSS runaway on a full disk);
+then it takes `wal_lock`, defers while `RewriteTail::is_active()` since a staged
 rewrite shares the `.tmp` sibling, drains, captures `RaftCore::wal_image()` and
 hands it to a `write_image` closure that must write a **fresh file**). Only on
 success does it `mark_durable_through`, `complete_all_drained` and clear the

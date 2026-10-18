@@ -3865,6 +3865,19 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 backlog_bytes: self.applied_watch.backlog_bytes(),
             };
         }
+        // Issue #1331: a StorageFull leader cannot persist or apply anything,
+        // so a client write accepted now only grows its in-memory log (and the
+        // encodings derived from it) until space returns. Refuse it here, as
+        // the wire edge's 503 `StorageFull` does for a request that reaches
+        // it; Raft's own entries (no-ops, ceilings, resolves) are not Client
+        // class and still flow.
+        if class == admission::AdmissionClass::Client && self.is_storage_full() {
+            self.metrics.incr(Metric::OverloadStorageFull);
+            return ProposeResult::Busy {
+                backlog_entries: entries,
+                backlog_bytes: self.applied_watch.backlog_bytes(),
+            };
+        }
         self.applied_watch.with_backlog(|ring| {
             ring.trim(applied);
             let bytes = ring.bytes();
@@ -8385,6 +8398,9 @@ async fn persist_wal<E: Env>(
             if animus_env::is_storage_full(&e) && !halted.load(Ordering::SeqCst) {
                 tracing::error!(error = %e, "raftkv shared wal append hit ENOSPC; group is StorageFull until the WAL is rewritten");
                 progress.mark_suspect();
+                // Issue #1331: the failed round's records are subsumed by the
+                // recovery image; do not pin them for the whole ENOSPC.
+                drop(records);
                 drop(wal_guard);
                 recover_kv_wal(
                     env,
@@ -8446,6 +8462,15 @@ async fn persist_wal<E: Env>(
                 // durable and nothing is acked until that rewrite lands.
                 tracing::error!(error = %e, "raftkv wal write hit ENOSPC; group is StorageFull until the WAL is rewritten");
                 progress.mark_suspect();
+                // Issue #1331: this future parks inside `recover_kv_wal` for as
+                // long as the disk stays full, and an async fn's locals live
+                // until it returns. The round's records and both of their
+                // encodings (3-6x the log bytes, held twice) are subsumed by
+                // the recovery image, so release them first instead of
+                // pinning them -- per stalled group -- for the whole ENOSPC.
+                drop(buf);
+                drop(record_bytes);
+                drop(records);
                 drop(wal_guard);
                 recover_kv_wal(
                     env, wal, core, wal_lock, progress, halted, shared, tablet, metrics,
@@ -8504,6 +8529,7 @@ async fn recover_kv_wal<E: Env>(
         wal_lock,
         progress,
         halted,
+        || persist_round::probe_free_space(env, wal),
         |image: Vec<animus_control::persist::WalRecord<KvCommand, KvState>>| async move {
             if let Some(shared) = shared {
                 let r = shared.compact_group(env, wal, tablet, image).await;
@@ -8516,6 +8542,9 @@ async fn recover_kv_wal<E: Env>(
                 for record in &image {
                     buf.extend(PersistedState::encode_record(record));
                 }
+                // Only the encoded bytes are written: free the image clone
+                // before the (possibly long) write, not after it (issue #1331).
+                drop(image);
                 let r = env.replace(wal, &buf).await;
                 if r.is_err() {
                     // Free the half-written temp sibling so the space it holds

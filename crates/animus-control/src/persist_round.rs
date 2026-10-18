@@ -286,9 +286,36 @@ where
 
 /// First delay of the free-space probe in [`recover_suspect_wal`].
 const STORAGE_FULL_PROBE_MIN: Duration = Duration::from_millis(50);
-/// Cap of the probe's exponential backoff. Each probe is a whole-WAL rewrite,
-/// so a disk that stays full for minutes must not be hammered.
+/// Cap of the probe's exponential backoff. Once a probe finds free space the
+/// attempt is a whole-WAL rewrite, so a disk that stays full for minutes must
+/// not be hammered.
 const STORAGE_FULL_PROBE_MAX: Duration = Duration::from_secs(2);
+
+/// Size of the free-space canary [`recover_suspect_wal`] writes before it
+/// materialises a WAL image (see [`probe_free_space`]).
+pub const FREE_SPACE_PROBE_BYTES: usize = 64 * 1024;
+
+/// **Cheap free-space canary** (issue #1331): write [`FREE_SPACE_PROBE_BYTES`]
+/// of zeros to `{file}.probe` (`Disk::replace`: create, fsync, rename), then
+/// remove it. `Ok` means a small durable write fits *now*; `Err` (ENOSPC above
+/// all) means the disk is still full.
+///
+/// Why this exists: the rewrite [`recover_suspect_wal`] performs needs the
+/// WAL image -- a clone of the **whole** in-memory log -- and its encoding,
+/// 3-6x the log's size because commands are JSON number arrays. Attempting
+/// that every backoff tick on every stalled group, on a disk that stays full,
+/// made each probe allocate a multiple of the log it could not write. Across
+/// hundreds of groups this was the RSS runaway under ENOSPC. The canary costs
+/// a fixed 64 KiB however large the log is, and the image is built only once
+/// it passes.
+pub async fn probe_free_space<E: Env>(env: &E, file: &str) -> std::io::Result<()> {
+    let name = format!("{file}.probe");
+    let r = env.replace(&name, &vec![0u8; FREE_SPACE_PROBE_BYTES]).await;
+    // Whatever the outcome, give any half-written bytes back to the volume.
+    let _ = env.remove(&name).await;
+    let _ = env.remove(&format!("{name}.tmp")).await;
+    r
+}
 
 /// **Recover a suspect WAL without a restart** (R-01 (d), ADR 0074 §2;
 /// `docs/resource-bounds.md` §3). Run by the consensus loop's persist future
@@ -308,24 +335,32 @@ const STORAGE_FULL_PROBE_MAX: Duration = Duration::from_secs(2);
 /// (durable-before-visible: nothing is acked before this point), then clear the
 /// suspect flag.
 ///
+/// Before building the image each attempt first runs `probe` (a cheap
+/// free-space canary, see [`probe_free_space`]); while it fails with ENOSPC the
+/// image is **not built at all** (issue #1331: the whole-log clone plus its
+/// JSON encoding is the memory a full disk must not be allowed to multiply).
+///
 /// `write_image` failing with ENOSPC just means space has not come back: keep
 /// probing. Any other error is returned for the caller to treat as the real
 /// durability fault it is. `Ok(false)` means `halted` was observed (teardown)
 /// and nothing was made durable. An attempt is deferred (not failed) while a
 /// staged compaction rewrite is in flight, since it shares the file's `.tmp`
 /// sibling.
-pub async fn recover_suspect_wal<E, C, S, F, Fut>(
+pub async fn recover_suspect_wal<E, C, S, P, PFut, F, Fut>(
     env: &E,
     core: &Mutex<RaftCore<C, S>>,
     wal_lock: &FairMutex,
     progress: &PersistProgress,
     halted: &AtomicBool,
+    mut probe: P,
     mut write_image: F,
 ) -> std::io::Result<bool>
 where
     E: Env,
     C: Clone + std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned,
     S: StateMachine<C>,
+    P: FnMut() -> PFut,
+    PFut: Future<Output = std::io::Result<()>>,
     F: FnMut(Vec<WalRecord<C, S>>) -> Fut,
     Fut: Future<Output = std::io::Result<()>>,
 {
@@ -339,6 +374,15 @@ where
         backoff = (backoff * 2).min(STORAGE_FULL_PROBE_MAX);
         if halted.load(Ordering::SeqCst) {
             return Ok(false);
+        }
+        // Issue #1331: nothing is cloned or encoded until a small write fits.
+        match probe().await {
+            Ok(()) => {}
+            Err(e) if is_storage_full(&e) => {
+                tracing::debug!(error = %e, "wal free-space probe still hits ENOSPC; group stays StorageFull");
+                continue;
+            }
+            Err(e) => return Err(e),
         }
         let _wal = wal_lock.lock().await;
         if wal_lock.tail().is_active() {
