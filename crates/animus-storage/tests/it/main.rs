@@ -8,6 +8,7 @@ mod lsm_crash;
 mod lsm_crash_encrypted;
 mod lsm_disk_faults;
 mod lsm_disk_full;
+mod lsm_flush_apply_race;
 mod lsm_gc;
 mod lsm_group_commit;
 mod lsm_maintenance;
