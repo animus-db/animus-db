@@ -38,7 +38,7 @@ use animus_cp_data::campaign_governor::ElectionBackpressure;
 use animus_cp_data::{HostedOptions, RaftKvNode, StageOutcome, StorageScope};
 use animus_cp_data::{TxnDecisionStatus, TxnOutcome, TxnWrite};
 use animus_env::{Clock, EnvExt, MetricsHandle, PRIMARY_STREAM, QueuedBytes, nid};
-use animus_sim::{SimEnv, Simulator};
+use animus_sim::{DiskConfig, SimEnv, Simulator};
 use animus_storage::{
     Key, MemoryEngine, MergeOp, Result as StorageResult, StorageEngine, Value, Version,
     VersionedValue, WriteBatch,
@@ -893,4 +893,77 @@ fn overload_control_h_without_the_cold_wake_refusal_a_cold_group_wakes() {
         Control::NoColdWakeRefusal,
         "cold-wake:",
     );
+}
+
+/// Issue #1331: a `StorageFull` leader must refuse client writes instead of
+/// accepting them into memory. With the propose bound itself off (so the
+/// apply-backlog bound cannot be what stops the growth), every disk goes full:
+/// once the leader's WAL is suspect it can persist and apply nothing, so each
+/// further accepted write only grows its in-memory log and everything derived
+/// from it (the recovery image, the replication frames). The log must stop
+/// growing within a few ticks of the leader noticing, however long the disk
+/// stays full, and writes must be admitted again once space returns.
+#[test]
+fn overload_c9_storage_full_leader_refuses_client_writes() {
+    for seed in seeds() {
+        let mut rig = Rig::new(seed, BacklogLimits::off());
+        rig.sim.run_for(Duration::from_secs(5));
+        let l = rig.leader().expect("a leader on a healthy disk");
+        let mut t = Tally::default();
+        let mut cfg = DiskConfig::default();
+        cfg.set_enospc_prob(1.0);
+        rig.sim.set_disk_config(cfg);
+        const BIG: usize = 4096;
+        let mut accepted_while_full = 0usize;
+        let mut refused_while_full = 0usize;
+        let mut full_seen_at = None;
+        for tick in 0..400usize {
+            for _ in 0..PER_TICK {
+                let key = key_of(seed, t.next_key);
+                t.next_key += 1;
+                let full = rig.nodes[l].is_storage_full();
+                if full && full_seen_at.is_none() {
+                    full_seen_at = Some(tick);
+                }
+                match rig.nodes[l].put(key, vec![9u8; BIG]) {
+                    ProposeResult::Accepted { .. } if full => accepted_while_full += 1,
+                    ProposeResult::Busy { .. } if full => refused_while_full += 1,
+                    _ => {}
+                }
+            }
+            rig.sim.run_for(TICK);
+        }
+        let full_at = full_seen_at.unwrap_or_else(|| {
+            panic!("seed={seed:#x}: the leader never reported StorageFull on a full disk")
+        });
+        assert!(
+            full_at < 50,
+            "seed={seed:#x}: the leader took {full_at} ticks to notice a full disk"
+        );
+        assert_eq!(
+            accepted_while_full, 0,
+            "seed={seed:#x}: a StorageFull leader accepted {accepted_while_full} client writes \
+             into memory (refused {refused_while_full})"
+        );
+        assert!(
+            refused_while_full > 1000,
+            "seed={seed:#x}: only {refused_while_full} refusals; the cell is vacuous"
+        );
+        // Space returns: the group recovers without a restart and admits writes.
+        rig.sim.set_disk_config(DiskConfig::default());
+        rig.sim.run_for(Duration::from_secs(10));
+        assert!(
+            !rig.nodes[l].is_storage_full(),
+            "seed={seed:#x}: the leader stayed StorageFull after space returned"
+        );
+        let leader = rig.leader().expect("a leader after recovery");
+        let key = key_of(seed, u64::MAX);
+        assert!(
+            matches!(
+                rig.nodes[leader].put(key, vec![1u8; 16]),
+                ProposeResult::Accepted { .. }
+            ),
+            "seed={seed:#x}: a fresh write was not admitted after recovery"
+        );
+    }
 }

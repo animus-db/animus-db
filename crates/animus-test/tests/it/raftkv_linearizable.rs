@@ -2757,6 +2757,17 @@ struct DiskFullObservation {
     /// #1219): with the leader's disk alone full these only exist if
     /// leadership moved to a replica with free space.
     acked_writes_in_window: usize,
+    /// `replace` calls that failed with an injected ENOSPC on anything but a
+    /// free-space canary (`*.probe`): attempts to rewrite a suspect WAL from
+    /// its in-memory image. Each one first cloned the **whole** in-memory log
+    /// and JSON-encoded it (3-6x its size) only to be refused -- the memory
+    /// amplification behind issue #1331 (RSS 4 GB to 13 GB, then OOM, with a
+    /// full disk and flat accepted writes). While the disk is entirely full
+    /// the canary must fail first, so this must stay 0.
+    wal_image_attempts: usize,
+    /// Canary writes (`*.probe`, a fixed 64 KiB each) the injector refused:
+    /// proof the recovery loop really probed while the disk was full.
+    probe_faults: usize,
 }
 
 /// Time a storage-full leader gets to notice (its next failed persist) and
@@ -2865,6 +2876,22 @@ fn run_disk_full_scenario_on<S: StorageEngine + 'static>(
         .iter()
         .filter(|e| matches!(e, animus_sim::TraceEvent::DiskFault { kind: "enospc", .. }))
         .count();
+    let (mut wal_image_attempts, mut probe_faults) = (0usize, 0usize);
+    for e in group.sim.trace() {
+        if let animus_sim::TraceEvent::DiskFault {
+            op: "replace",
+            file,
+            kind: "enospc",
+            ..
+        } = e
+        {
+            if file.contains(".probe") {
+                probe_faults += 1;
+            } else {
+                wal_image_attempts += 1;
+            }
+        }
+    }
     let result = finalize_scenario_result(&mut group, scenario.seed, scenario.keyspace);
     let acked_writes_after_heal = result
         .history
@@ -2888,6 +2915,8 @@ fn run_disk_full_scenario_on<S: StorageEngine + 'static>(
             storage_full_after_drain,
             acked_writes_after_heal,
             acked_writes_in_window,
+            wal_image_attempts,
+            probe_faults,
         },
     )
 }
@@ -2949,6 +2978,24 @@ fn check_disk_full_corpus<S: StorageEngine + 'static>(
              (the WAL rewrite never completed; recovery needed a restart)",
             s.name, s.seed
         );
+        if full_disk && tier.starts_with("mem") {
+            // Issue #1331: a disk that is entirely full must be recognised by
+            // the fixed-size canary, never by materialising the WAL image (a
+            // clone + encoding of the whole log) per probe. Over `MemoryEngine`
+            // every non-canary `replace` is such an image rewrite.
+            assert_eq!(
+                obs.wal_image_attempts, 0,
+                "scenario {} (seed={}): {} WAL image rewrite(s) were attempted (whole-log clone + \
+                 encode) while the disk was entirely full; the free-space canary must refuse first",
+                s.name, s.seed, obs.wal_image_attempts
+            );
+            assert!(
+                obs.probe_faults > 0,
+                "scenario {} (seed={}): the recovery loop never probed while the disk was full",
+                s.name,
+                s.seed
+            );
+        }
         if matches!(s.faults[0].1, Nemesis::LeaderDiskFull) {
             // Issue #1219: the leader's own disk is full but a quorum of
             // replicas is healthy, so the group must stay writable *during*

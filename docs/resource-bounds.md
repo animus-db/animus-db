@@ -137,6 +137,15 @@ task until a process restart (the node still looked healthy). Now:
 3. **Recovery without a restart** (`persist_round::recover_suspect_wal`). The
    persist future probes on `env.sleep` with exponential backoff (50 ms up to a
    2 s cap, so a disk that stays full for minutes is not hammered). Each probe
+   first writes a fixed 64 KiB canary (`persist_round::probe_free_space`,
+   `{wal}.probe`, removed straight after) and goes no further while that
+   fails with ENOSPC: the image below is a clone of the whole in-memory log plus
+   its JSON encoding (3-6x), and building it per probe per group on a disk that
+   stays full was the RSS runaway of issue #1331 (4 GB to 13 GB, then OOM, with
+   flat accepted writes). The failed round's own records and encodings are
+   likewise dropped before the future parks in recovery, and a `StorageFull`
+   leader refuses `Client`-class proposals in `gated_propose` (`Busy`,
+   `overload_storage_full`). Once the canary passes, the probe
    takes the group's `wal_lock`, skips if a staged compaction rewrite is in
    flight, drains whatever the core owes, captures `RaftCore::wal_image()`
    (snapshot + hard state + the whole in-memory log, a superset of everything any

@@ -3833,11 +3833,14 @@ async fn recover_control_wal<E: Env>(
         wal_lock,
         progress,
         halted,
+        || persist_round::probe_free_space(env, WAL),
         |image: Vec<crate::persist::WalRecord>| async move {
             let mut buf = Vec::new();
             for record in &image {
                 buf.extend(PersistedState::encode_record(record));
             }
+            // The encoded bytes are all that is written: free the image first.
+            drop(image);
             let r = env.replace(WAL, &buf).await;
             if r.is_err() {
                 // Free the half-written temp sibling so the space it holds
