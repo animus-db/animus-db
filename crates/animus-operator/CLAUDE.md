@@ -2020,3 +2020,10 @@ stay off). Round **down** (a 2500m pod is 2): `cores` scales the awake cap
 rendered), and too small is the safe error. Request, not limit; never
 `available_parallelism`. `spec.nodeCapacity.cores: 0` is refused at admission.
 `deploy/operator/crd.yaml` is regenerated.
+
+## `queued_bytes_budget` derivation (ADR 0080 section 4)
+
+`derive_queued_bytes_budget` renders 25 % of `spec.resources.limits.memory` into every node's
+`overload.queued_bytes_budget` (no limit -> nothing rendered, the node default of 256 MiB applies).
+It joins the restart-relevant config hash only when set (`skip_serializing_if`), so existing specs
+keep their hash. There is no `spec.nodeCapacity` override yet.

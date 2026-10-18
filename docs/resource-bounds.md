@@ -56,10 +56,39 @@ of `max_inflight_requests` executing requests (each bounded by the 1 MiB
 response page cap below). Default: about 4 GiB of request buffer in the
 adversarial case, which is why the knob exists; lower it on small nodes.
 
-Known gap: an idle or slow client holds its connection slot indefinitely (there
-is no header-read or keep-alive idle timeout), so a slowloris client can fill
-the cap. The cap turns that from unbounded memory into a bounded refusal, but a
-connection idle timeout is the follow-up that closes it.
+Idle and slow clients (ADR 0080 section 5, 4.6): every HTTP listener now closes
+an idle keep-alive connection after 120 s (`KEEPALIVE_IDLE_TIMEOUT`, a clean
+close) and a connection whose header block has not completed 10 s after its
+first byte (`HEADER_READ_TIMEOUT`, an error), so a slowloris client no longer
+holds a slot indefinitely. Admin handlers share a `max_admin_inflight` gate
+(default 32, `overload.max_admin_inflight`); `/admin/health`, `/admin/live` and
+`/metrics` are exempt (`overload_shed_admin_inflight`). The client-protocol
+listener refuses a declared frame over 16 MiB before allocating; the intra
+listener keeps 64 MiB.
+
+### ADR 0080: the client path and the transport
+
+| Bound | Default | Setting | Refusal | Counter |
+|---|---|---|---|---|
+| Per-group leader backlog (appended minus applied) | 512 entries / 4 MiB, lag-scaled | `overload.propose_backlog_max_entries` / `_bytes` (`0` = off) | `ProposeResult::Busy` -> 400 `ThrottlingException` | `overload_shed_busy` |
+| Node gate | `max_inflight_requests`, halved at 30 ms lag, quartered at 100 ms, floor 256 | `overload.max_inflight_requests` | 503 `ServiceUnavailable` | `overload_shed_admission` |
+| Leaderless group | refused after 2 s without a leader | `overload.leaderless_wait_ms` | 503 `ServiceUnavailable` (`no-leader:`) | `overload_shed_no_leader` |
+| Per-group in-flight | 256 | `overload.group_inflight_max` (`0` = off) | 400 `ThrottlingException` | `overload_shed_group_inflight` |
+| Forwarded requests | 4096 | `overload.max_forwarded_inflight` | forwarded refusal string | `overload_shed_forwarded` |
+| Cold wake of a quiesced group | lag >= 100 ms and awake >= `A_eff` | none | 400 `ThrottlingException` | `overload_shed_cold_wake` |
+| Node `QueuedBytes` budget | 256 MiB; soft 70 %, hard 100 % | `overload.queued_bytes_budget` / `--queued-bytes-budget` (`0` = unlimited); operator: 25 % of the memory limit | client class refused at the hard mark; Internal and Liveness are charged, never refused | `overload_shed_budget`, `queued_bytes`, `queued_bytes_hwm` |
+| Per-peer outbox | Vote 4096 frames, Heartbeat 4096 (coalesced per stream and key), Replicate/Normal 8 MiB and 4096 frames, all drop-oldest; Bulk 4 MiB on a second connection with producer-blocking credit | fixed | drop-oldest, counted | `transport_outbox_dropped_*`, `transport_outbox_bytes` |
+| `ProdEnv` accept channel | 16384 | fixed | the reader waits (TCP back-pressure) | none |
+| `HeartbeatInbox` | 8, drop oldest | fixed | drop-oldest | `heartbeat_inbox_dropped` |
+| Admin handlers | 32 | `overload.max_admin_inflight` | 503 JSON | `overload_shed_admin_inflight` |
+
+`Busy` and the per-group refusals are `ThrottlingException` (HTTP 400, an SDK
+retries it with backoff); a missing leader and the node gate stay 503. In a
+batch, a `Busy` item lands in `UnprocessedItems` / `UnprocessedKeys`; in a
+transaction it cancels with `ThrottlingError`. `/admin/health` reports
+`queued_bytes_budget`, `queued_bytes`, `queued_bytes_hwm`,
+`queued_bytes_over_soft` and `transport_outbox_bytes` (advisory, never part of
+`ok`). See `docs/runbook/overload-and-throttling.md`.
 
 ## 2. Memory audit (D-6)
 
@@ -328,13 +357,12 @@ healthy-quorum step-down described above, plus two read-path changes:
 3. `Query`/`Scan` byte cap is applied at the coordinator after the per-tablet
    scan RPC returns, so one tablet round trip can still materialize more than a
    page of raw pairs (already noted in `crates/animusd/CLAUDE.md`).
-4. Client/intra protocol: 64 MiB frame bound times `max_peer_connections`
+4. ~~Client/intra protocol frame bound~~ fixed for the client listener (16 MiB, ADR 0080); the intra listener keeps 64 MiB. Was: 64 MiB frame bound times `max_peer_connections`
    (16384) is a large theoretical buffer; consider a lower per-frame bound for
    the client port.
-5. The `ProdEnv` accept-to-pump `unbounded_channel`: one pump drains it, and the
+5. ~~The `ProdEnv` accept-to-pump `unbounded_channel`~~ now a bounded channel (16384, ADR 0080). Was: one pump drains it, and the
    demux behind it is capped, but a stalled pump (lock contention) would let it
    grow. Replace with a bounded channel and drop-oldest accounting.
-6. No idle/slow-header timeout on any HTTP listener (slot exhaustion by a slow
+6. ~~No idle/slow-header timeout on any HTTP listener~~ fixed (ADR 0080 section 5). Was: none on any HTTP listener (slot exhaustion by a slow
    client, section 1).
-7. Admin and console listeners are unauthenticated and their per-request
-   handlers are not covered by the in-flight bound (only the connection cap).
+7. Admin and console listeners are unauthenticated. The admin handlers now have an in-flight gate (ADR 0080); the console handler is still covered only by its connection cap.
