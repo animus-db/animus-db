@@ -185,7 +185,7 @@ nav.main a.nav-cta.here { text-decoration: none; background: var(--accent-soft);
 
 /* ---------- sections ---------- */
 section, .page-section { padding: 0 0 var(--sec-y); }
-section.band, .page-section.band { background: var(--bg-soft); padding: var(--sec-y) 0; margin-bottom: var(--sec-y); }
+section.band, .page-section.band { background: none; padding: var(--sec-y) 0; margin-bottom: var(--sec-y); }
 section.alt, .page-section.alt { padding-top: 0; }
 .section-head { max-width: 760px; margin-bottom: 8px; }
 .section-head p { margin: 0; max-width: 720px; }
@@ -209,24 +209,27 @@ section.alt, .page-section.alt { padding-top: 0; }
 @media (max-width: 560px) { .hero { padding-top: 36px; } .hero .lede { font-size: 19px; } }
 
 /* three plain columns */
-.cols-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: 40px 64px; }
+.cols-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: 16px; }
 .cols-3 h3 { margin-bottom: 10px; }
 .cols-3 p { margin: 0; }
 
 /* two plain lists */
-.cols-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: 32px 56px; }
+.cols-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: 16px; }
 .cols-2 ul { margin: 0; padding-left: 20px; }
 .cols-2 li { margin: 0 0 6px; }
 .cols-2 h3 { font-size: 20px; margin-bottom: 12px; }
 
 /* ---------- legacy card markup, rendered as open columns ---------- */
-.cardgrid { display: grid; grid-template-columns: repeat(var(--cols, 3), minmax(0, 1fr)); gap: 40px 56px; }
+.cardgrid { display: grid; grid-template-columns: repeat(var(--cols, 3), minmax(0, 1fr)); gap: 16px; }
 .cardgrid.c2 { --cols: 2; }
 .cardgrid.c3 { --cols: 3; }
 .cardgrid.c4 { --cols: 4; }
 @media (max-width: 900px) { .cardgrid.c4 { --cols: 2; } .cardgrid.c3 { --cols: 2; } }
-@media (max-width: 620px) { .cardgrid { --cols: 1 !important; gap: 28px; } }
-.lcard, .card { padding: 0; }
+@media (max-width: 620px) { .cardgrid { --cols: 1 !important; } }
+.lcard, .card, .cols-3 > div, .cols-2 > div {
+  background: var(--surface); border: 1px solid var(--rule); border-radius: 8px; padding: 20px 22px; min-width: 0;
+}
+.lcard .tag { display: block; margin-bottom: 8px; font-size: 13px; color: var(--text3); }
 .lcard h3, .card h3 { margin: 0 0 8px; }
 .lcard h3 a { color: inherit; }
 .lcard p, .card p { margin: 0; font-size: 17px; }
@@ -234,7 +237,7 @@ section.alt, .page-section.alt { padding-top: 0; }
 .lcard ul { margin: 0; padding-left: 20px; }
 .lcard li { margin-bottom: 5px; }
 .lcard .more { margin-top: 10px; display: block; }
-.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr)); gap: 32px 48px; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr)); gap: 16px; }
 
 /* ---------- diagrams ---------- */
 .diagram-plate { padding: 0; overflow-x: auto; }
