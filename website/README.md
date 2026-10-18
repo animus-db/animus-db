@@ -14,7 +14,7 @@ website/
   performance.html      reference: the cost model, the benchmark methodology (no published numbers yet)
   licence.html          reference: AGPL-3.0 scenario by scenario
   docs.html             documentation — concepts, architecture, API, operations
-  install.html          build, run a cluster, connect, deploy
+  install.html          docker run, build, run a cluster, connect, deploy
   articles/
     why-lock-in-compounds.html
     what-self-hosting-costs.html

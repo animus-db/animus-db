@@ -87,8 +87,8 @@
     <span class="kicker">Install</span>
     <h1>Get a cluster running</h1>
     <p>
-      AnimusDB builds from source with Cargo. There are no packages or container images
-      yet — clone, build, run. About a minute of typing plus a compile.
+      Run the container image, or build from source with Cargo. There are no distro
+      packages yet. Either way it is a couple of commands, plus a compile if you build.
     </p>
   </div>
 </div>
@@ -98,6 +98,7 @@
     <div class="cols">
       <div>
         <h4>Quick start</h4>
+        <a href="#docker">Run with Docker</a>
         <a href="#prereqs">Prerequisites</a>
         <a href="#build">Build from source</a>
         <a href="#run">Run a cluster</a>
@@ -122,6 +123,55 @@
 
   <div class="doc-body">
 
+    <section id="docker">
+      <h2>Run with Docker</h2>
+      <p>
+        The quickest way to try it: one node in a container, with the DynamoDB endpoint and both
+        web consoles published on your machine. Generate a single-node config that binds every
+        interface (the image has no shell, so the config comes from the image's own
+        <code>gen-config</code>), then start the node with a named volume for its data.
+      </p>
+      <div class="code">
+        <div class="code-head"><span class="lights"><i></i><i></i><i></i></span><span class="title">docker</span></div>
+<pre><span class="p">$</span> <span class="k">docker run --rm ghcr.io/animus-db/animusd:latest gen-config --nodes 1 --host 0.0.0.0 &gt; animus.json</span>
+<span class="p">$</span> <span class="k">docker run -d --name animusd \</span>
+    <span class="k">-p 7102:7102 -p 7103:7103 -p 7105:7105 \</span>
+    <span class="k">-v animus-data:/var/lib/animus \</span>
+    <span class="k">-v "$PWD/animus.json:/etc/animus/cluster.json:ro" \</span>
+    <span class="k">ghcr.io/animus-db/animusd:latest \</span>
+    <span class="k">--config /etc/animus/cluster.json --node 0 --dir /var/lib/animus</span></pre>
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th class="w-170">Port</th><th>What it serves</th></tr></thead>
+          <tbody>
+            <tr><td><code>7102</code></td><td>The DynamoDB endpoint: <code>http://localhost:7102</code>.</td></tr>
+            <tr><td><code>7103</code></td><td>The operator dashboard: <code>http://localhost:7103</code>.</td></tr>
+            <tr><td><code>7105</code></td><td>The data console: <code>http://localhost:7105</code>.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        Data lives in the <code>animus-data</code> volume, so it survives <code>docker rm</code>.
+        Once it logs <code>ready</code>, use the AWS CLI exactly as in
+        <a href="#connect">Connect to it</a>, with <code>ANIMUS=http://localhost:7102</code>.
+      </p>
+      <div class="callout">
+        <span class="label">What this image is</span>
+        <p>
+          <code>latest</code> tracks the <code>main</code> branch; there are no version tags yet.
+          It is built for <code>linux/amd64</code> only, so Apple-silicon Macs run it under
+          emulation. It is pre-alpha, and both consoles are unauthenticated: publish the ports
+          only on a machine you trust (use <code>-p 127.0.0.1:7102:7102</code> to keep them
+          off the network).
+        </p>
+      </div>
+      <p class="muted">
+        Prefer to build it yourself, or want a three-node cluster in one process? Use the
+        source build below.
+      </p>
+    </section>
+
     <section id="prereqs">
       <h2>Prerequisites</h2>
       <p>
@@ -141,6 +191,7 @@
 
     <section id="build">
       <h2>Build from source</h2>
+      <p>The alternative to the container image, and the way to run a multi-node cluster in one process.</p>
       <div class="code">
         <div class="code-head"><span class="lights"><i></i><i></i><i></i></span><span class="title">build</span></div>
 <pre><span class="p">$</span> <span class="k">git clone https://github.com/animus-db/animus-db.git</span>
