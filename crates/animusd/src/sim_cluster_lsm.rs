@@ -33,6 +33,53 @@ use futures::executor::block_on;
 
 use super::*;
 
+/// ADR 0081 Tier 2: LSM options and a shared compaction "wedge" every tablet
+/// engine of the cluster is built with, installed per thread like
+/// `SimOverload`. With the wedge set the engines' compaction gate withholds every
+/// permit (urgent included), the stand-in for compaction that cannot keep up.
+#[derive(Clone)]
+pub(crate) struct SimStall {
+    pub(crate) opts: animus_storage::LsmOptions,
+    pub(crate) wedge: Arc<std::sync::atomic::AtomicBool>,
+}
+
+thread_local! {
+    static SIM_STALL: std::cell::RefCell<Option<SimStall>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Removes the thread's [`SimStall`] when dropped.
+pub(crate) struct SimStallGuard(());
+
+impl Drop for SimStallGuard {
+    fn drop(&mut self) {
+        SIM_STALL.with(|d| *d.borrow_mut() = None);
+    }
+}
+
+impl SimStall {
+    pub(crate) fn install(self) -> SimStallGuard {
+        SIM_STALL.with(|d| *d.borrow_mut() = Some(self));
+        SimStallGuard(())
+    }
+
+    fn current() -> Option<SimStall> {
+        SIM_STALL.with(|d| d.borrow().clone())
+    }
+}
+
+struct SimWedge(Arc<std::sync::atomic::AtomicBool>);
+
+impl animus_storage::CompactionGate for SimWedge {
+    fn acquire(&self, _bypass: bool) -> Option<animus_storage::CompactionPermit> {
+        if self.0.load(std::sync::atomic::Ordering::Acquire) {
+            None
+        } else {
+            Some(Box::new(()))
+        }
+    }
+}
+
 /// Which storage engine a [`SimCluster`] builds under its control plane and
 /// its tablet-host reconcilers.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -48,12 +95,14 @@ pub(crate) enum SimEngineBackend {
 /// shape (ADR 0050 rung 1) over a `SimEnv` disk, strict on `open`.
 pub(crate) struct SimLsmTabletFactory {
     env: SimEnv,
+    stall: Option<SimStall>,
     files: animus_cp_data::tablet_files::TabletFileIndex<SimEnv>,
 }
 
 impl SimLsmTabletFactory {
     pub(crate) fn new(env: SimEnv) -> Self {
         Self {
+            stall: SimStall::current(),
             files: animus_cp_data::tablet_files::TabletFileIndex::new(
                 env.clone(),
                 |t| tablet_lsm_prefix(t.0),
@@ -68,8 +117,24 @@ impl SimLsmTabletFactory {
 impl EngineFactory<LsmEngine<SimEnv>> for SimLsmTabletFactory {
     async fn open(&self, tablet: TabletId) -> Result<LsmEngine<SimEnv>, String> {
         self.files.note_open(tablet);
-        match LsmEngine::open(self.env.clone(), tablet_lsm_prefix(tablet.0)).await {
-            Ok(engine) => Ok(engine),
+        let opened = match &self.stall {
+            Some(st) => {
+                LsmEngine::open_with(
+                    self.env.clone(),
+                    tablet_lsm_prefix(tablet.0),
+                    st.opts.clone(),
+                )
+                .await
+            }
+            None => LsmEngine::open(self.env.clone(), tablet_lsm_prefix(tablet.0)).await,
+        };
+        match opened {
+            Ok(engine) => {
+                if let Some(st) = &self.stall {
+                    engine.set_compaction_gate(Arc::new(SimWedge(st.wedge.clone())));
+                }
+                Ok(engine)
+            }
             // Deliberately a panic, never `Err`: see the module doc.
             Err(e) => panic!(
                 "strict open of the tablet {} LSM engine failed: {e}",
@@ -97,10 +162,14 @@ impl EngineFactory<LsmEngine<SimEnv>> for SimLsmTabletFactory {
         keep: &[(Vec<u8>, Option<Vec<u8>>)],
     ) -> Result<LsmEngine<SimEnv>, String> {
         self.files.note_open(target);
-        source
+        let engine = source
             .clone_to_filtered(tablet_lsm_prefix(target.0), keep)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        if let Some(st) = &self.stall {
+            engine.set_compaction_gate(Arc::new(SimWedge(st.wedge.clone())));
+        }
+        Ok(engine)
     }
 
     async fn local_tablets(&self) -> BTreeSet<TabletId> {

@@ -312,3 +312,5 @@ slowest follower stalls a healthy quorum). Pure: `animus-control`
 `quorum_applied::`. Wire: `codec::` v2 round trip, v1 byte identity,
 truncation, `raftkv-wire/v2.bin`. Mixed version:
 `release5_to_release6_follower_applied_gate` and its negative control.
+
+**2026-10-18 note (ADR 0081, question 8 answered):** `LsmEngine` memtables and compaction buffers stay out of `QueuedBytes`. An engine at its L0 stop level or memtable cap now only delays the apply task, and the stall reaches clients through this ADR's propose bound (`Busy`, `ThrottlingException`); the composition is proven by `animus-cp-data` `lsm_stall_admission::` and `animusd` `sim_cluster_lsm_stall`.

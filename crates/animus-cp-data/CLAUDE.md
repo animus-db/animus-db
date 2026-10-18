@@ -3623,3 +3623,16 @@ state is missing). Remove it with the R-1 pin once R-1 contains #1243/#1251.
   (`ANIMUS_FOLLOWER_LAG_SEEDS`, `ANIMUS_FOLLOWER_LAG_CELL`); its `PacedEngine` has a per-node apply
   pace and a stall switch, and the leader must be *fast* or its own backlog hides the effect.
   Fixture: `tests/fixtures/formats/raftkv-wire/v2.bin`. Diagnostic: `peer_applied_index`.
+
+## Compaction write budget (ADR 0081)
+
+`compaction_io.rs` is the pure `IoBucket` (a token bucket with debt, in byte-nanoseconds, 1 s
+burst, `scale_by_lag` with a 4 MiB/s floor). `BackgroundBudget` owns one per node
+(`BudgetSizes::with_compaction_io`, `set_compaction_io_rate`, `compaction_io_stats`) and
+`EngineCompactionGate` implements the storage `io_admit`/`io_settle`/`io_charge` seam; the
+rate `0` is off, and `compaction_gate()` returns a gate when the permit pool OR the bucket is on.
+Every engine the node hosts needs the gate, including split children (a clone
+used to be opened without it). Corpora: `tests/it/compaction_io_budget_corpus.rs` (budget
+cells and controls), `tests/it/lsm_stall_admission.rs` (a stall reaches the client as `Busy`
+through the ADR 0080 / #1330 bound, never a panic), and the ignored
+`tests/it/lsm_stall_measure.rs` characterisation sweep. Knob: `ANIMUS_LSM_STALL_SEEDS`.

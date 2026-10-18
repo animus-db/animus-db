@@ -295,6 +295,12 @@
         dropping it is deleting its files, and moving it does not disturb its neighbours.
       </p>
       <p>
+        When compaction falls behind, the engine slows its own writers (and waits at a hard
+        limit) instead of failing them; the slowdown reaches clients as a retryable
+        <code>ThrottlingException</code>, never as an error that loses a write. A node-wide
+        compaction write budget is available as an opt-in setting.
+      </p>
+      <p>
         Every byte of that engine's I/O goes through the same seam the simulator controls, which
         is why crash recovery is tested by injecting faults rather than by hoping.
       </p>

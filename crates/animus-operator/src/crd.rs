@@ -567,6 +567,12 @@ pub struct AnimusClusterSpec {
     /// and skipped when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_capacity: Option<NodeCapacitySpec>,
+    /// Node-local background-work limits (ADR 0081). Every field is an
+    /// **explicit** operator choice; nothing here is derived from the pod's
+    /// resource requests or the volume (the operator cannot know the disk's
+    /// bandwidth). Additive and skipped when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<BackgroundSpec>,
     /// Name of a `Secret` (in the same namespace) holding the DynamoDB
     /// SigV4 credential store (`{"credentials": {"AKID...": "secret...",
     /// ...}}`, ADR 0057). Mounted read-only at `/etc/animus/dynamo-auth/`
@@ -763,6 +769,22 @@ pub struct NodeCapacitySpec {
     /// set the cap and the pools stay off. `0` is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cores: Option<u32>,
+}
+
+/// `spec.background` (ADR 0081): explicit node-local background-work limits.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundSpec {
+    /// The node-wide compaction write budget in MiB per second (rendered into
+    /// `cluster_settings.bg_compaction_io_bytes_per_sec`, MiB x 2^20). It is a
+    /// token bucket with debt that paces the bytes compaction writes; flush is
+    /// never delayed and an L0 build-up past twice the compaction trigger
+    /// overrides it. **Never derived**: the operator cannot know the volume's
+    /// bandwidth, so unset (or `0`) leaves the limit off, which is the node's
+    /// default. Size it below the sustained write bandwidth the pod's volume
+    /// delivers, leaving room for the WAL and flush.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_io_mib_per_sec: Option<u64>,
 }
 
 impl AnimusClusterSpec {
@@ -997,6 +1019,7 @@ impl Default for AnimusClusterSpec {
             host_unsettled_max: None,
             host_settle_timeout_ms: None,
             node_capacity: None,
+            background: None,
             dynamo_auth_secret_name: None,
             tls: None,
             s3: None,

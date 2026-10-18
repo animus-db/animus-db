@@ -542,7 +542,10 @@ fn spawn_put(sim: &Simulator, e: &LsmEngine<SimEnv>, key: &'static [u8], version
     let out: Outcome = Arc::new(Mutex::new(None));
     let (o, e2) = (out.clone(), e.clone());
     sim.env(nid(0)).spawn_task(async move {
-        let r = e2.put(key, &big(), version).await.map_err(|x| x.to_string());
+        let r = e2
+            .put(key, &big(), version)
+            .await
+            .map_err(|x| x.to_string());
         *o.lock().unwrap() = Some(r);
     });
     out

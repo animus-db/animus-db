@@ -76,6 +76,10 @@ on:
         description: "Seeds per scenario (ANIMUS_LSM_DISK_FAULT_SEEDS, LsmEngine DiskConfig fault-injection corpus)"
         required: false
         default: "40"
+      lsm_stall_seeds:
+        description: "Seeds per cell (ANIMUS_LSM_STALL_SEEDS, ADR 0081 L0 write-stall / compaction IO budget corpus: storage tier 1, cp-data composition + budget, animusd SimCluster tier 2)"
+        required: false
+        default: "20"
       lsm_encrypted_seeds:
         description: "Seeds per scenario (ANIMUS_LSM_ENCRYPTED_SEEDS, LsmEngine<EncryptedEnv<SimEnv>> crash/fault corpus, ADR 0069)"
         required: false
@@ -408,6 +412,21 @@ jobs:
           ANIMUS_LSM_DISK_FAULT_SEEDS: ${{ github.event.inputs.lsm_disk_fault_seeds || '40' }}
         run: |
           cargo test -p animus-storage --test it lsm_disk_faults:: -- --nocapture
+
+      # ADR 0081: the L0 write stall and the node-wide compaction write budget.
+      # Tier 1 (animus-storage), the composition and budget cells (animus-cp-data)
+      # and the SimCluster wire cell (animusd), each a pure function of its seed.
+      - name: deep LSM write-stall corpus
+        id: lsm_stall
+        continue-on-error: true
+        timeout-minutes: 40
+        env:
+          ANIMUS_LSM_STALL_SEEDS: ${{ github.event.inputs.lsm_stall_seeds || '20' }}
+        run: |
+          cargo test -p animus-storage --test it lsm_write_stall:: -- --nocapture
+          cargo test -p animus-cp-data --test it lsm_stall_admission:: -- --nocapture
+          cargo test -p animus-cp-data --test it compaction_io_budget_corpus:: -- --nocapture
+          cargo test -p animusd --lib sim_cluster_lsm_stall -- --nocapture
 
       # LsmEngine<EncryptedEnv<SimEnv>> crash/fault corpus (ADR 0069, S-03
       # PR 1): the encrypted sibling of the two corpora above — a torn or
@@ -837,6 +856,7 @@ jobs:
             [pitr]="${{ steps.pitr.outcome }}"
             [lsm_crash]="${{ steps.lsm_crash.outcome }}"
             [lsm_disk_fault]="${{ steps.lsm_disk_fault.outcome }}"
+            [lsm_stall]="${{ steps.lsm_stall.outcome }}"
             [lsm_encrypted]="${{ steps.lsm_encrypted.outcome }}"
             [segment_store_encrypted]="${{ steps.segment_store_encrypted.outcome }}"
             [control]="${{ steps.control.outcome }}"
@@ -865,7 +885,7 @@ jobs:
           )
           failed=0
           failed_names=()
-          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner reconfigure_drop inplace_split backup pitr lsm_crash lsm_disk_fault lsm_encrypted segment_store_encrypted control simcluster dynamo_wire zone_placement split_relocation export_import s3_fault heartbeat wan_timing density_admission repair_pacing mrsc_leader mrsc_cluster mrec_world sharedwal wal_rewrite_crash upgrade_restart upgrade_restart_cluster upgrade_mixed upgrade_mixed_cluster upgrade_roll learner_snapshot_livelock scale; do
+          for name in raftkv raftkv_lsm raftkv_wal_faults txn streams backfill split reconciler quiesce learner reconfigure_drop inplace_split backup pitr lsm_crash lsm_disk_fault lsm_stall lsm_encrypted segment_store_encrypted control simcluster dynamo_wire zone_placement split_relocation export_import s3_fault heartbeat wan_timing density_admission repair_pacing mrsc_leader mrsc_cluster mrec_world sharedwal wal_rewrite_crash upgrade_restart upgrade_restart_cluster upgrade_mixed upgrade_mixed_cluster upgrade_roll learner_snapshot_livelock scale; do
             outcome="${outcomes[$name]}"
             echo "${name}: ${outcome}"
             if [ "${outcome}" != "success" ]; then

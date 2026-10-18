@@ -717,3 +717,5 @@ PlacementCapacityBlockedTablets` is an additive appended variant.
   `docs/lessons/testing/2026-10-14-bound-a-rate-by-cumulative-commits-not-by-a-window-anchored-at-an-observation.md`.
 
 **2026-10-17 note:** the refusal path this ADR said it lacked now exists: ADR 0080 refuses a client write that would wake a quiesced group when lag >= 100 ms and the awake set is at `A_eff`, and the node gate shrinks with the same lag. The ADR 0079 awake cap and the ADR 0080 `QueuedBytes` budget are independent bounds that compose; size the pod for the floor plus the budget plus the working set.
+
+**2026-10-18 note (ADR 0081):** decision 6 is answered. The L0 write stall and the compaction IO rate limit are ADR 0081 (issue #1300), implemented: per-engine L0 slowdown/stop levels before the WAL append (delay only, never `Err`), and a node-wide compaction write-bytes token bucket beside this ADR's permit pool (permit first, then bucket; the L0 bypass is also the bucket's urgent level, so the two limiters cannot deadlock a stall). The permit pool and its bypass are unchanged.

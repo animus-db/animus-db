@@ -864,3 +864,30 @@ The LSM WAL/manifest/SSTable decoders are the `lsm_formats` fuzz target, reached
   cannot resurrect GC'd versions. Test: `lsm_gc.rs::held_version_survives_compaction_gc`.
 
 - **A key's versions can straddle SSTable data blocks** (blocks are cut at 4 KiB regardless of key boundaries). `SsTableReader` point reads and `scan_at` use `blocks_for_key`, a range, never one block (issue #1315; `tests/it/lsm_multi_block_versions.rs`). Do not reintroduce a single-block lookup.
+
+## L0 write stall and the compaction IO seam (ADR 0081)
+
+- `stall.rs` is the pure policy (`StallPolicy::decide`: `Go` / `Delay` / `Wait`, the
+  linear ramp, `StallLedger` for the node-wide gauges). The engine hook is
+  `LsmEngine::stall_before_write`, called **first** in every mutating method, before
+  the WAL append and outside every lock. It only delays or waits; the only `Err`s it
+  returns are `StorageFull` (after one fresh maintenance run, `confirmed_full`) and
+  `Backend` after `maintenance_failure_limit` (8) consecutive non-ENOSPC maintenance
+  failures, counted in failures, never seconds. A stall must never return `Err` for
+  elapsed time: under the cp-data apply task an `Err` after the append panics the tablet.
+- `LsmOptions::production()` sets `l0_slowdown_factor`/`l0_stop_factor` to 3/5 (multiples
+  of `compaction_trigger`, validated `bypass < slowdown < stop`; 0 disables); `default()`
+  and `production_raw_versions()` leave them off. A test literal needs
+  `..LsmOptions::default()` (the struct gained fields).
+- `MaintenanceLock` has flush and compaction waiter classes: flush waiters are woken first,
+  a cancelled waiter hands the turn on. `CompactionGate` gained default methods
+  `io_admit`/`io_settle`/`io_charge` (`IoAdmission`); the order is permit, then bucket, and a
+  throttled run drops its permit and ends (retry in 100 ms). Urgent runs (L0 >= 2T) are
+  always admitted into debt.
+- `StallFault` (doc-hidden) are the negative-control faults of `tests/it/lsm_write_stall.rs`.
+  L0 only reaches 2T in practice: the corpora use a `Wedge` gate that withholds even urgent
+  compaction. See `docs/lessons/testing/2026-10-18-an-lsm-stall-test-must-withhold-compaction-not-just-slow-the-disk.md`.
+- Known: flush defers while `applies_in_flight > 0`, which starves under many concurrent
+  writers on a slow disk (memtable stall, no L0 growth); see
+  `docs/lessons/code-patterns/2026-10-18-flush-that-defers-to-in-flight-applies-starves-under-concurrent-writers.md`.
+- `tests/lsm_stall_prod.rs` is the `ProdEnv` liveness test (own target, timeout-guarded).

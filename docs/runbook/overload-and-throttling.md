@@ -108,6 +108,38 @@ heartbeats keep priority over bulk snapshot traffic. The node budget is
 of `spec.resources.limits.memory`). Size a pod for the measured floor plus that
 budget plus engine working memory (`docs/density-measurements.md`).
 
+## The LSM write stall and the compaction write budget (ADR 0081)
+
+Every tablet engine slows its own writers when compaction falls behind, and the
+slowdown reaches clients only as the refusals above. An engine whose level-0 table
+count reaches 3x the compaction trigger delays each write along a ramp (16 MiB/s
+down to 256 KiB/s); at 5x it waits until compaction brings the count down. The
+wait sits before the log append and never returns an error, so a stall is never a
+500: the tablet's apply backlog grows, the propose bound fires and the client sees
+`overload_shed_busy` (`ThrottlingException`). Read these on `/metrics`:
+
+| Metric | Means | Do |
+|---|---|---|
+| `storage_engines_slowed`, `storage_engines_stopped` | engines past the slowdown or stop level right now | a few slowed engines under a burst is normal; stopped engines that stay stopped mean compaction is starved (CPU, disk) |
+| `storage_l0_tables_max`, `storage_l0_tables_hwm` | the worst engine's level-0 count, now and the high-water mark | the count is bounded near 2x the trigger by the urgent compaction level; a mark near the stop level means the permit pool or the disk is the limit |
+| `storage_write_stalls_memtable`, `storage_write_stalls_l0_slowdown`, `storage_write_stalls_l0_stop` and the microsecond totals `storage_write_stall_micros_memtable`, `storage_write_stall_micros_l0_slowdown`, `storage_write_stall_micros_l0_stop` | writes delayed, by cause | a memtable cause is flush falling behind (the disk), an L0 cause is compaction |
+| `storage_flush_blocked_micros` | time flushes waited behind a running compaction | grows when one long compaction holds the maintenance lock; flush is served first once it is free |
+| `storage_maintenance_failure_streak` | consecutive failed flush or compaction runs in the worst engine | at 8 the engine stops the node instead of waiting forever; check the disk and the logs. A full disk is a different path (`StorageFull`) |
+| `storage_compaction_io_rate`, `storage_compaction_io_debt_bytes`, `storage_compaction_throttled_micros`, `storage_compaction_urgent` | the node compaction write budget, if configured | see below |
+
+`/admin/health` carries the same numbers as an advisory `lsm_stall` object; like the
+other advisory signals it never fails a probe or the roll gate.
+
+The compaction write budget is off by default (`--compaction-io-bytes-per-sec 0`,
+`cluster_settings.bg_compaction_io_bytes_per_sec`, operator
+`spec.background.compactionIoMiBPerSec`). Turn it on only when compaction writes
+compete with the log for a disk and you have measured the volume's sustained write
+bandwidth (`dd oflag=dsync` or the `volume_sequential_fsync_write_baseline` test):
+set it to a fraction of that figure. It paces compaction only; flush is never
+delayed, and an engine whose L0 count passes twice the trigger compacts regardless
+(`storage_compaction_urgent` counts those runs and the bucket goes into debt), so
+the budget cannot deadlock a stall.
+
 ## Verified
 
 Setting a table to 1 RCU / 1 WCU on a local dev cluster and writing 400 items in

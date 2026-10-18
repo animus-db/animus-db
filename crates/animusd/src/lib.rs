@@ -23425,6 +23425,9 @@ mod sim_cluster_upgrade_corpus;
 #[cfg(test)]
 mod sim_cluster_zone_placement;
 
+/// ADR 0081 Tier 2: an LSM write stall over `SimCluster` and the DynamoDB wire.
+#[cfg(test)]
+mod sim_cluster_lsm_stall;
 /// G-01 stage G-c, M4: the MRSC stretch-table cluster corpus
 /// (`ANIMUS_MRSC_SEEDS`) — see that module's own doc.
 #[cfg(test)]

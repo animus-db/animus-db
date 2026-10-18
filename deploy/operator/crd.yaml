@@ -42,6 +42,29 @@ spec:
                 minimum: 0.0
                 nullable: true
                 type: integer
+              background:
+                description: |-
+                  Node-local background-work limits (ADR 0081). Every field is an
+                  **explicit** operator choice; nothing here is derived from the pod's
+                  resource requests or the volume (the operator cannot know the disk's
+                  bandwidth). Additive and skipped when unset.
+                nullable: true
+                properties:
+                  compactionIoMibPerSec:
+                    description: |-
+                      The node-wide compaction write budget in MiB per second (rendered into
+                      `cluster_settings.bg_compaction_io_bytes_per_sec`, MiB x 2^20). It is a
+                      token bucket with debt that paces the bytes compaction writes; flush is
+                      never delayed and an L0 build-up past twice the compaction trigger
+                      overrides it. **Never derived**: the operator cannot know the volume's
+                      bandwidth, so unset (or `0`) leaves the limit off, which is the node's
+                      default. Size it below the sustained write bandwidth the pod's volume
+                      delivers, leaving room for the WAL and flush.
+                    format: uint64
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                type: object
               backupStore:
                 description: |-
                   The **non-S3** `--backup-store` value for every combined-role pod

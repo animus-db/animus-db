@@ -12598,3 +12598,14 @@ seal knobs). A new `StreamSealKnobs { .. }` literal needs `..Default::default()`
   `CLIENT_LISTENER_FRAME_CAP` (16 MiB) apply to the client listener only.
 - `SimOverload` (`sim_cluster.rs`) is the thread-local knob for Tier 2 (`sim_cluster_overload`).
 - `/admin/health` gained advisory `queued_bytes*` fields; they never affect `ok`.
+
+## LSM write stall wiring (ADR 0081)
+
+`LsmTabletFactory::install_node_seams` gives every engine it opens or clones the node's
+compaction gate and the shared `StallLedger`; the ledger feeds the `storage_engines_*` and
+`storage_l0_tables_*` gauges and `/admin/health`'s advisory `lsm_stall` object (never fails
+a probe or the roll gate). `--compaction-io-bytes-per-sec` / `cluster_settings.
+bg_compaction_io_bytes_per_sec` (0 = off, node-local class L: no Gate, no format) set the
+node bucket; the operator exposes only the explicit `spec.background.compactionIoMiBPerSec`.
+`sim_cluster_lsm_stall.rs` is the Tier 2 wire cell (`SimStall` thread-local in
+`sim_cluster_lsm.rs` installs the engine options and a shared compaction wedge).

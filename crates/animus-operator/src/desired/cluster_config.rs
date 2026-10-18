@@ -212,6 +212,11 @@ pub struct ClusterSettings {
     /// the compaction pool (`max(1, cores / 2)`) from it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cores: Option<u32>,
+    /// ADR 0081: the node-wide compaction write budget in bytes per second,
+    /// from `spec.background.compactionIoMiBPerSec` (never derived; absent
+    /// means off).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg_compaction_io_bytes_per_sec: Option<u64>,
     /// ADR 0075 section 5.4 (G-e): this cluster's MREC region name
     /// (`spec.region`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -487,6 +492,12 @@ pub fn cluster_settings_or_none(spec: &AnimusClusterSpec) -> Option<ClusterSetti
         node_weight,
         node_max_replicas,
         cores: derive_cores(spec),
+        bg_compaction_io_bytes_per_sec: spec
+            .background
+            .as_ref()
+            .and_then(|b| b.compaction_io_mib_per_sec)
+            .filter(|m| *m > 0)
+            .map(|m| m.saturating_mul(1 << 20)),
         auto_split_bytes: spec.auto_split_bytes,
         quiesce_after_secs: spec.quiesce_after_secs,
         max_region_rtt_ms: spec.max_region_rtt_ms,
@@ -1190,6 +1201,43 @@ mod tests {
                 .cluster_settings
                 .is_none()
         );
+    }
+
+    /// ADR 0081: the compaction write budget is an explicit operator choice
+    /// (MiB per second in the spec, bytes in `cluster.json`), never derived from
+    /// the resource requests, and `0` or unset leaves it absent.
+    #[test]
+    fn compaction_io_budget_is_explicit_and_never_derived() {
+        let mut s = spec(3);
+        with_requests(&mut s, Some("8"), Some("16Gi"));
+        let settings = cluster_settings_or_none(&s).expect("requests derive other keys");
+        assert_eq!(settings.bg_compaction_io_bytes_per_sec, None);
+        s.background = Some(crate::crd::BackgroundSpec {
+            compaction_io_mib_per_sec: Some(0),
+        });
+        assert_eq!(
+            cluster_settings_or_none(&s)
+                .unwrap()
+                .bg_compaction_io_bytes_per_sec,
+            None
+        );
+        s.background = Some(crate::crd::BackgroundSpec {
+            compaction_io_mib_per_sec: Some(48),
+        });
+        let value: serde_json::Value =
+            serde_json::from_str(&to_json(&build_cluster_config("c", "ns", &s))).unwrap();
+        assert_eq!(
+            value["cluster_settings"]["bg_compaction_io_bytes_per_sec"],
+            48u64 << 20,
+            "got {value}"
+        );
+        // Alone, it still produces the section; absent otherwise.
+        let mut bare = spec(3);
+        bare.background = Some(crate::crd::BackgroundSpec {
+            compaction_io_mib_per_sec: Some(1),
+        });
+        assert!(cluster_settings_or_none(&bare).is_some());
+        assert!(cluster_settings_or_none(&spec(3)).is_none());
     }
 
     #[test]
