@@ -887,12 +887,27 @@ The LSM WAL/manifest/SSTable decoders are the `lsm_formats` fuzz target, reached
 - `StallFault` (doc-hidden) are the negative-control faults of `tests/it/lsm_write_stall.rs`.
   L0 only reaches 2T in practice: the corpora use a `Wedge` gate that withholds even urgent
   compaction. See `docs/lessons/testing/2026-10-18-an-lsm-stall-test-must-withhold-compaction-not-just-slow-the-disk.md`.
-- Flush admission (issue #1341): `flush` does not skip while `applies_in_flight > 0`; under the
-  maintenance lock it sets `flush_pending` (writers park at `log_and_apply` entry, before logging),
+- Flush lane (issue #1341). Flush and compaction are **not** mutually exclusive any more:
+  `flush_lane` serializes flushes (and a `clone_to`, which takes both lanes, flush first),
+  `maintenance` serializes compactions, and the short `install` lock is the only place the two
+  meet: it builds the new `Manifest` from the *current* one, `write_manifest`s it and swaps the
+  tables/readers (one fsync, never across a merge or SSTable build). SSTable seqs come from
+  `Inner::alloc_seq`, not the manifest, because both lanes build files concurrently;
+  `manifest.next_seq` at install is `max(current, own seq)`; a flush inserts its table sorted by
+  seq. A crash can leave an orphan file at a seq below `next_seq` (unreferenced, never read, never
+  reused: a leaked file, not a correctness issue). Reads take the max version across tables, so
+  seq order across levels never mattered. Background mode runs a **flush task**
+  (`flush_scheduled`) and a **compaction task** (`maintenance_scheduled`); `failure_lane` keeps a
+  success on one lane from clearing the other lane's `StorageFull`/failure verdict. Control (g)
+  takes both lanes to model the old single lock.
+- Flush admission (#1341): `flush` does not skip while `applies_in_flight > 0`; holding the
+  flush lane it sets `flush_pending` (writers park at `log_and_apply` entry, before logging),
   waits for the in-flight count to reach zero and snapshots in that same critical section
-  (`FlushPendingGuard` clears the gate, also on drop). Never set the gate before the maintenance
-  lock (writers would wait out a compaction). Regression: `tests/it/lsm_flush_starvation.rs`
-  (`ANIMUS_FLUSH_STARVATION_SEEDS`). Remaining throughput limit with many writers on a slow disk:
-  a long compaction holds the one maintenance lock while the memtable fills. See
+  (`FlushPendingGuard` clears the gate, also on drop). Never set the gate before the flush lane
+  is held. A second would-be flusher skips while `flush_active`. Regressions:
+  `tests/it/lsm_flush_starvation.rs` (`ANIMUS_FLUSH_STARVATION_SEEDS`): the starvation test and
+  `flush_completes_while_a_compaction_is_running` (use `background_maintenance: true` there, or a
+  write runs the due compaction inline and queues on the compaction lane itself). The 1 x 8
+  throughput limit is now compaction cost (L0 to L1 rewrites all of L1). See
   `docs/lessons/code-patterns/2026-10-18-flush-that-defers-to-in-flight-applies-starves-under-concurrent-writers.md`.
 - `tests/lsm_stall_prod.rs` is the `ProdEnv` liveness test (own target, timeout-guarded).

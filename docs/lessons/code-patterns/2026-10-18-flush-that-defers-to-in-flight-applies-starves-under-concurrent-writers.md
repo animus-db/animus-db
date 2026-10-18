@@ -29,7 +29,14 @@ producer is a starvation; a "close the door, drain, then act" is not. Two
 pitfalls the fix avoids: set the gate only *after* taking the maintenance lock
 (else writers block for a whole compaction), and make the gate RAII (a dropped
 flush future must not leave it shut). Regression: `tests/it/lsm_flush_starvation.rs`.
-Caveat found while measuring: the 1-engine x 8-writer rig is mostly bounded by a
-long compaction holding the maintenance lock (0.3 s growing to 2 s at a 5 ms
-sync), during which the memtable fills to its cap; the flush fix doubled the flush
-count (23 to 44) but does not by itself restore goodput there.
+Second half (same issue): fixing the skip alone doubled the flush count but not goodput,
+because a flush still waited for a running compaction on the one maintenance lock, and the
+background mode ran flush and compaction in one task, so even a free lock could not help. The
+rule: **a lane is the lock plus the task that drives it.** Splitting only the lock changed
+nothing in the measurement (identical numbers); splitting the task as well removed the memtable
+stall entirely (190,000 ms of stall to 0) and moved the bound to L0, i.e. compaction cost. To run
+flush beside compaction: serialize them only on a short manifest-install section that builds the
+new manifest from the *current* one; allocate file seqs from a shared in-memory counter, not the
+manifest; keep per-lane failure state so one lane's success cannot clear the other's ENOSPC
+verdict. When a measurement does not move after a fix, trace timestamps before trusting the
+hypothesis: here the first model (the lock) was only half the answer.

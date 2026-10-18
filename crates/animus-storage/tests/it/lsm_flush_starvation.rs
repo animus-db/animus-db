@@ -124,3 +124,110 @@ fn flush_is_not_starved_by_overlapping_writers() {
         run(seed, 30);
     }
 }
+
+/// Issue #1341, second half: a flush must not wait for a compaction that is
+/// already running. The disk is slow, a compaction with many small output
+/// tables is in progress, and a memtable flush started meanwhile has to land
+/// (and be readable, with the compaction's inputs intact) before the
+/// compaction ends. Before the flush/compaction lanes were split this flush
+/// queued behind the whole compaction.
+#[test]
+fn flush_completes_while_a_compaction_is_running() {
+    for seed in seeds() {
+        let mut sim = Simulator::new(seed);
+        let env0 = sim.env(nid(0));
+        let o = LsmOptions {
+            flush_threshold_bytes: 1 << 20,
+            compaction_trigger: 3,
+            target_table_bytes: 256,
+            level_fanout: 4,
+            wal_segment_bytes: 1 << 20,
+            tombstone_grace_versions: 1 << 20,
+            trust_monotonic_versions: true,
+            // Background maintenance, so a write never runs the due compaction
+            // inline (it would then queue on the compaction lane itself).
+            background_maintenance: true,
+            l0_slowdown_factor: 0,
+            l0_stop_factor: 0,
+            ..LsmOptions::default()
+        };
+        let engine = block_on(LsmEngine::open_with(env0.clone(), PREFIX, o)).expect("open");
+        let mut ver = 0u64;
+        // Two flushes: L0 = 2, below the trigger of 3.
+        for round in 0..2u8 {
+            for k in 0..30u32 {
+                ver += 1;
+                block_on(engine.merge(format!("k{k:04}").as_bytes(), &[round; 100], ver))
+                    .expect("merge");
+            }
+            block_on(engine.flush_now()).expect("flush");
+        }
+        let mut cfg = DiskConfig::default();
+        cfg.set_sync_delay(Duration::from_millis(200));
+        sim.set_disk_config(cfg);
+
+        // Task A: the third flush makes L0 = 3, then a long compaction runs.
+        let compaction_done = Arc::new(AtomicBool::new(false));
+        {
+            let (e, done) = (engine.clone(), compaction_done.clone());
+            let base = ver;
+            env0.clone().spawn_task(async move {
+                for k in 0..30u32 {
+                    e.merge(
+                        format!("k{k:04}").as_bytes(),
+                        &[2u8; 100],
+                        base + 1 + u64::from(k),
+                    )
+                    .await
+                    .expect("merge");
+                }
+                e.flush_now().await.expect("flush a");
+                done.store(true, Ordering::Release);
+            });
+        }
+        // Run until the third flush has landed (compaction now in progress).
+        let mut guard = 0;
+        while engine.flush_count() < 3 && guard < 2000 {
+            sim.run_for(Duration::from_millis(50));
+            guard += 1;
+        }
+        assert_eq!(engine.flush_count(), 3, "seed {seed:#x}: third flush");
+        assert_eq!(
+            engine.compaction_count(),
+            0,
+            "seed {seed:#x}: compaction already committed; test needs a longer one"
+        );
+        // Task B: a fresh write and a flush while the compaction runs.
+        {
+            let e = engine.clone();
+            let v = ver + 100;
+            env0.clone().spawn_task(async move {
+                e.merge(b"zz-during", &[9u8; 100], v).await.expect("merge");
+                e.flush_now().await.expect("flush b");
+            });
+        }
+        let mut guard = 0;
+        while engine.flush_count() < 4 && guard < 4000 {
+            sim.run_for(Duration::from_millis(50));
+            guard += 1;
+        }
+        assert_eq!(engine.flush_count(), 4, "seed {seed:#x}: fourth flush");
+        assert_eq!(
+            engine.compaction_count(),
+            0,
+            "seed {seed:#x}: the flush waited for the running compaction to commit; \
+             replay: ANIMUS_SEED={seed:#x}"
+        );
+        sim.run_for(Duration::from_secs(120));
+        assert!(compaction_done.load(Ordering::Acquire), "compaction ends");
+        // Nothing lost across the interleaved installs.
+        let got = block_on(engine.get(b"zz-during")).expect("get");
+        assert!(got.is_some(), "seed {seed:#x}: flushed-during write lost");
+        for k in 0..30u32 {
+            let got = block_on(engine.get(format!("k{k:04}").as_bytes()))
+                .expect("get")
+                .expect("present");
+            assert_eq!(got.value, vec![2u8; 100], "seed {seed:#x}: k{k}");
+        }
+    }
+}

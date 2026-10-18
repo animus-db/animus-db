@@ -395,8 +395,31 @@ older binary that never reads it), and `lsm_crash`, `lsm_disk_faults` and
 
 ### Deferred
 
-- Flush starvation by `applies_in_flight` under concurrent writers (finding 3): follow-up issue.
+- ~~Flush starvation by `applies_in_flight` under concurrent writers (finding 3)~~: fixed by issue #1341, see the amendment below.
 - A default for the compaction write budget: needs a workload on a real volume; the sizing note in
   the runbook is the interim guidance.
-- Concurrent flush or incremental compaction (question 4): only if `storage_flush_blocked_micros`
-  is routinely large in production.
+- ~~Concurrent flush~~ (question 4): done in #1341, see the amendment below. Incremental or
+  partial L0 to L1 compaction remains deferred: it is now the bound on many writers per engine.
+
+## Amendment (2026-10-18, issue #1341): flush lane and flush admission
+
+The maintenance model changed; decision 4 ("a flush is served before a queued compaction") is
+superseded because a flush no longer queues behind a compaction at all.
+
+- **Flush admission.** `flush` no longer skips while `applies_in_flight > 0`. Holding the flush
+  lane it closes an entry gate (`flush_pending`), waits for the already-admitted applies to
+  finish, and snapshots in the same critical section that sees the count at zero, so a partially
+  applied batch is still never captured and the WAL watermark/GC argument is unchanged.
+- **Two lanes.** Flushes serialize on `flush_lane`, compactions on `maintenance`; both build their
+  files outside any lock and meet only in the `install` section (one `write_manifest` fsync, new
+  manifest built from the current one, in-memory tables/readers swapped). SSTable seqs come from
+  `Inner::alloc_seq`; `manifest.next_seq` at install is the max. Background mode has a separate
+  flush task and compaction task, and failure state is tracked per lane. The IO budget is
+  unchanged: a flush is still charged, never delayed, and never takes a compaction permit.
+- **Effect** (`docs/density-measurements.md` I.1): the memtable cap no longer stalls writers
+  behind a compaction ("flush blocked" 0 ms in every cell, it was up to 26 s); with the L0 stall on,
+  the 1 engine x 8 writer cell rises from 154 to 169 acked/s (5 ms) and p99 falls from 364 to
+  29 ms, and the bound becomes the cost of the L0 to L1 compaction. Control (g) now takes both
+  lanes to keep modelling the old single lock.
+- Class L, no durable format change (a crash can leave an unreferenced orphan SSTable below
+  `next_seq`, which recovery never reads).
