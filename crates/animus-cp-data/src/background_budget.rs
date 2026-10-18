@@ -132,6 +132,9 @@ pub struct BudgetSizes {
     pub splits: Option<usize>,
     /// [`BgPool::Compaction`].
     pub compactions: Option<usize>,
+    /// ADR 0081 decision 3: the node-wide compaction write budget in bytes/s;
+    /// `0` is **off** (the default), never derived from CPU or disk.
+    pub compaction_io_bytes_per_sec: u64,
 }
 
 impl BudgetSizes {
@@ -162,7 +165,16 @@ impl BudgetSizes {
                 Some(n) => (n > 0).then_some(n),
                 None => cores.map(|c| (c / 2).max(1)),
             },
+            compaction_io_bytes_per_sec: 0,
         }
+    }
+
+    /// Set the compaction write budget (`--compaction-io-bytes-per-sec`,
+    /// ADR 0081 decision 3); `0` leaves it off.
+    #[must_use]
+    pub const fn with_compaction_io(mut self, bytes_per_sec: u64) -> Self {
+        self.compaction_io_bytes_per_sec = bytes_per_sec;
+        self
     }
 
     /// Every pool off: byte-for-byte the pre-ADR behaviour.
@@ -174,6 +186,7 @@ impl BudgetSizes {
             catchup: None,
             splits: None,
             compactions: None,
+            compaction_io_bytes_per_sec: 0,
         }
     }
 
@@ -378,7 +391,7 @@ impl BackgroundBudget {
                     fault,
                     next_id: 1,
                     pools,
-                    io: crate::compaction_io::IoBucket::new(0),
+                    io: crate::compaction_io::IoBucket::new(sizes.compaction_io_bytes_per_sec),
                 }),
                 metrics,
             }),

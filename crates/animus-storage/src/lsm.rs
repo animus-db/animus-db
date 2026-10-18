@@ -6512,3 +6512,84 @@ mod legacy_wal_guard_tests {
         });
     }
 }
+
+/// ADR 0081 decision 4: the `MaintenanceLock` serves a flush before a queued
+/// compaction, FIFO within a class, with no lost wakeup (including when a woken
+/// waiter is cancelled before it polls).
+#[cfg(test)]
+mod maintenance_lock_order_tests {
+    use super::*;
+    use futures::executor::block_on;
+    use futures::task::noop_waker;
+
+    fn ready<F: Future>(f: Pin<&mut F>, cx: &mut Context<'_>) -> Option<F::Output> {
+        match f.poll(cx) {
+            Poll::Ready(v) => Some(v),
+            Poll::Pending => None,
+        }
+    }
+
+    #[test]
+    fn a_queued_flush_wins_over_an_earlier_queued_compaction() {
+        let lock = MaintenanceLock::default();
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let holder = block_on(lock.acquire(MaintenanceClass::Compaction));
+        let mut c = Box::pin(lock.acquire(MaintenanceClass::Compaction));
+        let mut f = Box::pin(lock.acquire(MaintenanceClass::Flush));
+        assert!(ready(c.as_mut(), &mut cx).is_none());
+        assert!(ready(f.as_mut(), &mut cx).is_none());
+        drop(holder);
+        // The compaction registered first and polls first, but must not take
+        // the free lock while a flush is parked.
+        assert!(ready(c.as_mut(), &mut cx).is_none());
+        let g = ready(f.as_mut(), &mut cx).expect("the flush takes the lock");
+        drop(g);
+        assert!(ready(c.as_mut(), &mut cx).is_some(), "then the compaction");
+    }
+
+    #[test]
+    fn registration_order_decides_within_a_class() {
+        let lock = MaintenanceLock::default();
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let holder = block_on(lock.acquire(MaintenanceClass::Flush));
+        let mut a = Box::pin(lock.acquire(MaintenanceClass::Flush));
+        let mut b = Box::pin(lock.acquire(MaintenanceClass::Flush));
+        assert!(ready(a.as_mut(), &mut cx).is_none());
+        assert!(ready(b.as_mut(), &mut cx).is_none());
+        drop(holder);
+        // Both are woken; whichever polls first wins, the other re-parks and
+        // wins next (no waiter is lost).
+        let g = ready(a.as_mut(), &mut cx).expect("first registered wins");
+        assert!(ready(b.as_mut(), &mut cx).is_none());
+        drop(g);
+        assert!(ready(b.as_mut(), &mut cx).is_some());
+    }
+
+    #[test]
+    fn a_cancelled_flush_waiter_hands_the_turn_to_the_compaction() {
+        let lock = MaintenanceLock::default();
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let holder = block_on(lock.acquire(MaintenanceClass::Compaction));
+        let mut c = Box::pin(lock.acquire(MaintenanceClass::Compaction));
+        let mut f = Box::pin(lock.acquire(MaintenanceClass::Flush));
+        assert!(ready(c.as_mut(), &mut cx).is_none());
+        assert!(ready(f.as_mut(), &mut cx).is_none());
+        drop(holder);
+        // The flush was the one woken, but is dropped before it polls.
+        drop(f);
+        assert!(
+            ready(c.as_mut(), &mut cx).is_some(),
+            "the compaction must not wait for a flush that no longer exists"
+        );
+    }
+
+    #[test]
+    fn an_uncontended_acquire_of_either_class_is_immediate() {
+        let lock = MaintenanceLock::default();
+        drop(block_on(lock.acquire(MaintenanceClass::Flush)));
+        drop(block_on(lock.acquire(MaintenanceClass::Compaction)));
+    }
+}

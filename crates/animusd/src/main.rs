@@ -349,7 +349,7 @@ fn otel_instance_label(args: &[String]) -> String {
 const USAGE: &str = "usage:\n  \
     animusd gen-config --nodes N [--host H] [--base-port P] [--region NAME] [--peer REGION=host:port[,..]]... [--allow-insecure-peers] [--mrec-max-clock-skew-ms MS]\n  \
     animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P]\n  \
-    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--max-region-rtt-ms MS] [--campaign-max-inflight N] [--lag-stretch-max N] [--host-unsettled-max N] [--host-settle-timeout-ms MS] [--node-weight N] [--node-max-replicas N] [--cores N] [--awake-max-per-core N] [--bg-snapshot-streams N] [--bg-catchup-learners N] [--bg-splits N] [--bg-compactions N] [--region NAME] [--peer REGION=host:port[,host:port...]]... [--allow-insecure-peers] [--mrec-max-clock-skew-ms MS] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH] [--encryption-key PATH] [--max-connections N] [--max-inflight N] [--queued-bytes-budget BYTES]\n  \
+    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--max-region-rtt-ms MS] [--campaign-max-inflight N] [--lag-stretch-max N] [--host-unsettled-max N] [--host-settle-timeout-ms MS] [--node-weight N] [--node-max-replicas N] [--cores N] [--awake-max-per-core N] [--bg-snapshot-streams N] [--bg-catchup-learners N] [--bg-splits N] [--bg-compactions N] [--compaction-io-bytes-per-sec N] [--region NAME] [--peer REGION=host:port[,host:port...]]... [--allow-insecure-peers] [--mrec-max-clock-skew-ms MS] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH] [--encryption-key PATH] [--max-connections N] [--max-inflight N] [--queued-bytes-budget BYTES]\n  \
     animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] [--encryption-key PATH]\n  \
     animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--dynamo-auth PATH]\n  \
     animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral] [--advertise-host NAME] [--label K=V]... [--labels-file PATH [--labels-file-annotations]] [--labels-wait-secs N] [--encryption-key PATH] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3]\n  \
@@ -609,6 +609,8 @@ async fn run(args: &[String]) -> Result<(), String> {
     let mut bg_catchup_learners: Option<usize> = None;
     let mut bg_splits: Option<usize> = None;
     let mut bg_compactions: Option<usize> = None;
+    // ADR 0081: the node-wide compaction write budget; same reach and rule.
+    let mut bg_compaction_io_bytes_per_sec: Option<u64> = None;
     // ADR 0079 step 6: control-leader repair pacing; same reach and conflict rule.
     let mut repair_proposals_per_tick: Option<usize> = None;
     let mut repair_inflight_max: Option<usize> = None;
@@ -807,6 +809,10 @@ async fn run(args: &[String]) -> Result<(), String> {
             "--bg-compactions" => {
                 bg_compactions = Some(parse_next(&mut it, "--bg-compactions")?);
             }
+            "--compaction-io-bytes-per-sec" => {
+                bg_compaction_io_bytes_per_sec =
+                    Some(parse_next(&mut it, "--compaction-io-bytes-per-sec")?);
+            }
             "--repair-proposals-per-tick" => {
                 repair_proposals_per_tick =
                     Some(parse_next(&mut it, "--repair-proposals-per-tick")?);
@@ -914,6 +920,7 @@ async fn run(args: &[String]) -> Result<(), String> {
         bg_catchup_learners,
         bg_splits,
         bg_compactions,
+        bg_compaction_io_bytes_per_sec,
         repair_proposals_per_tick,
         repair_inflight_max,
     };
@@ -987,13 +994,14 @@ async fn run(args: &[String]) -> Result<(), String> {
         || bg_catchup_learners.is_some()
         || bg_splits.is_some()
         || bg_compactions.is_some()
+        || bg_compaction_io_bytes_per_sec.is_some()
         || repair_proposals_per_tick.is_some()
         || repair_inflight_max.is_some())
         && config_path.is_none()
     {
         return Err(
             "--bg-snapshot-streams/--bg-catchup-learners/--bg-splits/--bg-compactions/\
-             --repair-proposals-per-tick/--repair-inflight-max are only \
+             --compaction-io-bytes-per-sec/--repair-proposals-per-tick/--repair-inflight-max are only \
              supported with --config/--node (set the matching cluster_settings keys in the \
              config file for the other shapes)"
                 .into(),
@@ -2158,6 +2166,10 @@ fn resolve_cluster_settings(
     merge_field!(bg_catchup_learners, "--bg-catchup-learners");
     merge_field!(bg_splits, "--bg-splits");
     merge_field!(bg_compactions, "--bg-compactions");
+    merge_field!(
+        bg_compaction_io_bytes_per_sec,
+        "--compaction-io-bytes-per-sec"
+    );
     merge_field!(repair_proposals_per_tick, "--repair-proposals-per-tick");
     merge_field!(repair_inflight_max, "--repair-inflight-max");
     merge_field!(allow_insecure_peers, "--allow-insecure-peers");
@@ -2301,6 +2313,7 @@ async fn run_single(
         || settings.bg_catchup_learners.is_some()
         || settings.bg_splits.is_some()
         || settings.bg_compactions.is_some()
+        || settings.bg_compaction_io_bytes_per_sec.is_some()
         || settings.repair_proposals_per_tick.is_some()
         || settings.repair_inflight_max.is_some()
     {
@@ -2309,6 +2322,7 @@ async fn run_single(
         cs.bg_catchup_learners = settings.bg_catchup_learners;
         cs.bg_splits = settings.bg_splits;
         cs.bg_compactions = settings.bg_compactions;
+        cs.bg_compaction_io_bytes_per_sec = settings.bg_compaction_io_bytes_per_sec;
         cs.repair_proposals_per_tick = settings.repair_proposals_per_tick;
         cs.repair_inflight_max = settings.repair_inflight_max;
     }

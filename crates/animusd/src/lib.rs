@@ -14615,6 +14615,9 @@ struct LsmTabletFactory {
     /// ADR 0079 layer 3: every tablet engine this factory opens takes its
     /// compactions from the node's pool (when that pool is on).
     bg_budget: Option<animus_cp_data::background_budget::BackgroundBudget>,
+    /// ADR 0081: the node's stall ledger, which every tablet engine joins so
+    /// `/admin/health` and the `storage_*` gauges see the node-wide stall.
+    stall_ledger: animus_storage::stall::StallLedger,
     /// Issue #1303: which tablets have files on the flat data dir, from one
     /// cached listing instead of one whole-directory listing per probe.
     files: animus_cp_data::tablet_files::TabletFileIndex<ProdEnv>,
@@ -14626,6 +14629,7 @@ impl LsmTabletFactory {
         bg_budget: Option<animus_cp_data::background_budget::BackgroundBudget>,
     ) -> Self {
         Self {
+            stall_ledger: animus_storage::stall::StallLedger::new(env.metrics()),
             files: animus_cp_data::tablet_files::TabletFileIndex::new(
                 env.clone(),
                 |t| tablet_lsm_prefix(t.0),
@@ -14634,6 +14638,21 @@ impl LsmTabletFactory {
             env,
             bg_budget,
         }
+    }
+}
+
+impl LsmTabletFactory {
+    /// Install the node-shared seams on a tablet engine: the compaction pool
+    /// and write budget (ADR 0079 layer 3, ADR 0081 decision 3) and the stall
+    /// ledger (ADR 0081 decision 5).
+    fn install_node_seams(&self, engine: &LsmEngine<ProdEnv>) {
+        if let Some(gate) = self.bg_budget.as_ref().and_then(|b| {
+            let env = self.env.clone();
+            b.compaction_gate(Arc::new(move || env.now()))
+        }) {
+            engine.set_compaction_gate(gate);
+        }
+        engine.set_stall_ledger(self.stall_ledger.clone());
     }
 }
 
@@ -14648,12 +14667,7 @@ impl animus_cp_data::host::EngineFactory<LsmEngine<ProdEnv>> for LsmTabletFactor
         )
         .await
         .map_err(|e| e.to_string())?;
-        if let Some(gate) = self.bg_budget.as_ref().and_then(|b| {
-            let env = self.env.clone();
-            b.compaction_gate(Arc::new(move || env.now()))
-        }) {
-            engine.set_compaction_gate(gate);
-        }
+        self.install_node_seams(&engine);
         Ok(engine)
     }
 
@@ -14698,10 +14712,15 @@ impl animus_cp_data::host::EngineFactory<LsmEngine<ProdEnv>> for LsmTabletFactor
         // hosted tablet. `source` is the caller's own already-open handle
         // (see the trait's own doc for why this method never re-opens it).
         self.files.note_open(target);
-        source
+        let child = source
             .clone_to_filtered(tablet_lsm_prefix(target.0), keep)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        // A split child is as much a tablet engine as any opened one: it takes
+        // its compactions from the node's pool and write budget and joins the
+        // node's stall ledger (ADR 0079 layer 3, ADR 0081).
+        self.install_node_seams(&child);
+        Ok(child)
     }
 
     /// Issue #722 — enumerate every tablet id this node's own data

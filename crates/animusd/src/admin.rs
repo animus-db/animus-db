@@ -2386,6 +2386,13 @@ fn health<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> (u16, Value) {
         // the high-water mark and the requests deferred; plus compactions that
         // bypassed the pool at the L0 safety valve. A pool that is off reads 0.
         "bg_permits": bg_permits_json(&ctx.env.metrics()),
+        // ADR 0081 decision 5, advisory only (never part of `ok`: a node under
+        // write load is working, not unhealthy, and a stall must not fail
+        // readiness or the roll gate): tablet engines whose writes are being
+        // delayed / are waiting now, the highest L0 table count on the node
+        // (now and ever), the compaction write budget's effective bytes/s
+        // (0 = off) and its debt, and the longest maintenance failure streak.
+        "lsm_stall": lsm_stall_json(&ctx.env.metrics()),
         // ADR 0080 section 4, advisory only (never part of `ok`, so it can
         // neither fail readiness nor the roll gate): the node `QueuedBytes`
         // budget (0 = unlimited), what is charged now and its high-water mark,
@@ -4333,6 +4340,21 @@ fn bg_permits_json(m: &animus_env::MetricsHandle) -> serde_json::Value {
         "split": pool(M::BgPermitInflightSplit, M::BgPermitInflightHwmSplit, M::BgPermitDeferredSplit),
         "compaction": pool(M::BgPermitInflightCompaction, M::BgPermitInflightHwmCompaction, M::BgPermitDeferredCompaction),
         "compaction_overcap": m.get(M::BgCompactionOvercap),
+    })
+}
+
+/// `/admin/health`'s `lsm_stall` object (ADR 0081 decision 5), read from the
+/// node's metrics. Advisory only.
+fn lsm_stall_json(m: &animus_env::MetricsHandle) -> serde_json::Value {
+    use animus_env::metrics::Metric as M;
+    serde_json::json!({
+        "engines_slowed": m.get(M::StorageEnginesSlowed),
+        "engines_stopped": m.get(M::StorageEnginesStopped),
+        "l0_max": m.get(M::StorageL0TablesMax),
+        "l0_hwm": m.get(M::StorageL0TablesHwm),
+        "compaction_io_rate": m.get(M::StorageCompactionIoRate),
+        "compaction_io_debt": m.get(M::StorageCompactionIoDebtBytes),
+        "maintenance_failure_streak": m.get(M::StorageMaintenanceFailureStreak),
     })
 }
 
