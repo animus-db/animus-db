@@ -122,7 +122,7 @@ impl EngineFactory<LsmEngine<SimEnv>> for SimLsmTabletFactory {
                 LsmEngine::open_with(
                     self.env.clone(),
                     tablet_lsm_prefix(tablet.0),
-                    st.opts.clone(),
+                    st.opts,
                 )
                 .await
             }

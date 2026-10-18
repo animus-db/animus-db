@@ -990,7 +990,7 @@ impl Drop for MaintenanceGuard<'_> {
 pub struct LsmEngine<E: Env> {
     env: E,
     prefix: Arc<str>,
-    opts: LsmOptions,
+    opts: Arc<LsmOptions>,
     inner: Arc<Mutex<Inner>>,
     /// WAL group-commit coordinator: concurrent writes batch their records and
     /// share a single `fsync`. Has its own lock (never the `Inner` lock), so a
@@ -1393,7 +1393,7 @@ impl<E: Env> LsmEngine<E> {
         Ok(Self {
             env,
             prefix,
-            opts,
+            opts: Arc::new(opts),
             inner: Arc::new(Mutex::new(inner)),
             wal,
             maintenance: Arc::new(MaintenanceLock::default()),
@@ -3191,7 +3191,7 @@ impl<E: Env> LsmEngine<E> {
         // released before reopening the (independent) target.
         drop(_maintenance);
 
-        LsmEngine::open_with(self.env.clone(), target_prefix, self.opts).await
+        LsmEngine::open_with(self.env.clone(), target_prefix, *self.opts).await
     }
 
     /// Clone the whole engine — [`clone_to_filtered`](Self::clone_to_filtered)
