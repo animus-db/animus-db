@@ -156,7 +156,7 @@ Alternatives considered:
 | `StorageFlushBlockedMicros` | counter | time a due flush waited on the `MaintenanceLock` |
 | `StorageMaintenanceFailureStreak` | gauge | consecutive maintenance failures (decision 2 rule 3) |
 
-**Admin.** `/admin/health` gains an advisory `lsm_stall` object (`engines_slowed`, `engines_stopped`, `l0_max`, `compaction_io_rate`, `compaction_io_debt`) beside the `bg_permits` object. Per ADR 0078 decision 4, it is **advisory only**: a stall never fails the health check or the roll gate (a node under write load is working, not unhealthy). The per-tablet admin view already shows sstable counts (`lsm_sstables`) and gains the engine's stall level and L0 count. The shed counters ADR 0080 already feeds into the 5xx-ratio alert need nothing new: a stall surfaces as `OverloadShedBusy`, and the runbook (`docs/runbook/overload-and-throttling.md`) gains one paragraph on reading `StorageWriteStall*` next to it.
+**Admin.** `/admin/health` gains an advisory `lsm_stall` object (`engines_slowed`, `engines_stopped`, `l0_max`, `compaction_io_rate`, `compaction_io_debt`) beside the background-permit object (ADR 0079). Per ADR 0078 decision 4, it is **advisory only**: a stall never fails the health check or the roll gate (a node under write load is working, not unhealthy). The per-tablet admin view already shows sstable counts (`lsm_sstables`) and gains the engine's stall level and L0 count. The shed counters ADR 0080 already feeds into the 5xx-ratio alert need nothing new: a stall surfaces as `OverloadShedBusy`, and the runbook (`docs/runbook/overload-and-throttling.md`) gains one paragraph on reading `StorageWriteStall*` next to it.
 
 **Knobs.**
 
@@ -242,7 +242,7 @@ One implementation PR on one branch (repo operating mode), ordered commits, each
 2. **Pure primitives:** the token bucket, the stall state machine, the `MaintenanceLock` waiter classes; Tier 0.
 3. **Engine stall:** the pre-write hook, deletion of the poll bound and post-write gate, `LsmOptions` fields and validation, the failure-streak fail-stop; cells 1-6, controls (a)-(c), (h); the `lsm_crash`/`lsm_disk_faults`/`lsm_maintenance` corpora unchanged and green.
 4. **Compaction IO budget:** the node-wide bucket beside `BackgroundBudget`, `CompactionGate` seam extension, defer-and-end semantics, urgent bypass, flush charge; cells 7-10, controls (d)-(g).
-5. **Composition:** the `animus-cp-data` composition cell, the Tier 2 cells; metrics and `/admin/health`; `cluster_settings` mirror, `animusd` flag, operator override.
+5. **Composition:** the `animus-cp-data` composition cell, the Tier 2 cells; metrics and `/admin/health`; the cluster-settings mirror, `animusd` flag, operator override.
 6. **Tier 3** liveness test and the acceptance run; defaults turned on.
 7. **Docs:** this ADR to Accepted with an as-built note; ADR 0079 (its decision 6 and the "L0 write stall" open items) and ADR 0080 (question 8) cross-references; `crates/animus-storage/CLAUDE.md`, `animus-cp-data`, `animusd`, `animus-operator` guides; `docs/runbook/overload-and-throttling.md`; `docs/roadmap.md`; `CLAUDE.md` knob table; `website/` if it states storage or overload behaviour; a `docs/lessons/` entry.
 
