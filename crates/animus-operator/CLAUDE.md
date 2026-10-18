@@ -2027,3 +2027,13 @@ rendered), and too small is the safe error. Request, not limit; never
 `overload.queued_bytes_budget` (no limit -> nothing rendered, the node default of 256 MiB applies).
 It joins the restart-relevant config hash only when set (`skip_serializing_if`), so existing specs
 keep their hash. There is no `spec.nodeCapacity` override yet.
+
+## `spec.background.compactionIoMiBPerSec` (ADR 0081)
+
+An **explicit** override, never derived: the operator cannot know the volume's write
+bandwidth, so an unset (or `0`) value renders nothing and the node's compaction write budget
+stays off. A nonzero value renders `cluster_settings.bg_compaction_io_bytes_per_sec` (MiB x 2^20)
+via `cluster_settings_or_none`, so it joins the restart-relevant config hash only when set. The
+node-local L0 write stall needs no operator input (on by default in `LsmOptions::production`).
+`BackgroundSpec` (`crd.rs`) is the home for any later explicit background-work limit;
+`deploy/operator/crd.yaml` is regenerated.

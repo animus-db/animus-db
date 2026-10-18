@@ -635,6 +635,13 @@ pub struct ClusterSettings {
     /// derives it from the pod CPU request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bg_compactions: Option<usize>,
+    /// `--compaction-io-bytes-per-sec N` (ADR 0081 decision 3): the node-wide
+    /// write budget, in bytes per second, shared by every tablet engine's
+    /// compactions (a flush is charged to it but never delayed). `None` or `0`
+    /// is **off** (today's behaviour); it is never derived, because the node
+    /// cannot see its disk. Node-local (class L), additive, skipped when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg_compaction_io_bytes_per_sec: Option<u64>,
     /// `--repair-proposals-per-tick R` (ADR 0079 step 6): new repair
     /// (`CasTabletReplicas`) proposals the control leader makes per reconcile
     /// tick. `None` resolves to 8; `0` turns the per-tick limit off. Leader-local
@@ -1043,6 +1050,10 @@ impl ClusterConfig {
             s.and_then(|s| s.bg_splits),
             s.and_then(|s| s.bg_compactions),
             self.cores(),
+        )
+        .with_compaction_io(
+            s.and_then(|s| s.bg_compaction_io_bytes_per_sec)
+                .unwrap_or(0),
         )
     }
 
@@ -1653,6 +1664,7 @@ mod tests {
             bg_catchup_learners: Some(5),
             bg_splits: Some(2),
             bg_compactions: Some(6),
+            bg_compaction_io_bytes_per_sec: Some(64 << 20),
             repair_proposals_per_tick: Some(4),
             repair_inflight_max: Some(9),
             region: Some("us".into()),

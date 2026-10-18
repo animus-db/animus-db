@@ -433,6 +433,46 @@ materialises its input tables; `decode_block`, `partition_records`,
 `flatten_memtable` in massif) and the Raft log plus apply clones; a node-wide
 memtable/compaction memory budget is a design decision.
 
+## I. LSM write stall and compaction IO budget (ADR 0081, issue #1300, 2026-10-18)
+
+Method. `animus-cp-data` `tests/it/lsm_stall_measure.rs`, an `#[ignore]`d sweep: `LsmEngine<SimEnv>`
+tablet engines under one node `BackgroundBudget` (pool of 2 compaction permits), 1 KiB values,
+60 s of virtual time per cell, writers in a closed loop, the disk slowed only by
+`DiskConfig::set_sync_delay` (ADR 0079 decision 7; no disk-cost model). Run with `cargo test -p
+animus-cp-data --test it lsm_stall_measure -- --ignored --nocapture` (`MEASURE_SECS`,
+`MEASURE_CELL` narrow it). Modes: everything off (factors 0, the gate at the old post-append
+position), the stall on, and the stall plus the budget at 100 %, 50 % and 25 % of the sustained
+compaction rate the off run measured. The grid is one writer per engine (finding 3 explains why).
+This is a simulation: it ranks mechanisms and shows shapes, it is not a throughput claim.
+
+| Cell (engines x writers, sync delay) | Mode | acked/s | L0 high-water | compactions | compaction MiB/s | flush blocked (ms) |
+|---|---|---|---|---|---|---|
+| 1 x 1, 5 ms | off and stall | 90 (p99 20 ms) | 4 | 22 | - | - |
+| 1 x 1, 5 ms | budget | 90 | 8 | 16-20 (about 3,600 deferrals) | - | 130-170 |
+| 8 x 1, 5 ms | off | 705 | 8 | 154 | 0.036 | 26,051 |
+| 8 x 1, 5 ms | budget 100 / 50 / 25 % | about 716 | 8 | - | 0.021 | 2,379 / 1,270 / 1,264 |
+| 32 x 1, 5 ms | off | 2,844 | 8 | - | - | 11,376 |
+| 32 x 1, 5 ms | budget | - | 8 | - | - | about 5,056 |
+| 32 x 1, 30 ms | off | 516 | 8 | - | - | 44,622 |
+| 8 x 8, 5 ms | off | memtable stalls about 2,014 s in 60 s | - | - | - | - |
+
+Findings.
+
+1. Level 0 never exceeded 8 (twice the trigger of 4) in any cell with the stall off. The urgent
+   bypass and the memtable cap hold the line first; the 3T/5T levels are a backstop for a
+   compaction that cannot run, which a slow disk alone does not produce. Under a slow disk the
+   active stall cause is the memtable.
+2. The budget costs no goodput here and cuts flush-behind-compaction wait 2x to 20x: a deferred
+   compaction does not hold the maintenance lock. The sustained compaction rate is only
+   0.036 MiB/s in this model, so there is no honest default number; the budget ships off.
+3. Eight concurrent writers per engine collapse goodput (124 acked/s for one engine) with L0
+   low: `flush` defers while `applies_in_flight > 0` and with several writers one is always in
+   flight, so the memtable hits its hard cap. Pre-existing flush starvation, exposed by the stall;
+   recorded in `docs/lessons/code-patterns/` and filed as a follow-up.
+4. ProdEnv baseline (the sandbox volume, `volume_sequential_fsync_write_baseline`, 128 MiB with an fsync per MiB): 170.5 MiB/s. That is the order of figure `compactionIoMiBPerSec` is sized as a fraction of; it is a sandbox number, not a recommendation. The real-thread stall test (`lsm_stall_prod.rs`) held a withheld-compaction writer stalled with L0 bounded at the stop level and resumed it with no `Err` once compaction returned (6.6 s).
+5. The provisional defaults (3T/5T, 16 MiB/s to 256 KiB/s, failure limit 8, 1 s burst, 4 MiB/s
+   lag floor) were not contradicted and are unchanged.
+
 ## Proposed final defaults (recommendations for review; ADR 0079's knob table is not edited)
 
 | Knob | ADR provisional | Recommendation | Basis |

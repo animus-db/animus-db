@@ -174,6 +174,7 @@ use std::time::Duration;
 use animus_env::{Env, EnvExt, Metric, MetricsHandle};
 use serde::{Deserialize, Serialize};
 
+use crate::stall::{self, StallCause, StallDecision, StallLedger, StallLevel};
 use crate::{
     Key, MergeOp, Result, Snapshot, StorageEngine, StorageError, Value, Version, VersionedValue,
     WriteBatch, WriteOp,
@@ -244,16 +245,11 @@ const READ_COMPACTION_RETRIES: u32 = 32;
 /// growth if maintenance falls behind (a slow disk, a burst far exceeding
 /// flush throughput, or repeated injected faults).
 const BACKPRESSURE_OVERSHOOT_FACTOR: usize = 4;
-/// How long a backpressured writer waits between polls of the memtable size.
-/// `env.sleep` keeps this deterministic under `SimEnv`.
-const BACKPRESSURE_POLL: Duration = Duration::from_millis(1);
-/// How many **consecutive** non-ENOSPC background-maintenance failures turn the
-/// backpressure gate into an error (ADR 0081 decision 3; #1338). Counted in
-/// failures, not seconds: a merely slow or busy maintenance task is waited out
-/// indefinitely (a stall below Raft may delay a committed entry but must never
-/// fail it), while a persistently failing disk still fails loudly. ENOSPC is
-/// not counted — it surfaces as [`StorageError::StorageFull`] instead.
-const BACKPRESSURE_MAX_CONSECUTIVE_FAILURES: u32 = 8;
+/// How long a stalled writer waits between re-evaluations of the stall state
+/// (ADR 0081). `env.sleep` keeps this deterministic under `SimEnv`.
+const STALL_POLL: Duration = Duration::from_millis(1);
+/// Control (b) only: the pre-ADR 0081 gate's poll bound (10,000 x 1 ms).
+const OLD_GATE_MAX_POLLS: u64 = 10_000;
 
 /// Tuning knobs for an [`LsmEngine`]. Defaults are sized for tests; production
 /// wiring can raise them.
@@ -314,6 +310,64 @@ pub struct LsmOptions {
     /// so backpressure would never resolve; every test in this crate that opts
     /// in drives the simulator explicitly (see `lsm_maintenance.rs`).
     pub background_maintenance: bool,
+    /// ADR 0081 decision 1: the L0 **slowdown** level as a multiple of
+    /// [`compaction_trigger`](Self::compaction_trigger) (production: `3`, i.e.
+    /// 12 tables at the default trigger). From this many L0 tables writes to
+    /// this engine are delayed per byte along a linear ramp. `0` (the
+    /// default) turns the whole L0 stall off together with
+    /// [`l0_stop_factor`](Self::l0_stop_factor); the memtable gate is
+    /// independent of it. Only meaningful with
+    /// [`background_maintenance`](Self::background_maintenance).
+    pub l0_slowdown_factor: usize,
+    /// ADR 0081 decision 1: the L0 **stop** level as a multiple of
+    /// [`compaction_trigger`](Self::compaction_trigger) (production: `5`, 20
+    /// tables at the default trigger). From this many L0 tables writes wait
+    /// until L0 falls below it. `0` disables the L0 stall.
+    pub l0_stop_factor: usize,
+    /// Write rate (bytes/s) at the slowdown level; the delay ramp starts here
+    /// (provisional 16 MiB/s, ADR 0081 decision 2).
+    pub l0_slowdown_write_rate: u64,
+    /// Write rate (bytes/s) at `stop - 1`; the ramp ends here (provisional
+    /// 256 KiB/s).
+    pub l0_min_write_rate: u64,
+    /// Consecutive non-ENOSPC background-maintenance failures after which a
+    /// stalled write returns `Err(Backend)` (the fail-stop, ADR 0081 decision
+    /// 2 rule 3). Counted in failures, never in elapsed time. Must be `>= 1`.
+    pub maintenance_failure_limit: u32,
+    /// Deliberate stall bugs for the ADR 0081 negative controls. `None` in
+    /// every real build.
+    #[doc(hidden)]
+    pub stall_fault: StallFault,
+}
+
+/// Deliberate bugs in the write stall, for the ADR 0081 negative controls
+/// (each must make its oracle FAIL). `None` everywhere outside the corpus.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum StallFault {
+    /// The real stall.
+    #[default]
+    None,
+    /// Control (b): the pre-ADR gate -- a bounded poll (10,000 x 1 ms) that
+    /// ends in `Err(Backend)` -- placed after the append.
+    OldGate,
+    /// Control (c): the stall evaluated *after* the WAL append and apply (the
+    /// old position), so an `Err` from it fails a write that took effect.
+    AfterAppend,
+    /// Control (d): the IO bucket applies to every compaction (the urgent
+    /// bypass is ignored), so a rate below the write rate never clears.
+    NoUrgentBypass,
+    /// Control (e): the pool permit is held while waiting for IO credit
+    /// instead of being dropped before the deferral.
+    PermitHeldWhileThrottled,
+    /// Control (f): a flush is gated by the IO bucket like a compaction.
+    FlushGated,
+    /// Control (g): the IO wait happens inside the compaction, holding the
+    /// maintenance lock, instead of defer-and-end.
+    WaitInsideCompaction,
+    /// Control (h): the fail-stop limit is counted in elapsed seconds (8 s of
+    /// continuous stall) instead of consecutive failures.
+    LimitInSeconds,
 }
 
 impl LsmOptions {
@@ -327,6 +381,8 @@ impl LsmOptions {
     pub fn production() -> Self {
         Self {
             background_maintenance: true,
+            l0_slowdown_factor: stall::DEFAULT_L0_SLOWDOWN_FACTOR,
+            l0_stop_factor: stall::DEFAULT_L0_STOP_FACTOR,
             ..Self::default()
         }
     }
@@ -334,6 +390,9 @@ impl LsmOptions {
     /// [`production`](Self::production) for an engine whose versions are small
     /// sequence numbers (Raft log indexes), not HLC-packed: the control system
     /// keyspace. Keeps the raw-version grace ([`RAW_VERSION_GRACE_VERSIONS`]).
+    ///
+    /// The control keyspace keeps the L0 stall **off** (ADR 0081): it is tiny,
+    /// and a stall there would delay the control plane's apply task.
     #[must_use]
     pub fn production_raw_versions() -> Self {
         Self {
@@ -376,7 +435,55 @@ impl LsmOptions {
                 level_fanout: self.level_fanout,
             });
         }
-        Ok(())
+        self.validate_stall()
+    }
+
+    /// ADR 0081 decision 1: `1 <= trigger`, `COMPACTION_L0_BYPASS_FACTOR <
+    /// slowdown < stop` (so an engine is urgent for a while before its writes
+    /// can stop), or both factors `0` (the L0 stall off); a usable ramp; and a
+    /// non-zero failure limit.
+    fn validate_stall(&self) -> Result<()> {
+        let bad = |reason: &'static str| Err(StorageError::InvalidStallOptions { reason });
+        if self.maintenance_failure_limit == 0 {
+            return bad("maintenance_failure_limit must be >= 1");
+        }
+        match (self.l0_slowdown_factor, self.l0_stop_factor) {
+            (0, 0) => Ok(()),
+            (slow, stop) => {
+                if self.compaction_trigger < 1 {
+                    return bad("compaction_trigger must be >= 1 when the L0 stall is on");
+                }
+                if slow <= COMPACTION_L0_BYPASS_FACTOR {
+                    return bad("l0_slowdown_factor must exceed the compaction bypass factor (2)");
+                }
+                if stop <= slow {
+                    return bad("l0_stop_factor must exceed l0_slowdown_factor");
+                }
+                if self.l0_min_write_rate == 0
+                    || self.l0_min_write_rate > self.l0_slowdown_write_rate
+                {
+                    return bad("need 0 < l0_min_write_rate <= l0_slowdown_write_rate");
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// The pure stall policy this engine runs (ADR 0081): thresholds in L0
+    /// tables, the memtable hard cap, and the slowdown ramp.
+    #[must_use]
+    pub fn stall_policy(&self) -> stall::StallPolicy {
+        stall::StallPolicy {
+            slowdown_tables: self
+                .l0_slowdown_factor
+                .saturating_mul(self.compaction_trigger),
+            stop_tables: self.l0_stop_factor.saturating_mul(self.compaction_trigger),
+            memtable_cap: self
+                .flush_threshold_bytes
+                .saturating_mul(BACKPRESSURE_OVERSHOOT_FACTOR),
+            slowdown_rate: self.l0_slowdown_write_rate,
+            min_rate: self.l0_min_write_rate,
+        }
     }
 }
 
@@ -391,6 +498,12 @@ impl Default for LsmOptions {
             tombstone_grace_versions: DEFAULT_TOMBSTONE_GRACE_VERSIONS,
             trust_monotonic_versions: false,
             background_maintenance: false,
+            l0_slowdown_factor: 0,
+            l0_stop_factor: 0,
+            l0_slowdown_write_rate: stall::DEFAULT_L0_SLOWDOWN_WRITE_RATE,
+            l0_min_write_rate: stall::DEFAULT_L0_MIN_WRITE_RATE,
+            maintenance_failure_limit: stall::DEFAULT_MAINTENANCE_FAILURE_LIMIT,
+            stall_fault: StallFault::None,
         }
     }
 }
@@ -583,6 +696,38 @@ pub trait CompactionGate: Send + Sync + 'static {
     /// `None` means "not now": the engine defers and re-checks after
     /// [`COMPACTION_DEFER_RETRY`].
     fn acquire(&self, bypass: bool) -> Option<CompactionPermit>;
+
+    /// ADR 0081 decision 3: the node-wide compaction **write-bytes budget**.
+    /// Asked *after* [`acquire`](Self::acquire) succeeded and *before* the run
+    /// starts, with the run's estimated output bytes and whether the engine is
+    /// `urgent` (its L0 reached `2 x compaction_trigger`).
+    ///
+    /// * [`IoAdmission::Admitted`]: the cost was charged; run now.
+    /// * [`IoAdmission::Defer`]: no credit; the engine drops its permit, ends
+    ///   the maintenance task and re-asks after [`COMPACTION_DEFER_RETRY`].
+    ///
+    /// An `urgent` request must **always** be admitted (it is charged into
+    /// debt): that is the no-deadlock rule, an engine near its stall is never
+    /// held back by the limiter. The default admits everything (budget off).
+    fn io_admit(&self, _estimated_bytes: u64, _urgent: bool) -> IoAdmission {
+        IoAdmission::Admitted
+    }
+
+    /// Correct a charge with the bytes the run actually wrote (a refund when
+    /// `actual < estimated`, more debt otherwise).
+    fn io_settle(&self, _estimated_bytes: u64, _actual_bytes: u64) {}
+
+    /// Charge bytes that are never delayed (a flush's output) into debt.
+    fn io_charge(&self, _bytes: u64) {}
+}
+
+/// The answer to [`CompactionGate::io_admit`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IoAdmission {
+    /// Charged; the compaction may run now.
+    Admitted,
+    /// No credit; defer and retry.
+    Defer,
 }
 
 /// Holds a compaction slot; dropping it returns the slot.
@@ -596,6 +741,92 @@ pub const COMPACTION_DEFER_RETRY: Duration = Duration::from_millis(100);
 /// The L0 safety valve of [`CompactionGate`]: an engine whose L0 holds at
 /// least this many tables times `compaction_trigger` bypasses the pool.
 pub const COMPACTION_L0_BYPASS_FACTOR: usize = 2;
+
+/// RAII accounting of one writer's stay in the stall: the per-engine level
+/// counters, the node ledger and the `storage_write_stall*` metrics.
+struct StallGuard<'a, E: Env> {
+    engine: &'a LsmEngine<E>,
+    entered: Option<(StallCause, bool, animus_env::Nanos)>,
+}
+
+impl<'a, E: Env> StallGuard<'a, E> {
+    fn new(engine: &'a LsmEngine<E>) -> Self {
+        Self {
+            engine,
+            entered: None,
+        }
+    }
+
+    /// Note the writer is held for `cause` (a wait when `waiting`, else a
+    /// delay). The first call counts one stalled write; a changed cause moves
+    /// the time accounting to the new one.
+    fn enter(&mut self, cause: StallCause, waiting: bool) {
+        match self.entered {
+            Some((c, w, _)) if c == cause && w == waiting => {}
+            Some(_) => {
+                self.settle();
+                self.start(cause, waiting);
+            }
+            None => {
+                self.start(cause, waiting);
+                self.engine.stall.writes[cause_slot(cause)].fetch_add(1, Ordering::Relaxed);
+                self.engine.metrics.incr(match cause {
+                    StallCause::Memtable => Metric::StorageWriteStallsMemtable,
+                    StallCause::L0Slowdown => Metric::StorageWriteStallsL0Slowdown,
+                    StallCause::L0Stop => Metric::StorageWriteStallsL0Stop,
+                });
+            }
+        }
+    }
+
+    fn start(&mut self, cause: StallCause, waiting: bool) {
+        let st = &self.engine.stall;
+        if waiting {
+            st.waiting.fetch_add(1, Ordering::AcqRel);
+        } else {
+            st.delaying.fetch_add(1, Ordering::AcqRel);
+        }
+        self.entered = Some((cause, waiting, self.engine.env.now()));
+        self.engine.publish_stall();
+    }
+
+    /// Time since the writer first entered the stall.
+    fn elapsed(&self) -> Duration {
+        self.entered.map_or(Duration::ZERO, |(_, _, t0)| {
+            self.engine.env.now().duration_since(t0)
+        })
+    }
+
+    /// Close the current stay: leave the level counters and add the time.
+    fn settle(&mut self) {
+        if let Some((cause, waiting, t0)) = self.entered.take() {
+            let st = &self.engine.stall;
+            if waiting {
+                st.waiting.fetch_sub(1, Ordering::AcqRel);
+            } else {
+                st.delaying.fetch_sub(1, Ordering::AcqRel);
+            }
+            let spent = self.engine.env.now().duration_since(t0);
+            let nanos = u64::try_from(spent.as_nanos()).unwrap_or(u64::MAX);
+            st.nanos[cause_slot(cause)].fetch_add(nanos, Ordering::Relaxed);
+            self.engine.metrics.incr_by(
+                match cause {
+                    StallCause::Memtable => Metric::StorageWriteStallMicrosMemtable,
+                    StallCause::L0Slowdown => Metric::StorageWriteStallMicrosL0Slowdown,
+                    StallCause::L0Stop => Metric::StorageWriteStallMicrosL0Stop,
+                },
+                nanos / 1000,
+            );
+            self.engine.publish_stall();
+        }
+    }
+}
+
+impl<E: Env> Drop for StallGuard<'_, E> {
+    fn drop(&mut self) {
+        self.settle();
+    }
+}
 
 /// An `Env`-agnostic **async mutex** serializing *maintenance* — memtable
 /// flushes and compactions — against each other. Exactly one flush **or**
@@ -619,58 +850,133 @@ struct MaintenanceLock {
     state: Mutex<MaintenanceState>,
 }
 
+/// Who is asking for the [`MaintenanceLock`] (ADR 0081 decision 4): a flush is
+/// served before a queued compaction when the lock is released.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MaintenanceClass {
+    Flush,
+    Compaction,
+}
+
 #[derive(Default)]
 struct MaintenanceState {
     /// Whether a flush/compaction currently holds the lock.
     held: bool,
-    /// Tasks parked waiting to acquire, in registration order.
-    waiters: Vec<Waker>,
+    /// Next waiter id.
+    next_id: u64,
+    /// Flush tasks parked waiting to acquire, in registration order.
+    flush_waiters: Vec<(u64, Waker)>,
+    /// Compaction (and other maintenance) tasks parked, in registration order.
+    compaction_waiters: Vec<(u64, Waker)>,
+}
+
+impl MaintenanceState {
+    /// Wake the class that is next in line: every parked flush if any is
+    /// parked, else every parked compaction. Waiters stay registered until
+    /// they acquire or are dropped, so "is a flush waiting" stays accurate and
+    /// no wakeup is lost; contenders re-poll in registration order and exactly
+    /// one wins.
+    fn wake_next(&self) {
+        let list = if self.flush_waiters.is_empty() {
+            &self.compaction_waiters
+        } else {
+            &self.flush_waiters
+        };
+        for (_, w) in list {
+            w.wake_by_ref();
+        }
+    }
+
+    fn remove(&mut self, id: u64) {
+        self.flush_waiters.retain(|(i, _)| *i != id);
+        self.compaction_waiters.retain(|(i, _)| *i != id);
+    }
 }
 
 impl MaintenanceLock {
-    /// Resolve to a guard once the lock is free. Contenders woken on release
-    /// re-poll in registration order; exactly one wins and the rest re-park, so
-    /// no wakeup is ever lost.
-    fn acquire(&self) -> AcquireMaintenance<'_> {
-        AcquireMaintenance { lock: self }
+    /// Resolve to a guard once the lock is free. A flush wins over a queued
+    /// compaction; within a class the registration order wins. No wakeup is
+    /// ever lost, including when a woken waiter is cancelled before it polls.
+    fn acquire(&self, class: MaintenanceClass) -> AcquireMaintenance<'_> {
+        AcquireMaintenance {
+            lock: self,
+            class,
+            id: None,
+        }
     }
 }
 
 struct AcquireMaintenance<'a> {
     lock: &'a MaintenanceLock,
+    class: MaintenanceClass,
+    /// Set once this future has parked.
+    id: Option<u64>,
 }
 
 impl<'a> Future for AcquireMaintenance<'a> {
     type Output = MaintenanceGuard<'a>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut state = self.lock.state.lock().expect("maintenance lock poisoned");
-        if state.held {
-            state.waiters.push(cx.waker().clone());
-            Poll::Pending
-        } else {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
+        let mut state = this.lock.state.lock().expect("maintenance lock poisoned");
+        // A compaction may not take a free lock while a flush is parked.
+        let may_take = !state.held
+            && (this.class == MaintenanceClass::Flush || state.flush_waiters.is_empty());
+        if may_take {
             state.held = true;
-            Poll::Ready(MaintenanceGuard { lock: self.lock })
+            if let Some(id) = this.id.take() {
+                state.remove(id);
+            }
+            return Poll::Ready(MaintenanceGuard { lock: this.lock });
+        }
+        let id = match this.id {
+            Some(id) => id,
+            None => {
+                let id = state.next_id;
+                state.next_id += 1;
+                this.id = Some(id);
+                id
+            }
+        };
+        let list = match this.class {
+            MaintenanceClass::Flush => &mut state.flush_waiters,
+            MaintenanceClass::Compaction => &mut state.compaction_waiters,
+        };
+        match list.iter_mut().find(|(i, _)| *i == id) {
+            Some(slot) => slot.1 = cx.waker().clone(),
+            None => list.push((id, cx.waker().clone())),
+        }
+        Poll::Pending
+    }
+}
+
+impl Drop for AcquireMaintenance<'_> {
+    fn drop(&mut self) {
+        // Cancelled while parked: leave the queue, and if the lock is free
+        // pass the turn on (this waiter may have been the one just woken).
+        if let Some(id) = self.id
+            && let Ok(mut state) = self.lock.state.lock()
+        {
+            state.remove(id);
+            if !state.held {
+                state.wake_next();
+            }
         }
     }
 }
 
 /// Releases the [`MaintenanceLock`] on drop (every exit path: success, an
-/// early-return error, or a panic) and wakes all parked contenders so the next
-/// one can acquire.
+/// early-return error, or a panic) and wakes the next class in line so one of
+/// them can acquire.
 struct MaintenanceGuard<'a> {
     lock: &'a MaintenanceLock,
 }
 
 impl Drop for MaintenanceGuard<'_> {
     fn drop(&mut self) {
-        let waiters = {
-            let mut state = self.lock.state.lock().expect("maintenance lock poisoned");
+        if let Ok(mut state) = self.lock.state.lock() {
             state.held = false;
-            std::mem::take(&mut state.waiters)
-        };
-        for w in waiters {
-            w.wake();
+            state.wake_next();
         }
     }
 }
@@ -684,7 +990,7 @@ impl Drop for MaintenanceGuard<'_> {
 pub struct LsmEngine<E: Env> {
     env: E,
     prefix: Arc<str>,
-    opts: LsmOptions,
+    opts: Arc<LsmOptions>,
     inner: Arc<Mutex<Inner>>,
     /// WAL group-commit coordinator: concurrent writes batch their records and
     /// share a single `fsync`. Has its own lock (never the `Inner` lock), so a
@@ -725,6 +1031,72 @@ pub struct LsmEngine<E: Env> {
     compaction_gate: Arc<std::sync::OnceLock<Arc<dyn CompactionGate>>>,
     /// Set while a deferred-compaction retry task is pending (at most one).
     compaction_retry_scheduled: Arc<AtomicBool>,
+    /// ADR 0081: this engine's write-stall bookkeeping (levels, ledger
+    /// registration, introspection counters).
+    stall: Arc<StallState>,
+}
+
+/// Per-engine write-stall bookkeeping (ADR 0081). Everything here is
+/// in-memory and observational except `waiting`/`delaying`, which only derive
+/// the level published to the ledger.
+#[derive(Default)]
+struct StallState {
+    /// Writers currently waiting (stopped).
+    waiting: AtomicU64,
+    /// Writers currently sleeping in the slowdown ramp.
+    delaying: AtomicU64,
+    /// The node-shared aggregate, if installed.
+    ledger: std::sync::OnceLock<LedgerReg>,
+    /// When a compaction was first deferred by the IO budget (until admitted).
+    throttled_since: Mutex<Option<animus_env::Nanos>>,
+    /// Introspection counters, indexed by [`StallCause`] order.
+    writes: [AtomicU64; 3],
+    nanos: [AtomicU64; 3],
+    flush_blocked_nanos: AtomicU64,
+    io_deferrals: AtomicU64,
+    urgent_runs: AtomicU64,
+    /// Highest L0 table count seen at a flush/compaction commit.
+    l0_hwm: AtomicU64,
+}
+
+/// An engine's slot in a [`StallLedger`]; unregisters when the last clone of
+/// the engine drops.
+struct LedgerReg {
+    ledger: StallLedger,
+    id: u64,
+}
+
+impl Drop for LedgerReg {
+    fn drop(&mut self) {
+        self.ledger.unregister(self.id);
+    }
+}
+
+/// Introspection copy of an engine's stall counters (tests, the measurement
+/// harness). Indexed `[memtable, l0_slowdown, l0_stop]` where an array.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StallStats {
+    /// Writes that entered a delay/wait, by cause.
+    pub writes: [u64; 3],
+    /// Nanoseconds spent stalled, by cause.
+    pub nanos: [u64; 3],
+    /// Nanoseconds a flush waited for the maintenance lock.
+    pub flush_blocked_nanos: u64,
+    /// Compactions deferred by the IO budget.
+    pub io_deferrals: u64,
+    /// Compactions that ran at the urgent level.
+    pub urgent_runs: u64,
+    /// Highest L0 count seen at a maintenance commit.
+    pub l0_hwm: u64,
+}
+
+const fn cause_slot(c: StallCause) -> usize {
+    match c {
+        StallCause::Memtable => 0,
+        StallCause::L0Slowdown => 1,
+        StallCause::L0Stop => 2,
+    }
 }
 
 impl<E: Env> LsmEngine<E> {
@@ -1021,7 +1393,7 @@ impl<E: Env> LsmEngine<E> {
         Ok(Self {
             env,
             prefix,
-            opts,
+            opts: Arc::new(opts),
             inner: Arc::new(Mutex::new(inner)),
             wal,
             maintenance: Arc::new(MaintenanceLock::default()),
@@ -1033,6 +1405,7 @@ impl<E: Env> LsmEngine<E> {
             maintenance_deferrals: Arc::new(AtomicU64::new(0)),
             compaction_gate: Arc::new(std::sync::OnceLock::new()),
             compaction_retry_scheduled: Arc::new(AtomicBool::new(false)),
+            stall: Arc::new(StallState::default()),
         })
     }
 
@@ -1335,6 +1708,9 @@ impl<E: Env> LsmEngine<E> {
                 && inner.applies_in_flight == 0
         };
         if should_flush {
+            if self.opts.stall_fault == StallFault::FlushGated {
+                self.wait_flush_behind_io_budget().await;
+            }
             self.flush().await?;
         }
         // Run compactions until none is due (bounded: each pass reduces a level's
@@ -1342,9 +1718,14 @@ impl<E: Env> LsmEngine<E> {
         while let Some(plan) = self.next_compaction() {
             // ADR 0079: take a pool slot first (or bypass it at the L0 safety
             // valve); no slot means defer and re-check on the maintenance tick.
-            let _permit = match self.compaction_gate.get() {
+            // ADR 0081 decision 3: then the node's write-bytes budget -- permit
+            // first, bucket second, and the permit is dropped before any
+            // deferral (holding it while waiting for credit is hold-and-wait).
+            let urgent = self.l0_overcap();
+            let gate = self.compaction_gate.get();
+            let permit = match gate {
                 None => None,
-                Some(gate) => match gate.acquire(self.l0_overcap()) {
+                Some(gate) => match gate.acquire(urgent) {
                     Some(p) => Some(p),
                     None => {
                         self.schedule_compaction_retry();
@@ -1352,9 +1733,179 @@ impl<E: Env> LsmEngine<E> {
                     }
                 },
             };
-            self.run_compaction(plan).await?;
+            let mut charged: Option<u64> = None;
+            if let Some(gate) = gate {
+                let est = self.plan_input_bytes(&plan);
+                let bucket_urgent = urgent && self.opts.stall_fault != StallFault::NoUrgentBypass;
+                if self.opts.stall_fault == StallFault::WaitInsideCompaction {
+                    self.wait_io_inside_lock(gate, est, bucket_urgent).await;
+                } else if gate.io_admit(est, bucket_urgent) == IoAdmission::Defer {
+                    self.note_io_deferred();
+                    if self.opts.stall_fault == StallFault::PermitHeldWhileThrottled {
+                        // Control (e): hold the pool permit across the wait.
+                        self.env.sleep(COMPACTION_DEFER_RETRY).await;
+                        drop(permit);
+                        continue;
+                    }
+                    drop(permit);
+                    self.schedule_compaction_retry();
+                    return Ok(());
+                }
+                self.note_io_admitted(urgent);
+                charged = Some(est);
+            }
+            let written = self.run_compaction(plan).await?;
+            if let (Some(gate), Some(est)) = (gate, charged) {
+                gate.io_settle(est, written);
+            }
+            drop(permit);
         }
         Ok(())
+    }
+
+    /// Control (f): delay the flush behind the IO budget like a compaction.
+    async fn wait_flush_behind_io_budget(&self) {
+        let Some(gate) = self.compaction_gate.get() else {
+            return;
+        };
+        let est = self.lock().memtable_bytes as u64;
+        while gate.io_admit(est, false) == IoAdmission::Defer {
+            self.note_io_deferred();
+            self.env.sleep(COMPACTION_DEFER_RETRY).await;
+        }
+    }
+
+    /// Control (g): wait for IO credit *inside* the maintenance lock.
+    async fn wait_io_inside_lock(&self, gate: &Arc<dyn CompactionGate>, est: u64, urgent: bool) {
+        let _held = self.acquire_maintenance(MaintenanceClass::Compaction).await;
+        while gate.io_admit(est, urgent) == IoAdmission::Defer {
+            self.note_io_deferred();
+            self.env.sleep(COMPACTION_DEFER_RETRY).await;
+        }
+    }
+
+    /// The estimated bytes a compaction of `plan` writes: the sizes of its
+    /// input tables (an LSM merge writes about what it reads, before GC),
+    /// taken from the manifest without the maintenance lock.
+    fn plan_input_bytes(&self, plan: &CompactionPlan) -> u64 {
+        let inner = self.lock();
+        let tables = &inner.manifest.tables;
+        let mut bounds: Option<(Key, Key)> = None;
+        let mut bytes = 0u64;
+        for m in tables.iter().filter(|m| m.level == plan.source_level) {
+            bytes += m.file_size;
+            if let (Some(lo), Some(hi)) = (&m.min_key, &m.max_key) {
+                bounds = Some(match bounds {
+                    None => (lo.clone(), hi.clone()),
+                    Some((slo, shi)) => (slo.min(lo.clone()), shi.max(hi.clone())),
+                });
+            }
+        }
+        if let Some((slo, shi)) = &bounds {
+            for m in tables
+                .iter()
+                .filter(|m| m.level == plan.source_level + 1 && ranges_overlap(m, slo, shi))
+            {
+                bytes += m.file_size;
+            }
+        }
+        bytes
+    }
+
+    fn note_io_deferred(&self) {
+        self.stall.io_deferrals.fetch_add(1, Ordering::Relaxed);
+        let mut since = self.stall.throttled_since.lock().expect("poisoned");
+        if since.is_none() {
+            *since = Some(self.env.now());
+        }
+    }
+
+    fn note_io_admitted(&self, urgent: bool) {
+        if urgent {
+            self.stall.urgent_runs.fetch_add(1, Ordering::Relaxed);
+            self.metrics.incr(Metric::StorageCompactionUrgent);
+        }
+        let since = self.stall.throttled_since.lock().expect("poisoned").take();
+        if let Some(t0) = since {
+            let waited = self.env.now().duration_since(t0);
+            self.metrics.incr_by(
+                Metric::StorageCompactionThrottledMicros,
+                u64::try_from(waited.as_micros()).unwrap_or(u64::MAX),
+            );
+        }
+    }
+
+    /// Take the maintenance lock as `class`, accounting the time a flush spent
+    /// waiting for it (`storage_flush_blocked_micros`).
+    async fn acquire_maintenance(&self, class: MaintenanceClass) -> MaintenanceGuard<'_> {
+        let t0 = self.env.now();
+        let guard = self.maintenance.acquire(class).await;
+        if class == MaintenanceClass::Flush {
+            let waited = self.env.now().duration_since(t0);
+            if !waited.is_zero() {
+                let nanos = u64::try_from(waited.as_nanos()).unwrap_or(u64::MAX);
+                self.stall
+                    .flush_blocked_nanos
+                    .fetch_add(nanos, Ordering::Relaxed);
+                self.metrics
+                    .incr_by(Metric::StorageFlushBlockedMicros, nanos / 1000);
+            }
+        }
+        guard
+    }
+
+    /// Introspection: this engine's stall counters.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn stall_stats(&self) -> StallStats {
+        let ld = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        let st = &self.stall;
+        StallStats {
+            writes: [ld(&st.writes[0]), ld(&st.writes[1]), ld(&st.writes[2])],
+            nanos: [ld(&st.nanos[0]), ld(&st.nanos[1]), ld(&st.nanos[2])],
+            flush_blocked_nanos: ld(&st.flush_blocked_nanos),
+            io_deferrals: ld(&st.io_deferrals),
+            urgent_runs: ld(&st.urgent_runs),
+            l0_hwm: ld(&st.l0_hwm),
+        }
+    }
+
+    /// Join the node's [`StallLedger`] (ADR 0081): the engine then publishes
+    /// its stall level, L0 count and failure streak into the node-wide
+    /// gauges. At most once; later calls are ignored.
+    pub fn set_stall_ledger(&self, ledger: StallLedger) {
+        let id = ledger.register();
+        if self.stall.ledger.set(LedgerReg { ledger, id }).is_ok() {
+            self.publish_stall();
+        }
+    }
+
+    /// The engine's current stall level.
+    fn stall_level(&self) -> StallLevel {
+        if self.stall.waiting.load(Ordering::Acquire) > 0 {
+            StallLevel::Stopped
+        } else if self.stall.delaying.load(Ordering::Acquire) > 0 {
+            StallLevel::Slowed
+        } else {
+            StallLevel::None
+        }
+    }
+
+    /// Push level, L0 count and failure streak to the node ledger, if any.
+    fn publish_stall(&self) {
+        if let Some(reg) = self.stall.ledger.get() {
+            let l0 = self.l0_table_count();
+            self.stall.l0_hwm.fetch_max(l0 as u64, Ordering::Relaxed);
+            reg.ledger.update(
+                reg.id,
+                self.stall_level(),
+                l0,
+                self.maintenance_consecutive_failures(),
+            );
+        } else {
+            let l0 = self.l0_table_count();
+            self.stall.l0_hwm.fetch_max(l0 as u64, Ordering::Relaxed);
+        }
     }
 
     /// Install the node's compaction pool ([`CompactionGate`]). At most once;
@@ -1420,7 +1971,17 @@ impl<E: Env> LsmEngine<E> {
     async fn after_write_maintenance(&self) -> Result<()> {
         if self.opts.background_maintenance {
             self.trigger_background_maintenance();
-            self.await_backpressure().await
+            // The stall sits *before* the append (`stall_before_write`); only
+            // the negative controls evaluate it here, after the write took
+            // effect, which is the pre-ADR 0081 position.
+            if matches!(
+                self.opts.stall_fault,
+                StallFault::AfterAppend | StallFault::OldGate
+            ) {
+                self.stall_gate(0).await
+            } else {
+                Ok(())
+            }
         } else {
             match self.maybe_flush_and_compact().await {
                 // The write that got us here is already durable and applied;
@@ -1462,6 +2023,7 @@ impl<E: Env> LsmEngine<E> {
                 *self.background_error.lock().expect("poisoned") = Some(e.to_string());
             }
         }
+        self.publish_stall();
     }
 
     /// Consecutive non-ENOSPC background-maintenance failures (introspection,
@@ -1504,61 +2066,121 @@ impl<E: Env> LsmEngine<E> {
         });
     }
 
-    /// Slow a writer down if the memtable has grown well past the flush
-    /// threshold — maintenance may be falling behind a burst of writes, or
-    /// stuck behind a slow/faulty disk. This is what bounds memtable growth
-    /// once flush/compaction move off the write path (without it, writers
-    /// could keep applying to the memtable indefinitely fast while a single
-    /// background task tries to keep up). A writer only waits
-    /// (`env.sleep`, deterministic under `SimEnv`); it never does the
-    /// flush/compaction work itself.
+    /// ADR 0081 decision 2: the write stall, evaluated at the front of every
+    /// write, **before** the WAL append and outside every lock.
     ///
-    /// # Errors
-    /// Elapsed time alone is never an error: a slow or busy maintenance task is
-    /// waited out (#1338; a stall below Raft may delay a committed entry but
-    /// must not fail it). Returns [`StorageError::StorageFull`] when the latest
-    /// maintenance run failed for want of disk (the recoverable class; the
-    /// write is already durable and applied), and [`StorageError::Backend`]
-    /// only after [`BACKPRESSURE_MAX_CONSECUTIVE_FAILURES`] consecutive
-    /// non-ENOSPC maintenance failures.
-    async fn await_backpressure(&self) -> Result<()> {
-        let cap = self
-            .opts
-            .flush_threshold_bytes
-            .saturating_mul(BACKPRESSURE_OVERSHOOT_FACTOR);
+    /// It only ever delays: a writer sleeps on the `Env` clock (virtual under
+    /// `SimEnv`) and re-evaluates until the state clears. It never fails a
+    /// write for elapsed time, because the caller (the CP-data apply task)
+    /// applies *committed* entries and a failure there is a tablet panic. The
+    /// two errors it can return both leave the engine unchanged (the write has
+    /// not been appended): [`StorageError::StorageFull`] when the latest
+    /// finished maintenance run failed for want of disk (the apply task's
+    /// pause-and-retry owns that), and [`StorageError::Backend`] after
+    /// [`LsmOptions::maintenance_failure_limit`] consecutive non-ENOSPC
+    /// maintenance failures (a dying disk: fail-stop, counted in failures not
+    /// seconds).
+    async fn stall_before_write(&self, bytes: u64) -> Result<()> {
+        if !self.opts.background_maintenance
+            || matches!(
+                self.opts.stall_fault,
+                StallFault::AfterAppend | StallFault::OldGate
+            )
+        {
+            return Ok(());
+        }
+        self.stall_gate(bytes).await
+    }
+
+    async fn stall_gate(&self, bytes: u64) -> Result<()> {
+        let policy = self.opts.stall_policy();
+        let mut guard = StallGuard::new(self);
+        let mut polls = 0u64;
+        let mut confirmed_full = false;
         loop {
-            if self.lock().memtable_bytes <= cap {
+            let (l0, memtable) = {
+                let inner = self.lock();
+                (
+                    inner
+                        .manifest
+                        .tables
+                        .iter()
+                        .filter(|t| t.level == 0)
+                        .count(),
+                    inner.memtable_bytes,
+                )
+            };
+            match policy.decide(l0, memtable, bytes) {
+                StallDecision::Go => return Ok(()),
+                StallDecision::Delay { cause, delay } => {
+                    guard.enter(cause, false);
+                    self.env.sleep(delay).await;
+                    return Ok(());
+                }
+                StallDecision::Wait { cause } => {
+                    guard.enter(cause, true);
+                    self.check_stall_errors(cause, polls, guard.elapsed(), &mut confirmed_full)?;
+                    // Make sure maintenance is actually working the backlog:
+                    // normally the write that crossed the threshold already
+                    // triggered it, so this is cheap insurance against a gap.
+                    self.trigger_background_maintenance();
+                    self.env.sleep(STALL_POLL).await;
+                    polls += 1;
+                }
+            }
+        }
+    }
+
+    /// The errors a stalled writer may return (see [`Self::stall_before_write`]).
+    fn check_stall_errors(
+        &self,
+        cause: StallCause,
+        polls: u64,
+        waited: Duration,
+        confirmed_full: &mut bool,
+    ) -> Result<()> {
+        let failures = self
+            .maintenance_consecutive_failures
+            .load(Ordering::Acquire);
+        let last_error = || self.background_error.lock().expect("poisoned").clone();
+        // `background_full` is stale while a fresh run is in flight (space may
+        // have returned since it was set): only a *finished* run that failed
+        // for want of space is a StorageFull verdict.
+        if self.background_full.load(Ordering::Acquire)
+            && !self.maintenance_scheduled.load(Ordering::Acquire)
+        {
+            // The verdict may predate the space coming back, and nothing else
+            // clears it while this writer is the only thing driving
+            // maintenance: ask for one fresh run first, and fail only if that
+            // run (which resets the flag on success) fails for space again.
+            if !*confirmed_full {
+                *confirmed_full = true;
+                self.trigger_background_maintenance();
                 return Ok(());
             }
-            let failures = self
-                .maintenance_consecutive_failures
-                .load(Ordering::Acquire);
-            let last_error = || self.background_error.lock().expect("poisoned").clone();
-            // `background_full` is stale while a fresh run is in flight (space
-            // may have returned since it was set): only a *finished* run that
-            // failed for want of space is a StorageFull verdict.
-            if self.background_full.load(Ordering::Acquire)
-                && !self.maintenance_scheduled.load(Ordering::Acquire)
-            {
-                return Err(StorageError::StorageFull(format!(
-                    "write backpressure: memtable over the hard cap ({cap} bytes) and \
-                     background maintenance is out of disk space (last error: {:?})",
-                    last_error()
-                )));
-            }
-            if failures >= BACKPRESSURE_MAX_CONSECUTIVE_FAILURES {
-                return Err(StorageError::Backend(format!(
-                    "write backpressure: memtable over the hard cap ({cap} bytes) after \
-                     {failures} consecutive background maintenance failures (last error: {:?})",
-                    last_error()
-                )));
-            }
-            // Make sure maintenance is actually working the backlog — normally
-            // the write that pushed the memtable over threshold already
-            // triggered it, but this is cheap insurance against any gap.
-            self.trigger_background_maintenance();
-            self.env.sleep(BACKPRESSURE_POLL).await;
+            return Err(StorageError::StorageFull(format!(
+                "write stall ({}): background maintenance is out of disk space \
+                 (last error: {:?})",
+                cause.name(),
+                last_error()
+            )));
         }
+        let limit_hit = match self.opts.stall_fault {
+            // Control (h): the limit counted in seconds.
+            StallFault::LimitInSeconds => waited >= Duration::from_secs(8),
+            // Control (b): the pre-ADR bounded poll.
+            StallFault::OldGate => polls >= OLD_GATE_MAX_POLLS,
+            _ => failures >= self.opts.maintenance_failure_limit,
+        };
+        if limit_hit {
+            return Err(StorageError::Backend(format!(
+                "write stall ({}): {failures} consecutive background maintenance \
+                 failures, waited {waited:?} (last error: {:?})",
+                cause.name(),
+                last_error()
+            )));
+        }
+        Ok(())
     }
 
     /// Open a reader for `file`/`meta` with the engine's shared block-read
@@ -1592,7 +2214,7 @@ impl<E: Env> LsmEngine<E> {
         // their manifest swaps, and each clear memtable state the other's
         // snapshot depends on. Writers never take this lock, so the write path
         // (and WAL group-commit liveness) is unaffected.
-        let _maintenance = self.maintenance.acquire().await;
+        let _maintenance = self.acquire_maintenance(MaintenanceClass::Flush).await;
 
         // Snapshot the memtable + the seq to allocate, lock-free for the write.
         // The `applies_in_flight == 0` gate is re-checked here, **atomically with
@@ -1662,6 +2284,7 @@ impl<E: Env> LsmEngine<E> {
         // Atomically swap the manifest to reference the new table and the surviving
         // WAL segments. Until this returns durably, a crash recovers the old
         // manifest + the intact WAL segments.
+        let flushed_bytes = meta.file_size;
         new_manifest.tables.push(meta);
         new_manifest.wal_segments = surviving;
         if let Err(e) = self.write_manifest(&new_manifest).await {
@@ -1727,6 +2350,12 @@ impl<E: Env> LsmEngine<E> {
         // Observability (ADR 0015): a flush actually committed (the manifest swap
         // is done and the new table is live).
         self.metrics.incr(Metric::StorageFlushes);
+        // ADR 0081 decision 4: a flush is charged to the node's IO budget (so
+        // the gauge shows real disk use) but never delayed by it.
+        if let Some(gate) = self.compaction_gate.get() {
+            gate.io_charge(flushed_bytes);
+        }
+        self.publish_stall();
         Ok(())
     }
 
@@ -1741,7 +2370,7 @@ impl<E: Env> LsmEngine<E> {
     /// physical layout changes. Crash safety is the same single-swap argument as
     /// before: the inputs stay named by the manifest (and intact on disk) until
     /// the swap commits, and the new files are orphans until then.
-    async fn run_compaction(&self, plan: CompactionPlan) -> Result<()> {
+    async fn run_compaction(&self, plan: CompactionPlan) -> Result<u64> {
         // Serialize against any concurrent flush or compaction: a compaction
         // allocates SSTable seqs from `manifest.next_seq` and swaps the manifest
         // + readers exactly like a flush does, so an overlap (e.g. an admin
@@ -1750,7 +2379,7 @@ impl<E: Env> LsmEngine<E> {
         // *under* the lock below, so a stale `plan` (its level already compacted
         // by whoever held the lock first) degrades to a harmless re-plan or
         // no-op.
-        let _maintenance = self.maintenance.acquire().await;
+        let _maintenance = self.acquire_maintenance(MaintenanceClass::Compaction).await;
         let target_level = plan.source_level + 1;
 
         // Pick inputs under the lock: all readers at the source level, plus the
@@ -1819,7 +2448,7 @@ impl<E: Env> LsmEngine<E> {
         };
 
         if input_readers.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
 
         // Observability (ADR 0015): the input tables this compaction merges away
@@ -1892,6 +2521,8 @@ impl<E: Env> LsmEngine<E> {
                 }
             }
         }
+
+        let written_bytes: u64 = new_metas.iter().map(|m| m.file_size).sum();
 
         // Build the new manifest: survivors (not consumed) + the new runs. A crash
         // before the swap keeps the old inputs (still named + intact); the new
@@ -1979,7 +2610,8 @@ impl<E: Env> LsmEngine<E> {
         for f in old_files {
             self.env.remove(&f).await.map_err(io)?;
         }
-        Ok(())
+        self.publish_stall();
+        Ok(written_bytes)
     }
 
     /// Atomically persist the manifest using the compact binary codec. The
@@ -2483,7 +3115,7 @@ impl<E: Env> LsmEngine<E> {
         // Hold the maintenance lock for the whole snapshot+link sequence so a
         // concurrent compaction on the source cannot swap/remove a table this
         // call is in the middle of linking (see the doc comment above).
-        let _maintenance = self.maintenance.acquire().await;
+        let _maintenance = self.acquire_maintenance(MaintenanceClass::Compaction).await;
 
         let (tables, mut next_seq, max_version, mut leftover) = {
             let inner = self.lock();
@@ -2559,7 +3191,7 @@ impl<E: Env> LsmEngine<E> {
         // released before reopening the (independent) target.
         drop(_maintenance);
 
-        LsmEngine::open_with(self.env.clone(), target_prefix, self.opts).await
+        LsmEngine::open_with(self.env.clone(), target_prefix, *self.opts).await
     }
 
     /// Clone the whole engine — [`clone_to_filtered`](Self::clone_to_filtered)
@@ -2673,6 +3305,8 @@ impl<E: Env> StorageEngine for LsmEngine<E> {
     type Snapshot = LsmSnapshot<E>;
 
     async fn put(&self, key: &[u8], value: &[u8], version: Version) -> Result<()> {
+        self.stall_before_write((key.len() + value.len()) as u64)
+            .await?;
         {
             let inner = self.lock();
             if version <= inner.manifest.max_version {
@@ -2698,6 +3332,8 @@ impl<E: Env> StorageEngine for LsmEngine<E> {
     }
 
     async fn merge(&self, key: &[u8], value: &[u8], version: Version) -> Result<bool> {
+        self.stall_before_write((key.len() + value.len()) as u64)
+            .await?;
         // Per-key LWW: apply only if strictly newer than this key's own latest
         // anywhere in the engine. Skipped under `trust_monotonic_versions` (see
         // `LsmOptions`): the caller guarantees `version` is already newer than
@@ -2727,6 +3363,7 @@ impl<E: Env> StorageEngine for LsmEngine<E> {
     }
 
     async fn merge_tombstone(&self, key: &[u8], version: Version) -> Result<bool> {
+        self.stall_before_write(key.len() as u64).await?;
         // See `merge`: the read is skipped under `trust_monotonic_versions`.
         if !self.opts.trust_monotonic_versions
             && self
@@ -2755,6 +3392,12 @@ impl<E: Env> StorageEngine for LsmEngine<E> {
         if ops.is_empty() {
             return Ok(());
         }
+        self.stall_before_write(
+            ops.iter()
+                .map(|o| (o.key.len() + o.value.as_ref().map_or(0, Vec::len)) as u64)
+                .sum(),
+        )
+        .await?;
         // Decide per-op LWW winners *before* logging, matching `merge`: an op
         // takes effect only if its version is strictly greater than the key's
         // current latest — considering both the engine's state AND earlier
@@ -2818,6 +3461,7 @@ impl<E: Env> StorageEngine for LsmEngine<E> {
     }
 
     async fn delete(&self, key: &[u8], version: Version) -> Result<()> {
+        self.stall_before_write(key.len() as u64).await?;
         {
             let inner = self.lock();
             if version <= inner.manifest.max_version {
@@ -2842,6 +3486,8 @@ impl<E: Env> StorageEngine for LsmEngine<E> {
     }
 
     async fn delete_range(&self, start: &[u8], end: &[u8], version: Version) -> Result<()> {
+        self.stall_before_write((start.len() + end.len()) as u64)
+            .await?;
         if start > end {
             return Err(StorageError::InvalidRange);
         }
@@ -2876,6 +3522,18 @@ impl<E: Env> StorageEngine for LsmEngine<E> {
     }
 
     async fn write_batch(&self, batch: WriteBatch) -> Result<()> {
+        self.stall_before_write(
+            batch
+                .ops
+                .iter()
+                .map(|op| match op {
+                    WriteOp::Put { key, value } => key.len() + value.len(),
+                    WriteOp::Delete { key } => key.len(),
+                    WriteOp::DeleteRange { start, end } => start.len() + end.len(),
+                } as u64)
+                .sum(),
+        )
+        .await?;
         for op in &batch.ops {
             if let WriteOp::DeleteRange { start, end } = op
                 && start > end
@@ -5628,6 +6286,7 @@ mod readers_arc_tests {
             tombstone_grace_versions: 1 << 20,
             trust_monotonic_versions: false,
             background_maintenance: false,
+            ..LsmOptions::default()
         }
     }
 
@@ -5851,5 +6510,86 @@ mod legacy_wal_guard_tests {
                 assert!(e.get(format!("k{i}").as_bytes()).await.unwrap().is_some());
             }
         });
+    }
+}
+
+/// ADR 0081 decision 4: the `MaintenanceLock` serves a flush before a queued
+/// compaction, FIFO within a class, with no lost wakeup (including when a woken
+/// waiter is cancelled before it polls).
+#[cfg(test)]
+mod maintenance_lock_order_tests {
+    use super::*;
+    use futures::executor::block_on;
+    use futures::task::noop_waker;
+
+    fn ready<F: Future>(f: Pin<&mut F>, cx: &mut Context<'_>) -> Option<F::Output> {
+        match f.poll(cx) {
+            Poll::Ready(v) => Some(v),
+            Poll::Pending => None,
+        }
+    }
+
+    #[test]
+    fn a_queued_flush_wins_over_an_earlier_queued_compaction() {
+        let lock = MaintenanceLock::default();
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let holder = block_on(lock.acquire(MaintenanceClass::Compaction));
+        let mut c = Box::pin(lock.acquire(MaintenanceClass::Compaction));
+        let mut f = Box::pin(lock.acquire(MaintenanceClass::Flush));
+        assert!(ready(c.as_mut(), &mut cx).is_none());
+        assert!(ready(f.as_mut(), &mut cx).is_none());
+        drop(holder);
+        // The compaction registered first and polls first, but must not take
+        // the free lock while a flush is parked.
+        assert!(ready(c.as_mut(), &mut cx).is_none());
+        let g = ready(f.as_mut(), &mut cx).expect("the flush takes the lock");
+        drop(g);
+        assert!(ready(c.as_mut(), &mut cx).is_some(), "then the compaction");
+    }
+
+    #[test]
+    fn registration_order_decides_within_a_class() {
+        let lock = MaintenanceLock::default();
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let holder = block_on(lock.acquire(MaintenanceClass::Flush));
+        let mut a = Box::pin(lock.acquire(MaintenanceClass::Flush));
+        let mut b = Box::pin(lock.acquire(MaintenanceClass::Flush));
+        assert!(ready(a.as_mut(), &mut cx).is_none());
+        assert!(ready(b.as_mut(), &mut cx).is_none());
+        drop(holder);
+        // Both are woken; whichever polls first wins, the other re-parks and
+        // wins next (no waiter is lost).
+        let g = ready(a.as_mut(), &mut cx).expect("first registered wins");
+        assert!(ready(b.as_mut(), &mut cx).is_none());
+        drop(g);
+        assert!(ready(b.as_mut(), &mut cx).is_some());
+    }
+
+    #[test]
+    fn a_cancelled_flush_waiter_hands_the_turn_to_the_compaction() {
+        let lock = MaintenanceLock::default();
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let holder = block_on(lock.acquire(MaintenanceClass::Compaction));
+        let mut c = Box::pin(lock.acquire(MaintenanceClass::Compaction));
+        let mut f = Box::pin(lock.acquire(MaintenanceClass::Flush));
+        assert!(ready(c.as_mut(), &mut cx).is_none());
+        assert!(ready(f.as_mut(), &mut cx).is_none());
+        drop(holder);
+        // The flush was the one woken, but is dropped before it polls.
+        drop(f);
+        assert!(
+            ready(c.as_mut(), &mut cx).is_some(),
+            "the compaction must not wait for a flush that no longer exists"
+        );
+    }
+
+    #[test]
+    fn an_uncontended_acquire_of_either_class_is_immediate() {
+        let lock = MaintenanceLock::default();
+        drop(block_on(lock.acquire(MaintenanceClass::Flush)));
+        drop(block_on(lock.acquire(MaintenanceClass::Compaction)));
     }
 }

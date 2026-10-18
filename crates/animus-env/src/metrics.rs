@@ -1222,12 +1222,44 @@ pub enum Metric {
     HeartbeatInboxDropped,
     /// A level (ADR 0080 section 3): per-peer writer tasks alive on this node now (the old task-per-frame count, now bounded by peers).
     TransportOutboxPeers,
+    /// A counter (ADR 0081): writes that waited because the engine's memtable was over its hard cap.
+    StorageWriteStallsMemtable,
+    /// A counter (ADR 0081): writes delayed by the L0 slowdown ramp.
+    StorageWriteStallsL0Slowdown,
+    /// A counter (ADR 0081): writes that waited because L0 reached the stop level.
+    StorageWriteStallsL0Stop,
+    /// A counter (ADR 0081): microseconds writers spent waiting on a full memtable.
+    StorageWriteStallMicrosMemtable,
+    /// A counter (ADR 0081): microseconds writers spent in the L0 slowdown delay.
+    StorageWriteStallMicrosL0Slowdown,
+    /// A counter (ADR 0081): microseconds writers spent waiting at the L0 stop level.
+    StorageWriteStallMicrosL0Stop,
+    /// A level (ADR 0081): engines on this node whose writes are being delayed now.
+    StorageEnginesSlowed,
+    /// A level (ADR 0081): engines on this node whose writes are waiting now.
+    StorageEnginesStopped,
+    /// A level (ADR 0081): the highest L0 table count of any engine on this node now.
+    StorageL0TablesMax,
+    /// A high-water mark (ADR 0081): the highest L0 table count any engine on this node ever reached.
+    StorageL0TablesHwm,
+    /// A level (ADR 0081): the compaction write budget in bytes/s after lag scaling (0 = off).
+    StorageCompactionIoRate,
+    /// A level (ADR 0081): bytes the compaction write budget is overdrawn by now (0 when in credit).
+    StorageCompactionIoDebtBytes,
+    /// A counter (ADR 0081): microseconds engines spent with a compaction deferred by the write budget.
+    StorageCompactionThrottledMicros,
+    /// A counter (ADR 0081): compactions that bypassed the write budget at the urgent L0 level.
+    StorageCompactionUrgent,
+    /// A counter (ADR 0081): microseconds a flush waited for the maintenance lock.
+    StorageFlushBlockedMicros,
+    /// A level (ADR 0081): the longest current run of consecutive maintenance failures of any engine on this node.
+    StorageMaintenanceFailureStreak,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 187] = [
+    pub const ALL: [Metric; 203] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -1415,6 +1447,22 @@ impl Metric {
         Metric::QueuedBytesHwm,
         Metric::HeartbeatInboxDropped,
         Metric::TransportOutboxPeers,
+        Metric::StorageWriteStallsMemtable,
+        Metric::StorageWriteStallsL0Slowdown,
+        Metric::StorageWriteStallsL0Stop,
+        Metric::StorageWriteStallMicrosMemtable,
+        Metric::StorageWriteStallMicrosL0Slowdown,
+        Metric::StorageWriteStallMicrosL0Stop,
+        Metric::StorageEnginesSlowed,
+        Metric::StorageEnginesStopped,
+        Metric::StorageL0TablesMax,
+        Metric::StorageL0TablesHwm,
+        Metric::StorageCompactionIoRate,
+        Metric::StorageCompactionIoDebtBytes,
+        Metric::StorageCompactionThrottledMicros,
+        Metric::StorageCompactionUrgent,
+        Metric::StorageFlushBlockedMicros,
+        Metric::StorageMaintenanceFailureStreak,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -1611,6 +1659,22 @@ impl Metric {
             Metric::QueuedBytesHwm => "queued_bytes_hwm",
             Metric::HeartbeatInboxDropped => "heartbeat_inbox_dropped",
             Metric::TransportOutboxPeers => "transport_outbox_peers",
+            Metric::StorageWriteStallsMemtable => "storage_write_stalls_memtable",
+            Metric::StorageWriteStallsL0Slowdown => "storage_write_stalls_l0_slowdown",
+            Metric::StorageWriteStallsL0Stop => "storage_write_stalls_l0_stop",
+            Metric::StorageWriteStallMicrosMemtable => "storage_write_stall_micros_memtable",
+            Metric::StorageWriteStallMicrosL0Slowdown => "storage_write_stall_micros_l0_slowdown",
+            Metric::StorageWriteStallMicrosL0Stop => "storage_write_stall_micros_l0_stop",
+            Metric::StorageEnginesSlowed => "storage_engines_slowed",
+            Metric::StorageEnginesStopped => "storage_engines_stopped",
+            Metric::StorageL0TablesMax => "storage_l0_tables_max",
+            Metric::StorageL0TablesHwm => "storage_l0_tables_hwm",
+            Metric::StorageCompactionIoRate => "storage_compaction_io_rate",
+            Metric::StorageCompactionIoDebtBytes => "storage_compaction_io_debt_bytes",
+            Metric::StorageCompactionThrottledMicros => "storage_compaction_throttled_micros",
+            Metric::StorageCompactionUrgent => "storage_compaction_urgent",
+            Metric::StorageFlushBlockedMicros => "storage_flush_blocked_micros",
+            Metric::StorageMaintenanceFailureStreak => "storage_maintenance_failure_streak",
         }
     }
 

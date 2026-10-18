@@ -29,6 +29,7 @@ fn opts(trust_monotonic_versions: bool) -> LsmOptions {
         tombstone_grace_versions: 1 << 20,
         trust_monotonic_versions,
         background_maintenance: false,
+        ..LsmOptions::default()
     }
 }
 

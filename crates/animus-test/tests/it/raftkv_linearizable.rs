@@ -815,6 +815,7 @@ fn lsm_opts() -> LsmOptions {
         // and off-loop maintenance) — exercise the default, always-safe path.
         trust_monotonic_versions: false,
         background_maintenance: false,
+        ..LsmOptions::default()
     }
 }
 

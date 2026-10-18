@@ -1994,6 +1994,7 @@ fn run_compaction_load(c: &BgCell) -> BgReport {
         tombstone_grace_versions: 1 << 20,
         trust_monotonic_versions: false,
         background_maintenance: true,
+        ..LsmOptions::default()
     };
     let engines: Vec<LsmEngine<SimEnv>> = (0..ENGINES)
         .map(|i| {

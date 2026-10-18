@@ -1,6 +1,6 @@
 # ADR 0081 — LSM write stall and compaction IO limit: an L0 slowdown/stop that delays but never fails a committed entry, and a node-wide compaction bytes/s budget
 
-- **Status:** Proposed (2026-10-18). Defaults are **provisional** until the measurement step of the implementation plan, which records the numbers in an as-built amendment. Nothing here is implemented.
+- **Status:** Accepted (2026-10-18): the maintainer accepted every recommendation, including the recommended answer to each open question. Implemented the same day; the as-built amendment at the end records the measurement, what changed and what is deferred. The defaults below are kept; the measurement did not contradict them.
 - **Date:** 2026-10-18
 - **Origin:** issue #1300; the maintainer decision of 2026-10-12 (ADR 0079 decision 6) that an L0 write stall and a compaction IO rate limit get their own storage-engine ADR; the maintainer order "ADR first, then measure, then code".
 - **Amends:** none. **Depends on:** ADR 0003 (determinism, the `Env` seam), ADR 0004/0008 (storage engine, `LsmEngine`), ADR 0016/0017 (CP data plane, the apply task), ADR 0050 (a private engine per tablet), ADR 0073 (upgrade compatibility), ADR 0074 (every queue is bounded), ADR 0078 (`LoadMonitor`; decision 4: advisory signals never fail health or the roll gate), ADR 0079 (compaction permit pool and its L0 bypass; decision 9, the shared `lag -> factor` helper), ADR 0080 (`ProposeResult::Busy`, the edge mapping to `ThrottlingException`; the 2026-10-18 amendment, follower applied-index bound, #1330).
@@ -256,3 +256,147 @@ One implementation PR on one branch (repo operating mode), ordered commits, each
 6. **Fail-stop after `maintenance_failure_limit` = 8 consecutive non-ENOSPC maintenance failures (apply-task panic, node restart), or wait forever and only alarm?** Recommended: fail-stop, counted in failures not seconds. It is what the engine does today for a persistent fault, but only after an arbitrary 10 s; a stuck unrecoverable engine that waits forever is a node that looks healthy and serves nothing. The panic path is the existing, tested one.
 7. **Operator surface: an explicit `spec.background.compactionIoMiBPerSec` only, never derived?** Recommended: yes. The node cannot see disk bandwidth, and deriving it from CPU would be guessing; a documented sizing note (a fraction of the volume's sustained write bandwidth, from the measurement) is the honest guidance. Alternative: a storage-class table in the operator, rejected as an unverifiable promise.
 8. **Per-engine thresholds, not scaled by the number of engines on the node?** Recommended: yes (decision 1): a tablet's read amplification and memtable are its own, and a stall only blocks that tablet's apply task. The node-level coupling lives in the shared IO budget and the permit pool.
+
+## As-built amendment (2026-10-18)
+
+Implemented in one workstream (issue #1300). Everything is node-local class L: no `Gate`, no
+format change, no fixture, no cross-node message (checked, see "Compatibility" below).
+
+### What was built
+
+- **Stall before the append** (`animus-storage` `stall.rs`, `LsmEngine::stall_before_write`).
+  `StallPolicy::decide(l0, memtable_bytes, write_bytes)` returns `Go`, `Delay{cause, delay}` or
+  `Wait{cause}`. It is called first in every mutating method (`put`, `merge`, `merge_tombstone`,
+  `merge_batch`, `delete`, `delete_range`, `write_batch`), outside every lock. `LsmOptions` gained
+  `l0_slowdown_factor`/`l0_stop_factor` (3 and 5 in `production()`, 0 in `default()` and
+  `production_raw_versions()`), `l0_slowdown_write_rate` (16 MiB/s), `l0_min_write_rate`
+  (256 KiB/s) and `maintenance_failure_limit` (8), validated by `LsmOptions::validate`
+  (`bypass < slowdown < stop`, or both 0; `0 < min <= slowdown`; limit >= 1; the new error is
+  `StorageError::InvalidStallOptions`). The old 10,000-poll memtable gate and its post-append
+  `await_backpressure` are deleted.
+- **Reconciliation with #1338** (which landed first): the failure-count limit is kept as written
+  (8 consecutive non-ENOSPC maintenance failures, counted in failures, not seconds). The stall
+  returns `Err` only for that and for `StorageFull`, and `StorageFull` now takes one **fresh
+  maintenance run** first (`confirmed_full`): `background_full` is sticky until a successful run
+  clears it and a waiting writer is the only thing driving maintenance, so a stale verdict would
+  fail it forever after space came back. Decision 2's "no `Err` for elapsed time" and decision
+  3's pre-append position hold.
+- **Compaction write budget** (`animus-cp-data` `compaction_io.rs`, `BackgroundBudget`). An
+  `IoBucket` in byte-nanoseconds with debt and a 1 s burst, charged before the run from
+  `plan_input_bytes`, settled to the actual bytes written; `scale_by_lag` with a 4 MiB/s floor
+  (never above the configured rate). Order is permit, then bucket; a throttled run drops its
+  permit and ends (`schedule_compaction_retry`, 100 ms), so a throttled compaction never holds a
+  pool permit. Urgent runs (L0 >= 2T, the existing `COMPACTION_L0_BYPASS_FACTOR`) are admitted
+  into debt, which is what keeps the limiter from deadlocking a stall. Flush is charged
+  (`io_charge`) but never delayed. The seam is three default methods on `CompactionGate`
+  (`io_admit`, `io_settle`, `io_charge`), so every other gate implementation is unchanged.
+  Default rate 0 = off.
+- **Maintenance lock**: `MaintenanceLock` has flush and compaction waiter classes; flush waiters
+  are woken first, a cancelled waiter hands its turn on (drop-safe, ids for deregistration). Time
+  flush spends waiting is `storage_flush_blocked_micros`.
+- **Observability**: 16 new metrics (`storage_write_stalls_{memtable,l0_slowdown,l0_stop}`, their
+  `storage_write_stall_micros_*` totals, `storage_engines_slowed`, `storage_engines_stopped`,
+  `storage_l0_tables_max`, `storage_l0_tables_hwm`, `storage_compaction_io_rate`,
+  `storage_compaction_io_debt_bytes`, `storage_compaction_throttled_micros`,
+  `storage_compaction_urgent`, `storage_flush_blocked_micros`,
+  `storage_maintenance_failure_streak`), a node-wide `StallLedger` that aggregates the per-engine
+  state into the gauges, and the advisory `lsm_stall` object on `/admin/health` (never fails a
+  probe or the roll gate, ADR 0078 decision 4).
+- **Knobs**: `animusd --compaction-io-bytes-per-sec` and `cluster_settings.
+  bg_compaction_io_bytes_per_sec` (CLI wins, conflict is a startup error as for the other `bg_*`
+  fields); the operator exposes only the explicit `spec.background.compactionIoMiBPerSec`
+  (MiB x 2^20, `0`/unset renders nothing, never derived).
+- **A defect found on the way**: a split child was opened without the node's compaction gate
+  (`clone_engine`), so it was outside the permit pool and the budget. `install_node_seams` now
+  covers open and clone.
+
+### Measurement (before code)
+
+Rig: `animus-cp-data` `tests/it/lsm_stall_measure.rs` (`#[ignore]`d sweep, `cargo test -p
+animus-cp-data --test it lsm_stall_measure -- --ignored --nocapture`), `LsmEngine<SimEnv>`, 1 KiB
+values, a node pool of 2 compaction permits, 60 s of virtual time per cell, the disk slowed only by
+`DiskConfig::set_sync_delay` (ADR 0079 decision 7). Modes: everything off (the old position of the
+gate, factors 0), the stall on, and the stall plus the budget at 100 %, 50 % and 25 % of the
+sustained compaction rate measured in the off run. One writer per engine (see finding 3). Columns
+for the cells that matter (full output in `docs/density-measurements.md` section I):
+
+| Cell (engines x writers, sync delay) | Mode | acked/s | L0 high-water | flush blocked (ms) | compaction MiB/s |
+|---|---|---|---|---|---|
+| 1 x 1, 5 ms | off / stall | 90 | 4 | - | - |
+| 8 x 1, 5 ms | off | 705 | 8 | 26,051 | 0.036 |
+| 8 x 1, 5 ms | budget 100 / 50 / 25 % | about 716 | 8 | 2,379 / 1,270 / 1,264 | 0.021 |
+| 32 x 1, 5 ms | off | 2,844 | 8 | 11,376 | - |
+| 32 x 1, 5 ms | budget | unchanged | 8 | about 5,056 | - |
+| 32 x 1, 30 ms | off | 516 | 8 | 44,622 | - |
+| 8 x 8, 5 ms | off | memtable stalls about 2,014 s in 60 s | - | - | - |
+
+Findings:
+
+1. **Level 0 never exceeded 8, twice the trigger, in any cell, with everything off.** The urgent
+   bypass (L0 >= 2T compacts even with an empty pool) and the memtable cap hold the line before
+   the 3T slowdown is reached. The 3T/5T levels are a backstop for a compaction that cannot run
+   (starved CPU, wedged disk), not something a slow disk alone reaches. The active cause under a
+   slow disk is the **memtable**. This is why the L0 cells of the corpus use a `Wedge` gate that
+   withholds even urgent compaction (outside the gate's contract, stated in the file docs).
+2. **The budget does not cost goodput** in these cells (within noise of the off run) and cuts the
+   time flushes wait behind compaction by 2x to 20x (26,051 ms to 1,264-2,379 ms at 8 x 1), because
+   a deferred compaction does not hold the maintenance lock. The sustained compaction rate here is
+   tiny (0.036 MiB/s), which is why the default stays off: there is no number to set until a
+   workload on a real volume has one (open question below).
+3. **Flush starves under concurrent writers.** With 8 writers per engine the memtable stall
+   totals about 2,014 s in 60 s of virtual time and goodput collapses (124 acked/s for one engine
+   with 8 writers): `flush` defers while `applies_in_flight > 0` and with several writers there is
+   always one in flight, so the memtable reaches its hard cap with L0 low. A pre-existing flush
+   liveness defect that the stall exposes; recorded as a lesson and filed as a follow-up, not
+   changed here (it touches the part the crash corpora guard hardest).
+4. The characterisation did not contradict the provisional defaults, so **none changed**: 3T/5T,
+   16 MiB/s to 256 KiB/s, failure limit 8, burst 1 s, floor 4 MiB/s, retry 100 ms, budget off.
+
+ProdEnv baseline on the sandbox volume (sequential write with an fsync per MiB): 170.5 MiB/s, the
+order of figure the budget is sized as a fraction of (`docs/density-measurements.md` section I).
+
+### Open questions, as answered
+
+All eight recommendations were accepted and built as recommended: (1) one workstream, budget
+default-off, explicit operator override only; (2) no immediate refusal at the stop level, the
+propose bound does it (the composition cells show a backlog of about 64 entries before the first
+`Busy`); (3) 3T/5T and the 16 MiB/s to 256 KiB/s ramp; (4) flush-first plus defer-and-end
+(`storage_flush_blocked_micros` drops 2x to 20x, finding 2; concurrent flush stays a separate
+measured amendment); (5) memtable and compaction buffers stay out of `QueuedBytes`; (6) fail-stop
+after 8 consecutive non-ENOSPC maintenance failures, counted in failures; (7) the operator
+override is explicit only; (8) per-engine thresholds.
+
+### Tests
+
+- Tier 0/1 (`animus-storage`): `stall.rs` unit tests, `maintenance_lock_order_tests` (4),
+  `tests/it/lsm_write_stall.rs` (`ANIMUS_LSM_STALL_SEEDS`, `ANIMUS_LSM_STALL_CELL`): cells 1 to 6
+  (ramp and stop, resume, no `Err`, crash mid-stall, with torn/corrupt tails, `StorageFull`,
+  the failure-count limit) and controls (a) the old post-append gate, (b) the bounded poll, (c) a
+  stall inside compaction, (h) a limit counted in seconds; each control fails its oracle.
+- `animus-cp-data` `tests/it/compaction_io_budget_corpus.rs`: cells 7 to 10 (bounded non-urgent
+  bytes, no urgent deferral, permit-then-bucket order, flush never delayed, lag scaling, zero
+  rate is off) and controls (d) no urgent bypass, (e) permit held while throttled, (f) and (g)
+  flush gated.
+- Composition, `animus-cp-data` `tests/it/lsm_stall_admission.rs`: a stall surfaces as `Busy`
+  through the ADR 0080 / #1330 bound and never as a panic; one wedged follower causes no refusal,
+  both do; a `Liveness`-class resolve is admitted and completes after the stall; control (b) the
+  old gate takes the apply task down.
+- Tier 2, `animusd` `sim_cluster_lsm_stall`: DynamoDB wire over `SimCluster`'s LSM backend, only
+  documented refusals, acked writes durable, a fresh write after; control: the old gate.
+- Tier 3, `animus-storage` `tests/lsm_stall_prod.rs`: `ProdEnv`, timeout-guarded.
+
+### Compatibility (verified)
+
+Class L. The stall and the bucket are in-process state; no durable format (WAL, manifest, SSTable,
+snapshot) changed, no wire or replicated enum gained a variant, `cluster_settings` gained one
+optional node-local field (`bg_compaction_io_bytes_per_sec`, `#[serde(default)]`, ignored by an
+older binary that never reads it), and `lsm_crash`, `lsm_disk_faults` and
+`check-format-fixtures.sh` are unchanged.
+
+### Deferred
+
+- Flush starvation by `applies_in_flight` under concurrent writers (finding 3): follow-up issue.
+- A default for the compaction write budget: needs a workload on a real volume; the sizing note in
+  the runbook is the interim guidance.
+- Concurrent flush or incremental compaction (question 4): only if `storage_flush_blocked_micros`
+  is routinely large in production.

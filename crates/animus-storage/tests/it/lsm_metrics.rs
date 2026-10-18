@@ -30,6 +30,7 @@ fn opts() -> LsmOptions {
         tombstone_grace_versions: 1 << 20,
         trust_monotonic_versions: false,
         background_maintenance: false,
+        ..LsmOptions::default()
     }
 }
 
@@ -204,6 +205,7 @@ fn tombstone_gc_is_recorded() {
             tombstone_grace_versions: grace,
             trust_monotonic_versions: false,
             background_maintenance: false,
+            ..LsmOptions::default()
         },
         metrics.clone(),
     ))
