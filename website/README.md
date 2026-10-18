@@ -1,8 +1,8 @@
 # animusdb.io — the AnimusDB marketing site
 
-Static HTML/CSS/JS on the "Ledger" design system (ADR 0056). **No build step,
+Static HTML/CSS/JS on the "Ledger" design system (ADR 0056), restyled 2026-10-18 as an open layout: Archivo headings at 75% width, white ground, light grey code surface, no black blocks. **No build step,
 no bundler** — edit a file, commit, and it ships. The site makes no third-party requests:
-the two faces (Work Sans + JetBrains Mono, variable, latin subset, SIL OFL)
+the two faces (Archivo, variable in weight and width, and JetBrains Mono for code only; latin subset, SIL OFL)
 are self-hosted in `assets/fonts/`.
 
 ```
@@ -22,7 +22,7 @@ website/
   assets/
     tokens.css    shared design tokens — byte-identical to crates/animusd/src/tokens.css
     site.css      the site's own skin (geometry) on top of the shared tokens
-    site.js       theme switch (light/dark/system; light is the default), mobile nav,
+    site.js       theme switch (light/dark/system; light is the default),
                   copy buttons, docs scrollspy
     favicon.svg
     fonts/        self-hosted WOFF2 faces + their OFL licences
