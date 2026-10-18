@@ -258,14 +258,14 @@ mod tests {
     #[test]
     fn urgent_is_always_admitted_into_debt_and_delays_the_non_urgent() {
         let mut b = IoBucket::new(4 * MIB);
-        assert!(b.try_admit(t(0), 0, 4 * MIB + 1, false));
+        assert!(b.try_admit(t(0), 0, 8 * MIB, false));
         assert!(b.try_admit(t(1), 0, 50 * MIB, true));
         assert_eq!(b.urgent, 1);
         assert!(b.debt_bytes() > 40 * MIB);
         assert!(!b.try_admit(t(2), 0, 1, false));
-        // Debt of ~50 MiB at 4 MiB/s repays in ~12.5 s.
+        // Debt of ~54 MiB at 4 MiB/s repays in ~13.5 s.
         assert!(!b.try_admit(t(10_000), 0, 1, false));
-        assert!(b.try_admit(t(13_000), 0, 1, false));
+        assert!(b.try_admit(t(15_000), 0, 1, false));
     }
 
     #[test]
