@@ -3,15 +3,19 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Architecture — AnimusDB</title>
+<title>Architecture of a self-hosted DynamoDB-compatible database — AnimusDB</title>
 <meta name="description" content="Two planes, one Raft group per tablet, no special node. The consistency model, deployment shapes, ports, determinism internals and known limits.">
 <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
 <link rel="canonical" href="https://animusdb.io/architecture.html">
-<meta property="og:title" content="Architecture — AnimusDB">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://animusdb.io/architecture.html">
+<meta property="og:title" content="Architecture of a self-hosted DynamoDB-compatible database — AnimusDB">
 <meta property="og:description" content="Two planes, one Raft group per tablet, no special node. The consistency model, deployment shapes, ports, determinism internals and known limits.">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Work+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<meta property="og:image" content="https://animusdb.io/assets/og-card.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="AnimusDB — the DynamoDB API on infrastructure you own">
+<meta name="twitter:card" content="summary_large_image">
 <link rel="stylesheet" href="assets/tokens.css">
 <link rel="stylesheet" href="assets/site.css">
 <script src="assets/site.js" defer></script>
@@ -87,11 +91,11 @@
 
 <main id="main">
 
-<div class="wrap ref-head" style="--rh-pt:38px;--rh-pb:20px">
+<div class="wrap ref-head">
   <span class="kicker">Architecture</span>
   <h1>Two planes, many groups, no special node.</h1>
-  <p style="font-size:15.5px;color:var(--ink-78,var(--ink-72));max-width:740px;font-style:italic;margin-bottom:22px">AnimusDB is a Dynamo-lineage store built out of ordinary Raft groups rather than a novel consensus protocol. This page is the whole shape of it: where the metadata lives, where your data lives, what a write costs, how you deploy it, and what it still can't do.</p>
-  <span class="kicker" style="margin-bottom:8px">On this page</span>
+  <p class="page-lede italic mb-22">AnimusDB is a Dynamo-lineage store built out of ordinary Raft groups rather than a novel consensus protocol. This page is the whole shape of it: where the metadata lives, where your data lives, what a write costs, how you deploy it, and what it still can't do.</p>
+  <span class="kicker mb-8">On this page</span>
   <ol class="toc">
     <li><a href="#planes">The two planes</a></li>
     <li><a href="#split">Why the split matters</a></li>
@@ -112,7 +116,7 @@
     <p class="body-text">The <strong>control plane</strong> is a single small Raft group. It holds cluster membership, the tablet map (which node owns which range of which table), and table definitions including indexes and stream configuration. It is written to when the topology changes — a node joins, a tablet splits, an index is added — and that is a rare event measured against your request rate.</p>
     <p class="body-text">The <strong>data plane</strong> is one independent Raft group per tablet. Each has its own leader, its own log and its own quorum. A write is durable and acknowledged when a quorum of that tablet's replicas has it; nothing else in the cluster is involved.</p>
 
-    <div class="diagram-plate" style="margin:18px 0">
+    <div class="diagram-plate my-18">
       <svg viewBox="0 0 980 360" role="img" aria-label="An unmodified AWS SDK sends a write; it arrives at the Raft leader of one tablet, not at a coordinator; a bracket marks the quorum acknowledgement across that tablet's replicas; two further tablets have their own separate leaders and no log connects the tablets; the control plane is a separate small Raft group holding membership, the tablet map and table definitions, attached only by a dashed link for topology lookups that never sit on the read or write path.">
         <defs>
           <marker id="arrF2" markerWidth="7" markerHeight="7" refX="5.5" refY="3.5" orient="auto"><path class="dg-arrow-muted" d="M0 1.2 L5.5 3.5 L0 5.8 z"/></marker>
@@ -124,7 +128,7 @@
         <path class="dg-req" d="M490 48 V66 H524 V90" marker-end="url(#arrFA2)"/>
         <text class="dg-rt" x="538" y="62">PutItem "a-1"</text>
         <text class="dg-rt" x="538" y="84">straight to tablet 2's leader — no coordinator</text>
-        <rect class="dg-bx" x="388" y="96" width="562" height="222" rx="4"/>
+        <rect class="dg-bx" x="388" y="96" width="562" height="232" rx="4"/>
         <text class="dg-t" x="404" y="122">Data plane — one Raft group per tablet</text>
         <rect class="dg-acc" x="404" y="138" width="240" height="130" rx="3"/>
         <text class="dg-t" x="524" y="163" text-anchor="middle">tablet 2 · tokens 5555–aaa9</text>
@@ -142,16 +146,17 @@
         <text class="dg-t" x="876" y="163" text-anchor="middle">tablet 3</text>
         <circle class="dg-leader-plain" cx="846" cy="196" r="5"/><circle class="dg-follower" cx="876" cy="196" r="4.5"/><circle class="dg-follower" cx="906" cy="196" r="4.5"/>
         <text class="dg-m" x="876" y="228" text-anchor="middle">own leader</text>
-        <text class="dg-m" x="669" y="300" text-anchor="middle" style="font-size:10.5px">each group: its own leader, its own log, its own quorum</text>
-        <text class="dg-m" x="669" y="320" text-anchor="middle" style="font-size:10.5px">no log connects the tablets to each other</text>
+        <text class="dg-m" x="669" y="300" text-anchor="middle">each group: its own leader, its own log, its own quorum</text>
+        <text class="dg-m" x="669" y="320" text-anchor="middle">no log connects the tablets to each other</text>
         <text class="dg-m" x="669" y="342" text-anchor="middle">● leader · ○ followers</text>
         <rect class="dg-bx" x="60" y="138" width="240" height="130" rx="3"/>
         <text class="dg-t" x="76" y="163">Control plane</text>
         <text class="dg-m" x="76" y="180">a separate small Raft group</text>
-        <text x="76" y="206" style="fill:var(--ink-72);font:400 11.5px var(--font-ui)">Membership · tablet map</text>
-        <text x="76" y="225" style="fill:var(--ink-72);font:400 11.5px var(--font-ui)">Table definitions</text>
+        <text class="dg-ui" x="76" y="206">Membership · tablet map</text>
+        <text class="dg-ui" x="76" y="225">Table definitions</text>
         <path class="dg-ln" d="M300 203 H384" stroke-dasharray="4 4" marker-end="url(#arrF2)"/>
-        <text class="dg-m" x="62" y="292">topology lookups — never on the read/write path</text>
+        <text class="dg-m" x="180" y="290" text-anchor="middle">topology lookups —</text>
+        <text class="dg-m" x="180" y="308" text-anchor="middle">never on the read/write path</text>
       </svg>
     </div>
   </div>
@@ -161,7 +166,7 @@
   <div class="wrap">
     <span class="kicker">Why the split matters</span>
     <h2>Three failure modes the split removes.</h2>
-    <div class="cardgrid c3" style="margin-top:16px">
+    <div class="cardgrid c3 mt-16">
       <div class="lcard"><span class="tag">Throughput</span><h3>No global log</h3><p>A design that orders every write through one consensus group is bounded by that group forever. Here, adding tablets adds independent groups, and the work spreads across leaders that live on different nodes.</p></div>
       <div class="lcard"><span class="tag">Blast radius</span><h3>No special node</h3><p>There is no coordinator to lose. Losing a node costs you leader elections on the tablets it happened to lead; the rest of the cluster does not notice, and no operator action is needed to repair the replicas.</p></div>
       <div class="lcard"><span class="tag">Latency</span><h3>Metadata off the hot path</h3><p>The control plane is consulted for topology, not for traffic. A hot control plane would put a second quorum round trip in front of every request; this one is asked when the map changes and otherwise left alone.</p></div>
@@ -216,7 +221,7 @@
         </tbody>
       </table>
     </div>
-    <p class="body-text" style="margin-top:14px">Generate a starting config with <code>animusd gen-config --nodes 3 --host 10.0.0.1</code>. Add a node later with <code>animusd join --seed 10.0.0.1:7104</code> — a new node needs exactly one thing, the intra-cluster address of any node that is already running.</p>
+    <p class="body-text mt-14">Generate a starting config with <code>animusd gen-config --nodes 3 --host 10.0.0.1</code>. Add a node later with <code>animusd join --seed 10.0.0.1:7104</code> — a new node needs exactly one thing, the intra-cluster address of any node that is already running.</p>
   </div>
 </section>
 
@@ -260,7 +265,7 @@
   <div class="wrap">
     <span class="kicker">Day-two operations</span>
     <h2>What exists, plainly, and what doesn't.</h2>
-    <div class="cardgrid c2" style="margin-top:16px">
+    <div class="cardgrid c2 mt-16">
       <div class="lcard"><h3>Available</h3><ul>
         <li><strong>Growing</strong> — a joining node needs the intra-cluster address of any running node; tablets rebalance onto it online.</li>
         <li><strong>Shrinking</strong> — <code>drain</code> relocates a node's replicas, <code>drain-status</code> reports progress, <code>decommission</code> removes it.</li>
@@ -287,7 +292,7 @@
   <div class="wrap">
     <span class="kicker">Known limits</span>
     <h2>The list we'd want to be shown.</h2>
-    <ul style="font-size:14.5px;max-width:720px">
+    <ul class="lead-list">
       <li>TLS is config-gated and off by default; no authentication beyond opt-in SigV4 on the client DynamoDB port either way.</li>
       <li>Rolling upgrades are either driven by hand (<code>animus cluster roll plan</code> gives the order, you restart one node at a time, <code>animus cluster roll wait</code> blocks until it is healthy, then run the irreversible <code>animus cluster finalize</code>) or, on Kubernetes, by the operator from a <code>spec.image</code> edit (clusters of at least three nodes whose PodDisruptionBudget allows losing one; smaller shapes are refused and need the whole-cluster stop, upgrade and restart). Skipping a release, rolling a node back to an older binary, reverting <code>spec.image</code> mid-roll, and an old binary joining after the upgrade started are not supported.</li>
       <li>Restore always creates a brand-new table, never in-place.</li>

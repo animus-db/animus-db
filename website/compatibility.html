@@ -3,15 +3,19 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Compatibility — AnimusDB</title>
+<title>DynamoDB API compatibility, operation by operation — AnimusDB</title>
 <meta name="description" content="Which DynamoDB operations AnimusDB supports, which it doesn't, and the four differences that will show up in your code.">
 <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
 <link rel="canonical" href="https://animusdb.io/compatibility.html">
-<meta property="og:title" content="Compatibility — AnimusDB">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://animusdb.io/compatibility.html">
+<meta property="og:title" content="DynamoDB API compatibility, operation by operation — AnimusDB">
 <meta property="og:description" content="Which DynamoDB operations AnimusDB supports, which it doesn't, and the four differences that will show up in your code.">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Work+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<meta property="og:image" content="https://animusdb.io/assets/og-card.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="AnimusDB — the DynamoDB API on infrastructure you own">
+<meta name="twitter:card" content="summary_large_image">
 <link rel="stylesheet" href="assets/tokens.css">
 <link rel="stylesheet" href="assets/site.css">
 <script src="assets/site.js" defer></script>
@@ -87,11 +91,11 @@
 
 <main id="main">
 
-<div class="wrap ref-head" style="--rh-pt:38px;--rh-pb:20px">
+<div class="wrap ref-head">
   <span class="kicker">Compatibility</span>
   <h1>What your SDK can call, and what it can't.</h1>
-  <p style="font-size:15.5px;color:var(--ink-78,var(--ink-72));max-width:740px;margin-bottom:20px">AnimusDB speaks the DynamoDB wire protocol, so the AWS SDKs and the <code>aws</code> CLI work against it unmodified. Compatibility is not the same as identity, and this page is where the differences are written down rather than discovered.</p>
-  <div class="plate" style="max-width:560px">
+  <p class="page-lede mb-20">AnimusDB speaks the DynamoDB wire protocol, so the AWS SDKs and the <code>aws</code> CLI work against it unmodified. Compatibility is not the same as identity, and this page is where the differences are written down rather than discovered.</p>
+  <div class="plate mw-560">
     <div class="head"><span class="t">the entire integration</span><span class="ext">diff</span></div>
     <div class="body">
       <div class="cl dm">- endpoint: dynamodb.eu-west-1.amazonaws.com</div>
@@ -113,9 +117,9 @@
   <div class="wrap">
     <span class="kicker">API status</span>
     <h2>Operation by operation.</h2>
-    <div class="table-scroll" style="margin-top:14px">
+    <div class="table-scroll mt-14">
       <table>
-        <thead><tr><th>Operation</th><th style="width:120px">Status</th><th>Notes</th></tr></thead>
+        <thead><tr><th>Operation</th><th class="w-120">Status</th><th>Notes</th></tr></thead>
         <tbody>
           <tr><td><code>CreateTable</code></td><td><span class="pill yes">Supported</span></td><td class="d">Partition and sort keys, GSIs and LSIs at creation, plus <code>BillingMode</code> (<code>PROVISIONED</code> or <code>PAY_PER_REQUEST</code>, the default) and, when <code>PROVISIONED</code>, <code>ProvisionedThroughput</code>. <code>AttributeDefinitions</code> must declare a type for every key attribute the table or an index uses, and nothing else — a missing or an unused definition is a <code>ValidationException</code>, matching DynamoDB</td></tr>
           <tr><td><code>DescribeTable</code></td><td><span class="pill yes">Supported</span></td><td class="d">Includes index status and stream configuration</td></tr>
@@ -152,10 +156,10 @@
   <div class="wrap">
     <span class="kicker">Service limits</span>
     <h2>AWS-faithful, compiled in, no escape hatch.</h2>
-    <p class="body-text">DynamoDB's service limits are part of the API, not an operational afterthought — code that depends on <code>ValidationException</code> at 400 KB, or on <code>BatchGetItem</code> handing back <code>UnprocessedKeys</code> past 16 MB, needs that behavior to actually happen against a local cluster, not just against AWS. So every limit below is AWS's own published number, checked in the wire adapter itself. There is no config flag, environment variable or "unleashed" mode that raises or removes any of them — the ones marked <span class="pill yes" style="display:inline-block">Enforced</span> below are load-bearing, not aspirational.</p>
-    <div class="table-scroll" style="margin-top:14px">
+    <p class="body-text">DynamoDB's service limits are part of the API, not an operational afterthought — code that depends on <code>ValidationException</code> at 400 KB, or on <code>BatchGetItem</code> handing back <code>UnprocessedKeys</code> past 16 MB, needs that behavior to actually happen against a local cluster, not just against AWS. So every limit below is AWS's own published number, checked in the wire adapter itself. There is no config flag, environment variable or "unleashed" mode that raises or removes any of them — the ones marked <span class="pill yes">Enforced</span> below are load-bearing, not aspirational.</p>
+    <div class="table-scroll mt-14">
       <table>
-        <thead><tr><th>Limit</th><th style="width:120px">Value</th><th style="width:120px">Status</th><th>Behavior</th></tr></thead>
+        <thead><tr><th>Limit</th><th class="w-120">Value</th><th class="w-120">Status</th><th>Behavior</th></tr></thead>
         <tbody>
           <tr><td>Item size</td><td class="mono">400 KB</td><td><span class="pill yes">Enforced</span></td><td class="d">Sum of every attribute's name plus its value, DynamoDB's own formula — checked on every write (<code>PutItem</code>, <code>UpdateItem</code>'s post-update result, <code>BatchWriteItem</code>'s <code>PutRequest</code>s, <code>TransactWriteItems</code>' <code>Put</code> actions). <code>ValidationException</code> over the cap</td></tr>
           <tr><td>Partition key value</td><td class="mono">2048 B</td><td><span class="pill yes">Enforced</span></td><td class="d">A table's own partition key, or a GSI's/LSI's</td></tr>
@@ -181,7 +185,7 @@
         </tbody>
       </table>
     </div>
-    <p class="body-text" style="margin-top:14px">Not yet enforced, and not expected to matter for most workloads: the Streams <code>ShardIterator</code>'s 15-minute expiry, the LSI item-collection size limit (10 GB per partition key, counting the base item and every LSI projection sharing it), the aggregate size rules DynamoDB places on <code>ExpressionAttributeNames</code>/<code>ExpressionAttributeValues</code>, and the account-level 80,000 RCU/WCU ceiling — <code>DescribeLimits</code> reports that last one honestly as a static number, but nothing sums capacity across tables to check against it, because there's no account concept here to sum across.</p>
+    <p class="body-text mt-14">Not yet enforced, and not expected to matter for most workloads: the Streams <code>ShardIterator</code>'s 15-minute expiry, the LSI item-collection size limit (10 GB per partition key, counting the base item and every LSI projection sharing it), the aggregate size rules DynamoDB places on <code>ExpressionAttributeNames</code>/<code>ExpressionAttributeValues</code>, and the account-level 80,000 RCU/WCU ceiling — <code>DescribeLimits</code> reports that last one honestly as a static number, but nothing sums capacity across tables to check against it, because there's no account concept here to sum across.</p>
   </div>
 </section>
 
@@ -189,7 +193,7 @@
   <div class="wrap">
     <span class="kicker">Differences that will show up in your code</span>
     <h2>Four things to check before you assume a drop-in.</h2>
-    <div class="cardgrid c4" style="margin-top:16px">
+    <div class="cardgrid c4 mt-16">
       <div class="lcard"><span class="tag">Ordering</span><h3>Scans are ordered by token</h3><p>A full <code>Scan</code> returns items in token order, not partition-key order. Sort-key ordering within a partition is preserved. If your code relies on the order a scan happens to produce, it was already relying on something DynamoDB does not promise — but it will now notice.</p></div>
       <div class="lcard"><span class="tag">Capacity</span><h3>Throttling exists; billing doesn't</h3><p>Declare a table's <code>ProvisionedThroughput</code> (or set a cluster-wide default) and it is enforced for real — <code>ProvisionedThroughputExceededException</code> and all. What's still missing is the meter: no invoice, no auto-scaling, no on-demand billing mode's own capacity-shaping behavior. Leave a table's throughput unset and it stays genuinely unthrottled, limited only by the hardware you gave it.</p></div>
       <div class="lcard"><span class="tag">Identity</span><h3>Credential checks are opt-in</h3><p>SigV4 verification exists on the client port and is off by default. Until you switch it on, any value works. Switched on, a key can be scoped to specific tables and read/write/DDL/streams/backup classes — but this is a flat allow list, not IAM: condition keys, temporary credentials, and per-item or attribute-level authorization all have to be enforced somewhere else.</p></div>

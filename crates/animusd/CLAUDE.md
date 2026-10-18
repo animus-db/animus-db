@@ -12599,6 +12599,8 @@ seal knobs). A new `StreamSealKnobs { .. }` literal needs `..Default::default()`
 - `SimOverload` (`sim_cluster.rs`) is the thread-local knob for Tier 2 (`sim_cluster_overload`).
 - `/admin/health` gained advisory `queued_bytes*` fields; they never affect `ok`.
 
+- `SimCluster::put` returns as soon as the write resolves (`spawn_and_capture_fast`); the full-`OP_BUDGET` `spawn_and_capture` retains ~5 MB of `Simulator` trace per call (issue #1305, `docs/lessons/testing/2026-10-18-a-sim-fixture-op-that-burns-a-fixed-virtual-time-budget-retains-trace-per-call.md`).
+
 ## LSM write stall wiring (ADR 0081)
 
 `LsmTabletFactory::install_node_seams` gives every engine it opens or clones the node's

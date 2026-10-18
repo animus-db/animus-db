@@ -7,11 +7,31 @@
 <meta name="description" content="The honest day-two bill for running a distributed database yourself: every line item, who pays it, when self-hosting wins, and when it loses.">
 <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
 <link rel="canonical" href="https://animusdb.io/articles/what-self-hosting-costs.html">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://animusdb.io/articles/what-self-hosting-costs.html">
 <meta property="og:title" content="What self-hosting actually costs — AnimusDB">
 <meta property="og:description" content="The honest day-two bill for running a distributed database yourself: every line item, who pays it, when self-hosting wins, and when it loses.">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Work+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<meta property="og:image" content="https://animusdb.io/assets/og-card.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="AnimusDB — the DynamoDB API on infrastructure you own">
+<meta name="twitter:card" content="summary_large_image">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "Article",
+  "headline": "What self-hosting actually costs",
+  "description": "The honest day-two bill for running a distributed database yourself: every line item, who pays it, when self-hosting wins, and when it loses.",
+  "url": "https://animusdb.io/articles/what-self-hosting-costs.html",
+  "mainEntityOfPage": "https://animusdb.io/articles/what-self-hosting-costs.html",
+  "image": "https://animusdb.io/assets/og-card.png",
+  "publisher": {
+   "@type": "Organization",
+   "name": "AnimusDB",
+   "url": "https://animusdb.io/"
+  }
+}
+</script>
 <link rel="stylesheet" href="../assets/tokens.css">
 <link rel="stylesheet" href="../assets/site.css">
 <script src="../assets/site.js" defer></script>
@@ -92,7 +112,7 @@
   <p>Some of these are obvious and priced in every plan. Others show up in month seven.</p>
   <div class="table-scroll">
     <table>
-      <thead><tr><th>Line item</th><th>What it actually involves</th><th style="width:140px">Usually forgotten?</th></tr></thead>
+      <thead><tr><th>Line item</th><th>What it actually involves</th><th class="w-140">Usually forgotten?</th></tr></thead>
       <tbody>
         <tr><td>Hardware or instances</td><td>Nodes, disks, and the replication factor multiplying both. Three replicas means three times the storage, always.</td><td>No</td></tr>
         <tr><td>Headroom</td><td>You cannot run a database at 90% of capacity. The gap between what you use and what you provision is a permanent cost.</td><td>Often</td></tr>
@@ -123,7 +143,7 @@
   <div class="callout">
     <h4>Managed</h4>
     <p>Invoice, plus the engineering time you still spend on capacity modelling and cost control, plus the coupling you accrue, plus the switching cost you are compounding.</p>
-    <h4 style="margin-top:14px">Self-hosted</h4>
+    <h4 class="mt-14">Self-hosted</h4>
     <p>Infrastructure, plus headroom, plus cross-zone traffic, plus backup storage, plus the fraction of a team that operates it, plus the recruitment cost of that skill set, plus the incidents you will handle yourself.</p>
   </div>
   <p>Done properly, the sum is much closer than either camp likes to admit, and it flips on the details of your situation rather than on principle.</p>
@@ -151,7 +171,7 @@
   <div class="callout">
     <h4>What it costs to evaluate it now</h4>
     <p>An afternoon. Three nodes in one process, your integration suite pointed at a different endpoint, and an answer to the question of whether your access patterns really are portable. That is a genuinely useful thing to know regardless of what you do next.</p>
-    <h4 style="margin-top:14px">What it will cost to run it later</h4>
+    <h4 class="mt-14">What it will cost to run it later</h4>
     <p>Every line in the table above. When the gaps close, the operational bill for AnimusDB will be an ordinary distributed-database bill, and nothing on this site should suggest that self-hosting has been made cheap. It has been made <em>possible without a rewrite</em>. Those are different claims.</p>
   </div>
 
@@ -168,8 +188,8 @@
   </ol>
   <p>Add up the right-hand column. If it comes out clearly in favour of staying managed, stay managed — and take the exercise as having produced the number from <a href="why-lock-in-compounds.html">the lock-in argument</a> that nobody in your company had.</p>
 
-  <span class="kicker" style="display:block;margin:34px 0 12px;border-top:1px solid var(--border);padding-top:24px">Keep reading</span>
-  <div class="cardgrid c2" style="margin-bottom:40px">
+  <span class="kicker kicker-rule">Keep reading</span>
+  <div class="cardgrid c2 mb-40">
     <div class="lcard"><span class="tag">The other half</span><h3><a href="why-lock-in-compounds.html">Why lock-in compounds</a></h3><p>The argument this cost is weighed against, including an explicit concession that this is not a case against AWS.</p></div>
     <div class="lcard"><span class="tag">Reference</span><h3><a href="../architecture.html#day2">Day-two operations</a></h3><p>Exactly which operational tools exist today and which don't, without the marketing gloss.</p></div>
   </div>

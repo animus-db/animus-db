@@ -4619,7 +4619,13 @@ impl SimCluster {
             sk.to_owned(),
             value.to_vec(),
         );
-        self.spawn_and_capture(node, async move {
+        // Early-returning (`spawn_and_capture_fast`), NOT the full-`OP_BUDGET`
+        // `spawn_and_capture`: burning 12s of virtual time per put on an
+        // N-node cluster retains ~5 MB of `Simulator` trace per call (idle
+        // control-plane heartbeat traffic, issue #1305), which caps how many
+        // items any cell can preload. A put resolves in a fraction of a
+        // second; a timed-out one still waits out the whole budget.
+        self.spawn_and_capture_fast(node, async move {
             handle.put(node, &table, &pk, &sk, &value).await
         })
         .unwrap_or_else(|| {
@@ -8299,6 +8305,41 @@ mod tests {
     /// (`ConsistentRead: true`-equivalent) read from a non-leader**, which
     /// must forward to the actual leader over the real `SimRelayClient`
     /// wire and observe the write.
+    /// Issue #1305: `SimCluster::put` used to burn the whole `OP_BUDGET`
+    /// (12s of virtual time) per call, retaining ~5 MB of `Simulator` trace
+    /// per put at 6 nodes. A successful put must now return as soon as it
+    /// resolves: the retained trace and the virtual time both stay a small
+    /// per-put constant (deterministic counts, not RSS).
+    #[test]
+    fn put_retains_bounded_trace_per_call() {
+        const PUTS: usize = 40;
+        let mut cluster = SimCluster::new(0x1305_0001, 3, 3);
+        cluster.create_table("t");
+        let tablet = cluster.tablet_of("t").expect("just created");
+        let leader = cluster.leader_index_of(tablet).expect("leader elected");
+        let sim = cluster.simulator();
+        // Warm one put so the first-write route setup is not counted.
+        cluster
+            .put(leader, "t", "pk", "warm", b"v")
+            .expect("warm put");
+        let (trace0, t0) = (sim.trace().len(), cluster.sim_now().0);
+        for i in 0..PUTS {
+            cluster
+                .put(leader, "t", "pk", &format!("sk{i}"), b"value")
+                .unwrap_or_else(|e| panic!("put {i}: {e}"));
+        }
+        let (events, virt) = (sim.trace().len() - trace0, cluster.sim_now().0 - t0);
+        // Pre-fix each put advanced OP_BUDGET (12s) of virtual time.
+        let budget_ns = OP_BUDGET.as_nanos() as u64;
+        assert!(
+            virt < PUTS as u64 * budget_ns / 10,
+            "{PUTS} puts advanced {virt}ns of virtual time; a put must not burn OP_BUDGET"
+        );
+        let per_put = events / PUTS;
+        eprintln!("put trace events per put: {per_put}");
+        assert!(per_put < 2_000, "{per_put} retained trace events per put");
+    }
+
     #[test]
     fn write_on_leader_reads_back_consistent_from_every_node() {
         run_write_on_leader_reads_back_consistent_from_every_node(0x51C1_0001);
