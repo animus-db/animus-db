@@ -478,7 +478,9 @@ async fn sustained_metadata_churn_over_a_real_engine_stays_live() {
                         accepted = true;
                         break;
                     }
-                    ProposeResult::NotLeader { .. } => sleep(Duration::from_millis(50)).await,
+                    ProposeResult::NotLeader { .. } | ProposeResult::Busy { .. } => {
+                        sleep(Duration::from_millis(50)).await;
+                    }
                 }
             }
             assert!(

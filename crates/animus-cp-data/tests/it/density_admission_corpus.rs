@@ -333,6 +333,7 @@ impl Rig {
             monitor: Some(self.monitors[i].clone()),
             awake: self.awake[i].clone(),
             budget: None,
+            admission: None,
         });
         r.set_host_stagger(HOST_H, DEFAULT_HOST_SETTLE_TIMEOUT);
         r

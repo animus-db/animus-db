@@ -619,7 +619,13 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
         // the work (`dispatch`), not the response write. (Pipelining is
         // bounded per connection by construction: this loop reads, runs and
         // answers one request before reading the next.)
-        let Some(inflight) = ctx.overload.inflight.try_acquire() else {
+        // ADR 0080 2a: the gate's effective size follows the node's scheduling
+        // lag (half at 30 ms, a quarter at 100 ms, floor 256).
+        let gate_cap = ctx
+            .overload
+            .admission
+            .node_gate(ctx.overload.limits.max_inflight_requests);
+        let Some(inflight) = ctx.overload.inflight.try_acquire_capped(gate_cap) else {
             ctx.overload.metrics.incr(Metric::OverloadShedAdmission);
             let err = WireError::service_unavailable(
                 "the node is at its in-flight request limit (max_inflight_requests); retry",
@@ -755,7 +761,12 @@ pub(crate) async fn execute_as(
     match wire::decode_request(target, body) {
         Ok(op) => match run_operation(ctx, principal, op).await {
             Ok(body) => (200, body),
-            Err(err) => (error_status(&err), err.to_json()),
+            Err(err) => {
+                // ADR 0080 safety net: whatever path produced it, an overload
+                // refusal never leaves as a 500.
+                let err = map_overload(err);
+                (error_status(&err), err.to_json())
+            }
         },
         Err(err) => (error_status(&err), err.to_json()),
     }
@@ -1504,7 +1515,7 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
                             }
                         }
                         Ok(None) => {}
-                        Err(e) if e.code == "ProvisionedThroughputExceededException" => {
+                        Err(e) if is_unprocessed_throttle(&e) => {
                             unprocessed.push((req.table.clone(), key.clone()));
                         }
                         Err(e) => return Err(e),
@@ -1859,7 +1870,7 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
                     for (key, result) in keys.into_iter().zip(results) {
                         match result {
                             Ok(_) => {}
-                            Err(e) if e.code == "ProvisionedThroughputExceededException" => {
+                            Err(e) if is_unprocessed_throttle(&e) => {
                                 if let Some(req) = by_key.get(&key) {
                                     unprocessed.push((table.clone(), req.clone()));
                                 }
@@ -2177,7 +2188,11 @@ pub(crate) async fn execute_item_op_as<E: Env, R: RelayClient>(
             };
             match result {
                 Ok(body) => (200, body),
-                Err(err) => (error_status(&err), err.to_json()),
+                Err(err) => {
+                    // ADR 0080 safety net (see `execute_as`).
+                    let err = map_overload(err);
+                    (error_status(&err), err.to_json())
+                }
             }
         }
         Err(err) => (error_status(&err), err.to_json()),
@@ -5911,9 +5926,16 @@ async fn run_transact<E: Env, R: RelayClient>(
                     let reasons = cancellation_reasons_for(actions, index, reason);
                     Err(WireError::transaction_canceled_with_reasons(reasons))
                 }
-                None => Err(WireError::transaction_canceled(format!(
-                    "transaction cancelled: {e}"
-                ))),
+                // ADR 0080 2b: a leaderless tablet is the server's condition,
+                // a retryable 503 (never a cancellation of the transaction).
+                None => match &e {
+                    crate::TxnAbortReason::Other(m) if decide::is_no_leader_refusal(m) => {
+                        Err(WireError::service_unavailable(m.clone()))
+                    }
+                    _ => Err(WireError::transaction_canceled(format!(
+                        "transaction cancelled: {e}"
+                    ))),
+                },
             }
         }
     }
@@ -10440,7 +10462,7 @@ pub(crate) async fn marker_batch_write_raw<E: Env, R: RelayClient>(
         let keys: Vec<Vec<u8>> = writes.iter().map(|(_, k, _)| k.clone()).collect();
         match ctx.cp_kind_write_raw(table, writes, markers).await {
             Ok(()) => {}
-            Err(e) if e == THROTTLE_WRITE_REFUSAL => {
+            Err(e) if e == THROTTLE_WRITE_REFUSAL || decide::is_busy_refusal(&e) => {
                 unprocessed.extend(keys);
             }
             Err(e) => return Err(e),
@@ -10987,11 +11009,53 @@ pub(crate) const THROTTLE_READ_REFUSAL: &str = "provisioned throughput exceeded 
 pub(crate) fn map_throttleable_error(message: String) -> WireError {
     if message == THROTTLE_WRITE_REFUSAL {
         WireError::provisioned_throughput_exceeded(message)
+    } else if decide::is_overload_refusal(&message) {
+        map_overload(internal(&message))
     } else if decide::read_should_retry(&message) {
         WireError::service_unavailable(message)
     } else {
         internal(&message)
     }
+}
+
+/// ADR 0080: the edge mapping for an overload refusal, a **pure step at the
+/// terminal return** (lesson 2026-09-20: the internal `"; retry"` loop
+/// decisions do not change). A `WireError` whose message carries one of the
+/// house refusals is rendered with the DynamoDB-faithful code:
+///
+/// | condition | code |
+/// |---|---|
+/// | propose `Busy`, per-group in-flight cap, budget | 400 `ThrottlingException` |
+/// | forwarded-request gate, `NoLeader:` fast-fail | 503 `ServiceUnavailable` |
+///
+/// Any other error, and any error that already has a specific code (not the
+/// generic `InternalServerError` / `ServiceUnavailable` the refusal strings
+/// arrive as through `decode_relayed_error` or `internal(..)`), is returned
+/// unchanged. Idempotent.
+pub(crate) fn map_overload(err: WireError) -> WireError {
+    if err.code != "InternalServerError" && err.code != "ServiceUnavailable" {
+        return err;
+    }
+    if decide::is_no_leader_refusal(&err.message) || is_forwarded_gate_refusal(&err.message) {
+        return WireError::service_unavailable(err.message);
+    }
+    if decide::is_busy_refusal(&err.message) {
+        return WireError::throttling(err.message);
+    }
+    err
+}
+
+/// Whether a per-item batch error is a throttle the client should resubmit
+/// (ADR 0065 provisioned throughput, or ADR 0080's `Busy`): the item goes to
+/// `UnprocessedItems` / `UnprocessedKeys` rather than failing the whole call.
+fn is_unprocessed_throttle(e: &WireError) -> bool {
+    e.code == "ProvisionedThroughputExceededException" || e.code == "ThrottlingException"
+}
+
+/// Whether `message` is the forwarded-request gate's refusal (a node
+/// condition, 503, not the caller-rate `Busy`).
+fn is_forwarded_gate_refusal(message: &str) -> bool {
+    message.contains(decide::FORWARDED_GATE_REFUSAL)
 }
 
 /// Marker carrying a [`WireError`]'s own `code` across the forwarded

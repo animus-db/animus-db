@@ -34,13 +34,58 @@ pub(crate) async fn read_http_request<S: AsyncRead + Unpin>(
     stream: &mut S,
     buf: &mut Vec<u8>,
 ) -> std::io::Result<Option<HttpRequest>> {
+    read_http_request_with(stream, buf, KEEPALIVE_IDLE_TIMEOUT, HEADER_READ_TIMEOUT).await
+}
+
+/// ADR 0080 section 5 (4.6): once the first byte of a request has arrived, the
+/// whole header block must follow within this long, or the connection is
+/// closed (a slow-header client otherwise holds a connection permit forever).
+pub(crate) const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// ADR 0080 section 5 (4.6): an idle keep-alive connection (no byte of a new
+/// request) is closed after this long. The AWS SDK pools keep idle
+/// connections for less than this, and an SDK retries a request that finds its
+/// pooled connection closed.
+pub(crate) const KEEPALIVE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// [`read_http_request`] with explicit timeouts (the test seam). An idle
+/// timeout before any byte of a new request is a clean close (`Ok(None)`); a
+/// header block that does not complete within `header` is a `TimedOut` error.
+pub(crate) async fn read_http_request_with<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    buf: &mut Vec<u8>,
+    idle: std::time::Duration,
+    header: std::time::Duration,
+) -> std::io::Result<Option<HttpRequest>> {
+    let mut header_deadline: Option<tokio::time::Instant> = if buf.is_empty() {
+        None
+    } else {
+        Some(tokio::time::Instant::now() + header)
+    };
     // Read until we have the full header block (terminated by CRLFCRLF).
     let header_end = loop {
         if let Some(pos) = animus_node::http::find_subslice(buf, b"\r\n\r\n") {
             break pos + 4;
         }
         let mut chunk = [0u8; 4096];
-        let n = stream.read(&mut chunk).await?;
+        let n = match header_deadline {
+            None => match tokio::time::timeout(idle, stream.read(&mut chunk)).await {
+                Ok(r) => r?,
+                Err(_) => return Ok(None),
+            },
+            Some(d) => match tokio::time::timeout_at(d, stream.read(&mut chunk)).await {
+                Ok(r) => r?,
+                Err(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "request headers not received in time",
+                    ));
+                }
+            },
+        };
+        if header_deadline.is_none() && n > 0 {
+            header_deadline = Some(tokio::time::Instant::now() + header);
+        }
         if n == 0 {
             return if buf.is_empty() {
                 Ok(None)
@@ -148,4 +193,50 @@ pub(crate) async fn write_text_response<S: AsyncWrite + Unpin>(
         keep_alive,
     )
     .await
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use std::time::Duration;
+
+    use tokio::io::AsyncWriteExt;
+
+    use super::*;
+
+    /// ADR 0080 section 5 (4.6): an idle keep-alive connection is closed
+    /// cleanly, a stalled header block errors, a prompt request still parses.
+    #[tokio::test]
+    async fn idle_closes_cleanly_slow_headers_time_out_and_a_prompt_request_parses() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let mut buf = Vec::new();
+        let idle = Duration::from_millis(50);
+        let header = Duration::from_millis(100);
+
+        // Nothing sent: the idle timeout is a clean close.
+        let r = read_http_request_with(&mut server, &mut buf, idle, header).await;
+        assert!(matches!(r, Ok(None)));
+
+        // A prompt request parses.
+        client
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: a\r\n\r\n")
+            .await
+            .unwrap();
+        let r = read_http_request_with(&mut server, &mut buf, idle, header)
+            .await
+            .expect("ok")
+            .expect("a request");
+        assert_eq!(r.path, "/metrics");
+
+        // Headers that start and then stall hit the header timeout, not the idle
+        // one (the idle one is shorter here on purpose).
+        client.write_all(b"GET /metrics HTT").await.unwrap();
+        let r = read_http_request_with(
+            &mut server,
+            &mut buf,
+            Duration::from_millis(10),
+            Duration::from_millis(150),
+        )
+        .await;
+        assert!(matches!(r, Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut));
+    }
 }

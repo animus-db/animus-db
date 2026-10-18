@@ -427,3 +427,5 @@ not probed), so a handoff to a voter that is in fact full and merely has not
 noticed can still happen and leaves the new leader unable to commit until space
 returns. Closing it needs an active free-space probe on followers; the
 hysteresis above removes the flapping-node form of it that the chaos run hit.
+
+**2026-10-17 note:** ADR 0080 closes the gaps this ADR left for the client path and the transport: a propose bound, group-state-aware admission, per-peer outboxes with message classes, a node `QueuedBytes` budget, the HTTP idle/header timeouts, an admin in-flight gate and a 16 MiB client frame cap. See `docs/resource-bounds.md`.

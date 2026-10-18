@@ -230,7 +230,24 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             if let Some(tablet) = tablet
                 && let Some(route) = self.resolve_cp_route(tablet)
             {
+                self.overload.leaderless.resolved(tablet);
                 return route;
+            }
+            // ADR 0080 2b: a tablet that has been leaderless for
+            // `leaderless_wait` is refused at once (no polling, no slot held);
+            // before that the request parks only until that same instant, not
+            // the caller's whole budget.
+            let mut deadline = deadline;
+            if let Some(tablet) = tablet {
+                match self.overload.leaderless.unresolved(tablet, self.env.now()) {
+                    crate::overload::LeaderlessVerdict::Refuse { .. } => {
+                        self.overload.metrics.incr(Metric::OverloadShedNoLeader);
+                        return CpRoute::None;
+                    }
+                    crate::overload::LeaderlessVerdict::Wait { until } => {
+                        deadline = deadline.min(until);
+                    }
+                }
             }
             if let Some(tablet) = tablet
                 && self.env.now() >= next_fanout_at
@@ -465,6 +482,39 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     fn not_leader_refusal(&self, tablet: Option<TabletId>) -> ClientResponse {
         let hint = tablet.and_then(|t| self.cp_leader_hint(t));
         ClientResponse::Error(topology::format_not_leader_refusal(hint))
+    }
+
+    /// ADR 0080 2b: the `NoLeader:` refusal for `(table, key)`'s tablet, naming
+    /// how long it has been leaderless. Mapped to 503 `ServiceUnavailable` at
+    /// the terminal return; `"; retry"`-suffixed like every transient refusal.
+    pub(crate) fn no_leader_message(&self, table: &str, key: &[u8]) -> String {
+        let tablet = self.tablet_for(table, key);
+        let waited = tablet.map_or(0, |t| {
+            self.overload.leaderless.waited(t, self.env.now()).as_secs()
+        });
+        decide::no_leader_refusal(tablet.map_or(0, |t| t.0), waited)
+    }
+
+    /// ADR 0080 2c: take a per-tablet in-flight slot for a request on
+    /// `(table, key)`'s tablet from this node's edge, held by the returned
+    /// guard until the request finishes. `Err` is the `Busy:` refusal.
+    pub(crate) fn group_permit(
+        &self,
+        table: &str,
+        key: &[u8],
+    ) -> Result<Option<crate::overload::GroupPermit>, String> {
+        let Some(tablet) = self.tablet_for(table, key) else {
+            return Ok(None);
+        };
+        self.overload
+            .group_inflight
+            .try_acquire(tablet)
+            .map_err(|()| {
+                self.overload
+                    .metrics
+                    .incr(Metric::OverloadShedGroupInflight);
+                decide::group_inflight_refusal(tablet.0)
+            })
     }
 
     /// Another known client-API address for `tablet`, distinct from every
@@ -1774,7 +1824,17 @@ pub(crate) async fn handle_relayed_request<E: Env, R: RelayClient>(
             watermark: ctx.control.metadata_watch().latest(),
             control_voters: ctx.control.config().unwrap_or_default(),
         },
-        ClientRequest::Forwarded { request, .. } => ctx.cp_serve_forwarded(*request).await,
+        ClientRequest::Forwarded { request, .. } => {
+            // ADR 0080 2d: forwarded work has its own gate, separate from the
+            // client gate, so a client flood cannot starve a leader of the
+            // forwards that complete its writes (and the reverse). A refusal
+            // is a string, executed nothing, retryable by the forwarder.
+            let Some(_permit) = ctx.overload.forwarded.try_acquire() else {
+                ctx.overload.metrics.incr(Metric::OverloadShedForwarded);
+                return ClientResponse::Error(decide::FORWARDED_GATE_REFUSAL.to_string());
+            };
+            ctx.cp_serve_forwarded(*request).await
+        }
         ClientRequest::ProposeSchema(command) => {
             if !crate::is_relayable_command(&command) {
                 ClientResponse::Error("command not allowed over the relay path".into())

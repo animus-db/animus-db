@@ -497,3 +497,21 @@ one listing each, against 100 and 1000 for the old shape (a negative control tha
 scans about 100x the entries at 10x N). `destroy` still lists once per reclaimed
 tablet (O(N) each, so a drop of N tablets is O(N^2) in directory entries, not on
 the hosting path); the `max_replicas` 1000 hosting-time cap can be revisited (dev profile only here; confirm in release first).
+
+# 2026-10-17: ADR 0080 overload admission calibration
+
+Provisional defaults held; nothing was retuned. What was measured:
+
+- **Tier 1 corpus** (`overload_admission_corpus`, 8 seeds, `ApplyEngine` = `MemoryEngine`
+  plus 1 ms of virtual apply cost per op): with the bound on, goodput is at least 80 % of the
+  capacity measured with the bound off (0.4 of it for the fault cells), the backlog never
+  passes the bound, and no acked write is lost. Controls (a)-(c), (g), (h) each fail their oracle.
+- **Tier 2** (`sim_cluster_overload`): a leaderless tablet is refused at 2.25 s (the 2 s
+  `leaderless_wait` plus one tick) and a storm of requests to healthy groups in the same run
+  completes in 50 ms; without the fast-fail (control d) the same request parks 10.25 s. A burst
+  against a tiny bound sees 6 ok / 90 `ThrottlingException`; with the bound off 96 ok, 0 refused.
+- **Tier 3** (`animusd/tests/overload.rs`, real TCP, one node, `queued_bytes_budget` = 2 MiB,
+  16 clients x 200 KB items for 8 s): 91 admitted, 2963 refused (only 200 / 503 / `ThrottlingException`),
+  `queued_bytes_hwm` 410 KB, the node serves again at once.
+- **Not run:** the 150 s density-rig RSS measurement with the budget on. The ADR 0079 floor
+  (0.4-0.55 GB) plus the 256 MiB budget is the sizing rule until it is.

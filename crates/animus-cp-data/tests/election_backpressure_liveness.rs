@@ -229,6 +229,7 @@ impl<S: StorageEngine + 'static> Cluster<S> {
                     monitor: Some(monitor),
                     awake,
                     budget: None,
+                    admission: None,
                 });
                 recon.set_host_stagger(DEFAULT_HOST_UNSETTLED_MAX, DEFAULT_HOST_SETTLE_TIMEOUT);
                 Node {

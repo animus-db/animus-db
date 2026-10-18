@@ -552,6 +552,10 @@ pub struct ElectionBackpressure {
     /// snapshot streams, learner catch-up, splits and compactions; `None` =
     /// every pool off. Its effective sizes follow the same `LoadMonitor` lag.
     pub budget: Option<crate::background_budget::BackgroundBudget>,
+    /// Propose admission (ADR 0080 decision 1): the per-group backlog bound and
+    /// the node `QueuedBytes` budget; `None` = no bound (the pre-ADR
+    /// behaviour). Its effective limits follow the same `LoadMonitor` lag.
+    pub admission: Option<crate::admission::NodeAdmission>,
 }
 
 #[cfg(test)]

@@ -1261,3 +1261,13 @@ match. Every WAL writer branches on it (persist rounds, compaction rewrites,
 of the enum (the ordering is a stable export contract), bumped by the wire
 edge when it refuses a write for a StorageFull group. Design:
 `docs/resource-bounds.md` section 3.
+
+## Outbox, `QueuedBytes` and the bounded accept channel (ADR 0080)
+
+- `queued_bytes.rs` (`QueuedBytes`, RAII `Reservation`, budget 0 = unlimited) and `outbox.rs`
+  (`PeerOutbox`, `MsgClass`) are pure; `ProdEnv` wires them: one control writer per peer
+  (Vote > Heartbeat > Replicate/Normal) and a separate `Bulk` connection with producer-blocking
+  credit (waits at most `SEND_TIMEOUT`, then drops). `Network::send_stream_classed` defaults to
+  `send_stream`, so `SimEnv` is unchanged and has no outbox to test: model it on `PeerOutbox`.
+- `ProdEnv::set_queued_bytes` must be called before traffic. The accept channel is bounded (16384).
+- Real-socket tests: `tests/outbox_prod.rs` (`--features prod`).

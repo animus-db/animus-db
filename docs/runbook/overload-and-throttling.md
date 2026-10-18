@@ -86,6 +86,28 @@ entry in the cluster config (`max_connections`, `max_inflight_requests`,
 Note the ADR 0065 consequence: eventually-consistent reads are admitted per
 replica, so aggregate read admission can reach RF times the per-tablet share.
 
+## Refusals from ADR 0080 (propose bound, admission, transport)
+
+A node now refuses work it cannot absorb instead of queueing it. Read the
+`overload_shed_*` counters on `/metrics` to see which bound fired:
+
+| Counter | Client sees | Means | Do |
+|---|---|---|---|
+| `overload_shed_busy` | 400 `ThrottlingException` (item in `UnprocessedItems` for a batch) | a tablet leader's appended-but-unapplied backlog hit its bound: the disk or apply path is the bottleneck | clients back off (the SDK does); check disk latency and `/admin/health` `queued_bytes_hwm`; do not raise the bound first |
+| `overload_shed_group_inflight` | 400 `ThrottlingException` | 256 requests are parked on one tablet from this node | a hot or stuck tablet; check `tablet-unavailable.md`; consider a split |
+| `overload_shed_no_leader` | 503 `ServiceUnavailable` | a tablet has had no leader for `leaderless_wait_ms` (2 s) | [tablet-leaderless.md](tablet-leaderless.md) |
+| `overload_shed_admission` | 503 | the node gate (shrinks with scheduling lag) is full | CPU starvation: `election_lag_ms` on `/admin/health`; add nodes or cores |
+| `overload_shed_cold_wake` | 400 `ThrottlingException` | a write would wake a quiesced group while lag is severe and awake is at the cap | wait; reduce write fan-out across idle tablets |
+| `overload_shed_forwarded`, `overload_shed_budget` | forwarded refusal / 400 | forwarded gate or the node `QueuedBytes` budget is full | check `queued_bytes` against `queued_bytes_budget` |
+| `overload_shed_admin_inflight` | 503 from `/admin/*` | 32 admin calls are running; probes are exempt | stop the scraper hammering expensive admin routes |
+
+Transport: `transport_outbox_dropped_{vote,heartbeat,replicate}` and
+`transport_outbox_bytes` show a stalled peer being bounded; votes and
+heartbeats keep priority over bulk snapshot traffic. The node budget is
+`overload.queued_bytes_budget` (`--queued-bytes-budget`; the operator sets 25 %
+of `spec.resources.limits.memory`). Size a pod for the measured floor plus that
+budget plus engine working memory (`docs/density-measurements.md`).
+
 ## Verified
 
 Setting a table to 1 RCU / 1 WCU on a local dev cluster and writing 400 items in

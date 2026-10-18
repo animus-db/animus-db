@@ -95,6 +95,15 @@ pub mod s3_store;
 #[cfg(feature = "s3")]
 pub use s3_store::{MultipartConfig, RetryPolicy, S3SegmentStore};
 
+/// The pure per-peer send queue and the sender-supplied message class (ADR 0080
+/// section 3). Unconditional: `SimEnv` rigs and `ProdEnv` share it.
+pub mod outbox;
+pub use outbox::{MsgClass, OutFrame, OutboxLimits, PeerOutbox, PushReport};
+
+/// The node-wide queued-bytes budget (ADR 0080 section 4).
+pub mod queued_bytes;
+pub use queued_bytes::{QueuedBytes, Reservation};
+
 pub mod metrics;
 pub use metrics::{Metric, MetricSink, MetricSnapshot, MetricsHandle};
 
@@ -642,6 +651,24 @@ pub trait Rng: Send + Sync {
 pub trait Network: Send + Sync {
     /// Hand a payload to the network for delivery to `to` on `stream`.
     async fn send_stream(&self, to: NodeId, stream: u64, payload: Vec<u8>);
+
+    /// [`send_stream`](Network::send_stream) with a sender-supplied delivery
+    /// [`MsgClass`] and an optional supersede key (ADR 0080 section 3). The
+    /// class is **in memory only**: it never appears on the wire (a receiver
+    /// cannot tell, and an older receiver is unaffected). The default ignores
+    /// both and sends as before, so every implementation without a per-peer
+    /// outbox (`SimEnv`, test envs) behaves exactly as it did;
+    /// `ProdEnv` queues by class with strict priority, coalescing and bounds.
+    async fn send_stream_classed(
+        &self,
+        to: NodeId,
+        stream: u64,
+        _class: MsgClass,
+        _supersede: Option<u64>,
+        payload: Vec<u8>,
+    ) {
+        self.send_stream(to, stream, payload).await;
+    }
 
     /// Await the next message addressed to this node on `stream`. `(node,
     /// stream)` is single-consumer — never run two receive loops on the same

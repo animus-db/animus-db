@@ -742,6 +742,17 @@ pub(crate) async fn write_cursors<E: Env>(
         .collect();
     let index = match group.put_kind_batch(batch, Vec::new()) {
         animus_control::ProposeResult::Accepted { index, .. } => index,
+        // ADR 0080: an `Internal`-class cursor write refused at 2x the bound; the
+        // shipper's next pass re-offers it.
+        animus_control::ProposeResult::Busy {
+            backlog_entries,
+            backlog_bytes,
+        } => {
+            return Err(animus_node::decide::busy_refusal(
+                backlog_entries,
+                backlog_bytes,
+            ));
+        }
         other => return Err(format!("not accepted: {other:?}")),
     };
     let deadline = group.env().now().saturating_add(CURSOR_TIMEOUT);
