@@ -1099,7 +1099,7 @@ type GetResult = Result<Option<Vec<u8>>, String>;
 /// One node's `ClientCtx` handle, named for the same clippy `type_complexity`
 /// reason as [`ScanRows`] — [`SimClusterHandle`]'s own `ctxs` field is a
 /// `Vec` of these behind an `Arc<Mutex<..>>`.
-type SimNodeCtx = ClientCtx<SimEnv, SimRelayClient<SimEnv>>;
+pub(crate) type SimNodeCtx = ClientCtx<SimEnv, SimRelayClient<SimEnv>>;
 
 /// ADR 0073 Phase 2 (P2-C): spawn one node's version feeder
 /// (`version_wiring::version_wiring_loop`) — the same generic task production's
@@ -4512,6 +4512,52 @@ impl SimCluster {
     {
         let ctx = self.shared.ctx(node);
         self.spawn_and_capture(node, f(ctx))
+    }
+
+    /// Spawn `f(ctx)` as a background task on `node`'s env WITHOUT advancing
+    /// the simulator, returning the slot its output lands in (`None` until
+    /// it resolves). The non-blocking twin of [`SimCluster::run_with_ctx`]:
+    /// a race test (`sim_cluster_seal_races.rs`) needs several tasks in
+    /// flight at once, started at chosen virtual instants and advanced with
+    /// [`SimCluster::run_for`], which the blocking `spawn_and_capture`
+    /// family cannot express. Also how a test runs a stand-in for a
+    /// production loop this fixture never spawns (the periodic seal arm).
+    pub(crate) fn spawn_detached<T, Fut>(
+        &self,
+        node: u64,
+        f: impl FnOnce(SimNodeCtx) -> Fut,
+    ) -> Arc<Mutex<Option<T>>>
+    where
+        T: Send + 'static,
+        Fut: std::future::Future<Output = T> + Send + 'static,
+    {
+        let fut = f(self.shared.ctx(node));
+        let slot: Arc<Mutex<Option<T>>> = Arc::new(Mutex::new(None));
+        let out = slot.clone();
+        self.shared.env(node).spawn_task(async move {
+            let result = fut.await;
+            *out.lock().expect("result slot poisoned") = Some(result);
+        });
+        slot
+    }
+
+    /// [`SimCluster::spawn_detached`]'s DynamoDB-wire sibling: start one
+    /// wire request on `node` without advancing the simulator.
+    pub(crate) fn spawn_dynamo_detached(
+        &self,
+        node: u64,
+        target: &str,
+        body: &[u8],
+    ) -> Arc<Mutex<Option<(u16, String)>>> {
+        let handle = self.shared.clone();
+        let (target, body) = (target.to_owned(), body.to_vec());
+        let slot: Arc<Mutex<Option<(u16, String)>>> = Arc::new(Mutex::new(None));
+        let out = slot.clone();
+        self.shared.env(node).spawn_task(async move {
+            let result = handle.dynamo(node, &target, &body).await;
+            *out.lock().expect("result slot poisoned") = Some(result);
+        });
+        slot
     }
 
     /// [`SimCluster::spawn_and_capture`]'s early-returning sibling — same

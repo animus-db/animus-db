@@ -23404,6 +23404,8 @@ mod sim_cluster_roll_orchestrator;
 /// table. See that module's own doc.
 #[cfg(test)]
 mod sim_cluster_scale;
+#[cfg(test)]
+mod sim_cluster_seal_races;
 /// Issue #1229: a split child relocated wholesale by directed Placing keeps
 /// its pre-split rows (`SimCluster`).
 #[cfg(test)]
@@ -23795,6 +23797,11 @@ mod sim_cluster_delete_backup_restore;
 /// account, including what stayed on `ProdEnv`.
 #[cfg(test)]
 mod sim_cluster_growth;
+
+/// Seeded `SimCluster` regression tests for past bugs previously covered only
+/// by unit / `ProdEnv` tests (sim-coverage audit); see the module doc.
+#[cfg(test)]
+mod sim_cluster_regressions;
 
 /// ADR 0061 rung F (C-06 PR 3): deterministic `SimCluster` coverage for
 /// `TransactWriteItems`/`TransactGetItems`, reachable through the generic
