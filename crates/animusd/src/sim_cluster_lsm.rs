@@ -119,12 +119,7 @@ impl EngineFactory<LsmEngine<SimEnv>> for SimLsmTabletFactory {
         self.files.note_open(tablet);
         let opened = match &self.stall {
             Some(st) => {
-                LsmEngine::open_with(
-                    self.env.clone(),
-                    tablet_lsm_prefix(tablet.0),
-                    st.opts,
-                )
-                .await
+                LsmEngine::open_with(self.env.clone(), tablet_lsm_prefix(tablet.0), st.opts).await
             }
             None => LsmEngine::open(self.env.clone(), tablet_lsm_prefix(tablet.0)).await,
         };
