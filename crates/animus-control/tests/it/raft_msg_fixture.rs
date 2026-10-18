@@ -138,6 +138,7 @@ fn every_raft_msg() -> Vec<(&'static str, RaftMsg<MetaCommand>)> {
                 match_index: 7,
                 needs_snapshot: true,
                 check_pending: true,
+                applied_index: 0,
             },
         ),
         (

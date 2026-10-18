@@ -167,6 +167,7 @@ fn kv_follower_catches_up_via_install_snapshot() {
                     match_index: index,
                     needs_snapshot: false,
                     check_pending: false,
+                    applied_index: 0,
                 },
                 now,
                 7,

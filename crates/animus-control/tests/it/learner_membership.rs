@@ -376,6 +376,7 @@ fn success_ack(term: u64, match_index: u64) -> RaftMsg<MetaCommand> {
         match_index,
         needs_snapshot: false,
         check_pending: false,
+        applied_index: 0,
     }
 }
 

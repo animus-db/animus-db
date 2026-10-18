@@ -19,6 +19,7 @@ mod directed_placing_under_sustained_load;
 mod election_backpressure_corpus;
 mod engine_layout;
 mod engine_wipe_needs_snapshot;
+mod follower_apply_lag;
 mod follower_aware_compaction;
 mod format_fixtures;
 mod freeze;

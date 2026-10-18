@@ -2248,6 +2248,9 @@ impl Drop for SimCluster {
     }
 }
 
+/// `(leader node, [(replica node, applied index it last reported)])`.
+pub(crate) type LeaderPeerApplied = (u64, Vec<(u64, Option<u64>)>);
+
 impl SimCluster {
     /// Build a fresh `nodes`-node cluster: one `Simulator::new(seed)`, a
     /// real `nodes`-voter control `RaftNode<SimEnv>` quorum, a
@@ -3770,6 +3773,24 @@ impl SimCluster {
             .iter()
             .map(|(_, g)| g.features())
             .collect()
+    }
+
+    /// The applied index each other replica of `tablet` last reported to
+    /// `tablet`'s leader (issue #1330, `Gate::FollowerAppliedIndex`): `(leader
+    /// node, [(replica node, reported index)])`, `None` while no node leads.
+    pub(crate) fn leader_peer_applied(&self, tablet: TabletId) -> Option<LeaderPeerApplied> {
+        let leader = self.leader_index_of(tablet)?;
+        let groups = self.shared.ctx(leader).edge.hosted_groups();
+        let (_, g) = groups.iter().find(|(t, _)| *t == tablet)?;
+        Some((
+            leader,
+            self.shared
+                .replicas_of(tablet)
+                .into_iter()
+                .filter(|&n| n != leader)
+                .map(|n| (n, g.peer_applied_index(&nid(n))))
+                .collect(),
+        ))
     }
 
     /// One metric's current value on `node` (the node's aggregated control +

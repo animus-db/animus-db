@@ -81,7 +81,9 @@ operator never deletes a pod (no new RBAC).
    seal-checked transaction decisions, ADR 0018's 2026-10-09 amendment, which close a
    commit-vs-split race; cluster version 5: per-node placement capacity,
    `--node-weight` / `--node-max-replicas`, ADR 0079, which nodes advertise only after
-   the finalize), so a cluster stays on the previous behaviour until then.
+   the finalize; cluster version 6: the per-group write bound also counts follower
+   apply lag, ADR 0080, which takes effect only after the finalize), so a cluster
+   stays on the previous behaviour until then.
 5. **If a pod never becomes healthy** the roll stops at that pod and the rest stay on the old
    binary (the cluster serves normally at the old cluster version). **Fix forward**: set
    `spec.image` to a fixed image and the gate re-targets it; or wipe that pod's PVC and let it

@@ -49,6 +49,7 @@ mod placement_split_placing;
 mod pre_vote;
 mod protocol_version_refusal;
 mod quiescence;
+mod quorum_applied;
 mod raft_msg_fixture;
 mod rebalance_cache;
 mod register_node_cas;

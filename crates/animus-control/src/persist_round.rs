@@ -827,6 +827,7 @@ mod tests {
             match_index: 3,
             needs_snapshot: false,
             check_pending: false,
+            applied_index: 0,
         }));
         assert!(!ships(RaftMsg::InstallSnapshotResp {
             term: 1,

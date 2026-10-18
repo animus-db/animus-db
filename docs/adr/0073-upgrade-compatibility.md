@@ -3559,3 +3559,46 @@ Fixture (new, none edited): `metadata/v1-repair-settled.json`;
 refuses it by content), and `animusd` `sim_cluster_repair_settled` (nothing
 reported through a closed gate, the leader's report lands once open, a
 follower-connected report relays, stale rejected).
+
+## Amendment 2026-10-18 — the fifth real gate: `Gate::FollowerAppliedIndex`, `MAX_SUPPORTED = 6` (ADR 0080, issue #1330)
+
+`MAX_SUPPORTED` is now **6** and `Gate::FollowerAppliedIndex` (version 6) guards
+the follower's engine-applied index on the data plane's `AppendEntriesResp`.
+
+| New shape | Class | Gate | Emit-site / propose-site check |
+|---|---|---|---|
+| `raftkv-wire` frame **v2**: an `AppendEntriesResp` (codec tag 5) carries a trailing `applied_index: u64` after its flags byte; every other tag is byte-for-byte v1 | G (new frame version) | `FollowerAppliedIndex` | `WIRE_VERSIONS` gains the row `(2, Gate::FollowerAppliedIndex)`; `encode_wire` selects the highest open row, so a closed gate emits exactly the v1 bytes (the field is dropped, never half-written). An older replica rejects a v2 frame (`UnsupportedFormatVersion`, the message is dropped and the leader retries forever), which is why the encoder, not the receiver, is gated |
+| `RaftMsg::AppendEntriesResp.applied_index` (JSON, `#[serde(default, skip_serializing_if = "is_zero")]`) | L (control plane) | none | the control plane never sets it (`0` = unknown) so its `RaftMsg` JSON is byte-identical; an older JSON reader ignores the field, a newer one defaults it to `0` |
+| The leader's use of it: `RaftKvNode::backlog_applied` lowers the propose bound's applied index to `RaftCore::quorum_applied` | G (behaviour) | `FollowerAppliedIndex` | read only when `ClusterFeatures::is_open(FollowerAppliedIndex)`; below it the bound is the leader-only bound of ADR 0080, unchanged |
+
+- **No `required_gate` row.** The surface is a frame version and a leader-local
+  admission input, not a command or a replicated field: nothing is proposed or
+  applied. The exhaustive per-gate tables (`Gate::version`, `Gate::rank`,
+  `Gate::ALL`, the `sim_versions` acceptance matrix, `gate_table_is_exhaustive`)
+  gained the row; the frame table `WIRE_VERSIONS` is the emit-site check, and
+  `frame_version_tables_are_well_formed_and_the_selector_picks_the_highest_open`
+  pins it (an open era alone does not select v2; cluster version 6 does).
+- **The v1 decoder is not moved to `legacy`.** v2 differs from v1 in exactly one
+  tag, so the body decoder is parametrized on the frame version (`read_raft(c,
+  version)`) and v1 stays a literal branch (`applied_index: 0`); duplicating ~100
+  unchanged lines would only add a place to diverge. The `check_header` ceiling is
+  now per format (`WIRE_MAX_VERSION` 2, `IMAGE_MAX_VERSION` 1).
+- **Fixtures (new, none edited):** `raftkv-wire/v2.bin` (every `AppendEntriesResp`
+  shape: alone, with each flag, `applied_index` 0 and `u64::MAX`, inside a
+  heartbeat batch, beside an `AppendEntries` and a probe).
+  `v1.bin` is untouched and a test decodes its responses to `applied_index: 0`.
+- **Cells.** `sim_cluster_mixed_version_corpus::release5_to_release6_follower_applied_gate`:
+  under a continuous writer, no tablet leader holds any follower's reported
+  applied index below the gate, half-rolled with the finalize refused by name
+  included; after the finalize to 6 every follower's report reaches the leader
+  and writes keep being acked. `negative_control_follower_applied_gate_emitted_early`
+  (N8): a follower's hosted-group handle forged open at version 5 makes the
+  report reach the leader early, and the oracle must see it. The pure tier is
+  `animus-control` `quorum_applied::` and `animus-cp-data` `codec::` /
+  `format_fixture_tests::` plus `follower_apply_lag::` (the SimEnv corpus of
+  ADR 0080's amendment).
+- **Rolling upgrade behaviour.** Before the finalize nothing changes. Between the
+  last binary swap and the finalize a node already decodes v2 but emits v1 (the
+  gate is closed); after it, every node emits v2. A node that restarts onto the
+  new binary and has not yet read the replicated version also emits v1 (the
+  floor handle), never v2.

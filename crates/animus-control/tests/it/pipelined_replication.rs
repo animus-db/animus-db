@@ -68,6 +68,7 @@ fn ack(term: u64, match_index: u64) -> RaftMsg {
         match_index,
         needs_snapshot: false,
         check_pending: false,
+        applied_index: 0,
     }
 }
 
@@ -204,6 +205,7 @@ fn a_reject_behind_a_deep_window_resends_at_once() {
             match_index: 0,
             needs_snapshot: false,
             check_pending: false,
+            applied_index: 0,
         },
         now,
         7,
