@@ -13342,6 +13342,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             }
             let deadline = self.env.now().saturating_add(CONTROL_TRANSFER_POLL_TIMEOUT);
             loop {
+                // Issue #1325: an arm lasts one election timeout; re-issue it
+                // while we wait so a lost `TimeoutNow` is not a dead 5 s.
+                leader.rearm_lapsed_transfer(target.clone());
                 if !leader.is_leader() {
                     return Err(format!(
                         "control leadership transferred away (to node {target}) so this \
@@ -13701,6 +13704,11 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             if leader.leader().as_ref() == Some(&target) {
                 return Ok(());
             }
+            // Issue #1325: the core's arm lapses after one election timeout
+            // (a lost `TimeoutNow`, a late ack), leaving this node leader with
+            // nothing armed; re-issue it (a no-op while still armed or once
+            // stepped down) so the whole poll budget is usable.
+            leader.rearm_lapsed_transfer(target.clone());
             if self.env.now() >= deadline {
                 return Err(match leader.leader() {
                     // Stepped down, and a *different* voter is the stable

@@ -729,10 +729,34 @@ async fn roll_scenario(
             // The leader may already have moved on its own; transfer only if not.
             let still_leader = c.control_leader().await.map(|l| c.nodes[l].id == from);
             if variant != Variant::KillLeader && still_leader == Some(true) {
-                let from_admin = c.nodes[c.index_of(&from)].admin.to_string();
-                let (ok, out, err) =
-                    cli(&refs.cli, &["admin", "control-transfer", &from_admin, &to]).await;
-                assert!(ok, "control-transfer {from} -> {to} failed: {out} {err}");
+                // The route's 409s are documented as "retry" (a third voter won
+                // the election, or the lapsed arm could not complete): a real
+                // orchestrator re-plans on the next pass, so re-resolve the
+                // leader and re-issue, bounded. (The route itself re-arms a
+                // lapsed transfer for its whole 5 s budget, #1325, so a 409 here
+                // is not one lost message.)
+                let mut last = String::new();
+                let mut done = false;
+                for attempt in 1..=3 {
+                    let Some(l) = c.control_leader().await else {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        continue;
+                    };
+                    if c.nodes[l].id != from {
+                        done = true; // the leader moved on its own
+                        break;
+                    }
+                    let from_admin = c.nodes[l].admin.to_string();
+                    let (ok, out, err) =
+                        cli(&refs.cli, &["admin", "control-transfer", &from_admin, &to]).await;
+                    if ok {
+                        done = true;
+                        break;
+                    }
+                    last = format!("attempt {attempt}: {out} {err}");
+                    eprintln!("upgrade[{name}]: control-transfer {from} -> {to} {last}");
+                }
+                assert!(done, "control-transfer {from} -> {to} failed: {last}");
                 poll_until(
                     "a control leader other than the old one",
                     Duration::from_secs(60),
