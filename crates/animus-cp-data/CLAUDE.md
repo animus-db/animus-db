@@ -3596,3 +3596,17 @@ like the previous release `f6709564` (in-memory `recently_resolved`, no resolved
 engine-ahead fence). `tests/it/legacy_r1_mixed_stage.rs` replays one log through both semantics
 and pins the mixed-version hazard (a stale stage resurrects an intent on the replica whose guard
 state is missing). Remove it with the R-1 pin once R-1 contains #1243/#1251.
+
+## Propose bound and admission (ADR 0080)
+
+- `admission.rs`: `AdmissionClass` (Client bounded, Internal 2x, Liveness never refused),
+  `ProposeBacklog` (entries = `last_log_index - engine_applied`, plus a byte ring),
+  `NodeAdmission` (lag-scaled limits, the shared `QueuedBytes`). The check is in `gated_propose`
+  under the core lock and returns the definite `ProposeResult::Busy`; the `*_checked` txn stage
+  variants return `Result<_, ProposeBusy>` and the old signatures wrap them.
+- Cold-wake refusal: `awake_admission::cold_wake_refuses` + `gated_propose` (Client class only).
+- `heartbeat_batch.rs`: `HeartbeatInbox` is bounded at 8 (drop-oldest, `with_cap` test seam),
+  flush frames split at 8192 entries, sent with `send_stream_classed(Heartbeat, ...)`.
+  `wire_class(&KvWire)` classifies every send in `lib.rs`.
+- Corpus: `tests/it/overload_admission_corpus.rs` (`ANIMUS_OVERLOAD_SEEDS`, `ANIMUS_OVERLOAD_CELL`).
+  The apply-cost model (`ApplyEngine`) is what makes a backlog form; a slow-fsync model livelocks elections.

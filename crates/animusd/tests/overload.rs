@@ -301,3 +301,124 @@ async fn requests_over_the_inflight_bound_are_shed_and_service_recovers() {
     }
     node.shutdown_graceful().await;
 }
+
+/// ADR 0080 Tier 3 (i)-(ii): with a small node `QueuedBytes` budget, a flood of
+/// large writes is answered only with 200, a 503 or a 400 `ThrottlingException`
+/// (never a hang or another error), the budget's high-water mark stays within
+/// its stated allowance, `/admin/health` reports the budget fields, and the
+/// node serves again once the flood stops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_small_queued_bytes_budget_bounds_a_large_write_flood() {
+    const BUDGET: u64 = 2 << 20;
+    let dir = support::panic_safe_tempdir();
+    let (node, dynamo) = start(
+        dir.path(),
+        OverloadSection {
+            queued_bytes_budget: Some(BUDGET),
+            ..Default::default()
+        },
+    )
+    .await;
+    let admin = node.admin_addr();
+    let (status, body) = once(
+        dynamo,
+        Some("DynamoDB_20120810.CreateTable"),
+        r#"{"TableName":"tbl","KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+            "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}]}"#,
+    )
+    .await
+    .expect("create");
+    assert_eq!(status, 200, "{body}");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let ok = Arc::new(AtomicU64::new(0));
+    let refused = Arc::new(AtomicU64::new(0));
+    let other = Arc::new(std::sync::Mutex::new(Vec::<(u16, String)>::new()));
+    let big = "x".repeat(200 * 1024);
+    let mut clients = Vec::new();
+    for c in 0..16 {
+        let (stop, ok, refused, other, big) = (
+            stop.clone(),
+            ok.clone(),
+            refused.clone(),
+            other.clone(),
+            big.clone(),
+        );
+        clients.push(tokio::spawn(async move {
+            let mut s = TcpStream::connect(dynamo).await.expect("connect");
+            let mut i = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                let body = format!(
+                    r#"{{"TableName":"tbl","Item":{{"id":{{"S":"c{c}-{i}"}},"v":{{"S":"{big}"}}}}}}"#
+                );
+                i += 1;
+                s.write_all(request(Some("DynamoDB_20120810.PutItem"), &body, false).as_bytes())
+                    .await
+                    .unwrap();
+                match timeout(Duration::from_secs(30), read_response(&mut s)).await {
+                    Ok(Some((200, _))) => {
+                        ok.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(Some((503, b))) if b.contains("ServiceUnavailable") => {
+                        refused.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(Some((400, b))) if b.contains("ThrottlingException") => {
+                        refused.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(Some(r)) => other.lock().unwrap().push(r),
+                    _ => other.lock().unwrap().push((0, "no response".into())),
+                }
+            }
+        }));
+    }
+    sleep(Duration::from_secs(8)).await;
+    stop.store(true, Ordering::Relaxed);
+    for c in clients {
+        c.await.expect("client task");
+    }
+    assert!(ok.load(Ordering::Relaxed) > 0, "nothing was ever admitted");
+    assert!(
+        other.lock().unwrap().is_empty(),
+        "only 200, 503 and ThrottlingException are allowed under overload: {:?}",
+        other.lock().unwrap()
+    );
+
+    let (st, health) = {
+        let mut s = TcpStream::connect(admin).await.expect("admin");
+        s.write_all(b"GET /admin/health HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        read_response(&mut s).await.expect("health")
+    };
+    assert!(st == 200 || st == 503, "{health}");
+    let v: serde_json::Value = serde_json::from_str(&health).expect("health json");
+    assert_eq!(v["queued_bytes_budget"], BUDGET, "{health}");
+    let hwm = v["queued_bytes_hwm"].as_u64().expect("hwm");
+    eprintln!(
+        "OVERLOAD tier3 ok={} refused={} queued_bytes_hwm={hwm}",
+        ok.load(Ordering::Relaxed),
+        refused.load(Ordering::Relaxed)
+    );
+    // The budget plus the Internal/Liveness allowance (the propose bound's 2x
+    // class allowance) and one oversized charge.
+    assert!(
+        hwm <= 3 * BUDGET + (1 << 20),
+        "hwm {hwm} past its allowance"
+    );
+
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        if let Some((200, _)) = once(
+            dynamo,
+            Some("DynamoDB_20120810.PutItem"),
+            r#"{"TableName":"tbl","Item":{"id":{"S":"after"}}}"#,
+        )
+        .await
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "node never recovered");
+        sleep(STEP).await;
+    }
+    node.shutdown_graceful().await;
+}

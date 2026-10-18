@@ -213,11 +213,19 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         if writes.iter().any(|w| !range.contains(&w.key)) {
             return Err(TxnAbortReason::Other(stage_rejected_stale_route(table)));
         }
+        // ADR 0080: a propose-bound refusal is a definite "nothing staged"; it
+        // surfaces as `ThrottlingError` at the first write's index.
+        let busy_key = writes.first().map(|w| w.key.clone()).unwrap_or_default();
+        let busy = |_: animus_cp_data::ProposeBusy| TxnAbortReason::Throttled {
+            table: table.to_owned(),
+            key: busy_key.clone(),
+        };
         match anchor {
             None => {
                 let (txn_id, record_key, outcome) = leader
                     .txn_stage(table, writes, participant_spans, conditions)
                     .await
+                    .map_err(busy)?
                     .ok_or_else(|| {
                         TxnAbortReason::Other(
                             "CP group leader moved during anchor stage; retry".into(),
@@ -236,6 +244,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         conditions,
                     )
                     .await
+                    .map_err(busy)?
                     .ok_or_else(|| {
                         TxnAbortReason::Other(
                             "CP group leader moved during participant stage; retry".into(),
@@ -293,6 +302,13 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         // (its own bounded-retry wrapper is `txn_prepare_pushing`, which
         // re-invokes this method fresh on each attempt), so the deadline
         // is minted once, here, at the top.
+        // ADR 0080 2c: one slot on the first key's tablet for this stage attempt.
+        let _group = self
+            .group_permit(table, &first)
+            .map_err(|_| TxnAbortReason::Throttled {
+                table: table.to_owned(),
+                key: first.clone(),
+            })?;
         let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
         match self.cp_route(table, &first, deadline).await {
             CpRoute::Local(leader) => {
@@ -348,9 +364,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             // `ClientRequestToken`'s idempotency record is never recorded
             // `CANCELLED` off this alone (ADR 0018's issue #298 "deep shape
             // A" amendment).
-            CpRoute::None => Err(TxnAbortReason::Other(
-                "no CP group leader reachable for txn prepare; retry".into(),
-            )),
+            CpRoute::None => Err(TxnAbortReason::Other(self.no_leader_message(table, &first))),
         }
     }
 

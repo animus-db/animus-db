@@ -1,6 +1,6 @@
 # ADR 0080 — Overload admission on the client path and the transport: group-aware admission, a propose bound, bounded queues, a node memory budget
 
-- **Status:** Proposed (2026-10-15). Docs only: no implementation code lands with this ADR. Defaults are **provisional** until the calibration step of the implementation plan.
+- **Status:** Accepted (2026-10-17): maintainer accepted all 12 recommendations in "Open questions" (each is resolved to its recommendation below). Proposed 2026-10-15. Defaults are **provisional** until the calibration step of the implementation plan, which records the numbers in an as-built amendment.
 - **Date:** 2026-10-15
 - **Origin:** issue #1296 (companion to #1295 / ADR 0079); the two follow-ups PR #1317 (issue #1304) left open; ADR 0074 section 2 ("every queue is bounded"); maintainer order "ADR first, code after".
 - **Amends:** none. **Depends on:** ADR 0003 (determinism), ADR 0009 (control-plane Raft, 2026-10-14 pipelining amendment), ADR 0016/0017 (CP data plane), ADR 0026 (stream addressing, inbox cap), ADR 0044/0048 (quiescence, heartbeat batching), ADR 0055 (replica-local reads), ADR 0065 (per-table throttling), ADR 0073 (upgrade compatibility), ADR 0074 (exit criteria), ADR 0078 (campaign governor, `LoadMonitor`), ADR 0079 (awake cap, permit pools, shared `lag -> factor` helper).
@@ -193,17 +193,51 @@ One implementation PR on one branch (repo operating mode), ordered commits, each
 
 The docs-drift fix (Open question 11) is a separate small PR and does not gate this one.
 
-## Open questions for the maintainer
+## Open questions (all resolved 2026-10-17: the maintainer accepted every recommendation)
 
 1. **Which code for a `Busy` / per-group refusal: 503 `ServiceUnavailable` for everything, or 400 `ThrottlingException` for group-level conditions?** Recommended: `ThrottlingException` for `Busy` and the per-group cap (a hot group is a caller-rate signal and lets adaptive SDK retry slow down), `ServiceUnavailable` for the node gate, leaderless and forwarded gates (the server's condition, visible to the 5xx-ratio alert), `ThrottlingError` as the transaction reason. The cost is that group-level overload is invisible to the 5xx alert, so the shed counters join it.
+   - **Resolved 2026-10-17: the recommendation is accepted.**
 2. **Are the provisional defaults acceptable as starting points** (backlog 512 entries / 4 MiB per group, `leaderless_wait` 2 s, `group_inflight_max` 256, `max_forwarded_inflight` 4096, `B` 256 MiB)? Recommended: yes, to be replaced by the calibration step; they are single-run-derived and flagged as such.
+   - **Resolved 2026-10-17: the recommendation is accepted.**
 3. **`ProposeResult::Busy` variant, or a pre-propose check?** Recommended: the variant. Atomic under the `core` lock; the compiler plus a grep audit find the 213 sites; the pre-check overshoots under concurrency.
+   - **Resolved 2026-10-17: the recommendation is accepted.**
 4. **Refuse a write that would wake a quiesced group when lag >= 100 ms and `awake >= A_eff`?** Recommended: yes, only in that regime; it is the refusal path ADR 0079 said it lacked, and below it the cap stays soft so a quiesced tablet is never made unwritable by ordinary load. The risk is a tablet unwritable for the duration of a severe lag episode, bounded by recovery.
+   - **Resolved 2026-10-17: the recommendation is accepted.**
 5. **Replace task-per-frame with a per-peer outbox now, or ship only a global cap on in-flight send tasks first?** Recommended: the outbox, in one PR with a commit order that lands the simple cap first. The cap alone fixes memory but not priority, and heartbeat starvation is the failure ADR 0078 cares about.
+   - **Resolved 2026-10-17: the recommendation is accepted.**
 6. **A second TCP connection per peer for the `Bulk` class?** Recommended: yes. Class L, one extra socket per peer, removes head-of-line blocking of votes behind a stuck snapshot write.
+   - **Resolved 2026-10-17: the recommendation is accepted.**
 7. **Memory budget on by default at a fixed 256 MiB, or off unless configured (as the awake cap needs `--cores`)?** Recommended: on by default; the operator derives 25 % of the memory limit. A bound that exists only when configured does not meet ADR 0074's "every queue is bounded".
+   - **Resolved 2026-10-17: the recommendation is accepted.**
 8. **Should `QueuedBytes` charge `LsmEngine` memtable and compaction buffers?** Recommended: no, here. Size the pod for `floor + B + working set` (floor 0.4-0.55 GB, measured) and leave engine memory policy to the storage ADR (#1300).
+   - **Resolved 2026-10-17: the recommendation is accepted.**
 9. **HTTP listener `header_read_timeout` 10 s and `keepalive_idle_timeout` 120 s?** Recommended: yes. Provisional; confirm against the AWS SDK pool idle defaults before fixing.
+   - **Resolved 2026-10-17: the recommendation is accepted.**
 10. **String refusal convention or a typed `Retry-After` on the forwarded hop?** Recommended: the string convention now (class L, no Gate). Revisit with a typed field and `Gate` at cluster version 6 only if a third refusal kind needs structure.
+   - **Resolved 2026-10-17: the recommendation is accepted.**
 11. **Fix the documentation drift in a separate docs PR** (`docs/production-readiness.md` D-4, D-5, D-6, D-8, `docs/runbook/overload-and-throttling.md`, roadmap R-01(d) items #1220/#1221)? Recommended: yes, before implementation step 7, so the as-built note edits a true baseline.
+   - **Resolved 2026-10-17: the recommendation is accepted.**
 12. **Client-listener frame cap 16 MiB (finding 4.4), and defer 4.3 (scan byte pushdown) to its own PR?** Recommended: yes to both; 4.3 adds a request field and needs its own classification.
+   - **Resolved 2026-10-17: the recommendation is accepted.**
+
+## As built (2026-10-17)
+
+One branch, seven ordered commits (accept; primitives and calibration; propose bound; client admission; transport; memory budget and wiring; residuals). Everything is class L: no `Gate`, no cluster-version bump, no new durable format. The refusal strings (`busy:`, `no-leader:`, forwarded-gate and budget refusals) ride the existing `ClientResponse::Error` string path and are mapped to wire errors by a pure step at the terminal return (`map_overload`); `ThrottlingException` was therefore **not** added to `RELAYABLE_WIRE_ERROR_CODES`.
+
+Deviations from the text above, each the closest sound choice:
+
+1. **Calibration ran after the propose bound existed**, not before it. The rig needs `Busy` to measure goodput with and without the bound (control a). Defaults were left at the accepted provisional values: the corpus held at 8 seeds with them, so no number moved.
+2. **Tier 1 cells 5 and 6 (leaderless fast-fail) live in `animusd` Tier 2** (`sim_cluster_overload`), because the fast-fail is edge code (`cp_route`) that `animus-cp-data` cannot reach. Control (d) is there too.
+3. **Control letters:** (h) was added for the cold-wake refusal (the refusal switched off must let a hot wake through).
+4. **WAN scaling of `leaderless_wait` is not implemented.** Operators set `overload.leaderless_wait_ms` (a stretch cluster should raise it above the cross-Region election time).
+5. **A `Bulk` producer waits for credit at most `SEND_TIMEOUT`, then the frame is dropped** (counted). Snapshot chunks are sent from the consensus driver loop, so an unbounded wait there would stall the group; the snapshot retry path already tolerates a dropped chunk.
+6. **Cell 9 is modelled on the pure `PeerOutbox`** (seeded stalled-writer model, with control e = one FIFO and control f = coalescing off), plus two real-socket `ProdEnv` tests (`animus-env/tests/outbox_prod.rs`: stalled peer bounded and a healthy peer unaffected; bulk credit loses nothing). `SimEnv` has no outbox to drive.
+7. **Cell 10 is a unit test of `HeartbeatInbox`** (it is `pub(crate)`), with the `with_cap` seam.
+8. **The SimCluster client context uses `OverloadState`'s admission**, not the reconciler's `NodeAdmission`, so Tier 2 drives the propose bound through the `SimOverload` thread-local knob.
+9. **The housekeeping kind write (`cp_kind_write_raw`) takes no group permit**: it is Internal-class work that must make progress under load.
+10. **`max_admin_inflight` gates the admin listener only.** The console handler has no `ClientCtx`; its connection cap (`max_admin_connections`) still bounds it.
+11. **Tier 3 (ii) memory:** the 150 s density-rig RSS run was not executed in this change; the real-TCP flood test (`animusd/tests/overload.rs`, `a_small_queued_bytes_budget_bounds_a_large_write_flood`) shows the budget high-water mark staying far inside its allowance (410 KB against a 2 MiB budget with 16 clients sending 200 KB items for 8 s: 91 admitted, 2963 refused, nothing but 200 / 503 / `ThrottlingException`). Run the rig before raising the default budget.
+12. **Operator:** the budget is derived from the memory **limit** (25 %), rendered as a per-node `overload.queued_bytes_budget` and included in the restart-relevant config hash only when set, so a spec without a memory limit keeps its hash. `spec.nodeCapacity` has no budget override yet.
+13. **Idle/header timeouts are fixed constants** (`HEADER_READ_TIMEOUT` 10 s, `KEEPALIVE_IDLE_TIMEOUT` 120 s) rather than config knobs; the 120 s was not yet checked against every SDK's pool idle default, as question 9 required.
+
+Test map: Tier 0 in `animus-env` (`queued_bytes`, `outbox`), `animus-cp-data` (`admission`, `heartbeat_batch`, `awake_admission`), `animusd` (`overload`, `http`, `admin`); Tier 1 `animus-cp-data` `tests/it/overload_admission_corpus.rs` (`ANIMUS_OVERLOAD_SEEDS`, `ANIMUS_OVERLOAD_CELL`); Tier 2 `animusd` `sim_cluster_overload`; Tier 3 `animus-env/tests/outbox_prod.rs` and `animusd/tests/overload.rs`.

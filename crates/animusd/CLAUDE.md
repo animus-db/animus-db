@@ -12582,3 +12582,19 @@ seal knobs). A new `StreamSealKnobs { .. }` literal needs `..Default::default()`
   on a full split pool is evaluated later even if it has quiesced.
 - Wire test: `sim_cluster_cluster_version::create_table_is_refused_retryably_when_every_node_is_at_max_replicas`
   (era -> finalize to 5 -> ceilings of 0 -> 503 -> raise -> 200).
+
+## Overload admission and residual bounds (ADR 0080)
+
+- `overload.rs` holds the edge state: `OverloadState` (node gate, `forwarded`,
+  `group_inflight`, `leaderless`, `admin_inflight`, and `admission`, the
+  `NodeAdmission` the tablet-host reconciler shares). Refusal strings come from
+  `animus_node::decide` (`busy_refusal`, `no_leader_refusal`, ...) and are mapped to wire
+  errors only at the terminal return (`dynamo.rs` `map_overload`); never map earlier,
+  and keep new overload strings out of `read_should_retry` so an inline loop cannot spin.
+- `cp_route` (`forwarding.rs`) owns the leaderless fast-fail; every client-path
+  `cp_*` call site takes a `group_permit`. The housekeeping `cp_kind_write_raw` takes none by design.
+- `http.rs`: `HEADER_READ_TIMEOUT` 10 s / `KEEPALIVE_IDLE_TIMEOUT` 120 s are applied inside
+  `read_http_request` for the dynamo, admin and console listeners. `read_frame_capped` +
+  `CLIENT_LISTENER_FRAME_CAP` (16 MiB) apply to the client listener only.
+- `SimOverload` (`sim_cluster.rs`) is the thread-local knob for Tier 2 (`sim_cluster_overload`).
+- `/admin/health` gained advisory `queued_bytes*` fields; they never affect `ok`.

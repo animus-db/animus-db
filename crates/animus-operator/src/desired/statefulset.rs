@@ -202,6 +202,10 @@ struct RestartRelevantConfig {
     // contribution and cause the exact one-time restart this is avoiding.
     #[serde(skip_serializing_if = "Option::is_none")]
     encryption_key_path: Option<String>,
+    // Same omit-when-absent rule as `encryption_key_path` (ADR 0080): a spec
+    // with no memory limit keeps its existing hash.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    queued_bytes_budget: Option<u64>,
 }
 
 fn restart_relevant_projection(spec: &AnimusClusterSpec) -> RestartRelevantConfig {
@@ -217,6 +221,7 @@ fn restart_relevant_projection(spec: &AnimusClusterSpec) -> RestartRelevantConfi
             .encryption_key_secret_name
             .as_ref()
             .map(|_| cluster_config::encryption_key_mount_path()),
+        queued_bytes_budget: cluster_config::derive_queued_bytes_budget(spec),
     }
 }
 

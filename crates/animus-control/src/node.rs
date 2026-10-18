@@ -1547,8 +1547,16 @@ pub async fn send_heartbeat<E: Env>(env: &E, control: &[NodeId]) {
     // the assert pins the classification instead.
     debug_assert_eq!(msg.envelope_gate(), crate::version::Gate::Base);
     let bytes = serde_json::to_vec(&msg).expect("heartbeat serializes");
+    let (class, key) = msg.transport_class();
     for c in control {
-        env.send(c.clone(), bytes.clone()).await;
+        env.send_stream_classed(
+            c.clone(),
+            animus_env::PRIMARY_STREAM,
+            class,
+            key,
+            bytes.clone(),
+        )
+        .await;
     }
 }
 
@@ -1691,7 +1699,10 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
                         continue;
                     }
                     let bytes = serde_json::to_vec(&msg).expect("raft message serializes");
-                    probe_env.send(to, bytes).await;
+                    let (class, key) = msg.transport_class();
+                    probe_env
+                        .send_stream_classed(to, animus_env::PRIMARY_STREAM, class, key, bytes)
+                        .await;
                 }
             });
         }
@@ -1987,7 +1998,9 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
                 continue;
             }
             let bytes = serde_json::to_vec(&msg).expect("raft message serializes");
-            env.send(to, bytes).await;
+            let (class, key) = msg.transport_class();
+            env.send_stream_classed(to, animus_env::PRIMARY_STREAM, class, key, bytes)
+                .await;
         }
         // Whatever round landed — this loop's own `fsync`, the apply task's
         // compaction rewrite, or a `RaftNode::flush` from a graceful shutdown —
@@ -1997,7 +2010,9 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
                 continue;
             }
             let bytes = serde_json::to_vec(&msg).expect("raft message serializes");
-            env.send(to, bytes).await;
+            let (class, key) = msg.transport_class();
+            env.send_stream_classed(to, animus_env::PRIMARY_STREAM, class, key, bytes)
+                .await;
         }
         // Safety net making a stranded ack structurally impossible rather than
         // merely unlikely: if the core owes the WAL nothing *and* no round is in
@@ -2017,7 +2032,9 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
                         continue;
                     }
                     let bytes = serde_json::to_vec(&msg).expect("raft message serializes");
-                    env.send(to, bytes).await;
+                    let (class, key) = msg.transport_class();
+                    env.send_stream_classed(to, animus_env::PRIMARY_STREAM, class, key, bytes)
+                        .await;
                 }
             }
         }
@@ -2772,7 +2789,11 @@ fn record_outbound(metrics: &MetricsHandle, outs: &[Out]) {
 fn record_reconfigure(metrics: &MetricsHandle, result: ProposeResult) -> ProposeResult {
     match result {
         ProposeResult::Accepted { .. } => metrics.incr(Metric::ControlReconfigureAccepted),
-        ProposeResult::NotLeader { .. } => metrics.incr(Metric::ControlReconfigureRejected),
+        // `Busy` is never produced by the control plane (ADR 0080: the bound
+        // lives in `animus-cp-data`); counted as a rejection to stay total.
+        ProposeResult::NotLeader { .. } | ProposeResult::Busy { .. } => {
+            metrics.incr(Metric::ControlReconfigureRejected);
+        }
     }
     result
 }

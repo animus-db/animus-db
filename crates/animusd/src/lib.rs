@@ -1679,14 +1679,14 @@ impl<E: Env> CpGroup<E> {
         writes: Vec<TxnWrite>,
         participant_spans: Vec<(String, KeyRange)>,
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
-    ) -> Option<(TxnId, Vec<u8>, StageOutcome)> {
+    ) -> Result<Option<(TxnId, Vec<u8>, StageOutcome)>, animus_cp_data::ProposeBusy> {
         match self {
             CpGroup::Lsm(n) => {
-                n.txn_stage_anchor(table, writes, participant_spans, conditions)
+                n.txn_stage_anchor_checked(table, writes, participant_spans, conditions)
                     .await
             }
             CpGroup::Mem(n) => {
-                n.txn_stage_anchor(table, writes, participant_spans, conditions)
+                n.txn_stage_anchor_checked(table, writes, participant_spans, conditions)
                     .await
             }
         }
@@ -1700,15 +1700,27 @@ impl<E: Env> CpGroup<E> {
         record_table: String,
         writes: Vec<TxnWrite>,
         conditions: Vec<(Vec<u8>, Option<Vec<u8>>)>,
-    ) -> Option<(HlcTimestamp, StageOutcome)> {
+    ) -> Result<Option<(HlcTimestamp, StageOutcome)>, animus_cp_data::ProposeBusy> {
         match self {
             CpGroup::Lsm(n) => {
-                n.txn_stage_participant(txn_id, record_key, record_table, writes, conditions)
-                    .await
+                n.txn_stage_participant_checked(
+                    txn_id,
+                    record_key,
+                    record_table,
+                    writes,
+                    conditions,
+                )
+                .await
             }
             CpGroup::Mem(n) => {
-                n.txn_stage_participant(txn_id, record_key, record_table, writes, conditions)
-                    .await
+                n.txn_stage_participant_checked(
+                    txn_id,
+                    record_key,
+                    record_table,
+                    writes,
+                    conditions,
+                )
+                .await
             }
         }
     }
@@ -5603,6 +5615,10 @@ fn spawn_common_tail(
     // (ADR 0073 Phase 2, P2-C); cloned before `edge` moves into the ctx.
     let relay_features = edge.version().features.clone();
     let overload_metrics = env.metrics();
+    // ADR 0080 section 4: the transport's outboxes charge the same node
+    // `QueuedBytes` budget the propose bound and the edge do.
+    let overload_state = overload::OverloadState::new(overload_limits, overload_metrics);
+    env.set_queued_bytes(overload_state.admission.budget().clone());
     let export_store_factory = Arc::new(Mutex::new(default_export_store_factory(
         export_s3,
         env.clone(),
@@ -5642,7 +5658,7 @@ fn spawn_common_tail(
         any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(
             initial_any_table_throughput,
         )),
-        overload: overload::OverloadState::new(overload_limits, overload_metrics),
+        overload: overload_state,
     };
     // ADR 0066 §1 (S-02 step 3): seed the lock-free "any catalog
     // credentials" fast path from whatever this node's control handle
@@ -6664,6 +6680,8 @@ impl BoundNode {
             || self.lag_stretch_max_x > 0
             || awake_max.is_some()
             || self.bg_sizes != animus_cp_data::background_budget::BudgetSizes::off()
+            || ctx.overload.admission.limits().is_on()
+            || ctx.overload.admission.budget().budget() != 0
         {
             reconciler.set_election_backpressure(node_election_backpressure(
                 &self.env,
@@ -6671,6 +6689,7 @@ impl BoundNode {
                 self.lag_stretch_max_x,
                 awake_max,
                 Some(bg_budget.clone()),
+                Some(ctx.overload.admission.clone()),
             ));
         }
         // ADR 0078 section 3: staggered hosting, and the gauge `/admin/health`
@@ -9040,6 +9059,8 @@ impl BoundDataNode {
             || self.lag_stretch_max_x > 0
             || awake_max.is_some()
             || self.bg_sizes != animus_cp_data::background_budget::BudgetSizes::off()
+            || ctx.overload.admission.limits().is_on()
+            || ctx.overload.admission.budget().budget() != 0
         {
             reconciler.set_election_backpressure(node_election_backpressure(
                 &self.env,
@@ -9047,6 +9068,7 @@ impl BoundDataNode {
                 self.lag_stretch_max_x,
                 awake_max,
                 Some(bg_budget.clone()),
+                Some(ctx.overload.admission.clone()),
             ));
         }
         // ADR 0078 section 3: staggered hosting, and the gauge `/admin/health`
@@ -12721,7 +12743,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             status: NodeStatus::Leaving,
         }) {
             ProposeResult::Accepted { .. } => Ok(()),
-            ProposeResult::NotLeader { .. } => {
+            // Control-plane proposals are never `Busy` (ADR 0080: the bound lives in
+            // `animus-cp-data`); folded in with the other not-accepted shape.
+            ProposeResult::NotLeader { .. } | ProposeResult::Busy { .. } => {
                 Err("control leadership moved; retry on the leader".into())
             }
         }
@@ -12861,7 +12885,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         }
         match leader.propose(MetaCommand::RemoveMember { node }) {
             ProposeResult::Accepted { .. } => Ok(()),
-            ProposeResult::NotLeader { .. } => {
+            // Control-plane proposals are never `Busy` (ADR 0080: the bound lives in
+            // `animus-cp-data`); folded in with the other not-accepted shape.
+            ProposeResult::NotLeader { .. } | ProposeResult::Busy { .. } => {
                 Err("control leadership moved; retry on the leader".into())
             }
         }
@@ -13172,7 +13198,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         voters.insert(node.clone());
         match leader.change_membership(voters) {
             ProposeResult::Accepted { .. } => Ok(node),
-            ProposeResult::NotLeader { .. } => Err(
+            ProposeResult::NotLeader { .. } | ProposeResult::Busy { .. } => Err(
                 "control leadership moved, or a membership change is already in \
                  flight; the address book was updated (retry-safe) but the voter \
                  was not added — retry on the leader"
@@ -13353,7 +13379,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 // keeps it current regardless of voter status).
                 Ok(ControlRemoveOutcome { warning })
             }
-            ProposeResult::NotLeader { .. } => Err(
+            ProposeResult::NotLeader { .. } | ProposeResult::Busy { .. } => Err(
                 "control leadership moved, or a membership change is already in \
                      flight; retry on the leader"
                     .into(),
@@ -16166,8 +16192,14 @@ async fn handle_connection(
     // half is further wrapped in [`Rewindable`] for [`peer_closed`]'s sake.
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut read_half = Rewindable::new(read_half);
+    let frame_cap = match listener {
+        ListenerKind::Client => CLIENT_LISTENER_FRAME_CAP,
+        ListenerKind::Intra => MAX_FRAME_LEN,
+    };
     loop {
-        let Some(request) = read_frame::<ClientRequest, _>(&mut read_half).await? else {
+        let Some(request) =
+            read_frame_capped::<ClientRequest, _>(&mut read_half, frame_cap).await?
+        else {
             return Ok(());
         };
         // Issue #1253: a connection admitted only through the peer-region CA
@@ -17930,6 +17962,7 @@ fn node_election_backpressure<E: Env>(
     stretch_x: u64,
     awake_max: Option<usize>,
     budget: Option<animus_cp_data::background_budget::BackgroundBudget>,
+    admission: Option<animus_cp_data::admission::NodeAdmission>,
 ) -> animus_cp_data::campaign_governor::ElectionBackpressure {
     let governor =
         (k > 0).then(|| animus_cp_data::campaign_governor::CampaignGovernor::new(k, env.metrics()));
@@ -17950,11 +17983,16 @@ fn node_election_backpressure<E: Env>(
     if let (Some(m), Some(b)) = (&monitor, &budget) {
         m.attach_budget(b.clone());
     }
+    // ADR 0080: the propose bound's limits follow the same lag.
+    if let (Some(m), Some(a)) = (&monitor, &admission) {
+        m.attach_admission(a.clone());
+    }
     animus_cp_data::campaign_governor::ElectionBackpressure {
         governor,
         monitor,
         awake,
         budget,
+        admission,
     }
 }
 
@@ -20087,11 +20125,40 @@ where
 pub async fn read_frame<T: DeserializeOwned, S: AsyncRead + Unpin>(
     stream: &mut S,
 ) -> std::io::Result<Option<T>> {
+    read_frame_capped(stream, MAX_FRAME_LEN).await
+}
+
+/// ADR 0080 section 5 (4.4): the inbound frame cap on the **client** listener,
+/// 16 MiB. The intra listener keeps [`MAX_FRAME_LEN`] (64 MiB), because forwarded
+/// batches and snapshot-adjacent frames legitimately exceed 16 MiB; a client
+/// request is bounded by the DynamoDB item and batch limits well below it.
+pub(crate) const CLIENT_LISTENER_FRAME_CAP: usize = 16 << 20;
+
+/// [`read_frame`] with an explicit declared-length cap (never above
+/// [`MAX_FRAME_LEN`]); a longer frame is an `InvalidData` error before any
+/// allocation.
+///
+/// # Errors
+/// As [`read_frame`].
+pub(crate) async fn read_frame_capped<T: DeserializeOwned, S: AsyncRead + Unpin>(
+    stream: &mut S,
+    cap: usize,
+) -> std::io::Result<Option<T>> {
     let raw_len = match stream.read_u32().await {
         Ok(len) => len,
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e),
     };
+    if raw_len as usize > cap.min(MAX_FRAME_LEN) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "declared frame length {raw_len} exceeds the listener frame cap \
+                 ({} bytes; MAX_FRAME_LEN is {MAX_FRAME_LEN})",
+                cap.min(MAX_FRAME_LEN)
+            ),
+        ));
+    }
     let len = animus_node::codec::frame_payload_len(raw_len)?;
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
@@ -23333,6 +23400,10 @@ mod sim_cluster_zone_placement;
 /// (`ANIMUS_MRSC_SEEDS`) — see that module's own doc.
 #[cfg(test)]
 mod sim_cluster_mrsc;
+/// ADR 0080 Tier 2: overload admission over `SimCluster` and the DynamoDB wire
+/// (leaderless fast-fail, the `Busy` propose bound, the error vocabulary).
+#[cfg(test)]
+mod sim_cluster_overload;
 
 /// A first deterministic smoke over `SimClusterHandle::dynamo`/`SimCluster::
 /// dynamo` (ADR 0061 rung D2 PR 1) — the DynamoDB wire edge, decoded by
@@ -24578,5 +24649,33 @@ mod bound_node_settings_tests {
         );
         let bound = apply_cluster_settings_to_bound(bound, &config, 0);
         assert_eq!(bound.max_region_rtt, Duration::from_millis(437));
+    }
+}
+
+#[cfg(test)]
+mod client_frame_cap_tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    /// ADR 0080 section 5 (4.4): a declared length past the cap is refused
+    /// before any allocation; the same length is fine under the intra cap.
+    #[tokio::test]
+    async fn a_frame_over_the_client_cap_is_refused_before_allocation() {
+        let len = (CLIENT_LISTENER_FRAME_CAP + 1) as u32;
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        tx.write_all(&len.to_be_bytes()).await.unwrap();
+        let r = read_frame_capped::<ClientRequest, _>(&mut rx, CLIENT_LISTENER_FRAME_CAP).await;
+        assert!(matches!(r, Err(ref e) if e.kind() == std::io::ErrorKind::InvalidData));
+
+        // Under the intra cap the same prefix is accepted as a length (the read
+        // then waits for the body, so it times out instead of erroring).
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        tx.write_all(&len.to_be_bytes()).await.unwrap();
+        let r = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            read_frame_capped::<ClientRequest, _>(&mut rx, MAX_FRAME_LEN),
+        )
+        .await;
+        assert!(r.is_err(), "the intra cap admits it and waits for the body");
     }
 }

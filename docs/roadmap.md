@@ -1763,6 +1763,15 @@ outstanding on the wire surface at present.
     (ADR 0039 criterion 1).
 - **Depends:** `animus-bench` (ADR 0076; landed: the Tier 2 harness and topology; Tier 1 can start now).
 
+### ADR 0080 overload admission (issue #1296): built
+
+The propose bound (`ProposeResult::Busy`), group-state-aware edge admission, bounded
+per-peer transport queues with message classes, the node `QueuedBytes` budget and the
+residual HTTP bounds landed together (ADR 0080 "As built"). Open: the 150 s density-rig
+RSS run with the budget on, a config knob for the HTTP timeouts, a `spec.nodeCapacity`
+budget override, console in-flight gate, and 4.3 (scan byte cap pushed into the per-tablet
+RPC; adds a request field, needs its own classification).
+
 ### R-01 Production-readiness pass: exit criteria for leaving pre-alpha
 
 - **Gap:** the project is "pre-alpha" (root `CLAUDE.md`, `website/index.html`

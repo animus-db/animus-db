@@ -85,13 +85,72 @@ pub fn is_storage_full_refusal(e: &str) -> bool {
     e.contains("StorageFull:")
 }
 
+/// ADR 0080 decision 1: the refusal a `ProposeResult::Busy` becomes at the
+/// animusd boundary. Begins with `Busy:` and ends in the house `"; retry"`
+/// suffix (so an N-1 edge that has never heard of it sees an ordinary
+/// retryable error), but is **never retried inline**: see
+/// [`is_overload_refusal`]. A `Busy` is a definite refusal (nothing was
+/// appended), so the client may retry or fail with no idempotency question.
+#[must_use]
+pub fn busy_refusal(backlog_entries: u64, backlog_bytes: u64) -> String {
+    format!(
+        "Busy: this tablet's apply backlog is over its bound ({backlog_entries} entries, \
+         {backlog_bytes} bytes unapplied); retry"
+    )
+}
+
+/// ADR 0080 decision 2c: the per-group in-flight refusal (also `Busy:`).
+#[must_use]
+pub fn group_inflight_refusal(tablet: u64) -> String {
+    format!("Busy: too many in-flight requests for tablet {tablet}; retry")
+}
+
+/// ADR 0080 decision 2d: the forwarded-request gate refusal (also `Busy:`).
+pub const FORWARDED_GATE_REFUSAL: &str =
+    "Busy: this node is at its forwarded-request limit (max_forwarded_inflight); retry";
+
+/// ADR 0080 section 4: the node `QueuedBytes` budget refusal (also `Busy:`).
+pub const BUDGET_REFUSAL: &str =
+    "Busy: this node's queued-bytes budget is exhausted (queued_bytes_budget); retry";
+
+/// ADR 0080 decision 2b: the leaderless fast-fail. `waited_secs` is how long
+/// the tablet has had no reachable leader.
+#[must_use]
+pub fn no_leader_refusal(tablet: u64, waited_secs: u64) -> String {
+    format!("NoLeader: tablet {tablet} has had no reachable leader for {waited_secs}s; retry")
+}
+
+/// Whether `e` is a `Busy:` refusal (propose bound, per-group in-flight,
+/// forwarded gate, budget), including a relayed or wrapped copy.
+pub fn is_busy_refusal(e: &str) -> bool {
+    e.contains("Busy: ")
+}
+
+/// Whether `e` is the leaderless fast-fail (`NoLeader:`), relayed or wrapped.
+pub fn is_no_leader_refusal(e: &str) -> bool {
+    e.contains("NoLeader: ")
+}
+
+/// Whether `e` is an ADR 0080 overload refusal that a retry loop must
+/// **not** spin on inline: the condition lasts until load or the election
+/// resolves, so the client backs off on the typed error instead.
+pub fn is_overload_refusal(e: &str) -> bool {
+    is_busy_refusal(e) || is_no_leader_refusal(e)
+}
+
 /// Whether a CP read error is a **transient routing/leadership/scope race**
 /// the reader should retry with re-resolved routing (the `"; retry"` shape
 /// every such error in this file carries), as opposed to a genuine failure
 /// to surface. Shared by every CP read/write retry loop in `animusd`'s
 /// `lib.rs`.
+///
+/// **ADR 0080:** a `Busy:` or `NoLeader:` refusal also ends in `"; retry"`
+/// (so an N-1 edge retries it as it would any transient error) but is
+/// excluded here, so no inline loop in this binary spins on it: it is
+/// returned to the edge, which maps it at the terminal return to a typed
+/// `ThrottlingException` / `ServiceUnavailable`.
 pub fn read_should_retry(e: &str) -> bool {
-    e.ends_with("; retry")
+    e.ends_with("; retry") && !is_overload_refusal(e)
 }
 
 /// Map a forwarded-op reply that should be a bare ack into `Result<(), String>`.
@@ -467,6 +526,41 @@ mod tests {
         assert!(e.starts_with("StorageFull:"), "{e}");
         assert!(read_should_retry(&e), "must map to a 503, not a 500: {e}");
         assert!(is_storage_full_refusal(&e));
+    }
+
+    // --- ADR 0080 overload refusals -------------------------------------------
+
+    #[test]
+    fn busy_and_no_leader_refusals_are_retryable_shaped_but_never_inline_retried() {
+        let busy = busy_refusal(512, 4 << 20);
+        let group = group_inflight_refusal(7);
+        let no_leader = no_leader_refusal(7, 3);
+        for e in [
+            busy.as_str(),
+            group.as_str(),
+            no_leader.as_str(),
+            FORWARDED_GATE_REFUSAL,
+            BUDGET_REFUSAL,
+        ] {
+            assert!(
+                e.ends_with("; retry"),
+                "N-1 reads it as a transient error: {e}"
+            );
+            assert!(
+                !read_should_retry(e),
+                "an inline loop must never spin on {e}"
+            );
+            assert!(is_overload_refusal(e), "{e}");
+        }
+        assert!(is_busy_refusal(&busy) && !is_no_leader_refusal(&busy));
+        assert!(is_no_leader_refusal(&no_leader) && !is_busy_refusal(&no_leader));
+        // A wrapped / relayed copy is still recognised.
+        let wrapped =
+            format!("forward to tablet leader: budget exhausted (last hop: {busy}); retry");
+        assert!(is_busy_refusal(&wrapped) && !read_should_retry(&wrapped));
+        // Ordinary transient errors are unaffected.
+        assert!(read_should_retry("CP group leader moved; retry"));
+        assert!(!is_overload_refusal("CP group leader moved; retry"));
     }
 
     #[test]

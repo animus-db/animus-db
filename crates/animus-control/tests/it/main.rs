@@ -70,6 +70,7 @@ mod storage_full_step_down;
 mod tablet_split;
 mod transfer_completes_under_faults;
 mod transfer_third_voter_wins;
+mod transport_class;
 mod version_apply_corpus;
 mod version_era_on;
 mod version_finalize_status;

@@ -813,6 +813,40 @@ impl<C> RaftMsg<C> {
         }
     }
 
+    /// ADR 0080 section 3: the transport class and supersede key this message
+    /// is sent with (in memory only, never on the wire). Exhaustive, no `_`
+    /// arm: a new variant does not compile until it names its class.
+    ///
+    /// Votes (and `TimeoutNow`) are strict priority; bare heartbeats and the
+    /// small liveness acks sit above bulk replication, and a newer bare
+    /// heartbeat supersedes a still-queued older one; entries ride the
+    /// replicate class; snapshot chunks are `Bulk`.
+    #[must_use]
+    pub fn transport_class(&self) -> (animus_env::MsgClass, Option<u64>) {
+        use animus_env::MsgClass;
+        match self {
+            RaftMsg::PreVote { .. }
+            | RaftMsg::PreVoteResp { .. }
+            | RaftMsg::RequestVote { .. }
+            | RaftMsg::RequestVoteResp { .. }
+            | RaftMsg::TimeoutNow { .. } => (MsgClass::Vote, None),
+            RaftMsg::AppendEntries { entries, .. } if entries.is_empty() => {
+                (MsgClass::Heartbeat, Some(0))
+            }
+            RaftMsg::AppendEntries { .. } => (MsgClass::Replicate, None),
+            RaftMsg::AppendEntriesResp { .. }
+            | RaftMsg::Heartbeat { .. }
+            | RaftMsg::Quiesce { .. }
+            | RaftMsg::WakeRequest { .. }
+            | RaftMsg::Removed { .. }
+            | RaftMsg::RemovedAck { .. } => (MsgClass::Heartbeat, None),
+            RaftMsg::InstallSnapshot { .. } => (MsgClass::Bulk, None),
+            RaftMsg::InstallSnapshotResp { .. }
+            | RaftMsg::ClusterProbe
+            | RaftMsg::ClusterProbeResp { .. } => (MsgClass::Normal, None),
+        }
+    }
+
     /// The Raft term carried by this message. A [`Heartbeat`](RaftMsg::Heartbeat)
     /// or [`WakeRequest`](RaftMsg::WakeRequest) is not consensus traffic and
     /// carries no term *authority* (it reports 0, never forcing a step-down) —
@@ -923,6 +957,21 @@ pub enum ProposeResult {
     Accepted { index: u64, term: u64 },
     /// This node is not the leader; `leader` is the best-known leader hint.
     NotLeader { leader: Option<NodeId> },
+    /// **Definite refusal (ADR 0080 decision 1):** the leader declined the
+    /// command because the group's propose backlog (`backlog_entries`
+    /// appended-but-unapplied entries, `backlog_bytes` of payload) is over its
+    /// bound, or the node's `QueuedBytes` budget is exhausted. **Nothing was
+    /// appended**, so unlike a timeout it can never have taken effect: a caller
+    /// may retry or fail with no idempotency question. Produced only by
+    /// `animus-cp-data`'s `gated_propose` for a client- or internal-class
+    /// command (never by [`RaftCore::propose`], and never for the control
+    /// plane); it is in-memory only (no serde), so it is node-local (ADR 0073
+    /// class L). A caller that does not special-case it must treat it as a
+    /// not-accepted result that is **retryable**, never as a terminal error.
+    Busy {
+        backlog_entries: u64,
+        backlog_bytes: u64,
+    },
 }
 
 /// An outbound message: `(destination, message)`. Generic over the command type

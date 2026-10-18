@@ -1594,6 +1594,17 @@ async fn advance_backfill_cursor<E: Env>(
         Vec::new(),
     ) {
         ProposeResult::Accepted { index, .. } => index,
+        // ADR 0080: `Busy` (Internal class, 2x bound) is a definite
+        // refusal; the drain's own retry/sweep re-offers the batch.
+        ProposeResult::Busy {
+            backlog_entries,
+            backlog_bytes,
+        } => {
+            return Err(animus_node::decide::busy_refusal(
+                backlog_entries,
+                backlog_bytes,
+            ));
+        }
         other => return Err(format!("backfill cursor advance not accepted: {other:?}")),
     };
     let deadline = group.env().now().saturating_add(BACKFILL_SEED_TIMEOUT);
@@ -1637,6 +1648,17 @@ pub(crate) async fn clear_backfill_cursor<E: Env>(
     let propose_index =
         match group.put_kind_batch(vec![(KIND_CURSOR, cursor_key_bytes, None)], Vec::new()) {
             ProposeResult::Accepted { index, .. } => index,
+            // ADR 0080: `Busy` (Internal class, 2x bound) is a definite
+            // refusal; the drain's own retry/sweep re-offers the batch.
+            ProposeResult::Busy {
+                backlog_entries,
+                backlog_bytes,
+            } => {
+                return Err(animus_node::decide::busy_refusal(
+                    backlog_entries,
+                    backlog_bytes,
+                ));
+            }
             other => return Err(format!("backfill cursor clear not accepted: {other:?}")),
         };
     let deadline = group.env().now().saturating_add(BACKFILL_SEED_TIMEOUT);
@@ -1703,6 +1725,17 @@ async fn seed_change_log_record<E: Env>(
     }
     let index = match group.put_kind_batch(Vec::new(), vec![(change_log_prefix, record)]) {
         ProposeResult::Accepted { index, .. } => index,
+        // ADR 0080: `Busy` (Internal class, 2x bound) is a definite
+        // refusal; the drain's own retry/sweep re-offers the batch.
+        ProposeResult::Busy {
+            backlog_entries,
+            backlog_bytes,
+        } => {
+            return Err(animus_node::decide::busy_refusal(
+                backlog_entries,
+                backlog_bytes,
+            ));
+        }
         other => return Err(format!("backfill seed not accepted: {other:?}")),
     };
     let deadline = group.env().now().saturating_add(BACKFILL_SEED_TIMEOUT);

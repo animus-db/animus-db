@@ -1833,6 +1833,21 @@ impl WireError {
         }
     }
 
+    /// DynamoDB's `ThrottlingException` (HTTP 400): the caller-rate signal for
+    /// a **group-level** overload (ADR 0080: a tablet's apply backlog over its
+    /// bound, or too many in-flight requests for one tablet). AWS SDKs treat a
+    /// throttle code differently from a 5xx: adaptive retry mode lowers its
+    /// own rate. Deliberately **not** `ProvisionedThroughputExceededException`,
+    /// which stays reserved for configured table capacity (ADR 0065).
+    #[must_use]
+    pub fn throttling(message: impl Into<String>) -> Self {
+        Self {
+            code: "ThrottlingException",
+            message: message.into(),
+            reasons: None,
+        }
+    }
+
     /// Render as the DynamoDB error JSON body (`{"__type":..,"message":..}`,
     /// plus a `"CancellationReasons"` sibling array when [`Self::reasons`]
     /// is `Some`, ADR 0018's 2026-08-24 `CancellationReasons` amendment).
@@ -1872,7 +1887,7 @@ impl WireError {
             "AccessDeniedException" => "AccessDenied",
             "ProvisionedThroughputExceededException" => "ProvisionedThroughputExceeded",
             "TransactionConflict" | "TransactionConflictException" => "TransactionConflict",
-            "ThrottlingError" => "ThrottlingError",
+            "ThrottlingError" | "ThrottlingException" => "ThrottlingError",
             _ => "InternalServerError",
         }
     }

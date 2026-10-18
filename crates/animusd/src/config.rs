@@ -46,6 +46,26 @@ pub const DEFAULT_MAX_ADMIN_CONNECTIONS: usize = 256;
 /// client-protocol and the intra-cluster listener each. A safety backstop,
 /// far above any real cluster's peer count.
 pub const DEFAULT_MAX_PEER_CONNECTIONS: usize = 16_384;
+/// Default [`OverloadSection::propose_backlog_max_entries`] (ADR 0080
+/// decision 1): per-group appended-but-unapplied entries before a client write
+/// is refused `Busy`.
+pub const DEFAULT_PROPOSE_BACKLOG_MAX_ENTRIES: u64 =
+    animus_cp_data::admission::DEFAULT_BACKLOG_MAX_ENTRIES;
+/// Default [`OverloadSection::propose_backlog_max_bytes`]: 4 MiB per group.
+pub const DEFAULT_PROPOSE_BACKLOG_MAX_BYTES: u64 =
+    animus_cp_data::admission::DEFAULT_BACKLOG_MAX_BYTES;
+/// Default [`OverloadSection::group_inflight_max`] (ADR 0080 decision 2c): one
+/// eighth of the node gate.
+pub const DEFAULT_GROUP_INFLIGHT_MAX: usize = 256;
+/// Default [`OverloadSection::leaderless_wait_ms`] (ADR 0080 decision 2b).
+pub const DEFAULT_LEADERLESS_WAIT_MS: u64 = 2_000;
+/// Default [`OverloadSection::max_forwarded_inflight`] (ADR 0080 decision 2d).
+pub const DEFAULT_MAX_FORWARDED_INFLIGHT: usize = 4096;
+/// Default [`OverloadSection::max_admin_inflight`] (ADR 0080 section 5, 4.7).
+pub const DEFAULT_MAX_ADMIN_INFLIGHT: usize = 32;
+/// Default [`OverloadSection::queued_bytes_budget`] (ADR 0080 section 4):
+/// 256 MiB, on out of the box ("every queue is bounded", ADR 0074).
+pub const DEFAULT_QUEUED_BYTES_BUDGET: u64 = 256 << 20;
 
 /// Per-node resource bounds and overload limits (R-01 sub-track (d), ADR
 /// 0074 §2): every field is `None` = the matching `DEFAULT_MAX_*` constant;
@@ -72,6 +92,37 @@ pub struct OverloadSection {
     /// listeners (peers and the CLI); an excess connection is closed.
     #[serde(default)]
     pub max_peer_connections: Option<usize>,
+    /// ADR 0080 decision 1: per-group appended-but-unapplied entries a leader
+    /// accepts from a client before refusing with `Busy` (lag-scaled). `0`
+    /// disables the entry bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub propose_backlog_max_entries: Option<u64>,
+    /// ADR 0080 decision 1: per-group unapplied payload bytes (lag-scaled,
+    /// capped at one eighth of `queued_bytes_budget`). `0` disables it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub propose_backlog_max_bytes: Option<u64>,
+    /// ADR 0080 decision 2c: requests parked on one tablet on this node (waiting
+    /// for a leader, a forward reply or a confirm) before one more is refused
+    /// `Busy`. `0` disables it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_inflight_max: Option<usize>,
+    /// ADR 0080 decision 2b: how long a request waits for a tablet's leader
+    /// before it is refused at once with `NoLeader`, in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leaderless_wait_ms: Option<u64>,
+    /// ADR 0080 decision 2d: forwarded operations executing at once on this
+    /// node's intra listener.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_forwarded_inflight: Option<usize>,
+    /// ADR 0080 section 5 (4.7): admin handlers executing at once; one more is
+    /// answered `503` at once. `/admin/health`, `/admin/live` and `/metrics`
+    /// are exempt, so a probe never starves behind an expensive admin call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_admin_inflight: Option<usize>,
+    /// ADR 0080 section 4: the node-wide `QueuedBytes` budget, in bytes. `0`
+    /// disables the budget (the per-queue bounds still apply).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_bytes_budget: Option<u64>,
 }
 
 impl OverloadSection {
@@ -85,12 +136,17 @@ impl OverloadSection {
             ("max_inflight_requests", self.max_inflight_requests),
             ("max_admin_connections", self.max_admin_connections),
             ("max_peer_connections", self.max_peer_connections),
+            ("max_forwarded_inflight", self.max_forwarded_inflight),
+            ("max_admin_inflight", self.max_admin_inflight),
         ] {
             if v == Some(0) {
                 return Err(format!(
                     "overload.{name} must be at least 1 (there is no \"unlimited\" setting)"
                 ));
             }
+        }
+        if self.leaderless_wait_ms == Some(0) {
+            return Err("overload.leaderless_wait_ms must be at least 1".to_string());
         }
         Ok(())
     }
@@ -110,6 +166,21 @@ impl OverloadSection {
             max_peer_connections: s
                 .max_peer_connections
                 .unwrap_or(DEFAULT_MAX_PEER_CONNECTIONS),
+            propose_backlog_max_entries: s
+                .propose_backlog_max_entries
+                .unwrap_or(DEFAULT_PROPOSE_BACKLOG_MAX_ENTRIES),
+            propose_backlog_max_bytes: s
+                .propose_backlog_max_bytes
+                .unwrap_or(DEFAULT_PROPOSE_BACKLOG_MAX_BYTES),
+            group_inflight_max: s.group_inflight_max.unwrap_or(DEFAULT_GROUP_INFLIGHT_MAX),
+            leaderless_wait: std::time::Duration::from_millis(
+                s.leaderless_wait_ms.unwrap_or(DEFAULT_LEADERLESS_WAIT_MS),
+            ),
+            max_forwarded_inflight: s
+                .max_forwarded_inflight
+                .unwrap_or(DEFAULT_MAX_FORWARDED_INFLIGHT),
+            max_admin_inflight: s.max_admin_inflight.unwrap_or(DEFAULT_MAX_ADMIN_INFLIGHT),
+            queued_bytes_budget: s.queued_bytes_budget.unwrap_or(DEFAULT_QUEUED_BYTES_BUDGET),
         }
     }
 }
@@ -125,6 +196,31 @@ pub struct ResolvedLimits {
     pub max_admin_connections: usize,
     /// See [`OverloadSection::max_peer_connections`].
     pub max_peer_connections: usize,
+    /// See [`OverloadSection::propose_backlog_max_entries`] (`0` = off).
+    pub propose_backlog_max_entries: u64,
+    /// See [`OverloadSection::propose_backlog_max_bytes`] (`0` = off).
+    pub propose_backlog_max_bytes: u64,
+    /// See [`OverloadSection::group_inflight_max`] (`0` = off).
+    pub group_inflight_max: usize,
+    /// See [`OverloadSection::leaderless_wait_ms`].
+    pub leaderless_wait: std::time::Duration,
+    /// See [`OverloadSection::max_forwarded_inflight`].
+    pub max_forwarded_inflight: usize,
+    /// See [`OverloadSection::max_admin_inflight`].
+    pub max_admin_inflight: usize,
+    /// See [`OverloadSection::queued_bytes_budget`] (`0` = off).
+    pub queued_bytes_budget: u64,
+}
+
+impl ResolvedLimits {
+    /// The propose-bound limits for `animus-cp-data` (ADR 0080 decision 1).
+    #[must_use]
+    pub fn backlog_limits(&self) -> animus_cp_data::admission::BacklogLimits {
+        animus_cp_data::admission::BacklogLimits {
+            max_entries: self.propose_backlog_max_entries,
+            max_bytes: self.propose_backlog_max_bytes,
+        }
+    }
 }
 
 impl Default for ResolvedLimits {

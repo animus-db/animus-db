@@ -233,6 +233,16 @@ struct Inner {
     /// head-of-line blocking *across* peers.
     #[allow(clippy::type_complexity)]
     conns: Arc<StdMutex<BTreeMap<String, Arc<Mutex<Option<MaybeTlsStream>>>>>>,
+    /// ADR 0080 section 3: one bounded, prioritised outbox per destination
+    /// address, drained by one control writer and one bulk writer task. Keyed
+    /// like `conns`. Replaces one spawned task per frame.
+    outboxes: StdMutex<BTreeMap<String, Arc<PeerOut>>>,
+    /// The node `QueuedBytes` budget the outboxes charge (unlimited until
+    /// [`ProdEnv::set_queued_bytes`] installs the node's).
+    queued: StdMutex<crate::QueuedBytes>,
+    /// Sends since start, to publish the `transport_outbox_bytes` gauge every
+    /// so often rather than on each one.
+    sends: AtomicU64,
     /// This node's intra-wire TLS material (ADR 0064), or `None` for plain
     /// TCP — the default, and the only mode this crate had before this ADR.
     /// Shared (not per-connection) since every accept/dial this env performs
@@ -446,6 +456,9 @@ impl ProdEnv {
                 peers: Arc::new(StdMutex::new(BTreeMap::new())),
                 local_addr,
                 conns: Arc::new(StdMutex::new(BTreeMap::new())),
+                outboxes: StdMutex::new(BTreeMap::new()),
+                queued: StdMutex::new(crate::QueuedBytes::unlimited()),
+                sends: AtomicU64::new(0),
                 tls,
                 disk,
                 demux,
@@ -825,7 +838,7 @@ fn check_frame_len(what: &str, len: usize, max: usize) -> std::io::Result<()> {
 /// handshake is a connection-setup step, not a per-frame one.
 async fn read_frames<S: AsyncRead + Unpin>(
     mut stream: S,
-    tx: mpsc::UnboundedSender<Envelope>,
+    tx: mpsc::Sender<Envelope>,
     peer_ext: Arc<[u8]>,
     hs: Arc<HandshakeCfg>,
     metrics: MetricsHandle,
@@ -861,6 +874,9 @@ async fn read_frames<S: AsyncRead + Unpin>(
                 handshake::HandshakeError::Phase1Peer,
             ));
         }
+        // ADR 0080 section 3: the channel is bounded, so a pump that falls
+        // behind stops this connection reading (TCP flow control pushes back on
+        // the sender) instead of buffering without limit.
         if tx
             .send(Envelope {
                 from,
@@ -868,6 +884,7 @@ async fn read_frames<S: AsyncRead + Unpin>(
                 payload,
                 peer_ext: Arc::clone(&peer_ext),
             })
+            .await
             .is_err()
         {
             return Ok(()); // receiver gone; node shutting down
@@ -888,7 +905,7 @@ async fn read_frames<S: AsyncRead + Unpin>(
 /// would just reproduce the exact unbounded-growth defect closing the
 /// stream exists to fix.
 fn spawn_pump(
-    mut raw_rx: mpsc::UnboundedReceiver<Envelope>,
+    mut raw_rx: mpsc::Receiver<Envelope>,
     demux: Arc<StdMutex<Demux>>,
     metrics: MetricsHandle,
 ) -> tokio::task::AbortHandle {
@@ -1128,6 +1145,22 @@ impl Rng for ProdClockRng {
 #[async_trait::async_trait]
 impl Network for ProdEnv {
     async fn send_stream(&self, to: NodeId, stream: u64, payload: Vec<u8>) {
+        self.send_stream_classed(to, stream, crate::MsgClass::Normal, None, payload)
+            .await;
+    }
+
+    /// Queue `payload` on the destination's [`PeerOutbox`] (ADR 0080 section
+    /// 3) and return; a per-peer writer task drains it. A `Bulk` frame waits
+    /// (at most [`SEND_TIMEOUT`]) for credit instead of being queued past its
+    /// bound; every other class is bounded by dropping the oldest.
+    async fn send_stream_classed(
+        &self,
+        to: NodeId,
+        stream: u64,
+        class: crate::MsgClass,
+        supersede: Option<u64>,
+        payload: Vec<u8>,
+    ) {
         let addr = {
             let peers = self.inner.peers.lock().expect("peers poisoned");
             match peers.get(&to) {
@@ -1150,83 +1183,57 @@ impl Network for ProdEnv {
                 }
             }
         };
-        // Fire-and-forget semantics: a transport error is the network dropping
-        // the message, not an error to the caller (see `Network::send`).
-        let from = self.inner.node_id.clone();
-        // Grab (or create) this address's connection slot. The map lock is a
-        // `StdMutex` and must not be held across an `.await` — clone the
-        // per-address `Arc` out and drop the guard before any I/O.
-        let slot = {
-            let mut conns = self.inner.conns.lock().expect("conns poisoned");
-            Arc::clone(conns.entry(addr.clone()).or_default())
-        };
-        let tls = self.inner.tls.clone();
-        let metrics = self.inner.metrics.clone();
-        let hs = Arc::clone(&self.inner.hs);
-        // Issue #661: run the actual connect+write on its own task, bounded by
-        // `SEND_TIMEOUT`, instead of inline on this `.await` — see
-        // `SEND_TIMEOUT`'s own doc for why a caller (most importantly a Raft
-        // driver's own outbound-dispatch loop, which awaits one peer at a time)
-        // must never be made to depend on this *particular* peer's own
-        // reachability: a raw `TcpStream::connect`/write against a silently
-        // unreachable address (no RST — e.g. a Kubernetes pod's collapsed
-        // network endpoint after a hard restart) can otherwise ride the OS's
-        // own multi-minute TCP retry timeout, during which every other peer
-        // queued behind it in the same loop gets nothing at all.
-        self.spawn(Box::pin(async move {
-            match tokio::time::timeout(
-                SEND_TIMEOUT,
-                send_frame_pooled(
-                    &slot,
-                    &addr,
-                    &from,
-                    stream,
-                    &payload,
-                    DialCtx {
-                        tls: tls.as_ref(),
-                        metrics: &metrics,
-                        hs: &hs,
-                    },
-                ),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => {
-                    tracing::debug!(?err, to = %to, %addr, "send failed (dropped)");
+        let len = payload.len();
+        let mut frame = Some(crate::OutFrame::new(stream, class, supersede, payload));
+        // A `Bulk` producer waits for credit, but never longer than one send
+        // timeout: the caller may be a consensus loop, which must not be
+        // parked behind a stalled peer for good.
+        let deadline = tokio::time::Instant::now() + SEND_TIMEOUT;
+        loop {
+            let po = self.peer_out(&addr);
+            let credit = po.credit.notified();
+            let report = {
+                let mut ob = po.outbox.lock().expect("outbox poisoned");
+                if po.closed.load(Ordering::Acquire) {
+                    None // the idle writer just retired this entry: look it up afresh
+                } else if class == crate::MsgClass::Bulk && !ob.bulk_credit(len) {
+                    Some(Err(()))
+                } else {
+                    Some(Ok(ob.push(frame.take().expect("frame is queued once"))))
                 }
-                Err(_elapsed) => {
-                    // Deliberately does NOT drop the cached connection here
-                    // (issue #924 investigation): a `SEND_TIMEOUT` elapsing
-                    // means only "this one send didn't finish in 2s" — under
-                    // real host contention (a busy CI box, a CPU-starved
-                    // node) that is routinely just scheduling latency on an
-                    // otherwise perfectly healthy connection, not evidence
-                    // the peer is unreachable. An earlier version of this
-                    // fix cleared the slot unconditionally on timeout too,
-                    // reasoning that a spurious reconnect "only costs one
-                    // extra handshake" — that reasoning was wrong under
-                    // *sustained* contention: discarding a warm connection
-                    // forces the *next* chunk to pay a fresh connect, which
-                    // can itself exceed `SEND_TIMEOUT` under the same load,
-                    // repeating forever and turning transient slowness into
-                    // total, permanent lack of progress (caught by this
-                    // crate's own `large_metadata_catch_up_stays_live`
-                    // sibling in `animus-control`, a ~1100-chunk streaming
-                    // `InstallSnapshot` that went from "slow" to "zero bytes
-                    // ever delivered" under exactly this change on a loaded
-                    // box). The actually-dead-peer case this bound exists
-                    // for is already covered by `POOLED_SOCKET_DEAD_PEER_
-                    // TIMEOUT`'s keepalive/`TCP_USER_TIMEOUT`, which surface
-                    // as a genuine write **error** (the `Ok(Err(err))` arm
-                    // above, which does drop the slot) well within this
-                    // 2s bound in the ordinary case — see that constant's
-                    // own doc. See `docs/lessons/code-patterns/` for the
-                    // general form of this lesson.
-                    tracing::debug!(to = %to, %addr, "send timed out (dropped)");
+            };
+            match report {
+                None => continue,
+                Some(Ok(r)) => {
+                    let dropped = (r.evicted + usize::from(r.superseded)) as u64;
+                    if dropped > 0 {
+                        self.inner
+                            .metrics
+                            .incr_by(outbox_dropped_metric(class), dropped);
+                    }
+                    if class == crate::MsgClass::Bulk {
+                        po.bulk_wake.notify_one();
+                    } else {
+                        po.control_wake.notify_one();
+                    }
+                    if self
+                        .inner
+                        .sends
+                        .fetch_add(1, Ordering::Relaxed)
+                        .is_multiple_of(64)
+                    {
+                        self.publish_outbox_gauges();
+                    }
+                    return;
+                }
+                Some(Err(())) => {
+                    if tokio::time::timeout_at(deadline, credit).await.is_err() {
+                        tracing::debug!(to = %to, %addr, "bulk send found no credit (dropped)");
+                        return;
+                    }
                 }
             }
-        }));
+        }
     }
 
     async fn recv_stream(&self, stream: u64) -> Envelope {
@@ -1335,6 +1342,11 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(10);
 /// multi-minute default — see `docs/engineering-lessons.md`'s matching
 /// entry for the incident this closes.
 const SEND_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Frames the accept loop's raw channel holds before connection readers stop
+/// reading (ADR 0080 section 3). Sized well above a healthy pump's backlog; the
+/// point is that it is finite.
+const ACCEPT_CHANNEL_CAP: usize = 16_384;
 
 /// The minimum number of completed-but-unswept tasks before `maybe_sweep`
 /// sweeps `Inner::tasks` (see that field's doc, issue #1105): the sweep
@@ -1823,8 +1835,8 @@ fn spawn_accept(
     tls: Option<TlsMaterial>,
     metrics: MetricsHandle,
     hs: Arc<HandshakeCfg>,
-) -> (mpsc::UnboundedReceiver<Envelope>, tokio::task::AbortHandle) {
-    let (tx, rx) = mpsc::unbounded_channel();
+) -> (mpsc::Receiver<Envelope>, tokio::task::AbortHandle) {
+    let (tx, rx) = mpsc::channel(ACCEPT_CHANNEL_CAP);
     let accept = tokio::spawn(async move {
         loop {
             match listener.accept().await {
@@ -2641,6 +2653,200 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
         s.clone()
     } else {
         "<non-string panic payload>".to_string()
+    }
+}
+
+/// One destination's outbox and its wake-ups (ADR 0080 section 3).
+struct PeerOut {
+    outbox: StdMutex<crate::PeerOutbox>,
+    /// A frame was queued for the control connection.
+    control_wake: tokio::sync::Notify,
+    /// A frame was queued for the bulk connection (or the entry closed).
+    bulk_wake: tokio::sync::Notify,
+    /// Bulk credit returned.
+    credit: tokio::sync::Notify,
+    /// Retired by its idle writer; producers look the entry up again.
+    closed: AtomicBool,
+}
+
+/// An idle outbox (nothing queued) retires its writers after this long.
+const OUTBOX_IDLE: Duration = Duration::from_secs(60);
+
+fn outbox_dropped_metric(class: crate::MsgClass) -> Metric {
+    match class {
+        crate::MsgClass::Vote => Metric::TransportOutboxDroppedVote,
+        crate::MsgClass::Heartbeat => Metric::TransportOutboxDroppedHeartbeat,
+        crate::MsgClass::Replicate | crate::MsgClass::Normal | crate::MsgClass::Bulk => {
+            Metric::TransportOutboxDroppedReplicate
+        }
+    }
+}
+
+impl ProdEnv {
+    /// Charge the outboxes this env creates from now on against `budget`
+    /// (ADR 0080 section 4). Existing outboxes keep the budget they were made
+    /// with, so call this before traffic starts.
+    pub fn set_queued_bytes(&self, budget: crate::QueuedBytes) {
+        *self.inner.queued.lock().expect("queued poisoned") = budget;
+    }
+
+    /// Frames and bytes queued across every peer outbox, and the peer count
+    /// (test and admin visibility).
+    #[must_use]
+    pub fn outbox_stats(&self) -> (usize, usize, usize) {
+        let map = self.inner.outboxes.lock().expect("outboxes poisoned");
+        let (mut frames, mut bytes) = (0, 0);
+        for po in map.values() {
+            let ob = po.outbox.lock().expect("outbox poisoned");
+            frames += ob.control_len() + ob.bulk_len();
+            bytes += ob.bytes();
+        }
+        (map.len(), frames, bytes)
+    }
+
+    fn publish_outbox_gauges(&self) {
+        let (peers, _frames, bytes) = self.outbox_stats();
+        self.inner
+            .metrics
+            .set(Metric::TransportOutboxPeers, peers as u64);
+        self.inner
+            .metrics
+            .set(Metric::TransportOutboxBytes, bytes as u64);
+    }
+
+    /// The outbox for `addr`, creating it (and its two writer tasks) on first
+    /// use.
+    fn peer_out(&self, addr: &str) -> Arc<PeerOut> {
+        let (po, control_slot, fresh) = {
+            let mut map = self.inner.outboxes.lock().expect("outboxes poisoned");
+            if let Some(po) = map.get(addr)
+                && !po.closed.load(Ordering::Acquire)
+            {
+                return Arc::clone(po);
+            }
+            let budget = self.inner.queued.lock().expect("queued poisoned").clone();
+            let po = Arc::new(PeerOut {
+                outbox: StdMutex::new(
+                    crate::PeerOutbox::new(crate::OutboxLimits::default()).with_budget(budget),
+                ),
+                control_wake: tokio::sync::Notify::new(),
+                bulk_wake: tokio::sync::Notify::new(),
+                credit: tokio::sync::Notify::new(),
+                closed: AtomicBool::new(false),
+            });
+            map.insert(addr.to_owned(), Arc::clone(&po));
+            let slot = {
+                let mut conns = self.inner.conns.lock().expect("conns poisoned");
+                Arc::clone(conns.entry(addr.to_owned()).or_default())
+            };
+            (po, slot, true)
+        };
+        if fresh {
+            let bulk_slot: Arc<Mutex<Option<MaybeTlsStream>>> = Arc::default();
+            let w = WriterCtx {
+                inner: Arc::clone(&self.inner),
+                po: Arc::clone(&po),
+                addr: addr.to_owned(),
+            };
+            self.spawn(Box::pin(run_control_writer(w.clone(), control_slot)));
+            self.spawn(Box::pin(run_bulk_writer(w, bulk_slot)));
+        }
+        po
+    }
+}
+
+#[derive(Clone)]
+struct WriterCtx {
+    inner: Arc<Inner>,
+    po: Arc<PeerOut>,
+    addr: String,
+}
+
+/// Send one dequeued frame, bounded by [`SEND_TIMEOUT`] (the old per-frame
+/// task's body, issues #661 and #924 — see the comments on the timeout arm).
+async fn write_one(w: &WriterCtx, slot: &Mutex<Option<MaybeTlsStream>>, frame: crate::OutFrame) {
+    let from = w.inner.node_id.clone();
+    match tokio::time::timeout(
+        SEND_TIMEOUT,
+        send_frame_pooled(
+            slot,
+            &w.addr,
+            &from,
+            frame.stream,
+            &frame.payload,
+            DialCtx {
+                tls: w.inner.tls.as_ref(),
+                metrics: &w.inner.metrics,
+                hs: &w.inner.hs,
+            },
+        ),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            tracing::debug!(?err, addr = %w.addr, "send failed (dropped)");
+        }
+        Err(_elapsed) => {
+            // Deliberately does NOT drop the cached connection (issue #924): a
+            // timeout is routinely scheduling latency on a healthy connection;
+            // a genuinely dead peer surfaces as a write error via
+            // `POOLED_SOCKET_DEAD_PEER_TIMEOUT`'s keepalive.
+            tracing::debug!(addr = %w.addr, "send timed out (dropped)");
+        }
+    }
+}
+
+async fn run_control_writer(w: WriterCtx, slot: Arc<Mutex<Option<MaybeTlsStream>>>) {
+    loop {
+        let wake = w.po.control_wake.notified();
+        let frame = w.po.outbox.lock().expect("outbox poisoned").pop_control();
+        match frame {
+            Some(frame) => write_one(&w, &slot, frame).await,
+            None => {
+                if tokio::time::timeout(OUTBOX_IDLE, wake).await.is_err() {
+                    let retire = {
+                        let ob = w.po.outbox.lock().expect("outbox poisoned");
+                        if ob.is_empty() {
+                            w.po.closed.store(true, Ordering::Release);
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if retire {
+                        let mut map = w.inner.outboxes.lock().expect("outboxes poisoned");
+                        if map.get(&w.addr).is_some_and(|p| Arc::ptr_eq(p, &w.po)) {
+                            map.remove(&w.addr);
+                        }
+                        drop(map);
+                        w.po.bulk_wake.notify_one();
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn run_bulk_writer(w: WriterCtx, slot: Arc<Mutex<Option<MaybeTlsStream>>>) {
+    loop {
+        let wake = w.po.bulk_wake.notified();
+        let frame = w.po.outbox.lock().expect("outbox poisoned").pop_bulk();
+        match frame {
+            Some(frame) => {
+                // The credit returns when the frame leaves the queue, not when
+                // the write completes: the bound is on what is *queued*.
+                w.po.credit.notify_waiters();
+                write_one(&w, &slot, frame).await;
+            }
+            None => {
+                if w.po.closed.load(Ordering::Acquire) {
+                    return;
+                }
+                wake.await;
+            }
+        }
     }
 }
 
@@ -5721,7 +5927,7 @@ mod tests {
         use tokio::io::AsyncWriteExt;
         let (mut client, server) = tokio::io::duplex(64 * 1024);
         client.write_all(&header).await.unwrap();
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(8);
         let res = tokio::time::timeout(
             Duration::from_secs(5),
             read_frames(
@@ -5777,7 +5983,7 @@ mod tests {
         h.extend_from_slice(b"abc");
         client.write_all(&h).await.unwrap();
         drop(client); // EOF after the one frame
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(8);
         read_frames(
             server,
             tx,

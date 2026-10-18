@@ -349,7 +349,7 @@ fn otel_instance_label(args: &[String]) -> String {
 const USAGE: &str = "usage:\n  \
     animusd gen-config --nodes N [--host H] [--base-port P] [--region NAME] [--peer REGION=host:port[,..]]... [--allow-insecure-peers] [--mrec-max-clock-skew-ms MS]\n  \
     animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P]\n  \
-    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--max-region-rtt-ms MS] [--campaign-max-inflight N] [--lag-stretch-max N] [--host-unsettled-max N] [--host-settle-timeout-ms MS] [--node-weight N] [--node-max-replicas N] [--cores N] [--awake-max-per-core N] [--bg-snapshot-streams N] [--bg-catchup-learners N] [--bg-splits N] [--bg-compactions N] [--region NAME] [--peer REGION=host:port[,host:port...]]... [--allow-insecure-peers] [--mrec-max-clock-skew-ms MS] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH] [--encryption-key PATH]\n  \
+    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--max-region-rtt-ms MS] [--campaign-max-inflight N] [--lag-stretch-max N] [--host-unsettled-max N] [--host-settle-timeout-ms MS] [--node-weight N] [--node-max-replicas N] [--cores N] [--awake-max-per-core N] [--bg-snapshot-streams N] [--bg-catchup-learners N] [--bg-splits N] [--bg-compactions N] [--region NAME] [--peer REGION=host:port[,host:port...]]... [--allow-insecure-peers] [--mrec-max-clock-skew-ms MS] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH] [--encryption-key PATH] [--max-connections N] [--max-inflight N] [--queued-bytes-budget BYTES]\n  \
     animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] [--encryption-key PATH]\n  \
     animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--dynamo-auth PATH]\n  \
     animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral] [--advertise-host NAME] [--label K=V]... [--labels-file PATH [--labels-file-annotations]] [--labels-wait-secs N] [--encryption-key PATH] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3]\n  \
@@ -687,6 +687,9 @@ async fn run(args: &[String]) -> Result<(), String> {
     // `animusd::config::OverloadSection`. Omitted: the documented defaults.
     let mut max_connections: Option<usize> = None;
     let mut max_inflight: Option<usize> = None;
+    // `--queued-bytes-budget BYTES` (ADR 0080 section 4): the node-wide
+    // `QueuedBytes` budget; `0` is unlimited.
+    let mut queued_bytes_budget: Option<u64> = None;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -858,6 +861,9 @@ async fn run(args: &[String]) -> Result<(), String> {
             "--max-connections" => {
                 max_connections = Some(parse_next(&mut it, "--max-connections")?);
             }
+            "--queued-bytes-budget" => {
+                queued_bytes_budget = Some(parse_next(&mut it, "--queued-bytes-budget")?);
+            }
             "--max-inflight" => {
                 max_inflight = Some(parse_next(&mut it, "--max-inflight")?);
             }
@@ -865,7 +871,7 @@ async fn run(args: &[String]) -> Result<(), String> {
         }
     }
     let tls_flag = resolve_tls_flags(tls_cert, tls_key, tls_ca)?;
-    let overload_flag = resolve_overload_flags(max_connections, max_inflight)?;
+    let overload_flag = resolve_overload_flags(max_connections, max_inflight, queued_bytes_budget)?;
     // S-06: the raw (un-defaulted) CLI values for every knob
     // `animusd::config::ClusterSettings` can also carry in a config file's
     // own `cluster_settings` section — `--config`/`--node`'s dispatch below
@@ -1899,13 +1905,15 @@ fn resolve_tls_flags(
 fn resolve_overload_flags(
     max_connections: Option<usize>,
     max_inflight: Option<usize>,
+    queued_bytes_budget: Option<u64>,
 ) -> Result<Option<animusd::config::OverloadSection>, String> {
-    if max_connections.is_none() && max_inflight.is_none() {
+    if max_connections.is_none() && max_inflight.is_none() && queued_bytes_budget.is_none() {
         return Ok(None);
     }
     let section = animusd::config::OverloadSection {
         max_connections,
         max_inflight_requests: max_inflight,
+        queued_bytes_budget,
         ..Default::default()
     };
     section.validate()?;
@@ -1949,6 +1957,16 @@ fn apply_overload_flag(
             (None, Some(v)) => *file = Some(v),
             _ => {}
         }
+    }
+    match (merged.queued_bytes_budget, flag.queued_bytes_budget) {
+        (Some(_), Some(_)) => {
+            return Err(format!(
+                "node {index}'s overload.queued_bytes_budget is set both in the config file and \
+                 via a flag — specify it one way, not both"
+            ));
+        }
+        (None, Some(v)) => merged.queued_bytes_budget = Some(v),
+        _ => {}
     }
     Ok(())
 }
@@ -2651,6 +2669,9 @@ async fn run_data(args: &[String]) -> Result<(), String> {
     // `animusd::config::OverloadSection`. Omitted: the documented defaults.
     let mut max_connections: Option<usize> = None;
     let mut max_inflight: Option<usize> = None;
+    // `--queued-bytes-budget BYTES` (ADR 0080 section 4): the node-wide
+    // `QueuedBytes` budget; `0` is unlimited.
+    let mut queued_bytes_budget: Option<u64> = None;
     // `--quiesce-after SECS` / `--heartbeat-batch`/`--no-heartbeat-batch` /
     // `--shared-wal`/`--no-shared-wal` (issue #676): threaded onto
     // `data --seed`, the same data-plane knobs `--config`/`--node` and
@@ -2707,6 +2728,9 @@ async fn run_data(args: &[String]) -> Result<(), String> {
             "--max-connections" => {
                 max_connections = Some(parse_next(&mut it, "--max-connections")?);
             }
+            "--queued-bytes-budget" => {
+                queued_bytes_budget = Some(parse_next(&mut it, "--queued-bytes-budget")?);
+            }
             "--max-inflight" => {
                 max_inflight = Some(parse_next(&mut it, "--max-inflight")?);
             }
@@ -2735,7 +2759,7 @@ async fn run_data(args: &[String]) -> Result<(), String> {
         .map(load_dynamo_auth_file)
         .transpose()?;
     let tls_flag = resolve_tls_flags(tls_cert, tls_key, tls_ca)?;
-    let overload_flag = resolve_overload_flags(max_connections, max_inflight)?;
+    let overload_flag = resolve_overload_flags(max_connections, max_inflight, queued_bytes_budget)?;
 
     match (config_path, seed_arg) {
         (Some(_), Some(_)) => Err("use either --config or --seed, not both".into()),
@@ -3043,6 +3067,9 @@ async fn run_join(args: &[String]) -> Result<(), String> {
     // `animusd::config::OverloadSection`. Omitted: the documented defaults.
     let mut max_connections: Option<usize> = None;
     let mut max_inflight: Option<usize> = None;
+    // `--queued-bytes-budget BYTES` (ADR 0080 section 4): the node-wide
+    // `QueuedBytes` budget; `0` is unlimited.
+    let mut queued_bytes_budget: Option<u64> = None;
     // `--quiesce-after SECS` / `--heartbeat-batch`/`--no-heartbeat-batch` /
     // `--shared-wal`/`--no-shared-wal` (issue #676): the same data-plane
     // knobs `--config`/`--node` and `--cluster N` already resolve, threaded
@@ -3087,6 +3114,9 @@ async fn run_join(args: &[String]) -> Result<(), String> {
             }
             "--max-connections" => {
                 max_connections = Some(parse_next(&mut it, "--max-connections")?);
+            }
+            "--queued-bytes-budget" => {
+                queued_bytes_budget = Some(parse_next(&mut it, "--queued-bytes-budget")?);
             }
             "--max-inflight" => {
                 max_inflight = Some(parse_next(&mut it, "--max-inflight")?);
@@ -3143,7 +3173,7 @@ async fn run_join(args: &[String]) -> Result<(), String> {
 
     let labels = label_flags.resolve(&BTreeMap::new()).await?;
     let p = |role: u16| SocketAddr::new(ip, base_port.wrapping_add(role));
-    let overload_flag = resolve_overload_flags(max_connections, max_inflight)?;
+    let overload_flag = resolve_overload_flags(max_connections, max_inflight, queued_bytes_budget)?;
     let addrs = RoleAddrs {
         // Unread placeholder: `Node::bind` takes the real (proposed or
         // self-minted) id as its own separate argument, never `addrs.id` —
@@ -3583,6 +3613,17 @@ fn orphan_sweep_after_duration(secs: Option<u64>) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queued_bytes_budget_flag_builds_a_section_and_conflicts_with_the_file() {
+        assert!(resolve_overload_flags(None, None, None).unwrap().is_none());
+        let flag = resolve_overload_flags(None, None, Some(1 << 20))
+            .unwrap()
+            .expect("a section");
+        assert_eq!(flag.queued_bytes_budget, Some(1 << 20));
+        // `0` is accepted: unlimited (counted, never refused).
+        assert!(resolve_overload_flags(None, None, Some(0)).is_ok());
+    }
 
     // --- `resolve_cluster_data_dir` (this fix) --------------------------
 
