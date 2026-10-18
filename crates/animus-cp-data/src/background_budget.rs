@@ -286,8 +286,10 @@ impl Shared {
 
     fn publish_io(&self, st: &State) {
         if st.io.is_on() {
-            self.metrics
-                .set(Metric::StorageCompactionIoRate, st.io.effective_rate(st.lag));
+            self.metrics.set(
+                Metric::StorageCompactionIoRate,
+                st.io.effective_rate(st.lag),
+            );
             self.metrics
                 .set(Metric::StorageCompactionIoDebtBytes, st.io.debt_bytes());
         }
@@ -641,7 +643,6 @@ impl animus_storage::CompactionGate for EngineCompactionGate {
     fn io_charge(&self, bytes: u64) {
         self.budget.compaction_io_charge((self.now)(), bytes);
     }
-
 }
 
 /// A held slot; dropping it returns the slot.

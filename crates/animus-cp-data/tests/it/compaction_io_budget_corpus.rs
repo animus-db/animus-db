@@ -295,14 +295,18 @@ fn cell7(seed: u64, fault: StallFault) -> (Result<(), String>, Rig, u64) {
         let bound = rate * secs + rate + r.meter.max_est.load(Ordering::Relaxed);
         let got = r.meter.nonurgent_est.load(Ordering::Relaxed);
         if got > bound {
-            return Err(format!("non-urgent bytes {got} exceed the budget bound {bound}"));
+            return Err(format!(
+                "non-urgent bytes {got} exceed the budget bound {bound}"
+            ));
         }
         // An urgent engine is never delayed by the debt of the others: no
         // urgent request was ever deferred, and L0 never climbed past the
         // urgent level plus the in-flight slack.
         let deferred_urgent = r.meter.urgent_deferred.load(Ordering::Relaxed);
         if deferred_urgent > 0 {
-            return Err(format!("{deferred_urgent} urgent compactions were deferred"));
+            return Err(format!(
+                "{deferred_urgent} urgent compactions were deferred"
+            ));
         }
         let slack = URGENT_L0 + 2;
         if obs.l0_hwm > slack {
@@ -585,6 +589,9 @@ fn cell10_the_effective_rate_follows_lag_and_never_drops_below_the_floor() {
 fn a_zero_rate_is_off_and_installs_no_gate_without_the_pool() {
     let b = BackgroundBudget::new(BudgetSizes::off(), MetricsHandle::recording());
     assert!(!b.compaction_io_on());
-    assert!(b.compaction_gate(Arc::new(|| animus_env::Nanos(0))).is_none());
+    assert!(
+        b.compaction_gate(Arc::new(|| animus_env::Nanos(0)))
+            .is_none()
+    );
     assert!(b.compaction_io_admit(animus_env::Nanos(0), u64::MAX, false));
 }
