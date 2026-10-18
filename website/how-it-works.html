@@ -3,18 +3,18 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>How a self-hosted DynamoDB alternative works — AnimusDB</title>
+<title>How a self-hosted DynamoDB alternative works: AnimusDB</title>
 <meta name="description" content="The whole system on one page: DynamoDB compatibility, the two-plane Raft architecture, deterministic simulation testing, the cost model, and how you run it.">
 <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
 <link rel="canonical" href="https://animusdb.io/how-it-works.html">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://animusdb.io/how-it-works.html">
-<meta property="og:title" content="How a self-hosted DynamoDB alternative works — AnimusDB">
+<meta property="og:title" content="How a self-hosted DynamoDB alternative works: AnimusDB">
 <meta property="og:description" content="The whole system on one page: DynamoDB compatibility, the two-plane Raft architecture, deterministic simulation testing, the cost model, and how you run it.">
 <meta property="og:image" content="https://animusdb.io/assets/og-card.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
-<meta property="og:image:alt" content="AnimusDB — the DynamoDB API on infrastructure you own">
+<meta property="og:image:alt" content="AnimusDB: the DynamoDB API on infrastructure you own">
 <meta name="twitter:card" content="summary_large_image">
 <link rel="stylesheet" href="assets/tokens.css">
 <link rel="stylesheet" href="assets/site.css">
@@ -23,14 +23,10 @@
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
 
-<div class="banner">
-  <b>Pre-alpha</b> — not ready for production data. <a href="index.html#status">Where it stands →</a>
-</div>
-
 <header class="site">
   <div class="wrap bar">
     <a class="brand" href="index.html">
-      <svg width="36" height="36" viewBox="-43 -43 86 86" aria-hidden="true">
+      <svg width="32" height="32" viewBox="-43 -43 86 86" aria-hidden="true">
         <circle cx="-26.14" cy="-15.09" r="2.4" fill="oklch(0.780 0.012 250.0)"></circle>
         <circle cx="-26.14" cy="0" r="3.04" fill="oklch(0.754 0.033 250.6)"></circle>
         <circle cx="-26.14" cy="15.09" r="2.4" fill="oklch(0.780 0.012 250.0)"></circle>
@@ -53,29 +49,31 @@
       </svg>
       AnimusDB
     </a>
-    <nav class="main">
-      <a href="index.html">Overview</a>
-      <a href="how-it-works.html" class="here" aria-current="page">How it works</a>
-      <a href="docs.html">Docs</a>
-      <a href="install.html">Install</a>
-      <a href="https://github.com/animus-db/animus-db">GitHub</a>
-    </nav>
-    <div class="theme-switch" role="group" aria-label="Theme">
-      <button type="button" data-theme-choice="light" aria-pressed="false" aria-label="Light theme">
-        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-          <circle cx="8" cy="8" r="3.2"/><path d="M8 .8v2M8 13.2v2M.8 8h2M13.2 8h2M2.9 2.9l1.4 1.4M11.7 11.7l1.4 1.4M13.1 2.9l-1.4 1.4M4.3 11.7l-1.4 1.4"/>
-        </svg>
-      </button>
-      <button type="button" data-theme-choice="dark" aria-pressed="false" aria-label="Dark theme">
-        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-          <path d="M13.2 9.1A5.6 5.6 0 1 1 6.9 2.8a4.4 4.4 0 0 0 6.3 6.3Z"/>
-        </svg>
-      </button>
-      <button type="button" data-theme-choice="system" aria-pressed="false" aria-label="System theme">
-        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-          <rect x="1.6" y="2.6" width="12.8" height="8.6" rx="1.4"/><path d="M5.6 14h4.8M8 11.2v2.8"/>
-        </svg>
-      </button>
+    <div class="head-right">
+      <nav class="main" aria-label="Main">
+        <a href="how-it-works.html" class="here" aria-current="page">How it works</a>
+        <a href="docs.html">Docs</a>
+        <a href="compatibility.html">Compatibility</a>
+        <a href="https://github.com/animus-db/animus-db">GitHub</a>
+        <a class="nav-cta" href="install.html">Install</a>
+      </nav>
+      <div class="theme-switch" role="group" aria-label="Theme">
+        <button type="button" data-theme-choice="light" aria-pressed="false" aria-label="Light theme">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+            <circle cx="8" cy="8" r="3.2"/><path d="M8 .8v2M8 13.2v2M.8 8h2M13.2 8h2M2.9 2.9l1.4 1.4M11.7 11.7l1.4 1.4M13.1 2.9l-1.4 1.4M4.3 11.7l-1.4 1.4"/>
+          </svg>
+        </button>
+        <button type="button" data-theme-choice="dark" aria-pressed="false" aria-label="Dark theme">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M13.2 9.1A5.6 5.6 0 1 1 6.9 2.8a4.4 4.4 0 0 0 6.3 6.3Z"/>
+          </svg>
+        </button>
+        <button type="button" data-theme-choice="system" aria-pressed="false" aria-label="System theme">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+            <rect x="1.6" y="2.6" width="12.8" height="8.6" rx="1.4"/><path d="M5.6 14h4.8M8 11.2v2.8"/>
+          </svg>
+        </button>
+      </div>
     </div>
   </div>
 </header>
@@ -83,10 +81,9 @@
 <main id="main">
 
 <div class="wrap ref-head rh-40">
-  <span class="kicker">How it works</span>
   <h1>The whole system, on one page.</h1>
   <p class="page-lede page-lede-lg mb-22">What it's compatible with, how it's built, how it's tested, what it costs you in round trips, and how you run it. Each section stops where the reference page begins.</p>
-  <span class="kicker mb-8">On this page</span>
+  <p class="toc-title">On this page</p>
   <ol class="toc">
     <li><a href="#api">It speaks DynamoDB</a></li>
     <li><a href="#raft">It's built out of ordinary Raft groups</a></li>
@@ -99,10 +96,8 @@
 
 <section class="alt" id="api">
   <div class="wrap">
-    <span class="kicker">Compatibility</span>
     <h2>It speaks DynamoDB, so your SDK doesn't know the difference.</h2>
     <div class="plate mw-560 plate-inset">
-      <div class="head"><span class="t">the entire integration</span><span class="ext">diff</span></div>
       <div class="body">
         <div class="cl dm">- endpoint: dynamodb.eu-west-1.amazonaws.com</div>
         <div class="cl dp">+ endpoint: animus.internal:7102</div>
@@ -110,13 +105,12 @@
     </div>
     <p class="body-text">Tables of items addressed by a partition key and an optional sort key, with schemaless attributes — the model you already design for. <strong>Working today:</strong> <code>PutItem</code>, <code>GetItem</code>, <code>UpdateItem</code>, <code>DeleteItem</code> with condition and update expressions; <code>Query</code> and <code>Scan</code> with filters, pagination and index queries; the batch operations; transactions; secondary indexes added and dropped online with backfill; streams; TTL.</p>
     <p class="body-text"><strong>Four differences worth knowing before you assume a drop-in:</strong> scans are ordered by token rather than partition-key value; provisioned throughput is enforced as real admission control (RCUs/WCUs, <code>ProvisionedThroughputExceededException</code> included) but there is no billing meter behind it — no invoice, no auto-scaling; credentials are verified only when the opt-in SigV4 check is switched on — by default any caller that can reach the port is trusted; and the AWS-side integrations — Lambda triggers, DAX, CloudWatch — have no equivalent.</p>
-    <a class="ctalink" href="compatibility.html">Operation by operation, with notes →</a>
+    <a class="ctalink" href="compatibility.html">Operation by operation, with notes</a>
   </div>
 </section>
 
 <section id="raft">
   <div class="wrap">
-    <span class="kicker">Architecture</span>
     <h2>Two planes, one Raft group per tablet, no special node.</h2>
     <p class="body-text">A small Raft group holds cluster metadata: membership, which node owns which tablet, what tables exist. It is written to when the topology changes, which is rare against your request rate, and it is not on the path of your reads and writes.</p>
     <p class="body-text">Your data lives in as many independent Raft groups as you have tablets, each replicated and led separately. A tablet is a contiguous range of the token space, and it is the unit of replication, movement and consensus. When one grows past its threshold it splits, online, into two groups.</p>
@@ -178,38 +172,35 @@
         </tbody>
       </table>
     </div>
-    <div class="ctalink-row"><a class="ctalink" href="architecture.html">The architecture in full →</a></div>
+    <div class="ctalink-row"><a class="ctalink" href="architecture.html">The architecture in full</a></div>
   </div>
 </section>
 
 <section class="alt" id="testing">
   <div class="wrap">
-    <span class="kicker">Testing</span>
     <h2>The cluster runs inside a deterministic simulator.</h2>
     <p class="body-text">Everything that could vary between runs — the clock, the network, the disk, scheduling, random numbers — goes through an abstraction. In production that is the operating system; under test it is a deterministic stand-in, so a whole cluster runs in one process, faster than real time, with partitions, crashes, clock skew and disk faults injected on purpose.</p>
     <p class="body-text">Because nothing varies except the seed, a failing run is described by a single number and replays exactly. That turns the expensive half of a distributed-systems bug — reproducing it — into a constant.</p>
     <p class="body-text">It is not a proof, and it only covers the faults that were modelled. The article below draws that boundary properly, and gives you six questions to interrogate anyone making this claim, us included.</p>
     <div class="ctalink-row">
-      <a class="ctalink" href="articles/determinism.html">Determinism, and why you should care →</a>
-      <a class="ctalink" href="architecture.html#determinism">How the simulator is built →</a>
+      <a class="ctalink" href="articles/determinism.html">Determinism, and why you should care</a>
+      <a class="ctalink" href="architecture.html#determinism">How the simulator is built</a>
     </div>
   </div>
 </section>
 
 <section id="cost">
   <div class="wrap">
-    <span class="kicker">Performance</span>
     <h2>No benchmarks yet — but the cost model is knowable.</h2>
     <p class="body-text">AnimusDB has not been benchmarked at scale, so it makes no performance claims. Publishing a number today would measure an unfinished storage path and then be quoted back at us for years.</p>
     <p class="body-text">What the architecture does fix is the shape of the cost. A write is one Raft round trip to a quorum plus a durable local write, so it cannot be acknowledged before the network has carried it to that quorum — put replicas in three availability zones and your write floor is a metro round trip. A linearizable read is served by the tablet leader; an eventually-consistent one need not be. A transaction across tablets is two-phase commit, and costs accordingly.</p>
     <p class="body-text">Throughput scales with tablet count, because tablets are independent groups with independent leaders. It does not scale within one tablet, and a hot partition key is still a hot partition key — exactly as on DynamoDB.</p>
-    <a class="ctalink" href="performance.html">The full cost model, and what we'll publish →</a>
+    <a class="ctalink" href="performance.html">The full cost model, and what we'll publish</a>
   </div>
 </section>
 
 <section class="alt" id="running">
   <div class="wrap">
-    <span class="kicker">Operating</span>
     <h2>One binary, four shapes, six ports.</h2>
     <p class="body-text">Every node is the same <code>animusd</code> binary; what differs is which planes it hosts, and that is a line in a config file. Run <strong>combined</strong> nodes by default, split into <strong>control-only</strong> and <strong>data-only</strong> as a cluster grows, or start an entire cluster in a <strong>single process</strong> for development. A config can mix shapes, so a cluster migrates between them incrementally rather than being rebuilt.</p>
     <p class="body-text">A node claims six consecutive ports from its base, 7100 by default: Raft traffic, the client protocol, the DynamoDB HTTP endpoint (which also serves <code>GET /metrics</code>), the admin API and dashboard, intra-cluster communication and a data console.</p>
@@ -235,41 +226,39 @@
       <p>A cluster with no TLS configured is exactly as before: plain TCP everywhere. Turn it on and the internal ports refuse a non-cluster-member outright; the client port still only verifies a signature — opt-in, off by default independently of TLS. Don't put an unconfigured cluster on the public internet, and don't store data you can't recreate.</p>
     </div>
     <div class="ctalink-row">
-      <a class="ctalink" href="install.html">Install it →</a>
-      <a class="ctalink" href="docs.html">Read the docs →</a>
-      <a class="ctalink" href="architecture.html#day2">Day-two operations in full →</a>
+      <a class="ctalink" href="install.html">Install it</a>
+      <a class="ctalink" href="docs.html">Read the docs</a>
+      <a class="ctalink" href="architecture.html#day2">Day-two operations in full</a>
     </div>
   </div>
 </section>
 
 <section id="licence">
   <div class="wrap">
-    <span class="kicker">Licensing</span>
     <h2>AGPL-3.0, and what it asks of you.</h2>
     <p class="body-text">Your application talks to AnimusDB over the DynamoDB HTTP API using AWS's own SDKs. It links nothing of ours, and using a database over a network protocol does not put your application under that database's licence.</p>
     <p class="body-text">Run an unmodified build, however commercially, and you owe no one any source. The obligations begin when you modify AnimusDB and let people interact with your modified version over a network — that is section 13, and it is the clause that makes this AGPL rather than GPL.</p>
     <p class="body-text">There is no commercial licence on offer today. The contributor agreement keeps one possible, which is a different thing from promising one.</p>
-    <a class="ctalink" href="licence.html">Scenario by scenario, including the clause your counsel will ask about →</a>
+    <a class="ctalink" href="licence.html">Scenario by scenario, including the clause your counsel will ask about</a>
   </div>
 </section>
 
 <section class="alt">
   <div class="wrap">
-    <span class="kicker">Going deeper</span>
     <h2>Four reference pages sit under this one.</h2>
     <p class="body-text">Each section above stops at the point where detail starts being useful only to someone who has decided to look. That detail is here.</p>
     <div class="cardgrid c4 mt-16">
-      <div class="lcard"><span class="tag">Reference</span><h3><a href="architecture.html">Architecture</a></h3><p>The two planes and why the split matters, tablets and placement, the consistency model, four deployment shapes with their commands, the six ports, determinism internals, day-two operations, and the known limits in one list.</p></div>
-      <div class="lcard"><span class="tag">Reference</span><h3><a href="compatibility.html">Compatibility</a></h3><p>Every DynamoDB operation with its status and per-operation notes, the data model, and the four differences that will actually show up in your code rather than in a table.</p></div>
-      <div class="lcard"><span class="tag">Reference</span><h3><a href="performance.html">Performance</a></h3><p>The cost model operation by operation, what scales with the cluster and what doesn't, six questions worth more than someone else's benchmark, and the benchmark methodology and load generator — with no published numbers yet.</p></div>
-      <div class="lcard"><span class="tag">Reference</span><h3><a href="licence.html">Licensing</a></h3><p>AGPL-3.0 scenario by scenario, the section 13 question your counsel will ask, why this licence and not a permissive one, and exactly where a commercial licence stands today.</p></div>
+      <div class="lcard"><h3><a href="architecture.html">Architecture</a></h3><p>The two planes and why the split matters, tablets and placement, the consistency model, four deployment shapes with their commands, the six ports, determinism internals, day-two operations, and the known limits in one list.</p></div>
+      <div class="lcard"><h3><a href="compatibility.html">Compatibility</a></h3><p>Every DynamoDB operation with its status and per-operation notes, the data model, and the four differences that will actually show up in your code rather than in a table.</p></div>
+      <div class="lcard"><h3><a href="performance.html">Performance</a></h3><p>The cost model operation by operation, what scales with the cluster and what doesn't, six questions worth more than someone else's benchmark, and the benchmark methodology and load generator — with no published numbers yet.</p></div>
+      <div class="lcard"><h3><a href="licence.html">Licensing</a></h3><p>AGPL-3.0 scenario by scenario, the section 13 question your counsel will ask, why this licence and not a permissive one, and exactly where a commercial licence stands today.</p></div>
     </div>
-    <span class="kicker kicker-sub">Longer arguments</span>
+    <h3>Longer arguments</h3>
     <h2 class="h2-sm">And three pieces that don't fit on a product page.</h2>
     <div class="cardgrid c3 mt-14">
-      <div class="lcard"><span class="tag">Essay</span><h3><a href="articles/why-lock-in-compounds.html">Why lock-in compounds</a></h3><p>Lock-in as an options problem rather than a price problem — and an explicit concession that this is not an argument against AWS.</p></div>
-      <div class="lcard"><span class="tag">Essay</span><h3><a href="articles/what-self-hosting-costs.html">What self-hosting actually costs</a></h3><p>The day-two bill written out in full, including the lines that show up in month seven, and the cases where self-hosting is the wrong answer.</p></div>
-      <div class="lcard"><span class="tag">Essay</span><h3><a href="articles/determinism.html">Determinism, and why you should care</a></h3><p>Simulation testing as risk reduction, with its boundaries drawn, and six questions to interrogate anyone who claims it — us included.</p></div>
+      <div class="lcard"><h3><a href="articles/why-lock-in-compounds.html">Why lock-in compounds</a></h3><p>Lock-in as an options problem rather than a price problem — and an explicit concession that this is not an argument against AWS.</p></div>
+      <div class="lcard"><h3><a href="articles/what-self-hosting-costs.html">What self-hosting actually costs</a></h3><p>The day-two bill written out in full, including the lines that show up in month seven, and the cases where self-hosting is the wrong answer.</p></div>
+      <div class="lcard"><h3><a href="articles/determinism.html">Determinism, and why you should care</a></h3><p>Simulation testing as risk reduction, with its boundaries drawn, and six questions to interrogate anyone who claims it — us included.</p></div>
     </div>
   </div>
 </section>
@@ -318,7 +307,7 @@
       </div>
     </div>
     <div class="foot-bottom">
-      <span>Pre-alpha — not ready for production data.</span>
+      <span>Pre-alpha. Not ready for production data.</span>
       <span class="spacer"></span>
       <span class="mono">AGPL-3.0 · animusdb.io</span>
     </div>

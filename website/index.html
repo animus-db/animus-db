@@ -3,19 +3,19 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AnimusDB — a self-hosted DynamoDB alternative on infrastructure you own</title>
-<meta name="description" content="A DynamoDB-compatible database you host yourself. Same SDKs, same access patterns, your cloud and your jurisdiction. Open source, AGPL-3.0, pre-alpha.">
+<title>AnimusDB: a self-hosted DynamoDB alternative on infrastructure you own</title>
+<meta name="description" content="A DynamoDB-compatible database you host yourself. Keep your AWS SDKs and queries; the data stays on your own servers. Open source, AGPL-3.0, pre-alpha.">
 <link rel="alternate" type="application/atom+xml" title="AnimusDB releases" href="https://github.com/animus-db/animus-db/releases.atom">
 <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
 <link rel="canonical" href="https://animusdb.io/">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://animusdb.io/">
-<meta property="og:title" content="AnimusDB — a self-hosted DynamoDB alternative on infrastructure you own">
-<meta property="og:description" content="A DynamoDB-compatible database you host yourself. Same SDKs, same access patterns, your cloud and your jurisdiction. Open source, AGPL-3.0, pre-alpha.">
+<meta property="og:title" content="AnimusDB: a self-hosted DynamoDB alternative on infrastructure you own">
+<meta property="og:description" content="A DynamoDB-compatible database you host yourself. Keep your AWS SDKs and queries; the data stays on your own servers. Open source, AGPL-3.0, pre-alpha.">
 <meta property="og:image" content="https://animusdb.io/assets/og-card.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
-<meta property="og:image:alt" content="AnimusDB — the DynamoDB API on infrastructure you own">
+<meta property="og:image:alt" content="AnimusDB: the DynamoDB API on infrastructure you own">
 <meta name="twitter:card" content="summary_large_image">
 <script type="application/ld+json">
 {
@@ -37,14 +37,10 @@
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
 
-<div class="banner">
-  <b>Pre-alpha</b> — not ready for production data. <a href="#status">Where it stands →</a>
-</div>
-
 <header class="site">
   <div class="wrap bar">
     <a class="brand" href="index.html">
-      <svg width="36" height="36" viewBox="-43 -43 86 86" aria-hidden="true">
+      <svg width="32" height="32" viewBox="-43 -43 86 86" aria-hidden="true">
         <circle cx="-26.14" cy="-15.09" r="2.4" fill="oklch(0.780 0.012 250.0)"></circle>
         <circle cx="-26.14" cy="0" r="3.04" fill="oklch(0.754 0.033 250.6)"></circle>
         <circle cx="-26.14" cy="15.09" r="2.4" fill="oklch(0.780 0.012 250.0)"></circle>
@@ -67,231 +63,153 @@
       </svg>
       AnimusDB
     </a>
-    <nav class="main">
-      <a href="index.html" class="here" aria-current="page">Overview</a>
-      <a href="how-it-works.html">How it works</a>
-      <a href="docs.html">Docs</a>
-      <a href="install.html">Install</a>
-      <a href="https://github.com/animus-db/animus-db">GitHub</a>
-    </nav>
-    <div class="theme-switch" role="group" aria-label="Theme">
-      <button type="button" data-theme-choice="light" aria-pressed="false" aria-label="Light theme">
-        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-          <circle cx="8" cy="8" r="3.2"/><path d="M8 .8v2M8 13.2v2M.8 8h2M13.2 8h2M2.9 2.9l1.4 1.4M11.7 11.7l1.4 1.4M13.1 2.9l-1.4 1.4M4.3 11.7l-1.4 1.4"/>
-        </svg>
-      </button>
-      <button type="button" data-theme-choice="dark" aria-pressed="false" aria-label="Dark theme">
-        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-          <path d="M13.2 9.1A5.6 5.6 0 1 1 6.9 2.8a4.4 4.4 0 0 0 6.3 6.3Z"/>
-        </svg>
-      </button>
-      <button type="button" data-theme-choice="system" aria-pressed="false" aria-label="System theme">
-        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-          <rect x="1.6" y="2.6" width="12.8" height="8.6" rx="1.4"/><path d="M5.6 14h4.8M8 11.2v2.8"/>
-        </svg>
-      </button>
+    <div class="head-right">
+      <nav class="main" aria-label="Main">
+        <a href="how-it-works.html">How it works</a>
+        <a href="docs.html">Docs</a>
+        <a href="compatibility.html">Compatibility</a>
+        <a href="https://github.com/animus-db/animus-db">GitHub</a>
+        <a class="nav-cta" href="install.html">Install</a>
+      </nav>
+      <div class="theme-switch" role="group" aria-label="Theme">
+        <button type="button" data-theme-choice="light" aria-pressed="false" aria-label="Light theme">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+            <circle cx="8" cy="8" r="3.2"/><path d="M8 .8v2M8 13.2v2M.8 8h2M13.2 8h2M2.9 2.9l1.4 1.4M11.7 11.7l1.4 1.4M13.1 2.9l-1.4 1.4M4.3 11.7l-1.4 1.4"/>
+          </svg>
+        </button>
+        <button type="button" data-theme-choice="dark" aria-pressed="false" aria-label="Dark theme">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M13.2 9.1A5.6 5.6 0 1 1 6.9 2.8a4.4 4.4 0 0 0 6.3 6.3Z"/>
+          </svg>
+        </button>
+        <button type="button" data-theme-choice="system" aria-pressed="false" aria-label="System theme">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+            <rect x="1.6" y="2.6" width="12.8" height="8.6" rx="1.4"/><path d="M5.6 14h4.8M8 11.2v2.8"/>
+          </svg>
+        </button>
+      </div>
     </div>
   </div>
 </header>
 
 <main id="main">
 
-<div class="hero wrap">
-  <div class="hero-grid">
+<section class="hero">
+  <div class="wrap hero-grid">
     <div>
-      <span class="kicker">Open source · Rust · AGPL-3.0</span>
-      <h1>The DynamoDB API, on infrastructure you own.</h1>
-      <p class="lede">Same SDKs, same queries, same access patterns. Your cloud, your datacentre, your jurisdiction.</p>
+      <p class="meta">Open source · AGPL-3.0 · Pre-alpha</p>
+      <h1>The DynamoDB API on hardware you control</h1>
+      <p class="lede">Keep your AWS SDK and your queries. Point them at AnimusDB and the data stays on your own servers.</p>
       <div class="btn-row">
-        <a class="btn primary" href="install.html">Evaluate AnimusDB</a>
-        <a class="btn" href="how-it-works.html">See how it works</a>
-      </div>
-      <p class="fineprint">One binary per node. No JVM, no external coordinator.</p>
-    </div>
-    <div class="plate">
-      <div class="head"><span class="t">a three-node cluster, one process</span><span class="ext">sh</span></div>
-      <div class="body">
-        <div class="cl"><span class="p">$</span> <span class="k">cargo run -p animusd -- --cluster 3</span></div>
-        <div class="cl o">animusd: started 3-node cluster (CP)</div>
-        <div class="cl o">&nbsp; node 0: dynamo http 127.0.0.1:52105</div>
-        <div class="cl o">animusd: ready — Ctrl-C to stop</div>
-        <div class="cl">&nbsp;</div>
-        <div class="cl c"># it's DynamoDB — your AWS SDK just works</div>
-        <div class="cl"><span class="p">$</span> <span class="k">aws dynamodb put-item \</span></div>
-        <div class="cl k">&nbsp;&nbsp;&nbsp; --endpoint-url <span class="s">http://127.0.0.1:52105</span> \</div>
-        <div class="cl k">&nbsp;&nbsp;&nbsp; --table-name <span class="s">orders</span> \</div>
-        <div class="cl k">&nbsp;&nbsp;&nbsp; --item <span class="s">'{"id":{"S":"a-1"},"total":{"N":"42"}}'</span></div>
-        <div class="cl o">→ 200 OK · on a Raft quorum before it answers</div>
+        <a class="btn primary" href="install.html">Install with Docker</a>
+        <a class="ctalink" href="how-it-works.html">Read how it works</a>
       </div>
     </div>
-  </div>
-
-  <div class="stat-row">
-    <div class="stat"><div class="n">Same SDKs</div><div class="l">The integration is one endpoint line — nothing new to learn, nothing new to hire for</div></div>
-    <div class="stat"><div class="n">No special node</div><div class="l">One Raft group per tablet, leaders spread across every node</div></div>
-    <div class="stat"><div class="n">Yours</div><div class="l">Your cloud, your datacentre, your jurisdiction</div></div>
-    <div class="stat"><div class="n">Seed-reproducible</div><div class="l">Every distributed failure replays exactly, from one number</div></div>
-  </div>
-</div>
-
-<section>
-  <div class="wrap">
-    <span class="kicker">Why this exists</span>
-    <h2>The API is the standard. The hosting doesn't have to be.</h2>
-    <div class="split mt-8 ai-start">
-      <div>
-        <p class="body-text">DynamoDB's API won for good reasons: predictable latency at any size, a data model that survives scale, and an SDK in every language your teams already use.</p>
-        <p class="body-text">But there is one place to run it. One vendor sets your price, your regions and your recovery time — and revisits all three on their schedule, not yours.</p>
-        <p class="body-text">A dependency on those terms would normally go out to tender. This one doesn't, because leaving means rewriting every access pattern you have. <strong>The switching cost is what removes the option</strong>, and it grows every quarter you don't exercise it.</p>
-        <p class="body-text">AnimusDB removes the rewrite. Keep the API; change who runs the cluster underneath.</p>
-        <a class="ctalink" href="articles/why-lock-in-compounds.html">Why lock-in compounds →</a>
-      </div>
-      <div>
-        <span class="kicker mb-10">What adoption costs you</span>
-        <div class="plate">
-          <div class="head"><span class="t">client configuration</span><span class="ext">diff</span></div>
-          <div class="body">
-            <div class="cl dm">- endpoint: dynamodb.eu-west-1.amazonaws.com</div>
-            <div class="cl dp">+ endpoint: animus.internal:7102</div>
-          </div>
-        </div>
-        <p class="body-text mt-14 fs-13">One line. Your SDKs, your queries, your conditional writes, your pagination — unchanged. Nothing new to learn, nothing new to hire for. What <em>does</em> change sits behind that endpoint: capacity planning, upgrades, backups, and a pager that now rings for the database. That bill is real. We'd rather write it out than let you discover it in month three.</p>
-        <a class="ctalink ctalink-sm" href="articles/what-self-hosting-costs.html">What self-hosting actually costs →</a>
+    <div>
+      <p class="caption">The only change in your application:</p>
+      <div class="code">
+<pre><span class="k">client = boto3.client(</span>
+<span class="k">    "dynamodb",</span>
+<span class="k">    region_name="eu-west-1",</span>
+<span class="s">    endpoint_url="http://db.internal:7102",</span>
+<span class="k">)</span></pre>
       </div>
     </div>
   </div>
 </section>
 
-<section class="alt">
+<section id="why">
   <div class="wrap">
-    <span class="kicker">Who it's for</span>
-    <h2>Three situations where this matters.</h2>
-    <div class="cardgrid c3 mt-18">
-      <div class="lcard"><span class="tag">Migration</span><h3>Leaving AWS</h3><p>Compute and object storage port in weeks. A decade of accumulated DynamoDB access patterns doesn't — which is why the data layer is usually the thing that blocks the move. It stops being the thing that blocks the move.</p></div>
-      <div class="lcard"><span class="tag">Regulation</span><h3>Residency requirements</h3><p>Pin a dataset to a jurisdiction because the regulator says so, not because a region happens to exist there. The cluster runs where you put it, under the law that applies where you put it, on hardware whose owner you can name.</p></div>
-      <div class="lcard"><span class="tag">Environment</span><h3>On-prem and edge</h3><p>Factory floor, ship, forward site, private cloud. Runs where there is no managed anything — and keeps running when the link back to head office doesn't.</p></div>
-    </div>
-    <div class="aside"><strong>And one situation where it doesn't.</strong> If you are happy on DynamoDB, committed to AWS, and expect to be in five years, AnimusDB is not an upgrade. Nothing here beats a managed service on operational burden, and we are not going to pretend otherwise.</div>
-  </div>
-</section>
-
-<section>
-  <div class="wrap">
-    <div class="split">
+    <h2>Why teams run it</h2>
+    <div class="cols-3">
       <div>
-        <span class="kicker">Trust</span>
-        <h2>Bugs found before you meet them.</h2>
-        <p class="body-text">AnimusDB runs its whole cluster inside a deterministic simulator. Network partitions, node crashes, clock skew, disk faults and message reordering are injected on purpose, thousands of times over, at machine speed. The one-in-ten-thousand interleavings that surface at 3am in production surface here instead.</p>
-        <p class="body-text">Every run is driven by a single number. Give the simulator the same seed and it reproduces the same failure, step for step — so <strong>a fix is verifiable rather than hopeful</strong>, and the run that caught the bug becomes the run that keeps it caught.</p>
-        <p class="body-text">What it does not do is prove correctness. It exercises the faults we thought to model, on the components we put under it. That is a large claim and a bounded one, and the article below draws the boundary rather than blurring it.</p>
-        <a class="ctalink" href="articles/determinism.html">Determinism, and why you should care →</a>
+        <h3>Leaving AWS</h3>
+        <p>Compute and object storage port in weeks. A decade of DynamoDB access patterns does not, which is why the data layer usually blocks the move. AnimusDB takes the same requests, conditional writes and pagination, so it stops blocking it.</p>
       </div>
-      <div class="plate">
-        <div class="head"><span class="t">a failure, replayed exactly</span><span class="ext">sh</span></div>
-        <div class="body">
-          <div class="cl c"># a simulation test fails and prints its seed</div>
-          <div class="cl"><span class="p">$</span> <span class="k">cargo test -p animus-cp-data</span></div>
-          <div class="cl o">thread 'linearizable_under_partition' panicked:</div>
-          <div class="cl o">&nbsp; read observed a stale value (seed = 8402173355719163220)</div>
-          <div class="cl">&nbsp;</div>
-          <div class="cl c"># replay that exact history — every time</div>
-          <div class="cl"><span class="p">$</span> <span class="k">ANIMUS_SEED=8402173355719163220 \</span></div>
-          <div class="cl k">&nbsp;&nbsp;&nbsp; cargo test linearizable_under_partition</div>
-        </div>
+      <div>
+        <h3>Data residency</h3>
+        <p>Pin a dataset to the country or datacentre your regulator names, even where no public cloud region exists. The cluster runs where you put it, on hardware whose owner you can name.</p>
+      </div>
+      <div>
+        <h3>On-prem and edge</h3>
+        <p>Factory floor, ship, forward site, private cloud. It runs where there is no managed service, and keeps running when the link back to head office does not.</p>
       </div>
     </div>
+    <p class="body-text mt-20">If you are happy on DynamoDB and expect to be in five years, AnimusDB is not an upgrade: a managed service has less operational burden. Running it yourself also means capacity planning, upgrades, backups and a pager for the database. Two short articles cover the argument and the bill: <a href="articles/why-lock-in-compounds.html">why lock-in compounds</a> and <a href="articles/what-self-hosting-costs.html">what self-hosting actually costs</a>.</p>
   </div>
 </section>
 
-<section class="alt">
-  <div class="wrap">
-    <span class="kicker">How it works</span>
-    <h2>Two planes, never blurred.</h2>
-    <p class="body-text">A small Raft group holds cluster metadata: membership, which node owns which tablet, what tables exist. It is consulted when the topology changes — not on the path of your reads and writes.</p>
-    <p class="body-text">Your data lives in as many independent Raft groups as you have tablets, each replicated and led separately. A write is acknowledged once a quorum of that tablet's replicas holds it. Nothing funnels through a single log, and no node is special. Lose one and you lose an election on some tablets, not the cluster.</p>
-
-    <div class="diagram-plate mt-18">
-      <svg viewBox="0 0 980 210" role="img" aria-label="Compact two-planes strip: the control plane holds the map; the data plane is one Raft group per tablet; a write lands on a single tablet's leader.">
-        <defs><marker id="arrB" markerWidth="7" markerHeight="7" refX="5.5" refY="3.5" orient="auto"><path class="dg-arrow" d="M0 1.2 L5.5 3.5 L0 5.8 z"/></marker></defs>
-        <rect class="dg-bx" x="20" y="46" width="184" height="118" rx="3"/>
-        <text class="dg-t" x="36" y="72">Control plane</text>
-        <text class="dg-m" x="36" y="90">one small Raft group</text>
-        <text class="dg-m dg-ui" x="36" y="114">holds the map:</text>
-        <text class="dg-m dg-ui" x="36" y="132">members · tablets · tables</text>
-        <path class="dg-ln" d="M204 105 H268" stroke-dasharray="4 4"/>
-        <text class="dg-m" x="236" y="96" text-anchor="middle">topology</text>
-        <rect class="dg-bx" x="268" y="24" width="692" height="162" rx="3"/>
-        <text class="dg-t" x="284" y="48">Data plane — one Raft group per tablet</text>
-        <path class="dg-req" d="M560 4 V56" marker-end="url(#arrB)"/>
-        <text class="dg-rt" x="572" y="24">write</text>
-        <rect class="dg-card" x="286" y="62" width="150" height="104" rx="3"/>
-        <text class="dg-t" x="361" y="86" text-anchor="middle">tablet 1</text>
-        <circle class="dg-leader-plain" cx="343" cy="112" r="5"/><circle class="dg-follower" cx="361" cy="112" r="4.5"/><circle class="dg-follower" cx="379" cy="112" r="4.5"/>
-        <text class="dg-m" x="361" y="146" text-anchor="middle">own leader</text>
-        <rect class="dg-acc" x="452" y="62" width="150" height="104" rx="3"/>
-        <text class="dg-t" x="527" y="86" text-anchor="middle">tablet 2</text>
-        <circle class="dg-follower" cx="509" cy="112" r="4.5"/><circle class="dg-leader" cx="527" cy="112" r="5.5"/><circle class="dg-follower" cx="545" cy="112" r="4.5"/>
-        <text class="dg-rt" x="527" y="146" text-anchor="middle">leader takes it</text>
-        <rect class="dg-card" x="618" y="62" width="150" height="104" rx="3"/>
-        <text class="dg-t" x="693" y="86" text-anchor="middle">tablet 3</text>
-        <circle class="dg-leader-plain" cx="675" cy="112" r="5"/><circle class="dg-follower" cx="693" cy="112" r="4.5"/><circle class="dg-follower" cx="711" cy="112" r="4.5"/>
-        <text class="dg-m" x="693" y="146" text-anchor="middle">own leader</text>
-        <rect class="dg-card" x="784" y="62" width="150" height="104" rx="3"/>
-        <text class="dg-t" x="859" y="86" text-anchor="middle">tablet 4</text>
-        <circle class="dg-leader-plain" cx="841" cy="112" r="5"/><circle class="dg-follower" cx="859" cy="112" r="4.5"/><circle class="dg-follower" cx="877" cy="112" r="4.5"/>
-        <text class="dg-m" x="859" y="146" text-anchor="middle">own leader</text>
-        <text class="dg-m" x="614" y="200" text-anchor="middle">no log connects the tablets · ● leader · ○ followers</text>
-      </svg>
+<section class="band" id="how">
+  <div class="wrap split-row">
+    <h2>How it works</h2>
+    <div class="split-main">
+      <p>AnimusDB splits each table into tablets. Every tablet is its own Raft group, and its leader can sit on any node, so no node is special and leadership spreads out as the cluster grows. It is one binary per node, with no JVM and no external coordinator.</p>
+      <p>A write is acknowledged once a quorum of that tablet's replicas holds it, so reads and writes are strongly consistent. A small, separate Raft group keeps the map of which node holds which tablet. It is consulted when the topology changes, not on the path of your reads and writes.</p>
+      <p>The distributed code runs first in a deterministic simulator that injects partitions, crashes, clock skew and disk faults. Every run is driven by one seed, and a failing run replays exactly from it. That catches bugs early. It does not prove the database correct, because it exercises only the faults we thought to model.</p>
+      <div class="code mb-20">
+<pre><span class="c"># a simulation test fails and prints its seed; replay that exact history</span>
+<span class="p">$</span> <span class="k">ANIMUS_SEED=8402173355719163220 \</span>
+    <span class="k">cargo test linearizable_under_partition</span></pre>
+      </div>
+      <p class="mt-20"><a class="ctalink" href="how-it-works.html">How it works, in full</a>, the <a class="ctalink" href="architecture.html">architecture</a> and <a class="ctalink" href="articles/determinism.html">why determinism matters</a>.</p>
     </div>
-    <div class="ctalink-row"><a class="ctalink" href="how-it-works.html">How it works, in full →</a></div>
   </div>
 </section>
 
 <section id="status">
-  <div class="wrap">
-    <span class="kicker">Where it stands</span>
-    <h2>Pre-alpha. Here's the honest version.</h2>
-    <ul class="status-list mt-18">
-      <li><span class="t">Per-tablet Raft replication, linearizable writes</span><span class="pill yes">Works today</span></li>
-      <li><span class="t">Tablet splits, movement and online rebalancing</span><span class="pill yes">Works today</span></li>
-      <li><span class="t">Multi-tablet transactions (2PC, MVCC snapshot reads)</span><span class="pill yes">Works today</span></li>
-      <li><span class="t">Secondary indexes, added and dropped online with backfill</span><span class="pill yes">Works today</span></li>
-      <li><span class="t">Streams and time to live</span><span class="pill yes">Works today</span></li>
-      <li><span class="t">On-demand backup and restore, plus point-in-time recovery to any second</span><span class="pill yes">Works today</span></li>
-      <li><span class="t">Metrics endpoint, admin API and a built-in dashboard</span><span class="pill yes">Works today</span></li>
-      <li><span class="t">Growing a cluster by seed address; <code>drain</code> and <code>decommission</code> to shrink one</span><span class="pill yes">Works today</span></li>
-      <li><span class="t">A Kubernetes operator, smoke-tested in CI on a <code>kind</code> cluster</span><span class="pill yes">Works today</span></li>
-      <li><span class="t">TLS on every port, mutual between cluster members (off by default)</span><span class="pill yes">Works today</span></li>
-      <li><span class="t">Encryption at rest for the WAL, engine files and backups (off by default)</span><span class="pill yes">Works today</span></li>
-      <li><span class="t">SigV4 with credential rotation and per-key allow lists (not full IAM)</span><span class="pill yes">Works today</span></li>
-      <li><span class="t">Versioned on-disk formats, full-cluster and rolling upgrades</span><span class="pill yes">Works today</span></li>
-      <li><span class="t">Zone-aware replica placement on Kubernetes</span><span class="pill yes">Works today</span></li>
-      <li><span class="t">Benchmarks with disclosed methodology (harness built, no numbers yet)</span><span class="pill opt">In progress</span></li>
-      <li><span class="t">Multi-Region strongly consistent global tables</span><span class="pill sim">Simulation-tested</span></li>
-      <li><span class="t">Eventual-consistency global tables between clusters</span><span class="pill sim">Simulation-tested</span></li>
-    </ul>
-    <p class="status-more"><span class="pill sim">Simulation-tested</span> means proven in deterministic simulation, not yet on real multi-Region hardware. <a href="architecture.html#limits">Details and known limits →</a></p>
-    <div class="warnbox">
-      <span class="label">Before you point anything at it</span>
-      <p><strong>TLS, encryption at rest and SigV4 exist but are off by default.</strong> Don't expose an unconfigured cluster, and don't store data you can't recreate.</p>
-      <p>What would end pre-alpha is written down: every item in the <a href="https://github.com/animus-db/animus-db/blob/main/docs/production-readiness.md">beta exit-criteria checklist</a> must be met or explicitly waived. Today most of the soak, chaos, fuzzing, overload, runbook and release-signing items are not met.</p>
-    </div>
-    <div class="ctalink-row">
-      <a class="ctalink" href="compatibility.html">Full API compatibility →</a>
-      <a class="ctalink" href="performance.html">What we know about performance →</a>
+  <div class="wrap split-row">
+    <h2>Where it stands</h2>
+    <div class="split-main">
+      <div class="cols-2">
+        <div>
+          <h3>Works today</h3>
+          <ul>
+            <li>Per-tablet Raft replication with linearizable writes</li>
+            <li>Tablet splits, movement and online rebalancing</li>
+            <li>Multi-tablet transactions (2PC, MVCC snapshot reads)</li>
+            <li>Secondary indexes, added and dropped online with backfill</li>
+            <li>Streams and time to live</li>
+            <li>On-demand backup and restore, plus point-in-time recovery to any second</li>
+            <li>Metrics endpoint, admin API and a built-in dashboard</li>
+            <li>Growing a cluster by seed address; <code>drain</code> and <code>decommission</code> to shrink one</li>
+            <li>A Kubernetes operator, smoke-tested in CI on a <code>kind</code> cluster</li>
+            <li>TLS on every port, mutual between cluster members (off by default)</li>
+            <li>Encryption at rest for the WAL, engine files and backups (off by default)</li>
+            <li>SigV4 with credential rotation and per-key allow lists (not full IAM)</li>
+            <li>Versioned on-disk formats, full-cluster and rolling upgrades</li>
+            <li>Zone-aware replica placement on Kubernetes</li>
+          </ul>
+        </div>
+        <div>
+          <h3>Not yet</h3>
+          <ul>
+            <li>Published benchmarks: the harness is built and the methodology disclosed, but there are no numbers yet</li>
+            <li>Multi-Region strongly consistent global tables: simulation-tested only, not run on real multi-Region hardware</li>
+            <li>Eventual-consistency global tables between clusters: simulation-tested only</li>
+            <li>TLS, encryption at rest and SigV4 on by default</li>
+          </ul>
+          <p class="mt-20"><strong>Do not store production data in it yet.</strong> TLS, encryption at rest and SigV4 exist but are off by default, so do not expose an unconfigured cluster, and do not store data you cannot recreate.</p>
+        </div>
+      </div>
+      <p class="mt-20">What would end pre-alpha is written down: every item in the <a href="https://github.com/animus-db/animus-db/blob/main/docs/production-readiness.md">beta exit-criteria checklist</a> must be met or explicitly waived. Today most of the soak, chaos, fuzzing, overload, runbook and release-signing items are not met. See <a href="compatibility.html">full API compatibility</a>, <a href="performance.html">what we know about performance</a> and <a href="architecture.html#limits">known limits</a>.</p>
     </div>
   </div>
 </section>
 
-<section class="alt">
+<section id="try">
   <div class="wrap">
-    <span class="kicker">Where to go from here</span>
-    <h2>Three ways in, depending on how much you trust us.</h2>
-    <div class="cardgrid c3 mt-18">
-      <div class="lcard"><span class="tag">Evaluating it</span><h3>Run it on your laptop</h3><p>One <code>docker run</code> gives you a node with a DynamoDB endpoint for the <code>aws</code> CLI. Prefer Cargo? Build from source and run a whole cluster in one process.</p><a class="ctalink more" href="install.html">Install →</a></div>
-      <div class="lcard"><span class="tag">Watching it</span><h3>Check back later</h3><p>It's pre-alpha, and most people reading this shouldn't adopt it yet. Get told when it changes: subscribe to the releases feed in any RSS reader, or use GitHub's Watch → Custom → Releases. Revisit when benchmarks are published and the beta exit criteria are met.</p><a class="ctalink more" href="https://github.com/animus-db/animus-db/releases.atom">Releases feed (RSS) →</a><a class="ctalink more" href="https://github.com/animus-db/animus-db/subscription">Watch releases on GitHub →</a></div>
-      <div class="lcard"><span class="tag">Building it</span><h3>Design records and issues</h3><p>Architecture decisions are written down and argued in the open. Contributions need a DCO sign-off and a CLA.</p><a class="ctalink more" href="https://github.com/animus-db/animus-db/blob/main/CONTRIBUTING.md">Contribute →</a></div>
+    <h2>Try it in a minute</h2>
+    <p class="body-text">One node in Docker, with the DynamoDB endpoint on port 7102, the operator dashboard on 7103 and the data console on 7105. Prefer Cargo? Build from source and run a whole cluster in one process.</p>
+    <div class="code">
+<pre><span class="p">$</span> <span class="k">docker run --rm ghcr.io/animus-db/animusd:latest gen-config --nodes 1 --host 0.0.0.0 &gt; animus.json</span>
+<span class="p">$</span> <span class="k">docker run -d --name animusd \</span>
+    <span class="k">-p 7102:7102 -p 7103:7103 -p 7105:7105 \</span>
+    <span class="k">-v animus-data:/var/lib/animus \</span>
+    <span class="k">-v "$PWD/animus.json:/etc/animus/cluster.json:ro" \</span>
+    <span class="k">ghcr.io/animus-db/animusd:latest \</span>
+    <span class="k">--config /etc/animus/cluster.json --node 0 --dir /var/lib/animus</span></pre>
     </div>
+    <p class="mt-20"><a class="ctalink" href="install.html">Full install guide</a>, including a multi-node cluster and a build from source. To follow the project, subscribe to the <a href="https://github.com/animus-db/animus-db/releases.atom">releases feed</a> in any RSS reader, or use GitHub's Watch, Custom, Releases. Architecture decisions are written down and argued in the open in the <a href="https://github.com/animus-db/animus-db/blob/main/docs/adr/README.md">design records</a>; contributions need a DCO sign-off and a CLA (<a href="https://github.com/animus-db/animus-db/blob/main/CONTRIBUTING.md">contributing guide</a>).</p>
   </div>
 </section>
 
@@ -339,7 +257,7 @@
       </div>
     </div>
     <div class="foot-bottom">
-      <span>Pre-alpha — not ready for production data.</span>
+      <span>Pre-alpha. Not ready for production data.</span>
       <span class="spacer"></span>
       <span class="mono">AGPL-3.0 · animusdb.io</span>
     </div>

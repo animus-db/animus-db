@@ -837,3 +837,16 @@ named above rendered as a quiet hairline in both themes on every page
 checked, and every live-indicator rule (the active nav link, the active
 subnav item, the pressed theme button, the active console tab) rendered
 with its full, unmodified accent-colored keyline in both themes.
+
+## Amendment (2026-10-18) — website redesign: Archivo, white ground, no black blocks, open layout
+
+The maintainer approved a site-wide redesign. The shared `tokens.css` (both copies) changes value, not name:
+white ground, ink `#111111`, one light grey surface `#f3f4f6`, accent `#2a56c6` (dark theme: a mirrored charcoal ground
+`#121417` and a lighter accent that passes 4.5:1). There is no black section, code block, footer or filled-black
+button in either theme: `--code-bg` is the light grey surface (a slightly lighter charcoal in dark) and the legacy
+`--plate-*` tokens now alias it, with no offset shadow. New tokens: `--font-display`, `--display-stretch`,
+`--display-weight` (Archivo at 75% width, weight 800, uppercase, for H1/H2 and the wordmark), `--accent-fill`, `--rule`.
+`--font-ui` is now Archivo falling back to Work Sans, so the embedded consoles (which still carry Work Sans via
+`fonts.css`) are unchanged until they are restyled. The site self-hosts Archivo (OFL, `archivo-latin-standard-normal.woff2`,
+both wght and wdth axes) and drops Work Sans. The site skin drops bordered cards, stat strips, pills, kicker labels,
+fake terminal headers and arrow links; status pills became plain words.
