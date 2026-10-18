@@ -513,5 +513,149 @@ Provisional defaults held; nothing was retuned. What was measured:
 - **Tier 3** (`animusd/tests/overload.rs`, real TCP, one node, `queued_bytes_budget` = 2 MiB,
   16 clients x 200 KB items for 8 s): 91 admitted, 2963 refused (only 200 / 503 / `ThrottlingException`),
   `queued_bytes_hwm` 410 KB, the node serves again at once.
-- **Not run:** the 150 s density-rig RSS measurement with the budget on. The ADR 0079 floor
+- **Not run (done 2026-10-18, see the section below):** the 150 s density-rig RSS measurement with the budget on. The ADR 0079 floor
   (0.4-0.55 GB) plus the 256 MiB budget is the sizing rule until it is.
+
+# 2026-10-18: `QueuedBytes` budget vs RSS (issue #1296, ADR 0080 as-built item 11)
+
+Question: is the 256 MiB default `QueuedBytes` budget (ADR 0080 section 4) sound
+against the measured RSS, and does RSS stay bounded and flat with it on? ADR 0080
+shipped it without the 150 s RSS run. This is that run. Same box (4 cores, 15 GB,
+release build), main `089e61f0` plus the rig knobs below. Every row is **one
+ProdEnv run** (not seed-reproducible; RSS repeats within about +-25 %).
+
+## Method
+
+Rig: section H's (`election_backpressure_liveness`, LSM, G=700 groups, 2 workers,
+`QUIESCE=0`, raw tablet puts through the leaders, 4 KiB values, 600 puts/s round-robin over
+the first 50 groups, hold 150 s unless stated). 600 puts/s is above this rig's LSM
+apply capacity (about 400-450/s), so the queues fill. New knobs (all default to the old
+behaviour), which wire the production assembly into the rig:
+
+- `ANIMUS_BP_LIVE_QUEUED_BYTES=B`: each node gets a `NodeAdmission` (propose bound
+  512 entries / 4 MiB per group, the lag feed from the `LoadMonitor`) over a
+  `QueuedBytes::new(B)` that `ProdEnv::set_queued_bytes` also hands to the transport
+  outboxes, exactly as `animusd` wires it. `0` = unlimited (counted, never refused).
+  Unset = no admission (the section H shape). The rig prints `writes_busy` (puts refused
+  `Busy`), `queued_used` (sum over the 3 nodes), `queued_hwm_max` (largest single-node
+  high-water mark) and `queued_refused` (budget refusals only; the rest of `writes_busy`
+  is the propose bound).
+- `ANIMUS_BP_LIVE_BACKLOG=off`: also switch the propose bound off (budget alone).
+- `ANIMUS_BP_LIVE_STALL_PEER=i`: every other node's address book points node `i` at a
+  listener that accepts and never reads, so their sends to it back up (a stalled peer
+  whose TCP connection stays up; node `i` receives nothing).
+
+```sh
+cargo test -p animus-cp-data --release --features prod-heavy --test election_backpressure_liveness --no-run
+ANIMUS_BP_LIVE_ASSERT=0 ANIMUS_BP_LIVE_QUIESCE=0 ANIMUS_BP_LIVE_WORKERS=2 ANIMUS_BP_LIVE_GROUPS=700 \
+  ANIMUS_BP_LIVE_ENGINE=lsm ANIMUS_BP_LIVE_WRITE_RPS=600 ANIMUS_BP_LIVE_WRITE_GROUPS=50 \
+  ANIMUS_BP_LIVE_VALUE_BYTES=4096 ANIMUS_BP_LIVE_HOLD_SECS=150 ANIMUS_BP_LIVE_QUEUED_BYTES=268435456 \
+  target/release/deps/election_backpressure_liveness-<hash> density_repro_g3000_holds_led_count --ignored --nocapture
+```
+
+**Caveat that governs every RSS figure:** three nodes share one process, so RSS is the
+**process** total; per node is about one third (inferred; the harness base is 67 MB).
+`queued_*` are per node or summed as labelled. Goodput = puts accepted in the 150 s hold
+(sent 89.9k in every 4 KiB row at 600/s).
+
+## Results: 4 KiB values, 600 puts/s, 50 hot groups (overload)
+
+| run | budget | propose bound | peer | RSS 60 s / 100 s / 150 s (process, MB) | accepted | `Busy` (of which budget) | `queued_bytes_hwm`, largest node | summed `queued_bytes` at end |
+|---|---|---|---|---|---|---|---|---|
+| r0 control | none | off | ok | 802 / 1828 / 2011 | 89 897 | 0 | n/a | n/a |
+| r1 **default** | 256 MiB | on | ok | 1017 / 1278 / 2258 | 77 510 | 12 428 (0) | 72 MiB | 97 MiB |
+| r2 | unlimited | on | ok | 937 / 1155 / 2057 | 77 389 | 12 590 (0) | 79 MiB | 29 MiB |
+| r3 | 32 MiB | on | ok | 890 / 1398 / 1493 | 71 936 | 17 977 (10 080) | 33 MiB | 39 MiB |
+| r4 | 256 MiB | **off** | ok | 674 / 1607 / 1774 | 89 914 | 0 (0) | 81 MiB | 91 MiB |
+| s1 | 256 MiB | on | node 2 stalled | 653 / 930 / 1109 | 88 766 | 1 210 (0) | 48 MiB | 52 MiB |
+| s2 | unlimited | on | node 2 stalled | 774 / 1038 / 1255 | 87 662 | 2 332 (0) | 68 MiB | 62 MiB |
+| s3 | 32 MiB | on | node 2 stalled | 778 / 879 / 999 | 80 550 | 9 414 (6 852) | 36 MiB | 41 MiB |
+| f1 | 256 MiB | on | ok, **300 puts/s** (below capacity) | 413 / 641 / 987 | 44 992 | 0 | 27 MiB | 22 MiB |
+
+All rows: all 700 groups led after about 13 s, `max_term` 2, fds 25-38. Led-count dips
+in r0-r4 (min 695-699 of 700) are the known loaded-ceiling behaviour (E3), not new; the
+stalled-peer rows held 700.
+
+Longer run, same as r1 but a 420 s hold (l1): RSS 1017 MB at 60 s, 1241 at 100 s,
+**2294 MB at 150 s and exactly 2295 MB for every sample from 150 s to 420 s**; accepted
+148 047, `Busy` 103 883 (all propose-bound, 0 budget), `queued_bytes_hwm` 96 MiB (largest
+node), summed `queued_bytes` 58-100 MiB for the whole plateau.
+
+8 KiB values, 300 puts/s over 300 hot groups (m1 256 MiB / m2 unlimited / m3 32 MiB):
+RSS 1845 / 1793 / 1793 MB at 150 s, flat from 110 s; accepted 44 313 / 43 848 / 42 747;
+hwm 46 / 50 / 39 MiB; budget refusals 0 / 0 / 863. The 32 MiB budget bit only after
+110 s and RSS did not move.
+
+## Findings
+
+1. **At the 256 MiB default the budget never binds on this workload.** The largest
+   single-node `queued_bytes_hwm` in any 4-8 KiB run with the default was 96 MiB (l1, 420 s),
+   with zero budget refusals; every `Busy` came from the per-group propose bound
+   (512 entries), which stops each hot group at about 2 MiB of 4 KiB entries
+   (`50 groups x 512 x 4 KiB` = 100 MiB, matching the 97-100 MiB the budget reads). The
+   budget is a backstop for many hot groups or large entries, not the working limit.
+2. **The small budget does bite**, and the refusals are the budget's own (32 MiB: 10 080
+   and 6 852 `queue-budget` refusals, hwm held at 33-36 MiB against a 32 MiB budget plus the
+   forced Internal/Liveness charge). Goodput cost at 32 MiB: 71.9k vs 77.5k accepted
+   (-7 %). So the mechanism works; the 256 MiB value is simply above this workload.
+3. **The budget does not bound RSS, because RSS is mostly state the budget does not
+   charge.** The charged bytes were 4-5 % of RSS (about 100 MiB of 2.0-2.3 GB, summed over the
+   three nodes), and RSS with the budget at 256 MiB, unlimited, or 32 MiB is the same
+   order (2.26 / 2.06 / 1.49 GB at 150 s; the single runs differ by less than the +-25 %
+   noise, except 32 MiB which is lower in both the healthy and the stalled-peer pair).
+   ADR 0080 section 4 states this by design (LSM memtables and compaction/flush buffers
+   are not charged); the measurement says how large the uncharged part is.
+4. **RSS is bounded and flat once it has climbed, but at a plateau set by uncharged
+   state.** It ratchets up in steps of 0.2-0.5 GB (each step coincides with a compaction
+   or flush burst: `dir_bytes` peaks at the same sample) and stops: l1 held 2295 MB for 270 s;
+   the 8 KiB rows are flat from 110 s. About 0.76 GB per node (inferred, process / 3) at
+   600 puts/s over capacity; 0.33 GB per node (987 / 3) at 300 puts/s below it. The 4 KiB
+   overload plateau is first reached between 100 s and 150 s, so a 60 s run (section H)
+   understates it by 2-3x: **use 150 s or more**.
+5. **A stalled peer does not grow the outboxes.** With node 2 never reading, the other
+   two nodes' charged bytes were no larger than in the healthy rows (48-68 MiB hwm) and RSS
+   was lower (1.1-1.25 GB), as the stalled node did no work. The per-peer outbox caps
+   (8 MiB Replicate/Normal, 4 MiB Bulk, drop-oldest) hold; the stalled peer's
+   queue is bounded at a few tens of MiB per node, not the thing that sizes memory.
+6. **The propose bound caps the leader's backlog, not the followers'.** In l1 the
+   cluster-wide apply lag (committed minus engine-applied, summed over all replicas)
+   kept growing after 150 s (72k to 128k entries by 420 s, about +200 entries/s) while
+   the leader-side bound was refusing 100k puts: the bound reads the leader's
+   own apply watermark, a follower that applies more slowly is not charged or limited.
+   RSS did not follow (flat at 2295 MB), so the entries are not memory-resident, but the
+   follower lag (and with it log retention on disk and restart replay) is unbounded
+   under sustained overload. Issue below.
+7. **Large values (64 KiB, 300 hot groups, 150 puts/s) are not measured cleanly.** The
+   disk filled (`dir_bytes` pinned at 5.1 GB, the box's free space) at about 45 s, so
+   RSS after that is a disk-full result. Up to that point, and independent of the budget
+   (256 MiB / unlimited / 32 MiB), RSS rose with the bytes written: 0.7, 1.5, 2.3, 2.7 GB at
+   10, 20, 30, 40 s with `log_len_sum` 6k-19k entries of 64 KiB (about 1.2 GB of retained
+   Raft log tail, which is charged nowhere), and the budget read at most 198 MiB summed
+   (144 MiB largest node). After the disk filled, RSS kept growing (13.0 GB at 150 s with
+   256 MiB, 9.5 GB with 32 MiB) while accepted puts were flat at 9 335, and with the budget
+   unlimited the process was killed by the container's OOM killer at about 14 GB. The
+   disk-full part is a separate question from the budget (ENOSPC has its own corpus,
+   issue #1218) but the memory growth under ENOSPC with load is filed, below.
+
+## Verdict
+
+- **Is 256 MiB sound?** Yes as a backstop, and the data does not support changing it:
+  it was never reached by a workload that stays inside the propose bound (hwm 96 MiB at
+  most), a 32 MiB budget costs about 7 % goodput and bites cleanly, and 25 % of a pod
+  limit (the operator rule) keeps the *charged* part inside the container. No default or
+  operator change is made. Raising it would only matter for a node with many more than 50
+  hot groups; lowering it is not justified by an OOM seen with the budget on.
+- **Does it make RSS bounded?** No: it bounds the charged queues, which are about 5 % of
+  RSS here. The sizing statement in ADR 0080 ("a pod needs floor + B + working set") is
+  right but the uncharged term is larger than the "0.4-0.55 GB" quoted for the floor:
+  **about 0.75 GB per node at 4 KiB / 600 puts/s overload, 150 s or more** (that figure
+  is also per process, so the old floor was a whole-process number at 60 s). With B = 256 MiB
+  a write-heavy node needs about 1 GiB; a 1 GiB limit (B = 256 MiB under the operator rule,
+  RSS about 0.76 GB + the charged part) has no headroom, and the operator's
+  `< 1 GiB` warning threshold is the right minimum, not a comfortable one. Recommend
+  **2 GiB** as the practical floor for a node taking sustained writes with large values
+  (the 64 KiB rows show RSS scaling with value size, uncharged).
+- **Open:** a rig with the DynamoDB wire (the wire holds request bodies and charges them)
+  was not run; the per-node RSS is inferred as process / 3; each row is a single run.
+
+Issues filed from this run: #1330 (follower apply lag grows without bound under sustained overload, finding 6) and #1331 (RSS grows without bound under ENOSPC with load, finding 7).

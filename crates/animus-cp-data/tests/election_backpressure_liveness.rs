@@ -50,6 +50,7 @@ use std::time::{Duration, Instant};
 
 use animus_control::timing::LAN_ELECTION_BASE;
 use animus_cp_data::RaftKvNode;
+use animus_cp_data::admission::{BacklogLimits, NodeAdmission};
 use animus_cp_data::campaign_governor::{
     CampaignGovernor, DEFAULT_CAMPAIGN_MAX_INFLIGHT, ElectionBackpressure,
 };
@@ -58,7 +59,7 @@ use animus_cp_data::host::{
     MetadataView, Reconciler,
 };
 use animus_cp_data::load_monitor::{DEFAULT_LAG_STRETCH_MAX_X, LoadMonitor};
-use animus_env::{Env, NodeId, ProdEnv, nid};
+use animus_env::{Env, NodeId, ProdEnv, QueuedBytes, nid};
 use animus_storage::{LsmEngine, LsmOptions, StorageEngine};
 use animus_tablet::{KeyRange, Tablet, TabletId};
 use tokio::time::{sleep, timeout};
@@ -67,6 +68,8 @@ type KvNode<S> = RaftKvNode<ProdEnv, S>;
 
 /// Max tokio oversleep (microseconds) of a 10 ms sleeper since the last
 /// `diag` (issue #1297: how late does a task wake on this runtime?).
+/// Puts the propose bound or the budget refused (`ProposeResult::Busy`).
+static WRITES_BUSY: AtomicU64 = AtomicU64::new(0);
 static SCHED_LAG_MAX_US: AtomicU64 = AtomicU64::new(0);
 static SCHED_LAG_SUM_US: AtomicU64 = AtomicU64::new(0);
 static SCHED_LAG_N: AtomicU64 = AtomicU64::new(0);
@@ -129,6 +132,8 @@ struct Node<S: StorageEngine + 'static> {
     hosted: Arc<Mutex<BTreeMap<TabletId, KvNode<S>>>>,
     governor: CampaignGovernor,
     next_tick: Instant,
+    /// The node's ADR 0080 admission when `ANIMUS_BP_LIVE_QUEUED_BYTES` is set.
+    adm: Option<NodeAdmission>,
 }
 
 struct Cluster<S: StorageEngine + 'static> {
@@ -157,8 +162,36 @@ impl<S: StorageEngine + 'static> Cluster<S> {
             .iter()
             .map(|e| (e.node_id(), e.local_addr().to_string()))
             .collect();
-        for e in &envs {
-            e.set_peers(book.clone());
+        // `ANIMUS_BP_LIVE_STALL_PEER=i` (issue #1296): every other node's
+        // address book points node `i` at a listener that accepts and never
+        // reads, so their sends to it back up the way a stalled peer's do and
+        // the per-peer outboxes grow to their caps.
+        let stall: Option<usize> = std::env::var("ANIMUS_BP_LIVE_STALL_PEER")
+            .ok()
+            .and_then(|v| v.parse().ok());
+        let blackhole = if stall.is_some() {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("blackhole bind");
+            let a = l.local_addr().expect("blackhole addr").to_string();
+            tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Ok((s, _)) = l.accept().await {
+                    held.push(s);
+                }
+            });
+            Some(a)
+        } else {
+            None
+        };
+        for (i, e) in envs.iter().enumerate() {
+            let mut b = book.clone();
+            if let (Some(s), Some(bh)) = (stall, &blackhole)
+                && s != i
+            {
+                b.insert(nid(s as u64), bh.clone());
+            }
+            e.set_peers(b);
         }
         let replicas: Vec<NodeId> = (0..NODES as u64).map(nid).collect();
         let view = MetadataView {
@@ -191,6 +224,27 @@ impl<S: StorageEngine + 'static> Cluster<S> {
                     Some(governor.clone()),
                 );
                 let id = env.node_id();
+                // `ANIMUS_BP_LIVE_QUEUED_BYTES=B` (issue #1296) wires ADR 0080's
+                // node admission as `animusd` does: the propose bound, a
+                // `QueuedBytes` budget of B bytes (0 = unlimited, counted) the
+                // transport outboxes charge too, lag fed by the monitor.
+                // `ANIMUS_BP_LIVE_BACKLOG=off` also switches the propose bound
+                // off (the pre-ADR-0080 shape).
+                let adm = std::env::var("ANIMUS_BP_LIVE_QUEUED_BYTES")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map(|b| {
+                        let limits =
+                            if std::env::var("ANIMUS_BP_LIVE_BACKLOG").as_deref() == Ok("off") {
+                                BacklogLimits::off()
+                            } else {
+                                BacklogLimits::default()
+                            };
+                        let adm = NodeAdmission::new(limits, QueuedBytes::new(b), env.metrics());
+                        env.set_queued_bytes(adm.budget().clone());
+                        monitor.attach_admission(adm.clone());
+                        adm
+                    });
                 let factory = make_factory(&env);
                 let mut recon: Recon<S> = Reconciler::new(
                     env,
@@ -229,7 +283,7 @@ impl<S: StorageEngine + 'static> Cluster<S> {
                     monitor: Some(monitor),
                     awake,
                     budget: None,
-                    admission: None,
+                    admission: adm.clone(),
                 });
                 recon.set_host_stagger(DEFAULT_HOST_UNSETTLED_MAX, DEFAULT_HOST_SETTLE_TIMEOUT);
                 Node {
@@ -237,6 +291,7 @@ impl<S: StorageEngine + 'static> Cluster<S> {
                     hosted,
                     governor,
                     next_tick: Instant::now(),
+                    adm,
                 }
             })
             .collect();
@@ -536,6 +591,22 @@ impl<S: StorageEngine + 'static> Cluster<S> {
              roles(fol={fol},pre={pre},cand={cand}) deferred_holds={held} terms={terms:?} gov=[{}]",
             gov.join(" | ")
         );
+    }
+
+    /// `(sum of used, sum of hwm, sum of refused)` over the nodes' budgets, and
+    /// the largest single node hwm. Zeros when the admission is not wired.
+    fn queued_stats(&self) -> (u64, u64, u64, u64) {
+        let (mut used, mut hwm, mut refused, mut max_hwm) = (0, 0, 0, 0);
+        for n in &self.nodes {
+            if let Some(a) = &n.adm {
+                let b = a.budget();
+                used += b.used();
+                hwm += b.hwm();
+                refused += b.refused();
+                max_hwm = max_hwm.max(b.hwm());
+            }
+        }
+        (used, hwm, refused, max_hwm)
     }
 
     fn governor_stats(&self) -> (usize, usize, u64) {
@@ -840,8 +911,12 @@ impl<S: StorageEngine + 'static> Cluster<S> {
                 {
                     return None;
                 }
+                let r = g.put(key, value);
+                if matches!(r, animus_control::raft::ProposeResult::Busy { .. }) {
+                    WRITES_BUSY.fetch_add(1, Ordering::Relaxed);
+                }
                 return Some(matches!(
-                    g.put(key, value),
+                    r,
                     animus_control::raft::ProposeResult::Accepted { .. }
                 ));
             }
@@ -860,6 +935,8 @@ impl<S: StorageEngine + 'static> Cluster<S> {
 /// `ANIMUS_BP_LIVE_WRITE_RPS` (client puts per second spread round-robin
 /// over the groups during the hold; 0), `ANIMUS_BP_LIVE_VALUE_BYTES` (128), `ANIMUS_BP_LIVE_WRITE_GROUPS` (all; a hot subset),
 /// `ANIMUS_BP_LIVE_WRITE_WINDOW` (0 = open loop; N sheds a put while its leader has more than N committed-but-unapplied entries, as the wire's per-request wait does),
+/// `ANIMUS_BP_LIVE_QUEUED_BYTES=B` (issue #1296: wire ADR 0080's node admission, propose bound plus a `QueuedBytes` budget of B bytes, 0 = unlimited; prints `writes_busy`, `queued_used`, `queued_hwm_max`, `queued_refused`), `ANIMUS_BP_LIVE_BACKLOG=off` (also switch the propose bound off),
+/// `ANIMUS_BP_LIVE_STALL_PEER=i` (every other node's book points node i at a listener that never reads),
 /// `ANIMUS_BP_LIVE_HOLD_SECS` (120), `ANIMUS_BP_LIVE_CONVERGE_SECS` (600), `ANIMUS_BP_LIVE_ASSERT=0` (report the
 /// outcome in a `BP-LIVE verdict` line instead of failing, for sweeps). The
 /// hold lines carry `cpu_ticks`/`rss_kb`/`fds`/`threads`/`files`/`ssts` from
@@ -963,12 +1040,17 @@ async fn density_body<S: StorageEngine + 'static>(c: &mut Cluster<S>, lsm: bool,
                 println!(
                     "BP-LIVE g={g} phase=hold t_s={} led={led} quiesced={quiesced} hosted={hosted} max_term={max_term} \
                      cpu_ticks={} rss_kb={} fds={} threads={} writes_sent={sent} writes_accepted={accepted} writes_shed={shed} \
+                     writes_busy={} queued_used={} queued_hwm_max={} queued_refused={} \
                      log_len_sum={} apply_lag_sum={} apply_lag_max={} files={files} dir_bytes={bytes} ssts={ssts}",
                     t0.elapsed().as_secs(),
                     s.0 - hold_base.0,
                     s.1,
                     s.2,
                     s.3,
+                    WRITES_BUSY.load(Ordering::Relaxed),
+                    c.queued_stats().0,
+                    c.queued_stats().3,
+                    c.queued_stats().2,
                     backlog.0,
                     backlog.1,
                     backlog.2
@@ -986,10 +1068,15 @@ async fn density_body<S: StorageEngine + 'static>(c: &mut Cluster<S>, lsm: bool,
         println!(
             "BP-LIVE g={g} phase=held min_led={min_led} led={led} max_term={max_term} inflight_hwm={hwm} deferred={deferred} \
              hold_cores={:.3} rss_kb={} fds={} writes_sent={sent} writes_accepted={accepted} writes_shed={shed} \
+             writes_busy={} queued_used={} queued_hwm_max={} queued_refused={} \
              log_len_sum={} apply_lag_sum={} apply_lag_max={} files={files} dir_bytes={bytes} ssts={ssts}",
             (end.0 - hold_base.0) as f64 / 100.0 / hold_s,
             end.1,
             end.2,
+            WRITES_BUSY.load(Ordering::Relaxed),
+            c.queued_stats().0,
+            c.queued_stats().3,
+            c.queued_stats().2,
             backlog.0,
             backlog.1,
             backlog.2
