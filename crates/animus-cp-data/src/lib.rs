@@ -72,6 +72,7 @@ pub mod campaign_governor;
 mod ceiling;
 pub mod cluster_segment_store;
 mod codec;
+pub mod compaction_io;
 pub mod cursor;
 #[cfg(test)]
 mod format_fixture_tests;

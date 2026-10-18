@@ -29,6 +29,7 @@ fn opts(grace: u64) -> LsmOptions {
         tombstone_grace_versions: grace,
         trust_monotonic_versions: false,
         background_maintenance: false,
+        ..LsmOptions::default()
     }
 }
 

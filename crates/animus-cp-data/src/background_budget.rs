@@ -241,6 +241,8 @@ struct State {
     fault: BudgetFault,
     next_id: u64,
     pools: BTreeMap<BgPool, PoolState>,
+    /// ADR 0081 decision 3: the node's compaction write-bytes bucket.
+    io: crate::compaction_io::IoBucket,
 }
 
 impl State {
@@ -269,6 +271,15 @@ impl Shared {
         }
     }
 
+    fn publish_io(&self, st: &State) {
+        if st.io.is_on() {
+            self.metrics
+                .set(Metric::StorageCompactionIoRate, st.io.effective_rate(st.lag));
+            self.metrics
+                .set(Metric::StorageCompactionIoDebtBytes, st.io.debt_bytes());
+        }
+    }
+
     fn release(&self, pool: BgPool, id: u64) {
         let mut st = self.state.lock().expect("budget poisoned");
         if st.fault == BudgetFault::LeakPermits {
@@ -279,6 +290,27 @@ impl Shared {
         }
         self.publish(&st, pool);
     }
+}
+
+/// The compaction write budget's counters (ADR 0081).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompactionIoStats {
+    /// Configured rate, bytes/s (`0` = off).
+    pub rate: u64,
+    /// The rate after lag scaling.
+    pub rate_eff: u64,
+    /// Bytes overdrawn now.
+    pub debt_bytes: u64,
+    /// Bytes of credit now.
+    pub credit_bytes: u64,
+    /// Non-urgent compactions admitted.
+    pub admitted: u64,
+    /// Urgent compactions admitted over an empty bucket.
+    pub urgent: u64,
+    /// Non-urgent compactions refused for want of credit.
+    pub refused: u64,
+    /// Total bytes charged.
+    pub charged_bytes: u128,
 }
 
 /// One pool's counters (for the admin interface and the tests).
@@ -346,6 +378,7 @@ impl BackgroundBudget {
                     fault,
                     next_id: 1,
                     pools,
+                    io: crate::compaction_io::IoBucket::new(0),
                 }),
                 metrics,
             }),
@@ -356,6 +389,68 @@ impl BackgroundBudget {
     /// [`crate::load_monitor::LoadMonitor`]. The effective sizes follow it.
     pub fn set_lag(&self, lag: u64) {
         self.shared.state.lock().expect("budget poisoned").lag = lag;
+    }
+
+    /// Turn on the node-wide compaction write budget (ADR 0081 decision 3) at
+    /// `bytes_per_sec` (`0` = off, today's behaviour). Call before the budget
+    /// is shared with any engine; the bucket starts with one second of credit.
+    pub fn set_compaction_io_rate(&self, bytes_per_sec: u64) {
+        let mut st = self.shared.state.lock().expect("budget poisoned");
+        st.io = crate::compaction_io::IoBucket::new(bytes_per_sec);
+        self.shared.publish_io(&st);
+    }
+
+    /// Whether the compaction write budget is on.
+    #[must_use]
+    pub fn compaction_io_on(&self) -> bool {
+        self.shared
+            .state
+            .lock()
+            .expect("budget poisoned")
+            .io
+            .is_on()
+    }
+
+    /// The compaction write budget's counters (admin, tests).
+    #[must_use]
+    pub fn compaction_io_stats(&self) -> CompactionIoStats {
+        let st = self.shared.state.lock().expect("budget poisoned");
+        CompactionIoStats {
+            rate: st.io.rate(),
+            rate_eff: st.io.effective_rate(st.lag),
+            debt_bytes: st.io.debt_bytes(),
+            credit_bytes: st.io.credit_bytes(),
+            admitted: st.io.admitted,
+            urgent: st.io.urgent,
+            refused: st.io.refused,
+            charged_bytes: st.io.charged_bytes,
+        }
+    }
+
+    /// Ask to spend `bytes` of the compaction write budget at `now`. `urgent`
+    /// requests are always admitted (into debt).
+    #[must_use]
+    pub fn compaction_io_admit(&self, now: Nanos, bytes: u64, urgent: bool) -> bool {
+        let mut st = self.shared.state.lock().expect("budget poisoned");
+        let lag = st.lag;
+        let ok = st.io.try_admit(now, lag, bytes, urgent);
+        self.shared.publish_io(&st);
+        ok
+    }
+
+    /// Correct a charge with the bytes actually written.
+    pub fn compaction_io_settle(&self, estimated: u64, actual: u64) {
+        let mut st = self.shared.state.lock().expect("budget poisoned");
+        st.io.settle(estimated, actual);
+        self.shared.publish_io(&st);
+    }
+
+    /// Charge never-delayed bytes (a flush) into debt.
+    pub fn compaction_io_charge(&self, now: Nanos, bytes: u64) {
+        let mut st = self.shared.state.lock().expect("budget poisoned");
+        let lag = st.lag;
+        st.io.charge(now, lag, bytes);
+        self.shared.publish_io(&st);
     }
 
     /// Whether `pool` is on (bounded).
@@ -476,7 +571,7 @@ impl BackgroundBudget {
         &self,
         env_now: Arc<dyn Fn() -> Nanos + Send + Sync>,
     ) -> Option<Arc<dyn animus_storage::CompactionGate>> {
-        self.is_on(BgPool::Compaction).then(|| {
+        (self.is_on(BgPool::Compaction) || self.compaction_io_on()).then(|| {
             Arc::new(EngineCompactionGate {
                 budget: self.clone(),
                 now: env_now,
@@ -514,6 +609,26 @@ impl animus_storage::CompactionGate for EngineCompactionGate {
             }
         }
     }
+    fn io_admit(&self, estimated_bytes: u64, urgent: bool) -> animus_storage::IoAdmission {
+        if self
+            .budget
+            .compaction_io_admit((self.now)(), estimated_bytes, urgent)
+        {
+            animus_storage::IoAdmission::Admitted
+        } else {
+            animus_storage::IoAdmission::Defer
+        }
+    }
+
+    fn io_settle(&self, estimated_bytes: u64, actual_bytes: u64) {
+        self.budget
+            .compaction_io_settle(estimated_bytes, actual_bytes);
+    }
+
+    fn io_charge(&self, bytes: u64) {
+        self.budget.compaction_io_charge((self.now)(), bytes);
+    }
+
 }
 
 /// A held slot; dropping it returns the slot.

@@ -51,6 +51,7 @@ fn churn_opts() -> LsmOptions {
         tombstone_grace_versions: 1 << 20,
         trust_monotonic_versions: false,
         background_maintenance: false,
+        ..LsmOptions::default()
     }
 }
 
@@ -67,6 +68,7 @@ fn no_compact_opts() -> LsmOptions {
         tombstone_grace_versions: 1 << 20,
         trust_monotonic_versions: false,
         background_maintenance: false,
+        ..LsmOptions::default()
     }
 }
 

@@ -37,6 +37,7 @@ fn open(seed: u64) -> LsmEngine<animus_sim::SimEnv> {
         tombstone_grace_versions: GRACE,
         trust_monotonic_versions: false,
         background_maintenance: false,
+        ..LsmOptions::default()
     };
     block_on(LsmEngine::open_with(sim.env(nid(0)), "db/", opts)).expect("open")
 }

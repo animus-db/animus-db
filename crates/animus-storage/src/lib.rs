@@ -26,6 +26,7 @@
 
 mod lsm;
 mod memory;
+pub mod stall;
 
 /// Test-only helper shared by the golden-fixture tests (ADR 0073 Phase 1,
 /// P1-B): the version a fixture file claims, parsed from its `v<N>.bin`
@@ -41,6 +42,9 @@ pub(crate) fn fixture_file_version(path: &std::path::Path) -> u32 {
         .unwrap_or_else(|| panic!("fixture {} is not named v<N>.bin", path.display()))
 }
 
+pub use lsm::IoAdmission;
+#[doc(hidden)]
+pub use lsm::StallFault;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub use lsm::fuzzing;
@@ -201,6 +205,15 @@ pub enum StorageError {
     InvalidLevelFanout {
         /// The rejected value.
         level_fanout: usize,
+    },
+    /// `LsmOptions` L0 stall options were inconsistent (ADR 0081 decision 1):
+    /// the factors must satisfy `bypass < slowdown < stop` (or both be `0`),
+    /// the ramp must be usable and the failure limit non-zero. Validated at
+    /// [`LsmOptions::validate`] / `LsmEngine::open*`.
+    #[error("invalid LsmOptions: {reason}")]
+    InvalidStallOptions {
+        /// What is wrong, a fixed sentence.
+        reason: &'static str,
     },
     /// A persisted format's bytes carried no recognized version tag at
     /// all — no magic (a byte-oriented format) or, for a `serde_json`
