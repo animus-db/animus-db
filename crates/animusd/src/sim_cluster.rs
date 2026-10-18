@@ -351,6 +351,77 @@ impl SimDensity {
     }
 }
 
+/// ADR 0080: the overload knobs a `SimCluster` node assembles with (the propose
+/// bound's limits and the `QueuedBytes` budget), installed per thread exactly
+/// like [`SimDensity`]. Every other cluster runs with the propose bound off.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SimOverload {
+    /// The per-group propose-backlog limits (`BacklogLimits::off()` = unbounded).
+    pub(crate) backlog: animus_cp_data::admission::BacklogLimits,
+    /// The node `QueuedBytes` budget in bytes (`0` = unlimited).
+    pub(crate) budget: u64,
+    /// The leaderless fast-fail wait (ADR 0080 2b). A very large value is the
+    /// "fast-fail off" negative control.
+    pub(crate) leaderless_wait: Duration,
+    /// The per-group in-flight cap at the edge (ADR 0080 2c; `0` = off).
+    pub(crate) group_inflight_max: usize,
+}
+
+impl SimOverload {
+    /// The production defaults for the edge knobs, with the propose bound as
+    /// given.
+    pub(crate) fn with_backlog(
+        backlog: animus_cp_data::admission::BacklogLimits,
+        budget: u64,
+    ) -> Self {
+        let d = crate::config::ResolvedLimits::default();
+        Self {
+            backlog,
+            budget,
+            leaderless_wait: d.leaderless_wait,
+            group_inflight_max: d.group_inflight_max,
+        }
+    }
+
+    /// The `OverloadState` a `SimCluster` node's `ClientCtx` carries: the
+    /// installed knobs on top of the production defaults, or plain defaults.
+    pub(crate) fn state() -> crate::overload::OverloadState {
+        let mut limits = crate::config::ResolvedLimits::default();
+        if let Some(o) = Self::current() {
+            limits.leaderless_wait = o.leaderless_wait;
+            limits.group_inflight_max = o.group_inflight_max;
+        }
+        crate::overload::OverloadState::new(limits, animus_env::MetricsHandle::recording())
+    }
+}
+
+thread_local! {
+    static SIM_OVERLOAD: std::cell::Cell<Option<SimOverload>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Removes the thread's [`SimOverload`] when dropped.
+pub(crate) struct SimOverloadGuard(());
+
+impl Drop for SimOverloadGuard {
+    fn drop(&mut self) {
+        SIM_OVERLOAD.with(|d| d.set(None));
+    }
+}
+
+impl SimOverload {
+    /// Install `self` for every node this thread's `SimCluster` builds from now
+    /// on, until the guard drops.
+    pub(crate) fn install(self) -> SimOverloadGuard {
+        SIM_OVERLOAD.with(|d| d.set(Some(self)));
+        SimOverloadGuard(())
+    }
+
+    fn current() -> Option<SimOverload> {
+        SIM_OVERLOAD.with(std::cell::Cell::get)
+    }
+}
+
 /// The split-pool handle a node's `DataRole` carries (`ClientCtx::
 /// trigger_split` takes a permit from it), when a [`SimDensity`] is installed.
 /// Its own `BackgroundBudget` (not the reconciler's): the pools are separate
@@ -397,6 +468,15 @@ fn build_reconciler(
         // snapshot send/receive and catch-up pools).
         density.map(|d| {
             animus_cp_data::background_budget::BackgroundBudget::new(d.sizes, env.metrics())
+        }),
+        // ADR 0080: the propose bound is off in the simulated cluster unless a
+        // cell installs one (`SimOverload`).
+        SimOverload::current().map(|o| {
+            animus_cp_data::admission::NodeAdmission::new(
+                o.backlog,
+                animus_env::QueuedBytes::new(o.budget),
+                env.metrics(),
+            )
         }),
     );
     let mut reconciler = if backend == SimEngineBackend::Lsm {
@@ -2792,7 +2872,7 @@ impl SimCluster {
                 throttle: ThrottleTracker::new(),
                 throttle_defaults: Arc::new(ThrottleDefaults::default()),
                 any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                overload: Default::default(),
+                overload: SimOverload::state(),
             };
             ctxs.push(ctx);
         }
@@ -4719,6 +4799,36 @@ impl SimCluster {
         })
     }
 
+    /// One DynamoDB request from `node`, polled every `step` for at most
+    /// `max_steps`: the virtual time it took and its `(status, body)`, `None`
+    /// when it had not resolved by then (ADR 0080 Tier 2 latency assertions).
+    pub(crate) fn dynamo_timed(
+        &mut self,
+        node: u64,
+        target: &str,
+        body: &[u8],
+        step: Duration,
+        max_steps: usize,
+    ) -> (Duration, Option<(u16, String)>) {
+        let handle = self.shared.clone();
+        let (target, body) = (target.to_owned(), body.to_vec());
+        let env = self.shared.env(node);
+        let slot: Arc<Mutex<Option<(u16, String)>>> = Arc::new(Mutex::new(None));
+        let out = slot.clone();
+        let start = self.sim.now();
+        env.spawn_task(async move {
+            let result = handle.dynamo(node, &target, &body).await;
+            *out.lock().expect("result slot poisoned") = Some(result);
+        });
+        for _ in 0..max_steps {
+            self.sim.run_for(step);
+            if let Some(result) = slot.lock().expect("result slot poisoned").take() {
+                return (self.sim.now().duration_since(start), Some(result));
+            }
+        }
+        (self.sim.now().duration_since(start), None)
+    }
+
     /// [`SimCluster::dynamo`]'s early-returning sibling — same request/
     /// response shape, same timeout contract, but driven through
     /// [`SimCluster::spawn_and_capture_fast`] instead of
@@ -6480,7 +6590,7 @@ impl SimCluster {
             throttle: ThrottleTracker::new(),
             throttle_defaults: Arc::new(ThrottleDefaults::default()),
             any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            overload: Default::default(),
+            overload: SimOverload::state(),
         };
 
         // Install the relay server, exactly like `SimCluster::new`/
@@ -6825,7 +6935,7 @@ impl SimCluster {
             throttle: ThrottleTracker::new(),
             throttle_defaults: Arc::new(ThrottleDefaults::default()),
             any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            overload: Default::default(),
+            overload: SimOverload::state(),
         };
 
         let ctx_for_server = ctx.clone();
@@ -7139,7 +7249,7 @@ impl SimCluster {
             throttle: ThrottleTracker::new(),
             throttle_defaults: Arc::new(ThrottleDefaults::default()),
             any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            overload: Default::default(),
+            overload: SimOverload::state(),
         };
 
         let ctx_for_server = ctx.clone();
@@ -7960,7 +8070,7 @@ impl SimCluster {
             throttle: ThrottleTracker::new(),
             throttle_defaults: Arc::new(ThrottleDefaults::default()),
             any_table_throughput: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            overload: Default::default(),
+            overload: SimOverload::state(),
         };
 
         let ctx_for_server = ctx.clone();

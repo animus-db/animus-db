@@ -154,6 +154,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         // Whether this write may be safely re-applied; see the retry decision
         // at the bottom of the loop.
         let idempotent = dynamo::kind_write_is_idempotent(&op);
+        // ADR 0080 2c: one slot on this tablet for the request's whole park.
+        let _group = self
+            .group_permit(table, &base_key)
+            .map_err(|e| dynamo::map_overload(dynamo::internal(&e)))?;
         let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
         loop {
             let err = match self.cp_route(table, &base_key, deadline).await {
@@ -217,7 +221,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         }
                     }
                 }
-                CpRoute::None => dynamo::internal("no CP group leader reachable"),
+                CpRoute::None => dynamo::internal(&self.no_leader_message(table, &base_key)),
             };
             // **At-most-once for a non-idempotent write.** This loop re-enters
             // `kind_write_item_at_leader`, which re-reads the old image and
@@ -263,7 +267,11 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 return Err(if decide::read_should_retry(&err.message) {
                     animus_dynamo::wire::WireError::service_unavailable(err.message)
                 } else {
-                    err
+                    // ADR 0080: a `Busy:` / `NoLeader:` refusal is returned
+                    // here rather than retried inline, and mapped to its
+                    // typed wire error (`ThrottlingException` /
+                    // `ServiceUnavailable`) at this terminal return, never a 500.
+                    dynamo::map_overload(err)
                 });
             }
             self.env.sleep(SCHEMA_POLL_INTERVAL).await;
@@ -324,6 +332,14 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             return items.iter().map(|_| Err(err.clone())).collect();
         }
         let first_key = dynamo::item_key(&items[0].pk, items[0].sk.as_ref());
+        // ADR 0080 2c: one slot on this tablet for the request's whole park.
+        let _group = match self.group_permit(table, &first_key) {
+            Ok(g) => g,
+            Err(e) => {
+                let err = dynamo::map_overload(dynamo::internal(&e));
+                return items.iter().map(|_| Err(err.clone())).collect();
+            }
+        };
         let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
         loop {
             let err = match self.cp_route(table, &first_key, deadline).await {
@@ -365,7 +381,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         )),
                     }
                 }
-                CpRoute::None => dynamo::internal("no CP group leader reachable"),
+                CpRoute::None => dynamo::internal(&self.no_leader_message(table, &first_key)),
             };
             if !decide::read_should_retry(&err.message)
                 || decide::is_storage_full_refusal(&err.message)
@@ -388,7 +404,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 let err = if decide::read_should_retry(&err.message) {
                     animus_dynamo::wire::WireError::service_unavailable(err.message)
                 } else {
-                    err
+                    dynamo::map_overload(err)
                 };
                 return items.iter().map(|_| Err(err.clone())).collect();
             }
@@ -629,7 +645,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         Err(e) => e,
                     }
                 }
-                CpRoute::None => "no CP group leader reachable".to_string(),
+                CpRoute::None => self.no_leader_message(table, &first),
             };
             if !decide::read_should_retry(&err)
                 || decide::is_storage_full_refusal(&err)
@@ -801,6 +817,12 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
              churn or an apply-time no-op); retry";
         let (accepted_index, accepted_term) = match leader.put_kind_batch(writes, change_log) {
             ProposeResult::Accepted { index, term } => (index, term),
+            // ADR 0080: a definite refusal (nothing appended). Routed to the
+            // house `Busy:` string, which no inline loop retries.
+            ProposeResult::Busy {
+                backlog_entries,
+                backlog_bytes,
+            } => return Err(decide::busy_refusal(backlog_entries, backlog_bytes)),
             other => return Err(format!("kind write not accepted: {other:?}")),
         };
         if housekeeping {
@@ -914,6 +936,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         let (accepted_index, accepted_term) =
             match leader.propose_kind_eval(schema, pk, sk, op, condition, ttl_expired) {
                 ProposeResult::Accepted { index, term } => (index, term),
+                ProposeResult::Busy {
+                    backlog_entries,
+                    backlog_bytes,
+                } => return Err(decide::busy_refusal(backlog_entries, backlog_bytes)),
                 other => return Err(format!("kind eval not accepted: {other:?}")),
             };
         let deadline = leader.env().now().saturating_add(CLIENT_TIMEOUT);
@@ -1125,6 +1151,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         }
         let (accepted_index, accepted_term) = match leader.propose_kind_eval_batch(entries) {
             ProposeResult::Accepted { index, term } => (index, term),
+            ProposeResult::Busy {
+                backlog_entries,
+                backlog_bytes,
+            } => return Err(decide::busy_refusal(backlog_entries, backlog_bytes)),
             other => return Err(format!("kind eval batch not accepted: {other:?}")),
         };
         let deadline = leader.env().now().saturating_add(CLIENT_TIMEOUT);
@@ -1309,6 +1339,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         match leader.put_batch(group) {
             ProposeResult::Accepted { index, term } => Ok(probe.map(|p| (index, term, p))),
             ProposeResult::NotLeader { .. } => Err("CP group leader moved; retry".into()),
+            ProposeResult::Busy {
+                backlog_entries,
+                backlog_bytes,
+            } => Err(decide::busy_refusal(backlog_entries, backlog_bytes)),
         }
     }
 
@@ -1621,6 +1655,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 }
             }
             ProposeResult::NotLeader { .. } => Err("CP group leader moved; retry".into()),
+            ProposeResult::Busy {
+                backlog_entries,
+                backlog_bytes,
+            } => Err(decide::busy_refusal(backlog_entries, backlog_bytes)),
         }
     }
 
@@ -1683,6 +1721,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 }
             }
             ProposeResult::NotLeader { .. } => Err("CP group leader moved; retry".into()),
+            ProposeResult::Busy {
+                backlog_entries,
+                backlog_bytes,
+            } => Err(decide::busy_refusal(backlog_entries, backlog_bytes)),
         }
     }
 }

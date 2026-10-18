@@ -613,6 +613,8 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         table: &str,
         key: Vec<u8>,
     ) -> Result<SnapshotRead, String> {
+        // ADR 0080 2c: one slot on this tablet for the request's whole park.
+        let _group = self.group_permit(table, &key)?;
         let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
         loop {
             let err = match self.cp_route(table, &key, deadline).await {
@@ -645,7 +647,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         }
                     }
                 }
-                CpRoute::None => return Err("no CP group leader reachable".into()),
+                CpRoute::None => return Err(self.no_leader_message(table, &key)),
             };
             if !decide::read_should_retry(&err) || self.env.now() >= deadline {
                 return Err(err);
@@ -731,6 +733,8 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 Ok(None) => {}
             }
         }
+        // ADR 0080 2c: one slot on this tablet for the request's whole park.
+        let _group = self.group_permit(table, &key)?;
         let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
         loop {
             let err = match self.cp_route(table, &key, deadline).await {
@@ -765,7 +769,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         }
                     }
                 }
-                CpRoute::None => return Err("no CP group leader reachable".into()),
+                CpRoute::None => return Err(self.no_leader_message(table, &key)),
             };
             if !decide::read_should_retry(&err) || self.env.now() >= deadline {
                 return Err(err);
@@ -891,6 +895,8 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 Ok(None) => {}
             }
         }
+        // ADR 0080 2c: one slot on this tablet for the request's whole park.
+        let _group = self.group_permit(table, &start)?;
         let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
         loop {
             let err = match self.cp_route(table, &start, deadline).await {
@@ -941,7 +947,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         }
                     }
                 }
-                CpRoute::None => return Err("no CP group leader reachable".into()),
+                CpRoute::None => return Err(self.no_leader_message(table, &start)),
             };
             if !decide::read_should_retry(&err) || self.env.now() >= deadline {
                 return Err(err);
@@ -1114,6 +1120,8 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 Ok(None) => {}
             }
         }
+        // ADR 0080 2c: one slot on this tablet for the request's whole park.
+        let _group = self.group_permit(table, &start)?;
         let deadline = self.env.now().saturating_add(CLIENT_TIMEOUT);
         loop {
             let err = match self.cp_route(table, &start, deadline).await {
@@ -1167,7 +1175,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         }
                     }
                 }
-                CpRoute::None => return Err("no CP group leader reachable".into()),
+                CpRoute::None => return Err(self.no_leader_message(table, &start)),
             };
             if !decide::read_should_retry(&err) || self.env.now() >= deadline {
                 return Err(err);

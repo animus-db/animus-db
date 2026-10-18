@@ -1236,6 +1236,10 @@ const NOT_A_METRIC: &[(&str, &str)] = &[
         "control_voters",
         "an /admin or CLI JSON field, not a Prometheus metric",
     ),
+    (
+        "queued_bytes_budget",
+        "the `overload.queued_bytes_budget` config key (ADR 0080), not a Prometheus metric",
+    ),
     ("cp_get_local", "a Rust function name"),
     ("cp_kind_write_raw_once", "a Rust function name"),
     ("cp_serve_forwarded", "a Rust function name"),

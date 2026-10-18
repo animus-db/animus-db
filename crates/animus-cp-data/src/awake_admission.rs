@@ -411,6 +411,19 @@ impl AwakeAdmission {
         }
     }
 
+    /// ADR 0080 section 2 (quiesced groups): whether a client write that would
+    /// wake `stream`'s quiesced group is refused now. True only in the
+    /// severe-lag regime (`lag >= 100 ms`, the `A/4` step) **and** with the
+    /// awake population already at `A_eff`, for a group that holds no slot.
+    /// Below that regime the cap stays soft exactly as in ADR 0079.
+    #[must_use]
+    pub fn cold_wake_refuses(&self, stream: u64) -> bool {
+        let st = self.lock();
+        crate::load_monitor::lag_divisor(st.lag) >= 4
+            && !st.awake.contains(&stream)
+            && st.awake.len() >= st.a_eff()
+    }
+
     /// The `HardCap` negative control only: whether a hard cap would refuse a
     /// quiesced group's inbound work now (it holds no slot and none is free).
     /// Always `false` for the real, soft cap.
@@ -512,6 +525,24 @@ mod tests {
         assert_eq!(a.try_admit_wake(4, Nanos(10), &w), WakeAdmission::Deferred);
         assert_eq!(a.try_admit_wake(3, Nanos(11), &w), WakeAdmission::Admitted);
         assert_eq!(a.stats().queue_depth, 1);
+    }
+
+    #[test]
+    fn the_cold_wake_refusal_needs_severe_lag_and_a_full_awake_set_and_a_cold_group() {
+        let a = adm(2);
+        a.register(1);
+        a.register(2);
+        // At cap but healthy: the cap stays soft.
+        assert!(!a.cold_wake_refuses(3));
+        a.set_lag(30_000_000);
+        assert!(!a.cold_wake_refuses(3), "30 ms is not the A/4 regime");
+        a.set_lag(100_000_000);
+        // A_eff is 1 now, two groups are awake: a cold group is refused ...
+        assert!(a.cold_wake_refuses(3));
+        // ... but an already awake group never is.
+        assert!(!a.cold_wake_refuses(1));
+        a.set_lag(0);
+        assert!(!a.cold_wake_refuses(3), "recovers with the lag");
     }
 
     #[test]

@@ -1187,12 +1187,47 @@ pub enum Metric {
     /// at its `max_replicas` (recomputed each reconcile tick; non-zero is the
     /// "raise a cap or add a node" alarm).
     PlacementCapacityBlockedTablets,
+    // --- Overload admission (ADR 0080; appended, same slot-stability discipline) ---
+    /// A counter (ADR 0080): a client-class write refused with `Busy` (the group's propose backlog over its bound, or the node `QueuedBytes` budget hard). Reason `busy`.
+    OverloadShedBusy,
+    /// A counter (ADR 0080 2b): a leader-requiring request refused at once because its tablet had been leaderless for `leaderless_wait` or more. Reason `no_leader`.
+    OverloadShedNoLeader,
+    /// A counter (ADR 0080 2c): a request refused because its tablet already had `group_inflight_max` requests parked on this node. Reason `group_inflight`.
+    OverloadShedGroupInflight,
+    /// A counter (ADR 0080 2d): a forwarded request refused by the intra listener's `max_forwarded_inflight` gate. Reason `forwarded`.
+    OverloadShedForwarded,
+    /// A counter (ADR 0080 quiesced groups): a write that would have woken a quiesced group refused under severe lag with the awake cap reached. Reason `cold_wake`.
+    OverloadShedColdWake,
+    /// A counter (ADR 0080 section 4): a client-class reservation refused because the node `QueuedBytes` budget was at 100 %. Reason `budget`.
+    OverloadShedBudget,
+    /// A counter (ADR 0080 section 5, finding 4.7): an admin or console request refused by `max_admin_inflight`.
+    OverloadShedAdminInflight,
+    /// A high-water mark (ADR 0080 decision 1): the largest per-group propose backlog in entries this node has seen at a propose.
+    CpProposeBacklogEntriesHwm,
+    /// A high-water mark (ADR 0080 decision 1): the largest per-group propose backlog in bytes this node has seen at a propose.
+    CpProposeBacklogBytesHwm,
+    /// A counter (ADR 0080 section 3): `Vote`-class frames dropped (oldest) by a per-peer outbox.
+    TransportOutboxDroppedVote,
+    /// A counter (ADR 0080 section 3): `Heartbeat`-class frames dropped or coalesced away by a per-peer outbox.
+    TransportOutboxDroppedHeartbeat,
+    /// A counter (ADR 0080 section 3): `Replicate`/`Normal`-class frames dropped or superseded by a per-peer outbox.
+    TransportOutboxDroppedReplicate,
+    /// A level (ADR 0080 section 3): bytes queued across every per-peer outbox on this node now.
+    TransportOutboxBytes,
+    /// A level (ADR 0080 section 4): bytes charged to the node `QueuedBytes` budget now.
+    QueuedBytes,
+    /// A high-water mark (ADR 0080 section 4): most bytes ever charged to the node `QueuedBytes` budget at once.
+    QueuedBytesHwm,
+    /// A counter (ADR 0080 section 3): heartbeat messages dropped (oldest) from a group's `HeartbeatInbox` at its bound of 8.
+    HeartbeatInboxDropped,
+    /// A level (ADR 0080 section 3): per-peer writer tasks alive on this node now (the old task-per-frame count, now bounded by peers).
+    TransportOutboxPeers,
 }
 
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 170] = [
+    pub const ALL: [Metric; 187] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -1363,6 +1398,23 @@ impl Metric {
         Metric::CpRepairInflight,
         Metric::CpRepairInflightHwm,
         Metric::PlacementCapacityBlockedTablets,
+        Metric::OverloadShedBusy,
+        Metric::OverloadShedNoLeader,
+        Metric::OverloadShedGroupInflight,
+        Metric::OverloadShedForwarded,
+        Metric::OverloadShedColdWake,
+        Metric::OverloadShedBudget,
+        Metric::OverloadShedAdminInflight,
+        Metric::CpProposeBacklogEntriesHwm,
+        Metric::CpProposeBacklogBytesHwm,
+        Metric::TransportOutboxDroppedVote,
+        Metric::TransportOutboxDroppedHeartbeat,
+        Metric::TransportOutboxDroppedReplicate,
+        Metric::TransportOutboxBytes,
+        Metric::QueuedBytes,
+        Metric::QueuedBytesHwm,
+        Metric::HeartbeatInboxDropped,
+        Metric::TransportOutboxPeers,
     ];
 
     /// The stable exported name of this metric (snake_case, used as the text
@@ -1542,6 +1594,23 @@ impl Metric {
             Metric::CpRepairInflight => "cp_repair_inflight",
             Metric::CpRepairInflightHwm => "cp_repair_inflight_hwm",
             Metric::PlacementCapacityBlockedTablets => "placement_capacity_blocked_tablets",
+            Metric::OverloadShedBusy => "overload_shed_busy",
+            Metric::OverloadShedNoLeader => "overload_shed_no_leader",
+            Metric::OverloadShedGroupInflight => "overload_shed_group_inflight",
+            Metric::OverloadShedForwarded => "overload_shed_forwarded",
+            Metric::OverloadShedColdWake => "overload_shed_cold_wake",
+            Metric::OverloadShedBudget => "overload_shed_budget",
+            Metric::OverloadShedAdminInflight => "overload_shed_admin_inflight",
+            Metric::CpProposeBacklogEntriesHwm => "cp_propose_backlog_entries_hwm",
+            Metric::CpProposeBacklogBytesHwm => "cp_propose_backlog_bytes_hwm",
+            Metric::TransportOutboxDroppedVote => "transport_outbox_dropped_vote",
+            Metric::TransportOutboxDroppedHeartbeat => "transport_outbox_dropped_heartbeat",
+            Metric::TransportOutboxDroppedReplicate => "transport_outbox_dropped_replicate",
+            Metric::TransportOutboxBytes => "transport_outbox_bytes",
+            Metric::QueuedBytes => "queued_bytes",
+            Metric::QueuedBytesHwm => "queued_bytes_hwm",
+            Metric::HeartbeatInboxDropped => "heartbeat_inbox_dropped",
+            Metric::TransportOutboxPeers => "transport_outbox_peers",
         }
     }
 
@@ -1593,6 +1662,12 @@ impl MetricSink {
     /// on the same variant; each metric's own doc says which it is.
     pub fn set(&self, metric: Metric, value: u64) {
         self.counters[metric.slot()].store(value, Ordering::Relaxed);
+    }
+
+    /// Raise `metric`'s slot to `value` if it is lower (a **high-water
+    /// mark**, ADR 0080); never lowers it.
+    pub fn set_max(&self, metric: Metric, value: u64) {
+        self.counters[metric.slot()].fetch_max(value, Ordering::Relaxed);
     }
 
     /// Set the leadership gauge (1 = this node believes it is leader, 0 = not).
@@ -1677,6 +1752,11 @@ impl MetricsHandle {
     /// Overwrite a **level** metric's slot — see [`MetricSink::set`]'s doc.
     pub fn set(&self, metric: Metric, value: u64) {
         self.sink.set(metric, value);
+    }
+
+    /// Raise a **high-water mark** metric — see [`MetricSink::set_max`].
+    pub fn set_max(&self, metric: Metric, value: u64) {
+        self.sink.set_max(metric, value);
     }
 
     /// Set the leadership gauge.

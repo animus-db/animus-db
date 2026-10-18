@@ -3414,3 +3414,11 @@ disables a limit. Non-obvious:
   era, then `ReportNodeVersion` for the data members and finalize 2..=5; the `[1,1]`
   `b2_ext()` of `version_world` blocks the finalize ("a registered node's range
   excludes the target"). A default-weight `SetNodeCapacity` is a `NoOp`.
+
+## `ProposeResult::Busy` and `RaftMsg::transport_class` (ADR 0080)
+
+`ProposeResult::Busy` is a definite refusal (never appended): every `match` on a
+`ProposeResult` handles it. `RaftMsg::transport_class()` is exhaustive (no `_` arm) and
+returns the outbox class and supersede key: votes -> Vote, bare `AppendEntries` -> Heartbeat
+(superseded per group), `AppendEntries` with entries -> Replicate, `InstallSnapshot` -> Bulk.
+A new variant must pick a class. Test: `tests/it/transport_class.rs`.

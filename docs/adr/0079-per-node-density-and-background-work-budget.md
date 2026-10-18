@@ -715,3 +715,5 @@ PlacementCapacityBlockedTablets` is an additive appended variant.
   exceeded the second's. The oracle is now cumulative, `R x (ticks since the first
   commit + 2)`; both negative controls still fail it; green at K=30. Lesson:
   `docs/lessons/testing/2026-10-14-bound-a-rate-by-cumulative-commits-not-by-a-window-anchored-at-an-observation.md`.
+
+**2026-10-17 note:** the refusal path this ADR said it lacked now exists: ADR 0080 refuses a client write that would wake a quiesced group when lag >= 100 ms and the awake set is at `A_eff`, and the node gate shrinks with the same lag. The ADR 0079 awake cap and the ADR 0080 `QueuedBytes` budget are independent bounds that compose; size the pod for the floor plus the budget plus the working set.

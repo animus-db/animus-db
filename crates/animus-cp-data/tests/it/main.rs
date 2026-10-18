@@ -45,6 +45,7 @@ mod membership;
 mod metrics;
 mod mrec_apply;
 mod mrec_ship_scan_markers;
+mod overload_admission_corpus;
 mod preferred_leader_corpus;
 mod quiesced_apply_no_poll;
 mod quiesced_eventual_read;

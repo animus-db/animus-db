@@ -846,6 +846,19 @@ impl<E: Env> Network for EncryptedEnv<E> {
         self.env.send_stream(to, stream, payload).await;
     }
 
+    async fn send_stream_classed(
+        &self,
+        to: NodeId,
+        stream: u64,
+        class: crate::MsgClass,
+        supersede: Option<u64>,
+        payload: Vec<u8>,
+    ) {
+        self.env
+            .send_stream_classed(to, stream, class, supersede, payload)
+            .await;
+    }
+
     async fn recv_stream(&self, stream: u64) -> crate::Envelope {
         self.env.recv_stream(stream).await
     }

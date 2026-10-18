@@ -346,3 +346,5 @@ to *start* past the cliff.
 help while the round trip exceeds the window of the *next* round as well.
 `RaftCore::campaign_stats` (pre-vote rounds, grants counted and dropped, the
 responder's refusal reasons, ages) stays as a diagnostic.
+
+**2026-10-17 note:** ADR 0080 adds the other half of overload control: this ADR keeps elections alive under CPU starvation; ADR 0080 keeps the data path from queueing without bound (`ProposeResult::Busy`, edge admission, bounded transport queues). The `LoadMonitor` lag feeds both.

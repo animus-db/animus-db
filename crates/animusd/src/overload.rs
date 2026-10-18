@@ -62,9 +62,17 @@ impl CountGate {
 
     /// Take a slot, or `None` when `cap` are already out. Never blocks.
     pub(crate) fn try_acquire(&self) -> Option<Permit> {
+        self.try_acquire_capped(self.cap)
+    }
+
+    /// As [`try_acquire`](Self::try_acquire) against a caller-supplied cap
+    /// (never above the gate's own): the lag-scaled node gate (ADR 0080 2a)
+    /// passes its current effective size on every request.
+    pub(crate) fn try_acquire_capped(&self, cap: usize) -> Option<Permit> {
+        let cap = cap.min(self.cap);
         let mut cur = self.live.load(Ordering::Acquire);
         loop {
-            if cur >= self.cap {
+            if cur >= cap {
                 return None;
             }
             match self
@@ -95,6 +103,150 @@ impl CountGate {
     }
 }
 
+/// Requests parked on each tablet from this node's edge (ADR 0080 2c), capped
+/// at `cap` per tablet (`0` = off). An entry exists only while it is non-zero,
+/// so the map is bounded by the tablets with live requests.
+#[derive(Clone, Debug)]
+pub(crate) struct GroupInflight {
+    cap: usize,
+    live: Arc<std::sync::Mutex<std::collections::BTreeMap<animus_tablet::TabletId, usize>>>,
+}
+
+/// One request's slot on a tablet; returned on drop.
+#[derive(Debug)]
+pub(crate) struct GroupPermit {
+    tablet: animus_tablet::TabletId,
+    live: Arc<std::sync::Mutex<std::collections::BTreeMap<animus_tablet::TabletId, usize>>>,
+}
+
+impl Drop for GroupPermit {
+    fn drop(&mut self) {
+        let mut m = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = m.get_mut(&self.tablet) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                m.remove(&self.tablet);
+            }
+        }
+    }
+}
+
+impl GroupInflight {
+    pub(crate) fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            live: Arc::default(),
+        }
+    }
+
+    /// Take a slot on `tablet`, or `None` when it already has `cap` parked.
+    /// With `cap == 0` (off) every request is admitted without a slot.
+    pub(crate) fn try_acquire(
+        &self,
+        tablet: animus_tablet::TabletId,
+    ) -> Result<Option<GroupPermit>, ()> {
+        if self.cap == 0 {
+            return Ok(None);
+        }
+        let mut m = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        let n = m.entry(tablet).or_insert(0);
+        if *n >= self.cap {
+            return Err(());
+        }
+        *n += 1;
+        drop(m);
+        Ok(Some(GroupPermit {
+            tablet,
+            live: Arc::clone(&self.live),
+        }))
+    }
+
+    /// Requests parked on `tablet` now.
+    #[allow(dead_code)] // read by the overload tests
+    pub(crate) fn live(&self, tablet: animus_tablet::TabletId) -> usize {
+        self.live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&tablet)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+/// What a request for a tablet with no resolved leader should do (ADR 0080 2b).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LeaderlessVerdict {
+    /// Keep waiting (an election is normally shorter), until `until`.
+    Wait { until: animus_env::Nanos },
+    /// Refuse at once: the tablet has had no leader for `waited`.
+    Refuse { waited: Duration },
+}
+
+/// Per-tablet "unresolved since" state (ADR 0080 2b). Pure: time is passed
+/// in. An entry exists only while its tablet is unresolved, so the map is
+/// bounded by the number of currently leaderless tablets.
+#[derive(Clone, Debug)]
+pub(crate) struct LeaderlessTracker {
+    wait: Duration,
+    since: Arc<
+        std::sync::Mutex<std::collections::BTreeMap<animus_tablet::TabletId, animus_env::Nanos>>,
+    >,
+}
+
+impl LeaderlessTracker {
+    pub(crate) fn new(wait: Duration) -> Self {
+        Self {
+            wait,
+            since: Arc::default(),
+        }
+    }
+
+    /// `tablet`'s leader did not resolve at `now`: record the first miss and
+    /// say wait or refuse.
+    pub(crate) fn unresolved(
+        &self,
+        tablet: animus_tablet::TabletId,
+        now: animus_env::Nanos,
+    ) -> LeaderlessVerdict {
+        let mut m = self.since.lock().unwrap_or_else(|e| e.into_inner());
+        let since = *m.entry(tablet).or_insert(now);
+        let waited = Duration::from_nanos(now.0.saturating_sub(since.0));
+        if waited >= self.wait {
+            LeaderlessVerdict::Refuse { waited }
+        } else {
+            LeaderlessVerdict::Wait {
+                until: since.saturating_add(self.wait),
+            }
+        }
+    }
+
+    /// `tablet`'s leader resolved: clear it.
+    pub(crate) fn resolved(&self, tablet: animus_tablet::TabletId) {
+        let mut m = self.since.lock().unwrap_or_else(|e| e.into_inner());
+        if !m.is_empty() {
+            m.remove(&tablet);
+        }
+    }
+
+    /// How long `tablet` has been leaderless at `now` (zero when it is not).
+    pub(crate) fn waited(
+        &self,
+        tablet: animus_tablet::TabletId,
+        now: animus_env::Nanos,
+    ) -> Duration {
+        let m = self.since.lock().unwrap_or_else(|e| e.into_inner());
+        m.get(&tablet).map_or(Duration::ZERO, |s| {
+            Duration::from_nanos(now.0.saturating_sub(s.0))
+        })
+    }
+
+    /// Tablets currently tracked as leaderless.
+    #[allow(dead_code)] // read by the overload tests
+    pub(crate) fn len(&self) -> usize {
+        self.since.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+}
+
 /// How many refusal tasks may be in flight at once. A connection refused
 /// beyond this is closed without a response.
 const SHED_TASK_SLOTS: usize = 64;
@@ -119,16 +271,41 @@ pub(crate) struct OverloadState {
     /// Where the `overload_shed_*` counters are recorded (this node's own
     /// sink, the one `/metrics` exports).
     pub(crate) metrics: MetricsHandle,
+    /// ADR 0080: this node's propose admission (the per-group backlog bound
+    /// and the shared `QueuedBytes` budget). Handed to the tablet-host
+    /// reconciler (via `ElectionBackpressure`), fed its lag by the
+    /// `LoadMonitor`, and read by the edge for its lag-scaled gates.
+    pub(crate) admission: animus_cp_data::admission::NodeAdmission,
+    /// ADR 0080 2d: forwarded requests executing now on this node's intra
+    /// listener, separate from `inflight` so client work cannot starve the
+    /// forwards that complete a leader's writes (and the reverse).
+    pub(crate) forwarded: CountGate,
+    /// ADR 0080 2c: requests parked on one tablet from this node's edge.
+    pub(crate) group_inflight: GroupInflight,
+    /// ADR 0080 2b: per-tablet "no leader since" state for the fast-fail.
+    pub(crate) leaderless: LeaderlessTracker,
+    /// ADR 0080 section 5 (4.7): admin handlers executing now.
+    pub(crate) admin_inflight: CountGate,
 }
 
 impl OverloadState {
     pub(crate) fn new(limits: ResolvedLimits, metrics: MetricsHandle) -> Self {
+        let budget = animus_env::QueuedBytes::new(limits.queued_bytes_budget);
         Self {
             limits,
+            admission: animus_cp_data::admission::NodeAdmission::new(
+                limits.backlog_limits(),
+                budget,
+                metrics.clone(),
+            ),
             metrics,
             dynamo_conns: CountGate::new(limits.max_connections),
             inflight: CountGate::new(limits.max_inflight_requests),
             shed_tasks: CountGate::new(SHED_TASK_SLOTS),
+            forwarded: CountGate::new(limits.max_forwarded_inflight),
+            group_inflight: GroupInflight::new(limits.group_inflight_max),
+            leaderless: LeaderlessTracker::new(limits.leaderless_wait),
+            admin_inflight: CountGate::new(limits.max_admin_inflight),
         }
     }
 }
@@ -222,5 +399,74 @@ mod tests {
         }
         assert_eq!(g.live(), 0, "every permit was returned");
         assert!(g.peak() <= 8, "peak {} exceeded the cap", g.peak());
+    }
+
+    #[test]
+    fn a_capped_acquire_honours_a_smaller_cap_but_never_a_larger_one() {
+        let g = CountGate::new(4);
+        let a = g.try_acquire_capped(2).expect("1");
+        let b = g.try_acquire_capped(2).expect("2");
+        assert!(g.try_acquire_capped(2).is_none(), "the lag-scaled cap");
+        let c = g.try_acquire_capped(100).expect("the gate's own cap is 4");
+        let d = g.try_acquire_capped(100).expect("4th");
+        assert!(
+            g.try_acquire_capped(100).is_none(),
+            "never above its own cap"
+        );
+        drop((a, b, c, d));
+        assert_eq!(g.live(), 0);
+    }
+
+    #[test]
+    fn group_inflight_is_per_tablet_and_cleans_up() {
+        let g = GroupInflight::new(2);
+        let t1 = animus_tablet::TabletId(1);
+        let t2 = animus_tablet::TabletId(2);
+        let a = g.try_acquire(t1).expect("room").expect("slot");
+        let b = g.try_acquire(t1).expect("room").expect("slot");
+        assert!(g.try_acquire(t1).is_err(), "t1 is full");
+        assert!(
+            g.try_acquire(t2).is_ok(),
+            "a full tablet does not block another"
+        );
+        drop(a);
+        assert!(g.try_acquire(t1).is_ok());
+        drop(b);
+        // Everything released: the map is empty again (bounded memory).
+        assert_eq!(g.live(t1), 0);
+        assert_eq!(g.live.lock().unwrap().len(), 0);
+        assert!(
+            GroupInflight::new(0)
+                .try_acquire(t1)
+                .expect("off")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn leaderless_waits_then_refuses_and_recovers() {
+        use animus_env::Nanos;
+        let t = LeaderlessTracker::new(Duration::from_secs(2));
+        let tab = animus_tablet::TabletId(7);
+        let at = |ms: u64| Nanos(ms * 1_000_000);
+        match t.unresolved(tab, at(1_000)) {
+            LeaderlessVerdict::Wait { until } => assert_eq!(until, at(3_000)),
+            v => panic!("{v:?}"),
+        }
+        assert!(matches!(
+            t.unresolved(tab, at(2_999)),
+            LeaderlessVerdict::Wait { .. }
+        ));
+        assert!(matches!(
+            t.unresolved(tab, at(3_000)),
+            LeaderlessVerdict::Refuse { waited } if waited == Duration::from_secs(2)
+        ));
+        assert_eq!(t.len(), 1);
+        t.resolved(tab);
+        assert_eq!(t.len(), 0, "recovers on its own");
+        assert!(matches!(
+            t.unresolved(tab, at(9_000)),
+            LeaderlessVerdict::Wait { .. }
+        ));
     }
 }
