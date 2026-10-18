@@ -123,6 +123,19 @@ nav.main a.nav-cta.here { text-decoration: none; background: var(--accent-soft);
 @media (max-width: 860px) {
   :root { --pad-x: 28px; --sec-y: 72px; }
 }
+/* Phones: row 1 = brand left, Install + theme switch grouped right; the text
+   links drop to their own compact row. CSS-only: the two wrappers dissolve
+   (display: contents) so their children order as items of the one .bar. */
+@media (max-width: 640px) {
+  header.site .bar { gap: 8px 16px; justify-content: flex-start; }
+  .head-right, nav.main { display: contents; }
+  .brand { order: 1; margin-right: auto; }
+  nav.main a.nav-cta { order: 2; padding: 6px 14px; font-size: 15px; }
+  .theme-switch { order: 2; gap: 12px; }
+  header.site .bar::after { content: ""; order: 3; flex: 1 0 100%; height: 0; }
+  nav.main a:not(.nav-cta) { order: 4; margin-right: 20px; }
+  nav.main a[href^="https://github.com"] { display: none; }
+}
 @media (max-width: 560px) {
   :root { --pad-x: 20px; --sec-y: 56px; }
   body { font-size: 17px; }
