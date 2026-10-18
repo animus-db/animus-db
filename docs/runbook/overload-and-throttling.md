@@ -13,18 +13,26 @@ Conventions are in [README.md](README.md). Related alert pages:
 | Request size caps | 1 MiB HTTP body cap on the edge; AWS-faithful item/page/batch limits (ADR 0072). | `animus-node/src/http.rs`, `animus_dynamo::limits` |
 | Inbox cap | Per-stream inbound frame queue is bounded, drop-oldest ([network.md](network.md)). | `demux_*` metrics |
 
-**Not implemented (pending R-01(d)): connection limits, admission control, a global
-concurrency cap, and a defined overload response when a node is saturated.** A
-node under more load than it can serve slows down and times out; clients that retry
-make it worse (`client_requests_abandoned` counts requests whose client left
-first). Do not assume a bounded queue exists. Throttling is **off by default**:
+**Connection and in-flight limits exist (R-01(d), ADR 0074 section 2).** The
+DynamoDB listener caps concurrent connections (`overload.max_connections`, 4096)
+and node-wide in-flight requests (`overload.max_inflight_requests`, 2048); past
+either, the node answers 503 `ServiceUnavailable` at once and never queues, and
+`overload_shed_conn_cap` / `overload_shed_admission` count it (the admin, console,
+client and intra listeners have their own caps: `overload_shed_admin_conn_cap`,
+`overload_shed_peer_conn_cap`). Pipelining is bounded at 1 per connection. See
+[Change the limits](#change-the-limits) and `docs/resource-bounds.md`. What is
+**not** bounded yet is the data path behind admission: a node whose disk or apply
+path falls behind still queues proposals on a leader, and a leaderless tablet parks
+requests for the client budget (ADR 0080 proposes the fixes). A saturated node can
+therefore still slow down and time out; clients that retry make it worse
+(`client_requests_abandoned` counts requests whose client left first). Throttling is **off by default**:
 a table is `PAY_PER_REQUEST` (unthrottled) unless it has its own
 `ProvisionedThroughput` or the cluster default below is set.
 
 ## Diagnose
 
 ```sh
-curl -s http://<dyn>/metrics | grep -E '^(throttled_reads|throttled_writes|client_requests_abandoned|cp_proposals_rejected_not_leader|cp_read_barriers_timed_out) '
+curl -s http://<dyn>/metrics | grep -E '^(overload_shed_[a-z_]+|throttled_reads|throttled_writes|client_requests_abandoned|cp_proposals_rejected_not_leader|cp_read_barriers_timed_out) '
 curl -s http://<admin>/admin/metrics | jq '.throttle, .request_rates'   # per tablet: tokens left, rates, throttled counts
 ```
 
@@ -36,8 +44,11 @@ hot tablet. `request_rates` shows which tablets take the writes.
 1. **Throttled** (400 `ProvisionedThroughputExceededException`, message
    "table `T` exceeds its provisioned write capacity"): raise the limit, split the hot
    tablet, spread keys, or let clients back off. Expected behaviour, not a fault.
-2. **503 `ServiceUnavailable`**: check for a split or leader change in progress;
-   clients should retry. Sustained: [tablet-unavailable.md](tablet-unavailable.md).
+2. **503 `ServiceUnavailable`**: first check the `overload_shed_*` counters: a
+   rising `overload_shed_conn_cap` or `overload_shed_admission` is the node's own
+   connection or in-flight limit (raise it only if CPU and disk have headroom, else add
+   nodes); otherwise check for a split or leader change in progress.
+   Clients should retry. Sustained: [tablet-unavailable.md](tablet-unavailable.md).
 3. **Latency up, no throttles**: resource saturation (CPU, disk); see
    [disk-full.md](disk-full.md) and [capacity-planning.md](capacity-planning.md);
    add nodes (growth is online: [node-replace.md](node-replace.md) A step 2) so
@@ -66,6 +77,12 @@ A provisioned table is also pre-split to a throughput-derived minimum tablet cou
 `--auto-split-bytes` / `cluster_settings.auto_split_bytes` (operator
 `spec.autoSplitBytes`) is set; write-rate splitting is `--auto-split-ops-rate`.
 
+Per node (not replicated; restart required): the `overload` section of the node's
+entry in the cluster config (`max_connections`, `max_inflight_requests`,
+`max_admin_connections`, `max_peer_connections`) or the `animusd` flags
+`--max-connections N` / `--max-inflight N`. Zero is rejected, there is no
+"unlimited" setting, and a flag plus the same config field is a startup error.
+
 Note the ADR 0065 consequence: eventually-consistent reads are admitted per
 replica, so aggregate read admission can reach RF times the per-tablet share.
 
@@ -79,5 +96,6 @@ exact error body above, `throttled_writes 97` on `/metrics` and the matching
 ## Maturity
 
 The throttle path is covered by simulation and real-thread tests; the dev-cluster
-check above was run by the author. No overload or soak behaviour of a saturated
-real node has been measured (pending R-01(a)/(b)/(d), B-01).
+check above was run by the author. The connection and in-flight caps are proven
+over real TCP (`crates/animusd/tests/overload.rs`); no soak behaviour of a saturated
+real node has been measured (pending R-01(a)/(b), B-01).
