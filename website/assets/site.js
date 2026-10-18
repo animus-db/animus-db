@@ -80,15 +80,27 @@
       block.appendChild(btn);
     });
 
-    // ---- docs scrollspy --------------------------------------------------
-    var links = document.querySelectorAll(".doc-nav a[href^='#']");
+    // ---- docs scrollspy + mobile "On this page" -------------------------
+    var toc = document.querySelector(".doc-toc");
+    var current = toc && toc.querySelector(".doc-toc-current");
+    if (toc) {
+      // Close the dropdown once a section is picked.
+      toc.addEventListener("click", function (e) {
+        if (e.target.closest("a[href^='#']")) { toc.removeAttribute("open"); }
+      });
+    }
+    var links = document.querySelectorAll(".doc-nav a[href^='#'], .doc-toc a[href^='#']");
     if (!links.length || !("IntersectionObserver" in window)) return;
     var byId = {};
     var targets = [];
     links.forEach(function (a) {
       var el = document.getElementById(a.getAttribute("href").slice(1));
-      if (el) { byId[el.id] = a; targets.push(el); }
+      if (!el) return;
+      if (!byId[el.id]) { byId[el.id] = []; targets.push(el); }
+      byId[el.id].push(a);
     });
+    // Ignore what sits under the sticky header (and the mobile dropdown).
+    var pad = parseInt(getComputedStyle(document.documentElement).scrollPaddingTop, 10) || 80;
     var visible = new Set();
     var obs = new IntersectionObserver(function (entries) {
       entries.forEach(function (entry) {
@@ -98,8 +110,9 @@
       var first = targets.filter(function (t) { return visible.has(t.id); })[0];
       if (!first) return;
       links.forEach(function (a) { a.classList.remove("active"); });
-      byId[first.id].classList.add("active");
-    }, { rootMargin: "-80px 0px -70% 0px", threshold: 0 });
+      byId[first.id].forEach(function (a) { a.classList.add("active"); });
+      if (current) { current.textContent = byId[first.id][0].textContent; }
+    }, { rootMargin: "-" + (pad + 8) + "px 0px -60% 0px", threshold: 0 });
     targets.forEach(function (t) { obs.observe(t); });
   });
 })();

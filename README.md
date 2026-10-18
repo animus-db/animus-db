@@ -74,6 +74,22 @@ leaderless AP plane, which is deferred and its code deleted.
 | `animus-cli` | Operator/client CLI (`status` / `put` / `get`) |
 | `animus-operator` | Kubernetes operator (`kube-rs`) reconciling the `AnimusCluster` custom resource into a running per-process AnimusDB deployment |
 
+## Quick start with Docker
+
+The `latest` image tracks `main` (linux/amd64 only, pre-alpha). It has no shell,
+so generate a single-node config that binds all interfaces, then run it:
+
+```sh
+docker run --rm ghcr.io/animus-db/animusd:latest gen-config --nodes 1 --host 0.0.0.0 > animus.json
+docker run -d --name animusd -p 7102:7102 -p 7103:7103 -p 7105:7105 \
+  -v animus-data:/var/lib/animus -v "$PWD/animus.json:/etc/animus/cluster.json:ro" \
+  ghcr.io/animus-db/animusd:latest \
+  --config /etc/animus/cluster.json --node 0 --dir /var/lib/animus
+aws dynamodb list-tables --endpoint-url http://localhost:7102
+```
+
+DynamoDB is on 7102, the operator dashboard on 7103 and the data console on 7105.
+
 ## Running a cluster
 
 In one process (dev convenience):

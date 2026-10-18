@@ -3,15 +3,19 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Install AnimusDB</title>
+<title>Install AnimusDB — run a DynamoDB-compatible cluster on-prem or on Kubernetes</title>
 <meta name="description" content="Build AnimusDB from source, run a cluster on your laptop, and connect with the AWS SDK, the aws CLI, or the animus CLI.">
 <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
 <link rel="canonical" href="https://animusdb.io/install.html">
-<meta property="og:title" content="Install AnimusDB">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://animusdb.io/install.html">
+<meta property="og:title" content="Install AnimusDB — run a DynamoDB-compatible cluster on-prem or on Kubernetes">
 <meta property="og:description" content="Build from source, start a cluster, and connect with tools you already have.">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Work+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<meta property="og:image" content="https://animusdb.io/assets/og-card.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="AnimusDB — the DynamoDB API on infrastructure you own">
+<meta name="twitter:card" content="summary_large_image">
 <link rel="stylesheet" href="assets/tokens.css">
 <link rel="stylesheet" href="assets/site.css">
 <script src="assets/site.js" defer></script>
@@ -83,8 +87,8 @@
     <span class="kicker">Install</span>
     <h1>Get a cluster running</h1>
     <p>
-      AnimusDB builds from source with Cargo. There are no packages or container images
-      yet — clone, build, run. About a minute of typing plus a compile.
+      Run the container image, or build from source with Cargo. There are no distro
+      packages yet. Either way it is a couple of commands, plus a compile if you build.
     </p>
   </div>
 </div>
@@ -94,6 +98,7 @@
     <div class="cols">
       <div>
         <h4>Quick start</h4>
+        <a href="#docker">Run with Docker</a>
         <a href="#prereqs">Prerequisites</a>
         <a href="#build">Build from source</a>
         <a href="#run">Run a cluster</a>
@@ -118,6 +123,55 @@
 
   <div class="doc-body">
 
+    <section id="docker">
+      <h2>Run with Docker</h2>
+      <p>
+        The quickest way to try it: one node in a container, with the DynamoDB endpoint and both
+        web consoles published on your machine. Generate a single-node config that binds every
+        interface (the image has no shell, so the config comes from the image's own
+        <code>gen-config</code>), then start the node with a named volume for its data.
+      </p>
+      <div class="code">
+        <div class="code-head"><span class="lights"><i></i><i></i><i></i></span><span class="title">docker</span></div>
+<pre><span class="p">$</span> <span class="k">docker run --rm ghcr.io/animus-db/animusd:latest gen-config --nodes 1 --host 0.0.0.0 &gt; animus.json</span>
+<span class="p">$</span> <span class="k">docker run -d --name animusd \</span>
+    <span class="k">-p 7102:7102 -p 7103:7103 -p 7105:7105 \</span>
+    <span class="k">-v animus-data:/var/lib/animus \</span>
+    <span class="k">-v "$PWD/animus.json:/etc/animus/cluster.json:ro" \</span>
+    <span class="k">ghcr.io/animus-db/animusd:latest \</span>
+    <span class="k">--config /etc/animus/cluster.json --node 0 --dir /var/lib/animus</span></pre>
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th class="w-170">Port</th><th>What it serves</th></tr></thead>
+          <tbody>
+            <tr><td><code>7102</code></td><td>The DynamoDB endpoint: <code>http://localhost:7102</code>.</td></tr>
+            <tr><td><code>7103</code></td><td>The operator dashboard: <code>http://localhost:7103</code>.</td></tr>
+            <tr><td><code>7105</code></td><td>The data console: <code>http://localhost:7105</code>.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        Data lives in the <code>animus-data</code> volume, so it survives <code>docker rm</code>.
+        Once it logs <code>ready</code>, use the AWS CLI exactly as in
+        <a href="#connect">Connect to it</a>, with <code>ANIMUS=http://localhost:7102</code>.
+      </p>
+      <div class="callout">
+        <span class="label">What this image is</span>
+        <p>
+          <code>latest</code> tracks the <code>main</code> branch; there are no version tags yet.
+          It is built for <code>linux/amd64</code> only, so Apple-silicon Macs run it under
+          emulation. It is pre-alpha, and both consoles are unauthenticated: publish the ports
+          only on a machine you trust (use <code>-p 127.0.0.1:7102:7102</code> to keep them
+          off the network).
+        </p>
+      </div>
+      <p class="muted">
+        Prefer to build it yourself, or want a three-node cluster in one process? Use the
+        source build below.
+      </p>
+    </section>
+
     <section id="prereqs">
       <h2>Prerequisites</h2>
       <p>
@@ -137,6 +191,7 @@
 
     <section id="build">
       <h2>Build from source</h2>
+      <p>The alternative to the container image, and the way to run a multi-node cluster in one process.</p>
       <div class="code">
         <div class="code-head"><span class="lights"><i></i><i></i><i></i></span><span class="title">build</span></div>
 <pre><span class="p">$</span> <span class="k">git clone https://github.com/animus-db/animus-db.git</span>
@@ -146,7 +201,7 @@
       <p>That produces two binaries in <code>target/release</code>:</p>
       <div class="table-scroll">
         <table>
-          <thead><tr><th style="width:170px">Binary</th><th>What it is</th></tr></thead>
+          <thead><tr><th class="w-170">Binary</th><th>What it is</th></tr></thead>
           <tbody>
             <tr><td><code>animusd</code></td><td>The node server. One process per node; it hosts the control plane, the data plane and every wire endpoint.</td></tr>
             <tr><td><code>animus</code></td><td>The operator and client CLI — cluster status, simple get/put, and the whole <code>admin</code> subcommand tree.</td></tr>
@@ -286,7 +341,7 @@ table.put_item(Item={<span class="s">"id"</span>: <span class="s">"a-2"</span>, 
           <p>On the <strong>console</strong> port. A DynamoDB-shaped app for application developers: browse tables, inspect and edit items, review a table's configuration and its stream.</p>
         </div>
       </div>
-      <p class="muted" style="margin-top:18px">Both are printed in the startup banner. Neither has authentication — see <a href="#trouble">the security note</a>. (SigV4 verification, when enabled, applies only to the DynamoDB client port.)</p>
+      <p class="muted mt-18">Both are printed in the startup banner. Neither has authentication — see <a href="#trouble">the security note</a>. (SigV4 verification, when enabled, applies only to the DynamoDB client port.)</p>
     </section>
 
     <section id="multinode">
@@ -386,7 +441,7 @@ table.put_item(Item={<span class="s">"id"</span>: <span class="s">"a-2"</span>, 
       </p>
       <div class="table-scroll">
         <table>
-          <thead><tr><th style="width:110px">Offset</th><th style="width:130px">Node 0</th><th style="width:130px">Listener</th><th>Purpose</th><th style="width:120px">Exposure</th></tr></thead>
+          <thead><tr><th class="w-110">Offset</th><th class="w-130">Node 0</th><th class="w-130">Listener</th><th>Purpose</th><th class="w-120">Exposure</th></tr></thead>
           <tbody>
             <tr><td>+0</td><td><code>7100</code></td><td>internal</td><td>Raft traffic between nodes</td><td><span class="pill no">Cluster-internal</span></td></tr>
             <tr><td>+1</td><td><code>7101</code></td><td>client</td><td>The native length-prefixed protocol the <code>animus</code> CLI speaks</td><td><span class="pill part">Trusted</span></td></tr>
@@ -397,7 +452,7 @@ table.put_item(Item={<span class="s">"id"</span>: <span class="s">"a-2"</span>, 
           </tbody>
         </table>
       </div>
-      <p class="muted" style="margin-top:14px">
+      <p class="muted mt-14">
         Only the DynamoDB port can verify a caller, and only if you turn on SigV4 — off by
         default. Everywhere else "trusted" means a network you control. Keep the internal,
         intra, admin and console ports off any externally reachable address.
@@ -408,7 +463,7 @@ table.put_item(Item={<span class="s">"id"</span>: <span class="s">"a-2"</span>, 
       <h2>Common flags</h2>
       <div class="table-scroll">
         <table>
-          <thead><tr><th style="width:250px">Flag</th><th>Effect</th></tr></thead>
+          <thead><tr><th class="w-250">Flag</th><th>Effect</th></tr></thead>
           <tbody>
             <tr><td><code>--config FILE --node I</code></td><td>Run node <code>I</code> of a generated cluster config. The normal production invocation.</td></tr>
             <tr><td><code>--cluster N</code></td><td>Run an <code>N</code>-node cluster in a single process. Development convenience.</td></tr>
@@ -425,7 +480,7 @@ table.put_item(Item={<span class="s">"id"</span>: <span class="s">"a-2"</span>, 
           </tbody>
         </table>
       </div>
-      <p class="muted" style="margin-top:14px">Run <code>animusd</code> with no arguments for the full usage summary, and <code>animus</code> for the CLI's.</p>
+      <p class="muted mt-14">Run <code>animusd</code> with no arguments for the full usage summary, and <code>animus</code> for the CLI's.</p>
     </section>
 
     <section id="data">
