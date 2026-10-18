@@ -12611,3 +12611,5 @@ bg_compaction_io_bytes_per_sec` (0 = off, node-local class L: no Gate, no format
 node bucket; the operator exposes only the explicit `spec.background.compactionIoMiBPerSec`.
 `sim_cluster_lsm_stall.rs` is the Tier 2 wire cell (`SimStall` thread-local in
 `sim_cluster_lsm.rs` installs the engine options and a shared compaction wedge).
+
+**Dashboard/console skin (2026-10-18):** both apps follow the shared tokens (Archivo UI, `--font-display` 75%/800 uppercase headings, accent-filled primary buttons, outlined quiet status pills, no black blocks). Archivo is embedded as base64 in `fonts.css` (`fonts/archivo-latin.woff2`); Work Sans was dropped. See `docs/lessons/general/2026-10-18-app-skin-follows-shared-tokens-and-fonts-are-base64.md`.

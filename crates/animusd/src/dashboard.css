@@ -14,7 +14,7 @@
  * surface (the Streams tail-records log) sits on the ordinary themed surface
  * with a plain border — no forced-dark interior, no offset shadow. A
  * functional status indicator (health, replica/tablet/stream state) is a
- * filled, tinted pill at a full 999px radius; nothing here is a decorative
+ * quiet outlined pill (state colour on text and a currentColor hairline, no fill) at a full 999px radius; nothing here is a decorative
  * stamped-outline chip any more. A live/updating value or an active nav/tab
  * state gets the one emphasis device in the system — a 2px accent underline
  * (`.live`, tokens.css) — never a glow, gradient, or blur shadow.
@@ -63,15 +63,15 @@ button:hover { border-color: var(--text3); }
 button:disabled { opacity: .45; cursor: not-allowed; }
 /* Primary CTA is ink-filled — Ledger's one solid-fill recipe. Accent stays a
    text/underline/hatch color, never a filled button background. */
-button.primary { background: var(--text); color: var(--bg); border: 1px solid var(--text); font-weight: 600; }
-button.primary:hover { background: var(--text2); }
+button.primary { background: var(--accent-fill); color: var(--accent-ink); border: 1px solid var(--accent-fill); font-weight: 600; }
+button.primary:hover { background: var(--accent-hi); }
 button.danger-text { background: none; border: none; color: var(--danger); font-weight: 500; padding: 0; }
 button.link-text { background: none; border: none; color: var(--accent); font-weight: 600; padding: 0; text-decoration: none; }
 
 /* Segmented toggle (view switches, protocol switches) — outer keyline only. */
 .seg-group { display: inline-flex; align-items: center; gap: 0; border: 1px solid var(--border-strong); border-radius: var(--radius); overflow: hidden; background: var(--surface); }
 .seg-group button { background: none; border: none; border-radius: 0; padding: 6px 13px; font: 600 11.5px var(--font-ui); color: var(--text2); }
-.seg-group button.active { background: var(--text); color: var(--bg); }
+.seg-group button.active { background: var(--accent-fill); color: var(--accent-ink); }
 
 /* ---- top bar ---- */
 header.topbar {
@@ -81,7 +81,7 @@ header.topbar {
 header.topbar .brand { display: flex; align-items: center; gap: 9px; }
 header.topbar .brand .logo { flex: none; }
 header.topbar .brand .wordmark { display: flex; align-items: baseline; gap: 9px; }
-header.topbar .brand .name { font: 700 16px var(--font-ui); letter-spacing: -0.01em; }
+header.topbar .brand .name { font-size: 20px; font-family: var(--font-display); font-stretch: var(--display-stretch); font-weight: var(--display-weight); text-transform: uppercase; letter-spacing: 0; }
 header.topbar .brand .env { font: 400 11px var(--font-mono); color: var(--text2); }
 header.topbar .banner {
   font: 600 11px var(--font-ui); color: var(--warn); background: var(--warn-bg);
@@ -91,14 +91,14 @@ header.topbar .banner {
 header.topbar .updated { font-size: 10.5px; font-family: var(--font-mono); color: var(--text2); }
 header.topbar select#auto { font-size: 12.5px; }
 header.topbar button#refresh {
-  background: var(--text); color: var(--bg); border: 1px solid var(--text); font-weight: 600;
+  background: var(--accent-fill); color: var(--accent-ink); border: 1px solid var(--accent-fill); font-weight: 600;
 }
-header.topbar button#refresh:hover { background: var(--text2); }
+header.topbar button#refresh:hover { background: var(--accent-hi); }
 
-.health-pill { display: flex; align-items: center; gap: 7px; padding: 3px 12px; border-radius: 999px; background: var(--ok-bg); }
+.health-pill { display: flex; align-items: center; gap: 7px; padding: 3px 12px; border-radius: 999px; border: 1px solid var(--rule); }
 .health-pill .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); }
 .health-pill .label { font: 600 11px var(--font-ui); letter-spacing: .04em; text-transform: uppercase; color: var(--ok); }
-.health-pill.degraded, .health-pill.critical { background: var(--danger-bg); }
+.health-pill.degraded, .health-pill.critical { border-color: var(--danger); }
 .health-pill.degraded .dot, .health-pill.critical .dot { background: var(--danger); animation: blink 1.4s ease-in-out infinite; }
 .health-pill.degraded .label, .health-pill.critical .label { color: var(--danger); }
 @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
@@ -117,7 +117,7 @@ header.topbar button#refresh:hover { background: var(--text2); }
 /* ---- shell: sidebar + main ---- */
 .shell { display: flex; flex: 1; min-height: 0; }
 .sidebar {
-  width: 176px; flex: none; border-right: 1px solid var(--border-strong);
+  width: 176px; flex: none; border-right: 1px solid var(--rule);
   padding: 18px 0; display: flex; flex-direction: column; gap: 1px;
 }
 .sidebar button.navlink {
@@ -133,7 +133,7 @@ main { flex: 1; min-width: 0; overflow-y: auto; padding: 24px 32px 60px; }
 main section { display: none; flex-direction: column; gap: 18px; }
 main section.active { display: flex; }
 .view-head { display: flex; align-items: baseline; justify-content: space-between; }
-.view-head h1 { margin: 0; font: 600 23px var(--font-ui); letter-spacing: -0.01em; }
+.view-head h1 { margin: 0; font-size: 28px; line-height: 1.1; font-family: var(--font-display); font-stretch: var(--display-stretch); font-weight: var(--display-weight); text-transform: uppercase; letter-spacing: 0; }
 .view-max { max-width: 1180px; width: 100%; }
 
 /* ---- cards / rows / tables (reused across views) ---- */
@@ -141,32 +141,33 @@ main section.active { display: flex; }
   background: var(--surface); border: 1px solid var(--border);
   border-radius: var(--radius-panel); padding: 16px 18px; box-shadow: none;
 }
-.card h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--text3); margin: 0 0 10px; font-weight: 600; font-family: var(--font-ui); }
+.card h2 { font-size: 15px; color: var(--text); margin: 0 0 10px; font-family: var(--font-display); font-stretch: var(--display-stretch); font-weight: var(--display-weight); text-transform: uppercase; letter-spacing: 0; }
 .scroll { overflow-x: auto; }
 .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 .row label { color: var(--text3); font-size: 11.5px; }
 table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 th, td { text-align: left; padding: 8px 12px; white-space: nowrap; }
 th { color: var(--text2); font-weight: 600; font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em; border-bottom: 1px solid var(--border); }
-td { border-bottom: 1px solid var(--ink-16); }
+td { border-bottom: 1px solid var(--rule); }
 tr.clickable { cursor: pointer; }
 tr.clickable:hover { background: var(--surface2); }
 tr.selected td { background: var(--surface); }
 tr.selected td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
 
-/* Functional status pills: filled, tinted chip at a full pill radius — off
+/* Functional status pills: quiet outlined chip at a full pill radius — off
    the `--radius`/`--radius-panel` scale entirely, same as the website's
    compatibility pills (ADR 0056's 2026-08-31 website-skin amendment). */
 .pill {
   display: inline-block; padding: 2px 9px; border-radius: 999px;
   font: 600 10px var(--font-mono); text-transform: uppercase; letter-spacing: .04em;
+  background: transparent; border: 1px solid currentColor;
 }
-.Active, .ok, .healthy   { color: var(--ok); background: var(--ok-bg); }
-.Down, .err, .quorum-lost { color: var(--danger); background: var(--danger-bg); }
-.Leaving, .Joining, .under-replicated, .warn { color: var(--warn); background: var(--warn-bg); }
+.Active, .ok, .healthy   { color: var(--ok); }
+.Down, .err, .quorum-lost { color: var(--danger); }
+.Leaving, .Joining, .under-replicated, .warn { color: var(--warn); }
 /* `forming` is a transition, not a data-risk state (health ≈ "is the data at
    risk", see dashboard_core.js::computeHealth) — neutral/dim, not orange. */
-.forming { color: var(--text3); background: var(--surface2); }
+.forming { color: var(--text3); }
 .leader { color: var(--accent); font-weight: 600; }
 .dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; flex: none; }
 .dot.ok-dot { background: var(--ok); }
@@ -176,10 +177,10 @@ tr.selected td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
 
 /* ---- Overview ---- */
 /* Filled full-width band: brings its own horizontal inset. */
-.health-banner { border-top: 1px solid var(--border); border-bottom: 1px solid var(--ink-30); background: var(--surface); padding: 14px 20px; }
+.health-banner { border-top: 1px solid var(--border); border-bottom: 1px solid var(--rule); background: var(--surface); padding: 14px 20px; }
 .health-banner.degraded, .health-banner.critical { border-top-color: var(--danger); }
 .stat-tiles { display: flex; }
-.stat-tile { flex: 1; padding: 0 22px; border-left: 1px solid var(--ink-16); }
+.stat-tile { flex: 1; padding: 0 22px; border-left: 1px solid var(--rule); }
 .stat-tile:first-child { padding-left: 0; border-left: none; }
 .stat-tile .label { font: 600 10.5px var(--font-ui); text-transform: uppercase; letter-spacing: .08em; color: var(--text2); margin-bottom: 8px; }
 .stat-tile .value { font: 500 27px var(--font-mono); letter-spacing: -0.03em; }
@@ -203,7 +204,7 @@ tr.selected td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
    operator-proposed id. */
 .id-trunc { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: bottom; }
 
-.list-row { display: flex; align-items: center; gap: 11px; padding: 8px 0; border-bottom: 1px solid var(--ink-16); }
+.list-row { display: flex; align-items: center; gap: 11px; padding: 8px 0; border-bottom: 1px solid var(--rule); }
 .list-row:last-child { border-bottom: none; }
 .list-row .id { font: 500 12.5px var(--font-mono); width: 92px; }
 .list-row .detail { font: 400 12px var(--font-ui); color: var(--text2); flex: 1; }
@@ -211,15 +212,15 @@ tr.selected td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
 
 .grid-2 { display: grid; grid-template-columns: 1.1fr 1fr; gap: 28px; align-items: start; }
 .section-head { display: flex; align-items: baseline; justify-content: space-between; border-bottom: 1px solid var(--border); padding-bottom: 6px; margin-bottom: 12px; }
-.section-head .title { font: 600 15px var(--font-ui); }
+.section-head .title { font-size: 18px; font-family: var(--font-display); font-stretch: var(--display-stretch); font-weight: var(--display-weight); text-transform: uppercase; letter-spacing: 0; }
 
 /* Balance bars: hatched fill on a neutral track, keyline baseline. */
-.balance-bars { display: flex; align-items: flex-end; gap: 4px; height: 56px; border-bottom: 1px solid var(--text); }
+.balance-bars { display: flex; align-items: flex-end; gap: 4px; height: 56px; border-bottom: 1px solid var(--border-strong); }
 .balance-bars .bar { flex: 1; min-width: 3px; background: repeating-linear-gradient(45deg, var(--accent) 0 3px, var(--hatch) 3px 6px); }
 .balance-bars .bar.down { background: var(--danger); opacity: .55; }
 
 /* ---- Placement ---- */
-.placement-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 1px; background: var(--ink-16); border: 1px solid var(--ink-16); border-radius: var(--radius-panel); overflow: hidden; }
+.placement-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 1px; background: var(--rule); border: 1px solid var(--rule); border-radius: var(--radius-panel); overflow: hidden; }
 .placement-card { background: var(--surface); padding: 16px; cursor: pointer; }
 .placement-card:hover { background: var(--surface2); }
 .placement-card.selected { background: var(--surface); box-shadow: inset 0 0 0 1.5px var(--accent); }
@@ -228,7 +229,7 @@ tr.selected td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
 .placement-card .head .idw .id-trunc { max-width: 120px; }
 .placement-card .status-text { font: 600 11px var(--font-ui); text-transform: uppercase; letter-spacing: .04em; }
 .placement-card .labels { font: 400 11.5px var(--font-ui); color: var(--text3); margin-bottom: 8px; min-height: 1em; }
-.placement-card .foot { display: flex; gap: 12px; margin-top: 4px; padding-top: 11px; border-top: 1px solid var(--ink-16); font: 400 11.5px var(--font-ui); color: var(--text2); }
+.placement-card .foot { display: flex; gap: 12px; margin-top: 4px; padding-top: 11px; border-top: 1px solid var(--rule); font: 400 11.5px var(--font-ui); color: var(--text2); }
 
 /* ---- Tablets ---- */
 /* `flex-wrap: wrap` (docs/roadmap.md U-05, the lineage panel): with the
@@ -252,7 +253,7 @@ tr.selected td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
 .replica-dots { display: inline-flex; gap: 3px; }
 /* Split lineage panel's descendant subtree (docs/roadmap.md U-05) — a plain
    nested list, one `<ul>` per generation of children. */
-.lineage-tree { list-style: none; margin: 6px 0 0; padding-left: 16px; border-left: 1px solid var(--ink-16); }
+.lineage-tree { list-style: none; margin: 6px 0 0; padding-left: 16px; border-left: 1px solid var(--rule); }
 .lineage-tree li { margin-bottom: 6px; }
 
 /* ---- Streams ---- */
@@ -269,7 +270,7 @@ tr.selected td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
    app-skin amendment, mirroring the same-day website-skin removal): an
    ordinary themed bordered block, no forced-dark interior, no shadow. */
 .stream-detail .tail-records {
-  background: var(--surface); border: 1px solid var(--ink-16); border-radius: var(--radius-panel);
+  background: var(--surface); border: 1px solid var(--rule); border-radius: var(--radius-panel);
   padding: 10px 12px; max-height: 260px; overflow-y: auto;
 }
 .stream-detail .tail-records pre { margin: 0; font: 400 11px var(--font-mono); color: var(--text2); line-height: 1.6; white-space: pre-wrap; word-break: break-all; }
