@@ -91,7 +91,8 @@
 //! from another task — would duplicate seqs and clobber manifests. A flush
 //! clears the memtable **surgically** (only the exact `(key, version)` slots its
 //! snapshot folded into the SSTable), so a write applied concurrently with the
-//! SSTable build is never erased; and it re-checks `applies_in_flight == 0`
+//! SSTable build is never erased; and it *drains* `applies_in_flight` to zero
+//! (closing the entry gate `flush_pending` so new writes wait, issue #1341)
 //! atomically with its snapshot + WAL-watermark sample, so a WAL segment is only
 //! GC'd when every durable record it holds is provably in the new SSTable.
 //!
@@ -625,6 +626,22 @@ struct Inner {
     /// SSTable. With WAL group commit a writer yields between log and apply, so this
     /// window is now observable; the gate closes it (see [`LsmEngine::flush`]).
     applies_in_flight: u64,
+    /// Flush admission (issue #1341): a flush holding the maintenance lock is
+    /// waiting for `applies_in_flight` to drain. While set, new writers wait at
+    /// [`LsmEngine::log_and_apply`]'s entry (they have written nothing yet), so
+    /// the in-flight count can only fall and the flush cannot be starved by
+    /// overlapping writers. Cleared (by [`FlushPendingGuard`]) the moment the
+    /// flush takes its snapshot, or if the flush future is dropped.
+    flush_pending: bool,
+    /// A flush holds the maintenance lock (set for its whole run). A second
+    /// would-be flusher skips instead of queueing behind it: the running flush
+    /// already covers what it would write, and a queued flush would only inflate
+    /// `storage_flush_blocked_micros` with flush-behind-flush time.
+    flush_active: bool,
+    /// Writers parked at the entry gate while `flush_pending` is set.
+    entry_waiters: Vec<Waker>,
+    /// The draining flush's waker, woken when `applies_in_flight` reaches zero.
+    drain_waker: Option<Waker>,
     /// Refcount of currently-held [`LsmSnapshot`]s, keyed by their pinned
     /// version (several snapshots can share a version if taken with no writes
     /// in between). Registered by [`LsmEngine::snapshot`], released when the
@@ -676,6 +693,47 @@ impl Drop for InFlightGuard {
     fn drop(&mut self) {
         if let Ok(mut inner) = self.inner.lock() {
             inner.applies_in_flight = inner.applies_in_flight.saturating_sub(1);
+            if inner.applies_in_flight == 0
+                && let Some(w) = inner.drain_waker.take()
+            {
+                w.wake();
+            }
+        }
+    }
+}
+
+/// Clears [`Inner::flush_active`] when a flush ends, on every path.
+struct FlushActiveGuard {
+    inner: Arc<Mutex<Inner>>,
+}
+
+impl Drop for FlushActiveGuard {
+    fn drop(&mut self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.flush_active = false;
+        }
+    }
+}
+
+/// Clears [`Inner::flush_pending`] and releases the writers parked at the entry
+/// gate. RAII so a flush future dropped mid-drain can never leave the gate
+/// shut.
+struct FlushPendingGuard {
+    inner: Arc<Mutex<Inner>>,
+}
+
+impl Drop for FlushPendingGuard {
+    fn drop(&mut self) {
+        let waiters = match self.inner.lock() {
+            Ok(mut inner) => {
+                inner.flush_pending = false;
+                inner.drain_waker = None;
+                std::mem::take(&mut inner.entry_waiters)
+            }
+            Err(_) => return,
+        };
+        for w in waiters {
+            w.wake();
         }
     }
 }
@@ -1373,6 +1431,10 @@ impl<E: Env> LsmEngine<E> {
             compactions: 0,
             block_reads,
             applies_in_flight: 0,
+            flush_pending: false,
+            flush_active: false,
+            entry_waiters: Vec::new(),
+            drain_waker: None,
             held_snapshots: BTreeMap::new(),
         };
 
@@ -1425,7 +1487,19 @@ impl<E: Env> LsmEngine<E> {
     ) -> Result<()> {
         // Enter the in-flight gate: a flush will not truncate the WAL while any
         // durable-but-unapplied record exists. A guard decrements on every path.
-        self.lock().applies_in_flight += 1;
+        // Flush admission (#1341): if a flush is draining, wait here -- nothing
+        // is logged yet, so parking is free -- instead of overlapping it.
+        std::future::poll_fn(|cx| {
+            let mut inner = self.lock();
+            if inner.flush_pending {
+                inner.entry_waiters.push(cx.waker().clone());
+                Poll::Pending
+            } else {
+                inner.applies_in_flight += 1;
+                Poll::Ready(())
+            }
+        })
+        .await;
         let guard = InFlightGuard {
             inner: Arc::clone(&self.inner),
         };
@@ -1696,22 +1770,18 @@ impl<E: Env> LsmEngine<E> {
             let inner = self.lock();
             !inner.memtable.is_empty()
                 && inner.memtable_bytes >= self.opts.flush_threshold_bytes
-                // Don't flush while a concurrent write is durable-but-unapplied:
-                // the flush's watermark = `durable_seq`, and only with no in-flight
-                // apply is every durable record (seq ≤ watermark) already in the
-                // memtable snapshot — the invariant that makes GCing a fully-covered
-                // WAL segment safe. The writer re-attempts the flush from its own
-                // `maybe_flush_and_compact` once it has applied. This check is only
-                // a cheap decision-time hint that avoids acquiring the maintenance
-                // lock; `flush` re-checks it authoritatively, atomically with its
-                // snapshot. (See `Inner::applies_in_flight` and `flush`.)
-                && inner.applies_in_flight == 0
+                // A cheap decision-time hint; `flush` re-checks it under the
+                // maintenance lock and then *drains* in-flight applies behind the
+                // flush-pending entry gate (it no longer skips when one is in
+                // flight: that starved the flush, #1341).
+                && !inner.flush_pending
+                && !inner.flush_active
         };
         if should_flush {
             if self.opts.stall_fault == StallFault::FlushGated {
                 self.wait_flush_behind_io_budget().await;
             }
-            self.flush().await?;
+            self.flush_if_over(self.opts.flush_threshold_bytes).await?;
         }
         // Run compactions until none is due (bounded: each pass reduces a level's
         // table count, and deeper levels have larger budgets).
@@ -2204,10 +2274,18 @@ impl<E: Env> LsmEngine<E> {
     /// Write the current memtable to a fresh SSTable, atomically add it to the
     /// manifest, then GC the WAL segments the flush fully covers.
     ///
-    /// A no-op when the memtable is empty **or** a concurrent write is still
-    /// durable-but-unapplied (`applies_in_flight > 0`) — see the gate below; the
-    /// writer re-attempts from its own `maybe_flush_and_compact` once applied.
+    /// A no-op when the memtable is empty. A concurrent write that is still
+    /// durable-but-unapplied (`applies_in_flight > 0`) is *waited for* behind the
+    /// `flush_pending` entry gate (issue #1341), never skipped and never
+    /// snapshotted half-applied; see the drain below.
     async fn flush(&self) -> Result<()> {
+        self.flush_if_over(0).await
+    }
+
+    /// [`Self::flush`] that is a no-op unless the memtable holds at least
+    /// `min_bytes` once the maintenance lock is held (a flush queued behind
+    /// another must not write a tiny SSTable of what is left).
+    async fn flush_if_over(&self, min_bytes: usize) -> Result<()> {
         // Serialize against any concurrent flush or compaction. Two overlapping
         // flushes would both allocate `next_seq + 1` (duplicate SSTable seqs —
         // the second file overwrites the first, corrupting the manifest), race
@@ -2215,6 +2293,10 @@ impl<E: Env> LsmEngine<E> {
         // snapshot depends on. Writers never take this lock, so the write path
         // (and WAL group-commit liveness) is unaffected.
         let _maintenance = self.acquire_maintenance(MaintenanceClass::Flush).await;
+        self.lock().flush_active = true;
+        let _active = FlushActiveGuard {
+            inner: Arc::clone(&self.inner),
+        };
 
         // Snapshot the memtable + the seq to allocate, lock-free for the write.
         // The `applies_in_flight == 0` gate is re-checked here, **atomically with
@@ -2230,16 +2312,37 @@ impl<E: Env> LsmEngine<E> {
         // tells us which WAL segments are fully covered (so they may be removed)
         // — a segment whose highest seq ≤ watermark holds only records now
         // durably in the SSTable.
-        let (records, seq, mut new_manifest, wal_watermark) = {
-            let inner = self.lock();
-            if inner.memtable.is_empty() || inner.applies_in_flight > 0 {
-                return Ok(());
+        //
+        // Drain (#1341): rather than skipping while a write is in flight, close
+        // the entry gate (`flush_pending`), wait for the in-flight applies to
+        // finish (they are already past the gate and need nothing from this
+        // flush, so the wait is bounded by one WAL commit + apply), and take the
+        // snapshot in the same critical section that observes the count at zero.
+        // A partially applied batch is therefore still never snapshotted.
+        let pending = FlushPendingGuard {
+            inner: Arc::clone(&self.inner),
+        };
+        let taken = std::future::poll_fn(|cx| {
+            let mut inner = self.lock();
+            if inner.memtable.is_empty() || inner.memtable_bytes < min_bytes {
+                return Poll::Ready(None);
+            }
+            if inner.applies_in_flight > 0 {
+                inner.flush_pending = true;
+                inner.drain_waker = Some(cx.waker().clone());
+                return Poll::Pending;
             }
             let records = flatten_memtable(&inner.memtable);
             let seq = inner.manifest.next_seq + 1;
             let mut m = inner.manifest.clone();
             m.next_seq = seq;
-            (records, seq, m, self.wal.durable_seq())
+            Poll::Ready(Some((records, seq, m, self.wal.durable_seq())))
+        })
+        .await;
+        // Gate open again: the snapshot is taken, writers may proceed.
+        drop(pending);
+        let Some((records, seq, mut new_manifest, wal_watermark)) = taken else {
+            return Ok(());
         };
 
         // Build + sync the new SSTable file (outside the lock). A flush always
@@ -2908,7 +3011,7 @@ impl<E: Env> LsmEngine<E> {
 
     /// **Admin action (ADR 0020):** force-flush the memtable to an SSTable now,
     /// then run any compactions that become due. A no-op flush if the memtable is
-    /// empty or a concurrent write is still durable-but-unapplied (`flush`
+    /// empty (`flush` drains any durable-but-unapplied write and
     /// enforces the `applies_in_flight == 0` invariant atomically with its
     /// snapshot, so a forced flush never GCs a WAL segment whose records aren't
     /// yet in the snapshot); compactions still run. Safe to call from a separate
@@ -3077,10 +3180,10 @@ impl<E: Env> LsmEngine<E> {
         //
         // **A single `flush()` call is not a correctness requirement any
         // more — it's just an optimization (issue #298 / its 2026-08-26
-        // starvation follow-up).** `flush` itself silently no-ops whenever
-        // `applies_in_flight > 0` (a concurrent writer is between its own
-        // WAL fsync and memtable apply) or the memtable is already empty, so
-        // there is no guarantee it leaves the memtable empty. The retry loop
+        // starvation follow-up).** `flush` snapshots whatever the memtable
+        // holds once in-flight applies drain (a writer that enters later
+        // refills it), or no-ops if it is already empty, so there is no
+        // guarantee it leaves the memtable empty. The retry loop
         // that used to sit here — call `flush()`, check `memtable.is_empty
         // ()`, sleep, repeat up to a fixed bound — chases a moving target: a
         // *persistent* concurrent writer can refill the memtable faster than

@@ -887,7 +887,12 @@ The LSM WAL/manifest/SSTable decoders are the `lsm_formats` fuzz target, reached
 - `StallFault` (doc-hidden) are the negative-control faults of `tests/it/lsm_write_stall.rs`.
   L0 only reaches 2T in practice: the corpora use a `Wedge` gate that withholds even urgent
   compaction. See `docs/lessons/testing/2026-10-18-an-lsm-stall-test-must-withhold-compaction-not-just-slow-the-disk.md`.
-- Known: flush defers while `applies_in_flight > 0`, which starves under many concurrent
-  writers on a slow disk (memtable stall, no L0 growth); see
+- Flush admission (issue #1341): `flush` does not skip while `applies_in_flight > 0`; under the
+  maintenance lock it sets `flush_pending` (writers park at `log_and_apply` entry, before logging),
+  waits for the in-flight count to reach zero and snapshots in that same critical section
+  (`FlushPendingGuard` clears the gate, also on drop). Never set the gate before the maintenance
+  lock (writers would wait out a compaction). Regression: `tests/it/lsm_flush_starvation.rs`
+  (`ANIMUS_FLUSH_STARVATION_SEEDS`). Remaining throughput limit with many writers on a slow disk:
+  a long compaction holds the one maintenance lock while the memtable fills. See
   `docs/lessons/code-patterns/2026-10-18-flush-that-defers-to-in-flight-applies-starves-under-concurrent-writers.md`.
 - `tests/lsm_stall_prod.rs` is the `ProdEnv` liveness test (own target, timeout-guarded).

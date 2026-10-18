@@ -465,13 +465,36 @@ Findings.
 2. The budget costs no goodput here and cuts flush-behind-compaction wait 2x to 20x: a deferred
    compaction does not hold the maintenance lock. The sustained compaction rate is only
    0.036 MiB/s in this model, so there is no honest default number; the budget ships off.
-3. Eight concurrent writers per engine collapse goodput (124 acked/s for one engine) with L0
+3. Eight concurrent writers per engine collapse goodput (124 acked/s for one engine; see I.1 for the #1341 follow-up) with L0
    low: `flush` defers while `applies_in_flight > 0` and with several writers one is always in
    flight, so the memtable hits its hard cap. Pre-existing flush starvation, exposed by the stall;
    recorded in `docs/lessons/code-patterns/` and filed as a follow-up.
 4. ProdEnv baseline (the sandbox volume, `volume_sequential_fsync_write_baseline`, 128 MiB with an fsync per MiB): 170.5 MiB/s. That is the order of figure `compactionIoMiBPerSec` is sized as a fraction of; it is a sandbox number, not a recommendation. The real-thread stall test (`lsm_stall_prod.rs`) held a withheld-compaction writer stalled with L0 bounded at the stop level and resumed it with no `Err` once compaction returned (6.6 s).
 5. The provisional defaults (3T/5T, 16 MiB/s to 256 KiB/s, failure limit 8, 1 s burst, 4 MiB/s
    lag floor) were not contradicted and are unchanged.
+
+### I.1 Flush admission under many writers per engine (issue #1341)
+
+Rig: `lsm_stall_characterise`, new cells `e1_w8_5ms` and `e1_w8_30ms` (one engine, eight writers,
+1 KiB values, 40 virtual s, seed 7). The fix: `flush` closes a `flush_pending` entry gate, drains
+`applies_in_flight` and snapshots at zero, instead of skipping while a write is in flight.
+
+| Cell | Mode | Acked/s before | Acked/s after | Flushes before | Flushes after |
+|---|---|---|---|---|---|
+| 1 x 8, 5 ms | off | 153 | 123 | 23 | 44 |
+| 1 x 8, 5 ms | stall | 154 | 124 | 23 | 44 |
+| 1 x 8, 5 ms | io50 | 168 | 141 | - | 64 |
+| 1 x 8, 30 ms | off | 38 | 45 | - | - |
+| 1 x 8, 30 ms | stall | 38 | 45 | - | - |
+
+Reading: the flush no longer starves (flush count roughly doubles, p99 latency in the io modes
+falls from 364 ms to 29-44 ms at 5 ms), but goodput on this cell is **not** restored. Tracing
+showed the flush itself takes 10-20 ms; the memtable instead sits at its cap because a single
+maintenance task alternates flush and compaction on one lock, and a compaction here runs 0.3 s,
+growing to about 2 s, while the 256 KiB memtable cap fills in about 0.2 s. More flushes also mean
+more L0 tables and so more compactions (5 to 10), which is why the 5 ms row dips. The remaining
+limit is flush waiting behind a running compaction, not `applies_in_flight`; a follow-up would let
+a flush run beside a compaction.
 
 ## Proposed final defaults (recommendations for review; ADR 0079's knob table is not edited)
 

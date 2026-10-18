@@ -19,3 +19,17 @@ Rules:
 - Followed up as an issue rather than folded into the stall change: fixing flush
   to wait for the in-flight set to drain (or to snapshot a memtable prefix) touches
   the part the crash corpora guard hardest.
+
+Resolved (issue #1341): `flush` now closes an entry gate (`Inner::flush_pending`,
+cleared by an RAII `FlushPendingGuard`) so new writers park before logging,
+waits for `applies_in_flight` to drain (already-admitted applies need nothing
+from the flush, so the wait is one commit + apply), and snapshots in the same
+critical section that sees zero. A "skip if busy" attempt against a live
+producer is a starvation; a "close the door, drain, then act" is not. Two
+pitfalls the fix avoids: set the gate only *after* taking the maintenance lock
+(else writers block for a whole compaction), and make the gate RAII (a dropped
+flush future must not leave it shut). Regression: `tests/it/lsm_flush_starvation.rs`.
+Caveat found while measuring: the 1-engine x 8-writer rig is mostly bounded by a
+long compaction holding the maintenance lock (0.3 s growing to 2 s at a 5 ms
+sync), during which the memtable fills to its cap; the flush fix doubled the flush
+count (23 to 44) but does not by itself restore goodput there.

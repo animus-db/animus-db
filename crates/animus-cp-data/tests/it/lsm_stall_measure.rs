@@ -304,8 +304,9 @@ fn lsm_stall_characterise() {
         .unwrap_or(40);
     let only = std::env::var("MEASURE_CELL").ok();
     // One writer per engine: the production topology (a tablet's apply task is
-    // the only writer of its private engine). Several writers per engine would
-    // starve the flush through `applies_in_flight` (see ADR 0081 as-built).
+    // the only writer of its private engine). Several writers per engine used
+    // to starve the flush through `applies_in_flight` (issue #1341, fixed by
+    // the flush-pending admission gate).
     let cells = [
         // (name, engines, writers per engine, sync delay in ms)
         ("e1_w1_5ms", 1, 1, 5),
@@ -315,6 +316,9 @@ fn lsm_stall_characterise() {
         ("e32_w1_5ms", 32, 1, 5),
         ("e32_w1_30ms", 32, 1, 30),
         ("e8_w8_5ms", 8, 8, 5),
+        // Issue #1341: several writers on ONE engine (flush admission).
+        ("e1_w8_5ms", 1, 8, 5),
+        ("e1_w8_30ms", 1, 8, 30),
     ];
     print_header();
     for (name, engines, writers_per_engine, sync_ms) in cells {
