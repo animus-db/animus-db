@@ -731,7 +731,14 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   only removed after a *known-unswapped* manifest failure, i.e. ENOSPC);
   `after_write_maintenance` swallows an inline `StorageFull` (the write is
   already durable, counted by `maintenance_deferral_count`) while
-  `flush_now`/`compact_now`/backpressure still return it. Tests:
+  `flush_now`/`compact_now`/backpressure still return it. **The memtable
+  backpressure gate (`await_backpressure`) never errors on elapsed time**
+  (#1338; it used to give up with `Backend` after 10 000 x 1 ms polls, which
+  panicked the raftkv apply task under plain overload): it waits via
+  `env.sleep`, returns `StorageFull` once a *finished* maintenance run failed
+  with ENOSPC, and `Backend` only after 8 consecutive non-ENOSPC maintenance
+  failures (`maintenance_consecutive_failures`). Tests:
+  `tests/it/lsm_write_stall.rs` (`ANIMUS_WRITE_STALL_SEEDS`). Tests:
   `tests/it/lsm_disk_full.rs` (depth `ANIMUS_LSM_DISK_FAULT_SEEDS`).
 
 ## Tests & benchmark
