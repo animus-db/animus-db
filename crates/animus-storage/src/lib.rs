@@ -419,6 +419,25 @@ pub trait StorageEngine: Clone + Send + Sync {
     /// holds the value (ADR 0010).
     async fn entries_with_tombstones(&self) -> Result<Vec<(Key, Option<Value>, Version)>>;
 
+    /// The version of `key`'s newest record **including a tombstone**, or
+    /// `None` if the key was never written (a plain [`get`](StorageEngine::get)
+    /// hides a deleted key, so it cannot prove a later delete ran). The CP
+    /// data plane's apply path uses it as a replay-ahead probe on hot keys.
+    ///
+    /// The **default implementation is correct but not cheap** (a one-key
+    /// `scan_with_tombstones` over `[key, key || 0x00)`); `LsmEngine`
+    /// overrides it with a Bloom-gated point lookup (issue #1349).
+    async fn latest_version_incl_tombstone(&self, key: &[u8]) -> Result<Option<Version>> {
+        let mut end = key.to_vec();
+        end.push(0);
+        Ok(self
+            .scan_with_tombstones(key, &end)
+            .await?
+            .into_iter()
+            .find(|(k, _, _)| k.as_slice() == key)
+            .map(|(_, _, v)| v))
+    }
+
     /// [`entries_with_tombstones`](StorageEngine::entries_with_tombstones)'s
     /// range-scoped sibling: every key in `[start, end)`'s latest record
     /// **including tombstones**, ordered by key (ADR 0050: the split-build

@@ -124,6 +124,37 @@ fn scenario(seed: u64) {
                 model.put(key, &value, version).await.expect("model put");
             });
         }
+        // Mid-stream (memtable plus tables, nothing flushed yet): a read at a
+        // random version and the newest-version probe agree with the model.
+        let probe_key = keys[rng.below(5) as usize];
+        let probe_v = rng.below(version + 2);
+        block_on(async {
+            let got = lsm.get_at(probe_key, probe_v).await.expect("lsm get_at");
+            let want = model
+                .get_at(probe_key, probe_v)
+                .await
+                .expect("model get_at");
+            assert!(
+                got == want,
+                "seed={seed}: mid-stream get_at({}, {probe_v}): engine {} vs model {}",
+                String::from_utf8_lossy(probe_key),
+                show(&got),
+                show(&want)
+            );
+            let got = lsm.get(probe_key).await.expect("lsm get");
+            let want = model.get(probe_key).await.expect("model get");
+            assert!(got == want, "seed={seed}: mid-stream get mismatch");
+            let got = StorageEngine::latest_version_incl_tombstone(&lsm, probe_key)
+                .await
+                .expect("lsm probe");
+            let want = StorageEngine::latest_version_incl_tombstone(&model, probe_key)
+                .await
+                .expect("model probe");
+            assert!(
+                got == want,
+                "seed={seed}: mid-stream probe {got:?} vs {want:?}"
+            );
+        });
         match rng.below(12) {
             0 | 1 => block_on(lsm.flush_now()).expect("flush"),
             2 => {
@@ -161,6 +192,22 @@ fn scenario(seed: u64) {
                     show_all(&want)
                 );
             }
+        }
+        // The Bloom-gated newest-version probe (tombstones included) agrees
+        // with the model's range-scan default (issue #1349), also for a key
+        // never written.
+        for key in keys.iter().copied().chain([b"zz-absent".as_slice()]) {
+            let got = StorageEngine::latest_version_incl_tombstone(&lsm, key)
+                .await
+                .expect("lsm probe");
+            let want = StorageEngine::latest_version_incl_tombstone(&model, key)
+                .await
+                .expect("model probe");
+            assert!(
+                got == want,
+                "seed={seed}: latest_version_incl_tombstone({}): engine {got:?} vs model {want:?}",
+                String::from_utf8_lossy(key)
+            );
         }
         let (got, want) = (
             lsm.get(b"k0").await.expect("get"),

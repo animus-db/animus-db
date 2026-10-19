@@ -217,6 +217,13 @@ impl<E: Env, S: StorageEngine> StorageEngine for StallingEngine<E, S> {
         .await
     }
 
+    async fn latest_version_incl_tombstone(&self, key: &[u8]) -> Result<Option<Version>> {
+        self.retry("latest_version_incl_tombstone", || {
+            self.inner.latest_version_incl_tombstone(key)
+        })
+        .await
+    }
+
     async fn approx_bytes_in_range(&self, start: &[u8], end: Option<&[u8]>) -> Result<u64> {
         self.retry("approx_bytes_in_range", || {
             self.inner.approx_bytes_in_range(start, end)

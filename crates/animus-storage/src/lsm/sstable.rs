@@ -721,16 +721,27 @@ impl SsTableReader {
         below.saturating_sub(1)..at_or_below
     }
 
-    /// Every record for `key` across the candidate blocks.
+    /// The newest record for `key` with version `<= version`.
+    ///
+    /// Records are sorted by `(key asc, version asc)` across the whole table,
+    /// so a key's versions run oldest to newest through its candidate blocks.
+    /// Walking those blocks from the last one backwards, the first block that
+    /// holds a visible record for `key` holds the answer: every later block
+    /// (already read, no visible record) is newer than `version`, every
+    /// earlier one is older than anything in this block. A hot key whose
+    /// versions straddle several blocks therefore costs one block read for the
+    /// newest version instead of all of them (issue #1349), while a key
+    /// absent from the last candidate block still falls back to the earlier
+    /// ones (issue #1315).
     async fn records_for_key<E: Env>(
         &self,
         env: &E,
         key: &[u8],
         version: Version,
     ) -> Result<Option<(Version, Option<Value>)>> {
-        let mut best: Option<(Version, Option<Value>)> = None;
-        for bidx in self.blocks_for_key(key) {
+        for bidx in self.blocks_for_key(key).rev() {
             let block = self.read_block(env, &self.index[bidx]).await?;
+            let mut best: Option<(Version, Option<Value>)> = None;
             for r in block {
                 if r.key == key
                     && r.version <= version
@@ -739,12 +750,15 @@ impl SsTableReader {
                     best = Some((r.version, r.value));
                 }
             }
+            if best.is_some() {
+                return Ok(best);
+            }
         }
-        Ok(best)
+        Ok(None)
     }
 
-    /// Newest record for `key` (greatest version), or `None`. Reads every block
-    /// that could hold `key` (its versions may straddle blocks).
+    /// Newest record for `key` (greatest version), or `None`. Reads the last
+    /// block that holds `key` (its versions may straddle blocks, newest last).
     pub async fn latest<E: Env>(
         &self,
         env: &E,
