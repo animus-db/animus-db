@@ -1521,9 +1521,13 @@ impl<E: Env> LsmEngine<E> {
         // durable-but-unapplied record exists. A guard decrements on every path.
         // Flush admission (#1341): if a flush is draining, wait here -- nothing
         // is logged yet, so parking is free -- instead of overlapping it.
+        let mut parked_at: Option<animus_env::Nanos> = None;
         std::future::poll_fn(|cx| {
             let mut inner = self.lock();
             if inner.flush_pending {
+                if parked_at.is_none() {
+                    parked_at = Some(self.env.now());
+                }
                 inner.entry_waiters.push(cx.waker().clone());
                 Poll::Pending
             } else {
@@ -1532,6 +1536,16 @@ impl<E: Env> LsmEngine<E> {
             }
         })
         .await;
+        if let Some(t0) = parked_at {
+            // Observability: how often, and for how long, a write waited for a
+            // draining flush (the cost of the #1341 admission gate).
+            let micros = self.env.now().duration_since(t0).as_micros();
+            self.metrics.incr(Metric::StorageEntryGateParks);
+            self.metrics.incr_by(
+                Metric::StorageEntryGateParkMicros,
+                u64::try_from(micros).unwrap_or(u64::MAX),
+            );
+        }
         let guard = InFlightGuard {
             inner: Arc::clone(&self.inner),
         };

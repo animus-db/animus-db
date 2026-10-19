@@ -154,6 +154,7 @@ Alternatives considered:
 | `StorageCompactionIoRate`, `StorageCompactionIoDebtBytes` | gauge | effective bytes/s after lag scaling; current debt (negative balance) |
 | `StorageCompactionThrottledMicros`, `StorageCompactionUrgent` | counter | time deferred by the bucket; compactions that bypassed it at the urgent level |
 | `StorageFlushBlockedMicros` | counter | time a due flush waited on the `MaintenanceLock` |
+| `StorageEntryGateParks`, `StorageEntryGateParkMicros` | counter | writes that parked at the flush-admission entry gate (issue #1341) while a flush drained in-flight applies; total time parked |
 | `StorageMaintenanceFailureStreak` | gauge | consecutive maintenance failures (decision 2 rule 3) |
 
 **Admin.** `/admin/health` gains an advisory `lsm_stall` object (`engines_slowed`, `engines_stopped`, `l0_max`, `compaction_io_rate`, `compaction_io_debt`) beside the background-permit object (ADR 0079). Per ADR 0078 decision 4, it is **advisory only**: a stall never fails the health check or the roll gate (a node under write load is working, not unhealthy). The per-tablet admin view already shows sstable counts (`lsm_sstables`) and gains the engine's stall level and L0 count. The shed counters ADR 0080 already feeds into the 5xx-ratio alert need nothing new: a stall surfaces as `OverloadShedBusy`, and the runbook (`docs/runbook/overload-and-throttling.md`) gains one paragraph on reading `StorageWriteStall*` next to it.
