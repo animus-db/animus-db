@@ -154,6 +154,7 @@ Alternatives considered:
 | `StorageCompactionIoRate`, `StorageCompactionIoDebtBytes` | gauge | effective bytes/s after lag scaling; current debt (negative balance) |
 | `StorageCompactionThrottledMicros`, `StorageCompactionUrgent` | counter | time deferred by the bucket; compactions that bypassed it at the urgent level |
 | `StorageFlushBlockedMicros` | counter | time a due flush waited on the `MaintenanceLock` |
+| `StorageEntryGateParks`, `StorageEntryGateParkMicros` | counter | writes that parked at the flush-admission entry gate (issue #1341) while a flush drained in-flight applies; total time parked |
 | `StorageMaintenanceFailureStreak` | gauge | consecutive maintenance failures (decision 2 rule 3) |
 
 **Admin.** `/admin/health` gains an advisory `lsm_stall` object (`engines_slowed`, `engines_stopped`, `l0_max`, `compaction_io_rate`, `compaction_io_debt`) beside the background-permit object (ADR 0079). Per ADR 0078 decision 4, it is **advisory only**: a stall never fails the health check or the roll gate (a node under write load is working, not unhealthy). The per-tablet admin view already shows sstable counts (`lsm_sstables`) and gains the engine's stall level and L0 count. The shed counters ADR 0080 already feeds into the 5xx-ratio alert need nothing new: a stall surfaces as `OverloadShedBusy`, and the runbook (`docs/runbook/overload-and-throttling.md`) gains one paragraph on reading `StorageWriteStall*` next to it.
@@ -395,8 +396,31 @@ older binary that never reads it), and `lsm_crash`, `lsm_disk_faults` and
 
 ### Deferred
 
-- Flush starvation by `applies_in_flight` under concurrent writers (finding 3): follow-up issue.
+- ~~Flush starvation by `applies_in_flight` under concurrent writers (finding 3)~~: fixed by issue #1341, see the amendment below.
 - A default for the compaction write budget: needs a workload on a real volume; the sizing note in
   the runbook is the interim guidance.
-- Concurrent flush or incremental compaction (question 4): only if `storage_flush_blocked_micros`
-  is routinely large in production.
+- ~~Concurrent flush~~ (question 4): done in #1341, see the amendment below. Incremental or
+  partial L0 to L1 compaction remains deferred: it is now the bound on many writers per engine.
+
+## Amendment (2026-10-18, issue #1341): flush lane and flush admission
+
+The maintenance model changed; decision 4 ("a flush is served before a queued compaction") is
+superseded because a flush no longer queues behind a compaction at all.
+
+- **Flush admission.** `flush` no longer skips while `applies_in_flight > 0`. Holding the flush
+  lane it closes an entry gate (`flush_pending`), waits for the already-admitted applies to
+  finish, and snapshots in the same critical section that sees the count at zero, so a partially
+  applied batch is still never captured and the WAL watermark/GC argument is unchanged.
+- **Two lanes.** Flushes serialize on `flush_lane`, compactions on `maintenance`; both build their
+  files outside any lock and meet only in the `install` section (one `write_manifest` fsync, new
+  manifest built from the current one, in-memory tables/readers swapped). SSTable seqs come from
+  `Inner::alloc_seq`; `manifest.next_seq` at install is the max. Background mode has a separate
+  flush task and compaction task, and failure state is tracked per lane. The IO budget is
+  unchanged: a flush is still charged, never delayed, and never takes a compaction permit.
+- **Effect** (`docs/density-measurements.md` I.1): the memtable cap no longer stalls writers
+  behind a compaction ("flush blocked" 0 ms in every cell, it was up to 26 s); with the L0 stall on,
+  the 1 engine x 8 writer cell rises from 154 to 169 acked/s (5 ms) and p99 falls from 364 to
+  29 ms, and the bound becomes the cost of the L0 to L1 compaction. Control (g) now takes both
+  lanes to keep modelling the old single lock.
+- Class L, no durable format change (a crash can leave an unreferenced orphan SSTable below
+  `next_seq`, which recovery never reads).

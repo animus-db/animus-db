@@ -465,13 +465,44 @@ Findings.
 2. The budget costs no goodput here and cuts flush-behind-compaction wait 2x to 20x: a deferred
    compaction does not hold the maintenance lock. The sustained compaction rate is only
    0.036 MiB/s in this model, so there is no honest default number; the budget ships off.
-3. Eight concurrent writers per engine collapse goodput (124 acked/s for one engine) with L0
+3. Eight concurrent writers per engine collapse goodput (124 acked/s for one engine; see I.1 for the #1341 follow-up) with L0
    low: `flush` defers while `applies_in_flight > 0` and with several writers one is always in
    flight, so the memtable hits its hard cap. Pre-existing flush starvation, exposed by the stall;
    recorded in `docs/lessons/code-patterns/` and filed as a follow-up.
 4. ProdEnv baseline (the sandbox volume, `volume_sequential_fsync_write_baseline`, 128 MiB with an fsync per MiB): 170.5 MiB/s. That is the order of figure `compactionIoMiBPerSec` is sized as a fraction of; it is a sandbox number, not a recommendation. The real-thread stall test (`lsm_stall_prod.rs`) held a withheld-compaction writer stalled with L0 bounded at the stop level and resumed it with no `Err` once compaction returned (6.6 s).
 5. The provisional defaults (3T/5T, 16 MiB/s to 256 KiB/s, failure limit 8, 1 s burst, 4 MiB/s
    lag floor) were not contradicted and are unchanged.
+
+### I.1 Flush admission and the flush lane under many writers per engine (issue #1341)
+
+Rig: `lsm_stall_characterise`, new cells `e1_w8_5ms` and `e1_w8_30ms` (one engine, eight writers,
+1 KiB values, 40 virtual s, seed 7). Two changes, measured in order:
+
+1. `flush` closes a `flush_pending` entry gate, drains `applies_in_flight` and snapshots at zero,
+   instead of skipping while a write is in flight (flushes 23 to 44, goodput unchanged).
+2. Flush and compaction no longer share one lock or one background task: a flush has its own lane
+   (flush lock plus its own task), and the two meet only in a short manifest-install section.
+
+| Cell, mode | acked/s before | after 1 | after 1+2 | p99 ms before / after 1+2 | L0 high-water after 1+2 |
+|---|---|---|---|---|---|
+| 1 x 8, 5 ms, off (no stall) | 153 | 123 | 376 | 354 / 29 | 115 |
+| 1 x 8, 5 ms, stall | 154 | 124 | 169 | 364 / 29 | 20 |
+| 1 x 8, 30 ms, off | 38 | 45 | 63 | 2129 / 179 | 20 |
+| 1 x 8, 30 ms, stall | 38 | 45 | 62 | 2189 / 179 | 20 |
+
+Reading. The memtable no longer pins at its cap (memtable stall time 190,000 ms to 0): the flush
+runs on its own lane and takes 10-20 ms. The bound moves to compaction: with eight writers whose
+keys span the whole range, every L0 to L1 compaction rewrites all of L1, runs seconds in this
+model and cannot keep up, so with the stall on the writers now wait on L0 (20 tables, the 5T stop
+level) instead of the memtable, and with the stall off L0 climbs to 115. That is the ADR 0081
+stall working as designed. Goodput with the stall on is up 10 to 40 percent on the original, p99
+write latency falls 12 to 70 fold; a faster 1 x 8 needs cheaper compaction (sub-compactions or
+partial L0 to L1 merges), which is a separate piece of work.
+
+No regression in the existing one-writer cells (identical acked/s: 1 x 1 5 ms 90, 8 x 1 5 ms 716,
+32 x 1 5 ms 2,866, 32 x 1 30 ms 515); "flush blocked" is now 0 ms in every cell (it was 26,051 ms
+for 8 x 1 5 ms off) because a flush no longer waits behind a compaction. 8 x 8 5 ms: off 3,011
+acked/s with L0 at 125; stall 1,347 with L0 held at 20.
 
 ## Proposed final defaults (recommendations for review; ADR 0079's knob table is not edited)
 

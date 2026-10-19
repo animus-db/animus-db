@@ -91,7 +91,8 @@
 //! from another task — would duplicate seqs and clobber manifests. A flush
 //! clears the memtable **surgically** (only the exact `(key, version)` slots its
 //! snapshot folded into the SSTable), so a write applied concurrently with the
-//! SSTable build is never erased; and it re-checks `applies_in_flight == 0`
+//! SSTable build is never erased; and it *drains* `applies_in_flight` to zero
+//! (closing the entry gate `flush_pending` so new writes wait, issue #1341)
 //! atomically with its snapshot + WAL-watermark sample, so a WAL segment is only
 //! GC'd when every durable record it holds is provably in the new SSTable.
 //!
@@ -625,6 +626,27 @@ struct Inner {
     /// SSTable. With WAL group commit a writer yields between log and apply, so this
     /// window is now observable; the gate closes it (see [`LsmEngine::flush`]).
     applies_in_flight: u64,
+    /// Flush admission (issue #1341): a flush holding the maintenance lock is
+    /// waiting for `applies_in_flight` to drain. While set, new writers wait at
+    /// [`LsmEngine::log_and_apply`]'s entry (they have written nothing yet), so
+    /// the in-flight count can only fall and the flush cannot be starved by
+    /// overlapping writers. Cleared (by [`FlushPendingGuard`]) the moment the
+    /// flush takes its snapshot, or if the flush future is dropped.
+    flush_pending: bool,
+    /// In-memory SSTable sequence allocator (>= `manifest.next_seq`): a flush
+    /// and a compaction now build files concurrently, so each takes its seqs
+    /// from here, not from the manifest, and the install step records the
+    /// highest as `manifest.next_seq`.
+    alloc_seq: u64,
+    /// A flush holds the maintenance lock (set for its whole run). A second
+    /// would-be flusher skips instead of queueing behind it: the running flush
+    /// already covers what it would write, and a queued flush would only inflate
+    /// `storage_flush_blocked_micros` with flush-behind-flush time.
+    flush_active: bool,
+    /// Writers parked at the entry gate while `flush_pending` is set.
+    entry_waiters: Vec<Waker>,
+    /// The draining flush's waker, woken when `applies_in_flight` reaches zero.
+    drain_waker: Option<Waker>,
     /// Refcount of currently-held [`LsmSnapshot`]s, keyed by their pinned
     /// version (several snapshots can share a version if taken with no writes
     /// in between). Registered by [`LsmEngine::snapshot`], released when the
@@ -676,9 +698,54 @@ impl Drop for InFlightGuard {
     fn drop(&mut self) {
         if let Ok(mut inner) = self.inner.lock() {
             inner.applies_in_flight = inner.applies_in_flight.saturating_sub(1);
+            if inner.applies_in_flight == 0
+                && let Some(w) = inner.drain_waker.take()
+            {
+                w.wake();
+            }
         }
     }
 }
+
+/// Clears [`Inner::flush_active`] when a flush ends, on every path.
+struct FlushActiveGuard {
+    inner: Arc<Mutex<Inner>>,
+}
+
+impl Drop for FlushActiveGuard {
+    fn drop(&mut self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.flush_active = false;
+        }
+    }
+}
+
+/// Clears [`Inner::flush_pending`] and releases the writers parked at the entry
+/// gate. RAII so a flush future dropped mid-drain can never leave the gate
+/// shut.
+struct FlushPendingGuard {
+    inner: Arc<Mutex<Inner>>,
+}
+
+impl Drop for FlushPendingGuard {
+    fn drop(&mut self) {
+        let waiters = match self.inner.lock() {
+            Ok(mut inner) => {
+                inner.flush_pending = false;
+                inner.drain_waker = None;
+                std::mem::take(&mut inner.entry_waiters)
+            }
+            Err(_) => return,
+        };
+        for w in waiters {
+            w.wake();
+        }
+    }
+}
+
+const FAIL_LANE_NONE: u8 = 0;
+const FAIL_LANE_FLUSH: u8 = 1;
+const FAIL_LANE_COMPACTION: u8 = 2;
 
 /// Admission for background compaction runs (ADR 0079 layer 3): a node-wide
 /// pool bounds how many compactions run at once across every engine on the
@@ -1000,6 +1067,15 @@ pub struct LsmEngine<E: Env> {
     /// [`MaintenanceLock`]). Held across the whole flush/compaction, including
     /// its disk I/O; never taken by the write path.
     maintenance: Arc<MaintenanceLock>,
+    /// The flush lane (issue #1341): flushes serialize against each other here
+    /// and **not** against a running compaction (`maintenance` is the
+    /// compaction lane). Never taken by the write path.
+    flush_lane: Arc<MaintenanceLock>,
+    /// The short manifest-install section both a flush and a compaction enter
+    /// to build their new manifest from the *current* one, `write_manifest` it
+    /// and swap the in-memory tables/readers. Held for one fsync, never across
+    /// the long merge or SSTable build, so the two lanes interleave safely.
+    install: Arc<MaintenanceLock>,
     /// Observability sink (ADR 0015). Defaults to `env.metrics()` at open (the
     /// no-op handle under `SimEnv`, a recording one under `ProdEnv`); a sim test
     /// threads a recording handle via [`open_with_metrics`](Self::open_with_metrics)
@@ -1009,6 +1085,14 @@ pub struct LsmEngine<E: Env> {
     /// Set while a background maintenance task (`LsmOptions::background_maintenance`)
     /// is in flight, so at most one runs at a time. See `trigger_background_maintenance`.
     maintenance_scheduled: Arc<AtomicBool>,
+    /// Set while the background **flush** task is in flight (issue #1341): a
+    /// flush has its own task, so it never waits behind the compaction task's
+    /// run-to-quiescence loop. At most one flush task runs at a time.
+    flush_scheduled: Arc<AtomicBool>,
+    /// Which lane recorded the latest background failure (`FAIL_LANE_*`), so a
+    /// success on the *other* lane does not clear it (a flush that fits must not
+    /// mask a compaction that keeps failing for space).
+    failure_lane: Arc<std::sync::atomic::AtomicU8>,
     /// The most recent background maintenance failure, if any (introspection —
     /// `background_maintenance` is fire-and-forget from the writer's point of
     /// view, so an error has nowhere else to surface; the next write that
@@ -1361,6 +1445,7 @@ impl<E: Env> LsmEngine<E> {
             }
         }
 
+        let alloc_seq = manifest.next_seq;
         let inner = Inner {
             memtable,
             memtable_bytes,
@@ -1373,6 +1458,11 @@ impl<E: Env> LsmEngine<E> {
             compactions: 0,
             block_reads,
             applies_in_flight: 0,
+            flush_pending: false,
+            alloc_seq,
+            flush_active: false,
+            entry_waiters: Vec::new(),
+            drain_waker: None,
             held_snapshots: BTreeMap::new(),
         };
 
@@ -1397,8 +1487,12 @@ impl<E: Env> LsmEngine<E> {
             inner: Arc::new(Mutex::new(inner)),
             wal,
             maintenance: Arc::new(MaintenanceLock::default()),
+            flush_lane: Arc::new(MaintenanceLock::default()),
+            install: Arc::new(MaintenanceLock::default()),
             metrics,
             maintenance_scheduled: Arc::new(AtomicBool::new(false)),
+            flush_scheduled: Arc::new(AtomicBool::new(false)),
+            failure_lane: Arc::new(std::sync::atomic::AtomicU8::new(FAIL_LANE_NONE)),
             background_error: Arc::new(Mutex::new(None)),
             background_full: Arc::new(AtomicBool::new(false)),
             maintenance_consecutive_failures: Arc::new(AtomicU32::new(0)),
@@ -1425,7 +1519,33 @@ impl<E: Env> LsmEngine<E> {
     ) -> Result<()> {
         // Enter the in-flight gate: a flush will not truncate the WAL while any
         // durable-but-unapplied record exists. A guard decrements on every path.
-        self.lock().applies_in_flight += 1;
+        // Flush admission (#1341): if a flush is draining, wait here -- nothing
+        // is logged yet, so parking is free -- instead of overlapping it.
+        let mut parked_at: Option<animus_env::Nanos> = None;
+        std::future::poll_fn(|cx| {
+            let mut inner = self.lock();
+            if inner.flush_pending {
+                if parked_at.is_none() {
+                    parked_at = Some(self.env.now());
+                }
+                inner.entry_waiters.push(cx.waker().clone());
+                Poll::Pending
+            } else {
+                inner.applies_in_flight += 1;
+                Poll::Ready(())
+            }
+        })
+        .await;
+        if let Some(t0) = parked_at {
+            // Observability: how often, and for how long, a write waited for a
+            // draining flush (the cost of the #1341 admission gate).
+            let micros = self.env.now().duration_since(t0).as_micros();
+            self.metrics.incr(Metric::StorageEntryGateParks);
+            self.metrics.incr_by(
+                Metric::StorageEntryGateParkMicros,
+                u64::try_from(micros).unwrap_or(u64::MAX),
+            );
+        }
         let guard = InFlightGuard {
             inner: Arc::clone(&self.inner),
         };
@@ -1707,27 +1827,35 @@ impl<E: Env> LsmEngine<E> {
     /// point. Compaction is driven to quiescence so a cascade (L0→L1→L2…) settles
     /// in one call.
     async fn maybe_flush_and_compact(&self) -> Result<()> {
+        self.flush_if_due().await?;
+        self.compact_until_quiescent().await
+    }
+
+    /// The flush half of [`Self::maybe_flush_and_compact`]: flush the memtable if
+    /// it is over the threshold (and no flush is already running).
+    async fn flush_if_due(&self) -> Result<()> {
         let should_flush = {
             let inner = self.lock();
             !inner.memtable.is_empty()
                 && inner.memtable_bytes >= self.opts.flush_threshold_bytes
-                // Don't flush while a concurrent write is durable-but-unapplied:
-                // the flush's watermark = `durable_seq`, and only with no in-flight
-                // apply is every durable record (seq ≤ watermark) already in the
-                // memtable snapshot — the invariant that makes GCing a fully-covered
-                // WAL segment safe. The writer re-attempts the flush from its own
-                // `maybe_flush_and_compact` once it has applied. This check is only
-                // a cheap decision-time hint that avoids acquiring the maintenance
-                // lock; `flush` re-checks it authoritatively, atomically with its
-                // snapshot. (See `Inner::applies_in_flight` and `flush`.)
-                && inner.applies_in_flight == 0
+                // A cheap decision-time hint; `flush` re-checks it under the
+                // maintenance lock and then *drains* in-flight applies behind the
+                // flush-pending entry gate (it no longer skips when one is in
+                // flight: that starved the flush, #1341).
+                && !inner.flush_pending
+                && !inner.flush_active
         };
         if should_flush {
             if self.opts.stall_fault == StallFault::FlushGated {
                 self.wait_flush_behind_io_budget().await;
             }
-            self.flush().await?;
+            self.flush_if_over(self.opts.flush_threshold_bytes).await?;
         }
+        Ok(())
+    }
+
+    /// The compaction half of [`Self::maybe_flush_and_compact`].
+    async fn compact_until_quiescent(&self) -> Result<()> {
         // Run compactions until none is due (bounded: each pass reduces a level's
         // table count, and deeper levels have larger budgets).
         while let Some(plan) = self.next_compaction() {
@@ -1792,6 +1920,8 @@ impl<E: Env> LsmEngine<E> {
 
     /// Control (g): wait for IO credit *inside* the maintenance lock.
     async fn wait_io_inside_lock(&self, gate: &Arc<dyn CompactionGate>, est: u64, urgent: bool) {
+        // Control (g) models the old single lock: it holds the flush lane too.
+        let _flush = self.acquire_maintenance(MaintenanceClass::Flush).await;
         let _held = self.acquire_maintenance(MaintenanceClass::Compaction).await;
         while gate.io_admit(est, urgent) == IoAdmission::Defer {
             self.note_io_deferred();
@@ -1854,7 +1984,10 @@ impl<E: Env> LsmEngine<E> {
     /// waiting for it (`storage_flush_blocked_micros`).
     async fn acquire_maintenance(&self, class: MaintenanceClass) -> MaintenanceGuard<'_> {
         let t0 = self.env.now();
-        let guard = self.maintenance.acquire(class).await;
+        let guard = match class {
+            MaintenanceClass::Flush => self.flush_lane.acquire(class).await,
+            MaintenanceClass::Compaction => self.maintenance.acquire(class).await,
+        };
         if class == MaintenanceClass::Flush {
             let waited = self.env.now().duration_since(t0);
             if !waited.is_zero() {
@@ -2019,13 +2152,22 @@ impl<E: Env> LsmEngine<E> {
     /// error, the ENOSPC flag, and the consecutive non-ENOSPC failure count the
     /// backpressure gate keys on.
     fn record_maintenance_result(&self, r: Result<()>) {
+        self.record_lane_result(FAIL_LANE_COMPACTION, r);
+    }
+
+    fn record_lane_result(&self, lane: u8, r: Result<()>) {
         match r {
             Ok(()) => {
-                self.background_full.store(false, Ordering::Release);
-                self.maintenance_consecutive_failures
-                    .store(0, Ordering::Release);
+                let owner = self.failure_lane.load(Ordering::Acquire);
+                if owner == FAIL_LANE_NONE || owner == lane {
+                    self.background_full.store(false, Ordering::Release);
+                    self.maintenance_consecutive_failures
+                        .store(0, Ordering::Release);
+                    self.failure_lane.store(FAIL_LANE_NONE, Ordering::Release);
+                }
             }
             Err(e) => {
+                self.failure_lane.store(lane, Ordering::Release);
                 let full = e.is_storage_full();
                 self.background_full.store(full, Ordering::Release);
                 if full {
@@ -2062,8 +2204,29 @@ impl<E: Env> LsmEngine<E> {
             let inner = self.lock();
             !inner.memtable.is_empty() && inner.memtable_bytes >= self.opts.flush_threshold_bytes
         };
-        let due = should_flush || self.next_compaction().is_some();
-        if !due {
+        if should_flush
+            && self
+                .flush_scheduled
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            // The flush lane (#1341): its own task, so a flush never waits for
+            // the compaction task's run-to-quiescence loop.
+            let engine = self.clone();
+            self.env.spawn_task(async move {
+                let r = engine.flush_if_due().await;
+                engine.record_lane_result(FAIL_LANE_FLUSH, r);
+                engine.flush_scheduled.store(false, Ordering::Release);
+                // A flush adds an L0 table: a compaction may now be due.
+                engine.trigger_background_compaction();
+            });
+        }
+        self.trigger_background_compaction();
+    }
+
+    /// Spawn the (single) background compaction task if a compaction is due.
+    fn trigger_background_compaction(&self) {
+        if self.next_compaction().is_none() {
             return;
         }
         if self
@@ -2071,11 +2234,11 @@ impl<E: Env> LsmEngine<E> {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            return; // a maintenance task is already in flight
+            return; // a compaction task is already in flight
         }
         let engine = self.clone();
         self.env.spawn_task(async move {
-            let r = engine.maybe_flush_and_compact().await;
+            let r = engine.compact_until_quiescent().await;
             engine.record_maintenance_result(r);
             engine.maintenance_scheduled.store(false, Ordering::Release);
         });
@@ -2163,6 +2326,7 @@ impl<E: Env> LsmEngine<E> {
         // for want of space is a StorageFull verdict.
         if self.background_full.load(Ordering::Acquire)
             && !self.maintenance_scheduled.load(Ordering::Acquire)
+            && !self.flush_scheduled.load(Ordering::Acquire)
         {
             // The verdict may predate the space coming back, and nothing else
             // clears it while this writer is the only thing driving
@@ -2219,10 +2383,18 @@ impl<E: Env> LsmEngine<E> {
     /// Write the current memtable to a fresh SSTable, atomically add it to the
     /// manifest, then GC the WAL segments the flush fully covers.
     ///
-    /// A no-op when the memtable is empty **or** a concurrent write is still
-    /// durable-but-unapplied (`applies_in_flight > 0`) — see the gate below; the
-    /// writer re-attempts from its own `maybe_flush_and_compact` once applied.
+    /// A no-op when the memtable is empty. A concurrent write that is still
+    /// durable-but-unapplied (`applies_in_flight > 0`) is *waited for* behind the
+    /// `flush_pending` entry gate (issue #1341), never skipped and never
+    /// snapshotted half-applied; see the drain below.
     async fn flush(&self) -> Result<()> {
+        self.flush_if_over(0).await
+    }
+
+    /// [`Self::flush`] that is a no-op unless the memtable holds at least
+    /// `min_bytes` once the maintenance lock is held (a flush queued behind
+    /// another must not write a tiny SSTable of what is left).
+    async fn flush_if_over(&self, min_bytes: usize) -> Result<()> {
         // Serialize against any concurrent flush or compaction. Two overlapping
         // flushes would both allocate `next_seq + 1` (duplicate SSTable seqs —
         // the second file overwrites the first, corrupting the manifest), race
@@ -2230,6 +2402,10 @@ impl<E: Env> LsmEngine<E> {
         // snapshot depends on. Writers never take this lock, so the write path
         // (and WAL group-commit liveness) is unaffected.
         let _maintenance = self.acquire_maintenance(MaintenanceClass::Flush).await;
+        self.lock().flush_active = true;
+        let _active = FlushActiveGuard {
+            inner: Arc::clone(&self.inner),
+        };
 
         // Snapshot the memtable + the seq to allocate, lock-free for the write.
         // The `applies_in_flight == 0` gate is re-checked here, **atomically with
@@ -2245,16 +2421,36 @@ impl<E: Env> LsmEngine<E> {
         // tells us which WAL segments are fully covered (so they may be removed)
         // — a segment whose highest seq ≤ watermark holds only records now
         // durably in the SSTable.
-        let (records, seq, mut new_manifest, wal_watermark) = {
-            let inner = self.lock();
-            if inner.memtable.is_empty() || inner.applies_in_flight > 0 {
-                return Ok(());
+        //
+        // Drain (#1341): rather than skipping while a write is in flight, close
+        // the entry gate (`flush_pending`), wait for the in-flight applies to
+        // finish (they are already past the gate and need nothing from this
+        // flush, so the wait is bounded by one WAL commit + apply), and take the
+        // snapshot in the same critical section that observes the count at zero.
+        // A partially applied batch is therefore still never snapshotted.
+        let pending = FlushPendingGuard {
+            inner: Arc::clone(&self.inner),
+        };
+        let taken = std::future::poll_fn(|cx| {
+            let mut inner = self.lock();
+            if inner.memtable.is_empty() || inner.memtable_bytes < min_bytes {
+                return Poll::Ready(None);
+            }
+            if inner.applies_in_flight > 0 {
+                inner.flush_pending = true;
+                inner.drain_waker = Some(cx.waker().clone());
+                return Poll::Pending;
             }
             let records = flatten_memtable(&inner.memtable);
-            let seq = inner.manifest.next_seq + 1;
-            let mut m = inner.manifest.clone();
-            m.next_seq = seq;
-            (records, seq, m, self.wal.durable_seq())
+            inner.alloc_seq += 1;
+            let seq = inner.alloc_seq;
+            Poll::Ready(Some((records, seq, self.wal.durable_seq())))
+        })
+        .await;
+        // Gate open again: the snapshot is taken, writers may proceed.
+        drop(pending);
+        let Some((records, seq, wal_watermark)) = taken else {
+            return Ok(());
         };
 
         // Build + sync the new SSTable file (outside the lock). A flush always
@@ -2288,6 +2484,14 @@ impl<E: Env> LsmEngine<E> {
         // segment we are about to remove — a crash mid-GC then recovers a manifest
         // that lists only the survivors, and the (orphaned) covered files, whose
         // data is in the SSTable, are simply ignored on recovery.
+        //
+        // The install section (issue #1341): everything from here to the
+        // in-memory swap runs under the install lock, so the new manifest is
+        // built from the *current* one (a compaction may have installed since
+        // the snapshot) and two installs never interleave.
+        let _install = self.install.acquire(MaintenanceClass::Flush).await;
+        let mut new_manifest = self.lock().manifest.clone();
+        new_manifest.next_seq = new_manifest.next_seq.max(seq);
         let covered = self.wal.segments_covered_by(wal_watermark);
         let surviving: Vec<u64> = self
             .wal
@@ -2300,7 +2504,10 @@ impl<E: Env> LsmEngine<E> {
         // WAL segments. Until this returns durably, a crash recovers the old
         // manifest + the intact WAL segments.
         let flushed_bytes = meta.file_size;
-        new_manifest.tables.push(meta);
+        // Keep the tables ordered oldest to newest by seq: a compaction that
+        // allocated its seqs after this flush's may already be installed.
+        let at = new_manifest.tables.partition_point(|m| m.seq < meta.seq);
+        new_manifest.tables.insert(at, meta);
         new_manifest.wal_segments = surviving;
         if let Err(e) = self.write_manifest(&new_manifest).await {
             // ENOSPC fails the atomic `replace` before it swaps anything, so the
@@ -2343,7 +2550,7 @@ impl<E: Env> LsmEngine<E> {
             // observing exactly the reader set it snapshotted, not gain this
             // flush's new table underneath it.
             let mut new_readers = (*inner.readers).clone();
-            new_readers.push(reader);
+            new_readers.insert(at, reader);
             inner.readers = Arc::new(new_readers);
             for rec in &records {
                 let now_empty = match inner.memtable.get_mut(&rec.key) {
@@ -2408,7 +2615,7 @@ impl<E: Env> LsmEngine<E> {
         // would otherwise resurface once the tombstone is gone). Sampled together
         // under one lock so a snapshot registered concurrently with this read is
         // either fully accounted for or not yet started — never a torn view.
-        let (input_readers, input_seqs, base_seq, max_version, held_floor, deeper_ranges) = {
+        let (input_readers, input_seqs, max_version, held_floor, deeper_ranges) = {
             let inner = self.lock();
             let mut input_readers: Vec<SsTableReader> = Vec::new();
             let mut source_bounds: Option<(Key, Key)> = None;
@@ -2455,7 +2662,6 @@ impl<E: Env> LsmEngine<E> {
             (
                 input_readers,
                 input_seqs,
-                inner.manifest.next_seq,
                 inner.manifest.max_version,
                 held_floor,
                 deeper_ranges,
@@ -2502,7 +2708,14 @@ impl<E: Env> LsmEngine<E> {
         let mut new_metas: Vec<SsTableMeta> = Vec::with_capacity(partitions.len());
         let mut new_readers: Vec<SsTableReader> = Vec::with_capacity(partitions.len());
         let mut new_files: Vec<String> = Vec::with_capacity(partitions.len());
-        let mut seq = base_seq;
+        // Reserve this compaction's seqs from the shared allocator (a flush may
+        // be allocating concurrently).
+        let mut seq = {
+            let mut inner = self.lock();
+            let base = inner.alloc_seq;
+            inner.alloc_seq += partitions.len() as u64;
+            base
+        };
         //
         // A failure while writing the outputs (ENOSPC above all) leaves the
         // input tables authoritative — the manifest has not changed — and every
@@ -2542,6 +2755,9 @@ impl<E: Env> LsmEngine<E> {
         // Build the new manifest: survivors (not consumed) + the new runs. A crash
         // before the swap keeps the old inputs (still named + intact); the new
         // files are orphans at seqs beyond `next_seq` and are ignored on recovery.
+        // Built under the install lock from the *current* manifest, so a flush
+        // that installed during the merge is a survivor, not dropped.
+        let _install = self.install.acquire(MaintenanceClass::Compaction).await;
         let (new_manifest, old_files) = {
             let inner = self.lock();
             let mut tables: Vec<SsTableMeta> = Vec::new();
@@ -2559,7 +2775,7 @@ impl<E: Env> LsmEngine<E> {
             // versions first.
             tables.sort_by_key(|m| m.seq);
             let new_manifest = Manifest {
-                next_seq: seq,
+                next_seq: inner.manifest.next_seq.max(seq),
                 tables,
                 max_version: inner.manifest.max_version,
                 // Compaction does not touch the WAL: carry the live segment set
@@ -2698,6 +2914,7 @@ impl<E: Env> LsmEngine<E> {
     #[must_use]
     pub fn background_maintenance_in_flight(&self) -> bool {
         self.maintenance_scheduled.load(Ordering::Acquire)
+            || self.flush_scheduled.load(Ordering::Acquire)
     }
 
     /// Number of WAL **group-commit batch `fsync`s** performed since open. With
@@ -2923,7 +3140,7 @@ impl<E: Env> LsmEngine<E> {
 
     /// **Admin action (ADR 0020):** force-flush the memtable to an SSTable now,
     /// then run any compactions that become due. A no-op flush if the memtable is
-    /// empty or a concurrent write is still durable-but-unapplied (`flush`
+    /// empty (`flush` drains any durable-but-unapplied write and
     /// enforces the `applies_in_flight == 0` invariant atomically with its
     /// snapshot, so a forced flush never GCs a WAL segment whose records aren't
     /// yet in the snapshot); compactions still run. Safe to call from a separate
@@ -3092,10 +3309,10 @@ impl<E: Env> LsmEngine<E> {
         //
         // **A single `flush()` call is not a correctness requirement any
         // more — it's just an optimization (issue #298 / its 2026-08-26
-        // starvation follow-up).** `flush` itself silently no-ops whenever
-        // `applies_in_flight > 0` (a concurrent writer is between its own
-        // WAL fsync and memtable apply) or the memtable is already empty, so
-        // there is no guarantee it leaves the memtable empty. The retry loop
+        // starvation follow-up).** `flush` snapshots whatever the memtable
+        // holds once in-flight applies drain (a writer that enters later
+        // refills it), or no-ops if it is already empty, so there is no
+        // guarantee it leaves the memtable empty. The retry loop
         // that used to sit here — call `flush()`, check `memtable.is_empty
         // ()`, sleep, repeat up to a fixed bound — chases a moving target: a
         // *persistent* concurrent writer can refill the memtable faster than
@@ -3130,6 +3347,10 @@ impl<E: Env> LsmEngine<E> {
         // Hold the maintenance lock for the whole snapshot+link sequence so a
         // concurrent compaction on the source cannot swap/remove a table this
         // call is in the middle of linking (see the doc comment above).
+        // Both lanes: the clone reads the table set and `next_seq` and must see
+        // neither a flush nor a compaction change them (flush lane first, the
+        // fixed order; no other path takes both).
+        let _flush_lane = self.acquire_maintenance(MaintenanceClass::Flush).await;
         let _maintenance = self.acquire_maintenance(MaintenanceClass::Compaction).await;
 
         let (tables, mut next_seq, max_version, mut leftover) = {

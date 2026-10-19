@@ -100,7 +100,14 @@ use chaos_support::workload::{self, CLIENTS, KEYS, Shared};
 use serde_json::{Value, json};
 
 /// The build under test (this checkout).
-const CURRENT_BIN: &str = env!("CARGO_BIN_EXE_animusd");
+const COMPILED_BIN: &str = env!("CARGO_BIN_EXE_animusd");
+
+/// The build under test: `ANIMUS_UPGRADE_CURRENT_BIN` if set (A/B runs of two
+/// trees that share a target dir copy each tree's binary out and point here),
+/// else the binary cargo built next to this test.
+fn current_bin() -> String {
+    std::env::var("ANIMUS_UPGRADE_CURRENT_BIN").unwrap_or_else(|_| COMPILED_BIN.to_string())
+}
 
 /// No acknowledged write for longer than this, at any point of the roll, is an
 /// availability failure (a leader election, a restart and a catch-up are all
@@ -163,7 +170,7 @@ fn refs() -> Refs {
     );
     let cli = std::env::var("ANIMUS_CLI_BIN").map_or_else(
         |_| {
-            Path::new(CURRENT_BIN)
+            Path::new(&current_bin())
                 .parent()
                 .expect("animusd binary has a parent dir")
                 .join("animus")
@@ -361,6 +368,56 @@ impl RollCluster {
         format!("---- node {i} log tail ----\n{}", lines[from..].join("\n"))
     }
 
+    /// Failure diagnostics for a stuck roll wait: every live node's roll-health,
+    /// per-group Raft state and (for each `tablet=N` named in `hint`) LSM and WAL
+    /// state, so a catch-up wedge is self-explanatory from the CI log.
+    async fn stuck_dump(&self, hint: &str) -> String {
+        let mut tablets: Vec<String> = Vec::new();
+        for part in hint.split("tablet=").skip(1) {
+            let t: String = part.chars().take_while(char::is_ascii_digit).collect();
+            if !t.is_empty() && !tablets.contains(&t) {
+                tablets.push(t);
+            }
+        }
+        let mut out = String::new();
+        // Two samples ten seconds apart: whether the stuck group's apply is
+        // frozen or merely slower than the commit rate shows in the deltas.
+        for sample in 0..2 {
+            if sample == 1 {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                out.push_str("==== second sample, 10s later ====\n");
+            }
+            out.push_str(&self.stuck_dump_once(&tablets).await);
+        }
+        out
+    }
+
+    async fn stuck_dump_once(&self, tablets: &[String]) -> String {
+        let mut out = String::new();
+        for i in 0..self.n() {
+            if self.children[i].is_none() {
+                continue;
+            }
+            let mut paths = vec![
+                "/admin/roll-health".to_string(),
+                "/admin/raftkv".to_string(),
+                "/admin/metrics".to_string(),
+            ];
+            for t in tablets {
+                paths.push(format!("/admin/storage/lsm?tablet={t}"));
+                paths.push(format!("/admin/storage/wal?tablet={t}"));
+            }
+            for p in paths {
+                let body = match http_get(self.nodes[i].admin, &p, Duration::from_secs(5)).await {
+                    Ok((s, b)) => format!("{s} {b}"),
+                    Err(e) => format!("error: {e:?}"),
+                };
+                out.push_str(&format!("---- node {i} GET {p} ----\n{body}\n"));
+            }
+        }
+        out
+    }
+
     async fn admin_json(&self, i: usize, path: &str) -> Option<Value> {
         match http_get(self.nodes[i].admin, path, Duration::from_secs(5)).await {
             Ok((200, body)) => serde_json::from_str(&body).ok(),
@@ -536,9 +593,10 @@ async fn run(variant: Variant, nodes: usize) {
     let dir = support::panic_safe_tempdir();
     let seed = chaos_support::rng::name_seed(&name);
     eprintln!(
-        "upgrade[{name}]: R-1 = {} ({}), current = {CURRENT_BIN}, cli = {}",
+        "upgrade[{name}]: R-1 = {} ({}), current = {}, cli = {}",
         refs.prev_bin.display(),
         refs.prev_ref,
+        current_bin(),
         refs.cli.display()
     );
     let result = tokio::time::timeout(
@@ -564,7 +622,7 @@ async fn roll_scenario(
     refs: &Refs,
     root: &Path,
 ) {
-    let current = PathBuf::from(CURRENT_BIN);
+    let current = PathBuf::from(current_bin());
     // `ANIMUS_UPGRADE_FROM_RESTART_GAP_SECS` overrides; the spare-node
     // measurement variant defaults to a gap past `REPAIR_DWELL` (5 s).
     let gap = Duration::from_secs(
@@ -820,21 +878,58 @@ async fn roll_scenario(
             .await;
             tokio::time::sleep(Duration::from_secs(6)).await;
         } else {
-            let (ok, out, err) = cli(
-                &refs.cli,
-                &[
-                    "cluster",
-                    "roll",
-                    "wait",
-                    &node_admin,
-                    "--node",
-                    &id,
-                    "--timeout",
-                    WAIT_TIMEOUT,
-                ],
-            )
-            .await;
-            assert!(ok, "roll wait {id} failed: {out} {err}\n{}", c.log_tail(i));
+            let wait_args = [
+                "cluster",
+                "roll",
+                "wait",
+                &node_admin,
+                "--node",
+                &id,
+                "--timeout",
+                WAIT_TIMEOUT,
+            ];
+            let wait = cli(&refs.cli, &wait_args);
+            // Catch-up curve (diagnostic): every few seconds, the rolled node's
+            // per-group apply lag, so a slow catch-up shows its rate in the log.
+            let sampler = async {
+                let t = Instant::now();
+                loop {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    if let Some(v) = c.admin_json(i, "/admin/raftkv").await {
+                        let mut parts = Vec::new();
+                        for g in v["groups"].as_array().into_iter().flatten() {
+                            let commit = g["commit_index"].as_u64().unwrap_or(0);
+                            let applied = g["engine_applied_index"].as_u64().unwrap_or(0);
+                            if commit.saturating_sub(applied) > 16 {
+                                parts.push(format!(
+                                    "t{}:lag={} (commit {commit} applied {applied} durable {})",
+                                    g["tablet"],
+                                    commit - applied,
+                                    g["durable_index"]
+                                ));
+                            }
+                        }
+                        if !parts.is_empty() {
+                            eprintln!(
+                                "upgrade[{name}]: catchup {id} +{}s {}",
+                                t.elapsed().as_secs(),
+                                parts.join(" ")
+                            );
+                        }
+                    }
+                }
+            };
+            let (ok, out, err) = tokio::select! {
+                r = wait => r,
+                () = sampler => unreachable!("the sampler never ends"),
+            };
+            if !ok {
+                let dump = c.stuck_dump(&format!("{out} {err}")).await;
+                panic!(
+                    "roll wait {id} failed: {out} {err}\n{}\n{dump}",
+                    c.log_tail(i)
+                );
+            }
         }
         let healthy_after = t0.elapsed();
         let after = snapshot(&c).await;

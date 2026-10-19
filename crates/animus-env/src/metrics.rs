@@ -1252,6 +1252,10 @@ pub enum Metric {
     StorageCompactionUrgent,
     /// A counter (ADR 0081): microseconds a flush waited for the maintenance lock.
     StorageFlushBlockedMicros,
+    /// A counter (issue #1341): writes that parked at the flush-admission entry gate.
+    StorageEntryGateParks,
+    /// A counter (issue #1341): microseconds writers spent parked at the flush-admission entry gate.
+    StorageEntryGateParkMicros,
     /// A level (ADR 0081): the longest current run of consecutive maintenance failures of any engine on this node.
     StorageMaintenanceFailureStreak,
 }
@@ -1259,7 +1263,7 @@ pub enum Metric {
 impl Metric {
     /// Every metric, in a fixed order. The array index of a metric in `ALL` is
     /// its slot in the [`MetricSink`]; keep this in sync with the enum.
-    pub const ALL: [Metric; 203] = [
+    pub const ALL: [Metric; 205] = [
         Metric::ElectionsStarted,
         Metric::ElectionsWon,
         Metric::AppendEntriesSent,
@@ -1462,6 +1466,8 @@ impl Metric {
         Metric::StorageCompactionThrottledMicros,
         Metric::StorageCompactionUrgent,
         Metric::StorageFlushBlockedMicros,
+        Metric::StorageEntryGateParks,
+        Metric::StorageEntryGateParkMicros,
         Metric::StorageMaintenanceFailureStreak,
     ];
 
@@ -1674,6 +1680,8 @@ impl Metric {
             Metric::StorageCompactionThrottledMicros => "storage_compaction_throttled_micros",
             Metric::StorageCompactionUrgent => "storage_compaction_urgent",
             Metric::StorageFlushBlockedMicros => "storage_flush_blocked_micros",
+            Metric::StorageEntryGateParks => "storage_entry_gate_parks",
+            Metric::StorageEntryGateParkMicros => "storage_entry_gate_park_micros",
             Metric::StorageMaintenanceFailureStreak => "storage_maintenance_failure_streak",
         }
     }
