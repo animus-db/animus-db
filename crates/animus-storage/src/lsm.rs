@@ -1505,6 +1505,13 @@ impl<E: Env> LsmEngine<E> {
             let mut best = memtable_latest;
             let mut read_err = None;
             for reader in readers.iter().rev() {
+                // A table whose newest record is no newer than what we already
+                // hold cannot improve the answer (issue #1349): skip its block
+                // read. Under monotonic versions the memtable or the newest
+                // table answers and every older table is skipped.
+                if best.is_some_and(|b| reader.meta().max_version <= b) {
+                    continue;
+                }
                 if !self.may_contain_observed(reader.meta(), key) {
                     continue;
                 }
@@ -1552,7 +1559,15 @@ impl<E: Env> LsmEngine<E> {
             let mut read_err = None;
             for reader in readers.iter().rev() {
                 // Take the max-version hit across all sources; a key range that
-                // can't contain `key` is skipped cheaply.
+                // can't contain `key` is skipped cheaply. A table with nothing
+                // visible at `version` (all newer), or nothing newer than the
+                // best hit so far, cannot change the answer (issue #1349).
+                let m = reader.meta();
+                if m.min_version > version
+                    || best.as_ref().is_some_and(|(bv, _)| m.max_version <= *bv)
+                {
+                    continue;
+                }
                 if !self.may_contain_observed(reader.meta(), key) {
                     continue;
                 }
@@ -3648,6 +3663,13 @@ impl<E: Env> StorageEngine for LsmEngine<E> {
             .into_iter()
             .map(|(k, (v, slot))| (k, slot, v))
             .collect())
+    }
+
+    /// Bloom-gated point lookup (issue #1349): `latest_version_of` skips every
+    /// table whose Bloom says the key is absent and reads only the last block
+    /// holding the key, instead of the range scan's every-block read.
+    async fn latest_version_incl_tombstone(&self, key: &[u8]) -> Result<Option<Version>> {
+        self.latest_version_of(key).await
     }
 
     async fn scan_with_tombstones(

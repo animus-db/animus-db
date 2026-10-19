@@ -863,7 +863,7 @@ The LSM WAL/manifest/SSTable decoders are the `lsm_formats` fuzz target, reached
   is an on-disk format (no ADR 0073 bump). A hold taken after the grace passed
   cannot resurrect GC'd versions. Test: `lsm_gc.rs::held_version_survives_compaction_gc`.
 
-- **A key's versions can straddle SSTable data blocks** (blocks are cut at 4 KiB regardless of key boundaries). `SsTableReader` point reads and `scan_at` use `blocks_for_key`, a range, never one block (issue #1315; `tests/it/lsm_multi_block_versions.rs`). Do not reintroduce a single-block lookup.
+- **A key's versions can straddle SSTable data blocks** (blocks are cut at 4 KiB regardless of key boundaries). `SsTableReader` point reads and `scan_at` use `blocks_for_key`, a range, never one block (issue #1315; `tests/it/lsm_multi_block_versions.rs`). Do not reintroduce a single-block lookup. Versions run oldest to newest through a table's blocks, so `records_for_key` walks the candidate blocks **backwards and stops at the first block with a visible record** (a hot key's newest version costs one block read, issue #1349), and `LsmEngine::read_at`/`latest_version_of` skip any table whose `max_version` cannot beat the best hit so far (or whose `min_version` is above the read version). `StorageEngine::latest_version_incl_tombstone(key)` (default: one-key `scan_with_tombstones`) is the Bloom-gated newest-version probe, tombstones included, that the CP apply path's replay-ahead checks use; `tests/it/lsm_hot_key_read_amp.rs` bounds block reads per apply (`tests/lsm_apply_read_amp_prod.rs` is the `--ignored` debug-build wall-clock companion).
 
 ## L0 write stall and the compaction IO seam (ADR 0081)
 

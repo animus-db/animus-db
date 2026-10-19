@@ -9224,21 +9224,17 @@ fn surface_suspicious_merge_noop(
 }
 
 /// The version of `physical`'s newest record, **tombstones included**
-/// (`get` hides a deleted key, so it cannot prove a later delete ran). Built on
-/// the bounded `scan_with_tombstones` over `[key, key || 0x00)`.
+/// (`get` hides a deleted key, so it cannot prove a later delete ran). A
+/// bloom-gated point lookup on the LSM (`StorageEngine::
+/// latest_version_incl_tombstone`, issue #1349), not a range scan: the apply
+/// path probes every staged key and resolved marker per entry.
 async fn latest_version_incl_tombstone<S: StorageEngine>(
     storage: &S,
     physical: &[u8],
 ) -> Option<u64> {
-    let mut end = physical.to_vec();
-    end.push(0);
-    storage
-        .scan_with_tombstones(physical, &end)
+    StorageEngine::latest_version_incl_tombstone(storage, physical)
         .await
         .expect("raftkv replay-ahead tombstone-aware read")
-        .into_iter()
-        .find(|(k, _, _)| k.as_slice() == physical)
-        .map(|(_, _, v)| v)
 }
 
 /// Replay check for a `KindEval`/`KindEvalBatch` entry's decided key (issues

@@ -1263,7 +1263,7 @@ State once here; cross-referenced from the sections below.
   therefore no-ops (`Fenced`) when any of its keys, their resolved markers, or
   (anchor) its record key carries a version strictly above the entry's `ts`
   (equal = its own partial merge, re-applies). The read is **tombstone-aware**
-  (`latest_version_incl_tombstone`, over `scan_with_tombstones`): `get` hides a
+  (`latest_version_incl_tombstone`, a `StorageEngine` method: Bloom-gated point lookup on the LSM, one-key `scan_with_tombstones` by default; a range scan per staged key cost ~20 block reads per apply on hot keys, issue #1349): `get` hides a
   key deleted after the stage, which makes a stage rejected live by an
   own-key condition (`A` must be absent) look acceptable on replay once `A` is
   deleted. The branch is unreachable live except via `SeedBatch` (the restore
