@@ -20,6 +20,17 @@
 //!    [`GlobalTableRequest`] the edge then checks against the cluster
 //!    (local Region label, known Regions, empty table, no TTL/LSI).
 //!
+//! ## Per-replica read overrides (cluster version 8)
+//!
+//! A `ReplicaUpdates` Create or Update may carry
+//! `ProvisionedThroughputOverride.ReadCapacityUnits` and per-GSI overrides on
+//! an MREC table ([`ReplicaSettings`], [`ReadChange`]); an Update is accepted
+//! only when it changes one of these. `OnDemandThroughputOverride`,
+//! `TableClassOverride` and `KMSMasterKeyId` stay refused with a precise
+//! message, and every per-replica setting is refused on an MRSC table.
+//! [`MrecRequest::needs_overrides_gate`] tells the edge to check
+//! `Gate::MrecReplicaOverrides` first.
+//!
 //! ## AWS field names (verified)
 //!
 //! The field and enum names below were checked against the AWS SDK for Go v2
@@ -75,16 +86,110 @@ pub fn legacy_global_table_operation_error(op: &str) -> WireError {
     ))
 }
 
-/// `CreateReplicationGroupMemberAction` per-replica overrides AnimusDB does
-/// not model (ADR 0075 section 5.1, Q6): a request carrying one is rejected
-/// naming the field.
-const UNSUPPORTED_REPLICA_CREATE_FIELDS: [&str; 5] = [
-    "KMSMasterKeyId",
-    "ProvisionedThroughputOverride",
-    "OnDemandThroughputOverride",
-    "GlobalSecondaryIndexes",
-    "TableClassOverride",
+/// Per-replica settings of `CreateReplicationGroupMemberAction` /
+/// `UpdateReplicationGroupMemberAction` whose **underlying table feature does
+/// not exist** in AnimusDB (ADR 0075 section 5.1, Q6 as amended 2026-10-21):
+/// `(field, why)`. A request carrying one is refused naming the missing
+/// feature, in the same spirit as `SSESpecification`'s own refusal.
+/// `ProvisionedThroughputOverride` and the per-GSI list are *not* here: read
+/// capacity is modelled (MREC tables only, see [`ReplicaSettings`]).
+const UNSUPPORTED_REPLICA_FIELDS: [(&str, &str); 3] = [
+    (
+        "KMSMasterKeyId",
+        "server-side encryption (SSESpecification) is not supported, so there is no \
+         per-replica KMS key to set",
+    ),
+    (
+        "OnDemandThroughputOverride",
+        "on-demand maximum throughput (OnDemandThroughput) is not supported, so there is no \
+         per-replica maximum read throughput to override",
+    ),
+    (
+        "TableClassOverride",
+        "table classes (TableClass) are not supported, so there is no per-replica table \
+         class to override",
+    ),
 ];
+
+/// The `why` text of an [`UNSUPPORTED_REPLICA_FIELDS`] field.
+fn unsupported_reason(field: &str) -> &'static str {
+    UNSUPPORTED_REPLICA_FIELDS
+        .iter()
+        .find(|(f, _)| *f == field)
+        .map_or("this setting is not supported", |(_, why)| why)
+}
+
+/// What a request says about one read-capacity override scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReadChange {
+    /// The scope was not mentioned: keep what is there.
+    #[default]
+    Unchanged,
+    /// `ProvisionedThroughputOverride` present without `ReadCapacityUnits`:
+    /// AWS's "use the source table's settings", i.e. clear the override.
+    Clear,
+    /// Override the scope's read capacity to this many units (>= 1).
+    Set(u64),
+}
+
+/// The per-replica settings one `Create` / `Update` action carries.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReplicaSettings {
+    /// `ProvisionedThroughputOverride` on the table.
+    pub table: ReadChange,
+    /// `GlobalSecondaryIndexes[].ProvisionedThroughputOverride`, by index
+    /// name, in request order (an element naming no override is dropped).
+    pub indexes: Vec<(String, ReadChange)>,
+    /// Present settings whose table feature AnimusDB lacks
+    /// ([`UNSUPPORTED_REPLICA_FIELDS`]); the first is named in the refusal.
+    pub unsupported: Vec<&'static str>,
+}
+
+impl ReplicaSettings {
+    /// Whether the action changes any supported setting.
+    #[must_use]
+    pub fn changes_read_capacity(&self) -> bool {
+        self.table != ReadChange::Unchanged
+            || self
+                .indexes
+                .iter()
+                .any(|(_, c)| *c != ReadChange::Unchanged)
+    }
+
+    /// Whether the action names no setting at all (supported or not).
+    #[must_use]
+    pub fn is_blank(&self) -> bool {
+        !self.changes_read_capacity() && self.unsupported.is_empty()
+    }
+
+    /// The refusal for the first present setting whose table feature does not
+    /// exist, if any.
+    fn unsupported_error(&self, action: &str) -> Option<WireError> {
+        let field = self.unsupported.first()?;
+        Some(WireError::validation(format!(
+            "UpdateTable: ReplicaUpdates {action} does not support `{field}`: {}",
+            unsupported_reason(field)
+        )))
+    }
+
+    /// The MRSC refusal: every per-replica setting is refused there, the
+    /// missing-feature ones by their reason, read capacity by its own.
+    fn mrsc_error(&self, action: &str) -> Option<WireError> {
+        if let Some(e) = self.unsupported_error(action) {
+            return Some(e);
+        }
+        if self.changes_read_capacity() {
+            return Some(WireError::validation(format!(
+                "UpdateTable: ReplicaUpdates {action} does not support \
+                 `ProvisionedThroughputOverride`: per-Region read capacity overrides are \
+                 supported on multi-Region eventually consistent tables only (the Regions of a \
+                 multi-Region strongly consistent table are one stretched cluster whose read \
+                 budget is shared by every Region's replicas)"
+            )));
+        }
+        None
+    }
+}
 
 /// `UpdateTable` keys that are a *different* change from a global-table
 /// conversion; combining them is "more than one change in one call" (Fork C,
@@ -100,17 +205,21 @@ const CONFLICTING_UPDATE_TABLE_KEYS: [&str; 4] = [
 /// One element of `UpdateTable.ReplicaUpdates` (`ReplicationGroupUpdate`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplicaAction {
-    /// `Create{RegionName, ..}`: `overrides` names every per-replica field
-    /// present that AnimusDB does not model (rejected by [`GlobalTableUpdate::
-    /// validate`]).
+    /// `Create{RegionName, ..}` with its per-replica settings.
     Create {
         /// The `RegionName`.
         region: String,
-        /// Unsupported override fields present on the action.
-        overrides: Vec<&'static str>,
+        /// The per-replica settings.
+        settings: ReplicaSettings,
     },
-    /// `Update{..}`: no per-replica setting is overridable (rejected).
-    Update,
+    /// `Update{RegionName, ..}`: change an existing replica's settings (MREC
+    /// read-capacity overrides; refused on MRSC).
+    Update {
+        /// The `RegionName`.
+        region: String,
+        /// The per-replica settings.
+        settings: ReplicaSettings,
+    },
     /// `Delete{RegionName}`: replicas of an MRSC table cannot be removed
     /// (rejected there); an MREC replica can (ADR 0075 section 5.1).
     Delete {
@@ -220,6 +329,93 @@ fn region_name(action: &Map<String, Value>, what: &str) -> Result<String, String
     }
 }
 
+/// `ProvisionedThroughputOverride` -> a [`ReadChange`]: absent or `null` is
+/// [`ReadChange::Unchanged`]; an object without `ReadCapacityUnits` clears;
+/// `ReadCapacityUnits` must be a positive integer (AWS `PositiveLongObject`).
+fn decode_read_override(parent: &Map<String, Value>, what: &str) -> Result<ReadChange, String> {
+    let v = match parent.get("ProvisionedThroughputOverride") {
+        None | Some(Value::Null) => return Ok(ReadChange::Unchanged),
+        Some(v) => v,
+    };
+    let o = v
+        .as_object()
+        .ok_or_else(|| format!("{what} `ProvisionedThroughputOverride` must be an object"))?;
+    match o.get("ReadCapacityUnits") {
+        None | Some(Value::Null) => Ok(ReadChange::Clear),
+        Some(Value::Number(n)) => match n.as_u64() {
+            Some(units) if units >= 1 => Ok(ReadChange::Set(units)),
+            _ => Err(format!(
+                "{what} `ProvisionedThroughputOverride.ReadCapacityUnits` must be a positive \
+                 integer"
+            )),
+        },
+        Some(_) => Err(format!(
+            "{what} `ProvisionedThroughputOverride.ReadCapacityUnits` must be a positive integer"
+        )),
+    }
+}
+
+/// The per-replica settings of a `Create` / `Update` action body.
+fn decode_replica_settings(
+    action: &Map<String, Value>,
+    what: &str,
+) -> Result<ReplicaSettings, String> {
+    let mut settings = ReplicaSettings {
+        table: decode_read_override(action, what)?,
+        ..ReplicaSettings::default()
+    };
+    for (field, _) in UNSUPPORTED_REPLICA_FIELDS {
+        if action.get(field).is_some_and(|v| !v.is_null()) {
+            settings.unsupported.push(field);
+        }
+    }
+    match action.get("GlobalSecondaryIndexes") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(list)) => {
+            let mut seen_indexes: Vec<String> = Vec::new();
+            if list.is_empty() {
+                return Err(format!(
+                    "{what} `GlobalSecondaryIndexes` must contain at least one element"
+                ));
+            }
+            for element in list {
+                let o = element.as_object().ok_or_else(|| {
+                    format!("each {what} `GlobalSecondaryIndexes` element must be an object")
+                })?;
+                let name = match o.get("IndexName") {
+                    Some(Value::String(n)) if !n.is_empty() => n.clone(),
+                    _ => {
+                        return Err(format!(
+                            "each {what} `GlobalSecondaryIndexes` element requires a string \
+                             `IndexName`"
+                        ));
+                    }
+                };
+                if o.get("OnDemandThroughputOverride")
+                    .is_some_and(|v| !v.is_null())
+                    && !settings.unsupported.contains(&"OnDemandThroughputOverride")
+                {
+                    settings.unsupported.push("OnDemandThroughputOverride");
+                }
+                let change = decode_read_override(o, what)?;
+                if seen_indexes.contains(&name) {
+                    return Err(format!(
+                        "{what} `GlobalSecondaryIndexes` names index `{name}` more than once"
+                    ));
+                }
+                seen_indexes.push(name.clone());
+                if change != ReadChange::Unchanged {
+                    settings.indexes.push((name, change));
+                }
+            }
+        }
+        Some(_) => {
+            return Err(format!("{what} `GlobalSecondaryIndexes` must be a list"));
+        }
+    }
+    Ok(settings)
+}
+
 fn decode_replica_actions(value: &Value) -> Result<Vec<ReplicaAction>, String> {
     let list = value
         .as_array()
@@ -240,13 +436,17 @@ fn decode_replica_actions(value: &Value) -> Result<Vec<ReplicaAction>, String> {
                     .as_object()
                     .ok_or_else(|| "`ReplicaUpdates` `Create` must be an object".to_owned())?;
                 let region = region_name(create, "`ReplicaUpdates` `Create`")?;
-                let overrides = UNSUPPORTED_REPLICA_CREATE_FIELDS
-                    .into_iter()
-                    .filter(|f| create.contains_key(*f))
-                    .collect();
-                out.push(ReplicaAction::Create { region, overrides });
+                let settings = decode_replica_settings(create, "`ReplicaUpdates` `Create`")?;
+                out.push(ReplicaAction::Create { region, settings });
             }
-            ["Update"] => out.push(ReplicaAction::Update),
+            ["Update"] => {
+                let update = element["Update"]
+                    .as_object()
+                    .ok_or_else(|| "`ReplicaUpdates` `Update` must be an object".to_owned())?;
+                let region = region_name(update, "`ReplicaUpdates` `Update`")?;
+                let settings = decode_replica_settings(update, "`ReplicaUpdates` `Update`")?;
+                out.push(ReplicaAction::Update { region, settings });
+            }
             ["Delete"] => {
                 let delete = element["Delete"]
                     .as_object()
@@ -373,11 +573,14 @@ impl GlobalTableUpdate {
         // never supported, so the named reason beats the EVENTUAL one.
         for action in &self.replica_actions {
             match action {
-                ReplicaAction::Update => {
-                    return Err(WireError::validation(
-                        "UpdateTable: ReplicaUpdates Update is not supported (no per-replica \
-                         setting can be overridden)",
-                    ));
+                ReplicaAction::Update { settings, .. } => {
+                    return Err(settings.mrsc_error("Update").unwrap_or_else(|| {
+                        WireError::validation(
+                            "UpdateTable: ReplicaUpdates Update is not supported on a \
+                             multi-Region strongly consistent table (it names no setting, and \
+                             no per-replica setting can be changed there)",
+                        )
+                    }));
                 }
                 ReplicaAction::Delete { .. } => {
                     return Err(WireError::validation(
@@ -386,7 +589,11 @@ impl GlobalTableUpdate {
                          kind of global table is supported yet",
                     ));
                 }
-                ReplicaAction::Create { .. } => {}
+                ReplicaAction::Create { settings, .. } => {
+                    if let Some(e) = settings.mrsc_error("Create") {
+                        return Err(e);
+                    }
+                }
             }
         }
         if self
@@ -424,26 +631,12 @@ impl GlobalTableUpdate {
         let mut replicas: Vec<String> = Vec::new();
         for action in &self.replica_actions {
             match action {
-                ReplicaAction::Create { region, overrides } => {
-                    if let Some(field) = overrides.first() {
-                        return Err(WireError::validation(format!(
-                            "UpdateTable: ReplicaUpdates Create does not support `{field}` \
-                             (per-replica overrides are not supported)"
-                        )));
-                    }
-                    replicas.push(region.clone());
-                }
-                ReplicaAction::Update => {
+                ReplicaAction::Create { region, .. } => replicas.push(region.clone()),
+                // Already refused by the first loop; kept total, not trusted.
+                ReplicaAction::Update { .. } | ReplicaAction::Delete { .. } => {
                     return Err(WireError::validation(
-                        "UpdateTable: ReplicaUpdates Update is not supported (no per-replica \
-                         setting can be overridden)",
-                    ));
-                }
-                ReplicaAction::Delete { .. } => {
-                    return Err(WireError::validation(
-                        "UpdateTable: ReplicaUpdates Delete is not supported: replicas cannot \
-                         be removed from a multi-Region strongly consistent table, and no other \
-                         kind of global table is supported yet",
+                        "UpdateTable: ReplicaUpdates Update and Delete are not supported on a \
+                         multi-Region strongly consistent table",
                     ));
                 }
             }
@@ -507,14 +700,19 @@ impl GlobalTableUpdate {
 }
 
 /// What a *valid* MREC replica request asks for, before the
-/// cluster-dependent checks: the peers to add, or the peers to remove (never
-/// both in one call).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// cluster-dependent checks: the peers to add and/or update, or the peers to
+/// remove (a delete is never mixed with a create or an update).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MrecRequest {
     /// `Create` Regions (peer names), in request order.
     pub creates: Vec<String>,
+    /// `Update` Regions (existing replicas, the local one included), in
+    /// request order. Each changes at least one read-capacity override.
+    pub updates: Vec<String>,
     /// `Delete` Regions (peer names), in request order.
     pub deletes: Vec<String>,
+    /// The per-replica settings of every `Create` and `Update` Region.
+    pub settings: std::collections::BTreeMap<String, ReplicaSettings>,
 }
 
 impl GlobalTableUpdate {
@@ -526,11 +724,34 @@ impl GlobalTableUpdate {
         matches!(self.consistency.as_deref(), None | Some("EVENTUAL"))
     }
 
+    /// Whether the request needs `Gate::MrecReplicaOverrides` open: an
+    /// `Update` action, or any read-capacity override on a `Create`. While it
+    /// is closed the edge refuses exactly these, with
+    /// [`overrides_gate_closed_error`](Self::overrides_gate_closed_error).
+    #[must_use]
+    pub fn needs_overrides_gate(&self) -> bool {
+        self.replica_actions.iter().any(|a| match a {
+            ReplicaAction::Update { .. } => true,
+            ReplicaAction::Create { settings, .. } => settings.changes_read_capacity(),
+            ReplicaAction::Delete { .. } => false,
+        })
+    }
+
+    /// The rejection while `Gate::MrecReplicaOverrides` is closed.
+    #[must_use]
+    pub fn overrides_gate_closed_error(&self) -> WireError {
+        WireError::validation(
+            "UpdateTable: ReplicaUpdates Update and per-replica ProvisionedThroughputOverride \
+             are not supported",
+        )
+    }
+
     /// Apply every request-shape rule of an MREC replica change (ADR 0075
-    /// section 5.1): per-replica overrides and `Update` are named and
-    /// refused, a witness is MRSC-only, creates and deletes are not mixed,
-    /// `EVENTUAL` needs a `Create` (V3). Cluster-dependent rules (configured
-    /// peers, own Region, already a replica) are the edge's.
+    /// section 5.1): settings whose table feature does not exist are named and
+    /// refused, a witness is MRSC-only, deletes are not mixed with creates or
+    /// updates, `EVENTUAL` needs a `Create` (V3) or an `Update`. Cluster-
+    /// dependent rules (configured peers, own Region, already a replica, the
+    /// table's billing mode, index names) are the edge's.
     ///
     /// # Errors
     /// A named `ValidationException`.
@@ -547,47 +768,58 @@ impl GlobalTableUpdate {
                  STRONG",
             ));
         }
-        let mut creates: Vec<String> = Vec::new();
-        let mut deletes: Vec<String> = Vec::new();
+        let mut req = MrecRequest::default();
         for action in &self.replica_actions {
             match action {
-                ReplicaAction::Create { region, overrides } => {
-                    if let Some(field) = overrides.first() {
+                ReplicaAction::Create { region, settings } => {
+                    if let Some(e) = settings.unsupported_error("Create") {
+                        return Err(e);
+                    }
+                    req.creates.push(region.clone());
+                    req.settings.insert(region.clone(), settings.clone());
+                }
+                ReplicaAction::Update { region, settings } => {
+                    if let Some(e) = settings.unsupported_error("Update") {
+                        return Err(e);
+                    }
+                    if !settings.changes_read_capacity() {
                         return Err(WireError::validation(format!(
-                            "UpdateTable: ReplicaUpdates Create does not support `{field}` \
-                             (per-replica overrides are not supported)"
+                            "UpdateTable: ReplicaUpdates Update for Region `{region}` names no \
+                             setting to change (supported: ProvisionedThroughputOverride, \
+                             GlobalSecondaryIndexes[].ProvisionedThroughputOverride)"
                         )));
                     }
-                    creates.push(region.clone());
+                    req.updates.push(region.clone());
+                    req.settings.insert(region.clone(), settings.clone());
                 }
-                ReplicaAction::Update => {
-                    return Err(WireError::validation(
-                        "UpdateTable: ReplicaUpdates Update is not supported (no per-replica \
-                         setting can be overridden)",
-                    ));
-                }
-                ReplicaAction::Delete { region } => deletes.push(region.clone()),
+                ReplicaAction::Delete { region } => req.deletes.push(region.clone()),
             }
         }
-        if !creates.is_empty() && !deletes.is_empty() {
+        if !req.deletes.is_empty() && (!req.creates.is_empty() || !req.updates.is_empty()) {
             return Err(WireError::validation(
-                "UpdateTable: ReplicaUpdates cannot mix Create and Delete actions in one call",
+                "UpdateTable: ReplicaUpdates cannot mix Delete with Create or Update actions in \
+                 one call",
             ));
         }
-        if creates.is_empty() && deletes.is_empty() {
+        if req.creates.is_empty() && req.updates.is_empty() && req.deletes.is_empty() {
             return Err(WireError::validation(
                 "UpdateTable: MultiRegionConsistency EVENTUAL requires ReplicaUpdates Create \
                  actions",
             ));
         }
-        if self.consistency.is_some() && creates.is_empty() {
+        if self.consistency.is_some() && req.creates.is_empty() {
             return Err(WireError::validation(
                 "UpdateTable: MultiRegionConsistency is only valid when ReplicaUpdates Create \
                  actions are specified",
             ));
         }
         let mut seen: Vec<&String> = Vec::new();
-        for region in creates.iter().chain(deletes.iter()) {
+        for region in req
+            .creates
+            .iter()
+            .chain(req.updates.iter())
+            .chain(req.deletes.iter())
+        {
             if region.is_empty() {
                 return Err(WireError::validation(
                     "UpdateTable: RegionName must not be empty",
@@ -600,7 +832,7 @@ impl GlobalTableUpdate {
             }
             seen.push(region);
         }
-        Ok(MrecRequest { creates, deletes })
+        Ok(req)
     }
 }
 
@@ -633,9 +865,35 @@ impl RegionStatus {
     }
 }
 
+/// One replica's read-capacity overrides, as `DescribeTable` reports them
+/// (`ProvisionedThroughputOverride` / `GlobalSecondaryIndexes[]`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReplicaReadOverrides {
+    /// The table's overridden read capacity units.
+    pub table_read_units: Option<u64>,
+    /// Per-GSI overridden read capacity units, by index name.
+    pub index_read_units: std::collections::BTreeMap<String, u64>,
+}
+
+impl ReplicaReadOverrides {
+    /// Nothing overridden (the replica object then carries neither field).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.table_read_units.is_none() && self.index_read_units.is_empty()
+    }
+}
+
+fn throughput_override(units: u64) -> Value {
+    let mut o = Map::new();
+    o.insert("ReadCapacityUnits".into(), Value::Number(units.into()));
+    Value::Object(o)
+}
+
 /// The global-table part of a `DescribeTable` response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GlobalTableDescription {
+    /// Per-replica read-capacity overrides by Region (MREC; absent = none).
+    pub overrides: std::collections::BTreeMap<String, ReplicaReadOverrides>,
     /// Every full replica Region (the table's own included, AWS-style), in
     /// the table's declaration order, with its status.
     pub replicas: Vec<(String, RegionStatus)>,
@@ -671,6 +929,36 @@ impl GlobalTableDescription {
                             "ReplicaStatus".into(),
                             Value::String(status.as_str().into()),
                         );
+                        if let Some(o) = self.overrides.get(region).filter(|o| !o.is_empty()) {
+                            if let Some(units) = o.table_read_units {
+                                r.insert(
+                                    "ProvisionedThroughputOverride".into(),
+                                    throughput_override(units),
+                                );
+                            }
+                            if !o.index_read_units.is_empty() {
+                                r.insert(
+                                    "GlobalSecondaryIndexes".into(),
+                                    Value::Array(
+                                        o.index_read_units
+                                            .iter()
+                                            .map(|(name, units)| {
+                                                let mut g = Map::new();
+                                                g.insert(
+                                                    "IndexName".into(),
+                                                    Value::String(name.clone()),
+                                                );
+                                                g.insert(
+                                                    "ProvisionedThroughputOverride".into(),
+                                                    throughput_override(*units),
+                                                );
+                                                Value::Object(g)
+                                            })
+                                            .collect(),
+                                    ),
+                                );
+                            }
+                        }
                         Value::Object(r)
                     })
                     .collect(),
@@ -824,13 +1112,30 @@ mod tests {
     }
 
     #[test]
-    fn every_unsupported_replica_override_is_rejected_naming_the_field() {
-        for field in UNSUPPORTED_REPLICA_CREATE_FIELDS {
+    fn mrsc_refuses_every_per_replica_setting_naming_it() {
+        // Settings whose table feature does not exist: the feature is named.
+        for field in [
+            "KMSMasterKeyId",
+            "OnDemandThroughputOverride",
+            "TableClassOverride",
+        ] {
             let mut c = json!({"RegionName": "b"});
             c[field] = json!({});
             let msg = validate_err(&json!({"TableName":"tbl","MultiRegionConsistency":"STRONG",
                 "ReplicaUpdates":[{"Create": c}, create("c")]}));
             assert!(msg.contains(&format!("`{field}`")), "{field}: {msg}");
+            assert!(msg.contains("so there is no"), "{field}: {msg}");
+        }
+        // Read capacity is modelled, but on MREC only.
+        for c in [
+            json!({"RegionName":"b","ProvisionedThroughputOverride":{"ReadCapacityUnits":5}}),
+            json!({"RegionName":"b","GlobalSecondaryIndexes":[
+                {"IndexName":"g","ProvisionedThroughputOverride":{"ReadCapacityUnits":5}}]}),
+        ] {
+            let msg = validate_err(&json!({"TableName":"tbl","MultiRegionConsistency":"STRONG",
+                "ReplicaUpdates":[{"Create": c}, create("c")]}));
+            assert!(msg.contains("`ProvisionedThroughputOverride`"), "{msg}");
+            assert!(msg.contains("eventually consistent tables only"), "{msg}");
         }
     }
 
@@ -931,10 +1236,192 @@ mod tests {
         }
     }
 
+    fn mrec_of(body: &Value) -> Result<MrecRequest, WireError> {
+        update_of(body).validate_mrec()
+    }
+
+    fn mrec_err(body: &Value) -> String {
+        mrec_of(body).expect_err("must be rejected").message
+    }
+
+    #[test]
+    fn mrec_create_and_update_carry_read_capacity_overrides() {
+        let r = mrec_of(&json!({"TableName":"tbl","ReplicaUpdates":[
+            {"Create":{"RegionName":"b",
+                "ProvisionedThroughputOverride":{"ReadCapacityUnits":50},
+                "GlobalSecondaryIndexes":[
+                    {"IndexName":"g1","ProvisionedThroughputOverride":{"ReadCapacityUnits":7}},
+                    {"IndexName":"g2"}]}},
+            {"Update":{"RegionName":"c","ProvisionedThroughputOverride":{}}},
+            {"Update":{"RegionName":"d","GlobalSecondaryIndexes":[
+                {"IndexName":"g1","ProvisionedThroughputOverride":{}}]}},
+        ]}))
+        .unwrap();
+        assert_eq!(r.creates, ["b"]);
+        assert_eq!(r.updates, ["c", "d"]);
+        let b = &r.settings["b"];
+        assert_eq!(b.table, ReadChange::Set(50));
+        assert_eq!(b.indexes, [("g1".to_string(), ReadChange::Set(7))]);
+        assert_eq!(r.settings["c"].table, ReadChange::Clear);
+        assert_eq!(
+            r.settings["d"].indexes,
+            [("g1".to_string(), ReadChange::Clear)]
+        );
+        // An Update-only request needs no MultiRegionConsistency and no Create.
+        assert!(r.deletes.is_empty());
+    }
+
+    #[test]
+    fn mrec_unsupported_settings_name_the_missing_feature() {
+        for (field, feature) in [
+            ("KMSMasterKeyId", "SSESpecification"),
+            ("OnDemandThroughputOverride", "OnDemandThroughput"),
+            ("TableClassOverride", "TableClass"),
+        ] {
+            for action in ["Create", "Update"] {
+                let mut c = json!({"RegionName": "b"});
+                c[field] = json!("x");
+                let msg = mrec_err(&json!({"TableName":"tbl","ReplicaUpdates":[{action: c}]}));
+                assert!(
+                    msg.contains(&format!(
+                        "ReplicaUpdates {action} does not support `{field}`"
+                    )),
+                    "{msg}"
+                );
+                assert!(msg.contains(feature), "{msg}");
+                assert!(
+                    !msg.contains("per-replica overrides are not supported"),
+                    "{msg}"
+                );
+            }
+        }
+        // A GSI-level on-demand override is the same refusal.
+        let msg = mrec_err(&json!({"TableName":"tbl","ReplicaUpdates":[{"Update":{
+            "RegionName":"b","GlobalSecondaryIndexes":[
+                {"IndexName":"g","OnDemandThroughputOverride":{"MaxReadRequestUnits":1}}]}}]}));
+        assert!(msg.contains("`OnDemandThroughputOverride`"), "{msg}");
+        // An Update naming only a missing-feature setting is that refusal, not a blank one.
+        let msg = mrec_err(&json!({"TableName":"tbl","ReplicaUpdates":[
+            {"Update":{"RegionName":"b","TableClassOverride":"STANDARD_INFREQUENT_ACCESS"}}]}));
+        assert!(msg.contains("table classes"), "{msg}");
+    }
+
+    #[test]
+    fn mrec_update_shape_rules() {
+        let msg = mrec_err(&json!({"TableName":"tbl","ReplicaUpdates":[
+            {"Update":{"RegionName":"b"}}]}));
+        assert!(msg.contains("names no setting to change"), "{msg}");
+        let msg = mrec_err(&json!({"TableName":"tbl","ReplicaUpdates":[
+            {"Update":{"RegionName":"b","ProvisionedThroughputOverride":{"ReadCapacityUnits":1}}},
+            {"Delete":{"RegionName":"c"}}]}));
+        assert!(msg.contains("cannot mix Delete"), "{msg}");
+        let msg = mrec_err(&json!({"TableName":"tbl","ReplicaUpdates":[
+            {"Update":{"RegionName":"b","ProvisionedThroughputOverride":{"ReadCapacityUnits":1}}},
+            {"Update":{"RegionName":"b","ProvisionedThroughputOverride":{"ReadCapacityUnits":2}}}]}));
+        assert!(msg.contains("`b` is named more than once"), "{msg}");
+        // MultiRegionConsistency needs a Create, as before.
+        let msg = mrec_err(
+            &json!({"TableName":"tbl","MultiRegionConsistency":"EVENTUAL",
+            "ReplicaUpdates":[{"Update":{"RegionName":"b",
+                "ProvisionedThroughputOverride":{"ReadCapacityUnits":1}}}]}),
+        );
+        assert!(
+            msg.contains("only valid when ReplicaUpdates Create"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn malformed_overrides_fail_validation_by_name() {
+        for body in [
+            json!({"ProvisionedThroughputOverride":"x"}),
+            json!({"ProvisionedThroughputOverride":{"ReadCapacityUnits":0}}),
+            json!({"ProvisionedThroughputOverride":{"ReadCapacityUnits":-3}}),
+            json!({"ProvisionedThroughputOverride":{"ReadCapacityUnits":"5"}}),
+            json!({"ProvisionedThroughputOverride":{"ReadCapacityUnits":1.5}}),
+            json!({"GlobalSecondaryIndexes":[]}),
+            json!({"GlobalSecondaryIndexes":"g"}),
+            json!({"GlobalSecondaryIndexes":[{}]}),
+            json!({"GlobalSecondaryIndexes":[{"IndexName":"g"},{"IndexName":"g"}]}),
+            json!({"GlobalSecondaryIndexes":[{"IndexName":"g",
+                "ProvisionedThroughputOverride":{"ReadCapacityUnits":0}}]}),
+        ] {
+            let mut c = body.clone();
+            c["RegionName"] = json!("b");
+            let u = update_of(&json!({"TableName":"tbl","ReplicaUpdates":[{"Update": c}]}));
+            assert!(u.shape_error.is_some(), "{body}");
+            assert!(
+                u.validate_mrec()
+                    .unwrap_err()
+                    .message
+                    .starts_with("UpdateTable: "),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_overrides_gate_only_guards_update_and_read_overrides() {
+        let needs = |body: Value| update_of(&body).needs_overrides_gate();
+        assert!(!needs(
+            json!({"TableName":"tbl","ReplicaUpdates":[create("b")]})
+        ));
+        assert!(!needs(json!({"TableName":"tbl","ReplicaUpdates":[
+            {"Delete":{"RegionName":"b"}}]})));
+        assert!(needs(json!({"TableName":"tbl","ReplicaUpdates":[
+            {"Update":{"RegionName":"b"}}]})));
+        assert!(needs(
+            json!({"TableName":"tbl","ReplicaUpdates":[{"Create":{
+            "RegionName":"b","ProvisionedThroughputOverride":{"ReadCapacityUnits":3}}}]})
+        ));
+        let e = update_of(&json!({"TableName":"tbl","ReplicaUpdates":[
+            {"Update":{"RegionName":"b"}}]}))
+        .overrides_gate_closed_error();
+        assert_eq!(e.code, "ValidationException");
+    }
+
+    #[test]
+    fn description_reports_overrides_per_replica() {
+        let mut desc = Map::new();
+        GlobalTableDescription {
+            overrides: [
+                (
+                    "b".to_string(),
+                    ReplicaReadOverrides {
+                        table_read_units: Some(50),
+                        index_read_units: [("g1".to_string(), 7)].into(),
+                    },
+                ),
+                ("c".to_string(), ReplicaReadOverrides::default()),
+            ]
+            .into(),
+            replicas: vec![
+                ("a".into(), RegionStatus::Active),
+                ("b".into(), RegionStatus::Active),
+                ("c".into(), RegionStatus::Active),
+            ],
+            witness: None,
+            eventual: true,
+        }
+        .apply_to(&mut desc);
+        assert_eq!(
+            desc["Replicas"],
+            json!([
+                {"RegionName":"a","ReplicaStatus":"ACTIVE"},
+                {"RegionName":"b","ReplicaStatus":"ACTIVE",
+                 "ProvisionedThroughputOverride":{"ReadCapacityUnits":50},
+                 "GlobalSecondaryIndexes":[{"IndexName":"g1",
+                    "ProvisionedThroughputOverride":{"ReadCapacityUnits":7}}]},
+                {"RegionName":"c","ReplicaStatus":"ACTIVE"},
+            ])
+        );
+    }
+
     #[test]
     fn description_shape() {
         let mut desc = Map::new();
         GlobalTableDescription {
+            overrides: Default::default(),
             replicas: vec![
                 ("a".into(), RegionStatus::Active),
                 ("b".into(), RegionStatus::Creating),
@@ -957,6 +1444,7 @@ mod tests {
         );
         let mut desc = Map::new();
         GlobalTableDescription {
+            overrides: Default::default(),
             replicas: vec![("a".into(), RegionStatus::Active)],
             witness: None,
             eventual: false,

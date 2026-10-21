@@ -1149,3 +1149,76 @@ fn generate_fixture_client_frame_mrec_control_ttl() {
     );
     std::fs::write(&path, encode_mrec_control_ttl()).expect("write");
 }
+
+/// ADR 0075's 2026-10-21 amendment: `MrecControl::SetOverrides` (per-replica
+/// read-capacity overrides synchronize to every replica). Its own fixture;
+/// the earlier mrec-control fixtures are never edited.
+fn mrec_control_overrides_messages() -> Vec<(&'static str, ClientRequest)> {
+    let frame = |read_units, index: &[(&str, u64)], stamp| {
+        ClientRequest::MrecApply(MrecApplyRequest {
+            proto: MREC_PROTO,
+            from_region: "eu".into(),
+            table: "orders".into(),
+            records: Vec::new(),
+            control: Some(animus_node::MrecControl::SetOverrides {
+                region: "us".into(),
+                read_units,
+                index_read_units: index.iter().map(|(n, u)| ((*n).to_owned(), *u)).collect(),
+                stamp,
+                origin: 7,
+            }),
+        })
+    };
+    vec![
+        (
+            "SetOverrides(table+index)",
+            frame(Some(400), &[("by_status", 200)], 1_000),
+        ),
+        ("SetOverrides(cleared)", frame(None, &[], 2_000)),
+    ]
+}
+
+fn encode_mrec_control_overrides() -> Vec<u8> {
+    let mut out = Vec::new();
+    for (_, r) in mrec_control_overrides_messages() {
+        out.extend(encode_client_frame(&r).expect("encodes"));
+    }
+    out
+}
+
+#[test]
+fn mrec_control_overrides_frames_are_byte_identical_to_the_fixture_and_gated() {
+    let fixture = std::fs::read(fixtures_dir().join("v1-mrec-control-overrides.bin"))
+        .expect("v1-mrec-control-overrides.bin is checked in");
+    assert_eq!(
+        encode_mrec_control_overrides(),
+        fixture,
+        "overrides control frames drifted"
+    );
+    let frames = split_frames(&fixture);
+    let msgs = mrec_control_overrides_messages();
+    assert_eq!(frames.len(), msgs.len());
+    for ((name, want), frame) in msgs.iter().zip(&frames) {
+        let got: ClientRequest = decode_client_frame(frame).expect("decodes");
+        assert_eq!(
+            encode_client_frame(&got).unwrap(),
+            encode_client_frame(want).unwrap(),
+            "{name}"
+        );
+        assert_eq!(want.required_gate(), Gate::MrecReplication, "{name}");
+        assert_eq!(surface_of(want), Surface::Intra, "{name}");
+    }
+}
+
+/// Refuses to overwrite: run once.
+#[test]
+#[ignore = "fixture generator; run explicitly, never regenerates an existing fixture"]
+fn generate_fixture_client_frame_mrec_control_overrides() {
+    let path = fixtures_dir().join("v1-mrec-control-overrides.bin");
+    assert!(
+        std::fs::metadata(&path).is_err(),
+        "{} already exists; a checked-in fixture is never regenerated in place",
+        path.display()
+    );
+    std::fs::write(&path, encode_mrec_control_overrides()).expect("write");
+}

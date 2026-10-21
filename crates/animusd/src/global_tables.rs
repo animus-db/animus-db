@@ -26,12 +26,14 @@
 //! write racing the conversion is safe because Raft membership change moves
 //! data anyway. It is deliberately *not* a replicated precondition.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use animus_control::schema::{GlobalTableSpec, MrecReplicaStatus, MultiRegionConsistency};
 use animus_control::version::Gate;
 use animus_control::{IndexKind, MetaCommand, Metadata, NodeStatus};
-use animus_dynamo::global::{GlobalTableDescription, GlobalTableUpdate, RegionStatus};
+use animus_dynamo::global::{
+    GlobalTableDescription, GlobalTableUpdate, RegionStatus, ReplicaReadOverrides,
+};
 use animus_dynamo::wire::{self, WireError};
 use animus_env::Env;
 use animus_node::host::RelayClient;
@@ -68,6 +70,7 @@ pub(crate) fn global_description(meta: &Metadata, table: &str) -> Option<GlobalT
         }
     };
     Some(GlobalTableDescription {
+        overrides: BTreeMap::new(),
         replicas: spec
             .regions
             .iter()
@@ -87,6 +90,20 @@ fn mrec_description(spec: &GlobalTableSpec) -> Option<GlobalTableDescription> {
         return None;
     }
     Some(GlobalTableDescription {
+        overrides: spec
+            .replicas
+            .iter()
+            .filter(|r| !r.overrides.is_empty())
+            .map(|r| {
+                (
+                    r.region.clone(),
+                    ReplicaReadOverrides {
+                        table_read_units: r.overrides.read_units,
+                        index_read_units: r.overrides.index_read_units.clone(),
+                    },
+                )
+            })
+            .collect(),
         replicas: spec
             .replicas
             .iter()

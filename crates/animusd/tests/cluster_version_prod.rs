@@ -10,11 +10,12 @@
 //! timeout-guarded (`ProdEnv` determinism guarantees do not apply, so a hang
 //! must fail loudly rather than stall CI).
 //!
-//! The real `MAX_SUPPORTED` is 6 (G-01 stage G-c shipped `Gate::GlobalTables`
+//! The real `MAX_SUPPORTED` is 8 (G-01 stage G-c shipped `Gate::GlobalTables`
 //! at 2, stage G-d `Gate::MrecReplication` at 3, R-01 `Gate::TxnSealChecked`
 //! at 4, ADR 0079 `Gate::NodeCapacity` at 5, ADR 0080 `Gate::FollowerAppliedIndex`
-//! at 6), so every real binary advertises `[1, 6]` and live Finalizes to 2, 3, 4, 5
-//! and then 6 succeed here: the era, the view, the leader-only routing and the
+//! at 6, ADR 0075's 2026-10-21 amendment `Gate::MrecReplicaOverrides` at 8; 7 is
+//! reserved by the parallel MRSC replica-removal gate), so every real binary
+//! advertises `[1, 8]` and live Finalizes to 2 through 8 succeed here: the era, the view, the leader-only routing and the
 //! finalizes that open `Gate::GlobalTables`, `Gate::MrecReplication` and
 //! `Gate::TxnSealChecked` on every node (a data-only node's mirror included). The blocker matrix and the one-step
 //! rules are proven over seeds in `sim_cluster_cluster_version.rs`.
@@ -100,7 +101,7 @@ async fn the_era_starts_over_real_sockets_and_the_admin_surface_works() {
 
         // GET /admin/cluster-version converges on every node: era on, version
         // 1, every member reported, and Finalize to 2 is within reach (every
-        // binary's range is [MIN_SUPPORTED, MAX_SUPPORTED] = [1, 6]).
+        // binary's range is [MIN_SUPPORTED, MAX_SUPPORTED] = [1, 8]).
         for node in &nodes {
             let addr = node.admin_addr();
             timeout(Duration::from_secs(30), async {
@@ -113,12 +114,12 @@ async fn the_era_starts_over_real_sockets_and_the_admin_surface_works() {
                             n.len() == 3 && n.iter().all(|x| x["reported"] == true)
                         })
                     {
-                        // Every member's range is [1,6], so nothing blocks the
+                        // Every member's range is [1,8], so nothing blocks the
                         // next step (target 2) and the safe target (the highest
                         // version every member supports) is the binary's max.
                         assert_eq!(v["can_finalize"], true, "{v}");
                         assert_eq!(v["target"], 2, "{v}");
-                        assert_eq!(v["safe_target"], 6, "{v}");
+                        assert_eq!(v["safe_target"], 8, "{v}");
                         assert!(v["blockers"].as_array().unwrap().is_empty(), "{v}");
                         return;
                     }
@@ -283,6 +284,34 @@ async fn the_era_starts_over_real_sockets_and_the_admin_surface_works() {
         })
         .await
         .expect("Gate::FollowerAppliedIndex never opened on every node after the finalize");
+
+        // 6 -> 7 (no gate of its own in this tree: the number is reserved) and
+        // 7 -> 8, which opens `Gate::MrecReplicaOverrides` (ADR 0075's
+        // 2026-10-21 amendment) on every node.
+        for (to, expected) in [(7, 6), (8, 7)] {
+            let (status, v) = admin(
+                nodes[leader].admin_addr(),
+                "POST",
+                "/admin/cluster-version/finalize",
+                Some(&format!(r#"{{"to":{to},"expected":{expected}}}"#)),
+            )
+            .await;
+            assert_eq!(status, 200, "{v}");
+            assert_eq!(v["active"], to, "{v}");
+        }
+        timeout(Duration::from_secs(60), async {
+            loop {
+                if nodes.iter().all(|n| {
+                    n.features()
+                        .is_open(animus_control::version::Gate::MrecReplicaOverrides)
+                }) {
+                    return;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("Gate::MrecReplicaOverrides never opened on every node after the finalize");
 
         // CHS1: an empty-`ext` dial is still welcome on the CLIENT port (the
         // CLI and external clients) ...

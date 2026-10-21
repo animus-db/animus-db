@@ -608,7 +608,8 @@ interim is **not** permitted.
   remote HLCs beyond it.
 - Q6: Per-replica overrides (`ProvisionedThroughputOverride`,
   `GlobalSecondaryIndexes`, `TableClassOverride`, KMS) and per-region
-  capacity accounting.
+  capacity accounting. **Closed as far as built by the 2026-10-21 amendment**
+  (MREC provisioned read capacity); the rest is listed there as remaining gaps.
 - Q7: Adding a region to an existing MREC table with data: initial full copy
   (snapshot scan + tail) uses the resync path of 4.2; its interaction with PITR
   and backup catalogs needs a follow-up section when G-d starts.
@@ -1308,3 +1309,89 @@ Tests: `classify_peer` and `peer_region_may_send` unit tests; real-process
 `animusd/tests/mrec_peer_transport.rs` (a peer-region certificate's `Forwarded`
 and `Get` are refused, `MrecApply` still reaches the handler, an own-CA
 certificate is not gated); operator tests pin `ca_path` and `peer_ca_path`.
+
+## Amendment (2026-10-21): per-replica read-capacity overrides (closes Q6 as far as built)
+
+`ReplicaUpdates` now accepts `ProvisionedThroughputOverride{ReadCapacityUnits}`
+on the table and, per index, in `GlobalSecondaryIndexes[]`, on `Create` and on
+`Update` (previously every override key and every `Update` was refused), **on
+MREC tables**. AWS makes exactly these overridable (table and GSI provisioned
+read capacity); write capacity is synchronized and is not.
+
+**Data model.** `MrecReplica.overrides: MrecReplicaOverrides { read_units,
+index_read_units, stamp, origin }`, additive and skipped while unset, so every
+existing encoding and fixture is byte-identical. Because MREC clusters have
+independent control planes, a change reaches a peer by a push that may arrive
+late, twice, or after a newer change made on the peer. The record is therefore
+**last-writer-wins by `(stamp, origin)`** (`stamp` = the issuing cluster's
+`Env::now`, forced strictly above the stored stamp; `origin` =
+`mrec_region_id`): `MetaCommand::SetMrecReplicaOverrides` applies only a
+strictly newer record and is otherwise a `NoOp`, so it is idempotent and a stale
+push is harmless. A *clear* (`ProvisionedThroughputOverride: {}`, AWS's "use the
+source table's settings") is a newer record with nothing set: a tombstone that
+keeps its stamp, so a stale push cannot resurrect the override.
+
+**Propagation.** The edge (`mrec_saga::update_table_mrec`) validates, then
+commits the merged record locally. The existing saga driver
+(`push_overrides`, beside `push_ttl`) sends each replica's record to every
+`Active` peer in `MrecControl::SetOverrides` until the peer acknowledges that
+exact `(stamp, origin)` (a driver-local memo; a restarted or new driver simply
+re-pushes everything, which the peer applies as a no-op). The peer
+(`set_overrides_from_peer`) applies it through its own control plane only while
+its own `Gate::MrecReplicaOverrides` is open (refused retryably otherwise). Every
+cluster's `DescribeTable` therefore converges on the same `Replicas[]`
+`ProvisionedThroughputOverride` / `GlobalSecondaryIndexes[]`.
+
+**Enforcement.** `ClientCtx::throttle_limits_for` (the single choke point of
+ADR 0065) replaces `read_units` with `Metadata::local_read_override(table)`, the
+override of **this cluster's own** replica: the table-level value for a user
+table, the index's value for the GSI's hidden table `<base>$<index>` (a GSI
+read is charged against its hidden table). `write_units` is untouched. The
+catalog-wide "anything throttled" flag counts a local override. A peer's
+override is inert in this cluster. Peers are created `PAY_PER_REQUEST` (the
+saga's existing "capacity is per region" decision), so an override is also how
+an operator gives a peer Region a read budget; it is enforced whatever the peer
+table's own billing mode.
+
+**Validation (receiving cluster).** An override on a `PAY_PER_REQUEST` table, an
+`IndexName` that is not a global secondary index of the table, an `Update` of a
+Region that is not a replica (or is `Deleting`), and an `Update` naming no
+setting are `ValidationException`s; a zero or non-integer `ReadCapacityUnits` is
+a shape error. `Update` may name the table's own Region. A call may mix `Create`
+and `Update`; `Delete` is not mixed with either.
+
+**Still refused, precisely.** `KMSMasterKeyId`, `OnDemandThroughputOverride`
+(also inside a GSI element) and `TableClassOverride` name the missing table
+feature (`SSESpecification`, `OnDemandThroughput`, `TableClass`: none exist in
+AnimusDB), on `Create` and `Update`, MREC and MRSC alike. **MRSC** keeps
+refusing the read-capacity overrides and `Update`: the Regions of an MRSC table
+are one stretched cluster whose per-tablet read budget (one bucket per tablet,
+ADR 0065) is shared by every Region's replicas and by strong reads served at the
+leader, so a per-Region budget has no place to be enforced cheaply; it is a
+remaining gap, not a bug. Also remaining: the override does not feed ADR 0067's
+minimum tablet count, and `DescribeTable`'s own `ProvisionedThroughput` still
+shows the table's declared (not the overridden) read units.
+
+**Gate (ADR 0073).** New `Gate::MrecReplicaOverrides` at cluster version 8
+(`MAX_SUPPORTED = 8`; version 7 is reserved by the parallel MRSC
+replica-removal gate, and the number lives in one constant,
+`version::MREC_REPLICA_OVERRIDES_VERSION`). Guards `SetMrecReplicaOverrides`
+(`required_gate` row, relay list, mirror arm, `sim_versions` content gate), the
+edge (below the gate `Update` and any read override are refused with
+`UpdateTable: ReplicaUpdates Update and per-replica ProvisionedThroughputOverride
+are not supported`, the emit-site check) and the peer handler. The cross-cluster
+`MrecControl::SetOverrides` variant follows `SetTtl`'s precedent (additive,
+class G with the `MrecApply` frame); a peer on an older binary rejects the frame
+and the sender retries until it upgrades.
+
+**Tests.** Pure: `animus-dynamo` `global::tests` (parsing, validation,
+description); `animus-control` `mrec_table_apply` (apply, LWW, rejections,
+`local_read_override`, gate row, mirror round trip), `format_fixtures`
+(new `metadata/v1-mrec-overrides.json`, pinned JSON), `version`/`sim_versions`
+units; `animus-node` new `client-frame/v1-mrec-control-overrides.bin`.
+Simulation: `sim_world_mrec_overrides_tests` (two clusters, seeded: create with
+an override, the 1-RCU Region throttled while the other is not, a partition
+during an `Update`, heal, convergence of both `Replicas[]`, clear as a
+tombstone, closed-gate refusal); `sim_cluster_mixed_version_corpus`
+`release7_to_release8_mrec_overrides_gate` and
+`negative_control_mrec_overrides_gate_emitted_early`.

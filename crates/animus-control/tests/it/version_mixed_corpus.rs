@@ -1526,6 +1526,7 @@ fn mrec_via_convert_to_global_cmd() -> MetaCommand {
                 status: animus_control::MrecReplicaStatus::Active,
                 local: true,
                 copied: Default::default(),
+                overrides: Default::default(),
             }],
         },
     }

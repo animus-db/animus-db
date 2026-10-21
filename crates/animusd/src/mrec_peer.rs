@@ -141,6 +141,12 @@ pub(crate) struct PeerHealth {
     /// The TTL attribute this node's saga last pushed (or observed at first
     /// sight) for the peer: `None` = never looked, `Some(None)` = no TTL.
     pub(crate) ttl_pushed: Option<Option<String>>,
+    /// The `(stamp, origin)` of each replica's read-capacity override record
+    /// this node's saga last got acknowledged by the peer (ADR 0075's
+    /// 2026-10-21 amendment), by the replica's Region. Absent = never pushed.
+    /// Driver-local and lost on restart or a driver change, which only costs
+    /// an idempotent re-push (the peer applies last-writer-wins).
+    pub(crate) overrides_pushed: BTreeMap<String, (u64, u32)>,
 }
 
 impl Default for MrecConfig {

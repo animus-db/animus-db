@@ -182,6 +182,9 @@ pub fn content_gate(msg: &RaftMsg) -> Gate {
         | crate::MetaCommand::RemoveMrecReplica { .. }
         | crate::MetaCommand::SetMrecReplicaStatus { .. }
         | crate::MetaCommand::MarkMrecCopied { .. } => g.join(Gate::MrecReplication),
+        // ADR 0075 (2026-10-21 amendment): what a Release(7) binary's strict
+        // decode cannot read (the variant, and `MrecReplica.overrides`).
+        crate::MetaCommand::SetMrecReplicaOverrides { .. } => g.join(Gate::MrecReplicaOverrides),
         crate::MetaCommand::ConvertTableToGlobal { spec, .. } if spec.is_mrec() => {
             g.join(Gate::MrecReplication)
         }
@@ -288,20 +291,27 @@ mod tests {
                 BinaryProfile::Release(4),
                 BinaryProfile::Release(5),
                 BinaryProfile::Release(6),
+                BinaryProfile::Release(7),
+                BinaryProfile::Release(8),
             ]
             .iter()
             .map(|p| p.accepts(g))
             .collect();
             let want = match g {
-                Gate::Base => [true, true, true, true, true, true, true],
-                Gate::Era => [false, true, true, true, true, true, true],
-                Gate::GlobalTables => [false, false, true, true, true, true, true],
-                Gate::MrecReplication => [false, false, false, true, true, true, true],
-                Gate::TxnSealChecked => [false, false, false, false, true, true, true],
-                Gate::NodeCapacity => [false, false, false, false, false, true, true],
-                Gate::FollowerAppliedIndex => [false, false, false, false, false, false, true],
-                Gate::Synthetic(2) => [false, false, true, true, true, true, true],
-                Gate::Synthetic(3) => [false, false, false, true, true, true, true],
+                Gate::Base => [true, true, true, true, true, true, true, true, true],
+                Gate::Era => [false, true, true, true, true, true, true, true, true],
+                Gate::GlobalTables => [false, false, true, true, true, true, true, true, true],
+                Gate::MrecReplication => [false, false, false, true, true, true, true, true, true],
+                Gate::TxnSealChecked => [false, false, false, false, true, true, true, true, true],
+                Gate::NodeCapacity => [false, false, false, false, false, true, true, true, true],
+                Gate::FollowerAppliedIndex => {
+                    [false, false, false, false, false, false, true, true, true]
+                }
+                Gate::MrecReplicaOverrides => {
+                    [false, false, false, false, false, false, false, false, true]
+                }
+                Gate::Synthetic(2) => [false, false, true, true, true, true, true, true, true],
+                Gate::Synthetic(3) => [false, false, false, true, true, true, true, true, true],
                 Gate::Synthetic(_) => unreachable!(),
             };
             assert_eq!(row, want, "{g:?}");
@@ -368,6 +378,38 @@ mod tests {
         assert_eq!(content_gate(&msg), Gate::NodeCapacity);
         assert!(!BinaryProfile::Release(4).accepts(Gate::NodeCapacity));
         assert!(BinaryProfile::Release(5).accepts(Gate::NodeCapacity));
+    }
+
+    /// ADR 0075 (2026-10-21 amendment): the override command is gated by
+    /// classification and by content, so a `Release(7)` voter's capped decode
+    /// refuses it and a `Release(8)` voter accepts it.
+    #[test]
+    fn replica_overrides_need_the_mrec_overrides_gate() {
+        use crate::raft::LogEntry;
+        let cmd = MetaCommand::SetMrecReplicaOverrides {
+            table: "t".into(),
+            region: "eu".into(),
+            overrides: Default::default(),
+        };
+        let msg = RaftMsg::AppendEntries {
+            term: 1,
+            leader: animus_env::nid(0),
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![LogEntry {
+                term: 1,
+                index: 1,
+                command: cmd,
+                config: None,
+                learners: None,
+            }],
+            leader_commit: 0,
+        };
+        assert_eq!(msg.required_gate(), Gate::MrecReplicaOverrides);
+        assert_eq!(content_gate(&msg), Gate::MrecReplicaOverrides);
+        let v = crate::version::MREC_REPLICA_OVERRIDES_VERSION;
+        assert!(!BinaryProfile::Release(v - 1).accepts(Gate::MrecReplicaOverrides));
+        assert!(BinaryProfile::Release(v).accepts(Gate::MrecReplicaOverrides));
     }
 
     #[test]

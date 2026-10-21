@@ -12613,3 +12613,18 @@ node bucket; the operator exposes only the explicit `spec.background.compactionI
 `sim_cluster_lsm.rs` installs the engine options and a shared compaction wedge).
 
 **Dashboard/console skin (2026-10-18):** both apps follow the shared tokens (Archivo UI, `--font-display` 75%/800 uppercase headings, accent-filled primary buttons, outlined quiet status pills, no black blocks). Archivo is embedded as base64 in `fonts.css` (`fonts/archivo-latin.woff2`); Work Sans was dropped. See `docs/lessons/general/2026-10-18-app-skin-follows-shared-tokens-and-fonts-are-base64.md`.
+
+## MREC per-replica read overrides (ADR 0075's 2026-10-21 amendment, `Gate::MrecReplicaOverrides`)
+
+`mrec_saga::update_table_mrec` accepts `ReplicaUpdates` `Update` and `ProvisionedThroughputOverride`
+(table and per-GSI) behind the gate (closed: the pre-amendment refusal text), validates against the
+receiving cluster's table (PROVISIONED, GSI names), commits `SetMrecReplicaOverrides` (stamp = max(now,
+stored+1), origin = this region's id) and `push_overrides` (saga driver) sends each replica's record to
+every Active peer as `MrecControl::SetOverrides` until acknowledged (memo `PeerHealth.overrides_pushed`;
+the peer applies last-writer-wins, so repeats are no-ops). Enforcement is only
+`ClientCtx::throttle_limits_for` -> `Metadata::local_read_override` (read units only). A node that
+applies a push calls `recompute_any_table_throughput`; the `SimCluster` fixture never spawns the
+`index_drain` watch, so sim tests call `SimCluster::recompute_throttle_flags()` before reading.
+MRSC and KMS/OnDemand/TableClass overrides stay refused (see the ADR). Sim test:
+`sim_world_mrec_overrides_tests`. In a sim cluster, a long idle finalize ladder *after* the table exists
+makes the first client calls time out (quiesced groups): open the gates before creating the table.

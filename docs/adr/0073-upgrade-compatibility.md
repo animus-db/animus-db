@@ -3602,3 +3602,29 @@ the follower's engine-applied index on the data plane's `AppendEntriesResp`.
   gate is closed); after it, every node emits v2. A node that restarts onto the
   new binary and has not yet read the replicated version also emits v1 (the
   floor handle), never v2.
+
+## Amendment 2026-10-21 — the sixth real gate: `Gate::MrecReplicaOverrides`, `MAX_SUPPORTED = 8` (ADR 0075's 2026-10-21 amendment)
+
+`MAX_SUPPORTED` is now **8**; `Gate::MrecReplicaOverrides` opens at version 8.
+Version 7 is reserved for the parallel MRSC replica-removal gate; until that
+lands the 6 -> 7 finalize is a plain step with no gate. The gate number is one
+constant (`version::MREC_REPLICA_OVERRIDES_VERSION`).
+
+| New shape | Class | Gate | Emit-site / propose-site check |
+|---|---|---|---|
+| `MetaCommand::SetMrecReplicaOverrides` | G (replicated command) | `MrecReplicaOverrides` | `required_gate` row (exhaustive); the `UpdateTable` edge checks the gate before proposing; the relay receiver re-checks (`relay_gate_verdict`); `sim_versions::content_gate` classifies it by content |
+| `MrecReplica.overrides` (JSON, skipped while unset) | G (replicated field) | `MrecReplicaOverrides` | only that command writes it; new fixture `metadata/v1-mrec-overrides.json` (existing fixtures untouched) |
+| `MrecControl::SetOverrides` (cross-cluster JSON frame) | G (additive variant of the `MrecApply` frame) | peer's own `MrecReplicaOverrides` | the sender is gated by its own cluster; the receiver refuses retryably while its gate is closed; new frame fixture `client-frame/v1-mrec-control-overrides.bin` |
+
+- **Tests.** `version::tests::mrec_replica_overrides_gate_opens_exactly_at_its_version`,
+  `sim_versions` `replica_overrides_need_the_mrec_overrides_gate` and the extended
+  acceptance matrix (`Release(7)`, `Release(8)` columns),
+  `mrec_table_apply::overrides_gate_row_and_mirror_round_trip`.
+- **Cells.** `sim_cluster_mixed_version_corpus::release7_to_release8_mrec_overrides_gate`
+  (relay refused by name and counted below the gate, half-rolled finalize refused,
+  accepted after, lands on every replica including the data-only mirror) and
+  `negative_control_mrec_overrides_gate_emitted_early` (N9). The pure
+  `version_mixed_corpus` tier stops at version 3 and is unchanged.
+- **Rolling upgrade behaviour.** Before the finalize `Update` and read overrides
+  are refused exactly as before; nothing is proposed or pushed.
+

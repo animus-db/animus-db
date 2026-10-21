@@ -43,10 +43,12 @@
 
 use std::time::Duration;
 
-use animus_control::schema::{GlobalTableSpec, MrecReplicaStatus, StreamViewType, mrec_region_id};
+use animus_control::schema::{
+    GlobalTableSpec, MrecReplicaOverrides, MrecReplicaStatus, StreamViewType, mrec_region_id,
+};
 use animus_control::version::Gate;
 use animus_control::{MetaCommand, Metadata};
-use animus_dynamo::global::{GlobalTableUpdate, MrecRequest};
+use animus_dynamo::global::{GlobalTableUpdate, MrecRequest, ReadChange, ReplicaSettings};
 use animus_dynamo::wire::WireError;
 use animus_env::Env;
 use animus_node::host::RelayClient;
@@ -146,6 +148,11 @@ pub(crate) async fn update_table_mrec<E: Env, R: RelayClient>(
     update: &GlobalTableUpdate,
 ) -> Result<String, WireError> {
     let request: MrecRequest = update.validate_mrec()?;
+    // The emit-site check of ADR 0073 for the override surface: with the gate
+    // closed the request is refused exactly as before this surface existed.
+    if update.needs_overrides_gate() && !overrides_gate_open(ctx) {
+        return Err(update.overrides_gate_closed_error());
+    }
     let cfg = &ctx.mrec;
     let Some(local) = cfg.region.clone() else {
         return Err(WireError::validation(
@@ -165,6 +172,7 @@ pub(crate) async fn update_table_mrec<E: Env, R: RelayClient>(
             "UpdateTable: table `{table}` is already a global table of another kind"
         )));
     }
+    validate_read_settings(meta, table, existing, &request)?;
     if request.deletes.is_empty() {
         let known = existing.map_or(1, |s| s.replicas.len());
         if known + request.creates.len() > GlobalTableSpec::MREC_MAX_REPLICAS {
@@ -226,6 +234,15 @@ pub(crate) async fn update_table_mrec<E: Env, R: RelayClient>(
             )
             .await?;
         }
+        // Per-replica read-capacity overrides, for the new replicas (set once
+        // the replica exists in the replicated spec) and the updated ones. The
+        // saga then pushes each record to the peers (`push_overrides`).
+        for region in request.creates.iter().chain(request.updates.iter()) {
+            let settings = &request.settings[region];
+            if settings.changes_read_capacity() {
+                set_overrides(ctx, table, &local, region, settings).await?;
+            }
+        }
     } else {
         let Some(spec) = existing else {
             return Err(WireError::validation(format!(
@@ -269,6 +286,141 @@ pub(crate) async fn update_table_mrec<E: Env, R: RelayClient>(
     }
     let fresh = ctx.metadata_fresh().await;
     describe_table_wrapped(&fresh, table, "TableDescription")
+}
+
+/// Whether `Gate::MrecReplicaOverrides` is open (the emit-site check).
+pub(crate) fn overrides_gate_open<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> bool {
+    gate_open(ctx, Gate::MrecReplicaOverrides)
+}
+
+/// The cluster-dependent rules of the read-capacity settings of a request
+/// (ADR 0075's 2026-10-21 amendment): an override needs a `PROVISIONED`
+/// table (AWS: replica read capacity is a provisioned-mode setting), every
+/// named index must be a global secondary index of the table, and an `Update`
+/// must name an existing, not-being-deleted replica.
+fn validate_read_settings(
+    meta: &Metadata,
+    table: &str,
+    existing: Option<&GlobalTableSpec>,
+    request: &MrecRequest,
+) -> Result<(), WireError> {
+    for region in &request.updates {
+        let Some(spec) = existing else {
+            return Err(WireError::validation(format!(
+                "UpdateTable: table `{table}` is not a multi-Region eventually consistent table, \
+                 so it has no replica to update"
+            )));
+        };
+        match spec.replicas.iter().find(|r| r.region == *region) {
+            None => {
+                return Err(WireError::validation(format!(
+                    "UpdateTable: Region `{region}` is not a replica of table `{table}`"
+                )));
+            }
+            Some(r) if r.status == MrecReplicaStatus::Deleting => {
+                return Err(WireError::validation(format!(
+                    "UpdateTable: the replica in Region `{region}` of table `{table}` is being \
+                     deleted and cannot be updated"
+                )));
+            }
+            Some(_) => {}
+        }
+    }
+    let changing: Vec<(&String, &ReplicaSettings)> = request
+        .creates
+        .iter()
+        .chain(request.updates.iter())
+        .map(|r| (r, &request.settings[r]))
+        .filter(|(_, s)| s.changes_read_capacity())
+        .collect();
+    if changing.is_empty() {
+        return Ok(());
+    }
+    if meta.table_throughput(table).is_none() {
+        return Err(WireError::validation(format!(
+            "UpdateTable: table `{table}` is PAY_PER_REQUEST; a per-replica \
+             ProvisionedThroughputOverride applies only to a PROVISIONED table"
+        )));
+    }
+    for (_, settings) in &changing {
+        for (index, _) in &settings.indexes {
+            let is_gsi = meta
+                .table_indexes(table)
+                .iter()
+                .any(|d| d.kind == animus_control::IndexKind::Global && d.name == *index);
+            if !is_gsi {
+                return Err(WireError::validation(format!(
+                    "UpdateTable: table `{table}` has no global secondary index `{index}` to \
+                     override"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The record `settings` yields on top of `base`: `Set` replaces, `Clear`
+/// removes, `Unchanged` keeps; stamped strictly newer than `base` and than this
+/// cluster's clock.
+fn merged_overrides(
+    base: &MrecReplicaOverrides,
+    settings: &ReplicaSettings,
+    now_nanos: u64,
+    origin: u32,
+) -> MrecReplicaOverrides {
+    let mut out = base.clone();
+    match settings.table {
+        ReadChange::Unchanged => {}
+        ReadChange::Clear => out.read_units = None,
+        ReadChange::Set(u) => out.read_units = Some(u),
+    }
+    for (index, change) in &settings.indexes {
+        match change {
+            ReadChange::Unchanged => {}
+            ReadChange::Clear => {
+                out.index_read_units.remove(index);
+            }
+            ReadChange::Set(u) => {
+                out.index_read_units.insert(index.clone(), *u);
+            }
+        }
+    }
+    out.stamp = now_nanos.max(base.stamp.saturating_add(1));
+    out.origin = origin;
+    out
+}
+
+/// Commit the merged override record of `region` (waits until the replicated
+/// record is at least as new).
+async fn set_overrides<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    table: &str,
+    local: &str,
+    region: &str,
+    settings: &ReplicaSettings,
+) -> Result<(), WireError> {
+    let current = ctx.metadata_fresh().await;
+    let base = mrec_spec(&current, table)
+        .and_then(|s| s.replicas.iter().find(|r| r.region == region))
+        .map(|r| r.overrides.clone())
+        .unwrap_or_default();
+    let merged = merged_overrides(&base, settings, ctx.env.now().0, mrec_region_id(local));
+    let (t, r, order) = (table.to_owned(), region.to_owned(), merged.order());
+    commit(
+        ctx,
+        MetaCommand::SetMrecReplicaOverrides {
+            table: table.to_owned(),
+            region: region.to_owned(),
+            overrides: merged,
+        },
+        move |m| {
+            mrec_spec(m, &t)
+                .and_then(|s| s.replicas.iter().find(|x| x.region == r))
+                .is_some_and(|x| x.overrides.order() >= order)
+        },
+    )
+    .await
+    .map(|fresh| ctx.recompute_any_table_throughput(&fresh))
 }
 
 // ---------------------------------------------------------------------------
@@ -400,6 +552,7 @@ pub(crate) async fn mrec_saga_table<E: Env, R: RelayClient>(
         return false;
     }
     let mut did = push_ttl(ctx, client, &meta, spec, table).await;
+    did |= push_overrides(ctx, client, spec, table).await;
     if spec.replicas.iter().all(|r| {
         r.local
             || r.status == MrecReplicaStatus::Active
@@ -591,7 +744,141 @@ pub(crate) async fn handle_control<E: Env, R: RelayClient>(
         MrecControl::AddPeer { region } => add_peer(ctx, table, &region).await,
         MrecControl::Leave => leave(ctx, from, table).await,
         MrecControl::SetTtl { attribute } => set_ttl(ctx, from, table, attribute).await,
+        MrecControl::SetOverrides {
+            region,
+            read_units,
+            index_read_units,
+            stamp,
+            origin,
+        } => {
+            let incoming = MrecReplicaOverrides {
+                read_units,
+                index_read_units,
+                stamp,
+                origin,
+            };
+            set_overrides_from_peer(ctx, table, &region, incoming).await
+        }
     }
+}
+
+/// Peer side of [`MrecControl::SetOverrides`]: apply the sender's record of
+/// `region`'s overrides iff it is newer than ours (last-writer-wins by
+/// `(stamp, origin)`); an equal or older one is acknowledged untouched, so a
+/// late, duplicated or stale push is harmless.
+async fn set_overrides_from_peer<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    table: &str,
+    region: &str,
+    incoming: MrecReplicaOverrides,
+) -> MrecApplyResponse {
+    if let Err(why) = incoming.validate() {
+        return refused(why, false);
+    }
+    if !overrides_gate_open(ctx) {
+        return refused(
+            "this cluster has not finalized the cluster version that carries per-replica \
+             overrides yet",
+            true,
+        );
+    }
+    let meta = ctx.metadata_fresh().await;
+    let Some(spec) = mrec_spec(&meta, table) else {
+        return refused(format!("table `{table}` is not an MREC table here"), true);
+    };
+    let Some(replica) = spec.replicas.iter().find(|r| r.region == region) else {
+        return refused(
+            format!("region `{region}` is not (yet) a replica of table `{table}` here"),
+            true,
+        );
+    };
+    if replica.overrides.order() >= incoming.order() {
+        return MrecApplyResponse::Done;
+    }
+    let (t, r, order) = (table.to_owned(), region.to_owned(), incoming.order());
+    match commit(
+        ctx,
+        MetaCommand::SetMrecReplicaOverrides {
+            table: table.to_owned(),
+            region: region.to_owned(),
+            overrides: incoming,
+        },
+        move |m| {
+            mrec_spec(m, &t)
+                .and_then(|s| s.replicas.iter().find(|x| x.region == r))
+                .is_none_or(|x| x.overrides.order() >= order)
+        },
+    )
+    .await
+    {
+        Ok(fresh) => {
+            // The "anything throttled" fast-path flag must see the new override
+            // at once (see `ClientCtx::any_table_throughput`).
+            ctx.recompute_any_table_throughput(&fresh);
+            MrecApplyResponse::Done
+        }
+        Err(e) => refused(e.message, true),
+    }
+}
+
+/// Sender side: push every replica's override record to every `Active` peer
+/// that this node has not yet got an acknowledgement from for that exact
+/// record. Convergent: the memo only skips records the peer acknowledged, a
+/// failed or timed-out send is retried on the next pass, and the peer's
+/// last-writer-wins apply makes any repeat (a restarted or newly elected
+/// driver re-pushing everything) a no-op.
+async fn push_overrides<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    client: &dyn PeerClient,
+    spec: &GlobalTableSpec,
+    table: &str,
+) -> bool {
+    if !overrides_gate_open(ctx) {
+        return false;
+    }
+    let mut did = false;
+    for target in spec
+        .replicas
+        .iter()
+        .filter(|r| !r.local && r.status == MrecReplicaStatus::Active)
+    {
+        let key: HealthKey = (table.to_owned(), SAGA_SLOT, target.region.clone());
+        for about in spec.replicas.iter().filter(|r| !r.overrides.is_unset()) {
+            let order = about.overrides.order();
+            let pushed = {
+                let h = ctx.mrec.health.lock().expect("mrec health poisoned");
+                h.get(&key)
+                    .and_then(|e| e.overrides_pushed.get(&about.region).copied())
+            };
+            if pushed == Some(order) {
+                continue;
+            }
+            let o = &about.overrides;
+            let reply = send_control(
+                ctx,
+                client,
+                &target.region,
+                table,
+                MrecControl::SetOverrides {
+                    region: about.region.clone(),
+                    read_units: o.read_units,
+                    index_read_units: o.index_read_units.clone(),
+                    stamp: o.stamp,
+                    origin: o.origin,
+                },
+            )
+            .await;
+            did = true;
+            if matches!(reply, Ok(MrecApplyResponse::Done)) {
+                let mut h = ctx.mrec.health.lock().expect("mrec health poisoned");
+                h.entry(key.clone())
+                    .or_default()
+                    .overrides_pushed
+                    .insert(about.region.clone(), order);
+            }
+        }
+    }
+    did
 }
 
 /// Peer side of [`MrecControl::SetTtl`]: mirror the sender's TTL setting

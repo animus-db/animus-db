@@ -3438,3 +3438,18 @@ A new variant must pick a class. Test: `tests/it/transport_class.rs`.
   silent or never-reporting voter does not move it. The data plane's `raftkv-wire` v2 is what carries
   the field on the wire (`animus-cp-data` `codec.rs`). New `AppendEntriesResp` construction sites need
   `applied_index: 0` (patterns want `..`). Pure tests: `tests/it/quorum_applied.rs`.
+
+## `Gate::MrecReplicaOverrides`, `MAX_SUPPORTED = 8` (ADR 0075's 2026-10-21 amendment)
+
+- `MetaCommand::SetMrecReplicaOverrides { table, region, overrides }` replaces an MREC replica's
+  `MrecReplica.overrides` (`MrecReplicaOverrides { read_units, index_read_units, stamp, origin }`).
+  Apply: rejected for a non-MREC table / unknown replica / zero capacity; a record whose
+  `(stamp, origin)` is not strictly newer than the stored one is a `NoOp` (last-writer-wins across
+  independent clusters; a clear keeps its stamp as a tombstone). Index names are not checked at apply.
+- `Metadata::local_read_override(table)` (table or hidden `<base>$<index>`) is what animusd's
+  `throttle_limits_for` reads; `any_table_throughput()` counts a local override.
+- The gate number is `version::MREC_REPLICA_OVERRIDES_VERSION` (8; 7 is reserved by the MRSC
+  removal gate). Rows: `required_gate`, mirror (schema row), `sim_versions` content gate and
+  matrix, relay list in `animus-node`. Fixture: `metadata/v1-mrec-overrides.json`. New
+  `MrecReplica { .. }` literals need `overrides: Default::default()`.
+
