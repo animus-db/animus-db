@@ -1308,3 +1308,84 @@ Tests: `classify_peer` and `peer_region_may_send` unit tests; real-process
 `animusd/tests/mrec_peer_transport.rs` (a peer-region certificate's `Forwarded`
 and `Get` are refused, `MrecApply` still reaches the handler, an own-CA
 certificate is not gated); operator tests pin `ca_path` and `peer_ca_path`.
+
+## Amendment (2026-10-21): removing replicas from an MRSC table (reverting to a single-Region table)
+
+**Status: as built.** AWS documents exactly one way to remove Regions from a
+multi-Region strongly consistent (MRSC) global table: *"You cannot delete a single
+replica or a witness from a MRSC global table. You can delete two replicas or delete
+one replica and a witness from a MRSC global table, converting the remaining replica
+to a single-Region DynamoDB table"* (developer guide, global tables how-it-works;
+`DeleteGlobalTableWitnessGroupMemberAction` in the service model). *"You cannot add
+additional replicas to an existing MRSC global table."* Section 5.1's blanket
+"`Delete` is rejected" and section 3.5's "the Regions are fixed at creation" are
+superseded for the Delete half; adds stay rejected (`already a global table`).
+
+**Wire (`animus-dynamo` `global.rs`, `animusd` `global_tables.rs`).** On an MRSC table an
+`UpdateTable` carrying any `Delete` takes `GlobalTableUpdate::validate_revert(regions,
+witness)`: exactly two of the table's three Regions are named (two `ReplicaUpdates`
+`Delete`s, or one replica `Delete` plus the `GlobalTableWitnessUpdates` `Delete`), and
+the Region that remains must be a replica, not the witness. Rejected with a named
+`ValidationException`: a single replica `Delete`, a lone witness `Delete`, all three,
+a duplicate, an unknown Region, the witness named as a replica, a witness `Delete` on a
+table with no witness (or naming another Region), a `Create` mixed with a `Delete`,
+`Update`, and `MultiRegionConsistency` (valid only with `Create`). The Regions a
+request names are the ones removed; the serving node's own Region is not special (the
+stretch cluster hosts every Region). `WitnessAction::Delete` now carries the optional
+`RegionName` so it can be checked. A regional table receiving a `Delete` keeps the
+pre-amendment text.
+
+**Control plane.** `MetaCommand::RevertGlobalToRegional { table, keep_region }`
+behind the new **`Gate::MrscReplicaRemoval`, cluster version 7, `MAX_SUPPORTED = 7`**
+(ADR 0073's 2026-10-21 amendment). Apply, in one step: clears `schema.global` and
+replaces every tablet's pinned MRSC policy with a *regional* one. Choice and why:
+the policy is `PlacementPolicy::allow_values(REGION_LABEL, [keep])` over the
+cluster's usual `zone_spread_policy` (RF `min(3, members in keep that are not
+Leaving)`, best-effort zone spread when every member of the Region carries a zone and
+there are at least RF zones, else a plain RF). It is **not** pinned, so the existing
+`reconcile_placement` repair (`replan_repair`) drops the replicas that now violate
+residency and recruits replacements in `keep`: there is no new mover, no new Raft
+membership code, and the host reconciler hands the removed replicas the same removal
+notices every other move uses. Not "the cluster default policy": that would not name
+the Region, and the prior policy was not stored (MRSC conversion overwrote it). RF is
+derived from members at apply, a pure function of replicated state, so every replica
+agrees. Rejections are state-based (never gate-based): no schema, an MREC table, `keep`
+not one of the table's Regions or the witness, no member carries `keep`. A table that
+is no longer global is a `NoOp`, which makes the command idempotent under leader change
+and retries (a racing request that kept a different Region also lands as `NoOp`; the edge
+detects it from the surviving policy and answers with a named error). While the kept
+Region has fewer live nodes than its RF, repair never shrinks the set (the documented
+growth-only rule of `replan_repair`): the table keeps its replicas and recruits no other
+Region until the node returns.
+
+**Truthfulness while converging.** Status is derived, not stored, so the moment the
+command applies the table *is* a regular table: `DescribeTable` carries no
+`GlobalTableVersion`/`Replicas`/`MultiRegionConsistency`/`GlobalTableWitnesses`,
+`/admin/global-tables` no longer lists it, `leader_preferences` (derived from
+`schema.global`) drops its tablets so the preferred-leader step clears the witness flag
+and stops steering, and `drain_strands_region` (reads `schema.global`) no longer guards
+the old Regions. No `DELETING` state is modelled: the replicas converge under ordinary
+repair, observable through the existing placement view. MRSC's TTL and transaction
+restrictions (derived from `schema.global`) stop applying immediately. The empty-table
+precondition of the conversion has no mirror here: removal needs no data copy.
+
+**Compatibility.** No new durable format: the stored shapes (`schema.global` absent,
+`PlacementPolicy.allowed_values` plus an unpinned spread) already exist; only the
+command variant is new (class G, gated). Pinned JSON
+`{"RevertGlobalToRegional":{"table":"t","keep_region":"a"}}`
+(`global_table_apply::revert_requires_its_own_gate_and_pins_its_json`); mirror arm and
+relay allowlist entry added. No fixture file is added or edited.
+
+**Evidence.** Pure: `animus-dynamo` `global::tests::revert_matrix_*` (the validation
+matrix on a three-replica and a witness table), `animus-control`
+`global_table_apply::revert_*` (apply, idempotency, rejections, convergence from every
+spread, a down node in the kept Region, zone spread, gate row, JSON pin). Cluster tier:
+`sim_cluster_mrsc` cells `revert_keep_preferred`, `revert_control_leader_kill`,
+`revert_tablet_leader_kill`, `revert_witness_form_partition` (6 nodes, 3 Regions x 2,
+WAN links, cluster version 7 through the real finalize path; no acked write lost,
+every replica converges into the kept Region, removed replicas leave their nodes,
+transactions and TTL become allowed, the old Regions drain, a killed leader or a
+partitioned Region during convergence) and the negative control
+`mrsc_negative_revert_oracle_bites`. Mixed-version:
+`sim_cluster_mixed_version_corpus` `release6_to_release7_mrsc_removal_gate` and
+`negative_control_mrsc_removal_gate_emitted_early` (N9).
