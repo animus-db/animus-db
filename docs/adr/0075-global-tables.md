@@ -20,8 +20,10 @@
   `Gate::MrecReplication` (cluster version 3), simulation-proven plus one
   real-process two-cluster test over mutual TLS; see the 2026-10-06 amendments at
   the end ("G-d M1/M2/M3 as built" and "G-d as built (M0-M6)"). **Stage G-e (operator
-  federation for MREC peers) is built**, unit-tested but with its `kind` e2e
-  unrun; see the 2026-10-06 amendment "G-e as built" at the end. Stretch-segment
+  federation for MREC peers) is built**, unit-tested, with a two-cluster `kind` e2e
+  (`scripts/e2e-federation-kind.sh`, CI job `e2e-kind-federation`) written but not yet
+  run anywhere; see the 2026-10-06 amendment "G-e as built" and the 2026-10-21
+  amendment "Emulated-WAN measurement and the federation e2e" at the end. Stretch-segment
   federation (MRSC over several Kubernetes clusters) remains deferred. ADR 0073
   Phase 2 (P2-B/C/D) is done, so the "blocked on P2" note in section 8 is historical.
 
@@ -1160,9 +1162,12 @@ clusters on loopback in one process: it shows the real TLS client, loops and
 framing work, **not** WAN behaviour.
 
 **Known gaps and residuals.**
-- No WAN latency, bandwidth or cost measurement; the two real clusters share a host.
-  `kind`/operator e2e cannot run in this sandbox, so the operator rendering peers
-  into `cluster.json` (G-e, built afterwards, see "G-e as built") is unverified on a real cluster.
+- No **real** WAN latency, bandwidth or cost measurement; the two real clusters share a host.
+  Since 2026-10-21 there is an *emulated*-WAN real-process measurement (a TCP delay
+  proxy on loopback; numbers in the amendment "Emulated-WAN measurement and the
+  federation e2e" at the end), which is not a WAN: no loss, reordering or congestion
+  control. The operator rendering peers into `cluster.json` (G-e, see "G-e as built") has
+  a two-cluster `kind` e2e written (same amendment) that has not yet run anywhere.
 - The AWS wire field and error names MREC uses (`ReplicaUpdates`, `Replicas`,
   `ReplicaStatus`, the validation texts) remain unverified against the AWS docs
   (section 0); they are the shapes AWS's public API reference extracts showed.
@@ -1257,11 +1262,13 @@ The operator does not dial peers itself and does not drive replica creation.
 **Not done.** Stretch-segment federation (MRSC over several Kubernetes clusters,
 remote seed addresses, flat pod networking) stays deferred as section 5.4 says.
 No automatic endpoint discovery. No source-address NetworkPolicy for peers. The
-two-cluster `kind` e2e was not written (it needs two clusters or two namespaces
+two-cluster `kind` e2e was not written when G-e landed (it needs two clusters or two namespaces
 with a routable, TLS-trusting path and a global table, and `kind` cannot run in
-the sandbox this was built in); **none of the rendering, mounts, NetworkPolicy
-or condition has been exercised against a real Kubernetes API server**, only
-unit tests of the builders and the reconciler over fakes.
+the sandbox this was built in); **at G-e's landing none of the rendering, mounts, NetworkPolicy
+or condition had been exercised against a real Kubernetes API server**, only
+unit tests of the builders and the reconciler over fakes. The e2e was written
+afterwards, see the 2026-10-21 amendment at the end of this file; it is still
+unrun.
 
 **Security residual (issue #1253): resolved** by the "Peer trust class" amendment
 below.
@@ -1308,3 +1315,74 @@ Tests: `classify_peer` and `peer_region_may_send` unit tests; real-process
 `animusd/tests/mrec_peer_transport.rs` (a peer-region certificate's `Forwarded`
 and `Get` are refused, `MrecApply` still reaches the handler, an own-CA
 certificate is not gated); operator tests pin `ca_path` and `peer_ca_path`.
+
+## Amendment (2026-10-21): Emulated-WAN measurement and the federation e2e
+
+Two of the G-d / G-e known gaps ("no WAN latency or bandwidth number", "two-cluster
+`kind` e2e unwritten") are narrowed, not closed. **There is still no measurement from
+a real multi-region deployment**, and the Kubernetes federation path has still never
+run on a real API server.
+
+**Emulated-WAN real-process test.** `animusd/tests/mrec_wan_emulated.rs` runs two
+single-node `ProdEnv` clusters with mutual TLS and different CAs, as
+`mrec_peer_transport.rs` does, except each side's configured peer endpoint is a
+**TCP delay proxy** (`tests/wan_proxy/mod.rs`: real sockets and threads, test code
+only) in front of the other side's intra port. The proxy adds a configurable one-way
+delay (default 40 ms, so an 80 ms RTT), optional seeded jitter and an optional
+bandwidth cap, preserves per-direction ordering and half-close, and counts bytes.
+The test finalizes both clusters to version 3, creates an MREC table, adds the
+replica, runs a paced write workload on both regions at once (40 writes per side),
+then 8 keys written concurrently from both regions, and asserts:
+
+- every acked write is readable, with its value, in the other region;
+- the conflicting keys converge to one value (one of the two writes) on both sides;
+- structural bounds only: lag is at least half the one-way delay (the proxy is on the
+  path), below 60 s, and both proxy directions carried bytes;
+- `/admin/global-tables` names the table with the `west` replica ACTIVE.
+
+It prints replication lag (ack in region A to visibility in region B, observed by a
+20 ms poller over a TLS GetItem, so a resolution of about 20 ms plus a request) and
+bytes on the wire per write (proxy counters, TLS framing and handshakes included, idle
+baseline subtracted). `ANIMUS_WAN_ONE_WAY_MS`, `ANIMUS_WAN_JITTER_MS`, `ANIMUS_WAN_MBPS`
+and `ANIMUS_WAN_WRITES` change the link and size. It is not behind a feature: it
+takes about 12 s and runs in the normal `animusd` test tier.
+
+**Measured, emulated WAN on loopback, not a real WAN** (one 4-core host, debug build,
+three runs at 40 ms one-way with no jitter and no cap; workload ~5 s, 96 writes, items
+of about 60 bytes):
+
+| quantity | result |
+|---|---|
+| replication lag min | 168 to 236 ms |
+| replication lag p50 | 426 to 479 ms |
+| replication lag p95 | 631 to 694 ms |
+| replication lag p99 / max | 675 to 765 ms |
+| WAN bytes per write, gross (both directions, TLS included) | 438 to 447 B |
+
+One run at 100 ms one-way, 20 ms jitter and an 8 Mbit/s cap: lag p50 789 to 858 ms,
+p99 about 1.2 s, about 350 B/write. How to read them: the lag floor is the 200 ms
+shipper tick plus the batch round trip (the shipper waits for the peer's ack), so lag is
+roughly tick + 2 x one-way delay + the ack, and it scales with the delay; the bytes are
+dominated by TLS record and `MrecApply` framing for tiny items, so they say nothing
+about large items or about cost. The idle baseline was near zero (empty ships send
+nothing). These numbers are for the test host and a debug binary; they establish that
+the shipper, the TLS peer client and the saga work and converge under an 80 ms RTT, not
+what a production WAN does. No cost figure exists.
+
+**Two-cluster `kind` e2e.** `scripts/e2e-federation-kind.sh` (CI job
+`e2e-kind-federation` in `.github/workflows/e2e-kind.yml`, per push on the operator,
+deploy and script paths) creates **two namespaces in one kind cluster**, not two kind
+clusters (kind gives no routable path between two clusters' pod networks; cluster DNS
+between namespaces exercises the same operator rendering and the same pod-to-pod mutual
+TLS). It installs cert-manager with **two different CA hierarchies**, copies each CA into
+the other namespace as the `caSecretRef` Secret, applies two 3-node `AnimusCluster`s
+(`spec.region`, `spec.peers` listing every peer pod's intra endpoint, `spec.tls`), runs the
+operator out of cluster, finalizes each cluster to version 3 over the admin port, then
+over the DynamoDB wire (an in-cluster curl pod): `CreateTable` on A, `UpdateTable
+ReplicaUpdates Create` for B, both replicas ACTIVE, a write on A read on B and a write on
+B read on A, `PeerReachable=True` on both resources, `/admin/global-tables` on each, then
+delete and garbage collection. **Unverified:** `kind` cannot run in the sandbox it was
+written in; only `bash -n` and a YAML parse were done. Its first CI run is its first
+test, and a first failure there is expected to be a script bug as likely as a product bug.
+Still not covered: a CNI that enforces the egress NetworkPolicy, separate Kubernetes
+control planes, a real WAN.

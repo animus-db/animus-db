@@ -1936,6 +1936,33 @@ webhook refuses it (`validate_election_backpressure_spec`) and the renderer
 drops it (node default) when no webhook is installed. `crd.yaml` regenerated.
 
 
+## Two-cluster federation e2e (`scripts/e2e-federation-kind.sh`, ADR 0075 G-e)
+
+A sibling script, not an `E2E_*` leg of `e2e-kind.sh` (that script is already 2.5k
+lines of single-cluster legs). CI job `e2e-kind-federation` in
+`.github/workflows/e2e-kind.yml`, per push on the same paths plus the script. It creates
+**two namespaces in one kind cluster** (`animus-fed-a`/`-b`, clusters `fed-a`/`fed-b`,
+regions `region-a`/`region-b`, 3 nodes and 3 control nodes each), not two kind clusters:
+kind gives no routable path between two clusters' pod networks, and cluster DNS between
+namespaces exercises the same rendering and the same pod-to-pod mutual TLS. cert-manager
+gives each cluster **its own CA** (so trust only works through `spec.peers[].caSecretRef`,
+the script copies each CA into the other namespace as Secret `peer-ca`); `spec.peers`
+lists every peer pod's intra endpoint (`<name>-<i>.<name>-internal.<ns>.svc.cluster.local:14004`,
+covered by the leaf's wildcard SAN). The operator runs out of cluster (admin calls go
+through the API-server pod proxy). The script finalizes each cluster to cluster version 3
+itself (`POST /admin/cluster-version/finalize` via a short-lived port-forward, tried on
+each pod because it is leader-only), then over the DynamoDB wire from an in-cluster curl
+pod: `CreateTable` on A, `UpdateTable ReplicaUpdates Create region-b`, both replicas
+ACTIVE, write A / read B and write B / read A, `PeerReachable=True` on both resources,
+`/admin/global-tables` on each, delete and GC. Knobs: `ANIMUSD_IMAGE`, `KIND_NODE_IMAGE`,
+`E2E_KEEP_CLUSTER`, `FED_CLIENT_IMAGE`.
+
+**UNVERIFIED:** `kind` cannot run in the sandbox it was written in (no `CAP_SYS_RESOURCE`);
+only `bash -n` and a YAML parse of the workflow and the rendered manifests were done (no
+`shellcheck`). Its first CI run is its first test. Not covered: a CNI enforcing the egress
+NetworkPolicy, separate Kubernetes control planes, a real WAN (the emulated-WAN numbers come
+from `animusd/tests/mrec_wan_emulated.rs`).
+
 ## `E2E_KEEP_CLUSTER=1`: keep the `kind` cluster after the smoke (#1278)
 
 Opt-in keep-alive for the game-day drill (`docs/runbook/game-day.md`). `cleanup()` still stops
@@ -1993,7 +2020,7 @@ that never goes Ready *before* the roll starts.
 - **Validation:** `AnimusClusterSpec::validate_peers_spec` (webhook + reconciler);
   reconciler refuses (applies nothing) with `PeersSpecInvalid`.
 - **`PeerReachable`:** `peers::evaluate` (pure) over every pod's `/admin/global-tables`;
-  Unknown until a shipper exists. Unverified against a real cluster; no kind e2e.
+  Unknown until a shipper exists. Unverified against a real cluster until the federation e2e below first runs.
 
 - **Peer CA bundle is peer-only (issue #1253).** `tls.ca_path` is always the own CA (`{TLS_MOUNT_DIR}/ca.crt`); when a peer names a CA `Secret`, `tls.peer_ca_path` is `PEER_CA_BUNDLE_PATH`, which `entrypoint.sh` fills with the peer CAs only (not the own CA). animusd trusts a certificate chaining only to `peer_ca_path` for MREC replication frames alone. The `TlsSection` mirror carries `peer_ca_path` (skipped when `None`).
 
