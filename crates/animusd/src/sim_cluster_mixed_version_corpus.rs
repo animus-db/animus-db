@@ -122,10 +122,22 @@
 //!   hosted-group feature handle is forged open at version 5; its v2 frames
 //!   reach the leader below the gate and the "reported below the gate" oracle
 //!   MUST fire.
+//! - `release6_to_release7_mrsc_removal_gate`: the sixth real gate (`Gate::
+//!   MrscReplicaRemoval`, cluster version 7, ADR 0075's 2026-10-21 amendment):
+//!   an MRSC table's `RevertGlobalToRegional` (the AWS "delete two replicas"
+//!   path) is refused by name by the relay receiver before the finalize
+//!   (counted, nothing appended, the table stays global, a finalize to 7 is
+//!   refused while a `[1,6]` node is recorded), and accepted after it: the
+//!   spec clears and the regional policy lands on every node (data-only
+//!   mirror included), with no capped rejection;
+//! - `negative_control_mrsc_removal_gate_emitted_early` (N9): the same command
+//!   appended ungated at version 6 with a `Release(6)` voter; the oracle MUST
+//!   report the capped rejection at exactly that voter, wedged and never
+//!   appended, and the regional policy applied before its gate on the others.
 //! - `release7_to_release8_mrec_overrides_gate`: the per-replica read-override
 //!   gate (`Gate::MrecReplicaOverrides`): `SetMrecReplicaOverrides` is refused
 //!   below version 8 and applies everywhere once it opens.
-//! - `negative_control_mrec_overrides_gate_emitted_early` (N9): the command is
+//! - `negative_control_mrec_overrides_gate_emitted_early` (N10): the command is
 //!   proposed ungated at version 7; the Release(7) node's capped decode MUST
 //!   reject it and the "gate applied early" oracle MUST fire.
 //!
@@ -216,11 +228,17 @@ enum Kind {
     FollowerAppliedGate,
     /// N8: a follower's feature handle forged open below the gate.
     FollowerAppliedGateNegative,
+    /// Release(6) -> Release(7) over `Gate::MrscReplicaRemoval` (ADR 0075's
+    /// 2026-10-21 amendment): `RevertGlobalToRegional` is refused by name
+    /// before the finalize, accepted after it.
+    MrscRemovalGate,
+    /// N9: `RevertGlobalToRegional` emitted ungated with a Release(6) voter.
+    MrscRemovalGateNegative,
     /// Release(7) -> Release(8) over `Gate::MrecReplicaOverrides` (ADR 0075's
     /// 2026-10-21 amendment): a per-replica read override is refused at the
     /// relay below the gate and lands on every replica after it.
     MrecOverridesGate,
-    /// N9: `SetMrecReplicaOverrides` emitted ungated with a Release(7) voter.
+    /// N10: `SetMrecReplicaOverrides` emitted ungated with a Release(7) voter.
     MrecOverridesGateNegative,
 }
 
@@ -326,6 +344,14 @@ fn cells() -> Vec<Cell> {
         cell(
             "negative_control_follower_applied_gate_emitted_early",
             Kind::FollowerAppliedGateNegative,
+        ),
+        cell(
+            "release6_to_release7_mrsc_removal_gate",
+            Kind::MrscRemovalGate,
+        ),
+        cell(
+            "negative_control_mrsc_removal_gate_emitted_early",
+            Kind::MrscRemovalGateNegative,
         ),
         cell(
             "release7_to_release8_mrec_overrides_gate",
@@ -448,6 +474,8 @@ fn run(c: &Cell) -> Verdict {
         Kind::NodeCapacityGateNegative => run_node_capacity_negative(c),
         Kind::FollowerAppliedGate => run_follower_applied_gate(c),
         Kind::FollowerAppliedGateNegative => run_follower_applied_negative(c),
+        Kind::MrscRemovalGate => run_mrsc_removal_gate(c),
+        Kind::MrscRemovalGateNegative => run_mrsc_removal_negative(c),
         Kind::MrecOverridesGate => run_mrec_overrides_gate(c),
         Kind::MrecOverridesGateNegative => run_mrec_overrides_negative(c),
         _ => run_roll(c),
@@ -516,6 +544,17 @@ pub(super) fn instant_violations(cluster: &SimCluster, delivery: bool) -> Vec<St
         if m.cluster_version() < 3 && m.table_global(GLOBAL_TABLE).is_some_and(|g| g.is_mrec()) {
             v.push(format!(
                 "gate applied early: node {n} holds an MREC spec at cluster version {}",
+                m.cluster_version()
+            ));
+        }
+    }
+    // ADR 0075 (2026-10-21): a reverted (regional) policy is applied only once
+    // the cluster version reached 7 (`Gate::MrscReplicaRemoval`).
+    for n in CONTROL {
+        let m = cluster.metadata(n);
+        if m.cluster_version() < 7 && m.policies.values().any(|p| p.name.starts_with("regional:")) {
+            v.push(format!(
+                "gate applied early: node {n} holds a reverted-table policy at cluster version {}",
                 m.cluster_version()
             ));
         }
@@ -786,6 +825,8 @@ fn run_roll(c: &Cell) -> Verdict {
         | Kind::NodeCapacityGateNegative
         | Kind::FollowerAppliedGate
         | Kind::FollowerAppliedGateNegative
+        | Kind::MrscRemovalGate
+        | Kind::MrscRemovalGateNegative
         | Kind::MrecOverridesGate
         | Kind::MrecOverridesGateNegative => unreachable!(),
     }
@@ -2379,10 +2420,262 @@ fn run_follower_applied_negative(c: &Cell) -> Verdict {
 }
 
 // ---------------------------------------------------------------------------
-// The sixth real gate: `Gate::MrecReplicaOverrides` (ADR 0075, 2026-10-21)
-//
-// Version 7 is reserved by the parallel MRSC replica-removal gate, which this
-// tree does not carry: the cells walk 6 -> 7 as a plain finalize.
+// The sixth real gate: `Gate::MrscReplicaRemoval` (cluster version 7, ADR 0075)
+// ---------------------------------------------------------------------------
+
+fn roll_to_release7(cluster: &mut SimCluster, w: &mut Watch, nodes: &[u64]) {
+    for &n in nodes {
+        cluster.set_binary_profile(n, BinaryProfile::Release(7));
+        cluster.set_node_version(n, Some(VersionRange::new(1, 7)));
+        w.run(cluster, Duration::from_millis(500));
+    }
+}
+
+fn revert_cmd() -> MetaCommand {
+    MetaCommand::RevertGlobalToRegional {
+        table: GLOBAL_TABLE.to_string(),
+        keep_region: "a".to_string(),
+    }
+}
+
+fn revert_request() -> animus_node::ClientRequest {
+    animus_node::ClientRequest::ProposeSchema(revert_cmd())
+}
+
+/// The table is a regular table whose tablets' policies are restricted to the
+/// kept Region `a` and no longer pinned.
+fn reverted(m: &animus_control::Metadata) -> bool {
+    m.schemas
+        .get(GLOBAL_TABLE)
+        .is_some_and(|s| s.global.is_none())
+        && m.tablets_for_table(GLOBAL_TABLE).count() > 0
+        && m.tablets_for_table(GLOBAL_TABLE).all(|(id, _)| {
+            m.policies.get(id).is_some_and(|p| {
+                !p.is_pinned()
+                    && p.allowed_values.get(animus_placement::REGION_LABEL)
+                        == Some(&["a".to_string()].into())
+            })
+        })
+}
+
+/// The cluster finalized at 6 (every node `Release(6)`), the members labelled
+/// with Regions (0 and 1 in `a`, 2 in `b`, the data node in `c`) and the table
+/// converted to MRSC: what both gate-7 cells start from.
+fn mrsc_removal_setup(cluster: &mut SimCluster, w: &mut Watch) {
+    let _ = follower_applied_setup(cluster, w);
+    roll_to_release6(cluster, w, &[0, 1, 2, DATA]);
+    if !all_recorded_at(cluster, w, 6) {
+        w.violations
+            .push("the [1,6] records never landed on every node".into());
+    }
+    let l = control_leader(cluster);
+    let (status, body) = finalize(cluster, l, r#"{"to":6,"expected":5}"#);
+    if status != 200 {
+        w.violations
+            .push(format!("finalize 5 -> 6: {status} {body}"));
+    }
+    if !converge(cluster, |c| {
+        w.sample(c);
+        (0..NODES).all(|n| c.metadata(n).cluster_version() == 6)
+    }) {
+        w.violations
+            .push("cluster version 6 never reached on every node".into());
+    }
+    for (n, region) in [(0u64, "a"), (1, "a"), (2, "b"), (DATA, "c")] {
+        let mut labels = cluster
+            .metadata(0)
+            .members
+            .get(&nid(n))
+            .map(|m| m.labels.clone())
+            .unwrap_or_default();
+        labels.insert(
+            animus_placement::REGION_LABEL.to_string(),
+            region.to_string(),
+        );
+        let _ = cluster.propose_meta(MetaCommand::UpsertMember {
+            node: nid(n),
+            labels,
+            status: animus_control::NodeStatus::Active,
+        });
+    }
+    let _ = cluster.propose_meta(convert_cmd());
+    if !converge(cluster, |c| {
+        w.sample(c);
+        (0..NODES).all(|n| converted(&c.metadata(n)))
+    }) {
+        w.violations
+            .push("the MRSC conversion never landed on every node".into());
+    }
+}
+
+/// Roll `Release(6)` -> `Release(7)` over an MRSC table. Before the finalize a
+/// relayed `RevertGlobalToRegional` is refused by name by the receiver
+/// (counted, nothing appended, the table stays global) -- including
+/// half-rolled, where a finalize to 7 is refused while a `[1,6]` node is
+/// recorded. After the finalize the identical relay is accepted and the spec
+/// clears with the regional policy on every node, the data-only node's mirror
+/// included. No capped rejection, no wedged control replica.
+fn run_mrsc_removal_gate(c: &Cell) -> Verdict {
+    use animus_control::version::Gate;
+    let mut cluster = light_cluster(c.seed);
+    let mut w = Watch::new(true);
+    mrsc_removal_setup(&mut cluster, &mut w);
+    if (0..NODES).any(|n| cluster.features(n).is_open(Gate::MrscReplicaRemoval)) {
+        w.violations
+            .push("MrscReplicaRemoval open before the finalize".into());
+    }
+    // Half-rolled: nodes 0, 1 and the data node are Release(7), node 2 is not.
+    roll_to_release7(&mut cluster, &mut w, &[0, 1, DATA]);
+    let leader = control_leader(&mut cluster);
+    let (status, body) = finalize(&mut cluster, leader, r#"{"to":7,"expected":6}"#);
+    if status == 200 {
+        w.violations.push(format!(
+            "a finalize to 7 was accepted with a [1,6] node: {body}"
+        ));
+    }
+    let follower = (0..3u64).find(|n| *n != leader).expect("a follower");
+    let pre_log: Vec<u64> = CONTROL
+        .iter()
+        .map(|&n| cluster.control_last_log_index(n))
+        .collect();
+    for (from, to) in [(follower, leader), (leader, follower)] {
+        let before = cluster.metric(to, animus_env::Metric::ClusterGateRelayRefused);
+        match cluster.relay_request(from, to, revert_request()) {
+            Some(animus_node::ClientResponse::Error(msg))
+                if msg.contains("relayed command refused")
+                    && msg.contains("MrscReplicaRemoval") => {}
+            other => w
+                .violations
+                .push(format!("relay {from}->{to} not refused by name: {other:?}")),
+        }
+        if cluster.metric(to, animus_env::Metric::ClusterGateRelayRefused) != before + 1 {
+            w.violations
+                .push(format!("refusal not counted on node {to}"));
+        }
+    }
+    w.run(&mut cluster, Duration::from_secs(2));
+    let post_log: Vec<u64> = CONTROL
+        .iter()
+        .map(|&n| cluster.control_last_log_index(n))
+        .collect();
+    if post_log != pre_log {
+        w.violations
+            .push("a refused relay appended to the control log".into());
+    }
+    if (0..NODES).any(|n| cluster.metadata(n).table_global(GLOBAL_TABLE).is_none()) {
+        w.violations
+            .push("the table was reverted before the gate opened".into());
+    }
+    // Everyone rolls; the finalize to 7 opens the gate on every node.
+    roll_to_release7(&mut cluster, &mut w, &[OLD]);
+    if !all_recorded_at(&mut cluster, &mut w, 7) {
+        w.violations
+            .push("the [1,7] records never landed on every node".into());
+    }
+    let l = control_leader(&mut cluster);
+    let (status, body) = finalize(&mut cluster, l, r#"{"to":7,"expected":6}"#);
+    if status != 200 {
+        w.violations
+            .push(format!("finalize 6 -> 7: {status} {body}"));
+    }
+    if !converge(&mut cluster, |c| {
+        w.sample(c);
+        (0..NODES).all(|n| c.features(n).is_open(Gate::MrscReplicaRemoval))
+    }) {
+        w.violations
+            .push("MrscReplicaRemoval never opened on every node".into());
+    }
+    // The identical relay is now accepted and lands everywhere.
+    let leader = control_leader(&mut cluster);
+    let follower = (0..3u64).find(|n| *n != leader).expect("a follower");
+    match cluster.relay_request(follower, leader, revert_request()) {
+        Some(animus_node::ClientResponse::PutOk) => {}
+        other => w
+            .violations
+            .push(format!("the post-finalize relay was refused: {other:?}")),
+    }
+    if !converge(&mut cluster, |c| {
+        w.sample(c);
+        (0..NODES).all(|n| reverted(&c.metadata(n)))
+    }) {
+        w.violations
+            .push("the revert never landed on every node (mirror included)".into());
+    }
+    let wedged = {
+        let mut last = wedged_control(&cluster);
+        let _ = converge(&mut cluster, |c| {
+            last = wedged_control(c);
+            last.is_empty()
+        });
+        last
+    };
+    if !wedged.is_empty() {
+        w.violations
+            .push(format!("control replicas {wedged:?} wedged"));
+    }
+    w.sample(&cluster);
+    verdict_of(c, w.violations, false)
+}
+
+/// N9: a buggy emitter appends `RevertGlobalToRegional` at cluster version 6
+/// with a `Release(6)` voter. The cap must reject it at exactly that voter
+/// (wedged, never appended), and the regional policy applied before its gate on
+/// the others must trip the "gate applied early" oracle.
+fn run_mrsc_removal_negative(c: &Cell) -> Verdict {
+    let mut cluster = light_cluster(c.seed);
+    let mut w = Watch::new(true);
+    mrsc_removal_setup(&mut cluster, &mut w);
+    let others: Vec<u64> = (0..NODES).filter(|&n| n != OLD).collect();
+    roll_to_release7(&mut cluster, &mut w, &others);
+    let setup = std::mem::take(&mut w.violations);
+    if control_leader(&mut cluster) == OLD {
+        let _ = cluster.transfer_leadership(OLD, 0);
+        w.run(&mut cluster, Duration::from_secs(2));
+    }
+    let mut v: Vec<String> = setup;
+    if control_leader(&mut cluster) == OLD {
+        v.push("could not move leadership off the Release(6) node".into());
+    }
+    let pre = instant_violations(&cluster, true);
+    if !pre.is_empty() {
+        v.push(format!("violations before the bad emit: {pre:?}"));
+    }
+    let pre_log = cluster.control_last_log_index(OLD);
+    let accepted = cluster.propose_meta_ungated(revert_cmd());
+    if !matches!(accepted, ProposeResult::Accepted { .. }) {
+        v.push(format!("the bad emit was not accepted: {accepted:?}"));
+    }
+    w.run(&mut cluster, Duration::from_secs(6));
+    let wedged = wedged_settled(&mut cluster, OLD);
+    if wedged != vec![OLD] {
+        v.push(format!("expected only node {OLD} wedged, got {wedged:?}"));
+    }
+    let cap_fired = w.violations.iter().any(|s| {
+        s.starts_with(&format!("delivery: node {OLD} (Release(6))"))
+            && s.contains("MrscReplicaRemoval")
+    });
+    if !cap_fired {
+        v.push(format!(
+            "the cap never rejected the MrscReplicaRemoval value: {:?}",
+            w.violations
+        ));
+    }
+    if !w
+        .violations
+        .iter()
+        .any(|s| s.starts_with("gate applied early"))
+    {
+        v.push("the early revert application went unnoticed".into());
+    }
+    if cluster.control_last_log_index(OLD) != pre_log {
+        v.push("the Release(6) replica appended the revert value".into());
+    }
+    verdict_of(c, v, cap_fired)
+}
+
+// ---------------------------------------------------------------------------
+// The seventh real gate: `Gate::MrecReplicaOverrides` (cluster version 8, ADR
+// 0075, 2026-10-21): the cells walk 6 -> 7 (opening the MRSC gate) -> 8.
 // ---------------------------------------------------------------------------
 
 const OVR_TABLE: &str = "fa";
@@ -2452,7 +2745,7 @@ fn ovr_landed(m: &animus_control::Metadata) -> bool {
 /// The cluster finalized at 7 (every node `Release(7)`), an MREC table `fa`
 /// with a local replica `us` and a peer `eu` recorded.
 fn overrides_setup(cluster: &mut SimCluster, w: &mut Watch) {
-    follower_applied_setup(cluster, w);
+    let _ = follower_applied_setup(cluster, w);
     for v in [6u32, 7] {
         roll_to_release(cluster, w, &[0, 1, 2, DATA], v);
         if !all_recorded_at(cluster, w, v) {
@@ -2574,7 +2867,7 @@ fn run_mrec_overrides_gate(c: &Cell) -> Verdict {
     verdict_of(c, w.violations, false)
 }
 
-/// N9: a buggy emitter appends `SetMrecReplicaOverrides` at cluster version 7
+/// N10: a buggy emitter appends `SetMrecReplicaOverrides` at cluster version 7
 /// with a `Release(7)` voter. The cap must reject it at exactly that voter,
 /// which is wedged and never appended the entry; the early application on the
 /// others is reported too.
@@ -2984,6 +3277,16 @@ fn sim_cluster_mixed_version_corpus_negative_control_follower_applied_gate() {
 }
 
 #[test]
+fn sim_cluster_mixed_version_corpus_mrsc_removal_gate() {
+    run_family("release6_to_release7_mrsc_removal_gate");
+}
+
+#[test]
+fn sim_cluster_mixed_version_corpus_negative_control_mrsc_removal_gate() {
+    run_family("negative_control_mrsc_removal_gate_emitted_early");
+}
+
+#[test]
 fn sim_cluster_mixed_version_corpus_mrec_overrides_gate() {
     run_family("release7_to_release8_mrec_overrides_gate");
 }
@@ -3023,6 +3326,8 @@ fn sim_cluster_mixed_version_cell_names_and_seeds_are_unique() {
         "negative_control_node_capacity_gate_emitted_early",
         "release5_to_release6_follower_applied_gate",
         "negative_control_follower_applied_gate_emitted_early",
+        "release6_to_release7_mrsc_removal_gate",
+        "negative_control_mrsc_removal_gate_emitted_early",
         "release7_to_release8_mrec_overrides_gate",
         "negative_control_mrec_overrides_gate_emitted_early",
     ] {

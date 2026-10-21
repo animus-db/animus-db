@@ -42,8 +42,7 @@ pub const MAX_SUPPORTED: ClusterVersion = MREC_REPLICA_OVERRIDES_VERSION;
 /// The cluster version at which [`Gate::MrecReplicaOverrides`] opens: the one
 /// place its number lives in non-test code (`Gate::version`/`Gate::rank` and
 /// `MAX_SUPPORTED` all read it). It is `8` because the MRSC replica-removal
-/// workstream takes `7` in a parallel branch; whichever lands second renumbers
-/// by editing only this constant (and the test matrices' columns).
+/// gate ([`Gate::MrscReplicaRemoval`]) took `7` first.
 pub const MREC_REPLICA_OVERRIDES_VERSION: ClusterVersion = 8;
 
 /// The lowest cluster version this binary can run at.
@@ -236,8 +235,15 @@ pub enum Gate {
     /// replica rejects the longer frame), so the encoder emits v2 only once
     /// the gate is open and the leader ignores the field while it is closed.
     FollowerAppliedIndex,
+    /// **MRSC replica removal** (ADR 0075's 2026-10-21 amendment): the sixth
+    /// real version gate, opening at cluster version 7. Guards
+    /// `MetaCommand::RevertGlobalToRegional` (an older voter cannot decode the
+    /// variant) and, with it, the client acceptance of the AWS-documented
+    /// `UpdateTable` that deletes two Regions of a multi-Region strongly
+    /// consistent table (two replicas, or one replica and the witness).
+    MrscReplicaRemoval,
     /// **MREC per-replica read-capacity overrides** (ADR 0075's 2026-10-21
-    /// amendment, closing Q6 for provisioned read capacity): the sixth real
+    /// amendment, closing Q6 for provisioned read capacity): the seventh real
     /// version gate, opening at [`MREC_REPLICA_OVERRIDES_VERSION`] (8). Guards
     /// `MetaCommand::SetMrecReplicaOverrides` and the `MrecReplica.overrides`
     /// field it writes, plus the client acceptance of `ReplicaUpdates`
@@ -273,6 +279,7 @@ impl Gate {
         Gate::TxnSealChecked,
         Gate::NodeCapacity,
         Gate::FollowerAppliedIndex,
+        Gate::MrscReplicaRemoval,
         Gate::MrecReplicaOverrides,
     ];
 
@@ -296,6 +303,7 @@ impl Gate {
             // ADR 0080 (issue #1330): the fifth real version gate.
             Gate::FollowerAppliedIndex => Some(6),
             // ADR 0075 (2026-10-21 amendment): the sixth real version gate.
+            Gate::MrscReplicaRemoval => Some(7),
             Gate::MrecReplicaOverrides => Some(MREC_REPLICA_OVERRIDES_VERSION),
             #[cfg(any(test, feature = "sim-versions"))]
             Gate::Synthetic(n) => Some(n),
@@ -316,6 +324,7 @@ impl Gate {
             Gate::TxnSealChecked => 4,
             Gate::NodeCapacity => 5,
             Gate::FollowerAppliedIndex => 6,
+            Gate::MrscReplicaRemoval => 7,
             Gate::MrecReplicaOverrides => MREC_REPLICA_OVERRIDES_VERSION,
             #[cfg(any(test, feature = "sim-versions"))]
             Gate::Synthetic(n) => {
@@ -598,7 +607,9 @@ mod tests {
                 Gate::NodeCapacity => Some(5),
                 // ADR 0080 (issue #1330): the fifth.
                 Gate::FollowerAppliedIndex => Some(6),
-                // ADR 0075 (2026-10-21 amendment): the sixth.
+                // ADR 0075 (2026-10-21): the sixth.
+                Gate::MrscReplicaRemoval => Some(7),
+                // ADR 0075 (2026-10-21 amendment): the seventh.
                 Gate::MrecReplicaOverrides => Some(MREC_REPLICA_OVERRIDES_VERSION),
                 // Never in `ALL` (parametric, test/sim only): see the ladder test.
                 Gate::Synthetic(_) => unreachable!("synthetic gates are not in Gate::ALL"),
@@ -636,9 +647,14 @@ mod tests {
             Gate::NodeCapacity.join(Gate::FollowerAppliedIndex),
             Gate::FollowerAppliedIndex
         );
+        assert!(seen.contains(&Gate::MrscReplicaRemoval));
+        assert_eq!(
+            Gate::FollowerAppliedIndex.join(Gate::MrscReplicaRemoval),
+            Gate::MrscReplicaRemoval
+        );
         assert!(seen.contains(&Gate::MrecReplicaOverrides));
         assert_eq!(
-            Gate::FollowerAppliedIndex.join(Gate::MrecReplicaOverrides),
+            Gate::MrscReplicaRemoval.join(Gate::MrecReplicaOverrides),
             Gate::MrecReplicaOverrides
         );
         assert_eq!(

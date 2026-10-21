@@ -196,6 +196,9 @@ pub fn content_gate(msg: &RaftMsg) -> Gate {
         | crate::MetaCommand::RegisterNode {
             capacity: Some(_), ..
         } => g.join(Gate::NodeCapacity),
+        // ADR 0075 (2026-10-21): what a Release(6) binary's strict decode
+        // cannot read (the variant), by content.
+        crate::MetaCommand::RevertGlobalToRegional { .. } => g.join(Gate::MrscReplicaRemoval),
         _ => g,
     })
 }
@@ -306,6 +309,9 @@ mod tests {
                 Gate::NodeCapacity => [false, false, false, false, false, true, true, true, true],
                 Gate::FollowerAppliedIndex => {
                     [false, false, false, false, false, false, true, true, true]
+                }
+                Gate::MrscReplicaRemoval => {
+                    [false, false, false, false, false, false, false, true, true]
                 }
                 Gate::MrecReplicaOverrides => {
                     [false, false, false, false, false, false, false, false, true]

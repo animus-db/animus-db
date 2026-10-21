@@ -3439,6 +3439,20 @@ A new variant must pick a class. Test: `tests/it/transport_class.rs`.
   the field on the wire (`animus-cp-data` `codec.rs`). New `AppendEntriesResp` construction sites need
   `applied_index: 0` (patterns want `..`). Pure tests: `tests/it/quorum_applied.rs`.
 
+## `Gate::MrscReplicaRemoval`, cluster version 7 (ADR 0075 / ADR 0073's 2026-10-21 amendments)
+
+- `MetaCommand::RevertGlobalToRegional { table, keep_region }` (gate version 7) is the inverse of
+  `ConvertTableToGlobal` for an MRSC table: clears `schema.global` and replaces each tablet's
+  pinned policy with `zone_spread_policy(RF = min(3, non-Leaving members of keep_region))` +
+  `allow_values(REGION_LABEL, [keep_region])`, **unpinned** so ordinary `reconcile_placement`
+  (`replan_repair`) does the movement. A table with no `global` is a `NoOp` (idempotent under
+  retries / leader change); rejections are state-based (MREC table, `keep_region` not a Region of
+  the table or the witness, no member in `keep_region`). `Metadata::table_pinned_region` reads
+  the single Region a table's policy is restricted to. New exhaustive-match sites touched:
+  `required_gate`, `mirror.rs` (schema entry + policies), the `sim_versions` by-content
+  `content_gate` row, `animus-node` relay allowlist. Tests: `tests/it/global_table_apply.rs`
+  (`revert_*`).
+
 ## `Gate::MrecReplicaOverrides`, `MAX_SUPPORTED = 8` (ADR 0075's 2026-10-21 amendment)
 
 - `MetaCommand::SetMrecReplicaOverrides { table, region, overrides }` replaces an MREC replica's
@@ -3448,8 +3462,7 @@ A new variant must pick a class. Test: `tests/it/transport_class.rs`.
   independent clusters; a clear keeps its stamp as a tombstone). Index names are not checked at apply.
 - `Metadata::local_read_override(table)` (table or hidden `<base>$<index>`) is what animusd's
   `throttle_limits_for` reads; `any_table_throughput()` counts a local override.
-- The gate number is `version::MREC_REPLICA_OVERRIDES_VERSION` (8; 7 is reserved by the MRSC
-  removal gate). Rows: `required_gate`, mirror (schema row), `sim_versions` content gate and
+- The gate number is `version::MREC_REPLICA_OVERRIDES_VERSION` (8; 7 is the MRSC removal gate). Rows: `required_gate`, mirror (schema row), `sim_versions` content gate and
   matrix, relay list in `animus-node`. Fixture: `metadata/v1-mrec-overrides.json`. New
   `MrecReplica { .. }` literals need `overrides: Default::default()`.
 

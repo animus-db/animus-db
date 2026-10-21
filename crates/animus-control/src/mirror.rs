@@ -396,10 +396,12 @@ pub fn apply_and_derive_mirror(
                 writes.push(put_json(syskv::schema_key(table), schema));
             }
         }
-        MetaCommand::ConvertTableToGlobal { table, .. } => {
+        MetaCommand::ConvertTableToGlobal { table, .. }
+        | MetaCommand::RevertGlobalToRegional { table, .. } => {
             // ADR 0075 (G-01 stage G-c): the schema entry (`global` set) plus
             // the pinned policy this apply wrote for every tablet of the
-            // table, in the same derived batch.
+            // table, in the same derived batch. The 2026-10-21 revert rewrites
+            // the same two entities (`global` cleared, the regional policy).
             if let Some(schema) = meta.schemas.get(table) {
                 writes.push(put_json(syskv::schema_key(table), schema));
             }
@@ -2724,6 +2726,12 @@ mod tests {
             MetaCommand::SetGlobalPreferredLeader {
                 table: "t".to_string(),
                 region: "b".to_string(),
+            },
+            // ADR 0075 (2026-10-21): the revert rewrites the schema entry
+            // and the tablet policy again.
+            MetaCommand::RevertGlobalToRegional {
+                table: "t".to_string(),
+                keep_region: "a".to_string(),
             },
             MetaCommand::RegisterNode {
                 node: nid(2),

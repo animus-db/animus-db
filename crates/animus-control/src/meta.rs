@@ -2397,6 +2397,30 @@ pub enum MetaCommand {
     /// G-c ships at cluster version 2; a table can only be global once that
     /// gate is open, so this command is meaningless before it).
     SetGlobalPreferredLeader { table: TableName, region: String },
+    /// **Revert an MRSC global table to a regular single-Region table**
+    /// (ADR 0075's 2026-10-21 amendment): the AWS-documented removal of two
+    /// replicas (or one replica and the witness) from a multi-Region strongly
+    /// consistent table, which converts the remaining replica to a
+    /// single-Region table. Clears `schema.global` and replaces every tablet's
+    /// pinned MRSC policy with a regional one — residency restricted to
+    /// `keep_region`, replication factor `min(3, members in that Region)`,
+    /// best-effort zone spread when the Region's members can honour it — so
+    /// the ordinary repair pass (`reconcile_placement`, not a new mover)
+    /// converges every replica into `keep_region`.
+    ///
+    /// Rejected (state-based) when the table has no schema, is an MREC table,
+    /// `keep_region` is not one of the table's Regions or is its witness, or
+    /// no cluster member carries `keep_region`. A table that is no longer
+    /// global (the revert already applied, a retried or duplicated proposal)
+    /// is a no-op, which is what makes the command idempotent under leader
+    /// change.
+    ///
+    /// **Gate: `Gate::MrscReplicaRemoval`** (cluster version 7). An older
+    /// voter cannot decode the variant.
+    RevertGlobalToRegional {
+        table: TableName,
+        keep_region: String,
+    },
     /// **Convert a table to an MREC (multi-Region eventual-consistency) global
     /// table** (ADR 0075 section 4, G-01 stage G-d): records
     /// `schema.global = GlobalTableSpec { consistency: Eventual, replicas:
@@ -5419,6 +5443,58 @@ impl Metadata {
                 global.preferred_leader_region.clone_from(region);
                 ApplyOutcome::Applied
             }
+            MetaCommand::RevertGlobalToRegional { table, keep_region } => {
+                let Some(schema) = self.schemas.get(table) else {
+                    return ApplyOutcome::Rejected("no such table schema");
+                };
+                let Some(global) = schema.global.as_ref() else {
+                    // Already reverted (a retried or duplicated proposal) or
+                    // never global: nothing to undo.
+                    return ApplyOutcome::NoOp;
+                };
+                if !global.is_mrsc() {
+                    return ApplyOutcome::Rejected(
+                        "table is not a strongly consistent global table",
+                    );
+                }
+                if !global.regions.contains(keep_region) {
+                    return ApplyOutcome::Rejected("kept region is not one of the table's regions");
+                }
+                if global.witness.as_ref() == Some(keep_region) {
+                    return ApplyOutcome::Rejected("kept region is the witness");
+                }
+                let kept_members: Vec<&BTreeMap<String, String>> = self
+                    .members
+                    .values()
+                    .filter(|m| {
+                        m.status != NodeStatus::Leaving
+                            && m.labels.get(animus_placement::REGION_LABEL) == Some(keep_region)
+                    })
+                    .map(|m| &m.labels)
+                    .collect();
+                if kept_members.is_empty() {
+                    return ApplyOutcome::Rejected("no cluster member carries the kept region");
+                }
+                // RF 3 when the Region can hold it, else every member it has
+                // (a two-node Region holds two replicas; repair never refuses
+                // to make progress for a smaller pool, ADR 0075 amendment).
+                let rf = kept_members.len().min(3);
+                let policy = animus_placement::zone_spread_policy(
+                    format!("regional:{table}"),
+                    rf,
+                    kept_members.iter().copied(),
+                )
+                .allow_values(animus_placement::REGION_LABEL, [keep_region.clone()]);
+                let tablet_ids: Vec<TabletId> =
+                    self.tablets_for_table(table).map(|(&id, _)| id).collect();
+                for id in tablet_ids {
+                    self.policies.insert(id, policy.clone());
+                }
+                if let Some(schema) = self.schemas.get_mut(table) {
+                    schema.global = None;
+                }
+                ApplyOutcome::Applied
+            }
             MetaCommand::ConvertTableToMrec {
                 table,
                 local_region,
@@ -6352,6 +6428,22 @@ impl Metadata {
     #[must_use]
     pub fn table_global(&self, table: &str) -> Option<&crate::schema::GlobalTableSpec> {
         self.schemas.get(table).and_then(|s| s.global.as_ref())
+    }
+
+    /// The single Region a table's first tablet's placement policy is
+    /// restricted to (`allowed_values` of the region label), if it is exactly
+    /// one: what `RevertGlobalToRegional` pins. `None` for any other policy.
+    #[must_use]
+    pub fn table_pinned_region(&self, table: &str) -> Option<String> {
+        let (id, _) = self.tablets_for_table(table).next()?;
+        let regions = self
+            .policies
+            .get(id)?
+            .allowed_values
+            .get(animus_placement::REGION_LABEL)?;
+        (regions.len() == 1)
+            .then(|| regions.iter().next().cloned())
+            .flatten()
     }
 
     /// The Regions in which **every** routable tablet of `table` has a replica
@@ -7463,6 +7555,9 @@ impl crate::version::GatedCommand for MetaCommand {
             }
             MetaCommand::ConvertTableToGlobal { .. }
             | MetaCommand::SetGlobalPreferredLeader { .. } => Gate::GlobalTables,
+            // ADR 0075 (2026-10-21 amendment): the sixth real gate; an older
+            // voter cannot decode the variant.
+            MetaCommand::RevertGlobalToRegional { .. } => Gate::MrscReplicaRemoval,
             // ADR 0075 (G-01 stage G-d): the MREC commands, one gate; an older
             // voter cannot decode the variants nor `Eventual` /
             // `GlobalTableSpec.replicas`.

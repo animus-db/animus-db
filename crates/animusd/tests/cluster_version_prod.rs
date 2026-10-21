@@ -13,9 +13,9 @@
 //! The real `MAX_SUPPORTED` is 8 (G-01 stage G-c shipped `Gate::GlobalTables`
 //! at 2, stage G-d `Gate::MrecReplication` at 3, R-01 `Gate::TxnSealChecked`
 //! at 4, ADR 0079 `Gate::NodeCapacity` at 5, ADR 0080 `Gate::FollowerAppliedIndex`
-//! at 6, ADR 0075's 2026-10-21 amendment `Gate::MrecReplicaOverrides` at 8; 7 is
-//! reserved by the parallel MRSC replica-removal gate), so every real binary
-//! advertises `[1, 8]` and live Finalizes to 2 through 8 succeed here: the era, the view, the leader-only routing and the
+//! at 6, ADR 0075's 2026-10-21 amendments `Gate::MrscReplicaRemoval` at 7 and
+//! `Gate::MrecReplicaOverrides` at 8), so every real binary advertises `[1, 8]`
+//! and live Finalizes to 2 through 8 succeed here: the era, the view, the
 //! finalizes that open `Gate::GlobalTables`, `Gate::MrecReplication` and
 //! `Gate::TxnSealChecked` on every node (a data-only node's mirror included). The blocker matrix and the one-step
 //! rules are proven over seeds in `sim_cluster_cluster_version.rs`.
@@ -285,10 +285,13 @@ async fn the_era_starts_over_real_sockets_and_the_admin_surface_works() {
         .await
         .expect("Gate::FollowerAppliedIndex never opened on every node after the finalize");
 
-        // 6 -> 7 (no gate of its own in this tree: the number is reserved) and
-        // 7 -> 8, which opens `Gate::MrecReplicaOverrides` (ADR 0075's
-        // 2026-10-21 amendment) on every node.
-        for (to, expected) in [(7, 6), (8, 7)] {
+        // The sixth step, 6 -> 7, opens `Gate::MrscReplicaRemoval` (ADR 0075's
+        // 2026-10-21 amendment): the replica-removal command of an MRSC table.
+        // The seventh, 7 -> 8, opens `Gate::MrecReplicaOverrides`.
+        for (to, expected, gate) in [
+            (7, 6, animus_control::version::Gate::MrscReplicaRemoval),
+            (8, 7, animus_control::version::Gate::MrecReplicaOverrides),
+        ] {
             let (status, v) = admin(
                 nodes[leader].admin_addr(),
                 "POST",
@@ -298,20 +301,17 @@ async fn the_era_starts_over_real_sockets_and_the_admin_surface_works() {
             .await;
             assert_eq!(status, 200, "{v}");
             assert_eq!(v["active"], to, "{v}");
-        }
-        timeout(Duration::from_secs(60), async {
-            loop {
-                if nodes.iter().all(|n| {
-                    n.features()
-                        .is_open(animus_control::version::Gate::MrecReplicaOverrides)
-                }) {
-                    return;
+            timeout(Duration::from_secs(60), async {
+                loop {
+                    if nodes.iter().all(|n| n.features().is_open(gate)) {
+                        return;
+                    }
+                    sleep(Duration::from_millis(50)).await;
                 }
-                sleep(Duration::from_millis(100)).await;
-            }
-        })
-        .await
-        .expect("Gate::MrecReplicaOverrides never opened on every node after the finalize");
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{gate:?} never opened on every node after the finalize"));
+        }
 
         // CHS1: an empty-`ext` dial is still welcome on the CLIENT port (the
         // CLI and external clients) ...

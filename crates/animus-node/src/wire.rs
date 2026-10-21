@@ -1182,6 +1182,11 @@ pub fn is_relayable_command(command: &MetaCommand) -> bool {
         // relay reason as `ConvertTableToGlobal` (the admin action may land
         // on a follower); the receiver re-checks `Gate::GlobalTables`.
         | MetaCommand::SetGlobalPreferredLeader { .. }
+        // MRSC replica removal (ADR 0075's 2026-10-21 amendment): the same
+        // schema-catalog class and relay reason (a follower-connected
+        // `UpdateTable` deleting Regions must reach the control leader); the
+        // receiver re-checks `Gate::MrscReplicaRemoval`.
+        | MetaCommand::RevertGlobalToRegional { .. }
         // MREC global tables (ADR 0075 section 4, G-01 stage G-d): the replica
         // set is catalog state mutated from a wire `UpdateTable` on any node
         // (and by the create/delete saga on the control leader), so all four
@@ -1932,6 +1937,10 @@ mod tests {
             MetaCommand::SetGlobalPreferredLeader {
                 table: table.clone(),
                 region: "b".to_string(),
+            },
+            MetaCommand::RevertGlobalToRegional {
+                table: table.clone(),
+                keep_region: "a".to_string(),
             },
             MetaCommand::ConvertTableToMrec {
                 table: table.clone(),
