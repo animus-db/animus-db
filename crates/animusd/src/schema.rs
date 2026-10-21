@@ -1441,6 +1441,16 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             .saturating_add(SCHEMA_COMMIT_TIMEOUT)
             .saturating_add(SPLIT_WAIT_BOUND);
         loop {
+            // #1345: re-check the tablet is still in `Metadata` on every
+            // pass. An in-place split that retired it after `grow_stream`'s
+            // snapshot leaves no leader anywhere to chase (the old group is
+            // torn down), so without this the loop below burned the whole
+            // deadline on not-leader refusals and returned a non-skip
+            // "budget exhausted" error. The retired tablet's children are
+            // already `Active` with the parent's stream lineage.
+            if !self.effective_metadata().tablets.contains_key(&tablet) {
+                return ClientResponse::Error("no such tablet".into());
+            }
             match self.resolve_cp_route(tablet) {
                 Some(CpRoute::Local(leader)) => {
                     return match median_split_key(&leader).await {
@@ -1451,12 +1461,21 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 }
                 Some(CpRoute::Forward(addr, hinted)) => {
                     let request = ClientRequest::TriggerAutoSplit { tablet: tablet.0 };
+                    // One bounded chase per pass (not the whole `deadline`), so
+                    // a tablet retired mid-chase is noticed by the re-check
+                    // above within `GROW_FORWARD_ATTEMPT` instead of after
+                    // the full budget.
+                    let attempt = deadline.min(self.env.now().saturating_add(GROW_FORWARD_ATTEMPT));
                     match self
-                        .forward_to_tablet_leader(Some(tablet), addr, hinted, request, deadline)
+                        .forward_to_tablet_leader(Some(tablet), addr, hinted, request, attempt)
                         .await
                     {
                         ClientResponse::Error(e)
                             if topology::parse_not_leader_refusal(&e).is_some() => {} // chase exhausted mid-election, retry below
+                        // The attempt's own budget ran out (transient, ends in
+                        // "; retry"): re-check the tablet and chase again.
+                        ClientResponse::Error(e)
+                            if crate::forwarding::is_forward_budget_exhausted(&e) => {}
                         // The remote's pool wait is capped under one relay hop
                         // (`FORWARDED_SPLIT_WAIT`), so a full pool there comes
                         // back as SPLIT_BUSY and this loop asks again.
@@ -1762,6 +1781,10 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         }
     }
 }
+
+/// How long one forwarded chase in [`ClientCtx::grow_stream_tablet`] may run
+/// before the tablet is re-checked against `Metadata` (#1345).
+const GROW_FORWARD_ATTEMPT: Duration = Duration::from_secs(5);
 
 /// #454: fold [`ClientCtx::grow_stream_tablet`]'s own "no such tablet"
 /// lookup miss into [`STREAM_GROW_MID_SPLIT`], the identical skip

@@ -2,13 +2,8 @@
 //! stale-quiesce-veto (gap G) races. See each test's doc for the issue it
 //! pins and the constructed window it needs.
 //!
-//! Gap H (issue #454, `grow_stream` vs a cascade split) is deliberately NOT
-//! pinned here: under the sim a tablet retired before the walk reaches it
-//! does not yield `"no such tablet"` (the only shape `classify_grow_response`
-//! folds into a skip); it yields a ~40 s virtual-time `"forward to tablet
-//! leader: budget exhausted ...; retry"` error. See the lesson
-//! `docs/lessons/testing/2026-10-18-a-dueling-seal-needs-a-shorter-prefix-and-a-stale-catalog-built-from-two-slow-links.md`
-//! and the hand-off report.
+//! Gap H (issue #454, `grow_stream` vs a cascade split) lives in
+//! `sim_cluster_grow_retired.rs` (issue #1345).
 //!
 //! # Why a stand-in for the periodic seal arm
 //!
