@@ -47,6 +47,12 @@ use crate::{
 const FORWARD_BUDGET_EXHAUSTED: &str =
     "forward to tablet leader: budget exhausted chasing the leader";
 
+/// Whether `error` is [`format_forward_budget_exhausted`]'s transient
+/// exhaustion shape (a chase that ran out of its budget, not a refusal).
+pub(crate) fn is_forward_budget_exhausted(error: &str) -> bool {
+    error.starts_with(FORWARD_BUDGET_EXHAUSTED)
+}
+
 /// Format [`FORWARD_BUDGET_EXHAUSTED`]'s full message, citing the last
 /// hop's own (transient) failure for diagnosis. Pure and clock-free — safe
 /// to call from this module, which carries a hard
