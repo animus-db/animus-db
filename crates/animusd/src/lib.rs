@@ -23386,6 +23386,10 @@ mod sim_cluster_cp_route_fanout;
 /// own `pub(crate)` surface, no further visibility widened).
 #[cfg(test)]
 mod sim_cluster_dynamo_throttle;
+/// Issue #1345: a stream grow walk vs a tablet an in-place split retired
+/// before the walk reached it (`SimCluster`).
+#[cfg(test)]
+mod sim_cluster_grow_retired;
 /// ADR 0078 section 3: the advisory `hosting_ramp` in `/admin/health` — a
 /// sibling of `sim_cluster_throttle` (needs `SimCluster`'s `pub(crate)`
 /// surface).
