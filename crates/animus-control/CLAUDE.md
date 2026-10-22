@@ -3438,3 +3438,9 @@ A new variant must pick a class. Test: `tests/it/transport_class.rs`.
   silent or never-reporting voter does not move it. The data plane's `raftkv-wire` v2 is what carries
   the field on the wire (`animus-cp-data` `codec.rs`). New `AppendEntriesResp` construction sites need
   `applied_index: 0` (patterns want `..`). Pure tests: `tests/it/quorum_applied.rs`.
+
+- **A duplicate `InstallSnapshotResp` never resends** (issue #1362): an ack that
+  repeats the offset the leader already tracks, for a chunk already shipped, is
+  an echo of an overlapping re-offer, not a loss signal; resending on it
+  multiplied every chunk ~9x (`handle_install_snapshot_resp`'s exact-repeat
+  branch). Test: `install_snapshot::duplicate_install_snapshot_ack_does_not_resend_the_outstanding_chunk`.

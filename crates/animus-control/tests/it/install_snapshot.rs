@@ -685,3 +685,114 @@ fn leader_resumes_from_offset_zero_after_a_restarted_follower_resets() {
         "the restarted follower must fully catch up after the reset"
     );
 }
+
+/// Issue #1362 (`large_metadata_catch_up_stays_live` flaked on a 12 s budget,
+/// really taking ~9 s in a debug build): an `InstallSnapshotResp` that merely
+/// repeats the offset the leader already tracks, for a chunk the leader has
+/// already shipped, is a **duplicate** ack (the answer to a periodic re-offer
+/// that overlapped the first send), not a loss signal. Resending on it turned
+/// every duplicate into another in-flight duplicate, so each chunk crossed the
+/// wire up to `SNAPSHOT_ACK_RESEND_CAP + 1` times. A duplicate ack must ship
+/// nothing; a genuine progress ack still ships the next chunk at once.
+#[test]
+fn duplicate_install_snapshot_ack_does_not_resend_the_outstanding_chunk() {
+    let pair: [NodeId; 2] = [nid(0), nid(1)];
+    let now = Nanos(1_000_000_000);
+    let follower_id = nid(1);
+    let image = vec![0xCDu8; 5 * SNAPSHOT_CHUNK_BYTES + 99];
+
+    let mut leader: RaftCore = RaftCore::new(nid(0), &pair, Nanos(0), 7);
+    let _ = leader.tick(now, 7);
+    let _ = leader.handle(
+        follower_id.clone(),
+        RaftMsg::PreVoteResp {
+            term: leader.term() + 1,
+            granted: true,
+        },
+        now,
+        7,
+    );
+    let _ = leader.handle(
+        follower_id.clone(),
+        RaftMsg::RequestVoteResp {
+            term: leader.term(),
+            granted: true,
+        },
+        now,
+        7,
+    );
+    assert!(leader.is_leader(), "node 0 should have won the election");
+    for i in 0..300u64 {
+        if let animus_control::ProposeResult::Accepted { index, .. } = leader.propose(upsert(i)) {
+            let _ = leader.handle(
+                follower_id.clone(),
+                RaftMsg::AppendEntriesResp {
+                    term: leader.term(),
+                    success: true,
+                    match_index: index,
+                    needs_snapshot: false,
+                    check_pending: false,
+                    applied_index: 0,
+                },
+                now,
+                7,
+            );
+        }
+    }
+    leader.mark_durable_through(leader.last_log_index());
+    leader.snapshot();
+    leader.set_snapshot_blob(image);
+
+    // A fresh follower rejects the heartbeat; its reply opens the transfer.
+    let mut follower: RaftCore = RaftCore::new(follower_id.clone(), &pair, Nanos(0), 7);
+    let mut first = Vec::new();
+    for (_, m) in leader.tick(Nanos(now.0 + 1_000_000_000), 7) {
+        for (_, reply) in follower.handle(nid(0), m, now, 7) {
+            first.extend(leader.handle(follower_id.clone(), reply, now, 7));
+        }
+    }
+    assert!(
+        first
+            .iter()
+            .any(|(_, m)| matches!(m, RaftMsg::InstallSnapshot { offset: 0, .. })),
+        "the heartbeat should open the transfer at offset 0 (got {} message(s))",
+        first.len()
+    );
+
+    let term = leader.term();
+    let ack = |next_offset: u64| RaftMsg::InstallSnapshotResp {
+        term,
+        last_index: 0,
+        next_offset,
+    };
+    let chunk = SNAPSHOT_CHUNK_BYTES as u64;
+    // Genuine progress: the next chunk goes out immediately.
+    let progress = leader.handle(follower_id.clone(), ack(chunk), now, 7);
+    assert!(
+        progress
+            .iter()
+            .any(|(_, m)| matches!(m, RaftMsg::InstallSnapshot { offset, .. } if *offset == chunk)),
+        "a progress ack must ship the next chunk (got {} message(s))",
+        progress.len()
+    );
+    // The duplicate of that same ack (the follower acks every chunk it sees,
+    // including the overlapping re-offer): the chunk at `chunk` is already in
+    // flight, so nothing more is sent, however many duplicates arrive.
+    for n in 0..4 {
+        let dup = leader.handle(follower_id.clone(), ack(chunk), now, 7);
+        assert!(
+            dup.is_empty(),
+            "duplicate ack #{n} must not re-ship the outstanding chunk (got {} message(s))",
+            dup.len()
+        );
+    }
+    // And real progress after the duplicates still flows.
+    let next = leader.handle(follower_id.clone(), ack(2 * chunk), now, 7);
+    assert!(
+        next.iter().any(
+            |(_, m)| matches!(m, RaftMsg::InstallSnapshot { offset, .. } if *offset == 2 * chunk)
+        ),
+        "progress after duplicates must still ship the next chunk (got {} message(s))",
+        next.len()
+    );
+}
