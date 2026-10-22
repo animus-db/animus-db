@@ -109,6 +109,8 @@ mod http;
 mod import;
 #[deny(clippy::disallowed_methods)]
 mod index_backfill;
+#[deny(clippy::disallowed_methods)]
+mod legacy_global;
 #[allow(
     dead_code,
     reason = "G-d M3: first production caller is the M4 shipper"
@@ -116,7 +118,6 @@ mod index_backfill;
 pub mod mrec_peer;
 #[deny(clippy::disallowed_methods)]
 mod mrec_receiver;
-#[deny(clippy::disallowed_methods)]
 mod mrec_saga;
 mod mrec_shipper;
 mod overload;
@@ -23560,6 +23561,8 @@ mod sim_world_mrec_e2e_tests;
 mod sim_world_mrec_edge_tests;
 /// ADR 0075's 2026-10-21 amendment: per-replica read-capacity overrides over
 /// `SimWorld`, with a partition during an `Update` (test-only).
+#[cfg(test)]
+mod sim_world_mrec_legacy_tests;
 #[cfg(test)]
 mod sim_world_mrec_overrides_tests;
 #[cfg(test)]

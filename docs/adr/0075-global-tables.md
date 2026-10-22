@@ -75,7 +75,9 @@ except where flagged.
   was seen. The catalogue entries in section 6 therefore derive from V6/V12
   rather than a quotas page.
 - N6: that the legacy 2017.11.29 operations error specifically on a table that
-  is a 2019.11.21 replica, and with which code.
+  is a 2019.11.21 replica, and with which code. (Answered with the nearest codes
+  the service model lists by the 2026-10-21 legacy-API amendment; still not
+  verified against the service.)
 - N7: replication latency, throughput-unit (rWRU) accounting details.
 
 ## 1. Context
@@ -450,6 +452,10 @@ AnimusDB does not validate names against AWS's region list (it is not AWS);
 names are operator-defined.
 
 ### 5.3 Legacy 2017.11.29 operations
+
+> Superseded in part: the six operations are implemented behind
+> `Gate::LegacyGlobalTables` (see the 2026-10-21 legacy-API amendment). The text
+> below is what they do while that gate is closed.
 
 `CreateGlobalTable`, `UpdateGlobalTable`, `DescribeGlobalTable`,
 `DescribeGlobalTableSettings`, `ListGlobalTables`, `UpdateGlobalTableSettings`
@@ -1475,3 +1481,149 @@ during an `Update`, heal, convergence of both `Replicas[]`, clear as a
 tombstone, closed-gate refusal); `sim_cluster_mixed_version_corpus`
 `release7_to_release8_mrec_overrides_gate` and
 `negative_control_mrec_overrides_gate_emitted_early` (N10).
+
+## Amendment (2026-10-21): the legacy 2017.11.29 global tables API (closes the section 5.3 gap as far as built)
+
+`CreateGlobalTable`, `UpdateGlobalTable`, `DescribeGlobalTable`,
+`ListGlobalTables`, `DescribeGlobalTableSettings` and
+`UpdateGlobalTableSettings` are implemented on top of the MREC machinery
+(sections 4 and 5; the saga, the shipper and the receiver are unchanged in
+their roles). Section 5.3's "rejected by name" is now the behaviour **only while
+`Gate::LegacyGlobalTables` is closed** (the text is byte-identical to before:
+`LEGACY_GLOBAL_TABLE_OPERATIONS` and `legacy_global_table_operation_error` are
+kept for that purpose, and the operations are decoded before the gate is
+looked at, so a malformed body is still its own `ValidationException`).
+
+**What a legacy table is.** An MREC table whose `GlobalTableSpec` carries a
+version marker, `legacy: Option<LegacyGlobal { created_ms, billing, stamp,
+origin }>` (additive, skipped while `None`, so every existing encoding and
+fixture is byte-identical; `GlobalBilling` is `PayPerRequest` or
+`Provisioned { write_units }`). `DescribeTable` of a legacy replica reports
+`GlobalTableVersion: "2017.11.29"` and no `MultiRegionConsistency`. A legacy
+spec is MREC-only (MRSC with a marker is `ModeFieldsMixed`). Because the
+replicas of a 2017.11.29 table are **pre-created, empty, identically shaped
+tables**, the saga never creates a peer table for a legacy replica: the new
+`MrecControl::LegacyReplica` makes the peer verify the table the operator
+created and adopt it.
+
+**Create (`CreateGlobalTable`).** The serving cluster's own Region must be in
+`ReplicationGroup`; every other Region must be a configured peer. The cluster
+checks its own table (exists and ACTIVE, empty, a stream with
+`NEW_AND_OLD_IMAGES`), then **verifies every other Region synchronously and
+concurrently** with `LegacyReplica { verify_only: true }` through a
+cross-cluster client installed on the edge (`MrecConfig.edge_client`, filled by
+the shipper loop; the edge had none, because everything cross-cluster used to
+be the saga's), under a 5 s timeout per Region. Only if all Regions accept does
+it commit `ConvertTableToLegacyGlobal` plus one `AddMrecReplica` per remote
+Region (`CREATING`); the saga then sends the non-verify `LegacyReplica`. A
+Region that cannot be reached is a retryable `InternalServerError` with nothing
+changed. `ConvertTableToLegacyGlobal` is idempotent and also adopts a
+standalone single-replica MREC table (it is how an MREC table is "upgraded" to
+carry the marker); any other global table is refused with
+`GlobalTableAlreadyExistsException`.
+
+**Update (`UpdateGlobalTable`).** `Create` verifies the new Region the same way
+and adds a replica (the existing saga then copies the rows into the new empty
+table); `Delete` marks the replica `DELETING` (the existing path). Because the
+2019 `Leave` message tells only the removed peer, a three-Region legacy table
+would leave the third Region believing the removed one is still a member.
+`MrecControl::LegacyRemovePeer { region }` therefore tells every remaining
+Region (and the removed one) to drop it; the removed cluster marks all its
+peers `DELETING` and dissolves, and a legacy spec left with one replica clears
+`schema.global` (`RemoveMrecReplica` does this) so it is a regular table again.
+A cluster that is itself being removed (every peer `DELETING`) never sends
+`LegacyRemovePeer`: it would otherwise dissolve the others (a bug the SimWorld
+test found).
+
+**Settings.** The replicated part is the billing mode and the write capacity:
+`MetaCommand::SetLegacyGlobalSettings` carries a last-writer-wins record
+`(stamp, origin)`, like the overrides record, pushed by the saga
+(`MrecControl::SetLegacySettings`) until each peer acknowledges that exact
+record. A `PROVISIONED` record sets the table throughput (`PAY_PER_REQUEST`
+clears it and clears every replica's read override). Per-Region provisioned
+**read** capacity is the per-replica override of the previous amendment
+(`ReplicaProvisionedReadCapacityUnits`, and per-index
+`ReplicaGlobalSecondaryIndexSettingsUpdate`), so it needs no new state.
+`DescribeGlobalTableSettings` reports each Region as that cluster knows it; a
+remote Region before any settings call is assumed to share the local billing
+mode (all replicas of a global table share one).
+
+**Errors, as the AWS model lists them** (service-2.json, checked per
+operation): `CreateGlobalTable` `LimitExceededException`,
+`GlobalTableAlreadyExistsException`, `TableNotFoundException`;
+`UpdateGlobalTable` `GlobalTableNotFoundException`,
+`ReplicaAlreadyExistsException`, `ReplicaNotFoundException`,
+`TableNotFoundException`; `DescribeGlobalTable` and
+`DescribeGlobalTableSettings` `GlobalTableNotFoundException`;
+`UpdateGlobalTableSettings` `GlobalTableNotFoundException`,
+`ReplicaNotFoundException`, `IndexNotFoundException`, `LimitExceededException`,
+`ResourceInUseException`; `ListGlobalTables` none; every operation also
+`InternalServerError`. A non-empty table, a missing or wrong-view-type stream,
+a ReplicationGroup that omits the serving Region or names fewer than two
+Regions or an unconfigured Region are `ValidationException`s, which the model
+does not list for these operations but AWS returns for malformed requests
+generally (unverified for these conditions; see below). `ListGlobalTables`
+pages by `ExclusiveStartGlobalTableName` and `Limit` (default 100) and is
+filtered by `RegionName`.
+
+**N6 (resolved as far as it can be, not verified).** The question was what a
+legacy operation does to a 2019.11.21 table. The model lists no error for it,
+so the implementation answers `GlobalTableNotFoundException` for `Describe*`,
+`UpdateGlobalTable` and `UpdateGlobalTableSettings` (the table is not a legacy
+global table) and `GlobalTableAlreadyExistsException` for `CreateGlobalTable`
+(the table already is a global table). The reverse is also refused: `UpdateTable`
+`ReplicaUpdates` and `UpdateTable` throughput changes on a legacy table are a
+`ValidationException` naming the legacy API. AWS's real behaviour here is still
+unverified (the documentation extracts and the model say nothing); the codes are
+the nearest listed ones.
+
+**Refused, naming the missing feature.** Auto scaling settings (all of
+`*AutoScalingSettingsUpdate`, except `{AutoScalingDisabled: true}`, which is a
+no-op because there is no auto scaling), `ReplicaTableClass`, and per-GSI write
+capacity (write capacity is the one global value).
+
+**Unverifiable here.** The sandbox cannot call AWS, so these are asserted from
+the service model only: the exact messages; whether the real service reports
+`CREATING` replicas the way `GlobalTableStatus` is derived here (`CREATING`
+while any replica is, `DELETING` while this Region's is, else `ACTIVE`;
+`UPDATING` is never reported); `ReplicaStatus` values beyond those the MREC saga
+has; the ARN shape (`arn:aws:dynamodb::0:global-table/<name>`); whether AWS
+accepts `UpdateGlobalTable` while a replica is `CREATING` (here it does; the
+settings call answers `ResourceInUseException` then); and the
+`ValidationException` conditions above.
+
+**Not built, precisely.** The legacy table cannot be created with data in any
+replica (as in AWS); there is no 2017.11.29 to 2019.11.21 upgrade call (the
+2019 `UpdateTable` simply refuses a legacy table); MRSC is not reachable through
+the legacy API (AWS has no such mode there either).
+
+**Found while testing (pre-existing, fixed here).** A replica of an *empty*
+source table was promoted to `ACTIVE` once its scan finished, and an empty scan
+needs no batch and so no peer contact: a partition during creation could leave a
+replica `ACTIVE` whose peer was never told, and the saga sent `CreateReplica`
+only while nothing was copied. The saga now promotes only after the peer
+acknowledged the creation (`PeerHealth.create_acked`, driver-local; a new driver
+re-sends the idempotent message). This affects the 2019 flow too.
+
+**Gate (ADR 0073).** New `Gate::LegacyGlobalTables` at cluster version 9
+(`MAX_SUPPORTED = 9`; the number lives in one constant,
+`version::LEGACY_GLOBAL_TABLES_VERSION`). It guards
+`ConvertTableToLegacyGlobal` and `SetLegacyGlobalSettings` (`required_gate`
+rows, relay list, mirror arms, `sim_versions` content gate), the six operations
+(the emit-site check; below the gate they keep the refusal above) and the peer
+handlers. The three `MrecControl` variants follow `SetTtl`'s precedent
+(additive, class G with the `MrecApply` frame).
+
+**Tests.** Pure: `animus-dynamo` `legacy_global` and `global::tests` (decode,
+bodies, errors, the closed-gate text); `animus-control` `legacy_global_apply`
+(apply, idempotency, LWW, dissolve, gate rows, mirror round trip),
+`format_fixtures` (new `metadata/v1-legacy-global.json`), `version` and
+`sim_versions` units including the acceptance-matrix row and `Release(9)`
+profile; `animus-node` new `client-frame/v1-mrec-control-legacy.bin`.
+Simulation: `sim_world_mrec_legacy_tests` (three clusters, seeded, >= 20
+seeds: a partition during `CreateGlobalTable` and another during the replica's
+creation, writes in each Region, `UpdateGlobalTable` add and remove,
+Describe/List agreement, settings, and every error case above);
+`sim_cluster_dynamo_global_table` (the closed-gate refusal loop);
+`sim_cluster_mixed_version_corpus` `release8_to_release9_legacy_global_gate`
+and `negative_control_legacy_global_gate_emitted_early` (N11).

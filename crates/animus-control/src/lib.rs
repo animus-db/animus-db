@@ -70,10 +70,10 @@ pub use meta::{
 };
 pub use node::{DeltaReply, MetadataChanged, MetadataWatch, RaftNode};
 pub use schema::{
-    ColumnDef, ColumnType, GlobalSpecError, GlobalTableSpec, IndexDef, IndexKind, IndexProjection,
-    IndexStatus, MrecReplica, MrecReplicaOverrides, MrecReplicaStatus, MultiRegionConsistency,
-    PitrSpec, ProvisionedThroughput, SchemaCatalog, SchemaError, StreamSpec, StreamViewType,
-    TableName, TableSchema, TtlSpec, mrec_region_id,
+    ColumnDef, ColumnType, GlobalBilling, GlobalSpecError, GlobalTableSpec, IndexDef, IndexKind,
+    IndexProjection, IndexStatus, LegacyGlobal, MrecReplica, MrecReplicaOverrides,
+    MrecReplicaStatus, MultiRegionConsistency, PitrSpec, ProvisionedThroughput, SchemaCatalog,
+    SchemaError, StreamSpec, StreamViewType, TableName, TableSchema, TtlSpec, mrec_region_id,
 };
 // Re-exported so downstream assemblers (e.g. `animusd`) can set a tablet's
 // placement policy via `SetTabletPolicy` without taking a direct

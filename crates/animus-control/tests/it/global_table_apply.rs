@@ -23,6 +23,7 @@ fn spec() -> GlobalTableSpec {
         witness: None,
         preferred_leader_region: "a".into(),
         replicas: Vec::new(),
+        legacy: None,
     }
 }
 

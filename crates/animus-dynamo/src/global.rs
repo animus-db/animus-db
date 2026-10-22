@@ -2,7 +2,8 @@
 //! G-c): `UpdateTable`'s `ReplicaUpdates` / `GlobalTableWitnessUpdates` /
 //! `MultiRegionConsistency`, `DescribeTable`'s `GlobalTableVersion` /
 //! `Replicas` / `MultiRegionConsistency` / `GlobalTableWitnesses`, and the
-//! rejection of the legacy 2017.11.29 operations.
+//! refusal of the legacy 2017.11.29 operations while their gate is closed (the
+//! operations themselves are [`crate::legacy_global`]).
 //!
 //! **Pure**, like the rest of this crate: nothing here sees the replicated
 //! catalog, the cluster's Regions or the gate. Division of labour:
@@ -62,9 +63,11 @@ use crate::limits::{MRSC_MAX_WITNESSES, MRSC_MIN_FULL_REPLICAS, MRSC_REQUIRED_RE
 use crate::wire::WireError;
 
 /// The `X-Amz-Target` operation names of the **legacy (2017.11.29)** global
-/// tables control plane (ADR 0075 V1/section 5.3). Every one is rejected by
-/// name ([`legacy_global_table_operation_error`]); the supported surface is
-/// `UpdateTable`'s `ReplicaUpdates` (version 2019.11.21).
+/// tables control plane (ADR 0075 V1/section 5.3 and the 2026-10-21
+/// amendment). They decode to [`crate::legacy_global::LegacyGlobalOp`]; while
+/// `Gate::LegacyGlobalTables` is closed `animusd` rejects each by name
+/// ([`legacy_global_table_operation_error`]), the behaviour before the gate
+/// existed.
 pub const LEGACY_GLOBAL_TABLE_OPERATIONS: [&str; 6] = [
     "CreateGlobalTable",
     "UpdateGlobalTable",
@@ -1064,6 +1067,10 @@ fn throughput_override(units: u64) -> Value {
 /// The global-table part of a `DescribeTable` response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GlobalTableDescription {
+    /// `true` for a legacy (2017.11.29) global table: `DescribeTable` then
+    /// reports `GlobalTableVersion` 2017.11.29 and no `MultiRegionConsistency`
+    /// (a 2019.11.21 concept).
+    pub legacy: bool,
     /// Per-replica read-capacity overrides by Region (MREC; absent = none).
     pub overrides: std::collections::BTreeMap<String, ReplicaReadOverrides>,
     /// Every full replica Region (the table's own included, AWS-style), in
@@ -1083,12 +1090,21 @@ impl GlobalTableDescription {
     pub fn apply_to(&self, desc: &mut Map<String, Value>) {
         desc.insert(
             "GlobalTableVersion".into(),
-            Value::String(crate::limits::GLOBAL_TABLE_VERSION.into()),
+            Value::String(
+                if self.legacy {
+                    crate::limits::GLOBAL_TABLE_VERSION_LEGACY
+                } else {
+                    crate::limits::GLOBAL_TABLE_VERSION
+                }
+                .into(),
+            ),
         );
-        desc.insert(
-            "MultiRegionConsistency".into(),
-            Value::String(if self.eventual { "EVENTUAL" } else { "STRONG" }.into()),
-        );
+        if !self.legacy {
+            desc.insert(
+                "MultiRegionConsistency".into(),
+                Value::String(if self.eventual { "EVENTUAL" } else { "STRONG" }.into()),
+            );
+        }
         desc.insert(
             "Replicas".into(),
             Value::Array(
@@ -1503,15 +1519,49 @@ mod tests {
         );
     }
 
+    /// The six legacy operations now decode (the gate is `animusd`'s); the
+    /// pre-gate refusal text stays available for it to answer while the gate
+    /// is closed.
     #[test]
-    fn legacy_operations_are_rejected_by_name() {
+    fn legacy_operations_decode_and_the_closed_gate_refusal_text_is_kept() {
         for op in LEGACY_GLOBAL_TABLE_OPERATIONS {
-            let e = decode_request(&format!("DynamoDB_20120810.{op}"), br#"{}"#).unwrap_err();
+            let body: &[u8] = match op {
+                "ListGlobalTables" => br#"{}"#,
+                _ => br#"{"GlobalTableName":"orders"}"#,
+            };
+            // Bodies lacking a required member are a named ValidationException,
+            // never an "unsupported operation".
+            let decoded = decode_request(&format!("DynamoDB_20120810.{op}"), body);
+            match decoded {
+                Ok(Operation::LegacyGlobal(l)) => assert_eq!(l.operation(), op),
+                Err(e) => assert_eq!(e.code, "ValidationException", "{op}: {}", e.message),
+                Ok(other) => panic!("{op} decoded to {other:?}"),
+            }
+            let e = legacy_global_table_operation_error(op);
             assert_eq!(e.code, "ValidationException", "{op}");
             assert!(e.message.starts_with(&format!("{op}: ")), "{}", e.message);
             assert!(e.message.contains("2017.11.29"), "{}", e.message);
             assert!(e.message.contains("2019.11.21"), "{}", e.message);
         }
+    }
+
+    #[test]
+    fn a_legacy_table_describes_as_2017_11_29_without_a_consistency_mode() {
+        let mut desc = Map::new();
+        GlobalTableDescription {
+            legacy: true,
+            overrides: Default::default(),
+            replicas: vec![
+                ("a".into(), RegionStatus::Active),
+                ("b".into(), RegionStatus::Creating),
+            ],
+            witness: None,
+            eventual: true,
+        }
+        .apply_to(&mut desc);
+        assert_eq!(desc["GlobalTableVersion"], "2017.11.29");
+        assert!(!desc.contains_key("MultiRegionConsistency"));
+        assert_eq!(desc["Replicas"][1]["ReplicaStatus"], "CREATING");
     }
 
     fn mrec_of(body: &Value) -> Result<MrecRequest, WireError> {
@@ -1662,6 +1712,7 @@ mod tests {
     fn description_reports_overrides_per_replica() {
         let mut desc = Map::new();
         GlobalTableDescription {
+            legacy: false,
             overrides: [
                 (
                     "b".to_string(),
@@ -1699,6 +1750,7 @@ mod tests {
     fn description_shape() {
         let mut desc = Map::new();
         GlobalTableDescription {
+            legacy: false,
             overrides: Default::default(),
             replicas: vec![
                 ("a".into(), RegionStatus::Active),
@@ -1722,6 +1774,7 @@ mod tests {
         );
         let mut desc = Map::new();
         GlobalTableDescription {
+            legacy: false,
             overrides: Default::default(),
             replicas: vec![("a".into(), RegionStatus::Active)],
             witness: None,

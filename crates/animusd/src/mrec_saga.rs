@@ -72,9 +72,9 @@ const LEAVE_ATTEMPTS: u32 = 3;
 /// to drop its cursors before the replica row is removed.
 const DELETE_GRACE: Duration = Duration::from_secs(2);
 /// The health-map tablet slot the saga's own per-(table, region) memo uses.
-const SAGA_SLOT: u64 = u64::MAX;
+pub(crate) const SAGA_SLOT: u64 = u64::MAX;
 
-fn gate_open<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>, gate: Gate) -> bool {
+pub(crate) fn gate_open<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>, gate: Gate) -> bool {
     let features = &ctx.edge.version().features;
     if !features.is_open(gate) {
         features.update(&ctx.effective_metadata());
@@ -89,7 +89,7 @@ pub(crate) fn mrec_gate_open<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> b
 }
 
 /// Propose `cmd` until `done` holds on a fresh view (or time out).
-async fn commit<E: Env, R: RelayClient>(
+pub(crate) async fn commit<E: Env, R: RelayClient>(
     ctx: &ClientCtx<E, R>,
     cmd: MetaCommand,
     done: impl Fn(&Metadata) -> bool,
@@ -111,7 +111,7 @@ async fn commit<E: Env, R: RelayClient>(
     }
 }
 
-fn mrec_spec<'a>(meta: &'a Metadata, table: &str) -> Option<&'a GlobalTableSpec> {
+pub(crate) fn mrec_spec<'a>(meta: &'a Metadata, table: &str) -> Option<&'a GlobalTableSpec> {
     meta.table_global(table).filter(|g| g.is_mrec())
 }
 
@@ -170,6 +170,13 @@ pub(crate) async fn update_table_mrec<E: Env, R: RelayClient>(
     if meta.table_global(table).is_some() && existing.is_none() {
         return Err(WireError::validation(format!(
             "UpdateTable: table `{table}` is already a global table of another kind"
+        )));
+    }
+    if existing.is_some_and(GlobalTableSpec::is_legacy) {
+        return Err(WireError::validation(format!(
+            "UpdateTable: table `{table}` is a legacy (version 2017.11.29) global table; its \
+             Regions are managed with UpdateGlobalTable, and a table is global table version \
+             2017.11.29 or 2019.11.21, never both"
         )));
     }
     validate_read_settings(meta, table, existing, &request)?;
@@ -392,7 +399,7 @@ fn merged_overrides(
 
 /// Commit the merged override record of `region` (waits until the replicated
 /// record is at least as new).
-async fn set_overrides<E: Env, R: RelayClient>(
+pub(crate) async fn set_overrides<E: Env, R: RelayClient>(
     ctx: &ClientCtx<E, R>,
     table: &str,
     local: &str,
@@ -429,7 +436,7 @@ async fn set_overrides<E: Env, R: RelayClient>(
 /// The `CreateTable` body a peer needs to hold this table's twin: key schema,
 /// attribute definitions, indexes (name, keys, projection), on-demand billing
 /// (capacity is per region) and the forced stream.
-fn create_table_body(meta: &Metadata, table: &str) -> Option<String> {
+pub(crate) fn create_table_body(meta: &Metadata, table: &str) -> Option<String> {
     let described = describe_table_wrapped(meta, table, "Table").ok()?;
     let v: Value = serde_json::from_str(&described).ok()?;
     let t = v.get("Table")?;
@@ -468,7 +475,7 @@ fn create_table_body(meta: &Metadata, table: &str) -> Option<String> {
 /// The parts of a `CreateTable` body that must agree for a peer to adopt an
 /// existing table: key schema, the attribute types the keys use, and every
 /// index's name, keys and projection.
-fn shape_of(body: &Value) -> Value {
+pub(crate) fn shape_of(body: &Value) -> Value {
     let mut attrs: Vec<Value> = body
         .get("AttributeDefinitions")
         .and_then(Value::as_array)
@@ -491,7 +498,7 @@ fn shape_of(body: &Value) -> Value {
     json!({"k": body.get("KeySchema"), "a": attrs, "i": indexes})
 }
 
-async fn send_control<E: Env, R: RelayClient>(
+pub(crate) async fn send_control<E: Env, R: RelayClient>(
     ctx: &ClientCtx<E, R>,
     client: &dyn PeerClient,
     region: &str,
@@ -553,6 +560,7 @@ pub(crate) async fn mrec_saga_table<E: Env, R: RelayClient>(
     }
     let mut did = push_ttl(ctx, client, &meta, spec, table).await;
     did |= push_overrides(ctx, client, spec, table).await;
+    did |= crate::legacy_global::push_settings(ctx, client, spec, table).await;
     if spec.replicas.iter().all(|r| {
         r.local
             || r.status == MrecReplicaStatus::Active
@@ -563,10 +571,19 @@ pub(crate) async fn mrec_saga_table<E: Env, R: RelayClient>(
     for replica in spec.replicas.iter().filter(|r| !r.local) {
         match replica.status {
             MrecReplicaStatus::Creating => {
-                if replica.copied.is_empty() {
+                let key: HealthKey = (table.to_owned(), SAGA_SLOT, replica.region.clone());
+                let acked = |ctx: &ClientCtx<E, R>| {
+                    ctx.mrec
+                        .health
+                        .lock()
+                        .expect("mrec health poisoned")
+                        .get(&key)
+                        .is_some_and(|h| h.create_acked)
+                };
+                if !acked(ctx) {
                     did |= step_creating(ctx, client, &meta, spec, table, &replica.region).await;
                 }
-                if active.iter().all(|t| replica.copied.contains(t)) {
+                if acked(ctx) && active.iter().all(|t| replica.copied.contains(t)) {
                     ctx.propose_schema(&MetaCommand::SetMrecReplicaStatus {
                         table: table.to_owned(),
                         region: replica.region.clone(),
@@ -577,6 +594,26 @@ pub(crate) async fn mrec_saga_table<E: Env, R: RelayClient>(
                 }
             }
             MrecReplicaStatus::Deleting => {
+                // A cluster whose every peer is `Deleting` is itself the one
+                // being removed (it dissolved on `LegacyRemovePeer`): it must
+                // not tell the others to drop *them*.
+                if spec.is_legacy()
+                    && spec
+                        .replicas
+                        .iter()
+                        .any(|r| !r.local && r.status != MrecReplicaStatus::Deleting)
+                    && crate::legacy_global::notify_removal(
+                        ctx,
+                        client,
+                        spec,
+                        table,
+                        &replica.region,
+                    )
+                    .await
+                {
+                    did = true;
+                    continue;
+                }
                 did |= step_deleting(ctx, client, table, &replica.region).await;
             }
             MrecReplicaStatus::Active | MrecReplicaStatus::CreationFailed => {}
@@ -603,20 +640,33 @@ async fn step_creating<E: Env, R: RelayClient>(
         .map(|r| r.region.clone())
         .collect();
     let ttl_attribute = meta.table_ttl(table).map(|t| t.attribute_name.clone());
-    let reply = send_control(
-        ctx,
-        client,
-        region,
-        table,
-        MrecControl::CreateReplica {
+    // A legacy (2017.11.29) global table never has its peer table created: the
+    // peer verifies the table the operator pre-created and adopts it.
+    let control = match &spec.legacy {
+        Some(legacy) => MrecControl::LegacyReplica {
+            create_table,
+            ttl_attribute,
+            peers: others.clone(),
+            write_units: meta.table_throughput(table).map(|t| t.write_units),
+            created_ms: legacy.created_ms,
+            verify_only: false,
+        },
+        None => MrecControl::CreateReplica {
             create_table,
             ttl_attribute,
             peers: others.clone(),
         },
-    )
-    .await;
+    };
+    let reply = send_control(ctx, client, region, table, control).await;
     match reply {
         Ok(MrecApplyResponse::Done) => {
+            ctx.mrec
+                .health
+                .lock()
+                .expect("mrec health poisoned")
+                .entry((table.to_owned(), SAGA_SLOT, region.to_owned()))
+                .or_default()
+                .create_acked = true;
             for other in others {
                 let _ = send_control(
                     ctx,
@@ -720,7 +770,7 @@ pub(crate) async fn drop_deleting_cursors<E: Env>(group: &crate::CpGroup<E>, reg
 // ---------------------------------------------------------------------------
 // The peer side
 
-fn refused(message: impl Into<String>, retryable: bool) -> MrecApplyResponse {
+pub(crate) fn refused(message: impl Into<String>, retryable: bool) -> MrecApplyResponse {
     MrecApplyResponse::Refused {
         message: message.into(),
         retryable,
@@ -758,6 +808,40 @@ pub(crate) async fn handle_control<E: Env, R: RelayClient>(
                 origin,
             };
             set_overrides_from_peer(ctx, table, &region, incoming).await
+        }
+        MrecControl::LegacyReplica {
+            create_table,
+            ttl_attribute,
+            peers,
+            write_units,
+            created_ms,
+            verify_only,
+        } => {
+            crate::legacy_global::legacy_replica(
+                ctx,
+                from,
+                table,
+                &crate::legacy_global::LegacyJoin {
+                    create_table,
+                    ttl_attribute,
+                    peers,
+                    write_units,
+                    created_ms,
+                    verify_only,
+                },
+            )
+            .await
+        }
+        MrecControl::SetLegacySettings {
+            write_units,
+            stamp,
+            origin,
+        } => {
+            crate::legacy_global::set_settings_from_peer(ctx, table, write_units, stamp, origin)
+                .await
+        }
+        MrecControl::LegacyRemovePeer { region } => {
+            crate::legacy_global::remove_peer(ctx, table, &region).await
         }
     }
 }
@@ -987,7 +1071,7 @@ async fn push_ttl<E: Env, R: RelayClient>(
     did
 }
 
-async fn add_replica_active<E: Env, R: RelayClient>(
+pub(crate) async fn add_replica_active<E: Env, R: RelayClient>(
     ctx: &ClientCtx<E, R>,
     table: &str,
     region: &str,

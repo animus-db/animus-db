@@ -849,3 +849,8 @@ tables (`consistency` distinguishes them); `admin.rs` has the FakeHost routing t
 
 New required method behind `GET /admin/roll-health` (always 200; `ok` in the body is the
 verdict). Both `animusd` impls delegate to `roll_health::roll_health` (see `animusd`'s guide).
+
+`MrecControl::{LegacyReplica, SetLegacySettings, LegacyRemovePeer}` (ADR 0075's 2026-10-21 legacy-API amendment,
+`Gate::LegacyGlobalTables`) are additive variants of the class-G `MrecApply` frame; the relay list
+(`is_relayable_command`) has arms for `ConvertTableToLegacyGlobal` and `SetLegacyGlobalSettings`. Fixture
+`client-frame/v1-mrec-control-legacy.bin` (never edit).

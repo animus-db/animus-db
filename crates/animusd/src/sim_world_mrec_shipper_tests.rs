@@ -54,6 +54,7 @@ fn cfg(local: &str, peers: &[&str], max_backlog: Duration) -> Arc<MrecConfig> {
         max_backlog,
         node_tls: None,
         health: Arc::default(),
+        edge_client: Default::default(),
     })
 }
 

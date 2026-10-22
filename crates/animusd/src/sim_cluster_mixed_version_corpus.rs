@@ -140,6 +140,13 @@
 //! - `negative_control_mrec_overrides_gate_emitted_early` (N10): the command is
 //!   proposed ungated at version 7; the Release(7) node's capped decode MUST
 //!   reject it and the "gate applied early" oracle MUST fire.
+//! - `release8_to_release9_legacy_global_gate`: the legacy (2017.11.29) global
+//!   tables gate (`Gate::LegacyGlobalTables`): `ConvertTableToLegacyGlobal` is
+//!   refused below version 9 and the table becomes a legacy global table on
+//!   every node (data-only mirror included) once it opens.
+//! - `negative_control_legacy_global_gate_emitted_early` (N11): the command is
+//!   proposed ungated at version 8; the Release(8) node's capped decode MUST
+//!   reject it and the "gate applied early" oracle MUST fire.
 //!
 //! # Not covered
 //!
@@ -240,6 +247,13 @@ enum Kind {
     MrecOverridesGate,
     /// N10: `SetMrecReplicaOverrides` emitted ungated with a Release(7) voter.
     MrecOverridesGateNegative,
+    /// Release(8) -> Release(9) over `Gate::LegacyGlobalTables` (ADR 0075's
+    /// 2026-10-21 amendment): `ConvertTableToLegacyGlobal` is refused at the
+    /// relay below the gate and lands on every replica after it.
+    LegacyGlobalGate,
+    /// N11: `ConvertTableToLegacyGlobal` emitted ungated with a Release(8)
+    /// voter.
+    LegacyGlobalGateNegative,
 }
 
 /// The three ladder negative controls (ADR 0073 section 7).
@@ -361,6 +375,14 @@ fn cells() -> Vec<Cell> {
             "negative_control_mrec_overrides_gate_emitted_early",
             Kind::MrecOverridesGateNegative,
         ),
+        cell(
+            "release8_to_release9_legacy_global_gate",
+            Kind::LegacyGlobalGate,
+        ),
+        cell(
+            "negative_control_legacy_global_gate_emitted_early",
+            Kind::LegacyGlobalGateNegative,
+        ),
     ]
 }
 
@@ -478,6 +500,8 @@ fn run(c: &Cell) -> Verdict {
         Kind::MrscRemovalGateNegative => run_mrsc_removal_negative(c),
         Kind::MrecOverridesGate => run_mrec_overrides_gate(c),
         Kind::MrecOverridesGateNegative => run_mrec_overrides_negative(c),
+        Kind::LegacyGlobalGate => run_legacy_global_gate(c),
+        Kind::LegacyGlobalGateNegative => run_legacy_global_negative(c),
         _ => run_roll(c),
     }
 }
@@ -571,6 +595,21 @@ pub(super) fn instant_violations(cluster: &SimCluster, delivery: bool) -> Vec<St
         {
             v.push(format!(
                 "gate applied early: node {n} holds a replica override at cluster version {}",
+                m.cluster_version()
+            ));
+        }
+    }
+    // ADR 0075 (2026-10-21 amendment): a table is a legacy (2017.11.29) global
+    // table only once the cluster version reached `LEGACY_GLOBAL_TABLES_VERSION`.
+    for n in CONTROL {
+        let m = cluster.metadata(n);
+        if m.cluster_version() < animus_control::version::LEGACY_GLOBAL_TABLES_VERSION
+            && [GLOBAL_TABLE, OVR_TABLE]
+                .iter()
+                .any(|t| m.table_global(t).is_some_and(|g| g.is_legacy()))
+        {
+            v.push(format!(
+                "gate applied early: node {n} holds a legacy global table at cluster version {}",
                 m.cluster_version()
             ));
         }
@@ -828,7 +867,9 @@ fn run_roll(c: &Cell) -> Verdict {
         | Kind::MrscRemovalGate
         | Kind::MrscRemovalGateNegative
         | Kind::MrecOverridesGate
-        | Kind::MrecOverridesGateNegative => unreachable!(),
+        | Kind::MrecOverridesGateNegative
+        | Kind::LegacyGlobalGate
+        | Kind::LegacyGlobalGateNegative => unreachable!(),
     }
 
     // Liveness: the era starts once the last node is B2, every node recorded.
@@ -1341,6 +1382,7 @@ fn global_spec() -> animus_control::GlobalTableSpec {
         witness: None,
         preferred_leader_region: "a".into(),
         replicas: Vec::new(),
+        legacy: None,
     }
 }
 
@@ -2923,6 +2965,198 @@ fn run_mrec_overrides_negative(c: &Cell) -> Verdict {
     verdict_of(c, v, cap_fired)
 }
 
+// ---------------------------------------------------------------------------
+// The eighth real gate: `Gate::LegacyGlobalTables` (cluster version 9, ADR
+// 0075, 2026-10-21): the cells walk 6 -> 7 -> 8 -> 9.
+// ---------------------------------------------------------------------------
+
+fn legacy_cmd() -> MetaCommand {
+    MetaCommand::ConvertTableToLegacyGlobal {
+        table: OVR_TABLE.to_string(),
+        local_region: "us".to_string(),
+        region_id: animus_control::mrec_region_id("us"),
+        created_ms: 1_700_000_000_000,
+    }
+}
+
+fn legacy_landed(m: &animus_control::Metadata) -> bool {
+    m.table_global(OVR_TABLE).is_some_and(|g| g.is_legacy())
+}
+
+/// The cluster finalized at 8 (every node `Release(8)`), a regional table `fa`.
+fn legacy_setup(cluster: &mut SimCluster, w: &mut Watch) {
+    let _ = follower_applied_setup(cluster, w);
+    for v in [6u32, 7, 8] {
+        roll_to_release(cluster, w, &[0, 1, 2, DATA], v);
+        if !all_recorded_at(cluster, w, v) {
+            w.violations
+                .push(format!("the [1,{v}] records never landed on every node"));
+        }
+        finalize_step(cluster, w, v);
+    }
+}
+
+/// Roll `Release(8)` -> `Release(9)`: a relayed `ConvertTableToLegacyGlobal`
+/// is refused by name below the gate (even half-rolled, the finalize refused
+/// while a `[1,8]` node is recorded), counted and never appended; after the
+/// finalize the identical relay is accepted and the table is a legacy global
+/// table on every node, the data-only node's mirror included, with no capped
+/// rejection and no wedged control replica.
+fn run_legacy_global_gate(c: &Cell) -> Verdict {
+    use animus_control::version::Gate;
+    let mut cluster = light_cluster(c.seed);
+    let mut w = Watch::new(true);
+    legacy_setup(&mut cluster, &mut w);
+    if (0..NODES).any(|n| cluster.features(n).is_open(Gate::LegacyGlobalTables)) {
+        w.violations
+            .push("LegacyGlobalTables open at version 8".into());
+    }
+    roll_to_release(&mut cluster, &mut w, &[0, 1, DATA], 9);
+    let leader = control_leader(&mut cluster);
+    let (status, body) = finalize(&mut cluster, leader, r#"{"to":9,"expected":8}"#);
+    if status == 200 {
+        w.violations.push(format!(
+            "a finalize to 9 was accepted with a [1,8] node: {body}"
+        ));
+    }
+    roll_to_release(&mut cluster, &mut w, &[OLD], 9);
+    if !all_recorded_at(&mut cluster, &mut w, 9) {
+        w.violations
+            .push("the [1,9] records never landed on every node".into());
+    }
+    let leader = control_leader(&mut cluster);
+    let follower = (0..3u64).find(|n| *n != leader).expect("a follower");
+    let pre_log: Vec<u64> = CONTROL
+        .iter()
+        .map(|&n| cluster.control_last_log_index(n))
+        .collect();
+    for (from, to) in [(follower, leader), (leader, follower)] {
+        let before = cluster.metric(to, animus_env::Metric::ClusterGateRelayRefused);
+        match cluster.relay_request(
+            from,
+            to,
+            animus_node::ClientRequest::ProposeSchema(legacy_cmd()),
+        ) {
+            Some(animus_node::ClientResponse::Error(msg))
+                if msg.contains("relayed command refused")
+                    && msg.contains("LegacyGlobalTables") => {}
+            other => w
+                .violations
+                .push(format!("relay {from}->{to} not refused by name: {other:?}")),
+        }
+        if cluster.metric(to, animus_env::Metric::ClusterGateRelayRefused) != before + 1 {
+            w.violations
+                .push(format!("refusal not counted on node {to}"));
+        }
+    }
+    w.run(&mut cluster, Duration::from_secs(2));
+    let post_log: Vec<u64> = CONTROL
+        .iter()
+        .map(|&n| cluster.control_last_log_index(n))
+        .collect();
+    if post_log != pre_log {
+        w.violations
+            .push("a refused relay appended to the control log".into());
+    }
+    finalize_step(&mut cluster, &mut w, 9);
+    if !converge(&mut cluster, |c| {
+        w.sample(c);
+        (0..NODES).all(|n| c.features(n).is_open(Gate::LegacyGlobalTables))
+    }) {
+        w.violations
+            .push("LegacyGlobalTables never opened on every node".into());
+    }
+    let leader = control_leader(&mut cluster);
+    let follower = (0..3u64).find(|n| *n != leader).expect("a follower");
+    match cluster.relay_request(
+        follower,
+        leader,
+        animus_node::ClientRequest::ProposeSchema(legacy_cmd()),
+    ) {
+        Some(animus_node::ClientResponse::PutOk) => {}
+        other => w
+            .violations
+            .push(format!("the post-finalize relay was refused: {other:?}")),
+    }
+    if !converge(&mut cluster, |c| {
+        w.sample(c);
+        (0..NODES).all(|n| legacy_landed(&c.metadata(n)))
+    }) {
+        w.violations
+            .push("the legacy global table never landed on every node (mirror included)".into());
+    }
+    let wedged = {
+        let mut last = wedged_control(&cluster);
+        let _ = converge(&mut cluster, |c| {
+            last = wedged_control(c);
+            last.is_empty()
+        });
+        last
+    };
+    if !wedged.is_empty() {
+        w.violations
+            .push(format!("control replicas {wedged:?} wedged"));
+    }
+    w.sample(&cluster);
+    verdict_of(c, w.violations, false)
+}
+
+/// N11: a buggy emitter appends `ConvertTableToLegacyGlobal` at cluster
+/// version 8 with a `Release(8)` voter. The cap must reject it at exactly that
+/// voter, which is wedged and never appended the entry; the early application
+/// on the others is reported too.
+fn run_legacy_global_negative(c: &Cell) -> Verdict {
+    let mut cluster = light_cluster(c.seed);
+    let mut w = Watch::new(true);
+    legacy_setup(&mut cluster, &mut w);
+    let others: Vec<u64> = (0..NODES).filter(|&n| n != OLD).collect();
+    roll_to_release(&mut cluster, &mut w, &others, 9);
+    let setup = std::mem::take(&mut w.violations);
+    if control_leader(&mut cluster) == OLD {
+        let _ = cluster.transfer_leadership(OLD, 0);
+        w.run(&mut cluster, Duration::from_secs(2));
+    }
+    let mut v: Vec<String> = setup;
+    if control_leader(&mut cluster) == OLD {
+        v.push("could not move leadership off the Release(8) node".into());
+    }
+    let pre = instant_violations(&cluster, true);
+    if !pre.is_empty() {
+        v.push(format!("violations before the bad emit: {pre:?}"));
+    }
+    let pre_log = cluster.control_last_log_index(OLD);
+    let accepted = cluster.propose_meta_ungated(legacy_cmd());
+    if !matches!(accepted, ProposeResult::Accepted { .. }) {
+        v.push(format!("the bad emit was not accepted: {accepted:?}"));
+    }
+    w.run(&mut cluster, Duration::from_secs(6));
+    let wedged = wedged_settled(&mut cluster, OLD);
+    if wedged != vec![OLD] {
+        v.push(format!("expected only node {OLD} wedged, got {wedged:?}"));
+    }
+    let cap_fired = w.violations.iter().any(|s| {
+        s.starts_with(&format!("delivery: node {OLD} (Release(8))"))
+            && s.contains("LegacyGlobalTables")
+    });
+    if !cap_fired {
+        v.push(format!(
+            "the cap never rejected the LegacyGlobalTables value: {:?}",
+            w.violations
+        ));
+    }
+    if !w
+        .violations
+        .iter()
+        .any(|s| s.starts_with("gate applied early"))
+    {
+        v.push("the early legacy conversion went unnoticed".into());
+    }
+    if cluster.control_last_log_index(OLD) != pre_log {
+        v.push("the Release(8) replica appended the legacy conversion".into());
+    }
+    verdict_of(c, v, cap_fired)
+}
+
 /// A Phase 1 binary joining after the era is refused at the seed's handshake
 /// (counted, never a member); the cluster is unaffected; a versioned joiner
 /// through the same seed is admitted and recorded. `via_data` dials the
@@ -3297,6 +3531,16 @@ fn sim_cluster_mixed_version_corpus_negative_control_mrec_overrides_gate() {
 }
 
 #[test]
+fn sim_cluster_mixed_version_corpus_legacy_global_gate() {
+    run_family("release8_to_release9_legacy_global_gate");
+}
+
+#[test]
+fn sim_cluster_mixed_version_corpus_negative_control_legacy_global_gate() {
+    run_family("negative_control_legacy_global_gate_emitted_early");
+}
+
+#[test]
 fn sim_cluster_mixed_version_cell_names_and_seeds_are_unique() {
     let cs = corpus::seed_expand(cells(), 3);
     let names: BTreeSet<_> = cs.iter().map(|c| c.name.clone()).collect();
@@ -3330,6 +3574,8 @@ fn sim_cluster_mixed_version_cell_names_and_seeds_are_unique() {
         "negative_control_mrsc_removal_gate_emitted_early",
         "release7_to_release8_mrec_overrides_gate",
         "negative_control_mrec_overrides_gate_emitted_early",
+        "release8_to_release9_legacy_global_gate",
+        "negative_control_legacy_global_gate_emitted_early",
     ] {
         assert!(
             cells().iter().any(|c| c.name.starts_with(prefix)),

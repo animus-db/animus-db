@@ -70,6 +70,7 @@ pub(crate) fn global_description(meta: &Metadata, table: &str) -> Option<GlobalT
         }
     };
     Some(GlobalTableDescription {
+        legacy: false,
         overrides: BTreeMap::new(),
         replicas: spec
             .regions
@@ -90,6 +91,7 @@ fn mrec_description(spec: &GlobalTableSpec) -> Option<GlobalTableDescription> {
         return None;
     }
     Some(GlobalTableDescription {
+        legacy: spec.legacy.is_some(),
         overrides: spec
             .replicas
             .iter()
@@ -160,7 +162,7 @@ pub(crate) fn reject_ttl_on_global(meta: &Metadata, table: &str) -> Result<(), W
 /// Whether `table` holds at least one live item (a DynamoDB tombstone row is
 /// not an item). A quorum scan over the whole table, page by page, stopping at
 /// the first live row.
-async fn table_has_items<E: Env, R: RelayClient>(
+pub(crate) async fn table_has_items<E: Env, R: RelayClient>(
     ctx: &ClientCtx<E, R>,
     table: &str,
 ) -> Result<bool, WireError> {
@@ -343,6 +345,7 @@ pub(crate) async fn update_table_global<E: Env, R: RelayClient>(
         witness: request.witness,
         preferred_leader_region: local,
         replicas: Vec::new(),
+        legacy: None,
     };
     spec.validate()
         .map_err(|e| WireError::validation(format!("UpdateTable: {}", e.message())))?;

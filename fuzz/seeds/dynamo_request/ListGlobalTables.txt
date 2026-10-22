@@ -1,0 +1,2 @@
+ListGlobalTables
+{"Limit": 10, "ExclusiveStartGlobalTableName": "a", "RegionName": "r"}
