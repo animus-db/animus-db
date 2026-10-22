@@ -3439,6 +3439,12 @@ A new variant must pick a class. Test: `tests/it/transport_class.rs`.
   the field on the wire (`animus-cp-data` `codec.rs`). New `AppendEntriesResp` construction sites need
   `applied_index: 0` (patterns want `..`). Pure tests: `tests/it/quorum_applied.rs`.
 
+- **A duplicate `InstallSnapshotResp` never resends** (issue #1362): an ack that
+  repeats the offset the leader already tracks, for a chunk already shipped, is
+  an echo of an overlapping re-offer, not a loss signal; resending on it
+  multiplied every chunk ~9x (`handle_install_snapshot_resp`'s exact-repeat
+  branch). Test: `install_snapshot::duplicate_install_snapshot_ack_does_not_resend_the_outstanding_chunk`.
+
 ## `Gate::MrscReplicaRemoval`, cluster version 7 (ADR 0075 / ADR 0073's 2026-10-21 amendments)
 
 - `MetaCommand::RevertGlobalToRegional { table, keep_region }` (gate version 7) is the inverse of
