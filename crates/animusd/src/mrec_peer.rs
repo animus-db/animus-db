@@ -147,6 +147,10 @@ pub(crate) struct PeerHealth {
     /// Driver-local and lost on restart or a driver change, which only costs
     /// an idempotent re-push (the peer applies last-writer-wins).
     pub(crate) overrides_pushed: BTreeMap<String, (u64, u32)>,
+    /// (Saga slot) the peer acknowledged creating its replica table; a
+    /// `Creating` replica is promoted only after this. Node-local: a new
+    /// driver re-sends the idempotent create.
+    pub(crate) create_acked: bool,
 }
 
 impl Default for MrecConfig {

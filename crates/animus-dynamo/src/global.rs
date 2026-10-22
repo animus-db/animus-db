@@ -430,7 +430,7 @@ fn decode_replica_actions(value: &Value) -> Result<Vec<ReplicaAction>, String> {
             .as_object()
             .ok_or_else(|| "each `ReplicaUpdates` element must be an object".to_owned())?;
         // Exactly one of Create / Update / Delete per element.
-        let present: Vec<&str> = ["Create", "Update", "Delete"]
+        let present: Vec<&str> = ["Create", "Update", "Delete", "Disassociate"]
             .into_iter()
             .filter(|k| element.contains_key(*k))
             .collect();
@@ -457,6 +457,11 @@ fn decode_replica_actions(value: &Value) -> Result<Vec<ReplicaAction>, String> {
                     .ok_or_else(|| "`ReplicaUpdates` `Delete` must be an object".to_owned())?;
                 let region = region_name(delete, "`ReplicaUpdates` `Delete`")?;
                 out.push(ReplicaAction::Delete { region });
+            }
+            ["Disassociate"] => {
+                // `ReplicationGroupUpdate` also defines `Disassociate`
+                // (service model); it is a different feature, named.
+                return Err("`ReplicaUpdates` `Disassociate` is not supported".to_owned());
             }
             _ => {
                 return Err(
@@ -1024,8 +1029,10 @@ pub enum RegionStatus {
 }
 
 impl RegionStatus {
-    /// The wire string (`ReplicaStatus` / `WitnessStatus` share these two
-    /// values).
+    /// The wire string. Every value is in the AWS service model's
+    /// `ReplicaStatus` enum (verified 2026-10-21); `WitnessStatus` is
+    /// `CREATING`/`DELETING`/`ACTIVE` only, and only MRSC (which never
+    /// produces `CreationFailed`) has a witness.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -1459,6 +1466,44 @@ mod tests {
                     .message
                     .starts_with("UpdateTable: ")
             );
+        }
+    }
+
+    #[test]
+    fn disassociate_is_named_and_refused() {
+        let body =
+            json!({"TableName":"tbl","ReplicaUpdates":[{"Disassociate":{"RegionName":"b"}}]});
+        let msg = validate_err(&body);
+        assert!(msg.contains("Disassociate"), "{msg}");
+    }
+
+    /// Wire names pinned against the AWS botocore service model
+    /// (`ReplicaStatus`, `WitnessStatus`, `MultiRegionConsistency`), 2026-10-21.
+    #[test]
+    fn wire_enum_values_are_in_the_service_model() {
+        const REPLICA_STATUS: [&str; 10] = [
+            "CREATING",
+            "CREATION_FAILED",
+            "UPDATING",
+            "DELETING",
+            "ACTIVE",
+            "REGION_DISABLED",
+            "INACCESSIBLE_ENCRYPTION_CREDENTIALS",
+            "ARCHIVING",
+            "ARCHIVED",
+            "REPLICATION_NOT_AUTHORIZED",
+        ];
+        const WITNESS_STATUS: [&str; 3] = ["CREATING", "DELETING", "ACTIVE"];
+        for st in [
+            RegionStatus::Creating,
+            RegionStatus::Active,
+            RegionStatus::Deleting,
+            RegionStatus::CreationFailed,
+        ] {
+            assert!(REPLICA_STATUS.contains(&st.as_str()), "{}", st.as_str());
+            if st != RegionStatus::CreationFailed {
+                assert!(WITNESS_STATUS.contains(&st.as_str()), "{}", st.as_str());
+            }
         }
     }
 

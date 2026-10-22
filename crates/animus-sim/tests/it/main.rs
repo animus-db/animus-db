@@ -4,6 +4,7 @@
 mod clock_skew;
 mod cpu_cost;
 mod determinism;
+mod dir_durability;
 mod disk_faults;
 mod encrypted_disk;
 mod executor_leak;
