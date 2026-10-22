@@ -12654,6 +12654,24 @@ MRSC and KMS/OnDemand/TableClass overrides stay refused (see the ADR). Sim test:
 `sim_world_mrec_overrides_tests`. In a sim cluster, a long idle finalize ladder *after* the table exists
 makes the first client calls time out (quiesced groups): open the gates before creating the table.
 
+## Legacy 2017.11.29 global tables (ADR 0075's 2026-10-21 legacy-API amendment, `Gate::LegacyGlobalTables`)
+
+`legacy_global::execute` serves the six operations (gate closed: `legacy_global_table_operation_error`,
+the pre-gate text). A legacy table is an MREC table with `GlobalTableSpec.legacy`; the replicas are the
+operator's pre-created empty tables, so the saga sends `MrecControl::LegacyReplica` (verify + adopt)
+instead of `CreateReplica`. `CreateGlobalTable` / `UpdateGlobalTable Create` verify every other Region
+**synchronously** through `MrecConfig.edge_client` (an `EdgePeerClient` the shipper loop installs; the
+edge otherwise has no peer client; sim worlds call `cfg.edge_client.install(Arc::new(w.peer_client(c)))`,
+and `MrecConfig` struct literals need `edge_client: Default::default()`), 5 s per Region; unreachable is a
+retryable `InternalServerError` with nothing changed. Settings: `SetLegacyGlobalSettings` LWW record pushed
+by `push_settings` (`MrecControl::SetLegacySettings`); per-Region read capacity reuses the overrides.
+Removal: `LegacyRemovePeer` goes to every other replica first and the departing Region last; a receiver
+ignores it from a sender that is `Deleting`/absent in its spec (a dissolving cluster must not dissolve the others);
+removing several Regions in one call drops every link between them. The saga promotes a replica to
+`Active` only after `PeerHealth.create_acked` (an empty table's copy needs no peer contact). 2019 edges
+(`update_table_mrec`, `update_table_throughput`) refuse a legacy table. Sim test:
+`sim_world_mrec_legacy_tests` (three clusters; reuses `mesh_cfg` and `open_overrides_gate`).
+
 **Sim regressions for a walk over a changing set (issue #1345):** hold the
 walk open with a partition on its first call and assert the window is open
 before healing; see

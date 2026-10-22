@@ -759,6 +759,12 @@ pub enum Operation {
         /// this call doesn't touch throughput at all.
         throughput_update: Option<Option<ProvisionedThroughput>>,
     },
+    /// A legacy (version 2017.11.29) global tables operation
+    /// (`CreateGlobalTable`, `UpdateGlobalTable`, `DescribeGlobalTable`,
+    /// `ListGlobalTables`, `DescribeGlobalTableSettings`,
+    /// `UpdateGlobalTableSettings`): ADR 0075's 2026-10-21 amendment. Decoding
+    /// is pure and ungated; `animusd` gates it on `Gate::LegacyGlobalTables`.
+    LegacyGlobal(crate::legacy_global::LegacyGlobalOp),
     /// `UpdateTable` carrying `ReplicaUpdates` / `GlobalTableWitnessUpdates` /
     /// `MultiRegionConsistency` (ADR 0075 section 5.1, G-01 stage G-c): the
     /// global-table conversion. A **separate variant** from
@@ -1435,6 +1441,9 @@ impl Operation {
             | Operation::TagResource { table, .. }
             | Operation::UntagResource { table, .. }
             | Operation::ListTagsOfResource { table, .. } => Some(table),
+            // A legacy global table is named like its tables; `ListGlobalTables`
+            // names none.
+            Operation::LegacyGlobal(op) => op.table(),
             // `RestoreTableFromBackup` targets its brand-new *target* table
             // (mirroring `CreateTable`'s own "the table about to exist" —
             // the target doesn't exist yet either way).
@@ -2088,11 +2097,12 @@ pub fn decode_request(target: &str, body: &[u8]) -> Result<Operation, WireError>
         }),
         "DescribeLimits" => Ok(Operation::DescribeLimits),
         "DescribeEndpoints" => Ok(Operation::DescribeEndpoints),
-        // ADR 0075 section 5.3: the legacy (2017.11.29) global tables control
-        // plane is rejected by name, ungated (rejecting is not a new
-        // surface).
+        // ADR 0075's 2026-10-21 amendment: the legacy (2017.11.29) global
+        // tables control plane. Decoding is ungated; `animusd` checks
+        // `Gate::LegacyGlobalTables` and, while it is closed, answers
+        // `legacy_global_table_operation_error` (the pre-amendment refusal).
         legacy if crate::global::LEGACY_GLOBAL_TABLE_OPERATIONS.contains(&legacy) => {
-            Err(crate::global::legacy_global_table_operation_error(legacy))
+            crate::legacy_global::decode_legacy_global(legacy, obj).map(Operation::LegacyGlobal)
         }
         _ => Err(WireError::unknown_operation(target)),
     }
@@ -9300,6 +9310,7 @@ mod tests {
             assert!(!plain.contains(key), "{key} leaked into a non-global table");
         }
         let g = crate::global::GlobalTableDescription {
+            legacy: false,
             overrides: Default::default(),
             replicas: vec![("a".into(), crate::global::RegionStatus::Active)],
             witness: None,

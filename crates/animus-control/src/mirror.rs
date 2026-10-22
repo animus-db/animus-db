@@ -390,7 +390,9 @@ pub fn apply_and_derive_mirror(
         | MetaCommand::RemoveMrecReplica { table, .. }
         | MetaCommand::SetMrecReplicaStatus { table, .. }
         | MetaCommand::MarkMrecCopied { table, .. }
-        | MetaCommand::SetMrecReplicaOverrides { table, .. } => {
+        | MetaCommand::SetMrecReplicaOverrides { table, .. }
+        | MetaCommand::ConvertTableToLegacyGlobal { table, .. }
+        | MetaCommand::SetLegacyGlobalSettings { table, .. } => {
             // ADR 0075 (G-01 stage G-d): schema-only (placement is untouched).
             if let Some(schema) = meta.schemas.get(table) {
                 writes.push(put_json(syskv::schema_key(table), schema));
@@ -2721,6 +2723,7 @@ mod tests {
                     witness: None,
                     preferred_leader_region: "a".to_string(),
                     replicas: Vec::new(),
+                    legacy: None,
                 },
             },
             MetaCommand::SetGlobalPreferredLeader {

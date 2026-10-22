@@ -3661,3 +3661,32 @@ constant (`version::MREC_REPLICA_OVERRIDES_VERSION`).
 - **Rolling upgrade behaviour.** Before the finalize `Update` and read overrides
   are refused exactly as before; nothing is proposed or pushed.
 
+
+## Amendment 2026-10-21 — the eighth real gate: `Gate::LegacyGlobalTables`, `MAX_SUPPORTED = 9` (ADR 0075's 2026-10-21 legacy-API amendment)
+
+`MAX_SUPPORTED` is now **9**; `Gate::LegacyGlobalTables` opens at version 9. Version 8
+is `Gate::MrecReplicaOverrides` (the amendment above). The gate number is one constant
+(`version::LEGACY_GLOBAL_TABLES_VERSION`).
+
+| New shape | Class | Gate | Emit-site / propose-site check |
+|---|---|---|---|
+| `MetaCommand::ConvertTableToLegacyGlobal` | G (replicated command) | `LegacyGlobalTables` | `required_gate` row (exhaustive); the `CreateGlobalTable` edge checks the gate before verifying peers or proposing; the relay receiver re-checks (`relay_gate_verdict`); `sim_versions::content_gate` classifies it by content |
+| `MetaCommand::SetLegacyGlobalSettings` | G (replicated command) | `LegacyGlobalTables` | same rows; the `UpdateGlobalTableSettings` edge checks the gate |
+| `GlobalTableSpec.legacy` (JSON, skipped while `None`) | G (replicated field) | `LegacyGlobalTables` | only `ConvertTableToLegacyGlobal` writes it; new fixture `metadata/v1-legacy-global.json` (existing fixtures untouched) |
+| `MrecControl::LegacyReplica`, `SetLegacySettings`, `LegacyRemovePeer` (cross-cluster JSON frame) | G (additive variants of the `MrecApply` frame) | peer's own `LegacyGlobalTables` | the sender is gated by its own cluster; the receiver refuses retryably while its gate is closed; new frame fixture `client-frame/v1-mrec-control-legacy.bin` |
+| the six legacy global table operations | wire surface | `LegacyGlobalTables` | `animusd::legacy_global::execute` checks the gate first; while closed it answers the pre-amendment refusal text (`legacy_global_table_operation_error`), byte for byte |
+
+- **Tests.** `version::tests::legacy_global_tables_gate_opens_exactly_at_its_version`,
+  `sim_versions` `legacy_global_tables_need_their_gate` and the extended acceptance matrix
+  (a `Release(9)` column and a `LegacyGlobalTables` row),
+  `legacy_global_apply::gate_rows_and_mirror_round_trip`.
+- **Cells.** `sim_cluster_mixed_version_corpus::release8_to_release9_legacy_global_gate`
+  (relay refused by name and counted below the gate, half-rolled finalize refused,
+  accepted after, lands on every replica including the data-only mirror) and
+  `negative_control_legacy_global_gate_emitted_early` (N11); the "gate applied early"
+  oracle gained the legacy-table check. `sim_cluster_dynamo_global_table` asserts the
+  closed-gate refusal text of all six operations; `tests/cluster_version_prod.rs`
+  finalizes through 9.
+- **Rolling upgrade behaviour.** Before the finalize the six operations are refused exactly
+  as before; nothing is proposed, verified or pushed. A peer on an older binary rejects the
+  new `MrecControl` variants and the sender retries until it upgrades.

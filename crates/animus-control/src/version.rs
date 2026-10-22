@@ -37,7 +37,13 @@ use crate::meta::Metadata;
 pub type ClusterVersion = u32;
 
 /// The highest cluster version this binary can run at.
-pub const MAX_SUPPORTED: ClusterVersion = MREC_REPLICA_OVERRIDES_VERSION;
+pub const MAX_SUPPORTED: ClusterVersion = LEGACY_GLOBAL_TABLES_VERSION;
+
+/// The cluster version at which [`Gate::LegacyGlobalTables`] opens (the
+/// legacy 2017.11.29 global tables API, ADR 0075's 2026-10-21 amendment): the
+/// one place its number lives in non-test code, read by `Gate::version`,
+/// `Gate::rank` and `MAX_SUPPORTED`.
+pub const LEGACY_GLOBAL_TABLES_VERSION: ClusterVersion = 9;
 
 /// The cluster version at which [`Gate::MrecReplicaOverrides`] opens: the one
 /// place its number lives in non-test code (`Gate::version`/`Gate::rank` and
@@ -253,6 +259,18 @@ pub enum Gate {
     /// `MrecReplication`, because a Release(7) voter knows the latter yet
     /// cannot decode the new variant.
     MrecReplicaOverrides,
+    /// **Legacy (2017.11.29) global tables** (ADR 0075's 2026-10-21
+    /// amendment): the eighth real version gate, opening at
+    /// [`LEGACY_GLOBAL_TABLES_VERSION`] (9). Guards
+    /// `MetaCommand::ConvertTableToLegacyGlobal` / `SetLegacyGlobalSettings`
+    /// and the `GlobalTableSpec.legacy` field they write (a Release(8) voter
+    /// cannot decode either), the client acceptance of `CreateGlobalTable`,
+    /// `UpdateGlobalTable`, `DescribeGlobalTable`, `ListGlobalTables`,
+    /// `DescribeGlobalTableSettings` and `UpdateGlobalTableSettings` (below it
+    /// they keep their named refusal), and the cross-cluster
+    /// `MrecControl::LegacyReplica` / `SetLegacySettings` messages (which a
+    /// peer cluster only honours once its own gate is open).
+    LegacyGlobalTables,
     /// A **synthetic** version gate `n` (test/sim builds only): opens at
     /// cluster version `n`, ranks `n`. It exists so the gate *ladder*
     /// (several version gates, each opening at its own finalize) can be
@@ -281,6 +299,7 @@ impl Gate {
         Gate::FollowerAppliedIndex,
         Gate::MrscReplicaRemoval,
         Gate::MrecReplicaOverrides,
+        Gate::LegacyGlobalTables,
     ];
 
     /// The cluster version at which this gate opens, or `None` for a gate
@@ -305,6 +324,8 @@ impl Gate {
             // ADR 0075 (2026-10-21 amendment): the sixth real version gate.
             Gate::MrscReplicaRemoval => Some(7),
             Gate::MrecReplicaOverrides => Some(MREC_REPLICA_OVERRIDES_VERSION),
+            // ADR 0075 (2026-10-21 amendment): the eighth real version gate.
+            Gate::LegacyGlobalTables => Some(LEGACY_GLOBAL_TABLES_VERSION),
             #[cfg(any(test, feature = "sim-versions"))]
             Gate::Synthetic(n) => Some(n),
         }
@@ -326,6 +347,7 @@ impl Gate {
             Gate::FollowerAppliedIndex => 6,
             Gate::MrscReplicaRemoval => 7,
             Gate::MrecReplicaOverrides => MREC_REPLICA_OVERRIDES_VERSION,
+            Gate::LegacyGlobalTables => LEGACY_GLOBAL_TABLES_VERSION,
             #[cfg(any(test, feature = "sim-versions"))]
             Gate::Synthetic(n) => {
                 if n > 1 {
@@ -611,6 +633,8 @@ mod tests {
                 Gate::MrscReplicaRemoval => Some(7),
                 // ADR 0075 (2026-10-21 amendment): the seventh.
                 Gate::MrecReplicaOverrides => Some(MREC_REPLICA_OVERRIDES_VERSION),
+                // ADR 0075 (2026-10-21 amendment): the eighth.
+                Gate::LegacyGlobalTables => Some(LEGACY_GLOBAL_TABLES_VERSION),
                 // Never in `ALL` (parametric, test/sim only): see the ladder test.
                 Gate::Synthetic(_) => unreachable!("synthetic gates are not in Gate::ALL"),
             };
@@ -657,9 +681,14 @@ mod tests {
             Gate::MrscReplicaRemoval.join(Gate::MrecReplicaOverrides),
             Gate::MrecReplicaOverrides
         );
+        assert!(seen.contains(&Gate::LegacyGlobalTables));
         assert_eq!(
-            MAX_SUPPORTED, 8,
-            "the MREC replica-overrides gate (ADR 0075, 2026-10-21) is the release that takes MAX to 8"
+            Gate::MrecReplicaOverrides.join(Gate::LegacyGlobalTables),
+            Gate::LegacyGlobalTables
+        );
+        assert_eq!(
+            MAX_SUPPORTED, 9,
+            "the legacy global tables gate (ADR 0075, 2026-10-21) is the release that takes MAX to 9"
         );
         assert_eq!(MIN_SUPPORTED, 1);
         // Declaration order is opening order: ranks are non-decreasing.
@@ -685,7 +714,7 @@ mod tests {
         };
         let g = Gate::MrecReplicaOverrides;
         assert_eq!(g.version(), Some(MREC_REPLICA_OVERRIDES_VERSION));
-        assert_eq!(MAX_SUPPORTED, MREC_REPLICA_OVERRIDES_VERSION);
+        const { assert!(MAX_SUPPORTED >= MREC_REPLICA_OVERRIDES_VERSION) };
         assert!(!at(MREC_REPLICA_OVERRIDES_VERSION - 1).is_open(g));
         assert!(at(MREC_REPLICA_OVERRIDES_VERSION).is_open(g));
         // The earlier MREC gate stays open below it: they are distinct gates.
@@ -696,6 +725,43 @@ mod tests {
             overrides: Default::default(),
         };
         assert_eq!(cmd.required_gate(), g);
+    }
+
+    /// ADR 0075 (2026-10-21 amendment): the legacy global tables gate opens
+    /// exactly at its version, and both of its commands classify by it.
+    #[test]
+    fn legacy_global_tables_gate_opens_exactly_at_its_version() {
+        use crate::meta::MetaCommand;
+        use crate::schema::GlobalBilling;
+        let at = |v: ClusterVersion| {
+            let f = ClusterFeatures::new();
+            f.update(&Metadata {
+                cluster_version: v,
+                ..Metadata::default()
+            });
+            f
+        };
+        let g = Gate::LegacyGlobalTables;
+        assert_eq!(g.version(), Some(LEGACY_GLOBAL_TABLES_VERSION));
+        assert_eq!(MAX_SUPPORTED, LEGACY_GLOBAL_TABLES_VERSION);
+        assert!(!at(LEGACY_GLOBAL_TABLES_VERSION - 1).is_open(g));
+        assert!(at(LEGACY_GLOBAL_TABLES_VERSION).is_open(g));
+        // The earlier gates stay open below it: they are distinct gates.
+        assert!(at(LEGACY_GLOBAL_TABLES_VERSION - 1).is_open(Gate::MrecReplicaOverrides));
+        let convert = MetaCommand::ConvertTableToLegacyGlobal {
+            table: "t".into(),
+            local_region: "r".into(),
+            region_id: 1,
+            created_ms: 0,
+        };
+        let settings = MetaCommand::SetLegacyGlobalSettings {
+            table: "t".into(),
+            billing: GlobalBilling::PayPerRequest,
+            stamp: 1,
+            origin: 1,
+        };
+        assert_eq!(convert.required_gate(), g);
+        assert_eq!(settings.required_gate(), g);
     }
 
     fn registered(meta: &mut Metadata, n: u64) {

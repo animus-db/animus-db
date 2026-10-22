@@ -31,6 +31,7 @@ mod learner_corpus;
 mod learner_membership;
 mod learner_promotion_leader_crash;
 mod learner_promotion_pending_check;
+mod legacy_global_apply;
 mod membership_commit_gate;
 mod metadata_watch;
 mod metrics;

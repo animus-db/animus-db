@@ -287,6 +287,51 @@ pub enum MrecControl {
         stamp: u64,
         origin: u32,
     },
+    /// **Legacy (2017.11.29) global table membership** (ADR 0075's
+    /// 2026-10-21 amendment): the sender's `CreateGlobalTable` /
+    /// `UpdateGlobalTable` names the receiving cluster's Region. Unlike
+    /// [`CreateReplica`](Self::CreateReplica) it never creates a table: the
+    /// receiver verifies that `table` already exists with the shape of the
+    /// `create_table` body, is `ACTIVE`, is empty, has a `NEW_AND_OLD_IMAGES`
+    /// stream and the same provisioned write capacity (`write_units`, `None` =
+    /// `PAY_PER_REQUEST`), and that it is not already part of another global
+    /// table. With `verify_only` it stops there (answers `Done` and changes
+    /// nothing: the sender's synchronous pre-check); otherwise it then joins
+    /// the replica set exactly as `CreateReplica` does, as a legacy global
+    /// table created at `created_ms`. A failed verification is
+    /// `Refused { retryable: false }` (a transient one `retryable: true`).
+    /// Refused retryably while the receiving cluster's
+    /// `Gate::LegacyGlobalTables` is closed. Class G with the rest of the
+    /// frame; an older binary fails to decode the variant.
+    LegacyReplica {
+        create_table: String,
+        ttl_attribute: Option<String>,
+        peers: Vec<String>,
+        write_units: Option<u64>,
+        created_ms: u64,
+        verify_only: bool,
+    },
+    /// The sender's record of the legacy global table's billing mode and
+    /// write capacity (`write_units`: `None` = `PAY_PER_REQUEST`): the
+    /// receiver applies it iff it is newer than its own by `(stamp, origin)`
+    /// (last-writer-wins) and acknowledges `Done` either way. Refused
+    /// retryably while its `Gate::LegacyGlobalTables` is closed or the table
+    /// is not (yet) a legacy global table there. Class G with the rest of the
+    /// frame.
+    SetLegacySettings {
+        write_units: Option<u64>,
+        stamp: u64,
+        origin: u32,
+    },
+    /// `region` leaves the legacy global table (the sender's
+    /// `UpdateGlobalTable` `Delete`): the receiver marks it `Deleting`, and if
+    /// `region` is the receiver's own Region it leaves the whole group (every
+    /// remote replica becomes `Deleting` and the table stays behind as a
+    /// regular table). Idempotent; acknowledged `Done` when the table is not a
+    /// legacy global table here. Refused retryably while the receiving
+    /// cluster's `Gate::LegacyGlobalTables` is closed. Class G with the rest
+    /// of the frame.
+    LegacyRemovePeer { region: String },
 }
 
 /// The receiver's per-record verdict (same order as the request's `records`).
@@ -1202,6 +1247,12 @@ pub fn is_relayable_command(command: &MetaCommand) -> bool {
         // `UpdateTable` `ReplicaUpdates`); the receiver re-checks
         // `Gate::MrecReplicaOverrides`.
         | MetaCommand::SetMrecReplicaOverrides { .. }
+        // The legacy 2017.11.29 API (ADR 0075's 2026-10-21 amendment): the
+        // same catalog class and relay reason (a follower-connected
+        // `CreateGlobalTable` / `UpdateGlobalTableSettings`); the receiver
+        // re-checks `Gate::LegacyGlobalTables`.
+        | MetaCommand::ConvertTableToLegacyGlobal { .. }
+        | MetaCommand::SetLegacyGlobalSettings { .. }
         // Resource tagging (roadmap W-06): schema-catalog class, same relay
         // reason as `SetTableTtl` — a follower-connected `TagResource`/
         // `UntagResource` must reach the control leader.
@@ -1932,6 +1983,7 @@ mod tests {
                     witness: None,
                     preferred_leader_region: "a".to_string(),
                     replicas: Vec::new(),
+                    legacy: None,
                 },
             },
             MetaCommand::SetGlobalPreferredLeader {
@@ -1965,6 +2017,18 @@ mod tests {
                 table: table.clone(),
                 region: "eu".to_string(),
                 overrides: Default::default(),
+            },
+            MetaCommand::ConvertTableToLegacyGlobal {
+                table: table.clone(),
+                local_region: "eu".to_string(),
+                region_id: animus_control::mrec_region_id("eu"),
+                created_ms: 1,
+            },
+            MetaCommand::SetLegacyGlobalSettings {
+                table: table.clone(),
+                billing: animus_control::GlobalBilling::PayPerRequest,
+                stamp: 1,
+                origin: 1,
             },
             MetaCommand::TagResource {
                 table: table.clone(),

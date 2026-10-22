@@ -131,6 +131,7 @@ fn convert_rejections_are_named() {
         witness: None,
         preferred_leader_region: "a".into(),
         replicas: Vec::new(),
+        legacy: None,
     };
     assert_eq!(
         strong.apply(&MetaCommand::ConvertTableToGlobal {
@@ -268,6 +269,7 @@ fn convert_to_global_refuses_an_eventual_spec_and_gates_it_by_content() {
             copied: Default::default(),
             overrides: Default::default(),
         }],
+        legacy: None,
     };
     let cmd = MetaCommand::ConvertTableToGlobal {
         table: "t".into(),
@@ -313,6 +315,7 @@ fn spec_validation_matrix() {
         witness: None,
         preferred_leader_region: String::new(),
         replicas,
+        legacy: None,
     };
     assert_eq!(spec(vec![ok("a", true)]).validate(), Ok(()));
     assert_eq!(spec(vec![ok("a", true), ok("b", false)]).validate(), Ok(()));
@@ -348,6 +351,7 @@ fn spec_validation_matrix() {
         witness: None,
         preferred_leader_region: "a".into(),
         replicas: vec![ok("a", true)],
+        legacy: None,
     };
     assert_eq!(strong.validate(), Err(GlobalSpecError::ModeFieldsMixed));
     strong.replicas.clear();

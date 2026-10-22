@@ -865,9 +865,29 @@ const MREC_LOOP_INTERVAL: Duration = Duration::from_millis(200);
     reason = "a concrete ClientCtx (E = ProdEnv) process-boundary background loop, same class as index_drain::change_consumer_loop; SimWorld drives mrec_ship_table directly"
 )]
 pub(crate) async fn mrec_ship_loop(ctx: ClientCtx) {
-    let mut client: Option<crate::mrec_peer::ProdPeerClient> = None;
+    let mut client: Option<std::sync::Arc<crate::mrec_peer::ProdPeerClient>> = None;
     loop {
         tokio::time::sleep(MREC_LOOP_INTERVAL).await;
+        if client.is_none() && ctx.mrec.enabled() {
+            match crate::mrec_peer::ProdPeerClient::new(
+                ctx.mrec.clone(),
+                ctx.tls.clone(),
+                ctx.mrec.node_tls.as_ref(),
+                ctx.edge.version().features.clone(),
+            ) {
+                Ok(c) => {
+                    let c = std::sync::Arc::new(c);
+                    // The wire edge's synchronous peer check (legacy global
+                    // tables, ADR 0075's 2026-10-21 amendment) shares it.
+                    ctx.mrec.edge_client.install(c.clone());
+                    client = Some(c);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "mrec shipper: cannot build the peer client");
+                    continue;
+                }
+            }
+        }
         let meta = ctx.effective_metadata();
         let tables: Vec<String> = meta
             .schemas
@@ -878,24 +898,10 @@ pub(crate) async fn mrec_ship_loop(ctx: ClientCtx) {
         if tables.is_empty() {
             continue;
         }
-        if client.is_none() {
-            match crate::mrec_peer::ProdPeerClient::new(
-                ctx.mrec.clone(),
-                ctx.tls.clone(),
-                ctx.mrec.node_tls.as_ref(),
-                ctx.edge.version().features.clone(),
-            ) {
-                Ok(c) => client = Some(c),
-                Err(e) => {
-                    tracing::warn!(error = %e, "mrec shipper: cannot build the peer client");
-                    continue;
-                }
-            }
-        }
         let Some(c) = client.as_ref() else { continue };
         for t in &tables {
-            let _ = crate::mrec_saga::mrec_saga_table(&ctx, t, c).await;
-            let _ = mrec_ship_table(&ctx, t, c).await;
+            let _ = crate::mrec_saga::mrec_saga_table(&ctx, t, c.as_ref()).await;
+            let _ = mrec_ship_table(&ctx, t, c.as_ref()).await;
         }
     }
 }

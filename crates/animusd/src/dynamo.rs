@@ -795,17 +795,18 @@ fn error_status(err: &WireError) -> u16 {
 /// entry, not a data op) — `ListTagsOfResource`, a pure read, does not,
 /// exactly like `DescribeTimeToLive`/`DescribeContinuousBackups`.
 fn is_ddl_mutation(op: &Operation) -> bool {
-    matches!(
-        op,
-        Operation::CreateTable { .. }
-            | Operation::UpdateTable { .. }
-            | Operation::UpdateTableGlobal { .. }
-            | Operation::DeleteTable { .. }
-            | Operation::UpdateTimeToLive { .. }
-            | Operation::UpdateContinuousBackups { .. }
-            | Operation::TagResource { .. }
-            | Operation::UntagResource { .. }
-    )
+    matches!(op, Operation::LegacyGlobal(l) if !l.is_read())
+        || matches!(
+            op,
+            Operation::CreateTable { .. }
+                | Operation::UpdateTable { .. }
+                | Operation::UpdateTableGlobal { .. }
+                | Operation::DeleteTable { .. }
+                | Operation::UpdateTimeToLive { .. }
+                | Operation::UpdateContinuousBackups { .. }
+                | Operation::TagResource { .. }
+                | Operation::UntagResource { .. }
+        )
 }
 
 /// Reject `table` when it names the reserved internal
@@ -921,6 +922,9 @@ async fn run_operation(
         Operation::UpdateTableGlobal { table, update } => {
             crate::global_tables::update_table_global(ctx, &table, update).await
         }
+        // ADR 0075's 2026-10-21 amendment: the legacy (2017.11.29) global
+        // tables operations, gate first.
+        Operation::LegacyGlobal(op) => crate::legacy_global::execute(ctx, op).await,
         Operation::DescribeTable { table } => describe_table(ctx, meta, &table),
         Operation::DeleteTable { table } => delete_table(ctx, &table).await,
         Operation::ListTables {
@@ -2058,6 +2062,7 @@ async fn dispatch_table_op<E: Env, R: RelayClient>(
         Operation::UpdateTableGlobal { table, update } => {
             crate::global_tables::update_table_global(ctx, &table, update).await
         }
+        Operation::LegacyGlobal(op) => crate::legacy_global::execute(ctx, op).await,
         // ADR 0061 rung D3 PR 2b + rung G (C-07 PR 2) + rung J (C-10 PR 2):
         // the throughput-only, stream-only, and (since rung J) index-change
         // shapes of `UpdateTable` are all covered now — see `update_table`'s
@@ -2181,6 +2186,7 @@ pub(crate) async fn execute_item_op_as<E: Env, R: RelayClient>(
                     | Operation::DescribeTable { .. }
                     | Operation::UpdateTable { .. }
                     | Operation::UpdateTableGlobal { .. }
+                    | Operation::LegacyGlobal(_)
             ) {
                 dispatch_table_op(ctx, meta, op).await
             } else {
@@ -4785,6 +4791,18 @@ async fn update_table_throughput<E: Env, R: RelayClient>(
     table: &str,
     spec: Option<animus_control::ProvisionedThroughput>,
 ) -> Result<(), WireError> {
+    // ADR 0075's 2026-10-21 amendment: a legacy (2017.11.29) global table's
+    // billing mode and write capacity are one replicated setting.
+    if metadata_fresh(ctx)
+        .await
+        .table_global(table)
+        .is_some_and(|g| g.is_legacy())
+    {
+        return Err(WireError::validation(format!(
+            "UpdateTable: table `{table}` is a legacy (version 2017.11.29) global table; change \
+             its billing mode and write capacity with UpdateGlobalTableSettings"
+        )));
+    }
     let deadline = ctx.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
     loop {
         ctx.propose_schema(&MetaCommand::SetTableThroughput {

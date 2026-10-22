@@ -40,7 +40,7 @@ use super::sim_world_mrec_tests::{A, B, LAT, TABLE, handler, open_mrec_gate, pol
 /// Finalize the cluster from the MREC gate's version (3, `open_mrec_gate`) up
 /// to this binary's `MAX_SUPPORTED` through the real admin path, one step at a
 /// time, so `Gate::MrecReplicaOverrides` is open.
-fn open_overrides_gate(c: &mut SimCluster, seed: u64) {
+pub(crate) fn open_overrides_gate(c: &mut SimCluster, seed: u64) {
     let n = c.node_count() as u64;
     c.set_all_node_versions(Some(VersionRange::new(1, MAX_SUPPORTED)));
     poll(c, "every node's full-range version record", seed, |c| {

@@ -930,3 +930,11 @@ assertion.
 `wire::decode_request` (every operation, and through it the private Update/Condition/Projection/KeyCondition expression parsers), `streams_wire`, `partiql::parse_statement`/`lower_*` and `sigv4::parse_credential`/`verify` are fuzz targets (`dynamo_request`, `dynamo_expressions`, `partiql`, `http_sigv4`). A new operation or expression form needs a seed in `fuzz/seeds/`; a decoder that panics on any input is a bug, not a precondition. See `fuzz/README.md` (stable smoke: `cd fuzz && cargo test --release --test smoke`).
 
 - `SchemaRegistry::sync_indexes` also refreshes the key schema of an already-registered table (a drop + re-create may change it); see `docs/lessons/code-patterns/2026-10-10-a-reconcile-from-the-catalog-must-reconcile-every-field.md`.
+
+- `legacy_global` (ADR 0075's 2026-10-21 legacy-API amendment): `decode_legacy_global` decodes the six 2017.11.29
+  operations into `LegacyGlobalOp` (`Operation::LegacyGlobal`), the exception-type constructors the AWS model lists
+  (`global_table_not_found`, `replica_already_exists`, ...) and the response bodies (`global_table_body`,
+  `list_body`, `settings_body`). Auto scaling (except `{AutoScalingDisabled:true}`), `ReplicaTableClass` and
+  per-GSI write capacity are refused naming the missing feature. `GlobalTableDescription.legacy` makes
+  `apply_to` report `GlobalTableVersion` 2017.11.29 and no `MultiRegionConsistency`. Every new operation form
+  needs a `fuzz/seeds/dynamo_request/` seed (the four new ones are there).

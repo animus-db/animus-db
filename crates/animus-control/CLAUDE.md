@@ -3466,3 +3466,18 @@ A new variant must pick a class. Test: `tests/it/transport_class.rs`.
   matrix, relay list in `animus-node`. Fixture: `metadata/v1-mrec-overrides.json`. New
   `MrecReplica { .. }` literals need `overrides: Default::default()`.
 
+## `Gate::LegacyGlobalTables`, `MAX_SUPPORTED = 9` (ADR 0075's 2026-10-21 legacy-API amendment)
+
+- `GlobalTableSpec.legacy: Option<LegacyGlobal { created_ms, billing, stamp, origin }>` marks an MREC
+  table as a legacy (2017.11.29) global table (skipped while `None`; MRSC + legacy is
+  `ModeFieldsMixed`; `GlobalBilling` is `PayPerRequest` / `Provisioned { write_units }`).
+  New `GlobalTableSpec { .. }` literals need `legacy: None`.
+- `MetaCommand::ConvertTableToLegacyGlobal { table, local_region, region_id, created_ms }`:
+  idempotent (`NoOp` if already legacy-local), adopts a standalone single-replica MREC table,
+  otherwise rejects "table is already a global table". `SetLegacyGlobalSettings { table, billing,
+  stamp, origin }` is last-writer-wins by `(stamp, origin)` and sets `schema.throughput`
+  (`PayPerRequest` -> `None`; `Provisioned` keeps the read units, else uses the write units).
+  `RemoveMrecReplica` clears `schema.global` when a legacy spec is left with one replica.
+- The gate number is `version::LEGACY_GLOBAL_TABLES_VERSION` (9). Rows: `required_gate`, mirror
+  (schema-only arms), `sim_versions` content gate and matrix (a `Release(9)` column), relay list in
+  `animus-node`. Fixture: `metadata/v1-legacy-global.json`. Tests: `tests/it/legacy_global_apply.rs`.
