@@ -128,9 +128,13 @@ pub enum WitnessAction {
         /// The witness `RegionName`.
         region: String,
     },
-    /// `Delete{RegionName}`: a witness cannot be removed from an MRSC table
-    /// (rejected).
-    Delete,
+    /// `Delete{RegionName}`: valid only as the witness half of removing two
+    /// Regions from an MRSC table ([`GlobalTableUpdate::validate_revert`]).
+    /// `region` is the `RegionName` when the request carried one.
+    Delete {
+        /// The `RegionName`, if present.
+        region: Option<String>,
+    },
 }
 
 /// What an `UpdateTable` carrying any of `ReplicaUpdates`,
@@ -292,7 +296,14 @@ fn decode_witness_actions(value: &Value) -> Result<Vec<WitnessAction>, String> {
                 let region = region_name(create, "`GlobalTableWitnessUpdates` `Create`")?;
                 out.push(WitnessAction::Create { region });
             }
-            ["Delete"] => out.push(WitnessAction::Delete),
+            ["Delete"] => {
+                let region = element["Delete"]
+                    .as_object()
+                    .and_then(|d| d.get("RegionName"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                out.push(WitnessAction::Delete { region });
+            }
             _ => {
                 return Err(
                     "each `GlobalTableWitnessUpdates` element must have exactly one of `Create` \
@@ -397,7 +408,7 @@ impl GlobalTableUpdate {
         if self
             .witness_actions
             .iter()
-            .any(|a| matches!(a, WitnessAction::Delete))
+            .any(|a| matches!(a, WitnessAction::Delete { .. }))
         {
             return Err(WireError::validation(
                 "UpdateTable: GlobalTableWitnessUpdates Delete is not supported: the \
@@ -457,7 +468,7 @@ impl GlobalTableUpdate {
         for action in &self.witness_actions {
             match action {
                 WitnessAction::Create { region } => witnesses.push(region.clone()),
-                WitnessAction::Delete => {
+                WitnessAction::Delete { .. } => {
                     return Err(WireError::validation(
                         "UpdateTable: GlobalTableWitnessUpdates Delete is not supported: the \
                          witness of a multi-Region strongly consistent table cannot be removed",
@@ -511,6 +522,15 @@ impl GlobalTableUpdate {
     }
 }
 
+/// What a *valid* MRSC replica-removal request asks for (ADR 0075's
+/// 2026-10-21 amendment): the one Region that remains, which becomes the
+/// regular single-Region table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevertRequest {
+    /// The Region that is not deleted.
+    pub keep_region: String,
+}
+
 /// What a *valid* MREC replica request asks for, before the
 /// cluster-dependent checks: the peers to add, or the peers to remove (never
 /// both in one call).
@@ -523,6 +543,158 @@ pub struct MrecRequest {
 }
 
 impl GlobalTableUpdate {
+    /// Whether the request carries any `Delete` (replica or witness): on an
+    /// MRSC table that is the replica-removal path
+    /// ([`validate_revert`](Self::validate_revert)).
+    #[must_use]
+    pub fn has_deletes(&self) -> bool {
+        self.replica_actions
+            .iter()
+            .any(|a| matches!(a, ReplicaAction::Delete { .. }))
+            || self
+                .witness_actions
+                .iter()
+                .any(|a| matches!(a, WitnessAction::Delete { .. }))
+    }
+
+    /// Apply the request-shape rules of removing Regions from an MRSC table
+    /// with Regions `regions` (the full replicas and the witness, as recorded)
+    /// and optional `witness` (ADR 0075's 2026-10-21 amendment; AWS: "You
+    /// cannot delete a single replica or a witness from a MRSC global table.
+    /// You can delete two replicas or delete one replica and a witness ...,
+    /// converting the remaining replica to a single-Region DynamoDB table").
+    /// Exactly two of the table's three Regions must be named, the remaining
+    /// one must be a replica (not the witness), and nothing else may be in
+    /// the request.
+    ///
+    /// # Errors
+    /// A named `ValidationException`.
+    pub fn validate_revert(
+        &self,
+        regions: &[String],
+        witness: Option<&str>,
+    ) -> Result<RevertRequest, WireError> {
+        if let Some(e) = &self.shape_error {
+            return Err(WireError::validation(format!("UpdateTable: {e}")));
+        }
+        if let Some(e) = &self.conflicting_change {
+            return Err(WireError::validation(e.clone()));
+        }
+        if self.consistency.is_some() {
+            return Err(WireError::validation(
+                "UpdateTable: MultiRegionConsistency is only valid when ReplicaUpdates Create \
+                 actions are specified",
+            ));
+        }
+        let mut deleted: Vec<String> = Vec::new();
+        let mut witness_deleted = false;
+        for action in &self.replica_actions {
+            match action {
+                ReplicaAction::Create { .. } => {
+                    return Err(WireError::validation(
+                        "UpdateTable: ReplicaUpdates cannot mix Create and Delete actions in one \
+                         call, and replicas cannot be added to an existing multi-Region strongly \
+                         consistent table",
+                    ));
+                }
+                ReplicaAction::Update => {
+                    return Err(WireError::validation(
+                        "UpdateTable: ReplicaUpdates Update is not supported (no per-replica \
+                         setting can be overridden)",
+                    ));
+                }
+                ReplicaAction::Delete { region } => {
+                    if region.is_empty() {
+                        return Err(WireError::validation(
+                            "UpdateTable: RegionName must not be empty",
+                        ));
+                    }
+                    if witness == Some(region.as_str()) {
+                        return Err(WireError::validation(format!(
+                            "UpdateTable: Region `{region}` is the witness of this table; remove \
+                             it with GlobalTableWitnessUpdates Delete, not ReplicaUpdates Delete"
+                        )));
+                    }
+                    if !regions.contains(region) {
+                        return Err(WireError::validation(format!(
+                            "UpdateTable: Region `{region}` is not a replica Region of this \
+                             table (its Regions are: {})",
+                            regions.join(", ")
+                        )));
+                    }
+                    if deleted.contains(region) {
+                        return Err(WireError::validation(format!(
+                            "UpdateTable: Region `{region}` is named more than once"
+                        )));
+                    }
+                    deleted.push(region.clone());
+                }
+            }
+        }
+        for action in &self.witness_actions {
+            match action {
+                WitnessAction::Create { .. } => {
+                    return Err(WireError::validation(
+                        "UpdateTable: GlobalTableWitnessUpdates cannot mix Create and Delete \
+                         actions, and a witness cannot be added to an existing multi-Region \
+                         strongly consistent table",
+                    ));
+                }
+                WitnessAction::Delete { region } => {
+                    let Some(w) = witness else {
+                        return Err(WireError::validation(
+                            "UpdateTable: GlobalTableWitnessUpdates Delete: this table has no \
+                             witness",
+                        ));
+                    };
+                    if witness_deleted {
+                        return Err(WireError::validation(
+                            "UpdateTable: the witness is named more than once",
+                        ));
+                    }
+                    if let Some(r) = region
+                        && r != w
+                    {
+                        return Err(WireError::validation(format!(
+                            "UpdateTable: Region `{r}` is not the witness of this table (the \
+                             witness is `{w}`)"
+                        )));
+                    }
+                    witness_deleted = true;
+                    deleted.push(w.to_owned());
+                }
+            }
+        }
+        match deleted.len() {
+            0 => Err(WireError::validation(
+                "UpdateTable: no Region to delete named",
+            )),
+            1 => Err(WireError::validation(
+                "UpdateTable: a single replica or the witness cannot be deleted from a \
+                 multi-Region strongly consistent table; delete two replicas, or one replica \
+                 and the witness, which converts the remaining replica to a single-Region table",
+            )),
+            2 => {
+                let mut left = regions.iter().filter(|r| !deleted.contains(r));
+                let keep = left.next().cloned();
+                match keep {
+                    Some(k) if left.next().is_none() && witness != Some(k.as_str()) => {
+                        Ok(RevertRequest { keep_region: k })
+                    }
+                    _ => Err(WireError::validation(
+                        "UpdateTable: the Region that remains must be a replica, not the \
+                         witness: on a table with a witness, delete the witness and one replica",
+                    )),
+                }
+            }
+            _ => Err(WireError::validation(
+                "UpdateTable: all Regions of a multi-Region strongly consistent table cannot be \
+                 deleted; delete two replicas, or one replica and the witness, and keep one \
+                 replica",
+            )),
+        }
+    }
+
     /// Whether this request is shaped for the MREC path: the consistency is
     /// absent or `EVENTUAL` (the AWS default). `STRONG` and unknown values
     /// stay on the MRSC path ([`validate`](Self::validate)).
@@ -861,6 +1033,112 @@ mod tests {
         assert!(
             msg.contains("GlobalTableWitnessUpdates Delete is not supported"),
             "{msg}"
+        );
+    }
+
+    fn del(region: &str) -> Value {
+        json!({"Delete": {"RegionName": region}})
+    }
+
+    /// The AWS-documented MRSC replica-removal matrix (ADR 0075, 2026-10-21):
+    /// exactly two of the three Regions, the remaining one a replica.
+    #[test]
+    fn revert_matrix_on_a_three_replica_table() {
+        let regions: Vec<String> = ["a", "b", "c"].map(str::to_owned).to_vec();
+        let revert = |body: Value| update_of(&body).validate_revert(&regions, None);
+        let ok = |reps: Vec<Value>| {
+            revert(json!({"TableName":"tbl","ReplicaUpdates":reps}))
+                .unwrap()
+                .keep_region
+        };
+        assert_eq!(ok(vec![del("b"), del("c")]), "a");
+        assert_eq!(ok(vec![del("c"), del("a")]), "b");
+        assert_eq!(ok(vec![del("a"), del("b")]), "c");
+        let err = |body: Value| revert(body).expect_err("rejected").message;
+        // A single replica.
+        let m = err(json!({"TableName":"tbl","ReplicaUpdates":[del("b")]}));
+        assert!(
+            m.contains("single replica or the witness cannot be deleted"),
+            "{m}"
+        );
+        // All three.
+        let m = err(json!({"TableName":"tbl","ReplicaUpdates":[del("a"), del("b"), del("c")]}));
+        assert!(m.contains("all Regions"), "{m}");
+        // Unknown Region.
+        let m = err(json!({"TableName":"tbl","ReplicaUpdates":[del("b"), del("zz")]}));
+        assert!(m.contains("`zz` is not a replica Region"), "{m}");
+        // Duplicate.
+        let m = err(json!({"TableName":"tbl","ReplicaUpdates":[del("b"), del("b")]}));
+        assert!(m.contains("more than once"), "{m}");
+        // Create mixed with Delete.
+        let m = err(json!({"TableName":"tbl","ReplicaUpdates":[del("b"), create("d")]}));
+        assert!(m.contains("cannot mix Create and Delete"), "{m}");
+        let m = err(
+            json!({"TableName":"tbl","ReplicaUpdates":[del("b"), del("c")],
+            "GlobalTableWitnessUpdates":[create("d")]}),
+        );
+        assert!(m.contains("cannot mix Create and Delete"), "{m}");
+        // A witness Delete on a table that has none.
+        let m = err(json!({"TableName":"tbl","ReplicaUpdates":[del("b")],
+            "GlobalTableWitnessUpdates":[{"Delete":{"RegionName":"c"}}]}));
+        assert!(m.contains("has no witness"), "{m}");
+        // MultiRegionConsistency only goes with Create.
+        let m = err(json!({"TableName":"tbl","MultiRegionConsistency":"STRONG",
+            "ReplicaUpdates":[del("b"), del("c")]}));
+        assert!(m.contains("only valid when ReplicaUpdates Create"), "{m}");
+        // Update is refused by name.
+        let m = err(json!({"TableName":"tbl","ReplicaUpdates":[{"Update":{"RegionName":"b"}}]}));
+        assert!(m.contains("Update is not supported"), "{m}");
+    }
+
+    #[test]
+    fn revert_matrix_on_a_witness_table() {
+        // a, b replicas; c witness.
+        let regions: Vec<String> = ["a", "b", "c"].map(str::to_owned).to_vec();
+        let revert = |body: Value| update_of(&body).validate_revert(&regions, Some("c"));
+        // One replica + the witness: the other replica remains.
+        for wdel in [json!({"Delete":{"RegionName":"c"}}), json!({"Delete":{}})] {
+            let r = revert(json!({"TableName":"tbl","ReplicaUpdates":[del("b")],
+                "GlobalTableWitnessUpdates":[wdel]}))
+            .unwrap();
+            assert_eq!(r.keep_region, "a");
+        }
+        let err = |body: Value| revert(body).expect_err("rejected").message;
+        // Two replicas would leave the witness.
+        let m = err(json!({"TableName":"tbl","ReplicaUpdates":[del("a"), del("b")]}));
+        assert!(m.contains("must be a replica, not the witness"), "{m}");
+        // A lone witness Delete.
+        let m = err(
+            json!({"TableName":"tbl","GlobalTableWitnessUpdates":[{"Delete":{"RegionName":"c"}}]}),
+        );
+        assert!(
+            m.contains("single replica or the witness cannot be deleted"),
+            "{m}"
+        );
+        // The witness named as a replica.
+        let m = err(json!({"TableName":"tbl","ReplicaUpdates":[del("a"), del("c")]}));
+        assert!(m.contains("is the witness of this table"), "{m}");
+        // A witness Delete naming the wrong Region.
+        let m = err(json!({"TableName":"tbl","ReplicaUpdates":[del("b")],
+            "GlobalTableWitnessUpdates":[{"Delete":{"RegionName":"a"}}]}));
+        assert!(m.contains("is not the witness"), "{m}");
+        // Everything.
+        let m = err(
+            json!({"TableName":"tbl","ReplicaUpdates":[del("a"), del("b")],
+            "GlobalTableWitnessUpdates":[{"Delete":{"RegionName":"c"}}]}),
+        );
+        assert!(m.contains("all Regions"), "{m}");
+    }
+
+    #[test]
+    fn has_deletes_sees_both_kinds() {
+        assert!(update_of(&json!({"TableName":"tbl","ReplicaUpdates":[del("b")]})).has_deletes());
+        assert!(
+            update_of(&json!({"TableName":"tbl","GlobalTableWitnessUpdates":[{"Delete":{}}]}))
+                .has_deletes()
+        );
+        assert!(
+            !update_of(&json!({"TableName":"tbl","ReplicaUpdates":[create("b")]})).has_deletes()
         );
     }
 

@@ -3365,6 +3365,10 @@ the only wake). The same pass calls `RaftKvNode::set_witness`, which makes
 `tests/it/preferred_leader_corpus.rs`, `ANIMUS_MRSC_SEEDS`. Known: quiescence does not
 settle on links with RTT above the heartbeat interval (issue #1226), so the quiescence
 cell runs on 1 ms links.
+When an MRSC table reverts to a regional one (`MetaCommand::RevertGlobalToRegional`, ADR 0075's
+2026-10-21 amendment) its tablets simply drop out of `preferred_leader` (derived from
+`schema.global`): the step's no-preference branch clears `set_witness` and forgets the
+group's stability/transfer state; nothing else in this crate changes.
 
 ## Fuzzing (roadmap R-01 (c))
 

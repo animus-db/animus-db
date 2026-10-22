@@ -37,7 +37,7 @@ use crate::meta::Metadata;
 pub type ClusterVersion = u32;
 
 /// The highest cluster version this binary can run at.
-pub const MAX_SUPPORTED: ClusterVersion = 6;
+pub const MAX_SUPPORTED: ClusterVersion = 7;
 
 /// The lowest cluster version this binary can run at.
 ///
@@ -229,6 +229,13 @@ pub enum Gate {
     /// replica rejects the longer frame), so the encoder emits v2 only once
     /// the gate is open and the leader ignores the field while it is closed.
     FollowerAppliedIndex,
+    /// **MRSC replica removal** (ADR 0075's 2026-10-21 amendment): the sixth
+    /// real version gate, opening at cluster version 7. Guards
+    /// `MetaCommand::RevertGlobalToRegional` (an older voter cannot decode the
+    /// variant) and, with it, the client acceptance of the AWS-documented
+    /// `UpdateTable` that deletes two Regions of a multi-Region strongly
+    /// consistent table (two replicas, or one replica and the witness).
+    MrscReplicaRemoval,
     /// A **synthetic** version gate `n` (test/sim builds only): opens at
     /// cluster version `n`, ranks `n`. It exists so the gate *ladder*
     /// (several version gates, each opening at its own finalize) can be
@@ -255,6 +262,7 @@ impl Gate {
         Gate::TxnSealChecked,
         Gate::NodeCapacity,
         Gate::FollowerAppliedIndex,
+        Gate::MrscReplicaRemoval,
     ];
 
     /// The cluster version at which this gate opens, or `None` for a gate
@@ -276,6 +284,8 @@ impl Gate {
             Gate::NodeCapacity => Some(5),
             // ADR 0080 (issue #1330): the fifth real version gate.
             Gate::FollowerAppliedIndex => Some(6),
+            // ADR 0075 (2026-10-21 amendment): the sixth real version gate.
+            Gate::MrscReplicaRemoval => Some(7),
             #[cfg(any(test, feature = "sim-versions"))]
             Gate::Synthetic(n) => Some(n),
         }
@@ -295,6 +305,7 @@ impl Gate {
             Gate::TxnSealChecked => 4,
             Gate::NodeCapacity => 5,
             Gate::FollowerAppliedIndex => 6,
+            Gate::MrscReplicaRemoval => 7,
             #[cfg(any(test, feature = "sim-versions"))]
             Gate::Synthetic(n) => {
                 if n > 1 {
@@ -576,6 +587,8 @@ mod tests {
                 Gate::NodeCapacity => Some(5),
                 // ADR 0080 (issue #1330): the fifth.
                 Gate::FollowerAppliedIndex => Some(6),
+                // ADR 0075 (2026-10-21): the sixth.
+                Gate::MrscReplicaRemoval => Some(7),
                 // Never in `ALL` (parametric, test/sim only): see the ladder test.
                 Gate::Synthetic(_) => unreachable!("synthetic gates are not in Gate::ALL"),
             };
@@ -612,9 +625,14 @@ mod tests {
             Gate::NodeCapacity.join(Gate::FollowerAppliedIndex),
             Gate::FollowerAppliedIndex
         );
+        assert!(seen.contains(&Gate::MrscReplicaRemoval));
         assert_eq!(
-            MAX_SUPPORTED, 6,
-            "the follower applied-index gate (ADR 0080, #1330) is the release that takes MAX to 6"
+            Gate::FollowerAppliedIndex.join(Gate::MrscReplicaRemoval),
+            Gate::MrscReplicaRemoval
+        );
+        assert_eq!(
+            MAX_SUPPORTED, 7,
+            "the MRSC replica-removal gate (ADR 0075, 2026-10-21) is the release that takes MAX to 7"
         );
         assert_eq!(MIN_SUPPORTED, 1);
         // Declaration order is opening order: ranks are non-decreasing.

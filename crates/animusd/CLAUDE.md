@@ -12625,6 +12625,20 @@ node bucket; the operator exposes only the explicit `spec.background.compactionI
 
 **Dashboard/console skin (2026-10-18):** both apps follow the shared tokens (Archivo UI, `--font-display` 75%/800 uppercase headings, accent-filled primary buttons, outlined quiet status pills, no black blocks). Archivo is embedded as base64 in `fonts.css` (`fonts/archivo-latin.woff2`); Work Sans was dropped. See `docs/lessons/general/2026-10-18-app-skin-follows-shared-tokens-and-fonts-are-base64.md`.
 
+## MRSC replica removal (ADR 0075 amendment 2026-10-21, `Gate::MrscReplicaRemoval`)
+
+`global_tables::update_table_global` routes an `UpdateTable` carrying any `Delete` on an MRSC
+table to `revert_table_global` (AWS: delete two replicas, or one replica plus the witness, which
+converts the remaining replica to a single-Region table): `GlobalTableUpdate::validate_revert`,
+the gate check (closed gate answers with the old `ReplicaUpdates Delete is not supported` text),
+one `MetaCommand::RevertGlobalToRegional`, then a poll until `schema.global` is gone (a racing
+request that kept another Region is detected from `Metadata::table_pinned_region`). Everything
+else follows `schema.global`: `DescribeTable`/`/admin/global-tables`, `leader_preferences`
+(preferred-leader and witness flag), `drain_strands_region` and the TTL/transaction restrictions
+all stop applying at once; the replicas converge through ordinary repair. Cluster-tier cells:
+`sim_cluster_mrsc` `revert_*` (they boot at cluster version 7 via `Run::boot_at`; the old cells
+stay at version 2) and the gate cells in `sim_cluster_mixed_version_corpus`.
+
 **Sim regressions for a walk over a changing set (issue #1345):** hold the
 walk open with a partition on its first call and assert the window is open
 before healing; see

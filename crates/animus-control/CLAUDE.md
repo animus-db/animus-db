@@ -3444,3 +3444,17 @@ A new variant must pick a class. Test: `tests/it/transport_class.rs`.
   an echo of an overlapping re-offer, not a loss signal; resending on it
   multiplied every chunk ~9x (`handle_install_snapshot_resp`'s exact-repeat
   branch). Test: `install_snapshot::duplicate_install_snapshot_ack_does_not_resend_the_outstanding_chunk`.
+
+## `Gate::MrscReplicaRemoval`, `MAX_SUPPORTED = 7` (ADR 0075 / ADR 0073's 2026-10-21 amendments)
+
+- `MetaCommand::RevertGlobalToRegional { table, keep_region }` (gate version 7) is the inverse of
+  `ConvertTableToGlobal` for an MRSC table: clears `schema.global` and replaces each tablet's
+  pinned policy with `zone_spread_policy(RF = min(3, non-Leaving members of keep_region))` +
+  `allow_values(REGION_LABEL, [keep_region])`, **unpinned** so ordinary `reconcile_placement`
+  (`replan_repair`) does the movement. A table with no `global` is a `NoOp` (idempotent under
+  retries / leader change); rejections are state-based (MREC table, `keep_region` not a Region of
+  the table or the witness, no member in `keep_region`). `Metadata::table_pinned_region` reads
+  the single Region a table's policy is restricted to. New exhaustive-match sites touched:
+  `required_gate`, `mirror.rs` (schema entry + policies), the `sim_versions` by-content
+  `content_gate` row, `animus-node` relay allowlist. Tests: `tests/it/global_table_apply.rs`
+  (`revert_*`).
