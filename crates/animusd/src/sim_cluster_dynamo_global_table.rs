@@ -341,6 +341,9 @@ fn run_seed(seed: u64) {
             "glob1",
             r#""ReplicaUpdates":[{"Delete":{"RegionName":"r-c"}}]"#,
         ),
+        // The cluster is at version 2: `Gate::MrscReplicaRemoval` is closed, so
+        // the pre-amendment refusal stands byte for byte (the open-gate
+        // matrix is `sim_cluster_mrsc` `revert_*`).
         "Delete is not supported",
     );
     expect_validation(

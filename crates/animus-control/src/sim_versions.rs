@@ -193,6 +193,9 @@ pub fn content_gate(msg: &RaftMsg) -> Gate {
         | crate::MetaCommand::RegisterNode {
             capacity: Some(_), ..
         } => g.join(Gate::NodeCapacity),
+        // ADR 0075 (2026-10-21): what a Release(6) binary's strict decode
+        // cannot read (the variant), by content.
+        crate::MetaCommand::RevertGlobalToRegional { .. } => g.join(Gate::MrscReplicaRemoval),
         _ => g,
     })
 }
@@ -288,20 +291,24 @@ mod tests {
                 BinaryProfile::Release(4),
                 BinaryProfile::Release(5),
                 BinaryProfile::Release(6),
+                BinaryProfile::Release(7),
             ]
             .iter()
             .map(|p| p.accepts(g))
             .collect();
             let want = match g {
-                Gate::Base => [true, true, true, true, true, true, true],
-                Gate::Era => [false, true, true, true, true, true, true],
-                Gate::GlobalTables => [false, false, true, true, true, true, true],
-                Gate::MrecReplication => [false, false, false, true, true, true, true],
-                Gate::TxnSealChecked => [false, false, false, false, true, true, true],
-                Gate::NodeCapacity => [false, false, false, false, false, true, true],
-                Gate::FollowerAppliedIndex => [false, false, false, false, false, false, true],
-                Gate::Synthetic(2) => [false, false, true, true, true, true, true],
-                Gate::Synthetic(3) => [false, false, false, true, true, true, true],
+                Gate::Base => [true, true, true, true, true, true, true, true],
+                Gate::Era => [false, true, true, true, true, true, true, true],
+                Gate::GlobalTables => [false, false, true, true, true, true, true, true],
+                Gate::MrecReplication => [false, false, false, true, true, true, true, true],
+                Gate::TxnSealChecked => [false, false, false, false, true, true, true, true],
+                Gate::NodeCapacity => [false, false, false, false, false, true, true, true],
+                Gate::FollowerAppliedIndex => {
+                    [false, false, false, false, false, false, true, true]
+                }
+                Gate::MrscReplicaRemoval => [false, false, false, false, false, false, false, true],
+                Gate::Synthetic(2) => [false, false, true, true, true, true, true, true],
+                Gate::Synthetic(3) => [false, false, false, true, true, true, true, true],
                 Gate::Synthetic(_) => unreachable!(),
             };
             assert_eq!(row, want, "{g:?}");

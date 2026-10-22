@@ -3438,3 +3438,17 @@ A new variant must pick a class. Test: `tests/it/transport_class.rs`.
   silent or never-reporting voter does not move it. The data plane's `raftkv-wire` v2 is what carries
   the field on the wire (`animus-cp-data` `codec.rs`). New `AppendEntriesResp` construction sites need
   `applied_index: 0` (patterns want `..`). Pure tests: `tests/it/quorum_applied.rs`.
+
+## `Gate::MrscReplicaRemoval`, `MAX_SUPPORTED = 7` (ADR 0075 / ADR 0073's 2026-10-21 amendments)
+
+- `MetaCommand::RevertGlobalToRegional { table, keep_region }` (gate version 7) is the inverse of
+  `ConvertTableToGlobal` for an MRSC table: clears `schema.global` and replaces each tablet's
+  pinned policy with `zone_spread_policy(RF = min(3, non-Leaving members of keep_region))` +
+  `allow_values(REGION_LABEL, [keep_region])`, **unpinned** so ordinary `reconcile_placement`
+  (`replan_repair`) does the movement. A table with no `global` is a `NoOp` (idempotent under
+  retries / leader change); rejections are state-based (MREC table, `keep_region` not a Region of
+  the table or the witness, no member in `keep_region`). `Metadata::table_pinned_region` reads
+  the single Region a table's policy is restricted to. New exhaustive-match sites touched:
+  `required_gate`, `mirror.rs` (schema entry + policies), the `sim_versions` by-content
+  `content_gate` row, `animus-node` relay allowlist. Tests: `tests/it/global_table_apply.rs`
+  (`revert_*`).
