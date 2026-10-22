@@ -551,3 +551,51 @@ fn legacy_global_table_errors_are_the_modeled_exceptions() {
         );
     }
 }
+
+#[test]
+fn removing_two_regions_in_one_call_leaves_no_link_between_them() {
+    for seed in saga_seeds() {
+        let mut l = L::new(seed, [true; 3]);
+        for c in 0..3 {
+            l.stream(c, NEW_AND_OLD);
+        }
+        l.ok(A, "CreateGlobalTable", &create_gt(&["a", "b", "c"]));
+        l.until("the three-way group", |l| {
+            (0..3).all(|c| l.active(c, &REGIONS))
+        });
+        l.put(A, "k0", "v0");
+        l.until("k0 everywhere", |l| {
+            (0..3).all(|c| l.read(c, "k0").as_deref() == Some("v0"))
+        });
+
+        // One call removes both `b` and `c`; the clusters are partitioned
+        // while the removal is carried out, then healed.
+        l.ok(
+            A,
+            "UpdateGlobalTable",
+            &format!(
+                r#"{{"GlobalTableName":"{TABLE}","ReplicaUpdates":[{{"Delete":{{"RegionName":"b"}}}},{{"Delete":{{"RegionName":"c"}}}}]}}"#
+            ),
+        );
+        l.w.bridge().partition(A, B);
+        l.steps(3);
+        l.w.bridge().heal();
+        l.until("every cluster stopped being a global table", |l| {
+            (0..3).all(|c| l.group(c).is_empty())
+        });
+        l.steps(4);
+
+        // No replication link remains: a write in any Region stays there.
+        for (from, key) in [(B, "kb"), (C, "kc"), (A, "ka")] {
+            l.put(from, key, "x");
+            l.steps(8);
+            for other in (0..3).filter(|c| *c != from) {
+                assert_eq!(
+                    l.read(other, key),
+                    None,
+                    "seed={seed}: write {key} on {from} reached {other} after the removal"
+                );
+            }
+        }
+    }
+}

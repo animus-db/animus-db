@@ -594,14 +594,7 @@ pub(crate) async fn mrec_saga_table<E: Env, R: RelayClient>(
                 }
             }
             MrecReplicaStatus::Deleting => {
-                // A cluster whose every peer is `Deleting` is itself the one
-                // being removed (it dissolved on `LegacyRemovePeer`): it must
-                // not tell the others to drop *them*.
                 if spec.is_legacy()
-                    && spec
-                        .replicas
-                        .iter()
-                        .any(|r| !r.local && r.status != MrecReplicaStatus::Deleting)
                     && crate::legacy_global::notify_removal(
                         ctx,
                         client,
@@ -841,7 +834,7 @@ pub(crate) async fn handle_control<E: Env, R: RelayClient>(
                 .await
         }
         MrecControl::LegacyRemovePeer { region } => {
-            crate::legacy_global::remove_peer(ctx, table, &region).await
+            crate::legacy_global::remove_peer(ctx, from, table, &region).await
         }
     }
 }

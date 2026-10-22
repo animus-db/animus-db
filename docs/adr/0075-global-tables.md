@@ -1531,9 +1531,16 @@ would leave the third Region believing the removed one is still a member.
 Region (and the removed one) to drop it; the removed cluster marks all its
 peers `DELETING` and dissolves, and a legacy spec left with one replica clears
 `schema.global` (`RemoveMrecReplica` does this) so it is a regular table again.
-A cluster that is itself being removed (every peer `DELETING`) never sends
-`LegacyRemovePeer`: it would otherwise dissolve the others (a bug the SimWorld
-test found).
+Removing several Regions in one call works the same way: for each departing
+Region the initiator tells every other replica (survivors and the other
+departing Regions) first and the departing Region last, so every removed Region
+drops every other removed Region and no link remains between them. A cluster
+that is itself dissolving also sends `LegacyRemovePeer` to its former peers;
+the receiver ignores a `LegacyRemovePeer` from a sender that is `DELETING` or
+absent in its own spec, and the ordering guarantees the sender is already
+`DELETING` there (without this the dissolving cluster dissolved the others, a
+bug the SimWorld test found). The notification gives up on an unreachable
+Region after six failed passes.
 
 **Settings.** The replicated part is the billing mode and the write capacity:
 `MetaCommand::SetLegacyGlobalSettings` carries a last-writer-wins record
@@ -1621,7 +1628,7 @@ bodies, errors, the closed-gate text); `animus-control` `legacy_global_apply`
 `sim_versions` units including the acceptance-matrix row and `Release(9)`
 profile; `animus-node` new `client-frame/v1-mrec-control-legacy.bin`.
 Simulation: `sim_world_mrec_legacy_tests` (three clusters, seeded, >= 20
-seeds: a partition during `CreateGlobalTable` and another during the replica's
+seeds, including removing two Regions in one call under a partition: a partition during `CreateGlobalTable` and another during the replica's
 creation, writes in each Region, `UpdateGlobalTable` add and remove,
 Describe/List agreement, settings, and every error case above);
 `sim_cluster_dynamo_global_table` (the closed-gate refusal loop);

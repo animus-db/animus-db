@@ -76,7 +76,7 @@ use crate::mrec_saga::{
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(5);
 /// `LegacyRemovePeer` passes that may fail before the saga stops waiting for
 /// an unreachable Region (the ordinary `Leave` path gives up the same way).
-const REMOVE_ATTEMPTS: u32 = 3;
+const REMOVE_ATTEMPTS: u32 = 6;
 
 /// Whether `Gate::LegacyGlobalTables` is open (the emit-site check).
 pub(crate) fn legacy_gate_open<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> bool {
@@ -1024,6 +1024,7 @@ pub(crate) async fn set_settings_from_peer<E: Env, R: RelayClient>(
 /// Peer side of [`MrecControl::LegacyRemovePeer`].
 pub(crate) async fn remove_peer<E: Env, R: RelayClient>(
     ctx: &ClientCtx<E, R>,
+    from: &str,
     table: &str,
     region: &str,
 ) -> MrecApplyResponse {
@@ -1038,6 +1039,16 @@ pub(crate) async fn remove_peer<E: Env, R: RelayClient>(
     let Some(spec) = legacy_spec(&meta, table) else {
         return MrecApplyResponse::Done;
     };
+    // Only a member in good standing may remove someone: a Region that is
+    // itself leaving (or already gone) from this table's point of view is
+    // dissolving and must not take the others down with it.
+    if !spec
+        .replicas
+        .iter()
+        .any(|r| !r.local && r.region == from && r.status != MrecReplicaStatus::Deleting)
+    {
+        return MrecApplyResponse::Done;
+    }
     let leaving_self = spec.replicas.iter().any(|r| r.local && r.region == region);
     let targets: Vec<String> = spec
         .replicas
@@ -1151,14 +1162,27 @@ pub(crate) async fn notify_removal<E: Env, R: RelayClient>(
             (e.legacy_removed.clone(), e.legacy_remove_failures)
         })
     };
-    let pending: Vec<String> = spec
+    // Every other replica (survivors and other removed Regions alike) first;
+    // the departing Region last, and only once all the others acknowledged, so
+    // that when it dissolves and tells its former peers, each of them already
+    // has it marked `Deleting` and ignores that (see `remove_peer`).
+    let others: Vec<String> = spec
         .replicas
         .iter()
-        .filter(|r| !r.local)
-        .filter(|r| r.region == leaving || r.status != MrecReplicaStatus::Deleting)
+        .filter(|r| !r.local && r.region != leaving)
         .map(|r| r.region.clone())
         .filter(|r| !acked.contains(r))
         .collect();
+    let pending: Vec<String> = if others.is_empty() {
+        spec.replicas
+            .iter()
+            .filter(|r| !r.local && r.region == leaving)
+            .map(|r| r.region.clone())
+            .filter(|r| !acked.contains(r))
+            .collect()
+    } else {
+        others
+    };
     if pending.is_empty() || failures >= REMOVE_ATTEMPTS {
         return false;
     }

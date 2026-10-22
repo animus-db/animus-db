@@ -12654,8 +12654,9 @@ edge otherwise has no peer client; sim worlds call `cfg.edge_client.install(Arc:
 and `MrecConfig` struct literals need `edge_client: Default::default()`), 5 s per Region; unreachable is a
 retryable `InternalServerError` with nothing changed. Settings: `SetLegacyGlobalSettings` LWW record pushed
 by `push_settings` (`MrecControl::SetLegacySettings`); per-Region read capacity reuses the overrides.
-Removal: `LegacyRemovePeer` tells every remaining Region; a cluster whose every peer is `Deleting` is the
-one being removed and must not send it (it would dissolve the others). The saga promotes a replica to
+Removal: `LegacyRemovePeer` goes to every other replica first and the departing Region last; a receiver
+ignores it from a sender that is `Deleting`/absent in its spec (a dissolving cluster must not dissolve the others);
+removing several Regions in one call drops every link between them. The saga promotes a replica to
 `Active` only after `PeerHealth.create_acked` (an empty table's copy needs no peer contact). 2019 edges
 (`update_table_mrec`, `update_table_throughput`) refuse a legacy table. Sim test:
 `sim_world_mrec_legacy_tests` (three clusters; reuses `mesh_cfg` and `open_overrides_gate`).
