@@ -416,8 +416,8 @@ fn validation_errors_are_exact() {
     assert_eq!(st, 400, "{r}");
     assert_eq!(
         msg(&r),
-        "UpdateTable: ReplicaUpdates Create does not support `KMSMasterKeyId` (per-replica \
-         overrides are not supported)"
+        "UpdateTable: ReplicaUpdates Create does not support `KMSMasterKeyId`: server-side \
+         encryption (SSESpecification) is not supported, so there is no per-replica KMS key to set"
     );
     let (st, r) = s.call(A, "UpdateTable", &delete_body("b"));
     assert_eq!(st, 400, "{r}");

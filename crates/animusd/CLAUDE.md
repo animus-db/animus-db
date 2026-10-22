@@ -12636,8 +12636,23 @@ request that kept another Region is detected from `Metadata::table_pinned_region
 else follows `schema.global`: `DescribeTable`/`/admin/global-tables`, `leader_preferences`
 (preferred-leader and witness flag), `drain_strands_region` and the TTL/transaction restrictions
 all stop applying at once; the replicas converge through ordinary repair. Cluster-tier cells:
-`sim_cluster_mrsc` `revert_*` (they boot at cluster version 7 via `Run::boot_at`; the old cells
+`sim_cluster_mrsc` `revert_*` (they boot at cluster version 7 via `Run::boot_at`, below the later version-8 MREC overrides gate; the old cells
 stay at version 2) and the gate cells in `sim_cluster_mixed_version_corpus`.
+
+## MREC per-replica read overrides (ADR 0075's 2026-10-21 amendment, `Gate::MrecReplicaOverrides`)
+
+`mrec_saga::update_table_mrec` accepts `ReplicaUpdates` `Update` and `ProvisionedThroughputOverride`
+(table and per-GSI) behind the gate (closed: the pre-amendment refusal text), validates against the
+receiving cluster's table (PROVISIONED, GSI names), commits `SetMrecReplicaOverrides` (stamp = max(now,
+stored+1), origin = this region's id) and `push_overrides` (saga driver) sends each replica's record to
+every Active peer as `MrecControl::SetOverrides` until acknowledged (memo `PeerHealth.overrides_pushed`;
+the peer applies last-writer-wins, so repeats are no-ops). Enforcement is only
+`ClientCtx::throttle_limits_for` -> `Metadata::local_read_override` (read units only). A node that
+applies a push calls `recompute_any_table_throughput`; the `SimCluster` fixture never spawns the
+`index_drain` watch, so sim tests call `SimCluster::recompute_throttle_flags()` before reading.
+MRSC and KMS/OnDemand/TableClass overrides stay refused (see the ADR). Sim test:
+`sim_world_mrec_overrides_tests`. In a sim cluster, a long idle finalize ladder *after* the table exists
+makes the first client calls time out (quiesced groups): open the gates before creating the table.
 
 **Sim regressions for a walk over a changing set (issue #1345):** hold the
 walk open with a partition on its first call and assert the window is open

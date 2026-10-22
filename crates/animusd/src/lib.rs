@@ -12640,16 +12640,25 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
     /// — the cheap common case (no limit anywhere) costs exactly two
     /// lock-free atomic loads plus one `BTreeMap` lookup.
     pub(crate) fn throttle_limits_for(&self, meta: &Metadata, table: &str) -> ThrottleLimits {
-        if let Some(spec) = meta.table_throughput(table) {
-            return ThrottleLimits {
+        let mut limits = if let Some(spec) = meta.table_throughput(table) {
+            ThrottleLimits {
                 read_units: Some(spec.read_units),
                 write_units: Some(spec.write_units),
-            };
+            }
+        } else {
+            ThrottleLimits {
+                read_units: self.throttle_defaults.read_units(),
+                write_units: self.throttle_defaults.write_units(),
+            }
+        };
+        // ADR 0075's 2026-10-21 amendment: this cluster's own replica of an
+        // MREC table may override the table's (or one GSI's, `table` being the
+        // hidden `<base>$<index>` table) read capacity. Read only: write
+        // capacity is synchronized, never overridden.
+        if let Some(read) = meta.local_read_override(table) {
+            limits.read_units = Some(read);
         }
-        ThrottleLimits {
-            read_units: self.throttle_defaults.read_units(),
-            write_units: self.throttle_defaults.write_units(),
-        }
+        limits
     }
 
     /// **Test-reachable hook for ADR 0065's cluster-wide default (§5(a)),
@@ -23553,6 +23562,10 @@ mod sim_world_mrec_corpus;
 mod sim_world_mrec_e2e_tests;
 #[cfg(test)]
 mod sim_world_mrec_edge_tests;
+/// ADR 0075's 2026-10-21 amendment: per-replica read-capacity overrides over
+/// `SimWorld`, with a partition during an `Update` (test-only).
+#[cfg(test)]
+mod sim_world_mrec_overrides_tests;
 #[cfg(test)]
 mod sim_world_mrec_saga_tests;
 #[cfg(test)]

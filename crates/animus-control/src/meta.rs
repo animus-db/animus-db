@@ -2479,6 +2479,25 @@ pub enum MetaCommand {
         region: String,
         tablet: u64,
     },
+    /// **Set an MREC replica's per-replica read-capacity overrides** (ADR 0075's
+    /// 2026-10-21 amendment, Q6): `overrides` replaces the replica's whole
+    /// override record (an empty `read_units`/`index_read_units` with a stamp
+    /// is a *clear*). Last-writer-wins by `(stamp, origin)`
+    /// ([`MrecReplicaOverrides`](crate::schema::MrecReplicaOverrides)): a record
+    /// that is not strictly newer than the stored one is a no-op, which makes
+    /// the command idempotent and lets a late or duplicated cross-cluster push
+    /// be harmless. Rejected (state-based) for a non-MREC table, an unknown
+    /// replica, or a zero capacity. Index names are **not** checked here (the
+    /// wire edge checked them against the receiving cluster's table; a peer's
+    /// index set may differ and an unknown index is simply inert).
+    ///
+    /// **Gate: `Gate::MrecReplicaOverrides`** (cluster version 8): an older voter
+    /// cannot decode the variant nor `MrecReplica.overrides`.
+    SetMrecReplicaOverrides {
+        table: TableName,
+        region: String,
+        overrides: crate::schema::MrecReplicaOverrides,
+    },
     /// Enable, reconfigure, or disable a table's **provisioned throughput**
     /// (ADR 0065 §5(b)) — the `CreateTable`/`UpdateTable` `BillingMode`/
     /// `ProvisionedThroughput` wire fields' own catalog mutation. Rejected
@@ -5495,6 +5514,7 @@ impl Metadata {
                         status: crate::schema::MrecReplicaStatus::Active,
                         local: true,
                         copied: Default::default(),
+                        overrides: Default::default(),
                     }],
                 };
                 if let Some(existing) = &schema.global {
@@ -5540,6 +5560,7 @@ impl Metadata {
                     status: crate::schema::MrecReplicaStatus::Creating,
                     local: false,
                     copied: Default::default(),
+                    overrides: Default::default(),
                 });
                 if let Err(e) = candidate.validate() {
                     return ApplyOutcome::Rejected(e.message());
@@ -5608,6 +5629,32 @@ impl Metadata {
                 } else {
                     ApplyOutcome::NoOp
                 }
+            }
+            MetaCommand::SetMrecReplicaOverrides {
+                table,
+                region,
+                overrides,
+            } => {
+                let Some(spec) = self
+                    .schemas
+                    .get_mut(table)
+                    .and_then(|s| s.global.as_mut())
+                    .filter(|g| g.is_mrec())
+                else {
+                    return ApplyOutcome::Rejected("table is not an MREC global table");
+                };
+                let Some(replica) = spec.replicas.iter_mut().find(|r| r.region == *region) else {
+                    return ApplyOutcome::Rejected("no such MREC replica");
+                };
+                if let Err(reason) = overrides.validate() {
+                    return ApplyOutcome::Rejected(reason);
+                }
+                if overrides.order() <= replica.overrides.order() {
+                    // Stale, duplicate or already applied.
+                    return ApplyOutcome::NoOp;
+                }
+                replica.overrides = overrides.clone();
+                ApplyOutcome::Applied
             }
             MetaCommand::SetTableThroughput { table, spec } => {
                 let Some(schema) = self.schemas.get_mut(table) else {
@@ -6452,7 +6499,39 @@ impl Metadata {
     /// per-request hot path, which reads the cached flag instead.
     #[must_use]
     pub fn any_table_throughput(&self) -> bool {
-        self.schemas.iter().any(|(_, s)| s.throughput.is_some())
+        self.schemas.iter().any(|(_, s)| {
+            s.throughput.is_some()
+                || s.global.as_ref().is_some_and(|g| {
+                    g.replicas
+                        .iter()
+                        .any(|r| r.local && !r.overrides.is_empty())
+                })
+        })
+    }
+
+    /// The read capacity units this cluster's **own** replica of `table` is
+    /// overridden to (ADR 0075's 2026-10-21 amendment), for the admission
+    /// budget. `table` is a user table (the override of its table-level
+    /// `ReadCapacityUnits`) or a GSI's hidden table `<base>$<index>` (that
+    /// index's override). `None` when nothing is overridden here (the table's
+    /// own budget applies), for a non-MREC table, or for an unknown name.
+    #[must_use]
+    pub fn local_read_override(&self, table: &str) -> Option<u64> {
+        let local = |base: &str| {
+            self.schemas
+                .get(base)?
+                .global
+                .as_ref()
+                .filter(|g| g.is_mrec())?
+                .replicas
+                .iter()
+                .find(|r| r.local)
+                .map(|r| &r.overrides)
+        };
+        if let Some((base, index)) = table.split_once('$') {
+            return local(base)?.index_read_units.get(index).copied();
+        }
+        local(table)?.read_units
     }
 
     /// This table's point-in-time recovery (PITR) configuration (ADR 0059
@@ -7487,6 +7566,8 @@ impl crate::version::GatedCommand for MetaCommand {
             | MetaCommand::RemoveMrecReplica { .. }
             | MetaCommand::SetMrecReplicaStatus { .. }
             | MetaCommand::MarkMrecCopied { .. } => Gate::MrecReplication,
+            // ADR 0075 (2026-10-21 amendment): per-replica read overrides.
+            MetaCommand::SetMrecReplicaOverrides { .. } => Gate::MrecReplicaOverrides,
             MetaCommand::ReportNodeVersion { .. } | MetaCommand::FinalizeClusterVersion { .. } => {
                 Gate::Era
             }
