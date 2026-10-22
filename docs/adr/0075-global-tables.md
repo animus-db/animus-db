@@ -1179,6 +1179,7 @@ framing work, **not** WAN behaviour.
   does not refresh the key schema of an already-registered table, so a table dropped
   and recreated with a *different* key schema stays unreadable on that node until a
   restart; MREC's re-create path hits it only for a different shape.
+- A `Creating` replica is promoted to ACTIVE only after the peer acknowledged creating its table (node-local `PeerHealth.create_acked`, re-sent by a new saga driver); an empty source table previously went ACTIVE with no peer table (fixed).
 - Only the full-mesh topology exists (D8); `ReplicaUpdates[].Update` and the
   per-replica overrides (KMS, throughput) are rejected, as section 5 says.
 

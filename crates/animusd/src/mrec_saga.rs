@@ -410,10 +410,24 @@ pub(crate) async fn mrec_saga_table<E: Env, R: RelayClient>(
     for replica in spec.replicas.iter().filter(|r| !r.local) {
         match replica.status {
             MrecReplicaStatus::Creating => {
-                if replica.copied.is_empty() {
+                // The peer must have acknowledged creating its twin before the
+                // replica can go ACTIVE: an empty source table copies nothing,
+                // so no shipped batch would ever reach (or prove) the peer.
+                // The memo is node-local; a new driver just re-sends the
+                // (idempotent) create.
+                let key: HealthKey = (table.to_owned(), SAGA_SLOT, replica.region.clone());
+                let acked = |ctx: &ClientCtx<E, R>| {
+                    ctx.mrec
+                        .health
+                        .lock()
+                        .expect("mrec health poisoned")
+                        .get(&key)
+                        .is_some_and(|h| h.create_acked)
+                };
+                if !acked(ctx) {
                     did |= step_creating(ctx, client, &meta, spec, table, &replica.region).await;
                 }
-                if active.iter().all(|t| replica.copied.contains(t)) {
+                if acked(ctx) && active.iter().all(|t| replica.copied.contains(t)) {
                     ctx.propose_schema(&MetaCommand::SetMrecReplicaStatus {
                         table: table.to_owned(),
                         region: replica.region.clone(),
@@ -464,6 +478,13 @@ async fn step_creating<E: Env, R: RelayClient>(
     .await;
     match reply {
         Ok(MrecApplyResponse::Done) => {
+            ctx.mrec
+                .health
+                .lock()
+                .expect("mrec health poisoned")
+                .entry((table.to_owned(), SAGA_SLOT, region.to_owned()))
+                .or_default()
+                .create_acked = true;
             for other in others {
                 let _ = send_control(
                     ctx,
