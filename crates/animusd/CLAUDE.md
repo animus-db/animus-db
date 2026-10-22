@@ -3981,6 +3981,17 @@ the identical `STREAM_GROW_MID_SPLIT` skip, deliberately narrow (only that
 literal message, only on `grow_stream`'s own call path) so a genuinely
 unknown tablet id elsewhere (e.g. `POST /admin/tablet/split`) still errors.
 
+That classification only covers the instant between the metadata flip and
+the old group's teardown. A tablet retired *earlier* has no leader anywhere,
+so (issue #1345) `grow_stream_tablet` re-reads `effective_metadata()` at the
+top of every pass and returns the same `"no such tablet"` once the tablet is
+gone, and it bounds each forwarded chase to `GROW_FORWARD_ATTEMPT` (5 s)
+rather than the whole ~35 s budget, so the re-check runs again after a
+`FORWARD_BUDGET_EXHAUSTED` attempt. The retired tablet's children are
+already `Active` and carry its stream lineage via `split_lineage`; the next
+`grow_stream` call splits them in their own turn. Pinned by
+`sim_cluster_grow_retired.rs`.
+
 **Split is the ADR 0058 in-place workflow's METADATA half (Train 2 rung
 3, directed by ADR 0062) — the sole split mechanism since the copy-based
 workflow was deleted whole 2026-09-01** (the copy-split-deletion stack,
@@ -12613,3 +12624,8 @@ node bucket; the operator exposes only the explicit `spec.background.compactionI
 `sim_cluster_lsm.rs` installs the engine options and a shared compaction wedge).
 
 **Dashboard/console skin (2026-10-18):** both apps follow the shared tokens (Archivo UI, `--font-display` 75%/800 uppercase headings, accent-filled primary buttons, outlined quiet status pills, no black blocks). Archivo is embedded as base64 in `fonts.css` (`fonts/archivo-latin.woff2`); Work Sans was dropped. See `docs/lessons/general/2026-10-18-app-skin-follows-shared-tokens-and-fonts-are-base64.md`.
+
+**Sim regressions for a walk over a changing set (issue #1345):** hold the
+walk open with a partition on its first call and assert the window is open
+before healing; see
+`docs/lessons/testing/2026-10-21-a-stuck-first-call-is-the-reliable-way-to-hold-a-walk-open.md`.

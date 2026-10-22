@@ -6,6 +6,7 @@ mod lsm_clone;
 mod lsm_clone_filtered;
 mod lsm_crash;
 mod lsm_crash_encrypted;
+mod lsm_dir_durability;
 mod lsm_disk_faults;
 mod lsm_disk_full;
 mod lsm_flush_apply_race;
