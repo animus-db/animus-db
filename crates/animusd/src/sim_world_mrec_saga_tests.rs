@@ -529,3 +529,43 @@ fn the_admin_global_tables_view_reports_mrec_replicas_and_shipper_health() {
         );
     }
 }
+
+/// Regression: an EMPTY source table copies nothing, so no batch ever reaches
+/// the peer. The replica must still not be ACTIVE until the peer has
+/// acknowledged creating its twin (found by the legacy global tables SimWorld
+/// test). A partition around the create must only delay, never promote early.
+#[test]
+fn an_empty_table_replica_is_not_active_before_the_peer_created_its_table() {
+    for seed in saga_seeds() {
+        let mut s = S::new(seed, true);
+        s.w.bridge().partition(A, B);
+        s.ok(A, "UpdateTable", &create_body("b"));
+        for _ in 0..10 {
+            s.step_both();
+            assert_ne!(
+                s.replicas(A).get("b").map(String::as_str),
+                Some("ACTIVE"),
+                "seed={seed}: ACTIVE while the peer was never told to create the table"
+            );
+        }
+        let (st, _) = s.call(B, "DescribeTable", &format!(r#"{{"TableName":"{TABLE}"}}"#));
+        assert_ne!(st, 200, "seed={seed}: B has the table across a partition");
+        s.w.bridge().heal();
+        // Never ACTIVE on A unless B already holds the table.
+        for _ in 0..240 {
+            if s.both_active() {
+                break;
+            }
+            if s.replicas(A).get("b").map(String::as_str) == Some("ACTIVE") {
+                let (st, r) = s.call(B, "DescribeTable", &format!(r#"{{"TableName":"{TABLE}"}}"#));
+                assert_eq!(st, 200, "seed={seed}: A says ACTIVE, B has no table: {r}");
+            }
+            s.step_both();
+        }
+        assert!(s.both_active(), "seed={seed}: did not converge after heal");
+        s.put(A, "k", "v");
+        s.until("the write reached b", |s| {
+            s.read(B, "k").as_deref() == Some("v")
+        });
+    }
+}

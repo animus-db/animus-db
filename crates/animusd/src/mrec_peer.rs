@@ -141,6 +141,10 @@ pub(crate) struct PeerHealth {
     /// The TTL attribute this node's saga last pushed (or observed at first
     /// sight) for the peer: `None` = never looked, `Some(None)` = no TTL.
     pub(crate) ttl_pushed: Option<Option<String>>,
+    /// (Saga slot) the peer acknowledged creating its replica table; a
+    /// `Creating` replica is promoted only after this. Node-local: a new
+    /// driver re-sends the idempotent create.
+    pub(crate) create_acked: bool,
 }
 
 impl Default for MrecConfig {
