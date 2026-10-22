@@ -140,6 +140,7 @@ fn a_restoring_table_cannot_become_a_global_table() {
         let (st, r) = s.call(A, "UpdateTable", body);
         assert_eq!(st, 400, "seed={seed}: {r}");
         assert!(r.contains("not ACTIVE"), "seed={seed}: {r}");
+        assert!(r.contains("ResourceInUseException"), "seed={seed}: {r}");
         assert!(
             s.w.clusters[A].metadata(0).table_global("rst").is_none(),
             "seed={seed}: the restoring table was converted"
