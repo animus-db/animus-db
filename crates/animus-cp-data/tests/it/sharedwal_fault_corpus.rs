@@ -158,6 +158,14 @@ fn scenario_cells() -> Vec<Scenario> {
             "cell_f_a_sync_only_failure_never_lets_a_siblings_later_success_launder_it",
             scenario_f_sync_only_failure_leaves_no_buffered_phantom
         ),
+        scenario!(
+            "cell_g_namespace_adversary_crash_cycles_lose_no_acked_write",
+            scenario_g_namespace_adversary
+        ),
+        scenario!(
+            "control_h_a_sync_that_does_not_make_the_name_durable_loses_acked_writes",
+            control_h_legacy_sync_loses_acked_writes
+        ),
     ]
 }
 
@@ -856,4 +864,99 @@ fn scenario_f_sync_only_failure_leaves_no_buffered_phantom(seed: u64) {
          even though a sibling tablet's own healthy ordinary round physically extended and \
          re-synced the SAME shared file right afterward (seed={seed})"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Cell (g) and control (h) (PR #27, `docs/sim-coverage.md`): directory-entry
+// durability. The shared WAL file is created by `append` and made durable by
+// the first `sync` (which fsyncs the parent directory); a forgotten tablet's
+// bytes leave through `Disk::replace`. Crash cycles with the namespace
+// adversary armed (`resurrect` removes, torn tails) must lose no acked write
+// and must never bring a forgotten tablet back. Control (h) arms
+// `set_sync_skips_dir_fsync` (the pre-PR-27 `ProdEnv`): the SAME oracle must
+// fail, proving the cell bites.
+// ---------------------------------------------------------------------------
+
+fn namespace_adversary_run(seed: u64, legacy_sync: bool) -> Result<(), String> {
+    const ROUNDS: u64 = 4;
+    const KEYS_PER_ROUND: u64 = 6;
+    let mut sim = Simulator::new(seed);
+    let mut cfg = DiskConfig::default();
+    cfg.set_resurrect_unsynced_removes_on_crash_prob(1.0);
+    cfg.torn_tail_on_crash = true;
+    cfg.set_sync_skips_dir_fsync(legacy_sync);
+    sim.set_disk_config(cfg);
+
+    for round in 0..ROUNDS {
+        let shared = block_on(Wal::open(&sim.env(nid(NODE)), SHARED_WAL))
+            .map_err(|e| format!("seed={seed} round {round}: shared WAL open failed: {e}"))?;
+        let a = host(&sim, 1, &shared);
+        let b = host(&sim, 2, &shared);
+        sim.run_for(SETTLE);
+        // Everything acked in earlier rounds must have survived the crash.
+        for prior in 0..round {
+            for k in 0..KEYS_PER_ROUND {
+                for (name, node) in [("a", &a), ("b", &b)] {
+                    let key = format!("r{prior}-{name}{k}");
+                    if get(node, key.as_bytes()) != Some(prior.to_le_bytes().to_vec()) {
+                        return Err(format!(
+                            "seed={seed} round {round}: acked write {key} lost across the crash"
+                        ));
+                    }
+                }
+            }
+        }
+        if round >= 1 && !block_on(shared.recovered_state(TabletId(3))).is_empty() {
+            return Err(format!(
+                "seed={seed} round {round}: forgotten tablet 3 came back"
+            ));
+        }
+        for k in 0..KEYS_PER_ROUND {
+            put(
+                &a,
+                seed,
+                format!("r{round}-a{k}").as_bytes(),
+                &round.to_le_bytes(),
+            );
+            put(
+                &b,
+                seed,
+                format!("r{round}-b{k}").as_bytes(),
+                &round.to_le_bytes(),
+            );
+        }
+        sim.run_for(SETTLE);
+        if round == 1 {
+            // A third group is written and torn down: `forget` rewrites the
+            // file through `Disk::replace`.
+            let g = host(&sim, 3, &shared);
+            sim.run_for(SETTLE);
+            put(&g, seed, b"ghost", b"boo");
+            sim.run_for(SETTLE);
+            g.shutdown();
+            sim.run_for(Duration::from_millis(200));
+            block_on(shared.forget(&sim.env(nid(NODE)), SHARED_WAL, TabletId(3)))
+                .map_err(|e| format!("seed={seed}: forget failed: {e}"))?;
+        }
+        sim.crash(nid(NODE));
+        sim.stop(nid(NODE));
+        sim.restart(nid(NODE));
+        drop(a);
+        drop(b);
+    }
+    Ok(())
+}
+
+fn scenario_g_namespace_adversary(seed: u64) {
+    namespace_adversary_run(seed, false).unwrap_or_else(|e| panic!("{e}"));
+}
+
+fn control_h_legacy_sync_loses_acked_writes(seed: u64) {
+    let r = namespace_adversary_run(seed, true);
+    assert!(
+        r.is_err(),
+        "seed={seed}: control did not bite - the oracle passed although `sync` no \
+         longer made the WAL file's name durable"
+    );
+    println!("control (h) seed={seed} bit: {}", r.unwrap_err());
 }

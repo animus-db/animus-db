@@ -911,3 +911,13 @@ The LSM WAL/manifest/SSTable decoders are the `lsm_formats` fuzz target, reached
   throughput limit is now compaction cost (L0 to L1 rewrites all of L1). See
   `docs/lessons/code-patterns/2026-10-18-flush-that-defers-to-in-flight-applies-starves-under-concurrent-writers.md`.
 - `tests/lsm_stall_prod.rs` is the `ProdEnv` liveness test (own target, timeout-guarded).
+
+## Directory-entry durability under `SimEnv` (PR #27)
+
+`SimEnv` now drops a never-name-durable file on `crash` and (opt-in) resurrects
+unsynced-removed files (`animus-sim/CLAUDE.md`). The engine's namespace discipline —
+new SSTable/WAL names made durable by their first `sync`, manifest by `replace`, obsolete
+files by `remove` with orphans tolerated at open — is pinned by
+`tests/it/lsm_dir_durability.rs` (`ANIMUS_LSM_DIR_DURABILITY_SEEDS`), including a
+negative control (`set_sync_skips_dir_fsync`) that must fail the oracle. A new file the
+engine creates must be `sync`ed (or `replace`d/`link`ed) before anything depends on it.
