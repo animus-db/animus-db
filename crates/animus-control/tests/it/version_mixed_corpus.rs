@@ -1152,6 +1152,7 @@ fn global_spec() -> animus_control::GlobalTableSpec {
         witness: None,
         preferred_leader_region: "a".into(),
         replicas: Vec::new(),
+        legacy: None,
     }
 }
 
@@ -1526,7 +1527,9 @@ fn mrec_via_convert_to_global_cmd() -> MetaCommand {
                 status: animus_control::MrecReplicaStatus::Active,
                 local: true,
                 copied: Default::default(),
+                overrides: Default::default(),
             }],
+            legacy: None,
         },
     }
 }

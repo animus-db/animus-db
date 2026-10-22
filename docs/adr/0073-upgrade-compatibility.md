@@ -2073,6 +2073,7 @@ first start of the new binary (Option B); **F** outlives the cluster, Phase 1 ru
 | Handshakes `NHS1`/`CHS1` | `animus-env/src/handshake.rs`, `prod.rs`, `animusd/src/lib.rs` | version fixed at 1 forever | `ext` TLVs; `check_peer` + disjoint-range refusal; `Envelope.peer_ext` |
 | `ReportNodeVersion`, `FinalizeClusterVersion` | new | `Gate::Era` | era-only variants |
 | `ConvertTableToGlobal` (`MetaCommand`), `TableSchema.global` (`GlobalTableSpec`), `PlacementPolicy.allowed_values` | `animus-control/src/{meta,schema}.rs`, `animus-placement/src/lib.rs`, relay arm in `animus-node/src/wire.rs` | G, `Gate::GlobalTables` (cluster version 2) | the variant is gated (`required_gate` row, relay allowlist); both fields are additive and skipped at their default, so an ordinary table/policy encodes byte-identically and only a converted table carries them (shaped fixtures `metadata/v1-global.json`, `mirror-entities/schema/v1-global.json`, `mirror-entities/policy/v1-pinned.json`) |
+| `RevertGlobalToRegional` (`MetaCommand`) | `animus-control/src/{meta,mirror}.rs`, relay arm in `animus-node/src/wire.rs`, edge in `animusd/src/global_tables.rs` | G, `Gate::MrscReplicaRemoval` (cluster version 7) | the variant is gated (exhaustive `required_gate` row, relay allowlist, by-content `sim_versions` row); writes only existing shapes (`schema.global` cleared, an unpinned `allowed_values` policy), so no fixture is added (ADR 0075's 2026-10-21 amendment) |
 | `ConvertTableToMrec`, `AddMrecReplica`, `RemoveMrecReplica`, `SetMrecReplicaStatus` (`MetaCommand`), `MultiRegionConsistency::Eventual`, `GlobalTableSpec.replicas` (`MrecReplica`/`MrecReplicaStatus`) | `animus-control/src/{meta,schema,mirror}.rs`, relay arms in `animus-node/src/wire.rs` | G, `Gate::MrecReplication` (cluster version 3) | the four variants are gated (exhaustive `required_gate` rows, relay allowlist; a `ConvertTableToGlobal` whose spec is `Eventual` is also classified `MrecReplication` by content); `replicas` is additive and skipped when empty, so an MRSC or ordinary table encodes byte-identically (shaped fixtures `metadata/v1-mrec.json`, `mirror-entities/schema/v1-mrec.json`) |
 | `WriteSchema.mrec` (`MrecWriteStamp`), `KindEvalOp::Replicate` (JSON blobs inside `KvCommand::KindEval`/`KindEvalBatch`/`TxnStage`) | `animus-item/src/write_schema.rs`, `animus-cp-data/src/{lib,gates}.rs` | G, `Gate::MrecReplication` | `KvCommand::required_gate` is **content-dependent** for the three carriers (an MREC entry joins to `MrecReplication`, everything else stays `Base`); the single propose choke point `gated_propose` refuses it while closed. `mrec` is additive/skipped when `None`. No binary codec change: the blobs are `serde_json` inside the envelope, so the wire stays v1 and the WAL stays v2 (shaped fixtures `raftkv-wire/v1-mrec.bin`, `raftkv-wal/v2-mrec.bin`) |
 | Stored item `VersionedItem`/`VersionedTombstone` (`MrecVersion`), base-row value of an MREC table | `animus-item/src/stored.rs` | F (outlives the cluster) + emitted only on MREC tables | additive variants inside stored-item **v1** (no tag change: the first byte is still `{`); `decode_stored_item` accepts all four forms, `decode_stored_item_versioned` also returns the stamp; an unversioned row decodes exactly as before and compares as `MrecVersion::ZERO` (shaped fixtures `stored-item/v1-versioned.json`, `v1-versioned-tombstone.json`) |
@@ -3602,3 +3603,90 @@ the follower's engine-applied index on the data plane's `AppendEntriesResp`.
   gate is closed); after it, every node emits v2. A node that restarts onto the
   new binary and has not yet read the replicated version also emits v1 (the
   floor handle), never v2.
+
+## Amendment 2026-10-21 — the sixth real gate: `Gate::MrscReplicaRemoval`, `MAX_SUPPORTED = 7` (ADR 0075)
+
+`MAX_SUPPORTED` is now **7** and `Gate::MrscReplicaRemoval` (version 7) guards
+`MetaCommand::RevertGlobalToRegional`, the AWS-documented removal of two replicas
+(or a replica and the witness) from an MRSC table (ADR 0075's 2026-10-21
+amendment).
+
+| New shape | Class | Gate | Emit-site / propose-site check |
+|---|---|---|---|
+| `MetaCommand::RevertGlobalToRegional { table, keep_region }` | G | `MrscReplicaRemoval` | exhaustive `required_gate` row; relay allowlist arm (`is_relayable_command`), the receiver re-checks (`relay_gate_verdict`); the wire edge (`animusd` `global_tables::revert_table_global`) checks the gate before proposing and answers a closed gate with the pre-amendment `ReplicaUpdates Delete is not supported` text |
+
+- **No new durable or wire format version.** The apply writes only shapes that
+  already exist (`schema.global` cleared; `PlacementPolicy.allowed_values` with an
+  unpinned spread), so there is no new fixture and no existing fixture changed
+  (`scripts/check-format-fixtures.sh`); the command JSON is pinned by
+  `global_table_apply::revert_requires_its_own_gate_and_pins_its_json`. The mirror
+  writes the schema entry and the tablet policies (same arm as the conversion).
+- Exhaustive per-gate tables gained the row: `Gate::version`/`rank`/`ALL`,
+  `gate_table_is_exhaustive`, the `sim_versions` acceptance matrix (a `Release(7)`
+  profile) and its by-content `content_gate` row (a `Release(6)` capped decode
+  refuses the variant).
+- **Cells.** `sim_cluster_mixed_version_corpus::release6_to_release7_mrsc_removal_gate`
+  (relays refused by name before the finalize, nothing appended, a finalize to 7
+  refused while a `[1,6]` node is recorded, accepted after: spec cleared and policy
+  swapped on every node, data-only mirror included, no capped rejection) and
+  `negative_control_mrsc_removal_gate_emitted_early` (N9: ungated emit with a
+  `Release(6)` voter wedges exactly that voter; the oracle also gained a "gate
+  applied early" clause for a `regional:` policy below version 7). The behavioural
+  cells are `sim_cluster_mrsc` `revert_*`.
+- **Rolling upgrade behaviour.** Before the finalize nothing changes: the edge refuses
+  the Delete with the old text and a relayed command is refused by name. After it,
+  every node accepts the request.
+
+## Amendment 2026-10-21 — the seventh real gate: `Gate::MrecReplicaOverrides`, `MAX_SUPPORTED = 8` (ADR 0075's 2026-10-21 amendment)
+
+`MAX_SUPPORTED` is now **8**; `Gate::MrecReplicaOverrides` opens at version 8.
+Version 7 is `Gate::MrscReplicaRemoval` (the amendment above). The gate number is one
+constant (`version::MREC_REPLICA_OVERRIDES_VERSION`).
+
+| New shape | Class | Gate | Emit-site / propose-site check |
+|---|---|---|---|
+| `MetaCommand::SetMrecReplicaOverrides` | G (replicated command) | `MrecReplicaOverrides` | `required_gate` row (exhaustive); the `UpdateTable` edge checks the gate before proposing; the relay receiver re-checks (`relay_gate_verdict`); `sim_versions::content_gate` classifies it by content |
+| `MrecReplica.overrides` (JSON, skipped while unset) | G (replicated field) | `MrecReplicaOverrides` | only that command writes it; new fixture `metadata/v1-mrec-overrides.json` (existing fixtures untouched) |
+| `MrecControl::SetOverrides` (cross-cluster JSON frame) | G (additive variant of the `MrecApply` frame) | peer's own `MrecReplicaOverrides` | the sender is gated by its own cluster; the receiver refuses retryably while its gate is closed; new frame fixture `client-frame/v1-mrec-control-overrides.bin` |
+
+- **Tests.** `version::tests::mrec_replica_overrides_gate_opens_exactly_at_its_version`,
+  `sim_versions` `replica_overrides_need_the_mrec_overrides_gate` and the extended
+  acceptance matrix (`Release(7)`, `Release(8)` columns),
+  `mrec_table_apply::overrides_gate_row_and_mirror_round_trip`.
+- **Cells.** `sim_cluster_mixed_version_corpus::release7_to_release8_mrec_overrides_gate`
+  (relay refused by name and counted below the gate, half-rolled finalize refused,
+  accepted after, lands on every replica including the data-only mirror) and
+  `negative_control_mrec_overrides_gate_emitted_early` (N10). The pure
+  `version_mixed_corpus` tier stops at version 3 and is unchanged.
+- **Rolling upgrade behaviour.** Before the finalize `Update` and read overrides
+  are refused exactly as before; nothing is proposed or pushed.
+
+
+## Amendment 2026-10-21 — the eighth real gate: `Gate::LegacyGlobalTables`, `MAX_SUPPORTED = 9` (ADR 0075's 2026-10-21 legacy-API amendment)
+
+`MAX_SUPPORTED` is now **9**; `Gate::LegacyGlobalTables` opens at version 9. Version 8
+is `Gate::MrecReplicaOverrides` (the amendment above). The gate number is one constant
+(`version::LEGACY_GLOBAL_TABLES_VERSION`).
+
+| New shape | Class | Gate | Emit-site / propose-site check |
+|---|---|---|---|
+| `MetaCommand::ConvertTableToLegacyGlobal` | G (replicated command) | `LegacyGlobalTables` | `required_gate` row (exhaustive); the `CreateGlobalTable` edge checks the gate before verifying peers or proposing; the relay receiver re-checks (`relay_gate_verdict`); `sim_versions::content_gate` classifies it by content |
+| `MetaCommand::SetLegacyGlobalSettings` | G (replicated command) | `LegacyGlobalTables` | same rows; the `UpdateGlobalTableSettings` edge checks the gate |
+| `GlobalTableSpec.legacy` (JSON, skipped while `None`) | G (replicated field) | `LegacyGlobalTables` | only `ConvertTableToLegacyGlobal` writes it; new fixture `metadata/v1-legacy-global.json` (existing fixtures untouched) |
+| `MrecControl::LegacyReplica`, `SetLegacySettings`, `LegacyRemovePeer` (cross-cluster JSON frame) | G (additive variants of the `MrecApply` frame) | peer's own `LegacyGlobalTables` | the sender is gated by its own cluster; the receiver refuses retryably while its gate is closed; new frame fixture `client-frame/v1-mrec-control-legacy.bin` |
+| the six legacy global table operations | wire surface | `LegacyGlobalTables` | `animusd::legacy_global::execute` checks the gate first; while closed it answers the pre-amendment refusal text (`legacy_global_table_operation_error`), byte for byte |
+
+- **Tests.** `version::tests::legacy_global_tables_gate_opens_exactly_at_its_version`,
+  `sim_versions` `legacy_global_tables_need_their_gate` and the extended acceptance matrix
+  (a `Release(9)` column and a `LegacyGlobalTables` row),
+  `legacy_global_apply::gate_rows_and_mirror_round_trip`.
+- **Cells.** `sim_cluster_mixed_version_corpus::release8_to_release9_legacy_global_gate`
+  (relay refused by name and counted below the gate, half-rolled finalize refused,
+  accepted after, lands on every replica including the data-only mirror) and
+  `negative_control_legacy_global_gate_emitted_early` (N11); the "gate applied early"
+  oracle gained the legacy-table check. `sim_cluster_dynamo_global_table` asserts the
+  closed-gate refusal text of all six operations; `tests/cluster_version_prod.rs`
+  finalizes through 9.
+- **Rolling upgrade behaviour.** Before the finalize the six operations are refused exactly
+  as before; nothing is proposed, verified or pushed. A peer on an older binary rejects the
+  new `MrecControl` variants and the sender retries until it upgrades.

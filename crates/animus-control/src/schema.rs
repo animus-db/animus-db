@@ -229,6 +229,93 @@ pub struct MrecReplica {
     /// once every routable tablet is here. Additive (absent = empty).
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub copied: std::collections::BTreeSet<u64>,
+    /// This Region's per-replica **read-capacity overrides** (ADR 0075's
+    /// 2026-10-21 amendment, closing Q6 for provisioned read capacity), set by
+    /// `MetaCommand::SetMrecReplicaOverrides` and identical in every cluster's
+    /// copy of the replica set. Additive: an unset replica serializes without
+    /// the field, byte-identical to before.
+    #[serde(default, skip_serializing_if = "MrecReplicaOverrides::is_unset")]
+    pub overrides: MrecReplicaOverrides,
+}
+
+/// The per-replica read-capacity overrides of one MREC replica (AWS
+/// `ProvisionedThroughputOverride{ReadCapacityUnits}` on the table and on each
+/// `ReplicaGlobalSecondaryIndex`). Write capacity is **not** overridable (it
+/// is synchronized across replicas, as in AWS).
+///
+/// **Last-writer-wins across clusters.** MREC clusters have independent
+/// control planes, so a change reaches a peer by a push that may arrive late,
+/// twice, or after a newer change made on the peer itself. [`stamp`]
+/// (the issuing cluster's `Env::now` in nanoseconds) and [`origin`] (its
+/// [`mrec_region_id`]) order the changes: `MetaCommand::
+/// SetMrecReplicaOverrides` applies only a strictly newer `(stamp, origin)`,
+/// so every cluster converges on the newest change whatever order it hears
+/// them in. A *cleared* override keeps its stamp (a tombstone), so a stale push
+/// can never resurrect it.
+///
+/// [`stamp`]: Self::stamp
+/// [`origin`]: Self::origin
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MrecReplicaOverrides {
+    /// The table's read capacity units in this Region, if overridden.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_units: Option<u64>,
+    /// Per-GSI read capacity units in this Region, by index name.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub index_read_units: std::collections::BTreeMap<String, u64>,
+    /// When the change was issued (issuing cluster's clock, nanoseconds);
+    /// `0` for a replica that never had an override.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub stamp: u64,
+    /// `mrec_region_id` of the issuing cluster (tie-break for equal stamps).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub origin: u32,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+impl MrecReplicaOverrides {
+    /// Nothing recorded at all (never set): the replica serializes without
+    /// the field.
+    #[must_use]
+    pub fn is_unset(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// No capacity is overridden (possibly a tombstone with a stamp).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.read_units.is_none() && self.index_read_units.is_empty()
+    }
+
+    /// The `(stamp, origin)` ordering key.
+    #[must_use]
+    pub fn order(&self) -> (u64, u32) {
+        (self.stamp, self.origin)
+    }
+
+    /// Structural validity: every override is at least one capacity unit
+    /// (AWS `PositiveLongObject`) and every index name is non-empty.
+    ///
+    /// # Errors
+    /// A static reason.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.read_units == Some(0) || self.index_read_units.values().any(|u| *u == 0) {
+            return Err("a read capacity override must be at least 1");
+        }
+        if self.index_read_units.keys().any(String::is_empty) {
+            return Err("an index read capacity override names an empty index");
+        }
+        Ok(())
+    }
 }
 
 /// The MREC Region id of a Region name: 32-bit **FNV-1a** over the name's
@@ -282,6 +369,65 @@ pub struct GlobalTableSpec {
     /// only an MREC table carries it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub replicas: Vec<MrecReplica>,
+    /// Present iff this MREC table is a **legacy (version 2017.11.29) global
+    /// table** (ADR 0075's 2026-10-21 amendment): created by
+    /// `CreateGlobalTable` from pre-existing, empty, identically shaped
+    /// tables, and managed only through the legacy operations. Data
+    /// replication is the MREC machinery unchanged. **Class G,
+    /// `Gate::LegacyGlobalTables`**: additive and skipped while `None`, so
+    /// every existing encoding is byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy: Option<LegacyGlobal>,
+}
+
+/// The legacy-global-table half of a [`GlobalTableSpec`]: when the global
+/// table was created and the replicated billing-mode / write-capacity
+/// setting `UpdateGlobalTableSettings` last wrote.
+///
+/// **Last-writer-wins across clusters**, exactly like
+/// [`MrecReplicaOverrides`]: `MetaCommand::SetLegacyGlobalSettings` applies
+/// only a strictly newer `(stamp, origin)`, so a late or duplicated
+/// cross-cluster push is harmless and every cluster converges on the newest
+/// change.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyGlobal {
+    /// `CreationDateTime` of the global table, in milliseconds since the Unix
+    /// epoch, as stamped by the cluster that ran `CreateGlobalTable` and
+    /// carried to every peer so all clusters describe the same instant.
+    #[serde(default)]
+    pub created_ms: u64,
+    /// The billing mode and write capacity every replica's table follows, once
+    /// `UpdateGlobalTableSettings` set it; `None` = never set (each Region's
+    /// table keeps the capacity it was created with).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing: Option<GlobalBilling>,
+    /// When the setting was issued (issuing cluster's clock, nanoseconds);
+    /// `0` while `billing` was never set.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub stamp: u64,
+    /// `mrec_region_id` of the issuing cluster (tie-break for equal stamps).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub origin: u32,
+}
+
+impl LegacyGlobal {
+    /// The `(stamp, origin)` ordering key of the settings record.
+    #[must_use]
+    pub fn order(&self) -> (u64, u32) {
+        (self.stamp, self.origin)
+    }
+}
+
+/// The billing mode and **write** capacity of a legacy global table (AWS
+/// `GlobalTableBillingMode` and `GlobalTableProvisionedWriteCapacityUnits`);
+/// read capacity stays per-Region ([`MrecReplicaOverrides`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GlobalBilling {
+    /// `PAY_PER_REQUEST`: no provisioned throughput on any replica's table.
+    PayPerRequest,
+    /// `PROVISIONED` with this many write capacity units (>= 1) on every
+    /// replica's table.
+    Provisioned { write_units: u64 },
 }
 
 /// Why a [`GlobalTableSpec`] was rejected.
@@ -311,6 +457,8 @@ pub enum GlobalSpecError {
     MrecRegionId,
     /// An MREC spec does not have exactly one `local` replica.
     MrecLocalReplica,
+    /// A legacy global table's provisioned write capacity is zero.
+    LegacyWriteUnits,
 }
 
 impl GlobalSpecError {
@@ -337,6 +485,9 @@ impl GlobalSpecError {
             GlobalSpecError::MrecReplicaName => "global table replica names are empty or repeated",
             GlobalSpecError::MrecRegionId => "global table replica region id is wrong or collides",
             GlobalSpecError::MrecLocalReplica => "global table needs exactly one local replica",
+            GlobalSpecError::LegacyWriteUnits => {
+                "legacy global table write capacity must be at least 1"
+            }
         }
     }
 }
@@ -355,6 +506,13 @@ impl GlobalTableSpec {
         self.consistency == MultiRegionConsistency::Strong
     }
 
+    /// Whether this is a **legacy (2017.11.29) global table** (an MREC table
+    /// created by `CreateGlobalTable`).
+    #[must_use]
+    pub fn is_legacy(&self) -> bool {
+        self.is_mrec() && self.legacy.is_some()
+    }
+
     /// Whether this is a multi-Region **eventual** (MREC) spec.
     #[must_use]
     pub fn is_mrec(&self) -> bool {
@@ -369,7 +527,7 @@ impl GlobalTableSpec {
         if self.is_mrec() {
             return self.validate_mrec();
         }
-        if !self.replicas.is_empty() {
+        if !self.replicas.is_empty() || self.legacy.is_some() {
             return Err(GlobalSpecError::ModeFieldsMixed);
         }
         if self.regions.len() != Self::MRSC_REGIONS {
@@ -421,6 +579,13 @@ impl GlobalTableSpec {
         }
         if self.replicas.iter().filter(|r| r.local).count() != 1 {
             return Err(GlobalSpecError::MrecLocalReplica);
+        }
+        if let Some(LegacyGlobal {
+            billing: Some(GlobalBilling::Provisioned { write_units: 0 }),
+            ..
+        }) = &self.legacy
+        {
+            return Err(GlobalSpecError::LegacyWriteUnits);
         }
         Ok(())
     }

@@ -12625,6 +12625,53 @@ node bucket; the operator exposes only the explicit `spec.background.compactionI
 
 **Dashboard/console skin (2026-10-18):** both apps follow the shared tokens (Archivo UI, `--font-display` 75%/800 uppercase headings, accent-filled primary buttons, outlined quiet status pills, no black blocks). Archivo is embedded as base64 in `fonts.css` (`fonts/archivo-latin.woff2`); Work Sans was dropped. See `docs/lessons/general/2026-10-18-app-skin-follows-shared-tokens-and-fonts-are-base64.md`.
 
+## MRSC replica removal (ADR 0075 amendment 2026-10-21, `Gate::MrscReplicaRemoval`)
+
+`global_tables::update_table_global` routes an `UpdateTable` carrying any `Delete` on an MRSC
+table to `revert_table_global` (AWS: delete two replicas, or one replica plus the witness, which
+converts the remaining replica to a single-Region table): `GlobalTableUpdate::validate_revert`,
+the gate check (closed gate answers with the old `ReplicaUpdates Delete is not supported` text),
+one `MetaCommand::RevertGlobalToRegional`, then a poll until `schema.global` is gone (a racing
+request that kept another Region is detected from `Metadata::table_pinned_region`). Everything
+else follows `schema.global`: `DescribeTable`/`/admin/global-tables`, `leader_preferences`
+(preferred-leader and witness flag), `drain_strands_region` and the TTL/transaction restrictions
+all stop applying at once; the replicas converge through ordinary repair. Cluster-tier cells:
+`sim_cluster_mrsc` `revert_*` (they boot at cluster version 7 via `Run::boot_at`, below the later version-8 MREC overrides gate; the old cells
+stay at version 2) and the gate cells in `sim_cluster_mixed_version_corpus`.
+
+## MREC per-replica read overrides (ADR 0075's 2026-10-21 amendment, `Gate::MrecReplicaOverrides`)
+
+`mrec_saga::update_table_mrec` accepts `ReplicaUpdates` `Update` and `ProvisionedThroughputOverride`
+(table and per-GSI) behind the gate (closed: the pre-amendment refusal text), validates against the
+receiving cluster's table (PROVISIONED, GSI names), commits `SetMrecReplicaOverrides` (stamp = max(now,
+stored+1), origin = this region's id) and `push_overrides` (saga driver) sends each replica's record to
+every Active peer as `MrecControl::SetOverrides` until acknowledged (memo `PeerHealth.overrides_pushed`;
+the peer applies last-writer-wins, so repeats are no-ops). Enforcement is only
+`ClientCtx::throttle_limits_for` -> `Metadata::local_read_override` (read units only). A node that
+applies a push calls `recompute_any_table_throughput`; the `SimCluster` fixture never spawns the
+`index_drain` watch, so sim tests call `SimCluster::recompute_throttle_flags()` before reading.
+MRSC and KMS/OnDemand/TableClass overrides stay refused (see the ADR). Sim test:
+`sim_world_mrec_overrides_tests`. In a sim cluster, a long idle finalize ladder *after* the table exists
+makes the first client calls time out (quiesced groups): open the gates before creating the table.
+
+## Legacy 2017.11.29 global tables (ADR 0075's 2026-10-21 legacy-API amendment, `Gate::LegacyGlobalTables`)
+
+`legacy_global::execute` serves the six operations (gate closed: `legacy_global_table_operation_error`,
+the pre-gate text). A legacy table is an MREC table with `GlobalTableSpec.legacy`; the replicas are the
+operator's pre-created empty tables, so the saga sends `MrecControl::LegacyReplica` (verify + adopt)
+instead of `CreateReplica`. `CreateGlobalTable` / `UpdateGlobalTable Create` verify every other Region
+**synchronously** through `MrecConfig.edge_client` (an `EdgePeerClient` the shipper loop installs; the
+edge otherwise has no peer client; sim worlds call `cfg.edge_client.install(Arc::new(w.peer_client(c)))`,
+and `MrecConfig` struct literals need `edge_client: Default::default()`), 5 s per Region; unreachable is a
+retryable `InternalServerError` with nothing changed. Settings: `SetLegacyGlobalSettings` LWW record pushed
+by `push_settings` (`MrecControl::SetLegacySettings`); per-Region read capacity reuses the overrides.
+Removal: `LegacyRemovePeer` goes to every other replica first and the departing Region last; a receiver
+ignores it from a sender that is `Deleting`/absent in its spec (a dissolving cluster must not dissolve the others);
+removing several Regions in one call drops every link between them. The saga promotes a replica to
+`Active` only after `PeerHealth.create_acked` (an empty table's copy needs no peer contact). 2019 edges
+(`update_table_mrec`, `update_table_throughput`) refuse a legacy table. Sim test:
+`sim_world_mrec_legacy_tests` (three clusters; reuses `mesh_cfg` and `open_overrides_gate`).
+
 **Sim regressions for a walk over a changing set (issue #1345):** hold the
 walk open with a partition on its first call and assert the window is open
 before healing; see

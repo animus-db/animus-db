@@ -23,6 +23,7 @@ fn spec() -> GlobalTableSpec {
         witness: None,
         preferred_leader_region: "a".into(),
         replicas: Vec::new(),
+        legacy: None,
     }
 }
 
@@ -432,4 +433,320 @@ fn table_global_and_ready_regions_accessors() {
     );
     // No tablets of the table at all: nothing is ready.
     assert!(m.table_ready_regions("absent").is_empty());
+}
+
+// ---- RevertGlobalToRegional (ADR 0075, 2026-10-21 amendment) ----
+
+fn revert(table: &str, keep: &str) -> MetaCommand {
+    MetaCommand::RevertGlobalToRegional {
+        table: table.to_string(),
+        keep_region: keep.to_string(),
+    }
+}
+
+fn region_of(m: &Metadata, n: &animus_env::NodeId) -> String {
+    m.members[n].labels[REGION_LABEL].clone()
+}
+
+/// The revert clears the spec and swaps every tablet's pinned policy for a
+/// regional one in one apply; the restrictions tied to MRSC fall away.
+#[test]
+fn revert_clears_the_spec_and_replaces_the_policy_atomically() {
+    let mut m = world(&[1, 3, 5]);
+    assert_eq!(m.apply(&convert("t", spec())), ApplyOutcome::Applied);
+    assert_eq!(m.apply(&revert("t", "a")), ApplyOutcome::Applied);
+    assert_eq!(m.schemas.get("t").unwrap().global, None);
+    assert_eq!(m.table_global("t"), None);
+    let policy = &m.policies[&TabletId(1)];
+    assert!(!policy.is_pinned(), "a regional policy is not a pin");
+    assert_eq!(policy.name, "regional:t");
+    // Two members in region a: RF = min(3, 2).
+    assert_eq!(policy.replication_factor, 2);
+    assert_eq!(
+        policy.allowed_values[REGION_LABEL],
+        ["a"].iter().map(|s| s.to_string()).collect()
+    );
+    assert_eq!(m.table_pinned_region("t").as_deref(), Some("a"));
+    // The MRSC-only restrictions no longer apply.
+    assert_eq!(
+        m.apply(&MetaCommand::SetTableTtl {
+            table: "t".into(),
+            spec: Some(TtlSpec {
+                attribute_name: "exp".into()
+            }),
+        }),
+        ApplyOutcome::Applied
+    );
+}
+
+/// Witness tables: keeping a replica Region works, keeping the witness does
+/// not.
+#[test]
+fn revert_keeps_a_replica_region_never_the_witness() {
+    let mut w = spec();
+    w.witness = Some("c".into());
+    let mut m = world(&[1, 3, 5]);
+    assert_eq!(m.apply(&convert("t", w.clone())), ApplyOutcome::Applied);
+    let before = m.clone();
+    assert_eq!(
+        m.apply(&revert("t", "c")),
+        ApplyOutcome::Rejected("kept region is the witness")
+    );
+    assert_eq!(
+        m.apply(&revert("t", "zz")),
+        ApplyOutcome::Rejected("kept region is not one of the table's regions")
+    );
+    assert_eq!(m, before, "a rejection leaves the state untouched");
+    assert_eq!(m.apply(&revert("t", "b")), ApplyOutcome::Applied);
+    assert_eq!(m.table_pinned_region("t").as_deref(), Some("b"));
+}
+
+/// Idempotent under a retried or duplicated proposal (leader change): the
+/// second apply of the same command is a no-op and changes nothing; a table
+/// that was never global is a no-op too, an unknown table is rejected.
+#[test]
+fn revert_is_idempotent_and_rejections_are_named() {
+    let mut m = world(&[1, 3, 5]);
+    assert_eq!(
+        m.apply(&revert("t", "a")),
+        ApplyOutcome::NoOp,
+        "never global"
+    );
+    assert_eq!(m.apply(&convert("t", spec())), ApplyOutcome::Applied);
+    assert_eq!(m.apply(&revert("t", "a")), ApplyOutcome::Applied);
+    let after = m.clone();
+    assert_eq!(m.apply(&revert("t", "a")), ApplyOutcome::NoOp);
+    // A duplicate naming another Region (a racing request) is also a no-op:
+    // the first revert's Region stands.
+    assert_eq!(m.apply(&revert("t", "b")), ApplyOutcome::NoOp);
+    assert_eq!(m, after);
+    assert_eq!(
+        m.apply(&revert("nope", "a")),
+        ApplyOutcome::Rejected("no such table schema")
+    );
+    // Converting again after a revert is an ordinary conversion.
+    assert_eq!(m.apply(&convert("t", spec())), ApplyOutcome::Applied);
+    assert!(m.policies[&TabletId(1)].is_pinned());
+}
+
+/// An MREC table is not a strongly consistent one: the command never touches it.
+#[test]
+fn revert_rejects_an_mrec_table() {
+    let mut m = world(&[1, 3, 5]);
+    assert_eq!(
+        m.apply(&MetaCommand::ConvertTableToMrec {
+            table: "t".into(),
+            local_region: "a".into(),
+            region_id: animus_control::mrec_region_id("a"),
+        }),
+        ApplyOutcome::Applied
+    );
+    let before = m.clone();
+    assert_eq!(
+        m.apply(&revert("t", "a")),
+        ApplyOutcome::Rejected("table is not a strongly consistent global table")
+    );
+    assert_eq!(m, before);
+}
+
+/// A Region none of whose members is left (all `Leaving`) cannot hold the table.
+#[test]
+fn revert_rejects_a_region_with_no_member() {
+    let mut m = world(&[1, 3, 5]);
+    assert_eq!(m.apply(&convert("t", spec())), ApplyOutcome::Applied);
+    for n in [5, 6] {
+        m.apply(&MetaCommand::UpsertMember {
+            node: nid(n),
+            labels: m.members[&nid(n)].labels.clone(),
+            status: NodeStatus::Leaving,
+        });
+    }
+    let before = m.clone();
+    assert_eq!(
+        m.apply(&revert("t", "c")),
+        ApplyOutcome::Rejected("no cluster member carries the kept region")
+    );
+    assert_eq!(m, before);
+}
+
+/// The table's tablets get the regional policy, an unrelated table keeps its own.
+#[test]
+fn revert_rewrites_the_tables_tablets_only() {
+    let mut m = world(&[1, 3, 5]);
+    assert_eq!(
+        m.apply(&MetaCommand::CreateTableSchema {
+            table: "other".into(),
+            schema: TableSchema::simple("id", ColumnType::String),
+        }),
+        ApplyOutcome::Applied
+    );
+    assert_eq!(
+        m.apply(&MetaCommand::CreateTablet {
+            tablet: TabletId(3),
+            table: Some("other".into()),
+            range: KeyRange::whole(),
+            replicas: vec![nid(1), nid(3), nid(5)],
+        }),
+        ApplyOutcome::Applied
+    );
+    assert_eq!(
+        m.apply(&MetaCommand::SetTabletPolicy {
+            tablet: TabletId(3),
+            policy: Some(PlacementPolicy::simple("o", 3)),
+        }),
+        ApplyOutcome::Applied
+    );
+    assert_eq!(m.apply(&convert("t", spec())), ApplyOutcome::Applied);
+    assert_eq!(m.apply(&revert("t", "b")), ApplyOutcome::Applied);
+    assert_eq!(m.policies[&TabletId(1)].name, "regional:t");
+    assert_eq!(m.policies[&TabletId(3)], PlacementPolicy::simple("o", 3));
+}
+
+/// Convergence (ordinary reconcile, no new mover): from every replica spread
+/// and every kept Region, the repair pass puts every replica in the kept
+/// Region and then goes quiet; the same with one kept-Region node down (the
+/// survivor is kept, no cross-Region fallback) and with a zone-labelled Region
+/// of three nodes (RF 3, spread over the zones).
+#[test]
+fn revert_converges_every_replica_into_the_kept_region() {
+    let none = std::collections::BTreeSet::new();
+    let no_nodes = std::collections::BTreeSet::new();
+    for keep in ["a", "b", "c"] {
+        for start in [[1u64, 3, 5], [2, 4, 6], [1, 2, 3], [5, 6, 1]] {
+            let mut m = world(&start);
+            assert_eq!(m.apply(&convert("t", spec())), ApplyOutcome::Applied);
+            assert_eq!(m.apply(&revert("t", keep)), ApplyOutcome::Applied);
+            let mut rounds = 0;
+            loop {
+                let cmds = m.reconcile(&none, &no_nodes);
+                if cmds.is_empty() {
+                    break;
+                }
+                rounds += 1;
+                assert!(rounds <= 4, "keep={keep} start={start:?}: no convergence");
+                for c in &cmds {
+                    assert!(matches!(c, MetaCommand::CasTabletReplicas { .. }));
+                    assert_eq!(m.apply(c), ApplyOutcome::Applied);
+                }
+            }
+            let reps = &m.tablets[&TabletId(1)].replicas;
+            assert_eq!(reps.len(), 2, "keep={keep} start={start:?}: {reps:?}");
+            assert!(
+                reps.iter().all(|n| region_of(&m, n) == keep),
+                "keep={keep} start={start:?}: {reps:?}"
+            );
+        }
+    }
+}
+
+/// While the kept Region has fewer live nodes than its RF, repair never
+/// shrinks the set (the documented `replan_repair` growth-only rule): the
+/// table keeps its existing replicas and recruits no other Region; once the
+/// Region's node is back, it converges inside the Region.
+#[test]
+fn revert_with_a_down_node_in_the_kept_region_waits_then_converges() {
+    let none = std::collections::BTreeSet::new();
+    let no_nodes = std::collections::BTreeSet::new();
+    let mut m = world(&[1, 3, 5]);
+    assert_eq!(m.apply(&convert("t", spec())), ApplyOutcome::Applied);
+    assert_eq!(m.apply(&revert("t", "a")), ApplyOutcome::Applied);
+    let labels = m.members[&nid(2)].labels.clone();
+    m.apply(&MetaCommand::UpsertMember {
+        node: nid(2),
+        labels: labels.clone(),
+        status: NodeStatus::Down,
+    });
+    assert!(
+        m.reconcile(&none, &no_nodes).is_empty(),
+        "no shrink, no cross-Region move"
+    );
+    assert_eq!(
+        m.tablets[&TabletId(1)].replicas,
+        vec![nid(1), nid(3), nid(5)]
+    );
+    m.apply(&MetaCommand::UpsertMember {
+        node: nid(2),
+        labels,
+        status: NodeStatus::Active,
+    });
+    for _ in 0..4 {
+        for c in m.reconcile(&none, &no_nodes) {
+            assert_eq!(m.apply(&c), ApplyOutcome::Applied);
+        }
+    }
+    assert_eq!(m.tablets[&TabletId(1)].replicas, vec![nid(1), nid(2)]);
+}
+
+/// A kept Region with three zone-labelled nodes keeps RF 3 with a best-effort
+/// spread over the zones.
+#[test]
+fn revert_keeps_rf3_and_zone_spread_when_the_region_can_honour_it() {
+    let mut m = Metadata::default();
+    for (n, region, zone) in [
+        (1, "a", "z1"),
+        (2, "a", "z2"),
+        (3, "a", "z3"),
+        (4, "b", "z1"),
+        (5, "c", "z1"),
+    ] {
+        let labels = BTreeMap::from([
+            (REGION_LABEL.to_string(), region.to_string()),
+            (animus_placement::ZONE_LABEL.to_string(), zone.to_string()),
+        ]);
+        m.apply(&MetaCommand::UpsertMember {
+            node: nid(n),
+            labels,
+            status: NodeStatus::Active,
+        });
+    }
+    m.apply(&MetaCommand::CreateTableSchema {
+        table: "t".into(),
+        schema: TableSchema::simple("id", ColumnType::String),
+    });
+    m.apply(&MetaCommand::CreateTablet {
+        tablet: TabletId(1),
+        table: Some("t".into()),
+        range: KeyRange::whole(),
+        replicas: vec![nid(1), nid(4), nid(5)],
+    });
+    assert_eq!(m.apply(&convert("t", spec())), ApplyOutcome::Applied);
+    assert_eq!(m.apply(&revert("t", "a")), ApplyOutcome::Applied);
+    let p = &m.policies[&TabletId(1)];
+    assert_eq!(p.replication_factor, 3);
+    let spread = p.spread.as_ref().expect("zone spread");
+    assert_eq!(spread.domain, animus_placement::ZONE_LABEL);
+    assert!(!spread.strict);
+    let none = std::collections::BTreeSet::new();
+    let no_nodes = std::collections::BTreeSet::new();
+    for _ in 0..4 {
+        for c in m.reconcile(&none, &no_nodes) {
+            assert_eq!(m.apply(&c), ApplyOutcome::Applied);
+        }
+    }
+    assert_eq!(
+        m.tablets[&TabletId(1)].replicas,
+        vec![nid(1), nid(2), nid(3)]
+    );
+}
+
+/// The gate row (mutation: downgrade it to `GlobalTables` or `Base` and this
+/// fails) and the pinned JSON shape (class G: a moved field would change what
+/// an older binary cannot decode).
+#[test]
+fn revert_requires_its_own_gate_and_pins_its_json() {
+    let cmd = revert("t", "a");
+    assert_eq!(cmd.required_gate(), Gate::MrscReplicaRemoval);
+    assert_eq!(Gate::MrscReplicaRemoval.version(), Some(7));
+    assert_ne!(cmd.required_gate(), Gate::GlobalTables);
+    assert_eq!(
+        serde_json::to_string(&cmd).unwrap(),
+        r#"{"RevertGlobalToRegional":{"table":"t","keep_region":"a"}}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<MetaCommand>(
+            r#"{"RevertGlobalToRegional":{"table":"t","keep_region":"a"}}"#
+        )
+        .unwrap(),
+        cmd
+    );
 }

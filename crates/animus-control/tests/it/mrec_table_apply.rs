@@ -8,8 +8,8 @@
 //! but inert until the M4 wire surface.
 
 use animus_control::schema::{
-    GlobalSpecError, GlobalTableSpec, MrecReplica, MrecReplicaStatus, MultiRegionConsistency,
-    mrec_region_id,
+    GlobalSpecError, GlobalTableSpec, MrecReplica, MrecReplicaOverrides, MrecReplicaStatus,
+    MultiRegionConsistency, mrec_region_id,
 };
 use animus_control::version::{Gate, GatedCommand};
 use animus_control::{
@@ -91,6 +91,7 @@ fn convert_records_an_active_local_replica_and_leaves_placement_alone() {
             status: MrecReplicaStatus::Active,
             local: true,
             copied: Default::default(),
+            overrides: Default::default(),
         }]
     );
     assert_eq!(m.policies, policies_before, "MREC never touches placement");
@@ -130,6 +131,7 @@ fn convert_rejections_are_named() {
         witness: None,
         preferred_leader_region: "a".into(),
         replicas: Vec::new(),
+        legacy: None,
     };
     assert_eq!(
         strong.apply(&MetaCommand::ConvertTableToGlobal {
@@ -265,7 +267,9 @@ fn convert_to_global_refuses_an_eventual_spec_and_gates_it_by_content() {
             status: MrecReplicaStatus::Active,
             local: true,
             copied: Default::default(),
+            overrides: Default::default(),
         }],
+        legacy: None,
     };
     let cmd = MetaCommand::ConvertTableToGlobal {
         table: "t".into(),
@@ -303,6 +307,7 @@ fn spec_validation_matrix() {
         status: MrecReplicaStatus::Active,
         local,
         copied: Default::default(),
+        overrides: Default::default(),
     };
     let spec = |replicas: Vec<MrecReplica>| GlobalTableSpec {
         consistency: MultiRegionConsistency::Eventual,
@@ -310,6 +315,7 @@ fn spec_validation_matrix() {
         witness: None,
         preferred_leader_region: String::new(),
         replicas,
+        legacy: None,
     };
     assert_eq!(spec(vec![ok("a", true)]).validate(), Ok(()));
     assert_eq!(spec(vec![ok("a", true), ok("b", false)]).validate(), Ok(()));
@@ -345,6 +351,7 @@ fn spec_validation_matrix() {
         witness: None,
         preferred_leader_region: "a".into(),
         replicas: vec![ok("a", true)],
+        legacy: None,
     };
     assert_eq!(strong.validate(), Err(GlobalSpecError::ModeFieldsMixed));
     strong.replicas.clear();
@@ -424,4 +431,198 @@ fn mark_mrec_copied_records_tablets_idempotently() {
             .is_empty()
     );
     assert_eq!(mark("eu", 1).required_gate(), Gate::MrecReplication);
+}
+
+// ---------------------------------------------------------------------------
+// Per-replica read-capacity overrides (ADR 0075's 2026-10-21 amendment, gate
+// `MrecReplicaOverrides`).
+// ---------------------------------------------------------------------------
+
+fn set_overrides(
+    region: &str,
+    read: Option<u64>,
+    idx: &[(&str, u64)],
+    stamp: u64,
+    origin: u32,
+) -> MetaCommand {
+    MetaCommand::SetMrecReplicaOverrides {
+        table: "t".into(),
+        region: region.into(),
+        overrides: MrecReplicaOverrides {
+            read_units: read,
+            index_read_units: idx.iter().map(|(n, u)| ((*n).to_owned(), *u)).collect(),
+            stamp,
+            origin,
+        },
+    }
+}
+
+fn mrec_world() -> Metadata {
+    let mut m = world();
+    assert_eq!(m.apply(&convert("t", "us")), ApplyOutcome::Applied);
+    assert_eq!(m.apply(&add("t", "eu")), ApplyOutcome::Applied);
+    m
+}
+
+fn overrides_of(m: &Metadata, region: &str) -> MrecReplicaOverrides {
+    m.table_global("t")
+        .unwrap()
+        .replicas
+        .iter()
+        .find(|r| r.region == region)
+        .unwrap()
+        .overrides
+        .clone()
+}
+
+/// The command applies, is idempotent, and last-writer-wins by
+/// `(stamp, origin)`: a stale or equal record is a no-op (never an error), a
+/// newer one replaces the whole record, and a clear keeps its stamp as a
+/// tombstone so a stale push cannot resurrect the override.
+#[test]
+fn set_overrides_is_idempotent_and_last_writer_wins() {
+    let mut m = mrec_world();
+    let first = set_overrides("eu", Some(400), &[("gsi", 200)], 10, 1);
+    assert_eq!(m.apply(&first), ApplyOutcome::Applied);
+    assert_eq!(m.apply(&first), ApplyOutcome::NoOp, "idempotent");
+    assert_eq!(overrides_of(&m, "eu").read_units, Some(400));
+    assert_eq!(overrides_of(&m, "eu").index_read_units["gsi"], 200);
+    assert!(
+        overrides_of(&m, "us").is_unset(),
+        "other replicas untouched"
+    );
+    // A stale stamp (even with different content) loses.
+    assert_eq!(
+        m.apply(&set_overrides("eu", Some(1), &[], 9, 1)),
+        ApplyOutcome::NoOp
+    );
+    assert_eq!(overrides_of(&m, "eu").read_units, Some(400));
+    // Equal stamp: the higher origin wins, the lower loses.
+    assert_eq!(
+        m.apply(&set_overrides("eu", Some(500), &[], 10, 0)),
+        ApplyOutcome::NoOp
+    );
+    assert_eq!(
+        m.apply(&set_overrides("eu", Some(500), &[], 10, 2)),
+        ApplyOutcome::Applied
+    );
+    assert_eq!(overrides_of(&m, "eu").read_units, Some(500));
+    assert!(overrides_of(&m, "eu").index_read_units.is_empty());
+    // A clear is a newer record with nothing set: a tombstone.
+    assert_eq!(
+        m.apply(&set_overrides("eu", None, &[], 20, 1)),
+        ApplyOutcome::Applied
+    );
+    let o = overrides_of(&m, "eu");
+    assert!(o.is_empty() && !o.is_unset() && o.stamp == 20);
+    assert_eq!(
+        m.apply(&set_overrides("eu", Some(500), &[], 10, 2)),
+        ApplyOutcome::NoOp,
+        "a stale push cannot resurrect a cleared override"
+    );
+    // The local replica takes an override too (a Region may override its own).
+    assert_eq!(
+        m.apply(&set_overrides("us", Some(7), &[], 1, 1)),
+        ApplyOutcome::Applied
+    );
+    assert_eq!(m.local_read_override("t"), Some(7));
+}
+
+#[test]
+fn set_overrides_rejections_are_named_and_leave_state_untouched() {
+    let mut m = world();
+    assert_eq!(
+        rejected(&mut m, &set_overrides("eu", Some(1), &[], 1, 1)),
+        "table is not an MREC global table"
+    );
+    assert_eq!(m.apply(&convert("t", "us")), ApplyOutcome::Applied);
+    assert_eq!(
+        rejected(&mut m, &set_overrides("eu", Some(1), &[], 1, 1)),
+        "no such MREC replica"
+    );
+    assert_eq!(m.apply(&add("t", "eu")), ApplyOutcome::Applied);
+    assert_eq!(
+        rejected(&mut m, &set_overrides("eu", Some(0), &[], 1, 1)),
+        "a read capacity override must be at least 1"
+    );
+    assert_eq!(
+        rejected(&mut m, &set_overrides("eu", None, &[("g", 0)], 1, 1)),
+        "a read capacity override must be at least 1"
+    );
+    assert_eq!(
+        rejected(&mut m, &set_overrides("eu", None, &[("", 5)], 1, 1)),
+        "an index read capacity override names an empty index"
+    );
+}
+
+/// Only the *local* replica's override reaches the admission budget; the
+/// table-level and per-GSI (hidden table `<base>$<index>`) lookups are
+/// separate; a peer's override and an unknown index are inert; and the
+/// catalog-wide "anything throttled" flag sees a local override even on a
+/// table with no `ProvisionedThroughput`.
+#[test]
+fn local_read_override_reads_only_the_local_replica() {
+    let mut m = mrec_world();
+    assert_eq!(m.local_read_override("t"), None);
+    assert!(!m.any_table_throughput());
+    assert_eq!(
+        m.apply(&set_overrides("eu", Some(5), &[("gsi", 9)], 1, 1)),
+        ApplyOutcome::Applied
+    );
+    assert_eq!(
+        m.local_read_override("t"),
+        None,
+        "a peer's override is inert here"
+    );
+    assert!(!m.any_table_throughput());
+    assert_eq!(
+        m.apply(&set_overrides("us", Some(40), &[("gsi", 20)], 2, 1)),
+        ApplyOutcome::Applied
+    );
+    assert_eq!(m.local_read_override("t"), Some(40));
+    assert_eq!(m.local_read_override("t$gsi"), Some(20));
+    assert_eq!(m.local_read_override("t$other"), None);
+    assert_eq!(m.local_read_override("nope"), None);
+    assert!(m.any_table_throughput());
+    // Cleared: back to the table's own budget.
+    assert_eq!(
+        m.apply(&set_overrides("us", None, &[], 3, 1)),
+        ApplyOutcome::Applied
+    );
+    assert_eq!(m.local_read_override("t"), None);
+    assert!(!m.any_table_throughput());
+}
+
+/// The gate row, the content-independence of the apply (it never consults the
+/// gate), and a mirror round-trip: the schema row derived from the command
+/// rebuilds the identical `Metadata` on a data-only node.
+#[test]
+fn overrides_gate_row_and_mirror_round_trip() {
+    use animus_control::mirror::{self, KeyWrite};
+    let cmd = set_overrides("eu", Some(400), &[("gsi", 200)], 10, 1);
+    assert_eq!(cmd.required_gate(), Gate::MrecReplicaOverrides);
+    assert_eq!(
+        Gate::MrecReplicaOverrides.version(),
+        Some(animus_control::version::MREC_REPLICA_OVERRIDES_VERSION)
+    );
+    assert!(Gate::MrecReplicaOverrides.rank() > Gate::MrecReplication.rank());
+    // Apply never consults a gate (ADR 0073 decision 4): era-0 metadata applies.
+    let mut mirror_side = Metadata::default();
+    let mut oracle = world();
+    for c in [convert("t", "us"), add("t", "eu"), cmd] {
+        let (outcome, writes) = mirror::apply_and_derive_mirror(&mut oracle, &c);
+        assert_eq!(outcome, ApplyOutcome::Applied, "{c:?}");
+        assert!(!writes.is_empty());
+        for w in &writes {
+            if let KeyWrite::Put(..) = w {
+                mirror::apply_key_write(&mut mirror_side, w);
+            }
+        }
+    }
+    assert_eq!(
+        mirror_side.schemas.get("t").and_then(|s| s.global.clone()),
+        oracle.schemas.get("t").and_then(|s| s.global.clone()),
+        "the mirrored schema row carries the overrides"
+    );
+    assert_eq!(overrides_of(&oracle, "eu").read_units, Some(400));
 }

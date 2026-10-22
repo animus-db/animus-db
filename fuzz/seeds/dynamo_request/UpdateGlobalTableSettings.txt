@@ -1,0 +1,2 @@
+UpdateGlobalTableSettings
+{"GlobalTableName": "tbl", "GlobalTableBillingMode": "PROVISIONED", "GlobalTableProvisionedWriteCapacityUnits": 5, "ReplicaSettingsUpdate": [{"RegionName": "b", "ReplicaProvisionedReadCapacityUnits": 3}]}

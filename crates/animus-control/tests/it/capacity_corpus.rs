@@ -692,6 +692,7 @@ fn cell12_a_full_region_refuses_the_conversion_and_a_lost_region_waits() {
             witness: None,
             preferred_leader_region: "a".into(),
             replicas: Vec::new(),
+            legacy: None,
         };
         assert_eq!(
             m.apply(&MetaCommand::ConvertTableToGlobal {

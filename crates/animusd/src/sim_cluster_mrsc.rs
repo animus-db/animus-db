@@ -301,6 +301,14 @@ impl Run {
     // ---- bring-up ---------------------------------------------------------
 
     fn boot(seed: u64) -> Run {
+        Run::boot_at(seed, 2)
+    }
+
+    /// [`boot`](Self::boot) rolled to cluster `version` (every node a
+    /// `Release(version)` binary, finalized one step at a time through the
+    /// real admin path): `2` is the G-c surface every pre-existing cell runs
+    /// on, `7` adds `Gate::MrscReplicaRemoval` (the replica-removal cells).
+    fn boot_at(seed: u64, version: u32) -> Run {
         let mut c = SimCluster::new_with_node_labels_lsm(seed, 3, labels());
         apply_wan(&mut c);
         let _ = c.control_leader_index();
@@ -330,25 +338,51 @@ impl Run {
                 Err("era not active everywhere".into())
             }
         });
-        let leader = {
-            let idx = run.c.control_leader_index();
-            run.c.control_node_id(idx)
-        };
-        let (s, b) = run.c.admin(
-            leader,
-            "POST",
-            "/admin/cluster-version/finalize",
-            "",
-            br#"{"to":2,"expected":1}"#,
-        );
-        assert_eq!(s, 200, "seed={seed}: finalize: {b}");
-        run.must("cluster version 2", |c| {
-            if (0..NODES).all(|n| c.features(n).cluster_version() == 2) {
-                Ok(())
-            } else {
-                Err("not at version 2".into())
+        for step in 2..=version {
+            if step > 2 {
+                // Roll the whole cluster to the next binary (the model's
+                // `Release(n)` range is `[n-1, n]`, so it can only be played
+                // once the cluster is at `n-1`), wait for every record, then
+                // finalize.
+                for n in 0..NODES {
+                    run.c.set_binary_profile(n, BinaryProfile::Release(step));
+                    run.c.set_node_version(n, Some(VersionRange::new(1, step)));
+                }
+                run.must(&format!("[1,{step}] records"), |c| {
+                    if (0..NODES).all(|n| {
+                        let m = c.metadata(n);
+                        m.node_versions.len() == NODES as usize
+                            && m.node_versions
+                                .values()
+                                .all(|v| v.range == VersionRange::new(1, step))
+                    }) {
+                        Ok(())
+                    } else {
+                        Err(format!("not every node recorded at [1,{step}]"))
+                    }
+                });
             }
-        });
+            let leader = {
+                let idx = run.c.control_leader_index();
+                run.c.control_node_id(idx)
+            };
+            let body = format!(r#"{{"to":{step},"expected":{}}}"#, step - 1);
+            let (s, b) = run.c.admin(
+                leader,
+                "POST",
+                "/admin/cluster-version/finalize",
+                "",
+                body.as_bytes(),
+            );
+            assert_eq!(s, 200, "seed={seed}: finalize to {step}: {b}");
+            run.must(&format!("cluster version {step}"), |c| {
+                if (0..NODES).all(|n| c.features(n).cluster_version() == step) {
+                    Ok(())
+                } else {
+                    Err(format!("not at version {step}"))
+                }
+            });
+        }
         run
     }
 
@@ -999,6 +1033,338 @@ fn cell_drain_last_node_of_region_refused(seed: u64) {
     run.workload("glob1", &live);
 }
 
+// ---------------------------------------------------------------------------
+// Replica removal: an MRSC table reverts to a single-Region table (ADR 0075,
+// 2026-10-21 amendment; `Gate::MrscReplicaRemoval`, cluster version 7)
+// ---------------------------------------------------------------------------
+
+/// The cluster version the replica-removal cells run at (`Gate::
+/// MrscReplicaRemoval`).
+const REMOVAL_VERSION: u32 = 7;
+
+/// `UpdateTable` deleting `replicas` (and the witness, when `witness` names
+/// one) of `table`, received by node `via`.
+fn delete_regions(
+    run: &mut Run,
+    via: u64,
+    table: &str,
+    replicas: &[&str],
+    witness: Option<&str>,
+) -> (u16, Value) {
+    let reps: Vec<String> = replicas
+        .iter()
+        .map(|r| format!(r#"{{"Delete":{{"RegionName":"{r}"}}}}"#))
+        .collect();
+    let mut body = format!(
+        r#"{{"TableName":"{table}","ReplicaUpdates":[{}]"#,
+        reps.join(",")
+    );
+    if let Some(w) = witness {
+        body.push_str(&format!(
+            r#","GlobalTableWitnessUpdates":[{{"Delete":{{"RegionName":"{w}"}}}}]"#
+        ));
+    }
+    body.push('}');
+    call(&mut run.c, via, "UpdateTable", &body)
+}
+
+/// The reverted-table invariant: no global spec, and every routable tablet
+/// has exactly one replica on each node of `keep` (a two-node Region holds
+/// two replicas), under a regional (unpinned) policy restricted to `keep`.
+fn reverted_into(meta: &Metadata, table: &str, keep: &str) -> Result<(), String> {
+    if meta.table_global(table).is_some() {
+        return Err(format!("{table}: still a global table"));
+    }
+    let want: BTreeSet<u64> = nodes_of_region(keep).into_iter().collect();
+    let mut any = false;
+    for (id, tab) in meta
+        .tablets_for_table(table)
+        .filter(|(_, t)| t.is_routable())
+    {
+        any = true;
+        let have: BTreeSet<u64> = tab.replicas.iter().map(node_index).collect();
+        if have != want {
+            return Err(format!(
+                "{table} tablet {id:?}: replicas {have:?}, want {want:?}"
+            ));
+        }
+        let p = meta.policies.get(id).ok_or("no policy")?;
+        if p.is_pinned()
+            || p.allowed_values.get(REGION_LABEL) != Some(&BTreeSet::from([keep.to_owned()]))
+        {
+            return Err(format!("{table} tablet {id:?}: policy {p:?}"));
+        }
+    }
+    if any {
+        Ok(())
+    } else {
+        Err(format!("{table}: no routable tablet"))
+    }
+}
+
+impl Run {
+    /// Converged-or-timeout: the table is a regional table in `keep`, every
+    /// tablet is led from `keep`, and no live node outside `keep` still hosts
+    /// a replica group of it (the removed replicas really left).
+    fn reverted(&mut self, table: &str, keep: &str) {
+        let (t, k) = (table.to_owned(), keep.to_owned());
+        let dead = self.dead.clone();
+        self.must(&format!("{table} reverted into {keep}"), move |c| {
+            let live = (0..NODES).find(|n| !dead.contains(n)).expect("a live node");
+            let meta = c.metadata(live);
+            reverted_into(&meta, &t, &k)?;
+            leaders_in(c, &meta, &t, &dead, &k)?;
+            let ids: BTreeSet<TabletId> = meta.tablets_for_table(&t).map(|(i, _)| *i).collect();
+            for n in (0..NODES).filter(|n| !dead.contains(n) && region_of_node(*n) != k) {
+                if c.hosted_tablets(n).iter().any(|h| ids.contains(h)) {
+                    return Err(format!("n{n} still hosts a replica of {t}"));
+                }
+            }
+            Ok(())
+        });
+    }
+
+    /// Acked writes through `via` while the cluster converges: `rounds` of one
+    /// virtual second and one put each (every put must ack: a quorum survives
+    /// every fault these cells inject).
+    fn write_while_converging(&mut self, table: &str, via: &[u64], rounds: usize) {
+        for _ in 0..rounds {
+            self.c.run_for(Duration::from_secs(1));
+            assert!(
+                self.put_unique(table, via, 30),
+                "seed={}: a put on {table} never acked while the table was converging",
+                self.seed
+            );
+        }
+    }
+}
+
+/// A single transactional put on `table` through `node`.
+fn transact_put(c: &mut SimCluster, node: u64, table: &str, pk: &str) -> (u16, Value) {
+    let body = format!(
+        r#"{{"TransactItems":[{{"Put":{{"TableName":"{table}","Item":{{"pk":{{"S":"{pk}"}},"v":{{"S":"t"}}}}}}}}]}}"#
+    );
+    call(c, node, "TransactWriteItems", &body)
+}
+
+fn enable_ttl(c: &mut SimCluster, node: u64, table: &str) -> (u16, Value) {
+    let body = format!(
+        r#"{{"TableName":"{table}","TimeToLiveSpecification":{{"AttributeName":"ttl","Enabled":true}}}}"#
+    );
+    call(c, node, "UpdateTimeToLive", &body)
+}
+
+/// The MRSC restrictions hold while global and fall away on revert.
+fn expect_mrsc_restrictions(run: &mut Run, table: &str) {
+    let seed = run.seed;
+    let (s, v) = transact_put(&mut run.c, 0, table, "t0");
+    assert_eq!(s, 400, "seed={seed}: transaction on a global table: {v}");
+    let (s, v) = enable_ttl(&mut run.c, 0, table);
+    assert_eq!(s, 400, "seed={seed}: TTL on a global table: {v}");
+}
+
+/// The surface of a reverted table: `DescribeTable` carries no global
+/// fields, `/admin/global-tables` does not list it, and the restrictions tied
+/// to MRSC (transactions, TTL) no longer apply.
+fn check_regional_surface(run: &mut Run, table: &str, via: u64) {
+    let seed = run.seed;
+    let body = format!(r#"{{"TableName":"{table}"}}"#);
+    let (s, v) = call(&mut run.c, via, "DescribeTable", &body);
+    assert_eq!(s, 200, "seed={seed}: DescribeTable: {v}");
+    for key in [
+        "GlobalTableVersion",
+        "Replicas",
+        "MultiRegionConsistency",
+        "GlobalTableWitnesses",
+    ] {
+        assert!(
+            v["Table"].get(key).is_none(),
+            "seed={seed}: {key} on a reverted table: {}",
+            v["Table"]
+        );
+    }
+    assert_eq!(v["Table"]["TableStatus"], "ACTIVE", "seed={seed}: {v}");
+    let (s, body) = run.c.admin(via, "GET", "/admin/global-tables", "", b"");
+    assert_eq!(s, 200, "seed={seed}: global-tables: {body}");
+    let g: Value = serde_json::from_str(&body).expect("json");
+    assert!(
+        g["tables"]
+            .as_array()
+            .is_none_or(|a| a.iter().all(|t| t["table"] != table)),
+        "seed={seed}: {table} still listed: {g}"
+    );
+    let mut ok = false;
+    for i in 0..30 {
+        let (s, v) = transact_put(&mut run.c, via, table, &format!("t{i}"));
+        if s == 200 {
+            ok = true;
+            break;
+        }
+        assert_ne!(s, 400, "seed={seed}: transaction still refused: {v}");
+    }
+    assert!(ok, "seed={seed}: a transaction never committed on {table}");
+    let (s, v) = enable_ttl(&mut run.c, via, table);
+    assert_eq!(s, 200, "seed={seed}: TTL after the revert: {v}");
+}
+
+/// Delete r-b and r-c through a node of r-a (the preferred Region): the table
+/// becomes a regular table whose replicas all live in r-a; the writer keeps
+/// acking throughout, no acked write is lost, transactions and TTL become
+/// allowed, and the decommission guard no longer holds the old Regions.
+fn cell_revert_keep_preferred(seed: u64) {
+    let mut run = Run::boot_at(seed, REMOVAL_VERSION);
+    run.global_table("glob1", false);
+    run.workload("glob1", &all_nodes());
+    expect_mrsc_restrictions(&mut run, "glob1");
+    // A single Region, or the wrong shape, is refused by name and changes
+    // nothing.
+    for (reps, want) in [
+        (
+            vec!["r-b"],
+            "single replica or the witness cannot be deleted",
+        ),
+        (vec!["r-b", "r-z"], "not a replica Region"),
+        (vec!["r-a", "r-b", "r-c"], "all Regions"),
+    ] {
+        let (s, v) = delete_regions(&mut run, 0, "glob1", &reps, None);
+        assert_eq!(s, 400, "seed={seed}: {reps:?}: {v}");
+        assert!(
+            v["message"].as_str().is_some_and(|m| m.contains(want)),
+            "seed={seed}: {reps:?}: {v}"
+        );
+    }
+    run.converged("glob1", "r-a");
+    let (s, v) = delete_regions(&mut run, 0, "glob1", &["r-b", "r-c"], None);
+    assert_eq!(s, 200, "seed={seed}: revert: {v}");
+    assert!(
+        v["TableDescription"].get("Replicas").is_none(),
+        "seed={seed}: {v}"
+    );
+    let live = run.live();
+    run.write_while_converging("glob1", &live, 5);
+    run.reverted("glob1", "r-a");
+    run.workload("glob1", &all_nodes());
+    check_regional_surface(&mut run, "glob1", 0);
+    // Idempotent: the same request on a regional table is refused by name (a
+    // regional table has no replica to delete), nothing changes.
+    let (s, _) = delete_regions(&mut run, 0, "glob1", &["r-b", "r-c"], None);
+    assert_eq!(s, 400, "seed={seed}: a second revert must not be accepted");
+    // The old Regions are free to drain: both nodes of r-c, the second of
+    // which the guard refused while the table was global.
+    for node in [4u64, 5] {
+        let leader = {
+            let idx = run.c.control_leader_index();
+            run.c.control_node_id(idx)
+        };
+        let body = format!(r#"{{"node":"n{node}"}}"#);
+        let (s, resp) = run
+            .c
+            .admin(leader, "POST", "/admin/drain", "", body.as_bytes());
+        assert_eq!(
+            s, 200,
+            "seed={seed}: drain n{node} of a freed Region: {resp}"
+        );
+    }
+    run.workload("glob1", &[0, 1, 2, 3]);
+    run.caught_up();
+}
+
+/// Which node dies while the table converges.
+#[derive(Clone, Copy)]
+enum Kill {
+    /// The control-plane leader (the proposer of every placement move).
+    ControlLeader,
+    /// The leader of the table's tablet (in the preferred Region, which is
+    /// being deleted).
+    TabletLeader,
+}
+
+/// Delete r-a (the preferred Region) and r-c through a node of r-b, keeping
+/// r-b, and kill a node right after the request: the revert and the replica
+/// moves converge under the new leader, nothing acked is lost, and the killed
+/// node, restarted, releases its stale replica instead of resurrecting it.
+fn revert_with_kill(seed: u64, kill: Kill) {
+    let mut run = Run::boot_at(seed, REMOVAL_VERSION);
+    run.global_table("glob1", false);
+    run.workload("glob1", &all_nodes());
+    let (s, v) = delete_regions(&mut run, 2, "glob1", &["r-a", "r-c"], None);
+    assert_eq!(s, 200, "seed={seed}: revert: {v}");
+    let victim = match kill {
+        Kill::ControlLeader => {
+            let idx = run.c.control_leader_index();
+            run.c.control_node_id(idx)
+        }
+        Kill::TabletLeader => {
+            let live = run.live()[0];
+            let id = tablets_of(&mut run.c, live, "glob1")[0];
+            leader_of(&run.c, id, &run.dead).expect("a leader").0
+        }
+    };
+    run.c.crash(victim);
+    run.dead.insert(victim);
+    let live = run.live();
+    run.write_while_converging("glob1", &live, 5);
+    run.reverted("glob1", "r-b");
+    run.workload("glob1", &live);
+    run.c.restart(victim);
+    run.dead.remove(&victim);
+    run.reverted("glob1", "r-b");
+    run.workload("glob1", &all_nodes());
+    check_regional_surface(&mut run, "glob1", 2);
+    run.caught_up();
+}
+
+fn cell_revert_control_leader_kill(seed: u64) {
+    revert_with_kill(seed, Kill::ControlLeader);
+}
+
+fn cell_revert_tablet_leader_kill(seed: u64) {
+    revert_with_kill(seed, Kill::TabletLeader);
+}
+
+/// The witness form (r-c witness): delete the witness and r-b through a node
+/// of r-a while r-b is partitioned from the rest during the convergence. The
+/// majority side keeps committing and converges; after the heal the cut
+/// Region's replica is gone too and no acked write was lost.
+fn cell_revert_witness_form_partition(seed: u64) {
+    let mut run = Run::boot_at(seed, REMOVAL_VERSION);
+    run.global_table("glob1", true);
+    run.workload("glob1", &all_nodes());
+    // The witness cannot be the Region that remains.
+    let (s, v) = delete_regions(&mut run, 0, "glob1", &["r-a", "r-b"], None);
+    assert_eq!(s, 400, "seed={seed}: {v}");
+    assert!(
+        v["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("must be a replica, not the witness")),
+        "seed={seed}: {v}"
+    );
+    // A lone witness Delete is the AWS-refused single removal.
+    let (s, v) = delete_regions(&mut run, 0, "glob1", &[], Some("r-c"));
+    assert_eq!(s, 400, "seed={seed}: {v}");
+    let cut = nodes_of_region("r-b");
+    let rest: Vec<u64> = (0..NODES).filter(|n| !cut.contains(n)).collect();
+    let (s, v) = delete_regions(&mut run, 0, "glob1", &["r-b"], Some("r-c"));
+    assert_eq!(s, 200, "seed={seed}: revert: {v}");
+    for a in &cut {
+        for b in &rest {
+            run.c.partition(*a, *b);
+        }
+    }
+    run.write_while_converging("glob1", &rest, 8);
+    let sim = run.c.simulator();
+    for a in &cut {
+        for b in &rest {
+            sim.heal(nid(*a), nid(*b));
+        }
+    }
+    apply_wan(&mut run.c);
+    run.reverted("glob1", "r-a");
+    run.workload("glob1", &all_nodes());
+    check_regional_surface(&mut run, "glob1", 0);
+    run.caught_up();
+}
+
 type CellFn = fn(u64);
 
 /// Run one cell over every seed (`ANIMUS_MRSC_SEEDS`/`ANIMUS_SEED`), unless
@@ -1045,6 +1411,14 @@ cell_tests! {
         ("witness_form_region_loss", cell_witness_form_region_loss),
     sim_cluster_mrsc_corpus_drain_last_node_of_region_refused =>
         ("drain_last_node_of_region_refused", cell_drain_last_node_of_region_refused),
+    sim_cluster_mrsc_corpus_revert_keep_preferred =>
+        ("revert_keep_preferred", cell_revert_keep_preferred),
+    sim_cluster_mrsc_corpus_revert_control_leader_kill =>
+        ("revert_control_leader_kill", cell_revert_control_leader_kill),
+    sim_cluster_mrsc_corpus_revert_tablet_leader_kill =>
+        ("revert_tablet_leader_kill", cell_revert_tablet_leader_kill),
+    sim_cluster_mrsc_corpus_revert_witness_form_partition =>
+        ("revert_witness_form_partition", cell_revert_witness_form_partition),
 }
 
 // ---------------------------------------------------------------------------
@@ -1122,6 +1496,36 @@ fn mrsc_negative_unpinned_policy() {
         violated, quorum_lost,
         "a Region holding two of three replicas must cost the quorum"
     );
+}
+
+/// The revert oracle is not vacuous: a table that was converted but never
+/// reverted fails every clause of [`reverted_into`] (still global, replicas in
+/// all three Regions), and a regional table in another Region fails the
+/// kept-Region clause. Also pins the pre-revert restrictions so the
+/// "transactions/TTL become allowed" assertions of the cells prove a change.
+#[test]
+fn mrsc_negative_revert_oracle_bites() {
+    for seed in seeds() {
+        let mut run = Run::boot_at(seed, REMOVAL_VERSION);
+        run.global_table("glob1", false);
+        let meta = run.c.metadata(0);
+        let e = reverted_into(&meta, "glob1", "r-a").unwrap_err();
+        assert!(e.contains("still a global table"), "seed={seed}: {e}");
+        expect_mrsc_restrictions(&mut run, "glob1");
+        // Below the gate's version nothing is accepted: the same request on a
+        // version-2 cluster is the pre-amendment refusal.
+        let mut old = Run::boot(seed);
+        old.global_table("glob1", false);
+        let (s, v) = delete_regions(&mut old, 0, "glob1", &["r-b", "r-c"], None);
+        assert_eq!(s, 400, "seed={seed}: {v}");
+        assert!(
+            v["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("ReplicaUpdates Delete is not supported")),
+            "seed={seed}: the gate-closed text changed: {v}"
+        );
+        assert!(old.c.metadata(0).table_global("glob1").is_some());
+    }
 }
 
 /// The register checker is not vacuous.

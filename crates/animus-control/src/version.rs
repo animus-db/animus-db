@@ -37,7 +37,19 @@ use crate::meta::Metadata;
 pub type ClusterVersion = u32;
 
 /// The highest cluster version this binary can run at.
-pub const MAX_SUPPORTED: ClusterVersion = 6;
+pub const MAX_SUPPORTED: ClusterVersion = LEGACY_GLOBAL_TABLES_VERSION;
+
+/// The cluster version at which [`Gate::LegacyGlobalTables`] opens (the
+/// legacy 2017.11.29 global tables API, ADR 0075's 2026-10-21 amendment): the
+/// one place its number lives in non-test code, read by `Gate::version`,
+/// `Gate::rank` and `MAX_SUPPORTED`.
+pub const LEGACY_GLOBAL_TABLES_VERSION: ClusterVersion = 9;
+
+/// The cluster version at which [`Gate::MrecReplicaOverrides`] opens: the one
+/// place its number lives in non-test code (`Gate::version`/`Gate::rank` and
+/// `MAX_SUPPORTED` all read it). It is `8` because the MRSC replica-removal
+/// gate ([`Gate::MrscReplicaRemoval`]) took `7` first.
+pub const MREC_REPLICA_OVERRIDES_VERSION: ClusterVersion = 8;
 
 /// The lowest cluster version this binary can run at.
 ///
@@ -229,6 +241,36 @@ pub enum Gate {
     /// replica rejects the longer frame), so the encoder emits v2 only once
     /// the gate is open and the leader ignores the field while it is closed.
     FollowerAppliedIndex,
+    /// **MRSC replica removal** (ADR 0075's 2026-10-21 amendment): the sixth
+    /// real version gate, opening at cluster version 7. Guards
+    /// `MetaCommand::RevertGlobalToRegional` (an older voter cannot decode the
+    /// variant) and, with it, the client acceptance of the AWS-documented
+    /// `UpdateTable` that deletes two Regions of a multi-Region strongly
+    /// consistent table (two replicas, or one replica and the witness).
+    MrscReplicaRemoval,
+    /// **MREC per-replica read-capacity overrides** (ADR 0075's 2026-10-21
+    /// amendment, closing Q6 for provisioned read capacity): the seventh real
+    /// version gate, opening at [`MREC_REPLICA_OVERRIDES_VERSION`] (8). Guards
+    /// `MetaCommand::SetMrecReplicaOverrides` and the `MrecReplica.overrides`
+    /// field it writes, plus the client acceptance of `ReplicaUpdates`
+    /// `Update` / the `ProvisionedThroughputOverride` fields and the
+    /// cross-cluster `MrecControl::SetOverrides` push (which a peer cluster
+    /// only honours once its own gate is open). Its own gate, not
+    /// `MrecReplication`, because a Release(7) voter knows the latter yet
+    /// cannot decode the new variant.
+    MrecReplicaOverrides,
+    /// **Legacy (2017.11.29) global tables** (ADR 0075's 2026-10-21
+    /// amendment): the eighth real version gate, opening at
+    /// [`LEGACY_GLOBAL_TABLES_VERSION`] (9). Guards
+    /// `MetaCommand::ConvertTableToLegacyGlobal` / `SetLegacyGlobalSettings`
+    /// and the `GlobalTableSpec.legacy` field they write (a Release(8) voter
+    /// cannot decode either), the client acceptance of `CreateGlobalTable`,
+    /// `UpdateGlobalTable`, `DescribeGlobalTable`, `ListGlobalTables`,
+    /// `DescribeGlobalTableSettings` and `UpdateGlobalTableSettings` (below it
+    /// they keep their named refusal), and the cross-cluster
+    /// `MrecControl::LegacyReplica` / `SetLegacySettings` messages (which a
+    /// peer cluster only honours once its own gate is open).
+    LegacyGlobalTables,
     /// A **synthetic** version gate `n` (test/sim builds only): opens at
     /// cluster version `n`, ranks `n`. It exists so the gate *ladder*
     /// (several version gates, each opening at its own finalize) can be
@@ -255,6 +297,9 @@ impl Gate {
         Gate::TxnSealChecked,
         Gate::NodeCapacity,
         Gate::FollowerAppliedIndex,
+        Gate::MrscReplicaRemoval,
+        Gate::MrecReplicaOverrides,
+        Gate::LegacyGlobalTables,
     ];
 
     /// The cluster version at which this gate opens, or `None` for a gate
@@ -276,6 +321,11 @@ impl Gate {
             Gate::NodeCapacity => Some(5),
             // ADR 0080 (issue #1330): the fifth real version gate.
             Gate::FollowerAppliedIndex => Some(6),
+            // ADR 0075 (2026-10-21 amendment): the sixth real version gate.
+            Gate::MrscReplicaRemoval => Some(7),
+            Gate::MrecReplicaOverrides => Some(MREC_REPLICA_OVERRIDES_VERSION),
+            // ADR 0075 (2026-10-21 amendment): the eighth real version gate.
+            Gate::LegacyGlobalTables => Some(LEGACY_GLOBAL_TABLES_VERSION),
             #[cfg(any(test, feature = "sim-versions"))]
             Gate::Synthetic(n) => Some(n),
         }
@@ -295,6 +345,9 @@ impl Gate {
             Gate::TxnSealChecked => 4,
             Gate::NodeCapacity => 5,
             Gate::FollowerAppliedIndex => 6,
+            Gate::MrscReplicaRemoval => 7,
+            Gate::MrecReplicaOverrides => MREC_REPLICA_OVERRIDES_VERSION,
+            Gate::LegacyGlobalTables => LEGACY_GLOBAL_TABLES_VERSION,
             #[cfg(any(test, feature = "sim-versions"))]
             Gate::Synthetic(n) => {
                 if n > 1 {
@@ -576,6 +629,12 @@ mod tests {
                 Gate::NodeCapacity => Some(5),
                 // ADR 0080 (issue #1330): the fifth.
                 Gate::FollowerAppliedIndex => Some(6),
+                // ADR 0075 (2026-10-21): the sixth.
+                Gate::MrscReplicaRemoval => Some(7),
+                // ADR 0075 (2026-10-21 amendment): the seventh.
+                Gate::MrecReplicaOverrides => Some(MREC_REPLICA_OVERRIDES_VERSION),
+                // ADR 0075 (2026-10-21 amendment): the eighth.
+                Gate::LegacyGlobalTables => Some(LEGACY_GLOBAL_TABLES_VERSION),
                 // Never in `ALL` (parametric, test/sim only): see the ladder test.
                 Gate::Synthetic(_) => unreachable!("synthetic gates are not in Gate::ALL"),
             };
@@ -612,9 +671,24 @@ mod tests {
             Gate::NodeCapacity.join(Gate::FollowerAppliedIndex),
             Gate::FollowerAppliedIndex
         );
+        assert!(seen.contains(&Gate::MrscReplicaRemoval));
         assert_eq!(
-            MAX_SUPPORTED, 6,
-            "the follower applied-index gate (ADR 0080, #1330) is the release that takes MAX to 6"
+            Gate::FollowerAppliedIndex.join(Gate::MrscReplicaRemoval),
+            Gate::MrscReplicaRemoval
+        );
+        assert!(seen.contains(&Gate::MrecReplicaOverrides));
+        assert_eq!(
+            Gate::MrscReplicaRemoval.join(Gate::MrecReplicaOverrides),
+            Gate::MrecReplicaOverrides
+        );
+        assert!(seen.contains(&Gate::LegacyGlobalTables));
+        assert_eq!(
+            Gate::MrecReplicaOverrides.join(Gate::LegacyGlobalTables),
+            Gate::LegacyGlobalTables
+        );
+        assert_eq!(
+            MAX_SUPPORTED, 9,
+            "the legacy global tables gate (ADR 0075, 2026-10-21) is the release that takes MAX to 9"
         );
         assert_eq!(MIN_SUPPORTED, 1);
         // Declaration order is opening order: ranks are non-decreasing.
@@ -623,6 +697,71 @@ mod tests {
         assert_eq!(Gate::Base.join(Gate::Era), Gate::Era);
         assert_eq!(Gate::Era.join(Gate::Base), Gate::Era);
         assert_eq!(Gate::Base.join(Gate::Base), Gate::Base);
+    }
+
+    /// ADR 0075 (2026-10-21 amendment): the override gate opens exactly at its
+    /// version, never before, and the emitter classifies the command by it.
+    #[test]
+    fn mrec_replica_overrides_gate_opens_exactly_at_its_version() {
+        use crate::meta::MetaCommand;
+        let at = |v: ClusterVersion| {
+            let f = ClusterFeatures::new();
+            f.update(&Metadata {
+                cluster_version: v,
+                ..Metadata::default()
+            });
+            f
+        };
+        let g = Gate::MrecReplicaOverrides;
+        assert_eq!(g.version(), Some(MREC_REPLICA_OVERRIDES_VERSION));
+        const { assert!(MAX_SUPPORTED >= MREC_REPLICA_OVERRIDES_VERSION) };
+        assert!(!at(MREC_REPLICA_OVERRIDES_VERSION - 1).is_open(g));
+        assert!(at(MREC_REPLICA_OVERRIDES_VERSION).is_open(g));
+        // The earlier MREC gate stays open below it: they are distinct gates.
+        assert!(at(MREC_REPLICA_OVERRIDES_VERSION - 1).is_open(Gate::MrecReplication));
+        let cmd = MetaCommand::SetMrecReplicaOverrides {
+            table: "t".into(),
+            region: "r".into(),
+            overrides: Default::default(),
+        };
+        assert_eq!(cmd.required_gate(), g);
+    }
+
+    /// ADR 0075 (2026-10-21 amendment): the legacy global tables gate opens
+    /// exactly at its version, and both of its commands classify by it.
+    #[test]
+    fn legacy_global_tables_gate_opens_exactly_at_its_version() {
+        use crate::meta::MetaCommand;
+        use crate::schema::GlobalBilling;
+        let at = |v: ClusterVersion| {
+            let f = ClusterFeatures::new();
+            f.update(&Metadata {
+                cluster_version: v,
+                ..Metadata::default()
+            });
+            f
+        };
+        let g = Gate::LegacyGlobalTables;
+        assert_eq!(g.version(), Some(LEGACY_GLOBAL_TABLES_VERSION));
+        assert_eq!(MAX_SUPPORTED, LEGACY_GLOBAL_TABLES_VERSION);
+        assert!(!at(LEGACY_GLOBAL_TABLES_VERSION - 1).is_open(g));
+        assert!(at(LEGACY_GLOBAL_TABLES_VERSION).is_open(g));
+        // The earlier gates stay open below it: they are distinct gates.
+        assert!(at(LEGACY_GLOBAL_TABLES_VERSION - 1).is_open(Gate::MrecReplicaOverrides));
+        let convert = MetaCommand::ConvertTableToLegacyGlobal {
+            table: "t".into(),
+            local_region: "r".into(),
+            region_id: 1,
+            created_ms: 0,
+        };
+        let settings = MetaCommand::SetLegacyGlobalSettings {
+            table: "t".into(),
+            billing: GlobalBilling::PayPerRequest,
+            stamp: 1,
+            origin: 1,
+        };
+        assert_eq!(convert.required_gate(), g);
+        assert_eq!(settings.required_gate(), g);
     }
 
     fn registered(meta: &mut Metadata, n: u64) {

@@ -2397,6 +2397,30 @@ pub enum MetaCommand {
     /// G-c ships at cluster version 2; a table can only be global once that
     /// gate is open, so this command is meaningless before it).
     SetGlobalPreferredLeader { table: TableName, region: String },
+    /// **Revert an MRSC global table to a regular single-Region table**
+    /// (ADR 0075's 2026-10-21 amendment): the AWS-documented removal of two
+    /// replicas (or one replica and the witness) from a multi-Region strongly
+    /// consistent table, which converts the remaining replica to a
+    /// single-Region table. Clears `schema.global` and replaces every tablet's
+    /// pinned MRSC policy with a regional one — residency restricted to
+    /// `keep_region`, replication factor `min(3, members in that Region)`,
+    /// best-effort zone spread when the Region's members can honour it — so
+    /// the ordinary repair pass (`reconcile_placement`, not a new mover)
+    /// converges every replica into `keep_region`.
+    ///
+    /// Rejected (state-based) when the table has no schema, is an MREC table,
+    /// `keep_region` is not one of the table's Regions or is its witness, or
+    /// no cluster member carries `keep_region`. A table that is no longer
+    /// global (the revert already applied, a retried or duplicated proposal)
+    /// is a no-op, which is what makes the command idempotent under leader
+    /// change.
+    ///
+    /// **Gate: `Gate::MrscReplicaRemoval`** (cluster version 7). An older
+    /// voter cannot decode the variant.
+    RevertGlobalToRegional {
+        table: TableName,
+        keep_region: String,
+    },
     /// **Convert a table to an MREC (multi-Region eventual-consistency) global
     /// table** (ADR 0075 section 4, G-01 stage G-d): records
     /// `schema.global = GlobalTableSpec { consistency: Eventual, replicas:
@@ -2454,6 +2478,62 @@ pub enum MetaCommand {
         table: TableName,
         region: String,
         tablet: u64,
+    },
+    /// **Set an MREC replica's per-replica read-capacity overrides** (ADR 0075's
+    /// 2026-10-21 amendment, Q6): `overrides` replaces the replica's whole
+    /// override record (an empty `read_units`/`index_read_units` with a stamp
+    /// is a *clear*). Last-writer-wins by `(stamp, origin)`
+    /// ([`MrecReplicaOverrides`](crate::schema::MrecReplicaOverrides)): a record
+    /// that is not strictly newer than the stored one is a no-op, which makes
+    /// the command idempotent and lets a late or duplicated cross-cluster push
+    /// be harmless. Rejected (state-based) for a non-MREC table, an unknown
+    /// replica, or a zero capacity. Index names are **not** checked here (the
+    /// wire edge checked them against the receiving cluster's table; a peer's
+    /// index set may differ and an unknown index is simply inert).
+    ///
+    /// **Gate: `Gate::MrecReplicaOverrides`** (cluster version 8): an older voter
+    /// cannot decode the variant nor `MrecReplica.overrides`.
+    SetMrecReplicaOverrides {
+        table: TableName,
+        region: String,
+        overrides: crate::schema::MrecReplicaOverrides,
+    },
+    /// **Convert a table into a legacy (version 2017.11.29) global table**
+    /// (ADR 0075's 2026-10-21 amendment): the MREC conversion of
+    /// [`ConvertTableToMrec`](Self::ConvertTableToMrec) plus the
+    /// `GlobalTableSpec.legacy` marker (`created_ms` is the instant the global
+    /// table was created, stamped by the cluster that ran `CreateGlobalTable`
+    /// and carried to every peer). Re-applying the identical conversion is a
+    /// no-op. A table that is already a global table is rejected (state-based),
+    /// except a standalone MREC table (only its own replica, e.g. after every
+    /// peer was deleted), which becomes legacy. The table need not be empty
+    /// here: emptiness is a wire-edge precondition of `CreateGlobalTable`.
+    ///
+    /// **Gate: `Gate::LegacyGlobalTables`** (cluster version 9): an older voter
+    /// cannot decode the variant nor `GlobalTableSpec.legacy`.
+    ConvertTableToLegacyGlobal {
+        table: TableName,
+        local_region: String,
+        region_id: u32,
+        created_ms: u64,
+    },
+    /// **Set a legacy global table's billing mode and write capacity** (AWS
+    /// `GlobalTableBillingMode` / `GlobalTableProvisionedWriteCapacityUnits`):
+    /// replaces `GlobalTableSpec.legacy.billing` and sets this cluster's own
+    /// table throughput to match (`PayPerRequest` clears it; `Provisioned`
+    /// keeps the table's read units, or uses the write units when it had
+    /// none). Last-writer-wins by `(stamp, origin)`: a record that is not
+    /// strictly newer than the stored one is a no-op, which makes the command
+    /// idempotent and lets a late or duplicated cross-cluster push be
+    /// harmless. Rejected (state-based) for a table that is not a legacy
+    /// global table or a zero write capacity.
+    ///
+    /// **Gate: `Gate::LegacyGlobalTables`** (cluster version 9).
+    SetLegacyGlobalSettings {
+        table: TableName,
+        billing: crate::schema::GlobalBilling,
+        stamp: u64,
+        origin: u32,
     },
     /// Enable, reconfigure, or disable a table's **provisioned throughput**
     /// (ADR 0065 §5(b)) — the `CreateTable`/`UpdateTable` `BillingMode`/
@@ -5400,6 +5480,58 @@ impl Metadata {
                 global.preferred_leader_region.clone_from(region);
                 ApplyOutcome::Applied
             }
+            MetaCommand::RevertGlobalToRegional { table, keep_region } => {
+                let Some(schema) = self.schemas.get(table) else {
+                    return ApplyOutcome::Rejected("no such table schema");
+                };
+                let Some(global) = schema.global.as_ref() else {
+                    // Already reverted (a retried or duplicated proposal) or
+                    // never global: nothing to undo.
+                    return ApplyOutcome::NoOp;
+                };
+                if !global.is_mrsc() {
+                    return ApplyOutcome::Rejected(
+                        "table is not a strongly consistent global table",
+                    );
+                }
+                if !global.regions.contains(keep_region) {
+                    return ApplyOutcome::Rejected("kept region is not one of the table's regions");
+                }
+                if global.witness.as_ref() == Some(keep_region) {
+                    return ApplyOutcome::Rejected("kept region is the witness");
+                }
+                let kept_members: Vec<&BTreeMap<String, String>> = self
+                    .members
+                    .values()
+                    .filter(|m| {
+                        m.status != NodeStatus::Leaving
+                            && m.labels.get(animus_placement::REGION_LABEL) == Some(keep_region)
+                    })
+                    .map(|m| &m.labels)
+                    .collect();
+                if kept_members.is_empty() {
+                    return ApplyOutcome::Rejected("no cluster member carries the kept region");
+                }
+                // RF 3 when the Region can hold it, else every member it has
+                // (a two-node Region holds two replicas; repair never refuses
+                // to make progress for a smaller pool, ADR 0075 amendment).
+                let rf = kept_members.len().min(3);
+                let policy = animus_placement::zone_spread_policy(
+                    format!("regional:{table}"),
+                    rf,
+                    kept_members.iter().copied(),
+                )
+                .allow_values(animus_placement::REGION_LABEL, [keep_region.clone()]);
+                let tablet_ids: Vec<TabletId> =
+                    self.tablets_for_table(table).map(|(&id, _)| id).collect();
+                for id in tablet_ids {
+                    self.policies.insert(id, policy.clone());
+                }
+                if let Some(schema) = self.schemas.get_mut(table) {
+                    schema.global = None;
+                }
+                ApplyOutcome::Applied
+            }
             MetaCommand::ConvertTableToMrec {
                 table,
                 local_region,
@@ -5419,7 +5551,9 @@ impl Metadata {
                         status: crate::schema::MrecReplicaStatus::Active,
                         local: true,
                         copied: Default::default(),
+                        overrides: Default::default(),
                     }],
+                    legacy: None,
                 };
                 if let Some(existing) = &schema.global {
                     return if existing.is_mrec()
@@ -5435,6 +5569,97 @@ impl Metadata {
                     return ApplyOutcome::Rejected(e.message());
                 }
                 schema.global = Some(spec);
+                ApplyOutcome::Applied
+            }
+            MetaCommand::ConvertTableToLegacyGlobal {
+                table,
+                local_region,
+                region_id,
+                created_ms,
+            } => {
+                let Some(schema) = self.schemas.get_mut(table) else {
+                    return ApplyOutcome::Rejected("no such table schema");
+                };
+                let legacy = crate::schema::LegacyGlobal {
+                    created_ms: *created_ms,
+                    ..Default::default()
+                };
+                if let Some(existing) = &mut schema.global {
+                    let is_local = existing.is_mrec()
+                        && existing.replicas.iter().any(|r| {
+                            r.local && r.region == *local_region && r.region_id == *region_id
+                        });
+                    if is_local && existing.legacy.is_some() {
+                        return ApplyOutcome::NoOp;
+                    }
+                    if is_local && existing.replicas.len() == 1 {
+                        existing.legacy = Some(legacy);
+                        return ApplyOutcome::Applied;
+                    }
+                    return ApplyOutcome::Rejected("table is already a global table");
+                }
+                let spec = crate::schema::GlobalTableSpec {
+                    consistency: crate::schema::MultiRegionConsistency::Eventual,
+                    regions: Vec::new(),
+                    witness: None,
+                    preferred_leader_region: String::new(),
+                    replicas: vec![crate::schema::MrecReplica {
+                        region: local_region.clone(),
+                        region_id: *region_id,
+                        status: crate::schema::MrecReplicaStatus::Active,
+                        local: true,
+                        copied: Default::default(),
+                        overrides: Default::default(),
+                    }],
+                    legacy: Some(legacy),
+                };
+                if let Err(e) = spec.validate() {
+                    return ApplyOutcome::Rejected(e.message());
+                }
+                schema.global = Some(spec);
+                ApplyOutcome::Applied
+            }
+            MetaCommand::SetLegacyGlobalSettings {
+                table,
+                billing,
+                stamp,
+                origin,
+            } => {
+                let Some(schema) = self.schemas.get_mut(table) else {
+                    return ApplyOutcome::Rejected("no such table schema");
+                };
+                let Some(legacy) = schema
+                    .global
+                    .as_mut()
+                    .filter(|g| g.is_mrec())
+                    .and_then(|g| g.legacy.as_mut())
+                else {
+                    return ApplyOutcome::Rejected("table is not a legacy global table");
+                };
+                if matches!(
+                    billing,
+                    crate::schema::GlobalBilling::Provisioned { write_units: 0 }
+                ) {
+                    return ApplyOutcome::Rejected(
+                        crate::schema::GlobalSpecError::LegacyWriteUnits.message(),
+                    );
+                }
+                if (*stamp, *origin) <= legacy.order() {
+                    // Stale, duplicate or already applied.
+                    return ApplyOutcome::NoOp;
+                }
+                legacy.billing = Some(*billing);
+                legacy.stamp = *stamp;
+                legacy.origin = *origin;
+                schema.throughput = match billing {
+                    crate::schema::GlobalBilling::PayPerRequest => None,
+                    crate::schema::GlobalBilling::Provisioned { write_units } => {
+                        Some(crate::schema::ProvisionedThroughput {
+                            read_units: schema.throughput.map_or(*write_units, |t| t.read_units),
+                            write_units: *write_units,
+                        })
+                    }
+                };
                 ApplyOutcome::Applied
             }
             MetaCommand::AddMrecReplica {
@@ -5464,6 +5689,7 @@ impl Metadata {
                     status: crate::schema::MrecReplicaStatus::Creating,
                     local: false,
                     copied: Default::default(),
+                    overrides: Default::default(),
                 });
                 if let Err(e) = candidate.validate() {
                     return ApplyOutcome::Rejected(e.message());
@@ -5472,12 +5698,10 @@ impl Metadata {
                 ApplyOutcome::Applied
             }
             MetaCommand::RemoveMrecReplica { table, region } => {
-                let Some(spec) = self
-                    .schemas
-                    .get_mut(table)
-                    .and_then(|s| s.global.as_mut())
-                    .filter(|g| g.is_mrec())
-                else {
+                let Some(schema) = self.schemas.get_mut(table) else {
+                    return ApplyOutcome::Rejected("table is not an MREC global table");
+                };
+                let Some(spec) = schema.global.as_mut().filter(|g| g.is_mrec()) else {
                     return ApplyOutcome::Rejected("table is not an MREC global table");
                 };
                 let Some(pos) = spec.replicas.iter().position(|r| r.region == *region) else {
@@ -5487,6 +5711,13 @@ impl Metadata {
                     return ApplyOutcome::Rejected("cannot remove the local replica");
                 }
                 spec.replicas.remove(pos);
+                if spec.legacy.is_some() && spec.replicas.len() == 1 {
+                    // A legacy (2017.11.29) global table with a single Region
+                    // is not a global table: the table is a regular one again
+                    // (only a legacy spec carries the marker, so a non-legacy
+                    // MREC table keeps its single-replica spec as before).
+                    schema.global = None;
+                }
                 ApplyOutcome::Applied
             }
             MetaCommand::SetMrecReplicaStatus {
@@ -5532,6 +5763,32 @@ impl Metadata {
                 } else {
                     ApplyOutcome::NoOp
                 }
+            }
+            MetaCommand::SetMrecReplicaOverrides {
+                table,
+                region,
+                overrides,
+            } => {
+                let Some(spec) = self
+                    .schemas
+                    .get_mut(table)
+                    .and_then(|s| s.global.as_mut())
+                    .filter(|g| g.is_mrec())
+                else {
+                    return ApplyOutcome::Rejected("table is not an MREC global table");
+                };
+                let Some(replica) = spec.replicas.iter_mut().find(|r| r.region == *region) else {
+                    return ApplyOutcome::Rejected("no such MREC replica");
+                };
+                if let Err(reason) = overrides.validate() {
+                    return ApplyOutcome::Rejected(reason);
+                }
+                if overrides.order() <= replica.overrides.order() {
+                    // Stale, duplicate or already applied.
+                    return ApplyOutcome::NoOp;
+                }
+                replica.overrides = overrides.clone();
+                ApplyOutcome::Applied
             }
             MetaCommand::SetTableThroughput { table, spec } => {
                 let Some(schema) = self.schemas.get_mut(table) else {
@@ -6307,6 +6564,22 @@ impl Metadata {
         self.schemas.get(table).and_then(|s| s.global.as_ref())
     }
 
+    /// The single Region a table's first tablet's placement policy is
+    /// restricted to (`allowed_values` of the region label), if it is exactly
+    /// one: what `RevertGlobalToRegional` pins. `None` for any other policy.
+    #[must_use]
+    pub fn table_pinned_region(&self, table: &str) -> Option<String> {
+        let (id, _) = self.tablets_for_table(table).next()?;
+        let regions = self
+            .policies
+            .get(id)?
+            .allowed_values
+            .get(animus_placement::REGION_LABEL)?;
+        (regions.len() == 1)
+            .then(|| regions.iter().next().cloned())
+            .flatten()
+    }
+
     /// The Regions in which **every** routable tablet of `table` has a replica
     /// in its current (desired) replica set — what `DescribeTable` reports as
     /// `ACTIVE` for a global table (ADR 0075 section 3.5, plan decision D4:
@@ -6360,7 +6633,39 @@ impl Metadata {
     /// per-request hot path, which reads the cached flag instead.
     #[must_use]
     pub fn any_table_throughput(&self) -> bool {
-        self.schemas.iter().any(|(_, s)| s.throughput.is_some())
+        self.schemas.iter().any(|(_, s)| {
+            s.throughput.is_some()
+                || s.global.as_ref().is_some_and(|g| {
+                    g.replicas
+                        .iter()
+                        .any(|r| r.local && !r.overrides.is_empty())
+                })
+        })
+    }
+
+    /// The read capacity units this cluster's **own** replica of `table` is
+    /// overridden to (ADR 0075's 2026-10-21 amendment), for the admission
+    /// budget. `table` is a user table (the override of its table-level
+    /// `ReadCapacityUnits`) or a GSI's hidden table `<base>$<index>` (that
+    /// index's override). `None` when nothing is overridden here (the table's
+    /// own budget applies), for a non-MREC table, or for an unknown name.
+    #[must_use]
+    pub fn local_read_override(&self, table: &str) -> Option<u64> {
+        let local = |base: &str| {
+            self.schemas
+                .get(base)?
+                .global
+                .as_ref()
+                .filter(|g| g.is_mrec())?
+                .replicas
+                .iter()
+                .find(|r| r.local)
+                .map(|r| &r.overrides)
+        };
+        if let Some((base, index)) = table.split_once('$') {
+            return local(base)?.index_read_units.get(index).copied();
+        }
+        local(table)?.read_units
     }
 
     /// This table's point-in-time recovery (PITR) configuration (ADR 0059
@@ -7384,6 +7689,9 @@ impl crate::version::GatedCommand for MetaCommand {
             }
             MetaCommand::ConvertTableToGlobal { .. }
             | MetaCommand::SetGlobalPreferredLeader { .. } => Gate::GlobalTables,
+            // ADR 0075 (2026-10-21 amendment): the sixth real gate; an older
+            // voter cannot decode the variant.
+            MetaCommand::RevertGlobalToRegional { .. } => Gate::MrscReplicaRemoval,
             // ADR 0075 (G-01 stage G-d): the MREC commands, one gate; an older
             // voter cannot decode the variants nor `Eventual` /
             // `GlobalTableSpec.replicas`.
@@ -7392,6 +7700,11 @@ impl crate::version::GatedCommand for MetaCommand {
             | MetaCommand::RemoveMrecReplica { .. }
             | MetaCommand::SetMrecReplicaStatus { .. }
             | MetaCommand::MarkMrecCopied { .. } => Gate::MrecReplication,
+            // ADR 0075 (2026-10-21 amendment): the legacy 2017.11.29 API.
+            MetaCommand::ConvertTableToLegacyGlobal { .. }
+            | MetaCommand::SetLegacyGlobalSettings { .. } => Gate::LegacyGlobalTables,
+            // ADR 0075 (2026-10-21 amendment): per-replica read overrides.
+            MetaCommand::SetMrecReplicaOverrides { .. } => Gate::MrecReplicaOverrides,
             MetaCommand::ReportNodeVersion { .. } | MetaCommand::FinalizeClusterVersion { .. } => {
                 Gate::Era
             }

@@ -178,7 +178,7 @@ struct M {
 
 const REGIONS: [&str; 3] = ["a", "b", "c"];
 
-fn mesh_cfg(i: usize) -> Arc<MrecConfig> {
+pub(crate) fn mesh_cfg(i: usize) -> Arc<MrecConfig> {
     // Sender view: peer index == the bridge's cluster index (self is `pad`).
     let peers: Vec<&str> = (0..3)
         .map(|j| if j == i { "pad" } else { REGIONS[j] })

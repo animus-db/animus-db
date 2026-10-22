@@ -152,6 +152,17 @@ pub(crate) fn classify(op: &Operation) -> (&'static str, OpClass) {
         Operation::UpdateTable { .. } | Operation::UpdateTableGlobal { .. } => {
             ("UpdateTable", OpClass::Ddl)
         }
+        // The legacy (2017.11.29) global tables API (ADR 0075's 2026-10-21
+        // amendment): each operation is its own name; the reads are `Read`,
+        // the rest `Ddl`.
+        Operation::LegacyGlobal(op) => (
+            op.operation(),
+            if op.is_read() {
+                OpClass::Read
+            } else {
+                OpClass::Ddl
+            },
+        ),
         Operation::DeleteTable { .. } => ("DeleteTable", OpClass::Ddl),
         Operation::UpdateTimeToLive { .. } => ("UpdateTimeToLive", OpClass::Ddl),
         Operation::TagResource { .. } => ("TagResource", OpClass::Ddl),
@@ -251,6 +262,13 @@ pub(crate) fn authorize_op<E: Env, R: RelayClient>(
         Operation::ListTables { .. } | Operation::DescribeLimits | Operation::DescribeEndpoints => {
             Ok(())
         }
+
+        // The legacy global tables API names its table like the table; its
+        // list (no table) is unscoped, like `ListTables` it needs no check.
+        Operation::LegacyGlobal(op) => match op.table() {
+            Some(table) => authorize(ctx, principal, name, class, Some(table)),
+            None => Ok(()),
+        },
 
         Operation::DescribeBackup { backup_arn } | Operation::DeleteBackup { backup_arn } => {
             let table = meta.backup(backup_arn).map(|row| row.table.as_str());

@@ -496,6 +496,7 @@ fn v1_global_metadata() -> Metadata {
                 witness: Some("c".to_string()),
                 preferred_leader_region: "a".to_string(),
                 replicas: Vec::new(),
+                legacy: None,
             },
         },
     ]);
@@ -563,6 +564,218 @@ fn v1_mrec_metadata() -> Metadata {
     // Placement is untouched by an MREC conversion.
     assert!(!m.policies.get(&TabletId(1)).is_some_and(|p| p.is_pinned()));
     m
+}
+
+/// The MREC per-replica override shape (ADR 0075's 2026-10-21 amendment, gate
+/// `MrecReplicaOverrides`): the MREC scenario plus `SetMrecReplicaOverrides` on
+/// the `Active` peer (table 400 RCU, index `by_status` 200 RCU) and on the
+/// local replica as a *cleared* tombstone (stamp kept), so the fixture carries
+/// `MrecReplica.overrides` in both its populated and its tombstone form. Built
+/// through real commands.
+fn v1_mrec_overrides_metadata() -> Metadata {
+    use animus_control::schema::MrecReplicaOverrides;
+    let mut m = v1_mrec_metadata();
+    for command in [
+        MetaCommand::SetMrecReplicaOverrides {
+            table: "orders".to_string(),
+            region: "eu-west".to_string(),
+            overrides: MrecReplicaOverrides {
+                read_units: Some(400),
+                index_read_units: BTreeMap::from([("by_status".to_string(), 200)]),
+                stamp: 1_000,
+                origin: 7,
+            },
+        },
+        MetaCommand::SetMrecReplicaOverrides {
+            table: "orders".to_string(),
+            region: "us-east".to_string(),
+            overrides: MrecReplicaOverrides {
+                stamp: 2_000,
+                origin: 7,
+                ..MrecReplicaOverrides::default()
+            },
+        },
+    ] {
+        assert_eq!(
+            m.apply(&command),
+            ApplyOutcome::Applied,
+            "fixture premise: {command:?} applies cleanly"
+        );
+    }
+    m
+}
+
+/// Writes `v1-mrec-overrides.json`; refuses to overwrite.
+/// `cargo test -p animus-control --test it format_fixtures::generate_fixture_metadata_mrec_overrides -- --ignored`.
+#[test]
+#[ignore]
+fn generate_fixture_metadata_mrec_overrides() {
+    let path = metadata_fixtures_dir().join("v1-mrec-overrides.json");
+    if std::fs::metadata(&path).is_ok() {
+        panic!(
+            "{} already exists — never regenerated in place",
+            path.display()
+        );
+    }
+    let bytes = serde_json::to_vec_pretty(&v1_mrec_overrides_metadata()).expect("serializes");
+    std::fs::write(&path, &bytes).unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
+}
+
+/// The compatibility claims of the override shape, pinned: the command's JSON,
+/// an unset replica encodes exactly as before the field existed (so every
+/// earlier fixture is byte-identical), and a pre-override document decodes
+/// with no override.
+#[test]
+fn mrec_override_wire_shapes_are_pinned() {
+    use animus_control::schema::MrecReplicaOverrides;
+    let cmd = MetaCommand::SetMrecReplicaOverrides {
+        table: "orders".to_string(),
+        region: "eu-west".to_string(),
+        overrides: MrecReplicaOverrides {
+            read_units: Some(400),
+            index_read_units: BTreeMap::from([("by_status".to_string(), 200)]),
+            stamp: 1_000,
+            origin: 7,
+        },
+    };
+    assert_eq!(
+        serde_json::to_string(&cmd).unwrap(),
+        r#"{"SetMrecReplicaOverrides":{"table":"orders","region":"eu-west","overrides":{"read_units":400,"index_read_units":{"by_status":200},"stamp":1000,"origin":7}}}"#
+    );
+    let back: MetaCommand = serde_json::from_str(&serde_json::to_string(&cmd).unwrap()).unwrap();
+    assert_eq!(back, cmd);
+    // Nothing mentions `overrides` until one is set.
+    let plain = serde_json::to_string(&v1_mrec_metadata()).unwrap();
+    assert!(!plain.contains("overrides"), "{plain}");
+    let set = v1_mrec_overrides_metadata();
+    let dump = serde_json::to_string(&set).unwrap();
+    assert_eq!(dump.matches("\"overrides\"").count(), 2, "{dump}");
+    // The tombstone keeps its stamp but no capacity.
+    assert!(
+        dump.contains(r#""overrides":{"stamp":2000,"origin":7}"#),
+        "{dump}"
+    );
+    let bytes = serde_json::to_vec(&set).unwrap();
+    assert_eq!(Metadata::from_json(&bytes).unwrap(), set);
+}
+
+/// The legacy (2017.11.29) global table shape (ADR 0075's 2026-10-21
+/// amendment, gate `LegacyGlobalTables`): a table converted by
+/// `ConvertTableToLegacyGlobal` (creation instant 1_700_000_000_000 ms), one
+/// `Active` peer, and a `SetLegacyGlobalSettings` (`PROVISIONED`, 120 write
+/// units), so the fixture carries `GlobalTableSpec.legacy` with and without a
+/// settings record. Built through real commands.
+fn v1_legacy_global_metadata() -> Metadata {
+    use animus_control::schema::{GlobalBilling, MrecReplicaStatus, mrec_region_id};
+    let mut m = Metadata::default();
+    let commands = [
+        MetaCommand::CreateTableSchema {
+            table: "orders".to_string(),
+            schema: TableSchema::simple("id", ColumnType::String),
+        },
+        MetaCommand::CreateTablet {
+            tablet: TabletId(1),
+            table: Some("orders".to_string()),
+            range: KeyRange::whole(),
+            replicas: vec![nid(1)],
+        },
+        MetaCommand::ConvertTableToLegacyGlobal {
+            table: "orders".to_string(),
+            local_region: "us-east".to_string(),
+            region_id: mrec_region_id("us-east"),
+            created_ms: 1_700_000_000_000,
+        },
+        MetaCommand::AddMrecReplica {
+            table: "orders".to_string(),
+            region: "eu-west".to_string(),
+            region_id: mrec_region_id("eu-west"),
+        },
+        MetaCommand::SetMrecReplicaStatus {
+            table: "orders".to_string(),
+            region: "eu-west".to_string(),
+            status: MrecReplicaStatus::Active,
+        },
+        MetaCommand::SetLegacyGlobalSettings {
+            table: "orders".to_string(),
+            billing: GlobalBilling::Provisioned { write_units: 120 },
+            stamp: 5_000,
+            origin: 7,
+        },
+    ];
+    for command in &commands {
+        assert_eq!(
+            m.apply(command),
+            ApplyOutcome::Applied,
+            "fixture premise: {command:?} applies cleanly"
+        );
+    }
+    let g = m.schemas.get("orders").unwrap().global.as_ref().unwrap();
+    assert!(g.is_legacy() && g.replicas.len() == 2);
+    m
+}
+
+/// Writes `v1-legacy-global.json`; refuses to overwrite.
+/// `cargo test -p animus-control --test it format_fixtures::generate_fixture_metadata_legacy_global -- --ignored`.
+#[test]
+#[ignore]
+fn generate_fixture_metadata_legacy_global() {
+    let path = metadata_fixtures_dir().join("v1-legacy-global.json");
+    if std::fs::metadata(&path).is_ok() {
+        panic!(
+            "{} already exists — never regenerated in place",
+            path.display()
+        );
+    }
+    let bytes = serde_json::to_vec_pretty(&v1_legacy_global_metadata()).expect("serializes");
+    std::fs::write(&path, &bytes).unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
+}
+
+/// The compatibility claims of the legacy shape, pinned: the two commands'
+/// JSON, no earlier fixture mentions `legacy` (a non-legacy MREC spec encodes
+/// byte-identically to before), and the populated document round-trips.
+#[test]
+fn legacy_global_wire_shapes_are_pinned() {
+    use animus_control::schema::GlobalBilling;
+    let convert = MetaCommand::ConvertTableToLegacyGlobal {
+        table: "orders".to_string(),
+        local_region: "us-east".to_string(),
+        region_id: 9,
+        created_ms: 1_700_000_000_000,
+    };
+    assert_eq!(
+        serde_json::to_string(&convert).unwrap(),
+        r#"{"ConvertTableToLegacyGlobal":{"table":"orders","local_region":"us-east","region_id":9,"created_ms":1700000000000}}"#
+    );
+    let settings = MetaCommand::SetLegacyGlobalSettings {
+        table: "orders".to_string(),
+        billing: GlobalBilling::Provisioned { write_units: 120 },
+        stamp: 5_000,
+        origin: 7,
+    };
+    assert_eq!(
+        serde_json::to_string(&settings).unwrap(),
+        r#"{"SetLegacyGlobalSettings":{"table":"orders","billing":{"Provisioned":{"write_units":120}},"stamp":5000,"origin":7}}"#
+    );
+    for c in [&convert, &settings] {
+        let back: MetaCommand = serde_json::from_str(&serde_json::to_string(c).unwrap()).unwrap();
+        assert_eq!(&back, c);
+    }
+    for plain in [
+        v1_mrec_metadata(),
+        v1_mrec_overrides_metadata(),
+        v1_global_metadata(),
+    ] {
+        assert!(!serde_json::to_string(&plain).unwrap().contains("legacy"));
+    }
+    let set = v1_legacy_global_metadata();
+    let dump = serde_json::to_string(&set).unwrap();
+    assert!(
+        dump.contains(
+            r#""legacy":{"created_ms":1700000000000,"billing":{"Provisioned":{"write_units":120}},"stamp":5000,"origin":7}"#
+        ),
+        "{dump}"
+    );
+    assert_eq!(Metadata::from_json(dump.as_bytes()).unwrap(), set);
 }
 
 /// The per-node capacity shape (ADR 0079, gate `NodeCapacity`, cluster
@@ -919,6 +1132,8 @@ fn decodes_every_checked_in_metadata_fixture_to_its_per_version_value() {
             (1, Some("era")) => v1_era_metadata(),
             (1, Some("global")) => v1_global_metadata(),
             (1, Some("mrec")) => v1_mrec_metadata(),
+            (1, Some("mrec-overrides")) => v1_mrec_overrides_metadata(),
+            (1, Some("legacy-global")) => v1_legacy_global_metadata(),
             (1, Some("capacity")) => v1_capacity_metadata(),
             (1, Some("repair-settled")) => v1_repair_settled_metadata(),
             (other, _) => panic!(
@@ -1899,6 +2114,7 @@ fn v1_global_mirror_scenario() -> (Metadata, Live) {
                 witness: Some("c".to_string()),
                 preferred_leader_region: "a".to_string(),
                 replicas: Vec::new(),
+                legacy: None,
             },
         },
     );

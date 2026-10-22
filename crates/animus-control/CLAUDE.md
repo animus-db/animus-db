@@ -3438,3 +3438,46 @@ A new variant must pick a class. Test: `tests/it/transport_class.rs`.
   silent or never-reporting voter does not move it. The data plane's `raftkv-wire` v2 is what carries
   the field on the wire (`animus-cp-data` `codec.rs`). New `AppendEntriesResp` construction sites need
   `applied_index: 0` (patterns want `..`). Pure tests: `tests/it/quorum_applied.rs`.
+
+## `Gate::MrscReplicaRemoval`, cluster version 7 (ADR 0075 / ADR 0073's 2026-10-21 amendments)
+
+- `MetaCommand::RevertGlobalToRegional { table, keep_region }` (gate version 7) is the inverse of
+  `ConvertTableToGlobal` for an MRSC table: clears `schema.global` and replaces each tablet's
+  pinned policy with `zone_spread_policy(RF = min(3, non-Leaving members of keep_region))` +
+  `allow_values(REGION_LABEL, [keep_region])`, **unpinned** so ordinary `reconcile_placement`
+  (`replan_repair`) does the movement. A table with no `global` is a `NoOp` (idempotent under
+  retries / leader change); rejections are state-based (MREC table, `keep_region` not a Region of
+  the table or the witness, no member in `keep_region`). `Metadata::table_pinned_region` reads
+  the single Region a table's policy is restricted to. New exhaustive-match sites touched:
+  `required_gate`, `mirror.rs` (schema entry + policies), the `sim_versions` by-content
+  `content_gate` row, `animus-node` relay allowlist. Tests: `tests/it/global_table_apply.rs`
+  (`revert_*`).
+
+## `Gate::MrecReplicaOverrides`, `MAX_SUPPORTED = 8` (ADR 0075's 2026-10-21 amendment)
+
+- `MetaCommand::SetMrecReplicaOverrides { table, region, overrides }` replaces an MREC replica's
+  `MrecReplica.overrides` (`MrecReplicaOverrides { read_units, index_read_units, stamp, origin }`).
+  Apply: rejected for a non-MREC table / unknown replica / zero capacity; a record whose
+  `(stamp, origin)` is not strictly newer than the stored one is a `NoOp` (last-writer-wins across
+  independent clusters; a clear keeps its stamp as a tombstone). Index names are not checked at apply.
+- `Metadata::local_read_override(table)` (table or hidden `<base>$<index>`) is what animusd's
+  `throttle_limits_for` reads; `any_table_throughput()` counts a local override.
+- The gate number is `version::MREC_REPLICA_OVERRIDES_VERSION` (8; 7 is the MRSC removal gate). Rows: `required_gate`, mirror (schema row), `sim_versions` content gate and
+  matrix, relay list in `animus-node`. Fixture: `metadata/v1-mrec-overrides.json`. New
+  `MrecReplica { .. }` literals need `overrides: Default::default()`.
+
+## `Gate::LegacyGlobalTables`, `MAX_SUPPORTED = 9` (ADR 0075's 2026-10-21 legacy-API amendment)
+
+- `GlobalTableSpec.legacy: Option<LegacyGlobal { created_ms, billing, stamp, origin }>` marks an MREC
+  table as a legacy (2017.11.29) global table (skipped while `None`; MRSC + legacy is
+  `ModeFieldsMixed`; `GlobalBilling` is `PayPerRequest` / `Provisioned { write_units }`).
+  New `GlobalTableSpec { .. }` literals need `legacy: None`.
+- `MetaCommand::ConvertTableToLegacyGlobal { table, local_region, region_id, created_ms }`:
+  idempotent (`NoOp` if already legacy-local), adopts a standalone single-replica MREC table,
+  otherwise rejects "table is already a global table". `SetLegacyGlobalSettings { table, billing,
+  stamp, origin }` is last-writer-wins by `(stamp, origin)` and sets `schema.throughput`
+  (`PayPerRequest` -> `None`; `Provisioned` keeps the read units, else uses the write units).
+  `RemoveMrecReplica` clears `schema.global` when a legacy spec is left with one replica.
+- The gate number is `version::LEGACY_GLOBAL_TABLES_VERSION` (9). Rows: `required_gate`, mirror
+  (schema-only arms), `sim_versions` content gate and matrix (a `Release(9)` column), relay list in
+  `animus-node`. Fixture: `metadata/v1-legacy-global.json`. Tests: `tests/it/legacy_global_apply.rs`.

@@ -114,10 +114,43 @@ fn run_seed(seed: u64) {
         create_table(&mut cluster, seed, t);
     }
 
-    // 2. Legacy operations: rejected by name regardless of the gate.
+    // 2. Legacy operations: while `Gate::LegacyGlobalTables` is closed (this
+    //    cluster is at version 1, then 2) each is rejected by name with the
+    //    exact text it had before the gate existed. A well-formed body is
+    //    needed: the operations are decoded (and an ill-formed one is its own
+    //    ValidationException) before the gate is looked at.
     for op in animus_dynamo::global::LEGACY_GLOBAL_TABLE_OPERATIONS {
-        expect_validation(&mut cluster, seed, 0, op, "{}", "legacy");
+        let body = match op {
+            "ListGlobalTables" => "{}".to_owned(),
+            "CreateGlobalTable" => {
+                r#"{"GlobalTableName":"glob1","ReplicationGroup":[{"RegionName":"r-a"},{"RegionName":"r-b"}]}"#.to_owned()
+            }
+            "UpdateGlobalTable" => {
+                r#"{"GlobalTableName":"glob1","ReplicaUpdates":[{"Create":{"RegionName":"r-b"}}]}"#.to_owned()
+            }
+            "UpdateGlobalTableSettings" => {
+                r#"{"GlobalTableName":"glob1","GlobalTableBillingMode":"PAY_PER_REQUEST"}"#
+                    .to_owned()
+            }
+            _ => r#"{"GlobalTableName":"glob1"}"#.to_owned(),
+        };
+        let wanted = animus_dynamo::global::legacy_global_table_operation_error(op).message;
+        let (s, v) = call(&mut cluster, 0, op, &body);
+        assert_eq!(s, 400, "seed={seed}: {op}: {v}");
+        assert!(
+            v["__type"]
+                .as_str()
+                .unwrap_or("")
+                .contains("ValidationException"),
+            "seed={seed}: {op}: {v}"
+        );
+        assert_eq!(
+            v["message"].as_str().or(v["Message"].as_str()),
+            Some(wanted.as_str()),
+            "seed={seed}: {op}: {v}"
+        );
     }
+    assert!(cluster.metadata(0).table_global("glob1").is_none());
 
     // 1. Gate closed: the pre-G-c text, byte for byte; the table stays regional.
     let (s, v) = call(
@@ -341,6 +374,9 @@ fn run_seed(seed: u64) {
             "glob1",
             r#""ReplicaUpdates":[{"Delete":{"RegionName":"r-c"}}]"#,
         ),
+        // The cluster is at version 2: `Gate::MrscReplicaRemoval` is closed, so
+        // the pre-amendment refusal stands byte for byte (the open-gate
+        // matrix is `sim_cluster_mrsc` `revert_*`).
         "Delete is not supported",
     );
     expect_validation(

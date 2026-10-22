@@ -188,6 +188,11 @@ pub const MRSC_MIN_FULL_REPLICAS: usize = 2;
 /// rejected by name). **Emitted** by `DescribeTable` for a global table only.
 pub const GLOBAL_TABLE_VERSION: &str = "2019.11.21";
 
+/// The `GlobalTableVersion` a **legacy** global table (created with
+/// `CreateGlobalTable`) reports in `DescribeTable` (ADR 0075's 2026-10-21
+/// amendment). A table is one version or the other, never both.
+pub const GLOBAL_TABLE_VERSION_LEGACY: &str = "2017.11.29";
+
 #[cfg(test)]
 mod tests {
     use super::*;

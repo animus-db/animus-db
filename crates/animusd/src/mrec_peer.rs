@@ -106,6 +106,39 @@ pub(crate) struct MrecConfig {
     pub(crate) node_tls: Option<TlsSection>,
     /// Per-(table, tablet, peer) shipper state, for backoff and the admin view.
     pub(crate) health: Arc<Mutex<BTreeMap<HealthKey, PeerHealth>>>,
+    /// The cross-cluster client the **wire edge** uses for the one synchronous
+    /// peer check of `CreateGlobalTable` / `UpdateGlobalTable` (ADR 0075's
+    /// 2026-10-21 amendment). Installed once by whoever owns the transport
+    /// (the shipper loop in production, the world harness in simulation);
+    /// empty means the edge cannot reach peers yet.
+    pub(crate) edge_client: EdgePeerClient,
+}
+
+/// A write-once slot for the edge's [`PeerClient`] (see
+/// [`MrecConfig::edge_client`]).
+#[derive(Clone, Default)]
+pub(crate) struct EdgePeerClient(Arc<std::sync::OnceLock<Arc<dyn PeerClient>>>);
+
+impl std::fmt::Debug for EdgePeerClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.get().is_some() {
+            "EdgePeerClient(installed)"
+        } else {
+            "EdgePeerClient(empty)"
+        })
+    }
+}
+
+impl EdgePeerClient {
+    /// Install the client; a second install is ignored (the first wins).
+    pub(crate) fn install(&self, client: Arc<dyn PeerClient>) {
+        let _ = self.0.set(client);
+    }
+
+    /// The installed client, if any.
+    pub(crate) fn get(&self) -> Option<Arc<dyn PeerClient>> {
+        self.0.get().cloned()
+    }
 }
 
 /// `(table, tablet id, peer region)`.
@@ -141,6 +174,29 @@ pub(crate) struct PeerHealth {
     /// The TTL attribute this node's saga last pushed (or observed at first
     /// sight) for the peer: `None` = never looked, `Some(None)` = no TTL.
     pub(crate) ttl_pushed: Option<Option<String>>,
+    /// The `(stamp, origin)` of each replica's read-capacity override record
+    /// this node's saga last got acknowledged by the peer (ADR 0075's
+    /// 2026-10-21 amendment), by the replica's Region. Absent = never pushed.
+    /// Driver-local and lost on restart or a driver change, which only costs
+    /// an idempotent re-push (the peer applies last-writer-wins).
+    pub(crate) overrides_pushed: BTreeMap<String, (u64, u32)>,
+    /// The `(stamp, origin)` of the legacy global table settings record this
+    /// node's saga last got acknowledged by the peer (ADR 0075's 2026-10-21
+    /// amendment). Driver-local, like `overrides_pushed`.
+    pub(crate) legacy_settings_pushed: Option<(u64, u32)>,
+    /// Targets that acknowledged `MrecControl::LegacyRemovePeer` for the
+    /// replica this entry's key names (legacy `Deleting` replicas only).
+    pub(crate) legacy_removed: std::collections::BTreeSet<String>,
+    /// Consecutive passes in which a `LegacyRemovePeer` notification failed.
+    pub(crate) legacy_remove_failures: u32,
+    /// The peer acknowledged this replica's creation (`CreateReplica` /
+    /// `LegacyReplica`) to this node's saga, keyed `(table, SAGA_SLOT,
+    /// region)`. A replica is promoted to `Active` only after that, so an
+    /// empty source table (whose copy needs no batch and so no peer contact)
+    /// cannot become `Active` while its peer was never told. Driver-local;
+    /// lost on restart or a driver change, which only costs an idempotent
+    /// re-send.
+    pub(crate) create_acked: bool,
 }
 
 impl Default for MrecConfig {
@@ -154,6 +210,7 @@ impl Default for MrecConfig {
             max_backlog: DEFAULT_MREC_MAX_BACKLOG,
             node_tls: None,
             health: Arc::default(),
+            edge_client: EdgePeerClient::default(),
         }
     }
 }
@@ -175,6 +232,7 @@ impl MrecConfig {
             max_backlog: DEFAULT_MREC_MAX_BACKLOG,
             node_tls: None,
             health: Arc::default(),
+            edge_client: EdgePeerClient::default(),
         }
     }
 

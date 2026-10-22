@@ -79,7 +79,9 @@ except where flagged.
   was seen. The catalogue entries in section 6 therefore derive from V6/V12
   rather than a quotas page.
 - N6: that the legacy 2017.11.29 operations error specifically on a table that
-  is a 2019.11.21 replica, and with which code.
+  is a 2019.11.21 replica, and with which code. (Answered with the nearest codes
+  the service model lists by the 2026-10-21 legacy-API amendment; still not
+  verified against the service.)
 - N7: replication latency, throughput-unit (rWRU) accounting details.
 
 ### 0.1 Wire-name verification against the botocore service model (2026-10-21)
@@ -521,6 +523,10 @@ names are operator-defined.
 
 ### 5.3 Legacy 2017.11.29 operations
 
+> Superseded in part: the six operations are implemented behind
+> `Gate::LegacyGlobalTables` (see the 2026-10-21 legacy-API amendment). The text
+> below is what they do while that gate is closed.
+
 `CreateGlobalTable`, `UpdateGlobalTable`, `DescribeGlobalTable`,
 `DescribeGlobalTableSettings`, `ListGlobalTables`, `UpdateGlobalTableSettings`
 (V1): **rejected** with a `ValidationException` whose message says the
@@ -678,7 +684,8 @@ interim is **not** permitted.
   remote HLCs beyond it.
 - Q6: Per-replica overrides (`ProvisionedThroughputOverride`,
   `GlobalSecondaryIndexes`, `TableClassOverride`, KMS) and per-region
-  capacity accounting.
+  capacity accounting. **Closed as far as built by the 2026-10-21 amendment**
+  (MREC provisioned read capacity); the rest is listed there as remaining gaps.
 - Q7: Adding a region to an existing MREC table with data: initial full copy
   (snapshot scan + tail) uses the resync path of 4.2; its interaction with PITR
   and backup catalogs needs a follow-up section when G-d starts.
@@ -1256,6 +1263,7 @@ framing work, **not** WAN behaviour.
   does not refresh the key schema of an already-registered table, so a table dropped
   and recreated with a *different* key schema stays unreadable on that node until a
   restart; MREC's re-create path hits it only for a different shape.
+- A `Creating` replica is promoted to ACTIVE only after the peer acknowledged creating its table (node-local `PeerHealth.create_acked`, re-sent by a new saga driver); an empty source table previously went ACTIVE with no peer table (fixed).
 - Only the full-mesh topology exists (D8); `ReplicaUpdates[].Update` and the
   per-replica overrides (KMS, throughput) are rejected, as section 5 says.
 
@@ -1458,3 +1466,322 @@ written in; only `bash -n` and a YAML parse were done. Its first CI run is its f
 test, and a first failure there is expected to be a script bug as likely as a product bug.
 Still not covered: a CNI that enforces the egress NetworkPolicy, separate Kubernetes
 control planes, a real WAN.
+
+## Amendment (2026-10-21): removing replicas from an MRSC table (reverting to a single-Region table)
+
+**Status: as built.** AWS documents exactly one way to remove Regions from a
+multi-Region strongly consistent (MRSC) global table: *"You cannot delete a single
+replica or a witness from a MRSC global table. You can delete two replicas or delete
+one replica and a witness from a MRSC global table, converting the remaining replica
+to a single-Region DynamoDB table"* (developer guide, global tables how-it-works;
+`DeleteGlobalTableWitnessGroupMemberAction` in the service model). *"You cannot add
+additional replicas to an existing MRSC global table."* Section 5.1's blanket
+"`Delete` is rejected" and section 3.5's "the Regions are fixed at creation" are
+superseded for the Delete half; adds stay rejected (`already a global table`).
+
+**Wire (`animus-dynamo` `global.rs`, `animusd` `global_tables.rs`).** On an MRSC table an
+`UpdateTable` carrying any `Delete` takes `GlobalTableUpdate::validate_revert(regions,
+witness)`: exactly two of the table's three Regions are named (two `ReplicaUpdates`
+`Delete`s, or one replica `Delete` plus the `GlobalTableWitnessUpdates` `Delete`), and
+the Region that remains must be a replica, not the witness. Rejected with a named
+`ValidationException`: a single replica `Delete`, a lone witness `Delete`, all three,
+a duplicate, an unknown Region, the witness named as a replica, a witness `Delete` on a
+table with no witness (or naming another Region), a `Create` mixed with a `Delete`,
+`Update`, and `MultiRegionConsistency` (valid only with `Create`). The Regions a
+request names are the ones removed; the serving node's own Region is not special (the
+stretch cluster hosts every Region). `WitnessAction::Delete` now carries the optional
+`RegionName` so it can be checked. A regional table receiving a `Delete` keeps the
+pre-amendment text.
+
+**Control plane.** `MetaCommand::RevertGlobalToRegional { table, keep_region }`
+behind the new **`Gate::MrscReplicaRemoval`, cluster version 7** (`MAX_SUPPORTED` was 7 when it landed; the MREC overrides gate below made it 8)
+(ADR 0073's 2026-10-21 amendment). Apply, in one step: clears `schema.global` and
+replaces every tablet's pinned MRSC policy with a *regional* one. Choice and why:
+the policy is `PlacementPolicy::allow_values(REGION_LABEL, [keep])` over the
+cluster's usual `zone_spread_policy` (RF `min(3, members in keep that are not
+Leaving)`, best-effort zone spread when every member of the Region carries a zone and
+there are at least RF zones, else a plain RF). It is **not** pinned, so the existing
+`reconcile_placement` repair (`replan_repair`) drops the replicas that now violate
+residency and recruits replacements in `keep`: there is no new mover, no new Raft
+membership code, and the host reconciler hands the removed replicas the same removal
+notices every other move uses. Not "the cluster default policy": that would not name
+the Region, and the prior policy was not stored (MRSC conversion overwrote it). RF is
+derived from members at apply, a pure function of replicated state, so every replica
+agrees. Rejections are state-based (never gate-based): no schema, an MREC table, `keep`
+not one of the table's Regions or the witness, no member carries `keep`. A table that
+is no longer global is a `NoOp`, which makes the command idempotent under leader change
+and retries (a racing request that kept a different Region also lands as `NoOp`; the edge
+detects it from the surviving policy and answers with a named error). While the kept
+Region has fewer live nodes than its RF, repair never shrinks the set (the documented
+growth-only rule of `replan_repair`): the table keeps its replicas and recruits no other
+Region until the node returns.
+
+**Truthfulness while converging.** Status is derived, not stored, so the moment the
+command applies the table *is* a regular table: `DescribeTable` carries no
+`GlobalTableVersion`/`Replicas`/`MultiRegionConsistency`/`GlobalTableWitnesses`,
+`/admin/global-tables` no longer lists it, `leader_preferences` (derived from
+`schema.global`) drops its tablets so the preferred-leader step clears the witness flag
+and stops steering, and `drain_strands_region` (reads `schema.global`) no longer guards
+the old Regions. No `DELETING` state is modelled: the replicas converge under ordinary
+repair, observable through the existing placement view. MRSC's TTL and transaction
+restrictions (derived from `schema.global`) stop applying immediately. The empty-table
+precondition of the conversion has no mirror here: removal needs no data copy.
+
+**Compatibility.** No new durable format: the stored shapes (`schema.global` absent,
+`PlacementPolicy.allowed_values` plus an unpinned spread) already exist; only the
+command variant is new (class G, gated). Pinned JSON
+`{"RevertGlobalToRegional":{"table":"t","keep_region":"a"}}`
+(`global_table_apply::revert_requires_its_own_gate_and_pins_its_json`); mirror arm and
+relay allowlist entry added. No fixture file is added or edited.
+
+**Evidence.** Pure: `animus-dynamo` `global::tests::revert_matrix_*` (the validation
+matrix on a three-replica and a witness table), `animus-control`
+`global_table_apply::revert_*` (apply, idempotency, rejections, convergence from every
+spread, a down node in the kept Region, zone spread, gate row, JSON pin). Cluster tier:
+`sim_cluster_mrsc` cells `revert_keep_preferred`, `revert_control_leader_kill`,
+`revert_tablet_leader_kill`, `revert_witness_form_partition` (6 nodes, 3 Regions x 2,
+WAN links, cluster version 7 through the real finalize path; no acked write lost,
+every replica converges into the kept Region, removed replicas leave their nodes,
+transactions and TTL become allowed, the old Regions drain, a killed leader or a
+partitioned Region during convergence) and the negative control
+`mrsc_negative_revert_oracle_bites`. Mixed-version:
+`sim_cluster_mixed_version_corpus` `release6_to_release7_mrsc_removal_gate` and
+`negative_control_mrsc_removal_gate_emitted_early` (N9).
+
+## Amendment (2026-10-21): per-replica read-capacity overrides (closes Q6 as far as built)
+
+`ReplicaUpdates` now accepts `ProvisionedThroughputOverride{ReadCapacityUnits}`
+on the table and, per index, in `GlobalSecondaryIndexes[]`, on `Create` and on
+`Update` (previously every override key and every `Update` was refused), **on
+MREC tables**. AWS makes exactly these overridable (table and GSI provisioned
+read capacity); write capacity is synchronized and is not.
+
+**Data model.** `MrecReplica.overrides: MrecReplicaOverrides { read_units,
+index_read_units, stamp, origin }`, additive and skipped while unset, so every
+existing encoding and fixture is byte-identical. Because MREC clusters have
+independent control planes, a change reaches a peer by a push that may arrive
+late, twice, or after a newer change made on the peer. The record is therefore
+**last-writer-wins by `(stamp, origin)`** (`stamp` = the issuing cluster's
+`Env::now`, forced strictly above the stored stamp; `origin` =
+`mrec_region_id`): `MetaCommand::SetMrecReplicaOverrides` applies only a
+strictly newer record and is otherwise a `NoOp`, so it is idempotent and a stale
+push is harmless. A *clear* (`ProvisionedThroughputOverride: {}`, AWS's "use the
+source table's settings") is a newer record with nothing set: a tombstone that
+keeps its stamp, so a stale push cannot resurrect the override.
+
+**Propagation.** The edge (`mrec_saga::update_table_mrec`) validates, then
+commits the merged record locally. The existing saga driver
+(`push_overrides`, beside `push_ttl`) sends each replica's record to every
+`Active` peer in `MrecControl::SetOverrides` until the peer acknowledges that
+exact `(stamp, origin)` (a driver-local memo; a restarted or new driver simply
+re-pushes everything, which the peer applies as a no-op). The peer
+(`set_overrides_from_peer`) applies it through its own control plane only while
+its own `Gate::MrecReplicaOverrides` is open (refused retryably otherwise). Every
+cluster's `DescribeTable` therefore converges on the same `Replicas[]`
+`ProvisionedThroughputOverride` / `GlobalSecondaryIndexes[]`.
+
+**Enforcement.** `ClientCtx::throttle_limits_for` (the single choke point of
+ADR 0065) replaces `read_units` with `Metadata::local_read_override(table)`, the
+override of **this cluster's own** replica: the table-level value for a user
+table, the index's value for the GSI's hidden table `<base>$<index>` (a GSI
+read is charged against its hidden table). `write_units` is untouched. The
+catalog-wide "anything throttled" flag counts a local override. A peer's
+override is inert in this cluster. Peers are created `PAY_PER_REQUEST` (the
+saga's existing "capacity is per region" decision), so an override is also how
+an operator gives a peer Region a read budget; it is enforced whatever the peer
+table's own billing mode.
+
+**Validation (receiving cluster).** An override on a `PAY_PER_REQUEST` table, an
+`IndexName` that is not a global secondary index of the table, an `Update` of a
+Region that is not a replica (or is `Deleting`), and an `Update` naming no
+setting are `ValidationException`s; a zero or non-integer `ReadCapacityUnits` is
+a shape error. `Update` may name the table's own Region. A call may mix `Create`
+and `Update`; `Delete` is not mixed with either.
+
+**Still refused, precisely.** `KMSMasterKeyId`, `OnDemandThroughputOverride`
+(also inside a GSI element) and `TableClassOverride` name the missing table
+feature (`SSESpecification`, `OnDemandThroughput`, `TableClass`: none exist in
+AnimusDB), on `Create` and `Update`, MREC and MRSC alike. **MRSC** keeps
+refusing the read-capacity overrides and `Update`: the Regions of an MRSC table
+are one stretched cluster whose per-tablet read budget (one bucket per tablet,
+ADR 0065) is shared by every Region's replicas and by strong reads served at the
+leader, so a per-Region budget has no place to be enforced cheaply; it is a
+remaining gap, not a bug. Also remaining: the override does not feed ADR 0067's
+minimum tablet count, and `DescribeTable`'s own `ProvisionedThroughput` still
+shows the table's declared (not the overridden) read units.
+
+**Gate (ADR 0073).** New `Gate::MrecReplicaOverrides` at cluster version 8
+(`MAX_SUPPORTED = 8`; version 7 is `Gate::MrscReplicaRemoval`, and the number lives in one constant,
+`version::MREC_REPLICA_OVERRIDES_VERSION`). Guards `SetMrecReplicaOverrides`
+(`required_gate` row, relay list, mirror arm, `sim_versions` content gate), the
+edge (below the gate `Update` and any read override are refused with
+`UpdateTable: ReplicaUpdates Update and per-replica ProvisionedThroughputOverride
+are not supported`, the emit-site check) and the peer handler. The cross-cluster
+`MrecControl::SetOverrides` variant follows `SetTtl`'s precedent (additive,
+class G with the `MrecApply` frame); a peer on an older binary rejects the frame
+and the sender retries until it upgrades.
+
+**Tests.** Pure: `animus-dynamo` `global::tests` (parsing, validation,
+description); `animus-control` `mrec_table_apply` (apply, LWW, rejections,
+`local_read_override`, gate row, mirror round trip), `format_fixtures`
+(new `metadata/v1-mrec-overrides.json`, pinned JSON), `version`/`sim_versions`
+units; `animus-node` new `client-frame/v1-mrec-control-overrides.bin`.
+Simulation: `sim_world_mrec_overrides_tests` (two clusters, seeded: create with
+an override, the 1-RCU Region throttled while the other is not, a partition
+during an `Update`, heal, convergence of both `Replicas[]`, clear as a
+tombstone, closed-gate refusal); `sim_cluster_mixed_version_corpus`
+`release7_to_release8_mrec_overrides_gate` and
+`negative_control_mrec_overrides_gate_emitted_early` (N10).
+
+## Amendment (2026-10-21): the legacy 2017.11.29 global tables API (closes the section 5.3 gap as far as built)
+
+`CreateGlobalTable`, `UpdateGlobalTable`, `DescribeGlobalTable`,
+`ListGlobalTables`, `DescribeGlobalTableSettings` and
+`UpdateGlobalTableSettings` are implemented on top of the MREC machinery
+(sections 4 and 5; the saga, the shipper and the receiver are unchanged in
+their roles). Section 5.3's "rejected by name" is now the behaviour **only while
+`Gate::LegacyGlobalTables` is closed** (the text is byte-identical to before:
+`LEGACY_GLOBAL_TABLE_OPERATIONS` and `legacy_global_table_operation_error` are
+kept for that purpose, and the operations are decoded before the gate is
+looked at, so a malformed body is still its own `ValidationException`).
+
+**What a legacy table is.** An MREC table whose `GlobalTableSpec` carries a
+version marker, `legacy: Option<LegacyGlobal { created_ms, billing, stamp,
+origin }>` (additive, skipped while `None`, so every existing encoding and
+fixture is byte-identical; `GlobalBilling` is `PayPerRequest` or
+`Provisioned { write_units }`). `DescribeTable` of a legacy replica reports
+`GlobalTableVersion: "2017.11.29"` and no `MultiRegionConsistency`. A legacy
+spec is MREC-only (MRSC with a marker is `ModeFieldsMixed`). Because the
+replicas of a 2017.11.29 table are **pre-created, empty, identically shaped
+tables**, the saga never creates a peer table for a legacy replica: the new
+`MrecControl::LegacyReplica` makes the peer verify the table the operator
+created and adopt it.
+
+**Create (`CreateGlobalTable`).** The serving cluster's own Region must be in
+`ReplicationGroup`; every other Region must be a configured peer. The cluster
+checks its own table (exists and ACTIVE, empty, a stream with
+`NEW_AND_OLD_IMAGES`), then **verifies every other Region synchronously and
+concurrently** with `LegacyReplica { verify_only: true }` through a
+cross-cluster client installed on the edge (`MrecConfig.edge_client`, filled by
+the shipper loop; the edge had none, because everything cross-cluster used to
+be the saga's), under a 5 s timeout per Region. Only if all Regions accept does
+it commit `ConvertTableToLegacyGlobal` plus one `AddMrecReplica` per remote
+Region (`CREATING`); the saga then sends the non-verify `LegacyReplica`. A
+Region that cannot be reached is a retryable `InternalServerError` with nothing
+changed. `ConvertTableToLegacyGlobal` is idempotent and also adopts a
+standalone single-replica MREC table (it is how an MREC table is "upgraded" to
+carry the marker); any other global table is refused with
+`GlobalTableAlreadyExistsException`.
+
+**Update (`UpdateGlobalTable`).** `Create` verifies the new Region the same way
+and adds a replica (the existing saga then copies the rows into the new empty
+table); `Delete` marks the replica `DELETING` (the existing path). Because the
+2019 `Leave` message tells only the removed peer, a three-Region legacy table
+would leave the third Region believing the removed one is still a member.
+`MrecControl::LegacyRemovePeer { region }` therefore tells every remaining
+Region (and the removed one) to drop it; the removed cluster marks all its
+peers `DELETING` and dissolves, and a legacy spec left with one replica clears
+`schema.global` (`RemoveMrecReplica` does this) so it is a regular table again.
+Removing several Regions in one call works the same way: for each departing
+Region the initiator tells every other replica (survivors and the other
+departing Regions) first and the departing Region last, so every removed Region
+drops every other removed Region and no link remains between them. A cluster
+that is itself dissolving also sends `LegacyRemovePeer` to its former peers;
+the receiver ignores a `LegacyRemovePeer` from a sender that is `DELETING` or
+absent in its own spec, and the ordering guarantees the sender is already
+`DELETING` there (without this the dissolving cluster dissolved the others, a
+bug the SimWorld test found). The notification gives up on an unreachable
+Region after six failed passes.
+
+**Settings.** The replicated part is the billing mode and the write capacity:
+`MetaCommand::SetLegacyGlobalSettings` carries a last-writer-wins record
+`(stamp, origin)`, like the overrides record, pushed by the saga
+(`MrecControl::SetLegacySettings`) until each peer acknowledges that exact
+record. A `PROVISIONED` record sets the table throughput (`PAY_PER_REQUEST`
+clears it and clears every replica's read override). Per-Region provisioned
+**read** capacity is the per-replica override of the previous amendment
+(`ReplicaProvisionedReadCapacityUnits`, and per-index
+`ReplicaGlobalSecondaryIndexSettingsUpdate`), so it needs no new state.
+`DescribeGlobalTableSettings` reports each Region as that cluster knows it; a
+remote Region before any settings call is assumed to share the local billing
+mode (all replicas of a global table share one).
+
+**Errors, as the AWS model lists them** (service-2.json, checked per
+operation): `CreateGlobalTable` `LimitExceededException`,
+`GlobalTableAlreadyExistsException`, `TableNotFoundException`;
+`UpdateGlobalTable` `GlobalTableNotFoundException`,
+`ReplicaAlreadyExistsException`, `ReplicaNotFoundException`,
+`TableNotFoundException`; `DescribeGlobalTable` and
+`DescribeGlobalTableSettings` `GlobalTableNotFoundException`;
+`UpdateGlobalTableSettings` `GlobalTableNotFoundException`,
+`ReplicaNotFoundException`, `IndexNotFoundException`, `LimitExceededException`,
+`ResourceInUseException`; `ListGlobalTables` none; every operation also
+`InternalServerError`. A non-empty table, a missing or wrong-view-type stream,
+a ReplicationGroup that omits the serving Region or names fewer than two
+Regions or an unconfigured Region are `ValidationException`s, which the model
+does not list for these operations but AWS returns for malformed requests
+generally (unverified for these conditions; see below). `ListGlobalTables`
+pages by `ExclusiveStartGlobalTableName` and `Limit` (default 100) and is
+filtered by `RegionName`.
+
+**N6 (resolved as far as it can be, not verified).** The question was what a
+legacy operation does to a 2019.11.21 table. The model lists no error for it,
+so the implementation answers `GlobalTableNotFoundException` for `Describe*`,
+`UpdateGlobalTable` and `UpdateGlobalTableSettings` (the table is not a legacy
+global table) and `GlobalTableAlreadyExistsException` for `CreateGlobalTable`
+(the table already is a global table). The reverse is also refused: `UpdateTable`
+`ReplicaUpdates` and `UpdateTable` throughput changes on a legacy table are a
+`ValidationException` naming the legacy API. AWS's real behaviour here is still
+unverified (the documentation extracts and the model say nothing); the codes are
+the nearest listed ones.
+
+**Refused, naming the missing feature.** Auto scaling settings (all of
+`*AutoScalingSettingsUpdate`, except `{AutoScalingDisabled: true}`, which is a
+no-op because there is no auto scaling), `ReplicaTableClass`, and per-GSI write
+capacity (write capacity is the one global value).
+
+**Unverifiable here.** The sandbox cannot call AWS, so these are asserted from
+the service model only: the exact messages; whether the real service reports
+`CREATING` replicas the way `GlobalTableStatus` is derived here (`CREATING`
+while any replica is, `DELETING` while this Region's is, else `ACTIVE`;
+`UPDATING` is never reported); `ReplicaStatus` values beyond those the MREC saga
+has; the ARN shape (`arn:aws:dynamodb::0:global-table/<name>`); whether AWS
+accepts `UpdateGlobalTable` while a replica is `CREATING` (here it does; the
+settings call answers `ResourceInUseException` then); and the
+`ValidationException` conditions above.
+
+**Not built, precisely.** The legacy table cannot be created with data in any
+replica (as in AWS); there is no 2017.11.29 to 2019.11.21 upgrade call (the
+2019 `UpdateTable` simply refuses a legacy table); MRSC is not reachable through
+the legacy API (AWS has no such mode there either).
+
+**Found while testing (pre-existing, fixed here).** A replica of an *empty*
+source table was promoted to `ACTIVE` once its scan finished, and an empty scan
+needs no batch and so no peer contact: a partition during creation could leave a
+replica `ACTIVE` whose peer was never told, and the saga sent `CreateReplica`
+only while nothing was copied. The saga now promotes only after the peer
+acknowledged the creation (`PeerHealth.create_acked`, driver-local; a new driver
+re-sends the idempotent message). This affects the 2019 flow too.
+
+**Gate (ADR 0073).** New `Gate::LegacyGlobalTables` at cluster version 9
+(`MAX_SUPPORTED = 9`; the number lives in one constant,
+`version::LEGACY_GLOBAL_TABLES_VERSION`). It guards
+`ConvertTableToLegacyGlobal` and `SetLegacyGlobalSettings` (`required_gate`
+rows, relay list, mirror arms, `sim_versions` content gate), the six operations
+(the emit-site check; below the gate they keep the refusal above) and the peer
+handlers. The three `MrecControl` variants follow `SetTtl`'s precedent
+(additive, class G with the `MrecApply` frame).
+
+**Tests.** Pure: `animus-dynamo` `legacy_global` and `global::tests` (decode,
+bodies, errors, the closed-gate text); `animus-control` `legacy_global_apply`
+(apply, idempotency, LWW, dissolve, gate rows, mirror round trip),
+`format_fixtures` (new `metadata/v1-legacy-global.json`), `version` and
+`sim_versions` units including the acceptance-matrix row and `Release(9)`
+profile; `animus-node` new `client-frame/v1-mrec-control-legacy.bin`.
+Simulation: `sim_world_mrec_legacy_tests` (three clusters, seeded, >= 20
+seeds, including removing two Regions in one call under a partition: a partition during `CreateGlobalTable` and another during the replica's
+creation, writes in each Region, `UpdateGlobalTable` add and remove,
+Describe/List agreement, settings, and every error case above);
+`sim_cluster_dynamo_global_table` (the closed-gate refusal loop);
+`sim_cluster_mixed_version_corpus` `release8_to_release9_legacy_global_gate`
+and `negative_control_legacy_global_gate_emitted_early` (N11).

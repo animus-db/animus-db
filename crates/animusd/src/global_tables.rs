@@ -26,12 +26,14 @@
 //! write racing the conversion is safe because Raft membership change moves
 //! data anyway. It is deliberately *not* a replicated precondition.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use animus_control::schema::{GlobalTableSpec, MrecReplicaStatus, MultiRegionConsistency};
 use animus_control::version::Gate;
 use animus_control::{IndexKind, MetaCommand, Metadata, NodeStatus};
-use animus_dynamo::global::{GlobalTableDescription, GlobalTableUpdate, RegionStatus};
+use animus_dynamo::global::{
+    GlobalTableDescription, GlobalTableUpdate, RegionStatus, ReplicaReadOverrides,
+};
 use animus_dynamo::wire::{self, WireError};
 use animus_env::Env;
 use animus_node::host::RelayClient;
@@ -68,6 +70,8 @@ pub(crate) fn global_description(meta: &Metadata, table: &str) -> Option<GlobalT
         }
     };
     Some(GlobalTableDescription {
+        legacy: false,
+        overrides: BTreeMap::new(),
         replicas: spec
             .regions
             .iter()
@@ -87,6 +91,21 @@ fn mrec_description(spec: &GlobalTableSpec) -> Option<GlobalTableDescription> {
         return None;
     }
     Some(GlobalTableDescription {
+        legacy: spec.legacy.is_some(),
+        overrides: spec
+            .replicas
+            .iter()
+            .filter(|r| !r.overrides.is_empty())
+            .map(|r| {
+                (
+                    r.region.clone(),
+                    ReplicaReadOverrides {
+                        table_read_units: r.overrides.read_units,
+                        index_read_units: r.overrides.index_read_units.clone(),
+                    },
+                )
+            })
+            .collect(),
         replicas: spec
             .replicas
             .iter()
@@ -143,7 +162,7 @@ pub(crate) fn reject_ttl_on_global(meta: &Metadata, table: &str) -> Result<(), W
 /// Whether `table` holds at least one live item (a DynamoDB tombstone row is
 /// not an item). A quorum scan over the whole table, page by page, stopping at
 /// the first live row.
-async fn table_has_items<E: Env, R: RelayClient>(
+pub(crate) async fn table_has_items<E: Env, R: RelayClient>(
     ctx: &ClientCtx<E, R>,
     table: &str,
 ) -> Result<bool, WireError> {
@@ -223,6 +242,15 @@ pub(crate) async fn update_table_global<E: Env, R: RelayClient>(
         return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
             table.to_owned(),
         )));
+    }
+
+    // 2b. Removing Regions from an MRSC table (ADR 0075's 2026-10-21
+    // amendment): the AWS-documented "delete two replicas, or one replica and
+    // the witness" path, which reverts the table to a single-Region one.
+    if update.has_deletes()
+        && let Some(spec) = meta.table_global(table).filter(|g| g.is_mrsc())
+    {
+        return revert_table_global(ctx, table, &update, spec.clone()).await;
     }
 
     // 3. The request shape.
@@ -317,6 +345,7 @@ pub(crate) async fn update_table_global<E: Env, R: RelayClient>(
         witness: request.witness,
         preferred_leader_region: local,
         replicas: Vec::new(),
+        legacy: None,
     };
     spec.validate()
         .map_err(|e| WireError::validation(format!("UpdateTable: {}", e.message())))?;
@@ -346,6 +375,90 @@ pub(crate) async fn update_table_global<E: Env, R: RelayClient>(
             return Err(internal(
                 "UpdateTable (ReplicaUpdates) did not commit to the control plane in time (no \
                  leader reachable, or the cluster refused the conversion)",
+            ));
+        }
+        ctx.env.sleep(SCHEMA_POLL_INTERVAL).await;
+    }
+}
+
+/// `UpdateTable` deleting Regions of a multi-Region strongly consistent table
+/// (ADR 0075's 2026-10-21 amendment): exactly two of the table's three
+/// Regions (two replicas, or one replica and the witness); the remaining
+/// replica Region becomes the regular single-Region table.
+///
+/// Proposes one [`MetaCommand::RevertGlobalToRegional`] (clear the spec and
+/// swap every tablet's pinned policy for a regional one in one apply); the
+/// ordinary repair pass then converges the replicas into the kept Region.
+/// The command is idempotent, so the retry loop is safe under leader change.
+///
+/// # Errors
+/// The named `ValidationException`s of
+/// [`GlobalTableUpdate::validate_revert`], plus: the table is not `ACTIVE`,
+/// the kept Region has no member.
+async fn revert_table_global<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    table: &str,
+    update: &GlobalTableUpdate,
+    spec: GlobalTableSpec,
+) -> Result<String, WireError> {
+    // The emit-site gate check (ADR 0073). A closed gate answers with the
+    // pre-amendment text, byte for byte.
+    let features = &ctx.edge.version().features;
+    if !features.is_open(Gate::MrscReplicaRemoval) {
+        features.update(&ctx.effective_metadata());
+        if !features.is_open(Gate::MrscReplicaRemoval) {
+            return Err(update
+                .validate()
+                .err()
+                .unwrap_or_else(|| update.closed_gate_error()));
+        }
+    }
+    let request = update.validate_revert(&spec.regions, spec.witness.as_deref())?;
+    let keep = request.keep_region;
+    let meta = ctx.metadata_fresh().await;
+    if table_status(&meta, table) != "ACTIVE" {
+        return Err(WireError::validation(format!(
+            "UpdateTable: table `{table}` is not ACTIVE"
+        )));
+    }
+    let kept_has_member = meta.members.values().any(|m| {
+        m.status != NodeStatus::Leaving && m.labels.get(REGION_LABEL).is_some_and(|r| *r == keep)
+    });
+    if !kept_has_member {
+        return Err(WireError::validation(format!(
+            "UpdateTable: no cluster member carries `{REGION_LABEL}={keep}`, so the table cannot \
+             be kept in Region `{keep}`"
+        )));
+    }
+    let deadline = ctx.env.now().saturating_add(SCHEMA_COMMIT_TIMEOUT);
+    loop {
+        ctx.propose_schema(&MetaCommand::RevertGlobalToRegional {
+            table: table.to_owned(),
+            keep_region: keep.clone(),
+        })
+        .await;
+        let fresh = ctx.metadata_fresh().await;
+        if !fresh.has_table_schema(table) {
+            return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
+                table.to_owned(),
+            )));
+        }
+        if fresh.table_global(table).is_none() {
+            // A concurrent request that kept a different Region won the race.
+            if let Some(won) = fresh.table_pinned_region(table)
+                && won != keep
+            {
+                return Err(WireError::validation(format!(
+                    "UpdateTable: table `{table}` was concurrently converted to a single-Region \
+                     table in Region `{won}`"
+                )));
+            }
+            return describe_table_wrapped(&fresh, table, "TableDescription");
+        }
+        if ctx.env.now() >= deadline {
+            return Err(internal(
+                "UpdateTable (ReplicaUpdates Delete) did not commit to the control plane in \
+                 time (no leader reachable, or the cluster refused the change)",
             ));
         }
         ctx.env.sleep(SCHEMA_POLL_INTERVAL).await;
