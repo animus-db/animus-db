@@ -387,6 +387,14 @@ not land results.
    produces. Each is a possible scenario on the library API (C-17 Tier 2
    builds the scale/density ones); none is claimed.
 
+9. **No cross-region (MREC) scenario.** This ADR owed one. It is still unbuilt: a
+   bench run would need a two-cluster launcher, the cluster-version-3 finalize,
+   the `ReplicaUpdates` saga and a second-region visibility probe, and over loopback
+   it could only report an *emulated* WAN. MREC replication lag and bytes per write
+   are instead measured by `animusd/tests/mrec_wan_emulated.rs` through a TCP delay
+   proxy (ADR 0075, amendment 2026-10-21; `docs/benchmarks.md`). A real cross-region
+   run needs real regions.
+
 ## Alternatives considered
 
 - **The AWS SDK** — §2.

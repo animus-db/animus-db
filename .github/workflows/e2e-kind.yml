@@ -13,6 +13,7 @@ on:
       - "deploy/**"
       - "Dockerfile"
       - "scripts/e2e-kind.sh"
+      - "scripts/e2e-federation-kind.sh"
       - ".github/workflows/e2e-kind.yml"
   pull_request:
     paths:
@@ -20,6 +21,7 @@ on:
       - "deploy/**"
       - "Dockerfile"
       - "scripts/e2e-kind.sh"
+      - "scripts/e2e-federation-kind.sh"
       - ".github/workflows/e2e-kind.yml"
 
 concurrency:
@@ -136,6 +138,56 @@ jobs:
           ANIMUSD_IMAGE: animusd:e2e
           E2E_TLS: "1"
         run: bash scripts/e2e-kind.sh
+
+  e2e-kind-federation:
+    name: e2e-kind-federation
+    runs-on: ubuntu-latest
+    # ADR 0075 G-e: two 3-node AnimusClusters (two namespaces in one kind
+    # cluster, two CAs, `spec.region`/`spec.peers`/`spec.tls`) federate and a
+    # global table replicates both ways over the DynamoDB wire
+    # (scripts/e2e-federation-kind.sh). Six animusd pods plus cert-manager and
+    # a finalize-to-version-3 step on each cluster, so more budget than the
+    # single-cluster TLS job. UNVERIFIED until its first run here: the script
+    # was written where kind cannot run.
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          df -h /
+
+      - name: Install Rust toolchain (1.96)
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Cache cargo registry + build output
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Install kind
+        run: |
+          curl -Lo ./kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build animusd image
+        run: docker build -t animusd:e2e .
+
+      - name: Run the two-cluster federation e2e
+        env:
+          ANIMUSD_IMAGE: animusd:e2e
+        run: bash scripts/e2e-federation-kind.sh
 
   e2e-kind-s3:
     name: e2e-kind-s3

@@ -353,6 +353,25 @@ by this same open-loop generator.
 - Tables are named `ycsb<epoch>_<workload>`; a crashed run can leave tables
   behind.
 
+## Emulated-WAN MREC measurement (not a real WAN)
+
+There is no cross-region variant of `animus-bench` yet. MREC replication lag and WAN
+bytes are measured by a real-process test instead:
+`cargo test -p animusd --test mrec_wan_emulated -- --nocapture` (two clusters with
+mutual TLS whose peer traffic goes through a TCP delay proxy, 40 ms one-way by
+default; knobs `ANIMUS_WAN_ONE_WAY_MS`, `ANIMUS_WAN_JITTER_MS`, `ANIMUS_WAN_MBPS`,
+`ANIMUS_WAN_WRITES`). Local result, **emulated WAN on loopback, not a real WAN**, 40 ms
+one-way, 96 writes: lag p50 about 450 ms, p95 about 650 ms, p99 about 700 ms (min about
+170 to 240 ms); about 440 bytes on the wire per write with TLS framing. These are test-host numbers, not
+published results, and must not be quoted as AnimusDB performance. Detail and the
+reading in ADR 0075's 2026-10-21 amendment.
+
+Why the test and not a bench scenario: a cross-region `animus-bench` run needs a
+two-cluster launcher, the version-3 finalize, the replica saga and a lag probe that
+reads the second region, none of which `animus_bench::cluster` has; that is a larger
+change than the measurement it would add on top of the test, and the numbers would
+carry the same "emulated" label.
+
 ## What is not done
 
 - **No published results.** The first curated run needs a dedicated client
