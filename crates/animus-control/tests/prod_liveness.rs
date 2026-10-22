@@ -295,7 +295,7 @@ async fn large_metadata_catch_up_stays_live() {
 
         // Start node 2 (dark until now): it must catch up to the large, compacted
         // state. Primary signal: it does so promptly (12s budget; the fix serves the
-        // ~1100-chunk snapshot in well under a second — the timed core test proves the
+        // ~3.5 MB / 55-chunk snapshot in about a second in a debug build — the timed core test proves the
         // per-chunk cost directly).
         let node2 = RaftNode::start(envs[2].clone(), group.clone(), MemoryEngine::new());
         let started = std::time::Instant::now();

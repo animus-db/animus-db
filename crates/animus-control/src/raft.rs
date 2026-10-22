@@ -5601,8 +5601,13 @@ where
             // Real forward progress (or an exact repeat) — the monotonic
             // guard's own case, and proof this peer's transfer is healthy:
             // clear any accumulated regression count.
+            let duplicate = next_offset == *tracked
+                && self.snapshot_chunk_sent.get(&from).map(|&(o, _)| o) == Some(next_offset);
             *tracked = next_offset;
             self.snapshot_offset_regressions.insert(from.clone(), 0);
+            if duplicate {
+                return Vec::new();
+            }
         }
         // `SnapshotResend::Capped(SNAPSHOT_ACK_RESEND_CAP)`, not `Always` and
         // not `Capped(0)` — see `snapshot_chunk_for`'s own doc for why this
