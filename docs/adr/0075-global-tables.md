@@ -27,6 +27,8 @@
 
 ## 0. Verification note (read first)
 
+**Update 2026-10-21:** wire names, shapes and enum values are now verified against the botocore service model (section 0.1). The text below is the original 2026-09 state; where it says "unverified" for a field name, read section 0.1.
+
 The AWS facts below were checked against the AWS documentation **through web
 search result extracts only**. Direct page fetches of `docs.aws.amazon.com`
 were blocked by the sandbox's egress proxy while this was written, so no page was
@@ -79,6 +81,72 @@ except where flagged.
   the service model lists by the 2026-10-21 legacy-API amendment; still not
   verified against the service.)
 - N7: replication latency, throughput-unit (rWRU) accounting details.
+
+### 0.1 Wire-name verification against the botocore service model (2026-10-21)
+
+Source: the AWS botocore DynamoDB `service-2.json` (the machine-readable model the
+AWS SDKs are generated from), read in full on 2026-10-21; AWS developer-guide
+statements are as quoted in V6-V15 (re-read 2026-10-21). This supersedes the
+"unverified field names" caveats in the sections below for **names and shapes**;
+it does not cover message strings.
+
+**Verified against the model (matches; no change):**
+
+| Wire name | Model shape | Result |
+|---|---|---|
+| `UpdateTable.ReplicaUpdates` (list), `MultiRegionConsistency`, `GlobalTableWitnessUpdates` (list) | `UpdateTableInput` | match |
+| `ReplicaUpdates[]` = `ReplicationGroupUpdate` with `Create`/`Update`/`Delete`/`Disassociate`; `Create`/`Delete` require `RegionName` | `ReplicationGroupUpdate`, `CreateReplicationGroupMemberAction` | match; `Disassociate` is now named and refused (it previously hit the generic "exactly one of" text) |
+| per-replica override members `KMSMasterKeyId`, `ProvisionedThroughputOverride`, `OnDemandThroughputOverride`, `GlobalSecondaryIndexes`, `TableClassOverride` | `CreateReplicationGroupMemberAction` | exactly the five the model defines; all still refused |
+| `GlobalTableWitnessUpdates[]` = `Create`/`Delete`, each with `RegionName` | `GlobalTableWitnessGroupUpdate` | match |
+| `MultiRegionConsistency` values `EVENTUAL`, `STRONG` | `MultiRegionConsistency` enum | match |
+| `TableDescription.GlobalTableVersion`, `Replicas`, `GlobalTableWitnesses`, `MultiRegionConsistency` (all top-level on `TableDescription`) | `TableDescription` | match, including placement |
+| `Replicas[].RegionName`, `ReplicaStatus` | `ReplicaDescription` | match |
+| `GlobalTableWitnesses[].RegionName`, `WitnessStatus` | `GlobalTableWitnessDescription` | match |
+| `ReplicaStatus` values emitted (`CREATING`, `CREATION_FAILED`, `DELETING`, `ACTIVE`) | `ReplicaStatus` enum (10 values) | subset; pinned by a unit test |
+| `WitnessStatus` values emitted (`CREATING`, `ACTIVE`, `DELETING`) | `WitnessStatus` enum (`CREATING`, `DELETING`, `ACTIVE`) | subset (the witness never gets `CREATION_FAILED`) |
+| `CreateTable` takes no replica/consistency members (N2) | `CreateTableInput` has only `GlobalTableSourceArn` and `GlobalTableSettingsReplicationMode` (multi-account global tables, a different feature) | N2 resolved: global-ness starts at `UpdateTable` |
+| Legacy operations `CreateGlobalTable`, `UpdateGlobalTable`, `DescribeGlobalTable`, `DescribeGlobalTableSettings`, `ListGlobalTables`, `UpdateGlobalTableSettings` | operation list of the model | all six exist and are the six we reject |
+
+**Changed because of this check:**
+
+- `UpdateTable` on a table that is not `ACTIVE` (global-table conversion and MREC
+  replica changes) now returns `ResourceInUseException`, not `ValidationException`.
+  The model lists `ResourceInUseException` for `UpdateTable` ("tried to update a
+  resource that was already being updated").
+- `ReplicaUpdates` `Disassociate` is named in its own refusal.
+- Section 5.1's claim that `UPDATING` is emitted is corrected (see the `DescribeTable`
+  row of the response table): AnimusDB has no truthful per-replica updating state.
+
+**Exception types.** The model lists `ResourceInUseException`,
+`ResourceNotFoundException`, `LimitExceededException` and `InternalServerError`
+for `UpdateTable` and `UpdateTimeToLive`; it lists no `ValidationException` for any
+operation (AWS returns it as a generic error; AnimusDB already uses it for every
+other validation failure). The remaining global-tables rejections stay
+`ValidationException`, as does the MRSC transaction and TTL rejection (the model's
+`TransactWriteItems`/`TransactGetItems` error lists have no MRSC-specific type).
+The region-capacity refusal stays the retryable `ServiceUnavailable` (the same code
+`CreateTable` uses for capacity); it is an AWS common error, not in the per-operation
+model, and is not changed here.
+
+**`ReplicatedWriteConflictException`** exists as a shape in the model ("one or more
+items in the request are being modified by a request in another Region") but the
+model attaches it to no operation's error list, so its per-operation contract is not
+verifiable. AnimusDB still never emits it (MRSC has one leader per tablet; MREC
+resolves by last-writer-wins).
+
+**Not filled in `ReplicaDescription`** (members exist in the model; AnimusDB has no
+truthful value or no feature behind them): `ReplicaArn`, `ReplicaStatusDescription`,
+`ReplicaStatusPercentProgress`, `KMSMasterKeyId`, throughput/table-class overrides,
+`GlobalSecondaryIndexes`, `WarmThroughput`, `ReplicaInaccessibleDateTime`,
+`GlobalTableSettingsReplicationMode`. Absent optional members are not a
+protocol error.
+
+**Still unverifiable without a real AWS account:** every error *message* string (AWS
+does not publish them; AnimusDB's wording is its own, the exception type is the
+checked part), the exact exception type AWS returns for MRSC-specific rejections
+(add-replica, non-empty conversion, TTL, LSI, transactions: N1), N6 (the legacy
+operations' behaviour on a table that is a 2019.11.21 replica), whether `STRONG`
+needs a non-empty-table error type other than `ValidationException`, N3, N4, N5, N7.
 
 ## 1. Context
 
@@ -437,7 +505,7 @@ assertions. `ANIMUS_MREC_SEEDS=K` joins the knob table; nightly depth in
 | `ReplicaUpdates[].Update` | Rejected in v1 (no overridable per-replica setting is supported). |
 | `UpdateTable.MultiRegionConsistency` (`EVENTUAL`/`STRONG`) | Accepted only together with at least one `Create` (V3). Default `EVENTUAL`. `STRONG` requires: exactly three regions (V6) = this region + two more, or this region + one more + one witness; an **empty** table (V8); no TTL, LSIs (V8). |
 | `UpdateTable.GlobalTableWitnessUpdates` | `Create` only, only with `STRONG`, at most one (V4); otherwise rejected. |
-| `DescribeTable` | Adds `GlobalTableVersion: "2019.11.21"`, `Replicas[]` (`RegionName`, `ReplicaStatus` from the V5 set; v1 emits `CREATING`, `CREATION_FAILED`, `UPDATING`, `DELETING`, `ACTIVE`), `MultiRegionConsistency`, and `GlobalTableWitnesses[]` (MRSC). The local region is *included* in `Replicas` as AWS does (N1: unverified, matches common SDK output). |
+| `DescribeTable` | Adds `GlobalTableVersion: "2019.11.21"`, `Replicas[]` (`RegionName`, `ReplicaStatus` from the V5 set; AnimusDB emits `CREATING`, `CREATION_FAILED`, `DELETING`, `ACTIVE`. It never emits `UPDATING`: a replica has no in-place update state, because per-replica `Update` is refused, so adding or removing a Region shows as `CREATING`/`DELETING`. `WitnessStatus` is `CREATING`/`ACTIVE` in practice), `MultiRegionConsistency`, and `GlobalTableWitnesses[]` (MRSC). The local region is *included* in `Replicas` as AWS does (N1: unverified, matches common SDK output; the member names and enum values are verified, see section 0.1). |
 | `CreateTable` | **Does not accept** replica/consistency fields (N2); global-ness begins with `UpdateTable`. |
 | `ExecuteTransaction`, `Transact*` | Rejected on MRSC (V8); region-local on MREC (V14). |
 
@@ -760,13 +828,15 @@ table, TTL or LSI present, an already-global table; on a global table
 rejected by name, ungated. The `limits` catalogue gained `MRSC_REQUIRED_REGIONS`,
 `MRSC_MAX_WITNESSES`, `MRSC_MIN_FULL_REPLICAS` and `GLOBAL_TABLE_VERSION`.
 
-**Unverified against AWS:** docs.aws.amazon.com was unreachable from the
+**Field names verified 2026-10-21 (section 0.1); error texts still AnimusDB's own.**
+(Original caveat: docs.aws.amazon.com was unreachable from the
 build environment, so the field names above (`ReplicaUpdates`,
 `GlobalTableWitnessUpdates`, `MultiRegionConsistency`, `GlobalTableVersion`,
 `GlobalTableWitnesses`, `ReplicaStatus`/`WitnessStatus`) come from the plan's
 earlier search extracts (section 0), and every error *text* is AnimusDB's own
 (N1). Re-read the API reference for `UpdateTable`/`ReplicationGroupUpdate`/
-`TableDescription` before G-c ships.
+`TableDescription` before G-c ships. The names were later checked against the
+botocore service model; see section 0.1.)
 
 (The M4 items listed here as open were completed; see the next amendment.)
 
@@ -855,8 +925,9 @@ register checker.
 - The control quorum across Regions is only checked at admin time; a cluster
   whose control majority sits in one Region loses DDL when that Region fails.
   `/admin/global-tables` warns; placement of control voters is the operator's.
-- The AWS field names and error texts are unverified against the live API
-  (see the M3 amendment); a docs re-read is still owed before release.
+- AWS field names, shapes and enum values were verified against the botocore
+  service model on 2026-10-21 (section 0.1); error message texts remain
+  unverifiable without a real AWS account.
 - Cost numbers of section 3.2 are unmeasured; an `animus-bench` cross-region
   variant (ADR 0076) is a follow-up.
 
@@ -1170,9 +1241,10 @@ framing work, **not** WAN behaviour.
 - No WAN latency, bandwidth or cost measurement; the two real clusters share a host.
   `kind`/operator e2e cannot run in this sandbox, so the operator rendering peers
   into `cluster.json` (G-e, built afterwards, see "G-e as built") is unverified on a real cluster.
-- The AWS wire field and error names MREC uses (`ReplicaUpdates`, `Replicas`,
-  `ReplicaStatus`, the validation texts) remain unverified against the AWS docs
-  (section 0); they are the shapes AWS's public API reference extracts showed.
+- The AWS wire field names and enum values MREC uses (`ReplicaUpdates`, `Replicas`,
+  `ReplicaStatus`) were verified against the botocore service model on 2026-10-21
+  (section 0.1); the validation message texts remain unverifiable without a real AWS
+  account.
 - F2 (above): the receiver's stream coalesces writes made within one shipping round, as AWS MREC does; decided 2026-10-06.
 - Shipper health is per node and in memory; no cluster-wide lag aggregate or alert.
 - A TTL change made while the saga driver role moves is not re-sent until the next
@@ -1186,6 +1258,7 @@ framing work, **not** WAN behaviour.
   does not refresh the key schema of an already-registered table, so a table dropped
   and recreated with a *different* key schema stays unreadable on that node until a
   restart; MREC's re-create path hits it only for a different shape.
+- A `Creating` replica is promoted to ACTIVE only after the peer acknowledged creating its table (node-local `PeerHealth.create_acked`, re-sent by a new saga driver); an empty source table previously went ACTIVE with no peer table (fixed).
 - Only the full-mesh topology exists (D8); `ReplicaUpdates[].Update` and the
   per-replica overrides (KMS, throughput) are rejected, as section 5 says.
 

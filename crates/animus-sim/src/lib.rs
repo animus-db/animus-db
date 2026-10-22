@@ -66,6 +66,17 @@ type TimerId = u64;
 struct FileState {
     durable: Vec<u8>,
     buffered: Vec<u8>,
+    /// The file's *directory entry* survives a power cut: a completed
+    /// `sync`/`replace`/`commit_staged`/`link` fsynced the parent directory
+    /// chain (the `ProdEnv` contract, PR #27). A file created by `append`
+    /// and never synced has `false` here, and a [`Simulator::crash`]
+    /// removes it entirely. Starts `false` (`Default`).
+    name_durable: bool,
+    /// Mirrors `ProdEnv`'s `dir_synced` memo: the *current process* already
+    /// fsynced this name's directory chain, so a further `sync` skips it.
+    /// Reset (to re-sync on next `sync`) by `crash`/`stop`, like the memo of
+    /// a fresh process.
+    dir_memo: bool,
 }
 
 /// A scheduled future event on the virtual timeline.
@@ -295,9 +306,48 @@ pub struct DiskConfig {
     /// is `"sync"`** — an unconfigured (default) value perturbs neither the
     /// RNG stream nor the trace for any existing config, on any op.
     sync_only_error_threshold: u64,
+    /// Directory-entry durability adversary (PR #27): on [`Simulator::crash`],
+    /// each `remove` whose containing directory was never fsynced afterwards
+    /// *un-happens* with this probability — the file comes back with its last
+    /// durable bytes (an orphan its owner already forgot), exactly what
+    /// `ProdEnv::remove`'s "no dir fsync" permits. `0` (default) = off;
+    /// `u64::MAX` = every pending remove resurrects (no RNG drawn); in
+    /// between, one `next_u64` per pending remove, in name order. **Must be
+    /// armed before the workload's `remove`s run** (the removed bytes are
+    /// only retained while it is on). See
+    /// [`set_resurrect_unsynced_removes_on_crash_prob`](Self::set_resurrect_unsynced_removes_on_crash_prob).
+    resurrect_remove_threshold: u64,
+    /// **Negative-control knob**: `sync` no longer fsyncs the parent
+    /// directory — the `ProdEnv` behaviour before PR #27. A file created by
+    /// `append` + `sync` then still has a non-durable name, and a crash
+    /// removes it (only `replace`/`commit_staged`/`link` make a name
+    /// durable). A component that is correct under the real contract does
+    /// not notice only if it never relies on `sync` alone for a *new* file;
+    /// tests use this to prove their oracle bites. Default `false`.
+    sync_skips_dir_fsync: bool,
 }
 
 impl DiskConfig {
+    /// Model a `Disk` whose `sync` skips the directory fsync — see
+    /// [`sync_skips_dir_fsync`](Self::sync_skips_dir_fsync). Negative controls only.
+    pub fn set_sync_skips_dir_fsync(&mut self, on: bool) {
+        self.sync_skips_dir_fsync = on;
+    }
+
+    /// Arm the unsynced-`remove` resurrection adversary with probability `p`
+    /// in `[0.0, 1.0]` per pending remove — see
+    /// [`resurrect_remove_threshold`](Self::resurrect_remove_threshold).
+    /// A `remove` is made permanent by any later fsync of a directory in its
+    /// chain: the first `sync` of a file in that directory (in the current
+    /// process), a `replace`, `commit_staged` or `link`.
+    pub fn set_resurrect_unsynced_removes_on_crash_prob(&mut self, p: f64) {
+        self.resurrect_remove_threshold = if p >= 1.0 {
+            u64::MAX
+        } else {
+            (p.clamp(0.0, 1.0) * (u64::MAX as f64)) as u64
+        };
+    }
+
     /// Set the independent per-op disk error probability in `[0.0, 1.0]`.
     pub fn set_error_prob(&mut self, p: f64) {
         self.error_threshold = (p.clamp(0.0, 1.0) * (u64::MAX as f64)) as u64;
@@ -445,6 +495,17 @@ pub enum TraceEvent {
     /// node id and any in-flight network/task state are untouched, only the
     /// persisted store is gone.
     DiskWipe { t: u64, node: NodeId },
+    /// A crash resurrected a `remove` whose directory was never fsynced
+    /// afterwards ([`DiskConfig::set_resurrect_unsynced_removes_on_crash_prob`]):
+    /// `file` is back with `len` durable bytes. (A never-synced created file
+    /// vanishing on crash is the default and emits no event, so default
+    /// traces stay byte-identical.)
+    DiskResurrect {
+        t: u64,
+        node: NodeId,
+        file: String,
+        len: usize,
+    },
 }
 
 impl std::fmt::Display for TraceEvent {
@@ -550,6 +611,9 @@ impl std::fmt::Display for TraceEvent {
             }
             TraceEvent::DiskWipe { t, node } => {
                 write!(f, "t={t} DISKWIPE node={node}")
+            }
+            TraceEvent::DiskResurrect { t, node, file, len } => {
+                write!(f, "t={t} DISKRESURRECT node={node} file={file} len={len}")
             }
         }
     }
@@ -711,6 +775,12 @@ struct SimState {
     closed_streams: BTreeSet<(NodeId, u64)>,
 
     disks: BTreeMap<(NodeId, String), FileState>,
+    /// Removed files whose removal is not yet namespace-durable (no later
+    /// fsync of a directory in their chain): `(node, name) -> last durable
+    /// state`. Only populated while the node's
+    /// [`DiskConfig::resurrect_remove_threshold`] is armed. Resolved (and
+    /// emptied for the node) by `crash`; cleared per directory by a dir fsync.
+    pending_removes: BTreeMap<(NodeId, String), FileState>,
 
     // Directed blocked pairs: `(a, b)` blocks delivery from `a` to `b`.
     partitions: BTreeSet<(NodeId, NodeId)>,
@@ -974,6 +1044,37 @@ impl SimState {
             .take_while(|((n, _), _)| n == node)
             .map(|(k, _)| k.clone())
             .collect()
+    }
+
+    /// Model `ProdEnv::sync_parents(file)`: fsync every directory from
+    /// `file`'s parent up to the data dir. That makes durable every earlier
+    /// namespace change (notably an unsynced `remove`) in those directories,
+    /// so the matching [`pending_removes`](Self::pending_removes) entries
+    /// stop being able to un-happen. A name's directory is its prefix up to
+    /// the last `/` (`""` = the data dir, always in the chain).
+    fn dir_fsync_chain(&mut self, node: &NodeId, file: &str) {
+        if self.pending_removes.is_empty() {
+            return;
+        }
+        let mut chain: Vec<&str> = vec![""];
+        for (i, c) in file.char_indices() {
+            if c == '/' {
+                chain.push(&file[..i]);
+            }
+        }
+        fn dir_of(name: &str) -> &str {
+            name.rfind('/').map_or("", |i| &name[..i])
+        }
+        let done: Vec<(NodeId, String)> = self
+            .pending_removes
+            .range((node.clone(), String::new())..)
+            .take_while(|((n, _), _)| n == node)
+            .filter(|((_, name), _)| chain.contains(&dir_of(name)))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in done {
+            self.pending_removes.remove(&k);
+        }
     }
 
     /// [`node_prefix_keys`](Self::node_prefix_keys)'s `BTreeSet` twin — same
@@ -1390,6 +1491,7 @@ impl Simulator {
             inbox_cap: InboxCap::default(),
             closed_streams: BTreeSet::new(),
             disks: BTreeMap::new(),
+            pending_removes: BTreeMap::new(),
             partitions: BTreeSet::new(),
             crashed: BTreeSet::new(),
             trace: Vec::new(),
@@ -1662,6 +1764,7 @@ impl Simulator {
                 f.buffered.clear();
             }
         }
+        st.pending_removes.retain(|(n, _), _| *n != node);
         st.trace.push(TraceEvent::DiskWipe { t, node });
     }
 
@@ -1769,6 +1872,45 @@ impl Simulator {
                 });
             }
         }
+        // Namespace durability (PR #27). A file whose directory entry was
+        // never fsynced (created by `append`, never `sync`ed, not the target
+        // of a completed `replace`/`commit_staged`/`link`) does not survive
+        // the power cut at all — after the tear draws above, so the RNG
+        // stream of torn-tail runs is unchanged.
+        let keys = SimState::node_prefix_keys(&st.disks, &node);
+        for k in keys {
+            let name_durable = st.disks.get(&k).is_some_and(|f| f.name_durable);
+            if !name_durable {
+                st.disks.remove(&k);
+            } else if let Some(f) = st.disks.get_mut(&k) {
+                // The restarted process has an empty `dir_synced` memo.
+                f.dir_memo = false;
+            }
+        }
+        // Unsynced removes may un-happen: the file returns with its last
+        // durable bytes. Pending removes are resolved here either way.
+        let threshold = st.disk_cfg_for(&node).resurrect_remove_threshold;
+        let pending: Vec<(NodeId, String)> = st
+            .pending_removes
+            .range((node.clone(), String::new())..)
+            .take_while(|((n, _), _)| *n == node)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in pending {
+            let Some(orphan) = st.pending_removes.remove(&k) else {
+                continue;
+            };
+            let back = threshold == u64::MAX || (threshold != 0 && st.rng.next_u64() < threshold);
+            if back && !st.disks.contains_key(&k) {
+                st.trace.push(TraceEvent::DiskResurrect {
+                    t,
+                    node: node.clone(),
+                    file: k.1.clone(),
+                    len: orphan.durable.len(),
+                });
+                st.disks.insert(k, orphan);
+            }
+        }
     }
 
     /// Bring a crashed `node` back. Its durable disk state remains.
@@ -1870,6 +2012,8 @@ impl Simulator {
         for k in keys {
             if let Some(f) = st.disks.get_mut(&k) {
                 f.buffered.clear();
+                // A fresh process starts with an empty `dir_synced` memo.
+                f.dir_memo = false;
             }
         }
         // A process exit drops its open connections: any `Deliver` already
@@ -2636,6 +2780,7 @@ impl Disk for SimEnv {
             // reaches here — nothing was "acked" at all). Draws RNG only when
             // configured non-zero, so a config with no `fsync_lie_prob` set
             // draws nothing extra here and stays byte-identical.
+            let skips_dir_fsync = st.disk_cfg_for(&self.node_id).sync_skips_dir_fsync;
             let fsync_lie_threshold = st.disk_cfg_for(&self.node_id).fsync_lie_threshold;
             let lie = fsync_lie_threshold != 0 && st.rng.next_u64() < fsync_lie_threshold;
             let key = (self.node_id.clone(), file.to_owned());
@@ -2650,9 +2795,25 @@ impl Disk for SimEnv {
                 // returned below is a lie, and these bytes stay exactly as
                 // exposed to a following `Simulator::crash` as any other
                 // un-synced tail.
-            } else if let Some(f) = st.disks.get_mut(&key) {
-                let mut buffered = std::mem::take(&mut f.buffered);
-                f.durable.append(&mut buffered);
+            } else {
+                let mut dir_sync = false;
+                if let Some(f) = st.disks.get_mut(&key) {
+                    let mut buffered = std::mem::take(&mut f.buffered);
+                    f.durable.append(&mut buffered);
+                    // ProdEnv: the FIRST sync of a file in this process also
+                    // fsyncs its directory chain, which is what makes the
+                    // name (and any earlier remove beside it) durable.
+                    if !f.dir_memo {
+                        f.dir_memo = true;
+                        if !skips_dir_fsync {
+                            f.name_durable = true;
+                            dir_sync = true;
+                        }
+                    }
+                }
+                if dir_sync {
+                    st.dir_fsync_chain(&self.node_id, file);
+                }
             }
             st.disk_cfg_for(&self.node_id).sync_delay
         };
@@ -2711,7 +2872,23 @@ impl Disk for SimEnv {
     async fn remove(&self, file: &str) -> std::io::Result<()> {
         let mut st = self.shared.lock();
         let key = (self.node_id.clone(), file.to_owned());
-        st.disks.remove(&key);
+        let removed = st.disks.remove(&key);
+        // `ProdEnv::remove` does not fsync the directory, so a durable name
+        // that is removed may come back after a power cut with its last
+        // durable bytes. Retain them for `crash` (only while the adversary
+        // is armed — see `DiskConfig::resurrect_remove_threshold`). An
+        // older pending entry for the same name (the on-disk truth) wins.
+        if let Some(f) = removed
+            && f.name_durable
+            && st.disk_cfg_for(&self.node_id).resurrect_remove_threshold != 0
+        {
+            st.pending_removes.entry(key).or_insert(FileState {
+                durable: f.durable,
+                buffered: Vec::new(),
+                name_durable: true,
+                dir_memo: false,
+            });
+        }
         Ok(())
     }
 
@@ -2738,6 +2915,10 @@ impl Disk for SimEnv {
         let f = st.disks.entry(key).or_default();
         f.durable = bytes.to_vec();
         f.buffered.clear();
+        // rename + directory-chain fsync: the name is durable on return.
+        f.name_durable = true;
+        f.dir_memo = true;
+        st.dir_fsync_chain(&self.node_id, file);
         Ok(())
     }
 
@@ -2818,6 +2999,10 @@ impl Disk for SimEnv {
             .or_default();
         f.durable = staged.durable;
         f.buffered.clear();
+        // rename + directory-chain fsync, as in `replace`.
+        f.name_durable = true;
+        f.dir_memo = true;
+        st.dir_fsync_chain(&self.node_id, file);
         Ok(())
     }
 
@@ -2863,7 +3048,12 @@ impl Disk for SimEnv {
         // Overwrite semantics (idempotent retry): a stale `dst` from a
         // previous, crashed clone attempt is simply replaced.
         let dst_key = (self.node_id.clone(), dst.to_owned());
+        let mut content = content;
+        // The new directory entry is fsynced before `link` returns.
+        content.name_durable = true;
+        content.dir_memo = true;
         st.disks.insert(dst_key, content);
+        st.dir_fsync_chain(&self.node_id, dst);
         Ok(())
     }
 }

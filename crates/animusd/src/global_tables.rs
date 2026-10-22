@@ -299,7 +299,7 @@ pub(crate) async fn update_table_global<E: Env, R: RelayClient>(
         }
     }
     if table_status(&meta, table) != "ACTIVE" {
-        return Err(WireError::validation(format!(
+        return Err(WireError::resource_in_use(format!(
             "UpdateTable: table `{table}` is not ACTIVE"
         )));
     }

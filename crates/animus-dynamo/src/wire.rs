@@ -1637,6 +1637,18 @@ impl WireError {
         }
     }
 
+    /// DynamoDB's `ResourceInUseException`: the operation conflicts with the
+    /// resource's availability (e.g. updating a table that is not `ACTIVE`).
+    /// The service model lists it for `UpdateTable`.
+    #[must_use]
+    pub fn resource_in_use(message: impl Into<String>) -> Self {
+        Self {
+            code: "ResourceInUseException",
+            message: message.into(),
+            reasons: None,
+        }
+    }
+
     /// An unrecognized `X-Amz-Target` operation.
     #[must_use]
     pub fn unknown_operation(target: &str) -> Self {
