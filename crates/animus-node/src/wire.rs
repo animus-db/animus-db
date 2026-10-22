@@ -273,6 +273,20 @@ pub enum MrecControl {
     /// settings synchronize across replicas). Added after the first three
     /// variants, class G with the rest of the `MrecApply` frame.
     SetTtl { attribute: Option<String> },
+    /// The sender's record of `region`'s per-replica read-capacity overrides
+    /// (ADR 0075's 2026-10-21 amendment): the receiver applies it iff it is
+    /// newer than its own by `(stamp, origin)` (last-writer-wins, so a late,
+    /// duplicated or stale push is harmless) and acknowledges `Done` either
+    /// way. `region` may be the receiver's own Region. Refused retryably while
+    /// the receiving cluster's `Gate::MrecReplicaOverrides` is closed or the
+    /// replica is not (yet) in its set. Class G with the rest of the frame.
+    SetOverrides {
+        region: String,
+        read_units: Option<u64>,
+        index_read_units: std::collections::BTreeMap<String, u64>,
+        stamp: u64,
+        origin: u32,
+    },
 }
 
 /// The receiver's per-record verdict (same order as the request's `records`).
@@ -1183,6 +1197,11 @@ pub fn is_relayable_command(command: &MetaCommand) -> bool {
         | MetaCommand::RemoveMrecReplica { .. }
         | MetaCommand::SetMrecReplicaStatus { .. }
         | MetaCommand::MarkMrecCopied { .. }
+        // Per-replica read overrides (ADR 0075's 2026-10-21 amendment): the
+        // same catalog class and relay reason (a follower-connected
+        // `UpdateTable` `ReplicaUpdates`); the receiver re-checks
+        // `Gate::MrecReplicaOverrides`.
+        | MetaCommand::SetMrecReplicaOverrides { .. }
         // Resource tagging (roadmap W-06): schema-catalog class, same relay
         // reason as `SetTableTtl` — a follower-connected `TagResource`/
         // `UntagResource` must reach the control leader.
@@ -1941,6 +1960,11 @@ mod tests {
                 table: table.clone(),
                 region: "eu".to_string(),
                 status: animus_control::MrecReplicaStatus::Active,
+            },
+            MetaCommand::SetMrecReplicaOverrides {
+                table: table.clone(),
+                region: "eu".to_string(),
+                overrides: Default::default(),
             },
             MetaCommand::TagResource {
                 table: table.clone(),

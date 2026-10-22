@@ -9300,6 +9300,7 @@ mod tests {
             assert!(!plain.contains(key), "{key} leaked into a non-global table");
         }
         let g = crate::global::GlobalTableDescription {
+            overrides: Default::default(),
             replicas: vec![("a".into(), crate::global::RegionStatus::Active)],
             witness: None,
             eventual: false,

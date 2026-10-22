@@ -3445,7 +3445,7 @@ A new variant must pick a class. Test: `tests/it/transport_class.rs`.
   multiplied every chunk ~9x (`handle_install_snapshot_resp`'s exact-repeat
   branch). Test: `install_snapshot::duplicate_install_snapshot_ack_does_not_resend_the_outstanding_chunk`.
 
-## `Gate::MrscReplicaRemoval`, `MAX_SUPPORTED = 7` (ADR 0075 / ADR 0073's 2026-10-21 amendments)
+## `Gate::MrscReplicaRemoval`, cluster version 7 (ADR 0075 / ADR 0073's 2026-10-21 amendments)
 
 - `MetaCommand::RevertGlobalToRegional { table, keep_region }` (gate version 7) is the inverse of
   `ConvertTableToGlobal` for an MRSC table: clears `schema.global` and replaces each tablet's
@@ -3458,3 +3458,17 @@ A new variant must pick a class. Test: `tests/it/transport_class.rs`.
   `required_gate`, `mirror.rs` (schema entry + policies), the `sim_versions` by-content
   `content_gate` row, `animus-node` relay allowlist. Tests: `tests/it/global_table_apply.rs`
   (`revert_*`).
+
+## `Gate::MrecReplicaOverrides`, `MAX_SUPPORTED = 8` (ADR 0075's 2026-10-21 amendment)
+
+- `MetaCommand::SetMrecReplicaOverrides { table, region, overrides }` replaces an MREC replica's
+  `MrecReplica.overrides` (`MrecReplicaOverrides { read_units, index_read_units, stamp, origin }`).
+  Apply: rejected for a non-MREC table / unknown replica / zero capacity; a record whose
+  `(stamp, origin)` is not strictly newer than the stored one is a `NoOp` (last-writer-wins across
+  independent clusters; a clear keeps its stamp as a tombstone). Index names are not checked at apply.
+- `Metadata::local_read_override(table)` (table or hidden `<base>$<index>`) is what animusd's
+  `throttle_limits_for` reads; `any_table_throughput()` counts a local override.
+- The gate number is `version::MREC_REPLICA_OVERRIDES_VERSION` (8; 7 is the MRSC removal gate). Rows: `required_gate`, mirror (schema row), `sim_versions` content gate and
+  matrix, relay list in `animus-node`. Fixture: `metadata/v1-mrec-overrides.json`. New
+  `MrecReplica { .. }` literals need `overrides: Default::default()`.
+

@@ -4183,6 +4183,15 @@ impl SimCluster {
         self.shared.recompute_any_table_throughput_all();
     }
 
+    /// Re-run, on every node, the "anything throttled" flag recompute that
+    /// production's metadata-watch loop (`index_drain`) performs each tick and
+    /// this fixture never spawns: for a test that changed throttle-relevant
+    /// catalog state through a path other than `set_table_throughput` (e.g.
+    /// an MREC per-replica read override).
+    pub(crate) fn recompute_throttle_flags(&self) {
+        self.shared.recompute_any_table_throughput_all();
+    }
+
     /// Enable point-in-time recovery (PITR, ADR 0059 §9) for `table` —
     /// `MetaCommand::UpdateContinuousBackups{enabled: true}`, proposed on
     /// the control group's current leader and converged-or-timeout polled
