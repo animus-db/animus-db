@@ -10,6 +10,36 @@ The deterministic simulator: a seeded `SimEnv` implementing the `animus-env`
 seam, plus a `Simulator` that drives an entire distributed run as a pure
 function of one seed. This is the substrate every distributed test runs on.
 
+## Directory-entry (namespace) durability (PR #27, `docs/sim-coverage.md`)
+
+The `SimEnv` disk mirrors `ProdEnv`'s namespace contract, not just byte durability.
+Per-file `FileState` carries `name_durable` (the dir entry survives a power cut) and
+`dir_memo` (ProdEnv's `dir_synced` memo; reset by `crash`/`stop`, like a fresh process).
+Crash semantics, exactly:
+
+- **Vanish (always on, no RNG, no trace event).** A file whose name is not durable —
+  created by `append`, never `sync`ed, not the target of a completed
+  `replace`/`commit_staged`/`link` — is dropped entirely on `crash` (after the torn-tail
+  draws, so torn-tail RNG streams are unchanged). `stage_replace`'s `{file}.tmp` is such
+  a name (an orphan until `commit_staged`). `stop` (process exit) keeps it.
+- **Name durability points.** The *first* `sync` of a name in the current process
+  (rest are memoised, like ProdEnv), `replace`, `commit_staged` and `link` fsync the
+  parent directory *chain* (`a/b/c` -> `a/b`, `a`, data dir). A lied `sync`
+  (`set_fsync_lie_prob`) makes nothing durable, name included.
+- **Resurrect (opt-in).** `DiskConfig::set_resurrect_unsynced_removes_on_crash_prob(p)`:
+  a `remove` of a name-durable file that no later dir fsync in its chain covered comes
+  back on `crash` with its last durable bytes (trace `DISKRESURRECT`), with probability
+  `p` per pending remove (`p = 1.0` draws no RNG). Must be armed *before* the removes
+  (the removed bytes are only kept while armed). ProdEnv's `remove` deliberately does
+  not dir-fsync, so this is exactly what the contract permits. `wipe_disk` drops pending
+  removes.
+- **`replace`/`commit_staged`/`link` are atomic and durable on return**; a crash during
+  the `replace_data_delay` window sees the whole old contents (never a half state).
+- **Negative control knob:** `DiskConfig::set_sync_skips_dir_fsync(true)` = the pre-PR-27
+  `ProdEnv` (sync does not make a new name durable). Corpora use it to prove their
+  oracle bites (`lsm_dir_durability`, `sharedwal_fault_corpus` control (h)).
+- Tests: `tests/it/dir_durability.rs`.
+
 ## Entry points
 
 - `Simulator::new(seed)`, `sim.env(node_id) -> SimEnv`.
