@@ -3516,3 +3516,8 @@ gate). `take_snapshot_dirty` clears it. Without this a crash after an install
 replayed `[old tail] ++ [entries past the base]`, which `check_log_contiguous`
 now turns into a halted node. Regression: `tests/it/control_install_crash_window.rs`.
 Lesson: `docs/lessons/code-patterns/2026-10-23-a-control-plane-install-must-hold-back-appends-until-its-wal-rewrite.md`.
+
+- `compaction_floor`: a peer with `match_index == 0` on a fresh leader is
+  "unknown", estimated at `elected_at_commit` (not 0); the retention cap still
+  excludes a peer that stays silent. See
+  `docs/lessons/code-patterns/2026-10-23-a-volatile-leader-seed-of-zero-is-not-caught-up-to-zero.md`.
