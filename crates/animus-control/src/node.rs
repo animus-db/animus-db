@@ -1645,6 +1645,19 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
         }
     };
     let state = PersistedState::replay(records);
+    // Issue #1368: a replayed log whose entries are not at their own
+    // positions would be silently misread (term checks and the apply
+    // labels are positional). Same doctrine as an undecodable WAL: loud, and
+    // halted before the node can vote, campaign or apply anything.
+    if let Err(e) = state.check_log_contiguous() {
+        tracing::error!(
+            error = %e,
+            "control-plane Raft WAL replays to a misaligned log; refusing to \
+             recover from it - halting this node until its WAL is repaired or removed"
+        );
+        halted.store(true, Ordering::SeqCst);
+        return;
+    }
     if !state.is_empty() {
         let recovered =
             RaftCore::recovered(env.node_id(), &all_nodes, state, env.now(), env.next_u64());

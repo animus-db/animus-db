@@ -32,6 +32,7 @@ mod hlc_skew;
 mod inbox_overflow_tolerance;
 mod inplace_split_dead_space;
 mod inplace_split_reconciler;
+mod install_snapshot_crash_window;
 mod kind_batch;
 mod kind_batch_outcome_identity;
 mod kind_eval;

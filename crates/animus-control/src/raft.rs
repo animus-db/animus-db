@@ -1829,6 +1829,15 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     /// (re-derived from the engine at driver start); `false` for every
     /// ordinary group.
     log_omits_base: bool,
+    /// Issue #1368: whether `handle_install_snapshot` writes a
+    /// [`WalRecord::Snapshot`] the moment it moves the base, so the move is
+    /// durable **in log order** with the appends that follow it. Only a driver
+    /// that recovers from a WAL base ahead of its engine may set this (the
+    /// data plane: `state_machine_behind`, issue #554); the control plane
+    /// relies on the WAL never being ahead of its engine, so it keeps `false`
+    /// (the base move reaches the WAL only with the apply task's rewrite, after
+    /// the engine install). Purely local, never persisted.
+    wal_records_install: bool,
 }
 
 impl<C, S> RaftCore<C, S>
@@ -1929,6 +1938,7 @@ where
             cluster_check_refused: false,
             group_label: None,
             log_omits_base: false,
+            wal_records_install: false,
         };
         core.reset_election_timer(now, entropy);
         core
@@ -1939,6 +1949,13 @@ where
     /// driver for a split child; idempotent.
     pub fn set_log_omits_base(&mut self, omits: bool) {
         self.log_omits_base = omits;
+    }
+
+    /// Issue #1368: have an installed snapshot write its base to the WAL
+    /// immediately (see the `wal_records_install` field). Set by the
+    /// data-plane driver, which tolerates a WAL base ahead of its engine.
+    pub fn set_wal_records_install(&mut self, record: bool) {
+        self.wal_records_install = record;
     }
 
     /// Recover a node from its durable state, then resume as a follower.
@@ -5263,6 +5280,29 @@ where
                 // Issue #1061: a snapshot whose config includes this node and
                 // is later than a recorded removal is a re-add.
                 core.refresh_removed_flag();
+                // Issue #1368: make the base move DURABLE in log order. The
+                // log was just cleared in memory; the WAL still holds the old
+                // entries, and the consensus loop persists the leader's next
+                // `AppendEntries` (indexes past the new base) onto it long
+                // before the apply task's deferred rewrite lands. Without this
+                // record a crash in that window replays `[old tail] ++ [new
+                // entries]` positionally -- a gap (or a duplicated range) the
+                // positional `term_at` then misreads, so the leader's resend
+                // appends one entry twice and the apply task panics on two
+                // equal HLC timestamps. `PersistedState::replay` treats a
+                // `Snapshot` record as "log reset to this base". Opt-in
+                // (`wal_records_install`): the record makes the WAL base run
+                // ahead of the engine's install, which only the data plane
+                // recovers from.
+                if core.wal_records_install {
+                    core.pending.push(WalRecord::Snapshot {
+                        metadata: core.metadata.clone(),
+                        last_index: core.snapshot_index,
+                        last_term: core.snapshot_term,
+                        config: core.snapshot_config.clone(),
+                        learners: core.snapshot_learners.clone(),
+                    });
+                }
             };
             if S::DRIVER_APPLIED {
                 // The bytes are the leader's engine image; the driver writes them
