@@ -6924,6 +6924,7 @@ impl BoundNode {
         // `auto_split_loop`/the reconciler do (each tick checks leadership
         // per tablet).
         tasks.push(tokio::spawn(txn_resolver_loop(ctx.clone())));
+        tasks.push(tokio::spawn(txn_decided_sweep_loop(ctx.clone())));
 
         // GSI drain (ADR 0041 §4): materializes global secondary indexes from
         // the change records indexed writes leave behind. Data-role-only and
@@ -15151,22 +15152,43 @@ const RECOVERY_STUCK_GRACE: Duration = Duration::from_secs(30);
 /// best-effort rather than synchronous: on every tick, for each tablet
 /// group this node currently **leads** (`ctx.edge.hosted_groups()`, no-op
 /// on a control-only node — it hosts none), push every stale `Pending`
-/// record ([`RaftKvNode::pending_txns`], via
-/// [`ClientCtx::txn_recover`]) and fan out a resolve for every
-/// decided-but-not-yet-locally-resolved one
-/// ([`RaftKvNode::unresolved_decided`]). Errors are logged and swallowed —
-/// this is a best-effort background sweep; the next tick retries.
+/// record ([`RaftKvNode::pending_txns`], via [`ClientCtx::txn_recover`]).
+/// Errors are logged and swallowed — this is a best-effort background
+/// sweep; the next tick retries.
+///
+/// **Only the in-doubt half runs here** (issue #1369). Fanning out a resolve
+/// for every decided-but-not-yet-locally-resolved record
+/// ([`RaftKvNode::unresolved_decided`]) is [`txn_decided_sweep_loop`], a task
+/// of its own: that backlog is every decided record the group has ever
+/// anchored right after a restart or a leadership change (the tracker is
+/// rebuilt from the record rows, and nothing marks a record "resolved"
+/// durably), thousands of serial proposals that took minutes, and while this
+/// loop owned both halves a `Pending` record anchored on a later tablet — or
+/// on a tablet this node had only just become leader of — waited for the
+/// whole backlog, so a read of a key under its intent failed for as long.
 async fn txn_resolver_loop(ctx: ClientCtx) {
     let mut state = TxnResolverState::default();
     loop {
         tokio::time::sleep(TXN_RESOLVER_INTERVAL).await;
-        txn_resolver_tick(&ctx, &mut state).await;
+        txn_resolver_pending_pass(&ctx, &mut state).await;
     }
 }
 
-/// The driver-local memo [`txn_resolver_tick`] carries between ticks: in
+/// The **decided-record sweep** (issue #1369): the second half of what
+/// [`txn_resolver_loop`] used to do, on its own task so its length can never
+/// delay an in-doubt recovery. See [`txn_resolver_decided_pass`].
+async fn txn_decided_sweep_loop(ctx: ClientCtx) {
+    let mut state = TxnResolverState::default();
+    loop {
+        tokio::time::sleep(TXN_RESOLVER_INTERVAL).await;
+        txn_resolver_decided_pass(&ctx, &mut state).await;
+    }
+}
+
+/// The driver-local memo the resolver passes carry between ticks: in
 /// memory only, per driver, pruned every tick against what the groups
-/// actually reported (see the field docs).
+/// actually reported (see the field docs). The two passes use disjoint
+/// fields, so each task owns its own instance.
 #[derive(Default)]
 struct TxnResolverState {
     /// Grace tracker for `unresolved_decided()` entries whose
@@ -15189,43 +15211,45 @@ struct TxnResolverState {
     stuck_recovery_warned: BTreeSet<TxnId>,
 }
 
-/// One sweep of [`txn_resolver_loop`]: split out so a `SimCluster` test can
-/// run exactly the production body (the loop's `tokio::time::sleep` is the
-/// process boundary; nothing else in it is).
-async fn txn_resolver_tick<E: Env, R: RelayClient>(
+/// The table a resolver pass should act on for `tablet`'s `group`, or `None`
+/// when the pass must skip it: this node does not lead it right now, it is
+/// quiesced (ADR 0044 phase-1 PR6: sound by the identical argument
+/// `change_consumer_loop`'s own gate gives — a quiesced group's `TxnTracker`
+/// is, by construction, empty, since PR5's in-crate veto is exactly "a
+/// non-empty tracker never quiesces", so both passes are guaranteed no-ops
+/// there; skipping avoids the `pending_txns()`/`unresolved_decided()`
+/// clones), or the tablet is a legacy whole-keyspace one or a stale view.
+/// Evaluated as the pass reaches each group, never up front: a long pass
+/// must see the leadership it has now, not the leadership it started with.
+fn resolver_group_table<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    tablet: TabletId,
+    group: &CpGroup<E>,
+) -> Option<String> {
+    if !group.is_leader() || group.is_quiesced() {
+        return None;
+    }
+    ctx.effective_metadata()
+        .tablets
+        .get(&tablet)
+        .and_then(|t| t.table.clone())
+}
+
+/// The body of [`txn_resolver_loop`]: split out so a `SimCluster`
+/// test can run exactly the production body (the loop's `tokio::time::sleep`
+/// is the process boundary; nothing else in it is).
+async fn txn_resolver_pending_pass<E: Env, R: RelayClient>(
     ctx: &ClientCtx<E, R>,
     state: &mut TxnResolverState,
 ) {
     let TxnResolverState {
-        unresolved_first_seen,
-        unresolved_stuck_warned,
         stuck_recovery_warned,
+        ..
     } = state;
-    // Every `TxnId` `unresolved_decided()` reports this tick, across
-    // every hosted group — the live set the two maps above are pruned
-    // against once the tick's tablet loop below finishes.
-    let mut unresolved_seen_this_tick: BTreeSet<TxnId> = BTreeSet::new();
     let mut pending_seen_this_tick: BTreeSet<TxnId> = BTreeSet::new();
     for (tablet, group) in ctx.edge.hosted_groups() {
-        if !group.is_leader() {
+        let Some(table) = resolver_group_table(ctx, tablet, &group) else {
             continue;
-        }
-        // ADR 0044 phase-1 PR6: sound by the identical argument
-        // `change_consumer_loop`'s own gate gives — a quiesced group's
-        // `TxnTracker` is, by construction, empty (PR5's in-crate veto
-        // is exactly "a non-empty tracker never quiesces"), so both
-        // loops below are guaranteed no-ops here; skip the
-        // `pending_txns()`/`unresolved_decided()` clones entirely.
-        if group.is_quiesced() {
-            continue;
-        }
-        let Some(table) = ctx
-            .effective_metadata()
-            .tablets
-            .get(&tablet)
-            .and_then(|t| t.table.clone())
-        else {
-            continue; // legacy whole-keyspace tablet, or a stale view — skip this tick
         };
 
         for (txn_id, (record_key, created_ts)) in group.pending_txns() {
@@ -15299,6 +15323,36 @@ async fn txn_resolver_tick<E: Env, R: RelayClient>(
                 }
             }
         }
+    }
+    stuck_recovery_warned.retain(|id| pending_seen_this_tick.contains(id));
+    if let Some(data) = ctx.data.as_ref() {
+        data.raftkv_metrics.incr(Metric::CpTxnResolverRuns);
+    }
+}
+
+/// The decided-record half (issue #1369): for every led group, fan out a
+/// resolve for each decided-but-not-yet-locally-resolved record
+/// ([`RaftKvNode::unresolved_decided`]). Serial, one proposal per record, and
+/// unbounded in the history the group has accumulated, so it must never share
+/// a task with [`txn_resolver_pending_pass`].
+async fn txn_resolver_decided_pass<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    state: &mut TxnResolverState,
+) {
+    let TxnResolverState {
+        unresolved_first_seen,
+        unresolved_stuck_warned,
+        ..
+    } = state;
+    // Every `TxnId` `unresolved_decided()` reports this tick, across
+    // every hosted group — the live set the two maps above are pruned
+    // against once the tick's tablet loop below finishes.
+    let mut unresolved_seen_this_tick: BTreeSet<TxnId> = BTreeSet::new();
+    for (tablet, group) in ctx.edge.hosted_groups() {
+        let Some(table) = resolver_group_table(ctx, tablet, &group) else {
+            continue;
+        };
+
         for (txn_id, (record_key, outcome)) in group.unresolved_decided() {
             unresolved_seen_this_tick.insert(txn_id.clone());
             // `unresolved_decided` only carries `(record_key, outcome)`
@@ -15374,10 +15428,6 @@ async fn txn_resolver_tick<E: Env, R: RelayClient>(
     }
     unresolved_first_seen.retain(|id, _| unresolved_seen_this_tick.contains(id));
     unresolved_stuck_warned.retain(|id| unresolved_seen_this_tick.contains(id));
-    stuck_recovery_warned.retain(|id| pending_seen_this_tick.contains(id));
-    if let Some(data) = ctx.data.as_ref() {
-        data.raftkv_metrics.incr(Metric::CpTxnResolverRuns);
-    }
 }
 
 /// How often [`metrics_sample_loop`] takes a metrics snapshot for the
@@ -23446,6 +23496,11 @@ mod sim_cluster_throttle;
 /// transaction whose anchor tablet split (`SimCluster`).
 #[cfg(test)]
 mod sim_cluster_txn_resolver_split;
+
+/// Issue #1369: an in-doubt transaction's recovery must not wait behind the
+/// decided-record backlog sweep — see that module's own doc.
+#[cfg(test)]
+mod sim_cluster_txn_resolver_backlog;
 /// ADR 0073 Phase 1, P1-D tier 2: the whole-cluster upgrade-restart corpus over
 /// `SimCluster`'s `LsmEngine` backend and the DynamoDB wire. Run via `cargo
 /// test -p animusd --lib sim_cluster_upgrade_corpus`; depth knob

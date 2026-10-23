@@ -19,7 +19,7 @@
 //!
 //! # What this module pins
 //!
-//! The body of `txn_resolver_loop` is `txn_resolver_tick` (split out so this
+//! The body of `txn_resolver_loop` is `txn_resolver_pending_pass` (split out so this
 //! fixture runs the production code; `SimCluster` spawns no background
 //! loops). A prepared-but-undecided two-table transaction (the coordinator
 //! "crashed" right after prepare, `SimCluster::txn_prepare_only`) has its
@@ -52,7 +52,10 @@ use animus_tablet::{KeyRange, TabletId, TabletState};
 use super::dynamo::item_key;
 use super::sim_cluster::SimCluster;
 use super::sim_cluster_grow_retired::leader_node;
-use crate::{CpGroup, TXN_RESOLVER_INTERVAL, TxnResolverState, txn_resolver_tick};
+use crate::{
+    CpGroup, TXN_RESOLVER_INTERVAL, TxnResolverState, txn_resolver_decided_pass,
+    txn_resolver_pending_pass,
+};
 
 const ANCHOR: &str = "txr_anchor";
 const PART: &str = "txr_part";
@@ -90,14 +93,22 @@ fn spawn_driver_ticks(cluster: &SimCluster, node: u64) -> Tick {
     })
 }
 
-/// The production sweep on `node`: `txn_resolver_tick` every
-/// `TXN_RESOLVER_INTERVAL`, forever (a `SimEnv` task, dropped with the node).
+/// The production sweep on `node`: the in-doubt pass and the decided-record
+/// pass, each every `TXN_RESOLVER_INTERVAL` on a task of its own, forever
+/// (`SimEnv` tasks, dropped with the node).
 fn spawn_resolver(cluster: &SimCluster, node: u64) {
-    let _slot = cluster.spawn_detached(node, |ctx| async move {
+    let _pending = cluster.spawn_detached(node, |ctx| async move {
         let mut state = TxnResolverState::default();
         loop {
             ctx.env.sleep(TXN_RESOLVER_INTERVAL).await;
-            txn_resolver_tick(&ctx, &mut state).await;
+            txn_resolver_pending_pass(&ctx, &mut state).await;
+        }
+    });
+    let _decided = cluster.spawn_detached(node, |ctx| async move {
+        let mut state = TxnResolverState::default();
+        loop {
+            ctx.env.sleep(TXN_RESOLVER_INTERVAL).await;
+            txn_resolver_decided_pass(&ctx, &mut state).await;
         }
     });
 }
