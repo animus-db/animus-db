@@ -316,3 +316,117 @@ fn a_voter_partitioned_well_past_the_retention_cap_still_gets_a_snapshot_and_log
          retention exists"
     );
 }
+
+/// **Soak throughput decay.** A replica that is down while its group changes
+/// leader must come back through ordinary `AppendEntries`, not a snapshot,
+/// when it was only briefly away — however long the log already is.
+///
+/// A newly elected leader has no `match_index` for anyone (`become_leader`
+/// seeds `0`). `RaftCore::compaction_floor` read that as "caught up to 0" and,
+/// once `last_log_index` was past `COMPACT_RETENTION_CAP_ENTRIES` (4096), as
+/// "too far behind to retain for": every peer the new leader had not yet
+/// heard from, including the one whose node had just been killed, was
+/// compacted away from within a few writes. In the real-process soak (a node
+/// killed every epoch, so every epoch a leader change) this began at the
+/// fifth restart, exactly when the groups' logs passed 4096 entries: each
+/// restarted node then needed a full `InstallSnapshot` for every tablet it
+/// led, repeated under the live writer for minutes, and acked writes per
+/// epoch fell from ~4600 to ~1200-2000.
+///
+/// The old leader is isolated (a dead node's observable behaviour, without a
+/// restart the `MemoryEngine` cannot model), the survivors elect a new leader
+/// and write on past several compaction thresholds, then it is healed. Red on
+/// the pre-fix floor (one or more installs); green once a peer the leader has
+/// not heard from is estimated at the commit index it inherited.
+#[test]
+fn a_peer_away_across_a_leader_change_catches_up_without_a_snapshot_on_a_long_log() {
+    let seed = 0x5324_1003;
+    let mut sim = Simulator::new(seed);
+    let ids = [0u64, 1, 2];
+    let handles: Vec<MetricsHandle> = ids.iter().map(|_| MetricsHandle::recording()).collect();
+    let nodes: Vec<KvNode> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, &id)| {
+            RaftKvNode::start_with_metrics(
+                sim.env(nid(id)),
+                ids.iter().copied().map(nid).collect(),
+                MemoryEngine::new(),
+                handles[i].clone(),
+            )
+        })
+        .collect();
+    sim.run_for(Duration::from_secs(2));
+    let l0 = leader_among(&nodes).expect("an initial leader");
+
+    // A log well past COMPACT_RETENTION_CAP_ENTRIES (4096), with every voter
+    // keeping up (nothing is ever excluded from the floor in this phase).
+    const LONG_LOG: u64 = 4500;
+    for round in 0..LONG_LOG {
+        let key = format!("a-{round}").into_bytes();
+        let _ = nodes[l0].put(key, b"v".to_vec());
+        sim.run_for(Duration::from_millis(1));
+    }
+    sim.run_for(Duration::from_secs(2));
+    assert!(
+        nodes[l0].commit_index() > 4200,
+        "seed={seed}: the scenario needs a log past the retention cap, got commit_index={}",
+        nodes[l0].commit_index()
+    );
+
+    // The old leader's node dies; the others elect a new leader and carry on
+    // for several compaction thresholds' worth of writes.
+    for &o in ids.iter().filter(|&&i| i != ids[l0]) {
+        sim.partition_pair(nid(ids[l0]), nid(o));
+    }
+    let mut l1 = None;
+    for _ in 0..200 {
+        sim.run_for(Duration::from_millis(50));
+        let ls: Vec<usize> = (0..3)
+            .filter(|&i| i != l0 && nodes[i].is_leader())
+            .collect();
+        if ls.len() == 1 {
+            l1 = Some(ls[0]);
+            break;
+        }
+    }
+    let l1 = l1.expect("the survivors elect a new leader");
+    const AWAY_WRITES: u64 = 400;
+    for round in 0..AWAY_WRITES {
+        let key = format!("b-{round}").into_bytes();
+        let _ = nodes[l1].put(key, b"v".to_vec());
+        sim.run_for(Duration::from_millis(1));
+    }
+    sim.run_for(Duration::from_secs(2));
+
+    sim.heal(nid(ids[l0]), nid(ids[l1]));
+    for &o in ids.iter().filter(|&&i| i != ids[l0]) {
+        sim.heal(nid(ids[l0]), nid(o));
+    }
+    let mut caught_up = false;
+    for _ in 0..400 {
+        sim.run_for(Duration::from_millis(50));
+        if nodes[l0].engine_applied_index() + 4 >= nodes[l1].commit_index() {
+            caught_up = true;
+            break;
+        }
+    }
+    let installs = handles[l0].get(Metric::CpSnapshotInstalls);
+    let ships: u64 = handles.iter().map(|h| h.get(Metric::CpSnapshotShips)).sum();
+    eprintln!(
+        "seed={seed}: old leader {l0} caught_up={caught_up} installs={installs} ships={ships} \
+         new_leader_commit={}",
+        nodes[l1].commit_index()
+    );
+    assert!(
+        caught_up,
+        "seed={seed}: the returning replica never caught up"
+    );
+    assert_eq!(
+        installs, 0,
+        "seed={seed}: the replica that was away for only {AWAY_WRITES} writes needed {installs} \
+         InstallSnapshot(s) ({ships} chunks shipped): the new leader compacted the log away from a \
+         peer it had not heard from yet (RaftCore::compaction_floor read its never-acked match \
+         index 0 as 'too far behind to retain for' on a log longer than the retention cap)"
+    );
+}

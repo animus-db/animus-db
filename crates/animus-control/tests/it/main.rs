@@ -7,6 +7,7 @@ mod apply_not_starved_by_wal_lock;
 mod backup_catalog;
 mod campaign_admission;
 mod capacity_corpus;
+mod compaction_floor_leader_change;
 mod control_corpus;
 mod control_install_crash_window;
 mod control_membership;

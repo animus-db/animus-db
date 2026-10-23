@@ -1299,6 +1299,12 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // timeout under load (post-election processing, everyone's own scheduler
     // contention right after a disruptive leadership change).
     leader_since: Option<Nanos>,
+    // The commit index this node held the moment it won its current election
+    // (volatile, like `leader_since`). `compaction_floor`'s estimate of where a
+    // peer it has not heard from since taking over (`match_index == 0`) stands:
+    // that peer was replicating with the previous leader right up to its
+    // death or restart, so it is near this index, not at 0.
+    elected_at_commit: u64,
     // Issue #667 (2026-09-15 amendment): every peer id this node has ever
     // witnessed casting a GENUINE, durably-forgettable vote — i.e. a
     // `voted_for` write this identity's own disk could later lose. Marked
@@ -1895,6 +1901,7 @@ where
             peer_recovered_at: BTreeMap::new(),
             last_contact: BTreeMap::new(),
             leader_since: None,
+            elected_at_commit: 0,
             heard_from: BTreeSet::new(),
             departing: BTreeMap::new(),
             departing_since: BTreeMap::new(),
@@ -2201,11 +2208,15 @@ where
     /// today regardless, via `replicate_to`'s own `next_index <=
     /// snapshot_index` check, once the base does advance past it; excluding
     /// it here just stops it from pinning EVERY peer's compaction to a
-    /// standstill). A peer this core has never heard from at all (absent
-    /// from `match_index`) is treated as caught up to `0` — conservative:
-    /// either it is freshly added (a real `0`) or it is down/partitioned
-    /// (and `last_log_index().saturating_sub(0)` will itself exceed the cap
-    /// once the leader has done enough work, excluding it in due course).
+    /// standstill). A peer this leader has not heard from since it took
+    /// over (`match_index == 0`, the `become_leader` seed) is estimated at
+    /// the commit index the leader inherited (`elected_at_commit`), not at
+    /// `0`: it was replicating with the previous leader until just now, so
+    /// reading it as `0` excluded every such peer as soon as the log passed
+    /// the cap and forced a full `InstallSnapshot` on its return (the
+    /// soak's post-leader-change snapshot storm). The cap still bounds a
+    /// peer that never answers: once the leader has appended more than
+    /// `retention_cap_entries` past the inherited commit it is excluded.
     ///
     /// **Deliberately voters only, never learners** (found building this
     /// fix): a learner's own catch-up contract in this codebase (ADR 0058
@@ -2244,7 +2255,21 @@ where
         let last = self.last_log_index();
         let mut floor: Option<u64> = None;
         for peer in self.peers.iter() {
-            let matched = self.match_index.get(peer).copied().unwrap_or(0);
+            let known = self.match_index.get(peer).copied().unwrap_or(0);
+            // A peer this leader has not heard from since it took over (the
+            // seed is `0` in `become_leader`) used to count as caught up to
+            // `0`, which `last - 0 > retention_cap_entries` excluded as soon
+            // as the log passed the cap: after a leader change every down or
+            // restarting peer was compacted away from and needed a full
+            // `InstallSnapshot` on its return, under the live write stream
+            // (the real-process soak's throughput decay). Estimate it at the
+            // commit index the leader inherited instead: the bound on how
+            // long the log is retained for it is still the cap.
+            let matched = if known == 0 {
+                self.elected_at_commit
+            } else {
+                known
+            };
             if last.saturating_sub(matched) > retention_cap_entries {
                 // Too far behind to retain for; it already gets (or will
                 // get) an `InstallSnapshot` via the ordinary `next_index <=
@@ -5938,6 +5963,7 @@ where
         // Issue #923: mark when THIS stint began, before any per-peer
         // `last_contact` seeding below — `leader_since`'s own field doc.
         self.leader_since = Some(now);
+        self.elected_at_commit = self.commit_index.max(self.snapshot_index);
         // Issue #595: this node itself just won an election — record itself
         // as the genuine contact (see `last_leader_contact`'s own doc).
         self.last_leader_contact = Some((self.id.clone(), now));
