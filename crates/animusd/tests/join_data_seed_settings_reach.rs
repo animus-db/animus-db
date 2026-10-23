@@ -196,24 +196,33 @@ async fn bring_up_base(dir: &Path) -> (Vec<Node>, ClusterConfig) {
     support::bring_up_deadline(1, dir, support::JOIN_DEADLINE).await
 }
 
-/// A fresh, unbound (`:0`) combined-mode `RoleAddrs` for join index `index`
-/// — **bind-and-hold, not probe-and-release (issue #1042)**: every port is
-/// `:0`, resolved atomically by `Node::bind` inside `run_node_join`/
-/// `run_node_join_with_settings` itself (whose explicit-`--id` path now
-/// binds before it durably claims `--id`'s `NodeAddrs`), never a
-/// [`support::free_addrs`] probe that releases the port before the real
-/// bind. See `support::join_fresh_deadline`'s own doc for the full account.
+/// A fresh combined-mode `RoleAddrs` for join index `index`, on six
+/// [`support::reserve_addrs`] ports (issue #1094) — **not** `:0`.
+///
+/// `:0` (issue #1042's bind-and-hold) is right for a node that is never
+/// restarted, but every test here that keeps the joined node's directory
+/// re-starts it on the *same* ports (`solo_config`) after the node has shut
+/// down and released them; for those ports the old `:0` request left the
+/// whole restart gap unclaimed, so another process's `bind(:0)` or any
+/// outgoing `connect()`'s ephemeral source port could take one and the
+/// restart failed with `Address already in use` (a rare, load-dependent
+/// flake). A reservation socket (`SO_REUSEADDR`, never `listen()`ed) lets the
+/// node bind and listen atop it, stays in the kernel's bind table across the
+/// gap, and so cannot be stolen. It keeps the bind-before-claim order of
+/// #1042: `run_node_join*` still binds these ports itself before it claims
+/// `--id`. See `docs/lessons/testing/2026-10-23-a-solo-restart-of-a-joined-
+/// node-needs-reserved-ports-not-colon-zero.md`.
 fn fresh_combined_addrs(index: usize, encryption_key_path: Option<String>) -> RoleAddrs {
-    let ephemeral = SocketAddr::from(([127, 0, 0, 1], 0));
+    let a = support::reserve_addrs(6);
     RoleAddrs {
         id: animusd::config::node_id(index),
         role: animusd::config::NodeRole::Both,
-        internal: ephemeral,
-        client: ephemeral,
-        dynamo: ephemeral,
-        admin: ephemeral,
-        intra: ephemeral,
-        console: ephemeral,
+        internal: a[0],
+        client: a[1],
+        dynamo: a[2],
+        admin: a[3],
+        intra: a[4],
+        console: a[5],
         advertise_host: None,
         tls: None,
         encryption_key_path,
@@ -222,13 +231,9 @@ fn fresh_combined_addrs(index: usize, encryption_key_path: Option<String>) -> Ro
     }
 }
 
-/// The [`RoleAddrs`] a joined `node` actually bound — its own `:0` request
-/// resolved to real ports, recovered from the started [`Node`]'s own
-/// accessors (never the pre-bind request, which names no real port).
-/// `internal` stays the pre-bind `:0` request verbatim: nothing in this
-/// file dials it directly, and a later solo restart of the same directory
-/// (`solo_config`) doesn't need it to match — `Node` itself exposes no
-/// post-bind `internal_addr()` accessor to recover it from.
+/// The [`RoleAddrs`] a joined `node` actually bound, recovered from the
+/// started [`Node`]'s own accessors. `internal` stays the requested
+/// reserved port verbatim (`Node` exposes no post-bind `internal_addr()`).
 fn bound_combined_addrs(requested: &RoleAddrs, node: &Node) -> RoleAddrs {
     RoleAddrs {
         client: node.client_addr(),
