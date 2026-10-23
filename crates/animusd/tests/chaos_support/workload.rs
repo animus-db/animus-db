@@ -12,7 +12,7 @@
 //! and got no clean answer (timeout, reset, non-200) is `info`, never `fail`;
 //! only a connect failure (no byte sent) is `fail`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -586,6 +586,22 @@ pub fn run_oracles(
     final_a: &BTreeMap<Key, Vec<ListVal>>,
     final_b: &BTreeMap<Key, Vec<ListVal>>,
 ) -> (History, Verdict) {
+    run_oracles_excluding(sh, final_a, final_b, &BTreeSet::new())
+}
+
+/// [`run_oracles`] with `excluded` keys: keys whose final read answered
+/// through neither node, so there is no state to judge them against. Their
+/// acknowledged appends are not checked for durability, eventual reads of them
+/// are not checked for prefixes, and a transaction touching one is not checked
+/// for atomicity (the caller reports the key as inconclusive instead). Keys
+/// that only one node answered stay checked: the caller passes the answering
+/// node's state as both `final_a` and `final_b` for them.
+pub fn run_oracles_excluding(
+    sh: &Shared,
+    final_a: &BTreeMap<Key, Vec<ListVal>>,
+    final_b: &BTreeMap<Key, Vec<ListVal>>,
+    excluded: &BTreeSet<Key>,
+) -> (History, Verdict) {
     let mut history = sh.rec.lock().expect("recorder").history().clone();
     let mut verdict = Verdict {
         violations: Vec::new(),
@@ -595,7 +611,18 @@ pub fn run_oracles(
     };
     let seed = sh.seed;
 
-    let durability = check_durability(&history, final_a);
+    let durability = if excluded.is_empty() {
+        check_durability(&history, final_a)
+    } else {
+        let mut judged = history.clone();
+        for e in &mut judged.entries {
+            e.mops.retain(|m| match m {
+                Mop::Append { key, .. } => !excluded.contains(key),
+                _ => true,
+            });
+        }
+        check_durability(&judged, final_a)
+    };
     let convergence = check_convergence(seed, final_a, final_b);
 
     // Feed the converged state back in as ok reads so check_cycles also
@@ -646,6 +673,9 @@ pub fn run_oracles(
     // `UpdateItem`s, acked or indeterminate, and when they were written.
     let writers = writer_index(&history);
     for r in sh.eventual.lock().expect("eventual").iter() {
+        if excluded.contains(&r.key) {
+            continue;
+        }
         let fin = final_a.get(&r.key).cloned().unwrap_or_default();
         if !fin.starts_with(&r.list) {
             let missing: Vec<u64> = fin
@@ -696,6 +726,9 @@ pub fn run_oracles(
 
     // TransactWriteItems atomicity: both appends present or neither.
     for t in sh.txns.lock().expect("txns").iter() {
+        if excluded.contains(&t.k0) || excluded.contains(&t.k1) {
+            continue;
+        }
         let p0 = final_a.get(&t.k0).is_some_and(|l| l.contains(&t.v0));
         let p1 = final_a.get(&t.k1).is_some_and(|l| l.contains(&t.v1));
         if p0 != p1 {

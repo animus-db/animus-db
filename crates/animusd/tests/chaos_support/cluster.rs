@@ -42,6 +42,9 @@ pub struct ChaosCluster {
     data_dirs: Vec<Option<PathBuf>>,
     paused: Vec<bool>,
     proxies: Vec<JoinHandle<()>>,
+    /// `RUST_LOG` for the node processes (`tracing` `EnvFilter` syntax); `None`
+    /// leaves the node's own default (`info`).
+    log_filter: Option<String>,
 }
 
 impl ChaosCluster {
@@ -148,6 +151,7 @@ impl ChaosCluster {
             children: (0..n).map(|_| None).collect(),
             data_dirs: (0..n).map(|_| None).collect(),
             paused: vec![false; n],
+            log_filter: None,
             proxies,
         }
     }
@@ -226,6 +230,12 @@ impl ChaosCluster {
         self.data_dirs[i] = Some(dir);
     }
 
+    #[allow(dead_code, reason = "used by the soak only")]
+    /// Set the nodes' log filter (`RUST_LOG` syntax) for every later `start`.
+    pub fn set_log_filter(&mut self, filter: Option<String>) {
+        self.log_filter = filter;
+    }
+
     pub fn log_path(&self, i: usize) -> PathBuf {
         self.root.join("logs").join(format!("n{i}.log"))
     }
@@ -239,7 +249,11 @@ impl ChaosCluster {
             .open(self.log_path(i))
             .expect("open node log");
         let err = log.try_clone().expect("clone log fd");
-        let child = Command::new(BIN)
+        let mut cmd = Command::new(BIN);
+        if let Some(f) = &self.log_filter {
+            cmd.env("RUST_LOG", f);
+        }
+        let child = cmd
             .arg("--config")
             .arg(self.root.join(format!("cfg{i}.json")))
             .arg("--node")
