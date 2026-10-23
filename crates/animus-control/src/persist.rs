@@ -369,7 +369,10 @@ pub enum WalRecord<C = MetaCommand, S = Metadata> {
     Truncate { keep: usize },
     /// A state-machine snapshot: the applied state covering all entries through
     /// `last_index` (whose term is `last_term`). The log keeps only entries
-    /// after `last_index`.
+    /// after `last_index`. On replay it **resets the log** (issue #1368): it is
+    /// either the first record of a rewritten image or the record an installed
+    /// snapshot emits right after clearing the in-memory log, and in both
+    /// cases every entry logged before it is gone.
     Snapshot {
         metadata: S,
         last_index: u64,
@@ -453,6 +456,14 @@ where
                     config,
                     learners,
                 } => {
+                    // A snapshot record resets the log to its base: the log
+                    // "keeps only entries after `last_index`" and every writer
+                    // emits it either as the first record of a rewritten image
+                    // (log already empty, so a no-op) or when an installed
+                    // snapshot cleared the whole in-memory log (issue #1368).
+                    // Replay is positional, so entries logged before the
+                    // record must not survive it.
+                    state.log.clear();
                     state.snapshot = Some((metadata, last_index, last_term));
                     state.snapshot_config = config;
                     state.snapshot_learners = learners;
@@ -460,6 +471,33 @@ where
             }
         }
         state
+    }
+
+    /// Defensive recovery check (issue #1368): the replayed log must be
+    /// **positionally contiguous** with the snapshot base, i.e. entry `i`
+    /// carries index `base + 1 + i`. [`replay`](Self::replay) rebuilds the log
+    /// by position and `RaftCore::term_at` / `apply` index it by position, so
+    /// a gap or a repeated entry silently shifts every later entry by one
+    /// (the apply task then labels, and the follower compares terms against,
+    /// the wrong entries). Such a WAL is not repairable here -- which entries
+    /// are authoritative is unknowable -- so the driver must refuse to recover
+    /// from it and halt loudly, exactly as for an undecodable WAL.
+    ///
+    /// # Errors
+    /// A description of the first entry whose index is not its position.
+    pub fn check_log_contiguous(&self) -> Result<(), String> {
+        let base = self.snapshot.as_ref().map_or(0, |(_, index, _)| *index);
+        for (pos, entry) in self.log.iter().enumerate() {
+            let expected = base + 1 + pos as u64;
+            if entry.index != expected {
+                return Err(format!(
+                    "recovered log is not contiguous with its snapshot base {base}: the entry at \
+                     position {pos} carries index {} but position {pos} must hold index {expected}",
+                    entry.index
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Encode a single record as one [`CONTROL_WAL`]-tagged, checksummed

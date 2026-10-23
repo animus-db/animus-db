@@ -3992,6 +3992,20 @@ already `Active` and carry its stream lineage via `split_lineage`; the next
 `grow_stream` call splits them in their own turn. Pinned by
 `sim_cluster_grow_retired.rs`.
 
+**Two PR #401 sub-bugs are pinned in `SimCluster`** (issue #298):
+`sim_cluster_gsi_frozen_endgame.rs` (a base tablet and its hidden GSI index
+tablet both forked and led by one node: the driver loop must not block on the
+frozen index tablet, `cp_kind_write_raw_once`; the hidden index tablet only
+exists after the first drain) and `sim_cluster_txn_resolver_split.rs`
+(`txn_resolver_loop`'s body is `txn_resolver_pending_pass` and the decided-record
+sweep is its own task, `txn_decided_sweep_loop` = `txn_resolver_decided_pass`
+(issue #1369: the decided backlog must never delay in-doubt recovery, pinned by
+`sim_cluster_txn_resolver_backlog.rs`); the test runs both on
+every node after the anchor tablet forked; the injected-record-loss cell is the
+one that fails with the recovery hint reverted to `None`). `SimCluster` still
+spawns neither loop, so a new fix inside one of them splits the body out the
+same way (lesson `docs/lessons/testing/2026-10-22-a-production-loop-with-no-sim-test-*`).
+
 **Split is the ADR 0058 in-place workflow's METADATA half (Train 2 rung
 3, directed by ADR 0062) — the sole split mechanism since the copy-based
 workflow was deleted whole 2026-09-01** (the copy-split-deletion stack,

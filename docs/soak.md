@@ -36,7 +36,7 @@ never schedules it; `clippy --all-features` still lints it).
 
 | Knob | Default | Effect |
 |---|---|---|
-| `ANIMUS_SOAK_DURATION` | `10m` | total length: seconds, or `s`/`m`/`h`/`d` suffix |
+| `ANIMUS_SOAK_DURATION` | `10m` | total length: seconds, or `s`/`m`/`h`/`d` suffix; no epoch starts with less than half an epoch left |
 | `ANIMUS_SOAK_SEED` | name hash | seed of the workload ops and the port range; printed |
 | `ANIMUS_SOAK_NODES` / `_TABLETS` | 3 / 4 | cluster size (>= 3), workload-table tablets |
 | `ANIMUS_SOAK_EPOCH_SECS` | 300 | length of one verification epoch (see below) |
@@ -44,6 +44,7 @@ never schedules it; `clippy --all-features` still lints it).
 | `ANIMUS_SOAK_WARMUP` | duration/4, max 6h | samples before this are ignored by the trend check |
 | `ANIMUS_SOAK_PACE_MS` | `20,60` | per-client pause between ops: `base,spread` ms |
 | `ANIMUS_SOAK_RESTART_EVERY` | 0 | `kill -9` + restart one node (rotating) every N epochs |
+| `ANIMUS_SOAK_LOG` | node default (`info`) | the node processes' log filter, `RUST_LOG` / `tracing` `EnvFilter` syntax (e.g. `info,animusd=debug`); node logs grow faster with it, budget disk |
 | `ANIMUS_SOAK_DIR` / `_OUT` | temp dir | scratch data dir parent; artifact dir parent |
 
 ## What it checks
@@ -93,7 +94,8 @@ windows of at least three samples fit.
 `<out>/soak-<seed>/`: `samples.csv` (always: `secs,node,series,value`),
 `trend-summary.txt`, `events.txt`; on failure also `history.json` (the failing
 epoch's history, `animus_test::export` format), `op-trace.txt`, `violations.txt`
-and each node's log.
+and each node's log; on a `[final-read]` failure also `diag-final-read.txt` and
+`diag-n<i>-<endpoint>.txt` (see "When it fails").
 
 ## CI and the 7-day run
 
@@ -110,6 +112,27 @@ is a correctness finding: replay-minimize it against the sim corpora (ADR 0074
 section 1). A `[resource-trend]` line names the node, series and rule; compare
 `samples.csv` against the node log and `/admin` state before concluding leak vs.
 a legitimate step. Do not widen a tolerance without a documented reason.
+
+**`[final-read]` is an availability finding, not data loss.** A consistent
+final read that no retry within 60s could complete through one node (a 503,
+`NoLeader`, a stuck forwarded read) fails the run, but the key is never treated
+as empty. If the other node's read answered, its state feeds the value oracles
+(`[durability]`, `[cycles]`, atomicity, eventual-prefix) and the `[final-read]`
+line says so; `[convergence]` compares only keys both nodes answered. If neither
+answered, the key is excluded from the value oracles and the `[final-read]` line
+says `inconclusive`: nothing about that key's data is known, so read it by hand
+(keep the cluster, or re-run with the same seed). A `[cold-data]` re-read that
+fails is reported the same way, not as a change.
+
+Before the cluster stops, a `[final-read]` failure writes
+`diag-final-read.txt` (each failed key, and the tablet the error names, when it
+names one; the key-to-tablet map is in `diag-n<i>-status.txt`) and, per node,
+`diag-n<i>-<endpoint>.txt` for `status` (tablet map), `raft` (control plane),
+`raftkv` (per-tablet Raft role, term, leader, applied index), `txns` (pending
+and undecided transactions per tablet, `PendingTxnView`), `metrics`, `health`
+and `roll-health`. Compare leadership and the pending transactions on the
+failing tablet across nodes. Re-run with `ANIMUS_SOAK_LOG` raised (e.g.
+`info,animusd=debug`) when the WARN-level node logs cannot show the leader state.
 
 ## Not done
 
