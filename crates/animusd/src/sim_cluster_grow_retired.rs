@@ -65,7 +65,7 @@ fn live_tablets(cluster: &SimCluster, node: u64) -> Vec<(TabletId, TabletState)>
         .collect()
 }
 
-fn leader_node(cluster: &SimCluster, tablet: TabletId) -> u64 {
+pub(crate) fn leader_node(cluster: &SimCluster, tablet: TabletId) -> u64 {
     (0..cluster.node_count() as u64)
         .find(|&n| cluster.is_leader_local(n, tablet))
         .unwrap_or_else(|| panic!("seed={}: {tablet:?} has no leader", cluster.seed()))
@@ -73,7 +73,7 @@ fn leader_node(cluster: &SimCluster, tablet: TabletId) -> u64 {
 
 /// Move `tablet`'s leadership onto `to` (test-only: matches the private
 /// `CpGroup` enum), waiting until it holds.
-fn move_leader(cluster: &mut SimCluster, tablet: TabletId, to: u64) {
+pub(crate) fn move_leader(cluster: &mut SimCluster, tablet: TabletId, to: u64) {
     let seed = cluster.seed();
     for _ in 0..200 {
         if cluster.is_leader_local(to, tablet) {
