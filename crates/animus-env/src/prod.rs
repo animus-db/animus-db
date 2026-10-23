@@ -200,11 +200,23 @@ impl HandshakeCfg {
     }
 }
 
+/// The calendar clock in nanoseconds since the Unix epoch, read once when an
+/// env is built (0 on a pre-epoch clock).
+fn calendar_epoch_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos().min(u128::from(u64::MAX)) as u64)
+}
+
 struct Inner {
     node_id: NodeId,
     /// Handshake `ext` policy; see [`HandshakeCfg`].
     hs: Arc<HandshakeCfg>,
     start: Instant,
+    /// Calendar nanoseconds since the Unix epoch at `start`: `Clock::now` is
+    /// this plus the monotonic elapsed time, so the `Nanos` it returns keep
+    /// counting across a process restart instead of restarting at zero.
+    boot_epoch_ns: u64,
     /// The peer address book: node id -> `host:port` (a hostname or a numeric
     /// address — `TcpStream::connect` resolves either). Kept as a string end
     /// to end (ADR: advertise/dial split) so a peer can be registered by a
@@ -453,6 +465,7 @@ impl ProdEnv {
                 node_id,
                 hs,
                 start: Instant::now(),
+                boot_epoch_ns: calendar_epoch_ns(),
                 peers: Arc::new(StdMutex::new(BTreeMap::new())),
                 local_addr,
                 conns: Arc::new(StdMutex::new(BTreeMap::new())),
@@ -1006,11 +1019,13 @@ impl Future for RecvStream {
 impl Clock for ProdEnv {
     fn now(&self) -> Nanos {
         Nanos(
-            self.inner
-                .start
-                .elapsed()
-                .as_nanos()
-                .min(u128::from(u64::MAX)) as u64,
+            self.inner.boot_epoch_ns.saturating_add(
+                self.inner
+                    .start
+                    .elapsed()
+                    .as_nanos()
+                    .min(u128::from(u64::MAX)) as u64,
+            ),
         )
     }
 
@@ -1091,6 +1106,7 @@ impl Rng for PreBindRng {
 #[derive(Clone)]
 pub struct ProdClockRng {
     start: std::time::Instant,
+    boot_epoch_ns: u64,
 }
 
 impl ProdClockRng {
@@ -1099,6 +1115,7 @@ impl ProdClockRng {
     pub fn new() -> Self {
         ProdClockRng {
             start: std::time::Instant::now(),
+            boot_epoch_ns: calendar_epoch_ns(),
         }
     }
 }
@@ -1112,7 +1129,10 @@ impl Default for ProdClockRng {
 #[async_trait::async_trait]
 impl Clock for ProdClockRng {
     fn now(&self) -> Nanos {
-        Nanos(self.start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64)
+        Nanos(
+            self.boot_epoch_ns
+                .saturating_add(self.start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64),
+        )
     }
 
     fn wall_now(&self) -> UnixMillis {
@@ -3047,6 +3067,44 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("animus-prodenv-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    /// `Clock::now` is anchored to the calendar clock at construction, then
+    /// monotonic: a second process incarnation started later reads a later
+    /// `now`, never one that restarted from zero. The HLC takes its wall
+    /// component from `now`, so an uptime clock froze it for good once every
+    /// original process had been restarted (a restarted node's uptime is below
+    /// the HLC floor it recovers): the LSM tombstone/version GC grace and the
+    /// read-ceiling cadence are both measured in HLC wall time, so they stopped
+    /// advancing and the soak's throughput decayed.
+    #[tokio::test]
+    async fn now_is_calendar_anchored_and_survives_a_restart() {
+        let cal_ns = |t: SystemTime| t.duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+        let before = cal_ns(SystemTime::now());
+        let dir = unique_tmp_dir();
+        let (env, _addr) = ProdEnv::bind(nid(0), "127.0.0.1:0".parse().unwrap(), &dir)
+            .await
+            .expect("bind");
+        let first = env.now();
+        let after = cal_ns(SystemTime::now());
+        assert!(
+            first.0 >= before && first.0 <= after + 5_000_000_000,
+            "now() {} is not the calendar time {before}..{after} the env was built at",
+            first.0
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            env.now().0 >= first.0 + 20_000_000,
+            "now() must keep advancing"
+        );
+
+        // A later incarnation (a restart) never reads an earlier `now`.
+        let rng = ProdClockRng::new();
+        assert!(
+            rng.now().0 >= first.0,
+            "a restarted process's clock went backwards"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `append` + `sync` + `read` of a file whose name carries a subdirectory

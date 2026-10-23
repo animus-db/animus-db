@@ -4331,3 +4331,16 @@ a_txn_decision_ordered_after_the_fork_is_a_sealed_no_op` (gate open) and
 closed), the gate-table unit test in `gates.rs`, the codec fixtures, and the
 mixed-version cell `sim_cluster_mixed_version_corpus::
 release3_to_release4_txn_seal_gate`.
+
+## Amendment 2026-10-23: `ProdEnv::now()` is calendar-anchored
+
+Issue #1204's fix (the in-doubt grace also opens on the node's own clock)
+treated one symptom of `ProdEnv::now()` being process uptime. The cause is
+wider: the HLC wall comes from `env.now()`, so once every original process had
+restarted the cluster HLC wall froze near the largest uptime ever reached
+(~200 s in the soaks), and everything measured in HLC wall time stopped
+elapsing (LSM GC grace, read-ceiling proposals). `ProdEnv::now()` now starts at
+the boot calendar time in ns and advances monotonically. HLC values jump once
+to ~1.7e12 ms << 20; they stay monotone and inside the `pack` bound. A rollback
+to the previous binary stalls the older nodes' HLC again. The #1204
+`in_doubt_grace_elapsed` path stays as defence in depth.

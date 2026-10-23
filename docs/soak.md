@@ -139,3 +139,12 @@ failing tablet across nodes. Re-run with `ANIMUS_SOAK_LOG` raised (e.g.
 The operator-on-`kind` leg; running faults concurrently with the soak (chaos
 owns faults; `ANIMUS_SOAK_RESTART_EVERY` only adds periodic `kill -9`); the
 7-day run itself; node log rotation (logs grow with the run; budget disk).
+
+## Restart-rotation throughput decay (fixed 2026-10-23)
+
+Before this fix `ProdEnv::now()` was process uptime, and a soak with
+`ANIMUS_SOAK_RESTART_EVERY` set lost roughly half its acked-write throughput
+(and more over hours) once every node had restarted once, because the HLC wall
+froze. A no-restart control stayed flat. If throughput decays with restart
+count again, compare `storage_tombstones_reclaimed`, `storage_sstable_block_reads`
+and `cp_snapshot_ships` per request, early vs late.
