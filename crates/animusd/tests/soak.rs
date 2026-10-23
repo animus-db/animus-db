@@ -13,7 +13,8 @@
 //! syntax; default a quarter of the run, at most 6h), `ANIMUS_SOAK_PACE_MS`
 //! (`base,spread`, default `20,60`), `ANIMUS_SOAK_RESTART_EVERY` (kill -9 and
 //! restart one node, rotating, every N epochs; default 0 = never),
-//! `ANIMUS_SOAK_DIR`, `ANIMUS_SOAK_OUT`.
+//! `ANIMUS_SOAK_LOG` (the nodes' log filter, `RUST_LOG` syntax; default the
+//! node's own `info`), `ANIMUS_SOAK_DIR`, `ANIMUS_SOAK_OUT`.
 //!
 //! # Why memory is bounded for a multi-day run
 //!
@@ -35,7 +36,7 @@
 )]
 mod chaos_support;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::SocketAddr;
@@ -211,22 +212,124 @@ async fn delete_keys(nodes: &[SocketAddr], base: u64) -> usize {
     failed
 }
 
-async fn read_epoch(
-    node: SocketAddr,
-    base: u64,
-    budget: Duration,
-    violations: &mut Vec<String>,
-) -> BTreeMap<u64, Vec<u64>> {
-    let mut m = BTreeMap::new();
+/// One epoch's final reads through one node: the keys that answered, and for
+/// each key that did not, the error (a failed read is a `[final-read]`
+/// finding, never an empty key).
+type EpochRead = (BTreeMap<u64, Vec<u64>>, BTreeMap<u64, String>);
+
+async fn read_epoch(node: SocketAddr, base: u64, budget: Duration) -> EpochRead {
+    let (mut m, mut failed) = (BTreeMap::new(), BTreeMap::new());
     for k in 0..KEYS {
         match workload::final_read(node, base + k, budget).await {
             Ok(l) => {
                 m.insert(base + k, l);
             }
-            Err(e) => violations.push(format!("[final-read] {e}")),
+            Err(e) => {
+                failed.insert(base + k, e);
+            }
         }
     }
-    m
+    (m, failed)
+}
+
+/// What the oracles may judge after two final reads, some of which failed.
+struct Judged {
+    /// Per key, the state the value oracles judge against: the first node's
+    /// answer, else the second's. Absent for an inconclusive key.
+    state: BTreeMap<u64, Vec<u64>>,
+    /// The same, preferring the second node: with `state` it feeds
+    /// `check_convergence`, so a key that only one node answered compares
+    /// equal to itself (its failed read is the `[final-read]` violation) and
+    /// only two answers that differ are a `[convergence]` violation.
+    state_b: BTreeMap<u64, Vec<u64>>,
+    /// Keys neither node answered: excluded from the value oracles.
+    inconclusive: BTreeSet<u64>,
+    /// The first error per key whose read failed through either node.
+    failed: BTreeMap<u64, String>,
+    /// One `[final-read]` line per failed read, saying what the oracles did.
+    violations: Vec<String>,
+}
+
+fn judge_final_reads(a: EpochRead, b: EpochRead) -> Judged {
+    let ((fin_a, err_a), (fin_b, err_b)) = (a, b);
+    let mut state = fin_a.clone();
+    let mut state_b = fin_b.clone();
+    for (k, l) in &fin_b {
+        state.entry(*k).or_insert_with(|| l.clone());
+    }
+    for (k, l) in &fin_a {
+        state_b.entry(*k).or_insert_with(|| l.clone());
+    }
+    let mut inconclusive = BTreeSet::new();
+    let mut violations = Vec::new();
+    let mut failed = BTreeMap::new();
+    for (k, e) in err_a.iter().chain(&err_b) {
+        let both = err_a.contains_key(k) && err_b.contains_key(k);
+        if both {
+            inconclusive.insert(*k);
+        }
+        let effect = if both {
+            format!(
+                "inconclusive: neither node answered, key k{k} is excluded from the value oracles"
+            )
+        } else {
+            "the other node answered; its state is used for the value oracles".to_owned()
+        };
+        violations.push(format!("[final-read] {e} ({effect})"));
+        failed.entry(*k).or_insert_with(|| e.clone());
+    }
+    Judged {
+        state,
+        state_b,
+        inconclusive,
+        failed,
+        violations,
+    }
+}
+
+/// The tablet a failed read's error names (`tablet 7 has had no reachable
+/// leader`), best effort: the harness has no key-to-tablet map of its own.
+fn tablet_in(err: &str) -> Option<u64> {
+    let rest = err.split("tablet ").nth(1)?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// On a `[final-read]` failure, before the cluster stops: every node's
+/// leadership and pending-transaction views, one `diag-n<i>-<endpoint>.txt`
+/// each, plus `diag-final-read.txt` naming each failed key and, when the error
+/// says, its tablet. Best effort: an endpoint that does not answer is written
+/// as its error.
+async fn capture_diagnostics(
+    cluster: &ChaosCluster,
+    n: usize,
+    out_dir: &Path,
+    failed: &BTreeMap<u64, String>,
+) {
+    const ENDPOINTS: [(&str, &str); 7] = [
+        ("status", "/admin/status"),
+        ("raft", "/admin/raft"),
+        ("raftkv", "/admin/raftkv?exact=1"),
+        ("txns", "/admin/txns"),
+        ("metrics", "/admin/metrics"),
+        ("health", "/admin/health"),
+        ("roll-health", "/admin/roll-health"),
+    ];
+    let mut keys = String::new();
+    for (k, e) in failed {
+        let tablet = tablet_in(e).map_or("unknown".to_owned(), |t| t.to_string());
+        let _ = writeln!(keys, "key k{k} tablet {tablet}: {e}");
+    }
+    let _ = std::fs::write(out_dir.join("diag-final-read.txt"), keys);
+    for i in 0..n {
+        for (name, path) in ENDPOINTS {
+            let body = match http_get(cluster.admin_addr(i), path, Duration::from_secs(10)).await {
+                Ok((code, body)) => format!("HTTP {code}\n{body}"),
+                Err(e) => format!("GET {path} failed: {e}"),
+            };
+            let _ = std::fs::write(out_dir.join(format!("diag-n{i}-{name}.txt")), body);
+        }
+    }
 }
 
 async fn soak() -> Vec<String> {
@@ -265,11 +368,13 @@ async fn soak() -> Vec<String> {
     let _ = writeln!(csv, "secs,node,series,value");
     eprintln!(
         "soak: seed={seed} duration={duration:?} nodes={n} tablets={tablets} epoch={epoch_len:?} \
-         sample={sample_every:?} warmup={warmup:?} restart_every={restart_every} pace={pace:?} out={}",
+         sample={sample_every:?} warmup={warmup:?} restart_every={restart_every} pace={pace:?} log={:?} out={}",
+        env_str("ANIMUS_SOAK_LOG"),
         out_dir.display()
     );
 
     let mut cluster = ChaosCluster::prepare(n, scratch.path(), seed).await;
+    cluster.set_log_filter(env_str("ANIMUS_SOAK_LOG"));
     cluster.start_all();
     let nodes: Vec<SocketAddr> = (0..n).map(|i| cluster.dynamo_addr(i)).collect();
     let mut violations: Vec<String> = Vec::new();
@@ -333,9 +438,19 @@ async fn soak() -> Vec<String> {
         }
 
         // ---- per-epoch verification --------------------------------
-        let fin_a = read_epoch(nodes[0], key_base, recovery, &mut violations).await;
-        let fin_b = read_epoch(nodes[1], key_base, recovery, &mut violations).await;
-        let (history, verdict) = workload::run_oracles(&shared, &fin_a, &fin_b);
+        let judged = judge_final_reads(
+            read_epoch(nodes[0], key_base, recovery).await,
+            read_epoch(nodes[1], key_base, recovery).await,
+        );
+        let mut final_read_failed = judged.failed.clone();
+        violations.extend(judged.violations.iter().cloned());
+        let fin_a = judged.state.clone();
+        let (history, verdict) = workload::run_oracles_excluding(
+            &shared,
+            &judged.state,
+            &judged.state_b,
+            &judged.inconclusive,
+        );
         violations.extend(
             verdict
                 .violations
@@ -365,19 +480,20 @@ async fn soak() -> Vec<String> {
         }
         // Cold data: epoch N-1 and epoch 0 must still read back unchanged.
         for (e, want) in prev.iter().chain(first.iter().filter(|_| epoch > 1)) {
-            let got = read_epoch(
-                nodes[(epoch as usize) % n],
-                e * KEYS,
-                recovery,
-                &mut violations,
-            )
-            .await;
-            if &got != want {
-                let k = got
-                    .iter()
-                    .find(|(k, v)| want.get(k) != Some(v))
-                    .map(|(k, _)| *k);
-                violations.push(format!("epoch {epoch}: [cold-data] epoch {e} changed since it was verified (first differing key {k:?})"));
+            let (got, failed) = read_epoch(nodes[(epoch as usize) % n], e * KEYS, recovery).await;
+            // A key whose read failed is a `[final-read]` finding, not a change.
+            for (k, err) in failed {
+                violations.push(format!(
+                    "[final-read] {err} (cold-data re-read of epoch {e})"
+                ));
+                final_read_failed.insert(k, err);
+            }
+            if let Some(k) = want
+                .iter()
+                .find(|(k, v)| got.get(k).is_some_and(|g| g != *v))
+                .map(|(k, _)| *k)
+            {
+                violations.push(format!("epoch {epoch}: [cold-data] epoch {e} changed since it was verified (first differing key {k})"));
             }
         }
         for (i, off) in log_off.iter_mut().enumerate() {
@@ -386,6 +502,9 @@ async fn soak() -> Vec<String> {
             }
         }
         if !violations.is_empty() {
+            if !final_read_failed.is_empty() {
+                capture_diagnostics(&cluster, n, &out_dir, &final_read_failed).await;
+            }
             let _ = std::fs::write(
                 out_dir.join("history.json"),
                 animus_test::export::to_json(&history),
@@ -470,6 +589,34 @@ async fn soak() -> Vec<String> {
     }
     drop(cluster);
     violations
+}
+
+#[test]
+fn failed_final_read_is_not_data_loss() {
+    let ok = |k: u64, l: &[u64]| (BTreeMap::from([(k, l.to_vec())]), BTreeMap::new());
+    let bad = |k: u64| {
+        (
+            BTreeMap::new(),
+            BTreeMap::from([(k, format!("key {k} 503"))]),
+        )
+    };
+    // One node answered: its state judges the key, and both views agree.
+    let j = judge_final_reads(bad(7), ok(7, &[1, 2]));
+    assert_eq!(j.state, j.state_b);
+    assert_eq!(j.state[&7], vec![1, 2]);
+    assert!(j.inconclusive.is_empty());
+    assert_eq!(j.violations.len(), 1);
+    assert!(j.violations[0].starts_with("[final-read]"));
+    // Neither answered: excluded, reported twice (once per node), never empty.
+    let j = judge_final_reads(bad(7), bad(7));
+    assert!(j.state.is_empty() && j.state_b.is_empty());
+    assert!(j.inconclusive.contains(&7));
+    assert!(j.violations.iter().all(|v| v.contains("inconclusive")));
+    assert_eq!(
+        tablet_in("503 tablet 7 has had no reachable leader"),
+        Some(7)
+    );
+    assert_eq!(tablet_in("503 nothing"), None);
 }
 
 #[test]
