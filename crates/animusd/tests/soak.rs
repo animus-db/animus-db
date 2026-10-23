@@ -408,7 +408,11 @@ async fn soak() -> Vec<String> {
     let mut prev: Option<(u64, BTreeMap<u64, Vec<u64>>)> = None;
     let mut first: Option<(u64, BTreeMap<u64, Vec<u64>>)> = None;
     let mut cleanup_failed = 0usize;
-    while t_start.elapsed() + Duration::from_secs(10) < duration && violations.is_empty() {
+    // Never start an epoch shorter than half the configured length: a short
+    // tail epoch right after a restart can ack fewer than the non-vacuity
+    // floor of writes and fail the run for no reason.
+    let min_epoch = (epoch_len / 2).max(Duration::from_secs(10));
+    while t_start.elapsed() + min_epoch < duration && violations.is_empty() {
         let remaining = duration - t_start.elapsed();
         let this_len = epoch_len.min(remaining);
         let key_base = epoch * KEYS;

@@ -36,7 +36,7 @@ never schedules it; `clippy --all-features` still lints it).
 
 | Knob | Default | Effect |
 |---|---|---|
-| `ANIMUS_SOAK_DURATION` | `10m` | total length: seconds, or `s`/`m`/`h`/`d` suffix |
+| `ANIMUS_SOAK_DURATION` | `10m` | total length: seconds, or `s`/`m`/`h`/`d` suffix; no epoch starts with less than half an epoch left |
 | `ANIMUS_SOAK_SEED` | name hash | seed of the workload ops and the port range; printed |
 | `ANIMUS_SOAK_NODES` / `_TABLETS` | 3 / 4 | cluster size (>= 3), workload-table tablets |
 | `ANIMUS_SOAK_EPOCH_SECS` | 300 | length of one verification epoch (see below) |
