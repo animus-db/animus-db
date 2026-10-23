@@ -178,14 +178,14 @@
             <li>SigV4 with credential rotation and per-key allow lists (not full IAM)</li>
             <li>Versioned on-disk formats, full-cluster and rolling upgrades</li>
             <li>Zone-aware replica placement on Kubernetes</li>
+            <li>Global tables in both modes (strongly and eventually consistent), plus the legacy 2017.11.29 API</li>
           </ul>
         </div>
         <div>
           <h3>Not yet</h3>
           <ul>
             <li>Published benchmarks: the harness is built and the methodology disclosed, but there are no numbers yet</li>
-            <li>Multi-Region strongly consistent global tables: simulation-tested only, not run on real multi-Region hardware</li>
-            <li>Eventual-consistency global tables between clusters: simulation-tested only</li>
+            <li>Global tables measured on a real multi-Region deployment (tested in simulation and over an emulated WAN link only)</li>
             <li>TLS, encryption at rest and SigV4 on by default</li>
           </ul>
           <p class="mt-20"><strong>Do not store production data in it yet.</strong> TLS, encryption at rest and SigV4 exist but are off by default, so do not expose an unconfigured cluster, and do not store data you cannot recreate.</p>
