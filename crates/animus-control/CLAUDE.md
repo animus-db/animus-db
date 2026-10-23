@@ -3504,3 +3504,15 @@ replay and halt loudly on a misaligned log. Regression tests:
 `tests/it/install_snapshot_wal_replay.rs` and cp-data
 `tests/it/install_snapshot_crash_window.rs`. Lesson:
 `docs/lessons/code-patterns/2026-10-23-a-positional-wal-replay-needs-every-log-reshaping-event-in-the-wal.md`.
+
+## Control-plane install holds appends back until its WAL rewrite (follow-up to #1368)
+
+The control plane does not log an installed snapshot's base (WAL must not run
+ahead of the engine), so `RaftCore::install_rewrite_owed` is set instead:
+`persist_wal` appends nothing while it is set (records stay pending, acks stay
+gated) and `meta_apply_and_compact` rewrites the whole image on its next pass
+once the engine install has been drained (`install_owed` in its compaction
+gate). `take_snapshot_dirty` clears it. Without this a crash after an install
+replayed `[old tail] ++ [entries past the base]`, which `check_log_contiguous`
+now turns into a halted node. Regression: `tests/it/control_install_crash_window.rs`.
+Lesson: `docs/lessons/code-patterns/2026-10-23-a-control-plane-install-must-hold-back-appends-until-its-wal-rewrite.md`.

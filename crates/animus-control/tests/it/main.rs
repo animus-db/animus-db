@@ -8,6 +8,7 @@ mod backup_catalog;
 mod campaign_admission;
 mod capacity_corpus;
 mod control_corpus;
+mod control_install_crash_window;
 mod control_membership;
 mod control_raft;
 mod credentials_catalog;
