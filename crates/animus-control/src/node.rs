@@ -1846,6 +1846,10 @@ async fn drive<E: Env, S: StorageEngine + 'static>(
         if persist_fut.is_none()
             && (core.lock().expect("raft core poisoned").has_unflushed_wal()
                 || persist.is_suspect())
+            && !core
+                .lock()
+                .expect("raft core poisoned")
+                .install_rewrite_owed()
         {
             // `persist_wal`'s record count is `flush`'s return value, not this
             // loop's business — drop it so the boxed future matches `PersistFut`.
@@ -2516,7 +2520,13 @@ async fn meta_apply_and_compact<E: Env, S: StorageEngine>(
         *compact_defer_since = None;
         *compact_defer_progress = None;
     }
-    if threshold_hit || image_needed {
+    // An installed snapshot owes the WAL a rewrite (the consensus loop holds
+    // appends back until it lands); wait for the engine install to be drained.
+    let install_owed = {
+        let c = core.lock().expect("raft core poisoned");
+        c.install_rewrite_owed() && !c.has_pending_install()
+    };
+    if threshold_hit || image_needed || install_owed {
         let image = if image_needed {
             Some(syskv_image(engine).await)
         } else {
@@ -3766,6 +3776,20 @@ async fn persist_wal<E: Env>(
     halted: &AtomicBool,
 ) -> usize {
     let wal_guard = wal_lock.lock().await;
+    // Held back after an `InstallSnapshot`: the base moved in memory but the
+    // WAL file still holds the pre-install log, so appending the leader's next
+    // entries (indexes past the new base) would let a crash replay a gap. The
+    // apply task owes a full-image rewrite (carries the base and every entry
+    // appended since, and releases the acks gated on it); records stay
+    // pending until then.
+    if !progress.is_suspect()
+        && core
+            .lock()
+            .expect("raft core poisoned")
+            .install_rewrite_owed()
+    {
+        return 0;
+    }
     // Disk-full (R-01 (d), ADR 0074 §2): a suspect WAL is never appended to
     // again — a compaction rewrite (or an earlier round) hit ENOSPC, so go
     // straight to the rewrite recovery, even with nothing new to drain.

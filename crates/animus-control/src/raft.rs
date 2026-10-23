@@ -1838,6 +1838,15 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     /// (the base move reaches the WAL only with the apply task's rewrite, after
     /// the engine install). Purely local, never persisted.
     wal_records_install: bool,
+    /// An installed snapshot moved the base in memory but the WAL has not been
+    /// rewritten since (only set when `wal_records_install` is off: the
+    /// control plane). While set, the driver must not append further records
+    /// to the old file -- positional replay would see `[old tail] ++ [entries
+    /// past the new base]`, a gap -- and instead owes a prompt full-image
+    /// rewrite, which carries the base and the whole current log. Cleared by
+    /// [`take_snapshot_dirty`](Self::take_snapshot_dirty). Local, never
+    /// persisted.
+    install_rewrite_owed: bool,
 }
 
 impl<C, S> RaftCore<C, S>
@@ -1939,6 +1948,7 @@ where
             group_label: None,
             log_omits_base: false,
             wal_records_install: false,
+            install_rewrite_owed: false,
         };
         core.reset_election_timer(now, entropy);
         core
@@ -2150,6 +2160,9 @@ where
     /// Take and clear the snapshot-dirty flag (the driver uses this to decide
     /// whether the WAL needs a full rewrite this iteration).
     pub fn take_snapshot_dirty(&mut self) -> bool {
+        // The caller rewrites the WAL from `wal_image` under the same lock
+        // hold, which settles any rewrite an install owed.
+        self.install_rewrite_owed = false;
         std::mem::replace(&mut self.snapshot_dirty, false)
     }
 
@@ -2518,6 +2531,15 @@ where
     /// actually drain it.
     pub fn has_pending_install(&self) -> bool {
         self.pending_install.is_some()
+    }
+
+    /// Whether an installed snapshot's base move has not reached the WAL yet
+    /// and the driver must therefore (a) hold back appends to the old file and
+    /// (b) rewrite the whole image promptly. See the `install_rewrite_owed`
+    /// field. Always `false` for a core that logs installs
+    /// ([`set_wal_records_install`](Self::set_wal_records_install)).
+    pub fn install_rewrite_owed(&self) -> bool {
+        self.install_rewrite_owed
     }
 
     /// The next virtual instant at which this node wants a timer tick, or
@@ -5294,7 +5316,9 @@ where
                 // (`wal_records_install`): the record makes the WAL base run
                 // ahead of the engine's install, which only the data plane
                 // recovers from.
-                if core.wal_records_install {
+                if !core.wal_records_install {
+                    core.install_rewrite_owed = true;
+                } else {
                     core.pending.push(WalRecord::Snapshot {
                         metadata: core.metadata.clone(),
                         last_index: core.snapshot_index,
