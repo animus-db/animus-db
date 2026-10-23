@@ -131,10 +131,13 @@ new binary, no skipped release, no mid-roll image revert. **Transactions:** #123
 (2026-10-10): it was the previous release's own abort-lookback bug (a v1 intent written
 before `efcaa6cb` carries no prior, so aborting it after LSM GC can lose an acked value),
 not a roll bug. The R-1 pin moved to `f6709564`, which contains `efcaa6cb`, and the
-previous-release test runs transactions by default. Rolling *from* a release containing
-`efcaa6cb` with transactions is supported; rolling *from an older one* is unsupported
-(it carries that bug for its still-unresolved intents, roll or no roll; stop issuing
-multi-item transactions and let in-flight ones resolve before the roll). **Open:** #1235 (a `SimCluster` Memory-backend restart oddity,
+previous-release test runs transactions by default. **#1355 (2026-10-23):** `f6709564` has no
+durable resolved-txn marker or replay fence (#1243/#1251/#1242/#1247), so a replica restarted
+onto the current build can replay a stale `TxnStage` over R-1's engine and diverge; the pin
+moved to `f97451d58` (past #1251, with its own version era, cluster version 6). Rolling *from* a
+tree containing #1251 with transactions is supported; rolling *from an older one* is
+unsupported (ADR 0073's 2026-10-23 amendment; stop issuing multi-item transactions and let
+in-flight ones resolve before the roll, as for `efcaa6cb`). **Open:** #1235 (a `SimCluster` Memory-backend restart oddity,
 test-only); the nightly `kind` operator-roll leg (`E2E_UPGRADE=1`) has not had a
 verified run; D4(b), a replicated maintenance mark that suppresses repair churn during
 a roll, is a pending maintainer decision (measured: ADR 0073 as-built). The

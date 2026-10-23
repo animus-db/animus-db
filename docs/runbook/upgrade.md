@@ -117,7 +117,10 @@ caught up by snapshot used to be able to crash on a transaction-envelope version
 a release older than commit `efcaa6cb` has its own bug (#1238, closed by moving the
 previous-release test's pin past that commit): a multi-item transaction intent it wrote that is
 still unresolved can lose an acknowledged value if aborted after storage compaction, with or without
-an upgrade. Rolling from a release containing `efcaa6cb` with transactions in use is supported and
+an upgrade. A release older than the durable resolved-transaction marker (#1243/#1251, 2026-10-06) also
+has no replay fence: a replica restarted onto the new binary can replay a stale transaction
+stage over its engine and diverge from its peers (#1355). Rolling from a release containing
+#1251 (and so `efcaa6cb`) with transactions in use is supported and
 is what the `upgrade-previous-release` job runs. **Rolling from an older release with transactions
 in use is unsupported.** Before starting such a roll, stop issuing multi-item transactions and wait
 until every in-flight one has resolved (an unresolved intent is durable, so the whole-cluster

@@ -3596,10 +3596,14 @@ touching the bound: step 4's cell 3 was root-caused from exactly those counters.
 
 Test-only (off by default, on for this crate's own tests via the self dev-dependency):
 `legacy_r1_model::set(node, true)` before a node starts makes it apply `TxnStage`/`TxnResolve`
-like the previous release `f6709564` (in-memory `recently_resolved`, no resolved marker, no
+like the old pin `f6709564` (in-memory `recently_resolved`, no resolved marker, no
 engine-ahead fence). `tests/it/legacy_r1_mixed_stage.rs` replays one log through both semantics
 and pins the mixed-version hazard (a stale stage resurrects an intent on the replica whose guard
-state is missing). Remove it with the R-1 pin once R-1 contains #1243/#1251.
+state is missing, also after a restart: #1355). The R-1 pin moved to `f97451d58` (contains
+#1243/#1251/#1242/#1247) on 2026-10-23, so this model is **no longer a supported source**: the
+feature and its cells stay as the documented model of the unsupported path (ADR 0073's
+2026-10-23 amendment) and as the proof that the current build cannot repair it. Delete them only
+if a later amendment drops the unsupported-path record.
 
 ## Propose bound and admission (ADR 0080)
 

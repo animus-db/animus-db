@@ -12319,11 +12319,13 @@ measurement needs `ANIMUS_UPGRADE_FROM_RESTART_GAP_SECS`; a write the client
 timed out on can commit after the workload stopped, so "unchanged after a
 restart" is wrong, "grew, in order, only by writes this workload issued" is
 right; **Transactions** (module doc, #1238 closed 2026-10-10): the pin
-(`scripts/upgrade-from.txt`) is `f6709564`, which contains `efcaa6cb`, so the
+(`scripts/upgrade-from.txt`) is `f97451d58` (since 2026-10-23, #1355; it contains #1251 and so `efcaa6cb`, and runs a
+version era of its own, cluster version 6, which the roll handles like any R-1 -> R), so the
 old `ac57d56a` defects (its own abort-tombstone bug, legacy v1 intents aborted by
 the new binary, the ungated v2 intent that panicked an R-1 replica) do not apply
 and the workload runs multi-key transactions by default (`ANIMUS_UPGRADE_FROM_TXN=0`
-turns them off). Never pin a ref older than `efcaa6cb` while transactions are on; that
+turns them off). Never pin a ref older than #1251 while transactions are on (the old `f6709564` diverged a
+restarted replica, #1355); that
 ref loses acked writes with no upgrade at all (`_CONTROL=same-binary`);
 `ANIMUS_UPGRADE_FROM_CONTROL=same-binary|current-only` runs the same
 roll with no binary change, to tell a mixed-version defect from a restart/repair
