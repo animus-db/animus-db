@@ -1642,16 +1642,16 @@ outstanding on the wire surface at present.
   (P3-C); the operator's gated `spec.image` roll behind an operator-owned
   `StatefulSet` partition, `spec.upgrade`/`status.upgrade` (P3-D); the
   `upgrade-previous-release` `ProdEnv` CI job (R-1 pinned in
-  `scripts/upgrade-from.txt`, `f6709564` until a `v*` tag exists) and the
+  `scripts/upgrade-from.txt`, `f97451d58` until a `v*` tag exists) and the
   nightly `kind` leg `E2E_UPGRADE=1` (P3-E); docs close-out (P3-F). Supported:
   a manual or operator-driven rolling upgrade R-1 -> R of a cluster of at
   least three nodes, ending in an explicit (or opted-in automatic) finalize;
   no rollback once a node ran the new binary. **Open items:** #1237
   (ungated `txn-envelope` v2 intent panics an N-1 replica) is fixed (#1240);
-  #1238 is the previous release's own abort-lookback bug (open; rolling from a
-  release older than `efcaa6cb` with transactions carries it), and the
-  transactional roll variant stays off in the previous-release job pending a
-  decision to repin R-1 past `efcaa6cb`; #1235 (a `SimCluster` Memory
+  #1238 is the previous release's own abort-lookback bug (closed 2026-10-10;
+  rolling from a release older than `efcaa6cb` with transactions carries it);
+  #1355 (closed 2026-10-23): R-1 moved to `f97451d58`, past the durable resolved
+  marker, and transactional rolls from older trees are unsupported; #1235 (a `SimCluster` Memory
   backend restart oddity); the nightly `kind` leg has not had a verified run;
   **D4(b)** (a replicated, expiring per-node maintenance mark that suppresses
   repair churn during a roll, a `Gate::Era` command) is a **pending

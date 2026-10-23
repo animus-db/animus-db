@@ -17,7 +17,8 @@
 //!   got no clean answer is `info`, never `fail`);
 //! * **availability within client retries**: the longest stretch with no
 //!   acknowledged write across the whole roll stays under [`STALL_BOUND`];
-//! * the roll converges: every `roll wait` succeeds, the version era becomes
+//! * R-1 is first finalized to its own cluster version (it runs an era of its
+//!   own), then the roll converges: every `roll wait` succeeds, the era stays
 //!   active, `can_finalize` becomes true, `roll.phase` is `ready_to_finalize`,
 //!   `animus cluster finalize` succeeds and every node observes the new
 //!   cluster version;
@@ -64,10 +65,18 @@
 //!
 //! The R-1 pin moved to `f6709564`, which contains `efcaa6cb`: its intents are
 //! v2 and carry their prior (0 and 1 do not apply), and it decodes tag 2 (2
-//! does not apply). **This has not been run locally** (the change was made
-//! where an R-1 build did not fit); the `upgrade-previous-release` CI job is
-//! the first run. Rolling with transactions *from a release older than
+//! does not apply). Rolling with transactions *from a release older than
 //! `efcaa6cb`* is unsupported (ADR 0073's 2026-10-10 amendment).
+//!
+//! **Issue #1355 (2026-10-23):** `f6709564` still had no durable resolved-txn
+//! marker and no replay fence (#1243/#1251/#1242/#1247): a replica restarted onto
+//! the current build replayed a stale `TxnStage` over R-1's engine and diverged
+//! (`[eventual-prefix]`, `[restart-all]`, about 1 run in 35). The pin moved to
+//! `f97451d58`, which has them; rolling with transactions from a tree older than
+//! #1251 is unsupported (ADR 0073's 2026-10-23 amendment). That R-1 runs a
+//! version era of its own (cluster version 6): it bootstraps with the era
+//! active, so the roll needs no era start, only the finalize steps from its
+//! active version up to this tree's `MAX_SUPPORTED`.
 //!
 //! **A missing reference binary FAILS this test** (it is feature-gated, so a
 //! job that selects it cannot silently match nothing, and the gate itself
@@ -610,6 +619,51 @@ async fn run(variant: Variant, nodes: usize) {
     );
 }
 
+/// Walk the cluster version up to the safe target (the highest version every
+/// node's binary supports), one `animus cluster finalize` per step (the CLI
+/// refuses a skip), waiting until every node observes each step. Returns the
+/// target. Used before the roll to finalize R-1 to its own maximum (an R-1 with
+/// a version era of its own must be at its max, as an operator would have it,
+/// or `roll plan` finds nothing to do: R-1 already covers the goal) and after
+/// it to finalize this tree to its `MAX_SUPPORTED`.
+async fn finalize_to_safe_target(c: &RollCluster, refs: &Refs) -> u64 {
+    let n = c.n();
+    let leader = c
+        .control_leader()
+        .await
+        .expect("a control leader before finalize");
+    let v = c
+        .admin_json(leader, "/admin/cluster-version")
+        .await
+        .expect("cluster-version");
+    let target_v = v["safe_target"].as_u64().expect("safe_target");
+    let start_v = v["active"].as_u64().expect("active");
+    for step_to in (start_v + 1)..=target_v {
+        let step_leader = c
+            .control_leader()
+            .await
+            .expect("a control leader before finalize step");
+        let step_admin = c.nodes[step_leader].admin.to_string();
+        let (ok, out, err) = cli(&refs.cli, &["cluster", "finalize", &step_admin, "--yes"]).await;
+        assert!(ok, "finalize to {step_to} failed: {out} {err}");
+        poll_until(
+            "every node observes the finalized version",
+            Duration::from_secs(60),
+            || async {
+                for i in 0..n {
+                    let v = c.admin_json(i, "/admin/cluster-version").await;
+                    if v.as_ref().map(|v| &v["active"]) != Some(&json!(step_to)) {
+                        return Err(format!("node {i}: {v:?}"));
+                    }
+                }
+                Ok(())
+            },
+        )
+        .await;
+    }
+    target_v
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "one linear scenario, read top to bottom"
@@ -685,6 +739,18 @@ async fn roll_scenario(
             .expect("bring-up: every R-1 node serves");
     }
 
+    // ---- R-1's own era --------------------------------------------------------------
+    // R-1 (`f97451d58`, since #1355) runs a version era of its own and boots at
+    // cluster version 1 with its own maximum above that. Finalize it to that
+    // maximum first, as an operator rolling R-1 -> R would have it: `roll plan`
+    // only restarts a node whose binary range misses the goal (`active + 1`),
+    // and R-1 already covers every version up to its own max. The controls
+    // that run no binary change skip it.
+    if control.is_none() {
+        let r1_max = finalize_to_safe_target(&c, refs).await;
+        eprintln!("upgrade[{name}]: R-1 finalized to its own cluster version {r1_max}");
+    }
+
     // ---- workload ---------------------------------------------------------------
     // Multi-key transactions (2PC intents) are ON by default since the R-1 pin
     // moved past `efcaa6cb` (module doc, "Transactions"; #1238).
@@ -734,11 +800,11 @@ async fn roll_scenario(
     // uses) each rolled node was started on its new binary, for the failure
     // digest to place an acked write against the roll.
     let mut restart_marks: Vec<(String, f64)> = Vec::new();
-    // The plan is taken over the Phase-1 cluster and followed in order; after
+    // The plan is taken over the finalized R-1 cluster and followed in order; after
     // every step it is asked again (from a node that is up) and must name
     // exactly the steps that are left: `plan` is re-entrant mid-roll because
-    // it probes each node's own `cluster-version` (before the era starts no
-    // node has a recorded range). `roll wait` is judged from the restarted
+    // it probes each node's own `cluster-version` (a node that has not reported yet
+    // has no recorded range). `roll wait` is judged from the restarted
     // node's own range.
     let admin0 = c.nodes[0].admin.to_string();
     let order: Vec<Value> = if control.is_some() {
@@ -1004,48 +1070,10 @@ async fn roll_scenario(
             .control_leader()
             .await
             .expect("a control leader before finalize");
-        let target_v = c
-            .admin_json(leader, "/admin/cluster-version")
-            .await
-            .expect("cluster-version")["safe_target"]
-            .as_u64()
-            .expect("safe_target");
         let leader_admin = c.nodes[leader].admin.to_string();
         // The cluster version is raised one step at a time (`cluster finalize`
-        // refuses a skip), so walk `active` up to the safe target, one
-        // finalize per step: the target is this tree's `MAX_SUPPORTED`, which
-        // is above `active + 1` whenever main has bumped the version more than
-        // once since R-1's era (G-d M1 made it 3).
-        let start_v = c
-            .admin_json(leader, "/admin/cluster-version")
-            .await
-            .expect("cluster-version")["active"]
-            .as_u64()
-            .expect("active");
-        for step_to in (start_v + 1)..=target_v {
-            let step_leader = c
-                .control_leader()
-                .await
-                .expect("a control leader before finalize step");
-            let step_admin = c.nodes[step_leader].admin.to_string();
-            let (ok, out, err) =
-                cli(&refs.cli, &["cluster", "finalize", &step_admin, "--yes"]).await;
-            assert!(ok, "finalize to {step_to} failed: {out} {err}");
-            poll_until(
-                "every node observes the finalized version",
-                Duration::from_secs(60),
-                || async {
-                    for i in 0..n {
-                        let v = c.admin_json(i, "/admin/cluster-version").await;
-                        if v.as_ref().map(|v| &v["active"]) != Some(&json!(step_to)) {
-                            return Err(format!("node {i}: {v:?}"));
-                        }
-                    }
-                    Ok(())
-                },
-            )
-            .await;
-        }
+        // refuses a skip), up to the safe target: this tree's `MAX_SUPPORTED`.
+        let target_v = finalize_to_safe_target(&c, refs).await;
         // Post-era: nothing is left to restart.
         let (_, out, err) = cli(
             &refs.cli,

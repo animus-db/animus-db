@@ -3690,3 +3690,41 @@ is `Gate::MrecReplicaOverrides` (the amendment above). The gate number is one co
 - **Rolling upgrade behaviour.** Before the finalize the six operations are refused exactly
   as before; nothing is proposed, verified or pushed. A peer on an older binary rejects the
   new `MrecControl` variants and the sender retries until it upgrades.
+
+### Amendment 2026-10-23: R-1 moves past the durable resolved marker; transactional rolls from older trees unsupported (#1355)
+
+Maintainer decision on #1355 (`upgrade_previous_release` `clean_3_nodes` failed
+`[eventual-prefix]` and `[restart-all]` on one CI run, about 1 in 35+).
+
+- **The mechanism.** The previous pin `f6709564` rejects a stale or duplicate
+  `TxnStage` only from in-memory `recently_resolved` and writes no durable
+  resolved marker (#1243, #1251) and no replay fence (#1242, #1247). A replica
+  restarted onto the current build replays a short log tail
+  (`COMPACT_THRESHOLD = 64`) over the engine R-1 wrote. A stale stage in that tail
+  whose resolve was compacted away finds no marker and no newer row version, so it
+  is accepted: it plants an intent on that one replica, and a later re-resolve
+  rewrites the key to the old staged value. The replica diverges (the
+  `ConsistentRead: false` read shows an older prefix, later appends on top of it).
+  No apply-side rule in the current build can tell "never resolved" from "resolved
+  by a binary that wrote no marker": skipping entries at or below the engine's max
+  row version is unsafe because `SeedBatch` carries source-cluster versions. So
+  the fix is on the support side, as for `efcaa6cb`.
+- **The pin.** `scripts/upgrade-from.txt` moved from `f6709564` to `f97451d58`
+  (`main` after PR #1351, 2026-10-21, all checks green). It contains #1243, #1251,
+  #1242, #1247 and the LSM multi-block read fix #1324, and it is not `main`'s tip.
+  Unlike `f6709564` it is past P2-C: it runs a version era of its own (cluster
+  version 6), so the previous rule (b) of the 2026-10-10 amendment (predate #1201)
+  is dropped; the harness no longer assumes a Phase 1 build.
+- **Support statement.** A rolling upgrade *from* a tree containing #1251, with
+  multi-item transactions in use, is supported and is what the job runs. Rolling
+  *from* an older tree (any release before 2026-10-06's #1243/#1251 stack) with
+  transactions in use is **unsupported**. The operator guidance is the same as for
+  `efcaa6cb`: stop issuing multi-item transactions and wait until every in-flight
+  one has resolved before the first node restarts on the new binary, so no stale
+  stage can be replayed over an engine without markers. Untested.
+- **Evidence.** `legacy_r1_mixed_stage` keeps the model of the old binary
+  (`legacy-r1-model`): the stale-stage-in-a-restarted-replica's-tail cell asserts
+  the divergence as documentation of the unsupported path, with an all-current
+  control that stays identical.
+- Docs updated in the same change: root and `animusd` and `animus-cp-data`
+  `CLAUDE.md`, `docs/runbook/upgrade.md`, `docs/release.md`, `docs/roadmap.md`.

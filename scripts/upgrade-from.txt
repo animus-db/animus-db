@@ -2,15 +2,19 @@
 # (ADR 0073 Phase 3, D10; docs/release.md checklist). One git ref (a tag or a
 # commit SHA) on the first non-comment line; nothing else.
 #
-# Until the first `v*` tag exists this is f6709564, the tip of PR #1205: the
-# oldest CI-green tree on `main`'s history that contains `efcaa6cb` (an intent
-# carries the committed value it shadows, ADR 0018 section 2; #1238), and still
-# before the node wiring that starts a version era in production (P2-C, #1201),
-# so it behaves as a Phase 1 build for the roll (no `cluster-version` endpoint).
-# It replaced `ac57d56a` (the last Phase 1 tree, which predates `efcaa6cb` and
-# loses acked writes under transactions even with no upgrade) on 2026-10-10.
+# Until the first `v*` tag exists this is f97451d58, `main` after PR #1351
+# (2026-10-21), CI green. It contains the durable resolved-txn marker (#1243,
+# #1251: markers ship in every snapshot image), the replay fences (#1242,
+# #1247) and the LSM multi-block read fix (#1324), and it runs a version era
+# of its own (cluster version 6): the roll starts from an era-active R-1.
+# It replaced `f6709564` (2026-10-23, issue #1355): that tree rejects a stale
+# or duplicate `TxnStage` only from in-memory state, so a replica restarted
+# onto the current build replayed a stale stage over R-1's engine and
+# diverged. Rolling with transactions from a tree older than #1251 is
+# unsupported (ADR 0073's 2026-10-23 amendment). Before it: `ac57d56a`
+# (replaced 2026-10-10, predates `efcaa6cb`).
 # Once a release R-1 is tagged, cutting release R moves this to R-1's tag in
 # the release PR and re-runs the `upgrade-previous-release` job green BEFORE
-# tagging R (docs/release.md). Never pin a ref older than `efcaa6cb` again
-# while the job runs transactions.
-f6709564864dbfb72879a96fd5303b12d5ebfb75
+# tagging R (docs/release.md). Never pin a ref older than #1251 again while
+# the job runs transactions.
+f97451d58b69ae541572b6cf7dd4c133a91149d0
