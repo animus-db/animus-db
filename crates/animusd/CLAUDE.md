@@ -3320,8 +3320,10 @@ txn_serializable.rs`'s own `push`/`resolver_tick`.
 
 **`RECOVERY_GRACE` after a restart (issue #1204)**: `txn_recover`'s grace
 gate compares `created_ts.wall_ms` (an HLC, re-seeded from the engine's
-high-water mark at start) with `env.now()` (`ProdEnv`: process uptime, near
-zero after a restart), so a restarted cluster refused to recover an in-doubt
+high-water mark at start) with `env.now()` (`ProdEnv`: process uptime until 2026-10-23, near
+zero after a restart; `now()` is now calendar-anchored at boot, which also
+unfroze the cluster HLC wall after a full restart rotation, see
+`docs/lessons/code-patterns/2026-10-23-a-process-uptime-clock-...`), so a restarted cluster refused to recover an in-doubt
 intent, and a consistent read of its key hung, until uptime caught up with the
 old incarnation's. The gate now also opens once *this node* has watched the
 txn in doubt for a grace on its own clock (`ClusterEdgeState::

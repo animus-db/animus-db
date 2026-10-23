@@ -320,6 +320,11 @@ the production implementation; the deterministic implementation lives in
   supertrait's methods are in scope from the bound — you do **not** need to
   `use animus_env::Clock` etc. in generic code (doing so trips an unused-import
   warning).
+- `ProdEnv::now()` is **calendar-anchored**: boot wall-clock ns since the Unix
+  epoch plus monotonic elapsed (2026-10-23). It used to be process uptime, which
+  froze the HLC wall after every node had restarted once (LSM GC grace and the
+  read ceiling stopped elapsing). It is still monotone and never re-reads the
+  calendar after boot; it is not a substitute for `wall_now()` on TTL data.
 - `Network::send` is fire-and-forget (no delivery result); `recv` is
   **single-consumer per node** — never run two receive loops on one `NodeId`.
   **`ProdEnv::send_stream` actually honors that contract now (issue #661)**:
