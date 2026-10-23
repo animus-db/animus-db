@@ -765,7 +765,14 @@ fn control_wal_fixture_restarts_with_current_code() {
                 Some(BTreeSet::from([nid(3)])),
                 "seed={seed}"
             );
-            assert_eq!(state.log, vec![upsert_entry(1, 3, 2)], "seed={seed}");
+            // The fixture is a synthetic "one of each record" file whose
+            // `Snapshot` comes AFTER an `Append`. No binary ever wrote that
+            // order (a rewritten image starts with its `Snapshot`), and since
+            // issue #1368 a `Snapshot` record resets the replayed log to its
+            // base (an installed snapshot logs one mid-file), so entry 1 --
+            // at or below the base 5 -- does not survive it. The records
+            // above are unchanged; only their replay differs.
+            assert!(state.log.is_empty(), "seed={seed}: {:?}", state.log);
         });
     }
 }

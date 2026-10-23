@@ -25,6 +25,7 @@ mod global_table_apply;
 mod growth_join_self_inclusive_boot;
 mod halted_gate_apply_and_wal_fault;
 mod install_snapshot;
+mod install_snapshot_wal_replay;
 mod leader_within_hysteresis;
 mod leadership_transfer;
 mod learner_corpus;

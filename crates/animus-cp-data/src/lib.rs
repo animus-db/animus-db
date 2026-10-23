@@ -13328,6 +13328,21 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             }
         }
     };
+    // Issue #1368: a replayed log whose entries are not at their own
+    // positions would be silently misread (term checks and the apply labels
+    // are positional), and surfaces much later as an `assert_ts_monotonic`
+    // panic on the apply task. Same doctrine as an undecodable WAL: loud, and
+    // halted before this group can vote, campaign or apply anything.
+    if let Err(e) = state.check_log_contiguous() {
+        tracing::error!(
+            error = %e,
+            stream,
+            "raftkv WAL replays to a misaligned log; refusing to recover from \
+             it - halting this tablet group"
+        );
+        halted.store(true, Ordering::SeqCst);
+        return;
+    }
     // Witnessing point (ADR 0018 §2 amendment): "WAL recovery, each recovered
     // entry." Every command this node ever durably logged for this group —
     // applied or not yet — must be witnessed before this node ever mints or
@@ -13445,6 +13460,14 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
         .unwrap_or(0);
     engine_applied.store(engine_watermark, Ordering::SeqCst);
     applied_watch.bump(engine_watermark);
+    // Issue #1368: an installed snapshot's base move reaches the WAL at once
+    // (in log order with the appends that follow it), not only with the
+    // apply task's later rewrite. The WAL base can then run ahead of the
+    // engine's install across a crash, which the `state_machine_behind`
+    // seed just below (issue #554) recovers from.
+    core.lock()
+        .expect("raftkv core poisoned")
+        .set_wal_records_install(true);
     // Issue #1229: an in-place split child's engine was cloned from its
     // parent (ADR 0058), so its pre-fork rows are in no log entry. The
     // durable trim marker identifies such a group (it survives restarts,

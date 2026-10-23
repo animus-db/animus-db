@@ -3487,3 +3487,20 @@ A new variant must pick a class. Test: `tests/it/transport_class.rs`.
 - The gate number is `version::LEGACY_GLOBAL_TABLES_VERSION` (9). Rows: `required_gate`, mirror
   (schema-only arms), `sim_versions` content gate and matrix (a `Release(9)` column), relay list in
   `animus-node`. Fixture: `metadata/v1-legacy-global.json`. Tests: `tests/it/legacy_global_apply.rs`.
+
+## Installed snapshot reaches the WAL in log order (issue #1368)
+
+`PersistedState::replay` is **positional**, and a `WalRecord::Snapshot` now
+**resets the replayed log** (it is either the first record of a rewritten image
+or the record an install emits right after clearing the log; a no-op in every
+pre-existing WAL, so no format change and no new fixture). With
+`RaftCore::set_wal_records_install(true)` (set by the `animus-cp-data` driver
+only) `handle_install_snapshot` queues that record at once, so the base move is
+durable in order with the `AppendEntries` that follow it instead of only with
+the apply task's later rewrite. The control plane keeps it off: its WAL must
+never run ahead of its engine (`state_machine_behind` is a data-plane
+recovery). Both drivers call `PersistedState::check_log_contiguous` after
+replay and halt loudly on a misaligned log. Regression tests:
+`tests/it/install_snapshot_wal_replay.rs` and cp-data
+`tests/it/install_snapshot_crash_window.rs`. Lesson:
+`docs/lessons/code-patterns/2026-10-23-a-positional-wal-replay-needs-every-log-reshaping-event-in-the-wal.md`.
