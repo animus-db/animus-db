@@ -444,3 +444,57 @@ fn a_resurrected_intent_blocks_a_later_acked_transaction_on_one_replica() {
         );
     }
 }
+
+/// Issue #1355: the same hazard through a plain RESTART instead of a snapshot.
+/// A node rolled from R-1 to the current build re-applies its recovered log
+/// tail (from the log's compaction base, which log compaction keeps at tens of
+/// entries) over an engine R-1 wrote. A stale stage inside that tail was
+/// rejected live by R-1's in-memory guard; the resolve that guard remembered
+/// was compacted away, so the replay finds no marker (R-1 wrote none) and no
+/// later version on the key, and accepts the stage: an intent exists on the
+/// restarted replica only, which later rewrites the key to the old transaction
+/// value and so loses acked appends there (the eventual-read prefix violation
+/// on key 20 in `upgrade-previous-release`, `clean_3_nodes`).
+#[test]
+fn a_replica_restarted_from_r1_resurrects_a_stale_stage_in_its_replayed_tail() {
+    for seed in seeds() {
+        let mut r = rig(seed, [true; 3]);
+        let l = r.leader();
+        r.stage_and_resolve(l);
+        r.compact_leader(l);
+        // The stale stage lands after the compaction base, so it is in every
+        // replica's replay tail while its resolve is not.
+        r.dup_stage();
+        assert_identical(&r, "all R-1, stale stage rejected from memory");
+        let fol = (0..3).find(|&i| i != l).unwrap();
+        r.sim.stop(nid(fol as u64));
+        r.nodes[fol] = start_node(&r.sim, fol as u64, r.engines[fol].clone(), false);
+        r.sim.run_for(ELECT);
+        let rows = r.base_rows();
+        assert_ne!(
+            rows[fol], rows[l],
+            "HAZARD EXPECTED: the replica restarted on the current build replays the stale \
+             stage its R-1 peers rejected (seed={seed}): {rows:?}"
+        );
+    }
+}
+
+/// Control for the cell above: the identical schedule on an all-current
+/// cluster (markers written live, so the replayed tail agrees with the live
+/// decision) stays replica-identical. The mix, not the restart, diverges.
+#[test]
+fn control_a_restarted_current_replica_replays_a_stale_stage_identically() {
+    for seed in seeds() {
+        let mut r = rig(seed, [false; 3]);
+        let l = r.leader();
+        r.stage_and_resolve(l);
+        r.compact_leader(l);
+        r.dup_stage();
+        assert_identical(&r, "all current, stale stage rejected from the marker");
+        let fol = (0..3).find(|&i| i != l).unwrap();
+        r.sim.stop(nid(fol as u64));
+        r.nodes[fol] = start_node(&r.sim, fol as u64, r.engines[fol].clone(), false);
+        r.sim.run_for(ELECT);
+        assert_identical(&r, "all current, after a restart replaying the tail");
+    }
+}
