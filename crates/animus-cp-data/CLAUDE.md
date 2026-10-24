@@ -857,10 +857,12 @@ State once here; cross-referenced from the sections below.
   **term** — see below).** A proposer can now tell "my entry no-op'd"
   (`ConditionFailed`/`Sealed`) from "applied" without falling back to a bare
   value-equality read, mirroring `Cas`'s `CasResults`/`TxnStage`'s
-  `StageOutcomes`. **Bounded, unlike those two** (a `KindBatch` proposes for
-  *every* indexed or streamed write, not just a CAS or a transaction, so an
-  unpruned map would grow without limit) — an aged-out entry falls back to
-  the value probe, the pre-existing behavior before this channel existed.
+  `StageOutcomes`. All four are one generic `TermOutcomes<T>` (issue #1383),
+  **bounded** to `RETAIN` indices behind the newest (a `KindBatch` proposes
+  for *every* write, so an unpruned map would grow without limit) — an
+  aged-out entry reads as `None` = unconfirmed (a `KindBatch` proposer falls
+  back to the value probe, the pre-existing behavior before this channel
+  existed; CAS/stage/resolve give up and the caller retries).
   **`Applied` alone is not a confirm of success — the identical
   "index means no-op-vs-failure, never success" discipline `StageOutcome`'s
   own doc states, and the coordinator-side `txn_verify_staged` enforces for
