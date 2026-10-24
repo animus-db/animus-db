@@ -469,7 +469,8 @@ async fn flush_loop<E: Env>(inner: Arc<BatcherInner<E>>) {
 /// an entry naming an unknown/not-hosted stream is dropped and counted
 /// ([`Metric::CpHeartbeatDemuxDropped`]), never delivered and never a panic
 /// — an ordinary, harmless race against a group being released or not yet
-/// hosted. A malformed frame (a corrupt payload, or a decoded [`KvWire`]
+/// hosted. An entry whose message is not `RaftMsg::AppendEntries` is dropped
+/// and counted the same way (#1381). A malformed frame (a corrupt payload, or a decoded [`KvWire`]
 /// variant other than [`KvWire::HeartbeatBatch`] arriving on this reserved
 /// stream — which nothing in this codebase sends, but a hostile/buggy peer
 /// could) is logged and dropped whole, the same discipline the ordinary
@@ -480,6 +481,19 @@ async fn demux_loop<E: Env>(inner: Arc<BatcherInner<E>>) {
         match codec::decode_wire(&envelope.payload) {
             Ok(KvWire::HeartbeatBatch(entries)) => {
                 for (stream, msg) in entries {
+                    // #1381: the codec accepts any `RaftMsg` in an entry, but
+                    // the sender only ever batches bare `AppendEntries`
+                    // heartbeats and `drive` treats anything else as
+                    // unreachable. Drop (count + warn) a hostile/buggy
+                    // peer's other variant here, before it reaches an inbox.
+                    if !matches!(msg, RaftMsg::AppendEntries { .. }) {
+                        tracing::warn!(
+                            stream,
+                            "non-AppendEntries entry in heartbeat batch frame dropped (#1381)"
+                        );
+                        inner.metrics.incr(Metric::CpHeartbeatDemuxDropped);
+                        continue;
+                    }
                     let inbox = inner
                         .hosted
                         .lock()
@@ -511,7 +525,7 @@ async fn demux_loop<E: Env>(inner: Arc<BatcherInner<E>>) {
 #[cfg(test)]
 mod tests {
     use animus_control::raft::RaftMsg;
-    use animus_env::{Metric, MetricsHandle, nid};
+    use animus_env::{Metric, MetricsHandle, Network, nid};
     use animus_sim::{SimEnv, Simulator};
 
     use super::*;
@@ -626,5 +640,52 @@ mod tests {
         }
         sim.run_for(DEFAULT_HEARTBEAT_BATCH_INTERVAL * 2);
         assert_eq!(metrics_a.get(Metric::CpHeartbeatFramesSent), 3);
+    }
+
+    /// #1381: a hostile/buggy peer's frame entry whose message is not a bare
+    /// `AppendEntries` is dropped and counted at the demux, never pushed into
+    /// the group's inbox (where `drive` would hit its `unreachable!`), while
+    /// a valid `AppendEntries` entry in the same frame is still delivered.
+    #[test]
+    fn non_append_entries_entry_is_dropped_and_valid_one_delivered() {
+        let mut sim = Simulator::new(0xB47C_1381);
+        let env_a: SimEnv = sim.env(nid(0));
+        let env_b: SimEnv = sim.env(nid(1));
+        let metrics_b = MetricsHandle::recording();
+        let batcher_b = HeartbeatBatcher::new(
+            env_b.clone(),
+            DEFAULT_HEARTBEAT_BATCH_INTERVAL,
+            metrics_b.clone(),
+        );
+        let inbox7 = batcher_b.register_hosted(7);
+        let inbox8 = batcher_b.register_hosted(8);
+
+        let frame = KvWire::HeartbeatBatch(vec![
+            (
+                7,
+                RaftMsg::RequestVote {
+                    term: 3,
+                    candidate: nid(0),
+                    last_log_index: 0,
+                    last_log_term: 0,
+                },
+            ),
+            (8, heartbeat(3, nid(0))),
+        ]);
+        let payload = codec::encode_wire(&frame, &ClusterFeatures::new());
+        let sender = env_a.clone();
+        env_a.spawn_task(async move {
+            sender
+                .send_stream(nid(1), HEARTBEAT_BATCH_STREAM, payload)
+                .await;
+        });
+        sim.run_for(DEFAULT_HEARTBEAT_BATCH_INTERVAL * 3);
+
+        assert!(
+            inbox7.queue.lock().unwrap().is_empty(),
+            "non-AppendEntries entry must not reach the inbox"
+        );
+        assert_eq!(inbox8.queue.lock().unwrap().len(), 1);
+        assert_eq!(metrics_b.get(Metric::CpHeartbeatDemuxDropped), 1);
     }
 }
