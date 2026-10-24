@@ -1850,6 +1850,78 @@ struct ReadState {
     ack_generation: u64,
 }
 
+/// The apply-time outcome registry every outcome-introspection primitive
+/// shares ([`CasResults`], [`StageOutcomes`], [`ResolveOutcomes`],
+/// [`KindBatchOutcomes`]): `Raft log index -> (term, outcome)`, filled by the
+/// apply loop on **every** replica (the decision is deterministic in commit
+/// order against the same committed engine state) and read back only by the
+/// proposer that appended the entry.
+///
+/// **The term is load-bearing, not incidental.** An entry a proposer
+/// appended but never committed (a leadership change truncated it) can have
+/// its log position reoccupied by a *different* command, which then applies
+/// and records an outcome at the identical index — index alone cannot tell
+/// that apart from the proposer's own entry having applied. [`get`](Self::get)
+/// therefore returns a record only when the caller's own accepted term
+/// matches (Raft's log-matching property makes `(index, term)` a sound proof
+/// of entry identity).
+///
+/// **Bounded (issue #1383).** Every `Cas`/`TxnStage`/`TxnResolve`/`KindBatch`
+/// apply records here, so an unpruned map grows without limit on a
+/// long-lived node. A record is only useful to a proposer polling within
+/// `CAS_TIMEOUT`/`CLIENT_TIMEOUT` of its own propose, so [`record`](Self::record)
+/// drops everything more than [`RETAIN`](Self::RETAIN) indices behind the
+/// newest. Dropping is safe because a missing record already means
+/// *unconfirmed* to every reader — the same `None` a not-yet-applied index, a
+/// term mismatch, or a snapshot install that skipped the index (the engine
+/// image globs the entry's effect in without a per-entry outcome) already
+/// produces: `compare_and_swap`/`wait_stage_outcome`/`wait_resolve_outcome`
+/// give up and the caller retries or treats the write as ambiguous, never as
+/// definitively failed, and a `KindBatch` proposer falls back to the value
+/// probe. No reader consults an index long after its apply, and the maps are
+/// in-memory only (empty at restart).
+struct TermOutcomes<T> {
+    outcomes: BTreeMap<u64, (u64, T)>,
+}
+
+impl<T> Default for TermOutcomes<T> {
+    fn default() -> Self {
+        Self {
+            outcomes: BTreeMap::new(),
+        }
+    }
+}
+
+impl<T> TermOutcomes<T> {
+    /// Indices retained behind the newest. Generous next to the poll window
+    /// (`CLIENT_TIMEOUT`) while keeping the map small enough to be free.
+    const RETAIN: u64 = 8192;
+
+    fn record(&mut self, index: u64, term: u64, outcome: T) {
+        self.outcomes.insert(index, (term, outcome));
+        // Prune in batches rather than on every insert: `split_off` allocates,
+        // and doing it once per 8192 writes is not worth measuring.
+        if self.outcomes.len() > (Self::RETAIN as usize) * 2 {
+            let cutoff = index.saturating_sub(Self::RETAIN);
+            self.outcomes = self.outcomes.split_off(&cutoff);
+        }
+    }
+
+    /// The outcome recorded at `index`, only if it was recorded under `term`.
+    fn get(&self, index: u64, term: u64) -> Option<&T> {
+        match self.outcomes.get(&index) {
+            Some((recorded_term, outcome)) if *recorded_term == term => Some(outcome),
+            _ => None,
+        }
+    }
+
+    /// The `(term, outcome)` recorded at `index`, whatever its term — for the
+    /// caller that compares the term itself (see `kind_batch_outcome`).
+    fn get_with_term(&self, index: u64) -> Option<&(u64, T)> {
+        self.outcomes.get(&index)
+    }
+}
+
 /// Per-CAS outcomes recorded at apply time, keyed by the entry's **Raft log
 /// index** (the value [`ProposeResult::Accepted`] hands the proposer) and
 /// paired with the entry's own **term** — `true` if the swap happened,
@@ -1859,18 +1931,12 @@ struct ReadState {
 /// entry is applied, then reads its index here (see
 /// [`RaftKvNode::cas_result`] / [`RaftKvNode::compare_and_swap`]).
 ///
-/// **The term is load-bearing, not incidental** (mirrors
-/// [`KindBatchOutcomes`]' own doc): an entry this proposer appended but
-/// never committed (a leadership change truncated it) can have its log
-/// position reoccupied by a *different* `Cas`, which then applies and
-/// records an outcome at the identical index — index alone cannot tell that
-/// apart from the proposer's own entry having applied. `cas_result` requires
-/// the caller's own accepted term to match before ever returning the
-/// recorded outcome as this proposer's own.
-#[derive(Default)]
-struct CasResults {
-    outcomes: BTreeMap<u64, (u64, bool)>,
-}
+/// **The term is load-bearing, not incidental** (see [`TermOutcomes`]):
+/// `cas_result` requires the caller's own accepted term to match before ever
+/// returning the recorded outcome as this proposer's own. Bounded like every
+/// [`TermOutcomes`] registry (issue #1383): a pruned record reads as `None`,
+/// i.e. unconfirmed.
+type CasResults = TermOutcomes<bool>;
 
 /// What a `KindBatch` entry actually did at apply time — the introspection
 /// channel `TxnStage` has via [`StageOutcome`] and `Cas` via
@@ -1959,32 +2025,12 @@ pub enum KindBatchOutcome {
 /// [`CasResults`]/[`StageOutcomes`] plus the term identity check
 /// [`KindBatchOutcome`]'s doc explains.
 ///
-/// **Bounded, unlike those two.** A `KindBatch` is proposed for *every*
-/// indexed or streamed write, not just for a CAS or a transaction, so an
-/// unpruned map would grow without limit on a busy table. Entries are only
-/// useful to a proposer polling within `CLIENT_TIMEOUT`, so old ones are
-/// dropped; a proposer that finds no record (or a term mismatch) falls back
-/// to the value probe, which is exactly today's behaviour.
-#[derive(Default)]
-struct KindBatchOutcomes {
-    outcomes: BTreeMap<u64, (u64, KindBatchOutcome)>,
-}
-
-impl KindBatchOutcomes {
-    /// Indices retained behind the newest. Generous next to the poll window
-    /// (`CLIENT_TIMEOUT`) while keeping the map small enough to be free.
-    const RETAIN: u64 = 8192;
-
-    fn record(&mut self, index: u64, term: u64, outcome: KindBatchOutcome) {
-        self.outcomes.insert(index, (term, outcome));
-        // Prune in batches rather than on every insert: `split_off` allocates,
-        // and doing it once per 8192 writes is not worth measuring.
-        if self.outcomes.len() > (Self::RETAIN as usize) * 2 {
-            let cutoff = index.saturating_sub(Self::RETAIN);
-            self.outcomes = self.outcomes.split_off(&cutoff);
-        }
-    }
-}
+/// Bounded like every [`TermOutcomes`] registry (issue #1383), and the
+/// bound matters most here: a `KindBatch` is proposed for *every* indexed or
+/// streamed write, not just for a CAS or a transaction. A proposer that
+/// finds no record (or a term mismatch) falls back to the value probe, which
+/// is exactly today's behaviour.
+type KindBatchOutcomes = TermOutcomes<KindBatchOutcome>;
 
 /// The **leader-local** result payload of one `KvCommand::KindEval` entry
 /// (ADR 0054 mechanism 3): the item immediately before and after the write
@@ -2051,7 +2097,7 @@ struct KindEvalResults {
 }
 
 impl KindEvalResults {
-    /// Same generous bound as [`KindBatchOutcomes::RETAIN`], for the
+    /// Same generous bound as [`TermOutcomes::RETAIN`], for the
     /// identical reason: a slot nobody ever reads back (a confirm loop that
     /// gave up, or this node losing leadership before polling) must not
     /// grow either map without bound.
@@ -2189,10 +2235,7 @@ impl KindEvalBatchResults {
 /// the identical index. `stage_outcome`/`wait_stage_outcome` require the
 /// caller's own accepted term to match before ever returning the recorded
 /// outcome as this proposer's own.
-#[derive(Default)]
-struct StageOutcomes {
-    outcomes: BTreeMap<u64, (u64, StageOutcome)>,
-}
+type StageOutcomes = TermOutcomes<StageOutcome>;
 
 /// Per-`TxnResolve` outcomes recorded at apply time, keyed by the entry's
 /// **Raft log index** and paired with the entry's own **term** — the
@@ -2211,10 +2254,7 @@ struct StageOutcomes {
 /// outcome at the identical index. `resolve_outcome`/`wait_resolve_outcome`
 /// require the caller's own accepted term to match before ever returning
 /// the recorded outcome as this proposer's own.
-#[derive(Default)]
-struct ResolveOutcomes {
-    outcomes: BTreeMap<u64, (u64, ResolveOutcome)>,
-}
+type ResolveOutcomes = TermOutcomes<ResolveOutcome>;
 
 /// This group's own in-memory index of the transaction records it holds
 /// (ADR 0018 §2/PR5) — populated **only** on a group that anchors at least
@@ -5386,16 +5426,11 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// exactly; see [`StageOutcome`]'s doc for what each variant means to a
     /// caller once confirmed.
     pub fn stage_outcome(&self, index: u64, term: u64) -> Option<StageOutcome> {
-        match self
-            .stage
+        self.stage
             .lock()
             .expect("stage outcomes poisoned")
-            .outcomes
-            .get(&index)
-        {
-            Some((recorded_term, outcome)) if *recorded_term == term => Some(outcome.clone()),
-            _ => None,
-        }
+            .get(index, term)
+            .cloned()
     }
 
     /// Poll [`resolve_outcome`](Self::resolve_outcome) for `(index, term)`
@@ -5432,16 +5467,11 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// exactly; see [`ResolveOutcome`](txn::ResolveOutcome)'s doc for what
     /// each variant means to a caller once confirmed.
     pub fn resolve_outcome(&self, index: u64, term: u64) -> Option<txn::ResolveOutcome> {
-        match self
-            .resolve
+        self.resolve
             .lock()
             .expect("resolve outcomes poisoned")
-            .outcomes
-            .get(&index)
-        {
-            Some((recorded_term, outcome)) if *recorded_term == term => Some(outcome.clone()),
-            _ => None,
-        }
+            .get(index, term)
+            .cloned()
     }
 
     /// What the `KindBatch` committed at Raft log `index` actually did, paired
@@ -5467,8 +5497,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         self.kind_outcomes
             .lock()
             .expect("kind batch outcomes poisoned")
-            .outcomes
-            .get(&index)
+            .get_with_term(index)
             .cloned()
     }
 
@@ -5484,16 +5513,11 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// replica records the identical outcome (the decision is deterministic
     /// in commit order).
     pub fn cas_result(&self, index: u64, term: u64) -> Option<bool> {
-        match self
-            .cas
+        self.cas
             .lock()
             .expect("cas results poisoned")
-            .outcomes
-            .get(&index)
-        {
-            Some((recorded_term, swapped)) if *recorded_term == term => Some(*swapped),
-            _ => None,
-        }
+            .get(index, term)
+            .copied()
     }
 
     /// Propose a CAS on the leader and **wait for its committed outcome**: returns
@@ -10360,8 +10384,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 };
                 cas.lock()
                     .expect("cas results poisoned")
-                    .outcomes
-                    .insert(index, (term, swapped));
+                    .record(index, term, swapped);
             }
             KvCommand::Freeze { ts } => {
                 assert_ts_monotonic(
@@ -11159,8 +11182,7 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                 stage
                     .lock()
                     .expect("stage outcomes poisoned")
-                    .outcomes
-                    .insert(index, (term, outcome));
+                    .record(index, term, outcome);
             }
             // R-01 F-2 (fourth mechanism): a SEAL-CHECKED txn DECISION whose
             // record key falls in a range this group has already sealed (the
@@ -11889,11 +11911,11 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                             .unresolved_decided
                             .remove(&txn_id);
                     }
-                    resolve
-                        .lock()
-                        .expect("resolve outcomes poisoned")
-                        .outcomes
-                        .insert(index, (term, resolve_outcome));
+                    resolve.lock().expect("resolve outcomes poisoned").record(
+                        index,
+                        term,
+                        resolve_outcome,
+                    );
                 }
             }
             // No `assert_ts_monotonic` call here, deliberately: `NoOp` carries
@@ -15840,5 +15862,34 @@ mod applied_watch_tests {
 
         watch.bump(5); // repeats the current value -- also a no-op
         assert!(!woken.woken());
+    }
+}
+
+/// Issue #1383: every apply-time outcome registry must stay bounded, keep
+/// recent records readable, and read pruned records or a wrong term as `None`.
+#[cfg(test)]
+mod outcome_registry_bound_tests {
+    use super::*;
+
+    const CAP: usize = (TermOutcomes::<()>::RETAIN as usize) * 2 + 1;
+
+    fn exercise<T: Clone + PartialEq + std::fmt::Debug>(mut reg: TermOutcomes<T>, v: T) {
+        let n = TermOutcomes::<()>::RETAIN * 2 + 1000;
+        for i in 1..=n {
+            reg.record(i, 7, v.clone());
+        }
+        assert!(reg.outcomes.len() <= CAP, "len {}", reg.outcomes.len());
+        assert_eq!(reg.get(n, 7), Some(&v), "newest, right term");
+        assert_eq!(reg.get(n, 8), None, "right index, wrong term");
+        assert_eq!(reg.get(1, 7), None, "pruned index");
+        assert_eq!(reg.get(n + 1, 7), None, "not yet applied");
+    }
+
+    #[test]
+    fn cas_stage_resolve_kind_batch_registries_stay_bounded() {
+        exercise(CasResults::default(), true);
+        exercise(StageOutcomes::default(), StageOutcome::Staged);
+        exercise(ResolveOutcomes::default(), ResolveOutcome::Resolved);
+        exercise(KindBatchOutcomes::default(), KindBatchOutcome::Applied);
     }
 }
