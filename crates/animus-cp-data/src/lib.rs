@@ -13990,7 +13990,8 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
                     RaftMsg::AppendEntries { leader, .. } => leader.clone(),
                     other => unreachable!(
                         "HeartbeatBatcher only ever demuxes bare AppendEntries \
-                             heartbeats, got {other:?}"
+                             heartbeats (demux_loop drops other variants, #1381), \
+                             got {other:?}"
                     ),
                 };
                 witness_append_entries(&hlc, &msg, env.now());
