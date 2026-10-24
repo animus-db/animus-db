@@ -432,19 +432,22 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
 - **A group-commit leader's failed `flush_batch` surfaces its own error text
   to every waiter, not just a generic prefix** (issue #939, 2026-09-19).
   `GroupCommit::Inner::failed_error` keeps the *first* failure's
-  `StorageError`/`io::Error` text alongside `failed_through`; every writer
+  `StorageError`/`io::Error` text alongside the `failed` ranges; every writer
   whose record was in that lost batch (the leader itself, and any later
-  waiter that observes `failed_through >= my_seq`) gets
+  waiter that finds `my_seq` in a failed range) gets
   `StorageError::Backend("wal group-commit sync failed: {leader_err}")` — the
   same `"wal group-commit sync failed"` prefix any existing grep/log consumer
   matches, plus the real cause (a full disk, a permissions error, a torn
-  write) that used to be discarded at the `Err(_) => failed_through = ...`
+  write) that used to be discarded at the `Err(_)`
   arm. The leader also logs once via `tracing::error!` (segment, batch byte
   count, `up_to`) at the point of failure — this crate's first `tracing`
   dependency (`workspace = true`, already declared root-level). No change to
-  `durable_seq`/`failed_through` semantics, the wake-all-waiters behavior, or
+  `durable_seq` semantics, the wake-all-waiters behavior, or
   segment rotation. Regression:
   `lsm_group_commit.rs::leader_sync_error_surfaces_underlying_disk_text_to_every_waiter`.
+  Failures are tracked as exact `(lo, up_to]` ranges (`Inner::failed`, resolved
+  by `Inner::settled`), not one high-water mark, so a durable record is never
+  reported failed by a later batch's failure (issue #1382).
 - **Each WAL record is framed `len(u32 BE) | crc32(u32 BE) | payload`** (a
   compact hand-rolled binary encoding, replacing an older newline-delimited
   `serde_json` line — a `Vec<u8>` value serialized as a decimal-number JSON
