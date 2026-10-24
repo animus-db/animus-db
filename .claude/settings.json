@@ -1,9 +1,4 @@
 {
-  "attribution": {
-    "commit": "",
-    "pr": ""
-  },
-  "includeCoAuthoredBy": false,
   "hooks": {
     "SessionStart": [
       {
