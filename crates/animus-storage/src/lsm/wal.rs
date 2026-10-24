@@ -240,16 +240,22 @@ struct Inner {
     /// Writers parked waiting for their sequence to become durable, keyed by the
     /// sequence they are waiting on (`BTreeMap` for deterministic iteration).
     waiters: BTreeMap<u64, Vec<Waker>>,
-    /// Set when a leader's batch `append`/`sync` failed: every writer whose record
-    /// was in that lost batch must surface the failure rather than claim durability.
-    failed_through: u64,
+    /// Sequence ranges of lost batches, as `up_to -> lo` meaning the half-open
+    /// range `(lo, up_to]`: every writer whose record was in such a batch must
+    /// surface the failure rather than claim durability. Recorded **exactly**
+    /// (not as a single high-water mark) so a writer whose own batch was
+    /// durable is never reported as failed just because a *later* batch failed
+    /// before it re-polled (issue #1382), while a record of a failed batch is
+    /// still never reported durable even though a later successful batch
+    /// advances `durable_seq` past it. See [`Inner::settled`].
+    failed: BTreeMap<u64, u64>,
     /// The leader's own `flush_batch` error text for the *first* failure
-    /// (`failed_through`'s companion) — kept so every waiter riding that lost
+    /// (`failed`'s companion) — kept so every waiter riding that lost
     /// batch, not only the leader, can see what actually failed on disk instead
     /// of a generic "sync failed" message. Never overwritten by a later failure:
     /// the first failure is what every already-parked waiter is surfacing, and a
-    /// second, unrelated failure on a later batch gets its own `failed_through`
-    /// bump but does not need its own text (the generic prefix already names the
+    /// second, unrelated failure on a later batch gets its own `failed`
+    /// range but does not need its own text (the generic prefix already names the
     /// batch as failed; the point of this field is the *first* underlying cause).
     failed_error: Option<String>,
     /// Whether the **latest** failed batch was out-of-space (ENOSPC/EDQUOT):
@@ -369,7 +375,7 @@ impl GroupCommit {
                 pending: Vec::new(),
                 flushing: false,
                 waiters: BTreeMap::new(),
-                failed_through: 0,
+                failed: BTreeMap::new(),
                 failed_error: None,
                 failed_full: false,
                 repair_to: None,
@@ -470,10 +476,14 @@ impl GroupCommit {
         loop {
             let action = {
                 let mut inner = self.lock();
-                if inner.failed_through >= my_seq {
-                    Action::Failed
-                } else if inner.durable_seq >= my_seq {
-                    Action::Done
+                // `settled` is exact per record (see `Inner::failed`), so the
+                // order of the two outcomes cannot misreport a durable record
+                // as failed or a lost one as durable (issue #1382).
+                if let Some(settled) = inner.settled(my_seq) {
+                    match settled {
+                        Settled::Durable => Action::Done,
+                        Settled::Failed => Action::Failed,
+                    }
                 } else if inner.flushing {
                     Action::Wait
                 } else {
@@ -625,7 +635,7 @@ impl GroupCommit {
                             // log it once here, at the leader, with the detail a waiter
                             // has no way to reconstruct on its own.
                             Err(e) => {
-                                inner.failed_through = inner.failed_through.max(up_to);
+                                inner.record_failure(up_to);
                                 inner.failed_full = e.is_storage_full();
                                 if e.is_storage_full() || repair_failed {
                                     // The tail is unknown (a short write, or
@@ -798,7 +808,51 @@ enum Action {
     Wait,
 }
 
+/// How a record's commit resolved (see [`Inner::settled`]).
+#[derive(Debug, PartialEq, Eq)]
+enum Settled {
+    Durable,
+    Failed,
+}
+
 impl Inner {
+    /// Record that the batch covering `(durable_seq, up_to]` failed. Called by
+    /// the leader under the lock with `durable_seq` still the pre-batch value
+    /// (only a successful batch advances it, and only one batch flushes at a
+    /// time), so the range holds exactly the records of the lost batch. An
+    /// earlier failed range starting at the same `durable_seq` (no success in
+    /// between) is subsumed, which keeps repeated failures to one entry.
+    fn record_failure(&mut self, up_to: u64) {
+        let lo = self.durable_seq;
+        if up_to <= lo {
+            return;
+        }
+        self.failed.retain(|_, l| *l < lo);
+        self.failed.insert(up_to, lo);
+    }
+
+    /// The resolved outcome of the record with sequence `seq`, or `None` if it
+    /// is still in flight. A record is failed iff it lies in a recorded failed
+    /// range; otherwise it is durable iff `durable_seq` has reached it. The
+    /// failed check cannot be a bare `failed_through >= seq`: a later failed
+    /// batch would then override an earlier, already-durable one (#1382).
+    /// Conversely `durable_seq` alone is not enough: a later successful batch
+    /// advances it past an earlier failed batch's records.
+    fn settled(&self, seq: u64) -> Option<Settled> {
+        let failed = self
+            .failed
+            .range(seq..)
+            .next()
+            .is_some_and(|(_, &lo)| lo < seq);
+        if failed {
+            Some(Settled::Failed)
+        } else if self.durable_seq >= seq {
+            Some(Settled::Durable)
+        } else {
+            None
+        }
+    }
+
     /// Remove and return every parked waker. Called after a batch flush so each
     /// waiter re-polls: durable ones complete, the rest re-park or one leads the
     /// next batch. Draining all of them is what prevents a stranded record (a
@@ -835,7 +889,7 @@ impl Future for DurableUpTo<'_> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let mut inner = self.gc.lock();
-        if inner.durable_seq >= self.seq || inner.failed_through >= self.seq || !inner.flushing {
+        if inner.settled(self.seq).is_some() || !inner.flushing {
             Poll::Ready(())
         } else {
             inner
@@ -867,5 +921,56 @@ impl Future for YieldOnce {
             cx.waker().wake_by_ref();
             Poll::Pending
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gc() -> GroupCommit {
+        GroupCommit::new("t/".into(), &[], 1 << 20, 0, true)
+    }
+
+    /// Issue #1382: writer A's batch (seq 5) is durable, then a *later* batch
+    /// (seq 6) fails before A re-polls. A must resolve Durable, not Failed.
+    #[test]
+    fn durable_record_survives_later_batch_failure() {
+        let g = gc();
+        let mut inner = g.lock();
+        inner.durable_seq = 5; // batch N synced, A (seq 5) woken but not yet polled
+        inner.record_failure(6); // batch N+1 (seq 6) fails
+        assert_eq!(inner.settled(5), Some(Settled::Durable));
+        assert_eq!(inner.settled(6), Some(Settled::Failed));
+        assert_eq!(inner.settled(7), None);
+    }
+
+    /// The converse the precedence swap alone would break: a failed batch's
+    /// records stay failed after a later batch succeeds past them.
+    #[test]
+    fn failed_record_stays_failed_after_later_success() {
+        let g = gc();
+        let mut inner = g.lock();
+        inner.record_failure(3); // batch of seqs 1..=3 lost
+        inner.durable_seq = 4; // batch of seq 4 succeeds
+        assert_eq!(inner.settled(2), Some(Settled::Failed));
+        assert_eq!(inner.settled(3), Some(Settled::Failed));
+        assert_eq!(inner.settled(4), Some(Settled::Durable));
+        inner.record_failure(7); // later batch of 5..=7 lost
+        assert_eq!(inner.settled(3), Some(Settled::Failed));
+        assert_eq!(inner.settled(4), Some(Settled::Durable));
+        assert_eq!(inner.settled(6), Some(Settled::Failed));
+    }
+
+    /// Back-to-back failures coalesce into one range.
+    #[test]
+    fn consecutive_failures_coalesce() {
+        let g = gc();
+        let mut inner = g.lock();
+        inner.record_failure(2);
+        inner.record_failure(5);
+        assert_eq!(inner.failed.len(), 1);
+        assert_eq!(inner.settled(1), Some(Settled::Failed));
+        assert_eq!(inner.settled(5), Some(Settled::Failed));
     }
 }
