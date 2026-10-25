@@ -1934,7 +1934,7 @@ freezes that type's absent-field semantics once merged.**
     a compaction defer. A peer the log still covers keeps getting ordinary
     `AppendEntries`.
   - **Everything sent to a departing peer rides one *time-based* send gate**
-    (`departing_send_gate`, `removal_sched`, `now_hint`). Not tick-count
+    (`departing_send_gate`, `DepartingPeer::sched`, `now_hint`). Not tick-count
     based: under a sustained writer `replicate_now` keeps pushing
     `heartbeat_deadline` out, the heartbeat tick never fires, and a
     tick-counting schedule would either send a notice per write or never.
@@ -1976,7 +1976,7 @@ freezes that type's absent-field semantics once merged.**
   - **Two silence bounds, not one (2026-09-29 live check).** A departing
     peer is dropped after `DEPARTING_NOTICE_GIVE_UP` (5 min) of silence from
     its last reply — unless it is on the **short** bound,
-    `DEPARTING_QUIET_GIVE_UP` (30s): `departing_quiet` holds peers that
+    `DEPARTING_QUIET_GIVE_UP` (30s): `DepartingPeer::quiet` marks peers that
     already **acked** their notice and peers **inherited** at
     `become_leader`. Both are overwhelmingly peers that have *left* (their
     host released the replica), and a released replica can never reply, so
@@ -1986,9 +1986,9 @@ freezes that type's absent-field semantics once merged.**
     so a live peer is unaffected, and a peer cut off early is still told by
     its own campaign (`stranger_notice`). Do not collapse the two into one
     constant without re-reading why a leader's own just-made, unanswered
-    removal keeps the long one. `departing_quiet` is pruned wherever
-    `departing` shrinks (`drop_departing`, the config-change retain,
-    `become_leader`).
+    removal keeps the long one. `quiet` (like `since` and `sched`) lives in the
+    per-peer `DepartingPeer` value in `departing`, so it is dropped with the
+    entry by construction — no satellite map to prune.
   - **`RaftCore::removal_stats()` (`RemovalStats`)** are lifetime counters the
     core keeps as plain facts (`notices_sent`/`notices_acked`/
     `notices_ignored`/`departing_dropped`); the CP-data driver emits the

@@ -548,6 +548,55 @@ struct Departing {
     term: u64,
 }
 
+/// Everything this leader tracks for ONE peer in `RaftCore::departing`: the
+/// removing entry's [`Departing`] stamp plus the leader-local, volatile
+/// notice/give-up bookkeeping (issue #1061). One value per peer, so all of it
+/// is dropped together when the peer stops departing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DepartingPeer {
+    /// The config entry that removed the peer.
+    stamp: Departing,
+    /// The last time (leader-local, volatile — same class as `last_contact`)
+    /// the peer proved it is alive by sending ANY reply — `AppendEntriesResp`,
+    /// `InstallSnapshotResp` or `RemovedAck`, success or reject. Seeded lazily
+    /// by `expire_stale_departing` the first time it sees the peer with `None`
+    /// here (`log_append`, where the peer is added, has no `now` and runs on
+    /// every replica during WAL replay), so `None` reads as "just started, not
+    /// yet stale".
+    since: Option<Nanos>,
+    /// On the SHORT silence bound (`DEPARTING_QUIET_GIVE_UP` rather than
+    /// `DEPARTING_NOTICE_GIVE_UP`) (issue #1061 follow-up): the peer already
+    /// acked its removal notice yet is still owed catch-up `AppendEntries`
+    /// (the log could serve it), or this leader merely inherited it from a
+    /// predecessor (`become_leader`'s re-derivation).
+    quiet: bool,
+    /// Send schedule — `(next_allowed_send, attempts)`, gating EVERY message
+    /// this leader would send to the peer (its removal notice and any catch-up
+    /// `AppendEntries` alike; `departing_send_gate`). The first send is
+    /// immediate (`None`); each further send with no reply from the peer in
+    /// between waits twice as long as the last (from one heartbeat interval,
+    /// doubling, up to `SNAPSHOT_HEARTBEAT_BACKOFF_MAX_TICKS` heartbeats — the
+    /// same capped steady period as the snapshot-resend schedule), and ANY
+    /// reply from the peer resets it (a live peer catching up is served at
+    /// full rate; a dead one costs a couple of dozen tiny messages a minute).
+    /// Time-based, not tick-count-based, because under a sustained writer
+    /// `replicate_now` keeps pushing `heartbeat_deadline` out and the
+    /// heartbeat tick that a count-based schedule would advance on never
+    /// fires.
+    sched: Option<(Nanos, u32)>,
+}
+
+impl DepartingPeer {
+    fn new(stamp: Departing) -> Self {
+        Self {
+            stamp,
+            since: None,
+            quiet: false,
+            sched: None,
+        }
+    }
+}
+
 /// A replicated log entry, generic over the command type `C` (defaults to the
 /// control plane's [`MetaCommand`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1452,41 +1501,12 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // is sent a `RaftMsg::Removed` notice instead (`replicate_to`), and is
     // dropped from this map on the peer's `RemovedAck`, on its `match_index`
     // reaching the removing entry, or after `DEPARTING_NOTICE_GIVE_UP` of
-    // total silence (`expire_stale_departing`).
-    departing: BTreeMap<NodeId, Departing>,
-    // Issue #1061: the last time (leader-local, volatile — same class as
-    // `last_contact`) each currently-departing peer proved it is alive by
-    // sending ANY reply — `AppendEntriesResp` or `InstallSnapshotResp`,
-    // success or reject. Seeded lazily by `expire_stale_departing` the first
-    // time it sees a peer in `departing` with no entry here (`log_append`,
-    // where `departing` is populated, has no `now`, and runs on every replica
-    // during WAL replay), so a peer absent here is always read as "just
-    // started, not yet stale". Pruned everywhere `departing` shrinks.
-    departing_since: BTreeMap<NodeId, Nanos>,
-    // Issue #1061 follow-up: the departing peers on the SHORT silence bound
-    // (`DEPARTING_QUIET_GIVE_UP` rather than `DEPARTING_NOTICE_GIVE_UP`):
-    // those that already acked their removal notice yet are still owed
-    // catch-up `AppendEntries` (the log could serve them), and those this
-    // leader merely inherited from a predecessor (`become_leader`'s
-    // re-derivation). Pruned everywhere `departing` shrinks.
-    departing_quiet: BTreeSet<NodeId>,
+    // total silence (`expire_stale_departing`). Each value carries the peer's
+    // own silence clock, short-bound flag and send schedule ([`DepartingPeer`]),
+    // so they live and die with the entry.
+    departing: BTreeMap<NodeId, DepartingPeer>,
     // Issue #1061 observability: lifetime counters (`RemovalStats`).
     removal_stats: RemovalStats,
-    // Issue #1061: per-departing-peer send schedule — `(next_allowed_send,
-    // attempts)`, gating EVERY message this leader would send to a
-    // departing peer (its removal notice and any catch-up `AppendEntries`
-    // alike; `departing_send_gate`). The first send is immediate; each
-    // further send with no reply from the peer in between waits twice as
-    // long as the last (from one heartbeat interval, doubling, up to
-    // `SNAPSHOT_HEARTBEAT_BACKOFF_MAX_TICKS` heartbeats — the same capped
-    // steady period as the snapshot-resend schedule), and ANY reply from the
-    // peer resets it (a live peer catching up is served at full rate; a dead
-    // one costs a couple of dozen tiny messages a minute). Time-based, not
-    // tick-count-based, because under a sustained writer `replicate_now`
-    // keeps pushing `heartbeat_deadline` out and the heartbeat tick that a
-    // count-based schedule would advance on never fires. Cleared with
-    // `departing`.
-    removal_sched: BTreeMap<NodeId, (Nanos, u32)>,
     // Issue #1061: the most recent `now` this core was driven with (`tick`,
     // `handle`, `replicate_now`) — `replicate_to` has no `now` parameter and
     // its many call sites should not all grow one just for the departing
@@ -1919,10 +1939,7 @@ where
             elected_at_commit: 0,
             heard_from: BTreeSet::new(),
             departing: BTreeMap::new(),
-            departing_since: BTreeMap::new(),
-            departing_quiet: BTreeSet::new(),
             removal_stats: RemovalStats::default(),
-            removal_sched: BTreeMap::new(),
             now_hint: Nanos(0),
             removed_by_leader: None,
             transfer_target: None,
@@ -3392,12 +3409,15 @@ where
                     if self.learners.contains(removed) {
                         continue;
                     }
+                    // `removed` was a voter, so it cannot already be departing
+                    // (`departing` is kept disjoint from `peers`/`learners`).
+                    debug_assert!(!self.departing.contains_key(removed));
                     self.departing.insert(
                         removed.clone(),
-                        Departing {
+                        DepartingPeer::new(Departing {
                             index: entry.index,
                             term: entry.term,
-                        },
+                        }),
                     );
                 }
             }
@@ -3406,12 +3426,6 @@ where
             if self.role == Role::Leader {
                 self.reset_peer_progress_on_membership_change(&old_members, entry.index);
             }
-            self.departing_since
-                .retain(|n, _| self.departing.contains_key(n));
-            self.departing_quiet
-                .retain(|n| self.departing.contains_key(n));
-            self.removal_sched
-                .retain(|n, _| self.departing.contains_key(n));
         }
         let carries_config = entry.config.is_some();
         self.pending.push(WalRecord::Append(entry.clone()));
@@ -4974,7 +4988,7 @@ where
         // here, ahead of the branch, so both paths get it identically.
         self.last_contact.insert(from.clone(), now);
         // Issue #1061: the same reachability proof resets a departing peer's
-        // give-up clock and its send-gate schedule (`removal_sched`).
+        // give-up clock and its send-gate schedule (`DepartingPeer::sched`).
         self.note_departing_reply(&from, now);
         // Issue #1228: whether this ack advanced what the leader knows `from`
         // has -- a storage-full follower's frozen ack never does.
@@ -4986,7 +5000,7 @@ where
             if self
                 .departing
                 .get(&from)
-                .is_some_and(|d| match_index >= d.index)
+                .is_some_and(|d| match_index >= d.stamp.index)
             {
                 self.drop_departing(&from);
             }
@@ -5524,7 +5538,7 @@ where
             if self
                 .departing
                 .get(&from)
-                .is_some_and(|d| self.match_index.get(&from).copied().unwrap_or(0) >= d.index)
+                .is_some_and(|d| self.match_index.get(&from).copied().unwrap_or(0) >= d.stamp.index)
             {
                 self.drop_departing(&from);
                 return Vec::new();
@@ -5995,9 +6009,6 @@ where
         // still in this leader's own log (`removals_in_log`) and seeded like
         // any other replication target — see that method for the bound.
         self.departing.clear();
-        self.departing_since.clear();
-        self.departing_quiet.clear();
-        self.removal_sched.clear();
         for (peer, dep) in self.removals_in_log() {
             if self.peers.contains(&peer) || self.learners.contains(&peer) {
                 continue;
@@ -6006,8 +6017,13 @@ where
             self.match_index.insert(peer.clone(), 0);
             // Inherited, not this leader's own removal: the short silence
             // bound (`DEPARTING_QUIET_GIVE_UP`'s doc).
-            self.departing_quiet.insert(peer.clone());
-            self.departing.insert(peer, dep);
+            self.departing.insert(
+                peer,
+                DepartingPeer {
+                    quiet: true,
+                    ..DepartingPeer::new(dep)
+                },
+            );
         }
         self.transfer_target = None;
         // A fresh term restarts any snapshot transfer from offset 0. Clear
@@ -6295,9 +6311,9 @@ where
     /// Record that a departing peer replied (any reply proves it is alive):
     /// resets its give-up clock and re-opens its send-gate schedule.
     fn note_departing_reply(&mut self, peer: &NodeId, now: Nanos) {
-        if self.departing.contains_key(peer) {
-            self.departing_since.insert(peer.clone(), now);
-            self.removal_sched.remove(peer);
+        if let Some(d) = self.departing.get_mut(peer) {
+            d.since = Some(now);
+            d.sched = None;
         }
     }
 
@@ -6363,9 +6379,6 @@ where
         if self.departing.remove(peer).is_some() {
             self.removal_stats.departing_dropped += 1;
         }
-        self.departing_since.remove(peer);
-        self.departing_quiet.remove(peer);
-        self.removal_sched.remove(peer);
         self.inflight_sent.remove(peer);
         self.next_index.remove(peer);
         self.match_index.remove(peer);
@@ -6388,30 +6401,24 @@ where
         }
     }
 
-    /// The send gate for a departing peer (see `removal_sched`'s field doc):
+    /// The send gate for a departing peer (see `DepartingPeer::sched`'s doc):
     /// `true` when nothing is departing-gated for `peer` at all, or its
     /// schedule allows a send at `now_hint` (which then advances the
     /// schedule); `false` to suppress this send.
     fn departing_send_gate(&mut self, peer: &NodeId) -> bool {
-        if !self.departing.contains_key(peer) {
+        let heartbeat = self.heartbeat_nanos();
+        let Some(d) = self.departing.get_mut(peer) else {
             return true;
-        }
+        };
         let now = self.now_hint;
-        let (next_at, attempts) = self
-            .removal_sched
-            .get(peer)
-            .copied()
-            .unwrap_or((Nanos(0), 0));
+        let (next_at, attempts) = d.sched.unwrap_or((Nanos(0), 0));
         if now.0 < next_at.0 {
             return false;
         }
         let cap_shift = SNAPSHOT_HEARTBEAT_BACKOFF_MAX_TICKS.ilog2();
         let mult = 1u64 << attempts.min(cap_shift);
-        let gap = self.heartbeat_nanos().saturating_mul(mult);
-        self.removal_sched.insert(
-            peer.clone(),
-            (Nanos(now.0.saturating_add(gap)), attempts.saturating_add(1)),
-        );
+        let gap = heartbeat.saturating_mul(mult);
+        d.sched = Some((Nanos(now.0.saturating_add(gap)), attempts.saturating_add(1)));
         true
     }
 
@@ -6556,26 +6563,18 @@ where
         if self.departing.is_empty() {
             return;
         }
-        for peer in self.departing.keys() {
-            self.departing_since.entry(peer.clone()).or_insert(now);
-        }
         let ceiling = DEPARTING_NOTICE_GIVE_UP.as_nanos() as u64;
         let quiet_ceiling = DEPARTING_QUIET_GIVE_UP.as_nanos() as u64;
-        let stale: Vec<NodeId> = self
-            .departing_since
-            .iter()
-            .filter(|(p, since)| {
-                // A peer that already acked its notice and then went silent
-                // has left (its host released the replica): the short bound.
-                let bound = if self.departing_quiet.contains(*p) {
-                    quiet_ceiling
-                } else {
-                    ceiling
-                };
-                self.departing.contains_key(*p) && now.0.saturating_sub(since.0) >= bound
-            })
-            .map(|(p, _)| p.clone())
-            .collect();
+        let mut stale: Vec<NodeId> = Vec::new();
+        for (peer, d) in &mut self.departing {
+            let since = *d.since.get_or_insert(now);
+            // A peer that already acked its notice and then went silent has
+            // left (its host released the replica): the short bound.
+            let bound = if d.quiet { quiet_ceiling } else { ceiling };
+            if now.0.saturating_sub(since.0) >= bound {
+                stale.push(peer.clone());
+            }
+        }
         for peer in stale {
             self.drop_departing(&peer);
         }
@@ -6701,7 +6700,7 @@ where
                 self.removal_stats.notices_acked += 1;
                 return;
             }
-            Some(d) if removal_index < d.index => {
+            Some(d) if removal_index < d.stamp.index => {
                 self.removal_stats.notices_ignored += 1;
                 return;
             }
@@ -6730,7 +6729,9 @@ where
             // Still owed the catch-up entries, but the peer is known to have
             // recorded its removal: from here only a *silent* peer is cut off,
             // and on the short bound (`DEPARTING_QUIET_GIVE_UP`).
-            self.departing_quiet.insert(from);
+            if let Some(d) = self.departing.get_mut(&from) {
+                d.quiet = true;
+            }
         }
     }
 
@@ -6774,7 +6775,7 @@ where
             // endless full-image flood to a peer that may never even be alive.
             // What it needs is the *fact* of its removal, not the state it
             // would have replicated: send the tiny notice instead.
-            if let Some(dep) = self.departing.get(&peer).copied() {
+            if let Some(dep) = self.departing.get(&peer).map(|d| d.stamp) {
                 self.forget_snapshot_transfer(&peer);
                 let notice = self.removal_notice_for(&peer, dep);
                 if notice.is_some() {
