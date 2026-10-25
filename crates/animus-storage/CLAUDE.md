@@ -924,3 +924,14 @@ files by `remove` with orphans tolerated at open — is pinned by
 `tests/it/lsm_dir_durability.rs` (`ANIMUS_LSM_DIR_DURABILITY_SEEDS`), including a
 negative control (`set_sync_skips_dir_fsync`) that must fail the oracle. A new file the
 engine creates must be `sync`ed (or `replace`d/`link`ed) before anything depends on it.
+
+## Compaction write amplification grows with tablet size (known, unfixed)
+
+`LsmOptions::production()` keeps the test-sized defaults (64 KiB flush, trigger 4, 2 MB tables,
+fanout 4): an L0->L1 compaction rewrites every overlapping L1 table (all of L1 for hashed keys), so
+bytes compacted per commit grow with the data held and, with the one-at-a-time maintenance lock, cap the
+sustainable write rate, which the ADR 0081 L0 stall then enforces (throughput falls 60-70 % over 15 min
+of unique-key puts on a 3-node debug cluster). A byte-based L0 trigger with L0->L0 merging, and a
+memtable budget that lets the flush size scale, are the proposed fixes. See
+`docs/lessons/code-patterns/2026-10-25-lsm-compaction-write-amp-scales-with-tablet-size-and-throttles-writes-via-the-l0-stall.md`.
+Also: the Bloom filter FPR is ~3.5 % (correlated FNV hashes), not the 1 % target.
