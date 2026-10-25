@@ -1218,15 +1218,11 @@ fn unsupported_by_generic_dispatch(op_name: &str) -> WireError {
 /// `run_operation`'s own arms call (both already `<E, R>`-generic since
 /// C-06 PR 2), and — **since ADR 0061 rung F, C-06 PR 5** —
 /// `ExecuteStatement`/`BatchExecuteStatement`/`ExecuteTransaction` (PartiQL,
-/// ADR 0071), calling their own new generic siblings
-/// [`execute_statement_as`]/[`run_batch_execute_statement_as`]/
-/// [`execute_transaction_as`] rather than the concrete production
-/// [`execute_statement`]/[`run_batch_execute_statement`]/
-/// [`execute_transaction`] — see those siblings' own doc, and this file's
-/// "SimEnv-capable PartiQL siblings" section header, for the full account
+/// ADR 0071), calling the same generic [`execute_statement`]/
+/// [`run_batch_execute_statement`]/[`execute_transaction`] `run_operation`
+/// calls — see this file's "PartiQL" section header for the shared path
 /// (in particular why `ExecuteStatement`'s `INSERT`/`UPDATE`/`DELETE` arm
-/// needed a new `dispatch_lowered_write_as` helper rather than reusing
-/// `execute_statement`'s own `Box::pin(run_operation(..))` recursion). **A
+/// goes through `dispatch_lowered_write`). **A
 /// GSI `Query`/`Scan` under `SimCluster` reads as empty** until a future
 /// rung generalizes `index_drain::change_consumer_loop` (the only thing
 /// that ever materializes a GSI's own hidden-table rows) — `SimCluster`
@@ -1899,13 +1895,8 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
             run_transact(ctx, principal, meta, &actions, token.as_deref()).await
         }
         Operation::TransactGetItems { gets } => run_transact_get(ctx, principal, meta, &gets).await,
-        // ADR 0061 rung F, C-06 PR 5: PartiQL's own generic siblings — see
-        // this file's own "SimEnv-capable PartiQL siblings" section header,
-        // and `execute_statement_as`'s own doc, for the full account.
-        // `run_operation` itself is untouched: it still calls
-        // `execute_statement`/`run_batch_execute_statement`/
-        // `execute_transaction` directly, monomorphized at `E = ProdEnv, R
-        // = AnimusdRelayClient`, so production behavior is unchanged.
+        // PartiQL: the same generic functions `run_operation` calls — see
+        // this file's "PartiQL" section header.
         Operation::ExecuteStatement {
             statement,
             parameters,
@@ -1914,7 +1905,7 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
             limit,
             return_consumed_capacity: _,
         } => {
-            execute_statement_as(
+            execute_statement(
                 ctx,
                 meta,
                 principal,
@@ -1929,12 +1920,12 @@ async fn dispatch_item_op<E: Env, R: RelayClient>(
         Operation::BatchExecuteStatement {
             statements,
             return_consumed_capacity: _,
-        } => run_batch_execute_statement_as(ctx, meta, principal, &statements).await,
+        } => run_batch_execute_statement(ctx, meta, principal, &statements).await,
         Operation::ExecuteTransaction {
             statements,
             token,
             return_consumed_capacity: _,
-        } => execute_transaction_as(ctx, principal, meta, &statements, token.as_deref()).await,
+        } => execute_transaction(ctx, principal, meta, &statements, token.as_deref()).await,
         // ADR 0061 rung H (C-08 PR 2): found necessary, not merely
         // convenient — `admin.rs::action_data_dynamo` and `impl console::
         // ConsoleBackend for ClientCtx<E, R>` both widened to `<E, R>` and
@@ -6566,7 +6557,7 @@ async fn quiescent_multi_get<E: Env, R: RelayClient>(
 /// that arm's own comment. `run_operation`'s `Query` arm keeps calling this
 /// exact function, monomorphized at `E = ProdEnv, R = AnimusdRelayClient`,
 /// so production behavior is unchanged; the new call site is
-/// [`execute_statement_as`], which needs a generic `SELECT` path rather
+/// [`execute_statement`], which needs a generic `SELECT` path rather
 /// than recursing into the concrete [`run_operation`] the way
 /// [`execute_statement`] does for its own `INSERT`/`UPDATE`/`DELETE`
 /// branches.
@@ -7413,6 +7404,123 @@ async fn run_scan<E: Env, R: RelayClient>(
     }
 }
 
+/// Reshape a `PutItem`/`UpdateItem`/`DeleteItem` response body
+/// (`{Attributes?, ConsumedCapacity?, ItemCollectionMetrics?}`) into
+/// `ExecuteStatement`'s own shape (`{Items}`) for a PartiQL `INSERT`/
+/// `UPDATE`/`DELETE` (ADR 0071, W-07 PR 3): a `RETURNING` echo — the
+/// underlying op's own `ReturnValues`/`UpdateReturnValues`, set by
+/// `partiql::lower_insert`/`lower_update`/`lower_delete` from the
+/// statement's `RETURNING` clause — surfaces as the response's `Attributes`
+/// field, which becomes a single-element `Items` array here; no `RETURNING`
+/// clause (the bare DynamoDB PartiQL default) means no `Attributes`, which
+/// becomes an **empty** `Items` array — never omitted, matching a `SELECT`
+/// `ExecuteStatement`'s own always-present `Items` field.
+fn reshape_write_response_to_execute_statement(raw: &str) -> Result<String, WireError> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(raw).expect("write/update response is well-formed JSON");
+    let obj = parsed
+        .as_object()
+        .expect("write/update response is a JSON object");
+    let items = match obj.get("Attributes") {
+        Some(attrs) => vec![attrs.clone()],
+        None => vec![],
+    };
+    let mut out = serde_json::Map::new();
+    out.insert("Items".to_string(), serde_json::Value::Array(items));
+    Ok(serde_json::to_string(&serde_json::Value::Object(out)).expect("response serializes"))
+}
+
+/// Reshape a `Query`/`Scan` response body (`{Items, Count, ScannedCount,
+/// LastEvaluatedKey?}`) into `ExecuteStatement`'s own AWS-faithful shape
+/// (`{Items, NextToken?}`) — `LastEvaluatedKey`, when present, becomes an
+/// opaque `NextToken` bound to `statement` (ADR 0071 §9,
+/// `animus_dynamo::partiql::encode_next_token`). `Count`/`ScannedCount`
+/// are `Query`/`Scan`-only fields with no `ExecuteStatement` equivalent and
+/// are dropped; `ConsumedCapacity` mirrors `Query`/`Scan`'s own pre-existing
+/// gap (ADR 0071 §11) — nothing to attach either way today.
+fn reshape_query_scan_response_to_execute_statement(
+    raw: &str,
+    statement: &str,
+) -> Result<String, WireError> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(raw).expect("run_query/run_scan response is well-formed JSON");
+    let obj = parsed
+        .as_object()
+        .expect("run_query/run_scan response is a JSON object");
+    let mut out = serde_json::Map::new();
+    out.insert(
+        "Items".to_string(),
+        obj.get("Items")
+            .cloned()
+            .unwrap_or(serde_json::Value::Array(vec![])),
+    );
+    if let Some(lek) = obj.get("LastEvaluatedKey") {
+        let lek_obj = lek.as_object().expect("LastEvaluatedKey is a JSON object");
+        let lek_item = wire::decode_item(lek_obj)?;
+        out.insert(
+            "NextToken".to_string(),
+            serde_json::Value::String(partiql::encode_next_token(statement, &lek_item)),
+        );
+    }
+    Ok(serde_json::to_string(&serde_json::Value::Object(out)).expect("response serializes"))
+}
+
+/// Pull the first item (if any) out of a `{"Items": [..], ...}` JSON body —
+/// the shape both `run_query`'s own raw response and
+/// [`execute_statement`]'s mutation-reshaped response
+/// ([`reshape_write_response_to_execute_statement`]) share, so this one
+/// helper serves both of [`execute_one_batch_statement`]'s branches without
+/// caring which produced `raw`.
+fn first_item(raw: &str) -> Result<Option<Item>, WireError> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(raw).expect("response is well-formed JSON");
+    let obj = parsed.as_object().expect("response is a JSON object");
+    match obj.get("Items").and_then(serde_json::Value::as_array) {
+        Some(items) if !items.is_empty() => {
+            let item_obj = items[0].as_object().expect("Items[0] is a JSON object");
+            Ok(Some(wire::decode_item(item_obj)?))
+        }
+        _ => Ok(None),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PartiQL (ADR 0071; generic over `<E: Env, R: RelayClient>` since ADR 0061
+// rung F, C-06 PR 5)
+// ---------------------------------------------------------------------------
+//
+// `execute_statement`/`execute_transaction`/`run_batch_execute_statement`/
+// `execute_one_batch_statement` are the one PartiQL path: `run_operation`
+// (monomorphized at `ProdEnv`) and `dispatch_item_op` (any `E`, so
+// `SimCluster` drives the same code) both call them, passing the request's
+// single `Metadata` snapshot. A lowered `INSERT`/`UPDATE`/`DELETE` reuses
+// that snapshot through `dispatch_lowered_write` rather than re-entering
+// `run_operation`, which would take a fresh one.
+//
+// `dispatch_item_op` -> `execute_statement` -> `dispatch_lowered_write` ->
+// `dispatch_item_op` is a genuine async cycle, so `dispatch_lowered_write`
+// boxes its `dispatch_item_op` call.
+
+/// Run one already-lowered `PutItem`/`UpdateItem`/`DeleteItem` [`Operation`]
+/// through the exact prelude+dispatch [`run_operation`] runs for these three
+/// operations — [`reject_internal_table`], `authz::authorize_op`, then
+/// [`dispatch_item_op`] — over any `ClientCtx<E, R>`, reusing the caller's
+/// `meta`. The one caller is [`execute_statement`]'s own
+/// `INSERT`/`UPDATE`/`DELETE` branches; the `Box::pin` below breaks the
+/// cycle described in the section header above.
+async fn dispatch_lowered_write<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    principal: &Principal,
+    meta: &Metadata,
+    op: Operation,
+) -> Result<String, WireError> {
+    if let Some(table) = op.table() {
+        reject_internal_table(table, is_ddl_mutation(&op))?;
+    }
+    authz::authorize_op(ctx, principal, &op, meta)?;
+    Box::pin(dispatch_item_op(ctx, principal, meta, op)).await
+}
+
 /// `ExecuteStatement` (ADR 0071, W-07 PR 2 `SELECT`; PR 3 `INSERT`/`UPDATE`/
 /// `DELETE`): parse `statement` into one of the four supported shapes
 /// (`animus_dynamo::partiql::parse_statement`), resolve its target table's
@@ -7427,9 +7535,9 @@ async fn run_scan<E: Env, R: RelayClient>(
 /// directly, unchanged from PR 2. An `INSERT`/`UPDATE`/`DELETE` lowers onto
 /// a real [`Operation::PutItem`]/[`Operation::UpdateItem`]/
 /// [`Operation::DeleteItem`] (`partiql::lower_insert`/`lower_update`/
-/// `lower_delete`) and runs through [`run_operation`] itself — the same
-/// dispatcher a client-built `PutItem`/`UpdateItem`/`DeleteItem` request
-/// goes through, so conditions, index maintenance, streams, and throttling
+/// `lower_delete`) and runs through [`dispatch_lowered_write`] — the same
+/// prelude and dispatcher a client-built `PutItem`/`UpdateItem`/`DeleteItem`
+/// request goes through, on this request's own `meta` snapshot, so conditions, index maintenance, streams, and throttling
 /// are all inherited with no new write-path code, and `authz::authorize_op`'s
 /// own per-table check (keyed on the *real*, now-concrete operation, whose
 /// `classify` is `OpClass::Write`) is the actual enforcement point for a
@@ -7445,10 +7553,10 @@ async fn run_scan<E: Env, R: RelayClient>(
 /// identical "resolved and checked inside its own handler" shape. A
 /// `SELECT`'s authorization is likewise checked explicitly here (`run_query`/
 /// `run_scan` have no `authz` call of their own); an `INSERT`/`UPDATE`/
-/// `DELETE`'s is checked automatically by [`run_operation`] once dispatched.
-#[allow(clippy::too_many_arguments)] // one ExecuteStatement request's full decoded shape
-async fn execute_statement(
-    ctx: &ClientCtx,
+/// `DELETE`'s is checked by [`dispatch_lowered_write`] once lowered.
+#[allow(clippy::too_many_arguments)] // mirrors `execute_statement`'s own full decoded shape
+pub(crate) async fn execute_statement<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     meta: &Metadata,
     principal: &Principal,
     statement: &str,
@@ -7462,16 +7570,7 @@ async fn execute_statement(
     reject_internal_table(&table, false)?;
 
     // ADR 0066 §5 / issue #842: authorize before `table_known` below reveals
-    // whether the table exists, mirroring `run_operation`'s own authz-then-
-    // dispatch order (and `run_transact`/`run_transact_get`'s authz-before-
-    // `resolve_key`) — a table-scoped principal must get an identical
-    // `AccessDeniedException` for a denied table whether or not it exists,
-    // never a distinguishable `ResourceNotFoundException`. `Policy::allows`
-    // only ever consults `OpClass`/table (never the operation name), so one
-    // `OpClass::Read`/`OpClass::Write` check here — before the statement's
-    // exact write kind is even lowered — makes the identical allow/deny
-    // decision `run_operation`'s own `authorize_op` would make later for
-    // every kind this function can produce.
+    // whether the table exists.
     let class = if matches!(stmt, partiql::Statement::Select(_)) {
         animus_control::OpClass::Read
     } else {
@@ -7609,7 +7708,7 @@ async fn execute_statement(
                 base.sort_key.as_deref(),
             )
             .map_err(WireError::from)?;
-            match Box::pin(run_operation(ctx, principal, op)).await {
+            match dispatch_lowered_write(ctx, principal, meta, op).await {
                 Ok(raw) => reshape_write_response_to_execute_statement(&raw),
                 Err(e) if e.code == "ConditionalCheckFailedException" => {
                     if on_conflict_do_nothing {
@@ -7633,7 +7732,7 @@ async fn execute_statement(
                 base.sort_key.as_deref(),
             )
             .map_err(WireError::from)?;
-            let raw = Box::pin(run_operation(ctx, principal, op)).await?;
+            let raw = dispatch_lowered_write(ctx, principal, meta, op).await?;
             reshape_write_response_to_execute_statement(&raw)
         }
         partiql::Statement::Delete(del) => {
@@ -7646,7 +7745,7 @@ async fn execute_statement(
                 base.sort_key.as_deref(),
             )
             .map_err(WireError::from)?;
-            let raw = Box::pin(run_operation(ctx, principal, op)).await?;
+            let raw = dispatch_lowered_write(ctx, principal, meta, op).await?;
             reshape_write_response_to_execute_statement(&raw)
         }
     }
@@ -7699,8 +7798,8 @@ async fn execute_statement(
 /// rejected outright rather than silently dropped or downgraded — see
 /// `animus_dynamo::partiql`'s own "Lowering: ExecuteTransaction" module doc
 /// for the full reasoning on both.
-async fn execute_transaction(
-    ctx: &ClientCtx,
+pub(crate) async fn execute_transaction<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     principal: &Principal,
     meta: &Metadata,
     statements: &[TransactStatementRequest],
@@ -7740,15 +7839,8 @@ async fn execute_transaction(
         reject_internal_table(stmt.table(), false)?;
     }
 
-    // ADR 0066 §5 / issue #842: authorize every named table, whole-set,
-    // before the `table_known` loop below reveals which of them exist —
-    // mirroring `run_transact`/`run_transact_get`'s own authz-before-
-    // `resolve_key` ordering, applied one layer up, ahead of this
-    // function's own pre-loop existence short-circuit. `run_transact_get`/
-    // `run_transact` still run their own identical `authorize_each_table`
-    // call once dispatched below (`OpClass::Read`/`Write` respectively) —
-    // this is deliberately redundant, not a replacement, so a caller of
-    // either function directly stays fully protected on its own.
+    // ADR 0066 §5 / issue #842: authorize before `table_known` below reveals
+    // which named tables exist.
     let class = if all_select {
         animus_control::OpClass::Read
     } else {
@@ -7828,86 +7920,6 @@ async fn execute_transaction(
     }
 }
 
-/// Reshape a `PutItem`/`UpdateItem`/`DeleteItem` response body
-/// (`{Attributes?, ConsumedCapacity?, ItemCollectionMetrics?}`) into
-/// `ExecuteStatement`'s own shape (`{Items}`) for a PartiQL `INSERT`/
-/// `UPDATE`/`DELETE` (ADR 0071, W-07 PR 3): a `RETURNING` echo — the
-/// underlying op's own `ReturnValues`/`UpdateReturnValues`, set by
-/// `partiql::lower_insert`/`lower_update`/`lower_delete` from the
-/// statement's `RETURNING` clause — surfaces as the response's `Attributes`
-/// field, which becomes a single-element `Items` array here; no `RETURNING`
-/// clause (the bare DynamoDB PartiQL default) means no `Attributes`, which
-/// becomes an **empty** `Items` array — never omitted, matching a `SELECT`
-/// `ExecuteStatement`'s own always-present `Items` field.
-fn reshape_write_response_to_execute_statement(raw: &str) -> Result<String, WireError> {
-    let parsed: serde_json::Value =
-        serde_json::from_str(raw).expect("write/update response is well-formed JSON");
-    let obj = parsed
-        .as_object()
-        .expect("write/update response is a JSON object");
-    let items = match obj.get("Attributes") {
-        Some(attrs) => vec![attrs.clone()],
-        None => vec![],
-    };
-    let mut out = serde_json::Map::new();
-    out.insert("Items".to_string(), serde_json::Value::Array(items));
-    Ok(serde_json::to_string(&serde_json::Value::Object(out)).expect("response serializes"))
-}
-
-/// Reshape a `Query`/`Scan` response body (`{Items, Count, ScannedCount,
-/// LastEvaluatedKey?}`) into `ExecuteStatement`'s own AWS-faithful shape
-/// (`{Items, NextToken?}`) — `LastEvaluatedKey`, when present, becomes an
-/// opaque `NextToken` bound to `statement` (ADR 0071 §9,
-/// `animus_dynamo::partiql::encode_next_token`). `Count`/`ScannedCount`
-/// are `Query`/`Scan`-only fields with no `ExecuteStatement` equivalent and
-/// are dropped; `ConsumedCapacity` mirrors `Query`/`Scan`'s own pre-existing
-/// gap (ADR 0071 §11) — nothing to attach either way today.
-fn reshape_query_scan_response_to_execute_statement(
-    raw: &str,
-    statement: &str,
-) -> Result<String, WireError> {
-    let parsed: serde_json::Value =
-        serde_json::from_str(raw).expect("run_query/run_scan response is well-formed JSON");
-    let obj = parsed
-        .as_object()
-        .expect("run_query/run_scan response is a JSON object");
-    let mut out = serde_json::Map::new();
-    out.insert(
-        "Items".to_string(),
-        obj.get("Items")
-            .cloned()
-            .unwrap_or(serde_json::Value::Array(vec![])),
-    );
-    if let Some(lek) = obj.get("LastEvaluatedKey") {
-        let lek_obj = lek.as_object().expect("LastEvaluatedKey is a JSON object");
-        let lek_item = wire::decode_item(lek_obj)?;
-        out.insert(
-            "NextToken".to_string(),
-            serde_json::Value::String(partiql::encode_next_token(statement, &lek_item)),
-        );
-    }
-    Ok(serde_json::to_string(&serde_json::Value::Object(out)).expect("response serializes"))
-}
-
-/// Pull the first item (if any) out of a `{"Items": [..], ...}` JSON body —
-/// the shape both `run_query`'s own raw response and
-/// [`execute_statement`]'s mutation-reshaped response
-/// ([`reshape_write_response_to_execute_statement`]) share, so this one
-/// helper serves both of [`execute_one_batch_statement`]'s branches without
-/// caring which produced `raw`.
-fn first_item(raw: &str) -> Result<Option<Item>, WireError> {
-    let parsed: serde_json::Value =
-        serde_json::from_str(raw).expect("response is well-formed JSON");
-    let obj = parsed.as_object().expect("response is a JSON object");
-    match obj.get("Items").and_then(serde_json::Value::as_array) {
-        Some(items) if !items.is_empty() => {
-            let item_obj = items[0].as_object().expect("Items[0] is a JSON object");
-            Ok(Some(wire::decode_item(item_obj)?))
-        }
-        _ => Ok(None),
-    }
-}
-
 /// `BatchExecuteStatement` (ADR 0071, W-07 PR 4): run every statement in
 /// `statements` independently, in request order, through
 /// [`execute_one_batch_statement`] — **no cross-statement atomicity**,
@@ -7915,8 +7927,8 @@ fn first_item(raw: &str) -> Result<Option<Item>, WireError> {
 /// (ADR 0071's lowering table). One entry per input statement, always —
 /// this function itself never fails on a per-statement problem; every such
 /// failure is that statement's own response entry.
-async fn run_batch_execute_statement(
-    ctx: &ClientCtx,
+pub(crate) async fn run_batch_execute_statement<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     meta: &Metadata,
     principal: &Principal,
     statements: &[wire::BatchStatementRequest],
@@ -7945,12 +7957,12 @@ async fn run_batch_execute_statement(
 /// fact). An `INSERT`/`UPDATE`/`DELETE` reuses [`execute_statement`]
 /// wholesale — the exact same lowering, `DuplicateItemException` mapping,
 /// and `RETURNING` handling PR 3 already built, dispatched through
-/// [`run_operation`] exactly as it would be for a standalone
+/// [`dispatch_lowered_write`] exactly as it would be for a standalone
 /// `ExecuteStatement` call (including that dispatch's own real
 /// `authorize_op` check on the lowered, now-concrete `PutItem`/
 /// `UpdateItem`/`DeleteItem`).
-async fn execute_one_batch_statement(
-    ctx: &ClientCtx,
+async fn execute_one_batch_statement<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     meta: &Metadata,
     principal: &Principal,
     req: &wire::BatchStatementRequest,
@@ -7966,13 +7978,6 @@ async fn execute_one_batch_statement(
 
     match stmt {
         partiql::Statement::Select(sel) => {
-            // ADR 0066 §5 / issue #842: authorize before `table_known`
-            // below reveals whether the table exists — see
-            // `execute_statement`'s identical comment for the full
-            // reasoning. The `INSERT`/`UPDATE`/`DELETE` arm below needs no
-            // check of its own here: it delegates wholesale to
-            // `execute_statement`, which authorizes-then-checks
-            // internally.
             if let Err(e) = authz::authorize(
                 ctx,
                 principal,
@@ -8082,597 +8087,6 @@ async fn execute_one_batch_statement(
         | partiql::Statement::Update(_)
         | partiql::Statement::Delete(_) => {
             let raw = execute_statement(
-                ctx,
-                meta,
-                principal,
-                &req.statement,
-                &req.parameters,
-                req.consistent_read,
-                None,
-                None,
-            )
-            .await;
-            match raw.and_then(|r| first_item(&r)) {
-                Ok(item) => wire::BatchStatementResult::success(table, item),
-                Err(e) => wire::BatchStatementResult::error(Some(table), &e),
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// SimEnv-capable PartiQL siblings (ADR 0061 rung F, C-06 PR 5)
-// ---------------------------------------------------------------------------
-//
-// `execute_statement_as`/`execute_transaction_as`/
-// `run_batch_execute_statement_as`/`execute_one_batch_statement_as` are the
-// PartiQL analogue of `execute_item_op_as` (above): new, `<E: Env, R:
-// RelayClient>`-generic siblings of `execute_statement`/`execute_transaction`/
-// `run_batch_execute_statement`/`execute_one_batch_statement` that let
-// `SimCluster` drive a real `ExecuteStatement`/`ExecuteTransaction`/
-// `BatchExecuteStatement` request the identical way production does, never a
-// widening of those four functions themselves (this rung's own ADR
-// amendment, and the D2 PR 1 lesson: a narrowed generic split of a
-// dispatcher must not become the production dispatcher's ONLY path,
-// `docs/engineering-lessons.md`). Every one of `execute_statement`/
-// `execute_transaction`/`run_batch_execute_statement`/
-// `execute_one_batch_statement` above stays byte-identical — zero lines
-// touched in any of their own bodies.
-//
-// `run_query`/`run_scan` (above) and `run_transact`/`run_transact_get`
-// (widened by C-06 PR 2) were already `<E, R>`-generic, so `execute_
-// transaction_as` and `execute_statement_as`'s own `SELECT` branch need no
-// new mechanism at all — a pure signature-and-plumbing widening. The one
-// real wrinkle, named by this rung's own ADR amendment up front, is
-// `execute_statement`'s `INSERT`/`UPDATE`/`DELETE` branches: they recurse
-// into the concrete, production-only `run_operation` via `Box::pin(
-// run_operation(ctx, principal, op)).await` (needed there because
-// `run_operation` itself calls back into `execute_statement` for its own
-// `ExecuteStatement` arm — a genuine mutual recursion). `execute_statement_as`
-// cannot call `run_operation` at all (it only accepts a concrete `&ClientCtx`),
-// so its own `INSERT`/`UPDATE`/`DELETE` branches instead run
-// `dispatch_lowered_write_as` — the identical `reject_internal_table`/
-// `authz::authorize_op` prelude `run_operation` runs ahead of its own
-// dispatch to `dispatch_item_op` for these three operations (see
-// `run_operation`'s own prelude, and `dispatch_item_op`'s own doc), then
-// `dispatch_item_op` directly. This closes a SECOND mutual-recursion cycle,
-// distinct from `run_operation`'s own: `dispatch_item_op`'s own new
-// `ExecuteStatement` arm (below) calls `execute_statement_as`, whose
-// `INSERT`/`UPDATE`/`DELETE` arms call `dispatch_lowered_write_as`, which
-// calls back into `dispatch_item_op` — so `dispatch_lowered_write_as`
-// itself needs the `Box::pin`, not `execute_statement_as`'s own call sites
-// (the compiler's `E0733` on the actual cycle is what caught this — the
-// header comment's own first draft claimed no boxing was needed, wrongly,
-// before `dispatch_item_op` gained its `ExecuteStatement` arm).
-
-/// Run one already-lowered `PutItem`/`UpdateItem`/`DeleteItem` [`Operation`]
-/// through the exact prelude+dispatch [`run_operation`] runs for these three
-/// operations — [`reject_internal_table`], `authz::authorize_op`, then
-/// [`dispatch_item_op`] — over any `ClientCtx<E, R>`. The one caller is
-/// [`execute_statement_as`]'s own `INSERT`/`UPDATE`/`DELETE` branches; see
-/// this section's own header doc for the full account, including why the
-/// `Box::pin` below (not present in `run_operation`'s own analogous prelude,
-/// which never recurses) is load-bearing: `dispatch_item_op` → (its own
-/// `ExecuteStatement` arm) → `execute_statement_as` → `dispatch_lowered_
-/// write_as` → `dispatch_item_op` is a genuine cycle, distinct from
-/// `execute_statement`'s own `Box::pin(run_operation(..))` cycle.
-async fn dispatch_lowered_write_as<E: Env, R: RelayClient>(
-    ctx: &ClientCtx<E, R>,
-    principal: &Principal,
-    meta: &Metadata,
-    op: Operation,
-) -> Result<String, WireError> {
-    if let Some(table) = op.table() {
-        reject_internal_table(table, is_ddl_mutation(&op))?;
-    }
-    authz::authorize_op(ctx, principal, &op, meta)?;
-    Box::pin(dispatch_item_op(ctx, principal, meta, op)).await
-}
-
-/// `SimEnv`-capable sibling of [`execute_statement`] — see this file's own
-/// "SimEnv-capable PartiQL siblings" section header for the full account of
-/// what changed and why. `SELECT` lowers and dispatches exactly like
-/// `execute_statement`'s own `SELECT` branch (`run_query`/`run_scan` are
-/// generic already); `INSERT`/`UPDATE`/`DELETE` route through
-/// [`dispatch_lowered_write_as`] instead of `execute_statement`'s own
-/// `Box::pin(run_operation(..))`. Every other line — parsing, key
-/// resolution, `authz::authorize`, response reshaping, `DuplicateItemException`/
-/// `ON CONFLICT DO NOTHING` handling — is copied verbatim from
-/// `execute_statement`, monomorphized differently.
-///
-/// Only called from `sim_cluster_dynamo_partiql.rs` today — the `cfg_attr`
-/// below mirrors [`execute_item_op_as`]'s own precise, not blanket,
-/// dead-code allowance.
-#[cfg_attr(not(test), allow(dead_code))]
-#[allow(clippy::too_many_arguments)] // mirrors `execute_statement`'s own full decoded shape
-pub(crate) async fn execute_statement_as<E: Env, R: RelayClient>(
-    ctx: &ClientCtx<E, R>,
-    meta: &Metadata,
-    principal: &Principal,
-    statement: &str,
-    parameters: &[AttributeValue],
-    consistent_read: bool,
-    next_token: Option<&str>,
-    limit: Option<usize>,
-) -> Result<String, WireError> {
-    let stmt = partiql::parse_statement(statement).map_err(WireError::from)?;
-    let table = stmt.table().to_string();
-    reject_internal_table(&table, false)?;
-
-    // ADR 0066 §5 / issue #842: authorize before `table_known` below reveals
-    // whether the table exists — see `execute_statement`'s identical comment
-    // for the full reasoning; this is its `<E, R>`-generic sibling.
-    let class = if matches!(stmt, partiql::Statement::Select(_)) {
-        animus_control::OpClass::Read
-    } else {
-        animus_control::OpClass::Write
-    };
-    authz::authorize(
-        ctx,
-        principal,
-        "ExecuteStatement",
-        class,
-        Some(table.as_str()),
-    )?;
-    if !table_known(ctx, meta, &table) {
-        return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
-            table.clone(),
-        )));
-    }
-
-    match stmt {
-        partiql::Statement::Select(sel) => {
-            mirror_catalog_schema(ctx, meta, &table);
-
-            let (partition_key, sort_key): (String, Option<String>) = match &sel.index {
-                Some(index_name) => {
-                    let idx = meta
-                        .table_indexes(&table)
-                        .iter()
-                        .find(|d| &d.name == index_name)
-                        .cloned()
-                        .ok_or_else(|| {
-                            registry_error(animus_dynamo::RegistryError::NoSuchIndex(
-                                index_name.clone(),
-                            ))
-                        })?;
-                    (idx.hash_attribute, idx.sort_attribute)
-                }
-                None => {
-                    let base = schema_for(meta, &table);
-                    (base.partition_key, base.sort_key)
-                }
-            };
-
-            let exclusive_start_key = match next_token {
-                Some(tok) => {
-                    Some(partiql::decode_next_token(tok, statement).map_err(WireError::from)?)
-                }
-                None => None,
-            };
-
-            let op = partiql::lower_select(
-                &sel,
-                parameters,
-                &partition_key,
-                sort_key.as_deref(),
-                exclusive_start_key,
-                limit,
-                consistent_read,
-            )
-            .map_err(WireError::from)?;
-
-            let raw = match op {
-                Operation::Query {
-                    table,
-                    index,
-                    partition_attr,
-                    partition_value,
-                    sort_attr,
-                    sort_condition,
-                    limit,
-                    exclusive_start_key,
-                    scan_index_forward,
-                    filter,
-                    projection,
-                    select,
-                    consistent_read,
-                } => {
-                    run_query(
-                        ctx,
-                        meta,
-                        &table,
-                        index.as_deref(),
-                        &partition_attr,
-                        &partition_value,
-                        sort_attr.as_deref(),
-                        sort_condition.as_ref(),
-                        limit,
-                        exclusive_start_key,
-                        scan_index_forward,
-                        filter.as_ref(),
-                        projection.as_ref(),
-                        select,
-                        consistent_read,
-                    )
-                    .await?
-                }
-                Operation::Scan {
-                    table,
-                    index,
-                    limit,
-                    exclusive_start_key,
-                    filter,
-                    projection,
-                    select,
-                    segment,
-                    consistent_read,
-                } => {
-                    run_scan(
-                        ctx,
-                        meta,
-                        &table,
-                        index.as_deref(),
-                        limit,
-                        exclusive_start_key,
-                        filter.as_ref(),
-                        projection.as_ref(),
-                        select,
-                        segment,
-                        consistent_read,
-                    )
-                    .await?
-                }
-                _ => unreachable!("partiql::lower_select only ever produces Query or Scan"),
-            };
-
-            reshape_query_scan_response_to_execute_statement(&raw, statement)
-        }
-        partiql::Statement::Insert(ins) => {
-            mirror_catalog_schema(ctx, meta, &table);
-            let base = schema_for(meta, &table);
-            let on_conflict_do_nothing = ins.on_conflict_do_nothing;
-            let op = partiql::lower_insert(
-                &ins,
-                parameters,
-                &base.partition_key,
-                base.sort_key.as_deref(),
-            )
-            .map_err(WireError::from)?;
-            match dispatch_lowered_write_as(ctx, principal, meta, op).await {
-                Ok(raw) => reshape_write_response_to_execute_statement(&raw),
-                Err(e) if e.code == "ConditionalCheckFailedException" => {
-                    if on_conflict_do_nothing {
-                        reshape_write_response_to_execute_statement("{}")
-                    } else {
-                        Err(WireError::duplicate_item(format!(
-                            "an item with this key already exists in table `{table}`"
-                        )))
-                    }
-                }
-                Err(e) => Err(e),
-            }
-        }
-        partiql::Statement::Update(upd) => {
-            mirror_catalog_schema(ctx, meta, &table);
-            let base = schema_for(meta, &table);
-            let op = partiql::lower_update(
-                &upd,
-                parameters,
-                &base.partition_key,
-                base.sort_key.as_deref(),
-            )
-            .map_err(WireError::from)?;
-            let raw = dispatch_lowered_write_as(ctx, principal, meta, op).await?;
-            reshape_write_response_to_execute_statement(&raw)
-        }
-        partiql::Statement::Delete(del) => {
-            mirror_catalog_schema(ctx, meta, &table);
-            let base = schema_for(meta, &table);
-            let op = partiql::lower_delete(
-                &del,
-                parameters,
-                &base.partition_key,
-                base.sort_key.as_deref(),
-            )
-            .map_err(WireError::from)?;
-            let raw = dispatch_lowered_write_as(ctx, principal, meta, op).await?;
-            reshape_write_response_to_execute_statement(&raw)
-        }
-    }
-}
-
-/// `SimEnv`-capable sibling of [`execute_transaction`] — a pure signature
-/// widening to `<E: Env, R: RelayClient>` of the identical body (see this
-/// file's own "SimEnv-capable PartiQL siblings" section header). Unlike
-/// [`execute_statement_as`], `ExecuteTransaction` never recurses into a
-/// concrete production dispatcher — every callee ([`table_known`],
-/// [`mirror_catalog_schema`], [`schema_for`], [`run_transact_get`],
-/// [`run_transact`]) was already generic or `Metadata`-only — so this needed
-/// no dispatch change at all, just the type parameters.
-///
-/// Only called from `sim_cluster_dynamo_partiql.rs` today; the `cfg_attr`
-/// below mirrors [`execute_item_op_as`]'s own precise dead-code allowance.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) async fn execute_transaction_as<E: Env, R: RelayClient>(
-    ctx: &ClientCtx<E, R>,
-    principal: &Principal,
-    meta: &Metadata,
-    statements: &[TransactStatementRequest],
-    token: Option<&str>,
-) -> Result<String, WireError> {
-    if statements.is_empty() {
-        return Err(WireError::validation(
-            "ExecuteTransaction requires at least one statement",
-        ));
-    }
-    if statements.len() > wire::EXECUTE_TRANSACTION_MAX_STATEMENTS {
-        return Err(WireError::validation(format!(
-            "ExecuteTransaction supports at most {} statements",
-            wire::EXECUTE_TRANSACTION_MAX_STATEMENTS
-        )));
-    }
-
-    let parsed: Vec<partiql::Statement> = statements
-        .iter()
-        .map(|s| partiql::parse_statement(&s.statement).map_err(WireError::from))
-        .collect::<Result<_, _>>()?;
-
-    let all_select = parsed
-        .iter()
-        .all(|s| matches!(s, partiql::Statement::Select(_)));
-    let any_select = parsed
-        .iter()
-        .any(|s| matches!(s, partiql::Statement::Select(_)));
-    if any_select && !all_select {
-        return Err(WireError::validation(
-            "ExecuteTransaction cannot mix SELECT with INSERT/UPDATE/DELETE statements — a \
-             transaction is all-reads or all-writes",
-        ));
-    }
-
-    for stmt in &parsed {
-        reject_internal_table(stmt.table(), false)?;
-    }
-
-    // ADR 0066 §5 / issue #842: authorize before `table_known` below reveals
-    // which named tables exist — see `execute_transaction`'s identical
-    // comment for the full reasoning; this is its `<E, R>`-generic sibling.
-    let class = if all_select {
-        animus_control::OpClass::Read
-    } else {
-        animus_control::OpClass::Write
-    };
-    authz::authorize_each_table(
-        ctx,
-        principal,
-        "ExecuteTransaction",
-        class,
-        parsed.iter().map(partiql::Statement::table),
-    )?;
-
-    for stmt in &parsed {
-        let table = stmt.table();
-        if !table_known(ctx, meta, table) {
-            return Err(registry_error(animus_dynamo::RegistryError::NoSuchTable(
-                table.to_string(),
-            )));
-        }
-        mirror_catalog_schema(ctx, meta, table);
-    }
-
-    if all_select {
-        let mut gets = Vec::with_capacity(parsed.len());
-        for (stmt, req) in parsed.iter().zip(statements.iter()) {
-            let partiql::Statement::Select(sel) = stmt else {
-                unreachable!("all_select guarantees every parsed statement is Select")
-            };
-            let base = schema_for(meta, &sel.table);
-            let get = partiql::lower_select_to_transact_get(
-                sel,
-                &req.parameters,
-                &base.partition_key,
-                base.sort_key.as_deref(),
-            )
-            .map_err(WireError::from)?;
-            gets.push(get);
-        }
-        run_transact_get(ctx, principal, meta, &gets).await
-    } else {
-        let mut actions = Vec::with_capacity(parsed.len());
-        for (stmt, req) in parsed.iter().zip(statements.iter()) {
-            let base = schema_for(meta, stmt.table());
-            let action = match stmt {
-                partiql::Statement::Select(_) => {
-                    unreachable!("any_select && !all_select was already rejected above")
-                }
-                partiql::Statement::Insert(ins) => partiql::lower_insert_to_transact_action(
-                    ins,
-                    &req.parameters,
-                    &base.partition_key,
-                    base.sort_key.as_deref(),
-                    req.rvocf,
-                ),
-                partiql::Statement::Update(upd) => partiql::lower_update_to_transact_action(
-                    upd,
-                    &req.parameters,
-                    &base.partition_key,
-                    base.sort_key.as_deref(),
-                    req.rvocf,
-                ),
-                partiql::Statement::Delete(del) => partiql::lower_delete_to_transact_action(
-                    del,
-                    &req.parameters,
-                    &base.partition_key,
-                    base.sort_key.as_deref(),
-                    req.rvocf,
-                ),
-            }
-            .map_err(WireError::from)?;
-            actions.push(action);
-        }
-        let count = actions.len();
-        run_transact(ctx, principal, meta, &actions, token).await?;
-        Ok(wire::execute_transaction_write_response(count))
-    }
-}
-
-/// `SimEnv`-capable sibling of [`run_batch_execute_statement`] — see this
-/// file's own "SimEnv-capable PartiQL siblings" section header. Calls
-/// [`execute_one_batch_statement_as`], never the concrete
-/// [`execute_one_batch_statement`] — the identical "the narrowed split must
-/// call its own generic sibling, never the concrete one" risk this rung's
-/// own ADR amendment names up front (the D2 PR 1 lesson once more): were
-/// this to call the concrete function by mistake, `BatchExecuteStatement`'s
-/// `INSERT`/`UPDATE`/`DELETE` arm would silently stay `ProdEnv`-only forever
-/// under `SimCluster`, with nothing failing loudly to say so.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) async fn run_batch_execute_statement_as<E: Env, R: RelayClient>(
-    ctx: &ClientCtx<E, R>,
-    meta: &Metadata,
-    principal: &Principal,
-    statements: &[wire::BatchStatementRequest],
-) -> Result<String, WireError> {
-    let mut results = Vec::with_capacity(statements.len());
-    for req in statements {
-        results.push(execute_one_batch_statement_as(ctx, meta, principal, req).await);
-    }
-    Ok(wire::batch_execute_statement_response(&results))
-}
-
-/// `SimEnv`-capable sibling of [`execute_one_batch_statement`] — see this
-/// file's own "SimEnv-capable PartiQL siblings" section header. Identical
-/// body, except the `INSERT`/`UPDATE`/`DELETE` arm calls
-/// [`execute_statement_as`] rather than the concrete [`execute_statement`]
-/// — the one substitution [`run_batch_execute_statement_as`]'s own doc names
-/// as load-bearing.
-#[cfg_attr(not(test), allow(dead_code))]
-async fn execute_one_batch_statement_as<E: Env, R: RelayClient>(
-    ctx: &ClientCtx<E, R>,
-    meta: &Metadata,
-    principal: &Principal,
-    req: &wire::BatchStatementRequest,
-) -> wire::BatchStatementResult {
-    let stmt = match partiql::parse_statement(&req.statement) {
-        Ok(s) => s,
-        Err(e) => return wire::BatchStatementResult::error(None, &WireError::from(e)),
-    };
-    let table = stmt.table().to_string();
-    if let Err(e) = reject_internal_table(&table, false) {
-        return wire::BatchStatementResult::error(Some(table), &e);
-    }
-
-    match stmt {
-        partiql::Statement::Select(sel) => {
-            if let Err(e) = authz::authorize(
-                ctx,
-                principal,
-                "BatchExecuteStatement",
-                animus_control::OpClass::Read,
-                Some(table.as_str()),
-            ) {
-                return wire::BatchStatementResult::error(Some(table), &e);
-            }
-            if !table_known(ctx, meta, &table) {
-                let e = registry_error(animus_dynamo::RegistryError::NoSuchTable(table.clone()));
-                return wire::BatchStatementResult::error(Some(table), &e);
-            }
-
-            mirror_catalog_schema(ctx, meta, &table);
-
-            let (partition_key, sort_key): (String, Option<String>) = match &sel.index {
-                Some(index_name) => match meta
-                    .table_indexes(&table)
-                    .iter()
-                    .find(|d| &d.name == index_name)
-                    .cloned()
-                {
-                    Some(idx) => (idx.hash_attribute, idx.sort_attribute),
-                    None => {
-                        let e = registry_error(animus_dynamo::RegistryError::NoSuchIndex(
-                            index_name.clone(),
-                        ));
-                        return wire::BatchStatementResult::error(Some(table), &e);
-                    }
-                },
-                None => {
-                    let base = schema_for(meta, &table);
-                    (base.partition_key, base.sort_key)
-                }
-            };
-
-            if !partiql::select_is_exact_key(&sel, &partition_key, sort_key.as_deref()) {
-                return wire::BatchStatementResult::error(
-                    Some(table),
-                    &WireError::validation(
-                        "a BatchExecuteStatement SELECT must be an exact-key read: an \
-                         equality condition on the partition key, and on the sort key \
-                         when the table has one, and nothing else",
-                    ),
-                );
-            }
-
-            let op = match partiql::lower_select(
-                &sel,
-                &req.parameters,
-                &partition_key,
-                sort_key.as_deref(),
-                None,
-                None,
-                req.consistent_read,
-            ) {
-                Ok(op) => op,
-                Err(e) => {
-                    return wire::BatchStatementResult::error(Some(table), &WireError::from(e));
-                }
-            };
-            let Operation::Query {
-                table: q_table,
-                index,
-                partition_attr,
-                partition_value,
-                sort_attr,
-                sort_condition,
-                limit,
-                exclusive_start_key,
-                scan_index_forward,
-                filter,
-                projection,
-                select,
-                consistent_read,
-            } = op
-            else {
-                unreachable!(
-                    "select_is_exact_key only accepts a WHERE shape lower_select turns into Query"
-                );
-            };
-            let raw = run_query(
-                ctx,
-                meta,
-                &q_table,
-                index.as_deref(),
-                &partition_attr,
-                &partition_value,
-                sort_attr.as_deref(),
-                sort_condition.as_ref(),
-                limit,
-                exclusive_start_key,
-                scan_index_forward,
-                filter.as_ref(),
-                projection.as_ref(),
-                select,
-                consistent_read,
-            )
-            .await;
-            match raw.and_then(|r| first_item(&r)) {
-                Ok(item) => wire::BatchStatementResult::success(table, item),
-                Err(e) => wire::BatchStatementResult::error(Some(table), &e),
-            }
-        }
-        partiql::Statement::Insert(_)
-        | partiql::Statement::Update(_)
-        | partiql::Statement::Delete(_) => {
-            let raw = execute_statement_as(
                 ctx,
                 meta,
                 principal,

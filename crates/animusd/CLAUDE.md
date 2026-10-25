@@ -9212,7 +9212,18 @@ never become the production dispatcher's only path). This PR instead adds
 four new, strictly additive, `<E: Env, R: RelayClient>`-generic siblings in
 `dynamo.rs`, all under a new "SimEnv-capable PartiQL siblings" section
 header (that header carries the full design account; this appendix
-summarizes it):
+summarizes it).
+
+> **Superseded 2026-10-25:** the concrete twins (`execute_statement`,
+> `execute_transaction`, `run_batch_execute_statement`,
+> `execute_one_batch_statement`) are deleted and the `_as` siblings below
+> took the plain names (`dispatch_lowered_write_as` is `dispatch_lowered_
+> write`): one generic PartiQL path, called by both `run_operation` and
+> `dispatch_item_op`, reusing the request's single `Metadata` snapshot for
+> a lowered `INSERT`/`UPDATE`/`DELETE` (no fresh `metadata(ctx)` via
+> `run_operation`). Read the `_as` names and the "byte-identical" claims in
+> this appendix as history. Only the `execute_item_op_as` family remains
+> a true sibling.
 
 - **`execute_statement_as`** — copies `execute_statement`'s body verbatim.
   Its `SELECT` branch needed no new mechanism at all: `run_query`/

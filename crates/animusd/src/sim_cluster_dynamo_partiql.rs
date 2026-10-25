@@ -4,30 +4,15 @@
 //! reachable under `SimEnv` for the first time (ADR 0061 rung F, C-06
 //! PR 5).
 //!
-//! **The dispatch change (`dynamo.rs`)**: three new parallel generic
-//! siblings — [`crate::dynamo::execute_statement_as`]/
-//! [`crate::dynamo::execute_transaction_as`]/
-//! `run_batch_execute_statement_as` (plus its own private
-//! `execute_one_batch_statement_as` helper) — the PartiQL analogue of
-//! `execute_item_op_as` (ADR 0061 rung D2 PR 1) — and three new
-//! `dispatch_item_op` match arms routing `Operation::ExecuteStatement`/
-//! `Operation::BatchExecuteStatement`/`Operation::ExecuteTransaction` to
-//! them. `run_operation`, `execute_statement`, `execute_transaction`,
-//! `run_batch_execute_statement`, and `execute_one_batch_statement` are all
-//! byte-identical, unchanged — see `dynamo.rs`'s own "SimEnv-capable
-//! PartiQL siblings" section header for the full account, including the two
-//! distinct mutual-recursion cycles this rung closes: `execute_statement`'s
-//! own pre-existing `Box::pin(run_operation(..))` (untouched — it still
-//! recurses into the concrete, production-only `run_operation` for its
-//! `INSERT`/`UPDATE`/`DELETE` arms), and a **second, new** cycle —
-//! `dispatch_item_op`'s own new `ExecuteStatement` arm calls
-//! `execute_statement_as`, whose `INSERT`/`UPDATE`/`DELETE` arms call a new
-//! `dispatch_lowered_write_as` helper, which calls back into
-//! `dispatch_item_op` — closed by boxing `dispatch_lowered_write_as`'s own
-//! call, not `execute_statement_as`'s call sites (found by the compiler's
-//! `E0733` the moment `dispatch_item_op` gained the `ExecuteStatement` arm,
-//! not anticipated up front — see `docs/engineering-lessons.md`'s matching
-//! entry).
+//! **The dispatch change (`dynamo.rs`)**: [`crate::dynamo::execute_statement`]/
+//! [`crate::dynamo::execute_transaction`]/
+//! `run_batch_execute_statement` (plus its private
+//! `execute_one_batch_statement` helper) are the one PartiQL path, generic
+//! over `<E, R>`; `run_operation` and `dispatch_item_op` both call them (the
+//! latter through three match arms for `Operation::ExecuteStatement`/
+//! `BatchExecuteStatement`/`ExecuteTransaction`). See `dynamo.rs`'s "PartiQL"
+//! section header for the async cycle through `dispatch_lowered_write` and
+//! why it is boxed there.
 //!
 //! Deeper PartiQL fault-injection coverage (GSI/LSI `SELECT`, a corpus
 //! equivalence cell) is PR 6's own scope (ADR 0061 rung F) — this module is
@@ -145,8 +130,8 @@
 //!
 //! **No bug found.** Every converted scenario passed at its pinned seed and
 //! every `_over_seeds` seed on the first clean run — the generic dispatch
-//! path PR 5 wired (`execute_statement_as`/`execute_transaction_as`/
-//! `run_batch_execute_statement_as`, unchanged by this PR) behaves
+//! path PR 5 wired (`execute_statement`/`execute_transaction`/
+//! `run_batch_execute_statement`, unchanged by this PR) behaves
 //! identically to the concrete, real-socket-only path for every scenario
 //! converted here.
 //!
