@@ -22775,12 +22775,10 @@ mod simenv_client_ctx_tests {
         );
     }
 
-    /// ADR 0066 §5 / issue #842: `execute_statement_as`/`execute_transaction_as`
-    /// — the `<E, R>`-generic PartiQL siblings `dynamo::dispatch_item_op`
-    /// calls (never reached by the real DynamoDB wire, which always calls
-    /// the concrete `execute_statement`/`execute_transaction` directly; see
-    /// `dynamo.rs`'s own "SimEnv-capable PartiQL siblings" section) — must
-    /// authorize a `Principal::Scoped` caller **before** the target table's
+    /// ADR 0066 §5 / issue #842: `execute_statement`/`execute_transaction`
+    /// — the `<E, R>`-generic PartiQL handlers both `run_operation`
+    /// and `dynamo::dispatch_item_op` call (see `dynamo.rs`'s own "PartiQL"
+    /// section) — must authorize a `Principal::Scoped` caller **before** the target table's
     /// existence is revealed by `table_known`, exactly like their concrete
     /// counterparts (proven end-to-end over the real wire by
     /// `crates/animusd/tests/dynamo_auth_policy.rs`'s own scoped-policy
@@ -22793,9 +22791,9 @@ mod simenv_client_ctx_tests {
     /// `Principal::unrestricted()`), so this harness constructs both
     /// functions' inputs directly rather than through any wire path.
     #[test]
-    fn execute_statement_as_and_execute_transaction_as_authorize_before_table_known() {
+    fn execute_statement_and_execute_transaction_authorize_before_table_known() {
         use crate::authz::Principal;
-        use crate::dynamo::{execute_statement_as, execute_transaction_as};
+        use crate::dynamo::{execute_statement, execute_transaction};
         use animus_control::{OpClass, Policy, TableMatch};
         use animus_dynamo::AttributeValue;
         use animus_dynamo::wire::TransactStatementRequest;
@@ -22845,7 +22843,7 @@ mod simenv_client_ctx_tests {
             let denied = denied.clone();
             let meta = meta_absent.clone();
             async move {
-                execute_statement_as(
+                execute_statement(
                     &ctx,
                     &meta,
                     &denied,
@@ -22870,7 +22868,7 @@ mod simenv_client_ctx_tests {
             let denied = denied.clone();
             let meta = meta_present.clone();
             async move {
-                execute_statement_as(
+                execute_statement(
                     &ctx,
                     &meta,
                     &denied,
@@ -22901,7 +22899,7 @@ mod simenv_client_ctx_tests {
              difference (issue #842)"
         );
 
-        // The identical proof for `execute_transaction_as`, one write
+        // The identical proof for `execute_transaction`, one write
         // statement.
         let txn_statement = "INSERT INTO issue_842_denied_txn VALUE {'pk': ?}";
         let statements = vec![TransactStatementRequest {
@@ -22916,7 +22914,7 @@ mod simenv_client_ctx_tests {
             let denied = denied.clone();
             let meta = meta_absent.clone();
             let statements = statements.clone();
-            async move { execute_transaction_as(&ctx, &denied, &meta, &statements, None).await }
+            async move { execute_transaction(&ctx, &denied, &meta, &statements, None).await }
         })
         .expect("future completed")
         .expect_err("a denied ExecuteTransaction must be refused even against an unknown table");
@@ -22929,7 +22927,7 @@ mod simenv_client_ctx_tests {
             let denied = denied.clone();
             let meta = meta_present.clone();
             let statements = statements.clone();
-            async move { execute_transaction_as(&ctx, &denied, &meta, &statements, None).await }
+            async move { execute_transaction(&ctx, &denied, &meta, &statements, None).await }
         })
         .expect("future completed")
         .expect_err("a denied ExecuteTransaction must be refused even once the table exists");
@@ -22948,11 +22946,11 @@ mod simenv_client_ctx_tests {
         );
     }
 
-    /// ADR 0066 §5 / issue #842 (the sixth site): `execute_one_batch_statement_as`
-    /// — reached through [`crate::dynamo::run_batch_execute_statement_as`], the
-    /// `BatchExecuteStatement` sibling of `execute_statement_as`/
-    /// `execute_transaction_as` above (see `dynamo.rs`'s own "SimEnv-capable
-    /// PartiQL siblings" section) — used to check `table_known` before
+    /// ADR 0066 §5 / issue #842 (the sixth site): `execute_one_batch_statement`
+    /// — reached through [`crate::dynamo::run_batch_execute_statement`], the
+    /// `BatchExecuteStatement` counterpart of `execute_statement`/
+    /// `execute_transaction` above (see `dynamo.rs`'s own "PartiQL"
+    /// section) — used to check `table_known` before
     /// `authz::authorize` for its `SELECT` arm, the identical five-site defect
     /// this issue names, just uncounted. A denied `SELECT` batch statement must
     /// report a byte-identical `Error.Code`/`Error.Message` whether the named
@@ -22960,9 +22958,9 @@ mod simenv_client_ctx_tests {
     /// would let a table-scoped credential enumerate the cluster's tables via
     /// the batch API.
     #[test]
-    fn execute_one_batch_statement_as_authorizes_before_table_known() {
+    fn execute_one_batch_statement_authorizes_before_table_known() {
         use crate::authz::Principal;
-        use crate::dynamo::run_batch_execute_statement_as;
+        use crate::dynamo::run_batch_execute_statement;
         use animus_control::{OpClass, Policy, TableMatch};
         use animus_dynamo::wire::BatchStatementRequest;
         use std::collections::BTreeSet;
@@ -23027,10 +23025,10 @@ mod simenv_client_ctx_tests {
             let denied = denied.clone();
             let meta = meta_absent.clone();
             let statements = statements.clone();
-            async move { run_batch_execute_statement_as(&ctx, &meta, &denied, &statements).await }
+            async move { run_batch_execute_statement(&ctx, &meta, &denied, &statements).await }
         })
         .expect("future completed")
-        .expect("run_batch_execute_statement_as never returns Err — every failure is a per-statement entry");
+        .expect("run_batch_execute_statement never returns Err — every failure is a per-statement entry");
 
         // (2) Now the table genuinely exists.
         seed_schema(&control, "issue_842_denied_batch", TabletId(4));
@@ -23041,10 +23039,10 @@ mod simenv_client_ctx_tests {
             let denied = denied.clone();
             let meta = meta_present.clone();
             let statements = statements.clone();
-            async move { run_batch_execute_statement_as(&ctx, &meta, &denied, &statements).await }
+            async move { run_batch_execute_statement(&ctx, &meta, &denied, &statements).await }
         })
         .expect("future completed")
-        .expect("run_batch_execute_statement_as never returns Err — every failure is a per-statement entry");
+        .expect("run_batch_execute_statement never returns Err — every failure is a per-statement entry");
 
         let (code_absent, message_absent) = batch_error(&raw_absent);
         let (code_present, message_present) = batch_error(&raw_present);
@@ -23921,15 +23919,15 @@ mod sim_cluster_dynamo_intent_blocked;
 /// ADR 0061 rung F (C-06 PR 5): deterministic `SimCluster` reachability
 /// smoke for `ExecuteStatement`/`BatchExecuteStatement`/`ExecuteTransaction`
 /// (PartiQL, ADR 0071) — `dynamo::dispatch_item_op` gained three match arms
-/// calling new parallel generic siblings (`execute_statement_as`/
-/// `run_batch_execute_statement_as`/`execute_transaction_as`), routing
-/// every wire PartiQL request issued through `SimClusterHandle::dynamo` the
-/// exact way `run_operation`'s own production arms do. See this module's
+/// calling the generic `execute_statement`/
+/// `run_batch_execute_statement`/`execute_transaction`, the same ones
+/// `run_operation`'s production arms call, so every wire PartiQL request
+/// issued through `SimClusterHandle::dynamo` runs the production path. See this module's
 /// own doc for the five scenarios (`INSERT` then `SELECT`, `UPDATE`/
 /// `DELETE` with `RETURNING`, a mixed `BatchExecuteStatement`, an
 /// `ExecuteTransaction` commit across two tables, and a condition-failed
 /// cancel) and `crates/animusd/CLAUDE.md`'s matching entry for the full
-/// account, including the two mutual-recursion cycles this rung closes.
+/// account.
 /// Deeper PartiQL fault-injection coverage is PR 6's own scope.
 #[cfg(test)]
 mod sim_cluster_dynamo_partiql;
