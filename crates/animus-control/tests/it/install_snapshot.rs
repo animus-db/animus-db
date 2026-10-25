@@ -545,7 +545,7 @@ fn caught_up_control_node_reships_non_empty() {
 /// restarts mid-chunked-transfer and loses its volatile `incoming_snapshot`
 /// buffer must not permanently deadlock the leader's resend logic.
 /// `handle_install_snapshot_resp`'s monotonic `max` guard on
-/// `snapshot_offset` (added to keep out-of-order acks from regressing an
+/// `SnapshotSend::acked_offset` (added to keep out-of-order acks from regressing an
 /// in-flight transfer) used to also swallow a follower's own honest
 /// post-restart reset: the only way that response's `next_offset` field
 /// can ever legitimately report exactly `0` again mid-transfer is a

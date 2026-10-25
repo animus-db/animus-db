@@ -115,7 +115,7 @@ const SNAPSHOT_COMPACT_DEFER_CEILING: u64 = SNAPSHOT_THRESHOLD * 8;
 /// `RaftCore::snapshot_chunk_advances` (a genuine forward-progress counter,
 /// already the exact metric `snapshot_resend_bound.rs` uses for the
 /// identical reason — see `animus-control/CLAUDE.md`'s entry on why it,
-/// not `snapshot_offset`, is the right denominator) across every peer
+/// not `SnapshotSend::acked_offset`, is the right denominator) across every peer
 /// `RaftCore::snapshot_transfer_peers` names; `compact_defer_since` resets
 /// to `now` every time that sum changes, so it always measures "how long
 /// since the last real chunk actually shipped a NEW offset," never how
