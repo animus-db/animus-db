@@ -68,9 +68,19 @@
 //! level can contain a given key, so read amplification is bounded by the number
 //! of levels rather than the total table count.
 //!
-//! - **L0→L1**: once `compaction_trigger` L0 tables accumulate, all L0 tables are
-//!   merged with every L1 table their combined key range overlaps, and the result
-//!   is re-partitioned into non-overlapping L1 runs (each ≈`target_table_bytes`).
+//! - **L0→L1**: once `compaction_trigger` L0 tables accumulate *and* L0 holds at
+//!   least `overlapping_L1_bytes / level_fanout` bytes (the L1 tables that overlap
+//!   L0's key range; all of L1 for hashed keys, none for in-order keys), all L0
+//!   tables are merged with every L1
+//!   table their combined key range overlaps, and the result is re-partitioned
+//!   into non-overlapping L1 runs (each ≈`target_table_bytes`). The byte floor
+//!   keeps write amplification at about `level_fanout` however large L1 grows
+//!   (issue #1389): hashed keys make every L0->L1 rewrite all of L1.
+//! - **L0→L0**: at the table-count trigger but below that byte floor, a
+//!   size-tiered group of the smallest L0 tables is merged among themselves back
+//!   into L0 (`l0_merge_group`), keeping the table count (reads, ADR 0081
+//!   stall) bounded without rewriting L1. Reads pick by version, never by table
+//!   order, so the output's newer seq changes nothing.
 //! - **Ln→L(n+1)** (n≥1): when a level exceeds its table budget
 //!   (`L1_TABLE_BUDGET * level_fanout^(n-1)`), its tables are merged with the
 //!   overlapping L(n+1) tables and re-partitioned into L(n+1).
@@ -1935,6 +1945,14 @@ impl<E: Env> LsmEngine<E> {
     fn plan_input_bytes(&self, plan: &CompactionPlan) -> u64 {
         let inner = self.lock();
         let tables = &inner.manifest.tables;
+        if plan.l0_merge {
+            let group = l0_merge_group(tables, &self.opts);
+            return tables
+                .iter()
+                .filter(|m| m.level == 0 && group.contains(&m.seq))
+                .map(|m| m.file_size)
+                .sum();
+        }
         let mut bounds: Option<(Key, Key)> = None;
         let mut bytes = 0u64;
         for m in tables.iter().filter(|m| m.level == plan.source_level) {
@@ -2602,7 +2620,7 @@ impl<E: Env> LsmEngine<E> {
         // by whoever held the lock first) degrades to a harmless re-plan or
         // no-op.
         let _maintenance = self.acquire_maintenance(MaintenanceClass::Compaction).await;
-        let target_level = plan.source_level + 1;
+        let target_level = plan.target_level();
 
         // Pick inputs under the lock: all readers at the source level, plus the
         // target-level readers overlapping the source's combined key range. Also
@@ -2618,23 +2636,33 @@ impl<E: Env> LsmEngine<E> {
         let (input_readers, input_seqs, max_version, held_floor, deeper_ranges) = {
             let inner = self.lock();
             let mut input_readers: Vec<SsTableReader> = Vec::new();
-            let mut source_bounds: Option<(Key, Key)> = None;
-            for (reader, meta) in inner.readers.iter().zip(&inner.manifest.tables) {
-                if meta.level == plan.source_level {
-                    if let (Some(lo), Some(hi)) = (&meta.min_key, &meta.max_key) {
-                        source_bounds = Some(match source_bounds {
-                            None => (lo.clone(), hi.clone()),
-                            Some((slo, shi)) => (slo.min(lo.clone()), shi.max(hi.clone())),
-                        });
-                    }
-                    input_readers.push(reader.clone());
-                }
-            }
-            // Overlapping target-level tables (non-overlapping among themselves).
-            if let Some((slo, shi)) = &source_bounds {
+            if plan.l0_merge {
+                // L0->L0 (issue #1389): only the size-tiered group, no L1.
+                let group = l0_merge_group(&inner.manifest.tables, &self.opts);
                 for (reader, meta) in inner.readers.iter().zip(&inner.manifest.tables) {
-                    if meta.level == target_level && ranges_overlap(meta, slo, shi) {
+                    if meta.level == 0 && group.contains(&meta.seq) {
                         input_readers.push(reader.clone());
+                    }
+                }
+            } else {
+                let mut source_bounds: Option<(Key, Key)> = None;
+                for (reader, meta) in inner.readers.iter().zip(&inner.manifest.tables) {
+                    if meta.level == plan.source_level {
+                        if let (Some(lo), Some(hi)) = (&meta.min_key, &meta.max_key) {
+                            source_bounds = Some(match source_bounds {
+                                None => (lo.clone(), hi.clone()),
+                                Some((slo, shi)) => (slo.min(lo.clone()), shi.max(hi.clone())),
+                            });
+                        }
+                        input_readers.push(reader.clone());
+                    }
+                }
+                // Overlapping target-level tables (non-overlapping among themselves).
+                if let Some((slo, shi)) = &source_bounds {
+                    for (reader, meta) in inner.readers.iter().zip(&inner.manifest.tables) {
+                        if meta.level == target_level && ranges_overlap(meta, slo, shi) {
+                            input_readers.push(reader.clone());
+                        }
                     }
                 }
             }
@@ -2645,7 +2673,13 @@ impl<E: Env> LsmEngine<E> {
                 .manifest
                 .tables
                 .iter()
-                .filter(|m| m.level > target_level)
+                // An L0->L0 merge leaves other L0 tables behind; they may hold
+                // an older value a reclaimed tombstone would unhide, so they
+                // count as deeper (L1+ always does).
+                .filter(|m| {
+                    m.level > target_level
+                        || (plan.l0_merge && m.level == 0 && !input_seqs.contains(&m.seq))
+                })
                 .filter_map(|m| match (&m.min_key, &m.max_key) {
                     (Some(lo), Some(hi)) => Some((lo.clone(), hi.clone())),
                     _ => None,
@@ -2702,7 +2736,17 @@ impl<E: Env> LsmEngine<E> {
 
         // Partition into non-overlapping runs of ≈target_table_bytes, splitting
         // only on a key boundary so each run owns a disjoint key range.
-        let partitions = partition_records(&merged, self.opts.target_table_bytes);
+        //
+        // An L0->L0 merge writes ONE table: L0 tables may overlap, so there is
+        // nothing to partition for, and re-splitting at `target_table_bytes`
+        // could turn N inputs into N or more outputs, so the L0 count would
+        // not fall and the merge could repeat forever.
+        let partition_bytes = if plan.l0_merge {
+            usize::MAX
+        } else {
+            self.opts.target_table_bytes
+        };
+        let partitions = partition_records(&merged, partition_bytes);
 
         // Allocate sequence numbers and write each run at the target level.
         let mut new_metas: Vec<SsTableMeta> = Vec::with_capacity(partitions.len());
@@ -4072,26 +4116,54 @@ impl<E: Env> Snapshot for LsmSnapshot<E> {
 }
 
 /// A chosen compaction: merge `source_level` (and the overlapping
-/// `source_level + 1` tables) down into `source_level + 1`.
+/// `source_level + 1` tables) down into `source_level + 1`, or, for an
+/// [`l0_merge`](Self::l0_merge), merge a few L0 tables among themselves back
+/// into L0 (issue #1389).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CompactionPlan {
     source_level: u32,
+    /// L0->L0: merge the group [`l0_merge_group`] picks into L0 itself, without
+    /// touching L1. Only ever set with `source_level == 0`.
+    l0_merge: bool,
+}
+
+impl CompactionPlan {
+    /// A leveled compaction of `source_level` into `source_level + 1`.
+    const fn leveled(source_level: u32) -> Self {
+        Self {
+            source_level,
+            l0_merge: false,
+        }
+    }
+
+    /// The level the merged output lands in.
+    const fn target_level(&self) -> u32 {
+        if self.l0_merge {
+            0
+        } else {
+            self.source_level + 1
+        }
+    }
 }
 
 /// Pure policy behind [`LsmEngine::next_compaction`]: given the current table
-/// set and tuning options, decide the next compaction to run, if any. Prefers
-/// an L0→L1 compaction (the flush tier fills fastest); otherwise the
-/// shallowest L≥1 over budget cascades down one level. `None` means neither
-/// condition is met — the caller has nothing to do.
+/// set and tuning options, decide the next compaction to run, if any.
 ///
-/// Applying the returned plan changes the table counts that fed this
-/// decision (a compaction merges `source_level`'s tables — and any
-/// overlapping `source_level + 1` tables — down into `source_level + 1`, so
-/// `source_level`'s count drops to 0 and `source_level + 1`'s count changes
-/// by at most the merge). Re-deriving a plan from the *post-compaction*
-/// table counts is therefore guaranteed to eventually return `None`: L0
-/// only grows via new flushes (never via this function), and cascading a
-/// level down strictly reduces that level's own backlog, so no fixed table
+/// * L0 at `compaction_trigger` tables is the first priority (the flush tier
+///   fills fastest). Issue #1389: an L0->L1 compaction rewrites every
+///   overlapping L1 table, which for hashed keys is all of L1, so it only runs
+///   once L0 holds at least `overlapping_L1_bytes / level_fanout` bytes (write
+///   amplification of about `level_fanout` per byte, independent of how large
+///   L1 has grown). Below that, the L0 tables are merged among themselves
+///   (`l0_merge`): the table count the reads and the ADR 0081 stall key on stays
+///   bounded and L1 is not rewritten.
+/// * Otherwise the shallowest L>=1 over its table budget cascades down one level.
+///
+/// `None` means neither condition is met -- the caller has nothing to do.
+///
+/// Termination: an L0->L1 or L1+ compaction empties its source level (as
+/// before); an L0->L0 merge always has at least two inputs, so it strictly
+/// reduces the L0 table count. L0 only grows via new flushes, so no fixed table
 /// set can make this function return `Some` forever.
 fn next_compaction_plan(tables: &[SsTableMeta], opts: &LsmOptions) -> Option<CompactionPlan> {
     // Count tables per level.
@@ -4099,19 +4171,80 @@ fn next_compaction_plan(tables: &[SsTableMeta], opts: &LsmOptions) -> Option<Com
     for t in tables {
         *by_level.entry(t.level).or_default() += 1;
     }
-    // L0 → L1 when enough flush-tier tables piled up.
-    if by_level.get(&0).copied().unwrap_or(0) >= opts.compaction_trigger {
-        return Some(CompactionPlan { source_level: 0 });
+    let l0_count = by_level.get(&0).copied().unwrap_or(0);
+    if l0_count >= opts.compaction_trigger {
+        let l0_bytes: u64 = tables
+            .iter()
+            .filter(|t| t.level == 0)
+            .map(|t| t.file_size)
+            .sum();
+        let fanout = u64::try_from(opts.level_fanout.max(1)).unwrap_or(u64::MAX);
+        if l0_count < 2 || l0_bytes >= l1_rewrite_bytes(tables) / fanout {
+            return Some(CompactionPlan::leveled(0));
+        }
+        return Some(CompactionPlan {
+            source_level: 0,
+            l0_merge: true,
+        });
     }
     // Otherwise the shallowest level ≥1 over its table budget cascades down.
     for (&level, &count) in by_level.range(1..) {
         if count > level_table_budget(level, opts) {
-            return Some(CompactionPlan {
-                source_level: level,
-            });
+            return Some(CompactionPlan::leveled(level));
         }
     }
     None
+}
+
+/// Bytes of the L1 tables an L0->L1 compaction would rewrite: those whose key
+/// range overlaps the combined key range of L0. For hashed keys that is all of
+/// L1; for keys that arrive in order (time series, counters) it is nothing, so
+/// L0 drains straight into L1 as before and costs no extra amplification.
+fn l1_rewrite_bytes(tables: &[SsTableMeta]) -> u64 {
+    let mut bounds: Option<(&Key, &Key)> = None;
+    for t in tables.iter().filter(|t| t.level == 0) {
+        if let (Some(lo), Some(hi)) = (&t.min_key, &t.max_key) {
+            bounds = Some(match bounds {
+                None => (lo, hi),
+                Some((slo, shi)) => (slo.min(lo), shi.max(hi)),
+            });
+        }
+    }
+    let Some((lo, hi)) = bounds else { return 0 };
+    tables
+        .iter()
+        .filter(|t| t.level == 1 && ranges_overlap(t, lo, hi))
+        .map(|t| t.file_size)
+        .sum()
+}
+
+/// The L0 tables (by seq) an L0->L0 merge consumes: size-tiered, smallest
+/// first, so a byte is rewritten about `log2(L0 bytes / flush size)` times
+/// before the L0->L1 byte trigger moves it down, rather than once per merge.
+/// Starts from the two smallest tables and keeps adding the next-smallest while
+/// it is no larger than everything chosen so far, but never fewer tables than
+/// bring the count back under `compaction_trigger`. Fewer than two L0 tables
+/// yields an empty group (nothing to merge).
+fn l0_merge_group(tables: &[SsTableMeta], opts: &LsmOptions) -> Vec<u64> {
+    let mut l0: Vec<&SsTableMeta> = tables.iter().filter(|t| t.level == 0).collect();
+    if l0.len() < 2 {
+        return Vec::new();
+    }
+    l0.sort_by_key(|t| (t.file_size, t.seq));
+    // Never merge fewer tables than it takes to get back under the trigger
+    // (`count - n + 1 < trigger`), so a burst of flushes cannot outrun the merges.
+    let min_n = (l0.len() + 2)
+        .saturating_sub(opts.compaction_trigger)
+        .clamp(2, l0.len());
+    let mut sum = l0[..min_n]
+        .iter()
+        .fold(0u64, |a, t| a.saturating_add(t.file_size));
+    let mut n = min_n;
+    while n < l0.len() && l0[n].file_size <= sum {
+        sum = sum.saturating_add(l0[n].file_size);
+        n += 1;
+    }
+    l0[..n].iter().map(|t| t.seq).collect()
 }
 
 /// Max tables allowed at `level` (≥1) before it cascades into `level+1`:
@@ -6274,6 +6407,102 @@ mod compaction_policy_tests {
         }
     }
 
+    /// A table over the full key range `[0x00, 0xff]` (hashed keys: every table
+    /// overlaps every other).
+    fn sized(level: u32, seq: u64, file_size: u64) -> SsTableMeta {
+        SsTableMeta {
+            seq,
+            file_size,
+            min_key: Some(vec![0x00]),
+            max_key: Some(vec![0xff]),
+            ..table_at(level)
+        }
+    }
+
+    // -- issue #1389: byte-based L0 trigger ----------------------------
+
+    #[test]
+    fn l0_below_l1_byte_floor_merges_l0_only() {
+        // 4 L0 tables of 25 KB (100 KB) against 8 MB of L1 at fanout 4
+        // (floor 2 MB): L0->L0, not L0->L1.
+        let mut tables: Vec<_> = (0..4).map(|i| sized(0, i, 25_000)).collect();
+        tables.extend((10..14).map(|i| sized(1, i, 2_000_000)));
+        let plan = next_compaction_plan(&tables, &opts(4, 4)).unwrap();
+        assert!(plan.l0_merge && plan.source_level == 0 && plan.target_level() == 0);
+        assert_eq!(l0_merge_group(&tables, &opts(4, 4)).len(), 4);
+    }
+
+    #[test]
+    fn l0_at_l1_byte_floor_compacts_into_l1() {
+        let mut tables: Vec<_> = (0..4).map(|i| sized(0, i, 500_000)).collect();
+        tables.extend((10..14).map(|i| sized(1, i, 2_000_000)));
+        assert_eq!(
+            next_compaction_plan(&tables, &opts(4, 4)),
+            Some(CompactionPlan::leveled(0))
+        );
+    }
+
+    #[test]
+    fn in_order_keys_never_wait_for_the_l1_floor() {
+        // L0 holds keys above every L1 table: nothing in L1 is rewritten, so
+        // L0 compacts into L1 as soon as the count trigger fires.
+        let mut tables: Vec<_> = (0..4).map(|i| sized(0, i, 100)).collect();
+        for t in &mut tables {
+            t.min_key = Some(vec![0x80]);
+        }
+        tables.extend((10..14).map(|i| {
+            let mut t = sized(1, i, 2_000_000);
+            t.max_key = Some(vec![0x7f]);
+            t
+        }));
+        assert_eq!(
+            next_compaction_plan(&tables, &opts(4, 4)),
+            Some(CompactionPlan::leveled(0))
+        );
+    }
+
+    #[test]
+    fn l0_merge_group_is_size_tiered_and_at_least_two() {
+        let tables = vec![
+            sized(0, 1, 1_000),
+            sized(0, 2, 100),
+            sized(0, 3, 100),
+            sized(0, 4, 150),
+            sized(0, 5, 10_000),
+            sized(1, 9, 1),
+        ];
+        let mut g = l0_merge_group(&tables, &opts(4, 4));
+        g.sort_unstable();
+        // 100+100 = 200 -> 150 joins (350) -> 1000 > 350 stops.
+        assert_eq!(g, vec![2, 3, 4]);
+        assert!(l0_merge_group(&[sized(0, 1, 5), sized(1, 2, 5)], &opts(4, 4)).is_empty());
+        // Two tables where the second dwarfs the first still merge (progress).
+        assert_eq!(
+            l0_merge_group(&[sized(0, 1, 1), sized(0, 2, 1 << 30)], &opts(4, 4)).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn l0_merge_group_gets_a_backlog_back_under_the_trigger() {
+        // 8 L0 tables at trigger 4: merging just the two smallest would leave
+        // 7; the group must be at least 6 tables, leaving 3.
+        let mut tables: Vec<_> = (0..8).map(|i| sized(0, i, 1_000 * (1 << i))).collect();
+        tables.extend((10..14).map(|i| sized(1, i, 100_000_000)));
+        let o = opts(4, 4);
+        let n = l0_merge_group(&tables, &o).len();
+        assert!(8 - n + 1 < o.compaction_trigger, "group of {n}");
+    }
+
+    #[test]
+    fn single_l0_table_trigger_one_never_plans_a_merge() {
+        let tables = vec![sized(0, 1, 10), sized(1, 2, 1 << 30)];
+        assert_eq!(
+            next_compaction_plan(&tables, &opts(1, 4)),
+            Some(CompactionPlan::leveled(0))
+        );
+    }
+
     // -- table-driven truth table --------------------------------------
 
     #[test]
@@ -6292,7 +6521,7 @@ mod compaction_policy_tests {
         let tables = tables_at(0, 4);
         assert_eq!(
             next_compaction_plan(&tables, &opts(4, 4)),
-            Some(CompactionPlan { source_level: 0 })
+            Some(CompactionPlan::leveled(0))
         );
     }
 
@@ -6301,7 +6530,7 @@ mod compaction_policy_tests {
         let tables = tables_at(0, 9);
         assert_eq!(
             next_compaction_plan(&tables, &opts(4, 4)),
-            Some(CompactionPlan { source_level: 0 })
+            Some(CompactionPlan::leveled(0))
         );
     }
 
@@ -6318,7 +6547,7 @@ mod compaction_policy_tests {
         let tables = tables_at(1, 5);
         assert_eq!(
             next_compaction_plan(&tables, &opts(4, 4)),
-            Some(CompactionPlan { source_level: 1 })
+            Some(CompactionPlan::leveled(1))
         );
     }
 
@@ -6328,7 +6557,7 @@ mod compaction_policy_tests {
         tables.extend(tables_at(1, 5));
         assert_eq!(
             next_compaction_plan(&tables, &opts(4, 4)),
-            Some(CompactionPlan { source_level: 0 }),
+            Some(CompactionPlan::leveled(0)),
             "L0->L1 must win over any L1+ cascade candidate"
         );
     }
@@ -6341,7 +6570,7 @@ mod compaction_policy_tests {
         tables.extend(tables_at(2, 20));
         assert_eq!(
             next_compaction_plan(&tables, &opts(4, 4)),
-            Some(CompactionPlan { source_level: 1 })
+            Some(CompactionPlan::leveled(1))
         );
     }
 
@@ -6352,7 +6581,7 @@ mod compaction_policy_tests {
         tables.extend(tables_at(2, 17));
         assert_eq!(
             next_compaction_plan(&tables, &opts(4, 4)),
-            Some(CompactionPlan { source_level: 2 })
+            Some(CompactionPlan::leveled(2))
         );
     }
 
@@ -6365,7 +6594,7 @@ mod compaction_policy_tests {
         let over = tables_at(2, 13);
         assert_eq!(
             next_compaction_plan(&over, &opts(4, 3)),
-            Some(CompactionPlan { source_level: 2 })
+            Some(CompactionPlan::leveled(2))
         );
     }
 
@@ -6389,6 +6618,12 @@ mod compaction_policy_tests {
     /// worst case for how much backlog can pile up one level down — if the
     /// cascade terminates under this model, it terminates in reality too.
     fn apply_worst_case(by_level: &mut BTreeMap<u32, usize>, plan: CompactionPlan) {
+        if plan.l0_merge {
+            // Worst case: the group is two tables, merged into one.
+            let l0 = by_level.entry(0).or_default();
+            *l0 = l0.saturating_sub(1);
+            return;
+        }
         let consumed = by_level.remove(&plan.source_level).unwrap_or(0);
         *by_level.entry(plan.source_level + 1).or_default() += consumed;
     }
@@ -6472,7 +6707,7 @@ mod compaction_policy_tests {
             tables.extend(tables_at(1, l1));
             prop_assert_eq!(
                 next_compaction_plan(&tables, &opts(trigger, fanout)),
-                Some(CompactionPlan { source_level: 0 })
+                Some(CompactionPlan::leveled(0))
             );
         }
 
@@ -6492,9 +6727,9 @@ mod compaction_policy_tests {
             let mut tables = tables_at(1, l1);
             tables.extend(tables_at(2, l2));
             let expected = if l1 > l1_budget {
-                Some(CompactionPlan { source_level: 1 })
+                Some(CompactionPlan::leveled(1))
             } else if l2 > l2_budget {
-                Some(CompactionPlan { source_level: 2 })
+                Some(CompactionPlan::leveled(2))
             } else {
                 None
             };

@@ -191,7 +191,11 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   tables carry a `level`; L0 is the overlapping flush tier, L1+ hold
   non-overlapping runs (re-partitioned on key boundaries to ≈`target_table_bytes`),
   so read amplification is bounded by level count. L0→L1 fires at
-  `compaction_trigger`; deeper levels cascade over a fanout-scaled budget. Reads
+  `compaction_trigger` **and** once L0 holds `overlapping_L1_bytes / level_fanout` bytes (issue
+  #1389: hashed keys make L0→L1 rewrite all of L1, so without the byte floor write
+  amplification grows with tablet size); at the count trigger below that floor a
+  size-tiered group of L0 tables is merged L0→L0 (`l0_merge_group`, ADR 0081's
+  2026-10-25 amendment); deeper levels cascade over a fanout-scaled budget. Reads
   merge the memtable (newest) with SSTables newest→oldest by version, matching
   `MemoryEngine` exactly (a differential proptest in `lsm_semantics.rs` pins this).
 - **Tombstone GC happens during compaction** (`gc_obsolete_records` in `lsm.rs`):
@@ -805,7 +809,7 @@ multi-thread test; the sim proves logic/order, not real-thread races.
 its workload actually reaches — drive the *maintenance* machinery (cross
 the flush threshold), not just the write path.
 
-`LsmEngine::next_compaction`'s level-picking policy (L0→L1 trigger, then
+`LsmEngine::next_compaction`'s level-picking policy (L0→L1 trigger with its L1-bytes floor and the L0→L0 merge, then
 shallowest-over-budget cascade) is extracted as a free function,
 `next_compaction_plan(tables, opts)`, specifically so it's unit/property-
 testable without a live engine — see `compaction_policy_tests` in
@@ -913,6 +917,15 @@ The LSM WAL/manifest/SSTable decoders are the `lsm_formats` fuzz target, reached
   write runs the due compaction inline and queues on the compaction lane itself). The 1 x 8
   throughput limit is now compaction cost (L0 to L1 rewrites all of L1). See
   `docs/lessons/code-patterns/2026-10-18-flush-that-defers-to-in-flight-applies-starves-under-concurrent-writers.md`.
+- Compaction write amplification (#1389): `tests/it/lsm_compaction_wa.rs`
+  (`ANIMUS_COMPACTION_WA_SEEDS`, `_MB`, `_PRINT=1`) ingests up to 64 MB of hashed-key puts at
+  production sizes and bounds compaction input bytes per ingested byte per power-of-two window; it
+  FAILS on the pre-fix policy. Gotchas: use **incompressible** values (SSTable blocks are lz4, a
+  zero-filled value reads as WA below 1); an L0->L0 merge must treat the L0 tables it leaves behind as
+  "deeper" for tombstone GC (`run_compaction`'s `deeper_ranges`), else a reclaimed tombstone resurrects
+  an older value; `CompactionPlan::l0_merge` plans must recompute the group under the maintenance lock
+  (`l0_merge_group`), an empty group is a no-op. See
+  `docs/lessons/code-patterns/2026-10-25-lsm-compaction-write-amp-scales-with-tablet-size-and-throttles-writes-via-the-l0-stall.md`.
 - `tests/lsm_stall_prod.rs` is the `ProdEnv` liveness test (own target, timeout-guarded).
 
 ## Directory-entry durability under `SimEnv` (PR #27)
