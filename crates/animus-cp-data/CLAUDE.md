@@ -3646,3 +3646,14 @@ used to be opened without it). Corpora: `tests/it/compaction_io_budget_corpus.rs
 cells and controls), `tests/it/lsm_stall_admission.rs` (a stall reaches the client as `Busy`
 through the ADR 0080 / #1330 bound, never a panic), and the ignored
 `tests/it/lsm_stall_measure.rs` characterisation sweep. Knob: `ANIMUS_LSM_STALL_SEEDS`.
+
+## Group-start scans are chunked (soak RSS finding, 2026-10-25)
+
+`StorageScope::has_data` and `rebuild_txn_tracker` visit the tablet in key-byte sub-ranges (`scan_chunk_ranges` /
+`for_each_scan_chunk`) instead of one `storage.scan` over the whole range: a single scan materialises every row at
+once (about 1.3 KB per transaction of history), and the allocator keeps that high-water mark as RSS, so a node
+restarted over and over grew with total history (87 -> 150 MB over 8 h). Any new "once per group start" scan over a
+whole kind scope must do the same (`scan_hot_change_max`, the seal-marker scan and `raw_scoped_keys` still scan whole
+ranges; they are small or erase-only today). Tests: `scan_chunk_tests` in `lib.rs`. The tracker itself still holds
+every decided record of the history (issue #1380, a design question). Lesson:
+`docs/lessons/code-patterns/2026-10-25-a-group-start-scan-that-materialises-the-whole-tablet-becomes-rss-proportional-to-history.md`.

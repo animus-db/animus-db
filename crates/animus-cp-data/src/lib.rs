@@ -799,19 +799,32 @@ impl StorageScope {
         // must still read as "no data" for the reforming-vs-fresh-join
         // decision this presence check exists for.
         let (start, end) = self.physical_bounds();
-        let rows = match end {
-            Some(end) => storage.scan(&start, &end).await,
+        let is_user_row = |k: &[u8]| {
+            self.strip_in_range(k)
+                .is_some_and(|logical| !txn::is_internal_key(logical))
+        };
+        match end {
+            // One bounded sub-range at a time, stopping at the first user row
+            // (the common case answers from the first non-empty chunk): the
+            // whole range is never materialised at once (see
+            // [`scan_chunk_ranges`]).
+            Some(end) => {
+                let mut found = false;
+                for_each_scan_chunk(storage, &start, &end, |rows| {
+                    found = rows.iter().any(|(k, _)| is_user_row(k));
+                    !found
+                })
+                .await;
+                found
+            }
             // Only `StorageScope::whole()`'s parent scope (no prefix at all)
             // has no finite bound; a kind scope's never hits this.
-            None => storage.entries().await,
-        };
-        rows.map(|rows| {
-            rows.iter().any(|(k, _)| {
-                self.strip_in_range(k)
-                    .is_some_and(|logical| !txn::is_internal_key(logical))
-            })
-        })
-        .unwrap_or(false)
+            None => storage
+                .entries()
+                .await
+                .map(|rows| rows.iter().any(|(k, _)| is_user_row(k)))
+                .unwrap_or(false),
+        }
     }
 
     /// This kind scope's own physical `(start, end)` bounds, for every
@@ -850,6 +863,85 @@ fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
         }
     }
     None
+}
+
+/// How many sub-ranges [`scan_chunk_ranges`] yields at least, for any range
+/// that is not itself nearly empty of distinct byte values (the unit tests
+/// pin this).
+#[cfg(test)]
+const SCAN_CHUNKS_MIN: usize = 32;
+
+/// Partition `[start, end)` into ordered, contiguous, disjoint sub-ranges
+/// that together cover it exactly, cut on the key bytes: at every
+/// `p ++ [b]` strictly inside the range, for `p` the common prefix of
+/// `start` and `end`, `start` through one byte past it, and `end` through
+/// one byte past it. A tablet's keys lead with a Murmur3 token (ADR 0022),
+/// so equal-width byte ranges hold about equal row counts; the one-byte-past
+/// cuts matter because the usual range is a whole kind, `[kind]..[kind+1]`,
+/// which has no byte strictly between its bounds and is cut at `[kind, b]`.
+///
+/// **Why this exists (soak finding, `docs/soak.md`):** the group-start scans
+/// — [`StorageScope::has_data`] and [`rebuild_txn_tracker`] — used to
+/// `storage.scan(start, end)` the *whole* range in one call, which
+/// materialises every row at once (the LSM builds a merged map and then a
+/// result `Vec`, about 1.3 KB per transaction of history). It is freed right
+/// after, but the allocator keeps the high-water mark as RSS, so a node that
+/// is restarted over and over ends up holding memory proportional to the
+/// total history, not to what it keeps alive. Visiting one sub-range at a
+/// time bounds the transient to roughly 1/256 of the data.
+fn scan_chunk_ranges(start: &[u8], end: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    if start >= end {
+        return Vec::new();
+    }
+    let lcp = start.iter().zip(end).take_while(|(a, b)| a == b).count();
+    let mut prefixes: Vec<&[u8]> = vec![&start[..lcp]];
+    if start.len() > lcp {
+        prefixes.push(&start[..=lcp]);
+    }
+    if end.len() > lcp {
+        prefixes.push(&end[..=lcp]);
+    }
+    let mut cuts: Vec<Vec<u8>> = Vec::new();
+    for prefix in prefixes {
+        for b in 0..=u8::MAX {
+            let mut cut = prefix.to_vec();
+            cut.push(b);
+            if cut.as_slice() > start && cut.as_slice() < end {
+                cuts.push(cut);
+            }
+        }
+    }
+    cuts.sort();
+    cuts.dedup();
+    let mut bounds = Vec::with_capacity(cuts.len() + 2);
+    bounds.push(start.to_vec());
+    bounds.extend(cuts);
+    bounds.push(end.to_vec());
+    bounds
+        .windows(2)
+        .map(|w| (w[0].clone(), w[1].clone()))
+        .collect()
+}
+
+/// Scan `[start, end)` one [`scan_chunk_ranges`] sub-range at a time, in key
+/// order, handing each chunk's rows to `visit` (which owns them and drops
+/// them before the next chunk is read). `visit` returns whether to continue.
+/// A failed chunk read ends the walk, exactly as the single whole-range scan
+/// this replaces treated an error: the rows seen so far are all there is.
+async fn for_each_scan_chunk<S: StorageEngine>(
+    storage: &S,
+    start: &[u8],
+    end: &[u8],
+    mut visit: impl FnMut(Vec<(Vec<u8>, animus_storage::VersionedValue)>) -> bool,
+) {
+    for (a, b) in scan_chunk_ranges(start, end) {
+        let Ok(rows) = storage.scan(&a, &b).await else {
+            return;
+        };
+        if !visit(rows) {
+            return;
+        }
+    }
 }
 
 impl Default for StorageScope {
@@ -2419,47 +2511,52 @@ async fn stage_intent_prior<S: StorageEngine>(
 /// range has a finite end, else the same whole-engine-then-filter fallback
 /// `engine_image`/`has_data` already use for an unbounded range).
 async fn rebuild_txn_tracker<S: StorageEngine>(storage: &S, scope: &StorageScope) -> TxnTracker {
-    let range = scope.range();
-    let rows: Vec<(Vec<u8>, animus_storage::VersionedValue)> = match &range.end {
-        Some(end) => {
-            let physical_start = scope.physical(&range.start);
-            let physical_end = scope.physical(end);
-            storage
-                .scan(&physical_start, &physical_end)
-                .await
-                .unwrap_or_default()
-        }
-        None => storage.entries().await.unwrap_or_default(),
-    };
     let mut tracker = TxnTracker::default();
-    for (physical_key, vv) in rows {
-        let Some(logical) = scope.strip_in_range(&physical_key) else {
-            continue;
-        };
-        if !txn::is_record_key(logical) {
-            continue;
+    let mut absorb = |rows: Vec<(Vec<u8>, animus_storage::VersionedValue)>| {
+        for (physical_key, vv) in rows {
+            let Some(logical) = scope.strip_in_range(&physical_key) else {
+                continue;
+            };
+            if !txn::is_record_key(logical) {
+                continue;
+            }
+            let Some(record) = txn::decode_record(&vv.value) else {
+                continue;
+            };
+            match record.status {
+                txn::TxnStatus::Pending => {
+                    tracker
+                        .pending
+                        .insert(record.txn_id, (logical.to_vec(), record.created_ts));
+                }
+                txn::TxnStatus::Committed { commit_ts } => {
+                    tracker.unresolved_decided.insert(
+                        record.txn_id,
+                        (logical.to_vec(), txn::TxnOutcome::Committed { commit_ts }),
+                    );
+                }
+                txn::TxnStatus::Aborted => {
+                    tracker
+                        .unresolved_decided
+                        .insert(record.txn_id, (logical.to_vec(), txn::TxnOutcome::Aborted));
+                }
+            }
         }
-        let Some(record) = txn::decode_record(&vv.value) else {
-            continue;
-        };
-        match record.status {
-            txn::TxnStatus::Pending => {
-                tracker
-                    .pending
-                    .insert(record.txn_id, (logical.to_vec(), record.created_ts));
-            }
-            txn::TxnStatus::Committed { commit_ts } => {
-                tracker.unresolved_decided.insert(
-                    record.txn_id,
-                    (logical.to_vec(), txn::TxnOutcome::Committed { commit_ts }),
-                );
-            }
-            txn::TxnStatus::Aborted => {
-                tracker
-                    .unresolved_decided
-                    .insert(record.txn_id, (logical.to_vec(), txn::TxnOutcome::Aborted));
-            }
+    };
+    // One bounded sub-range at a time (see [`scan_chunk_ranges`]): this scan
+    // used to materialise every row of the tablet at once, which at a few
+    // hundred thousand transactions of history was tens of MB of transient
+    // allocation per group start that the allocator then kept as RSS.
+    match scope.physical_bounds() {
+        (start, Some(end)) => {
+            for_each_scan_chunk(storage, &start, &end, |rows| {
+                absorb(rows);
+                true
+            })
+            .await;
         }
+        // Only `StorageScope::whole()`'s parent scope (no prefix at all).
+        (_, None) => absorb(storage.entries().await.unwrap_or_default()),
     }
     tracker
 }
@@ -15892,5 +15989,318 @@ mod outcome_registry_bound_tests {
         exercise(StageOutcomes::default(), StageOutcome::Staged);
         exercise(ResolveOutcomes::default(), ResolveOutcome::Resolved);
         exercise(KindBatchOutcomes::default(), KindBatchOutcome::Applied);
+    }
+}
+
+/// Group-start scans must not materialise a whole tablet at once (soak RSS
+/// finding): the chunking helper's contract and the two callers' equivalence
+/// with the single whole-range scan they replaced.
+#[cfg(test)]
+mod scan_chunk_tests {
+    use super::*;
+    use animus_storage::MemoryEngine;
+
+    /// xorshift64*: a seeded, dependency-free generator.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn bytes(&mut self, max_len: usize) -> Vec<u8> {
+            let n = (self.next() % (max_len as u64 + 1)) as usize;
+            // Few distinct byte values so ranges share long prefixes.
+            (0..n).map(|_| (self.next() % 4) as u8 * 85).collect()
+        }
+    }
+
+    fn seed() -> u64 {
+        std::env::var("ANIMUS_SEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0x5CA9_C4A4)
+    }
+
+    /// The chunks tile `[start, end)` exactly: ordered, contiguous, disjoint,
+    /// non-empty, and every key in the range falls in exactly one.
+    #[test]
+    fn scan_chunk_ranges_tile_the_range_exactly() {
+        let mut rng = Rng(seed() | 1);
+        for round in 0..2000 {
+            let (mut a, mut b) = (rng.bytes(5), rng.bytes(5));
+            if a > b {
+                std::mem::swap(&mut a, &mut b);
+            }
+            let chunks = scan_chunk_ranges(&a, &b);
+            if a == b {
+                assert!(chunks.is_empty(), "seed {} round {round}", seed());
+                continue;
+            }
+            assert_eq!(chunks.first().map(|c| &c.0), Some(&a), "round {round}");
+            assert_eq!(chunks.last().map(|c| &c.1), Some(&b), "round {round}");
+            for w in chunks.windows(2) {
+                assert_eq!(w[0].1, w[1].0, "contiguous, round {round}");
+            }
+            for (lo, hi) in &chunks {
+                assert!(lo < hi, "non-empty chunk, round {round}");
+            }
+            for _ in 0..20 {
+                let k = rng.bytes(6);
+                let inside = k >= a && k < b;
+                let hits = chunks.iter().filter(|(lo, hi)| &k >= lo && &k < hi).count();
+                assert_eq!(
+                    hits,
+                    usize::from(inside),
+                    "key {k:?} in [{a:?},{b:?}) round {round}"
+                );
+            }
+        }
+    }
+
+    /// The point of the change: with token-spread keys no single chunk holds
+    /// more than a small fraction of the rows, so one `scan` call returns
+    /// a small fraction of the tablet. Includes a narrow range (a tablet
+    /// after many splits), which needs the second refinement level.
+    #[test]
+    fn scan_chunks_bound_the_rows_returned_per_call() {
+        futures::executor::block_on(async {
+            let mut rng = Rng(seed() | 1);
+            const N: usize = 20_000;
+            for (lo, hi) in [
+                (vec![0x00u8], vec![0x01u8]),
+                // Narrow: one first-token-byte value wide.
+                (vec![0x00, 0x40], vec![0x00, 0x41]),
+            ] {
+                let e = MemoryEngine::new();
+                let mut inserted = 0;
+                while inserted < N {
+                    let mut k = lo.clone();
+                    k.extend_from_slice(&rng.next().to_be_bytes());
+                    k.extend_from_slice(&rng.next().to_be_bytes());
+                    if k.as_slice() < hi.as_slice() && e.merge(&k, b"v", 1).await.unwrap() {
+                        inserted += 1;
+                    }
+                }
+                let chunks = scan_chunk_ranges(&lo, &hi);
+                assert!(
+                    chunks.len() >= SCAN_CHUNKS_MIN,
+                    "seed {}: {} chunks for {lo:?}..{hi:?}",
+                    seed(),
+                    chunks.len()
+                );
+                let (mut max_rows, mut total) = (0, 0);
+                for (a, b) in &chunks {
+                    let n = e.scan(a, b).await.unwrap().len();
+                    max_rows = max_rows.max(n);
+                    total += n;
+                }
+                assert_eq!(total, N, "the chunks cover every row once");
+                // Uniform keys: ~N/256 per chunk; allow 8x headroom for
+                // skew. The whole-range scan this replaces returned N.
+                assert!(
+                    max_rows <= N / 32,
+                    "seed {}: one chunk returned {max_rows} of {N} rows for {lo:?}..{hi:?}",
+                    seed()
+                );
+            }
+        });
+    }
+
+    /// The pre-change `rebuild_txn_tracker`, verbatim in effect: one whole-range scan.
+    async fn rebuild_whole_range<S: StorageEngine>(
+        storage: &S,
+        scope: &StorageScope,
+    ) -> TxnTracker {
+        let (start, end) = scope.physical_bounds();
+        let rows = storage
+            .scan(&start, &end.unwrap())
+            .await
+            .unwrap_or_default();
+        let mut t = TxnTracker::default();
+        for (pk, vv) in rows {
+            let Some(logical) = scope.strip_in_range(&pk) else {
+                continue;
+            };
+            if !txn::is_record_key(logical) {
+                continue;
+            }
+            let Some(r) = txn::decode_record(&vv.value) else {
+                continue;
+            };
+            match r.status {
+                txn::TxnStatus::Pending => {
+                    t.pending.insert(r.txn_id, (logical.to_vec(), r.created_ts));
+                }
+                txn::TxnStatus::Committed { commit_ts } => {
+                    t.unresolved_decided.insert(
+                        r.txn_id,
+                        (logical.to_vec(), txn::TxnOutcome::Committed { commit_ts }),
+                    );
+                }
+                txn::TxnStatus::Aborted => {
+                    t.unresolved_decided
+                        .insert(r.txn_id, (logical.to_vec(), txn::TxnOutcome::Aborted));
+                }
+            }
+        }
+        t
+    }
+
+    fn parent_scope() -> StorageScope {
+        StorageScope::new(KeyRange {
+            start: vec![0; 8],
+            end: Some(vec![0xff; 8]),
+        })
+    }
+
+    fn base_scope() -> StorageScope {
+        parent_scope().with_kind(KIND_BASE)
+    }
+
+    /// `rebuild_txn_tracker` finds exactly the records the single whole-range
+    /// scan found, over pending / committed / aborted records mixed with base
+    /// rows, resolved markers and rows of other kinds.
+    #[test]
+    fn chunked_rebuild_matches_the_whole_range_scan() {
+        futures::executor::block_on(async {
+            let mut rng = Rng(seed() | 1);
+            let scope = base_scope();
+            let e = MemoryEngine::new();
+            let node = animus_env::NodeId::propose("n0").unwrap();
+            for i in 0..3000u64 {
+                let token = rng.next().to_be_bytes().to_vec();
+                let txn_id = txn::TxnId {
+                    ts: HlcTimestamp {
+                        wall_ms: 1_000 + i,
+                        logical: (i % 3) as u32,
+                    },
+                    node: node.clone(),
+                };
+                let status = match i % 3 {
+                    0 => txn::TxnStatus::Pending,
+                    1 => txn::TxnStatus::Committed {
+                        commit_ts: HlcTimestamp {
+                            wall_ms: 2_000 + i,
+                            logical: 1,
+                        },
+                    },
+                    _ => txn::TxnStatus::Aborted,
+                };
+                let rec = txn::TxnRecord {
+                    txn_id: txn_id.clone(),
+                    status,
+                    intent_spans: Vec::new(),
+                    created_ts: HlcTimestamp {
+                        wall_ms: 1_000 + i,
+                        logical: 0,
+                    },
+                };
+                e.merge(
+                    &scope.physical(&txn::record_key(&token, &txn_id)),
+                    &txn::encode_record(&rec),
+                    i + 1,
+                )
+                .await
+                .unwrap();
+                let mut base = token.clone();
+                base.extend_from_slice(b"user-key");
+                e.merge(&scope.physical(&base), b"value", i + 1)
+                    .await
+                    .unwrap();
+                e.merge(
+                    &scope.physical(&txn::resolved_marker_key(&base)),
+                    &txn::encode_resolved_marker(&txn_id),
+                    i + 1,
+                )
+                .await
+                .unwrap();
+                // A row of a different kind sharing the token must be ignored.
+                e.merge(
+                    &parent_scope().with_kind(KIND_BASE + 1).physical(&base),
+                    b"x",
+                    i + 1,
+                )
+                .await
+                .unwrap();
+            }
+            let want = rebuild_whole_range(&e, &scope).await;
+            let got = rebuild_txn_tracker(&e, &scope).await;
+            assert!(!want.unresolved_decided.is_empty() && !want.pending.is_empty());
+            assert_eq!(got.pending, want.pending, "seed {}", seed());
+            assert_eq!(
+                got.unresolved_decided,
+                want.unresolved_decided,
+                "seed {}",
+                seed()
+            );
+        });
+    }
+
+    /// `has_data` answers as the whole-range scan did: internal bookkeeping
+    /// rows alone are "no data"; a user row anywhere in the range (first
+    /// chunk, last chunk, among thousands of internal rows) is "data"; an
+    /// empty engine, and user rows of another kind, are not.
+    #[test]
+    fn chunked_has_data_matches_the_whole_range_scan() {
+        futures::executor::block_on(async {
+            let scope = base_scope();
+            let node = animus_env::NodeId::propose("n0").unwrap();
+            let internal_rows = |e: &MemoryEngine, n: u64| {
+                let scope = scope.clone();
+                let node = node.clone();
+                let e = e.clone();
+                async move {
+                    for i in 0..n {
+                        let token = (i.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                            .to_be_bytes()
+                            .to_vec();
+                        let txn_id = txn::TxnId {
+                            ts: HlcTimestamp {
+                                wall_ms: 1 + i,
+                                logical: 0,
+                            },
+                            node: node.clone(),
+                        };
+                        let mut base = token.clone();
+                        base.extend_from_slice(b"k");
+                        e.merge(
+                            &scope.physical(&txn::resolved_marker_key(&base)),
+                            &txn::encode_resolved_marker(&txn_id),
+                            i + 1,
+                        )
+                        .await
+                        .unwrap();
+                    }
+                }
+            };
+            let e = MemoryEngine::new();
+            assert!(!scope.has_data(&e).await, "empty engine");
+            internal_rows(&e, 2000).await;
+            assert!(!scope.has_data(&e).await, "internal rows only");
+            e.merge(
+                &parent_scope().with_kind(KIND_BASE + 1).physical(&[1; 9]),
+                b"x",
+                9_999,
+            )
+            .await
+            .unwrap();
+            assert!(
+                !scope.has_data(&e).await,
+                "a row of another kind is not this kind's data"
+            );
+            for token_byte in [0x00u8, 0x7f, 0xfe] {
+                let e2 = MemoryEngine::new();
+                internal_rows(&e2, 2000).await;
+                let mut key = vec![token_byte; 8];
+                key.extend_from_slice(b"user");
+                e2.merge(&scope.physical(&key), b"v", 9_999).await.unwrap();
+                assert!(
+                    scope.has_data(&e2).await,
+                    "user row led by {token_byte:#04x}"
+                );
+            }
+        });
     }
 }
