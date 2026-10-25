@@ -1934,7 +1934,7 @@ freezes that type's absent-field semantics once merged.**
     a compaction defer. A peer the log still covers keeps getting ordinary
     `AppendEntries`.
   - **Everything sent to a departing peer rides one *time-based* send gate**
-    (`departing_send_gate`, `removal_sched`, `now_hint`). Not tick-count
+    (`departing_send_gate`, `DepartingPeer::sched`, `now_hint`). Not tick-count
     based: under a sustained writer `replicate_now` keeps pushing
     `heartbeat_deadline` out, the heartbeat tick never fires, and a
     tick-counting schedule would either send a notice per write or never.
@@ -1976,7 +1976,7 @@ freezes that type's absent-field semantics once merged.**
   - **Two silence bounds, not one (2026-09-29 live check).** A departing
     peer is dropped after `DEPARTING_NOTICE_GIVE_UP` (5 min) of silence from
     its last reply — unless it is on the **short** bound,
-    `DEPARTING_QUIET_GIVE_UP` (30s): `departing_quiet` holds peers that
+    `DEPARTING_QUIET_GIVE_UP` (30s): `DepartingPeer::quiet` marks peers that
     already **acked** their notice and peers **inherited** at
     `become_leader`. Both are overwhelmingly peers that have *left* (their
     host released the replica), and a released replica can never reply, so
@@ -1986,9 +1986,9 @@ freezes that type's absent-field semantics once merged.**
     so a live peer is unaffected, and a peer cut off early is still told by
     its own campaign (`stranger_notice`). Do not collapse the two into one
     constant without re-reading why a leader's own just-made, unanswered
-    removal keeps the long one. `departing_quiet` is pruned wherever
-    `departing` shrinks (`drop_departing`, the config-change retain,
-    `become_leader`).
+    removal keeps the long one. `quiet` (like `since` and `sched`) lives in the
+    per-peer `DepartingPeer` value in `departing`, so it is dropped with the
+    entry by construction — no satellite map to prune.
   - **`RaftCore::removal_stats()` (`RemovalStats`)** are lifetime counters the
     core keeps as plain facts (`notices_sent`/`notices_acked`/
     `notices_ignored`/`departing_dropped`); the CP-data driver emits the
@@ -2012,15 +2012,15 @@ freezes that type's absent-field semantics once merged.**
   #1048), and *nothing on the leader used to act on it*: `next_index` — reset
   to 1 by a `needs_snapshot` echo whose `snapshot_served_through` lagged a
   base that had since moved — stayed at 1, so the leader re-offered chunk 0
-  on every heartbeat forever, the reply handler's `snapshot_offset.entry(..)
-  .or_insert(0)` left a phantom in-flight entry (which the driver reads as
+  on every heartbeat forever, the reply handler's `snapshot_send.entry(..)` + `acked_offset.get_or_insert(0)`
+  left a phantom in-flight record (which the driver reads as
   "defer compaction", then counts a `CpSnapshotTransferRestarts` every
   `COMPACT_DEFER_IDLE_CEILING` at zero write rate), and the follower got no
   entries. The fix keys on the unambiguous shape: `(0, 0)` answering a chunk
   at **offset 0** (an accepting receiver always buffers it and reports
   `next_offset > 0`; a receiver that lost its buffer only ever reports `0` to
   a chunk at a *nonzero* offset) means the receiver holds state through the
-  offer's base (`snapshot_offer_base`, written at each send), so
+  offer's base (`SnapshotSend::offer_base`, written at each send), so
   `match_index`/`next_index`/`snapshot_served_through` advance to it and the
   transfer is forgotten. Two gotchas: (1) the sender may resend the offset-0
   chunk up to `SNAPSHOT_ACK_RESEND_CAP` times before its first ack, so a
@@ -2278,14 +2278,14 @@ freezes that type's absent-field semantics once merged.**
   `RaftCore::snapshot_transfer_in_flight()` is true, up to that ceiling,
   which still bounds the WAL even if a peer's transfer never completes.
   **`snapshot_transfer_in_flight()` itself had a second, compounding gap**:
-  defined purely off `snapshot_offset` (populated only once a peer's FIRST
+  defined purely off `acked_offset` (populated only once a peer's FIRST
   ack is *processed*), it reported `false` for the whole round trip from
   "leader ships chunk 0" to "leader processes the first ack" — a window a
   slow/contended peer or link (`ProdEnv`'s real shape) can stretch
   arbitrarily far — so the defer never engaged during exactly the window it
   mattered most. Fixed by widening the accessor to also check
-  `snapshot_chunk_sent` (set at SEND time, not ack time) — both maps are
-  already cleared together at every existing invalidation/completion point,
+  `last_sent` (set at SEND time, not ack time) — both live in one
+  `snapshot_send` record, cleared together at every existing invalidation/completion point,
   so this benefits `animus-cp-data` for free (same shared `RaftCore`).
   Regression: `tests/snapshot_compaction_race.rs` (a `SimEnv` test with an
   artificially slow leader<->follower link, since `SimEnv`'s own near-zero
@@ -2294,8 +2294,8 @@ freezes that type's absent-field semantics once merged.**
 
   **Fixing that defer unmasked a THIRD, previously-latent bug** — read this
   if you ever touch `handle_install_snapshot_resp`'s mid-transfer branch or
-  the defer gate above again: a leader's per-peer `snapshot_offset`/
-  `snapshot_chunk_sent` bookkeeping is never reset when that peer's
+  the defer gate above again: a leader's per-peer `snapshot_send`
+  bookkeeping is never reset when that peer's
   *process* restarts (same `NodeId`, a brand-new empty `RaftCore`), and a
   restarted follower reporting `next_offset == 0` forever can never be
   reconciled against a leader that keeps resending from its own stale,
@@ -2309,7 +2309,7 @@ freezes that type's absent-field semantics once merged.**
   `tests/control_corpus.rs`'s pre-existing
   `chunked_snapshot_receiver_stop_restart_3` caught this immediately (a
   real `StopRestart` of the receiver mid-transfer) once the defer fix
-  landed. Fixed by `snapshot_offset_regressions: BTreeMap<NodeId, u32>` +
+  landed. Fixed by `SnapshotSend::regressions` +
   `SNAPSHOT_OFFSET_REGRESSION_REBASE`: a peer's mid-transfer ack reporting
   an offset below the currently tracked one increments a per-peer counter
   instead of being silently absorbed by the existing monotonic `max` guard;
@@ -2330,8 +2330,8 @@ freezes that type's absent-field semantics once merged.**
   `prod_liveness.rs` under real `ProdEnv` contention (not caught by any
   `SimEnv` test)**:
 
-  - **Fourth: the leader-only `snapshot_offset`/`snapshot_offset_
-    regressions`/`snapshot_chunk_sent` bookkeeping outlived losing
+  - **Fourth: the leader-only `snapshot_send`
+    bookkeeping outlived losing
     leadership.** `RaftCore::handle`'s generic higher-term step-down already
     clears a stale `transfer_target` on the exact same reasoning ("a future
     `is_leader`-independent inspection must never report a transfer in
@@ -2529,7 +2529,7 @@ freezes that type's absent-field semantics once merged.**
   at all (`SimEnv` charges a resend flood no virtual time and little real
   time, so a timing-only test cannot see it) and why its denominator is an
   exact in-core counter (`RaftCore::snapshot_chunk_advances`) rather than
-  externally polling `snapshot_offset`.
+  externally polling `SnapshotSend::acked_offset`.
 
   **`SnapshotResend::Backoff` (issue found live, 2026-09-27): the
   heartbeat tick's own resend was `Always`, not because it was truly
@@ -2561,7 +2561,7 @@ freezes that type's absent-field semantics once merged.**
   multi-minute stall — while never fully silencing the retry (a peer that
   later reconnects is still eventually resent to, unlike a hard `Capped`
   cutoff). **Deliberately keyed off a SEPARATE counter,
-  `snapshot_heartbeat_attempts` (not `snapshot_chunk_sent`'s own
+  `SnapshotSend::heartbeat_attempts` (not `last_sent`'s own
   `resends`)** — found building this fix: `resends_so_far` (the counter
   `Capped` reads) only advances on a call that actually SENDS, so gating
   `Backoff`'s own schedule on it directly freezes the schedule forever at
@@ -2570,11 +2570,11 @@ freezes that type's absent-field semantics once merged.**
   power of two, since a suppressed call never increments it — this broke
   `animus-control/tests/control_corpus.rs`'s `chunked_snapshot_*_3` cells
   outright, not merely a timing flake, catching the bug before it shipped).
-  `snapshot_heartbeat_attempts` instead advances on every heartbeat-tick
+  `heartbeat_attempts` instead advances on every heartbeat-tick
   ATTEMPT for the peer's current offset, sent or suppressed alike, and
   resets to `(offset, 0)` whenever the tracked offset itself changes (real
-  progress always restarts the backoff) — cleared at the identical points
-  `snapshot_chunk_sent` itself is. A still-converging transfer is
+  progress always restarts the backoff) — cleared with the rest of the
+  `SnapshotSend` record. A still-converging transfer is
   unaffected in practice: it advances the offset well before the attempt
   count climbs past the first few doublings, so `handle_install_snapshot_
   resp`'s own `Capped(SNAPSHOT_ACK_RESEND_CAP)` ack-driven resend — which

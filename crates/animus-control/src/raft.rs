@@ -165,7 +165,7 @@ const SUSTAINED_HEALTH_ELECTION_TIMEOUTS: u64 = 20;
 /// (unchanged) offset is bounded (issues #532/#537, ADR 0009's third
 /// 2026-09-01 amendment — the residual beyond `MAX_APPEND_ENTRIES_BATCH` and
 /// `COMPACT_DEFER_CEILING`). See [`RaftCore::snapshot_chunk_for`]'s doc for
-/// the full mechanism and [`RaftCore::snapshot_chunk_sent`]'s doc for the
+/// the full mechanism and `SnapshotSend::last_sent`'s doc for the
 /// marker this gates against. A chunk for a genuinely NEW offset (real ack
 /// progress, or nothing sent to this peer yet) is never held back by either
 /// variant, at any call site — this only ever bounds a repeat of the exact
@@ -193,7 +193,7 @@ enum SnapshotResend {
     Always,
     /// Exponential backoff on a resend of the SAME outstanding offset,
     /// keyed off a dedicated per-peer ATTEMPT counter
-    /// (`snapshot_heartbeat_attempts`, not `snapshot_chunk_for`'s own
+    /// (`SnapshotSend::heartbeat_attempts`, not `snapshot_chunk_for`'s own
     /// `resends_so_far` — see that field's own doc for why): send while the
     /// attempt count is `0` or a power of two **below**
     /// [`SNAPSHOT_HEARTBEAT_BACKOFF_MAX_TICKS`], suppress every other call
@@ -322,10 +322,10 @@ const SNAPSHOT_ACK_RESEND_CAP: u32 = 8;
 pub const SNAPSHOT_HEARTBEAT_BACKOFF_MAX_TICKS: u32 = 32;
 
 /// Issue #898: how many CONSECUTIVE mid-transfer acks reporting an offset
-/// below the currently tracked `snapshot_offset` this leader tolerates as
+/// below the currently tracked `SnapshotSend::acked_offset` this leader tolerates as
 /// "probably a stale, reordered ack" before concluding the peer's own buffer
 /// genuinely reset and rebasing down to match it — see
-/// `snapshot_offset_regressions`'s own doc for the full mechanism and
+/// `SnapshotSend::regressions`'s own doc for the full mechanism and
 /// incident. Small, matching `SNAPSHOT_ACK_RESEND_CAP`'s own order of
 /// magnitude: large enough that an ordinary handful of reordered acks (the
 /// scenario the monotonic guard exists for) never falsely triggers a rebase,
@@ -465,12 +465,136 @@ pub struct RemovalStats {
 /// notice's guards (`RaftCore::handle_removed`, `refresh_removed_flag`).
 type EntryStamp = (u64, u64);
 
+/// Leader-side state of the chunked `InstallSnapshot` transfer to ONE peer
+/// (`RaftCore::snapshot_send`). Leader-local and volatile.
+///
+/// Invariant (kept by `snapshot_send`'s writers): the record exists iff
+/// `acked_offset.is_some() || last_sent.is_some()`.
+#[derive(Clone, Debug, Default)]
+struct SnapshotSend {
+    /// Byte offset the peer has ACKED in the in-flight transfer, so the leader
+    /// resumes shipping the next chunk on each heartbeat / ack (`None` until
+    /// the peer's first ack is processed). Distinct from `last_sent`, what the
+    /// leader last TRANSMITTED.
+    acked_offset: Option<u64>,
+    /// Issue #898: count of CONSECUTIVE mid-transfer acks reporting an offset
+    /// strictly below the tracked `acked_offset` — the monotonic guard's own
+    /// "is this a stale, reordered ack or a peer whose buffer genuinely reset"
+    /// ambiguity (see `handle_install_snapshot_resp`'s doc). A transient
+    /// reordering self-heals within a round trip or two (the peer's next ack
+    /// reports a LARGER offset, which resets this to 0); a peer that genuinely
+    /// lost its buffer (a real restart mid-transfer, same `NodeId`) reports
+    /// the SAME regressed value — 0, from a fresh `RaftCore` — forever, since
+    /// it can never accept a chunk at a nonzero offset with an empty buffer
+    /// (`handle_install_snapshot`'s `fresh && offset == 0` reassembly gate).
+    /// Left unaddressed the leader keeps resending from its own stale,
+    /// now-unreachable offset indefinitely — confirmed live building this fix:
+    /// `chunked_snapshot_receiver_stop_restart_3` deadlocked this way once
+    /// `meta_apply_and_compact`'s compaction-defer gate stopped the ordinary
+    /// recompaction that used to incidentally wipe this bookkeeping. Once this
+    /// crosses `SNAPSHOT_OFFSET_REGRESSION_REBASE`,
+    /// `handle_install_snapshot_resp` REBASES (`restart_from`) down to the
+    /// peer's own reported (lower) truth instead of taking `max`, which lets
+    /// a fresh chunk-0 ship land on a fresh, empty buffer correctly.
+    regressions: u32,
+    /// `(offset, resends)` of the last `InstallSnapshot` chunk actually SENT
+    /// (issues #532/#537): `offset` is the byte offset last transmitted;
+    /// `resends` counts how many times THAT SAME offset has been resent since
+    /// it was first sent (reset to 1 whenever the offset itself changes).
+    /// `snapshot_chunk_for` consults it against a caller's own
+    /// `SnapshotResend::Capped(n)` to decide whether one more resend of an
+    /// unchanged offset is still allowed — for a peer with an outstanding
+    /// unacked chunk this is normally the same offset repeatedly, exactly the
+    /// case this exists to bound.
+    last_sent: Option<(u64, u32)>,
+    /// `(offset, attempts)` for `SnapshotResend::Backoff`'s own
+    /// exponential-thinning schedule (the heartbeat tick's policy). A SEPARATE
+    /// counter from `last_sent`'s `resends`: that one counts only chunks
+    /// actually SENT, so a suppressed call never advances it — keying the
+    /// backoff off it would freeze the schedule forever at whatever count
+    /// first got suppressed (a resend suppressed at count 3 never reaches
+    /// count 4, the next allowed power of two). This instead counts every
+    /// heartbeat-tick ATTEMPT for the current offset, sent or suppressed
+    /// alike. Reset to `(offset, 0)` whenever the offset changes (genuine
+    /// progress restarts the backoff); the default `(0, 0)` is equivalent to
+    /// "no attempts yet" at offset 0, and any other offset resets it.
+    heartbeat_attempts: (u64, u32),
+    /// The `snapshot_index` (the base) the most recent `InstallSnapshot`
+    /// chunk to this peer was built at — written at every send, read only by
+    /// `handle_install_snapshot_resp`'s *declined offer* branch (a receiver
+    /// that answers the very first chunk of an offer with "nothing buffered"
+    /// already holds state through this base). Only meaningful while
+    /// `last_sent` is `Some`; every send that sets `last_sent` overwrites it.
+    offer_base: u64,
+}
+
+impl SnapshotSend {
+    /// Rebase the transfer to `offset` after the peer reported a lower truth
+    /// (issues #898/#899): forget what was sent and the backoff schedule, and
+    /// clear the regression count. `acked_offset` stays `Some`.
+    fn restart_from(&mut self, offset: u64) {
+        self.acked_offset = Some(offset);
+        self.regressions = 0;
+        self.last_sent = None;
+        self.heartbeat_attempts = (0, 0);
+    }
+}
+
 /// A peer this leader still owes a removal notification (`RaftCore::departing`):
 /// the config entry that removed it, by index and term.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Departing {
     index: u64,
     term: u64,
+}
+
+/// Everything this leader tracks for ONE peer in `RaftCore::departing`: the
+/// removing entry's [`Departing`] stamp plus the leader-local, volatile
+/// notice/give-up bookkeeping (issue #1061). One value per peer, so all of it
+/// is dropped together when the peer stops departing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DepartingPeer {
+    /// The config entry that removed the peer.
+    stamp: Departing,
+    /// The last time (leader-local, volatile — same class as `last_contact`)
+    /// the peer proved it is alive by sending ANY reply — `AppendEntriesResp`,
+    /// `InstallSnapshotResp` or `RemovedAck`, success or reject. Seeded lazily
+    /// by `expire_stale_departing` the first time it sees the peer with `None`
+    /// here (`log_append`, where the peer is added, has no `now` and runs on
+    /// every replica during WAL replay), so `None` reads as "just started, not
+    /// yet stale".
+    since: Option<Nanos>,
+    /// On the SHORT silence bound (`DEPARTING_QUIET_GIVE_UP` rather than
+    /// `DEPARTING_NOTICE_GIVE_UP`) (issue #1061 follow-up): the peer already
+    /// acked its removal notice yet is still owed catch-up `AppendEntries`
+    /// (the log could serve it), or this leader merely inherited it from a
+    /// predecessor (`become_leader`'s re-derivation).
+    quiet: bool,
+    /// Send schedule — `(next_allowed_send, attempts)`, gating EVERY message
+    /// this leader would send to the peer (its removal notice and any catch-up
+    /// `AppendEntries` alike; `departing_send_gate`). The first send is
+    /// immediate (`None`); each further send with no reply from the peer in
+    /// between waits twice as long as the last (from one heartbeat interval,
+    /// doubling, up to `SNAPSHOT_HEARTBEAT_BACKOFF_MAX_TICKS` heartbeats — the
+    /// same capped steady period as the snapshot-resend schedule), and ANY
+    /// reply from the peer resets it (a live peer catching up is served at
+    /// full rate; a dead one costs a couple of dozen tiny messages a minute).
+    /// Time-based, not tick-count-based, because under a sustained writer
+    /// `replicate_now` keeps pushing `heartbeat_deadline` out and the
+    /// heartbeat tick that a count-based schedule would advance on never
+    /// fires.
+    sched: Option<(Nanos, u32)>,
+}
+
+impl DepartingPeer {
+    fn new(stamp: Departing) -> Self {
+        Self {
+            stamp,
+            since: None,
+            quiet: false,
+            sched: None,
+        }
+    }
 }
 
 /// A replicated log entry, generic over the command type `C` (defaults to the
@@ -1377,41 +1501,12 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // is sent a `RaftMsg::Removed` notice instead (`replicate_to`), and is
     // dropped from this map on the peer's `RemovedAck`, on its `match_index`
     // reaching the removing entry, or after `DEPARTING_NOTICE_GIVE_UP` of
-    // total silence (`expire_stale_departing`).
-    departing: BTreeMap<NodeId, Departing>,
-    // Issue #1061: the last time (leader-local, volatile — same class as
-    // `last_contact`) each currently-departing peer proved it is alive by
-    // sending ANY reply — `AppendEntriesResp` or `InstallSnapshotResp`,
-    // success or reject. Seeded lazily by `expire_stale_departing` the first
-    // time it sees a peer in `departing` with no entry here (`log_append`,
-    // where `departing` is populated, has no `now`, and runs on every replica
-    // during WAL replay), so a peer absent here is always read as "just
-    // started, not yet stale". Pruned everywhere `departing` shrinks.
-    departing_since: BTreeMap<NodeId, Nanos>,
-    // Issue #1061 follow-up: the departing peers on the SHORT silence bound
-    // (`DEPARTING_QUIET_GIVE_UP` rather than `DEPARTING_NOTICE_GIVE_UP`):
-    // those that already acked their removal notice yet are still owed
-    // catch-up `AppendEntries` (the log could serve them), and those this
-    // leader merely inherited from a predecessor (`become_leader`'s
-    // re-derivation). Pruned everywhere `departing` shrinks.
-    departing_quiet: BTreeSet<NodeId>,
+    // total silence (`expire_stale_departing`). Each value carries the peer's
+    // own silence clock, short-bound flag and send schedule ([`DepartingPeer`]),
+    // so they live and die with the entry.
+    departing: BTreeMap<NodeId, DepartingPeer>,
     // Issue #1061 observability: lifetime counters (`RemovalStats`).
     removal_stats: RemovalStats,
-    // Issue #1061: per-departing-peer send schedule — `(next_allowed_send,
-    // attempts)`, gating EVERY message this leader would send to a
-    // departing peer (its removal notice and any catch-up `AppendEntries`
-    // alike; `departing_send_gate`). The first send is immediate; each
-    // further send with no reply from the peer in between waits twice as
-    // long as the last (from one heartbeat interval, doubling, up to
-    // `SNAPSHOT_HEARTBEAT_BACKOFF_MAX_TICKS` heartbeats — the same capped
-    // steady period as the snapshot-resend schedule), and ANY reply from the
-    // peer resets it (a live peer catching up is served at full rate; a dead
-    // one costs a couple of dozen tiny messages a minute). Time-based, not
-    // tick-count-based, because under a sustained writer `replicate_now`
-    // keeps pushing `heartbeat_deadline` out and the heartbeat tick that a
-    // count-based schedule would advance on never fires. Cleared with
-    // `departing`.
-    removal_sched: BTreeMap<NodeId, (Nanos, u32)>,
     // Issue #1061: the most recent `now` this core was driven with (`tick`,
     // `handle`, `replicate_now`) — `replicate_to` has no `now` parameter and
     // its many call sites should not all grow one just for the departing
@@ -1439,82 +1534,22 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // (see [`first_term_index`](Self::first_term_index)); re-set on every
     // election win.
     first_term_index: u64,
-    // Per-follower byte offset reached in the in-flight snapshot transfer, so the
-    // leader resumes shipping the next chunk on each heartbeat / ack. Cleared for
-    // a peer once it has fully installed the snapshot.
-    snapshot_offset: BTreeMap<NodeId, u64>,
-    // Issue #898: per-peer count of CONSECUTIVE mid-transfer acks reporting an
-    // offset strictly below the currently tracked `snapshot_offset` — the
-    // monotonic guard's own "is this a stale, reordered ack or a peer whose
-    // buffer genuinely reset" ambiguity (see `handle_install_snapshot_resp`'s
-    // doc). A transient reordering self-heals within a round trip or two (the
-    // peer's very next ack, for whatever legitimately arrives next, reports a
-    // LARGER offset than any stale one, so this resets to 0 the moment real
-    // forward progress is seen); a peer that genuinely lost its buffer (a
-    // real process restart mid-transfer, same `NodeId`, `snapshot_offset`
-    // never told about it) reports the SAME regressed value — 0, from a
-    // fresh `RaftCore` — forever, since it can never accept a chunk at a
-    // nonzero offset with an empty buffer (`handle_install_snapshot`'s
-    // `fresh && offset == 0` reassembly gate). Left unaddressed, the leader
-    // keeps resending from its own stale, now-unreachable offset
-    // indefinitely — confirmed live building this fix:
-    // `chunked_snapshot_receiver_stop_restart_3` deadlocked exactly this way
-    // once `meta_apply_and_compact`'s new compaction-defer gate (also this
-    // issue) stopped the ordinary threshold-triggered recompaction that used
-    // to incidentally wipe this bookkeeping clean before the peer's next
-    // request. Once this counter crosses `SNAPSHOT_OFFSET_REGRESSION_REBASE`,
-    // `handle_install_snapshot_resp` REBASES `snapshot_offset`/
-    // `snapshot_chunk_sent` down to the peer's own reported (lower) truth
-    // instead of taking `max`, which lets a fresh chunk-0 ship land on a
-    // fresh, empty buffer correctly. Cleared at the identical points
-    // `snapshot_offset` itself is.
-    snapshot_offset_regressions: BTreeMap<NodeId, u32>,
-    // Per-peer `(offset, resends)` of the last `InstallSnapshot` chunk
-    // actually SENT (issues #532/#537): `offset` is the byte offset last
-    // transmitted; `resends` counts how many times THAT SAME offset has
-    // been resent since it was first sent (reset to 0 whenever the offset
-    // itself changes). `snapshot_chunk_for` consults this against a
-    // caller's own `SnapshotResend::Capped(n)` to decide whether one more
-    // resend of an unchanged offset is still allowed. Distinct from
-    // `snapshot_offset` (the offset the peer has ACKED): this tracks what
-    // the leader last transmitted, which for a peer with an outstanding
-    // unacked chunk is normally the same offset repeatedly — exactly the
-    // case this map exists to bound. Cleared/removed at the identical
-    // points `snapshot_offset` itself is: per-peer once fully installed,
-    // wholesale on `snapshot_upto` invalidation (a moved base makes any
-    // prior offset meaningless), and on a fresh leadership term.
-    snapshot_chunk_sent: BTreeMap<NodeId, (u64, u32)>,
-    // Per-peer `snapshot_index` (the base) the most recent `InstallSnapshot`
-    // chunk to that peer was built at — written at every send
-    // (`snapshot_chunk_for`), read only by `handle_install_snapshot_resp`'s
-    // *declined offer* branch (a receiver that answers the very first chunk
-    // of an offer with "nothing buffered" already holds state through this
-    // base). Deliberately not cleared alongside `snapshot_chunk_sent`: it is
-    // only ever read while that map still has the peer, and every send that
-    // repopulates that map overwrites this too.
-    snapshot_offer_base: BTreeMap<NodeId, u64>,
-    // Per-peer `(offset, attempts)` for `SnapshotResend::Backoff`'s own
-    // exponential-thinning schedule (the heartbeat tick's policy — see that
-    // variant's own doc). Deliberately a SEPARATE counter from
-    // `snapshot_chunk_sent`'s `resends` above: that one counts only chunks
-    // actually SENT, so a suppressed call never advances it — keying the
-    // backoff schedule off it directly would freeze the schedule forever at
-    // whatever count first got suppressed (found building this fix: a
-    // resend suppressed at count 3 never reaches count 4, the next allowed
-    // power of two, since only a successful send increments it). This
-    // field instead counts every heartbeat-tick ATTEMPT for the current
-    // offset, sent or suppressed alike, so the schedule genuinely advances
-    // tick over tick. Reset to `(offset, 0)` whenever the offset itself
-    // changes (genuine progress restarts the backoff); cleared at the
-    // identical points `snapshot_chunk_sent` itself is.
-    snapshot_heartbeat_attempts: BTreeMap<NodeId, (u64, u32)>,
+    // Leader-side bookkeeping of the in-flight chunked `InstallSnapshot`
+    // transfer to each peer; see [`SnapshotSend`]. Invariant: a record exists
+    // iff `acked_offset.is_some() || last_sent.is_some()`, so
+    // `snapshot_transfer_in_flight` is `!is_empty()` and
+    // `snapshot_transfer_peers` is the key set. Dropped with the record once
+    // the peer has fully installed the snapshot, wholesale on `snapshot_upto`
+    // invalidation (a moved base makes any prior offset meaningless), on
+    // step-down, and on a fresh leadership term.
+    snapshot_send: BTreeMap<NodeId, SnapshotSend>,
     // Per-peer lifetime count of GENUINE `InstallSnapshot` chunk advances —
     // bumped exactly once whenever `snapshot_chunk_for` builds a chunk for
     // an offset it has never sent before (a capped RESEND of an
     // already-attempted offset never bumps it). Test-observability only, no
     // role in the resend decision itself: it's what lets a test measure
     // "sends per genuinely distinct chunk" exactly, without externally
-    // polling `snapshot_offset` at some fixed cadence and undercounting
+    // polling `SnapshotSend::acked_offset` at some fixed cadence and undercounting
     // whatever the poll interval is coarser than (found building this fix's
     // own test — see `animus-cp-data/tests/snapshot_resend_bound.rs`).
     // Deliberately NEVER cleared (not by `snapshot_upto` invalidation, not
@@ -1904,20 +1939,13 @@ where
             elected_at_commit: 0,
             heard_from: BTreeSet::new(),
             departing: BTreeMap::new(),
-            departing_since: BTreeMap::new(),
-            departing_quiet: BTreeSet::new(),
             removal_stats: RemovalStats::default(),
-            removal_sched: BTreeMap::new(),
             now_hint: Nanos(0),
             removed_by_leader: None,
             transfer_target: None,
             transfer_deadline: Nanos(0),
             first_term_index: 0,
-            snapshot_offset: BTreeMap::new(),
-            snapshot_offset_regressions: BTreeMap::new(),
-            snapshot_chunk_sent: BTreeMap::new(),
-            snapshot_offer_base: BTreeMap::new(),
-            snapshot_heartbeat_attempts: BTreeMap::new(),
+            snapshot_send: BTreeMap::new(),
             snapshot_chunk_advances: BTreeMap::new(),
             incoming_snapshot: None,
             election_base: Duration::from_millis(150),
@@ -2157,10 +2185,7 @@ where
             // path calls `set_snapshot_blob` *after* this, in the same driver
             // pass, so a deliberately fresh image is never dropped.
             self.snapshot_blob = None;
-            self.snapshot_offset.clear();
-            self.snapshot_offset_regressions.clear();
-            self.snapshot_chunk_sent.clear();
-            self.snapshot_heartbeat_attempts.clear();
+            self.snapshot_send.clear();
         }
     }
 
@@ -2302,11 +2327,11 @@ where
     /// stays a pure fact, same as `snapshot_index` itself.
     ///
     /// **True the moment a chunk has been SENT to some peer, not only once
-    /// it has been ACKED (issue #898)**: checks `snapshot_chunk_sent` (set
+    /// it has been ACKED (issue #898)**: checks `SnapshotSend::last_sent` (set
     /// by [`snapshot_chunk_for`](Self::snapshot_chunk_for) at send time, for
-    /// the very first chunk included) in addition to `snapshot_offset` (set
+    /// the very first chunk included) in addition to `SnapshotSend::acked_offset` (set
     /// only once a peer's first ack is processed — see that field's own
-    /// doc). A definition keyed on `snapshot_offset` ALONE leaves a real gap
+    /// doc). A definition keyed on `acked_offset` ALONE leaves a real gap
     /// from "leader ships chunk 0" to "leader processes that peer's first
     /// ack": for that whole round trip (which a slow/contended peer or link
     /// can stretch arbitrarily far), this accessor would report `false` even
@@ -2346,12 +2371,12 @@ where
     /// this accessor's own `behind`-sized `SNAPSHOT_COMPACT_DEFER_CEILING`
     /// escape hatch, with no change needed here.
     pub fn snapshot_transfer_in_flight(&self) -> bool {
-        !self.snapshot_offset.is_empty() || !self.snapshot_chunk_sent.is_empty()
+        !self.snapshot_send.is_empty()
     }
 
     /// The set of peers [`snapshot_transfer_in_flight`](Self::
     /// snapshot_transfer_in_flight) currently considers in flight (the
-    /// union of `snapshot_offset`'s and `snapshot_chunk_sent`'s keys) — a
+    /// `snapshot_send`'s keys) — a
     /// pure, `now`-unaware structural fact, same as that accessor itself.
     /// Exists so a driver that DOES have `now` (issue #898 follow-up) can
     /// sum [`snapshot_chunk_advances`](Self::snapshot_chunk_advances) across
@@ -2362,23 +2387,19 @@ where
     /// feeds.
     #[must_use]
     pub fn snapshot_transfer_peers(&self) -> BTreeSet<NodeId> {
-        self.snapshot_offset
-            .keys()
-            .chain(self.snapshot_chunk_sent.keys())
-            .cloned()
-            .collect()
+        self.snapshot_send.keys().cloned().collect()
     }
 
     /// The byte offset `peer` has acked so far in an in-flight chunked
     /// `InstallSnapshot` transfer (`None` if no transfer to `peer` is in
-    /// flight) — a pure read of [`snapshot_offset`](Self::snapshot_offset),
+    /// flight) — a pure read of `SnapshotSend::acked_offset`,
     /// mirroring [`snapshot_transfer_in_flight`](Self::snapshot_transfer_in_flight)'s
     /// "policy lives in the driver, this core stays a fact" shape. Exists
     /// primarily so a test can observe transfer PROGRESS deterministically
     /// (distinct offsets reached over a run) rather than only volume — see
     /// `animus-cp-data/tests/snapshot_resend_bound.rs`.
     pub fn snapshot_chunk_progress(&self, peer: &NodeId) -> Option<u64> {
-        self.snapshot_offset.get(peer).copied()
+        self.snapshot_send.get(peer).and_then(|r| r.acked_offset)
     }
 
     /// Lifetime count of GENUINE `InstallSnapshot` chunk advances shipped to
@@ -3388,12 +3409,15 @@ where
                     if self.learners.contains(removed) {
                         continue;
                     }
+                    // `removed` was a voter, so it cannot already be departing
+                    // (`departing` is kept disjoint from `peers`/`learners`).
+                    debug_assert!(!self.departing.contains_key(removed));
                     self.departing.insert(
                         removed.clone(),
-                        Departing {
+                        DepartingPeer::new(Departing {
                             index: entry.index,
                             term: entry.term,
-                        },
+                        }),
                     );
                 }
             }
@@ -3402,12 +3426,6 @@ where
             if self.role == Role::Leader {
                 self.reset_peer_progress_on_membership_change(&old_members, entry.index);
             }
-            self.departing_since
-                .retain(|n, _| self.departing.contains_key(n));
-            self.departing_quiet
-                .retain(|n| self.departing.contains_key(n));
-            self.removal_sched
-                .retain(|n, _| self.departing.contains_key(n));
         }
         let carries_config = entry.config.is_some();
         self.pending.push(WalRecord::Append(entry.clone()));
@@ -3727,7 +3745,7 @@ where
             // reports a "transfer in flight" for a node that isn't leading.
             self.transfer_target = None;
             // Issue #898 follow-up: unlike `transfer_target` above,
-            // `snapshot_offset`/`snapshot_chunk_sent` are NOT merely inert
+            // `snapshot_send` records are NOT merely inert
             // once this node stops being leader — `snapshot_transfer_in_
             // flight()` (read by every replica's OWN `meta_apply_and_compact`
             // defer gate, node.rs) has no `role == Leader` guard of its own,
@@ -3749,10 +3767,7 @@ where
             // two. Clearing here, at the one place a `RaftCore` genuinely
             // steps down from believing it might be leading, closes it same
             // as `transfer_target`.
-            self.snapshot_offset.clear();
-            self.snapshot_offset_regressions.clear();
-            self.snapshot_chunk_sent.clear();
-            self.snapshot_heartbeat_attempts.clear();
+            self.snapshot_send.clear();
         }
         // ADR 0044 phase-1 PR3, un-quiesce trigger (a): **any** inbound Raft
         // message un-quiesces, run before dispatch so every specific handler
@@ -4973,7 +4988,7 @@ where
         // here, ahead of the branch, so both paths get it identically.
         self.last_contact.insert(from.clone(), now);
         // Issue #1061: the same reachability proof resets a departing peer's
-        // give-up clock and its send-gate schedule (`removal_sched`).
+        // give-up clock and its send-gate schedule (`DepartingPeer::sched`).
         self.note_departing_reply(&from, now);
         // Issue #1228: whether this ack advanced what the leader knows `from`
         // has -- a storage-full follower's frozen ack never does.
@@ -4985,7 +5000,7 @@ where
             if self
                 .departing
                 .get(&from)
-                .is_some_and(|d| match_index >= d.index)
+                .is_some_and(|d| match_index >= d.stamp.index)
             {
                 self.drop_departing(&from);
             }
@@ -5230,7 +5245,7 @@ where
             // `animus-cp-data::record_kv_outbound` increments
             // `Metric::CpSnapshotInstalls` on ANY outbound `last_index > 0`
             // ack, and `handle_install_snapshot_resp`'s own "transfer
-            // complete" branch reset `next_index`/cleared `snapshot_offset`
+            // complete" branch reset `next_index`/cleared `snapshot_send`
             // bookkeeping the same way for both. Once a peer has ever
             // compacted, a stale/duplicate/late-arriving chunk landing after
             // that peer has already caught up further via ordinary
@@ -5243,9 +5258,9 @@ where
             // fix: report `last_index: 0, next_offset: 0` — the "no
             // completion happened, and I have nothing buffered" shape
             // `handle_install_snapshot_resp`'s "still mid-transfer" branch
-            // already handles via its own `next_offset == 0 && *tracked > 0`
-            // case, which clears this peer's `snapshot_chunk_sent`/
-            // `snapshot_heartbeat_attempts`/`tracked` bookkeeping without
+            // already handles via its own `next_offset == 0 && tracked > 0`
+            // case, which clears this peer's `last_sent`/
+            // `heartbeat_attempts`/`tracked` bookkeeping without
             // touching `next_index`/`match_index` or counting a completed
             // install — exactly the "just acknowledge our position as
             // redundant" contract this short-circuit's own top-of-function
@@ -5460,17 +5475,22 @@ where
         self.note_departing_reply(&from, now);
         if last_index > 0 {
             // Transfer complete: the follower installed the snapshot.
-            self.snapshot_offset.remove(&from);
-            self.snapshot_offset_regressions.remove(&from);
-            self.snapshot_chunk_sent.remove(&from);
-            self.snapshot_heartbeat_attempts.remove(&from);
+            self.snapshot_send.remove(&from);
             // Lazy-image discipline (`DRIVER_APPLIED`): once no transfer is in
             // flight, drop the materialized image instead of retaining a
             // whole-tablet copy in the core indefinitely — a later straggler
             // triggers an on-demand rebuild from the engine. Kept while any
             // other peer's transfer is mid-flight so its chunks stay
             // byte-identical. In-core state machines keep their eager blob.
-            if S::DRIVER_APPLIED && self.snapshot_offset.is_empty() {
+            // Deliberately ignores peers that were sent a chunk but have not
+            // acked yet (unlike `forget_snapshot_transfer`, which keys on
+            // `snapshot_send.is_empty()`); kept as-is, so behaviour is unchanged.
+            if S::DRIVER_APPLIED
+                && !self
+                    .snapshot_send
+                    .values()
+                    .any(|r| r.acked_offset.is_some())
+            {
                 self.snapshot_blob = None;
             }
             let m = self.match_index.entry(from.clone()).or_insert(0);
@@ -5518,7 +5538,7 @@ where
             if self
                 .departing
                 .get(&from)
-                .is_some_and(|d| self.match_index.get(&from).copied().unwrap_or(0) >= d.index)
+                .is_some_and(|d| self.match_index.get(&from).copied().unwrap_or(0) >= d.stamp.index)
             {
                 self.drop_departing(&from);
                 return Vec::new();
@@ -5552,7 +5572,7 @@ where
         // `next_index` to 1 while `snapshot_served_through` lagged a base
         // that had since moved — and every later ack was a chunk reply,
         // never an `AppendEntriesResp`, so nothing ever re-advanced it: the
-        // leader re-offered forever, the phantom `snapshot_offset` entry the
+        // leader re-offered forever, the phantom `snapshot_send` record the
         // fallthrough below inserts kept `snapshot_transfer_in_flight` true,
         // the idle-ceiling then counted a "restart" every
         // `COMPACT_DEFER_IDLE_CEILING`, and the group could never quiesce.
@@ -5570,11 +5590,13 @@ where
         // that base then accepts. The base counts as served so a stale
         // `needs_snapshot` echo for it cannot re-arm the offer.
         if next_offset == 0
-            && self.snapshot_chunk_sent.get(&from).map(|&(o, _)| o) == Some(0)
-            && let Some(base) = self.snapshot_offer_base.get(&from).copied()
+            && let Some(base) = self
+                .snapshot_send
+                .get(&from)
+                .filter(|r| r.last_sent.map(|(o, _)| o) == Some(0))
+                .map(|r| r.offer_base)
         {
             self.forget_snapshot_transfer(&from);
-            self.snapshot_offer_base.remove(&from);
             let served = self
                 .snapshot_served_through
                 .entry(from.clone())
@@ -5595,11 +5617,8 @@ where
         // resolved the offer (an offset-0 chunk is resent up to
         // `SNAPSHOT_ACK_RESEND_CAP` times before its first ack): no transfer
         // is outstanding, so it must not re-create the phantom
-        // `snapshot_offset` entry the fallthrough below would insert.
-        if next_offset == 0
-            && !self.snapshot_offset.contains_key(&from)
-            && !self.snapshot_chunk_sent.contains_key(&from)
-        {
+        // `snapshot_send` record the fallthrough below would insert.
+        if next_offset == 0 && !self.snapshot_send.contains_key(&from) {
             return Vec::new();
         }
         // Still mid-transfer: record progress and ship the next chunk.
@@ -5625,8 +5644,9 @@ where
         // more round trips to recover from. `max` makes the tracked offset
         // monotonic regardless of ack arrival order — independent of, and
         // additive with, the resend cap below.
-        let tracked = self.snapshot_offset.entry(from.clone()).or_insert(0);
-        if next_offset == 0 && *tracked > 0 {
+        let rec = self.snapshot_send.entry(from.clone()).or_default();
+        let tracked = *rec.acked_offset.get_or_insert(0);
+        if next_offset == 0 && tracked > 0 {
             // Issue #899 amendment (folded into #898's own regression-
             // counting rebase below, not a bypass of it): `next_offset == 0`
             // is a genuine, AUTHORITATIVE reset, never a reorder to guard
@@ -5654,11 +5674,8 @@ where
             // perturbing any other seed into this same narrow window — the
             // bug is pre-existing, not specific to how the seed is
             // reached). See `docs/lessons/` for the incident writeup.
-            *tracked = 0;
-            self.snapshot_chunk_sent.remove(&from);
-            self.snapshot_heartbeat_attempts.remove(&from);
-            self.snapshot_offset_regressions.insert(from.clone(), 0);
-        } else if next_offset < *tracked {
+            rec.restart_from(0);
+        } else if next_offset < tracked {
             // Issue #898: a regression below the tracked offset — either a
             // stale, reordered ack for THIS transfer (the common case the
             // monotonic guard below protects against) or a peer whose buffer
@@ -5672,28 +5689,18 @@ where
             // immediately, instead — see that branch's own doc for why zero
             // specifically is never ambiguous the way any other partial
             // regression is.)
-            let regressions = self
-                .snapshot_offset_regressions
-                .entry(from.clone())
-                .or_insert(0);
-            *regressions += 1;
-            if *regressions > SNAPSHOT_OFFSET_REGRESSION_REBASE {
-                *tracked = next_offset;
-                self.snapshot_chunk_sent.remove(&from);
-                self.snapshot_heartbeat_attempts.remove(&from);
-                *self
-                    .snapshot_offset_regressions
-                    .entry(from.clone())
-                    .or_insert(0) = 0;
+            rec.regressions += 1;
+            if rec.regressions > SNAPSHOT_OFFSET_REGRESSION_REBASE {
+                rec.restart_from(next_offset);
             }
         } else {
             // Real forward progress (or an exact repeat) — the monotonic
             // guard's own case, and proof this peer's transfer is healthy:
             // clear any accumulated regression count.
-            let duplicate = next_offset == *tracked
-                && self.snapshot_chunk_sent.get(&from).map(|&(o, _)| o) == Some(next_offset);
-            *tracked = next_offset;
-            self.snapshot_offset_regressions.insert(from.clone(), 0);
+            let duplicate =
+                next_offset == tracked && rec.last_sent.map(|(o, _)| o) == Some(next_offset);
+            rec.acked_offset = Some(next_offset);
+            rec.regressions = 0;
             if duplicate {
                 return Vec::new();
             }
@@ -6002,9 +6009,6 @@ where
         // still in this leader's own log (`removals_in_log`) and seeded like
         // any other replication target — see that method for the bound.
         self.departing.clear();
-        self.departing_since.clear();
-        self.departing_quiet.clear();
-        self.removal_sched.clear();
         for (peer, dep) in self.removals_in_log() {
             if self.peers.contains(&peer) || self.learners.contains(&peer) {
                 continue;
@@ -6013,22 +6017,24 @@ where
             self.match_index.insert(peer.clone(), 0);
             // Inherited, not this leader's own removal: the short silence
             // bound (`DEPARTING_QUIET_GIVE_UP`'s doc).
-            self.departing_quiet.insert(peer.clone());
-            self.departing.insert(peer, dep);
+            self.departing.insert(
+                peer,
+                DepartingPeer {
+                    quiet: true,
+                    ..DepartingPeer::new(dep)
+                },
+            );
         }
         self.transfer_target = None;
         // A fresh term restarts any snapshot transfer from offset 0. Clear
-        // `snapshot_chunk_sent` alongside `snapshot_offset` (issue #898's
-        // `snapshot_transfer_in_flight` fix reads both) — a stale sent-chunk
+        // every `snapshot_send` record (issue #898's
+        // `snapshot_transfer_in_flight` fix reads it) — a stale sent-chunk
         // record from a PRIOR stint as leader on this same node would
         // otherwise make this accessor report an in-flight transfer that no
         // longer exists, needlessly deferring compaction until the
         // `SNAPSHOT_COMPACT_DEFER_CEILING`/`COMPACT_DEFER_CEILING` backstop
         // eventually overrides it (harmless, but not the intent).
-        self.snapshot_offset.clear();
-        self.snapshot_offset_regressions.clear();
-        self.snapshot_chunk_sent.clear();
-        self.snapshot_heartbeat_attempts.clear();
+        self.snapshot_send.clear();
         // No-op entry so prior-term entries can be committed under our term.
         // Record its index: it is this leader's first current-term entry, the
         // watermark ReadIndex barriers and membership changes gate on
@@ -6048,7 +6054,7 @@ where
         self.maybe_advance_commit();
         self.apply();
         self.heartbeat_deadline = Nanos(now.0.saturating_add(self.heartbeat_nanos()));
-        // A fresh leadership term just cleared `snapshot_chunk_sent` above,
+        // A fresh leadership term just cleared `snapshot_send` above,
         // so this makes no observable difference from `Capped(0)` here —
         // `Always` for consistency with the other "this leader just did
         // something noteworthy" call sites.
@@ -6305,9 +6311,9 @@ where
     /// Record that a departing peer replied (any reply proves it is alive):
     /// resets its give-up clock and re-opens its send-gate schedule.
     fn note_departing_reply(&mut self, peer: &NodeId, now: Nanos) {
-        if self.departing.contains_key(peer) {
-            self.departing_since.insert(peer.clone(), now);
-            self.removal_sched.remove(peer);
+        if let Some(d) = self.departing.get_mut(peer) {
+            d.since = Some(now);
+            d.sched = None;
         }
     }
 
@@ -6365,7 +6371,7 @@ where
     /// Drop every per-peer scrap of leader-side bookkeeping for a peer that is
     /// no longer owed anything (`departing` and everything keyed by its id,
     /// including any snapshot-transfer bookkeeping — a phantom
-    /// `snapshot_offset`/`snapshot_chunk_sent` entry would keep
+    /// `snapshot_send` record would keep
     /// `snapshot_transfer_in_flight` `true` forever for a peer that will
     /// never ack again, wedging a `DRIVER_APPLIED` driver's compaction defer
     /// the way issue #898's step-down cleanup already guards against).
@@ -6373,9 +6379,6 @@ where
         if self.departing.remove(peer).is_some() {
             self.removal_stats.departing_dropped += 1;
         }
-        self.departing_since.remove(peer);
-        self.departing_quiet.remove(peer);
-        self.removal_sched.remove(peer);
         self.inflight_sent.remove(peer);
         self.next_index.remove(peer);
         self.match_index.remove(peer);
@@ -6392,42 +6395,30 @@ where
     /// when this was the last outstanding transfer, mirroring
     /// `handle_install_snapshot_resp`'s lazy-image discipline.
     fn forget_snapshot_transfer(&mut self, peer: &NodeId) {
-        self.snapshot_offset.remove(peer);
-        self.snapshot_offset_regressions.remove(peer);
-        self.snapshot_chunk_sent.remove(peer);
-        self.snapshot_heartbeat_attempts.remove(peer);
-        if S::DRIVER_APPLIED
-            && self.snapshot_offset.is_empty()
-            && self.snapshot_chunk_sent.is_empty()
-        {
+        self.snapshot_send.remove(peer);
+        if S::DRIVER_APPLIED && self.snapshot_send.is_empty() {
             self.snapshot_blob = None;
         }
     }
 
-    /// The send gate for a departing peer (see `removal_sched`'s field doc):
+    /// The send gate for a departing peer (see `DepartingPeer::sched`'s doc):
     /// `true` when nothing is departing-gated for `peer` at all, or its
     /// schedule allows a send at `now_hint` (which then advances the
     /// schedule); `false` to suppress this send.
     fn departing_send_gate(&mut self, peer: &NodeId) -> bool {
-        if !self.departing.contains_key(peer) {
+        let heartbeat = self.heartbeat_nanos();
+        let Some(d) = self.departing.get_mut(peer) else {
             return true;
-        }
+        };
         let now = self.now_hint;
-        let (next_at, attempts) = self
-            .removal_sched
-            .get(peer)
-            .copied()
-            .unwrap_or((Nanos(0), 0));
+        let (next_at, attempts) = d.sched.unwrap_or((Nanos(0), 0));
         if now.0 < next_at.0 {
             return false;
         }
         let cap_shift = SNAPSHOT_HEARTBEAT_BACKOFF_MAX_TICKS.ilog2();
         let mult = 1u64 << attempts.min(cap_shift);
-        let gap = self.heartbeat_nanos().saturating_mul(mult);
-        self.removal_sched.insert(
-            peer.clone(),
-            (Nanos(now.0.saturating_add(gap)), attempts.saturating_add(1)),
-        );
+        let gap = heartbeat.saturating_mul(mult);
+        d.sched = Some((Nanos(now.0.saturating_add(gap)), attempts.saturating_add(1)));
         true
     }
 
@@ -6572,26 +6563,18 @@ where
         if self.departing.is_empty() {
             return;
         }
-        for peer in self.departing.keys() {
-            self.departing_since.entry(peer.clone()).or_insert(now);
-        }
         let ceiling = DEPARTING_NOTICE_GIVE_UP.as_nanos() as u64;
         let quiet_ceiling = DEPARTING_QUIET_GIVE_UP.as_nanos() as u64;
-        let stale: Vec<NodeId> = self
-            .departing_since
-            .iter()
-            .filter(|(p, since)| {
-                // A peer that already acked its notice and then went silent
-                // has left (its host released the replica): the short bound.
-                let bound = if self.departing_quiet.contains(*p) {
-                    quiet_ceiling
-                } else {
-                    ceiling
-                };
-                self.departing.contains_key(*p) && now.0.saturating_sub(since.0) >= bound
-            })
-            .map(|(p, _)| p.clone())
-            .collect();
+        let mut stale: Vec<NodeId> = Vec::new();
+        for (peer, d) in &mut self.departing {
+            let since = *d.since.get_or_insert(now);
+            // A peer that already acked its notice and then went silent has
+            // left (its host released the replica): the short bound.
+            let bound = if d.quiet { quiet_ceiling } else { ceiling };
+            if now.0.saturating_sub(since.0) >= bound {
+                stale.push(peer.clone());
+            }
+        }
         for peer in stale {
             self.drop_departing(&peer);
         }
@@ -6717,7 +6700,7 @@ where
                 self.removal_stats.notices_acked += 1;
                 return;
             }
-            Some(d) if removal_index < d.index => {
+            Some(d) if removal_index < d.stamp.index => {
                 self.removal_stats.notices_ignored += 1;
                 return;
             }
@@ -6746,7 +6729,9 @@ where
             // Still owed the catch-up entries, but the peer is known to have
             // recorded its removal: from here only a *silent* peer is cut off,
             // and on the short bound (`DEPARTING_QUIET_GIVE_UP`).
-            self.departing_quiet.insert(from);
+            if let Some(d) = self.departing.get_mut(&from) {
+                d.quiet = true;
+            }
         }
     }
 
@@ -6790,7 +6775,7 @@ where
             // endless full-image flood to a peer that may never even be alive.
             // What it needs is the *fact* of its removal, not the state it
             // would have replicated: send the tiny notice instead.
-            if let Some(dep) = self.departing.get(&peer).copied() {
+            if let Some(dep) = self.departing.get(&peer).map(|d| d.stamp) {
                 self.forget_snapshot_transfer(&peer);
                 let notice = self.removal_notice_for(&peer, dep);
                 if notice.is_some() {
@@ -6854,7 +6839,7 @@ where
     }
 
     /// Build the next `InstallSnapshot` chunk for `peer`, starting at the byte
-    /// offset recorded in `snapshot_offset` (0 if no transfer is in flight).
+    /// offset recorded in `SnapshotSend::acked_offset` (0 if no transfer is in flight).
     /// Cheap: it slices the serialized [`snapshot_blob`] **by reference** rather
     /// than (re-)serializing or cloning the state, so repeated calls at the same
     /// offset are byte-identical, deterministic, and O(chunk) — not O(state) per
@@ -6898,7 +6883,7 @@ where
     /// correctness, see that method's own doc) and it restarted from chunk 0,
     /// forever.
     ///
-    /// [`snapshot_chunk_sent`](Self::snapshot_chunk_sent) tracks the offset
+    /// `SnapshotSend::last_sent` tracks the offset
     /// last actually shipped to each peer and how many times it has been
     /// resent since; a resend of the SAME offset is suppressed once the
     /// caller's own `SnapshotResend::Capped(n)` budget is exhausted — a chunk
@@ -6958,17 +6943,14 @@ where
             return None;
         };
         let total = serialized.len() as u64;
-        let offset = self
-            .snapshot_offset
-            .get(&peer)
-            .copied()
-            .unwrap_or(0)
-            .min(total);
-        let resends_so_far = self
-            .snapshot_chunk_sent
-            .get(&peer)
-            .filter(|&&(last_offset, _)| last_offset == offset)
-            .map_or(0, |&(_, resends)| resends);
+        // Read-only until the send below: the `Capped` and blob-missing early
+        // returns must not create a record (it exists iff offset acked or chunk sent).
+        let rec = self.snapshot_send.get(&peer);
+        let offset = rec.and_then(|r| r.acked_offset).unwrap_or(0).min(total);
+        let resends_so_far = rec
+            .and_then(|r| r.last_sent)
+            .filter(|&(last_offset, _)| last_offset == offset)
+            .map_or(0, |(_, resends)| resends);
         if let SnapshotResend::Capped(limit) = snapshot_resend
             && resends_so_far > limit
         {
@@ -6987,20 +6969,24 @@ where
         // between resends growing without bound too (see that constant's
         // own doc for why this ceiling, not zero and not sub-election-
         // timeout, is the sound value). Deliberately keyed off
-        // `snapshot_heartbeat_attempts`, NOT `resends_so_far` above: that
+        // `heartbeat_attempts`, NOT `resends_so_far` above: that
         // counter only advances on a call that actually sends, so gating on
         // it directly would freeze the schedule forever at whatever count
         // first got suppressed (see that field's own doc).
-        // `snapshot_heartbeat_attempts` instead advances on every attempt,
+        // `heartbeat_attempts` instead advances on every attempt,
         // sent or suppressed, and resets whenever the tracked offset itself
         // changes (real progress always restarts the backoff, and a
         // genuinely new offset — attempt count freshly reset to `0` — is
         // never held back).
         if snapshot_resend == SnapshotResend::Backoff {
-            let attempts = self
-                .snapshot_heartbeat_attempts
+            // A fresh record starts at attempt 0, which is never suppressed, so
+            // it always proceeds to the send below that sets `last_sent` —
+            // this cannot leave a record with neither field set.
+            let attempts = &mut self
+                .snapshot_send
                 .entry(peer.clone())
-                .or_insert((offset, 0));
+                .or_default()
+                .heartbeat_attempts;
             if attempts.0 != offset {
                 *attempts = (offset, 0);
             }
@@ -7024,10 +7010,9 @@ where
         let end = (start + self.snapshot_chunk_bytes).min(serialized.len());
         let data = serialized[start..end].to_vec();
         let done = end as u64 == total;
-        self.snapshot_chunk_sent
-            .insert(peer.clone(), (offset, resends_so_far.saturating_add(1)));
-        self.snapshot_offer_base
-            .insert(peer.clone(), self.snapshot_index);
+        let rec = self.snapshot_send.entry(peer.clone()).or_default();
+        rec.last_sent = Some((offset, resends_so_far.saturating_add(1)));
+        rec.offer_base = self.snapshot_index;
         Some((
             peer,
             RaftMsg::InstallSnapshot {

@@ -8,8 +8,8 @@
 //! 1. `RaftCore::snapshot_upto` unconditionally invalidates every peer's
 //!    in-flight chunked transfer the moment the snapshot base moves again (a
 //!    `DRIVER_APPLIED` state machine's blob is rebuilt lazily, so a moved
-//!    base drops the stale image and clears `snapshot_offset`/
-//!    `snapshot_chunk_sent` for every peer — see that method's own doc).
+//!    base drops the stale image and clears the `snapshot_send`
+//!    records for every peer — see that method's own doc).
 //!    `animus-cp-data`'s `apply_and_compact` already defers a
 //!    THRESHOLD-triggered (never an `image_needed`-triggered) compaction
 //!    while `RaftCore::snapshot_transfer_in_flight()` is true, up to
@@ -27,9 +27,9 @@
 //!
 //! 2. Adding that gate ALONE still did not fix this test: `RaftCore::
 //!    snapshot_transfer_in_flight()` was defined purely in terms of
-//!    `snapshot_offset`, which is populated only once a peer's FIRST ack is
+//!    `SnapshotSend::acked_offset`, which is populated only once a peer's FIRST ack is
 //!    processed — not the moment a chunk is actually sent
-//!    (`snapshot_chunk_for` records that in `snapshot_chunk_sent` instead).
+//!    (`snapshot_chunk_for` records that in `SnapshotSend::last_sent` instead).
 //!    That leaves a real window, from "leader ships chunk 0" to "leader
 //!    processes the first ack" (stretchable arbitrarily far by a slow link
 //!    or a contended peer — exactly `ProdEnv`'s real-thread CI shape), during
@@ -37,7 +37,7 @@
 //!    `false`, so a threshold crossing landing in that window still
 //!    invalidates it — the defer gate never engages during the window it
 //!    matters most. Fixed by widening `snapshot_transfer_in_flight` to also
-//!    check `snapshot_chunk_sent`; both maps are already cleared together at
+//!    check `last_sent`; both fields live in one `snapshot_send` record, cleared together at
 //!    every existing invalidation/completion point, so this is a strictly
 //!    more accurate reading of the same "is a chunk genuinely outstanding"
 //!    fact, benefiting `animus-cp-data` for free (same shared `RaftCore`).

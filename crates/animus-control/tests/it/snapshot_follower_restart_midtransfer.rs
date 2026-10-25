@@ -1,7 +1,7 @@
 //! Issue #899 / PR #903 under real faults: a follower that is stopped and
 //! restarted partway through a multi-chunk `InstallSnapshot` loses its volatile
 //! reassembly buffer and honestly reports `next_offset: 0` on its next ack. The
-//! leader's monotonic `max` guard on the per-peer `snapshot_offset` used to
+//! leader's monotonic `max` guard on the per-peer `SnapshotSend::acked_offset` used to
 //! swallow that reset, so it kept sending chunks at the stale high offset and
 //! the follower never converged.
 //!

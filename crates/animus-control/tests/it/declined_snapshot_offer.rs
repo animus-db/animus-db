@@ -20,7 +20,7 @@
 //! 4. Nothing on the leader ever moved `next_index` off 1 again: every further
 //!    ack was such a chunk reply, never an `AppendEntriesResp`. So it re-offered
 //!    the same chunk-0 on every heartbeat forever, the phantom
-//!    `snapshot_offset` entry the reply handler inserted kept
+//!    `snapshot_send` record the reply handler inserted kept
 //!    `snapshot_transfer_in_flight()` true (which the driver reads as "defer
 //!    compaction", then "idle ceiling hit: count a transfer restart" every
 //!    `COMPACT_DEFER_IDLE_CEILING`), and the follower never received another
