@@ -424,3 +424,46 @@ superseded because a flush no longer queues behind a compaction at all.
   lanes to keep modelling the old single lock.
 - Class L, no durable format change (a crash can leave an unreferenced orphan SSTable below
   `next_seq`, which recovery never reads).
+
+## Amendment (2026-10-25, issue #1389): byte-based L0 trigger and L0 to L0 merges
+
+The "incremental or partial L0 to L1 compaction" deferred above is the bound that a 3-node
+real-process cluster hit: throughput fell 60-70 % in 25 minutes at flat CPU and fsync time, with the
+L0 stop stall on for up to half of wall time. With production sizes (64 KiB flush, trigger 4, 2 MiB
+tables, fanout 4) every L0 to L1 compaction rewrote every overlapping L1 table, which for hashed keys is
+all of L1, so compaction input bytes per ingested byte grew with `L1_bytes / flush_size` and the one
+compaction at a time could not keep up.
+
+- **Policy** (`next_compaction_plan`, `run_compaction`; no other file). At `compaction_trigger` L0
+  tables, compact L0 to L1 only if L0 holds at least `overlapping_L1_bytes / level_fanout` bytes, where
+  "overlapping" is the L1 tables whose range meets L0's combined range (write amplification about the
+  fanout per level whatever L1's size). Hashed keys overlap all of L1; keys arriving in order overlap none,
+  so they compact straight into L1 exactly as before (the `compaction_io_budget_corpus` cell 7 workload
+  is of that kind and would otherwise merge needlessly in L0). Below the floor, merge a size-tiered
+  group of the smallest L0 tables among themselves back into L0 (`l0_merge_group`: the two smallest, then
+  each next-smallest no larger than the sum so far, and never fewer tables than bring the count back
+  under the trigger; always at least two, and written as ONE table, so the L0 count strictly falls).
+  L1+ cascade is unchanged. With `trigger = 1` or a single L0 table the old L0 to L1 plan is kept.
+- **Reads and ordering.** Reads choose by version across all tables, never by table order, so an L0
+  output with a new (highest) seq changes no read; ties on an identical `(key, version)` already
+  re-order against concurrent flushes in any compaction, and replays write identical values.
+- **Tombstone GC.** An L0 to L0 merge leaves other L0 tables behind, so those count as "deeper" for
+  `gc_obsolete_records` (L1+ always did); a tombstone is only reclaimed by an L0 to L1 compaction, which
+  takes all of L0. Held-snapshot floors are unchanged.
+- **Stall thresholds.** The stall counts L0 tables, and an L0 to L0 merge strictly reduces the count, so
+  the slowdown (3T) and stop (5T) levels keep their meaning; the corpus asserts L0 stays at or below 2T
+  while ingesting 64 MB. Compaction input is charged to the IO budget as the group's bytes
+  (`plan_input_bytes`), the urgent bypass at 2T is unchanged and still gets a merge or a compaction.
+- **Class L, no format change.** The manifest records tables with their level exactly as before; L0
+  already allowed any number of overlapping tables. Nothing new is persisted, so ADR 0073 needs no
+  version tag or fixture. Crash safety is the existing single manifest swap: the inputs stay named until
+  the swap, the outputs are orphans before it.
+- **Measured** (`animus-storage` `lsm_compaction_wa`, `LsmEngine<SimEnv>`, hashed keys, incompressible
+  1 KiB values, 5 % deletes, 10 % overwrites; compaction input bytes per ingested byte per window ending
+  at 2/4/8/16/32/64 MB): old 6.6, 12.8, 27.0, 18.9, 22.5, 21.5; new 3.5, 5.3, 6.4, 7.0, 9.5, 9.5. The
+  residue is the number of levels in play (each about the fanout plus one), not L1's size. Real 3-node
+  debug-build cluster, 48 closed-loop `PutItem` clients on unique keys, 13 minutes, never restarted:
+  baseline 464 puts/s in the first 30 s falling to 125-170/s at the end (about -72 %, 180k commits,
+  `l0_stop` stall up to 226 s on one node); with the change 508/s falling to a 410-500/s band (one
+  low 170/s final bucket, one 245/s dip), 321k commits (1.8x), `l0_stop` stall 0 to 25 s, and
+  compaction input per commit about 1.4 KB against 3.1-4.2 KB.

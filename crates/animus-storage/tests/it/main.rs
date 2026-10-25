@@ -4,6 +4,7 @@
 mod lsm_approx_bytes;
 mod lsm_clone;
 mod lsm_clone_filtered;
+mod lsm_compaction_wa;
 mod lsm_crash;
 mod lsm_crash_encrypted;
 mod lsm_dir_durability;
