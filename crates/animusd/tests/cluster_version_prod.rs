@@ -10,12 +10,13 @@
 //! timeout-guarded (`ProdEnv` determinism guarantees do not apply, so a hang
 //! must fail loudly rather than stall CI).
 //!
-//! The real `MAX_SUPPORTED` is 9 (G-01 stage G-c shipped `Gate::GlobalTables`
+//! The real `MAX_SUPPORTED` is 10 (G-01 stage G-c shipped `Gate::GlobalTables`
 //! at 2, stage G-d `Gate::MrecReplication` at 3, R-01 `Gate::TxnSealChecked`
 //! at 4, ADR 0079 `Gate::NodeCapacity` at 5, ADR 0080 `Gate::FollowerAppliedIndex`
 //! at 6, ADR 0075's 2026-10-21 amendments `Gate::MrscReplicaRemoval` at 7 and
-//! `Gate::MrecReplicaOverrides` at 8 and `Gate::LegacyGlobalTables` at 9), so
-//! every real binary advertises `[1, 9]` and live Finalizes to 2 through 9
+//! `Gate::MrecReplicaOverrides` at 8 and `Gate::LegacyGlobalTables` at 9 and issue #1380's
+//! `Gate::TxnSettled` at 10), so
+//! every real binary advertises `[1, 10]` and live Finalizes to 2 through 10
 //! succeed here: the era, the view, the
 //! finalizes that open `Gate::GlobalTables`, `Gate::MrecReplication` and
 //! `Gate::TxnSealChecked` on every node (a data-only node's mirror included). The blocker matrix and the one-step
@@ -102,7 +103,7 @@ async fn the_era_starts_over_real_sockets_and_the_admin_surface_works() {
 
         // GET /admin/cluster-version converges on every node: era on, version
         // 1, every member reported, and Finalize to 2 is within reach (every
-        // binary's range is [MIN_SUPPORTED, MAX_SUPPORTED] = [1, 9]).
+        // binary's range is [MIN_SUPPORTED, MAX_SUPPORTED] = [1, 10]).
         for node in &nodes {
             let addr = node.admin_addr();
             timeout(Duration::from_secs(30), async {
@@ -115,12 +116,12 @@ async fn the_era_starts_over_real_sockets_and_the_admin_surface_works() {
                             n.len() == 3 && n.iter().all(|x| x["reported"] == true)
                         })
                     {
-                        // Every member's range is [1,9], so nothing blocks the
+                        // Every member's range is [1,10], so nothing blocks the
                         // next step (target 2) and the safe target (the highest
                         // version every member supports) is the binary's max.
                         assert_eq!(v["can_finalize"], true, "{v}");
                         assert_eq!(v["target"], 2, "{v}");
-                        assert_eq!(v["safe_target"], 9, "{v}");
+                        assert_eq!(v["safe_target"], 10, "{v}");
                         assert!(v["blockers"].as_array().unwrap().is_empty(), "{v}");
                         return;
                     }
@@ -289,11 +290,13 @@ async fn the_era_starts_over_real_sockets_and_the_admin_surface_works() {
         // The sixth step, 6 -> 7, opens `Gate::MrscReplicaRemoval` (ADR 0075's
         // 2026-10-21 amendment): the replica-removal command of an MRSC table.
         // The seventh, 7 -> 8, opens `Gate::MrecReplicaOverrides`; the eighth,
-        // 8 -> 9, opens `Gate::LegacyGlobalTables` (the 2017.11.29 API).
+        // 8 -> 9, opens `Gate::LegacyGlobalTables` (the 2017.11.29 API); the
+        // ninth, 9 -> 10, opens `Gate::TxnSettled` (issue #1380).
         for (to, expected, gate) in [
             (7, 6, animus_control::version::Gate::MrscReplicaRemoval),
             (8, 7, animus_control::version::Gate::MrecReplicaOverrides),
             (9, 8, animus_control::version::Gate::LegacyGlobalTables),
+            (10, 9, animus_control::version::Gate::TxnSettled),
         ] {
             let (status, v) = admin(
                 nodes[leader].admin_addr(),

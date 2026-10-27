@@ -229,6 +229,19 @@ const MAX_TRANSACT_ITEMS: usize = 100;
 /// no AWS-documented value to match (real DynamoDB does not publish one).
 const TXN_IDEMPOTENCY_TTL_SECS: u64 = 600;
 
+// Issue #1380 (ADR 0018's 2026-10-27 amendment): a Settled txn-record stub is
+// reaped no sooner than `TXN_SETTLED_REAP_AGE`. It must outlive the longest
+// window in which anything can still ask about the transaction: the
+// idempotency record's TTL (a retry inside it is answered from that table) plus
+// two client round trips (`CLIENT_TIMEOUT`: one for a delayed stage, one for a
+// delayed decision/resolve). Compile-time, so raising either constant cannot
+// silently shrink the margin.
+const _: () = assert!(
+    animus_cp_data::TXN_SETTLED_REAP_AGE.as_secs()
+        >= TXN_IDEMPOTENCY_TTL_SECS + 2 * crate::CLIENT_TIMEOUT.as_secs(),
+    "TXN_SETTLED_REAP_AGE must exceed the idempotency TTL plus two client timeouts"
+);
+
 /// A `ClientRequestToken` record's `outcome` attribute values (ADR 0018's
 /// 2026-08-24 amendment) — see [`run_transact`]'s doc for the state machine.
 const TXN_IDEMPOTENCY_PENDING: &str = "PENDING";

@@ -1286,6 +1286,62 @@ fn txn_envelope_row_transcode_registration_is_complete() {
     assert_eq!(transcode::supported_row_back(), vec![0, 1]);
 }
 
+/// `txn-record` (issue #1380): the v2 fixture's Settled stubs, stored as engine
+/// rows (one in an SSTable, one in the WAL) beside the v1 fixture's decided
+/// records, come back from a row transcode as the v1 `Committed`/`Aborted`
+/// bytes; the v1 records and a junk row are untouched.
+#[test]
+fn txn_record_settled_stubs_are_rewritten_to_v1_in_sstables_and_wal() {
+    each_seed("txn_record_row_transcode", |seed| {
+        let sc = Scenario::new(seed);
+        let env = sc.env();
+        let v2 = unpack_frames(&fixtures("txn-record")[&2]);
+        let v1 = unpack_frames(&fixtures("txn-record")[&1]);
+        assert_eq!((v2.len(), v1.len()), (2, 3));
+        let engine =
+            block_on(LsmEngine::open_with(env.clone(), sc.prefix, lsm_opts())).expect("open");
+        let rows: Vec<Row> = vec![
+            (b"r-pending".to_vec(), 5, Some(v1[0].clone())),
+            (b"r-committed".to_vec(), 6, Some(v1[1].clone())),
+            (b"r-settled-committed".to_vec(), 7, Some(v2[0].clone())),
+            (b"r-junk".to_vec(), 8, Some(vec![9, 9, 9])),
+        ];
+        for (k, v, val) in &rows {
+            assert!(block_on(engine.merge(k, val.as_ref().unwrap(), *v)).unwrap());
+        }
+        block_on(engine.flush_now()).expect("flush");
+        let wal = (b"r-settled-aborted".to_vec(), 9, Some(v2[1].clone()));
+        assert!(block_on(engine.merge(&wal.0, wal.2.as_ref().unwrap(), wal.1)).unwrap());
+        drop(engine);
+        let mut rows = rows;
+        rows.push(wal);
+
+        let opts = TranscodeOpts {
+            row_back: 1,
+            ..TranscodeOpts::default()
+        };
+        let report = transcode::transcode_disk(&env, 0, &opts)
+            .unwrap_or_else(|e| panic!("seed={seed}: transcode_disk: {e}"));
+        assert!(
+            report.rows.values_rewritten >= 2,
+            "seed={seed}: {:?}",
+            report.rows
+        );
+        let got = read_rows(&env, sc.prefix, &rows);
+        for (i, (_, _, before)) in rows.iter().enumerate() {
+            let after = got[i].as_ref().expect("row present");
+            let before = before.as_ref().unwrap();
+            let settled = v2.contains(before);
+            assert_eq!(after != before, settled, "seed={seed}: row {i}");
+            if settled {
+                let rec =
+                    animus_cp_data::downgrade_txn_record_to_v1(before).expect("fixture downgrades");
+                assert_eq!(after, &rec, "seed={seed}: row {i}");
+            }
+        }
+    });
+}
+
 #[test]
 fn txn_envelope_v2_intents_are_rewritten_to_v1_in_sstables_and_wal() {
     each_seed("txn_envelope_row_transcode", |seed| {

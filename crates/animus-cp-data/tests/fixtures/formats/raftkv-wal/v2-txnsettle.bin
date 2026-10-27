@@ -1,0 +1,5 @@
+af889cce:CWL102{"Hard":{"term":12,"voted_for":"n2"}}
+1a770af3:CWL102{"Append":{"term":12,"index":70,"command":{"TxnSettle":{"entries":[[{"ts":{"wall_ms":30,"logical":0},"node":"n1"},[114,101,99,111,114,100,45,97]],[{"ts":{"wall_ms":31,"logical":0},"node":"n2"},[114,101,99,111,114,100,45,98]]],"ts":{"wall_ms":32,"logical":0}}},"config":null,"learners":null}}
+248f1ee5:CWL102{"Append":{"term":12,"index":71,"command":{"TxnReap":{"entries":[[{"ts":{"wall_ms":30,"logical":0},"node":"n1"},[114,101,99,111,114,100,45,97]]],"ts":{"wall_ms":33,"logical":1}}},"config":null,"learners":null}}
+dfbade7f:CWL102{"Append":{"term":12,"index":72,"command":{"TxnSettle":{"entries":[],"ts":{"wall_ms":34,"logical":0}}},"config":null,"learners":null}}
+05eed539:CWL102!sync:736

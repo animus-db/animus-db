@@ -270,8 +270,22 @@ pub(crate) struct CpTxnView {
     pub(crate) tablet: u64,
     pub(crate) node: NodeId,
     pub(crate) pending: Vec<PendingTxnView>,
+    /// At most the request's `limit` entries (see `txns_view`).
     pub(crate) unresolved_decided: Vec<UnresolvedTxnView>,
+    /// Exact size of the group's decided-with-no-local-resolve map.
+    pub(crate) unresolved_decided_total: usize,
+    /// Whether `unresolved_decided` was cut at the limit.
+    pub(crate) unresolved_decided_truncated: bool,
+    /// Exact count of decided records not yet settled (`Gate::TxnSettled`).
+    pub(crate) unsettled_total: usize,
+    /// Exact count of Settled stubs awaiting the reaper.
+    pub(crate) settled_total: usize,
 }
+
+/// `GET /admin/txns` list cap when `?limit=` is absent.
+const TXN_VIEW_DEFAULT_LIMIT: usize = 200;
+/// The largest `?limit=` honoured.
+const TXN_VIEW_MAX_LIMIT: usize = 5000;
 
 /// Accept loop for the admin HTTP endpoint. One task per connection; HTTP/1.1
 /// keep-alive lets a client reuse the connection (mirrors `dynamo::serve`).
@@ -559,8 +573,8 @@ impl AdminHost for ClientCtx {
     async fn raftkv_view(&self, query: &str) -> Value {
         raftkv_view(self, query).await
     }
-    async fn txns_view(&self) -> Value {
-        txns_view(self).await
+    async fn txns_view(&self, query: &str) -> Value {
+        txns_view(self, query).await
     }
     async fn storage_lsm(&self, query: &str) -> (u16, Value) {
         storage_lsm(self, query).await
@@ -747,8 +761,8 @@ impl<E: Env, R: RelayClient> AdminHost for GenericAdminHost<E, R> {
     async fn raftkv_view(&self, query: &str) -> Value {
         raftkv_view(&self.0, query).await
     }
-    async fn txns_view(&self) -> Value {
-        txns_view(&self.0).await
+    async fn txns_view(&self, query: &str) -> Value {
+        txns_view(&self.0, query).await
     }
     async fn storage_lsm(&self, query: &str) -> (u16, Value) {
         storage_lsm(&self.0, query).await
@@ -1142,10 +1156,20 @@ async fn raftkv_view<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>, q: &str) -> 
 /// client-side fan-out over every node's own `/admin/txns`, exactly like
 /// `/admin/raftkv` (see that route's own doc). Pure observer, no gated
 /// action: manual transaction resolution is deferred (see `CpTxnView`'s doc).
-async fn txns_view<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> Value {
+///
+/// **Bounded (issue #1380):** a group's decided history used to be serialized
+/// whole. `?limit=N` (default [`TXN_VIEW_DEFAULT_LIMIT`], at most
+/// [`TXN_VIEW_MAX_LIMIT`]) caps each group's `unresolved_decided` list; the
+/// `*_total` fields stay exact and `unresolved_decided_truncated` says whether
+/// the list was cut.
+async fn txns_view<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>, q: &str) -> Value {
+    let limit = http::query_param(q, "limit")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(TXN_VIEW_DEFAULT_LIMIT)
+        .clamp(1, TXN_VIEW_MAX_LIMIT);
     let mut groups: Vec<CpTxnView> = Vec::new();
     for (t, g) in ctx.edge.hosted_groups() {
-        groups.push(g.txn_view(t).await);
+        groups.push(g.txn_view(t, limit).await);
     }
     json!({ "hosts_cp": !groups.is_empty(), "groups": groups })
 }

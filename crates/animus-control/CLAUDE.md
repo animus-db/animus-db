@@ -3521,3 +3521,7 @@ Lesson: `docs/lessons/code-patterns/2026-10-23-a-control-plane-install-must-hold
   "unknown", estimated at `elected_at_commit` (not 0); the retention cap still
   excludes a peer that stays silent. See
   `docs/lessons/code-patterns/2026-10-23-a-volatile-leader-seed-of-zero-is-not-caught-up-to-zero.md`.
+
+## `Gate::TxnSettled`, `MAX_SUPPORTED = 10` (issue #1380)
+
+The tenth gate (cluster version 10) guards the data-plane `TxnSettle`/`TxnReap` commands (`animus-cp-data`'s `gates.rs` row). `sim_versions.rs` has a `Release(10)` column and a `TxnSettled` row; literal-9 tests were moved to 10. ADR 0073's 2026-10-27 amendment.

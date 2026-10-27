@@ -424,6 +424,26 @@ fn read_txn_id(c: &mut Cursor<'_>) -> Result<TxnId, DecodeError> {
     })
 }
 
+/// Issue #1380: a `(txn_id, record_key)` list (`TxnSettle`/`TxnReap`).
+fn put_txn_entries(out: &mut Vec<u8>, entries: &[(TxnId, Vec<u8>)]) {
+    out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+    for (id, key) in entries {
+        put_txn_id(out, id);
+        put_bytes(out, key);
+    }
+}
+
+fn read_txn_entries(c: &mut Cursor<'_>) -> Result<Vec<(TxnId, Vec<u8>)>, DecodeError> {
+    let n = c.u32()?;
+    // Capped pre-allocation against an untrusted wire count (see
+    // `read_kind_writes`).
+    let mut entries = Vec::with_capacity(n.min(1 << 20) as usize);
+    for _ in 0..n {
+        entries.push((read_txn_id(c)?, c.bytes()?));
+    }
+    Ok(entries)
+}
+
 /// ADR 0018 §2/PR4: `TxnOutcome`'s decision travels explicitly inside
 /// `KvCommand::TxnResolve` — see that variant's doc.
 fn put_txn_outcome(out: &mut Vec<u8>, o: &TxnOutcome) {
@@ -724,6 +744,19 @@ fn put_command(out: &mut Vec<u8>, c: &KvCommand) {
             put_ts(out, *ts);
             put_opt_ts(out, orphan_created_ts);
         }
+        // ADR 0018 (2026-10-27, issue #1380), `Gate::TxnSettled`: additive tags
+        // inside wire v1 like 18/19 -- an older decoder rejects the tag by
+        // name and the gate keeps the entry from being sent.
+        KvCommand::TxnSettle { entries, ts } => {
+            put_u8(out, 20);
+            put_txn_entries(out, entries);
+            put_ts(out, *ts);
+        }
+        KvCommand::TxnReap { entries, ts } => {
+            put_u8(out, 21);
+            put_txn_entries(out, entries);
+            put_ts(out, *ts);
+        }
         KvCommand::TxnResolve {
             txn_id,
             record_key,
@@ -881,6 +914,14 @@ fn read_command(c: &mut Cursor<'_>) -> Result<KvCommand, DecodeError> {
             record_key: c.bytes()?,
             ts: read_ts(c)?,
             orphan_created_ts: read_opt_ts(c)?,
+        },
+        20 => KvCommand::TxnSettle {
+            entries: read_txn_entries(c)?,
+            ts: read_ts(c)?,
+        },
+        21 => KvCommand::TxnReap {
+            entries: read_txn_entries(c)?,
+            ts: read_ts(c)?,
         },
         11 => {
             let txn_id = read_txn_id(c)?;
@@ -2249,6 +2290,59 @@ pub(crate) mod tests {
             prev_log_term: 11,
             entries,
             leader_commit: 59,
+        })]
+    }
+
+    /// ADR 0018 (2026-10-27, issue #1380): one `AppendEntries` frame carrying
+    /// the two settled-record variants (`Gate::TxnSettled`, codec tags 20 and
+    /// 21). A *shaped* fixture (`raftkv-wire/v1-txnsettle.bin`), append-only
+    /// like [`txn_sealed_sample_wires`]: the variants are additive inside wire
+    /// v1.
+    pub(crate) fn txn_settled_sample_wires() -> Vec<KvWire> {
+        let entry = |index: u64, command: KvCommand| LogEntry {
+            term: 12,
+            index,
+            command,
+            config: None,
+            learners: None,
+        };
+        let id = |wall, node| TxnId {
+            ts: ts(wall, 0),
+            node: nid(node),
+        };
+        let entries = vec![
+            entry(
+                70,
+                KvCommand::TxnSettle {
+                    entries: vec![
+                        (id(30, 1), b"record-a".to_vec()),
+                        (id(31, 2), b"record-b".to_vec()),
+                    ],
+                    ts: ts(32, 0),
+                },
+            ),
+            entry(
+                71,
+                KvCommand::TxnReap {
+                    entries: vec![(id(30, 1), b"record-a".to_vec())],
+                    ts: ts(33, 1),
+                },
+            ),
+            entry(
+                72,
+                KvCommand::TxnSettle {
+                    entries: Vec::new(),
+                    ts: ts(34, 0),
+                },
+            ),
+        ];
+        vec![KvWire::Raft(RaftMsg::AppendEntries {
+            term: 12,
+            leader: nid(2),
+            prev_log_index: 69,
+            prev_log_term: 12,
+            entries,
+            leader_commit: 69,
         })]
     }
 

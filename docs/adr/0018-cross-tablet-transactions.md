@@ -4344,3 +4344,86 @@ the boot calendar time in ns and advances monotonically. HLC values jump once
 to ~1.7e12 ms << 20; they stay monotone and inside the `pack` bound. A rollback
 to the previous binary stalls the older nodes' HLC again. The #1204
 `in_doubt_grace_elapsed` path stays as defence in depth.
+
+## Amendment 2026-10-27: decided records are settled once, and reaped after a TTL (issue #1380)
+
+**Problem.** `rebuild_txn_tracker` (group start and `InstallSnapshot`) could only
+see the engine rows, and a decided record said nothing about whether its resolve
+had already run, so every decided record became `unresolved_decided`. After a
+restart the decided pass re-proposed a `TxnResolve` for the group's whole
+transaction history; a follower's tracker never drained (it only sees resolves
+that apply on its own tablet, and the log is compacted), and a non-empty tracker
+vetoes quiescence (ADR 0048). Groups never went idle.
+
+**Design (`Gate::TxnSettled`, cluster version 10, ADR 0073's same-date amendment).**
+
+1. A new durable record form, **Settled**: the decided outcome (and commit ts)
+   kept, `intent_spans` dropped, `settled_ts` stamped. `TxnStatus::Settled` is
+   `txn-record` v2.
+2. The decided pass proposes `KvCommand::TxnSettle` for a record only after
+   `txn_verify_staged` (via `txn_participants_clear`) showed that **no participant
+   holds an intent** for the transaction; an unconfirmed verify leaves the record
+   unsettled and retried. Apply cannot see other tablets, so the premise is the
+   proposer's; apply itself is a deterministic per-entry no-op for an absent,
+   `Pending`, already-Settled, foreign-txn or sealed-range record.
+3. `rebuild_txn_tracker` skips Settled records (they go to a `settled` set used
+   only by the reaper), and the settle apply removes the record from
+   `unresolved_decided` on **every replica**, so a follower drains too. With the
+   gate open a non-empty `unsettled` set also vetoes quiescence.
+4. The decided work-list is iterated in bounded batches (`TXN_DECIDED_BATCH` =
+   128, a per-tablet cursor), so a large backlog is neither one giant proposal
+   nor one giant scan per sweep.
+5. **Reaper.** `KvCommand::TxnReap` deletes a Settled stub, but only when the stub
+   is at least `TXN_SETTLED_REAP_AGE` (20 minutes, HLC wall time) older than the
+   entry's own `ts`. The age check is part of apply, so a stale or buggy proposer
+   cannot delete a young stub.
+
+**Why deleting the stub cannot make a late lookup misread "absent" as abort.**
+An absent record plus a stale intent is how a recovery pusher decides to
+synthesize an abort tombstone (section 2b), so the question is whether anything
+can still hold an intent, or stage one, for a reaped transaction.
+
+- A stub exists only after every participant was verified to hold **no intent**.
+  Resolution is by then complete everywhere, so no recovery pusher has a stale
+  intent to ask about.
+- A new intent for the same transaction can only come from a stage still in
+  flight. A stage is bounded by its propose timeout (5 s) and a client round trip
+  by `CLIENT_TIMEOUT` (10 s). The reap age is 20 minutes: two orders of magnitude
+  more than the longest message life, which the compile-time assertion in
+  `dynamo.rs` ties to `TXN_IDEMPOTENCY_TTL_SECS + 2 * CLIENT_TIMEOUT`.
+- The resolved marker (#1243) is **not** relied on for this: it is one row per
+  key, overwritten by the next resolve there, so it does not outlive the stub in
+  general. The safety rests on the time bound above, which is the same kind of
+  assumption the `RECOVERY_GRACE` discussion already makes (a bound on message
+  delay, never an ordering argument).
+- A client retry of a transaction is answered by the Dynamo idempotency table
+  (`TXN_IDEMPOTENCY_TTL_SECS` = 600 s) without re-driving it, and after the TTL
+  starts a **new** transaction with a fresh `TxnId`; it never looks up the old
+  one.
+- A status lookup of a reaped transaction (for example from the console) reads
+  "no record", which every reader already treats as "not committed". The stub
+  answers `Committed`/`Aborted` until then.
+
+The residual, stated plainly: a stage message delayed beyond 20 minutes (a
+network partition that heals with the packet still queued, which TCP and the
+node timeouts make impossible in this system) could land on an absent record and
+be aborted by a pusher after the transaction had committed. The reap age is
+`pub const TXN_SETTLED_REAP_AGE` so a deployment that cannot accept that bound
+has one place to raise it.
+
+**Admin.** `/admin/txns` gains `?limit=` (default 200, max 5000) and reports
+`unresolved_decided_total`, `unresolved_decided_truncated`, `unsettled_total` and
+`settled_total`; the dashboard panel shows the totals.
+
+**Tests.** `sim_cluster_txn_settled.rs` (seeded, three LSM nodes, restart of
+every node, log compaction past the transactions): fixed run asserts the rebuilt
+trackers hold stubs only, the anchor group proposes nothing after the restart, a
+stub still answers its outcome, data stays correct, and stubs are deleted only
+after the reap age; the negative control (gate never opened) re-queues every
+record and re-proposes resolves. In-crate: codec and shaped fixtures,
+`txn-record` v1/v2 fixtures, the gate table row, the chunked-rebuild reference
+with stubs mixed in. Mixed-version cell `release9_to_release10_txn_settle_gate`.
+Note: a restarted `SimCluster` group does not re-quiesce even without any
+transaction, so the quiescence effect is pinned through the tracker (the veto's
+input), not observed directly.
+

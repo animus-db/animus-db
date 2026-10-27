@@ -101,6 +101,12 @@ impl KvCommand {
             | KvCommand::TxnCommitSealChecked { .. }
             | KvCommand::TxnAbortSealChecked { .. }
             | KvCommand::TxnResolve { .. }
+            // Issue #1380: settle/reap are the resolver's own background
+            // bookkeeping; like the resolve they follow, they must not be shed
+            // behind client load (a shed settle is just retried next tick, but
+            // the backlog they retire is what keeps groups awake).
+            | KvCommand::TxnSettle { .. }
+            | KvCommand::TxnReap { .. }
             | KvCommand::NoOp => AdmissionClass::Liveness,
         }
     }
@@ -163,6 +169,10 @@ impl KvCommand {
             | KvCommand::TxnAbort { record_key, .. }
             | KvCommand::TxnCommitSealChecked { record_key, .. }
             | KvCommand::TxnAbortSealChecked { record_key, .. } => record_key.len(),
+            KvCommand::TxnSettle { entries, .. } | KvCommand::TxnReap { entries, .. } => entries
+                .iter()
+                .map(|(_, record_key)| record_key.len() + 32)
+                .sum(),
             KvCommand::Freeze { .. } | KvCommand::ReadCeiling { .. } | KvCommand::NoOp => 0,
         };
         n as u64 + OVERHEAD

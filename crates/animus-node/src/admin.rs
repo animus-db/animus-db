@@ -39,7 +39,7 @@ pub async fn dispatch<H: AdminHost + ?Sized>(
         ("GET", "/admin/status") => (200, host.status_json().await),
         ("GET", "/admin/raft") => (200, host.raft_view().await),
         ("GET", "/admin/raftkv") => (200, host.raftkv_view(query).await),
-        ("GET", "/admin/txns") => (200, host.txns_view().await),
+        ("GET", "/admin/txns") => (200, host.txns_view(query).await),
         ("GET", "/admin/storage/lsm") => host.storage_lsm(query).await,
         ("GET", "/admin/storage/control") => host.storage_control().await,
         ("GET", "/admin/storage/wal") => host.storage_wal(query).await,
@@ -175,7 +175,7 @@ mod tests {
             assert_eq!(query, "exact=1");
             self.record()
         }
-        async fn txns_view(&self) -> Value {
+        async fn txns_view(&self, _query: &str) -> Value {
             unreachable!()
         }
         async fn storage_lsm(&self, _query: &str) -> (u16, Value) {

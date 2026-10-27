@@ -40,7 +40,7 @@ function renderTxns() {
   tabletIds.forEach((id) => {
     groups[id].forEach(({ node, tv }) => {
       pendingCount += tv.pending.length;
-      unresolvedCount += tv.unresolved_decided.length;
+      unresolvedCount += tv.unresolved_decided_total ?? tv.unresolved_decided.length;
       tv.pending.forEach((p) => {
         pendingRows.push(`<tr>
           <td class="mono">${esc(id)}</td>
