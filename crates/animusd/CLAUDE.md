@@ -12705,3 +12705,5 @@ removing several Regions in one call drops every link between them. The saga pro
 walk open with a partition on its first call and assert the window is open
 before healing; see
 `docs/lessons/testing/2026-10-21-a-stuck-first-call-is-the-reliable-way-to-hold-a-walk-open.md`.
+
+- **Console backend dispatch (2026-10-27):** `lib.rs`'s `ConsoleBackend` bodies live once in `console_op_*` helpers generic over the private `ConsoleDispatch` trait; `ProductionDispatch` (concrete `execute_routed`) and `GenericDispatch` (`execute_routed_as_generic`) must stay distinct. See `docs/lessons/code-patterns/2026-10-27-share-a-body-across-prod-and-sim-impls-by-passing-the-dispatch.md`. `admin.rs`'s two `AdminHost` impls are already one-line forwards and differ in `action_data_dynamo` and `debug_inboxes_view`; leave them.
