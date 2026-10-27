@@ -35,8 +35,8 @@ partition driver). `animusd` uses it as a dev-dependency (`sim_cluster_roll_orch
   reporting (era) and `Health::Ok`, holds every restart (`Wait`, or `Blocked(NodeStalled)` past
   `Config::stall_after`).
 - The gate: every member `Active`; every other node's roll-health `Ok` (`NotOk` and `Unreachable`
-  block; `Unavailable` is tolerated only from a node still on the old binary, and only until a
-  node is on the new one: then at least one verdict must exist).
+  block; `Unavailable` passes: a node on the new binary is only past the in-flight check once its
+  verdict is `Ok`, so only a node still on the old binary can be `Unavailable`).
 - `decide_with_target(cfg, obs, Some(id))` (P3-D): a driver that fixes the order itself (the
   operator: a `StatefulSet` replaces pods highest ordinal first) names the node it will restart
   next; the gate then excludes *that* node's verdict and a control leader target gets its
