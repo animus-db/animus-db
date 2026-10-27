@@ -8514,16 +8514,22 @@ async fn persist_wal<E: Env>(
     metrics: &MetricsHandle,
 ) {
     let wal_guard = wal_lock.lock().await;
-    // Disk-full (R-01 (d), ADR 0074 §2): a suspect WAL is never appended to
-    // again — a compaction rewrite (or an earlier round) hit ENOSPC, so go
-    // straight to the rewrite recovery, even with nothing new to drain.
-    if progress.is_suspect() {
+    // The one recovery sequence (suspect WAL -> rewrite -> wake the apply
+    // task). Takes the `wal_lock` guard by value so every caller drops it
+    // before `recover_kv_wal` re-locks `wal_lock`.
+    let recover = |wal_guard| async move {
         drop(wal_guard);
         recover_kv_wal(
             env, wal, core, wal_lock, progress, halted, shared, tablet, metrics,
         )
         .await;
         apply_signal.notify();
+    };
+    // Disk-full (R-01 (d), ADR 0074 §2): a suspect WAL is never appended to
+    // again — a compaction rewrite (or an earlier round) hit ENOSPC, so go
+    // straight to the rewrite recovery, even with nothing new to drain.
+    if progress.is_suspect() {
+        recover(wal_guard).await;
         return;
     }
     // The round number is claimed in the *same* core-lock acquisition as the
@@ -8541,37 +8547,19 @@ async fn persist_wal<E: Env>(
         debug_assert!(records.is_empty());
         return;
     };
-    if let Some(shared) = shared {
-        if let Err(e) = shared.append_tagged(env, wal, tablet, &records).await {
-            if animus_env::is_storage_full(&e) && !halted.load(Ordering::SeqCst) {
-                tracing::error!(error = %e, "raftkv shared wal append hit ENOSPC; group is StorageFull until the WAL is rewritten");
-                progress.mark_suspect();
-                // Issue #1331: the failed round's records are subsumed by the
-                // recovery image; do not pin them for the whole ENOSPC.
-                drop(records);
-                drop(wal_guard);
-                recover_kv_wal(
-                    env,
-                    wal,
-                    core,
-                    wal_lock,
-                    progress,
-                    halted,
-                    Some(shared),
-                    tablet,
-                    metrics,
-                )
-                .await;
-                apply_signal.notify();
-                return;
-            }
-            assert!(
-                halted.load(Ordering::SeqCst),
-                "raftkv shared wal append failed while running: {e}"
-            );
-            return;
-        }
-        metrics.incr(Metric::CpSharedWalSyncs);
+    // Both WAL flavours reduce to one `io::Result`; on success it carries the
+    // private path's encoded round (`None` on the shared path), which the
+    // success bookkeeping below needs. Every other local of the write (the
+    // `append` buffer, and on failure the encoded round) is dropped at the end
+    // of this block, i.e. before any recovery parks (issue #1331).
+    let (what, written): (&str, std::io::Result<Option<Vec<u8>>>) = if let Some(shared) = shared {
+        (
+            "shared wal append",
+            shared
+                .append_tagged(env, wal, tablet, &records)
+                .await
+                .map(|()| None),
+        )
     } else {
         // Issue #1092: ONE `append` for the whole round, not one per record.
         // The WAL is line-framed, so the concatenation is byte-identical to
@@ -8600,7 +8588,18 @@ async fn persist_wal<E: Env>(
             env.sync(wal).await
         }
         .await;
-        if let Err(e) = io {
+        ("wal write", io.map(|()| Some(record_bytes)))
+    };
+    match written {
+        Ok(None) => metrics.incr(Metric::CpSharedWalSyncs),
+        Ok(Some(record_bytes)) => {
+            wal_lock.markers().mark_synced();
+            // Issue #1116: a compaction rewrite staging its replacement outside
+            // the lock must re-append this durable round before it swaps (the
+            // records, not the piggybacked marker, which describes the live file).
+            wal_lock.tail().push(&record_bytes);
+        }
+        Err(e) => {
             if animus_env::is_storage_full(&e) && !halted.load(Ordering::SeqCst) {
                 // ENOSPC: the file's tail is now unknown (a torn partial
                 // append, or bytes a failed fsync may have dropped), so it is
@@ -8608,36 +8607,23 @@ async fn persist_wal<E: Env>(
                 // fresh file once space returns. Never retry the fsync on this
                 // file and assume success (fsyncgate). The round is NOT marked
                 // durable and nothing is acked until that rewrite lands.
-                tracing::error!(error = %e, "raftkv wal write hit ENOSPC; group is StorageFull until the WAL is rewritten");
+                tracing::error!(error = %e, "raftkv {what} hit ENOSPC; group is StorageFull until the WAL is rewritten");
                 progress.mark_suspect();
                 // Issue #1331: this future parks inside `recover_kv_wal` for as
                 // long as the disk stays full, and an async fn's locals live
-                // until it returns. The round's records and both of their
-                // encodings (3-6x the log bytes, held twice) are subsumed by
-                // the recovery image, so release them first instead of
-                // pinning them -- per stalled group -- for the whole ENOSPC.
-                drop(buf);
-                drop(record_bytes);
+                // until it returns. The failed round's records are subsumed by
+                // the recovery image, so release them first instead of pinning
+                // them -- per stalled group -- for the whole ENOSPC.
                 drop(records);
-                drop(wal_guard);
-                recover_kv_wal(
-                    env, wal, core, wal_lock, progress, halted, shared, tablet, metrics,
-                )
-                .await;
-                apply_signal.notify();
+                recover(wal_guard).await;
                 return;
             }
             assert!(
                 halted.load(Ordering::SeqCst),
-                "raftkv wal append failed while running (append or sync): {e}"
+                "raftkv {what} failed while running: {e}"
             );
             return;
         }
-        wal_lock.markers().mark_synced();
-        // Issue #1116: a compaction rewrite staging its replacement outside
-        // the lock must re-append this durable round before it swaps (the
-        // records, not the piggybacked marker, which describes the live file).
-        wal_lock.tail().push(&record_bytes);
     }
     // Durable now: advance the log watermark and the round watermark under one
     // acquisition, then release whatever the consensus loop buffered on this
