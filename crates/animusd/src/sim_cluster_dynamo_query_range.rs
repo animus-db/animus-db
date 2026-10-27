@@ -24,37 +24,8 @@
 //! Seed replay (repo convention): `ANIMUS_SEED=<seed> cargo test -p animusd
 //! --lib <test name>`.
 
-use std::time::Duration;
-
 use super::sim_cluster::SimCluster;
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
-
-/// Poll `body`'s `Query` until `accept` holds, or panic after a bounded
-/// number of attempts — mirrors `sim_cluster_dynamo_query_filter.rs`'s own
-/// `await_gsi_query`.
-fn await_gsi_query(
-    cluster: &mut SimCluster,
-    node: u64,
-    body: &str,
-    accept: impl Fn(&str) -> bool,
-) -> String {
-    let mut last = String::new();
-    for _ in 0..80 {
-        let (status, resp) = cluster.dynamo(node, "DynamoDB_20120810.Query", body.as_bytes());
-        if status == 200 && accept(&resp) {
-            return resp;
-        }
-        last = resp;
-        cluster.run_for(Duration::from_millis(100));
-    }
-    panic!("gsi query never converged (last saw: {last})");
-}
+use super::sim_support::{await_gsi_query, env_seed, first_tablet};
 
 /// A 3-node cluster with table `readings` (composite `pk`/`sk`, `sk`
 /// declared `N`), a composite GSI (`by-device-value`) and a composite LSI
@@ -232,20 +203,6 @@ fn scan_index_forward_orders_n_sort_keys_numerically() {
         vec!["100", "10", "2.5", "2", "0", "-5", "-10"],
         "ScanIndexForward:false returns descending numeric order: {desc}"
     );
-}
-
-/// `table`'s own (sole) tablet id, read off node 0's own `Metadata` — see
-/// `sim_cluster_dynamo_query_pagination.rs`'s identical helper for why
-/// `SimCluster::tablet_of` doesn't work here (this file's `setup` creates
-/// its table through the real wire, not the hand-hosted bypass).
-fn first_tablet(cluster: &SimCluster, table: &str) -> animus_tablet::TabletId {
-    cluster
-        .metadata(0)
-        .tablets_for_table(table)
-        .next()
-        .unwrap_or_else(|| panic!("{table} has no tablet"))
-        .0
-        .to_owned()
 }
 
 /// The same range comparators over a **composite GSI**'s own `N` sort

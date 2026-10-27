@@ -15,26 +15,7 @@
 //! --lib <test name>`.
 
 use super::sim_cluster::SimCluster;
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
-
-/// `table`'s own (sole) tablet id, read off node 0's own `Metadata` — see
-/// `sim_cluster_dynamo_query_pagination.rs`'s identical helper for why
-/// `SimCluster::tablet_of` doesn't work here.
-fn first_tablet(cluster: &SimCluster, table: &str) -> animus_tablet::TabletId {
-    cluster
-        .metadata(0)
-        .tablets_for_table(table)
-        .next()
-        .unwrap_or_else(|| panic!("{table} has no tablet"))
-        .0
-        .to_owned()
-}
+use super::sim_support::{env_seed, first_tablet};
 
 /// Document/set attribute types, projection expressions (including a
 /// list-index projection), and `ReturnValues: ALL_OLD` on both `PutItem` and

@@ -32,71 +32,7 @@
 //!     identical `ValidationException` way.
 
 use super::sim_cluster::SimCluster;
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
-
-/// Pull `(IndexStatus, Backfilling)` for `index` out of a `DescribeTable`/
-/// `UpdateTable` response body's `GlobalSecondaryIndexes` array — `None` if
-/// the index isn't listed at all (dropped, or never created). Mirrors
-/// `tests/update_table_create_index.rs::index_status` (duplicated rather
-/// than shared, per this crate's own per-file-fixture convention).
-fn index_status(body: &str, index: &str) -> Option<(String, bool)> {
-    let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    let table = v.get("Table").or_else(|| v.get("TableDescription"))?;
-    let gsis = table.get("GlobalSecondaryIndexes")?.as_array()?;
-    let entry = gsis
-        .iter()
-        .find(|g| g.get("IndexName").and_then(|n| n.as_str()) == Some(index))?;
-    let status = entry.get("IndexStatus")?.as_str()?.to_owned();
-    let backfilling = entry
-        .get("Backfilling")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    Some((status, backfilling))
-}
-
-/// Find the tablet leader of `table`'s (sole) tablet — mirrors
-/// `sim_cluster_dynamo_indexes.rs::gsi_write_then_query_sim`'s own idiom.
-fn leader_of_table(cluster: &SimCluster, table: &str) -> u64 {
-    let meta = cluster.metadata(0);
-    let (tablet, _) = meta
-        .tablets_for_table(table)
-        .next()
-        .unwrap_or_else(|| panic!("{table} has no tablet"));
-    let tablet = *tablet;
-    drop(meta);
-    cluster
-        .leader_index_of(tablet)
-        .unwrap_or_else(|| panic!("{table} tablet has no leader"))
-}
-
-/// Drive the backfill seeder + GSI drain to exhaustion, then poll
-/// `DescribeTable` (a real op call each time, which is what actually gives
-/// the always-on `index_backfill_loop` completion aggregator a chance to
-/// observe the freshly-reported tablet and flip the index `Active`) until
-/// `index` converges to `ACTIVE` — never a single call assumed to finish a
-/// populated table's backfill in one pass.
-fn converge_gsi_active(cluster: &mut SimCluster, table: &str, index: &str) {
-    let leader = leader_of_table(cluster, table);
-    for _ in 0..10 {
-        cluster.drive_backfill_seed(leader, table);
-        cluster.drain_gsi(leader, table);
-        let (_, body) = cluster.dynamo(
-            0,
-            "DynamoDB_20120810.DescribeTable",
-            format!(r#"{{"TableName":"{table}"}}"#).as_bytes(),
-        );
-        if index_status(&body, index).map(|(s, _)| s) == Some("ACTIVE".to_owned()) {
-            return;
-        }
-    }
-    panic!("index `{index}` on `{table}` did not converge to ACTIVE within 10 rounds");
-}
+use super::sim_support::{converge_gsi_active, env_seed, index_status};
 
 // ---------------------------------------------------------------------------
 // Scenario (a): UpdateTable adds a GSI to a populated table, backfills, and

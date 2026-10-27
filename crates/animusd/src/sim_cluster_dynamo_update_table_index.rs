@@ -68,13 +68,7 @@ use animus_storage::StorageEngine;
 use animus_tablet::TabletId;
 
 use super::sim_cluster::SimCluster;
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
+use super::sim_support::{env_seed, index_status, leader_of_sole_tablet as leader_of_table};
 
 // ---------------------------------------------------------------------------
 // Shared wire helpers (duplicated from `sim_cluster_index_ddl.rs`/the
@@ -228,24 +222,6 @@ fn query_index(
     )
 }
 
-/// Pull `(IndexStatus, Backfilling)` for `index` out of a `DescribeTable`/
-/// `UpdateTable` response body's `GlobalSecondaryIndexes` array — `None` if
-/// the index isn't listed at all.
-fn index_status(body: &str, index: &str) -> Option<(String, bool)> {
-    let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    let table = v.get("Table").or_else(|| v.get("TableDescription"))?;
-    let gsis = table.get("GlobalSecondaryIndexes")?.as_array()?;
-    let entry = gsis
-        .iter()
-        .find(|g| g.get("IndexName").and_then(|n| n.as_str()) == Some(index))?;
-    let status = entry.get("IndexStatus")?.as_str()?.to_owned();
-    let backfilling = entry
-        .get("Backfilling")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    Some((status, backfilling))
-}
-
 fn has_index(cluster: &SimCluster, node: u64, table: &str, index: &str) -> bool {
     cluster
         .metadata(node)
@@ -260,21 +236,6 @@ fn is_index_active(cluster: &SimCluster, node: u64, table: &str, index: &str) ->
         .table_indexes(table)
         .iter()
         .any(|i| i.name == index && i.status == IndexStatus::Active)
-}
-
-/// Find the tablet leader of `table`'s (sole) tablet — mirrors
-/// `sim_cluster_index_ddl.rs::leader_of_table`.
-fn leader_of_table(cluster: &SimCluster, table: &str) -> u64 {
-    let meta = cluster.metadata(0);
-    let (tablet, _) = meta
-        .tablets_for_table(table)
-        .next()
-        .unwrap_or_else(|| panic!("{table} has no tablet"));
-    let tablet = *tablet;
-    drop(meta);
-    cluster
-        .leader_index_of(tablet)
-        .unwrap_or_else(|| panic!("{table} tablet has no leader"))
 }
 
 fn tablet_of_table(cluster: &SimCluster, node: u64, table: &str) -> TabletId {

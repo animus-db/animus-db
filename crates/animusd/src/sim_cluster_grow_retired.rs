@@ -42,6 +42,7 @@ use animus_env::nid;
 use animus_tablet::{TabletId, TabletState};
 
 use super::sim_cluster::SimCluster;
+use super::sim_support::{Tick, env_seed, spawn_driver_ticks};
 use crate::ClientResponse;
 
 const TABLE: &str = "growret";
@@ -49,13 +50,6 @@ const STEP: Duration = Duration::from_millis(50);
 /// The product's chase budget is `SCHEMA_COMMIT_TIMEOUT + SPLIT_WAIT_BOUND`
 /// (about 35 s); after the heal the walk must finish far inside it.
 const WALK_BOUND: Duration = Duration::from_secs(15);
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
 
 fn live_tablets(cluster: &SimCluster, node: u64) -> Vec<(TabletId, TabletState)> {
     cluster
@@ -104,29 +98,6 @@ pub(crate) fn move_leader(cluster: &mut SimCluster, tablet: TabletId, to: u64) {
         cluster.is_leader_local(to, tablet),
         "seed={seed}: could not move {tablet:?} leadership to node {to}"
     );
-}
-
-type Tick = std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>>;
-
-/// One `inplace_split_driver_tick` per `Splitting` tablet `node` leads
-/// (what `change_consumer_loop` does), without blocking the simulator.
-fn spawn_driver_ticks(cluster: &SimCluster, node: u64) -> Tick {
-    cluster.spawn_detached(node, move |ctx| async move {
-        let meta = ctx.effective_metadata();
-        for (tablet, group) in ctx.edge.hosted_groups() {
-            if !group.is_leader() {
-                continue;
-            }
-            let splitting = meta
-                .tablets
-                .get(&tablet)
-                .is_some_and(|t| t.state == TabletState::Splitting);
-            if splitting {
-                crate::index_drain::inplace_split_driver_tick(&ctx, &meta, tablet, &group).await?;
-            }
-        }
-        Ok(())
-    })
 }
 
 /// Advance `STEP` at a time, keeping one driver tick per node in flight,

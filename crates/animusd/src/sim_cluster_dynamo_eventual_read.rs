@@ -23,13 +23,7 @@
 use std::time::Duration;
 
 use super::sim_cluster::SimCluster;
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
+use super::sim_support::env_seed;
 
 /// Poll a DynamoDB request until `accept(status, body)` holds, or panic
 /// after a bounded number of converged-or-timeout attempts — the sim

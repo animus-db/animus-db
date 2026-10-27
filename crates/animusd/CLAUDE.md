@@ -6818,6 +6818,36 @@ rung's own smoke doesn't happen to call `propose_schema` at all, so it
 doesn't exercise that specific path, but nothing about the relay seam
 itself blocks a follow-on test that does.
 
+### Shared `sim_*` helpers: `sim_support.rs`
+
+`#[cfg(test)] pub(crate) mod sim_support;` (`src/sim_support.rs`) is the one
+home for a helper that several `sim_*` files used to carry byte-identical
+copies of: `env_seed` (the `ANIMUS_SEED` replay override), `json`,
+`poll_until` (100 ms virtual-time steps; **not** the private
+`SimCluster::poll_until`, a different method with a 50 ms step), the
+single-hash-key `create_table`/`create_table_via_wire` pair, the
+catalog-reading `first_tablet`/`tablet_of`/`tablet_of_table`/`leader_of_table`,
+the GSI helpers (`index_status`, `await_gsi_query`, `converge_gsi_active`),
+`spawn_driver_ticks` (with `Tick`), `panic_message`, `error_type` and
+`put_body`. The older "per-file-fixture convention" (copy a small fixture into
+each file rather than reach into a sibling) is **superseded for these**: import
+from `sim_support`, do not re-declare. The rules for adding to it:
+
+- Move a helper only when two or more copies are identical (diff the bodies; a
+  path-only difference such as `animus_tablet::TabletId` vs `TabletId` counts as
+  identical). A copy that differs in a key name, an assertion, a message or a
+  step stays local to its file, because those are part of a scenario's
+  seed-reproducible schedule and failure text.
+- Where two differing bodies share a name, `sim_support` keeps both under
+  distinct names (`create_table_pk_via_wire`, `leader_of_sole_tablet`,
+  `error_type_lenient`) and the caller imports the second `as` the old name, so
+  no call site changes.
+- A helper that is an inherent method on a file-local type (e.g. the corpus
+  recorders' `fresh_value`) is not a shared candidate.
+- The corpus cell expansion (`ANIMUS_SEED` replay, depth, cell filter) lives in
+  `animus_test::corpus::corpus_cells`; each corpus passes its own two env-var
+  names.
+
 ### `SimCluster`: the multi-node generalization (ADR 0061 rung D1)
 
 `sim_cluster.rs`'s `SimCluster` (declared `#[cfg(test)] mod sim_cluster;`
@@ -10898,7 +10928,8 @@ a rung against it.
   `DescribeTable` and rejects a `Query` against the now-gone name.
   `converge_gsi_active`, this module's own bounded-poll helper, is the
   shape every later module's own `converge_gsi_active`-family helper
-  duplicates locally (this crate's per-file-fixture convention).
+  duplicates locally (this crate's per-file-fixture convention, since
+  superseded for identical helpers by `sim_support`).
 - `sim_cluster_dynamo_update_table_index.rs` (PR 3): converts `tests/
   update_table_create_index.rs` (4), `tests/update_table_drop_index.rs`
   (4), and `tests/dynamo_gsi_drain.rs` (1) — 9 tests, 18 `#[test]` fns
@@ -11097,7 +11128,8 @@ carry no metrics sink) turned out stale on inspection.
   helpers (`big_value`/`put_body`) mirroring `dynamo_throttling.rs`'s/
   `sim_cluster_dynamo_throttle.rs`'s own identically-named copies rather
   than reaching into either sibling module's `pub(crate)` surface — this
-  crate's per-file-fixture convention.
+  crate's per-file-fixture convention (identical helpers now live in
+  `sim_support`; `big_value` and the differing variants stay local).
 
 **`tests/dynamo_throttling.rs` trimmed in PR 3** to its one remaining
 residual — removing the five converted tests and the helpers only they
@@ -11877,7 +11909,8 @@ no-transfer-needed branches across seeds); `sim_cluster_growth.rs`
 scenario (f) (2 tests, `f_grow_combined_hosts_replicas_and_can_lead` —
 `grow("combined")`, a rebalance-placed replica landing on the grown
 node, then the identical crash/transfer/serve/restart proof duplicated
-per this crate's own per-file-fixture-helper convention).
+per this crate's own per-file-fixture-helper convention, since superseded
+for identical helpers by `sim_support`).
 
 **Final residue table** — every real-socket control-voter-growth test
 and its disposition:

@@ -16,13 +16,7 @@ use std::time::Duration;
 use animus_sim::DiskConfig;
 
 use super::sim_cluster::SimCluster;
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
+use super::sim_support::env_seed;
 
 const PUT: &str = "DynamoDB_20120810.PutItem";
 const GET: &str = "DynamoDB_20120810.GetItem";

@@ -177,18 +177,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use super::sim_cluster::SimCluster;
+use super::sim_support::{create_table_via_wire, env_seed, json, leader_of_table, poll_until};
 use crate::config::NodeRole;
-
-pub(crate) fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
-
-pub(crate) fn json(body: &str) -> serde_json::Value {
-    serde_json::from_str(body).unwrap_or_else(|e| panic!("invalid JSON ({e}): {body}"))
-}
 
 /// No node/tablet/replica/raft/leader/quorum/placement/health/epoch-shaped
 /// key anywhere in `body` — the same forbidden-substring list every
@@ -213,45 +203,12 @@ pub(crate) fn assert_no_cluster_shape(body: &str) {
     }
 }
 
-/// One DynamoDB wire `CreateTable`, issued from `node` — mirrors every
-/// other `sim_cluster_*` module's identically-named helper, taking a
-/// caller-supplied body since this module's own fixtures need several
-/// distinct table shapes (unlike `sim_cluster_dynamo_streams.rs`'s fixed
-/// single-key shape).
-pub(crate) fn create_table_via_wire(
-    cluster: &mut SimCluster,
-    node: u64,
-    body: &str,
-) -> (u16, String) {
-    cluster.dynamo(node, "DynamoDB_20120810.CreateTable", body.as_bytes())
-}
-
 pub(crate) fn put_item_via_wire(cluster: &mut SimCluster, node: u64, body: &str) -> (u16, String) {
     cluster.dynamo(node, "DynamoDB_20120810.PutItem", body.as_bytes())
 }
 
 pub(crate) fn get_item_via_wire(cluster: &mut SimCluster, node: u64, body: &str) -> (u16, String) {
     cluster.dynamo(node, "DynamoDB_20120810.GetItem", body.as_bytes())
-}
-
-/// `table`'s own tablet id, resolved from the replicated catalog — every
-/// table in this module is created over the real wire, never via
-/// `SimCluster::create_table`'s own hand-hosted-only bookkeeping, mirroring
-/// `sim_cluster_dynamo_streams.rs`'s identical helper.
-pub(crate) fn tablet_of_table(cluster: &SimCluster, table: &str) -> animus_tablet::TabletId {
-    *cluster
-        .metadata(0)
-        .tablets_for_table(table)
-        .next()
-        .unwrap_or_else(|| panic!("table `{table}` has no tablet"))
-        .0
-}
-
-pub(crate) fn leader_of_table(cluster: &SimCluster, table: &str) -> u64 {
-    let tablet = tablet_of_table(cluster, table);
-    cluster
-        .leader_index_of(tablet)
-        .unwrap_or_else(|| panic!("tablet {} has no leader", tablet.0))
 }
 
 /// A node id that does **not** lead `table`'s own tablet.
@@ -1194,32 +1151,6 @@ fn console_error_mapping_and_json_routing_assertions_over_seeds() {
 // ---------------------------------------------------------------------------
 // PR 4c: role split — tests/console_endpoint.rs's two role-named tests
 // ---------------------------------------------------------------------------
-
-/// Converged-or-timeout poll on `cond(cluster)` — the shared shape every
-/// `sim_cluster_*` module's own scenario-local convergence checks use
-/// (duplicated, not reached into, per this crate's own convention —
-/// `sim_cluster_control_data_split.rs` carries the identical copy).
-fn poll_until(
-    cluster: &mut SimCluster,
-    budget: Duration,
-    seed: u64,
-    what: &str,
-    mut cond: impl FnMut(&mut SimCluster) -> bool,
-) {
-    const STEP: Duration = Duration::from_millis(100);
-    let mut elapsed = Duration::ZERO;
-    loop {
-        if cond(cluster) {
-            return;
-        }
-        assert!(
-            elapsed < budget,
-            "seed={seed}: {what} never converged within {budget:?}"
-        );
-        cluster.run_for(STEP);
-        elapsed += STEP;
-    }
-}
 
 // ---------------------------------------------------------------------------
 // (11) console_endpoint.rs::console_serves_shell_on_data_only_node

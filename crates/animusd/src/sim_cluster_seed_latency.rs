@@ -103,9 +103,8 @@
 use std::time::Duration;
 
 use super::sim_cluster::SimCluster;
-use super::sim_cluster_console::{
-    create_table_via_wire, env_seed, json, leader_of_table, non_leader_of_table,
-};
+use super::sim_cluster_console::non_leader_of_table;
+use super::sim_support::{create_table_via_wire, env_seed, json, leader_of_table};
 
 /// Step size for [`SimCluster::admin_timed`]'s incremental drive — fine
 /// enough to resolve a single write's own virtual cost precisely without

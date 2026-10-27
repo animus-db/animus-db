@@ -193,9 +193,8 @@ use animus_env::nid;
 use serde_json::Value;
 
 use super::sim_cluster::SimCluster;
-use super::sim_cluster_console::{
-    control_leader_and_follower, env_seed, json, non_leader_of_table,
-};
+use super::sim_cluster_console::{control_leader_and_follower, non_leader_of_table};
+use super::sim_support::{env_seed, json, poll_until};
 use crate::config::NodeRole;
 use crate::dashboard::{
     BACKUPS_JS, BROWSER_JS, CORE_JS, HTML, NODE_JS, OVERVIEW_JS, STORAGE_JS, TABLETS_JS, TXNS_JS,
@@ -1185,30 +1184,6 @@ fn u05_control_member_actions_over_seeds() {
 // PR 4c: role split — tests/dashboard_endpoint.rs's two role-named tests
 // ---------------------------------------------------------------------------
 
-/// Local `poll_until` for both scenarios below (this file's own convention
-/// has no shared one — every other convergence check here polls inline).
-fn poll_until_dashboard_role(
-    cluster: &mut SimCluster,
-    budget: Duration,
-    seed: u64,
-    what: &str,
-    mut cond: impl FnMut(&mut SimCluster) -> bool,
-) {
-    const STEP: Duration = Duration::from_millis(100);
-    let mut elapsed = Duration::ZERO;
-    loop {
-        if cond(cluster) {
-            return;
-        }
-        assert!(
-            elapsed < budget,
-            "seed={seed}: {what} never converged within {budget:?}"
-        );
-        cluster.run_for(STEP);
-        elapsed += STEP;
-    }
-}
-
 // ---------------------------------------------------------------------------
 // (13) dashboard_role_gating_split_deployment
 //      — the JSON/asset-marker half only; the original stays whole for its
@@ -1283,7 +1258,7 @@ fn run_dashboard_role_gating_split_deployment(seed: u64) {
     // ---- the data-only node's control-plane mirror actually syncs -----
     // Bounded poll — the mirror needs at least one sync/long-poll round
     // trip against the control deployment.
-    poll_until_dashboard_role(
+    poll_until(
         &mut cluster,
         Duration::from_secs(20),
         seed,
@@ -1393,7 +1368,7 @@ fn run_control_node_streams_read_path_is_ground_truth(seed: u64) {
     // `/admin/status` mirrors the full replicated catalog: both streams'
     // specs/rows, converged-or-timeout (the data-only node's writes need a
     // beat to reach the control-only node's own mirror).
-    poll_until_dashboard_role(
+    poll_until(
         &mut cluster,
         Duration::from_secs(20),
         seed,

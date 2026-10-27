@@ -12,13 +12,7 @@
 //! Seed replay: `ANIMUS_SEED=<seed> cargo test -p animusd --lib <test name>`.
 
 use super::sim_cluster::SimCluster;
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
+use super::sim_support::env_seed;
 
 /// Seed a 3-node RF3 cluster with one base table (`events`) and six items
 /// in partition `pk = "p1"`, mirroring the `ProdEnv` fixture minus the

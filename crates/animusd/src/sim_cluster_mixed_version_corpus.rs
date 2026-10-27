@@ -174,6 +174,7 @@ use super::sim_cluster_upgrade_corpus::{
     CELL_WATCHDOG, DRAIN, NODES, SETTLE, Shared, TBL, combine, converge, create_table_body,
     final_state, live_replicas, ok_appends, run_until_clients_done, spawn_clients, tablet_of,
 };
+use super::sim_support::panic_message;
 use super::*;
 use crate::config::NodeRole;
 
@@ -386,32 +387,10 @@ fn cells() -> Vec<Cell> {
     ]
 }
 
-fn seeds_per_cell() -> usize {
-    corpus::seeds_from_env("ANIMUS_UPGRADE_SEEDS")
-}
-
 /// The cells after the depth knob, `ANIMUS_SEED` replay and the optional
 /// `ANIMUS_UPGRADE_CELL` name filter.
 fn corpus_cells() -> Vec<Cell> {
-    let filter = std::env::var("ANIMUS_UPGRADE_CELL").ok();
-    let expanded = if let Some(seed) = std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        cells()
-            .into_iter()
-            .map(|c| {
-                let name = c.name.clone();
-                c.reseeded(name, seed)
-            })
-            .collect()
-    } else {
-        corpus::seed_expand(cells(), seeds_per_cell())
-    };
-    expanded
-        .into_iter()
-        .filter(|c| filter.as_ref().is_none_or(|f| c.name.contains(f.as_str())))
-        .collect()
+    corpus::corpus_cells(cells(), "ANIMUS_UPGRADE_SEEDS", "ANIMUS_UPGRADE_CELL")
 }
 
 // ---------------------------------------------------------------------------
@@ -426,14 +405,6 @@ struct Verdict {
     acks: (usize, usize, usize),
     /// N1 only: the capped decode rejected the premature variant.
     cap_fired: bool,
-}
-
-fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
-    payload
-        .downcast_ref::<&str>()
-        .map(|m| (*m).to_string())
-        .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "<non-string panic payload>".to_string())
 }
 
 fn run_cell(c: &Cell) -> Verdict {

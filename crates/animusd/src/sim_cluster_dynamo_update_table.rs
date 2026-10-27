@@ -42,13 +42,7 @@ use std::time::Duration;
 use animus_env::NodeId;
 
 use super::sim_cluster::SimCluster;
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
+use super::sim_support::{env_seed, error_type, put_body};
 
 /// The substring `dynamo::THROTTLE_WRITE_REFUSAL`/`THROTTLE_READ_REFUSAL`
 /// share — mirrors `sim_cluster_throttle.rs`'s own `REFUSAL_MARKER`.
@@ -64,19 +58,6 @@ const REFUSAL_MARKER: &str = "provisioned throughput exceeded";
 /// to be cleared by a wide margin for a drain loop to net-throttle at all).
 fn big_value() -> String {
     "x".repeat(100 * 1024)
-}
-
-fn put_body(table: &str, id: &str, value: &str) -> String {
-    format!(r#"{{"TableName":"{table}","Item":{{"id":{{"S":"{id}"}},"v":{{"S":"{value}"}}}}}}"#)
-}
-
-fn error_type(body: &str) -> String {
-    let json: serde_json::Value =
-        serde_json::from_str(body).unwrap_or_else(|e| panic!("body is not JSON ({e}): {body}"));
-    json["__type"]
-        .as_str()
-        .unwrap_or_else(|| panic!("no __type in: {body}"))
-        .to_string()
 }
 
 /// `table`'s own tablet's current, sorted replica set on `node`'s own view

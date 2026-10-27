@@ -24,7 +24,7 @@ use std::time::Duration;
 use animus_env::{EnvExt, nid};
 
 use super::sim_cluster::SimCluster;
-use super::sim_cluster_console::env_seed;
+use super::sim_support::env_seed;
 use super::{MetaCommand, NodeAddrs, RegisterOutcome};
 
 type Slot = Arc<Mutex<Option<Result<RegisterOutcome, String>>>>;

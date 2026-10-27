@@ -264,9 +264,9 @@ use animus_tablet::TabletId;
 use serde_json::Value;
 
 use super::sim_cluster::SimCluster;
-use super::sim_cluster_console::{
-    control_leader_and_follower, create_table_via_wire, env_seed, json, leader_of_table,
-    non_leader_of_table, tablet_of_table,
+use super::sim_cluster_console::{control_leader_and_follower, non_leader_of_table};
+use super::sim_support::{
+    create_table_via_wire, env_seed, json, leader_of_table, put_body, tablet_of_table,
 };
 
 fn accepted(r: ProposeResult) -> bool {
@@ -1114,10 +1114,6 @@ fn admin_ttl_reports_reaper_progress_and_ttl_tables_over_seeds() {
 /// helper).
 fn big_value() -> String {
     "x".repeat(256 * 1024)
-}
-
-fn put_body(table: &str, id: &str, value: &str) -> String {
-    format!(r#"{{"TableName":"{table}","Item":{{"id":{{"S":"{id}"}},"v":{{"S":"{value}"}}}}}}"#)
 }
 
 fn run_admin_metrics_reports_nonzero_throttled_counters(seed: u64) {

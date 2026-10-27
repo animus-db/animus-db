@@ -30,19 +30,13 @@ use animus_env::Clock;
 
 use super::dynamo::SCHEMA_COMMIT_TIMEOUT;
 use super::sim_cluster::SimCluster;
+use super::sim_support::env_seed;
 
 /// Per-`append`/`sync` delay: one persist round (an append then a sync) is
 /// shorter than [`SCHEMA_COMMIT_TIMEOUT`], two back to back are longer.
 const SYNC_DELAY: Duration = Duration::from_secs(2);
 
 const TABLE: &str = "orders";
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
 
 fn create_table(cluster: &mut SimCluster) {
     let body = format!(

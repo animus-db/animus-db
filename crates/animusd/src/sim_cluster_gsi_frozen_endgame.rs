@@ -49,6 +49,7 @@ use animus_tablet::{TabletId, TabletState};
 
 use super::sim_cluster::SimCluster;
 use super::sim_cluster_grow_retired::{leader_node, move_leader};
+use super::sim_support::{Tick, env_seed, spawn_driver_ticks};
 
 const TABLE: &str = "users";
 const INDEX: &str = "by-email";
@@ -60,36 +61,6 @@ const EMAILS: usize = 4;
 const CONVERGE_BOUND: Duration = Duration::from_secs(8);
 /// The base tablet's tick must not wait out a frozen index tablet.
 const FIRST_TICK_BOUND: Duration = Duration::from_secs(5);
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
-
-type Tick = std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>>;
-
-/// One `inplace_split_driver_tick` per `Splitting` tablet `node` leads, in
-/// hosted-group order: what `change_consumer_loop` does in one pass.
-fn spawn_driver_ticks(cluster: &SimCluster, node: u64) -> Tick {
-    cluster.spawn_detached(node, move |ctx| async move {
-        let meta = ctx.effective_metadata();
-        for (tablet, group) in ctx.edge.hosted_groups() {
-            if !group.is_leader() {
-                continue;
-            }
-            let splitting = meta
-                .tablets
-                .get(&tablet)
-                .is_some_and(|t| t.state == TabletState::Splitting);
-            if splitting {
-                crate::index_drain::inplace_split_driver_tick(&ctx, &meta, tablet, &group).await?;
-            }
-        }
-        Ok(())
-    })
-}
 
 fn tablets_of(cluster: &SimCluster, table: &str) -> Vec<(TabletId, TabletState)> {
     cluster

@@ -52,65 +52,13 @@ use std::time::Duration;
 
 use animus_control::{Metadata, NodeStatus};
 use animus_env::{NodeId, nid};
-use animus_tablet::{TabletId, TabletState};
+use animus_tablet::TabletState;
 
 use super::sim_cluster::SimCluster;
-use super::sim_cluster_console::{create_table_via_wire, env_seed, json};
+use super::sim_support::{
+    create_table_pk_via_wire as create_table, env_seed, json, poll_until, tablet_of,
+};
 use crate::config::NodeRole;
-
-/// A single hash-key (`pk`, string) `CreateTable`, issued from `node` —
-/// mirrors `sim_cluster_control_data_split.rs`'s identically-named helper
-/// (duplicated per this crate's own "small fixtures duplicated per test
-/// module" convention).
-fn create_table(cluster: &mut SimCluster, node: u64, table: &str) -> (u16, String) {
-    let body = format!(
-        r#"{{"TableName":"{table}",
-            "KeySchema":[{{"AttributeName":"pk","KeyType":"HASH"}}],
-            "AttributeDefinitions":[{{"AttributeName":"pk","AttributeType":"S"}}]}}"#
-    );
-    create_table_via_wire(cluster, node, &body)
-}
-
-/// Converged-or-timeout poll on `cond(cluster)` — the shared shape every
-/// `sim_cluster_*` module's own scenario-local convergence checks use
-/// (duplicated, not reached into, per this crate's own convention —
-/// `sim_cluster_control_data_split.rs` carries the identical copy).
-fn poll_until(
-    cluster: &mut SimCluster,
-    budget: Duration,
-    seed: u64,
-    what: &str,
-    mut cond: impl FnMut(&mut SimCluster) -> bool,
-) {
-    const STEP: Duration = Duration::from_millis(100);
-    let mut elapsed = Duration::ZERO;
-    loop {
-        if cond(cluster) {
-            return;
-        }
-        assert!(
-            elapsed < budget,
-            "seed={seed}: {what} never converged within {budget:?}"
-        );
-        cluster.run_for(STEP);
-        elapsed += STEP;
-    }
-}
-
-/// The (sole, pre-split) tablet id hosting `table`, from `node`'s own view —
-/// mirrors `sim_cluster_auto_split.rs`'s identically-named helper (this
-/// crate's own "small fixtures duplicated per test module" convention). A
-/// wire-provisioned table (every table this module creates) never has an
-/// entry in `SimCluster::create_table_with_replication`'s own hand-hosted
-/// bookkeeping, so this reads live `Metadata` instead.
-fn tablet_of(cluster: &SimCluster, node: u64, table: &str) -> TabletId {
-    let meta = cluster.metadata(node);
-    *meta
-        .tablets_for_table(table)
-        .next()
-        .unwrap_or_else(|| panic!("table {table} has no tablet on node {node}'s own view"))
-        .0
-}
 
 /// Poll `run_for(STEP)` interleaved with [`SimCluster::drive_inplace_split_
 /// cutover`] on every id in `nodes` (this fixture never spawns that driver

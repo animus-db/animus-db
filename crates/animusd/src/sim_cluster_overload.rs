@@ -21,14 +21,8 @@
 use std::time::Duration;
 
 use super::sim_cluster::{SimCluster, SimOverload};
+use super::sim_support::{env_seed, error_type_lenient as error_type};
 use animus_cp_data::admission::BacklogLimits;
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
 
 fn create_table(cluster: &mut SimCluster, node: u64, table: &str) {
     let body = format!(
@@ -42,13 +36,6 @@ fn create_table(cluster: &mut SimCluster, node: u64, table: &str) {
 
 fn put_body(table: &str, id: &str) -> String {
     format!(r#"{{"TableName":"{table}","Item":{{"id":{{"S":"{id}"}},"v":{{"S":"x"}}}}}}"#)
-}
-
-fn error_type(body: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|j| j["__type"].as_str().map(str::to_owned))
-        .unwrap_or_default()
 }
 
 const STEP: Duration = Duration::from_millis(50);

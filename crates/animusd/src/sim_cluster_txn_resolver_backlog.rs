@@ -41,6 +41,7 @@ use animus_tablet::TabletId;
 use super::dynamo::item_key;
 use super::sim_cluster::SimCluster;
 use super::sim_cluster_grow_retired::move_leader;
+use super::sim_support::env_seed;
 use crate::{
     TXN_RESOLVER_INTERVAL, TxnResolverState, txn_resolver_decided_pass, txn_resolver_pending_pass,
 };
@@ -55,13 +56,6 @@ const STEP: Duration = Duration::from_millis(250);
 /// backlog sweep (`BACKLOG` x two round trips of 2 x `LINK_DELAY` and more).
 const PENDING_BOUND: Duration = Duration::from_secs(8);
 const LINK_DELAY: Duration = Duration::from_millis(25);
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Layout {

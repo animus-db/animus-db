@@ -49,25 +49,7 @@
 //! animusd --lib create_enable_write_seal`.
 
 use super::sim_cluster::SimCluster;
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
-
-/// One DynamoDB wire `CreateTable` for a plain single-key (`pk`, string)
-/// table named `table`, issued from `node` — mirrors every other
-/// `sim_cluster_*` module's identically-named helper.
-fn create_table(cluster: &mut SimCluster, node: u64, table: &str) -> (u16, String) {
-    let body = format!(
-        r#"{{"TableName":"{table}",
-            "KeySchema":[{{"AttributeName":"pk","KeyType":"HASH"}}],
-            "AttributeDefinitions":[{{"AttributeName":"pk","AttributeType":"S"}}]}}"#
-    );
-    cluster.dynamo(node, "DynamoDB_20120810.CreateTable", body.as_bytes())
-}
+use super::sim_support::{create_table, env_seed, tablet_of_table};
 
 fn put_item(cluster: &mut SimCluster, node: u64, table: &str, pk: &str, v: &str) -> (u16, String) {
     let body =
@@ -86,21 +68,6 @@ fn get_item(
         r#"{{"ConsistentRead":{consistent},"TableName":"{table}","Key":{{"pk":{{"S":"{pk}"}}}}}}"#
     );
     cluster.dynamo(node, "DynamoDB_20120810.GetItem", body.as_bytes())
-}
-
-/// `table`'s own tablet id, resolved from the replicated catalog
-/// (`Metadata::tablets_for_table`) — this table is always created over the
-/// real wire, never via `SimCluster::create_table`, so `SimCluster::
-/// tablet_of`'s own hand-hosted-only bookkeeping never covers it (the same
-/// lookup every other `sim_cluster_dynamo_*` sibling uses for a
-/// wire-created table).
-fn tablet_of_table(cluster: &SimCluster, table: &str) -> animus_tablet::TabletId {
-    *cluster
-        .metadata(0)
-        .tablets_for_table(table)
-        .next()
-        .unwrap_or_else(|| panic!("table `{table}` has no tablet"))
-        .0
 }
 
 /// The node id currently leading `table`'s own tablet.
