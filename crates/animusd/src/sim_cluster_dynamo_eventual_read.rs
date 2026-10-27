@@ -20,10 +20,10 @@
 //!
 //! Seed replay: `ANIMUS_SEED=<seed> cargo test -p animusd --lib <test name>`.
 
-use super::sim_support::env_seed;
 use std::time::Duration;
 
 use super::sim_cluster::SimCluster;
+use super::sim_support::env_seed;
 
 /// Poll a DynamoDB request until `accept(status, body)` holds, or panic
 /// after a bounded number of converged-or-timeout attempts — the sim

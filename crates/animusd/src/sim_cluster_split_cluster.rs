@@ -48,8 +48,6 @@
 //! convention exactly. Seed replay (repo convention): `ANIMUS_SEED=<seed>
 //! cargo test -p animusd --lib <test name>`.
 
-use super::sim_support::poll_until;
-use super::sim_support::{create_table_pk_via_wire as create_table, tablet_of};
 use std::time::Duration;
 
 use animus_control::{Metadata, NodeStatus};
@@ -57,7 +55,9 @@ use animus_env::{NodeId, nid};
 use animus_tablet::TabletState;
 
 use super::sim_cluster::SimCluster;
-use super::sim_support::{env_seed, json};
+use super::sim_support::{
+    create_table_pk_via_wire as create_table, env_seed, json, poll_until, tablet_of,
+};
 use crate::config::NodeRole;
 
 /// Poll `run_for(STEP)` interleaved with [`SimCluster::drive_inplace_split_

@@ -21,10 +21,8 @@
 //! Seed replay (repo convention): `ANIMUS_SEED=<seed> cargo test -p animusd
 //! --lib <test name>`.
 
-use super::sim_support::env_seed;
-use super::sim_support::{await_gsi_query, first_tablet};
-
 use super::sim_cluster::SimCluster;
+use super::sim_support::{await_gsi_query, env_seed, first_tablet};
 
 /// [`n_order`], numerically sorted — the order-**independent** form for a
 /// membership assertion, mirroring `dynamo_query_range.rs`'s identical

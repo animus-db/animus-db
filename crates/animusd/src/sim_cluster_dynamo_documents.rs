@@ -15,8 +15,7 @@
 //! --lib <test name>`.
 
 use super::sim_cluster::SimCluster;
-use super::sim_support::env_seed;
-use super::sim_support::first_tablet;
+use super::sim_support::{env_seed, first_tablet};
 
 /// Document/set attribute types, projection expressions (including a
 /// list-index projection), and `ReturnValues: ALL_OLD` on both `PutItem` and

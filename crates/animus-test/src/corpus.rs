@@ -107,6 +107,46 @@ pub fn seed_expand<T: SeedVariant>(cells: Vec<T>, k: usize) -> Vec<T> {
     out
 }
 
+/// The pure core of [`corpus_cells`]: with `replay = Some(seed)` every cell is
+/// reseeded to `seed` under its own name (an `ANIMUS_SEED` replay, no depth
+/// expansion); otherwise the cells are expanded `k` deep with [`seed_expand`].
+/// Either way, `filter` keeps only cells whose name contains it.
+pub fn expand_cells<T: SeedVariant>(
+    cells: Vec<T>,
+    replay: Option<u64>,
+    k: usize,
+    filter: Option<&str>,
+) -> Vec<T> {
+    let expanded = if let Some(seed) = replay {
+        cells
+            .into_iter()
+            .map(|c| {
+                let name = c.scenario_name().to_owned();
+                c.reseeded(name, seed)
+            })
+            .collect()
+    } else {
+        seed_expand(cells, k)
+    };
+    expanded
+        .into_iter()
+        .filter(|c| filter.is_none_or(|f| c.scenario_name().contains(f)))
+        .collect()
+}
+
+/// The cells a corpus runs, after the depth knob, `ANIMUS_SEED` replay and an
+/// optional cell-name filter: `seeds_var` is the corpus's own depth knob (see
+/// [`seeds_from_env`]) and `cell_var` its name-substring filter. An
+/// `ANIMUS_SEED` that parses as a `u64` replays every cell at that seed;
+/// see [`expand_cells`].
+pub fn corpus_cells<T: SeedVariant>(cells: Vec<T>, seeds_var: &str, cell_var: &str) -> Vec<T> {
+    let filter = env::var(cell_var).ok();
+    let replay = env::var("ANIMUS_SEED")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    expand_cells(cells, replay, seeds_from_env(seeds_var), filter.as_deref())
+}
+
 /// Run `body` once per seed variant of a scenario named `name`, `k` times
 /// total — the closure-based sibling of [`seed_expand`], for corpora that
 /// drive a scenario directly rather than building a `Vec<Scenario>` up
@@ -195,6 +235,47 @@ mod tests {
         assert_eq!(expanded[1].seed, name_seed("cell_s01"));
         assert_eq!(expanded[2].name, "cell_s02");
         assert_eq!(expanded[2].seed, name_seed("cell_s02"));
+    }
+
+    #[test]
+    fn expand_cells_replays_filters_and_expands() {
+        let cells = vec![
+            C {
+                name: "alpha".into(),
+                seed: 1,
+            },
+            C {
+                name: "beta".into(),
+                seed: 2,
+            },
+        ];
+        // Replay: every cell keeps its own name, takes the replay seed, and
+        // the depth knob is ignored.
+        let replayed = expand_cells(cells.clone(), Some(7), 3, None);
+        assert_eq!(
+            replayed,
+            vec![
+                C {
+                    name: "alpha".into(),
+                    seed: 7
+                },
+                C {
+                    name: "beta".into(),
+                    seed: 7
+                },
+            ]
+        );
+        // No replay: plain seed_expand, then the name filter.
+        assert_eq!(expand_cells(cells.clone(), None, 1, None), cells);
+        assert_eq!(
+            expand_cells(cells.clone(), None, 1, Some("bet")),
+            cells[1..]
+        );
+        let deep = expand_cells(cells.clone(), None, 2, Some("alpha"));
+        assert_eq!(deep.len(), 2);
+        assert_eq!(deep[1].name, "alpha_s01");
+        // The filter applies to a replay too.
+        assert_eq!(expand_cells(cells, Some(9), 1, Some("alp")).len(), 1);
     }
 
     #[test]

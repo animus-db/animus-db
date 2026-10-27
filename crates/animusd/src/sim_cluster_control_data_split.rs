@@ -37,12 +37,10 @@
 //! only.rs`'s own convention exactly. Seed replay (repo convention):
 //! `ANIMUS_SEED=<seed> cargo test -p animusd --lib <test name>`.
 
-use super::sim_support::create_table_pk_via_wire as create_table;
-use super::sim_support::poll_until;
 use std::time::Duration;
 
 use super::sim_cluster::SimCluster;
-use super::sim_support::{env_seed, json};
+use super::sim_support::{create_table_pk_via_wire as create_table, env_seed, json, poll_until};
 use crate::config::NodeRole;
 
 /// One `GET` against `path`, parsed as JSON — the JSON-dispatch analog of

@@ -19,12 +19,12 @@
 //! Seed replay (repo convention): `ANIMUS_SEED=<seed> cargo test -p animusd
 //! --lib <test name>`.
 
-use super::sim_support::env_seed;
 use std::time::Duration;
 
 use animus_item::{AttributeValue, Item, item_size};
 
 use super::sim_cluster::SimCluster;
+use super::sim_support::env_seed;
 
 /// Every fixture item's `pad` attribute is this many bytes of filler — large
 /// enough that a handful of items already trips `MAX_QUERY_SCAN_PAGE_BYTES`,

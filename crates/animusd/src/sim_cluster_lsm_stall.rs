@@ -13,7 +13,6 @@
 //!
 //! Knobs: `ANIMUS_LSM_STALL_SEEDS=K` (default 1), `ANIMUS_SEED` replays.
 
-use super::sim_support::error_type_lenient as error_type;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,6 +20,7 @@ use std::time::Duration;
 
 use super::sim_cluster::{SimCluster, SimOverload};
 use super::sim_cluster_lsm::SimStall;
+use super::sim_support::error_type_lenient as error_type;
 use animus_cp_data::admission::BacklogLimits;
 use animus_storage::{LsmOptions, StallFault};
 

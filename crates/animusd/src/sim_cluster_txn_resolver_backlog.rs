@@ -30,7 +30,6 @@
 //!
 //! Replay one seed with `ANIMUS_SEED=<seed>`.
 
-use super::sim_support::env_seed;
 use std::time::Duration;
 
 use animus_cp_data::hlc::HlcTimestamp;
@@ -42,6 +41,7 @@ use animus_tablet::TabletId;
 use super::dynamo::item_key;
 use super::sim_cluster::SimCluster;
 use super::sim_cluster_grow_retired::move_leader;
+use super::sim_support::env_seed;
 use crate::{
     TXN_RESOLVER_INTERVAL, TxnResolverState, txn_resolver_decided_pass, txn_resolver_pending_pass,
 };

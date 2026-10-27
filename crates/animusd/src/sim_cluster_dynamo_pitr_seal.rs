@@ -49,8 +49,7 @@
 //! animusd --lib create_enable_write_seal`.
 
 use super::sim_cluster::SimCluster;
-use super::sim_support::env_seed;
-use super::sim_support::{create_table, tablet_of_table};
+use super::sim_support::{create_table, env_seed, tablet_of_table};
 
 fn put_item(cluster: &mut SimCluster, node: u64, table: &str, pk: &str, v: &str) -> (u16, String) {
     let body =

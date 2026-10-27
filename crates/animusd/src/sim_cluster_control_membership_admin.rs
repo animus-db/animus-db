@@ -83,7 +83,6 @@
 //! crashing anyone, so those genuine-staleness scenarios stay decoupled
 //! from the new post-election grace issue #923's fix introduced.
 
-use super::sim_support::poll_until;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -92,7 +91,7 @@ use animus_env::{EnvExt, NodeId, nid};
 use animus_sim::NetConfig;
 
 use super::sim_cluster::SimCluster;
-use super::sim_support::{env_seed, json};
+use super::sim_support::{env_seed, json, poll_until};
 use crate::config::NodeRole;
 
 /// A fake, never-dialed placeholder control-Raft address — the identical

@@ -20,10 +20,10 @@
 //! Seed replay (repo convention): `ANIMUS_SEED=<seed> cargo test -p animusd
 //! --lib <test name>`.
 
-use super::sim_support::env_seed;
 use serde_json::Value;
 
 use super::sim_cluster::SimCluster;
+use super::sim_support::env_seed;
 
 /// The oversized attribute that pushes the base item past one write unit —
 /// mirrors `dynamo_consumed_capacity.rs::BLOB`.

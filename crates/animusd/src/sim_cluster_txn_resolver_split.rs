@@ -42,8 +42,6 @@
 //!
 //! Replay one seed with `ANIMUS_SEED=<seed>`.
 
-use super::sim_support::env_seed;
-use super::sim_support::{Tick, spawn_driver_ticks};
 use std::time::Duration;
 
 use animus_cp_data::KIND_BASE;
@@ -54,6 +52,7 @@ use animus_tablet::{KeyRange, TabletId, TabletState};
 use super::dynamo::item_key;
 use super::sim_cluster::SimCluster;
 use super::sim_cluster_grow_retired::leader_node;
+use super::sim_support::{Tick, env_seed, spawn_driver_ticks};
 use crate::{
     CpGroup, TXN_RESOLVER_INTERVAL, TxnResolverState, txn_resolver_decided_pass,
     txn_resolver_pending_pass,

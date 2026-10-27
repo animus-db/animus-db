@@ -18,10 +18,10 @@
 //! Seed replay (repo convention): `ANIMUS_SEED=<seed> cargo test -p animusd
 //! --lib <test name>`.
 
-use super::sim_support::env_seed;
 use serde_json::Value;
 
 use super::sim_cluster::SimCluster;
+use super::sim_support::env_seed;
 
 /// A 3-node cluster with two tables: `withlsi` (composite `pk`/`sk`, an LSI
 /// on `score`) and `nolsi` (same key schema, a GSI but no LSI). Mirrors

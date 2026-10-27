@@ -206,9 +206,6 @@
 //! every op/dial call here, as everywhere else in this fixture — no
 //! wall-clock wait anywhere in this module.
 
-use super::sim_support::create_table_pk_via_wire as create_table;
-use super::sim_support::poll_until;
-use super::sim_support::{env_seed, tablet_of_table};
 use std::collections::BTreeSet;
 use std::time::Duration;
 
@@ -217,6 +214,9 @@ use animus_env::{NodeId, nid};
 use animus_tablet::TabletId;
 
 use super::sim_cluster::SimCluster;
+use super::sim_support::{
+    create_table_pk_via_wire as create_table, env_seed, poll_until, tablet_of_table,
+};
 use crate::config::NodeRole;
 
 const PRIMARY_SEED_A: u64 = 0xC13E_0001;

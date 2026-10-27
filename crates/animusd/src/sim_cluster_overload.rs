@@ -18,11 +18,10 @@
 //!
 //! Metric lines are printed `C17`-style (`OVERLOAD metric=value ...`).
 
-use super::sim_support::env_seed;
-use super::sim_support::error_type_lenient as error_type;
 use std::time::Duration;
 
 use super::sim_cluster::{SimCluster, SimOverload};
+use super::sim_support::{env_seed, error_type_lenient as error_type};
 use animus_cp_data::admission::BacklogLimits;
 
 fn create_table(cluster: &mut SimCluster, node: u64, table: &str) {

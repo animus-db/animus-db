@@ -67,8 +67,6 @@
 //! leftover PARENT engine is reclaimed via the issue #722 fix (`host::
 //! Reconciler`'s `EngineFactory::local_tablets` second fact source).
 
-use super::sim_support::env_seed;
-use super::sim_support::{create_table, tablet_of};
 use std::time::Duration;
 
 use animus_storage::StorageEngine;
@@ -76,6 +74,7 @@ use animus_tablet::{TabletId, TabletState};
 
 use super::AutoSplitThresholds;
 use super::sim_cluster::SimCluster;
+use super::sim_support::{create_table, env_seed, tablet_of};
 
 /// `PutItem` with a `pad` string attribute of `pad_len` bytes — the byte
 /// trigger's own knob: a caller controls exactly how many total bytes a

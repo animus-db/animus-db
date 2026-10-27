@@ -157,12 +157,12 @@
 //!     confirms the newly created table is genuinely servable, not merely
 //!     catalog-visible.
 
-use super::sim_support::create_table_pk_via_wire as create_table;
-use super::sim_support::{poll_until, tablet_of_table};
 use std::time::Duration;
 
 use super::sim_cluster::SimCluster;
-use super::sim_support::env_seed;
+use super::sim_support::{
+    create_table_pk_via_wire as create_table, env_seed, poll_until, tablet_of_table,
+};
 use crate::config::NodeRole;
 
 /// A 6-node cluster: 3 control-only (`NodeRole::Control`, indices 0-2) + 3

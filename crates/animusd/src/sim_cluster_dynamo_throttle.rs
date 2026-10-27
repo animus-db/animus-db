@@ -44,8 +44,7 @@
 //! --lib <test name>`.
 
 use super::sim_cluster::SimCluster;
-use super::sim_support::env_seed;
-use super::sim_support::{error_type, put_body};
+use super::sim_support::{env_seed, error_type, put_body};
 
 /// `CreateTable` for a plain single-key (`id`, string) table — mirrors
 /// `dynamo_throttling.rs::create_table`'s own key shape verbatim (this

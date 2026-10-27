@@ -23,7 +23,6 @@
 //! Replay one seed: `ANIMUS_SEED=<seed> cargo test -p animusd --lib
 //! sim_cluster_schema_commit_wait`.
 
-use super::sim_support::env_seed;
 use std::time::Duration;
 
 use animus_control::MetaCommand;
@@ -31,6 +30,7 @@ use animus_env::Clock;
 
 use super::dynamo::SCHEMA_COMMIT_TIMEOUT;
 use super::sim_cluster::SimCluster;
+use super::sim_support::env_seed;
 
 /// Per-`append`/`sync` delay: one persist round (an append then a sync) is
 /// shorter than [`SCHEMA_COMMIT_TIMEOUT`], two back to back are longer.

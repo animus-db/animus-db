@@ -199,8 +199,6 @@
 //! support — a combined-node `SimCluster` has the identical gap, so C-12
 //! PR 4d's own role work does not change this test's disposition at all.
 
-use super::sim_support::{env_seed, json};
-use super::sim_support::{leader_of_table, tablet_of_table};
 use std::time::Duration;
 
 use animus_control::Metadata;
@@ -208,6 +206,7 @@ use animus_env::nid;
 use animus_tablet::TabletId;
 
 use super::sim_cluster::SimCluster;
+use super::sim_support::{env_seed, json, leader_of_table, tablet_of_table};
 use crate::config::NodeRole;
 
 /// A single-hash-key (`pk`, string), streamed `CreateTable` — mirrors every

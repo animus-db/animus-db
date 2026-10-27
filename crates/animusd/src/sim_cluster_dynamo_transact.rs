@@ -119,8 +119,6 @@
 //! findings above now fixed and confirmed green — reproduces identically at
 //! every `_over_seeds` seed tried too).
 
-use super::sim_support::create_table;
-use super::sim_support::env_seed;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -128,6 +126,7 @@ use animus_env::EnvExt;
 use animus_tablet::TOKEN_BYTES;
 
 use super::sim_cluster::SimCluster;
+use super::sim_support::{create_table, env_seed};
 
 /// Virtual time the issue #1204 scenario runs before it prepares: the age the
 /// "previous incarnation" had when it was power-cut.

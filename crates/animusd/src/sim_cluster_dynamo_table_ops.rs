@@ -61,13 +61,12 @@
 //! Seed replay (repo convention): `ANIMUS_SEED=<seed> cargo test -p animusd
 //! --lib <test name>`.
 
-use super::sim_support::create_table;
-use super::sim_support::env_seed;
 use std::time::Duration;
 
 use animus_env::{NodeId, nid};
 
 use super::sim_cluster::SimCluster;
+use super::sim_support::{create_table, env_seed};
 
 /// `TableNames` out of a `ListTables` response body, via `serde_json` —
 /// mirrors `tests/dynamo_table_ops.rs::table_names`.

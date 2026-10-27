@@ -173,13 +173,11 @@
 //! Replays (repo convention): `ANIMUS_SEED=<seed> cargo test -p animusd
 //! --lib <scenario name>`.
 
-use super::sim_support::poll_until;
-use super::sim_support::{create_table_via_wire, leader_of_table};
-use super::sim_support::{env_seed, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use super::sim_cluster::SimCluster;
+use super::sim_support::{create_table_via_wire, env_seed, json, leader_of_table, poll_until};
 use crate::config::NodeRole;
 
 /// No node/tablet/replica/raft/leader/quorum/placement/health/epoch-shaped

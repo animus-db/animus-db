@@ -105,8 +105,6 @@
 //! and any admin-HTTP-surface assertion — none of those are reachable from
 //! a `SimCluster`-based fixture at all, growth or not.
 
-use super::sim_support::env_seed;
-use super::sim_support::{create_table, tablet_of};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
@@ -115,6 +113,7 @@ use animus_env::{NodeId, nid};
 
 use super::sim_cluster::SimCluster;
 use super::sim_cluster_dynamo_table_ops::assert_no_zombie_groups;
+use super::sim_support::{create_table, env_seed, tablet_of};
 use crate::config::NodeRole;
 
 fn accepted(r: &ProposeResult) -> bool {

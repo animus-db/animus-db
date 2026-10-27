@@ -128,15 +128,16 @@
 //!     once the fresh, post-restart loop is the only one that could have
 //!     ever seen it).
 
-use super::sim_support::create_table_pk_via_wire as create_table;
-use super::sim_support::{create_table_via_wire, poll_until, tablet_of_table};
 use std::time::Duration;
 
 use animus_env::nid;
 
 use super::sim_cluster::SimCluster;
 use super::sim_cluster_console::{get_item_via_wire, put_item_via_wire};
-use super::sim_support::env_seed;
+use super::sim_support::{
+    create_table_pk_via_wire as create_table, create_table_via_wire, env_seed, poll_until,
+    tablet_of_table,
+};
 use crate::config::NodeRole;
 
 /// A 5-node cluster: 2 combined (`NodeRole::Both`, indices 0-1) + 3

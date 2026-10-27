@@ -256,7 +256,6 @@
 //! Replays (repo convention): `ANIMUS_SEED=<seed> cargo test -p animusd
 //! --lib <scenario name>`.
 
-use super::sim_support::{create_table_via_wire, leader_of_table, put_body, tablet_of_table};
 use std::time::Duration;
 
 use animus_control::{MetaCommand, ProposeResult};
@@ -266,7 +265,9 @@ use serde_json::Value;
 
 use super::sim_cluster::SimCluster;
 use super::sim_cluster_console::{control_leader_and_follower, non_leader_of_table};
-use super::sim_support::{env_seed, json};
+use super::sim_support::{
+    create_table_via_wire, env_seed, json, leader_of_table, put_body, tablet_of_table,
+};
 
 fn accepted(r: ProposeResult) -> bool {
     matches!(r, ProposeResult::Accepted { .. })

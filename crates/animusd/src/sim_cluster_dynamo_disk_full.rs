@@ -11,12 +11,12 @@
 //! (`ANIMUS_SEED=<seed>`) and asserts strictly where the chaos run can only
 //! sample.
 
-use super::sim_support::env_seed;
 use std::time::Duration;
 
 use animus_sim::DiskConfig;
 
 use super::sim_cluster::SimCluster;
+use super::sim_support::env_seed;
 
 const PUT: &str = "DynamoDB_20120810.PutItem";
 const GET: &str = "DynamoDB_20120810.GetItem";

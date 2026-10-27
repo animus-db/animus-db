@@ -21,11 +21,10 @@
 //! Seed replay (repo convention): `ANIMUS_SEED=<seed> cargo test -p animusd
 //! --lib <test name>`.
 
-use super::sim_support::env_seed;
-use super::sim_support::first_tablet;
 use std::time::Duration;
 
 use super::sim_cluster::SimCluster;
+use super::sim_support::{env_seed, first_tablet};
 
 /// Poll `body`'s `Query` on **every** node until `accept` holds on all of
 /// them, or panic after a bounded number of attempts — the sim analogue of

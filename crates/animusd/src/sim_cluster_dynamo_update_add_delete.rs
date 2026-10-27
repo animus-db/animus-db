@@ -24,11 +24,10 @@
 //!
 //! Seed replay: `ANIMUS_SEED=<seed> cargo test -p animusd --lib <test name>`.
 
-use super::sim_support::env_seed;
-use super::sim_support::first_tablet;
 use std::time::Duration;
 
 use super::sim_cluster::SimCluster;
+use super::sim_support::{env_seed, first_tablet};
 
 fn setup(seed: u64) -> SimCluster {
     let mut cluster = SimCluster::new(seed, 3, 3);

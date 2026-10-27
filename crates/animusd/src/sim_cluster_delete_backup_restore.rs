@@ -53,11 +53,11 @@
 //! attempts to catch the in-flight window at all, deferring entirely to
 //! this module for the deterministic proof.
 
-use super::sim_support::{env_seed, json};
 use animus_control::{ColumnType, MetaCommand, ProposeResult, TableSchema};
 use animus_tablet::TabletId;
 
 use super::sim_cluster::SimCluster;
+use super::sim_support::{env_seed, json};
 
 fn accepted(r: ProposeResult) -> bool {
     matches!(r, ProposeResult::Accepted { .. })

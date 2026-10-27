@@ -47,13 +47,13 @@
 //! exactly 1) is itself the proof that B lost: had B won, epoch 0 would hold
 //! 4.
 
-use super::sim_support::env_seed;
 use std::time::Duration;
 
 use animus_sim::NetConfig;
 use animus_tablet::TabletId;
 
 use super::sim_cluster::SimCluster;
+use super::sim_support::env_seed;
 
 /// One-way delay of the deliberately slow control-plane link.
 const SLOW: Duration = Duration::from_millis(300);

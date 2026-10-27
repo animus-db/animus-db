@@ -20,10 +20,8 @@
 //! Seed replay (repo convention): `ANIMUS_SEED=<seed> cargo test -p animusd
 //! --lib <test name>`.
 
-use super::sim_support::env_seed;
-use super::sim_support::{await_gsi_query, first_tablet};
-
 use super::sim_cluster::SimCluster;
+use super::sim_support::{await_gsi_query, env_seed, first_tablet};
 
 /// A 3-node cluster with table `events` (composite `pk`/`sk`), a hash-only
 /// GSI (`by-cat`) and an LSI (`by-score`) — mirrors `dynamo_select.rs::

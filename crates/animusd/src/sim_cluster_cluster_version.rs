@@ -32,7 +32,6 @@
 //!   agreeing with the dashboard's tablet ladder on the same state;
 //! - the joiner's pure range check and the `JoinInfo` additive-field shape.
 
-use super::sim_support::poll_until;
 use std::time::Duration;
 
 use animus_control::MetaCommand;
@@ -42,6 +41,7 @@ use animus_node::{ClientRequest, ClientResponse};
 use serde_json::Value;
 
 use super::sim_cluster::SimCluster;
+use super::sim_support::poll_until;
 use crate::config::NodeRole;
 
 fn seeds() -> Vec<u64> {

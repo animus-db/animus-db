@@ -68,8 +68,9 @@
 //! --lib backfill_seed_markers_never_surface_as_phantom_stream_events`.
 
 use super::sim_cluster::SimCluster;
-use super::sim_support::{converge_gsi_active, leader_of_sole_tablet as leader_of_table};
-use super::sim_support::{env_seed, json};
+use super::sim_support::{
+    converge_gsi_active, env_seed, json, leader_of_sole_tablet as leader_of_table,
+};
 
 /// A single-key (`id`, string) table with a stream enabled
 /// (`NEW_AND_OLD_IMAGES`) — mirrors the original real-socket test's own

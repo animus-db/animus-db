@@ -65,8 +65,6 @@
 //!     `JanitorProgress.backups_seen` stays 0 and the store keeps every
 //!     object.
 
-use super::sim_support::env_seed;
-use super::sim_support::{create_table, tablet_of};
 use std::time::Duration;
 
 use animus_control::{BackupStatus, MetaCommand, ProposeResult};
@@ -74,6 +72,7 @@ use animus_cp_data::backup as backup_codec;
 use animus_node::backup_janitor::JanitorPhase;
 
 use super::sim_cluster::SimCluster;
+use super::sim_support::{create_table, env_seed, tablet_of};
 
 fn accepted(r: ProposeResult) -> bool {
     matches!(r, ProposeResult::Accepted { .. })

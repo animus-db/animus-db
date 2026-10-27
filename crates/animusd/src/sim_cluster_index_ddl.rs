@@ -32,8 +32,7 @@
 //!     identical `ValidationException` way.
 
 use super::sim_cluster::SimCluster;
-use super::sim_support::env_seed;
-use super::sim_support::{converge_gsi_active, index_status};
+use super::sim_support::{converge_gsi_active, env_seed, index_status};
 
 // ---------------------------------------------------------------------------
 // Scenario (a): UpdateTable adds a GSI to a populated table, backfills, and

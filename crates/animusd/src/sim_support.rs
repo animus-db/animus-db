@@ -256,3 +256,12 @@ pub(crate) fn error_type_lenient(body: &str) -> String {
 pub(crate) fn put_body(table: &str, id: &str, value: &str) -> String {
     format!(r#"{{"TableName":"{table}","Item":{{"id":{{"S":"{id}"}},"v":{{"S":"{value}"}}}}}}"#)
 }
+
+/// The message of a caught panic payload.
+pub(crate) fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|m| (*m).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "<non-string panic payload>".to_string())
+}

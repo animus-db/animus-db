@@ -43,14 +43,13 @@
 //!
 //! Replay one seed with `ANIMUS_SEED=<seed>`.
 
-use super::sim_support::env_seed;
-use super::sim_support::{Tick, spawn_driver_ticks};
 use std::time::Duration;
 
 use animus_tablet::{TabletId, TabletState};
 
 use super::sim_cluster::SimCluster;
 use super::sim_cluster_grow_retired::{leader_node, move_leader};
+use super::sim_support::{Tick, env_seed, spawn_driver_ticks};
 
 const TABLE: &str = "users";
 const INDEX: &str = "by-email";

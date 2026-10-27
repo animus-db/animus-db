@@ -59,8 +59,6 @@
 //! Seed replay (repo convention): `ANIMUS_SEED=<seed> cargo test -p animusd
 //! --lib <test name>`.
 
-use super::sim_support::env_seed;
-use super::sim_support::{index_status, leader_of_sole_tablet as leader_of_table};
 use std::time::Duration;
 
 use animus_control::{IndexDef, IndexKind, IndexProjection, IndexStatus, MetaCommand};
@@ -70,6 +68,7 @@ use animus_storage::StorageEngine;
 use animus_tablet::TabletId;
 
 use super::sim_cluster::SimCluster;
+use super::sim_support::{env_seed, index_status, leader_of_sole_tablet as leader_of_table};
 
 // ---------------------------------------------------------------------------
 // Shared wire helpers (duplicated from `sim_cluster_index_ddl.rs`/the

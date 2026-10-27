@@ -91,8 +91,6 @@
 //! scenario in this file that exercises three interacting subsystems at
 //! once, it stays exactly as it was.
 
-use super::sim_support::env_seed;
-use super::sim_support::index_status;
 use std::time::Duration;
 
 use animus_control::{
@@ -101,6 +99,7 @@ use animus_control::{
 use animus_dynamo::wire::BATCH_WRITE_MAX_ITEMS;
 
 use super::sim_cluster::SimCluster;
+use super::sim_support::{env_seed, index_status};
 
 /// A `Creating` GSI definition hashing on `hash_attribute` — duplicated from
 /// `tests/backfill_seeder.rs`'s own identically-named helper (this crate's

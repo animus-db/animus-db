@@ -37,7 +37,6 @@
 //!
 //! Replay one seed with `ANIMUS_SEED=<seed>`.
 
-use super::sim_support::poll_until;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
@@ -46,6 +45,7 @@ use animus_env::handshake::encode_ext;
 use animus_env::{Env, NodeId, nid};
 
 use super::sim_cluster::SimCluster;
+use super::sim_support::poll_until;
 use crate::config::NodeRole;
 
 fn seeds() -> Vec<u64> {

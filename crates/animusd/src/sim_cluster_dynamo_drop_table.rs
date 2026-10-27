@@ -98,8 +98,6 @@
 //! Seed replay (repo convention): `ANIMUS_SEED=<seed> cargo test -p animusd
 //! --lib <test name>`.
 
-use super::sim_support::env_seed;
-use super::sim_support::{create_table, tablet_of};
 use std::time::Duration;
 
 use animus_env::{NodeId, nid};
@@ -107,6 +105,7 @@ use animus_storage::StorageEngine;
 use animus_tablet::TabletId;
 
 use super::sim_cluster::SimCluster;
+use super::sim_support::{create_table, env_seed, tablet_of};
 
 fn delete_table(cluster: &mut SimCluster, node: u64, table: &str) -> (u16, String) {
     let body = format!(r#"{{"TableName":"{table}"}}"#);

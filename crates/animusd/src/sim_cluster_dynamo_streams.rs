@@ -254,8 +254,7 @@
 //! animusd --lib update_table_stream_enable_and_disable_through_every_node`.
 
 use super::sim_cluster::SimCluster;
-use super::sim_support::{create_table, leader_of_table, tablet_of_table};
-use super::sim_support::{env_seed, json};
+use super::sim_support::{create_table, env_seed, json, leader_of_table, tablet_of_table};
 
 /// `UpdateTable` enabling a stream, issued from `node` — the shape the new
 /// `dispatch_table_op` stream-only sub-arm accepts.

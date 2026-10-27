@@ -26,7 +26,6 @@
 //! Seed replay (repo convention): `ANIMUS_SEED=<seed> cargo test -p animusd
 //! --lib <test name>`.
 
-use super::sim_support::env_seed;
 use std::collections::BTreeSet;
 
 use animus_dynamo::limits::{
@@ -35,6 +34,7 @@ use animus_dynamo::limits::{
 use animus_item::{AttributeValue, Item, item_size};
 
 use super::sim_cluster::SimCluster;
+use super::sim_support::env_seed;
 
 const PARTITION: &str = "p1";
 
