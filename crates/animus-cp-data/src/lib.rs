@@ -7190,43 +7190,6 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         *self.hot_change_max.lock().expect("hot change max poisoned")
     }
 
-    /// The split-build driver's raw row read (ADR 0050 Train B rung 4): every
-    /// row of one kind scope — **tombstones and MVCC versions retained, value
-    /// bytes verbatim** (envelope tag included, so a staged intent ships as
-    /// an intent, fork F7) — optionally bounded to `[start, end)` in
-    /// *logical* key space (the tail's per-token re-read; `None` = the whole
-    /// kind scope, the bulk pass). Leader-local and non-linearizable by
-    /// design: the driver re-reads dirty rows until convergence, and the
-    /// freeze (B5) is what makes the final pass authoritative.
-    pub async fn seed_rows_kind(
-        &self,
-        kind_idx: usize,
-        logical_range: Option<(&[u8], &[u8])>,
-    ) -> Vec<(Vec<u8>, Option<Vec<u8>>, u64)> {
-        let kscope = &self.kind_scopes[kind_idx];
-        let (start, end) = match logical_range {
-            Some((lo, hi)) => (kscope.physical(lo), kscope.physical(hi)),
-            None => {
-                let (start, end) = kscope.physical_bounds();
-                let Some(end) = end else {
-                    return Vec::new(); // only `StorageScope::whole()`; no real tablet
-                };
-                (start, end)
-            }
-        };
-        self.storage
-            .scan_with_tombstones(&start, &end)
-            .await
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(|(k, slot, version)| {
-                let logical = kscope.strip_in_range(&k)?.to_vec();
-                Some((logical, slot, version))
-            })
-            .collect()
-    }
-
     /// A **linearizable** read of `key` via **ReadIndex** (ADR 0017): only the
     /// leader can serve it. Records `read_index = commit_index`, confirms it is
     /// still leader by a quorum of peers acking its current term (a read-barrier

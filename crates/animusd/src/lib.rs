@@ -6229,7 +6229,7 @@ impl BoundNode {
     /// — see `ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL`'s doc for why it
     /// defaults to a minute. Every caller above `start_with_growth` in this
     /// layered stack passes that default; a test that needs a fast sweep
-    /// calls this method (or `run_node_with_ttl_sweep_interval`) directly,
+    /// calls this method directly,
     /// the same "widen the innermost layer, mint a thin test-facing
     /// wrapper" convention `quiesce_after` established.
     ///
@@ -7470,12 +7470,6 @@ impl Node {
     /// feeder. Floor (era off) until the first `Metadata` read.
     pub fn features(&self) -> animus_control::version::ClusterFeatures {
         self.edge.version().features.clone()
-    }
-
-    /// The named reason this node must exit (its binary's version range does
-    /// not contain the cluster version), if its feeder latched one.
-    pub fn version_halt_reason(&self) -> Option<String> {
-        self.edge.version().halt.get()
     }
 
     /// Resolves with the halt reason once this node's feeder latches one;
@@ -16918,44 +16912,7 @@ pub async fn start_cluster_with_auto_split_bytes(
     .await
 }
 
-/// Like [`start_cluster_with_auto_split_bytes`], but also configures the
-/// **orphan-member sweep** grace period (ADR 0040 PR6, `animus_control::node`'s
-/// `orphan_sweep_after`) instead of [`DEFAULT_ORPHAN_SWEEP_AFTER`] —
-/// `Duration::ZERO` disables the sweep entirely. The knob `--cluster`'s
-/// `--orphan-sweep-after SECS` CLI flag threads through here.
-///
-/// # Errors
-/// Propagates a failure to open any node's CP group engine.
-pub async fn start_cluster_with_auto_split_bytes_and_orphan_sweep_after(
-    bound: Vec<BoundNode>,
-    backend: StorageBackend,
-    auto_split_bytes: Option<u64>,
-    orphan_sweep_after: Duration,
-) -> std::io::Result<Vec<Node>> {
-    start_cluster_inner(
-        bound,
-        backend,
-        auto_split_bytes,
-        orphan_sweep_after,
-        StreamSealKnobs::default(),
-        SegmentStoreConfig::default(),
-        DEFAULT_STREAM_RETENTION,
-        None,
-        None,
-        Duration::ZERO,
-        false,
-        None,
-        BackupStoreConfig::default(),
-        None,
-        None,
-        None,
-        None,
-        false,
-    )
-    .await
-}
-
-/// Like [`start_cluster_with_auto_split_bytes_and_orphan_sweep_after`], with
+/// Like [`start_cluster_with_auto_split_bytes`], with
 /// explicit DynamoDB Streams sealer knobs, segment-store selection, and the
 /// segment-janitor's own retention grace period — see
 /// [`BoundNode::start_with_streams`]'s doc for the layered-wrapper
@@ -17261,7 +17218,7 @@ async fn start_cluster_inner(
                 // yet (mirrors `stream_retention`'s own layered-stack
                 // precedent for a not-yet-CLI-exposed knob) — production
                 // default; a test that needs a fast sweep uses the
-                // per-process `run_node_with_ttl_sweep_interval` instead.
+                // per-process `run_node_with_streams_quiesce_and_ttl_sweep_interval` instead.
                 ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
                 dynamo_auth.clone(),
                 backup_store_config.clone(),
@@ -17934,8 +17891,7 @@ pub async fn run_node_with_cluster_settings(
 /// established (`animusd/CLAUDE.md`'s engineering-lessons entry): every
 /// existing call site above keeps compiling and behaving identically; a
 /// test that needs a fast TTL sweep (this codebase's own testing
-/// discipline — never wait out a real minute) calls this directly, or its
-/// single-knob convenience sibling [`run_node_with_ttl_sweep_interval`].
+/// discipline — never wait out a real minute) calls this directly.
 ///
 /// `auto_split_bytes`/`auto_split_change_rate` (ADR 0034 / ADR 0042 §14,
 /// S-06): threaded straight to [`BoundNode::start_with_growth`]'s own knobs
@@ -18335,50 +18291,6 @@ pub async fn run_bound_node_with(
     .await
 }
 
-/// Like [`run_node_with`], but with a test-tunable TTL reaper sweep
-/// interval (ADR 0051) instead of [`ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL`]
-/// — the single-knob convenience shape [`run_node_with_orphan_sweep_after`]
-/// establishes for its own knob, so a TTL end-to-end test doesn't need to
-/// spell out every other layer's default explicitly. Every other knob stays
-/// at its production default (no quiescence, the default orphan-sweep
-/// grace, production stream-seal/segment-store/retention settings).
-///
-/// # Errors
-/// As [`run_node_with`].
-pub async fn run_node_with_ttl_sweep_interval(
-    config: &ClusterConfig,
-    index: usize,
-    dir: impl Into<PathBuf>,
-    backend: StorageBackend,
-    ttl_sweep_interval: Duration,
-) -> std::io::Result<Node> {
-    run_node_with_streams_quiesce_and_ttl_sweep_interval(
-        config,
-        index,
-        dir,
-        backend,
-        DEFAULT_ORPHAN_SWEEP_AFTER,
-        StreamSealKnobs::default(),
-        SegmentStoreConfig::default(),
-        DEFAULT_STREAM_RETENTION,
-        Duration::ZERO,
-        false,
-        None,
-        None,
-        None,
-        ttl_sweep_interval,
-        BackupStoreConfig::default(),
-        pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
-        None,
-        None,
-        None,
-        None,
-        None,
-        false,
-    )
-    .await
-}
-
 /// Start node `index` from `config` as a **control-only** node (ADR 0035
 /// PR3, `animusd control`): binds only the control internal `ProdEnv` role
 /// plus the client + admin listeners, and runs only the control [`RaftNode`]
@@ -18587,51 +18499,6 @@ pub async fn run_node_data(
     .await
 }
 
-/// Like [`run_node_data`], but also configures the DynamoDB Streams sealer's
-/// own size/age knobs and segment-store selection — the data-only sibling of
-/// [`BoundNode::start_with_streams`]'s own layered-wrapper convention: every
-/// existing `run_node_data` call site keeps compiling and behaving
-/// identically (production knobs, the default `Cluster` store); a test that
-/// needs tiny seal thresholds (this codebase's own testing discipline —
-/// never wait out a 4-hour age trigger) calls this directly. Pairs with
-/// [`run_node_control_with_stores`]'s own `stream_retention` parameter for a
-/// genuine split-topology segment-janitor test (see `tests/stream_janitor.rs`).
-/// A thin wrapper over [`run_node_data_with_cluster_settings`] with every
-/// S-06 cluster-settings knob at its pre-S-06 default.
-///
-/// # Errors
-/// As [`run_node_data`].
-pub async fn run_node_data_with_streams(
-    config: &ClusterConfig,
-    index: usize,
-    dir: impl Into<PathBuf>,
-    backend: StorageBackend,
-    stream_seal_knobs: StreamSealKnobs,
-    segment_store_config: SegmentStoreConfig,
-) -> std::io::Result<Node> {
-    run_node_data_with_cluster_settings(
-        config,
-        index,
-        dir,
-        backend,
-        None,
-        None,
-        None,
-        Duration::ZERO,
-        false,
-        stream_seal_knobs,
-        segment_store_config,
-        None,
-        None,
-        None,
-        None,
-        // `--shared-wal` has the identical hardcoded-`false` gap as
-        // `heartbeat_batch` above — this wrapper doesn't expose it.
-        false,
-    )
-    .await
-}
-
 /// Like [`run_node_data`], but also exposes the knobs `animusd data
 /// --config`'s own `cluster_settings`-carrying [`ClusterConfig`] can now
 /// reach (S-06): auto-split (ADR 0034 / ADR 0042 §14), quiescence (ADR 0044
@@ -18645,8 +18512,8 @@ pub async fn run_node_data_with_streams(
 /// applicability breakdown. Every default
 /// below (`None`/`Duration::ZERO`/[`StreamSealKnobs::default`]/
 /// [`SegmentStoreConfig::default`]) is byte-identical to [`run_node_data`]'s
-/// own pre-S-06 behavior. `segment_store_config` is W-10's own knob (the
-/// same one [`run_node_data_with_streams`] exposes); `animusd data --config`
+/// own pre-S-06 behavior. `segment_store_config` is W-10's own knob;
+/// `animusd data --config`
 /// has no flag for it yet, so `main.rs` passes the default.
 ///
 /// `throttle_read_units`/`throttle_write_units` (ADR 0065 §5(a), W-08 step
