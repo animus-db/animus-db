@@ -12511,7 +12511,7 @@ drives two real one-node clusters through `mrec_peer::probe_peer_for_test`; it c
 data until M4's replica-create saga. Never drive a `SimWorld` member cluster directly.
 
 **MREC global tables, as built (ADR 0075 "G-d as built", G-01 G-d M4-M6).** Modules:
-`mrec_peer` (config, `PeerClient`, `ProdPeerClient`, node-local `PeerHealth` memo),
+`mrec_peer` (config, `PeerClient`, `ProdPeerClient`, node-local `PeerHealth` shipper memo and the separate `SagaMemo` map),
 `mrec_receiver` (`handle_mrec_apply`, routed from `ClientRequest::MrecApply`),
 `mrec_shipper` (module doc = design: per `(led tablet, peer)` tick, dirty keys above
 `mrec:<region>`, scan under `mrecscan:<region>`; cursor advances only after the peer's
@@ -12674,7 +12674,7 @@ stay at version 2) and the gate cells in `sim_cluster_mixed_version_corpus`.
 (table and per-GSI) behind the gate (closed: the pre-amendment refusal text), validates against the
 receiving cluster's table (PROVISIONED, GSI names), commits `SetMrecReplicaOverrides` (stamp = max(now,
 stored+1), origin = this region's id) and `push_overrides` (saga driver) sends each replica's record to
-every Active peer as `MrecControl::SetOverrides` until acknowledged (memo `PeerHealth.overrides_pushed`;
+every Active peer as `MrecControl::SetOverrides` until acknowledged (memo `SagaMemo.overrides_pushed`;
 the peer applies last-writer-wins, so repeats are no-ops). Enforcement is only
 `ClientCtx::throttle_limits_for` -> `Metadata::local_read_override` (read units only). A node that
 applies a push calls `recompute_any_table_throughput`; the `SimCluster` fixture never spawns the
@@ -12697,7 +12697,7 @@ by `push_settings` (`MrecControl::SetLegacySettings`); per-Region read capacity 
 Removal: `LegacyRemovePeer` goes to every other replica first and the departing Region last; a receiver
 ignores it from a sender that is `Deleting`/absent in its spec (a dissolving cluster must not dissolve the others);
 removing several Regions in one call drops every link between them. The saga promotes a replica to
-`Active` only after `PeerHealth.create_acked` (an empty table's copy needs no peer contact). 2019 edges
+`Active` only after `SagaMemo.create_acked` (an empty table's copy needs no peer contact). 2019 edges
 (`update_table_mrec`, `update_table_throughput`) refuse a legacy table. Sim test:
 `sim_world_mrec_legacy_tests` (three clusters; reuses `mesh_cfg` and `open_overrides_gate`).
 

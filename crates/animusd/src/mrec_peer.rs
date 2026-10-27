@@ -106,6 +106,9 @@ pub(crate) struct MrecConfig {
     pub(crate) node_tls: Option<TlsSection>,
     /// Per-(table, tablet, peer) shipper state, for backoff and the admin view.
     pub(crate) health: Arc<Mutex<BTreeMap<HealthKey, PeerHealth>>>,
+    /// Per-(table, peer Region) saga memo (see [`SagaMemo`]); separate from
+    /// `health` so shipper readers (backoff, the admin view) never see it.
+    pub(crate) saga: Arc<Mutex<BTreeMap<SagaKey, SagaMemo>>>,
     /// The cross-cluster client the **wire edge** uses for the one synchronous
     /// peer check of `CreateGlobalTable` / `UpdateGlobalTable` (ADR 0075's
     /// 2026-10-21 amendment). Installed once by whoever owns the transport
@@ -171,6 +174,18 @@ pub(crate) struct PeerHealth {
     pub(crate) shipped_rows: u64,
     /// The tablet's work is done (cursor current, nothing pending).
     pub(crate) caught_up: bool,
+}
+
+/// `(table, peer Region)`.
+pub(crate) type SagaKey = (String, String);
+
+/// What this node's MREC saga (the driver) last knew about one
+/// `(table, peer Region)`: which control messages the peer has acknowledged
+/// and the `Deleting` bookkeeping. In-memory, node-local, never replicated or
+/// sent on the wire; reset on restart or a driver change, which only costs an
+/// idempotent re-send.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SagaMemo {
     /// The TTL attribute this node's saga last pushed (or observed at first
     /// sight) for the peer: `None` = never looked, `Some(None)` = no TTL.
     pub(crate) ttl_pushed: Option<Option<String>>,
@@ -190,13 +205,20 @@ pub(crate) struct PeerHealth {
     /// Consecutive passes in which a `LegacyRemovePeer` notification failed.
     pub(crate) legacy_remove_failures: u32,
     /// The peer acknowledged this replica's creation (`CreateReplica` /
-    /// `LegacyReplica`) to this node's saga, keyed `(table, SAGA_SLOT,
-    /// region)`. A replica is promoted to `Active` only after that, so an
+    /// `LegacyReplica`) to this node's saga, keyed
+    /// `(table, region)`. A replica is promoted to `Active` only after that, so an
     /// empty source table (whose copy needs no batch and so no peer contact)
     /// cannot become `Active` while its peer was never told. Driver-local;
     /// lost on restart or a driver change, which only costs an idempotent
     /// re-send.
     pub(crate) create_acked: bool,
+    /// The peer acknowledged `MrecControl::Leave` for this `Deleting` replica.
+    pub(crate) leave_acked: bool,
+    /// Consecutive `Leave` attempts that failed.
+    pub(crate) leave_failures: u32,
+    /// Monotonic nanos at which the `Deleting` grace ends (set on the first
+    /// `Deleting` pass); `None` until then.
+    pub(crate) delete_ready_at: Option<u64>,
 }
 
 impl Default for MrecConfig {
@@ -210,6 +232,7 @@ impl Default for MrecConfig {
             max_backlog: DEFAULT_MREC_MAX_BACKLOG,
             node_tls: None,
             health: Arc::default(),
+            saga: Arc::default(),
             edge_client: EdgePeerClient::default(),
         }
     }
@@ -232,6 +255,7 @@ impl MrecConfig {
             max_backlog: DEFAULT_MREC_MAX_BACKLOG,
             node_tls: None,
             health: Arc::default(),
+            saga: Arc::default(),
             edge_client: EdgePeerClient::default(),
         }
     }

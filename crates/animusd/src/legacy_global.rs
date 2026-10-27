@@ -65,10 +65,10 @@ use animus_node::{MrecApplyResponse, MrecControl};
 
 use crate::ClientCtx;
 use crate::dynamo::{internal, table_status};
-use crate::mrec_peer::{HealthKey, PeerClient};
+use crate::mrec_peer::{PeerClient, SagaKey};
 use crate::mrec_saga::{
-    SAGA_SLOT, add_replica_active, commit, create_table_body, gate_open, mrec_spec, refused,
-    send_control, shape_of,
+    add_replica_active, commit, create_table_body, gate_open, mrec_spec, refused, send_control,
+    shape_of,
 };
 
 /// How long the edge waits for a peer's read-only verification. Short: the
@@ -1113,9 +1113,9 @@ pub(crate) async fn push_settings<E: Env, R: RelayClient>(
         .iter()
         .filter(|r| !r.local && r.status == MrecReplicaStatus::Active)
     {
-        let key: HealthKey = (table.to_owned(), SAGA_SLOT, target.region.clone());
+        let key: SagaKey = (table.to_owned(), target.region.clone());
         let pushed = {
-            let h = ctx.mrec.health.lock().expect("mrec health poisoned");
+            let h = ctx.mrec.saga.lock().expect("mrec saga memo poisoned");
             h.get(&key).and_then(|e| e.legacy_settings_pushed)
         };
         if pushed == Some(order) {
@@ -1135,7 +1135,7 @@ pub(crate) async fn push_settings<E: Env, R: RelayClient>(
         .await;
         did = true;
         if matches!(reply, Ok(MrecApplyResponse::Done)) {
-            let mut h = ctx.mrec.health.lock().expect("mrec health poisoned");
+            let mut h = ctx.mrec.saga.lock().expect("mrec saga memo poisoned");
             h.entry(key).or_default().legacy_settings_pushed = Some(order);
         }
     }
@@ -1155,9 +1155,9 @@ pub(crate) async fn notify_removal<E: Env, R: RelayClient>(
     table: &str,
     leaving: &str,
 ) -> bool {
-    let key: HealthKey = (table.to_owned(), SAGA_SLOT, leaving.to_owned());
+    let key: SagaKey = (table.to_owned(), leaving.to_owned());
     let (acked, failures) = {
-        let h = ctx.mrec.health.lock().expect("mrec health poisoned");
+        let h = ctx.mrec.saga.lock().expect("mrec saga memo poisoned");
         h.get(&key).map_or((BTreeSet::new(), 0), |e| {
             (e.legacy_removed.clone(), e.legacy_remove_failures)
         })
@@ -1198,7 +1198,7 @@ pub(crate) async fn notify_removal<E: Env, R: RelayClient>(
             },
         )
         .await;
-        let mut h = ctx.mrec.health.lock().expect("mrec health poisoned");
+        let mut h = ctx.mrec.saga.lock().expect("mrec saga memo poisoned");
         let e = h.entry(key.clone()).or_default();
         if matches!(reply, Ok(MrecApplyResponse::Done)) {
             e.legacy_removed.insert(target);
@@ -1207,7 +1207,7 @@ pub(crate) async fn notify_removal<E: Env, R: RelayClient>(
         }
     }
     if failed {
-        let mut h = ctx.mrec.health.lock().expect("mrec health poisoned");
+        let mut h = ctx.mrec.saga.lock().expect("mrec saga memo poisoned");
         h.entry(key).or_default().legacy_remove_failures += 1;
     }
     true
