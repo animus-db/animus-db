@@ -322,7 +322,11 @@ async fn stream_shard_catalog_relay_allows_seal_but_not_expire() {
         view_type: StreamViewType::NewAndOldImages,
         hlc_range: (0, 100),
         count: 1,
-        seal_wall_ms: 1_700_000_000_000,
+        // Sealed "now": the leader's real segment janitor ticks every 200ms
+        // and marks any row older than the stream retention as expired, so a
+        // fixed past timestamp let it expire this row before the assertion
+        // below that the rejected `ExpireStreamShards` left it unmarked.
+        seal_wall_ms: wall_now_ms(),
         replicas: vec![nid(10), nid(11)],
         object_id: "stream_relay_t/relay-L1/1/0/test".to_owned(),
     };
@@ -378,11 +382,11 @@ async fn stream_shard_catalog_relay_allows_seal_but_not_expire() {
     );
     // And it really did not take effect (the row is still unmarked).
     assert!(
-        !nodes[leader]
+        nodes[leader]
             .metadata()
             .stream_shard_chain("stream_relay_t", "relay-L1", TabletId(1))
             .next()
-            .is_some_and(|(_, row)| row.expired),
+            .is_some_and(|(_, row)| !row.expired),
         "rejected ExpireStreamShards must not have marked the row"
     );
 
@@ -1131,4 +1135,13 @@ async fn http_admin(addr: SocketAddr, path: &str, body: &str) -> (u16, String) {
         .and_then(|c| c.parse().ok())
         .expect("status");
     (status, payload.to_owned())
+}
+
+/// The current wall-clock time in Unix milliseconds, the clock the segment
+/// janitor measures a sealed row's age against.
+fn wall_now_ms() -> u64 {
+    let since_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("wall clock is after the Unix epoch");
+    u64::try_from(since_epoch.as_millis()).expect("wall clock fits in u64 milliseconds")
 }
