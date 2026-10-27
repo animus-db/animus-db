@@ -4111,6 +4111,676 @@ fn console_drop_gsi_result(status: u16, resp_body: &str) -> Result<(), console::
     Ok(())
 }
 
+/// How a console method reaches the DynamoDB execution path. The console's
+/// request validation and response parsing live once in the `console_op_*`
+/// helpers below; the ONLY thing the production backend and the
+/// `SimCluster`-facing [`GenericConsoleBackend`] do differently is this
+/// dispatch, and they must stay distinct (the generic core covers a narrower
+/// operation set than the concrete one, see `docs/engineering-lessons.md`'s
+/// 2026-09-08 entry): [`ProductionDispatch`] calls the concrete
+/// [`crate::dynamo::execute_routed`], [`GenericDispatch`] calls
+/// [`crate::dynamo::execute_routed_as_generic`].
+#[async_trait::async_trait]
+trait ConsoleDispatch<E: Env, R: RelayClient>: Send + Sync {
+    async fn execute(ctx: &ClientCtx<E, R>, target: &str, body: &[u8]) -> (u16, String);
+}
+
+/// Production dispatch: the concrete, unmodified `execute_routed`.
+struct ProductionDispatch;
+
+#[async_trait::async_trait]
+impl ConsoleDispatch<ProdEnv, AnimusdRelayClient> for ProductionDispatch {
+    async fn execute(ctx: &ClientCtx, target: &str, body: &[u8]) -> (u16, String) {
+        crate::dynamo::execute_routed(ctx, target, body).await
+    }
+}
+
+/// Simulation dispatch: the `<E, R>`-generic `execute_routed_as_generic`.
+#[cfg_attr(not(test), allow(dead_code))]
+struct GenericDispatch;
+
+#[async_trait::async_trait]
+impl<E: Env, R: RelayClient> ConsoleDispatch<E, R> for GenericDispatch {
+    async fn execute(ctx: &ClientCtx<E, R>, target: &str, body: &[u8]) -> (u16, String) {
+        crate::dynamo::execute_routed_as_generic(
+            ctx,
+            &crate::authz::Principal::unrestricted(),
+            target,
+            body,
+        )
+        .await
+    }
+}
+
+async fn console_op_create_table<E: Env, R: RelayClient, D: ConsoleDispatch<E, R>>(
+    ctx: &ClientCtx<E, R>,
+    req: console::CreateTableRequest,
+) -> Result<console::TableDetail, console::ConsoleError> {
+    // -- client-side validation: every case that would otherwise reach
+    // the wire only to bounce back as a decode error gets a clear
+    // message here instead, and the two cases this PR's brief calls out
+    // by name (an LSI with no sort key attribute of its own, and a
+    // table declaring no sort key at all while still declaring an LSI)
+    // are both rejected before a single byte reaches `execute_routed`.
+    let table_name = req.table_name.trim();
+    if table_name.is_empty() {
+        return Err(console::ConsoleError::new(400, "table_name is required"));
+    }
+    if req.partition_key.name.trim().is_empty() {
+        return Err(console::ConsoleError::new(
+            400,
+            "partition key name is required",
+        ));
+    }
+    if !is_valid_key_attribute_type(&req.partition_key.attribute_type) {
+        return Err(console::ConsoleError::new(
+            400,
+            "partition key attribute_type must be S, N, or B",
+        ));
+    }
+    if let Some(sk) = &req.sort_key {
+        if sk.name.trim().is_empty() {
+            return Err(console::ConsoleError::new(400, "sort key name is required"));
+        }
+        if !is_valid_key_attribute_type(&sk.attribute_type) {
+            return Err(console::ConsoleError::new(
+                400,
+                "sort key attribute_type must be S, N, or B",
+            ));
+        }
+    }
+    for lsi in &req.lsis {
+        if lsi.index_name.trim().is_empty() {
+            return Err(console::ConsoleError::new(
+                400,
+                "LSI index_name is required",
+            ));
+        }
+        if lsi.sort_attribute.trim().is_empty() {
+            return Err(console::ConsoleError::new(
+                400,
+                format!("LSI `{}` needs a sort key attribute", lsi.index_name),
+            ));
+        }
+        if req.sort_key.is_none() {
+            return Err(console::ConsoleError::new(
+                400,
+                "declaring an LSI requires the table to have its own sort key",
+            ));
+        }
+    }
+    for gsi in &req.gsis {
+        if gsi.index_name.trim().is_empty() {
+            return Err(console::ConsoleError::new(
+                400,
+                "GSI index_name is required",
+            ));
+        }
+        if gsi.hash_attribute.trim().is_empty() {
+            return Err(console::ConsoleError::new(
+                400,
+                format!("GSI `{}` needs a hash attribute", gsi.index_name),
+            ));
+        }
+        if gsi.projection_type == "INCLUDE"
+            && gsi
+                .projection_non_key_attributes
+                .as_ref()
+                .is_none_or(|a| a.is_empty())
+        {
+            return Err(console::ConsoleError::new(
+                400,
+                format!(
+                    "GSI `{}`'s INCLUDE projection needs at least one attribute",
+                    gsi.index_name
+                ),
+            ));
+        }
+    }
+    if req.stream_enabled
+        && req
+            .stream_view_type
+            .as_deref()
+            .is_none_or(|s| s.trim().is_empty())
+    {
+        return Err(console::ConsoleError::new(
+            400,
+            "stream_view_type is required to enable a stream",
+        ));
+    }
+    if req.ttl_enabled
+        && req
+            .ttl_attribute_name
+            .as_deref()
+            .is_none_or(|s| s.trim().is_empty())
+    {
+        return Err(console::ConsoleError::new(
+            400,
+            "ttl_attribute_name is required to enable TTL",
+        ));
+    }
+
+    // -- build the real CreateTable wire body. Deliberately no
+    // `AttributeDefinitions` entry for any GSI/LSI key attribute — see
+    // `console::CreateTableRequest`'s own doc for why sending one would
+    // misrepresent what actually gets recorded.
+    let mut key_schema = vec![serde_json::json!({
+        "AttributeName": req.partition_key.name, "KeyType": "HASH",
+    })];
+    let mut attribute_definitions = vec![serde_json::json!({
+        "AttributeName": req.partition_key.name,
+        "AttributeType": req.partition_key.attribute_type,
+    })];
+    if let Some(sk) = &req.sort_key {
+        key_schema.push(serde_json::json!({
+            "AttributeName": sk.name, "KeyType": "RANGE",
+        }));
+        attribute_definitions.push(serde_json::json!({
+            "AttributeName": sk.name, "AttributeType": sk.attribute_type,
+        }));
+    }
+    let mut body = serde_json::json!({
+        "TableName": table_name,
+        "KeySchema": key_schema,
+        "AttributeDefinitions": attribute_definitions,
+    });
+    if !req.gsis.is_empty() {
+        let gsis: Vec<serde_json::Value> = req
+            .gsis
+            .iter()
+            .map(|g| {
+                let mut key_schema = vec![serde_json::json!({
+                    "AttributeName": g.hash_attribute, "KeyType": "HASH",
+                })];
+                if let Some(sort) = g.sort_attribute.as_deref().filter(|s| !s.trim().is_empty()) {
+                    key_schema.push(serde_json::json!({
+                        "AttributeName": sort, "KeyType": "RANGE",
+                    }));
+                }
+                let mut projection = serde_json::json!({ "ProjectionType": g.projection_type });
+                if g.projection_type == "INCLUDE" {
+                    projection["NonKeyAttributes"] = serde_json::Value::Array(
+                        g.projection_non_key_attributes
+                            .clone()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(serde_json::Value::String)
+                            .collect(),
+                    );
+                }
+                serde_json::json!({
+                    "IndexName": g.index_name,
+                    "KeySchema": key_schema,
+                    "Projection": projection,
+                })
+            })
+            .collect();
+        body["GlobalSecondaryIndexes"] = serde_json::Value::Array(gsis);
+    }
+    if !req.lsis.is_empty() {
+        let lsis: Vec<serde_json::Value> = req
+            .lsis
+            .iter()
+            .map(|l| {
+                serde_json::json!({
+                    "IndexName": l.index_name,
+                    "KeySchema": [
+                        {"AttributeName": req.partition_key.name, "KeyType": "HASH"},
+                        {"AttributeName": l.sort_attribute, "KeyType": "RANGE"},
+                    ],
+                })
+            })
+            .collect();
+        body["LocalSecondaryIndexes"] = serde_json::Value::Array(lsis);
+    }
+    // Roadmap W-11: `AttributeDefinitions` must cover every key
+    // attribute the request's own `KeySchema` names — the base table's
+    // (already declared above) *and* every GSI/LSI's own hash/sort
+    // attribute. This form collects no type for an index-only key
+    // attribute (`CreateGsiRequest`/`CreateLsiRequest` carry key
+    // attribute *names* only — see `console::CreateTableRequest`'s own
+    // doc for why that's a deliberate console-form scope cut, not a
+    // mechanism gap), so default each to `"S"`, the same default
+    // `schema::column_type_for(None)` already applies bridge-side.
+    let declared: std::collections::BTreeSet<String> = body["AttributeDefinitions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|d| d["AttributeName"].as_str().map(str::to_owned))
+        .collect();
+    let mut extra_names: Vec<String> = Vec::new();
+    for g in &req.gsis {
+        if !g.hash_attribute.trim().is_empty() {
+            extra_names.push(g.hash_attribute.clone());
+        }
+        if let Some(sort) = g.sort_attribute.as_deref().filter(|s| !s.trim().is_empty()) {
+            extra_names.push(sort.to_owned());
+        }
+    }
+    for l in &req.lsis {
+        if !l.sort_attribute.trim().is_empty() {
+            extra_names.push(l.sort_attribute.clone());
+        }
+    }
+    let mut seen = declared;
+    let defs = body["AttributeDefinitions"].as_array_mut().unwrap();
+    for name in extra_names {
+        if seen.insert(name.clone()) {
+            defs.push(serde_json::json!({
+                "AttributeName": name, "AttributeType": "S",
+            }));
+        }
+    }
+    if req.stream_enabled {
+        body["StreamSpecification"] = serde_json::json!({
+            "StreamEnabled": true,
+            "StreamViewType": req.stream_view_type.as_deref().unwrap_or_default(),
+        });
+    }
+    let payload = serde_json::to_vec(&body).unwrap_or_default();
+    let (status, resp_body) = D::execute(ctx, "DynamoDB_20120810.CreateTable", &payload).await;
+    if status != 200 {
+        return Err(console_wire_error(status, &resp_body));
+    }
+
+    // The table now exists; TTL is not part of `CreateTable`'s own wire
+    // shape (`animus_dynamo::wire::Operation::CreateTable` carries no
+    // TTL field at all — ADR 0051's `UpdateTimeToLive` is a separate
+    // call even for a brand-new table), so enable it as a follow-up
+    // call, same shape `set_ttl` already uses.
+    if req.ttl_enabled {
+        let ttl_body = serde_json::json!({
+            "TableName": table_name,
+            "TimeToLiveSpecification": {
+                "Enabled": true,
+                "AttributeName": req.ttl_attribute_name.as_deref().unwrap_or_default(),
+            },
+        });
+        let payload = serde_json::to_vec(&ttl_body).unwrap_or_default();
+        let (status, resp_body) =
+            D::execute(ctx, "DynamoDB_20120810.UpdateTimeToLive", &payload).await;
+        if status != 200 {
+            return Err(console_wire_error(status, &resp_body));
+        }
+    }
+
+    let meta = ctx.metadata_fresh().await;
+    console_table_detail(ctx, &meta, table_name).ok_or_else(|| {
+        console::ConsoleError::new(500, "table created but not found in the catalog")
+    })
+}
+
+async fn console_op_table_detail<E: Env, R: RelayClient, D: ConsoleDispatch<E, R>>(
+    ctx: &ClientCtx<E, R>,
+    table: &str,
+) -> Option<console::TableDetail> {
+    console_table_detail(ctx, &ctx.effective_metadata(), table)
+}
+
+async fn console_op_add_gsi<E: Env, R: RelayClient, D: ConsoleDispatch<E, R>>(
+    ctx: &ClientCtx<E, R>,
+    table: &str,
+    req: console::AddGsiRequest,
+) -> Result<console::GsiDetail, console::ConsoleError> {
+    let payload = console_add_gsi_payload(table, &req)?;
+    let (status, resp_body) = D::execute(ctx, "DynamoDB_20120810.UpdateTable", &payload).await;
+    console_add_gsi_result(ctx, table, &req.index_name, status, &resp_body).await
+}
+
+async fn console_op_drop_gsi<E: Env, R: RelayClient, D: ConsoleDispatch<E, R>>(
+    ctx: &ClientCtx<E, R>,
+    table: &str,
+    index: &str,
+) -> Result<(), console::ConsoleError> {
+    let payload = console_drop_gsi_payload(table, index);
+    let (status, resp_body) = D::execute(ctx, "DynamoDB_20120810.UpdateTable", &payload).await;
+    console_drop_gsi_result(status, &resp_body)
+}
+
+async fn console_op_set_stream<E: Env, R: RelayClient, D: ConsoleDispatch<E, R>>(
+    ctx: &ClientCtx<E, R>,
+    table: &str,
+    req: console::SetStreamRequest,
+) -> Result<console::StreamSummary, console::ConsoleError> {
+    let body = if req.enabled {
+        let Some(view_type) = req.view_type.as_deref().filter(|s| !s.trim().is_empty()) else {
+            return Err(console::ConsoleError::new(
+                400,
+                "view_type is required to enable a stream",
+            ));
+        };
+        serde_json::json!({
+            "TableName": table,
+            "StreamSpecification": {"StreamEnabled": true, "StreamViewType": view_type},
+        })
+    } else {
+        serde_json::json!({
+            "TableName": table,
+            "StreamSpecification": {"StreamEnabled": false},
+        })
+    };
+    let payload = serde_json::to_vec(&body).unwrap_or_default();
+    let (status, resp_body) = D::execute(ctx, "DynamoDB_20120810.UpdateTable", &payload).await;
+    if status != 200 {
+        return Err(console_wire_error(status, &resp_body));
+    }
+    let meta = ctx.metadata_fresh().await;
+    let Some(schema) = meta.table_schema(table) else {
+        return Err(console::ConsoleError::new(404, "no such table"));
+    };
+    Ok(console_stream_summary(schema))
+}
+
+async fn console_op_set_ttl<E: Env, R: RelayClient, D: ConsoleDispatch<E, R>>(
+    ctx: &ClientCtx<E, R>,
+    table: &str,
+    req: console::SetTtlRequest,
+) -> Result<console::TtlSummary, console::ConsoleError> {
+    let Some(attribute_name) = req
+        .attribute_name
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return Err(console::ConsoleError::new(
+            400,
+            "attribute_name is required",
+        ));
+    };
+    let body = serde_json::json!({
+        "TableName": table,
+        "TimeToLiveSpecification": {"Enabled": req.enabled, "AttributeName": attribute_name},
+    });
+    let payload = serde_json::to_vec(&body).unwrap_or_default();
+    let (status, resp_body) = D::execute(ctx, "DynamoDB_20120810.UpdateTimeToLive", &payload).await;
+    if status != 200 {
+        return Err(console_wire_error(status, &resp_body));
+    }
+    let meta = ctx.metadata_fresh().await;
+    let Some(schema) = meta.table_schema(table) else {
+        return Err(console::ConsoleError::new(404, "no such table"));
+    };
+    Ok(console_ttl_summary(schema))
+}
+
+async fn console_op_delete_table<E: Env, R: RelayClient, D: ConsoleDispatch<E, R>>(
+    ctx: &ClientCtx<E, R>,
+    table: &str,
+) -> Result<(), console::ConsoleError> {
+    if !ctx.metadata_fresh().await.has_table_schema(table) {
+        return Err(console::ConsoleError::new(404, "no such table"));
+    }
+    ctx.drop_table(table.to_string())
+        .await
+        .map_err(|e| console::ConsoleError::new(409, e))
+}
+
+async fn console_op_scan_items<E: Env, R: RelayClient, D: ConsoleDispatch<E, R>>(
+    ctx: &ClientCtx<E, R>,
+    table: &str,
+    req: console::ScanItemsRequest,
+) -> Result<console::ItemsPage, console::ConsoleError> {
+    let mut body = serde_json::json!({ "TableName": table });
+    if let Some(index_name) = &req.index_name {
+        body["IndexName"] = serde_json::Value::String(index_name.clone());
+    }
+    if let Some(limit) = req.limit {
+        body["Limit"] = serde_json::Value::from(limit);
+    }
+    if let Some(key) = req.exclusive_start_key {
+        body["ExclusiveStartKey"] = serde_json::Value::Object(key);
+    }
+    let payload = serde_json::to_vec(&body).unwrap_or_default();
+    let (status, resp_body) = D::execute(ctx, "DynamoDB_20120810.Scan", &payload).await;
+    if status != 200 {
+        return Err(console_wire_error(status, &resp_body));
+    }
+    console_parse_items_page(&resp_body)
+}
+
+async fn console_op_query_items<E: Env, R: RelayClient, D: ConsoleDispatch<E, R>>(
+    ctx: &ClientCtx<E, R>,
+    table: &str,
+    req: console::QueryItemsRequest,
+) -> Result<console::ItemsPage, console::ConsoleError> {
+    let meta = ctx.effective_metadata();
+    let Some(schema) = meta.table_schema(table) else {
+        return Err(console::ConsoleError::new(404, "no such table"));
+    };
+    // Resolve the partition/sort attribute *names* to query by, server-side
+    // — `console.rs` never imports a schema-catalog type, so the client
+    // sends only the index name (a real closed set, from this same
+    // table's own `TableDetail`) and the raw key *values*, never a
+    // hand-typed attribute name. See `console::QueryItemsRequest`'s doc.
+    let (pk_name, sk_name) = match &req.index_name {
+        None => (
+            schema.partition_key.clone(),
+            schema.clustering_keys.first().cloned(),
+        ),
+        Some(index_name) => {
+            let Some(idx) = schema.indexes.iter().find(|i| &i.name == index_name) else {
+                return Err(console::ConsoleError::new(404, "no such index"));
+            };
+            (idx.hash_attribute.clone(), idx.sort_attribute.clone())
+        }
+    };
+    let mut key_condition = format!("{pk_name} = :pk_value");
+    let mut expr_values = serde_json::Map::new();
+    expr_values.insert(":pk_value".to_string(), req.partition_value.clone());
+    if let Some(sort_condition) = &req.sort_condition {
+        let Some(sk_name) = &sk_name else {
+            return Err(console::ConsoleError::new(
+                400,
+                "this table/index has no sort key to condition on",
+            ));
+        };
+        match sort_condition {
+            console::SortKeyQuery::Equals { value } => {
+                key_condition.push_str(&format!(" AND {sk_name} = :sk_value"));
+                expr_values.insert(":sk_value".to_string(), value.clone());
+            }
+            console::SortKeyQuery::Between { lo, hi } => {
+                key_condition.push_str(&format!(" AND {sk_name} BETWEEN :sk_lo AND :sk_hi"));
+                expr_values.insert(":sk_lo".to_string(), lo.clone());
+                expr_values.insert(":sk_hi".to_string(), hi.clone());
+            }
+            console::SortKeyQuery::BeginsWith { value } => {
+                key_condition.push_str(&format!(" AND begins_with({sk_name}, :sk_value)"));
+                expr_values.insert(":sk_value".to_string(), value.clone());
+            }
+        }
+    }
+    let mut body = serde_json::json!({
+        "TableName": table,
+        "KeyConditionExpression": key_condition,
+        "ExpressionAttributeValues": expr_values,
+    });
+    if let Some(index_name) = &req.index_name {
+        body["IndexName"] = serde_json::Value::String(index_name.clone());
+    }
+    let payload = serde_json::to_vec(&body).unwrap_or_default();
+    let (status, resp_body) = D::execute(ctx, "DynamoDB_20120810.Query", &payload).await;
+    if status != 200 {
+        return Err(console_wire_error(status, &resp_body));
+    }
+    console_parse_items_page(&resp_body)
+}
+
+async fn console_op_get_item<E: Env, R: RelayClient, D: ConsoleDispatch<E, R>>(
+    ctx: &ClientCtx<E, R>,
+    table: &str,
+    key: console::WireItem,
+) -> Result<Option<console::WireItem>, console::ConsoleError> {
+    let body = serde_json::json!({ "TableName": table, "Key": serde_json::Value::Object(key) });
+    let payload = serde_json::to_vec(&body).unwrap_or_default();
+    let (status, resp_body) = D::execute(ctx, "DynamoDB_20120810.GetItem", &payload).await;
+    if status != 200 {
+        return Err(console_wire_error(status, &resp_body));
+    }
+    let value: serde_json::Value = serde_json::from_str(&resp_body)
+        .map_err(|e| console::ConsoleError::new(500, format!("malformed GetItem response: {e}")))?;
+    Ok(value.get("Item").and_then(|v| v.as_object().cloned()))
+}
+
+async fn console_op_put_item<E: Env, R: RelayClient, D: ConsoleDispatch<E, R>>(
+    ctx: &ClientCtx<E, R>,
+    table: &str,
+    item: console::WireItem,
+) -> Result<(), console::ConsoleError> {
+    let body = serde_json::json!({ "TableName": table, "Item": serde_json::Value::Object(item) });
+    let payload = serde_json::to_vec(&body).unwrap_or_default();
+    let (status, resp_body) = D::execute(ctx, "DynamoDB_20120810.PutItem", &payload).await;
+    if status != 200 {
+        return Err(console_wire_error(status, &resp_body));
+    }
+    Ok(())
+}
+
+async fn console_op_delete_item<E: Env, R: RelayClient, D: ConsoleDispatch<E, R>>(
+    ctx: &ClientCtx<E, R>,
+    table: &str,
+    key: console::WireItem,
+) -> Result<(), console::ConsoleError> {
+    let body = serde_json::json!({ "TableName": table, "Key": serde_json::Value::Object(key) });
+    let payload = serde_json::to_vec(&body).unwrap_or_default();
+    let (status, resp_body) = D::execute(ctx, "DynamoDB_20120810.DeleteItem", &payload).await;
+    if status != 200 {
+        return Err(console_wire_error(status, &resp_body));
+    }
+    Ok(())
+}
+
+async fn console_op_stream_shards<E: Env, R: RelayClient, D: ConsoleDispatch<E, R>>(
+    ctx: &ClientCtx<E, R>,
+    table: &str,
+    req: console::StreamShardsRequest,
+) -> Result<console::StreamShardsPage, console::ConsoleError> {
+    let meta = ctx.effective_metadata();
+    if !meta.has_table_schema(table) {
+        return Err(console::ConsoleError::new(404, "no such table"));
+    }
+    let Some(spec) = meta.table_stream(table) else {
+        // The honest "no stream enabled" answer — see
+        // `console::StreamShardsPage`'s own doc: a plain `200`, never a
+        // `404`/error, since a table with no stream is the common case.
+        return Ok(console::StreamShardsPage {
+            enabled: false,
+            view_type: None,
+            stream_arn: None,
+            shards: Vec::new(),
+            last_evaluated_shard_id: None,
+        });
+    };
+    let stream_arn = animus_dynamo::wire::stream_arn(table, &spec.label);
+    let mut body = serde_json::json!({ "StreamArn": stream_arn });
+    if let Some(start) = &req.exclusive_start_shard_id {
+        body["ExclusiveStartShardId"] = serde_json::Value::String(start.clone());
+    }
+    let payload = serde_json::to_vec(&body).unwrap_or_default();
+    let (status, resp_body) =
+        D::execute(ctx, "DynamoDBStreams_20120810.DescribeStream", &payload).await;
+    if status != 200 {
+        return Err(console_wire_error(status, &resp_body));
+    }
+    let value: serde_json::Value = serde_json::from_str(&resp_body).map_err(|e| {
+        console::ConsoleError::new(500, format!("malformed DescribeStream response: {e}"))
+    })?;
+    let sd = &value["StreamDescription"];
+    let shards = sd["Shards"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|s| console::ShardSummary {
+            shard_id: s["ShardId"].as_str().unwrap_or_default().to_string(),
+            parent_shard_id: s["ParentShardId"].as_str().map(str::to_string),
+            starting_sequence_number: s["SequenceNumberRange"]["StartingSequenceNumber"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            ending_sequence_number: s["SequenceNumberRange"]["EndingSequenceNumber"]
+                .as_str()
+                .map(str::to_string),
+        })
+        .collect();
+    Ok(console::StreamShardsPage {
+        enabled: true,
+        view_type: Some(stream_view_type_label(spec.view_type).to_string()),
+        stream_arn: Some(stream_arn),
+        shards,
+        last_evaluated_shard_id: sd["LastEvaluatedShardId"].as_str().map(str::to_string),
+    })
+}
+
+async fn console_op_get_shard_iterator<E: Env, R: RelayClient, D: ConsoleDispatch<E, R>>(
+    ctx: &ClientCtx<E, R>,
+    table: &str,
+    req: console::GetShardIteratorRequest,
+) -> Result<String, console::ConsoleError> {
+    let meta = ctx.effective_metadata();
+    if !meta.has_table_schema(table) {
+        return Err(console::ConsoleError::new(404, "no such table"));
+    }
+    let Some(spec) = meta.table_stream(table) else {
+        return Err(console::ConsoleError::new(
+            400,
+            "this table has no stream enabled",
+        ));
+    };
+    let stream_arn = animus_dynamo::wire::stream_arn(table, &spec.label);
+    let mut body = serde_json::json!({
+        "StreamArn": stream_arn,
+        "ShardId": req.shard_id,
+        "ShardIteratorType": req.iterator_type,
+    });
+    if let Some(seq) = &req.sequence_number {
+        body["SequenceNumber"] = serde_json::Value::String(seq.clone());
+    }
+    let payload = serde_json::to_vec(&body).unwrap_or_default();
+    let (status, resp_body) =
+        D::execute(ctx, "DynamoDBStreams_20120810.GetShardIterator", &payload).await;
+    if status != 200 {
+        return Err(console_wire_error(status, &resp_body));
+    }
+    let value: serde_json::Value = serde_json::from_str(&resp_body).map_err(|e| {
+        console::ConsoleError::new(500, format!("malformed GetShardIterator response: {e}"))
+    })?;
+    value["ShardIterator"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| console::ConsoleError::new(500, "GetShardIterator returned no iterator"))
+}
+
+async fn console_op_get_stream_records<E: Env, R: RelayClient, D: ConsoleDispatch<E, R>>(
+    ctx: &ClientCtx<E, R>,
+    _table: &str,
+    req: console::GetStreamRecordsRequest,
+) -> Result<console::StreamRecordsPage, console::ConsoleError> {
+    // No `table`/label check here: `req.shard_iterator` is an opaque
+    // token this same backend's `get_shard_iterator` already minted
+    // against a resolved `StreamArn`, and the real `GetRecords` wire
+    // path (`dynamo_streams::get_records`) independently re-validates
+    // the token's own label against the catalog — a second check here
+    // would just duplicate that gate, not add one.
+    let mut body = serde_json::json!({ "ShardIterator": req.shard_iterator });
+    if let Some(limit) = req.limit {
+        body["Limit"] = serde_json::Value::from(limit);
+    }
+    let payload = serde_json::to_vec(&body).unwrap_or_default();
+    let (status, resp_body) =
+        D::execute(ctx, "DynamoDBStreams_20120810.GetRecords", &payload).await;
+    if status != 200 {
+        return Err(console_wire_error(status, &resp_body));
+    }
+    let value: serde_json::Value = serde_json::from_str(&resp_body).map_err(|e| {
+        console::ConsoleError::new(500, format!("malformed GetRecords response: {e}"))
+    })?;
+    let records = value["Records"].as_array().cloned().unwrap_or_default();
+    let next_shard_iterator = value["NextShardIterator"].as_str().map(str::to_string);
+    Ok(console::StreamRecordsPage {
+        records,
+        next_shard_iterator,
+    })
+}
+
 /// animusd console's mutating-endpoint seam (ADR 0052 PR3, widened by PR6's
 /// `create_table`) — [`console::ConsoleBackend`]'s PRODUCTION implementor
 /// (ADR 0061 rung H, C-08 PR 2 rework: concrete `ClientCtx`, `E = ProdEnv,
@@ -4136,265 +4806,11 @@ impl console::ConsoleBackend for ClientCtx {
         &self,
         req: console::CreateTableRequest,
     ) -> Result<console::TableDetail, console::ConsoleError> {
-        // -- client-side validation: every case that would otherwise reach
-        // the wire only to bounce back as a decode error gets a clear
-        // message here instead, and the two cases this PR's brief calls out
-        // by name (an LSI with no sort key attribute of its own, and a
-        // table declaring no sort key at all while still declaring an LSI)
-        // are both rejected before a single byte reaches `execute_routed`.
-        let table_name = req.table_name.trim();
-        if table_name.is_empty() {
-            return Err(console::ConsoleError::new(400, "table_name is required"));
-        }
-        if req.partition_key.name.trim().is_empty() {
-            return Err(console::ConsoleError::new(
-                400,
-                "partition key name is required",
-            ));
-        }
-        if !is_valid_key_attribute_type(&req.partition_key.attribute_type) {
-            return Err(console::ConsoleError::new(
-                400,
-                "partition key attribute_type must be S, N, or B",
-            ));
-        }
-        if let Some(sk) = &req.sort_key {
-            if sk.name.trim().is_empty() {
-                return Err(console::ConsoleError::new(400, "sort key name is required"));
-            }
-            if !is_valid_key_attribute_type(&sk.attribute_type) {
-                return Err(console::ConsoleError::new(
-                    400,
-                    "sort key attribute_type must be S, N, or B",
-                ));
-            }
-        }
-        for lsi in &req.lsis {
-            if lsi.index_name.trim().is_empty() {
-                return Err(console::ConsoleError::new(
-                    400,
-                    "LSI index_name is required",
-                ));
-            }
-            if lsi.sort_attribute.trim().is_empty() {
-                return Err(console::ConsoleError::new(
-                    400,
-                    format!("LSI `{}` needs a sort key attribute", lsi.index_name),
-                ));
-            }
-            if req.sort_key.is_none() {
-                return Err(console::ConsoleError::new(
-                    400,
-                    "declaring an LSI requires the table to have its own sort key",
-                ));
-            }
-        }
-        for gsi in &req.gsis {
-            if gsi.index_name.trim().is_empty() {
-                return Err(console::ConsoleError::new(
-                    400,
-                    "GSI index_name is required",
-                ));
-            }
-            if gsi.hash_attribute.trim().is_empty() {
-                return Err(console::ConsoleError::new(
-                    400,
-                    format!("GSI `{}` needs a hash attribute", gsi.index_name),
-                ));
-            }
-            if gsi.projection_type == "INCLUDE"
-                && gsi
-                    .projection_non_key_attributes
-                    .as_ref()
-                    .is_none_or(|a| a.is_empty())
-            {
-                return Err(console::ConsoleError::new(
-                    400,
-                    format!(
-                        "GSI `{}`'s INCLUDE projection needs at least one attribute",
-                        gsi.index_name
-                    ),
-                ));
-            }
-        }
-        if req.stream_enabled
-            && req
-                .stream_view_type
-                .as_deref()
-                .is_none_or(|s| s.trim().is_empty())
-        {
-            return Err(console::ConsoleError::new(
-                400,
-                "stream_view_type is required to enable a stream",
-            ));
-        }
-        if req.ttl_enabled
-            && req
-                .ttl_attribute_name
-                .as_deref()
-                .is_none_or(|s| s.trim().is_empty())
-        {
-            return Err(console::ConsoleError::new(
-                400,
-                "ttl_attribute_name is required to enable TTL",
-            ));
-        }
-
-        // -- build the real CreateTable wire body. Deliberately no
-        // `AttributeDefinitions` entry for any GSI/LSI key attribute — see
-        // `console::CreateTableRequest`'s own doc for why sending one would
-        // misrepresent what actually gets recorded.
-        let mut key_schema = vec![serde_json::json!({
-            "AttributeName": req.partition_key.name, "KeyType": "HASH",
-        })];
-        let mut attribute_definitions = vec![serde_json::json!({
-            "AttributeName": req.partition_key.name,
-            "AttributeType": req.partition_key.attribute_type,
-        })];
-        if let Some(sk) = &req.sort_key {
-            key_schema.push(serde_json::json!({
-                "AttributeName": sk.name, "KeyType": "RANGE",
-            }));
-            attribute_definitions.push(serde_json::json!({
-                "AttributeName": sk.name, "AttributeType": sk.attribute_type,
-            }));
-        }
-        let mut body = serde_json::json!({
-            "TableName": table_name,
-            "KeySchema": key_schema,
-            "AttributeDefinitions": attribute_definitions,
-        });
-        if !req.gsis.is_empty() {
-            let gsis: Vec<serde_json::Value> = req
-                .gsis
-                .iter()
-                .map(|g| {
-                    let mut key_schema = vec![serde_json::json!({
-                        "AttributeName": g.hash_attribute, "KeyType": "HASH",
-                    })];
-                    if let Some(sort) = g.sort_attribute.as_deref().filter(|s| !s.trim().is_empty())
-                    {
-                        key_schema.push(serde_json::json!({
-                            "AttributeName": sort, "KeyType": "RANGE",
-                        }));
-                    }
-                    let mut projection = serde_json::json!({ "ProjectionType": g.projection_type });
-                    if g.projection_type == "INCLUDE" {
-                        projection["NonKeyAttributes"] = serde_json::Value::Array(
-                            g.projection_non_key_attributes
-                                .clone()
-                                .unwrap_or_default()
-                                .into_iter()
-                                .map(serde_json::Value::String)
-                                .collect(),
-                        );
-                    }
-                    serde_json::json!({
-                        "IndexName": g.index_name,
-                        "KeySchema": key_schema,
-                        "Projection": projection,
-                    })
-                })
-                .collect();
-            body["GlobalSecondaryIndexes"] = serde_json::Value::Array(gsis);
-        }
-        if !req.lsis.is_empty() {
-            let lsis: Vec<serde_json::Value> = req
-                .lsis
-                .iter()
-                .map(|l| {
-                    serde_json::json!({
-                        "IndexName": l.index_name,
-                        "KeySchema": [
-                            {"AttributeName": req.partition_key.name, "KeyType": "HASH"},
-                            {"AttributeName": l.sort_attribute, "KeyType": "RANGE"},
-                        ],
-                    })
-                })
-                .collect();
-            body["LocalSecondaryIndexes"] = serde_json::Value::Array(lsis);
-        }
-        // Roadmap W-11: `AttributeDefinitions` must cover every key
-        // attribute the request's own `KeySchema` names — the base table's
-        // (already declared above) *and* every GSI/LSI's own hash/sort
-        // attribute. This form collects no type for an index-only key
-        // attribute (`CreateGsiRequest`/`CreateLsiRequest` carry key
-        // attribute *names* only — see `console::CreateTableRequest`'s own
-        // doc for why that's a deliberate console-form scope cut, not a
-        // mechanism gap), so default each to `"S"`, the same default
-        // `schema::column_type_for(None)` already applies bridge-side.
-        let declared: std::collections::BTreeSet<String> = body["AttributeDefinitions"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|d| d["AttributeName"].as_str().map(str::to_owned))
-            .collect();
-        let mut extra_names: Vec<String> = Vec::new();
-        for g in &req.gsis {
-            if !g.hash_attribute.trim().is_empty() {
-                extra_names.push(g.hash_attribute.clone());
-            }
-            if let Some(sort) = g.sort_attribute.as_deref().filter(|s| !s.trim().is_empty()) {
-                extra_names.push(sort.to_owned());
-            }
-        }
-        for l in &req.lsis {
-            if !l.sort_attribute.trim().is_empty() {
-                extra_names.push(l.sort_attribute.clone());
-            }
-        }
-        let mut seen = declared;
-        let defs = body["AttributeDefinitions"].as_array_mut().unwrap();
-        for name in extra_names {
-            if seen.insert(name.clone()) {
-                defs.push(serde_json::json!({
-                    "AttributeName": name, "AttributeType": "S",
-                }));
-            }
-        }
-        if req.stream_enabled {
-            body["StreamSpecification"] = serde_json::json!({
-                "StreamEnabled": true,
-                "StreamViewType": req.stream_view_type.as_deref().unwrap_or_default(),
-            });
-        }
-        let payload = serde_json::to_vec(&body).unwrap_or_default();
-        let (status, resp_body) =
-            crate::dynamo::execute_routed(self, "DynamoDB_20120810.CreateTable", &payload).await;
-        if status != 200 {
-            return Err(console_wire_error(status, &resp_body));
-        }
-
-        // The table now exists; TTL is not part of `CreateTable`'s own wire
-        // shape (`animus_dynamo::wire::Operation::CreateTable` carries no
-        // TTL field at all — ADR 0051's `UpdateTimeToLive` is a separate
-        // call even for a brand-new table), so enable it as a follow-up
-        // call, same shape `set_ttl` already uses.
-        if req.ttl_enabled {
-            let ttl_body = serde_json::json!({
-                "TableName": table_name,
-                "TimeToLiveSpecification": {
-                    "Enabled": true,
-                    "AttributeName": req.ttl_attribute_name.as_deref().unwrap_or_default(),
-                },
-            });
-            let payload = serde_json::to_vec(&ttl_body).unwrap_or_default();
-            let (status, resp_body) =
-                crate::dynamo::execute_routed(self, "DynamoDB_20120810.UpdateTimeToLive", &payload)
-                    .await;
-            if status != 200 {
-                return Err(console_wire_error(status, &resp_body));
-            }
-        }
-
-        let meta = self.metadata_fresh().await;
-        console_table_detail(self, &meta, table_name).ok_or_else(|| {
-            console::ConsoleError::new(500, "table created but not found in the catalog")
-        })
+        console_op_create_table::<_, _, ProductionDispatch>(self, req).await
     }
 
     async fn table_detail(&self, table: &str) -> Option<console::TableDetail> {
-        console_table_detail(self, &self.effective_metadata(), table)
+        console_op_table_detail::<_, _, ProductionDispatch>(self, table).await
     }
 
     async fn add_gsi(
@@ -4402,17 +4818,11 @@ impl console::ConsoleBackend for ClientCtx {
         table: &str,
         req: console::AddGsiRequest,
     ) -> Result<console::GsiDetail, console::ConsoleError> {
-        let payload = console_add_gsi_payload(table, &req)?;
-        let (status, resp_body) =
-            crate::dynamo::execute_routed(self, "DynamoDB_20120810.UpdateTable", &payload).await;
-        console_add_gsi_result(self, table, &req.index_name, status, &resp_body).await
+        console_op_add_gsi::<_, _, ProductionDispatch>(self, table, req).await
     }
 
     async fn drop_gsi(&self, table: &str, index: &str) -> Result<(), console::ConsoleError> {
-        let payload = console_drop_gsi_payload(table, index);
-        let (status, resp_body) =
-            crate::dynamo::execute_routed(self, "DynamoDB_20120810.UpdateTable", &payload).await;
-        console_drop_gsi_result(status, &resp_body)
+        console_op_drop_gsi::<_, _, ProductionDispatch>(self, table, index).await
     }
 
     async fn set_stream(
@@ -4420,34 +4830,7 @@ impl console::ConsoleBackend for ClientCtx {
         table: &str,
         req: console::SetStreamRequest,
     ) -> Result<console::StreamSummary, console::ConsoleError> {
-        let body = if req.enabled {
-            let Some(view_type) = req.view_type.as_deref().filter(|s| !s.trim().is_empty()) else {
-                return Err(console::ConsoleError::new(
-                    400,
-                    "view_type is required to enable a stream",
-                ));
-            };
-            serde_json::json!({
-                "TableName": table,
-                "StreamSpecification": {"StreamEnabled": true, "StreamViewType": view_type},
-            })
-        } else {
-            serde_json::json!({
-                "TableName": table,
-                "StreamSpecification": {"StreamEnabled": false},
-            })
-        };
-        let payload = serde_json::to_vec(&body).unwrap_or_default();
-        let (status, resp_body) =
-            crate::dynamo::execute_routed(self, "DynamoDB_20120810.UpdateTable", &payload).await;
-        if status != 200 {
-            return Err(console_wire_error(status, &resp_body));
-        }
-        let meta = self.metadata_fresh().await;
-        let Some(schema) = meta.table_schema(table) else {
-            return Err(console::ConsoleError::new(404, "no such table"));
-        };
-        Ok(console_stream_summary(schema))
+        console_op_set_stream::<_, _, ProductionDispatch>(self, table, req).await
     }
 
     async fn set_ttl(
@@ -4455,41 +4838,11 @@ impl console::ConsoleBackend for ClientCtx {
         table: &str,
         req: console::SetTtlRequest,
     ) -> Result<console::TtlSummary, console::ConsoleError> {
-        let Some(attribute_name) = req
-            .attribute_name
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-        else {
-            return Err(console::ConsoleError::new(
-                400,
-                "attribute_name is required",
-            ));
-        };
-        let body = serde_json::json!({
-            "TableName": table,
-            "TimeToLiveSpecification": {"Enabled": req.enabled, "AttributeName": attribute_name},
-        });
-        let payload = serde_json::to_vec(&body).unwrap_or_default();
-        let (status, resp_body) =
-            crate::dynamo::execute_routed(self, "DynamoDB_20120810.UpdateTimeToLive", &payload)
-                .await;
-        if status != 200 {
-            return Err(console_wire_error(status, &resp_body));
-        }
-        let meta = self.metadata_fresh().await;
-        let Some(schema) = meta.table_schema(table) else {
-            return Err(console::ConsoleError::new(404, "no such table"));
-        };
-        Ok(console_ttl_summary(schema))
+        console_op_set_ttl::<_, _, ProductionDispatch>(self, table, req).await
     }
 
     async fn delete_table(&self, table: &str) -> Result<(), console::ConsoleError> {
-        if !self.metadata_fresh().await.has_table_schema(table) {
-            return Err(console::ConsoleError::new(404, "no such table"));
-        }
-        self.drop_table(table.to_string())
-            .await
-            .map_err(|e| console::ConsoleError::new(409, e))
+        console_op_delete_table::<_, _, ProductionDispatch>(self, table).await
     }
 
     async fn scan_items(
@@ -4497,23 +4850,7 @@ impl console::ConsoleBackend for ClientCtx {
         table: &str,
         req: console::ScanItemsRequest,
     ) -> Result<console::ItemsPage, console::ConsoleError> {
-        let mut body = serde_json::json!({ "TableName": table });
-        if let Some(index_name) = &req.index_name {
-            body["IndexName"] = serde_json::Value::String(index_name.clone());
-        }
-        if let Some(limit) = req.limit {
-            body["Limit"] = serde_json::Value::from(limit);
-        }
-        if let Some(key) = req.exclusive_start_key {
-            body["ExclusiveStartKey"] = serde_json::Value::Object(key);
-        }
-        let payload = serde_json::to_vec(&body).unwrap_or_default();
-        let (status, resp_body) =
-            crate::dynamo::execute_routed(self, "DynamoDB_20120810.Scan", &payload).await;
-        if status != 200 {
-            return Err(console_wire_error(status, &resp_body));
-        }
-        console_parse_items_page(&resp_body)
+        console_op_scan_items::<_, _, ProductionDispatch>(self, table, req).await
     }
 
     async fn query_items(
@@ -4521,68 +4858,7 @@ impl console::ConsoleBackend for ClientCtx {
         table: &str,
         req: console::QueryItemsRequest,
     ) -> Result<console::ItemsPage, console::ConsoleError> {
-        let meta = self.effective_metadata();
-        let Some(schema) = meta.table_schema(table) else {
-            return Err(console::ConsoleError::new(404, "no such table"));
-        };
-        // Resolve the partition/sort attribute *names* to query by, server-side
-        // — `console.rs` never imports a schema-catalog type, so the client
-        // sends only the index name (a real closed set, from this same
-        // table's own `TableDetail`) and the raw key *values*, never a
-        // hand-typed attribute name. See `console::QueryItemsRequest`'s doc.
-        let (pk_name, sk_name) = match &req.index_name {
-            None => (
-                schema.partition_key.clone(),
-                schema.clustering_keys.first().cloned(),
-            ),
-            Some(index_name) => {
-                let Some(idx) = schema.indexes.iter().find(|i| &i.name == index_name) else {
-                    return Err(console::ConsoleError::new(404, "no such index"));
-                };
-                (idx.hash_attribute.clone(), idx.sort_attribute.clone())
-            }
-        };
-        let mut key_condition = format!("{pk_name} = :pk_value");
-        let mut expr_values = serde_json::Map::new();
-        expr_values.insert(":pk_value".to_string(), req.partition_value.clone());
-        if let Some(sort_condition) = &req.sort_condition {
-            let Some(sk_name) = &sk_name else {
-                return Err(console::ConsoleError::new(
-                    400,
-                    "this table/index has no sort key to condition on",
-                ));
-            };
-            match sort_condition {
-                console::SortKeyQuery::Equals { value } => {
-                    key_condition.push_str(&format!(" AND {sk_name} = :sk_value"));
-                    expr_values.insert(":sk_value".to_string(), value.clone());
-                }
-                console::SortKeyQuery::Between { lo, hi } => {
-                    key_condition.push_str(&format!(" AND {sk_name} BETWEEN :sk_lo AND :sk_hi"));
-                    expr_values.insert(":sk_lo".to_string(), lo.clone());
-                    expr_values.insert(":sk_hi".to_string(), hi.clone());
-                }
-                console::SortKeyQuery::BeginsWith { value } => {
-                    key_condition.push_str(&format!(" AND begins_with({sk_name}, :sk_value)"));
-                    expr_values.insert(":sk_value".to_string(), value.clone());
-                }
-            }
-        }
-        let mut body = serde_json::json!({
-            "TableName": table,
-            "KeyConditionExpression": key_condition,
-            "ExpressionAttributeValues": expr_values,
-        });
-        if let Some(index_name) = &req.index_name {
-            body["IndexName"] = serde_json::Value::String(index_name.clone());
-        }
-        let payload = serde_json::to_vec(&body).unwrap_or_default();
-        let (status, resp_body) =
-            crate::dynamo::execute_routed(self, "DynamoDB_20120810.Query", &payload).await;
-        if status != 200 {
-            return Err(console_wire_error(status, &resp_body));
-        }
-        console_parse_items_page(&resp_body)
+        console_op_query_items::<_, _, ProductionDispatch>(self, table, req).await
     }
 
     async fn get_item(
@@ -4590,17 +4866,7 @@ impl console::ConsoleBackend for ClientCtx {
         table: &str,
         key: console::WireItem,
     ) -> Result<Option<console::WireItem>, console::ConsoleError> {
-        let body = serde_json::json!({ "TableName": table, "Key": serde_json::Value::Object(key) });
-        let payload = serde_json::to_vec(&body).unwrap_or_default();
-        let (status, resp_body) =
-            crate::dynamo::execute_routed(self, "DynamoDB_20120810.GetItem", &payload).await;
-        if status != 200 {
-            return Err(console_wire_error(status, &resp_body));
-        }
-        let value: serde_json::Value = serde_json::from_str(&resp_body).map_err(|e| {
-            console::ConsoleError::new(500, format!("malformed GetItem response: {e}"))
-        })?;
-        Ok(value.get("Item").and_then(|v| v.as_object().cloned()))
+        console_op_get_item::<_, _, ProductionDispatch>(self, table, key).await
     }
 
     async fn put_item(
@@ -4608,15 +4874,7 @@ impl console::ConsoleBackend for ClientCtx {
         table: &str,
         item: console::WireItem,
     ) -> Result<(), console::ConsoleError> {
-        let body =
-            serde_json::json!({ "TableName": table, "Item": serde_json::Value::Object(item) });
-        let payload = serde_json::to_vec(&body).unwrap_or_default();
-        let (status, resp_body) =
-            crate::dynamo::execute_routed(self, "DynamoDB_20120810.PutItem", &payload).await;
-        if status != 200 {
-            return Err(console_wire_error(status, &resp_body));
-        }
-        Ok(())
+        console_op_put_item::<_, _, ProductionDispatch>(self, table, item).await
     }
 
     async fn delete_item(
@@ -4624,14 +4882,7 @@ impl console::ConsoleBackend for ClientCtx {
         table: &str,
         key: console::WireItem,
     ) -> Result<(), console::ConsoleError> {
-        let body = serde_json::json!({ "TableName": table, "Key": serde_json::Value::Object(key) });
-        let payload = serde_json::to_vec(&body).unwrap_or_default();
-        let (status, resp_body) =
-            crate::dynamo::execute_routed(self, "DynamoDB_20120810.DeleteItem", &payload).await;
-        if status != 200 {
-            return Err(console_wire_error(status, &resp_body));
-        }
-        Ok(())
+        console_op_delete_item::<_, _, ProductionDispatch>(self, table, key).await
     }
 
     async fn stream_shards(
@@ -4639,64 +4890,7 @@ impl console::ConsoleBackend for ClientCtx {
         table: &str,
         req: console::StreamShardsRequest,
     ) -> Result<console::StreamShardsPage, console::ConsoleError> {
-        let meta = self.effective_metadata();
-        if !meta.has_table_schema(table) {
-            return Err(console::ConsoleError::new(404, "no such table"));
-        }
-        let Some(spec) = meta.table_stream(table) else {
-            // The honest "no stream enabled" answer — see
-            // `console::StreamShardsPage`'s own doc: a plain `200`, never a
-            // `404`/error, since a table with no stream is the common case.
-            return Ok(console::StreamShardsPage {
-                enabled: false,
-                view_type: None,
-                stream_arn: None,
-                shards: Vec::new(),
-                last_evaluated_shard_id: None,
-            });
-        };
-        let stream_arn = animus_dynamo::wire::stream_arn(table, &spec.label);
-        let mut body = serde_json::json!({ "StreamArn": stream_arn });
-        if let Some(start) = &req.exclusive_start_shard_id {
-            body["ExclusiveStartShardId"] = serde_json::Value::String(start.clone());
-        }
-        let payload = serde_json::to_vec(&body).unwrap_or_default();
-        let (status, resp_body) = crate::dynamo::execute_routed(
-            self,
-            "DynamoDBStreams_20120810.DescribeStream",
-            &payload,
-        )
-        .await;
-        if status != 200 {
-            return Err(console_wire_error(status, &resp_body));
-        }
-        let value: serde_json::Value = serde_json::from_str(&resp_body).map_err(|e| {
-            console::ConsoleError::new(500, format!("malformed DescribeStream response: {e}"))
-        })?;
-        let sd = &value["StreamDescription"];
-        let shards = sd["Shards"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|s| console::ShardSummary {
-                shard_id: s["ShardId"].as_str().unwrap_or_default().to_string(),
-                parent_shard_id: s["ParentShardId"].as_str().map(str::to_string),
-                starting_sequence_number: s["SequenceNumberRange"]["StartingSequenceNumber"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string(),
-                ending_sequence_number: s["SequenceNumberRange"]["EndingSequenceNumber"]
-                    .as_str()
-                    .map(str::to_string),
-            })
-            .collect();
-        Ok(console::StreamShardsPage {
-            enabled: true,
-            view_type: Some(stream_view_type_label(spec.view_type).to_string()),
-            stream_arn: Some(stream_arn),
-            shards,
-            last_evaluated_shard_id: sd["LastEvaluatedShardId"].as_str().map(str::to_string),
-        })
+        console_op_stream_shards::<_, _, ProductionDispatch>(self, table, req).await
     }
 
     async fn get_shard_iterator(
@@ -4704,42 +4898,7 @@ impl console::ConsoleBackend for ClientCtx {
         table: &str,
         req: console::GetShardIteratorRequest,
     ) -> Result<String, console::ConsoleError> {
-        let meta = self.effective_metadata();
-        if !meta.has_table_schema(table) {
-            return Err(console::ConsoleError::new(404, "no such table"));
-        }
-        let Some(spec) = meta.table_stream(table) else {
-            return Err(console::ConsoleError::new(
-                400,
-                "this table has no stream enabled",
-            ));
-        };
-        let stream_arn = animus_dynamo::wire::stream_arn(table, &spec.label);
-        let mut body = serde_json::json!({
-            "StreamArn": stream_arn,
-            "ShardId": req.shard_id,
-            "ShardIteratorType": req.iterator_type,
-        });
-        if let Some(seq) = &req.sequence_number {
-            body["SequenceNumber"] = serde_json::Value::String(seq.clone());
-        }
-        let payload = serde_json::to_vec(&body).unwrap_or_default();
-        let (status, resp_body) = crate::dynamo::execute_routed(
-            self,
-            "DynamoDBStreams_20120810.GetShardIterator",
-            &payload,
-        )
-        .await;
-        if status != 200 {
-            return Err(console_wire_error(status, &resp_body));
-        }
-        let value: serde_json::Value = serde_json::from_str(&resp_body).map_err(|e| {
-            console::ConsoleError::new(500, format!("malformed GetShardIterator response: {e}"))
-        })?;
-        value["ShardIterator"]
-            .as_str()
-            .map(str::to_string)
-            .ok_or_else(|| console::ConsoleError::new(500, "GetShardIterator returned no iterator"))
+        console_op_get_shard_iterator::<_, _, ProductionDispatch>(self, table, req).await
     }
 
     async fn get_stream_records(
@@ -4747,32 +4906,7 @@ impl console::ConsoleBackend for ClientCtx {
         _table: &str,
         req: console::GetStreamRecordsRequest,
     ) -> Result<console::StreamRecordsPage, console::ConsoleError> {
-        // No `table`/label check here: `req.shard_iterator` is an opaque
-        // token this same backend's `get_shard_iterator` already minted
-        // against a resolved `StreamArn`, and the real `GetRecords` wire
-        // path (`dynamo_streams::get_records`) independently re-validates
-        // the token's own label against the catalog — a second check here
-        // would just duplicate that gate, not add one.
-        let mut body = serde_json::json!({ "ShardIterator": req.shard_iterator });
-        if let Some(limit) = req.limit {
-            body["Limit"] = serde_json::Value::from(limit);
-        }
-        let payload = serde_json::to_vec(&body).unwrap_or_default();
-        let (status, resp_body) =
-            crate::dynamo::execute_routed(self, "DynamoDBStreams_20120810.GetRecords", &payload)
-                .await;
-        if status != 200 {
-            return Err(console_wire_error(status, &resp_body));
-        }
-        let value: serde_json::Value = serde_json::from_str(&resp_body).map_err(|e| {
-            console::ConsoleError::new(500, format!("malformed GetRecords response: {e}"))
-        })?;
-        let records = value["Records"].as_array().cloned().unwrap_or_default();
-        let next_shard_iterator = value["NextShardIterator"].as_str().map(str::to_string);
-        Ok(console::StreamRecordsPage {
-            records,
-            next_shard_iterator,
-        })
+        console_op_get_stream_records::<_, _, ProductionDispatch>(self, _table, req).await
     }
 }
 /// **The `SimCluster`-facing GENERIC sibling of [`console::ConsoleBackend`]
@@ -4805,274 +4939,11 @@ impl<E: Env, R: RelayClient> console::ConsoleBackend for GenericConsoleBackend<E
         &self,
         req: console::CreateTableRequest,
     ) -> Result<console::TableDetail, console::ConsoleError> {
-        // -- client-side validation: every case that would otherwise reach
-        // the wire only to bounce back as a decode error gets a clear
-        // message here instead, and the two cases this PR's brief calls out
-        // by name (an LSI with no sort key attribute of its own, and a
-        // table declaring no sort key at all while still declaring an LSI)
-        // are both rejected before a single byte reaches `execute_routed`.
-        let table_name = req.table_name.trim();
-        if table_name.is_empty() {
-            return Err(console::ConsoleError::new(400, "table_name is required"));
-        }
-        if req.partition_key.name.trim().is_empty() {
-            return Err(console::ConsoleError::new(
-                400,
-                "partition key name is required",
-            ));
-        }
-        if !is_valid_key_attribute_type(&req.partition_key.attribute_type) {
-            return Err(console::ConsoleError::new(
-                400,
-                "partition key attribute_type must be S, N, or B",
-            ));
-        }
-        if let Some(sk) = &req.sort_key {
-            if sk.name.trim().is_empty() {
-                return Err(console::ConsoleError::new(400, "sort key name is required"));
-            }
-            if !is_valid_key_attribute_type(&sk.attribute_type) {
-                return Err(console::ConsoleError::new(
-                    400,
-                    "sort key attribute_type must be S, N, or B",
-                ));
-            }
-        }
-        for lsi in &req.lsis {
-            if lsi.index_name.trim().is_empty() {
-                return Err(console::ConsoleError::new(
-                    400,
-                    "LSI index_name is required",
-                ));
-            }
-            if lsi.sort_attribute.trim().is_empty() {
-                return Err(console::ConsoleError::new(
-                    400,
-                    format!("LSI `{}` needs a sort key attribute", lsi.index_name),
-                ));
-            }
-            if req.sort_key.is_none() {
-                return Err(console::ConsoleError::new(
-                    400,
-                    "declaring an LSI requires the table to have its own sort key",
-                ));
-            }
-        }
-        for gsi in &req.gsis {
-            if gsi.index_name.trim().is_empty() {
-                return Err(console::ConsoleError::new(
-                    400,
-                    "GSI index_name is required",
-                ));
-            }
-            if gsi.hash_attribute.trim().is_empty() {
-                return Err(console::ConsoleError::new(
-                    400,
-                    format!("GSI `{}` needs a hash attribute", gsi.index_name),
-                ));
-            }
-            if gsi.projection_type == "INCLUDE"
-                && gsi
-                    .projection_non_key_attributes
-                    .as_ref()
-                    .is_none_or(|a| a.is_empty())
-            {
-                return Err(console::ConsoleError::new(
-                    400,
-                    format!(
-                        "GSI `{}`'s INCLUDE projection needs at least one attribute",
-                        gsi.index_name
-                    ),
-                ));
-            }
-        }
-        if req.stream_enabled
-            && req
-                .stream_view_type
-                .as_deref()
-                .is_none_or(|s| s.trim().is_empty())
-        {
-            return Err(console::ConsoleError::new(
-                400,
-                "stream_view_type is required to enable a stream",
-            ));
-        }
-        if req.ttl_enabled
-            && req
-                .ttl_attribute_name
-                .as_deref()
-                .is_none_or(|s| s.trim().is_empty())
-        {
-            return Err(console::ConsoleError::new(
-                400,
-                "ttl_attribute_name is required to enable TTL",
-            ));
-        }
-
-        // -- build the real CreateTable wire body. Deliberately no
-        // `AttributeDefinitions` entry for any GSI/LSI key attribute — see
-        // `console::CreateTableRequest`'s own doc for why sending one would
-        // misrepresent what actually gets recorded.
-        let mut key_schema = vec![serde_json::json!({
-            "AttributeName": req.partition_key.name, "KeyType": "HASH",
-        })];
-        let mut attribute_definitions = vec![serde_json::json!({
-            "AttributeName": req.partition_key.name,
-            "AttributeType": req.partition_key.attribute_type,
-        })];
-        if let Some(sk) = &req.sort_key {
-            key_schema.push(serde_json::json!({
-                "AttributeName": sk.name, "KeyType": "RANGE",
-            }));
-            attribute_definitions.push(serde_json::json!({
-                "AttributeName": sk.name, "AttributeType": sk.attribute_type,
-            }));
-        }
-        let mut body = serde_json::json!({
-            "TableName": table_name,
-            "KeySchema": key_schema,
-            "AttributeDefinitions": attribute_definitions,
-        });
-        if !req.gsis.is_empty() {
-            let gsis: Vec<serde_json::Value> = req
-                .gsis
-                .iter()
-                .map(|g| {
-                    let mut key_schema = vec![serde_json::json!({
-                        "AttributeName": g.hash_attribute, "KeyType": "HASH",
-                    })];
-                    if let Some(sort) = g.sort_attribute.as_deref().filter(|s| !s.trim().is_empty())
-                    {
-                        key_schema.push(serde_json::json!({
-                            "AttributeName": sort, "KeyType": "RANGE",
-                        }));
-                    }
-                    let mut projection = serde_json::json!({ "ProjectionType": g.projection_type });
-                    if g.projection_type == "INCLUDE" {
-                        projection["NonKeyAttributes"] = serde_json::Value::Array(
-                            g.projection_non_key_attributes
-                                .clone()
-                                .unwrap_or_default()
-                                .into_iter()
-                                .map(serde_json::Value::String)
-                                .collect(),
-                        );
-                    }
-                    serde_json::json!({
-                        "IndexName": g.index_name,
-                        "KeySchema": key_schema,
-                        "Projection": projection,
-                    })
-                })
-                .collect();
-            body["GlobalSecondaryIndexes"] = serde_json::Value::Array(gsis);
-        }
-        if !req.lsis.is_empty() {
-            let lsis: Vec<serde_json::Value> = req
-                .lsis
-                .iter()
-                .map(|l| {
-                    serde_json::json!({
-                        "IndexName": l.index_name,
-                        "KeySchema": [
-                            {"AttributeName": req.partition_key.name, "KeyType": "HASH"},
-                            {"AttributeName": l.sort_attribute, "KeyType": "RANGE"},
-                        ],
-                    })
-                })
-                .collect();
-            body["LocalSecondaryIndexes"] = serde_json::Value::Array(lsis);
-        }
-        // Roadmap W-11: `AttributeDefinitions` must cover every key
-        // attribute the request's own `KeySchema` names — the base table's
-        // (already declared above) *and* every GSI/LSI's own hash/sort
-        // attribute. This form collects no type for an index-only key
-        // attribute (`CreateGsiRequest`/`CreateLsiRequest` carry key
-        // attribute *names* only — see `console::CreateTableRequest`'s own
-        // doc for why that's a deliberate console-form scope cut, not a
-        // mechanism gap), so default each to `"S"`, the same default
-        // `schema::column_type_for(None)` already applies bridge-side.
-        let declared: std::collections::BTreeSet<String> = body["AttributeDefinitions"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|d| d["AttributeName"].as_str().map(str::to_owned))
-            .collect();
-        let mut extra_names: Vec<String> = Vec::new();
-        for g in &req.gsis {
-            if !g.hash_attribute.trim().is_empty() {
-                extra_names.push(g.hash_attribute.clone());
-            }
-            if let Some(sort) = g.sort_attribute.as_deref().filter(|s| !s.trim().is_empty()) {
-                extra_names.push(sort.to_owned());
-            }
-        }
-        for l in &req.lsis {
-            if !l.sort_attribute.trim().is_empty() {
-                extra_names.push(l.sort_attribute.clone());
-            }
-        }
-        let mut seen = declared;
-        let defs = body["AttributeDefinitions"].as_array_mut().unwrap();
-        for name in extra_names {
-            if seen.insert(name.clone()) {
-                defs.push(serde_json::json!({
-                    "AttributeName": name, "AttributeType": "S",
-                }));
-            }
-        }
-        if req.stream_enabled {
-            body["StreamSpecification"] = serde_json::json!({
-                "StreamEnabled": true,
-                "StreamViewType": req.stream_view_type.as_deref().unwrap_or_default(),
-            });
-        }
-        let payload = serde_json::to_vec(&body).unwrap_or_default();
-        let (status, resp_body) = crate::dynamo::execute_routed_as_generic(
-            &self.0,
-            &crate::authz::Principal::unrestricted(),
-            "DynamoDB_20120810.CreateTable",
-            &payload,
-        )
-        .await;
-        if status != 200 {
-            return Err(console_wire_error(status, &resp_body));
-        }
-
-        // The table now exists; TTL is not part of `CreateTable`'s own wire
-        // shape (`animus_dynamo::wire::Operation::CreateTable` carries no
-        // TTL field at all — ADR 0051's `UpdateTimeToLive` is a separate
-        // call even for a brand-new table), so enable it as a follow-up
-        // call, same shape `set_ttl` already uses.
-        if req.ttl_enabled {
-            let ttl_body = serde_json::json!({
-                "TableName": table_name,
-                "TimeToLiveSpecification": {
-                    "Enabled": true,
-                    "AttributeName": req.ttl_attribute_name.as_deref().unwrap_or_default(),
-                },
-            });
-            let payload = serde_json::to_vec(&ttl_body).unwrap_or_default();
-            let (status, resp_body) = crate::dynamo::execute_routed_as_generic(
-                &self.0,
-                &crate::authz::Principal::unrestricted(),
-                "DynamoDB_20120810.UpdateTimeToLive",
-                &payload,
-            )
-            .await;
-            if status != 200 {
-                return Err(console_wire_error(status, &resp_body));
-            }
-        }
-
-        let meta = self.0.metadata_fresh().await;
-        console_table_detail(&self.0, &meta, table_name).ok_or_else(|| {
-            console::ConsoleError::new(500, "table created but not found in the catalog")
-        })
+        console_op_create_table::<_, _, GenericDispatch>(&self.0, req).await
     }
 
     async fn table_detail(&self, table: &str) -> Option<console::TableDetail> {
-        console_table_detail(&self.0, &self.0.effective_metadata(), table)
+        console_op_table_detail::<_, _, GenericDispatch>(&self.0, table).await
     }
 
     async fn add_gsi(
@@ -5080,27 +4951,11 @@ impl<E: Env, R: RelayClient> console::ConsoleBackend for GenericConsoleBackend<E
         table: &str,
         req: console::AddGsiRequest,
     ) -> Result<console::GsiDetail, console::ConsoleError> {
-        let payload = console_add_gsi_payload(table, &req)?;
-        let (status, resp_body) = crate::dynamo::execute_routed_as_generic(
-            &self.0,
-            &crate::authz::Principal::unrestricted(),
-            "DynamoDB_20120810.UpdateTable",
-            &payload,
-        )
-        .await;
-        console_add_gsi_result(&self.0, table, &req.index_name, status, &resp_body).await
+        console_op_add_gsi::<_, _, GenericDispatch>(&self.0, table, req).await
     }
 
     async fn drop_gsi(&self, table: &str, index: &str) -> Result<(), console::ConsoleError> {
-        let payload = console_drop_gsi_payload(table, index);
-        let (status, resp_body) = crate::dynamo::execute_routed_as_generic(
-            &self.0,
-            &crate::authz::Principal::unrestricted(),
-            "DynamoDB_20120810.UpdateTable",
-            &payload,
-        )
-        .await;
-        console_drop_gsi_result(status, &resp_body)
+        console_op_drop_gsi::<_, _, GenericDispatch>(&self.0, table, index).await
     }
 
     async fn set_stream(
@@ -5108,39 +4963,7 @@ impl<E: Env, R: RelayClient> console::ConsoleBackend for GenericConsoleBackend<E
         table: &str,
         req: console::SetStreamRequest,
     ) -> Result<console::StreamSummary, console::ConsoleError> {
-        let body = if req.enabled {
-            let Some(view_type) = req.view_type.as_deref().filter(|s| !s.trim().is_empty()) else {
-                return Err(console::ConsoleError::new(
-                    400,
-                    "view_type is required to enable a stream",
-                ));
-            };
-            serde_json::json!({
-                "TableName": table,
-                "StreamSpecification": {"StreamEnabled": true, "StreamViewType": view_type},
-            })
-        } else {
-            serde_json::json!({
-                "TableName": table,
-                "StreamSpecification": {"StreamEnabled": false},
-            })
-        };
-        let payload = serde_json::to_vec(&body).unwrap_or_default();
-        let (status, resp_body) = crate::dynamo::execute_routed_as_generic(
-            &self.0,
-            &crate::authz::Principal::unrestricted(),
-            "DynamoDB_20120810.UpdateTable",
-            &payload,
-        )
-        .await;
-        if status != 200 {
-            return Err(console_wire_error(status, &resp_body));
-        }
-        let meta = self.0.metadata_fresh().await;
-        let Some(schema) = meta.table_schema(table) else {
-            return Err(console::ConsoleError::new(404, "no such table"));
-        };
-        Ok(console_stream_summary(schema))
+        console_op_set_stream::<_, _, GenericDispatch>(&self.0, table, req).await
     }
 
     async fn set_ttl(
@@ -5148,46 +4971,11 @@ impl<E: Env, R: RelayClient> console::ConsoleBackend for GenericConsoleBackend<E
         table: &str,
         req: console::SetTtlRequest,
     ) -> Result<console::TtlSummary, console::ConsoleError> {
-        let Some(attribute_name) = req
-            .attribute_name
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-        else {
-            return Err(console::ConsoleError::new(
-                400,
-                "attribute_name is required",
-            ));
-        };
-        let body = serde_json::json!({
-            "TableName": table,
-            "TimeToLiveSpecification": {"Enabled": req.enabled, "AttributeName": attribute_name},
-        });
-        let payload = serde_json::to_vec(&body).unwrap_or_default();
-        let (status, resp_body) = crate::dynamo::execute_routed_as_generic(
-            &self.0,
-            &crate::authz::Principal::unrestricted(),
-            "DynamoDB_20120810.UpdateTimeToLive",
-            &payload,
-        )
-        .await;
-        if status != 200 {
-            return Err(console_wire_error(status, &resp_body));
-        }
-        let meta = self.0.metadata_fresh().await;
-        let Some(schema) = meta.table_schema(table) else {
-            return Err(console::ConsoleError::new(404, "no such table"));
-        };
-        Ok(console_ttl_summary(schema))
+        console_op_set_ttl::<_, _, GenericDispatch>(&self.0, table, req).await
     }
 
     async fn delete_table(&self, table: &str) -> Result<(), console::ConsoleError> {
-        if !self.0.metadata_fresh().await.has_table_schema(table) {
-            return Err(console::ConsoleError::new(404, "no such table"));
-        }
-        self.0
-            .drop_table(table.to_string())
-            .await
-            .map_err(|e| console::ConsoleError::new(409, e))
+        console_op_delete_table::<_, _, GenericDispatch>(&self.0, table).await
     }
 
     async fn scan_items(
@@ -5195,28 +4983,7 @@ impl<E: Env, R: RelayClient> console::ConsoleBackend for GenericConsoleBackend<E
         table: &str,
         req: console::ScanItemsRequest,
     ) -> Result<console::ItemsPage, console::ConsoleError> {
-        let mut body = serde_json::json!({ "TableName": table });
-        if let Some(index_name) = &req.index_name {
-            body["IndexName"] = serde_json::Value::String(index_name.clone());
-        }
-        if let Some(limit) = req.limit {
-            body["Limit"] = serde_json::Value::from(limit);
-        }
-        if let Some(key) = req.exclusive_start_key {
-            body["ExclusiveStartKey"] = serde_json::Value::Object(key);
-        }
-        let payload = serde_json::to_vec(&body).unwrap_or_default();
-        let (status, resp_body) = crate::dynamo::execute_routed_as_generic(
-            &self.0,
-            &crate::authz::Principal::unrestricted(),
-            "DynamoDB_20120810.Scan",
-            &payload,
-        )
-        .await;
-        if status != 200 {
-            return Err(console_wire_error(status, &resp_body));
-        }
-        console_parse_items_page(&resp_body)
+        console_op_scan_items::<_, _, GenericDispatch>(&self.0, table, req).await
     }
 
     async fn query_items(
@@ -5224,73 +4991,7 @@ impl<E: Env, R: RelayClient> console::ConsoleBackend for GenericConsoleBackend<E
         table: &str,
         req: console::QueryItemsRequest,
     ) -> Result<console::ItemsPage, console::ConsoleError> {
-        let meta = self.0.effective_metadata();
-        let Some(schema) = meta.table_schema(table) else {
-            return Err(console::ConsoleError::new(404, "no such table"));
-        };
-        // Resolve the partition/sort attribute *names* to query by, server-side
-        // — `console.rs` never imports a schema-catalog type, so the client
-        // sends only the index name (a real closed set, from this same
-        // table's own `TableDetail`) and the raw key *values*, never a
-        // hand-typed attribute name. See `console::QueryItemsRequest`'s doc.
-        let (pk_name, sk_name) = match &req.index_name {
-            None => (
-                schema.partition_key.clone(),
-                schema.clustering_keys.first().cloned(),
-            ),
-            Some(index_name) => {
-                let Some(idx) = schema.indexes.iter().find(|i| &i.name == index_name) else {
-                    return Err(console::ConsoleError::new(404, "no such index"));
-                };
-                (idx.hash_attribute.clone(), idx.sort_attribute.clone())
-            }
-        };
-        let mut key_condition = format!("{pk_name} = :pk_value");
-        let mut expr_values = serde_json::Map::new();
-        expr_values.insert(":pk_value".to_string(), req.partition_value.clone());
-        if let Some(sort_condition) = &req.sort_condition {
-            let Some(sk_name) = &sk_name else {
-                return Err(console::ConsoleError::new(
-                    400,
-                    "this table/index has no sort key to condition on",
-                ));
-            };
-            match sort_condition {
-                console::SortKeyQuery::Equals { value } => {
-                    key_condition.push_str(&format!(" AND {sk_name} = :sk_value"));
-                    expr_values.insert(":sk_value".to_string(), value.clone());
-                }
-                console::SortKeyQuery::Between { lo, hi } => {
-                    key_condition.push_str(&format!(" AND {sk_name} BETWEEN :sk_lo AND :sk_hi"));
-                    expr_values.insert(":sk_lo".to_string(), lo.clone());
-                    expr_values.insert(":sk_hi".to_string(), hi.clone());
-                }
-                console::SortKeyQuery::BeginsWith { value } => {
-                    key_condition.push_str(&format!(" AND begins_with({sk_name}, :sk_value)"));
-                    expr_values.insert(":sk_value".to_string(), value.clone());
-                }
-            }
-        }
-        let mut body = serde_json::json!({
-            "TableName": table,
-            "KeyConditionExpression": key_condition,
-            "ExpressionAttributeValues": expr_values,
-        });
-        if let Some(index_name) = &req.index_name {
-            body["IndexName"] = serde_json::Value::String(index_name.clone());
-        }
-        let payload = serde_json::to_vec(&body).unwrap_or_default();
-        let (status, resp_body) = crate::dynamo::execute_routed_as_generic(
-            &self.0,
-            &crate::authz::Principal::unrestricted(),
-            "DynamoDB_20120810.Query",
-            &payload,
-        )
-        .await;
-        if status != 200 {
-            return Err(console_wire_error(status, &resp_body));
-        }
-        console_parse_items_page(&resp_body)
+        console_op_query_items::<_, _, GenericDispatch>(&self.0, table, req).await
     }
 
     async fn get_item(
@@ -5298,22 +4999,7 @@ impl<E: Env, R: RelayClient> console::ConsoleBackend for GenericConsoleBackend<E
         table: &str,
         key: console::WireItem,
     ) -> Result<Option<console::WireItem>, console::ConsoleError> {
-        let body = serde_json::json!({ "TableName": table, "Key": serde_json::Value::Object(key) });
-        let payload = serde_json::to_vec(&body).unwrap_or_default();
-        let (status, resp_body) = crate::dynamo::execute_routed_as_generic(
-            &self.0,
-            &crate::authz::Principal::unrestricted(),
-            "DynamoDB_20120810.GetItem",
-            &payload,
-        )
-        .await;
-        if status != 200 {
-            return Err(console_wire_error(status, &resp_body));
-        }
-        let value: serde_json::Value = serde_json::from_str(&resp_body).map_err(|e| {
-            console::ConsoleError::new(500, format!("malformed GetItem response: {e}"))
-        })?;
-        Ok(value.get("Item").and_then(|v| v.as_object().cloned()))
+        console_op_get_item::<_, _, GenericDispatch>(&self.0, table, key).await
     }
 
     async fn put_item(
@@ -5321,20 +5007,7 @@ impl<E: Env, R: RelayClient> console::ConsoleBackend for GenericConsoleBackend<E
         table: &str,
         item: console::WireItem,
     ) -> Result<(), console::ConsoleError> {
-        let body =
-            serde_json::json!({ "TableName": table, "Item": serde_json::Value::Object(item) });
-        let payload = serde_json::to_vec(&body).unwrap_or_default();
-        let (status, resp_body) = crate::dynamo::execute_routed_as_generic(
-            &self.0,
-            &crate::authz::Principal::unrestricted(),
-            "DynamoDB_20120810.PutItem",
-            &payload,
-        )
-        .await;
-        if status != 200 {
-            return Err(console_wire_error(status, &resp_body));
-        }
-        Ok(())
+        console_op_put_item::<_, _, GenericDispatch>(&self.0, table, item).await
     }
 
     async fn delete_item(
@@ -5342,19 +5015,7 @@ impl<E: Env, R: RelayClient> console::ConsoleBackend for GenericConsoleBackend<E
         table: &str,
         key: console::WireItem,
     ) -> Result<(), console::ConsoleError> {
-        let body = serde_json::json!({ "TableName": table, "Key": serde_json::Value::Object(key) });
-        let payload = serde_json::to_vec(&body).unwrap_or_default();
-        let (status, resp_body) = crate::dynamo::execute_routed_as_generic(
-            &self.0,
-            &crate::authz::Principal::unrestricted(),
-            "DynamoDB_20120810.DeleteItem",
-            &payload,
-        )
-        .await;
-        if status != 200 {
-            return Err(console_wire_error(status, &resp_body));
-        }
-        Ok(())
+        console_op_delete_item::<_, _, GenericDispatch>(&self.0, table, key).await
     }
 
     async fn stream_shards(
@@ -5362,65 +5023,7 @@ impl<E: Env, R: RelayClient> console::ConsoleBackend for GenericConsoleBackend<E
         table: &str,
         req: console::StreamShardsRequest,
     ) -> Result<console::StreamShardsPage, console::ConsoleError> {
-        let meta = self.0.effective_metadata();
-        if !meta.has_table_schema(table) {
-            return Err(console::ConsoleError::new(404, "no such table"));
-        }
-        let Some(spec) = meta.table_stream(table) else {
-            // The honest "no stream enabled" answer — see
-            // `console::StreamShardsPage`'s own doc: a plain `200`, never a
-            // `404`/error, since a table with no stream is the common case.
-            return Ok(console::StreamShardsPage {
-                enabled: false,
-                view_type: None,
-                stream_arn: None,
-                shards: Vec::new(),
-                last_evaluated_shard_id: None,
-            });
-        };
-        let stream_arn = animus_dynamo::wire::stream_arn(table, &spec.label);
-        let mut body = serde_json::json!({ "StreamArn": stream_arn });
-        if let Some(start) = &req.exclusive_start_shard_id {
-            body["ExclusiveStartShardId"] = serde_json::Value::String(start.clone());
-        }
-        let payload = serde_json::to_vec(&body).unwrap_or_default();
-        let (status, resp_body) = crate::dynamo::execute_routed_as_generic(
-            &self.0,
-            &crate::authz::Principal::unrestricted(),
-            "DynamoDBStreams_20120810.DescribeStream",
-            &payload,
-        )
-        .await;
-        if status != 200 {
-            return Err(console_wire_error(status, &resp_body));
-        }
-        let value: serde_json::Value = serde_json::from_str(&resp_body).map_err(|e| {
-            console::ConsoleError::new(500, format!("malformed DescribeStream response: {e}"))
-        })?;
-        let sd = &value["StreamDescription"];
-        let shards = sd["Shards"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|s| console::ShardSummary {
-                shard_id: s["ShardId"].as_str().unwrap_or_default().to_string(),
-                parent_shard_id: s["ParentShardId"].as_str().map(str::to_string),
-                starting_sequence_number: s["SequenceNumberRange"]["StartingSequenceNumber"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string(),
-                ending_sequence_number: s["SequenceNumberRange"]["EndingSequenceNumber"]
-                    .as_str()
-                    .map(str::to_string),
-            })
-            .collect();
-        Ok(console::StreamShardsPage {
-            enabled: true,
-            view_type: Some(stream_view_type_label(spec.view_type).to_string()),
-            stream_arn: Some(stream_arn),
-            shards,
-            last_evaluated_shard_id: sd["LastEvaluatedShardId"].as_str().map(str::to_string),
-        })
+        console_op_stream_shards::<_, _, GenericDispatch>(&self.0, table, req).await
     }
 
     async fn get_shard_iterator(
@@ -5428,43 +5031,7 @@ impl<E: Env, R: RelayClient> console::ConsoleBackend for GenericConsoleBackend<E
         table: &str,
         req: console::GetShardIteratorRequest,
     ) -> Result<String, console::ConsoleError> {
-        let meta = self.0.effective_metadata();
-        if !meta.has_table_schema(table) {
-            return Err(console::ConsoleError::new(404, "no such table"));
-        }
-        let Some(spec) = meta.table_stream(table) else {
-            return Err(console::ConsoleError::new(
-                400,
-                "this table has no stream enabled",
-            ));
-        };
-        let stream_arn = animus_dynamo::wire::stream_arn(table, &spec.label);
-        let mut body = serde_json::json!({
-            "StreamArn": stream_arn,
-            "ShardId": req.shard_id,
-            "ShardIteratorType": req.iterator_type,
-        });
-        if let Some(seq) = &req.sequence_number {
-            body["SequenceNumber"] = serde_json::Value::String(seq.clone());
-        }
-        let payload = serde_json::to_vec(&body).unwrap_or_default();
-        let (status, resp_body) = crate::dynamo::execute_routed_as_generic(
-            &self.0,
-            &crate::authz::Principal::unrestricted(),
-            "DynamoDBStreams_20120810.GetShardIterator",
-            &payload,
-        )
-        .await;
-        if status != 200 {
-            return Err(console_wire_error(status, &resp_body));
-        }
-        let value: serde_json::Value = serde_json::from_str(&resp_body).map_err(|e| {
-            console::ConsoleError::new(500, format!("malformed GetShardIterator response: {e}"))
-        })?;
-        value["ShardIterator"]
-            .as_str()
-            .map(str::to_string)
-            .ok_or_else(|| console::ConsoleError::new(500, "GetShardIterator returned no iterator"))
+        console_op_get_shard_iterator::<_, _, GenericDispatch>(&self.0, table, req).await
     }
 
     async fn get_stream_records(
@@ -5472,36 +5039,7 @@ impl<E: Env, R: RelayClient> console::ConsoleBackend for GenericConsoleBackend<E
         _table: &str,
         req: console::GetStreamRecordsRequest,
     ) -> Result<console::StreamRecordsPage, console::ConsoleError> {
-        // No `table`/label check here: `req.shard_iterator` is an opaque
-        // token this same backend's `get_shard_iterator` already minted
-        // against a resolved `StreamArn`, and the real `GetRecords` wire
-        // path (`dynamo_streams::get_records`) independently re-validates
-        // the token's own label against the catalog — a second check here
-        // would just duplicate that gate, not add one.
-        let mut body = serde_json::json!({ "ShardIterator": req.shard_iterator });
-        if let Some(limit) = req.limit {
-            body["Limit"] = serde_json::Value::from(limit);
-        }
-        let payload = serde_json::to_vec(&body).unwrap_or_default();
-        let (status, resp_body) = crate::dynamo::execute_routed_as_generic(
-            &self.0,
-            &crate::authz::Principal::unrestricted(),
-            "DynamoDBStreams_20120810.GetRecords",
-            &payload,
-        )
-        .await;
-        if status != 200 {
-            return Err(console_wire_error(status, &resp_body));
-        }
-        let value: serde_json::Value = serde_json::from_str(&resp_body).map_err(|e| {
-            console::ConsoleError::new(500, format!("malformed GetRecords response: {e}"))
-        })?;
-        let records = value["Records"].as_array().cloned().unwrap_or_default();
-        let next_shard_iterator = value["NextShardIterator"].as_str().map(str::to_string);
-        Ok(console::StreamRecordsPage {
-            records,
-            next_shard_iterator,
-        })
+        console_op_get_stream_records::<_, _, GenericDispatch>(&self.0, _table, req).await
     }
 }
 
