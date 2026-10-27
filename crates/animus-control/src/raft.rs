@@ -5474,25 +5474,9 @@ where
         // Issue #1061: identical reachability proof to `handle_append_resp`'s.
         self.note_departing_reply(&from, now);
         if last_index > 0 {
-            // Transfer complete: the follower installed the snapshot.
-            self.snapshot_send.remove(&from);
-            // Lazy-image discipline (`DRIVER_APPLIED`): once no transfer is in
-            // flight, drop the materialized image instead of retaining a
-            // whole-tablet copy in the core indefinitely — a later straggler
-            // triggers an on-demand rebuild from the engine. Kept while any
-            // other peer's transfer is mid-flight so its chunks stay
-            // byte-identical. In-core state machines keep their eager blob.
-            // Deliberately ignores peers that were sent a chunk but have not
-            // acked yet (unlike `forget_snapshot_transfer`, which keys on
-            // `snapshot_send.is_empty()`); kept as-is, so behaviour is unchanged.
-            if S::DRIVER_APPLIED
-                && !self
-                    .snapshot_send
-                    .values()
-                    .any(|r| r.acked_offset.is_some())
-            {
-                self.snapshot_blob = None;
-            }
+            // Transfer complete: the follower installed the snapshot. Drops
+            // the lazy image once no other transfer is in flight (issue #1392).
+            self.forget_snapshot_transfer(&from);
             let m = self.match_index.entry(from.clone()).or_insert(0);
             *m = (*m).max(last_index);
             // This used to be a bare `insert`, unconditionally overwriting
@@ -6390,10 +6374,15 @@ where
         self.forget_snapshot_transfer(peer);
     }
 
-    /// Forget any in-flight snapshot transfer bookkeeping for `peer` (see
-    /// [`drop_departing`](Self::drop_departing)); releases the cached image
-    /// when this was the last outstanding transfer, mirroring
-    /// `handle_install_snapshot_resp`'s lazy-image discipline.
+    /// Forget any in-flight snapshot transfer bookkeeping for `peer` (a
+    /// completed install, or [`drop_departing`](Self::drop_departing)).
+    /// Lazy-image discipline (`DRIVER_APPLIED`): once no transfer is in flight
+    /// ([`snapshot_transfer_in_flight`](Self::snapshot_transfer_in_flight)),
+    /// drop the materialized image instead of retaining a whole-tablet copy in
+    /// the core indefinitely; a later straggler triggers an on-demand rebuild
+    /// from the engine. Kept while any other peer's transfer is in flight,
+    /// acked or merely sent, so its chunks stay byte-identical and are not
+    /// rebuilt (issue #1392). In-core state machines keep their eager blob.
     fn forget_snapshot_transfer(&mut self, peer: &NodeId) {
         self.snapshot_send.remove(peer);
         if S::DRIVER_APPLIED && self.snapshot_send.is_empty() {
