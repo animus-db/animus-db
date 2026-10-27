@@ -3571,7 +3571,7 @@ replicas at `A = awake_max_per_core x cores` by deferring **bulk** wakes only.
 
 ## Background budget (ADR 0079 layer 3, step 5)
 
-`src/background_budget.rs`: node-local permit pools (snapshot send 2 / receive 2,
+`src/background_budget.rs` (also owns the node `FlushBudget`, `--memtable-budget-bytes`, issue #1389 / ADR 0079 amendment: each tablet engine's flush threshold is its share of a 256 MiB node memtable budget, 64 KiB to 4 MiB; `0` = off): node-local permit pools (snapshot send 2 / receive 2,
 learner catch-up 4, splits 1 on by default; compactions `max(1, cores/2)` only
 with `--cores`, else off; `0` = off). Class L, no gate. Permits are RAII; a pool
 that is full reaps idle-TTL'd permits lazily at the next acquire. The raftkv

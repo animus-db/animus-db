@@ -14664,6 +14664,11 @@ impl LsmTabletFactory {
             engine.set_compaction_gate(gate);
         }
         engine.set_stall_ledger(self.stall_ledger.clone());
+        // Issue #1389: the engine's flush threshold is its share of the
+        // node's memtable budget.
+        if let Some(fb) = self.bg_budget.as_ref().and_then(|b| b.flush_budget()) {
+            engine.set_flush_budget(&fb);
+        }
     }
 }
 
@@ -23510,6 +23515,10 @@ mod sim_cluster_upgrade_corpus;
 #[cfg(test)]
 mod sim_cluster_zone_placement;
 
+/// Issue #1389: many hosted tablets on one node keep their total memtable
+/// bytes within the node's memtable budget (`ANIMUS_FLUSH_BUDGET_SEEDS`).
+#[cfg(test)]
+mod sim_cluster_flush_budget;
 /// ADR 0081 Tier 2: an LSM write stall over `SimCluster` and the DynamoDB wire.
 #[cfg(test)]
 mod sim_cluster_lsm_stall;

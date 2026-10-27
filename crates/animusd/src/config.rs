@@ -642,6 +642,14 @@ pub struct ClusterSettings {
     /// cannot see its disk. Node-local (class L), additive, skipped when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bg_compaction_io_bytes_per_sec: Option<u64>,
+    /// `--memtable-budget-bytes N` (issue #1389, ADR 0079 amendment): the
+    /// node-wide memtable budget, in bytes, that sizes every tablet engine's
+    /// flush threshold as `clamp(budget / active engines, 64 KiB, 4 MiB)`.
+    /// `None` resolves to 256 MiB; `0` turns it off (every engine keeps the
+    /// fixed 64 KiB threshold). Node-local (class L), additive, skipped when
+    /// unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memtable_budget_bytes: Option<u64>,
     /// `--repair-proposals-per-tick R` (ADR 0079 step 6): new repair
     /// (`CasTabletReplicas`) proposals the control leader makes per reconcile
     /// tick. `None` resolves to 8; `0` turns the per-tick limit off. Leader-local
@@ -1054,6 +1062,10 @@ impl ClusterConfig {
         .with_compaction_io(
             s.and_then(|s| s.bg_compaction_io_bytes_per_sec)
                 .unwrap_or(0),
+        )
+        .with_memtable_budget(
+            s.and_then(|s| s.memtable_budget_bytes)
+                .unwrap_or(animus_cp_data::background_budget::DEFAULT_MEMTABLE_BUDGET_BYTES),
         )
     }
 
@@ -1665,6 +1677,7 @@ mod tests {
             bg_splits: Some(2),
             bg_compactions: Some(6),
             bg_compaction_io_bytes_per_sec: Some(64 << 20),
+            memtable_budget_bytes: Some(128 << 20),
             repair_proposals_per_tick: Some(4),
             repair_inflight_max: Some(9),
             region: Some("us".into()),
