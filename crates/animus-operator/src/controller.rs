@@ -619,29 +619,12 @@ async fn advance_control_growth<C: ClusterApi, A: AdminOps>(
     tls_ca: Option<&[u8]>,
     status: &mut AnimusClusterStatus,
 ) -> i32 {
-    // Record that a growth is in progress *before* the first admin call —
-    // a stall (this reconcile's own discovery/add call hanging, timing out,
-    // or failing every reconcile in a row) must be visible from `kubectl get
-    // animuscluster -o yaml` even if nothing below ever narrows the message
-    // further. Every branch below either overwrites this with a more
-    // specific message or clears the condition outright once growth
-    // completes — this call never survives as the final message on a
-    // reconcile that got further than this line.
-    set_condition(
-        status,
-        CONDITION_CONTROL_NODES_GROWING,
-        format!(
-            "growing spec.controlNodes: {previously_applied}/{target} voters confirmed as of \
-             the last successful check; discovering live control-voter truth"
-        ),
-    );
     let Some(voters) =
         discover_control_voters(&ctx.admin, name, ns, target, admin_port, tls_ca).await
     else {
         // Can't observe live truth this reconcile (every ordinal 0..target
         // refused/timed out — still bootstrapping, or a transient blip):
-        // surface that a discovery attempt was made and failed, rather than
-        // leaving only the generic "discovering" message above, and fall
+        // surface that a discovery attempt was made and failed, and fall
         // back to the last confirmed-safe count for the PDB.
         info!(
             cluster = %name,
@@ -1349,37 +1332,34 @@ async fn reconcile<C: ClusterApi, A: AdminOps>(
     let target_control_nodes = cluster.spec.control_nodes_or_default();
     let prior_control_nodes =
         previous_applied_control_nodes(&ctx.cluster_api, &ns, &cluster).await?;
+    // The identical pure rule the webhook enforces on an UPDATE review
+    // (`validate::validate_spec`), so the message below can never disagree
+    // with it.
+    if let Some((prior, violation)) = prior_control_nodes.and_then(|prior| {
+        validate::control_nodes_regression(prior, target_control_nodes).map(|v| (prior, v))
+    }) {
+        warn!(
+            cluster = %name,
+            prior_control_nodes = prior,
+            requested_control_nodes = target_control_nodes,
+            "refusing controlNodes decrease"
+        );
+        set_condition(
+            &mut status,
+            CONDITION_CONTROL_NODES_SHRINK_REJECTED,
+            violation.message,
+        );
+        // Reconcile with the *prior* control-node count so the running
+        // cluster's own role split never actually changes underneath it.
+        let mut pinned = (*cluster).clone();
+        pinned.spec.control_nodes = Some(prior);
+        return finish_reconcile(&pinned, &ctx, &ns, status, prior).await;
+    }
+    status
+        .conditions
+        .retain(|c| c.type_ != CONDITION_CONTROL_NODES_SHRINK_REJECTED);
     let pdb_control_nodes = match prior_control_nodes {
-        Some(prior)
-            if validate::control_nodes_regression(prior, target_control_nodes).is_some() =>
-        {
-            // The condition above is exactly `validate::control_nodes_regression(..).
-            // is_some()` — the identical pure rule the webhook enforces on an
-            // UPDATE review (`validate::validate_spec`) — so the message below,
-            // built from that same function, can never disagree with it.
-            let violation = validate::control_nodes_regression(prior, target_control_nodes)
-                .expect("guard above just proved this is Some");
-            warn!(
-                cluster = %name,
-                prior_control_nodes = prior,
-                requested_control_nodes = target_control_nodes,
-                "refusing controlNodes decrease"
-            );
-            set_condition(
-                &mut status,
-                CONDITION_CONTROL_NODES_SHRINK_REJECTED,
-                violation.message,
-            );
-            // Reconcile with the *prior* control-node count so the running
-            // cluster's own role split never actually changes underneath it.
-            let mut pinned = (*cluster).clone();
-            pinned.spec.control_nodes = Some(prior);
-            return finish_reconcile(&pinned, &ctx, &ns, status, prior).await;
-        }
         Some(prior) => {
-            status
-                .conditions
-                .retain(|c| c.type_ != CONDITION_CONTROL_NODES_SHRINK_REJECTED);
             // Issue #864 (second recurrence, after the ephemeral-storage
             // fix): this used to call `advance_control_growth` only when
             // `target_control_nodes > prior || already_growing` — gating
@@ -1454,12 +1434,7 @@ async fn reconcile<C: ClusterApi, A: AdminOps>(
                 .await
             }
         }
-        None => {
-            status
-                .conditions
-                .retain(|c| c.type_ != CONDITION_CONTROL_NODES_SHRINK_REJECTED);
-            target_control_nodes
-        }
+        None => target_control_nodes,
     };
 
     // Refuse scaling below `controlNodes` — every control-role pod must
