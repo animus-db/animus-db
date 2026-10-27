@@ -20,11 +20,10 @@ use animusd::config::NodeRole;
 use animusd::{
     ClusterConfig, Node, RoleAddrs, SegmentStoreConfig, StorageBackend, StreamSealKnobs,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
 mod support;
+use support::{dynamo, error_code, json};
 
 /// Tiny seal-size trigger so a PITR segment seals within a test's own
 /// budget, mirroring `streams_e2e.rs`'s `tiny_seal_knobs` idea — never wait
@@ -90,53 +89,6 @@ async fn start_single_node_with_knobs(dir: &Path, knobs: StreamSealKnobs) -> (No
         }
     }
     panic!("single node (fast seal) failed to start after 10 attempts: {last_err:?}");
-}
-
-/// One DynamoDB JSON request over a fresh HTTP/1.1 connection → `(status,
-/// body)`. Mirrors every other `tests/dynamo_*.rs` file's identical helper.
-async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
-    let mut stream = TcpStream::connect(addr).await.expect("connect to dynamo");
-    let request = format!(
-        "POST / HTTP/1.1\r\n\
-         Host: animus\r\n\
-         X-Amz-Target: {target}\r\n\
-         Content-Type: application/x-amz-json-1.0\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {body}",
-        body.len(),
-    );
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .expect("send request");
-    stream.flush().await.expect("flush");
-    let mut raw = Vec::new();
-    stream
-        .read_to_end(&mut raw)
-        .await
-        .expect("read full response");
-    let text = String::from_utf8(raw).expect("utf8 response");
-    let (head, payload) = text.split_once("\r\n\r\n").expect("response has a body");
-    let status: u16 = head
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse().ok())
-        .expect("status line");
-    (status, payload.to_string())
-}
-
-fn json(body: &str) -> serde_json::Value {
-    serde_json::from_str(body).unwrap_or_else(|e| panic!("invalid JSON ({e}): {body}"))
-}
-
-fn error_code(body: &str) -> String {
-    json(body)["__type"]
-        .as_str()
-        .map(|t| t.rsplit('#').next().unwrap_or(t).to_owned())
-        .unwrap_or_else(|| panic!("no __type in error body: {body}"))
 }
 
 async fn create_base_table(addr: SocketAddr, table: &str) {

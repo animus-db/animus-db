@@ -24,13 +24,12 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use animus_dynamo::AttributeValue;
-use animusd::{ClientRequest, ClientResponse, read_frame};
+use animusd::{ClientRequest, ClientResponse};
 use serde_json::Value;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
 mod support;
+use support::{call, create_table, dynamo, put_until_ok};
 
 // ---------------------------------------------------------------------------
 // Shared bring-up + protocol helpers (mirrors dynamo_txn.rs).
@@ -82,61 +81,6 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<animusd::Node>, animu
         sleep(Duration::from_millis(50)).await;
     }
     panic!("could not bring up cluster after retries (ports kept getting stolen)");
-}
-
-/// One DynamoDB request over a fresh HTTP/1.1 connection → `(status, body)`.
-async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
-    let mut stream = TcpStream::connect(addr).await.expect("connect to dynamo");
-    let request = format!(
-        "POST / HTTP/1.1\r\n\
-         Host: animus\r\n\
-         X-Amz-Target: {target}\r\n\
-         Content-Type: application/x-amz-json-1.0\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {body}",
-        body.len(),
-    );
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .expect("send request");
-    stream.flush().await.expect("flush");
-    let mut raw = Vec::new();
-    stream
-        .read_to_end(&mut raw)
-        .await
-        .expect("read full response");
-    let text = String::from_utf8(raw).expect("utf8 response");
-    let (head, payload) = text.split_once("\r\n\r\n").expect("response has a body");
-    let status: u16 = head
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse().ok())
-        .expect("status line");
-    (status, payload.to_string())
-}
-
-/// `CreateTable` with a simple `id: S` partition key — no split. Every C2a
-/// test here is single-tablet: a `ConditionCheck` failure is flagged by
-/// `dynamo.rs::run_transact` itself, entirely before any cross-tablet
-/// coordination, so a genuinely split table adds nothing these tests need
-/// (unlike `dynamo_txn.rs`'s own atomicity suite, or this file's own C2b
-/// additions below, which specifically need multiple tablets).
-async fn create_table(dynamo_addr: SocketAddr, table: &str) {
-    let (status, body) = dynamo(
-        dynamo_addr,
-        "DynamoDB_20120810.CreateTable",
-        &format!(
-            r#"{{"TableName":"{table}",
-                "KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}],
-                "AttributeDefinitions":[{{"AttributeName":"id","AttributeType":"S"}}]}}"#
-        ),
-    )
-    .await;
-    assert_eq!(status, 200, "CreateTable({table}) failed: {body}");
 }
 
 /// Parse a `TransactionCanceledException` body's `CancellationReasons` array.
@@ -257,15 +201,6 @@ async fn create_table_pre_split(
     (lower_id, upper_id)
 }
 
-async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
-    let mut stream = animusd::connect_client(addr).await.expect("connect");
-    animusd::write_frame(&mut stream, &req).await.expect("send");
-    read_frame(&mut stream)
-        .await
-        .expect("read")
-        .expect("a reply")
-}
-
 /// Send `request` wrapped in `ClientRequest::Forwarded` directly to `addr` —
 /// copied from `cp_txn.rs`'s helper of the same name (see that file's own
 /// doc for why this bypasses `ClientCtx::cp_txn`'s own routing on purpose).
@@ -278,33 +213,6 @@ async fn call_forwarded(addr: SocketAddr, request: ClientRequest) -> ClientRespo
         },
     )
     .await
-}
-
-/// Provision `table`'s bootstrap tablet via the plain client protocol's
-/// auto-provisioning `Put` — copied from `cp_txn.rs`'s helper of the same
-/// name (retries: provisioning a fresh table can race the control plane's
-/// own tablet-map propagation).
-async fn put_until_ok(addr: SocketAddr, table: &str, key: &[u8], value: &[u8]) {
-    timeout(Duration::from_secs(25), async {
-        loop {
-            match call(
-                addr,
-                ClientRequest::Put {
-                    key: key.to_vec(),
-                    value: value.to_vec(),
-                    table: table.to_string(),
-                },
-            )
-            .await
-            {
-                ClientResponse::PutOk => return,
-                ClientResponse::Error(_) => sleep(Duration::from_millis(150)).await,
-                other => panic!("unexpected put response: {other:?}"),
-            }
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("put {table}/{key:?} did not succeed in 25s"));
 }
 
 /// `Forwarded { TxnPrepare }` only succeeds against a tablet's own current

@@ -25,6 +25,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 mod support;
+use support::json;
 
 /// A fixed test credential pair — the same access-key-id/secret pair
 /// `animus-dynamo`'s own `sigv4` unit tests use (`sigv4.rs`'s `AKID`/
@@ -248,10 +249,6 @@ async fn send_raw(addr: SocketAddr, request: &str) -> (u16, String) {
         .and_then(|code| code.parse().ok())
         .expect("status line");
     (status, payload.to_string())
-}
-
-fn json(body: &str) -> serde_json::Value {
-    serde_json::from_str(body).unwrap_or_else(|e| panic!("invalid JSON ({e}): {body}"))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

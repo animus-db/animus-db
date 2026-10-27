@@ -40,47 +40,10 @@ use animusd::{
     Node, SegmentStoreConfig, StorageBackend, StreamSealKnobs, bind_cluster, start_cluster,
     start_cluster_with_streams,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
 mod support;
-
-/// One DynamoDB JSON request over a fresh HTTP/1.1 connection → `(status,
-/// body)`. Mirrors every other `tests/dynamo_*.rs` file's identical helper.
-async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
-    let mut stream = TcpStream::connect(addr).await.expect("connect to dynamo");
-    let request = format!(
-        "POST / HTTP/1.1\r\n\
-         Host: animus\r\n\
-         X-Amz-Target: {target}\r\n\
-         Content-Type: application/x-amz-json-1.0\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {body}",
-        body.len(),
-    );
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .expect("send request");
-    stream.flush().await.expect("flush");
-    let mut raw = Vec::new();
-    stream
-        .read_to_end(&mut raw)
-        .await
-        .expect("read full response");
-    let text = String::from_utf8(raw).expect("utf8 response");
-    let (head, payload) = text.split_once("\r\n\r\n").expect("response has a body");
-    let status: u16 = head
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse().ok())
-        .expect("status line");
-    (status, payload.to_string())
-}
+use support::{dynamo, field};
 
 async fn await_node_bootstrap(node: &Node) {
     let ready = async {
@@ -114,20 +77,6 @@ async fn await_stream_label_everywhere(nodes: &[Node], table: &str, label: &str)
     timeout(Duration::from_secs(20), converged)
         .await
         .unwrap_or_else(|_| panic!("stream label `{label}` never converged on every node"));
-}
-
-/// Extract a `"LatestStreamLabel":"..."` (or `"StreamViewType":"..."`) field's
-/// value out of a raw JSON response body — a tiny substring parse, matching
-/// this codebase's existing `tests/*.rs` convention of not pulling in a JSON
-/// crate for response assertions.
-fn field(body: &str, name: &str) -> String {
-    let needle = format!("\"{name}\":\"");
-    let start = body
-        .find(&needle)
-        .unwrap_or_else(|| panic!("field `{name}` not found in: {body}"))
-        + needle.len();
-    let end = body[start..].find('"').expect("closing quote") + start;
-    body[start..end].to_owned()
 }
 
 /// `SetTableStream` enable (via `CreateTable`) replicates to every node's

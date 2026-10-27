@@ -114,6 +114,7 @@ use tokio::time::{sleep, timeout};
 
 mod support;
 use support::free_addrs;
+use support::sole_tablet_of;
 
 /// DIAGNOSTIC, kept permanently (issue #670/#950): set to the test's own
 /// start instant so `put`'s per-attempt timing lines share the identical
@@ -363,22 +364,6 @@ async fn put(stream: &mut TcpStream, key: Vec<u8>, value: Vec<u8>) {
             other => panic!("put failed: {other:?}"),
         }
     }
-}
-
-fn sole_tablet_of(node: &Node, table: &str) -> u64 {
-    let meta = node.metadata();
-    let ids: Vec<u64> = meta
-        .tablets
-        .iter()
-        .filter(|(_, t)| t.table.as_deref() == Some(table))
-        .map(|(id, _)| id.0)
-        .collect();
-    assert_eq!(
-        ids.len(),
-        1,
-        "expected exactly one tablet of {table}: {ids:?}"
-    );
-    ids[0]
 }
 
 async fn kickoff_tablet(node: &Node, tablet: u64, split_key: &str) {

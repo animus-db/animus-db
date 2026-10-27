@@ -35,22 +35,12 @@ use std::time::Duration;
 
 use animus_control::{StreamSpec, StreamViewType};
 use animus_tablet::{KeyRange, TabletId};
-use animusd::{
-    ClientRequest, ClientResponse, ColumnType, MetaCommand, Node, TableSchema, read_frame,
-};
+use animusd::{ClientRequest, ClientResponse, ColumnType, MetaCommand, Node, TableSchema};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
 mod support;
-
-async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
-    let mut stream = animusd::connect_client(addr).await.expect("connect");
-    animusd::write_frame(&mut stream, &req).await.expect("send");
-    read_frame(&mut stream)
-        .await
-        .expect("read")
-        .expect("a reply")
-}
+use support::call;
 
 /// Bring up an `n`-node per-process cluster (each its own edge state) —
 /// duplicated fixture, per this codebase's own "sibling test modules keep

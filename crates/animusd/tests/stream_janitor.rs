@@ -34,9 +34,9 @@ use animus_tablet::TabletId;
 use animusd::{Node, SegmentStoreConfig, StorageBackend, StreamSealKnobs, bind_cluster};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::time::sleep;
 
 mod support;
+use support::await_true;
 
 /// Seals almost immediately on any pending byte — mirrors
 /// `dynamo_streams.rs::tiny_seal_knobs`.
@@ -73,22 +73,6 @@ async fn start_streamed_cluster_with_store(
     )
     .await
     .unwrap()
-}
-
-/// Poll a **synchronous** `check` (a plain in-memory comparison — every
-/// `Metadata` this file polls is already fetched into an owned value before
-/// the check runs) until it holds, or panic after `secs`.
-async fn await_true(secs: u64, msg: &str, mut check: impl FnMut() -> bool) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
-    loop {
-        if check() {
-            return;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("{msg} (timed out after {secs}s)");
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
 }
 
 /// One DynamoDB JSON request over a fresh HTTP/1.1 connection.
