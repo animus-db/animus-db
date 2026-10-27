@@ -60,7 +60,7 @@ use crate::dynamo::{
     SCHEMA_COMMIT_TIMEOUT, SCHEMA_POLL_INTERVAL, describe_table_wrapped, enable_stream, internal,
     table_status,
 };
-use crate::mrec_peer::{HealthKey, PeerClient, PeerError};
+use crate::mrec_peer::{PeerClient, PeerError, SagaKey};
 use crate::mrec_shipper::clear_peer_cursors;
 
 /// How long one control message waits for the peer (a `CreateTable` on the
@@ -71,8 +71,6 @@ const LEAVE_ATTEMPTS: u32 = 3;
 /// After a `Deleting` replica is first seen, how long the tablet leaders get
 /// to drop its cursors before the replica row is removed.
 const DELETE_GRACE: Duration = Duration::from_secs(2);
-/// The health-map tablet slot the saga's own per-(table, region) memo uses.
-pub(crate) const SAGA_SLOT: u64 = u64::MAX;
 
 pub(crate) fn gate_open<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>, gate: Gate) -> bool {
     let features = &ctx.edge.version().features;
@@ -571,12 +569,12 @@ pub(crate) async fn mrec_saga_table<E: Env, R: RelayClient>(
     for replica in spec.replicas.iter().filter(|r| !r.local) {
         match replica.status {
             MrecReplicaStatus::Creating => {
-                let key: HealthKey = (table.to_owned(), SAGA_SLOT, replica.region.clone());
+                let key: SagaKey = (table.to_owned(), replica.region.clone());
                 let acked = |ctx: &ClientCtx<E, R>| {
                     ctx.mrec
-                        .health
+                        .saga
                         .lock()
-                        .expect("mrec health poisoned")
+                        .expect("mrec saga memo poisoned")
                         .get(&key)
                         .is_some_and(|h| h.create_acked)
                 };
@@ -654,10 +652,10 @@ async fn step_creating<E: Env, R: RelayClient>(
     match reply {
         Ok(MrecApplyResponse::Done) => {
             ctx.mrec
-                .health
+                .saga
                 .lock()
-                .expect("mrec health poisoned")
-                .entry((table.to_owned(), SAGA_SLOT, region.to_owned()))
+                .expect("mrec saga memo poisoned")
+                .entry((table.to_owned(), region.to_owned()))
                 .or_default()
                 .create_acked = true;
             for other in others {
@@ -698,27 +696,30 @@ async fn step_deleting<E: Env, R: RelayClient>(
     table: &str,
     region: &str,
 ) -> bool {
-    let key: HealthKey = (table.to_owned(), SAGA_SLOT, region.to_owned());
+    let key: SagaKey = (table.to_owned(), region.to_owned());
     let now = ctx.env.now().0;
     let (notified, ready_at) = {
-        let mut h = ctx.mrec.health.lock().expect("mrec health poisoned");
+        let mut h = ctx.mrec.saga.lock().expect("mrec saga memo poisoned");
         let e = h.entry(key.clone()).or_default();
-        if e.retry_after == 0 {
-            e.retry_after = now + u64::try_from(DELETE_GRACE.as_nanos()).unwrap_or(u64::MAX);
-        }
-        (e.failures >= LEAVE_ATTEMPTS || e.caught_up, e.retry_after)
+        let ready_at = *e.delete_ready_at.get_or_insert_with(|| {
+            now + u64::try_from(DELETE_GRACE.as_nanos()).unwrap_or(u64::MAX)
+        });
+        (
+            e.leave_failures >= LEAVE_ATTEMPTS || e.leave_acked,
+            ready_at,
+        )
     };
     if !notified {
         let ok = matches!(
             send_control(ctx, client, region, table, MrecControl::Leave).await,
             Ok(MrecApplyResponse::Done | MrecApplyResponse::Refused { .. })
         );
-        let mut h = ctx.mrec.health.lock().expect("mrec health poisoned");
+        let mut h = ctx.mrec.saga.lock().expect("mrec saga memo poisoned");
         let e = h.entry(key.clone()).or_default();
         if ok {
-            e.caught_up = true;
+            e.leave_acked = true;
         } else {
-            e.failures += 1;
+            e.leave_failures += 1;
         }
         return true;
     }
@@ -731,9 +732,9 @@ async fn step_deleting<E: Env, R: RelayClient>(
     })
     .await;
     ctx.mrec
-        .health
+        .saga
         .lock()
-        .expect("mrec health poisoned")
+        .expect("mrec saga memo poisoned")
         .remove(&key);
     true
 }
@@ -919,11 +920,11 @@ async fn push_overrides<E: Env, R: RelayClient>(
         .iter()
         .filter(|r| !r.local && r.status == MrecReplicaStatus::Active)
     {
-        let key: HealthKey = (table.to_owned(), SAGA_SLOT, target.region.clone());
+        let key: SagaKey = (table.to_owned(), target.region.clone());
         for about in spec.replicas.iter().filter(|r| !r.overrides.is_unset()) {
             let order = about.overrides.order();
             let pushed = {
-                let h = ctx.mrec.health.lock().expect("mrec health poisoned");
+                let h = ctx.mrec.saga.lock().expect("mrec saga memo poisoned");
                 h.get(&key)
                     .and_then(|e| e.overrides_pushed.get(&about.region).copied())
             };
@@ -947,7 +948,7 @@ async fn push_overrides<E: Env, R: RelayClient>(
             .await;
             did = true;
             if matches!(reply, Ok(MrecApplyResponse::Done)) {
-                let mut h = ctx.mrec.health.lock().expect("mrec health poisoned");
+                let mut h = ctx.mrec.saga.lock().expect("mrec saga memo poisoned");
                 h.entry(key.clone())
                     .or_default()
                     .overrides_pushed
@@ -970,8 +971,8 @@ async fn set_ttl<E: Env, R: RelayClient>(
     if r == MrecApplyResponse::Done {
         // The sender has this setting: never echo it back to it (an echo
         // arriving after a newer local change would revert that change).
-        let key: HealthKey = (table.to_owned(), SAGA_SLOT, from.to_owned());
-        let mut h = ctx.mrec.health.lock().expect("mrec health poisoned");
+        let key: SagaKey = (table.to_owned(), from.to_owned());
+        let mut h = ctx.mrec.saga.lock().expect("mrec saga memo poisoned");
         h.entry(key).or_default().ttl_pushed = Some(attribute);
     }
     r
@@ -1030,9 +1031,9 @@ async fn push_ttl<E: Env, R: RelayClient>(
         .iter()
         .filter(|r| !r.local && r.status == MrecReplicaStatus::Active)
     {
-        let key: HealthKey = (table.to_owned(), SAGA_SLOT, r.region.clone());
+        let key: SagaKey = (table.to_owned(), r.region.clone());
         let last = {
-            let h = ctx.mrec.health.lock().expect("mrec health poisoned");
+            let h = ctx.mrec.saga.lock().expect("mrec saga memo poisoned");
             h.get(&key).and_then(|e| e.ttl_pushed.clone())
         };
         let push = match &last {
@@ -1057,7 +1058,7 @@ async fn push_ttl<E: Env, R: RelayClient>(
             did = true;
         }
         if done {
-            let mut h = ctx.mrec.health.lock().expect("mrec health poisoned");
+            let mut h = ctx.mrec.saga.lock().expect("mrec saga memo poisoned");
             h.entry(key).or_default().ttl_pushed = Some(current.clone());
         }
     }

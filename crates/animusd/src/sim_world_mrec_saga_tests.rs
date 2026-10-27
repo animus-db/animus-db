@@ -54,6 +54,7 @@ pub(crate) fn cfg(local: &str, peers: &[&str]) -> Arc<MrecConfig> {
         max_backlog: Duration::from_secs(3600),
         node_tls: None,
         health: Arc::default(),
+        saga: Arc::default(),
         edge_client: Default::default(),
     })
 }
@@ -522,6 +523,21 @@ fn the_admin_global_tables_view_reports_mrec_replicas_and_shipper_health() {
             sh.iter()
                 .all(|r| r["peer"] == "b" && r["last_error"].is_null()),
             "seed={seed}: {t}"
+        );
+        // The saga's own memo (create/TTL/override acks) lives in `MrecConfig::saga`,
+        // not the shipper health map, so it must not appear as a shipper row.
+        assert!(
+            ctx.mrec
+                .saga
+                .lock()
+                .expect("saga")
+                .keys()
+                .any(|k| k.0 == TABLE),
+            "seed={seed}: the saga recorded no memo, so this test proves nothing"
+        );
+        assert!(
+            sh.iter().all(|r| r["tablet"] != u64::MAX),
+            "seed={seed}: the saga memo leaked into the shippers list: {t}"
         );
         assert!(
             sh.iter()
