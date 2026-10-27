@@ -2466,40 +2466,28 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         let voters: Vec<NodeId> = bootstrap_voters.into_iter().collect();
         let profile = self.timing_profile_for(&voters);
         // ADR 0058 Train 2 rung 4: the parent-leader-at-fork replica
-        // campaigns for this child's leadership immediately instead of
-        // waiting out a cold randomized election timeout — see
+        // (`campaign`) campaigns for this child's leadership immediately
+        // instead of waiting out a cold randomized election timeout — see
         // `start_hosted_campaigning`'s own doc for why this is safe.
-        let node = if campaign {
-            RaftKvNode::start_hosted_with_options(
-                self.env.clone(),
-                voters,
-                engine,
-                scope,
-                child.id.0,
-                self.hosted_options(true, true),
-            )
-        } else {
-            // Issue #945: this replica doesn't campaign, but it is exactly
-            // as provably fresh-by-construction as the sibling that does —
-            // both come from this same `materialize_split_child` call, a
-            // brand new `TabletId` minted once, at the fork, from the
-            // parent's own committed entry. Skip the issue #900/#667
-            // boot-time cluster check here too (see `DriveState::
-            // skip_cluster_check`'s doc): gating it on `campaign` alone
-            // left every non-campaigning split replica's own
-            // `handle_request_vote` refusing a real vote to the campaigning
-            // sibling until its own cluster check resolved, silently
-            // degrading ADR 0058 Train 2 rung 4's "no added latency"
-            // deterministic-first-leader optimization on every split.
-            RaftKvNode::start_hosted_with_options(
-                self.env.clone(),
-                voters,
-                engine,
-                scope,
-                child.id.0,
-                self.hosted_options(false, true),
-            )
-        };
+        //
+        // Issue #945: every split replica, campaigning or not, skips the
+        // issue #900/#667 boot-time cluster check (see `DriveState::
+        // skip_cluster_check`'s doc). They are all equally fresh by
+        // construction: they come from this same `materialize_split_child`
+        // call, for a brand new `TabletId` minted once, at the fork, from the
+        // parent's own committed entry. Gating the skip on `campaign` alone
+        // left every non-campaigning split replica's own `handle_request_vote`
+        // refusing a real vote to the campaigning sibling until its own
+        // cluster check resolved, silently degrading rung 4's "no added
+        // latency" deterministic-first-leader optimization on every split.
+        let node = RaftKvNode::start_hosted_with_options(
+            self.env.clone(),
+            voters,
+            engine,
+            scope,
+            child.id.0,
+            self.hosted_options(campaign, true),
+        );
         if let Some(after) = self.quiesce_after {
             node.enable_quiescence(after);
         }
