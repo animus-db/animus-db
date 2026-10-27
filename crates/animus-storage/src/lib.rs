@@ -53,7 +53,9 @@ pub use lsm::{
 };
 pub use lsm::{LsmEngine, LsmOptions, LsmSnapshot, SsTableView, WalRecordView};
 #[cfg(any(test, feature = "legacy-encoders"))]
-pub use lsm::{RowMapper, RowRewriteReport, reframe_wal_to_v1, rewrite_row_values};
+pub use lsm::{
+    RowMapper, RowRewriteReport, reframe_manifest_to_v1, reframe_wal_to_v1, rewrite_row_values,
+};
 pub use memory::{MemoryEngine, MemorySnapshot};
 
 /// A storage key.

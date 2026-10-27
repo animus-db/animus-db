@@ -6,7 +6,7 @@
 //! format back to an older version (`target_back` versions behind current),
 //! restarts on the current code, and verifies every acknowledged write.
 //!
-//! `lsm-wal`, `control-wal` and `shared-wal` are v2 and transcode to v1 for
+//! `lsm-wal`, `lsm-manifest`, `control-wal` and `shared-wal` are v2 and transcode to v1 for
 //! real; every other format is still v1 only, so its only supported target
 //! is the current version and its transcode is the identity. A request for
 //! any unlisted target is an **error** ([`TranscodeError::UnsupportedTarget`]), never a
@@ -271,6 +271,25 @@ fn lsm_wal_transcode(
     }
 }
 
+/// `CMF1` (LSM manifest) v2 -> v1: drop the per-table Bloom hash-scheme byte
+/// (`animus_storage::reframe_manifest_to_v1`). A filter built under the current
+/// scheme cannot be expressed in v1 and is dropped (the table is then gated by
+/// key range alone); legacy-scheme filters survive.
+fn lsm_manifest_transcode(
+    entry: &FormatEntry,
+    bytes: &[u8],
+    target: u32,
+) -> Result<Vec<u8>, TranscodeError> {
+    match target {
+        t if t == entry.current_version => Ok(bytes.to_vec()),
+        1 => animus_storage::reframe_manifest_to_v1(bytes).map_err(|e| TranscodeError::Malformed {
+            format: entry.name,
+            detail: e.to_string(),
+        }),
+        t => Err(entry.unsupported(t)),
+    }
+}
+
 const V1_ONLY: &[VersionSpec] = &[VersionSpec {
     version: 1,
     capabilities: CapabilityMask::ALL,
@@ -301,9 +320,9 @@ pub static TABLE: &[FormatEntry] = &[
     },
     FormatEntry {
         name: "lsm-manifest",
-        current_version: 1,
-        versions: V1_ONLY,
-        transcode: identity_current_only,
+        current_version: 2,
+        versions: V1_V2,
+        transcode: lsm_manifest_transcode,
     },
     FormatEntry {
         name: "lsm-sstable",

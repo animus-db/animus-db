@@ -195,7 +195,7 @@ mod bloom;
 mod sstable;
 mod wal;
 
-use bloom::BloomFilter;
+use bloom::{BloomFilter, HashScheme};
 use sstable::{Record, SsTableMeta, SsTableReader, SsTableWriter};
 use wal::{GroupCommit, WAL_HEADER_LEN, WAL_MAGIC, WAL_MARKER_TAG, WAL_VERSION, WAL_VERSION_V1};
 
@@ -4787,6 +4787,115 @@ mod legacy {
             out
         }
     }
+
+    /// The v1 manifest: table records have no `bloom_scheme` byte; every Bloom
+    /// in it was built with the legacy FNV pair (issue #1389).
+    pub(super) mod manifest_v1 {
+        use super::super::{BloomFilter, Cursor, HashScheme, Manifest, Result, SsTableMeta};
+        #[cfg(any(test, feature = "legacy-encoders"))]
+        use super::super::{MANIFEST_MAGIC, put_bytes, put_opt_bytes};
+
+        /// The v1 manifest body decoder (frozen); `c` is positioned just past the
+        /// version byte. Every v1 Bloom was built with the legacy FNV pair, so the
+        /// result carries [`HashScheme::LegacyFnv`] (upgrade-on-read).
+        pub(in super::super) fn decode_manifest(mut c: Cursor<'_>) -> Result<Manifest> {
+            let next_seq = c.u64()?;
+            let max_version = c.u64()?;
+            let table_count = c.u32()? as usize;
+            // `table_count` is an on-disk length prefix with no CRC protecting it
+            // (unlike the WAL frame codec above) — a corrupted manifest byte could
+            // set it near `u32::MAX`. Cap the requested capacity so that can't
+            // demand a many-GB allocation and trigger an allocator abort; the
+            // actual number of tables decoded is still governed solely by what
+            // the buffer holds.
+            let mut tables = Vec::with_capacity(table_count.min(1 << 20));
+            for _ in 0..table_count {
+                let seq = c.u64()?;
+                let level = c.u32()?;
+                let min_key = c.opt_bytes()?;
+                let max_key = c.opt_bytes()?;
+                let min_version = c.u64()?;
+                let tbl_max_version = c.u64()?;
+                let index_offset = c.u64()?;
+                let index_len = c.u64()?;
+                let file_size = c.u64()?;
+                let has_bloom = c.u8()? != 0;
+                let bloom_k = c.u32()?;
+                let bloom_bits = c.bytes()?;
+                let format = c.u32()?;
+                tables.push(SsTableMeta {
+                    seq,
+                    level,
+                    min_key,
+                    max_key,
+                    min_version,
+                    max_version: tbl_max_version,
+                    index_offset,
+                    index_len,
+                    file_size,
+                    bloom: BloomFilter::from_parts(bloom_bits, bloom_k, HashScheme::LegacyFnv),
+                    has_bloom,
+                    format,
+                });
+            }
+            // Trailer: the live WAL-segment list.
+            let count = c.u32()? as usize;
+            // Capped pre-allocation against an untrusted on-disk length prefix
+            // — see `table_count`'s decode above for why.
+            let mut wal_segments = Vec::with_capacity(count.min(1 << 20));
+            for _ in 0..count {
+                wal_segments.push(c.u64()?);
+            }
+            Ok(Manifest {
+                next_seq,
+                tables,
+                max_version,
+                wal_segments,
+            })
+        }
+
+        /// Test-only legacy encoder (ADR 0073 "Legacy encoders are test-only"):
+        /// a whole v1 manifest image. v1 cannot name a hash scheme, so a Bloom
+        /// built under any scheme other than the legacy one is dropped
+        /// (`has_bloom = false`, which is valid: such a table is gated by key
+        /// range alone) rather than mislabelled.
+        #[cfg(any(test, feature = "legacy-encoders"))]
+        pub(in super::super) fn encode_manifest(m: &Manifest) -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(&MANIFEST_MAGIC);
+            out.push(1);
+            out.extend_from_slice(&m.next_seq.to_be_bytes());
+            out.extend_from_slice(&m.max_version.to_be_bytes());
+            out.extend_from_slice(&(m.tables.len() as u32).to_be_bytes());
+            for t in &m.tables {
+                out.extend_from_slice(&t.seq.to_be_bytes());
+                out.extend_from_slice(&t.level.to_be_bytes());
+                put_opt_bytes(&mut out, &t.min_key);
+                put_opt_bytes(&mut out, &t.max_key);
+                out.extend_from_slice(&t.min_version.to_be_bytes());
+                out.extend_from_slice(&t.max_version.to_be_bytes());
+                out.extend_from_slice(&t.index_offset.to_be_bytes());
+                out.extend_from_slice(&t.index_len.to_be_bytes());
+                out.extend_from_slice(&t.file_size.to_be_bytes());
+                let (bits, k, scheme) = t.bloom.as_parts();
+                let legacy = scheme == HashScheme::LegacyFnv;
+                out.push(u8::from(t.has_bloom && legacy));
+                if legacy {
+                    out.extend_from_slice(&k.to_be_bytes());
+                    put_bytes(&mut out, bits);
+                } else {
+                    out.extend_from_slice(&1u32.to_be_bytes());
+                    put_bytes(&mut out, &[]);
+                }
+                out.extend_from_slice(&t.format.to_be_bytes());
+            }
+            out.extend_from_slice(&(m.wal_segments.len() as u32).to_be_bytes());
+            for &seg in &m.wal_segments {
+                out.extend_from_slice(&seg.to_be_bytes());
+            }
+            out
+        }
+    }
 }
 
 /// Re-frame a current-version (v2) WAL segment image as a v1 image: decode it
@@ -4803,6 +4912,25 @@ pub fn reframe_wal_to_v1(bytes: &[u8]) -> Result<Vec<u8>> {
     }
     let (records, _) = decode_wal(bytes)?;
     Ok(legacy::v1::encode_file(&records))
+}
+
+/// Re-frame a current-version (v2) manifest image as a v1 image: decode it and
+/// re-encode under the v1 layout, which has no Bloom hash-scheme byte. A table
+/// whose Bloom was built under the current scheme loses its filter (a table
+/// without one is gated by key range alone, which is always correct); legacy
+/// -scheme filters are kept. The upgrade-restart harness's transcode for
+/// `lsm-manifest` (ADR 0073 P1-D, issue #1389).
+///
+/// # Errors
+/// Whatever [`decode_manifest`] reports for `bytes`.
+#[cfg(any(test, feature = "legacy-encoders"))]
+pub fn reframe_manifest_to_v1(bytes: &[u8]) -> Result<Vec<u8>> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(legacy::manifest_v1::encode_manifest(&decode_manifest(
+        bytes,
+    )?))
 }
 
 /// A row-value mapper for [`rewrite_row_values`]: `(key, value)` -> the new
@@ -4935,6 +5063,9 @@ pub async fn rewrite_row_values<E: Env>(
             continue;
         }
         let mut manifest = decode_manifest(&bytes)?;
+        // Re-encode at the version the manifest already has (like a WAL
+        // segment), so a transcoded-back v1 manifest stays v1.
+        let manifest_v1 = bytes.get(4) == Some(&1);
         let mut manifest_dirty = false;
         for i in 0..manifest.tables.len() {
             let meta = manifest.tables[i].clone();
@@ -4972,9 +5103,12 @@ pub async fn rewrite_row_values<E: Env>(
             report.files_rewritten.push(file);
         }
         if manifest_dirty {
-            env.replace(mfile, &encode_manifest(&manifest))
-                .await
-                .map_err(io)?;
+            let out = if manifest_v1 {
+                legacy::manifest_v1::encode_manifest(&manifest)
+            } else {
+                encode_manifest(&manifest)
+            };
+            env.replace(mfile, &out).await.map_err(io)?;
         }
     }
     Ok(report)
@@ -5717,7 +5851,10 @@ mod wal_format_fixture_tests {
 //   | min_key: opt_bytes | max_key: opt_bytes
 //   | min_version(u64) | max_version(u64)
 //   | index_offset(u64) | index_len(u64) | file_size(u64)
-//   | has_bloom(u8) | bloom_k(u32) | bloom_bits: bytes | format(u32)
+//   | has_bloom(u8) | bloom_k(u32) | bloom_scheme(u8, v2+) | bloom_bits: bytes
+//   | format(u32)
+//
+//   bloom_scheme := 0 legacy FNV pair (what every v1 filter used) | 1 SplitMix
 //
 //   opt_bytes := present(u8) [ len(u32) bytes ]   (present 0 => None)
 //   bytes     := len(u32) bytes
@@ -5741,8 +5878,11 @@ mod wal_format_fixture_tests {
 /// Binary manifest magic: "CMF1" (AnimusDB ManiFest, format family 1).
 const MANIFEST_MAGIC: [u8; 4] = *b"CMF1";
 /// Binary manifest format version (within the `CMF1` family). ADR 0073 Phase 0
-/// reset the counter to 1; the live WAL-segment list is part of v1.
-const MANIFEST_VERSION: u8 = 1;
+/// reset the counter to 1; the live WAL-segment list is part of v1. **v2**
+/// (issue #1389) tags every table's Bloom filter with its hash scheme
+/// (`bloom_scheme`), because v1 filters were built with correlated FNV base
+/// hashes and must keep being probed with them; new filters use SplitMix.
+const MANIFEST_VERSION: u8 = 2;
 
 /// Append a length-prefixed (`u32`) byte string.
 fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
@@ -5780,8 +5920,9 @@ fn encode_manifest(m: &Manifest) -> Vec<u8> {
         out.extend_from_slice(&t.index_len.to_be_bytes());
         out.extend_from_slice(&t.file_size.to_be_bytes());
         out.push(u8::from(t.has_bloom));
-        let (bits, k) = t.bloom.as_parts();
+        let (bits, k, scheme) = t.bloom.as_parts();
         out.extend_from_slice(&k.to_be_bytes());
+        out.push(scheme.tag());
         put_bytes(&mut out, bits);
         out.extend_from_slice(&t.format.to_be_bytes());
     }
@@ -5871,7 +6012,8 @@ fn decode_manifest(bytes: &[u8]) -> Result<Manifest> {
     let version = c.u8()?;
     // Version dispatch (ADR 0073 Phase 1): exact `match`; see `legacy`.
     match version {
-        1 => decode_manifest_v1(c),
+        1 => legacy::manifest_v1::decode_manifest(c),
+        2 => decode_manifest_v2(c),
         v => Err(StorageError::UnsupportedFormatVersion {
             format: "lsm-manifest",
             found: u32::from(v),
@@ -5880,17 +6022,16 @@ fn decode_manifest(bytes: &[u8]) -> Result<Manifest> {
     }
 }
 
-/// The v1 manifest body decoder; `c` is positioned just past the version byte.
-fn decode_manifest_v1(mut c: Cursor<'_>) -> Result<Manifest> {
+/// The v2 (current) manifest body decoder; `c` is positioned just past the
+/// version byte. Identical to v1 except each table record carries a trailing
+/// `bloom_scheme(u8)` after `bloom_k` naming the hash scheme its Bloom bits
+/// were set with.
+fn decode_manifest_v2(mut c: Cursor<'_>) -> Result<Manifest> {
     let next_seq = c.u64()?;
     let max_version = c.u64()?;
     let table_count = c.u32()? as usize;
-    // `table_count` is an on-disk length prefix with no CRC protecting it
-    // (unlike the WAL frame codec above) — a corrupted manifest byte could
-    // set it near `u32::MAX`. Cap the requested capacity so that can't
-    // demand a many-GB allocation and trigger an allocator abort; the
-    // actual number of tables decoded is still governed solely by what
-    // the buffer holds.
+    // Capped pre-allocation against an untrusted on-disk length prefix: see the
+    // frozen v1 decoder for why.
     let mut tables = Vec::with_capacity(table_count.min(1 << 20));
     for _ in 0..table_count {
         let seq = c.u64()?;
@@ -5904,6 +6045,12 @@ fn decode_manifest_v1(mut c: Cursor<'_>) -> Result<Manifest> {
         let file_size = c.u64()?;
         let has_bloom = c.u8()? != 0;
         let bloom_k = c.u32()?;
+        let scheme_tag = c.u8()?;
+        let scheme = HashScheme::from_tag(scheme_tag).ok_or_else(|| {
+            StorageError::Backend(format!(
+                "unknown bloom hash scheme {scheme_tag} in manifest"
+            ))
+        })?;
         let bloom_bits = c.bytes()?;
         let format = c.u32()?;
         tables.push(SsTableMeta {
@@ -5916,15 +6063,13 @@ fn decode_manifest_v1(mut c: Cursor<'_>) -> Result<Manifest> {
             index_offset,
             index_len,
             file_size,
-            bloom: BloomFilter::from_parts(bloom_bits, bloom_k),
+            bloom: BloomFilter::from_parts(bloom_bits, bloom_k, scheme),
             has_bloom,
             format,
         });
     }
     // Trailer: the live WAL-segment list.
     let count = c.u32()? as usize;
-    // Capped pre-allocation against an untrusted on-disk length prefix
-    // — see `table_count`'s decode above for why.
     let mut wal_segments = Vec::with_capacity(count.min(1 << 20));
     for _ in 0..count {
         wal_segments.push(c.u64()?);
@@ -5946,8 +6091,19 @@ mod manifest_tests {
     use super::*;
 
     fn sample_meta(seq: u64, with_bloom: bool) -> SsTableMeta {
+        sample_meta_for(seq, with_bloom, false)
+    }
+
+    /// `legacy_bloom`: build the filter under the frozen v1 hash scheme (what a
+    /// manifest-v1 binary persisted) instead of the current one.
+    fn sample_meta_for(seq: u64, with_bloom: bool, legacy_bloom: bool) -> SsTableMeta {
         let bloom = if with_bloom {
-            BloomFilter::build(&[b"a".as_slice(), b"bbb".as_slice(), b"cc".as_slice()])
+            let keys = [b"a".as_slice(), b"bbb".as_slice(), b"cc".as_slice()];
+            if legacy_bloom {
+                BloomFilter::build_legacy(&keys)
+            } else {
+                BloomFilter::build(&keys)
+            }
         } else {
             BloomFilter::default()
         };
@@ -6021,11 +6177,20 @@ mod manifest_tests {
     /// keys/versions, tables with and without a bloom and with an empty-key
     /// table, and a non-empty WAL-segment list (ADR 0073 fixture-determinism).
     fn representative_manifest() -> Manifest {
+        representative_manifest_for(false)
+    }
+
+    /// The v1 fixture's expectation: same shape, Bloom under the legacy scheme.
+    fn representative_manifest_v1() -> Manifest {
+        representative_manifest_for(true)
+    }
+
+    fn representative_manifest_for(legacy_bloom: bool) -> Manifest {
         Manifest {
             next_seq: 7,
             max_version: 1234,
             tables: vec![
-                sample_meta(1, true),
+                sample_meta_for(1, true, legacy_bloom),
                 sample_meta(2, false),
                 SsTableMeta {
                     min_key: None,
@@ -6086,7 +6251,8 @@ mod manifest_tests {
             // Expected value per fixture version (from the file name, not
             // `MANIFEST_VERSION`); an unknown version panics, never skips.
             let expected = match crate::fixture_file_version(&path) {
-                1 => representative_manifest(),
+                1 => representative_manifest_v1(),
+                2 => representative_manifest(),
                 v => panic!(
                     "fixture {} is version {v} but this test has no expectation for it — \
                      add a per-version arm (ADR 0073 Phase 1 checklist)",
@@ -6175,6 +6341,142 @@ mod manifest_tests {
                 other => panic!("{len}-byte prefix: expected Backend error, got {other:?}"),
             }
         }
+    }
+
+    /// The checked-in v1 fixture is exactly what the frozen legacy encoder
+    /// writes for the v1 expectation (so the encoder the harness transcodes
+    /// with is byte-faithful), and its filters decode as the legacy scheme.
+    #[test]
+    fn v1_fixture_matches_the_legacy_encoder_and_scheme() {
+        let bytes = std::fs::read(fixture_dir().join("v1.bin")).expect("v1 fixture");
+        assert_eq!(
+            legacy::manifest_v1::encode_manifest(&representative_manifest_v1()),
+            bytes
+        );
+        let m = decode_manifest(&bytes).expect("decode v1");
+        let bloomed = &m.tables[0];
+        assert!(bloomed.has_bloom);
+        assert_eq!(bloomed.bloom.as_parts().2, HashScheme::LegacyFnv);
+        for k in [b"a".as_slice(), b"bbb", b"cc"] {
+            assert!(bloomed.bloom.may_contain(k), "legacy filter answers {k:?}");
+        }
+    }
+
+    /// v2 -> v1 transcode keeps legacy-scheme filters and drops current-scheme
+    /// ones (valid: a table with no Bloom is range-gated only); the result
+    /// decodes. v1 -> v2 -> v1 is stable.
+    #[test]
+    fn reframe_to_v1_drops_only_current_scheme_filters() {
+        let v2 = encode_manifest(&Manifest {
+            tables: vec![
+                sample_meta_for(1, true, true),
+                sample_meta_for(2, true, false),
+            ],
+            ..representative_manifest()
+        });
+        let v1 = reframe_manifest_to_v1(&v2).expect("reframe");
+        assert_eq!(v1[4], 1, "v1 version byte");
+        let m = decode_manifest(&v1).expect("decode");
+        assert!(m.tables[0].has_bloom);
+        assert_eq!(m.tables[0].bloom.as_parts().2, HashScheme::LegacyFnv);
+        assert!(!m.tables[1].has_bloom, "current-scheme filter is dropped");
+        assert_eq!(reframe_manifest_to_v1(&v1).expect("again"), v1);
+    }
+
+    /// An unknown Bloom scheme tag in a v2 manifest is a loud error, never a
+    /// silent mis-probe.
+    #[test]
+    fn unknown_bloom_scheme_tag_is_refused() {
+        let mut bytes = encode_manifest(&Manifest {
+            tables: vec![sample_meta(1, true)],
+            wal_segments: vec![],
+            ..Manifest::default()
+        });
+        // Locate the scheme byte: it sits right after `has_bloom(1)+bloom_k(4)`.
+        let table_fixed = 4 + 1 + 8 + 8 + 4 + 8 + 4; // magic, ver, next_seq, max_version, count, seq, level
+        let min_key = 1 + 4 + "min-1".len();
+        let max_key = 1 + 4 + "max-1".len();
+        let pos = table_fixed + min_key + max_key + 8 * 5 + 1 + 4;
+        assert_eq!(
+            bytes[pos],
+            HashScheme::CURRENT.tag(),
+            "found the scheme byte"
+        );
+        bytes[pos] = 99;
+        assert!(matches!(
+            decode_manifest(&bytes),
+            Err(StorageError::Backend(m)) if m.contains("bloom hash scheme")
+        ));
+    }
+
+    /// Issue #1389 end to end: an engine whose manifest is a v1 image with
+    /// legacy-scheme filters opens and answers every key (no false negatives
+    /// from probing with the wrong scheme), and a table flushed afterwards
+    /// uses the current scheme in the same manifest.
+    #[test]
+    fn engine_opens_a_v1_manifest_and_probes_legacy_filters() {
+        use crate::StorageEngine;
+        use animus_env::{Disk, nid};
+        use animus_sim::Simulator;
+        use futures::executor::block_on;
+
+        let sim = Simulator::new(1389);
+        let opts = || LsmOptions {
+            flush_threshold_bytes: 1 << 30,
+            compaction_trigger: 1 << 20,
+            background_maintenance: false,
+            ..LsmOptions::default()
+        };
+        let key = |i: u32| format!("k{i:05}").into_bytes();
+        block_on(async {
+            let e = LsmEngine::open_with(sim.env(nid(0)), "m/", opts())
+                .await
+                .expect("open");
+            for i in 0u32..300 {
+                e.put(&key(i), b"v", u64::from(i) + 1).await.expect("put");
+            }
+            e.flush_now().await.expect("flush");
+            drop(e);
+
+            // Rewrite the manifest as a v1 image whose filter was built the
+            // old way over the same keys.
+            let env = sim.env(nid(0));
+            let mut m = decode_manifest(&env.read("m/MANIFEST").await.expect("read")).unwrap();
+            assert_eq!(m.tables.len(), 1);
+            let keys: Vec<Vec<u8>> = (0u32..300).map(key).collect();
+            let refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+            m.tables[0].bloom = BloomFilter::build_legacy(&refs);
+            let v1 = legacy::manifest_v1::encode_manifest(&m);
+            assert_eq!(v1[4], 1);
+            env.replace("m/MANIFEST", &v1).await.expect("replace");
+
+            let e = LsmEngine::open_with(sim.env(nid(0)), "m/", opts())
+                .await
+                .expect("open v1 manifest");
+            for i in 0u32..300 {
+                assert_eq!(
+                    e.get(&key(i)).await.unwrap().map(|v| v.value),
+                    Some(b"v".to_vec())
+                );
+            }
+            assert_eq!(e.get(b"k99999").await.unwrap(), None);
+
+            // A new flush writes a v2 manifest carrying both schemes.
+            e.put(b"zz", b"w", 1000).await.expect("put");
+            e.flush_now().await.expect("flush");
+            drop(e);
+            let m = decode_manifest(&env.read("m/MANIFEST").await.expect("read")).unwrap();
+            let schemes: Vec<_> = m.tables.iter().map(|t| t.bloom.as_parts().2).collect();
+            assert!(schemes.contains(&HashScheme::LegacyFnv), "{schemes:?}");
+            assert!(schemes.contains(&HashScheme::CURRENT), "{schemes:?}");
+            let e = LsmEngine::open_with(sim.env(nid(0)), "m/", opts())
+                .await
+                .expect("reopen mixed");
+            for i in 0u32..300 {
+                assert!(e.get(&key(i)).await.unwrap().is_some());
+            }
+            assert!(e.get(b"zz").await.unwrap().is_some());
+        });
     }
 
     /// Engine-level crash soundness: the manifest is swapped by an atomic
