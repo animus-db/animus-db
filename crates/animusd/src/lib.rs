@@ -20138,6 +20138,41 @@ mod forward_transport_failure_tests {
             .map(|(i, _)| i)
             .expect("a 4-node cluster at RF 3 has exactly one non-replica node");
 
+        // The control-plane replica set reaching RF 3 does NOT mean the
+        // data-plane Raft group has finished growing: the tablet's leader
+        // adds each new replica as a learner, catches it up, then promotes
+        // it, and that takes seconds longer under CPU load. A kill that
+        // lands mid-reconfigure can take out the sole voter (voters
+        // `{n0}`, learner `n1`) and leave the group leaderless for good,
+        // which no forwarding chase can fix and is not what this test
+        // guards. So wait until every replica hosts the group as one of
+        // three voters, with no learners, and one of them leads.
+        let settle_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let mut views = Vec::new();
+            for (i, node) in nodes.iter().enumerate() {
+                for (t, g) in node.ctx_for_test().edge.hosted_groups() {
+                    if t == tablet {
+                        let v = g.raft_view(t, false).await;
+                        views.push((i, v.role, v.leader, v.voters, v.learners));
+                    }
+                }
+            }
+            let settled = views.len() == 3
+                && views.iter().any(|(_, role, ..)| role == "Leader")
+                && views.iter().all(|(_, _, leader, voters, learners)| {
+                    leader.is_some() && voters.len() == 3 && learners.is_empty()
+                });
+            if settled {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < settle_deadline,
+                "data-plane group did not settle on 3 voters and a leader: {views:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
         // Kill the FIRST replica in `Metadata` order — the deterministic
         // guess `resolve_cp_route` will make on every single call, whether
         // or not it was ever this tablet's leader.
