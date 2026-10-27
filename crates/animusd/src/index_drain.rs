@@ -2588,12 +2588,12 @@ pub(crate) async fn hot_read<E: Env>(
 ///   this arm with `gsis` empty and `stream_enabled` false, precisely to
 ///   land here). One trim rule, both shapes; never a second deleter.
 #[allow(clippy::too_many_arguments)] // mirrors `seal_now`/`pitr_seal_now`'s own precedent for this shape
-async fn trim_janitor(
-    ctx: &ClientCtx,
+pub(crate) async fn trim_janitor<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     meta: &Metadata,
     table: &str,
     tablet: TabletId,
-    group: &CpGroup,
+    group: &CpGroup<E>,
     gsis: &[IndexDef],
     stream_enabled: bool,
     pitr_enabled: bool,
@@ -2657,8 +2657,38 @@ async fn trim_janitor(
     // bound at all.
     let trim_all = trim_point.is_none();
 
+    // Scan FIRST, then (for the unbounded delete only) re-validate "no term
+    // is expected" against a fresh catalog read. Issue #1410: `meta` is the
+    // tick's start-of-tick snapshot, and under CPU starvation a tick can run
+    // long after it was taken. A stream (or PITR / GSI / MREC term) enabled
+    // since then makes a record written under the new term present in this
+    // scan with no consumer having sealed it yet; `trim_all` would delete it
+    // and the final seal would then silently lose an acked write. Any record
+    // in `pending` was committed before this scan, so a fresh read taken
+    // after it that still shows no expected term proves no record in
+    // `pending` can belong to a live term (a term that existed and was since
+    // disabled had its final seal run first, F12-b). A bounded delete
+    // (`trim_point` is `Some`) needs no such check: every record at or below
+    // the bound is already consumed by every term it names.
+    let pending = group.pending_changes_key_order().await;
+    if trim_all && !pending.is_empty() {
+        let fresh = ctx.metadata_fresh().await;
+        let term_appeared = fresh.table_stream(table).is_some()
+            || fresh.table_pitr(table).is_some()
+            || fresh.table_indexes(table).iter().any(|i| {
+                i.kind == IndexKind::Global
+                    && matches!(i.status, IndexStatus::Creating | IndexStatus::Active)
+            })
+            || crate::mrec_shipper::trim_term(&ctx.env, &ctx.mrec, &fresh, table, group)
+                .await
+                .is_some();
+        if term_appeared {
+            return Ok(()); // a consumer term appeared since `meta`; next tick decides afresh
+        }
+    }
+
     let mut writes: Vec<(u8, Vec<u8>, Option<Vec<u8>>)> = Vec::new();
-    for (key, _) in group.pending_changes_key_order().await {
+    for (key, _) in pending {
         if !trim_all {
             let Some(ts) = record_hlc(&key) else {
                 continue; // malformed suffix; leave it rather than guess
