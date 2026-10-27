@@ -121,9 +121,10 @@ use std::time::Duration;
 
 use super::sim_cluster::SimCluster;
 use super::sim_cluster_console::{
-    create_table_via_wire, env_seed, get_item_via_wire, json, leader_of_table, non_leader_of_table,
+    create_table_via_wire, get_item_via_wire, leader_of_table, non_leader_of_table,
     put_item_via_wire,
 };
+use super::sim_support::{env_seed, json};
 
 /// Bounded converged-or-timeout poll for the always-on reaper — a fixed
 /// number of `run_for(SIM_TTL_SWEEP_INTERVAL * 2)` steps past `settle`,

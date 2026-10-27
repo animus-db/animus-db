@@ -42,6 +42,7 @@
 //!
 //! Replay one seed with `ANIMUS_SEED=<seed>`.
 
+use super::sim_support::env_seed;
 use std::time::Duration;
 
 use animus_cp_data::KIND_BASE;
@@ -63,13 +64,6 @@ const STEP: Duration = Duration::from_millis(250);
 /// `RECOVERY_GRACE` is 5 s; a decision plus its resolves follows within a
 /// few sweeps.
 const RECOVER_BOUND: Duration = Duration::from_secs(40);
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
 
 type Tick = std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>>;
 

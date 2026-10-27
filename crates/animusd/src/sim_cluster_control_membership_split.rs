@@ -235,7 +235,8 @@ use animus_control::{MetaCommand, NodeAddrs, ProposeResult};
 use animus_env::{NodeId, nid};
 
 use super::sim_cluster::SimCluster;
-use super::sim_cluster_console::{create_table_via_wire, env_seed, json};
+use super::sim_cluster_console::create_table_via_wire;
+use super::sim_support::{env_seed, json};
 use crate::config::NodeRole;
 
 /// Converged-or-timeout poll on `cond(cluster)` — the shared shape every

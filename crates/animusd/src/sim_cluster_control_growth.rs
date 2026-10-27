@@ -43,7 +43,7 @@ use std::time::Duration;
 use animus_env::{NodeId, nid};
 
 use super::sim_cluster::SimCluster;
-use super::sim_cluster_console::{env_seed, json};
+use super::sim_support::{env_seed, json};
 use crate::config::NodeRole;
 
 /// The current control-bearing node id set, as real node ids — derived

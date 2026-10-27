@@ -30,6 +30,7 @@
 //!
 //! Replay one seed with `ANIMUS_SEED=<seed>`.
 
+use super::sim_support::env_seed;
 use std::time::Duration;
 
 use animus_cp_data::hlc::HlcTimestamp;
@@ -55,13 +56,6 @@ const STEP: Duration = Duration::from_millis(250);
 /// backlog sweep (`BACKLOG` x two round trips of 2 x `LINK_DELAY` and more).
 const PENDING_BOUND: Duration = Duration::from_secs(8);
 const LINK_DELAY: Duration = Duration::from_millis(25);
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Layout {

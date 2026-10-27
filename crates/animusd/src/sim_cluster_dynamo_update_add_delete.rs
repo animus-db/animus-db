@@ -24,18 +24,12 @@
 //!
 //! Seed replay: `ANIMUS_SEED=<seed> cargo test -p animusd --lib <test name>`.
 
+use super::sim_support::env_seed;
 use std::time::Duration;
 
 use animus_tablet::TabletId;
 
 use super::sim_cluster::SimCluster;
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
 
 /// `table`'s own (sole) tablet id, read off node 0's own `Metadata` — **not**
 /// `SimCluster::tablet_of`, which only knows about a *hand-hosted* table

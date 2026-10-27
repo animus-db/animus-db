@@ -91,7 +91,7 @@ use animus_env::{EnvExt, NodeId, nid};
 use animus_sim::NetConfig;
 
 use super::sim_cluster::SimCluster;
-use super::sim_cluster_console::{env_seed, json};
+use super::sim_support::{env_seed, json};
 use crate::config::NodeRole;
 
 /// A fake, never-dialed placeholder control-Raft address — the identical

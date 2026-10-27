@@ -43,6 +43,7 @@
 //!
 //! Replay one seed with `ANIMUS_SEED=<seed>`.
 
+use super::sim_support::env_seed;
 use std::time::Duration;
 
 use animus_tablet::{TabletId, TabletState};
@@ -60,13 +61,6 @@ const EMAILS: usize = 4;
 const CONVERGE_BOUND: Duration = Duration::from_secs(8);
 /// The base tablet's tick must not wait out a frozen index tablet.
 const FIRST_TICK_BOUND: Duration = Duration::from_secs(5);
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
 
 type Tick = std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>>;
 

@@ -35,6 +35,7 @@
 //!
 //! Replay one seed with `ANIMUS_SEED=<seed>`.
 
+use super::sim_support::env_seed;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
@@ -49,13 +50,6 @@ const STEP: Duration = Duration::from_millis(50);
 /// The product's chase budget is `SCHEMA_COMMIT_TIMEOUT + SPLIT_WAIT_BOUND`
 /// (about 35 s); after the heal the walk must finish far inside it.
 const WALK_BOUND: Duration = Duration::from_secs(15);
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
 
 fn live_tablets(cluster: &SimCluster, node: u64) -> Vec<(TabletId, TabletState)> {
     cluster

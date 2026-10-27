@@ -265,9 +265,10 @@ use serde_json::Value;
 
 use super::sim_cluster::SimCluster;
 use super::sim_cluster_console::{
-    control_leader_and_follower, create_table_via_wire, env_seed, json, leader_of_table,
-    non_leader_of_table, tablet_of_table,
+    control_leader_and_follower, create_table_via_wire, leader_of_table, non_leader_of_table,
+    tablet_of_table,
 };
+use super::sim_support::{env_seed, json};
 
 fn accepted(r: ProposeResult) -> bool {
     matches!(r, ProposeResult::Accepted { .. })

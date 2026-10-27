@@ -119,6 +119,7 @@
 //! findings above now fixed and confirmed green — reproduces identically at
 //! every `_over_seeds` seed tried too).
 
+use super::sim_support::env_seed;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -130,13 +131,6 @@ use super::sim_cluster::SimCluster;
 /// Virtual time the issue #1204 scenario runs before it prepares: the age the
 /// "previous incarnation" had when it was power-cut.
 const RESTART_WARMUP: Duration = Duration::from_secs(300);
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
 
 /// One DynamoDB wire `CreateTable` for a plain single-key (`pk`, string)
 /// table named `table`, issued from `node` — mirrors `sim_cluster_dynamo_

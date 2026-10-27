@@ -63,9 +63,10 @@
 
 use super::sim_cluster::SimCluster;
 use super::sim_cluster_console::{
-    assert_no_cluster_shape, control_leader_and_follower, create_table_via_wire, env_seed, json,
-    leader_of_table, put_item_via_wire,
+    assert_no_cluster_shape, control_leader_and_follower, create_table_via_wire, leader_of_table,
+    put_item_via_wire,
 };
+use super::sim_support::{env_seed, json};
 
 // ---------------------------------------------------------------------------
 // (1) table_detail_projects_full_configuration

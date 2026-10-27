@@ -134,8 +134,9 @@ use animus_env::nid;
 
 use super::sim_cluster::SimCluster;
 use super::sim_cluster_console::{
-    create_table_via_wire, env_seed, get_item_via_wire, put_item_via_wire, tablet_of_table,
+    create_table_via_wire, get_item_via_wire, put_item_via_wire, tablet_of_table,
 };
+use super::sim_support::env_seed;
 use crate::config::NodeRole;
 
 /// A 5-node cluster: 2 combined (`NodeRole::Both`, indices 0-1) + 3

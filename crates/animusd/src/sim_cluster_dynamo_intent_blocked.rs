@@ -15,17 +15,11 @@
 //! Seed replay: `ANIMUS_SEED=<seed> cargo test -p animusd --lib
 //! single_item_write_blocked_by_a_transaction_intent`.
 
+use super::sim_support::env_seed;
 use animus_dynamo::AttributeValue;
 
 use super::dynamo::item_key;
 use super::sim_cluster::SimCluster;
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
 
 fn assert_conflict(seed: u64, node: u64, what: &str, (status, body): (u16, String)) {
     assert_eq!(status, 400, "seed={seed}: {what} on node {node}: {body}");

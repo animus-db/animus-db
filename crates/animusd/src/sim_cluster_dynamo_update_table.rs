@@ -37,18 +37,12 @@
 //! Seed replay (repo convention): `ANIMUS_SEED=<seed> cargo test -p animusd
 //! --lib <test name>`.
 
+use super::sim_support::env_seed;
 use std::time::Duration;
 
 use animus_env::NodeId;
 
 use super::sim_cluster::SimCluster;
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
 
 /// The substring `dynamo::THROTTLE_WRITE_REFUSAL`/`THROTTLE_READ_REFUSAL`
 /// share — mirrors `sim_cluster_throttle.rs`'s own `REFUSAL_MARKER`.

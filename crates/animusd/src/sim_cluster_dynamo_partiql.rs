@@ -139,13 +139,7 @@
 //! --lib select_partition_equality_matches_query`.
 
 use super::sim_cluster::SimCluster;
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
+use super::sim_support::env_seed;
 
 /// One DynamoDB wire `CreateTable` for a plain single-key (`pk`, string)
 /// table named `table`, issued from node 0 — mirrors `sim_cluster_dynamo_

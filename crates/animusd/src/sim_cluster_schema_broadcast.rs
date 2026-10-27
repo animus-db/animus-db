@@ -40,18 +40,12 @@
 //! Seed replay (repo convention): `ANIMUS_SEED=<seed> cargo test -p animusd
 //! --lib <test name>`.
 
+use super::sim_support::env_seed;
 use std::time::Duration;
 
 use animus_control::{ColumnType, MetaCommand, TableSchema};
 
 use super::sim_cluster::SimCluster;
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
 
 #[test]
 fn propose_schema_from_a_leaderless_follower_does_not_wait_out_an_unreachable_broadcast_candidate()

@@ -32,13 +32,7 @@
 //!     identical `ValidationException` way.
 
 use super::sim_cluster::SimCluster;
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
+use super::sim_support::env_seed;
 
 /// Pull `(IndexStatus, Backfilling)` for `index` out of a `DescribeTable`/
 /// `UpdateTable` response body's `GlobalSecondaryIndexes` array — `None` if

@@ -44,13 +44,7 @@
 //! --lib <test name>`.
 
 use super::sim_cluster::SimCluster;
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
+use super::sim_support::env_seed;
 
 /// `CreateTable` for a plain single-key (`id`, string) table — mirrors
 /// `dynamo_throttling.rs::create_table`'s own key shape verbatim (this

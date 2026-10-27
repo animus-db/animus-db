@@ -75,6 +75,7 @@
 //! `ANIMUS_SEED=<seed> cargo test -p animusd --lib <test name>` replays
 //! any of the three scenarios (repo convention).
 
+use super::sim_support::env_seed;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
@@ -83,13 +84,6 @@ use animus_tablet::{TabletId, TabletState};
 
 use super::AutoSplitThresholds;
 use super::sim_cluster::SimCluster;
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
 
 // ---------------------------------------------------------------------------
 // (1) cp_member_addresses_register_and_replicate

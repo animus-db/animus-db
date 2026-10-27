@@ -68,17 +68,7 @@
 //! --lib backfill_seed_markers_never_surface_as_phantom_stream_events`.
 
 use super::sim_cluster::SimCluster;
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
-
-fn json(body: &str) -> serde_json::Value {
-    serde_json::from_str(body).unwrap_or_else(|e| panic!("invalid JSON ({e}): {body}"))
-}
+use super::sim_support::{env_seed, json};
 
 /// A single-key (`id`, string) table with a stream enabled
 /// (`NEW_AND_OLD_IMAGES`) — mirrors the original real-socket test's own

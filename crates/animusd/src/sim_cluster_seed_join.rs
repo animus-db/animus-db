@@ -206,6 +206,7 @@
 //! every op/dial call here, as everywhere else in this fixture — no
 //! wall-clock wait anywhere in this module.
 
+use super::sim_support::env_seed;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
@@ -216,13 +217,6 @@ use animus_tablet::TabletId;
 use super::sim_cluster::SimCluster;
 use super::sim_cluster_console::{create_table_via_wire, tablet_of_table};
 use crate::config::NodeRole;
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
 
 const PRIMARY_SEED_A: u64 = 0xC13E_0001;
 const OVER_SEEDS_A: [u64; 5] = [

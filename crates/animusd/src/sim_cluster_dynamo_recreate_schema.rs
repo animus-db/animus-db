@@ -10,13 +10,7 @@
 //! recreated_table_with_new_key_schema`.
 
 use super::sim_cluster::SimCluster;
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
+use super::sim_support::env_seed;
 
 fn create(cluster: &mut SimCluster, key: &str) -> (u16, String) {
     let body = format!(

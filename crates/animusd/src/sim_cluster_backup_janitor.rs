@@ -65,6 +65,7 @@
 //!     `JanitorProgress.backups_seen` stays 0 and the store keeps every
 //!     object.
 
+use super::sim_support::env_seed;
 use std::time::Duration;
 
 use animus_control::{BackupStatus, MetaCommand, ProposeResult};
@@ -73,13 +74,6 @@ use animus_node::backup_janitor::JanitorPhase;
 use animus_tablet::TabletId;
 
 use super::sim_cluster::SimCluster;
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
 
 /// A single-hash-key (`pk`, string) `CreateTable`, issued from `node` —
 /// mirrors every other `sim_cluster_*` module's identically-named helper.

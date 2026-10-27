@@ -173,22 +173,12 @@
 //! Replays (repo convention): `ANIMUS_SEED=<seed> cargo test -p animusd
 //! --lib <scenario name>`.
 
+use super::sim_support::{env_seed, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use super::sim_cluster::SimCluster;
 use crate::config::NodeRole;
-
-pub(crate) fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
-
-pub(crate) fn json(body: &str) -> serde_json::Value {
-    serde_json::from_str(body).unwrap_or_else(|e| panic!("invalid JSON ({e}): {body}"))
-}
 
 /// No node/tablet/replica/raft/leader/quorum/placement/health/epoch-shaped
 /// key anywhere in `body` — the same forbidden-substring list every

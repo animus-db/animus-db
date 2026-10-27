@@ -40,7 +40,8 @@
 use std::time::Duration;
 
 use super::sim_cluster::SimCluster;
-use super::sim_cluster_console::{create_table_via_wire, env_seed, json};
+use super::sim_cluster_console::create_table_via_wire;
+use super::sim_support::{env_seed, json};
 use crate::config::NodeRole;
 
 /// A single hash-key (`pk`, string) `CreateTable`, issued from `node` —

@@ -39,19 +39,13 @@
 //! helpers) stays reachable with no visibility widened" reason those
 //! already document.
 
+use super::sim_support::env_seed;
 use std::time::Duration;
 
 use animus_control::Metadata;
 use animus_tablet::TabletId;
 
 use super::sim_cluster::SimCluster;
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
 
 /// `table`'s (sole) tablet id and its current leader's node index — mirrors
 /// `sim_cluster_index_ddl.rs::leader_of_table`'s own idiom, which every

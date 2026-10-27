@@ -11,18 +11,12 @@
 //! `cp_route` stops trusting a stale purely-local view, not about routing
 //! around a genuine, ongoing network partition).
 
+use super::sim_support::env_seed;
 use std::time::Duration;
 
 use animus_dynamo::AttributeValue;
 
 use super::sim_cluster::{CpRouteOutcome, SimCluster};
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
 
 /// A tablet's leader partitioned away from a node that also hosts a replica
 /// (`victim`) must not strand a routed write on `victim`'s own purely local

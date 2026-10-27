@@ -23989,6 +23989,10 @@ mod sim_cluster_stream_janitor;
 #[cfg(test)]
 mod sim_cluster_console;
 
+/// Helpers shared by the `sim_*` test modules (see that file's module doc).
+#[cfg(test)]
+pub(crate) mod sim_support;
+
 /// ADR 0061 rung H (post-C-07): admin/console/dashboard `SimCluster`
 /// dispatch (C-08), PR 4 — the console table page's Stream data tab
 /// (`tests/console_stream.rs`): the honest disabled answer for a stream-

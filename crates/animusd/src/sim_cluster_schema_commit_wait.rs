@@ -23,6 +23,7 @@
 //! Replay one seed: `ANIMUS_SEED=<seed> cargo test -p animusd --lib
 //! sim_cluster_schema_commit_wait`.
 
+use super::sim_support::env_seed;
 use std::time::Duration;
 
 use animus_control::MetaCommand;
@@ -36,13 +37,6 @@ use super::sim_cluster::SimCluster;
 const SYNC_DELAY: Duration = Duration::from_secs(2);
 
 const TABLE: &str = "orders";
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
 
 fn create_table(cluster: &mut SimCluster) {
     let body = format!(

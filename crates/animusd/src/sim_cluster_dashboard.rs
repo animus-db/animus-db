@@ -193,9 +193,8 @@ use animus_env::nid;
 use serde_json::Value;
 
 use super::sim_cluster::SimCluster;
-use super::sim_cluster_console::{
-    control_leader_and_follower, env_seed, json, non_leader_of_table,
-};
+use super::sim_cluster_console::{control_leader_and_follower, non_leader_of_table};
+use super::sim_support::{env_seed, json};
 use crate::config::NodeRole;
 use crate::dashboard::{
     BACKUPS_JS, BROWSER_JS, CORE_JS, HTML, NODE_JS, OVERVIEW_JS, STORAGE_JS, TABLETS_JS, TXNS_JS,

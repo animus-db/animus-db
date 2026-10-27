@@ -67,6 +67,7 @@
 //! leftover PARENT engine is reclaimed via the issue #722 fix (`host::
 //! Reconciler`'s `EngineFactory::local_tablets` second fact source).
 
+use super::sim_support::env_seed;
 use std::time::Duration;
 
 use animus_storage::StorageEngine;
@@ -74,13 +75,6 @@ use animus_tablet::{TabletId, TabletState};
 
 use super::AutoSplitThresholds;
 use super::sim_cluster::SimCluster;
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
 
 /// A single-hash-key (`pk`, string) `CreateTable`, issued from `node` —
 /// mirrors `sim_cluster_dynamo_drop_table.rs`'s own identically-named

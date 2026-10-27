@@ -254,13 +254,7 @@
 //! animusd --lib update_table_stream_enable_and_disable_through_every_node`.
 
 use super::sim_cluster::SimCluster;
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
+use super::sim_support::{env_seed, json};
 
 /// One DynamoDB wire `CreateTable` for a plain single-key (`pk`, string)
 /// table named `table`, issued from `node` — mirrors every other
@@ -342,10 +336,6 @@ fn non_leader_of_table(cluster: &SimCluster, table: &str) -> u64 {
     (0..cluster.node_count() as u64)
         .find(|&n| n != leader)
         .expect("a 3-node cluster always has a non-leader node")
-}
-
-fn json(body: &str) -> serde_json::Value {
-    serde_json::from_str(body).unwrap_or_else(|e| panic!("invalid JSON ({e}): {body}"))
 }
 
 /// `ListStreams`, issued from `node` via [`SimCluster::dynamo_streams`] —

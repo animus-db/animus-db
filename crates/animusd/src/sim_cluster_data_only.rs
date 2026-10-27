@@ -160,7 +160,8 @@
 use std::time::Duration;
 
 use super::sim_cluster::SimCluster;
-use super::sim_cluster_console::{create_table_via_wire, env_seed, tablet_of_table};
+use super::sim_cluster_console::{create_table_via_wire, tablet_of_table};
+use super::sim_support::env_seed;
 use crate::config::NodeRole;
 
 /// A 6-node cluster: 3 control-only (`NodeRole::Control`, indices 0-2) + 3
