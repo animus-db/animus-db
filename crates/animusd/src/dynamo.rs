@@ -5585,30 +5585,34 @@ async fn run_transact<E: Env, R: RelayClient>(
     // actions may target the same item — both checked **before** the
     // `ClientRequestToken` preflight `Put` below, so a `ValidationException`
     // here never strands a `PENDING` idempotency record nobody will ever
-    // resolve. Mirrors (rather than shares) the identical dedup check the
-    // main loop performs below on its own resolved keys — that version is
-    // threaded through the per-action `writes`/`preconditions` construction
-    // this pure pre-pass has no reason to build.
+    // resolve. This is also the one place each action's key is resolved:
+    // `keys[i]` is `actions[i]`'s `(partition key, sort key, data key)`, and
+    // the per-action loop below reuses it rather than resolving (and
+    // de-duplicating) a second time.
+    let mut keys: Vec<(AttributeValue, Option<AttributeValue>, Vec<u8>)> =
+        Vec::with_capacity(actions.len());
     {
-        let mut seen: BTreeSet<(String, Vec<u8>)> = BTreeSet::new();
+        let mut seen: BTreeSet<(&str, Vec<u8>)> = BTreeSet::new();
         for action in actions {
             let table = action.table();
             reject_internal_table(table, false)?;
             let (pk, sk) = resolve_key(ctx, meta, table, transact_action_key_item(action))?;
-            if !seen.insert((table.to_owned(), item_key(&pk, sk.as_ref()))) {
+            let data_key = item_key(&pk, sk.as_ref());
+            if !seen.insert((table, data_key.clone())) {
                 return Err(WireError::validation(
                     "Transaction request cannot include multiple operations on one item",
                 ));
             }
+            keys.push((pk, sk, data_key));
         }
     }
 
     // `ClientRequestToken` preflight — see this function's own doc for the
     // full protocol.
-    let idempotency_fingerprint = match token {
+    let idem: Option<(&str, String)> = match token {
         Some(token) => match transact_write_idempotency_preflight(ctx, actions, token).await? {
             Some(cached) => return Ok(cached),
-            None => Some(wire::transact_write_fingerprint(actions)),
+            None => Some((token, wire::transact_write_fingerprint(actions))),
         },
         None => None,
     };
@@ -5629,128 +5633,110 @@ async fn run_transact<E: Env, R: RelayClient>(
     // conditions) is still real machinery the raw `ClientRequest::Txn`
     // protocol can exercise.
     let write_conditions: Vec<crate::TxnWriteCondition> = Vec::new();
-    let mut seen: BTreeSet<(String, Vec<u8>)> = BTreeSet::new();
     // A `ConditionCheck` failure detected inside the loop must not run an
     // idempotency-outcome update (or any other `cp_kind_write_item` call)
     // from inside the loop — captured here and handled once, alongside
     // every other cancellation exit.
     let mut condition_check_failure: Option<WireError> = None;
-    // Every action's own (table, data key), by index — populated below in
-    // the same order `actions` is iterated, so `action_keys[i]` always
-    // corresponds to `actions[i]`. `cp_txn`'s own typed `TxnAbortReason`
-    // (ADR 0018's 2026-08-24 `CancellationReasons` amendment, issue #374
-    // C2b) names a `(table, key)`, not an action index — this is what lets
-    // this function's own `cp_txn` call site (below) correlate the two
-    // without re-deriving each key a second time.
-    let mut action_keys: Vec<(String, Vec<u8>)> = Vec::with_capacity(actions.len());
+    // `cp_txn`'s own typed `TxnAbortReason` (ADR 0018's 2026-08-24
+    // `CancellationReasons` amendment, issue #374 C2b) names a `(table, key)`,
+    // not an action index; `keys` (index-aligned with `actions`) is what lets
+    // this function's own `cp_txn` call site (below) correlate the two.
+    let action_index_of = |table: &str, key: &[u8]| {
+        actions
+            .iter()
+            .zip(&keys)
+            .position(|(a, (_, _, data_key))| a.table() == table && data_key == key)
+    };
 
-    'actions: for (action_index, action) in actions.iter().enumerate() {
-        let table = action.table().to_owned();
-        let (key_item, condition): (&Item, Option<&ConditionExpression>) = match action {
-            TransactAction::Put {
-                item, condition, ..
-            } => (item, condition.as_ref()),
-            TransactAction::Delete { key, condition, .. } => (key, condition.as_ref()),
-            TransactAction::Update { key, condition, .. } => (key, condition.as_ref()),
-            TransactAction::ConditionCheck { key, condition, .. } => (key, Some(condition)),
-        };
-        let is_condition_check = matches!(action, TransactAction::ConditionCheck { .. });
-        let (pk, sk) = resolve_key(ctx, meta, &table, key_item)?;
-        let data_key = item_key(&pk, sk.as_ref());
-        if !seen.insert((table.clone(), data_key.clone())) {
-            return Err(WireError::validation(
-                "Transaction request cannot include multiple operations on one item",
-            ));
-        }
-        debug_assert_eq!(action_keys.len(), action_index);
-        action_keys.push((table.clone(), data_key.clone()));
-
+    'actions: for (action_index, (action, (pk, sk, data_key))) in
+        actions.iter().zip(&keys).enumerate()
+    {
+        let table = action.table();
         // ADR 0046 U3 (universal since ADR 0049): EVERY write action — never
         // a bare `ConditionCheck`, which writes nothing and stays the
         // ordinary precondition path below — defers entirely to the
         // participant leader: no coordinator-local read, no
         // coordinator-local condition evaluation, no coordinator-computed
         // diff. See this function's own doc and `PendingKindWrite`'s doc.
-        if !is_condition_check {
-            let op = match action {
-                TransactAction::Put { item, .. } => KindWriteOp::Put(item.clone()),
-                TransactAction::Delete { .. } => KindWriteOp::Delete,
-                TransactAction::Update {
-                    key,
-                    actions: update_actions,
-                    ..
-                } => KindWriteOp::Update {
+        let (op, condition) = match action {
+            TransactAction::Put {
+                item, condition, ..
+            } => (KindWriteOp::Put(item.clone()), condition.as_ref()),
+            TransactAction::Delete { condition, .. } => (KindWriteOp::Delete, condition.as_ref()),
+            TransactAction::Update {
+                key,
+                actions: update_actions,
+                condition,
+                ..
+            } => (
+                KindWriteOp::Update {
                     key_item: key.clone(),
                     actions: update_actions.clone(),
                 },
-                TransactAction::ConditionCheck { .. } => {
-                    unreachable!("is_condition_check excludes this arm")
+                condition.as_ref(),
+            ),
+            // A `ConditionCheck` writes nothing (every write action deferred
+            // to its participant leader above, since ADR 0049 made the kind
+            // path universal — the coordinator-valued write path and its
+            // own-key `write_conditions` mechanism were deleted with it in
+            // Train A rung 5; a write action's condition rides
+            // `PendingKindWrite::condition` + the C1 own-key OCC instead). Its
+            // condition evaluates against a read here, and its observed value
+            // becomes an ordinary cross-key `cp_txn` precondition: always
+            // linearizable (ADR 0055), never the cheap path —
+            // `TransactWriteItems` carries no `ConsistentRead` and its
+            // conditions decide whether the whole transaction commits.
+            TransactAction::ConditionCheck { condition, .. } => {
+                let raw =
+                    raw_quorum_read(ctx, meta, table, data_key, ReadConsistency::Strong).await?;
+                let decoded = match &raw {
+                    Some(bytes) => wire::decode_stored_item(bytes)?,
+                    _ => None,
+                };
+                if !condition.evaluate(decoded.as_ref())? {
+                    // ADR 0018's 2026-08-24 `CancellationReasons` amendment
+                    // (issue #374 C2a): this action's own index is known
+                    // here, so the reply carries the full per-action array
+                    // rather than an aggregate-only message. `decoded` is
+                    // this `ConditionCheck`'s own observed item — the exact
+                    // "old image" AWS's `Item` field means for a check that
+                    // never writes — echoed only when this action asked for
+                    // `ReturnValuesOnConditionCheckFailure: ALL_OLD`.
+                    let item = matches!(
+                        action.rvocf(),
+                        wire::ReturnValuesOnConditionCheckFailure::AllOld
+                    )
+                    .then_some(decoded.as_ref())
+                    .flatten();
+                    let reasons = cancellation_reasons_for(
+                        actions,
+                        action_index,
+                        wire::CancellationReason::conditional_check_failed(item),
+                    );
+                    condition_check_failure =
+                        Some(WireError::transaction_canceled_with_reasons(reasons));
+                    break 'actions;
                 }
-            };
-            writes.push(crate::TxnTableWrite {
-                table: table.clone(),
-                key: data_key,
-                value: None,
-                pending: Some(crate::PendingKindWrite {
-                    pk,
-                    sk,
-                    op,
-                    condition: condition.cloned(),
-                }),
-            });
-            continue;
-        }
-
-        // Only a `ConditionCheck` reaches here (every write action deferred
-        // to its participant leader above, since ADR 0049 made the kind
-        // path universal — the coordinator-valued write path and its
-        // own-key `write_conditions` mechanism were deleted with it in
-        // Train A rung 5; a write action's condition rides
-        // `PendingKindWrite::condition` + the C1 own-key OCC instead). A
-        // `ConditionCheck`'s condition evaluates against a read here, and
-        // its observed value becomes an ordinary cross-key `cp_txn`
-        // precondition.
-        // A `ConditionCheck`'s observed value becomes a transaction
-        // precondition: always linearizable (ADR 0055), never the cheap path
-        // — `TransactWriteItems` carries no `ConsistentRead` and its
-        // conditions decide whether the whole transaction commits.
-        let raw = raw_quorum_read(ctx, meta, &table, &data_key, ReadConsistency::Strong).await?;
-        let decoded = match &raw {
-            Some(bytes) => wire::decode_stored_item(bytes)?,
-            _ => None,
+                preconditions.push((table.to_owned(), data_key.clone(), raw));
+                continue;
+            }
         };
-        if let Some(cond) = condition
-            && !cond.evaluate(decoded.as_ref())?
-        {
-            // ADR 0018's 2026-08-24 `CancellationReasons` amendment (issue
-            // #374 C2a): this action's own index is known here, so the
-            // reply carries the full per-action array rather than an
-            // aggregate-only message. `decoded` is this `ConditionCheck`'s
-            // own observed item — the exact "old image" AWS's `Item` field
-            // means for a check that never writes — echoed only when this
-            // action asked for `ReturnValuesOnConditionCheckFailure: ALL_OLD`.
-            let item = matches!(
-                action.rvocf(),
-                wire::ReturnValuesOnConditionCheckFailure::AllOld
-            )
-            .then_some(decoded.as_ref())
-            .flatten();
-            let reasons = cancellation_reasons_for(
-                actions,
-                action_index,
-                wire::CancellationReason::conditional_check_failed(item),
-            );
-            condition_check_failure = Some(WireError::transaction_canceled_with_reasons(reasons));
-            break 'actions;
-        }
-        preconditions.push((table, data_key, raw));
+        writes.push(crate::TxnTableWrite {
+            table: table.to_owned(),
+            key: data_key.clone(),
+            value: None,
+            pending: Some(crate::PendingKindWrite {
+                pk: pk.clone(),
+                sk: sk.clone(),
+                op,
+                condition: condition.cloned(),
+            }),
+        });
     }
 
     if let Some(err) = condition_check_failure {
-        if let (Some(token), Some(fingerprint)) = (token, idempotency_fingerprint.as_deref()) {
-            record_transact_write_outcome(ctx, meta, token, fingerprint, TXN_IDEMPOTENCY_CANCELLED)
-                .await;
-        }
+        record_idempotency_outcome(ctx, meta, idem.as_ref(), TXN_IDEMPOTENCY_CANCELLED).await;
         return Err(err);
     }
 
@@ -5771,18 +5757,8 @@ async fn run_transact<E: Env, R: RelayClient>(
                 ctx.data()
                     .raftkv_metrics
                     .incr(Metric::DynamoTransactWritesCanceled);
-                if let (Some(token), Some(fingerprint)) =
-                    (token, idempotency_fingerprint.as_deref())
-                {
-                    record_transact_write_outcome(
-                        ctx,
-                        meta,
-                        token,
-                        fingerprint,
-                        TXN_IDEMPOTENCY_CANCELLED,
-                    )
+                record_idempotency_outcome(ctx, meta, idem.as_ref(), TXN_IDEMPOTENCY_CANCELLED)
                     .await;
-                }
                 let decoded_item = match &actual {
                     Some(bytes) => wire::decode_stored_item(bytes)?,
                     None => None,
@@ -5804,10 +5780,7 @@ async fn run_transact<E: Env, R: RelayClient>(
         ctx.data()
             .raftkv_metrics
             .incr(Metric::DynamoTransactWritesCommitted);
-        if let (Some(token), Some(fingerprint)) = (token, idempotency_fingerprint.as_deref()) {
-            record_transact_write_outcome(ctx, meta, token, fingerprint, TXN_IDEMPOTENCY_COMMITTED)
-                .await;
-        }
+        record_idempotency_outcome(ctx, meta, idem.as_ref(), TXN_IDEMPOTENCY_COMMITTED).await;
         return Ok(wire::empty_response());
     }
 
@@ -5851,16 +5824,7 @@ async fn run_transact<E: Env, R: RelayClient>(
             ctx.data()
                 .raftkv_metrics
                 .incr(Metric::DynamoTransactWritesCommitted);
-            if let (Some(token), Some(fingerprint)) = (token, idempotency_fingerprint.as_deref()) {
-                record_transact_write_outcome(
-                    ctx,
-                    meta,
-                    token,
-                    fingerprint,
-                    TXN_IDEMPOTENCY_COMMITTED,
-                )
-                .await;
-            }
+            record_idempotency_outcome(ctx, meta, idem.as_ref(), TXN_IDEMPOTENCY_COMMITTED).await;
             Ok(wire::empty_response())
         }
         Err(e) if e.is_ambiguous() => {
@@ -5890,43 +5854,32 @@ async fn run_transact<E: Env, R: RelayClient>(
             ctx.data()
                 .raftkv_metrics
                 .incr(Metric::DynamoTransactWritesCanceled);
-            if let (Some(token), Some(fingerprint)) = (token, idempotency_fingerprint.as_deref()) {
-                record_transact_write_outcome(
-                    ctx,
-                    meta,
-                    token,
-                    fingerprint,
-                    TXN_IDEMPOTENCY_CANCELLED,
-                )
-                .await;
-            }
+            record_idempotency_outcome(ctx, meta, idem.as_ref(), TXN_IDEMPOTENCY_CANCELLED).await;
             // Site 3 of ADR 0018's 2026-08-24 `CancellationReasons`
             // amendment (issue #374 C2b): `cp_txn` now returns a typed
             // `TxnAbortReason` naming a `(table, key)` — correlate it back
-            // to its own action index via `action_keys` (built above, same
-            // order as `actions`) so a write action's own condition/
+            // to its own action index via `action_index_of` (built above over
+            // `keys`, same order as `actions`) so a write action's own condition/
             // conflict flags the right entry, matching sites 1/2. `Other`,
             // or a `(table, key)` this coordinator never resolved (should
             // not happen, but never guess an index), falls back to the
             // aggregate-only shape.
             let matched = match &e {
-                crate::TxnAbortReason::ConditionFailed { table, key } => action_keys
-                    .iter()
-                    .position(|(t, k)| t == table && k == key)
-                    // `Item` is deliberately omitted: the old image isn't in
-                    // hand at this site and this path must not add a read
-                    // just to populate it (see this function's own doc).
-                    .map(|i| (i, wire::CancellationReason::conditional_check_failed(None))),
-                crate::TxnAbortReason::TransactionConflict { table, key } => action_keys
-                    .iter()
-                    .position(|(t, k)| t == table && k == key)
-                    .map(|i| (i, wire::CancellationReason::transaction_conflict())),
+                crate::TxnAbortReason::ConditionFailed { table, key } => {
+                    action_index_of(table, key)
+                        // `Item` is deliberately omitted: the old image isn't in
+                        // hand at this site and this path must not add a read
+                        // just to populate it (see this function's own doc).
+                        .map(|i| (i, wire::CancellationReason::conditional_check_failed(None)))
+                }
+                crate::TxnAbortReason::TransactionConflict { table, key } => {
+                    action_index_of(table, key)
+                        .map(|i| (i, wire::CancellationReason::transaction_conflict()))
+                }
                 // ADR 0065 §6: a throttled participant maps to
                 // `ThrottlingError` at its own action index, the identical
                 // by-`(table,key)` correlation the two arms above use.
-                crate::TxnAbortReason::Throttled { table, key } => action_keys
-                    .iter()
-                    .position(|(t, k)| t == table && k == key)
+                crate::TxnAbortReason::Throttled { table, key } => action_index_of(table, key)
                     .map(|i| (i, wire::CancellationReason::throttling_error())),
                 crate::TxnAbortReason::Other(_) => None,
             };
@@ -6156,6 +6109,19 @@ fn item_string<'a>(item: &'a Item, key: &str) -> Option<&'a str> {
     match item.get(key) {
         Some(AttributeValue::S(s)) => Some(s.as_str()),
         _ => None,
+    }
+}
+
+/// Record `outcome` for the `ClientRequestToken` claim `idem` holds (token,
+/// fingerprint), if the request carried a token at all.
+async fn record_idempotency_outcome<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
+    meta: &Metadata,
+    idem: Option<&(&str, String)>,
+    outcome: &'static str,
+) {
+    if let Some((token, fingerprint)) = idem {
+        record_transact_write_outcome(ctx, meta, token, fingerprint, outcome).await;
     }
 }
 
