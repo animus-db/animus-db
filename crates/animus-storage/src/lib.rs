@@ -24,6 +24,7 @@
 //! [`LsmEngine`]), and folding that into "key absent" / "range empty" would
 //! be a silent wrong answer, not a graceful one.
 
+mod flush_budget;
 mod lsm;
 mod memory;
 pub mod stall;
@@ -42,6 +43,10 @@ pub(crate) fn fixture_file_version(path: &std::path::Path) -> u32 {
         .unwrap_or_else(|| panic!("fixture {} is not named v<N>.bin", path.display()))
 }
 
+pub use flush_budget::{
+    DEFAULT_FLUSH_CAP_BYTES, DEFAULT_FLUSH_FLOOR_BYTES, DEFAULT_NODE_MEMTABLE_BUDGET_BYTES,
+    FlushBudget, FlushSlot,
+};
 pub use lsm::IoAdmission;
 #[doc(hidden)]
 pub use lsm::StallFault;

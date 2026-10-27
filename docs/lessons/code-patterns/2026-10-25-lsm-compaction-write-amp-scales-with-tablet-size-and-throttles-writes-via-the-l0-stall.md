@@ -31,3 +31,5 @@ investigation notes, not in the repo).
 - **Related find**: the LSM bloom filter's false-positive rate is ~3.5 % (target 1 %) because the two
   base hashes are FNV-1a over the same bytes with different offset bases; a persisted-format fix needs
   a manifest version bump (ADR 0073).
+
+**Follow-up (2026-10-27, #1389):** the flush size now comes from a per-node memtable budget (`FlushBudget`, ADR 0079 amendment): 7.1 -> 1.35 compaction bytes per ingested byte for a lone hot engine, back to 7.1 when 4096 engines are active.

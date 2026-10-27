@@ -220,6 +220,9 @@ const L1_TABLE_BUDGET: usize = 4;
 /// the default flush threshold so a flush usually covers and removes one or more
 /// whole segments.
 const DEFAULT_WAL_SEGMENT_BYTES: u64 = 64 * 1024;
+/// `LsmOptions::production()` WAL segment size: 1 MiB, a quarter of the
+/// adaptive flush cap, so a capped flush drops ~4 whole segments.
+const PRODUCTION_WAL_SEGMENT_BYTES: u64 = 1 << 20;
 /// Low bits of an HLC-packed version (`wall_ms << 20 | logical`); mirrors
 /// `animus-cp-data`'s `hlc::LOGICAL_BITS`. The storage crate stays HLC-agnostic
 /// (versions are opaque `u64`s to the engine); this only sizes the default grace.
@@ -392,6 +395,9 @@ impl LsmOptions {
     pub fn production() -> Self {
         Self {
             background_maintenance: true,
+            // Sized for the adaptive flush's cap (a few MiB memtable): a few
+            // segments per flush, not dozens of 64 KiB files (issue #1389).
+            wal_segment_bytes: PRODUCTION_WAL_SEGMENT_BYTES,
             l0_slowdown_factor: stall::DEFAULT_L0_SLOWDOWN_FACTOR,
             l0_stop_factor: stall::DEFAULT_L0_STOP_FACTOR,
             ..Self::default()
@@ -1128,6 +1134,9 @@ pub struct LsmEngine<E: Env> {
     /// ADR 0081: this engine's write-stall bookkeeping (levels, ledger
     /// registration, introspection counters).
     stall: Arc<StallState>,
+    /// The node's memtable budget slot (issue #1389), if installed; when set
+    /// it replaces `opts.flush_threshold_bytes` with the budget's live share.
+    flush_slot: Arc<std::sync::OnceLock<crate::flush_budget::FlushSlot>>,
 }
 
 /// Per-engine write-stall bookkeeping (ADR 0081). Everything here is
@@ -1508,6 +1517,7 @@ impl<E: Env> LsmEngine<E> {
             maintenance_consecutive_failures: Arc::new(AtomicU32::new(0)),
             maintenance_deferrals: Arc::new(AtomicU64::new(0)),
             compaction_gate: Arc::new(std::sync::OnceLock::new()),
+            flush_slot: Arc::new(std::sync::OnceLock::new()),
             compaction_retry_scheduled: Arc::new(AtomicBool::new(false)),
             stall: Arc::new(StallState::default()),
         })
@@ -1844,10 +1854,11 @@ impl<E: Env> LsmEngine<E> {
     /// The flush half of [`Self::maybe_flush_and_compact`]: flush the memtable if
     /// it is over the threshold (and no flush is already running).
     async fn flush_if_due(&self) -> Result<()> {
+        let threshold = self.flush_threshold();
         let should_flush = {
             let inner = self.lock();
             !inner.memtable.is_empty()
-                && inner.memtable_bytes >= self.opts.flush_threshold_bytes
+                && inner.memtable_bytes >= threshold
                 // A cheap decision-time hint; `flush` re-checks it under the
                 // maintenance lock and then *drains* in-flight applies behind the
                 // flush-pending entry gate (it no longer skips when one is in
@@ -1859,7 +1870,7 @@ impl<E: Env> LsmEngine<E> {
             if self.opts.stall_fault == StallFault::FlushGated {
                 self.wait_flush_behind_io_budget().await;
             }
-            self.flush_if_over(self.opts.flush_threshold_bytes).await?;
+            self.flush_if_over(threshold).await?;
         }
         Ok(())
     }
@@ -2074,6 +2085,31 @@ impl<E: Env> LsmEngine<E> {
         }
     }
 
+    /// Join the node's memtable budget (issue #1389): from now on this
+    /// engine's flush threshold is the budget's live per-engine share
+    /// (`clamp(budget / active engines, floor, cap)`) instead of
+    /// `LsmOptions::flush_threshold_bytes`, and the memtable hard cap follows
+    /// it. At most once; later calls are ignored.
+    pub fn set_flush_budget(&self, budget: &crate::flush_budget::FlushBudget) {
+        let _ = self.flush_slot.set(budget.slot());
+    }
+
+    /// The flush threshold in force now: the node budget's share when joined,
+    /// else `opts.flush_threshold_bytes`. Also refreshes this engine's
+    /// active/idle report to the budget (an engine is active while its
+    /// memtable holds bytes), so it is called on every write and flush.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn flush_threshold(&self) -> usize {
+        match self.flush_slot.get() {
+            Some(slot) => {
+                slot.set_dirty(self.lock().memtable_bytes > 0);
+                slot.budget().threshold()
+            }
+            None => self.opts.flush_threshold_bytes,
+        }
+    }
+
     /// Install the node's compaction pool ([`CompactionGate`]). At most once;
     /// a second call is ignored.
     pub fn set_compaction_gate(&self, gate: Arc<dyn CompactionGate>) {
@@ -2218,9 +2254,10 @@ impl<E: Env> LsmEngine<E> {
     /// write that still finds work due will trigger another task once this one
     /// finishes.
     fn trigger_background_maintenance(&self) {
+        let threshold = self.flush_threshold();
         let should_flush = {
             let inner = self.lock();
-            !inner.memtable.is_empty() && inner.memtable_bytes >= self.opts.flush_threshold_bytes
+            !inner.memtable.is_empty() && inner.memtable_bytes >= threshold
         };
         if should_flush
             && self
@@ -2289,7 +2326,12 @@ impl<E: Env> LsmEngine<E> {
     }
 
     async fn stall_gate(&self, bytes: u64) -> Result<()> {
-        let policy = self.opts.stall_policy();
+        let mut policy = self.opts.stall_policy();
+        if self.flush_slot.get().is_some() {
+            policy.memtable_cap = self
+                .flush_threshold()
+                .saturating_mul(BACKPRESSURE_OVERSHOOT_FACTOR);
+        }
         let mut guard = StallGuard::new(self);
         let mut polls = 0u64;
         let mut confirmed_full = false;
@@ -2590,6 +2632,8 @@ impl<E: Env> LsmEngine<E> {
         // Observability (ADR 0015): a flush actually committed (the manifest swap
         // is done and the new table is live).
         self.metrics.incr(Metric::StorageFlushes);
+        // The memtable may now be empty: stop counting against the node budget.
+        let _ = self.flush_threshold();
         // ADR 0081 decision 4: a flush is charged to the node's IO budget (so
         // the gauge shows real disk use) but never delayed by it.
         if let Some(gate) = self.compaction_gate.get() {

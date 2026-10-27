@@ -938,7 +938,7 @@ files by `remove` with orphans tolerated at open — is pinned by
 negative control (`set_sync_skips_dir_fsync`) that must fail the oracle. A new file the
 engine creates must be `sync`ed (or `replace`d/`link`ed) before anything depends on it.
 
-## Compaction write amplification grows with tablet size (known, unfixed)
+## Compaction write amplification grows with tablet size (byte-based trigger and adaptive flush landed, issue #1389)
 
 `LsmOptions::production()` keeps the test-sized defaults (64 KiB flush, trigger 4, 2 MB tables,
 fanout 4): an L0->L1 compaction rewrites every overlapping L1 table (all of L1 for hashed keys), so
@@ -948,3 +948,21 @@ of unique-key puts on a 3-node debug cluster). A byte-based L0 trigger with L0->
 memtable budget that lets the flush size scale, are the proposed fixes. See
 `docs/lessons/code-patterns/2026-10-25-lsm-compaction-write-amp-scales-with-tablet-size-and-throttles-writes-via-the-l0-stall.md`.
 Also: the Bloom filter FPR is ~3.5 % (correlated FNV hashes), not the 1 % target.
+
+**Adaptive flush size (issue #1389, ADR 0079 amendment 2026-10-27).** `flush_budget.rs`:
+`FlushBudget` is a cheap `Arc` of atomics shared by every engine on a node; each engine joins it
+with `LsmEngine::set_flush_budget` (a `FlushSlot`, `OnceLock`, like `set_stall_ledger`) and from then
+on `LsmEngine::flush_threshold()` returns `clamp(budget / active, floor, cap)` (64 KiB floor, 4 MiB
+cap, 256 MiB default budget) instead of `opts.flush_threshold_bytes`. "Active" = engines whose memtable
+is non-empty; `flush_threshold()` refreshes the slot on every write and after every flush, and a
+dropped engine leaves the count, so tablets waking, flushing, quiescing and being released move
+everyone's share with no clock and no lock. The write stall's memtable hard cap follows the live
+threshold (4x). Not durable, no format change. The sum of memtables stays within the budget while
+`budget / floor` engines are active or fewer; past that the floor binds by design. An idle engine keeps
+the bytes it accumulated under an older, larger share until its next write (transient overshoot).
+`LsmOptions::production()` also raises `wal_segment_bytes` to 1 MiB so a capped flush drops about four
+whole segments rather than sixty-four. Measured (`tests/it/lsm_adaptive_flush.rs`, 16 MiB hashed 1 KiB
+puts): compaction input bytes per ingested byte 7.1 at the fixed 64 KiB, 1.35 with the cap, and back to
+7.1 with 4096 other active engines (the negative control). `animusd --memtable-budget-bytes N`
+(`cluster_settings.memtable_budget_bytes`, 0 = off) sets it via `BackgroundBudget::flush_budget()`.
+

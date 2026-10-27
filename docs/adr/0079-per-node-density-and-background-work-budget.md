@@ -719,3 +719,34 @@ PlacementCapacityBlockedTablets` is an additive appended variant.
 **2026-10-17 note:** the refusal path this ADR said it lacked now exists: ADR 0080 refuses a client write that would wake a quiesced group when lag >= 100 ms and the awake set is at `A_eff`, and the node gate shrinks with the same lag. The ADR 0079 awake cap and the ADR 0080 `QueuedBytes` budget are independent bounds that compose; size the pod for the floor plus the budget plus the working set.
 
 **2026-10-18 note (ADR 0081):** decision 6 is answered. The L0 write stall and the compaction IO rate limit are ADR 0081 (issue #1300), implemented: per-engine L0 slowdown/stop levels before the WAL append (delay only, never `Err`), and a node-wide compaction write-bytes token bucket beside this ADR's permit pool (permit first, then bucket; the L0 bypass is also the bucket's urgent level, so the two limiters cannot deadlock a stall). The permit pool and its bypass are unchanged.
+
+## Amendment (2026-10-27, issue #1389): the node memtable budget sizes the flush
+
+A fixed per-tablet flush threshold fits neither end of the density range: 64 KiB makes a hot tablet
+flush a swarm of tiny L0 tables whose compaction dominates its writes (an experiment with a 2 MiB flush
+cut compaction bytes per commit about 10x), while 2 MiB times thousands of hosted tablets is the memory
+blow-up this ADR exists to prevent. So the threshold is a share of a per-node budget:
+
+    flush threshold = clamp(node_memtable_budget / active engines, floor, cap)
+
+- **Defaults:** budget 256 MiB (`--memtable-budget-bytes N`, `cluster_settings.memtable_budget_bytes`,
+  node-local class L, additive; `0` turns it off and engines keep the fixed `LsmOptions` threshold),
+  floor 64 KiB (the old fixed value), cap 4 MiB. A lone hot tablet flushes 4 MiB tables; at 4096 active
+  tablets each is back at 64 KiB.
+- **Active** = a hosted engine whose memtable holds bytes. It is counted by each engine, not derived
+  from the quiescence state, so it needs no clock and no entropy: an engine that flushes, is released or
+  is dropped stops counting, and every other engine's next threshold read sees the new share.
+- **Shape:** the same node-shared object pattern as the compaction pool and IO bucket. The budget lives
+  in `BackgroundBudget` (`flush_budget()`), `LsmTabletFactory` joins every tablet engine to it, the
+  engine consults it on each write and flush. The control keyspace engine does not join (it is tiny).
+- **Bound:** while `budget / floor` or fewer engines are active the sum of memtables stays within the
+  budget (plus one write each, plus a transient where an idle engine holds bytes sized for an older,
+  smaller share until its next write). Past that the floor binds and the total can exceed the budget; the
+  floor is what keeps flushes from degenerating. The ADR 0081 memtable hard cap is 4x the live threshold.
+- **WAL:** `LsmOptions::production()` raises the segment size to 1 MiB so a capped flush covers a few whole
+  segments. No durable format changes.
+- **Tests:** `animus-storage` `lsm_adaptive_flush` (compaction bytes per ingested byte 7.1 fixed vs 1.35
+  adaptive, 7.1 again when crowded to the floor), `FlushBudget` unit tests, and `animusd`
+  `sim_cluster_flush_budget` (8 hosted tablets per node on a 64 KiB scaled budget stay within it; the
+  control without a budget peaks at 478 KB).
+
