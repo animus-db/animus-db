@@ -1462,6 +1462,15 @@ type OnHostFn<E, S> = Box<dyn Fn(TabletId, &RaftKvNode<E, S>) + Send + Sync>;
 /// doc.
 type OnTeardownFn = Box<dyn Fn(TabletId) + Send + Sync>;
 
+/// Where `materialize_split_child`'s engine comes from: an already-cloned and
+/// trimmed engine to resume, a first-time fresh clone, or a fresh clone
+/// replacing a lost/corrupt earlier one (counts the `CpEngineRebuilt` metric).
+enum SplitChildSource<S> {
+    Resume(S),
+    Fresh,
+    Rebuild,
+}
+
 impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
     /// A fresh reconciler for one node. `env` is this node's `raftkv` env —
     /// every tablet's `RaftKvNode` this reconciler ever hosts runs on
@@ -2434,6 +2443,67 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         bootstrap_voters: BTreeSet<NodeId>,
         campaign: bool,
     ) {
+        let Some(engine) = self
+            .split_child_engine(parent, child.id, &range, &drop_range)
+            .await
+        else {
+            // Every failure exit of `split_child_engine` undoes `plan`'s
+            // optimistic claim identically.
+            self.state.release_unconfirmed_host(child.id);
+            self.state.split_forming.remove(&child.id);
+            return;
+        };
+        self.engines.insert(child.id, engine.clone());
+        let scope = StorageScope::new(range);
+        let voters: Vec<NodeId> = bootstrap_voters.into_iter().collect();
+        let profile = self.timing_profile_for(&voters);
+        // ADR 0058 Train 2 rung 4: the parent-leader-at-fork replica
+        // (`campaign`) campaigns for this child's leadership immediately
+        // instead of waiting out a cold randomized election timeout — see
+        // `start_hosted_campaigning`'s own doc for why this is safe.
+        //
+        // Issue #945: every split replica, campaigning or not, skips the
+        // issue #900/#667 boot-time cluster check (see `DriveState::
+        // skip_cluster_check`'s doc). They are all equally fresh by
+        // construction: they come from this same `materialize_split_child`
+        // call, for a brand new `TabletId` minted once, at the fork, from the
+        // parent's own committed entry. Gating the skip on `campaign` alone
+        // left every non-campaigning split replica's own `handle_request_vote`
+        // refusing a real vote to the campaigning sibling until its own
+        // cluster check resolved, silently degrading rung 4's "no added
+        // latency" deterministic-first-leader optimization on every split.
+        let node = RaftKvNode::start_hosted_with_options(
+            self.env.clone(),
+            voters,
+            engine,
+            scope,
+            child.id.0,
+            self.hosted_options(campaign, true),
+        );
+        if let Some(after) = self.quiesce_after {
+            node.enable_quiescence(after);
+        }
+        // ADR 0075 section 3.4: a fork child inherits the parent's replicas
+        // (`bootstrap_voters`), so it starts on the same profile; the per-tick
+        // re-apply corrects it once the child's own row exists.
+        node.set_timing_profile(profile);
+        (self.on_host)(child.id, &node);
+        self.hosted.insert(child.id, node);
+    }
+
+    /// The fallible half of [`materialize_split_child`](Self::materialize_split_child):
+    /// steps 1 and 2 of its G4 sequencing (probe/resume or fresh clone, trim,
+    /// flush, layout verify), returning the ready-to-host engine. Every
+    /// failure returns `None` after its own log/metric; the caller does the
+    /// one shared cleanup (`release_unconfirmed_host` + `split_forming`
+    /// removal), so no exit here may touch that state.
+    async fn split_child_engine(
+        &mut self,
+        parent: TabletId,
+        child: TabletId,
+        range: &KeyRange,
+        drop_range: &KeyRange,
+    ) -> Option<S> {
         // Issue #554, same shape as `ensure_engine`'s own doc: a `probe`
         // hit whose `open` then fails is treated as a lost/corrupt engine,
         // not a reason to keep retrying the same open forever. Unlike an
@@ -2445,8 +2515,7 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         // state is authoritative regardless of which attempt produced the
         // target, exactly like the G4 contract's own "crash before step 1"
         // case this re-enters.
-        let mut rebuilding = false;
-        let already_cloned = if self.factory.probe(child.id).await {
+        let source = if self.factory.probe(child).await {
             // G4 step 1 already committed on an earlier attempt (a crash
             // landed after the clone but before the group started) — never
             // re-clone. Recover the handle, then check the SEPARATE trim
@@ -2455,9 +2524,9 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
             // engine-commit half of G4 (the clone), not the trim step that
             // must still run on top of it — see `trim_marker.rs`'s module
             // doc for the bug this closes.
-            match self.factory.open(child.id).await {
-                Ok(engine) => match trim_marker_present(&engine, child.id).await {
-                    Ok(true) => Some(engine),
+            match self.factory.open(child).await {
+                Ok(engine) => match trim_marker_present(&engine, child).await {
+                    Ok(true) => SplitChildSource::Resume(engine),
                     Ok(false) => {
                         // Cloned, but trim never fully completed (a prior
                         // attempt either crashed between the clone and the
@@ -2469,24 +2538,22 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                         // and holds no committed state of its own yet — see
                         // `trim_split_child`'s doc for why re-running its
                         // (idempotent) deletes is always safe.
-                        if let Err(e) = trim_split_child(&engine, &drop_range, child.id).await {
+                        if let Err(e) = trim_split_child(&engine, drop_range, child).await {
                             tracing::warn!(
-                                child = child.id.0,
+                                child = child.0,
                                 parent = parent.0,
                                 %e,
                                 "reconciler: re-trimming a split child resumed from an \
                                  already-cloned-but-untrimmed engine"
                             );
-                            self.state.release_unconfirmed_host(child.id);
-                            self.state.split_forming.remove(&child.id);
-                            return;
+                            return None;
                         }
-                        self.flush_isolated(child.id, &engine).await;
-                        Some(engine)
+                        self.flush_isolated(child, &engine).await;
+                        SplitChildSource::Resume(engine)
                     }
                     Err(e) => {
                         tracing::warn!(
-                            child = child.id.0,
+                            child = child.0,
                             parent = parent.0,
                             %e,
                             "reconciler: reading a split child's trim-completion marker failed \
@@ -2494,188 +2561,131 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
                              (issue #554's own recovery shape)"
                         );
                         self.env.metrics().incr(Metric::CpEngineOpenFailed);
-                        self.factory.destroy(child.id).await;
-                        rebuilding = true;
-                        None
+                        self.factory.destroy(child).await;
+                        SplitChildSource::Rebuild
                     }
                 },
                 Err(e) => {
                     tracing::warn!(
-                        child = child.id.0,
+                        child = child.0,
                         parent = parent.0,
                         %e,
                         "reconciler: reopening a split child's already-cloned engine failed \
                          — treating as lost, destroying and re-cloning fresh (issue #554)"
                     );
                     self.env.metrics().incr(Metric::CpEngineOpenFailed);
-                    self.factory.destroy(child.id).await;
-                    rebuilding = true;
-                    None
+                    self.factory.destroy(child).await;
+                    SplitChildSource::Rebuild
                 }
             }
         } else {
-            None
+            SplitChildSource::Fresh
         };
-        let engine = if let Some(engine) = already_cloned {
-            engine
-        } else {
-            // The parent is a currently-hosted tablet — reuse its own
-            // already-open engine handle rather than asking the factory to
-            // re-open the same on-disk prefix a second time (see
-            // `EngineFactory::clone_engine`'s own doc for why that would be
-            // unsafe for `LsmEngine`).
-            // If `parent`'s own engine is already gone by the time this
-            // runs (its `Reclaim` teardown — planned in the SAME `plan`
-            // call, per phase 0.5's own doc — somehow already executed
-            // first, or a genuinely corrupt/unopenable parent engine),
-            // there is nothing left to clone from. `release_unconfirmed_
-            // host`/`split_forming.remove` below undo `plan`'s optimistic
-            // claim (mirroring every other failure branch in this
-            // function), so the NEXT `plan` call sees `child.id` neither in
-            // `next.hosted` nor named by a still-hosted parent's
-            // `pending_split` fact (the parent, if truly torn down, no
-            // longer produces a fact at all) — it therefore falls through
-            // to phase 1's ORDINARY `Host`, which hosts the child fresh
-            // with an empty engine and lets it catch up via `InstallSnapshot`
-            // from a peer that materialized correctly. This is the correct
-            // fallback, not a data-loss path: `Host`'s own `initial_
-            // formation`/needs-snapshot machinery is exactly what recovers
-            // a legitimately-behind replica in every other case. Retrying
-            // the same failing clone forever would be strictly worse.
-            let Some(parent_engine) = self.ensure_engine(parent).await else {
-                tracing::warn!(
-                    child = child.id.0,
-                    parent = parent.0,
-                    "reconciler: parent engine unavailable while materializing a split child — \
-                     falling back to an ordinary fresh Host next tick rather than retrying"
-                );
-                self.state.release_unconfirmed_host(child.id);
-                self.state.split_forming.remove(&child.id);
-                return;
-            };
-            // The child's own keep-set: its declared range within
-            // BASE/LSI/FOOTPRINT (the sibling's own half of each is what
-            // `clone_engine`'s whole-file assignment gets to skip linking
-            // entirely — see that method's own doc), nothing of
-            // CHANGE/CURSOR (a child is always born with an empty change
-            // log — `trim_split_child`, below, still deletes those two
-            // scopes unconditionally as a correctness backstop, not because
-            // this keep-set could ever be wrong about them).
-            let keep: Vec<(Vec<u8>, Option<Vec<u8>>)> =
-                [crate::KIND_BASE, crate::KIND_LSI, crate::KIND_FOOTPRINT]
-                    .into_iter()
-                    .map(|kind| {
-                        StorageScope::new(range.clone())
-                            .with_kind(kind)
-                            .physical_bounds()
-                    })
-                    .collect();
-            let engine = match self
-                .factory
-                .clone_engine(&parent_engine, child.id, &keep)
-                .await
-            {
-                Ok(engine) => engine,
-                Err(e) => {
+        let engine = match source {
+            SplitChildSource::Resume(engine) => engine,
+            source @ (SplitChildSource::Fresh | SplitChildSource::Rebuild) => {
+                // The parent is a currently-hosted tablet — reuse its own
+                // already-open engine handle rather than asking the factory to
+                // re-open the same on-disk prefix a second time (see
+                // `EngineFactory::clone_engine`'s own doc for why that would be
+                // unsafe for `LsmEngine`).
+                // If `parent`'s own engine is already gone by the time this
+                // runs (its `Reclaim` teardown — planned in the SAME `plan`
+                // call, per phase 0.5's own doc — somehow already executed
+                // first, or a genuinely corrupt/unopenable parent engine),
+                // there is nothing left to clone from. `release_unconfirmed_
+                // host`/`split_forming.remove` below undo `plan`'s optimistic
+                // claim, so the NEXT `plan` call sees `child` neither in
+                // `next.hosted` nor named by a still-hosted parent's
+                // `pending_split` fact (the parent, if truly torn down, no
+                // longer produces a fact at all) — it therefore falls through
+                // to phase 1's ORDINARY `Host`, which hosts the child fresh
+                // with an empty engine and lets it catch up via `InstallSnapshot`
+                // from a peer that materialized correctly. This is the correct
+                // fallback, not a data-loss path: `Host`'s own `initial_
+                // formation`/needs-snapshot machinery is exactly what recovers
+                // a legitimately-behind replica in every other case. Retrying
+                // the same failing clone forever would be strictly worse.
+                let Some(parent_engine) = self.ensure_engine(parent).await else {
                     tracing::warn!(
-                        child = child.id.0,
+                        child = child.0,
+                        parent = parent.0,
+                        "reconciler: parent engine unavailable while materializing a split child — \
+                         falling back to an ordinary fresh Host next tick rather than retrying"
+                    );
+                    return None;
+                };
+                // The child's own keep-set: its declared range within
+                // BASE/LSI/FOOTPRINT (the sibling's own half of each is what
+                // `clone_engine`'s whole-file assignment gets to skip linking
+                // entirely — see that method's own doc), nothing of
+                // CHANGE/CURSOR (a child is always born with an empty change
+                // log — `trim_split_child`, below, still deletes those two
+                // scopes unconditionally as a correctness backstop, not because
+                // this keep-set could ever be wrong about them).
+                let keep: Vec<(Vec<u8>, Option<Vec<u8>>)> =
+                    [crate::KIND_BASE, crate::KIND_LSI, crate::KIND_FOOTPRINT]
+                        .into_iter()
+                        .map(|kind| {
+                            StorageScope::new(range.clone())
+                                .with_kind(kind)
+                                .physical_bounds()
+                        })
+                        .collect();
+                let engine = match self
+                    .factory
+                    .clone_engine(&parent_engine, child, &keep)
+                    .await
+                {
+                    Ok(engine) => engine,
+                    Err(e) => {
+                        tracing::warn!(
+                            child = child.0,
+                            parent = parent.0,
+                            %e,
+                            "reconciler: cloning a split child's engine"
+                        );
+                        return None;
+                    }
+                };
+                if let Err(e) = trim_split_child(&engine, drop_range, child).await {
+                    tracing::warn!(
+                        child = child.0,
                         parent = parent.0,
                         %e,
-                        "reconciler: cloning a split child's engine"
+                        "reconciler: trimming a freshly cloned split child"
                     );
-                    self.state.release_unconfirmed_host(child.id);
-                    self.state.split_forming.remove(&child.id);
-                    return;
+                    return None;
                 }
-            };
-            if let Err(e) = trim_split_child(&engine, &drop_range, child.id).await {
-                tracing::warn!(
-                    child = child.id.0,
-                    parent = parent.0,
-                    %e,
-                    "reconciler: trimming a freshly cloned split child"
-                );
-                self.state.release_unconfirmed_host(child.id);
-                self.state.split_forming.remove(&child.id);
-                return;
+                self.flush_isolated(child, &engine).await;
+                if matches!(source, SplitChildSource::Rebuild) {
+                    tracing::warn!(
+                        child = child.0,
+                        parent = parent.0,
+                        "reconciler: rebuilt a split child's engine from a fresh clone after its \
+                         earlier clone was found lost"
+                    );
+                    self.env.metrics().incr(Metric::CpEngineRebuilt);
+                }
+                engine
             }
-            self.flush_isolated(child.id, &engine).await;
-            if rebuilding {
-                tracing::warn!(
-                    child = child.id.0,
-                    parent = parent.0,
-                    "reconciler: rebuilt a split child's engine from a fresh clone after its \
-                     earlier clone was found lost"
-                );
-                self.env.metrics().incr(Metric::CpEngineRebuilt);
-            }
-            engine
         };
         // ADR 0073 Phase 0 layer 4: by here trim completed (marker batch, or
         // the resume branch's marker check), and the trim batch carries this
         // child's own layout marker — verify (never stamp, never destroy) so
         // an engine trimmed by a build that did not write one is refused
         // rather than hosted unstamped.
-        if let Err(e) = layout::verify(&engine, child.id.0).await {
+        if let Err(e) = layout::verify(&engine, child.0).await {
             tracing::error!(
-                child = child.id.0,
+                child = child.0,
                 parent = parent.0,
                 %e,
                 "reconciler: refusing to host a split child whose engine layout marker is \
                  missing/unsupported — engine left untouched"
             );
-            self.state.release_unconfirmed_host(child.id);
-            self.state.split_forming.remove(&child.id);
-            return;
+            return None;
         }
-        self.engines.insert(child.id, engine.clone());
-        let scope = StorageScope::new(range);
-        let voters: Vec<NodeId> = bootstrap_voters.into_iter().collect();
-        let profile = self.timing_profile_for(&voters);
-        // ADR 0058 Train 2 rung 4: the parent-leader-at-fork replica
-        // campaigns for this child's leadership immediately instead of
-        // waiting out a cold randomized election timeout — see
-        // `start_hosted_campaigning`'s own doc for why this is safe.
-        let node = if campaign {
-            RaftKvNode::start_hosted_with_options(
-                self.env.clone(),
-                voters,
-                engine,
-                scope,
-                child.id.0,
-                self.hosted_options(true, true),
-            )
-        } else {
-            // Issue #945: this replica doesn't campaign, but it is exactly
-            // as provably fresh-by-construction as the sibling that does —
-            // both come from this same `materialize_split_child` call, a
-            // brand new `TabletId` minted once, at the fork, from the
-            // parent's own committed entry. Skip the issue #900/#667
-            // boot-time cluster check here too (see `DriveState::
-            // skip_cluster_check`'s doc): gating it on `campaign` alone
-            // left every non-campaigning split replica's own
-            // `handle_request_vote` refusing a real vote to the campaigning
-            // sibling until its own cluster check resolved, silently
-            // degrading ADR 0058 Train 2 rung 4's "no added latency"
-            // deterministic-first-leader optimization on every split.
-            RaftKvNode::start_hosted_with_options(
-                self.env.clone(),
-                voters,
-                engine,
-                scope,
-                child.id.0,
-                self.hosted_options(false, true),
-            )
-        };
-        if let Some(after) = self.quiesce_after {
-            node.enable_quiescence(after);
-        }
-        // ADR 0075 section 3.4: a fork child inherits the parent's replicas
-        // (`bootstrap_voters`), so it starts on the same profile; the per-tick
-        // re-apply corrects it once the child's own row exists.
-        node.set_timing_profile(profile);
-        (self.on_host)(child.id, &node);
-        self.hosted.insert(child.id, node);
+        Some(engine)
     }
 
     /// Execute a [`HostAction::Release`]/[`HostAction::Reclaim`]: unregister
