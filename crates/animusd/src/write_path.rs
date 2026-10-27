@@ -19,8 +19,7 @@ use animus_node::host::RelayClient;
 use crate::{
     CLIENT_TIMEOUT, CP_CONFIRM_POLL_MAX, ClientCtx, ClientRequest, ClientResponse, CpGroup,
     CpRoute, KindBatchSignal, KindWriteBatchItem, KindWriteOp, KvPair, ProbeIdentity, ProbeWait,
-    SCHEMA_POLL_INTERVAL, classify_kind_batch_outcome, decide, dynamo,
-    kind_batch_confirm_superseded, kind_poll,
+    SCHEMA_POLL_INTERVAL, decide, dynamo, kind_batch_confirm_superseded, kind_poll,
 };
 
 /// The message [`ClientCtx::cp_kind_eval_local`] returns for a confirmed-
@@ -1420,12 +1419,17 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             // happens to be identical), just not proof of success. See
             // `kind_batch_signal_tests` for the identity check exercised in
             // isolation.
-            let effects_readable = leader.engine_applied_index() >= accepted_index;
-            match classify_kind_batch_outcome(
-                leader.kind_batch_outcome(accepted_index),
-                accepted_term,
-                effects_readable,
-            ) {
+            //
+            // ONE `engine_applied_index` sample feeds both the confirm
+            // classification and the superseded proof (issue #1308): see
+            // `kind_poll`'s doc. The sample is taken first, so everything read
+            // after it (the outcome, the value below) is at least as new as
+            // the sample: apply records the outcome and merges the effects
+            // before it publishes the applied index.
+            let applied = leader.engine_applied_index();
+            let outcome = leader.kind_batch_outcome(accepted_index);
+            let (signal, superseded) = kind_poll(applied, accepted_index, accepted_term, &outcome);
+            match signal {
                 KindBatchSignal::Confirm => return ProbeWait::Confirmed,
                 // The caller's OCC round (re-read, re-evaluate) or a re-route.
                 KindBatchSignal::NoOp => return ProbeWait::Superseded,
@@ -1466,37 +1470,12 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             // Leadership-independent proof this index resolved against us
             // (issue #971 — see [`kind_batch_confirm_superseded`]'s own doc
             // for why `!is_leader()` alone is deliberately NOT consulted
-            // here any more).
-            if kind_batch_confirm_superseded(
-                leader.engine_applied_index(),
-                accepted_index,
-                accepted_term,
-                &leader.kind_batch_outcome(accepted_index),
-            ) {
-                // Close the probe-vs-apply race before giving up: the value-
-                // equality check above (and the outcome check that feeds
-                // `kind_batch_confirm_superseded`) can race this entry's own
-                // effects actually becoming visible during their own
-                // `.await` above — re-check the outcome first, then the
-                // value, before reporting `Superseded`.
-                if classify_kind_batch_outcome(
-                    leader.kind_batch_outcome(accepted_index),
-                    accepted_term,
-                    leader.engine_applied_index() >= accepted_index,
-                ) == KindBatchSignal::Confirm
-                {
-                    return ProbeWait::Confirmed;
-                }
-                // Same idempotency gate as the fallback above — a
-                // non-idempotent write must not consult the value here
-                // either, for the identical reason: a different,
-                // concurrently-committed entry's bytes prove nothing about
-                // whether THIS entry (about to be judged futile) applied.
-                if identity == ProbeIdentity::ValueProves
-                    && leader.local_get(probe_key).await.as_deref() == Some(probe_val)
-                {
-                    return ProbeWait::Confirmed;
-                }
+            // here any more). Taken from the same sample as the
+            // classification and checked after the value probe above, so an
+            // entry that applied and became readable after the sample is
+            // never reported superseded: at or past the index the sample's
+            // own outcome (read after it) already classified `Confirm`.
+            if superseded {
                 return ProbeWait::Superseded;
             }
             if leader.env().now() >= deadline {
@@ -1621,6 +1600,13 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             ProposeResult::Accepted { index, term } => {
                 let deadline = leader.env().now().saturating_add(CLIENT_TIMEOUT);
                 loop {
+                    // Sample the applied index BEFORE the value read: apply
+                    // merges an entry's effects before it publishes the
+                    // index, so a value read after the sample is at least as
+                    // new as the sample, and an entry at or below the
+                    // sampled index that does not read back is final
+                    // (issue #1308: one sample, never a re-check).
+                    let applied = leader.engine_applied_index();
                     if leader.local_get(&key).await.as_deref() == Some(value.as_slice()) {
                         return Ok(());
                     }
@@ -1630,18 +1616,11 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     // `!is_leader()` alone is deliberately NOT consulted
                     // here any more).
                     if kind_batch_confirm_superseded(
-                        leader.engine_applied_index(),
+                        applied,
                         index,
                         term,
                         &leader.kind_batch_outcome(index),
                     ) {
-                        // Close the probe-vs-apply race before giving up:
-                        // the value-equality check above can race this
-                        // entry's own effects actually becoming visible
-                        // during its own `.await`.
-                        if leader.local_get(&key).await.as_deref() == Some(value.as_slice()) {
-                            return Ok(());
-                        }
                         return Err(
                             "CP write superseded before its effect appeared (leadership churn \
                              or an apply-time no-op); retry"
@@ -1687,6 +1666,13 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             ProposeResult::Accepted { index, term } => {
                 let deadline = leader.env().now().saturating_add(CLIENT_TIMEOUT);
                 loop {
+                    // Sample the applied index BEFORE the value read: apply
+                    // merges an entry's effects before it publishes the
+                    // index, so a value read after the sample is at least as
+                    // new as the sample, and an entry at or below the
+                    // sampled index that does not read back is final
+                    // (issue #1308: one sample, never a re-check).
+                    let applied = leader.engine_applied_index();
                     if leader.local_get(&key).await.is_none() {
                         return Ok(());
                     }
@@ -1696,18 +1682,11 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     // `!is_leader()` alone is deliberately NOT consulted
                     // here any more).
                     if kind_batch_confirm_superseded(
-                        leader.engine_applied_index(),
+                        applied,
                         index,
                         term,
                         &leader.kind_batch_outcome(index),
                     ) {
-                        // Close the probe-vs-apply race before giving up:
-                        // the value-equality check above can race this
-                        // entry's own effects actually becoming visible
-                        // during its own `.await`.
-                        if leader.local_get(&key).await.is_none() {
-                            return Ok(());
-                        }
                         return Err(
                             "CP delete superseded before its effect appeared (leadership churn \
                              or an apply-time no-op); retry"
