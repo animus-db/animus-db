@@ -104,6 +104,7 @@ dependencies = [
  "animus-cp-data",
  "animus-dynamo",
  "animus-env",
+ "animus-item",
  "animus-tablet",
  "async-trait",
  "serde",

@@ -2410,12 +2410,6 @@ where
         self.snapshot_chunk_advances.get(peer).copied().unwrap_or(0)
     }
 
-    /// Applied entries not yet covered by the snapshot — the log prefix a
-    /// snapshot would truncate. The driver snapshots once this grows large.
-    pub fn applied_since_snapshot(&self) -> u64 {
-        self.last_applied.saturating_sub(self.snapshot_index)
-    }
-
     /// Number of log entries currently retained (the tail after the snapshot).
     pub fn log_len(&self) -> usize {
         self.log.len()

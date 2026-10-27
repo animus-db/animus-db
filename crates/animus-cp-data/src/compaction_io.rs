@@ -182,19 +182,6 @@ impl IoBucket {
             0
         }
     }
-
-    /// How long until a non-urgent request would be admitted at `rate_eff`
-    /// (zero when it would be admitted now). Informational.
-    #[must_use]
-    pub fn wait_for_credit(&self, lag_nanos: u64) -> std::time::Duration {
-        let eff = self.effective_rate(lag_nanos);
-        if self.rate == 0 || self.balance > 0 || eff == 0 {
-            return std::time::Duration::ZERO;
-        }
-        let need = (-self.balance) as u128 + 1;
-        let nanos = need / u128::from(eff);
-        std::time::Duration::from_nanos(u64::try_from(nanos + 1).unwrap_or(u64::MAX))
-    }
 }
 
 #[cfg(test)]

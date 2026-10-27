@@ -78,12 +78,6 @@ impl TimingProfile {
             }
         }
     }
-
-    /// Whether this is the WAN profile.
-    #[must_use]
-    pub fn is_wan(self) -> bool {
-        matches!(self, TimingProfile::Wan { .. })
-    }
 }
 
 /// The number of distinct region label values among `replicas`, looked up in
