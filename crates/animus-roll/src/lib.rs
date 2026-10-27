@@ -45,7 +45,6 @@
 //! /admin/roll-health` bodies into an [`Observation`]; the machine itself is
 //! independent of the wire.
 
-use std::collections::BTreeSet;
 use std::fmt;
 use std::time::Duration;
 
@@ -211,9 +210,6 @@ pub enum Block {
     Unhealthy { node: String, reasons: Vec<Reason> },
     /// A node could not be asked, so the gate cannot be evaluated: fail closed.
     Unobservable { node: String },
-    /// No verdict could be obtained from any node other than the target on a
-    /// cluster where some node must have the endpoint.
-    NoVerdict,
     /// A control node is next but no control leader is known.
     NoControlLeader,
     /// The control leader is next and there is nobody to hand leadership to.
@@ -239,7 +235,6 @@ impl fmt::Display for Block {
                 Ok(())
             }
             Block::Unobservable { node } => write!(f, "cannot read roll-health from {node}"),
-            Block::NoVerdict => write!(f, "no node could provide a roll-health verdict"),
             Block::NoControlLeader => write!(f, "no control leader is known"),
             Block::NoTransferTarget { leader } => write!(
                 f,
@@ -388,7 +383,7 @@ pub fn decide_with_target(cfg: &Config, obs: &Observation, next: Option<&str>) -
     };
 
     // The gate (D2).
-    if let Some(b) = gate(obs, Some(&target.id)) {
+    if let Some(b) = gate(obs, &target.id) {
         return Action::Blocked(b);
     }
 
@@ -425,10 +420,12 @@ pub fn decide_with_target(cfg: &Config, obs: &Observation, next: Option<&str>) -
     }
 }
 
-/// The D2 gate for touching (or finalizing past) the cluster, with `target`
-/// the node about to be restarted (excluded from the verdicts: its own answer
-/// is about to be stale).
-fn gate(obs: &Observation, target: Option<&String>) -> Option<Block> {
+/// The D2 gate for restarting `target` (excluded from the verdicts: its own
+/// answer is about to be stale). Only called once nothing is in flight, so every
+/// node on the new binary is already `done` (`Active`, health `Ok`); the only
+/// verdicts that can still differ are the other nodes still on the old binary,
+/// and those may lack the endpoint (`Unavailable`: tolerated).
+fn gate(obs: &Observation, target: &str) -> Option<Block> {
     for n in &obs.nodes {
         if !n.active() {
             return Some(Block::MemberNotActive {
@@ -437,17 +434,11 @@ fn gate(obs: &Observation, target: Option<&String>) -> Option<Block> {
             });
         }
     }
-    let mut ok_verdicts = 0usize;
     // Reasons are reported once per node, in id order.
-    let mut seen: BTreeSet<&str> = BTreeSet::new();
-    let mut nodes: Vec<&NodeObs> = obs.nodes.iter().collect();
+    let mut nodes: Vec<&NodeObs> = obs.nodes.iter().filter(|n| n.id != target).collect();
     nodes.sort_by(|a, b| a.id.cmp(&b.id));
     for n in nodes {
-        if target == Some(&n.id) || !seen.insert(n.id.as_str()) {
-            continue;
-        }
         match &n.health {
-            Health::Ok => ok_verdicts += 1,
             Health::NotOk(reasons) => {
                 return Some(Block::Unhealthy {
                     node: n.id.clone(),
@@ -457,21 +448,8 @@ fn gate(obs: &Observation, target: Option<&String>) -> Option<Block> {
             Health::Unreachable => {
                 return Some(Block::Unobservable { node: n.id.clone() });
             }
-            // A node on the previous binary has no endpoint: tolerated. A node
-            // already on the new one must answer (its absence is a gap, not a
-            // pass).
-            Health::Unavailable if n.platform == Platform::Old => {}
-            Health::Unavailable => {
-                return Some(Block::Unobservable { node: n.id.clone() });
-            }
+            Health::Ok | Health::Unavailable => {}
         }
-    }
-    // With at least one node on the new binary a verdict must exist; at the very
-    // start of a roll over previous-release binaries none can (D8 case 1), and the
-    // membership gate above is all there is.
-    let any_new = obs.nodes.iter().any(|n| n.platform == Platform::New);
-    if ok_verdicts == 0 && any_new {
-        return Some(Block::NoVerdict);
     }
     None
 }
@@ -483,9 +461,14 @@ fn finish(cfg: &Config, obs: &Observation) -> Action {
     if obs.active >= obs.goal {
         return Action::Complete;
     }
-    if let Some(b) = gate(obs, None) {
-        return Action::Blocked(b);
-    }
+    // No node is old or in flight here, so every node is new, `Active` and
+    // healthy: the D2 gate has nothing left to check.
+    debug_assert!(
+        obs.nodes
+            .iter()
+            .all(|n| n.platform == Platform::New && n.active() && n.health == Health::Ok),
+        "finish reached with a node that is not new, Active and healthy"
+    );
     if !obs.finalize_blockers.is_empty() || !obs.can_finalize {
         return Action::Blocked(Block::FinalizeBlocked {
             blockers: obs.finalize_blockers.clone(),
