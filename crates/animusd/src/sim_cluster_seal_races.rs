@@ -817,3 +817,130 @@ fn a_stale_veto_never_quiesces_a_group_with_an_unsealed_change_log_over_seeds() 
         run_a_stale_veto_never_quiesces_a_group_with_an_unsealed_change_log(0x5EA1_5100 + i);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #1410: a stale-snapshot trim must not delete a re-enabled stream's records
+// ---------------------------------------------------------------------------
+
+fn enable_stream_body(table: &str) -> Vec<u8> {
+    format!(
+        r#"{{"TableName":"{table}","StreamSpecification":
+            {{"StreamEnabled":true,"StreamViewType":"NEW_AND_OLD_IMAGES"}}}}"#
+    )
+    .into_bytes()
+}
+
+/// Issue #1410: `trim_janitor`'s unbounded (`trim_all`) delete runs against the
+/// catalog snapshot the tick took at its start. If the stream was disabled in
+/// that snapshot and re-enabled before the janitor scans, a record written
+/// under the new label is in the scan, no seal has covered it, and the
+/// unbounded delete destroys an acked write; the next disable's final seal
+/// then finds nothing to seal under the new label.
+///
+/// The race window is forced exactly: a snapshot is captured while the stream
+/// is disabled, the stream is re-enabled and one record is written, then the
+/// janitor runs with the stale snapshot (what a starved tick does). The
+/// exactly-once oracle (both records sealed, one per label) fails before the
+/// fix with the new label's shard missing.
+fn run_stale_trim_never_deletes_a_reenabled_streams_records(seed: u64) {
+    let mut cluster = SimCluster::new(seed, 3, 3);
+    let table = "trimrace";
+    create_table(&mut cluster, 0, table, true);
+    let tablet = *cluster
+        .metadata(0)
+        .tablets_for_table(table)
+        .next()
+        .unwrap_or_else(|| panic!("seed={seed}: no tablet"))
+        .0;
+    let l = (0..3u64)
+        .find(|&n| cluster.is_leader_local(n, tablet))
+        .unwrap_or_else(|| panic!("seed={seed}: tablet has no leader"));
+
+    let (s, b) = cluster.dynamo(l, "DynamoDB_20120810.PutItem", &put_body(table, "old"));
+    assert_eq!(s, 200, "seed={seed}: put old: {b}");
+    let (s, b) = cluster.dynamo(
+        l,
+        "DynamoDB_20120810.UpdateTable",
+        &disable_stream_body(table),
+    );
+    assert_eq!(s, 200, "seed={seed}: disable: {b}");
+
+    // The tick's start-of-tick snapshot: stream disabled.
+    let stale = cluster.spawn_detached(l, move |ctx| async move { ctx.metadata_fresh().await });
+    let stale = await_slot(
+        &mut cluster,
+        &stale,
+        Duration::from_millis(1),
+        Duration::from_secs(5),
+        "stale snapshot",
+    );
+    assert!(
+        stale.table_stream(table).is_none(),
+        "seed={seed}: snapshot must show the stream disabled"
+    );
+
+    // Re-enable and write one record under the new label.
+    let (s, b) = cluster.dynamo(
+        l,
+        "DynamoDB_20120810.UpdateTable",
+        &enable_stream_body(table),
+    );
+    assert_eq!(s, 200, "seed={seed}: re-enable: {b}");
+    let (s, b) = cluster.dynamo(l, "DynamoDB_20120810.PutItem", &put_body(table, "new"));
+    assert_eq!(s, 200, "seed={seed}: put new: {b}");
+
+    // The starved tick finally reaches its trim arm with the stale snapshot.
+    let trimmed = cluster.spawn_detached(l, move |ctx| async move {
+        let (_, group) = ctx
+            .edge
+            .hosted_groups()
+            .into_iter()
+            .find(|(t, _)| *t == tablet)
+            .expect("tablet hosted on its leader");
+        crate::index_drain::trim_janitor(&ctx, &stale, table, tablet, &group, &[], false, false)
+            .await
+    });
+    let out = await_slot(
+        &mut cluster,
+        &trimmed,
+        Duration::from_millis(5),
+        Duration::from_secs(30),
+        "trim_janitor",
+    );
+    assert_eq!(out, Ok(()), "seed={seed}: trim_janitor");
+
+    let (s, b) = cluster.dynamo(
+        l,
+        "DynamoDB_20120810.UpdateTable",
+        &disable_stream_body(table),
+    );
+    assert_eq!(s, 200, "seed={seed}: final disable: {b}");
+
+    let mut elapsed = Duration::ZERO;
+    loop {
+        let rows = sealed_rows(&cluster, l, tablet, false);
+        if rows.iter().map(|r| r.2).sum::<u64>() >= 2 {
+            assert_exactly_once(&rows, 2, seed, "re-enabled stream after a stale trim");
+            return;
+        }
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "seed={seed}: the record written under the re-enabled stream was lost \
+             (deleted by a stale-snapshot trim before the final seal): {rows:?}"
+        );
+        cluster.run_for(Duration::from_millis(50));
+        elapsed += Duration::from_millis(50);
+    }
+}
+
+#[test]
+fn a_stale_snapshot_trim_never_deletes_a_reenabled_streams_records() {
+    run_stale_trim_never_deletes_a_reenabled_streams_records(env_seed(0x5EA1_6001));
+}
+
+#[test]
+fn a_stale_snapshot_trim_never_deletes_a_reenabled_streams_records_over_seeds() {
+    for i in 0..5 {
+        run_stale_trim_never_deletes_a_reenabled_streams_records(0x5EA1_6100 + i);
+    }
+}
