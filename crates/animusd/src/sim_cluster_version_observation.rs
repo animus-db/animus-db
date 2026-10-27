@@ -37,6 +37,7 @@
 //!
 //! Replay one seed with `ANIMUS_SEED=<seed>`.
 
+use super::sim_support::poll_until;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
@@ -59,30 +60,6 @@ fn seeds() -> Vec<u64> {
 
 fn b2_ext() -> Vec<u8> {
     encode_ext(Some((1, 1)), Some("b2"))
-}
-
-/// Converged-or-timeout poll (this crate's per-module duplicate of the
-/// shared idiom).
-fn poll_until(
-    cluster: &mut SimCluster,
-    budget: Duration,
-    seed: u64,
-    what: &str,
-    mut cond: impl FnMut(&mut SimCluster) -> bool,
-) {
-    const STEP: Duration = Duration::from_millis(100);
-    let mut elapsed = Duration::ZERO;
-    loop {
-        if cond(cluster) {
-            return;
-        }
-        assert!(
-            elapsed < budget,
-            "seed={seed}: {what} never converged within {budget:?}"
-        );
-        cluster.run_for(STEP);
-        elapsed += STEP;
-    }
 }
 
 /// The leader's table: every node in `all` but the leader itself, with

@@ -228,6 +228,7 @@
 //! "combined growth" primitive named above, and (3) at the top of this
 //! doc is that natural next PR (C-14 PR 3).**
 
+use super::sim_support::poll_until;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -238,31 +239,6 @@ use super::sim_cluster::SimCluster;
 use super::sim_cluster_console::create_table_via_wire;
 use super::sim_support::{env_seed, json};
 use crate::config::NodeRole;
-
-/// Converged-or-timeout poll on `cond(cluster)` — the shared shape every
-/// `sim_cluster_*` module's own scenario-local convergence check uses
-/// (duplicated, not reached into, per this crate's own convention).
-fn poll_until(
-    cluster: &mut SimCluster,
-    budget: Duration,
-    seed: u64,
-    what: &str,
-    mut cond: impl FnMut(&mut SimCluster) -> bool,
-) {
-    const STEP: Duration = Duration::from_millis(100);
-    let mut elapsed = Duration::ZERO;
-    loop {
-        if cond(cluster) {
-            return;
-        }
-        assert!(
-            elapsed < budget,
-            "seed={seed}: {what} never converged within {budget:?}"
-        );
-        cluster.run_for(STEP);
-        elapsed += STEP;
-    }
-}
 
 fn admin_get(cluster: &mut SimCluster, node: u64, path: &str) -> (u16, serde_json::Value) {
     let (status, body) = cluster.admin(node, "GET", path, "", &[]);

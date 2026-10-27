@@ -32,6 +32,7 @@
 //!   agreeing with the dashboard's tablet ladder on the same state;
 //! - the joiner's pure range check and the `JoinInfo` additive-field shape.
 
+use super::sim_support::poll_until;
 use std::time::Duration;
 
 use animus_control::MetaCommand;
@@ -51,30 +52,6 @@ fn seeds() -> Vec<u64> {
         return vec![s];
     }
     (0..3).map(|i| 0x7C20_0000 + i).collect()
-}
-
-/// Converged-or-timeout poll (this crate's per-module duplicate of the shared
-/// idiom).
-fn poll_until(
-    cluster: &mut SimCluster,
-    budget: Duration,
-    seed: u64,
-    what: &str,
-    mut cond: impl FnMut(&mut SimCluster) -> bool,
-) {
-    const STEP: Duration = Duration::from_millis(100);
-    let mut elapsed = Duration::ZERO;
-    loop {
-        if cond(cluster) {
-            return;
-        }
-        assert!(
-            elapsed < budget,
-            "seed={seed}: {what} never converged within {budget:?}"
-        );
-        cluster.run_for(STEP);
-        elapsed += STEP;
-    }
 }
 
 const ROLES: [NodeRole; 4] = [

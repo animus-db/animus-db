@@ -173,6 +173,7 @@
 //! Replays (repo convention): `ANIMUS_SEED=<seed> cargo test -p animusd
 //! --lib <scenario name>`.
 
+use super::sim_support::poll_until;
 use super::sim_support::{env_seed, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -1184,32 +1185,6 @@ fn console_error_mapping_and_json_routing_assertions_over_seeds() {
 // ---------------------------------------------------------------------------
 // PR 4c: role split — tests/console_endpoint.rs's two role-named tests
 // ---------------------------------------------------------------------------
-
-/// Converged-or-timeout poll on `cond(cluster)` — the shared shape every
-/// `sim_cluster_*` module's own scenario-local convergence checks use
-/// (duplicated, not reached into, per this crate's own convention —
-/// `sim_cluster_control_data_split.rs` carries the identical copy).
-fn poll_until(
-    cluster: &mut SimCluster,
-    budget: Duration,
-    seed: u64,
-    what: &str,
-    mut cond: impl FnMut(&mut SimCluster) -> bool,
-) {
-    const STEP: Duration = Duration::from_millis(100);
-    let mut elapsed = Duration::ZERO;
-    loop {
-        if cond(cluster) {
-            return;
-        }
-        assert!(
-            elapsed < budget,
-            "seed={seed}: {what} never converged within {budget:?}"
-        );
-        cluster.run_for(STEP);
-        elapsed += STEP;
-    }
-}
 
 // ---------------------------------------------------------------------------
 // (11) console_endpoint.rs::console_serves_shell_on_data_only_node

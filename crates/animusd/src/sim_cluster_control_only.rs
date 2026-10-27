@@ -128,6 +128,7 @@
 //!     once the fresh, post-restart loop is the only one that could have
 //!     ever seen it).
 
+use super::sim_support::poll_until;
 use std::time::Duration;
 
 use animus_env::nid;
@@ -164,34 +165,6 @@ fn create_table(cluster: &mut SimCluster, node: u64, table: &str) -> (u16, Strin
             "AttributeDefinitions":[{{"AttributeName":"pk","AttributeType":"S"}}]}}"#
     );
     create_table_via_wire(cluster, node, &body)
-}
-
-/// Converged-or-timeout poll on `cond(cluster)` — the shared shape every
-/// `sim_cluster_*` module's own scenario-local convergence checks use
-/// (`sim_cluster_growth.rs::poll_until_member_active`'s identical idiom),
-/// duplicated here rather than reached into a sibling module's private
-/// helper (this crate's own "small fixtures duplicated per test module"
-/// convention).
-fn poll_until(
-    cluster: &mut SimCluster,
-    budget: Duration,
-    seed: u64,
-    what: &str,
-    mut cond: impl FnMut(&mut SimCluster) -> bool,
-) {
-    const STEP: Duration = Duration::from_millis(100);
-    let mut elapsed = Duration::ZERO;
-    loop {
-        if cond(cluster) {
-            return;
-        }
-        assert!(
-            elapsed < budget,
-            "seed={seed}: {what} never converged within {budget:?}"
-        );
-        cluster.run_for(STEP);
-        elapsed += STEP;
-    }
 }
 
 /// Bounded converged-or-timeout poll for the always-on TTL reaper — mirrors

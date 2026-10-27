@@ -157,6 +157,7 @@
 //!     confirms the newly created table is genuinely servable, not merely
 //!     catalog-visible.
 
+use super::sim_support::poll_until;
 use std::time::Duration;
 
 use super::sim_cluster::SimCluster;
@@ -192,33 +193,6 @@ fn create_table(cluster: &mut SimCluster, node: u64, table: &str) -> (u16, Strin
             "AttributeDefinitions":[{{"AttributeName":"pk","AttributeType":"S"}}]}}"#
     );
     create_table_via_wire(cluster, node, &body)
-}
-
-/// Converged-or-timeout poll on `cond(cluster)` — the shared shape every
-/// `sim_cluster_*` module's own scenario-local convergence checks use,
-/// mirrored (not reached into) from `sim_cluster_control_only.rs`'s
-/// identically-named helper per this crate's own "small fixtures
-/// duplicated per test module" convention.
-fn poll_until(
-    cluster: &mut SimCluster,
-    budget: Duration,
-    seed: u64,
-    what: &str,
-    mut cond: impl FnMut(&mut SimCluster) -> bool,
-) {
-    const STEP: Duration = Duration::from_millis(100);
-    let mut elapsed = Duration::ZERO;
-    loop {
-        if cond(cluster) {
-            return;
-        }
-        assert!(
-            elapsed < budget,
-            "seed={seed}: {what} never converged within {budget:?}"
-        );
-        cluster.run_for(STEP);
-        elapsed += STEP;
-    }
 }
 
 // ---------------------------------------------------------------------------
