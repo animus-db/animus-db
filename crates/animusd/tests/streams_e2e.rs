@@ -19,7 +19,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use animus_control::Metadata;
 use animus_cp_data::segment;
 use animus_tablet::{TabletId, partition_token};
 use animusd::{
@@ -32,6 +31,7 @@ use tokio::net::TcpStream;
 use tokio::time::sleep;
 
 mod support;
+use support::{await_true, dynamo, field, tablets_for};
 
 /// Ceiling for [`dynamo_retrying`]/[`get_records_allow_trim`]'s bounded
 /// retry loop against a **known, self-resolving** transient (the ADR 0050
@@ -139,40 +139,6 @@ async fn start_streamed_cluster_with_change_rate(
     .unwrap()
 }
 
-async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
-    let mut stream = TcpStream::connect(addr).await.expect("connect to dynamo");
-    let request = format!(
-        "POST / HTTP/1.1\r\n\
-         Host: animus\r\n\
-         X-Amz-Target: {target}\r\n\
-         Content-Type: application/x-amz-json-1.0\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {body}",
-        body.len(),
-    );
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .expect("send request");
-    stream.flush().await.expect("flush");
-    let mut raw = Vec::new();
-    stream
-        .read_to_end(&mut raw)
-        .await
-        .expect("read full response");
-    let text = String::from_utf8(raw).expect("utf8 response");
-    let (head, payload) = text.split_once("\r\n\r\n").expect("response has a body");
-    let status: u16 = head
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse().ok())
-        .expect("status line");
-    (status, payload.to_string())
-}
-
 async fn admin(addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -> (u16, Value) {
     let mut stream = TcpStream::connect(addr).await.expect("connect to admin");
     let body = body.unwrap_or("");
@@ -198,20 +164,6 @@ async fn admin(addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -
 
 fn json(body: &str) -> Value {
     serde_json::from_str(body).unwrap_or_else(|e| panic!("invalid JSON ({e}): {body}"))
-}
-
-fn field(body: &str, name: &str) -> String {
-    let needle = format!("\"{name}\":\"");
-    let start = body
-        .find(&needle)
-        .unwrap_or_else(|| panic!("field `{name}` not found in: {body}"))
-        + needle.len();
-    let end = body[start..].find('"').expect("closing quote") + start;
-    body[start..end].to_owned()
-}
-
-fn tablets_for(meta: &Metadata, table: &str) -> Vec<TabletId> {
-    meta.tablets_for_table(table).map(|(&t, _)| t).collect()
 }
 
 /// `PutItem`s `{"id": "o{i:05}", "body": filler}` into table `orders` via
@@ -961,19 +913,6 @@ async fn drain_all_tablets_lineage(
                  {chain_lens:?}",
                 collected.len()
             );
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-}
-
-async fn await_true(secs: u64, msg: &str, mut check: impl FnMut() -> bool) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
-    loop {
-        if check() {
-            return;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("{msg} (timed out after {secs}s)");
         }
         sleep(Duration::from_millis(50)).await;
     }

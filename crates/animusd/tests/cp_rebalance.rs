@@ -18,36 +18,12 @@ use std::time::Duration;
 
 use animus_env::NodeId;
 use animusd::{ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, read_frame};
-use serde_json::Value;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
 mod support;
+use support::admin_get;
 
 const TABLES: [&str; 6] = ["kv0", "kv1", "kv2", "kv3", "kv4", "kv5"];
-
-async fn admin_get(addr: SocketAddr, path: &str) -> (u16, Value) {
-    let mut stream = TcpStream::connect(addr).await.expect("connect to admin");
-    let request = format!("GET {path} HTTP/1.0\r\nHost: animus\r\nConnection: close\r\n\r\n");
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .expect("send request");
-    stream.flush().await.expect("flush");
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).await.expect("read response");
-    let text = String::from_utf8(raw).expect("utf8 response");
-    let (head, payload) = text.split_once("\r\n\r\n").expect("response has a body");
-    let status: u16 = head
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse().ok())
-        .expect("status line");
-    let value: Value = serde_json::from_str(payload).expect("admin body is JSON");
-    (status, value)
-}
 
 /// The full replicated tablet map, `TabletId -> (replicas, epoch)`, from a
 /// node's `/admin/status` (`Metadata`, identical on every node).

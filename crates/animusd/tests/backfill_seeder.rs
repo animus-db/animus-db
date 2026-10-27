@@ -48,15 +48,7 @@ use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
 mod support;
-
-async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
-    let mut stream = animusd::connect_client(addr).await.expect("connect");
-    animusd::write_frame(&mut stream, &req).await.expect("send");
-    read_frame(&mut stream)
-        .await
-        .expect("read")
-        .expect("a reply")
-}
+use support::call;
 
 /// Bring up an `n`-node per-process combined cluster — duplicated from
 /// `tests/index_backfill.rs` rather than shared, per this codebase's own

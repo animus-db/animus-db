@@ -13,8 +13,13 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use animus_control::Metadata;
+use animus_tablet::TabletId;
 use animusd::config::{NodeRole, TlsSection};
-use animusd::{ClusterConfig, Node, RoleAddrs, StorageBackend};
+use animusd::{
+    ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, StorageBackend, read_frame,
+};
+use serde_json::Value;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -1410,4 +1415,246 @@ pub async fn cluster_status_snapshot(config: &ClusterConfig) -> String {
         out.push('\n');
     }
     out
+}
+
+// ---------------------------------------------------------------------
+// Raw-wire client helpers shared by the `dynamo_*`/admin/client-port tests.
+// Each was previously copied byte-for-byte into every file that used it.
+// ---------------------------------------------------------------------
+
+/// One DynamoDB request over a fresh HTTP/1.1 connection, returning `(status, body)`.
+pub async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
+    let mut stream = TcpStream::connect(addr).await.expect("connect to dynamo");
+    let request = format!(
+        "POST / HTTP/1.1\r\n\
+         Host: animus\r\n\
+         X-Amz-Target: {target}\r\n\
+         Content-Type: application/x-amz-json-1.0\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {body}",
+        body.len(),
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("send request");
+    stream.flush().await.expect("flush");
+    let mut raw = Vec::new();
+    stream
+        .read_to_end(&mut raw)
+        .await
+        .expect("read full response");
+    let text = String::from_utf8(raw).expect("utf8 response");
+    let (head, payload) = text.split_once("\r\n\r\n").expect("response has a body");
+    let status: u16 = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .expect("status line");
+    (status, payload.to_string())
+}
+
+/// Parse a response body as JSON, panicking with the body on failure.
+pub fn json(body: &str) -> serde_json::Value {
+    serde_json::from_str(body).unwrap_or_else(|e| panic!("invalid JSON ({e}): {body}"))
+}
+
+/// One framed client-port request over a fresh connection.
+pub async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
+    let mut stream = animusd::connect_client(addr).await.expect("connect");
+    animusd::write_frame(&mut stream, &req).await.expect("send");
+    read_frame(&mut stream)
+        .await
+        .expect("read")
+        .expect("a reply")
+}
+
+/// `GET` an admin path over a fresh HTTP/1.0 connection, returning `(status, JSON body)`.
+pub async fn admin_get(addr: SocketAddr, path: &str) -> (u16, Value) {
+    let mut stream = TcpStream::connect(addr).await.expect("connect to admin");
+    let request = format!("GET {path} HTTP/1.0\r\nHost: animus\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("send request");
+    stream.flush().await.expect("flush");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.expect("read response");
+    let text = String::from_utf8(raw).expect("utf8 response");
+    let (head, payload) = text.split_once("\r\n\r\n").expect("response has a body");
+    let status: u16 = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .expect("status line");
+    let value: Value = serde_json::from_str(payload).expect("admin body is JSON");
+    (status, value)
+}
+
+/// Send an admin request (`method path` with an optional JSON body) over a fresh HTTP/1.0 connection, returning `(status, JSON body)`; a non-JSON body is `Null`.
+pub async fn admin(addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -> (u16, Value) {
+    let mut stream = TcpStream::connect(addr).await.expect("connect to admin");
+    let body = body.unwrap_or("");
+    let request = format!(
+        "{method} {path} HTTP/1.0\r\nHost: animus\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len(),
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("send request");
+    stream.flush().await.expect("flush");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.expect("read response");
+    let text = String::from_utf8(raw).expect("utf8 response");
+    let (head, payload) = text.split_once("\r\n\r\n").expect("response has a body");
+    let status: u16 = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .expect("status line");
+    let json: Value = serde_json::from_str(payload.trim()).unwrap_or(Value::Null);
+    (status, json)
+}
+
+/// The bare DynamoDB error code (the part of `__type` after `#`) of an error body.
+pub fn error_code(body: &str) -> String {
+    json(body)["__type"]
+        .as_str()
+        .map(|t| t.rsplit('#').next().unwrap_or(t).to_owned())
+        .unwrap_or_else(|| panic!("no __type in error body: {body}"))
+}
+
+/// Create a hash-keyed (`id`, `S`) table through the DynamoDB wire, asserting a 200.
+pub async fn create_table(dynamo_addr: SocketAddr, table: &str) {
+    let (status, body) = dynamo(
+        dynamo_addr,
+        "DynamoDB_20120810.CreateTable",
+        &format!(
+            r#"{{"TableName":"{table}",
+                "KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}],
+                "AttributeDefinitions":[{{"AttributeName":"id","AttributeType":"S"}}]}}"#
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "CreateTable({table}) failed: {body}");
+}
+
+/// Put a `{pk, val}` string item through the DynamoDB wire, asserting a 200.
+pub async fn put_item(addr: SocketAddr, table: &str, pk: &str, val: &str) {
+    let body = format!(
+        r#"{{"TableName":"{table}","Item":{{"pk":{{"S":"{pk}"}},"val":{{"S":"{val}"}}}}}}"#
+    );
+    let (status, resp) = dynamo(addr, "DynamoDB_20120810.PutItem", &body).await;
+    assert_eq!(status, 200, "PutItem {table}/{pk} failed: {resp}");
+}
+
+/// Poll `DescribeTable` until the table is `ACTIVE`, panicking after 20 s.
+pub async fn await_table_active(addr: SocketAddr, table: &str) {
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let (status, body) = dynamo(
+                addr,
+                "DynamoDB_20120810.DescribeTable",
+                &format!(r#"{{"TableName":"{table}"}}"#),
+            )
+            .await;
+            if status == 200 && json(&body)["Table"]["TableStatus"] == "ACTIVE" {
+                return;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("table `{table}` did not converge to ACTIVE in 20s"));
+}
+
+/// The tablet ids of `table` in `meta`.
+pub fn tablets_for(meta: &Metadata, table: &str) -> Vec<TabletId> {
+    meta.tablets_for_table(table).map(|(&t, _)| t).collect()
+}
+
+/// The string value of the first `"name":"..."` field in a raw JSON body.
+pub fn field(body: &str, name: &str) -> String {
+    let needle = format!("\"{name}\":\"");
+    let start = body
+        .find(&needle)
+        .unwrap_or_else(|| panic!("field `{name}` not found in: {body}"))
+        + needle.len();
+    let end = body[start..].find('"').expect("closing quote") + start;
+    body[start..end].to_owned()
+}
+
+/// Poll `check` every 50 ms until it holds, panicking with `msg` after `secs` seconds.
+pub async fn await_true(secs: u64, msg: &str, mut check: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        if check() {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("{msg} (timed out after {secs}s)");
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Retry a client-port `Put` until it succeeds (25 s budget), panicking on any other reply.
+pub async fn put_until_ok(addr: SocketAddr, table: &str, key: &[u8], value: &[u8]) {
+    timeout(Duration::from_secs(25), async {
+        loop {
+            match call(
+                addr,
+                ClientRequest::Put {
+                    key: key.to_vec(),
+                    value: value.to_vec(),
+                    table: table.to_string(),
+                },
+            )
+            .await
+            {
+                ClientResponse::PutOk => return,
+                ClientResponse::Error(_) => sleep(Duration::from_millis(150)).await,
+                other => panic!("unexpected put response: {other:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("put {table}/{key:?} did not succeed in 25s"));
+}
+
+/// The id of the one tablet of `table`; asserts there is exactly one.
+pub fn sole_tablet_of(node: &Node, table: &str) -> u64 {
+    let meta = node.metadata();
+    let ids: Vec<u64> = meta
+        .tablets
+        .iter()
+        .filter(|(_, t)| t.table.as_deref() == Some(table))
+        .map(|(id, _)| id.0)
+        .collect();
+    assert_eq!(
+        ids.len(),
+        1,
+        "expected exactly one tablet of {table}: {ids:?}"
+    );
+    ids[0]
+}
+
+/// Ask the admin API to split `tablet` at `split_key`, asserting a 200.
+pub async fn kickoff_tablet(node: &Node, tablet: u64, split_key: &str) {
+    let (status, body) = admin(
+        node.admin_addr(),
+        "POST",
+        "/admin/tablet/split",
+        Some(&format!(
+            "{{\"tablet\":{tablet},\"split_key\":\"{split_key}\"}}"
+        )),
+    )
+    .await;
+    assert_eq!(status, 200, "kickoff of tablet {tablet} failed: {body}");
 }

@@ -27,51 +27,14 @@
 use std::net::SocketAddr;
 
 use animusd::StorageBackend;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 mod support;
+use support::dynamo;
 
 /// AWS's per-item size cap, mirrored from `animus_dynamo::wire::
 /// MAX_ITEM_SIZE_BYTES` (not imported directly — this is an end-to-end test
 /// over the wire, not a unit test against the crate's internals).
 const MAX_ITEM_SIZE_BYTES: usize = 409_600;
-
-/// One DynamoDB JSON request over a fresh HTTP/1.1 connection → `(status,
-/// body)`. Mirrors every other `tests/dynamo_*.rs` file's identical helper.
-async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
-    let mut stream = TcpStream::connect(addr).await.expect("connect to dynamo");
-    let request = format!(
-        "POST / HTTP/1.1\r\n\
-         Host: animus\r\n\
-         X-Amz-Target: {target}\r\n\
-         Content-Type: application/x-amz-json-1.0\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {body}",
-        body.len(),
-    );
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .expect("send request");
-    stream.flush().await.expect("flush");
-    let mut raw = Vec::new();
-    stream
-        .read_to_end(&mut raw)
-        .await
-        .expect("read full response");
-    let text = String::from_utf8(raw).expect("utf8 response");
-    let (head, payload) = text.split_once("\r\n\r\n").expect("response has a body");
-    let status: u16 = head
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse().ok())
-        .expect("status line");
-    (status, payload.to_string())
-}
 
 async fn create_table(addr: SocketAddr, table: &str) {
     let (status, body) = dynamo(

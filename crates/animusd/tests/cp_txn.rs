@@ -22,10 +22,11 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use animusd::{ClientRequest, ClientResponse, Node, read_frame};
+use animusd::{ClientRequest, ClientResponse, Node};
 use tokio::time::{sleep, timeout};
 
 mod support;
+use support::call;
 
 /// Send `request` wrapped in `ClientRequest::Forwarded` directly to `addr`
 /// — the shape `ClientCtx::cp_forward` uses internally, and the mechanism
@@ -483,15 +484,6 @@ fn txn_key(prefix: &str, suffix: &str) -> Vec<u8> {
         s.push('_');
     }
     s.into_bytes()
-}
-
-async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
-    let mut stream = animusd::connect_client(addr).await.expect("connect");
-    animusd::write_frame(&mut stream, &req).await.expect("send");
-    read_frame(&mut stream)
-        .await
-        .expect("read")
-        .expect("a reply")
 }
 
 /// Mirrors `cp_cross_process.rs`'s identical helper: `n` per-process nodes,

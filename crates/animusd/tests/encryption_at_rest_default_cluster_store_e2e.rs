@@ -29,11 +29,10 @@ use animusd::{
     BackupStoreConfig, Node, SegmentStoreConfig, StorageBackend, StreamSealKnobs,
     bind_cluster_with_advertise_host_and_key, start_cluster_with_growth_and_quiesce_after,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
 mod support;
+use support::{await_table_active, dynamo, json, put_item};
 
 const PLAINTEXT_NEEDLE: &str = "default-cluster-store-secret-77";
 
@@ -135,58 +134,12 @@ async fn await_sealed_shard(nodes: &[Node], table: &str) {
     .unwrap_or_else(|_| panic!("`{table}` never sealed a shard on every node within 20s"));
 }
 
-async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
-    let mut stream = TcpStream::connect(addr).await.expect("connect to dynamo");
-    let request = format!(
-        "POST / HTTP/1.1\r\n\
-         Host: animus\r\n\
-         X-Amz-Target: {target}\r\n\
-         Content-Type: application/x-amz-json-1.0\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {body}",
-        body.len(),
-    );
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .expect("send request");
-    stream.flush().await.expect("flush");
-    let mut raw = Vec::new();
-    stream
-        .read_to_end(&mut raw)
-        .await
-        .expect("read full response");
-    let text = String::from_utf8(raw).expect("utf8 response");
-    let (head, payload) = text.split_once("\r\n\r\n").expect("response has a body");
-    let status: u16 = head
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse().ok())
-        .expect("status line");
-    (status, payload.to_string())
-}
-
-fn json(body: &str) -> serde_json::Value {
-    serde_json::from_str(body).unwrap_or_else(|e| panic!("invalid JSON ({e}): {body}"))
-}
-
 async fn create_streamed_table(addr: SocketAddr, name: &str) {
     let body = format!(
         r#"{{"TableName":"{name}","AttributeDefinitions":[{{"AttributeName":"pk","AttributeType":"S"}}],"KeySchema":[{{"AttributeName":"pk","KeyType":"HASH"}}],"StreamSpecification":{{"StreamEnabled":true,"StreamViewType":"NEW_AND_OLD_IMAGES"}}}}"#
     );
     let (status, resp) = dynamo(addr, "DynamoDB_20120810.CreateTable", &body).await;
     assert_eq!(status, 200, "CreateTable {name} failed: {resp}");
-}
-
-async fn put_item(addr: SocketAddr, table: &str, pk: &str, val: &str) {
-    let body = format!(
-        r#"{{"TableName":"{table}","Item":{{"pk":{{"S":"{pk}"}},"val":{{"S":"{val}"}}}}}}"#
-    );
-    let (status, resp) = dynamo(addr, "DynamoDB_20120810.PutItem", &body).await;
-    assert_eq!(status, 200, "PutItem {table}/{pk} failed: {resp}");
 }
 
 async fn get_item_consistent(addr: SocketAddr, table: &str, pk: &str) -> Option<String> {
@@ -249,25 +202,6 @@ async fn restore_table(
         &format!(r#"{{"BackupArn":"{backup_arn}","TargetTableName":"{target_table_name}"}}"#),
     )
     .await
-}
-
-async fn await_table_active(addr: SocketAddr, table: &str) {
-    timeout(Duration::from_secs(20), async {
-        loop {
-            let (status, body) = dynamo(
-                addr,
-                "DynamoDB_20120810.DescribeTable",
-                &format!(r#"{{"TableName":"{table}"}}"#),
-            )
-            .await;
-            if status == 200 && json(&body)["Table"]["TableStatus"] == "ACTIVE" {
-                return;
-            }
-            sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("table `{table}` did not converge to ACTIVE in 20s"));
 }
 
 /// Walks every regular file under `dir` recursively and asserts none of

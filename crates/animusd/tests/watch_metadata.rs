@@ -24,23 +24,14 @@
 //!   to a full `Status` reply, while one already caught up to the
 //!   post-restart watermark still gets a cheap trivial delta.
 
-use std::net::SocketAddr;
 use std::time::Duration;
 
-use animusd::{ClientRequest, ClientResponse, MetaCommand, read_frame};
+use animusd::{ClientRequest, ClientResponse, MetaCommand};
 use tokio::time::{sleep, timeout};
 
 mod support;
+use support::call;
 use support::{bring_up_split, start_single_node};
-
-async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
-    let mut stream = animusd::connect_client(addr).await.expect("connect");
-    animusd::write_frame(&mut stream, &req).await.expect("send");
-    read_frame(&mut stream)
-        .await
-        .expect("read")
-        .expect("a reply")
-}
 
 /// The watermark carried by either `WatchMetadata` reply shape (ADR 0038
 /// PR5) — most assertions in this file only care about the watermark, not

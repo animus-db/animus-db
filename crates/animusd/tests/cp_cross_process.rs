@@ -11,26 +11,15 @@
 //!
 //! Real TCP/time → polls with timeouts.
 
-use std::net::SocketAddr;
 use std::time::Duration;
 
-use animusd::{
-    ClientRequest, ClientResponse, ColumnType, MetaCommand, Node, TableSchema, read_frame,
-};
+use animusd::{ClientRequest, ClientResponse, ColumnType, MetaCommand, Node, TableSchema};
 use tokio::time::{sleep, timeout};
 
 mod support;
+use support::call;
 
 const CP_TABLE: &str = "cp_t";
-
-async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
-    let mut stream = animusd::connect_client(addr).await.expect("connect");
-    animusd::write_frame(&mut stream, &req).await.expect("send");
-    read_frame(&mut stream)
-        .await
-        .expect("read")
-        .expect("a reply")
-}
 
 async fn propose_on_leader(nodes: &[Node], command: MetaCommand) {
     timeout(Duration::from_secs(20), async {

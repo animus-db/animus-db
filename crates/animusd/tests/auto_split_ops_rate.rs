@@ -17,14 +17,11 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
-use animus_control::Metadata;
-use animus_tablet::TabletId;
 use animusd::{Node, SegmentStoreConfig, StorageBackend, StreamSealKnobs, bind_cluster};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::time::sleep;
 
 mod support;
+use support::{await_true, dynamo, tablets_for};
 
 /// [`bind_cluster`] + [`animusd::start_cluster_with_growth`] with only the
 /// opt-in **ops-rate** auto-split trigger enabled (`auto_split_bytes` and
@@ -48,57 +45,6 @@ async fn start_cluster_with_ops_rate(n: usize, dir: &Path, ops_rate_per_sec: u64
     )
     .await
     .unwrap()
-}
-
-async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
-    let mut stream = TcpStream::connect(addr).await.expect("connect to dynamo");
-    let request = format!(
-        "POST / HTTP/1.1\r\n\
-         Host: animus\r\n\
-         X-Amz-Target: {target}\r\n\
-         Content-Type: application/x-amz-json-1.0\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {body}",
-        body.len(),
-    );
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .expect("send request");
-    stream.flush().await.expect("flush");
-    let mut raw = Vec::new();
-    stream
-        .read_to_end(&mut raw)
-        .await
-        .expect("read full response");
-    let text = String::from_utf8(raw).expect("utf8 response");
-    let (head, payload) = text.split_once("\r\n\r\n").expect("response has a body");
-    let status: u16 = head
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse().ok())
-        .expect("status line");
-    (status, payload.to_string())
-}
-
-fn tablets_for(meta: &Metadata, table: &str) -> Vec<TabletId> {
-    meta.tablets_for_table(table).map(|(&t, _)| t).collect()
-}
-
-async fn await_true(secs: u64, msg: &str, mut check: impl FnMut() -> bool) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
-    loop {
-        if check() {
-            return;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("{msg} (timed out after {secs}s)");
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
 }
 
 async fn create_plain_table(addr: SocketAddr, name: &str) {
