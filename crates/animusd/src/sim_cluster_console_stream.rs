@@ -47,10 +47,9 @@ use std::time::Duration;
 
 use super::sim_cluster::SimCluster;
 use super::sim_cluster_console::{
-    assert_no_cluster_shape, create_table_via_wire, get_item_via_wire, leader_of_table,
-    non_leader_of_table, put_item_via_wire,
+    assert_no_cluster_shape, get_item_via_wire, non_leader_of_table, put_item_via_wire,
 };
-use super::sim_support::{env_seed, json};
+use super::sim_support::{create_table_via_wire, env_seed, json, leader_of_table};
 
 // ---------------------------------------------------------------------------
 // (1) table_with_no_stream_reports_the_honest_disabled_answer

@@ -228,7 +228,7 @@
 //! "combined growth" primitive named above, and (3) at the top of this
 //! doc is that natural next PR (C-14 PR 3).**
 
-use super::sim_support::poll_until;
+use super::sim_support::{create_table_via_wire, poll_until};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -236,7 +236,6 @@ use animus_control::{MetaCommand, NodeAddrs, ProposeResult};
 use animus_env::{NodeId, nid};
 
 use super::sim_cluster::SimCluster;
-use super::sim_cluster_console::create_table_via_wire;
 use super::sim_support::{env_seed, json};
 use crate::config::NodeRole;
 

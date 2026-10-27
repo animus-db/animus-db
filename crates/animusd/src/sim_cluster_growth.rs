@@ -106,6 +106,7 @@
 //! a `SimCluster`-based fixture at all, growth or not.
 
 use super::sim_support::env_seed;
+use super::sim_support::{create_table, tablet_of};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
@@ -118,28 +119,6 @@ use crate::config::NodeRole;
 
 fn accepted(r: &ProposeResult) -> bool {
     matches!(r, ProposeResult::Accepted { .. })
-}
-
-/// A single-hash-key (`pk`, string) `CreateTable`, issued from `node` —
-/// mirrors every other `sim_cluster_*` module's identically-named helper.
-fn create_table(cluster: &mut SimCluster, node: u64, table: &str) -> (u16, String) {
-    let body = format!(
-        r#"{{"TableName":"{table}",
-            "KeySchema":[{{"AttributeName":"pk","KeyType":"HASH"}}],
-            "AttributeDefinitions":[{{"AttributeName":"pk","AttributeType":"S"}}]}}"#
-    );
-    cluster.dynamo(node, "DynamoDB_20120810.CreateTable", body.as_bytes())
-}
-
-/// `table`'s own tablet id, per `node`'s own view of `Metadata` — mirrors
-/// every other `sim_cluster_*` module's identically-named helper.
-fn tablet_of(cluster: &SimCluster, node: u64, table: &str) -> animus_tablet::TabletId {
-    let meta = cluster.metadata(node);
-    *meta
-        .tablets_for_table(table)
-        .next()
-        .unwrap_or_else(|| panic!("table {table} has no tablet on node {node}'s own view"))
-        .0
 }
 
 /// Poll until every node in `0..cluster.node_count()` shows `target`

@@ -254,19 +254,8 @@
 //! animusd --lib update_table_stream_enable_and_disable_through_every_node`.
 
 use super::sim_cluster::SimCluster;
+use super::sim_support::{create_table, leader_of_table, tablet_of_table};
 use super::sim_support::{env_seed, json};
-
-/// One DynamoDB wire `CreateTable` for a plain single-key (`pk`, string)
-/// table named `table`, issued from `node` — mirrors every other
-/// `sim_cluster_*` module's identically-named helper.
-fn create_table(cluster: &mut SimCluster, node: u64, table: &str) -> (u16, String) {
-    let body = format!(
-        r#"{{"TableName":"{table}",
-            "KeySchema":[{{"AttributeName":"pk","KeyType":"HASH"}}],
-            "AttributeDefinitions":[{{"AttributeName":"pk","AttributeType":"S"}}]}}"#
-    );
-    cluster.dynamo(node, "DynamoDB_20120810.CreateTable", body.as_bytes())
-}
 
 /// `UpdateTable` enabling a stream, issued from `node` — the shape the new
 /// `dispatch_table_op` stream-only sub-arm accepts.
@@ -303,29 +292,6 @@ fn get_item(
         r#"{{"ConsistentRead":{consistent},"TableName":"{table}","Key":{{"pk":{{"S":"{pk}"}}}}}}"#
     );
     cluster.dynamo(node, "DynamoDB_20120810.GetItem", body.as_bytes())
-}
-
-/// `table`'s own tablet id, resolved from the replicated catalog
-/// (`Metadata::tablets_for_table`) — every table in this module is created
-/// over the real wire, never via `SimCluster::create_table` itself, so
-/// `SimCluster::tablet_of`'s own hand-hosted-only bookkeeping never covers
-/// it (the same lookup `sim_cluster_dynamo_transact.rs`/`sim_cluster_
-/// dynamo_partiql.rs` already use for a wire-created table).
-fn tablet_of_table(cluster: &SimCluster, table: &str) -> animus_tablet::TabletId {
-    *cluster
-        .metadata(0)
-        .tablets_for_table(table)
-        .next()
-        .unwrap_or_else(|| panic!("table `{table}` has no tablet"))
-        .0
-}
-
-/// The node id currently leading `table`'s own tablet.
-fn leader_of_table(cluster: &SimCluster, table: &str) -> u64 {
-    let tablet = tablet_of_table(cluster, table);
-    cluster
-        .leader_index_of(tablet)
-        .unwrap_or_else(|| panic!("tablet {} has no leader", tablet.0))
 }
 
 /// A node id that does **not** lead `table`'s own tablet — mirrors

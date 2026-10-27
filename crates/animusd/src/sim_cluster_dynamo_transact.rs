@@ -119,6 +119,7 @@
 //! findings above now fixed and confirmed green — reproduces identically at
 //! every `_over_seeds` seed tried too).
 
+use super::sim_support::create_table;
 use super::sim_support::env_seed;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -131,18 +132,6 @@ use super::sim_cluster::SimCluster;
 /// Virtual time the issue #1204 scenario runs before it prepares: the age the
 /// "previous incarnation" had when it was power-cut.
 const RESTART_WARMUP: Duration = Duration::from_secs(300);
-
-/// One DynamoDB wire `CreateTable` for a plain single-key (`pk`, string)
-/// table named `table`, issued from `node` — mirrors `sim_cluster_dynamo_
-/// table_ops.rs`'s own identically-named helper.
-fn create_table(cluster: &mut SimCluster, node: u64, table: &str) -> (u16, String) {
-    let body = format!(
-        r#"{{"TableName":"{table}",
-            "KeySchema":[{{"AttributeName":"pk","KeyType":"HASH"}}],
-            "AttributeDefinitions":[{{"AttributeName":"pk","AttributeType":"S"}}]}}"#
-    );
-    cluster.dynamo(node, "DynamoDB_20120810.CreateTable", body.as_bytes())
-}
 
 fn put_item(cluster: &mut SimCluster, node: u64, table: &str, pk: &str, v: &str) -> (u16, String) {
     let body =

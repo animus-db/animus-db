@@ -174,6 +174,7 @@
 //! --lib <scenario name>`.
 
 use super::sim_support::poll_until;
+use super::sim_support::{create_table_via_wire, leader_of_table};
 use super::sim_support::{env_seed, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -204,45 +205,12 @@ pub(crate) fn assert_no_cluster_shape(body: &str) {
     }
 }
 
-/// One DynamoDB wire `CreateTable`, issued from `node` — mirrors every
-/// other `sim_cluster_*` module's identically-named helper, taking a
-/// caller-supplied body since this module's own fixtures need several
-/// distinct table shapes (unlike `sim_cluster_dynamo_streams.rs`'s fixed
-/// single-key shape).
-pub(crate) fn create_table_via_wire(
-    cluster: &mut SimCluster,
-    node: u64,
-    body: &str,
-) -> (u16, String) {
-    cluster.dynamo(node, "DynamoDB_20120810.CreateTable", body.as_bytes())
-}
-
 pub(crate) fn put_item_via_wire(cluster: &mut SimCluster, node: u64, body: &str) -> (u16, String) {
     cluster.dynamo(node, "DynamoDB_20120810.PutItem", body.as_bytes())
 }
 
 pub(crate) fn get_item_via_wire(cluster: &mut SimCluster, node: u64, body: &str) -> (u16, String) {
     cluster.dynamo(node, "DynamoDB_20120810.GetItem", body.as_bytes())
-}
-
-/// `table`'s own tablet id, resolved from the replicated catalog — every
-/// table in this module is created over the real wire, never via
-/// `SimCluster::create_table`'s own hand-hosted-only bookkeeping, mirroring
-/// `sim_cluster_dynamo_streams.rs`'s identical helper.
-pub(crate) fn tablet_of_table(cluster: &SimCluster, table: &str) -> animus_tablet::TabletId {
-    *cluster
-        .metadata(0)
-        .tablets_for_table(table)
-        .next()
-        .unwrap_or_else(|| panic!("table `{table}` has no tablet"))
-        .0
-}
-
-pub(crate) fn leader_of_table(cluster: &SimCluster, table: &str) -> u64 {
-    let tablet = tablet_of_table(cluster, table);
-    cluster
-        .leader_index_of(tablet)
-        .unwrap_or_else(|| panic!("tablet {} has no leader", tablet.0))
 }
 
 /// A node id that does **not** lead `table`'s own tablet.

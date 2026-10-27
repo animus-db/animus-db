@@ -25,25 +25,10 @@
 //! Seed replay: `ANIMUS_SEED=<seed> cargo test -p animusd --lib <test name>`.
 
 use super::sim_support::env_seed;
+use super::sim_support::first_tablet;
 use std::time::Duration;
 
-use animus_tablet::TabletId;
-
 use super::sim_cluster::SimCluster;
-
-/// `table`'s own (sole) tablet id, read off node 0's own `Metadata` — **not**
-/// `SimCluster::tablet_of`, which only knows about a *hand-hosted* table
-/// (`setup`'s own table); `setup_indexed`'s table is created through the
-/// real DynamoDB wire, so it never gets a `tablet_of` entry.
-fn first_tablet(cluster: &SimCluster, table: &str) -> TabletId {
-    cluster
-        .metadata(0)
-        .tablets_for_table(table)
-        .next()
-        .unwrap_or_else(|| panic!("{table} has no tablet"))
-        .0
-        .to_owned()
-}
 
 fn setup(seed: u64) -> SimCluster {
     let mut cluster = SimCluster::new(seed, 3, 3);

@@ -99,6 +99,7 @@
 //! --lib <test name>`.
 
 use super::sim_support::env_seed;
+use super::sim_support::{create_table, tablet_of};
 use std::time::Duration;
 
 use animus_env::{NodeId, nid};
@@ -106,18 +107,6 @@ use animus_storage::StorageEngine;
 use animus_tablet::TabletId;
 
 use super::sim_cluster::SimCluster;
-
-/// One DynamoDB wire `CreateTable` for a plain single-key (`pk`, string)
-/// table named `table`, issued from `node` — mirrors `sim_cluster_dynamo_
-/// table_ops.rs`'s own identically-named helper.
-fn create_table(cluster: &mut SimCluster, node: u64, table: &str) -> (u16, String) {
-    let body = format!(
-        r#"{{"TableName":"{table}",
-            "KeySchema":[{{"AttributeName":"pk","KeyType":"HASH"}}],
-            "AttributeDefinitions":[{{"AttributeName":"pk","AttributeType":"S"}}]}}"#
-    );
-    cluster.dynamo(node, "DynamoDB_20120810.CreateTable", body.as_bytes())
-}
 
 fn delete_table(cluster: &mut SimCluster, node: u64, table: &str) -> (u16, String) {
     let body = format!(r#"{{"TableName":"{table}"}}"#);
@@ -127,19 +116,6 @@ fn delete_table(cluster: &mut SimCluster, node: u64, table: &str) -> (u16, Strin
 fn put_item(cluster: &mut SimCluster, node: u64, table: &str, pk: &str) -> (u16, String) {
     let body = format!(r#"{{"TableName":"{table}","Item":{{"pk":{{"S":"{pk}"}}}}}}"#);
     cluster.dynamo(node, "DynamoDB_20120810.PutItem", body.as_bytes())
-}
-
-/// `table`'s own tablet id, per `node`'s own view of `Metadata` — panics if
-/// `node` sees no tablet for `table` (every caller checks this immediately
-/// after a `CreateTable` that already returned 200, so absence would mean a
-/// real bug, not a legitimate empty state to tolerate).
-fn tablet_of(cluster: &SimCluster, node: u64, table: &str) -> TabletId {
-    let meta = cluster.metadata(node);
-    *meta
-        .tablets_for_table(table)
-        .next()
-        .unwrap_or_else(|| panic!("table {table} has no tablet on node {node}'s own view"))
-        .0
 }
 
 /// The three converged-or-timeout observables this whole module is about,

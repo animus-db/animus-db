@@ -49,44 +49,16 @@
 //! cargo test -p animusd --lib <test name>`.
 
 use super::sim_support::poll_until;
+use super::sim_support::{create_table_pk_via_wire as create_table, tablet_of};
 use std::time::Duration;
 
 use animus_control::{Metadata, NodeStatus};
 use animus_env::{NodeId, nid};
-use animus_tablet::{TabletId, TabletState};
+use animus_tablet::TabletState;
 
 use super::sim_cluster::SimCluster;
-use super::sim_cluster_console::create_table_via_wire;
 use super::sim_support::{env_seed, json};
 use crate::config::NodeRole;
-
-/// A single hash-key (`pk`, string) `CreateTable`, issued from `node` —
-/// mirrors `sim_cluster_control_data_split.rs`'s identically-named helper
-/// (duplicated per this crate's own "small fixtures duplicated per test
-/// module" convention).
-fn create_table(cluster: &mut SimCluster, node: u64, table: &str) -> (u16, String) {
-    let body = format!(
-        r#"{{"TableName":"{table}",
-            "KeySchema":[{{"AttributeName":"pk","KeyType":"HASH"}}],
-            "AttributeDefinitions":[{{"AttributeName":"pk","AttributeType":"S"}}]}}"#
-    );
-    create_table_via_wire(cluster, node, &body)
-}
-
-/// The (sole, pre-split) tablet id hosting `table`, from `node`'s own view —
-/// mirrors `sim_cluster_auto_split.rs`'s identically-named helper (this
-/// crate's own "small fixtures duplicated per test module" convention). A
-/// wire-provisioned table (every table this module creates) never has an
-/// entry in `SimCluster::create_table_with_replication`'s own hand-hosted
-/// bookkeeping, so this reads live `Metadata` instead.
-fn tablet_of(cluster: &SimCluster, node: u64, table: &str) -> TabletId {
-    let meta = cluster.metadata(node);
-    *meta
-        .tablets_for_table(table)
-        .next()
-        .unwrap_or_else(|| panic!("table {table} has no tablet on node {node}'s own view"))
-        .0
-}
 
 /// Poll `run_for(STEP)` interleaved with [`SimCluster::drive_inplace_split_
 /// cutover`] on every id in `nodes` (this fixture never spawns that driver

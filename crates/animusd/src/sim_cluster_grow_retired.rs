@@ -36,6 +36,7 @@
 //! Replay one seed with `ANIMUS_SEED=<seed>`.
 
 use super::sim_support::env_seed;
+use super::sim_support::{Tick, spawn_driver_ticks};
 use std::collections::BTreeSet;
 use std::time::Duration;
 
@@ -98,29 +99,6 @@ pub(crate) fn move_leader(cluster: &mut SimCluster, tablet: TabletId, to: u64) {
         cluster.is_leader_local(to, tablet),
         "seed={seed}: could not move {tablet:?} leadership to node {to}"
     );
-}
-
-type Tick = std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>>;
-
-/// One `inplace_split_driver_tick` per `Splitting` tablet `node` leads
-/// (what `change_consumer_loop` does), without blocking the simulator.
-fn spawn_driver_ticks(cluster: &SimCluster, node: u64) -> Tick {
-    cluster.spawn_detached(node, move |ctx| async move {
-        let meta = ctx.effective_metadata();
-        for (tablet, group) in ctx.edge.hosted_groups() {
-            if !group.is_leader() {
-                continue;
-            }
-            let splitting = meta
-                .tablets
-                .get(&tablet)
-                .is_some_and(|t| t.state == TabletState::Splitting);
-            if splitting {
-                crate::index_drain::inplace_split_driver_tick(&ctx, &meta, tablet, &group).await?;
-            }
-        }
-        Ok(())
-    })
 }
 
 /// Advance `STEP` at a time, keeping one driver tick per node in flight,

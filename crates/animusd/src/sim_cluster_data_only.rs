@@ -157,11 +157,11 @@
 //!     confirms the newly created table is genuinely servable, not merely
 //!     catalog-visible.
 
-use super::sim_support::poll_until;
+use super::sim_support::create_table_pk_via_wire as create_table;
+use super::sim_support::{poll_until, tablet_of_table};
 use std::time::Duration;
 
 use super::sim_cluster::SimCluster;
-use super::sim_cluster_console::{create_table_via_wire, tablet_of_table};
 use super::sim_support::env_seed;
 use crate::config::NodeRole;
 
@@ -182,17 +182,6 @@ fn new_mixed_cluster(seed: u64) -> SimCluster {
         NodeRole::Data,
     ];
     SimCluster::new_with_roles(seed, &roles, 3)
-}
-
-/// A single-hash-key (`pk`, string) `CreateTable`, issued from `node` —
-/// mirrors `sim_cluster_control_only.rs`'s identically-named helper.
-fn create_table(cluster: &mut SimCluster, node: u64, table: &str) -> (u16, String) {
-    let body = format!(
-        r#"{{"TableName":"{table}",
-            "KeySchema":[{{"AttributeName":"pk","KeyType":"HASH"}}],
-            "AttributeDefinitions":[{{"AttributeName":"pk","AttributeType":"S"}}]}}"#
-    );
-    create_table_via_wire(cluster, node, &body)
 }
 
 // ---------------------------------------------------------------------------

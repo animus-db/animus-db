@@ -22,43 +22,9 @@
 //! --lib <test name>`.
 
 use super::sim_support::env_seed;
-use std::time::Duration;
+use super::sim_support::{await_gsi_query, first_tablet};
 
 use super::sim_cluster::SimCluster;
-
-/// `table`'s own (sole) tablet id, read off node 0's own `Metadata` — see
-/// `sim_cluster_dynamo_query_pagination.rs`'s identical helper for why
-/// `SimCluster::tablet_of` doesn't work here.
-fn first_tablet(cluster: &SimCluster, table: &str) -> animus_tablet::TabletId {
-    cluster
-        .metadata(0)
-        .tablets_for_table(table)
-        .next()
-        .unwrap_or_else(|| panic!("{table} has no tablet"))
-        .0
-        .to_owned()
-}
-
-/// Poll `body`'s `Query` until `accept` holds, or panic after a bounded
-/// number of attempts — mirrors `sim_cluster_dynamo_query_filter.rs`'s own
-/// `await_gsi_query`.
-fn await_gsi_query(
-    cluster: &mut SimCluster,
-    node: u64,
-    body: &str,
-    accept: impl Fn(&str) -> bool,
-) -> String {
-    let mut last = String::new();
-    for _ in 0..80 {
-        let (status, resp) = cluster.dynamo(node, "DynamoDB_20120810.Query", body.as_bytes());
-        if status == 200 && accept(&resp) {
-            return resp;
-        }
-        last = resp;
-        cluster.run_for(Duration::from_millis(100));
-    }
-    panic!("gsi query never converged (last saw: {last})");
-}
 
 /// [`n_order`], numerically sorted — the order-**independent** form for a
 /// membership assertion, mirroring `dynamo_query_range.rs`'s identical

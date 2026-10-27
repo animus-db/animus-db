@@ -37,26 +37,13 @@
 //! only.rs`'s own convention exactly. Seed replay (repo convention):
 //! `ANIMUS_SEED=<seed> cargo test -p animusd --lib <test name>`.
 
+use super::sim_support::create_table_pk_via_wire as create_table;
 use super::sim_support::poll_until;
 use std::time::Duration;
 
 use super::sim_cluster::SimCluster;
-use super::sim_cluster_console::create_table_via_wire;
 use super::sim_support::{env_seed, json};
 use crate::config::NodeRole;
-
-/// A single hash-key (`pk`, string) `CreateTable`, issued from `node` —
-/// mirrors every other `sim_cluster_*` module's identically-named helper
-/// (duplicated per this crate's own "small fixtures duplicated per test
-/// module" convention).
-fn create_table(cluster: &mut SimCluster, node: u64, table: &str) -> (u16, String) {
-    let body = format!(
-        r#"{{"TableName":"{table}",
-            "KeySchema":[{{"AttributeName":"pk","KeyType":"HASH"}}],
-            "AttributeDefinitions":[{{"AttributeName":"pk","AttributeType":"S"}}]}}"#
-    );
-    create_table_via_wire(cluster, node, &body)
-}
 
 /// One `GET` against `path`, parsed as JSON — the JSON-dispatch analog of
 /// every real-socket test's own `admin_get` helper (`tests/support` has no

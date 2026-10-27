@@ -22,29 +22,10 @@
 //! --lib <test name>`.
 
 use super::sim_support::env_seed;
+use super::sim_support::first_tablet;
 use std::time::Duration;
 
-use animus_tablet::TabletId;
-
 use super::sim_cluster::SimCluster;
-
-/// `table`'s own (sole) tablet id, read off node 0's own `Metadata` —
-/// **not** `SimCluster::tablet_of`, which only ever knows about a
-/// *hand-hosted* table's tablet (`SimCluster::create_table_with_
-/// replication`'s own bookkeeping); every table in this file is created
-/// through the real DynamoDB wire (`cluster.dynamo(0, "..CreateTable", ..)`)
-/// so it never gets a `tablet_of` entry at all. Node 0 issued the
-/// `CreateTable` itself, so its own metadata already reflects the freshly
-/// committed tablet by the time that call returns 200.
-fn first_tablet(cluster: &SimCluster, table: &str) -> TabletId {
-    cluster
-        .metadata(0)
-        .tablets_for_table(table)
-        .next()
-        .unwrap_or_else(|| panic!("{table} has no tablet"))
-        .0
-        .to_owned()
-}
 
 /// Poll `body`'s `Query` on **every** node until `accept` holds on all of
 /// them, or panic after a bounded number of attempts — the sim analogue of

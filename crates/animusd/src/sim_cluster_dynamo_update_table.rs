@@ -38,6 +38,7 @@
 //! --lib <test name>`.
 
 use super::sim_support::env_seed;
+use super::sim_support::{error_type, put_body};
 use std::time::Duration;
 
 use animus_env::NodeId;
@@ -58,19 +59,6 @@ const REFUSAL_MARKER: &str = "provisioned throughput exceeded";
 /// to be cleared by a wide margin for a drain loop to net-throttle at all).
 fn big_value() -> String {
     "x".repeat(100 * 1024)
-}
-
-fn put_body(table: &str, id: &str, value: &str) -> String {
-    format!(r#"{{"TableName":"{table}","Item":{{"id":{{"S":"{id}"}},"v":{{"S":"{value}"}}}}}}"#)
-}
-
-fn error_type(body: &str) -> String {
-    let json: serde_json::Value =
-        serde_json::from_str(body).unwrap_or_else(|e| panic!("body is not JSON ({e}): {body}"));
-    json["__type"]
-        .as_str()
-        .unwrap_or_else(|| panic!("no __type in: {body}"))
-        .to_string()
 }
 
 /// `table`'s own tablet's current, sorted replica set on `node`'s own view

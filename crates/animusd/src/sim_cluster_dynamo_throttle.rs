@@ -45,6 +45,7 @@
 
 use super::sim_cluster::SimCluster;
 use super::sim_support::env_seed;
+use super::sim_support::{error_type, put_body};
 
 /// `CreateTable` for a plain single-key (`id`, string) table — mirrors
 /// `dynamo_throttling.rs::create_table`'s own key shape verbatim (this
@@ -85,21 +86,6 @@ fn create_streamed_table(cluster: &mut SimCluster, node: u64, table: &str) -> (u
 /// already use.
 fn big_value() -> String {
     "x".repeat(256 * 1024)
-}
-
-fn put_body(table: &str, id: &str, value: &str) -> String {
-    format!(r#"{{"TableName":"{table}","Item":{{"id":{{"S":"{id}"}},"v":{{"S":"{value}"}}}}}}"#)
-}
-
-/// Parse an error body's `__type` field — mirrors `dynamo_throttling.rs::
-/// error_type`/every sibling `sim_cluster_dynamo_*.rs` module's own copy.
-fn error_type(body: &str) -> String {
-    let json: serde_json::Value =
-        serde_json::from_str(body).unwrap_or_else(|e| panic!("body is not JSON ({e}): {body}"));
-    json["__type"]
-        .as_str()
-        .unwrap_or_else(|| panic!("no __type in: {body}"))
-        .to_string()
 }
 
 // ---------------------------------------------------------------------------

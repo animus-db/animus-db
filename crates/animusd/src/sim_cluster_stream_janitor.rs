@@ -200,6 +200,7 @@
 //! PR 4d's own role work does not change this test's disposition at all.
 
 use super::sim_support::{env_seed, json};
+use super::sim_support::{leader_of_table, tablet_of_table};
 use std::time::Duration;
 
 use animus_control::Metadata;
@@ -249,26 +250,6 @@ fn update_table_stream(
         format!(r#"{{"TableName":"{table}","StreamSpecification":{{"StreamEnabled":false}}}}"#)
     };
     cluster.dynamo(node, "DynamoDB_20120810.UpdateTable", body.as_bytes())
-}
-
-/// `table`'s own tablet id, resolved from the replicated catalog — every
-/// table in this module is created over the real wire, never via
-/// `SimCluster::create_table` itself, mirroring `sim_cluster_dynamo_
-/// streams.rs`'s own identically-named helper.
-fn tablet_of_table(cluster: &SimCluster, table: &str) -> TabletId {
-    *cluster
-        .metadata(0)
-        .tablets_for_table(table)
-        .next()
-        .unwrap_or_else(|| panic!("table `{table}` has no tablet"))
-        .0
-}
-
-fn leader_of_table(cluster: &SimCluster, table: &str) -> u64 {
-    let tablet = tablet_of_table(cluster, table);
-    cluster
-        .leader_index_of(tablet)
-        .unwrap_or_else(|| panic!("tablet {} has no leader", tablet.0))
 }
 
 /// The first sealed `(tablet, epoch)` row's own key, for `table`'s tablet —

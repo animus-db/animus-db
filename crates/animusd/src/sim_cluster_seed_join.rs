@@ -206,8 +206,9 @@
 //! every op/dial call here, as everywhere else in this fixture — no
 //! wall-clock wait anywhere in this module.
 
-use super::sim_support::env_seed;
+use super::sim_support::create_table_pk_via_wire as create_table;
 use super::sim_support::poll_until;
+use super::sim_support::{env_seed, tablet_of_table};
 use std::collections::BTreeSet;
 use std::time::Duration;
 
@@ -216,7 +217,6 @@ use animus_env::{NodeId, nid};
 use animus_tablet::TabletId;
 
 use super::sim_cluster::SimCluster;
-use super::sim_cluster_console::{create_table_via_wire, tablet_of_table};
 use crate::config::NodeRole;
 
 const PRIMARY_SEED_A: u64 = 0xC13E_0001;
@@ -505,20 +505,6 @@ const OVER_SEEDS_C: [u64; 5] = [
 /// a single table already suffices here, since `MAX_REPLICATION_FACTOR` is
 /// always the recorded *target*, not a point-in-time observation).
 const DATA_JOIN_TABLES: [&str; 3] = ["datajoin0", "datajoin1", "datajoin2"];
-
-/// One hash-key (`pk`, string) `CreateTable`, issued from `node` — mirrors
-/// every other `sim_cluster_*` module's identically-named helper (this
-/// crate's own "small fixtures duplicated per test module" convention;
-/// `sim_cluster_control_data_split.rs`/`sim_cluster_split_cluster.rs` carry
-/// the identical copy).
-fn create_table(cluster: &mut SimCluster, node: u64, table: &str) -> (u16, String) {
-    let body = format!(
-        r#"{{"TableName":"{table}",
-            "KeySchema":[{{"AttributeName":"pk","KeyType":"HASH"}}],
-            "AttributeDefinitions":[{{"AttributeName":"pk","AttributeType":"S"}}]}}"#
-    );
-    create_table_via_wire(cluster, node, &body)
-}
 
 /// Retry a single-joiner forwarding proof (a `put`/`get` issued through the
 /// joined node, or against a pre-existing node reading back what the

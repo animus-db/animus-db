@@ -131,10 +131,8 @@ use std::time::Duration;
 use serde_json::Value;
 
 use super::sim_cluster::SimCluster;
-use super::sim_cluster_console::{
-    control_leader_and_follower, create_table_via_wire, non_leader_of_table,
-};
-use super::sim_support::{env_seed, json};
+use super::sim_cluster_console::{control_leader_and_follower, non_leader_of_table};
+use super::sim_support::{create_table_via_wire, env_seed, json};
 
 /// Poll `GET path?query` on `node` until `pred` holds on the parsed JSON
 /// body, or panic after `max_polls` calls. Each [`SimCluster::admin`] call

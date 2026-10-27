@@ -68,6 +68,7 @@
 //! Reconciler`'s `EngineFactory::local_tablets` second fact source).
 
 use super::sim_support::env_seed;
+use super::sim_support::{create_table, tablet_of};
 use std::time::Duration;
 
 use animus_storage::StorageEngine;
@@ -75,36 +76,6 @@ use animus_tablet::{TabletId, TabletState};
 
 use super::AutoSplitThresholds;
 use super::sim_cluster::SimCluster;
-
-/// A single-hash-key (`pk`, string) `CreateTable`, issued from `node` —
-/// mirrors `sim_cluster_dynamo_drop_table.rs`'s own identically-named
-/// helper.
-fn create_table(cluster: &mut SimCluster, node: u64, table: &str) -> (u16, String) {
-    let body = format!(
-        r#"{{"TableName":"{table}",
-            "KeySchema":[{{"AttributeName":"pk","KeyType":"HASH"}}],
-            "AttributeDefinitions":[{{"AttributeName":"pk","AttributeType":"S"}}]}}"#
-    );
-    cluster.dynamo(node, "DynamoDB_20120810.CreateTable", body.as_bytes())
-}
-
-/// `table`'s own tablet id, per `node`'s own view of `Metadata` — panics if
-/// `node` sees no tablet for `table`. **Reads `Metadata` directly, never
-/// `SimCluster::tablet_of`**: that accessor only knows about a table
-/// [`SimCluster::create_table_with_replication`] hand-hosted (its own
-/// `TabletInfo` bookkeeping) — a wire-provisioned table (every table this
-/// module creates) never has an entry there at all, the identical gotcha
-/// `SimClusterHandle::leader_index_of`'s own doc names for `replicas_of`.
-/// Mirrors `sim_cluster_dynamo_drop_table.rs`'s own identically-named
-/// helper.
-fn tablet_of(cluster: &SimCluster, node: u64, table: &str) -> TabletId {
-    let meta = cluster.metadata(node);
-    *meta
-        .tablets_for_table(table)
-        .next()
-        .unwrap_or_else(|| panic!("table {table} has no tablet on node {node}'s own view"))
-        .0
-}
 
 /// `PutItem` with a `pad` string attribute of `pad_len` bytes — the byte
 /// trigger's own knob: a caller controls exactly how many total bytes a
