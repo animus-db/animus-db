@@ -140,7 +140,10 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   byte strings — not JSON; ADR 0073 Phase 0 **deleted the JSON fallback**: a
   missing/foreign magic is `PreBaselineFormat { "lsm-manifest" }`, a version
   outside `1..=MANIFEST_VERSION` is `UnsupportedFormatVersion` — see
-  `encode_manifest`/`decode_manifest` in `lsm.rs`; the manifest also records the
+  `encode_manifest`/`decode_manifest` in `lsm.rs` (**v2**, issue #1389: each
+  table record adds a `bloom_scheme` byte; v1 decodes via
+  `legacy::manifest_v1` to the legacy hash scheme and
+  `reframe_manifest_to_v1` is the upgrade-harness transcode back); the manifest also records the
   **live WAL segment numbers**, part of v1; a torn manifest cannot occur because
   `replace` is atomic, and a truncated image stays a plain `Backend` error),
   `wal-NNNNNN` (the WAL split into **rotating numbered segments** — each write
@@ -222,8 +225,12 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   `cut_version`) are a known, separately tracked gap.
 - **Two read gates skip an SSTable before any disk read** (`sstable.rs`
   `SsTableMeta::may_contain`): the key range `[min_key, max_key]`, then the
-  per-table **Bloom filter** (`lsm/bloom.rs` — a hand-rolled FNV-1a
-  double-hashing bit vector, deterministic, no external dep). A table with
+  per-table **Bloom filter** (`lsm/bloom.rs` — a hand-rolled
+  double-hashing bit vector, deterministic, no external dep; base hashes are an
+  FNV-1a seed run through two SplitMix64 outputs, **not** two FNV passes — see
+  `docs/lessons/code-patterns/2026-10-27-bloom-double-hashing-needs-independent-base-hashes.md`;
+  filters from manifest v1 keep the old `HashScheme::LegacyFnv` and are probed
+  with it until compacted away). A table with
   `has_bloom == false` is range-gated only. Built over the table's distinct keys on flush/compaction.
 - **`merged_at` (the shared backend for `scan`/`scan_at`/`entries`/
   `entries_at`/`entries_with_tombstones`/`scan_with_tombstones`) applies the
@@ -947,7 +954,7 @@ sustainable write rate, which the ADR 0081 L0 stall then enforces (throughput fa
 of unique-key puts on a 3-node debug cluster). A byte-based L0 trigger with L0->L0 merging, and a
 memtable budget that lets the flush size scale, are the proposed fixes. See
 `docs/lessons/code-patterns/2026-10-25-lsm-compaction-write-amp-scales-with-tablet-size-and-throttles-writes-via-the-l0-stall.md`.
-Also: the Bloom filter FPR is ~3.5 % (correlated FNV hashes), not the 1 % target.
+Also: the Bloom filter FPR was ~3.5 % (correlated FNV hashes), not the 1 % target (fixed in #1389: manifest v2 + SplitMix base hashes, now ~1.0 %).
 
 **Adaptive flush size (issue #1389, ADR 0079 amendment 2026-10-27).** `flush_budget.rs`:
 `FlushBudget` is a cheap `Arc` of atomics shared by every engine on a node; each engine joins it

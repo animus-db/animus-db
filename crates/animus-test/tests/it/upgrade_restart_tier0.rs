@@ -494,7 +494,7 @@ fn lsm_manifest_run(seed: u64, bytes: &[u8]) -> Result<(), StorageError> {
 fn lsm_manifest_fixture_decodes_and_recovery_proceeds_to_its_tables() {
     for (version, bytes) in fixtures("lsm-manifest") {
         match version {
-            1 => {}
+            1 | 2 => {}
             v => panic!("lsm-manifest v{v} fixture has no tier-0 expectation yet — add an arm"),
         }
         each_seed("tier0_lsm_manifest", |seed| {
@@ -821,6 +821,26 @@ fn lsm_wal_v2_transcodes_to_the_v1_fixture() {
     let v1 = entry.transcode_to(&v2, 1).expect("v2 -> v1");
     assert_ne!(v1, v2);
     assert_eq!(v1, fixtures("lsm-wal")[&1].clone());
+}
+
+/// `CMF1` (LSM manifest) v2 -> v1 (issue #1389): the transcode of the v2
+/// fixture is a v1 image (version byte 1, no per-table scheme byte, so one byte
+/// per table shorter) that the current decoder still opens; the one
+/// current-scheme Bloom in the fixture is dropped, everything else survives.
+#[test]
+fn lsm_manifest_v2_transcodes_to_a_decodable_v1_file() {
+    let entry = transcode::TABLE
+        .iter()
+        .find(|e| e.name == "lsm-manifest")
+        .expect("lsm-manifest entry");
+    let v2 = fixtures("lsm-manifest")[&2].clone();
+    let v1 = entry.transcode_to(&v2, 1).expect("v2 -> v1");
+    assert_eq!(v1[4], 1);
+    assert_eq!(v2[4], 2);
+    // 3 tables: the v2 image carries one scheme byte each; the dropped Bloom
+    // also loses its bits.
+    assert!(v1.len() < v2.len() - 3, "{} vs {}", v1.len(), v2.len());
+    assert_eq!(entry.transcode_to(&v2, 2).expect("identity"), v2);
 }
 
 /// `SWL1` mirror of the CWL1 v2 -> v1 transcode check.
